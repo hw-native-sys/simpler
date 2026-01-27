@@ -5,7 +5,7 @@
 #include "kernel_args.h"
 
 // Forward declaration of AicpuExecute (implemented in runtimeexecutor.cpp)
-extern "C" int AicpuExecute(void* arg);  // arg is Runtime*
+extern "C" int AicpuExecute(Runtime* arg);
 
 extern "C" __attribute__((visibility("default"))) int StaticTileFwkBackendKernelServer(void *arg) {
     if (arg == nullptr) {

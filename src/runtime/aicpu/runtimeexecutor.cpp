@@ -3,14 +3,13 @@
 #include <mutex>
 #include "device_log.h"
 #include "runtime.h"
-#include "kernel_args.h"
 
 constexpr int MAX_AICPU_THREADS = 4;
 constexpr int MAX_AIC_PER_THREAD = 24;
 constexpr int MAX_AIV_PER_THREAD = 48;
 constexpr int MAX_CORES_PER_THREAD = MAX_AIC_PER_THREAD + MAX_AIV_PER_THREAD;
 
-struct GraphExecutor {
+struct RuntimeExecutor {
     // ===== Thread management state =====
     std::atomic<int> thread_idx_{0};
     std::atomic<bool> initialized_{false};
@@ -48,17 +47,17 @@ struct GraphExecutor {
     void DeInit();
 };
 
-static GraphExecutor g_executor;
+static RuntimeExecutor g_executor;
 
-// ===== GraphExecutor Method Implementations =====
+// ===== RuntimeExecutor Method Implementations =====
 
-int GraphExecutor::Init(Runtime* runtime) {
+int RuntimeExecutor::Init(Runtime* runtime) {
     bool expected = false;
     if (!initialized_.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return 0;
     }
 
-    DEV_INFO("GraphExecutor: Initializing");
+    DEV_INFO("RuntimeExecutor: Initializing");
 
     if (runtime == nullptr) {
         DEV_ERROR("runtime is nullptr");
@@ -155,14 +154,14 @@ int GraphExecutor::Init(Runtime* runtime) {
     finished_count_.store(0, std::memory_order_release);
 
     init_done_.store(true, std::memory_order_release);
-    DEV_INFO("GraphExecutor: Init complete");
+    DEV_INFO("RuntimeExecutor: Init complete");
     return 0;
 }
 
 /**
  * Handshake AICore - Initialize and synchronize with AICore kernels
  */
-int GraphExecutor::HankAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
+int RuntimeExecutor::HankAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
     Handshake* all_hanks = (Handshake*)runtime->workers;
 
     DEV_INFO("Thread %d: Handshaking with %d cores", thread_idx, cores_per_thread_);
@@ -186,7 +185,7 @@ int GraphExecutor::HankAiCore(Runtime* runtime, int thread_idx, const int* cur_t
 /**
  * Shutdown AICore - Send quit signal to all AICore kernels
  */
-int GraphExecutor::ShutdownAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
+int RuntimeExecutor::ShutdownAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
     Handshake* all_hanks = (Handshake*)runtime->workers;
 
     DEV_INFO("Thread %d: Shutting down %d cores", thread_idx, cores_per_thread_);
@@ -204,7 +203,7 @@ int GraphExecutor::ShutdownAiCore(Runtime* runtime, int thread_idx, const int* c
 /**
  * Execute task runtime using polling-based dispatch to AICore
  */
-int GraphExecutor::Execute(Runtime& r, Handshake* hank, int thread_idx,
+int RuntimeExecutor::Execute(Runtime& r, Handshake* hank, int thread_idx,
                            const int* cur_thread_cores, int core_num) {
 
     DEV_INFO("Thread %d: Starting execution with %d cores", thread_idx, core_num);
@@ -319,7 +318,7 @@ int GraphExecutor::Execute(Runtime& r, Handshake* hank, int thread_idx,
     return cur_thread_completed;
 }
 
-int GraphExecutor::Run(Runtime* runtime) {
+int RuntimeExecutor::Run(Runtime* runtime) {
     int thread_idx = thread_idx_++;
 
     DEV_INFO("Thread %d: Start", thread_idx);
@@ -353,7 +352,7 @@ int GraphExecutor::Run(Runtime* runtime) {
     return 0;
 }
 
-void GraphExecutor::DeInit() {
+void RuntimeExecutor::DeInit() {
     // Cleanup runtime execution state
     ready_count_aic_.store(0, std::memory_order_release);
     ready_count_aiv_.store(0, std::memory_order_release);
@@ -369,7 +368,7 @@ void GraphExecutor::DeInit() {
     thread_idx_.store(0, std::memory_order_release);
     finished_.store(false, std::memory_order_release);
 
-    DEV_INFO("DeInit: GraphExecutor reset complete");
+    DEV_INFO("DeInit: RuntimeExecutor reset complete");
 }
 
 // ===== Public Entry Point =====
@@ -384,19 +383,17 @@ void GraphExecutor::DeInit() {
  * 3. Execute tasks on managed cores
  * 4. Cleanup when last thread finishes
  *
- * @param arg Pointer to Runtime structure containing:
- *            - workers[]: handshake buffers for AICPU-AICore communication
- *            - block_dim, scheCpuNum: execution parameters
- *            - tasks[]: task runtime to execute
+ * @param runtime Pointer to Runtime structure containing:
+ *                - workers[]: handshake buffers for AICPU-AICore communication
+ *                - block_dim, scheCpuNum: execution parameters
+ *                - tasks[]: task runtime to execute
  * @return 0 on success, non-zero on error
  */
-extern "C" int AicpuExecute(void *arg) {
-    if (arg == nullptr) {
+extern "C" int AicpuExecute(Runtime* runtime) {
+    if (runtime == nullptr) {
         DEV_ERROR("%s", "Invalid runtime argument: null pointer");
         return -1;
     }
-
-    auto runtime = (Runtime *)arg;
 
     DEV_INFO("%s", "AicpuExecute: Starting AICPU kernel execution");
 
