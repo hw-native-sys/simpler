@@ -476,10 +476,7 @@ Kernel uses macros:
 ## Testing
 
 ```bash
-cd runtime/tests
-python3 test_host_compilation.py      # Test host runtime compilation
-python3 test_aicpu_compilation.py     # Test AICPU compilation
-python3 test_aicore_compilation.py    # Test AICore compilation
+./ci.sh
 ```
 
 ## References

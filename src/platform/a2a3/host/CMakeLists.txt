@@ -22,8 +22,6 @@ set(HOST_RUNTIME_SOURCES "")
 list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/devicerunner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memoryallocator.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/kernel_compiler.cpp"
-    "${CMAKE_CURRENT_SOURCE_DIR}/binary_loader.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)

@@ -106,31 +106,4 @@ struct CoreFunctionBinCache {
     }
 };
 
-/**
- * Workspace address information for each kernel
- *
- * Contains the address of the kernel binary in device GM memory along
- * with other execution metadata.
- *
- * This structure is populated on the host and copied to device memory
- * where it's accessed by AICore kernels during task execution.
- */
-struct CoreFunctionWsAddr {
-    uint64_t functionBinAddr;       // *** THE KEY FIELD *** - Address in device GM
-    uint64_t invokeEntryAddr;       // Parameter entry address (unused in simple runtime)
-    uint64_t psgId;                 // Program subgraph ID (func_id in this runtime)
-    uint64_t topoAddr;              // Topology address (unused in simple runtime)
-    uint64_t invokeEntryInfo;       // Tensor info address (unused in simple runtime)
-    uint64_t invokeEntryNum;        // Number of entries (unused in simple runtime)
-    uint64_t invokeEntryOriAddr;    // Original address backup (unused in simple runtime)
-
-    CoreFunctionWsAddr()
-        : functionBinAddr(0), invokeEntryAddr(0), psgId(0), topoAddr(0),
-          invokeEntryInfo(0), invokeEntryNum(0), invokeEntryOriAddr(0) {}
-
-    CoreFunctionWsAddr(uint64_t bin, uint64_t psg)
-        : functionBinAddr(bin), invokeEntryAddr(0), psgId(psg), topoAddr(0),
-          invokeEntryInfo(0), invokeEntryNum(0), invokeEntryOriAddr(0) {}
-};
-
 #endif  // RUNTIME_FUNCTION_CACHE_H

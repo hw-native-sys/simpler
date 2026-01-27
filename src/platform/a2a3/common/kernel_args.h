@@ -16,6 +16,7 @@
 #include <cstdint>
 
 // Forward declaration
+class DeviceArgs;
 class Runtime;
 
 #ifdef __cplusplus
@@ -36,18 +37,22 @@ extern "C" {
  * Field Access Patterns:
  * - unused[5]: Padding for alignment with CANN runtime expectations
  * - deviceArgs: Written by host, read by AICPU (contains aicpuSoBin/aicpuSoLen)
- * - runtimeArgs: Written by host, read by AICPU (task runtime with execution parameters)
- *                Runtime contains: workers[], worker_count, block_dim, scheCpuNum, tasks[]
+ * - block_dim: Written by host, read by AICPU (number of blocks, each block = 1 AIC + 2 AIV)
+ * - nrAic: Written by host, read by AICPU (number of AIC cores)
+ * - scheCpuNum: Written by host, read by AICPU (number of AICPU scheduling threads)
+ * - graphArgs: Written by host, read by AICPU (task graph, includes handshake buffers)
  *
- * Note: AICore kernels receive Runtime* directly, not KernelArgs
- *       - AICPU: accesses runtimeArgs->workers, runtimeArgs->block_dim, etc.
- *       - AICore: receives Runtime* pointer with workers at offset 0
+ * Note: AICore kernels receive Graph* directly, not KernelArgs
+ *       - AICPU: accesses graphArgs->workers directly
+ *       - AICore: receives Graph* pointer with workers at offset 0
  */
 struct KernelArgs {
     uint64_t unused[5] = {0};        // Alignment padding (required by CANN runtime offset)
-    uint64_t *deviceArgs{nullptr};    // Device arguments (AICPU reads, contains SO info)
-    uint64_t *runtimeCtx{nullptr};    // Runtime context (AICPU reads)
-    Runtime *runtimeArgs{nullptr};    // Task runtime in device memory
+    DeviceArgs *deviceArgs{nullptr};    // Device arguments (AICPU reads, contains SO info)
+    uint64_t block_dim;               // Number of blocks (1 block = 1 AIC + 2 AIV)
+    uint32_t nrAic;                   // Number of AIC cores
+    uint32_t scheCpuNum;              // Number of AICPU scheduling threads
+    Runtime *runtimeArgs{nullptr};        // Task graph in device memory
 };
 
 #ifdef __cplusplus

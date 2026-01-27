@@ -17,6 +17,7 @@
  *   task2 -> task3
  */
 
+#include "runtime.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <new>
@@ -45,47 +46,19 @@ static size_t g_tensor_bytes = 0;
 /**
  * Initialize a pre-allocated runtime for the basic example.
  *
- * This function takes a pre-allocated Runtime pointer and builds the complete
- * example runtime inside it. All runtime building logic is handled in C++.
+ * This function takes a pre-constructed Runtime pointer and builds the complete
+ * example runtime inside it. Runtime is already constructed via placement new.
  *
- * @param runtime      Pointer to pointer to Runtime (will allocate and fill)
+ * @param runtime    Pointer to pre-constructed Runtime
  * @return 0 on success, -1 on failure
  */
-int InitGraphImpl(Runtime **runtime) {
+int InitGraphImpl(Runtime *runtime) {
     int rc = 0;
 
     // Initialize DeviceRunner
     DeviceRunner& runner = DeviceRunner::Get();
     // Note: DeviceRunner should already be initialized by Python before calling InitGraph
-
-    // Compile and load kernels at runtime
-    std::cout << "\n=== Compiling Kernels at Runtime ===" << '\n';
-
-    // Note: PTO-ISA root is already configured in DeviceRunner during Init()
-    // which was called by Python before this function
-
-    // Compile and load kernel_add (func_id=0)
-    rc = runner.CompileAndLoadKernel(0, "kernels/aiv/kernel_add.cpp", 1);
-    if (rc != 0) {
-        std::cerr << "Error: Failed to compile kernel_add" << '\n';
-        return rc;
-    }
-
-    // Compile and load kernel_add_scalar (func_id=1)
-    rc = runner.CompileAndLoadKernel(1, "kernels/aiv/kernel_add_scalar.cpp", 1);
-    if (rc != 0) {
-        std::cerr << "Error: Failed to compile kernel_add_scalar" << '\n';
-        return rc;
-    }
-
-    // Compile and load kernel_mul (func_id=2)
-    rc = runner.CompileAndLoadKernel(2, "kernels/aiv/kernel_mul.cpp", 1);
-    if (rc != 0) {
-        std::cerr << "Error: Failed to compile kernel_mul" << '\n';
-        return rc;
-    }
-
-    std::cout << "All kernels compiled and loaded successfully\n";
+    // Note: Kernels should be registered via Python's runner.register_kernel() before calling InitGraph
 
     // Allocate device tensors
     constexpr int ROWS = 128;
@@ -130,10 +103,6 @@ int InitGraphImpl(Runtime **runtime) {
     std::cout << "Initialized input tensors: a=2.0, b=3.0 (all elements)\n";
     std::cout << "Expected result: f = (2+3+1)*(2+3+2) = 6*7 = 42.0\n";
 
-    // Allocate Runtime on heap
-    *runtime = new Runtime();
-    Runtime* g = *runtime;
-
     // Store tensor pointers for later use by ValidateGraphImpl
     g_dev_a = dev_a;
     g_dev_b = dev_b;
@@ -166,7 +135,7 @@ int InitGraphImpl(Runtime **runtime) {
     args_t0[1] = reinterpret_cast<uint64_t>(dev_b);  // src1
     args_t0[2] = reinterpret_cast<uint64_t>(dev_c);  // out
     args_t0[3] = SIZE;                                // size
-    int t0 = g->add_task(args_t0, 4, 0);
+    int t0 = runtime->add_task(args_t0, 4, 0);
 
     // Task 1: d = c + 1 (func_id=1: kernel_add_scalar)
     uint64_t args_t1[4];
@@ -175,7 +144,7 @@ int InitGraphImpl(Runtime **runtime) {
     args_t1[1] = scalar_converter.u64;                // scalar=1.0
     args_t1[2] = reinterpret_cast<uint64_t>(dev_d);  // out
     args_t1[3] = SIZE;                                // size
-    int t1 = g->add_task(args_t1, 4, 1);
+    int t1 = runtime->add_task(args_t1, 4, 1);
 
     // Task 2: e = c + 2 (func_id=1: kernel_add_scalar)
     uint64_t args_t2[4];
@@ -184,7 +153,7 @@ int InitGraphImpl(Runtime **runtime) {
     args_t2[1] = scalar_converter.u64;                // scalar=2.0
     args_t2[2] = reinterpret_cast<uint64_t>(dev_e);  // out
     args_t2[3] = SIZE;                                // size
-    int t2 = g->add_task(args_t2, 4, 1);
+    int t2 = runtime->add_task(args_t2, 4, 1);
 
     // Task 3: f = d * e (func_id=2: kernel_mul)
     uint64_t args_t3[4];
@@ -192,16 +161,16 @@ int InitGraphImpl(Runtime **runtime) {
     args_t3[1] = reinterpret_cast<uint64_t>(dev_e);  // src1
     args_t3[2] = reinterpret_cast<uint64_t>(dev_f);  // out
     args_t3[3] = SIZE;                                // size
-    int t3 = g->add_task(args_t3, 4, 2);
+    int t3 = runtime->add_task(args_t3, 4, 2);
 
     // Add dependencies
-    g->add_successor(t0, t1);  // t0 → t1
-    g->add_successor(t0, t2);  // t0 → t2
-    g->add_successor(t1, t3);  // t1 → t3
-    g->add_successor(t2, t3);  // t2 → t3
+    runtime->add_successor(t0, t1);  // t0 → t1
+    runtime->add_successor(t0, t2);  // t0 → t2
+    runtime->add_successor(t1, t3);  // t1 → t3
+    runtime->add_successor(t2, t3);  // t2 → t3
 
-    std::cout << "Created runtime with " << g->get_task_count() << " tasks\n";
-    g->print_runtime();
+    std::cout << "Created runtime with " << runtime->get_task_count() << " tasks\n";
+    runtime->print_runtime();
 
     std::cout << "\nRuntime initialized. Ready for execution from Python.\n";
 
@@ -274,7 +243,7 @@ int ValidateGraphImpl(Runtime *runtime) {
     // Print handshake results
     runner.PrintHandshakeResults(*runtime);
 
-    // Cleanup
+    // Cleanup device tensors
     std::cout << "\n=== Cleaning Up ===" << '\n';
     runner.FreeTensor(dev_a);
     runner.FreeTensor(dev_b);
@@ -284,8 +253,8 @@ int ValidateGraphImpl(Runtime *runtime) {
     runner.FreeTensor(dev_f);
     std::cout << "Freed all device tensors\n";
 
-    // Delete the runtime
-    delete runtime;
+    // Note: Runtime destructor is called by FinalizeGraph() after this returns
+    // User will call free() after FinalizeGraph()
 
     // Clear global tensor pointers
     g_dev_a = g_dev_b = g_dev_c = g_dev_d = g_dev_e = g_dev_f = nullptr;

@@ -1,5 +1,5 @@
 /**
- * Runtime Class - Task Dependency Graph Management
+ * Runtime Class - Task Dependency Runtime Management
  *
  * This is a simplified, standalone runtime class for managing task dependencies.
  * Tasks are stored in a fixed-size array with compile-time configurable bounds.
@@ -9,7 +9,7 @@
  * - Fanin (predecessor count)
  * - Fanout (array of successor task IDs)
  *
- * The runtime maintains a ready queue for tasks with fanin == 0.
+ * The graph maintains a ready queue for tasks with fanin == 0.
  *
  * Based on patterns from pto_runtime.h/c but simplified for educational
  * and lightweight scheduling use cases.
@@ -23,9 +23,6 @@
 #include <stdio.h>  // for fprintf, printf
 #include <string.h> // for memset
 #include <atomic>
-
-// Forward declaration
-class DeviceRunner;
 
 // =============================================================================
 // Configuration Macros
@@ -141,24 +138,23 @@ typedef struct {
 // =============================================================================
 
 /**
- * Runtime class for task dependency management
+ * Graph class for task dependency management
  *
  * Maintains a fixed-size array of tasks and uses a Queue for ready tasks.
  * Tasks are allocated monotonically and never reused within the same
- * runtime instance.
+ * graph instance.
  *
  * Dependencies are managed manually via add_successor().
  */
 class Runtime {
 public:
   // Handshake buffers for AICPU-AICore communication
-  // Public to allow DeviceRunner to initialize and access them
   Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
   int worker_count;                      // Number of active workers
 
-  // Execution parameters (previously in KernelArgs)
-  int block_dim{1};                      // Number of blocks (1 block = 1 AIC + 2 AIV)
-  int scheCpuNum{1};                     // Number of AICPU scheduling threads
+  // Execution parameters for AICPU scheduling
+  int block_dim;                         // Number of AIC blocks (block dimension)
+  int scheCpuNum;                        // Number of AICPU threads for scheduling
 
 private:
   // Task storage
@@ -214,7 +210,7 @@ public:
   Task *get_task(int task_id);
 
   /**
-   * Get the total number of tasks in the runtime
+   * Get the total number of tasks in the graph
    *
    * @return Total task count
    */
@@ -237,7 +233,7 @@ public:
   // =========================================================================
 
   /**
-   * Print the runtime structure to stdout
+   * Print the graph structure to stdout
    *
    * Shows task table with fanin/fanout information.
    */

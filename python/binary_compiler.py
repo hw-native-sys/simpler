@@ -2,7 +2,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import List
 from toolchain import AICoreToolchain, AICPUToolchain, HostToolchain
 
 

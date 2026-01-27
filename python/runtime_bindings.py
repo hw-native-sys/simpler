@@ -1,24 +1,29 @@
 """
+
 PTO Runtime ctypes Bindings
 
 Provides a Pythonic interface to the PTO runtime via ctypes.
 Users must provide a pre-compiled libpto_runtime.so (built via binary_compiler.py).
 
 Usage:
-    from runtime_bindings import load_runtime
+    from runtime_bindings import load_runtime, register_kernel, launch_graph
 
-    DeviceRunner, Graph = load_runtime("/path/to/libpto_runtime.so")
-    runner = DeviceRunner()
-    runner.init(device_id=0, aicpu_binary=aicpu_bytes, aicore_binary=aicore_bytes, pto_isa_root="/path/to/pto-isa")
+    Graph = load_runtime("/path/to/libpto_runtime.so")
 
-    graph = Graph()
-    graph.initialize()
+    runtime = Runtime()
+    runtime.initialize()
 
-    runner.run(graph, block_dim=3, launch_aicpu_num=1)
-    runner.print_handshake_results(graph)
-    graph.validate_and_cleanup()
-    runner.finalize()
+    register_kernel(0, kernel_add)
+    register_kernel(1, kernel_add_scalar)
+    register_kernel(2, kernel_mul)
+
+    launch_graph(graph, aicpu_thread_num=1, block_dim=1,
+                 device_id=0, aicpu_binary=aicpu_bytes,
+                 aicore_binary=aicore_bytes)
+
+    runtime.finalize()
 """
+
 
 from ctypes import (
     CDLL,
@@ -27,12 +32,15 @@ from ctypes import (
     c_void_p,
     c_uint8,
     c_size_t,
-    c_char_p,
 )
 from pathlib import Path
 from typing import Union
 import ctypes
 import tempfile
+
+
+# Module-level library reference
+_lib = None
 
 
 # ============================================================================
@@ -42,8 +50,10 @@ import tempfile
 class RuntimeLibraryLoader:
     """Loads and manages the PTO runtime C API library."""
 
+
     def __init__(self, lib_path: Union[str, Path]):
         """
+
         Load the PTO runtime library.
 
         Args:
@@ -53,6 +63,7 @@ class RuntimeLibraryLoader:
             FileNotFoundError: If library file not found
             OSError: If library cannot be loaded
         """
+
         lib_path = Path(lib_path)
         if not lib_path.exists():
             raise FileNotFoundError(f"Library not found: {lib_path}")
@@ -63,28 +74,39 @@ class RuntimeLibraryLoader:
 
     def _setup_functions(self):
         """Set up ctypes function signatures."""
-        # Graph functions
+
+        # GetGraphSize - returns sizeof(Graph) for user allocation
+        self.lib.GetGraphSize.argtypes = []
+        self.lib.GetGraphSize.restype = c_size_t
+
+        # InitGraph - placement new + build graph
         self.lib.InitGraph.argtypes = [c_void_p]
         self.lib.InitGraph.restype = c_int
 
-        self.lib.ValidateGraph.argtypes = [c_void_p]
-        self.lib.ValidateGraph.restype = c_int
+        # launch_graph - device init + execute graph
+        self.lib.launch_graph.argtypes = [
+            c_void_p,           # runtime
+            c_int,              # aicpu_thread_num
+            c_int,              # block_dim
+            c_int,              # device_id
+            POINTER(c_uint8),   # aicpu_binary
+            c_size_t,           # aicpu_size
+            POINTER(c_uint8),   # aicore_binary
+            c_size_t,           # aicore_size
+        ]
+        self.lib.launch_graph.restype = c_int
 
-        # DeviceRunner functions
-        self.lib.DeviceRunner_Init.argtypes = [c_int,
-                                               POINTER(c_uint8), c_size_t,
-                                               POINTER(c_uint8), c_size_t,
-                                               c_char_p]
-        self.lib.DeviceRunner_Init.restype = c_int
+        # FinalizeGraph - validate + cleanup
+        self.lib.FinalizeGraph.argtypes = [c_void_p]
+        self.lib.FinalizeGraph.restype = c_int
 
-        self.lib.DeviceRunner_Run.argtypes = [c_void_p, c_int, c_int]
-        self.lib.DeviceRunner_Run.restype = c_int
+        # RegisterKernel - register kernel binary for func_id
+        self.lib.RegisterKernel.argtypes = [c_int, POINTER(c_uint8), c_size_t]
+        self.lib.RegisterKernel.restype = c_int
 
-        self.lib.DeviceRunner_PrintHandshakeResults.argtypes = [c_void_p]
-        self.lib.DeviceRunner_PrintHandshakeResults.restype = None
-
-        self.lib.DeviceRunner_Finalize.argtypes = []
-        self.lib.DeviceRunner_Finalize.restype = c_int
+        # set_device - set device and create streams
+        self.lib.set_device.argtypes = [c_int]
+        self.lib.set_device.restype = c_int
 
 
 # ============================================================================
@@ -93,217 +115,217 @@ class RuntimeLibraryLoader:
 
 class Runtime:
     """
+
     Task dependency runtime.
 
     Python wrapper around the C Runtime API.
-    Runtimes are allocated and managed by C++. Python just holds handles.
+    User allocates memory via ctypes buffer, C++ uses placement new.
     """
+
 
     def __init__(self, lib: CDLL):
         """
+
         Create a new runtime handle.
 
         Args:
             lib: Loaded ctypes library (RuntimeLibraryLoader.lib)
         """
+
         self.lib = lib
-        # Allocate buffer to hold a Runtime pointer (8 bytes on 64-bit)
-        # This buffer will be filled by C++ during InitGraph()
-        self._buffer = ctypes.create_string_buffer(ctypes.sizeof(c_void_p))
-        # Get the address of this buffer to pass to C++
-        # C++ will dereference this as Runtime** and fill in the Runtime*
-        self._handle = ctypes.addressof(self._buffer)
+        # Allocate buffer of size GetGraphSize() for placement new
+        size = lib.GetGraphSize()
+        self._buffer = ctypes.create_string_buffer(size)
+        self._handle = ctypes.cast(self._buffer, c_void_p)
 
     def initialize(self) -> None:
         """
+
         Initialize the runtime structure.
 
-        Calls InitGraph() in C++ which allocates the Runtime, builds tasks,
-        allocates device tensors, initializes data, and runs the runtime.
+        Calls InitGraph() in C++ which uses placement new to construct
+        the Runtime, builds tasks, allocates device tensors, and initializes data.
 
         Raises:
             RuntimeError: If initialization fails
         """
+
         rc = self.lib.InitGraph(self._handle)
         if rc != 0:
-            raise RuntimeError(f"Failed to initialize Runtime: {rc}")
+            raise RuntimeError(f"InitGraph failed: {rc}")
 
-    def validate_and_cleanup(self) -> None:
+    def finalize(self) -> None:
         """
-        Validate results and cleanup all resources.
 
-        Calls ValidateGraph() in C++ which validates computation results,
-        frees device tensors, and deletes the runtime.
+        Finalize and cleanup the runtime.
+
+        Calls FinalizeGraph() in C++ which validates computation results,
+        frees device tensors, and calls the Runtime destructor.
 
         Raises:
-            RuntimeError: If validation fails
+            RuntimeError: If finalization fails
         """
-        # Get the Runtime* pointer that was stored in the buffer by InitGraph
-        # _buffer contains [Runtime*], so cast it to pointer to void* and dereference
-        runtime_ptr = ctypes.cast(self._buffer, ctypes.POINTER(c_void_p)).contents
-        rc = self.lib.ValidateGraph(runtime_ptr)
+
+        rc = self.lib.FinalizeGraph(self._handle)
         if rc != 0:
-            raise RuntimeError(f"ValidateGraph failed: {rc}")
+            raise RuntimeError(f"FinalizeGraph failed: {rc}")
 
     def __del__(self):
         """Clean up runtime resources."""
-        # Runtime is managed by C++ (deleted in ValidateGraph), no explicit cleanup needed
+
+        # Runtime destructor is called by finalize(), buffer freed by Python GC
         pass
 
 
-class DeviceRunner:
+# ============================================================================
+# Module-level Functions
+# ============================================================================
+
+def register_kernel(func_id: int, binary_data: bytes) -> None:
     """
-    Device execution runtime.
 
-    Python wrapper around the C DeviceRunner API.
-    Supports context manager protocol for automatic cleanup.
+    Register a kernel binary for a func_id.
+
+    Receives pre-extracted .text section binary data,
+    allocates device GM memory, copies the binary to device,
+    and stores the GM address for later use by launch_graph().
+
+    Args:
+        func_id: Function identifier (0, 1, 2, ...)
+        binary_data: Kernel .text section binary data
+
+    Raises:
+        RuntimeError: If not initialized or registration fails
+        ValueError: If binary_data is empty
     """
 
-    def __init__(self, lib: CDLL):
-        """
-        Initialize the DeviceRunner wrapper.
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call load_runtime() first.")
 
-        Args:
-            lib: Loaded ctypes library (RuntimeLibraryLoader.lib)
-        """
-        self.lib = lib
-        self._initialized = False
+    if not binary_data:
+        raise ValueError("binary_data cannot be empty")
 
-    def init(
-        self,
-        device_id: int,
-        aicpu_binary: bytes,
-        aicore_binary: bytes,
-        pto_isa_root: str,
-    ) -> None:
-        """
-        Initialize the device runner.
+    # Convert bytes to ctypes array
+    bin_array = (c_uint8 * len(binary_data)).from_buffer_copy(binary_data)
+    rc = _lib.RegisterKernel(func_id, bin_array, len(binary_data))
+    if rc != 0:
+        raise RuntimeError(f"RegisterKernel failed: {rc}")
 
-        Args:
-            device_id: Device ID (0-15)
-            aicpu_binary: Binary data of AICPU shared object
-            aicore_binary: Binary data of AICore kernel
-            pto_isa_root: Path to PTO-ISA root directory (headers location)
 
-        Raises:
-            RuntimeError: If initialization fails
-        """
-        # Convert bytes to ctypes arrays
-        aicpu_array = (c_uint8 * len(aicpu_binary)).from_buffer_copy(aicpu_binary)
-        aicore_array = (c_uint8 * len(aicore_binary)).from_buffer_copy(aicore_binary)
+def set_device(device_id: int) -> None:
+    """
 
-        rc = self.lib.DeviceRunner_Init(
-            device_id,
-            aicpu_array,
-            len(aicpu_binary),
-            aicore_array,
-            len(aicore_binary),
-            pto_isa_root.encode('utf-8'),
-        )
-        if rc != 0:
-            raise RuntimeError(f"DeviceRunner_Init failed: {rc}")
-        self._initialized = True
+    Set device and create streams for memory operations.
 
-    def run(self, runtime: "Runtime", block_dim: int, launch_aicpu_num: int = 1) -> None:
-        """
-        Execute a runtime on the device.
+    Must be called before runtime.initialize() to enable device tensor allocation.
+    Only performs minimal initialization:
+    - rtSetDevice(device_id)
+    - Create AICPU and AICore streams
 
-        Args:
-            runtime: Runtime to execute (must have been initialized via runtime.initialize())
-            block_dim: Number of blocks (1 block = 1 AIC + 2 AIV)
-            launch_aicpu_num: Number of AICPU instances
+    Binary loading happens later in launch_graph().
 
-        Raises:
-            RuntimeError: If execution fails
-        """
-        if not self._initialized:
-            raise RuntimeError("DeviceRunner not initialized")
+    Args:
+        device_id: Device ID (0-15)
 
-        # Get the actual Runtime* pointer from the buffer
-        runtime_ptr = ctypes.cast(runtime._buffer, ctypes.POINTER(c_void_p)).contents
-        rc = self.lib.DeviceRunner_Run(runtime_ptr, block_dim, launch_aicpu_num)
-        if rc != 0:
-            raise RuntimeError(f"DeviceRunner_Run failed: {rc}")
+    Raises:
+        RuntimeError: If not loaded or device setup fails
+    """
 
-    def print_handshake_results(self, runtime: "Runtime") -> None:
-        """
-        Print handshake results from device.
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call load_runtime() first.")
 
-        Args:
-            runtime: Runtime whose handshake results should be printed
+    rc = _lib.set_device(device_id)
+    if rc != 0:
+        raise RuntimeError(f"set_device failed: {rc}")
 
-        Raises:
-            RuntimeError: If not initialized
-        """
-        if not self._initialized:
-            raise RuntimeError("DeviceRunner not initialized")
 
-        # Get the actual Runtime* pointer from the buffer
-        runtime_ptr = ctypes.cast(runtime._buffer, ctypes.POINTER(c_void_p)).contents
-        self.lib.DeviceRunner_PrintHandshakeResults(runtime_ptr)
+def launch_graph(
+    runtime: "Runtime",
+    aicpu_thread_num: int,
+    block_dim: int,
+    device_id: int,
+    aicpu_binary: bytes,
+    aicore_binary: bytes,
+) -> None:
+    """
 
-    def finalize(self) -> None:
-        """Cleanup all resources."""
-        if self._initialized:
-            rc = self.lib.DeviceRunner_Finalize()
-            if rc != 0:
-                raise RuntimeError(f"DeviceRunner_Finalize failed: {rc}")
-            self._initialized = False
+    Execute a runtime on the device.
 
-    def __enter__(self):
-        """Context manager entry."""
-        return self
+    Initializes DeviceRunner singleton (if first call), copies runtime to device,
+    launches kernels, synchronizes, and copies runtime back from device.
 
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit - cleanup resources."""
-        try:
-            self.finalize()
-        except Exception:
-            pass  # Ignore errors during cleanup
-        return False
+    Args:
+        runtime: Runtime to execute (must have been initialized via runtime.initialize())
+        aicpu_thread_num: Number of AICPU scheduler threads
+        block_dim: Number of blocks (1 block = 1 AIC + 2 AIV)
+        device_id: Device ID (0-15)
+        aicpu_binary: Binary data of AICPU shared object
+        aicore_binary: Binary data of AICore kernel
 
-    def __del__(self):
-        """Clean up on deletion."""
-        try:
-            if self._initialized:
-                self.finalize()
-        except Exception:
-            pass  # Ignore errors during cleanup
+    Raises:
+        RuntimeError: If not initialized or execution fails
+    """
+
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call load_runtime() first.")
+
+    # Convert bytes to ctypes arrays
+    aicpu_array = (c_uint8 * len(aicpu_binary)).from_buffer_copy(aicpu_binary)
+    aicore_array = (c_uint8 * len(aicore_binary)).from_buffer_copy(aicore_binary)
+
+    rc = _lib.launch_graph(
+        runtime._handle,
+        aicpu_thread_num,
+        block_dim,
+        device_id,
+        aicpu_array,
+        len(aicpu_binary),
+        aicore_array,
+        len(aicore_binary),
+    )
+    if rc != 0:
+        raise RuntimeError(f"launch_graph failed: {rc}")
 
 
 # ============================================================================
 # Public API
 # ============================================================================
 
-def load_runtime(lib_path: Union[str, Path, bytes]) -> tuple:
+def load_runtime(lib_path: Union[str, Path, bytes]) -> type:
     """
-    Load the PTO runtime library and return wrapper classes.
+
+    Load the PTO runtime library and return Runtime class.
 
     Args:
         lib_path: Path to libpto_runtime.so (str/Path), or compiled binary data (bytes)
 
     Returns:
-        Tuple of (DeviceRunnerClass, RuntimeClass) initialized with the library
+        Runtime class initialized with the library
 
     Example:
-        # From file path
-        DeviceRunner, Runtime = load_runtime("/path/to/libpto_runtime.so")
+        from runtime_bindings import load_runtime, register_kernel, launch_graph
 
-        # From compiled binary bytes
-        host_binary = compiler.compile("host", include_dirs, source_dirs)
-        DeviceRunner, Runtime = load_runtime(host_binary)
-
-        runner = DeviceRunner()
-        runner.init(device_id=0, aicpu_binary=aicpu_bytes, aicore_binary=aicore_bytes, pto_isa_root="/path/to/pto-isa")
+        Graph = load_runtime("/path/to/libpto_runtime.so")
 
         runtime = Runtime()
         runtime.initialize()
 
-        runner.run(runtime, block_dim=3, launch_aicpu_num=1)
-        runner.print_handshake_results(runtime)
-        runtime.validate_and_cleanup()
-        runner.finalize()
+        register_kernel(0, kernel_add)
+        register_kernel(1, kernel_add_scalar)
+        register_kernel(2, kernel_mul)
+
+        launch_graph(graph, aicpu_thread_num=1, block_dim=1,
+                     device_id=0, aicpu_binary=aicpu_bytes,
+                     aicore_binary=aicore_bytes)
+
+        runtime.finalize()
     """
+
+    global _lib
+
     # If bytes are provided, write to temporary file
     if isinstance(lib_path, bytes):
         with tempfile.NamedTemporaryFile(delete=False, suffix='.so') as f:
@@ -311,15 +333,11 @@ def load_runtime(lib_path: Union[str, Path, bytes]) -> tuple:
             lib_path = f.name
 
     loader = RuntimeLibraryLoader(lib_path)
-    lib = loader.lib
+    _lib = loader.lib
 
-    # Create wrapper classes with the loaded library
-    class _DeviceRunner(DeviceRunner):
-        def __init__(self):
-            super().__init__(lib)
-
+    # Create wrapper class with the loaded library
     class _Runtime(Runtime):
         def __init__(self):
-            super().__init__(lib)
+            super().__init__(_lib)
 
-    return _DeviceRunner, _Runtime
+    return _Runtime

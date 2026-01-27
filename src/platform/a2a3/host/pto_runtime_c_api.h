@@ -8,7 +8,7 @@
  * - All functions use C linkage (extern "C")
  * - Opaque pointers hide C++ implementation details
  * - Error codes: 0 = success, negative = error
- * - Memory management: C++ owns all Graph and device memory
+ * - Memory management: User allocates Graph with malloc(GetGraphSize())
  */
 
 #ifndef PTO_RUNTIME_C_API_H
@@ -32,98 +32,91 @@ typedef void* GraphHandle;
 /* =========================================================================== */
 
 /**
+ * Get the size of Graph structure for memory allocation.
+ *
+ * User should allocate: Graph* g = (Graph*)malloc(GetGraphSize());
+ *
+ * @return Size of Graph structure in bytes
+ */
+size_t GetGraphSize(void);
+
+/**
  * Initialize a graph for the basic example.
  *
- * Takes a graph handle and initializes it with the example graph structure
- * (4 tasks with dependencies). C++ allocates device tensors, builds the graph,
- * and initializes data.
+ * Uses placement new to construct Graph in user-allocated memory.
+ * Builds the task graph, allocates device tensors, initializes data.
+ * Does NOT initialize device runner - that happens in launch_graph().
  *
- * @param graph  Graph handle to initialize (will be filled by C++)
+ * @param graph  User-allocated memory of size GetGraphSize()
  * @return 0 on success, -1 on failure
  */
 int InitGraph(GraphHandle graph);
 
 /**
- * Validate results and cleanup resources.
- *
- * Copies results from device, validates correctness, frees device tensors,
- * and deletes the graph structure.
- *
- * @param graph  Graph handle to validate and cleanup (will be deleted)
- * @return 0 on success, -1 on failure
- */
-int ValidateGraph(GraphHandle graph);
-
-/* =========================================================================== */
-/* DeviceRunner API */
-/* =========================================================================== */
-
-/**
- * Initialize the device runner.
- *
- * Must be called before any device operations.
- * Uses the DeviceRunner singleton internally.
- *
- * @param device_id              Device ID (0-15)
- * @param aicpu_binary           Binary data of AICPU shared object
- * @param aicpu_size             Size of AICPU binary in bytes
- * @param aicore_binary          Binary data of AICore kernel
- * @param aicore_size            Size of AICore binary in bytes
- * @param pto_isa_root           Path to PTO-ISA root directory (headers location)
- * @return 0 on success, error code on failure
- */
-int DeviceRunner_Init(int device_id,
-                      const uint8_t* aicpu_binary, size_t aicpu_size,
-                      const uint8_t* aicore_binary, size_t aicore_size,
-                      const char* pto_isa_root);
-
-/**
  * Execute a graph on the device.
  *
- * Uses the DeviceRunner singleton internally.
+ * Initializes DeviceRunner singleton (if first call), registers kernel
+ * addresses, copies graph to device, launches kernels, synchronizes,
+ * and copies graph back from device.
  *
- * @param graph            Graph handle to execute
+ * @param graph            Initialized graph handle
+ * @param aicpu_thread_num Number of AICPU scheduler threads
  * @param block_dim        Number of blocks (1 block = 1 AIC + 2 AIV)
- * @param launch_aicpu_num Number of AICPU instances to launch (default 1)
+ * @param device_id        Device ID (0-15)
+ * @param aicpu_binary     AICPU shared object binary data
+ * @param aicpu_size       Size of AICPU binary in bytes
+ * @param aicore_binary    AICore kernel binary data
+ * @param aicore_size      Size of AICore binary in bytes
  * @return 0 on success, error code on failure
  */
-int DeviceRunner_Run(GraphHandle graph, int block_dim, int launch_aicpu_num);
+int launch_graph(GraphHandle graph,
+                 int aicpu_thread_num, int block_dim,
+                 int device_id,
+                 const uint8_t* aicpu_binary, size_t aicpu_size,
+                 const uint8_t* aicore_binary, size_t aicore_size);
 
 /**
- * Print handshake results from device.
+ * Finalize and cleanup a graph instance.
  *
- * Uses the DeviceRunner singleton internally.
+ * Validates results, frees device tensors, calls Graph destructor.
+ * After this call, user can free(graph).
  *
- * @param graph  Graph handle whose handshake results should be printed
+ * @param graph  Graph handle to finalize
+ * @return 0 on success, -1 on failure
  */
-void DeviceRunner_PrintHandshakeResults(GraphHandle graph);
+int FinalizeGraph(GraphHandle graph);
 
 /**
- * Cleanup all resources and finalize the device runner.
+ * Set device and create streams for memory operations.
  *
- * Uses the DeviceRunner singleton internally.
+ * Must be called before InitGraph() to enable device tensor allocation.
+ * Only performs minimal initialization:
+ * - rtSetDevice(device_id)
+ * - Create AICPU and AICore streams
  *
+ * Binary loading happens later in launch_graph().
+ *
+ * @param device_id  Device ID (0-15)
  * @return 0 on success, error code on failure
  */
-int DeviceRunner_Finalize(void);
+int set_device(int device_id);
 
 /**
- * Compile and load a kernel at runtime.
+ * Register a kernel binary for a func_id.
  *
- * Uses the DeviceRunner singleton internally.
+ * Receives pre-extracted .text section binary data from Python,
+ * allocates device GM memory, copies the binary to device,
+ * and stores the GM address for later use by launch_graph().
  *
- * @param func_id       Function identifier for this kernel
- * @param kernel_path   Path to kernel source file (.cpp)
- * @param core_type     Core type: 0=AIC, 1=AIV (default 1)
+ * @param func_id   Function identifier (0, 1, 2, ...)
+ * @param bin_data  Kernel .text section binary data
+ * @param bin_size  Size of binary data in bytes
  * @return 0 on success, error code on failure
  */
-int DeviceRunner_CompileAndLoadKernel(int func_id,
-                                      const char* kernel_path,
-                                      int core_type);
+int RegisterKernel(int func_id, const uint8_t* bin_data, size_t bin_size);
 
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif
 
 #endif  /* PTO_RUNTIME_C_API_H */
-
