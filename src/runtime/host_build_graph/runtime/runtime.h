@@ -45,6 +45,10 @@
 #define RUNTIME_MAX_WORKER 72  // 24 AIC + 48 AIV cores
 #endif
 
+#ifndef RUNTIME_MAX_TENSOR_PAIRS
+#define RUNTIME_MAX_TENSOR_PAIRS 64
+#endif
+
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -101,6 +105,16 @@ struct Handshake {
 enum class CoreType : int {
     AIC = 0,  // AICore Compute
     AIV = 1   // AICore Vector
+};
+
+/**
+ * Tensor pair for tracking host-device memory mappings.
+ * Used for copy-back during finalize.
+ */
+struct TensorPair {
+    void* hostPtr;
+    void* devPtr;
+    size_t size;
 };
 
 /**
@@ -165,6 +179,10 @@ private:
     // Initial ready tasks (computed once, read-only after)
     int initial_ready_tasks[RUNTIME_MAX_TASKS];
     int initial_ready_count;
+
+  // Tensor pairs for host-device memory tracking
+  TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
+  int tensor_pair_count;
 
 public:
     /**
@@ -240,6 +258,77 @@ public:
      * Shows task table with fanin/fanout information.
      */
     void print_runtime() const;
+
+    // =========================================================================
+    // Device Memory Management
+    // =========================================================================
+
+    /**
+     * Allocate device memory.
+     *
+     * @param size  Size in bytes to allocate
+     * @return Device pointer on success, nullptr on failure
+     */
+    void* DeviceMalloc(size_t size);
+
+    /**
+     * Free device memory.
+     *
+     * @param devPtr  Device pointer to free
+     */
+    void DeviceFree(void* devPtr);
+
+    /**
+     * Copy data from host to device.
+     *
+     * @param devPtr   Device destination pointer
+     * @param hostPtr  Host source pointer
+     * @param size     Size in bytes to copy
+     * @return 0 on success, error code on failure
+     */
+    int CopyToDevice(void* devPtr, const void* hostPtr, size_t size);
+
+    /**
+     * Copy data from device to host.
+     *
+     * @param hostPtr  Host destination pointer
+     * @param devPtr   Device source pointer
+     * @param size     Size in bytes to copy
+     * @return 0 on success, error code on failure
+     */
+    int CopyFromDevice(void* hostPtr, const void* devPtr, size_t size);
+
+    // =========================================================================
+    // Tensor Pair Management
+    // =========================================================================
+
+    /**
+     * Record a host-device tensor pair for copy-back during finalize.
+     *
+     * @param hostPtr  Host memory pointer (destination for copy-back)
+     * @param devPtr   Device memory pointer (source for copy-back)
+     * @param size     Size of tensor in bytes
+     */
+    void RecordTensorPair(void* hostPtr, void* devPtr, size_t size);
+
+    /**
+     * Get pointer to tensor pairs array.
+     *
+     * @return Pointer to tensor pairs array
+     */
+    TensorPair* GetTensorPairs();
+
+    /**
+     * Get number of recorded tensor pairs.
+     *
+     * @return Number of tensor pairs
+     */
+    int GetTensorPairCount() const;
+
+    /**
+     * Clear all recorded tensor pairs.
+     */
+    void ClearTensorPairs();
 };
 
 #endif  // RUNTIME_H

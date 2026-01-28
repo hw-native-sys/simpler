@@ -179,3 +179,89 @@ class PTOCompiler:
         cmd.extend(["-o", output_path, source_path])
 
         return cmd
+
+    def compile_orchestration(
+        self,
+        source_path: str,
+        extra_include_dirs: Optional[List[str]] = None
+    ) -> str:
+        """
+        Compile an orchestration function to a shared library (.so).
+
+        The orchestration function must have signature:
+            int FuncName(Runtime* runtime, uint64_t* args, int arg_count);
+
+        Args:
+            source_path: Path to orchestration source file (.cpp)
+            extra_include_dirs: Additional include directories (must include
+                               paths to runtime.h and devicerunner.h)
+
+        Returns:
+            Path to compiled .so file (in /tmp)
+
+        Raises:
+            FileNotFoundError: If source file not found
+            RuntimeError: If compilation fails
+        """
+        source_path = os.path.abspath(source_path)
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Source file not found: {source_path}")
+
+        # Generate output path
+        timestamp = int(time.time() * 1000)
+        output_path = f"/tmp/orch_{timestamp}_{os.getpid()}.so"
+
+        # Build compilation command (using g++)
+        cmd = [
+            "g++",
+            "-shared", "-fPIC",
+            "-O3", "-g",
+            "-std=c++17",
+        ]
+
+        # Add include dirs
+        if extra_include_dirs:
+            for inc_dir in extra_include_dirs:
+                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+
+        # Add Ascend runtime include
+        ascend_include = os.path.join(self.ascend_home_path, "include")
+        cmd.append(f"-I{ascend_include}")
+
+        # Output and input
+        cmd.extend(["-o", output_path, source_path])
+
+        # Print compilation command
+        print(f"\n{'='*80}")
+        print(f"[Orchestration] Compiling: {source_path}")
+        print(f"  Command: {' '.join(cmd)}")
+        print(f"{'='*80}\n")
+
+        # Execute
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True
+            )
+
+            if result.stdout:
+                print(f"[Orchestration] stdout:\n{result.stdout}")
+            if result.stderr:
+                print(f"[Orchestration] stderr:\n{result.stderr}")
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"Orchestration compilation failed with exit code {result.returncode}:\n"
+                    f"{result.stderr}"
+                )
+
+        except FileNotFoundError:
+            raise RuntimeError("g++ compiler not found. Please install g++.")
+
+        # Verify output file exists
+        if not os.path.isfile(output_path):
+            raise RuntimeError(f"Compilation succeeded but output file not found: {output_path}")
+
+        print(f"[Orchestration] Compilation successful: {output_path}")
+        return output_path

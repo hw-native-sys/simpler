@@ -27,6 +27,18 @@ extern "C" {
  */
 typedef void* RuntimeHandle;
 
+/**
+ * Orchestration function signature.
+ *
+ * @param runtime   RuntimeHandle (opaque pointer to Runtime)
+ * @param args      Unified argument array:
+ *                  - args[0..input_count-1]: device pointers (cast to uint64_t)
+ *                  - args[input_count..]: additional arguments
+ * @param arg_count Total number of arguments
+ * @return 0 on success, negative on error
+ */
+typedef int (*OrchestrationFunc)(void* runtime, uint64_t* args, int arg_count);
+
 /* ===========================================================================
  */
 /* Runtime API */
@@ -43,16 +55,61 @@ typedef void* RuntimeHandle;
 size_t GetRuntimeSize(void);
 
 /**
- * Initialize a runtime for the basic example.
+ * Initialize a runtime with dynamic orchestration.
  *
  * Uses placement new to construct Runtime in user-allocated memory.
- * Builds the task runtime, allocates device tensors, initializes data.
- * Does NOT initialize device runner - that happens in launch_runtime().
+ * Calls orchestration function to build the task graph.
+ * The orchestration function is responsible for device memory management.
  *
- * @param runtime  User-allocated memory of size GetRuntimeSize()
+ * @param runtime         User-allocated memory of size GetRuntimeSize()
+ * @param orch_func       Orchestration function to build task graph
+ * @param func_args       Arguments for orchestration (host pointers, sizes, etc.)
+ * @param func_args_count Number of arguments
  * @return 0 on success, -1 on failure
  */
-int InitRuntime(RuntimeHandle runtime);
+int InitRuntime(RuntimeHandle runtime,
+                OrchestrationFunc orch_func,
+                uint64_t* func_args,
+                int func_args_count);
+
+/* =========================================================================== */
+/* Device Memory API (for use by orchestration functions) */
+/* =========================================================================== */
+
+/**
+ * Allocate device memory.
+ *
+ * @param size  Size in bytes to allocate
+ * @return Device pointer on success, NULL on failure
+ */
+void* DeviceMalloc(size_t size);
+
+/**
+ * Free device memory.
+ *
+ * @param devPtr  Device pointer to free
+ */
+void DeviceFree(void* devPtr);
+
+/**
+ * Copy data from host to device.
+ *
+ * @param devPtr   Device destination pointer
+ * @param hostPtr  Host source pointer
+ * @param size     Size in bytes to copy
+ * @return 0 on success, error code on failure
+ */
+int CopyToDevice(void* devPtr, const void* hostPtr, size_t size);
+
+/**
+ * Copy data from device to host.
+ *
+ * @param hostPtr  Host destination pointer
+ * @param devPtr   Device source pointer
+ * @param size     Size in bytes to copy
+ * @return 0 on success, error code on failure
+ */
+int CopyFromDevice(void* hostPtr, const void* devPtr, size_t size);
 
 /**
  * Execute a runtime on the device.

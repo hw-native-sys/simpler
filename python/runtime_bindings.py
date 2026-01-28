@@ -27,20 +27,25 @@ Usage:
 
 from ctypes import (
     CDLL,
+    CFUNCTYPE,
     POINTER,
     c_int,
     c_void_p,
     c_uint8,
+    c_uint64,
     c_size_t,
 )
 from pathlib import Path
-from typing import Union
+from typing import Union, List, Callable, Optional
 import ctypes
 import tempfile
 
 
 # Module-level library reference
 _lib = None
+
+# Orchestration function type: (runtime, args, arg_count) -> int
+OrchestrationFunc = CFUNCTYPE(c_int, c_void_p, POINTER(c_uint64), c_int)
 
 
 # ============================================================================
@@ -69,7 +74,7 @@ class RuntimeLibraryLoader:
             raise FileNotFoundError(f"Library not found: {lib_path}")
 
         self.lib_path = lib_path
-        self.lib = CDLL(str(lib_path))
+        self.lib = CDLL(str(lib_path), mode=ctypes.RTLD_GLOBAL)
         self._setup_functions()
 
     def _setup_functions(self):
@@ -79,8 +84,13 @@ class RuntimeLibraryLoader:
         self.lib.GetRuntimeSize.argtypes = []
         self.lib.GetRuntimeSize.restype = c_size_t
 
-        # InitRuntime - placement new + build runtime
-        self.lib.InitRuntime.argtypes = [c_void_p]
+        # InitRuntime - placement new + build runtime with orchestration
+        self.lib.InitRuntime.argtypes = [
+            c_void_p,               # runtime
+            OrchestrationFunc,      # orch_func
+            POINTER(c_uint64),      # func_args
+            c_int,                  # func_args_count
+        ]
         self.lib.InitRuntime.restype = c_int
 
         # launch_runtime - device init + execute runtime
@@ -138,19 +148,49 @@ class Runtime:
         self._buffer = ctypes.create_string_buffer(size)
         self._handle = ctypes.cast(self._buffer, c_void_p)
 
-    def initialize(self) -> None:
+    def initialize(
+        self,
+        orch_func: Callable,
+        func_args: Optional[List[int]] = None
+    ) -> None:
         """
 
-        Initialize the runtime structure.
+        Initialize the runtime structure with dynamic orchestration.
 
-        Calls InitRuntime() in C++ which uses placement new to construct
-        the Runtime, builds tasks, allocates device tensors, and initializes data.
+        Calls InitRuntime() in C++ which calls the orchestration function.
+        The orchestration function is responsible for:
+        1. Allocating device memory
+        2. Copying data to device
+        3. Building the task graph
+        4. Recording tensor pairs for copy-back
+
+        Args:
+            orch_func: Orchestration function to build task graph.
+                       Signature: int func(runtime, args, arg_count)
+            func_args: Arguments for orchestration (host pointers, sizes, etc.)
 
         Raises:
             RuntimeError: If initialization fails
         """
 
-        rc = self.lib.InitRuntime(self._handle)
+        func_args = func_args or []
+        func_args_count = len(func_args)
+
+        # Convert func_args to ctypes array
+        if func_args_count > 0:
+            func_args_array = (c_uint64 * func_args_count)(*func_args)
+        else:
+            func_args_array = None
+
+        # Store orch_func reference to prevent garbage collection
+        self._orch_func = OrchestrationFunc(orch_func)
+
+        rc = self.lib.InitRuntime(
+            self._handle,
+            self._orch_func,
+            func_args_array,
+            func_args_count
+        )
         if rc != 0:
             raise RuntimeError(f"InitRuntime failed: {rc}")
 

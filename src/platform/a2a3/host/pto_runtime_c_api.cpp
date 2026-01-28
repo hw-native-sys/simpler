@@ -13,6 +13,9 @@
 #include "devicerunner.h"
 #include "runtime.h"
 
+// Internal typedef matching the C++ OrchestrationFunc signature
+typedef int (*OrchestrationFuncInternal)(Runtime* runtime, uint64_t* args, int arg_count);
+
 extern "C" {
 
 /* ===========================================================================
@@ -20,7 +23,10 @@ extern "C" {
 /* Runtime Implementation Functions (defined in runtimemaker.cpp) */
 /* ===========================================================================
  */
-int InitRuntimeImpl(Runtime* runtime);
+int InitRuntimeImpl(Runtime* runtime,
+                    OrchestrationFuncInternal orch_func,
+                    uint64_t* func_args,
+                    int func_args_count);
 int ValidateRuntimeImpl(Runtime* runtime);
 
 /* ===========================================================================
@@ -31,17 +37,88 @@ int ValidateRuntimeImpl(Runtime* runtime);
 
 size_t GetRuntimeSize(void) { return sizeof(Runtime); }
 
-int InitRuntime(RuntimeHandle runtime) {
+int InitRuntime(RuntimeHandle runtime,
+                OrchestrationFunc orch_func,
+                uint64_t* func_args,
+                int func_args_count) {
     if (runtime == NULL) {
         return -1;
     }
     try {
         // Placement new to construct Runtime in user-allocated memory
         Runtime* r = new (runtime) Runtime();
-        return InitRuntimeImpl(r);
+        // Cast the C-style function pointer to internal C++ type
+        OrchestrationFuncInternal orch_internal =
+            reinterpret_cast<OrchestrationFuncInternal>(orch_func);
+        return InitRuntimeImpl(r, orch_internal, func_args, func_args_count);
     } catch (...) {
         return -1;
     }
+}
+
+/* =========================================================================== */
+/* Device Memory API Implementation */
+/* =========================================================================== */
+
+void* DeviceMalloc(size_t size) {
+    try {
+        DeviceRunner& runner = DeviceRunner::Get();
+        return runner.AllocateTensor(size);
+    } catch (...) {
+        return NULL;
+    }
+}
+
+void* DeviceMalloc_CApi(size_t size) {
+    return DeviceMalloc(size);
+}
+
+void DeviceFree(void* devPtr) {
+    if (devPtr == NULL) {
+        return;
+    }
+    try {
+        DeviceRunner& runner = DeviceRunner::Get();
+        runner.FreeTensor(devPtr);
+    } catch (...) {
+        // Ignore errors during free
+    }
+}
+
+void DeviceFree_CApi(void* devPtr) {
+    DeviceFree(devPtr);
+}
+
+int CopyToDevice(void* devPtr, const void* hostPtr, size_t size) {
+    if (devPtr == NULL || hostPtr == NULL) {
+        return -1;
+    }
+    try {
+        DeviceRunner& runner = DeviceRunner::Get();
+        return runner.CopyToDevice(devPtr, hostPtr, size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int CopyToDevice_CApi(void* devPtr, const void* hostPtr, size_t size) {
+    return CopyToDevice(devPtr, hostPtr, size);
+}
+
+int CopyFromDevice(void* hostPtr, const void* devPtr, size_t size) {
+    if (hostPtr == NULL || devPtr == NULL) {
+        return -1;
+    }
+    try {
+        DeviceRunner& runner = DeviceRunner::Get();
+        return runner.CopyFromDevice(hostPtr, devPtr, size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int CopyFromDevice_CApi(void* hostPtr, const void* devPtr, size_t size) {
+    return CopyFromDevice(hostPtr, devPtr, size);
 }
 
 int launch_runtime(RuntimeHandle runtime,

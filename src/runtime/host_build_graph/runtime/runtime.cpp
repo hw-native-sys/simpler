@@ -7,6 +7,14 @@
 
 #include "runtime.h"
 
+// External C API functions for device memory operations (defined in pto_runtime_c_api.cpp)
+extern "C" {
+void* DeviceMalloc_CApi(size_t size);
+void DeviceFree_CApi(void* devPtr);
+int CopyToDevice_CApi(void* devPtr, const void* hostPtr, size_t size);
+int CopyFromDevice_CApi(void* hostPtr, const void* devPtr, size_t size);
+}
+
 // =============================================================================
 // Constructor
 // =============================================================================
@@ -31,6 +39,7 @@ Runtime::Runtime() {
     worker_count = 0;
     block_dim = 0;
     scheCpuNum = 1;
+    tensor_pair_count = 0;
 }
 
 // =============================================================================
@@ -179,4 +188,52 @@ void Runtime::print_runtime() const {
     printf(
         "======================================================================"
         "==========\n\n");
+}
+
+// =============================================================================
+// Device Memory Management
+// =============================================================================
+
+void* Runtime::DeviceMalloc(size_t size) {
+    return DeviceMalloc_CApi(size);
+}
+
+void Runtime::DeviceFree(void* devPtr) {
+    DeviceFree_CApi(devPtr);
+}
+
+int Runtime::CopyToDevice(void* devPtr, const void* hostPtr, size_t size) {
+    return CopyToDevice_CApi(devPtr, hostPtr, size);
+}
+
+int Runtime::CopyFromDevice(void* hostPtr, const void* devPtr, size_t size) {
+    return CopyFromDevice_CApi(hostPtr, devPtr, size);
+}
+
+// =============================================================================
+// Tensor Pair Management
+// =============================================================================
+
+void Runtime::RecordTensorPair(void* hostPtr, void* devPtr, size_t size) {
+    if (tensor_pair_count >= RUNTIME_MAX_TENSOR_PAIRS) {
+        fprintf(stderr, "[Runtime] ERROR: Tensor pairs full (max=%d)\n", RUNTIME_MAX_TENSOR_PAIRS);
+        return;
+    }
+    tensor_pairs[tensor_pair_count].hostPtr = hostPtr;
+    tensor_pairs[tensor_pair_count].devPtr = devPtr;
+    tensor_pairs[tensor_pair_count].size = size;
+    tensor_pair_count++;
+    printf("Recorded tensor pair: host=%p dev=%p size=%zu\n", hostPtr, devPtr, size);
+}
+
+TensorPair* Runtime::GetTensorPairs() {
+    return tensor_pairs;
+}
+
+int Runtime::GetTensorPairCount() const {
+    return tensor_pair_count;
+}
+
+void Runtime::ClearTensorPairs() {
+    tensor_pair_count = 0;
 }
