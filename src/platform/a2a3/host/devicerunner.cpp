@@ -379,7 +379,7 @@ int DeviceRunner::Finalize() {
         return 0;
     }
 
-    // Cleanup kernel args (deviceArgs, graphArgs if any)
+    // Cleanup kernel args (deviceArgs, runtimeArgs if any)
     kernelArgs_.FinalizeDeviceArgs();
 
     // Cleanup AICPU SO

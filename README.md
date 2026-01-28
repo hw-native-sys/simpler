@@ -1,6 +1,6 @@
-# PTO Runtime - Task Graph Execution Framework
+# PTO Runtime - Task Runtime Execution Framework
 
-Modular runtime for building and executing task dependency graphs on Ascend devices with coordinated AICPU and AICore execution. Three independently compiled programs work together through clearly defined APIs.
+Modular runtime for building and executing task dependency runtimes on Ascend devices with coordinated AICPU and AICore execution. Three independently compiled programs work together through clearly defined APIs.
 
 ## Architecture Overview
 
@@ -23,7 +23,7 @@ The PTO Runtime consists of **three separate programs** that communicate through
 │   (src/host/)    │  │  (AICPU + AICore)│
 ├──────────────────┤  └──────────────────┘
 │ DeviceRunner     │         │
-│ Graph            │         │
+│ Runtime          │         │
 │ MemoryAllocator  │    Loaded at runtime
 │ C API            │         │
 └────────┬─────────┘         │
@@ -44,7 +44,7 @@ The PTO Runtime consists of **three separate programs** that communicate through
 ### 1. Host Runtime (`src/host/`)
 **C++ library** - Device orchestration and management
 - `DeviceRunner`: Singleton managing device operations
-- `Graph`: Task dependency graph data structure
+- `Runtime`: Task dependency runtime data structure
 - `MemoryAllocator`: Device tensor memory management
 - `pto_runtime_c_api.h`: Pure C API for Python bindings
 - Compiled to shared library (.so) at runtime
@@ -54,7 +54,7 @@ The PTO Runtime consists of **three separate programs** that communicate through
 - Host ↔ Device data transfer
 - AICPU kernel launching and configuration
 - AICore kernel registration and loading
-- Graph execution workflow coordination
+- Runtime execution workflow coordination
 
 ### 2. AICPU Kernel (`src/aicpu/`)
 **Device program** - Task scheduler running on AICPU processor
@@ -91,7 +91,7 @@ DeviceRunner& runner = DeviceRunner::Get();
 runner.Init(device_id, num_cores, aicpu_bin, aicore_bin, pto_isa_root);
 runner.AllocateTensor(bytes);
 runner.CopyToDevice(device_ptr, host_ptr, bytes);
-runner.Run(graph);
+runner.Run(runtime);
 runner.Finalize();
 ```
 
@@ -99,22 +99,21 @@ runner.Finalize();
 ```c
 int DeviceRunner_Init(device_id, num_cores, aicpu_binary, aicpu_size,
                       aicore_binary, aicore_size, pto_isa_root);
-int DeviceRunner_Run(graph_handle, launch_aicpu_num);
-int InitGraph(graph_handle);
-int ValidateGraph(graph_handle);
+int DeviceRunner_Run(runtime_handle, launch_aicpu_num);
+int InitRuntime(runtime_handle);
+int FinalizeRuntime(runtime_handle);
 int DeviceRunner_Finalize();
 ```
 
 ### Layer 3: Python API (`python/runtime_bindings.py`)
 ```python
-DeviceRunner, Graph = load_runtime(host_binary)
-runner = DeviceRunner()
-runner.init(device_id, num_cores, aicpu_binary, aicore_binary, pto_isa_root)
-graph = Graph()
-graph.initialize()
-runner.run(graph)
-graph.validate_and_cleanup()
-runner.finalize()
+Runtime = load_runtime(host_binary)
+runtime = Runtime()
+runtime.initialize()
+launch_runtime(runtime, aicpu_thread_num=1, block_dim=1,
+               device_id=device_id, aicpu_binary=aicpu_bytes,
+               aicore_binary=aicore_bytes)
+runtime.finalize()
 ```
 
 ## Directory Structure
@@ -145,10 +144,10 @@ runtime/
 │
 ├── examples/basic/                  # Complete working example
 │   ├── main.py                      # Python orchestration
-│   ├── host/graphmaker.cpp          # C++ graph builder & validator
+│   ├── host/runtimemaker.cpp        # C++ runtime builder & validator
 │   ├── aicpu/execute.cpp            # Example scheduler
-│   ├── graph/                       # Task graph definitions
-│   │   ├── graph.h/cpp              # Task graph and handshake structures
+│   ├── runtime/                     # Task runtime definitions
+│   │   ├── runtime.h/cpp            # Task runtime and handshake structures
 │   │   └── kernel_args.h
 │   └── kernels/aiv/                 # Example kernels
 │       ├── kernel_add.cpp
@@ -211,20 +210,19 @@ aicpu_bin = compiler.compile("aicpu", [...include_dirs...], [...source_dirs...])
 host_bin = compiler.compile("host", [...include_dirs...], [...source_dirs...])
 
 # Load and initialize runtime
-DeviceRunner, Graph = load_runtime(host_bin)
-runner = DeviceRunner()
-runner.init(device_id=9, num_cores=3,
-           aicpu_binary=aicpu_bin,
-           aicore_binary=aicore_bin,
-           pto_isa_root="/path/to/pto-isa")
+Runtime = load_runtime(host_bin)
+runtime = Runtime()
+runtime.initialize()  # C++ builds runtime and allocates tensors
 
-# Create and execute graph
-graph = Graph()
-graph.initialize()  # C++ builds graph and allocates tensors
-runner.run(graph, launch_aicpu_num=1)  # Execute on device
-graph.validate_and_cleanup()  # Verify and cleanup
+# Execute runtime on device
+launch_runtime(runtime,
+               aicpu_thread_num=1,
+               block_dim=1,
+               device_id=9,
+               aicpu_binary=aicpu_bin,
+               aicore_binary=aicore_bin)
 
-runner.finalize()
+runtime.finalize()  # Verify and cleanup
 ```
 
 ### Running the Example
@@ -238,16 +236,16 @@ This example:
 1. Compiles AICPU, AICore, and Host binaries using BinaryCompiler
 2. Loads the host runtime library
 3. Initializes DeviceRunner with compiled binaries
-4. Creates a task graph: `f = (a + b + 1)(a + b + 2)` with 4 tasks and dependencies
+4. Creates a task runtime: `f = (a + b + 1)(a + b + 2)` with 4 tasks and dependencies
 5. Executes on device (AICPU scheduling, AICore computing)
 6. Validates results and cleans up
 
 Expected output:
 ```
-=== Creating and Initializing Graph ===
+=== Creating and Initializing Runtime ===
 Formula: (a + b + 1)(a + b + 2)
 
-=== Executing Graph on Device ===
+=== Executing Runtime on Device ===
 
 === Validating Results and Cleaning Up ===
 ✓ SUCCESS: All 16384 elements are correct (42.0)
@@ -283,12 +281,12 @@ runner.init(device_id, num_cores, aicpu_binary, aicore_binary, pto_isa_root)
   └─→ DeviceRunner singleton ready
 ```
 
-### 3. Graph Building Phase
+### 3. Runtime Building Phase
 ```
-graph.initialize()
+runtime.initialize()
   │
-  └─→ InitGraph (C API)
-       └─→ InitGraphImpl (C++)
+  └─→ InitRuntime (C API)
+       └─→ InitRuntimeImpl (C++)
             ├─→ Compile kernels at runtime (CompileAndLoadKernel)
             │    ├─→ KernelCompiler calls ccec
             │    ├─→ Load .o to device GM memory
@@ -296,17 +294,18 @@ graph.initialize()
             │
             ├─→ Allocate device tensors via MemoryAllocator
             ├─→ Copy input data to device
-            ├─→ Build task graph with dependencies
-            └─→ Return Graph pointer
+            ├─→ Build task runtime with dependencies
+            └─→ Return Runtime pointer
 ```
 
 ### 4. Execution Phase
 ```
-runner.run(graph, launch_aicpu_num=1)
+launch_runtime(runtime, aicpu_thread_num=1, block_dim=1, device_id=device_id,
+               aicpu_binary=aicpu_bytes, aicore_binary=aicore_bytes)
   │
-  └─→ DeviceRunner_Run (C API)
+  └─→ launch_runtime (C API)
        │
-       ├─→ Copy Graph to device memory
+       ├─→ Copy Runtime to device memory
        │
        ├─→ LaunchAiCpuKernel (init kernel)
        │    └─→ Execute on AICPU: Initialize handshake
@@ -328,14 +327,14 @@ runner.run(graph, launch_aicpu_num=1)
 
 ### 5. Validation Phase
 ```
-graph.validate_and_cleanup()
+runtime.finalize()
   │
-  └─→ ValidateGraph (C API)
-       └─→ ValidateGraphImpl (C++)
+  └─→ FinalizeRuntime (C API)
+       └─→ FinalizeRuntimeImpl (C++)
             ├─→ Copy results from device to host
             ├─→ Verify correctness (compare with expected values)
             ├─→ Free all device tensors
-            ├─→ Delete graph
+            ├─→ Delete runtime
             └─→ Return success/failure
 ```
 
@@ -370,9 +369,9 @@ struct Handshake {
 - Copy data between host and device
 - Launch AICPU and AICore kernels
 - Manage handshake buffers
-- Coordinate graph execution
+- Coordinate runtime execution
 
-**Graph**: Task dependency graph
+**Runtime**: Task dependency runtime
 - Add tasks with arguments and function IDs
 - Add dependencies between tasks (fanin/fanout)
 - Query task information and dependency structure
@@ -436,12 +435,12 @@ Full Python API with ctypes:
 
 ## Configuration
 
-### Compile-time Configuration (Graph Limits)
-In [examples/basic/graph/graph.h](examples/basic/graph/graph.h):
+### Compile-time Configuration (Runtime Limits)
+In [src/runtime/runtime/runtime.h](src/runtime/runtime/runtime.h):
 ```cpp
-#define GRAPH_MAX_TASKS 1024     // Maximum number of tasks
-#define GRAPH_MAX_ARGS 16        // Maximum arguments per task
-#define GRAPH_MAX_FANOUT 512     // Maximum successors per task
+#define RUNTIME_MAX_TASKS 1024     // Maximum number of tasks
+#define RUNTIME_MAX_ARGS 16        // Maximum arguments per task
+#define RUNTIME_MAX_FANOUT 512     // Maximum successors per task
 ```
 
 ### Runtime Configuration

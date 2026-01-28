@@ -1,14 +1,14 @@
 /**
  * PTO Runtime C API
  *
- * Pure C interface for Python ctypes bindings. Wraps C++ classes (Graph, DeviceRunner)
+ * Pure C interface for Python ctypes bindings. Wraps C++ classes (Runtime, DeviceRunner)
  * as opaque pointers and provides C functions to manipulate them.
  *
  * Key design:
  * - All functions use C linkage (extern "C")
  * - Opaque pointers hide C++ implementation details
  * - Error codes: 0 = success, negative = error
- * - Memory management: User allocates Graph with malloc(GetGraphSize())
+ * - Memory management: User allocates Runtime with malloc(GetRuntimeSize())
  */
 
 #ifndef PTO_RUNTIME_C_API_H
@@ -25,41 +25,41 @@ extern "C" {
  * Opaque pointer types for C interface.
  * These hide the C++ class implementations.
  */
-typedef void* GraphHandle;
+typedef void* RuntimeHandle;
 
 /* =========================================================================== */
-/* Graph API */
+/* Runtime API */
 /* =========================================================================== */
 
 /**
- * Get the size of Graph structure for memory allocation.
+ * Get the size of Runtime structure for memory allocation.
  *
- * User should allocate: Graph* g = (Graph*)malloc(GetGraphSize());
+ * User should allocate: Runtime* r = (Runtime*)malloc(GetRuntimeSize());
  *
- * @return Size of Graph structure in bytes
+ * @return Size of Runtime structure in bytes
  */
-size_t GetGraphSize(void);
+size_t GetRuntimeSize(void);
 
 /**
- * Initialize a graph for the basic example.
+ * Initialize a runtime for the basic example.
  *
- * Uses placement new to construct Graph in user-allocated memory.
- * Builds the task graph, allocates device tensors, initializes data.
- * Does NOT initialize device runner - that happens in launch_graph().
+ * Uses placement new to construct Runtime in user-allocated memory.
+ * Builds the task runtime, allocates device tensors, initializes data.
+ * Does NOT initialize device runner - that happens in launch_runtime().
  *
- * @param graph  User-allocated memory of size GetGraphSize()
+ * @param runtime  User-allocated memory of size GetRuntimeSize()
  * @return 0 on success, -1 on failure
  */
-int InitGraph(GraphHandle graph);
+int InitRuntime(RuntimeHandle runtime);
 
 /**
- * Execute a graph on the device.
+ * Execute a runtime on the device.
  *
  * Initializes DeviceRunner singleton (if first call), registers kernel
- * addresses, copies graph to device, launches kernels, synchronizes,
- * and copies graph back from device.
+ * addresses, copies runtime to device, launches kernels, synchronizes,
+ * and copies runtime back from device.
  *
- * @param graph            Initialized graph handle
+ * @param runtime         Initialized runtime handle
  * @param aicpu_thread_num Number of AICPU scheduler threads
  * @param block_dim        Number of blocks (1 block = 1 AIC + 2 AIV)
  * @param device_id        Device ID (0-15)
@@ -69,32 +69,32 @@ int InitGraph(GraphHandle graph);
  * @param aicore_size      Size of AICore binary in bytes
  * @return 0 on success, error code on failure
  */
-int launch_graph(GraphHandle graph,
+int launch_runtime(RuntimeHandle runtime,
                  int aicpu_thread_num, int block_dim,
                  int device_id,
                  const uint8_t* aicpu_binary, size_t aicpu_size,
                  const uint8_t* aicore_binary, size_t aicore_size);
 
 /**
- * Finalize and cleanup a graph instance.
+ * Finalize and cleanup a runtime instance.
  *
- * Validates results, frees device tensors, calls Graph destructor.
- * After this call, user can free(graph).
+ * Validates results, frees device tensors, calls Runtime destructor.
+ * After this call, user can free(runtime).
  *
- * @param graph  Graph handle to finalize
+ * @param runtime  Runtime handle to finalize
  * @return 0 on success, -1 on failure
  */
-int FinalizeGraph(GraphHandle graph);
+int FinalizeRuntime(RuntimeHandle runtime);
 
 /**
  * Set device and create streams for memory operations.
  *
- * Must be called before InitGraph() to enable device tensor allocation.
+ * Must be called before InitRuntime() to enable device tensor allocation.
  * Only performs minimal initialization:
  * - rtSetDevice(device_id)
  * - Create AICPU and AICore streams
  *
- * Binary loading happens later in launch_graph().
+ * Binary loading happens later in launch_runtime().
  *
  * @param device_id  Device ID (0-15)
  * @return 0 on success, error code on failure
@@ -106,7 +106,7 @@ int set_device(int device_id);
  *
  * Receives pre-extracted .text section binary data from Python,
  * allocates device GM memory, copies the binary to device,
- * and stores the GM address for later use by launch_graph().
+ * and stores the GM address for later use by launch_runtime().
  *
  * @param func_id   Function identifier (0, 1, 2, ...)
  * @param bin_data  Kernel .text section binary data

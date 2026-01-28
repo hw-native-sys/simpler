@@ -1,7 +1,7 @@
 /**
  * Runtime Class - Implementation
  *
- * Task dependency graph management with circular ready queue.
+ * Task dependency management with circular ready queue.
  * Follows patterns from pto_runtime.c for consistency.
  */
 

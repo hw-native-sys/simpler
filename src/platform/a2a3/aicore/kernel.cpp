@@ -34,7 +34,7 @@ class Runtime;
 *
 * Each core (AIC or AIV) gets its own handshake buffer indexed by blockIdx.
 *
-* @param graph Address of Graph structure in device memory
+* @param runtime Address of Runtime structure in device memory
 */
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime* runtime) {
     // Calculate blockIdx for this core

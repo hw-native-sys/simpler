@@ -34,7 +34,7 @@
 extern "C" {
 #endif
 
-// Static storage for tensor pointers (used by ValidateGraphImpl)
+// Static storage for tensor pointers (used by ValidateRuntimeImpl)
 static void* g_dev_a = nullptr;
 static void* g_dev_b = nullptr;
 static void* g_dev_c = nullptr;
@@ -52,13 +52,13 @@ static size_t g_tensor_bytes = 0;
  * @param runtime    Pointer to pre-constructed Runtime
  * @return 0 on success, -1 on failure
  */
-int InitGraphImpl(Runtime *runtime) {
+int InitRuntimeImpl(Runtime *runtime) {
     int rc = 0;
 
     // Initialize DeviceRunner
     DeviceRunner& runner = DeviceRunner::Get();
-    // Note: DeviceRunner should already be initialized by Python before calling InitGraph
-    // Note: Kernels should be registered via Python's runner.register_kernel() before calling InitGraph
+    // Note: DeviceRunner should already be initialized by Python before calling InitRuntime
+    // Note: Kernels should be registered via Python's runner.register_kernel() before calling InitRuntime
 
     // Allocate device tensors
     constexpr int ROWS = 128;
@@ -103,7 +103,7 @@ int InitGraphImpl(Runtime *runtime) {
     std::cout << "Initialized input tensors: a=2.0, b=3.0 (all elements)\n";
     std::cout << "Expected result: f = (2+3+1)*(2+3+2) = 6*7 = 42.0\n";
 
-    // Store tensor pointers for later use by ValidateGraphImpl
+    // Store tensor pointers for later use by ValidateRuntimeImpl
     g_dev_a = dev_a;
     g_dev_b = dev_b;
     g_dev_c = dev_c;
@@ -177,7 +177,7 @@ int InitGraphImpl(Runtime *runtime) {
     return 0;
 }
 
-int ValidateGraphImpl(Runtime *runtime) {
+int ValidateRuntimeImpl(Runtime *runtime) {
     if (runtime == nullptr) {
         std::cerr << "Error: Runtime pointer is null\n";
         return -1;
@@ -197,7 +197,7 @@ int ValidateGraphImpl(Runtime *runtime) {
 
     constexpr int ROWS = 128;
     constexpr int COLS = 128;
-    constexpr int SIZE = ROWS * COLS;  // Must match InitGraphImpl
+    constexpr int SIZE = ROWS * COLS;  // Must match InitRuntimeImpl
 
     // =========================================================================
     // VALIDATE RESULTS - Retrieve and verify output
@@ -253,8 +253,8 @@ int ValidateGraphImpl(Runtime *runtime) {
     runner.FreeTensor(dev_f);
     std::cout << "Freed all device tensors\n";
 
-    // Note: Runtime destructor is called by FinalizeGraph() after this returns
-    // User will call free() after FinalizeGraph()
+    // Note: Runtime destructor is called by FinalizeRuntime() after this returns
+    // User will call free() after FinalizeRuntime()
 
     // Clear global tensor pointers
     g_dev_a = g_dev_b = g_dev_c = g_dev_d = g_dev_e = g_dev_f = nullptr;

@@ -9,7 +9,7 @@
  * - Fanin (predecessor count)
  * - Fanout (array of successor task IDs)
  *
- * The graph maintains a ready queue for tasks with fanin == 0.
+ * The runtime maintains a ready queue for tasks with fanin == 0.
  *
  * Based on patterns from pto_runtime.h/c but simplified for educational
  * and lightweight scheduling use cases.
@@ -103,7 +103,7 @@ enum class CoreType : int {
 };
 
 /**
- * Task entry in the dependency graph
+ * Task entry in the runtime
  *
  * Each task has a unique ID (its index in the task array), arguments,
  * and dependency information (fanin/fanout).
@@ -138,11 +138,11 @@ typedef struct {
 // =============================================================================
 
 /**
- * Graph class for task dependency management
+ * Runtime class for task dependency management
  *
  * Maintains a fixed-size array of tasks and uses a Queue for ready tasks.
  * Tasks are allocated monotonically and never reused within the same
- * graph instance.
+ * runtime instance.
  *
  * Dependencies are managed manually via add_successor().
  */
@@ -210,7 +210,7 @@ public:
   Task *get_task(int task_id);
 
   /**
-   * Get the total number of tasks in the graph
+   * Get the total number of tasks in the runtime
    *
    * @return Total task count
    */
@@ -233,7 +233,7 @@ public:
   // =========================================================================
 
   /**
-   * Print the graph structure to stdout
+   * Print the runtime structure to stdout
    *
    * Shows task table with fanin/fanout information.
    */

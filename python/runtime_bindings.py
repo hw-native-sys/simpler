@@ -6,9 +6,9 @@ Provides a Pythonic interface to the PTO runtime via ctypes.
 Users must provide a pre-compiled libpto_runtime.so (built via binary_compiler.py).
 
 Usage:
-    from runtime_bindings import load_runtime, register_kernel, launch_graph
+    from runtime_bindings import load_runtime, register_kernel, launch_runtime
 
-    Graph = load_runtime("/path/to/libpto_runtime.so")
+    Runtime = load_runtime("/path/to/libpto_runtime.so")
 
     runtime = Runtime()
     runtime.initialize()
@@ -17,7 +17,7 @@ Usage:
     register_kernel(1, kernel_add_scalar)
     register_kernel(2, kernel_mul)
 
-    launch_graph(graph, aicpu_thread_num=1, block_dim=1,
+    launch_runtime(runtime, aicpu_thread_num=1, block_dim=1,
                  device_id=0, aicpu_binary=aicpu_bytes,
                  aicore_binary=aicore_bytes)
 
@@ -75,16 +75,16 @@ class RuntimeLibraryLoader:
     def _setup_functions(self):
         """Set up ctypes function signatures."""
 
-        # GetGraphSize - returns sizeof(Graph) for user allocation
-        self.lib.GetGraphSize.argtypes = []
-        self.lib.GetGraphSize.restype = c_size_t
+        # GetRuntimeSize - returns sizeof(Runtime) for user allocation
+        self.lib.GetRuntimeSize.argtypes = []
+        self.lib.GetRuntimeSize.restype = c_size_t
 
-        # InitGraph - placement new + build graph
-        self.lib.InitGraph.argtypes = [c_void_p]
-        self.lib.InitGraph.restype = c_int
+        # InitRuntime - placement new + build runtime
+        self.lib.InitRuntime.argtypes = [c_void_p]
+        self.lib.InitRuntime.restype = c_int
 
-        # launch_graph - device init + execute graph
-        self.lib.launch_graph.argtypes = [
+        # launch_runtime - device init + execute runtime
+        self.lib.launch_runtime.argtypes = [
             c_void_p,           # runtime
             c_int,              # aicpu_thread_num
             c_int,              # block_dim
@@ -94,11 +94,11 @@ class RuntimeLibraryLoader:
             POINTER(c_uint8),   # aicore_binary
             c_size_t,           # aicore_size
         ]
-        self.lib.launch_graph.restype = c_int
+        self.lib.launch_runtime.restype = c_int
 
-        # FinalizeGraph - validate + cleanup
-        self.lib.FinalizeGraph.argtypes = [c_void_p]
-        self.lib.FinalizeGraph.restype = c_int
+        # FinalizeRuntime - validate + cleanup
+        self.lib.FinalizeRuntime.argtypes = [c_void_p]
+        self.lib.FinalizeRuntime.restype = c_int
 
         # RegisterKernel - register kernel binary for func_id
         self.lib.RegisterKernel.argtypes = [c_int, POINTER(c_uint8), c_size_t]
@@ -133,8 +133,8 @@ class Runtime:
         """
 
         self.lib = lib
-        # Allocate buffer of size GetGraphSize() for placement new
-        size = lib.GetGraphSize()
+        # Allocate buffer of size GetRuntimeSize() for placement new
+        size = lib.GetRuntimeSize()
         self._buffer = ctypes.create_string_buffer(size)
         self._handle = ctypes.cast(self._buffer, c_void_p)
 
@@ -143,32 +143,32 @@ class Runtime:
 
         Initialize the runtime structure.
 
-        Calls InitGraph() in C++ which uses placement new to construct
+        Calls InitRuntime() in C++ which uses placement new to construct
         the Runtime, builds tasks, allocates device tensors, and initializes data.
 
         Raises:
             RuntimeError: If initialization fails
         """
 
-        rc = self.lib.InitGraph(self._handle)
+        rc = self.lib.InitRuntime(self._handle)
         if rc != 0:
-            raise RuntimeError(f"InitGraph failed: {rc}")
+            raise RuntimeError(f"InitRuntime failed: {rc}")
 
     def finalize(self) -> None:
         """
 
         Finalize and cleanup the runtime.
 
-        Calls FinalizeGraph() in C++ which validates computation results,
+        Calls FinalizeRuntime() in C++ which validates computation results,
         frees device tensors, and calls the Runtime destructor.
 
         Raises:
             RuntimeError: If finalization fails
         """
 
-        rc = self.lib.FinalizeGraph(self._handle)
+        rc = self.lib.FinalizeRuntime(self._handle)
         if rc != 0:
-            raise RuntimeError(f"FinalizeGraph failed: {rc}")
+            raise RuntimeError(f"FinalizeRuntime failed: {rc}")
 
     def __del__(self):
         """Clean up runtime resources."""
@@ -188,7 +188,7 @@ def register_kernel(func_id: int, binary_data: bytes) -> None:
 
     Receives pre-extracted .text section binary data,
     allocates device GM memory, copies the binary to device,
-    and stores the GM address for later use by launch_graph().
+    and stores the GM address for later use by launch_runtime().
 
     Args:
         func_id: Function identifier (0, 1, 2, ...)
@@ -223,7 +223,7 @@ def set_device(device_id: int) -> None:
     - rtSetDevice(device_id)
     - Create AICPU and AICore streams
 
-    Binary loading happens later in launch_graph().
+    Binary loading happens later in launch_runtime().
 
     Args:
         device_id: Device ID (0-15)
@@ -241,7 +241,7 @@ def set_device(device_id: int) -> None:
         raise RuntimeError(f"set_device failed: {rc}")
 
 
-def launch_graph(
+def launch_runtime(
     runtime: "Runtime",
     aicpu_thread_num: int,
     block_dim: int,
@@ -276,7 +276,7 @@ def launch_graph(
     aicpu_array = (c_uint8 * len(aicpu_binary)).from_buffer_copy(aicpu_binary)
     aicore_array = (c_uint8 * len(aicore_binary)).from_buffer_copy(aicore_binary)
 
-    rc = _lib.launch_graph(
+    rc = _lib.launch_runtime(
         runtime._handle,
         aicpu_thread_num,
         block_dim,
@@ -287,7 +287,7 @@ def launch_graph(
         len(aicore_binary),
     )
     if rc != 0:
-        raise RuntimeError(f"launch_graph failed: {rc}")
+        raise RuntimeError(f"launch_runtime failed: {rc}")
 
 
 # ============================================================================
@@ -306,9 +306,9 @@ def load_runtime(lib_path: Union[str, Path, bytes]) -> type:
         Runtime class initialized with the library
 
     Example:
-        from runtime_bindings import load_runtime, register_kernel, launch_graph
+        from runtime_bindings import load_runtime, register_kernel, launch_runtime
 
-        Graph = load_runtime("/path/to/libpto_runtime.so")
+        Runtime = load_runtime("/path/to/libpto_runtime.so")
 
         runtime = Runtime()
         runtime.initialize()
@@ -317,7 +317,7 @@ def load_runtime(lib_path: Union[str, Path, bytes]) -> type:
         register_kernel(1, kernel_add_scalar)
         register_kernel(2, kernel_mul)
 
-        launch_graph(graph, aicpu_thread_num=1, block_dim=1,
+        launch_runtime(runtime, aicpu_thread_num=1, block_dim=1,
                      device_id=0, aicpu_binary=aicpu_bytes,
                      aicore_binary=aicore_bytes)
 

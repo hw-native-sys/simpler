@@ -2,7 +2,7 @@
  * KernelArgs Structure - Shared between Host, AICPU, and AICore
  *
  * This structure is used to pass arguments to both AICPU and AICore kernels.
- * It contains pointers to device memory for arguments and graph data.
+ * It contains pointers to device memory for arguments and runtime data.
  *
  * Memory Layout:
  * This structure's layout is hardcoded in libaicpu_extend_kernels.so, which
@@ -40,11 +40,11 @@ extern "C" {
  * - block_dim: Written by host, read by AICPU (number of blocks, each block = 1 AIC + 2 AIV)
  * - nrAic: Written by host, read by AICPU (number of AIC cores)
  * - scheCpuNum: Written by host, read by AICPU (number of AICPU scheduling threads)
- * - graphArgs: Written by host, read by AICPU (task graph, includes handshake buffers)
+ * - runtimeArgs: Written by host, read by AICPU (task runtime, includes handshake buffers)
  *
- * Note: AICore kernels receive Graph* directly, not KernelArgs
- *       - AICPU: accesses graphArgs->workers directly
- *       - AICore: receives Graph* pointer with workers at offset 0
+ * Note: AICore kernels receive Runtime* directly, not KernelArgs
+ *       - AICPU: accesses runtimeArgs->workers directly
+ *       - AICore: receives Runtime* pointer with workers at offset 0
  */
 struct KernelArgs {
     uint64_t unused[5] = {0};        // Alignment padding (required by CANN runtime offset)
@@ -52,7 +52,7 @@ struct KernelArgs {
     uint64_t block_dim;               // Number of blocks (1 block = 1 AIC + 2 AIV)
     uint32_t nrAic;                   // Number of AIC cores
     uint32_t scheCpuNum;              // Number of AICPU scheduling threads
-    Runtime *runtimeArgs{nullptr};        // Task graph in device memory
+    Runtime *runtimeArgs{nullptr};        // Task runtime in device memory
 };
 
 #ifdef __cplusplus

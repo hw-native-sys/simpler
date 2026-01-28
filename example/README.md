@@ -57,7 +57,7 @@ python3 main.py 9
 ## Expected Output
 
 ```
-=== Graph Builder Example (Python) ===
+=== Runtime Builder Example (Python) ===
 
 === Compiling Kernels at Runtime ===
 All kernels compiled and loaded successfully
@@ -67,7 +67,7 @@ Allocated 6 tensors (128x128 each, 65536 bytes per tensor)
 Initialized input tensors: a=2.0, b=3.0 (all elements)
 Expected result: f = (2+3+1)*(2+3+2) = 6*7 = 42.0
 
-=== Creating Task Graph for Formula ===
+=== Creating Task Runtime for Formula ===
 Formula: (a + b + 1)(a + b + 2)
 Tasks:
   task0: c = a + b
@@ -75,10 +75,10 @@ Tasks:
   task2: e = c + 2
   task3: f = d * e
 
-Created graph with 4 tasks
+Created runtime with 4 tasks
 ...
 
-=== Executing Graph ===
+=== Executing Runtime ===
 
 === Validating Results ===
 First 10 elements of result:
@@ -101,8 +101,8 @@ Formula verified: (a + b + 1)(a + b + 2) = (2+3+1)*(2+3+2) = 42
    - `kernel_mul.cpp`: Element-wise multiplication
 3. **Allocate Memory**: Device memory is allocated for 6 tensors (a, b, c, d, e, f)
 4. **Copy Input**: Input data is copied from host to device
-5. **Build Graph**: A task dependency graph is constructed with proper dependencies
-6. **Execute Graph** (Python): Python calls `runner.run(graph)` to execute the graph on device
+5. **Build Runtime**: A task dependency runtime is constructed with proper dependencies
+6. **Execute Runtime** (Python): Python calls `runner.run(runtime)` to execute the runtime on device
 7. **Validate**: Results are copied back and verified
 8. **Cleanup**: All resources are freed
 
@@ -110,21 +110,21 @@ Formula verified: (a + b + 1)(a + b + 2) = (2+3+1)*(2+3+2) = 42
 
 The example demonstrates a clean separation of concerns:
 
-**C++ (InitGraph)**:
+**C++ (InitRuntime)**:
 - Compiles and loads kernels
 - Allocates device memory for tensors
 - Initializes input data
-- Builds the task dependency graph
+- Builds the task dependency runtime
 
 **Python**:
 - Orchestrates the overall flow
-- Calls `runner.run(graph)` to execute the graph on device
+- Calls `runner.run(runtime)` to execute the runtime on device
 
-**C++ (ValidateGraph)**:
+**C++ (FinalizeRuntime)**:
 - Copies results from device
 - Validates computation correctness
 - Frees device memory
-- Deletes the graph
+- Deletes the runtime
 
 ## Kernels
 

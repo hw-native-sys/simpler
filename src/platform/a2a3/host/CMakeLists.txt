@@ -1,4 +1,4 @@
-# Build Host runtime using host/* + common/* + custom includes and sources (for `Graph`)
+# Build Host runtime using host/* + common/* + custom includes and sources (for `Runtime`)
 # CMAKE_C_COMPILER and CMAKE_CXX_COMPILER are set when calling cmake
 # CUSTOM_INCLUDE_DIRS and CUSTOM_SOURCE_DIRS are set when calling cmake
 # ASCEND_HOME_PATH is set when calling cmake

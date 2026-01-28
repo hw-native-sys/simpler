@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Main Example - PTO Runtime with C++ Graph Builder
+Main Example - PTO Runtime with C++ Runtime Builder
 
-This program demonstrates how to use the refactored graph builder where
-the graph initialization logic is in C++ (graphbuilder.cpp) and Python
+This program demonstrates how to use the refactored runtime builder where
+the runtime initialization logic is in C++ (runtimemaker.cpp) and Python
 orchestrates the runtime execution.
 
 Flow:
 1. Python: Load runtime, register kernels
-2. C++ InitGraph(): Allocates tensors, builds task structure, initializes data
-3. Python launch_graph(): Initializes device and executes the graph
-4. C++ FinalizeGraph(): Validates results, frees tensors, calls destructor
+2. C++ InitRuntime(): Allocates tensors, builds task structure, initializes data
+3. Python launch_runtime(): Initializes device and executes the runtime
+4. C++ FinalizeRuntime(): Validates results, frees tensors, calls destructor
 
 Example usage:
    python main.py [device_id]
@@ -28,7 +28,7 @@ runtime_dir = runtime_root / "python"
 sys.path.insert(0, str(runtime_dir))
 
 try:
-    from runtime_bindings import load_runtime, register_kernel, set_device, launch_graph
+    from runtime_bindings import load_runtime, register_kernel, set_device, launch_runtime
     from binary_compiler import BinaryCompiler
     from pto_compiler import PTOCompiler
     from elf_parser import extract_text_section
@@ -174,9 +174,9 @@ def main():
     runtime.initialize()
 
     # Execute runtime on device
-    # Device init happens inside launch_graph if not already done
+    # Device init happens inside launch_runtime if not already done
     print("\n=== Executing Runtime on Device ===")
-    launch_graph(runtime,
+    launch_runtime(runtime,
                  aicpu_thread_num=1,
                  block_dim=1,
                  device_id=device_id,
