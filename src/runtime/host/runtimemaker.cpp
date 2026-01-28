@@ -17,18 +17,19 @@
  *   task2 -> task3
  */
 
-#include "runtime.h"
-#include <stdint.h>
 #include <stddef.h>
-#include <new>
+#include <stdint.h>
+
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
-#include <cmath>
 #include <iostream>
+#include <new>
 #include <string>
 #include <vector>
-#include "runtime.h"
+
 #include "devicerunner.h"
+#include "runtime.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -52,13 +53,14 @@ static size_t g_tensor_bytes = 0;
  * @param runtime    Pointer to pre-constructed Runtime
  * @return 0 on success, -1 on failure
  */
-int InitRuntimeImpl(Runtime *runtime) {
+int InitRuntimeImpl(Runtime* runtime) {
     int rc = 0;
 
     // Initialize DeviceRunner
     DeviceRunner& runner = DeviceRunner::Get();
-    // Note: DeviceRunner should already be initialized by Python before calling InitRuntime
-    // Note: Kernels should be registered via Python's runner.register_kernel() before calling InitRuntime
+    // Note: DeviceRunner should already be initialized by Python before calling
+    // InitRuntime Note: Kernels should be registered via Python's
+    // runner.register_kernel() before calling InitRuntime
 
     // Allocate device tensors
     constexpr int ROWS = 128;
@@ -87,16 +89,24 @@ int InitRuntimeImpl(Runtime *runtime) {
     rc = runner.CopyToDevice(dev_a, host_a.data(), BYTES);
     if (rc != 0) {
         std::cerr << "Error: Failed to copy input a to device" << '\n';
-        runner.FreeTensor(dev_a); runner.FreeTensor(dev_b); runner.FreeTensor(dev_c);
-        runner.FreeTensor(dev_d); runner.FreeTensor(dev_e); runner.FreeTensor(dev_f);
+        runner.FreeTensor(dev_a);
+        runner.FreeTensor(dev_b);
+        runner.FreeTensor(dev_c);
+        runner.FreeTensor(dev_d);
+        runner.FreeTensor(dev_e);
+        runner.FreeTensor(dev_f);
         return rc;
     }
 
     rc = runner.CopyToDevice(dev_b, host_b.data(), BYTES);
     if (rc != 0) {
         std::cerr << "Error: Failed to copy input b to device" << '\n';
-        runner.FreeTensor(dev_a); runner.FreeTensor(dev_b); runner.FreeTensor(dev_c);
-        runner.FreeTensor(dev_d); runner.FreeTensor(dev_e); runner.FreeTensor(dev_f);
+        runner.FreeTensor(dev_a);
+        runner.FreeTensor(dev_b);
+        runner.FreeTensor(dev_c);
+        runner.FreeTensor(dev_d);
+        runner.FreeTensor(dev_e);
+        runner.FreeTensor(dev_f);
         return rc;
     }
 
@@ -134,25 +144,25 @@ int InitRuntimeImpl(Runtime *runtime) {
     args_t0[0] = reinterpret_cast<uint64_t>(dev_a);  // src0
     args_t0[1] = reinterpret_cast<uint64_t>(dev_b);  // src1
     args_t0[2] = reinterpret_cast<uint64_t>(dev_c);  // out
-    args_t0[3] = SIZE;                                // size
+    args_t0[3] = SIZE;                               // size
     int t0 = runtime->add_task(args_t0, 4, 0);
 
     // Task 1: d = c + 1 (func_id=1: kernel_add_scalar)
     uint64_t args_t1[4];
     args_t1[0] = reinterpret_cast<uint64_t>(dev_c);  // src
     scalar_converter.f32 = 1.0f;
-    args_t1[1] = scalar_converter.u64;                // scalar=1.0
+    args_t1[1] = scalar_converter.u64;               // scalar=1.0
     args_t1[2] = reinterpret_cast<uint64_t>(dev_d);  // out
-    args_t1[3] = SIZE;                                // size
+    args_t1[3] = SIZE;                               // size
     int t1 = runtime->add_task(args_t1, 4, 1);
 
     // Task 2: e = c + 2 (func_id=1: kernel_add_scalar)
     uint64_t args_t2[4];
     args_t2[0] = reinterpret_cast<uint64_t>(dev_c);  // src
     scalar_converter.f32 = 2.0f;
-    args_t2[1] = scalar_converter.u64;                // scalar=2.0
+    args_t2[1] = scalar_converter.u64;               // scalar=2.0
     args_t2[2] = reinterpret_cast<uint64_t>(dev_e);  // out
-    args_t2[3] = SIZE;                                // size
+    args_t2[3] = SIZE;                               // size
     int t2 = runtime->add_task(args_t2, 4, 1);
 
     // Task 3: f = d * e (func_id=2: kernel_mul)
@@ -160,7 +170,7 @@ int InitRuntimeImpl(Runtime *runtime) {
     args_t3[0] = reinterpret_cast<uint64_t>(dev_d);  // src0
     args_t3[1] = reinterpret_cast<uint64_t>(dev_e);  // src1
     args_t3[2] = reinterpret_cast<uint64_t>(dev_f);  // out
-    args_t3[3] = SIZE;                                // size
+    args_t3[3] = SIZE;                               // size
     int t3 = runtime->add_task(args_t3, 4, 2);
 
     // Add dependencies
@@ -177,7 +187,7 @@ int InitRuntimeImpl(Runtime *runtime) {
     return 0;
 }
 
-int ValidateRuntimeImpl(Runtime *runtime) {
+int ValidateRuntimeImpl(Runtime* runtime) {
     if (runtime == nullptr) {
         std::cerr << "Error: Runtime pointer is null\n";
         return -1;
@@ -207,8 +217,12 @@ int ValidateRuntimeImpl(Runtime *runtime) {
     int rc = runner.CopyFromDevice(host_result.data(), dev_f, BYTES);
     if (rc != 0) {
         std::cerr << "Error: Failed to copy result from device: " << rc << '\n';
-        runner.FreeTensor(dev_a); runner.FreeTensor(dev_b); runner.FreeTensor(dev_c);
-        runner.FreeTensor(dev_d); runner.FreeTensor(dev_e); runner.FreeTensor(dev_f);
+        runner.FreeTensor(dev_a);
+        runner.FreeTensor(dev_b);
+        runner.FreeTensor(dev_c);
+        runner.FreeTensor(dev_d);
+        runner.FreeTensor(dev_e);
+        runner.FreeTensor(dev_f);
         return rc;
     }
 
@@ -225,8 +239,7 @@ int ValidateRuntimeImpl(Runtime *runtime) {
     for (int i = 0; i < SIZE; i++) {
         if (std::abs(host_result[i] - EXPECTED) > 0.001f) {
             if (error_count < 5) {
-                std::cerr << "ERROR: f[" << i << "] = " << host_result[i]
-                          << ", expected " << EXPECTED << '\n';
+                std::cerr << "ERROR: f[" << i << "] = " << host_result[i] << ", expected " << EXPECTED << '\n';
             }
             error_count++;
             all_correct = false;
@@ -235,7 +248,8 @@ int ValidateRuntimeImpl(Runtime *runtime) {
 
     if (all_correct) {
         std::cout << "\n✓ SUCCESS: All " << SIZE << " elements are correct (42.0)\n";
-        std::cout << "Formula verified: (a + b + 1)(a + b + 2) = (2+3+1)*(2+3+2) = 42\n";
+        std::cout << "Formula verified: (a + b + 1)(a + b + 2) = "
+                     "(2+3+1)*(2+3+2) = 42\n";
     } else {
         std::cerr << "\n✗ FAILED: " << error_count << " elements are incorrect\n";
     }
@@ -253,8 +267,8 @@ int ValidateRuntimeImpl(Runtime *runtime) {
     runner.FreeTensor(dev_f);
     std::cout << "Freed all device tensors\n";
 
-    // Note: Runtime destructor is called by FinalizeRuntime() after this returns
-    // User will call free() after FinalizeRuntime()
+    // Note: Runtime destructor is called by FinalizeRuntime() after this
+    // returns User will call free() after FinalizeRuntime()
 
     // Clear global tensor pointers
     g_dev_a = g_dev_b = g_dev_c = g_dev_d = g_dev_e = g_dev_f = nullptr;
@@ -271,6 +285,5 @@ int ValidateRuntimeImpl(Runtime *runtime) {
 }
 
 #ifdef __cplusplus
-}  /* extern "C" */
+} /* extern "C" */
 #endif
-

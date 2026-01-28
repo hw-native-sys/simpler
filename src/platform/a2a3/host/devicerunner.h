@@ -14,22 +14,24 @@
 #ifndef RUNTIME_DEVICERUNNER_H
 #define RUNTIME_DEVICERUNNER_H
 
+#include <runtime/rt.h>
+
 #include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
-#include <runtime/rt.h>
-#include "runtime.h"
+
+#include "function_cache.h"
 #include "kernel_args.h"
 #include "memoryallocator.h"
-#include "function_cache.h"
+#include "runtime.h"
 
 /**
  * DeviceArgs structure for AICPU device arguments
  *
- * This structure contains pointers to device memory for the AICPU shared object.
- * The layout is hardcoded in libaicpu_extend_kernels.so, which expects specific
- * offsets for aicpuSoBin and aicpuSoLen fields.
+ * This structure contains pointers to device memory for the AICPU shared
+ * object. The layout is hardcoded in libaicpu_extend_kernels.so, which expects
+ * specific offsets for aicpuSoBin and aicpuSoLen fields.
  */
 struct DeviceArgs {
     uint64_t unused[12] = {0};
@@ -59,7 +61,7 @@ struct KernelArgsHelper {
      * @param allocator       Memory allocator to use
      * @return 0 on success, error code on failure
      */
-    int InitDeviceArgs(const DeviceArgs &hostDeviceArgs, MemoryAllocator& allocator);
+    int InitDeviceArgs(const DeviceArgs& hostDeviceArgs, MemoryAllocator& allocator);
 
     /**
      * Free device memory allocated for device arguments
@@ -142,7 +144,7 @@ public:
      *
      * @return Reference to the singleton DeviceRunner instance
      */
-    static DeviceRunner &Get();
+    static DeviceRunner& Get();
 
     /**
      * Allocate device tensor memory
@@ -192,7 +194,8 @@ public:
      * 7. Synchronizes streams
      * 8. Cleans up runtime memory
      *
-     * @param runtime             Runtime to execute (will be modified to initialize workers)
+     * @param runtime             Runtime to execute (will be modified to
+     * initialize workers)
      * @param blockDim            Number of blocks (1 block = 1 AIC + 2 AIV)
      * @param deviceId            Device ID (0-15)
      * @param aicpuSoBinary       Binary data of AICPU shared object
@@ -200,11 +203,12 @@ public:
      * @param launchAicpuNum      Number of AICPU instances (default: 1)
      * @return 0 on success, error code on failure
      */
-    int Run(Runtime& runtime, int blockDim,
-            int deviceId,
-            const std::vector<uint8_t>& aicpuSoBinary,
-            const std::vector<uint8_t>& aicoreKernelBinary,
-            int launchAicpuNum = 1);
+    int Run(Runtime& runtime,
+        int blockDim,
+        int deviceId,
+        const std::vector<uint8_t>& aicpuSoBinary,
+        const std::vector<uint8_t>& aicoreKernelBinary,
+        int launchAicpuNum = 1);
 
     /**
      * Print handshake results from device
@@ -228,7 +232,8 @@ public:
     /**
      * Launch an AICPU kernel
      *
-     * Internal method used by Run(). Can be called directly for custom workflows.
+     * Internal method used by Run(). Can be called directly for custom
+     * workflows.
      *
      * @param stream      AICPU stream
      * @param kArgs       Kernel arguments
@@ -236,19 +241,19 @@ public:
      * @param aicpuNum    Number of AICPU instances to launch
      * @return 0 on success, error code on failure
      */
-    int LaunchAiCpuKernel(rtStream_t stream, KernelArgs *kArgs,
-                          const char *kernelName, int aicpuNum);
+    int LaunchAiCpuKernel(rtStream_t stream, KernelArgs* kArgs, const char* kernelName, int aicpuNum);
 
     /**
      * Launch an AICore kernel
      *
-     * Internal method used by Run(). Can be called directly for custom workflows.
+     * Internal method used by Run(). Can be called directly for custom
+     * workflows.
      *
      * @param stream  AICore stream
      * @param runtime   Pointer to device runtime
      * @return 0 on success, error code on failure
      */
-    int LaunchAicoreKernel(rtStream_t stream, Runtime *runtime);
+    int LaunchAicoreKernel(rtStream_t stream, Runtime* runtime);
 
     /**
      * Register a kernel binary for a func_id
@@ -314,9 +319,9 @@ private:
         std::vector<uint8_t> data;
     };
     std::map<int, PendingKernel> pendingKernels_;  // func_id -> host binary
-    bool kernelsCommitted_{false};                  // true after kernels copied to device
-    bool binariesLoaded_{false};                    // true after AICPU SO loaded
-    std::map<int, uint64_t> funcIdToAddr_;          // func_id -> functionBinAddr (device GM)
+    bool kernelsCommitted_{false};                 // true after kernels copied to device
+    bool binariesLoaded_{false};                   // true after AICPU SO loaded
+    std::map<int, uint64_t> funcIdToAddr_;         // func_id -> functionBinAddr (device GM)
 
     /**
      * Ensure device is initialized (lazy initialization)
@@ -332,9 +337,8 @@ private:
      * @param aicoreKernelBinary  Binary data of AICore kernel
      * @return 0 on success, error code on failure
      */
-    int EnsureDeviceInitialized(int deviceId,
-                                const std::vector<uint8_t>& aicpuSoBinary,
-                                const std::vector<uint8_t>& aicoreKernelBinary);
+    int EnsureDeviceInitialized(
+        int deviceId, const std::vector<uint8_t>& aicpuSoBinary, const std::vector<uint8_t>& aicoreKernelBinary);
 
     /**
      * Load AICPU SO and initialize device args
@@ -347,8 +351,7 @@ private:
      * @param aicoreKernelBinary  Binary data of AICore kernel
      * @return 0 on success, error code on failure
      */
-    int EnsureBinariesLoaded(const std::vector<uint8_t>& aicpuSoBinary,
-                             const std::vector<uint8_t>& aicoreKernelBinary);
+    int EnsureBinariesLoaded(const std::vector<uint8_t>& aicpuSoBinary, const std::vector<uint8_t>& aicoreKernelBinary);
 
     /**
      * Copy pending kernels from host to device memory

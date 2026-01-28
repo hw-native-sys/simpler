@@ -62,7 +62,8 @@ public:
      *
      * Iterates through all tracked pointers, frees them using rtFree, and
      * clears the tracking set. Can be called explicitly for error checking,
-     * or automatically via destructor. Idempotent - safe to call multiple times.
+     * or automatically via destructor. Idempotent - safe to call multiple
+     * times.
      *
      * @return 0 on success, error code if any frees failed
      */

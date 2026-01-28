@@ -1,21 +1,23 @@
 /**
  * Device Runner Implementation
  *
- * This file implements the device execution utilities for launching and managing
- * AICPU and AICore kernels on Ascend devices.
+ * This file implements the device execution utilities for launching and
+ * managing AICPU and AICore kernels on Ascend devices.
  */
 
 #include "devicerunner.h"
-#include "runtime.h"
+
 #include <cstring>
 #include <iostream>
 #include <vector>
+
+#include "runtime.h"
 
 // =============================================================================
 // KernelArgsHelper Implementation
 // =============================================================================
 
-int KernelArgsHelper::InitDeviceArgs(const DeviceArgs &hostDeviceArgs, MemoryAllocator& allocator) {
+int KernelArgsHelper::InitDeviceArgs(const DeviceArgs& hostDeviceArgs, MemoryAllocator& allocator) {
     allocator_ = &allocator;
 
     // Allocate device memory for deviceArgs
@@ -26,7 +28,7 @@ int KernelArgsHelper::InitDeviceArgs(const DeviceArgs &hostDeviceArgs, MemoryAll
             std::cerr << "Error: Alloc for deviceArgs failed\n";
             return -1;
         }
-        args.deviceArgs = reinterpret_cast<DeviceArgs *>(deviceArgsDev);
+        args.deviceArgs = reinterpret_cast<DeviceArgs*>(deviceArgsDev);
     }
     // Copy hostDeviceArgs to device memory via deviceArgs
     int rc =
@@ -93,7 +95,7 @@ int AicpuSoInfo::Init(const std::vector<uint8_t>& aicpuSoBinary, MemoryAllocator
     }
 
     size_t fileSize = aicpuSoBinary.size();
-    void *dAicpuData = allocator_->Alloc(fileSize);
+    void* dAicpuData = allocator_->Alloc(fileSize);
     if (dAicpuData == nullptr) {
         std::cerr << "Error: Alloc failed for AICPU SO\n";
         return -1;
@@ -114,7 +116,7 @@ int AicpuSoInfo::Init(const std::vector<uint8_t>& aicpuSoBinary, MemoryAllocator
 
 int AicpuSoInfo::Finalize() {
     if (aicpuSoBin != 0 && allocator_ != nullptr) {
-        int rc = allocator_->Free(reinterpret_cast<void *>(aicpuSoBin));
+        int rc = allocator_->Free(reinterpret_cast<void*>(aicpuSoBin));
         aicpuSoBin = 0;
         return rc;
     }
@@ -125,18 +127,15 @@ int AicpuSoInfo::Finalize() {
 // DeviceRunner Implementation
 // =============================================================================
 
-DeviceRunner &DeviceRunner::Get() {
+DeviceRunner& DeviceRunner::Get() {
     static DeviceRunner runner;
     return runner;
 }
 
-DeviceRunner::~DeviceRunner() {
-    Finalize();
-}
+DeviceRunner::~DeviceRunner() { Finalize(); }
 
-int DeviceRunner::EnsureDeviceInitialized(int deviceId,
-                                          const std::vector<uint8_t>& aicpuSoBinary,
-                                          const std::vector<uint8_t>& aicoreKernelBinary) {
+int DeviceRunner::EnsureDeviceInitialized(
+    int deviceId, const std::vector<uint8_t>& aicpuSoBinary, const std::vector<uint8_t>& aicoreKernelBinary) {
     // First ensure device is set and streams are created
     int rc = EnsureDeviceSet(deviceId);
     if (rc != 0) {
@@ -181,8 +180,8 @@ int DeviceRunner::EnsureDeviceSet(int deviceId) {
     return 0;
 }
 
-int DeviceRunner::EnsureBinariesLoaded(const std::vector<uint8_t>& aicpuSoBinary,
-                                       const std::vector<uint8_t>& aicoreKernelBinary) {
+int DeviceRunner::EnsureBinariesLoaded(
+    const std::vector<uint8_t>& aicpuSoBinary, const std::vector<uint8_t>& aicoreKernelBinary) {
     // Check if already loaded
     if (binariesLoaded_) {
         // Just update kernel binary if different
@@ -222,9 +221,7 @@ int DeviceRunner::EnsureBinariesLoaded(const std::vector<uint8_t>& aicpuSoBinary
     return 0;
 }
 
-void* DeviceRunner::AllocateTensor(size_t bytes) {
-    return memAlloc_.Alloc(bytes);
-}
+void* DeviceRunner::AllocateTensor(size_t bytes) { return memAlloc_.Alloc(bytes); }
 
 void DeviceRunner::FreeTensor(void* devPtr) {
     if (devPtr != nullptr) {
@@ -240,11 +237,12 @@ int DeviceRunner::CopyFromDevice(void* hostPtr, const void* devPtr, size_t bytes
     return rtMemcpy(hostPtr, bytes, devPtr, bytes, RT_MEMCPY_DEVICE_TO_HOST);
 }
 
-int DeviceRunner::Run(Runtime& runtime, int blockDim,
-                      int deviceId,
-                      const std::vector<uint8_t>& aicpuSoBinary,
-                      const std::vector<uint8_t>& aicoreKernelBinary,
-                      int launchAicpuNum) {
+int DeviceRunner::Run(Runtime& runtime,
+    int blockDim,
+    int deviceId,
+    const std::vector<uint8_t>& aicpuSoBinary,
+    const std::vector<uint8_t>& aicoreKernelBinary,
+    int launchAicpuNum) {
     // Ensure device is initialized (lazy initialization)
     int rc = EnsureDeviceInitialized(deviceId, aicpuSoBinary, aicoreKernelBinary);
     if (rc != 0) {
@@ -286,15 +284,16 @@ int DeviceRunner::Run(Runtime& runtime, int blockDim,
         runtime.workers[i].core_type = (i < numAic) ? 0 : 1;
     }
 
-    // Set functionBinAddr for all tasks (NEW - Runtime function pointer dispatch)
+    // Set functionBinAddr for all tasks (NEW - Runtime function pointer
+    // dispatch)
     std::cout << "\n=== Setting functionBinAddr for Tasks ===" << '\n';
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task* task = runtime.get_task(i);
         if (task != nullptr) {
             uint64_t addr = GetFunctionBinAddr(task->func_id);
             task->functionBinAddr = addr;
-            std::cout << "  Task " << i << " (func_id=" << task->func_id
-                      << ") -> functionBinAddr=0x" << std::hex << addr << std::dec << '\n';
+            std::cout << "  Task " << i << " (func_id=" << task->func_id << ") -> functionBinAddr=0x" << std::hex
+                      << addr << std::dec << '\n';
         }
     }
     std::cout << '\n';
@@ -362,8 +361,7 @@ void DeviceRunner::PrintHandshakeResults(Runtime& runtime) {
     std::cout << "Handshake results for " << runtime.worker_count << " cores:" << std::endl;
     for (int i = 0; i < runtime.worker_count; i++) {
         std::cout << "  Core " << i << ": aicore_done=" << runtime.workers[i].aicore_done
-                  << " aicpu_ready=" << runtime.workers[i].aicpu_ready
-                  << " control=" << runtime.workers[i].control
+                  << " aicpu_ready=" << runtime.workers[i].aicpu_ready << " control=" << runtime.workers[i].control
                   << " task=" << runtime.workers[i].task << std::endl;
     }
 }
@@ -405,7 +403,7 @@ int DeviceRunner::Finalize() {
     return 0;
 }
 
-int DeviceRunner::LaunchAiCpuKernel(rtStream_t stream, KernelArgs *kArgs, const char *kernelName, int aicpuNum) {
+int DeviceRunner::LaunchAiCpuKernel(rtStream_t stream, KernelArgs* kArgs, const char* kernelName, int aicpuNum) {
     struct Args {
         KernelArgs kArgs;
         char kernelName[32];
@@ -424,18 +422,18 @@ int DeviceRunner::LaunchAiCpuKernel(rtStream_t stream, KernelArgs *kArgs, const 
     rtArgs.kernelNameAddrOffset = offsetof(struct Args, kernelName);
     rtArgs.soNameAddrOffset = offsetof(struct Args, soName);
 
-    return rtAicpuKernelLaunchExWithArgs(rtKernelType_t::KERNEL_TYPE_AICPU_KFC, "AST_DYN_AICPU", aicpuNum, &rtArgs,
-                                         nullptr, stream, 0);
+    return rtAicpuKernelLaunchExWithArgs(
+        rtKernelType_t::KERNEL_TYPE_AICPU_KFC, "AST_DYN_AICPU", aicpuNum, &rtArgs, nullptr, stream, 0);
 }
 
-int DeviceRunner::LaunchAicoreKernel(rtStream_t stream, Runtime *runtime) {
+int DeviceRunner::LaunchAicoreKernel(rtStream_t stream, Runtime* runtime) {
     if (aicoreKernelBinary_.empty()) {
         std::cerr << "Error: AICore kernel binary is empty\n";
         return -1;
     }
 
     size_t binSize = aicoreKernelBinary_.size();
-    const void *binData = aicoreKernelBinary_.data();
+    const void* binData = aicoreKernelBinary_.data();
 
     rtDevBinary_t binary;
     std::memset(&binary, 0, sizeof(binary));
@@ -443,7 +441,7 @@ int DeviceRunner::LaunchAicoreKernel(rtStream_t stream, Runtime *runtime) {
     binary.version = 0;
     binary.data = binData;
     binary.length = binSize;
-    void *binHandle = nullptr;
+    void* binHandle = nullptr;
     int rc = rtRegisterAllKernel(&binary, &binHandle);
     if (rc != RT_ERROR_NONE) {
         std::cerr << "rtRegisterAllKernel失败: " << rc << '\n';
@@ -484,12 +482,14 @@ int DeviceRunner::RegisterKernel(int funcId, const uint8_t* binData, size_t binS
 
     std::cout << "Registering kernel: func_id=" << funcId << ", size=" << binSize << " bytes\n";
 
-    // Store kernel binary in host memory (will be copied to device in CommitKernels)
+    // Store kernel binary in host memory (will be copied to device in
+    // CommitKernels)
     PendingKernel kernel;
     kernel.data.assign(binData, binData + binSize);
     pendingKernels_[funcId] = std::move(kernel);
 
-    // If already initialized and committed, need to copy this kernel immediately
+    // If already initialized and committed, need to copy this kernel
+    // immediately
     if (streamAicpu_ != nullptr && kernelsCommitted_) {
         // Re-commit just this kernel
         kernelsCommitted_ = false;  // Force re-commit
@@ -522,11 +522,14 @@ int DeviceRunner::CommitKernels() {
         uint64_t allocSize = sizeof(uint64_t) + binSize;
         void* gmAddr = memAlloc_.Alloc(allocSize);
         if (gmAddr == nullptr) {
-            std::cerr << "Error: Failed to allocate device GM memory for kernel func_id=" << funcId << '\n';
+            std::cerr << "Error: Failed to allocate device GM memory for "
+                         "kernel func_id="
+                      << funcId << '\n';
             return -1;
         }
 
-        // Step 2: Build host buffer with CoreFunctionBin structure (size + data)
+        // Step 2: Build host buffer with CoreFunctionBin structure (size +
+        // data)
         std::vector<uint8_t> hostBuf(allocSize);
         uint64_t* sizePtr = reinterpret_cast<uint64_t*>(hostBuf.data());
         *sizePtr = binSize;
@@ -540,12 +543,13 @@ int DeviceRunner::CommitKernels() {
             return rc;
         }
 
-        // Step 4: Calculate functionBinAddr (skip size field to get actual code address)
+        // Step 4: Calculate functionBinAddr (skip size field to get actual code
+        // address)
         uint64_t functionBinAddr = reinterpret_cast<uint64_t>(gmAddr) + sizeof(uint64_t);
         funcIdToAddr_[funcId] = functionBinAddr;
 
-        std::cout << "  func_id=" << funcId << " -> functionBinAddr=0x"
-                  << std::hex << functionBinAddr << std::dec << '\n';
+        std::cout << "  func_id=" << funcId << " -> functionBinAddr=0x" << std::hex << functionBinAddr << std::dec
+                  << '\n';
     }
 
     kernelsCommitted_ = true;
@@ -560,5 +564,3 @@ uint64_t DeviceRunner::GetFunctionBinAddr(int funcId) {
     }
     return it->second;
 }
-
-

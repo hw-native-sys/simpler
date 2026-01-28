@@ -1,8 +1,8 @@
 /**
  * PTO Runtime C API
  *
- * Pure C interface for Python ctypes bindings. Wraps C++ classes (Runtime, DeviceRunner)
- * as opaque pointers and provides C functions to manipulate them.
+ * Pure C interface for Python ctypes bindings. Wraps C++ classes (Runtime,
+ * DeviceRunner) as opaque pointers and provides C functions to manipulate them.
  *
  * Key design:
  * - All functions use C linkage (extern "C")
@@ -14,8 +14,8 @@
 #ifndef PTO_RUNTIME_C_API_H
 #define PTO_RUNTIME_C_API_H
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -27,9 +27,11 @@ extern "C" {
  */
 typedef void* RuntimeHandle;
 
-/* =========================================================================== */
+/* ===========================================================================
+ */
 /* Runtime API */
-/* =========================================================================== */
+/* ===========================================================================
+ */
 
 /**
  * Get the size of Runtime structure for memory allocation.
@@ -70,10 +72,13 @@ int InitRuntime(RuntimeHandle runtime);
  * @return 0 on success, error code on failure
  */
 int launch_runtime(RuntimeHandle runtime,
-                 int aicpu_thread_num, int block_dim,
-                 int device_id,
-                 const uint8_t* aicpu_binary, size_t aicpu_size,
-                 const uint8_t* aicore_binary, size_t aicore_size);
+    int aicpu_thread_num,
+    int block_dim,
+    int device_id,
+    const uint8_t* aicpu_binary,
+    size_t aicpu_size,
+    const uint8_t* aicore_binary,
+    size_t aicore_size);
 
 /**
  * Finalize and cleanup a runtime instance.
@@ -116,7 +121,7 @@ int set_device(int device_id);
 int RegisterKernel(int func_id, const uint8_t* bin_data, size_t bin_size);
 
 #ifdef __cplusplus
-}  /* extern "C" */
+} /* extern "C" */
 #endif
 
-#endif  /* PTO_RUNTIME_C_API_H */
+#endif /* PTO_RUNTIME_C_API_H */

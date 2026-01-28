@@ -1,31 +1,35 @@
 /**
  * PTO Runtime C API - Implementation
  *
- * Wraps C++ classes as opaque pointers, providing C interface for ctypes bindings.
- * Simplified single-concept model: Runtime only.
+ * Wraps C++ classes as opaque pointers, providing C interface for ctypes
+ * bindings. Simplified single-concept model: Runtime only.
  */
 
 #include "pto_runtime_c_api.h"
+
+#include <new>  // for placement new
+#include <vector>
+
 #include "devicerunner.h"
 #include "runtime.h"
-#include <new>      // for placement new
-#include <vector>
 
 extern "C" {
 
-/* =========================================================================== */
+/* ===========================================================================
+ */
 /* Runtime Implementation Functions (defined in runtimemaker.cpp) */
-/* =========================================================================== */
+/* ===========================================================================
+ */
 int InitRuntimeImpl(Runtime* runtime);
 int ValidateRuntimeImpl(Runtime* runtime);
 
-/* =========================================================================== */
+/* ===========================================================================
+ */
 /* Runtime API Implementation */
-/* =========================================================================== */
+/* ===========================================================================
+ */
 
-size_t GetRuntimeSize(void) {
-    return sizeof(Runtime);
-}
+size_t GetRuntimeSize(void) { return sizeof(Runtime); }
 
 int InitRuntime(RuntimeHandle runtime) {
     if (runtime == NULL) {
@@ -41,10 +45,13 @@ int InitRuntime(RuntimeHandle runtime) {
 }
 
 int launch_runtime(RuntimeHandle runtime,
-                 int aicpu_thread_num, int block_dim,
-                 int device_id,
-                 const uint8_t* aicpu_binary, size_t aicpu_size,
-                 const uint8_t* aicore_binary, size_t aicore_size) {
+    int aicpu_thread_num,
+    int block_dim,
+    int device_id,
+    const uint8_t* aicpu_binary,
+    size_t aicpu_size,
+    const uint8_t* aicore_binary,
+    size_t aicore_size) {
     if (runtime == NULL) {
         return -1;
     }
@@ -102,4 +109,4 @@ int RegisterKernel(int func_id, const uint8_t* bin_data, size_t bin_size) {
     }
 }
 
-}  /* extern "C" */
+} /* extern "C" */

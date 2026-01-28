@@ -1,6 +1,7 @@
-#include <cstdint>
 #include <atomic>
+#include <cstdint>
 #include <mutex>
+
 #include "device_log.h"
 #include "runtime.h"
 
@@ -40,8 +41,7 @@ struct AicpuExecutor {
     // ===== Methods =====
     int Init(Runtime* runtime);
     int HankAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores);
-    int resolve_and_dispatch(Runtime& runtime, int thread_idx,
-                             const int* cur_thread_cores, int core_num);
+    int resolve_and_dispatch(Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num);
     int ShutdownAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores);
     int Run(Runtime* runtime);
     void DeInit();
@@ -69,8 +69,6 @@ int AicpuExecutor::Init(Runtime* runtime) {
     thread_num_ = runtime->scheCpuNum;
     if (thread_num_ == 0) thread_num_ = 1;
 
-
-
     if (thread_num_ < 1 || thread_num_ > MAX_AICPU_THREADS) {
         DEV_ERROR("Invalid thread_num: %d", thread_num_);
         init_failed_.store(true, std::memory_order_release);
@@ -86,25 +84,26 @@ int AicpuExecutor::Init(Runtime* runtime) {
     cores_total_num_ = runtime->block_dim * blockdim_cores_num_;
     thread_cores_num_ = cores_total_num_ / thread_num_;
 
-    DEV_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d",
-        thread_num_, cores_total_num_, thread_cores_num_);
+    DEV_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num_);
 
     // Pre-compute core assignments for each thread
     // Each thread manages blocks_per_thread blocks
-    // For each block b: AIC is core b, AIVs are cores (nrAic + b*2) and (nrAic + b*2 + 1)
+    // For each block b: AIC is core b, AIVs are cores (nrAic + b*2) and (nrAic
+    // + b*2 + 1)
     int num_aic = runtime->block_dim;  // Total AIC cores (= block_dim)
     int blocks_per_thread = runtime->block_dim / thread_num_;
 
     // Validate block distribution
     if (runtime->block_dim % thread_num_ != 0) {
-        DEV_ERROR("block_dim (%d) must be divisible by thread_num (%d)",
-                  runtime->block_dim, thread_num_);
+        DEV_ERROR("block_dim (%d) must be divisible by thread_num (%d)", runtime->block_dim, thread_num_);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
 
     DEV_INFO("Block assignment: %d blocks, %d threads, %d blocks per thread",
-             runtime->block_dim, thread_num_, blocks_per_thread);
+        runtime->block_dim,
+        thread_num_,
+        blocks_per_thread);
 
     for (int t = 0; t < thread_num_; t++) {
         int start_block = t * blocks_per_thread;
@@ -118,15 +117,21 @@ int AicpuExecutor::Init(Runtime* runtime) {
 
         // Assign AIV cores for all blocks managed by this thread
         for (int b = start_block; b < end_block; b++) {
-            int aiv_base = num_aic;  // AIV cores start after all AIC cores
+            int aiv_base = num_aic;                                   // AIV cores start after all AIC cores
             core_assignments_[t][core_idx++] = aiv_base + b * 2;      // First AIV of block b
             core_assignments_[t][core_idx++] = aiv_base + b * 2 + 1;  // Second AIV of block b
         }
 
-        DEV_INFO("Thread %d: manages blockDims [%d-%d], cores: AIC[%d-%d] AIV[%d-%d]",
-                 t, start_block, end_block - 1,
-                 start_block, end_block - 1,
-                 num_aic + start_block * 2, num_aic + (end_block - 1) * 2 + 1);
+        DEV_INFO(
+            "Thread %d: manages blockDims [%d-%d], cores: AIC[%d-%d] "
+            "AIV[%d-%d]",
+            t,
+            start_block,
+            end_block - 1,
+            start_block,
+            end_block - 1,
+            num_aic + start_block * 2,
+            num_aic + (end_block - 1) * 2 + 1);
     }
 
     // Initialize runtime execution state
@@ -178,7 +183,8 @@ int AicpuExecutor::HankAiCore(Runtime* runtime, int thread_idx, const int* cur_t
     for (int i = 0; i < thread_cores_num_; i++) {
         int core_id = cur_thread_cores[i];
         Handshake* hank = &all_hanks[core_id];
-        while (hank->aicore_done == 0) { }
+        while (hank->aicore_done == 0) {
+        }
         DEV_INFO("Thread %d: success hank->aicore_done = %u", thread_idx, (uint64_t)hank->aicore_done);
     }
     return 0;
@@ -203,10 +209,10 @@ int AicpuExecutor::ShutdownAiCore(Runtime* runtime, int thread_idx, const int* c
 }
 
 /**
- * Resolve dependencies and dispatch tasks using polling-based dispatch to AICore
+ * Resolve dependencies and dispatch tasks using polling-based dispatch to
+ * AICore
  */
-int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx,
-                                         const int* cur_thread_cores, int core_num) {
+int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num) {
     Handshake* hank = (Handshake*)runtime.workers;
 
     DEV_INFO("Thread %d: Starting execution with %d cores", thread_idx, core_num);
@@ -217,7 +223,6 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx,
 
     // Execute tasks using polling-based dispatch
     while (completed_tasks_.load(std::memory_order_acquire) < task_count) {
-
         // Phase 1: Process completed tasks on my managed cores
         for (int i = 0; i < core_num; i++) {
             int core_id = cur_thread_cores[i];
@@ -231,7 +236,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx,
 
                 DEV_INFO("Thread %d: Core %d completed task %d", thread_idx, core_id, task_id);
 
-                // Update fanin of successors atomically and add to appropriate shared ready queue
+                // Update fanin of successors atomically and add to appropriate
+                // shared ready queue
                 for (int j = 0; j < task->fanout_count; j++) {
                     int dep_id = task->fanout[j];
                     Task* dep = runtime.get_task(dep_id);
@@ -239,7 +245,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx,
                     // Atomic decrement fanin
                     int prev_fanin = dep->fanin.fetch_sub(1, std::memory_order_acq_rel);
 
-                    // Dependency resolved, add to appropriate shared ready queue
+                    // Dependency resolved, add to appropriate shared ready
+                    // queue
                     if (prev_fanin == 1) {
                         if (dep->core_type == 0) {  // AIC task
                             std::lock_guard<std::mutex> lock(ready_queue_aic_mutex_);
@@ -287,8 +294,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx,
                             int task_id = ready_queue_aic_[count - 1];
                             Task* task = runtime.get_task(task_id);
 
-                            DEV_INFO("Thread %d: Dispatching AIC task %d to core %d",
-                                    thread_idx, task_id, core_id);
+                            DEV_INFO("Thread %d: Dispatching AIC task %d to core %d", thread_idx, task_id, core_id);
 
                             h->task = reinterpret_cast<uint64_t>(task);
                             h->task_status = 1;  // Mark as busy
@@ -304,8 +310,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx,
                             int task_id = ready_queue_aiv_[count - 1];
                             Task* task = runtime.get_task(task_id);
 
-                            DEV_INFO("Thread %d: Dispatching AIV task %d to core %d",
-                                    thread_idx, task_id, core_id);
+                            DEV_INFO("Thread %d: Dispatching AIV task %d to core %d", thread_idx, task_id, core_id);
 
                             h->task = reinterpret_cast<uint64_t>(task);
                             h->task_status = 1;  // Mark as busy

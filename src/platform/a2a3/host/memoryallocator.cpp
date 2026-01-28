@@ -6,12 +6,12 @@
  */
 
 #include "memoryallocator.h"
+
 #include <runtime/rt.h>
+
 #include <iostream>
 
-MemoryAllocator::~MemoryAllocator() {
-    Finalize();
-}
+MemoryAllocator::~MemoryAllocator() { Finalize(); }
 
 void* MemoryAllocator::Alloc(size_t size) {
     void* ptr = nullptr;

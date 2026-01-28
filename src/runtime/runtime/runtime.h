@@ -1,9 +1,9 @@
 /**
  * Runtime Class - Task Dependency Runtime Management
  *
- * This is a simplified, standalone runtime class for managing task dependencies.
- * Tasks are stored in a fixed-size array with compile-time configurable bounds.
- * Each task has:
+ * This is a simplified, standalone runtime class for managing task
+ * dependencies. Tasks are stored in a fixed-size array with compile-time
+ * configurable bounds. Each task has:
  * - Unique ID (array index)
  * - Arguments (uint64_t array)
  * - Fanin (predecessor count)
@@ -20,8 +20,9 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <stdio.h>  // for fprintf, printf
-#include <string.h> // for memset
+#include <stdio.h>   // for fprintf, printf
+#include <string.h>  // for memset
+
 #include <atomic>
 
 // =============================================================================
@@ -82,12 +83,12 @@
  * - core_type: Written by AICPU, read by AICore (0 = AIC, 1 = AIV)
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;   // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;   // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;          // Task pointer: 0=no task, non-zero=Task* address
-    volatile int32_t task_status;    // Task execution status: 0=idle, 1=busy
-    volatile int32_t control;        // Control signal: 0=execute, 1=quit
-    volatile int32_t core_type;      // Core type: 0=AIC, 1=AIV
+    volatile uint32_t aicpu_ready;  // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;         // Task pointer: 0=no task, non-zero=Task* address
+    volatile int32_t task_status;   // Task execution status: 0=idle, 1=busy
+    volatile int32_t control;       // Control signal: 0=execute, 1=quit
+    volatile int32_t core_type;     // Core type: 0=AIC, 1=AIV
 } __attribute__((aligned(64)));
 
 /**
@@ -98,8 +99,8 @@ struct Handshake {
  * AIV (AICore Vector) handles vector/SIMD operations.
  */
 enum class CoreType : int {
-  AIC = 0,  // AICore Compute
-  AIV = 1   // AICore Vector
+    AIC = 0,  // AICore Compute
+    AIV = 1   // AICore Vector
 };
 
 /**
@@ -109,28 +110,28 @@ enum class CoreType : int {
  * and dependency information (fanin/fanout).
  */
 typedef struct {
-  int task_id;                   // Unique task identifier
-  int func_id;                   // Function identifier
-  uint64_t args[RUNTIME_MAX_ARGS]; // Task arguments
-  int num_args;                  // Number of valid arguments
+    int task_id;                      // Unique task identifier
+    int func_id;                      // Function identifier
+    uint64_t args[RUNTIME_MAX_ARGS];  // Task arguments
+    int num_args;                     // Number of valid arguments
 
-  // Runtime function pointer address (NEW)
-  // This is the GM address where the kernel binary resides
-  // It's cast to a function pointer at runtime: (KernelFunc)functionBinAddr
-  uint64_t functionBinAddr;     // Address of kernel in device GM memory
+    // Runtime function pointer address (NEW)
+    // This is the GM address where the kernel binary resides
+    // It's cast to a function pointer at runtime: (KernelFunc)functionBinAddr
+    uint64_t functionBinAddr;  // Address of kernel in device GM memory
 
-  // Core type specification (NEW)
-  // Specifies which core type this task should run on: 0=AIC, 1=AIV
-  int core_type;                // 0=AIC, 1=AIV
+    // Core type specification (NEW)
+    // Specifies which core type this task should run on: 0=AIC, 1=AIV
+    int core_type;  // 0=AIC, 1=AIV
 
-  // Dependency tracking (using PTO runtime terminology)
-  std::atomic<int> fanin;       // Number of predecessors (dependencies)
-  int fanout[RUNTIME_MAX_FANOUT]; // Successor task IDs
-  int fanout_count;             // Number of successors
+    // Dependency tracking (using PTO runtime terminology)
+    std::atomic<int> fanin;          // Number of predecessors (dependencies)
+    int fanout[RUNTIME_MAX_FANOUT];  // Successor task IDs
+    int fanout_count;                // Number of successors
 
-  // DFX-specific fields
-  uint64_t start_time;          // Start time of the task
-  uint64_t end_time;            // End time of the task
+    // DFX-specific fields
+    uint64_t start_time;  // Start time of the task
+    uint64_t end_time;    // End time of the task
 } Task;
 
 // =============================================================================
@@ -148,96 +149,97 @@ typedef struct {
  */
 class Runtime {
 public:
-  // Handshake buffers for AICPU-AICore communication
-  Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
-  int worker_count;                      // Number of active workers
+    // Handshake buffers for AICPU-AICore communication
+    Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
+    int worker_count;                       // Number of active workers
 
-  // Execution parameters for AICPU scheduling
-  int block_dim;                         // Number of AIC blocks (block dimension)
-  int scheCpuNum;                        // Number of AICPU threads for scheduling
+    // Execution parameters for AICPU scheduling
+    int block_dim;   // Number of AIC blocks (block dimension)
+    int scheCpuNum;  // Number of AICPU threads for scheduling
 
 private:
-  // Task storage
-  Task tasks[RUNTIME_MAX_TASKS]; // Fixed-size task array
-  int next_task_id;            // Next available task ID
+    // Task storage
+    Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
+    int next_task_id;               // Next available task ID
 
-  // Initial ready tasks (computed once, read-only after)
-  int initial_ready_tasks[RUNTIME_MAX_TASKS];
-  int initial_ready_count;
+    // Initial ready tasks (computed once, read-only after)
+    int initial_ready_tasks[RUNTIME_MAX_TASKS];
+    int initial_ready_count;
 
 public:
-  /**
-   * Constructor - zero-initialize all arrays
-   */
-  Runtime();
+    /**
+     * Constructor - zero-initialize all arrays
+     */
+    Runtime();
 
-  // =========================================================================
-  // Task Management
-  // =========================================================================
+    // =========================================================================
+    // Task Management
+    // =========================================================================
 
-  /**
-   * Allocate a new task with the given arguments
-   *
-   * @param args      Array of uint64_t arguments
-   * @param num_args  Number of arguments (must be <= RUNTIME_MAX_ARGS)
-   * @param func_id   Function identifier
-   * @param core_type Core type for this task (0=AIC, 1=AIV)
-   * @return Task ID (>= 0) on success, -1 on failure
-   */
-  int add_task(uint64_t *args, int num_args, int func_id, int core_type = 0);
+    /**
+     * Allocate a new task with the given arguments
+     *
+     * @param args      Array of uint64_t arguments
+     * @param num_args  Number of arguments (must be <= RUNTIME_MAX_ARGS)
+     * @param func_id   Function identifier
+     * @param core_type Core type for this task (0=AIC, 1=AIV)
+     * @return Task ID (>= 0) on success, -1 on failure
+     */
+    int add_task(uint64_t *args, int num_args, int func_id, int core_type = 0);
 
-  /**
-   * Add a dependency edge: from_task -> to_task
-   *
-   * This adds to_task to from_task's fanout array and increments
-   * to_task's fanin counter.
-   *
-   * @param from_task  Producer task ID
-   * @param to_task    Consumer task ID (depends on from_task)
-   */
-  void add_successor(int from_task, int to_task);
+    /**
+     * Add a dependency edge: from_task -> to_task
+     *
+     * This adds to_task to from_task's fanout array and increments
+     * to_task's fanin counter.
+     *
+     * @param from_task  Producer task ID
+     * @param to_task    Consumer task ID (depends on from_task)
+     */
+    void add_successor(int from_task, int to_task);
 
-  // =========================================================================
-  // Query Methods
-  // =========================================================================
+    // =========================================================================
+    // Query Methods
+    // =========================================================================
 
-  /**
-   * Get a pointer to a task by ID
-   *
-   * @param task_id  Task ID to query
-   * @return Pointer to task, or nullptr if invalid ID
-   */
-  Task *get_task(int task_id);
+    /**
+     * Get a pointer to a task by ID
+     *
+     * @param task_id  Task ID to query
+     * @return Pointer to task, or nullptr if invalid ID
+     */
+    Task *get_task(int task_id);
 
-  /**
-   * Get the total number of tasks in the runtime
-   *
-   * @return Total task count
-   */
-  int get_task_count() const;
+    /**
+     * Get the total number of tasks in the runtime
+     *
+     * @return Total task count
+     */
+    int get_task_count() const;
 
-  /**
-   * Get initially ready tasks (fanin == 0) as entry point for execution
-   *
-   * This scans all tasks and populates the provided array with task IDs
-   * that have no dependencies (fanin == 0). The runtime can use this
-   * as the starting point for task scheduling.
-   *
-   * @param ready_tasks  Array to populate with ready task IDs (can be nullptr)
-   * @return Number of initially ready tasks
-   */
-  int get_initial_ready_tasks(int *ready_tasks);
+    /**
+     * Get initially ready tasks (fanin == 0) as entry point for execution
+     *
+     * This scans all tasks and populates the provided array with task IDs
+     * that have no dependencies (fanin == 0). The runtime can use this
+     * as the starting point for task scheduling.
+     *
+     * @param ready_tasks  Array to populate with ready task IDs (can be
+     * nullptr)
+     * @return Number of initially ready tasks
+     */
+    int get_initial_ready_tasks(int *ready_tasks);
 
-  // =========================================================================
-  // Utility Methods
-  // =========================================================================
+    // =========================================================================
+    // Utility Methods
+    // =========================================================================
 
-  /**
-   * Print the runtime structure to stdout
-   *
-   * Shows task table with fanin/fanout information.
-   */
-  void print_runtime() const;
+    /**
+     * Print the runtime structure to stdout
+     *
+     * Shows task table with fanin/fanout information.
+     */
+    void print_runtime() const;
 };
 
-#endif // RUNTIME_H
+#endif  // RUNTIME_H

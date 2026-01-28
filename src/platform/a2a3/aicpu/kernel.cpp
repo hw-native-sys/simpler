@@ -1,11 +1,12 @@
 #include <cstdint>
 #include <cstdio>
+
 #include "device_log.h"
-#include "runtime.h"
 #include "kernel_args.h"
+#include "runtime.h"
 
 // Forward declaration of AicpuExecute (implemented in aicpu_executor.cpp)
-extern "C" int AicpuExecute(Runtime* arg);
+extern "C" int AicpuExecute(Runtime *arg);
 
 extern "C" __attribute__((visibility("default"))) int StaticTileFwkBackendKernelServer(void *arg) {
     if (arg == nullptr) {
@@ -19,8 +20,8 @@ extern "C" __attribute__((visibility("default"))) int StaticTileFwkBackendKernel
 /**
  * AICPU kernel initialization entry point
  *
- * This function is called once during kernel initialization by the CANN runtime.
- * It initializes logging and validates kernel arguments.
+ * This function is called once during kernel initialization by the CANN
+ * runtime. It initializes logging and validates kernel arguments.
  *
  * Note: Function name is hardcoded in libaicpu_extend_kernels.so
  *
@@ -57,7 +58,7 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
 
     // Extract Runtime from KernelArgs
     auto kargs = (KernelArgs *)arg;
-    Runtime* runtime = kargs->runtimeArgs;
+    Runtime *runtime = kargs->runtimeArgs;
 
     if (runtime == nullptr) {
         DEV_ERROR("%s", "Invalid runtimeArgs: null pointer");

@@ -43,8 +43,8 @@
  */
 #pragma pack(1)
 struct CoreFunctionBin {
-    uint64_t size;      // Size of binary data in bytes
-    uint8_t data[0];    // Flexible array member for kernel binary
+    uint64_t size;    // Size of binary data in bytes
+    uint8_t data[0];  // Flexible array member for kernel binary
 };
 #pragma pack()
 
@@ -61,26 +61,22 @@ struct CoreFunctionBin {
  * to the beginning of the cache.
  */
 struct CoreFunctionBinCache {
-    uint64_t dataSize;      // Total size of all data (excluding this header)
-    uint64_t numKernels;    // Number of kernels in this cache
+    uint64_t dataSize;    // Total size of all data (excluding this header)
+    uint64_t numKernels;  // Number of kernels in this cache
 
     /**
      * Get offset array pointer
      * @return Pointer to array of offsets
      */
     uint64_t* GetOffsets() {
-        return reinterpret_cast<uint64_t*>(
-            reinterpret_cast<uint8_t*>(this) + sizeof(CoreFunctionBinCache));
+        return reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(this) + sizeof(CoreFunctionBinCache));
     }
 
     /**
      * Get pointer to binary data region
      * @return Pointer to start of binary data
      */
-    uint8_t* GetBinaryData() {
-        return reinterpret_cast<uint8_t*>(GetOffsets()) +
-               numKernels * sizeof(uint64_t);
-    }
+    uint8_t* GetBinaryData() { return reinterpret_cast<uint8_t*>(GetOffsets()) + numKernels * sizeof(uint64_t); }
 
     /**
      * Get CoreFunctionBin by index
@@ -99,11 +95,7 @@ struct CoreFunctionBinCache {
      * Calculate total cache size including header
      * @return Total size in bytes
      */
-    uint64_t GetTotalSize() const {
-        return sizeof(CoreFunctionBinCache) +
-               numKernels * sizeof(uint64_t) +
-               dataSize;
-    }
+    uint64_t GetTotalSize() const { return sizeof(CoreFunctionBinCache) + numKernels * sizeof(uint64_t) + dataSize; }
 };
 
 #endif  // RUNTIME_FUNCTION_CACHE_H

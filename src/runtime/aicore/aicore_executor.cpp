@@ -2,33 +2,33 @@
 #include "runtime.h"
 
 /**
-* Unified function pointer type for kernel dispatch
-*
-* All kernels follow the same signature: void kernel(__gm__ int64_t* args)
-* This enables simple, switch-free dispatch.
-*/
+ * Unified function pointer type for kernel dispatch
+ *
+ * All kernels follow the same signature: void kernel(__gm__ int64_t* args)
+ * This enables simple, switch-free dispatch.
+ */
 typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
 
 /**
-* Task execution wrapper - dispatches tasks using function pointers
-*
-* This function demonstrates the runtime function pointer dispatch pattern.
-* Following the production system flow:
-* - functionBinAddr points to compiled kernel code in device GM memory
-* - The address is cast to a function pointer: UnifiedKernelFunc kernel = (UnifiedKernelFunc)functionBinAddr
-* - The kernel is invoked: kernel(task->args)
-*
-* This is the KEY difference from compile-time linking:
-* - OLD: extern "C" declarations, resolved at link time
-* - NEW: functionBinAddr from GM memory, cast at runtime
-*
-* With unified kernel signature, no switch statement is needed.
-* All kernels unpack their own arguments from the args array.
-*
-* @param task Pointer to task in global memory (null during initialization)
-*/
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task)
-{
+ * Task execution wrapper - dispatches tasks using function pointers
+ *
+ * This function demonstrates the runtime function pointer dispatch pattern.
+ * Following the production system flow:
+ * - functionBinAddr points to compiled kernel code in device GM memory
+ * - The address is cast to a function pointer: UnifiedKernelFunc kernel =
+ * (UnifiedKernelFunc)functionBinAddr
+ * - The kernel is invoked: kernel(task->args)
+ *
+ * This is the KEY difference from compile-time linking:
+ * - OLD: extern "C" declarations, resolved at link time
+ * - NEW: functionBinAddr from GM memory, cast at runtime
+ *
+ * With unified kernel signature, no switch statement is needed.
+ * All kernels unpack their own arguments from the args array.
+ *
+ * @param task Pointer to task in global memory (null during initialization)
+ */
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task) {
     // Null task pointer indicates no work assigned (initialization state)
     if (task == nullptr) {
         return;
@@ -47,8 +47,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
 }
 
 __aicore__ __attribute__((weak)) void AicoreExecute(__gm__ Runtime* runtime, int blockIdx, int coreType) {
-
-    __gm__ Handshake* my_hank = (__gm__ Handshake *)(&runtime->workers[blockIdx]);
+    __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[blockIdx]);
 
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {

@@ -29,13 +29,15 @@
  *              args[2] = out pointer (output tensor)
  *              args[3] = size (number of elements)
  */
-extern "C" __aicore__ __attribute__((always_inline)) void kernel_add_scalar(__gm__ int64_t* args)
-{
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_add_scalar(__gm__ int64_t* args) {
     // Unpack arguments
     __gm__ float* src = reinterpret_cast<__gm__ float*>(args[0]);
 
     // Convert scalar from uint64_t to float
-    union { uint64_t u64; float f32; } converter;
+    union {
+        uint64_t u64;
+        float f32;
+    } converter;
     converter.u64 = args[1];
     float scalar = converter.f32;
 
@@ -47,4 +49,3 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_add_scalar(__gm
         out[i] = src[i] + scalar;
     }
 }
-

@@ -3,10 +3,10 @@
  *
  * Implements: out[i] = src0[i] * src1[i]
  *
- * This kernel performs element-wise multiplication of two tensors. It's compiled
- * separately as a standalone kernel and linked with the dispatcher using
- * function pointers, demonstrating the separation pattern used in production
- * systems where kernel binaries are loaded dynamically.
+ * This kernel performs element-wise multiplication of two tensors. It's
+ * compiled separately as a standalone kernel and linked with the dispatcher
+ * using function pointers, demonstrating the separation pattern used in
+ * production systems where kernel binaries are loaded dynamically.
  */
 
 #include <cstdint>
@@ -29,8 +29,7 @@
  *              args[2] = out pointer (output tensor)
  *              args[3] = size (number of elements)
  */
-extern "C" __aicore__ __attribute__((always_inline)) void kernel_mul(__gm__ int64_t* args)
-{
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_mul(__gm__ int64_t* args) {
     // Unpack arguments
     __gm__ float* src0 = reinterpret_cast<__gm__ float*>(args[0]);
     __gm__ float* src1 = reinterpret_cast<__gm__ float*>(args[1]);
@@ -42,4 +41,3 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_mul(__gm__ int6
         out[i] = src0[i] * src1[i];
     }
 }
-

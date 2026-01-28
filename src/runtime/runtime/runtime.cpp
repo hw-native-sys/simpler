@@ -45,8 +45,7 @@ int Runtime::add_task(uint64_t* args, int num_args, int func_id, int core_type) 
     }
 
     if (num_args > RUNTIME_MAX_ARGS) {
-        fprintf(stderr, "[Runtime] ERROR: Too many args (%d > %d)\n",
-                num_args, RUNTIME_MAX_ARGS);
+        fprintf(stderr, "[Runtime] ERROR: Too many args (%d > %d)\n", num_args, RUNTIME_MAX_ARGS);
         return -1;
     }
 
@@ -61,7 +60,7 @@ int Runtime::add_task(uint64_t* args, int num_args, int func_id, int core_type) 
     if (args && num_args > 0) {
         memcpy(task->args, args, num_args * sizeof(uint64_t));
     }
-    task->functionBinAddr = 0;  // Will be set by host before copying to device
+    task->functionBinAddr = 0;    // Will be set by host before copying to device
     task->core_type = core_type;  // Set core type (0=AIC, 1=AIV)
     task->fanin = 0;
     task->fanout_count = 0;
@@ -87,8 +86,7 @@ void Runtime::add_successor(int from_task, int to_task) {
 
     // Add to_task to from_task's fanout
     if (from->fanout_count >= RUNTIME_MAX_FANOUT) {
-        fprintf(stderr, "[Runtime] ERROR: Fanout overflow for task %d (max=%d)\n",
-                from_task, RUNTIME_MAX_FANOUT);
+        fprintf(stderr, "[Runtime] ERROR: Fanout overflow for task %d (max=%d)\n", from_task, RUNTIME_MAX_FANOUT);
         return;
     }
 
@@ -107,9 +105,7 @@ Task* Runtime::get_task(int task_id) {
     return &tasks[task_id];
 }
 
-int Runtime::get_task_count() const {
-    return next_task_id;
-}
+int Runtime::get_task_count() const { return next_task_id; }
 
 int Runtime::get_initial_ready_tasks(int* ready_tasks) {
     initial_ready_count = 0;
@@ -130,14 +126,20 @@ int Runtime::get_initial_ready_tasks(int* ready_tasks) {
 // =============================================================================
 
 void Runtime::print_runtime() const {
-    printf("\n================================================================================\n");
+    printf(
+        "\n===================================================================="
+        "============\n");
     printf("[Runtime] Task Runtime Status\n");
-    printf("================================================================================\n");
+    printf(
+        "======================================================================"
+        "==========\n");
     printf("  Total tasks: %d\n", next_task_id);
 
     // Print initially ready tasks
     printf("\nInitially Ready Tasks (fanin==0):\n");
-    printf("--------------------------------------------------------------------------------\n");
+    printf(
+        "----------------------------------------------------------------------"
+        "----------\n");
     printf("  ");
     int ready_count = 0;
     for (int i = 0; i < next_task_id; i++) {
@@ -153,21 +155,28 @@ void Runtime::print_runtime() const {
     printf("\n  Count: %d\n", ready_count);
 
     printf("\nTask Table:\n");
-    printf("--------------------------------------------------------------------------------\n");
+    printf(
+        "----------------------------------------------------------------------"
+        "----------\n");
 
     for (int i = 0; i < next_task_id; i++) {
         const Task* t = &tasks[i];
 
         printf("  Task %d: func_id=%d, fanin=%d, fanout=%d, args=%d [",
-               i, t->func_id, t->fanin.load(), t->fanout_count, t->num_args);
+            i,
+            t->func_id,
+            t->fanin.load(),
+            t->fanout_count,
+            t->num_args);
 
         // Print fanout list
         for (int j = 0; j < t->fanout_count; j++) {
-            printf("%d%s", t->fanout[j],
-                   j < t->fanout_count - 1 ? "," : "");
+            printf("%d%s", t->fanout[j], j < t->fanout_count - 1 ? "," : "");
         }
         printf("]\n");
     }
 
-    printf("================================================================================\n\n");
+    printf(
+        "======================================================================"
+        "==========\n\n");
 }

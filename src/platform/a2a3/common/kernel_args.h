@@ -37,18 +37,21 @@ extern "C" {
  * Field Access Patterns:
  * - unused[5]: Padding for alignment with CANN runtime expectations
  * - deviceArgs: Written by host, read by AICPU (contains aicpuSoBin/aicpuSoLen)
- * - block_dim: Written by host, read by AICPU (number of blocks, each block = 1 AIC + 2 AIV)
+ * - block_dim: Written by host, read by AICPU (number of blocks, each block = 1
+ * AIC + 2 AIV)
  * - nrAic: Written by host, read by AICPU (number of AIC cores)
- * - scheCpuNum: Written by host, read by AICPU (number of AICPU scheduling threads)
- * - runtimeArgs: Written by host, read by AICPU (task runtime, includes handshake buffers)
+ * - scheCpuNum: Written by host, read by AICPU (number of AICPU scheduling
+ * threads)
+ * - runtimeArgs: Written by host, read by AICPU (task runtime, includes
+ * handshake buffers)
  *
  * Note: AICore kernels receive Runtime* directly, not KernelArgs
  *       - AICPU: accesses runtimeArgs->workers directly
  *       - AICore: receives Runtime* pointer with workers at offset 0
  */
 struct KernelArgs {
-    uint64_t unused[5] = {0};        // Alignment padding (required by CANN runtime offset)
-    DeviceArgs *deviceArgs{nullptr};    // Device arguments (AICPU reads, contains SO info)
+    uint64_t unused[5] = {0};         // Alignment padding (required by CANN runtime offset)
+    DeviceArgs *deviceArgs{nullptr};  // Device arguments (AICPU reads, contains SO info)
     Runtime *runtimeArgs{nullptr};    // Task runtime in device memory
 };
 

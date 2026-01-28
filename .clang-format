@@ -1,0 +1,25 @@
+BasedOnStyle: Google
+IndentWidth: 4
+
+# 列宽限制，超过此宽度会自动换行
+ColumnLimit: 120
+
+# 续行缩进宽度（函数参数换行等）
+ContinuationIndentWidth: 4
+
+# 开括号后的对齐方式：DontAlign 表示不对齐到括号位置
+# 可选值：Align, DontAlign, AlwaysBreak, BlockIndent
+AlignAfterOpenBracket: DontAlign
+
+# 允许函数声明的所有参数放到下一行
+AllowAllParametersOfDeclarationOnNextLine: true
+
+# 允许函数调用的所有参数放到下一行
+AllowAllArgumentsOnNextLine: true
+
+# 不紧凑排列参数，每个参数一行（如果需要换行的话）
+BinPackParameters: false
+BinPackArguments: false
+
+# 访问修饰符(public/private/protected)的缩进偏移，-4表示与class对齐
+AccessModifierOffset: -4
