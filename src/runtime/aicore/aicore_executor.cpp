@@ -46,7 +46,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
     kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
 }
 
-__aicore__ __attribute__((always_inline)) static void AicoreExecute(__gm__ Runtime* runtime, int blockIdx, int coreType) {
+__aicore__ __attribute__((weak)) void AicoreExecute(__gm__ Runtime* runtime, int blockIdx, int coreType) {
 
     __gm__ Handshake* my_hank = (__gm__ Handshake *)(&runtime->workers[blockIdx]);
 

@@ -53,10 +53,10 @@ def check_and_build_runtime():
     print("\n[1/3] Compiling AICore kernel...")
     try:
         aicore_include_dirs = [
-            str(runtime_root / "src" / "runtime" / "aicore"),
             str(runtime_root / "src" / "runtime" / "runtime"),
         ]
         aicore_source_dirs = [
+            str(runtime_root / "src" / "runtime" / "aicore"),
             str(runtime_root / "src" / "runtime" / "runtime"),
         ]
         aicore_binary = compiler.compile("aicore", aicore_include_dirs, aicore_source_dirs)

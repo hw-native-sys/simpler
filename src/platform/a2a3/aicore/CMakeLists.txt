@@ -16,33 +16,25 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build with `Task` implementation")
 endif()
 
-# Build complete source list: kernel.cpp + sources from CUSTOM_SOURCE_DIRS
-set(AICORE_KERNEL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/kernel.cpp")
-file(GLOB DIR_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../common/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/../common/*.c")
-list(APPEND AICORE_KERNEL_SOURCES ${DIR_SOURCES})
+# Build complete source list: kernel.cpp + common + CUSTOM_SOURCE_DIRS
+set(ALL_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/kernel.cpp")
+file(GLOB COMMON_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../common/*.cpp" "${CMAKE_CURRENT_SOURCE_DIR}/../common/*.c")
+list(APPEND ALL_SOURCES ${COMMON_SOURCES})
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
         file(GLOB DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
-        list(APPEND AICORE_KERNEL_SOURCES ${DIR_SOURCES})
+        list(APPEND ALL_SOURCES ${DIR_SOURCES})
     endforeach()
 else()
     message(FATAL_ERROR "MUST set CUSTOM_SOURCE_DIRS to build with `Task` implementation")
 endif()
-list(LENGTH AICORE_KERNEL_SOURCES NUM_SOURCES)
+list(LENGTH ALL_SOURCES NUM_SOURCES)
+message(STATUS "AICore kernel: ${NUM_SOURCES} source files")
 
-# Final linked kernel object
+# Output files
 set(AICORE_KERNEL_OBJ ${CMAKE_CURRENT_BINARY_DIR}/aicore_kernel.o)
 
-# Generate object file paths for each source
-set(ALL_AIC_OBJECTS "")
-set(ALL_AIV_OBJECTS "")
-
-foreach(SRC_FILE ${AICORE_KERNEL_SOURCES})
-    get_filename_component(SRC_NAME ${SRC_FILE} NAME_WE)
-    list(APPEND ALL_AIC_OBJECTS "${CMAKE_CURRENT_BINARY_DIR}/${SRC_NAME}_aic.o")
-    list(APPEND ALL_AIV_OBJECTS "${CMAKE_CURRENT_BINARY_DIR}/${SRC_NAME}_aiv.o")
-endforeach()
-
+# Compiler flags
 set(AICORE_FLAGS
     "-c -O3 -g -x cce -Wall -std=c++17 \
     --cce-aicore-only \
@@ -55,17 +47,23 @@ set(AICORE_FLAGS
 )
 separate_arguments(AICORE_FLAGS)
 
-# Generate compilation commands for each source file
-foreach(SRC_FILE ${AICORE_KERNEL_SOURCES})
+# Step 1: Compile each source file to individual .o files for AIC and AIV
+set(ALL_AIC_OBJECTS "")
+set(ALL_AIV_OBJECTS "")
+
+foreach(SRC_FILE ${ALL_SOURCES})
     get_filename_component(SRC_NAME ${SRC_FILE} NAME_WE)
     set(OBJ_AIC "${CMAKE_CURRENT_BINARY_DIR}/${SRC_NAME}_aic.o")
     set(OBJ_AIV "${CMAKE_CURRENT_BINARY_DIR}/${SRC_NAME}_aiv.o")
+
+    list(APPEND ALL_AIC_OBJECTS ${OBJ_AIC})
+    list(APPEND ALL_AIV_OBJECTS ${OBJ_AIV})
 
     # Compile for AIC architecture
     add_custom_command(
         OUTPUT ${OBJ_AIC}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} -D__AIC__ --cce-aicore-arch=dav-c220-cube
-        -o ${OBJ_AIC} ${SRC_FILE}
+                -o ${OBJ_AIC} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
         COMMENT "Compiling ${SRC_NAME} for AIC"
     )
@@ -74,18 +72,36 @@ foreach(SRC_FILE ${AICORE_KERNEL_SOURCES})
     add_custom_command(
         OUTPUT ${OBJ_AIV}
         COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} -D__AIV__ --cce-aicore-arch=dav-c220-vec
-        -o ${OBJ_AIV} ${SRC_FILE}
+                -o ${OBJ_AIV} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
         COMMENT "Compiling ${SRC_NAME} for AIV"
     )
 endforeach()
 
-# Link all AIC and AIV objects together
+# Step 2: Combine all .o files using ld -r (relocatable link)
+set(COMBINED_AIC_OBJ "${CMAKE_CURRENT_BINARY_DIR}/aicore_aic_combined.o")
+set(COMBINED_AIV_OBJ "${CMAKE_CURRENT_BINARY_DIR}/aicore_aiv_combined.o")
+
+add_custom_command(
+    OUTPUT ${COMBINED_AIC_OBJ}
+    COMMAND ${BISHENG_LD} -r -o ${COMBINED_AIC_OBJ} ${ALL_AIC_OBJECTS}
+    DEPENDS ${ALL_AIC_OBJECTS}
+    COMMENT "Combining ${NUM_SOURCES} AIC object files into single .o"
+)
+
+add_custom_command(
+    OUTPUT ${COMBINED_AIV_OBJ}
+    COMMAND ${BISHENG_LD} -r -o ${COMBINED_AIV_OBJ} ${ALL_AIV_OBJECTS}
+    DEPENDS ${ALL_AIV_OBJECTS}
+    COMMENT "Combining ${NUM_SOURCES} AIV object files into single .o"
+)
+
+# Step 3: Final link
 add_custom_target(aicore_kernel ALL
-    DEPENDS ${ALL_AIC_OBJECTS} ${ALL_AIV_OBJECTS}
+    DEPENDS ${COMBINED_AIC_OBJ} ${COMBINED_AIV_OBJ}
 
     COMMAND ${BISHENG_LD} -m aicorelinux -Ttext=0 -static -n
-    -o ${AICORE_KERNEL_OBJ} ${ALL_AIC_OBJECTS} ${ALL_AIV_OBJECTS}
+    -o ${AICORE_KERNEL_OBJ} ${COMBINED_AIC_OBJ} ${COMBINED_AIV_OBJ}
 
     BYPRODUCTS ${AICORE_KERNEL_OBJ}
     COMMENT "Linking AICore kernel binary"

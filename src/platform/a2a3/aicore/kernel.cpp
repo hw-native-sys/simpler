@@ -3,7 +3,6 @@
 */
 #include <cstdint>
 #include "aicore.h"
-#include "aicore_executor.h"
 
 class Runtime;
 
@@ -20,6 +19,7 @@ class Runtime;
 [[block_local]] int blockIdx;
 [[block_local]] int coreType;
 
+extern __aicore__ void AicoreExecute(__gm__ Runtime* runtime, int blockIdx, int coreType);
 
 /**
 * Kernel entry point with control loop
