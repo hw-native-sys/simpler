@@ -23,7 +23,7 @@ import numpy as np
 
 # Add parent directory to path so we can import runtime_bindings
 example_root = Path(__file__).parent
-runtime_root = Path(__file__).parent.parent
+runtime_root = Path(__file__).parent.parent.parent
 runtime_dir = runtime_root / "python"
 sys.path.insert(0, str(runtime_dir))
 sys.path.insert(0, str(example_root))

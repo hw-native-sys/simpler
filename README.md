@@ -9,7 +9,7 @@ The PTO Runtime consists of **three separate programs** that communicate through
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Python Application                        │
-│              (examples/basic/main.py)                       │
+│         (examples/host_build_graph_example/main.py)         │
 └─────────────────────────┬───────────────────────────────────┘
                           │
          ┌────────────────┼────────────────┐
@@ -20,8 +20,9 @@ The PTO Runtime consists of **three separate programs** that communicate through
          ▼                ▼                ▼
 ┌──────────────────┐  ┌──────────────────┐
 │   Host Runtime   │  │   Binary Data    │
-│   (src/host/)    │  │  (AICPU + AICore)│
-├──────────────────┤  └──────────────────┘
+│ (src/platform/   │  │  (AICPU + AICore)│
+│  a2a3/host/)     │  └──────────────────┘
+├──────────────────┤         │
 │ DeviceRunner     │         │
 │ Runtime          │         │
 │ MemoryAllocator  │    Loaded at runtime
@@ -34,14 +35,14 @@ The PTO Runtime consists of **three separate programs** that communicate through
     ┌────────────────────────────┐
     │  Ascend Device (Hardware)   │
     ├────────────────────────────┤
-    │ AICPU: Task Scheduler       │  (src/aicpu/)
-    │ AICore: Compute Kernels     │  (src/aicore/)
+    │ AICPU: Task Scheduler       │  (src/platform/a2a3/aicpu/)
+    │ AICore: Compute Kernels     │  (src/platform/a2a3/aicore/)
     └────────────────────────────┘
 ```
 
 ## Three Components
 
-### 1. Host Runtime (`src/host/`)
+### 1. Host Runtime (`src/platform/a2a3/host/`)
 **C++ library** - Device orchestration and management
 - `DeviceRunner`: Singleton managing device operations
 - `Runtime`: Task dependency runtime data structure
@@ -56,10 +57,10 @@ The PTO Runtime consists of **three separate programs** that communicate through
 - AICore kernel registration and loading
 - Runtime execution workflow coordination
 
-### 2. AICPU Kernel (`src/aicpu/`)
+### 2. AICPU Kernel (`src/platform/a2a3/aicpu/`)
 **Device program** - Task scheduler running on AICPU processor
 - `kernel.cpp`: Kernel entry points and handshake protocol
-- `execute.cpp`: Task scheduler implementation
+- Runtime-specific executor in `src/runtime/host_build_graph/aicpu/`
 - Compiled to device binary at build time
 
 **Key Responsibilities:**
@@ -69,9 +70,10 @@ The PTO Runtime consists of **three separate programs** that communicate through
 - Track task completion and update dependencies
 - Continue until all tasks complete
 
-### 3. AICore Kernel (`src/aicore/`)
+### 3. AICore Kernel (`src/platform/a2a3/aicore/`)
 **Device program** - Computation kernels executing on AICore processors
 - `kernel.cpp`: Task execution kernels (add, mul, etc.)
+- Runtime-specific executor in `src/runtime/host_build_graph/aicore/`
 - Compiled to object file (.o) at build time
 
 **Key Responsibilities:**
@@ -85,7 +87,7 @@ The PTO Runtime consists of **three separate programs** that communicate through
 
 Three layers of APIs enable the separation:
 
-### Layer 1: C++ API (`src/host/devicerunner.h`)
+### Layer 1: C++ API (`src/platform/a2a3/host/devicerunner.h`)
 ```cpp
 DeviceRunner& runner = DeviceRunner::Get();
 runner.Init(device_id, num_cores, aicpu_bin, aicore_bin, pto_isa_root);
@@ -95,7 +97,7 @@ runner.Run(runtime);
 runner.Finalize();
 ```
 
-### Layer 2: C API (`src/host/pto_runtime_c_api.h`)
+### Layer 2: C API (`src/platform/a2a3/host/pto_runtime_c_api.h`)
 ```c
 int DeviceRunner_Init(device_id, num_cores, aicpu_binary, aicpu_size,
                       aicore_binary, aicore_size, pto_isa_root);
@@ -119,43 +121,75 @@ runtime.finalize()
 ## Directory Structure
 
 ```
-runtime/
+pto-runtime/
 ├── src/
-│   ├── host/                        # Host runtime program
-│   │   ├── devicerunner.h/cpp       # Device management
-│   │   ├── memoryallocator.h/cpp    # Memory allocation
-│   │   ├── kernel_compiler.h/cpp    # Runtime kernel compilation
-│   │   ├── binary_loader.h/cpp      # Binary loading utilities
-│   │   ├── pto_runtime_c_api.h/cpp  # C API for bindings
-│   │   └── function_cache.h         # Kernel binary cache
-│   ├── aicpu/                       # AICPU kernel (device program)
-│   │   ├── kernel.cpp              # Entry points & handshake
-│   │   ├── execute.cpp             # Task scheduler
-│   │   └── device_log.h/cpp        # Device logging
-│   ├── aicore/                      # AICore kernel (device program)
-│   │   └── kernel.cpp              # Task execution kernels
-│   └── common/                      # Shared structures
-│       └── kernel_args.h            # Kernel argument structures
+│   ├── platform/                       # Platform-specific implementations
+│   │   └── a2a3/                       # Ascend A2/A3 platform
+│   │       ├── host/                   # Host runtime program
+│   │       │   ├── devicerunner.h/cpp  # Device management
+│   │       │   ├── memoryallocator.h/cpp # Memory allocation
+│   │       │   ├── function_cache.h    # Kernel binary cache
+│   │       │   └── pto_runtime_c_api.h/cpp # C API for bindings
+│   │       ├── aicpu/                  # AICPU kernel (device program)
+│   │       │   ├── kernel.cpp          # Entry points & handshake
+│   │       │   └── device_log.h/cpp    # Device logging
+│   │       ├── aicore/                 # AICore kernel (device program)
+│   │       │   ├── kernel.cpp          # Task execution kernels
+│   │       │   └── aicore.h            # AICore header
+│   │       └── common/                 # Shared structures
+│   │           └── kernel_args.h       # Kernel argument structures
+│   │
+│   └── runtime/                        # Runtime implementations
+│       └── host_build_graph/           # Host-built graph runtime
+│           ├── build_config.py         # Build configuration
+│           ├── host/
+│           │   └── runtimemaker.cpp    # C++ runtime builder & validator
+│           ├── aicpu/
+│           │   └── runtimeexecutor.cpp # Task scheduler implementation
+│           ├── aicore/
+│           │   └── aicore_executor.cpp # AICore task executor
+│           └── runtime/
+│               └── runtime.h/cpp       # Task runtime and handshake structures
 │
-├── python/                          # Language bindings
-│   ├── runtime_bindings.py          # ctypes wrapper (C → Python)
-│   ├── binary_compiler.py           # Multi-platform compiler
-│   └── toolchain.py                 # Toolchain configuration
+├── python/                             # Language bindings
+│   ├── runtime_bindings.py             # ctypes wrapper (C → Python)
+│   ├── runtime_builder.py              # Python runtime builder
+│   ├── binary_compiler.py              # Multi-platform compiler
+│   ├── pto_compiler.py                 # PTO kernel compiler
+│   ├── elf_parser.py                   # ELF binary parser
+│   └── toolchain.py                    # Toolchain configuration
 │
-├── examples/basic/                  # Complete working example
-│   ├── main.py                      # Python orchestration
-│   ├── host/runtimemaker.cpp        # C++ runtime builder & validator
-│   ├── aicpu/execute.cpp            # Example scheduler
-│   ├── runtime/                     # Task runtime definitions
-│   │   ├── runtime.h/cpp            # Task runtime and handshake structures
-│   │   └── kernel_args.h
-│   └── kernels/aiv/                 # Example kernels
-│       ├── kernel_add.cpp
-│       ├── kernel_add_scalar.cpp
-│       └── kernel_mul.cpp
+├── examples/                           # Working examples
+│   └── host_build_graph_example/       # Host-built graph example
+│       ├── main.py                     # Python orchestration
+│       ├── README.md                   # Example documentation
+│       └── kernels/
+│           ├── kernel_config.py        # Kernel configuration
+│           ├── aiv/                    # AIV kernels
+│           │   ├── kernel_add.cpp
+│           │   ├── kernel_add_scalar.cpp
+│           │   └── kernel_mul.cpp
+│           └── orchestration/
+│               └── example_orch.cpp    # Orchestration kernel
 │
-└── CMakeLists.txt                   # Build configuration
+└── tests/                              # Test suite
+    └── test_runtime_builder.py         # Runtime builder tests
 ```
+
+## Developer Guidelines
+
+Each developer role has a designated working directory:
+
+| Role | Directory | Responsibility |
+|------|-----------|----------------|
+| **Platform Developer** | `src/platform/` | Platform-specific logic and abstractions |
+| **Runtime Developer** | `src/runtime/` | Runtime logic (host, aicpu, aicore, common) |
+| **Codegen Developer** | `examples/` | Code generation examples and kernel implementations |
+
+**Rules:**
+- Stay within your assigned directory unless explicitly requested otherwise
+- Create new subdirectories under your assigned directory as needed
+- When in doubt, ask before making changes to other areas
 
 ## Building
 
@@ -228,7 +262,7 @@ runtime.finalize()  # Verify and cleanup
 ### Running the Example
 
 ```bash
-cd runtime/examples/basic
+cd examples/host_build_graph_example
 python3 main.py [device_id]
 ```
 
@@ -362,7 +396,7 @@ struct Handshake {
 
 ## Components in Detail
 
-### Host Runtime (`src/host/`)
+### Host Runtime (`src/platform/a2a3/host/`)
 
 **DeviceRunner**: Singleton managing device operations
 - Allocate/free device tensor memory
@@ -388,7 +422,7 @@ struct Handshake {
 - Error codes: 0=success, negative=failure
 - All memory management in C++
 
-### AICPU Kernel (`src/aicpu/`)
+### AICPU Kernel (`src/platform/a2a3/aicpu/`)
 
 **kernel.cpp**: Kernel entry points
 - Initialization kernel: Sets up handshake protocol
@@ -401,7 +435,7 @@ struct Handshake {
 - Dependency tracking and updates
 - Loop until completion
 
-### AICore Kernel (`src/aicore/`)
+### AICore Kernel (`src/platform/a2a3/aicore/`)
 
 **kernel.cpp**: Computation kernels
 - Task execution implementations
@@ -436,7 +470,7 @@ Full Python API with ctypes:
 ## Configuration
 
 ### Compile-time Configuration (Runtime Limits)
-In [src/runtime/runtime/runtime.h](src/runtime/runtime/runtime.h):
+In [src/runtime/host_build_graph/runtime/runtime.h](src/runtime/host_build_graph/runtime/runtime.h):
 ```cpp
 #define RUNTIME_MAX_TASKS 1024     // Maximum number of tasks
 #define RUNTIME_MAX_ARGS 16        // Maximum arguments per task
@@ -480,8 +514,9 @@ Kernel uses macros:
 
 ## References
 
-- [src/host/](src/host/) - Host runtime implementation details
-- [src/aicpu/](src/aicpu/) - AICPU scheduler implementation
-- [src/aicore/](src/aicore/) - AICore kernel implementation
-- [examples/basic/](examples/basic/) - Complete working example
+- [src/platform/a2a3/host/](src/platform/a2a3/host/) - Host runtime implementation details
+- [src/platform/a2a3/aicpu/](src/platform/a2a3/aicpu/) - AICPU scheduler implementation
+- [src/platform/a2a3/aicore/](src/platform/a2a3/aicore/) - AICore kernel implementation
+- [src/runtime/host_build_graph/](src/runtime/host_build_graph/) - Host-built graph runtime
+- [examples/host_build_graph_example/](examples/host_build_graph_example/) - Complete working example
 - [python/](python/) - Python bindings and compiler

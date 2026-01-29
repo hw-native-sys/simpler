@@ -3,4 +3,4 @@
 # run all tests
 pytest tests
 # run all examples
-python example/main.py
+python examples/host_build_graph_example/main.py
