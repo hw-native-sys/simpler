@@ -15,7 +15,7 @@ The PTO Runtime consists of **three separate programs** that communicate through
          ┌────────────────┼────────────────┐
          │                │                │
     Python Bindings   (ctypes)      Device I/O
-    runtime_bindings.py
+    bindings.py
          │                │                │
          ▼                ▼                ▼
 ┌──────────────────┐  ┌──────────────────┐
@@ -39,6 +39,22 @@ The PTO Runtime consists of **three separate programs** that communicate through
     │ AICore: Compute Kernels     │  (src/platform/a2a3/aicore/)
     └────────────────────────────┘
 ```
+
+## Platforms
+
+PTO Runtime supports multiple target platforms:
+
+| Platform | Description | Requirements |
+|----------|-------------|--------------|
+| `a2a3` | Real Ascend hardware | CANN toolkit (ccec, aarch64 cross-compiler) |
+| `a2a3sim` | Thread-based host simulation | gcc/g++ only (no Ascend SDK needed) |
+
+```python
+builder = RuntimeBuilder(platform="a2a3")      # Real hardware
+builder = RuntimeBuilder(platform="a2a3sim")   # Simulation
+```
+
+The simulation platform (`a2a3sim`) uses host threads to emulate AICPU/AICore execution, enabling development and testing without Ascend hardware. Kernel `.text` sections are loaded into mmap'd executable memory for direct invocation.
 
 ## Three Components
 
@@ -87,7 +103,7 @@ The PTO Runtime consists of **three separate programs** that communicate through
 
 Three layers of APIs enable the separation:
 
-### Layer 1: C++ API (`src/platform/a2a3/host/devicerunner.h`)
+### Layer 1: C++ API (`src/platform/a2a3/host/device_runner.h`)
 ```cpp
 DeviceRunner& runner = DeviceRunner::Get();
 runner.Init(device_id, num_cores, aicpu_bin, aicore_bin, pto_isa_root);
@@ -107,9 +123,9 @@ int FinalizeRuntime(runtime_handle);
 int DeviceRunner_Finalize();
 ```
 
-### Layer 3: Python API (`python/runtime_bindings.py`)
+### Layer 3: Python API (`python/bindings.py`)
 ```python
-Runtime = load_runtime(host_binary)
+Runtime = bind_host_binary(host_binary)
 runtime = Runtime()
 runtime.initialize()
 launch_runtime(runtime, aicpu_thread_num=1, block_dim=1,
@@ -124,35 +140,44 @@ runtime.finalize()
 pto-runtime/
 ├── src/
 │   ├── platform/                       # Platform-specific implementations
-│   │   └── a2a3/                       # Ascend A2/A3 platform
-│   │       ├── host/                   # Host runtime program
-│   │       │   ├── devicerunner.h/cpp  # Device management
-│   │       │   ├── memoryallocator.h/cpp # Memory allocation
-│   │       │   ├── function_cache.h    # Kernel binary cache
-│   │       │   └── pto_runtime_c_api.h/cpp # C API for bindings
-│   │       ├── aicpu/                  # AICPU kernel (device program)
-│   │       │   ├── kernel.cpp          # Entry points & handshake
-│   │       │   └── device_log.h/cpp    # Device logging
-│   │       ├── aicore/                 # AICore kernel (device program)
-│   │       │   ├── kernel.cpp          # Task execution kernels
-│   │       │   └── aicore.h            # AICore header
+│   │   ├── a2a3/                       # Ascend A2/A3 platform
+│   │   │   ├── host/                   # Host runtime program
+│   │   │   │   ├── device_runner.h/cpp  # Device management
+│   │   │   │   ├── memory_allocator.h/cpp # Memory allocation
+│   │   │   │   ├── function_cache.h    # Kernel binary cache
+│   │   │   │   └── pto_runtime_c_api.h/cpp # C API for bindings
+│   │   │   ├── aicpu/                  # AICPU kernel (device program)
+│   │   │   │   ├── kernel.cpp          # Entry points & handshake
+│   │   │   │   └── device_log.h/cpp    # Device logging
+│   │   │   ├── aicore/                 # AICore kernel (device program)
+│   │   │   │   ├── kernel.cpp          # Task execution kernels
+│   │   │   │   └── aicore.h            # AICore header
+│   │   │   └── common/                 # Shared structures
+│   │   │       └── kernel_args.h       # Kernel argument structures
+│   │   │
+│   │   └── a2a3sim/                    # Thread-based simulation platform
+│   │       ├── host/                   # Simulation host runtime
+│   │       │   ├── device_runner.h/cpp  # Thread-based device emulation
+│   │       │   ├── memory_allocator.h/cpp # Host memory allocation
+│   │       │   └── pto_runtime_c_api.h/cpp # Same C API as a2a3
+│   │       ├── aicpu/                  # Simulation AICPU
+│   │       ├── aicore/                 # Simulation AICore
 │   │       └── common/                 # Shared structures
-│   │           └── kernel_args.h       # Kernel argument structures
 │   │
 │   └── runtime/                        # Runtime implementations
 │       └── host_build_graph/           # Host-built graph runtime
 │           ├── build_config.py         # Build configuration
 │           ├── host/
-│           │   └── runtimemaker.cpp    # C++ runtime builder & validator
+│           │   └── runtime_maker.cpp    # C++ runtime builder & validator
 │           ├── aicpu/
-│           │   └── runtimeexecutor.cpp # Task scheduler implementation
+│           │   └── aicpu_executor.cpp # Task scheduler implementation
 │           ├── aicore/
 │           │   └── aicore_executor.cpp # AICore task executor
 │           └── runtime/
 │               └── runtime.h/cpp       # Task runtime and handshake structures
 │
 ├── python/                             # Language bindings
-│   ├── runtime_bindings.py             # ctypes wrapper (C → Python)
+│   ├── bindings.py                      # ctypes wrapper (C → Python)
 │   ├── runtime_builder.py              # Python runtime builder
 │   ├── binary_compiler.py              # Multi-platform compiler
 │   ├── pto_compiler.py                 # PTO kernel compiler
@@ -160,17 +185,21 @@ pto-runtime/
 │   └── toolchain.py                    # Toolchain configuration
 │
 ├── examples/                           # Working examples
-│   └── host_build_graph_example/       # Host-built graph example
+│   ├── host_build_graph_example/       # Host-built graph example (a2a3)
+│   │   ├── main.py                     # Python orchestration
+│   │   ├── README.md                   # Example documentation
+│   │   └── kernels/
+│   │       ├── kernel_config.py        # Kernel configuration
+│   │       ├── aiv/                    # AIV kernels
+│   │       │   ├── kernel_add.cpp
+│   │       │   ├── kernel_add_scalar.cpp
+│   │       │   └── kernel_mul.cpp
+│   │       └── orchestration/
+│   │           └── example_orch.cpp    # Orchestration kernel
+│   │
+│   └── host_build_graph_sim_example/   # Simulation example (a2a3sim)
 │       ├── main.py                     # Python orchestration
-│       ├── README.md                   # Example documentation
-│       └── kernels/
-│           ├── kernel_config.py        # Kernel configuration
-│           ├── aiv/                    # AIV kernels
-│           │   ├── kernel_add.cpp
-│           │   ├── kernel_add_scalar.cpp
-│           │   └── kernel_mul.cpp
-│           └── orchestration/
-│               └── example_orch.cpp    # Orchestration kernel
+│       └── kernels/                    # Simulation kernels (plain C++)
 │
 └── tests/                              # Test suite
     └── test_runtime_builder.py         # Runtime builder tests
@@ -209,12 +238,16 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 
 ### Build Process
 
-The **BinaryCompiler** class handles compilation of all three components separately:
+The **BinaryCompiler** class handles compilation of all three components separately. Use the `platform` parameter to select the target platform:
 
 ```python
 from binary_compiler import BinaryCompiler
 
-compiler = BinaryCompiler()
+# For real Ascend hardware (requires CANN toolkit)
+compiler = BinaryCompiler(platform="a2a3")
+
+# For simulation (no Ascend SDK needed)
+compiler = BinaryCompiler(platform="a2a3sim")
 
 # Compile each component to independent binaries
 aicore_binary = compiler.compile("aicore", include_dirs, source_dirs)    # → .o file
@@ -223,9 +256,10 @@ host_binary = compiler.compile("host", include_dirs, source_dirs)        # → .
 ```
 
 **Toolchains used:**
-- **AICore**: Bisheng CCE (`ccec` compiler) → `.o` object file
-- **AICPU**: aarch64 cross-compiler → `.so` shared object
+- **AICore**: Bisheng CCE (`ccec` compiler) → `.o` object file (a2a3 only)
+- **AICPU**: aarch64 cross-compiler → `.so` shared object (a2a3 only)
 - **Host**: Standard gcc/g++ → `.so` shared library
+- **HostSim**: Standard gcc/g++ for all targets (a2a3sim)
 
 Each component is compiled independently with its own toolchain, allowing modular development.
 
@@ -234,7 +268,7 @@ Each component is compiled independently with its own toolchain, allowing modula
 ### Quick Start - Python Example
 
 ```python
-from runtime_bindings import load_runtime
+from bindings import bind_host_binary
 from binary_compiler import BinaryCompiler
 
 # Compile all binaries
@@ -244,7 +278,7 @@ aicpu_bin = compiler.compile("aicpu", [...include_dirs...], [...source_dirs...])
 host_bin = compiler.compile("host", [...include_dirs...], [...source_dirs...])
 
 # Load and initialize runtime
-Runtime = load_runtime(host_bin)
+Runtime = bind_host_binary(host_bin)
 runtime = Runtime()
 runtime.initialize()  # C++ builds runtime and allocates tensors
 
@@ -296,7 +330,7 @@ Python main.py
   ├─→ BinaryCompiler.compile("aicpu", ...) → aicpu_binary (.so)
   ├─→ BinaryCompiler.compile("aicore", ...) → aicore_binary (.o)
   │
-  └─→ load_runtime(host_binary)
+  └─→ bind_host_binary(host_binary)
        └─→ RuntimeLibraryLoader(host_binary)
             └─→ CDLL(host_binary) ← Loads .so into memory
 ```
@@ -514,9 +548,11 @@ Kernel uses macros:
 
 ## References
 
-- [src/platform/a2a3/host/](src/platform/a2a3/host/) - Host runtime implementation details
+- [src/platform/a2a3/host/](src/platform/a2a3/host/) - Host runtime implementation (real hardware)
 - [src/platform/a2a3/aicpu/](src/platform/a2a3/aicpu/) - AICPU scheduler implementation
 - [src/platform/a2a3/aicore/](src/platform/a2a3/aicore/) - AICore kernel implementation
+- [src/platform/a2a3sim/](src/platform/a2a3sim/) - Thread-based simulation platform
 - [src/runtime/host_build_graph/](src/runtime/host_build_graph/) - Host-built graph runtime
-- [examples/host_build_graph_example/](examples/host_build_graph_example/) - Complete working example
+- [examples/host_build_graph_example/](examples/host_build_graph_example/) - Hardware example (a2a3)
+- [examples/host_build_graph_sim_example/](examples/host_build_graph_sim_example/) - Simulation example (a2a3sim)
 - [python/](python/) - Python bindings and compiler

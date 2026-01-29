@@ -187,7 +187,7 @@ int AicpuExecutor::hank_aicore(Runtime* runtime, int thread_idx, const int* cur_
         Handshake* hank = &all_hanks[core_id];
         while (hank->aicore_done == 0) {
         }
-        DEV_INFO("Thread %d: success hank->aicore_done = %u", thread_idx, (uint64_t)hank->aicore_done);
+        DEV_INFO("Thread %d: success hank->aicore_done = %u", thread_idx, hank->aicore_done);
     }
     return 0;
 }

@@ -166,3 +166,47 @@ class HostToolchain:
             f"-DCUSTOM_INCLUDE_DIRS={include_dirs_list}",
             f"-DCUSTOM_SOURCE_DIRS={source_dirs_list}",
         ])
+
+
+class HostSimToolchain:
+    """
+    Host simulation toolchain for compiling simulation binaries.
+    Uses host gcc/g++ without requiring Ascend SDK paths.
+    """
+    def __init__(self, cc: str, cxx: str, host_dir: str, binary_name: str = "libhost_runtime.so"):
+        """
+        Initialize the Host simulation toolchain.
+
+        Args:
+            cc: Path to the C compiler (e.g., gcc)
+            cxx: Path to the C++ compiler (e.g., g++)
+            host_dir: Path to the host source directory
+            binary_name: Name of the shared library output
+        """
+        self.cc = cc
+        self.cxx = cxx
+        self.host_dir = os.path.abspath(host_dir)
+        self.binary_name = binary_name
+
+    def get_root_dir(self) -> str:
+        """Get the host source root directory."""
+        return self.host_dir
+
+    def get_binary_name(self) -> str:
+        """Get the output binary name."""
+        return self.binary_name
+
+    def gen_cmake_args(self, include_dirs: List[str], source_dirs: List[str]) -> str:
+        """Generate CMake arguments without Ascend dependencies."""
+        include_dirs = [os.path.abspath(d) for d in include_dirs]
+        source_dirs = [os.path.abspath(d) for d in source_dirs]
+
+        include_dirs_list = ";".join(include_dirs)
+        source_dirs_list = ";".join(source_dirs)
+
+        return " ".join([
+            f"-DCMAKE_C_COMPILER={self.cc}",
+            f"-DCMAKE_CXX_COMPILER={self.cxx}",
+            f"-DCUSTOM_INCLUDE_DIRS={include_dirs_list}",
+            f"-DCUSTOM_SOURCE_DIRS={source_dirs_list}",
+        ])

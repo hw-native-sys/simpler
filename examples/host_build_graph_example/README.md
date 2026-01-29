@@ -15,20 +15,23 @@ With input values `a=2.0` and `b=3.0`, the expected result is `f = (2+3+1)*(2+3+
 
 ## Building
 
-From the runtime directory:
+The example uses Python-driven compilation via RuntimeBuilder:
 
-```bash
-mkdir -p build && cd build
-cmake .. -DBUILD_PYTHON_BINDINGS=ON
-make -j
+```python
+from runtime_builder import RuntimeBuilder
+
+builder = RuntimeBuilder(platform="a2a3")
+host_binary, aicpu_binary, aicore_binary = builder.build("host_build_graph")
 ```
+
+No separate CMake build step is required - RuntimeBuilder handles compilation automatically.
 
 ## Dependencies
 
 - Python 3
 - NumPy
-- CANN Runtime (Ascend)
-- PTO Runtime Python bindings (built automatically)
+- CANN Runtime (Ascend) with ASCEND_HOME_PATH set
+- gcc/g++ compiler
 
 ## Running the Example
 
@@ -44,7 +47,7 @@ export PTO_ISA_ROOT=$(pwd)/_deps/pto-isa-src
 ### Run the Example
 
 ```bash
-cd ../examples/basic
+cd examples/host_build_graph_example
 python3 main.py <device_id>
 ```
 
@@ -94,17 +97,14 @@ Formula verified: (a + b + 1)(a + b + 2) = (2+3+1)*(2+3+2) = 42
 
 ## How It Works
 
-1. **Initialize Device**: The example initializes the DeviceRunner with the specified device ID
-2. **Compile Kernels**: Three kernels are compiled at runtime:
-   - `kernel_add.cpp`: Element-wise addition
-   - `kernel_add_scalar.cpp`: Add scalar to each element
-   - `kernel_mul.cpp`: Element-wise multiplication
-3. **Allocate Memory**: Device memory is allocated for 6 tensors (a, b, c, d, e, f)
-4. **Copy Input**: Input data is copied from host to device
-5. **Build Runtime**: A task dependency runtime is constructed with proper dependencies
-6. **Execute Runtime** (Python): Python calls `runner.run(runtime)` to execute the runtime on device
-7. **Validate**: Results are copied back and verified
-8. **Cleanup**: All resources are freed
+1. **Build Runtime**: RuntimeBuilder compiles host, AICPU, and AICore binaries
+2. **Load Runtime Library**: `bind_host_binary()` loads the host .so via ctypes
+3. **Set Device**: Initialize the target device
+4. **Compile Orchestration**: Compile the orchestration function that builds the task graph
+5. **Compile & Register Kernels**: Compile AIV kernels using PTOCompiler and register them
+6. **Initialize Runtime**: Call `runtime.initialize()` with orchestration and input tensors
+7. **Execute Runtime**: `launch_runtime()` executes the task graph on device
+8. **Finalize**: Copy results back and verify correctness
 
 ### Execution Flow
 
@@ -142,11 +142,12 @@ See the main [runtime README](../../README.md) for detailed documentation on the
 
 ## Troubleshooting
 
-### Import Error: Cannot import pto_runtime
+### Import Error: Cannot import bindings
 
-Make sure PYTHONPATH is set correctly:
+Make sure you are running from the correct directory and the python/ directory is in your path:
 ```bash
-export PYTHONPATH=/path/to/runtime/build/python:$PYTHONPATH
+cd examples/host_build_graph_example
+python3 main.py
 ```
 
 ### Kernel Compilation Failed
@@ -163,3 +164,7 @@ Or set it to your custom PTO-ISA installation path.
 - Verify CANN runtime is installed and ASCEND_HOME_PATH is set
 - Check that the specified device ID is valid (0-15)
 - Ensure you have permission to access the device
+
+## See Also
+
+For a simulation-based version that runs without Ascend hardware, see [host_build_graph_sim_example](../host_build_graph_sim_example/).

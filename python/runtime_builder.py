@@ -3,18 +3,28 @@ from pathlib import Path
 from typing import Optional
 
 from binary_compiler import BinaryCompiler
+from pto_compiler import PTOCompiler
 
 
 class RuntimeBuilder:
-    """Discovers and builds runtime implementations from src/runtime/."""
+    """Discovers and builds runtime implementations from src/runtime/.
 
-    def __init__(self, runtime_root: Optional[Path] = None):
+    Accepts a platform selection to provide correctly configured
+    BinaryCompiler and PTOCompiler instances. Runtime and platform
+    are orthogonal — the same runtime (e.g., host_build_graph) can
+    be compiled for any platform (e.g., a2a3, a2a3sim).
+    """
+
+    def __init__(self, platform: str = "a2a3", runtime_root: Optional[Path] = None):
         """
-        Scan src/runtime/ for subdirectories containing build_config.py.
+        Initialize RuntimeBuilder with platform selection.
 
         Args:
+            platform: Target platform ("a2a3" or "a2a3sim")
             runtime_root: Root directory of the project. Defaults to parent of python/.
         """
+        self.platform = platform
+
         if runtime_root is None:
             runtime_root = Path(__file__).parent.parent
         self.runtime_root = runtime_root
@@ -27,6 +37,18 @@ class RuntimeBuilder:
                 config_path = entry / "build_config.py"
                 if entry.is_dir() and config_path.is_file():
                     self._runtimes[entry.name] = config_path
+
+        # Create platform-configured compilers
+        self._binary_compiler = BinaryCompiler(platform=platform)
+        self._pto_compiler = PTOCompiler(platform=platform)
+
+    def get_binary_compiler(self) -> BinaryCompiler:
+        """Return the BinaryCompiler configured for this platform."""
+        return self._binary_compiler
+
+    def get_pto_compiler(self) -> PTOCompiler:
+        """Return the PTOCompiler configured for this platform."""
+        return self._pto_compiler
 
     def list_runtimes(self) -> list:
         """Return names of discovered runtime implementations."""
@@ -60,7 +82,7 @@ class RuntimeBuilder:
         spec.loader.exec_module(build_config_module)
         build_config = build_config_module.BUILD_CONFIG
 
-        compiler = BinaryCompiler()
+        compiler = self._binary_compiler
 
         # Compile AICore kernel
         print("\n[1/3] Compiling AICore kernel...")

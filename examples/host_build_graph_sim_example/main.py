@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
 """
-Main Example - PTO Runtime with Dynamic Orchestration
+A2A3Sim Python Example - Thread-based Simulation via Python
 
-This program demonstrates how to use the runtime with dynamic orchestration
-functions that can be compiled and loaded at runtime.
+This demonstrates calling the a2a3sim simulation platform from Python,
+following the same flow as host_build_graph_example/main.py:
 
-Flow:
-1. Python: Load runtime, compile orchestration, register kernels
-2. Python: Prepare input tensors (numpy arrays)
-3. C++ InitRuntime(): Calls orchestration to allocate device memory, copy data, build graph
-4. Python launch_runtime(): Executes the runtime on device
-5. C++ FinalizeRuntime(): Copies results back to host, frees device memory
+1. Build simulation runtime as .so via RuntimeBuilder
+2. Compile kernels to .o with g++, extract .text, register as binary
+3. Compile orchestration to .so, initialize runtime, execute
+
+The simulation uses threads on host to emulate device execution.
+Kernel .text sections are loaded into mmap'd executable memory.
 
 Example usage:
-   python main.py -d <device_id>
+    python main.py
 """
 
 import sys
@@ -34,25 +34,23 @@ try:
     from elf_parser import extract_text_section
     from kernels.kernel_config import KERNELS, ORCHESTRATION
 except ImportError as e:
-    print(f"Error: Cannot import bindings module: {e}")
+    print(f"Error: Cannot import module: {e}")
     print("Make sure you are running this from the correct directory")
     sys.exit(1)
 
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(description="PTO Runtime with Dynamic Orchestration")
+    parser = argparse.ArgumentParser(description="A2A3Sim Python Example")
     parser.add_argument("-d", "--device", type=int, default=0,
-                        help="Device ID (0-15, default: 0)")
+                        help="Device ID (simulation, default: 0)")
     args = parser.parse_args()
 
     device_id = args.device
-    if device_id < 0 or device_id > 15:
-        print(f"Error: device_id ({device_id}) out of range [0, 15]")
-        return -1
 
-    # Check and build runtime if necessary
-    builder = RuntimeBuilder(platform="a2a3")
+    # Build simulation runtime
+    print("\n=== Building Simulation Runtime ===")
+    builder = RuntimeBuilder(platform="a2a3sim")
     pto_compiler = builder.get_pto_compiler()
     print(f"Available runtimes: {builder.list_runtimes()}")
     try:
@@ -66,7 +64,7 @@ def main():
     Runtime = bind_host_binary(host_binary)
     print(f"Loaded runtime ({len(host_binary)} bytes)")
 
-    # Set device before creating runtime (enables memory allocation)
+    # Set device (no-op in simulation, records device ID)
     print(f"\n=== Setting Device {device_id} ===")
     set_device(device_id)
 
@@ -81,23 +79,27 @@ def main():
     )
     print(f"Compiled orchestration: {len(orch_so_binary)} bytes")
 
-    # Compile and register kernels (Python-side compilation)
-    print("\n=== Compiling and Registering Kernels ===")
+    # Compile and register simulation kernels
+    print("\n=== Compiling and Registering Simulation Kernels ===")
 
+    # Define pto_isa_root for a2a3 platform (not needed for a2a3sim, but kept for compatibility)
     pto_isa_root = "/data/wcwxy/workspace/pypto/pto-isa"
 
     for kernel in KERNELS:
         print(f"Compiling {kernel['source']}...")
-        incore_o = pto_compiler.compile_incore(
+        # compile_incore handles platform dispatch internally
+        kernel_o = pto_compiler.compile_incore(
             kernel["source"],
-            core_type=kernel["core_type"],
+            core_type=kernel.get("core_type", "aiv"),
             pto_isa_root=pto_isa_root
         )
-        kernel_bin = extract_text_section(incore_o)
+
+        # Extract .text section (raw machine code)
+        kernel_bin = extract_text_section(kernel_o)
+        # Register kernel binary (will be mmap'd as executable memory)
         register_kernel(kernel["func_id"], kernel_bin)
 
     print("All kernels compiled and registered successfully")
-
 
     # Prepare input tensors
     print("\n=== Preparing Input Tensors ===")
@@ -132,14 +134,14 @@ def main():
     runtime = Runtime()
     runtime.initialize(orch_so_binary, ORCHESTRATION["function_name"], func_args)
 
-    # Execute runtime on device
-    print("\n=== Executing Runtime on Device ===")
+    # Execute runtime (simulation: uses threads)
+    print("\n=== Executing Runtime (Simulation) ===")
     launch_runtime(runtime,
-                 aicpu_thread_num=3,
-                 block_dim=3,
-                 device_id=device_id,
-                 aicpu_binary=aicpu_binary,
-                 aicore_binary=aicore_binary)
+                   aicpu_thread_num=3,
+                   block_dim=3,
+                   device_id=device_id,
+                   aicpu_binary=aicpu_binary,
+                   aicore_binary=aicore_binary)
 
     # Finalize and copy results back to host
     print("\n=== Finalizing and Copying Results ===")

@@ -6,9 +6,9 @@ Provides a Pythonic interface to the PTO runtime via ctypes.
 Users must provide a pre-compiled libpto_runtime.so (built via binary_compiler.py).
 
 Usage:
-    from runtime_bindings import load_runtime, register_kernel, launch_runtime
+    from bindings import bind_host_binary, register_kernel, launch_runtime
 
-    Runtime = load_runtime("/path/to/libpto_runtime.so")
+    Runtime = bind_host_binary("/path/to/libpto_runtime.so")
 
     runtime = Runtime()
     runtime.initialize(orch_so_binary, "build_example_graph", func_args)
@@ -244,7 +244,7 @@ def register_kernel(func_id: int, binary_data: bytes) -> None:
 
     global _lib
     if _lib is None:
-        raise RuntimeError("Runtime not loaded. Call load_runtime() first.")
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
 
     if not binary_data:
         raise ValueError("binary_data cannot be empty")
@@ -277,7 +277,7 @@ def set_device(device_id: int) -> None:
 
     global _lib
     if _lib is None:
-        raise RuntimeError("Runtime not loaded. Call load_runtime() first.")
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
 
     rc = _lib.set_device(device_id)
     if rc != 0:
@@ -313,7 +313,7 @@ def launch_runtime(
 
     global _lib
     if _lib is None:
-        raise RuntimeError("Runtime not loaded. Call load_runtime() first.")
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
 
     # Convert bytes to ctypes arrays
     aicpu_array = (c_uint8 * len(aicpu_binary)).from_buffer_copy(aicpu_binary)
@@ -337,7 +337,7 @@ def launch_runtime(
 # Public API
 # ============================================================================
 
-def load_runtime(lib_path: Union[str, Path, bytes]) -> type:
+def bind_host_binary(lib_path: Union[str, Path, bytes]) -> type:
     """
 
     Load the PTO runtime library and return Runtime class.
@@ -349,9 +349,9 @@ def load_runtime(lib_path: Union[str, Path, bytes]) -> type:
         Runtime class initialized with the library
 
     Example:
-        from runtime_bindings import load_runtime, register_kernel, launch_runtime
+        from bindings import bind_host_binary, register_kernel, launch_runtime
 
-        Runtime = load_runtime("/path/to/libpto_runtime.so")
+        Runtime = bind_host_binary("/path/to/libpto_runtime.so")
 
         runtime = Runtime()
         runtime.initialize(orch_so_binary, "build_example_graph", func_args)

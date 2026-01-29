@@ -1,43 +1,70 @@
 import os
 import subprocess
 import time
+from pathlib import Path
 from typing import List, Optional
 
 
 class PTOCompiler:
     """
-    Compiler for PTO AICore kernels.
+    Compiler for PTO kernels and orchestration functions.
 
-    Compiles single AICore kernel source files to .o using ccec compiler,
-    suitable for runtime kernel compilation without CMake.
+    Platform determines compilation method:
+    - "a2a3": Uses ccec for incore kernels (real hardware)
+    - "a2a3sim": Uses g++ for simulation kernels (host execution)
+
+    Both platforms use g++ for orchestration compilation.
     """
 
-    def __init__(self, ascend_home_path: Optional[str] = None):
+    def __init__(self, platform: str = "a2a3", ascend_home_path: Optional[str] = None):
         """
         Initialize PTOCompiler.
 
         Args:
+            platform: Target platform ("a2a3" or "a2a3sim")
             ascend_home_path: Path to Ascend toolkit. If None, reads from
                               ASCEND_HOME_PATH environment variable.
 
         Raises:
-            EnvironmentError: If ASCEND_HOME_PATH is not set and not provided
-            FileNotFoundError: If ccec compiler not found
+            ValueError: If platform is unknown
+            EnvironmentError: If ASCEND_HOME_PATH is not set for a2a3 platform
+            FileNotFoundError: If required compiler not found
         """
+        self.platform = platform
+        self.project_root = Path(__file__).parent.parent
+        self.platform_dir = self.project_root / "src" / "platform" / platform
+
+        if platform not in ("a2a3", "a2a3sim"):
+            raise ValueError(
+                f"Unknown platform: {platform}. Supported: a2a3, a2a3sim"
+            )
+
         if ascend_home_path is None:
             ascend_home_path = os.getenv("ASCEND_HOME_PATH")
 
-        if not ascend_home_path:
-            raise EnvironmentError(
-                "ASCEND_HOME_PATH environment variable is not set. "
-                "Please `source /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash`."
-            )
-
         self.ascend_home_path = ascend_home_path
-        self.cc_path = os.path.join(self.ascend_home_path, "bin", "ccec")
 
-        if not os.path.isfile(self.cc_path):
-            raise FileNotFoundError(f"ccec compiler not found: {self.cc_path}")
+        if platform == "a2a3":
+            if not self.ascend_home_path:
+                raise EnvironmentError(
+                    "ASCEND_HOME_PATH environment variable is not set. "
+                    "Please `source /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash`."
+                )
+            self.cc_path = os.path.join(self.ascend_home_path, "bin", "ccec")
+            if not os.path.isfile(self.cc_path):
+                raise FileNotFoundError(f"ccec compiler not found: {self.cc_path}")
+        else:
+            # a2a3sim uses g++ which is checked at compile time
+            self.cc_path = None
+
+    def get_platform_include_dirs(self) -> List[str]:
+        """
+        Get platform-specific include directories for orchestration compilation.
+
+        Returns:
+            List of include directory paths (e.g., for device_runner.h)
+        """
+        return [str(self.platform_dir / "host")]
 
     def compile_incore(
         self,
@@ -47,12 +74,14 @@ class PTOCompiler:
         extra_include_dirs: Optional[List[str]] = None
     ) -> bytes:
         """
-        Compile a single AICore incore source file to .o using ccec.
+        Compile a kernel source file. Dispatches based on platform:
+        - a2a3: Uses ccec compiler (requires pto_isa_root)
+        - a2a3sim: Uses compile_incore_sim (g++)
 
         Args:
             source_path: Path to kernel source file (.cpp)
             core_type: Core type: "aic" (cube) or "aiv" (vector). Default: "aiv"
-            pto_isa_root: Path to PTO-ISA root directory. Required.
+            pto_isa_root: Path to PTO-ISA root directory. Required for a2a3.
             extra_include_dirs: Additional include directories
 
         Returns:
@@ -60,9 +89,14 @@ class PTOCompiler:
 
         Raises:
             FileNotFoundError: If source file or PTO-ISA headers not found
-            ValueError: If pto_isa_root is not provided or core_type is invalid
+            ValueError: If pto_isa_root is not provided (for a2a3) or core_type is invalid
             RuntimeError: If compilation fails
         """
+        # For simulation platform, dispatch to compile_incore_sim
+        if self.platform == "a2a3sim":
+            return self.compile_incore_sim(source_path)
+
+        # For real hardware (a2a3), continue with ccec compilation
         # Validate source file exists
         source_path = os.path.abspath(source_path)
         if not os.path.isfile(source_path):
@@ -197,10 +231,13 @@ class PTOCompiler:
         The orchestration function must have signature:
             int FuncName(Runtime* runtime, uint64_t* args, int arg_count);
 
+        Note: Use get_platform_include_dirs() to get platform-specific includes
+        (e.g., for device_runner.h) and add them to extra_include_dirs.
+
         Args:
             source_path: Path to orchestration source file (.cpp)
             extra_include_dirs: Additional include directories (must include
-                               paths to runtime.h and devicerunner.h)
+                               paths to runtime.h and device_runner.h)
 
         Returns:
             Binary contents of the compiled .so file
@@ -230,9 +267,10 @@ class PTOCompiler:
             for inc_dir in extra_include_dirs:
                 cmd.append(f"-I{os.path.abspath(inc_dir)}")
 
-        # Add Ascend runtime include
-        ascend_include = os.path.join(self.ascend_home_path, "include")
-        cmd.append(f"-I{ascend_include}")
+        # Add Ascend runtime include if available
+        if self.ascend_home_path:
+            ascend_include = os.path.join(self.ascend_home_path, "include")
+            cmd.append(f"-I{ascend_include}")
 
         # Output and input
         cmd.extend(["-o", output_path, source_path])
@@ -276,4 +314,79 @@ class PTOCompiler:
         os.remove(output_path)
 
         print(f"[Orchestration] Compilation successful: {len(binary_data)} bytes")
+        return binary_data
+
+    def compile_incore_sim(self, source_path: str) -> bytes:
+        """
+        Compile a simulation kernel to .o using g++.
+
+        This compiles a simulation kernel (plain C++ code) to an object file,
+        which can then have its .text section extracted for execution on host.
+
+        Args:
+            source_path: Path to kernel source file (.cpp)
+
+        Returns:
+            Binary contents of the compiled .o file
+
+        Raises:
+            FileNotFoundError: If source file not found
+            RuntimeError: If compilation fails
+        """
+        source_path = os.path.abspath(source_path)
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Source file not found: {source_path}")
+
+        # Generate output path
+        timestamp = int(time.time() * 1000)
+        output_path = f"/tmp/sim_kernel_{timestamp}_{os.getpid()}.o"
+
+        # Build compilation command
+        cmd = [
+            "g++", "-c",
+            "-O2", "-fPIC", "-fno-plt",
+            "-std=c++17",
+            "-o", output_path,
+            source_path
+        ]
+
+        # Print compilation command
+        print(f"\n{'='*80}")
+        print(f"[SimKernel] Compiling: {source_path}")
+        print(f"  Command: {' '.join(cmd)}")
+        print(f"{'='*80}\n")
+
+        # Execute
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True
+            )
+
+            if result.stdout:
+                print(f"[SimKernel] stdout:\n{result.stdout}")
+            if result.stderr:
+                print(f"[SimKernel] stderr:\n{result.stderr}")
+
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"SimKernel compilation failed with exit code {result.returncode}:\n"
+                    f"{result.stderr}"
+                )
+
+        except FileNotFoundError:
+            raise RuntimeError("g++ compiler not found. Please install g++.")
+
+        # Verify output file exists and read binary data
+        if not os.path.isfile(output_path):
+            raise RuntimeError(f"Compilation succeeded but output file not found: {output_path}")
+
+        with open(output_path, 'rb') as f:
+            binary_data = f.read()
+
+        # Clean up temp file
+        os.remove(output_path)
+
+        print(f"[SimKernel] Compilation successful: {len(binary_data)} bytes")
         return binary_data
