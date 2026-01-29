@@ -117,8 +117,8 @@ typedef struct {
 
     // Runtime function pointer address (NEW)
     // This is the GM address where the kernel binary resides
-    // It's cast to a function pointer at runtime: (KernelFunc)functionBinAddr
-    uint64_t functionBinAddr;  // Address of kernel in device GM memory
+    // It's cast to a function pointer at runtime: (KernelFunc)function_bin_addr
+    uint64_t function_bin_addr;  // Address of kernel in device GM memory
 
     // Core type specification (NEW)
     // Specifies which core type this task should run on: 0=AIC, 1=AIV
@@ -154,8 +154,8 @@ public:
     int worker_count;                       // Number of active workers
 
     // Execution parameters for AICPU scheduling
-    int block_dim;   // Number of AIC blocks (block dimension)
-    int scheCpuNum;  // Number of AICPU threads for scheduling
+    int block_dim;     // Number of AIC blocks (block dimension)
+    int sche_cpu_num;  // Number of AICPU threads for scheduling
 
 private:
     // Task storage

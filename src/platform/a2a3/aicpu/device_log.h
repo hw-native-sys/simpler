@@ -11,45 +11,45 @@
 
 #include "dlog_pub.h"
 
-extern bool g_isLogEnableDebug;
-extern bool g_isLogEnableInfo;
-extern bool g_isLogEnableWarn;
-extern bool g_isLogEnableError;
+extern bool g_is_log_enable_debug;
+extern bool g_is_log_enable_info;
+extern bool g_is_log_enable_warn;
+extern bool g_is_log_enable_error;
 
-static inline bool IsLogEnableDebug() { return g_isLogEnableDebug; }
-static inline bool IsLogEnableInfo() { return g_isLogEnableInfo; }
-static inline bool IsLogEnableWarn() { return g_isLogEnableWarn; }
-static inline bool IsLogEnableError() { return g_isLogEnableError; }
+static inline bool is_log_enable_debug() { return g_is_log_enable_debug; }
+static inline bool is_log_enable_info() { return g_is_log_enable_info; }
+static inline bool is_log_enable_warn() { return g_is_log_enable_warn; }
+static inline bool is_log_enable_error() { return g_is_log_enable_error; }
 
 #define GET_TID() syscall(__NR_gettid)
 constexpr const char *TILE_FWK_DEVICE_MACHINE = "AI_CPU";
 
-inline bool IsDebugMode() { return g_isLogEnableDebug; }
+inline bool is_debug_mode() { return g_is_log_enable_debug; }
 
 #define D_DEV_LOGD(MODE_NAME, fmt, ...)                                                 \
     do {                                                                                \
-        if (IsLogEnableDebug()) {                                                       \
+        if (is_log_enable_debug()) {                                                       \
             dlog_debug(AICPU, "%lu %s\n" #fmt, GET_TID(), __FUNCTION__, ##__VA_ARGS__); \
         }                                                                               \
     } while (false)
 
 #define D_DEV_LOGI(MODE_NAME, fmt, ...)                                                \
     do {                                                                               \
-        if (IsLogEnableInfo()) {                                                       \
+        if (is_log_enable_info()) {                                                       \
             dlog_info(AICPU, "%lu %s\n" #fmt, GET_TID(), __FUNCTION__, ##__VA_ARGS__); \
         }                                                                              \
     } while (false)
 
 #define D_DEV_LOGW(MODE_NAME, fmt, ...)                                                \
     do {                                                                               \
-        if (IsLogEnableWarn()) {                                                       \
+        if (is_log_enable_warn()) {                                                       \
             dlog_warn(AICPU, "%lu %s\n" #fmt, GET_TID(), __FUNCTION__, ##__VA_ARGS__); \
         }                                                                              \
     } while (false)
 
 #define D_DEV_LOGE(MODE_NAME, fmt, ...)                                                 \
     do {                                                                                \
-        if (IsLogEnableError()) {                                                       \
+        if (is_log_enable_error()) {                                                       \
             dlog_error(AICPU, "%lu %s\n" #fmt, GET_TID(), __FUNCTION__, ##__VA_ARGS__); \
         }                                                                               \
     } while (false)
@@ -85,4 +85,4 @@ inline bool IsDebugMode() { return g_isLogEnableDebug; }
 
 #define DEV_DEBUG_ASSERT_MSG(expr, fmt, args...) DEV_ASSERT_MSG(expr, fmt, ##args)
 
-void InitLogSwitch();
+void init_log_switch();

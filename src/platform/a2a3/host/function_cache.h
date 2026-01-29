@@ -12,7 +12,7 @@
  * ┌────────────────────────────────────────────────┐
  * │ CoreFunctionBinCache                            │
  * │ ┌────────────────────────────────────────────┐ │
- * │ │ dataSize                                   │ │
+ * │ │ data_size                                  │ │
  * │ ├────────────────────────────────────────────┤ │
  * │ │ offset[0]                                  │ │
  * │ │ offset[1]                                  │ │
@@ -55,20 +55,20 @@ struct CoreFunctionBin {
  * memory block for efficient device memory allocation and copying.
  *
  * Memory Layout:
- * [dataSize][numKernels][offset0][offset1]...[offsetN][CoreFunctionBin0][CoreFunctionBin1]...
+ * [data_size][num_kernels][offset0][offset1]...[offsetN][CoreFunctionBin0][CoreFunctionBin1]...
  *
  * Each offset points to the start of a CoreFunctionBin structure relative
  * to the beginning of the cache.
  */
 struct CoreFunctionBinCache {
-    uint64_t dataSize;    // Total size of all data (excluding this header)
-    uint64_t numKernels;  // Number of kernels in this cache
+    uint64_t data_size;    // Total size of all data (excluding this header)
+    uint64_t num_kernels;  // Number of kernels in this cache
 
     /**
      * Get offset array pointer
      * @return Pointer to array of offsets
      */
-    uint64_t* GetOffsets() {
+    uint64_t* get_offsets() {
         return reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(this) + sizeof(CoreFunctionBinCache));
     }
 
@@ -76,26 +76,26 @@ struct CoreFunctionBinCache {
      * Get pointer to binary data region
      * @return Pointer to start of binary data
      */
-    uint8_t* GetBinaryData() { return reinterpret_cast<uint8_t*>(GetOffsets()) + numKernels * sizeof(uint64_t); }
+    uint8_t* get_binary_data() { return reinterpret_cast<uint8_t*>(get_offsets()) + num_kernels * sizeof(uint64_t); }
 
     /**
      * Get CoreFunctionBin by index
      * @param index  Kernel index
      * @return Pointer to CoreFunctionBin structure
      */
-    CoreFunctionBin* GetKernel(uint64_t index) {
-        if (index >= numKernels) {
+    CoreFunctionBin* get_kernel(uint64_t index) {
+        if (index >= num_kernels) {
             return nullptr;
         }
-        uint64_t offset = GetOffsets()[index];
-        return reinterpret_cast<CoreFunctionBin*>(GetBinaryData() + offset);
+        uint64_t offset = get_offsets()[index];
+        return reinterpret_cast<CoreFunctionBin*>(get_binary_data() + offset);
     }
 
     /**
      * Calculate total cache size including header
      * @return Total size in bytes
      */
-    uint64_t GetTotalSize() const { return sizeof(CoreFunctionBinCache) + numKernels * sizeof(uint64_t) + dataSize; }
+    uint64_t get_total_size() const { return sizeof(CoreFunctionBinCache) + num_kernels * sizeof(uint64_t) + data_size; }
 };
 
 #endif  // RUNTIME_FUNCTION_CACHE_H

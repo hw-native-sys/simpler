@@ -35,7 +35,7 @@
 extern "C" {
 #endif
 
-// Static storage for tensor pointers (used by ValidateRuntimeImpl)
+// Static storage for tensor pointers (used by validate_runtime_impl)
 static void* g_dev_a = nullptr;
 static void* g_dev_b = nullptr;
 static void* g_dev_c = nullptr;
@@ -53,11 +53,11 @@ static size_t g_tensor_bytes = 0;
  * @param runtime    Pointer to pre-constructed Runtime
  * @return 0 on success, -1 on failure
  */
-int InitRuntimeImpl(Runtime* runtime) {
+int init_runtime_impl(Runtime* runtime) {
     int rc = 0;
 
     // Initialize DeviceRunner
-    DeviceRunner& runner = DeviceRunner::Get();
+    DeviceRunner& runner = DeviceRunner::get();
     // Note: DeviceRunner should already be initialized by Python before calling
     // InitRuntime Note: Kernels should be registered via Python's
     // runner.register_kernel() before calling InitRuntime
@@ -69,12 +69,12 @@ int InitRuntimeImpl(Runtime* runtime) {
     constexpr size_t BYTES = SIZE * sizeof(float);
 
     std::cout << "\n=== Allocating Device Memory ===" << '\n';
-    void* dev_a = runner.AllocateTensor(BYTES);
-    void* dev_b = runner.AllocateTensor(BYTES);
-    void* dev_c = runner.AllocateTensor(BYTES);
-    void* dev_d = runner.AllocateTensor(BYTES);
-    void* dev_e = runner.AllocateTensor(BYTES);
-    void* dev_f = runner.AllocateTensor(BYTES);
+    void* dev_a = runner.allocate_tensor(BYTES);
+    void* dev_b = runner.allocate_tensor(BYTES);
+    void* dev_c = runner.allocate_tensor(BYTES);
+    void* dev_d = runner.allocate_tensor(BYTES);
+    void* dev_e = runner.allocate_tensor(BYTES);
+    void* dev_f = runner.allocate_tensor(BYTES);
 
     if (!dev_a || !dev_b || !dev_c || !dev_d || !dev_e || !dev_f) {
         std::cerr << "Error: Failed to allocate device tensors" << '\n';
@@ -86,34 +86,34 @@ int InitRuntimeImpl(Runtime* runtime) {
     std::vector<float> host_a(SIZE, 2.0f);
     std::vector<float> host_b(SIZE, 3.0f);
 
-    rc = runner.CopyToDevice(dev_a, host_a.data(), BYTES);
+    rc = runner.copy_to_device(dev_a, host_a.data(), BYTES);
     if (rc != 0) {
         std::cerr << "Error: Failed to copy input a to device" << '\n';
-        runner.FreeTensor(dev_a);
-        runner.FreeTensor(dev_b);
-        runner.FreeTensor(dev_c);
-        runner.FreeTensor(dev_d);
-        runner.FreeTensor(dev_e);
-        runner.FreeTensor(dev_f);
+        runner.free_tensor(dev_a);
+        runner.free_tensor(dev_b);
+        runner.free_tensor(dev_c);
+        runner.free_tensor(dev_d);
+        runner.free_tensor(dev_e);
+        runner.free_tensor(dev_f);
         return rc;
     }
 
-    rc = runner.CopyToDevice(dev_b, host_b.data(), BYTES);
+    rc = runner.copy_to_device(dev_b, host_b.data(), BYTES);
     if (rc != 0) {
         std::cerr << "Error: Failed to copy input b to device" << '\n';
-        runner.FreeTensor(dev_a);
-        runner.FreeTensor(dev_b);
-        runner.FreeTensor(dev_c);
-        runner.FreeTensor(dev_d);
-        runner.FreeTensor(dev_e);
-        runner.FreeTensor(dev_f);
+        runner.free_tensor(dev_a);
+        runner.free_tensor(dev_b);
+        runner.free_tensor(dev_c);
+        runner.free_tensor(dev_d);
+        runner.free_tensor(dev_e);
+        runner.free_tensor(dev_f);
         return rc;
     }
 
     std::cout << "Initialized input tensors: a=2.0, b=3.0 (all elements)\n";
     std::cout << "Expected result: f = (2+3+1)*(2+3+2) = 6*7 = 42.0\n";
 
-    // Store tensor pointers for later use by ValidateRuntimeImpl
+    // Store tensor pointers for later use by validate_runtime_impl
     g_dev_a = dev_a;
     g_dev_b = dev_b;
     g_dev_c = dev_c;
@@ -187,14 +187,14 @@ int InitRuntimeImpl(Runtime* runtime) {
     return 0;
 }
 
-int ValidateRuntimeImpl(Runtime* runtime) {
+int validate_runtime_impl(Runtime* runtime) {
     if (runtime == nullptr) {
         std::cerr << "Error: Runtime pointer is null\n";
         return -1;
     }
 
     // Get DeviceRunner instance
-    DeviceRunner& runner = DeviceRunner::Get();
+    DeviceRunner& runner = DeviceRunner::get();
 
     // Use globally stored tensor pointers
     void* dev_a = g_dev_a;
@@ -207,22 +207,22 @@ int ValidateRuntimeImpl(Runtime* runtime) {
 
     constexpr int ROWS = 128;
     constexpr int COLS = 128;
-    constexpr int SIZE = ROWS * COLS;  // Must match InitRuntimeImpl
+    constexpr int SIZE = ROWS * COLS;  // Must match init_runtime_impl
 
     // =========================================================================
     // VALIDATE RESULTS - Retrieve and verify output
     // =========================================================================
     std::cout << "\n=== Validating Results ===" << '\n';
     std::vector<float> host_result(SIZE);
-    int rc = runner.CopyFromDevice(host_result.data(), dev_f, BYTES);
+    int rc = runner.copy_from_device(host_result.data(), dev_f, BYTES);
     if (rc != 0) {
         std::cerr << "Error: Failed to copy result from device: " << rc << '\n';
-        runner.FreeTensor(dev_a);
-        runner.FreeTensor(dev_b);
-        runner.FreeTensor(dev_c);
-        runner.FreeTensor(dev_d);
-        runner.FreeTensor(dev_e);
-        runner.FreeTensor(dev_f);
+        runner.free_tensor(dev_a);
+        runner.free_tensor(dev_b);
+        runner.free_tensor(dev_c);
+        runner.free_tensor(dev_d);
+        runner.free_tensor(dev_e);
+        runner.free_tensor(dev_f);
         return rc;
     }
 
@@ -255,16 +255,16 @@ int ValidateRuntimeImpl(Runtime* runtime) {
     }
 
     // Print handshake results
-    runner.PrintHandshakeResults(*runtime);
+    runner.print_handshake_results(*runtime);
 
     // Cleanup device tensors
     std::cout << "\n=== Cleaning Up ===" << '\n';
-    runner.FreeTensor(dev_a);
-    runner.FreeTensor(dev_b);
-    runner.FreeTensor(dev_c);
-    runner.FreeTensor(dev_d);
-    runner.FreeTensor(dev_e);
-    runner.FreeTensor(dev_f);
+    runner.free_tensor(dev_a);
+    runner.free_tensor(dev_b);
+    runner.free_tensor(dev_c);
+    runner.free_tensor(dev_d);
+    runner.free_tensor(dev_e);
+    runner.free_tensor(dev_f);
     std::cout << "Freed all device tensors\n";
 
     // Note: Runtime destructor is called by FinalizeRuntime() after this

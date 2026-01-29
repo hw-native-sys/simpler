@@ -9,7 +9,7 @@
  * - Automatic tracking of all allocated device memory
  * - Safe deallocation with existence checking
  * - Automatic cleanup via destructor (RAII pattern)
- * - Idempotent Finalize() for explicit cleanup with error checking
+ * - Idempotent finalize() for explicit cleanup with error checking
  */
 
 #ifndef RUNTIME_MEMORYALLOCATOR_H
@@ -43,7 +43,7 @@ public:
      * @param size  Size in bytes to allocate
      * @return Device pointer on success, nullptr on failure
      */
-    void* Alloc(size_t size);
+    void* alloc(size_t size);
 
     /**
      * Free device memory if tracked
@@ -55,7 +55,7 @@ public:
      * @param ptr  Device pointer to free
      * @return 0 on success, error code on failure, 0 if ptr not tracked
      */
-    int Free(void* ptr);
+    int free(void* ptr);
 
     /**
      * Free all remaining tracked allocations
@@ -67,17 +67,17 @@ public:
      *
      * @return 0 on success, error code if any frees failed
      */
-    int Finalize();
+    int finalize();
 
     /**
      * Get number of tracked allocations
      *
      * @return Number of currently tracked pointers
      */
-    size_t GetAllocationCount() const { return ptrSet_.size(); }
+    size_t get_allocation_count() const { return ptr_set_.size(); }
 
 private:
-    std::set<void*> ptrSet_;
+    std::set<void*> ptr_set_;
     bool finalized_{false};
 };
 

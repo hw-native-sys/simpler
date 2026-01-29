@@ -11,9 +11,9 @@
 
 #include <iostream>
 
-MemoryAllocator::~MemoryAllocator() { Finalize(); }
+MemoryAllocator::~MemoryAllocator() { finalize(); }
 
-void* MemoryAllocator::Alloc(size_t size) {
+void* MemoryAllocator::alloc(size_t size) {
     void* ptr = nullptr;
     int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
     if (rc != 0) {
@@ -22,18 +22,18 @@ void* MemoryAllocator::Alloc(size_t size) {
     }
 
     // Track the pointer
-    ptrSet_.insert(ptr);
+    ptr_set_.insert(ptr);
     return ptr;
 }
 
-int MemoryAllocator::Free(void* ptr) {
+int MemoryAllocator::free(void* ptr) {
     if (ptr == nullptr) {
         return 0;
     }
 
     // Check if we're tracking this pointer
-    auto it = ptrSet_.find(ptr);
-    if (it == ptrSet_.end()) {
+    auto it = ptr_set_.find(ptr);
+    if (it == ptr_set_.end()) {
         // Not tracked by us, don't free
         return 0;
     }
@@ -46,30 +46,30 @@ int MemoryAllocator::Free(void* ptr) {
     }
 
     // Remove from tracking set
-    ptrSet_.erase(it);
+    ptr_set_.erase(it);
     return 0;
 }
 
-int MemoryAllocator::Finalize() {
+int MemoryAllocator::finalize() {
     // Idempotent - safe to call multiple times
     if (finalized_) {
         return 0;
     }
 
-    int lastError = 0;
+    int last_error = 0;
 
     // Free all remaining tracked pointers
-    for (void* ptr : ptrSet_) {
+    for (void* ptr : ptr_set_) {
         int rc = rtFree(ptr);
         if (rc != 0) {
             std::cerr << "Error: rtFree failed during Finalize: " << rc << '\n';
-            lastError = rc;
+            last_error = rc;
         }
     }
 
     // Clear the set
-    ptrSet_.clear();
+    ptr_set_.clear();
     finalized_ = true;
 
-    return lastError;
+    return last_error;
 }

@@ -5,8 +5,8 @@
 #include "kernel_args.h"
 #include "runtime.h"
 
-// Forward declaration of AicpuExecute (implemented in aicpu_executor.cpp)
-extern "C" int AicpuExecute(Runtime *arg);
+// Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp)
+extern "C" int aicpu_execute(Runtime *arg);
 
 extern "C" __attribute__((visibility("default"))) int StaticTileFwkBackendKernelServer(void *arg) {
     if (arg == nullptr) {
@@ -29,7 +29,7 @@ extern "C" __attribute__((visibility("default"))) int StaticTileFwkBackendKernel
  * @return 0 on success, -1 on error
  */
 extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelServerInit(void *arg) {
-    InitLogSwitch();
+    init_log_switch();
     if (arg == nullptr) {
         DEV_ERROR("%s", "Invalid kernel arguments: null pointer");
         return -1;
@@ -47,7 +47,7 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
  *
  * Note: Function name is hardcoded in libaicpu_extend_kernels.so
  *
- * @param arg Pointer to KernelArgs structure containing runtimeArgs
+ * @param arg Pointer to KernelArgs structure containing runtime_args
  * @return 0 on success, non-zero on error
  */
 extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelServer(void *arg) {
@@ -57,21 +57,21 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
     }
 
     // Extract Runtime from KernelArgs
-    auto kargs = (KernelArgs *)arg;
-    Runtime *runtime = kargs->runtimeArgs;
+    auto k_args = (KernelArgs *)arg;
+    Runtime *runtime = k_args->runtime_args;
 
     if (runtime == nullptr) {
-        DEV_ERROR("%s", "Invalid runtimeArgs: null pointer");
+        DEV_ERROR("%s", "Invalid runtime_args: null pointer");
         return -1;
     }
 
-    DEV_INFO("%s", "DynTileFwkBackendKernelServer: Calling AicpuExecute with Runtime");
-    int rc = AicpuExecute(runtime);  // Pass Runtime* instead of KernelArgs*
+    DEV_INFO("%s", "DynTileFwkBackendKernelServer: Calling aicpu_execute with Runtime");
+    int rc = aicpu_execute(runtime);  // Pass Runtime* instead of KernelArgs*
     if (rc != 0) {
-        DEV_ERROR("DynTileFwkBackendKernelServer: AicpuExecute failed with rc=%d", rc);
+        DEV_ERROR("DynTileFwkBackendKernelServer: aicpu_execute failed with rc=%d", rc);
         return rc;
     }
-    DEV_INFO("%s", "DynTileFwkBackendKernelServer: AicpuExecute completed successfully");
+    DEV_INFO("%s", "DynTileFwkBackendKernelServer: aicpu_execute completed successfully");
 
     return rc;
 }

@@ -8,7 +8,7 @@
  * - All functions use C linkage (extern "C")
  * - Opaque pointers hide C++ implementation details
  * - Error codes: 0 = success, negative = error
- * - Memory management: User allocates Runtime with malloc(GetRuntimeSize())
+ * - Memory management: User allocates Runtime with malloc(get_runtime_size())
  */
 
 #ifndef PTO_RUNTIME_C_API_H
@@ -36,11 +36,11 @@ typedef void* RuntimeHandle;
 /**
  * Get the size of Runtime structure for memory allocation.
  *
- * User should allocate: Runtime* r = (Runtime*)malloc(GetRuntimeSize());
+ * User should allocate: Runtime* r = (Runtime*)malloc(get_runtime_size());
  *
  * @return Size of Runtime structure in bytes
  */
-size_t GetRuntimeSize(void);
+size_t get_runtime_size(void);
 
 /**
  * Initialize a runtime for the basic example.
@@ -49,10 +49,10 @@ size_t GetRuntimeSize(void);
  * Builds the task runtime, allocates device tensors, initializes data.
  * Does NOT initialize device runner - that happens in launch_runtime().
  *
- * @param runtime  User-allocated memory of size GetRuntimeSize()
+ * @param runtime  User-allocated memory of size get_runtime_size()
  * @return 0 on success, -1 on failure
  */
-int InitRuntime(RuntimeHandle runtime);
+int init_runtime(RuntimeHandle runtime);
 
 /**
  * Execute a runtime on the device.
@@ -89,12 +89,12 @@ int launch_runtime(RuntimeHandle runtime,
  * @param runtime  Runtime handle to finalize
  * @return 0 on success, -1 on failure
  */
-int FinalizeRuntime(RuntimeHandle runtime);
+int finalize_runtime(RuntimeHandle runtime);
 
 /**
  * Set device and create streams for memory operations.
  *
- * Must be called before InitRuntime() to enable device tensor allocation.
+ * Must be called before init_runtime() to enable device tensor allocation.
  * Only performs minimal initialization:
  * - rtSetDevice(device_id)
  * - Create AICPU and AICore streams
@@ -118,7 +118,7 @@ int set_device(int device_id);
  * @param bin_size  Size of binary data in bytes
  * @return 0 on success, error code on failure
  */
-int RegisterKernel(int func_id, const uint8_t* bin_data, size_t bin_size);
+int register_kernel(int func_id, const uint8_t* bin_data, size_t bin_size);
 
 #ifdef __cplusplus
 } /* extern "C" */

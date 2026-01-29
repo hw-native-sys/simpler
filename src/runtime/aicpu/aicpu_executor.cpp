@@ -39,19 +39,19 @@ struct AicpuExecutor {
     std::atomic<int> finished_count_{0};
 
     // ===== Methods =====
-    int Init(Runtime* runtime);
-    int HankAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores);
+    int init(Runtime* runtime);
+    int hank_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores);
     int resolve_and_dispatch(Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num);
-    int ShutdownAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores);
-    int Run(Runtime* runtime);
-    void DeInit();
+    int shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores);
+    int run(Runtime* runtime);
+    void deinit();
 };
 
 static AicpuExecutor g_aicpu_executor;
 
 // ===== AicpuExecutor Method Implementations =====
 
-int AicpuExecutor::Init(Runtime* runtime) {
+int AicpuExecutor::init(Runtime* runtime) {
     bool expected = false;
     if (!initialized_.compare_exchange_strong(expected, true, std::memory_order_acq_rel, std::memory_order_acquire)) {
         return 0;
@@ -66,7 +66,7 @@ int AicpuExecutor::Init(Runtime* runtime) {
     }
 
     // Read execution parameters from runtime
-    thread_num_ = runtime->scheCpuNum;
+    thread_num_ = runtime->sche_cpu_num;
     if (thread_num_ == 0) thread_num_ = 1;
 
     if (thread_num_ < 1 || thread_num_ > MAX_AICPU_THREADS) {
@@ -168,7 +168,7 @@ int AicpuExecutor::Init(Runtime* runtime) {
 /**
  * Handshake AICore - Initialize and synchronize with AICore kernels
  */
-int AicpuExecutor::HankAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
+int AicpuExecutor::hank_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
     Handshake* all_hanks = (Handshake*)runtime->workers;
 
     DEV_INFO("Thread %d: Handshaking with %d cores", thread_idx, thread_cores_num_);
@@ -193,7 +193,7 @@ int AicpuExecutor::HankAiCore(Runtime* runtime, int thread_idx, const int* cur_t
 /**
  * Shutdown AICore - Send quit signal to all AICore kernels
  */
-int AicpuExecutor::ShutdownAiCore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
+int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
     Handshake* all_hanks = (Handshake*)runtime->workers;
 
     DEV_INFO("Thread %d: Shutting down %d cores", thread_idx, thread_cores_num_);
@@ -326,14 +326,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
     return cur_thread_completed;
 }
 
-int AicpuExecutor::Run(Runtime* runtime) {
+int AicpuExecutor::run(Runtime* runtime) {
     int thread_idx = thread_idx_++;
 
     DEV_INFO("Thread %d: Start", thread_idx);
 
     const int* cur_thread_cores = core_assignments_[thread_idx];
 
-    auto rc = HankAiCore(runtime, thread_idx, cur_thread_cores);
+    auto rc = hank_aicore(runtime, thread_idx, cur_thread_cores);
     if (rc != 0) {
         return rc;
     }
@@ -342,7 +342,7 @@ int AicpuExecutor::Run(Runtime* runtime) {
     int completed = resolve_and_dispatch(*runtime, thread_idx, cur_thread_cores, thread_cores_num_);
     DEV_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
 
-    rc = ShutdownAiCore(runtime, thread_idx, cur_thread_cores);
+    rc = shutdown_aicore(runtime, thread_idx, cur_thread_cores);
     if (rc != 0) {
         return rc;
     }
@@ -359,7 +359,7 @@ int AicpuExecutor::Run(Runtime* runtime) {
     return 0;
 }
 
-void AicpuExecutor::DeInit() {
+void AicpuExecutor::deinit() {
     // Cleanup runtime execution state
     ready_count_aic_.store(0, std::memory_order_release);
     ready_count_aiv_.store(0, std::memory_order_release);
@@ -381,7 +381,7 @@ void AicpuExecutor::DeInit() {
 // ===== Public Entry Point =====
 
 /**
- * AicpuExecute - Main AICPU kernel execution entry point
+ * aicpu_execute - Main AICPU kernel execution entry point
  *
  * This is called by DynTileFwkBackendKernelServer in kernel.cpp.
  * Orchestrates the complete task runtime execution:
@@ -392,39 +392,39 @@ void AicpuExecutor::DeInit() {
  *
  * @param runtime Pointer to Runtime structure containing:
  *                - workers[]: handshake buffers for AICPU-AICore communication
- *                - block_dim, scheCpuNum: execution parameters
+ *                - block_dim, sche_cpu_num: execution parameters
  *                - tasks[]: task runtime to execute
  * @return 0 on success, non-zero on error
  */
-extern "C" int AicpuExecute(Runtime* runtime) {
+extern "C" int aicpu_execute(Runtime* runtime) {
     if (runtime == nullptr) {
         DEV_ERROR("%s", "Invalid runtime argument: null pointer");
         return -1;
     }
 
-    DEV_INFO("%s", "AicpuExecute: Starting AICPU kernel execution");
+    DEV_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
 
-    g_aicpu_executor.Init(runtime);
+    g_aicpu_executor.init(runtime);
 
     while (!g_aicpu_executor.init_done_.load(std::memory_order_acquire)) {
         if (g_aicpu_executor.init_failed_.load(std::memory_order_acquire)) {
-            DEV_ERROR("%s", "AicpuExecute: Initialization failed, aborting execution");
+            DEV_ERROR("%s", "aicpu_execute: Initialization failed, aborting execution");
             return -1;
         }
     }
 
-    int rc = g_aicpu_executor.Run(runtime);
+    int rc = g_aicpu_executor.run(runtime);
     if (rc != 0) {
-        DEV_ERROR("AicpuExecute: Thread execution failed with rc=%d", rc);
+        DEV_ERROR("aicpu_execute: Thread execution failed with rc=%d", rc);
         return rc;
     }
 
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
-        DEV_INFO("AicpuExecute: Last thread finished, cleaning up");
-        g_aicpu_executor.DeInit();
+        DEV_INFO("aicpu_execute: Last thread finished, cleaning up");
+        g_aicpu_executor.deinit();
     }
 
-    DEV_INFO("%s", "AicpuExecute: Kernel execution completed successfully");
+    DEV_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }

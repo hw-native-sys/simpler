@@ -14,14 +14,14 @@ typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
  *
  * This function demonstrates the runtime function pointer dispatch pattern.
  * Following the production system flow:
- * - functionBinAddr points to compiled kernel code in device GM memory
+ * - function_bin_addr points to compiled kernel code in device GM memory
  * - The address is cast to a function pointer: UnifiedKernelFunc kernel =
- * (UnifiedKernelFunc)functionBinAddr
+ * (UnifiedKernelFunc)function_bin_addr
  * - The kernel is invoked: kernel(task->args)
  *
  * This is the KEY difference from compile-time linking:
  * - OLD: extern "C" declarations, resolved at link time
- * - NEW: functionBinAddr from GM memory, cast at runtime
+ * - NEW: function_bin_addr from GM memory, cast at runtime
  *
  * With unified kernel signature, no switch statement is needed.
  * All kernels unpack their own arguments from the args array.
@@ -34,20 +34,20 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
         return;
     }
 
-    // Check for valid functionBinAddr
-    if (task->functionBinAddr == 0) {
+    // Check for valid function_bin_addr
+    if (task->function_bin_addr == 0) {
         // Invalid address - skip execution
         return;
     }
 
-    // Cast functionBinAddr to unified function pointer and invoke
+    // Cast function_bin_addr to unified function pointer and invoke
     // All kernels have signature: void kernel(__gm__ int64_t* args)
-    UnifiedKernelFunc kernel = (UnifiedKernelFunc)task->functionBinAddr;
+    UnifiedKernelFunc kernel = (UnifiedKernelFunc)task->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
 }
 
-__aicore__ __attribute__((weak)) void AicoreExecute(__gm__ Runtime* runtime, int blockIdx, int coreType) {
-    __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[blockIdx]);
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, int core_type) {
+    __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {
@@ -55,7 +55,7 @@ __aicore__ __attribute__((weak)) void AicoreExecute(__gm__ Runtime* runtime, int
     }
 
     // Phase 2: Signal AICore is ready (use core_id + 1 to avoid 0)
-    my_hank->aicore_done = blockIdx + 1;
+    my_hank->aicore_done = block_idx + 1;
 
     // Phase 3: Main execution loop - poll for tasks until quit signal
     while (true) {

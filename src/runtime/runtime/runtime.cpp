@@ -17,7 +17,7 @@ Runtime::Runtime() {
         tasks[i].task_id = 0;
         tasks[i].func_id = 0;
         tasks[i].num_args = 0;
-        tasks[i].functionBinAddr = 0;
+        tasks[i].function_bin_addr = 0;
         tasks[i].core_type = 0;
         tasks[i].fanin = 0;
         tasks[i].fanout_count = 0;
@@ -30,7 +30,7 @@ Runtime::Runtime() {
     initial_ready_count = 0;
     worker_count = 0;
     block_dim = 0;
-    scheCpuNum = 1;
+    sche_cpu_num = 1;
 }
 
 // =============================================================================
@@ -60,8 +60,8 @@ int Runtime::add_task(uint64_t* args, int num_args, int func_id, int core_type) 
     if (args && num_args > 0) {
         memcpy(task->args, args, num_args * sizeof(uint64_t));
     }
-    task->functionBinAddr = 0;    // Will be set by host before copying to device
-    task->core_type = core_type;  // Set core type (0=AIC, 1=AIV)
+    task->function_bin_addr = 0;    // Will be set by host before copying to device
+    task->core_type = core_type;    // Set core type (0=AIC, 1=AIV)
     task->fanin = 0;
     task->fanout_count = 0;
     memset(task->fanout, 0, sizeof(task->fanout));
