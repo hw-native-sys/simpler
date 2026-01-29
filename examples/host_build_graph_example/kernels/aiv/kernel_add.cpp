@@ -40,11 +40,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_add(__gm__ int6
     __gm__ float* out = reinterpret_cast<__gm__ float*>(args[2]);
     int size = static_cast<int>(args[3]);
 
-    // Configuration: float, 64, 64, 64, 64
-    constexpr int kTRows_ = 64;
-    constexpr int kTCols_ = 64;
-    constexpr int vRows = 64;
-    constexpr int vCols = 64;
+    // Configuration: float, 128, 128, 128, 128
+    constexpr int kTRows_ = 128;
+    constexpr int kTCols_ = 128;
+    constexpr int vRows = 128;
+    constexpr int vCols = 128;
 
     using DynShapeDim5 = Shape<1, 1, 1, vRows, vCols>;
     using DynStridDim5 = Stride<1, 1, 1, kTCols_, 1>;
@@ -62,12 +62,12 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_add(__gm__ int6
     GlobalData src1Global(src1);
     GlobalData dstGlobal(out);
 
-    Event<Op::TLOAD, Op::TADD> event0;
-    Event<Op::TADD, Op::TSTORE_VEC> event1;
-
     TLOAD(src0Tile, src0Global);
-    event0 = TLOAD(src1Tile, src1Global);
-    event1 = TADD(dstTile, src0Tile, src1Tile, event0);
-    TSTORE(dstGlobal, dstTile, event1);
-    out = dstGlobal.data();
+    TLOAD(src1Tile, src1Global);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    TADD(dstTile, src0Tile, src1Tile);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(dstGlobal, dstTile);
 }
