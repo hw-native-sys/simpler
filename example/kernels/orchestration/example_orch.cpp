@@ -5,15 +5,14 @@
  *
  * This orchestration function:
  * 1. Receives host pointers and sizes in args
- * 2. Allocates device memory via runtime methods
- * 3. Copies input data to device via runtime methods
+ * 2. Allocates device memory via runtime->host_api
+ * 3. Copies input data to device via runtime->host_api
  * 4. Records output tensor for copy-back during finalize
  * 5. Builds the task graph
  */
 
 // Include runtime.h first to get full Runtime class definition
 #include "runtime.h"
-#include "example_orch.h"
 #include <iostream>
 
 extern "C" {
@@ -42,28 +41,28 @@ int BuildExampleGraph(Runtime* runtime, uint64_t* args, int arg_count) {
     // Allocate device memory and copy inputs
     std::cout << "\n=== Allocating Device Memory ===" << '\n';
 
-    void* dev_a = runtime->DeviceMalloc(size_a);
+    void* dev_a = runtime->host_api.DeviceMalloc(size_a);
     if (!dev_a) {
         std::cerr << "Error: Failed to allocate device memory for a\n";
         return -1;
     }
-    runtime->CopyToDevice(dev_a, host_a, size_a);
+    runtime->host_api.CopyToDevice(dev_a, host_a, size_a);
     std::cout << "Tensor a: " << size_a << " bytes copied to device\n";
 
-    void* dev_b = runtime->DeviceMalloc(size_b);
+    void* dev_b = runtime->host_api.DeviceMalloc(size_b);
     if (!dev_b) {
         std::cerr << "Error: Failed to allocate device memory for b\n";
-        runtime->DeviceFree(dev_a);
+        runtime->host_api.DeviceFree(dev_a);
         return -1;
     }
-    runtime->CopyToDevice(dev_b, host_b, size_b);
+    runtime->host_api.CopyToDevice(dev_b, host_b, size_b);
     std::cout << "Tensor b: " << size_b << " bytes copied to device\n";
 
-    void* dev_f = runtime->DeviceMalloc(size_f);
+    void* dev_f = runtime->host_api.DeviceMalloc(size_f);
     if (!dev_f) {
         std::cerr << "Error: Failed to allocate device memory for f\n";
-        runtime->DeviceFree(dev_a);
-        runtime->DeviceFree(dev_b);
+        runtime->host_api.DeviceFree(dev_a);
+        runtime->host_api.DeviceFree(dev_b);
         return -1;
     }
     // Record output tensor for copy-back during finalize
@@ -72,18 +71,18 @@ int BuildExampleGraph(Runtime* runtime, uint64_t* args, int arg_count) {
 
     // Allocate intermediate tensors (c, d, e)
     size_t BYTES = SIZE * sizeof(float);
-    void* dev_c = runtime->DeviceMalloc(BYTES);
-    void* dev_d = runtime->DeviceMalloc(BYTES);
-    void* dev_e = runtime->DeviceMalloc(BYTES);
+    void* dev_c = runtime->host_api.DeviceMalloc(BYTES);
+    void* dev_d = runtime->host_api.DeviceMalloc(BYTES);
+    void* dev_e = runtime->host_api.DeviceMalloc(BYTES);
 
     if (!dev_c || !dev_d || !dev_e) {
         std::cerr << "Error: Failed to allocate intermediate tensors\n";
-        runtime->DeviceFree(dev_a);
-        runtime->DeviceFree(dev_b);
-        runtime->DeviceFree(dev_f);
-        if (dev_c) runtime->DeviceFree(dev_c);
-        if (dev_d) runtime->DeviceFree(dev_d);
-        if (dev_e) runtime->DeviceFree(dev_e);
+        runtime->host_api.DeviceFree(dev_a);
+        runtime->host_api.DeviceFree(dev_b);
+        runtime->host_api.DeviceFree(dev_f);
+        if (dev_c) runtime->host_api.DeviceFree(dev_c);
+        if (dev_d) runtime->host_api.DeviceFree(dev_d);
+        if (dev_e) runtime->host_api.DeviceFree(dev_e);
         return -1;
     }
 
@@ -95,39 +94,39 @@ int BuildExampleGraph(Runtime* runtime, uint64_t* args, int arg_count) {
         uint64_t u64;
     } scalar_converter;
 
-    // Task 0: c = a + b (func_id=0: kernel_add)
+    // Task 0: c = a + b (func_id=0: kernel_add, AIV)
     uint64_t args_t0[4];
     args_t0[0] = reinterpret_cast<uint64_t>(dev_a);  // src0
     args_t0[1] = reinterpret_cast<uint64_t>(dev_b);  // src1
     args_t0[2] = reinterpret_cast<uint64_t>(dev_c);  // out
     args_t0[3] = SIZE;                                // size
-    int t0 = runtime->add_task(args_t0, 4, 0);
+    int t0 = runtime->add_task(args_t0, 4, 0, 1);
 
-    // Task 1: d = c + 1 (func_id=1: kernel_add_scalar)
+    // Task 1: d = c + 1 (func_id=1: kernel_add_scalar, AIV)
     uint64_t args_t1[4];
     args_t1[0] = reinterpret_cast<uint64_t>(dev_c);  // src
     scalar_converter.f32 = 1.0f;
     args_t1[1] = scalar_converter.u64;                // scalar=1.0
     args_t1[2] = reinterpret_cast<uint64_t>(dev_d);  // out
     args_t1[3] = SIZE;                                // size
-    int t1 = runtime->add_task(args_t1, 4, 1);
+    int t1 = runtime->add_task(args_t1, 4, 1, 1);
 
-    // Task 2: e = c + 2 (func_id=1: kernel_add_scalar)
+    // Task 2: e = c + 2 (func_id=1: kernel_add_scalar, AIV)
     uint64_t args_t2[4];
     args_t2[0] = reinterpret_cast<uint64_t>(dev_c);  // src
     scalar_converter.f32 = 2.0f;
     args_t2[1] = scalar_converter.u64;                // scalar=2.0
     args_t2[2] = reinterpret_cast<uint64_t>(dev_e);  // out
     args_t2[3] = SIZE;                                // size
-    int t2 = runtime->add_task(args_t2, 4, 1);
+    int t2 = runtime->add_task(args_t2, 4, 1, 1);
 
-    // Task 3: f = d * e (func_id=2: kernel_mul)
+    // Task 3: f = d * e (func_id=2: kernel_mul, AIV)
     uint64_t args_t3[4];
     args_t3[0] = reinterpret_cast<uint64_t>(dev_d);  // src0
     args_t3[1] = reinterpret_cast<uint64_t>(dev_e);  // src1
     args_t3[2] = reinterpret_cast<uint64_t>(dev_f);  // out
     args_t3[3] = SIZE;                                // size
-    int t3 = runtime->add_task(args_t3, 4, 2);
+    int t3 = runtime->add_task(args_t3, 4, 2, 1);
 
     // Add dependencies
     runtime->add_successor(t0, t1);  // t0 → t1

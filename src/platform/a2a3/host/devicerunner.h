@@ -218,7 +218,7 @@ public:
      *
      * @param runtime  The runtime whose handshake results should be printed
      */
-    void PrintHandshakeResults(Runtime& runtime);
+    void PrintHandshakeResults();
 
     /**
      * Cleanup all resources
@@ -257,6 +257,9 @@ public:
 
     /**
      * Register a kernel binary for a func_id
+     *
+     * IMPORTANT: EnsureDeviceSet() must be called before this function.
+     * Kernels are immediately copied to device memory.
      *
      * Receives pre-extracted .text section binary data from Python,
      * allocates device GM memory, copies the binary to device,
@@ -301,6 +304,7 @@ private:
     int deviceId_{-1};
     int blockDim_{0};
     int coresPerBlockdim_{3};
+    int worker_count_{0};  // Stored for PrintHandshakeResults in destructor
     std::vector<uint8_t> aicoreKernelBinary_;
 
     // Memory management
@@ -314,14 +318,8 @@ private:
     DeviceArgs deviceArgs_;
 
     // Kernel binary management
-    // Host-side storage for pending kernels (before device init)
-    struct PendingKernel {
-        std::vector<uint8_t> data;
-    };
-    std::map<int, PendingKernel> pendingKernels_;  // func_id -> host binary
-    bool kernelsCommitted_{false};                 // true after kernels copied to device
-    bool binariesLoaded_{false};                   // true after AICPU SO loaded
-    std::map<int, uint64_t> funcIdToAddr_;         // func_id -> functionBinAddr (device GM)
+    bool binariesLoaded_{false};            // true after AICPU SO loaded
+    std::map<int, uint64_t> funcIdToAddr_;  // func_id -> functionBinAddr (device GM)
 
     /**
      * Ensure device is initialized (lazy initialization)
@@ -352,15 +350,6 @@ private:
      * @return 0 on success, error code on failure
      */
     int EnsureBinariesLoaded(const std::vector<uint8_t>& aicpuSoBinary, const std::vector<uint8_t>& aicoreKernelBinary);
-
-    /**
-     * Copy pending kernels from host to device memory
-     *
-     * Called automatically by Run() if kernels haven't been committed yet.
-     *
-     * @return 0 on success, -1 on error
-     */
-    int CommitKernels();
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

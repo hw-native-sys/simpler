@@ -13,26 +13,27 @@ Flow:
 5. C++ FinalizeRuntime(): Copies results back to host, frees device memory
 
 Example usage:
-   python main.py [device_id]
+   python main.py -d <device_id>
 """
 
 import sys
-import os
+import argparse
 from pathlib import Path
 import numpy as np
-from ctypes import cdll, c_void_p, c_uint64, c_int, POINTER, CFUNCTYPE
 
 # Add parent directory to path so we can import runtime_bindings
 example_root = Path(__file__).parent
 runtime_root = Path(__file__).parent.parent
 runtime_dir = runtime_root / "python"
 sys.path.insert(0, str(runtime_dir))
+sys.path.insert(0, str(example_root))
 
 try:
-    from runtime_bindings import load_runtime, register_kernel, set_device, launch_runtime, OrchestrationFunc
     from runtime_builder import RuntimeBuilder
+    from runtime_bindings import load_runtime, register_kernel, set_device, launch_runtime
     from pto_compiler import PTOCompiler
     from elf_parser import extract_text_section
+    from kernels.kernel_config import KERNELS, ORCHESTRATION
 except ImportError as e:
     print(f"Error: Cannot import runtime_bindings module: {e}")
     print("Make sure you are running this from the correct directory")
@@ -40,6 +41,17 @@ except ImportError as e:
 
 
 def main():
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description="PTO Runtime with Dynamic Orchestration")
+    parser.add_argument("-d", "--device", type=int, default=0,
+                        help="Device ID (0-15, default: 0)")
+    args = parser.parse_args()
+
+    device_id = args.device
+    if device_id < 0 or device_id > 15:
+        print(f"Error: deviceId ({device_id}) out of range [0, 15]")
+        return -1
+
     # Check and build runtime if necessary
     builder = RuntimeBuilder()
     print(f"Available runtimes: {builder.list_runtimes()}")
@@ -49,87 +61,45 @@ def main():
         print(f"Error: Failed to build runtime libraries: {e}")
         return -1
 
-    # Parse device ID from command line
-    device_id = 9
-    if len(sys.argv) > 1:
-        try:
-            device_id = int(sys.argv[1])
-            if device_id < 0 or device_id > 15:
-                print(f"Error: deviceId ({device_id}) out of range [0, 15]")
-                return -1
-        except ValueError:
-            print(f"Error: invalid deviceId argument: {sys.argv[1]}")
-            return -1
-
     # Load runtime library and get Runtime class
     print("\n=== Loading Runtime Library ===")
     Runtime = load_runtime(host_binary)
     print(f"Loaded runtime ({len(host_binary)} bytes)")
 
+    # Set device before creating runtime (enables memory allocation)
+    print(f"\n=== Setting Device {device_id} ===")
+    set_device(device_id)
+
     # Compile orchestration shared library
     print("\n=== Compiling Orchestration Function ===")
     pto_compiler = PTOCompiler()
 
-    orch_so_path = pto_compiler.compile_orchestration(
-        str(example_root / "kernels" / "orchestration" / "example_orch.cpp"),
+    orch_so_binary = pto_compiler.compile_orchestration(
+        ORCHESTRATION["source"],
         extra_include_dirs=[
             str(runtime_root / "src" / "runtime" / "host_build_graph" / "runtime"),  # for runtime.h
             str(runtime_root / "src" / "platform" / "a2a3" / "host"),                 # for devicerunner.h
         ]
     )
-    print(f"Compiled orchestration: {orch_so_path}")
-
-    # Load orchestration function from shared library
-    orch_lib = cdll.LoadLibrary(orch_so_path)
-    orch_lib.BuildExampleGraph.argtypes = [c_void_p, POINTER(c_uint64), c_int]
-    orch_lib.BuildExampleGraph.restype = c_int
-
-    def build_example_graph(runtime, args, arg_count):
-        """Wrapper to call C++ orchestration function."""
-        return orch_lib.BuildExampleGraph(runtime, args, arg_count)
-
-    print("Loaded orchestration function: BuildExampleGraph")
+    print(f"Compiled orchestration: {len(orch_so_binary)} bytes")
 
     # Compile and register kernels (Python-side compilation)
     print("\n=== Compiling and Registering Kernels ===")
 
     pto_isa_root = "/data/wcwxy/workspace/pypto/pto-isa"
 
-    # Compile kernel_add (func_id=0)
-    print("Compiling kernel_add.cpp...")
-    kernel_add_o = pto_compiler.compile_kernel(
-        str(example_root / "kernels" / "aiv" / "kernel_add.cpp"),
-        core_type=1,  # AIV
-        pto_isa_root=pto_isa_root
-    )
-    kernel_add_bin = extract_text_section(kernel_add_o)
-    register_kernel(0, kernel_add_bin)
-
-    # Compile kernel_add_scalar (func_id=1)
-    print("Compiling kernel_add_scalar.cpp...")
-    kernel_add_scalar_o = pto_compiler.compile_kernel(
-        str(example_root / "kernels" / "aiv" / "kernel_add_scalar.cpp"),
-        core_type=1,  # AIV
-        pto_isa_root=pto_isa_root
-    )
-    kernel_add_scalar_bin = extract_text_section(kernel_add_scalar_o)
-    register_kernel(1, kernel_add_scalar_bin)
-
-    # Compile kernel_mul (func_id=2)
-    print("Compiling kernel_mul.cpp...")
-    kernel_mul_o = pto_compiler.compile_kernel(
-        str(example_root / "kernels" / "aiv" / "kernel_mul.cpp"),
-        core_type=1,  # AIV
-        pto_isa_root=pto_isa_root
-    )
-    kernel_mul_bin = extract_text_section(kernel_mul_o)
-    register_kernel(2, kernel_mul_bin)
+    for kernel in KERNELS:
+        print(f"Compiling {kernel['source']}...")
+        incore_o = pto_compiler.compile_incore(
+            kernel["source"],
+            core_type=kernel["core_type"],
+            pto_isa_root=pto_isa_root
+        )
+        kernel_bin = extract_text_section(incore_o)
+        register_kernel(kernel["func_id"], kernel_bin)
 
     print("All kernels compiled and registered successfully")
 
-    # Set device before creating runtime (enables memory allocation)
-    print(f"\n=== Setting Device {device_id} ===")
-    set_device(device_id)
 
     # Prepare input tensors
     print("\n=== Preparing Input Tensors ===")
@@ -162,7 +132,7 @@ def main():
     # Create and initialize runtime
     print("\n=== Creating and Initializing Runtime ===")
     runtime = Runtime()
-    runtime.initialize(build_example_graph, func_args)
+    runtime.initialize(orch_so_binary, ORCHESTRATION["function_name"], func_args)
 
     # Execute runtime on device
     print("\n=== Executing Runtime on Device ===")

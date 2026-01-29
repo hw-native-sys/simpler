@@ -13,16 +13,20 @@
  *   - Frees device memory
  */
 
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "runtime.h"
-#include "devicerunner.h"
 #include <stdint.h>
 #include <stddef.h>
-#include <new>
 #include <cstddef>
 #include <cstdint>
-#include <cmath>
+#include <cstdio>
+#include <cstring>
+#include <dlfcn.h>
 #include <iostream>
-#include <string>
+#include <sys/mman.h>
+#include <unistd.h>
 
 /**
  * Orchestration function signature.
@@ -41,20 +45,26 @@ extern "C" {
 /**
  * Initialize a pre-allocated runtime with dynamic orchestration.
  *
- * This function calls the orchestration function which is responsible for:
- * - Allocating device memory via runtime->DeviceMalloc()
- * - Copying data to device via runtime->CopyToDevice()
+ * This function loads the orchestration SO from binary data using memfd_create,
+ * resolves the orchestration function via dlsym, then calls it to build the
+ * task graph. The orchestration function is responsible for:
+ * - Allocating device memory via runtime->host_api.DeviceMalloc()
+ * - Copying data to device via runtime->host_api.CopyToDevice()
  * - Building the task graph
  * - Recording tensor pairs via runtime->RecordTensorPair()
  *
- * @param runtime         Pointer to pre-constructed Runtime
- * @param orch_func       Orchestration function to build task graph
- * @param func_args       Arguments for orchestration (host pointers, sizes, etc.)
- * @param func_args_count Number of arguments
+ * @param runtime           Pointer to pre-constructed Runtime
+ * @param orch_so_binary    Orchestration shared library binary data
+ * @param orch_so_size      Size of orchestration SO binary in bytes
+ * @param orch_func_name    Name of the orchestration function to call
+ * @param func_args         Arguments for orchestration (host pointers, sizes, etc.)
+ * @param func_args_count   Number of arguments
  * @return 0 on success, -1 on failure
  */
 int InitRuntimeImpl(Runtime *runtime,
-                    OrchestrationFunc orch_func,
+                    const uint8_t* orch_so_binary,
+                    size_t orch_so_size,
+                    const char* orch_func_name,
                     uint64_t* func_args,
                     int func_args_count) {
     // Validate inputs
@@ -62,10 +72,49 @@ int InitRuntimeImpl(Runtime *runtime,
         std::cerr << "Error: Runtime pointer is null\n";
         return -1;
     }
-    if (orch_func == nullptr) {
-        std::cerr << "Error: Orchestration function is null\n";
+    if (orch_so_binary == nullptr || orch_so_size == 0 || orch_func_name == nullptr) {
+        std::cerr << "Error: Invalid orchestration parameters\n";
         return -1;
     }
+
+    // Load orchestration SO from binary data using memfd_create
+    int fd = memfd_create("orch_so", MFD_CLOEXEC);
+    if (fd < 0) {
+        std::cerr << "Error: memfd_create failed\n";
+        return -1;
+    }
+
+    ssize_t written = write(fd, orch_so_binary, orch_so_size);
+    if (written < 0 || static_cast<size_t>(written) != orch_so_size) {
+        std::cerr << "Error: Failed to write orchestration SO to memfd\n";
+        close(fd);
+        return -1;
+    }
+
+    char fd_path[64];
+    snprintf(fd_path, sizeof(fd_path), "/proc/self/fd/%d", fd);
+
+    void* handle = dlopen(fd_path, RTLD_NOW | RTLD_LOCAL);
+    if (handle == nullptr) {
+        std::cerr << "Error: dlopen failed: " << dlerror() << "\n";
+        close(fd);
+        return -1;
+    }
+
+    dlerror();  // Clear any existing error
+    OrchestrationFunc orch_func =
+        reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
+    const char* dlsym_error = dlerror();
+    if (dlsym_error != nullptr) {
+        std::cerr << "Error: dlsym failed for '" << orch_func_name << "': " << dlsym_error << "\n";
+        dlclose(handle);
+        close(fd);
+        return -1;
+    }
+
+    close(fd);
+
+    std::cout << "Loaded orchestration function: " << orch_func_name << "\n";
 
     // Clear any previous tensor pairs
     runtime->ClearTensorPairs();
@@ -79,10 +128,14 @@ int InitRuntimeImpl(Runtime *runtime,
     if (rc != 0) {
         std::cerr << "Error: Orchestration function failed with code " << rc << '\n';
         runtime->ClearTensorPairs();
+        dlclose(handle);
         return rc;
     }
 
     std::cout << "\nRuntime initialized. Ready for execution from Python.\n";
+
+    // Note: We intentionally leak the dlopen handle to keep the SO loaded
+    // for the lifetime of the process.
 
     return 0;
 }
@@ -104,8 +157,6 @@ int ValidateRuntimeImpl(Runtime *runtime) {
         return -1;
     }
 
-    // Get DeviceRunner instance
-    DeviceRunner& runner = DeviceRunner::Get();
     int rc = 0;
 
     std::cout << "\n=== Copying Results Back to Host ===" << '\n';
@@ -116,7 +167,7 @@ int ValidateRuntimeImpl(Runtime *runtime) {
 
     for (int i = 0; i < tensor_pair_count; i++) {
         const TensorPair& pair = tensor_pairs[i];
-        int copy_rc = runner.CopyFromDevice(pair.hostPtr, pair.devPtr, pair.size);
+        int copy_rc = runtime->host_api.CopyFromDevice(pair.hostPtr, pair.devPtr, pair.size);
         if (copy_rc != 0) {
             std::cerr << "Error: Failed to copy tensor " << i << " from device: " << copy_rc << '\n';
             rc = copy_rc;
@@ -126,13 +177,12 @@ int ValidateRuntimeImpl(Runtime *runtime) {
         }
     }
 
-    // Print handshake results
-    runner.PrintHandshakeResults(*runtime);
+    // Note: PrintHandshakeResults is now called in DeviceRunner's destructor
 
     // Cleanup device tensors
     std::cout << "\n=== Cleaning Up ===" << '\n';
     for (int i = 0; i < tensor_pair_count; i++) {
-        runner.FreeTensor(tensor_pairs[i].devPtr);
+        runtime->host_api.DeviceFree(tensor_pairs[i].devPtr);
     }
     std::cout << "Freed " << tensor_pair_count << " device tensors\n";
 

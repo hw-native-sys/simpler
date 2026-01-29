@@ -39,28 +39,28 @@ class PTOCompiler:
         if not os.path.isfile(self.cc_path):
             raise FileNotFoundError(f"ccec compiler not found: {self.cc_path}")
 
-    def compile_kernel(
+    def compile_incore(
         self,
         source_path: str,
-        core_type: int = 1,
+        core_type: str = "aiv",
         pto_isa_root: Optional[str] = None,
         extra_include_dirs: Optional[List[str]] = None
-    ) -> str:
+    ) -> bytes:
         """
-        Compile a single AICore kernel source file to .o using ccec.
+        Compile a single AICore incore source file to .o using ccec.
 
         Args:
             source_path: Path to kernel source file (.cpp)
-            core_type: Core type: 0=AIC (cube), 1=AIV (vector). Default: 1 (AIV)
+            core_type: Core type: "aic" (cube) or "aiv" (vector). Default: "aiv"
             pto_isa_root: Path to PTO-ISA root directory. Required.
             extra_include_dirs: Additional include directories
 
         Returns:
-            Path to compiled .o file (in /tmp)
+            Binary contents of the compiled .o file
 
         Raises:
             FileNotFoundError: If source file or PTO-ISA headers not found
-            ValueError: If pto_isa_root is not provided
+            ValueError: If pto_isa_root is not provided or core_type is invalid
             RuntimeError: If compilation fails
         """
         # Validate source file exists
@@ -70,7 +70,7 @@ class PTOCompiler:
 
         # Validate PTO-ISA root
         if pto_isa_root is None:
-            raise ValueError("pto_isa_root is required for kernel compilation")
+            raise ValueError("pto_isa_root is required for incore compilation")
 
         pto_include = os.path.join(pto_isa_root, "include")
         pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
@@ -80,7 +80,7 @@ class PTOCompiler:
 
         # Generate output path
         timestamp = int(time.time() * 1000)
-        output_path = f"/tmp/kernel_{timestamp}_{os.getpid()}.o"
+        output_path = f"/tmp/incore_{timestamp}_{os.getpid()}.o"
 
         # Build compilation command
         cmd = self._build_compile_command(
@@ -93,9 +93,9 @@ class PTOCompiler:
         )
 
         # Execute compilation
-        core_type_name = "AIV" if core_type == 1 else "AIC"
+        core_type_name = "AIV" if core_type == "aiv" else "AIC"
         print(f"\n{'='*80}")
-        print(f"[Kernel] Compiling ({core_type_name}): {source_path}")
+        print(f"[Incore] Compiling ({core_type_name}): {source_path}")
         print(f"  Command: {' '.join(cmd)}")
         print(f"{'='*80}\n")
 
@@ -107,31 +107,37 @@ class PTOCompiler:
             )
 
             if result.stdout:
-                print(f"[Kernel] stdout:\n{result.stdout}")
+                print(f"[Incore] stdout:\n{result.stdout}")
             if result.stderr:
-                print(f"[Kernel] stderr:\n{result.stderr}")
+                print(f"[Incore] stderr:\n{result.stderr}")
 
             if result.returncode != 0:
                 raise RuntimeError(
-                    f"Kernel compilation failed with exit code {result.returncode}:\n"
+                    f"Incore compilation failed with exit code {result.returncode}:\n"
                     f"{result.stderr}"
                 )
 
         except FileNotFoundError:
             raise RuntimeError(f"ccec compiler not found at {self.cc_path}")
 
-        # Verify output file exists
+        # Verify output file exists and read binary data
         if not os.path.isfile(output_path):
             raise RuntimeError(f"Compilation succeeded but output file not found: {output_path}")
 
-        print(f"[Kernel] Compilation successful: {output_path}")
-        return output_path
+        with open(output_path, 'rb') as f:
+            binary_data = f.read()
+
+        # Clean up temp file
+        os.remove(output_path)
+
+        print(f"[Incore] Compilation successful: {len(binary_data)} bytes")
+        return binary_data
 
     def _build_compile_command(
         self,
         source_path: str,
         output_path: str,
-        core_type: int,
+        core_type: str,
         pto_include: str,
         pto_pto_include: str,
         extra_include_dirs: Optional[List[str]] = None
@@ -142,7 +148,7 @@ class PTOCompiler:
         Args:
             source_path: Path to source file
             output_path: Path for output .o file
-            core_type: 0=AIC (cube), 1=AIV (vector)
+            core_type: "aic" (cube) or "aiv" (vector)
             pto_include: Path to PTO include directory
             pto_pto_include: Path to PTO/pto include directory
             extra_include_dirs: Additional include directories
@@ -150,8 +156,8 @@ class PTOCompiler:
         Returns:
             List of command arguments
         """
-        arch = "dav-c220-vec" if core_type == 1 else "dav-c220-cube"
-        define = "__AIV__" if core_type == 1 else "__AIC__"
+        arch = "dav-c220-vec" if core_type == "aiv" else "dav-c220-cube"
+        define = "__AIV__" if core_type == "aiv" else "__AIC__"
 
         cmd = [
             self.cc_path,
@@ -184,7 +190,7 @@ class PTOCompiler:
         self,
         source_path: str,
         extra_include_dirs: Optional[List[str]] = None
-    ) -> str:
+    ) -> bytes:
         """
         Compile an orchestration function to a shared library (.so).
 
@@ -197,7 +203,7 @@ class PTOCompiler:
                                paths to runtime.h and devicerunner.h)
 
         Returns:
-            Path to compiled .so file (in /tmp)
+            Binary contents of the compiled .so file
 
         Raises:
             FileNotFoundError: If source file not found
@@ -259,9 +265,15 @@ class PTOCompiler:
         except FileNotFoundError:
             raise RuntimeError("g++ compiler not found. Please install g++.")
 
-        # Verify output file exists
+        # Verify output file exists and read binary data
         if not os.path.isfile(output_path):
             raise RuntimeError(f"Compilation succeeded but output file not found: {output_path}")
 
-        print(f"[Orchestration] Compilation successful: {output_path}")
-        return output_path
+        with open(output_path, 'rb') as f:
+            binary_data = f.read()
+
+        # Clean up temp file
+        os.remove(output_path)
+
+        print(f"[Orchestration] Compilation successful: {len(binary_data)} bytes")
+        return binary_data

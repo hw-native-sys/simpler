@@ -1,5 +1,6 @@
 """Tests for RuntimeBuilder class."""
 
+import os
 import sys
 import textwrap
 from pathlib import Path
@@ -225,3 +226,41 @@ class TestRuntimeBuilderBuild:
         builder = RuntimeBuilder(runtime_root=tmp_path)
         with pytest.raises(RuntimeError, match="cmake failed"):
             builder.build("test_rt")
+
+
+# --- Full integration tests (real compilation) ---
+
+
+requires_ascend = pytest.mark.skipif(
+    not os.getenv("ASCEND_HOME_PATH"),
+    reason="ASCEND_HOME_PATH not set; Ascend toolkit required for real build",
+)
+
+
+@requires_ascend
+class TestRuntimeBuilderIntegration:
+    """Integration tests that actually compile host_build_graph."""
+
+    @pytest.fixture(autouse=True)
+    def _reset_compiler_singleton(self):
+        """Reset BinaryCompiler singleton so each test gets a fresh instance."""
+        from binary_compiler import BinaryCompiler
+
+        yield
+        BinaryCompiler._instance = None
+        BinaryCompiler._initialized = False
+
+    def test_build_host_build_graph_returns_three_binaries(self):
+        """build('host_build_graph') produces a 3-tuple of non-empty bytes."""
+        from runtime_builder import RuntimeBuilder
+
+        builder = RuntimeBuilder(runtime_root=PROJECT_ROOT)
+        result = builder.build("host_build_graph")
+
+        assert isinstance(result, tuple)
+        assert len(result) == 3
+
+        host_binary, aicpu_binary, aicore_binary = result
+        for label, binary in [("host", host_binary), ("aicpu", aicpu_binary), ("aicore", aicore_binary)]:
+            assert isinstance(binary, bytes), f"{label} binary is not bytes"
+            assert len(binary) > 0, f"{label} binary is empty"

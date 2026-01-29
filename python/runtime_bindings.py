@@ -11,7 +11,7 @@ Usage:
     Runtime = load_runtime("/path/to/libpto_runtime.so")
 
     runtime = Runtime()
-    runtime.initialize()
+    runtime.initialize(orch_so_binary, "BuildExampleGraph", func_args)
 
     register_kernel(0, kernel_add)
     register_kernel(1, kernel_add_scalar)
@@ -27,8 +27,8 @@ Usage:
 
 from ctypes import (
     CDLL,
-    CFUNCTYPE,
     POINTER,
+    c_char_p,
     c_int,
     c_void_p,
     c_uint8,
@@ -36,16 +36,13 @@ from ctypes import (
     c_size_t,
 )
 from pathlib import Path
-from typing import Union, List, Callable, Optional
+from typing import Union, List, Optional
 import ctypes
 import tempfile
 
 
 # Module-level library reference
 _lib = None
-
-# Orchestration function type: (runtime, args, arg_count) -> int
-OrchestrationFunc = CFUNCTYPE(c_int, c_void_p, POINTER(c_uint64), c_int)
 
 
 # ============================================================================
@@ -84,10 +81,12 @@ class RuntimeLibraryLoader:
         self.lib.GetRuntimeSize.argtypes = []
         self.lib.GetRuntimeSize.restype = c_size_t
 
-        # InitRuntime - placement new + build runtime with orchestration
+        # InitRuntime - placement new + load SO + build runtime with orchestration
         self.lib.InitRuntime.argtypes = [
             c_void_p,               # runtime
-            OrchestrationFunc,      # orch_func
+            POINTER(c_uint8),       # orch_so_binary
+            c_size_t,               # orch_so_size
+            c_char_p,               # orch_func_name
             POINTER(c_uint64),      # func_args
             c_int,                  # func_args_count
         ]
@@ -150,14 +149,16 @@ class Runtime:
 
     def initialize(
         self,
-        orch_func: Callable,
+        orch_so_binary: bytes,
+        orch_func_name: str,
         func_args: Optional[List[int]] = None
     ) -> None:
         """
 
         Initialize the runtime structure with dynamic orchestration.
 
-        Calls InitRuntime() in C++ which calls the orchestration function.
+        Calls InitRuntime() in C++ which loads the orchestration SO,
+        resolves the function, and calls it to build the task graph.
         The orchestration function is responsible for:
         1. Allocating device memory
         2. Copying data to device
@@ -165,8 +166,8 @@ class Runtime:
         4. Recording tensor pairs for copy-back
 
         Args:
-            orch_func: Orchestration function to build task graph.
-                       Signature: int func(runtime, args, arg_count)
+            orch_so_binary: Orchestration shared library binary data
+            orch_func_name: Name of the orchestration function to call
             func_args: Arguments for orchestration (host pointers, sizes, etc.)
 
         Raises:
@@ -182,12 +183,14 @@ class Runtime:
         else:
             func_args_array = None
 
-        # Store orch_func reference to prevent garbage collection
-        self._orch_func = OrchestrationFunc(orch_func)
+        # Convert orch_so_binary to ctypes array
+        orch_so_array = (c_uint8 * len(orch_so_binary)).from_buffer_copy(orch_so_binary)
 
         rc = self.lib.InitRuntime(
             self._handle,
-            self._orch_func,
+            orch_so_array,
+            len(orch_so_binary),
+            orch_func_name.encode('utf-8'),
             func_args_array,
             func_args_count
         )
@@ -351,7 +354,7 @@ def load_runtime(lib_path: Union[str, Path, bytes]) -> type:
         Runtime = load_runtime("/path/to/libpto_runtime.so")
 
         runtime = Runtime()
-        runtime.initialize()
+        runtime.initialize(orch_so_binary, "BuildExampleGraph", func_args)
 
         register_kernel(0, kernel_add)
         register_kernel(1, kernel_add_scalar)

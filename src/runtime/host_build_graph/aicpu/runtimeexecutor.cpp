@@ -75,14 +75,14 @@ int AicpuExecutor::Init(Runtime* runtime) {
         return -1;
     }
 
+    cores_total_num_ = runtime->block_dim * blockdim_cores_num_;
+    thread_cores_num_ = cores_total_num_ / thread_num_;
+
     if (cores_total_num_ > MAX_CORES_PER_THREAD) {
         DEV_ERROR("Total cores %d exceeds maximum %d", cores_total_num_, MAX_CORES_PER_THREAD);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
-
-    cores_total_num_ = runtime->block_dim * blockdim_cores_num_;
-    thread_cores_num_ = cores_total_num_ / thread_num_;
 
     DEV_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num_);
 

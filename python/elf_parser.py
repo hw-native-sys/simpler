@@ -7,7 +7,7 @@ Based on the C++ implementation in binary_loader.cpp.
 
 import struct
 from pathlib import Path
-from typing import Optional
+from typing import Union
 
 
 # ELF Magic Numbers
@@ -17,30 +17,34 @@ ELFMAG2 = ord('L')
 ELFMAG3 = ord('F')
 
 
-def extract_text_section(elf_path: str) -> bytes:
+def extract_text_section(elf_input: Union[str, Path, bytes]) -> bytes:
     """
     Extract .text section from an ELF64 .o file.
 
     Args:
-        elf_path: Path to the ELF .o file
+        elf_input: Either a path to the ELF .o file (str/Path) or the ELF binary data (bytes)
 
     Returns:
         Binary data of the .text section
 
     Raises:
-        FileNotFoundError: If file does not exist
-        ValueError: If file is not a valid ELF or .text section not found
+        FileNotFoundError: If file path is provided and does not exist
+        ValueError: If data is not a valid ELF or .text section not found
     """
-    path = Path(elf_path)
-    if not path.exists():
-        raise FileNotFoundError(f"ELF file not found: {elf_path}")
-
-    # Read entire file
-    with open(elf_path, 'rb') as f:
-        elf_data = f.read()
+    # Handle input: either path or bytes
+    if isinstance(elf_input, bytes):
+        elf_data = elf_input
+        source_name = "<bytes>"
+    else:
+        path = Path(elf_input)
+        if not path.exists():
+            raise FileNotFoundError(f"ELF file not found: {elf_input}")
+        with open(elf_input, 'rb') as f:
+            elf_data = f.read()
+        source_name = str(elf_input)
 
     if len(elf_data) < 64:
-        raise ValueError(f"File too small to be a valid ELF: {elf_path}")
+        raise ValueError(f"Data too small to be a valid ELF: {source_name}")
 
     # Step 1: Parse ELF64 Header (64 bytes)
     # Reference: https://en.wikipedia.org/wiki/Executable_and_Linkable_Format
@@ -65,7 +69,7 @@ def extract_text_section(elf_path: str) -> bytes:
         elf_data[1] != ELFMAG1 or
         elf_data[2] != ELFMAG2 or
         elf_data[3] != ELFMAG3):
-        raise ValueError(f"Not a valid ELF file: {elf_path}")
+        raise ValueError(f"Not a valid ELF file: {source_name}")
 
     # Extract section header table info from ELF header
     # Use little-endian ('<') format
@@ -109,10 +113,10 @@ def extract_text_section(elf_path: str) -> bytes:
         if section_name == '.text':
             # Extract .text section binary data
             text_data = elf_data[sh_offset:sh_offset+sh_size]
-            print(f"Loaded .text section from {elf_path} (size: {sh_size} bytes)")
+            print(f"Loaded .text section from {source_name} (size: {sh_size} bytes)")
             return text_data
 
-    raise ValueError(f".text section not found in: {elf_path}")
+    raise ValueError(f".text section not found in: {source_name}")
 
 
 def _extract_cstring(data: bytes, offset: int) -> str:

@@ -118,6 +118,17 @@ struct TensorPair {
 };
 
 /**
+ * Host API function pointers for device memory operations.
+ * Allows runtime to use pluggable device memory backends.
+ */
+struct HostApi {
+    void* (*DeviceMalloc)(size_t size);
+    void (*DeviceFree)(void* devPtr);
+    int (*CopyToDevice)(void* devPtr, const void* hostPtr, size_t size);
+    int (*CopyFromDevice)(void* hostPtr, const void* devPtr, size_t size);
+};
+
+/**
  * Task entry in the runtime
  *
  * Each task has a unique ID (its index in the task array), arguments,
@@ -260,45 +271,6 @@ public:
     void print_runtime() const;
 
     // =========================================================================
-    // Device Memory Management
-    // =========================================================================
-
-    /**
-     * Allocate device memory.
-     *
-     * @param size  Size in bytes to allocate
-     * @return Device pointer on success, nullptr on failure
-     */
-    void* DeviceMalloc(size_t size);
-
-    /**
-     * Free device memory.
-     *
-     * @param devPtr  Device pointer to free
-     */
-    void DeviceFree(void* devPtr);
-
-    /**
-     * Copy data from host to device.
-     *
-     * @param devPtr   Device destination pointer
-     * @param hostPtr  Host source pointer
-     * @param size     Size in bytes to copy
-     * @return 0 on success, error code on failure
-     */
-    int CopyToDevice(void* devPtr, const void* hostPtr, size_t size);
-
-    /**
-     * Copy data from device to host.
-     *
-     * @param hostPtr  Host destination pointer
-     * @param devPtr   Device source pointer
-     * @param size     Size in bytes to copy
-     * @return 0 on success, error code on failure
-     */
-    int CopyFromDevice(void* hostPtr, const void* devPtr, size_t size);
-
-    // =========================================================================
     // Tensor Pair Management
     // =========================================================================
 
@@ -329,6 +301,14 @@ public:
      * Clear all recorded tensor pairs.
      */
     void ClearTensorPairs();
+
+    // =========================================================================
+    // Host API (host-only, not copied to device)
+    // =========================================================================
+
+    // Host API function pointers for device memory operations
+    // NOTE: Placed at end of class to avoid affecting device memory layout
+    HostApi host_api;
 };
 
 #endif  // RUNTIME_H

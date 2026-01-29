@@ -7,19 +7,14 @@
 
 #include "runtime.h"
 
-// External C API functions for device memory operations (defined in pto_runtime_c_api.cpp)
-extern "C" {
-void* DeviceMalloc_CApi(size_t size);
-void DeviceFree_CApi(void* devPtr);
-int CopyToDevice_CApi(void* devPtr, const void* hostPtr, size_t size);
-int CopyFromDevice_CApi(void* hostPtr, const void* devPtr, size_t size);
-}
-
 // =============================================================================
 // Constructor
 // =============================================================================
 
 Runtime::Runtime() {
+    // NOTE: host_api is initialized in InitRuntime() (host-only code)
+    // because the CApi functions don't exist when compiled for device.
+
     // Initialize task array (cannot use memset with atomic members)
     for (int i = 0; i < RUNTIME_MAX_TASKS; i++) {
         tasks[i].task_id = 0;
@@ -188,26 +183,6 @@ void Runtime::print_runtime() const {
     printf(
         "======================================================================"
         "==========\n\n");
-}
-
-// =============================================================================
-// Device Memory Management
-// =============================================================================
-
-void* Runtime::DeviceMalloc(size_t size) {
-    return DeviceMalloc_CApi(size);
-}
-
-void Runtime::DeviceFree(void* devPtr) {
-    DeviceFree_CApi(devPtr);
-}
-
-int Runtime::CopyToDevice(void* devPtr, const void* hostPtr, size_t size) {
-    return CopyToDevice_CApi(devPtr, hostPtr, size);
-}
-
-int Runtime::CopyFromDevice(void* hostPtr, const void* devPtr, size_t size) {
-    return CopyFromDevice_CApi(hostPtr, devPtr, size);
 }
 
 // =============================================================================

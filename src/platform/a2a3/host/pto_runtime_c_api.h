@@ -27,18 +27,6 @@ extern "C" {
  */
 typedef void* RuntimeHandle;
 
-/**
- * Orchestration function signature.
- *
- * @param runtime   RuntimeHandle (opaque pointer to Runtime)
- * @param args      Unified argument array:
- *                  - args[0..input_count-1]: device pointers (cast to uint64_t)
- *                  - args[input_count..]: additional arguments
- * @param arg_count Total number of arguments
- * @return 0 on success, negative on error
- */
-typedef int (*OrchestrationFunc)(void* runtime, uint64_t* args, int arg_count);
-
 /* ===========================================================================
  */
 /* Runtime API */
@@ -58,17 +46,22 @@ size_t GetRuntimeSize(void);
  * Initialize a runtime with dynamic orchestration.
  *
  * Uses placement new to construct Runtime in user-allocated memory.
- * Calls orchestration function to build the task graph.
+ * Loads the orchestration shared library from binary data, resolves the
+ * specified function, and calls it to build the task graph.
  * The orchestration function is responsible for device memory management.
  *
- * @param runtime         User-allocated memory of size GetRuntimeSize()
- * @param orch_func       Orchestration function to build task graph
- * @param func_args       Arguments for orchestration (host pointers, sizes, etc.)
- * @param func_args_count Number of arguments
+ * @param runtime           User-allocated memory of size GetRuntimeSize()
+ * @param orch_so_binary    Orchestration shared library binary data
+ * @param orch_so_size      Size of orchestration SO binary in bytes
+ * @param orch_func_name    Name of the orchestration function to call
+ * @param func_args         Arguments for orchestration (host pointers, sizes, etc.)
+ * @param func_args_count   Number of arguments
  * @return 0 on success, -1 on failure
  */
 int InitRuntime(RuntimeHandle runtime,
-                OrchestrationFunc orch_func,
+                const uint8_t* orch_so_binary,
+                size_t orch_so_size,
+                const char* orch_func_name,
                 uint64_t* func_args,
                 int func_args_count);
 
@@ -165,6 +158,9 @@ int set_device(int device_id);
 
 /**
  * Register a kernel binary for a func_id.
+ *
+ * IMPORTANT: set_device() MUST be called before this function.
+ * Kernels are immediately copied to device memory.
  *
  * Receives pre-extracted .text section binary data from Python,
  * allocates device GM memory, copies the binary to device,

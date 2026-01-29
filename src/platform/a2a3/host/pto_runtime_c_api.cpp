@@ -7,14 +7,12 @@
 
 #include "pto_runtime_c_api.h"
 
+#include <iostream>
 #include <new>  // for placement new
 #include <vector>
 
 #include "devicerunner.h"
 #include "runtime.h"
-
-// Internal typedef matching the C++ OrchestrationFunc signature
-typedef int (*OrchestrationFuncInternal)(Runtime* runtime, uint64_t* args, int arg_count);
 
 extern "C" {
 
@@ -24,10 +22,18 @@ extern "C" {
 /* ===========================================================================
  */
 int InitRuntimeImpl(Runtime* runtime,
-                    OrchestrationFuncInternal orch_func,
+                    const uint8_t* orch_so_binary,
+                    size_t orch_so_size,
+                    const char* orch_func_name,
                     uint64_t* func_args,
                     int func_args_count);
 int ValidateRuntimeImpl(Runtime* runtime);
+
+/* Forward declarations for device memory functions used in InitRuntime */
+void* DeviceMalloc(size_t size);
+void DeviceFree(void* devPtr);
+int CopyToDevice(void* devPtr, const void* hostPtr, size_t size);
+int CopyFromDevice(void* hostPtr, const void* devPtr, size_t size);
 
 /* ===========================================================================
  */
@@ -38,19 +44,32 @@ int ValidateRuntimeImpl(Runtime* runtime);
 size_t GetRuntimeSize(void) { return sizeof(Runtime); }
 
 int InitRuntime(RuntimeHandle runtime,
-                OrchestrationFunc orch_func,
+                const uint8_t* orch_so_binary,
+                size_t orch_so_size,
+                const char* orch_func_name,
                 uint64_t* func_args,
                 int func_args_count) {
     if (runtime == NULL) {
         return -1;
     }
+    if (orch_so_binary == NULL || orch_so_size == 0 || orch_func_name == NULL) {
+        std::cerr << "Error: Invalid orchestration parameters\n";
+        return -1;
+    }
+
     try {
         // Placement new to construct Runtime in user-allocated memory
         Runtime* r = new (runtime) Runtime();
-        // Cast the C-style function pointer to internal C++ type
-        OrchestrationFuncInternal orch_internal =
-            reinterpret_cast<OrchestrationFuncInternal>(orch_func);
-        return InitRuntimeImpl(r, orch_internal, func_args, func_args_count);
+
+        // Initialize host API function pointers (host-only, not available on device)
+        r->host_api.DeviceMalloc = DeviceMalloc;
+        r->host_api.DeviceFree = DeviceFree;
+        r->host_api.CopyToDevice = CopyToDevice;
+        r->host_api.CopyFromDevice = CopyFromDevice;
+
+        // Delegate SO loading and orchestration to InitRuntimeImpl
+        return InitRuntimeImpl(r, orch_so_binary, orch_so_size,
+                               orch_func_name, func_args, func_args_count);
     } catch (...) {
         return -1;
     }
@@ -69,10 +88,6 @@ void* DeviceMalloc(size_t size) {
     }
 }
 
-void* DeviceMalloc_CApi(size_t size) {
-    return DeviceMalloc(size);
-}
-
 void DeviceFree(void* devPtr) {
     if (devPtr == NULL) {
         return;
@@ -83,10 +98,6 @@ void DeviceFree(void* devPtr) {
     } catch (...) {
         // Ignore errors during free
     }
-}
-
-void DeviceFree_CApi(void* devPtr) {
-    DeviceFree(devPtr);
 }
 
 int CopyToDevice(void* devPtr, const void* hostPtr, size_t size) {
@@ -101,10 +112,6 @@ int CopyToDevice(void* devPtr, const void* hostPtr, size_t size) {
     }
 }
 
-int CopyToDevice_CApi(void* devPtr, const void* hostPtr, size_t size) {
-    return CopyToDevice(devPtr, hostPtr, size);
-}
-
 int CopyFromDevice(void* hostPtr, const void* devPtr, size_t size) {
     if (hostPtr == NULL || devPtr == NULL) {
         return -1;
@@ -115,10 +122,6 @@ int CopyFromDevice(void* hostPtr, const void* devPtr, size_t size) {
     } catch (...) {
         return -1;
     }
-}
-
-int CopyFromDevice_CApi(void* hostPtr, const void* devPtr, size_t size) {
-    return CopyFromDevice(hostPtr, devPtr, size);
 }
 
 int launch_runtime(RuntimeHandle runtime,
