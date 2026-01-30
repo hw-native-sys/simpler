@@ -5,10 +5,13 @@
 #include "device_log.h"
 #include "runtime.h"
 
-constexpr int MAX_AICPU_THREADS = 4;
-constexpr int MAX_AIC_PER_THREAD = 24;
-constexpr int MAX_AIV_PER_THREAD = 48;
-constexpr int MAX_CORES_PER_THREAD = MAX_AIC_PER_THREAD + MAX_AIV_PER_THREAD;
+// Platform-specific constants are provided via CMake compile definitions
+// (PLATFORM_MAX_AICPU_THREADS, PLATFORM_MAX_AIC_PER_THREAD, etc.)
+// defined in src/platform/*/host/CMakeLists.txt
+constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
+constexpr int MAX_AIC_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD;
+constexpr int MAX_AIV_PER_THREAD = PLATFORM_MAX_AIV_PER_THREAD;
+constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 
 struct AicpuExecutor {
     // ===== Thread management state =====
@@ -20,7 +23,6 @@ struct AicpuExecutor {
 
     int thread_num_{0};
     int cores_total_num_{0};
-    int blockdim_cores_num_{3};
     int thread_cores_num_{0};
     int core_assignments_[MAX_AICPU_THREADS][MAX_CORES_PER_THREAD];
 
@@ -67,6 +69,13 @@ int AicpuExecutor::init(Runtime* runtime) {
         return -1;
     }
 
+    // Verify core topology has been initialized by platform
+    if (!runtime->core_topology.initialized) {
+        DEV_ERROR("Core topology not initialized by platform");
+        init_failed_.store(true, std::memory_order_release);
+        return -1;
+    }
+
     // Read execution parameters from runtime
     thread_num_ = runtime->sche_cpu_num;
     if (thread_num_ == 0) thread_num_ = 1;
@@ -77,7 +86,8 @@ int AicpuExecutor::init(Runtime* runtime) {
         return -1;
     }
 
-    cores_total_num_ = runtime->block_dim * blockdim_cores_num_;
+    // Use core topology instead of hardcoded calculation
+    cores_total_num_ = runtime->core_topology.total_cores;
     thread_cores_num_ = cores_total_num_ / thread_num_;
 
     if (cores_total_num_ > MAX_CORES_PER_THREAD) {
@@ -88,52 +98,69 @@ int AicpuExecutor::init(Runtime* runtime) {
 
     DEV_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num_);
 
-    // Pre-compute core assignments for each thread
-    // Each thread manages blocks_per_thread blocks
-    // For each block b: AIC is core b, AIVs are cores (nrAic + b*2) and (nrAic
-    // + b*2 + 1)
-    int num_aic = runtime->block_dim;  // Total AIC cores (= block_dim)
-    int blocks_per_thread = runtime->block_dim / thread_num_;
+    // Infer block information from core topology
+    // Find the maximum block_idx to determine number of blocks
+    int num_blocks = 0;
+    for (int i = 0; i < cores_total_num_; i++) {
+        const CoreInfo* info = runtime->get_core_info(i);
+        if (info && info->block_idx + 1 > num_blocks) {
+            num_blocks = info->block_idx + 1;
+        }
+    }
 
-    // Validate block distribution
-    if (runtime->block_dim % thread_num_ != 0) {
-        DEV_ERROR("block_dim (%d) must be divisible by thread_num (%d)", runtime->block_dim, thread_num_);
+    // Calculate blocks per thread
+    int blocks_per_thread = num_blocks / thread_num_;
+    if (num_blocks % thread_num_ != 0) {
+        DEV_ERROR("Number of blocks (%d) must be divisible by thread_num (%d)", num_blocks, thread_num_);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
 
     DEV_INFO("Block assignment: %d blocks, %d threads, %d blocks per thread",
-        runtime->block_dim,
+        num_blocks,
         thread_num_,
         blocks_per_thread);
 
+    // Assign cores to threads using platform-provided topology
+    // Maintain original allocation order: group by blocks, AIC first then AIV
     for (int t = 0; t < thread_num_; t++) {
         int start_block = t * blocks_per_thread;
         int end_block = (t + 1) * blocks_per_thread;
         int core_idx = 0;
 
-        // Assign AIC cores for all blocks managed by this thread
-        for (int b = start_block; b < end_block; b++) {
-            core_assignments_[t][core_idx++] = b;  // AIC core ID = block ID
+        int aic_start = -1, aic_end = -1;
+        int aiv_start = -1, aiv_end = -1;
+
+        // First, assign all AIC cores for this thread's blocks
+        for (int i = 0; i < cores_total_num_; i++) {
+            const CoreInfo* info = runtime->get_core_info(i);
+            if (info && info->core_type == 0 &&
+                info->block_idx >= start_block && info->block_idx < end_block) {
+                if (aic_start == -1) aic_start = info->core_id;
+                aic_end = info->core_id;
+                core_assignments_[t][core_idx++] = info->core_id;
+            }
         }
 
-        // Assign AIV cores for all blocks managed by this thread
-        for (int b = start_block; b < end_block; b++) {
-            int aiv_base = num_aic;                                   // AIV cores start after all AIC cores
-            core_assignments_[t][core_idx++] = aiv_base + b * 2;      // First AIV of block b
-            core_assignments_[t][core_idx++] = aiv_base + b * 2 + 1;  // Second AIV of block b
+        // Then, assign all AIV cores for this thread's blocks
+        for (int i = 0; i < cores_total_num_; i++) {
+            const CoreInfo* info = runtime->get_core_info(i);
+            if (info && info->core_type == 1 &&
+                info->block_idx >= start_block && info->block_idx < end_block) {
+                if (aiv_start == -1) aiv_start = info->core_id;
+                aiv_end = info->core_id;
+                core_assignments_[t][core_idx++] = info->core_id;
+            }
         }
 
         DEV_INFO(
-            "Thread %d: manages blockDims [%d-%d], cores: AIC[%d-%d] "
-            "AIV[%d-%d]",
+            "Thread %d: manages cores: AIC[%d-%d] AIV[%d-%d], total %d cores",
             t,
-            start_block,
-            end_block - 1,
-            start_block,
-            end_block - 1,
-            num_aic + start_block * 2,
-            num_aic + (end_block - 1) * 2 + 1);
+            aic_start,
+            aic_end,
+            aiv_start,
+            aiv_end,
+            core_idx);
     }
 
     // Initialize runtime execution state

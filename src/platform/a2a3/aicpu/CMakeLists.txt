@@ -49,6 +49,15 @@ target_compile_options(aicpu_kernel
         -g
 )
 
+# Add platform-specific compile definitions
+target_compile_definitions(aicpu_kernel
+    PRIVATE
+        PLATFORM_MAX_AICPU_THREADS=4
+        PLATFORM_MAX_AIC_PER_THREAD=24
+        PLATFORM_MAX_AIV_PER_THREAD=48
+        PLATFORM_MAX_CORES_PER_THREAD=72
+)
+
 target_include_directories(aicpu_kernel
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}

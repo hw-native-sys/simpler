@@ -11,6 +11,7 @@
 #include <iostream>
 #include <vector>
 
+#include "platform_config.h"
 #include "runtime.h"
 
 // =============================================================================
@@ -253,29 +254,38 @@ int DeviceRunner::run(Runtime& runtime,
     // Calculate execution parameters
     block_dim_ = block_dim;
 
-    int num_ai_core = block_dim * cores_per_blockdim_;
-    // Initialize handshake buffers in runtime
-    if (num_ai_core > RUNTIME_MAX_WORKER) {
-        std::cerr << "Error: block_dim (" << block_dim << ") exceeds RUNTIME_MAX_WORKER (" << RUNTIME_MAX_WORKER << ")\n";
+    // Initialize platform-specific core topology (NEW)
+    rc = init_runtime_core_topology(&runtime, block_dim);
+    if (rc != 0) {
+        std::cerr << "Error: init_runtime_core_topology failed: " << rc << '\n';
+        return rc;
+    }
+
+    // Use core topology to initialize runtime parameters (NEW)
+    int aicore_num = runtime.core_topology.total_cores;
+    if (aicore_num > RUNTIME_MAX_WORKER) {
+        std::cerr << "Error: total cores (" << aicore_num << ") exceeds RUNTIME_MAX_WORKER (" << RUNTIME_MAX_WORKER << ")\n";
         return -1;
     }
 
-    runtime.worker_count = num_ai_core;
-    worker_count_ = num_ai_core;  // Store for print_handshake_results in destructor
-    runtime.block_dim = block_dim;
+    runtime.worker_count = aicore_num;
+    worker_count_ = aicore_num;  // Store for print_handshake_results in destructor
     runtime.sche_cpu_num = launch_aicpu_num;
 
-    // Calculate number of AIC cores (1/3 of total)
-    int num_aic = block_dim;  // Round up for 1/3
+    // Initialize handshake buffers using core topology (NEW)
+    for (int i = 0; i < aicore_num; i++) {
+        const CoreInfo* info = runtime.get_core_info(i);
+        if (info == nullptr) {
+            std::cerr << "Error: Failed to get core info for core " << i << '\n';
+            return -1;
+        }
 
-    for (int i = 0; i < num_ai_core; i++) {
         runtime.workers[i].aicpu_ready = 0;
         runtime.workers[i].aicore_done = 0;
         runtime.workers[i].control = 0;
         runtime.workers[i].task = 0;
         runtime.workers[i].task_status = 0;
-        // Set core type: first 1/3 are AIC (0), remaining 2/3 are AIV (1)
-        runtime.workers[i].core_type = (i < num_aic) ? 0 : 1;
+        runtime.workers[i].core_type = info->core_type;  // Use topology info
     }
 
     // Set function_bin_addr for all tasks (NEW - Runtime function pointer

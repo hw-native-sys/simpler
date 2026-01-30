@@ -32,7 +32,6 @@ Runtime::Runtime() {
     next_task_id = 0;
     initial_ready_count = 0;
     worker_count = 0;
-    block_dim = 0;
     sche_cpu_num = 1;
     tensor_pair_count = 0;
 }

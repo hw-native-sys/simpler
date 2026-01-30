@@ -25,6 +25,7 @@
 #include "kernel_args.h"
 #include "memory_allocator.h"
 #include "runtime.h"
+#include "platform_config.h"
 
 /**
  * DeviceArgs structure for AICPU device arguments

@@ -108,6 +108,35 @@ enum class CoreType : int {
 };
 
 /**
+ * Core Information - Platform-agnostic core descriptor
+ *
+ * This structure describes a single core's properties without encoding
+ * platform-specific mapping logic. Platform code is responsible for
+ * populating these structures, while runtime code uses them.
+ */
+struct CoreInfo {
+    int core_id;      // Logical core ID (index into Handshake buffer)
+    int block_idx;    // Block index for this core (platform-specific mapping)
+    int core_type;    // Core type: 0=AIC, 1=AIV
+};
+
+/**
+ * Core Topology - Platform-provided core mapping
+ *
+ * This structure contains the complete core topology for the current
+ * platform configuration. The platform must initialize this before
+ * runtime execution begins. This allows the runtime to remain completely
+ * platform-agnostic while still handling diverse core configurations.
+ */
+struct CoreTopology {
+    int total_cores;                    // Total number of cores
+    CoreInfo cores[RUNTIME_MAX_WORKER]; // Per-core information
+    bool initialized;                   // Has topology been set?
+
+    CoreTopology() : total_cores(0), initialized(false) {}
+};
+
+/**
  * Tensor pair for tracking host-device memory mappings.
  * Used for copy-back during finalize.
  */
@@ -179,8 +208,11 @@ public:
     int worker_count;                       // Number of active workers
 
     // Execution parameters for AICPU scheduling
-    int block_dim;     // Number of AIC blocks (block dimension)
     int sche_cpu_num;  // Number of AICPU threads for scheduling
+
+    // Platform-provided core topology (NEW)
+    // The platform must initialize this before runtime execution
+    CoreTopology core_topology;
 
 private:
     // Task storage
@@ -245,6 +277,23 @@ public:
      * @return Total task count
      */
     int get_task_count() const;
+
+    /**
+     * Query core information by core ID (used by runtime executor)
+     *
+     * This method provides platform-agnostic access to core properties.
+     * The runtime executor uses this to determine core assignments without
+     * needing to know platform-specific mapping logic.
+     *
+     * @param core_id  Core ID to query (index into Handshake buffer)
+     * @return Pointer to CoreInfo, or nullptr if invalid or not initialized
+     */
+    const CoreInfo* get_core_info(int core_id) const {
+        if (!core_topology.initialized || core_id < 0 || core_id >= core_topology.total_cores) {
+            return nullptr;
+        }
+        return &core_topology.cores[core_id];
+    }
 
     /**
      * Get initially ready tasks (fanin == 0) as entry point for execution

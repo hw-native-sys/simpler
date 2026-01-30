@@ -28,6 +28,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/device_runner.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/platform_config.cpp"
 )
 
 if(DEFINED CUSTOM_SOURCE_DIRS)
@@ -51,6 +52,15 @@ target_compile_options(host_runtime
         -fPIC
         -O3
         -g
+)
+
+# Add platform-specific compile definitions
+target_compile_definitions(host_runtime
+    PRIVATE
+        PLATFORM_MAX_AICPU_THREADS=4
+        PLATFORM_MAX_AIC_PER_THREAD=24
+        PLATFORM_MAX_AIV_PER_THREAD=48
+        PLATFORM_MAX_CORES_PER_THREAD=72
 )
 
 # Include directories

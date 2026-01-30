@@ -16,6 +16,8 @@
 
 #include "device_runner.h"
 
+#include "platform_config.h"
+
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
@@ -168,7 +170,16 @@ int DeviceRunner::run(Runtime& runtime,
 
     // Calculate execution parameters
     block_dim_ = block_dim;
-    int num_cores = block_dim * cores_per_blockdim_;
+
+    // Initialize platform-specific core topology (NEW)
+    rc = init_runtime_core_topology(&runtime, block_dim);
+    if (rc != 0) {
+        std::cerr << "Error: init_runtime_core_topology failed: " << rc << '\n';
+        return rc;
+    }
+
+    // Use core topology to initialize runtime parameters (NEW)
+    int num_cores = runtime.core_topology.total_cores;
 
     if (num_cores > RUNTIME_MAX_WORKER) {
         std::cerr << "Error: num_cores (" << num_cores << ") exceeds RUNTIME_MAX_WORKER ("
@@ -179,20 +190,22 @@ int DeviceRunner::run(Runtime& runtime,
     // Initialize handshake buffers
     runtime.worker_count = num_cores;
     worker_count_ = num_cores;
-    runtime.block_dim = block_dim;
     runtime.sche_cpu_num = launch_aicpu_num;
 
-    // Calculate number of AIC cores
-    int num_aic = block_dim;
-
+    // Initialize handshake buffers using core topology (NEW)
     for (int i = 0; i < num_cores; i++) {
+        const CoreInfo* info = runtime.get_core_info(i);
+        if (info == nullptr) {
+            std::cerr << "Error: Failed to get core info for core " << i << '\n';
+            return -1;
+        }
+
         runtime.workers[i].aicpu_ready = 0;
         runtime.workers[i].aicore_done = 0;
         runtime.workers[i].control = 0;
         runtime.workers[i].task = 0;
         runtime.workers[i].task_status = 0;
-        // First 1/3 are AIC (0), remaining 2/3 are AIV (1)
-        runtime.workers[i].core_type = (i < num_aic) ? 0 : 1;
+        runtime.workers[i].core_type = info->core_type;  // Use topology info
     }
 
     // Set function_bin_addr for all tasks

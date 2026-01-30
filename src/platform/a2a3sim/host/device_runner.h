@@ -23,6 +23,7 @@
 #include "kernel_args.h"
 #include "memory_allocator.h"
 #include "runtime.h"
+#include "platform_config.h"
 
 /**
  * Mapped kernel binary in executable memory
