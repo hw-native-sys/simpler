@@ -1,4 +1,4 @@
-# PTO Runtime Python Example - Simulation (a2a3sim)
+# PTO Runtime Example - Simulation Platform (a2a3sim)
 
 This example demonstrates how to build and execute task dependency graphs using the thread-based simulation platform, without requiring Ascend hardware.
 
@@ -17,7 +17,7 @@ With input values `a=2.0` and `b=3.0`, the expected result is `f = (2+3+1)*(2+3+
 
 | Aspect | Hardware (a2a3) | Simulation (a2a3sim) |
 |--------|-----------------|----------------------|
-| Platform | `RuntimeBuilder(platform="a2a3")` | `RuntimeBuilder(platform="a2a3sim")` |
+| Platform | `-p a2a3` | `-p a2a3sim` |
 | Requirements | CANN toolkit, Ascend device | gcc/g++ only |
 | Kernel compilation | ccec (Bisheng) compiler | g++ compiler |
 | Execution | AICPU/AICore on device | Host threads |
@@ -31,74 +31,101 @@ With input values `a=2.0` and `b=3.0`, the expected result is `f = (2+3+1)*(2+3+
 
 No Ascend SDK or CANN toolkit required.
 
-## Running the Example
+## Quick Start
 
-From the repository root:
+Run the example using the test framework:
 
 ```bash
-cd examples/host_build_graph_sim_example
-python3 main.py
+# From repository root
+python examples/scripts/run_example.py \
+  -k examples/host_build_graph_sim_example/kernels \
+  -g examples/host_build_graph_sim_example/golden.py \
+  -p a2a3sim
+
+# With verbose output
+python examples/scripts/run_example.py \
+  -k examples/host_build_graph_sim_example/kernels \
+  -g examples/host_build_graph_sim_example/golden.py \
+  -p a2a3sim \
+  -v
 ```
 
-Optional device ID (simulation only, default 0):
-```bash
-python3 main.py -d 0
+## Directory Structure
+
+```
+host_build_graph_sim_example/
+├── README.md                    # This file
+├── golden.py                    # Input generation and expected output
+└── kernels/
+    ├── kernel_config.py         # Kernel configuration
+    ├── aiv/                      # AIV kernel implementations (plain C++)
+    │   ├── kernel_add.cpp        # Element-wise tensor addition
+    │   ├── kernel_add_scalar.cpp # Add scalar to tensor elements
+    │   └── kernel_mul.cpp        # Element-wise tensor multiplication
+    └── orchestration/
+        └── example_orch.cpp      # Task graph building function
+```
+
+## Files
+
+### `golden.py`
+
+Defines input tensors and expected output computation:
+
+```python
+__outputs__ = ["f"]           # Output tensor names
+TENSOR_ORDER = ["a", "b", "f"]  # Order passed to orchestration function
+
+def generate_inputs(params: dict) -> dict:
+    # Returns: {"a": ..., "b": ..., "f": ...}
+
+def compute_golden(tensors: dict, params: dict) -> None:
+    # Computes expected output in-place
+```
+
+### `kernels/kernel_config.py`
+
+Defines kernel sources and orchestration function:
+
+```python
+KERNELS = [
+    {"func_id": 0, "core_type": "aiv", "source": ".../kernel_add.cpp"},
+    {"func_id": 1, "core_type": "aiv", "source": ".../kernel_add_scalar.cpp"},
+    {"func_id": 2, "core_type": "aiv", "source": ".../kernel_mul.cpp"},
+]
+
+ORCHESTRATION = {
+    "source": ".../example_orch.cpp",
+    "function_name": "BuildExampleGraph"
+}
 ```
 
 ## Expected Output
 
 ```
-=== Building Simulation Runtime ===
-Available runtimes: ['host_build_graph']
+=== Building Runtime: host_build_graph (platform: a2a3sim) ===
+...
+=== Compiling and Registering Kernels ===
+Compiling kernel: kernels/aiv/kernel_add.cpp (func_id=0)
+...
+=== Generating Input Tensors ===
+Inputs: ['a', 'b']
+Outputs: ['f']
+...
+=== Launching Runtime ===
+...
+=== Comparing Results ===
+Comparing f: shape=(16384,), dtype=float32
+  First 10 actual:   [42. 42. 42. 42. 42. 42. 42. 42. 42. 42.]
+  First 10 expected: [42. 42. 42. 42. 42. 42. 42. 42. 42. 42.]
+  f: PASS (16384/16384 elements matched)
 
-=== Loading Runtime Library ===
-Loaded runtime (xxx bytes)
-
-=== Setting Device 0 ===
-
-=== Compiling Orchestration Function ===
-Compiled orchestration: xxx bytes
-
-=== Compiling and Registering Simulation Kernels ===
-Compiling kernels/aiv/kernel_add.cpp...
-Compiling kernels/aiv/kernel_add_scalar.cpp...
-Compiling kernels/aiv/kernel_mul.cpp...
-All kernels compiled and registered successfully
-
-=== Preparing Input Tensors ===
-Created tensors: 16384 elements each
-  host_a: all 2.0
-  host_b: all 3.0
-  host_f: zeros (output)
-Expected result: f = (a + b + 1) * (a + b + 2) = (2+3+1)*(2+3+2) = 42.0
-
-=== Creating and Initializing Runtime ===
-
-=== Executing Runtime (Simulation) ===
-
-=== Finalizing and Copying Results ===
-
-=== Validating Results ===
-First 10 elements of result (host_f):
-  f[0] = 42.0
-  f[1] = 42.0
-  ...
-
-SUCCESS: All 16384 elements are correct (42.0)
+============================================================
+TEST PASSED
+============================================================
 ```
 
-## How It Works
-
-1. **Build Runtime**: `RuntimeBuilder(platform="a2a3sim")` compiles host, AICPU, and AICore libraries using g++
-2. **Load Runtime Library**: `bind_host_binary()` loads the host .so via ctypes
-3. **Set Device**: Records device ID (no actual device initialization in simulation)
-4. **Compile Orchestration**: Compile the orchestration function using g++
-5. **Compile & Register Kernels**: Compile simulation kernels (plain C++) and register their .text sections
-6. **Initialize Runtime**: Call `runtime.initialize()` with orchestration and input tensors
-7. **Execute Runtime**: `launch_runtime()` executes using host threads instead of device cores
-8. **Finalize**: Results are already in host memory (no copy needed)
-
-### Simulation Architecture
+## Simulation Architecture
 
 The simulation platform emulates the AICPU/AICore execution model:
 
@@ -111,16 +138,27 @@ The simulation platform emulates the AICPU/AICore execution model:
 
 Simulation kernels are plain C++ implementations in `kernels/aiv/`:
 
-- `kernel_add.cpp` - Element-wise tensor addition (loop-based)
-- `kernel_add_scalar.cpp` - Add scalar to each tensor element (loop-based)
-- `kernel_mul.cpp` - Element-wise tensor multiplication (loop-based)
+- **kernel_add.cpp** - Element-wise tensor addition (loop-based)
+- **kernel_add_scalar.cpp** - Add scalar to each tensor element (loop-based)
+- **kernel_mul.cpp** - Element-wise tensor multiplication (loop-based)
 
 These are compiled with g++ instead of the PTO compiler.
 
-## API Reference
+## Troubleshooting
 
-See the main [runtime README](../../README.md) for detailed documentation on the PTO Runtime API.
+### "binary_data cannot be empty" Error
+
+- Verify correct `-p a2a3sim` parameter is used
+- Check if kernel source files exist
+- Use `-v` to view detailed compilation logs
+
+### Compilation Errors
+
+- Ensure gcc/g++ is installed and available in PATH
+- Check kernel source syntax for C++ errors
 
 ## See Also
 
-For the hardware version that runs on real Ascend devices, see [host_build_graph_example](../host_build_graph_example/).
+- [Test Framework Documentation](../scripts/README.md)
+- [Hardware Example](../host_build_graph_example/) - Run on real Ascend devices
+- [Main Project README](../../README.md)

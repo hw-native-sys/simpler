@@ -9,7 +9,7 @@ The PTO Runtime consists of **three separate programs** that communicate through
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                    Python Application                        │
-│         (examples/host_build_graph_example/main.py)         │
+│              (examples/scripts/run_example.py)                   │
 └─────────────────────────┬───────────────────────────────────┘
                           │
          ┌────────────────┼────────────────┐
@@ -185,9 +185,14 @@ pto-runtime/
 │   └── toolchain.py                    # Toolchain configuration
 │
 ├── examples/                           # Working examples
+│   ├── scripts/                        # Test framework scripts
+│   │   ├── run_example.py                   # Main test runner
+│   │   ├── code_runner.py              # Test execution engine
+│   │   └── README.md                   # Test framework documentation
+│   │
 │   ├── host_build_graph_example/       # Host-built graph example (a2a3)
-│   │   ├── main.py                     # Python orchestration
 │   │   ├── README.md                   # Example documentation
+│   │   ├── golden.py                   # Input generation and expected output
 │   │   └── kernels/
 │   │       ├── kernel_config.py        # Kernel configuration
 │   │       ├── aiv/                    # AIV kernels
@@ -198,7 +203,8 @@ pto-runtime/
 │   │           └── example_orch.cpp    # Orchestration kernel
 │   │
 │   └── host_build_graph_sim_example/   # Simulation example (a2a3sim)
-│       ├── main.py                     # Python orchestration
+│       ├── README.md                   # Example documentation
+│       ├── golden.py                   # Input generation and expected output
 │       └── kernels/                    # Simulation kernels (plain C++)
 │
 └── tests/                              # Test suite
@@ -295,9 +301,20 @@ runtime.finalize()  # Verify and cleanup
 
 ### Running the Example
 
+Use the test framework to run examples:
+
 ```bash
-cd examples/host_build_graph_example
-python3 main.py [device_id]
+# Hardware platform (requires Ascend device)
+python examples/scripts/run_example.py \
+  -k examples/host_build_graph_example/kernels \
+  -g examples/host_build_graph_example/golden.py \
+  -p a2a3
+
+# Simulation platform (no hardware required)
+python examples/scripts/run_example.py \
+  -k examples/host_build_graph_sim_example/kernels \
+  -g examples/host_build_graph_sim_example/golden.py \
+  -p a2a3sim
 ```
 
 This example:
@@ -306,25 +323,26 @@ This example:
 3. Initializes DeviceRunner with compiled binaries
 4. Creates a task runtime: `f = (a + b + 1)(a + b + 2)` with 4 tasks and dependencies
 5. Executes on device (AICPU scheduling, AICore computing)
-6. Validates results and cleans up
+6. Validates results against golden output
 
 Expected output:
 ```
-=== Creating and Initializing Runtime ===
-Formula: (a + b + 1)(a + b + 2)
+=== Building Runtime: host_build_graph (platform: a2a3sim) ===
+...
+=== Comparing Results ===
+Comparing f: shape=(16384,), dtype=float32
+  f: PASS (16384/16384 elements matched)
 
-=== Executing Runtime on Device ===
-
-=== Validating Results and Cleaning Up ===
-✓ SUCCESS: All 16384 elements are correct (42.0)
-Formula verified: (a + b + 1)(a + b + 2) = (2+3+1)*(2+3+2) = 42
+============================================================
+TEST PASSED
+============================================================
 ```
 
 ## Execution Flow
 
 ### 1. Python Setup Phase
 ```
-Python main.py
+Python run_example.py
   │
   ├─→ BinaryCompiler.compile("host", ...) → host_binary (.so)
   ├─→ BinaryCompiler.compile("aicpu", ...) → aicpu_binary (.so)

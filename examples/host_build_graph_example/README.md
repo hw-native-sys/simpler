@@ -1,10 +1,10 @@
-# PTO Runtime Python Example - Basic
+# PTO Runtime Example - Hardware Platform (a2a3)
 
-This example demonstrates how to build and execute task dependency graphs on Ascend devices using the Python bindings for PTO Runtime.
+This example demonstrates how to build and execute task dependency graphs on Ascend devices using the PTO Runtime test framework.
 
 ## Overview
 
-The example implements the formula `(a + b + 1)(a + b + 2)` using a task dependency graph with runtime kernel compilation:
+The example implements the formula `(a + b + 1)(a + b + 2)` using a task dependency graph:
 
 - Task 0: `c = a + b`
 - Task 1: `d = c + 1`
@@ -13,151 +13,143 @@ The example implements the formula `(a + b + 1)(a + b + 2)` using a task depende
 
 With input values `a=2.0` and `b=3.0`, the expected result is `f = (2+3+1)*(2+3+2) = 42.0`.
 
-## Building
-
-The example uses Python-driven compilation via RuntimeBuilder:
-
-```python
-from runtime_builder import RuntimeBuilder
-
-builder = RuntimeBuilder(platform="a2a3")
-host_binary, aicpu_binary, aicore_binary = builder.build("host_build_graph")
-```
-
-No separate CMake build step is required - RuntimeBuilder handles compilation automatically.
-
 ## Dependencies
 
 - Python 3
 - NumPy
 - CANN Runtime (Ascend) with ASCEND_HOME_PATH set
 - gcc/g++ compiler
+- PTO-ISA headers (PTO_ISA_ROOT environment variable)
 
-## Running the Example
+## Quick Start
 
-### Set Environment Variables
-
-From the build directory:
+Run the example using the test framework:
 
 ```bash
-# Set PTO_ISA_ROOT for runtime kernel compilation
-export PTO_ISA_ROOT=$(pwd)/_deps/pto-isa-src
+# From repository root
+python examples/scripts/run_example.py \
+  -k examples/host_build_graph_example/kernels \
+  -g examples/host_build_graph_example/golden.py \
+  -p a2a3
+
+# With specific device ID
+python examples/scripts/run_example.py \
+  -k examples/host_build_graph_example/kernels \
+  -g examples/host_build_graph_example/golden.py \
+  -p a2a3 \
+  -d 9
+
+# With verbose output
+python examples/scripts/run_example.py \
+  -k examples/host_build_graph_example/kernels \
+  -g examples/host_build_graph_example/golden.py \
+  -p a2a3 \
+  -v
 ```
 
-### Run the Example
+## Directory Structure
 
-```bash
-cd examples/host_build_graph_example
-python3 main.py <device_id>
+```
+host_build_graph_example/
+├── README.md                    # This file
+├── golden.py                    # Input generation and expected output
+└── kernels/
+    ├── kernel_config.py         # Kernel configuration
+    ├── aiv/                      # AIV kernel implementations
+    │   ├── kernel_add.cpp        # Element-wise tensor addition
+    │   ├── kernel_add_scalar.cpp # Add scalar to tensor elements
+    │   └── kernel_mul.cpp        # Element-wise tensor multiplication
+    └── orchestration/
+        └── example_orch.cpp      # Task graph building function
 ```
 
-For example, to run on device 9:
+## Files
 
-```bash
-python3 main.py 9
+### `golden.py`
+
+Defines input tensors and expected output computation:
+
+```python
+__outputs__ = ["f"]           # Output tensor names
+TENSOR_ORDER = ["a", "b", "f"]  # Order passed to orchestration function
+
+def generate_inputs(params: dict) -> dict:
+    # Returns: {"a": ..., "b": ..., "f": ...}
+
+def compute_golden(tensors: dict, params: dict) -> None:
+    # Computes expected output in-place
+```
+
+### `kernels/kernel_config.py`
+
+Defines kernel sources and orchestration function:
+
+```python
+KERNELS = [
+    {"func_id": 0, "core_type": "aiv", "source": ".../kernel_add.cpp"},
+    {"func_id": 1, "core_type": "aiv", "source": ".../kernel_add_scalar.cpp"},
+    {"func_id": 2, "core_type": "aiv", "source": ".../kernel_mul.cpp"},
+]
+
+ORCHESTRATION = {
+    "source": ".../example_orch.cpp",
+    "function_name": "BuildExampleGraph"
+}
 ```
 
 ## Expected Output
 
 ```
-=== Runtime Builder Example (Python) ===
-
-=== Compiling Kernels at Runtime ===
-All kernels compiled and loaded successfully
-
-=== Allocating Device Memory ===
-Allocated 6 tensors (128x128 each, 65536 bytes per tensor)
-Initialized input tensors: a=2.0, b=3.0 (all elements)
-Expected result: f = (2+3+1)*(2+3+2) = 6*7 = 42.0
-
-=== Creating Task Runtime for Formula ===
-Formula: (a + b + 1)(a + b + 2)
-Tasks:
-  task0: c = a + b
-  task1: d = c + 1
-  task2: e = c + 2
-  task3: f = d * e
-
-Created runtime with 4 tasks
+=== Building Runtime: host_build_graph (platform: a2a3) ===
 ...
+=== Compiling and Registering Kernels ===
+Compiling kernel: kernels/aiv/kernel_add.cpp (func_id=0)
+...
+=== Generating Input Tensors ===
+Inputs: ['a', 'b']
+Outputs: ['f']
+...
+=== Launching Runtime ===
+...
+=== Comparing Results ===
+Comparing f: shape=(16384,), dtype=float32
+  First 10 actual:   [42. 42. 42. 42. 42. 42. 42. 42. 42. 42.]
+  First 10 expected: [42. 42. 42. 42. 42. 42. 42. 42. 42. 42.]
+  f: PASS (16384/16384 elements matched)
 
-=== Executing Runtime ===
-
-=== Validating Results ===
-First 10 elements of result:
-  f[0] = 42.0
-  f[1] = 42.0
-  ...
-
-✓ SUCCESS: All 16384 elements are correct (42.0)
-Formula verified: (a + b + 1)(a + b + 2) = (2+3+1)*(2+3+2) = 42
-
-=== Success ===
+============================================================
+TEST PASSED
+============================================================
 ```
 
-## How It Works
+## Environment Setup
 
-1. **Build Runtime**: RuntimeBuilder compiles host, AICPU, and AICore binaries
-2. **Load Runtime Library**: `bind_host_binary()` loads the host .so via ctypes
-3. **Set Device**: Initialize the target device
-4. **Compile Orchestration**: Compile the orchestration function that builds the task graph
-5. **Compile & Register Kernels**: Compile AIV kernels using PTOCompiler and register them
-6. **Initialize Runtime**: Call `runtime.initialize()` with orchestration and input tensors
-7. **Execute Runtime**: `launch_runtime()` executes the task graph on device
-8. **Finalize**: Copy results back and verify correctness
+```bash
+# Required environment variables
+source /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash
+export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+export PTO_ISA_ROOT=/path/to/pto-isa
 
-### Execution Flow
-
-The example demonstrates a clean separation of concerns:
-
-**C++ (InitRuntime)**:
-- Compiles and loads kernels
-- Allocates device memory for tensors
-- Initializes input data
-- Builds the task dependency runtime
-
-**Python**:
-- Orchestrates the overall flow
-- Calls `runner.run(runtime)` to execute the runtime on device
-
-**C++ (FinalizeRuntime)**:
-- Copies results from device
-- Validates computation correctness
-- Frees device memory
-- Deletes the runtime
+# Optional
+export PTO_DEVICE_ID=0
+```
 
 ## Kernels
 
-The example uses runtime kernel compilation. Kernel source files are in the `kernels/` directory:
+The example uses runtime kernel compilation. Kernels are compiled using the Bisheng CCE compiler (`ccec`) from the CANN toolkit:
 
-- `kernel_add.cpp` - Element-wise tensor addition
-- `kernel_add_scalar.cpp` - Add a scalar value to each tensor element
-- `kernel_mul.cpp` - Element-wise tensor multiplication
-
-These kernels are compiled at runtime using the Bisheng compiler from the CANN toolkit.
-
-## API Reference
-
-See the main [runtime README](../../README.md) for detailed documentation on the PTO Runtime API.
+- **kernel_add.cpp** - Element-wise tensor addition using PTO ISA
+- **kernel_add_scalar.cpp** - Add a scalar value to each tensor element
+- **kernel_mul.cpp** - Element-wise tensor multiplication
 
 ## Troubleshooting
-
-### Import Error: Cannot import bindings
-
-Make sure you are running from the correct directory and the python/ directory is in your path:
-```bash
-cd examples/host_build_graph_example
-python3 main.py
-```
 
 ### Kernel Compilation Failed
 
 Ensure PTO_ISA_ROOT is set:
 ```bash
-export PTO_ISA_ROOT=/path/to/runtime/build/_deps/pto-isa-src
+export PTO_ISA_ROOT=/path/to/pto-isa
 ```
-
-Or set it to your custom PTO-ISA installation path.
 
 ### Device Initialization Failed
 
@@ -165,6 +157,14 @@ Or set it to your custom PTO-ISA installation path.
 - Check that the specified device ID is valid (0-15)
 - Ensure you have permission to access the device
 
+### "binary_data cannot be empty" Error
+
+- Verify correct `-p a2a3` parameter is used
+- Check if kernel source files exist
+- Use `-v` to view detailed compilation logs
+
 ## See Also
 
-For a simulation-based version that runs without Ascend hardware, see [host_build_graph_sim_example](../host_build_graph_sim_example/).
+- [Test Framework Documentation](../scripts/README.md)
+- [Simulation Example](../host_build_graph_sim_example/) - Run without Ascend hardware
+- [Main Project README](../../README.md)

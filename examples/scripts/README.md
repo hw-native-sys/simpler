@@ -1,0 +1,408 @@
+# PTO Runtime Test Framework
+
+This directory contains scripts and tools for running PTO Runtime tests.
+
+## Overview
+
+The PTO Runtime test framework provides a simplified interface for testing runtime implementations. Users only need to provide:
+
+1. **Kernel configuration** (`kernel_config.py`) - Defines kernels and orchestration function
+2. **Golden script** (`golden.py`) - Defines input generation and expected output computation
+
+The test framework automatically handles compilation, execution, and result validation.
+
+## Quick Start
+
+### Basic Usage
+
+```bash
+python examples/scripts/run_example.py \
+  --kernels <kernels_directory> \
+  --golden <golden_script_path> \
+  --platform <platform_name>
+```
+
+### Examples
+
+#### Running Hardware Platform Tests (Requires Ascend Device)
+
+```bash
+python examples/scripts/run_example.py \
+  -k examples/host_build_graph_example/kernels \
+  -g examples/host_build_graph_example/golden.py \
+  -p a2a3
+```
+
+#### Running Simulation Platform Tests (No Hardware Required)
+
+```bash
+python examples/scripts/run_example.py \
+  -k examples/host_build_graph_sim_example/kernels \
+  -g examples/host_build_graph_sim_example/golden.py \
+  -p a2a3sim
+```
+
+## Command Line Arguments
+
+### `run_example.py` Parameters
+
+| Argument | Short | Description | Default |
+|----------|-------|-------------|---------|
+| `--kernels` | `-k` | Kernels directory path (contains kernel_config.py) | **Required** |
+| `--golden` | `-g` | golden.py script path | **Required** |
+| `--platform` | `-p` | Platform name: `a2a3` or `a2a3sim` | `a2a3` |
+| `--device` | `-d` | Device ID | From env var or 0 |
+| `--runtime` | `-r` | Runtime implementation name | `host_build_graph` |
+| `--verbose` | `-v` | Enable verbose output | False |
+
+### Platform Description
+
+- **`a2a3`**: Hardware platform, requires Ascend device and CANN toolkit
+- **`a2a3sim`**: Simulation platform, uses thread simulation, only requires gcc/g++
+
+## File Structure Requirements
+
+### 1. Kernels Directory Structure
+
+The kernels directory must contain a `kernel_config.py` file:
+
+```
+kernels/
+├── kernel_config.py          # Required: kernel configuration
+├── orchestration/
+│   └── example_orch.cpp      # Orchestration function implementation
+└── aiv/                      # or aic/, depending on core type
+    ├── kernel_add.cpp
+    ├── kernel_mul.cpp
+    └── ...
+```
+
+### 2. `kernel_config.py` Format
+
+```python
+from pathlib import Path
+
+KERNELS_DIR = Path(__file__).parent
+
+# Kernel list
+KERNELS = [
+    {
+        "func_id": 0,                                      # Kernel ID
+        "core_type": "aiv",                                # Core type: aiv or aic
+        "source": str(KERNELS_DIR / "aiv/kernel_add.cpp") # Kernel source file path
+    },
+    # More kernels...
+]
+
+# Orchestration function configuration
+ORCHESTRATION = {
+    "source": str(KERNELS_DIR / "orchestration/example_orch.cpp"),
+    "function_name": "BuildExampleGraph"  # Orchestration function name
+}
+```
+
+### 3. `golden.py` Format
+
+```python
+import numpy as np
+
+# Output tensor names list (optional, or use 'out_' prefix convention)
+__outputs__ = ["f"]
+
+# Tensor order (required, must match orchestration function parameter order)
+TENSOR_ORDER = ["a", "b", "f"]
+
+# Comparison tolerances
+RTOL = 1e-5
+ATOL = 1e-5
+
+def generate_inputs(params: dict) -> dict:
+    """
+    Generate input and output tensors.
+
+    Args:
+        params: Parameter dictionary (from PARAMS_LIST)
+
+    Returns:
+        Dictionary containing all tensors (inputs + outputs)
+    """
+    SIZE = 16384
+    return {
+        "a": np.full(SIZE, 2.0, dtype=np.float32),
+        "b": np.full(SIZE, 3.0, dtype=np.float32),
+        "f": np.zeros(SIZE, dtype=np.float32),  # Output tensor
+    }
+
+def compute_golden(tensors: dict, params: dict) -> None:
+    """
+    Compute expected output (in-place modification).
+
+    Args:
+        tensors: Dictionary containing all tensors
+        params: Parameter dictionary
+    """
+    a = tensors["a"]
+    b = tensors["b"]
+    tensors["f"][:] = (a + b + 1) * (a + b + 2)
+
+# Optional: Multiple test cases
+PARAMS_LIST = [
+    {},  # Default parameters
+    # {"size": 1024},  # Other test cases
+]
+```
+
+### Golden Script Interface Description
+
+#### Required Functions
+
+1. **`generate_inputs(params: dict) -> dict`**
+   - Generate input and output tensors
+   - Returns: Dictionary with tensor names as keys and numpy arrays as values
+
+2. **`compute_golden(tensors: dict, params: dict) -> None`**
+   - Compute expected output values
+   - Modifies output tensors in `tensors` dictionary in-place
+
+#### Required Configuration
+
+- **`TENSOR_ORDER`**: List specifying the order of tensors passed to orchestration function
+
+#### Optional Configuration
+
+- **`__outputs__`**: Output tensor names list (or use `out_` prefix convention)
+- **`PARAMS_LIST`**: Test parameters list (default `[{}]`)
+- **`RTOL`**: Relative tolerance (default `1e-5`)
+- **`ATOL`**: Absolute tolerance (default `1e-5`)
+
+## Output Tensor Identification
+
+The test framework supports two methods for identifying output tensors:
+
+### Method 1: Explicit Declaration (Recommended)
+
+```python
+__outputs__ = ["f", "result", ...]
+```
+
+### Method 2: Naming Convention
+
+Use `out_` prefix to name output tensors:
+
+```python
+def generate_inputs(params: dict) -> dict:
+    return {
+        "a": np.array(...),      # Input
+        "b": np.array(...),      # Input
+        "out_f": np.zeros(...),  # Output (auto-detected)
+    }
+```
+
+## Orchestration Function Interface
+
+The orchestration function's parameter order must match `TENSOR_ORDER`:
+
+```cpp
+// Assume TENSOR_ORDER = ["a", "b", "f"]
+int BuildExampleGraph(Runtime* runtime, uint64_t* args, int arg_count) {
+    // args layout: [ptr_a, ptr_b, ptr_f, size_a, size_b, size_f, count]
+    void* ptr_a = reinterpret_cast<void*>(args[0]);
+    void* ptr_b = reinterpret_cast<void*>(args[1]);
+    void* ptr_f = reinterpret_cast<void*>(args[2]);
+    uint64_t size_a = args[3];
+    uint64_t size_b = args[4];
+    uint64_t size_f = args[5];
+    uint64_t count = args[6];
+
+    // Build task graph...
+}
+```
+
+## Environment Variables
+
+### a2a3 Platform (Hardware)
+
+```bash
+# Required
+export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.0
+export PTO_ISA_ROOT=/path/to/pto-isa
+
+# Optional
+export PTO_DEVICE_ID=0
+```
+
+### a2a3sim Platform (Simulation)
+
+No special environment variables required.
+
+## Complete Example
+
+### Directory Structure
+
+```
+my_test/
+├── kernels/
+│   ├── kernel_config.py
+│   ├── orchestration/
+│   │   └── my_orch.cpp
+│   └── aiv/
+│       ├── kernel_add.cpp
+│       └── kernel_mul.cpp
+└── golden.py
+```
+
+### Running Tests
+
+```bash
+# Hardware platform
+python examples/scripts/run_example.py -k my_test/kernels -g my_test/golden.py -p a2a3
+
+# Simulation platform
+python examples/scripts/run_example.py -k my_test/kernels -g my_test/golden.py -p a2a3sim
+
+# Verbose output
+python examples/scripts/run_example.py -k my_test/kernels -g my_test/golden.py -p a2a3sim -v
+```
+
+## Test Output
+
+### Success Example
+
+```
+=== Building Runtime: host_build_graph (platform: a2a3sim) ===
+...
+=== Compiling and Registering Kernels ===
+Compiling kernel: kernels/aiv/kernel_add.cpp (func_id=0)
+...
+=== Generating Input Tensors ===
+Inputs: ['a', 'b']
+Outputs: ['f']
+...
+=== Launching Runtime ===
+...
+=== Comparing Results ===
+Comparing f: shape=(16384,), dtype=float32
+  First 10 actual:   [42. 42. 42. 42. 42. 42. 42. 42. 42. 42.]
+  First 10 expected: [42. 42. 42. 42. 42. 42. 42. 42. 42. 42.]
+  f: PASS (16384/16384 elements matched)
+
+============================================================
+TEST PASSED
+============================================================
+```
+
+### Failure Example
+
+```
+=== Comparing Results ===
+Comparing f: shape=(16384,), dtype=float32
+  First 10 actual:   [40. 40. 40. 40. 40. 40. 40. 40. 40. 40.]
+  First 10 expected: [42. 42. 42. 42. 42. 42. 42. 42. 42. 42.]
+
+TEST FAILED: Output 'f' does not match golden
+```
+
+## Reference Examples
+
+- **Hardware Example**: [examples/host_build_graph_example/](../host_build_graph_example/)
+- **Simulation Example**: [examples/host_build_graph_sim_example/](../host_build_graph_sim_example/)
+
+## FAQ
+
+### Q: How to debug test failures?
+
+Use the `-v` flag to enable verbose output:
+
+```bash
+python examples/scripts/run_example.py -k ... -g ... -p ... -v
+```
+
+### Q: Why "binary_data cannot be empty" error?
+
+This usually happens when:
+- Using wrong platform (a2a3 vs a2a3sim)
+- Kernel compilation failed silently
+
+Solutions:
+1. Verify correct `-p` parameter is used
+2. Check if kernel source files exist
+3. Use `-v` to view detailed compilation logs
+
+### Q: How to add multiple test cases?
+
+Define `PARAMS_LIST` in `golden.py`:
+
+```python
+PARAMS_LIST = [
+    {"size": 1024},
+    {"size": 2048},
+    {"size": 4096},
+]
+
+def generate_inputs(params: dict) -> dict:
+    size = params["size"]
+    return {
+        "a": np.random.randn(size).astype(np.float32),
+        "b": np.random.randn(size).astype(np.float32),
+        "out_f": np.zeros(size, dtype=np.float32),
+    }
+```
+
+### Q: Are PyTorch tensors supported?
+
+Yes. The test framework automatically converts PyTorch tensors to NumPy arrays:
+
+```python
+import torch
+
+def generate_inputs(params: dict) -> dict:
+    return {
+        "a": torch.randn(1024),      # Auto-converted
+        "b": torch.randn(1024),
+        "out_f": torch.zeros(1024),
+    }
+```
+
+## Advanced Usage
+
+### Custom Runtime Implementation
+
+If you have a custom runtime implementation:
+
+```bash
+python examples/scripts/run_example.py \
+  -k my_test/kernels \
+  -g my_test/golden.py \
+  -r my_custom_runtime \
+  -p a2a3sim
+```
+
+Runtime implementation should be located at: `src/runtime/<runtime_name>/`
+
+### Programmatic Usage
+
+You can use `CodeRunner` directly in Python scripts:
+
+```python
+from code_runner import CodeRunner
+
+runner = CodeRunner(
+    kernels_dir="my_test/kernels",
+    golden_path="my_test/golden.py",
+    runtime_name="host_build_graph",
+    platform="a2a3sim",
+    device_id=0,
+)
+
+runner.run()  # Execute test
+```
+
+## Related Documentation
+
+- [Main Project README](../../README.md)
+- [Python Bindings Documentation](../../python/README.md)
+- [Examples Documentation](../README.md)
+
+## Contributing
+
+For issues or suggestions, please submit an Issue or Pull Request.
