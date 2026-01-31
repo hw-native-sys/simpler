@@ -95,7 +95,11 @@ class PTOCompiler:
         """
         # For simulation platform, dispatch to compile_incore_sim
         if self.platform == "a2a3sim":
-            return self.compile_incore_sim(source_path)
+            return self.compile_incore_sim(
+                source_path,
+                pto_isa_root=pto_isa_root,
+                extra_include_dirs=extra_include_dirs
+            )
 
         # For real hardware (a2a3), continue with ccec compilation
         # Validate source file exists
@@ -322,18 +326,22 @@ class PTOCompiler:
         print(f"[Orchestration] Compilation successful: {len(binary_data)} bytes")
         return binary_data
 
-    def compile_incore_sim(self, source_path: str) -> bytes:
+    def compile_incore_sim(
+        self,
+        source_path: str,
+        pto_isa_root: Optional[str] = None,
+        extra_include_dirs: Optional[List[str]] = None
+    ) -> bytes:
         """
-        Compile a simulation kernel to .o using g++.
-
-        This compiles a simulation kernel (plain C++ code) to an object file,
-        which can then have its .text section extracted for execution on host.
+        Compile a simulation kernel to .so/.dylib using g++-15.
 
         Args:
             source_path: Path to kernel source file (.cpp)
+            pto_isa_root: Path to PTO-ISA root directory (for PTO ISA headers)
+            extra_include_dirs: Additional include directories
 
         Returns:
-            Binary contents of the compiled .o file
+            Binary contents of the compiled .so/.dylib file
 
         Raises:
             FileNotFoundError: If source file not found
@@ -343,18 +351,53 @@ class PTOCompiler:
         if not os.path.isfile(source_path):
             raise FileNotFoundError(f"Source file not found: {source_path}")
 
-        # Generate output path
+        # Generate output path (use platform-appropriate extension)
         timestamp = int(time.time() * 1000)
-        output_path = f"/tmp/sim_kernel_{timestamp}_{os.getpid()}.o"
+        ext = ".dylib" if sys.platform == "darwin" else ".so"
+        output_path = f"/tmp/sim_kernel_{timestamp}_{os.getpid()}{ext}"
 
-        # Build compilation command
+        # Build compilation command to create dynamic library
         cmd = [
-            "g++", "-c",
-            "-O2", "-fPIC", "-fno-plt",
-            "-std=c++17",
-            "-o", output_path,
-            source_path
+            "g++-15", "-shared",
+            "-O2", "-fPIC",
+            "-std=c++23",
+            "-fvisibility=hidden",          # Avoid stub calls for internal functions
+            "-fpermissive",                 # Allow extensions
+            "-Wno-macro-redefined",         # Suppress macro redefinition warnings
+            "-Wno-ignored-attributes",      # Suppress attribute warnings
+            "-D__CPU_SIM",                  # CPU simulation mode
+            "-DPTO_CPU_TEXT_STANDALONE",    # No C++ stdlib symbols in .text
+            "-DNDEBUG",                     # Disable assert
+            "-fno-builtin",                 # Prevent loop-to-memset optimization
+            "-ffunction-sections",          # Put each function in its own section
         ]
+
+        # Place kernel entry function at .text+0x0 via -ffunction-sections + linker layout
+        kernel_func = Path(source_path).stem  # kernel_add.cpp -> kernel_add
+        order_file_path = f"/tmp/sim_kernel_order_{timestamp}_{os.getpid()}"
+        if sys.platform == "darwin":
+            order_file_path += ".txt"
+            with open(order_file_path, 'w') as f:
+                f.write(f"_{kernel_func}\n")
+            cmd.append(f"-Wl,-order_file,{order_file_path}")
+        else:
+            order_file_path += ".ld"
+            with open(order_file_path, 'w') as f:
+                f.write(f"SECTIONS {{ .text : {{ *(.text.{kernel_func}) *(.text .text.*) }} }}\n")
+                f.write("INSERT BEFORE .fini;\n")
+            cmd.append(f"-Wl,-T,{order_file_path}")
+
+        # Add PTO ISA header paths if provided
+        if pto_isa_root:
+            pto_include = os.path.join(pto_isa_root, "include")
+            cmd.append(f"-I{pto_include}")
+
+        # Add extra include directories if provided
+        if extra_include_dirs:
+            for inc_dir in extra_include_dirs:
+                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+
+        cmd.extend(["-o", output_path, source_path])
 
         # Print compilation command
         print(f"\n{'='*80}")
@@ -391,8 +434,10 @@ class PTOCompiler:
         with open(output_path, 'rb') as f:
             binary_data = f.read()
 
-        # Clean up temp file
+        # Clean up temp files
         os.remove(output_path)
+        if os.path.isfile(order_file_path):
+            os.remove(order_file_path)
 
         print(f"[SimKernel] Compilation successful: {len(binary_data)} bytes")
         return binary_data

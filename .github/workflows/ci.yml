@@ -15,6 +15,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Clone pto-isa headers
+        run: |
+          git clone --depth 1 --branch ci_simpler \
+            https://gitcode.com/zhangqi-chen/pto-isa.git \
+            third_party/pto-isa
+
+      - name: Install g++-15 (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+          if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+
+      - name: Install g++-15 (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install gcc@15 || brew install gcc
+
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
@@ -24,4 +42,6 @@ jobs:
         run: pip install numpy
 
       - name: Run simulation example
+        env:
+          PTO_ISA_ROOT: ${{ github.workspace }}/third_party/pto-isa
         run: python examples/scripts/run_example.py -k examples/host_build_graph_sim_example/kernels -g examples/host_build_graph_sim_example/golden.py -p a2a3sim
