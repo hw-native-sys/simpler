@@ -24,3 +24,6 @@ profile_*_log*.toml
 
 # Git cloned dependencies (not tracked in repo)
 examples/scripts/_deps/
+
+# Local development plans (not tracked in repo)
+docs/plans/
