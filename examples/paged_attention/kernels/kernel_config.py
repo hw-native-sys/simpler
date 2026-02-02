@@ -1,0 +1,36 @@
+"""
+Paged Attention Kernel and Orchestration Configuration
+
+Defines the kernels and orchestration function for paged attention
+with AIC/AIV subgraph splitting:
+
+AIC Kernels (Matrix Multiplication):
+  - aic_qk_matmul: Q @ K^T computation
+  - aic_pv_matmul: P @ V computation
+
+AIV Kernels (Vector Operations):
+  - aiv_softmax_prepare: scale, rowmax, exp, rowsum
+  - aiv_online_update: online softmax accumulation + fused normalization
+
+Note: aiv_normalize has been merged into aiv_online_update for efficiency.
+"""
+
+from pathlib import Path
+
+_KERNELS_ROOT = Path(__file__).parent
+
+# Orchestration config
+ORCHESTRATION = {
+    "source": str(_KERNELS_ROOT / "orchestration" / "paged_attention_orch.cpp"),
+    "function_name": "build_paged_attention_graph",
+}
+
+# Kernel configs (aiv_normalize removed - merged into aiv_online_update)
+KERNELS = [
+    # AIC kernels (matrix multiplication using Cube unit)
+    {"func_id": 0, "source": str(_KERNELS_ROOT / "aic" / "aic_qk_matmul.cpp"),       "core_type": "aic"},
+    {"func_id": 2, "source": str(_KERNELS_ROOT / "aic" / "aic_pv_matmul.cpp"),       "core_type": "aic"},
+    # AIV kernels (vector operations)
+    {"func_id": 1, "source": str(_KERNELS_ROOT / "aiv" / "aiv_softmax_prepare.cpp"), "core_type": "aiv"},
+    {"func_id": 3, "source": str(_KERNELS_ROOT / "aiv" / "aiv_online_update.cpp"),   "core_type": "aiv"},
+]
