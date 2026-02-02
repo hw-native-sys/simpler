@@ -95,6 +95,168 @@ def _get_device_id() -> int:
     return int(device_id)
 
 
+def _get_pto_isa_clone_path() -> Path:
+    """Get the expected path to pto-isa clone."""
+    return _get_project_root() / "examples" / "scripts" / "_deps" / "pto-isa"
+
+
+def _is_pto_isa_cloned() -> bool:
+    """
+    Check if pto-isa is cloned.
+
+    A clone is considered valid if:
+    1. The directory exists
+    2. It contains the include directory (essential content)
+    """
+    clone_path = _get_pto_isa_clone_path()
+    if not clone_path.exists():
+        return False
+
+    # Check for essential content
+    include_dir = clone_path / "include"
+    return include_dir.exists() and include_dir.is_dir()
+
+
+def _is_git_available() -> bool:
+    """Check if git command is available."""
+    try:
+        import subprocess
+        result = subprocess.run(
+            ["git", "--version"],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        return result.returncode == 0
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return False
+
+
+def _clone_pto_isa(verbose: bool = False) -> bool:
+    """
+    Clone pto-isa repository.
+
+    Args:
+        verbose: Print detailed progress information
+
+    Returns:
+        True if successful, False otherwise
+    """
+    import subprocess
+
+    if not _is_git_available():
+        if verbose:
+            print("Warning: git command not available, cannot clone pto-isa")
+        return False
+
+    clone_path = _get_pto_isa_clone_path()
+
+    # Create parent deps directory if it doesn't exist
+    deps_dir = clone_path.parent
+    try:
+        deps_dir.mkdir(parents=True, exist_ok=True)
+    except Exception as e:
+        if verbose:
+            print(f"Warning: Failed to create deps directory: {e}")
+        return False
+
+    try:
+        if verbose:
+            print(f"\nCloning pto-isa to {clone_path}...")
+            print("This may take a few moments on first run...")
+
+        # Clone with shallow depth for faster download
+        result = subprocess.run(
+            [
+                "git", "clone",
+                "--branch", "ci_simpler",
+                "--depth", "1",
+                "https://gitcode.com/zhangqi-chen/pto-isa.git",
+                str(clone_path)
+            ],
+            capture_output=True,
+            text=True,
+            timeout=300  # 5 minutes timeout
+        )
+
+        if result.returncode != 0:
+            if verbose:
+                print(f"Warning: Failed to clone pto-isa:\n{result.stderr}")
+            return False
+
+        if verbose:
+            if result.stdout:
+                print(result.stdout)
+            print(f"pto-isa cloned successfully to: {clone_path}")
+
+        return True
+
+    except subprocess.TimeoutExpired:
+        if verbose:
+            print("Warning: Clone operation timed out")
+        return False
+    except Exception as e:
+        if verbose:
+            print(f"Warning: Failed to clone pto-isa: {e}")
+        return False
+
+
+def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
+    """
+    Ensure PTO_ISA_ROOT is set, either from environment or cloned repo.
+
+    This function:
+    1. Checks if PTO_ISA_ROOT is already set
+    2. If not, tries to clone pto-isa repository
+    3. Sets PTO_ISA_ROOT to the clone path
+
+    Args:
+        verbose: Print detailed progress information
+
+    Returns:
+        PTO_ISA_ROOT path if successful, None otherwise
+    """
+    # Check if already set in environment
+    existing_root = os.environ.get("PTO_ISA_ROOT")
+    if existing_root:
+        if verbose:
+            print(f"Using existing PTO_ISA_ROOT: {existing_root}")
+        return existing_root
+
+    # Try to use cloned repository
+    clone_path = _get_pto_isa_clone_path()
+
+    # Clone if needed
+    if not _is_pto_isa_cloned():
+        if verbose:
+            print("PTO_ISA_ROOT not set, cloning pto-isa repository...")
+        if not _clone_pto_isa(verbose=verbose):
+            if verbose:
+                print("\nFailed to automatically clone pto-isa.")
+                print("You can manually clone it with:")
+                print(f"  mkdir -p {clone_path.parent}")
+                print(f"  git clone --branch ci_simpler https://gitcode.com/zhangqi-chen/pto-isa.git {clone_path}")
+                print(f"Or set PTO_ISA_ROOT to an existing pto-isa installation:")
+                print(f"  export PTO_ISA_ROOT=/path/to/pto-isa")
+            return None
+
+    # Verify clone has expected content
+    include_dir = clone_path / "include"
+    if not include_dir.exists():
+        if verbose:
+            print(f"Warning: pto-isa cloned but missing include directory: {include_dir}")
+        return None
+
+    # Set environment variable
+    pto_isa_root = str(clone_path.resolve())
+    os.environ["PTO_ISA_ROOT"] = pto_isa_root
+
+    if verbose:
+        print(f"Set PTO_ISA_ROOT to: {pto_isa_root}")
+
+    return pto_isa_root
+
+
 class CodeRunner:
     """
     Simplified test runner that loads kernel config and golden script.
@@ -258,7 +420,7 @@ class CodeRunner:
             raise EnvironmentError(
                 "PTO_ISA_ROOT environment variable is not set.\n"
                 "Please set it to the PTO-ISA root directory, e.g.:\n"
-                "  export PTO_ISA_ROOT=$(pwd)/_deps/pto-isa-src"
+                "  export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa"
             )
 
     def run(self) -> None:
@@ -279,7 +441,13 @@ class CodeRunner:
         from bindings import bind_host_binary, register_kernel, set_device, launch_runtime
         from elf_parser import extract_text_section
 
-        # Skip if environment not available (only for a2a3 platform)
+        # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
+        pto_isa_root = _ensure_pto_isa_root(verbose=True)
+        if pto_isa_root is None:
+            print("Warning: Could not auto-setup PTO_ISA_ROOT")
+            print("         If kernels use PTO ISA headers, they may fail to compile")
+
+        # Check platform-specific environment (only for a2a3 hardware platform)
         if self.platform == "a2a3":
             self.skip_if_no_env()
 

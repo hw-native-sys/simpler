@@ -4,44 +4,64 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   run-example:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python-version: ['3.10']
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - name: Clone pto-isa headers
+      - name: Clone pto-isa dependency
         run: |
-          git clone --depth 1 --branch ci_simpler \
-            https://gitcode.com/zhangqi-chen/pto-isa.git \
-            third_party/pto-isa
+          mkdir -p examples/scripts/_deps
+          git clone --branch ci_simpler --depth 1 https://gitcode.com/zhangqi-chen/pto-isa.git examples/scripts/_deps/pto-isa
 
-      - name: Install g++-15 (Ubuntu)
-        if: runner.os == 'Linux'
+      - name: Set up C++ compiler
         run: |
-          sudo apt-get update
-          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
-          if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
-
-      - name: Install g++-15 (macOS)
-        if: runner.os == 'macOS'
-        run: |
-          brew install gcc@15 || brew install gcc
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+            if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+          else
+            brew install gcc@15 || brew install gcc
+            if command -v g++-15; then
+              echo "CXX=g++-15" >> $GITHUB_ENV
+            else
+              echo "CXX=g++" >> $GITHUB_ENV
+            fi
+          fi
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
       - name: Install dependencies
         run: pip install numpy
 
       - name: Run simulation example
         env:
-          PTO_ISA_ROOT: ${{ github.workspace }}/third_party/pto-isa
-        run: python examples/scripts/run_example.py -k examples/host_build_graph_sim_example/kernels -g examples/host_build_graph_sim_example/golden.py -p a2a3sim
+          PTO_ISA_ROOT: ${{ github.workspace }}/examples/scripts/_deps/pto-isa
+        run: |
+          python examples/scripts/run_example.py -k examples/host_build_graph_example/kernels -g examples/host_build_graph_example/golden.py -p a2a3sim || {
+            echo "::error::Simulation example failed"
+            exit 1
+          }

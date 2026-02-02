@@ -1,8 +1,8 @@
 """
-Golden script for host_build_graph_example test.
+Golden script for host_build_graph example.
 
 This script defines the input data generation and expected output computation
-for the host_build_graph example.
+for the host_build_graph example (both a2a3 and a2a3sim platforms).
 
 Computation:
     f = (a + b + 1) * (a + b + 2)

@@ -225,7 +225,10 @@ int BuildExampleGraph(Runtime* runtime, uint64_t* args, int arg_count) {
 ```bash
 # Required
 export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.0
-export PTO_ISA_ROOT=/path/to/pto-isa
+
+# PTO_ISA_ROOT is auto-detected (auto-cloned to examples/scripts/_deps/pto-isa on first run)
+# Override if needed:
+# export PTO_ISA_ROOT=/path/to/pto-isa
 
 # Optional
 export PTO_DEVICE_ID=0

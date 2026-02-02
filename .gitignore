@@ -21,3 +21,6 @@ examples/output_ascend_a5/
 # Ascend simulator debug dumps
 core*_*.dump
 profile_*_log*.toml
+
+# Git cloned dependencies (not tracked in repo)
+examples/scripts/_deps/

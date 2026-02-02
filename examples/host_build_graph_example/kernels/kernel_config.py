@@ -2,6 +2,7 @@
 Kernel and Orchestration Configuration
 
 Defines the kernels and orchestration function used by the example.
+Supports both hardware (a2a3) and simulation (a2a3sim) platforms.
 """
 
 from pathlib import Path

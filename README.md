@@ -40,6 +40,59 @@ The PTO Runtime consists of **three separate programs** that communicate through
     └────────────────────────────┘
 ```
 
+## Setup
+
+### Cloning the Repository
+
+Simply clone the repository:
+
+```bash
+git clone <repo-url>
+cd simpler
+```
+
+The pto-isa dependency will be automatically cloned when you first run an example that needs it.
+
+### PTO ISA Headers
+
+The pto-isa repository provides header files needed for kernel compilation on the `a2a3` (hardware) platform.
+
+The test framework automatically handles PTO_ISA_ROOT setup:
+1. Checks if `PTO_ISA_ROOT` is already set
+2. If not, clones pto-isa to `examples/scripts/_deps/pto-isa` on first run
+3. Sets `PTO_ISA_ROOT` to the cloned path
+
+**Automatic Setup (Recommended):**
+Just run your example - pto-isa will be cloned automatically on first run:
+```bash
+python examples/scripts/run_example.py -k examples/host_build_graph_example/kernels \
+                                       -g examples/host_build_graph_example/golden.py \
+                                       -p a2a3sim
+```
+
+**Manual Setup** (if auto-setup fails or you prefer manual control):
+```bash
+# Clone pto-isa manually
+mkdir -p examples/scripts/_deps
+git clone --branch ci_simpler https://gitcode.com/zhangqi-chen/pto-isa.git examples/scripts/_deps/pto-isa
+
+# Set environment variable (optional - auto-detected if in standard location)
+export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa
+```
+
+**Using a Different Location:**
+If you already have pto-isa elsewhere, just set the environment variable:
+```bash
+export PTO_ISA_ROOT=/path/to/your/pto-isa
+```
+
+**Troubleshooting:**
+- If git is not available: Clone pto-isa manually and set `PTO_ISA_ROOT`
+- If clone fails due to network: Try again or clone manually
+- For CI/CD: Either rely on auto-clone or pre-clone in CI steps
+
+Note: For the simulation platform (`a2a3sim`), PTO ISA headers are optional and only needed if your kernels use PTO ISA intrinsics.
+
 ## Platforms
 
 PTO Runtime supports multiple target platforms:
