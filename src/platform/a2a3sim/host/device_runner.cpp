@@ -19,31 +19,11 @@
 #include <cstdio>
 #include <cstring>
 #include <dlfcn.h>
-#include <errno.h>
 #include <fstream>
 #include <iostream>
 #include <thread>
 #include <unistd.h>
 #include <vector>
-#include <sys/mman.h>
-
-#ifdef __APPLE__
-// macOS Apple Silicon requires pthread_jit_write_protect_np for W^X memory
-// and sys_icache_invalidate to flush instruction cache after writing code
-#include <pthread.h>
-#include <libkern/OSCacheControl.h>
-#endif
-
-// Cross-platform mmap flags
-// macOS uses MAP_ANON, Linux uses MAP_ANONYMOUS
-#ifndef MAP_ANONYMOUS
-#define MAP_ANONYMOUS MAP_ANON
-#endif
-
-// macOS Apple Silicon requires MAP_JIT for writable+executable memory
-#ifndef MAP_JIT
-#define MAP_JIT 0
-#endif
 
 #include "common/platform_config.h"
 #include "runtime.h"
@@ -295,13 +275,13 @@ int DeviceRunner::finalize() {
     // Print handshake results before cleanup
     print_handshake_results();
 
-    // Unmap all kernel executable memory regions
+    // Close all dlopen'd kernel libraries
     for (auto& pair : func_id_to_addr_) {
         MappedKernel& kernel = pair.second;
-        if (kernel.exec_mem != nullptr && kernel.exec_mem != MAP_FAILED) {
-            munmap(kernel.exec_mem, kernel.size);
-            kernel.exec_mem = nullptr;
-            kernel.size = 0;
+        if (kernel.dl_handle != nullptr) {
+            dlclose(kernel.dl_handle);
+            std::cout << "Closed dlopen kernel: func_id=" << pair.first << '\n';
+            kernel.dl_handle = nullptr;
             kernel.func_addr = 0;
         }
     }
@@ -355,55 +335,52 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
         return 0;
     }
 
-    MappedKernel kernel;
+    // 1. Generate temp file path
+    char tmpfile[256];
+    snprintf(tmpfile, sizeof(tmpfile), "/tmp/kernel_%d_%d.so", func_id, getpid());
 
-    if (bin_size == sizeof(uint64_t)) {
-        // Legacy mode: bin_data contains a function pointer (used by C++ example)
-        uint64_t func_ptr = *reinterpret_cast<const uint64_t*>(bin_data);
-        kernel.exec_mem = nullptr;
-        kernel.size = 0;
-        kernel.func_addr = func_ptr;
+    // 2. Write to temp file
+    std::ofstream ofs(tmpfile, std::ios::binary);
+    if (!ofs) {
+        std::cerr << "Error: Failed to create temp file: " << tmpfile << '\n';
+        return -1;
+    }
+    ofs.write(reinterpret_cast<const char*>(bin_data), bin_size);
+    ofs.close();
 
-        std::cout << "Registered kernel (function pointer): func_id=" << func_id
-                  << " -> addr=0x" << std::hex << func_ptr << std::dec << '\n';
-    } else {
-        // Binary mode: bin_data contains .text section binary code
-        // Allocate executable memory using mmap with MAP_JIT for Apple Silicon
-        // compatibility. MAP_JIT is 0 on Linux so this works cross-platform.
-        void* exec_mem = mmap(nullptr, bin_size,
-                             PROT_READ | PROT_WRITE | PROT_EXEC,
-                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
-        if (exec_mem == MAP_FAILED) {
-            std::cerr << "Error: mmap failed for kernel func_id=" << func_id
-                      << " (errno=" << errno << ": " << strerror(errno) << ")\n";
-            return -1;
-        }
+    std::cout << "Wrote kernel .so to temp file: " << tmpfile
+              << " (size=" << bin_size << " bytes)\n";
 
-#ifdef __APPLE__
-        // Apple Silicon enforces W^X: memory cannot be writable and executable
-        // simultaneously. Toggle to write mode, copy code, then toggle back.
-        pthread_jit_write_protect_np(false);
-#endif
+    // 3. dlopen to load .so (RTLD_NOW ensures all symbols resolved immediately)
+    void* handle = dlopen(tmpfile, RTLD_NOW | RTLD_LOCAL);
 
-        // Copy kernel .text binary into executable memory
-        std::memcpy(exec_mem, bin_data, bin_size);
+    // 4. Remove temp file immediately (.so is already in memory)
+    std::remove(tmpfile);
 
-#ifdef __APPLE__
-        // Toggle back to execute mode and flush instruction cache
-        pthread_jit_write_protect_np(true);
-        sys_icache_invalidate(exec_mem, bin_size);
-#endif
-
-        kernel.exec_mem = exec_mem;
-        kernel.size = bin_size;
-        kernel.func_addr = reinterpret_cast<uint64_t>(exec_mem);
-
-        std::cout << "Registered kernel (binary): func_id=" << func_id
-                  << " -> addr=0x" << std::hex << kernel.func_addr << std::dec
-                  << " (size=" << bin_size << " bytes)\n";
+    if (!handle) {
+        std::cerr << "Error: dlopen failed: " << dlerror() << '\n';
+        return -1;
     }
 
+    // 5. dlsym to get kernel function address (unified entry point: "kernel_entry")
+    void* func = dlsym(handle, "kernel_entry");
+    if (!func) {
+        std::cerr << "Error: dlsym failed for 'kernel_entry': " << dlerror() << '\n';
+        dlclose(handle);
+        return -1;
+    }
+
+    // 6. Store mapping info
+    MappedKernel kernel;
+    kernel.dl_handle = handle;
+    kernel.func_addr = reinterpret_cast<uint64_t>(func);
+
     func_id_to_addr_[func_id] = kernel;
+
+    std::cout << "Registered kernel (dlopen): func_id=" << func_id
+              << " -> addr=0x" << std::hex << kernel.func_addr << std::dec
+              << ", handle=" << handle << '\n';
+
     return 0;
 }
 

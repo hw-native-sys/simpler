@@ -17,6 +17,10 @@ if [ "$OS" = "Darwin" ]; then
         -k examples/host_build_graph_example/kernels \
         -g examples/host_build_graph_example/golden.py \
         -p a2a3sim
+    python examples/scripts/run_example.py \
+        -k examples/matmul_example/kernels \
+        -g examples/matmul_example/golden.py \
+        -p a2a3sim
 else
     # Linux: run all platforms
     echo "Linux detected, running all platforms..."
@@ -27,6 +31,14 @@ else
     python examples/scripts/run_example.py \
         -k examples/host_build_graph_example/kernels \
         -g examples/host_build_graph_example/golden.py \
+        -p a2a3sim
+    python examples/scripts/run_example.py \
+        -k examples/matmul_example/kernels \
+        -g examples/matmul_example/golden.py \
+        -p a2a3
+    python examples/scripts/run_example.py \
+        -k examples/matmul_example/kernels \
+        -g examples/matmul_example/golden.py \
         -p a2a3sim
 fi
 

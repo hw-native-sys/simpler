@@ -1,12 +1,10 @@
 /**
- * Scalar Addition Kernel
+ * Element-wise Add then Exp Kernel
  *
- * Implements: out[i] = src[i] + scalar
+ * Implements: out[i] = exp(src0[i] + src1[i])
  *
- * This kernel adds a scalar value to each element of a tensor. It's compiled
- * separately as a standalone kernel and linked with the dispatcher using
- * function pointers, demonstrating the separation pattern used in production
- * systems where kernel binaries are loaded dynamically.
+ * This kernel performs element-wise addition of two tensors followed by
+ * exponential operation.
  */
 
 #include <cstdint>
@@ -24,27 +22,19 @@ using namespace pto;
 #endif
 
 /**
- * Scalar addition kernel implementation
+ * Add + Exp kernel implementation
  *
  * Unified signature: all arguments passed via int64_t array
  * @param args  Argument array:
- *              args[0] = src pointer (input tensor)
- *              args[1] = scalar value (as uint64_t, needs conversion to float)
+ *              args[0] = src0 pointer (first input tensor)
+ *              args[1] = src1 pointer (second input tensor)
  *              args[2] = out pointer (output tensor)
  *              args[3] = size (number of elements)
  */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
     // Unpack arguments
-    __gm__ float* src = reinterpret_cast<__gm__ float*>(args[0]);
-
-    // Convert scalar from uint64_t to float
-    union {
-        uint64_t u64;
-        float f32;
-    } converter;
-    converter.u64 = args[1];
-    float scalar = converter.f32;
-
+    __gm__ float* src0 = reinterpret_cast<__gm__ float*>(args[0]);
+    __gm__ float* src1 = reinterpret_cast<__gm__ float*>(args[1]);
     __gm__ float* out = reinterpret_cast<__gm__ float*>(args[2]);
     int size = static_cast<int>(args[3]);
 
@@ -59,18 +49,26 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
     using TileData = Tile<TileType::Vec, float, kTRows_, kTCols_, BLayout::RowMajor, -1, -1>;
 
-    TileData srcTile(vRows, vCols);
+    // Optimized memory: only 3 tiles needed (reuse for intermediate and output)
+    TileData src0Tile(vRows, vCols);
+    TileData src1Tile(vRows, vCols);
     TileData dstTile(vRows, vCols);
-    TASSIGN(srcTile, 0x0);
-    TASSIGN(dstTile, 0x10000);
+    TASSIGN(src0Tile, 0x0);
+    TASSIGN(src1Tile, 0x10000);
+    TASSIGN(dstTile, 0x20000);
 
-    GlobalData srcGlobal(src);
+    GlobalData src0Global(src0);
+    GlobalData src1Global(src1);
     GlobalData dstGlobal(out);
 
-    TLOAD(srcTile, srcGlobal);
+    TLOAD(src0Tile, src0Global);
+    TLOAD(src1Tile, src1Global);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    TADDS(dstTile, srcTile, scalar);
+    // Add: result in src0Tile (reuse)
+    TADD(src0Tile, src0Tile, src1Tile);
+    // Exp: result in dstTile
+    TEXP(dstTile, src0Tile);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(dstGlobal, dstTile);

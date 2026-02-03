@@ -210,7 +210,7 @@ The simulation platform (a2a3sim) emulates the AICPU/AICore execution model:
 The test framework auto-clones pto-isa on first run. If this fails, clone it manually:
 ```bash
 mkdir -p examples/scripts/_deps
-git clone --branch ci_simpler https://gitcode.com/zhangqi-chen/pto-isa.git examples/scripts/_deps/pto-isa
+git clone --branch master https://gitcode.com/cann/pto-isa.git examples/scripts/_deps/pto-isa
 ```
 Or set PTO_ISA_ROOT to an existing installation:
 ```bash

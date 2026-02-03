@@ -169,9 +169,9 @@ def _clone_pto_isa(verbose: bool = False) -> bool:
         result = subprocess.run(
             [
                 "git", "clone",
-                "--branch", "ci_simpler",
+                "--branch", "master",
                 "--depth", "1",
-                "https://gitcode.com/zhangqi-chen/pto-isa.git",
+                "https://gitcode.com/cann/pto-isa.git",
                 str(clone_path)
             ],
             capture_output=True,
@@ -235,7 +235,7 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
                 print("\nFailed to automatically clone pto-isa.")
                 print("You can manually clone it with:")
                 print(f"  mkdir -p {clone_path.parent}")
-                print(f"  git clone --branch ci_simpler https://gitcode.com/zhangqi-chen/pto-isa.git {clone_path}")
+                print(f"  git clone --branch master https://gitcode.com/cann/pto-isa.git {clone_path}")
                 print(f"Or set PTO_ISA_ROOT to an existing pto-isa installation:")
                 print(f"  export PTO_ISA_ROOT=/path/to/pto-isa")
             return None
@@ -497,7 +497,14 @@ class CodeRunner:
                 core_type=kernel["core_type"],
                 pto_isa_root=pto_isa_root,
             )
-            kernel_bin = extract_text_section(incore_o)
+            # For sim platform: keep complete .so for dlopen (supports external symbols like std::exp)
+            # For real hardware: extract .text section (ccec compiled kernels don't depend on external symbols)
+            if self.platform == "a2a3sim":
+                kernel_bin = incore_o  # Complete .so for dlopen
+            else:
+                kernel_bin = extract_text_section(incore_o)  # .text only for mmap
+
+            # All kernels use unified entry point "kernel_entry"
             register_kernel(kernel["func_id"], kernel_bin)
 
         print("All kernels compiled and registered")

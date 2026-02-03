@@ -27,16 +27,14 @@
 #include "runtime.h"
 
 /**
- * Mapped kernel binary in executable memory
+ * Mapped kernel binary loaded via dlopen
  *
- * Stores kernel .text binary in mmap'd executable memory, allowing
- * direct function pointer invocation. This mirrors the real device
- * behavior where kernel binaries are stored in GM.
+ * Stores dlopen handle and function pointer address. This enables
+ * proper handling of external symbols (e.g., std::exp) via PLT/GOT.
  */
 struct MappedKernel {
-    void* exec_mem{nullptr};     // mmap'd executable memory
-    size_t size{0};              // Size of mapped region
-    uint64_t func_addr{0};       // Function pointer address (same as exec_mem)
+    void* dl_handle{nullptr};    // dlopen handle
+    uint64_t func_addr{0};       // Function pointer address (from dlsym)
 };
 
 /**
@@ -133,13 +131,13 @@ public:
     /**
      * Register a kernel for a func_id
      *
-     * Copies the kernel .text binary into mmap'd executable memory,
-     * enabling direct function pointer invocation. This mirrors the
-     * real device behavior where kernel binaries are stored in GM.
+     * Loads the complete kernel .so via dlopen, enabling proper handling
+     * of external symbols (e.g., std::exp, std::log) via PLT/GOT.
+     * Uses dlsym to resolve the unified entry point "kernel_entry".
      *
-     * @param func_id   Function identifier
-     * @param bin_data  Kernel .text section binary data
-     * @param bin_size  Size of binary data in bytes
+     * @param func_id      Function identifier
+     * @param bin_data     Complete kernel .so binary data
+     * @param bin_size     Size of binary data in bytes
      * @return 0 on success
      */
     int register_kernel(int func_id, const uint8_t* bin_data, size_t bin_size);

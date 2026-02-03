@@ -24,7 +24,7 @@ jobs:
       - name: Clone pto-isa dependency
         run: |
           mkdir -p examples/scripts/_deps
-          git clone --branch ci_simpler --depth 1 https://gitcode.com/zhangqi-chen/pto-isa.git examples/scripts/_deps/pto-isa
+          git clone --branch master --depth 1 https://gitcode.com/cann/pto-isa examples/scripts/_deps/pto-isa
 
       - name: Set up C++ compiler
         run: |
@@ -65,6 +65,10 @@ jobs:
             echo "::error::Simulation example failed"
             exit 1
           }
+          python examples/scripts/run_example.py -k examples/matmul_example/kernels -g examples/matmul_example/golden.py -p a2a3sim || {
+            echo "::error::Matmul example failed"
+            exit 1
+          }
 
   run-example-on-device:
     runs-on: self-hosted
@@ -80,5 +84,9 @@ jobs:
         run: |
           source /home/github-ci/Ascend/ascend-toolkit/latest/bin/setenv.bash && python examples/scripts/run_example.py -k examples/host_build_graph_example/kernels -g examples/host_build_graph_example/golden.py -p a2a3 -d 5 || {
             echo "::error::On-device example failed"
+            exit 1
+          }
+          source /home/github-ci/Ascend/ascend-toolkit/latest/bin/setenv.bash && python examples/scripts/run_example.py -k examples/matmul_example/kernels -g examples/matmul_example/golden.py -p a2a3 -d 5 || {
+            echo "::error::Matmul example failed"
             exit 1
           }

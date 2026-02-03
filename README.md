@@ -74,7 +74,7 @@ python examples/scripts/run_example.py -k examples/host_build_graph_example/kern
 ```bash
 # Clone pto-isa manually
 mkdir -p examples/scripts/_deps
-git clone --branch ci_simpler https://gitcode.com/zhangqi-chen/pto-isa.git examples/scripts/_deps/pto-isa
+git clone --branch master https://gitcode.com/cann/pto-isa.git examples/scripts/_deps/pto-isa
 
 # Set environment variable (optional - auto-detected if in standard location)
 export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa

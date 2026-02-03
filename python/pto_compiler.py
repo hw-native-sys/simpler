@@ -364,31 +364,13 @@ class PTOCompiler:
             "g++-15", "-shared",
             "-O2", "-fPIC",
             "-std=c++23",
-            "-fvisibility=hidden",          # Avoid stub calls for internal functions
             "-fpermissive",                 # Allow extensions
             "-Wno-macro-redefined",         # Suppress macro redefinition warnings
             "-Wno-ignored-attributes",      # Suppress attribute warnings
             "-D__CPU_SIM",                  # CPU simulation mode
-            "-DPTO_CPU_TEXT_STANDALONE",    # No C++ stdlib symbols in .text
+            "-DPTO_CPU_MAX_THREADS=1",      # Prevent multithreading in PTO-ISA simulation
             "-DNDEBUG",                     # Disable assert
-            "-fno-builtin",                 # Prevent loop-to-memset optimization
-            "-ffunction-sections",          # Put each function in its own section
         ]
-
-        # Place kernel entry function at .text+0x0 via -ffunction-sections + linker layout
-        kernel_func = Path(source_path).stem  # kernel_add.cpp -> kernel_add
-        order_file_path = f"/tmp/sim_kernel_order_{timestamp}_{os.getpid()}"
-        if sys.platform == "darwin":
-            order_file_path += ".txt"
-            with open(order_file_path, 'w') as f:
-                f.write(f"_{kernel_func}\n")
-            cmd.append(f"-Wl,-order_file,{order_file_path}")
-        else:
-            order_file_path += ".ld"
-            with open(order_file_path, 'w') as f:
-                f.write(f"SECTIONS {{ .text : {{ *(.text.{kernel_func}) *(.text .text.*) }} }}\n")
-                f.write("INSERT BEFORE .fini;\n")
-            cmd.append(f"-Wl,-T,{order_file_path}")
 
         # Add PTO ISA header paths if provided
         if pto_isa_root:
@@ -439,8 +421,6 @@ class PTOCompiler:
 
         # Clean up temp files
         os.remove(output_path)
-        if os.path.isfile(order_file_path):
-            os.remove(order_file_path)
 
         print(f"[SimKernel] Compilation successful: {len(binary_data)} bytes")
         return binary_data
