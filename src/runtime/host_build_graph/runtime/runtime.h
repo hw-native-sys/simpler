@@ -32,7 +32,7 @@
 // =============================================================================
 
 #ifndef RUNTIME_MAX_TASKS
-#define RUNTIME_MAX_TASKS 1024
+#define RUNTIME_MAX_TASKS 4096
 #endif
 
 #ifndef RUNTIME_MAX_ARGS
