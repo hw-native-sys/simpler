@@ -18,7 +18,7 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-extern "C" __aicore__ __attribute__((always_inline)) void kernel_mul(__gm__ int64_t* args) {
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
     __gm__ float* src0 = reinterpret_cast<__gm__ float*>(args[0]);
     __gm__ float* src1 = reinterpret_cast<__gm__ float*>(args[1]);
     __gm__ float* out = reinterpret_cast<__gm__ float*>(args[2]);
