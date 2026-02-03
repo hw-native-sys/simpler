@@ -179,8 +179,8 @@ typedef struct {
      * - Set by scheduler threads when the task finishes on AICore.
      * - Used to make `add_successor_conditional()` safe when edges are added late.
      */
-    std::atomic<int> published;   // 0 = not visible to scheduler, 1 = published
-    std::atomic<int> completed;   // 0 = not completed, 1 = completed
+    std::atomic<int> published;  // 0 = not visible to scheduler, 1 = published
+    std::atomic<int> completed;  // 0 = not completed, 1 = completed
 } Task;
 
 // =============================================================================
@@ -248,9 +248,9 @@ private:
     int initial_ready_tasks[RUNTIME_MAX_TASKS];
     int initial_ready_count;
 
-  // Tensor pairs for host-device memory tracking
-  TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
-  int tensor_pair_count;
+    // Tensor pairs for host-device memory tracking
+    TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
+    int tensor_pair_count;
 
 public:
     /**
@@ -271,7 +271,7 @@ public:
      * @param core_type Core type for this task (CoreType::AIC or CoreType::AIV)
      * @return Task ID (>= 0) on success, -1 on failure
      */
-    int add_task(uint64_t *args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
+    int add_task(uint64_t* args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
 
     /**
      * Add a dependency edge: from_task -> to_task
@@ -303,7 +303,7 @@ public:
      * @param task_id  Task ID to query
      * @return Pointer to task, or nullptr if invalid ID
      */
-    Task *get_task(int task_id);
+    Task* get_task(int task_id);
 
     /**
      * Get the total number of tasks in the runtime
@@ -323,7 +323,7 @@ public:
      * nullptr)
      * @return Number of initially ready tasks
      */
-    int get_initial_ready_tasks(int *ready_tasks);
+    int get_initial_ready_tasks(int* ready_tasks);
 
     // =========================================================================
     // Utility Methods
@@ -407,8 +407,8 @@ extern "C" {
  *   This is the intended path for most examples: pass 0 and rely on the host to populate
  *   `Runtime::kernel_addrs[]` before launching AICPU (guarded by `RUNTIME_HAS_KERNEL_ADDRS`).
  */
-int aicpu_runtime_add_task(Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type,
-                          uint64_t function_bin_addr);
+int aicpu_runtime_add_task(
+    Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type, uint64_t function_bin_addr);
 
 /**
  * Add an edge `from_task -> to_task` during AICPU-side graph build (concurrency-safe).

@@ -15,4 +15,3 @@ extern "C" __attribute__((weak)) int build_graph_aicpu(Runtime* runtime) {
     DEV_ERROR("%s", "build_graph_aicpu() not provided by example");
     return -1;
 }
-

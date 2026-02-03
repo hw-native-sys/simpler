@@ -18,7 +18,7 @@ static thread_local const char* tl_thread_role = "unknown";
 
 // Core information for discovery
 struct CoreInfo {
-    int worker_id;     // Index in runtime.workers[]
+    int worker_id;  // Index in runtime.workers[]
     CoreType core_type;
 };
 
@@ -73,8 +73,8 @@ struct AicpuExecutor {
     int shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores, int core_num);
     int run(Runtime* runtime);
     void deinit();
-    void diagnose_stuck_state(Runtime& runtime, int thread_idx, const int* cur_thread_cores,
-                              int core_num, Handshake* hank);
+    void diagnose_stuck_state(
+        Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num, Handshake* hank);
 };
 
 static AicpuExecutor g_aicpu_executor;
@@ -108,7 +108,9 @@ int AicpuExecutor::init(Runtime* runtime) {
 
     if (schedule_thread_num_ < 1) {
         DEV_ERROR("Invalid schedule_thread_num: %d (thread_num=%d, builder=%d)",
-                  schedule_thread_num_, thread_num_, BUILDER_THREAD_NUM);
+            schedule_thread_num_,
+            thread_num_,
+            BUILDER_THREAD_NUM);
         init_failed_.store(true, std::memory_order_release);
         return -1;
     }
@@ -126,7 +128,10 @@ int AicpuExecutor::init(Runtime* runtime) {
     }
 
     DEV_INFO("Config: aicpu_threads=%d (builder=%d scheduler=%d), cores=%d",
-             thread_num_, BUILDER_THREAD_NUM, schedule_thread_num_, cores_total_num_);
+        thread_num_,
+        BUILDER_THREAD_NUM,
+        schedule_thread_num_,
+        cores_total_num_);
 
     // Assign discovered cores to threads
     assign_cores_to_threads();
@@ -248,8 +253,7 @@ void AicpuExecutor::assign_cores_to_threads() {
     int aiv_base = aiv_count_ / sched;
     int aiv_rem = aiv_count_ % sched;
 
-    DEV_INFO("Core Assignment (scheduler only): AIC=%d, AIV=%d, sched_threads=%d",
-             aic_count_, aiv_count_, sched);
+    DEV_INFO("Core Assignment (scheduler only): AIC=%d, AIV=%d, sched_threads=%d", aic_count_, aiv_count_, sched);
 
     int aic_idx = 0;
     int aiv_idx = 0;
@@ -275,20 +279,19 @@ void AicpuExecutor::assign_cores_to_threads() {
 
         char log_buffer[256];
         int offset = 0;
-        offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset,
-                           "Thread %d: assigned %d cores - AIC[", t, core_idx);
+        offset += snprintf(
+            log_buffer + offset, sizeof(log_buffer) - offset, "Thread %d: assigned %d cores - AIC[", t, core_idx);
 
         for (int i = 0; i < aic_take; i++) {
             if (i > 0) offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, ",");
-            offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d",
-                               core_assignments_[t][i]);
+            offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d", core_assignments_[t][i]);
         }
         offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "] AIV[");
 
         for (int i = 0; i < aiv_take; i++) {
             if (i > 0) offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, ",");
-            offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d",
-                               core_assignments_[t][aic_take + i]);
+            offset +=
+                snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d", core_assignments_[t][aic_take + i]);
         }
         offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "]");
 
@@ -296,8 +299,7 @@ void AicpuExecutor::assign_cores_to_threads() {
     }
 
     if (aic_idx != aic_count_ || aiv_idx != aiv_count_) {
-        DEV_ERROR("Core Assignment mismatch: assigned AIC=%d/%d AIV=%d/%d",
-                  aic_idx, aic_count_, aiv_idx, aiv_count_);
+        DEV_ERROR("Core Assignment mismatch: assigned AIC=%d/%d AIV=%d/%d", aic_idx, aic_count_, aiv_idx, aiv_count_);
         init_failed_.store(true, std::memory_order_release);
     }
 }
@@ -417,7 +419,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
 
         if (!build_done && published != last_seen_published) {
             DEV_INFO("Thread %d: Observed published=%d (completed=%d, build_done=%d)",
-                     thread_idx, published, completed, build_done ? 1 : 0);
+                thread_idx,
+                published,
+                completed,
+                build_done ? 1 : 0);
             last_seen_published = published;
         }
 
@@ -430,7 +435,12 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                     all_cores_idle = false;
                     if (verification_warning_count == 0) {
                         DEV_WARN("Thread %d: Counter reached %d/%d but core %d still has work (status=%d, task=%p)",
-                                 thread_idx, completed, published, core_id, h->task_status, (void*)h->task);
+                            thread_idx,
+                            completed,
+                            published,
+                            core_id,
+                            h->task_status,
+                            (void*)h->task);
                     }
                     break;
                 }
@@ -447,7 +457,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
             verification_warning_count++;
             if (verification_warning_count > MAX_VERIFICATION_WARNINGS) {
                 DEV_ERROR("Thread %d: Counter reached but cores still working after %d checks!",
-                          thread_idx, verification_warning_count);
+                    thread_idx,
+                    verification_warning_count);
                 diagnose_stuck_state(runtime, thread_idx, cur_thread_cores, core_num, hank);
                 return -1;
             }
@@ -483,8 +494,10 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                             if (dep->published.load(std::memory_order_acquire) != 0) {
                                 push_ready_task(runtime, dep_id);
                             }
-                            DEV_INFO("Thread %d: Task %d becomes ready (published=%d)", thread_idx, dep_id,
-                                     dep->published.load(std::memory_order_acquire));
+                            DEV_INFO("Thread %d: Task %d becomes ready (published=%d)",
+                                thread_idx,
+                                dep_id,
+                                dep->published.load(std::memory_order_acquire));
                         } else if (prev_fanin <= 0) {
                             DEV_WARN("Thread %d: Task %d fanin underflow (prev=%d)", thread_idx, dep_id, prev_fanin);
                         }
@@ -515,13 +528,16 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                         continue;
                     }
                     if (task->function_bin_addr == 0) {
-                        DEV_ERROR("Thread %d: Task %d has function_bin_addr==0, refusing to dispatch", thread_idx,
-                                  task_id);
+                        DEV_ERROR(
+                            "Thread %d: Task %d has function_bin_addr==0, refusing to dispatch", thread_idx, task_id);
                         return -1;
                     }
 
-                    DEV_INFO("Thread %d: Dispatching %s task %d to core %d", thread_idx, core_type_to_string(h->core_type),
-                             task_id, core_id);
+                    DEV_INFO("Thread %d: Dispatching %s task %d to core %d",
+                        thread_idx,
+                        core_type_to_string(h->core_type),
+                        task_id,
+                        core_id);
                     h->task = reinterpret_cast<uint64_t>(task);
                     h->task_status = 1;
                     cur_thread_tasks_in_flight++;
@@ -536,8 +552,11 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                 int current_completed = completed_tasks_.load(std::memory_order_acquire);
                 int current_published = published_tasks_.load(std::memory_order_acquire);
                 DEV_WARN("Thread %d: %d idle iterations, progress %d/%d tasks (build_done=%d)",
-                         thread_idx, idle_iterations, current_completed, current_published,
-                         build_done_.load(std::memory_order_acquire) ? 1 : 0);
+                    thread_idx,
+                    idle_iterations,
+                    current_completed,
+                    current_published,
+                    build_done_.load(std::memory_order_acquire) ? 1 : 0);
             }
             if (idle_iterations > MAX_IDLE_ITERATIONS) {
                 DEV_ERROR("Thread %d: Timeout after %d idle iterations!", thread_idx, idle_iterations);
@@ -564,7 +583,8 @@ int AicpuExecutor::run(Runtime* runtime) {
 
     if (thread_idx < BUILDER_THREAD_NUM) {
         DEV_INFO("Thread %d: Builder starting build_graph_aicpu() (build_mode=%d)",
-                 thread_idx, runtime ? runtime->build_mode : -1);
+            thread_idx,
+            runtime ? runtime->build_mode : -1);
         int rc = build_graph_aicpu(runtime);
         if (rc != 0) {
             DEV_ERROR("Thread %d: build_graph_aicpu failed rc=%d", thread_idx, rc);
@@ -575,10 +595,10 @@ int AicpuExecutor::run(Runtime* runtime) {
         final_rc = (rc == 0) ? 0 : -1;
     } else {
         DEV_INFO("Thread %d: Scheduler thread (build_mode=%d, build_done=%d, published=%d)",
-                 thread_idx,
-                 runtime ? runtime->build_mode : -1,
-                 build_done_.load(std::memory_order_acquire) ? 1 : 0,
-                 published_tasks_.load(std::memory_order_acquire));
+            thread_idx,
+            runtime ? runtime->build_mode : -1,
+            build_done_.load(std::memory_order_acquire) ? 1 : 0,
+            published_tasks_.load(std::memory_order_acquire));
 
         if (runtime->build_mode == 0) {
             DEV_INFO("Thread %d: Sequential mode: waiting for builder barrier", thread_idx);
@@ -640,17 +660,17 @@ void AicpuExecutor::deinit() {
     DEV_INFO("DeInit: AicpuExecutor reset complete");
 }
 
-void AicpuExecutor::diagnose_stuck_state(Runtime& runtime, int thread_idx,
-                                         const int* cur_thread_cores, int core_num,
-                                         Handshake* hank) {
+void AicpuExecutor::diagnose_stuck_state(
+    Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num, Handshake* hank) {
     DEV_ERROR("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
 
     int completed = completed_tasks_.load(std::memory_order_acquire);
     int published = published_tasks_.load(std::memory_order_acquire);
     DEV_ERROR("Progress: completed=%d published=%d build_done=%d build_failed=%d",
-              completed, published,
-              build_done_.load(std::memory_order_acquire) ? 1 : 0,
-              build_failed_.load(std::memory_order_acquire) ? 1 : 0);
+        completed,
+        published,
+        build_done_.load(std::memory_order_acquire) ? 1 : 0,
+        build_failed_.load(std::memory_order_acquire) ? 1 : 0);
 
     int aic_ready = ready_count_aic_.load(std::memory_order_acquire);
     int aiv_ready = ready_count_aiv_.load(std::memory_order_acquire);
@@ -672,10 +692,12 @@ void AicpuExecutor::diagnose_stuck_state(Runtime& runtime, int thread_idx,
             busy_cores++;
 
             DEV_ERROR("  Core %d [%s, BUSY]: task_id=%d, func_id=%d, fanin=%d, fanout=%d",
-                     core_id, core_type_str,
-                     task->task_id, task->func_id,
-                     task->fanin.load(std::memory_order_acquire),
-                     task->fanout_count);
+                core_id,
+                core_type_str,
+                task->task_id,
+                task->func_id,
+                task->fanin.load(std::memory_order_acquire),
+                task->fanout_count);
         } else if (h->task_status != 0) {
             anomaly_cores++;
             DEV_ERROR("  Core %d [%s, ANOMALY]: status=BUSY but task=NULL", core_id, core_type_str);
@@ -776,15 +798,19 @@ extern "C" int aicpu_execute(Runtime* runtime) {
  *   `func_id -> kernel_addrs[]` table (populated by the host before launch).
  *   This is the recommended default for examples.
  */
-extern "C" int aicpu_runtime_add_task(Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type,
-                                      uint64_t function_bin_addr) {
+extern "C" int aicpu_runtime_add_task(
+    Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type, uint64_t function_bin_addr) {
     if (runtime == nullptr) {
         return -1;
     }
 
     DEV_INFO("Thread %d(%s): add_task(func_id=%d core=%s num_args=%d addr=0x%lx)",
-             tl_thread_idx, tl_thread_role,
-             func_id, core_type_to_string(core_type), num_args, (uint64_t)function_bin_addr);
+        tl_thread_idx,
+        tl_thread_role,
+        func_id,
+        core_type_to_string(core_type),
+        num_args,
+        (uint64_t)function_bin_addr);
 
     std::scoped_lock lock(g_aicpu_executor.graph_mutex_);
 
@@ -806,9 +832,11 @@ extern "C" int aicpu_runtime_add_task(Runtime* runtime, uint64_t* args, int num_
     task->completed.store(0, std::memory_order_release);
 
     DEV_INFO("Thread %d(%s): add_task -> task_id=%d fanin=%d bound_addr=0x%lx",
-             tl_thread_idx, tl_thread_role,
-             task_id, task->fanin.load(std::memory_order_acquire),
-             (uint64_t)task->function_bin_addr);
+        tl_thread_idx,
+        tl_thread_role,
+        task_id,
+        task->fanin.load(std::memory_order_acquire),
+        (uint64_t)task->function_bin_addr);
     return task_id;
 }
 
@@ -827,8 +855,7 @@ extern "C" void aicpu_runtime_add_successor_conditional(Runtime* runtime, int fr
         return;
     }
 
-    DEV_INFO("Thread %d(%s): add_edge_conditional(%d -> %d)",
-             tl_thread_idx, tl_thread_role, from_task, to_task);
+    DEV_INFO("Thread %d(%s): add_edge_conditional(%d -> %d)", tl_thread_idx, tl_thread_role, from_task, to_task);
 
     std::scoped_lock lock(g_aicpu_executor.graph_mutex_);
     runtime->add_successor_conditional(from_task, to_task);
@@ -850,8 +877,7 @@ extern "C" void aicpu_runtime_publish_task(Runtime* runtime, int task_id) {
         return;
     }
 
-    DEV_INFO("Thread %d(%s): publish_task(%d)",
-             tl_thread_idx, tl_thread_role, task_id);
+    DEV_INFO("Thread %d(%s): publish_task(%d)", tl_thread_idx, tl_thread_role, task_id);
 
     std::scoped_lock lock(g_aicpu_executor.graph_mutex_);
     Task* task = runtime->get_task(task_id);
@@ -871,8 +897,10 @@ extern "C" void aicpu_runtime_publish_task(Runtime* runtime, int task_id) {
     }
 
     DEV_INFO("Thread %d(%s): publish_task(%d) done (fanin=%d published=%d total_published=%d)",
-             tl_thread_idx, tl_thread_role, task_id,
-             task->fanin.load(std::memory_order_acquire),
-             task->published.load(std::memory_order_acquire),
-             g_aicpu_executor.published_tasks_.load(std::memory_order_acquire));
+        tl_thread_idx,
+        tl_thread_role,
+        task_id,
+        task->fanin.load(std::memory_order_acquire),
+        task->published.load(std::memory_order_acquire),
+        g_aicpu_executor.published_tasks_.load(std::memory_order_acquire));
 }

@@ -15,19 +15,21 @@
  *   - Frees device memory
  */
 
-#include "runtime.h"
-#include <stdint.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <strings.h>
+#include <unistd.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <strings.h>
-#include <dlfcn.h>
-#include <fcntl.h>
 #include <iostream>
-#include <unistd.h>
+
+#include "runtime.h"
 
 /**
  * Orchestration function signature.
@@ -85,12 +87,12 @@ extern "C" {
  * @param func_args_count   Number of arguments
  * @return 0 on success, -1 on failure
  */
-int init_runtime_impl(Runtime *runtime,
-                    const uint8_t* orch_so_binary,
-                    size_t orch_so_size,
-                    const char* orch_func_name,
-                    uint64_t* func_args,
-                    int func_args_count) {
+int init_runtime_impl(Runtime* runtime,
+    const uint8_t* orch_so_binary,
+    size_t orch_so_size,
+    const char* orch_func_name,
+    uint64_t* func_args,
+    int func_args_count) {
     // Validate inputs
     if (runtime == nullptr) {
         std::cerr << "Error: Runtime pointer is null\n";
@@ -128,8 +130,7 @@ int init_runtime_impl(Runtime *runtime,
     }
 
     dlerror();  // Clear any existing error
-    OrchestrationFunc orch_func =
-        reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
+    OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
     const char* dlsym_error = dlerror();
     if (dlsym_error != nullptr) {
         std::cerr << "Error: dlsym failed for '" << orch_func_name << "': " << dlsym_error << "\n";
@@ -149,8 +150,7 @@ int init_runtime_impl(Runtime *runtime,
     const char* build_mode_env = std::getenv("PTO_AICPU_BUILD_GRAPH_BUILD_MODE");
     runtime->build_mode = parse_build_mode_env(build_mode_env, runtime->build_mode);
     std::cout << "aicpu_build_graph build_mode=" << runtime->build_mode
-              << " (PTO_AICPU_BUILD_GRAPH_BUILD_MODE="
-              << (build_mode_env ? build_mode_env : "<unset>") << ")\n";
+              << " (PTO_AICPU_BUILD_GRAPH_BUILD_MODE=" << (build_mode_env ? build_mode_env : "<unset>") << ")\n";
 
     std::cout << "\n=== Calling Orchestration Function ===" << '\n';
     std::cout << "Args count: " << func_args_count << '\n';
@@ -184,7 +184,7 @@ int init_runtime_impl(Runtime *runtime,
  * @param runtime  Pointer to Runtime
  * @return 0 on success, -1 on failure
  */
-int validate_runtime_impl(Runtime *runtime) {
+int validate_runtime_impl(Runtime* runtime) {
     if (runtime == nullptr) {
         std::cerr << "Error: Runtime pointer is null\n";
         return -1;
@@ -228,5 +228,5 @@ int validate_runtime_impl(Runtime *runtime) {
 }
 
 #ifdef __cplusplus
-}  /* extern "C" */
+} /* extern "C" */
 #endif
