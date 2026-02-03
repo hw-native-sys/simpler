@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  run-example:
+  run-example-on-sim:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -63,5 +63,22 @@ jobs:
         run: |
           python examples/scripts/run_example.py -k examples/host_build_graph_example/kernels -g examples/host_build_graph_example/golden.py -p a2a3sim || {
             echo "::error::Simulation example failed"
+            exit 1
+          }
+
+  run-example-on-device:
+    runs-on: self-hosted
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run on-device example
+        env:
+          PTO_ISA_ROOT: /home/github-ci/pto-isa
+        run: |
+          source /home/github-ci/Ascend/ascend-toolkit/latest/bin/setenv.bash && python examples/scripts/run_example.py -k examples/host_build_graph_example/kernels -g examples/host_build_graph_example/golden.py -p a2a3 -d 5 || {
+            echo "::error::On-device example failed"
             exit 1
           }
