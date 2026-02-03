@@ -9,11 +9,20 @@
  *   sij: (num_heads, block_size)  contiguous output
  */
 #include <cstdint>
+#include <pto/pto-inst.hpp>
 
-extern "C" void aic_qk_matmul(int64_t* args) {
-    float* qi  = reinterpret_cast<float*>(args[0]);   // (num_heads, head_dim)
-    float* kj  = reinterpret_cast<float*>(args[1]);   // (block_size, kv_head_num, head_dim)
-    float* sij = reinterpret_cast<float*>(args[2]);   // (num_heads, block_size)
+#ifndef __gm__
+#define __gm__
+#endif
+
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    __gm__ float* qi  = reinterpret_cast<__gm__ float*>(args[0]);   // (num_heads, head_dim)
+    __gm__ float* kj  = reinterpret_cast<__gm__ float*>(args[1]);   // (block_size, kv_head_num, head_dim)
+    __gm__ float* sij = reinterpret_cast<__gm__ float*>(args[2]);   // (num_heads, block_size)
     int num_heads   = static_cast<int>(args[3]);
     int kv_head_num = static_cast<int>(args[4]);
     int block_size  = static_cast<int>(args[5]);
@@ -24,10 +33,10 @@ extern "C" void aic_qk_matmul(int64_t* args) {
 
     for (int h = 0; h < num_heads; h++) {
         int kv_h = h / heads_per_kv;
-        float* qi_h = qi + h * head_dim;
+        __gm__ float* qi_h = qi + h * head_dim;
 
         for (int j = 0; j < block_size; j++) {
-            float* kj_token = kj + j * kv_stride + kv_h * head_dim;
+            __gm__ float* kj_token = kj + j * kv_stride + kv_h * head_dim;
             float sum = 0.0f;
             for (int d = 0; d < head_dim; d++) {
                 sum += qi_h[d] * kj_token[d];
