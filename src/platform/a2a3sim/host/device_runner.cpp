@@ -214,6 +214,17 @@ int DeviceRunner::run(Runtime& runtime,
     }
     LOG_DEBUG("");
 
+#ifdef RUNTIME_HAS_KERNEL_ADDRS
+    // Provide a runtime-visible func_id -> code address table for AICPU-side graph build.
+    for (const auto& kv : func_id_to_addr_) {
+        int func_id = kv.first;
+        uint64_t addr = kv.second.func_addr;
+        if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
+            runtime.kernel_addrs[func_id] = addr;
+        }
+    }
+#endif
+
     // Store runtime pointer for print_handshake_results
     last_runtime_ = &runtime;
 

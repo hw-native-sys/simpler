@@ -28,6 +28,14 @@ class TestRuntimeBuilderDiscovery:
         runtimes = builder.list_runtimes()
         assert "host_build_graph" in runtimes
 
+    def test_discovers_aicpu_build_graph(self):
+        """RuntimeBuilder discovers aicpu_build_graph from the real project tree."""
+        from runtime_builder import RuntimeBuilder
+
+        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=PROJECT_ROOT)
+        runtimes = builder.list_runtimes()
+        assert "aicpu_build_graph" in runtimes
+
     def test_default_runtime_root(self):
         """Default runtime_root resolves to the project root."""
         from runtime_builder import RuntimeBuilder

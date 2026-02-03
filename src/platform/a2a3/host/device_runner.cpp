@@ -318,6 +318,18 @@ int DeviceRunner::run(Runtime& runtime,
     }
     LOG_DEBUG("");
 
+#ifdef RUNTIME_HAS_KERNEL_ADDRS
+    // For runtimes that build tasks on AICPU, provide a runtime-visible table of
+    // func_id -> kernel code address so the builder can set Task::function_bin_addr.
+    for (const auto& kv : func_id_to_addr_) {
+        int func_id = kv.first;
+        uint64_t addr = kv.second;
+        if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
+            runtime.kernel_addrs[func_id] = addr;
+        }
+    }
+#endif
+
     // Initialize runtime args
     rc = kernel_args_.init_runtime_args(runtime, mem_alloc_);
     if (rc != 0) {
