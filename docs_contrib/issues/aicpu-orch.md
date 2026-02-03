@@ -13,7 +13,7 @@ This issue proposes a new runtime implementation named `aicpu_build_graph` under
 ### Host orchestration builds the graph today
 
 - The example orchestration function `build_example_graph()` constructs tensors *and* builds tasks/edges on the host: `examples/host_build_graph_example/kernels/orchestration/example_orch.cpp:20`.
-- It is compiled as a **host `.so`** by `PTOCompiler.compile_orchestration()` in the runner: `examples/scripts/code_runner.py:481`.
+- It is compiled as a **host `.so`** by `PTOCompiler.compile_orchestration()` in the runner: `examples/scripts/code_runner.py:545`.
 - It is loaded and executed by `dlopen()` + `dlsym()` inside `init_runtime_impl()`: `src/runtime/host_build_graph/host/runtime_maker.cpp:96`.
 
 ### AICPU runs a scheduler loop (graph is assumed already built)
@@ -98,74 +98,81 @@ This preserves flexibility: `orch_args[]` is just a word array; it can represent
 Then implement the actual graph build logic as an AICPU function:
 
 - `extern "C" int build_graph_aicpu(Runtime* runtime);`
-- It interprets `runtime->orch_args[]` however it wants and calls `add_task()` / `add_successor()`.
+- It interprets `runtime->orch_args[]` however it wants and calls the runtime-provided AICPU build APIs:
+  - `aicpu_runtime_add_task()`
+  - `aicpu_runtime_add_successor_conditional()`
+  - `aicpu_runtime_publish_task()`
 
 Execution mechanism (important): **link-time inclusion into the AICPU binary**, not device-side `dlopen`.
 
 - The AICPU binary is already built from source using `CUSTOM_SOURCE_DIRS` (`src/platform/a2a3/aicpu/CMakeLists.txt:20`).
-- `aicpu_build_graph/build_config.py` can include a copied example directory containing the builder implementation as a `source_dir` for the AICPU target (developer experience similar to “host builds `.so` from example source”, but implemented as “AICPU binary includes example builder source”).
+- The example provides the builder program under:
+  - `examples/<example>/kernels/aicpu/build_graph_aicpu.cpp`
+- The runtime build config (`src/runtime/aicpu_build_graph/build_config.py`) automatically adds `PTO_KERNELS_DIR/aicpu`
+  into AICPU include/source dirs when present. The runner sets `PTO_KERNELS_DIR`:
+  - `examples/scripts/code_runner.py:270`
+- For runtime behavior knobs (like build/schedule mode), the example sets `RUNTIME_ENV` and the runner applies it
+  while calling `Runtime.initialize()`: `examples/scripts/code_runner.py:599`
 
 ### Challenge C — Sequential vs concurrent build/schedule (and concrete algorithms)
 
-Status: **there is no existing implementation of concurrent build∥schedule in the repo**. Current AICPU scheduling assumes the graph is fully built and immutable during scheduling.
+Status: **implemented in `aicpu_build_graph`** (concurrent build∥schedule + sequential build→schedule). `host_build_graph` still assumes the graph is fully built and immutable during scheduling.
 
 We require concurrent build∥schedule, and we also support sequential build→schedule as a baseline.
 
 #### Mode 1: Sequential build→schedule (supported baseline)
 
-Design:
+Implementation:
 
-- Total AICPU instances launched is `aicpu_thread_num` (current C API).
-- Runtime adds fields:
-  - `int build_thread_num` (default 1)
-  - `int schedule_thread_num` (default `aicpu_thread_num - build_thread_num`)
-  - `std::atomic<int> build_done` (0/1)
-  - `int build_mode` (0=sequential, 1=concurrent)
-- Role assignment:
-  - Each AICPU instance obtains `thread_idx` as today (`src/runtime/host_build_graph/aicpu/aicpu_executor.cpp:498`).
-  - Builder threads are those with `thread_idx < build_thread_num`.
-  - Scheduler threads are the remaining threads.
+- Builder/scheduler split is fixed in the executor:
+  - `BUILDER_THREAD_NUM = 1`: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:13`
+  - Scheduler threads = `thread_num - BUILDER_THREAD_NUM`: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:100`
+- Mode is selected via `Runtime::build_mode` (0=sequential, 1=concurrent):
+  - `src/runtime/aicpu_build_graph/runtime/runtime.h:243`
+  - Set at init time by `PTO_AICPU_BUILD_GRAPH_BUILD_MODE`: `src/runtime/aicpu_build_graph/host/runtime_maker.cpp:149`
 - Barrier:
-  - Builder thread runs `build_graph_aicpu(runtime)` once, then sets `build_done=1`.
-  - Scheduler threads spin-wait on `build_done` before starting scheduling.
+  - Builder thread runs `build_graph_aicpu(runtime)`, then sets `build_done_`: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:557`
+  - Scheduler threads wait for `build_done_` when `build_mode==0`: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:569`
 
 Core assignment implication:
 
-- Scheduler threads manage AICore workers; builder threads should manage **zero** worker cores.
-- Any existing “even distribution across threads” logic must be parameterized on `schedule_thread_num` (not on total AICPU instances), otherwise builder threads “steal” cores they never use.
+- Scheduler threads manage AICore workers; the builder thread manages **zero** worker cores:
+  - `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:225`
 
 Termination:
 
-- Use the existing termination assumptions from the scheduler loop: scheduling ends when all tasks complete and all cores are idle (current code has “double verification” when counters indicate done but cores are still busy: `src/runtime/host_build_graph/aicpu/aicpu_executor.cpp:333`).
+- Scheduling ends when:
+  - builder is done,
+  - `completed_tasks >= published_tasks`,
+  - ready queues are empty,
+  - all managed cores are idle (with a bounded re-check loop to avoid tearing): `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:416`.
 
 #### Mode 2: Concurrent build∥schedule (required)
 
 Correct-first strategy (recommended initial approach): **global graph mutex**.
 
-New executor state:
+Executor state (implemented):
 
-- Add `std::mutex graph_mutex_` (similar to existing ready-queue mutexes: `src/runtime/host_build_graph/aicpu/aicpu_executor.cpp:40`).
-- Add `std::atomic<int> published_task_count` and reuse `build_done`.
+- `std::mutex graph_mutex_` to guard task/edge publication: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:48`
+- `published_tasks_` counter + `build_done_`: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:61`
 
 Publication rule:
 
-- Builder must fully initialize a task (including setting `function_bin_addr`) and any edges it adds, while holding `graph_mutex_`, then increment `published_task_count` before releasing the lock.
+- Builder publishes tasks via the C ABI helpers:
+  - `aicpu_runtime_add_task()`: sets `Task::function_bin_addr` (supports `function_bin_addr==0` → `kernel_addrs[func_id]`) under the mutex: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:762`
+  - `aicpu_runtime_add_successor_conditional()`: appends fanout and conditionally increments fanin under the mutex: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:808`
+  - `aicpu_runtime_publish_task()`: marks published, increments `published_tasks_`, and enqueues if `fanin==0`: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:831`
 
 Scheduler behavior changes:
 
-- When a core completes a task, the scheduler thread:
-  - acquires `graph_mutex_`,
-  - reads the completed task’s `fanout[]`,
-  - decrements successor `fanin`,
-  - pushes newly-ready successors into the appropriate ready queue,
-  - releases `graph_mutex_`.
+- When a core completes a task, the scheduler thread acquires `graph_mutex_` before walking `fanout[]` and decrementing successor `fanin` so the builder can append edges safely: `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:463`.
 
 Termination condition (must include build progress):
 
 Schedulers may exit only when all of the following are true:
 
 - `build_done == 1`
-- `completed_tasks == published_task_count`
+- `completed_tasks >= published_tasks`
 - ready queues are empty
 - all managed cores are idle (retain the existing “core idle verification” idea; see `src/runtime/host_build_graph/aicpu/aicpu_executor.cpp:333`)
 
@@ -182,7 +189,9 @@ Constraints today:
 
 For `aicpu_build_graph`:
 
-- Use `aicpu_thread_num=4` with `build_thread_num=1` and `schedule_thread_num=3`.
+- Use `aicpu_thread_num=4` (1 builder + 3 schedulers). In this repo:
+  - The runner picks 4 threads for `aicpu_build_graph`: `examples/scripts/code_runner.py:372`
+  - Thread 0 is the builder (`BUILDER_THREAD_NUM=1`): `src/runtime/aicpu_build_graph/aicpu/aicpu_executor.cpp:13`
 - Keep `block_dim` a multiple of `aicpu_thread_num` initially to avoid touching host-side validation (`src/platform/a2a3/host/device_runner.cpp:262`).
 
 ## Acceptance criteria
@@ -197,16 +206,33 @@ For `aicpu_build_graph`:
 
 - Simulation:
   - Run `python examples/scripts/run_example.py -k examples/<new_example>/kernels -g examples/<new_example>/golden.py -p a2a3sim`.
-  - Run both modes: sequential build→schedule and concurrent build∥schedule (how the mode is selected is part of the runtime design; e.g. `runtime.build_mode`).
+  - Run both modes by setting `RUNTIME_ENV["PTO_AICPU_BUILD_GRAPH_BUILD_MODE"]` in the example’s `kernel_config.py`:
+    - `"1"` = concurrent build∥schedule (required default)
+    - `"0"` = sequential build→schedule (debug baseline)
+    The env is applied during `Runtime.initialize()` so `init_runtime_impl()` can set `Runtime::build_mode`.
 - Unit tests:
   - Extend pytest to assert discovery of `aicpu_build_graph`.
 - Diagnostics:
   - Use existing AICPU timeout diagnostics patterns as needed (see `src/runtime/host_build_graph/aicpu/aicpu_executor.cpp:545`).
 
+## Implementation status (as of current branch)
+
+- Done:
+  - Runtime skeleton: `src/runtime/aicpu_build_graph/` (host/aicpu/aicore + `runtime/runtime.h`)
+  - Example builder moved out of runtime:
+    - `examples/aicpu_build_graph_example/kernels/aicpu/build_graph_aicpu.cpp`
+    - Runtime provides a weak default that errors if the example forgets it: `src/runtime/aicpu_build_graph/aicpu/build_graph_default.cpp`
+  - Concurrency-safe AICPU build APIs + logs:
+    - `aicpu_runtime_add_task`, `aicpu_runtime_add_successor_conditional`, `aicpu_runtime_publish_task`
+  - Mode selection wired for simulation runs:
+    - `RUNTIME_ENV["PTO_AICPU_BUILD_GRAPH_BUILD_MODE"]` → `Runtime::build_mode`
+- Pending verification:
+  - None (validated via `a2a3sim` for `host_build_graph_example` and `aicpu_build_graph_example` in both concurrent and sequential modes).
+
 ## References (most relevant files)
 
 - Host orchestration example: `examples/host_build_graph_example/kernels/orchestration/example_orch.cpp:20`
-- Orchestration compilation in runner: `examples/scripts/code_runner.py:481`
+- Orchestration compilation in runner: `examples/scripts/code_runner.py:545`
 - Host `dlopen` orchestration: `src/runtime/host_build_graph/host/runtime_maker.cpp:96`
 - Host runtime launch/param injection: `src/platform/a2a3/host/device_runner.cpp:241`
 - Kernel registration mapping: `src/platform/a2a3/host/device_runner.cpp:499`
