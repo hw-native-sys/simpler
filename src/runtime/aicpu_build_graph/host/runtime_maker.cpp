@@ -1,12 +1,14 @@
 /**
- * Runtime Builder - Generic Implementation
+ * Runtime Builder - aicpu_build_graph (host side)
  *
  * Provides init_runtime_impl and validate_runtime_impl functions that work with
- * pluggable orchestration functions for building task graphs.
+ * pluggable orchestration functions.
  *
  * init_runtime_impl:
- *   - Calls orchestration function to build task graph
- *   - Orchestration is responsible for device memory management
+ *   - Calls orchestration function to prepare device memory and marshal inputs
+ *     for the AICPU graph builder (e.g. writes `runtime->orch_args[]`)
+ *   - Orchestration is responsible for device memory management via
+ *     `runtime->host_api.*`
  *
  * validate_runtime_impl (finalize_runtime_impl):
  *   - Copies recorded tensors back from device to host
@@ -19,7 +21,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <strings.h>
 #include <dlfcn.h>
 #include <fcntl.h>
 #include <iostream>
@@ -28,12 +32,32 @@
 /**
  * Orchestration function signature.
  *
- * @param runtime   Pointer to Runtime to populate with tasks
+ * @param runtime   Pointer to Runtime to prepare (e.g. set orch_args[], record tensors)
  * @param args      Arguments array (host pointers, sizes, etc.)
  * @param arg_count Total number of arguments
  * @return 0 on success, negative on error
  */
 typedef int (*OrchestrationFunc)(Runtime* runtime, uint64_t* args, int arg_count);
+
+static int parse_build_mode_env(const char* s, int default_mode) {
+    if (s == nullptr || s[0] == '\0') {
+        return default_mode;
+    }
+    // Accept either numeric or string values.
+    if (strcmp(s, "0") == 0 || strcasecmp(s, "sequential") == 0) {
+        return 0;
+    }
+    if (strcmp(s, "1") == 0 || strcasecmp(s, "concurrent") == 0) {
+        return 1;
+    }
+    // Fall back to numeric parsing.
+    char* end = nullptr;
+    long v = strtol(s, &end, 10);
+    if (end != s) {
+        return (v != 0) ? 1 : 0;
+    }
+    return default_mode;
+}
 
 #ifdef __cplusplus
 extern "C" {
@@ -43,12 +67,15 @@ extern "C" {
  * Initialize a pre-allocated runtime with dynamic orchestration.
  *
  * This function loads the orchestration SO from binary data via a temp file,
- * resolves the orchestration function via dlsym, then calls it to build the
- * task graph. The orchestration function is responsible for:
+ * resolves the orchestration function via dlsym, then calls it.
+ *
+ * For `aicpu_build_graph`, the orchestration function is expected to:
  * - Allocating device memory via runtime->host_api.device_malloc()
  * - Copying data to device via runtime->host_api.copy_to_device()
- * - Building the task graph
- * - Recording tensor pairs via runtime->record_tensor_pair()
+ * - Recording tensor pairs via runtime->record_tensor_pair() (for copy-back)
+ * - Marshalling a device-visible payload into runtime->orch_argc/runtime->orch_args[]
+ *
+ * The task graph itself is built later on device by `build_graph_aicpu(Runtime*)`.
  *
  * @param runtime           Pointer to pre-constructed Runtime
  * @param orch_so_binary    Orchestration shared library binary data
@@ -114,6 +141,16 @@ int init_runtime_impl(Runtime *runtime,
 
     // Clear any previous tensor pairs
     runtime->clear_tensor_pairs();
+
+    // Optional: select build/schedule mode for this runtime instance.
+    //
+    // 0 = sequential build -> schedule
+    // 1 = concurrent build || schedule (default)
+    const char* build_mode_env = std::getenv("PTO_AICPU_BUILD_GRAPH_BUILD_MODE");
+    runtime->build_mode = parse_build_mode_env(build_mode_env, runtime->build_mode);
+    std::cout << "aicpu_build_graph build_mode=" << runtime->build_mode
+              << " (PTO_AICPU_BUILD_GRAPH_BUILD_MODE="
+              << (build_mode_env ? build_mode_env : "<unset>") << ")\n";
 
     std::cout << "\n=== Calling Orchestration Function ===" << '\n';
     std::cout << "Args count: " << func_args_count << '\n';

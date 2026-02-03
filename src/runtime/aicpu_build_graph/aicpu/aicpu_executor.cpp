@@ -12,6 +12,10 @@ constexpr int MAX_AIV_PER_THREAD = PLATFORM_MAX_AIV_PER_THREAD;
 constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 constexpr int BUILDER_THREAD_NUM = 1;
 
+// Best-effort per-thread context for logging (helps attribute builder activity).
+static thread_local int tl_thread_idx = -1;
+static thread_local const char* tl_thread_role = "unknown";
+
 // Core information for discovery
 struct CoreInfo {
     int worker_id;     // Index in runtime.workers[]
@@ -399,6 +403,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
     int verification_warning_count = 0;
     const int MAX_VERIFICATION_WARNINGS = 10;
 
+    int last_seen_published = -1;
+
     while (true) {
         if (build_failed_.load(std::memory_order_acquire)) {
             DEV_ERROR("Thread %d: build_failed set, aborting scheduling loop", thread_idx);
@@ -408,6 +414,12 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
         int published = published_tasks_.load(std::memory_order_acquire);
         int completed = completed_tasks_.load(std::memory_order_acquire);
         bool build_done = build_done_.load(std::memory_order_acquire);
+
+        if (!build_done && published != last_seen_published) {
+            DEV_INFO("Thread %d: Observed published=%d (completed=%d, build_done=%d)",
+                     thread_idx, published, completed, build_done ? 1 : 0);
+            last_seen_published = published;
+        }
 
         if (build_done && completed >= published) {
             bool all_cores_idle = true;
@@ -545,10 +557,14 @@ int AicpuExecutor::run(Runtime* runtime) {
     int thread_idx = thread_idx_++;
     int final_rc = 0;
 
+    tl_thread_idx = thread_idx;
+    tl_thread_role = (thread_idx < BUILDER_THREAD_NUM) ? "builder" : "scheduler";
+
     DEV_INFO("Thread %d: Start", thread_idx);
 
     if (thread_idx < BUILDER_THREAD_NUM) {
-        DEV_INFO("Thread %d: Builder starting build_graph_aicpu()", thread_idx);
+        DEV_INFO("Thread %d: Builder starting build_graph_aicpu() (build_mode=%d)",
+                 thread_idx, runtime ? runtime->build_mode : -1);
         int rc = build_graph_aicpu(runtime);
         if (rc != 0) {
             DEV_ERROR("Thread %d: build_graph_aicpu failed rc=%d", thread_idx, rc);
@@ -558,13 +574,22 @@ int AicpuExecutor::run(Runtime* runtime) {
         DEV_INFO("Thread %d: Builder done (rc=%d)", thread_idx, rc);
         final_rc = (rc == 0) ? 0 : -1;
     } else {
+        DEV_INFO("Thread %d: Scheduler thread (build_mode=%d, build_done=%d, published=%d)",
+                 thread_idx,
+                 runtime ? runtime->build_mode : -1,
+                 build_done_.load(std::memory_order_acquire) ? 1 : 0,
+                 published_tasks_.load(std::memory_order_acquire));
+
         if (runtime->build_mode == 0) {
+            DEV_INFO("Thread %d: Sequential mode: waiting for builder barrier", thread_idx);
             while (!build_done_.load(std::memory_order_acquire)) {
                 if (build_failed_.load(std::memory_order_acquire)) {
                     DEV_ERROR("Thread %d: build_failed while waiting for sequential barrier", thread_idx);
                     break;
                 }
             }
+        } else {
+            DEV_INFO("Thread %d: Concurrent mode: not waiting for builder barrier", thread_idx);
         }
 
         const int* cur_thread_cores = core_assignments_[thread_idx];
@@ -741,11 +766,25 @@ extern "C" int aicpu_execute(Runtime* runtime) {
 
 // ===== AICPU-side graph build helpers (exported C ABI) =====
 
+/**
+ * AICPU graph-build API: create a task that can be scheduled by the runtime.
+ *
+ * Notes:
+ * - This function acquires the internal graph mutex, so it is safe to call while
+ *   scheduler threads are concurrently dispatching/completing tasks.
+ * - Passing `function_bin_addr == 0` means: bind the task using the runtime's
+ *   `func_id -> kernel_addrs[]` table (populated by the host before launch).
+ *   This is the recommended default for examples.
+ */
 extern "C" int aicpu_runtime_add_task(Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type,
                                       uint64_t function_bin_addr) {
     if (runtime == nullptr) {
         return -1;
     }
+
+    DEV_INFO("Thread %d(%s): add_task(func_id=%d core=%s num_args=%d addr=0x%lx)",
+             tl_thread_idx, tl_thread_role,
+             func_id, core_type_to_string(core_type), num_args, (uint64_t)function_bin_addr);
 
     std::scoped_lock lock(g_aicpu_executor.graph_mutex_);
 
@@ -766,22 +805,53 @@ extern "C" int aicpu_runtime_add_task(Runtime* runtime, uint64_t* args, int num_
     task->published.store(0, std::memory_order_release);
     task->completed.store(0, std::memory_order_release);
 
+    DEV_INFO("Thread %d(%s): add_task -> task_id=%d fanin=%d bound_addr=0x%lx",
+             tl_thread_idx, tl_thread_role,
+             task_id, task->fanin.load(std::memory_order_acquire),
+             (uint64_t)task->function_bin_addr);
     return task_id;
 }
 
+/**
+ * AICPU graph-build API: add an edge `from_task -> to_task` for concurrent build.
+ *
+ * This is a concurrency-safe variant of `Runtime::add_successor()`:
+ * - Always records the fanout edge.
+ * - Only increments `to_task.fanin` if `from_task` has not already completed.
+ *
+ * Use this when the scheduler may complete `from_task` while the builder is still
+ * constructing the graph.
+ */
 extern "C" void aicpu_runtime_add_successor_conditional(Runtime* runtime, int from_task, int to_task) {
     if (runtime == nullptr) {
         return;
     }
 
+    DEV_INFO("Thread %d(%s): add_edge_conditional(%d -> %d)",
+             tl_thread_idx, tl_thread_role, from_task, to_task);
+
     std::scoped_lock lock(g_aicpu_executor.graph_mutex_);
     runtime->add_successor_conditional(from_task, to_task);
 }
 
+/**
+ * AICPU graph-build API: publish a task to the scheduler.
+ *
+ * Publishing makes the task visible to scheduler threads. If the task's fanin is
+ * already zero at publish time, it is enqueued immediately into the ready queue.
+ *
+ * Typical pattern for concurrent build||schedule:
+ * 1) Create task via `aicpu_runtime_add_task()`
+ * 2) Add edges via `aicpu_runtime_add_successor_conditional()`
+ * 3) Call `aicpu_runtime_publish_task()`
+ */
 extern "C" void aicpu_runtime_publish_task(Runtime* runtime, int task_id) {
     if (runtime == nullptr) {
         return;
     }
+
+    DEV_INFO("Thread %d(%s): publish_task(%d)",
+             tl_thread_idx, tl_thread_role, task_id);
 
     std::scoped_lock lock(g_aicpu_executor.graph_mutex_);
     Task* task = runtime->get_task(task_id);
@@ -799,4 +869,10 @@ extern "C" void aicpu_runtime_publish_task(Runtime* runtime, int task_id) {
     if (task->fanin.load(std::memory_order_acquire) == 0) {
         g_aicpu_executor.push_ready_task(*runtime, task_id);
     }
+
+    DEV_INFO("Thread %d(%s): publish_task(%d) done (fanin=%d published=%d total_published=%d)",
+             tl_thread_idx, tl_thread_role, task_id,
+             task->fanin.load(std::memory_order_acquire),
+             task->published.load(std::memory_order_acquire),
+             g_aicpu_executor.published_tasks_.load(std::memory_order_acquire));
 }

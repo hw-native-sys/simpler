@@ -167,7 +167,18 @@ typedef struct {
     uint64_t start_time;  // Start time of the task
     uint64_t end_time;    // End time of the task
 
-    // Scheduling state for concurrent graph build
+    /**
+     * Scheduling state for concurrent build||schedule.
+     *
+     * `published`:
+     * - Set by the builder when the task's fields (args/func_id/core_type, and any
+     *   required dependency edges) are ready for scheduler consumption.
+     * - Scheduler threads must treat unpublished tasks as non-existent.
+     *
+     * `completed`:
+     * - Set by scheduler threads when the task finishes on AICore.
+     * - Used to make `add_successor_conditional()` safe when edges are added late.
+     */
     std::atomic<int> published;   // 0 = not visible to scheduler, 1 = published
     std::atomic<int> completed;   // 0 = not completed, 1 = completed
 } Task;
@@ -194,14 +205,38 @@ public:
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;  // Number of AICPU threads for scheduling
 
-    // Orchestration payload (written on host, consumed by AICPU builder)
+    /**
+     * Orchestration payload (written on host, consumed by AICPU builder).
+     *
+     * For `aicpu_build_graph`, the host orchestration function is expected to:
+     * - allocate/copy device tensors (via `runtime->host_api`)
+     * - record outputs (via `runtime->record_tensor_pair()`)
+     * - marshal a device-visible payload into `orch_args[]`
+     *
+     * The AICPU-side `build_graph_aicpu(Runtime*)` program interprets `orch_args[]`
+     * to create tasks/edges on device.
+     */
     int orch_argc;
     uint64_t orch_args[RUNTIME_MAX_ORCH_ARGS];
 
-    // Kernel address table (written on host before launch, read by AICPU builder)
+    /**
+     * Kernel address table (written on host before launch, read by AICPU builder).
+     *
+     * This enables AICPU-built tasks to bind `Task::function_bin_addr` without host
+     * iterating the task table (tasks may not exist yet on host).
+     *
+     * Convention:
+     * - `kernel_addrs[func_id]` holds the executable address for that `func_id`.
+     * - Examples typically pass `function_bin_addr=0` to `aicpu_runtime_add_task()`
+     *   to auto-bind via this table.
+     */
     uint64_t kernel_addrs[RUNTIME_MAX_FUNC_ID];
 
-    // Build mode: 0 = sequential build->schedule, 1 = concurrent build||schedule
+    /**
+     * Build mode:
+     * - 0 = sequential build->schedule (scheduler threads wait for builder)
+     * - 1 = concurrent build||schedule (builder publishes tasks while schedulers run)
+     */
     int build_mode;
 
 private:
@@ -249,13 +284,13 @@ public:
      */
     void add_successor(int from_task, int to_task);
 
-	/**
-	 * Add a dependency edge conditionally for concurrent build.
-	 *
-	 * Always records the edge in from_task.fanout[]. If from_task is already
-	 * completed, the dependency is considered already satisfied and to_task.fanin
-	 * is NOT incremented.
-	 */
+    /**
+     * Add a dependency edge conditionally for concurrent build.
+     *
+     * Always records the edge in from_task.fanout[]. If from_task is already
+     * completed, the dependency is considered already satisfied and to_task.fanin
+     * is NOT incremented.
+     */
     void add_successor_conditional(int from_task, int to_task);
 
     // =========================================================================
@@ -341,5 +376,67 @@ public:
     // NOTE: Placed at end of class to avoid affecting device memory layout
     HostApi host_api;
 };
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+// =============================================================================
+// AICPU-side Graph Build API (for examples)
+// =============================================================================
+//
+// These functions are implemented by the aicpu_build_graph AICPU executor and
+// are intended to be called from an example-provided `build_graph_aicpu()`.
+//
+// They provide:
+// - Internal synchronization with the scheduler (graph mutex)
+// - Published task counting and ready-queue insertion
+//
+// The builder program itself is compiled from the example (not hardcoded in the
+// runtime).
+
+/**
+ * Create a task from AICPU during graph build.
+ *
+ * Thread-safety:
+ * - Safe to call concurrently with scheduler threads in concurrent build||schedule mode.
+ *
+ * Kernel address binding:
+ * - If `function_bin_addr != 0`, it is written into `Task::function_bin_addr` directly.
+ * - If `function_bin_addr == 0`, the runtime will auto-fill it from `runtime->kernel_addrs[func_id]`.
+ *   This is the intended path for most examples: pass 0 and rely on the host to populate
+ *   `Runtime::kernel_addrs[]` before launching AICPU (guarded by `RUNTIME_HAS_KERNEL_ADDRS`).
+ */
+int aicpu_runtime_add_task(Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type,
+                          uint64_t function_bin_addr);
+
+/**
+ * Add an edge `from_task -> to_task` during AICPU-side graph build (concurrency-safe).
+ *
+ * This is the recommended edge API for concurrent build||schedule:
+ * - It always appends `to_task` into `from_task.fanout[]`.
+ * - It only increments `to_task.fanin` if `from_task` has not already completed.
+ *
+ * This avoids races where the scheduler completes `from_task` before the builder
+ * adds the edge.
+ */
+void aicpu_runtime_add_successor_conditional(Runtime* runtime, int from_task, int to_task);
+
+/**
+ * Publish a task to the scheduler during AICPU-side graph build.
+ *
+ * Publishing makes the task visible to scheduler threads. If `task.fanin == 0` at
+ * publish time, the task is pushed into the appropriate ready queue immediately.
+ *
+ * Typical builder order:
+ * 1) Create task
+ * 2) Add edges (successors)
+ * 3) Publish the task
+ */
+void aicpu_runtime_publish_task(Runtime* runtime, int task_id);
+
+#ifdef __cplusplus
+}  // extern "C"
+#endif
 
 #endif  // RUNTIME_H
