@@ -1,5 +1,11 @@
+#include <dlfcn.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <mutex>
 
 #include "aicpu/device_log.h"
@@ -23,6 +29,76 @@ struct CoreInfo {
 };
 
 extern "C" int build_graph_aicpu(Runtime* runtime);
+
+namespace {
+using AicpuBuilderFunc = int (*)(Runtime*);
+
+int write_bytes_to_file(const char* path, const uint8_t* data, size_t size) {
+    int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
+    if (fd < 0) {
+        return -1;
+    }
+    size_t off = 0;
+    while (off < size) {
+        ssize_t n = ::write(fd, data + off, size - off);
+        if (n <= 0) {
+            ::close(fd);
+            return -1;
+        }
+        off += static_cast<size_t>(n);
+    }
+    ::close(fd);
+    return 0;
+}
+
+int build_graph_via_aicpu_plugin(Runtime* runtime, int thread_idx) {
+    if (runtime == nullptr) {
+        return -1;
+    }
+
+    if (runtime->aicpu_orch_so_dev_addr == 0 || runtime->aicpu_orch_so_size == 0) {
+        return -2;  // caller fallback
+    }
+
+    const char* sym = (runtime->aicpu_orch_func_name[0] != '\0') ? runtime->aicpu_orch_func_name : "build_graph_aicpu";
+    const uint8_t* so_data = reinterpret_cast<const uint8_t*>(runtime->aicpu_orch_so_dev_addr);
+    size_t so_size = static_cast<size_t>(runtime->aicpu_orch_so_size);
+
+    char so_path[128];
+    snprintf(so_path, sizeof(so_path), "/tmp/aicpu_orch_%p_%d.so", (void*)runtime, thread_idx);
+
+    DEV_INFO("Thread %d: Builder loading AICPU orch plugin %s (bytes=%lu, sym=%s)",
+        thread_idx,
+        so_path,
+        static_cast<uint64_t>(so_size),
+        sym);
+
+    if (write_bytes_to_file(so_path, so_data, so_size) != 0) {
+        DEV_ERROR("Thread %d: Failed to write AICPU orch plugin to %s", thread_idx, so_path);
+        return -1;
+    }
+
+    void* handle = ::dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+    ::unlink(so_path);
+    if (handle == nullptr) {
+        DEV_ERROR("Thread %d: dlopen failed for AICPU orch plugin: %s", thread_idx, ::dlerror());
+        return -1;
+    }
+
+    ::dlerror();  // clear
+    AicpuBuilderFunc func = reinterpret_cast<AicpuBuilderFunc>(::dlsym(handle, sym));
+    const char* err = ::dlerror();
+    if (err != nullptr || func == nullptr) {
+        DEV_ERROR("Thread %d: dlsym failed for '%s': %s", thread_idx, sym, err ? err : "<null>");
+        ::dlclose(handle);
+        return -1;
+    }
+
+    int rc = func(runtime);
+    ::dlclose(handle);
+    return rc;
+}
+}  // namespace
 
 struct AicpuExecutor {
     // ===== Thread management state =====
@@ -582,10 +658,13 @@ int AicpuExecutor::run(Runtime* runtime) {
     DEV_INFO("Thread %d: Start", thread_idx);
 
     if (thread_idx < BUILDER_THREAD_NUM) {
-        DEV_INFO("Thread %d: Builder starting build_graph_aicpu() (build_mode=%d)",
-            thread_idx,
-            runtime ? runtime->build_mode : -1);
-        int rc = build_graph_aicpu(runtime);
+        DEV_INFO("Thread %d: Builder starting (build_mode=%d)", thread_idx, runtime ? runtime->build_mode : -1);
+
+        int rc = build_graph_via_aicpu_plugin(runtime, thread_idx);
+        if (rc == -2) {
+            DEV_INFO("Thread %d: No AICPU plugin provided, falling back to linked build_graph_aicpu()", thread_idx);
+            rc = build_graph_aicpu(runtime);
+        }
         if (rc != 0) {
             DEV_ERROR("Thread %d: build_graph_aicpu failed rc=%d", thread_idx, rc);
             build_failed_.store(true, std::memory_order_release);
