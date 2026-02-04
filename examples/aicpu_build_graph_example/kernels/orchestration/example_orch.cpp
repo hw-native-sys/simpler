@@ -8,13 +8,42 @@
  * Graph building happens on device in build_graph_aicpu(Runtime*).
  */
 
-#include "runtime.h"
-
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
 #include <iostream>
+#include <string>
+#include <vector>
+
+#include "runtime.h"
 
 extern "C" {
+
+namespace {
+std::vector<uint8_t> read_file_bytes(const char* path) {
+    if (path == nullptr || path[0] == '\0') {
+        return {};
+    }
+    std::ifstream ifs(path, std::ios::binary);
+    if (!ifs) {
+        return {};
+    }
+    ifs.seekg(0, std::ios::end);
+    std::streamoff size = ifs.tellg();
+    if (size <= 0) {
+        return {};
+    }
+    ifs.seekg(0, std::ios::beg);
+
+    std::vector<uint8_t> buf(static_cast<size_t>(size));
+    if (!ifs.read(reinterpret_cast<char*>(buf.data()), size)) {
+        return {};
+    }
+    return buf;
+}
+}  // namespace
 
 int prepare_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
     // Expected args: [host_a, host_b, host_f, size_a, size_b, size_f, SIZE]
@@ -71,8 +100,40 @@ int prepare_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
     runtime->orch_args[5] = reinterpret_cast<uint64_t>(dev_f);
     runtime->orch_args[6] = static_cast<uint64_t>(SIZE);
 
+    // Upload AICPU-side orchestration plugin (.so) so the builder can dlopen+dlsym it on device.
+    //
+    // This decouples the graph-building program from the runtime binary: updating the orchestration
+    // only requires shipping a small plugin `.so`, rather than relinking/reuploading the full runtime.
+    const char* aicpu_orch_path = std::getenv("PTO_AICPU_ORCH_SO");
+    const char* aicpu_orch_func = std::getenv("PTO_AICPU_ORCH_FUNC");  // optional
+
+    std::vector<uint8_t> so_bytes = read_file_bytes(aicpu_orch_path);
+    if (so_bytes.empty()) {
+        std::cerr << "prepare_example_graph: failed to read PTO_AICPU_ORCH_SO="
+                  << (aicpu_orch_path ? aicpu_orch_path : "<unset>") << "\n";
+        return -1;
+    }
+
+    void* dev_so = runtime->host_api.device_malloc(so_bytes.size());
+    if (!dev_so) {
+        std::cerr << "prepare_example_graph: device_malloc failed for AICPU orch plugin\n";
+        return -1;
+    }
+    runtime->host_api.copy_to_device(dev_so, so_bytes.data(), so_bytes.size());
+
+    runtime->aicpu_orch_so_dev_addr = reinterpret_cast<uint64_t>(dev_so);
+    runtime->aicpu_orch_so_size = static_cast<uint32_t>(so_bytes.size());
+    memset(runtime->aicpu_orch_func_name, 0, sizeof(runtime->aicpu_orch_func_name));
+    if (aicpu_orch_func && aicpu_orch_func[0] != '\0') {
+        strncpy(runtime->aicpu_orch_func_name, aicpu_orch_func, sizeof(runtime->aicpu_orch_func_name) - 1);
+    } else {
+        strncpy(runtime->aicpu_orch_func_name, "build_graph_aicpu", sizeof(runtime->aicpu_orch_func_name) - 1);
+    }
+
+    std::cout << "prepare_example_graph: uploaded AICPU orch plugin " << (aicpu_orch_path ? aicpu_orch_path : "<unset>")
+              << " (" << so_bytes.size() << " bytes), func=" << runtime->aicpu_orch_func_name << "\n";
+
     return 0;
 }
 
 }  // extern "C"
-
