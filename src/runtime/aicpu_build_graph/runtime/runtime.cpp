@@ -40,6 +40,10 @@ Runtime::Runtime() {
     orch_argc = 0;
     memset(orch_args, 0, sizeof(orch_args));
     memset(kernel_addrs, 0, sizeof(kernel_addrs));
+    aicpu_orch_so_dev_addr = 0;
+    aicpu_orch_so_size = 0;
+    memset(aicpu_orch_func_name, 0, sizeof(aicpu_orch_func_name));
+    strncpy(aicpu_orch_func_name, "build_graph_aicpu", sizeof(aicpu_orch_func_name) - 1);
     build_mode = 1;  // default to concurrent build||schedule
 }
 

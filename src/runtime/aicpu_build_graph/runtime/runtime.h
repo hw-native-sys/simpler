@@ -233,6 +233,22 @@ public:
     uint64_t kernel_addrs[RUNTIME_MAX_FUNC_ID];
 
     /**
+     * AICPU orchestration plugin (device-side dlopen builder).
+     *
+     * When set by host orchestration, the AICPU builder thread will:
+     * - materialize the `.so` bytes from `aicpu_orch_so_dev_addr` into a temp file
+     * - `dlopen()` the temp file on AICPU
+     * - `dlsym()` the entry function `aicpu_orch_func_name`
+     * - call `int (*)(Runtime*)`
+     *
+     * This enables updating graph-building logic by uploading only a small
+     * orchestration plugin `.so` (instead of relinking/reuploading the full runtime).
+     */
+    uint64_t aicpu_orch_so_dev_addr;
+    uint32_t aicpu_orch_so_size;
+    char aicpu_orch_func_name[64];
+
+    /**
      * Build mode:
      * - 0 = sequential build->schedule (scheduler threads wait for builder)
      * - 1 = concurrent build||schedule (builder publishes tasks while schedulers run)
