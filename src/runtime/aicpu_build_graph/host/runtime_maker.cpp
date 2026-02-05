@@ -29,6 +29,7 @@
 #include <cstring>
 #include <iostream>
 
+#include "device_runner.h"
 #include "runtime.h"
 
 /**
@@ -40,6 +41,47 @@
  * @return 0 on success, negative on error
  */
 typedef int (*OrchestrationFunc)(Runtime* runtime, uint64_t* args, int arg_count);
+
+static void populate_kernel_addrs(Runtime* runtime) {
+    if (runtime == nullptr) {
+        return;
+    }
+    memset(runtime->kernel_addrs, 0, sizeof(runtime->kernel_addrs));
+
+    // Kernel binaries are registered via the platform C API (register_kernel),
+    // which populates DeviceRunner's func_id -> address map. Since this file is
+    // compiled into the same host runtime library as DeviceRunner, we can query
+    // the mapping here without changing src/platform.
+    //
+    // We assume func_ids are generally dense starting from 0 (as in examples).
+    // To avoid spamming warnings from get_function_bin_addr() on missing ids,
+    // stop after a small number of consecutive misses once we've seen at least
+    // one registered kernel.
+    DeviceRunner& runner = DeviceRunner::get();
+    bool saw_any = false;
+    int consecutive_misses = 0;
+    constexpr int kMaxConsecutiveMisses = 8;
+
+    for (int func_id = 0; func_id < RUNTIME_MAX_FUNC_ID; ++func_id) {
+        uint64_t addr = runner.get_function_bin_addr(func_id);
+        if (addr == 0) {
+            if (saw_any) {
+                consecutive_misses++;
+                if (consecutive_misses >= kMaxConsecutiveMisses) {
+                    break;
+                }
+            }
+            continue;
+        }
+        saw_any = true;
+        consecutive_misses = 0;
+        runtime->kernel_addrs[func_id] = addr;
+    }
+
+    if (!saw_any) {
+        std::cerr << "Warning: no registered kernels found; Runtime::kernel_addrs[] remains empty\n";
+    }
+}
 
 static int parse_build_mode_env(const char* s, int default_mode) {
     if (s == nullptr || s[0] == '\0') {
@@ -164,6 +206,11 @@ int init_runtime_impl(Runtime* runtime,
         dlclose(handle);
         return rc;
     }
+
+    // Populate `kernel_addrs[]` for AICPU-side task creation (Challenge A).
+    // This must happen after Python has called register_kernel() and before
+    // launch_runtime() copies Runtime to device / starts AICPU execution.
+    populate_kernel_addrs(runtime);
 
     std::cout << "\nRuntime initialized. Ready for execution from Python.\n";
 

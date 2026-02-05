@@ -29,13 +29,6 @@
 #include "common/platform_config.h"
 
 // =============================================================================
-// aicpu_build_graph Feature Flags
-// =============================================================================
-
-// Used by platform device_runner to conditionally populate Runtime::kernel_addrs[].
-#define RUNTIME_HAS_KERNEL_ADDRS 1
-
-// =============================================================================
 // Configuration Macros
 // =============================================================================
 
@@ -220,16 +213,17 @@ public:
     uint64_t orch_args[RUNTIME_MAX_ORCH_ARGS];
 
     /**
-     * Kernel address table (written on host before launch, read by AICPU builder).
+ * Kernel address table (written on host before launch, read by AICPU builder).
      *
      * This enables AICPU-built tasks to bind `Task::function_bin_addr` without host
      * iterating the task table (tasks may not exist yet on host).
      *
-     * Convention:
-     * - `kernel_addrs[func_id]` holds the executable address for that `func_id`.
-     * - Examples typically pass `function_bin_addr=0` to `aicpu_runtime_add_task()`
-     *   to auto-bind via this table.
-     */
+ * Convention:
+ * - `kernel_addrs[func_id]` holds the executable address for that `func_id`.
+ * - Examples typically pass `function_bin_addr=0` to `aicpu_runtime_add_task()`
+ *   to auto-bind via this table (the table is filled by the host runtime init,
+ *   not by platform code).
+ */
     uint64_t kernel_addrs[RUNTIME_MAX_FUNC_ID];
 
     /**
@@ -421,7 +415,7 @@ extern "C" {
  * - If `function_bin_addr != 0`, it is written into `Task::function_bin_addr` directly.
  * - If `function_bin_addr == 0`, the runtime will auto-fill it from `runtime->kernel_addrs[func_id]`.
  *   This is the intended path for most examples: pass 0 and rely on the host to populate
- *   `Runtime::kernel_addrs[]` before launching AICPU (guarded by `RUNTIME_HAS_KERNEL_ADDRS`).
+ *   `Runtime::kernel_addrs[]` before launching AICPU.
  */
 int aicpu_runtime_add_task(
     Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type, uint64_t function_bin_addr);
