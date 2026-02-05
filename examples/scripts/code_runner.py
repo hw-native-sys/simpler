@@ -35,7 +35,10 @@ Golden.py interface:
 import importlib.util
 import logging
 import os
+import shutil
+import subprocess
 import sys
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -385,6 +388,7 @@ class CodeRunner:
         # Extract kernel configuration
         self.kernels = self._kernel_config.KERNELS
         self.orchestration = self._kernel_config.ORCHESTRATION
+        self.aicpu_orchestration = getattr(self._kernel_config, "AICPU_ORCHESTRATION", None)
 
         # Extract golden configuration
         self.params_list = getattr(self._golden_module, 'PARAMS_LIST', [{}])
@@ -412,6 +416,117 @@ class CodeRunner:
                 f"Expected: {config_path}"
             )
         return _load_module_from_path(config_path, f"kernel_config_{id(self)}")
+
+    def _compile_aicpu_orchestration_plugin(self, pto_compiler) -> Optional[Path]:
+        """
+        Compile the AICPU-side orchestration plugin (a small .so loaded via dlopen on AICPU).
+
+        The example config must provide:
+            AICPU_ORCHESTRATION = {"source": ".../build_graph_aicpu.cpp", "function_name": "build_graph_aicpu"}
+
+        Returns:
+            Host path to the compiled plugin .so (kept on disk until the run completes), or None.
+        """
+        if self.runtime_name != "aicpu_build_graph":
+            return None
+
+        cfg = self.aicpu_orchestration
+        if cfg is None:
+            return None
+        if not isinstance(cfg, dict):
+            raise TypeError("AICPU_ORCHESTRATION must be a dict when provided")
+
+        source_path = cfg.get("source")
+        func_name = cfg.get("function_name", "build_graph_aicpu")
+        if not source_path or not isinstance(source_path, str):
+            raise ValueError("AICPU_ORCHESTRATION['source'] must be a non-empty string")
+        if not func_name or not isinstance(func_name, str):
+            raise ValueError("AICPU_ORCHESTRATION['function_name'] must be a non-empty string")
+
+        source_p = Path(source_path)
+        if not source_p.is_absolute():
+            source_p = (self.kernels_dir / source_p).resolve()
+        source_path = str(source_p)
+
+        runtime_include_dir = str(self.project_root / "src" / "runtime" / self.runtime_name / "runtime")
+        platform_include_dir = str(self.project_root / "src" / "platform" / "include")
+        include_dirs = [runtime_include_dir, platform_include_dir]
+
+        # Best-effort: include platform-specific includes (doesn't hurt and helps if examples include platform headers).
+        include_dirs += pto_compiler.get_platform_include_dirs()
+
+        # Secure, unique output path in /tmp. This prevents other users/processes from
+        # hijacking a predictable filename (e.g., via symlink races).
+        fd, out_s = tempfile.mkstemp(prefix="aicpu_orch_", suffix=".so", dir="/tmp")
+        os.close(fd)
+        out_path = Path(out_s)
+
+        if self.platform == "a2a3":
+            ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
+            if not ascend_home:
+                raise EnvironmentError("ASCEND_HOME_PATH must be set to compile AICPU orchestration for platform=a2a3")
+            cxx = os.path.join(ascend_home, "tools", "hcc", "bin", "aarch64-target-linux-gnu-g++")
+            if not os.path.isfile(cxx):
+                raise FileNotFoundError(f"AICPU cross-compiler not found: {cxx}")
+            cmd = [
+                cxx,
+                "-shared",
+                "-fPIC",
+                "-O3",
+                "-g",
+                "-std=gnu++17",
+            ]
+            # Match the platform AICPU build include search paths (subset).
+            cmd += [
+                f"-I{os.path.join(ascend_home, 'include')}",
+                f"-I{os.path.join(ascend_home, 'include', 'toolchain')}",
+                f"-I{os.path.join(ascend_home, 'pkg_inc', 'base')}",
+            ]
+        else:
+            cxx = os.environ.get("CXX") or (shutil.which("g++") or "")
+            if not cxx:
+                raise RuntimeError("g++ compiler not found. Please install g++ (or activate your toolchain env).")
+            cmd = [
+                cxx,
+                "-shared",
+                "-fPIC",
+                "-O3",
+                "-g",
+                "-std=c++17",
+            ]
+
+        for inc_dir in include_dirs:
+            cmd.append(f"-I{os.path.abspath(inc_dir)}")
+
+        cmd += ["-o", str(out_path), os.path.abspath(source_path)]
+
+        print("\n=== Compiling AICPU Orchestration Plugin ===")
+        print(f"AICPU plugin entry: {func_name}")
+        print(f"Output: {out_path}")
+        print(f"Command: {' '.join(cmd)}")
+
+        result = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            if result.stdout:
+                print(f"[AICPU Orchestration Plugin] stdout:\n{result.stdout}")
+            if result.stderr:
+                print(f"[AICPU Orchestration Plugin] stderr:\n{result.stderr}")
+            if result.returncode != 0:
+                raise RuntimeError(
+                    f"AICPU orchestration plugin compilation failed with exit code {result.returncode}:\n{result.stderr}"
+                )
+        except Exception:
+            try:
+                out_path.unlink()
+            except FileNotFoundError:
+                pass
+            raise
+
+        if not out_path.is_file():
+            raise RuntimeError(f"AICPU orchestration plugin compilation succeeded but output not found: {out_path}")
+
+        print(f"Compiled AICPU orchestration plugin: {out_path} ({out_path.stat().st_size} bytes)")
+        return out_path
 
     def _load_golden_module(self):
         """Load golden.py script."""
@@ -624,6 +739,23 @@ class CodeRunner:
             )
             logger.debug(f"Compiled orchestration: {len(orch_so_binary)} bytes")
 
+        aicpu_orch_plugin_path: Optional[Path] = None
+        if self.runtime_name == "aicpu_build_graph":
+            if self.aicpu_orchestration is not None:
+                aicpu_orch_plugin_path = self._compile_aicpu_orchestration_plugin(pto_compiler)
+            else:
+                # Allow advanced users to supply a prebuilt plugin path via RUNTIME_ENV.
+                base_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
+                aicpu_orch_so = base_env.get("PTO_AICPU_ORCH_SO")
+                if not aicpu_orch_so:
+                    raise RuntimeError(
+                        "aicpu_build_graph requires an AICPU orchestration plugin. Either:\n"
+                        "- Define AICPU_ORCHESTRATION in kernels/kernel_config.py, or\n"
+                        "- Provide PTO_AICPU_ORCH_SO in RUNTIME_ENV pointing to a prebuilt .so"
+                    )
+                if not Path(aicpu_orch_so).is_file():
+                    raise FileNotFoundError(f"PTO_AICPU_ORCH_SO does not exist: {aicpu_orch_so}")
+
         # Step 4: Compile kernels (will be registered during runtime.initialize)
         logger.info("=== Compiling Kernels ===")
 
@@ -652,78 +784,92 @@ class CodeRunner:
 
         # Step 5: Run each parameter set
         total_cases = len(self.params_list)
-        for case_idx, params in enumerate(self.params_list):
-            logger.info("=" * 60)
-            logger.info(f"=== Case {case_idx + 1}/{total_cases}: {params} ===")
-            logger.info("=" * 60)
+        try:
+            for case_idx, params in enumerate(self.params_list):
+                logger.info("=" * 60)
+                logger.info(f"=== Case {case_idx + 1}/{total_cases}: {params} ===")
+                logger.info("=" * 60)
 
-            # Generate tensors using golden.py
-            logger.info("=== Generating Inputs ===")
-            tensors = self._golden_module.generate_inputs(params)
+                # Generate tensors using golden.py
+                logger.info("=== Generating Inputs ===")
+                tensors = self._golden_module.generate_inputs(params)
 
-            # Convert any PyTorch tensors to numpy
-            tensors = {k: _to_numpy(v) for k, v in tensors.items()}
+                # Convert any PyTorch tensors to numpy
+                tensors = {k: _to_numpy(v) for k, v in tensors.items()}
 
-            # Identify inputs and outputs
-            inputs, outputs = self._identify_outputs(tensors)
-            logger.info(f"Inputs: {list(inputs.keys())}")
-            logger.info(f"Outputs: {list(outputs.keys())}")
+                # Identify inputs and outputs
+                inputs, outputs = self._identify_outputs(tensors)
+                logger.info(f"Inputs: {list(inputs.keys())}")
+                logger.info(f"Outputs: {list(outputs.keys())}")
 
-            # Build func_args automatically
-            func_args, arg_types, arg_sizes = self._build_func_args(tensors)
+                # Build func_args automatically
+                func_args, arg_types, arg_sizes = self._build_func_args(tensors)
 
-            # Determine actual tensor order for debugging
-            order = self.tensor_order if self.tensor_order else list(tensors.keys())
-            logger.debug(f"Tensor order: {order}")
-            logger.debug(f"func_args count: {len(func_args)}")
+                # Determine actual tensor order for debugging
+                order = self.tensor_order if self.tensor_order else list(tensors.keys())
+                logger.debug(f"Tensor order: {order}")
+                logger.debug(f"func_args count: {len(func_args)}")
 
-            # Create and initialize runtime (including kernel registration)
-            logger.info("=== Initializing Runtime ===")
-            runtime = Runtime()
-            run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
-            if run_env:
-                logger.debug(f"Runtime init env overrides: {run_env}")
-            with _temporary_env(run_env):
-                runtime.initialize(
-                    orch_so_binary,
-                    self.orchestration["function_name"],
-                    func_args,
-                    arg_types=arg_types,
-                    arg_sizes=arg_sizes,
-                    kernel_binaries=kernel_binaries,
+                # Create and initialize runtime (including kernel registration)
+                logger.info("=== Initializing Runtime ===")
+                runtime = Runtime()
+                run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
+                if aicpu_orch_plugin_path is not None:
+                    run_env = dict(run_env)
+                    run_env["PTO_AICPU_ORCH_SO"] = str(aicpu_orch_plugin_path)
+                    run_env["PTO_AICPU_ORCH_FUNC"] = str(
+                        self.aicpu_orchestration.get("function_name", "build_graph_aicpu")
+                    )
+                if run_env:
+                    logger.debug(f"Runtime init env overrides: {run_env}")
+                with _temporary_env(run_env):
+                    runtime.initialize(
+                        orch_so_binary,
+                        self.orchestration["function_name"],
+                        func_args,
+                        arg_types=arg_types,
+                        arg_sizes=arg_sizes,
+                        kernel_binaries=kernel_binaries,
+                    )
+
+                # Launch runtime
+                logger.info("=== Launching Runtime ===")
+                logger.debug(f"Device ID: {self.device_id}")
+                logger.debug(f"AICPU threads: {self.aicpu_thread_num}, Block dim: {self.block_dim}")
+                import sys
+
+                sys.stdout.flush()  # Ensure output is visible before potential hang
+
+                launch_runtime(
+                    runtime,
+                    aicpu_thread_num=self.aicpu_thread_num,
+                    block_dim=self.block_dim,
+                    device_id=self.device_id,
+                    aicpu_binary=aicpu_binary,
+                    aicore_binary=aicore_binary,
                 )
 
-            # Launch runtime
-            logger.info("=== Launching Runtime ===")
-            logger.debug(f"Device ID: {self.device_id}")
-            logger.debug(f"AICPU threads: {self.aicpu_thread_num}, Block dim: {self.block_dim}")
-            import sys
-            sys.stdout.flush()  # Ensure output is visible before potential hang
+                logger.info("Launch completed successfully")  # Will only print if not hung
 
-            launch_runtime(
-                runtime,
-                aicpu_thread_num=self.aicpu_thread_num,
-                block_dim=self.block_dim,
-                device_id=self.device_id,
-                aicpu_binary=aicpu_binary,
-                aicore_binary=aicore_binary,
-            )
+                # Finalize
+                logger.info("=== Finalizing Runtime ===")
+                runtime.finalize()
 
-            logger.info("Launch completed successfully")  # Will only print if not hung
+                # Compute golden and compare
+                logger.info("=== Comparing Results ===")
+                self._compare_with_golden(tensors, inputs, outputs, params)
 
-            # Finalize
-            logger.info("=== Finalizing Runtime ===")
-            runtime.finalize()
+                logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
 
-            # Compute golden and compare
-            logger.info("=== Comparing Results ===")
-            self._compare_with_golden(tensors, inputs, outputs, params)
-
-            logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
-
-        logger.info("=" * 60)
-        logger.info(f"=== All {total_cases} cases passed ===")
-        logger.info("=" * 60)
+            logger.info("=" * 60)
+            logger.info(f"=== All {total_cases} cases passed ===")
+            logger.info("=" * 60)
+        finally:
+            if aicpu_orch_plugin_path is not None:
+                try:
+                    aicpu_orch_plugin_path.unlink()
+                except FileNotFoundError:
+                    pass
 
     def _compare_with_golden(
         self,
