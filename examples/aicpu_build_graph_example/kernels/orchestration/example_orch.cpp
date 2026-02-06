@@ -120,7 +120,12 @@ int prepare_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
         return -1;
     }
 
-    runtime->set_aicpu_orch_so(so_bytes.data(), so_bytes.size());
+    if (!runtime->try_set_aicpu_orch_so(so_bytes.data(), so_bytes.size())) {
+        std::cerr << "prepare_example_graph: failed to embed AICPU orchestration plugin into Runtime "
+                     "(size="
+                  << so_bytes.size() << " bytes, max=" << RUNTIME_MAX_AICPU_ORCH_SO_SIZE << " bytes)\n";
+        return -1;
+    }
     memset(runtime->aicpu_orch_func_name, 0, sizeof(runtime->aicpu_orch_func_name));
     if (aicpu_orch_func && aicpu_orch_func[0] != '\0') {
         strncpy(runtime->aicpu_orch_func_name, aicpu_orch_func, sizeof(runtime->aicpu_orch_func_name) - 1);
@@ -129,7 +134,8 @@ int prepare_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
     }
 
     std::cout << "prepare_example_graph: loaded AICPU orch plugin " << (aicpu_orch_path ? aicpu_orch_path : "<unset>")
-              << " (" << so_bytes.size() << " bytes), func=" << runtime->aicpu_orch_func_name << "\n";
+              << " (file_bytes=" << so_bytes.size() << ", embedded_bytes=" << runtime->get_aicpu_orch_so_size()
+              << "), func=" << runtime->aicpu_orch_func_name << "\n";
 
     return 0;
 }

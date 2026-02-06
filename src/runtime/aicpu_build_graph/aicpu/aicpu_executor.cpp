@@ -29,7 +29,6 @@ struct CoreInfo {
     CoreType core_type;
 };
 
-extern "C" int build_graph_aicpu(Runtime* runtime);
 extern "C" int aicpu_runtime_add_task(
     Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type, uint64_t function_bin_addr);
 extern "C" void aicpu_runtime_add_successor_conditional(Runtime* runtime, int from_task, int to_task);
@@ -83,7 +82,9 @@ int build_graph_via_aicpu_plugin(Runtime* runtime, int thread_idx) {
     const void* so_data_v = runtime->get_aicpu_orch_so_data();
     size_t so_size = runtime->get_aicpu_orch_so_size();
     if (so_data_v == nullptr || so_size == 0) {
-        return -2;  // caller fallback
+        DEV_ERROR("Thread %d: AICPU orch plugin not embedded (size=0). Host orchestration must embed plugin bytes.",
+            thread_idx);
+        return -1;
     }
 
     const char* sym = (runtime->aicpu_orch_func_name[0] != '\0') ? runtime->aicpu_orch_func_name : "build_graph_aicpu";
@@ -118,10 +119,7 @@ int build_graph_via_aicpu_plugin(Runtime* runtime, int thread_idx) {
             sym);
 
         if (write_bytes_to_file(so_path, so_data, so_size) != 0) {
-            DEV_INFO("Thread %d: Cannot create/write plugin at %s (errno=%d), trying next",
-                thread_idx,
-                so_path,
-                errno);
+            DEV_INFO("Thread %d: Cannot create/write plugin at %s (errno=%d), trying next", thread_idx, so_path, errno);
             continue;
         }
 
@@ -280,7 +278,8 @@ int AicpuExecutor::init(Runtime* runtime) {
     for (int t = BUILDER_THREAD_NUM; t < thread_num_; ++t) {
         if (thread_core_counts_[t] <= 0) {
             DEV_ERROR(
-                "Invalid core assignment: scheduler thread %d has core_num=%d (aic=%d aiv=%d total=%d sched_threads=%d)",
+                "Invalid core assignment: scheduler thread %d has core_num=%d (aic=%d aiv=%d total=%d "
+                "sched_threads=%d)",
                 t,
                 thread_core_counts_[t],
                 aic_count_,
@@ -741,10 +740,6 @@ int AicpuExecutor::run(Runtime* runtime) {
         DEV_INFO("Thread %d: Builder starting (build_mode=%d)", thread_idx, runtime ? runtime->build_mode : -1);
 
         int rc = build_graph_via_aicpu_plugin(runtime, thread_idx);
-        if (rc == -2) {
-            DEV_INFO("Thread %d: No AICPU plugin provided, falling back to linked build_graph_aicpu()", thread_idx);
-            rc = build_graph_aicpu(runtime);
-        }
         if (rc != 0) {
             DEV_ERROR("Thread %d: build_graph_aicpu failed rc=%d", thread_idx, rc);
             build_failed_.store(true, std::memory_order_release);

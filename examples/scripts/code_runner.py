@@ -286,18 +286,6 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
     return pto_isa_root
 
 
-def _default_runtime_env(runtime_name: str, kernels_dir: Path) -> Dict[str, str]:
-    """
-    Default per-runtime environment variables used during runtime compilation.
-
-    Keep these defaults minimal. Examples can override/extend them via
-    `RUNTIME_ENV` in `kernel_config.py`.
-    """
-    # Always expose the kernels dir. Runtimes may optionally use it in their
-    # build_config.py (e.g., to pick up `kernels/aicpu/*.cpp` sources).
-    return {"PTO_KERNELS_DIR": str(kernels_dir)}
-
-
 def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> Dict[str, str]:
     """
     Optional per-example environment variables for runtime compilation.
@@ -305,8 +293,9 @@ def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> Dict[
     `kernel_config.py` may define:
         RUNTIME_ENV = {"ENV_KEY": "value", ...}
 
-    If a value looks like a path (ENV key ends with _DIR/_PATH) and is not
-    absolute, it is resolved relative to `kernels_dir`.
+    If a value looks like a path (ENV key ends with _DIR/_PATH, or is
+    PTO_AICPU_ORCH_SO) and is not absolute, it is resolved relative to
+    `kernels_dir`.
     """
     runtime_env = getattr(kernel_config_module, "RUNTIME_ENV", None)
     if not isinstance(runtime_env, dict):
@@ -317,7 +306,8 @@ def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> Dict[
         if not isinstance(k, str):
             continue
         s = str(v)
-        if (k.endswith("_DIR") or k.endswith("_PATH")) and s:
+        is_path_like = k.endswith("_DIR") or k.endswith("_PATH") or (k == "PTO_AICPU_ORCH_SO")
+        if is_path_like and s:
             p = Path(s)
             if not p.is_absolute():
                 s = str((kernels_dir / p).resolve())
@@ -458,9 +448,9 @@ class CodeRunner:
         os.close(fd)
         out_path = Path(out_s)
 
-        print("\n=== Compiling AICPU Orchestration Plugin ===")
-        print(f"AICPU plugin entry: {func_name}")
-        print(f"Output: {out_path}")
+        logger.info("=== Compiling AICPU Orchestration Plugin ===")
+        logger.info(f"AICPU plugin entry: {func_name}")
+        logger.info(f"Output: {out_path}")
 
         try:
             out_s = pto_compiler.compile_aicpu_orchestration_plugin(
@@ -480,7 +470,7 @@ class CodeRunner:
         if not out_path.is_file():
             raise RuntimeError(f"AICPU orchestration plugin compilation succeeded but output not found: {out_path}")
 
-        print(f"Compiled AICPU orchestration plugin: {out_path} ({out_path.stat().st_size} bytes)")
+        logger.info(f"Compiled AICPU orchestration plugin: {out_path} ({out_path.stat().st_size} bytes)")
         return out_path
 
     def _load_golden_module(self):
@@ -648,8 +638,7 @@ class CodeRunner:
         extra_aicpu_include_dirs = None
 
         try:
-            runtime_env = _default_runtime_env(self.runtime_name, self.kernels_dir)
-            runtime_env.update(_kernel_config_runtime_env(self._kernel_config, self.kernels_dir))
+            runtime_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
             with _temporary_env(runtime_env):
                 host_binary, aicpu_binary, aicore_binary = builder.build(
                     self.runtime_name,

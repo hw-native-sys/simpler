@@ -31,28 +31,28 @@ Runtime::Runtime() {
         memset(tasks[i].args, 0, sizeof(tasks[i].args));
         memset(tasks[i].fanout, 0, sizeof(tasks[i].fanout));
     }
-	    next_task_id = 0;
-	    initial_ready_count = 0;
-	    worker_count = 0;
-	    sche_cpu_num = 1;
-	    tensor_pair_count = 0;
-	    device_alloc_count = 0;
+    next_task_id = 0;
+    initial_ready_count = 0;
+    worker_count = 0;
+    sche_cpu_num = 1;
+    tensor_pair_count = 0;
+    device_alloc_count = 0;
 
-	    orch_argc = 0;
-	    memset(orch_args, 0, sizeof(orch_args));
-	    memset(kernel_addrs, 0, sizeof(kernel_addrs));
-	    aicpu_orch_so_size = 0;
-	    memset(aicpu_orch_so_storage, 0, sizeof(aicpu_orch_so_storage));
-	    memset(aicpu_orch_func_name, 0, sizeof(aicpu_orch_func_name));
-	    strncpy(aicpu_orch_func_name, "build_graph_aicpu", sizeof(aicpu_orch_func_name) - 1);
-	    build_mode = 1;  // default to concurrent build||schedule
-	    aicpu_build_api = {};
-	}
+    orch_argc = 0;
+    memset(orch_args, 0, sizeof(orch_args));
+    memset(kernel_addrs, 0, sizeof(kernel_addrs));
+    aicpu_orch_so_size = 0;
+    memset(aicpu_orch_so_storage, 0, sizeof(aicpu_orch_so_storage));
+    memset(aicpu_orch_func_name, 0, sizeof(aicpu_orch_func_name));
+    strncpy(aicpu_orch_func_name, "build_graph_aicpu", sizeof(aicpu_orch_func_name) - 1);
+    build_mode = 1;  // default to concurrent build||schedule
+    aicpu_build_api = {};
+}
 
-void Runtime::set_aicpu_orch_so(const void* data, size_t size) {
+bool Runtime::try_set_aicpu_orch_so(const void* data, size_t size) {
     if (data == nullptr || size == 0) {
         aicpu_orch_so_size = 0;
-        return;
+        return false;
     }
     if (size > sizeof(aicpu_orch_so_storage)) {
         fprintf(stderr,
@@ -60,19 +60,18 @@ void Runtime::set_aicpu_orch_so(const void* data, size_t size) {
             size,
             sizeof(aicpu_orch_so_storage));
         aicpu_orch_so_size = 0;
-        return;
+        return false;
     }
     memcpy(aicpu_orch_so_storage, data, size);
     aicpu_orch_so_size = static_cast<uint32_t>(size);
+    return true;
 }
 
-const void* Runtime::get_aicpu_orch_so_data() const {
-    return aicpu_orch_so_size > 0 ? aicpu_orch_so_storage : nullptr;
-}
+void Runtime::set_aicpu_orch_so(const void* data, size_t size) { (void)try_set_aicpu_orch_so(data, size); }
 
-size_t Runtime::get_aicpu_orch_so_size() const {
-    return static_cast<size_t>(aicpu_orch_so_size);
-}
+const void* Runtime::get_aicpu_orch_so_data() const { return aicpu_orch_so_size > 0 ? aicpu_orch_so_storage : nullptr; }
+
+size_t Runtime::get_aicpu_orch_so_size() const { return static_cast<size_t>(aicpu_orch_so_size); }
 
 // =============================================================================
 // Task Management
@@ -101,8 +100,8 @@ int Runtime::add_task(uint64_t* args, int num_args, int func_id, CoreType core_t
     if (args && num_args > 0) {
         memcpy(task->args, args, num_args * sizeof(uint64_t));
     }
-    task->function_bin_addr = 0;    // Set by AICPU builder for this runtime
-    task->core_type = core_type;    // Set core type
+    task->function_bin_addr = 0;  // Set by AICPU builder for this runtime
+    task->core_type = core_type;  // Set core type
     task->fanin = 0;
     task->fanout_count = 0;
     task->published.store(0, std::memory_order_release);
@@ -285,26 +284,14 @@ void Runtime::record_device_alloc(void* dev_ptr) {
     device_alloc_count++;
 }
 
-TensorPair* Runtime::get_tensor_pairs() {
-    return tensor_pairs;
-}
+TensorPair* Runtime::get_tensor_pairs() { return tensor_pairs; }
 
-int Runtime::get_tensor_pair_count() const {
-    return tensor_pair_count;
-}
+int Runtime::get_tensor_pair_count() const { return tensor_pair_count; }
 
-DeviceAlloc* Runtime::get_device_allocs() {
-    return device_allocs;
-}
+DeviceAlloc* Runtime::get_device_allocs() { return device_allocs; }
 
-int Runtime::get_device_alloc_count() const {
-    return device_alloc_count;
-}
+int Runtime::get_device_alloc_count() const { return device_alloc_count; }
 
-void Runtime::clear_tensor_pairs() {
-    tensor_pair_count = 0;
-}
+void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }
 
-void Runtime::clear_device_allocs() {
-    device_alloc_count = 0;
-}
+void Runtime::clear_device_allocs() { device_alloc_count = 0; }

@@ -284,6 +284,10 @@ public:
     uint32_t aicpu_orch_so_size;
     char aicpu_orch_func_name[64];
 
+    // Attempt to embed AICPU orchestration plugin bytes into Runtime.
+    // Returns false on invalid input or if the plugin is larger than the
+    // built-in storage.
+    bool try_set_aicpu_orch_so(const void* data, size_t size);
     void set_aicpu_orch_so(const void* data, size_t size);
     const void* get_aicpu_orch_so_data() const;
     size_t get_aicpu_orch_so_size() const;
