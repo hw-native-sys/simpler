@@ -55,6 +55,8 @@ extern "C" {
  * @param orch_func_name    Name of the orchestration function to call
  * @param func_args         Arguments for orchestration (host pointers, sizes, etc.)
  * @param func_args_count   Number of arguments
+ * @param arg_types         Array describing each argument's type (unused for host orchestration)
+ * @param arg_sizes         Array of sizes for pointer arguments (unused for host orchestration)
  * @return 0 on success, -1 on failure
  */
 int init_runtime_impl(Runtime *runtime,
@@ -62,7 +64,13 @@ int init_runtime_impl(Runtime *runtime,
                     size_t orch_so_size,
                     const char* orch_func_name,
                     uint64_t* func_args,
-                    int func_args_count) {
+                    int func_args_count,
+                    int* arg_types,
+                    uint64_t* arg_sizes) {
+    // Unused parameters for host orchestration
+    (void)arg_types;
+    (void)arg_sizes;
+
     // Validate inputs
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");

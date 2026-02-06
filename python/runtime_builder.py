@@ -57,12 +57,20 @@ class RuntimeBuilder:
         """Return names of discovered runtime implementations."""
         return list(self._runtimes.keys())
 
-    def build(self, name: str) -> tuple:
+    def build(
+        self,
+        name: str,
+        extra_aicpu_source_dirs: list = None,
+        extra_aicpu_include_dirs: list = None,
+    ) -> tuple:
         """
         Build a specific runtime implementation by name.
 
         Args:
             name: Name of the runtime implementation (e.g. 'host_build_graph')
+            extra_aicpu_source_dirs: Additional source directories for AICPU compilation
+                                     (used by rt2 for device-side orchestration)
+            extra_aicpu_include_dirs: Additional include directories for AICPU compilation
 
         Returns:
             Tuple of (host_binary, aicpu_binary, aicore_binary) as bytes
@@ -99,6 +107,13 @@ class RuntimeBuilder:
         aicpu_cfg = build_config["aicpu"]
         aicpu_include_dirs = [str((config_dir / p).resolve()) for p in aicpu_cfg["include_dirs"]]
         aicpu_source_dirs = [str((config_dir / p).resolve()) for p in aicpu_cfg["source_dirs"]]
+
+        # Add extra source/include dirs for device-side orchestration (rt2)
+        if extra_aicpu_include_dirs:
+            aicpu_include_dirs.extend(extra_aicpu_include_dirs)
+        if extra_aicpu_source_dirs:
+            aicpu_source_dirs.extend(extra_aicpu_source_dirs)
+
         aicpu_binary = compiler.compile("aicpu", aicpu_include_dirs, aicpu_source_dirs)
 
         # Compile Host runtime

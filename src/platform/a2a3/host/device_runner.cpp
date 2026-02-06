@@ -260,10 +260,12 @@ int DeviceRunner::run(Runtime& runtime,
         return -1;
     }
 
-    // Validate even distribution: block_dim must be divisible by launch_aicpu_num
-    if (block_dim % launch_aicpu_num != 0) {
-        LOG_ERROR("block_dim (%d) must be evenly divisible by launch_aicpu_num (%d)",
-                      block_dim, launch_aicpu_num);
+    // Validate even distribution: block_dim must be divisible by scheduler thread count
+    // When launch_aicpu_num == 4: 3 schedulers + 1 orchestrator (thread 3 has 0 cores)
+    int scheduler_thread_num = (launch_aicpu_num == 4) ? 3 : launch_aicpu_num;
+    if (block_dim % scheduler_thread_num != 0) {
+        LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
+                      block_dim, scheduler_thread_num);
         return -1;
     }
 
@@ -302,13 +304,13 @@ int DeviceRunner::run(Runtime& runtime,
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
     }
 
-    // Set function_bin_addr for all tasks (NEW - Runtime function pointer
-    // dispatch)
+    // Set function_bin_addr for all tasks from Runtime's func_id_to_addr_[] array
+    // (addresses were stored there during init_runtime via upload_kernel_binary)
     LOG_DEBUG("\n=== Setting function_bin_addr for Tasks ===");
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task* task = runtime.get_task(i);
         if (task != nullptr) {
-            uint64_t addr = get_function_bin_addr(task->func_id);
+            uint64_t addr = runtime.get_function_bin_addr(task->func_id);
             task->function_bin_addr = addr;
             LOG_DEBUG("  Task %d (func_id=%d) -> function_bin_addr=0x%lx",
                           i, task->func_id, addr);
@@ -495,35 +497,36 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime* runtime) {
 }
 
 // =============================================================================
-// Kernel Binary Registration (Python provides pre-extracted .text section)
+// Kernel Binary Upload (returns device address for caller to store in Runtime)
 // =============================================================================
 
-int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t bin_size) {
+uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data, size_t bin_size) {
     if (bin_data == nullptr || bin_size == 0) {
         LOG_ERROR("Invalid kernel binary data");
-        return -1;
-    }
-
-    // Device must be set first (set_device() must be called before register_kernel())
-    if (stream_aicpu_ == nullptr) {
-        LOG_ERROR("Device not set. Call set_device() before register_kernel()");
-        return -1;
-    }
-
-    // Skip if already registered
-    if (func_id_to_addr_.find(func_id) != func_id_to_addr_.end()) {
-        LOG_INFO("Kernel func_id=%d already registered, skipping", func_id);
         return 0;
     }
 
-    LOG_DEBUG("Registering kernel: func_id=%d, size=%zu bytes", func_id, bin_size);
+    // Device must be set first (set_device() must be called before upload_kernel_binary())
+    if (stream_aicpu_ == nullptr) {
+        LOG_ERROR("Device not set. Call set_device() before upload_kernel_binary()");
+        return 0;
+    }
+
+    // Return cached address if already uploaded
+    auto it = func_id_to_addr_.find(func_id);
+    if (it != func_id_to_addr_.end()) {
+        LOG_INFO("Kernel func_id=%d already uploaded, returning cached address", func_id);
+        return it->second;
+    }
+
+    LOG_DEBUG("Uploading kernel binary: func_id=%d, size=%zu bytes", func_id, bin_size);
 
     // Allocate device GM memory (size field + binary data)
     uint64_t alloc_size = sizeof(uint64_t) + bin_size;
     void* gm_addr = mem_alloc_.alloc(alloc_size);
     if (gm_addr == nullptr) {
         LOG_ERROR("Failed to allocate device GM memory for kernel func_id=%d", func_id);
-        return -1;
+        return 0;
     }
 
     // Build host buffer with CoreFunctionBin structure (size + data)
@@ -532,28 +535,21 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
     *size_ptr = bin_size;
     std::memcpy(host_buf.data() + sizeof(uint64_t), bin_data, bin_size);
 
-        // Step 3: Copy to device
-        int rc = rtMemcpy(gm_addr, alloc_size, host_buf.data(), alloc_size, RT_MEMCPY_HOST_TO_DEVICE);
-        if (rc != 0) {
-            LOG_ERROR("rtMemcpy to device failed: %d", rc);
-            mem_alloc_.free(gm_addr);
-            return rc;
-        }
+    // Copy to device
+    int rc = rtMemcpy(gm_addr, alloc_size, host_buf.data(), alloc_size, RT_MEMCPY_HOST_TO_DEVICE);
+    if (rc != 0) {
+        LOG_ERROR("rtMemcpy to device failed: %d", rc);
+        mem_alloc_.free(gm_addr);
+        return 0;
+    }
 
     // Calculate function_bin_addr (skip size field to get actual code address)
     uint64_t function_bin_addr = reinterpret_cast<uint64_t>(gm_addr) + sizeof(uint64_t);
+
+    // Cache for later reuse and cleanup
     func_id_to_addr_[func_id] = function_bin_addr;
 
     LOG_DEBUG("  func_id=%d -> function_bin_addr=0x%lx", func_id, function_bin_addr);
 
-    return 0;
-}
-
-uint64_t DeviceRunner::get_function_bin_addr(int func_id) {
-    auto it = func_id_to_addr_.find(func_id);
-    if (it == func_id_to_addr_.end()) {
-        LOG_WARN("function_bin_addr not found for func_id=%d", func_id);
-        return 0;
-    }
-    return it->second;
+    return function_bin_addr;
 }

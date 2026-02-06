@@ -305,7 +305,7 @@ class CodeRunner:
         self,
         kernels_dir: str,
         golden_path: str,
-        runtime_name: str = "host_build_graph",
+        runtime_name: Optional[str] = None,
         device_id: Optional[int] = None,
         platform: str = "a2a3",
     ):
@@ -314,7 +314,6 @@ class CodeRunner:
         
         self.kernels_dir = Path(kernels_dir).resolve()
         self.golden_path = Path(golden_path).resolve()
-        self.runtime_name = runtime_name
         self.platform = platform
         self.project_root = _get_project_root()
 
@@ -338,9 +337,15 @@ class CodeRunner:
         self.output_names = getattr(self._golden_module, '__outputs__', None)
         self.tensor_order = getattr(self._golden_module, 'TENSOR_ORDER', None)
 
-        # Runtime configuration
-        self.aicpu_thread_num = 3
-        self.block_dim = 3
+        # Runtime configuration - read from kernel_config or use defaults
+        runtime_config = getattr(self._kernel_config, 'RUNTIME_CONFIG', {})
+        self.aicpu_thread_num = runtime_config.get('aicpu_thread_num', 3)
+        self.block_dim = runtime_config.get('block_dim', 3)
+
+        # Resolve runtime_name from RUNTIME_CONFIG if not explicitly provided
+        if runtime_name is None:
+            runtime_name = runtime_config.get('runtime', 'host_build_graph')
+        self.runtime_name = runtime_name
 
     def _load_kernel_config(self):
         """Load kernel_config.py from kernels directory."""
@@ -400,9 +405,9 @@ class CodeRunner:
 
         return inputs, outputs
 
-    def _build_func_args(self, tensors: Dict[str, np.ndarray]) -> List[int]:
+    def _build_func_args(self, tensors: Dict[str, np.ndarray]) -> Tuple[List[int], List[int], List[int]]:
         """
-        Build func_args from tensors automatically.
+        Build func_args, arg_types, and arg_sizes from tensors automatically.
 
         Convention for orchestration function signature:
             int BuildGraph(Runtime* runtime, uint64_t* args, int arg_count)
@@ -414,17 +419,27 @@ class CodeRunner:
             tensors: Dict of numpy arrays
 
         Returns:
-            List of func_args values (pointers, sizes, count)
+            Tuple of (func_args, arg_types, arg_sizes)
         """
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR
+
         # Determine tensor order
         if self.tensor_order:
             order = self.tensor_order
         else:
             order = list(tensors.keys())
 
-        ptrs = []
-        sizes = []
+        # Identify outputs
+        if self.output_names:
+            output_set = set(self.output_names)
+        else:
+            output_set = {k for k in tensors.keys() if k.startswith('out_')}
 
+        func_args = []
+        arg_types = []
+        arg_sizes = []
+
+        # Add pointers
         for name in order:
             if name not in tensors:
                 raise KeyError(
@@ -432,13 +447,30 @@ class CodeRunner:
                     f"Available tensors: {list(tensors.keys())}"
                 )
             arr = tensors[name]
-            ptrs.append(arr.ctypes.data)
-            sizes.append(arr.nbytes)
+            func_args.append(arr.ctypes.data)
 
-        # Get element count from first tensor
+            # Determine arg type based on whether it's an output
+            if name in output_set:
+                arg_types.append(ARG_OUTPUT_PTR)
+            else:
+                arg_types.append(ARG_INPUT_PTR)
+
+            arg_sizes.append(arr.nbytes)
+
+        # Add sizes (as scalars)
+        for name in order:
+            arr = tensors[name]
+            func_args.append(arr.nbytes)
+            arg_types.append(ARG_SCALAR)
+            arg_sizes.append(0)
+
+        # Add element count (as scalar)
         count = tensors[order[0]].size
+        func_args.append(count)
+        arg_types.append(ARG_SCALAR)
+        arg_sizes.append(0)
 
-        return ptrs + sizes + [count]
+        return func_args, arg_types, arg_sizes
 
     def skip_if_no_env(self) -> None:
         """Raise error if required environment is not available."""
@@ -466,7 +498,7 @@ class CodeRunner:
         """
         # Import runtime modules (deferred to allow skip_if_no_env to work)
         from runtime_builder import RuntimeBuilder
-        from bindings import bind_host_binary, register_kernel, set_device, launch_runtime
+        from bindings import bind_host_binary, set_device, launch_runtime
         from elf_parser import extract_text_section
 
         # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
@@ -483,8 +515,18 @@ class CodeRunner:
         logger.info(f"=== Building Runtime: {self.runtime_name} (platform: {self.platform}) ===")
         builder = RuntimeBuilder(runtime_root=self.project_root, platform=self.platform)
         pto_compiler = builder.get_pto_compiler()
+
+        # For rt2, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
+        # NOT compiled into AICPU binary
+        extra_aicpu_source_dirs = None
+        extra_aicpu_include_dirs = None
+
         try:
-            host_binary, aicpu_binary, aicore_binary = builder.build(self.runtime_name)
+            host_binary, aicpu_binary, aicore_binary = builder.build(
+                self.runtime_name,
+                extra_aicpu_source_dirs=extra_aicpu_source_dirs,
+                extra_aicpu_include_dirs=extra_aicpu_include_dirs,
+            )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to build runtime '{self.runtime_name}' for platform '{self.platform}'.\n"
@@ -506,18 +548,31 @@ class CodeRunner:
             str(self.project_root / "src" / "runtime" / self.runtime_name / "runtime"),
         ] + pto_compiler.get_platform_include_dirs()
 
-        orch_so_binary = pto_compiler.compile_orchestration(
-            self.orchestration["source"],
-            extra_include_dirs=orch_include_dirs,
-        )
-        logger.debug(f"Compiled orchestration: {len(orch_so_binary)} bytes")
+        # For rt2, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
+        if self.runtime_name == "rt2":
+            logger.info("RT2: Compiling orchestration as separate SO for dlopen")
+            orch_so_binary = pto_compiler.compile_orchestration(
+                self.orchestration["source"],
+                extra_include_dirs=orch_include_dirs,
+                runtime_name="rt2",
+            )
+            logger.debug(f"Compiled orchestration SO: {len(orch_so_binary)} bytes")
+        else:
+            orch_so_binary = pto_compiler.compile_orchestration(
+                self.orchestration["source"],
+                extra_include_dirs=orch_include_dirs,
+                runtime_name=self.runtime_name,
+            )
+            logger.debug(f"Compiled orchestration: {len(orch_so_binary)} bytes")
 
-        # Step 4: Compile and register kernels
-        logger.info("=== Compiling and Registering Kernels ===")
+        # Step 4: Compile kernels (will be registered during runtime.initialize)
+        logger.info("=== Compiling Kernels ===")
 
         # Get PTO_ISA_ROOT (use default for sim platform)
         pto_isa_root = os.environ.get("PTO_ISA_ROOT", "/tmp/unused")
 
+        # Build list of (func_id, binary) tuples for passing to runtime.initialize()
+        kernel_binaries = []
         for kernel in self.kernels:
             logger.info(f"Compiling kernel: {kernel['source']} (func_id={kernel['func_id']})")
             incore_o = pto_compiler.compile_incore(
@@ -532,10 +587,9 @@ class CodeRunner:
             else:
                 kernel_bin = extract_text_section(incore_o)  # .text only for mmap
 
-            # All kernels use unified entry point "kernel_entry"
-            register_kernel(kernel["func_id"], kernel_bin)
+            kernel_binaries.append((kernel["func_id"], kernel_bin))
 
-        logger.info("All kernels compiled and registered")
+        logger.info(f"Compiled {len(kernel_binaries)} kernel(s)")
 
         # Step 5: Run each parameter set
         total_cases = len(self.params_list)
@@ -557,17 +611,24 @@ class CodeRunner:
             logger.info(f"Outputs: {list(outputs.keys())}")
 
             # Build func_args automatically
-            func_args = self._build_func_args(tensors)
+            func_args, arg_types, arg_sizes = self._build_func_args(tensors)
 
             # Determine actual tensor order for debugging
             order = self.tensor_order if self.tensor_order else list(tensors.keys())
             logger.debug(f"Tensor order: {order}")
             logger.debug(f"func_args count: {len(func_args)}")
 
-            # Create and initialize runtime
+            # Create and initialize runtime (including kernel registration)
             logger.info("=== Initializing Runtime ===")
             runtime = Runtime()
-            runtime.initialize(orch_so_binary, self.orchestration["function_name"], func_args)
+            runtime.initialize(
+                orch_so_binary,
+                self.orchestration["function_name"],
+                func_args,
+                arg_types=arg_types,
+                arg_sizes=arg_sizes,
+                kernel_binaries=kernel_binaries,
+            )
 
             # Launch runtime
             logger.info("=== Launching Runtime ===")

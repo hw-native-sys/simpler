@@ -25,6 +25,17 @@ extern "C" {
 #endif
 
 /**
+ * Argument type for init_runtime.
+ * Describes how each argument should be handled for device orchestration.
+ */
+typedef enum {
+    ARG_SCALAR = 0,      // Scalar value, passed directly
+    ARG_INPUT_PTR = 1,   // Input pointer: device_malloc + copy_to_device
+    ARG_OUTPUT_PTR = 2,  // Output pointer: device_malloc + record for copy-back
+    ARG_INOUT_PTR = 3,   // Input/output: copy_to_device + copy-back
+} ArgType;
+
+/**
  * Opaque pointer types for C interface.
  * These hide the C++ class implementations.
  */
@@ -45,12 +56,15 @@ typedef void* RuntimeHandle;
 size_t get_runtime_size(void);
 
 /**
- * Initialize a runtime with dynamic orchestration.
+ * Initialize a runtime with dynamic orchestration and kernel binaries.
  *
  * Uses placement new to construct Runtime in user-allocated memory.
- * Loads the orchestration shared library from binary data, resolves the
+ * Registers kernel binaries to device memory, storing addresses directly
+ * in Runtime's func_id_to_addr_[] array.
+ * Then loads the orchestration shared library from binary data, resolves the
  * specified function, and calls it to build the task graph.
- * The orchestration function is responsible for device memory management.
+ *
+ * IMPORTANT: set_device() MUST be called before this function if kernel_count > 0.
  *
  * @param runtime           User-allocated memory of size get_runtime_size()
  * @param orch_so_binary    Orchestration shared library binary data
@@ -58,6 +72,12 @@ size_t get_runtime_size(void);
  * @param orch_func_name    Name of the orchestration function to call
  * @param func_args         Arguments for orchestration (host pointers, sizes, etc.)
  * @param func_args_count   Number of arguments
+ * @param arg_types         Array describing each argument's type (ArgType enum)
+ * @param arg_sizes         Array of sizes for pointer arguments (0 for scalars)
+ * @param kernel_func_ids   Array of kernel function IDs (can be NULL if kernel_count == 0)
+ * @param kernel_binaries   Array of pointers to kernel binary data
+ * @param kernel_sizes      Array of kernel binary sizes in bytes
+ * @param kernel_count      Number of kernels to register
  * @return 0 on success, -1 on failure
  */
 int init_runtime(RuntimeHandle runtime,
@@ -65,7 +85,13 @@ int init_runtime(RuntimeHandle runtime,
                 size_t orch_so_size,
                 const char* orch_func_name,
                 uint64_t* func_args,
-                int func_args_count);
+                int func_args_count,
+                int* arg_types,
+                uint64_t* arg_sizes,
+                const int* kernel_func_ids,
+                const uint8_t* const* kernel_binaries,
+                const size_t* kernel_sizes,
+                int kernel_count);
 
 /* ===========================================================================
  * Device Memory API (for use by orchestration functions)
@@ -159,22 +185,43 @@ int finalize_runtime(RuntimeHandle runtime);
  */
 int set_device(int device_id);
 
-/**
- * Register a kernel binary for a func_id.
- *
- * IMPORTANT: set_device() MUST be called before this function.
- * Kernels are immediately copied to device memory.
- *
- * Receives pre-extracted .text section binary data from Python,
- * allocates device GM memory, copies the binary to device,
- * and stores the GM address for later use by launch_runtime().
- *
- * @param func_id   Function identifier (0, 1, 2, ...)
- * @param bin_data  Kernel .text section binary data
- * @param bin_size  Size of binary data in bytes
- * @return 0 on success, error code on failure
+/* Note: register_kernel() has been internalized into init_runtime().
+ * Kernel binaries are now passed directly to init_runtime() which handles
+ * registration and stores addresses in Runtime's func_id_to_addr_[] array.
  */
-int register_kernel(int func_id, const uint8_t* bin_data, size_t bin_size);
+
+/**
+ * Record a tensor pair for copy-back during finalize.
+ *
+ * Used by orchestration to track host-device memory mappings.
+ * During finalize_runtime(), tensors with non-null host_ptr will be
+ * copied back from device to host, then all device memory is freed.
+ *
+ * @param runtime   Runtime handle
+ * @param host_ptr  Host memory pointer (NULL if no copy-back needed)
+ * @param dev_ptr   Device memory pointer
+ * @param size      Size of tensor in bytes
+ */
+void record_tensor_pair(RuntimeHandle runtime,
+                       void* host_ptr,
+                       void* dev_ptr,
+                       size_t size);
+
+/**
+ * Set PTO2 shared memory pointer for device orchestration.
+ *
+ * @param runtime   Runtime handle
+ * @param dev_ptr   Device pointer to PTO2 shared memory
+ */
+void set_pto2_gm_sm_ptr(RuntimeHandle runtime, void* dev_ptr);
+
+/**
+ * Get PTO2 shared memory size.
+ *
+ * @param runtime   Runtime handle
+ * @return Size in bytes, or 0 if not available
+ */
+int32_t get_pto2_sm_size(RuntimeHandle runtime);
 
 #ifdef __cplusplus
 } /* extern "C" */

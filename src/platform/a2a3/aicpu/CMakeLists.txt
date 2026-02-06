@@ -34,12 +34,11 @@ endif()
 
 add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
 
-# Compile options
+# Compile options (common to both C and C++)
 target_compile_options(aicpu_kernel
     PRIVATE
         -Wall
         -Wextra
-        -std=gnu++17
         -rdynamic
         -O3
         -fPIC
@@ -47,6 +46,8 @@ target_compile_options(aicpu_kernel
         -Wno-error=variadic-macros
         -fno-common
         -g
+        $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>
+        $<$<COMPILE_LANGUAGE:C>:-std=gnu11>
 )
 
 target_include_directories(aicpu_kernel

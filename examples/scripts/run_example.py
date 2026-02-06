@@ -87,12 +87,6 @@ Golden.py interface:
     )
 
     parser.add_argument(
-        "-r", "--runtime",
-        default="host_build_graph",
-        help="Runtime implementation name (default: host_build_graph)"
-    )
-
-    parser.add_argument(
         "-p", "--platform",
         default="a2a3",
         choices=["a2a3", "a2a3sim"],
@@ -176,7 +170,6 @@ Golden.py interface:
         runner = CodeRunner(
             kernels_dir=str(args.kernels),
             golden_path=str(args.golden),
-            runtime_name=args.runtime,
             device_id=args.device,
             platform=args.platform,
         )

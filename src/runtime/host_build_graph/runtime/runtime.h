@@ -55,6 +55,10 @@
 #define RUNTIME_MAX_TENSOR_PAIRS 64
 #endif
 
+#ifndef RUNTIME_MAX_FUNC_ID
+#define RUNTIME_MAX_FUNC_ID 32
+#endif
+
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -188,6 +192,9 @@ private:
   TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
   int tensor_pair_count;
 
+    // Function address mapping (for API compatibility with rt2)
+    uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
+
 public:
     /**
      * Constructor - zero-initialize all arrays
@@ -294,6 +301,35 @@ public:
      * Clear all recorded tensor pairs.
      */
     void clear_tensor_pairs();
+
+    // =========================================================================
+    // Device Orchestration (stub for API compatibility)
+    // =========================================================================
+
+    /**
+     * Set PTO2 shared memory pointer (stub for host_build_graph).
+     * This is a no-op for host orchestration; only used by rt2.
+     */
+    void set_pto2_gm_sm_ptr(void*) { /* no-op */ }
+
+    /**
+     * Get function binary address by func_id.
+     * Used by platform layer to resolve kernel addresses.
+     */
+    uint64_t get_function_bin_addr(int func_id) const {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
+        return func_id_to_addr_[func_id];
+    }
+
+    /**
+     * Set function binary address for a func_id.
+     * Called by platform layer after kernel registration.
+     */
+    void set_function_bin_addr(int func_id, uint64_t addr) {
+        if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
+            func_id_to_addr_[func_id] = addr;
+        }
+    }
 
     // =========================================================================
     // Host API (host-only, not copied to device)

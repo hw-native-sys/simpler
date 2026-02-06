@@ -34,6 +34,11 @@ Runtime::Runtime() {
     worker_count = 0;
     sche_cpu_num = 1;
     tensor_pair_count = 0;
+
+    // Initialize function address mapping
+    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
+        func_id_to_addr_[i] = 0;
+    }
 }
 
 // =============================================================================

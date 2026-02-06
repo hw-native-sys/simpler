@@ -3,10 +3,17 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Dict, Optional
 from toolchain import AICoreToolchain, AICPUToolchain, HostToolchain, HostSimToolchain
 
 logger = logging.getLogger(__name__)
+
+
+# Runtime type to directory mapping
+RUNTIME_DIRS = {
+    "host_build_graph": "host_build_graph",
+    "rt2": "rt2",
+}
 
 
 class BinaryCompiler:
@@ -278,3 +285,97 @@ class BinaryCompiler:
                 binary_data = f.read()
 
         return binary_data
+
+    def get_runtime_dir(self, runtime_type: str = "host_build_graph") -> Path:
+        """
+        Get the runtime directory path for the specified runtime type.
+
+        Args:
+            runtime_type: Runtime type ("host_build_graph" or "rt2")
+
+        Returns:
+            Path to the runtime directory
+
+        Raises:
+            ValueError: If runtime type is invalid
+        """
+        if runtime_type not in RUNTIME_DIRS:
+            raise ValueError(
+                f"Invalid runtime type: {runtime_type}. "
+                f"Supported: {list(RUNTIME_DIRS.keys())}"
+            )
+        return self.project_root / "src" / "runtime" / RUNTIME_DIRS[runtime_type]
+
+    def compile_runtime(
+        self,
+        target_platform: str,
+        runtime_type: str = "host_build_graph",
+    ) -> bytes:
+        """
+        Compile runtime binary for the specified target platform and runtime type.
+
+        This method loads the build configuration from the runtime's build_config.py
+        and compiles the appropriate binary.
+
+        Args:
+            target_platform: Target platform ("aicore", "aicpu", or "host")
+            runtime_type: Runtime type ("host_build_graph" or "rt2")
+
+        Returns:
+            Compiled binary data as bytes
+
+        Raises:
+            ValueError: If target platform or runtime type is invalid
+            RuntimeError: If compilation fails
+        """
+        runtime_dir = self.get_runtime_dir(runtime_type)
+
+        # Load build config from runtime directory
+        import importlib.util
+        config_path = runtime_dir / "build_config.py"
+        if not config_path.exists():
+            raise FileNotFoundError(f"Build config not found: {config_path}")
+
+        spec = importlib.util.spec_from_file_location("build_config", config_path)
+        build_config_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(build_config_module)
+        build_config = build_config_module.BUILD_CONFIG
+
+        if target_platform not in build_config:
+            raise ValueError(
+                f"Invalid target platform: {target_platform}. "
+                f"Available: {list(build_config.keys())}"
+            )
+
+        config = build_config[target_platform]
+
+        # Convert relative paths to absolute paths
+        include_dirs = [str(runtime_dir / d) for d in config["include_dirs"]]
+        source_dirs = [str(runtime_dir / d) for d in config["source_dirs"]]
+
+        print(f"\n[{runtime_type.upper()}] Compiling {target_platform} runtime...")
+        print(f"  Runtime dir: {runtime_dir}")
+        print(f"  Include dirs: {include_dirs}")
+        print(f"  Source dirs: {source_dirs}")
+
+        return self.compile(target_platform, include_dirs, source_dirs)
+
+    def compile_all_runtime(
+        self,
+        runtime_type: str = "host_build_graph",
+    ) -> Dict[str, bytes]:
+        """
+        Compile all runtime binaries (aicore, aicpu, host) for the specified runtime type.
+
+        Args:
+            runtime_type: Runtime type ("host_build_graph" or "rt2")
+
+        Returns:
+            Dictionary mapping target platform to compiled binary data
+        """
+        return {
+            "aicore": self.compile_runtime("aicore", runtime_type),
+            "aicpu": self.compile_runtime("aicpu", runtime_type),
+            "host": self.compile_runtime("host", runtime_type),
+        }
+

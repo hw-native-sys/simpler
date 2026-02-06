@@ -26,7 +26,9 @@ int init_runtime_impl(Runtime* runtime,
                     size_t orch_so_size,
                     const char* orch_func_name,
                     uint64_t* func_args,
-                    int func_args_count);
+                    int func_args_count,
+                    int* arg_types,
+                    uint64_t* arg_sizes);
 int validate_runtime_impl(Runtime* runtime);
 
 /* Forward declarations for device memory functions used in init_runtime */
@@ -48,14 +50,18 @@ int init_runtime(RuntimeHandle runtime,
                 size_t orch_so_size,
                 const char* orch_func_name,
                 uint64_t* func_args,
-                int func_args_count) {
+                int func_args_count,
+                int* arg_types,
+                uint64_t* arg_sizes,
+                const int* kernel_func_ids,
+                const uint8_t* const* kernel_binaries,
+                const size_t* kernel_sizes,
+                int kernel_count) {
     if (runtime == NULL) {
         return -1;
     }
-    if (orch_so_binary == NULL || orch_so_size == 0 || orch_func_name == NULL) {
-        LOG_ERROR("Invalid orchestration parameters");
-        return -1;
-    }
+    // Note: orchestration parameters may be empty for device-side orchestration (rt2)
+    // Validation is done in init_runtime_impl which knows the runtime type
 
     try {
         // Placement new to construct Runtime in user-allocated memory
@@ -67,9 +73,35 @@ int init_runtime(RuntimeHandle runtime,
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
 
+        // Register kernel binaries and store addresses in Runtime's func_id_to_addr_[]
+        if (kernel_count > 0 && kernel_func_ids != NULL && kernel_binaries != NULL && kernel_sizes != NULL) {
+            DeviceRunner& runner = DeviceRunner::get();
+            LOG_INFO("Registering %d kernel(s) in init_runtime", kernel_count);
+            for (int i = 0; i < kernel_count; i++) {
+                int func_id = kernel_func_ids[i];
+                const uint8_t* bin_data = kernel_binaries[i];
+                size_t bin_size = kernel_sizes[i];
+
+                uint64_t addr = runner.upload_kernel_binary(func_id, bin_data, bin_size);
+                if (addr == 0) {
+                    LOG_ERROR("Failed to upload kernel binary for func_id=%d", func_id);
+                    r->~Runtime();
+                    return -1;
+                }
+                r->set_function_bin_addr(func_id, addr);
+            }
+        }
+
+        LOG_DEBUG("About to call init_runtime_impl, r=%p", (void*)r);
+
         // Delegate SO loading and orchestration to init_runtime_impl
-        return init_runtime_impl(r, orch_so_binary, orch_so_size,
-                               orch_func_name, func_args, func_args_count);
+        int result = init_runtime_impl(r, orch_so_binary, orch_so_size,
+                               orch_func_name, func_args, func_args_count,
+                               arg_types, arg_sizes);
+
+        LOG_DEBUG("init_runtime_impl returned: %d", result);
+
+        return result;
     } catch (...) {
         return -1;
     }
@@ -179,16 +211,36 @@ int set_device(int device_id) {
     }
 }
 
-int register_kernel(int func_id, const uint8_t* bin_data, size_t bin_size) {
-    if (bin_data == NULL || bin_size == 0) {
-        return -1;
+/* Note: register_kernel() has been internalized into init_runtime().
+ * Kernel binaries are now passed directly to init_runtime() which handles
+ * registration and stores addresses in Runtime's func_id_to_addr_[] array.
+ */
+
+void record_tensor_pair(RuntimeHandle runtime,
+                       void* host_ptr,
+                       void* dev_ptr,
+                       size_t size) {
+    if (runtime == NULL) {
+        return;
     }
-    try {
-        DeviceRunner& runner = DeviceRunner::get();
-        return runner.register_kernel(func_id, bin_data, bin_size);
-    } catch (...) {
-        return -1;
+    Runtime* r = static_cast<Runtime*>(runtime);
+    r->record_tensor_pair(host_ptr, dev_ptr, size);
+}
+
+void set_pto2_gm_sm_ptr(RuntimeHandle runtime, void* dev_ptr) {
+    if (runtime == NULL) {
+        return;
     }
+    Runtime* r = static_cast<Runtime*>(runtime);
+    r->set_pto2_gm_sm_ptr(dev_ptr);
+}
+
+int32_t get_pto2_sm_size(RuntimeHandle runtime) {
+    if (runtime == NULL) {
+        return 0;
+    }
+    // For now, return a fixed size. RT2 will calculate this based on config.
+    return 4 * 1024 * 1024;  // 4 MiB
 }
 
 } /* extern "C" */

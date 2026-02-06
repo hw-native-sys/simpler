@@ -233,7 +233,8 @@ class PTOCompiler:
     def compile_orchestration(
         self,
         source_path: str,
-        extra_include_dirs: Optional[List[str]] = None
+        extra_include_dirs: Optional[List[str]] = None,
+        runtime_name: str = "host_build_graph"
     ) -> bytes:
         """
         Compile an orchestration function to a shared library (.so).
@@ -248,6 +249,7 @@ class PTOCompiler:
             source_path: Path to orchestration source file (.cpp)
             extra_include_dirs: Additional include directories (must include
                                paths to runtime.h and device_runner.h)
+            runtime_name: Runtime implementation name ("rt2" or "host_build_graph")
 
         Returns:
             Binary contents of the compiled .so file
@@ -264,13 +266,49 @@ class PTOCompiler:
         timestamp = int(time.time() * 1000)
         output_path = f"/tmp/orch_{timestamp}_{os.getpid()}.so"
 
-        # Build compilation command (using g++)
+        # Build compilation command
+        # For a2a3 (real hardware), use aarch64 cross-compiler since orchestration
+        # runs on AICPU Thread 3 which is on the device (aarch64)
+        if self.platform == "a2a3" and self.ascend_home_path:
+            cxx_path = os.path.join(self.ascend_home_path, "tools", "hcc", "bin", "aarch64-target-linux-gnu-g++")
+            if not os.path.isfile(cxx_path):
+                print(f"Warning: aarch64 cross-compiler not found at {cxx_path}, falling back to g++")
+                cxx_path = "g++"
+        else:
+            cxx_path = "g++"
+
         cmd = [
-            "g++",
+            cxx_path,
             "-shared", "-fPIC",
             "-O3", "-g",
             "-std=c++17",
         ]
+
+        # For a2a3 + rt2 (device orchestration), include static linking and PTO2 runtime sources
+        # because dlopen'd SO cannot access symbols from libaicpu.so
+        if self.platform == "a2a3" and self.ascend_home_path and runtime_name == "rt2":
+            cmd.extend([
+                "-static-libstdc++",
+                "-static-libgcc",
+                "-Wl,--export-dynamic",  # Ensure symbols are exported (needed for dlsym)
+            ])
+            # Include PTO2 runtime source files directly
+            runtime_dir = os.path.join(os.path.dirname(__file__), "..", "src", "runtime", "rt2", "runtime")
+            runtime_dir = os.path.abspath(runtime_dir)
+            runtime_sources = [
+                "pto_runtime2.c",
+                "pto_orchestrator.c",
+                "pto_shared_memory.c",
+                "pto_scheduler.c",
+                "pto_ring_buffer.c",
+                "pto_tensormap.c",
+                "pto_logical_tensor.c",
+            ]
+            for src in runtime_sources:
+                src_path = os.path.join(runtime_dir, src)
+                if os.path.isfile(src_path):
+                    cmd.append(src_path)
+                    print(f"  Including runtime source: {src}")
 
         # On macOS, allow undefined symbols to be resolved at dlopen time
         if sys.platform == "darwin":

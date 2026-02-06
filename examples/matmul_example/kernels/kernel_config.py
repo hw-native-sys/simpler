@@ -25,3 +25,10 @@ KERNELS = [
     {"func_id": 1, "source": str(_KERNELS_ROOT / "aic" / "kernel_matmul.cpp"),   "core_type": "aic"},
     {"func_id": 2, "source": str(_KERNELS_ROOT / "aiv" / "kernel_add_exp.cpp"),  "core_type": "aiv"},
 ]
+
+# Runtime configuration
+RUNTIME_CONFIG = {
+    "runtime": "host_build_graph",
+    "aicpu_thread_num": 3,
+    "block_dim": 3,
+}

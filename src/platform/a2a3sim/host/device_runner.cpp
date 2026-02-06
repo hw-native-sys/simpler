@@ -156,10 +156,12 @@ int DeviceRunner::run(Runtime& runtime,
         return -1;
     }
 
-    // Validate even distribution: block_dim must be divisible by launch_aicpu_num
-    if (block_dim % launch_aicpu_num != 0) {
-        LOG_ERROR("block_dim (%d) must be evenly divisible by launch_aicpu_num (%d)", 
-                       block_dim, launch_aicpu_num);
+    // Validate even distribution: block_dim must be divisible by scheduler thread count
+    // When launch_aicpu_num == 4: 3 schedulers + 1 orchestrator (thread 3 has 0 cores)
+    int scheduler_thread_num = (launch_aicpu_num == 4) ? 3 : launch_aicpu_num;
+    if (block_dim % scheduler_thread_num != 0) {
+        LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
+                       block_dim, scheduler_thread_num);
         return -1;
     }
 
@@ -198,14 +200,15 @@ int DeviceRunner::run(Runtime& runtime,
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
     }
 
-    // Set function_bin_addr for all tasks
+    // Set function_bin_addr for each task from Runtime's func_id_to_addr_[] array
+    // (addresses were stored there during init_runtime via upload_kernel_binary)
     LOG_DEBUG("\n=== Setting function_bin_addr for Tasks (Simulation) ===");
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task* task = runtime.get_task(i);
         if (task != nullptr) {
-            uint64_t addr = get_function_bin_addr(task->func_id);
+            uint64_t addr = runtime.get_function_bin_addr(task->func_id);
             task->function_bin_addr = addr;
-            LOG_DEBUG("  Task %d (func_id=%d) -> function_bin_addr=0x%lx", 
+            LOG_DEBUG("  Task %d (func_id=%d) -> function_bin_addr=0x%lx",
                           i, task->func_id, addr);
         }
     }
@@ -322,19 +325,20 @@ int DeviceRunner::finalize() {
 }
 
 // =============================================================================
-// Kernel Registration (Executable Memory Mapping)
+// Kernel Binary Upload (returns function address for caller to store in Runtime)
 // =============================================================================
 
-int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t bin_size) {
+uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data, size_t bin_size) {
     if (bin_data == nullptr || bin_size == 0) {
         LOG_ERROR("Invalid kernel data");
-        return -1;
+        return 0;
     }
 
-    // Skip if already registered
-    if (func_id_to_addr_.find(func_id) != func_id_to_addr_.end()) {
-        LOG_INFO("Kernel func_id=%d already registered, skipping", func_id);
-        return 0;
+    // Return cached address if already uploaded
+    auto it = func_id_to_addr_.find(func_id);
+    if (it != func_id_to_addr_.end()) {
+        LOG_INFO("Kernel func_id=%d already uploaded, returning cached address", func_id);
+        return it->second.func_addr;
     }
 
     // 1. Generate temp file path
@@ -345,12 +349,12 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
     std::ofstream ofs(tmpfile, std::ios::binary);
     if (!ofs) {
         LOG_ERROR("Failed to create temp file: %s", tmpfile);
-        return -1;
+        return 0;
     }
     ofs.write(reinterpret_cast<const char*>(bin_data), bin_size);
     ofs.close();
 
-    LOG_DEBUG("Wrote kernel .so to temp file: %s (size=%zu bytes)", tmpfile, bin_size);
+    LOG_DEBUG("Uploading kernel .so: %s (size=%zu bytes)", tmpfile, bin_size);
 
     // 3. dlopen to load .so (RTLD_NOW ensures all symbols resolved immediately)
     void* handle = dlopen(tmpfile, RTLD_NOW | RTLD_LOCAL);
@@ -360,7 +364,7 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
 
     if (!handle) {
         LOG_ERROR("dlopen failed: %s", dlerror());
-        return -1;
+        return 0;
     }
 
     // 5. dlsym to get kernel function address (unified entry point: "kernel_entry")
@@ -368,10 +372,10 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
     if (!func) {
         LOG_ERROR("dlsym failed for 'kernel_entry': %s", dlerror());
         dlclose(handle);
-        return -1;
+        return 0;
     }
 
-    // 6. Store mapping info
+    // 6. Store mapping info for cleanup
     MappedKernel kernel;
     kernel.dl_handle = handle;
     kernel.func_addr = reinterpret_cast<uint64_t>(func);
@@ -381,14 +385,5 @@ int DeviceRunner::register_kernel(int func_id, const uint8_t* bin_data, size_t b
     LOG_DEBUG("Registered kernel (dlopen): func_id=%d -> addr=0x%lx, handle=%p",
                   func_id, kernel.func_addr, handle);
 
-    return 0;
-}
-
-uint64_t DeviceRunner::get_function_bin_addr(int func_id) {
-    auto it = func_id_to_addr_.find(func_id);
-    if (it == func_id_to_addr_.end()) {
-        LOG_WARN("function_bin_addr not found for func_id=%d", func_id);
-        return 0;
-    }
-    return it->second.func_addr;
+    return kernel.func_addr;
 }

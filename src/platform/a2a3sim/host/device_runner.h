@@ -129,26 +129,21 @@ public:
     int finalize();
 
     /**
-     * Register a kernel for a func_id
+     * Upload a kernel binary and return the function address
      *
      * Loads the complete kernel .so via dlopen, enabling proper handling
      * of external symbols (e.g., std::exp, std::log) via PLT/GOT.
      * Uses dlsym to resolve the unified entry point "kernel_entry".
      *
-     * @param func_id      Function identifier
+     * If the kernel is already uploaded (same func_id), returns the
+     * cached address without re-uploading.
+     *
+     * @param func_id      Function identifier (for caching)
      * @param bin_data     Complete kernel .so binary data
      * @param bin_size     Size of binary data in bytes
-     * @return 0 on success
+     * @return Function pointer address on success, 0 on error
      */
-    int register_kernel(int func_id, const uint8_t* bin_data, size_t bin_size);
-
-    /**
-     * Get function_bin_addr for a given func_id
-     *
-     * @param func_id  Function identifier
-     * @return Function pointer address, or 0 if not found
-     */
-    uint64_t get_function_bin_addr(int func_id);
+    uint64_t upload_kernel_binary(int func_id, const uint8_t* bin_data, size_t bin_size);
 
 private:
     DeviceRunner() = default;

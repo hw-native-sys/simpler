@@ -255,32 +255,25 @@ public:
     int launch_aicore_kernel(rtStream_t stream, Runtime* runtime);
 
     /**
-     * Register a kernel binary for a func_id
+     * Upload a kernel binary to device memory
      *
      * IMPORTANT: ensure_device_set() must be called before this function.
      * Kernels are immediately copied to device memory.
      *
-     * Receives pre-extracted .text section binary data from Python,
+     * Receives pre-extracted .text section binary data,
      * allocates device GM memory, copies the binary to device,
-     * and stores the GM address in func_id_to_addr_.
+     * and returns the device GM address. The caller is responsible
+     * for storing this address (typically in Runtime::func_id_to_addr_[]).
      *
-     * @param func_id   Function identifier (0, 1, 2, ...)
+     * If the kernel is already uploaded (same func_id), returns the
+     * cached address without re-uploading.
+     *
+     * @param func_id   Function identifier (0, 1, 2, ...) for caching
      * @param bin_data  Kernel .text section binary data
      * @param bin_size  Size of binary data in bytes
-     * @return 0 on success, -1 on error
+     * @return Device GM address of kernel on success, 0 on error
      */
-    int register_kernel(int func_id, const uint8_t* bin_data, size_t bin_size);
-
-    /**
-     * Get function_bin_addr for a given func_id
-     *
-     * Returns the device GM address where the kernel binary resides.
-     * This address can be cast to a function pointer and called.
-     *
-     * @param func_id  Function identifier
-     * @return Device GM address of kernel, or 0 if not found
-     */
-    uint64_t get_function_bin_addr(int func_id);
+    uint64_t upload_kernel_binary(int func_id, const uint8_t* bin_data, size_t bin_size);
 
     /**
      * Ensure device is set and streams are created (minimal initialization)

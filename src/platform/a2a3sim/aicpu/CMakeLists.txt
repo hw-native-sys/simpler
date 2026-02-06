@@ -7,7 +7,7 @@
 
 cmake_minimum_required(VERSION 3.16.3)
 
-project(aicpu_sim LANGUAGES CXX)
+project(aicpu_sim LANGUAGES C CXX)
 
 # Build complete include list
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
@@ -44,15 +44,16 @@ endif()
 # Create shared library (host-compatible for dlopen)
 add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
 
-# Compile options (host g++)
+# Compile options (host g++/gcc)
 target_compile_options(aicpu_kernel
     PRIVATE
         -Wall
         -Wextra
-        -std=c++17
         -fPIC
         -O3
         -g
+        $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>
+        $<$<COMPILE_LANGUAGE:C>:-std=gnu11>
 )
 
 # Platform definition

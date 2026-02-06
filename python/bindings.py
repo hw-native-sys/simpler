@@ -6,16 +6,25 @@ Provides a Pythonic interface to the PTO runtime via ctypes.
 Users must provide a pre-compiled libpto_runtime.so (built via binary_compiler.py).
 
 Usage:
-    from bindings import bind_host_binary, register_kernel, launch_runtime
+    from bindings import bind_host_binary, launch_runtime, set_device
 
     Runtime = bind_host_binary("/path/to/libpto_runtime.so")
+    set_device(0)  # Must be called before initialize with kernels
+
+    # Prepare kernel binaries as list of (func_id, binary_data) tuples
+    kernel_binaries = [
+        (0, kernel_add_binary),
+        (1, kernel_add_scalar_binary),
+        (2, kernel_mul_binary),
+    ]
 
     runtime = Runtime()
-    runtime.initialize(orch_so_binary, "build_example_graph", func_args)
-
-    register_kernel(0, kernel_add)
-    register_kernel(1, kernel_add_scalar)
-    register_kernel(2, kernel_mul)
+    runtime.initialize(
+        orch_so_binary,
+        "build_example_graph",
+        func_args,
+        kernel_binaries=kernel_binaries
+    )
 
     launch_runtime(runtime, aicpu_thread_num=1, block_dim=1,
                  device_id=0, aicpu_binary=aicpu_bytes,
@@ -30,13 +39,15 @@ from ctypes import (
     POINTER,
     c_char_p,
     c_int,
+    c_int32,
     c_void_p,
     c_uint8,
     c_uint64,
     c_size_t,
+    cast,
 )
 from pathlib import Path
-from typing import Union, List, Optional
+from typing import Union, List, Optional, Tuple
 import ctypes
 import tempfile
 
@@ -44,6 +55,14 @@ import tempfile
 # Module-level library reference
 _lib = None
 
+
+# ============================================================================
+# ArgType enum (must match pto_runtime_c_api.h)
+# ============================================================================
+ARG_SCALAR = 0      # Scalar value, passed directly
+ARG_INPUT_PTR = 1   # Input pointer: device_malloc + copy_to_device
+ARG_OUTPUT_PTR = 2  # Output pointer: device_malloc + record for copy-back
+ARG_INOUT_PTR = 3   # Input/output: copy_to_device + copy-back
 
 # ============================================================================
 # Runtime Library Loader
@@ -81,7 +100,7 @@ class RuntimeLibraryLoader:
         self.lib.get_runtime_size.argtypes = []
         self.lib.get_runtime_size.restype = c_size_t
 
-        # init_runtime - placement new + load SO + build runtime with orchestration
+        # init_runtime - placement new + register kernels + load SO + build runtime with orchestration
         self.lib.init_runtime.argtypes = [
             c_void_p,               # runtime
             POINTER(c_uint8),       # orch_so_binary
@@ -89,6 +108,12 @@ class RuntimeLibraryLoader:
             c_char_p,               # orch_func_name
             POINTER(c_uint64),      # func_args
             c_int,                  # func_args_count
+            POINTER(c_int),         # arg_types
+            POINTER(c_uint64),      # arg_sizes
+            POINTER(c_int),         # kernel_func_ids (array of func_ids)
+            POINTER(POINTER(c_uint8)),  # kernel_binaries (array of binary pointers)
+            POINTER(c_size_t),      # kernel_sizes (array of sizes)
+            c_int,                  # kernel_count
         ]
         self.lib.init_runtime.restype = c_int
 
@@ -109,13 +134,40 @@ class RuntimeLibraryLoader:
         self.lib.finalize_runtime.argtypes = [c_void_p]
         self.lib.finalize_runtime.restype = c_int
 
-        # register_kernel - register kernel binary for func_id
-        self.lib.register_kernel.argtypes = [c_int, POINTER(c_uint8), c_size_t]
-        self.lib.register_kernel.restype = c_int
+        # Note: register_kernel has been internalized into init_runtime
+        # Kernel binaries are now passed directly to init_runtime()
 
         # set_device - set device and create streams
         self.lib.set_device.argtypes = [c_int]
         self.lib.set_device.restype = c_int
+
+        # device_malloc - allocate device memory
+        self.lib.device_malloc.argtypes = [c_size_t]
+        self.lib.device_malloc.restype = c_void_p
+
+        # device_free - free device memory
+        self.lib.device_free.argtypes = [c_void_p]
+        self.lib.device_free.restype = None
+
+        # copy_to_device - copy data from host to device
+        self.lib.copy_to_device.argtypes = [c_void_p, c_void_p, c_size_t]
+        self.lib.copy_to_device.restype = c_int
+
+        # copy_from_device - copy data from device to host
+        self.lib.copy_from_device.argtypes = [c_void_p, c_void_p, c_size_t]
+        self.lib.copy_from_device.restype = c_int
+
+        # record_tensor_pair - record tensor pair for copy-back
+        self.lib.record_tensor_pair.argtypes = [c_void_p, c_void_p, c_void_p, c_size_t]
+        self.lib.record_tensor_pair.restype = None
+
+        # set_pto2_gm_sm_ptr - set PTO2 shared memory pointer
+        self.lib.set_pto2_gm_sm_ptr.argtypes = [c_void_p, c_void_p]
+        self.lib.set_pto2_gm_sm_ptr.restype = None
+
+        # get_pto2_sm_size - get PTO2 shared memory size
+        self.lib.get_pto2_sm_size.argtypes = [c_void_p]
+        self.lib.get_pto2_sm_size.restype = c_int32
 
 
 # ============================================================================
@@ -151,14 +203,19 @@ class Runtime:
         self,
         orch_so_binary: bytes,
         orch_func_name: str,
-        func_args: Optional[List[int]] = None
+        func_args: Optional[List[int]] = None,
+        arg_types: Optional[List[int]] = None,
+        arg_sizes: Optional[List[int]] = None,
+        kernel_binaries: Optional[List[Tuple[int, bytes]]] = None,
     ) -> None:
         """
 
         Initialize the runtime structure with dynamic orchestration.
 
-        Calls init_runtime() in C++ which loads the orchestration SO,
-        resolves the function, and calls it to build the task graph.
+        Calls init_runtime() in C++ which:
+        1. Registers kernel binaries and stores addresses in Runtime's func_id_to_addr_[]
+        2. Loads the orchestration SO, resolves the function, and calls it to build the task graph
+
         The orchestration function is responsible for:
         1. Allocating device memory
         2. Copying data to device
@@ -169,6 +226,9 @@ class Runtime:
             orch_so_binary: Orchestration shared library binary data
             orch_func_name: Name of the orchestration function to call
             func_args: Arguments for orchestration (host pointers, sizes, etc.)
+            arg_types: Array describing each argument's type (ARG_SCALAR, ARG_INPUT_PTR, etc.)
+            arg_sizes: Array of sizes for pointer arguments (0 for scalars)
+            kernel_binaries: List of (func_id, binary_data) tuples for kernel registration
 
         Raises:
             RuntimeError: If initialization fails
@@ -183,8 +243,45 @@ class Runtime:
         else:
             func_args_array = None
 
+        # Convert arg_types to ctypes array
+        if arg_types is not None and len(arg_types) > 0:
+            arg_types_array = (c_int * len(arg_types))(*arg_types)
+        else:
+            arg_types_array = None
+
+        # Convert arg_sizes to ctypes array
+        if arg_sizes is not None and len(arg_sizes) > 0:
+            arg_sizes_array = (c_uint64 * len(arg_sizes))(*arg_sizes)
+        else:
+            arg_sizes_array = None
+
         # Convert orch_so_binary to ctypes array
         orch_so_array = (c_uint8 * len(orch_so_binary)).from_buffer_copy(orch_so_binary)
+
+        # Prepare kernel binary arrays
+        # Keep references to prevent garbage collection during C call
+        self._kernel_binary_arrays = []
+        if kernel_binaries and len(kernel_binaries) > 0:
+            kernel_count = len(kernel_binaries)
+            func_ids = [k[0] for k in kernel_binaries]
+            func_ids_array = (c_int * kernel_count)(*func_ids)
+
+            # Create array of binary pointers
+            binary_ptrs = []
+            sizes = []
+            for func_id, binary in kernel_binaries:
+                arr = (c_uint8 * len(binary)).from_buffer_copy(binary)
+                self._kernel_binary_arrays.append(arr)  # Keep reference
+                binary_ptrs.append(cast(arr, POINTER(c_uint8)))
+                sizes.append(len(binary))
+
+            binaries_array = (POINTER(c_uint8) * kernel_count)(*binary_ptrs)
+            sizes_array = (c_size_t * kernel_count)(*sizes)
+        else:
+            kernel_count = 0
+            func_ids_array = None
+            binaries_array = None
+            sizes_array = None
 
         rc = self.lib.init_runtime(
             self._handle,
@@ -192,7 +289,13 @@ class Runtime:
             len(orch_so_binary),
             orch_func_name.encode('utf-8'),
             func_args_array,
-            func_args_count
+            func_args_count,
+            arg_types_array,
+            arg_sizes_array,
+            func_ids_array,
+            binaries_array,
+            sizes_array,
+            kernel_count,
         )
         if rc != 0:
             raise RuntimeError(f"init_runtime failed: {rc}")
@@ -224,36 +327,10 @@ class Runtime:
 # Module-level Functions
 # ============================================================================
 
-def register_kernel(func_id: int, binary_data: bytes) -> None:
-    """
-
-    Register a kernel binary for a func_id.
-
-    Receives pre-extracted .text section binary data,
-    allocates device GM memory, copies the binary to device,
-    and stores the GM address for later use by launch_runtime().
-
-    Args:
-        func_id: Function identifier (0, 1, 2, ...)
-        binary_data: Kernel .text section binary data
-
-    Raises:
-        RuntimeError: If not initialized or registration fails
-        ValueError: If binary_data is empty
-    """
-
-    global _lib
-    if _lib is None:
-        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
-
-    if not binary_data:
-        raise ValueError("binary_data cannot be empty")
-
-    # Convert bytes to ctypes array
-    bin_array = (c_uint8 * len(binary_data)).from_buffer_copy(binary_data)
-    rc = _lib.register_kernel(func_id, bin_array, len(binary_data))
-    if rc != 0:
-        raise RuntimeError(f"register_kernel failed: {rc}")
+"""
+Note: register_kernel() has been internalized into runtime.initialize().
+Kernel binaries are now passed directly to initialize() via the kernel_binaries parameter.
+"""
 
 
 def set_device(device_id: int) -> None:
@@ -282,6 +359,86 @@ def set_device(device_id: int) -> None:
     rc = _lib.set_device(device_id)
     if rc != 0:
         raise RuntimeError(f"set_device failed: {rc}")
+
+
+def device_malloc(size: int) -> Optional[int]:
+    """
+    Allocate device memory.
+
+    Args:
+        size: Size in bytes to allocate
+
+    Returns:
+        Device pointer as integer, or None on failure
+
+    Raises:
+        RuntimeError: If not loaded
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    ptr = _lib.device_malloc(size)
+    return ptr if ptr else None
+
+
+def device_free(dev_ptr: int) -> None:
+    """
+    Free device memory.
+
+    Args:
+        dev_ptr: Device pointer to free
+
+    Raises:
+        RuntimeError: If not loaded
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    _lib.device_free(ctypes.c_void_p(dev_ptr))
+
+
+def copy_to_device(dev_ptr: int, host_ptr: int, size: int) -> None:
+    """
+    Copy data from host to device.
+
+    Args:
+        dev_ptr: Device destination pointer
+        host_ptr: Host source pointer
+        size: Size in bytes to copy
+
+    Raises:
+        RuntimeError: If not loaded or copy fails
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    rc = _lib.copy_to_device(ctypes.c_void_p(dev_ptr), ctypes.c_void_p(host_ptr), size)
+    if rc != 0:
+        raise RuntimeError(f"copy_to_device failed: {rc}")
+
+
+def copy_from_device(host_ptr: int, dev_ptr: int, size: int) -> None:
+    """
+    Copy data from device to host.
+
+    Args:
+        host_ptr: Host destination pointer
+        dev_ptr: Device source pointer
+        size: Size in bytes to copy
+
+    Raises:
+        RuntimeError: If not loaded or copy fails
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    rc = _lib.copy_from_device(ctypes.c_void_p(host_ptr), ctypes.c_void_p(dev_ptr), size)
+    if rc != 0:
+        raise RuntimeError(f"copy_from_device failed: {rc}")
 
 
 def launch_runtime(
@@ -349,16 +506,23 @@ def bind_host_binary(lib_path: Union[str, Path, bytes]) -> type:
         Runtime class initialized with the library
 
     Example:
-        from bindings import bind_host_binary, register_kernel, launch_runtime
+        from bindings import bind_host_binary, launch_runtime, set_device
 
         Runtime = bind_host_binary("/path/to/libpto_runtime.so")
+        set_device(0)
+
+        kernel_binaries = [
+            (0, kernel_add_binary),
+            (1, kernel_mul_binary),
+        ]
 
         runtime = Runtime()
-        runtime.initialize(orch_so_binary, "build_example_graph", func_args)
-
-        register_kernel(0, kernel_add)
-        register_kernel(1, kernel_add_scalar)
-        register_kernel(2, kernel_mul)
+        runtime.initialize(
+            orch_so_binary,
+            "build_example_graph",
+            func_args,
+            kernel_binaries=kernel_binaries
+        )
 
         launch_runtime(runtime, aicpu_thread_num=1, block_dim=1,
                      device_id=0, aicpu_binary=aicpu_bytes,
