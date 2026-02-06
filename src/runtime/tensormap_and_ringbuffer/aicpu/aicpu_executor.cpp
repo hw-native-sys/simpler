@@ -453,8 +453,8 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     int cur_thread_completed = 0;
     int cur_thread_tasks_in_flight = 0;
     int idle_iterations = 0;
-    const int MAX_IDLE_ITERATIONS = 1000000;
-    const int WARN_INTERVAL = 100000;
+    const int MAX_IDLE_ITERATIONS = 50000000;
+    const int WARN_INTERVAL = 1000000;
 
     while (true) {
         if (completed_tasks_.load(std::memory_order_acquire) >= task_count) {

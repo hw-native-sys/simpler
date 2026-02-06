@@ -340,7 +340,7 @@ class CodeRunner:
         # Runtime configuration - read from kernel_config or use defaults
         runtime_config = getattr(self._kernel_config, 'RUNTIME_CONFIG', {})
         self.aicpu_thread_num = runtime_config.get('aicpu_thread_num', 3)
-        self.block_dim = runtime_config.get('block_dim', 3)
+        self.block_dim = runtime_config.get('block_dim', 24)
 
         # Resolve runtime_name from RUNTIME_CONFIG if not explicitly provided
         if runtime_name is None:

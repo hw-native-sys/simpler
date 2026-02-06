@@ -337,7 +337,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
 
     // Timeout detection using idle iteration counting
     int idle_iterations = 0;
-    const int MAX_IDLE_ITERATIONS = 10000000;
+    const int MAX_IDLE_ITERATIONS = 50000000;
     const int WARN_INTERVAL = 1000000;
     bool made_progress = false;
 
