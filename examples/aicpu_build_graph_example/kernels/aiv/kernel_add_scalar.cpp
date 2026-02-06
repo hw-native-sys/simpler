@@ -5,8 +5,10 @@
  */
 
 #include <cstdint>
-#include <pto/pto-inst.hpp>
-#include <pto/common/constants.hpp>
+// clang-format off
+#include <pto/pto-inst.hpp>          // defines CPU stubs (incl. __gm__) under __CPU_SIM
+#include <pto/common/constants.hpp>  // uses __gm__ in some headers
+// clang-format on
 
 using namespace pto;
 
@@ -18,6 +20,7 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
+// `a2a3sim` loads per-kernel binaries via dlopen+dlsym("kernel_entry").
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
     __gm__ float* src = reinterpret_cast<__gm__ float*>(args[0]);
 

@@ -452,69 +452,24 @@ class CodeRunner:
         platform_include_dir = str(self.project_root / "src" / "platform" / "include")
         include_dirs = [runtime_include_dir, platform_include_dir]
 
-        # Best-effort: include platform-specific includes (doesn't hurt and helps if examples include platform headers).
-        include_dirs += pto_compiler.get_platform_include_dirs()
-
         # Secure, unique output path in /tmp. This prevents other users/processes from
         # hijacking a predictable filename (e.g., via symlink races).
         fd, out_s = tempfile.mkstemp(prefix="aicpu_orch_", suffix=".so", dir="/tmp")
         os.close(fd)
         out_path = Path(out_s)
 
-        if self.platform == "a2a3":
-            ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
-            if not ascend_home:
-                raise EnvironmentError("ASCEND_HOME_PATH must be set to compile AICPU orchestration for platform=a2a3")
-            cxx = os.path.join(ascend_home, "tools", "hcc", "bin", "aarch64-target-linux-gnu-g++")
-            if not os.path.isfile(cxx):
-                raise FileNotFoundError(f"AICPU cross-compiler not found: {cxx}")
-            cmd = [
-                cxx,
-                "-shared",
-                "-fPIC",
-                "-O3",
-                "-g",
-                "-std=gnu++17",
-            ]
-            # Match the platform AICPU build include search paths (subset).
-            cmd += [
-                f"-I{os.path.join(ascend_home, 'include')}",
-                f"-I{os.path.join(ascend_home, 'include', 'toolchain')}",
-                f"-I{os.path.join(ascend_home, 'pkg_inc', 'base')}",
-            ]
-        else:
-            cxx = os.environ.get("CXX") or (shutil.which("g++") or "")
-            if not cxx:
-                raise RuntimeError("g++ compiler not found. Please install g++ (or activate your toolchain env).")
-            cmd = [
-                cxx,
-                "-shared",
-                "-fPIC",
-                "-O3",
-                "-g",
-                "-std=c++17",
-            ]
-
-        for inc_dir in include_dirs:
-            cmd.append(f"-I{os.path.abspath(inc_dir)}")
-
-        cmd += ["-o", str(out_path), os.path.abspath(source_path)]
-
         print("\n=== Compiling AICPU Orchestration Plugin ===")
         print(f"AICPU plugin entry: {func_name}")
         print(f"Output: {out_path}")
-        print(f"Command: {' '.join(cmd)}")
 
-        result = subprocess.run(cmd, capture_output=True, text=True)
         try:
-            if result.stdout:
-                print(f"[AICPU Orchestration Plugin] stdout:\n{result.stdout}")
-            if result.stderr:
-                print(f"[AICPU Orchestration Plugin] stderr:\n{result.stderr}")
-            if result.returncode != 0:
-                raise RuntimeError(
-                    f"AICPU orchestration plugin compilation failed with exit code {result.returncode}:\n{result.stderr}"
-                )
+            out_s = pto_compiler.compile_aicpu_orchestration_plugin(
+                source_path,
+                output_path=str(out_path),
+                extra_include_dirs=include_dirs,
+            )
+            if out_s != str(out_path):
+                raise RuntimeError(f"Unexpected AICPU plugin output path: {out_s} (expected {out_path})")
         except Exception:
             try:
                 out_path.unlink()
