@@ -151,7 +151,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
             PTO2_INPUT(dev_b, tile, sz),
             PTO2_OUTPUT(dev_c, tile, sz),
         };
-        if (pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, nullptr, "kernel_add", params_t0, 3) < 0) {
+        if (pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, "kernel_add", params_t0, 3) < 0) {
             pto2_rt_orchestration_done(rt);
             pto2_runtime_destroy(rt);
             *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
@@ -163,7 +163,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
             PTO2_INPUT(dev_c, tile, sz),
             PTO2_OUTPUT(dev_d, tile, sz),
         };
-        if (pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, nullptr, "kernel_add_scalar", params_t1, 2) < 0) {
+        if (pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t1, 2) < 0) {
             pto2_rt_orchestration_done(rt);
             pto2_runtime_destroy(rt);
             *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
@@ -175,7 +175,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
             PTO2_INPUT(dev_c, tile, sz),
             PTO2_OUTPUT(dev_e, tile, sz),
         };
-        if (pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, nullptr, "kernel_add_scalar", params_t2, 2) < 0) {
+        if (pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t2, 2) < 0) {
             pto2_rt_orchestration_done(rt);
             pto2_runtime_destroy(rt);
             *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
@@ -188,7 +188,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
             PTO2_INPUT(dev_e, tile, sz),
             PTO2_OUTPUT(dev_f, tile, sz),
         };
-        int32_t task3_id = pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, nullptr, "kernel_mul", params_t3, 3);
+        int32_t task3_id = pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, "kernel_mul", params_t3, 3);
         if (task3_id < 0) {
             pto2_rt_orchestration_done(rt);
             pto2_runtime_destroy(rt);

@@ -17,8 +17,7 @@
  *      - pto2_scope_begin() / pto2_scope_end()
  *      - pto2_submit_task()
  *   3. Mark orchestration complete: pto2_orchestrator_done()
- *   4. Execute or simulate: pto2_runtime_execute() / pto2_runtime_simulate()
- *   5. Destroy runtime: pto2_runtime_destroy()
+ *   4. Destroy runtime: pto2_runtime_destroy()
  *
  * Based on: docs/runtime_buffer_manager_methods.md
  */
@@ -158,7 +157,6 @@ void pto2_rt_scope_end(PTO2Runtime* rt);
  * @param rt          Runtime context
  * @param kernel_id   InCore function ID
  * @param worker_type Target worker type
- * @param func_ptr    Function pointer (optional)
  * @param func_name   Function name (for debugging)
  * @param params      Array of task parameters
  * @param num_params  Number of parameters
@@ -167,7 +165,6 @@ void pto2_rt_scope_end(PTO2Runtime* rt);
 int32_t pto2_rt_submit_task(PTO2Runtime* rt,
                              int32_t kernel_id,
                              PTO2WorkerType worker_type,
-                             void* func_ptr,
                              const char* func_name,
                              PTO2TaskParam* params,
                              int32_t num_params);
@@ -177,7 +174,6 @@ int32_t pto2_rt_submit_task(PTO2Runtime* rt,
  */
 int32_t pto2_rt_submit(PTO2Runtime* rt,
                         const char* func_name,
-                        void* func_ptr,
                         PTO2TaskParam* params,
                         int32_t num_params);
 
@@ -192,71 +188,6 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt);
  * Get output buffer pointer for a task
  */
 void* pto2_rt_get_output(PTO2Runtime* rt, int32_t task_id, int32_t output_idx);
-
-// =============================================================================
-// Execution API
-// =============================================================================
-
-/**
- * Execute all submitted tasks
- *
- * In EXECUTE mode, dispatches tasks to workers.
- * In SIMULATE mode, simulates execution with cycle counting.
- * In GRAPH_ONLY mode, does nothing (graph already built).
- *
- * Blocks until all tasks complete.
- */
-void pto2_runtime_execute(PTO2Runtime* rt);
-
-/**
- * Signal task completion (called by worker)
- *
- * @param rt      Runtime context
- * @param task_id Completed task ID
- */
-void pto2_rt_task_complete(PTO2Runtime* rt, int32_t task_id);
-
-/**
- * Get next ready task for worker type
- *
- * @param rt          Runtime context
- * @param worker_type Worker type requesting task
- * @return Task ID, or -1 if no ready tasks
- */
-int32_t pto2_rt_get_ready_task(PTO2Runtime* rt, PTO2WorkerType worker_type);
-
-/**
- * Check if all tasks are complete
- */
-bool pto2_runtime_is_done(PTO2Runtime* rt);
-
-// =============================================================================
-// Statistics and Debug API
-// =============================================================================
-
-/**
- * Print runtime statistics
- */
-void pto2_runtime_print_stats(PTO2Runtime* rt);
-
-/**
- * Get total simulated cycles
- */
-int64_t pto2_runtime_get_cycles(PTO2Runtime* rt);
-
-/**
- * Dump task graph to file
- *
- * @param rt       Runtime context
- * @param filename Output file path
- * @return 0 on success, -1 on failure
- */
-int pto2_runtime_dump_graph(PTO2Runtime* rt, const char* filename);
-
-/**
- * Validate runtime state (for debugging)
- */
-bool pto2_runtime_validate(PTO2Runtime* rt);
 
 // =============================================================================
 // Convenience Macros (if not already defined in pto_runtime2_types.h)

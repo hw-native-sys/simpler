@@ -328,9 +328,8 @@ typedef struct {
     
     // Input buffer pointers (for dependency resolution)
     int32_t  num_inputs;          // Number of input buffers
-    
-    // Function pointer (for execution)
-    void*    func_ptr;            // InCore function pointer
+
+    // Function name (for debugging/tracing)
     const char* func_name;        // Function name (for debugging/tracing)
     
     // Status flags

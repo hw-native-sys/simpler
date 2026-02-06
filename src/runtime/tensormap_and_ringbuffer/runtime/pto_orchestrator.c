@@ -276,28 +276,26 @@ void pto2_param_fix_sizes(void* params_base, int32_t num_params, int32_t size_by
 int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                           int32_t kernel_id,
                           PTO2WorkerType worker_type,
-                          void* func_ptr,
                           const char* func_name,
                           PTO2TaskParam* params,
                           int32_t num_params) {
-    
+
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
     pto2_orchestrator_sync_tensormap(orch);
-    
+
     // === STEP 1: Allocate task slot from Task Ring (may stall) ===
     int32_t task_id = pto2_task_ring_alloc(&orch->task_ring);
     if (task_id < 0) {
         return -1;  // Should not happen (stalls instead)
     }
-    
+
     PTO2TaskDescriptor* task = pto2_task_ring_get(&orch->task_ring, task_id);
-    
+
     // Initialize task descriptor
     task->task_id = task_id;
     task->kernel_id = kernel_id;
     task->worker_type = worker_type;
     task->scope_depth = pto2_get_scope_depth(orch);
-    task->func_ptr = func_ptr;
     task->func_name = func_name;
     task->fanin_head = 0;
     task->fanin_count = 0;
