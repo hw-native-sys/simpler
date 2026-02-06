@@ -1,15 +1,15 @@
 """
-Golden script for RT2 example.
+Golden script for tensormap_and_ringbuffer example.
 
 This script defines the input data generation and expected output computation
-for the RT2 example (both a2a3 and a2a3sim platforms).
+for the tensormap_and_ringbuffer example (both a2a3 and a2a3sim platforms).
 
 Computation:
     f = (a + b + 1) * (a + b + 2)
     where a=2.0, b=3.0, so f=42.0
 
-This is the same computation as host_build_graph_example, but uses
-device-side orchestration (RT2 runtime).
+This is the same computation as host_build_graph/vector_example, but uses
+device-side orchestration (tensormap_and_ringbuffer runtime).
 """
 
 import numpy as np
@@ -18,8 +18,8 @@ import numpy as np
 __outputs__ = ["f"]
 
 # Tensor order for orchestration function arguments
-# RT2 args layout: [dev_a, dev_b, dev_f, size_a, size_b, size_f, SIZE, dev_c, dev_d, dev_e]
-# Note: RT2 requires intermediate tensors (c, d, e) to be pre-allocated
+# tensormap_and_ringbuffer args layout: [dev_a, dev_b, dev_f, size_a, size_b, size_f, SIZE, dev_c, dev_d, dev_e]
+# Note: tensormap_and_ringbuffer requires intermediate tensors (c, d, e) to be pre-allocated
 TENSOR_ORDER = ["a", "b", "f", "c", "d", "e"]
 
 # Comparison tolerances
@@ -48,7 +48,7 @@ def generate_inputs(params: dict) -> dict:
         "a": np.full(SIZE, 2.0, dtype=np.float32),
         "b": np.full(SIZE, 3.0, dtype=np.float32),
         "f": np.zeros(SIZE, dtype=np.float32),
-        # Intermediate tensors for RT2 device orchestration
+        # Intermediate tensors for tensormap_and_ringbuffer device orchestration
         "c": np.zeros(SIZE, dtype=np.float32),
         "d": np.zeros(SIZE, dtype=np.float32),
         "e": np.zeros(SIZE, dtype=np.float32),

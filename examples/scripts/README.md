@@ -28,8 +28,8 @@ python examples/scripts/run_example.py \
 
 ```bash
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph_example/kernels \
-  -g examples/host_build_graph_example/golden.py \
+  -k examples/host_build_graph/vector_example/kernels \
+  -g examples/host_build_graph/vector_example/golden.py \
   -p a2a3
 ```
 
@@ -37,8 +37,8 @@ python examples/scripts/run_example.py \
 
 ```bash
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph_sim_example/kernels \
-  -g examples/host_build_graph_sim_example/golden.py \
+  -k examples/host_build_graph/vector_example/kernels \
+  -g examples/host_build_graph/vector_example/golden.py \
   -p a2a3sim
 ```
 
@@ -376,8 +376,8 @@ TEST FAILED: Output 'f' does not match golden
 
 ## Reference Examples
 
-- **Hardware Example**: [examples/host_build_graph_example/](../host_build_graph_example/)
-- **Simulation Example**: [examples/host_build_graph_sim_example/](../host_build_graph_sim_example/)
+- **Hardware Example**: [examples/host_build_graph/vector_example/](../host_build_graph/vector_example/)
+- **Simulation Example**: [examples/host_build_graph/vector_example/](../host_build_graph/vector_example/)
 
 ## FAQ
 

@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 # Runtime type to directory mapping
 RUNTIME_DIRS = {
     "host_build_graph": "host_build_graph",
-    "rt2": "rt2",
+    "tensormap_and_ringbuffer": "tensormap_and_ringbuffer",
 }
 
 
@@ -291,7 +291,7 @@ class BinaryCompiler:
         Get the runtime directory path for the specified runtime type.
 
         Args:
-            runtime_type: Runtime type ("host_build_graph" or "rt2")
+            runtime_type: Runtime type ("host_build_graph" or "tensormap_and_ringbuffer")
 
         Returns:
             Path to the runtime directory
@@ -319,7 +319,7 @@ class BinaryCompiler:
 
         Args:
             target_platform: Target platform ("aicore", "aicpu", or "host")
-            runtime_type: Runtime type ("host_build_graph" or "rt2")
+            runtime_type: Runtime type ("host_build_graph" or "tensormap_and_ringbuffer")
 
         Returns:
             Compiled binary data as bytes
@@ -368,7 +368,7 @@ class BinaryCompiler:
         Compile all runtime binaries (aicore, aicpu, host) for the specified runtime type.
 
         Args:
-            runtime_type: Runtime type ("host_build_graph" or "rt2")
+            runtime_type: Runtime type ("host_build_graph" or "tensormap_and_ringbuffer")
 
         Returns:
             Dictionary mapping target platform to compiled binary data

@@ -52,14 +52,14 @@ This example supports two platforms:
 ```bash
 # From repository root
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph_example/kernels \
-  -g examples/host_build_graph_example/golden.py \
+  -k examples/host_build_graph/vector_example/kernels \
+  -g examples/host_build_graph/vector_example/golden.py \
   -p a2a3sim
 
 # With verbose output
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph_example/kernels \
-  -g examples/host_build_graph_example/golden.py \
+  -k examples/host_build_graph/vector_example/kernels \
+  -g examples/host_build_graph/vector_example/golden.py \
   -p a2a3sim \
   -v
 ```
@@ -69,21 +69,21 @@ python examples/scripts/run_example.py \
 ```bash
 # From repository root
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph_example/kernels \
-  -g examples/host_build_graph_example/golden.py \
+  -k examples/host_build_graph/vector_example/kernels \
+  -g examples/host_build_graph/vector_example/golden.py \
   -p a2a3
 
 # With specific device ID
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph_example/kernels \
-  -g examples/host_build_graph_example/golden.py \
+  -k examples/host_build_graph/vector_example/kernels \
+  -g examples/host_build_graph/vector_example/golden.py \
   -p a2a3 \
   -d 9
 
 # With verbose output
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph_example/kernels \
-  -g examples/host_build_graph_example/golden.py \
+  -k examples/host_build_graph/vector_example/kernels \
+  -g examples/host_build_graph/vector_example/golden.py \
   -p a2a3 \
   -v
 ```
@@ -91,7 +91,7 @@ python examples/scripts/run_example.py \
 ## Directory Structure
 
 ```
-host_build_graph_example/
+vector_example/
 ├── README.md                    # This file
 ├── golden.py                    # Input generation and expected output
 └── kernels/

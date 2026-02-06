@@ -50,11 +50,11 @@ jobs:
             ${{ runner.os }}-pip-
 
       - name: Install dependencies
-        run: pip install numpy
+        run: |
+          pip install numpy
+          pip install pytest
 
       - name: Run simulation examples
-        env:
-          PTO_ISA_ROOT: ${{ github.workspace }}/examples/scripts/_deps/pto-isa
         run: ./ci.sh -p a2a3sim
 
   run-example-on-device:
@@ -66,8 +66,6 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Run on-device examples
-        env:
-          PTO_ISA_ROOT: /home/github-ci/pto-isa
         run: |
-          source /home/github-ci/Ascend/ascend-toolkit/latest/bin/setenv.bash
-          ./ci.sh -p a2a3 -d 5
+          export PATH="$HOME/.local/bin:$PATH"
+          source /home/github-ci/Ascend/ascend-toolkit/latest/bin/setenv.bash && ./ci.sh -p a2a3 -d 5

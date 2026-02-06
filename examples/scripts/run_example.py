@@ -13,12 +13,12 @@ Usage:
 
 Examples:
     # Run hardware example (requires Ascend device)
-    python examples/scripts/run_example.py -k examples/host_build_graph_example/kernels \
-                                      -g examples/host_build_graph_example/golden.py
+    python examples/scripts/run_example.py -k examples/host_build_graph/vector_example/kernels \
+                                      -g examples/host_build_graph/vector_example/golden.py
 
     # Run simulation example (no hardware required)
-    python examples/scripts/run_example.py -k examples/host_build_graph_sim_example/kernels \
-                                      -g examples/host_build_graph_sim_example/golden.py \
+    python examples/scripts/run_example.py -k examples/host_build_graph/vector_example/kernels \
+                                      -g examples/host_build_graph/vector_example/golden.py \
                                       -p a2a3sim
 
     # Run with specific device

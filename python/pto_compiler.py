@@ -249,7 +249,7 @@ class PTOCompiler:
             source_path: Path to orchestration source file (.cpp)
             extra_include_dirs: Additional include directories (must include
                                paths to runtime.h and device_runner.h)
-            runtime_name: Runtime implementation name ("rt2" or "host_build_graph")
+            runtime_name: Runtime implementation name ("tensormap_and_ringbuffer" or "host_build_graph")
 
         Returns:
             Binary contents of the compiled .so file
@@ -284,16 +284,16 @@ class PTOCompiler:
             "-std=c++17",
         ]
 
-        # For a2a3 + rt2 (device orchestration), include static linking and PTO2 runtime sources
+        # For a2a3 + tensormap_and_ringbuffer (device orchestration), include static linking and PTO2 runtime sources
         # because dlopen'd SO cannot access symbols from libaicpu.so
-        if self.platform == "a2a3" and self.ascend_home_path and runtime_name == "rt2":
+        if self.platform == "a2a3" and self.ascend_home_path and runtime_name == "tensormap_and_ringbuffer":
             cmd.extend([
                 "-static-libstdc++",
                 "-static-libgcc",
                 "-Wl,--export-dynamic",  # Ensure symbols are exported (needed for dlsym)
             ])
             # Include PTO2 runtime source files directly
-            runtime_dir = os.path.join(os.path.dirname(__file__), "..", "src", "runtime", "rt2", "runtime")
+            runtime_dir = os.path.join(os.path.dirname(__file__), "..", "src", "runtime", "tensormap_and_ringbuffer", "runtime")
             runtime_dir = os.path.abspath(runtime_dir)
             runtime_sources = [
                 "pto_runtime2.c",

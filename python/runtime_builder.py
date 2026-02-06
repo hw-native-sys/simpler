@@ -69,7 +69,7 @@ class RuntimeBuilder:
         Args:
             name: Name of the runtime implementation (e.g. 'host_build_graph')
             extra_aicpu_source_dirs: Additional source directories for AICPU compilation
-                                     (used by rt2 for device-side orchestration)
+                                     (used by tensormap_and_ringbuffer for device-side orchestration)
             extra_aicpu_include_dirs: Additional include directories for AICPU compilation
 
         Returns:

@@ -516,7 +516,7 @@ class CodeRunner:
         builder = RuntimeBuilder(runtime_root=self.project_root, platform=self.platform)
         pto_compiler = builder.get_pto_compiler()
 
-        # For rt2, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
+        # For tensormap_and_ringbuffer, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
         # NOT compiled into AICPU binary
         extra_aicpu_source_dirs = None
         extra_aicpu_include_dirs = None
@@ -548,13 +548,13 @@ class CodeRunner:
             str(self.project_root / "src" / "runtime" / self.runtime_name / "runtime"),
         ] + pto_compiler.get_platform_include_dirs()
 
-        # For rt2, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
-        if self.runtime_name == "rt2":
-            logger.info("RT2: Compiling orchestration as separate SO for dlopen")
+        # For tensormap_and_ringbuffer, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
+        if self.runtime_name == "tensormap_and_ringbuffer":
+            logger.info("tensormap_and_ringbuffer: Compiling orchestration as separate SO for dlopen")
             orch_so_binary = pto_compiler.compile_orchestration(
                 self.orchestration["source"],
                 extra_include_dirs=orch_include_dirs,
-                runtime_name="rt2",
+                runtime_name="tensormap_and_ringbuffer",
             )
             logger.debug(f"Compiled orchestration SO: {len(orch_so_binary)} bytes")
         else:
