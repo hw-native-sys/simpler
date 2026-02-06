@@ -42,6 +42,11 @@ extern "C" int build_graph_aicpu(Runtime* runtime) {
         return -1;
     }
 
+    const AicpuBuildApi& api = runtime->aicpu_build_api;
+    if (api.add_task == nullptr || api.add_successor_conditional == nullptr || api.publish_task == nullptr) {
+        return -1;
+    }
+
     // Task 0: c = a + b (func_id=0, AIV)
     uint64_t args_t0[4];
     args_t0[0] = dev_a;
@@ -49,9 +54,9 @@ extern "C" int build_graph_aicpu(Runtime* runtime) {
     args_t0[2] = dev_c;
     args_t0[3] = static_cast<uint64_t>(size);
     // Pass function_bin_addr=0 to use the runtime's func_id -> kernel_addrs[] binding.
-    int t0 = aicpu_runtime_add_task(runtime, args_t0, 4, 0, CoreType::AIV, 0);
+    int t0 = api.add_task(runtime, args_t0, 4, 0, CoreType::AIV, 0);
     if (t0 < 0) return -1;
-    aicpu_runtime_publish_task(runtime, t0);
+    api.publish_task(runtime, t0);
 
     // Task 1: d = c + 1 (func_id=1, AIV)
     ScalarConverter s1{};
@@ -61,10 +66,10 @@ extern "C" int build_graph_aicpu(Runtime* runtime) {
     args_t1[1] = s1.u64;
     args_t1[2] = dev_d;
     args_t1[3] = static_cast<uint64_t>(size);
-    int t1 = aicpu_runtime_add_task(runtime, args_t1, 4, 1, CoreType::AIV, 0);
+    int t1 = api.add_task(runtime, args_t1, 4, 1, CoreType::AIV, 0);
     if (t1 < 0) return -1;
-    aicpu_runtime_add_successor_conditional(runtime, t0, t1);
-    aicpu_runtime_publish_task(runtime, t1);
+    api.add_successor_conditional(runtime, t0, t1);
+    api.publish_task(runtime, t1);
 
     // Task 2: e = c + 2 (func_id=1, AIV)
     ScalarConverter s2{};
@@ -74,10 +79,10 @@ extern "C" int build_graph_aicpu(Runtime* runtime) {
     args_t2[1] = s2.u64;
     args_t2[2] = dev_e;
     args_t2[3] = static_cast<uint64_t>(size);
-    int t2 = aicpu_runtime_add_task(runtime, args_t2, 4, 1, CoreType::AIV, 0);
+    int t2 = api.add_task(runtime, args_t2, 4, 1, CoreType::AIV, 0);
     if (t2 < 0) return -1;
-    aicpu_runtime_add_successor_conditional(runtime, t0, t2);
-    aicpu_runtime_publish_task(runtime, t2);
+    api.add_successor_conditional(runtime, t0, t2);
+    api.publish_task(runtime, t2);
 
     // Task 3: f = d * e (func_id=2, AIV)
     uint64_t args_t3[4];
@@ -85,11 +90,11 @@ extern "C" int build_graph_aicpu(Runtime* runtime) {
     args_t3[1] = dev_e;
     args_t3[2] = dev_f;
     args_t3[3] = static_cast<uint64_t>(size);
-    int t3 = aicpu_runtime_add_task(runtime, args_t3, 4, 2, CoreType::AIV, 0);
+    int t3 = api.add_task(runtime, args_t3, 4, 2, CoreType::AIV, 0);
     if (t3 < 0) return -1;
-    aicpu_runtime_add_successor_conditional(runtime, t1, t3);
-    aicpu_runtime_add_successor_conditional(runtime, t2, t3);
-    aicpu_runtime_publish_task(runtime, t3);
+    api.add_successor_conditional(runtime, t1, t3);
+    api.add_successor_conditional(runtime, t2, t3);
+    api.publish_task(runtime, t3);
 
     // Minimal sanity: kernel addresses must exist (0 indicates not registered).
     if (runtime->kernel_addrs[0] == 0 || runtime->kernel_addrs[1] == 0 || runtime->kernel_addrs[2] == 0) {

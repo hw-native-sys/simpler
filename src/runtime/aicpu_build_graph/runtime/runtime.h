@@ -130,6 +130,35 @@ struct DeviceAlloc {
     void* dev_ptr;
 };
 
+class Runtime;
+
+/**
+ * AICPU graph-build API table (device-side).
+ *
+ * Motivation:
+ * On some real AICPU deployments, dlopen'd orchestration plugins may not be able
+ * to resolve undefined symbols from the main AICPU runtime binary at load time.
+ * To keep the plugin small and avoid relinking/reuploading the runtime, we pass
+ * graph-build entry points to the plugin via function pointers stored in
+ * `Runtime`. The AICPU executor initializes these pointers on device before
+ * calling into the plugin.
+ *
+ * Example usage (in plugin):
+ *   auto& api = runtime->aicpu_build_api;
+ *   int t = api.add_task(runtime, args, n, func_id, CoreType::AIV, 0);
+ *   api.publish_task(runtime, t);
+ */
+struct AicpuBuildApi {
+    int (*add_task)(Runtime* runtime,
+        uint64_t* args,
+        int num_args,
+        int func_id,
+        CoreType core_type,
+        uint64_t function_bin_addr);
+    void (*add_successor_conditional)(Runtime* runtime, int from_task, int to_task);
+    void (*publish_task)(Runtime* runtime, int task_id);
+};
+
 /**
  * Host API function pointers for device memory operations.
  * Allows runtime to use pluggable device memory backends.
@@ -259,6 +288,15 @@ public:
      * - 1 = concurrent build||schedule (builder publishes tasks while schedulers run)
      */
     int build_mode;
+
+    /**
+     * Device-side graph-build API table.
+     *
+     * This is initialized by the AICPU executor on device before any
+     * orchestration plugin runs. Plugins should prefer this table over linking
+     * against `aicpu_runtime_*` symbols directly.
+     */
+    AicpuBuildApi aicpu_build_api;
 
 private:
     // Task storage

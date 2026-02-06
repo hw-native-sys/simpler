@@ -30,6 +30,10 @@ struct CoreInfo {
 };
 
 extern "C" int build_graph_aicpu(Runtime* runtime);
+extern "C" int aicpu_runtime_add_task(
+    Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type, uint64_t function_bin_addr);
+extern "C" void aicpu_runtime_add_successor_conditional(Runtime* runtime, int from_task, int to_task);
+extern "C" void aicpu_runtime_publish_task(Runtime* runtime, int task_id);
 
 namespace {
 using AicpuBuilderFunc = int (*)(Runtime*);
@@ -262,6 +266,13 @@ int AicpuExecutor::init(Runtime* runtime) {
 
     // Assign discovered cores to threads
     assign_cores_to_threads();
+
+    // Initialize AICPU graph-build API table for dlopen'd orchestration plugins.
+    // This avoids requiring the plugin to resolve `aicpu_runtime_*` symbols via
+    // the dynamic loader at plugin load time.
+    runtime->aicpu_build_api.add_task = &aicpu_runtime_add_task;
+    runtime->aicpu_build_api.add_successor_conditional = &aicpu_runtime_add_successor_conditional;
+    runtime->aicpu_build_api.publish_task = &aicpu_runtime_publish_task;
 
     // Hard error: scheduler threads must have at least one assigned core.
     // Otherwise, they will spin in resolve_and_dispatch() and eventually timeout.

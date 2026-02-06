@@ -11,7 +11,7 @@
 // Constructor
 // =============================================================================
 
-	Runtime::Runtime() {
+Runtime::Runtime() {
     // NOTE: host_api is initialized in InitRuntime() (host-only code)
     // because the CApi functions don't exist when compiled for device.
 
@@ -46,6 +46,7 @@
 	    memset(aicpu_orch_func_name, 0, sizeof(aicpu_orch_func_name));
 	    strncpy(aicpu_orch_func_name, "build_graph_aicpu", sizeof(aicpu_orch_func_name) - 1);
 	    build_mode = 1;  // default to concurrent build||schedule
+	    aicpu_build_api = {};
 	}
 
 // =============================================================================

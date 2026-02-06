@@ -424,6 +424,8 @@ class PTOCompiler:
         extra_flags: List[str] = []
         if self.platform == "a2a3":
             extra_flags.append("-std=gnu++17")
+            # Prefer a self-contained plugin on device to reduce runtime deps.
+            extra_flags.extend(["-static-libstdc++", "-static-libgcc"])
             if self.ascend_home_path:
                 extra_inc.extend(
                     [
