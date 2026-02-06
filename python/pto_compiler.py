@@ -302,7 +302,7 @@ class PTOCompiler:
                 "pto_scheduler.c",
                 "pto_ring_buffer.c",
                 "pto_tensormap.c",
-                "pto_logical_tensor.c",
+                "pto_logical_tensor.cpp",
             ]
             for src in runtime_sources:
                 src_path = os.path.join(runtime_dir, src)

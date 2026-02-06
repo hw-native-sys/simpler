@@ -21,6 +21,10 @@
 #include "pto_runtime2_types.h"
 #include <stdbool.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // =============================================================================
 // Bounding Box Computation
 // =============================================================================
@@ -552,5 +556,9 @@ void pto2_region_to_logical_tensor(
     const PTO2TensorRegion* region,
     PTO2LogicalTensor* tensor
 );
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif // PTO_LOGICAL_TENSOR_H

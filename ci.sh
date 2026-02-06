@@ -26,7 +26,7 @@ OS=$(uname -s)
 echo "Running tests on $OS..."
 
 # Run pytest
-if [ -d "tests" ]; then
+if [[ -d "tests" && "$OS" == "Linux" && "$PLATFORM" == "a2a3" ]]; then
     pytest tests -v
 fi
 

@@ -38,12 +38,17 @@ endif()
 # Create shared library
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 
+# C++ standard (applied only to C++ files)
+set_target_properties(host_runtime PROPERTIES
+    CXX_STANDARD 17
+    CXX_STANDARD_REQUIRED ON
+)
+
 # Compile options (matching AICPU pattern)
 target_compile_options(host_runtime
     PRIVATE
         -Wall
         -Wextra
-        -std=c++17
         -fPIC
         -O3
         -g
