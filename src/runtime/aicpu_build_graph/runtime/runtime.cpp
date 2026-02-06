@@ -11,7 +11,7 @@
 // Constructor
 // =============================================================================
 
-Runtime::Runtime() {
+	Runtime::Runtime() {
     // NOTE: host_api is initialized in InitRuntime() (host-only code)
     // because the CApi functions don't exist when compiled for device.
 
@@ -31,21 +31,22 @@ Runtime::Runtime() {
         memset(tasks[i].args, 0, sizeof(tasks[i].args));
         memset(tasks[i].fanout, 0, sizeof(tasks[i].fanout));
     }
-    next_task_id = 0;
-    initial_ready_count = 0;
-    worker_count = 0;
-    sche_cpu_num = 1;
-    tensor_pair_count = 0;
+	    next_task_id = 0;
+	    initial_ready_count = 0;
+	    worker_count = 0;
+	    sche_cpu_num = 1;
+	    tensor_pair_count = 0;
+	    device_alloc_count = 0;
 
     orch_argc = 0;
     memset(orch_args, 0, sizeof(orch_args));
     memset(kernel_addrs, 0, sizeof(kernel_addrs));
-    aicpu_orch_so_dev_addr = 0;
-    aicpu_orch_so_size = 0;
-    memset(aicpu_orch_func_name, 0, sizeof(aicpu_orch_func_name));
-    strncpy(aicpu_orch_func_name, "build_graph_aicpu", sizeof(aicpu_orch_func_name) - 1);
-    build_mode = 1;  // default to concurrent build||schedule
-}
+	    aicpu_orch_so_dev_addr = 0;
+	    aicpu_orch_so_size = 0;
+	    memset(aicpu_orch_func_name, 0, sizeof(aicpu_orch_func_name));
+	    strncpy(aicpu_orch_func_name, "build_graph_aicpu", sizeof(aicpu_orch_func_name) - 1);
+	    build_mode = 1;  // default to concurrent build||schedule
+	}
 
 // =============================================================================
 // Task Management
@@ -241,6 +242,23 @@ void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
     printf("Recorded tensor pair: host=%p dev=%p size=%zu\n", host_ptr, dev_ptr, size);
 }
 
+void Runtime::record_device_alloc(void* dev_ptr) {
+    if (dev_ptr == nullptr) {
+        return;
+    }
+    for (int i = 0; i < device_alloc_count; ++i) {
+        if (device_allocs[i].dev_ptr == dev_ptr) {
+            return;
+        }
+    }
+    if (device_alloc_count >= RUNTIME_MAX_TENSOR_PAIRS) {
+        fprintf(stderr, "[Runtime] ERROR: Device allocs full (max=%d)\n", RUNTIME_MAX_TENSOR_PAIRS);
+        return;
+    }
+    device_allocs[device_alloc_count].dev_ptr = dev_ptr;
+    device_alloc_count++;
+}
+
 TensorPair* Runtime::get_tensor_pairs() {
     return tensor_pairs;
 }
@@ -249,6 +267,18 @@ int Runtime::get_tensor_pair_count() const {
     return tensor_pair_count;
 }
 
+DeviceAlloc* Runtime::get_device_allocs() {
+    return device_allocs;
+}
+
+int Runtime::get_device_alloc_count() const {
+    return device_alloc_count;
+}
+
 void Runtime::clear_tensor_pairs() {
     tensor_pair_count = 0;
+}
+
+void Runtime::clear_device_allocs() {
+    device_alloc_count = 0;
 }

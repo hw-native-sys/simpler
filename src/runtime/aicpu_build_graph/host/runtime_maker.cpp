@@ -145,22 +145,25 @@ int init_runtime_impl(Runtime* runtime,
         return -1;
     }
 
-    // Load orchestration SO from binary data via temp file
-    char fd_path[128];
-    snprintf(fd_path, sizeof(fd_path), "/tmp/orch_so_%d.so", getpid());
-
-    int fd = open(fd_path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
+    // Load orchestration SO from binary data via a unique temp file.
+    // This mirrors the runner's pattern and avoids collisions across threads.
+    char fd_path[] = "/tmp/orch_so_XXXXXX";
+    int fd = mkstemp(fd_path);
     if (fd < 0) {
-        std::cerr << "Error: Failed to create temp SO file\n";
+        std::cerr << "Error: Failed to create temp SO file (mkstemp)\n";
         return -1;
     }
 
-    ssize_t written = write(fd, orch_so_binary, orch_so_size);
-    if (written < 0 || static_cast<size_t>(written) != orch_so_size) {
-        std::cerr << "Error: Failed to write orchestration SO to temp file\n";
-        close(fd);
-        unlink(fd_path);
-        return -1;
+    size_t off = 0;
+    while (off < orch_so_size) {
+        ssize_t n = write(fd, orch_so_binary + off, orch_so_size - off);
+        if (n <= 0) {
+            std::cerr << "Error: Failed to write orchestration SO to temp file\n";
+            close(fd);
+            unlink(fd_path);
+            return -1;
+        }
+        off += static_cast<size_t>(n);
     }
     close(fd);
 
@@ -261,10 +264,49 @@ int validate_runtime_impl(Runtime* runtime) {
 
     // Cleanup device tensors
     std::cout << "\n=== Cleaning Up ===" << '\n';
-    for (int i = 0; i < tensor_pair_count; i++) {
-        runtime->host_api.device_free(tensor_pairs[i].dev_ptr);
+
+    DeviceAlloc* device_allocs = runtime->get_device_allocs();
+    int device_alloc_count = runtime->get_device_alloc_count();
+
+    auto is_recorded_alloc = [&](void* dev_ptr) -> bool {
+        if (dev_ptr == nullptr) {
+            return false;
+        }
+        for (int i = 0; i < device_alloc_count; ++i) {
+            if (device_allocs[i].dev_ptr == dev_ptr) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    int freed_allocs = 0;
+    for (int i = 0; i < device_alloc_count; ++i) {
+        void* p = device_allocs[i].dev_ptr;
+        if (p == nullptr) {
+            continue;
+        }
+        runtime->host_api.device_free(p);
+        freed_allocs++;
     }
-    std::cout << "Freed " << tensor_pair_count << " device tensors\n";
+
+    // Backward-compatible fallback: if orchestration didn't register allocations,
+    // at least free the device pointers that were recorded for copy-back.
+    int freed_pairs = 0;
+    for (int i = 0; i < tensor_pair_count; i++) {
+        void* p = tensor_pairs[i].dev_ptr;
+        if (p == nullptr) {
+            continue;
+        }
+        if (is_recorded_alloc(p)) {
+            continue;
+        }
+        runtime->host_api.device_free(p);
+        freed_pairs++;
+    }
+
+    std::cout << "Freed " << freed_allocs << " recorded device allocation(s) and " << freed_pairs
+              << " tensor-pair device pointer(s)\n";
 
     // Cleanup AICPU orchestration plugin bytes (if uploaded by orchestration).
     if (runtime->aicpu_orch_so_dev_addr != 0 && runtime->aicpu_orch_so_size != 0) {
@@ -277,6 +319,7 @@ int validate_runtime_impl(Runtime* runtime) {
 
     // Clear tensor pairs
     runtime->clear_tensor_pairs();
+    runtime->clear_device_allocs();
 
     std::cout << "=== Finalize Complete ===" << '\n';
 

@@ -73,6 +73,9 @@ int prepare_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
         std::cerr << "prepare_example_graph: device_malloc failed\n";
         return -1;
     }
+    runtime->record_device_alloc(dev_a);
+    runtime->record_device_alloc(dev_b);
+    runtime->record_device_alloc(dev_f);
     runtime->host_api.copy_to_device(dev_a, host_a, size_a);
     runtime->host_api.copy_to_device(dev_b, host_b, size_b);
 
@@ -88,6 +91,9 @@ int prepare_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
         std::cerr << "prepare_example_graph: intermediate malloc failed\n";
         return -1;
     }
+    runtime->record_device_alloc(dev_c);
+    runtime->record_device_alloc(dev_d);
+    runtime->record_device_alloc(dev_e);
 
     // Marshal device pointers for AICPU builder:
     // orch_args = [dev_a, dev_b, dev_c, dev_d, dev_e, dev_f, SIZE]

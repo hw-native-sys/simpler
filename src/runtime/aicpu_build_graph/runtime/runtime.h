@@ -120,6 +120,17 @@ struct TensorPair {
 };
 
 /**
+ * Device allocations tracked for cleanup in finalize.
+ *
+ * This is distinct from TensorPair: not every device allocation needs copy-back.
+ * Orchestration code should register any device buffers it allocates so the
+ * runtime can free them in validate_runtime_impl().
+ */
+struct DeviceAlloc {
+    void* dev_ptr;
+};
+
+/**
  * Host API function pointers for device memory operations.
  * Allows runtime to use pluggable device memory backends.
  */
@@ -262,6 +273,10 @@ private:
     TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
     int tensor_pair_count;
 
+    // Device allocations for cleanup (no copy-back implied).
+    DeviceAlloc device_allocs[RUNTIME_MAX_TENSOR_PAIRS];
+    int device_alloc_count;
+
 public:
     /**
      * Constructor - zero-initialize all arrays
@@ -360,6 +375,13 @@ public:
     void record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size);
 
     /**
+     * Record a device allocation for cleanup during finalize.
+     *
+     * This does not imply copy-back; it only affects `validate_runtime_impl()`.
+     */
+    void record_device_alloc(void* dev_ptr);
+
+    /**
      * Get pointer to tensor pairs array.
      *
      * @return Pointer to tensor pairs array
@@ -374,9 +396,28 @@ public:
     int get_tensor_pair_count() const;
 
     /**
+     * Get pointer to device allocations array.
+     *
+     * @return Pointer to device allocations array
+     */
+    DeviceAlloc* get_device_allocs();
+
+    /**
+     * Get number of recorded device allocations.
+     *
+     * @return Number of device allocations
+     */
+    int get_device_alloc_count() const;
+
+    /**
      * Clear all recorded tensor pairs.
      */
     void clear_tensor_pairs();
+
+    /**
+     * Clear all recorded device allocations.
+     */
+    void clear_device_allocs();
 
     // =========================================================================
     // Host API (host-only, not copied to device)

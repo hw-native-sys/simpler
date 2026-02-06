@@ -1,4 +1,5 @@
 #include <dlfcn.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -34,7 +35,7 @@ namespace {
 using AicpuBuilderFunc = int (*)(Runtime*);
 
 int write_bytes_to_file(const char* path, const uint8_t* data, size_t size) {
-    int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
+    int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
     if (fd < 0) {
         return -1;
     }
@@ -51,6 +52,25 @@ int write_bytes_to_file(const char* path, const uint8_t* data, size_t size) {
     return 0;
 }
 
+void ensure_current_so_is_global(int thread_idx) {
+    static std::once_flag once;
+    std::call_once(once, [&]() {
+        Dl_info info;
+        if (::dladdr(reinterpret_cast<void*>(&ensure_current_so_is_global), &info) == 0 || info.dli_fname == nullptr ||
+            info.dli_fname[0] == '\0') {
+            DEV_WARN("Thread %d: dladdr failed; cannot promote current AICPU runtime .so to RTLD_GLOBAL", thread_idx);
+            return;
+        }
+        void* h = ::dlopen(info.dli_fname, RTLD_NOW | RTLD_GLOBAL);
+        if (h == nullptr) {
+            DEV_WARN("Thread %d: dlopen(self, RTLD_GLOBAL) failed: %s", thread_idx, ::dlerror());
+            return;
+        }
+        DEV_INFO("Thread %d: Promoted current AICPU runtime .so to RTLD_GLOBAL: %s", thread_idx, info.dli_fname);
+        // Intentionally leak `h` for process lifetime.
+    });
+}
+
 int build_graph_via_aicpu_plugin(Runtime* runtime, int thread_idx) {
     if (runtime == nullptr) {
         return -1;
@@ -64,24 +84,55 @@ int build_graph_via_aicpu_plugin(Runtime* runtime, int thread_idx) {
     const uint8_t* so_data = reinterpret_cast<const uint8_t*>(runtime->aicpu_orch_so_dev_addr);
     size_t so_size = static_cast<size_t>(runtime->aicpu_orch_so_size);
 
-    char so_path[128];
-    snprintf(so_path, sizeof(so_path), "/tmp/aicpu_orch_%p_%d.so", (void*)runtime, thread_idx);
+    // On some real AICPU configurations, /dev/shm, /tmp, and memfd may be mounted `noexec`,
+    // so we try multiple candidate directories that may allow dlopen() execution.
+    const char* candidate_dirs[] = {
+        "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device",
+        "/usr/lib64",
+        "/lib64",
+        "/var/tmp",
+        "/tmp",
+    };
+    constexpr int num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
 
-    DEV_INFO("Thread %d: Builder loading AICPU orch plugin %s (bytes=%lu, sym=%s)",
-        thread_idx,
-        so_path,
-        static_cast<uint64_t>(so_size),
-        sym);
+    // Ensure the current runtime .so's symbols are visible to the dynamic loader.
+    // This helps the plugin resolve `aicpu_runtime_*` symbols at dlopen time even
+    // if the initial loader didn't use RTLD_GLOBAL.
+    ensure_current_so_is_global(thread_idx);
 
-    if (write_bytes_to_file(so_path, so_data, so_size) != 0) {
-        DEV_ERROR("Thread %d: Failed to write AICPU orch plugin to %s", thread_idx, so_path);
-        return -1;
+    void* handle = nullptr;
+    const char* last_err = nullptr;
+    char so_path[256]{};
+    for (int i = 0; i < num_candidates; ++i) {
+        snprintf(so_path, sizeof(so_path), "%s/libaicpu_orch_%p_%d.so", candidate_dirs[i], (void*)runtime, thread_idx);
+
+        DEV_INFO("Thread %d: Trying AICPU orch plugin path %s (bytes=%lu, sym=%s)",
+            thread_idx,
+            so_path,
+            static_cast<uint64_t>(so_size),
+            sym);
+
+        if (write_bytes_to_file(so_path, so_data, so_size) != 0) {
+            DEV_INFO("Thread %d: Cannot create/write plugin at %s (errno=%d), trying next",
+                thread_idx,
+                so_path,
+                errno);
+            continue;
+        }
+
+        handle = ::dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
+        last_err = ::dlerror();
+        ::unlink(so_path);
+        if (handle != nullptr) {
+            break;
+        }
+        DEV_INFO("Thread %d: dlopen failed for %s: %s", thread_idx, so_path, last_err ? last_err : "<null>");
     }
 
-    void* handle = ::dlopen(so_path, RTLD_NOW | RTLD_LOCAL);
-    ::unlink(so_path);
     if (handle == nullptr) {
-        DEV_ERROR("Thread %d: dlopen failed for AICPU orch plugin: %s", thread_idx, ::dlerror());
+        DEV_ERROR("Thread %d: dlopen failed for AICPU orch plugin in all candidate dirs: %s",
+            thread_idx,
+            last_err ? last_err : "<null>");
         return -1;
     }
 
@@ -211,6 +262,23 @@ int AicpuExecutor::init(Runtime* runtime) {
 
     // Assign discovered cores to threads
     assign_cores_to_threads();
+
+    // Hard error: scheduler threads must have at least one assigned core.
+    // Otherwise, they will spin in resolve_and_dispatch() and eventually timeout.
+    for (int t = BUILDER_THREAD_NUM; t < thread_num_; ++t) {
+        if (thread_core_counts_[t] <= 0) {
+            DEV_ERROR(
+                "Invalid core assignment: scheduler thread %d has core_num=%d (aic=%d aiv=%d total=%d sched_threads=%d)",
+                t,
+                thread_core_counts_[t],
+                aic_count_,
+                aiv_count_,
+                cores_total_num_,
+                schedule_thread_num_);
+            init_failed_.store(true, std::memory_order_release);
+            return -1;
+        }
+    }
 
     // Initialize runtime execution state
     completed_tasks_.store(0, std::memory_order_release);
@@ -693,6 +761,11 @@ int AicpuExecutor::run(Runtime* runtime) {
 
         const int* cur_thread_cores = core_assignments_[thread_idx];
         int core_num = thread_core_counts_[thread_idx];
+
+        if (core_num <= 0) {
+            DEV_ERROR("Thread %d: Scheduler has core_num=%d, aborting", thread_idx, core_num);
+            return -1;
+        }
 
         // Handshaking is already done in init() - no per-thread handshake needed
         DEV_INFO("Thread %d: Scheduler starting (core_num=%d)", thread_idx, core_num);
