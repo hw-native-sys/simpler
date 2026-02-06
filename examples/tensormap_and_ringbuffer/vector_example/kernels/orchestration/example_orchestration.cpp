@@ -139,71 +139,71 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     int32_t sz = (int32_t)BYTES;
     if (sz <= 0) sz = (int32_t)size_a;
 
-    PTO2_SCOPE_BEGIN(rt);
+    // Use RAII scope guard for automatic scope management.
+    // PTO2_SCOPE creates a scoped block where pto2_rt_scope_begin() is called
+    // at the start and pto2_rt_scope_end() is called automatically at the end
+    // (even in error paths). This eliminates manual cleanup and prevents bugs.
+    // See src/runtime/rt2/runtime/pto_runtime2.h for alternative usage patterns.
+    PTO2_SCOPE(rt) {
+        // t0: c = a + b (kernel_id=0, kernel_add)
+        PTO2TaskParam params_t0[] = {
+            PTO2_INPUT(dev_a, tile, sz),
+            PTO2_INPUT(dev_b, tile, sz),
+            PTO2_OUTPUT(dev_c, tile, sz),
+        };
+        if (pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, nullptr, "kernel_add", params_t0, 3) < 0) {
+            pto2_rt_orchestration_done(rt);
+            pto2_runtime_destroy(rt);
+            *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
+            return;
+        }
 
-    // t0: c = a + b (kernel_id=0, kernel_add)
-    PTO2TaskParam params_t0[] = {
-        PTO2_INPUT(dev_a, tile, sz),
-        PTO2_INPUT(dev_b, tile, sz),
-        PTO2_OUTPUT(dev_c, tile, sz),
-    };
-    if (pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, nullptr, "kernel_add", params_t0, 3) < 0) {
-        PTO2_SCOPE_END(rt);
-        pto2_rt_orchestration_done(rt);
-        pto2_runtime_destroy(rt);
-        *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
-        return;
-    }
+        // t1: d = c + 1 (kernel_id=1, kernel_add_scalar)
+        PTO2TaskParam params_t1[] = {
+            PTO2_INPUT(dev_c, tile, sz),
+            PTO2_OUTPUT(dev_d, tile, sz),
+        };
+        if (pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, nullptr, "kernel_add_scalar", params_t1, 2) < 0) {
+            pto2_rt_orchestration_done(rt);
+            pto2_runtime_destroy(rt);
+            *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
+            return;
+        }
 
-    // t1: d = c + 1 (kernel_id=1, kernel_add_scalar)
-    PTO2TaskParam params_t1[] = {
-        PTO2_INPUT(dev_c, tile, sz),
-        PTO2_OUTPUT(dev_d, tile, sz),
-    };
-    if (pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, nullptr, "kernel_add_scalar", params_t1, 2) < 0) {
-        PTO2_SCOPE_END(rt);
-        pto2_rt_orchestration_done(rt);
-        pto2_runtime_destroy(rt);
-        *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
-        return;
-    }
+        // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
+        PTO2TaskParam params_t2[] = {
+            PTO2_INPUT(dev_c, tile, sz),
+            PTO2_OUTPUT(dev_e, tile, sz),
+        };
+        if (pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, nullptr, "kernel_add_scalar", params_t2, 2) < 0) {
+            pto2_rt_orchestration_done(rt);
+            pto2_runtime_destroy(rt);
+            *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
+            return;
+        }
 
-    // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
-    PTO2TaskParam params_t2[] = {
-        PTO2_INPUT(dev_c, tile, sz),
-        PTO2_OUTPUT(dev_e, tile, sz),
-    };
-    if (pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, nullptr, "kernel_add_scalar", params_t2, 2) < 0) {
-        PTO2_SCOPE_END(rt);
-        pto2_rt_orchestration_done(rt);
-        pto2_runtime_destroy(rt);
-        *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
-        return;
-    }
+        // t3: f = d * e (kernel_id=2, kernel_mul)
+        PTO2TaskParam params_t3[] = {
+            PTO2_INPUT(dev_d, tile, sz),
+            PTO2_INPUT(dev_e, tile, sz),
+            PTO2_OUTPUT(dev_f, tile, sz),
+        };
+        int32_t task3_id = pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, nullptr, "kernel_mul", params_t3, 3);
+        if (task3_id < 0) {
+            pto2_rt_orchestration_done(rt);
+            pto2_runtime_destroy(rt);
+            *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
+            return;
+        }
 
-    // t3: f = d * e (kernel_id=2, kernel_mul)
-    PTO2TaskParam params_t3[] = {
-        PTO2_INPUT(dev_d, tile, sz),
-        PTO2_INPUT(dev_e, tile, sz),
-        PTO2_OUTPUT(dev_f, tile, sz),
-    };
-    int32_t task3_id = pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, nullptr, "kernel_mul", params_t3, 3);
-    if (task3_id < 0) {
-        PTO2_SCOPE_END(rt);
-        pto2_rt_orchestration_done(rt);
-        pto2_runtime_destroy(rt);
-        *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
-        return;
-    }
+        // Set graph output pointer for host copy-back
+        void* graph_out_ptr = pto2_rt_get_output(rt, task3_id, 0);
+        if (graph_out_ptr && size_f > 0) {
+            rt->sm_handle->header->graph_output_ptr = (uint64_t)(uintptr_t)graph_out_ptr;
+            rt->sm_handle->header->graph_output_size = (int32_t)size_f;
+        }
+    } // PTO2_SCOPE ends here - automatic pto2_rt_scope_end() called
 
-    // Set graph output pointer for host copy-back
-    void* graph_out_ptr = pto2_rt_get_output(rt, task3_id, 0);
-    if (graph_out_ptr && size_f > 0) {
-        rt->sm_handle->header->graph_output_ptr = (uint64_t)(uintptr_t)graph_out_ptr;
-        rt->sm_handle->header->graph_output_size = (int32_t)size_f;
-    }
-
-    PTO2_SCOPE_END(rt);
     pto2_rt_orchestration_done(rt);
     pto2_runtime_destroy(rt);
 
