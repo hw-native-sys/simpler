@@ -63,6 +63,12 @@
 #define RUNTIME_MAX_FUNC_ID 64
 #endif
 
+// Max size of the AICPU orchestration plugin (.so) embedded in Runtime.
+// This storage is read by AICPU and written to an executable temp file for dlopen().
+#ifndef RUNTIME_MAX_AICPU_ORCH_SO_SIZE
+#define RUNTIME_MAX_AICPU_ORCH_SO_SIZE (1024 * 1024)  // 1MB
+#endif
+
 // =============================================================================
 // Data Structures
 // =============================================================================
@@ -270,7 +276,7 @@ public:
      * AICPU orchestration plugin (device-side dlopen builder).
      *
      * When set by host orchestration, the AICPU builder thread will:
-     * - materialize the `.so` bytes from `aicpu_orch_so_dev_addr` into a temp file
+     * - materialize the embedded `.so` bytes into a temp file
      * - `dlopen()` the temp file on AICPU
      * - `dlsym()` the entry function `aicpu_orch_func_name`
      * - call `int (*)(Runtime*)`
@@ -278,9 +284,13 @@ public:
      * This enables updating graph-building logic by uploading only a small
      * orchestration plugin `.so` (instead of relinking/reuploading the full runtime).
      */
-    uint64_t aicpu_orch_so_dev_addr;
+    uint8_t aicpu_orch_so_storage[RUNTIME_MAX_AICPU_ORCH_SO_SIZE];
     uint32_t aicpu_orch_so_size;
     char aicpu_orch_func_name[64];
+
+    void set_aicpu_orch_so(const void* data, size_t size);
+    const void* get_aicpu_orch_so_data() const;
+    size_t get_aicpu_orch_so_size() const;
 
     /**
      * Build mode:

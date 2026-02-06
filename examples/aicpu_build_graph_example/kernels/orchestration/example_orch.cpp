@@ -106,7 +106,7 @@ int prepare_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
     runtime->orch_args[5] = reinterpret_cast<uint64_t>(dev_f);
     runtime->orch_args[6] = static_cast<uint64_t>(SIZE);
 
-    // Upload AICPU-side orchestration plugin (.so) so the builder can dlopen+dlsym it on device.
+    // Provide AICPU-side orchestration plugin bytes (.so) so the builder can dlopen+dlsym it on device.
     //
     // This decouples the graph-building program from the runtime binary: updating the orchestration
     // only requires shipping a small plugin `.so`, rather than relinking/reuploading the full runtime.
@@ -120,15 +120,7 @@ int prepare_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
         return -1;
     }
 
-    void* dev_so = runtime->host_api.device_malloc(so_bytes.size());
-    if (!dev_so) {
-        std::cerr << "prepare_example_graph: device_malloc failed for AICPU orch plugin\n";
-        return -1;
-    }
-    runtime->host_api.copy_to_device(dev_so, so_bytes.data(), so_bytes.size());
-
-    runtime->aicpu_orch_so_dev_addr = reinterpret_cast<uint64_t>(dev_so);
-    runtime->aicpu_orch_so_size = static_cast<uint32_t>(so_bytes.size());
+    runtime->set_aicpu_orch_so(so_bytes.data(), so_bytes.size());
     memset(runtime->aicpu_orch_func_name, 0, sizeof(runtime->aicpu_orch_func_name));
     if (aicpu_orch_func && aicpu_orch_func[0] != '\0') {
         strncpy(runtime->aicpu_orch_func_name, aicpu_orch_func, sizeof(runtime->aicpu_orch_func_name) - 1);
@@ -136,7 +128,7 @@ int prepare_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
         strncpy(runtime->aicpu_orch_func_name, "build_graph_aicpu", sizeof(runtime->aicpu_orch_func_name) - 1);
     }
 
-    std::cout << "prepare_example_graph: uploaded AICPU orch plugin " << (aicpu_orch_path ? aicpu_orch_path : "<unset>")
+    std::cout << "prepare_example_graph: loaded AICPU orch plugin " << (aicpu_orch_path ? aicpu_orch_path : "<unset>")
               << " (" << so_bytes.size() << " bytes), func=" << runtime->aicpu_orch_func_name << "\n";
 
     return 0;

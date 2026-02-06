@@ -80,13 +80,14 @@ int build_graph_via_aicpu_plugin(Runtime* runtime, int thread_idx) {
         return -1;
     }
 
-    if (runtime->aicpu_orch_so_dev_addr == 0 || runtime->aicpu_orch_so_size == 0) {
+    const void* so_data_v = runtime->get_aicpu_orch_so_data();
+    size_t so_size = runtime->get_aicpu_orch_so_size();
+    if (so_data_v == nullptr || so_size == 0) {
         return -2;  // caller fallback
     }
 
     const char* sym = (runtime->aicpu_orch_func_name[0] != '\0') ? runtime->aicpu_orch_func_name : "build_graph_aicpu";
-    const uint8_t* so_data = reinterpret_cast<const uint8_t*>(runtime->aicpu_orch_so_dev_addr);
-    size_t so_size = static_cast<size_t>(runtime->aicpu_orch_so_size);
+    const uint8_t* so_data = reinterpret_cast<const uint8_t*>(so_data_v);
 
     // On some real AICPU configurations, /dev/shm, /tmp, and memfd may be mounted `noexec`,
     // so we try multiple candidate directories that may allow dlopen() execution.

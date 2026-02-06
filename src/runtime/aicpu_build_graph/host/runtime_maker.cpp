@@ -308,14 +308,8 @@ int validate_runtime_impl(Runtime* runtime) {
     std::cout << "Freed " << freed_allocs << " recorded device allocation(s) and " << freed_pairs
               << " tensor-pair device pointer(s)\n";
 
-    // Cleanup AICPU orchestration plugin bytes (if uploaded by orchestration).
-    if (runtime->aicpu_orch_so_dev_addr != 0 && runtime->aicpu_orch_so_size != 0) {
-        runtime->host_api.device_free(reinterpret_cast<void*>(runtime->aicpu_orch_so_dev_addr));
-        std::cout << "Freed AICPU orch plugin: " << runtime->aicpu_orch_so_size << " bytes\n";
-        runtime->aicpu_orch_so_dev_addr = 0;
-        runtime->aicpu_orch_so_size = 0;
-        memset(runtime->aicpu_orch_func_name, 0, sizeof(runtime->aicpu_orch_func_name));
-    }
+    // Note: AICPU orchestration plugin bytes are embedded in `Runtime` and do not
+    // require device_free(). (They may be overwritten next run.)
 
     // Clear tensor pairs
     runtime->clear_tensor_pairs();

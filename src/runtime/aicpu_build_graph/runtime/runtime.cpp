@@ -38,16 +38,41 @@ Runtime::Runtime() {
 	    tensor_pair_count = 0;
 	    device_alloc_count = 0;
 
-    orch_argc = 0;
-    memset(orch_args, 0, sizeof(orch_args));
-    memset(kernel_addrs, 0, sizeof(kernel_addrs));
-	    aicpu_orch_so_dev_addr = 0;
+	    orch_argc = 0;
+	    memset(orch_args, 0, sizeof(orch_args));
+	    memset(kernel_addrs, 0, sizeof(kernel_addrs));
 	    aicpu_orch_so_size = 0;
+	    memset(aicpu_orch_so_storage, 0, sizeof(aicpu_orch_so_storage));
 	    memset(aicpu_orch_func_name, 0, sizeof(aicpu_orch_func_name));
 	    strncpy(aicpu_orch_func_name, "build_graph_aicpu", sizeof(aicpu_orch_func_name) - 1);
 	    build_mode = 1;  // default to concurrent build||schedule
 	    aicpu_build_api = {};
 	}
+
+void Runtime::set_aicpu_orch_so(const void* data, size_t size) {
+    if (data == nullptr || size == 0) {
+        aicpu_orch_so_size = 0;
+        return;
+    }
+    if (size > sizeof(aicpu_orch_so_storage)) {
+        fprintf(stderr,
+            "[Runtime] ERROR: AICPU orchestration plugin too large (%zu > %zu)\n",
+            size,
+            sizeof(aicpu_orch_so_storage));
+        aicpu_orch_so_size = 0;
+        return;
+    }
+    memcpy(aicpu_orch_so_storage, data, size);
+    aicpu_orch_so_size = static_cast<uint32_t>(size);
+}
+
+const void* Runtime::get_aicpu_orch_so_data() const {
+    return aicpu_orch_so_size > 0 ? aicpu_orch_so_storage : nullptr;
+}
+
+size_t Runtime::get_aicpu_orch_so_size() const {
+    return static_cast<size_t>(aicpu_orch_so_size);
+}
 
 // =============================================================================
 // Task Management
