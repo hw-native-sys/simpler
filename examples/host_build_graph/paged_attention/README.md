@@ -1,10 +1,21 @@
-# Paged Attention Example - Simulation Platform (a2a3sim)
+# Paged Attention CCE Example
 
-This example demonstrates Paged Attention implementation with AIC/AIV kernel splitting using the thread-based simulation platform.
+This example demonstrates Paged Attention implementation using CCE (Cube Core Engine) code generation, with AIC matmul kernels and AIV vector kernels using PTO Tile API.
 
 ## Overview
 
-Paged Attention is an efficient attention mechanism that processes KV cache in fixed-size blocks, enabling memory-efficient inference for long sequences. This implementation uses the Online Softmax algorithm for numerically stable incremental computation.
+Paged Attention is an efficient attention mechanism that processes KV cache in fixed-size blocks, enabling memory-efficient inference for long sequences. This implementation uses:
+
+- **CCE-style codegen** for AIC kernels (Cube unit matmul)
+- **PTO Tile API** for AIV kernels (Vector unit operations)
+- **Online Softmax** algorithm for numerically stable incremental computation
+
+### Supported Platforms
+
+| Platform | Description |
+|----------|-------------|
+| a2a3sim | Thread-based simulator |
+| a2a3 | Ascend hardware (requires device ID) |
 
 ### Algorithm
 
@@ -12,20 +23,26 @@ For each query token, the attention is computed incrementally across KV cache bl
 
 ```
 For each block j:
-    sij = Qi @ Kj.T                    # QK MatMul
-    pij = softmax(sij * scale)         # Softmax
-    oi_new = pij @ Vj                  # PV MatMul
-    oi = online_update(oi, oi_new)     # Accumulate with Online Softmax
+    sij = Qi @ Kj^T                    # QK MatMul (AIC)
+    mij, lij, pij = softmax_prepare(sij)  # Softmax (AIV)
+    oi_new = pij @ Vj                  # PV MatMul (AIC)
+    oi = online_update(oi, oi_new, mij, lij)  # Accumulate (AIV)
 ```
 
 ### Kernel Design (AIC/AIV Split)
 
-| Kernel | Core Type | Operation |
-|--------|-----------|-----------|
-| `aic_qk_matmul` | AIC (Cube) | Q @ K^T matrix multiplication |
-| `aiv_softmax_prepare` | AIV (Vector) | scale, rowmax, exp, rowsum |
-| `aic_pv_matmul` | AIC (Cube) | P @ V matrix multiplication |
-| `aiv_online_update` | AIV (Vector) | Online Softmax accumulation + normalize |
+| Kernel | Core Type | Operation | Key Instructions |
+|--------|-----------|-----------|------------------|
+| aic_qk_matmul | AIC (Cube) | Q @ K^T | TLOAD/TMOV/TMATMUL/TSTORE |
+| aiv_softmax_prepare | AIV (Vector) | scale, rowmax, exp, rowsum | TMULS/TROWMAX/TROWEXPANDSUB/TEXP/TROWSUM |
+| aic_pv_matmul | AIC (Cube) | P @ V | TLOAD/TMOV/TMATMUL/TSTORE |
+| aiv_online_update | AIV (Vector) | Online Softmax + normalize | TMAX/TSUB/TEXP/TROWEXPANDMUL/TROWEXPANDDIV |
+
+### Memory Hierarchy (AIC Matmul)
+
+```
+GM -> L1 (Mat tiles) -> L0A/L0B -> L0C (Accumulator) -> GM
+```
 
 ### Task Graph Structure
 
@@ -33,167 +50,152 @@ For each batch, the task dependency pattern is:
 
 ```
 Block 0: QK -> SF -> PV --+
-Block 1: QK -> SF -> PV --+--> UP[0] -> UP[1] -> UP[2] -> UP[3]
-Block 2: QK -> SF -> PV --+
-Block 3: QK -> SF -> PV --+
+Block 1: QK -> SF -> PV --+--> UP[0] -> UP[1] -> ... -> UP[n]
+Block n: QK -> SF -> PV --+
 ```
 
 - **QK/SF/PV chains**: Run in parallel across blocks
 - **UP (Online Update)**: Serialized within batch due to accumulator dependency
 
-## Dependencies
-
-- Python 3
-- NumPy
-- gcc/g++ compiler
-
-No Ascend SDK or CANN toolkit required.
-
 ## Quick Start
 
 ```bash
-# From repository root
+# Run on simulator
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph/paged_attention/kernels \
-  -g examples/host_build_graph/paged_attention/golden.py \
+  -k examples/paged_attention_cce/kernels \
+  -g examples/paged_attention_cce/golden.py \
   -p a2a3sim
 
-# With verbose output
+# Run on hardware (specify device ID)
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph/paged_attention/kernels \
-  -g examples/host_build_graph/paged_attention/golden.py \
-  -p a2a3sim \
-  -v
+  -k examples/paged_attention_cce/kernels \
+  -g examples/paged_attention_cce/golden.py \
+  -p a2a3 -d=13
+
+# Run multi-block test case
+PA_CASE=Case2 python examples/scripts/run_example.py \
+  -k examples/paged_attention_cce/kernels \
+  -g examples/paged_attention_cce/golden.py \
+  -p a2a3sim
 ```
 
 ## Directory Structure
 
 ```
-host_build_graph/paged_attention/
+paged_attention_cce/
 ├── README.md                    # This file
 ├── golden.py                    # Input generation and expected output
 └── kernels/
-    ├── kernel_config.py         # Kernel configuration
-    ├── aic/                      # AIC kernel implementations (Cube unit)
-    │   ├── aic_qk_matmul.cpp     # Q @ K^T matrix multiplication
-    │   └── aic_pv_matmul.cpp     # P @ V matrix multiplication
-    ├── aiv/                      # AIV kernel implementations (Vector unit)
+    ├── kernel_config.py         # Kernel registration config
+    ├── aic/                      # AIC kernels (CCE codegen style)
+    │   ├── aic_qk_matmul.cpp     # Q @ K^T matmul
+    │   └── aic_pv_matmul.cpp     # P @ V matmul
+    ├── aiv/                      # AIV kernels (PTO Tile API)
     │   ├── aiv_softmax_prepare.cpp  # Softmax preparation
     │   └── aiv_online_update.cpp    # Online Softmax update + normalize
     └── orchestration/
-        └── paged_attention_orch.cpp # Task graph building function
+        └── paged_attention_orch.cpp # Task graph builder
 ```
 
-## Files
+## Test Cases
 
-### `golden.py`
+| Case | batch | num_heads | head_dim | block_size | block_num | Description |
+|------|-------|-----------|----------|------------|-----------|-------------|
+| Case1 | 1 | 16 | 16 | 16 | 1 | Single block (default) |
+| Case2 | 1 | 16 | 16 | 16 | 4 | Multi-block (4 blocks) |
 
-Defines input tensors and expected output computation:
+All test cases use **16x16 tile dimensions** (256 elements, 1024 bytes per tile).
 
-```python
-__outputs__ = ["out"]
-TENSOR_ORDER = ["query", "key_cache", "value_cache", "block_table", 
-                "context_lens", "out", "config"]
+## Key Technical Details
 
-PARAMS_LIST = [
-    {
-        "batch": 2,
-        "num_heads": 16,
-        "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 64,
-        "block_num": 4,
-        "context_len": 256,
-    },
-]
+### AIC Kernels (CCE Codegen)
 
-def generate_inputs(params: dict) -> dict:
-    # Returns all tensors including config
+```cpp
+// L1 tiles: ColMajor + SLayout::RowMajor (required for matmul)
+using TileMatA = Tile<TileType::Mat, float, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
+using TileMatB = Tile<TileType::Mat, float, K, N, BLayout::ColMajor, K, N, SLayout::RowMajor, 512>;
 
-def compute_golden(tensors: dict, params: dict) -> None:
-    # Computes expected output using Online Softmax algorithm
+// L0 tiles: Use standard TileLeft/TileRight/TileAcc aliases
+using LeftTile = TileLeft<float, M, K, M, K>;
+using RightTile = TileRight<float, K, N, K, N>;
+using AccTile = TileAcc<float, M, N, M, N>;
+
+// Pipeline: MTE2 -> MTE1 -> M -> FIX -> MTE3
+TLOAD(aMatTile, qiGlobal);           // GM -> L1
+TMOV(aTile, aMatTile);               // L1 -> L0A
+TMATMUL(cTile, aTile, bTile);        // L0A x L0B -> L0C
+TSTORE(sijGlobal, cTile);            // L0C -> GM
 ```
 
-### `kernels/kernel_config.py`
+### AIV Kernels (PTO Tile API)
 
-Defines kernel sources and orchestration function:
+**softmax_prepare**: Uses DN layout (ColMajor, 16x1) for row reduction results
 
-```python
-KERNELS = [
-    {"func_id": 0, "source": ".../aic_qk_matmul.cpp",       "core_type": "aic"},
-    {"func_id": 1, "source": ".../aiv_softmax_prepare.cpp", "core_type": "aiv"},
-    {"func_id": 2, "source": ".../aic_pv_matmul.cpp",       "core_type": "aic"},
-    {"func_id": 3, "source": ".../aiv_online_update.cpp",   "core_type": "aiv"},
-]
+```cpp
+using TileScalarDN = Tile<TileType::Vec, float, kAlignedRows, 1, BLayout::ColMajor, kRows, 1>;
 
-ORCHESTRATION = {
-    "source": ".../paged_attention_orch.cpp",
-    "function_name": "build_paged_attention_graph"
-}
+TMULS(sijTile, sijTile, scale_value);      // Scale
+TROWMAX(maxTile, sijTile, tmpTile);        // Row max
+TROWEXPANDSUB(pijTile, sijTile, maxTile);  // Subtract max (broadcast)
+TEXP(pijTile, pijTile);                    // Exp
+TROWSUM(sumTile, pijTile, tmpTile);        // Row sum
 ```
 
-## Parameters
+**online_update**: Uses ND/DN layout conversion for hardware compatibility
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `batch` | Batch size | 2 |
-| `num_heads` | Number of query heads | 16 |
-| `kv_head_num` | Number of KV heads (for GQA) | 1 |
-| `head_dim` | Head dimension | 128 |
-| `block_size` | KV cache block size | 64 |
-| `block_num` | Number of blocks per batch | 4 |
-| `context_len` | Context length | 256 |
+```cpp
+// ND (1x16, RowMajor) for scalar arithmetic - TSUB/TMUL/TADD require RowMajor
+using TileScalarND = Tile<TileType::Vec, float, 1, kNumHeads, BLayout::RowMajor, 1, kNumHeads>;
+// DN (16x1, ColMajor) for row broadcast - TROWEXPANDMUL/TROWEXPANDDIV require this
+using TileScalarDN = Tile<TileType::Vec, float, kNumHeads, 1, BLayout::ColMajor, kNumHeads, 1>;
+
+// Arithmetic in ND layout
+TMAX(miNewTileND, miTileND, mijTileND);
+TSUB(alphaTileND, miTileND, miNewTileND);
+TEXP(alphaTileND, alphaTileND);
+
+// Reshape ND -> DN for broadcast operations
+TRESHAPE(alphaTileDN, alphaTileND);
+TROWEXPANDMUL(oiTile, oiTile, alphaTileDN);
+```
+
+### Data Layout
+
+- **K stored as K^T**: (head_dim, block_size) for direct matmul compatibility
+- **V stored normally**: (block_size, head_dim)
 
 ## Expected Output
 
 ```
-=== Building Runtime: host_build_graph (platform: a2a3sim) ===
-...
 === Compiling and Registering Kernels ===
 Compiling kernel: .../aic_qk_matmul.cpp (func_id=0)
 Compiling kernel: .../aiv_softmax_prepare.cpp (func_id=1)
 Compiling kernel: .../aic_pv_matmul.cpp (func_id=2)
 Compiling kernel: .../aiv_online_update.cpp (func_id=3)
 ...
-=== build_paged_attention_graph (multi-head per task) ===
-batch=2, num_heads=16, kv_head_num=1, head_dim=128
-block_size=64, block_num=4
+=== build_paged_attention_graph (16x16 framework version) ===
+batch=1, num_heads=16, kv_head_num=1, head_dim=16
+block_size=16, block_num=1
 ...
-Created 32 tasks
+Created 4 tasks
 ...
 === Comparing Results ===
-Comparing out: shape=(4096,), dtype=float32
-  out: PASS (4096/4096 elements matched)
+Comparing out: shape=(256,), dtype=float32
+  out: PASS (256/256 elements matched)
 
 ============================================================
 TEST PASSED
 ============================================================
 ```
 
-## Kernels
+## Reference
 
-### AIC Kernels (Cube Unit)
+This implementation corresponds to the PyPTO paged_attention.py:
+- /data/w00949583/pypto/examples/ir_parser/paged_attention.py
 
-- **aic_qk_matmul.cpp** - Computes Q @ K^T for all heads
-- **aic_pv_matmul.cpp** - Computes P @ V for all heads
-
-### AIV Kernels (Vector Unit)
-
-- **aiv_softmax_prepare.cpp** - Computes scale, rowmax, exp, rowsum for softmax
-- **aiv_online_update.cpp** - Online Softmax accumulation with fused final normalization
-
-## GQA Support
-
-This implementation supports Grouped Query Attention (GQA) where multiple query heads share a single KV head:
-
-```
-heads_per_kv = num_heads / kv_head_num
-```
-
-For example, with `num_heads=16` and `kv_head_num=1`, all 16 query heads share the same KV cache.
+Both implementations use the same Online Softmax algorithm with identical kernel structure.
 
 ## See Also
 
 - [Test Framework Documentation](../scripts/README.md)
-- [Simple Example](../host_build_graph_sim_example/) - Basic task graph example
-- [Main Project README](../../README.md)
+- [Paged Attention (original)](../paged_attention/) - PTO Tile API only version

@@ -1,19 +1,17 @@
 /**
- * Online Softmax Update + Normalize Kernel (AIV) - Multi-Head
+ * Online Softmax Update + Normalize Kernel (AIV) - 16x16 Version with PTO Tile API
  *
- * Processes ALL heads in one task.
- *
- * Memory layout:
- *   mij:    (num_heads,)             current block row max
- *   lij:    (num_heads,)             current block row sum
- *   oi_new: (num_heads, head_dim)    current block PV output
- *   mi:     (num_heads,)             accumulated max  (in/out)
- *   li:     (num_heads,)             accumulated sum  (in/out)
- *   oi:     (num_heads, head_dim)    accumulated out  (in/out)
- *   dst:    (num_heads, head_dim)    final output (written when is_last)
+ * For a2a3 hardware:
+ * - TSUB/TMUL/TADD only support RowMajor layout
+ * - TROWEXPANDMUL/TROWEXPANDDIV require ColMajor (DN) layout for scalar tile
+ * 
+ * Solution: Use (1, 16) RowMajor for scalar arithmetic, reshape to (16, 1) ColMajor for broadcast
  */
 #include <cstdint>
 #include <pto/pto-inst.hpp>
+#include <pto/common/constants.hpp>
+
+using namespace pto;
 
 #ifndef __gm__
 #define __gm__
@@ -23,19 +21,8 @@
 #define __aicore__ [aicore]
 #endif
 
-__aicore__ static inline float my_exp(float x) {
-    if (x < -88.0f) return 0.0f;
-    if (x > 88.0f) x = 88.0f;
-
-    float result = 1.0f + x * (1.0f + x * (0.5f + x * (0.166666667f +
-                   x * (0.041666667f + x * (0.008333333f + x * 0.001388889f)))));
-
-    int n = static_cast<int>(x * 1.4426950408889634f);
-    union { uint32_t i; float f; } bias;
-    bias.i = static_cast<uint32_t>((n + 127)) << 23;
-
-    return result * bias.f;
-}
+constexpr int kNumHeads = 16;
+constexpr int kHeadDim = 16;
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ float* mij    = reinterpret_cast<__gm__ float*>(args[0]);
@@ -47,38 +34,125 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     int is_first  = static_cast<int>(args[6]);
     int is_last   = static_cast<int>(args[7]);
     __gm__ float* dst    = reinterpret_cast<__gm__ float*>(args[8]);
-    int num_heads = static_cast<int>(args[9]);
-    int head_dim  = static_cast<int>(args[10]);
 
-    for (int h = 0; h < num_heads; h++) {
-        __gm__ float* oi_new_h = oi_new + h * head_dim;
-        __gm__ float* oi_h     = oi     + h * head_dim;
+    // GlobalTensor definitions
+    using GlobalData16x16 = GlobalTensor<float, Shape<1, 1, 1, kNumHeads, kHeadDim>, Stride<1, 1, 1, kHeadDim, 1>>;
+    // For scalar: ND layout (row-major, 1 x 16)
+    using GlobalScalarND = GlobalTensor<float, Shape<1, 1, 1, 1, kNumHeads>, Stride<1, 1, 1, kNumHeads, 1>>;
 
-        if (is_first) {
-            mi[h] = mij[h];
-            li[h] = lij[h];
-            for (int d = 0; d < head_dim; d++) {
-                oi_h[d] = oi_new_h[d];
-            }
-        } else {
-            float mi_new = (mi[h] > mij[h]) ? mi[h] : mij[h];
-            float alpha = my_exp(mi[h] - mi_new);
-            float beta  = my_exp(mij[h] - mi_new);
+    GlobalData16x16 oiNewGlobal(oi_new);
+    GlobalData16x16 oiGlobal(oi);
+    GlobalData16x16 dstGlobal(dst);
+    GlobalScalarND mijGlobal(mij);
+    GlobalScalarND lijGlobal(lij);
+    GlobalScalarND miGlobal(mi);
+    GlobalScalarND liGlobal(li);
 
-            li[h] = alpha * li[h] + beta * lij[h];
-            for (int d = 0; d < head_dim; d++) {
-                oi_h[d] = alpha * oi_h[d] + beta * oi_new_h[d];
-            }
-            mi[h] = mi_new;
-        }
+    // Tile types
+    using TileData16x16 = Tile<TileType::Vec, float, kNumHeads, kHeadDim, BLayout::RowMajor, kNumHeads, kHeadDim>;
+    // ND scalar tile for arithmetic (1 x 16, RowMajor) - TSUB/TMUL/TADD require RowMajor
+    using TileScalarND = Tile<TileType::Vec, float, 1, kNumHeads, BLayout::RowMajor, 1, kNumHeads>;
+    // DN scalar tile for row broadcast (16 x 1, ColMajor) - TROWEXPANDMUL/TROWEXPANDDIV require this
+    using TileScalarDN = Tile<TileType::Vec, float, kNumHeads, 1, BLayout::ColMajor, kNumHeads, 1>;
 
-        // Fused normalize on last block
-        if (is_last) {
-            float inv_li = 1.0f / li[h];
-            __gm__ float* dst_h = dst + h * head_dim;
-            for (int d = 0; d < head_dim; d++) {
-                dst_h[d] = oi_h[d] * inv_li;
-            }
-        }
+    TileData16x16 oiNewTile;
+    TileData16x16 oiTile;
+    TileScalarND mijTileND, lijTileND, miTileND, liTileND;
+    TileScalarND miNewTileND, alphaTileND, betaTileND, tmpScalarND;
+    TileScalarDN alphaTileDN, betaTileDN, liTileDN;
+
+    // Allocate tiles in UB
+    TASSIGN(oiNewTile, 0x0);
+    TASSIGN(oiTile, 0x400);
+    TASSIGN(mijTileND, 0x800);
+    TASSIGN(lijTileND, 0x840);
+    TASSIGN(miTileND, 0x880);
+    TASSIGN(liTileND, 0x8C0);
+    TASSIGN(miNewTileND, 0x900);
+    TASSIGN(alphaTileND, 0x940);
+    TASSIGN(betaTileND, 0x980);
+    TASSIGN(tmpScalarND, 0x9C0);
+    TASSIGN(alphaTileDN, 0xA00);
+    TASSIGN(betaTileDN, 0xA40);
+    TASSIGN(liTileDN, 0xA80);
+
+    // Load current block data
+    TLOAD(oiNewTile, oiNewGlobal);
+    TLOAD(mijTileND, mijGlobal);
+    TLOAD(lijTileND, lijGlobal);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+    if (is_first) {
+        // First block: just copy
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        TSTORE(miGlobal, mijTileND);
+        TSTORE(liGlobal, lijTileND);
+        TSTORE(oiGlobal, oiNewTile);
+    } else {
+        // Load accumulated values
+        TLOAD(oiTile, oiGlobal);
+        TLOAD(miTileND, miGlobal);
+        TLOAD(liTileND, liGlobal);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+
+        // mi_new = max(mi, mij) - RowMajor OK for TMAX
+        TMAX(miNewTileND, miTileND, mijTileND);
+
+        // alpha = exp(mi - mi_new) - RowMajor for TSUB/TEXP
+        TSUB(alphaTileND, miTileND, miNewTileND);
+        TEXP(alphaTileND, alphaTileND);
+
+        // beta = exp(mij - mi_new)
+        TSUB(betaTileND, mijTileND, miNewTileND);
+        TEXP(betaTileND, betaTileND);
+
+        // li_new = alpha * li + beta * lij (element-wise on scalars) - RowMajor for TMUL/TADD
+        TMUL(liTileND, alphaTileND, liTileND);
+        TMUL(tmpScalarND, betaTileND, lijTileND);
+        TADD(liTileND, liTileND, tmpScalarND);
+
+        // Reshape alpha/beta from ND (1,16) to DN (16,1) for row broadcast
+        TRESHAPE(alphaTileDN, alphaTileND);
+        TRESHAPE(betaTileDN, betaTileND);
+
+        // oi_scaled = oi * alpha (row broadcast) - ColMajor required for TROWEXPANDMUL
+        TROWEXPANDMUL(oiTile, oiTile, alphaTileDN);
+
+        // oi_new_scaled = oi_new * beta (row broadcast)
+        TROWEXPANDMUL(oiNewTile, oiNewTile, betaTileDN);
+
+        // oi = oi_scaled + oi_new_scaled - RowMajor OK
+        TADD(oiTile, oiTile, oiNewTile);
+
+        // Store updated values
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+        TSTORE(miGlobal, miNewTileND);
+        TSTORE(liGlobal, liTileND);
+        TSTORE(oiGlobal, oiTile);
+    }
+
+    // Normalize on last block
+    if (is_last) {
+        // Reload oi and li for normalization
+        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
+        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID2);
+        TLOAD(oiTile, oiGlobal);
+        TLOAD(liTileND, liGlobal);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID2);
+
+        // Reshape li from ND (1,16) to DN (16,1) for row broadcast
+        TRESHAPE(liTileDN, liTileND);
+
+        // Normalize: oi = oi / li (row broadcast division)
+        TROWEXPANDDIV(oiTile, oiTile, liTileDN);
+
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID2);
+        TSTORE(dstGlobal, oiTile);
     }
 }

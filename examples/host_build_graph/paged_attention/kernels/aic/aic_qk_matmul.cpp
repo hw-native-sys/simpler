@@ -1,15 +1,11 @@
-/**
- * QK MatMul Kernel (AIC) - Multi-Head
- *
- * Computes: sij[h] = qi[h] @ kj[kv_h].T  for all heads h
- *
- * Memory layout:
- *   qi:  (num_heads, head_dim)  contiguous
- *   kj:  (block_size, kv_head_num, head_dim)  strided
- *   sij: (num_heads, block_size)  contiguous output
- */
+// Kernel Function: qk_matmul
+// Fixed for PTO-ISA matmul layout requirements on a2a3 hardware
+
 #include <cstdint>
 #include <pto/pto-inst.hpp>
+#include <pto/common/constants.hpp>
+
+using namespace pto;
 
 #ifndef __gm__
 #define __gm__
@@ -19,29 +15,66 @@
 #define __aicore__ [aicore]
 #endif
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ float* qi  = reinterpret_cast<__gm__ float*>(args[0]);   // (num_heads, head_dim)
-    __gm__ float* kj  = reinterpret_cast<__gm__ float*>(args[1]);   // (block_size, kv_head_num, head_dim)
-    __gm__ float* sij = reinterpret_cast<__gm__ float*>(args[2]);   // (num_heads, block_size)
-    int num_heads   = static_cast<int>(args[3]);
-    int kv_head_num = static_cast<int>(args[4]);
-    int block_size  = static_cast<int>(args[5]);
-    int head_dim    = static_cast<int>(args[6]);
+constexpr int M = 16;
+constexpr int K = 16;
+constexpr int N = 16;
 
-    int heads_per_kv = num_heads / kv_head_num;
-    int kv_stride = kv_head_num * head_dim;  // stride between tokens in K
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
+{
+    __gm__ float* qi = reinterpret_cast<__gm__ float*>(args[0]);
+    __gm__ float* kj_t = reinterpret_cast<__gm__ float*>(args[1]);
+    __gm__ float* sij = reinterpret_cast<__gm__ float*>(args[2]);
 
-    for (int h = 0; h < num_heads; h++) {
-        int kv_h = h / heads_per_kv;
-        __gm__ float* qi_h = qi + h * head_dim;
+    // GlobalTensor definitions
+    using GlobalDataA = GlobalTensor<float, Shape<1, 1, 1, M, K>, Stride<M*K, M*K, M*K, K, 1>>;
+    using GlobalDataB = GlobalTensor<float, Shape<1, 1, 1, K, N>, Stride<K*N, K*N, K*N, N, 1>>;
+    using GlobalDataOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<M*N, M*N, M*N, N, 1>>;
+    
+    GlobalDataA qiGlobal(qi);
+    GlobalDataB kjGlobal(kj_t);
+    GlobalDataOut sijGlobal(sij);
 
-        for (int j = 0; j < block_size; j++) {
-            __gm__ float* kj_token = kj + j * kv_stride + kv_h * head_dim;
-            float sum = 0.0f;
-            for (int d = 0; d < head_dim; d++) {
-                sum += qi_h[d] * kj_token[d];
-            }
-            sij[h * block_size + j] = sum;
-        }
-    }
+    // L1 tiles: ColMajor + SLayout::RowMajor (required for matmul)
+    using TileMatA = Tile<TileType::Mat, float, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
+    using TileMatB = Tile<TileType::Mat, float, K, N, BLayout::ColMajor, K, N, SLayout::RowMajor, 512>;
+
+    // L0 tiles: Use the standard TileLeft/TileRight/TileAcc aliases
+    using LeftTile = TileLeft<float, M, K, M, K>;
+    using RightTile = TileRight<float, K, N, K, N>;
+    using AccTile = TileAcc<float, M, N, M, N>;
+
+    TileMatA aMatTile;
+    TileMatB bMatTile;
+    TASSIGN(aMatTile, 0x0);
+    TASSIGN(bMatTile, 0x20000);
+
+    LeftTile aTile;
+    RightTile bTile;
+    AccTile cTile;
+    TASSIGN(aTile, 0x0);
+    TASSIGN(bTile, 0x0);
+    TASSIGN(cTile, 0x0);
+
+    // Load A and B to L1
+    TLOAD(aMatTile, qiGlobal);
+    TLOAD(bMatTile, kjGlobal);
+
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+
+    // Move from L1 to L0A/L0B
+    TMOV(aTile, aMatTile);
+    TMOV(bTile, bMatTile);
+
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+
+    // Matmul
+    TMATMUL(cTile, aTile, bTile);
+
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+
+    // Store result
+    TSTORE(sijGlobal, cTile);
 }

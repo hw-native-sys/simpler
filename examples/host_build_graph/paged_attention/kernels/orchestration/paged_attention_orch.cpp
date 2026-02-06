@@ -1,19 +1,13 @@
 /**
- * Paged Attention Orchestration Function (Multi-Head per Task)
+ * Paged Attention Orchestration Function - 16x16 Version
  *
- * Each task processes ALL heads for a given (batch, block).
- * This dramatically reduces task count and improves NPU utilization.
+ * Simplified for 16x16 framework-generated matmul kernels.
+ * Each block processes a single 16x16 matmul operation.
  *
- * Task count: batch * block_num * 4  (instead of batch * num_heads * block_num * 4)
- *
- * Parallelism:
- *   - Different batches run in parallel
- *   - Different blocks: QK->SF->PV chains run in parallel
- *   - Only UP within same batch is serialized (accumulator dependency)
- *
- * Buffer allocation:
- *   - Per-batch-per-block: sij, pij, mij, lij, oi_new  (all heads)
- *   - Per-batch accumulators: mi, li, oi  (all heads)
+ * Memory Layout:
+ *   Query: (batch, 16, 16) - one 16x16 tile per batch
+ *   Key:   (total_blocks, 16, 16) - stored as K^T for direct matmul
+ *   Value: (total_blocks, 16, 16) - direct format
  */
 
 #include "runtime.h"
@@ -27,13 +21,13 @@
 
 #define MAX_BLOCKS 64
 
+// Fixed 16x16 tile dimensions
+constexpr int kTileSize = 16;
+constexpr int kTileElements = kTileSize * kTileSize;  // 256
+
 extern "C" {
 
 int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count) {
-    // Expected args layout from CodeRunner:
-    // [ptr_query, ptr_key_cache, ptr_value_cache, ptr_block_table, ptr_context_lens, ptr_out, ptr_config,
-    //  size_query, size_key_cache, size_value_cache, size_block_table, size_context_lens, size_out, size_config,
-    //  count]
     if (arg_count < 15) {
         std::cerr << "Expected at least 15 args, got " << arg_count << '\n';
         return -1;
@@ -57,8 +51,7 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
     size_t out_size = static_cast<size_t>(args[12]);
     size_t config_size = static_cast<size_t>(args[13]);
 
-    // Extract config parameters from config array
-    // config = [batch, num_heads, kv_head_num, head_dim, block_size, block_num, scale_bits]
+    // Extract config parameters
     int batch = static_cast<int>(host_config[0]);
     int num_heads = static_cast<int>(host_config[1]);
     int kv_head_num = static_cast<int>(host_config[2]);
@@ -67,12 +60,12 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
     int block_num = static_cast<int>(host_config[5]);
     uint64_t scale_value_bits = static_cast<uint64_t>(host_config[6]);
 
-    std::cout << "\n=== build_paged_attention_graph (multi-head per task) ===" << '\n';
+    std::cout << "\n=== build_paged_attention_graph (16x16 framework version) ===" << '\n';
     std::cout << "batch=" << batch << ", num_heads=" << num_heads
               << ", kv_head_num=" << kv_head_num << ", head_dim=" << head_dim << '\n';
     std::cout << "block_size=" << block_size << ", block_num=" << block_num << '\n';
 
-    // Allocate device memory for inputs
+    // Allocate device memory
     void* dev_query = runtime->host_api.device_malloc(query_size);
     void* dev_key_cache = runtime->host_api.device_malloc(key_cache_size);
     void* dev_value_cache = runtime->host_api.device_malloc(value_cache_size);
@@ -88,13 +81,11 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
     runtime->host_api.copy_to_device(dev_value_cache, host_value_cache, value_cache_size);
     runtime->record_tensor_pair(host_out, dev_out, out_size);
 
-    // Buffer sizes (all heads packed together)
-    size_t sij_size    = num_heads * block_size * sizeof(float);   // (num_heads, block_size)
-    size_t scalar_size = num_heads * sizeof(float);                // (num_heads,)
-    size_t vec_size    = num_heads * head_dim * sizeof(float);     // (num_heads, head_dim)
+    // Buffer sizes for 16x16 tiles
+    size_t tile_size = kTileElements * sizeof(float);  // 256 * 4 = 1024 bytes
+    size_t scalar_size = kTileSize * sizeof(float);    // 16 * 4 = 64 bytes
 
     // Per-batch-per-block intermediate buffers
-    // Index: [b_idx * block_num + bn]
     int total_buffers = batch * block_num;
     void** dev_sij_arr    = new void*[total_buffers];
     void** dev_pij_arr    = new void*[total_buffers];
@@ -103,14 +94,14 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
     void** dev_oi_new_arr = new void*[total_buffers];
 
     for (int i = 0; i < total_buffers; i++) {
-        dev_sij_arr[i]    = runtime->host_api.device_malloc(sij_size);
-        dev_pij_arr[i]    = runtime->host_api.device_malloc(sij_size);
+        dev_sij_arr[i]    = runtime->host_api.device_malloc(tile_size);
+        dev_pij_arr[i]    = runtime->host_api.device_malloc(tile_size);
         dev_mij_arr[i]    = runtime->host_api.device_malloc(scalar_size);
         dev_lij_arr[i]    = runtime->host_api.device_malloc(scalar_size);
-        dev_oi_new_arr[i] = runtime->host_api.device_malloc(vec_size);
+        dev_oi_new_arr[i] = runtime->host_api.device_malloc(tile_size);
     }
 
-    // Per-batch accumulators (mi, li, oi) — all heads packed
+    // Per-batch accumulators
     void** dev_mi_arr = new void*[batch];
     void** dev_li_arr = new void*[batch];
     void** dev_oi_arr = new void*[batch];
@@ -118,11 +109,11 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
     for (int i = 0; i < batch; i++) {
         dev_mi_arr[i] = runtime->host_api.device_malloc(scalar_size);
         dev_li_arr[i] = runtime->host_api.device_malloc(scalar_size);
-        dev_oi_arr[i] = runtime->host_api.device_malloc(vec_size);
+        dev_oi_arr[i] = runtime->host_api.device_malloc(tile_size);
     }
 
-    std::cout << "Allocated " << total_buffers << " per-batch-per-block buffers (all heads packed)\n";
-    std::cout << "Allocated " << batch << " per-batch accumulators (all heads packed)\n";
+    std::cout << "Allocated " << total_buffers << " per-batch-per-block buffers\n";
+    std::cout << "Allocated " << batch << " per-batch accumulators\n";
 
     int total_tasks = 0;
 
@@ -130,13 +121,11 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
         int cur_seq = host_context_lens[b_idx];
         int bn_this_batch = (cur_seq + block_size - 1) / block_size;
 
-        // Query pointer for this batch (all heads): (num_heads, head_dim)
-        float* qi_ptr = reinterpret_cast<float*>(dev_query)
-                      + b_idx * num_heads * head_dim;
+        // Query pointer: each batch has one 16x16 tile
+        float* qi_ptr = reinterpret_cast<float*>(dev_query) + b_idx * kTileElements;
 
-        // Output pointer for this batch (all heads): (num_heads, head_dim)
-        float* out_ptr = reinterpret_cast<float*>(dev_out)
-                       + b_idx * num_heads * head_dim;
+        // Output pointer: each batch has one 16x16 tile
+        float* out_ptr = reinterpret_cast<float*>(dev_out) + b_idx * kTileElements;
 
         // Per-batch accumulators
         void* dev_mi = dev_mi_arr[b_idx];
@@ -145,21 +134,14 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
 
         int t_pv_arr[MAX_BLOCKS];
 
-        // Phase 1: Create parallel QK -> SF -> PV chains for all blocks
+        // Phase 1: Create parallel QK -> SF -> PV chains
         for (int bn = 0; bn < bn_this_batch; bn++) {
             int cur_block_idx = host_block_table[b_idx * block_num + bn];
 
-            int valid_len = (bn == bn_this_batch - 1)
-                          ? (cur_seq - bn * block_size)
-                          : block_size;
+            // Key/Value pointers: each block has one 16x16 tile
+            float* kj_ptr = reinterpret_cast<float*>(dev_key_cache) + cur_block_idx * kTileElements;
+            float* vj_ptr = reinterpret_cast<float*>(dev_value_cache) + cur_block_idx * kTileElements;
 
-            // K/V block base pointer: (block_size, kv_head_num, head_dim)
-            float* kj_ptr = reinterpret_cast<float*>(dev_key_cache)
-                          + cur_block_idx * block_size * kv_head_num * head_dim;
-            float* vj_ptr = reinterpret_cast<float*>(dev_value_cache)
-                          + cur_block_idx * block_size * kv_head_num * head_dim;
-
-            // Per-batch-per-block buffers
             int buf_idx = b_idx * block_num + bn;
             void* dev_sij    = dev_sij_arr[buf_idx];
             void* dev_pij    = dev_pij_arr[buf_idx];
@@ -167,54 +149,42 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
             void* dev_lij    = dev_lij_arr[buf_idx];
             void* dev_oi_new = dev_oi_new_arr[buf_idx];
 
-            // QK MatMul (AIC) — all heads
-            uint64_t qk_args[7] = {
+            // QK MatMul: Q (16x16) @ K^T (16x16) = S (16x16)
+            uint64_t qk_args[3] = {
                 reinterpret_cast<uint64_t>(qi_ptr),
                 reinterpret_cast<uint64_t>(kj_ptr),
-                reinterpret_cast<uint64_t>(dev_sij),
-                static_cast<uint64_t>(num_heads),
-                static_cast<uint64_t>(kv_head_num),
-                static_cast<uint64_t>(block_size),
-                static_cast<uint64_t>(head_dim)
+                reinterpret_cast<uint64_t>(dev_sij)
             };
-            int t_qk = runtime->add_task(qk_args, 7, FUNC_QK_MATMUL, CoreType::AIC);
+            int t_qk = runtime->add_task(qk_args, 3, FUNC_QK_MATMUL, CoreType::AIC);
             total_tasks++;
 
-            // Softmax Prepare (AIV) — all heads
-            uint64_t sf_args[8] = {
+            // Softmax Prepare
+            uint64_t sf_args[5] = {
                 reinterpret_cast<uint64_t>(dev_sij),
                 scale_value_bits,
                 reinterpret_cast<uint64_t>(dev_pij),
                 reinterpret_cast<uint64_t>(dev_mij),
-                reinterpret_cast<uint64_t>(dev_lij),
-                static_cast<uint64_t>(num_heads),
-                static_cast<uint64_t>(block_size),
-                static_cast<uint64_t>(valid_len)
+                reinterpret_cast<uint64_t>(dev_lij)
             };
-            int t_sf = runtime->add_task(sf_args, 8, FUNC_SOFTMAX_PREPARE, CoreType::AIV);
+            int t_sf = runtime->add_task(sf_args, 5, FUNC_SOFTMAX_PREPARE, CoreType::AIV);
             total_tasks++;
 
-            // PV MatMul (AIC) — all heads
-            uint64_t pv_args[7] = {
+            // PV MatMul: P (16x16) @ V (16x16) = O (16x16)
+            uint64_t pv_args[3] = {
                 reinterpret_cast<uint64_t>(dev_pij),
                 reinterpret_cast<uint64_t>(vj_ptr),
-                reinterpret_cast<uint64_t>(dev_oi_new),
-                static_cast<uint64_t>(num_heads),
-                static_cast<uint64_t>(kv_head_num),
-                static_cast<uint64_t>(block_size),
-                static_cast<uint64_t>(head_dim)
+                reinterpret_cast<uint64_t>(dev_oi_new)
             };
-            int t_pv = runtime->add_task(pv_args, 7, FUNC_PV_MATMUL, CoreType::AIC);
+            int t_pv = runtime->add_task(pv_args, 3, FUNC_PV_MATMUL, CoreType::AIC);
             total_tasks++;
 
-            // Dependencies: QK -> SF -> PV
             runtime->add_successor(t_qk, t_sf);
             runtime->add_successor(t_sf, t_pv);
 
             t_pv_arr[bn] = t_pv;
         }
 
-        // Phase 2: Create serialized UP chain (within this batch)
+        // Phase 2: Serialized Online Update chain
         int t_up_prev = -1;
         for (int bn = 0; bn < bn_this_batch; bn++) {
             int is_first = (bn == 0) ? 1 : 0;
@@ -225,8 +195,7 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
             void* dev_lij    = dev_lij_arr[buf_idx];
             void* dev_oi_new = dev_oi_new_arr[buf_idx];
 
-            // Online Update (AIV) — all heads
-            uint64_t up_args[11] = {
+            uint64_t up_args[9] = {
                 reinterpret_cast<uint64_t>(dev_mij),
                 reinterpret_cast<uint64_t>(dev_lij),
                 reinterpret_cast<uint64_t>(dev_oi_new),
@@ -235,17 +204,13 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
                 reinterpret_cast<uint64_t>(dev_oi),
                 static_cast<uint64_t>(is_first),
                 static_cast<uint64_t>(is_last),
-                reinterpret_cast<uint64_t>(out_ptr),
-                static_cast<uint64_t>(num_heads),
-                static_cast<uint64_t>(head_dim)
+                reinterpret_cast<uint64_t>(out_ptr)
             };
-            int t_up = runtime->add_task(up_args, 11, FUNC_ONLINE_UPDATE, CoreType::AIV);
+            int t_up = runtime->add_task(up_args, 9, FUNC_ONLINE_UPDATE, CoreType::AIV);
             total_tasks++;
 
-            // UP[bn] depends on PV[bn]
             runtime->add_successor(t_pv_arr[bn], t_up);
 
-            // UP[bn] depends on UP[bn-1] (within same batch)
             if (t_up_prev >= 0) {
                 runtime->add_successor(t_up_prev, t_up);
             }
@@ -264,7 +229,6 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
     delete[] dev_li_arr;
     delete[] dev_oi_arr;
 
-    
     std::cout << "Created " << total_tasks << " tasks\n";
     runtime->print_runtime();
 
