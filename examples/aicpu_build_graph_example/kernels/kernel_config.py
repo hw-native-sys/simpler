@@ -11,6 +11,13 @@ from pathlib import Path
 
 _KERNELS_ROOT = Path(__file__).parent
 
+RUNTIME_CONFIG = {
+    "runtime": "aicpu_build_graph",
+    # Default split: 1 AICPU thread builds tasks while 3 AICPU threads schedule/execute.
+    "aicpu_thread_num": 4,
+    "block_dim": 24,
+}
+
 ORCHESTRATION = {
     "source": str(_KERNELS_ROOT / "orchestration" / "example_orch.cpp"),
     "function_name": "prepare_example_graph",

@@ -155,12 +155,8 @@ class Runtime;
  *   api.publish_task(runtime, t);
  */
 struct AicpuBuildApi {
-    int (*add_task)(Runtime* runtime,
-        uint64_t* args,
-        int num_args,
-        int func_id,
-        CoreType core_type,
-        uint64_t function_bin_addr);
+    int (*add_task)(
+        Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type, uint64_t function_bin_addr);
     void (*add_successor_conditional)(Runtime* runtime, int from_task, int to_task);
     void (*publish_task)(Runtime* runtime, int task_id);
 };
@@ -259,17 +255,17 @@ public:
     uint64_t orch_args[RUNTIME_MAX_ORCH_ARGS];
 
     /**
- * Kernel address table (written on host before launch, read by AICPU builder).
+     * Kernel address table (written on host before launch, read by AICPU builder).
      *
      * This enables AICPU-built tasks to bind `Task::function_bin_addr` without host
      * iterating the task table (tasks may not exist yet on host).
      *
- * Convention:
- * - `kernel_addrs[func_id]` holds the executable address for that `func_id`.
- * - Examples typically pass `function_bin_addr=0` to `aicpu_runtime_add_task()`
- *   to auto-bind via this table (the table is filled by the host runtime init,
- *   not by platform code).
- */
+     * Convention:
+     * - `kernel_addrs[func_id]` holds the executable address for that `func_id`.
+     * - Examples typically pass `function_bin_addr=0` to `aicpu_runtime_add_task()`
+     *   to auto-bind via this table (the table is filled by the host runtime init,
+     *   not by platform code).
+     */
     uint64_t kernel_addrs[RUNTIME_MAX_FUNC_ID];
 
     /**
@@ -384,6 +380,42 @@ public:
      * @return Total task count
      */
     int get_task_count() const;
+
+    /**
+     * Resolve executable function address for a kernel func_id.
+     *
+     * Used by platform runners (e.g., `a2a3sim`) to populate `Task::function_bin_addr`
+     * before dispatch. For `aicpu_build_graph`, the host runtime fills
+     * `Runtime::kernel_addrs[]` during initialization.
+     *
+     * @return Executable address, or 0 if unknown/out-of-range.
+     */
+    uint64_t get_function_bin_addr(int func_id) const {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
+            return 0;
+        }
+        return kernel_addrs[func_id];
+    }
+
+    /**
+     * Set PTO2 shared memory pointer (stub for API compatibility).
+     *
+     * Only used by the `tensormap_and_ringbuffer` runtime (rt2). This runtime
+     * doesn't use PTO2 shared memory, so this is a no-op.
+     */
+    void set_pto2_gm_sm_ptr(void*) { /* no-op */ }
+
+    /**
+     * Set function binary address for a func_id.
+     *
+     * Called by the platform C API after kernel registration.
+     */
+    void set_function_bin_addr(int func_id, uint64_t addr) {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) {
+            return;
+        }
+        kernel_addrs[func_id] = addr;
+    }
 
     /**
      * Get initially ready tasks (fanin == 0) as entry point for execution

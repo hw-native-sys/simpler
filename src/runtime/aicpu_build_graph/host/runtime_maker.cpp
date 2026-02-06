@@ -46,36 +46,15 @@ static void populate_kernel_addrs(Runtime* runtime) {
     if (runtime == nullptr) {
         return;
     }
-    memset(runtime->kernel_addrs, 0, sizeof(runtime->kernel_addrs));
-
     // Kernel binaries are registered via the platform C API (register_kernel),
-    // which populates DeviceRunner's func_id -> address map. Since this file is
-    // compiled into the same host runtime library as DeviceRunner, we can query
-    // the mapping here without changing src/platform.
-    //
-    // We assume func_ids are generally dense starting from 0 (as in examples).
-    // To avoid spamming warnings from get_function_bin_addr() on missing ids,
-    // stop after a small number of consecutive misses once we've seen at least
-    // one registered kernel.
-    DeviceRunner& runner = DeviceRunner::get();
+    // which calls `Runtime::set_function_bin_addr(func_id, addr)` after upload.
+    // That directly populates `Runtime::kernel_addrs[]`.
     bool saw_any = false;
-    int consecutive_misses = 0;
-    constexpr int kMaxConsecutiveMisses = 8;
-
     for (int func_id = 0; func_id < RUNTIME_MAX_FUNC_ID; ++func_id) {
-        uint64_t addr = runner.get_function_bin_addr(func_id);
-        if (addr == 0) {
-            if (saw_any) {
-                consecutive_misses++;
-                if (consecutive_misses >= kMaxConsecutiveMisses) {
-                    break;
-                }
-            }
-            continue;
+        if (runtime->kernel_addrs[func_id] != 0) {
+            saw_any = true;
+            break;
         }
-        saw_any = true;
-        consecutive_misses = 0;
-        runtime->kernel_addrs[func_id] = addr;
     }
 
     if (!saw_any) {
