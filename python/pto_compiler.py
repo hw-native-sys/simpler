@@ -1,10 +1,10 @@
 import logging
 import os
-import subprocess
 import shutil
+import subprocess
 import sys
-import time
 import tempfile
+import time
 from pathlib import Path
 from typing import List, Optional
 
@@ -19,11 +19,7 @@ class PTOCompiler:
     - "a2a3": Uses ccec for incore kernels (real hardware)
     - "a2a3sim": Uses g++ for simulation kernels (host execution)
 
-    Orchestration compilation has two distinct targets:
-    - Host orchestration (.so dlopen'ed by the host runtime): built with host C++ compiler (g++).
-    - AICPU orchestration plugin (.so dlopen'ed on device AICPU for `aicpu_build_graph`):
-        - a2a3: must be compiled for AICPU (aarch64) via cross toolchain.
-        - a2a3sim: compiled with host C++ compiler (runs in host threads).
+    Both platforms use g++ for orchestration compilation.
     """
 
     def __init__(self, platform: str = "a2a3", ascend_home_path: Optional[str] = None):
@@ -80,6 +76,7 @@ class PTOCompiler:
         ]
 
     def _resolve_host_cxx(self) -> str:
+        """Resolve host C++ compiler."""
         cxx = os.environ.get("CXX") or shutil.which("g++") or shutil.which("c++")
         if not cxx:
             raise RuntimeError("Host C++ compiler not found (g++). Please install g++ or set CXX.")
@@ -117,54 +114,6 @@ class PTOCompiler:
             "AICPU cross-compiler not found. Set PTO_AICPU_CXX, or install an aarch64 cross toolchain, "
             "or ensure ASCEND_HOME_PATH is set and contains tools/hcc."
         )
-
-    def _compile_shared_library_to_path(
-        self,
-        source_path: str,
-        *,
-        output_path: str,
-        cxx: str,
-        extra_include_dirs: Optional[List[str]] = None,
-        extra_cxxflags: Optional[List[str]] = None,
-        extra_inc_dirs: Optional[List[str]] = None,
-        label: str,
-        allow_undefined: bool = False,
-    ) -> None:
-        cmd = [cxx, "-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
-
-        # On macOS, allow undefined symbols to be resolved at dlopen time.
-        if allow_undefined and sys.platform == "darwin":
-            cmd.extend(["-undefined", "dynamic_lookup"])
-
-        if extra_cxxflags:
-            cmd.extend(extra_cxxflags)
-
-        if extra_include_dirs:
-            for inc_dir in extra_include_dirs:
-                cmd.append(f"-I{os.path.abspath(inc_dir)}")
-        if extra_inc_dirs:
-            for inc_dir in extra_inc_dirs:
-                cmd.append(f"-I{os.path.abspath(inc_dir)}")
-
-        cmd.extend(["-o", output_path, source_path])
-
-        print(f"\n{'='*80}")
-        print(f"[{label}] Compiling: {source_path}")
-        print(f"  Command: {' '.join(cmd)}")
-        print(f"{'='*80}\n")
-
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True)
-        except FileNotFoundError:
-            raise RuntimeError(f"{label} compiler not found: {cxx}")
-
-        if result.stdout:
-            print(f"[{label}] stdout:\n{result.stdout}")
-        if result.stderr:
-            print(f"[{label}] stderr:\n{result.stderr}")
-
-        if result.returncode != 0:
-            raise RuntimeError(f"{label} compilation failed with exit code {result.returncode}:\n{result.stderr}")
 
     def compile_incore(
         self,
@@ -355,27 +304,98 @@ class PTOCompiler:
         if not os.path.isfile(source_path):
             raise FileNotFoundError(f"Source file not found: {source_path}")
 
-        # Host orchestration runs on the host and is dlopen'ed by the host runtime,
-        # so it must be compiled for the host architecture.
-        cxx = self._resolve_host_cxx()
-
         # Generate output path
         timestamp = int(time.time() * 1000)
         output_path = f"/tmp/orch_{timestamp}_{os.getpid()}.so"
 
-        extra_inc: List[str] = []
-        if self.ascend_home_path:
-            extra_inc.append(os.path.join(self.ascend_home_path, "include"))
+        # Build compilation command
+        # For a2a3 (real hardware), use aarch64 cross-compiler since orchestration
+        # runs on AICPU Thread 3 which is on the device (aarch64)
+        if self.platform == "a2a3" and self.ascend_home_path:
+            cxx_path = os.path.join(self.ascend_home_path, "tools", "hcc", "bin", "aarch64-target-linux-gnu-g++")
+            if not os.path.isfile(cxx_path):
+                print(f"Warning: aarch64 cross-compiler not found at {cxx_path}, falling back to g++")
+                cxx_path = "g++"
+        else:
+            cxx_path = "g++"
 
-        self._compile_shared_library_to_path(
-            source_path,
-            output_path=output_path,
-            cxx=cxx,
-            extra_include_dirs=extra_include_dirs,
-            extra_inc_dirs=extra_inc,
-            label="Orchestration",
-            allow_undefined=True,
-        )
+        cmd = [
+            cxx_path,
+            "-shared", "-fPIC",
+            "-O3", "-g",
+            "-std=c++17",
+        ]
+
+        # For a2a3 + tensormap_and_ringbuffer (device orchestration), include static linking and PTO2 runtime sources
+        # because dlopen'd SO cannot access symbols from libaicpu.so
+        if self.platform == "a2a3" and self.ascend_home_path and runtime_name == "tensormap_and_ringbuffer":
+            cmd.extend([
+                "-static-libstdc++",
+                "-static-libgcc",
+                "-Wl,--export-dynamic",  # Ensure symbols are exported (needed for dlsym)
+            ])
+            # Include PTO2 runtime source files directly
+            runtime_dir = os.path.join(os.path.dirname(__file__), "..", "src", "runtime", "tensormap_and_ringbuffer", "runtime")
+            runtime_dir = os.path.abspath(runtime_dir)
+            runtime_sources = [
+                "pto_runtime2.c",
+                "pto_orchestrator.c",
+                "pto_shared_memory.c",
+                "pto_scheduler.c",
+                "pto_ring_buffer.c",
+                "pto_tensormap.c",
+                "pto_logical_tensor.cpp",
+            ]
+            for src in runtime_sources:
+                src_path = os.path.join(runtime_dir, src)
+                if os.path.isfile(src_path):
+                    cmd.append(src_path)
+                    print(f"  Including runtime source: {src}")
+
+        # On macOS, allow undefined symbols to be resolved at dlopen time
+        if sys.platform == "darwin":
+            cmd.append("-undefined")
+            cmd.append("dynamic_lookup")
+
+        # Add include dirs
+        if extra_include_dirs:
+            for inc_dir in extra_include_dirs:
+                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+
+        # Add Ascend runtime include if available
+        if self.ascend_home_path:
+            ascend_include = os.path.join(self.ascend_home_path, "include")
+            cmd.append(f"-I{ascend_include}")
+
+        # Output and input
+        cmd.extend(["-o", output_path, source_path])
+
+        # Log compilation command
+        logger.info(f"[Orchestration] Compiling: {source_path}")
+        logger.debug(f"  Command: {' '.join(cmd)}")
+
+        # Execute
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True
+            )
+
+            if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
+                logger.debug(f"[Orchestration] stdout:\n{result.stdout}")
+            if result.stderr and logger.isEnabledFor(10):
+                logger.debug(f"[Orchestration] stderr:\n{result.stderr}")
+
+            if result.returncode != 0:
+                logger.error(f"[Orchestration] Compilation failed: {result.stderr}")
+                raise RuntimeError(
+                    f"Orchestration compilation failed with exit code {result.returncode}:\n"
+                    f"{result.stderr}"
+                )
+
+        except FileNotFoundError:
+            raise RuntimeError("g++ compiler not found. Please install g++.")
 
         # Verify output file exists and read binary data
         if not os.path.isfile(output_path):
@@ -419,38 +439,56 @@ class PTOCompiler:
 
         cxx = self._resolve_aicpu_cxx()
 
+        # Build compilation command
+        cmd = [cxx, "-shared", "-fPIC", "-O3", "-g"]
+
         # For a2a3, match the platform AICPU build include search paths (subset).
         extra_inc: List[str] = []
-        extra_flags: List[str] = []
         if self.platform == "a2a3":
-            extra_flags.append("-std=gnu++17")
+            cmd.append("-std=gnu++17")
             # Prefer a self-contained plugin on device to reduce runtime deps.
-            extra_flags.extend(["-static-libstdc++", "-static-libgcc"])
+            cmd.extend(["-static-libstdc++", "-static-libgcc"])
             if self.ascend_home_path:
-                extra_inc.extend(
-                    [
-                        os.path.join(self.ascend_home_path, "include"),
-                        os.path.join(self.ascend_home_path, "include", "toolchain"),
-                        os.path.join(self.ascend_home_path, "pkg_inc", "base"),
-                    ]
-                )
+                extra_inc.extend([
+                    os.path.join(self.ascend_home_path, "include"),
+                    os.path.join(self.ascend_home_path, "include", "toolchain"),
+                    os.path.join(self.ascend_home_path, "pkg_inc", "base"),
+                ])
+        else:
+            cmd.append("-std=c++17")
 
         if extra_cxxflags:
-            extra_flags.extend(extra_cxxflags)
+            cmd.extend(extra_cxxflags)
 
-        self._compile_shared_library_to_path(
-            source_path,
-            output_path=output_path,
-            cxx=cxx,
-            extra_include_dirs=extra_include_dirs,
-            extra_cxxflags=extra_flags,
-            label="AICPU Orchestration Plugin",
-            allow_undefined=False,
-        )
+        if extra_include_dirs:
+            for inc_dir in extra_include_dirs:
+                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+        for inc_dir in extra_inc:
+            cmd.append(f"-I{os.path.abspath(inc_dir)}")
+
+        cmd.extend(["-o", output_path, source_path])
+
+        logger.info(f"[AICPU Orchestration Plugin] Compiling: {source_path}")
+        logger.debug(f"  Command: {' '.join(cmd)}")
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.stdout and logger.isEnabledFor(10):
+                logger.debug(f"[AICPU Orchestration Plugin] stdout:\n{result.stdout}")
+            if result.stderr and logger.isEnabledFor(10):
+                logger.debug(f"[AICPU Orchestration Plugin] stderr:\n{result.stderr}")
+            if result.returncode != 0:
+                logger.error(f"[AICPU Orchestration Plugin] Compilation failed: {result.stderr}")
+                raise RuntimeError(
+                    f"AICPU orchestration plugin compilation failed with exit code {result.returncode}:\n{result.stderr}"
+                )
+        except FileNotFoundError:
+            raise RuntimeError(f"AICPU C++ compiler not found: {cxx}")
 
         if not os.path.isfile(output_path):
             raise RuntimeError(f"AICPU orchestration plugin compilation succeeded but output not found: {output_path}")
 
+        logger.info(f"[AICPU Orchestration Plugin] Compilation successful: {os.path.getsize(output_path)} bytes")
         return output_path
 
     def compile_incore_sim(

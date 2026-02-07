@@ -35,8 +35,6 @@ Golden.py interface:
 import importlib.util
 import logging
 import os
-import shutil
-import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -442,8 +440,7 @@ class CodeRunner:
         platform_include_dir = str(self.project_root / "src" / "platform" / "include")
         include_dirs = [runtime_include_dir, platform_include_dir]
 
-        # Secure, unique output path in /tmp. This prevents other users/processes from
-        # hijacking a predictable filename (e.g., via symlink races).
+        # Secure, unique output path in /tmp.
         fd, out_s = tempfile.mkstemp(prefix="aicpu_orch_", suffix=".so", dir="/tmp")
         os.close(fd)
         out_path = Path(out_s)
@@ -638,13 +635,11 @@ class CodeRunner:
         extra_aicpu_include_dirs = None
 
         try:
-            runtime_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
-            with _temporary_env(runtime_env):
-                host_binary, aicpu_binary, aicore_binary = builder.build(
-                    self.runtime_name,
-                    extra_aicpu_source_dirs=extra_aicpu_source_dirs,
-                    extra_aicpu_include_dirs=extra_aicpu_include_dirs,
-                )
+            host_binary, aicpu_binary, aicore_binary = builder.build(
+                self.runtime_name,
+                extra_aicpu_source_dirs=extra_aicpu_source_dirs,
+                extra_aicpu_include_dirs=extra_aicpu_include_dirs,
+            )
         except Exception as e:
             raise RuntimeError(
                 f"Failed to build runtime '{self.runtime_name}' for platform '{self.platform}'.\n"
@@ -683,6 +678,7 @@ class CodeRunner:
             )
             logger.debug(f"Compiled orchestration: {len(orch_so_binary)} bytes")
 
+        # Compile AICPU orchestration plugin if needed (for aicpu_build_graph runtime)
         aicpu_orch_plugin_path: Optional[Path] = None
         if self.runtime_name == "aicpu_build_graph":
             if self.aicpu_orchestration is not None:
@@ -728,92 +724,87 @@ class CodeRunner:
 
         # Step 5: Run each parameter set
         total_cases = len(self.params_list)
-        try:
-            for case_idx, params in enumerate(self.params_list):
-                logger.info("=" * 60)
-                logger.info(f"=== Case {case_idx + 1}/{total_cases}: {params} ===")
-                logger.info("=" * 60)
+        for case_idx, params in enumerate(self.params_list):
+            logger.info("=" * 60)
+            logger.info(f"=== Case {case_idx + 1}/{total_cases}: {params} ===")
+            logger.info("=" * 60)
 
-                # Generate tensors using golden.py
-                logger.info("=== Generating Inputs ===")
-                tensors = self._golden_module.generate_inputs(params)
+            # Generate tensors using golden.py
+            logger.info("=== Generating Inputs ===")
+            tensors = self._golden_module.generate_inputs(params)
 
-                # Convert any PyTorch tensors to numpy
-                tensors = {k: _to_numpy(v) for k, v in tensors.items()}
+            # Convert any PyTorch tensors to numpy
+            tensors = {k: _to_numpy(v) for k, v in tensors.items()}
 
-                # Identify inputs and outputs
-                inputs, outputs = self._identify_outputs(tensors)
-                logger.info(f"Inputs: {list(inputs.keys())}")
-                logger.info(f"Outputs: {list(outputs.keys())}")
+            # Identify inputs and outputs
+            inputs, outputs = self._identify_outputs(tensors)
+            logger.info(f"Inputs: {list(inputs.keys())}")
+            logger.info(f"Outputs: {list(outputs.keys())}")
 
-                # Build func_args automatically
-                func_args, arg_types, arg_sizes = self._build_func_args(tensors)
+            # Build func_args automatically
+            func_args, arg_types, arg_sizes = self._build_func_args(tensors)
 
-                # Determine actual tensor order for debugging
-                order = self.tensor_order if self.tensor_order else list(tensors.keys())
-                logger.debug(f"Tensor order: {order}")
-                logger.debug(f"func_args count: {len(func_args)}")
+            # Determine actual tensor order for debugging
+            order = self.tensor_order if self.tensor_order else list(tensors.keys())
+            logger.debug(f"Tensor order: {order}")
+            logger.debug(f"func_args count: {len(func_args)}")
 
-                # Create and initialize runtime (including kernel registration)
-                logger.info("=== Initializing Runtime ===")
-                runtime = Runtime()
-                run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
-                if aicpu_orch_plugin_path is not None:
-                    run_env = dict(run_env)
-                    run_env["PTO_AICPU_ORCH_SO"] = str(aicpu_orch_plugin_path)
-                    run_env["PTO_AICPU_ORCH_FUNC"] = str(
-                        self.aicpu_orchestration.get("function_name", "build_graph_aicpu")
-                    )
-                if run_env:
-                    logger.debug(f"Runtime init env overrides: {run_env}")
-                with _temporary_env(run_env):
-                    runtime.initialize(
-                        orch_so_binary,
-                        self.orchestration["function_name"],
-                        func_args,
-                        arg_types=arg_types,
-                        arg_sizes=arg_sizes,
-                        kernel_binaries=kernel_binaries,
-                    )
+            # Create and initialize runtime (including kernel registration)
+            logger.info("=== Initializing Runtime ===")
+            runtime = Runtime()
 
-                # Launch runtime
-                logger.info("=== Launching Runtime ===")
-                logger.debug(f"Device ID: {self.device_id}")
-                logger.debug(f"AICPU threads: {self.aicpu_thread_num}, Block dim: {self.block_dim}")
-                import sys
+            # Build environment for runtime initialization
+            run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
+            if aicpu_orch_plugin_path is not None:
+                run_env = dict(run_env)
+                run_env["PTO_AICPU_ORCH_SO"] = str(aicpu_orch_plugin_path)
+                run_env["PTO_AICPU_ORCH_FUNC"] = str(
+                    self.aicpu_orchestration.get("function_name", "build_graph_aicpu")
+                )
+            if run_env:
+                logger.debug(f"Runtime init env overrides: {run_env}")
 
-                sys.stdout.flush()  # Ensure output is visible before potential hang
-
-                launch_runtime(
-                    runtime,
-                    aicpu_thread_num=self.aicpu_thread_num,
-                    block_dim=self.block_dim,
-                    device_id=self.device_id,
-                    aicpu_binary=aicpu_binary,
-                    aicore_binary=aicore_binary,
+            with _temporary_env(run_env):
+                runtime.initialize(
+                    orch_so_binary,
+                    self.orchestration["function_name"],
+                    func_args,
+                    arg_types=arg_types,
+                    arg_sizes=arg_sizes,
+                    kernel_binaries=kernel_binaries,
                 )
 
-                logger.info("Launch completed successfully")  # Will only print if not hung
+            # Launch runtime
+            logger.info("=== Launching Runtime ===")
+            logger.debug(f"Device ID: {self.device_id}")
+            logger.debug(f"AICPU threads: {self.aicpu_thread_num}, Block dim: {self.block_dim}")
+            import sys
+            sys.stdout.flush()  # Ensure output is visible before potential hang
 
-                # Finalize
-                logger.info("=== Finalizing Runtime ===")
-                runtime.finalize()
+            launch_runtime(
+                runtime,
+                aicpu_thread_num=self.aicpu_thread_num,
+                block_dim=self.block_dim,
+                device_id=self.device_id,
+                aicpu_binary=aicpu_binary,
+                aicore_binary=aicore_binary,
+            )
 
-                # Compute golden and compare
-                logger.info("=== Comparing Results ===")
-                self._compare_with_golden(tensors, inputs, outputs, params)
+            logger.info("Launch completed successfully")  # Will only print if not hung
 
-                logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
+            # Finalize
+            logger.info("=== Finalizing Runtime ===")
+            runtime.finalize()
 
-            logger.info("=" * 60)
-            logger.info(f"=== All {total_cases} cases passed ===")
-            logger.info("=" * 60)
-        finally:
-            if aicpu_orch_plugin_path is not None:
-                try:
-                    aicpu_orch_plugin_path.unlink()
-                except FileNotFoundError:
-                    pass
+            # Compute golden and compare
+            logger.info("=== Comparing Results ===")
+            self._compare_with_golden(tensors, inputs, outputs, params)
+
+            logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
+
+        logger.info("=" * 60)
+        logger.info(f"=== All {total_cases} cases passed ===")
+        logger.info("=" * 60)
 
     def _compare_with_golden(
         self,
