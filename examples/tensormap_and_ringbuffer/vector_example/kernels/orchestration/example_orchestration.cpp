@@ -134,10 +134,13 @@ extern "C" {
 
 __attribute__((visibility("default")))
 void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
+    // Get shared memory header for proper access
+    PTO2SharedMemoryHeader* header = (PTO2SharedMemoryHeader*)sm_ptr;
+
     // Validate inputs
     if (!sm_ptr || !args || arg_count < 13) {
-        if (sm_ptr) {
-            *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
+        if (header) {
+            header->orchestrator_done = 1;
         }
         return;
     }
@@ -166,7 +169,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
         PTO2_DEP_LIST_POOL_SIZE
     );
     if (!sm_handle) {
-        *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
+        header->orchestrator_done = 1;
         return;
     }
 
@@ -193,7 +196,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     );
     if (!rt) {
         pto2_sm_destroy(sm_handle);
-        *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
+        header->orchestrator_done = 1;
         return;
     }
 
@@ -260,7 +263,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     pto2_runtime_destroy(rt);
 
     // Signal orchestration complete
-    *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
+    header->orchestrator_done = 1;
 }
 
 }  // extern "C"
