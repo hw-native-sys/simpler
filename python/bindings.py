@@ -3,7 +3,7 @@
 PTO Runtime ctypes Bindings
 
 Provides a Pythonic interface to the PTO runtime via ctypes.
-Users must provide a pre-compiled libpto_runtime.so (built via binary_compiler.py).
+Users must provide a pre-compiled libpto_runtime.so (built via runtime_compiler.py).
 
 Usage:
     from bindings import bind_host_binary, launch_runtime, set_device
@@ -63,6 +63,12 @@ ARG_SCALAR = 0      # Scalar value, passed directly
 ARG_INPUT_PTR = 1   # Input pointer: device_malloc + copy_to_device
 ARG_OUTPUT_PTR = 2  # Output pointer: device_malloc + record for copy-back
 ARG_INOUT_PTR = 3   # Input/output: copy_to_device + copy-back
+
+
+# ============================================================================
+# ToolchainType enum (defined in toolchain.py, must match compile_strategy.h)
+# ============================================================================
+from toolchain import ToolchainType
 
 # ============================================================================
 # Runtime Library Loader
@@ -161,13 +167,13 @@ class RuntimeLibraryLoader:
         self.lib.record_tensor_pair.argtypes = [c_void_p, c_void_p, c_void_p, c_size_t]
         self.lib.record_tensor_pair.restype = None
 
-        # set_pto2_gm_sm_ptr - set PTO2 shared memory pointer
-        self.lib.set_pto2_gm_sm_ptr.argtypes = [c_void_p, c_void_p]
-        self.lib.set_pto2_gm_sm_ptr.restype = None
+        # get_incore_compiler - get toolchain for incore kernel compilation
+        self.lib.get_incore_compiler.argtypes = []
+        self.lib.get_incore_compiler.restype = c_int
 
-        # get_pto2_sm_size - get PTO2 shared memory size
-        self.lib.get_pto2_sm_size.argtypes = [c_void_p]
-        self.lib.get_pto2_sm_size.restype = c_int32
+        # get_orchestration_compiler - get toolchain for orchestration compilation
+        self.lib.get_orchestration_compiler.argtypes = []
+        self.lib.get_orchestration_compiler.restype = c_int
 
         # enable_runtime_profiling - enable profiling for swimlane
         self.lib.enable_runtime_profiling.argtypes = [c_void_p, c_int]
@@ -510,6 +516,50 @@ def launch_runtime(
     )
     if rc != 0:
         raise RuntimeError(f"launch_runtime failed: {rc}")
+
+
+# ============================================================================
+# Compile Strategy Functions
+# ============================================================================
+
+def get_incore_compiler() -> ToolchainType:
+    """
+    Get the toolchain for incore kernel compilation.
+
+    Queries the loaded C++ library to determine which compiler to use,
+    based on the current platform and runtime combination.
+
+    Returns:
+        ToolchainType indicating the compiler to use
+
+    Raises:
+        RuntimeError: If library not loaded
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    return ToolchainType(_lib.get_incore_compiler())
+
+
+def get_orchestration_compiler() -> ToolchainType:
+    """
+    Get the toolchain for orchestration function compilation.
+
+    Queries the loaded C++ library to determine which compiler to use,
+    based on the current platform and runtime combination.
+
+    Returns:
+        ToolchainType indicating the compiler to use
+
+    Raises:
+        RuntimeError: If library not loaded
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    return ToolchainType(_lib.get_orchestration_compiler())
 
 
 # ============================================================================

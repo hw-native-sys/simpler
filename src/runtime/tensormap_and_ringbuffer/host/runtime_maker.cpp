@@ -63,7 +63,11 @@ extern "C" int init_runtime_impl(Runtime *runtime,
                     uint64_t* func_args,
                     int func_args_count,
                     int* arg_types,
-                    uint64_t* arg_sizes) {
+                    uint64_t* arg_sizes,
+                    const int* kernel_func_ids,
+                    const uint8_t* const* kernel_binaries,
+                    const size_t* kernel_sizes,
+                    int kernel_count) {
     // Suppress unused parameter warning
     (void)orch_func_name;
 
@@ -71,6 +75,21 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     if (runtime == nullptr) {
         std::cerr << "Error: Runtime pointer is null\n";
         return -1;
+    }
+
+    // Register kernel binaries via platform-provided upload function
+    if (kernel_count > 0 && kernel_func_ids != nullptr &&
+        kernel_binaries != nullptr && kernel_sizes != nullptr) {
+        std::cout << "Registering " << kernel_count << " kernel(s) in init_runtime_impl\n";
+        for (int i = 0; i < kernel_count; i++) {
+            uint64_t addr = runtime->host_api.upload_kernel_binary(
+                kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
+            if (addr == 0) {
+                std::cerr << "Error: Failed to upload kernel binary for func_id=" << kernel_func_ids[i] << "\n";
+                return -1;
+            }
+            runtime->set_function_bin_addr(kernel_func_ids[i], addr);
+        }
     }
 
     if (orch_so_binary == nullptr || orch_so_size == 0) {

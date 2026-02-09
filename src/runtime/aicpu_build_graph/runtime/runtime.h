@@ -174,6 +174,7 @@ struct HostApi {
     void (*device_free)(void* dev_ptr);
     int (*copy_to_device)(void* dev_ptr, const void* host_ptr, size_t size);
     int (*copy_from_device)(void* host_ptr, const void* dev_ptr, size_t size);
+    uint64_t (*upload_kernel_binary)(int func_id, const uint8_t* bin_data, size_t bin_size);
 };
 
 /**

@@ -60,7 +60,7 @@ The pto-isa repository provides header files needed for kernel compilation on th
 The test framework automatically handles PTO_ISA_ROOT setup:
 1. Checks if `PTO_ISA_ROOT` is already set
 2. If not, clones pto-isa to `examples/scripts/_deps/pto-isa` on first run
-3. Sets `PTO_ISA_ROOT` to the cloned path
+3. Passes the resolved path to the kernel compiler
 
 **Automatic Setup (Recommended):**
 Just run your example - pto-isa will be cloned automatically on first run:
@@ -232,8 +232,8 @@ pto-runtime/
 ├── python/                             # Language bindings
 │   ├── bindings.py                      # ctypes wrapper (C → Python)
 │   ├── runtime_builder.py              # Python runtime builder
-│   ├── binary_compiler.py              # Multi-platform compiler
-│   ├── pto_compiler.py                 # PTO kernel compiler
+│   ├── runtime_compiler.py              # Multi-platform runtime compiler
+│   ├── kernel_compiler.py               # Kernel compiler
 │   ├── elf_parser.py                   # ELF binary parser
 │   └── toolchain.py                    # Toolchain configuration
 │
@@ -297,16 +297,16 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 
 ### Build Process
 
-The **BinaryCompiler** class handles compilation of all three components separately. Use the `platform` parameter to select the target platform:
+The **RuntimeCompiler** class handles compilation of all three components separately. Use the `platform` parameter to select the target platform:
 
 ```python
-from binary_compiler import BinaryCompiler
+from runtime_compiler import RuntimeCompiler
 
 # For real Ascend hardware (requires CANN toolkit)
-compiler = BinaryCompiler(platform="a2a3")
+compiler = RuntimeCompiler(platform="a2a3")
 
 # For simulation (no Ascend SDK needed)
-compiler = BinaryCompiler(platform="a2a3sim")
+compiler = RuntimeCompiler(platform="a2a3sim")
 
 # Compile each component to independent binaries
 aicore_binary = compiler.compile("aicore", include_dirs, source_dirs)    # → .o file
@@ -328,10 +328,10 @@ Each component is compiled independently with its own toolchain, allowing modula
 
 ```python
 from bindings import bind_host_binary
-from binary_compiler import BinaryCompiler
+from runtime_compiler import RuntimeCompiler
 
 # Compile all binaries
-compiler = BinaryCompiler()
+compiler = RuntimeCompiler()
 aicore_bin = compiler.compile("aicore", [...include_dirs...], [...source_dirs...])
 aicpu_bin = compiler.compile("aicpu", [...include_dirs...], [...source_dirs...])
 host_bin = compiler.compile("host", [...include_dirs...], [...source_dirs...])
@@ -371,7 +371,7 @@ python examples/scripts/run_example.py \
 ```
 
 This example:
-1. Compiles AICPU, AICore, and Host binaries using BinaryCompiler
+1. Compiles AICPU, AICore, and Host binaries using RuntimeCompiler
 2. Loads the host runtime library
 3. Initializes DeviceRunner with compiled binaries
 4. Creates a task runtime: `f = (a + b + 1)(a + b + 2)` with 4 tasks and dependencies
@@ -397,9 +397,9 @@ TEST PASSED
 ```
 Python run_example.py
   │
-  ├─→ BinaryCompiler.compile("host", ...) → host_binary (.so)
-  ├─→ BinaryCompiler.compile("aicpu", ...) → aicpu_binary (.so)
-  ├─→ BinaryCompiler.compile("aicore", ...) → aicore_binary (.o)
+  ├─→ RuntimeCompiler.compile("host", ...) → host_binary (.so)
+  ├─→ RuntimeCompiler.compile("aicpu", ...) → aicpu_binary (.so)
+  ├─→ RuntimeCompiler.compile("aicore", ...) → aicore_binary (.o)
   │
   └─→ bind_host_binary(host_binary)
        └─→ RuntimeLibraryLoader(host_binary)

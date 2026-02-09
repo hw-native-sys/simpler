@@ -1,10 +1,8 @@
 import importlib.util
 import logging
 from pathlib import Path
-from typing import Optional
-
-from binary_compiler import BinaryCompiler
-from pto_compiler import PTOCompiler
+from runtime_compiler import RuntimeCompiler
+from kernel_compiler import KernelCompiler
 
 logger = logging.getLogger(__name__)
 
@@ -13,23 +11,21 @@ class RuntimeBuilder:
     """Discovers and builds runtime implementations from src/runtime/.
 
     Accepts a platform selection to provide correctly configured
-    BinaryCompiler and PTOCompiler instances. Runtime and platform
+    RuntimeCompiler and KernelCompiler instances. Runtime and platform
     are orthogonal — the same runtime (e.g., host_build_graph) can
     be compiled for any platform (e.g., a2a3, a2a3sim).
     """
 
-    def __init__(self, platform: str = "a2a3", runtime_root: Optional[Path] = None):
+    def __init__(self, platform: str = "a2a3"):
         """
         Initialize RuntimeBuilder with platform selection.
 
         Args:
             platform: Target platform ("a2a3" or "a2a3sim")
-            runtime_root: Root directory of the project. Defaults to parent of python/.
         """
         self.platform = platform
 
-        if runtime_root is None:
-            runtime_root = Path(__file__).parent.parent
+        runtime_root = Path(__file__).parent.parent
         self.runtime_root = runtime_root
         self.runtime_dir = runtime_root / "src" / "runtime"
 
@@ -42,35 +38,27 @@ class RuntimeBuilder:
                     self._runtimes[entry.name] = config_path
 
         # Create platform-configured compilers
-        self._binary_compiler = BinaryCompiler(platform=platform)
-        self._pto_compiler = PTOCompiler(platform=platform)
+        self._runtime_compiler = RuntimeCompiler.get_instance(platform=platform)
+        self._kernel_compiler = KernelCompiler(platform=platform)
 
-    def get_binary_compiler(self) -> BinaryCompiler:
-        """Return the BinaryCompiler configured for this platform."""
-        return self._binary_compiler
+    def get_runtime_compiler(self) -> RuntimeCompiler:
+        """Return the RuntimeCompiler configured for this platform."""
+        return self._runtime_compiler
 
-    def get_pto_compiler(self) -> PTOCompiler:
-        """Return the PTOCompiler configured for this platform."""
-        return self._pto_compiler
+    def get_kernel_compiler(self) -> KernelCompiler:
+        """Return the KernelCompiler configured for this platform."""
+        return self._kernel_compiler
 
     def list_runtimes(self) -> list:
         """Return names of discovered runtime implementations."""
         return list(self._runtimes.keys())
 
-    def build(
-        self,
-        name: str,
-        extra_aicpu_source_dirs: list = None,
-        extra_aicpu_include_dirs: list = None,
-    ) -> tuple:
+    def build(self, name: str) -> tuple:
         """
         Build a specific runtime implementation by name.
 
         Args:
             name: Name of the runtime implementation (e.g. 'host_build_graph')
-            extra_aicpu_source_dirs: Additional source directories for AICPU compilation
-                                     (used by tensormap_and_ringbuffer for device-side orchestration)
-            extra_aicpu_include_dirs: Additional include directories for AICPU compilation
 
         Returns:
             Tuple of (host_binary, aicpu_binary, aicore_binary) as bytes
@@ -93,7 +81,7 @@ class RuntimeBuilder:
         spec.loader.exec_module(build_config_module)
         build_config = build_config_module.BUILD_CONFIG
 
-        compiler = self._binary_compiler
+        compiler = self._runtime_compiler
 
         # Compile AICore kernel
         logger.info("[1/3] Compiling AICore kernel...")
@@ -107,13 +95,6 @@ class RuntimeBuilder:
         aicpu_cfg = build_config["aicpu"]
         aicpu_include_dirs = [str((config_dir / p).resolve()) for p in aicpu_cfg["include_dirs"]]
         aicpu_source_dirs = [str((config_dir / p).resolve()) for p in aicpu_cfg["source_dirs"]]
-
-        # Add extra source/include dirs for device-side orchestration (rt2)
-        if extra_aicpu_include_dirs:
-            aicpu_include_dirs.extend(extra_aicpu_include_dirs)
-        if extra_aicpu_source_dirs:
-            aicpu_source_dirs.extend(extra_aicpu_source_dirs)
-
         aicpu_binary = compiler.compile("aicpu", aicpu_include_dirs, aicpu_source_dirs)
 
         # Compile Host runtime

@@ -171,9 +171,9 @@ Golden.py interface:
 
     # Import and run
     try:
-        from code_runner import CodeRunner
+        from code_runner import create_code_runner
 
-        runner = CodeRunner(
+        runner = create_code_runner(
             kernels_dir=str(args.kernels),
             golden_path=str(args.golden),
             device_id=args.device,

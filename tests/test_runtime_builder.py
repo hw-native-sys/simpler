@@ -4,7 +4,7 @@ import os
 import sys
 import textwrap
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 
@@ -24,7 +24,7 @@ class TestRuntimeBuilderDiscovery:
         from runtime_builder import RuntimeBuilder
 
         # Use a2a3sim platform which doesn't require ASCEND_HOME_PATH
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=PROJECT_ROOT)
+        builder = RuntimeBuilder(platform="a2a3sim")
         runtimes = builder.list_runtimes()
         assert "host_build_graph" in runtimes
 
@@ -32,25 +32,27 @@ class TestRuntimeBuilderDiscovery:
         """RuntimeBuilder discovers aicpu_build_graph from the real project tree."""
         from runtime_builder import RuntimeBuilder
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=PROJECT_ROOT)
+        builder = RuntimeBuilder(platform="a2a3sim")
         runtimes = builder.list_runtimes()
         assert "aicpu_build_graph" in runtimes
 
-    def test_default_runtime_root(self):
-        """Default runtime_root resolves to the project root."""
+    def test_runtime_dir_resolves_to_project_root(self):
+        """runtime_dir resolves to src/runtime/ under the project root."""
         from runtime_builder import RuntimeBuilder
 
         # Use a2a3sim platform which doesn't require ASCEND_HOME_PATH
         builder = RuntimeBuilder(platform="a2a3sim")
-        # runtime_root should be parent of python/ which is the project root
         assert builder.runtime_dir == builder.runtime_root / "src" / "runtime"
         assert builder.runtime_dir.is_dir()
 
-    @patch("runtime_builder.BinaryCompiler")
-    @patch("runtime_builder.PTOCompiler")
-    def test_custom_runtime_root_with_configs(self, MockPTO, MockCompiler, tmp_path):
-        """RuntimeBuilder discovers implementations in a custom root."""
+    @patch("runtime_builder.RuntimeCompiler")
+    @patch("runtime_builder.KernelCompiler")
+    def test_discovers_configs_in_runtime_dir(self, MockKernel, MockCompiler, tmp_path, monkeypatch):
+        """RuntimeBuilder discovers implementations in the runtime directory."""
+        import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
+
+        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "python" / "rb.py"))
 
         # Set up fake runtime tree
         rt_dir = tmp_path / "src" / "runtime" / "my_runtime"
@@ -59,14 +61,17 @@ class TestRuntimeBuilderDiscovery:
             "BUILD_CONFIG = {}\n"
         )
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        builder = RuntimeBuilder(platform="a2a3sim")
         assert builder.list_runtimes() == ["my_runtime"]
 
-    @patch("runtime_builder.BinaryCompiler")
-    @patch("runtime_builder.PTOCompiler")
-    def test_ignores_dirs_without_build_config(self, MockPTO, MockCompiler, tmp_path):
+    @patch("runtime_builder.RuntimeCompiler")
+    @patch("runtime_builder.KernelCompiler")
+    def test_ignores_dirs_without_build_config(self, MockKernel, MockCompiler, tmp_path, monkeypatch):
         """Directories without build_config.py are not listed."""
+        import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
+
+        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "python" / "rb.py"))
 
         rt_dir = tmp_path / "src" / "runtime"
         (rt_dir / "has_config").mkdir(parents=True)
@@ -75,34 +80,43 @@ class TestRuntimeBuilderDiscovery:
         # __pycache__ should also be ignored
         (rt_dir / "__pycache__").mkdir(parents=True)
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        builder = RuntimeBuilder(platform="a2a3sim")
         assert builder.list_runtimes() == ["has_config"]
 
-    @patch("runtime_builder.BinaryCompiler")
-    @patch("runtime_builder.PTOCompiler")
-    def test_empty_runtime_dir(self, MockPTO, MockCompiler, tmp_path):
+    @patch("runtime_builder.RuntimeCompiler")
+    @patch("runtime_builder.KernelCompiler")
+    def test_empty_runtime_dir(self, MockKernel, MockCompiler, tmp_path, monkeypatch):
         """Empty src/runtime/ directory yields no runtimes."""
+        import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
+
+        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "python" / "rb.py"))
 
         (tmp_path / "src" / "runtime").mkdir(parents=True)
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        builder = RuntimeBuilder(platform="a2a3sim")
         assert builder.list_runtimes() == []
 
-    @patch("runtime_builder.BinaryCompiler")
-    @patch("runtime_builder.PTOCompiler")
-    def test_missing_runtime_dir(self, MockPTO, MockCompiler, tmp_path):
+    @patch("runtime_builder.RuntimeCompiler")
+    @patch("runtime_builder.KernelCompiler")
+    def test_missing_runtime_dir(self, MockKernel, MockCompiler, tmp_path, monkeypatch):
         """Non-existent src/runtime/ directory yields no runtimes."""
+        import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "python" / "rb.py"))
+
+        builder = RuntimeBuilder(platform="a2a3sim")
         assert builder.list_runtimes() == []
 
-    @patch("runtime_builder.BinaryCompiler")
-    @patch("runtime_builder.PTOCompiler")
-    def test_multiple_runtimes_sorted(self, MockPTO, MockCompiler, tmp_path):
+    @patch("runtime_builder.RuntimeCompiler")
+    @patch("runtime_builder.KernelCompiler")
+    def test_multiple_runtimes_sorted(self, MockKernel, MockCompiler, tmp_path, monkeypatch):
         """Multiple implementations are returned in sorted order."""
+        import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
+
+        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "python" / "rb.py"))
 
         rt_dir = tmp_path / "src" / "runtime"
         for name in ["zeta", "alpha", "beta"]:
@@ -110,7 +124,7 @@ class TestRuntimeBuilderDiscovery:
             d.mkdir(parents=True)
             (d / "build_config.py").write_text("BUILD_CONFIG = {}\n")
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        builder = RuntimeBuilder(platform="a2a3sim")
         assert builder.list_runtimes() == ["alpha", "beta", "zeta"]
 
 
@@ -125,7 +139,7 @@ class TestRuntimeBuilderBuildErrors:
         from runtime_builder import RuntimeBuilder
 
         # Use a2a3sim platform which doesn't require ASCEND_HOME_PATH
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=PROJECT_ROOT)
+        builder = RuntimeBuilder(platform="a2a3sim")
         with pytest.raises(ValueError, match="not found"):
             builder.build("nonexistent_runtime")
 
@@ -133,18 +147,21 @@ class TestRuntimeBuilderBuildErrors:
         """ValueError message includes available runtime names."""
         from runtime_builder import RuntimeBuilder
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=PROJECT_ROOT)
+        builder = RuntimeBuilder(platform="a2a3sim")
         with pytest.raises(ValueError, match="host_build_graph"):
             builder.build("nonexistent_runtime")
 
-    @patch("runtime_builder.BinaryCompiler")
-    @patch("runtime_builder.PTOCompiler")
-    def test_build_empty_registry_shows_none(self, MockPTO, MockCompiler, tmp_path):
+    @patch("runtime_builder.RuntimeCompiler")
+    @patch("runtime_builder.KernelCompiler")
+    def test_build_empty_registry_shows_none(self, MockKernel, MockCompiler, tmp_path, monkeypatch):
         """ValueError message shows '(none)' when no runtimes exist."""
+        import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
 
+        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "python" / "rb.py"))
+
         (tmp_path / "src" / "runtime").mkdir(parents=True)
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        builder = RuntimeBuilder(platform="a2a3sim")
         with pytest.raises(ValueError, match=r"\(none\)"):
             builder.build("anything")
 
@@ -153,7 +170,12 @@ class TestRuntimeBuilderBuildErrors:
 
 
 class TestRuntimeBuilderBuild:
-    """Test build() logic with mocked BinaryCompiler."""
+    """Test build() logic with mocked RuntimeCompiler."""
+
+    @pytest.fixture(autouse=True)
+    def _patch_runtime_root(self, monkeypatch, tmp_path):
+        import runtime_builder as rb_module
+        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "python" / "rb.py"))
 
     def _make_runtime(self, tmp_path):
         """Create a fake runtime with a valid build_config.py."""
@@ -180,56 +202,56 @@ class TestRuntimeBuilderBuild:
         (rt_dir / "build_config.py").write_text(config_content)
         return rt_dir
 
-    @patch("runtime_builder.PTOCompiler")
-    @patch("runtime_builder.BinaryCompiler")
-    def test_build_returns_three_binaries(self, MockCompiler, MockPTO, tmp_path):
+    @patch("runtime_builder.KernelCompiler")
+    @patch("runtime_builder.RuntimeCompiler")
+    def test_build_returns_three_binaries(self, MockCompiler, MockKernel, tmp_path):
         """build() returns (host_binary, aicpu_binary, aicore_binary)."""
         from runtime_builder import RuntimeBuilder
 
         self._make_runtime(tmp_path)
 
-        mock_instance = MockCompiler.return_value
+        mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.side_effect = [
             b"aicore_bin",   # first call: aicore
             b"aicpu_bin",    # second call: aicpu
             b"host_bin",     # third call: host
         ]
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        builder = RuntimeBuilder(platform="a2a3sim")
         result = builder.build("test_rt")
 
         assert result == (b"host_bin", b"aicpu_bin", b"aicore_bin")
 
-    @patch("runtime_builder.PTOCompiler")
-    @patch("runtime_builder.BinaryCompiler")
-    def test_build_calls_compiler_three_times(self, MockCompiler, MockPTO, tmp_path):
+    @patch("runtime_builder.KernelCompiler")
+    @patch("runtime_builder.RuntimeCompiler")
+    def test_build_calls_compiler_three_times(self, MockCompiler, MockKernel, tmp_path):
         """build() invokes compiler.compile() exactly 3 times (aicore, aicpu, host)."""
         from runtime_builder import RuntimeBuilder
 
         self._make_runtime(tmp_path)
 
-        mock_instance = MockCompiler.return_value
+        mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.return_value = b"binary"
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        builder = RuntimeBuilder(platform="a2a3sim")
         builder.build("test_rt")
 
         assert mock_instance.compile.call_count == 3
         platforms = [call.args[0] for call in mock_instance.compile.call_args_list]
         assert platforms == ["aicore", "aicpu", "host"]
 
-    @patch("runtime_builder.PTOCompiler")
-    @patch("runtime_builder.BinaryCompiler")
-    def test_build_resolves_paths_relative_to_config(self, MockCompiler, MockPTO, tmp_path):
+    @patch("runtime_builder.KernelCompiler")
+    @patch("runtime_builder.RuntimeCompiler")
+    def test_build_resolves_paths_relative_to_config(self, MockCompiler, MockKernel, tmp_path):
         """Include/source dirs are resolved relative to the build_config.py directory."""
         from runtime_builder import RuntimeBuilder
 
         rt_dir = self._make_runtime(tmp_path)
 
-        mock_instance = MockCompiler.return_value
+        mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.return_value = b"binary"
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        builder = RuntimeBuilder(platform="a2a3sim")
         builder.build("test_rt")
 
         # Check the first call (aicore): include_dirs should be resolved paths
@@ -239,18 +261,18 @@ class TestRuntimeBuilderBuild:
             assert Path(d).is_absolute()
             assert str(rt_dir.resolve()) in d
 
-    @patch("runtime_builder.PTOCompiler")
-    @patch("runtime_builder.BinaryCompiler")
-    def test_build_propagates_compiler_error(self, MockCompiler, MockPTO, tmp_path):
-        """If BinaryCompiler.compile() raises, build() propagates the exception."""
+    @patch("runtime_builder.KernelCompiler")
+    @patch("runtime_builder.RuntimeCompiler")
+    def test_build_propagates_compiler_error(self, MockCompiler, MockKernel, tmp_path):
+        """If RuntimeCompiler.compile() raises, build() propagates the exception."""
         from runtime_builder import RuntimeBuilder
 
         self._make_runtime(tmp_path)
 
-        mock_instance = MockCompiler.return_value
+        mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.side_effect = RuntimeError("cmake failed")
 
-        builder = RuntimeBuilder(platform="a2a3sim", runtime_root=tmp_path)
+        builder = RuntimeBuilder(platform="a2a3sim")
         with pytest.raises(RuntimeError, match="cmake failed"):
             builder.build("test_rt")
 
@@ -263,25 +285,34 @@ requires_ascend = pytest.mark.skipif(
     reason="ASCEND_HOME_PATH not set; Ascend toolkit required for real build",
 )
 
+PLATFORMS = ["a2a3", "a2a3sim"]
+RUNTIMES = ["host_build_graph", "aicpu_build_graph", "tensormap_and_ringbuffer"]
 
-@requires_ascend
+
 class TestRuntimeBuilderIntegration:
-    """Integration tests that actually compile host_build_graph."""
+    """Integration tests that actually compile all platform × runtime combinations."""
 
     @pytest.fixture(autouse=True)
     def _reset_compiler_singleton(self):
-        """Reset BinaryCompiler singleton-per-platform cache so each test gets fresh instances."""
-        from binary_compiler import BinaryCompiler
+        """Reset RuntimeCompiler singleton-per-platform cache so each test gets fresh instances."""
+        from runtime_compiler import RuntimeCompiler
 
         yield
-        BinaryCompiler._instances.clear()
+        RuntimeCompiler._instances.clear()
 
-    def test_build_host_build_graph_returns_three_binaries(self):
-        """build('host_build_graph') produces a 3-tuple of non-empty bytes."""
+    @pytest.mark.parametrize("platform,runtime_name", [
+        pytest.param(p, r,
+                     marks=requires_ascend if p == "a2a3" else [],
+                     id=f"{p}-{r}")
+        for p in PLATFORMS
+        for r in RUNTIMES
+    ])
+    def test_build_returns_three_binaries(self, platform, runtime_name):
+        """build() produces a 3-tuple of non-empty bytes."""
         from runtime_builder import RuntimeBuilder
 
-        builder = RuntimeBuilder(platform="a2a3", runtime_root=PROJECT_ROOT)
-        result = builder.build("host_build_graph")
+        builder = RuntimeBuilder(platform=platform)
+        result = builder.build(runtime_name)
 
         assert isinstance(result, tuple)
         assert len(result) == 3

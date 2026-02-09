@@ -36,7 +36,6 @@ import importlib.util
 import logging
 import os
 import sys
-import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -102,24 +101,6 @@ def _load_module_from_path(module_path: Path, module_name: str):
 def _get_project_root() -> Path:
     """Get the project root directory."""
     return Path(__file__).parent.parent.parent  # examples/scripts/ -> examples/ -> simpler/
-
-
-def _check_ascend_env() -> bool:
-    """Check if ASCEND_HOME_PATH environment is set."""
-    return bool(os.environ.get("ASCEND_HOME_PATH"))
-
-
-def _check_pto_isa_root() -> bool:
-    """Check if PTO_ISA_ROOT environment is set."""
-    return bool(os.environ.get("PTO_ISA_ROOT"))
-
-
-def _get_device_id() -> int:
-    """Get device ID from environment variables."""
-    device_id = os.environ.get("PTO_DEVICE_ID")
-    if device_id is None:
-        device_id = os.environ.get("TILE_FWK_DEVICE_ID", "0")
-    return int(device_id)
 
 
 def _get_pto_isa_clone_path() -> Path:
@@ -230,12 +211,12 @@ def _clone_pto_isa(verbose: bool = False) -> bool:
 
 def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
     """
-    Ensure PTO_ISA_ROOT is set, either from environment or cloned repo.
+    Ensure PTO_ISA_ROOT is available, either from environment or cloned repo.
 
     This function:
     1. Checks if PTO_ISA_ROOT is already set
     2. If not, tries to clone pto-isa repository
-    3. Sets PTO_ISA_ROOT to the clone path
+    3. Returns the resolved path
 
     Args:
         verbose: Print detailed progress information
@@ -274,14 +255,7 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
             logger.warning(f"pto-isa cloned but missing include directory: {include_dir}")
         return None
 
-    # Set environment variable
-    pto_isa_root = str(clone_path.resolve())
-    os.environ["PTO_ISA_ROOT"] = pto_isa_root
-
-    if verbose:
-        logger.info(f"Set PTO_ISA_ROOT to: {pto_isa_root}")
-
-    return pto_isa_root
+    return str(clone_path.resolve())
 
 
 def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> Dict[str, str]:
@@ -343,7 +317,6 @@ class CodeRunner:
     Args:
         kernels_dir: Path to kernels directory containing kernel_config.py
         golden_path: Path to golden.py script
-        runtime_name: Runtime implementation name (default: "host_build_graph")
         device_id: Device ID (defaults to PTO_DEVICE_ID env var or 0)
         platform: Platform name ("a2a3" for hardware, "a2a3sim" for simulation, default: "a2a3")
     """
@@ -352,14 +325,13 @@ class CodeRunner:
         self,
         kernels_dir: str,
         golden_path: str,
-        runtime_name: Optional[str] = None,
         device_id: Optional[int] = None,
         platform: str = "a2a3",
         enable_profiling: bool = False,
     ):
         # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
         _setup_logging_if_needed()
-        
+
         self.kernels_dir = Path(kernels_dir).resolve()
         self.golden_path = Path(golden_path).resolve()
         self.platform = platform
@@ -367,9 +339,7 @@ class CodeRunner:
         self.project_root = _get_project_root()
 
         # Resolve device ID
-        if device_id is None:
-            device_id = _get_device_id()
-        self.device_id = device_id
+        self.device_id = device_id if device_id is not None else 0
 
         # Load configurations
         self._kernel_config = self._load_kernel_config()
@@ -390,11 +360,7 @@ class CodeRunner:
         runtime_config = getattr(self._kernel_config, 'RUNTIME_CONFIG', {})
         self.aicpu_thread_num = runtime_config.get('aicpu_thread_num', 3)
         self.block_dim = runtime_config.get('block_dim', 24)
-
-        # Resolve runtime_name from RUNTIME_CONFIG if not explicitly provided
-        if runtime_name is None:
-            runtime_name = runtime_config.get('runtime', 'host_build_graph')
-        self.runtime_name = runtime_name
+        self.runtime_name = runtime_config.get('runtime', 'host_build_graph')
 
     def _load_kernel_config(self):
         """Load kernel_config.py from kernels directory."""
@@ -405,62 +371,6 @@ class CodeRunner:
                 f"Expected: {config_path}"
             )
         return _load_module_from_path(config_path, f"kernel_config_{id(self)}")
-
-    def _compile_aicpu_orchestration_plugin(self, pto_compiler) -> Path:
-        """
-        Compile the AICPU orchestration plugin (.so loaded via dlopen on AICPU).
-
-        Uses ORCHESTRATION config from kernel_config.py.
-
-        Returns:
-            Host path to the compiled plugin .so.
-        """
-        cfg = self.orchestration
-        source_path = cfg.get("source")
-        func_name = cfg.get("function_name", "orchestration")
-        if not source_path or not isinstance(source_path, str):
-            raise ValueError("ORCHESTRATION['source'] must be a non-empty string")
-        if not func_name or not isinstance(func_name, str):
-            raise ValueError("ORCHESTRATION['function_name'] must be a non-empty string")
-
-        source_p = Path(source_path)
-        if not source_p.is_absolute():
-            source_p = (self.kernels_dir / source_p).resolve()
-        source_path = str(source_p)
-
-        runtime_include_dir = str(self.project_root / "src" / "runtime" / self.runtime_name / "runtime")
-        platform_include_dir = str(self.project_root / "src" / "platform" / "include")
-        include_dirs = [runtime_include_dir, platform_include_dir]
-
-        # Secure, unique output path in /tmp.
-        fd, out_s = tempfile.mkstemp(prefix="aicpu_orch_", suffix=".so", dir="/tmp")
-        os.close(fd)
-        out_path = Path(out_s)
-
-        logger.info("=== Compiling AICPU Orchestration Plugin ===")
-        logger.info(f"AICPU plugin entry: {func_name}")
-        logger.info(f"Output: {out_path}")
-
-        try:
-            out_s = pto_compiler.compile_aicpu_orchestration_plugin(
-                source_path,
-                output_path=str(out_path),
-                extra_include_dirs=include_dirs,
-            )
-            if out_s != str(out_path):
-                raise RuntimeError(f"Unexpected AICPU plugin output path: {out_s} (expected {out_path})")
-        except Exception:
-            try:
-                out_path.unlink()
-            except FileNotFoundError:
-                pass
-            raise
-
-        if not out_path.is_file():
-            raise RuntimeError(f"AICPU orchestration plugin compilation succeeded but output not found: {out_path}")
-
-        logger.info(f"Compiled AICPU orchestration plugin: {out_path} ({out_path.stat().st_size} bytes)")
-        return out_path
 
     def _load_golden_module(self):
         """Load golden.py script."""
@@ -577,17 +487,6 @@ class CodeRunner:
 
         return func_args, arg_types, arg_sizes
 
-    def skip_if_no_env(self) -> None:
-        """Raise error if required environment is not available."""
-        if not _check_ascend_env():
-            raise EnvironmentError("ASCEND_HOME_PATH not set")
-        if not _check_pto_isa_root():
-            raise EnvironmentError(
-                "PTO_ISA_ROOT environment variable is not set.\n"
-                "Please set it to the PTO-ISA root directory, e.g.:\n"
-                "  export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa"
-            )
-
     def run(self) -> None:
         """
         Execute the full test flow:
@@ -601,7 +500,7 @@ class CodeRunner:
            - Initialize and launch runtime
            - Finalize and compare with golden
         """
-        # Import runtime modules (deferred to allow skip_if_no_env to work)
+        # Import runtime modules (deferred import to avoid top-level dependency)
         from runtime_builder import RuntimeBuilder
         from bindings import bind_host_binary, set_device, launch_runtime
         from elf_parser import extract_text_section
@@ -609,28 +508,20 @@ class CodeRunner:
         # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
         pto_isa_root = _ensure_pto_isa_root(verbose=True)
         if pto_isa_root is None:
-            logger.warning("Could not auto-setup PTO_ISA_ROOT")
-            logger.warning("If kernels use PTO ISA headers, they may fail to compile")
-
-        # Check platform-specific environment (only for a2a3 hardware platform)
-        if self.platform == "a2a3":
-            self.skip_if_no_env()
+            raise EnvironmentError(
+                "PTO_ISA_ROOT could not be resolved.\n"
+                "Please set it to the PTO-ISA root directory, e.g.:\n"
+                "  export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa"
+            )
 
         # Step 1: Build runtime
         logger.info(f"=== Building Runtime: {self.runtime_name} (platform: {self.platform}) ===")
-        builder = RuntimeBuilder(runtime_root=self.project_root, platform=self.platform)
-        pto_compiler = builder.get_pto_compiler()
-
-        # For tensormap_and_ringbuffer, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
-        # NOT compiled into AICPU binary
-        extra_aicpu_source_dirs = None
-        extra_aicpu_include_dirs = None
+        builder = RuntimeBuilder(platform=self.platform)
+        kernel_compiler = builder.get_kernel_compiler()
 
         try:
             host_binary, aicpu_binary, aicore_binary = builder.build(
                 self.runtime_name,
-                extra_aicpu_source_dirs=extra_aicpu_source_dirs,
-                extra_aicpu_include_dirs=extra_aicpu_include_dirs,
             )
         except Exception as e:
             raise RuntimeError(
@@ -648,40 +539,13 @@ class CodeRunner:
         # Step 3: Compile orchestration
         logger.info("=== Compiling Orchestration ===")
 
-        # Build include directories for orchestration
-        orch_include_dirs = [
-            str(self.project_root / "src" / "runtime" / self.runtime_name / "runtime"),
-        ] + pto_compiler.get_platform_include_dirs()
-
-        if self.runtime_name == "aicpu_build_graph":
-            # For aicpu_build_graph: compile orchestration as an AICPU plugin SO.
-            # The framework (init_runtime_impl) embeds it into the Runtime and
-            # auto-manages I/O tensor device memory using arg_types/arg_sizes.
-            orch_plugin_path = self._compile_aicpu_orchestration_plugin(pto_compiler)
-            orch_so_binary = orch_plugin_path.read_bytes()
-            logger.debug(f"Compiled orchestration plugin: {len(orch_so_binary)} bytes")
-        elif self.runtime_name == "tensormap_and_ringbuffer":
-            # For tensormap_and_ringbuffer, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
-            logger.info("tensormap_and_ringbuffer: Compiling orchestration as separate SO for dlopen")
-            orch_so_binary = pto_compiler.compile_orchestration(
-                self.orchestration["source"],
-                extra_include_dirs=orch_include_dirs,
-                runtime_name="tensormap_and_ringbuffer",
-            )
-            logger.debug(f"Compiled orchestration SO: {len(orch_so_binary)} bytes")
-        else:
-            orch_so_binary = pto_compiler.compile_orchestration(
-                self.orchestration["source"],
-                extra_include_dirs=orch_include_dirs,
-                runtime_name=self.runtime_name,
-            )
-            logger.debug(f"Compiled orchestration: {len(orch_so_binary)} bytes")
+        orch_so_binary = kernel_compiler.compile_orchestration(
+            self.runtime_name,
+            self.orchestration["source"],
+        )
 
         # Step 4: Compile kernels (will be registered during runtime.initialize)
         logger.info("=== Compiling Kernels ===")
-
-        # Get PTO_ISA_ROOT (use default for sim platform)
-        pto_isa_root = os.environ.get("PTO_ISA_ROOT", "/tmp/unused")
 
         # Build list of (func_id, binary) tuples for passing to runtime.initialize()
         kernel_binaries = []
@@ -692,7 +556,7 @@ class CodeRunner:
 
         for kernel in self.kernels:
             logger.info(f"Compiling kernel: {kernel['source']} (func_id={kernel['func_id']})")
-            incore_o = pto_compiler.compile_incore(
+            incore_o = kernel_compiler.compile_incore(
                 kernel["source"],
                 core_type=kernel["core_type"],
                 pto_isa_root=pto_isa_root,
@@ -744,7 +608,7 @@ class CodeRunner:
             run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
             if run_env:
                 logger.debug(f"Runtime init env overrides: {run_env}")
-            
+
             # Enable profiling if requested (must be before initialize)
             if self.enable_profiling:
                 runtime.enable_profiling(True)
@@ -825,3 +689,11 @@ class CodeRunner:
             )
             matched = np.sum(np.isclose(actual, expected, rtol=self.rtol, atol=self.atol))
             logger.info(f"  {name}: PASS ({matched}/{actual.size} elements matched)")
+
+
+def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",
+                       enable_profiling=False):
+    """Factory: creates a CodeRunner based on kernel_config."""
+    return CodeRunner(kernels_dir=kernels_dir, golden_path=golden_path,
+                      device_id=device_id, platform=platform,
+                      enable_profiling=enable_profiling)

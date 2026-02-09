@@ -500,15 +500,15 @@ Runtime implementation should be located at: `src/runtime/<runtime_name>/`
 
 ### Programmatic Usage
 
-You can use `CodeRunner` directly in Python scripts:
+You can use `create_code_runner` directly in Python scripts. It creates a
+`CodeRunner` configured from the `RUNTIME_CONFIG` in your `kernel_config.py`:
 
 ```python
-from code_runner import CodeRunner
+from code_runner import create_code_runner
 
-runner = CodeRunner(
+runner = create_code_runner(
     kernels_dir="my_test/kernels",
     golden_path="my_test/golden.py",
-    runtime_name="host_build_graph",
     platform="a2a3sim",
     device_id=0,
 )

@@ -20,9 +20,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "common/compile_strategy.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ===========================================================================
+ * Compile Strategy API
+ *
+ * get_incore_compiler() and get_orchestration_compiler() are declared in
+ * host/runtime_compile_info.h and linked into this library. They return
+ * ToolchainType values indicating which compiler to use.
+ * get_platform() is declared in host/platform_compile_info.h.
+ * ===========================================================================
+ */
 
 /**
  * Argument type for init_runtime.
@@ -207,21 +219,6 @@ void record_tensor_pair(RuntimeHandle runtime,
                        void* dev_ptr,
                        size_t size);
 
-/**
- * Set PTO2 shared memory pointer for device orchestration.
- *
- * @param runtime   Runtime handle
- * @param dev_ptr   Device pointer to PTO2 shared memory
- */
-void set_pto2_gm_sm_ptr(RuntimeHandle runtime, void* dev_ptr);
-
-/**
- * Get PTO2 shared memory size.
- *
- * @param runtime   Runtime handle
- * @return Size in bytes, or 0 if not available
- */
-int32_t get_pto2_sm_size(RuntimeHandle runtime);
 
 /**
  * Enable or disable performance profiling for swimlane visualization.

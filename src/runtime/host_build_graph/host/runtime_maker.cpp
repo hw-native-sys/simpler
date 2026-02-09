@@ -66,7 +66,11 @@ int init_runtime_impl(Runtime *runtime,
                     uint64_t* func_args,
                     int func_args_count,
                     int* arg_types,
-                    uint64_t* arg_sizes) {
+                    uint64_t* arg_sizes,
+                    const int* kernel_func_ids,
+                    const uint8_t* const* kernel_binaries,
+                    const size_t* kernel_sizes,
+                    int kernel_count) {
     // Unused parameters for host orchestration
     (void)arg_types;
     (void)arg_sizes;
@@ -75,6 +79,21 @@ int init_runtime_impl(Runtime *runtime,
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
+    }
+
+    // Register kernel binaries via platform-provided upload function
+    if (kernel_count > 0 && kernel_func_ids != NULL &&
+        kernel_binaries != NULL && kernel_sizes != NULL) {
+        LOG_INFO("Registering %d kernel(s) in init_runtime_impl", kernel_count);
+        for (int i = 0; i < kernel_count; i++) {
+            uint64_t addr = runtime->host_api.upload_kernel_binary(
+                kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
+            if (addr == 0) {
+                LOG_ERROR("Failed to upload kernel binary for func_id=%d", kernel_func_ids[i]);
+                return -1;
+            }
+            runtime->set_function_bin_addr(kernel_func_ids[i], addr);
+        }
     }
     if (orch_so_binary == nullptr || orch_so_size == 0 || orch_func_name == nullptr) {
         LOG_ERROR("Invalid orchestration parameters");
