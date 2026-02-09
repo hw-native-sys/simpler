@@ -16,6 +16,7 @@
 #define ORCH_BUILD_GRAPH_PTO_TYPES_H
 
 #include <stdint.h>
+#include <assert.h>
 
 #include "tensor_descriptor.h"
 
@@ -66,9 +67,9 @@ constexpr int32_t PTO_NUM_WORKER_TYPES = 2;
  */
 enum class PTOParamType : int32_t {
     INPUT = 0,   // Read-only input buffer
-    OUTPUT = 1,  // Write-only output buffer (allocated implicitly by runtime)
-    SCALAR = 2,  // Raw scalar value (no buffer, no dependency tracking)
-    INOUT = 3    // In-place update (creates dependency but NOT a new producer)
+    OUTPUT = 1,  // Write-only output buffer (NULL addr: runtime allocates; non-NULL: use as-is)
+    INOUT = 2,   // Read-then-write: consumer of prior producer + modifier for downstream
+    SCALAR = 3   // Raw scalar value (no buffer, no dependency tracking)
 };
 
 /**
@@ -90,5 +91,46 @@ struct PTOParam {
     PTOBufferHandle* buffer;  // Associated buffer handle (nullptr for SCALAR)
     uint64_t scalar_value;    // Raw value for PTOParamType::SCALAR (e.g., encoded float, int size)
 };
+
+// =============================================================================
+// Factory Helpers
+// =============================================================================
+
+static inline PTOParam make_scalar_param(uint64_t value) {
+    PTOParam p = {};
+    p.type = PTOParamType::SCALAR;
+    p.buffer = nullptr;
+    p.scalar_value = value;
+    return p;
+}
+
+static inline PTOParam make_input_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
+    assert(buf.addr != 0 && "INPUT param must have a non-NULL buffer address");
+    PTOParam p = {};
+    p.type = PTOParamType::INPUT;
+    p.tensor = make_tensor_bbox(buf.addr, size, version);
+    p.buffer = &buf;
+    p.scalar_value = 0;
+    return p;
+}
+
+static inline PTOParam make_output_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
+    PTOParam p = {};
+    p.type = PTOParamType::OUTPUT;
+    p.tensor = make_tensor_bbox(buf.addr, size, version);
+    p.buffer = &buf;
+    p.scalar_value = 0;
+    return p;
+}
+
+static inline PTOParam make_inout_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
+    assert(buf.addr != 0 && "INOUT param must have a non-NULL buffer address");
+    PTOParam p = {};
+    p.type = PTOParamType::INOUT;
+    p.tensor = make_tensor_bbox(buf.addr, size, version);
+    p.buffer = &buf;
+    p.scalar_value = 0;
+    return p;
+}
 
 #endif  // ORCH_BUILD_GRAPH_PTO_TYPES_H

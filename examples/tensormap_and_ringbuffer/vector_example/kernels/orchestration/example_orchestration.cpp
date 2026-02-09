@@ -64,45 +64,6 @@
 // Static buffer only for simulation; real device uses host-allocated gm_heap
 static char s_gm_heap_stub[PTO2_HEAP_SIZE];
 
-// Helper: create a BoundingBox tensor descriptor
-static TensorDescriptor make_tensor_bbox(uint64_t addr, int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
-    // size_bytes is the total buffer size in bytes
-    uint64_t size_elements = size_bytes / get_element_size(dtype);
-    uint64_t strides[] = {1};
-    uint64_t repeats[] = {size_elements};
-    TensorDescriptor t(addr, size_bytes, 0, strides, repeats, 1, dtype, version);
-    return t;
-}
-
-// Helper: create a scalar PTOParam
-static PTOParam make_scalar_param(uint64_t value) {
-    PTOParam p = {};
-    p.type = PTOParamType::SCALAR;
-    p.buffer = nullptr;
-    p.scalar_value = value;
-    return p;
-}
-
-// Helper: create an input PTOParam from an existing buffer handle
-static PTOParam make_input_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
-    PTOParam p = {};
-    p.type = PTOParamType::INPUT;
-    p.tensor = make_tensor_bbox(buf.addr, size, version);
-    p.buffer = &buf;
-    p.scalar_value = 0;
-    return p;
-}
-
-// Helper: create an output PTOParam (addr will be filled by pto_submit_task)
-static PTOParam make_output_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
-    PTOParam p = {};
-    p.type = PTOParamType::OUTPUT;
-    p.tensor = make_tensor_bbox(0, size, version);  // addr=0, filled during submit
-    p.buffer = &buf;
-    p.scalar_value = 0;
-    return p;
-}
-
 // Helper to encode float as uint64_t for scalar params
 static uint64_t float_to_u64(float f) {
     union {
@@ -112,22 +73,6 @@ static uint64_t float_to_u64(float f) {
     conv.u64 = 0;  // Clear upper bits
     conv.f32 = f;
     return conv.u64;
-}
-
-// Helper: create a PTOBufferHandle for external (pre-allocated) buffer
-static PTOBufferHandle make_external_handle(void* addr, int32_t size) {
-    PTOBufferHandle h = {};
-    h.addr = (uint64_t)addr;
-    h.size = size;
-    return h;
-}
-
-// Helper: create a PTOBufferHandle for output (addr filled during submit)
-static PTOBufferHandle make_output_handle(int32_t size) {
-    PTOBufferHandle h = {};
-    h.addr = 0;  // Will be allocated by runtime during pto_submit_task
-    h.size = size;
-    return h;
 }
 
 extern "C" {
@@ -223,7 +168,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
             make_input_param(dev_b, sz),
             make_output_param(dev_c, sz),
         };
-        (void)pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, "kernel_add", params_t0, 3);
+        pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, "kernel_add", params_t0, 3);
 
         PTOParam params_t1[] = {
             make_input_param(dev_c, sz),
@@ -231,7 +176,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
             make_output_param(dev_d, sz),
             make_scalar_param((uint64_t)3),
         };
-        (void)pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t1, 3);
+        pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t1, 3);
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
         PTOParam params_t2[] = {
@@ -240,7 +185,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
             make_output_param(dev_e, sz),
             make_scalar_param((uint64_t)3),
         };
-        (void)pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t2, 3);
+        pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t2, 3);
 
         // t3: f = d * e (kernel_id=2, kernel_mul)
         PTOParam params_t3[] = {
@@ -249,14 +194,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
             make_output_param(dev_f, sz),
             make_scalar_param((uint64_t)3),
         };
-        int32_t task3_id = pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, "kernel_mul", params_t3, 3);
-
-        // Set graph output pointer for host copy-back
-        void* graph_out_ptr = pto2_rt_get_output(rt, task3_id, 0);
-        if (graph_out_ptr && size_f > 0) {
-            rt->sm_handle->header->graph_output_ptr = (uint64_t)(uintptr_t)graph_out_ptr;
-            rt->sm_handle->header->graph_output_size = (int32_t)size_f;
-        }
+        pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, "kernel_mul", params_t3, 3);
     } // PTO2_SCOPE ends here - automatic pto2_rt_scope_end() called
 
     pto2_rt_orchestration_done(rt);

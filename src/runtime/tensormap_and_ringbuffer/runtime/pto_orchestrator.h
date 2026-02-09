@@ -167,26 +167,13 @@ static inline int32_t pto2_get_scope_depth(PTO2OrchestratorState* orch) {
  * @param func_name   Function name (for debugging)
  * @param params      Array of task parameters
  * @param num_params  Number of parameters
- * @return Task ID of the submitted task
  */
-int32_t pto2_submit_task(PTO2OrchestratorState* orch,
-                          int32_t kernel_id,
-                          PTO2WorkerType worker_type,
-                          const char* func_name,
-                          PTOParam* params,
-                          int32_t num_params);
-
-/**
- * Get pointer to specific output of a task
- * 
- * @param orch       Orchestrator state
- * @param task_id    Task ID
- * @param output_idx Output index (0-based)
- * @return Pointer to output buffer
- */
-void* pto2_task_get_output(PTO2OrchestratorState* orch, 
-                            int32_t task_id, 
-                            int32_t output_idx);
+void pto2_submit_task(PTO2OrchestratorState* orch,
+                      int32_t kernel_id,
+                      PTO2WorkerType worker_type,
+                      const char* func_name,
+                      PTOParam* params,
+                      int32_t num_params);
 
 // =============================================================================
 // Flow Control

@@ -255,12 +255,12 @@ void pto2_param_set_inout(PTO2TaskParam* p, void* buf, int32_t tile_index, int32
     pto2_param_set(p, (int32_t)PTO2_PARAM_INOUT, buf, tile_index, size_bytes);
 }
 
-int32_t pto2_submit_task(PTO2OrchestratorState* orch,
-                          int32_t kernel_id,
-                          PTO2WorkerType worker_type,
-                          const char* func_name,
-                          PTOParam* params,
-                          int32_t num_params) {
+void pto2_submit_task(PTO2OrchestratorState* orch,
+                      int32_t kernel_id,
+                      PTO2WorkerType worker_type,
+                      const char* func_name,
+                      PTOParam* params,
+                      int32_t num_params) {
 
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
     pto2_orchestrator_sync_tensormap(orch);
@@ -340,8 +340,10 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
             }
 
             case PTOParamType::OUTPUT: {
-                // Collect output size for packed buffer allocation
-                total_output_size += PTO2_ALIGN_UP(params[i].tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                // Only allocate from ring buffer when caller did not provide an address
+                if (params[i].tensor.buffer.addr == 0) {
+                    total_output_size += PTO2_ALIGN_UP(params[i].tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                }
                 break;
             }
 
@@ -384,9 +386,11 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
         int32_t offset = 0;
         for (int i = 0; i < task->param_count; i++) {
             if (task->params[i].type == PTOParamType::OUTPUT) {
-                task->params[i].tensor.buffer.addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
-                task->params[i].buffer->addr = task->params[i].tensor.buffer.addr;
-                offset += PTO2_ALIGN_UP(task->params[i].tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                if (task->params[i].tensor.buffer.addr == 0) {
+                    task->params[i].tensor.buffer.addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
+                    task->params[i].buffer->addr = task->params[i].tensor.buffer.addr;
+                    offset += PTO2_ALIGN_UP(task->params[i].tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                }
                 task->output_index[task->num_outputs++] = i;
             }
         }
@@ -428,20 +432,6 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                        orch->task_ring.current_index);
     
     orch->tasks_submitted++;
-
-    return task_id;
-}
-
-void* pto2_task_get_output(PTO2OrchestratorState* orch, 
-                            int32_t task_id, 
-                            int32_t output_idx) {
-    PTO2TaskDescriptor* task = pto2_task_ring_get(&orch->task_ring, task_id);
-    
-    if (output_idx < 0 || output_idx >= task->num_outputs) {
-        return NULL;
-    }
-    
-    return reinterpret_cast<char*>(task->params[task->output_index[output_idx]].tensor.buffer.addr);
 }
 
 // =============================================================================

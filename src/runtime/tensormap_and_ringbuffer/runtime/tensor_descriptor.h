@@ -157,3 +157,30 @@ struct TensorDescriptor {
 
     bool complex_overlap(const TensorDescriptor& pre_task_output) const;
 };
+
+// =============================================================================
+// Factory Helpers
+// =============================================================================
+
+static inline PTOBufferHandle make_external_handle(void* addr, int32_t size) {
+    PTOBufferHandle h = {};
+    h.addr = (uint64_t)addr;
+    h.size = size;
+    return h;
+}
+
+static inline PTOBufferHandle make_output_handle(int32_t size) {
+    PTOBufferHandle h = {};
+    h.addr = 0;
+    h.size = size;
+    return h;
+}
+
+static inline TensorDescriptor make_tensor_bbox(uint64_t addr, int32_t size_bytes,
+        int32_t version = 0, DataType dtype = DataType::FLOAT32) {
+    uint64_t size_elements = size_bytes / get_element_size(dtype);
+    uint64_t strides[] = {1};
+    uint64_t repeats[] = {size_elements};
+    TensorDescriptor t(addr, size_bytes, 0, strides, repeats, 1, dtype, version);
+    return t;
+}

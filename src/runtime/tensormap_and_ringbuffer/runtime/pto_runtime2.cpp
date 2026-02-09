@@ -161,20 +161,20 @@ void pto2_rt_scope_end(PTO2Runtime* rt) {
     pto2_scope_end(&rt->orchestrator);
 }
 
-int32_t pto2_rt_submit_task(PTO2Runtime* rt,
-                             int32_t kernel_id,
-                             PTO2WorkerType worker_type,
-                             const char* func_name,
-                             PTOParam* params,
-                             int32_t num_params) {
-    return pto2_submit_task(&rt->orchestrator, kernel_id, worker_type,
-                            func_name, params, num_params);
+void pto2_rt_submit_task(PTO2Runtime* rt,
+                         int32_t kernel_id,
+                         PTO2WorkerType worker_type,
+                         const char* func_name,
+                         PTOParam* params,
+                         int32_t num_params) {
+    pto2_submit_task(&rt->orchestrator, kernel_id, worker_type,
+                     func_name, params, num_params);
 }
 
-int32_t pto2_rt_submit(PTO2Runtime* rt,
-                        const char* func_name,
-                        PTOParam* params,
-                        int32_t num_params) {
+void pto2_rt_submit(PTO2Runtime* rt,
+                    const char* func_name,
+                    PTOParam* params,
+                    int32_t num_params) {
     // Auto-detect worker type based on function name
     PTO2WorkerType worker_type = PTO2_WORKER_VECTOR;  // Default
 
@@ -189,14 +189,10 @@ int32_t pto2_rt_submit(PTO2Runtime* rt,
         }
     }
 
-    return pto2_submit_task(&rt->orchestrator, 0, worker_type,
-                            func_name, params, num_params);
+    pto2_submit_task(&rt->orchestrator, 0, worker_type,
+                     func_name, params, num_params);
 }
 
 void pto2_rt_orchestration_done(PTO2Runtime* rt) {
     pto2_orchestrator_done(&rt->orchestrator);
-}
-
-void* pto2_rt_get_output(PTO2Runtime* rt, int32_t task_id, int32_t output_idx) {
-    return pto2_task_get_output(&rt->orchestrator, task_id, output_idx);
 }

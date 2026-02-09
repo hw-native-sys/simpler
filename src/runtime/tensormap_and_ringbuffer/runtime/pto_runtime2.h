@@ -160,24 +160,21 @@ void pto2_rt_scope_end(PTO2Runtime* rt);
  * @param func_name   Function name (for debugging)
  * @param params      Array of task parameters
  * @param num_params  Number of parameters
- * @return Task ID of the submitted task
  */
-int32_t pto2_rt_submit_task(PTO2Runtime* rt,
-                             int32_t kernel_id,
-                             PTO2WorkerType worker_type,
-                             const char* func_name,
-                             PTOParam* params,
-                             int32_t num_params);
+void pto2_rt_submit_task(PTO2Runtime* rt,
+                         int32_t kernel_id,
+                         PTO2WorkerType worker_type,
+                         const char* func_name,
+                         PTOParam* params,
+                         int32_t num_params);
 
 /**
  * Simplified task submission (auto-detect worker type)
- *
- * @return Task ID of the submitted task
  */
-int32_t pto2_rt_submit(PTO2Runtime* rt,
-                        const char* func_name,
-                        PTOParam* params,
-                        int32_t num_params);
+void pto2_rt_submit(PTO2Runtime* rt,
+                    const char* func_name,
+                    PTOParam* params,
+                    int32_t num_params);
 
 /**
  * Mark orchestration as complete
@@ -185,11 +182,6 @@ int32_t pto2_rt_submit(PTO2Runtime* rt,
  * Signals that no more tasks will be submitted.
  */
 void pto2_rt_orchestration_done(PTO2Runtime* rt);
-
-/**
- * Get output buffer pointer for a task
- */
-void* pto2_rt_get_output(PTO2Runtime* rt, int32_t task_id, int32_t output_idx);
 
 // =============================================================================
 // Convenience Macros (if not already defined in pto_runtime2_types.h)
