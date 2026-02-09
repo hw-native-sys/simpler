@@ -166,7 +166,7 @@ int32_t pto2_rt_submit_task(PTO2Runtime* rt,
                              int32_t kernel_id,
                              PTO2WorkerType worker_type,
                              const char* func_name,
-                             PTOParam* params,
+                             PTO2TaskParam* params,
                              int32_t num_params);
 
 /**
@@ -176,7 +176,7 @@ int32_t pto2_rt_submit_task(PTO2Runtime* rt,
  */
 int32_t pto2_rt_submit(PTO2Runtime* rt,
                         const char* func_name,
-                        PTOParam* params,
+                        PTO2TaskParam* params,
                         int32_t num_params);
 
 /**
