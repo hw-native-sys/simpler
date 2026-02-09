@@ -235,26 +235,6 @@ void* pto2_alloc_packed_buffer(PTO2OrchestratorState* orch, int32_t total_size) 
     return buffer;
 }
 
-static inline void pto2_param_set(PTO2TaskParam* p, int32_t type, void* buf, int32_t tile_index, int32_t size_bytes) {
-    p->type = type;
-    memset(p->_pad, 0, sizeof(p->_pad));
-    p->buffer = buf;
-    p->tile_index = tile_index;
-    p->size = size_bytes;
-}
-
-void pto2_param_set_input(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes) {
-    pto2_param_set(p, (int32_t)PTO2_PARAM_INPUT, buf, tile_index, size_bytes);
-}
-
-void pto2_param_set_output(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes) {
-    pto2_param_set(p, (int32_t)PTO2_PARAM_OUTPUT, buf, tile_index, size_bytes);
-}
-
-void pto2_param_set_inout(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes) {
-    pto2_param_set(p, (int32_t)PTO2_PARAM_INOUT, buf, tile_index, size_bytes);
-}
-
 void pto2_submit_task(PTO2OrchestratorState* orch,
                       int32_t kernel_id,
                       PTO2WorkerType worker_type,
@@ -302,8 +282,13 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     task->param_count = num_params;
     for (int i = 0; i < task->param_count; i++) {
         task->params[i] = params[i];
+        // Copy tensor data into task-owned storage; redirect task's pointer to it
+        if (params[i].tensor) {
+            task->tensor_copies[i] = *params[i].tensor;
+            task->params[i].tensor = &task->tensor_copies[i];
+        }
     }
-    
+
     // === STEP 2: First pass - collect output sizes and process inputs ===
 
     for (int i = 0; i < num_params; i++) {
@@ -312,8 +297,8 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         switch (p->type) {
             case PTOParamType::INPUT: {
                 // Look up producer via TensorMap
-                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, &params[i].tensor);
-                
+                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, params[i].tensor);
+
                 if (producer_id >= 0) {
                     // Check if this producer is already in fanin list (avoid duplicates)
                     bool already_added = false;
@@ -323,13 +308,13 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                             break;
                         }
                     }
-                    
+
                     if (!already_added) {
                         // Add to fanin list (this task depends on producer)
                         if (fanin_count < PTO2_MAX_INPUTS) {
                             fanin_temp[fanin_count++] = producer_id;
                         }
-                        
+
                         // Add this task to producer's fanout list (with spinlock)
                         PTO2TaskDescriptor* producer = pto2_task_ring_get(
                             &orch->task_ring, producer_id);
@@ -341,15 +326,15 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 
             case PTOParamType::OUTPUT: {
                 // Only allocate from ring buffer when caller did not provide an address
-                if (params[i].tensor.buffer.addr == 0) {
-                    total_output_size += PTO2_ALIGN_UP(params[i].tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                if (params[i].tensor->buffer.addr == 0) {
+                    total_output_size += PTO2_ALIGN_UP(params[i].tensor->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
                 break;
             }
 
             case PTOParamType::INOUT: {
                 // Handle as input (get dependency on previous writer)
-                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, &params[i].tensor);
+                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, params[i].tensor);
                 if (producer_id >= 0) {
                     // Check if this producer is already in fanin list (avoid duplicates)
                     bool already_added = false;
@@ -359,7 +344,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                             break;
                         }
                     }
-                    
+
                     if (!already_added) {
                         if (fanin_count < PTO2_MAX_INPUTS) {
                             fanin_temp[fanin_count++] = producer_id;
@@ -375,21 +360,23 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                     break;
         }
     }
-    
+
     // === STEP 3: Allocate packed buffer from Heap Ring (may stall) ===
     // Each output slot is aligned to PTO2_PACKED_OUTPUT_ALIGN (1024B); gap after data is padding.
     if (total_output_size > 0) {
         task->packed_buffer_base = pto2_alloc_packed_buffer(orch, total_output_size);
         task->packed_buffer_end = (char*)task->packed_buffer_base + total_output_size;
-        
+
         // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(size, 1024)
         int32_t offset = 0;
         for (int i = 0; i < task->param_count; i++) {
             if (task->params[i].type == PTOParamType::OUTPUT) {
-                if (task->params[i].tensor.buffer.addr == 0) {
-                    task->params[i].tensor.buffer.addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
-                    task->params[i].buffer->addr = task->params[i].tensor.buffer.addr;
-                    offset += PTO2_ALIGN_UP(task->params[i].tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                if (task->tensor_copies[i].buffer.addr == 0) {
+                    uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
+                    task->tensor_copies[i].buffer.addr = alloc_addr;
+                    // Write back through caller's pointer (implicit update)
+                    params[i].tensor->buffer.addr = alloc_addr;
+                    offset += PTO2_ALIGN_UP(task->tensor_copies[i].buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
                 task->output_index[task->num_outputs++] = i;
             }
@@ -403,10 +390,8 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 
         if (p->type == PTOParamType::OUTPUT || p->type == PTOParamType::INOUT) {
             // Register in TensorMap: this region is produced by task_id
-            // Use task->params[i].tensor (not params[i].tensor) because STEP 3
-            // updated task->params[i].tensor.buffer.addr with the heap-allocated
-            // address. The original params[i].tensor still has addr=0 for outputs.
-            pto2_tensormap_insert(&orch->tensor_map, &task->params[i].tensor, task_id);
+            // Use task's tensor_copies (which has the heap-allocated address for outputs)
+            pto2_tensormap_insert(&orch->tensor_map, &task->tensor_copies[i], task_id);
             output_idx++;
         }
     }

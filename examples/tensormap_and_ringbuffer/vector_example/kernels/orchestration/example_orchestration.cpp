@@ -144,12 +144,12 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     int32_t sz = (int32_t)BYTES;
     if (sz <= 0) sz = (int32_t)size_a;
 
-    PTOBufferHandle arg_a = make_external_handle(arg_a_ptr, size_a);
-    PTOBufferHandle arg_b = make_external_handle(arg_b_ptr, size_b);
-    PTOBufferHandle arg_f = make_external_handle(arg_f_ptr, size_f);
-    PTOBufferHandle buf_c = make_output_handle(BYTES);  // c = a + b
-    PTOBufferHandle buf_d = make_output_handle(BYTES);  // d = c + 1
-    PTOBufferHandle buf_e = make_output_handle(BYTES);  // e = c + 2
+    TensorDescriptor ext_td_a = make_tensor_external(arg_a_ptr, size_a);
+    TensorDescriptor ext_td_b = make_tensor_external(arg_b_ptr, size_b);
+    TensorDescriptor ext_td_f = make_tensor_external(arg_f_ptr, size_f);
+    TensorDescriptor td_c = make_tensor(BYTES);  // c = a + b
+    TensorDescriptor td_d = make_tensor(BYTES);  // d = c + 1
+    TensorDescriptor td_e = make_tensor(BYTES);  // e = c + 2
 
     // Use RAII scope guard for automatic scope management.
     // PTO2_SCOPE creates a scoped block where pto2_rt_scope_begin() is called
@@ -159,34 +159,35 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     PTO2_SCOPE(rt) {
         // t0: c = a + b (kernel_id=0, kernel_add)
         PTOParam params_t0[] = {
-            make_input_param(arg_a, sz),
-            make_input_param(arg_b, sz),
-            make_output_param(buf_c, sz),
+            make_input_param(ext_td_a),
+            make_input_param(ext_td_b),
+            make_output_param(td_c),
         };
         pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, "kernel_add", params_t0, 3);
 
+        // t1: d = c + 1 (kernel_id=1, kernel_add_scalar)
         PTOParam params_t1[] = {
-            make_input_param(buf_c, sz),
+            make_input_param(td_c),
             make_scalar_param(float_to_u64(1.0f)),
-            make_output_param(buf_d, sz),
+            make_output_param(td_d),
             make_scalar_param((uint64_t)3),
         };
         pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t1, 3);
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
         PTOParam params_t2[] = {
-            make_input_param(buf_c, sz),
+            make_input_param(td_c),
             make_scalar_param(float_to_u64(2.0f)),
-            make_output_param(buf_e, sz),
+            make_output_param(td_e),
             make_scalar_param((uint64_t)3),
         };
         pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t2, 3);
 
         // t3: f = d * e (kernel_id=2, kernel_mul)
         PTOParam params_t3[] = {
-            make_input_param(buf_d, sz),
-            make_input_param(buf_e, sz),
-            make_output_param(arg_f, sz),
+            make_input_param(td_d),
+            make_input_param(td_e),
+            make_output_param(ext_td_f),
             make_scalar_param((uint64_t)3),
         };
         pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, "kernel_mul", params_t3, 3);

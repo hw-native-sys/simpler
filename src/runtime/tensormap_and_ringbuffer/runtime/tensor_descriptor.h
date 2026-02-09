@@ -156,31 +156,37 @@ struct TensorDescriptor {
     bool is_overlap(const TensorDescriptor& pre_task_output) const;
 
     bool complex_overlap(const TensorDescriptor& pre_task_output) const;
+
+    /**
+     * Create a 1D contiguous TensorDescriptor covering the entire buffer.
+     * strides={1}, repeats={size_elements}, ndims=1.
+     */
+    static TensorDescriptor make_1d_contiguous(uint64_t addr, int32_t size_bytes,
+            int32_t version = 0, DataType dtype = DataType::FLOAT32) {
+        uint64_t size_elements = size_bytes / get_element_size(dtype);
+        uint64_t strides[] = {1};
+        uint64_t repeats[] = {size_elements};
+        return TensorDescriptor(addr, size_bytes, 0, strides, repeats, 1, dtype, version);
+    }
 };
 
 // =============================================================================
 // Factory Helpers
 // =============================================================================
 
-static inline PTOBufferHandle make_external_handle(void* addr, int32_t size) {
-    PTOBufferHandle h = {};
-    h.addr = (uint64_t)addr;
-    h.size = size;
-    return h;
-}
-
-static inline PTOBufferHandle make_output_handle(int32_t size) {
-    PTOBufferHandle h = {};
-    h.addr = 0;
-    h.size = size;
-    return h;
-}
-
-static inline TensorDescriptor make_tensor_bbox(uint64_t addr, int32_t size_bytes,
+/**
+ * Create a TensorDescriptor for pre-allocated external memory.
+ */
+static inline TensorDescriptor make_tensor_external(void* addr, int32_t size_bytes,
         int32_t version = 0, DataType dtype = DataType::FLOAT32) {
-    uint64_t size_elements = size_bytes / get_element_size(dtype);
-    uint64_t strides[] = {1};
-    uint64_t repeats[] = {size_elements};
-    TensorDescriptor t(addr, size_bytes, 0, strides, repeats, 1, dtype, version);
-    return t;
+    return TensorDescriptor::make_1d_contiguous(reinterpret_cast<uint64_t>(addr), size_bytes, version, dtype);
+}
+
+/**
+ * Create a TensorDescriptor for runtime-allocated output (addr=0).
+ * The runtime fills in the actual address during pto2_submit_task.
+ */
+static inline TensorDescriptor make_tensor(int32_t size_bytes,
+        int32_t version = 0, DataType dtype = DataType::FLOAT32) {
+    return TensorDescriptor::make_1d_contiguous(0, size_bytes, version, dtype);
 }

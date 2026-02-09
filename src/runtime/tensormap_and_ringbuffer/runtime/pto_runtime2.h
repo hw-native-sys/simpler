@@ -183,34 +183,6 @@ void pto2_rt_submit(PTO2Runtime* rt,
  */
 void pto2_rt_orchestration_done(PTO2Runtime* rt);
 
-// =============================================================================
-// Convenience Macros (if not already defined in pto_runtime2_types.h)
-// =============================================================================
-
-#ifndef PTO2_INPUT
-/**
- * Create input parameter
- */
-#define PTO2_INPUT(buf, tile, sz) \
-    ((PTO2TaskParam){.type = PTO2_PARAM_INPUT, ._pad = {0}, .buffer = (buf), .tile_index = (tile), .size = (sz)})
-#endif
-
-#ifndef PTO2_OUTPUT
-/**
- * Create output parameter
- */
-#define PTO2_OUTPUT(buf, tile, sz) \
-    ((PTO2TaskParam){.type = PTO2_PARAM_OUTPUT, ._pad = {0}, .buffer = (buf), .tile_index = (tile), .size = (sz)})
-#endif
-
-#ifndef PTO2_INOUT
-/**
- * Create in-out parameter
- */
-#define PTO2_INOUT(buf, tile, sz) \
-    ((PTO2TaskParam){.type = PTO2_PARAM_INOUT, ._pad = {0}, .buffer = (buf), .tile_index = (tile), .size = (sz)})
-#endif
-
 /**
  * Scope helper macros for C
  *
@@ -225,11 +197,6 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt);
  */
 #define PTO2_SCOPE_BEGIN(rt) pto2_rt_scope_begin(rt)
 #define PTO2_SCOPE_END(rt)   pto2_rt_scope_end(rt)
-
-/** Fill a single PTO2TaskParam using direct field access (for C++ callers). */
-void pto2_param_set_input(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes);
-void pto2_param_set_output(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes);
-void pto2_param_set_inout(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes);
 
 #ifdef __cplusplus
 }

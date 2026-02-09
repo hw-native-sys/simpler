@@ -75,21 +75,27 @@ enum class PTOParamType : int32_t {
 /**
  * Parameter Descriptor for pto_submit_task
  *
- * Each parameter carries a full tensor descriptor for automatic
- * dependency detection via TensorMap overlap checking.
+ * Each parameter holds a pointer to the caller's TensorDescriptor for
+ * automatic dependency detection via TensorMap overlap checking.
+ *
+ * For OUTPUT params with tensor->buffer.addr == 0, the runtime allocates
+ * a buffer and writes the address back through the pointer, implicitly
+ * updating the caller's local TensorDescriptor. No manual sync needed.
  *
  * Example:
+ *   TensorDescriptor td_a = make_tensor_external(dev_a, size);
+ *   TensorDescriptor td_c = make_tensor(size);
  *   PTOParam params[] = {
- *       {PTOParamType::INPUT,  make_tensor_bbox(dev_a->addr, size), dev_a},
- *       {PTOParamType::OUTPUT, make_tensor_bbox(dev_c->addr, size), dev_c},
+ *       make_input_param(td_a),
+ *       make_output_param(td_c),
  *   };
- *   runtime->pto_submit_task(func_id, worker_type, params, 2);
+ *   pto2_rt_submit_task(rt, func_id, worker_type, name, params, 2);
+ *   // td_c.buffer.addr is already updated - no explicit sync needed
  */
 struct PTOParam {
-    PTOParamType type;        // PTOParamType::INPUT, PTOParamType::OUTPUT, or PTOParamType::SCALAR
-    TensorDescriptor tensor;  // Full strided descriptor for overlap checking (unused for SCALAR)
-    PTOBufferHandle* buffer;  // Associated buffer handle (nullptr for SCALAR)
-    uint64_t scalar_value;    // Raw value for PTOParamType::SCALAR (e.g., encoded float, int size)
+    PTOParamType type;         // PTOParamType::INPUT, PTOParamType::OUTPUT, or PTOParamType::SCALAR
+    TensorDescriptor* tensor;  // Pointer to caller's tensor descriptor (NULL for SCALAR)
+    uint64_t scalar_value;     // Raw value for PTOParamType::SCALAR (e.g., encoded float, int size)
 };
 
 // =============================================================================
@@ -99,36 +105,33 @@ struct PTOParam {
 static inline PTOParam make_scalar_param(uint64_t value) {
     PTOParam p = {};
     p.type = PTOParamType::SCALAR;
-    p.buffer = nullptr;
+    p.tensor = nullptr;
     p.scalar_value = value;
     return p;
 }
 
-static inline PTOParam make_input_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
-    assert(buf.addr != 0 && "INPUT param must have a non-NULL buffer address");
+static inline PTOParam make_input_param(TensorDescriptor& td) {
+    assert(td.buffer.addr != 0 && "INPUT param must have a non-NULL buffer address");
     PTOParam p = {};
     p.type = PTOParamType::INPUT;
-    p.tensor = make_tensor_bbox(buf.addr, size, version);
-    p.buffer = &buf;
+    p.tensor = &td;
     p.scalar_value = 0;
     return p;
 }
 
-static inline PTOParam make_output_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
+static inline PTOParam make_output_param(TensorDescriptor& td) {
     PTOParam p = {};
     p.type = PTOParamType::OUTPUT;
-    p.tensor = make_tensor_bbox(buf.addr, size, version);
-    p.buffer = &buf;
+    p.tensor = &td;
     p.scalar_value = 0;
     return p;
 }
 
-static inline PTOParam make_inout_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
-    assert(buf.addr != 0 && "INOUT param must have a non-NULL buffer address");
+static inline PTOParam make_inout_param(TensorDescriptor& td) {
+    assert(td.buffer.addr != 0 && "INOUT param must have a non-NULL buffer address");
     PTOParam p = {};
     p.type = PTOParamType::INOUT;
-    p.tensor = make_tensor_bbox(buf.addr, size, version);
-    p.buffer = &buf;
+    p.tensor = &td;
     p.scalar_value = 0;
     return p;
 }

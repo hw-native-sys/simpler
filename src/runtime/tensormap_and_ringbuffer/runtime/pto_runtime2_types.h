@@ -221,45 +221,6 @@ typedef struct {
 } PTO2LogicalTensor;
 
 // =============================================================================
-// Task Parameter
-// =============================================================================
-
-/**
- * Task parameter type enumeration
- */
-typedef enum {
-    PTO2_PARAM_INPUT = 0,     // Read-only input
-    PTO2_PARAM_OUTPUT = 1,    // Write-only output
-    PTO2_PARAM_INOUT = 2      // Read-write (accumulation)
-} PTO2ParamType;
-
-/**
- * Task parameter descriptor
- * Describes one input/output/inout buffer for a task.
- * Pack(1) forces identical layout in C and C++ with no padding.
- */
-#pragma pack(push, 1)
-typedef struct PTO2TaskParam {
-    int32_t       type;       // PTO2ParamType value (int32_t for ABI stability)
-    char          _pad[4];    // Explicit padding so buffer is at offset 8
-    void*         buffer;     // Buffer base pointer
-    int32_t       tile_index; // Tile index
-    int32_t       size;       // Size in bytes
-} PTO2TaskParam;
-#pragma pack(pop)
-
-/* Compile-time layout check: C and C++ must see the same layout */
-#if defined(__cplusplus)
-#include <cstddef>
-static_assert(sizeof(PTO2TaskParam) == 24, "PTO2TaskParam size mismatch");
-static_assert(offsetof(PTO2TaskParam, size) == 20, "PTO2TaskParam size offset mismatch");
-#else
-#include <stddef.h>
-_Static_assert(sizeof(PTO2TaskParam) == 24, "PTO2TaskParam size mismatch");
-_Static_assert(offsetof(PTO2TaskParam, size) == 20, "PTO2TaskParam size offset mismatch");
-#endif
-
-// =============================================================================
 // Dependency List Entry
 // =============================================================================
 
@@ -321,6 +282,7 @@ typedef struct {
 
 
     PTOParam params[16];
+    TensorDescriptor tensor_copies[16];  // Owned tensor data (params[i].tensor points here)
     int param_count{0};
     
 } PTO2TaskDescriptor;
@@ -445,21 +407,5 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
  */
 #define PTO2_EXCHANGE(ptr, val) \
     __atomic_exchange_n(ptr, val, __ATOMIC_ACQ_REL)
-
-// =============================================================================
-// Task Parameter Convenience Macros
-// =============================================================================
-
-/**
- * Convenience macros for creating task parameters
- */
-#define PTO2_INPUT(buf, tile_idx, sz) \
-    (PTO2TaskParam){ .type = (int32_t)PTO2_PARAM_INPUT, ._pad = {0}, .buffer = (buf), .tile_index = (tile_idx), .size = (sz) }
-
-#define PTO2_OUTPUT(buf, tile_idx, sz) \
-    (PTO2TaskParam){ .type = (int32_t)PTO2_PARAM_OUTPUT, ._pad = {0}, .buffer = (buf), .tile_index = (tile_idx), .size = (sz) }
-
-#define PTO2_INOUT(buf, tile_idx, sz) \
-    (PTO2TaskParam){ .type = (int32_t)PTO2_PARAM_INOUT, ._pad = {0}, .buffer = (buf), .tile_index = (tile_idx), .size = (sz) }
 
 #endif // PTO_RUNTIME2_TYPES_H

@@ -308,9 +308,9 @@ static void build_pto2_payload(PTO2DispatchPayload* out, Runtime* runtime,
         if (task->params[i].type == PTOParamType::SCALAR) {
             out->args[n++] = task->params[i].scalar_value;
         } else {
-            // Pass pointer to the TensorDescriptor (in shared memory), not the raw buffer address.
+            // Pass pointer to the TensorDescriptor (in task-owned storage), not the raw buffer address.
             // Kernels expect args[i] to be a TensorDescriptor* from which they read buffer.addr.
-            out->args[n++] = reinterpret_cast<uint64_t>(&task->params[i].tensor);
+            out->args[n++] = reinterpret_cast<uint64_t>(task->params[i].tensor);
         }
     }
 
