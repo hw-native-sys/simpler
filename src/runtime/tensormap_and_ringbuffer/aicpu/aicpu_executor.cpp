@@ -292,96 +292,36 @@ int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* 
 }
 
 // Build PTO2DispatchPayload from PTO2TaskDescriptor.
-// Kernel convention: args[0..num_inputs-1]=input ptrs, args[num_inputs..num_inputs+num_outputs-1]=output ptrs, args[...]=size (elements).
 static void build_pto2_payload(PTO2DispatchPayload* out, Runtime* runtime,
                                PTO2TaskDescriptor* task, PTO2TaskDescriptor* task_descriptors,
                                PTO2DepListEntry* dep_list_pool, int32_t window_size) {
+    (void)task_descriptors;
+    (void)dep_list_pool;
+    (void)window_size;
     out->task_id = task->task_id;
     out->kernel_id = task->kernel_id;
     out->core_type = (task->worker_type == PTO2_WORKER_CUBE) ? CoreType::AIC : CoreType::AIV;
     out->function_bin_addr = runtime->get_function_bin_addr(task->kernel_id);
-    int32_t num_outputs = task->num_outputs;
-    int32_t num_inputs = task->num_inputs;
     int n = 0;
 
-    // 1) Input ptrs (from fanin producers, order = fanin list)
-    int32_t current = __atomic_load_n(&task->fanin_head, __ATOMIC_ACQUIRE);
-    while (current > 0 && n < PTO2_DISPATCH_MAX_ARGS) {
-        PTO2DepListEntry* entry = &dep_list_pool[current];
-        int32_t producer_id = entry->task_id;
-        PTO2TaskDescriptor* producer = &task_descriptors[producer_id & (window_size - 1)];
-        if (producer->packed_buffer_base != nullptr && producer->num_outputs > 0) {
-            out->args[n++] = reinterpret_cast<uint64_t>(
-                static_cast<char*>(producer->packed_buffer_base) + producer->output_offsets[0]);
+    for (int i = 0; i < task->param_count; i++) {
+        if (task->params[i].type == PTOParamType::SCALAR) {
+            out->args[n++] = task->params[i].scalar_value;
+        } else {
+            // Pass pointer to the TensorDescriptor (in shared memory), not the raw buffer address.
+            // Kernels expect args[i] to be a TensorDescriptor* from which they read buffer.addr.
+            out->args[n++] = reinterpret_cast<uint64_t>(&task->params[i].tensor);
         }
-        current = entry->next_offset;
-    }
-
-    // 1b) External inputs (e.g. task 0's a,b from orch_args; fanin is empty for graph inputs)
-    if (n < num_inputs) {
-        uint64_t* orch = runtime->get_orch_args();
-        int orch_count = runtime->get_orch_arg_count();
-        for (int i = 0; n < num_inputs && orch && i < orch_count && n < PTO2_DISPATCH_MAX_ARGS; i++) {
-            out->args[n++] = orch[i];
-        }
-    }
-
-    // 2) For kernel_add_scalar (kernel_id==1): scalar as uint64. PTO2 task params only have
-    //    input/output buffers; scalar is not in the descriptor. Use task_id to infer scalar
-    //    for this example graph: task 1 = c+1 (1.0f), task 2 = c+2 (2.0f).
-    if (task->kernel_id == 1 && n < PTO2_DISPATCH_MAX_ARGS) {
-        union { uint64_t u; float f; } u;
-        int32_t tid = task->task_id;
-        if (tid == 1)
-            u.f = 1.0f;
-        else if (tid == 2)
-            u.f = 2.0f;
-        else
-            u.f = 0.f;
-        out->args[n++] = u.u;
-    }
-
-    // 3) Output ptrs (our task)
-    if (task->packed_buffer_base != nullptr) {
-        for (int i = 0; i < num_outputs && n < PTO2_DISPATCH_MAX_ARGS; i++) {
-            void* out_ptr = static_cast<char*>(task->packed_buffer_base) + task->output_offsets[i];
-            out->args[n++] = reinterpret_cast<uint64_t>(out_ptr);
-        }
-    }
-
-    // 4) Size in elements (kernels expect args[last]=size; float -> /4)
-    if (task->packed_buffer_end != nullptr && task->packed_buffer_base != nullptr && n < PTO2_DISPATCH_MAX_ARGS) {
-        size_t bytes = static_cast<char*>(task->packed_buffer_end) - static_cast<char*>(task->packed_buffer_base);
-        out->args[n++] = static_cast<uint64_t>(bytes / sizeof(float));
     }
 
     out->num_args = n;
-
-    // Debug: print args when PTO2_DEBUG_TENSOR is set
-    if (std::getenv("PTO2_DEBUG_TENSOR") != nullptr) {
-        auto hex16 = [](const void* p) {
-            if (!p) return std::string("(null)");
-            const unsigned char* q = static_cast<const unsigned char*>(p);
-            char buf[33];
-            for (int i = 0; i < 16; i++) std::snprintf(buf + i * 2, 3, "%02x", q[i]);
-            return std::string(buf);
-        };
-        fprintf(stderr, "[Scheduler] task_id=%d ", task->task_id);
-        int idx = 0;
-        if (num_inputs >= 1 && idx < n && out->args[idx] != 0) {
-            fprintf(stderr, "input0=%p first16=%s ", (void*)(uintptr_t)out->args[idx], hex16((void*)(uintptr_t)out->args[idx]).c_str());
-            idx++;
+    DEV_INFO("build_pto2_payload ok");
+    for (int i = 0; i < task->param_count; i++) {
+        if (task->params[i].type == PTOParamType::SCALAR) {
+            DEV_INFO("build_pto2_payload param %d scalar: %d", i, out->args[i]);
+        } else {
+            DEV_INFO("build_pto2_payload param %d addr: %x", i, out->args[i]);
         }
-        if (num_inputs >= 2 && idx < n && out->args[idx] != 0) {
-            fprintf(stderr, "input1=%p first16=%s ", (void*)(uintptr_t)out->args[idx], hex16((void*)(uintptr_t)out->args[idx]).c_str());
-            idx++;
-        }
-        if (task->kernel_id == 1 && idx < n) idx++;  // skip scalar
-        if (task->packed_buffer_base != nullptr && num_outputs > 0) {
-            void* out_ptr = static_cast<char*>(task->packed_buffer_base) + task->output_offsets[0];
-            fprintf(stderr, "output=%p first16=%s", out_ptr, hex16(out_ptr).c_str());
-        }
-        fprintf(stderr, "\n");
     }
 }
 
@@ -686,9 +626,16 @@ int AicpuExecutor::run(Runtime* runtime) {
             }
 
             DEV_INFO("Thread 3: Calling aicpu_orchestration_entry from SO");
+            DEV_INFO("Thread 3: sm_ptr=%p, arg_count=%d", runtime->get_pto2_gm_sm_ptr(), runtime->get_orch_arg_count());
+            uint64_t* args = runtime->get_orch_args();
+            int arg_count = runtime->get_orch_arg_count();
+            for (int i = 0; i < arg_count && i < 20; i++) {
+                DEV_INFO("Thread 3: args[%d] = 0x%lx", i, args[i]);
+            }
+
             orch_func(runtime->get_pto2_gm_sm_ptr(),
-                      runtime->get_orch_args(),
-                      runtime->get_orch_arg_count());
+                      args,
+                      arg_count);
             DEV_INFO("Thread 3: aicpu_orchestration_entry returned");
 
             // Store the SO handle and path - defer dlclose and unlink until all tasks complete

@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-
+#include "tensor_descriptor.h"
 
 // =============================================================================
 // Per-Task Spinlock Implementation
@@ -259,7 +259,7 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                           int32_t kernel_id,
                           PTO2WorkerType worker_type,
                           const char* func_name,
-                          PTO2TaskParam* params,
+                          PTOParam* params,
                           int32_t num_params) {
 
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
@@ -290,33 +290,29 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
     task->packed_buffer_base = NULL;
     task->packed_buffer_end = NULL;
     task->num_outputs = 0;
-    task->num_inputs = 0;
     task->is_active = true;
     
     // Temporary storage for collecting output sizes
-    int32_t output_sizes[PTO2_MAX_OUTPUTS];
-    int32_t num_outputs = 0;
     int32_t total_output_size = 0;
     
     // Temporary storage for fanin
     int32_t fanin_temp[PTO2_MAX_INPUTS];
     int32_t fanin_count = 0;
+
+    task->param_count = num_params;
+    for (int i = 0; i < task->param_count; i++) {
+        task->params[i] = params[i];
+    }
     
     // === STEP 2: First pass - collect output sizes and process inputs ===
+
     for (int i = 0; i < num_params; i++) {
-        PTO2TaskParam* p = &params[i];
-        int32_t param_size = p->size;
-        PTO2TensorRegion region = {
-            .base_ptr = p->buffer,
-            .tile_index = p->tile_index,
-            .offset = 0,
-            .size = param_size
-        };
-        
+        PTOParam* p = &params[i];
+
         switch (p->type) {
-            case PTO2_PARAM_INPUT: {
+            case PTOParamType::INPUT: {
                 // Look up producer via TensorMap
-                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, &region);
+                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, &params[i].tensor);
                 
                 if (producer_id >= 0) {
                     // Check if this producer is already in fanin list (avoid duplicates)
@@ -340,24 +336,18 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                         pto2_add_consumer_to_producer(orch, producer, producer_id, task_id);
                     }
                 }
-                task->num_inputs++;
                 break;
             }
-            
-            case PTO2_PARAM_OUTPUT: {
+
+            case PTOParamType::OUTPUT: {
                 // Collect output size for packed buffer allocation
-                if (num_outputs < PTO2_MAX_OUTPUTS) {
-                    output_sizes[num_outputs++] = param_size;
-                    total_output_size += PTO2_ALIGN_UP(param_size, PTO2_PACKED_OUTPUT_ALIGN);
-                }
+                total_output_size += PTO2_ALIGN_UP(params[i].tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
                 break;
             }
-            
-            case PTO2_PARAM_INOUT: {
-                // INOUT = INPUT + OUTPUT
-                
+
+            case PTOParamType::INOUT: {
                 // Handle as input (get dependency on previous writer)
-                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, &region);
+                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, &params[i].tensor);
                 if (producer_id >= 0) {
                     // Check if this producer is already in fanin list (avoid duplicates)
                     bool already_added = false;
@@ -377,66 +367,42 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                         pto2_add_consumer_to_producer(orch, producer, producer_id, task_id);
                     }
                 }
-                task->num_inputs++;
-                
-                // Collect output size for packed buffer
-                if (num_outputs < PTO2_MAX_OUTPUTS) {
-                    output_sizes[num_outputs++] = param_size;
-                    total_output_size += PTO2_ALIGN_UP(param_size, PTO2_PACKED_OUTPUT_ALIGN);
-                }
                 break;
             }
+            default:
+                    break;
         }
     }
     
-    /* Debug: each output tensor size at submit */
-    fprintf(stderr, "[PTO2 submit] task_id=%d num_outputs=%d output_sizes:", task_id, num_outputs);
-    for (int i = 0; i < num_outputs; i++)
-        fprintf(stderr, " %d", output_sizes[i]);
-    fprintf(stderr, "\n");
-    
     // === STEP 3: Allocate packed buffer from Heap Ring (may stall) ===
     // Each output slot is aligned to PTO2_PACKED_OUTPUT_ALIGN (1024B); gap after data is padding.
-    // Copy-back: use (packed_buffer_base + output_offsets[i]) as pointer, actual tensor size as length.
     if (total_output_size > 0) {
         task->packed_buffer_base = pto2_alloc_packed_buffer(orch, total_output_size);
         task->packed_buffer_end = (char*)task->packed_buffer_base + total_output_size;
         
-        // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(output_sizes[i], 1024)
+        // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(size, 1024)
         int32_t offset = 0;
-        for (int i = 0; i < num_outputs; i++) {
-            task->output_offsets[i] = offset;
-            offset += PTO2_ALIGN_UP(output_sizes[i], PTO2_PACKED_OUTPUT_ALIGN);
-        }
-        /* Debug: each output ptr and size after packed buffer alloc */
-        fprintf(stderr, "[PTO2 packed] task_id=%d base=%p total=%d\n", task_id,
-                (void*)task->packed_buffer_base, total_output_size);
-        for (int i = 0; i < num_outputs; i++) {
-            void* out_ptr = (char*)task->packed_buffer_base + task->output_offsets[i];
-            fprintf(stderr, "  output[%d] ptr=%p offset=%d size=%d\n",
-                    i, out_ptr, task->output_offsets[i], output_sizes[i]);
+        for (int i = 0; i < task->param_count; i++) {
+            if (task->params[i].type == PTOParamType::OUTPUT) {
+                task->params[i].tensor.buffer.addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
+                task->params[i].buffer->addr = task->params[i].tensor.buffer.addr;
+                offset += PTO2_ALIGN_UP(task->params[i].tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                task->output_index[task->num_outputs++] = i;
+            }
         }
     }
-    task->num_outputs = num_outputs;
-    
+
     // === STEP 4: Second pass - register outputs in TensorMap ===
     int32_t output_idx = 0;
     for (int i = 0; i < num_params; i++) {
-        PTO2TaskParam* p = &params[i];
-        
-        if (p->type == PTO2_PARAM_OUTPUT || p->type == PTO2_PARAM_INOUT) {
-            // IMPORTANT: Use the ORIGINAL buffer address (p->buffer) for TensorMap,
-            // not the packed buffer address. This ensures that consumers looking up
-            // dependencies using the original tensor address will find this producer.
-            PTO2TensorRegion region = {
-                .base_ptr = p->buffer,        // Use original tensor address
-                .tile_index = p->tile_index,
-                .offset = 0,
-                .size = p->size
-            };
-            
+        PTOParam* p = &params[i];
+
+        if (p->type == PTOParamType::OUTPUT || p->type == PTOParamType::INOUT) {
             // Register in TensorMap: this region is produced by task_id
-            pto2_tensormap_insert(&orch->tensor_map, &region, task_id);
+            // Use task->params[i].tensor (not params[i].tensor) because STEP 3
+            // updated task->params[i].tensor.buffer.addr with the heap-allocated
+            // address. The original params[i].tensor still has addr=0 for outputs.
+            pto2_tensormap_insert(&orch->tensor_map, &task->params[i].tensor, task_id);
             output_idx++;
         }
     }
@@ -475,7 +441,7 @@ void* pto2_task_get_output(PTO2OrchestratorState* orch,
         return NULL;
     }
     
-    return (char*)task->packed_buffer_base + task->output_offsets[output_idx];
+    return reinterpret_cast<char*>(task->params[task->output_index[output_idx]].tensor.buffer.addr);
 }
 
 // =============================================================================

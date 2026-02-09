@@ -18,6 +18,8 @@
 #include <stdbool.h>
 #include <stddef.h>
 
+#include "pto_types.h"
+
 // =============================================================================
 // Configuration Constants
 // =============================================================================
@@ -94,21 +96,6 @@ typedef enum {
     PTO2_TASK_COMPLETED = 3,  // Execution finished, output may still be in use
     PTO2_TASK_CONSUMED = 4    // Output fully consumed, buffers can be released
 } PTO2TaskState;
-
-// =============================================================================
-// Tensor Region (Legacy, for simple 1D regions)
-// =============================================================================
-
-/**
- * Tensor region identifier
- * Uniquely identifies a region within a tensor buffer
- */
-typedef struct {
-    void*    base_ptr;        // Buffer base pointer
-    int32_t  tile_index;      // Tile index within buffer
-    int32_t  offset;          // Byte offset within tile
-    int32_t  size;            // Region size in bytes
-} PTO2TensorRegion;
 
 // =============================================================================
 // Logical Tensor (for view/reshape/transpose operations)
@@ -323,45 +310,24 @@ typedef struct {
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
     void*    packed_buffer_end;   // End of packed buffer (for heap reclamation)
-    int32_t  output_offsets[PTO2_MAX_OUTPUTS]; // Offset of each output within packed buffer
+    int32_t  output_index[PTO2_MAX_OUTPUTS]; // Offset of each output in params;
     int32_t  num_outputs;         // Number of output buffers
-    
-    // Input buffer pointers (for dependency resolution)
-    int32_t  num_inputs;          // Number of input buffers
 
     // Function name (for debugging/tracing)
     const char* func_name;        // Function name (for debugging/tracing)
     
     // Status flags
     bool     is_active;           // Task slot is in use
+
+
+    PTOParam params[16];
+    int param_count{0};
     
 } PTO2TaskDescriptor;
 
 // =============================================================================
 // TensorMap Entry
 // =============================================================================
-
-/**
- * TensorMap entry structure
- * Maps tensor region -> producer task ID
- * 
- * Stored in ring buffer pool with lazy invalidation:
- * - Entry is valid only if producer_task_id >= last_task_alive
- * - Stale entries ignored during lookup
- * - Pool wraps around, overwriting stale entries
- * 
- * Chain truncation optimization:
- * - Entries in bucket chains sorted by task_id (newest first)
- * - When lookup hits stale entry, truncate rest of chain
- */
-typedef struct {
-    PTO2TensorRegion region;      // Tensor region key (legacy, for simple 1D)
-    int32_t producer_task_id;     // Task that produces this region
-    int32_t next_in_bucket;       // Offset to next entry in hash bucket (-1 = end)
-    int32_t next_in_task;         // Offset to next entry for same task (-1 = end)
-    bool    in_bucket;            // True if entry is linked in a bucket chain
-                                  // CRITICAL: Must be set false before overwriting!
-} PTO2TensorMapEntry;
 
 /**
  * Extended TensorMap entry structure (for LogicalTensor support)

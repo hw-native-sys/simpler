@@ -23,6 +23,7 @@
 #include "pto_ring_buffer.h"
 #include "pto_tensormap.h"
 #include "pto_scheduler.h"
+#include "pto_types.h"
 
 // =============================================================================
 // Orchestrator State
@@ -172,7 +173,7 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                           int32_t kernel_id,
                           PTO2WorkerType worker_type,
                           const char* func_name,
-                          PTO2TaskParam* params,
+                          PTOParam* params,
                           int32_t num_params);
 
 /**

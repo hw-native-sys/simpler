@@ -706,12 +706,18 @@ class CodeRunner:
 
         # Build list of (func_id, binary) tuples for passing to runtime.initialize()
         kernel_binaries = []
+        # Prepare runtime include directories for kernel compilation
+        runtime_include_dirs = []
+        runtime_dir = os.path.join(self.project_root, "src", "runtime", self.runtime_name, "runtime")
+        runtime_include_dirs.append(runtime_dir)
+
         for kernel in self.kernels:
             logger.info(f"Compiling kernel: {kernel['source']} (func_id={kernel['func_id']})")
             incore_o = pto_compiler.compile_incore(
                 kernel["source"],
                 core_type=kernel["core_type"],
                 pto_isa_root=pto_isa_root,
+                extra_include_dirs=runtime_include_dirs,
             )
             # For sim platform: keep complete .so for dlopen (supports external symbols like std::exp)
             # For real hardware: extract .text section (ccec compiled kernels don't depend on external symbols)

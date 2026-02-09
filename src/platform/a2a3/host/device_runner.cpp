@@ -363,6 +363,7 @@ int DeviceRunner::run(Runtime& runtime,
         }
     }
 
+    std::cout << "\n=== Initialize runtime args ===" << '\n';
     // Initialize runtime args
     rc = kernel_args_.init_runtime_args(runtime, mem_alloc_);
     if (rc != 0) {
@@ -370,6 +371,7 @@ int DeviceRunner::run(Runtime& runtime,
         return rc;
     }
 
+    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerInit===" << '\n';
     // Launch AICPU init kernel
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
     if (rc != 0) {
@@ -378,6 +380,7 @@ int DeviceRunner::run(Runtime& runtime,
         return rc;
     }
 
+    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer===" << '\n';
     // Launch AICPU main kernel
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", launch_aicpu_num);
     if (rc != 0) {
@@ -386,6 +389,7 @@ int DeviceRunner::run(Runtime& runtime,
         return rc;
     }
 
+    std::cout << "\n=== launch_aicore_kernel===" << '\n';
     // Launch AICore kernel
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.args.runtime_args);
     if (rc != 0) {
@@ -399,6 +403,7 @@ int DeviceRunner::run(Runtime& runtime,
         poll_and_collect_performance_data(runtime.worker_count, runtime.get_task_count());
     }
 
+    std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
     // Synchronize streams
     rc = rtStreamSynchronize(stream_aicpu_);
     if (rc != 0) {
@@ -407,6 +412,7 @@ int DeviceRunner::run(Runtime& runtime,
         return rc;
     }
 
+    std::cout << "\n=== rtStreamSynchronize stream_aicore_===" << '\n';
     rc = rtStreamSynchronize(stream_aicore_);
     if (rc != 0) {
         LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);

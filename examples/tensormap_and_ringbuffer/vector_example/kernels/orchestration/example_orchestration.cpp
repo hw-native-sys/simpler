@@ -17,6 +17,7 @@
 #include "pto_runtime2.h"
 #include "pto_shared_memory.h"
 
+
 // =============================================================================
 // Args layout (from code_runner.py + runtime_maker.cpp extension):
 // Base args from code_runner.py: [tensors..., sizes..., SIZE]
@@ -63,6 +64,72 @@
 // Static buffer only for simulation; real device uses host-allocated gm_heap
 static char s_gm_heap_stub[PTO2_HEAP_SIZE];
 
+// Helper: create a BoundingBox tensor descriptor
+static TensorDescriptor make_tensor_bbox(uint64_t addr, int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
+    // size_bytes is the total buffer size in bytes
+    uint64_t size_elements = size_bytes / get_element_size(dtype);
+    uint64_t strides[] = {1};
+    uint64_t repeats[] = {size_elements};
+    TensorDescriptor t(addr, size_bytes, 0, strides, repeats, 1, dtype, version);
+    return t;
+}
+
+// Helper: create a scalar PTOParam
+static PTOParam make_scalar_param(uint64_t value) {
+    PTOParam p = {};
+    p.type = PTOParamType::SCALAR;
+    p.buffer = nullptr;
+    p.scalar_value = value;
+    return p;
+}
+
+// Helper: create an input PTOParam from an existing buffer handle
+static PTOParam make_input_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
+    PTOParam p = {};
+    p.type = PTOParamType::INPUT;
+    p.tensor = make_tensor_bbox(buf.addr, size, version);
+    p.buffer = &buf;
+    p.scalar_value = 0;
+    return p;
+}
+
+// Helper: create an output PTOParam (addr will be filled by pto_submit_task)
+static PTOParam make_output_param(PTOBufferHandle& buf, int32_t size, int32_t version = 0) {
+    PTOParam p = {};
+    p.type = PTOParamType::OUTPUT;
+    p.tensor = make_tensor_bbox(0, size, version);  // addr=0, filled during submit
+    p.buffer = &buf;
+    p.scalar_value = 0;
+    return p;
+}
+
+// Helper to encode float as uint64_t for scalar params
+static uint64_t float_to_u64(float f) {
+    union {
+        float f32;
+        uint64_t u64;
+    } conv;
+    conv.u64 = 0;  // Clear upper bits
+    conv.f32 = f;
+    return conv.u64;
+}
+
+// Helper: create a PTOBufferHandle for external (pre-allocated) buffer
+static PTOBufferHandle make_external_handle(void* addr, int32_t size) {
+    PTOBufferHandle h = {};
+    h.addr = (uint64_t)addr;
+    h.size = size;
+    return h;
+}
+
+// Helper: create a PTOBufferHandle for output (addr filled during submit)
+static PTOBufferHandle make_output_handle(int32_t size) {
+    PTOBufferHandle h = {};
+    h.addr = 0;  // Will be allocated by runtime during pto_submit_task
+    h.size = size;
+    return h;
+}
+
 extern "C" {
 
 __attribute__((visibility("default")))
@@ -76,26 +143,21 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     }
 
     // Extract device pointers
-    void* dev_a = (void*)(uintptr_t)args[ARG_DEV_A];
-    void* dev_b = (void*)(uintptr_t)args[ARG_DEV_B];
-    void* dev_f = (void*)(uintptr_t)args[ARG_DEV_F];
-    void* dev_c = (void*)(uintptr_t)args[ARG_DEV_C];
-    void* dev_d = (void*)(uintptr_t)args[ARG_DEV_D];
-    void* dev_e = (void*)(uintptr_t)args[ARG_DEV_E];
+    void* dev_a_ptr = (void*)(uintptr_t)args[ARG_DEV_A];
+    void* dev_b_ptr = (void*)(uintptr_t)args[ARG_DEV_B];
+    void* dev_f_ptr = (void*)(uintptr_t)args[ARG_DEV_F];
     size_t size_a = (size_t)args[ARG_SIZE_A];
+    size_t size_b = (size_t)args[ARG_SIZE_B];
     size_t size_f = (size_t)args[ARG_SIZE_F];
     int SIZE = (int)(args[ARG_SIZE] & 0x7FFFFFFF);
 
-    // Validate intermediate pointers
-    if (!dev_c || !dev_d || !dev_e) {
-        *(volatile int32_t*)((char*)sm_ptr + 8) = 1;
-        return;
-    }
+    printf("===============SIZE=%d\n", SIZE);
 
     size_t BYTES = (size_t)SIZE * sizeof(float);
 
     // Create shared memory handle
     int32_t sm_size = pto2_sm_calculate_size(PTO2_TASK_WINDOW_SIZE, PTO2_DEP_LIST_POOL_SIZE);
+
     PTO2SharedMemoryHandle* sm_handle = pto2_sm_create_from_buffer(
         sm_ptr,
         sm_size,
@@ -139,6 +201,13 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     int32_t sz = (int32_t)BYTES;
     if (sz <= 0) sz = (int32_t)size_a;
 
+    PTOBufferHandle dev_a = make_external_handle(dev_a_ptr, size_a);
+    PTOBufferHandle dev_b = make_external_handle(dev_b_ptr, size_b);
+    PTOBufferHandle dev_f = make_external_handle(dev_f_ptr, size_f);
+    PTOBufferHandle dev_c = make_output_handle(BYTES);  // c = a + b
+    PTOBufferHandle dev_d = make_output_handle(BYTES);  // d = c + 1
+    PTOBufferHandle dev_e = make_output_handle(BYTES);  // e = c + 2
+
     // Use RAII scope guard for automatic scope management.
     // PTO2_SCOPE creates a scoped block where pto2_rt_scope_begin() is called
     // at the start and pto2_rt_scope_end() is called automatically at the end
@@ -146,32 +215,36 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     // See src/runtime/rt2/runtime/pto_runtime2.h for alternative usage patterns.
     PTO2_SCOPE(rt) {
         // t0: c = a + b (kernel_id=0, kernel_add)
-        PTO2TaskParam params_t0[] = {
-            PTO2_INPUT(dev_a, tile, sz),
-            PTO2_INPUT(dev_b, tile, sz),
-            PTO2_OUTPUT(dev_c, tile, sz),
+        PTOParam params_t0[] = {
+            make_input_param(dev_a, sz),
+            make_input_param(dev_b, sz),
+            make_output_param(dev_c, sz),
         };
         (void)pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, "kernel_add", params_t0, 3);
 
-        // t1: d = c + 1 (kernel_id=1, kernel_add_scalar)
-        PTO2TaskParam params_t1[] = {
-            PTO2_INPUT(dev_c, tile, sz),
-            PTO2_OUTPUT(dev_d, tile, sz),
+        PTOParam params_t1[] = {
+            make_input_param(dev_c, sz),
+            make_scalar_param(float_to_u64(1.0f)),
+            make_output_param(dev_d, sz),
+            make_scalar_param((uint64_t)3),
         };
-        (void)pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t1, 2);
+        (void)pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t1, 3);
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
-        PTO2TaskParam params_t2[] = {
-            PTO2_INPUT(dev_c, tile, sz),
-            PTO2_OUTPUT(dev_e, tile, sz),
+        PTOParam params_t2[] = {
+            make_input_param(dev_c, sz),
+            make_scalar_param(float_to_u64(2.0f)),
+            make_output_param(dev_e, sz),
+            make_scalar_param((uint64_t)3),
         };
-        (void)pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t2, 2);
+        (void)pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t2, 3);
 
         // t3: f = d * e (kernel_id=2, kernel_mul)
-        PTO2TaskParam params_t3[] = {
-            PTO2_INPUT(dev_d, tile, sz),
-            PTO2_INPUT(dev_e, tile, sz),
-            PTO2_OUTPUT(dev_f, tile, sz),
+        PTOParam params_t3[] = {
+            make_input_param(dev_d, sz),
+            make_input_param(dev_e, sz),
+            make_output_param(dev_f, sz),
+            make_scalar_param((uint64_t)3),
         };
         int32_t task3_id = pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, "kernel_mul", params_t3, 3);
 

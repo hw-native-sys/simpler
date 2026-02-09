@@ -330,21 +330,19 @@ class PTOCompiler:
         # because dlopen'd SO cannot access symbols from libaicpu.so
         if self.platform == "a2a3" and self.ascend_home_path and runtime_name == "tensormap_and_ringbuffer":
             cmd.extend([
-                "-static-libstdc++",
-                "-static-libgcc",
                 "-Wl,--export-dynamic",  # Ensure symbols are exported (needed for dlsym)
             ])
             # Include PTO2 runtime source files directly
             runtime_dir = os.path.join(os.path.dirname(__file__), "..", "src", "runtime", "tensormap_and_ringbuffer", "runtime")
             runtime_dir = os.path.abspath(runtime_dir)
             runtime_sources = [
-                "pto_runtime2.c",
-                "pto_orchestrator.c",
-                "pto_shared_memory.c",
-                "pto_scheduler.c",
-                "pto_ring_buffer.c",
-                "pto_tensormap.c",
-                "pto_logical_tensor.cpp",
+                "pto_orchestrator.cpp",
+                "pto_ring_buffer.cpp",
+                "pto_runtime2.cpp",
+                "pto_shared_memory.cpp",
+                "pto_scheduler.cpp",
+                "pto_tensormap.cpp",
+                "tensor_descriptor.cpp",
             ]
             for src in runtime_sources:
                 src_path = os.path.join(runtime_dir, src)
