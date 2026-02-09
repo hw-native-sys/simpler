@@ -760,6 +760,10 @@ class CodeRunner:
                     kernel_binaries=kernel_binaries,
                 )
 
+            # Save expected values BEFORE hardware execution (outputs will be overwritten)
+            golden = {k: v.copy() for k, v in outputs.items()}
+            self._golden_module.compute_golden({**inputs, **golden}, params)
+
             # Launch runtime
             logger.info("=== Launching Runtime ===")
             logger.debug(f"Device ID: {self.device_id}")
@@ -784,7 +788,7 @@ class CodeRunner:
 
             # Compute golden and compare
             logger.info("=== Comparing Results ===")
-            self._compare_with_golden(tensors, inputs, outputs, params)
+            self._compare_with_golden(outputs, golden)
 
             logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
 
@@ -794,23 +798,14 @@ class CodeRunner:
 
     def _compare_with_golden(
         self,
-        tensors: Dict[str, np.ndarray],
-        inputs: Dict[str, np.ndarray],
         outputs: Dict[str, np.ndarray],
-        params: Dict[str, Any],
+        golden: Dict[str, np.ndarray],
     ) -> None:
-        """Compare outputs with golden values."""
-        # Create copies for golden computation
-        golden_outputs = {k: v.copy() for k, v in outputs.items()}
-        golden_tensors = {**inputs, **golden_outputs}
-
-        # Compute golden
-        self._golden_module.compute_golden(golden_tensors, params)
-
+        """Compare hardware outputs with pre-computed golden values."""
         # Compare each output
         for name in outputs:
             actual = outputs[name]
-            expected = golden_outputs[name]
+            expected = golden[name]
             logger.info(f"Comparing {name}: shape={actual.shape}, dtype={actual.dtype}")
 
             # Show first 10 values
