@@ -161,6 +161,8 @@ struct AicpuBuildApi {
         Runtime* runtime, uint64_t* args, int num_args, int func_id, CoreType core_type, uint64_t function_bin_addr);
     void (*add_successor_conditional)(Runtime* runtime, int from_task, int to_task);
     void (*publish_task)(Runtime* runtime, int task_id);
+    void* (*device_malloc)(size_t size);
+    void (*device_free)(void* ptr);
 };
 
 /**
@@ -243,15 +245,15 @@ public:
     int sche_cpu_num;  // Number of AICPU threads for scheduling
 
     /**
-     * Orchestration payload (written on host, consumed by AICPU builder).
+     * Orchestration payload (auto-populated by init_runtime_impl, consumed by AICPU orchestration).
      *
-     * For `aicpu_build_graph`, the host orchestration function is expected to:
-     * - allocate/copy device tensors (via `runtime->host_api`)
-     * - record outputs (via `runtime->record_tensor_pair()`)
-     * - marshal a device-visible payload into `orch_args[]`
+     * The framework iterates func_args using arg_types/arg_sizes:
+     * - Pointer args (ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR): device memory
+     *   is allocated, input data is copied, and the device pointer is stored here.
+     * - Scalar args (ARG_SCALAR): the value is stored directly.
      *
-     * The AICPU-side `build_graph_aicpu(Runtime*)` program interprets `orch_args[]`
-     * to create tasks/edges on device.
+     * The AICPU orchestration plugin reads orch_args[] to obtain device pointers
+     * and scalar values, then builds the task graph.
      */
     int orch_argc;
     uint64_t orch_args[RUNTIME_MAX_ORCH_ARGS];
@@ -527,7 +529,7 @@ extern "C" {
 // =============================================================================
 //
 // These functions are implemented by the aicpu_build_graph AICPU executor and
-// are intended to be called from an example-provided `build_graph_aicpu()`.
+// are intended to be called from an example-provided orchestration plugin.
 //
 // They provide:
 // - Internal synchronization with the scheduler (graph mutex)

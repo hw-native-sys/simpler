@@ -10,6 +10,7 @@
 #include <mutex>
 
 #include "aicpu/device_log.h"
+#include "aicpu/device_malloc.h"
 #include "common/platform_config.h"
 #include "runtime.h"
 
@@ -87,7 +88,7 @@ int build_graph_via_aicpu_plugin(Runtime* runtime, int thread_idx) {
         return -1;
     }
 
-    const char* sym = (runtime->aicpu_orch_func_name[0] != '\0') ? runtime->aicpu_orch_func_name : "build_graph_aicpu";
+    const char* sym = (runtime->aicpu_orch_func_name[0] != '\0') ? runtime->aicpu_orch_func_name : "orchestration";
     const uint8_t* so_data = reinterpret_cast<const uint8_t*>(so_data_v);
 
     // On some real AICPU configurations, /dev/shm, /tmp, and memfd may be mounted `noexec`,
@@ -272,6 +273,9 @@ int AicpuExecutor::init(Runtime* runtime) {
     runtime->aicpu_build_api.add_task = &aicpu_runtime_add_task;
     runtime->aicpu_build_api.add_successor_conditional = &aicpu_runtime_add_successor_conditional;
     runtime->aicpu_build_api.publish_task = &aicpu_runtime_publish_task;
+
+    runtime->aicpu_build_api.device_malloc = &aicpu_device_malloc;
+    runtime->aicpu_build_api.device_free = &aicpu_device_free;
 
     // Hard error: scheduler threads must have at least one assigned core.
     // Otherwise, they will spin in resolve_and_dispatch() and eventually timeout.
@@ -741,7 +745,7 @@ int AicpuExecutor::run(Runtime* runtime) {
 
         int rc = build_graph_via_aicpu_plugin(runtime, thread_idx);
         if (rc != 0) {
-            DEV_ERROR("Thread %d: build_graph_aicpu failed rc=%d", thread_idx, rc);
+            DEV_ERROR("Thread %d: orchestration plugin failed rc=%d", thread_idx, rc);
             build_failed_.store(true, std::memory_order_release);
         }
         build_done_.store(true, std::memory_order_release);

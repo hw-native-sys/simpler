@@ -1,30 +1,24 @@
 /**
  * Runtime Builder - aicpu_build_graph (host side)
  *
- * Provides init_runtime_impl and validate_runtime_impl functions that work with
- * pluggable orchestration functions.
+ * Provides init_runtime_impl and validate_runtime_impl functions.
  *
  * init_runtime_impl:
- *   - Calls orchestration function to prepare device memory and marshal inputs
- *     for the AICPU graph builder (e.g. writes `runtime->orch_args[]`)
- *   - Orchestration is responsible for device memory management via
- *     `runtime->host_api.*`
+ *   - Automatically manages I/O tensor device memory using arg_types/arg_sizes
+ *   - Marshals device pointers and scalars into runtime->orch_args[]
+ *   - Embeds the AICPU orchestration plugin SO into the Runtime
  *
  * validate_runtime_impl (finalize_runtime_impl):
  *   - Copies recorded tensors back from device to host
  *   - Frees device memory
  */
 
-#include <dlfcn.h>
-#include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <strings.h>
-#include <unistd.h>
 
 #include <cstddef>
 #include <cstdint>
-#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
@@ -32,15 +26,13 @@
 #include "device_runner.h"
 #include "runtime.h"
 
-/**
- * Orchestration function signature.
- *
- * @param runtime   Pointer to Runtime to prepare (e.g. set orch_args[], record tensors)
- * @param args      Arguments array (host pointers, sizes, etc.)
- * @param arg_count Total number of arguments
- * @return 0 on success, negative on error
- */
-typedef int (*OrchestrationFunc)(Runtime* runtime, uint64_t* args, int arg_count);
+// Argument type constants (must match ArgType in pto_runtime_c_api.h and bindings.py).
+#ifndef ARG_SCALAR
+#define ARG_SCALAR     0
+#define ARG_INPUT_PTR  1
+#define ARG_OUTPUT_PTR 2
+#define ARG_INOUT_PTR  3
+#endif
 
 static void populate_kernel_addrs(Runtime* runtime) {
     if (runtime == nullptr) {
@@ -87,25 +79,24 @@ extern "C" {
 #endif
 
 /**
- * Initialize a pre-allocated runtime with dynamic orchestration.
+ * Initialize a pre-allocated runtime for aicpu_build_graph.
  *
- * This function loads the orchestration SO from binary data via a temp file,
- * resolves the orchestration function via dlsym, then calls it.
+ * This function:
+ * 1. Automatically manages I/O tensor device memory using arg_types/arg_sizes
+ *    (device_malloc, copy_to_device, record_tensor_pair, record_device_alloc)
+ * 2. Marshals device pointers and scalars into runtime->orch_args[]
+ * 3. Embeds the AICPU orchestration plugin SO into the Runtime
  *
- * For `aicpu_build_graph`, the orchestration function is expected to:
- * - Allocating device memory via runtime->host_api.device_malloc()
- * - Copying data to device via runtime->host_api.copy_to_device()
- * - Recording tensor pairs via runtime->record_tensor_pair() (for copy-back)
- * - Marshalling a device-visible payload into runtime->orch_argc/runtime->orch_args[]
- *
- * The task graph itself is built later on device by `build_graph_aicpu(Runtime*)`.
+ * The task graph is built on device by the orchestration plugin.
  *
  * @param runtime           Pointer to pre-constructed Runtime
- * @param orch_so_binary    Orchestration shared library binary data
+ * @param orch_so_binary    AICPU orchestration plugin SO binary data
  * @param orch_so_size      Size of orchestration SO binary in bytes
- * @param orch_func_name    Name of the orchestration function to call
- * @param func_args         Arguments for orchestration (host pointers, sizes, etc.)
+ * @param orch_func_name    Name of the orchestration entry function
+ * @param func_args         Arguments (host pointers for tensors, scalar values)
  * @param func_args_count   Number of arguments
+ * @param arg_types         Per-argument type (ARG_SCALAR, ARG_INPUT_PTR, etc.)
+ * @param arg_sizes         Per-argument byte size (0 for scalars)
  * @return 0 on success, -1 on failure
  */
 int init_runtime_impl(Runtime* runtime,
@@ -113,8 +104,9 @@ int init_runtime_impl(Runtime* runtime,
     size_t orch_so_size,
     const char* orch_func_name,
     uint64_t* func_args,
-    int func_args_count) {
-    // Validate inputs
+    int func_args_count,
+    int* arg_types,
+    uint64_t* arg_sizes) {
     if (runtime == nullptr) {
         std::cerr << "Error: Runtime pointer is null\n";
         return -1;
@@ -124,81 +116,84 @@ int init_runtime_impl(Runtime* runtime,
         return -1;
     }
 
-    // Load orchestration SO from binary data via a unique temp file.
-    // This mirrors the runner's pattern and avoids collisions across threads.
-    char fd_path[] = "/tmp/orch_so_XXXXXX";
-    int fd = mkstemp(fd_path);
-    if (fd < 0) {
-        std::cerr << "Error: Failed to create temp SO file (mkstemp)\n";
-        return -1;
-    }
-
-    size_t off = 0;
-    while (off < orch_so_size) {
-        ssize_t n = write(fd, orch_so_binary + off, orch_so_size - off);
-        if (n <= 0) {
-            std::cerr << "Error: Failed to write orchestration SO to temp file\n";
-            close(fd);
-            unlink(fd_path);
-            return -1;
-        }
-        off += static_cast<size_t>(n);
-    }
-    close(fd);
-
-    void* handle = dlopen(fd_path, RTLD_NOW | RTLD_LOCAL);
-    unlink(fd_path);
-    if (handle == nullptr) {
-        std::cerr << "Error: dlopen failed: " << dlerror() << "\n";
-        return -1;
-    }
-
-    dlerror();  // Clear any existing error
-    OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
-    const char* dlsym_error = dlerror();
-    if (dlsym_error != nullptr) {
-        std::cerr << "Error: dlsym failed for '" << orch_func_name << "': " << dlsym_error << "\n";
-        dlclose(handle);
-        return -1;
-    }
-
-    std::cout << "Loaded orchestration function: " << orch_func_name << "\n";
-
-    // Clear any previous tensor pairs
+    // Clear any previous state.
     runtime->clear_tensor_pairs();
+    runtime->clear_device_allocs();
 
-    // Optional: select build/schedule mode for this runtime instance.
-    //
-    // 0 = sequential build -> schedule
-    // 1 = concurrent build || schedule (default)
+    // --- Auto-manage I/O tensors and marshal orch_args[] ---
+    std::cout << "\n=== Preparing Orchestration Args ===" << '\n';
+    std::cout << "func_args_count: " << func_args_count << '\n';
+
+    if (func_args_count > RUNTIME_MAX_ORCH_ARGS) {
+        std::cerr << "Error: func_args_count (" << func_args_count
+                  << ") exceeds RUNTIME_MAX_ORCH_ARGS (" << RUNTIME_MAX_ORCH_ARGS << ")\n";
+        return -1;
+    }
+
+    for (int i = 0; i < func_args_count; i++) {
+        int atype = (arg_types != nullptr) ? arg_types[i] : ARG_SCALAR;
+        uint64_t asize = (arg_sizes != nullptr) ? arg_sizes[i] : 0;
+
+        if (atype == ARG_SCALAR) {
+            // Pass scalar value directly.
+            runtime->orch_args[i] = func_args[i];
+        } else {
+            // Pointer argument: allocate device memory.
+            void* host_ptr = reinterpret_cast<void*>(func_args[i]);
+            size_t nbytes = static_cast<size_t>(asize);
+
+            void* dev_ptr = runtime->host_api.device_malloc(nbytes);
+            if (dev_ptr == nullptr) {
+                std::cerr << "Error: device_malloc failed for arg " << i
+                          << " (" << nbytes << " bytes)\n";
+                return -1;
+            }
+            runtime->record_device_alloc(dev_ptr);
+
+            // Copy input data to device.
+            if (atype == ARG_INPUT_PTR || atype == ARG_INOUT_PTR) {
+                int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, nbytes);
+                if (rc != 0) {
+                    std::cerr << "Error: copy_to_device failed for arg " << i << '\n';
+                    return -1;
+                }
+            }
+
+            // Record output tensors for copy-back during finalize.
+            if (atype == ARG_OUTPUT_PTR || atype == ARG_INOUT_PTR) {
+                runtime->record_tensor_pair(host_ptr, dev_ptr, nbytes);
+            }
+
+            runtime->orch_args[i] = reinterpret_cast<uint64_t>(dev_ptr);
+        }
+    }
+    runtime->orch_argc = func_args_count;
+
+    // --- Embed AICPU orchestration plugin ---
+    if (!runtime->try_set_aicpu_orch_so(orch_so_binary, orch_so_size)) {
+        std::cerr << "Error: failed to embed AICPU orchestration plugin into Runtime "
+                     "(size=" << orch_so_size << " bytes, max="
+                  << RUNTIME_MAX_AICPU_ORCH_SO_SIZE << " bytes)\n";
+        return -1;
+    }
+    memset(runtime->aicpu_orch_func_name, 0, sizeof(runtime->aicpu_orch_func_name));
+    strncpy(runtime->aicpu_orch_func_name, orch_func_name,
+            sizeof(runtime->aicpu_orch_func_name) - 1);
+
+    std::cout << "Embedded orchestration plugin (" << orch_so_size
+              << " bytes), entry: " << runtime->aicpu_orch_func_name << '\n';
+
+    // --- Build mode ---
     const char* build_mode_env = std::getenv("PTO_AICPU_BUILD_GRAPH_BUILD_MODE");
     runtime->build_mode = parse_build_mode_env(build_mode_env, runtime->build_mode);
     std::cout << "aicpu_build_graph build_mode=" << runtime->build_mode
-              << " (PTO_AICPU_BUILD_GRAPH_BUILD_MODE=" << (build_mode_env ? build_mode_env : "<unset>") << ")\n";
+              << " (PTO_AICPU_BUILD_GRAPH_BUILD_MODE="
+              << (build_mode_env ? build_mode_env : "<unset>") << ")\n";
 
-    std::cout << "\n=== Calling Orchestration Function ===" << '\n';
-    std::cout << "Args count: " << func_args_count << '\n';
-
-    // Call orchestration function to build task graph
-    // The orchestration function handles device memory allocation and copy-to-device
-    int rc = orch_func(runtime, func_args, func_args_count);
-    if (rc != 0) {
-        std::cerr << "Error: Orchestration function failed with code " << rc << '\n';
-        runtime->clear_tensor_pairs();
-        dlclose(handle);
-        return rc;
-    }
-
-    // Populate `kernel_addrs[]` for AICPU-side task creation (Challenge A).
-    // This must happen after Python has called register_kernel() and before
-    // launch_runtime() copies Runtime to device / starts AICPU execution.
+    // Populate kernel_addrs[] for AICPU-side task creation.
     populate_kernel_addrs(runtime);
 
     std::cout << "\nRuntime initialized. Ready for execution from Python.\n";
-
-    // Note: We intentionally leak the dlopen handle to keep the SO loaded
-    // for the lifetime of the process.
-
     return 0;
 }
 
@@ -294,7 +289,7 @@ int validate_runtime_impl(Runtime* runtime) {
     runtime->clear_tensor_pairs();
     runtime->clear_device_allocs();
 
-    std::cout << "=== Finalize Complete ===" << '\n';
+    std::cout << "=== Finalize Complete ===" << std::endl;  // flush so output appears before Python continues
 
     return rc;
 }

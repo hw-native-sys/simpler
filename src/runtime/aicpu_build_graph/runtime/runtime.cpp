@@ -44,7 +44,7 @@ Runtime::Runtime() {
     aicpu_orch_so_size = 0;
     memset(aicpu_orch_so_storage, 0, sizeof(aicpu_orch_so_storage));
     memset(aicpu_orch_func_name, 0, sizeof(aicpu_orch_func_name));
-    strncpy(aicpu_orch_func_name, "build_graph_aicpu", sizeof(aicpu_orch_func_name) - 1);
+    strncpy(aicpu_orch_func_name, "orchestration", sizeof(aicpu_orch_func_name) - 1);
     build_mode = 1;  // default to concurrent build||schedule
     aicpu_build_api = {};
 }

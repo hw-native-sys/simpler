@@ -291,8 +291,8 @@ def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> Dict[
     `kernel_config.py` may define:
         RUNTIME_ENV = {"ENV_KEY": "value", ...}
 
-    If a value looks like a path (ENV key ends with _DIR/_PATH, or is
-    PTO_AICPU_ORCH_SO) and is not absolute, it is resolved relative to
+    If a value looks like a path (ENV key ends with _DIR/_PATH)
+    and is not absolute, it is resolved relative to
     `kernels_dir`.
     """
     runtime_env = getattr(kernel_config_module, "RUNTIME_ENV", None)
@@ -304,7 +304,7 @@ def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> Dict[
         if not isinstance(k, str):
             continue
         s = str(v)
-        is_path_like = k.endswith("_DIR") or k.endswith("_PATH") or (k == "PTO_AICPU_ORCH_SO")
+        is_path_like = k.endswith("_DIR") or k.endswith("_PATH")
         if is_path_like and s:
             p = Path(s)
             if not p.is_absolute():
@@ -378,7 +378,6 @@ class CodeRunner:
         # Extract kernel configuration
         self.kernels = self._kernel_config.KERNELS
         self.orchestration = self._kernel_config.ORCHESTRATION
-        self.aicpu_orchestration = getattr(self._kernel_config, "AICPU_ORCHESTRATION", None)
 
         # Extract golden configuration
         self.params_list = getattr(self._golden_module, 'PARAMS_LIST', [{}])
@@ -407,31 +406,22 @@ class CodeRunner:
             )
         return _load_module_from_path(config_path, f"kernel_config_{id(self)}")
 
-    def _compile_aicpu_orchestration_plugin(self, pto_compiler) -> Optional[Path]:
+    def _compile_aicpu_orchestration_plugin(self, pto_compiler) -> Path:
         """
-        Compile the AICPU-side orchestration plugin (a small .so loaded via dlopen on AICPU).
+        Compile the AICPU orchestration plugin (.so loaded via dlopen on AICPU).
 
-        The example config must provide:
-            AICPU_ORCHESTRATION = {"source": ".../build_graph_aicpu.cpp", "function_name": "build_graph_aicpu"}
+        Uses ORCHESTRATION config from kernel_config.py.
 
         Returns:
-            Host path to the compiled plugin .so (kept on disk until the run completes), or None.
+            Host path to the compiled plugin .so.
         """
-        if self.runtime_name != "aicpu_build_graph":
-            return None
-
-        cfg = self.aicpu_orchestration
-        if cfg is None:
-            return None
-        if not isinstance(cfg, dict):
-            raise TypeError("AICPU_ORCHESTRATION must be a dict when provided")
-
+        cfg = self.orchestration
         source_path = cfg.get("source")
-        func_name = cfg.get("function_name", "build_graph_aicpu")
+        func_name = cfg.get("function_name", "orchestration")
         if not source_path or not isinstance(source_path, str):
-            raise ValueError("AICPU_ORCHESTRATION['source'] must be a non-empty string")
+            raise ValueError("ORCHESTRATION['source'] must be a non-empty string")
         if not func_name or not isinstance(func_name, str):
-            raise ValueError("AICPU_ORCHESTRATION['function_name'] must be a non-empty string")
+            raise ValueError("ORCHESTRATION['function_name'] must be a non-empty string")
 
         source_p = Path(source_path)
         if not source_p.is_absolute():
@@ -663,8 +653,15 @@ class CodeRunner:
             str(self.project_root / "src" / "runtime" / self.runtime_name / "runtime"),
         ] + pto_compiler.get_platform_include_dirs()
 
-        # For tensormap_and_ringbuffer, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
-        if self.runtime_name == "tensormap_and_ringbuffer":
+        if self.runtime_name == "aicpu_build_graph":
+            # For aicpu_build_graph: compile orchestration as an AICPU plugin SO.
+            # The framework (init_runtime_impl) embeds it into the Runtime and
+            # auto-manages I/O tensor device memory using arg_types/arg_sizes.
+            orch_plugin_path = self._compile_aicpu_orchestration_plugin(pto_compiler)
+            orch_so_binary = orch_plugin_path.read_bytes()
+            logger.debug(f"Compiled orchestration plugin: {len(orch_so_binary)} bytes")
+        elif self.runtime_name == "tensormap_and_ringbuffer":
+            # For tensormap_and_ringbuffer, orchestration is compiled as a separate SO (loaded via dlopen on AICPU thread 3)
             logger.info("tensormap_and_ringbuffer: Compiling orchestration as separate SO for dlopen")
             orch_so_binary = pto_compiler.compile_orchestration(
                 self.orchestration["source"],
@@ -679,24 +676,6 @@ class CodeRunner:
                 runtime_name=self.runtime_name,
             )
             logger.debug(f"Compiled orchestration: {len(orch_so_binary)} bytes")
-
-        # Compile AICPU orchestration plugin if needed (for aicpu_build_graph runtime)
-        aicpu_orch_plugin_path: Optional[Path] = None
-        if self.runtime_name == "aicpu_build_graph":
-            if self.aicpu_orchestration is not None:
-                aicpu_orch_plugin_path = self._compile_aicpu_orchestration_plugin(pto_compiler)
-            else:
-                # Allow advanced users to supply a prebuilt plugin path via RUNTIME_ENV.
-                base_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
-                aicpu_orch_so = base_env.get("PTO_AICPU_ORCH_SO")
-                if not aicpu_orch_so:
-                    raise RuntimeError(
-                        "aicpu_build_graph requires an AICPU orchestration plugin. Either:\n"
-                        "- Define AICPU_ORCHESTRATION in kernels/kernel_config.py, or\n"
-                        "- Provide PTO_AICPU_ORCH_SO in RUNTIME_ENV pointing to a prebuilt .so"
-                    )
-                if not Path(aicpu_orch_so).is_file():
-                    raise FileNotFoundError(f"PTO_AICPU_ORCH_SO does not exist: {aicpu_orch_so}")
 
         # Step 4: Compile kernels (will be registered during runtime.initialize)
         logger.info("=== Compiling Kernels ===")
@@ -757,12 +736,6 @@ class CodeRunner:
 
             # Build environment for runtime initialization
             run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
-            if aicpu_orch_plugin_path is not None:
-                run_env = dict(run_env)
-                run_env["PTO_AICPU_ORCH_SO"] = str(aicpu_orch_plugin_path)
-                run_env["PTO_AICPU_ORCH_FUNC"] = str(
-                    self.aicpu_orchestration.get("function_name", "build_graph_aicpu")
-                )
             if run_env:
                 logger.debug(f"Runtime init env overrides: {run_env}")
             

@@ -13,10 +13,9 @@ python examples/scripts/run_example.py \
 
 ## Key difference vs host_build_graph/vector_example
 
-- `kernels/orchestration/example_orch.cpp` does **prepare + marshal only**:
-  - allocates/copies tensors,
-  - writes `runtime->orch_argc` / `runtime->orch_args[]`,
-  - does **not** call `runtime->add_task()` / `runtime->add_successor()`.
-- `kernels/aicpu/build_graph_aicpu.cpp` is compiled into a small AICPU-side plugin `.so`.
-  - The host orchestration embeds the plugin bytes into `Runtime`.
-  - The AICPU runtime `dlopen()`s the embedded plugin and calls `build_graph_aicpu(Runtime*)` on device.
+- The framework (`init_runtime_impl`) automatically manages I/O tensor device memory
+  using `arg_types`/`arg_sizes` and populates `runtime->orch_args[]`.
+- `kernels/aicpu/orchestration.cpp` is compiled into a small AICPU-side plugin `.so`.
+  - The framework embeds the plugin bytes into `Runtime`.
+  - The AICPU runtime `dlopen()`s the embedded plugin and calls `orchestration(Runtime*)` on device.
+  - The orchestration allocates intermediate tensors via `api.device_malloc()` (HBM) and builds the task graph.

@@ -74,7 +74,7 @@ while IFS= read -r -d '' example_dir; do
             python examples/scripts/run_example.py \
                 -k "${example_dir}/kernels" \
                 -g "$golden" \
-                -p a2a3 -d "${DEVICE_ID:-6}"
+                -p a2a3 -d "$DEVICE_ID"
             python examples/scripts/run_example.py \
                 -k "${example_dir}/kernels" \
                 -g "$golden" \
