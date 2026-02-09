@@ -153,8 +153,8 @@ static inline int32_t pto2_get_scope_depth(PTO2OrchestratorState* orch) {
  * Submit a task with InCore function and parameters
  *
  * This is the main API for building the task graph:
- * 1. Allocates task slot from TaskRing (may stall)
- * 2. Allocates packed output buffer from HeapRing (may stall)
+ * 1. Allocates task slot from TaskRing (blocks until available)
+ * 2. Allocates packed output buffer from HeapRing (blocks until available)
  * 3. Looks up inputs in TensorMap to find dependencies
  * 4. Updates producer's fanout_count/list (with spinlock)
  * 5. Registers outputs in TensorMap
@@ -166,7 +166,7 @@ static inline int32_t pto2_get_scope_depth(PTO2OrchestratorState* orch) {
  * @param func_name   Function name (for debugging)
  * @param params      Array of task parameters
  * @param num_params  Number of parameters
- * @return Task ID, or -1 on failure
+ * @return Task ID of the submitted task
  */
 int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                           int32_t kernel_id,

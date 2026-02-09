@@ -11,8 +11,6 @@
 #include <string.h>
 #include <stdio.h>
 
-/* ABI-stable read of size field (offset 20); volatile to avoid C/C++ visibility issues */
-#define PTO2_PARAM_SIZE(p) (*(volatile int32_t*)((char*)(p) + 20))
 
 // =============================================================================
 // Per-Task Spinlock Implementation
@@ -237,14 +235,12 @@ void* pto2_alloc_packed_buffer(PTO2OrchestratorState* orch, int32_t total_size) 
     return buffer;
 }
 
-/* ABI-stable param fill (offset 20 = size); volatile write for size so C/C++ see it */
 static inline void pto2_param_set(PTO2TaskParam* p, int32_t type, void* buf, int32_t tile_index, int32_t size_bytes) {
-    *(int32_t*)((char*)p + 0) = type;
-    *(int32_t*)((char*)p + 4) = 0;
-    *(void**)((char*)p + 8) = buf;
-    *(int32_t*)((char*)p + 16) = tile_index;
-    *(volatile int32_t*)((char*)p + 20) = size_bytes;
-    PTO2_MEMORY_BARRIER();
+    p->type = type;
+    memset(p->_pad, 0, sizeof(p->_pad));
+    p->buffer = buf;
+    p->tile_index = tile_index;
+    p->size = size_bytes;
 }
 
 void pto2_param_set_input(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes) {
@@ -259,20 +255,6 @@ void pto2_param_set_inout(PTO2TaskParam* p, void* buf, int32_t tile_index, int32
     pto2_param_set(p, (int32_t)PTO2_PARAM_INOUT, buf, tile_index, size_bytes);
 }
 
-/** Force size at offset 20 in each 24-byte param slot (C/C++ ABI workaround). Call before submit. */
-void pto2_param_fix_sizes(void* params_base, int32_t num_params, int32_t size_bytes) {
-    unsigned char* base = (unsigned char*)params_base;
-    for (int32_t i = 0; i < num_params; i++) {
-        *(volatile int32_t*)(base + i * 24 + 20) = size_bytes;
-    }
-    PTO2_MEMORY_BARRIER();
-    if (getenv("PTO2_DEBUG_PARAMS") != NULL && num_params > 0) {
-        int32_t read_back = *(volatile int32_t*)(base + 20);
-        fprintf(stderr, "[PTO2] pto2_param_fix_sizes: base=%p wrote size=%d read_back@20=%d\n",
-                (void*)base, size_bytes, read_back);
-    }
-}
-
 int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                           int32_t kernel_id,
                           PTO2WorkerType worker_type,
@@ -283,11 +265,8 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
     pto2_orchestrator_sync_tensormap(orch);
 
-    // === STEP 1: Allocate task slot from Task Ring (may stall) ===
+    // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
     int32_t task_id = pto2_task_ring_alloc(&orch->task_ring);
-    if (task_id < 0) {
-        return -1;  // Should not happen (stalls instead)
-    }
 
     PTO2TaskDescriptor* task = pto2_task_ring_get(&orch->task_ring, task_id);
 
@@ -324,36 +303,9 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
     int32_t fanin_count = 0;
     
     // === STEP 2: First pass - collect output sizes and process inputs ===
-    /* Debug: raw bytes at size offset for first param (optional, set PTO2_DEBUG_PARAMS=1 to enable) */
-    if (getenv("PTO2_DEBUG_PARAMS") != NULL && num_params > 0) {
-        const unsigned char* base = (const unsigned char*)params;
-        fprintf(stderr, "[PTO2] params=%p task_id=%d raw@20: %02x %02x %02x %02x -> %d\n",
-                (void*)params, task_id,
-                base[20], base[21], base[22], base[23],
-                *(const int32_t*)(base + 20));
-    }
-    /* Workaround: ensure .size at offset 20 is visible; if first param has valid size, propagate to all */
-    {
-        int32_t s0 = PTO2_PARAM_SIZE(&params[0]);
-        if (s0 > 0 && s0 <= (16 * 1024 * 1024)) {
-            for (int i = 1; i < num_params; i++)
-                *(volatile int32_t*)((char*)&params[i] + 20) = s0;
-            PTO2_MEMORY_BARRIER();
-        }
-    }
     for (int i = 0; i < num_params; i++) {
         PTO2TaskParam* p = &params[i];
-        int32_t param_size = PTO2_PARAM_SIZE(p);
-        /* If size looks like garbage (e.g. pointer low 32 bits), try first param's size once */
-        if ((param_size <= 0 || param_size > (16 * 1024 * 1024)) && num_params > 0) {
-            int32_t s0 = PTO2_PARAM_SIZE(&params[0]);
-            if (s0 > 0 && s0 <= (16 * 1024 * 1024)) {
-                for (int j = 0; j < num_params; j++)
-                    *(volatile int32_t*)((char*)&params[j] + 20) = s0;
-                PTO2_MEMORY_BARRIER();
-                param_size = s0;
-            }
-        }
+        int32_t param_size = p->size;
         PTO2TensorRegion region = {
             .base_ptr = p->buffer,
             .tile_index = p->tile_index,
@@ -395,24 +347,8 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
             case PTO2_PARAM_OUTPUT: {
                 // Collect output size for packed buffer allocation
                 if (num_outputs < PTO2_MAX_OUTPUTS) {
-                    int32_t out_size = param_size;
-                    if (out_size <= 0 || out_size > (16 * 1024 * 1024)) {
-                        /* Fallback: use first param's size (often all tensors same size) */
-                        int32_t s0 = PTO2_PARAM_SIZE(&params[0]);
-                        if (s0 > 0 && s0 <= (16 * 1024 * 1024)) {
-                            out_size = s0;
-                            *(volatile int32_t*)((char*)p + 20) = s0;
-                        } else {
-                            const unsigned char* base = (const unsigned char*)params;
-                            fprintf(stderr, "[PTO2] Invalid output size: %d (param type=OUTPUT). "
-                                    "Expected 0 < size <= 16MB. params=%p param[0].size@20=%d raw: %02x %02x %02x %02x\n",
-                                    out_size, (void*)params, *(const int32_t*)(base + 20),
-                                    base[20], base[21], base[22], base[23]);
-                            return -1;
-                        }
-                    }
-                    output_sizes[num_outputs++] = out_size;
-                    total_output_size += PTO2_ALIGN_UP(out_size, PTO2_PACKED_OUTPUT_ALIGN);
+                    output_sizes[num_outputs++] = param_size;
+                    total_output_size += PTO2_ALIGN_UP(param_size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
                 break;
             }
@@ -445,20 +381,8 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                 
                 // Collect output size for packed buffer
                 if (num_outputs < PTO2_MAX_OUTPUTS) {
-                    int32_t out_size = param_size;
-                    if (out_size <= 0 || out_size > (16 * 1024 * 1024)) {
-                        int32_t s0 = PTO2_PARAM_SIZE(&params[0]);
-                        if (s0 > 0 && s0 <= (16 * 1024 * 1024)) {
-                            out_size = s0;
-                            *(volatile int32_t*)((char*)p + 20) = s0;
-                        } else {
-                            fprintf(stderr, "[PTO2] Invalid output size: %d (param type=INOUT). "
-                                    "Expected 0 < size <= 16MB.\n", out_size);
-                            return -1;
-                        }
-                    }
-                    output_sizes[num_outputs++] = out_size;
-                    total_output_size += PTO2_ALIGN_UP(out_size, PTO2_PACKED_OUTPUT_ALIGN);
+                    output_sizes[num_outputs++] = param_size;
+                    total_output_size += PTO2_ALIGN_UP(param_size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
                 break;
             }
@@ -508,7 +432,7 @@ int32_t pto2_submit_task(PTO2OrchestratorState* orch,
                 .base_ptr = p->buffer,        // Use original tensor address
                 .tile_index = p->tile_index,
                 .offset = 0,
-                .size = PTO2_PARAM_SIZE(p)
+                .size = p->size
             };
             
             // Register in TensorMap: this region is produced by task_id

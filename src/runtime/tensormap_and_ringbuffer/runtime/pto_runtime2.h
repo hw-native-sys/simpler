@@ -160,7 +160,7 @@ void pto2_rt_scope_end(PTO2Runtime* rt);
  * @param func_name   Function name (for debugging)
  * @param params      Array of task parameters
  * @param num_params  Number of parameters
- * @return Task ID, or -1 on failure
+ * @return Task ID of the submitted task
  */
 int32_t pto2_rt_submit_task(PTO2Runtime* rt,
                              int32_t kernel_id,
@@ -171,6 +171,8 @@ int32_t pto2_rt_submit_task(PTO2Runtime* rt,
 
 /**
  * Simplified task submission (auto-detect worker type)
+ *
+ * @return Task ID of the submitted task
  */
 int32_t pto2_rt_submit(PTO2Runtime* rt,
                         const char* func_name,
@@ -232,13 +234,10 @@ void* pto2_rt_get_output(PTO2Runtime* rt, int32_t task_id, int32_t output_idx);
 #define PTO2_SCOPE_BEGIN(rt) pto2_rt_scope_begin(rt)
 #define PTO2_SCOPE_END(rt)   pto2_rt_scope_end(rt)
 
-/** Fill a single PTO2TaskParam at ABI-stable offsets (for C++ callers). */
+/** Fill a single PTO2TaskParam using direct field access (for C++ callers). */
 void pto2_param_set_input(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes);
 void pto2_param_set_output(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes);
 void pto2_param_set_inout(PTO2TaskParam* p, void* buf, int32_t tile_index, int32_t size_bytes);
-
-/** Force size at offset 20 in each 24-byte param slot. Call before submit to avoid C/C++ layout issues. */
-void pto2_param_fix_sizes(void* params_base, int32_t num_params, int32_t size_bytes);
 
 #ifdef __cplusplus
 }
