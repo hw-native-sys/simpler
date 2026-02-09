@@ -18,9 +18,9 @@ import numpy as np
 __outputs__ = ["f"]
 
 # Tensor order for orchestration function arguments
-# tensormap_and_ringbuffer args layout: [dev_a, dev_b, dev_f, size_a, size_b, size_f, SIZE, dev_c, dev_d, dev_e]
-# Note: tensormap_and_ringbuffer requires intermediate tensors (c, d, e) to be pre-allocated
-TENSOR_ORDER = ["a", "b", "f", "c", "d", "e"]
+# tensormap_and_ringbuffer args layout: [dev_a, dev_b, dev_f, size_a, size_b, size_f, SIZE]
+# Note: intermediate tensors (c, d, e) are allocated on-device by the runtime heap
+TENSOR_ORDER = ["a", "b", "f"]
 
 # Comparison tolerances
 RTOL = 1e-5
@@ -35,7 +35,6 @@ def generate_inputs(params: dict) -> dict:
     - a: 16384 elements, all 2.0
     - b: 16384 elements, all 3.0
     - f: 16384 elements, zeros (output)
-    - c, d, e: 16384 elements, zeros (intermediate tensors for RT2)
 
     Returns:
         Dict of numpy arrays with tensor names as keys
@@ -48,10 +47,6 @@ def generate_inputs(params: dict) -> dict:
         "a": np.full(SIZE, 2.0, dtype=np.float32),
         "b": np.full(SIZE, 3.0, dtype=np.float32),
         "f": np.zeros(SIZE, dtype=np.float32),
-        # Intermediate tensors for tensormap_and_ringbuffer device orchestration
-        "c": np.zeros(SIZE, dtype=np.float32),
-        "d": np.zeros(SIZE, dtype=np.float32),
-        "e": np.zeros(SIZE, dtype=np.float32),
     }
 
 

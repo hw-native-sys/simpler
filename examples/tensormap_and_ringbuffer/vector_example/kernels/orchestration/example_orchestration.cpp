@@ -24,30 +24,25 @@
 // Extended by runtime_maker.cpp: [..., gm_heap, heap_size] (always last 2)
 //
 // For this example (a+b+1)(a+b+2):
-//   [dev_a, dev_b, dev_f, dev_c, dev_d, dev_e, size_a, size_b, size_f, size_c, size_d, size_e, SIZE]
+//   [a, b, f, size_a, size_b, size_f, SIZE]
 //   + [gm_heap, heap_size] appended by runtime_maker.cpp
 //
+// Intermediate tensors (c, d, e) are allocated on-device by the runtime heap.
 // Generic access: gm_heap = args[arg_count - 2], heap_size = args[arg_count - 1]
 // =============================================================================
 
-// Tensor device pointers (order from code_runner.py: inputs, outputs, intermediates)
-#define ARG_DEV_A      0
-#define ARG_DEV_B      1
-#define ARG_DEV_F      2   // output
-#define ARG_DEV_C      3   // intermediate
-#define ARG_DEV_D      4   // intermediate
-#define ARG_DEV_E      5   // intermediate
+// Tensor device pointers (order from code_runner.py: inputs, outputs)
+#define ARG_PTR_A      0
+#define ARG_PTR_B      1
+#define ARG_PTR_F      2   // output
 
 // Tensor sizes (same order as pointers)
-#define ARG_SIZE_A     6
-#define ARG_SIZE_B     7
-#define ARG_SIZE_F     8
-#define ARG_SIZE_C     9
-#define ARG_SIZE_D     10
-#define ARG_SIZE_E     11
+#define ARG_SIZE_A     3
+#define ARG_SIZE_B     4
+#define ARG_SIZE_F     5
 
 // Element count (scalar)
-#define ARG_SIZE       12
+#define ARG_SIZE       6
 
 // gm_heap and heap_size are ALWAYS the last 2 args (generic, not hardcoded index)
 
@@ -83,7 +78,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     PTO2SharedMemoryHeader* header = (PTO2SharedMemoryHeader*)sm_ptr;
 
     // Validate inputs
-    if (!sm_ptr || !args || arg_count < 13) {
+    if (!sm_ptr || !args || arg_count < 7) {
         if (header) {
             header->orchestrator_done = 1;
         }
@@ -91,9 +86,9 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     }
 
     // Extract device pointers
-    void* dev_a_ptr = (void*)(uintptr_t)args[ARG_DEV_A];
-    void* dev_b_ptr = (void*)(uintptr_t)args[ARG_DEV_B];
-    void* dev_f_ptr = (void*)(uintptr_t)args[ARG_DEV_F];
+    void* arg_a_ptr = (void*)(uintptr_t)args[ARG_PTR_A];
+    void* arg_b_ptr = (void*)(uintptr_t)args[ARG_PTR_B];
+    void* arg_f_ptr = (void*)(uintptr_t)args[ARG_PTR_F];
     size_t size_a = (size_t)args[ARG_SIZE_A];
     size_t size_b = (size_t)args[ARG_SIZE_B];
     size_t size_f = (size_t)args[ARG_SIZE_F];
@@ -149,12 +144,12 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     int32_t sz = (int32_t)BYTES;
     if (sz <= 0) sz = (int32_t)size_a;
 
-    PTOBufferHandle dev_a = make_external_handle(dev_a_ptr, size_a);
-    PTOBufferHandle dev_b = make_external_handle(dev_b_ptr, size_b);
-    PTOBufferHandle dev_f = make_external_handle(dev_f_ptr, size_f);
-    PTOBufferHandle dev_c = make_output_handle(BYTES);  // c = a + b
-    PTOBufferHandle dev_d = make_output_handle(BYTES);  // d = c + 1
-    PTOBufferHandle dev_e = make_output_handle(BYTES);  // e = c + 2
+    PTOBufferHandle arg_a = make_external_handle(arg_a_ptr, size_a);
+    PTOBufferHandle arg_b = make_external_handle(arg_b_ptr, size_b);
+    PTOBufferHandle arg_f = make_external_handle(arg_f_ptr, size_f);
+    PTOBufferHandle buf_c = make_output_handle(BYTES);  // c = a + b
+    PTOBufferHandle buf_d = make_output_handle(BYTES);  // d = c + 1
+    PTOBufferHandle buf_e = make_output_handle(BYTES);  // e = c + 2
 
     // Use RAII scope guard for automatic scope management.
     // PTO2_SCOPE creates a scoped block where pto2_rt_scope_begin() is called
@@ -164,34 +159,34 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     PTO2_SCOPE(rt) {
         // t0: c = a + b (kernel_id=0, kernel_add)
         PTOParam params_t0[] = {
-            make_input_param(dev_a, sz),
-            make_input_param(dev_b, sz),
-            make_output_param(dev_c, sz),
+            make_input_param(arg_a, sz),
+            make_input_param(arg_b, sz),
+            make_output_param(buf_c, sz),
         };
         pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, "kernel_add", params_t0, 3);
 
         PTOParam params_t1[] = {
-            make_input_param(dev_c, sz),
+            make_input_param(buf_c, sz),
             make_scalar_param(float_to_u64(1.0f)),
-            make_output_param(dev_d, sz),
+            make_output_param(buf_d, sz),
             make_scalar_param((uint64_t)3),
         };
         pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t1, 3);
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
         PTOParam params_t2[] = {
-            make_input_param(dev_c, sz),
+            make_input_param(buf_c, sz),
             make_scalar_param(float_to_u64(2.0f)),
-            make_output_param(dev_e, sz),
+            make_output_param(buf_e, sz),
             make_scalar_param((uint64_t)3),
         };
         pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t2, 3);
 
         // t3: f = d * e (kernel_id=2, kernel_mul)
         PTOParam params_t3[] = {
-            make_input_param(dev_d, sz),
-            make_input_param(dev_e, sz),
-            make_output_param(dev_f, sz),
+            make_input_param(buf_d, sz),
+            make_input_param(buf_e, sz),
+            make_output_param(arg_f, sz),
             make_scalar_param((uint64_t)3),
         };
         pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, "kernel_mul", params_t3, 3);
