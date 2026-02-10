@@ -65,8 +65,8 @@ The test framework automatically handles PTO_ISA_ROOT setup:
 **Automatic Setup (Recommended):**
 Just run your example - pto-isa will be cloned automatically on first run:
 ```bash
-python examples/scripts/run_example.py -k examples/host_build_graph_example/kernels \
-                                       -g examples/host_build_graph_example/golden.py \
+python examples/scripts/run_example.py -k examples/host_build_graph/vector_example/kernels \
+                                       -g examples/host_build_graph/vector_example/golden.py \
                                        -p a2a3sim
 ```
 
