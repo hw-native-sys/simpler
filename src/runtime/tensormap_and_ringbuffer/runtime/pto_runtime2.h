@@ -268,6 +268,134 @@ private:
  *   } // scope automatically ends here
  */
 #define PTO2_SCOPE(rt) if (PTO2_SCOPE_GUARD(rt); true)
+
+/**
+ * Configuration for orchestration entry point setup.
+ *
+ * Groups all parameters needed by PTO2OrchestrationGuard so the
+ * PTO2_ORCHESTRATION macro stays concise.
+ *
+ * Example:
+ *   PTO2OrchestrationBeginInfo begin_info{
+ *       .sm_ptr             = sm_ptr,
+ *       .args               = args,
+ *       .arg_count          = arg_count,
+ *       .expected_arg_count = 7,
+ *       .task_window_size   = 16384,
+ *       .dep_list_pool_size = 65536,
+ *       .heap_size          = 256 * 1024,
+ *       .gm_heap_ptr        = s_gm_heap_stub,
+ *   };
+ */
+struct PTO2OrchestrationBeginInfo {
+    void*       sm_ptr;
+    uint64_t*   args;
+    int         arg_count;
+    int         expected_arg_count;
+    int32_t     task_window_size;
+    int32_t     dep_list_pool_size;
+    int32_t     heap_size;
+    void*       gm_heap_ptr = nullptr;
+};
+
+/**
+ * RAII guard for orchestration entry/exit boilerplate.
+ *
+ * Handles validation, shared memory creation, GM heap extraction,
+ * runtime creation (constructor) and orchestration-done signaling,
+ * runtime destruction (destructor).
+ *
+ * On any init failure the destructor still signals orchestrator_done = 1.
+ *
+ * Usage with PTO2_ORCHESTRATION macro:
+ *   PTO2_ORCHESTRATION(rt, begin_info) {
+ *       pto2_rt_submit_task(rt, ...);  // implicitly inside outer scope
+ *       PTO2_SCOPE(rt) { ... }        // nested inner scope
+ *   }
+ */
+class PTO2OrchestrationGuard {
+public:
+    explicit PTO2OrchestrationGuard(const PTO2OrchestrationBeginInfo& begin_info)
+        : header_(nullptr), rt_(nullptr)
+    {
+        if (!begin_info.sm_ptr || !begin_info.args || begin_info.arg_count < begin_info.expected_arg_count) {
+            if (begin_info.sm_ptr) {
+                header_ = static_cast<PTO2SharedMemoryHeader*>(begin_info.sm_ptr);
+            }
+            return;
+        }
+        header_ = static_cast<PTO2SharedMemoryHeader*>(begin_info.sm_ptr);
+
+        int32_t sm_size = pto2_sm_calculate_size(begin_info.task_window_size,
+                                                  begin_info.dep_list_pool_size);
+        PTO2SharedMemoryHandle* sm_handle =
+            pto2_sm_create_from_buffer(begin_info.sm_ptr, sm_size,
+                                       begin_info.task_window_size,
+                                       begin_info.heap_size,
+                                       begin_info.dep_list_pool_size);
+        if (!sm_handle) return;
+
+        void*   gm_heap      = begin_info.gm_heap_ptr;
+        int32_t gm_heap_size = begin_info.heap_size;
+        if (begin_info.arg_count >= 2) {
+            uint64_t heap_arg  = begin_info.args[begin_info.arg_count - 2];
+            uint64_t size_arg  = begin_info.args[begin_info.arg_count - 1];
+            if (heap_arg != 0 && size_arg != 0) {
+                gm_heap      = reinterpret_cast<void*>(static_cast<uintptr_t>(heap_arg));
+                gm_heap_size = static_cast<int32_t>(size_arg & 0x7FFFFFFF);
+            }
+        }
+
+        rt_ = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle,
+                                           gm_heap, gm_heap_size);
+        if (!rt_) {
+            pto2_sm_destroy(sm_handle);
+            return;
+        }
+    }
+
+    ~PTO2OrchestrationGuard() {
+        if (rt_) {
+            pto2_rt_orchestration_done(rt_);
+            pto2_runtime_destroy(rt_);
+        }
+        if (header_) {
+            header_->orchestrator_done = 1;
+        }
+    }
+
+    bool valid() const { return rt_ != nullptr; }
+    PTO2Runtime* runtime() const { return rt_; }
+
+    PTO2OrchestrationGuard(const PTO2OrchestrationGuard&) = delete;
+    PTO2OrchestrationGuard& operator=(const PTO2OrchestrationGuard&) = delete;
+
+private:
+    PTO2SharedMemoryHeader* header_;
+    PTO2Runtime* rt_;
+};
+
+/**
+ * Macro for orchestration entry with automatic setup/teardown.
+ * Uses C++17 if-init to create the guard, expose the runtime pointer,
+ * and implicitly open an outer scope (PTO2_SCOPE).
+ * The block is skipped if initialization fails.
+ *
+ * Example:
+ *   PTO2_ORCHESTRATION(rt, begin_info) {
+ *       pto2_rt_submit_task(rt, ...);
+ *       PTO2_SCOPE(rt) { ... }  // nested inner scope
+ *   }
+ *   // scope end + orchestrator_done + runtime destroy all automatic
+ */
+#define _PTO2_ORCHESTRATION_IMPL(rt_var, guard_name, begin_info)  \
+    if ([[maybe_unused]] PTO2OrchestrationGuard guard_name(begin_info); \
+        PTO2Runtime* rt_var = guard_name.runtime()) \
+        PTO2_SCOPE(rt_var)
+
+#define PTO2_ORCHESTRATION(rt_var, begin_info) \
+    _PTO2_ORCHESTRATION_IMPL(rt_var, _PTO2_CONCATENATE(_pto2_orch_, __COUNTER__), begin_info)
+
 #endif // __cplusplus
 
 #endif // PTO_RUNTIME2_H

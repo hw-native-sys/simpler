@@ -6,13 +6,13 @@
  *   t1: d = c + 1     (func_id=1, kernel_add_scalar) [inner scope]
  *   t2: e = c + 2     (func_id=1, kernel_add_scalar) [inner scope]
  *   t3: g = d * e     (func_id=2, kernel_mul)        [inner scope]
- *   t4: f = g + c     (func_id=0, kernel_add)        [outer scope]
+ *   t4: f = g + c     (func_id=0, kernel_add)        [inner scope]
  *   Dependencies: t0->t1, t0->t2, t1->t3, t2->t3, t0->t4, t3->t4
  *
  * Nested scope demonstration:
- *   - Inner scope owns t1, t2, t3; intermediates d, e release on inner scope end
- *   - Outer scope owns t0, t4; c persists across inner scope for t4
- *   - g crosses scope boundary (produced in inner, consumed in outer)
+ *   - Inner scope owns t1, t2, t3, t4; intermediates d, e, g release on inner scope end
+ *   - Outer scope owns t0; c persists across inner scope for t1, t2, t4
+ *   - c flows from outer to inner scope (outer-scope tensors are visible to inner scopes)
  *
  * Compiled with PTO2 runtime sources for device execution.
  */
@@ -77,133 +77,91 @@ static uint64_t float_to_u64(float f) {
 
 extern "C" {
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
-    // Get shared memory header for proper access
-    PTO2SharedMemoryHeader* header = (PTO2SharedMemoryHeader*)sm_ptr;
+__attribute__((visibility("default")))
+void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
+    PTO2OrchestrationBeginInfo begin_info{
+        .sm_ptr             = sm_ptr,
+        .args               = args,
+        .arg_count          = arg_count,
+        .expected_arg_count = 7,
+        .task_window_size   = PTO2_TASK_WINDOW_SIZE,
+        .dep_list_pool_size = PTO2_DEP_LIST_POOL_SIZE,
+        .heap_size          = PTO2_HEAP_SIZE,
+        .gm_heap_ptr        = s_gm_heap_stub,
+    };
 
-    // Validate inputs
-    if (!sm_ptr || !args || arg_count < 7) {
-        if (header) {
-            header->orchestrator_done = 1;
-        }
-        return;
-    }
+    PTO2_ORCHESTRATION(rt, begin_info) {
+        // Outer scope: implicitly opened by PTO2_ORCHESTRATION macro; owns t0, t4
 
-    // Extract device pointers
-    void* arg_a_ptr = (void*)(uintptr_t)args[ARG_PTR_A];
-    void* arg_b_ptr = (void*)(uintptr_t)args[ARG_PTR_B];
-    void* arg_f_ptr = (void*)(uintptr_t)args[ARG_PTR_F];
-    size_t size_a = (size_t)args[ARG_SIZE_A];
-    size_t size_b = (size_t)args[ARG_SIZE_B];
-    size_t size_f = (size_t)args[ARG_SIZE_F];
-    int SIZE = (int)(args[ARG_SIZE] & 0x7FFFFFFF);
+        void* arg_a_ptr = (void*)(uintptr_t)args[ARG_PTR_A];
+        void* arg_b_ptr = (void*)(uintptr_t)args[ARG_PTR_B];
+        void* arg_f_ptr = (void*)(uintptr_t)args[ARG_PTR_F];
+        size_t size_a = (size_t)args[ARG_SIZE_A];
+        size_t size_b = (size_t)args[ARG_SIZE_B];
+        size_t size_f = (size_t)args[ARG_SIZE_F];
+        int SIZE = (int)(args[ARG_SIZE] & 0x7FFFFFFF);
 
-    printf("===============SIZE=%d\n", SIZE);
+        printf("===============SIZE=%d\n", SIZE);
 
-    size_t BYTES = (size_t)SIZE * sizeof(float);
+        size_t BYTES = (size_t)SIZE * sizeof(float);
 
-    // Create shared memory handle
-    int32_t sm_size = pto2_sm_calculate_size(PTO2_TASK_WINDOW_SIZE, PTO2_DEP_LIST_POOL_SIZE);
+        Tensor ext_a = make_tensor_external(arg_a_ptr, size_a);
+        Tensor ext_b = make_tensor_external(arg_b_ptr, size_b);
+        Tensor ext_f = make_tensor_external(arg_f_ptr, size_f);
 
-    PTO2SharedMemoryHandle* sm_handle =
-        pto2_sm_create_from_buffer(sm_ptr, sm_size, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE, PTO2_DEP_LIST_POOL_SIZE);
-    if (!sm_handle) {
-        header->orchestrator_done = 1;
-        return;
-    }
-
-    // Get GM heap: runtime_maker.cpp appends [gm_heap, heap_size] as last 2 args
-    // Use generic access: args[arg_count - 2] and args[arg_count - 1]
-    // Fall back to static buffer only for simulation (when not provided)
-    void* gm_heap = s_gm_heap_stub;
-    int32_t heap_size = (int32_t)sizeof(s_gm_heap_stub);
-    if (arg_count >= 2) {
-        uint64_t gm_heap_arg = args[arg_count - 2];
-        uint64_t heap_size_arg = args[arg_count - 1];
-        if (gm_heap_arg != 0 && heap_size_arg != 0) {
-            gm_heap = (void*)(uintptr_t)gm_heap_arg;
-            heap_size = (int32_t)(heap_size_arg & 0x7FFFFFFF);
-        }
-    }
-
-    // Create runtime
-    PTO2Runtime* rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size);
-    if (!rt) {
-        pto2_sm_destroy(sm_handle);
-        header->orchestrator_done = 1;
-        return;
-    }
-
-    int32_t tile = 0;
-    int32_t sz = (int32_t)BYTES;
-    if (sz <= 0) sz = (int32_t)size_a;
-
-    Tensor ext_td_a = make_tensor_external(arg_a_ptr, size_a);
-    Tensor ext_td_b = make_tensor_external(arg_b_ptr, size_b);
-    Tensor ext_td_f = make_tensor_external(arg_f_ptr, size_f);
-
-    // Nested scope demonstration:
-    // Outer scope owns t0 and t4; inner scope owns t1, t2, t3.
-    // When inner scope ends, intermediates d and e can be released.
-    // Tensor c persists in outer scope for t4. Tensor g crosses the boundary.
-    PTO2_SCOPE(rt) {
-        Tensor td_c = make_tensor(BYTES);  // c = a + b
-        Tensor td_g = make_tensor(BYTES);  // g = d * e (produced in inner, consumed here)
+        Tensor c = make_tensor(BYTES);  // c = a + b
 
         // t0: c = a + b (kernel_id=0, kernel_add) [outer scope]
         PTOParam params_t0[] = {
-            make_input_param(ext_td_a),
-            make_input_param(ext_td_b),
-            make_output_param(td_c),
+            make_input_param(ext_a),
+            make_input_param(ext_b),
+            make_output_param(c),
         };
         pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, "kernel_add", params_t0, 3);
 
+        // Inner scope: owns t1, t2, t3, t4; intermediates d, e, g release on scope end.
+        // c flows in from outer scope (outer-scope tensors are visible to inner scopes).
         PTO2_SCOPE(rt) {
-            Tensor td_d = make_tensor(BYTES);  // d = c + 1
-            Tensor td_e = make_tensor(BYTES);  // e = c + 2
+            Tensor d = make_tensor(BYTES);  // d = c + 1
+            Tensor e = make_tensor(BYTES);  // e = c + 2
+            Tensor g = make_tensor(BYTES);  // g = d * e
 
-            // t1: d = c + 1 (kernel_id=1, kernel_add_scalar) [inner scope]
+            // t1: d = c + 1 (kernel_id=1, kernel_add_scalar)
             PTOParam params_t1[] = {
-                make_input_param(td_c),
+                make_input_param(c),
                 make_scalar_param(float_to_u64(1.0f)),
-                make_output_param(td_d),
+                make_output_param(d),
                 make_scalar_param((uint64_t)3),
             };
             pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t1, 3);
 
-            // t2: e = c + 2 (kernel_id=1, kernel_add_scalar) [inner scope]
+            // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
             PTOParam params_t2[] = {
-                make_input_param(td_c),
+                make_input_param(c),
                 make_scalar_param(float_to_u64(2.0f)),
-                make_output_param(td_e),
+                make_output_param(e),
                 make_scalar_param((uint64_t)3),
             };
             pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, "kernel_add_scalar", params_t2, 3);
 
-            // t3: g = d * e (kernel_id=2, kernel_mul) [inner scope]
+            // t3: g = d * e (kernel_id=2, kernel_mul)
             PTOParam params_t3[] = {
-                make_input_param(td_d),
-                make_input_param(td_e),
-                make_output_param(td_g),
+                make_input_param(d),
+                make_input_param(e),
+                make_output_param(g),
                 make_scalar_param((uint64_t)3),
             };
             pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, "kernel_mul", params_t3, 3);
-        }  // inner scope ends: releases t1, t2, t3
 
-        // t4: f = g + c (kernel_id=0, kernel_add) [outer scope]
-        PTOParam params_t4[] = {
-            make_input_param(td_g),
-            make_input_param(td_c),
-            make_output_param(ext_td_f),
-        };
-        pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, "kernel_add", params_t4, 3);
-    }  // outer scope ends: releases t0, t4
-
-    pto2_rt_orchestration_done(rt);
-    pto2_runtime_destroy(rt);
-
-    // Signal orchestration complete
-    header->orchestrator_done = 1;
+            // t4: f = g + c (kernel_id=0, kernel_add)
+            PTOParam params_t4[] = {
+                make_input_param(g),
+                make_input_param(c),
+                make_output_param(ext_f),
+            };
+            pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, "kernel_add", params_t4, 3);
+        }  // inner scope ends: releases d, e, g
+    }
 }
 
 }  // extern "C"
