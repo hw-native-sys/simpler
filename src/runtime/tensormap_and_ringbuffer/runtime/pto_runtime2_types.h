@@ -282,7 +282,7 @@ typedef struct {
 
 
     PTOParam params[16];
-    TensorDescriptor tensor_copies[16];  // Owned tensor data (params[i].tensor points here)
+    Tensor tensor_copies[16];  // Owned tensor data (params[i].tensor points here)
     int param_count{0};
     
 } PTO2TaskDescriptor;

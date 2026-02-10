@@ -17,7 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
-#include "tensor_descriptor.h"
+#include "tensor.h"
 
 // =============================================================================
 // Initialization and Destruction
@@ -129,7 +129,7 @@ void pto2_tensormap_reset(PTO2TensorMap* tm) {
 // Hash Function
 // =============================================================================
 
-uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, TensorDescriptor* region) {
+uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, Tensor* tensor) {
     // ========================================================================
     // CRITICAL: Hash ONLY by base_ptr for correct overlap detection!
     // ========================================================================
@@ -147,7 +147,7 @@ uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, TensorDescriptor* region) {
     //   Region A: base=X, offset=0   → bucket 5
     //   Region B: base=X, offset=128 → bucket 5   (CORRECT! Same bucket)
     //
-    uint64_t key = (uint64_t)(uintptr_t)region->buffer.addr;
+    uint64_t key = (uint64_t)(uintptr_t)tensor->buffer.addr;
     
     // Improve distribution by mixing bits (pointers often have aligned low bits)
     key = key ^ (key >> 16);
@@ -170,7 +170,7 @@ void pto2_tensormap_remove_from_bucket(PTO2TensorMap* tm, PTO2TensorMapEntry* en
         return;  // Already removed
     }
     
-    uint32_t bucket = pto2_tensormap_hash(tm, &entry->region);
+    uint32_t bucket = pto2_tensormap_hash(tm, &entry->tensor);
     int32_t* prev_ptr = &tm->buckets[bucket];
     int32_t offset = *prev_ptr;
     int32_t target_offset = entry - tm->entry_pool;
@@ -214,8 +214,8 @@ void pto2_tensormap_cleanup_retired(PTO2TensorMap* tm,
 // Lookup with Chain Truncation
 // =============================================================================
 
-int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, TensorDescriptor* region) {
-    uint32_t bucket = pto2_tensormap_hash(tm, region);
+int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor) {
+    uint32_t bucket = pto2_tensormap_hash(tm, tensor);
     int32_t* prev_ptr = &tm->buckets[bucket];  // For truncation
     int32_t offset = *prev_ptr;
     
@@ -244,7 +244,7 @@ int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, TensorDescriptor* region) {
         // Entry is valid - check if regions OVERLAP (not just exact match)
         // Since we hash only by base_ptr, all entries in this bucket have
         // potential to overlap. We must check actual byte-range overlap.
-        if (region->is_overlap(entry->region)) {
+        if (tensor->is_overlap(entry->tensor)) {
             return entry->producer_task_id;  // FOUND (overlapping region)
         }
         
@@ -260,7 +260,7 @@ int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, TensorDescriptor* region) {
 // Insert
 // =============================================================================
 
-void pto2_tensormap_insert(PTO2TensorMap* tm, TensorDescriptor* region, 
+void pto2_tensormap_insert(PTO2TensorMap* tm, Tensor* tensor,
                             int32_t producer_task_id) {
     // Allocate entry from ring buffer pool
     int32_t entry_offset = tm->pool_head;
@@ -277,11 +277,11 @@ void pto2_tensormap_insert(PTO2TensorMap* tm, TensorDescriptor* region,
     }
     
     // Initialize new entry
-    entry->region = *region;
+    entry->tensor = *tensor;
     entry->producer_task_id = producer_task_id;
     
     // Insert at head of hash bucket (maintains task_id descending order)
-    uint32_t bucket = pto2_tensormap_hash(tm, region);
+    uint32_t bucket = pto2_tensormap_hash(tm, tensor);
     entry->next_in_bucket = tm->buckets[bucket];
     tm->buckets[bucket] = entry_offset;
     entry->in_bucket = true;

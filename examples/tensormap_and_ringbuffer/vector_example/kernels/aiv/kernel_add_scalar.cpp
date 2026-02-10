@@ -11,8 +11,8 @@
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
-#include <pto/common/constants.hpp>
-#include "tensor_descriptor.h"
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -36,10 +36,10 @@ using namespace pto;
  */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
     // Unpack arguments
-    __gm__ TensorDescriptor* src_tensor_descriptor = reinterpret_cast<__gm__ TensorDescriptor*>(args[0]);
-    __gm__ TensorDescriptor* out_tensor_descriptor = reinterpret_cast<__gm__ TensorDescriptor*>(args[2]);
-    __gm__ float* src = reinterpret_cast<__gm__ float*>(src_tensor_descriptor->buffer.addr);
-    __gm__ float* out = reinterpret_cast<__gm__ float*>(out_tensor_descriptor->buffer.addr);
+    __gm__ Tensor* src_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* out_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ float* src = reinterpret_cast<__gm__ float*>(src_tensor->buffer.addr);
+    __gm__ float* out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr);
     // __gm__ float* src = reinterpret_cast<__gm__ float*>(args[0]);
 
     // Convert scalar from uint64_t to float

@@ -34,7 +34,7 @@
 #define PTO_TENSORMAP_H
 
 #include "pto_runtime2_types.h"
-#include "tensor_descriptor.h"
+#include "tensor.h"
 
 // =============================================================================
 // TensorMap Structure
@@ -55,7 +55,7 @@
  * - When lookup hits stale entry, truncate rest of chain
  */
 typedef struct {
-    TensorDescriptor region;      // Tensor region key (legacy, for simple 1D)
+    Tensor tensor;      // Tensor descriptor key
     int32_t producer_task_id;     // Task that produces this region
     int32_t next_in_bucket;       // Offset to next entry in hash bucket (-1 = end)
     int32_t next_in_task;         // Offset to next entry for same task (-1 = end)
@@ -135,10 +135,10 @@ void pto2_tensormap_sync_validity(PTO2TensorMap* tm, int32_t last_task_alive);
  * the rest of the chain (all subsequent entries are also stale).
  * 
  * @param tm      TensorMap
- * @param region  Tensor region to look up
+ * @param tensor  Tensor to look up
  * @return Producer task ID, or -1 if not found
  */
-int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, TensorDescriptor* region);
+int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor);
 
 /**
  * Insert a new entry (called when task produces output)
@@ -147,10 +147,10 @@ int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, TensorDescriptor* region);
  * Inserts at head of hash bucket chain (maintains task_id ordering).
  * 
  * @param tm                TensorMap
- * @param region            Tensor region produced
+ * @param tensor            Tensor produced
  * @param producer_task_id  Task ID of producer
  */
-void pto2_tensormap_insert(PTO2TensorMap* tm, TensorDescriptor* region, 
+void pto2_tensormap_insert(PTO2TensorMap* tm, Tensor* tensor,
                             int32_t producer_task_id);
 
 /**
@@ -174,7 +174,7 @@ void pto2_tensormap_cleanup_retired(PTO2TensorMap* tm,
 /**
  * Compute hash for tensor region
  */
-uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, TensorDescriptor* region);
+uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, Tensor* tensor);
 
 /**
  * Check if entry is valid (producer has not retired)

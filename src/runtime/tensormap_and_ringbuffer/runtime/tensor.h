@@ -1,6 +1,10 @@
 
 #include <stdint.h>
 
+#ifndef NDEBUG
+#include <vector>
+#endif
+
 #include "common.h"
 #include "data_type.h"
 
@@ -12,7 +16,7 @@
  * Buffer Handle
  *
  * Represents a device memory buffer with address and total size in bytes.
- * This is the underlying memory allocation that a TensorDescriptor describes access patterns for.
+ * This is the underlying memory allocation that a Tensor describes access patterns for.
  */
 struct PTOBufferHandle {
     uint64_t addr;  // Device memory address (bytes)
@@ -65,10 +69,10 @@ static constexpr uint64_t RESHAPE_NEEDS_ALLOC = UINT64_MAX;
  *   - Outer dim (strides[0]=10, repeats[0]=3): repeat 3 times with stride 10 elements
  * Result: [addr+28..addr+48], [addr+68..addr+88], [addr+108..addr+128] (byte offsets)
  */
-struct TensorDescriptor {
+struct Tensor {
     class ContiguousMemSegIterator {
     public:
-        ContiguousMemSegIterator(const TensorDescriptor& tensor);
+        ContiguousMemSegIterator(const Tensor& tensor);
 
         void operator++();
         void operator++(int) { ++*this; }
@@ -78,23 +82,23 @@ struct TensorDescriptor {
         bool is_end() const { return indexes_[0] >= tensor_.repeats[0]; }
 
     private:
-        const TensorDescriptor& tensor_;
+        const Tensor& tensor_;
         Segment cur_seg;
         uint64_t indexes_[RUNTIME_MAX_TENSOR_DIMS];
     };
 
-    PTOBufferHandle buffer;                         // Underlying memory buffer (addr in bytes, size in bytes)
-    uint64_t start_offset;                          // Starting offset from buffer.addr, unit: elements
-    uint64_t strides[RUNTIME_MAX_TENSOR_DIMS];      // Stride for each dimension, unit: elements
-    uint64_t repeats[RUNTIME_MAX_TENSOR_DIMS];      // Repeat count for each dimension
-    uint64_t ndims;                                 // Number of dimensions used
-    DataType dtype;                                 // Data type of tensor elements
-    int32_t version;                                // tensor的版本
-    OverlapType overlap_type;                       // 判断覆盖的方式
+    PTOBufferHandle buffer;                     // Underlying memory buffer (addr in bytes, size in bytes)
+    uint64_t start_offset;                      // Starting offset from buffer.addr, unit: elements
+    uint64_t strides[RUNTIME_MAX_TENSOR_DIMS];  // Stride for each dimension, unit: elements
+    uint64_t repeats[RUNTIME_MAX_TENSOR_DIMS];  // Repeat count for each dimension
+    uint64_t ndims;                             // Number of dimensions used
+    DataType dtype;                             // Data type of tensor elements
+    int32_t version;                            // tensor的版本
+    OverlapType overlap_type;                   // 判断覆盖的方式
 
-    TensorDescriptor() : buffer{0, 0}, ndims(0), dtype(DataType::FLOAT32) {}
+    Tensor() : buffer{0, 0}, ndims(0), dtype(DataType::FLOAT32) {}
 
-    explicit TensorDescriptor(uint64_t addr,
+    explicit Tensor(uint64_t addr,
         uint64_t buffer_size_bytes,
         uint64_t start_offset,
         uint64_t strides[],
@@ -104,16 +108,16 @@ struct TensorDescriptor {
         int32_t version,
         OverlapType overlap_type = OverlapType::Accurate);
 
-    TensorDescriptor(TensorDescriptor&& other);
-    TensorDescriptor(const TensorDescriptor& other);
+    Tensor(Tensor&& other);
+    Tensor(const Tensor& other);
 
-    TensorDescriptor& operator=(const TensorDescriptor& other);
+    Tensor& operator=(const Tensor& other);
 
     std::string dump() const;
 
     bool is_valid_tensor() const;
 
-    TensorDescriptor& optimize();
+    Tensor& optimize();
 
     void resort_strides();
 
@@ -123,8 +127,8 @@ struct TensorDescriptor {
     bool validate_memory_access_preserved(
         uint64_t original_strides[], uint64_t original_repeats[], int32_t original_ndims) const;
 
-    void collect_all_offsets(
-        const uint64_t strides_arr[], const uint64_t repeats_arr[], int32_t dims, uint64_t offsets[]) const;
+    std::vector<uint64_t> collect_all_offsets(
+        const uint64_t strides_arr[], const uint64_t repeats_arr[], int32_t dims) const;
 #endif
 
     bool valid_view(const uint64_t shapes[], const uint64_t offsets[]) const;
@@ -133,40 +137,40 @@ struct TensorDescriptor {
 
     bool valid_transpose(uint64_t x, uint64_t y) const { return x < ndims && y < ndims; }
 
-    TensorDescriptor view(const uint64_t shapes[], const uint64_t offsets[]) const;
+    Tensor view(const uint64_t shapes[], const uint64_t offsets[]) const;
 
     bool is_contiguous() const;
 
     uint64_t numel() const;
 
-    TensorDescriptor reshape(const uint64_t shapes[], uint64_t new_ndims) const;
+    Tensor reshape(const uint64_t shapes[], uint64_t new_ndims) const;
 
-    TensorDescriptor transpose(uint64_t x, uint64_t y) const;
+    Tensor transpose(uint64_t x, uint64_t y) const;
 
     Segment get_fuzzy_seg() const;
 
-    bool is_same_memref(const TensorDescriptor& other) const { return buffer.addr == other.buffer.addr; }
+    bool is_same_memref(const Tensor& other) const { return buffer.addr == other.buffer.addr; }
 
-    bool is_same_strides(const TensorDescriptor& other) const;
+    bool is_same_strides(const Tensor& other) const;
 
     void offset_to_ndims(uint64_t offset_ndims[]) const;
 
     uint64_t offset_ndim_to_1d(const uint64_t offset_ndims[]) const;
 
-    bool is_overlap(const TensorDescriptor& pre_task_output) const;
+    bool is_overlap(const Tensor& pre_task_output) const;
 
-    bool complex_overlap(const TensorDescriptor& pre_task_output) const;
+    bool complex_overlap(const Tensor& pre_task_output) const;
 
     /**
-     * Create a 1D contiguous TensorDescriptor covering the entire buffer.
+     * Create a 1D contiguous Tensor covering the entire buffer.
      * strides={1}, repeats={size_elements}, ndims=1.
      */
-    static TensorDescriptor make_1d_contiguous(uint64_t addr, int32_t size_bytes,
-            int32_t version = 0, DataType dtype = DataType::FLOAT32) {
+    static Tensor make_1d_contiguous(
+        uint64_t addr, int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
         uint64_t size_elements = size_bytes / get_element_size(dtype);
         uint64_t strides[] = {1};
         uint64_t repeats[] = {size_elements};
-        return TensorDescriptor(addr, size_bytes, 0, strides, repeats, 1, dtype, version);
+        return Tensor(addr, size_bytes, 0, strides, repeats, 1, dtype, version);
     }
 };
 
@@ -175,18 +179,18 @@ struct TensorDescriptor {
 // =============================================================================
 
 /**
- * Create a TensorDescriptor for pre-allocated external memory.
+ * Create a Tensor for pre-allocated external memory.
  */
-static inline TensorDescriptor make_tensor_external(void* addr, int32_t size_bytes,
-        int32_t version = 0, DataType dtype = DataType::FLOAT32) {
-    return TensorDescriptor::make_1d_contiguous(reinterpret_cast<uint64_t>(addr), size_bytes, version, dtype);
+static inline Tensor make_tensor_external(
+    void* addr, int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
+    return Tensor::make_1d_contiguous(reinterpret_cast<uint64_t>(addr), size_bytes, version, dtype);
 }
 
 /**
- * Create a TensorDescriptor for runtime-allocated output (addr=0).
+ * Create a Tensor for runtime-allocated output (addr=0).
  * The runtime fills in the actual address during pto2_submit_task.
  */
-static inline TensorDescriptor make_tensor(int32_t size_bytes,
-        int32_t version = 0, DataType dtype = DataType::FLOAT32) {
-    return TensorDescriptor::make_1d_contiguous(0, size_bytes, version, dtype);
+static inline Tensor make_tensor(
+    int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
+    return Tensor::make_1d_contiguous(0, size_bytes, version, dtype);
 }

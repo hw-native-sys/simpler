@@ -11,12 +11,11 @@
  * Compiled with PTO2 runtime sources for device execution.
  */
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 #include "pto_runtime2.h"
 #include "pto_shared_memory.h"
-
 
 // =============================================================================
 // Args layout (from code_runner.py + runtime_maker.cpp extension):
@@ -32,17 +31,17 @@
 // =============================================================================
 
 // Tensor device pointers (order from code_runner.py: inputs, outputs)
-#define ARG_PTR_A      0
-#define ARG_PTR_B      1
-#define ARG_PTR_F      2   // output
+#define ARG_PTR_A 0
+#define ARG_PTR_B 1
+#define ARG_PTR_F 2  // output
 
 // Tensor sizes (same order as pointers)
-#define ARG_SIZE_A     3
-#define ARG_SIZE_B     4
-#define ARG_SIZE_F     5
+#define ARG_SIZE_A 3
+#define ARG_SIZE_B 4
+#define ARG_SIZE_F 5
 
 // Element count (scalar)
-#define ARG_SIZE       6
+#define ARG_SIZE 6
 
 // gm_heap and heap_size are ALWAYS the last 2 args (generic, not hardcoded index)
 
@@ -72,8 +71,7 @@ static uint64_t float_to_u64(float f) {
 
 extern "C" {
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     // Get shared memory header for proper access
     PTO2SharedMemoryHeader* header = (PTO2SharedMemoryHeader*)sm_ptr;
 
@@ -101,13 +99,8 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     // Create shared memory handle
     int32_t sm_size = pto2_sm_calculate_size(PTO2_TASK_WINDOW_SIZE, PTO2_DEP_LIST_POOL_SIZE);
 
-    PTO2SharedMemoryHandle* sm_handle = pto2_sm_create_from_buffer(
-        sm_ptr,
-        sm_size,
-        PTO2_TASK_WINDOW_SIZE,
-        PTO2_HEAP_SIZE,
-        PTO2_DEP_LIST_POOL_SIZE
-    );
+    PTO2SharedMemoryHandle* sm_handle =
+        pto2_sm_create_from_buffer(sm_ptr, sm_size, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE, PTO2_DEP_LIST_POOL_SIZE);
     if (!sm_handle) {
         header->orchestrator_done = 1;
         return;
@@ -128,12 +121,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     }
 
     // Create runtime
-    PTO2Runtime* rt = pto2_runtime_create_from_sm(
-        PTO2_MODE_EXECUTE,
-        sm_handle,
-        gm_heap,
-        heap_size
-    );
+    PTO2Runtime* rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size);
     if (!rt) {
         pto2_sm_destroy(sm_handle);
         header->orchestrator_done = 1;
@@ -144,12 +132,12 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
     int32_t sz = (int32_t)BYTES;
     if (sz <= 0) sz = (int32_t)size_a;
 
-    TensorDescriptor ext_td_a = make_tensor_external(arg_a_ptr, size_a);
-    TensorDescriptor ext_td_b = make_tensor_external(arg_b_ptr, size_b);
-    TensorDescriptor ext_td_f = make_tensor_external(arg_f_ptr, size_f);
-    TensorDescriptor td_c = make_tensor(BYTES);  // c = a + b
-    TensorDescriptor td_d = make_tensor(BYTES);  // d = c + 1
-    TensorDescriptor td_e = make_tensor(BYTES);  // e = c + 2
+    Tensor ext_td_a = make_tensor_external(arg_a_ptr, size_a);
+    Tensor ext_td_b = make_tensor_external(arg_b_ptr, size_b);
+    Tensor ext_td_f = make_tensor_external(arg_f_ptr, size_f);
+    Tensor td_c = make_tensor(BYTES);  // c = a + b
+    Tensor td_d = make_tensor(BYTES);  // d = c + 1
+    Tensor td_e = make_tensor(BYTES);  // e = c + 2
 
     // Use RAII scope guard for automatic scope management.
     // PTO2_SCOPE creates a scoped block where pto2_rt_scope_begin() is called
@@ -191,7 +179,7 @@ void aicpu_orchestration_entry(void* sm_ptr, uint64_t* args, int arg_count) {
             make_scalar_param((uint64_t)3),
         };
         pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, "kernel_mul", params_t3, 3);
-    } // PTO2_SCOPE ends here - automatic pto2_rt_scope_end() called
+    }  // PTO2_SCOPE ends here - automatic pto2_rt_scope_end() called
 
     pto2_rt_orchestration_done(rt);
     pto2_runtime_destroy(rt);
