@@ -48,9 +48,15 @@ typedef struct {
     int32_t         tensormap_last_cleanup;  // Last cleanup threshold
     
     // === SCOPE STACK (Private) ===
-    int32_t*        scope_stack;    // Stack of scope begin positions
-    int32_t         scope_stack_top;// Current top of stack (-1 = empty)
-    int32_t         scope_stack_capacity;
+    // Single contiguous buffer of task IDs, partitioned by scope level.
+    // scope_begins[i] is the index into scope_tasks where scope i starts.
+    // Tasks for the top scope occupy [scope_begins[top], scope_tasks_size).
+    int32_t*  scope_tasks;           // Flat buffer of task IDs (all scopes concatenated)
+    int32_t   scope_tasks_size;      // Number of task IDs currently in the buffer
+    int32_t   scope_tasks_capacity;  // Allocated capacity of scope_tasks
+    int32_t*  scope_begins;          // scope_begins[i] = start index of scope i in scope_tasks
+    int32_t   scope_stack_top;       // Current top of stack (-1 = no scope open)
+    int32_t   scope_stack_capacity;  // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
     
     // === SCHEDULER REFERENCE ===
     // Note: In simulated mode, orchestrator and scheduler share address space
@@ -66,7 +72,6 @@ typedef struct {
     int64_t         tasks_submitted;
     int64_t         buffers_allocated;
     int64_t         bytes_allocated;
-    int64_t         scope_depth_max;
     
 } PTO2OrchestratorState;
 
@@ -122,29 +127,21 @@ void pto2_orchestrator_set_scheduler_mode(PTO2OrchestratorState* orch,
 
 /**
  * Begin a new scope
- * 
- * Pushes current task index to scope stack.
- * All buffers allocated within this scope will have their fanout_count
- * initialized to include this scope reference.
+ *
+ * Pushes a new empty task list onto the scope stack.
+ * Tasks submitted while this scope is at the top of the stack are
+ * owned by it and have their fanout_count initialized to 1.
  */
 void pto2_scope_begin(PTO2OrchestratorState* orch);
 
 /**
  * End current scope
- * 
- * Pops scope stack and increments fanout_refcount for all tasks
- * in [scope_begin_pos, current_task_index).
+ *
+ * Pops the top scope and increments fanout_refcount for each task
+ * directly owned by that scope.
  * May trigger buffer release for tasks that are now fully consumed.
  */
 void pto2_scope_end(PTO2OrchestratorState* orch);
-
-/**
- * Get current scope depth
- * @return Current nesting depth (0 = global scope)
- */
-static inline int32_t pto2_get_scope_depth(PTO2OrchestratorState* orch) {
-    return orch->scope_stack_top + 1;
-}
 
 // =============================================================================
 // Task Submission

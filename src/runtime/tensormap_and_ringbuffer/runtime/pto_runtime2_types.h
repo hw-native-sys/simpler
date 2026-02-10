@@ -47,6 +47,7 @@
 
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH      64      // Maximum nesting depth
+#define PTO2_SCOPE_TASKS_INIT_CAP 256     // Initial capacity for scope task buffer
 
 // Ready queue
 #define PTO2_READY_QUEUE_SIZE     65536   // Per-worker-type queue size (16x larger to avoid queue full)
@@ -255,8 +256,6 @@ typedef struct {
     int32_t task_id;              // Unique task identifier (absolute, not wrapped)
     int32_t kernel_id;            // InCore function to execute
     int32_t worker_type;          // Target: CUBE, VECTOR, AI_CPU, ACCELERATOR
-    int32_t scope_depth;          // Depth of scope when task was created
-    
     // Dependency lists (linked list heads - offsets into DepListPool)
     // Fanin: producers this task depends on (set once at submission)
     int32_t fanin_head;           // Offset to first fanin entry (0 = empty)
@@ -266,7 +265,7 @@ typedef struct {
     // PROTECTED BY fanout_lock
     volatile int32_t fanout_lock; // Per-task spinlock (0=unlocked, 1=locked)
     volatile int32_t fanout_head; // Offset to first fanout entry (0 = empty)
-    volatile int32_t fanout_count;// Total consumers + scope_depth (for lifecycle)
+    volatile int32_t fanout_count;// 1 (owning scope) + number of consumers
     
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap

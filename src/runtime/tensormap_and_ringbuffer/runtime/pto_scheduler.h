@@ -230,16 +230,16 @@ void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id)
 
 /**
  * Handle scope end (called when orchestrator ends a scope)
- * 
- * Increments fanout_refcount for all tasks in [begin_pos, end_pos).
+ *
+ * Increments fanout_refcount for each task in the provided list.
  * May transition some tasks to CONSUMED.
- * 
+ *
  * @param sched     Scheduler state
- * @param begin_pos First task in scope (absolute ID)
- * @param end_pos   One past last task in scope (absolute ID)
+ * @param task_ids  Array of task IDs owned by the ending scope
+ * @param count     Number of task IDs in the array
  */
-void pto2_scheduler_on_scope_end(PTO2SchedulerState* sched, 
-                                  int32_t begin_pos, int32_t end_pos);
+void pto2_scheduler_on_scope_end(PTO2SchedulerState* sched,
+                                  const int32_t* task_ids, int32_t count);
 
 /**
  * Increment fanout_refcount and check CONSUMED

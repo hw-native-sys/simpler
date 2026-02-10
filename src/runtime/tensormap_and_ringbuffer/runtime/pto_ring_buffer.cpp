@@ -174,7 +174,7 @@ void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
     ring->last_alive_ptr = last_alive_ptr;
 }
 
-// Flow control spin limit - if exceeded, likely deadlock due to scope_depth/fanout_count
+// Flow control spin limit - if exceeded, likely deadlock due to scope/fanout_count
 #define PTO2_FLOW_CONTROL_SPIN_LIMIT  100000
 
 int32_t pto2_task_ring_alloc(PTO2TaskRing* ring) {
@@ -233,7 +233,7 @@ int32_t pto2_task_ring_alloc(PTO2TaskRing* ring) {
             fprintf(stderr, "\n");
             fprintf(stderr, "Root Cause:\n");
             fprintf(stderr, "  Tasks cannot transition to CONSUMED state because:\n");
-            fprintf(stderr, "  - fanout_count is initialized to scope_depth\n");
+            fprintf(stderr, "  - fanout_count includes 1 for the owning scope\n");
             fprintf(stderr, "  - scope_end() requires orchestrator to continue\n");
             fprintf(stderr, "  - But orchestrator is blocked waiting for task ring space\n");
             fprintf(stderr, "  This creates a circular dependency (deadlock).\n");

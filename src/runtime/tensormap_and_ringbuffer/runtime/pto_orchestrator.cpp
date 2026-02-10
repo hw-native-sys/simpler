@@ -8,6 +8,7 @@
 
 #include "pto_orchestrator.h"
 
+#include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -62,14 +63,21 @@ bool pto2_orchestrator_init(
     }
     orch->tensormap_last_cleanup = 0;
 
-    // Initialize scope stack
-    orch->scope_stack = (int32_t*)malloc(PTO2_MAX_SCOPE_DEPTH * sizeof(int32_t));
-    if (!orch->scope_stack) {
+    // Initialize scope stack: one flat buffer for task IDs + one array for begin offsets
+    int32_t max_depth = PTO2_MAX_SCOPE_DEPTH;
+    int32_t init_cap = PTO2_SCOPE_TASKS_INIT_CAP;
+    orch->scope_tasks = (int32_t*)malloc(init_cap * sizeof(int32_t));
+    orch->scope_begins = (int32_t*)malloc(max_depth * sizeof(int32_t));
+    if (!orch->scope_tasks || !orch->scope_begins) {
+        free(orch->scope_tasks);
+        free(orch->scope_begins);
         pto2_tensormap_destroy(&orch->tensor_map);
         return false;
     }
+    orch->scope_tasks_size = 0;
+    orch->scope_tasks_capacity = init_cap;
     orch->scope_stack_top = -1;
-    orch->scope_stack_capacity = PTO2_MAX_SCOPE_DEPTH;
+    orch->scope_stack_capacity = max_depth;
 
     return true;
 }
@@ -77,10 +85,10 @@ bool pto2_orchestrator_init(
 void pto2_orchestrator_destroy(PTO2OrchestratorState* orch) {
     pto2_tensormap_destroy(&orch->tensor_map);
 
-    if (orch->scope_stack) {
-        free(orch->scope_stack);
-        orch->scope_stack = NULL;
-    }
+    free(orch->scope_tasks);
+    orch->scope_tasks = NULL;
+    free(orch->scope_begins);
+    orch->scope_begins = NULL;
 }
 
 void pto2_orchestrator_reset(PTO2OrchestratorState* orch) {
@@ -91,11 +99,11 @@ void pto2_orchestrator_reset(PTO2OrchestratorState* orch) {
 
     orch->tensormap_last_cleanup = 0;
     orch->scope_stack_top = -1;
+    orch->scope_tasks_size = 0;
 
     orch->tasks_submitted = 0;
     orch->buffers_allocated = 0;
     orch->bytes_allocated = 0;
-    orch->scope_depth_max = 0;
 
     // Reset shared memory header
     orch->sm_handle->header->current_task_index = 0;
@@ -118,41 +126,36 @@ void pto2_orchestrator_set_scheduler_mode(
 // Scope Management
 // =============================================================================
 
+static void scope_tasks_push(PTO2OrchestratorState* orch, int32_t task_id) {
+    if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
+        int32_t new_cap = orch->scope_tasks_capacity * 2;
+        int32_t* new_buf = (int32_t*)realloc(orch->scope_tasks, new_cap * sizeof(int32_t));
+        assert(new_buf && "Failed to grow scope task buffer");
+        orch->scope_tasks = new_buf;
+        orch->scope_tasks_capacity = new_cap;
+    }
+    orch->scope_tasks[orch->scope_tasks_size++] = task_id;
+}
+
 void pto2_scope_begin(PTO2OrchestratorState* orch) {
-    // Check for stack overflow
-    if (orch->scope_stack_top >= orch->scope_stack_capacity - 1) {
-        fprintf(stderr, "ERROR: Scope stack overflow\n");
-        return;
-    }
+    assert(orch->scope_stack_top < orch->scope_stack_capacity - 1 && "Scope stack overflow");
 
-    // Push current task index to scope stack
-    int32_t current_pos = orch->task_ring.current_index;
-    orch->scope_stack[++orch->scope_stack_top] = current_pos;
-
-    // Update max depth tracking
-    int32_t depth = orch->scope_stack_top + 1;
-    if (depth > orch->scope_depth_max) {
-        orch->scope_depth_max = depth;
-    }
+    ++orch->scope_stack_top;
+    orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
 }
 
 void pto2_scope_end(PTO2OrchestratorState* orch) {
-    // Check for stack underflow
-    if (orch->scope_stack_top < 0) {
-        fprintf(stderr, "ERROR: Scope stack underflow\n");
-        return;
+    assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
+
+    int32_t begin = orch->scope_begins[orch->scope_stack_top--];
+    int32_t count = orch->scope_tasks_size - begin;
+
+    if (orch->scheduler && count > 0) {
+        pto2_scheduler_on_scope_end(orch->scheduler, &orch->scope_tasks[begin], count);
     }
 
-    // Pop scope stack to get begin position
-    int32_t scope_begin_pos = orch->scope_stack[orch->scope_stack_top--];
-    int32_t scope_end_pos = orch->task_ring.current_index;
-
-    // Notify scheduler to release scope references
-    // In simulated mode, we can call scheduler directly
-    if (orch->scheduler) {
-        pto2_scheduler_on_scope_end(orch->scheduler, scope_begin_pos, scope_end_pos);
-    }
-    // In real mode, scope_end would be communicated via shared memory or message
+    // Rewind the task buffer — these entries are no longer needed
+    orch->scope_tasks_size = begin;
 }
 
 // =============================================================================
@@ -231,6 +234,9 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
     pto2_orchestrator_sync_tensormap(orch);
 
+    // Submission without an open scope is illegal
+    assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
+
     // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
     int32_t task_id = pto2_task_ring_alloc(&orch->task_ring);
 
@@ -240,23 +246,20 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     task->task_id = task_id;
     task->kernel_id = kernel_id;
     task->worker_type = worker_type;
-    task->scope_depth = pto2_get_scope_depth(orch);
     task->func_name = func_name;
     task->fanin_head = 0;
     task->fanin_count = 0;
     task->fanout_head = 0;
     task->fanout_lock = 0;
-    // Initial fanout_count = scope_depth (number of enclosing scopes that reference this task)
-    // WARNING: If task_window_size is too small, this can cause deadlock:
-    //   - Orchestrator waits for task ring space (flow control)
-    //   - scope_end() needs orchestrator to continue execution
-    //   - Tasks can't become CONSUMED without scope_end releasing references
-    // Solution: Increase task_window_size to accommodate all tasks in scope
-    task->fanout_count = task->scope_depth;
+    // Initial fanout_count = 1 (the owning scope holds one reference)
+    task->fanout_count = 1;
     task->packed_buffer_base = NULL;
     task->packed_buffer_end = NULL;
     task->num_outputs = 0;
     task->is_active = true;
+
+    // Register this task in its owning scope
+    scope_tasks_push(orch, task_id);
 
     // Temporary storage for collecting output sizes
     int32_t total_output_size = 0;
@@ -433,8 +436,7 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
     printf("Tasks submitted:     %lld\n", (long long)orch->tasks_submitted);
     printf("Buffers allocated:   %lld\n", (long long)orch->buffers_allocated);
     printf("Bytes allocated:     %lld\n", (long long)orch->bytes_allocated);
-    printf("Max scope depth:     %lld\n", (long long)orch->scope_depth_max);
-    printf("Current scope depth: %d\n", pto2_get_scope_depth(orch));
+    printf("Current scope depth: %d\n", orch->scope_stack_top + 1);
     printf("Task ring active:    %d\n", pto2_task_ring_active_count(&orch->task_ring));
     printf("Heap ring used:      %d / %d\n", orch->heap_ring.top, orch->heap_ring.size);
     printf("Dep pool used:       %d / %d\n", pto2_dep_pool_used(&orch->dep_pool), orch->dep_pool.capacity);
@@ -444,10 +446,12 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
 
 void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
     printf("=== Scope Stack ===\n");
-    printf("Depth: %d\n", pto2_get_scope_depth(orch));
+    printf("Depth: %d\n", orch->scope_stack_top + 1);
 
     for (int i = 0; i <= orch->scope_stack_top; i++) {
-        printf("  [%d] begin_pos = %d\n", i, orch->scope_stack[i]);
+        int32_t begin = orch->scope_begins[i];
+        int32_t end = (i < orch->scope_stack_top) ? orch->scope_begins[i + 1] : orch->scope_tasks_size;
+        printf("  [%d] tasks_owned = %d\n", i, end - begin);
     }
 
     printf("==================\n");

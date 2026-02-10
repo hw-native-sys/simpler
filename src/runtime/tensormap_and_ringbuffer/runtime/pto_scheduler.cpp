@@ -317,10 +317,10 @@ void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id)
     check_and_handle_consumed(sched, task_id, task);
 }
 
-void pto2_scheduler_on_scope_end(PTO2SchedulerState* sched, 
-                                  int32_t begin_pos, int32_t end_pos) {
-    for (int32_t task_id = begin_pos; task_id < end_pos; task_id++) {
-        pto2_scheduler_release_producer(sched, task_id);
+void pto2_scheduler_on_scope_end(PTO2SchedulerState* sched,
+                                  const int32_t* task_ids, int32_t count) {
+    for (int32_t i = 0; i < count; i++) {
+        pto2_scheduler_release_producer(sched, task_ids[i]);
     }
 }
 
