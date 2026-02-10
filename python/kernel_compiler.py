@@ -9,7 +9,7 @@ from typing import List, Optional
 
 from bindings import get_incore_compiler, get_orchestration_compiler
 from toolchain import (
-    ToolchainType, CCECToolchain, Gxx15Toolchain, GxxToolchain, Aarch64GxxToolchain,
+    Toolchain, ToolchainType, CCECToolchain, Gxx15Toolchain, GxxToolchain, Aarch64GxxToolchain,
 )
 import env_manager
 
@@ -259,7 +259,7 @@ class KernelCompiler:
         output_path = self._make_temp_path(prefix="incore_", suffix=".o")
 
         # Build command from toolchain
-        cmd = [self.ccec.compiler_path] + self.ccec.get_compile_flags(core_type=core_type)
+        cmd = [self.ccec.cxx_path] + self.ccec.get_compile_flags(core_type=core_type)
         cmd.extend([f"-I{pto_include}", f"-I{pto_pto_include}"])
 
         if extra_include_dirs:
@@ -275,7 +275,7 @@ class KernelCompiler:
 
         return self._compile_to_bytes(
             cmd, output_path, "Incore",
-            error_hint=f"ccec compiler not found at {self.ccec.compiler_path}"
+            error_hint=f"ccec compiler not found at {self.ccec.cxx_path}"
         )
 
     def compile_orchestration(
@@ -308,55 +308,51 @@ class KernelCompiler:
         if extra_include_dirs:
             include_dirs = include_dirs + list(extra_include_dirs)
 
-        if runtime_name == "host_build_graph":
+        # Resolve toolchain: HOST_GXX needs no runtime-specific extras
+        toolchain_type = self._get_toolchain(
+            get_orchestration_compiler,
+            {"a2a3": ToolchainType.AARCH64_GXX, "a2a3sim": ToolchainType.HOST_GXX}
+        )
+        toolchain = self.aarch64 if toolchain_type == ToolchainType.AARCH64_GXX else self.host_gxx
+
+        if toolchain_type == ToolchainType.HOST_GXX:
             return self._compile_orchestration_shared_lib(
-                source_path,
-                extra_include_dirs=include_dirs,
+                source_path, toolchain, extra_include_dirs=include_dirs,
             )
 
+        # AARCH64_GXX (a2a3 only): runtime-specific extras for cross-compilation
         if runtime_name == "tensormap_and_ringbuffer":
-            extra_sources = None
-            extra_link_flags = None
-            if self.platform == "a2a3":
-                runtime_dir = (
-                    self.project_root / "src" / "runtime"
-                    / runtime_name / "runtime"
-                )
-                extra_sources = sorted(
-                    str(p) for p in runtime_dir.glob("*.cpp")
-                    if p.name != "runtime.cpp"
-                )
-                extra_link_flags = self.aarch64.get_device_link_flags()
+            runtime_dir = (
+                self.project_root / "src" / "runtime"
+                / runtime_name / "runtime"
+            )
+            extra_sources = sorted(
+                str(p) for p in runtime_dir.glob("*.cpp")
+                if p.name != "runtime.cpp"
+            )
             return self._compile_orchestration_shared_lib(
-                source_path,
+                source_path, toolchain,
                 extra_include_dirs=include_dirs,
                 extra_sources=extra_sources,
-                extra_link_flags=extra_link_flags,
             )
 
         if runtime_name == "aicpu_build_graph":
-            extra_cxxflags = None
-            if self.platform == "a2a3":
-                extra_cxxflags = self.aarch64.get_aicpu_plugin_flags()
-                include_dirs.extend(self.aarch64.get_aicpu_include_flags())
             return self._compile_orchestration_shared_lib(
-                source_path,
+                source_path, toolchain,
                 extra_include_dirs=include_dirs,
-                extra_cxxflags=extra_cxxflags,
             )
 
         raise ValueError(
-            f"Unknown runtime: {runtime_name}. "
+            f"Unknown runtime for AARCH64_GXX: {runtime_name}. "
             f"Supported: host_build_graph, tensormap_and_ringbuffer, aicpu_build_graph"
         )
 
     def _compile_orchestration_shared_lib(
         self,
         source_path: str,
+        toolchain: Toolchain,
         extra_include_dirs: Optional[List[str]] = None,
         extra_sources: Optional[List[str]] = None,
-        extra_link_flags: Optional[List[str]] = None,
-        extra_cxxflags: Optional[List[str]] = None,
     ) -> bytes:
         """Compile an orchestration function to a shared library (.so).
 
@@ -364,11 +360,9 @@ class KernelCompiler:
 
         Args:
             source_path: Path to orchestration source file (.cpp)
+            toolchain: Resolved toolchain object (GxxToolchain or Aarch64GxxToolchain)
             extra_include_dirs: Additional include directories
             extra_sources: Additional source files to compile into the SO
-            extra_link_flags: Additional linker flags
-            extra_cxxflags: Additional C++ compiler flags (appended after
-                base flags, so can override e.g. -std=c++17)
 
         Returns:
             Binary contents of the compiled .so file
@@ -380,24 +374,7 @@ class KernelCompiler:
         # Generate output path
         output_path = self._make_temp_path(prefix="orch_", suffix=".so")
 
-        orch_toolchain_type = self._get_toolchain(
-            get_orchestration_compiler,
-            {"a2a3": ToolchainType.AARCH64_GXX, "a2a3sim": ToolchainType.HOST_GXX}
-        )
-
-        # Select toolchain object
-        if orch_toolchain_type == ToolchainType.AARCH64_GXX:
-            toolchain = self.aarch64
-        else:
-            toolchain = self.host_gxx
-
-        cmd = [toolchain.compiler_path] + toolchain.get_compile_flags()
-
-        if extra_cxxflags:
-            cmd.extend(extra_cxxflags)
-
-        if extra_link_flags:
-            cmd.extend(extra_link_flags)
+        cmd = [toolchain.cxx_path] + toolchain.get_compile_flags()
 
         if extra_sources:
             for src in extra_sources:
@@ -416,9 +393,6 @@ class KernelCompiler:
             for inc_dir in extra_include_dirs:
                 cmd.append(f"-I{os.path.abspath(inc_dir)}")
 
-        # Add toolchain-level includes (e.g. Ascend SDK)
-        cmd.extend(toolchain.get_include_flags())
-
         # Output and input
         cmd.extend(["-o", output_path, source_path])
 
@@ -428,7 +402,7 @@ class KernelCompiler:
 
         return self._compile_to_bytes(
             cmd, output_path, "Orchestration",
-            error_hint=f"{toolchain.compiler_path} not found. Please install it."
+            error_hint=f"{toolchain.cxx_path} not found. Please install it."
         )
 
     def _compile_incore_sim(
@@ -461,7 +435,7 @@ class KernelCompiler:
         output_path = self._make_temp_path(prefix="sim_kernel_", suffix=ext)
 
         # Build command from toolchain
-        cmd = [self.gxx15.compiler_path] + self.gxx15.get_compile_flags()
+        cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags()
 
         # Add PTO ISA header paths if provided
         if pto_isa_root:
@@ -482,5 +456,5 @@ class KernelCompiler:
 
         return self._compile_to_bytes(
             cmd, output_path, "SimKernel",
-            error_hint=f"{self.gxx15.compiler_path} not found. Please install g++-15."
+            error_hint=f"{self.gxx15.cxx_path} not found. Please install g++-15."
         )

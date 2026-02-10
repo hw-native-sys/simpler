@@ -41,21 +41,17 @@ class Toolchain:
         """Return compiler-specific CMake -D arguments."""
         raise NotImplementedError
 
-    def get_include_flags(self) -> List[str]:
-        """Return -I flags this toolchain always contributes (e.g. Ascend SDK)."""
-        return []
-
 
 class CCECToolchain(Toolchain):
     """Ascend ccec compiler for AICore kernels."""
 
     def __init__(self):
         super().__init__()
-        self.compiler_path = os.path.join(self.ascend_home_path, "bin", "ccec")
+        self.cxx_path = os.path.join(self.ascend_home_path, "bin", "ccec")
         self.linker_path = os.path.join(self.ascend_home_path, "bin", "ld.lld")
-        if not os.path.isfile(self.compiler_path):
+        if not os.path.isfile(self.cxx_path):
             raise FileNotFoundError(
-                f"ccec compiler not found: {self.compiler_path}"
+                f"ccec compiler not found: {self.cxx_path}"
             )
         if not os.path.isfile(self.linker_path):
             raise FileNotFoundError(
@@ -81,7 +77,7 @@ class CCECToolchain(Toolchain):
 
     def get_cmake_args(self) -> List[str]:
         return [
-            f"-DBISHENG_CC={self.compiler_path}",
+            f"-DBISHENG_CC={self.cxx_path}",
             f"-DBISHENG_LD={self.linker_path}",
         ]
 
@@ -91,7 +87,7 @@ class Gxx15Toolchain(Toolchain):
 
     def __init__(self):
         super().__init__()
-        self.compiler_path = "g++-15"
+        self.cxx_path = "g++-15"
 
     def get_compile_flags(self, **kwargs) -> List[str]:
         return [
@@ -117,7 +113,7 @@ class GxxToolchain(Toolchain):
 
     def __init__(self):
         super().__init__()
-        self.compiler_path = "g++"
+        self.cxx_path = "g++"
 
     def get_compile_flags(self, **kwargs) -> List[str]:
         return ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
@@ -130,11 +126,6 @@ class GxxToolchain(Toolchain):
         if self.ascend_home_path:
             args.append(f"-DASCEND_HOME_PATH={self.ascend_home_path}")
         return args
-
-    def get_include_flags(self) -> List[str]:
-        if self.ascend_home_path:
-            return [f"-I{os.path.join(self.ascend_home_path, 'include')}"]
-        return []
 
 
 class Aarch64GxxToolchain(Toolchain):
@@ -150,7 +141,6 @@ class Aarch64GxxToolchain(Toolchain):
             self.ascend_home_path, "tools", "hcc", "bin",
             "aarch64-target-linux-gnu-gcc",
         )
-        self.compiler_path = self.cxx_path
         if not os.path.isfile(self.cc_path):
             raise FileNotFoundError(
                 f"aarch64 C compiler not found: {self.cc_path}"
@@ -163,31 +153,9 @@ class Aarch64GxxToolchain(Toolchain):
     def get_compile_flags(self, **kwargs) -> List[str]:
         return ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
 
-    def get_device_link_flags(self) -> List[str]:
-        """Extra flags for device-side orchestration (symbol export for dlsym)."""
-        return ["-Wl,--export-dynamic"]
-
     def get_cmake_args(self) -> List[str]:
         return [
             f"-DCMAKE_C_COMPILER={self.cc_path}",
             f"-DCMAKE_CXX_COMPILER={self.cxx_path}",
             f"-DASCEND_HOME_PATH={self.ascend_home_path}",
-        ]
-
-    def get_include_flags(self) -> List[str]:
-        return [f"-I{os.path.join(self.ascend_home_path, 'include')}"]
-
-    def get_aicpu_plugin_flags(self) -> List[str]:
-        """Extra flags for AICPU orchestration plugin (GNU extensions + static linking)."""
-        return ["-std=gnu++17", "-static-libstdc++", "-static-libgcc"]
-
-    def get_aicpu_include_flags(self) -> List[str]:
-        """Ascend SDK include paths needed by AICPU plugin compilation."""
-        ascend = self.ascend_home_path
-        if not ascend:
-            return []
-        return [
-            f"-I{os.path.join(ascend, 'include')}",
-            f"-I{os.path.join(ascend, 'include', 'toolchain')}",
-            f"-I{os.path.join(ascend, 'pkg_inc', 'base')}",
         ]
