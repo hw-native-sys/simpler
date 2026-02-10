@@ -58,7 +58,9 @@ typedef struct {
     Tensor tensor;      // Tensor descriptor key
     int32_t producer_task_id;     // Task that produces this region
     int32_t next_in_bucket;       // Offset to next entry in hash bucket (-1 = end)
+    int32_t prev_in_bucket;       // Offset to prev entry in hash bucket (-1 = head is buckets[bucket])
     int32_t next_in_task;         // Offset to next entry for same task (-1 = end)
+    int32_t prev_in_task;         // Offset to prev entry for same task (-1 = head is task_entry_head[slot])
     bool    in_bucket;            // True if entry is linked in a bucket chain
                                   // CRITICAL: Must be set false before overwriting!
 } PTO2TensorMapEntry;
@@ -184,10 +186,16 @@ static inline bool pto2_tensormap_entry_valid(PTO2TensorMap* tm, PTO2TensorMapEn
 }
 
 /**
- * Remove entry from its bucket chain
+ * Remove entry from its bucket chain (O(1) with prev pointer)
  * Called during pool wrap-around or cleanup.
  */
 void pto2_tensormap_remove_from_bucket(PTO2TensorMap* tm, PTO2TensorMapEntry* entry);
+
+/**
+ * Remove entry from its task chain (O(1) with prev pointer)
+ * Called during pool wrap-around to unlink reused entries.
+ */
+void pto2_tensormap_remove_from_task(PTO2TensorMap* tm, PTO2TensorMapEntry* entry);
 
 // =============================================================================
 // Debug Utilities
