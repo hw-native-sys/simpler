@@ -6,7 +6,7 @@ Computation:
     where a=2.0, b=3.0, so f=42.0
 """
 
-import numpy as np
+import torch
 
 __outputs__ = ["f"]
 
@@ -23,9 +23,9 @@ def generate_inputs(params: dict) -> dict:
     SIZE = ROWS * COLS
 
     return {
-        "a": np.full(SIZE, 2.0, dtype=np.float32),
-        "b": np.full(SIZE, 3.0, dtype=np.float32),
-        "f": np.zeros(SIZE, dtype=np.float32),
+        "a": torch.full((SIZE,), 2.0, dtype=torch.float32),
+        "b": torch.full((SIZE,), 3.0, dtype=torch.float32),
+        "f": torch.zeros(SIZE, dtype=torch.float32),
     }
 
 

@@ -163,7 +163,7 @@ ORCHESTRATION = {
 ### 3. `golden.py` Format
 
 ```python
-import numpy as np
+import torch
 
 # Output tensor names list (optional, or use 'out_' prefix convention)
 __outputs__ = ["f"]
@@ -187,9 +187,9 @@ def generate_inputs(params: dict) -> dict:
     """
     SIZE = 16384
     return {
-        "a": np.full(SIZE, 2.0, dtype=np.float32),
-        "b": np.full(SIZE, 3.0, dtype=np.float32),
-        "f": np.zeros(SIZE, dtype=np.float32),  # Output tensor
+        "a": torch.full((SIZE,), 2.0, dtype=torch.float32),
+        "b": torch.full((SIZE,), 3.0, dtype=torch.float32),
+        "f": torch.zeros(SIZE, dtype=torch.float32),  # Output tensor
     }
 
 def compute_golden(tensors: dict, params: dict) -> None:
@@ -217,7 +217,7 @@ PARAMS_LIST = [
 
 1. **`generate_inputs(params: dict) -> dict`**
    - Generate input and output tensors
-   - Returns: Dictionary with tensor names as keys and numpy arrays as values
+   - Returns: Dictionary with tensor names as keys and torch tensors as values
 
 2. **`compute_golden(tensors: dict, params: dict) -> None`**
    - Compute expected output values
@@ -251,9 +251,9 @@ Use `out_` prefix to name output tensors:
 ```python
 def generate_inputs(params: dict) -> dict:
     return {
-        "a": np.array(...),      # Input
-        "b": np.array(...),      # Input
-        "out_f": np.zeros(...),  # Output (auto-detected)
+        "a": torch.randn(1024),      # Input
+        "b": torch.randn(1024),      # Input
+        "out_f": torch.zeros(1024),  # Output (auto-detected)
     }
 ```
 
@@ -414,22 +414,22 @@ PARAMS_LIST = [
 def generate_inputs(params: dict) -> dict:
     size = params["size"]
     return {
-        "a": np.random.randn(size).astype(np.float32),
-        "b": np.random.randn(size).astype(np.float32),
-        "out_f": np.zeros(size, dtype=np.float32),
+        "a": torch.randn(size, dtype=torch.float32),
+        "b": torch.randn(size, dtype=torch.float32),
+        "out_f": torch.zeros(size, dtype=torch.float32),
     }
 ```
 
 ### Q: Are PyTorch tensors supported?
 
-Yes. The test framework automatically converts PyTorch tensors to NumPy arrays:
+Yes. The test framework uses PyTorch tensors by default:
 
 ```python
 import torch
 
 def generate_inputs(params: dict) -> dict:
     return {
-        "a": torch.randn(1024),      # Auto-converted
+        "a": torch.randn(1024),
         "b": torch.randn(1024),
         "out_f": torch.zeros(1024),
     }

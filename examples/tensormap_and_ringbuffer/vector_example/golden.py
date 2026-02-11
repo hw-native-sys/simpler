@@ -12,7 +12,7 @@ This is the same computation as host_build_graph/vector_example, but uses
 device-side orchestration (tensormap_and_ringbuffer runtime).
 """
 
-import numpy as np
+import torch
 
 # Output tensor names
 __outputs__ = ["f"]
@@ -37,16 +37,16 @@ def generate_inputs(params: dict) -> dict:
     - f: 16384 elements, zeros (output)
 
     Returns:
-        Dict of numpy arrays with tensor names as keys
+        Dict of torch tensors with tensor names as keys
     """
     ROWS = 128
     COLS = 128
     SIZE = ROWS * COLS  # 16384 elements
 
     return {
-        "a": np.full(SIZE, 2.0, dtype=np.float32),
-        "b": np.full(SIZE, 3.0, dtype=np.float32),
-        "f": np.zeros(SIZE, dtype=np.float32),
+        "a": torch.full((SIZE,), 2.0, dtype=torch.float32),
+        "b": torch.full((SIZE,), 3.0, dtype=torch.float32),
+        "f": torch.zeros(SIZE, dtype=torch.float32),
     }
 
 
@@ -63,6 +63,7 @@ def compute_golden(tensors: dict, params: dict) -> None:
         tensors: Dict containing all tensors (inputs and outputs)
         params: Parameter dict (unused in this example)
     """
-    a = tensors["a"]
-    b = tensors["b"]
+    # Convert to torch tensors (handles both array types)
+    a = torch.as_tensor(tensors["a"])
+    b = torch.as_tensor(tensors["b"])
     tensors["f"][:] = (a + b + 1) * (a + b + 2) + (a + b)

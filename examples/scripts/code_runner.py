@@ -18,8 +18,8 @@ Usage:
 Golden.py interface:
     # Required functions
     def generate_inputs(params: dict) -> dict:
-        '''Return dict of numpy arrays (inputs + outputs)'''
-        return {"a": np.array(...), "b": np.array(...), "out_f": np.zeros(...)}
+        '''Return dict of torch tensors or numpy arrays (inputs + outputs)'''
+        return {"a": torch.tensor(...), "b": torch.tensor(...), "out_f": torch.zeros(...)}
 
     def compute_golden(tensors: dict, params: dict) -> None:
         '''Compute expected outputs in-place'''
@@ -40,8 +40,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
-import numpy as np
-from numpy.testing import assert_allclose
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -68,23 +67,21 @@ def _setup_logging_if_needed() -> None:
         )
 
 
-def _has_torch() -> bool:
-    """Check if PyTorch is available."""
+def _to_torch(tensor) -> torch.Tensor:
+    """Convert tensor to torch.Tensor, handling bfloat16 and other tensor types."""
+    if isinstance(tensor, torch.Tensor):
+        # Already a torch tensor, ensure it's on CPU and contiguous
+        return tensor.cpu().contiguous()
+
+    # For any non-torch tensor, try direct torch conversion first
+    # This handles most array-like objects including numpy arrays
     try:
-        import torch
-        return True
-    except ImportError:
-        return False
-
-
-def _to_numpy(tensor) -> np.ndarray:
-    """Convert tensor to numpy array, handling PyTorch tensors."""
-    if hasattr(tensor, 'detach'):
-        # PyTorch tensor
-        return tensor.detach().cpu().numpy()
-    elif hasattr(tensor, '__array__'):
-        return np.asarray(tensor)
-    return tensor
+        return torch.as_tensor(tensor)
+    except (TypeError, RuntimeError):
+        # If direct conversion fails, fall back to numpy path
+        import numpy as np
+        arr = np.asarray(tensor)
+        return torch.from_numpy(arr)
 
 
 def _load_module_from_path(module_path: Path, module_name: str):
@@ -309,8 +306,8 @@ class CodeRunner:
 
     This class automates:
     - Loading kernel_config.py and golden.py dynamically
-    - Building func_args automatically from numpy arrays
-    - Converting PyTorch tensors to numpy
+    - Building func_args automatically from torch tensors
+    - Converting numpy arrays to torch tensors
     - Separating inputs and outputs based on naming convention
     - Running the full test flow
 
@@ -393,7 +390,7 @@ class CodeRunner:
 
         return module
 
-    def _identify_outputs(self, tensors: Dict[str, np.ndarray]) -> Tuple[Dict, Dict]:
+    def _identify_outputs(self, tensors: Dict[str, torch.Tensor]) -> Tuple[Dict, Dict]:
         """
         Separate inputs and outputs from tensor dict.
 
@@ -420,7 +417,7 @@ class CodeRunner:
 
         return inputs, outputs
 
-    def _build_func_args(self, tensors: Dict[str, np.ndarray]) -> Tuple[List[int], List[int], List[int]]:
+    def _build_func_args(self, tensors: Dict[str, torch.Tensor]) -> Tuple[List[int], List[int], List[int]]:
         """
         Build func_args, arg_types, and arg_sizes from tensors automatically.
 
@@ -431,7 +428,7 @@ class CodeRunner:
             [ptr_0, ptr_1, ..., ptr_n, nbytes_0, nbytes_1, ..., nbytes_n, count]
 
         Args:
-            tensors: Dict of numpy arrays
+            tensors: Dict of torch tensors (will be modified to ensure contiguous)
 
         Returns:
             Tuple of (func_args, arg_types, arg_sizes)
@@ -450,19 +447,23 @@ class CodeRunner:
         else:
             output_set = {k for k in tensors.keys() if k.startswith('out_')}
 
-        func_args = []
-        arg_types = []
-        arg_sizes = []
-
-        # Add pointers
+        # First pass: ensure all tensors are CPU and contiguous (update dict in place)
         for name in order:
             if name not in tensors:
                 raise KeyError(
                     f"Tensor '{name}' from TENSOR_ORDER not found in generate_inputs() result.\n"
                     f"Available tensors: {list(tensors.keys())}"
                 )
-            arr = tensors[name]
-            func_args.append(arr.ctypes.data)
+            tensors[name] = tensors[name].cpu().contiguous()
+
+        func_args = []
+        arg_types = []
+        arg_sizes = []
+
+        # Add pointers
+        for name in order:
+            tensor = tensors[name]
+            func_args.append(tensor.data_ptr())
 
             # Determine arg type based on whether it's an output
             if name in output_set:
@@ -470,17 +471,17 @@ class CodeRunner:
             else:
                 arg_types.append(ARG_INPUT_PTR)
 
-            arg_sizes.append(arr.nbytes)
+            arg_sizes.append(tensor.element_size() * tensor.numel())
 
         # Add sizes (as scalars)
         for name in order:
-            arr = tensors[name]
-            func_args.append(arr.nbytes)
+            tensor = tensors[name]
+            func_args.append(tensor.element_size() * tensor.numel())
             arg_types.append(ARG_SCALAR)
             arg_sizes.append(0)
 
         # Add element count (as scalar)
-        count = tensors[order[0]].size
+        count = tensors[order[0]].numel()
         func_args.append(count)
         arg_types.append(ARG_SCALAR)
         arg_sizes.append(0)
@@ -582,18 +583,18 @@ class CodeRunner:
 
             # Generate tensors using golden.py
             logger.info("=== Generating Inputs ===")
-            tensors = self._golden_module.generate_inputs(params)
+            tensors_raw = self._golden_module.generate_inputs(params)
 
-            # Convert any PyTorch tensors to numpy
-            tensors = {k: _to_numpy(v) for k, v in tensors.items()}
+            # Convert any inputs to torch tensors
+            tensors = {k: _to_torch(v) for k, v in tensors_raw.items()}
 
-            # Identify inputs and outputs
+            # Build func_args automatically (this will make tensors contiguous)
+            func_args, arg_types, arg_sizes = self._build_func_args(tensors)
+
+            # Identify inputs and outputs AFTER making tensors contiguous
             inputs, outputs = self._identify_outputs(tensors)
             logger.info(f"Inputs: {list(inputs.keys())}")
             logger.info(f"Outputs: {list(outputs.keys())}")
-
-            # Build func_args automatically
-            func_args, arg_types, arg_sizes = self._build_func_args(tensors)
 
             # Determine actual tensor order for debugging
             order = self.tensor_order if self.tensor_order else list(tensors.keys())
@@ -625,8 +626,10 @@ class CodeRunner:
                 )
 
             # Save expected values BEFORE hardware execution (outputs will be overwritten)
-            golden = {k: v.copy() for k, v in outputs.items()}
-            self._golden_module.compute_golden({**inputs, **golden}, params)
+            golden = {k: v.clone() for k, v in outputs.items()}
+            # Convert to dict for compute_golden (may expect numpy-like interface)
+            golden_with_inputs = {**inputs, **golden}
+            self._golden_module.compute_golden(golden_with_inputs, params)
 
             # Launch runtime
             logger.info("=== Launching Runtime ===")
@@ -662,8 +665,8 @@ class CodeRunner:
 
     def _compare_with_golden(
         self,
-        outputs: Dict[str, np.ndarray],
-        golden: Dict[str, np.ndarray],
+        outputs: Dict[str, torch.Tensor],
+        golden: Dict[str, torch.Tensor],
     ) -> None:
         """Compare hardware outputs with pre-computed golden values."""
         # Compare each output
@@ -672,23 +675,32 @@ class CodeRunner:
             expected = golden[name]
             logger.info(f"Comparing {name}: shape={actual.shape}, dtype={actual.dtype}")
 
+            # Ensure both are on CPU for comparison
+            actual = actual.cpu()
+            expected = expected.cpu()
+
             # Show first 10 values
-            if actual.size > 0:
+            if actual.numel() > 0:
                 flat_actual = actual.flatten()
                 flat_expected = expected.flatten()
-                n_show = min(10, flat_actual.size)
-                logger.debug(f"  First {n_show} actual:   {flat_actual[:n_show]}")
-                logger.debug(f"  First {n_show} expected: {flat_expected[:n_show]}")
+                n_show = min(10, flat_actual.numel())
+                logger.debug(f"  First {n_show} actual:   {flat_actual[:n_show].tolist()}")
+                logger.debug(f"  First {n_show} expected: {flat_expected[:n_show].tolist()}")
 
-            assert_allclose(
-                actual,
-                expected,
-                rtol=self.rtol,
-                atol=self.atol,
-                err_msg=f"Output '{name}' does not match golden",
-            )
-            matched = np.sum(np.isclose(actual, expected, rtol=self.rtol, atol=self.atol))
-            logger.info(f"  {name}: PASS ({matched}/{actual.size} elements matched)")
+            # Use torch for comparison
+            if not torch.allclose(actual, expected, rtol=self.rtol, atol=self.atol):
+                # Find mismatches for better error reporting
+                close_mask = torch.isclose(actual, expected, rtol=self.rtol, atol=self.atol)
+                mismatches = (~close_mask).sum().item()
+                total = actual.numel()
+                raise AssertionError(
+                    f"Output '{name}' does not match golden.\n"
+                    f"Mismatched elements: {mismatches}/{total}\n"
+                    f"rtol={self.rtol}, atol={self.atol}"
+                )
+
+            matched = torch.isclose(actual, expected, rtol=self.rtol, atol=self.atol).sum().item()
+            logger.info(f"  {name}: PASS ({matched}/{actual.numel()} elements matched)")
 
 
 def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",

@@ -11,8 +11,7 @@ Implements the online softmax algorithm for paged attention with:
 
 import os
 import struct
-import numpy as np
-import ml_dtypes
+import torch
 
 # Output tensor names
 __outputs__ = ["out"]
@@ -62,8 +61,6 @@ def generate_inputs(params: dict) -> dict:
     context_len = params["context_len"]
     max_model_len = params["max_model_len"]
 
-    np.random.seed(None)
-
     max_num_blocks_per_req = max_model_len // block_size
     cur_valid_blocks = (context_len + block_size - 1) // block_size
     total_blocks = batch * cur_valid_blocks
@@ -71,32 +68,31 @@ def generate_inputs(params: dict) -> dict:
     scale_bits = struct.unpack('I', struct.pack('f', scale_value))[0]
 
     # Random block table: (batch, max_num_blocks_per_req) int32
-    # randint is [low, high), so high=total_blocks covers indices [0, total_blocks)
-    block_table = np.random.randint(
+    block_table = torch.randint(
         0,
         max(total_blocks, 1),
         size=(batch, max_num_blocks_per_req),
-        dtype=np.int32,
+        dtype=torch.int32,
     )
 
     # Context lens: all = context_len
-    context_lens = np.full(batch, context_len, dtype=np.int32)
+    context_lens = torch.full((batch,), context_len, dtype=torch.int32)
 
-    config = np.array(
+    config = torch.tensor(
         [batch, num_heads, kv_head_num, head_dim, block_size,
          max_num_blocks_per_req, scale_bits],
-        dtype=np.int64,
+        dtype=torch.int64,
     )
 
     # Query: (batch, 1, num_heads * head_dim) -> (batch, num_heads, head_dim) bfloat16
-    query_bf16 = np.random.uniform(-0.5, 0.5, size=(batch, 1, num_heads * head_dim)).astype(ml_dtypes.bfloat16)
+    query_bf16 = torch.empty(batch, 1, num_heads * head_dim).uniform_(-0.5, 0.5).to(torch.bfloat16)
     query_bf16 = query_bf16.reshape(batch, num_heads, head_dim)
 
     # Key cache: (total_blocks, block_size, kv_head_num, head_dim) bfloat16
-    key_bf16 = np.random.uniform(-0.5, 0.5, size=(total_blocks, block_size, kv_head_num, head_dim)).astype(ml_dtypes.bfloat16)
+    key_bf16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-0.5, 0.5).to(torch.bfloat16)
 
     # Value cache: (total_blocks, block_size, kv_head_num, head_dim) bfloat16
-    value_bf16 = np.random.uniform(-1, 1, size=(total_blocks, block_size, kv_head_num, head_dim)).astype(ml_dtypes.bfloat16)
+    value_bf16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-1, 1).to(torch.bfloat16)
 
     return {
         "query": query_bf16.flatten(),
@@ -104,21 +100,21 @@ def generate_inputs(params: dict) -> dict:
         "value_cache": value_bf16.flatten(),
         "block_table": block_table.flatten(),
         "context_lens": context_lens,
-        "out": np.zeros(batch * num_heads * head_dim, dtype=np.float32),
+        "out": torch.zeros(batch * num_heads * head_dim, dtype=torch.float32),
         "config": config,
     }
 
 
 def paged_attention(
-    query: np.ndarray,
-    key_cache: np.ndarray,
-    value_cache: np.ndarray,
+    query: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
     num_kv_heads: int,
     num_heads: int,
     scale_value: float,
-    block_table: np.ndarray,
-    context_lens: np.ndarray,
-) -> np.ndarray:
+    block_table: torch.Tensor,
+    context_lens: torch.Tensor,
+) -> torch.Tensor:
     """
     Compute paged attention using online softmax with head tiling and GQA.
 
@@ -144,7 +140,7 @@ def paged_attention(
     key_cache = key_cache.reshape(-1, block_size, head_dim)
     value_cache = value_cache.reshape(-1, block_size, head_dim)
 
-    out = np.zeros((batch * num_heads, head_dim), dtype=np.float32)
+    out = torch.zeros((batch * num_heads, head_dim), dtype=torch.float32)
 
     for b_idx in range(batch):
         cur_seq = int(context_lens[b_idx])
@@ -155,7 +151,7 @@ def paged_attention(
         for cur_offset in range(0, num_heads, q_tile):
             q_tile_size = min(q_tile, num_heads - cur_offset)
             base_idx = b_idx * num_heads + cur_offset
-            qi = query[base_idx : base_idx + q_tile_size].astype(np.float32)
+            qi = query[base_idx : base_idx + q_tile_size].to(torch.float32)
 
             oi = None
             li = None
@@ -164,22 +160,22 @@ def paged_attention(
             for bn in range(bn_this_batch):
                 cur_block_idx = block_table[b_idx, bn]
                 valid_len = min(block_size, cur_seq - bn * block_size)
-                kj = key_cache[cur_block_idx, :valid_len, :].astype(np.float32)
-                vj = value_cache[cur_block_idx, :valid_len, :].astype(np.float32)
+                kj = key_cache[cur_block_idx, :valid_len, :].to(torch.float32)
+                vj = value_cache[cur_block_idx, :valid_len, :].to(torch.float32)
 
                 sij = (qi @ kj.T) * scale_value
-                mij = sij.max(axis=-1, keepdims=True)
-                pij = np.exp(sij - mij).astype(ml_dtypes.bfloat16).astype(np.float32)
-                lij = np.sum(pij, axis=1, keepdims=True)
+                mij = sij.max(dim=-1, keepdim=True)[0]
+                pij = torch.exp(sij - mij).to(torch.bfloat16).to(torch.float32)
+                lij = pij.sum(dim=1, keepdim=True)
 
                 if bn == 0:
                     oi = pij @ vj
                     li = lij
                     mi = mij
                 else:
-                    mi_new = np.maximum(mi, mij)
-                    alpha = np.exp(mi - mi_new)
-                    beta = np.exp(mij - mi_new)
+                    mi_new = torch.maximum(mi, mij)
+                    alpha = torch.exp(mi - mi_new)
+                    beta = torch.exp(mij - mi_new)
                     li_new = alpha * li + beta * lij
                     oi_new = pij @ vj
                     oi = alpha * oi + beta * oi_new
@@ -205,7 +201,7 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
     max_num_blocks_per_req = max_model_len // block_size
 
-    # Reconstruct shaped arrays from flat bfloat16 tensors
+    # Reconstruct shaped tensors from flat tensors
     query = tensors["query"].reshape(batch, num_heads, head_dim)
     key_cache = tensors["key_cache"].reshape(-1, block_size, kv_head_num, head_dim)
     value_cache = tensors["value_cache"].reshape(-1, block_size, kv_head_num, head_dim)

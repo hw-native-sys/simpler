@@ -54,6 +54,7 @@ jobs:
           pip install numpy
           pip install ml_dtypes
           pip install pytest
+          pip install torch
 
       - name: Run simulation examples
         run: ./ci.sh -p a2a3sim
