@@ -32,10 +32,6 @@
 #include "pto_scheduler.h"
 #include "pto_orchestrator.h"
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 // =============================================================================
 // Runtime Context
 // =============================================================================
@@ -50,12 +46,33 @@ typedef enum {
 } PTO2RuntimeMode;
 
 /**
+ * Function-pointer ops table for runtime operations.
+ *
+ * The orchestration .so calls runtime functions through this table
+ * (via pto_orchestration_api.h inline wrappers), so it has zero link
+ * dependencies on runtime .cpp files.
+ */
+typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
+
+typedef struct PTO2RuntimeOps {
+    void (*submit_task)(PTO2Runtime* rt, int32_t kernel_id,
+                        PTO2WorkerType worker_type, const char* func_name,
+                        PTOParam* params, int32_t num_params);
+    void (*scope_begin)(PTO2Runtime* rt);
+    void (*scope_end)(PTO2Runtime* rt);
+    void (*orchestration_done)(PTO2Runtime* rt);
+} PTO2RuntimeOps;
+
+/**
  * PTO Runtime2 context
  *
  * Contains all state for orchestration and scheduling.
  * In simulated mode, runs in single process with shared address space.
  */
-typedef struct PTO2Runtime {
+struct PTO2Runtime {
+    // Ops table (first field — used by orchestration .so via function pointers)
+    const PTO2RuntimeOps*   ops;
+
     // Components
     PTO2SharedMemoryHandle* sm_handle;
     PTO2OrchestratorState   orchestrator;
@@ -71,8 +88,7 @@ typedef struct PTO2Runtime {
 
     // Statistics
     int64_t                 total_cycles;
-
-} PTO2Runtime;
+};
 
 // =============================================================================
 // Runtime Lifecycle API
@@ -169,14 +185,6 @@ void pto2_rt_submit_task(PTO2Runtime* rt,
                          int32_t num_params);
 
 /**
- * Simplified task submission (auto-detect worker type)
- */
-void pto2_rt_submit(PTO2Runtime* rt,
-                    const char* func_name,
-                    PTOParam* params,
-                    int32_t num_params);
-
-/**
  * Mark orchestration as complete
  *
  * Signals that no more tasks will be submitted.
@@ -198,11 +206,6 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt);
 #define PTO2_SCOPE_BEGIN(rt) pto2_rt_scope_begin(rt)
 #define PTO2_SCOPE_END(rt)   pto2_rt_scope_end(rt)
 
-#ifdef __cplusplus
-}
-#endif
-
-#ifdef __cplusplus
 /**
  * RAII Scope Guard for C++
  *
@@ -396,6 +399,18 @@ private:
 #define PTO2_ORCHESTRATION(rt_var, begin_info) \
     _PTO2_ORCHESTRATION_IMPL(rt_var, _PTO2_CONCATENATE(_pto2_orch_, __COUNTER__), begin_info)
 
-#endif // __cplusplus
+/**
+ * Slim config struct exported by orchestration .so via aicpu_orchestration_config().
+ * Shared definition with pto_orchestration_api.h (same layout, guarded).
+ */
+#ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
+#define PTO2_ORCHESTRATION_CONFIG_DEFINED
+struct PTO2OrchestrationConfig {
+    int         expected_arg_count;
+    int32_t     task_window_size;
+    int32_t     dep_list_pool_size;
+    int32_t     heap_size;
+};
+#endif
 
 #endif // PTO_RUNTIME2_H

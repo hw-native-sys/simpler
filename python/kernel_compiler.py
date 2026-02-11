@@ -1,3 +1,4 @@
+import importlib.util
 import logging
 import os
 import subprocess
@@ -5,7 +6,7 @@ import sys
 import tempfile
 
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from bindings import get_incore_compiler, get_orchestration_compiler
 from toolchain import (
@@ -96,6 +97,50 @@ class KernelCompiler:
         """
         runtime_dir = str(self.project_root / "src" / "runtime" / runtime_name / "runtime")
         return [runtime_dir] + self.get_platform_include_dirs()
+
+    def _get_orchestration_config(self, runtime_name: str) -> Tuple[List[str], List[str]]:
+        """
+        Load the optional "orchestration" section from a runtime's build_config.py.
+
+        If the runtime has an "orchestration" key in its BUILD_CONFIG, returns
+        the resolved include dirs and discovered source files.  Otherwise returns
+        empty lists (backward-compatible for runtimes without the section).
+
+        Args:
+            runtime_name: Name of the runtime (e.g., "tensormap_and_ringbuffer")
+
+        Returns:
+            (include_dirs, source_files) — both as absolute paths, or ([], [])
+        """
+        config_path = self.project_root / "src" / "runtime" / runtime_name / "build_config.py"
+        if not config_path.is_file():
+            return [], []
+
+        spec = importlib.util.spec_from_file_location("build_config", str(config_path))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        build_config = getattr(mod, "BUILD_CONFIG", {})
+
+        orch_cfg = build_config.get("orchestration")
+        if orch_cfg is None:
+            return [], []
+
+        config_dir = config_path.parent
+
+        include_dirs = [
+            str((config_dir / p).resolve())
+            for p in orch_cfg.get("include_dirs", [])
+        ]
+
+        source_files = []
+        for src_dir_rel in orch_cfg.get("source_dirs", []):
+            src_dir = (config_dir / src_dir_rel).resolve()
+            if src_dir.is_dir():
+                for f in sorted(src_dir.iterdir()):
+                    if f.suffix in (".cpp", ".c") and f.is_file():
+                        source_files.append(str(f))
+
+        return include_dirs, source_files
 
     def _run_subprocess(
         self,
@@ -308,6 +353,11 @@ class KernelCompiler:
         if extra_include_dirs:
             include_dirs = include_dirs + list(extra_include_dirs)
 
+        # Load optional orchestration config for extra sources/includes
+        orch_includes, orch_sources = self._get_orchestration_config(runtime_name)
+        if orch_includes:
+            include_dirs = include_dirs + orch_includes
+
         # Resolve toolchain: HOST_GXX needs no runtime-specific extras
         toolchain_type = self._get_toolchain(
             get_orchestration_compiler,
@@ -318,28 +368,23 @@ class KernelCompiler:
         if toolchain_type == ToolchainType.HOST_GXX:
             return self._compile_orchestration_shared_lib(
                 source_path, toolchain, extra_include_dirs=include_dirs,
+                extra_sources=orch_sources or None,
             )
 
-        # AARCH64_GXX (a2a3 only): runtime-specific extras for cross-compilation
+        # AARCH64_GXX (a2a3 only): cross-compilation (no extra runtime sources
+        # needed — orchestration uses the ops table via pto_orchestration_api.h)
         if runtime_name == "tensormap_and_ringbuffer":
-            runtime_dir = (
-                self.project_root / "src" / "runtime"
-                / runtime_name / "runtime"
-            )
-            extra_sources = sorted(
-                str(p) for p in runtime_dir.glob("*.cpp")
-                if p.name != "runtime.cpp"
-            )
             return self._compile_orchestration_shared_lib(
                 source_path, toolchain,
                 extra_include_dirs=include_dirs,
-                extra_sources=extra_sources,
+                extra_sources=orch_sources or None,
             )
 
         if runtime_name == "aicpu_build_graph":
             return self._compile_orchestration_shared_lib(
                 source_path, toolchain,
                 extra_include_dirs=include_dirs,
+                extra_sources=orch_sources or None,
             )
 
         raise ValueError(

@@ -110,28 +110,28 @@ static inline PTOParam make_scalar_param(uint64_t value) {
     return p;
 }
 
-static inline PTOParam make_input_param(Tensor& td) {
-    assert(td.buffer.addr != 0 && "INPUT param must have a non-NULL buffer address");
+static inline PTOParam make_input_param(Tensor& tensor) {
+    assert(tensor.buffer.addr != 0 && "INPUT param must have a non-NULL buffer address");
     PTOParam p = {};
     p.type = PTOParamType::INPUT;
-    p.tensor = &td;
+    p.tensor = &tensor;
     p.scalar_value = 0;
     return p;
 }
 
-static inline PTOParam make_output_param(Tensor& td) {
+static inline PTOParam make_output_param(Tensor& tensor) {
     PTOParam p = {};
     p.type = PTOParamType::OUTPUT;
-    p.tensor = &td;
+    p.tensor = &tensor;
     p.scalar_value = 0;
     return p;
 }
 
-static inline PTOParam make_inout_param(Tensor& td) {
-    assert(td.buffer.addr != 0 && "INOUT param must have a non-NULL buffer address");
+static inline PTOParam make_inout_param(Tensor& tensor) {
+    assert(tensor.buffer.addr != 0 && "INOUT param must have a non-NULL buffer address");
     PTOParam p = {};
     p.type = PTOParamType::INOUT;
-    p.tensor = &td;
+    p.tensor = &tensor;
     p.scalar_value = 0;
     return p;
 }

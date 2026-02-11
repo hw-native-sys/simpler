@@ -18,7 +18,7 @@ Each developer role has a designated working directory. Stay within your assigne
 
 ## Important Rules
 
-1. **Read `.ai-instruction/` directory first** before starting any work to understand codestyle rules and terminology guidelines
+1. **Consult `.ai-instructions/` for task-specific rules.** The directory contains topic-based guides — read the ones relevant to your current task (e.g., `coding/` when writing code, `git-commit/` when committing, `terminologies/` when unsure about domain terms). You do not need to read all files upfront
 2. **Do not modify directories outside your assigned area** unless the user explicitly requests it
 3. Create new subdirectories under your assigned directory as needed
 4. When in doubt, ask the user before making changes to other areas

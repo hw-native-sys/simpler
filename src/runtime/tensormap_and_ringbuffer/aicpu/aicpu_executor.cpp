@@ -19,8 +19,8 @@
 #include "runtime.h"
 #include "pto2_dispatch_payload.h"
 
-// Include C headers - they have their own extern "C" guards
-#include "pto_runtime2_types.h"
+// Runtime headers (full struct definition for create/destroy + PTO2_SCOPE)
+#include "pto_runtime2.h"
 #include "pto_shared_memory.h"
 
 // Performance profiling headers
@@ -28,8 +28,13 @@
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
 
-// Device orchestration function signature (loaded via dlopen)
-typedef void (*DeviceOrchestrationFunc)(void* sm_ptr, uint64_t* args, int arg_count);
+// Device orchestration function signature (loaded via dlopen).
+// The orchestration .so receives a PTO2Runtime* (with ops table populated)
+// instead of a raw shared-memory pointer.
+typedef void (*DeviceOrchestrationFunc)(PTO2Runtime* rt, uint64_t* args, int arg_count);
+
+// Config function exported by orchestration .so
+typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(uint64_t* args, int arg_count);
 
 constexpr int MAX_AICPU_THREADS = 4;
 constexpr int MAX_AIC_PER_THREAD = 24;
@@ -652,8 +657,13 @@ int AicpuExecutor::run(Runtime* runtime) {
             }
             DEV_INFO("Thread 3: dlopen succeeded, handle=%p", handle);
 
+            // Get the config function to read orchestration parameters
+            dlerror();
+            auto config_func = reinterpret_cast<DeviceOrchestrationConfigFunc>(
+                dlsym(handle, "aicpu_orchestration_config"));
+
             // Get the orchestration entry function
-            dlerror();  // Clear any existing error before dlsym
+            dlerror();
             DeviceOrchestrationFunc orch_func =
                 reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, "aicpu_orchestration_entry"));
             const char* dlsym_error = dlerror();
@@ -664,32 +674,95 @@ int AicpuExecutor::run(Runtime* runtime) {
                 return -1;
             }
             if (orch_func == nullptr) {
-                DEV_ERROR("Thread 3: dlsym returned NULL (no error)");
+                DEV_ERROR("Thread 3: dlsym returned NULL for aicpu_orchestration_entry");
                 dlclose(handle);
                 unlink(so_path);
                 return -1;
             }
 
-            DEV_INFO("Thread 3: Calling aicpu_orchestration_entry from SO");
-            DEV_INFO("Thread 3: sm_ptr=%p, arg_count=%d", runtime->get_pto2_gm_sm_ptr(), runtime->get_orch_arg_count());
             uint64_t* args = runtime->get_orch_args();
             int arg_count = runtime->get_orch_arg_count();
+            DEV_INFO("Thread 3: sm_ptr=%p, arg_count=%d", runtime->get_pto2_gm_sm_ptr(), arg_count);
             for (int i = 0; i < arg_count && i < 20; i++) {
                 DEV_INFO("Thread 3: args[%d] = 0x%lx", i, args[i]);
             }
 
-            orch_func(runtime->get_pto2_gm_sm_ptr(),
-                      args,
-                      arg_count);
+            // Read config from orchestration SO (or use defaults)
+            int32_t task_window_size = PTO2_TASK_WINDOW_SIZE;
+            int32_t dep_list_pool_size = PTO2_DEP_LIST_POOL_SIZE;
+            int32_t heap_size = PTO2_HEAP_SIZE;
+            int expected_arg_count = 0;
+            if (config_func) {
+                PTO2OrchestrationConfig cfg = config_func(args, arg_count);
+                task_window_size = cfg.task_window_size;
+                dep_list_pool_size = cfg.dep_list_pool_size;
+                heap_size = cfg.heap_size;
+                expected_arg_count = cfg.expected_arg_count;
+                DEV_INFO("Thread 3: Config: window=%d, dep_pool=%d, heap=%d, expected_args=%d",
+                         task_window_size, dep_list_pool_size, heap_size, expected_arg_count);
+            } else {
+                DEV_INFO("Thread 3: No config function, using defaults");
+            }
+
+            if (expected_arg_count > 0 && arg_count < expected_arg_count) {
+                DEV_ERROR("Thread 3: arg_count %d < expected %d", arg_count, expected_arg_count);
+                dlclose(handle);
+                unlink(so_path);
+                return -1;
+            }
+
+            // Extract GM heap from args (always last 2: gm_heap ptr, heap_size)
+            void* sm_ptr = runtime->get_pto2_gm_sm_ptr();
+            PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_ptr);
+            void* gm_heap = nullptr;
+            int32_t gm_heap_size = heap_size;
+            if (arg_count >= 2) {
+                uint64_t heap_arg = args[arg_count - 2];
+                uint64_t size_arg = args[arg_count - 1];
+                if (heap_arg != 0 && size_arg != 0) {
+                    gm_heap = reinterpret_cast<void*>(static_cast<uintptr_t>(heap_arg));
+                    gm_heap_size = static_cast<int32_t>(size_arg & 0x7FFFFFFF);
+                }
+            }
+
+            // Create shared memory handle and runtime (ops table populated inside)
+            int32_t sm_size = pto2_sm_calculate_size(task_window_size, dep_list_pool_size);
+            PTO2SharedMemoryHandle* sm_handle =
+                pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size,
+                                            gm_heap_size, dep_list_pool_size);
+            if (!sm_handle) {
+                DEV_ERROR("Thread 3: Failed to create shared memory handle");
+                dlclose(handle);
+                unlink(so_path);
+                return -1;
+            }
+
+            PTO2Runtime* rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE,
+                                                            sm_handle, gm_heap, gm_heap_size);
+            if (!rt) {
+                DEV_ERROR("Thread 3: Failed to create PTO2Runtime");
+                pto2_sm_destroy(sm_handle);
+                dlclose(handle);
+                unlink(so_path);
+                return -1;
+            }
+
+            // Call orchestration wrapped in outer scope (matches old PTO2_ORCHESTRATION behavior)
+            DEV_INFO("Thread 3: Calling aicpu_orchestration_entry from SO");
+            PTO2_SCOPE(rt) {
+                orch_func(rt, args, arg_count);
+            }
             DEV_INFO("Thread 3: aicpu_orchestration_entry returned");
 
-            // Store the SO handle and path - defer dlclose and unlink until all tasks complete
-            // The orchestration SO contains static buffers (s_gm_heap_stub) that are
-            // used by tasks as output buffers. Closing the SO prematurely would
-            // invalidate those buffers and cause segfaults.
-            orch_so_handle_ = handle;
-            strncpy(orch_so_path_, so_path, sizeof(orch_so_path_) - 1);
-            orch_so_path_[sizeof(orch_so_path_) - 1] = '\0';
+            // Teardown runtime
+            pto2_rt_orchestration_done(rt);
+            pto2_runtime_destroy(rt);
+            header->orchestrator_done = 1;
+
+            // The orchestration .so no longer contains static output buffers
+            // (heap is managed by the executor), so we can close immediately
+            dlclose(handle);
+            unlink(so_path);
 
             // Device mode: task count lives in PTO2 shared memory (current_task_index at offset 0)
             void* sm = runtime->get_pto2_gm_sm_ptr();
@@ -697,7 +770,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             DEV_INFO("Thread 3: PTO2 task count = %d", pto2_task_count);
             total_tasks_.store(pto2_task_count, std::memory_order_release);
             pto2_init_done_.store(false, std::memory_order_release);
-            pto2_init_complete_.store(false, std::memory_order_release);  // so workers re-init and wait this run
+            pto2_init_complete_.store(false, std::memory_order_release);
             orchestrator_done_.store(true, std::memory_order_release);
             DEV_INFO("Thread 3: Set orchestrator_done=true");
         }
@@ -734,27 +807,6 @@ int AicpuExecutor::run(Runtime* runtime) {
 }
 
 void AicpuExecutor::deinit() {
-    // NOTE: Do NOT close the orchestration SO handle here!
-    // The SO contains static buffers (s_gm_heap_stub) that are used as task
-    // output buffers. These buffers are referenced by graph_output_ptr in
-    // the PTO2 shared memory header, which is read during validate_runtime_impl
-    // (copy-back phase) that runs AFTER all AICPU threads finish.
-    //
-    // Closing the SO here would unmap s_gm_heap_stub, causing a segfault when
-    // validate_runtime_impl tries to copy from graph_output_ptr.
-    //
-    // In simulation mode, we let the SO "leak" - the OS will clean it up when
-    // the process exits. For production (a2a3), the SO runs in device memory
-    // which has a different lifecycle.
-    if (orch_so_handle_ != nullptr) {
-        DEV_INFO("DeInit: Keeping orchestration SO handle open for copy-back phase");
-        // Do NOT call dlclose here - the SO must remain loaded until
-        // validate_runtime_impl completes
-        // TODO: Add a separate cleanup phase after validate_runtime_impl that calls:
-        //   dlclose(orch_so_handle_);
-        //   if (orch_so_path_[0] != '\0') unlink(orch_so_path_);
-    }
-
     // Cleanup runtime execution state
     ready_count_aic_.store(0, std::memory_order_release);
     ready_count_aiv_.store(0, std::memory_order_release);

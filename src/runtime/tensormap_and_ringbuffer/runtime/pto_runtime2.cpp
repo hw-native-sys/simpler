@@ -1,8 +1,8 @@
 /**
  * PTO Runtime2 - Main Implementation
- * 
+ *
  * Implements the unified runtime API that combines orchestrator and scheduler.
- * 
+ *
  * Based on: docs/runtime_buffer_manager_methods.md
  */
 
@@ -10,6 +10,36 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+
+// =============================================================================
+// Ops Table (function-pointer dispatch for orchestration .so)
+// =============================================================================
+
+static void submit_task_impl(PTO2Runtime* rt, int32_t kernel_id,
+                              PTO2WorkerType worker_type, const char* func_name,
+                              PTOParam* params, int32_t num_params) {
+    pto2_submit_task(&rt->orchestrator, kernel_id, worker_type,
+                     func_name, params, num_params);
+}
+
+static void scope_begin_impl(PTO2Runtime* rt) {
+    pto2_scope_begin(&rt->orchestrator);
+}
+
+static void scope_end_impl(PTO2Runtime* rt) {
+    pto2_scope_end(&rt->orchestrator);
+}
+
+static void orchestration_done_impl(PTO2Runtime* rt) {
+    pto2_orchestrator_done(&rt->orchestrator);
+}
+
+static const PTO2RuntimeOps s_runtime_ops = {
+    .submit_task        = submit_task_impl,
+    .scope_begin        = scope_begin_impl,
+    .scope_end          = scope_end_impl,
+    .orchestration_done = orchestration_done_impl,
+};
 
 // =============================================================================
 // Runtime Creation and Destruction
@@ -31,16 +61,15 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
     if (!rt) {
         return NULL;
     }
-    
+
+    rt->ops = &s_runtime_ops;
     rt->mode = mode;
-    
-    // Create shared memory
     rt->sm_handle = pto2_sm_create(task_window_size, heap_size, dep_list_size);
     if (!rt->sm_handle) {
         free(rt);
         return NULL;
     }
-    
+
     // Allocate GM heap for output buffers
     rt->gm_heap_size = heap_size;
     #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
@@ -58,7 +87,7 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
         }
     #endif
     rt->gm_heap_owned = true;
-    
+
     // Initialize orchestrator
     if (!pto2_orchestrator_init(&rt->orchestrator, rt->sm_handle,
                                  rt->gm_heap, heap_size)) {
@@ -67,7 +96,7 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
         free(rt);
         return NULL;
     }
-    
+
     // Initialize scheduler
     if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle,
                               &rt->orchestrator.dep_pool)) {
@@ -77,10 +106,10 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
         free(rt);
         return NULL;
     }
-    
+
     // Connect orchestrator to scheduler (for simulated mode)
     pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
-    
+
     return rt;
 }
 
@@ -93,6 +122,7 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
     PTO2Runtime* rt = (PTO2Runtime*)calloc(1, sizeof(PTO2Runtime));
     if (!rt) return NULL;
 
+    rt->ops = &s_runtime_ops;
     rt->mode = mode;
     rt->sm_handle = sm_handle;
     rt->gm_heap = gm_heap;
@@ -118,28 +148,28 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
 
 void pto2_runtime_destroy(PTO2Runtime* rt) {
     if (!rt) return;
-    
+
     pto2_scheduler_destroy(&rt->scheduler);
     pto2_orchestrator_destroy(&rt->orchestrator);
-    
+
     if (rt->gm_heap_owned && rt->gm_heap) {
         free(rt->gm_heap);
     }
-    
+
     if (rt->sm_handle) {
         pto2_sm_destroy(rt->sm_handle);
     }
-    
+
     free(rt);
 }
 
 void pto2_runtime_reset(PTO2Runtime* rt) {
     if (!rt) return;
-    
+
     pto2_orchestrator_reset(&rt->orchestrator);
     pto2_scheduler_reset(&rt->scheduler);
     pto2_sm_reset(rt->sm_handle);
-    
+
     rt->total_cycles = 0;
 }
 
@@ -154,11 +184,11 @@ void pto2_runtime_set_mode(PTO2Runtime* rt, PTO2RuntimeMode mode) {
 // =============================================================================
 
 void pto2_rt_scope_begin(PTO2Runtime* rt) {
-    pto2_scope_begin(&rt->orchestrator);
+    scope_begin_impl(rt);
 }
 
 void pto2_rt_scope_end(PTO2Runtime* rt) {
-    pto2_scope_end(&rt->orchestrator);
+    scope_end_impl(rt);
 }
 
 void pto2_rt_submit_task(PTO2Runtime* rt,
@@ -167,32 +197,10 @@ void pto2_rt_submit_task(PTO2Runtime* rt,
                          const char* func_name,
                          PTOParam* params,
                          int32_t num_params) {
-    pto2_submit_task(&rt->orchestrator, kernel_id, worker_type,
-                     func_name, params, num_params);
-}
-
-void pto2_rt_submit(PTO2Runtime* rt,
-                    const char* func_name,
-                    PTOParam* params,
-                    int32_t num_params) {
-    // Auto-detect worker type based on function name
-    PTO2WorkerType worker_type = PTO2_WORKER_VECTOR;  // Default
-
-    if (func_name) {
-        if (strstr(func_name, "gemm") || strstr(func_name, "matmul") ||
-            strstr(func_name, "conv") || strstr(func_name, "cube")) {
-            worker_type = PTO2_WORKER_CUBE;
-        } else if (strstr(func_name, "dma") || strstr(func_name, "copy")) {
-            worker_type = PTO2_WORKER_ACCELERATOR;
-        } else if (strstr(func_name, "cpu") || strstr(func_name, "scalar")) {
-            worker_type = PTO2_WORKER_AI_CPU;
-        }
-    }
-
-    pto2_submit_task(&rt->orchestrator, 0, worker_type,
+    submit_task_impl(rt, kernel_id, worker_type,
                      func_name, params, num_params);
 }
 
 void pto2_rt_orchestration_done(PTO2Runtime* rt) {
-    pto2_orchestrator_done(&rt->orchestrator);
+    orchestration_done_impl(rt);
 }
