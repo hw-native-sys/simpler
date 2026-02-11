@@ -7,7 +7,6 @@
 #include <cstdint>
 // clang-format off
 #include <pto/pto-inst.hpp>          // defines CPU stubs (incl. __gm__) under __CPU_SIM
-#include <pto/common/constants.hpp>  // uses __gm__ in some headers
 // clang-format on
 
 using namespace pto;

@@ -10,7 +10,6 @@
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
-#include <pto/common/constants.hpp>
 
 using namespace pto;
 
