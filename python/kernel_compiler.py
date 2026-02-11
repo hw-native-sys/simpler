@@ -365,31 +365,13 @@ class KernelCompiler:
         )
         toolchain = self.aarch64 if toolchain_type == ToolchainType.AARCH64_GXX else self.host_gxx
 
-        if toolchain_type == ToolchainType.HOST_GXX:
-            return self._compile_orchestration_shared_lib(
-                source_path, toolchain, extra_include_dirs=include_dirs,
-                extra_sources=orch_sources or None,
-            )
-
-        # AARCH64_GXX (a2a3 only): cross-compilation (no extra runtime sources
-        # needed — orchestration uses the ops table via pto_orchestration_api.h)
-        if runtime_name == "tensormap_and_ringbuffer":
-            return self._compile_orchestration_shared_lib(
-                source_path, toolchain,
-                extra_include_dirs=include_dirs,
-                extra_sources=orch_sources or None,
-            )
-
-        if runtime_name == "aicpu_build_graph":
-            return self._compile_orchestration_shared_lib(
-                source_path, toolchain,
-                extra_include_dirs=include_dirs,
-                extra_sources=orch_sources or None,
-            )
-
-        raise ValueError(
-            f"Unknown runtime for AARCH64_GXX: {runtime_name}. "
-            f"Supported: host_build_graph, tensormap_and_ringbuffer, aicpu_build_graph"
+        # HOST_GXX: simulation build (host execution)
+        # AARCH64_GXX: cross-compilation for supported runtimes
+        #   Note: orchestration uses ops table via pto_orchestration_api.h (no extra runtime sources needed)
+        return self._compile_orchestration_shared_lib(
+            source_path, toolchain,
+            extra_include_dirs=include_dirs,
+            extra_sources=orch_sources or None,
         )
 
     def _compile_orchestration_shared_lib(
