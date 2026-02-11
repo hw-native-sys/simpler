@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "common.h"
+#include "pto_orchestrator.h"
 #include "tensor.h"
 
 // =============================================================================
@@ -169,6 +171,11 @@ uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, Tensor* tensor) {
 
 void pto2_tensormap_sync_validity(PTO2TensorMap* tm, int32_t last_task_alive) { tm->last_task_alive = last_task_alive; }
 
+void pto2_tensormap_remove_entry(PTO2TensorMap& tm, PTO2TensorMapEntry* entry) {
+    pto2_tensormap_remove_from_bucket(&tm, entry);
+    pto2_tensormap_remove_from_task(&tm, entry);
+}
+
 void pto2_tensormap_remove_from_bucket(PTO2TensorMap* tm, PTO2TensorMapEntry* entry) {
     if (!entry->in_bucket) {
         return;  // Already removed
@@ -241,10 +248,12 @@ void pto2_tensormap_cleanup_retired(PTO2TensorMap* tm, int32_t old_last_task_ali
 // Lookup with Chain Truncation
 // =============================================================================
 
-int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor) {
+std::vector<std::pair<PTO2TensorMapEntry*, OverlapStatus>> pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor) {
     uint32_t bucket = pto2_tensormap_hash(tm, tensor);
     int32_t* prev_ptr = &tm->buckets[bucket];  // For truncation
     int32_t offset = *prev_ptr;
+
+    std::vector<std::pair<PTO2TensorMapEntry*, OverlapStatus>> task_ids;
 
     while (offset >= 0) {
         PTO2TensorMapEntry* entry = &tm->entry_pool[offset];
@@ -266,14 +275,15 @@ int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor) {
                 offset = next;
             }
 
-            return -1;  // Not found (and cleaned up stale tail)
+            return task_ids;
         }
 
         // Entry is valid - check if regions OVERLAP (not just exact match)
         // Since we hash only by base_ptr, all entries in this bucket have
         // potential to overlap. We must check actual byte-range overlap.
-        if (tensor->is_overlap(entry->tensor)) {
-            return entry->producer_task_id;  // FOUND (overlapping region)
+        auto overlap_status = tensor->is_overlap(entry->tensor);
+        if (overlap_status != OverlapStatus::NO_OVERLAP) {
+            task_ids.emplace_back(entry, overlap_status);
         }
 
         // Move to next entry
@@ -281,14 +291,14 @@ int32_t pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor) {
         offset = *prev_ptr;
     }
 
-    return -1;  // Not found
+    return task_ids;
 }
 
 // =============================================================================
 // Insert
 // =============================================================================
 
-void pto2_tensormap_insert(PTO2TensorMap* tm, Tensor* tensor, int32_t producer_task_id) {
+void pto2_tensormap_insert(PTO2TensorMap* tm, Tensor* tensor, int32_t producer_task_id, bool with_alloc) {
     // Allocate entry from ring buffer pool
     int32_t entry_offset = tm->pool_head;
     PTO2TensorMapEntry* entry = &tm->entry_pool[entry_offset];
@@ -296,15 +306,16 @@ void pto2_tensormap_insert(PTO2TensorMap* tm, Tensor* tensor, int32_t producer_t
     // Advance pool head (wrap around)
     tm->pool_head = (tm->pool_head + 1) % tm->pool_size;
 
-    // TODO：这里需要改成不断等待tensor_map清理旧task数据
-    if (entry->in_bucket) {
-        pto2_tensormap_remove_from_bucket(tm, entry);
-        pto2_tensormap_remove_from_task(tm, entry);
+    int wait_count = 0;
+    while (entry->in_bucket) {
+        pto2_orchestrator_sync_tensormap(tm);
+        always_assert(wait_count++ <= 100000000);
     }
 
     // Initialize new entry
     entry->tensor = *tensor;
     entry->producer_task_id = producer_task_id;
+    entry->with_alloc = with_alloc;
 
     // Insert at head of hash bucket (maintains task_id descending order)
     uint32_t bucket = pto2_tensormap_hash(tm, tensor);
@@ -395,4 +406,23 @@ int32_t pto2_tensormap_valid_count(PTO2TensorMap* tm) {
     }
 
     return count;
+}
+
+// =============================================================================
+// TensorMap Synchronization
+// =============================================================================
+
+void pto2_orchestrator_sync_tensormap(PTO2TensorMap* tm) {
+    always_assert(tm->orch != nullptr);
+    // Read current last_task_alive from shared memory
+    int32_t new_last_task_alive = PTO2_LOAD_ACQUIRE(&tm->orch->sm_handle->header->last_task_alive);
+
+    // Update TensorMap validity threshold
+    pto2_tensormap_sync_validity(tm, new_last_task_alive);
+
+    // Periodically cleanup TensorMap to remove stale entries from bucket chains
+    if (new_last_task_alive - tm->orch->tensormap_last_cleanup >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
+        pto2_tensormap_cleanup_retired(tm, tm->orch->tensormap_last_cleanup, new_last_task_alive);
+        tm->orch->tensormap_last_cleanup = new_last_task_alive;
+    }
 }

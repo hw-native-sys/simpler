@@ -45,7 +45,7 @@
 #endif
 
 #ifndef RUNTIME_MAX_ORCH_SO_SIZE
-#define RUNTIME_MAX_ORCH_SO_SIZE (1024 * 1024)  // 1MB max for orchestration SO
+#define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 1MB max for orchestration SO
 #endif
 
 // =============================================================================
@@ -86,14 +86,14 @@
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;  // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;         // Task pointer: 0=no task, non-zero=PTO2DispatchPayload*
-    volatile int32_t task_status;   // Task execution status: 0=idle, 1=busy
-    volatile int32_t control;       // Control signal: 0=execute, 1=quit
-    volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t perf_records_addr; // Performance records address
-    volatile uint32_t perf_buffer_status; // 0 = not full, 1 == full
+    volatile uint32_t aicpu_ready;         // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;         // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;                // Task pointer: 0=no task, non-zero=PTO2DispatchPayload*
+    volatile int32_t task_status;          // Task execution status: 0=idle, 1=busy
+    volatile int32_t control;              // Control signal: 0=execute, 1=quit
+    volatile CoreType core_type;           // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint64_t perf_records_addr;   // Performance records address
+    volatile uint32_t perf_buffer_status;  // 0 = not full, 1 == full
 } __attribute__((aligned(64)));
 
 /**
@@ -155,8 +155,8 @@ public:
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
     // Profiling support
-    bool enable_profiling;                  // Enable profiling flag
-    uint64_t perf_data_base;                // Performance data shared memory base address (device-side)
+    bool enable_profiling;    // Enable profiling flag
+    uint64_t perf_data_base;  // Performance data shared memory base address (device-side)
 
 private:
     // Tensor pairs for host-device memory tracking
@@ -165,8 +165,8 @@ private:
 
     // Device orchestration: when false, orchestration runs on device (thread 3)
     bool orch_built_on_host_;
-    void* pto2_gm_sm_ptr_;   // GM pointer to PTO2 shared memory (device)
-    uint64_t* orch_args_;    // Arguments for device orchestration
+    void* pto2_gm_sm_ptr_;  // GM pointer to PTO2 shared memory (device)
+    uint64_t* orch_args_;   // Arguments for device orchestration
     int orch_arg_count_;
     uint64_t orch_args_storage_[RUNTIME_MAX_ARGS];  // Copy of args for device
 
@@ -240,7 +240,7 @@ public:
     bool get_use_pto2_dispatch() const { return true; }
 
     /** @deprecated Use PTO2 dispatch mode */
-    void set_use_pto2_dispatch(bool) { }
+    void set_use_pto2_dispatch(bool) {}
 
     // =========================================================================
     // Host API (host-only, not copied to device)

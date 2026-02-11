@@ -376,15 +376,15 @@ uint64_t Tensor::offset_ndim_to_1d(const uint64_t offset_ndims[]) const {
     return result;
 }
 
-bool Tensor::is_overlap(const Tensor& pre_task_output) const {
+OverlapStatus Tensor::is_overlap(const Tensor& pre_task_output) const {
     printf("input: %s\n", dump().c_str());
     printf("output: %s\n", pre_task_output.dump().c_str());
     if (!is_same_memref(pre_task_output)) {
-        return false;
+        return OverlapStatus::NO_OVERLAP;
     }
     debug_assert(version >= pre_task_output.version);
     if (version > pre_task_output.version) {
-        return true;
+        return OverlapStatus::OTHER;
     }
 
     // Convert element offsets to byte offsets for comparison
@@ -402,19 +402,23 @@ bool Tensor::is_overlap(const Tensor& pre_task_output) const {
         output_memory_fuzzy_seg.begin * elem_size_output, output_memory_fuzzy_seg.end * elem_size_output};
 
     if (!input_byte_seg.line_segment_intersection(output_byte_seg)) {
-        return false;
+        return OverlapStatus::NO_OVERLAP;
     }
 
     // 只做模糊判断
     if (pre_task_output.overlap_type == OverlapType::Fuzzy) {
-        return true;
+        return OverlapStatus::OTHER;
     }
 
     // 一维场景
     if (ndims == 1 && pre_task_output.ndims == 1) {
         debug_assert(strides[0] == 1);
         debug_assert(pre_task_output.strides[0] == 1);
-        return true;
+        if (input_byte_seg.contains(output_byte_seg)) {
+            return OverlapStatus::COVERED;
+        } else {
+            return OverlapStatus::OTHER;
+        }
     }
 
     // 精准判断 - only if same dtype and strides
@@ -426,6 +430,8 @@ bool Tensor::is_overlap(const Tensor& pre_task_output) const {
         pre_task_output.offset_to_ndims(output_offset_ndims);
         // O(ndims) 判断超矩形间overlap
         bool need_complex_compare = false;
+        bool contains = true;
+        bool overlap = true;
         for (uint64_t i = 0; i < ndims; i++) {
             Segment input_range_dim_i{input_offset_ndims[i], input_offset_ndims[i] + repeats[i]};
             Segment output_range_dim_i{output_offset_ndims[i], output_offset_ndims[i] + pre_task_output.repeats[i]};
@@ -444,15 +450,23 @@ bool Tensor::is_overlap(const Tensor& pre_task_output) const {
                 }
             }
             if (!input_range_dim_i.line_segment_intersection(output_range_dim_i)) {
-                return false;
+                overlap = false;
+            } else if (!input_range_dim_i.contains(output_range_dim_i)) {
+                contains = false;
             }
         }
         if (!need_complex_compare) {
-            return true;
+            if (contains) {
+                return OverlapStatus::COVERED;
+            } else if (overlap) {
+                return OverlapStatus::OTHER;
+            } else {
+                return OverlapStatus::NO_OVERLAP;
+            }
         }
     }
     // O(\prod repeats[i]) 判断线段相交
-    return complex_overlap(pre_task_output);
+    return complex_overlap(pre_task_output) ? OverlapStatus::OTHER : OverlapStatus::NO_OVERLAP;
 }
 
 bool Tensor::complex_overlap(const Tensor& pre_task_output) const {

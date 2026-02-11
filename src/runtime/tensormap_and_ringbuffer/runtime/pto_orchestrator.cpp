@@ -13,6 +13,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "pto_tensormap.h"
 #include "tensor.h"
 
 // =============================================================================
@@ -61,6 +62,7 @@ bool pto2_orchestrator_init(
     if (!pto2_tensormap_init_default(&orch->tensor_map)) {
         return false;
     }
+    orch->tensor_map.orch = orch;
     orch->tensormap_last_cleanup = 0;
 
     // Initialize scope stack: one flat buffer for task IDs + one array for begin offsets
@@ -159,24 +161,6 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 }
 
 // =============================================================================
-// TensorMap Synchronization
-// =============================================================================
-
-void pto2_orchestrator_sync_tensormap(PTO2OrchestratorState* orch) {
-    // Read current last_task_alive from shared memory
-    int32_t new_last_task_alive = PTO2_LOAD_ACQUIRE(&orch->sm_handle->header->last_task_alive);
-
-    // Update TensorMap validity threshold
-    pto2_tensormap_sync_validity(&orch->tensor_map, new_last_task_alive);
-
-    // Periodically cleanup TensorMap to remove stale entries from bucket chains
-    if (new_last_task_alive - orch->tensormap_last_cleanup >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
-        pto2_tensormap_cleanup_retired(&orch->tensor_map, orch->tensormap_last_cleanup, new_last_task_alive);
-        orch->tensormap_last_cleanup = new_last_task_alive;
-    }
-}
-
-// =============================================================================
 // Task Submission
 // =============================================================================
 
@@ -232,7 +216,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     PTOParam* params,
     int32_t num_params) {
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
-    pto2_orchestrator_sync_tensormap(orch);
+    pto2_orchestrator_sync_tensormap(&orch->tensor_map);
 
     // Submission without an open scope is illegal
     assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
@@ -284,15 +268,17 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         PTOParam* p = &params[i];
 
         switch (p->type) {
+            case PTOParamType::INOUT:
             case PTOParamType::INPUT: {
                 // Look up producer via TensorMap
-                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, params[i].tensor);
+                auto dependency_task_ids = pto2_tensormap_lookup(&orch->tensor_map, params[i].tensor);
 
-                if (producer_id >= 0) {
+                for (auto [entry, overlap_status] : dependency_task_ids) {
                     // Check if this producer is already in fanin list (avoid duplicates)
+                    int producer_task_id = entry->producer_task_id;
                     bool already_added = false;
                     for (int j = 0; j < fanin_count; j++) {
-                        if (fanin_temp[j] == producer_id) {
+                        if (fanin_temp[j] == producer_task_id) {
                             already_added = true;
                             break;
                         }
@@ -301,12 +287,21 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                     if (!already_added) {
                         // Add to fanin list (this task depends on producer)
                         if (fanin_count < PTO2_MAX_INPUTS) {
-                            fanin_temp[fanin_count++] = producer_id;
+                            fanin_temp[fanin_count++] = producer_task_id;
                         }
 
                         // Add this task to producer's fanout list (with spinlock)
-                        PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, producer_id);
-                        pto2_add_consumer_to_producer(orch, producer, producer_id, task_id);
+                        PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, producer_task_id);
+                        pto2_add_consumer_to_producer(orch, producer, producer_task_id, task_id);
+                    }
+                    if (p->type == PTOParamType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                        // inout因为会再次insert进tensor map，
+                        // 因此为了尽量减少依赖构建个数（尽可能构造链式依赖），当该tensor完全覆盖前面的tensor时，
+                        // 应将前面的tensor从tensor map中剔除。
+                        // 但是最开始的tensor除外，因为必须建立和最开始的task的依赖关系以保证tensor生命周期的正确管理
+                        if (!entry->with_alloc) {
+                            pto2_tensormap_remove_entry(orch->tensor_map, entry);
+                        }
                     }
                 }
                 break;
@@ -316,30 +311,6 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                 // Only allocate from ring buffer when caller did not provide an address
                 if (params[i].tensor->buffer.addr == 0) {
                     total_output_size += PTO2_ALIGN_UP(params[i].tensor->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
-                }
-                break;
-            }
-
-            case PTOParamType::INOUT: {
-                // Handle as input (get dependency on previous writer)
-                int32_t producer_id = pto2_tensormap_lookup(&orch->tensor_map, params[i].tensor);
-                if (producer_id >= 0) {
-                    // Check if this producer is already in fanin list (avoid duplicates)
-                    bool already_added = false;
-                    for (int j = 0; j < fanin_count; j++) {
-                        if (fanin_temp[j] == producer_id) {
-                            already_added = true;
-                            break;
-                        }
-                    }
-
-                    if (!already_added) {
-                        if (fanin_count < PTO2_MAX_INPUTS) {
-                            fanin_temp[fanin_count++] = producer_id;
-                        }
-                        PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, producer_id);
-                        pto2_add_consumer_to_producer(orch, producer, producer_id, task_id);
-                    }
                 }
                 break;
             }
@@ -378,7 +349,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         if (p->type == PTOParamType::OUTPUT || p->type == PTOParamType::INOUT) {
             // Register in TensorMap: this tensor is produced by task_id
             // Use task's tensor_copies (which has the heap-allocated address for outputs)
-            pto2_tensormap_insert(&orch->tensor_map, &task->tensor_copies[i], task_id);
+            pto2_tensormap_insert(&orch->tensor_map, &task->tensor_copies[i], task_id, p->type == PTOParamType::OUTPUT);
             output_idx++;
         }
     }

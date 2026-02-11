@@ -41,11 +41,18 @@ enum class OverlapType {
     Fuzzy = 1,
 };
 
+enum class OverlapStatus {
+    NO_OVERLAP,
+    COVERED,
+    OTHER,
+};
+
 struct Segment {
     uint64_t begin;
     uint64_t end;
 
     bool line_segment_intersection(const Segment& other) const { return end > other.begin && other.end > begin; }
+    bool contains(const Segment& other) const { return begin <= other.begin && other.end <= end; }
 };
 
 // 特殊值，表示 reshape 后需要分配新地址
@@ -157,7 +164,7 @@ struct Tensor {
 
     uint64_t offset_ndim_to_1d(const uint64_t offset_ndims[]) const;
 
-    bool is_overlap(const Tensor& pre_task_output) const;
+    OverlapStatus is_overlap(const Tensor& pre_task_output) const;
 
     bool complex_overlap(const Tensor& pre_task_output) const;
 
@@ -190,7 +197,6 @@ static inline Tensor make_tensor_external(
  * Create a Tensor for runtime-allocated output (addr=0).
  * The runtime fills in the actual address during pto2_submit_task.
  */
-static inline Tensor make_tensor(
-    int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
+static inline Tensor make_tensor(int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
     return Tensor::make_1d_contiguous(0, size_bytes, version, dtype);
 }
