@@ -36,7 +36,7 @@
 // =============================================================================
 
 #ifndef RUNTIME_MAX_TASKS
-#define RUNTIME_MAX_TASKS 4096
+#define RUNTIME_MAX_TASKS 131072
 #endif
 
 #ifndef RUNTIME_MAX_ARGS

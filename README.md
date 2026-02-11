@@ -577,7 +577,7 @@ Full Python API with ctypes:
 ### Compile-time Configuration (Runtime Limits)
 In [src/runtime/host_build_graph/runtime/runtime.h](src/runtime/host_build_graph/runtime/runtime.h):
 ```cpp
-#define RUNTIME_MAX_TASKS 1024     // Maximum number of tasks
+#define RUNTIME_MAX_TASKS 131072   // Maximum number of tasks
 #define RUNTIME_MAX_ARGS 16        // Maximum arguments per task
 #define RUNTIME_MAX_FANOUT 512     // Maximum successors per task
 ```

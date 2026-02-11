@@ -1,4 +1,4 @@
-# Paged Attention CCE Example
+# Paged Attention (Device Test)
 
 This example demonstrates Paged Attention implementation using CCE (Cube Core Engine) code generation, with AIC matmul kernels and AIV vector kernels using PTO Tile API.
 
@@ -14,8 +14,9 @@ Paged Attention is an efficient attention mechanism that processes KV cache in f
 
 | Platform | Description |
 |----------|-------------|
-| a2a3sim | Thread-based simulator |
 | a2a3 | Ascend hardware (requires device ID) |
+
+> This test uses bfloat16 data types and production-scale shapes that are not supported by the a2a3sim simulator. It only runs on real hardware.
 
 ### Algorithm
 
@@ -60,29 +61,23 @@ Block n: QK -> SF -> PV --+
 ## Quick Start
 
 ```bash
-# Run on simulator
-python examples/scripts/run_example.py \
-  -k examples/paged_attention_cce/kernels \
-  -g examples/paged_attention_cce/golden.py \
-  -p a2a3sim
-
 # Run on hardware (specify device ID)
 python examples/scripts/run_example.py \
-  -k examples/paged_attention_cce/kernels \
-  -g examples/paged_attention_cce/golden.py \
-  -p a2a3 -d=13
+  -k tests/device_tests/host_build_graph/paged_attention/kernels \
+  -g tests/device_tests/host_build_graph/paged_attention/golden.py \
+  -p a2a3 -d 0
 
 # Run multi-block test case
 PA_CASE=Case2 python examples/scripts/run_example.py \
-  -k examples/paged_attention_cce/kernels \
-  -g examples/paged_attention_cce/golden.py \
-  -p a2a3sim
+  -k tests/device_tests/host_build_graph/paged_attention/kernels \
+  -g tests/device_tests/host_build_graph/paged_attention/golden.py \
+  -p a2a3 -d 0
 ```
 
 ## Directory Structure
 
 ```
-paged_attention_cce/
+paged_attention/
 ├── README.md                    # This file
 ├── golden.py                    # Input generation and expected output
 └── kernels/
@@ -99,12 +94,12 @@ paged_attention_cce/
 
 ## Test Cases
 
-| Case | batch | num_heads | head_dim | block_size | block_num | Description |
-|------|-------|-----------|----------|------------|-----------|-------------|
-| Case1 | 1 | 16 | 16 | 16 | 1 | Single block (default) |
-| Case2 | 1 | 16 | 16 | 16 | 4 | Multi-block (4 blocks) |
+| Case | batch | num_heads | kv_head_num | head_dim | block_size | context_len | Description |
+|------|-------|-----------|-------------|----------|------------|-------------|-------------|
+| Case1 | 1 | 16 | 1 | 128 | 128 | 256 | Small scale (default) |
+| Case2 | 8 | 64 | 1 | 128 | 64 | 8192 | Production scale |
 
-All test cases use **16x16 tile dimensions** (256 elements, 1024 bytes per tile).
+All test cases use **bfloat16** Q/K/V inputs with GQA (kv_head_num=1).
 
 ## Key Technical Details
 
@@ -190,12 +185,8 @@ TEST PASSED
 
 ## Reference
 
-This implementation corresponds to the PyPTO paged_attention.py:
-- /data/w00949583/pypto/examples/ir_parser/paged_attention.py
-
-Both implementations use the same Online Softmax algorithm with identical kernel structure.
+This implementation uses the Online Softmax algorithm for paged attention, with identical kernel structure to the PyPTO reference implementation.
 
 ## See Also
 
-- [Test Framework Documentation](../scripts/README.md)
-- [Paged Attention (original)](../paged_attention/) - PTO Tile API only version
+- [Test Framework Documentation](../../../../examples/scripts/README.md)

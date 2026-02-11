@@ -84,4 +84,36 @@ while IFS= read -r -d '' example_dir; do
     fi
 done < <(find "$EXAMPLES_DIR" -mindepth 1 -type d -print0 | sort -z)
 
+# Discover and run device tests (a2a3 hardware only - never run on simulator)
+DEVICE_TESTS_DIR="tests/device_tests"
+if [[ -d "$DEVICE_TESTS_DIR" ]]; then
+    RUN_DEVICE_TESTS=false
+    if [[ "$PLATFORM" == "a2a3" ]]; then
+        RUN_DEVICE_TESTS=true
+    elif [[ -z "$PLATFORM" && "$OS" == "Linux" ]]; then
+        RUN_DEVICE_TESTS=true
+    fi
+
+    if [[ "$RUN_DEVICE_TESTS" == "true" ]]; then
+        while IFS= read -r -d '' test_dir; do
+            kernel_config="${test_dir}/kernels/kernel_config.py"
+            golden="${test_dir}/golden.py"
+
+            if [[ -f "$kernel_config" && -f "$golden" ]]; then
+                test_name="${test_dir#$DEVICE_TESTS_DIR/}"
+                echo "========================================"
+                echo "Running device test: $test_name"
+                echo "========================================"
+
+                python examples/scripts/run_example.py \
+                    -k "${test_dir}/kernels" \
+                    -g "$golden" \
+                    -p a2a3 -d "$DEVICE_ID"
+            fi
+        done < <(find "$DEVICE_TESTS_DIR" -mindepth 1 -type d -print0 | sort -z)
+    else
+        echo "Skipping device tests (a2a3 hardware only)"
+    fi
+fi
+
 echo "All tests passed!"

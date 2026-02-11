@@ -52,6 +52,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install numpy
+          pip install ml_dtypes
           pip install pytest
 
       - name: Run simulation examples
