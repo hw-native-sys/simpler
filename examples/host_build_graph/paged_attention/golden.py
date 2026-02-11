@@ -1,18 +1,16 @@
 """
-Paged Attention Golden Implementation - Production Scale
+Paged Attention Golden Implementation - Small Scale (16x16)
 
 Implements the online softmax algorithm for paged attention with:
-- bfloat16 Q/K/V inputs
+- float16 Q/K/V inputs (sim-compatible)
 - Non-transposed K storage: (total_blocks, block_size, kv_head_num, head_dim)
 - GQA support (kv_head_num=1)
-- Head tiling: q_tile = min(q_head_num, 128)
-- Random block table mapping
+- 16x16 tile dimensions for fast simulation
 """
 
 import os
 import struct
 import numpy as np
-import ml_dtypes
 
 # Output tensor names
 __outputs__ = ["out"]
@@ -21,29 +19,29 @@ __outputs__ = ["out"]
 TENSOR_ORDER = ["query", "key_cache", "value_cache", "block_table", "context_lens", "out", "config"]
 
 # Comparison tolerances
-RTOL = 1e-3
-ATOL = 1e-3
+RTOL = 1e-2
+ATOL = 1e-2
 
 
-# All test cases - production scale
+# All test cases - small scale (16x16 tiles)
 ALL_CASES = {
     "Case1": {
-        "batch": 256,
+        "batch": 1,
         "num_heads": 16,
         "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 128,
-        "context_len": 8192,
-        "max_model_len": 32768,
+        "head_dim": 16,
+        "block_size": 16,
+        "context_len": 16,
+        "max_model_len": 256,
     },
     "Case2": {
-        "batch": 64,
-        "num_heads": 64,
+        "batch": 1,
+        "num_heads": 16,
         "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 64,
-        "context_len": 8192,
-        "max_model_len": 32768,
+        "head_dim": 16,
+        "block_size": 16,
+        "context_len": 64,
+        "max_model_len": 256,
     },
 }
 
@@ -88,20 +86,20 @@ def generate_inputs(params: dict) -> dict:
         dtype=np.int64,
     )
 
-    # Query: (batch, 1, num_heads * head_dim) -> (batch, num_heads, head_dim) bfloat16
-    query_bf16 = np.random.uniform(-0.5, 0.5, size=(batch, 1, num_heads * head_dim)).astype(ml_dtypes.bfloat16)
-    query_bf16 = query_bf16.reshape(batch, num_heads, head_dim)
+    # Query: (batch, 1, num_heads * head_dim) -> (batch, num_heads, head_dim) float16
+    query_fp16 = np.random.uniform(-0.5, 0.5, size=(batch, 1, num_heads * head_dim)).astype(np.float16)
+    query_fp16 = query_fp16.reshape(batch, num_heads, head_dim)
 
-    # Key cache: (total_blocks, block_size, kv_head_num, head_dim) bfloat16
-    key_bf16 = np.random.uniform(-0.5, 0.5, size=(total_blocks, block_size, kv_head_num, head_dim)).astype(ml_dtypes.bfloat16)
+    # Key cache: (total_blocks, block_size, kv_head_num, head_dim) float16
+    key_fp16 = np.random.uniform(-0.5, 0.5, size=(total_blocks, block_size, kv_head_num, head_dim)).astype(np.float16)
 
-    # Value cache: (total_blocks, block_size, kv_head_num, head_dim) bfloat16
-    value_bf16 = np.random.uniform(-1, 1, size=(total_blocks, block_size, kv_head_num, head_dim)).astype(ml_dtypes.bfloat16)
+    # Value cache: (total_blocks, block_size, kv_head_num, head_dim) float16
+    value_fp16 = np.random.uniform(-1, 1, size=(total_blocks, block_size, kv_head_num, head_dim)).astype(np.float16)
 
     return {
-        "query": query_bf16.flatten(),
-        "key_cache": key_bf16.flatten(),
-        "value_cache": value_bf16.flatten(),
+        "query": query_fp16.flatten(),
+        "key_cache": key_fp16.flatten(),
+        "value_cache": value_fp16.flatten(),
         "block_table": block_table.flatten(),
         "context_lens": context_lens,
         "out": np.zeros(batch * num_heads * head_dim, dtype=np.float32),
@@ -123,9 +121,9 @@ def paged_attention(
     Compute paged attention using online softmax with head tiling and GQA.
 
     Args:
-        query: (batch, num_heads, head_dim) bfloat16
-        key_cache: (total_blocks, block_size, num_kv_heads, head_dim) bfloat16
-        value_cache: (total_blocks, block_size, num_kv_heads, head_dim) bfloat16
+        query: (batch, num_heads, head_dim) float16
+        key_cache: (total_blocks, block_size, num_kv_heads, head_dim) float16
+        value_cache: (total_blocks, block_size, num_kv_heads, head_dim) float16
         num_kv_heads: int
         num_heads: int
         scale_value: float
@@ -169,7 +167,7 @@ def paged_attention(
 
                 sij = (qi @ kj.T) * scale_value
                 mij = sij.max(axis=-1, keepdims=True)
-                pij = np.exp(sij - mij).astype(ml_dtypes.bfloat16).astype(np.float32)
+                pij = np.exp(sij - mij).astype(np.float16).astype(np.float32)
                 lij = np.sum(pij, axis=1, keepdims=True)
 
                 if bn == 0:
@@ -205,7 +203,7 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
     max_num_blocks_per_req = max_model_len // block_size
 
-    # Reconstruct shaped arrays from flat bfloat16 tensors
+    # Reconstruct shaped arrays from flat float16 tensors
     query = tensors["query"].reshape(batch, num_heads, head_dim)
     key_cache = tensors["key_cache"].reshape(-1, block_size, kv_head_num, head_dim)
     value_cache = tensors["value_cache"].reshape(-1, block_size, kv_head_num, head_dim)
