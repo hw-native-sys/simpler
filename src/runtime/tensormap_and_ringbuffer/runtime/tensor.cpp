@@ -346,9 +346,9 @@ Tensor Tensor::transpose(uint64_t x, uint64_t y) const {
 Segment Tensor::get_fuzzy_seg() const {
     uint64_t end_offset = start_offset;
     for (uint64_t i = 0; i < ndims; i++) {
-        end_offset += strides[i] * repeats[i];
+        end_offset += strides[i] * (repeats[i] - 1);
     }
-    return {start_offset, end_offset};
+    return {start_offset, end_offset + 1};
 }
 
 bool Tensor::is_same_strides(const Tensor& other) const {
