@@ -36,24 +36,22 @@
  * Returns monotonic counter value at 1850 MHz frequency.
  * Uses std::chrono::high_resolution_clock and converts to counter ticks.
  *
- * @return Simulated counter value (ticks since program start)
+ * @return Simulated counter value (ticks since epoch)
  */
 inline uint64_t get_sys_cnt() {
-    // Use a global start time to ensure consistency across all threads
-    static auto program_start = std::chrono::high_resolution_clock::now();
-
     auto now = std::chrono::high_resolution_clock::now();
     uint64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        now - program_start
+        now.time_since_epoch()
     ).count();
 
     // Convert nanoseconds to counter ticks at PLATFORM_PROF_SYS_CNT_FREQ
     // Split elapsed_ns into seconds and remainder to avoid overflow
-    uint64_t seconds = elapsed_ns / 1000000000ULL;
-    uint64_t remaining_ns = elapsed_ns % 1000000000ULL;
+    constexpr uint64_t kNsPerSec = std::nano::den;
+    uint64_t seconds = elapsed_ns / kNsPerSec;
+    uint64_t remaining_ns = elapsed_ns % kNsPerSec;
 
     uint64_t ticks = seconds * PLATFORM_PROF_SYS_CNT_FREQ +
-                     (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / 1000000000ULL;
+                     (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
 
     return ticks;
 }

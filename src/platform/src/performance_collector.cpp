@@ -303,6 +303,8 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         double end_us = cycles_to_us(record.end_time);
         double duration_us = end_us - start_us;
         double kernel_ready_us = cycles_to_us(record.kernel_ready_time);
+        double dispatch_us = (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time) : 0.0;
+        double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time) : 0.0;
 
         // Determine core type string
         const char* core_type_str = (record.core_type == CoreType::AIC) ? "aic" : "aiv";
@@ -316,6 +318,8 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
         outfile << "      \"kernel_ready_time_us\": " << std::fixed << std::setprecision(3) << kernel_ready_us << ",\n";
+        outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
+        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
         outfile << "      \"fanout\": [";
         for (int j = 0; j < record.fanout_count; ++j) {
             outfile << record.fanout[j];

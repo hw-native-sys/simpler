@@ -163,9 +163,15 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
             - task_id, func_id, core_id, core_type
             - start_time_us, end_time_us, duration_us
             - kernel_ready_time_us, fanout, fanout_count
+            - dispatch_time_us (optional, AICPU dispatch timestamp)
+            - finish_time_us (optional, AICPU finish timestamp)
         output_path: Path to output JSON file
         func_id_to_name: Optional dict mapping func_id to function name
         verbose: Print progress information
+
+    Generates two processes in the trace:
+        - pid=1 "AICore View": start_time_us to end_time_us (kernel execution)
+        - pid=2 "AICPU View": dispatch_time_us to finish_time_us (AICPU perspective)
     """
     if verbose:
         print(f"Generating Chrome Trace JSON...")
@@ -190,14 +196,29 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
     # Step 2: Generate JSON events
     events = []
 
-    # Metadata event: Process name
+    # Metadata event: Process names
     events.append({
-        "args": {"name": "Machine View"},
+        "args": {"name": "AICore View"},
         "cat": "__metadata",
         "name": "process_name",
         "ph": "M",
         "pid": 1
     })
+
+    # Check if any task has AICPU timestamps
+    has_aicpu_data = any(
+        task.get('dispatch_time_us', 0) > 0 and task.get('finish_time_us', 0) > 0
+        for task in tasks
+    )
+
+    if has_aicpu_data:
+        events.append({
+            "args": {"name": "AICPU View"},
+            "cat": "__metadata",
+            "name": "process_name",
+            "ph": "M",
+            "pid": 2
+        })
 
     # Metadata events: Thread names (one per core)
     for core_id, tid in core_to_tid.items():
@@ -219,6 +240,17 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
             "pid": 1,
             "tid": tid
         })
+
+        # Also add thread name for AICPU View if data exists
+        if has_aicpu_data:
+            events.append({
+                "args": {"name": thread_name},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": 2,
+                "tid": tid
+            })
 
     # Duration events (Complete events "X")
     # Build task_id -> event_id mapping for flow events
@@ -264,6 +296,44 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
         # Record mapping for flow events
         task_to_event_id[task['task_id']] = event_id
         event_id += 1
+
+    # AICPU View duration events (dispatch_time to finish_time)
+    if has_aicpu_data:
+        for task in tasks:
+            dispatch_us = task.get('dispatch_time_us', 0)
+            finish_us = task.get('finish_time_us', 0)
+            if dispatch_us <= 0 or finish_us <= 0:
+                continue
+
+            tid = core_to_tid[task['core_id']]
+            aicpu_dur = finish_us - dispatch_us
+
+            # Get function name if available
+            func_id = task['func_id']
+            if func_id_to_name and str(func_id) in func_id_to_name:
+                func_name = func_id_to_name[str(func_id)]
+                task_name = f"{func_name}({task['task_id']})"
+            else:
+                task_name = f"Func_{func_id}({task['task_id']})"
+
+            events.append({
+                "args": {
+                    "event-hint": f"Task:{task['task_id']}, FuncId:{func_id}, CoreId:{task['core_id']}",
+                    "dispatch-time-us": dispatch_us,
+                    "finish-time-us": finish_us,
+                    "aicpu-duration-us": aicpu_dur,
+                    "taskId": task['task_id']
+                },
+                "cat": "event",
+                "id": event_id,
+                "name": task_name,
+                "ph": "X",
+                "pid": 2,
+                "tid": tid,
+                "ts": dispatch_us,
+                "dur": aicpu_dur
+            })
+            event_id += 1
 
     # Flow events (Flow events "s" and "f" for dependencies)
     task_map = {t['task_id']: t for t in tasks}

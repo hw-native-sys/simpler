@@ -81,6 +81,10 @@ struct PerfRecord {
                                  // Records when AICore enters main loop (ready to execute)
                                  // Used for: 1) startup overhead analysis, 2) cross-core alignment
 
+    // AICPU-side timestamps (written by AICPU, not AICore)
+    uint64_t dispatch_time;      // AICPU timestamp: when task was dispatched to AICore (task_status set to 1)
+    uint64_t finish_time;        // AICPU timestamp: when AICPU observed task completion (task_status back to 0)
+
     // Task identification
     uint32_t task_id;         // Task unique identifier
     uint32_t func_id;         // Kernel function identifier

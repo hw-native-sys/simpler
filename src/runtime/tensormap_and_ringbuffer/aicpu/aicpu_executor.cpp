@@ -27,6 +27,7 @@
 #include "common/perf_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
+#include "inner_aicpu.h"
 
 // Device orchestration function signature (loaded via dlopen).
 // The orchestration .so receives a PTO2Runtime* (with ops table populated)
@@ -98,6 +99,7 @@ struct AicpuExecutor {
 
     // ===== Performance profiling state =====
     std::mutex perf_ready_queue_mutex_;  // Protects enqueue_ready_buffer operations
+    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
 
     // ===== Methods =====
     int init(Runtime* runtime);
@@ -292,6 +294,11 @@ int AicpuExecutor::init(Runtime* runtime) {
     ready_queue_aiv_head_ = 0;
     ready_queue_aiv_tail_ = 0;
 
+    // Reset per-core dispatch timestamps
+    for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
+        dispatch_timestamps_[i] = 0;
+    }
+
     DEV_INFO("Init: PTO2 mode, task count from shared memory");
 
     finished_count_.store(0, std::memory_order_release);
@@ -459,6 +466,22 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 PTO2DispatchPayload* payload = reinterpret_cast<PTO2DispatchPayload*>(h->task);
                 h->task = 0;
 
+                // Write AICPU dispatch/finish timestamps into the PerfRecord
+                if (profiling_enabled) {
+                    uint64_t finish_ts = get_sys_cnt_aicpu();
+                    PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
+                    rmb();
+                    uint32_t count = perf_buf->count;
+                    if (count > 0) {
+                        PerfRecord* record = &perf_buf->records[count - 1];
+                        if (record->task_id == static_cast<uint32_t>(payload->task_id)) {
+                            record->dispatch_time = dispatch_timestamps_[core_id];
+                            record->finish_time = finish_ts;
+                            wmb();
+                        }
+                    }
+                }
+
                 // Check and switch performance buffer if needed
                 if (profiling_enabled && h->perf_buffer_status == 1) {
                     switch_perf_buffer(runtime, core_id, thread_idx,
@@ -524,6 +547,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                             PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                             build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
                             h->task = reinterpret_cast<uint64_t>(payload);
+                            if (runtime->enable_profiling) {
+                                dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                            }
                             h->task_status = 1;
                             cur_thread_tasks_in_flight++;
                             made_progress = true;
@@ -543,6 +569,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                             PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                             build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
                             h->task = reinterpret_cast<uint64_t>(payload);
+                            if (runtime->enable_profiling) {
+                                dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                            }
                             h->task_status = 1;
                             cur_thread_tasks_in_flight++;
                             made_progress = true;
@@ -814,6 +843,12 @@ void AicpuExecutor::deinit() {
     ready_queue_aic_tail_ = 0;
     ready_queue_aiv_head_ = 0;
     ready_queue_aiv_tail_ = 0;
+
+    // Reset per-core dispatch timestamps
+    for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
+        dispatch_timestamps_[i] = 0;
+    }
+
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_.store(0, std::memory_order_release);
     finished_count_.store(0, std::memory_order_release);

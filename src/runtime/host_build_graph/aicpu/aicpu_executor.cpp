@@ -8,6 +8,7 @@
 #include "common/memory_barrier.h"
 #include "runtime.h"
 #include "aicpu/device_log.h"
+#include "inner_aicpu.h"
 
 constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int MAX_AIC_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD;
@@ -59,6 +60,7 @@ struct AicpuExecutor {
 
     // ===== Performance profiling state =====
     std::mutex perf_ready_queue_mutex_;  // Protects enqueue_ready_buffer operations
+    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
 
     // ===== Methods =====
     int init(Runtime* runtime);
@@ -137,6 +139,11 @@ int AicpuExecutor::init(Runtime* runtime) {
     ready_queue_aic_tail_ = 0;
     ready_queue_aiv_head_ = 0;
     ready_queue_aiv_tail_ = 0;
+
+    // Reset per-core dispatch timestamps
+    for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
+        dispatch_timestamps_[i] = 0;
+    }
 
     int aic_count = 0;
     int aiv_count = 0;
@@ -414,15 +421,34 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
 
             // Core finished a task (idle + task not null)
             if (h->task_status == 0 && h->task != 0) {
+                // Get completed task pointer before any buffer operations
+                Task* task = reinterpret_cast<Task*>(h->task);
+                int completed_task_id = task->task_id;
+
+                // Write AICPU dispatch/finish timestamps into the PerfRecord
+                if (profiling_enabled) {
+                    uint64_t finish_ts = get_sys_cnt_aicpu();
+                    PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
+                    rmb();
+                    uint32_t count = perf_buf->count;
+                    if (count > 0) {
+                        PerfRecord* record = &perf_buf->records[count - 1];
+                        if (record->task_id == static_cast<uint32_t>(completed_task_id)) {
+                            record->dispatch_time = dispatch_timestamps_[core_id];
+                            record->finish_time = finish_ts;
+                            wmb();
+                        }
+                    }
+                }
+
                 // Check and switch performance buffer if needed
                 if (profiling_enabled && h->perf_buffer_status == 1) {
                     switch_perf_buffer(&runtime, core_id, thread_idx);
                 }
-                // Get completed task and immediately clear the pointer to prevent duplicate detection
-                Task* task = reinterpret_cast<Task*>(h->task);
-                h->task = 0;  // Clear immediately to minimize race condition window
+                // Clear the task pointer
+                h->task = 0;
 
-                int task_id = task->task_id;
+                int task_id = completed_task_id;
 
                 LOG_INFO("Thread %d: Core %d completed task %d", thread_idx, core_id, task_id);
 
@@ -491,6 +517,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                                          thread_idx, task_id, core_id, ready_queue_aic_head_);
 
                                 h->task = reinterpret_cast<uint64_t>(task);
+                                if (runtime.enable_profiling) {
+                                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                                }
                                 h->task_status = 1;  // Mark as busy
                                 cur_thread_tasks_in_flight++;
                                 made_progress = true;
@@ -511,6 +540,9 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                                          thread_idx, task_id, core_id, ready_queue_aiv_head_);
 
                                 h->task = reinterpret_cast<uint64_t>(task);
+                                if (runtime.enable_profiling) {
+                                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                                }
                                 h->task_status = 1;  // Mark as busy
                                 cur_thread_tasks_in_flight++;
                                 made_progress = true;
@@ -587,6 +619,11 @@ void AicpuExecutor::deinit() {
     ready_queue_aic_tail_ = 0;
     ready_queue_aiv_head_ = 0;
     ready_queue_aiv_tail_ = 0;
+
+    // Reset per-core dispatch timestamps
+    for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
+        dispatch_timestamps_[i] = 0;
+    }
 
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_.store(0, std::memory_order_release);
