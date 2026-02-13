@@ -286,7 +286,7 @@ public:
      * orchestration plugin `.so` (instead of relinking/reuploading the full runtime).
      */
     uint8_t aicpu_orch_so_storage[RUNTIME_MAX_AICPU_ORCH_SO_SIZE];
-    uint32_t aicpu_orch_so_size;
+    size_t aicpu_orch_so_size;
     char aicpu_orch_func_name[64];
 
     // Attempt to embed AICPU orchestration plugin bytes into Runtime.

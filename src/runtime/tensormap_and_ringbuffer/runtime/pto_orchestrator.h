@@ -52,11 +52,11 @@ struct PTO2OrchestratorState {
     // scope_begins[i] is the index into scope_tasks where scope i starts.
     // Tasks for the top scope occupy [scope_begins[top], scope_tasks_size).
     int32_t* scope_tasks;          // Flat buffer of task IDs (all scopes concatenated)
-    int32_t scope_tasks_size;      // Number of task IDs currently in the buffer
-    int32_t scope_tasks_capacity;  // Allocated capacity of scope_tasks
+    size_t scope_tasks_size;       // Number of task IDs currently in the buffer
+    size_t scope_tasks_capacity;   // Allocated capacity of scope_tasks
     int32_t* scope_begins;         // scope_begins[i] = start index of scope i in scope_tasks
     int32_t scope_stack_top;       // Current top of stack (-1 = no scope open)
-    int32_t scope_stack_capacity;  // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
+    size_t scope_stack_capacity;   // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
 
     // === SCHEDULER REFERENCE ===
     // Note: In simulated mode, orchestrator and scheduler share address space
@@ -66,7 +66,7 @@ struct PTO2OrchestratorState {
 
     // === GM HEAP (for output buffers) ===
     void* gm_heap_base;    // Base address of GM heap
-    int32_t gm_heap_size;  // Size of GM heap
+    size_t gm_heap_size;   // Size of GM heap
 
     // === STATISTICS ===
     int64_t tasks_submitted;
@@ -93,7 +93,7 @@ struct PTO2OrchestratorState {
  * @return true on success
  */
 bool pto2_orchestrator_init(
-    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, int32_t heap_size);
+    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, size_t heap_size);
 
 /**
  * Destroy orchestrator state and free resources

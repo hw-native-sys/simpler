@@ -75,12 +75,12 @@ typedef struct {
 typedef struct {
     // Hash table buckets (fixed size, power of 2)
     int32_t* buckets;     // Array of offsets into entry_pool (-1 = empty)
-    int32_t num_buckets;  // Must be power of 2 for fast modulo
+    size_t num_buckets;   // Must be power of 2 for fast modulo
 
     // Entry pool as ring buffer
     PTO2TensorMapEntry* entry_pool;  // Ring buffer of entries
-    int32_t pool_size;               // Total pool capacity
-    int32_t pool_head;               // Next allocation position (wraps around)
+    size_t pool_size;                // Total pool capacity
+    size_t pool_head;                // Next allocation position (wraps around)
 
     // Per-task entry tracking (for efficient bucket cleanup)
     int32_t* task_entry_head;  // Per-task head offset (-1 = no entries)
@@ -104,7 +104,7 @@ typedef struct {
  * @param pool_size   Size of entry pool
  * @return true on success, false on allocation failure
  */
-bool pto2_tensormap_init(PTO2TensorMap* tm, int32_t num_buckets, int32_t pool_size);
+bool pto2_tensormap_init(PTO2TensorMap* tm, size_t num_buckets, size_t pool_size);
 
 /**
  * Initialize TensorMap with default sizes

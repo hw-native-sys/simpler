@@ -21,8 +21,8 @@
 // Heap Ring Buffer Implementation
 // =============================================================================
 
-void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, int32_t size,
-                          volatile int32_t* tail_ptr) {
+void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
+                          volatile uint64_t* tail_ptr) {
     ring->base = base;
     ring->size = size;
     ring->top = 0;
@@ -34,14 +34,14 @@ void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, int32_t size,
 // Heap ring spin limit - after this, report deadlock and exit
 #define PTO2_HEAP_SPIN_LIMIT        100000
 
-void* pto2_heap_ring_alloc(PTO2HeapRing* ring, int32_t size) {
+void* pto2_heap_ring_alloc(PTO2HeapRing* ring, uint64_t size) {
     // Align size for DMA efficiency
     size = PTO2_ALIGN_UP(size, PTO2_ALIGN_SIZE);
-    
+
     // Spin-wait if insufficient space (back-pressure from Scheduler)
     int spin_count = 0;
     bool notified = false;
-    
+
     while (1) {
         void* ptr = pto2_heap_ring_try_alloc(ring, size);
         if (ptr != NULL) {
@@ -52,69 +52,69 @@ void* pto2_heap_ring_alloc(PTO2HeapRing* ring, int32_t size) {
 #endif
             return ptr;
         }
-        
+
         // No space available, spin-wait
         spin_count++;
-        
+
 #if PTO2_SPIN_VERBOSE_LOGGING
         // Periodic block notification
         if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 &&
             spin_count < PTO2_HEAP_SPIN_LIMIT) {
-            int32_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
-            int32_t available = pto2_heap_ring_available(ring);
-            fprintf(stderr, "[HeapRing] BLOCKED: requesting %d bytes, available=%d, "
-                    "top=%d, tail=%d, spins=%d\n",
+            uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
+            uint64_t available = pto2_heap_ring_available(ring);
+            fprintf(stderr, "[HeapRing] BLOCKED: requesting %lu bytes, available=%lu, "
+                    "top=%lu, tail=%lu, spins=%d\n",
                     size, available, ring->top, tail, spin_count);
             notified = true;
         }
 #endif
-        
+
         if (spin_count >= PTO2_HEAP_SPIN_LIMIT) {
-            int32_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
-            int32_t available = pto2_heap_ring_available(ring);
+            uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
+            uint64_t available = pto2_heap_ring_available(ring);
             fprintf(stderr, "\n");
             fprintf(stderr, "========================================\n");
             fprintf(stderr, "FATAL: Heap Ring Deadlock Detected!\n");
             fprintf(stderr, "========================================\n");
             fprintf(stderr, "Orchestrator blocked waiting for heap space after %d spins.\n", spin_count);
-            fprintf(stderr, "  - Requested:     %d bytes\n", size);
-            fprintf(stderr, "  - Available:     %d bytes\n", available);
-            fprintf(stderr, "  - Heap top:      %d\n", ring->top);
-            fprintf(stderr, "  - Heap tail:     %d\n", tail);
-            fprintf(stderr, "  - Heap size:     %d\n", ring->size);
+            fprintf(stderr, "  - Requested:     %lu bytes\n", size);
+            fprintf(stderr, "  - Available:     %lu bytes\n", available);
+            fprintf(stderr, "  - Heap top:      %lu\n", ring->top);
+            fprintf(stderr, "  - Heap tail:     %lu\n", tail);
+            fprintf(stderr, "  - Heap size:     %lu\n", ring->size);
             fprintf(stderr, "\n");
             fprintf(stderr, "Solution: Increase PTO2_HEAP_SIZE (e.g. 256*1024 for 4 x 64KB outputs).\n");
             fprintf(stderr, "========================================\n");
             fprintf(stderr, "\n");
             exit(1);
         }
-        
+
         PTO2_SPIN_PAUSE();
     }
 }
 
-void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, int32_t size) {
+void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, uint64_t size) {
     // Align size for DMA efficiency
     size = PTO2_ALIGN_UP(size, PTO2_ALIGN_SIZE);
-    
+
     // Read latest tail from shared memory (Scheduler updates this)
-    int32_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
-    int32_t top = ring->top;
-    
+    uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
+    uint64_t top = ring->top;
+
     if (top >= tail) {
         // Case 1: top is at or ahead of tail (normal case)
         //   [....tail====top......]
         //                   ^-- space_at_end = size - top
-        
-        int32_t space_at_end = ring->size - top;
-        
+
+        uint64_t space_at_end = ring->size - top;
+
         if (space_at_end >= size) {
             // Enough space at end - allocate here
             void* ptr = (char*)ring->base + top;
             ring->top = top + size;
             return ptr;
         }
-        
+
         // Not enough space at end - check if we can wrap to beginning
         // IMPORTANT: Don't split buffer, skip remaining space at end
         if (tail > size) {
@@ -122,35 +122,35 @@ void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, int32_t size) {
             ring->top = size;
             return ring->base;
         }
-        
+
         // Not enough space anywhere - return NULL
         return NULL;
-        
+
     } else {
         // Case 2: top has wrapped, tail is ahead
         //   [====top....tail=====]
         //         ^-- free space = tail - top
-        
-        int32_t gap = tail - top;
+
+        uint64_t gap = tail - top;
         if (gap >= size) {
             void* ptr = (char*)ring->base + top;
             ring->top = top + size;
             return ptr;
         }
-        
+
         // Not enough space - return NULL
         return NULL;
     }
 }
 
-int32_t pto2_heap_ring_available(PTO2HeapRing* ring) {
-    int32_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
-    int32_t top = ring->top;
-    
+uint64_t pto2_heap_ring_available(PTO2HeapRing* ring) {
+    uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
+    uint64_t top = ring->top;
+
     if (top >= tail) {
         // Space at end + space at beginning (if any)
-        int32_t at_end = ring->size - top;
-        int32_t at_begin = tail;
+        uint64_t at_end = ring->size - top;
+        uint64_t at_begin = tail;
         return at_end > at_begin ? at_end : at_begin;  // Max usable
     } else {
         // Contiguous space between top and tail
@@ -167,7 +167,7 @@ void pto2_heap_ring_reset(PTO2HeapRing* ring) {
 // =============================================================================
 
 void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
-                          int32_t window_size, volatile int32_t* last_alive_ptr) {
+                          size_t window_size, volatile int32_t* last_alive_ptr) {
     ring->descriptors = descriptors;
     ring->window_size = window_size;
     ring->current_index = 0;
@@ -204,7 +204,7 @@ int32_t pto2_task_ring_alloc(PTO2TaskRing* ring) {
             int32_t last_alive = PTO2_LOAD_ACQUIRE(ring->last_alive_ptr);
             int32_t active_count = ring->current_index - last_alive;
             fprintf(stderr, "[TaskRing] BLOCKED (Flow Control): current=%d, last_alive=%d, "
-                    "active=%d/%d (%.1f%%), spins=%d\n",
+                    "active=%d/%zu (%.1f%%), spins=%d\n",
                     ring->current_index, last_alive, active_count, ring->window_size,
                     100.0 * active_count / ring->window_size, spin_count);
             notified = true;
@@ -227,7 +227,7 @@ int32_t pto2_task_ring_alloc(PTO2TaskRing* ring) {
             fprintf(stderr, "  - Current task index:  %d\n", ring->current_index);
             fprintf(stderr, "  - Last task alive:     %d\n", last_alive);
             fprintf(stderr, "  - Active tasks:        %d\n", active_count);
-            fprintf(stderr, "  - Window size:         %d\n", ring->window_size);
+            fprintf(stderr, "  - Window size:         %zu\n", ring->window_size);
             fprintf(stderr, "  - Window utilization:  %.1f%%\n", 
                     100.0 * active_count / ring->window_size);
             fprintf(stderr, "\n");
@@ -239,7 +239,7 @@ int32_t pto2_task_ring_alloc(PTO2TaskRing* ring) {
             fprintf(stderr, "  This creates a circular dependency (deadlock).\n");
             fprintf(stderr, "\n");
             fprintf(stderr, "Solution:\n");
-            fprintf(stderr, "  Current task_window_size: %d\n", ring->window_size);
+            fprintf(stderr, "  Current task_window_size: %zu\n", ring->window_size);
             fprintf(stderr, "  Default PTO2_TASK_WINDOW_SIZE: %d\n", PTO2_TASK_WINDOW_SIZE);
             fprintf(stderr, "  Recommended: %d (at least 2x current active tasks)\n", 
                     active_count * 2);
@@ -309,7 +309,7 @@ void pto2_task_ring_reset(PTO2TaskRing* ring) {
 // Dependency List Pool Implementation
 // =============================================================================
 
-void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t capacity) {
+void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, size_t capacity) {
     pool->base = base;
     pool->capacity = capacity;
     pool->top = 1;  // Start from 1, 0 means NULL/empty

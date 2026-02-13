@@ -63,7 +63,7 @@ bool Runtime::try_set_aicpu_orch_so(const void* data, size_t size) {
         return false;
     }
     memcpy(aicpu_orch_so_storage, data, size);
-    aicpu_orch_so_size = static_cast<uint32_t>(size);
+    aicpu_orch_so_size = size;
     return true;
 }
 
@@ -71,7 +71,7 @@ void Runtime::set_aicpu_orch_so(const void* data, size_t size) { (void)try_set_a
 
 const void* Runtime::get_aicpu_orch_so_data() const { return aicpu_orch_so_size > 0 ? aicpu_orch_so_storage : nullptr; }
 
-size_t Runtime::get_aicpu_orch_so_size() const { return static_cast<size_t>(aicpu_orch_so_size); }
+size_t Runtime::get_aicpu_orch_so_size() const { return aicpu_orch_so_size; }
 
 // =============================================================================
 // Task Management

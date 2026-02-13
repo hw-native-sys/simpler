@@ -39,7 +39,7 @@ static inline void task_fanout_unlock(PTO2TaskDescriptor* task) { PTO2_STORE_REL
 // =============================================================================
 
 bool pto2_orchestrator_init(
-    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, int32_t heap_size) {
+    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, size_t heap_size) {
     memset(orch, 0, sizeof(PTO2OrchestratorState));
 
     orch->sm_handle = sm_handle;
@@ -66,8 +66,8 @@ bool pto2_orchestrator_init(
     orch->tensormap_last_cleanup = 0;
 
     // Initialize scope stack: one flat buffer for task IDs + one array for begin offsets
-    int32_t max_depth = PTO2_MAX_SCOPE_DEPTH;
-    int32_t init_cap = PTO2_SCOPE_TASKS_INIT_CAP;
+    size_t max_depth = PTO2_MAX_SCOPE_DEPTH;
+    size_t init_cap = PTO2_SCOPE_TASKS_INIT_CAP;
     orch->scope_tasks = (int32_t*)malloc(init_cap * sizeof(int32_t));
     orch->scope_begins = (int32_t*)malloc(max_depth * sizeof(int32_t));
     if (!orch->scope_tasks || !orch->scope_begins) {
@@ -130,7 +130,7 @@ void pto2_orchestrator_set_scheduler_mode(
 
 static void scope_tasks_push(PTO2OrchestratorState* orch, int32_t task_id) {
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
-        int32_t new_cap = orch->scope_tasks_capacity * 2;
+        size_t new_cap = orch->scope_tasks_capacity * 2;
         int32_t* new_buf = (int32_t*)realloc(orch->scope_tasks, new_cap * sizeof(int32_t));
         assert(new_buf && "Failed to grow scope task buffer");
         orch->scope_tasks = new_buf;
@@ -140,7 +140,7 @@ static void scope_tasks_push(PTO2OrchestratorState* orch, int32_t task_id) {
 }
 
 void pto2_scope_begin(PTO2OrchestratorState* orch) {
-    assert(orch->scope_stack_top < orch->scope_stack_capacity - 1 && "Scope stack overflow");
+    assert(orch->scope_stack_top < (int32_t)(orch->scope_stack_capacity - 1) && "Scope stack overflow");
 
     ++orch->scope_stack_top;
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
@@ -150,7 +150,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
 
     int32_t begin = orch->scope_begins[orch->scope_stack_top--];
-    int32_t count = orch->scope_tasks_size - begin;
+    size_t count = orch->scope_tasks_size - begin;
 
     if (orch->scheduler && count > 0) {
         pto2_scheduler_on_scope_end(orch->scheduler, &orch->scope_tasks[begin], count);
@@ -255,7 +255,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     scope_tasks_push(orch, task_id);
 
     // Temporary storage for collecting output sizes
-    int32_t total_output_size = 0;
+    uint64_t total_output_size = 0;
 
     // Temporary storage for fanin
     int32_t fanin_temp[PTO2_MAX_INPUTS];
@@ -419,7 +419,7 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
     printf("Current scope depth: %d\n", orch->scope_stack_top + 1);
     printf("Task ring active:    %d\n", pto2_task_ring_active_count(&orch->task_ring));
     printf("Heap ring used:      %d / %d\n", orch->heap_ring.top, orch->heap_ring.size);
-    printf("Dep pool used:       %d / %d\n", pto2_dep_pool_used(&orch->dep_pool), orch->dep_pool.capacity);
+    printf("Dep pool used:       %d / %zu\n", pto2_dep_pool_used(&orch->dep_pool), orch->dep_pool.capacity);
     printf("TensorMap valid:     %d\n", pto2_tensormap_valid_count(&orch->tensor_map));
     printf("===============================\n");
 }
@@ -430,8 +430,8 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
 
     for (int i = 0; i <= orch->scope_stack_top; i++) {
         int32_t begin = orch->scope_begins[i];
-        int32_t end = (i < orch->scope_stack_top) ? orch->scope_begins[i + 1] : orch->scope_tasks_size;
-        printf("  [%d] tasks_owned = %d\n", i, end - begin);
+        size_t end = (i < orch->scope_stack_top) ? orch->scope_begins[i + 1] : orch->scope_tasks_size;
+        printf("  [%d] tasks_owned = %zu\n", i, end - begin);
     }
 
     printf("==================\n");

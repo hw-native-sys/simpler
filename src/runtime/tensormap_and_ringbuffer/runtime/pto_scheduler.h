@@ -54,11 +54,11 @@ typedef struct PTO2SchedulerState {
 
     // Local copies of ring pointers (written to shared memory after update)
     int32_t last_task_alive;      // Task ring tail
-    int32_t heap_tail;            // Heap ring tail
+    uint64_t heap_tail;           // Heap ring tail
 
     // === DYNAMIC CONFIGURATION ===
-    int32_t task_window_size;     // Task window size (power of 2)
-    int32_t task_window_mask;     // task_window_size - 1 (for fast modulo)
+    size_t task_window_size;    // Task window size (power of 2)
+    size_t task_window_mask;    // task_window_size - 1 (for fast modulo)
 
     // === PRIVATE DATA (not in shared memory) ===
 
@@ -121,7 +121,7 @@ void pto2_scheduler_reset(PTO2SchedulerState* sched);
 /**
  * Initialize a ready queue
  */
-bool pto2_ready_queue_init(PTO2ReadyQueue* queue, int32_t capacity);
+bool pto2_ready_queue_init(PTO2ReadyQueue* queue, size_t capacity);
 
 /**
  * Destroy ready queue

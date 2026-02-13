@@ -41,12 +41,12 @@
  */
 typedef struct {
     void*    base;        // GM_Heap_Base pointer
-    int32_t  size;        // GM_Heap_Size (total heap size in bytes)
-    int32_t  top;         // Allocation pointer (local copy)
-    
+    uint64_t size;        // GM_Heap_Size (total heap size in bytes)
+    uint64_t top;         // Allocation pointer (local copy)
+
     // Reference to shared memory tail (for back-pressure)
-    volatile int32_t* tail_ptr;  // Points to header->heap_tail
-    
+    volatile uint64_t* tail_ptr;  // Points to header->heap_tail
+
 } PTO2HeapRing;
 
 /**
@@ -57,35 +57,35 @@ typedef struct {
  * @param size      Total heap size in bytes
  * @param tail_ptr  Pointer to shared memory heap_tail
  */
-void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, int32_t size,
-                          volatile int32_t* tail_ptr);
+void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
+                          volatile uint64_t* tail_ptr);
 
 /**
  * Allocate memory from heap ring
- * 
+ *
  * O(1) bump allocation with wrap-around.
  * May STALL (spin-wait) if insufficient space (back-pressure).
  * Never splits a buffer across the wrap-around boundary.
- * 
+ *
  * @param ring  Heap ring
  * @param size  Requested size in bytes
  * @return Pointer to allocated memory, never NULL (stalls instead)
  */
-void* pto2_heap_ring_alloc(PTO2HeapRing* ring, int32_t size);
+void* pto2_heap_ring_alloc(PTO2HeapRing* ring, uint64_t size);
 
 /**
  * Try to allocate memory without stalling
- * 
+ *
  * @param ring  Heap ring
  * @param size  Requested size in bytes
  * @return Pointer to allocated memory, or NULL if no space
  */
-void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, int32_t size);
+void* pto2_heap_ring_try_alloc(PTO2HeapRing* ring, uint64_t size);
 
 /**
  * Get available space in heap ring
  */
-int32_t pto2_heap_ring_available(PTO2HeapRing* ring);
+uint64_t pto2_heap_ring_available(PTO2HeapRing* ring);
 
 /**
  * Reset heap ring to initial state
@@ -104,24 +104,24 @@ void pto2_heap_ring_reset(PTO2HeapRing* ring);
  */
 typedef struct {
     PTO2TaskDescriptor* descriptors;  // Task descriptor array (from shared memory)
-    int32_t window_size;              // Window size (power of 2)
+    size_t window_size;               // Window size (power of 2)
     int32_t current_index;            // Next task to allocate (absolute ID)
-    
+
     // Reference to shared memory last_task_alive (for back-pressure)
     volatile int32_t* last_alive_ptr;  // Points to header->last_task_alive
-    
+
 } PTO2TaskRing;
 
 /**
  * Initialize task ring buffer
- * 
+ *
  * @param ring            Task ring to initialize
  * @param descriptors     Task descriptor array from shared memory
  * @param window_size     Window size (must be power of 2)
  * @param last_alive_ptr  Pointer to shared memory last_task_alive
  */
 void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
-                          int32_t window_size, volatile int32_t* last_alive_ptr);
+                          size_t window_size, volatile int32_t* last_alive_ptr);
 
 /**
  * Allocate a task slot from task ring
@@ -176,19 +176,19 @@ void pto2_task_ring_reset(PTO2TaskRing* ring);
  */
 typedef struct {
     PTO2DepListEntry* base;   // Pool base address (from shared memory)
-    int32_t capacity;         // Total number of entries
+    size_t capacity;          // Total number of entries
     int32_t top;              // Next allocation position (starts from 1, 0=NULL)
-    
+
 } PTO2DepListPool;
 
 /**
  * Initialize dependency list pool
- * 
+ *
  * @param pool      Pool to initialize
  * @param base      Pool base address from shared memory
  * @param capacity  Total number of entries
  */
-void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t capacity);
+void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, size_t capacity);
 
 /**
  * Allocate a single entry from the pool
