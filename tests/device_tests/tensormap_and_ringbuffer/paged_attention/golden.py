@@ -32,7 +32,7 @@ ALL_CASES = {
         "kv_head_num": 1,
         "head_dim": 128,
         "block_size": 128,
-        "context_len": 8192,
+        "context_len": 8193,
         "max_model_len": 32768,
     },
     "Case2": {
@@ -42,7 +42,7 @@ ALL_CASES = {
         "head_dim": 128,
         "block_size": 64,
         "context_len": 8192,
-        "max_model_len": 8192,
+        "max_model_len": 32768,
     },
 }
 

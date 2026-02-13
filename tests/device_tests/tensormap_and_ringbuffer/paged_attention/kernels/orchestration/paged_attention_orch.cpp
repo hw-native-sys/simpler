@@ -146,10 +146,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     Tensor qi = query.view({q_tile, head_dim}, {cur_offset, 0});
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
                     uint64_t valid_len = std::min(block_size, cur_seq - bn * block_size);
-                    Tensor kj = key_cache.view({valid_len, head_dim}, {cur_block_idx * block_size, 0});
-                    Tensor vj = value_cache.view({valid_len, head_dim}, {cur_block_idx * block_size, 0});
+                    Tensor kj = key_cache.view({block_size, head_dim}, {cur_block_idx * block_size, 0});
+                    Tensor vj = value_cache.view({block_size, head_dim}, {cur_block_idx * block_size, 0});
 
-                    uint64_t sij_shapes[2] = {q_tile, valid_len};
+                    uint64_t sij_shapes[2] = {q_tile, block_size};
                     Tensor sij = make_tensor(sij_shapes, 2, DataType::FLOAT32);
                     Tensor pij_f16 = make_tensor(sij_shapes, 2, data_type);
 
@@ -160,10 +160,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     };
                     TIMED_SUBMIT_TASK(rt, FUNC_QK_MATMUL, PTO2_WORKER_CUBE, "c1", params_qk, 3);
 
+                    Tensor sij_valid = sij.view({q_tile, valid_len}, {0, 0});
                     Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
                     Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
                     PTOParam params_sf[] = {
-                        make_input_param(sij),
+                        make_input_param(sij_valid),
                         make_scalar_param(float_to_u64(scale_value)),
                         make_output_param(pij_f16),
                         make_output_param(mi),

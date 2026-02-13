@@ -35,8 +35,8 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     float scale_value,
     __gm__ Tensor* pij,
     __gm__ Tensor* mij,
-    __gm__ Tensor* lij,
-    uint64_t valid_len) {
+    __gm__ Tensor* lij) {
+    uint64_t valid_len = static_cast<uint64_t>(sij->repeats[1]);
     __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
     __gm__ bfloat16_t* pij_addr = reinterpret_cast<__gm__ bfloat16_t*>(pij->buffer.addr);
     __gm__ float* mij_addr = reinterpret_cast<__gm__ float*>(mij->buffer.addr);
@@ -122,12 +122,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[3]);
     __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[4]);
     uint64_t q_tile_size = static_cast<uint64_t>(sij->repeats[0]);
-    // args[6] = block_size
-    uint64_t valid_len = static_cast<uint64_t>(sij->repeats[1]);
 
     if (q_tile_size == 16) {
-        softmax_prepare_impl<16, 128>(sij, scale_value, pij, mij, lij, valid_len);
+        softmax_prepare_impl<16, 128>(sij, scale_value, pij, mij, lij);
     } else {
-        softmax_prepare_impl<64, 64>(sij, scale_value, pij, mij, lij, valid_len);
+        softmax_prepare_impl<64, 64>(sij, scale_value, pij, mij, lij);
     }
 }
