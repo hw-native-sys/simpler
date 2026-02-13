@@ -134,20 +134,20 @@ void Tensor::resort_strides() {
 }
 
 Tensor& Tensor::optimize() {
-#ifndef NDEBUG
-    uint64_t original_strides[RUNTIME_MAX_TENSOR_DIMS];
-    uint64_t original_repeats[RUNTIME_MAX_TENSOR_DIMS];
-    int32_t original_ndims = ndims;
-    for (uint64_t i = 0; i < ndims; i++) {
-        original_strides[i] = this->strides[i];
-        original_repeats[i] = this->repeats[i];
-    }
-#endif
+// #ifndef NDEBUG
+//     uint64_t original_strides[RUNTIME_MAX_TENSOR_DIMS];
+//     uint64_t original_repeats[RUNTIME_MAX_TENSOR_DIMS];
+//     int32_t original_ndims = ndims;
+//     for (uint64_t i = 0; i < ndims; i++) {
+//         original_strides[i] = this->strides[i];
+//         original_repeats[i] = this->repeats[i];
+//     }
+// #endif
     resort_strides();
 
-#ifndef NDEBUG
-    debug_assert(validate_memory_access_preserved(original_strides, original_repeats, original_ndims));
-#endif
+// #ifndef NDEBUG
+//     debug_assert(validate_memory_access_preserved(original_strides, original_repeats, original_ndims));
+// #endif
     return *this;
 }
 

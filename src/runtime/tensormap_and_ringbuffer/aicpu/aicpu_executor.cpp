@@ -22,6 +22,7 @@
 // Runtime headers (full struct definition for create/destroy + PTO2_SCOPE)
 #include "pto_runtime2.h"
 #include "pto_shared_memory.h"
+#include "pto_runtime2_types.h"
 
 // Performance profiling headers
 #include "common/perf_profiling.h"
@@ -136,7 +137,7 @@ struct AicpuExecutor {
 static AicpuExecutor g_aicpu_executor;
 
 // PTO2 device-mode state (shared memory view + per-task fanin refcount)
-static constexpr int PTO2_MAX_SLOTS = 16384;
+static constexpr int PTO2_MAX_SLOTS = PTO2_TASK_WINDOW_SIZE;
 static int s_pto2_fanin_refcount[PTO2_MAX_SLOTS];
 static volatile int32_t s_pto2_task_completed[PTO2_MAX_SLOTS];
 static PTO2DispatchPayload s_pto2_payload_per_core[RUNTIME_MAX_WORKER];
