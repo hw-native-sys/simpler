@@ -170,20 +170,29 @@ void pto2_add_consumer_to_producer(
     // This synchronizes with scheduler's on_task_complete_threadsafe
     task_fanout_lock(producer);
 
-    // Prepend consumer to producer's fanout list
+    // AICPU parallel mode: check if producer already completed before adding to fanout
+    if (orch->aicpu_task_completed) {
+        int32_t prod_slot = producer_id & orch->aicpu_window_mask;
+        if (__atomic_load_n(&orch->aicpu_task_completed[prod_slot], __ATOMIC_ACQUIRE) >= 2) {
+            // Producer already completed, directly increment consumer's refcount
+            int32_t cons_slot = consumer_id & orch->aicpu_window_mask;
+            __atomic_fetch_add(&orch->aicpu_fanin_refcount[cons_slot], 1, __ATOMIC_ACQ_REL);
+            task_fanout_unlock(producer);
+            return;
+        }
+    }
+
+    // Normal path: prepend consumer to producer's fanout list
     producer->fanout_head = pto2_dep_list_prepend(&orch->dep_pool, producer->fanout_head, consumer_id);
     producer->fanout_count++;
 
-    // Check if producer has already completed
-    // If so, we need to update consumer's fanin_refcount directly
-    // because on_task_complete_threadsafe has already run and won't see this consumer
+    // Check if producer has already completed (scheduler mode)
     if (orch->scheduler) {
         PTO2SchedulerState* sched = orch->scheduler;
         int32_t prod_slot = pto2_task_slot(sched, producer_id);
         int32_t prod_state = __atomic_load_n(&sched->task_state[prod_slot], __ATOMIC_ACQUIRE);
 
         if (prod_state >= PTO2_TASK_COMPLETED) {
-            // Producer already completed - update consumer's fanin_refcount directly
             int32_t cons_slot = pto2_task_slot(sched, consumer_id);
             __atomic_fetch_add(&sched->fanin_refcount[cons_slot], 1, __ATOMIC_SEQ_CST);
         }

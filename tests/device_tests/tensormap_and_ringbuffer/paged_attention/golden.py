@@ -27,13 +27,13 @@ ATOL = 1e-3
 # All test cases - production scale
 ALL_CASES = {
     "Case1": {
-        "batch": 2,
+        "batch": 16,
         "num_heads": 16,
         "kv_head_num": 1,
         "head_dim": 128,
         "block_size": 128,
-        "context_len": 2048,
-        "max_model_len": 4096,
+        "context_len": 8192,
+        "max_model_len": 32768,
     },
     "Case2": {
         "batch": 64,

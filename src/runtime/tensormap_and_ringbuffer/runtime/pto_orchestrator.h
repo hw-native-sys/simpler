@@ -72,6 +72,11 @@ struct PTO2OrchestratorState {
     int64_t tasks_submitted;
     int64_t buffers_allocated;
     int64_t bytes_allocated;
+
+    // === AICPU PARALLEL MODE (set by aicpu_executor, NULL when unused) ===
+    int32_t* aicpu_fanin_refcount;
+    volatile int32_t* aicpu_task_completed;
+    int32_t aicpu_window_mask;
 };
 
 // =============================================================================
