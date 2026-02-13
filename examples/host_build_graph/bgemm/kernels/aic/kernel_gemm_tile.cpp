@@ -1,0 +1,90 @@
+/**
+ * Tile-based Matrix Multiplication Kernel (Cube Core)
+ *
+ * Computes: output = input_a @ input_b (64x64 tile matmul)
+ * Uses TMATMUL instruction
+ */
+
+#include <cstdint>
+#include <pto/pto-inst.hpp>
+#include <pto/common/constants.hpp>
+#include <pto/common/pto_tile.hpp>
+
+using namespace pto;
+
+#ifndef __gm__
+#define __gm__
+#endif
+
+#ifndef __aicore__
+#define __aicore__ [aicore]
+#endif
+
+template <typename T>
+AICORE constexpr inline T CeilAlign(T num_1, T num_2) {
+    if (num_2 == 0) {
+        return 0;
+    }
+    return (num_1 + num_2 - 1) / num_2 * num_2;
+}
+
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
+    __gm__ float* input_a = reinterpret_cast<__gm__ float*>(args[0]);
+    __gm__ float* input_b = reinterpret_cast<__gm__ float*>(args[1]);
+    __gm__ float* output = reinterpret_cast<__gm__ float*>(args[2]);
+
+    constexpr int TILE = 64;
+    constexpr int blockAlign = C0_SIZE_BYTE / sizeof(float);
+    constexpr int M = CeilAlign<int>(TILE, 16);
+    constexpr int K = CeilAlign<int>(TILE, blockAlign);
+    constexpr int N = CeilAlign<int>(TILE, blockAlign);
+
+    using GlobalDataA = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
+        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+    using GlobalDataB = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
+        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+    using GlobalDataC = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
+        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+
+    GlobalDataA src0Global(input_a);
+    GlobalDataB src1Global(input_b);
+    GlobalDataC dstGlobal(output);
+
+    using TileMatA = Tile<TileType::Mat, float, M, K, BLayout::ColMajor, TILE, TILE, SLayout::RowMajor, 512>;
+    using TileMatB = Tile<TileType::Mat, float, K, N, BLayout::ColMajor, TILE, TILE, SLayout::RowMajor, 512>;
+
+    using LeftTile = TileLeft<float, M, K, TILE, TILE>;
+    using RightTile = TileRight<float, K, N, TILE, TILE>;
+    using AccTile = TileAcc<float, M, N, TILE, TILE>;
+
+    TileMatA aMatTile;
+    TileMatB bMatTile;
+    TASSIGN(aMatTile, 0x0);
+    TASSIGN(bMatTile, 0x20000);
+
+    LeftTile aTile;
+    RightTile bTile;
+    AccTile cTile;
+    TASSIGN(aTile, 0x0);
+    TASSIGN(bTile, 0x0);
+    TASSIGN(cTile, 0x0);
+
+    TLOAD(aMatTile, src0Global);
+    TLOAD(bMatTile, src1Global);
+
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+
+    TMOV(aTile, aMatTile);
+    TMOV(bTile, bMatTile);
+
+    set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
+
+    TMATMUL(cTile, aTile, bTile);
+
+    set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
+
+    TSTORE(dstGlobal, cTile);
+}
