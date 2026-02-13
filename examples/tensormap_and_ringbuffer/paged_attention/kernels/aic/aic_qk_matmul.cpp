@@ -21,8 +21,7 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-constexpr int M = 16, K = 16, N = 16;
-
+template <int M, int K, int N>
 static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm__ Tensor* sij) {
     __gm__ half* qi_addr = reinterpret_cast<__gm__ half*>(qi->buffer.addr);
     __gm__ half* kj_addr = reinterpret_cast<__gm__ half*>(kj->buffer.addr);
@@ -87,5 +86,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* kj = reinterpret_cast<__gm__ Tensor*>(args[1]);
     __gm__ Tensor* sij = reinterpret_cast<__gm__ Tensor*>(args[2]);
 
-    qk_matmul_impl(qi, kj, sij);
+    qk_matmul_impl<16, 16, 16>(qi, kj, sij);
 }

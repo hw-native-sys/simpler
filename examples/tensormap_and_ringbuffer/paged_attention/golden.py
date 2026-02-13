@@ -5,7 +5,7 @@ Implements the online softmax algorithm for paged attention with:
 - float16 Q/K/V inputs (sim-compatible)
 - Non-transposed K storage: (total_blocks, block_size, kv_head_num, head_dim)
 - GQA support (kv_head_num=1)
-- 16x16 tile dimensions for fast simulation
+- 16x16 tile dimensions
 """
 
 import os
@@ -31,7 +31,7 @@ ALL_CASES = {
         "kv_head_num": 1,
         "head_dim": 16,
         "block_size": 16,
-        "context_len": 16,
+        "context_len": 33,
         "max_model_len": 256,
     },
     "Case2": {
@@ -40,7 +40,7 @@ ALL_CASES = {
         "kv_head_num": 1,
         "head_dim": 16,
         "block_size": 16,
-        "context_len": 64,
+        "context_len": 128,
         "max_model_len": 256,
     },
 }
@@ -60,8 +60,6 @@ def generate_inputs(params: dict) -> dict:
     context_len = params["context_len"]
     max_model_len = params["max_model_len"]
 
-    # Random seed will be different each time (torch default behavior)
-
     max_num_blocks_per_req = max_model_len // block_size
     cur_valid_blocks = (context_len + block_size - 1) // block_size
     total_blocks = batch * cur_valid_blocks
@@ -69,7 +67,6 @@ def generate_inputs(params: dict) -> dict:
     scale_bits = struct.unpack('I', struct.pack('f', scale_value))[0]
 
     # Random block table: (batch, max_num_blocks_per_req) int32
-    # randint is [low, high), so high=total_blocks covers indices [0, total_blocks)
     block_table = torch.randint(
         0,
         max(total_blocks, 1),
@@ -87,14 +84,14 @@ def generate_inputs(params: dict) -> dict:
     )
 
     # Query: (batch, 1, num_heads * head_dim) -> (batch, num_heads, head_dim) float16
-    query_fp16 = (torch.rand(batch, 1, num_heads * head_dim) - 0.5).to(torch.float16)
+    query_fp16 = torch.empty(batch, 1, num_heads * head_dim).uniform_(-0.5, 0.5).to(torch.float16)
     query_fp16 = query_fp16.reshape(batch, num_heads, head_dim)
 
     # Key cache: (total_blocks, block_size, kv_head_num, head_dim) float16
-    key_fp16 = (torch.rand(total_blocks, block_size, kv_head_num, head_dim) - 0.5).to(torch.float16)
+    key_fp16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-0.5, 0.5).to(torch.float16)
 
     # Value cache: (total_blocks, block_size, kv_head_num, head_dim) float16
-    value_fp16 = (torch.rand(total_blocks, block_size, kv_head_num, head_dim) * 2 - 1).to(torch.float16)
+    value_fp16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-1, 1).to(torch.float16)
 
     return {
         "query": query_fp16.flatten(),
@@ -168,7 +165,7 @@ def paged_attention(
                 sij = (qi @ kj.T) * scale_value
                 mij = sij.max(dim=-1, keepdim=True)[0]
                 pij = torch.exp(sij - mij).to(torch.float16).to(torch.float32)
-                lij = torch.sum(pij, dim=1, keepdim=True)
+                lij = pij.sum(dim=1, keepdim=True)
 
                 if bn == 0:
                     oi = pij @ vj
@@ -203,13 +200,12 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
     max_num_blocks_per_req = max_model_len // block_size
 
-    # Reconstruct shaped arrays from flat float16 tensors
-    # Convert to torch tensors (handles both array types)
-    query = torch.as_tensor(tensors["query"]).reshape(batch, num_heads, head_dim)
-    key_cache = torch.as_tensor(tensors["key_cache"]).reshape(-1, block_size, kv_head_num, head_dim)
-    value_cache = torch.as_tensor(tensors["value_cache"]).reshape(-1, block_size, kv_head_num, head_dim)
-    block_table = torch.as_tensor(tensors["block_table"]).reshape(batch, max_num_blocks_per_req)
-    context_lens = torch.as_tensor(tensors["context_lens"])
+    # Reconstruct shaped tensors from flat tensors
+    query = tensors["query"].reshape(batch, num_heads, head_dim)
+    key_cache = tensors["key_cache"].reshape(-1, block_size, kv_head_num, head_dim)
+    value_cache = tensors["value_cache"].reshape(-1, block_size, kv_head_num, head_dim)
+    block_table = tensors["block_table"].reshape(batch, max_num_blocks_per_req)
+    context_lens = tensors["context_lens"]
 
     out = paged_attention(
         query=query,

@@ -23,8 +23,7 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-constexpr int M = 16, N = 16;
-
+template <int M, int N>
 static __aicore__ void online_update_impl(__gm__ Tensor* mij,
     __gm__ Tensor* lij,
     __gm__ Tensor* oi_new,
@@ -231,5 +230,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t is_first = static_cast<uint64_t>(args[7]);
     uint64_t is_last = static_cast<uint64_t>(args[8]);
 
-    online_update_impl(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
+    online_update_impl<16, 16>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
 }

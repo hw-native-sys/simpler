@@ -1,9 +1,18 @@
-// Softmax Preparation Kernel (AIV)
+// Softmax Preparation Kernel (AIV) with partial block masking
 //
 // Fixed tile size: sij is (16, 16)
 //
+// For partial blocks (valid_len < N), positions [valid_len, N) in sij are
+// filled with -inf before softmax, ensuring exp(-inf)=0 so that invalid
+// key positions contribute zero attention weight.
+//
+// Uses TFILLPAD_INPLACE for vector pipeline state setup, then patches with
+// scalar SetValue writes to fix a hardware bug in TFILLPAD's vcopy broadcast
+// path at small N (N=16).
+//
 // Computes:
-//   sij_scale = sij * scale
+//   sij_masked = pad(sij, valid_len, -inf)
+//   sij_scale = sij_masked * scale
 //   mij = row_max(sij_scale)        -> (M, 1)
 //   pij = exp(sij_scale - mij)      -> (M, N)
 //   lij = row_sum(pij)              -> (M, 1)
@@ -23,13 +32,13 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-constexpr int M = 16, N = 16;
-
+template <int M, int N>
 static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     float scale_value,
     __gm__ Tensor* pij,
     __gm__ Tensor* mij,
     __gm__ Tensor* lij) {
+    uint64_t valid_len = static_cast<uint64_t>(sij->repeats[1]);
     __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
     __gm__ half* pij_addr = reinterpret_cast<__gm__ half*>(pij->buffer.addr);
     __gm__ float* mij_addr = reinterpret_cast<__gm__ float*>(mij->buffer.addr);
@@ -46,11 +55,18 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     GlobalScalarDN mijGlobal(mij_addr + mij->start_offset);
     GlobalScalarDN lijGlobal(lij_addr + lij->start_offset);
 
+    // Dynamic-cols tile: marks which columns are valid for TFILLPAD boundary
+    using TileSijDyn = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, -1>;
+    // Padded tile: TFILLPAD_INPLACE fills positions [valid_len, N) with -inf
+    using TileSijPad = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N, SLayout::NoneBox, 512, PadValue::Min>;
+
     using TileVecMxN = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N>;
     using TileVecMxN_f16 = Tile<TileType::Vec, half, M, N, BLayout::RowMajor, M, N>;
     using TileScalarDN = Tile<TileType::Vec, float, kAlignedRows, 1, BLayout::ColMajor, M, 1>;
 
     TileVecMxN sijTile;
+    TileSijDyn sijDynTile(static_cast<size_t>(valid_len));
+    TileSijPad sijPadTile;
     TileVecMxN pijTile;
     TileVecMxN tmpTile;
     TileScalarDN maxTile;
@@ -58,19 +74,40 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     TileVecMxN_f16 pijF16Tile;
 
     TASSIGN(sijTile, 0x0);
+    TASSIGN(sijDynTile, 0x0);
+    TASSIGN(sijPadTile, 0x0);
     TASSIGN(pijTile, M * N * sizeof(float));
     TASSIGN(tmpTile, 2 * M * N * sizeof(float));
     TASSIGN(maxTile, 3 * M * N * sizeof(float));
     TASSIGN(sumTile, 3 * M * N * sizeof(float) + kAlignedRows * sizeof(float));
     TASSIGN(pijF16Tile, 3 * M * N * sizeof(float) + 2 * kAlignedRows * sizeof(float));
 
+    // Load full sij (M, N) tile from GM - all N columns including garbage for partial blocks
     TLOAD(sijTile, sijGlobal);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
+    // Mask columns [valid_len, N) with -inf.
+    // Use TFILLPAD_INPLACE for the main fill, then patch with SetValue for
+    // cases where TFILLPAD's vcopy broadcast path fails at small N.
+    TFILLPAD_INPLACE(sijPadTile, sijDynTile);
+    // Patch: SetValue ensures correctness for valid_len <= N/2 where
+    // TFILLPAD's PadRightRemainingRows vcopy has a hardware issue.
+    if (valid_len < static_cast<uint64_t>(N)) {
+        constexpr float NEG_INF = -__builtin_huge_valf();
+        for (int r = 0; r < M; r++) {
+            for (uint64_t c = valid_len; c < N; c++) {
+                sijTile.SetValue(static_cast<uint32_t>(r * N + c), NEG_INF);
+            }
+        }
+    }
+
     TMULS(sijTile, sijTile, scale_value);
+    pipe_barrier(PIPE_V);
     TROWMAX(maxTile, sijTile, tmpTile);
+    pipe_barrier(PIPE_V);
     TROWEXPANDSUB(pijTile, sijTile, maxTile);
+    pipe_barrier(PIPE_V);
     TEXP(pijTile, pijTile);
     // Truncate pij to fp16 first, then compute lij from truncated values (matches golden)
     TCVT(pijF16Tile, pijTile, RoundMode::CAST_ROUND);
@@ -96,5 +133,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[3]);
     __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[4]);
 
-    softmax_prepare_impl(sij, scale_value, pij, mij, lij);
+    softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij);
 }
