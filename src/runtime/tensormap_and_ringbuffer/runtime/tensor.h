@@ -47,6 +47,22 @@ enum class OverlapStatus {
     OTHER,
 };
 
+inline std::string to_str(OverlapStatus overlap_status) {
+    switch (overlap_status) {
+#define CASE(X)              \
+    case OverlapStatus::X: { \
+        return #X;           \
+    }
+        CASE(NO_OVERLAP)
+        CASE(COVERED)
+        CASE(OTHER)
+#undef CASE
+        default:
+            always_assert(false);
+    }
+    return "";
+}
+
 struct Segment {
     uint64_t begin;
     uint64_t end;
@@ -108,8 +124,8 @@ struct Tensor {
     explicit Tensor(uint64_t addr,
         uint64_t buffer_size_bytes,
         uint64_t start_offset,
-        uint64_t strides[],
-        uint64_t repeats[],
+        const uint64_t strides[],
+        const uint64_t repeats[],
         uint64_t ndims,
         DataType dtype,
         int32_t version,
@@ -146,6 +162,8 @@ struct Tensor {
 
     Tensor view(const uint64_t shapes[], const uint64_t offsets[]) const;
 
+    Tensor view(const std::vector<uint64_t>& shapes, const std::vector<uint64_t>& offsets) const;
+
     bool is_contiguous() const;
 
     uint64_t numel() const;
@@ -163,6 +181,7 @@ struct Tensor {
     void offset_to_ndims(uint64_t offset_ndims[]) const;
 
     uint64_t offset_ndim_to_1d(const uint64_t offset_ndims[]) const;
+    uint64_t offset_ndim_to_1d(const std::vector<uint64_t>& offset_ndims) const;
 
     OverlapStatus is_overlap(const Tensor& pre_task_output) const;
 
@@ -173,7 +192,7 @@ struct Tensor {
      * strides={1}, repeats={size_elements}, ndims=1.
      */
     static Tensor make_1d_contiguous(
-        uint64_t addr, int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
+        uint64_t addr, uint64_t size_bytes, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
         uint64_t size_elements = size_bytes / get_element_size(dtype);
         uint64_t strides[] = {1};
         uint64_t repeats[] = {size_elements};
@@ -189,14 +208,41 @@ struct Tensor {
  * Create a Tensor for pre-allocated external memory.
  */
 static inline Tensor make_tensor_external(
-    void* addr, int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
-    return Tensor::make_1d_contiguous(reinterpret_cast<uint64_t>(addr), size_bytes, version, dtype);
+    void* addr, uint64_t size_bytes, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
+    return Tensor::make_1d_contiguous(reinterpret_cast<uint64_t>(addr), size_bytes, dtype, version);
+}
+
+/**
+ * Create a Tensor for pre-allocated external memory.
+ */
+static inline Tensor make_tensor_external(
+    void* addr, const uint64_t shapes[], uint64_t ndims, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
+    uint64_t strides[RUNTIME_MAX_TENSOR_DIMS];
+    strides[ndims - 1] = 1;
+    for (uint64_t i = ndims - 1; i > 0; i--) {
+        strides[i - 1] = strides[i] * shapes[i];
+    }
+    return Tensor(reinterpret_cast<uint64_t>(addr), strides[0] * shapes[0] * get_element_size(dtype), 0, strides, shapes, ndims, dtype, version);
 }
 
 /**
  * Create a Tensor for runtime-allocated output (addr=0).
  * The runtime fills in the actual address during pto2_submit_task.
  */
-static inline Tensor make_tensor(int32_t size_bytes, int32_t version = 0, DataType dtype = DataType::FLOAT32) {
-    return Tensor::make_1d_contiguous(0, size_bytes, version, dtype);
+static inline Tensor make_tensor(uint64_t size_bytes, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
+    return Tensor::make_1d_contiguous(0, size_bytes, dtype, version);
+}
+
+/**
+ * Create a Tensor for runtime-allocated output (addr=0).
+ * The runtime fills in the actual address during pto2_submit_task.
+ */
+static inline Tensor make_tensor(
+    const uint64_t shapes[], uint64_t ndims, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
+    uint64_t strides[RUNTIME_MAX_TENSOR_DIMS];
+    strides[ndims - 1] = 1;
+    for (uint64_t i = ndims - 1; i > 0; i--) {
+        strides[i - 1] = strides[i] * shapes[i];
+    }
+    return Tensor(0, strides[0] * shapes[0] * get_element_size(dtype), 0, strides, shapes, ndims, dtype, version);
 }

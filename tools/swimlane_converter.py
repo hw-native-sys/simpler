@@ -155,6 +155,7 @@ def print_task_statistics(tasks, func_id_to_name=None):
     print("=" * 104)
 
 
+
 def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose=False):
     """Generate Chrome Trace Event Format JSON from task data.
 

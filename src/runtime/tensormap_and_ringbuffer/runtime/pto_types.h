@@ -21,44 +21,6 @@
 #include "tensor.h"
 
 // =============================================================================
-// Configuration
-// =============================================================================
-
-#ifndef PTO_TENSORMAP_POOL_SIZE
-#define PTO_TENSORMAP_POOL_SIZE 4096
-#endif
-
-#ifndef PTO_TENSORMAP_NUM_BUCKETS
-#define PTO_TENSORMAP_NUM_BUCKETS 1024
-#endif
-
-#ifndef PTO_MAX_SCOPE_DEPTH
-#define PTO_MAX_SCOPE_DEPTH 32
-#endif
-
-// =============================================================================
-// Worker Types
-// =============================================================================
-
-/**
- * Worker types for heterogeneous scheduling
- *
- * Tasks are routed to different ready queues based on worker_type:
- * - PTOWorkerType::CUBE:   AICore-CUBE (matrix ops, convolution)
- * - PTOWorkerType::VECTOR: AICore-VECTOR (element-wise ops, activation)
- *
- * Note: AICPU is not a worker type - AICPU threads act as schedulers that
- * dispatch tasks to AICore workers.
- */
-enum class PTOWorkerType : int32_t {
-    CUBE = 0,    // AICore-CUBE
-    VECTOR = 1,  // AICore-VECTOR
-};
-
-// Number of worker types (used for array sizing)
-constexpr int32_t PTO_NUM_WORKER_TYPES = 2;
-
-// =============================================================================
 // Parameter Types (for pto_submit_task API)
 // =============================================================================
 

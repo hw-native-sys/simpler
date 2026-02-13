@@ -306,10 +306,10 @@ void pto2_tensormap_insert(PTO2TensorMap* tm, Tensor* tensor, int32_t producer_t
     // Advance pool head (wrap around)
     tm->pool_head = (tm->pool_head + 1) % tm->pool_size;
 
-    int wait_count = 0;
+    size_t wait_count = 0;
     while (entry->in_bucket) {
         pto2_orchestrator_sync_tensormap(tm);
-        always_assert(wait_count++ <= 100000000);
+        always_assert(wait_count++ <= 1000000000UL);
     }
 
     // Initialize new entry

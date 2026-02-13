@@ -28,7 +28,7 @@
 // Configuration Macros
 // =============================================================================
 
-#define RUNTIME_MAX_ARGS 16
+#define RUNTIME_MAX_ARGS 32
 #define RUNTIME_MAX_WORKER 72  // 24 AIC + 48 AIV cores
 #define RUNTIME_MAX_TENSOR_PAIRS 64
 #define RUNTIME_MAX_FUNC_ID 32

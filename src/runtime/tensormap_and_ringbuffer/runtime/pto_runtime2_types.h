@@ -28,13 +28,13 @@
 // NOTE: PTO2_TASK_WINDOW_SIZE is now the DEFAULT value only.
 // Actual window size is passed at runtime to pto2_runtime_create_threaded_custom().
 // Use pto2_task_slot(sched, task_id) for slot calculation.
-#define PTO2_TASK_WINDOW_SIZE     16384   // Default task window size (power of 2)
+#define PTO2_TASK_WINDOW_SIZE     65536   // Default task window size (power of 2)
 
 // Memory pools
-#define PTO2_HEAP_SIZE            (64 * 1024 * 1024)  // 64MB default heap
-#define PTO2_DEP_LIST_POOL_SIZE   65536   // Dependency list pool entries
-#define PTO2_TENSORMAP_POOL_SIZE  32768   // TensorMap entry pool
-#define PTO2_TENSORMAP_NUM_BUCKETS 4096   // Power of 2 for fast hash
+#define PTO2_HEAP_SIZE            (1024 * 1024 * 1024)  // 1GB default heap
+#define PTO2_DEP_LIST_POOL_SIZE    65536    // Dependency list pool entries
+#define PTO2_TENSORMAP_POOL_SIZE   (65536)   // TensorMap entry pool
+#define PTO2_TENSORMAP_NUM_BUCKETS 65536    // Power of 2 for fast hash
 
 // Task parameters
 #define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task

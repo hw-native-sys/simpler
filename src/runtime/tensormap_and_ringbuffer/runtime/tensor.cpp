@@ -1,26 +1,12 @@
 /**
  * Tensor Descriptor - Overlap detection implementations
+ *
+ * Methods here are only needed by runtime targets (aicpu/aicore/host),
+ * NOT by the orchestration .so. Methods shared with orchestration
+ * live in tensor_orch.cpp.
  */
 
 #include "tensor.h"
-
-#include <algorithm>
-#include <sstream>
-
-std::string to_str(OverlapType overlap_type) {
-    switch (overlap_type) {
-#define CASE(X)            \
-    case OverlapType::X: { \
-        return #X;         \
-    }
-        CASE(Accurate)
-        CASE(Fuzzy)
-#undef CASE
-        default:
-            always_assert(false);
-    }
-    return "";
-}
 
 // ContiguousMemSegIterator implementations
 Tensor::ContiguousMemSegIterator::ContiguousMemSegIterator(const Tensor& tensor)
@@ -48,134 +34,6 @@ void Tensor::ContiguousMemSegIterator::operator++() {
     cur_seg.end = cur_seg.begin + tensor_.repeats[tensor_.ndims - 1];
 }
 
-// Remaining Tensor method implementations (not needed by orchestration .so)
-std::string Tensor::dump() const {
-    std::stringstream ss;
-    std::string indent = "    ";
-    ss << "{" << std::endl;
-    ss << indent << "buffer.addr: " << buffer.addr << std::endl;
-    ss << indent << "buffer.size: " << buffer.size << " bytes" << std::endl;
-    ss << indent << "dtype: " << get_dtype_name(dtype) << std::endl;
-    ss << indent << "start_offset: " << start_offset << " elements" << std::endl;
-    ss << indent << "ndims: " << ndims << std::endl;
-    ss << indent << "version: " << version << std::endl;
-    ss << indent << "overlap_type: " << to_str(overlap_type) << std::endl;
-
-    ss << indent << "strides: [";
-    for (uint64_t i = 0; i < ndims; i++) {
-        if (i > 0) {
-            ss << ", ";
-        }
-        ss << strides[i];
-    }
-    ss << "] (elements)" << std::endl;
-    ss << indent << "repeats: [";
-    for (uint64_t i = 0; i < ndims; i++) {
-        if (i > 0) {
-            ss << ", ";
-        }
-        ss << repeats[i];
-    }
-    ss << "]" << std::endl;
-    ss << "}" << std::endl;
-    return ss.str();
-}
-
-bool Tensor::valid_view(const uint64_t shapes[], const uint64_t offsets[]) const {
-    for (size_t i = 0; i < ndims; i++) {
-        if (shapes[i] + offsets[i] > repeats[i]) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool Tensor::valid_reshape(const uint64_t shapes[], uint64_t new_ndims) const {
-    uint64_t x = 1;
-    for (size_t i = 0; i < ndims; i++) {
-        x *= repeats[i];
-    }
-    uint64_t y = 1;
-    for (size_t i = 0; i < new_ndims; i++) {
-        y *= shapes[i];
-    }
-    return x == y;
-}
-
-Tensor Tensor::view(const uint64_t shapes[], const uint64_t offsets[]) const {
-    debug_assert(valid_view(shapes, offsets));
-    Tensor result(*this);
-
-    // 计算新的 start_offset: 原 offset + sum(offsets[i] * strides[i])
-    result.start_offset = start_offset + offset_ndim_to_1d(offsets);
-
-    // strides 保持不变，repeats 更新为新的 shapes
-    for (size_t i = 0; i < ndims; i++) {
-        result.repeats[i] = shapes[i];
-    }
-
-    return result;
-}
-
-bool Tensor::is_contiguous() const {
-    if (ndims == 0) {
-        return true;
-    }
-    if (strides[ndims - 1] != 1) {
-        return false;
-    }
-    for (int32_t i = ndims - 2; i >= 0; i--) {
-        if (strides[i] != strides[i + 1] * repeats[i + 1]) {
-            return false;
-        }
-    }
-    return true;
-}
-
-uint64_t Tensor::numel() const {
-    if (ndims == 0) {
-        return 0;
-    }
-    uint64_t total = 1;
-    for (uint64_t i = 0; i < ndims; i++) {
-        total *= repeats[i];
-    }
-    return total;
-}
-
-Tensor Tensor::reshape(const uint64_t shapes[], uint64_t new_ndims) const {
-    debug_assert(valid_reshape(shapes, new_ndims));
-
-    // 目前我们期望reshape的对象一定是连续内存，先限制使用场景
-    always_assert(is_contiguous());
-
-    // 计算新的 strides（row-major 布局）和 repeats
-    uint64_t new_strides[RUNTIME_MAX_TENSOR_DIMS];
-    uint64_t new_repeats[RUNTIME_MAX_TENSOR_DIMS];
-    // int32_t new_ndims = static_cast<int32_t>(shapes.size());
-
-    uint64_t stride = 1;
-    for (int i = new_ndims - 1; i >= 0; i--) {
-        new_strides[i] = stride;
-        new_repeats[i] = shapes[i];
-        stride *= shapes[i];
-    }
-
-    return Tensor(
-        buffer.addr, buffer.size, start_offset, new_strides, new_repeats, new_ndims, dtype, version, overlap_type);
-}
-
-Tensor Tensor::transpose(uint64_t x, uint64_t y) const {
-    debug_assert(valid_transpose(x, y));
-    Tensor result(*this);
-
-    // 直接交换 strides 和 repeats
-    std::swap(result.strides[x], result.strides[y]);
-    std::swap(result.repeats[x], result.repeats[y]);
-
-    return result;
-}
-
 bool Tensor::is_same_strides(const Tensor& other) const {
     for (uint64_t i = 0; i < ndims; i++) {
         if (strides[i] != other.strides[i]) {
@@ -193,17 +51,7 @@ void Tensor::offset_to_ndims(uint64_t offset_ndims[]) const {
     }
 }
 
-uint64_t Tensor::offset_ndim_to_1d(const uint64_t offset_ndims[]) const {
-    uint64_t result = 0;
-    for (uint64_t i = 0; i < ndims; i++) {
-        result += offset_ndims[i] * strides[i];
-    }
-    return result;
-}
-
 OverlapStatus Tensor::is_overlap(const Tensor& pre_task_output) const {
-    printf("input: %s\n", dump().c_str());
-    printf("output: %s\n", pre_task_output.dump().c_str());
     if (!is_same_memref(pre_task_output)) {
         return OverlapStatus::NO_OVERLAP;
     }

@@ -13,6 +13,7 @@
 #include "tensor.h"
 
 #include <algorithm>
+#include <sstream>
 
 // =============================================================================
 // Constructors and assignment
@@ -21,8 +22,8 @@
 Tensor::Tensor(uint64_t addr,
     uint64_t buffer_size_bytes,
     uint64_t start_offset,
-    uint64_t strides[],
-    uint64_t repeats[],
+    const uint64_t strides[],
+    const uint64_t repeats[],
     uint64_t ndims,
     DataType dtype,
     int32_t version,
@@ -189,3 +190,159 @@ std::vector<uint64_t> Tensor::collect_all_offsets(
     return offsets;
 }
 #endif
+
+// =============================================================================
+// Methods needed by orchestration .so (view, reshape, transpose, etc.)
+// =============================================================================
+
+uint64_t Tensor::offset_ndim_to_1d(const uint64_t offset_ndims[]) const {
+    uint64_t result = 0;
+    for (uint64_t i = 0; i < ndims; i++) {
+        result += offset_ndims[i] * strides[i];
+    }
+    return result;
+}
+
+uint64_t Tensor::offset_ndim_to_1d(const std::vector<uint64_t>& offset_ndims) const {
+    uint64_t result = 0;
+    for (uint64_t i = 0; i < ndims; i++) {
+        result += offset_ndims[i] * strides[i];
+    }
+    return result;
+}
+
+bool Tensor::valid_view(const uint64_t shapes[], const uint64_t offsets[]) const {
+    for (size_t i = 0; i < ndims; i++) {
+        if (shapes[i] + offsets[i] > repeats[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+Tensor Tensor::view(const uint64_t shapes[], const uint64_t offsets[]) const {
+    debug_assert(valid_view(shapes, offsets));
+    Tensor result(*this);
+    result.start_offset = start_offset + offset_ndim_to_1d(offsets);
+    for (size_t i = 0; i < ndims; i++) {
+        result.repeats[i] = shapes[i];
+    }
+    return result;
+}
+
+Tensor Tensor::view(const std::vector<uint64_t>& shapes, const std::vector<uint64_t>& offsets) const {
+    Tensor result(*this);
+    result.start_offset = start_offset + offset_ndim_to_1d(offsets);
+    for (size_t i = 0; i < ndims; i++) {
+        result.repeats[i] = shapes[i];
+    }
+    return result;
+}
+
+bool Tensor::is_contiguous() const {
+    if (ndims == 0) {
+        return true;
+    }
+    if (strides[ndims - 1] != 1) {
+        return false;
+    }
+    for (int32_t i = ndims - 2; i >= 0; i--) {
+        if (strides[i] != strides[i + 1] * repeats[i + 1]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool Tensor::valid_reshape(const uint64_t shapes[], uint64_t new_ndims) const {
+    uint64_t x = 1;
+    for (size_t i = 0; i < ndims; i++) {
+        x *= repeats[i];
+    }
+    uint64_t y = 1;
+    for (size_t i = 0; i < new_ndims; i++) {
+        y *= shapes[i];
+    }
+    return x == y;
+}
+
+Tensor Tensor::reshape(const uint64_t shapes[], uint64_t new_ndims) const {
+    debug_assert(valid_reshape(shapes, new_ndims));
+    always_assert(is_contiguous());
+    uint64_t new_strides[RUNTIME_MAX_TENSOR_DIMS];
+    uint64_t new_repeats[RUNTIME_MAX_TENSOR_DIMS];
+    uint64_t stride = 1;
+    for (int i = new_ndims - 1; i >= 0; i--) {
+        new_strides[i] = stride;
+        new_repeats[i] = shapes[i];
+        stride *= shapes[i];
+    }
+    return Tensor(
+        buffer.addr, buffer.size, start_offset, new_strides, new_repeats, new_ndims, dtype, version, overlap_type);
+}
+
+Tensor Tensor::transpose(uint64_t x, uint64_t y) const {
+    debug_assert(valid_transpose(x, y));
+    Tensor result(*this);
+    std::swap(result.strides[x], result.strides[y]);
+    std::swap(result.repeats[x], result.repeats[y]);
+    return result;
+}
+
+std::string to_str(OverlapType overlap_type) {
+    switch (overlap_type) {
+#define CASE(X)            \
+    case OverlapType::X: { \
+        return #X;         \
+    }
+        CASE(Accurate)
+        CASE(Fuzzy)
+#undef CASE
+        default:
+            always_assert(false);
+    }
+    return "";
+}
+
+std::string Tensor::dump() const {
+    std::stringstream ss;
+    std::string indent = "    ";
+    ss << "{" << std::endl;
+    ss << indent << "buffer.addr: " << buffer.addr << std::endl;
+    ss << indent << "buffer.size: " << buffer.size << " bytes" << std::endl;
+    ss << indent << "dtype: " << get_dtype_name(dtype) << std::endl;
+    ss << indent << "start_offset: " << start_offset << " elements" << std::endl;
+    ss << indent << "ndims: " << ndims << std::endl;
+    ss << indent << "version: " << version << std::endl;
+    ss << indent << "overlap_type: " << to_str(overlap_type) << std::endl;
+
+    ss << indent << "strides: [";
+    for (uint64_t i = 0; i < ndims; i++) {
+        if (i > 0) {
+            ss << ", ";
+        }
+        ss << strides[i];
+    }
+    ss << "] (elements)" << std::endl;
+    ss << indent << "repeats: [";
+    for (uint64_t i = 0; i < ndims; i++) {
+        if (i > 0) {
+            ss << ", ";
+        }
+        ss << repeats[i];
+    }
+    ss << "]" << std::endl;
+    ss << "}" << std::endl;
+    return ss.str();
+}
+
+uint64_t Tensor::numel() const {
+    if (ndims == 0) {
+        return 0;
+    }
+    uint64_t total = 1;
+    for (uint64_t i = 0; i < ndims; i++) {
+        total *= repeats[i];
+    }
+    return total;
+}

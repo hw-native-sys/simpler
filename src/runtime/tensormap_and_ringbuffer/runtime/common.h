@@ -14,41 +14,64 @@
 #include <array>
 #include <cstring>
 #include <memory>
+#include <vector>
 #endif
 
 /**
  * 使用 addr2line 将地址转换为 文件:行号 信息
+ * 使用 -i 标志展开内联，返回第一行（最内层实际代码位置）
+ * 如果存在内联，同时通过 inline_chain 返回外层调用链
  */
 #ifdef __linux__
-inline std::string addr_to_line(const char* executable, void* addr) {
+inline std::string addr_to_line(const char* executable, void* addr,
+                                std::string* inline_chain = nullptr) {
     char cmd[512];
-    snprintf(cmd, sizeof(cmd), "addr2line -e %s -f -C -p %p 2>/dev/null", executable, addr);
+    snprintf(cmd, sizeof(cmd), "addr2line -e %s -f -C -p -i %p 2>/dev/null", executable, addr);
 
     std::array<char, 256> buffer;
-    std::string result;
+    std::string raw_output;
 
     FILE* pipe = popen(cmd, "r");
     if (pipe) {
         while (fgets(buffer.data(), buffer.size(), pipe) != nullptr) {
-            result += buffer.data();
+            raw_output += buffer.data();
         }
         pclose(pipe);
-        // 移除末尾换行符
-        while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
-            result.pop_back();
+    }
+
+    if (raw_output.empty() || raw_output.find("??") != std::string::npos) {
+        return "";
+    }
+
+    // 按行分割
+    std::vector<std::string> lines;
+    size_t pos = 0;
+    while (pos < raw_output.size()) {
+        size_t nl = raw_output.find('\n', pos);
+        if (nl == std::string::npos) nl = raw_output.size();
+        std::string line = raw_output.substr(pos, nl - pos);
+        while (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty()) lines.push_back(line);
+        pos = nl + 1;
+    }
+
+    if (lines.empty()) return "";
+
+    // 第一行是最内层的实际代码位置，后续行是外层内联调用者
+    if (inline_chain && lines.size() > 1) {
+        *inline_chain = "";
+        for (size_t j = 1; j < lines.size(); j++) {
+            *inline_chain += "    [inlined by] " + lines[j] + "\n";
         }
     }
 
-    // 如果 addr2line 失败或返回 "??"，返回空
-    if (result.empty() || result.find("??") != std::string::npos) {
-        return "";
-    }
-    return result;
+    return lines.front();
 }
 #endif
 
 /**
  * 获取当前调用栈信息（包含文件路径和行号）
+ * 通过 dladdr 定位每个栈帧所在的共享库，并用相对地址调用 addr2line
  */
 inline std::string get_stacktrace(int skip_frames = 1) {
     std::string result;
@@ -58,33 +81,37 @@ inline std::string get_stacktrace(int skip_frames = 1) {
     int nframes = backtrace(buffer, max_frames);
     char** symbols = backtrace_symbols(buffer, nframes);
 
-    // 获取当前可执行文件路径
-    char exe_path[1024];
-    ssize_t len = readlink("/proc/self/exe", exe_path, sizeof(exe_path) - 1);
-    if (len > 0) {
-        exe_path[len] = '\0';
-    } else {
-        exe_path[0] = '\0';
-    }
-
     if (symbols) {
         result = "调用栈:\n";
         for (int i = skip_frames; i < nframes; i++) {
             std::string frame_info;
 
-            // 尝试使用 addr2line 获取精确的文件:行号
-            if (exe_path[0] != '\0') {
-                std::string addr2line_result = addr_to_line(exe_path, buffer[i]);
+            // backtrace() 返回的是返回地址（call 指令的下一条指令）
+            // 减 1 使地址落在 call 指令内部，避免解析到下一个函数
+            void* addr = (void*)((char*)buffer[i] - 1);
+
+            // 使用 dladdr 获取栈帧所在的共享库信息
+            Dl_info dl_info;
+            std::string inline_chain;
+            if (dladdr(addr, &dl_info) && dl_info.dli_fname) {
+                // 计算相对于共享库基地址的偏移
+                void* rel_addr = (void*)((char*)addr - (char*)dl_info.dli_fbase);
+                std::string addr2line_result = addr_to_line(dl_info.dli_fname, rel_addr, &inline_chain);
+
+                // 如果相对地址失败，尝试用绝对地址（适用于非 PIE 可执行文件）
+                if (addr2line_result.empty()) {
+                    addr2line_result = addr_to_line(dl_info.dli_fname, addr, &inline_chain);
+                }
+
                 if (!addr2line_result.empty()) {
-                    frame_info = addr2line_result;
+                    frame_info = std::string(dl_info.dli_fname) + ": " + addr2line_result;
                 }
             }
 
-            // 如果 addr2line 失败，使用 backtrace_symbols 的输出
+            // 如果 addr2line 失败，使用 backtrace_symbols 的输出并 demangle
             if (frame_info.empty()) {
                 std::string frame(symbols[i]);
 
-                // 尝试 demangle C++ 符号
                 size_t start = frame.find('(');
                 size_t end = frame.find('+', start);
                 if (start != std::string::npos && end != std::string::npos) {
@@ -102,6 +129,9 @@ inline std::string get_stacktrace(int skip_frames = 1) {
             char buf[16];
             snprintf(buf, sizeof(buf), "  #%d ", i - skip_frames);
             result += buf + frame_info + "\n";
+            if (!inline_chain.empty()) {
+                result += inline_chain;
+            }
         }
         free(symbols);
     }
