@@ -27,7 +27,7 @@ ATOL = 1e-3
 # All test cases - production scale
 ALL_CASES = {
     "Case1": {
-        "batch": 16,
+        "batch": 64,
         "num_heads": 16,
         "kv_head_num": 1,
         "head_dim": 128,
