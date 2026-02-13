@@ -129,47 +129,44 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
     const auto timeout_duration = std::chrono::seconds(PLATFORM_PROF_TIMEOUT_SECONDS);
     std::optional<std::chrono::steady_clock::time_point> idle_start;
 
-    // Poll for total_tasks if not provided
-    if (expected_tasks <= 0) {
-        LOG_INFO("Waiting for AICPU to write total_tasks to PerfDataHeader...");
-        idle_start = std::chrono::steady_clock::now();
-
-        while (true) {
-            rmb();
-            expected_tasks = static_cast<int>(header->total_tasks);
-
-            if (expected_tasks > 0) {
-                LOG_INFO("Task count read from PerfDataHeader: %d", expected_tasks);
-                break;
-            }
-
-            auto elapsed = std::chrono::steady_clock::now() - idle_start.value();
-            if (elapsed >= timeout_duration) {
-                LOG_ERROR("Timeout waiting for total_tasks from AICPU after %ld seconds",
-                         std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
-                LOG_ERROR("AICPU may not have initialized performance profiling");
-                return;
-            }
-        }
-    }
-
-    LOG_DEBUG("Expected tasks: %d", expected_tasks);
-
     uint32_t capacity = PLATFORM_PROF_READYQUEUE_SIZE;
     int total_records_collected = 0;
     int buffers_processed = 0;
 
     collected_perf_records_.clear();
-    idle_start.reset();
     int empty_poll_count = 0;
 
-    // Poll the ready queue
-    while (total_records_collected < expected_tasks) {
+    // When expected_tasks is unknown (<=0), we start consuming buffers immediately
+    // and dynamically check header->total_tasks to learn the final count.
+    bool tasks_known = (expected_tasks > 0);
+    if (!tasks_known) {
+        LOG_INFO("Task count unknown, will poll total_tasks from PerfDataHeader while consuming buffers");
+    }
+
+    // Unified polling loop: consume ready buffers and check for total_tasks
+    while (true) {
+        // Dynamically discover total_tasks if not yet known
+        if (!tasks_known) {
+            rmb();
+            int discovered = static_cast<int>(header->total_tasks);
+            if (discovered > 0) {
+                expected_tasks = discovered;
+                tasks_known = true;
+                LOG_INFO("Task count read from PerfDataHeader: %d", expected_tasks);
+            }
+        }
+
+        // Termination: collected enough records
+        if (tasks_known && total_records_collected >= expected_tasks) {
+            break;
+        }
+
         rmb();
         uint32_t head = header->queue_head;
         uint32_t tail = header->queue_tail;
 
         if (head == tail) {
+            // Queue empty — track idle time for timeout
             if (!idle_start.has_value()) {
                 idle_start = std::chrono::steady_clock::now();
             }
@@ -189,6 +186,7 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
             continue;
         }
 
+        // Got data — reset idle tracking
         idle_start.reset();
         empty_poll_count = 0;
 
@@ -230,7 +228,7 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
     LOG_INFO("Total buffers processed: %d", buffers_processed);
     LOG_INFO("Total records collected: %d", total_records_collected);
 
-    if (total_records_collected < expected_tasks) {
+    if (tasks_known && total_records_collected < expected_tasks) {
         LOG_WARN("Incomplete collection (%d / %d records)",
                  total_records_collected, expected_tasks);
     }

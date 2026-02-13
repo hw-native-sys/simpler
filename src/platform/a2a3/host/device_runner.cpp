@@ -8,6 +8,7 @@
 #include "device_runner.h"
 
 #include <dlfcn.h>
+#include <thread>
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
@@ -397,9 +398,15 @@ int DeviceRunner::run(Runtime& runtime,
         return rc;
     }
 
-    // Poll and collect performance data (must be before stream sync)
+    // Poll and collect performance data in a separate thread so it runs
+    // concurrently with stream synchronization.  This prevents a deadlock
+    // where AICPU spins waiting for the host to consume a full perf buffer
+    // while the host has already stopped polling.
+    std::thread collector_thread;
     if (runtime.enable_profiling) {
-        poll_and_collect_performance_data(runtime.worker_count, runtime.get_task_count());
+        collector_thread = std::thread([this, &runtime]() {
+            poll_and_collect_performance_data(runtime.worker_count, runtime.get_task_count());
+        });
     }
 
     std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
@@ -407,6 +414,7 @@ int DeviceRunner::run(Runtime& runtime,
     rc = rtStreamSynchronize(stream_aicpu_);
     if (rc != 0) {
         LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
+        if (collector_thread.joinable()) collector_thread.join();
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -415,11 +423,17 @@ int DeviceRunner::run(Runtime& runtime,
     rc = rtStreamSynchronize(stream_aicore_);
     if (rc != 0) {
         LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
+        if (collector_thread.joinable()) collector_thread.join();
         kernel_args_.finalize_runtime_args();
         return rc;
     }
 
-    // Print collected performance data (after stream sync)
+    // Wait for collector thread to finish
+    if (collector_thread.joinable()) {
+        collector_thread.join();
+    }
+
+    // Export collected performance data (after stream sync + collection done)
     if (runtime.enable_profiling) {
         export_swimlane_json();
     }

@@ -94,7 +94,7 @@ constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 50000000;  // 50 MHz
 /**
  * Timeout duration for performance data collection (seconds)
  */
-constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 2;
+constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 60;
 
 /**
  * Number of empty polling iterations before checking timeout
