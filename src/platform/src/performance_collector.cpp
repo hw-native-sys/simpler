@@ -6,8 +6,10 @@
 #include "host/performance_collector.h"
 
 #include <algorithm>
+#include <chrono>
 #include <fstream>
 #include <iomanip>
+#include <optional>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <ctime>

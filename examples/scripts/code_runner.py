@@ -530,47 +530,26 @@ class CodeRunner:
                 "  export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa"
             )
 
-        # Step 1: Build runtime
+        # Step 1: Build runtime, orchestration, and kernels in parallel
+        # (they are independent — all only need kernel_compiler which is ready)
         logger.info(f"=== Building Runtime: {self.runtime_name} (platform: {self.platform}) ===")
         builder = RuntimeBuilder(platform=self.platform)
         kernel_compiler = builder.get_kernel_compiler()
 
-        try:
-            host_binary, aicpu_binary, aicore_binary = builder.build(
+        from concurrent.futures import ThreadPoolExecutor, Future
+
+        runtime_include_dirs = [
+            os.path.join(self.project_root, "src", "runtime", self.runtime_name, "runtime")
+        ]
+
+        def _build_runtime():
+            return builder.build(self.runtime_name)
+
+        def _compile_orchestration():
+            return kernel_compiler.compile_orchestration(
                 self.runtime_name,
+                self.orchestration["source"],
             )
-        except Exception as e:
-            raise RuntimeError(
-                f"Failed to build runtime '{self.runtime_name}' for platform '{self.platform}'.\n"
-                f"Error: {e}"
-            ) from e
-
-        # Step 2: Load runtime and set device
-        logger.info(f"=== Loading Runtime ({len(host_binary)} bytes) ===")
-        Runtime = bind_host_binary(host_binary)
-
-        logger.info(f"=== Setting Device {self.device_id} ===")
-        set_device(self.device_id)
-
-        # Step 3: Compile orchestration
-        logger.info("=== Compiling Orchestration ===")
-
-        orch_so_binary = kernel_compiler.compile_orchestration(
-            self.runtime_name,
-            self.orchestration["source"],
-        )
-
-        # Step 4: Compile kernels (will be registered during runtime.initialize)
-        logger.info("=== Compiling Kernels ===")
-
-        # Build list of (func_id, binary) tuples for passing to runtime.initialize()
-        kernel_binaries = []
-        # Prepare runtime include directories for kernel compilation
-        runtime_include_dirs = []
-        runtime_dir = os.path.join(self.project_root, "src", "runtime", self.runtime_name, "runtime")
-        runtime_include_dirs.append(runtime_dir)
-
-        from concurrent.futures import ThreadPoolExecutor
 
         def _compile_one_kernel(kernel):
             logger.info(f"Compiling kernel: {kernel['source']} (func_id={kernel['func_id']})")
@@ -580,18 +559,38 @@ class CodeRunner:
                 pto_isa_root=pto_isa_root,
                 extra_include_dirs=runtime_include_dirs,
             )
-            # For sim platform: keep complete .so for dlopen (supports external symbols like std::exp)
-            # For real hardware: extract .text section (ccec compiled kernels don't depend on external symbols)
             if self.platform == "a2a3sim":
-                kernel_bin = incore_o  # Complete .so for dlopen
+                kernel_bin = incore_o
             else:
-                kernel_bin = extract_text_section(incore_o)  # .text only for mmap
+                kernel_bin = extract_text_section(incore_o)
             return (kernel["func_id"], kernel_bin)
 
-        with ThreadPoolExecutor(max_workers=len(self.kernels)) as executor:
-            kernel_binaries = list(executor.map(_compile_one_kernel, self.kernels))
+        # Launch all compilations concurrently
+        max_workers = 2 + len(self.kernels)  # runtime + orchestration + kernels
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            fut_runtime = executor.submit(_build_runtime)
+            fut_orch = executor.submit(_compile_orchestration)
+            fut_kernels = [executor.submit(_compile_one_kernel, k) for k in self.kernels]
+
+            try:
+                host_binary, aicpu_binary, aicore_binary = fut_runtime.result()
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to build runtime '{self.runtime_name}' for platform '{self.platform}'.\n"
+                    f"Error: {e}"
+                ) from e
+
+            orch_so_binary = fut_orch.result()
+            kernel_binaries = [f.result() for f in fut_kernels]
 
         logger.info(f"Compiled {len(kernel_binaries)} kernel(s)")
+
+        # Step 2: Load runtime and set device
+        logger.info(f"=== Loading Runtime ({len(host_binary)} bytes) ===")
+        Runtime = bind_host_binary(host_binary)
+
+        logger.info(f"=== Setting Device {self.device_id} ===")
+        set_device(self.device_id)
 
         # Step 5: Run each parameter set
         total_cases = len(self.params_list)

@@ -16,8 +16,6 @@
 #ifndef PLATFORM_HOST_PERFORMANCE_COLLECTOR_H_
 #define PLATFORM_HOST_PERFORMANCE_COLLECTOR_H_
 
-#include <chrono>
-#include <optional>
 #include <string>
 #include <vector>
 
