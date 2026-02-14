@@ -131,6 +131,25 @@ void pto2_tensormap_reset(PTO2TensorMap* tm);
 void pto2_tensormap_sync_validity(PTO2TensorMap* tm, int32_t last_task_alive);
 
 /**
+ * Stack-allocated lookup result (avoids heap allocation per lookup)
+ */
+#define PTO2_LOOKUP_MAX_RESULTS 16
+struct PTO2LookupResult {
+    struct Entry {
+        PTO2TensorMapEntry* entry;
+        OverlapStatus overlap_status;
+    };
+    Entry entries[PTO2_LOOKUP_MAX_RESULTS];
+    int32_t count{0};
+
+    void push(PTO2TensorMapEntry* e, OverlapStatus s) {
+        if (count < PTO2_LOOKUP_MAX_RESULTS) {
+            entries[count++] = {e, s};
+        }
+    }
+};
+
+/**
  * Lookup producer for a tensor region
  *
  * Searches the hash table for a matching region.
@@ -141,9 +160,9 @@ void pto2_tensormap_sync_validity(PTO2TensorMap* tm, int32_t last_task_alive);
  *
  * @param tm      TensorMap
  * @param tensor  Tensor to look up
- * @return Producer entry, and overlap status
+ * @param result  Output: stack-allocated result buffer
  */
-std::vector<std::pair<PTO2TensorMapEntry*, OverlapStatus>> pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor);
+void pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor, PTO2LookupResult* result);
 
 /**
  * Insert a new entry (called when task produces output)

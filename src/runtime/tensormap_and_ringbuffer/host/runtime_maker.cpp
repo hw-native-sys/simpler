@@ -24,6 +24,14 @@
 #include <cstdio>
 #include <cstring>
 #include <iostream>
+#include <sys/time.h>
+
+// Helper: return current time in milliseconds
+static long long _now_ms() {
+    struct timeval tv;
+    gettimeofday(&tv, nullptr);
+    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+}
 
 // Max args for device orchestration
 #define RT2_MAX_DEVICE_ARGS 32
@@ -103,9 +111,12 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
     std::cout << "RT2 init: " << func_args_count << " arguments, device orchestration mode\n";
 
+    long long t_total_start = _now_ms();
+
     // Convert host pointers to device pointers based on arg_types
     uint64_t device_args[RT2_MAX_DEVICE_ARGS];
 
+    long long t_args_start = _now_ms();
     for (int i = 0; i < func_args_count; i++) {
         switch (arg_types[i]) {
             case ARG_SCALAR:
@@ -186,8 +197,10 @@ extern "C" int init_runtime_impl(Runtime *runtime,
                 return -1;
         }
     }
+    long long t_args_end = _now_ms();
 
     // Copy orchestration SO to device memory (AICPU cannot access host memory)
+    long long t_so_start = _now_ms();
     void* dev_so = runtime->host_api.device_malloc(orch_so_size);
     if (dev_so == nullptr) {
         std::cerr << "Error: Failed to allocate device memory for orchestration SO\n";
@@ -205,9 +218,12 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     runtime->set_device_orch_so(orch_so_binary, orch_so_size);
     runtime->record_tensor_pair(nullptr, dev_so, orch_so_size);
     std::cout << "Orchestration SO: " << orch_so_size << " bytes copied to device\n";
+    long long t_so_end = _now_ms();
 
     // Allocate GM heap for orchestrator output buffers
+    long long t_heap_start = _now_ms();
     void* gm_heap = runtime->host_api.device_malloc(PTO2_HEAP_SIZE);
+    long long t_heap_end = _now_ms();
     if (gm_heap == nullptr) {
         std::cerr << "Error: Failed to allocate GM heap\n";
         return -1;
@@ -216,8 +232,10 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     runtime->set_pto2_gm_heap(gm_heap);
 
     // Allocate PTO2 shared memory
+    long long t_sm_start = _now_ms();
     int32_t sm_size = pto2_sm_calculate_size(PTO2_TASK_WINDOW_SIZE, PTO2_DEP_LIST_POOL_SIZE);
     void* sm_ptr = runtime->host_api.device_malloc(static_cast<size_t>(sm_size));
+    long long t_sm_end = _now_ms();
     if (sm_ptr == nullptr) {
         std::cerr << "Error: Failed to allocate PTO2 shared memory\n";
         return -1;
@@ -230,6 +248,14 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     runtime->set_orch_args(device_args, func_args_count);
 
     std::cout << "Device orchestration ready: " << func_args_count << " args\n";
+
+    long long t_total_end = _now_ms();
+    printf("TIMING: args_malloc_copy = %lldms\n", t_args_end - t_args_start);
+    printf("TIMING: orch_so_copy = %lldms\n", t_so_end - t_so_start);
+    printf("TIMING: gm_heap_alloc(1GB) = %lldms\n", t_heap_end - t_heap_start);
+    printf("TIMING: shared_mem_alloc = %lldms\n", t_sm_end - t_sm_start);
+    printf("TIMING: total_init_runtime_impl = %lldms\n", t_total_end - t_total_start);
+
     return 0;
 }
 

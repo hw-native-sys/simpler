@@ -272,9 +272,9 @@ int32_t pto2_task_ring_try_alloc(PTO2TaskRing* ring) {
         int32_t task_id = current;
         int32_t slot = task_id & (ring->window_size - 1);
         
-        // Initialize task descriptor
+        // Mark slot as occupied (skip full memset — pto2_submit_task
+        // explicitly initializes all fields it needs)
         PTO2TaskDescriptor* task = &ring->descriptors[slot];
-        memset(task, 0, sizeof(PTO2TaskDescriptor));
         task->task_id = task_id;
         task->is_active = true;
         

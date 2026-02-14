@@ -279,7 +279,6 @@ typedef struct {
     PTOParam params[16];
     Tensor tensor_copies[16];  // Owned tensor data (params[i].tensor points here)
     int param_count{0};
-    
 } PTO2TaskDescriptor;
 
 // =============================================================================
@@ -378,10 +377,13 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 #include <sched.h>
 #if defined(__aarch64__)
     #define PTO2_SPIN_PAUSE()         do { __asm__ __volatile__("yield" ::: "memory"); sched_yield(); } while(0)
+    #define PTO2_SPIN_PAUSE_LIGHT()   __asm__ __volatile__("yield" ::: "memory")
 #elif defined(__x86_64__)
     #define PTO2_SPIN_PAUSE()         do { __builtin_ia32_pause(); sched_yield(); } while(0)
+    #define PTO2_SPIN_PAUSE_LIGHT()   __builtin_ia32_pause()
 #else
     #define PTO2_SPIN_PAUSE()         sched_yield()
+    #define PTO2_SPIN_PAUSE_LIGHT()   ((void)0)
 #endif
 
 /**

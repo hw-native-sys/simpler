@@ -77,6 +77,18 @@ struct PTO2OrchestratorState {
     int32_t* aicpu_fanin_refcount;
     volatile int32_t* aicpu_task_completed;
     int32_t aicpu_window_mask;
+
+    // === ORCHESTRATOR READY QUEUE (early-return path → scheduler) ===
+    // When the orchestrator discovers a producer already completed, it
+    // increments the consumer's refcount directly.  If that makes the
+    // consumer ready, the consumer_id is pushed here so scheduler threads
+    // can pick it up without an O(N) scan.
+    // SPSC-ish ring: orchestrator writes (single producer), scheduler
+    // threads read via CAS on orch_ready_head (multiple consumers).
+    static constexpr int32_t ORCH_READY_QUEUE_SIZE = 4096;
+    volatile int32_t orch_ready_queue[4096];
+    volatile int32_t orch_ready_tail;  // written by orchestrator only
+    volatile int32_t orch_ready_head;  // advanced by scheduler via CAS
 };
 
 // =============================================================================
@@ -225,5 +237,34 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch);
  * Print scope stack state
  */
 void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch);
+
+// =============================================================================
+// Orchestrator Profiling Data
+// =============================================================================
+
+#ifndef PTO2_ORCH_PROFILING
+#define PTO2_ORCH_PROFILING 1
+#endif
+
+#if PTO2_ORCH_PROFILING
+struct PTO2OrchProfilingData {
+    uint64_t sync_ns;
+    uint64_t alloc_ns;
+    uint64_t params_ns;
+    uint64_t lookup_ns;
+    uint64_t heap_ns;
+    uint64_t insert_ns;
+    uint64_t fanin_ns;
+    uint64_t finalize_ns;
+    uint64_t scope_end_ns;
+    int64_t  submit_count;
+};
+
+/**
+ * Get and reset orchestrator profiling data.
+ * Returns accumulated profiling data and resets counters.
+ */
+PTO2OrchProfilingData pto2_orchestrator_get_profiling();
+#endif
 
 #endif  // PTO_ORCHESTRATOR_H

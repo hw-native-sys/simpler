@@ -28,6 +28,14 @@
 #include "common/perf_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
+
+// Scheduler profiling helper
+#include <time.h>
+static inline uint64_t _orch_now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
 #include "inner_aicpu.h"
 
 // Device orchestration function signature (loaded via dlopen).
@@ -45,6 +53,14 @@ constexpr int MAX_CORES_PER_THREAD = MAX_AIC_PER_THREAD + MAX_AIV_PER_THREAD;
 
 // Maximum tasks for ready queue (PTO2 mode uses shared memory task count)
 constexpr int AICPU_MAX_READY_TASKS = 16384;
+constexpr int AICPU_READY_MASK = AICPU_MAX_READY_TASKS - 1;
+
+// Lightweight spinlock (avoids futex syscall overhead of std::mutex)
+struct SpinLock {
+    std::atomic<int> flag{0};
+    void lock() { while (flag.exchange(1, std::memory_order_acquire) != 0) { PTO2_SPIN_PAUSE_LIGHT(); } }
+    void unlock() { flag.store(0, std::memory_order_release); }
+};
 
 // Core information for discovery (aligned with host_build_graph)
 struct CoreInfo {
@@ -73,17 +89,16 @@ struct AicpuExecutor {
     int aiv_count_{0};
 
     // ===== Task queue state (FIFO circular queue, aligned with host_build_graph) =====
-    std::mutex ready_queue_aic_mutex_;
+    // ===== Spinlock-based MPMC ready queues (lighter than std::mutex) =====
+    SpinLock ready_queue_aic_lock_;
     int ready_queue_aic_[AICPU_MAX_READY_TASKS];
-    std::atomic<int> ready_count_aic_{0};
-    int ready_queue_aic_head_{0};  // Circular queue: read position (front)
-    int ready_queue_aic_tail_{0};  // Circular queue: write position (back)
+    int ready_queue_aic_head_{0};
+    int ready_queue_aic_tail_{0};
 
-    std::mutex ready_queue_aiv_mutex_;
+    SpinLock ready_queue_aiv_lock_;
     int ready_queue_aiv_[AICPU_MAX_READY_TASKS];
-    std::atomic<int> ready_count_aiv_{0};
-    int ready_queue_aiv_head_{0};  // Circular queue: read position (front)
-    int ready_queue_aiv_tail_{0};  // Circular queue: write position (back)
+    int ready_queue_aiv_head_{0};
+    int ready_queue_aiv_tail_{0};
 
     // Task execution tracking
     std::atomic<int> completed_tasks_{0};
@@ -96,6 +111,12 @@ struct AicpuExecutor {
     std::atomic<int> next_scan_index_{0};
     std::atomic<bool> perf_init_done_{false};
     std::atomic<bool> sm_header_ready_{false};  // Thread 3 sets after SM header init
+
+    // Orchestrator ready queue pointers (set by Thread 3, read by scheduler threads)
+    volatile int32_t* orch_ready_queue_{nullptr};
+    volatile int32_t* orch_ready_tail_{nullptr};
+    volatile int32_t* orch_ready_head_{nullptr};
+    int32_t orch_ready_capacity_{0};
 
     // Orchestration SO handle - defer dlclose until all tasks complete
     void* orch_so_handle_{nullptr};
@@ -292,8 +313,6 @@ int AicpuExecutor::init(Runtime* runtime) {
     orchestrator_done_.store(orch_on_host, std::memory_order_release);
 
     // Initial ready tasks will be populated from PTO2 shared memory in resolve_and_dispatch_pto2
-    ready_count_aic_.store(0, std::memory_order_release);
-    ready_count_aiv_.store(0, std::memory_order_release);
     ready_queue_aic_head_ = 0;
     ready_queue_aic_tail_ = 0;
     ready_queue_aiv_head_ = 0;
@@ -357,14 +376,6 @@ static void build_pto2_payload(PTO2DispatchPayload* out, Runtime* runtime,
     }
 
     out->num_args = n;
-    DEV_INFO("build_pto2_payload ok");
-    for (int i = 0; i < task->param_count; i++) {
-        if (task->params[i].type == PTOParamType::SCALAR) {
-            DEV_INFO("build_pto2_payload param %d scalar: %d", i, out->args[i]);
-        } else {
-            DEV_INFO("build_pto2_payload param %d addr: %x", i, out->args[i]);
-        }
-    }
 }
 
 int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
@@ -433,7 +444,17 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     const int WARN_INTERVAL = 1000000;
     bool profiling_enabled = runtime->enable_profiling;
 
+    // Scheduler profiling counters
+    uint64_t sched_scan_ns = 0, sched_orch_drain_ns = 0;
+    uint64_t sched_complete_ns = 0, sched_dispatch_ns = 0, sched_yield_ns = 0;
+    uint64_t sched_loop_count = 0, sched_yield_count = 0;
+    // Fanout traversal statistics
+    uint64_t total_fanout_traversed = 0;
+    int32_t max_fanout_len = 0;
+
     while (true) {
+        sched_loop_count++;
+        uint64_t _phase_t0 = _orch_now_ns(), _phase_t1;
         // Dynamic task_count (Thread 3 sets total_tasks_ when orchestration completes)
         int32_t task_count = total_tasks_.load(std::memory_order_acquire);
         bool orch_done = orchestrator_done_.load(std::memory_order_acquire);
@@ -481,57 +502,57 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                     __atomic_store_n(&s_pto2_task_completed[slot], 1, __ATOMIC_RELEASE);
                     int32_t wt = t->worker_type;
                     if (wt == PTO2_WORKER_CUBE) {
-                        std::lock_guard<std::mutex> lock(ready_queue_aic_mutex_);
-                        ready_queue_aic_[ready_queue_aic_tail_] = idx;
-                        ready_queue_aic_tail_ = (ready_queue_aic_tail_ + 1) % AICPU_MAX_READY_TASKS;
-                        ready_count_aic_.fetch_add(1, std::memory_order_release);
+                        ready_queue_aic_lock_.lock();
+                        ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = idx;
+                        ready_queue_aic_lock_.unlock();
                     } else {
-                        std::lock_guard<std::mutex> lock(ready_queue_aiv_mutex_);
-                        ready_queue_aiv_[ready_queue_aiv_tail_] = idx;
-                        ready_queue_aiv_tail_ = (ready_queue_aiv_tail_ + 1) % AICPU_MAX_READY_TASKS;
-                        ready_count_aiv_.fetch_add(1, std::memory_order_release);
+                        ready_queue_aiv_lock_.lock();
+                        ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = idx;
+                        ready_queue_aiv_lock_.unlock();
                     }
                     made_progress = true;
                 }
             }
         }
+        _phase_t1 = _orch_now_ns(); sched_scan_ns += (_phase_t1 - _phase_t0); _phase_t0 = _phase_t1;
 
-        // Readiness scan: enqueue tasks made ready by orchestrator's early-return path
-        // (producer already completed → refcount incremented directly, but not enqueued)
-        {
-            int32_t scanned = next_scan_index_.load(std::memory_order_acquire);
-            for (int32_t idx = 0; idx < scanned; idx++) {
-                int32_t slot = idx & window_mask;
-                int32_t state = __atomic_load_n(&s_pto2_task_completed[slot], __ATOMIC_ACQUIRE);
-                if (state != 0) continue;  // already enqueued (1) or completed (2)
 
-                PTO2TaskDescriptor* t = &task_descriptors[slot];
-                int32_t fanin_count = __atomic_load_n(&t->fanin_count, __ATOMIC_ACQUIRE);
-                if (fanin_count <= 0) continue;  // root tasks handled by incremental scan
+        // Drain orchestrator ready queue: tasks made ready by orchestrator's early-return path
+        // (producer already completed → refcount incremented directly, consumer pushed to queue)
+        if (orch_ready_queue_ != nullptr) {
+            while (true) {
+                int32_t head = __atomic_load_n(orch_ready_head_, __ATOMIC_ACQUIRE);
+                int32_t tail = __atomic_load_n(orch_ready_tail_, __ATOMIC_ACQUIRE);
+                if (head == tail) break;  // queue empty
 
-                int32_t refcount = __atomic_load_n(&s_pto2_fanin_refcount[slot], __ATOMIC_ACQUIRE);
-                if (refcount < fanin_count) continue;
+                // CAS to claim this slot (multiple scheduler threads compete)
+                if (!__atomic_compare_exchange_n(orch_ready_head_, &head, head + 1,
+                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
 
-                // CAS from 0 → 1 to claim enqueue rights
+                int32_t task_id = orch_ready_queue_[head & (orch_ready_capacity_ - 1)];
+                int32_t slot = task_id & window_mask;
+
+                // CAS from 0 → 1 to claim enqueue rights (may already be enqueued by fanout path)
                 int32_t expected = 0;
                 if (!__atomic_compare_exchange_n(&s_pto2_task_completed[slot], &expected, 1,
                         false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
 
+                PTO2TaskDescriptor* t = &task_descriptors[slot];
                 int32_t wt = t->worker_type;
                 if (wt == PTO2_WORKER_CUBE) {
-                    std::lock_guard<std::mutex> lock(ready_queue_aic_mutex_);
-                    ready_queue_aic_[ready_queue_aic_tail_] = idx;
-                    ready_queue_aic_tail_ = (ready_queue_aic_tail_ + 1) % AICPU_MAX_READY_TASKS;
-                    ready_count_aic_.fetch_add(1, std::memory_order_release);
+                    ready_queue_aic_lock_.lock();
+                    ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = task_id;
+                    ready_queue_aic_lock_.unlock();
                 } else {
-                    std::lock_guard<std::mutex> lock(ready_queue_aiv_mutex_);
-                    ready_queue_aiv_[ready_queue_aiv_tail_] = idx;
-                    ready_queue_aiv_tail_ = (ready_queue_aiv_tail_ + 1) % AICPU_MAX_READY_TASKS;
-                    ready_count_aiv_.fetch_add(1, std::memory_order_release);
+                    ready_queue_aiv_lock_.lock();
+                    ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = task_id;
+                    ready_queue_aiv_lock_.unlock();
                 }
                 made_progress = true;
             }
         }
+        _phase_t1 = _orch_now_ns(); sched_orch_drain_ns += (_phase_t1 - _phase_t0); _phase_t0 = _phase_t1;
+
 
         // Phase 1: Process completed tasks (Handshake.task = PTO2DispatchPayload*)
         for (int i = 0; i < core_num; i++) {
@@ -566,17 +587,19 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 int32_t task_id = payload->task_id;
                 PTO2TaskDescriptor* pto2_task = &task_descriptors[task_id & window_mask];
 
-                DEV_INFO("Thread %d: Core %d completed PTO2 task %d", thread_idx, core_id, task_id);
+                DEV_DEBUG("Thread %d: Core %d completed PTO2 task %d", thread_idx, core_id, task_id);
 
                 // Acquire fanout_lock, mark completed (state=2), snapshot fanout_head
-                while (PTO2_EXCHANGE(&pto2_task->fanout_lock, 1) != 0) { PTO2_SPIN_PAUSE(); }
+                while (PTO2_EXCHANGE(&pto2_task->fanout_lock, 1) != 0) { PTO2_SPIN_PAUSE_LIGHT(); }
                 __atomic_store_n(&s_pto2_task_completed[task_id & window_mask], 2, __ATOMIC_RELEASE);
                 int32_t fanout_head = pto2_task->fanout_head;
                 PTO2_STORE_RELEASE(&pto2_task->fanout_lock, 0);
 
                 // Traverse fanout outside lock
+                int32_t fanout_len = 0;
                 int32_t current = fanout_head;
                 while (current > 0) {
+                    fanout_len++;
                     PTO2DepListEntry* entry = &dep_list_pool[current];
                     int32_t consumer_id = entry->task_id;
                     int32_t consumer_slot = consumer_id & window_mask;
@@ -587,21 +610,19 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         __atomic_store_n(&s_pto2_task_completed[consumer_slot], 1, __ATOMIC_RELEASE);
                         int32_t wt = consumer_desc->worker_type;
                         if (wt == PTO2_WORKER_CUBE) {
-                            std::lock_guard<std::mutex> lock(ready_queue_aic_mutex_);
-                            // FIFO: enqueue to tail
-                            ready_queue_aic_[ready_queue_aic_tail_] = consumer_id;
-                            ready_queue_aic_tail_ = (ready_queue_aic_tail_ + 1) % AICPU_MAX_READY_TASKS;
-                            ready_count_aic_.fetch_add(1, std::memory_order_release);
+                            ready_queue_aic_lock_.lock();
+                            ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = consumer_id;
+                            ready_queue_aic_lock_.unlock();
                         } else {
-                            std::lock_guard<std::mutex> lock(ready_queue_aiv_mutex_);
-                            // FIFO: enqueue to tail
-                            ready_queue_aiv_[ready_queue_aiv_tail_] = consumer_id;
-                            ready_queue_aiv_tail_ = (ready_queue_aiv_tail_ + 1) % AICPU_MAX_READY_TASKS;
-                            ready_count_aiv_.fetch_add(1, std::memory_order_release);
+                            ready_queue_aiv_lock_.lock();
+                            ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = consumer_id;
+                            ready_queue_aiv_lock_.unlock();
                         }
                     }
                     current = entry->next_offset;
                 }
+                total_fanout_traversed += fanout_len;
+                if (fanout_len > max_fanout_len) max_fanout_len = fanout_len;
 
                 cur_thread_tasks_in_flight--;
                 cur_thread_completed++;
@@ -609,6 +630,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 completed_tasks_.fetch_add(1, std::memory_order_release);
             }
         }
+        _phase_t1 = _orch_now_ns(); sched_complete_ns += (_phase_t1 - _phase_t0); _phase_t0 = _phase_t1;
 
         // Phase 2: Dispatch ready tasks to idle cores (build PTO2DispatchPayload)
         if (cur_thread_tasks_in_flight < core_num) {
@@ -616,53 +638,37 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 int core_id = cur_thread_cores[i];
                 Handshake* h = &hank[core_id];
                 if (h->task_status == 0 && h->task == 0) {
-                    bool dispatched = false;
-                    if (h->core_type == CoreType::AIC && ready_count_aic_.load(std::memory_order_acquire) > 0) {
-                        std::lock_guard<std::mutex> lock(ready_queue_aic_mutex_);
-                        int count = ready_count_aic_.load(std::memory_order_relaxed);
-                        if (count > 0) {
-                            // FIFO: dequeue from head
-                            int32_t task_id = ready_queue_aic_[ready_queue_aic_head_];
-                            ready_queue_aic_head_ = (ready_queue_aic_head_ + 1) % AICPU_MAX_READY_TASKS;
-                            ready_count_aic_.fetch_sub(1, std::memory_order_release);
-                            PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
-                            PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
-                            build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
-                            h->task = reinterpret_cast<uint64_t>(payload);
-                            if (runtime->enable_profiling) {
-                                dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-                            }
-                            h->task_status = 1;
-                            cur_thread_tasks_in_flight++;
-                            made_progress = true;
-                            dispatched = true;
-                            DEV_INFO("Thread %d: Dispatching PTO2 AIC task %d to core %d", thread_idx, task_id, core_id);
+                    int32_t task_id = -1;
+                    if (h->core_type == CoreType::AIC) {
+                        ready_queue_aic_lock_.lock();
+                        if (ready_queue_aic_head_ < ready_queue_aic_tail_) {
+                            task_id = ready_queue_aic_[ready_queue_aic_head_++ & AICPU_READY_MASK];
                         }
+                        ready_queue_aic_lock_.unlock();
+                    } else {
+                        ready_queue_aiv_lock_.lock();
+                        if (ready_queue_aiv_head_ < ready_queue_aiv_tail_) {
+                            task_id = ready_queue_aiv_[ready_queue_aiv_head_++ & AICPU_READY_MASK];
+                        }
+                        ready_queue_aiv_lock_.unlock();
                     }
-                    if (!dispatched && h->core_type == CoreType::AIV && ready_count_aiv_.load(std::memory_order_acquire) > 0) {
-                        std::lock_guard<std::mutex> lock(ready_queue_aiv_mutex_);
-                        int count = ready_count_aiv_.load(std::memory_order_relaxed);
-                        if (count > 0) {
-                            // FIFO: dequeue from head
-                            int32_t task_id = ready_queue_aiv_[ready_queue_aiv_head_];
-                            ready_queue_aiv_head_ = (ready_queue_aiv_head_ + 1) % AICPU_MAX_READY_TASKS;
-                            ready_count_aiv_.fetch_sub(1, std::memory_order_release);
-                            PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
-                            PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
-                            build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
-                            h->task = reinterpret_cast<uint64_t>(payload);
-                            if (runtime->enable_profiling) {
-                                dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-                            }
-                            h->task_status = 1;
-                            cur_thread_tasks_in_flight++;
-                            made_progress = true;
-                            DEV_INFO("Thread %d: Dispatching PTO2 AIV task %d to core %d", thread_idx, task_id, core_id);
+                    if (task_id >= 0) {
+                        PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
+                        PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
+                        build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
+                        h->task = reinterpret_cast<uint64_t>(payload);
+                        if (runtime->enable_profiling) {
+                            dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                         }
+                        h->task_status = 1;
+                        cur_thread_tasks_in_flight++;
+                        made_progress = true;
+                        DEV_DEBUG("Thread %d: Dispatching PTO2 task %d to core %d", thread_idx, task_id, core_id);
                     }
                 }
             }
         }
+        _phase_t1 = _orch_now_ns(); sched_dispatch_ns += (_phase_t1 - _phase_t0); _phase_t0 = _phase_t1;
 
         if (!made_progress) {
             idle_iterations++;
@@ -675,12 +681,32 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 return -1;
             }
             std::this_thread::yield();
+            sched_yield_count++;
+            _phase_t1 = _orch_now_ns(); sched_yield_ns += (_phase_t1 - _phase_t0);
         } else {
             idle_iterations = 0;
         }
     }
 
-    DEV_INFO("Thread %d: PTO2 execution complete, completed %d tasks", thread_idx, cur_thread_completed);
+    uint64_t sched_total = sched_scan_ns + sched_orch_drain_ns + sched_complete_ns + sched_dispatch_ns + sched_yield_ns;
+    if (sched_total == 0) sched_total = 1;  // avoid div-by-zero
+    DEV_ALWAYS("Thread %d: PTO2 scheduler stats: loops=%llu, completed=%d, total=%.3fms",
+             thread_idx, (unsigned long long)sched_loop_count, cur_thread_completed, sched_total/1e6);
+    DEV_ALWAYS("Thread %d:   scan=%.3fms (%.1f%%), orch_drain=%.3fms (%.1f%%), complete=%.3fms (%.1f%%), dispatch=%.3fms (%.1f%%)",
+             thread_idx,
+             sched_scan_ns/1e6, sched_scan_ns*100.0/sched_total,
+             sched_orch_drain_ns/1e6, sched_orch_drain_ns*100.0/sched_total,
+             sched_complete_ns/1e6, sched_complete_ns*100.0/sched_total,
+             sched_dispatch_ns/1e6, sched_dispatch_ns*100.0/sched_total);
+    DEV_ALWAYS("Thread %d:   yield=%.3fms (%.1f%%, %llu calls, avg=%.1fus)",
+             thread_idx, sched_yield_ns/1e6, sched_yield_ns*100.0/sched_total,
+             (unsigned long long)sched_yield_count,
+             sched_yield_count > 0 ? sched_yield_ns/1e3/sched_yield_count : 0.0);
+    DEV_ALWAYS("Thread %d:   fanout: total_traversed=%llu, max_len=%d, avg=%.1f",
+             thread_idx, (unsigned long long)total_fanout_traversed, max_fanout_len,
+             cur_thread_completed > 0 ? (double)total_fanout_traversed / cur_thread_completed : 0.0);
+
+    DEV_ALWAYS("Thread %d: PTO2 execution complete, completed %d tasks", thread_idx, cur_thread_completed);
 
     // Flush performance buffers for cores managed by this thread
     if (profiling_enabled) {
@@ -860,12 +886,40 @@ int AicpuExecutor::run(Runtime* runtime) {
             rt->orchestrator.aicpu_task_completed = s_pto2_task_completed;
             rt->orchestrator.aicpu_window_mask = ws - 1;
 
+            // Expose orchestrator ready queue to scheduler threads
+            orch_ready_queue_ = rt->orchestrator.orch_ready_queue;
+            orch_ready_tail_ = &rt->orchestrator.orch_ready_tail;
+            orch_ready_head_ = &rt->orchestrator.orch_ready_head;
+            orch_ready_capacity_ = PTO2OrchestratorState::ORCH_READY_QUEUE_SIZE;
+
             // Call orchestration wrapped in outer scope (matches old PTO2_ORCHESTRATION behavior)
             DEV_INFO("Thread 3: Calling aicpu_orchestration_entry from SO");
             PTO2_SCOPE(rt) {
                 orch_func(rt, args, arg_count);
             }
             DEV_INFO("Thread 3: aicpu_orchestration_entry returned");
+
+            // Print orchestrator profiling data
+#if PTO2_ORCH_PROFILING
+            {
+                PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
+                uint64_t total = p.sync_ns + p.alloc_ns + p.params_ns +
+                                 p.lookup_ns + p.heap_ns + p.insert_ns +
+                                 p.fanin_ns + p.finalize_ns;
+                DEV_INFO("=== Orchestrator Profiling: %lld tasks, total=%.3fms ===",
+                         (long long)p.submit_count, total / 1e6);
+                DEV_INFO("  sync_tensormap : %.3fms (%.1f%%)", p.sync_ns / 1e6, p.sync_ns * 100.0 / total);
+                DEV_INFO("  task_ring_alloc: %.3fms (%.1f%%)", p.alloc_ns / 1e6, p.alloc_ns * 100.0 / total);
+                DEV_INFO("  param_copy     : %.3fms (%.1f%%)", p.params_ns / 1e6, p.params_ns * 100.0 / total);
+                DEV_INFO("  lookup+dep     : %.3fms (%.1f%%)", p.lookup_ns / 1e6, p.lookup_ns * 100.0 / total);
+                DEV_INFO("  heap_alloc     : %.3fms (%.1f%%)", p.heap_ns / 1e6, p.heap_ns * 100.0 / total);
+                DEV_INFO("  tensormap_ins  : %.3fms (%.1f%%)", p.insert_ns / 1e6, p.insert_ns * 100.0 / total);
+                DEV_INFO("  fanin+ready    : %.3fms (%.1f%%)", p.fanin_ns / 1e6, p.fanin_ns * 100.0 / total);
+                DEV_INFO("  finalize+SM    : %.3fms (%.1f%%)", p.finalize_ns / 1e6, p.finalize_ns * 100.0 / total);
+                DEV_INFO("  scope_end      : %.3fms", p.scope_end_ns / 1e6);
+                DEV_INFO("  avg/task       : %.3fus", total / 1e3 / p.submit_count);
+            }
+#endif
 
             // Teardown runtime
             pto2_rt_orchestration_done(rt);
@@ -913,8 +967,6 @@ int AicpuExecutor::run(Runtime* runtime) {
 
 void AicpuExecutor::deinit() {
     // Cleanup runtime execution state
-    ready_count_aic_.store(0, std::memory_order_release);
-    ready_count_aiv_.store(0, std::memory_order_release);
     ready_queue_aic_head_ = 0;
     ready_queue_aic_tail_ = 0;
     ready_queue_aiv_head_ = 0;
@@ -954,22 +1006,22 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,
                                          const int* cur_thread_cores, int core_num,
                                          Handshake* hank) {
     (void)runtime;  // Reserved for future use
-    DEV_ERROR("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
+    DEV_ALWAYS("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
 
     int completed = completed_tasks_.load(std::memory_order_acquire);
     int total = total_tasks_.load(std::memory_order_acquire);
-    DEV_ERROR("Progress: %d/%d tasks (%.1f%%)",
+    DEV_ALWAYS("Progress: %d/%d tasks (%.1f%%)",
              completed, total, total > 0 ? completed * 100.0 / total : 0.0);
 
-    int aic_ready = ready_count_aic_.load(std::memory_order_acquire);
-    int aiv_ready = ready_count_aiv_.load(std::memory_order_acquire);
-    DEV_ERROR("Ready Queues: AIC=%d, AIV=%d", aic_ready, aiv_ready);
+    int aic_ready = ready_queue_aic_tail_ - ready_queue_aic_head_;
+    int aiv_ready = ready_queue_aiv_tail_ - ready_queue_aiv_head_;
+    DEV_ALWAYS("Ready Queues: AIC=%d, AIV=%d", aic_ready, aiv_ready);
 
     int busy_cores = 0;
     int idle_cores = 0;
     int anomaly_cores = 0;
 
-    DEV_ERROR("Core Status:");
+    DEV_ALWAYS("Core Status:");
     for (int i = 0; i < core_num; i++) {
         int core_id = cur_thread_cores[i];
         Handshake* h = &hank[core_id];
@@ -980,30 +1032,30 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,
             PTO2DispatchPayload* payload = reinterpret_cast<PTO2DispatchPayload*>(h->task);
             busy_cores++;
 
-            DEV_ERROR("  Core %d [%s, BUSY]: task_id=%d, kernel_id=%d",
+            DEV_ALWAYS("  Core %d [%s, BUSY]: task_id=%d, kernel_id=%d",
                      core_id, core_type_str,
                      payload->task_id, payload->kernel_id);
         } else if (h->task_status != 0) {
             anomaly_cores++;
-            DEV_ERROR("  Core %d [%s, ANOMALY]: status=BUSY but task=NULL", core_id, core_type_str);
+            DEV_ALWAYS("  Core %d [%s, ANOMALY]: status=BUSY but task=NULL", core_id, core_type_str);
         } else {
             idle_cores++;
         }
     }
 
-    DEV_ERROR("Summary: %d busy, %d idle, %d anomaly", busy_cores, idle_cores, anomaly_cores);
+    DEV_ALWAYS("Summary: %d busy, %d idle, %d anomaly", busy_cores, idle_cores, anomaly_cores);
 
     // Diagnose deadlock vs livelock
     if (busy_cores == 0 && aic_ready == 0 && aiv_ready == 0 && completed < total) {
-        DEV_ERROR("*** DEADLOCK DETECTED ***");
-        DEV_ERROR("All cores idle, no ready tasks, but %d tasks incomplete", total - completed);
-        DEV_ERROR("Check PTO2 shared memory for task dependency state");
+        DEV_ALWAYS("*** DEADLOCK DETECTED ***");
+        DEV_ALWAYS("All cores idle, no ready tasks, but %d tasks incomplete", total - completed);
+        DEV_ALWAYS("Check PTO2 shared memory for task dependency state");
     } else if (busy_cores > 0) {
-        DEV_ERROR("*** LIVELOCK / HUNG TASK ***");
-        DEV_ERROR("%d cores executing but no progress", busy_cores);
+        DEV_ALWAYS("*** LIVELOCK / HUNG TASK ***");
+        DEV_ALWAYS("%d cores executing but no progress", busy_cores);
     }
 
-    DEV_ERROR("========== END DIAGNOSTIC ==========");
+    DEV_ALWAYS("========== END DIAGNOSTIC ==========");
 }
 
 // =============================================================================

@@ -61,3 +61,12 @@ void dev_log_error(const char* func, const char* fmt, ...) {
     va_end(args);
     dlog_error(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
 }
+
+void dev_log_always(const char* func, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char buffer[2048];
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    dlog_error(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
+}

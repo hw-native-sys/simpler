@@ -54,32 +54,7 @@ Tensor::Tensor(Tensor&& other)
     }
 }
 
-Tensor::Tensor(const Tensor& other)
-    : buffer(other.buffer),
-      start_offset(other.start_offset),
-      ndims(other.ndims),
-      dtype(other.dtype),
-      version(other.version),
-      overlap_type(other.overlap_type) {
-    for (uint64_t i = 0; i < ndims; i++) {
-        strides[i] = other.strides[i];
-        repeats[i] = other.repeats[i];
-    }
-}
-
-Tensor& Tensor::operator=(const Tensor& other) {
-    buffer = other.buffer;
-    start_offset = other.start_offset;
-    ndims = other.ndims;
-    dtype = other.dtype;
-    version = other.version;
-    overlap_type = other.overlap_type;
-    for (uint64_t i = 0; i < ndims; i++) {
-        strides[i] = other.strides[i];
-        repeats[i] = other.repeats[i];
-    }
-    return *this;
-}
+// Copy constructor and operator= are now inline in tensor.h
 
 // =============================================================================
 // Validation and optimization (called by constructor's debug_assert)

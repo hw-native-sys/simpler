@@ -248,12 +248,12 @@ void pto2_tensormap_cleanup_retired(PTO2TensorMap* tm, int32_t old_last_task_ali
 // Lookup with Chain Truncation
 // =============================================================================
 
-std::vector<std::pair<PTO2TensorMapEntry*, OverlapStatus>> pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor) {
+void pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor, PTO2LookupResult* result) {
     uint32_t bucket = pto2_tensormap_hash(tm, tensor);
     int32_t* prev_ptr = &tm->buckets[bucket];  // For truncation
     int32_t offset = *prev_ptr;
 
-    std::vector<std::pair<PTO2TensorMapEntry*, OverlapStatus>> task_ids;
+    result->count = 0;
 
     while (offset >= 0) {
         PTO2TensorMapEntry* entry = &tm->entry_pool[offset];
@@ -275,7 +275,7 @@ std::vector<std::pair<PTO2TensorMapEntry*, OverlapStatus>> pto2_tensormap_lookup
                 offset = next;
             }
 
-            return task_ids;
+            return;
         }
 
         // Entry is valid - check if regions OVERLAP (not just exact match)
@@ -283,15 +283,13 @@ std::vector<std::pair<PTO2TensorMapEntry*, OverlapStatus>> pto2_tensormap_lookup
         // potential to overlap. We must check actual byte-range overlap.
         auto overlap_status = tensor->is_overlap(entry->tensor);
         if (overlap_status != OverlapStatus::NO_OVERLAP) {
-            task_ids.emplace_back(entry, overlap_status);
+            result->push(entry, overlap_status);
         }
 
         // Move to next entry
         prev_ptr = &entry->next_in_bucket;
         offset = *prev_ptr;
     }
-
-    return task_ids;
 }
 
 // =============================================================================

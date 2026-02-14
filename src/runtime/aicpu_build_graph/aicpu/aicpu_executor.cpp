@@ -825,11 +825,11 @@ void AicpuExecutor::deinit() {
 
 void AicpuExecutor::diagnose_stuck_state(
     Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num, Handshake* hank) {
-    DEV_ERROR("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
+    DEV_ALWAYS("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
 
     int completed = completed_tasks_.load(std::memory_order_acquire);
     int published = published_tasks_.load(std::memory_order_acquire);
-    DEV_ERROR("Progress: completed=%d published=%d build_done=%d build_failed=%d",
+    DEV_ALWAYS("Progress: completed=%d published=%d build_done=%d build_failed=%d",
         completed,
         published,
         build_done_.load(std::memory_order_acquire) ? 1 : 0,
@@ -837,13 +837,13 @@ void AicpuExecutor::diagnose_stuck_state(
 
     int aic_ready = ready_count_aic_.load(std::memory_order_acquire);
     int aiv_ready = ready_count_aiv_.load(std::memory_order_acquire);
-    DEV_ERROR("Ready Queues: AIC=%d, AIV=%d", aic_ready, aiv_ready);
+    DEV_ALWAYS("Ready Queues: AIC=%d, AIV=%d", aic_ready, aiv_ready);
 
     int busy_cores = 0;
     int idle_cores = 0;
     int anomaly_cores = 0;
 
-    DEV_ERROR("Core Status:");
+    DEV_ALWAYS("Core Status:");
     for (int i = 0; i < core_num; i++) {
         int core_id = cur_thread_cores[i];
         Handshake* h = &hank[core_id];
@@ -854,7 +854,7 @@ void AicpuExecutor::diagnose_stuck_state(
             Task* task = reinterpret_cast<Task*>(h->task);
             busy_cores++;
 
-            DEV_ERROR("  Core %d [%s, BUSY]: task_id=%d, func_id=%d, fanin=%d, fanout=%d",
+            DEV_ALWAYS("  Core %d [%s, BUSY]: task_id=%d, func_id=%d, fanin=%d, fanout=%d",
                 core_id,
                 core_type_str,
                 task->task_id,
@@ -863,39 +863,39 @@ void AicpuExecutor::diagnose_stuck_state(
                 task->fanout_count);
         } else if (h->task_status != 0) {
             anomaly_cores++;
-            DEV_ERROR("  Core %d [%s, ANOMALY]: status=BUSY but task=NULL", core_id, core_type_str);
+            DEV_ALWAYS("  Core %d [%s, ANOMALY]: status=BUSY but task=NULL", core_id, core_type_str);
         } else {
             idle_cores++;
         }
     }
 
-    DEV_ERROR("Summary: %d busy, %d idle, %d anomaly", busy_cores, idle_cores, anomaly_cores);
+    DEV_ALWAYS("Summary: %d busy, %d idle, %d anomaly", busy_cores, idle_cores, anomaly_cores);
 
     // Diagnose deadlock vs livelock
     if (busy_cores == 0 && aic_ready == 0 && aiv_ready == 0 && completed < published) {
-        DEV_ERROR("*** DEADLOCK DETECTED ***");
-        DEV_ERROR("All cores idle, no ready tasks, but %d tasks incomplete", published - completed);
+        DEV_ALWAYS("*** DEADLOCK DETECTED ***");
+        DEV_ALWAYS("All cores idle, no ready tasks, but %d tasks incomplete", published - completed);
 
-        DEV_ERROR("Tasks with fanin > 0:");
+        DEV_ALWAYS("Tasks with fanin > 0:");
         int stuck_count = 0;
         int task_count = runtime.get_task_count();
         for (int tid = 0; tid < task_count && stuck_count < 10; tid++) {
             Task* t = runtime.get_task(tid);
             int fanin = t->fanin.load(std::memory_order_acquire);
             if (fanin > 0) {
-                DEV_ERROR("  Task %d: fanin=%d (waiting for dependencies)", tid, fanin);
+                DEV_ALWAYS("  Task %d: fanin=%d (waiting for dependencies)", tid, fanin);
                 stuck_count++;
             }
         }
         if (stuck_count == 0) {
-            DEV_ERROR("  No tasks waiting! Possible counter corruption.");
+            DEV_ALWAYS("  No tasks waiting! Possible counter corruption.");
         }
     } else if (busy_cores > 0) {
-        DEV_ERROR("*** LIVELOCK / HUNG TASK ***");
-        DEV_ERROR("%d cores executing but no progress", busy_cores);
+        DEV_ALWAYS("*** LIVELOCK / HUNG TASK ***");
+        DEV_ALWAYS("%d cores executing but no progress", busy_cores);
     }
 
-    DEV_ERROR("========== END DIAGNOSTIC ==========");
+    DEV_ALWAYS("========== END DIAGNOSTIC ==========");
 }
 
 // ===== Public Entry Point =====

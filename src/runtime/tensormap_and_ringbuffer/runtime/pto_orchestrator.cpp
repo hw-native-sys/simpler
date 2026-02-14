@@ -17,6 +17,39 @@
 #include "tensor.h"
 
 // =============================================================================
+// Orchestrator Profiling (compile-time toggle)
+// =============================================================================
+#ifndef PTO2_ORCH_PROFILING
+#define PTO2_ORCH_PROFILING 1
+#endif
+
+#if PTO2_ORCH_PROFILING
+#include <time.h>
+static inline uint64_t _orch_now_ns() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+// Accumulated nanoseconds per sub-step
+static uint64_t g_orch_sync_ns      = 0;  // tensormap sync
+static uint64_t g_orch_alloc_ns     = 0;  // task ring alloc
+static uint64_t g_orch_params_ns    = 0;  // param copy
+static uint64_t g_orch_lookup_ns    = 0;  // tensormap lookup + dep building
+static uint64_t g_orch_heap_ns      = 0;  // heap alloc + output assign
+static uint64_t g_orch_insert_ns    = 0;  // tensormap insert
+static uint64_t g_orch_fanin_ns     = 0;  // fanin list + early-return check
+static uint64_t g_orch_finalize_ns  = 0;  // scheduler init + SM update
+static uint64_t g_orch_scope_end_ns = 0;  // scope_end overhead
+static int64_t  g_orch_submit_count = 0;
+#define ORCH_PROF_START() uint64_t _t0 = _orch_now_ns(), _t1
+#define ORCH_PROF_LAP(acc) do { _t1 = _orch_now_ns(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
+#else
+#define ORCH_PROF_START()
+#define ORCH_PROF_LAP(acc)
+#endif
+
+// =============================================================================
 // Per-Task Spinlock Implementation
 // =============================================================================
 
@@ -25,7 +58,7 @@
  */
 static inline void task_fanout_lock(PTO2TaskDescriptor* task) {
     while (PTO2_EXCHANGE(&task->fanout_lock, 1) != 0) {
-        PTO2_SPIN_PAUSE();
+        PTO2_SPIN_PAUSE_LIGHT();
     }
 }
 
@@ -149,6 +182,10 @@ void pto2_scope_begin(PTO2OrchestratorState* orch) {
 void pto2_scope_end(PTO2OrchestratorState* orch) {
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
 
+#if PTO2_ORCH_PROFILING
+    uint64_t _se0 = _orch_now_ns();
+#endif
+
     int32_t begin = orch->scope_begins[orch->scope_stack_top--];
     int32_t count = orch->scope_tasks_size - begin;
 
@@ -158,6 +195,10 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 
     // Rewind the task buffer — these entries are no longer needed
     orch->scope_tasks_size = begin;
+
+#if PTO2_ORCH_PROFILING
+    g_orch_scope_end_ns += (_orch_now_ns() - _se0);
+#endif
 }
 
 // =============================================================================
@@ -224,14 +265,20 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     const char* func_name,
     PTOParam* params,
     int32_t num_params) {
+    ORCH_PROF_START();
+
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
     pto2_orchestrator_sync_tensormap(&orch->tensor_map);
+
+    ORCH_PROF_LAP(g_orch_sync_ns);
 
     // Submission without an open scope is illegal
     assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
 
     // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
     int32_t task_id = pto2_task_ring_alloc(&orch->task_ring);
+
+    ORCH_PROF_LAP(g_orch_alloc_ns);
 
     PTO2TaskDescriptor* task = pto2_task_ring_get(&orch->task_ring, task_id);
 
@@ -262,14 +309,17 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     int32_t fanin_count = 0;
 
     task->param_count = num_params;
-    for (int i = 0; i < task->param_count; i++) {
-        task->params[i] = params[i];
-        // Copy tensor data into task-owned storage; redirect task's pointer to it
+    // Bulk copy all params at once
+    memcpy(task->params, params, num_params * sizeof(PTOParam));
+    // Copy tensor data into task-owned storage; redirect pointers
+    for (int i = 0; i < num_params; i++) {
         if (params[i].tensor) {
             task->tensor_copies[i] = *params[i].tensor;
             task->params[i].tensor = &task->tensor_copies[i];
         }
     }
+
+    ORCH_PROF_LAP(g_orch_params_ns);
 
     // === STEP 2: First pass - collect output sizes and process inputs ===
 
@@ -280,9 +330,12 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
             case PTOParamType::INOUT:
             case PTOParamType::INPUT: {
                 // Look up producer via TensorMap
-                auto dependency_task_ids = pto2_tensormap_lookup(&orch->tensor_map, params[i].tensor);
+                PTO2LookupResult lookup_result;
+                pto2_tensormap_lookup(&orch->tensor_map, params[i].tensor, &lookup_result);
 
-                for (auto [entry, overlap_status] : dependency_task_ids) {
+                for (int r = 0; r < lookup_result.count; r++) {
+                    auto* entry = lookup_result.entries[r].entry;
+                    auto overlap_status = lookup_result.entries[r].overlap_status;
                     // Check if this producer is already in fanin list (avoid duplicates)
                     int producer_task_id = entry->producer_task_id;
                     bool already_added = false;
@@ -328,6 +381,8 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         }
     }
 
+    ORCH_PROF_LAP(g_orch_lookup_ns);
+
     // === STEP 3: Allocate packed buffer from Heap Ring (may stall) ===
     // Each output slot is aligned to PTO2_PACKED_OUTPUT_ALIGN (1024B); gap after data is padding.
     if (total_output_size > 0) {
@@ -350,6 +405,8 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         }
     }
 
+    ORCH_PROF_LAP(g_orch_heap_ns);
+
     // === STEP 4: Second pass - register outputs in TensorMap ===
     int32_t output_idx = 0;
     for (int i = 0; i < num_params; i++) {
@@ -363,6 +420,8 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         }
     }
 
+    ORCH_PROF_LAP(g_orch_insert_ns);
+
     // === STEP 5: Finalize fanin list ===
     // First build the fanin list
     for (int i = 0; i < fanin_count; i++) {
@@ -370,6 +429,28 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     }
     // Use release semantics to ensure fanin list is visible before fanin_count
     __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_RELEASE);
+
+    ORCH_PROF_LAP(g_orch_fanin_ns);
+
+    // === STEP 5b: Check if task is already ready (all producers completed via early-return) ===
+    // In AICPU parallel mode, early-return in pto2_add_consumer_to_producer may have
+    // already incremented aicpu_fanin_refcount for this task.  Now that fanin_count is
+    // finalized, check if the task is already satisfied and push it to the orchestrator
+    // ready queue so scheduler threads can pick it up without an O(N) scan.
+    if (orch->aicpu_fanin_refcount && fanin_count > 0) {
+        int32_t slot = task_id & orch->aicpu_window_mask;
+        int32_t refcount = __atomic_load_n(&orch->aicpu_fanin_refcount[slot], __ATOMIC_ACQUIRE);
+        if (refcount >= fanin_count) {
+            // All producers already completed — push to orch ready queue
+            int32_t tail = orch->orch_ready_tail;
+            int32_t capacity = PTO2OrchestratorState::ORCH_READY_QUEUE_SIZE;
+            int32_t head = __atomic_load_n(&orch->orch_ready_head, __ATOMIC_ACQUIRE);
+            if (((tail + 1) & (capacity - 1)) != (head & (capacity - 1))) {
+                orch->orch_ready_queue[tail & (capacity - 1)] = task_id;
+                __atomic_store_n(&orch->orch_ready_tail, tail + 1, __ATOMIC_RELEASE);
+            }
+        }
+    }
 
     // === STEP 6: Initialize task in scheduler ===
     // In multi-threaded mode, scheduler thread handles task initialization via polling
@@ -380,7 +461,12 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // === STEP 7: Update shared memory with current task index ===
     PTO2_STORE_RELEASE(&orch->sm_handle->header->current_task_index, orch->task_ring.current_index);
 
+    ORCH_PROF_LAP(g_orch_finalize_ns);
+
     orch->tasks_submitted++;
+#if PTO2_ORCH_PROFILING
+    g_orch_submit_count++;
+#endif
 }
 
 // =============================================================================
@@ -436,3 +522,26 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
 
     printf("==================\n");
 }
+
+#if PTO2_ORCH_PROFILING
+PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
+    PTO2OrchProfilingData d;
+    d.sync_ns      = g_orch_sync_ns;
+    d.alloc_ns     = g_orch_alloc_ns;
+    d.params_ns    = g_orch_params_ns;
+    d.lookup_ns    = g_orch_lookup_ns;
+    d.heap_ns      = g_orch_heap_ns;
+    d.insert_ns    = g_orch_insert_ns;
+    d.fanin_ns     = g_orch_fanin_ns;
+    d.finalize_ns  = g_orch_finalize_ns;
+    d.scope_end_ns = g_orch_scope_end_ns;
+    d.submit_count = g_orch_submit_count;
+
+    // Reset
+    g_orch_sync_ns = g_orch_alloc_ns = g_orch_params_ns = 0;
+    g_orch_lookup_ns = g_orch_heap_ns = g_orch_insert_ns = 0;
+    g_orch_fanin_ns = g_orch_finalize_ns = g_orch_scope_end_ns = 0;
+    g_orch_submit_count = 0;
+    return d;
+}
+#endif

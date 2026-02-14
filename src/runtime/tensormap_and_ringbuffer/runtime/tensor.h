@@ -132,9 +132,33 @@ struct Tensor {
         OverlapType overlap_type = OverlapType::Accurate);
 
     Tensor(Tensor&& other);
-    Tensor(const Tensor& other);
 
-    Tensor& operator=(const Tensor& other);
+    Tensor(const Tensor& other)
+        : buffer(other.buffer),
+          start_offset(other.start_offset),
+          ndims(other.ndims),
+          dtype(other.dtype),
+          version(other.version),
+          overlap_type(other.overlap_type) {
+        for (uint64_t i = 0; i < ndims; i++) {
+            strides[i] = other.strides[i];
+            repeats[i] = other.repeats[i];
+        }
+    }
+
+    Tensor& operator=(const Tensor& other) {
+        buffer = other.buffer;
+        start_offset = other.start_offset;
+        ndims = other.ndims;
+        dtype = other.dtype;
+        version = other.version;
+        overlap_type = other.overlap_type;
+        for (uint64_t i = 0; i < ndims; i++) {
+            strides[i] = other.strides[i];
+            repeats[i] = other.repeats[i];
+        }
+        return *this;
+    }
 
     std::string dump() const;
 

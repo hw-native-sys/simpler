@@ -51,6 +51,7 @@ void dev_log_debug(const char* func, const char* fmt, ...);
 void dev_log_info(const char* func, const char* fmt, ...);
 void dev_log_warn(const char* func, const char* fmt, ...);
 void dev_log_error(const char* func, const char* fmt, ...);
+void dev_log_always(const char* func, const char* fmt, ...);
 
 // =============================================================================
 // High-Level Logging Macros (Platform-Independent Layer)
@@ -92,6 +93,7 @@ void dev_log_error(const char* func, const char* fmt, ...);
 #define DEV_INFO(fmt, args...)  D_DEV_LOGI(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
 #define DEV_WARN(fmt, args...)  D_DEV_LOGW(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
 #define DEV_ERROR(fmt, args...) D_DEV_LOGE(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
+#define DEV_ALWAYS(fmt, args...) dev_log_always(__FUNCTION__, fmt, ##args)
 
 // =============================================================================
 // Platform-Specific Assertion

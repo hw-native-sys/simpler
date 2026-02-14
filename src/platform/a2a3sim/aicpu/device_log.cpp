@@ -120,3 +120,12 @@ void dev_log_error(const char* func, const char* fmt, ...) {
     printf("\n");
     va_end(args);
 }
+
+void dev_log_always(const char* func, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    printf("[ALWAYS] %s: ", func);
+    vprintf(fmt, args);
+    printf("\n");
+    va_end(args);
+}

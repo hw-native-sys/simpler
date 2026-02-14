@@ -36,6 +36,7 @@ import importlib.util
 import logging
 import os
 import sys
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -629,6 +630,7 @@ class CodeRunner:
                 runtime.enable_profiling(True)
                 logger.info("Profiling enabled")
 
+            _t_init_start = time.perf_counter()
             with _temporary_env(run_env):
                 runtime.initialize(
                     orch_so_binary,
@@ -638,12 +640,20 @@ class CodeRunner:
                     arg_sizes=arg_sizes,
                     kernel_binaries=kernel_binaries,
                 )
+            _t_init_end = time.perf_counter()
+            logger.info(f">>> runtime.initialize() took {_t_init_end - _t_init_start:.3f}s")
 
             # Save expected values BEFORE hardware execution (outputs will be overwritten)
             golden = {k: v.clone() for k, v in outputs.items()}
             # Convert to dict for compute_golden (may expect numpy-like interface)
             golden_with_inputs = {**inputs, **golden}
+            _t_golden_start = time.perf_counter()
             self._golden_module.compute_golden(golden_with_inputs, params)
+            _t_golden_end = time.perf_counter()
+            logger.info(f">>> compute_golden() took {_t_golden_end - _t_golden_start:.3f}s")
+            logger.info(f">>> Total init-to-launch: {_t_golden_end - _t_init_start:.3f}s "
+                        f"(initialize={_t_init_end - _t_init_start:.3f}s, "
+                        f"golden={_t_golden_end - _t_golden_start:.3f}s)")
 
             # Launch runtime
             logger.info("=== Launching Runtime ===")
