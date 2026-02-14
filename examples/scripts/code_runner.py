@@ -570,7 +570,9 @@ class CodeRunner:
         runtime_dir = os.path.join(self.project_root, "src", "runtime", self.runtime_name, "runtime")
         runtime_include_dirs.append(runtime_dir)
 
-        for kernel in self.kernels:
+        from concurrent.futures import ThreadPoolExecutor
+
+        def _compile_one_kernel(kernel):
             logger.info(f"Compiling kernel: {kernel['source']} (func_id={kernel['func_id']})")
             incore_o = kernel_compiler.compile_incore(
                 kernel["source"],
@@ -584,8 +586,10 @@ class CodeRunner:
                 kernel_bin = incore_o  # Complete .so for dlopen
             else:
                 kernel_bin = extract_text_section(incore_o)  # .text only for mmap
+            return (kernel["func_id"], kernel_bin)
 
-            kernel_binaries.append((kernel["func_id"], kernel_bin))
+        with ThreadPoolExecutor(max_workers=len(self.kernels)) as executor:
+            kernel_binaries = list(executor.map(_compile_one_kernel, self.kernels))
 
         logger.info(f"Compiled {len(kernel_binaries)} kernel(s)")
 

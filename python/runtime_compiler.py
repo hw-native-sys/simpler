@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import List
 from toolchain import Toolchain, CCECToolchain, Aarch64GxxToolchain, GxxToolchain
 import env_manager
+import multiprocessing
 
 logger = logging.getLogger(__name__)
 
@@ -250,7 +251,7 @@ class RuntimeCompiler:
             cmake_cmd = ["cmake", cmake_source_dir] + cmake_args
             self._run_build_step(cmake_cmd, build_dir, platform, "CMake configuration")
 
-            make_cmd = ["make", "VERBOSE=1"]
+            make_cmd = ["make", f"-j{min(multiprocessing.cpu_count(), 32)}", "VERBOSE=1"]
             self._run_build_step(make_cmd, build_dir, platform, "Make build")
 
             # Read the compiled binary

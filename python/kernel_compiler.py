@@ -148,19 +148,7 @@ class KernelCompiler:
         label: str,
         error_hint: str = "Compiler not found"
     ) -> subprocess.CompletedProcess:
-        """Run a subprocess command with standardized logging and error handling.
-
-        Args:
-            cmd: Command and arguments
-            label: Label for log messages (e.g., "Incore", "Orchestration")
-            error_hint: Message for FileNotFoundError
-
-        Returns:
-            CompletedProcess on success
-
-        Raises:
-            RuntimeError: If command fails or executable not found
-        """
+        """Run a subprocess command with standardized logging and error handling."""
         try:
             result = subprocess.run(cmd, capture_output=True, text=True)
 

@@ -1,6 +1,7 @@
 import importlib.util
 import logging
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
 from runtime_compiler import RuntimeCompiler
 from kernel_compiler import KernelCompiler
 
@@ -83,26 +84,30 @@ class RuntimeBuilder:
 
         compiler = self._runtime_compiler
 
-        # Compile AICore kernel
-        logger.info("[1/3] Compiling AICore kernel...")
+        # Prepare configs for all three targets
         aicore_cfg = build_config["aicore"]
         aicore_include_dirs = [str((config_dir / p).resolve()) for p in aicore_cfg["include_dirs"]]
         aicore_source_dirs = [str((config_dir / p).resolve()) for p in aicore_cfg["source_dirs"]]
-        aicore_binary = compiler.compile("aicore", aicore_include_dirs, aicore_source_dirs)
 
-        # Compile AICPU kernel
-        logger.info("[2/3] Compiling AICPU kernel...")
         aicpu_cfg = build_config["aicpu"]
         aicpu_include_dirs = [str((config_dir / p).resolve()) for p in aicpu_cfg["include_dirs"]]
         aicpu_source_dirs = [str((config_dir / p).resolve()) for p in aicpu_cfg["source_dirs"]]
-        aicpu_binary = compiler.compile("aicpu", aicpu_include_dirs, aicpu_source_dirs)
 
-        # Compile Host runtime
-        logger.info("[3/3] Compiling Host runtime...")
         host_cfg = build_config["host"]
         host_include_dirs = [str((config_dir / p).resolve()) for p in host_cfg["include_dirs"]]
         host_source_dirs = [str((config_dir / p).resolve()) for p in host_cfg["source_dirs"]]
-        host_binary = compiler.compile("host", host_include_dirs, host_source_dirs)
+
+        # Compile all three targets in parallel
+        logger.info("Compiling AICore, AICPU, Host in parallel...")
+
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            fut_aicore = executor.submit(compiler.compile, "aicore", aicore_include_dirs, aicore_source_dirs)
+            fut_aicpu = executor.submit(compiler.compile, "aicpu", aicpu_include_dirs, aicpu_source_dirs)
+            fut_host = executor.submit(compiler.compile, "host", host_include_dirs, host_source_dirs)
+
+            aicore_binary = fut_aicore.result()
+            aicpu_binary = fut_aicpu.result()
+            host_binary = fut_host.result()
 
         logger.info("Build complete!")
         return (host_binary, aicpu_binary, aicore_binary)
