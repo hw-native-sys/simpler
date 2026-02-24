@@ -126,73 +126,54 @@ echo "Discovered ${#HW_TASK_NAMES[@]} hardware tasks, ${#SIM_TASK_NAMES[@]} simu
 
 MAX_RETRIES=3
 
-# Run a single HW task with retry across different devices (max 3 attempts).
-# Writes final result to RESULTS_FILE. Each attempt logged separately.
-# Usage: run_hw_task_with_retry <name> <dir> [initial_device_id]
-run_hw_task_with_retry() {
+# Run a single HW task on a specific device.
+# Writes result to RESULTS_FILE as: name:a2a3|PASS_or_FAIL|device:ID|round:N
+# Usage: run_hw_task <name> <dir> <device_id> <round>
+run_hw_task() {
     local name="$1"
     local dir="$2"
-    local initial_device="${3:-${DEVICES[0]}}"
+    local device_id="$3"
+    local round="$4"
     local safe_name="${name//[:\/]/_}"
-    local tried_devices=()
-    local failed_devices=()
+    local task_log="${LOG_DIR}/${safe_name}_hw_round${round}.log"
+    local start_time=$SECONDS
 
-    for attempt in $(seq 1 $MAX_RETRIES); do
-        # First attempt uses the assigned device, retries pick next untried
-        local device_id=""
-        if [[ $attempt -eq 1 ]]; then
-            device_id="$initial_device"
-        else
-            for dev in "${DEVICES[@]}"; do
-                local already_tried=false
-                for tried in "${tried_devices[@]}"; do
-                    [[ "$tried" == "$dev" ]] && { already_tried=true; break; }
-                done
-                if [[ "$already_tried" == "false" ]]; then
-                    device_id="$dev"
-                    break
-                fi
-            done
-        fi
+    {
+        echo "========================================"
+        echo "[Device $device_id] Running: $name (round $round/$MAX_RETRIES)"
+        echo "========================================"
+        python examples/scripts/run_example.py \
+            -k "${dir}/kernels" -g "${dir}/golden.py" \
+            -p a2a3 -d "$device_id"
+    } > "$task_log" 2>&1
+    local rc=$?
+    local elapsed=$(( SECONDS - start_time ))
 
-        # No untried device left
-        if [[ -z "$device_id" ]]; then
-            echo "${name}:a2a3|FAIL|failed_on:${failed_devices[*]}|no_device_left" >> "$RESULTS_FILE"
-            return 1
-        fi
-
-        tried_devices+=("$device_id")
-        local task_log="${LOG_DIR}/${safe_name}_hw_attempt${attempt}.log"
-
-        {
-            echo "========================================"
-            echo "[Device $device_id] Running: $name (attempt $attempt/$MAX_RETRIES)"
-            echo "========================================"
-            python examples/scripts/run_example.py \
-                -k "${dir}/kernels" -g "${dir}/golden.py" \
-                -p a2a3 -d "$device_id"
-        } > "$task_log" 2>&1
-        local rc=$?
-
-        if [[ $rc -eq 0 ]]; then
-            echo "${name}:a2a3|PASS|device:${device_id}|attempt:${attempt}" >> "$RESULTS_FILE"
-            return 0
-        else
-            failed_devices+=("$device_id")
-            echo "[Retry] $name failed on device $device_id (attempt $attempt/$MAX_RETRIES)" >&2
-        fi
-    done
-
-    # All retries exhausted
-    echo "${name}:a2a3|FAIL|failed_on:${failed_devices[*]}|attempts:${MAX_RETRIES}" >> "$RESULTS_FILE"
-    return 1
+    if [[ $rc -eq 0 ]]; then
+        echo "${name}:a2a3|PASS|device:${device_id}|round:${round}|${elapsed}s" >> "$RESULTS_FILE"
+    else
+        echo "${name}:a2a3|FAIL|device:${device_id}|round:${round}|${elapsed}s" >> "$RESULTS_FILE"
+    fi
+    return $rc
 }
 
 # ---- Sequential mode ----
 if [[ "$PARALLEL" == "false" ]]; then
+    # HW tasks: run with retry across different devices
     for i in "${!HW_TASK_NAMES[@]}"; do
-        run_hw_task_with_retry "${HW_TASK_NAMES[$i]}" "${HW_TASK_DIRS[$i]}"
+        name="${HW_TASK_NAMES[$i]}"
+        dir="${HW_TASK_DIRS[$i]}"
+        passed=false
+        for round in $(seq 1 $MAX_RETRIES); do
+            dev_idx=$(( (round - 1) % NUM_DEVICES ))
+            device_id="${DEVICES[$dev_idx]}"
+            if run_hw_task "$name" "$dir" "$device_id" "$round"; then
+                passed=true
+                break
+            fi
+        done
     done
+    # SIM tasks
     for i in "${!SIM_TASK_NAMES[@]}"; do
         name="${SIM_TASK_NAMES[$i]}"
         dir="${SIM_TASK_DIRS[$i]}"
@@ -209,9 +190,8 @@ if [[ "$PARALLEL" == "false" ]]; then
     done
 else
     # ---- Parallel mode ----
-    declare -a WORKER_PIDS=()
-
-    # Launch sim tasks in parallel (no device constraint)
+    # Sim tasks: launch all in parallel (no device constraint)
+    declare -a SIM_PIDS=()
     for i in "${!SIM_TASK_NAMES[@]}"; do
         name="${SIM_TASK_NAMES[$i]}"
         dir="${SIM_TASK_DIRS[$i]}"
@@ -229,40 +209,97 @@ else
                 echo "${name}:a2a3sim|FAIL" >> "$RESULTS_FILE"
             fi
         ) > "$log_file" 2>&1 &
-        WORKER_PIDS+=($!)
+        SIM_PIDS+=($!)
     done
 
-    # Launch HW tasks with round-robin device assignment
-    # Each task runs with retry logic: on failure, retries on a different device
-    for d in $(seq 0 $((NUM_DEVICES - 1))); do
-        device_id="${DEVICES[$d]}"
+    # HW tasks: dynamic work-stealing with retry
+    # Each device worker atomically grabs tasks from a shared queue.
+    # This naturally balances load — faster workers pick up more tasks.
 
-        # Collect task indices for this device slot
-        slot_indices=()
-        for i in "${!HW_TASK_NAMES[@]}"; do
-            if [[ $((i % NUM_DEVICES)) -eq $d ]]; then
-                slot_indices+=("$i")
-            fi
+    PENDING_INDICES=()
+    for i in "${!HW_TASK_NAMES[@]}"; do
+        PENDING_INDICES+=("$i")
+    done
+
+    QUEUE_LOCK="${LOG_DIR}/queue.lock"
+
+    for round in $(seq 1 $MAX_RETRIES); do
+        [[ ${#PENDING_INDICES[@]} -eq 0 ]] && break
+
+        echo "---- HW round $round/$MAX_RETRIES: ${#PENDING_INDICES[@]} tasks ----"
+
+        TASK_QUEUE="${LOG_DIR}/task_queue_round${round}.txt"
+        ROUND_MARKER="${LOG_DIR}/round_${round}_results.txt"
+        printf '%s\n' "${PENDING_INDICES[@]}" > "$TASK_QUEUE"
+        touch "$ROUND_MARKER"
+
+        # Launch one worker per device; each grabs tasks dynamically
+        declare -a HW_PIDS=()
+        for d in $(seq 0 $((NUM_DEVICES - 1))); do
+            device_id="${DEVICES[$d]}"
+            worker_log="${LOG_DIR}/device_${device_id}_round${round}.log"
+
+            (
+                while true; do
+                    # Atomically pop the next task index from the queue
+                    idx=$(flock "$QUEUE_LOCK" bash -c "
+                        idx=\$(head -n1 \"$TASK_QUEUE\" 2>/dev/null)
+                        if [[ -z \"\$idx\" ]]; then exit 1; fi
+                        sed -i '1d' \"$TASK_QUEUE\"
+                        echo \"\$idx\"
+                    ") || break
+
+                    name="${HW_TASK_NAMES[$idx]}"
+                    dir="${HW_TASK_DIRS[$idx]}"
+                    run_hw_task "$name" "$dir" "$device_id" "$round"
+                    rc=$?
+                    if [[ $rc -eq 0 ]]; then
+                        echo "${idx}|PASS" >> "$ROUND_MARKER"
+                    else
+                        echo "${idx}|FAIL" >> "$ROUND_MARKER"
+                    fi
+                done
+            ) > "$worker_log" 2>&1 &
+            HW_PIDS+=($!)
         done
-        [[ ${#slot_indices[@]} -eq 0 ]] && continue
 
-        worker_log="${LOG_DIR}/device_${device_id}_worker.log"
+        # Wait for this round to finish
+        for pid in "${HW_PIDS[@]}"; do
+            wait "$pid" 2>/dev/null || true
+        done
 
-        (
-            for idx in "${slot_indices[@]}"; do
-                run_hw_task_with_retry "${HW_TASK_NAMES[$idx]}" "${HW_TASK_DIRS[$idx]}" "$device_id"
-            done
-        ) > "$worker_log" 2>&1 &
-        WORKER_PIDS+=($!)
+        # Collect failures for next round
+        NEXT_PENDING=()
+        while IFS='|' read -r idx result; do
+            if [[ "$result" == "FAIL" ]]; then
+                NEXT_PENDING+=("$idx")
+            fi
+        done < "$ROUND_MARKER"
+
+        PENDING_INDICES=("${NEXT_PENDING[@]}")
     done
 
-    # Wait for all workers
-    for pid in "${WORKER_PIDS[@]}"; do
+    # Wait for sim tasks too
+    for pid in "${SIM_PIDS[@]}"; do
         wait "$pid" 2>/dev/null || true
     done
 fi
 
 # ---- Print summary ----
+# Deduplicate results: a task may have multiple entries (fail then pass on retry).
+# Keep the last result per task name — the final outcome.
+declare -A FINAL_RESULTS=()
+declare -A FINAL_EXTRA=()
+declare -a TASK_ORDER=()
+
+while IFS='|' read -r task_name result extra1 extra2 timing; do
+    if [[ -z "${FINAL_RESULTS[$task_name]+x}" ]]; then
+        TASK_ORDER+=("$task_name")
+    fi
+    FINAL_RESULTS["$task_name"]="$result"
+    FINAL_EXTRA["$task_name"]="${extra1:+$extra1, }${extra2:+$extra2, }${timing}"
+done < "$RESULTS_FILE"
+
 echo ""
 echo "========================================"
 echo "          CI RESULTS SUMMARY"
@@ -272,27 +309,27 @@ printf "%-55s %s\n" "----" "------"
 
 FAIL_COUNT=0
 PASS_COUNT=0
-while IFS='|' read -r task_name result extra1 extra2; do
+for task_name in "${TASK_ORDER[@]}"; do
+    result="${FINAL_RESULTS[$task_name]}"
+    extra="${FINAL_EXTRA[$task_name]}"
     if [[ "$result" == "FAIL" ]]; then
-        printf "%-55s \033[31mFAIL\033[0m  (%s)\n" "$task_name" "${extra1:+$extra1 }${extra2}"
+        printf "%-55s \033[31mFAIL\033[0m  (%s)\n" "$task_name" "$extra"
         ((FAIL_COUNT++))
-        # Print all attempt logs inline
+        # Print all round logs inline
         safe_name="${task_name//[:\/]/_}"
-        for attempt_log in "${LOG_DIR}/${safe_name}_hw_attempt"*.log "${LOG_DIR}/${safe_name}_sim.log"; do
-            if [[ -f "$attempt_log" ]]; then
-                echo "--- LOG: $(basename "$attempt_log") ---"
-                cat "$attempt_log"
+        for round_log in "${LOG_DIR}/${safe_name}_hw_round"*.log "${LOG_DIR}/${safe_name}_sim.log"; do
+            if [[ -f "$round_log" ]]; then
+                echo "--- LOG: $(basename "$round_log") ---"
+                cat "$round_log"
                 echo "--- END ---"
                 echo ""
             fi
         done
     else
-        local_info=""
-        [[ -n "$extra1" ]] && local_info=" ($extra1, $extra2)"
-        printf "%-55s \033[32mPASS\033[0m%s\n" "$task_name" "$local_info"
+        printf "%-55s \033[32mPASS\033[0m  (%s)\n" "$task_name" "$extra"
         ((PASS_COUNT++))
     fi
-done < "$RESULTS_FILE"
+done
 
 echo "========================================"
 echo "Total: $((PASS_COUNT + FAIL_COUNT))  Passed: $PASS_COUNT  Failed: $FAIL_COUNT"
