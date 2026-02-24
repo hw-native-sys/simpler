@@ -10,35 +10,40 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include "common/unified_log.h"
 
 // =============================================================================
-// Ops Table (function-pointer dispatch for orchestration .so)
+// Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================
 
 static void submit_task_impl(PTO2Runtime* rt, int32_t kernel_id,
-                              PTO2WorkerType worker_type,
-                              PTOParam* params, int32_t num_params) {
+                             PTO2WorkerType worker_type,
+                             PTOParam* params, int32_t num_params) {
     pto2_submit_task(&rt->orchestrator, kernel_id, worker_type,
                      params, num_params);
 }
 
-static void scope_begin_impl(PTO2Runtime* rt) {
+void pto2_rt_scope_begin(PTO2Runtime* rt) {
     pto2_scope_begin(&rt->orchestrator);
 }
 
-static void scope_end_impl(PTO2Runtime* rt) {
+void pto2_rt_scope_end(PTO2Runtime* rt) {
     pto2_scope_end(&rt->orchestrator);
 }
 
-static void orchestration_done_impl(PTO2Runtime* rt) {
+void pto2_rt_orchestration_done(PTO2Runtime* rt) {
     pto2_orchestrator_done(&rt->orchestrator);
 }
 
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task        = submit_task_impl,
-    .scope_begin        = scope_begin_impl,
-    .scope_end          = scope_end_impl,
-    .orchestration_done = orchestration_done_impl,
+    .scope_begin        = pto2_rt_scope_begin,
+    .scope_end          = pto2_rt_scope_end,
+    .orchestration_done = pto2_rt_orchestration_done,
+    .log_error          = unified_log_error,
+    .log_warn           = unified_log_warn,
+    .log_info           = unified_log_info,
+    .log_debug          = unified_log_debug,
 };
 
 // =============================================================================
@@ -177,20 +182,4 @@ void pto2_runtime_set_mode(PTO2Runtime* rt, PTO2RuntimeMode mode) {
     if (rt) {
         rt->mode = mode;
     }
-}
-
-// =============================================================================
-// Orchestration API
-// =============================================================================
-
-void pto2_rt_scope_begin(PTO2Runtime* rt) {
-    scope_begin_impl(rt);
-}
-
-void pto2_rt_scope_end(PTO2Runtime* rt) {
-    scope_end_impl(rt);
-}
-
-void pto2_rt_orchestration_done(PTO2Runtime* rt) {
-    orchestration_done_impl(rt);
 }

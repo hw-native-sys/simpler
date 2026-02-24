@@ -61,6 +61,12 @@ typedef struct PTO2RuntimeOps {
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
+
+    // Logging (populated by runtime, called by orchestration)
+    void (*log_error)(const char* func, const char* fmt, ...);
+    void (*log_warn)(const char* func, const char* fmt, ...);
+    void (*log_info)(const char* func, const char* fmt, ...);
+    void (*log_debug)(const char* func, const char* fmt, ...);
 } PTO2RuntimeOps;
 
 /**

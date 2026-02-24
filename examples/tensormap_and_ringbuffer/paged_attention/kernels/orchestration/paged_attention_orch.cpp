@@ -15,7 +15,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "pto_orchestration_api.h"
 
@@ -94,7 +93,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
 
     (void)kv_head_num;
 
-    printf("batch = %lu\n", (unsigned long)batch);
+    LOG_INFO(rt, "batch = %lu", (unsigned long)batch);
 
     // Compute actual tensor shapes from buffer sizes (not from max block_num)
     uint64_t query_shapes[2] = {batch * num_heads, head_dim};
@@ -106,10 +105,10 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     Tensor key_cache = make_tensor_external(host_key_cache, key_cache_shapes, 2, data_type);
     Tensor value_cache = make_tensor_external(host_value_cache, value_cache_shapes, 2, data_type);
     Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
-    printf("query=%s\n", query.dump().c_str());
-    printf("key_cache=%s\n", key_cache.dump().c_str());
-    printf("value_cache=%s\n", value_cache.dump().c_str());
-    printf("out=%s\n", out.dump().c_str());
+    LOG_DEBUG(rt, "query=%s", query.dump().c_str());
+    LOG_DEBUG(rt, "key_cache=%s", key_cache.dump().c_str());
+    LOG_DEBUG(rt, "value_cache=%s", value_cache.dump().c_str());
+    LOG_DEBUG(rt, "out=%s", out.dump().c_str());
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint64_t cur_seq = host_context_lens[b_idx];
@@ -192,8 +191,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
         }
     }
 
-    printf("[orch] tasks submitted for batch=%lu, num_heads=%lu\n",
-           (unsigned long)batch, (unsigned long)num_heads);
+    LOG_INFO(rt, "tasks submitted for batch=%lu, num_heads=%lu",
+                  (unsigned long)batch, (unsigned long)num_heads);
 }
 
 }  // extern "C"

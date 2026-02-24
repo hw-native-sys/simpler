@@ -20,7 +20,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "pto_orchestration_api.h"
 
@@ -93,7 +92,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     size_t size_f = (size_t)args[ARG_SIZE_F];
     int SIZE = (int)(args[ARG_SIZE] & 0x7FFFFFFF);
 
-    printf("===============SIZE=%d\n", SIZE);
+    LOG_INFO(rt, "===============SIZE=%d", SIZE);
 
     size_t BYTES = (size_t)SIZE * sizeof(float);
 

@@ -26,7 +26,6 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <stdio.h>
 
 #include "pto_orchestration_api.h"
 
@@ -73,8 +72,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     size_t size_B = (size_t)args[ARG_SIZE_B];
     size_t size_C = (size_t)args[ARG_SIZE_C];
 
-    printf("[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d\n",
-           GRID_M, GRID_K, GRID_N, BATCH, TILE);
+    LOG_INFO(rt, "[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d",
+                  GRID_M, GRID_K, GRID_N, BATCH, TILE);
 
     // Create 1D external tensors for the full A, B, C arrays
     Tensor ext_A = make_tensor_external(dev_A, size_A);
@@ -127,8 +126,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
         }
     }
 
-    printf("[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each\n",
-           BATCH, GRID_M, GRID_N, GRID_K);
+    LOG_INFO(rt, "[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each",
+                  BATCH, GRID_M, GRID_N, GRID_K);
 }
 
 }  // extern "C"
