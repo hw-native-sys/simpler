@@ -52,7 +52,7 @@ typedef struct PTO2Runtime PTO2Runtime;
  */
 typedef struct PTO2RuntimeOps {
     void (*submit_task)(PTO2Runtime* rt, int32_t kernel_id,
-                        PTO2WorkerType worker_type, const char* func_name,
+                        PTO2WorkerType worker_type,
                         PTOParam* params, int32_t num_params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
@@ -76,9 +76,8 @@ struct PTO2Runtime {
 
 static inline void pto2_rt_submit_task(PTO2Runtime* rt, int32_t kernel_id,
                                         PTO2WorkerType worker_type,
-                                        const char* func_name,
                                         PTOParam* params, int32_t num_params) {
-    rt->ops->submit_task(rt, kernel_id, worker_type, func_name, params, num_params);
+    rt->ops->submit_task(rt, kernel_id, worker_type, params, num_params);
 }
 
 static inline void pto2_rt_scope_begin(PTO2Runtime* rt) {

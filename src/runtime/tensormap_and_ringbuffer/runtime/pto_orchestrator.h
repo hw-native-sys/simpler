@@ -173,14 +173,12 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  * @param orch        Orchestrator state
  * @param kernel_id   InCore function ID
  * @param worker_type Target worker type (CUBE, VECTOR, AI_CPU, ACCELERATOR)
- * @param func_name   Function name (for debugging)
  * @param params      Array of task parameters
  * @param num_params  Number of parameters
  */
 void pto2_submit_task(PTO2OrchestratorState* orch,
     int32_t kernel_id,
     PTO2WorkerType worker_type,
-    const char* func_name,
     PTOParam* params,
     int32_t num_params);
 

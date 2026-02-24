@@ -262,7 +262,6 @@ void* pto2_alloc_packed_buffer(PTO2OrchestratorState* orch, int32_t total_size) 
 void pto2_submit_task(PTO2OrchestratorState* orch,
     int32_t kernel_id,
     PTO2WorkerType worker_type,
-    const char* func_name,
     PTOParam* params,
     int32_t num_params) {
     ORCH_PROF_START();
@@ -286,7 +285,6 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     task->task_id = task_id;
     task->kernel_id = kernel_id;
     task->worker_type = worker_type;
-    task->func_name = func_name;
     task->fanin_head = 0;
     task->fanin_count = 0;
     task->fanout_head = 0;

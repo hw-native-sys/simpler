@@ -56,7 +56,7 @@ typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 typedef struct PTO2RuntimeOps {
     void (*submit_task)(PTO2Runtime* rt, int32_t kernel_id,
-                        PTO2WorkerType worker_type, const char* func_name,
+                        PTO2WorkerType worker_type,
                         PTOParam* params, int32_t num_params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
@@ -166,23 +166,6 @@ void pto2_rt_scope_begin(PTO2Runtime* rt);
  * Tasks whose refcount reaches zero will have their buffers released.
  */
 void pto2_rt_scope_end(PTO2Runtime* rt);
-
-/**
- * Submit a task
- *
- * @param rt          Runtime context
- * @param kernel_id   InCore function ID
- * @param worker_type Target worker type
- * @param func_name   Function name (for debugging)
- * @param params      Array of task parameters
- * @param num_params  Number of parameters
- */
-void pto2_rt_submit_task(PTO2Runtime* rt,
-                         int32_t kernel_id,
-                         PTO2WorkerType worker_type,
-                         const char* func_name,
-                         PTOParam* params,
-                         int32_t num_params);
 
 /**
  * Mark orchestration as complete

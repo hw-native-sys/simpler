@@ -52,10 +52,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     int submit_task_count = 0;
     uint64_t submit_task_total_ns = 0;
 
-#define TIMED_SUBMIT_TASK(rt, func, worker, name, params, params_count)                                     \
+#define TIMED_SUBMIT_TASK(rt, func, worker, params, params_count)                                          \
     do {                                                                                                    \
         auto _t0 = std::chrono::high_resolution_clock::now();                                               \
-        pto2_rt_submit_task(rt, func, worker, name, params, params_count);                                  \
+        pto2_rt_submit_task(rt, func, worker, params, params_count);                                        \
         auto _t1 = std::chrono::high_resolution_clock::now();                                               \
         submit_task_total_ns +=                                                                             \
             static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(_t1 - _t0).count()); \
@@ -140,7 +140,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     make_output_param(li_update),
                     make_output_param(mi_update),
                 };
-                TIMED_SUBMIT_TASK(rt, FUNC_AIV_HUB, PTO2_WORKER_VECTOR, "create_inplace", params_inplace, 3);
+                TIMED_SUBMIT_TASK(rt, FUNC_AIV_HUB, PTO2_WORKER_VECTOR, params_inplace, 3); // create_inplace
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     Tensor qi = query.view({q_tile, head_dim}, {cur_offset, 0});
@@ -158,7 +158,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                         make_input_param(kj),
                         make_output_param(sij),
                     };
-                    TIMED_SUBMIT_TASK(rt, FUNC_QK_MATMUL, PTO2_WORKER_CUBE, "c1", params_qk, 3);
+                    TIMED_SUBMIT_TASK(rt, FUNC_QK_MATMUL, PTO2_WORKER_CUBE, params_qk, 3); // c1
 
                     Tensor sij_valid = sij.view({q_tile, valid_len}, {0, 0});
                     Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
@@ -170,7 +170,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                         make_output_param(mi),
                         make_output_param(li),
                     };
-                    TIMED_SUBMIT_TASK(rt, FUNC_SOFTMAX_PREPARE, PTO2_WORKER_VECTOR, "v1", params_sf, 5);
+                    TIMED_SUBMIT_TASK(rt, FUNC_SOFTMAX_PREPARE, PTO2_WORKER_VECTOR, params_sf, 5); // v1
 
                     uint64_t oi_tmp_shapes[2] = {q_tile, head_dim};
                     Tensor oi_tmp = make_tensor(oi_tmp_shapes, 2, DataType::FLOAT32);
@@ -180,7 +180,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                         make_input_param(vj),
                         make_output_param(oi_tmp),
                     };
-                    TIMED_SUBMIT_TASK(rt, FUNC_PV_MATMUL, PTO2_WORKER_CUBE, "c2", params_pv, 3);
+                    TIMED_SUBMIT_TASK(rt, FUNC_PV_MATMUL, PTO2_WORKER_CUBE, params_pv, 3); // c2
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
@@ -197,7 +197,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                         make_scalar_param(is_first),
                         make_scalar_param(is_last),
                     };
-                    TIMED_SUBMIT_TASK(rt, FUNC_ONLINE_UPDATE, PTO2_WORKER_VECTOR, "v2", params_up, 9);
+                    TIMED_SUBMIT_TASK(rt, FUNC_ONLINE_UPDATE, PTO2_WORKER_VECTOR, params_up, 9); // v2
                 }
             }
         }

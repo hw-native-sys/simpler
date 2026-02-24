@@ -16,10 +16,10 @@
 // =============================================================================
 
 static void submit_task_impl(PTO2Runtime* rt, int32_t kernel_id,
-                              PTO2WorkerType worker_type, const char* func_name,
+                              PTO2WorkerType worker_type,
                               PTOParam* params, int32_t num_params) {
     pto2_submit_task(&rt->orchestrator, kernel_id, worker_type,
-                     func_name, params, num_params);
+                     params, num_params);
 }
 
 static void scope_begin_impl(PTO2Runtime* rt) {
@@ -189,16 +189,6 @@ void pto2_rt_scope_begin(PTO2Runtime* rt) {
 
 void pto2_rt_scope_end(PTO2Runtime* rt) {
     scope_end_impl(rt);
-}
-
-void pto2_rt_submit_task(PTO2Runtime* rt,
-                         int32_t kernel_id,
-                         PTO2WorkerType worker_type,
-                         const char* func_name,
-                         PTOParam* params,
-                         int32_t num_params) {
-    submit_task_impl(rt, kernel_id, worker_type,
-                     func_name, params, num_params);
 }
 
 void pto2_rt_orchestration_done(PTO2Runtime* rt) {

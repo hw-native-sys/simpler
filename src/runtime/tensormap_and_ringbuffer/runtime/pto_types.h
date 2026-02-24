@@ -51,7 +51,7 @@ enum class PTOParamType : int32_t {
  *       make_input_param(td_a),
  *       make_output_param(td_c),
  *   };
- *   pto2_rt_submit_task(rt, func_id, worker_type, name, params, 2);
+ *   pto2_rt_submit_task(rt, func_id, worker_type, params, 2);
  *   // td_c.buffer.addr is already updated - no explicit sync needed
  */
 struct PTOParam {

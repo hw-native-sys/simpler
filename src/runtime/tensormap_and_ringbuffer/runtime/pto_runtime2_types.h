@@ -269,9 +269,6 @@ typedef struct {
     int32_t  output_index[PTO2_MAX_OUTPUTS]; // Offset of each output in params;
     int32_t  num_outputs;         // Number of output buffers
 
-    // Function name (for debugging/tracing)
-    const char* func_name;        // Function name (for debugging/tracing)
-    
     // Status flags
     bool     is_active;           // Task slot is in use
 

@@ -112,7 +112,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                             make_output_param(P),
                         };
                         pto2_rt_submit_task(rt, FUNC_GEMM_TILE, PTO2_WORKER_CUBE,
-                                           "gemm", params_gemm, 3);
+                                           params_gemm, 3); // gemm
 
                         // C[m,n] += P
                         PTOParam params_add[] = {
@@ -120,7 +120,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                             make_input_param(P),
                         };
                         pto2_rt_submit_task(rt, FUNC_TILE_ADD, PTO2_WORKER_VECTOR,
-                                           "add", params_add, 2);
+                                           params_add, 2); // add
                     }
                 }
             }
