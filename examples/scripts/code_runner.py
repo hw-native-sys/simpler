@@ -139,7 +139,6 @@ def _is_git_available() -> bool:
 
 
 _PTO_ISA_REPO = "https://gitcode.com/cann/pto-isa.git"
-_PTO_ISA_COMMIT = "1482821f66abac4f5b2979069442c45a2e98bb6e"
 
 
 def _clone_pto_isa(verbose: bool = False) -> bool:
@@ -175,7 +174,6 @@ def _clone_pto_isa(verbose: bool = False) -> bool:
             logger.info(f"Cloning pto-isa to {clone_path}...")
             logger.info("This may take a few moments on first run...")
 
-        # Clone and checkout pinned commit for reproducibility
         result = subprocess.run(
             [
                 "git", "clone",
@@ -190,19 +188,6 @@ def _clone_pto_isa(verbose: bool = False) -> bool:
         if result.returncode != 0:
             if verbose:
                 logger.warning(f"Failed to clone pto-isa:\n{result.stderr}")
-            return False
-
-        result = subprocess.run(
-            ["git", "checkout", _PTO_ISA_COMMIT],
-            capture_output=True,
-            text=True,
-            cwd=str(clone_path),
-            timeout=60
-        )
-
-        if result.returncode != 0:
-            if verbose:
-                logger.warning(f"Failed to checkout pto-isa commit:\n{result.stderr}")
             return False
 
         if verbose:
@@ -255,7 +240,6 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
                 logger.warning("You can manually clone it with:")
                 logger.warning(f"  mkdir -p {clone_path.parent}")
                 logger.warning(f"  git clone {_PTO_ISA_REPO} {clone_path}")
-                logger.warning(f"  cd {clone_path} && git checkout {_PTO_ISA_COMMIT}")
                 logger.warning("Or set PTO_ISA_ROOT to an existing pto-isa installation:")
                 logger.warning("  export PTO_ISA_ROOT=/path/to/pto-isa")
             return None
