@@ -73,6 +73,12 @@ inline uint64_t get_sys_cnt() {
 extern thread_local volatile uint8_t* g_sim_reg_base;
 
 /**
+ * Per-thread simulated physical core ID.
+ * Set by the kernel wrapper before calling aicore_execute().
+ */
+extern thread_local uint32_t g_sim_physical_core_id;
+
+/**
  * Read an AICore register from simulated register memory
  *
  * @param reg  Register identifier
@@ -96,6 +102,15 @@ inline void write_reg(RegId reg, uint64_t value) {
     *reinterpret_cast<volatile uint32_t*>(g_sim_reg_base + offset) =
         static_cast<uint32_t>(value);
     __sync_synchronize();
+}
+
+/**
+ * Get the physical core ID from simulation state
+ *
+ * @return Physical core ID for the current simulated core
+ */
+inline uint32_t get_physical_core_id() {
+    return g_sim_physical_core_id;
 }
 
 #endif  // PLATFORM_A2A3SIM_AICORE_INNER_KERNEL_H_

@@ -56,4 +56,13 @@ __aicore__ inline void write_reg(RegId reg, uint64_t value) {
     }
 }
 
+/**
+ * Get the physical core ID from hardware
+ *
+ * @return Physical core ID (masked to 12 bits)
+ */
+__aicore__ inline uint32_t get_physical_core_id() {
+    return static_cast<uint32_t>(get_coreid()) & AICORE_COREID_MASK;
+}
+
 #endif  // PLATFORM_A2A3_AICORE_INNER_KERNEL_H_

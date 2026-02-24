@@ -72,7 +72,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
     pipe_barrier(PIPE_ALL);
 }
 
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id) {
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type) {
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
@@ -81,7 +81,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     }
 
     // Report physical core ID and core type for AICPU
-    my_hank->physical_core_id = physical_core_id;
+    my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
     my_hank->aicore_done = block_idx + 1;
 

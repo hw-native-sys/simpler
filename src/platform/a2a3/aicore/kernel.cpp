@@ -1,8 +1,6 @@
 /**
  * Minimal AICore Kernel
  */
-#include <cstdint>
-
 #include "aicore/aicore.h"
 #include "common/core_type.h"
 
@@ -23,7 +21,7 @@ class Runtime;
 [[block_local]] int block_idx;
 [[block_local]] CoreType core_type;
 
-extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id);
+extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type);
 
 /**
  * Kernel entry point with control loop
@@ -49,6 +47,5 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime
     block_idx = get_block_idx();
     core_type = CoreType::AIC;
 #endif
-    uint32_t physical_core_id = static_cast<uint32_t>(get_coreid()) & AICORE_COREID_MASK;
-    aicore_execute(runtime, block_idx, core_type, physical_core_id);
+    aicore_execute(runtime, block_idx, core_type);
 }
