@@ -39,11 +39,11 @@
 /**
  * Runtime execution mode
  */
-typedef enum {
+enum PTO2RuntimeMode {
     PTO2_MODE_EXECUTE = 0,    // Execute tasks on workers
     PTO2_MODE_SIMULATE = 1,   // Simulate task execution with cycle counting
     PTO2_MODE_GRAPH_ONLY = 2  // Build graph only, no execution
-} PTO2RuntimeMode;
+};
 
 /**
  * Function-pointer ops table for runtime operations.
@@ -54,7 +54,7 @@ typedef enum {
  */
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
-typedef struct PTO2RuntimeOps {
+struct PTO2RuntimeOps {
     void (*submit_task)(PTO2Runtime* rt, int32_t kernel_id,
                         PTO2WorkerType worker_type,
                         PTOParam* params, int32_t num_params);
@@ -67,7 +67,8 @@ typedef struct PTO2RuntimeOps {
     void (*log_warn)(const char* func, const char* fmt, ...);
     void (*log_info)(const char* func, const char* fmt, ...);
     void (*log_debug)(const char* func, const char* fmt, ...);
-} PTO2RuntimeOps;
+    void (*log_always)(const char* func, const char* fmt, ...);
+};
 
 /**
  * PTO Runtime2 context

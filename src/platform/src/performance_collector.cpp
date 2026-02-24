@@ -271,13 +271,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         }
     }
 
-    // Step 5: Cycles to microseconds conversion function
-    auto cycles_to_us = [base_time_cycles](uint64_t cycles) -> double {
-        uint64_t normalized_cycles = cycles - base_time_cycles;
-        return (static_cast<double>(normalized_cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
-    };
-
-    // Step 6: Generate filename with timestamp (YYYYMMDD_HHMMSS)
+    // Step 5: Generate filename with timestamp (YYYYMMDD_HHMMSS)
     std::time_t now = time(nullptr);
     std::tm* timeinfo = std::localtime(&now);
     char time_buffer[32];
@@ -285,14 +279,14 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     std::string filepath = output_path + "/perf_swimlane_"
                           + std::string(time_buffer) + ".json";
 
-    // Step 7: Open JSON file for writing
+    // Step 6: Open JSON file for writing
     std::ofstream outfile(filepath);
     if (!outfile.is_open()) {
         LOG_ERROR("Error: Failed to open file: %s", filepath.c_str());
         return -1;
     }
 
-    // Step 8: Write JSON data
+    // Step 7: Write JSON data
     outfile << "{\n";
     outfile << "  \"version\": 1,\n";
     outfile << "  \"tasks\": [\n";
@@ -301,12 +295,12 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         const auto& record = sorted_records[i];
 
         // Convert times to microseconds
-        double start_us = cycles_to_us(record.start_time);
-        double end_us = cycles_to_us(record.end_time);
+        double start_us = cycles_to_us(record.start_time - base_time_cycles);
+        double end_us = cycles_to_us(record.end_time - base_time_cycles);
         double duration_us = end_us - start_us;
-        double kernel_ready_us = cycles_to_us(record.kernel_ready_time);
-        double dispatch_us = (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time) : 0.0;
-        double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time) : 0.0;
+        double kernel_ready_us = cycles_to_us(record.kernel_ready_time - base_time_cycles);
+        double dispatch_us = (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time - base_time_cycles) : 0.0;
+        double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time - base_time_cycles) : 0.0;
 
         // Determine core type string
         const char* core_type_str = (record.core_type == CoreType::AIC) ? "aic" : "aiv";

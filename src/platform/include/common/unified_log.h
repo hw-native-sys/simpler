@@ -20,6 +20,7 @@ void unified_log_error(const char* func, const char* fmt, ...);
 void unified_log_warn(const char* func, const char* fmt, ...);
 void unified_log_info(const char* func, const char* fmt, ...);
 void unified_log_debug(const char* func, const char* fmt, ...);
+void unified_log_always(const char* func, const char* fmt, ...);
 
 #ifdef __cplusplus
 }
@@ -30,6 +31,7 @@ void unified_log_debug(const char* func, const char* fmt, ...);
 #define LOG_WARN(fmt, ...)  unified_log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_INFO(fmt, ...)  unified_log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...) unified_log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_ALWAYS(fmt, ...) unified_log_always(__FUNCTION__, fmt, ##__VA_ARGS__)
 
 #endif  // PLATFORM_UNIFIED_LOG_H_
 

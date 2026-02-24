@@ -247,7 +247,7 @@ typedef struct {
  * - fanin_head, fanin_count set once at submission, read-only after
  * - Other fields set by Orchestrator, read by Scheduler
  */
-typedef struct {
+struct PTO2TaskDescriptor {
     // Task identification
     int32_t task_id;              // Unique task identifier (absolute, not wrapped)
     int32_t kernel_id;            // InCore function to execute
@@ -276,55 +276,7 @@ typedef struct {
     PTOParam params[16];
     Tensor tensor_copies[16];  // Owned tensor data (params[i].tensor points here)
     int param_count{0};
-} PTO2TaskDescriptor;
-
-// =============================================================================
-// TensorMap Entry
-// =============================================================================
-
-/**
- * Extended TensorMap entry structure (for LogicalTensor support)
- * 
- * Supports multi-dimensional tensors with view/reshape/transpose operations.
- * Uses Hierarchical Bounding Box (HBB) for overlap detection.
- * 
- * Hash strategy: 
- *   - Primary key: raw_base (groups all views of same storage)
- *   - Within bucket: use HBB overlap detection
- */
-typedef struct {
-    // === Raw tensor identification (for grouping into same bucket) ===
-    void*    raw_base;            // Base pointer of raw tensor storage
-    int64_t  raw_total_size;      // Total size of raw tensor (for validation)
-    
-    // === Bounding box (precomputed for fast overlap check) ===
-    // Quick rejection: no overlap if bbox don't intersect
-    int64_t  min_byte_offset;     // First byte accessed (relative to raw_base)
-    int64_t  max_byte_offset;     // Last byte accessed (relative to raw_base)
-    
-    // === Full logical tensor info (for legacy compatibility) ===
-    int64_t  storage_offset;      // Byte offset from raw_base
-    int64_t  shape[PTO2_MAX_TENSOR_DIM];    // Shape in each dimension
-    int64_t  strides[PTO2_MAX_TENSOR_DIM];  // Strides in each dimension
-    int32_t  ndim;                // Number of dimensions
-    
-    // === HBB Layout History (for precise overlap detection) ===
-    int32_t  layout_depth;                           // Number of layout ops (1=simple)
-    PTO2LayoutOp layout_ops[PTO2_MAX_LAYOUT_DEPTH];  // Derivation history
-    
-    // === Producer tracking ===
-    int32_t  producer_task_id;    // Task that produces this tensor
-    
-    // === Chain links ===
-    int32_t  next_in_bucket;      // Offset to next entry in hash bucket (-1 = end)
-    int32_t  next_in_task;        // Offset to next entry for same task (-1 = end)
-    bool     in_bucket;           // True if entry is linked in a bucket chain
-    
-    // === Flags ===
-    bool     is_deep_copy;        // True if this is a deep copy (independent storage)
-    bool     is_simple;           // Deprecated: equivalent to (layout_depth == 1)
-    
-} PTO2TensorMapEntryEx;
+};
 
 // =============================================================================
 // Cycle Cost Function Type

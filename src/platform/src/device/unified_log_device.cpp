@@ -65,3 +65,11 @@ void unified_log_debug(const char* func, const char* fmt, ...) {
     dev_log_debug(func, "%s", buffer);
 }
 
+void unified_log_always(const char* func, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char buffer[2048];
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    dev_log_always(func, "%s", buffer);
+}

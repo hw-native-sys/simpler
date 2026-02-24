@@ -30,6 +30,7 @@
 // =============================================================================
 
 enum class HostLogLevel {
+    ALWAYS = -1, // always logging
     ERROR = 0,   // error level only
     WARN = 1,    // warn level and above
     INFO = 2,    // info level and above (default)

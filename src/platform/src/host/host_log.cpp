@@ -111,6 +111,8 @@ const char* HostLogger::get_level_name(HostLogLevel level) const {
             return "INFO";
         case HostLogLevel::DEBUG:
             return "DEBUG";
+        case HostLogLevel::ALWAYS:
+            return "ALWAYS";
         default:
             return "UNKNOWN";
     }

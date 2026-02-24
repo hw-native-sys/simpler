@@ -44,6 +44,7 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .log_warn           = unified_log_warn,
     .log_info           = unified_log_info,
     .log_debug          = unified_log_debug,
+    .log_always         = unified_log_always,
 };
 
 // =============================================================================

@@ -40,8 +40,10 @@ void* pto2_heap_ring_alloc(PTO2HeapRing* ring, int32_t size) {
     
     // Spin-wait if insufficient space (back-pressure from Scheduler)
     int spin_count = 0;
+#if PTO2_SPIN_VERBOSE_LOGGING
     bool notified = false;
-    
+#endif
+
     while (1) {
         void* ptr = pto2_heap_ring_try_alloc(ring, size);
         if (ptr != NULL) {
@@ -180,7 +182,9 @@ void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
 int32_t pto2_task_ring_alloc(PTO2TaskRing* ring) {
     // Spin-wait if window is full (back-pressure from Scheduler)
     int spin_count = 0;
+#if PTO2_SPIN_VERBOSE_LOGGING
     bool notified = false;
+#endif
     
     while (1) {
         int32_t task_id = pto2_task_ring_try_alloc(ring);

@@ -55,7 +55,7 @@ struct PTO2OrchestratorState;  // forward declare
  * - Entries in bucket chains sorted by task_id (newest first)
  * - When lookup hits stale entry, truncate rest of chain
  */
-typedef struct {
+struct PTO2TensorMapEntry {
     Tensor tensor;             // Tensor descriptor key
     int32_t producer_task_id;  // Task that produces this region
     int32_t next_in_bucket;    // Offset to next entry in hash bucket (-1 = end)
@@ -65,22 +65,24 @@ typedef struct {
     bool in_bucket;            // True if entry is linked in a bucket chain
                                // CRITICAL: Must be set false before overwriting!
     bool with_alloc{true};     // True if entry is task output, False if entry is task inout
-} PTO2TensorMapEntry;
+};
 
 /**
  * TensorMap structure
  *
  * Hash table with ring buffer entry pool and lazy invalidation.
  */
-typedef struct {
+struct PTO2TensorMap {
     // Hash table buckets (fixed size, power of 2)
     int32_t* buckets;     // Array of offsets into entry_pool (-1 = empty)
     int32_t num_buckets;  // Must be power of 2 for fast modulo
 
     // Entry pool as ring buffer
     PTO2TensorMapEntry* entry_pool;  // Ring buffer of entries
+    int32_t* free_entry_list;        // free entry ids
     int32_t pool_size;               // Total pool capacity
-    int32_t pool_head;               // Next allocation position (wraps around)
+    int32_t next_entry_idx;               // id when next entry insert
+    int32_t free_num;                // free entry number in entry pool
 
     // Per-task entry tracking (for efficient bucket cleanup)
     int32_t* task_entry_head;  // Per-task head offset (-1 = no entries)
@@ -90,7 +92,10 @@ typedef struct {
     int32_t last_task_alive;  // Cached value from shared memory
 
     PTO2OrchestratorState* orch{nullptr};
-} PTO2TensorMap;
+
+    int32_t new_entry();
+    void free_entry(int32_t entry_idx);
+};
 
 // =============================================================================
 // TensorMap API
@@ -136,15 +141,15 @@ void pto2_tensormap_sync_validity(PTO2TensorMap* tm, int32_t last_task_alive);
 #define PTO2_LOOKUP_MAX_RESULTS 16
 struct PTO2LookupResult {
     struct Entry {
-        PTO2TensorMapEntry* entry;
+        int32_t entry_idx;
         OverlapStatus overlap_status;
     };
     Entry entries[PTO2_LOOKUP_MAX_RESULTS];
     int32_t count{0};
 
-    void push(PTO2TensorMapEntry* e, OverlapStatus s) {
+    void push(int32_t entry_idx, OverlapStatus s) {
         if (count < PTO2_LOOKUP_MAX_RESULTS) {
-            entries[count++] = {e, s};
+            entries[count++] = {entry_idx, s};
         }
     }
 };
@@ -204,19 +209,13 @@ static inline bool pto2_tensormap_entry_valid(PTO2TensorMap* tm, PTO2TensorMapEn
     return entry->producer_task_id >= tm->last_task_alive;
 }
 
-void pto2_tensormap_remove_entry(PTO2TensorMap& tm, PTO2TensorMapEntry* entry);
-
-/**
- * Remove entry from its bucket chain (O(1) with prev pointer)
- * Called during pool wrap-around or cleanup.
- */
-void pto2_tensormap_remove_from_bucket(PTO2TensorMap* tm, PTO2TensorMapEntry* entry);
+void pto2_tensormap_remove_entry(PTO2TensorMap& tm, int32_t entry_idx);
 
 /**
  * Remove entry from its task chain (O(1) with prev pointer)
  * Called during pool wrap-around to unlink reused entries.
  */
-void pto2_tensormap_remove_from_task(PTO2TensorMap* tm, PTO2TensorMapEntry* entry);
+void pto2_tensormap_remove_from_task(PTO2TensorMap* tm, int32_t entry_idx);
 
 // =============================================================================
 // Debug Utilities
@@ -242,6 +241,6 @@ int32_t pto2_tensormap_valid_count(PTO2TensorMap* tm);
  * Called periodically to refresh the lazy invalidation threshold.
  * Also triggers cleanup if threshold has advanced significantly.
  */
-void pto2_orchestrator_sync_tensormap(PTO2TensorMap* tm);
+void pto2_orchestrator_sync_tensormap(PTO2TensorMap* tm, bool force = false);
 
 #endif  // PTO_TENSORMAP_H

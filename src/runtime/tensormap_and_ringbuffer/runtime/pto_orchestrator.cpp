@@ -19,34 +19,27 @@
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
-#ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 1
-#endif
-
 #if PTO2_ORCH_PROFILING
-#include <time.h>
-static inline uint64_t _orch_now_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-
+#include "aicpu/device_time.h"
+// Weak fallback for builds that don't link device_time.cpp (e.g. host).
+// The strong symbol from platform/.../device_time.cpp wins in the AICPU build.
+__attribute__((weak)) uint64_t get_sys_cnt_aicpu() { return 0; }
 // Accumulated nanoseconds per sub-step
-static uint64_t g_orch_sync_ns      = 0;  // tensormap sync
-static uint64_t g_orch_alloc_ns     = 0;  // task ring alloc
-static uint64_t g_orch_params_ns    = 0;  // param copy
-static uint64_t g_orch_lookup_ns    = 0;  // tensormap lookup + dep building
-static uint64_t g_orch_heap_ns      = 0;  // heap alloc + output assign
-static uint64_t g_orch_insert_ns    = 0;  // tensormap insert
-static uint64_t g_orch_fanin_ns     = 0;  // fanin list + early-return check
-static uint64_t g_orch_finalize_ns  = 0;  // scheduler init + SM update
-static uint64_t g_orch_scope_end_ns = 0;  // scope_end overhead
+static uint64_t g_orch_sync_cycle      = 0;  // tensormap sync
+static uint64_t g_orch_alloc_cycle     = 0;  // task ring alloc
+static uint64_t g_orch_params_cycle    = 0;  // param copy
+static uint64_t g_orch_lookup_cycle    = 0;  // tensormap lookup + dep building
+static uint64_t g_orch_heap_cycle      = 0;  // heap alloc + output assign
+static uint64_t g_orch_insert_cycle    = 0;  // tensormap insert
+static uint64_t g_orch_fanin_cycle     = 0;  // fanin list + early-return check
+static uint64_t g_orch_finalize_cycle  = 0;  // scheduler init + SM update
+static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
 static int64_t  g_orch_submit_count = 0;
-#define ORCH_PROF_START() uint64_t _t0 = _orch_now_ns(), _t1
-#define ORCH_PROF_LAP(acc) do { _t1 = _orch_now_ns(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
+#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
+#define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
 #else
-#define ORCH_PROF_START()
-#define ORCH_PROF_LAP(acc)
+#define CYCLE_COUNT_START()
+#define CYCLE_COUNT_LAP(acc)
 #endif
 
 // =============================================================================
@@ -183,7 +176,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
 
 #if PTO2_ORCH_PROFILING
-    uint64_t _se0 = _orch_now_ns();
+    uint64_t _se0 = get_sys_cnt_aicpu();
 #endif
 
     int32_t begin = orch->scope_begins[orch->scope_stack_top--];
@@ -197,7 +190,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
     orch->scope_tasks_size = begin;
 
 #if PTO2_ORCH_PROFILING
-    g_orch_scope_end_ns += (_orch_now_ns() - _se0);
+    g_orch_scope_end_cycle += (get_sys_cnt_aicpu() - _se0);
 #endif
 }
 
@@ -264,12 +257,12 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     PTO2WorkerType worker_type,
     PTOParam* params,
     int32_t num_params) {
-    ORCH_PROF_START();
+    CYCLE_COUNT_START();
 
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
     pto2_orchestrator_sync_tensormap(&orch->tensor_map);
 
-    ORCH_PROF_LAP(g_orch_sync_ns);
+    CYCLE_COUNT_LAP(g_orch_sync_cycle);
 
     // Submission without an open scope is illegal
     assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
@@ -277,7 +270,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
     int32_t task_id = pto2_task_ring_alloc(&orch->task_ring);
 
-    ORCH_PROF_LAP(g_orch_alloc_ns);
+    CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
     PTO2TaskDescriptor* task = pto2_task_ring_get(&orch->task_ring, task_id);
 
@@ -317,7 +310,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         }
     }
 
-    ORCH_PROF_LAP(g_orch_params_ns);
+    CYCLE_COUNT_LAP(g_orch_params_cycle);
 
     // === STEP 2: First pass - collect output sizes and process inputs ===
 
@@ -332,10 +325,11 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                 pto2_tensormap_lookup(&orch->tensor_map, params[i].tensor, &lookup_result);
 
                 for (int r = 0; r < lookup_result.count; r++) {
-                    auto* entry = lookup_result.entries[r].entry;
+                    int32_t entry_idx = lookup_result.entries[r].entry_idx;
+                    auto &entry = orch->tensor_map.entry_pool[entry_idx];
                     auto overlap_status = lookup_result.entries[r].overlap_status;
                     // Check if this producer is already in fanin list (avoid duplicates)
-                    int producer_task_id = entry->producer_task_id;
+                    int producer_task_id = entry.producer_task_id;
                     bool already_added = false;
                     for (int j = 0; j < fanin_count; j++) {
                         if (fanin_temp[j] == producer_task_id) {
@@ -359,8 +353,8 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                         // 因此为了尽量减少依赖构建个数（尽可能构造链式依赖），当该tensor完全覆盖前面的tensor时，
                         // 应将前面的tensor从tensor map中剔除。
                         // 但是最开始的tensor除外，因为必须建立和最开始的task的依赖关系以保证tensor生命周期的正确管理
-                        if (!entry->with_alloc) {
-                            pto2_tensormap_remove_entry(orch->tensor_map, entry);
+                        if (!entry.with_alloc) {
+                            pto2_tensormap_remove_entry(orch->tensor_map, entry_idx);
                         }
                     }
                 }
@@ -379,7 +373,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         }
     }
 
-    ORCH_PROF_LAP(g_orch_lookup_ns);
+    CYCLE_COUNT_LAP(g_orch_lookup_cycle);
 
     // === STEP 3: Allocate packed buffer from Heap Ring (may stall) ===
     // Each output slot is aligned to PTO2_PACKED_OUTPUT_ALIGN (1024B); gap after data is padding.
@@ -403,7 +397,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         }
     }
 
-    ORCH_PROF_LAP(g_orch_heap_ns);
+    CYCLE_COUNT_LAP(g_orch_heap_cycle);
 
     // === STEP 4: Second pass - register outputs in TensorMap ===
     int32_t output_idx = 0;
@@ -418,7 +412,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         }
     }
 
-    ORCH_PROF_LAP(g_orch_insert_ns);
+    CYCLE_COUNT_LAP(g_orch_insert_cycle);
 
     // === STEP 5: Finalize fanin list ===
     // First build the fanin list
@@ -428,7 +422,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // Use release semantics to ensure fanin list is visible before fanin_count
     __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_RELEASE);
 
-    ORCH_PROF_LAP(g_orch_fanin_ns);
+    CYCLE_COUNT_LAP(g_orch_fanin_cycle);
 
     // === STEP 5b: Check if task is already ready (all producers completed via early-return) ===
     // In AICPU parallel mode, early-return in pto2_add_consumer_to_producer may have
@@ -459,7 +453,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // === STEP 7: Update shared memory with current task index ===
     PTO2_STORE_RELEASE(&orch->sm_handle->header->current_task_index, orch->task_ring.current_index);
 
-    ORCH_PROF_LAP(g_orch_finalize_ns);
+    CYCLE_COUNT_LAP(g_orch_finalize_cycle);
 
     orch->tasks_submitted++;
 #if PTO2_ORCH_PROFILING
@@ -524,21 +518,21 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
 #if PTO2_ORCH_PROFILING
 PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
-    d.sync_ns      = g_orch_sync_ns;
-    d.alloc_ns     = g_orch_alloc_ns;
-    d.params_ns    = g_orch_params_ns;
-    d.lookup_ns    = g_orch_lookup_ns;
-    d.heap_ns      = g_orch_heap_ns;
-    d.insert_ns    = g_orch_insert_ns;
-    d.fanin_ns     = g_orch_fanin_ns;
-    d.finalize_ns  = g_orch_finalize_ns;
-    d.scope_end_ns = g_orch_scope_end_ns;
+    d.sync_cycle      = g_orch_sync_cycle;
+    d.alloc_cycle     = g_orch_alloc_cycle;
+    d.params_cycle    = g_orch_params_cycle;
+    d.lookup_cycle    = g_orch_lookup_cycle;
+    d.heap_cycle      = g_orch_heap_cycle;
+    d.insert_cycle    = g_orch_insert_cycle;
+    d.fanin_cycle     = g_orch_fanin_cycle;
+    d.finalize_cycle  = g_orch_finalize_cycle;
+    d.scope_end_cycle = g_orch_scope_end_cycle;
     d.submit_count = g_orch_submit_count;
 
     // Reset
-    g_orch_sync_ns = g_orch_alloc_ns = g_orch_params_ns = 0;
-    g_orch_lookup_ns = g_orch_heap_ns = g_orch_insert_ns = 0;
-    g_orch_fanin_ns = g_orch_finalize_ns = g_orch_scope_end_ns = 0;
+    g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_params_cycle = 0;
+    g_orch_lookup_cycle = g_orch_heap_cycle = g_orch_insert_cycle = 0;
+    g_orch_fanin_cycle = g_orch_finalize_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
     return d;
 }

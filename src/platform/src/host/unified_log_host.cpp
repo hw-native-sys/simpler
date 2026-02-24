@@ -53,3 +53,11 @@ void unified_log_debug(const char* func, const char* fmt, ...) {
     HostLogger::get_instance().log(HostLogLevel::DEBUG, "%s: %s", func, buffer);
 }
 
+void unified_log_always(const char* func, const char* fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    char buffer[2048];
+    vsnprintf(buffer, sizeof(buffer), fmt, args);
+    va_end(args);
+    HostLogger::get_instance().log(HostLogLevel::ALWAYS, "%s: %s", func, buffer);
+}

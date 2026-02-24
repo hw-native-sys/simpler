@@ -16,6 +16,7 @@
 #endif
 
 #include "aicpu/device_log.h"
+#include "aicpu/device_time.h"
 #include "runtime.h"
 #include "pto2_dispatch_payload.h"
 
@@ -30,13 +31,18 @@
 #include "common/unified_log.h"
 
 // Scheduler profiling helper
-#include <time.h>
-static inline uint64_t _orch_now_ns() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
-}
-#include "aicpu/device_time.h"
+#ifndef PTO2_ORCH_PROFILING
+#define PTO2_ORCH_PROFILING 1
+#endif
+
+#if PTO2_ORCH_PROFILING
+// Accumulated nanoseconds per sub-step
+#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
+#define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
+#else
+#define CYCLE_COUNT_START()
+#define CYCLE_COUNT_LAP(acc)
+#endif
 
 // Device orchestration function signature (loaded via dlopen).
 // The orchestration .so receives a PTO2Runtime* (with ops table populated)
@@ -445,16 +451,24 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     bool profiling_enabled = runtime->enable_profiling;
 
     // Scheduler profiling counters
-    uint64_t sched_scan_ns = 0, sched_orch_drain_ns = 0;
-    uint64_t sched_complete_ns = 0, sched_dispatch_ns = 0, sched_yield_ns = 0;
-    uint64_t sched_loop_count = 0, sched_yield_count = 0;
+#if PTO2_ORCH_PROFILING
+    uint64_t sched_scan_cycle = 0;
+    uint64_t sched_orch_drain_cycle = 0;
+    uint64_t sched_complete_cycle = 0;
+    uint64_t sched_dispatch_cycle = 0;
+    uint64_t sched_yield_cycle = 0;
+    uint64_t sched_loop_count = 0;
+    uint64_t sched_yield_count = 0;
+#endif
     // Fanout traversal statistics
     uint64_t total_fanout_traversed = 0;
     int32_t max_fanout_len = 0;
 
     while (true) {
+#if PTO2_ORCH_PROFILING
         sched_loop_count++;
-        uint64_t _phase_t0 = _orch_now_ns(), _phase_t1;
+#endif
+        CYCLE_COUNT_START();
         // Dynamic task_count (Thread 3 sets total_tasks_ when orchestration completes)
         int32_t task_count = total_tasks_.load(std::memory_order_acquire);
         bool orch_done = orchestrator_done_.load(std::memory_order_acquire);
@@ -514,7 +528,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 }
             }
         }
-        _phase_t1 = _orch_now_ns(); sched_scan_ns += (_phase_t1 - _phase_t0); _phase_t0 = _phase_t1;
+        CYCLE_COUNT_LAP(sched_scan_cycle);
 
 
         // Drain orchestrator ready queue: tasks made ready by orchestrator's early-return path
@@ -551,8 +565,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 made_progress = true;
             }
         }
-        _phase_t1 = _orch_now_ns(); sched_orch_drain_ns += (_phase_t1 - _phase_t0); _phase_t0 = _phase_t1;
-
+        CYCLE_COUNT_LAP(sched_orch_drain_cycle);
 
         // Phase 1: Process completed tasks (Handshake.task = PTO2DispatchPayload*)
         for (int i = 0; i < core_num; i++) {
@@ -630,7 +643,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 completed_tasks_.fetch_add(1, std::memory_order_release);
             }
         }
-        _phase_t1 = _orch_now_ns(); sched_complete_ns += (_phase_t1 - _phase_t0); _phase_t0 = _phase_t1;
+        CYCLE_COUNT_LAP(sched_complete_cycle);
 
         // Phase 2: Dispatch ready tasks to idle cores (build PTO2DispatchPayload)
         if (cur_thread_tasks_in_flight < core_num) {
@@ -668,7 +681,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 }
             }
         }
-        _phase_t1 = _orch_now_ns(); sched_dispatch_ns += (_phase_t1 - _phase_t0); _phase_t0 = _phase_t1;
+        CYCLE_COUNT_LAP(sched_dispatch_cycle);
 
         if (!made_progress) {
             idle_iterations++;
@@ -681,32 +694,50 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 return -1;
             }
             std::this_thread::yield();
+#if PTO2_ORCH_PROFILING
             sched_yield_count++;
-            _phase_t1 = _orch_now_ns(); sched_yield_ns += (_phase_t1 - _phase_t0);
+#endif
+            CYCLE_COUNT_LAP(sched_yield_cycle);
         } else {
             idle_iterations = 0;
         }
     }
 
-    uint64_t sched_total = sched_scan_ns + sched_orch_drain_ns + sched_complete_ns + sched_dispatch_ns + sched_yield_ns;
+#if PTO2_ORCH_PROFILING
+    uint64_t sched_total =
+        sched_scan_cycle + sched_orch_drain_cycle + sched_complete_cycle + sched_dispatch_cycle + sched_yield_cycle;
     if (sched_total == 0) sched_total = 1;  // avoid div-by-zero
-    DEV_ALWAYS("Thread %d: PTO2 scheduler stats: loops=%llu, completed=%d, total=%.3fms",
-             thread_idx, (unsigned long long)sched_loop_count, cur_thread_completed, sched_total/1e6);
-    DEV_ALWAYS("Thread %d:   scan=%.3fms (%.1f%%), orch_drain=%.3fms (%.1f%%), complete=%.3fms (%.1f%%), dispatch=%.3fms (%.1f%%)",
-             thread_idx,
-             sched_scan_ns/1e6, sched_scan_ns*100.0/sched_total,
-             sched_orch_drain_ns/1e6, sched_orch_drain_ns*100.0/sched_total,
-             sched_complete_ns/1e6, sched_complete_ns*100.0/sched_total,
-             sched_dispatch_ns/1e6, sched_dispatch_ns*100.0/sched_total);
-    DEV_ALWAYS("Thread %d:   yield=%.3fms (%.1f%%, %llu calls, avg=%.1fus)",
-             thread_idx, sched_yield_ns/1e6, sched_yield_ns*100.0/sched_total,
-             (unsigned long long)sched_yield_count,
-             sched_yield_count > 0 ? sched_yield_ns/1e3/sched_yield_count : 0.0);
+    DEV_ALWAYS("Thread %d: PTO2 scheduler stats: loops=%llu, completed=%d, total=%.3fus",
+        thread_idx,
+        (unsigned long long)sched_loop_count,
+        cur_thread_completed,
+        cycles_to_us(sched_total));
+    DEV_ALWAYS(
+        "Thread %d:   scan=%.3fus (%.1f%%), orch_drain=%.3fus (%.1f%%), complete=%.3fus (%.1f%%), dispatch=%.3fus "
+        "(%.1f%%)",
+        thread_idx,
+        cycles_to_us(sched_scan_cycle),
+        sched_scan_cycle * 100.0 / sched_total,
+        cycles_to_us(sched_orch_drain_cycle),
+        sched_orch_drain_cycle * 100.0 / sched_total,
+        cycles_to_us(sched_complete_cycle),
+        sched_complete_cycle * 100.0 / sched_total,
+        cycles_to_us(sched_dispatch_cycle),
+        sched_dispatch_cycle * 100.0 / sched_total);
+    DEV_ALWAYS("Thread %d:   yield=%.3fus (%.1f%%, %llu calls, avg=%.1fus)",
+        thread_idx,
+        cycles_to_us(sched_yield_cycle),
+        sched_yield_cycle * 100.0 / sched_total,
+        (unsigned long long)sched_yield_count,
+        sched_yield_count > 0 ? cycles_to_us(sched_yield_cycle) / sched_yield_count : 0.0);
     DEV_ALWAYS("Thread %d:   fanout: total_traversed=%llu, max_len=%d, avg=%.1f",
-             thread_idx, (unsigned long long)total_fanout_traversed, max_fanout_len,
-             cur_thread_completed > 0 ? (double)total_fanout_traversed / cur_thread_completed : 0.0);
+        thread_idx,
+        (unsigned long long)total_fanout_traversed,
+        max_fanout_len,
+        cur_thread_completed > 0 ? (double)total_fanout_traversed / cur_thread_completed : 0.0);
 
     DEV_ALWAYS("Thread %d: PTO2 execution complete, completed %d tasks", thread_idx, cur_thread_completed);
+#endif
 
     // Flush performance buffers for cores managed by this thread
     if (profiling_enabled) {
@@ -893,31 +924,32 @@ int AicpuExecutor::run(Runtime* runtime) {
             orch_ready_capacity_ = PTO2OrchestratorState::ORCH_READY_QUEUE_SIZE;
 
             // Call orchestration wrapped in outer scope (matches old PTO2_ORCHESTRATION behavior)
-            DEV_INFO("Thread 3: Calling aicpu_orchestration_entry from SO");
-            PTO2_SCOPE(rt) {
-                orch_func(rt, args, arg_count);
-            }
-            DEV_INFO("Thread 3: aicpu_orchestration_entry returned");
+            DEV_ALWAYS("Thread 3: Calling aicpu_orchestration_entry from SO");
+            uint64_t orch_cycle_start = get_sys_cnt_aicpu();
+            PTO2_SCOPE(rt) { orch_func(rt, args, arg_count); }
+            uint64_t orch_cycle_end = get_sys_cnt_aicpu();
+            DEV_ALWAYS("Thread 3: aicpu_orchestration_entry returned, cost %.3fus",
+                cycles_to_us(orch_cycle_end - orch_cycle_start));
 
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             {
                 PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
-                uint64_t total = p.sync_ns + p.alloc_ns + p.params_ns +
-                                 p.lookup_ns + p.heap_ns + p.insert_ns +
-                                 p.fanin_ns + p.finalize_ns;
-                DEV_INFO("=== Orchestrator Profiling: %lld tasks, total=%.3fms ===",
-                         (long long)p.submit_count, total / 1e6);
-                DEV_INFO("  sync_tensormap : %.3fms (%.1f%%)", p.sync_ns / 1e6, p.sync_ns * 100.0 / total);
-                DEV_INFO("  task_ring_alloc: %.3fms (%.1f%%)", p.alloc_ns / 1e6, p.alloc_ns * 100.0 / total);
-                DEV_INFO("  param_copy     : %.3fms (%.1f%%)", p.params_ns / 1e6, p.params_ns * 100.0 / total);
-                DEV_INFO("  lookup+dep     : %.3fms (%.1f%%)", p.lookup_ns / 1e6, p.lookup_ns * 100.0 / total);
-                DEV_INFO("  heap_alloc     : %.3fms (%.1f%%)", p.heap_ns / 1e6, p.heap_ns * 100.0 / total);
-                DEV_INFO("  tensormap_ins  : %.3fms (%.1f%%)", p.insert_ns / 1e6, p.insert_ns * 100.0 / total);
-                DEV_INFO("  fanin+ready    : %.3fms (%.1f%%)", p.fanin_ns / 1e6, p.fanin_ns * 100.0 / total);
-                DEV_INFO("  finalize+SM    : %.3fms (%.1f%%)", p.finalize_ns / 1e6, p.finalize_ns * 100.0 / total);
-                DEV_INFO("  scope_end      : %.3fms", p.scope_end_ns / 1e6);
-                DEV_INFO("  avg/task       : %.3fus", total / 1e3 / p.submit_count);
+                uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle +
+                                 p.lookup_cycle + p.heap_cycle + p.insert_cycle +
+                                 p.fanin_cycle + p.finalize_cycle;
+                DEV_ALWAYS("=== Orchestrator Profiling: %lld tasks, total=%.3fus ===",
+                         (long long)p.submit_count, cycles_to_us(total));
+                DEV_ALWAYS("  sync_tensormap : %.3fus (%.1f%%)", cycles_to_us(p.sync_cycle), p.sync_cycle * 100.0 / total);
+                DEV_ALWAYS("  task_ring_alloc: %.3fus (%.1f%%)", cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total);
+                DEV_ALWAYS("  param_copy     : %.3fus (%.1f%%)", cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total);
+                DEV_ALWAYS("  lookup+dep     : %.3fus (%.1f%%)", cycles_to_us(p.lookup_cycle), p.lookup_cycle * 100.0 / total);
+                DEV_ALWAYS("  heap_alloc     : %.3fus (%.1f%%)", cycles_to_us(p.heap_cycle), p.heap_cycle * 100.0 / total);
+                DEV_ALWAYS("  tensormap_ins  : %.3fus (%.1f%%)", cycles_to_us(p.insert_cycle), p.insert_cycle * 100.0 / total);
+                DEV_ALWAYS("  fanin+ready    : %.3fus (%.1f%%)", cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total);
+                DEV_ALWAYS("  finalize+SM    : %.3fus (%.1f%%)", cycles_to_us(p.finalize_cycle), p.finalize_cycle * 100.0 / total);
+                DEV_ALWAYS("  scope_end      : %.3fus", cycles_to_us(p.scope_end_cycle));
+                DEV_ALWAYS("  avg/task       : %.3fus", cycles_to_us(total) / p.submit_count);
             }
 #endif
 

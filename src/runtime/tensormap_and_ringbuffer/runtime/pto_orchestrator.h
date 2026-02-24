@@ -246,15 +246,15 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch);
 
 #if PTO2_ORCH_PROFILING
 struct PTO2OrchProfilingData {
-    uint64_t sync_ns;
-    uint64_t alloc_ns;
-    uint64_t params_ns;
-    uint64_t lookup_ns;
-    uint64_t heap_ns;
-    uint64_t insert_ns;
-    uint64_t fanin_ns;
-    uint64_t finalize_ns;
-    uint64_t scope_end_ns;
+    uint64_t sync_cycle;
+    uint64_t alloc_cycle;
+    uint64_t params_cycle;
+    uint64_t lookup_cycle;
+    uint64_t heap_cycle;
+    uint64_t insert_cycle;
+    uint64_t fanin_cycle;
+    uint64_t finalize_cycle;
+    uint64_t scope_end_cycle;
     int64_t  submit_count;
 };
 

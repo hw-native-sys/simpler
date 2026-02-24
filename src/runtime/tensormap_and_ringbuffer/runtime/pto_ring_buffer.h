@@ -39,7 +39,7 @@
  * Allocates output buffers from a contiguous GM Heap.
  * Wrap-around design with implicit reclamation.
  */
-typedef struct {
+struct PTO2HeapRing {
     void*    base;        // GM_Heap_Base pointer
     int32_t  size;        // GM_Heap_Size (total heap size in bytes)
     int32_t  top;         // Allocation pointer (local copy)
@@ -47,7 +47,7 @@ typedef struct {
     // Reference to shared memory tail (for back-pressure)
     volatile int32_t* tail_ptr;  // Points to header->heap_tail
     
-} PTO2HeapRing;
+};
 
 /**
  * Initialize heap ring buffer
@@ -102,7 +102,7 @@ void pto2_heap_ring_reset(PTO2HeapRing* ring);
  * Fixed-size sliding window for task management.
  * Provides back-pressure when window is full.
  */
-typedef struct {
+struct PTO2TaskRing {
     PTO2TaskDescriptor* descriptors;  // Task descriptor array (from shared memory)
     int32_t window_size;              // Window size (power of 2)
     int32_t current_index;            // Next task to allocate (absolute ID)
@@ -110,7 +110,7 @@ typedef struct {
     // Reference to shared memory last_task_alive (for back-pressure)
     volatile int32_t* last_alive_ptr;  // Points to header->last_task_alive
     
-} PTO2TaskRing;
+};
 
 /**
  * Initialize task ring buffer

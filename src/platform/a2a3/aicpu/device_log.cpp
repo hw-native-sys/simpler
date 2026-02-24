@@ -68,5 +68,5 @@ void dev_log_always(const char* func, const char* fmt, ...) {
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
-    dlog_error(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
+    dlog_error(AICPU, "[ALWAYS] %lu %s\n\"%s\"", GET_TID(), func, buffer);
 }

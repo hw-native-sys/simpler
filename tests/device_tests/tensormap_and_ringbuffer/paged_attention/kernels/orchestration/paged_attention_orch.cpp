@@ -99,7 +99,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
     DataType data_type = DataType::BFLOAT16;  // 用例是float32的，这个考虑要如何扩展成其他类型
 
-    printf("batch = %lu\n", batch);
+    LOG_ALWAYS(rt, ">>>>>> batch = %lu", (unsigned long)batch);
 
     // query_size = batch * num_heads * head_dim * data_type
     // key_cache_size = batch * block_num * block_size * head_dim * data_type
@@ -115,10 +115,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     // Tensor block_table = make_tensor_external(host_block_table, block_table_size);
     // Tensor context_lens = make_tensor_external(host_context_lens, context_lens_size);
     Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
-    printf("query=%s\n", query.dump().c_str());
-    printf("key_cache=%s\n", key_cache.dump().c_str());
-    printf("value_cache=%s\n", value_cache.dump().c_str());
-    printf("out=%s\n", out.dump().c_str());
+    LOG_DEBUG(rt, "query=%s", query.dump().c_str());
+    LOG_DEBUG(rt, "key_cache=%s", key_cache.dump().c_str());
+    LOG_DEBUG(rt, "value_cache=%s", value_cache.dump().c_str());
+    LOG_DEBUG(rt, "out=%s", out.dump().c_str());
 
     int total_tasks = 0;
 

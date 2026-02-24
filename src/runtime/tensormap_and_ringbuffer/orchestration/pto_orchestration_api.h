@@ -63,6 +63,7 @@ typedef struct PTO2RuntimeOps {
     void (*log_warn)(const char* func, const char* fmt, ...);
     void (*log_info)(const char* func, const char* fmt, ...);
     void (*log_debug)(const char* func, const char* fmt, ...);
+    void (*log_always)(const char* func, const char* fmt, ...);
 } PTO2RuntimeOps;
 
 /**
@@ -106,6 +107,7 @@ static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) {
 #define LOG_WARN(rt, fmt, ...)  (rt)->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_INFO(rt, fmt, ...)  (rt)->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(rt, fmt, ...) (rt)->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_ALWAYS(rt, fmt, ...) (rt)->ops->log_always(__FUNCTION__, fmt, ##__VA_ARGS__)
 
 // =============================================================================
 // C++ Scope Guards and Macros

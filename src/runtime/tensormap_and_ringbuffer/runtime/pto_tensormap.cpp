@@ -54,8 +54,19 @@ bool pto2_tensormap_init(PTO2TensorMap* tm, int32_t num_buckets, int32_t pool_si
         return false;
     }
 
+    // Allocate free entry list
+    tm->free_entry_list = (int32_t*)calloc(pool_size, sizeof(int32_t));
+    if (!tm->free_entry_list) {
+        free(tm->buckets);
+        free(tm->entry_pool);
+        tm->buckets = NULL;
+        tm->entry_pool = NULL;
+        return false;
+    }
+
     tm->pool_size = pool_size;
-    tm->pool_head = 0;
+    tm->next_entry_idx = 0;
+    tm->free_num = 0;
 
     // Initialize all entries as not in bucket
     for (int32_t i = 0; i < pool_size; i++) {
@@ -72,8 +83,10 @@ bool pto2_tensormap_init(PTO2TensorMap* tm, int32_t num_buckets, int32_t pool_si
     if (!tm->task_entry_head) {
         free(tm->entry_pool);
         free(tm->buckets);
+        free(tm->free_entry_list);
         tm->entry_pool = NULL;
         tm->buckets = NULL;
+        tm->free_entry_list = NULL;
         return false;
     }
 
@@ -129,7 +142,8 @@ void pto2_tensormap_reset(PTO2TensorMap* tm) {
         tm->task_entry_head[i] = -1;
     }
 
-    tm->pool_head = 0;
+    tm->next_entry_idx = 0;
+    tm->free_num = 0;
     tm->last_task_alive = 0;
 }
 
@@ -171,36 +185,13 @@ uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, Tensor* tensor) {
 
 void pto2_tensormap_sync_validity(PTO2TensorMap* tm, int32_t last_task_alive) { tm->last_task_alive = last_task_alive; }
 
-void pto2_tensormap_remove_entry(PTO2TensorMap& tm, PTO2TensorMapEntry* entry) {
-    pto2_tensormap_remove_from_bucket(&tm, entry);
-    pto2_tensormap_remove_from_task(&tm, entry);
+void pto2_tensormap_remove_entry(PTO2TensorMap& tm, int32_t entry_idx) {
+    pto2_tensormap_remove_from_task(&tm, entry_idx);
+    tm.free_entry(entry_idx);
 }
 
-void pto2_tensormap_remove_from_bucket(PTO2TensorMap* tm, PTO2TensorMapEntry* entry) {
-    if (!entry->in_bucket) {
-        return;  // Already removed
-    }
-
-    // Update predecessor's next pointer (O(1) via prev_in_bucket)
-    if (entry->prev_in_bucket == -1) {
-        // Entry is the head of its bucket chain, update bucket head
-        uint32_t bucket = pto2_tensormap_hash(tm, &entry->tensor);
-        tm->buckets[bucket] = entry->next_in_bucket;
-    } else {
-        tm->entry_pool[entry->prev_in_bucket].next_in_bucket = entry->next_in_bucket;
-    }
-
-    // Update successor's prev pointer
-    if (entry->next_in_bucket >= 0) {
-        tm->entry_pool[entry->next_in_bucket].prev_in_bucket = entry->prev_in_bucket;
-    }
-
-    entry->in_bucket = false;
-    entry->next_in_bucket = -1;
-    entry->prev_in_bucket = -1;
-}
-
-void pto2_tensormap_remove_from_task(PTO2TensorMap* tm, PTO2TensorMapEntry* entry) {
+void pto2_tensormap_remove_from_task(PTO2TensorMap* tm, int32_t entry_idx) {
+    auto entry = &tm->entry_pool[entry_idx];
     // Update predecessor's next pointer (O(1) via prev_in_task)
     if (entry->prev_in_task == -1) {
         // Entry is the head of its task chain, update task_entry_head
@@ -231,10 +222,8 @@ void pto2_tensormap_cleanup_retired(PTO2TensorMap* tm, int32_t old_last_task_ali
             // Only remove if this entry belongs to the retiring task
             // (slot may have been reused by a newer task)
             if (entry->producer_task_id == task_id) {
-                pto2_tensormap_remove_from_bucket(tm, entry);
                 // Clear task chain pointers (entire chain is being destroyed)
-                entry->next_in_task = -1;
-                entry->prev_in_task = -1;
+                tm->free_entry(offset);
             }
             offset = next;
         }
@@ -283,7 +272,7 @@ void pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor, PTO2LookupResult* 
         // potential to overlap. We must check actual byte-range overlap.
         auto overlap_status = tensor->is_overlap(entry->tensor);
         if (overlap_status != OverlapStatus::NO_OVERLAP) {
-            result->push(entry, overlap_status);
+            result->push(offset, overlap_status);
         }
 
         // Move to next entry
@@ -292,23 +281,65 @@ void pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor, PTO2LookupResult* 
     }
 }
 
+int32_t PTO2TensorMap::new_entry() {
+    if (free_num > 0) {
+        int32_t res = free_entry_list[--free_num];
+        debug_assert(!entry_pool[res].in_bucket);
+        return res;
+    }
+    if (next_entry_idx < pool_size) {
+        int32_t res = next_entry_idx++;
+        debug_assert(!entry_pool[res].in_bucket);
+        return res;
+    }
+
+    size_t wait_count = 0;
+    while (free_num == 0) {
+        pto2_orchestrator_sync_tensormap(this, true);
+        always_assert(wait_count++ <= 1000000000UL);
+    }
+    debug_assert(free_num > 0);
+    int32_t res = free_entry_list[--free_num];
+    debug_assert(!entry_pool[res].in_bucket);
+    return res;
+}
+
+void PTO2TensorMap::free_entry(int32_t entry_idx) {
+    auto entry = &entry_pool[entry_idx];
+    if (!entry->in_bucket) {
+        return;  // Already removed
+    }
+
+    // Update predecessor's next pointer (O(1) via prev_in_bucket)
+    if (entry->prev_in_bucket == -1) {
+        // Entry is the head of its bucket chain, update bucket head
+        uint32_t bucket = pto2_tensormap_hash(this, &entry->tensor);
+        buckets[bucket] = entry->next_in_bucket;
+    } else {
+        entry_pool[entry->prev_in_bucket].next_in_bucket = entry->next_in_bucket;
+    }
+
+    // Update successor's prev pointer
+    if (entry->next_in_bucket >= 0) {
+        entry_pool[entry->next_in_bucket].prev_in_bucket = entry->prev_in_bucket;
+    }
+
+    free_entry_list[free_num++] = entry_idx;
+    entry->in_bucket = false;
+    entry->next_in_bucket = -1;
+    entry->prev_in_bucket = -1;
+    entry->next_in_task = -1;
+    entry->prev_in_task = -1;
+}
+
 // =============================================================================
 // Insert
 // =============================================================================
 
 void pto2_tensormap_insert(PTO2TensorMap* tm, Tensor* tensor, int32_t producer_task_id, bool with_alloc) {
     // Allocate entry from ring buffer pool
-    int32_t entry_offset = tm->pool_head;
+    int32_t entry_offset = tm->new_entry();
     PTO2TensorMapEntry* entry = &tm->entry_pool[entry_offset];
-
-    // Advance pool head (wrap around)
-    tm->pool_head = (tm->pool_head + 1) % tm->pool_size;
-
-    size_t wait_count = 0;
-    while (entry->in_bucket) {
-        pto2_orchestrator_sync_tensormap(tm);
-        always_assert(wait_count++ <= 1000000000UL);
-    }
 
     // Initialize new entry
     entry->tensor = *tensor;
@@ -382,15 +413,16 @@ void pto2_tensormap_print_stats(PTO2TensorMap* tm) {
     }
 
     printf("=== TensorMap Statistics ===\n");
-    printf("Pool size:       %d\n", tm->pool_size);
-    printf("Pool head:       %d\n", tm->pool_head);
-    printf("Num buckets:     %d\n", tm->num_buckets);
-    printf("Valid entries:   %d\n", valid);
-    printf("Stale entries:   %d\n", stale);
-    printf("Empty buckets:   %d\n", empty_buckets);
-    printf("Max chain len:   %d\n", max_chain);
-    printf("Avg chain len:   %.2f\n", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
-    printf("Last task alive: %d\n", tm->last_task_alive);
+    printf("Pool size:           %d\n", tm->pool_size);
+    printf("Pool next entry idx: %d\n", tm->next_entry_idx);
+    printf("Pool free_num:       %d\n", tm->free_num);
+    printf("Num buckets:         %d\n", tm->num_buckets);
+    printf("Valid entries:       %d\n", valid);
+    printf("Stale entries:       %d\n", stale);
+    printf("Empty buckets:       %d\n", empty_buckets);
+    printf("Max chain len:       %d\n", max_chain);
+    printf("Avg chain len:       %.2f\n", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
+    printf("Last task alive:     %d\n", tm->last_task_alive);
     printf("============================\n");
 }
 
@@ -410,7 +442,7 @@ int32_t pto2_tensormap_valid_count(PTO2TensorMap* tm) {
 // TensorMap Synchronization
 // =============================================================================
 
-void pto2_orchestrator_sync_tensormap(PTO2TensorMap* tm) {
+void pto2_orchestrator_sync_tensormap(PTO2TensorMap* tm, bool force) {
     always_assert(tm->orch != nullptr);
     // Read current last_task_alive from shared memory
     int32_t new_last_task_alive = PTO2_LOAD_ACQUIRE(&tm->orch->sm_handle->header->last_task_alive);
@@ -419,7 +451,7 @@ void pto2_orchestrator_sync_tensormap(PTO2TensorMap* tm) {
     pto2_tensormap_sync_validity(tm, new_last_task_alive);
 
     // Periodically cleanup TensorMap to remove stale entries from bucket chains
-    if (new_last_task_alive - tm->orch->tensormap_last_cleanup >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
+    if (force || (new_last_task_alive - tm->orch->tensormap_last_cleanup >= PTO2_TENSORMAP_CLEANUP_INTERVAL)) {
         pto2_tensormap_cleanup_retired(tm, tm->orch->tensormap_last_cleanup, new_last_task_alive);
         tm->orch->tensormap_last_cleanup = new_last_task_alive;
     }

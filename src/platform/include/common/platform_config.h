@@ -100,4 +100,9 @@ constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 2;
  * Number of empty polling iterations before checking timeout
  */
 constexpr int PLATFORM_PROF_EMPTY_POLLS_CHECK_NUM = 1000;
+
+inline double cycles_to_us(uint64_t cycles) {
+    return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
+};
+
 #endif  // PLATFORM_COMMON_PLATFORM_CONFIG_H_
