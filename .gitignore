@@ -10,19 +10,12 @@ build/
 .venv/
 venv/
 .cache
-.claude
 .vscode
 *bak
 outputs
 
-# Generated example outputs (Ascend header backends)
-examples/output_ascend_a2a3/
-examples/output_ascend_a5/
-
-# Ascend simulator debug dumps
-core*_*.dump
-profile_*_log*.toml
-
 # Git cloned dependencies (not tracked in repo)
 examples/scripts/_deps/
+
+# Profiling files
 outputs

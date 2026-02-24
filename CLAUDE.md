@@ -16,6 +16,40 @@ Each developer role has a designated working directory. Stay within your assigne
 - **Working directory**: `examples/`
 - Write code generation examples and kernel implementations here
 
+## Architecture
+
+PTO Runtime compiles three independent programs (Host `.so`, AICPU `.so`, AICore `.o`) that communicate through handshake buffers on Ascend NPU devices. Three runtime variants live under `src/runtime/` (`host_build_graph`, `aicpu_build_graph`, `tensormap_and_ringbuffer`), two platform backends under `src/platform/` (`a2a3` = hardware, `a2a3sim` = simulation). See `README.md` for the full architecture diagram.
+
+## Common Commands
+
+### Simulation tests (no hardware required)
+```bash
+./ci.sh -p a2a3sim
+```
+
+### Hardware tests (requires Ascend device)
+```bash
+./ci.sh -p a2a3 -d 4-7 --parallel
+```
+
+### Run a single example
+```bash
+python examples/scripts/run_example.py \
+    -k examples/host_build_graph/vector_example/kernels \
+    -g examples/host_build_graph/vector_example/golden.py \
+    -p a2a3sim
+```
+
+### Python unit tests
+```bash
+pytest tests -v
+```
+
+### Format C++ code
+```bash
+clang-format -i <file>
+```
+
 ## Important Rules
 
 1. **Consult `.ai-instructions/` for task-specific rules.** The directory contains topic-based guides — read the ones relevant to your current task (e.g., `coding/` when writing code, `git-commit/` when committing, `terminologies/` when unsure about domain terms). You do not need to read all files upfront
