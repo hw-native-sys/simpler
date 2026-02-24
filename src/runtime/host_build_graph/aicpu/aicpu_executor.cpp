@@ -8,7 +8,7 @@
 #include "common/memory_barrier.h"
 #include "runtime.h"
 #include "aicpu/device_log.h"
-#include "inner_aicpu.h"
+#include "aicpu/device_time.h"
 
 constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int MAX_AIC_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD;

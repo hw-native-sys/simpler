@@ -36,7 +36,7 @@ static inline uint64_t _orch_now_ns() {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
-#include "inner_aicpu.h"
+#include "aicpu/device_time.h"
 
 // Device orchestration function signature (loaded via dlopen).
 // The orchestration .so receives a PTO2Runtime* (with ops table populated)
