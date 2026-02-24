@@ -58,6 +58,7 @@ struct KernelArgs {
     uint64_t unused[5] = {0};          // Alignment padding (required by CANN runtime offset)
     DeviceArgs* device_args{nullptr};  // Device arguments (AICPU reads, contains SO info)
     Runtime* runtime_args{nullptr};    // Task runtime in device memory
+    uint64_t regs{0};                  // Per-core register base address array (platform-specific)
 };
 
 #ifdef __cplusplus

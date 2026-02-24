@@ -1,7 +1,7 @@
 #include "aicore/aicore.h"
 #include "runtime.h"
 #include "common/perf_profiling.h"
-#include "common/memory_barrier.h"
+#include "common/platform_config.h"  // Platform configuration (C/C++ compatible)
 
 typedef void (*KernelFunc)(__gm__ int64_t*);
 
@@ -28,23 +28,19 @@ __aicore__ __attribute__((always_inline)) static void record_task_performance(
     CoreType core_type,
     uint64_t kernel_ready_time) {
 
-    // Check if buffer is available for writing
+    // dcci() for handshake visibility during profiling
+    dcci((__gm__ uint32_t*)&my_hank->perf_buffer_status, SINGLE_CACHE_LINE, CACHELINE_OUT);
+
     if (my_hank->perf_buffer_status != 0) {
-        return;  // Buffer full, skip recording
+        return;
     }
 
-    // Get current performance buffer pointer
     __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-
-    // Get current count
     uint32_t idx = perf_buf->count;
 
-    // Check if buffer has space
     if (idx < PLATFORM_PROF_BUFFER_SIZE) {
-        // Get pointer to the record slot
         __gm__ PerfRecord* record = (__gm__ PerfRecord*)&perf_buf->records[idx];
 
-        // Write record data (only essential fields, fanout filled by AICPU)
         record->start_time = start_time;
         record->end_time = end_time;
         record->kernel_ready_time = kernel_ready_time;
@@ -53,20 +49,16 @@ __aicore__ __attribute__((always_inline)) static void record_task_performance(
         record->core_id = block_idx;
         record->core_type = core_type;
 
-        // Increment count after writing record
         perf_buf->count = idx + 1;
-
-        // Write memory barrier: ensure performance data is visible to Host
-        wmb();
-
-        // Check if buffer is full after this write
+        dcci(record, ENTIRE_DATA_CACHE, CACHELINE_OUT);
         if (perf_buf->count >= PLATFORM_PROF_BUFFER_SIZE) {
-            my_hank->perf_buffer_status = 1;  // Notify AICPU: buffer full
+            my_hank->perf_buffer_status = 1;
         }
     } else {
-        // Buffer is already full
         my_hank->perf_buffer_status = 1;
     }
+    // dcci() for handshake visibility during profiling
+    dcci((__gm__ uint32_t*)&my_hank->perf_buffer_status, SINGLE_CACHE_LINE, CACHELINE_OUT);
 }
 
 __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task) {
@@ -75,9 +67,12 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
     }
     KernelFunc kernel = (KernelFunc)task->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
+
+    // Ensure all memory writes are visible to other cores
+    pipe_barrier(PIPE_ALL);
 }
 
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type) {
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id) {
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
@@ -85,51 +80,45 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
     }
 
-    // Phase 2: Signal AICore is ready and report core type
-    my_hank->core_type = core_type;        // Report core type to AICPU
-    my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
+    // Report physical core ID and core type for AICPU
+    my_hank->physical_core_id = physical_core_id;
+    my_hank->core_type = core_type;
+    my_hank->aicore_done = block_idx + 1;
 
-    // Check if profiling is enabled
+    dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+
+    // Report initial idle status for task dispatch
+    write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::IDLE));
+
     bool profiling_enabled = runtime->enable_profiling;
+    uint64_t kernel_ready_time = get_sys_cnt();
 
-    // Record kernel ready time (before entering main loop)
-    // This timestamp represents when the AICore is ready to execute tasks
-    // but hasn't started executing any task yet.
-    // Used for: 1) Startup overhead analysis, 2) Cross-core time alignment
-    uint64_t kernel_ready_time = 0;
-    if (profiling_enabled) {
-        kernel_ready_time = get_sys_cnt();
-    }
+    // Main loop: poll DATA_MAIN_BASE for task_id
+    volatile uint32_t task_id = 0;
+    volatile uint32_t last_task_id = 0;
 
-    // Phase 3: Main execution loop - poll for tasks until quit signal
     while (true) {
-        dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
-
-        // Check for quit command from AICPU
-        if (my_hank->control == 1) {
-            break;  // Exit kernel
+        task_id = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+        if (task_id == AICORE_EXIT_SIGNAL) {
+            break;
         }
 
-        // Execute task if assigned (task != 0 means valid task pointer)
-        if (my_hank->task_status == 1 && my_hank->task != 0) {
-            __gm__ Task* task_ptr = reinterpret_cast<__gm__ Task*>(my_hank->task);
-
-            // Performance profiling: record start time
-            uint64_t start_time = 0;
-            start_time = get_sys_cnt();
+        // Execute task if new (task_id encoding: 0=idle, task_id+1=task)
+        if (task_id != 0 && task_id != last_task_id) {
+            write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::BUSY));
+            __gm__ Task* task_ptr = &(runtime->tasks[task_id - 1]);
+            uint64_t start_time = get_sys_cnt();
             
-
-            // Execute the task
             execute_task(task_ptr);
 
-            // Performance profiling: record task execution
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt();
-                record_task_performance(my_hank, task_ptr, start_time, end_time, block_idx, core_type, kernel_ready_time);
+                record_task_performance(my_hank, task_ptr, start_time, end_time,
+                                      block_idx, core_type, kernel_ready_time);
             }
 
-            // Mark task as complete (task_status: 0=idle, 1=busy)
-            my_hank->task_status = 0;
+            last_task_id = task_id;
+            write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::IDLE));
         }
     }
 }

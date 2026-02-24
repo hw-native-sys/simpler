@@ -28,8 +28,9 @@ set(AICPU_SOURCES "")
 # First, collect all .cpp files from the current platform directory
 file(GLOB PLATFORM_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/*.cpp")
 list(APPEND AICPU_SOURCES ${PLATFORM_SOURCES})
-# Add unified log device implementation
-list(APPEND AICPU_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/device/unified_log_device.cpp")
+# Add common source list like 1) unified log device implementation; 2) platform register implementation
+file(GLOB COMMON_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/aicpu/*.cpp")
+list(APPEND AICPU_SOURCES ${COMMON_SOURCES})
 
 # Then, collect sources from CUSTOM_SOURCE_DIRS (runtime sources)
 if(DEFINED CUSTOM_SOURCE_DIRS)

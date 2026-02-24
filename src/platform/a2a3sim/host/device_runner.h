@@ -207,7 +207,8 @@ private:
     void* aicpu_so_handle_{nullptr};
     void* aicore_so_handle_{nullptr};
     int (*aicpu_execute_func_)(Runtime*){nullptr};
-    void (*aicore_execute_func_)(Runtime*, int, CoreType){nullptr};
+    void (*aicore_execute_func_)(Runtime*, int, CoreType, uint32_t, uint64_t){nullptr};
+    void (*set_platform_regs_func_)(uint64_t){nullptr};
     std::string aicpu_so_path_;
     std::string aicore_so_path_;
 

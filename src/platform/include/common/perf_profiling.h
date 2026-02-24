@@ -38,11 +38,6 @@
 #define RUNTIME_MAX_FANOUT 512
 #endif
 
-// Maximum cores that can be profiled simultaneously
-#ifndef PLATFORM_MAX_CORES
-#define PLATFORM_MAX_CORES 72  // 24 blocks × 3 cores/block
-#endif
-
 // =============================================================================
 // Buffer Status Enumeration
 // =============================================================================

@@ -105,4 +105,78 @@ inline double cycles_to_us(uint64_t cycles) {
     return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
 };
 
+// =============================================================================
+// Register Communication Configuration
+// =============================================================================
+
+// Register offsets for AICore SPR access
+constexpr uint32_t REG_SPR_DATA_MAIN_BASE_OFFSET = 0xA0;  // Task dispatch (AICPU→AICore)
+constexpr uint32_t REG_SPR_COND_OFFSET = 0x4C8;           // Status (AICore→AICPU): 0=IDLE, 1=BUSY
+constexpr uint32_t REG_SPR_FAST_PATH_ENABLE_OFFSET = 0x18;
+
+// Fast path control values
+constexpr uint32_t REG_SPR_FAST_PATH_OPEN = 0xE;
+constexpr uint32_t REG_SPR_FAST_PATH_CLOSE = 0xF;
+
+// Exit signal for AICore shutdown
+constexpr uint32_t AICORE_EXIT_SIGNAL = 0x7FFFFFF0;
+
+// Physical core ID mask for get_coreid()
+constexpr uint32_t AICORE_COREID_MASK = 0x0FFF;
+
+/**
+ * Register identifier for unified read_reg/write_reg interface
+ */
+enum class RegId : uint32_t {
+    DATA_MAIN_BASE = 0,    // Task dispatch (AICPU→AICore)
+    COND = 1,              // Status (AICore→AICPU)
+    FAST_PATH_ENABLE = 2,  // Fast path control
+};
+
+/**
+ * AICore execution status (communicated via COND register)
+ */
+enum class AICoreStatus : uint32_t {
+    IDLE = 0,
+    BUSY = 1,
+};
+
+/**
+ * Map RegId to hardware register offset
+ */
+constexpr uint32_t reg_offset(RegId reg) {
+    switch (reg) {
+        case RegId::DATA_MAIN_BASE:  return REG_SPR_DATA_MAIN_BASE_OFFSET;
+        case RegId::COND:            return REG_SPR_COND_OFFSET;
+        case RegId::FAST_PATH_ENABLE: return REG_SPR_FAST_PATH_ENABLE_OFFSET;
+    }
+    return 0;  // unreachable: all RegId cases handled above
+}
+
+// Size of simulated register block per core (covers largest offset + 4 bytes)
+constexpr uint32_t SIM_REG_BLOCK_SIZE = 0x500;
+
+// =============================================================================
+// Hardware Configuration Constants
+// =============================================================================
+
+/**
+ * AICore register bitmap buffer length
+ * Used for querying valid AICore cores via HAL API
+ */
+constexpr uint8_t PLATFORM_AICORE_BITMAP_LEN = 2;
+
+/**
+ * Number of sub-cores per AICore
+ * Hardware architecture: 1 AICore = 1 AIC + 2 AIV sub-cores
+ */
+constexpr uint32_t PLATFORM_SUB_CORES_PER_AICORE = PLATFORM_CORES_PER_BLOCKDIM;
+
+/**
+ * Maximum physical AICore count for DAV 2201 chip
+ */
+namespace DAV_2201 {
+constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = 25;
+}
+
 #endif  // PLATFORM_COMMON_PLATFORM_CONFIG_H_

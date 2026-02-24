@@ -95,16 +95,20 @@
  * - task_status: Written by both (AICPU=1 on dispatch, AICore=0 on completion)
  * - control: Written by AICPU, read by AICore (0 = continue, 1 = quit)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
+ * - perf_records_addr: Written by AICPU, read by AICore (performance records address)
+ * - perf_buffer_status: Written by both (AICPU=1 on buffer full, AICore=0 on buffer empty)
+ * - physical_core_id: Written by AICPU, read by AICore (physical core ID)
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;  // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;  // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;         // Task pointer: 0=no task, non-zero=Task* address
-    volatile int32_t task_status;   // Task execution status: 0=idle, 1=busy
-    volatile int32_t control;       // Control signal: 0=execute, 1=quit
-    volatile CoreType core_type;    // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t perf_records_addr; // Performance records address
-    volatile uint32_t perf_buffer_status; // 0 = not full, 1 == full
+    volatile uint32_t aicpu_ready;          // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;          // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;                 // Task pointer: 0=no task, non-zero=Task* address
+    volatile int32_t task_status;           // Task execution status: 0=idle, 1=busy
+    volatile int32_t control;               // Control signal: 0=execute, 1=quit
+    volatile CoreType core_type;            // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint64_t perf_records_addr;    // Performance records address
+    volatile uint32_t perf_buffer_status;   // 0 = not full, 1 = full
+    volatile uint32_t physical_core_id;     // Physical core ID
 } __attribute__((aligned(64)));
 
 /**
@@ -185,9 +189,11 @@ public:
     // Profiling support
     bool enable_profiling;                  // Enable profiling flag
     uint64_t perf_data_base;                // Performance data shared memory base address (device-side)
-private:
+
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
+
+private:
     int next_task_id;               // Next available task ID
 
     // Initial ready tasks (computed once, read-only after)

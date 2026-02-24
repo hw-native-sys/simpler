@@ -1461,15 +1461,12 @@ void AicpuExecutor::flush_performance_buffers(Runtime* runtime, int thread_idx,
  * 3. Execute tasks on managed cores
  * 4. Cleanup when last thread finishes
  *
- * @param runtime Pointer to Runtime structure containing:
- *                - workers[]: handshake buffers for AICPU-AICore communication
- *                - worker_count, sche_cpu_num: execution parameters
- *                - PTO2 shared memory for task graph
+ * @param runtime Pointer to Runtime structure
  * @return 0 on success, non-zero on error
  */
 extern "C" int aicpu_execute(Runtime* runtime) {
     if (runtime == nullptr) {
-        DEV_ERROR("%s", "Invalid runtime argument: null pointer");
+        DEV_ERROR("%s", "Invalid argument: null Runtime pointer");
         return -1;
     }
 

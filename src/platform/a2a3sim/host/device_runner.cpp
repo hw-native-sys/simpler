@@ -18,7 +18,8 @@
 
 // Function pointer types for dynamically loaded executors
 typedef int (*aicpu_execute_func_t)(Runtime* runtime);
-typedef void (*aicore_execute_func_t)(Runtime* runtime, int block_idx, CoreType core_type);
+typedef void (*aicore_execute_func_t)(Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs);
+typedef void (*set_platform_regs_func_t)(uint64_t regs);
 
 // =============================================================================
 // DeviceRunner Implementation
@@ -69,6 +70,13 @@ int DeviceRunner::ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_bi
             LOG_ERROR("dlsym failed for aicpu_execute: %s", dlerror());
             return -1;
         }
+
+        set_platform_regs_func_ = reinterpret_cast<void(*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_regs"));
+        if (set_platform_regs_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_regs: %s", dlerror());
+            return -1;
+        }
+
         LOG_INFO("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
     }
 
@@ -89,7 +97,7 @@ int DeviceRunner::ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_bi
             return -1;
         }
 
-        aicore_execute_func_ = reinterpret_cast<void(*)(Runtime*, int, CoreType)>(dlsym(aicore_so_handle_, "aicore_execute_wrapper"));
+        aicore_execute_func_ = reinterpret_cast<void(*)(Runtime*, int, CoreType, uint32_t, uint64_t)>(dlsym(aicore_so_handle_, "aicore_execute_wrapper"));
         if (aicore_execute_func_ == nullptr) {
             LOG_ERROR("dlsym failed for aicore_execute_wrapper: %s", dlerror());
             return -1;
@@ -212,11 +220,38 @@ int DeviceRunner::run(Runtime& runtime,
         }
     }
 
+    // Allocate simulated register blocks for all AICore cores
+    size_t total_reg_size = num_aicore * SIM_REG_BLOCK_SIZE;
+    void* reg_blocks = mem_alloc_.alloc(total_reg_size);
+    if (reg_blocks == nullptr) {
+        LOG_ERROR("Failed to allocate simulated register memory (%zu bytes)", total_reg_size);
+        return -1;
+    }
+    std::memset(reg_blocks, 0, total_reg_size);
+
+    // Build array of per-core register base addresses
+    size_t regs_array_size = num_aicore * sizeof(uint64_t);
+    uint64_t* regs_array = reinterpret_cast<uint64_t*>(mem_alloc_.alloc(regs_array_size));
+    if (regs_array == nullptr) {
+        LOG_ERROR("Failed to allocate register address array");
+        return -1;
+    }
+    for (int i = 0; i < num_aicore; i++) {
+        regs_array[i] = reinterpret_cast<uint64_t>(
+            static_cast<uint8_t*>(reg_blocks) + i * SIM_REG_BLOCK_SIZE);
+    }
+    kernel_args_.regs = reinterpret_cast<uint64_t>(regs_array);
+
+    LOG_INFO("Allocated simulated registers: %d cores x 0x%x bytes", num_aicore, SIM_REG_BLOCK_SIZE);
+
     // Check if executors are loaded
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
+
+    // Set platform regs in the AICPU .so before launching threads
+    set_platform_regs_func_(kernel_args_.regs);
 
     // Launch AICPU threads
     LOG_INFO("Launching %d AICPU thread(s)", launch_aicpu_num);
@@ -232,8 +267,9 @@ int DeviceRunner::run(Runtime& runtime,
     std::vector<std::thread> aicore_threads;
     for (int i = 0; i < num_aicore; i++) {
         CoreType core_type = runtime.workers[i].core_type;
-        aicore_threads.emplace_back([this, &runtime, i, core_type]() {
-            aicore_execute_func_(&runtime, i, core_type);
+        uint32_t physical_core_id = static_cast<uint32_t>(i);
+        aicore_threads.emplace_back([this, &runtime, i, core_type, physical_core_id]() {
+            aicore_execute_func_(&runtime, i, core_type, physical_core_id, kernel_args_.regs);
         });
     }
 

@@ -1,9 +1,9 @@
-#include <cstdint>
 #include <cstdio>
 
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
 #include "aicpu/device_log.h"
+#include "aicpu/platform_regs.h"
 
 // Forward declaration (no need for full runtime.h)
 class Runtime;
@@ -68,8 +68,11 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
         return -1;
     }
 
+    // Store platform regs before calling aicpu_execute
+    set_platform_regs(k_args->regs);
+
     LOG_INFO("%s", "DynTileFwkBackendKernelServer: Calling aicpu_execute with Runtime");
-    int rc = aicpu_execute(runtime);  // Pass Runtime* instead of KernelArgs*
+    int rc = aicpu_execute(runtime);
     if (rc != 0) {
         LOG_ERROR("DynTileFwkBackendKernelServer: aicpu_execute failed with rc=%d", rc);
         return rc;

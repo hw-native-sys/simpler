@@ -11,6 +11,7 @@
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
+#include "host/host_regs.h"  // Register address retrieval
 
 // =============================================================================
 // Lazy-loaded HAL (ascend_hal) for profiling host-register only
@@ -323,6 +324,13 @@ int DeviceRunner::run(Runtime& runtime,
     runtime.worker_count = num_aicore;
     worker_count_ = num_aicore;  // Store for print_handshake_results in destructor
     runtime.sche_cpu_num = launch_aicpu_num;
+
+    // Get AICore register addresses for register-based task dispatch
+    rc = init_aicore_register_addresses(&kernel_args_.args.regs, static_cast<uint64_t>(device_id), mem_alloc_);
+    if (rc != 0) {
+        LOG_ERROR("init_aicore_register_addresses failed: %d", rc);
+        return rc;
+    }
 
     // Calculate number of AIC cores (1/3 of total)
     int num_aic = block_dim;  // Round up for 1/3

@@ -910,15 +910,12 @@ void AicpuExecutor::diagnose_stuck_state(
  * 3. Execute tasks on managed cores
  * 4. Cleanup when last thread finishes
  *
- * @param runtime Pointer to Runtime structure containing:
- *                - workers[]: handshake buffers for AICPU-AICore communication
- *                - block_dim, sche_cpu_num: execution parameters
- *                - tasks[]: task runtime to execute
+ * @param runtime Pointer to Runtime structure
  * @return 0 on success, non-zero on error
  */
 extern "C" int aicpu_execute(Runtime* runtime) {
     if (runtime == nullptr) {
-        DEV_ERROR("%s", "Invalid runtime argument: null pointer");
+        DEV_ERROR("%s", "Invalid argument: null Runtime pointer");
         return -1;
     }
 

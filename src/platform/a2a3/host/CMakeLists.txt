@@ -24,6 +24,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/memory_allocator.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/platform_compile_info.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/host_log.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_log_host.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/performance_collector.cpp"

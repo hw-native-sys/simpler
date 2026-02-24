@@ -14,6 +14,9 @@ venv/
 *bak
 outputs
 
+# claude local settings
+.claude/settings.local.json
+
 # Git cloned dependencies (not tracked in repo)
 examples/scripts/_deps/
 

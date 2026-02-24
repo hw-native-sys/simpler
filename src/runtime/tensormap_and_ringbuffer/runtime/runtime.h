@@ -80,6 +80,7 @@ struct Handshake {
     volatile CoreType core_type;           // Core type: CoreType::AIC or CoreType::AIV
     volatile uint64_t perf_records_addr;   // Performance records address
     volatile uint32_t perf_buffer_status;  // 0 = not full, 1 == full
+    volatile uint32_t physical_core_id;     // Physical core ID
 } __attribute__((aligned(64)));
 
 /**
