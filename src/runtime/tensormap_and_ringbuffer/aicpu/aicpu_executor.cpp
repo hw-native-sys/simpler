@@ -26,6 +26,7 @@
 #include "pto_runtime2_types.h"
 
 // Performance profiling headers
+#include "aicpu/performance_collector_aicpu.h"
 #include "common/perf_profiling.h"
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
@@ -115,7 +116,6 @@ struct AicpuExecutor {
     std::atomic<bool> pto2_init_done_{false};
     std::atomic<bool> pto2_init_complete_{false};  // init block finished; others wait for this
     std::atomic<int> next_scan_index_{0};
-    std::atomic<bool> perf_init_done_{false};
     std::atomic<bool> sm_header_ready_{false};  // Thread 3 sets after SM header init
 
     // Orchestrator ready queue pointers (set by Thread 3, read by scheduler threads)
@@ -129,8 +129,8 @@ struct AicpuExecutor {
     char orch_so_path_[256]{};  // Path to orchestration SO file for cleanup
 
     // ===== Performance profiling state =====
-    std::mutex perf_ready_queue_mutex_;  // Protects enqueue_ready_buffer operations
     uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
+    uint32_t core_dispatch_counts_[RUNTIME_MAX_WORKER]; // Per-core total dispatched task counter (for buffer management)
 
     // ===== Methods =====
     int init(Runtime* runtime);
@@ -142,23 +142,6 @@ struct AicpuExecutor {
     void deinit();
     void diagnose_stuck_state(Runtime* runtime, int thread_idx, const int* cur_thread_cores,
                               int core_num, Handshake* hank);
-
-    // Performance profiling methods
-    void init_performance_profiling(Runtime* runtime);
-    void complete_perf_records(Runtime* runtime, PerfBuffer* perf_buf,
-                               PTO2TaskDescriptor* task_descriptors,
-                               PTO2DepListEntry* dep_list_pool,
-                               int32_t window_mask);
-    void switch_perf_buffer(Runtime* runtime, int core_id, int thread_idx,
-                           PTO2TaskDescriptor* task_descriptors,
-                           PTO2DepListEntry* dep_list_pool,
-                           int32_t window_mask);
-    int enqueue_ready_buffer(PerfDataHeader* header, uint32_t core_index, uint32_t buffer_id);
-    void flush_performance_buffers(Runtime* runtime, int thread_idx,
-                                  const int* cur_thread_cores, int core_num,
-                                  PTO2TaskDescriptor* task_descriptors,
-                                  PTO2DepListEntry* dep_list_pool,
-                                  int32_t window_mask);
 };
 
 static AicpuExecutor g_aicpu_executor;
@@ -324,9 +307,10 @@ int AicpuExecutor::init(Runtime* runtime) {
     ready_queue_aiv_head_ = 0;
     ready_queue_aiv_tail_ = 0;
 
-    // Reset per-core dispatch timestamps
+    // Reset per-core dispatch timestamps and task counters
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
+        core_dispatch_counts_[i] = 0;
     }
 
     DEV_INFO("Init: PTO2 mode, task count from shared memory");
@@ -431,7 +415,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         // Assign perf buffers to cores early so profiling captures all tasks
         // (total_tasks written to header later when orchestrator completes)
         if (runtime->enable_profiling) {
-            init_performance_profiling(runtime);
+            perf_aicpu_init_profiling(runtime);
         }
 
         DEV_INFO("Thread %d: one-time init done", thread_idx);
@@ -449,6 +433,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     const int MAX_IDLE_ITERATIONS = 50000000;
     const int WARN_INTERVAL = 1000000;
     bool profiling_enabled = runtime->enable_profiling;
+    int32_t last_reported_task_count = 0;
 
     // Scheduler profiling counters
 #if PTO2_ORCH_PROFILING
@@ -485,22 +470,20 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
         bool made_progress = false;
 
-        // Update perf header total_tasks after orchestrator sets the final count
-        if (profiling_enabled && orch_done && !perf_init_done_.load(std::memory_order_acquire)) {
-            bool expected = false;
-            if (perf_init_done_.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) {
-                void* perf_base = (void*)runtime->perf_data_base;
-                if (perf_base) {
-                    PerfDataHeader* perf_hdr = get_perf_header(perf_base);
-                    perf_hdr->total_tasks = static_cast<uint32_t>(task_count);
-                    wmb();
-                }
-            }
-        }
-
         // Incremental scan: discover root tasks (fanin_count == 0)
         {
             int32_t visible = __atomic_load_n(&header->current_task_index, __ATOMIC_ACQUIRE);
+
+            // Update perf header total_tasks if visible tasks have changed
+            if (profiling_enabled && visible > 0 && visible != last_reported_task_count) {
+                perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(visible));
+
+                DEV_INFO("Thread %d: Updated perf total_tasks to %d%s",
+                            thread_idx, visible, orch_done ? " (final)" : "");
+
+                last_reported_task_count = visible;
+            }
+
             while (true) {
                 int32_t idx = next_scan_index_.load(std::memory_order_acquire);
                 if (idx >= visible) break;
@@ -584,17 +567,11 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                     if (count > 0) {
                         PerfRecord* record = &perf_buf->records[count - 1];
                         if (record->task_id == static_cast<uint32_t>(payload->task_id)) {
-                            record->dispatch_time = dispatch_timestamps_[core_id];
-                            record->finish_time = finish_ts;
-                            wmb();
+                            perf_aicpu_record_dispatch_and_finish_time(record,
+                                                                        dispatch_timestamps_[core_id],
+                                                                        finish_ts);
                         }
                     }
-                }
-
-                // Check and switch performance buffer if needed
-                if (profiling_enabled && h->perf_buffer_status == 1) {
-                    switch_perf_buffer(runtime, core_id, thread_idx,
-                                     task_descriptors, dep_list_pool, window_mask);
                 }
 
                 int32_t task_id = payload->task_id;
@@ -670,13 +647,21 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                         build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
                         h->task = reinterpret_cast<uint64_t>(payload);
-                        if (runtime->enable_profiling) {
+                        // Performance profiling: check if buffer needs switching
+                        if (profiling_enabled) {
                             dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                            if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE) {
+                                perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
+                                core_dispatch_counts_[core_id] = 0;
+                            }
+                            core_dispatch_counts_[core_id]++;
                         }
                         h->task_status = 1;
                         cur_thread_tasks_in_flight++;
                         made_progress = true;
                         DEV_DEBUG("Thread %d: Dispatching PTO2 task %d to core %d", thread_idx, task_id, core_id);
+
+                        
                     }
                 }
             }
@@ -741,8 +726,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
     // Flush performance buffers for cores managed by this thread
     if (profiling_enabled) {
-        flush_performance_buffers(runtime, thread_idx, cur_thread_cores, core_num,
-                                 task_descriptors, dep_list_pool, window_mask);
+        perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, core_num);
     }
 
     return cur_thread_completed;
@@ -1004,9 +988,10 @@ void AicpuExecutor::deinit() {
     ready_queue_aiv_head_ = 0;
     ready_queue_aiv_tail_ = 0;
 
-    // Reset per-core dispatch timestamps
+    // Reset per-core dispatch timestamps and task counters
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
+        core_dispatch_counts_[i] = 0;
     }
 
     completed_tasks_.store(0, std::memory_order_release);
@@ -1016,7 +1001,6 @@ void AicpuExecutor::deinit() {
     pto2_init_done_.store(false, std::memory_order_release);
     pto2_init_complete_.store(false, std::memory_order_release);
     next_scan_index_.store(0, std::memory_order_release);
-    perf_init_done_.store(false, std::memory_order_release);
     sm_header_ready_.store(false, std::memory_order_release);
 
     // Reset core discovery state
@@ -1088,365 +1072,6 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,
     }
 
     DEV_ALWAYS("========== END DIAGNOSTIC ==========");
-}
-
-// =============================================================================
-// Performance Profiling Methods
-// =============================================================================
-
-/**
- * Initialize performance profiling for all cores
- *
- * Called once in resolve_and_dispatch_pto2() after one-time init.
- * Assigns buffer1 to each core and sets initial states.
- * Also writes total_tasks to PerfDataHeader for Host access.
- */
-void AicpuExecutor::init_performance_profiling(Runtime* runtime) {
-    void* perf_base = (void*)runtime->perf_data_base;
-    if (perf_base == nullptr) {
-        LOG_ERROR("perf_data_base is NULL, cannot initialize profiling");
-        return;
-    }
-
-    PerfDataHeader* header = get_perf_header(perf_base);
-    DoubleBuffer* buffers = get_double_buffers(perf_base);
-
-    // Write total_tasks to shared memory header for Host access
-    // This is necessary because Runtime object is not copied back from Device to Host
-    int32_t task_count = total_tasks_.load(std::memory_order_acquire);
-    header->total_tasks = static_cast<uint32_t>(task_count);
-    wmb();  // Ensure total_tasks is visible to Host
-
-    LOG_INFO("Initializing performance profiling for %d cores, total_tasks=%d", runtime->worker_count, task_count);
-
-    // Assign initial buffer (buffer1) to each AICore
-    for (int i = 0; i < runtime->worker_count; i++) {
-        Handshake* h = &runtime->workers[i];
-        DoubleBuffer* db = &buffers[i];
-
-        // Read memory barrier before checking buffer1 status
-        rmb();
-        if (db->buffer1_status != BufferStatus::IDLE) {
-            LOG_WARN("Core %d: buffer1 not idle (status=%u)", i, static_cast<uint32_t>(db->buffer1_status));
-        }
-
-        // Assign buffer1 to AICore
-        h->perf_records_addr = (uint64_t)&db->buffer1;
-        h->perf_buffer_status = 0;  // 0 = can write
-
-        // Write barrier: ensure writes visible to AICore before changing status
-        wmb();
-        db->buffer1_status = BufferStatus::WRITING;
-
-        LOG_INFO("Core %d: assigned buffer1 (addr=0x%lx)", i, h->perf_records_addr);
-    }
-
-    LOG_INFO("Performance profiling initialized for %d cores", runtime->worker_count);
-}
-
-/**
- * Complete performance records by filling fanout information
- *
- * This function is called by AICPU to fill in fanout information that
- * was not recorded by AICore. Duration is NOT calculated here - it will
- * be calculated by Host when printing/processing the data.
- *
- * Key difference from host_build_graph: fanout is stored as a linked list
- * in PTO2 shared memory, not as an array in Task structure.
- *
- * Called in two places:
- * 1. switch_perf_buffer() - when switching buffers during normal operation
- * 2. flush_performance_buffers() - when flushing buffers during shutdown
- *
- * @param runtime Runtime instance (unused but kept for API consistency)
- * @param perf_buf PerfBuffer to be completed with fanout data
- * @param task_descriptors Pointer to task descriptor array in shared memory
- * @param dep_list_pool Pointer to dependency list pool in shared memory
- * @param window_mask Mask for computing task slot (window_size - 1)
- */
-void AicpuExecutor::complete_perf_records(Runtime* runtime, PerfBuffer* perf_buf,
-                                          PTO2TaskDescriptor* task_descriptors,
-                                          PTO2DepListEntry* dep_list_pool,
-                                          int32_t window_mask) {
-    (void)runtime;  // Unused parameter
-    uint32_t count = perf_buf->count;
-
-    for (uint32_t i = 0; i < count; i++) {
-        PerfRecord* record = &perf_buf->records[i];
-        int32_t task_id = record->task_id;
-
-        // Get TaskDescriptor from PTO2 shared memory
-        int32_t slot = task_id & window_mask;
-        PTO2TaskDescriptor* task = &task_descriptors[slot];
-
-        // Fill fanout information by traversing the linked list
-        record->fanout_count = 0;
-        int32_t fanout_offset = task->fanout_head;
-
-        while (fanout_offset != 0 && record->fanout_count < RUNTIME_MAX_FANOUT) {
-            PTO2DepListEntry* entry = &dep_list_pool[fanout_offset];
-            record->fanout[record->fanout_count++] = entry->task_id;
-            fanout_offset = entry->next_offset;
-        }
-    }
-
-    // Write memory barrier: ensure fanout data is visible to Host
-    wmb();
-}
-
-/**
- * Switch performance buffer for a core
- *
- * Called when perf_buffer_status == 1 (buffer full).
- * Determines which buffer is full by address comparison,
- * then switches to the alternate buffer if available.
- *
- * @param runtime Runtime instance
- * @param core_id AICore ID
- * @param thread_idx AICPU thread ID (for logging)
- * @param task_descriptors Pointer to task descriptor array in shared memory
- * @param dep_list_pool Pointer to dependency list pool in shared memory
- * @param window_mask Mask for computing task slot (window_size - 1)
- */
-void AicpuExecutor::switch_perf_buffer(Runtime* runtime, int core_id, int thread_idx,
-                                       PTO2TaskDescriptor* task_descriptors,
-                                       PTO2DepListEntry* dep_list_pool,
-                                       int32_t window_mask) {
-    void* perf_base = (void*)runtime->perf_data_base;
-    if (perf_base == nullptr) {
-        return;
-    }
-
-    Handshake* h = &runtime->workers[core_id];
-    PerfDataHeader* header = get_perf_header(perf_base);
-    DoubleBuffer* db = get_core_double_buffer(perf_base, core_id);
-
-    // Determine if current buffer is buffer1 or buffer2 by address comparison
-    uint64_t current_addr = h->perf_records_addr;
-    uint64_t buffer1_addr = (uint64_t)&db->buffer1;
-    uint64_t buffer2_addr = (uint64_t)&db->buffer2;
-
-    uint32_t full_buffer_id = 0;
-    PerfBuffer* full_buf = nullptr;
-    volatile BufferStatus* full_status_ptr = nullptr;
-    PerfBuffer* alternate_buf = nullptr;
-    volatile BufferStatus* alternate_status_ptr = nullptr;
-    uint32_t alternate_buffer_id = 0;
-
-    if (current_addr == buffer1_addr) {
-        // Current buffer is buffer1, it's full
-        full_buffer_id = 1;
-        full_buf = &db->buffer1;
-        full_status_ptr = &db->buffer1_status;
-        alternate_buf = &db->buffer2;
-        alternate_status_ptr = &db->buffer2_status;
-        alternate_buffer_id = 2;
-    } else if (current_addr == buffer2_addr) {
-        // Current buffer is buffer2, it's full
-        full_buffer_id = 2;
-        full_buf = &db->buffer2;
-        full_status_ptr = &db->buffer2_status;
-        alternate_buf = &db->buffer1;
-        alternate_status_ptr = &db->buffer1_status;
-        alternate_buffer_id = 1;
-    } else {
-        LOG_ERROR("Thread %d: Core %d has invalid perf_records_addr=0x%lx",
-                  thread_idx, core_id, current_addr);
-        return;
-    }
-
-    LOG_INFO("Thread %d: Core %d buffer%u is full (count=%u)",
-             thread_idx, core_id, full_buffer_id, full_buf->count);
-
-    // Complete performance records by filling fanout information
-    // (called before checking alternate buffer status to make data ready earlier)
-    complete_perf_records(runtime, full_buf, task_descriptors, dep_list_pool, window_mask);
-
-    // Read alternate buffer status (rmb needed, since status is modified by Host)
-    rmb();
-
-    BufferStatus alternate_status = *alternate_status_ptr;
-
-    // If alternate buffer is not idle, spin wait for Host to finish reading
-    if (alternate_status != BufferStatus::IDLE) {
-        LOG_WARN("Thread %d: Core %d cannot switch, buffer%u status=%u, spinning until Host reads it",
-                 thread_idx, core_id, alternate_buffer_id, static_cast<uint32_t>(alternate_status));
-
-        // Spin wait: continuously check alternate buffer status until Host sets it to IDLE
-        while (true) {
-            rmb();  // Read barrier: ensure reading latest status modified by Host
-            alternate_status = *alternate_status_ptr;
-
-            if (alternate_status == BufferStatus::IDLE) {
-                LOG_INFO("Thread %d: Core %d buffer%u now idle, proceeding with switch",
-                         thread_idx, core_id, alternate_buffer_id);
-                break;
-            }
-        }
-    }
-
-    // Alternate buffer is idle, can switch
-
-    // Step 1: Enqueue full buffer to ready queue
-    int enqueue_result = enqueue_ready_buffer(header, core_id, full_buffer_id);
-    if (enqueue_result != 0) {
-        LOG_WARN("Thread %d: Core %d failed to enqueue buffer%u (queue full)",
-                 thread_idx, core_id, full_buffer_id);
-        return;
-    }
-
-    // Step 2: Change full buffer status to READY (visible to Host)
-    *full_status_ptr = BufferStatus::READY;
-    // Step 3: Change alternate buffer status to WRITING (visible to Host)
-    *alternate_status_ptr = BufferStatus::WRITING;
-    wmb();  // Write barrier: ensure status changes visible to Host
-
-    LOG_INFO("Thread %d: Core %d enqueued buffer%u", thread_idx, core_id, full_buffer_id);
-
-    // Step 4: Switch perf_records_addr to alternate buffer (visible to AICore)
-    h->perf_records_addr = (uint64_t)alternate_buf;
-
-    // Step 5: Reset perf_buffer_status = 0 (notify AICore can continue writing)
-    h->perf_buffer_status = 0;
-
-    LOG_INFO("Thread %d: Core %d switched to buffer%u (status=0)",
-             thread_idx, core_id, alternate_buffer_id);
-}
-
-/**
- * Enqueue a ready buffer to the queue
- *
- * Thread-safe: Uses mutex to protect queue operations since multiple
- * AICPU threads may enqueue concurrently.
- *
- * @return 0=success, -1=queue full
- */
-int AicpuExecutor::enqueue_ready_buffer(PerfDataHeader* header, uint32_t core_index, uint32_t buffer_id) {
-    std::lock_guard<std::mutex> lock(perf_ready_queue_mutex_);
-
-    uint32_t capacity = PLATFORM_PROF_READYQUEUE_SIZE;
-
-    // Read barrier: ensure reading latest tail value
-    rmb();
-
-    uint32_t current_tail = header->queue_tail;
-    uint32_t current_head = header->queue_head;
-
-    // Check if queue is full
-    uint32_t next_tail = (current_tail + 1) % capacity;
-    if (next_tail == current_head) {
-        return -1;  // Queue full
-    }
-
-    // Enqueue entry
-    header->queue[current_tail].core_index = core_index;
-    header->queue[current_tail].buffer_id = buffer_id;
-    header->queue_tail = next_tail;
-
-    // Write memory barrier: ensure data written before updating tail, visible to Host
-    wmb();
-
-    return 0;
-}
-
-/**
- * Flush performance buffers for cores managed by this thread
- *
- * Called after shutdown_aicore to ensure all buffers with data
- * (even if not full) are enqueued for Host collection.
- *
- * For each core managed by this thread:
- * - Check which buffer is currently assigned (via perf_records_addr)
- * - If buffer has data (count > 0), mark it as READY and enqueue
- *
- * @param runtime Runtime instance
- * @param thread_idx Current thread index
- * @param cur_thread_cores Array of core IDs managed by this thread
- * @param core_num Number of cores managed by this thread
- * @param task_descriptors Pointer to task descriptor array in shared memory
- * @param dep_list_pool Pointer to dependency list pool in shared memory
- * @param window_mask Mask for computing task slot (window_size - 1)
- */
-void AicpuExecutor::flush_performance_buffers(Runtime* runtime, int thread_idx,
-                                              const int* cur_thread_cores, int core_num,
-                                              PTO2TaskDescriptor* task_descriptors,
-                                              PTO2DepListEntry* dep_list_pool,
-                                              int32_t window_mask) {
-    if (!runtime->enable_profiling) {
-        return;
-    }
-
-    void* perf_base = (void*)runtime->perf_data_base;
-    if (perf_base == nullptr) {
-        return;
-    }
-
-    PerfDataHeader* header = get_perf_header(perf_base);
-    DoubleBuffer* buffers = get_double_buffers(perf_base);
-
-    LOG_INFO("Thread %d: Flushing performance buffers for %d cores", thread_idx, core_num);
-
-    int flushed_count = 0;
-
-    // Only process cores managed by this thread
-    for (int i = 0; i < core_num; i++) {
-        int core_id = cur_thread_cores[i];
-        Handshake* h = &runtime->workers[core_id];
-        DoubleBuffer* db = &buffers[core_id];
-
-        // Read current buffer address
-        uint64_t current_addr = h->perf_records_addr;
-        if (current_addr == 0) {
-            continue;  // No buffer assigned
-        }
-
-        // Determine which buffer is current
-        uint64_t buf1_addr = (uint64_t)&db->buffer1;
-        uint64_t buf2_addr = (uint64_t)&db->buffer2;
-
-        PerfBuffer* current_buf = nullptr;
-        volatile BufferStatus* current_status = nullptr;
-        uint32_t buffer_id = 0;
-
-        if (current_addr == buf1_addr) {
-            current_buf = &db->buffer1;
-            current_status = &db->buffer1_status;
-            buffer_id = 1;
-        } else if (current_addr == buf2_addr) {
-            current_buf = &db->buffer2;
-            current_status = &db->buffer2_status;
-            buffer_id = 2;
-        } else {
-            LOG_WARN("Thread %d: Core %d perf_records_addr=0x%lx doesn't match buffer1=0x%lx or buffer2=0x%lx",
-                     thread_idx, core_id, current_addr, buf1_addr, buf2_addr);
-            continue;
-        }
-
-        // Read buffer count with memory barrier
-        rmb();
-        uint32_t count = current_buf->count;
-
-        // If buffer has data, enqueue it
-        if (count > 0) {
-            // Complete performance records by filling fanout information before flush
-            complete_perf_records(runtime, current_buf, task_descriptors, dep_list_pool, window_mask);
-
-            // Mark buffer as READY
-            *current_status = BufferStatus::READY;
-            wmb();
-
-            // Enqueue to ready queue
-            int rc = enqueue_ready_buffer(header, core_id, buffer_id);
-            if (rc == 0) {
-                LOG_INFO("Thread %d: Core %d flushed buffer%d with %u records", thread_idx, core_id, buffer_id, count);
-                flushed_count++;
-            } else {
-                LOG_WARN("Thread %d: Core %d failed to enqueue buffer%d (queue full)", thread_idx, core_id, buffer_id);
-            }
-        }
-    }
-
-    LOG_INFO("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
 // ===== Public Entry Point =====

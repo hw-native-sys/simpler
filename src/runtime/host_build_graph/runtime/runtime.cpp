@@ -215,3 +215,28 @@ int Runtime::get_tensor_pair_count() const {
 void Runtime::clear_tensor_pairs() {
     tensor_pair_count = 0;
 }
+
+// =============================================================================
+// Performance Profiling
+// =============================================================================
+
+void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
+    uint32_t count = perf_buf->count;
+
+    for (uint32_t i = 0; i < count; i++) {
+        PerfRecord* record = &perf_buf->records[i];
+        uint32_t task_id = record->task_id;
+
+        // Query Task by task_id (O(1) array indexing)
+        Task* task = get_task(task_id);
+        if (task != nullptr) {
+            record->fanout_count = task->fanout_count;
+
+            for (int32_t j = 0; j < task->fanout_count; j++) {
+                record->fanout[j] = task->fanout[j];
+            }
+        } else {
+            record->fanout_count = 0;
+        }
+    }
+}

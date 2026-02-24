@@ -26,6 +26,7 @@
 #include <atomic>
 
 #include "common/core_type.h"
+#include "common/perf_profiling.h"
 #include "common/platform_config.h"
 
 // =============================================================================
@@ -512,6 +513,20 @@ public:
      * Clear all recorded device allocations.
      */
     void clear_device_allocs();
+
+    // =========================================================================
+    // Performance Profiling
+    // =========================================================================
+
+    /**
+     * Fill fanout information for performance records (stub for API compatibility)
+     *
+     * This is a no-op for aicpu_build_graph. Task graph is managed by the
+     * AICPU orchestration plugin, which handles performance record completion.
+     *
+     * @param perf_buf Performance buffer containing records to complete
+     */
+    void complete_perf_records(PerfBuffer* perf_buf);
 
     // =========================================================================
     // Host API (host-only, not copied to device)

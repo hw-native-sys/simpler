@@ -65,4 +65,17 @@ __aicore__ inline uint32_t get_physical_core_id() {
     return static_cast<uint32_t>(get_coreid()) & AICORE_COREID_MASK;
 }
 
+// =============================================================================
+// System Counter
+// =============================================================================
+
+/**
+ * Get AICore system counter
+ *
+ * @return Hardware counter value (ticks)
+ */
+__aicore__ __attribute__((always_inline)) inline uint64_t get_sys_cnt_aicore() {
+    return get_sys_cnt();
+}
+
 #endif  // PLATFORM_A2A3_AICORE_INNER_KERNEL_H_

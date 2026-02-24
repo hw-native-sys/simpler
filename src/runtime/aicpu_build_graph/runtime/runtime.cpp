@@ -295,3 +295,14 @@ int Runtime::get_device_alloc_count() const { return device_alloc_count; }
 void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }
 
 void Runtime::clear_device_allocs() { device_alloc_count = 0; }
+
+// =============================================================================
+// Performance Profiling
+// =============================================================================
+
+void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
+    // No-op for aicpu_build_graph.
+    // Task graph is managed by AICPU orchestration plugin, which handles
+    // performance record completion.
+    (void)perf_buf;
+}

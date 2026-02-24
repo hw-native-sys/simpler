@@ -44,6 +44,9 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
     // All kernels have signature: void kernel(__gm__ int64_t* args)
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)task->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
+
+    // Ensure all memory writes are visible to other cores
+    pipe_barrier(PIPE_ALL);
 }
 
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type) {

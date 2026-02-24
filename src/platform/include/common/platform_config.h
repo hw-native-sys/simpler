@@ -76,7 +76,7 @@ constexpr int PLATFORM_MAX_CORES =
  * Performance buffer capacity for each double buffer
  * Number of PerfRecord entries per buffer (ping or pong)
  */
-constexpr int PLATFORM_PROF_BUFFER_SIZE = 20;
+constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 
 /**
  * Ready queue capacity for performance data collection
@@ -94,7 +94,7 @@ constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 50000000;  // 50 MHz
 /**
  * Timeout duration for performance data collection (seconds)
  */
-constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 2;
+constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 30;
 
 /**
  * Number of empty polling iterations before checking timeout

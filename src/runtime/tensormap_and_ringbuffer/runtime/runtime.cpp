@@ -6,6 +6,7 @@
  */
 
 #include "runtime.h"
+#include "pto_shared_memory.h"
 
 // =============================================================================
 // Constructor
@@ -125,5 +126,47 @@ uint64_t Runtime::get_function_bin_addr(int func_id) const {
 void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
     if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
         func_id_to_addr_[func_id] = addr;
+    }
+}
+
+// =============================================================================
+// Performance Profiling
+// =============================================================================
+
+void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
+    // Get PTO2 shared memory context
+    void* sm_base = get_pto2_gm_sm_ptr();
+    if (sm_base == nullptr) {
+        // No PTO2 context, cannot complete records
+        return;
+    }
+
+    // Get PTO2 data structures
+    PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
+    PTO2TaskDescriptor* task_descriptors = reinterpret_cast<PTO2TaskDescriptor*>(
+        static_cast<char*>(sm_base) + header->task_descriptors_offset);
+    PTO2DepListEntry* dep_list_pool = reinterpret_cast<PTO2DepListEntry*>(
+        static_cast<char*>(sm_base) + header->dep_list_pool_offset);
+    int32_t window_mask = header->task_window_size - 1;
+
+    uint32_t count = perf_buf->count;
+
+    for (uint32_t i = 0; i < count; i++) {
+        PerfRecord* record = &perf_buf->records[i];
+        int32_t task_id = record->task_id;
+
+        // Get TaskDescriptor from PTO2 shared memory
+        int32_t slot = task_id & window_mask;
+        PTO2TaskDescriptor* task = &task_descriptors[slot];
+
+        // Fill fanout information by traversing the linked list
+        record->fanout_count = 0;
+        int32_t fanout_offset = task->fanout_head;
+
+        while (fanout_offset != 0 && record->fanout_count < RUNTIME_MAX_FANOUT) {
+            PTO2DepListEntry* entry = &dep_list_pool[fanout_offset];
+            record->fanout[record->fanout_count++] = entry->task_id;
+            fanout_offset = entry->next_offset;
+        }
     }
 }

@@ -111,26 +111,67 @@ def print_task_statistics(tasks, func_id_to_name=None):
     """
     from collections import defaultdict
 
-    # Group tasks by func_id
-    func_stats = defaultdict(list)
+    # Group tasks by func_id with extended metrics
+    func_stats = defaultdict(lambda: {
+        'durations': [],
+        'head_overheads': [],
+        'tail_overheads': [],
+        'schedule_times': [],
+        'total_exec_time': 0.0,
+        'total_schedule_time': 0.0
+    })
+
+    # Track global min dispatch and max finish times
+    min_dispatch_time = float('inf')
+    max_finish_time = float('-inf')
+
     for task in tasks:
         func_id = task['func_id']
         duration = task['duration_us']
-        func_stats[func_id].append(duration)
+        func_stats[func_id]['durations'].append(duration)
+
+        # Calculate new metrics if dispatch_time_us and finish_time_us are available
+        if 'dispatch_time_us' in task and 'finish_time_us' in task:
+            dispatch_time = task['dispatch_time_us']
+            finish_time = task['finish_time_us']
+            start_time = task['start_time_us']
+            end_time = task['end_time_us']
+
+            # Head overhead: start_time_us - dispatch_time_us
+            head_overhead = start_time - dispatch_time
+            func_stats[func_id]['head_overheads'].append(head_overhead)
+
+            # Tail overhead: finish_time_us - end_time_us
+            tail_overhead = finish_time - end_time
+            func_stats[func_id]['tail_overheads'].append(tail_overhead)
+
+            # Schedule time: finish_time_us - dispatch_time_us
+            schedule_time = finish_time - dispatch_time
+            func_stats[func_id]['schedule_times'].append(schedule_time)
+
+            # Accumulate execution time and schedule time for ratio calculation
+            func_stats[func_id]['total_exec_time'] += duration
+            func_stats[func_id]['total_schedule_time'] += schedule_time
+
+            # Track global times
+            min_dispatch_time = min(min_dispatch_time, dispatch_time)
+            max_finish_time = max(max_finish_time, finish_time)
 
     # Print statistics
-    print("\n" + "=" * 104)
+    print("\n" + "=" * 160)
     print("Task Statistics by Function")
-    print("=" * 104)
-    print(f"{'Func ID':<8} {'Func Name':<20} {'Count':>8} {'Total (us)':>14} {'Avg (us)':>12} {'Min (us)':>12} {'Max (us)':>12}")
-    print("-" * 104)
+    print("=" * 160)
+    print(f"{'Func_ID':<8} {'Func_Name':<12} {'Count':^6} {'Total_Exec/Sched(us)':^25} {'Avg_Exec/Sched(us)':^23} "
+          f"{'Min_Exec/Sched(us)':^23} {'Max_Exec/Sched(us)':^23} {'Avg_Head/Tail_OH(us)':^23} {'Exec_%':^8}")
+    print("-" * 160)
 
     # Sort by func_id for consistent output
     total_count = 0
     total_duration = 0.0
 
     for func_id in sorted(func_stats.keys()):
-        durations = func_stats[func_id]
+        stats = func_stats[func_id]
+        durations = stats['durations']
         count = len(durations)
         sum_duration = sum(durations)
         avg_duration = sum_duration / count
@@ -147,12 +188,42 @@ def print_task_statistics(tasks, func_id_to_name=None):
         else:
             func_name = f"Func_{func_id}"
 
-        print(f"{func_id:<8} {func_name:<20} {count:>8} {sum_duration:>14.2f} {avg_duration:>12.2f} {min_duration:>12.2f} {max_duration:>12.2f}")
+        # Calculate averages for new metrics
+        avg_head_overhead = sum(stats['head_overheads']) / len(stats['head_overheads']) if stats['head_overheads'] else 0
+        avg_tail_overhead = sum(stats['tail_overheads']) / len(stats['tail_overheads']) if stats['tail_overheads'] else 0
+        avg_schedule_time = stats['total_schedule_time'] / count if count > 0 else 0
+        min_schedule_time = min(stats['schedule_times']) if stats['schedule_times'] else 0
+        max_schedule_time = max(stats['schedule_times']) if stats['schedule_times'] else 0
+        total_schedule_time = stats['total_schedule_time']
+
+        # Calculate execution ratio: total_exec_time / total_schedule_time
+        exec_ratio = (stats['total_exec_time'] / stats['total_schedule_time'] * 100) if stats['total_schedule_time'] > 0 else 0
+
+        # Format combined exec/sched values
+        total_combined = f"{sum_duration:.2f}/{total_schedule_time:.2f}"
+        avg_combined = f"{avg_duration:.2f}/{avg_schedule_time:.2f}"
+        min_combined = f"{min_duration:.2f}/{min_schedule_time:.2f}"
+        max_combined = f"{max_duration:.2f}/{max_schedule_time:.2f}"
+        overhead_combined = f"{avg_head_overhead:.2f}/{avg_tail_overhead:.2f}"
+
+        print(f"{func_id:<8} {func_name:<12} {count:^6} {total_combined:^25} {avg_combined:^23} "
+              f"{min_combined:^23} {max_combined:^23} {overhead_combined:^23} {exec_ratio:^7.2f}%")
 
     # Print total row
-    print("-" * 104)
-    print(f"{'TOTAL':<29} {total_count:>8} {total_duration:>14.2f}")
-    print("=" * 104)
+    print("-" * 160)
+
+    # Calculate total schedule time (sum of all schedule times)
+    total_schedule_sum = sum(stats['total_schedule_time'] for stats in func_stats.values())
+    total_combined = f"{total_duration:.2f}/{total_schedule_sum:.2f}"
+    print(f"{'TOTAL':<21} {total_count:^6} {total_combined:^25}")
+
+    # Print total test execution time
+    if min_dispatch_time != float('inf') and max_finish_time != float('-inf'):
+        total_test_time = max_finish_time - min_dispatch_time
+        print(f"\nTotal Test Time: {total_test_time:.2f} us (from earliest dispatch to latest finish)")
+
+    print("=" * 160)
+
 
 
 

@@ -2,7 +2,7 @@
 #include "runtime.h"
 #include "pto2_dispatch_payload.h"
 #include "common/perf_profiling.h"
-#include "common/memory_barrier.h"
+#include "aicore/performance_collector_aicore.h"
 
 /**
  * Unified function pointer type for kernel dispatch
@@ -11,73 +11,6 @@
  * This enables simple, switch-free dispatch.
  */
 typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
-
-/**
- * @brief Record task execution performance data
- *
- * This function records the performance metrics of a task execution to the profiling buffer.
- * It writes the task timing data, metadata, and marks the buffer as full when needed.
- *
- * Note: Fanout information is filled by AICPU after task completion (not recorded here).
- *
- * @param my_hank Pointer to the handshake structure containing perf buffer info
- * @param payload Pointer to the PTO2DispatchPayload structure
- * @param start_time Task start timestamp
- * @param end_time Task end timestamp
- * @param block_idx AICore block index
- * @param core_type Core type (AIC or AIV)
- * @param kernel_ready_time Kernel ready timestamp (when AICore entered main loop)
- */
-__aicore__ __attribute__((always_inline)) static void record_task_performance(
-    __gm__ Handshake* my_hank,
-    __gm__ PTO2DispatchPayload* payload,
-    uint64_t start_time,
-    uint64_t end_time,
-    int block_idx,
-    CoreType core_type,
-    uint64_t kernel_ready_time) {
-
-    // Check if buffer is available for writing
-    if (my_hank->perf_buffer_status != 0) {
-        return;  // Buffer full, skip recording
-    }
-
-    // Get current performance buffer pointer
-    __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-
-    // Get current count (no atomic operation needed - single writer)
-    rmb();
-    uint32_t idx = perf_buf->count;
-
-    // Check if buffer has space
-    if (idx < PLATFORM_PROF_BUFFER_SIZE) {
-        // Get pointer to the record slot
-        __gm__ PerfRecord* record = (__gm__ PerfRecord*)&perf_buf->records[idx];
-
-        // Write record data (only essential fields, fanout filled by AICPU)
-        record->start_time = start_time;
-        record->end_time = end_time;
-        record->kernel_ready_time = kernel_ready_time;
-        record->task_id = payload->task_id;      // Use payload->task_id
-        record->func_id = payload->kernel_id;    // Use payload->kernel_id
-        record->core_id = block_idx;
-        record->core_type = core_type;
-
-        // Increment count after writing record
-        perf_buf->count = idx + 1;
-
-        // Write memory barrier: ensure performance data is visible to Host
-        wmb();
-
-        // Check if buffer is full after this write
-        if (perf_buf->count >= PLATFORM_PROF_BUFFER_SIZE) {
-            my_hank->perf_buffer_status = 1;  // Notify AICPU: buffer full
-        }
-    } else {
-        // Buffer is already full
-        my_hank->perf_buffer_status = 1;
-    }
-}
 
 /**
  * Execute task from PTO2DispatchPayload.
@@ -95,6 +28,9 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ void* 
 
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(payload->args));
+
+    // Ensure all memory writes are visible to other cores
+    pipe_barrier(PIPE_ALL);
 }
 
 /**
@@ -133,7 +69,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     // Used for: 1) Startup overhead analysis, 2) Cross-core time alignment
     uint64_t kernel_ready_time = 0;
     if (profiling_enabled) {
-        kernel_ready_time = get_sys_cnt();
+        kernel_ready_time = get_sys_cnt_aicore();
     }
 
     // Phase 3: Main execution loop - poll for tasks until quit signal
@@ -153,7 +89,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             // Performance profiling: record start time
             uint64_t start_time = 0;
             if (profiling_enabled) {
-                start_time = get_sys_cnt();
+                start_time = get_sys_cnt_aicore();
             }
 
             // Execute the task
@@ -161,9 +97,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
             // Performance profiling: record task execution
             if (profiling_enabled) {
-                uint64_t end_time = get_sys_cnt();
-                record_task_performance(my_hank, payload, start_time, end_time,
-                                      block_idx, core_type, kernel_ready_time);
+                uint64_t end_time = get_sys_cnt_aicore();
+                __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
+                perf_aicore_record_task(perf_buf, payload->task_id, payload->kernel_id,
+                                       start_time, end_time, kernel_ready_time,
+                                       block_idx, core_type);
             }
 
             // Mark task as complete (task_status: 0=idle, 1=busy)

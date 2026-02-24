@@ -20,7 +20,8 @@
 #endif
 
 // dcci (Data Cache Clean and Invalidate) - no-op in simulation
-#define dcci(addr, mode, opt) ((void)0)
+// Use variadic macro to support both 2-arg and 3-arg calls
+#define dcci(...) ((void)0)
 
 // Cache coherency constants (no-op in simulation)
 #define ENTIRE_DATA_CACHE 0
@@ -36,21 +37,17 @@
 // =============================================================================
 
 /**
- * Simulated system counter for performance profiling
+ * Get simulated AICore system counter
  *
- * Returns monotonic counter value at 1850 MHz frequency.
- * Uses std::chrono::high_resolution_clock and converts to counter ticks.
- *
- * @return Simulated counter value (ticks since epoch)
+ * @return Simulated counter value (ticks)
  */
-inline uint64_t get_sys_cnt() {
+inline uint64_t get_sys_cnt_aicore() {
     auto now = std::chrono::high_resolution_clock::now();
     uint64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
         now.time_since_epoch()
     ).count();
 
-    // Convert nanoseconds to counter ticks at PLATFORM_PROF_SYS_CNT_FREQ
-    // Split elapsed_ns into seconds and remainder to avoid overflow
+    // Convert nanoseconds to counter ticks
     constexpr uint64_t kNsPerSec = std::nano::den;
     uint64_t seconds = elapsed_ns / kNsPerSec;
     uint64_t remaining_ns = elapsed_ns % kNsPerSec;

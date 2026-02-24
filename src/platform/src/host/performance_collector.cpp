@@ -18,8 +18,6 @@
 #include "common/unified_log.h"
 
 PerformanceCollector::~PerformanceCollector() {
-    // Destructor should not call finalize() because callbacks are not available
-    // User must explicitly call finalize() before destruction
     if (perf_shared_mem_host_ != nullptr) {
         LOG_WARN("PerformanceCollector destroyed without finalize()");
     }
@@ -78,17 +76,23 @@ int PerformanceCollector::initialize(Runtime& runtime,
         LOG_DEBUG("Simulation mode: host_ptr = dev_ptr = %p", perf_host_ptr);
     }
 
-    // Step 4: Initialize fixed header
+    // Step 4: Initialize header
     PerfDataHeader* header = get_perf_header(perf_host_ptr);
-    memset(header->queue, 0, sizeof(header->queue));
-    header->queue_head = 0;
-    header->queue_tail = 0;
+
+    for (int t = 0; t < PLATFORM_MAX_AICPU_THREADS; t++) {
+        memset(header->queues[t], 0, sizeof(header->queues[t]));
+        header->queue_heads[t] = 0;
+        header->queue_tails[t] = 0;
+    }
+
     header->num_cores = num_aicore;
+    header->total_tasks = 0;
 
     LOG_DEBUG("Initialized PerfDataHeader:");
     LOG_DEBUG("  num_cores:        %d", header->num_cores);
     LOG_DEBUG("  buffer_capacity:  %d", PLATFORM_PROF_BUFFER_SIZE);
     LOG_DEBUG("  queue capacity:   %d", PLATFORM_PROF_READYQUEUE_SIZE);
+    LOG_DEBUG("  num threads:      %d", PLATFORM_MAX_AICPU_THREADS);
 
     // Step 5: Initialize all DoubleBuffers
     DoubleBuffer* buffers = get_double_buffers(perf_host_ptr);
@@ -103,14 +107,12 @@ int PerformanceCollector::initialize(Runtime& runtime,
     }
     LOG_DEBUG("Initialized %d DoubleBuffers (all status=0, idle)", num_aicore);
 
-    // Write memory barrier
     wmb();
 
     // Step 6: Pass to Runtime
     runtime.perf_data_base = (uint64_t)perf_dev_ptr;
     LOG_DEBUG("Set runtime.perf_data_base = 0x%lx", runtime.perf_data_base);
 
-    // Save pointers
     perf_shared_mem_dev_ = perf_dev_ptr;
     perf_shared_mem_host_ = perf_host_ptr;
 
@@ -131,61 +133,76 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
     const auto timeout_duration = std::chrono::seconds(PLATFORM_PROF_TIMEOUT_SECONDS);
     std::optional<std::chrono::steady_clock::time_point> idle_start;
 
-    // Poll for total_tasks if not provided
     if (expected_tasks <= 0) {
-        LOG_INFO("Waiting for AICPU to write total_tasks to PerfDataHeader...");
+        LOG_INFO("Waiting for AICPU to write total_tasks in PerfDataHeader...");
         idle_start = std::chrono::steady_clock::now();
 
         while (true) {
             rmb();
-            expected_tasks = static_cast<int>(header->total_tasks);
+            uint32_t raw_total_tasks = header->total_tasks;
 
-            if (expected_tasks > 0) {
-                LOG_INFO("Task count read from PerfDataHeader: %d", expected_tasks);
+            if (raw_total_tasks > 0) {
+                expected_tasks = static_cast<int>(raw_total_tasks);
+                LOG_INFO("AICPU reported task count: %d", expected_tasks);
                 break;
             }
 
             auto elapsed = std::chrono::steady_clock::now() - idle_start.value();
             if (elapsed >= timeout_duration) {
-                LOG_ERROR("Timeout waiting for total_tasks from AICPU after %ld seconds",
+                LOG_ERROR("Timeout waiting for AICPU task count after %ld seconds",
                          std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
-                LOG_ERROR("AICPU may not have initialized performance profiling");
+                LOG_INFO("AICPU finally reported task count: %d", raw_total_tasks);
                 return;
             }
         }
     }
 
-    LOG_DEBUG("Expected tasks: %d", expected_tasks);
+    LOG_DEBUG("Initial expected tasks: %d", expected_tasks);
 
-    uint32_t capacity = PLATFORM_PROF_READYQUEUE_SIZE;
     int total_records_collected = 0;
     int buffers_processed = 0;
 
     collected_perf_records_.clear();
     idle_start.reset();
     int empty_poll_count = 0;
+    int last_logged_expected = -1;
 
-    // Poll the ready queue
+    int current_thread = 0;
+
     while (total_records_collected < expected_tasks) {
         rmb();
-        uint32_t head = header->queue_head;
-        uint32_t tail = header->queue_tail;
+
+        int current_expected = static_cast<int>(header->total_tasks);
+        if (current_expected > expected_tasks) {
+            expected_tasks = current_expected;
+            if (last_logged_expected < 0) {
+                LOG_INFO("Updated expected_tasks to %d (orchestrator progress)", expected_tasks);
+                last_logged_expected = expected_tasks;
+            }
+        }
+
+        uint32_t head = header->queue_heads[current_thread];
+        uint32_t tail = header->queue_tails[current_thread];
 
         if (head == tail) {
-            if (!idle_start.has_value()) {
-                idle_start = std::chrono::steady_clock::now();
-            }
+            current_thread = (current_thread + 1) % PLATFORM_MAX_AICPU_THREADS;
 
-            empty_poll_count++;
-            if (empty_poll_count >= PLATFORM_PROF_EMPTY_POLLS_CHECK_NUM) {
-                empty_poll_count = 0;
-                auto elapsed = std::chrono::steady_clock::now() - idle_start.value();
-                if (elapsed >= timeout_duration) {
-                    LOG_WARN("Performance data collection idle timeout after %ld seconds",
-                             std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
-                    LOG_WARN("Collected %d / %d records before timeout",
-                             total_records_collected, expected_tasks);
-                    break;
+            if (current_thread == 0) {
+                if (!idle_start.has_value()) {
+                    idle_start = std::chrono::steady_clock::now();
+                }
+
+                empty_poll_count++;
+                if (empty_poll_count >= PLATFORM_PROF_EMPTY_POLLS_CHECK_NUM) {
+                    empty_poll_count = 0;
+                    auto elapsed = std::chrono::steady_clock::now() - idle_start.value();
+                    if (elapsed >= timeout_duration) {
+                        LOG_ERROR("Performance data collection idle timeout after %ld seconds",
+                                 std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+                        LOG_ERROR("Collected %d / %d records before timeout",
+                                 total_records_collected, expected_tasks);
+                        break;
+                    }
                 }
             }
             continue;
@@ -194,7 +211,7 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
         idle_start.reset();
         empty_poll_count = 0;
 
-        ReadyQueueEntry entry = header->queue[head];
+        ReadyQueueEntry entry = header->queues[current_thread][head];
         uint32_t core_index = entry.core_index;
         uint32_t buffer_id = entry.buffer_id;
 
@@ -203,7 +220,7 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
             break;
         }
 
-        LOG_DEBUG("Processing: core=%u, buffer=%u", core_index, buffer_id);
+        LOG_DEBUG("Processing: thread=%d, core=%u, buffer=%u", current_thread, core_index, buffer_id);
 
         DoubleBuffer* db = &buffers[core_index];
         PerfBuffer* buf = nullptr;
@@ -221,12 +238,16 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
 
         buf->count = 0;
         *status = BufferStatus::IDLE;
-        wmb();
-
-        header->queue_head = (head + 1) % capacity;
+        header->queue_heads[current_thread] = (head + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
         wmb();
 
         buffers_processed++;
+
+        current_thread = (current_thread + 1) % PLATFORM_MAX_AICPU_THREADS;
+    }
+
+    if (last_logged_expected >= 0 && expected_tasks != last_logged_expected) {
+        LOG_INFO("Final expected_tasks: %d (orchestration complete)", expected_tasks);
     }
 
     LOG_INFO("Total buffers processed: %d", buffers_processed);
@@ -269,6 +290,11 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         if (record.kernel_ready_time < base_time_cycles) {
             base_time_cycles = record.kernel_ready_time;
         }
+        if (record.dispatch_time < base_time_cycles && record.dispatch_time > 0) {
+            base_time_cycles = record.dispatch_time;
+            LOG_WARN("Timestamp violation: dispatch_time (%lu) < base_time (%lu) for task %u, using dispatch_time as new base_time",
+                        record.dispatch_time, base_time_cycles, record.task_id);
+        }
     }
 
     // Step 5: Generate filename with timestamp (YYYYMMDD_HHMMSS)
@@ -302,7 +328,6 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         double dispatch_us = (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time - base_time_cycles) : 0.0;
         double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time - base_time_cycles) : 0.0;
 
-        // Determine core type string
         const char* core_type_str = (record.core_type == CoreType::AIC) ? "aic" : "aiv";
 
         outfile << "    {\n";

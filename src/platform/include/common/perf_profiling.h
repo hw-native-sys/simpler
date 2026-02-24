@@ -155,22 +155,24 @@ struct ReadyQueueEntry {
  * Performance data fixed header
  *
  * Located at the start of shared memory, contains:
- * 1. Ready queue (FIFO Circular Buffer)
+ * 1. Per-thread ready queues (FIFO Circular Buffers)
  * 2. Metadata (core count)
  *
  * Ready queue design:
- * - Capacity: PLATFORM_PROF_READYQUEUE_SIZE (max 2 buffers ready per core)
+ * - Per-thread queues: Avoid lock contention between AICPU threads
+ * - Capacity per queue: PLATFORM_PROF_READYQUEUE_SIZE (full capacity for each thread)
  * - Implementation: Circular Buffer
- * - Producer: AICPU (adds full buffers)
- * - Consumer: Host (reads and clears buffers)
+ * - Producer: AICPU thread (adds full buffers to its own queue)
+ * - Consumer: Host (reads from all queues)
  * - Queue empty: head == tail
  * - Queue full: (tail + 1) % capacity == head
  */
 struct PerfDataHeader {
-    // Ready queue (FIFO Circular Buffer)
-    ReadyQueueEntry queue[PLATFORM_PROF_READYQUEUE_SIZE];  // Queue array
-    volatile uint32_t queue_head;                    // Consumer read position (Host modifies)
-    volatile uint32_t queue_tail;                    // Producer write position (AICPU modifies)
+    // Per-thread ready queues (FIFO Circular Buffers)
+    // Each AICPU thread has its own queue to avoid lock contention
+    ReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][PLATFORM_PROF_READYQUEUE_SIZE];
+    volatile uint32_t queue_heads[PLATFORM_MAX_AICPU_THREADS];  // Consumer read positions (Host modifies)
+    volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // Producer write positions (AICPU modifies)
 
     // Metadata (Host initializes, Device read-only)
     uint32_t num_cores;                              // Actual number of cores launched

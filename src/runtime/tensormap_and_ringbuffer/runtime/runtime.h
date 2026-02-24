@@ -22,6 +22,7 @@
 #include <string.h>  // for memset
 
 #include "common/core_type.h"
+#include "common/perf_profiling.h"
 #include "pto2_dispatch_payload.h"
 
 // =============================================================================
@@ -192,6 +193,20 @@ public:
      * Clear all recorded tensor pairs.
      */
     void clear_tensor_pairs();
+
+    // =========================================================================
+    // Performance Profiling
+    // =========================================================================
+
+    /**
+     * Fill fanout information for performance records
+     *
+     * Extracts task dependency data from the task graph and populates
+     * fanout arrays in performance records.
+     *
+     * @param perf_buf Performance buffer containing records to complete
+     */
+    void complete_perf_records(PerfBuffer* perf_buf);
 
     // =========================================================================
     // Device orchestration (for AICPU thread 3)
