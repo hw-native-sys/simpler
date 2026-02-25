@@ -22,3 +22,6 @@ examples/scripts/_deps/
 
 # Profiling files
 outputs
+
+# Mid-work documentation
+.docs

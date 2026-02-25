@@ -44,7 +44,7 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
     (void)args;
     (void)arg_count;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 15,
+        .expected_arg_count = 10,
     };
 }
 
@@ -72,14 +72,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     void* host_out = reinterpret_cast<void*>(args[5]);          // [batch, num_heads, head_dim]
     int64_t* host_config = reinterpret_cast<int64_t*>(args[6]);
 
-    // Extract sizes (next 7)
+    // Extract sizes (next 3)
     size_t query_size = static_cast<size_t>(args[7]);
     size_t key_cache_size = static_cast<size_t>(args[8]);
     size_t value_cache_size = static_cast<size_t>(args[9]);
-    size_t block_table_size = static_cast<size_t>(args[10]);
-    size_t context_lens_size = static_cast<size_t>(args[11]);
-    size_t out_size = static_cast<size_t>(args[12]);
-    size_t config_size = static_cast<size_t>(args[13]);
 
     // Extract config parameters
     uint64_t batch = static_cast<uint64_t>(static_cast<int>(host_config[0]));

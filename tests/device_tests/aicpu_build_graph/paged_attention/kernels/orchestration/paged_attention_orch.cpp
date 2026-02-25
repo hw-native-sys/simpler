@@ -63,7 +63,7 @@ extern "C" int orchestration(Runtime* runtime) {
         return -1;
     }
 
-    if (runtime->orch_argc < 15) {
+    if (runtime->orch_argc < 14) {
         return -1;
     }
 

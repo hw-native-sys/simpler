@@ -33,8 +33,8 @@ constexpr int BATCH = 1;
 constexpr size_t TILE_BYTES = TILE * TILE * sizeof(float);
 
 int build_bgemm_graph(Runtime* runtime, uint64_t* args, int arg_count) {
-    if (arg_count < 7) {
-        std::cerr << "build_bgemm_graph: Expected at least 7 args, got " << arg_count << '\n';
+    if (arg_count < 6) {
+        std::cerr << "build_bgemm_graph: Expected at least 6 args, got " << arg_count << '\n';
         return -1;
     }
 

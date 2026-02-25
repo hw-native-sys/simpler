@@ -17,9 +17,20 @@ Usage:
 
 Golden.py interface:
     # Required functions
-    def generate_inputs(params: dict) -> dict:
-        '''Return dict of torch tensors or numpy arrays (inputs + outputs)'''
-        return {"a": torch.tensor(...), "b": torch.tensor(...), "out_f": torch.zeros(...)}
+    def generate_inputs(params: dict) -> list:
+        '''Return flat argument list — tensors as (name, tensor) tuples, scalars as ctypes typed values'''
+        a = torch.tensor(...)
+        b = torch.tensor(...)
+        out_f = torch.zeros(...)
+        return [
+            ("a", a),
+            ("b", b),
+            ("out_f", out_f),
+            ("size_a", ctypes.c_int64(a.nbytes)),
+            ("size_b", ctypes.c_int64(b.nbytes)),
+            ("size_f", ctypes.c_int64(out_f.nbytes)),
+            ("SIZE",   ctypes.c_int64(a.numel())),
+        ]
 
     def compute_golden(tensors: dict, params: dict) -> None:
         '''Compute expected outputs in-place'''
@@ -416,9 +427,95 @@ class CodeRunner:
 
         return inputs, outputs
 
+    def _build_func_args_from_list(
+        self, args_list: list
+    ) -> Tuple[List[int], List[int], List[int], Dict[str, Any], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+        """
+        Build func_args from an explicit argument list returned by generate_inputs.
+
+        Every element must be a (name, value) pair where value is either:
+        - torch.Tensor / numpy array: a tensor argument
+        - ctypes scalar (ctypes.c_int64, ctypes.c_float, etc.): a scalar argument
+
+        All named items (tensors and scalars) are collected into the args dict
+        passed to compute_golden, so compute_golden can reference any arg by name.
+
+        Returns:
+            Tuple of (func_args, arg_types, arg_sizes, args, inputs, outputs)
+            where args contains all named items, inputs/outputs contain tensor-only subsets.
+        """
+        import ctypes
+        import numpy as np
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR
+
+        # Identify outputs
+        if self.output_names:
+            output_set = set(self.output_names)
+        else:
+            output_set = set()
+
+        func_args = []
+        arg_types = []
+        arg_sizes = []
+        args = {}    # all named items: tensors + scalars → passed to compute_golden
+        inputs = {}  # tensor inputs only → for logging
+        outputs = {} # tensor outputs only → for comparison
+
+        for item in args_list:
+            if not (isinstance(item, tuple) and len(item) == 2):
+                raise TypeError(
+                    f"Each element in generate_inputs() list must be a (name, value) pair, "
+                    f"got: {type(item)}\n"
+                    f"Tensors: ('name', tensor)  Scalars: ('name', ctypes.c_int64(...))"
+                )
+
+            name, value = item
+
+            if isinstance(value, (torch.Tensor, np.ndarray)):
+                tensor = _to_torch(value)
+                tensor = tensor.cpu().contiguous()
+                args[name] = tensor
+
+                func_args.append(tensor.data_ptr())
+                nbytes = tensor.element_size() * tensor.numel()
+                arg_sizes.append(nbytes)
+
+                if name in output_set or (not output_set and name.startswith('out_')):
+                    arg_types.append(ARG_OUTPUT_PTR)
+                    outputs[name] = tensor
+                else:
+                    arg_types.append(ARG_INPUT_PTR)
+                    inputs[name] = tensor
+
+            elif isinstance(value, ctypes._SimpleCData):
+                if isinstance(value, (ctypes.c_float, ctypes.c_double)):
+                    uint_type = ctypes.c_uint32 if isinstance(value, ctypes.c_float) else ctypes.c_uint64
+                    bits = uint_type.from_buffer_copy(value).value
+                    func_args.append(bits)
+                else:
+                    func_args.append(int(value.value))
+                args[name] = value.value
+                arg_types.append(ARG_SCALAR)
+                arg_sizes.append(0)
+
+            else:
+                raise TypeError(
+                    f"Unsupported value type for arg '{name}': {type(value)}\n"
+                    f"Expected torch.Tensor, numpy array, or ctypes scalar (ctypes.c_int64, ctypes.c_float, etc.)"
+                )
+
+        if not outputs:
+            raise ValueError(
+                "No output tensors identified. Either:\n"
+                "1. Define __outputs__ = ['tensor_name'] in golden.py, or\n"
+                "2. Use 'out_' prefix for output tensor names (e.g., 'out_result')"
+            )
+
+        return func_args, arg_types, arg_sizes, args, inputs, outputs
+
     def _build_func_args(self, tensors: Dict[str, torch.Tensor]) -> Tuple[List[int], List[int], List[int]]:
         """
-        Build func_args, arg_types, and arg_sizes from tensors automatically.
+        Build func_args, arg_types, and arg_sizes from tensors dict (legacy path).
 
         Convention for orchestration function signature:
             int BuildGraph(Runtime* runtime, uint64_t* args, int arg_count)
@@ -585,22 +682,24 @@ class CodeRunner:
 
             # Generate tensors using golden.py
             logger.info("=== Generating Inputs ===")
-            tensors_raw = self._golden_module.generate_inputs(params)
+            result = self._golden_module.generate_inputs(params)
 
-            # Convert any inputs to torch tensors
-            tensors = {k: _to_torch(v) for k, v in tensors_raw.items()}
+            if isinstance(result, list):
+                # New-style: generate_inputs returns flat argument list
+                func_args, arg_types, arg_sizes, args, inputs, outputs = \
+                    self._build_func_args_from_list(result)
+                tensors = args  # args contains all named items; compute_golden receives all
+            else:
+                # Legacy: generate_inputs returns dict of tensors
+                tensors = {k: _to_torch(v) for k, v in result.items()}
+                func_args, arg_types, arg_sizes = self._build_func_args(tensors)
+                inputs, outputs = self._identify_outputs(tensors)
 
-            # Build func_args automatically (this will make tensors contiguous)
-            func_args, arg_types, arg_sizes = self._build_func_args(tensors)
-
-            # Identify inputs and outputs AFTER making tensors contiguous
-            inputs, outputs = self._identify_outputs(tensors)
             logger.info(f"Inputs: {list(inputs.keys())}")
             logger.info(f"Outputs: {list(outputs.keys())}")
 
             # Determine actual tensor order for debugging
-            order = self.tensor_order if self.tensor_order else list(tensors.keys())
-            logger.debug(f"Tensor order: {order}")
+            logger.debug(f"Tensor order: {list(tensors.keys())}")
             logger.debug(f"func_args count: {len(func_args)}")
 
             # Create and initialize runtime (including kernel registration)

@@ -7,10 +7,7 @@
  *   orch_args[0] = dev_a      (input,  float[SIZE])
  *   orch_args[1] = dev_b      (input,  float[SIZE])
  *   orch_args[2] = dev_f      (output, float[SIZE])
- *   orch_args[3] = nbytes_a   (scalar)
- *   orch_args[4] = nbytes_b   (scalar)
- *   orch_args[5] = nbytes_f   (scalar)
- *   orch_args[6] = SIZE        (element count, scalar)
+ *   orch_args[3] = SIZE        (element count, scalar)
  *
  * This function allocates intermediate tensors via api.device_malloc() (HBM)
  * and builds the task dependency graph:
@@ -34,7 +31,7 @@ union ScalarConverter {
 constexpr int DEV_A = 0;
 constexpr int DEV_B = 1;
 constexpr int DEV_F = 2;
-constexpr int SIZE  = 6;
+constexpr int SIZE  = 3;
 }  // namespace
 
 extern "C" int orchestration(Runtime* runtime) {

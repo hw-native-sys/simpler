@@ -47,7 +47,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
     (void)args;
     (void)arg_count;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 7,
+        .expected_arg_count = 10,
     };
 }
 
@@ -69,7 +69,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     void* host_out = (void*)(uintptr_t)args[5];             // [batch, num_heads, head_dim]
     int64_t* host_config = (int64_t*)(uintptr_t)args[6];
 
-    // Extract sizes (next 7 args after pointers)
+    // Extract sizes (next 3 args after pointers)
     size_t query_size = (size_t)args[7];
     size_t key_cache_size = (size_t)args[8];
     size_t value_cache_size = (size_t)args[9];

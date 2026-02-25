@@ -24,8 +24,8 @@
 extern "C" {
 
 int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count) {
-    if (arg_count < 15) {
-        std::cerr << "Expected at least 15 args, got " << arg_count << '\n';
+    if (arg_count < 14) {
+        std::cerr << "Expected at least 14 args, got " << arg_count << '\n';
         return -1;
     }
 

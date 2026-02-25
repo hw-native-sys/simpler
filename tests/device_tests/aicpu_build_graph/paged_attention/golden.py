@@ -7,19 +7,17 @@ Implements the online softmax algorithm for paged attention with:
 - GQA support (kv_head_num=1)
 - Head tiling: q_tile = min(q_head_num, 128)
 - Random block table mapping
+
+Args layout: [ptr_query, ..., ptr_config, size_query, ..., size_config]
 """
 
+import ctypes
 import os
 import struct
 import torch
 
-# Output tensor names
 __outputs__ = ["out"]
 
-# Tensor order matching orchestration function parameter order
-TENSOR_ORDER = ["query", "key_cache", "value_cache", "block_table", "context_lens", "out", "config"]
-
-# Comparison tolerances
 RTOL = 1e-3
 ATOL = 1e-3
 
@@ -51,7 +49,7 @@ _selected = os.environ.get("PA_CASE", "Case1")
 PARAMS_LIST = [{"name": _selected, **ALL_CASES[_selected]}]
 
 
-def generate_inputs(params: dict) -> dict:
+def generate_inputs(params: dict) -> list:
     """Generate input tensors and zeroed output tensor."""
     batch = params["batch"]
     num_heads = params["num_heads"]
@@ -67,7 +65,6 @@ def generate_inputs(params: dict) -> dict:
     scale_value = 1.0
     scale_bits = struct.unpack('I', struct.pack('f', scale_value))[0]
 
-    # Random block table: (batch, max_num_blocks_per_req) int32
     block_table = torch.randint(
         0,
         batch * cur_valid_blocks - 1,
@@ -75,7 +72,6 @@ def generate_inputs(params: dict) -> dict:
         dtype=torch.int32,
     )
 
-    # Context lens: all = context_len
     context_lens = torch.full((batch,), context_len, dtype=torch.int32)
 
     config = torch.tensor(
@@ -84,25 +80,34 @@ def generate_inputs(params: dict) -> dict:
         dtype=torch.int64,
     )
 
-    # Query: (batch, 1, num_heads * head_dim) -> (batch, num_heads, head_dim) bfloat16
     query_bf16 = torch.empty(batch, 1, num_heads * head_dim).uniform_(-0.5, 0.5).to(torch.bfloat16)
     query_bf16 = query_bf16.reshape(batch, num_heads, head_dim)
 
-    # Key cache: (total_blocks, block_size, kv_head_num, head_dim) bfloat16
     key_bf16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-0.5, 0.5).to(torch.bfloat16)
-
-    # Value cache: (total_blocks, block_size, kv_head_num, head_dim) bfloat16
     value_bf16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-1, 1).to(torch.bfloat16)
 
-    return {
-        "query": query_bf16.flatten(),
-        "key_cache": key_bf16.flatten(),
-        "value_cache": value_bf16.flatten(),
-        "block_table": block_table.flatten(),
-        "context_lens": context_lens,
-        "out": torch.zeros(batch * num_heads * head_dim, dtype=torch.float32),
-        "config": config,
-    }
+    query = query_bf16.flatten()
+    key_cache = key_bf16.flatten()
+    value_cache = value_bf16.flatten()
+    block_table_flat = block_table.flatten()
+    out = torch.zeros(batch * num_heads * head_dim, dtype=torch.float32)
+
+    return [
+        ("query", query),
+        ("key_cache", key_cache),
+        ("value_cache", value_cache),
+        ("block_table", block_table_flat),
+        ("context_lens", context_lens),
+        ("out", out),
+        ("config", config),
+        ("size_query", ctypes.c_int64(query.nbytes)),
+        ("size_key_cache", ctypes.c_int64(key_cache.nbytes)),
+        ("size_value_cache", ctypes.c_int64(value_cache.nbytes)),
+        ("size_block_table", ctypes.c_int64(block_table_flat.nbytes)),
+        ("size_context_lens", ctypes.c_int64(context_lens.nbytes)),
+        ("size_out", ctypes.c_int64(out.nbytes)),
+        ("size_config", ctypes.c_int64(config.nbytes)),
+    ]
 
 
 def paged_attention(
@@ -249,7 +254,8 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
 if __name__ == "__main__":
     params = PARAMS_LIST[0]
-    tensors = generate_inputs(params)
+    result = generate_inputs(params)
+    tensors = {name: tensor for name, tensor in result if isinstance(tensor, torch.Tensor)}
     compute_golden(tensors, params)
 
     print(f"=== Paged Attention Golden Test ({params['name']}) ===")

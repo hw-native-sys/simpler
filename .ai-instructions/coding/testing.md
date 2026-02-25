@@ -39,8 +39,37 @@ python examples/scripts/run_example.py \
 
 ### `golden.py` required functions
 
-- **`generate_inputs(params)`** -- Returns a dict of torch tensors (inputs + zero-initialized outputs)
+- **`generate_inputs(params)`** -- Returns a flat argument list (see below) or a dict of torch tensors (legacy)
 - **`compute_golden(tensors, params)`** -- Computes expected outputs in-place by writing to output tensors
+
+### `generate_inputs` return format
+
+Returns a `list` of `(name, value)` pairs where value is either:
+- **`torch.Tensor` / numpy array**: A tensor argument. The framework handles `device_malloc`, `copy_to_device`, and copy-back based on `__outputs__`.
+- **ctypes scalar** (`ctypes.c_int64`, `ctypes.c_float`, etc.): A scalar value passed directly to the orchestration function. Integer types are zero-extended to uint64; `c_float` is bit-cast to uint32 then zero-extended; `c_double` is bit-cast to uint64.
+
+The list order defines the argument order in the orchestration's `uint64_t* args` array. All named items (tensors and scalars) are collected into the dict passed to `compute_golden`, so `compute_golden` can reference any argument by name.
+
+Example:
+```python
+import ctypes
+import torch
+
+def generate_inputs(params: dict) -> list:
+    a = torch.full((16384,), 2.0, dtype=torch.float32)
+    b = torch.full((16384,), 3.0, dtype=torch.float32)
+    f = torch.zeros(16384, dtype=torch.float32)
+
+    return [
+        ("a",      a),                           # args[0]: tensor pointer
+        ("b",      b),                           # args[1]: tensor pointer
+        ("f",      f),                           # args[2]: tensor pointer (output)
+        ("size_a", ctypes.c_int64(a.nbytes)),    # args[3]: scalar
+        ("size_b", ctypes.c_int64(b.nbytes)),    # args[4]: scalar
+        ("size_f", ctypes.c_int64(f.nbytes)),    # args[5]: scalar
+        ("SIZE",   ctypes.c_int64(a.numel())),   # args[6]: scalar
+    ]
+```
 
 ### Declaring outputs
 
@@ -50,7 +79,6 @@ Output tensors are identified by one of:
 
 ### Optional configuration
 
-- `TENSOR_ORDER`: List of tensor names defining the argument order for the orchestration function
 - `RTOL` / `ATOL`: Comparison tolerances (default: `1e-5`)
 - `PARAMS_LIST`: List of parameter dicts for parameterized tests
 

@@ -6,19 +6,17 @@ Implements the online softmax algorithm for paged attention with:
 - Non-transposed K storage: (total_blocks, block_size, kv_head_num, head_dim)
 - GQA support (kv_head_num=1)
 - 16x16 tile dimensions
+
+Args layout: [ptr_query, ..., ptr_config, size_query, size_key_cache, size_value_cache]
 """
 
+import ctypes
 import os
 import struct
 import torch
 
-# Output tensor names
 __outputs__ = ["out"]
 
-# Tensor order matching orchestration function parameter order
-TENSOR_ORDER = ["query", "key_cache", "value_cache", "block_table", "context_lens", "out", "config"]
-
-# Comparison tolerances
 RTOL = 1e-2
 ATOL = 1e-2
 
@@ -50,7 +48,7 @@ _selected = os.environ.get("PA_CASE", "Case1")
 PARAMS_LIST = [{"name": _selected, **ALL_CASES[_selected]}]
 
 
-def generate_inputs(params: dict) -> dict:
+def generate_inputs(params: dict) -> list:
     """Generate input tensors and zeroed output tensor."""
     batch = params["batch"]
     num_heads = params["num_heads"]
@@ -66,7 +64,6 @@ def generate_inputs(params: dict) -> dict:
     scale_value = 1.0
     scale_bits = struct.unpack('I', struct.pack('f', scale_value))[0]
 
-    # Random block table: (batch, max_num_blocks_per_req) int32
     block_table = torch.randint(
         0,
         max(total_blocks, 1),
@@ -74,7 +71,6 @@ def generate_inputs(params: dict) -> dict:
         dtype=torch.int32,
     )
 
-    # Context lens: all = context_len
     context_lens = torch.full((batch,), context_len, dtype=torch.int32)
 
     config = torch.tensor(
@@ -83,25 +79,30 @@ def generate_inputs(params: dict) -> dict:
         dtype=torch.int64,
     )
 
-    # Query: (batch, 1, num_heads * head_dim) -> (batch, num_heads, head_dim) float16
     query_fp16 = torch.empty(batch, 1, num_heads * head_dim).uniform_(-0.5, 0.5).to(torch.float16)
     query_fp16 = query_fp16.reshape(batch, num_heads, head_dim)
 
-    # Key cache: (total_blocks, block_size, kv_head_num, head_dim) float16
     key_fp16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-0.5, 0.5).to(torch.float16)
-
-    # Value cache: (total_blocks, block_size, kv_head_num, head_dim) float16
     value_fp16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-1, 1).to(torch.float16)
 
-    return {
-        "query": query_fp16.flatten(),
-        "key_cache": key_fp16.flatten(),
-        "value_cache": value_fp16.flatten(),
-        "block_table": block_table.flatten(),
-        "context_lens": context_lens,
-        "out": torch.zeros(batch * num_heads * head_dim, dtype=torch.float32),
-        "config": config,
-    }
+    query = query_fp16.flatten()
+    key_cache = key_fp16.flatten()
+    value_cache = value_fp16.flatten()
+    block_table_flat = block_table.flatten()
+    out = torch.zeros(batch * num_heads * head_dim, dtype=torch.float32)
+
+    return [
+        ("query", query),
+        ("key_cache", key_cache),
+        ("value_cache", value_cache),
+        ("block_table", block_table_flat),
+        ("context_lens", context_lens),
+        ("out", out),
+        ("config", config),
+        ("size_query", ctypes.c_int64(query.nbytes)),
+        ("size_key_cache", ctypes.c_int64(key_cache.nbytes)),
+        ("size_value_cache", ctypes.c_int64(value_cache.nbytes)),
+    ]
 
 
 def paged_attention(
@@ -137,7 +138,6 @@ def paged_attention(
     batch, num_heads_dim, head_dim = query.shape
     _, block_size, _, _ = key_cache.shape
 
-    # Reshape for batched computation
     key_cache_flat = key_cache.reshape(-1, block_size, head_dim)
     value_cache_flat = value_cache.reshape(-1, block_size, head_dim)
 
@@ -145,55 +145,46 @@ def paged_attention(
 
     q_tile = min(num_heads_dim, 128)
 
-    # Max blocks across all batches (each batch may have different context_len)
     max_bn = int(((context_lens.max().item()) + block_size - 1) // block_size)
 
     for q_offset in range(0, num_heads_dim, q_tile):
         q_tile_size = min(q_tile, num_heads_dim - q_offset)
-        # qi: (batch, q_tile_size, head_dim)
         qi = query[:, q_offset:q_offset + q_tile_size, :].to(torch.float32)
 
-        oi = None  # (batch, q_tile_size, head_dim)
-        li = None  # (batch, q_tile_size, 1)
-        mi = None  # (batch, q_tile_size, 1)
+        oi = None
+        li = None
+        mi = None
 
         for bn in range(max_bn):
-            # valid_len per batch for this block position
             valid_lens = torch.clamp(context_lens - bn * block_size, min=0, max=block_size)
-            active_mask = valid_lens > 0  # (batch,)
+            active_mask = valid_lens > 0
 
             if not active_mask.any():
                 break
 
-            # Gather block indices for all batches
-            block_indices = block_table[:, bn]  # (batch,)
+            block_indices = block_table[:, bn]
 
-            # Gather K and V: (batch, block_size, head_dim)
             kj_all = key_cache_flat[block_indices].to(torch.float32)
             vj_all = value_cache_flat[block_indices].to(torch.float32)
 
-            # QK matmul: (batch, q_tile_size, block_size)
             sij = torch.bmm(qi, kj_all.transpose(1, 2)) * scale_value
 
-            # Mask out invalid positions (beyond valid_len per batch)
-            pos = torch.arange(block_size, device=sij.device).unsqueeze(0)  # (1, block_size)
-            valid_mask = pos < valid_lens.unsqueeze(1)  # (batch, block_size)
-            valid_mask = valid_mask.unsqueeze(1)  # (batch, 1, block_size)
+            pos = torch.arange(block_size, device=sij.device).unsqueeze(0)
+            valid_mask = pos < valid_lens.unsqueeze(1)
+            valid_mask = valid_mask.unsqueeze(1)
             sij = sij.masked_fill(~valid_mask, float('-inf'))
 
-            # Also mask inactive batches (no blocks at this position)
-            batch_mask = active_mask.view(-1, 1, 1)  # (batch, 1, 1)
+            batch_mask = active_mask.view(-1, 1, 1)
             sij = sij.masked_fill(~batch_mask, float('-inf'))
 
-            mij = sij.max(dim=-1, keepdim=True)[0]  # (batch, q_tile_size, 1)
+            mij = sij.max(dim=-1, keepdim=True)[0]
             mij = mij.clamp(min=-1e30)
             pij = torch.exp(sij - mij)
             pij = pij.masked_fill(~valid_mask, 0.0)
             pij = pij.masked_fill(~batch_mask, 0.0)
             pij = pij.to(torch.bfloat16).to(torch.float32)
-            lij = pij.sum(dim=-1, keepdim=True)  # (batch, q_tile_size, 1)
+            lij = pij.sum(dim=-1, keepdim=True)
 
-            # PV matmul: (batch, q_tile_size, head_dim)
             oi_new = torch.bmm(pij, vj_all)
 
             if bn == 0:
@@ -208,7 +199,6 @@ def paged_attention(
                 oi = alpha * oi + beta * oi_new
                 mi = mi_new
 
-        # Final normalization
         out[:, q_offset:q_offset + q_tile_size, :] = oi / li
 
     return out.reshape(-1, head_dim)
@@ -225,7 +215,6 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
     max_num_blocks_per_req = max_model_len // block_size
 
-    # Reconstruct shaped tensors from flat tensors
     query = tensors["query"].reshape(batch, num_heads, head_dim)
     key_cache = tensors["key_cache"].reshape(-1, block_size, kv_head_num, head_dim)
     value_cache = tensors["value_cache"].reshape(-1, block_size, kv_head_num, head_dim)
@@ -248,7 +237,8 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
 if __name__ == "__main__":
     params = PARAMS_LIST[0]
-    tensors = generate_inputs(params)
+    result = generate_inputs(params)
+    tensors = {name: tensor for name, tensor in result if isinstance(tensor, torch.Tensor)}
     compute_golden(tensors, params)
 
     print(f"=== Paged Attention Golden Test ({params['name']}) ===")

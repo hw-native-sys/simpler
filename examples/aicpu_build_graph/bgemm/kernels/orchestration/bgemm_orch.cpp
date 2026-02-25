@@ -35,7 +35,7 @@ constexpr int NUM_P_BUFFERS = BATCH * GRID_M * GRID_N;
 constexpr int DEV_A = 0;
 constexpr int DEV_B = 1;
 constexpr int DEV_C = 2;
-constexpr int ARG_SIZE = 6;
+constexpr int ARG_SIZE = 2;
 }  // namespace
 
 extern "C" int orchestration(Runtime* runtime) {

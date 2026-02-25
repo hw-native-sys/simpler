@@ -1,69 +1,43 @@
 """
 Golden script for tensormap_and_ringbuffer example.
 
-This script defines the input data generation and expected output computation
-for the tensormap_and_ringbuffer example (both a2a3 and a2a3sim platforms).
-
 Computation:
     f = (a + b + 1) * (a + b + 2) + (a + b)
     where a=2.0, b=3.0, so f=47.0
 
-This is the same computation as host_build_graph/vector_example, but uses
-device-side orchestration (tensormap_and_ringbuffer runtime).
+Args layout: [ptr_a, ptr_b, ptr_f, size_a, size_b, size_f, SIZE]
 """
 
+import ctypes
 import torch
 
-# Output tensor names
 __outputs__ = ["f"]
 
-# Tensor order for orchestration function arguments
-# tensormap_and_ringbuffer args layout: [dev_a, dev_b, dev_f, size_a, size_b, size_f, SIZE]
-# Note: intermediate tensors (c, d, e, g) are allocated on-device by the runtime heap
-TENSOR_ORDER = ["a", "b", "f"]
-
-# Comparison tolerances
 RTOL = 1e-5
 ATOL = 1e-5
 
 
-def generate_inputs(params: dict) -> dict:
-    """
-    Generate input and output tensors.
-
-    Creates:
-    - a: 16384 elements, all 2.0
-    - b: 16384 elements, all 3.0
-    - f: 16384 elements, zeros (output)
-
-    Returns:
-        Dict of torch tensors with tensor names as keys
-    """
+def generate_inputs(params: dict) -> list:
     ROWS = 128
     COLS = 128
-    SIZE = ROWS * COLS  # 16384 elements
+    SIZE = ROWS * COLS
 
-    return {
-        "a": torch.full((SIZE,), 2.0, dtype=torch.float32),
-        "b": torch.full((SIZE,), 3.0, dtype=torch.float32),
-        "f": torch.zeros(SIZE, dtype=torch.float32),
-    }
+    a = torch.full((SIZE,), 2.0, dtype=torch.float32)
+    b = torch.full((SIZE,), 3.0, dtype=torch.float32)
+    f = torch.zeros(SIZE, dtype=torch.float32)
+
+    return [
+        ("a", a),
+        ("b", b),
+        ("f", f),
+        ("size_a", ctypes.c_int64(a.nbytes)),
+        ("size_b", ctypes.c_int64(b.nbytes)),
+        ("size_f", ctypes.c_int64(f.nbytes)),
+        ("SIZE", ctypes.c_int64(SIZE)),
+    ]
 
 
 def compute_golden(tensors: dict, params: dict) -> None:
-    """
-    Compute expected output in-place.
-
-    f = (a + b + 1) * (a + b + 2) + (a + b)
-      = (2 + 3 + 1) * (2 + 3 + 2) + (2 + 3)
-      = 6 * 7 + 5
-      = 47
-
-    Args:
-        tensors: Dict containing all tensors (inputs and outputs)
-        params: Parameter dict (unused in this example)
-    """
-    # Convert to torch tensors (handles both array types)
     a = torch.as_tensor(tensors["a"])
     b = torch.as_tensor(tensors["b"])
     tensors["f"][:] = (a + b + 1) * (a + b + 2) + (a + b)
