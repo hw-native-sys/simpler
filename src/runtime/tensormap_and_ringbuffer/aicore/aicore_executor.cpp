@@ -3,6 +3,7 @@
 #include "pto2_dispatch_payload.h"
 #include "common/perf_profiling.h"
 #include "aicore/performance_collector_aicore.h"
+#include "common/platform_config.h"  // Register-based communication (RegId, AICoreStatus)
 
 /**
  * Unified function pointer type for kernel dispatch
@@ -36,12 +37,12 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ void* 
 /**
  * AICore main execution loop
  *
- * Implements the AICPU-AICore handshake protocol:
- * 1. Wait for AICPU ready signal
- * 2. Signal AICore ready
- * 3. Poll for tasks and execute until quit signal
+ * Implements the AICPU-AICore register-based dispatch protocol:
+ * 1. Wait for AICPU ready signal via handshake buffer
+ * 2. Report physical core ID and core type, signal AICore ready
+ * 3. Poll DATA_MAIN_BASE register for task dispatch until exit signal
  *
- * Task dispatch uses PTO2DispatchPayload from PTO2 shared memory.
+ * Task dispatch uses PTO2DispatchPayload from per-core payload array.
  * Supports performance profiling when runtime->enable_profiling is true.
  *
  * @param runtime Pointer to Runtime in global memory
@@ -53,38 +54,47 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {
-        dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+        dcci(my_hank, SINGLE_CACHE_LINE);
     }
 
-    // Phase 2: Signal AICore is ready and report core type
-    my_hank->core_type = core_type;        // Report core type to AICPU
+    // Phase 2: Report physical core ID and core type, signal ready
+    my_hank->physical_core_id = get_physical_core_id();
+    my_hank->core_type = core_type;
     my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
 
-    // Check if profiling is enabled
-    bool profiling_enabled = runtime->enable_profiling;
+    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    // Record kernel ready time (before entering main loop)
-    // This timestamp represents when the AICore is ready to execute tasks
-    // but hasn't started executing any task yet.
-    // Used for: 1) Startup overhead analysis, 2) Cross-core time alignment
+    // Report initial idle status via register
+    write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::IDLE));
+
+    // Read per-core payload address from hank->task (written by AICPU before aicpu_ready)
+    __gm__ PTO2DispatchPayload* my_payload =
+        reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
+
+    bool profiling_enabled = runtime->enable_profiling;
     uint64_t kernel_ready_time = 0;
     if (profiling_enabled) {
         kernel_ready_time = get_sys_cnt_aicore();
     }
 
-    // Phase 3: Main execution loop - poll for tasks until quit signal
-    while (true) {
-        dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+    // Phase 3: Main execution loop - poll register for tasks until exit signal
+    volatile uint32_t task_id = 0;
+    volatile uint32_t last_task_id = 0;
 
-        // Check for quit command from AICPU
-        if (my_hank->control == 1) {
-            break;  // Exit kernel
+    while (true) {
+        task_id = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+        if (task_id == AICORE_EXIT_SIGNAL) {
+            break;
         }
 
-        // Execute task if assigned (task != 0)
-        if (my_hank->task_status == 1 && my_hank->task != 0) {
-            __gm__ PTO2DispatchPayload* payload =
-                reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
+        // Execute task if new (task_id encoding: 0=idle, task_id+1=task)
+        if (task_id != 0 && task_id != last_task_id) {
+            write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::BUSY));
+
+            // Invalidate cache to read fresh payload written by AICPU
+            dcci(my_payload, ENTIRE_DATA_CACHE);
+
+            __gm__ PTO2DispatchPayload* payload = my_payload;
 
             // Performance profiling: record start time
             uint64_t start_time = 0;
@@ -93,7 +103,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             }
 
             // Execute the task
-            execute_task(reinterpret_cast<__gm__ void*>(my_hank->task));
+            execute_task(reinterpret_cast<__gm__ void*>(payload));
 
             // Performance profiling: record task execution
             if (profiling_enabled) {
@@ -104,8 +114,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
                                        block_idx, core_type);
             }
 
-            // Mark task as complete (task_status: 0=idle, 1=busy)
-            my_hank->task_status = 0;
+            last_task_id = task_id;
+            write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::IDLE));
         }
     }
 }

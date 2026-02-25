@@ -4,6 +4,7 @@
 PLATFORM=""
 DEVICE_RANGE=""
 PARALLEL=false
+RUNTIME=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -13,6 +14,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -d|--device)
             DEVICE_RANGE="$2"
+            shift 2
+            ;;
+        -r|--runtime)
+            RUNTIME="$2"
             shift 2
             ;;
         --parallel)
@@ -25,6 +30,23 @@ while [[ $# -gt 0 ]]; do
             ;;
     esac
 done
+
+# Validate runtime if specified
+if [[ -n "$RUNTIME" ]]; then
+    VALID_RUNTIMES=("host_build_graph" "aicpu_build_graph" "tensormap_and_ringbuffer")
+    RUNTIME_VALID=false
+    for r in "${VALID_RUNTIMES[@]}"; do
+        if [[ "$RUNTIME" == "$r" ]]; then
+            RUNTIME_VALID=true
+            break
+        fi
+    done
+    if [[ "$RUNTIME_VALID" == "false" ]]; then
+        echo "Unknown runtime: $RUNTIME"
+        echo "Valid runtimes: ${VALID_RUNTIMES[*]}"
+        exit 1
+    fi
+fi
 
 # Parse device range (e.g., "5-8" or "5")
 if [[ "$DEVICE_RANGE" == *-* ]]; then
@@ -83,6 +105,11 @@ while IFS= read -r -d '' example_dir; do
 
     example_name="${example_dir#$EXAMPLES_DIR/}"
 
+    # Filter by runtime if specified
+    if [[ -n "$RUNTIME" && "$example_name" != "$RUNTIME"/* ]]; then
+        continue
+    fi
+
     if [[ -n "$PLATFORM" ]]; then
         if [[ "$PLATFORM" == "a2a3" ]]; then
             HW_TASK_NAMES+=("example:${example_name}")
@@ -114,6 +141,10 @@ if [[ -d "$DEVICE_TESTS_DIR" ]]; then
             golden="${test_dir}/golden.py"
             [[ -f "$kernel_config" && -f "$golden" ]] || continue
             test_name="${test_dir#$DEVICE_TESTS_DIR/}"
+            # Filter by runtime if specified
+            if [[ -n "$RUNTIME" && "$test_name" != "$RUNTIME"/* ]]; then
+                continue
+            fi
             HW_TASK_NAMES+=("device_test:${test_name}")
             HW_TASK_DIRS+=("${test_dir}")
         done < <(find "$DEVICE_TESTS_DIR" -mindepth 1 -type d -print0 | sort -z)

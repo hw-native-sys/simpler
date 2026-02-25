@@ -31,6 +31,11 @@
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
 
+// Register-based communication
+#include "common/platform_config.h"
+#include "aicpu/platform_regs.h"
+#include "aicpu/aicpu_regs.h"
+
 // Scheduler profiling helper
 #ifndef PTO2_ORCH_PROFILING
 #define PTO2_ORCH_PROFILING 1
@@ -53,10 +58,10 @@ typedef void (*DeviceOrchestrationFunc)(PTO2Runtime* rt, uint64_t* args, int arg
 // Config function exported by orchestration .so
 typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(uint64_t* args, int arg_count);
 
-constexpr int MAX_AICPU_THREADS = 4;
-constexpr int MAX_AIC_PER_THREAD = 24;
-constexpr int MAX_AIV_PER_THREAD = 48;
-constexpr int MAX_CORES_PER_THREAD = MAX_AIC_PER_THREAD + MAX_AIV_PER_THREAD;
+constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
+constexpr int MAX_AIC_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD;
+constexpr int MAX_AIV_PER_THREAD = PLATFORM_MAX_AIV_PER_THREAD;
+constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 
 // Maximum tasks for ready queue (PTO2 mode uses shared memory task count)
 constexpr int AICPU_MAX_READY_TASKS = 16384;
@@ -69,9 +74,11 @@ struct SpinLock {
     void unlock() { flag.store(0, std::memory_order_release); }
 };
 
-// Core information for discovery (aligned with host_build_graph)
+// Core information for discovery (with register address for fast dispatch)
 struct CoreInfo {
-    int worker_id;     // Index in runtime.workers[]
+    int worker_id;              // Index in runtime.workers[]
+    uint32_t physical_core_id;  // Hardware physical core ID (from AICore)
+    uint64_t reg_addr;          // Cached register address for fast access
     CoreType core_type;
 };
 
@@ -89,11 +96,20 @@ struct AicpuExecutor {
     int core_count_per_thread_[MAX_AICPU_THREADS];  // Actual core count per thread
     int core_assignments_[MAX_AICPU_THREADS][MAX_CORES_PER_THREAD];
 
-    // Core discovery arrays (aligned with host_build_graph)
+    // Core discovery arrays (with register addresses)
     CoreInfo aic_cores_[MAX_CORES_PER_THREAD];
     CoreInfo aiv_cores_[MAX_CORES_PER_THREAD];
     int aic_count_{0};
     int aiv_count_{0};
+
+    // Fast lookup: core_id -> reg_addr (for register-based dispatch)
+    uint64_t core_id_to_reg_addr_[MAX_CORES_PER_THREAD];
+
+    // Platform register base address array (set via get_platform_regs())
+    uint64_t regs_{0};
+
+    // Track executing task_id per core (-1 = idle)
+    int executing_task_ids_[MAX_CORES_PER_THREAD];
 
     // ===== Task queue state (FIFO circular queue, aligned with host_build_graph) =====
     // ===== Spinlock-based MPMC ready queues (lighter than std::mutex) =====
@@ -156,7 +172,7 @@ static PTO2DispatchPayload s_pto2_payload_per_core[RUNTIME_MAX_WORKER];
 
 /**
  * Handshake with all cores and discover their types
- * (Aligned with host_build_graph mechanism)
+ * Sets up register addresses for fast dispatch.
  */
 int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     Handshake* all_hanks = (Handshake*)runtime->workers;
@@ -167,12 +183,14 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
 
     DEV_INFO("Handshaking with %d cores", cores_total_num_);
 
-    // Step 1: Send handshake signal to all cores
+    // Step 1: Write per-core payload addresses and send handshake signal
+    // task must be written BEFORE aicpu_ready so AICore sees it after waking up
     for (int i = 0; i < cores_total_num_; i++) {
+        all_hanks[i].task = reinterpret_cast<uint64_t>(&s_pto2_payload_per_core[i]);
         all_hanks[i].aicpu_ready = 1;
     }
 
-    // Step 2: Wait for all cores to respond and collect core type
+    // Step 2: Wait for all cores to respond, collect core type and register addresses
     for (int i = 0; i < cores_total_num_; i++) {
         Handshake* hank = &all_hanks[i];
         while (hank->aicore_done == 0) {
@@ -180,16 +198,34 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
         }
 
         CoreType type = hank->core_type;
+        uint32_t physical_core_id = hank->physical_core_id;
+
+        // Get register address using physical_core_id
+        uint64_t* regs = reinterpret_cast<uint64_t*>(regs_);
+        uint64_t reg_addr = regs[physical_core_id];
+
         if (type == CoreType::AIC) {
             aic_cores_[aic_count_].worker_id = i;
+            aic_cores_[aic_count_].physical_core_id = physical_core_id;
+            aic_cores_[aic_count_].reg_addr = reg_addr;
             aic_cores_[aic_count_].core_type = type;
             aic_count_++;
-            DEV_INFO("Core %d: AIC", i);
+            DEV_INFO("Core %d: AIC, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
         } else {
             aiv_cores_[aiv_count_].worker_id = i;
+            aiv_cores_[aiv_count_].physical_core_id = physical_core_id;
+            aiv_cores_[aiv_count_].reg_addr = reg_addr;
             aiv_cores_[aiv_count_].core_type = type;
             aiv_count_++;
-            DEV_INFO("Core %d: AIV", i);
+            DEV_INFO("Core %d: AIV, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
+        }
+
+        core_id_to_reg_addr_[i] = reg_addr;
+
+        // Initialize fast path registers
+        if (reg_addr != 0) {
+            write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
+            write_reg(reg_addr, RegId::DATA_MAIN_BASE, 0);
         }
     }
 
@@ -285,6 +321,11 @@ int AicpuExecutor::init(Runtime* runtime) {
         return -1;
     }
 
+    // Initialize executing_task_ids_ to -1 (idle)
+    for (int i = 0; i < MAX_CORES_PER_THREAD; i++) {
+        executing_task_ids_[i] = -1;
+    }
+
     DEV_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num_);
 
     // Initialize runtime execution state
@@ -323,20 +364,23 @@ int AicpuExecutor::init(Runtime* runtime) {
 }
 
 /**
- * Shutdown AICore - Send quit signal to all AICore kernels
+ * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
 int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores, int core_num) {
+    (void)runtime;
     if (core_num == 0) return 0;
-
-    Handshake* all_hanks = (Handshake*)runtime->workers;
 
     DEV_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
 
     for (int i = 0; i < core_num; i++) {
         int core_id = cur_thread_cores[i];
-        Handshake* hank = &all_hanks[core_id];
-        DEV_INFO("Thread %d: AICPU hank addr = 0x%lx", thread_idx, (uint64_t)hank);
-        hank->control = 1;
+        uint64_t reg_addr = core_id_to_reg_addr_[core_id];
+        if (reg_addr != 0) {
+            write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+            write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
+        } else {
+            DEV_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
+        }
     }
     DEV_INFO("Thread %d: Shutdown complete", thread_idx);
     return 0;
@@ -462,8 +506,12 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         if (task_count > 0 && completed_tasks_.load(std::memory_order_acquire) >= task_count) {
             bool all_cores_idle = true;
             for (int i = 0; i < core_num; i++) {
-                Handshake* h = &hank[cur_thread_cores[i]];
-                if (h->task_status != 0 || h->task != 0) { all_cores_idle = false; break; }
+                int core_id = cur_thread_cores[i];
+                uint64_t reg_addr = core_id_to_reg_addr_[core_id];
+                AICoreStatus status = static_cast<AICoreStatus>(read_reg(reg_addr, RegId::COND));
+                if (status != AICoreStatus::IDLE || executing_task_ids_[core_id] >= 0) {
+                    all_cores_idle = false; break;
+                }
             }
             if (all_cores_idle && orch_done) break;
         }
@@ -550,16 +598,19 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         }
         CYCLE_COUNT_LAP(sched_orch_drain_cycle);
 
-        // Phase 1: Process completed tasks (Handshake.task = PTO2DispatchPayload*)
+        // Phase 1: Process completed tasks (register-based completion detection)
         for (int i = 0; i < core_num; i++) {
             int core_id = cur_thread_cores[i];
-            Handshake* h = &hank[core_id];
-            if (h->task_status == 0 && h->task != 0) {
-                PTO2DispatchPayload* payload = reinterpret_cast<PTO2DispatchPayload*>(h->task);
-                h->task = 0;
+            uint64_t reg_addr = core_id_to_reg_addr_[core_id];
+            AICoreStatus status = static_cast<AICoreStatus>(read_reg(reg_addr, RegId::COND));
+            if (status == AICoreStatus::IDLE && executing_task_ids_[core_id] >= 0) {
+                PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
+                int32_t task_id = executing_task_ids_[core_id];
+                executing_task_ids_[core_id] = -1;
 
                 // Write AICPU dispatch/finish timestamps into the PerfRecord
                 if (profiling_enabled) {
+                    Handshake* h = &hank[core_id];
                     uint64_t finish_ts = get_sys_cnt_aicpu();
                     PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
                     rmb();
@@ -574,7 +625,6 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                     }
                 }
 
-                int32_t task_id = payload->task_id;
                 PTO2TaskDescriptor* pto2_task = &task_descriptors[task_id & window_mask];
 
                 DEV_DEBUG("Thread %d: Core %d completed PTO2 task %d", thread_idx, core_id, task_id);
@@ -622,12 +672,14 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         }
         CYCLE_COUNT_LAP(sched_complete_cycle);
 
-        // Phase 2: Dispatch ready tasks to idle cores (build PTO2DispatchPayload)
+        // Phase 2: Dispatch ready tasks to idle cores (register-based dispatch)
         if (cur_thread_tasks_in_flight < core_num) {
             for (int i = 0; i < core_num; i++) {
                 int core_id = cur_thread_cores[i];
-                Handshake* h = &hank[core_id];
-                if (h->task_status == 0 && h->task == 0) {
+                uint64_t reg_addr = core_id_to_reg_addr_[core_id];
+                AICoreStatus status = static_cast<AICoreStatus>(read_reg(reg_addr, RegId::COND));
+                if (status == AICoreStatus::IDLE && executing_task_ids_[core_id] == -1) {
+                    Handshake* h = &hank[core_id];
                     int32_t task_id = -1;
                     if (h->core_type == CoreType::AIC) {
                         ready_queue_aic_lock_.lock();
@@ -646,7 +698,6 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
                         PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                         build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
-                        h->task = reinterpret_cast<uint64_t>(payload);
                         // Performance profiling: check if buffer needs switching
                         if (profiling_enabled) {
                             dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
@@ -656,12 +707,15 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                             }
                             core_dispatch_counts_[core_id]++;
                         }
-                        h->task_status = 1;
+                        // Pre-set COND=BUSY before writing task_id to prevent
+                        // false completion detection (AICPU seeing stale IDLE
+                        // before AICore has started the task)
+                        write_reg(reg_addr, RegId::COND, static_cast<uint64_t>(AICoreStatus::BUSY));
+                        write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id + 1));
+                        executing_task_ids_[core_id] = task_id;
                         cur_thread_tasks_in_flight++;
                         made_progress = true;
                         DEV_DEBUG("Thread %d: Dispatching PTO2 task %d to core %d", thread_idx, task_id, core_id);
-
-                        
                     }
                 }
             }
@@ -1007,6 +1061,13 @@ void AicpuExecutor::deinit() {
     aic_count_ = 0;
     aiv_count_ = 0;
 
+    // Reset register-related state
+    for (int i = 0; i < MAX_CORES_PER_THREAD; i++) {
+        executing_task_ids_[i] = -1;
+        core_id_to_reg_addr_[i] = 0;
+    }
+    regs_ = 0;
+
     DEV_INFO("DeInit: Runtime execution state reset");
 
     initialized_.store(false, std::memory_order_release);
@@ -1021,7 +1082,7 @@ void AicpuExecutor::deinit() {
 void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,
                                          const int* cur_thread_cores, int core_num,
                                          Handshake* hank) {
-    (void)runtime;  // Reserved for future use
+    (void)runtime;
     DEV_ALWAYS("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
 
     int completed = completed_tasks_.load(std::memory_order_acquire);
@@ -1035,31 +1096,34 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,
 
     int busy_cores = 0;
     int idle_cores = 0;
-    int anomaly_cores = 0;
 
     DEV_ALWAYS("Core Status:");
     for (int i = 0; i < core_num; i++) {
         int core_id = cur_thread_cores[i];
         Handshake* h = &hank[core_id];
-
         const char* core_type_str = core_type_to_string(h->core_type);
 
-        if (h->task != 0) {
-            PTO2DispatchPayload* payload = reinterpret_cast<PTO2DispatchPayload*>(h->task);
-            busy_cores++;
+        uint64_t reg_addr = core_id_to_reg_addr_[core_id];
+        AICoreStatus status = static_cast<AICoreStatus>(read_reg(reg_addr, RegId::COND));
+        int task_id = executing_task_ids_[core_id];
 
-            DEV_ALWAYS("  Core %d [%s, BUSY]: task_id=%d, kernel_id=%d",
-                     core_id, core_type_str,
-                     payload->task_id, payload->kernel_id);
-        } else if (h->task_status != 0) {
-            anomaly_cores++;
-            DEV_ALWAYS("  Core %d [%s, ANOMALY]: status=BUSY but task=NULL", core_id, core_type_str);
+        if (status != AICoreStatus::IDLE || task_id >= 0) {
+            busy_cores++;
+            if (task_id >= 0) {
+                PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
+                DEV_ALWAYS("  Core %d [%s, BUSY]: COND=%d, task_id=%d, kernel_id=%d",
+                         core_id, core_type_str, static_cast<uint32_t>(status),
+                         payload->task_id, payload->kernel_id);
+            } else {
+                DEV_ALWAYS("  Core %d [%s, BUSY]: COND=%d but task_id not tracked",
+                         core_id, core_type_str, static_cast<uint32_t>(status));
+            }
         } else {
             idle_cores++;
         }
     }
 
-    DEV_ALWAYS("Summary: %d busy, %d idle, %d anomaly", busy_cores, idle_cores, anomaly_cores);
+    DEV_ALWAYS("Summary: %d busy, %d idle", busy_cores, idle_cores);
 
     // Diagnose deadlock vs livelock
     if (busy_cores == 0 && aic_ready == 0 && aiv_ready == 0 && completed < total) {
@@ -1096,6 +1160,9 @@ extern "C" int aicpu_execute(Runtime* runtime) {
     }
 
     DEV_INFO("%s", "aicpu_execute: Starting AICPU kernel execution");
+
+    // Get platform register addresses from platform-level global
+    g_aicpu_executor.regs_ = get_platform_regs();
 
     g_aicpu_executor.init(runtime);
 
