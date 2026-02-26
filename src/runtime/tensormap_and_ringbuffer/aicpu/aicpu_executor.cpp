@@ -554,7 +554,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         for (int i = 0; i < core_num; i++) {
             int core_id = cur_thread_cores[i];
             Handshake* h = &hank[core_id];
-            if (h->task_status == 0 && h->task != 0) {
+            if (__atomic_load_n(const_cast<int32_t*>(&h->task_status), __ATOMIC_ACQUIRE) == 0 && h->task != 0) {
                 PTO2DispatchPayload* payload = reinterpret_cast<PTO2DispatchPayload*>(h->task);
                 h->task = 0;
 
@@ -656,7 +656,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                             }
                             core_dispatch_counts_[core_id]++;
                         }
-                        h->task_status = 1;
+                        __atomic_store_n(const_cast<int32_t*>(&h->task_status), 1, __ATOMIC_RELEASE);
                         cur_thread_tasks_in_flight++;
                         made_progress = true;
                         DEV_DEBUG("Thread %d: Dispatching PTO2 task %d to core %d", thread_idx, task_id, core_id);

@@ -21,7 +21,7 @@
 
 // dcci (Data Cache Clean and Invalidate) - no-op in simulation
 // Use variadic macro to support both 2-arg and 3-arg calls
-#define dcci(...) ((void)0)
+#define dcci(...) __atomic_thread_fence(__ATOMIC_ACQUIRE)
 
 // Cache coherency constants (no-op in simulation)
 #define ENTIRE_DATA_CACHE 0
