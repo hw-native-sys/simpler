@@ -518,85 +518,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
         bool made_progress = false;
 
-        // Incremental scan: discover root tasks (fanin_count == 0)
-        {
-            int32_t visible = __atomic_load_n(&header->current_task_index, __ATOMIC_ACQUIRE);
-
-            // Update perf header total_tasks if visible tasks have changed
-            if (profiling_enabled && visible > 0 && visible != last_reported_task_count) {
-                perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(visible));
-
-                DEV_INFO("Thread %d: Updated perf total_tasks to %d%s",
-                            thread_idx, visible, orch_done ? " (final)" : "");
-
-                last_reported_task_count = visible;
-            }
-
-            while (true) {
-                int32_t idx = next_scan_index_.load(std::memory_order_acquire);
-                if (idx >= visible) break;
-                if (!next_scan_index_.compare_exchange_weak(idx, idx + 1,
-                        std::memory_order_acq_rel, std::memory_order_acquire)) continue;
-
-                int32_t slot = idx & window_mask;
-
-                PTO2TaskDescriptor* t = &task_descriptors[slot];
-                int32_t fanin_count = __atomic_load_n(&t->fanin_count, __ATOMIC_ACQUIRE);
-                if (fanin_count == 0) {
-                    // Mark as enqueued (state=1) to prevent double-enqueue
-                    __atomic_store_n(&s_pto2_task_completed[slot], 1, __ATOMIC_RELEASE);
-                    int32_t wt = t->worker_type;
-                    if (wt == PTO2_WORKER_CUBE) {
-                        ready_queue_aic_lock_.lock();
-                        ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = idx;
-                        ready_queue_aic_lock_.unlock();
-                    } else {
-                        ready_queue_aiv_lock_.lock();
-                        ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = idx;
-                        ready_queue_aiv_lock_.unlock();
-                    }
-                    made_progress = true;
-                }
-            }
-        }
-        CYCLE_COUNT_LAP(sched_scan_cycle);
-
-
-        // Drain orchestrator ready queue: tasks made ready by orchestrator's early-return path
-        // (producer already completed → refcount incremented directly, consumer pushed to queue)
-        if (orch_ready_queue_ != nullptr) {
-            while (true) {
-                int32_t head = __atomic_load_n(orch_ready_head_, __ATOMIC_ACQUIRE);
-                int32_t tail = __atomic_load_n(orch_ready_tail_, __ATOMIC_ACQUIRE);
-                if (head == tail) break;  // queue empty
-
-                // CAS to claim this slot (multiple scheduler threads compete)
-                if (!__atomic_compare_exchange_n(orch_ready_head_, &head, head + 1,
-                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
-
-                int32_t task_id = orch_ready_queue_[head & (orch_ready_capacity_ - 1)];
-                int32_t slot = task_id & window_mask;
-
-                // CAS from 0 → 1 to claim enqueue rights (may already be enqueued by fanout path)
-                int32_t expected = 0;
-                if (!__atomic_compare_exchange_n(&s_pto2_task_completed[slot], &expected, 1,
-                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
-
-                PTO2TaskDescriptor* t = &task_descriptors[slot];
-                int32_t wt = t->worker_type;
-                if (wt == PTO2_WORKER_CUBE) {
-                    ready_queue_aic_lock_.lock();
-                    ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = task_id;
-                    ready_queue_aic_lock_.unlock();
-                } else {
-                    ready_queue_aiv_lock_.lock();
-                    ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = task_id;
-                    ready_queue_aiv_lock_.unlock();
-                }
-                made_progress = true;
-            }
-        }
-        CYCLE_COUNT_LAP(sched_orch_drain_cycle);
+        // Process completed and dispatch FIRST to minimize Sched (dispatch→finish) latency.
+        // Sched time = finish_ts - dispatch_ts; recording finish_ts here at loop start reduces
+        // tail overhead (time from AICore done to AICPU recording finish).
 
         // Phase 1: Process completed tasks (register-based completion detection)
         for (int i = 0; i < core_num; i++) {
@@ -756,6 +680,85 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             }
         }
         CYCLE_COUNT_LAP(sched_dispatch_cycle);
+
+        // Incremental scan: discover root tasks (fanin_count == 0)
+        {
+            int32_t visible = __atomic_load_n(&header->current_task_index, __ATOMIC_ACQUIRE);
+
+            // Update perf header total_tasks if visible tasks have changed
+            if (profiling_enabled && visible > 0 && visible != last_reported_task_count) {
+                perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(visible));
+
+                DEV_INFO("Thread %d: Updated perf total_tasks to %d%s",
+                            thread_idx, visible, orch_done ? " (final)" : "");
+
+                last_reported_task_count = visible;
+            }
+
+            while (true) {
+                int32_t idx = next_scan_index_.load(std::memory_order_acquire);
+                if (idx >= visible) break;
+                if (!next_scan_index_.compare_exchange_weak(idx, idx + 1,
+                        std::memory_order_acq_rel, std::memory_order_acquire)) continue;
+
+                int32_t slot = idx & window_mask;
+
+                PTO2TaskDescriptor* t = &task_descriptors[slot];
+                int32_t fanin_count = __atomic_load_n(&t->fanin_count, __ATOMIC_ACQUIRE);
+                if (fanin_count == 0) {
+                    // Mark as enqueued (state=1) to prevent double-enqueue
+                    __atomic_store_n(&s_pto2_task_completed[slot], 1, __ATOMIC_RELEASE);
+                    int32_t wt = t->worker_type;
+                    if (wt == PTO2_WORKER_CUBE) {
+                        ready_queue_aic_lock_.lock();
+                        ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = idx;
+                        ready_queue_aic_lock_.unlock();
+                    } else {
+                        ready_queue_aiv_lock_.lock();
+                        ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = idx;
+                        ready_queue_aiv_lock_.unlock();
+                    }
+                    made_progress = true;
+                }
+            }
+        }
+        CYCLE_COUNT_LAP(sched_scan_cycle);
+
+        // Drain orchestrator ready queue: tasks made ready by orchestrator's early-return path
+        // (producer already completed → refcount incremented directly, consumer pushed to queue)
+        if (orch_ready_queue_ != nullptr) {
+            while (true) {
+                int32_t head = __atomic_load_n(orch_ready_head_, __ATOMIC_ACQUIRE);
+                int32_t tail = __atomic_load_n(orch_ready_tail_, __ATOMIC_ACQUIRE);
+                if (head == tail) break;  // queue empty
+
+                // CAS to claim this slot (multiple scheduler threads compete)
+                if (!__atomic_compare_exchange_n(orch_ready_head_, &head, head + 1,
+                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+
+                int32_t task_id = orch_ready_queue_[head & (orch_ready_capacity_ - 1)];
+                int32_t slot = task_id & window_mask;
+
+                // CAS from 0 → 1 to claim enqueue rights (may already be enqueued by fanout path)
+                int32_t expected = 0;
+                if (!__atomic_compare_exchange_n(&s_pto2_task_completed[slot], &expected, 1,
+                        false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) continue;
+
+                PTO2TaskDescriptor* t = &task_descriptors[slot];
+                int32_t wt = t->worker_type;
+                if (wt == PTO2_WORKER_CUBE) {
+                    ready_queue_aic_lock_.lock();
+                    ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = task_id;
+                    ready_queue_aic_lock_.unlock();
+                } else {
+                    ready_queue_aiv_lock_.lock();
+                    ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = task_id;
+                    ready_queue_aiv_lock_.unlock();
+                }
+                made_progress = true;
+            }
+        }
+        CYCLE_COUNT_LAP(sched_orch_drain_cycle);
 
         if (!made_progress) {
             idle_iterations++;
