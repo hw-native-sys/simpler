@@ -301,9 +301,11 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     int32_t fanin_count = 0;
 
     task->param_count = num_params;
-    // Bulk copy all params at once
+    // Bulk copy param descriptors (type, tensor pointer, scalar); no tensor buffer content is copied.
     memcpy(task->params, params, num_params * sizeof(PTOParam));
-    // Copy tensor data into task-owned storage; redirect pointers
+    // Copy only Tensor *descriptors* (metadata: addr, size, strides, shape) into task-owned storage;
+    // redirect task->params[i].tensor to point to task->tensor_copies[i]. No allocation here;
+    // output buffer allocation happens in Step 3, and we write back buffer.addr to the caller's tensor.
     for (int i = 0; i < num_params; i++) {
         if (params[i].tensor) {
             task->tensor_copies[i] = *params[i].tensor;
@@ -363,6 +365,8 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
             }
 
             case PTOParamType::OUTPUT: {
+                // OUTPUT must have a non-null tensor (descriptor for shape/size); no allocation in make_tensor.
+                assert(params[i].tensor && "OUTPUT param must have a non-NULL tensor descriptor");
                 // Only allocate from ring buffer when caller did not provide an address
                 if (params[i].tensor->buffer.addr == 0) {
                     total_output_size += PTO2_ALIGN_UP(params[i].tensor->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
@@ -383,13 +387,14 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         task->packed_buffer_end = (char*)task->packed_buffer_base + total_output_size;
 
         // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(size, 1024)
+        // Allocation happens here only; no memcpy of buffer content. Caller's tensor gets addr written back.
         int32_t offset = 0;
         for (int i = 0; i < task->param_count; i++) {
             if (task->params[i].type == PTOParamType::OUTPUT) {
                 if (task->tensor_copies[i].buffer.addr == 0) {
                     uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
                     task->tensor_copies[i].buffer.addr = alloc_addr;
-                    // Write back through caller's pointer (implicit update)
+                    // Write back to caller's tensor so orchestration stack sees the allocated address (no copy)
                     params[i].tensor->buffer.addr = alloc_addr;
                     offset += PTO2_ALIGN_UP(task->tensor_copies[i].buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
