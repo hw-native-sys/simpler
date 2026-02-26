@@ -48,12 +48,12 @@ using PerfRegisterCallback = int (*)(void* dev_ptr, size_t size, int device_id,
 /**
  * Memory unregister callback
  *
- * @param host_ptr Host-mapped pointer
+ * @param dev_ptr Device memory pointer
  * @param device_id Device ID
  * @param user_data User-provided context pointer
  * @return 0 on success, error code on failure
  */
-using PerfUnregisterCallback = int (*)(void* host_ptr, int device_id, void* user_data);
+using PerfUnregisterCallback = int (*)(void* dev_ptr, int device_id, void* user_data);
 
 /**
  * Memory free callback
@@ -145,6 +145,7 @@ private:
     // Shared memory pointers
     void* perf_shared_mem_dev_{nullptr};   // Device memory pointer
     void* perf_shared_mem_host_{nullptr};  // Host-mapped pointer
+    bool was_registered_{false};           // True if register_cb was called successfully
     int device_id_{-1};
 
     // Collected data

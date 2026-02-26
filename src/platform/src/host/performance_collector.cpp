@@ -69,6 +69,11 @@ int PerformanceCollector::initialize(Runtime& runtime,
             LOG_ERROR("Memory registration failed: %d", rc);
             return rc;
         }
+        was_registered_ = true;
+        if (perf_host_ptr == nullptr) {
+            LOG_ERROR("register_cb succeeded but returned null host_ptr");
+            return -1;
+        }
         LOG_DEBUG("Mapped to host memory: %p", perf_host_ptr);
     } else {
         // Simulation mode: both pointers point to same memory
@@ -380,8 +385,12 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
     LOG_DEBUG("Cleaning up performance profiling resources");
 
     // Unregister host mapping (optional)
-    if (unregister_cb != nullptr && perf_shared_mem_host_ != perf_shared_mem_dev_) {
-        unregister_cb(perf_shared_mem_host_, device_id_, user_data);
+    if (unregister_cb != nullptr && was_registered_) {
+        int rc = unregister_cb(perf_shared_mem_dev_, device_id_, user_data);
+        if (rc != 0) {
+            LOG_ERROR("halHostUnregister failed: %d", rc);
+            return rc;
+        }
         LOG_DEBUG("Host mapping unregistered");
     }
 
@@ -393,6 +402,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
 
     perf_shared_mem_dev_ = nullptr;
     perf_shared_mem_host_ = nullptr;
+    was_registered_ = false;
     collected_perf_records_.clear();
     device_id_ = -1;
 

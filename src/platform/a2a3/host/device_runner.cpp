@@ -488,11 +488,11 @@ int DeviceRunner::finalize() {
 
     // Cleanup performance profiling
     if (perf_collector_.is_initialized()) {
-        auto unregister_cb = [](void* host_ptr, int device_id, void* user_data) -> int {
+        auto unregister_cb = [](void* dev_ptr, int device_id, void* user_data) -> int {
             (void)user_data;
             HalHostUnregisterFn fn = get_halHostUnregister();
             if (fn != nullptr) {
-                return fn(host_ptr, device_id);
+                return fn(dev_ptr, device_id);
             }
             return 0;
         };
