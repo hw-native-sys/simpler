@@ -102,12 +102,48 @@ def load_kernel_config(config_path):
     return func_id_to_name
 
 
-def print_task_statistics(tasks, func_id_to_name=None):
+def parse_sched_cpu_from_device_log(log_path, task_count):
+    """Parse device log for PTO2 scheduler stats and return scheduler CPU time per task (us).
+
+    Looks for lines like: "Thread N: PTO2 scheduler stats: ... total=32522.740us"
+    Sums the 'total' values (one per scheduler thread, typically 3) and divides by task_count.
+
+    Returns:
+        float: scheduler_us_per_task, or None if parsing failed / file missing
+    """
+    import re
+    path = Path(log_path)
+    if not path.exists() or task_count <= 0:
+        return None
+    pattern = re.compile(r'total=([\d.]+)us')
+    totals = []
+    try:
+        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+            for line in f:
+                m = pattern.search(line)
+                if m and 'PTO2 scheduler stats' in line:
+                    totals.append(float(m.group(1)))
+    except Exception:
+        return None
+    if not totals:
+        return None
+    return sum(totals) / task_count
+
+
+def print_task_statistics(tasks, func_id_to_name=None, sched_cpu_us_per_task=None):
     """Print task statistics grouped by func_id.
+
+    Exec = kernel execution time (end_time_us - start_time_us) on AICore.
+    Latency = AICPU view: finish_time_us - dispatch_time_us (includes head OH + Exec + tail OH).
+    High Latency with low Exec means scheduler/polling overhead (tail OH = finish_ts recorded
+    when the scheduler loop next sees the completed handshake; reordering the loop to process
+    completed tasks first reduces this).
 
     Args:
         tasks: List of task dicts
         func_id_to_name: Optional dict mapping func_id to function name
+        sched_cpu_us_per_task: Optional AICPU scheduler CPU time per task (us),
+            parsed from device log
     """
     from collections import defaultdict
 
@@ -116,9 +152,9 @@ def print_task_statistics(tasks, func_id_to_name=None):
         'durations': [],
         'head_overheads': [],
         'tail_overheads': [],
-        'schedule_times': [],
+        'latencies': [],
         'total_exec_time': 0.0,
-        'total_schedule_time': 0.0
+        'total_latency': 0.0
     })
 
     # Track global min dispatch and max finish times
@@ -145,13 +181,13 @@ def print_task_statistics(tasks, func_id_to_name=None):
             tail_overhead = finish_time - end_time
             func_stats[func_id]['tail_overheads'].append(tail_overhead)
 
-            # Schedule time: finish_time_us - dispatch_time_us
-            schedule_time = finish_time - dispatch_time
-            func_stats[func_id]['schedule_times'].append(schedule_time)
+            # Latency: finish_time_us - dispatch_time_us
+            latency = finish_time - dispatch_time
+            func_stats[func_id]['latencies'].append(latency)
 
-            # Accumulate execution time and schedule time for ratio calculation
+            # Accumulate execution time and latency for ratio calculation
             func_stats[func_id]['total_exec_time'] += duration
-            func_stats[func_id]['total_schedule_time'] += schedule_time
+            func_stats[func_id]['total_latency'] += latency
 
             # Track global times
             min_dispatch_time = min(min_dispatch_time, dispatch_time)
@@ -160,9 +196,10 @@ def print_task_statistics(tasks, func_id_to_name=None):
     # Print statistics
     print("\n" + "=" * 160)
     print("Task Statistics by Function")
+    print("  Exec = kernel time on AICore; Latency = dispatch->finish (incl. head OH + Exec + tail OH)")
     print("=" * 160)
-    print(f"{'Func_ID':<8} {'Func_Name':<12} {'Count':^6} {'Total_Exec/Sched(us)':^25} {'Avg_Exec/Sched(us)':^23} "
-          f"{'Min_Exec/Sched(us)':^23} {'Max_Exec/Sched(us)':^23} {'Avg_Head/Tail_OH(us)':^23} {'Exec_%':^8}")
+    print(f"{'Func_ID':<8} {'Func_Name':<12} {'Count':^6} {'Total_Exec/Latency(us)':^25} {'Avg_Exec/Latency(us)':^23} "
+          f"{'Min_Exec/Latency(us)':^23} {'Max_Exec/Latency(us)':^23} {'Avg_Head/Tail_OH(us)':^23} {'Exec_%':^8}")
     print("-" * 160)
 
     # Sort by func_id for consistent output
@@ -191,19 +228,19 @@ def print_task_statistics(tasks, func_id_to_name=None):
         # Calculate averages for new metrics
         avg_head_overhead = sum(stats['head_overheads']) / len(stats['head_overheads']) if stats['head_overheads'] else 0
         avg_tail_overhead = sum(stats['tail_overheads']) / len(stats['tail_overheads']) if stats['tail_overheads'] else 0
-        avg_schedule_time = stats['total_schedule_time'] / count if count > 0 else 0
-        min_schedule_time = min(stats['schedule_times']) if stats['schedule_times'] else 0
-        max_schedule_time = max(stats['schedule_times']) if stats['schedule_times'] else 0
-        total_schedule_time = stats['total_schedule_time']
+        avg_latency = stats['total_latency'] / count if count > 0 else 0
+        min_latency = min(stats['latencies']) if stats['latencies'] else 0
+        max_latency = max(stats['latencies']) if stats['latencies'] else 0
+        total_latency = stats['total_latency']
 
-        # Calculate execution ratio: total_exec_time / total_schedule_time
-        exec_ratio = (stats['total_exec_time'] / stats['total_schedule_time'] * 100) if stats['total_schedule_time'] > 0 else 0
+        # Calculate execution ratio: total_exec_time / total_latency
+        exec_ratio = (stats['total_exec_time'] / stats['total_latency'] * 100) if stats['total_latency'] > 0 else 0
 
-        # Format combined exec/sched values
-        total_combined = f"{sum_duration:.2f}/{total_schedule_time:.2f}"
-        avg_combined = f"{avg_duration:.2f}/{avg_schedule_time:.2f}"
-        min_combined = f"{min_duration:.2f}/{min_schedule_time:.2f}"
-        max_combined = f"{max_duration:.2f}/{max_schedule_time:.2f}"
+        # Format combined exec/latency values
+        total_combined = f"{sum_duration:.2f}/{total_latency:.2f}"
+        avg_combined = f"{avg_duration:.2f}/{avg_latency:.2f}"
+        min_combined = f"{min_duration:.2f}/{min_latency:.2f}"
+        max_combined = f"{max_duration:.2f}/{max_latency:.2f}"
         overhead_combined = f"{avg_head_overhead:.2f}/{avg_tail_overhead:.2f}"
 
         print(f"{func_id:<8} {func_name:<12} {count:^6} {total_combined:^25} {avg_combined:^23} "
@@ -212,15 +249,27 @@ def print_task_statistics(tasks, func_id_to_name=None):
     # Print total row
     print("-" * 160)
 
-    # Calculate total schedule time (sum of all schedule times)
-    total_schedule_sum = sum(stats['total_schedule_time'] for stats in func_stats.values())
-    total_combined = f"{total_duration:.2f}/{total_schedule_sum:.2f}"
+    # Calculate total latency (sum of all latencies)
+    total_latency_sum = sum(stats['total_latency'] for stats in func_stats.values())
+    total_combined = f"{total_duration:.2f}/{total_latency_sum:.2f}"
     print(f"{'TOTAL':<21} {total_count:^6} {total_combined:^25}")
 
     # Print total test execution time
     if min_dispatch_time != float('inf') and max_finish_time != float('-inf'):
         total_test_time = max_finish_time - min_dispatch_time
         print(f"\nTotal Test Time: {total_test_time:.2f} us (from earliest dispatch to latest finish)")
+
+    # Task execution vs Scheduler overhead summary
+    if total_count > 0 and total_latency_sum > 0:
+        avg_exec_us = total_duration / total_count
+        avg_latency_us = total_latency_sum / total_count
+        exec_latency_ratio_pct = total_duration / total_latency_sum * 100
+        print("\n--- Task execution vs Scheduler overhead ---")
+        print(f"  Per-task (all):  Avg Exec = {avg_exec_us:.2f} us,  Avg Latency (dispatch->finish) = {avg_latency_us:.2f} us,  Exec/Latency = {exec_latency_ratio_pct:.2f}%")
+        if sched_cpu_us_per_task is not None:
+            exec_sched_cpu_ratio = (avg_exec_us / sched_cpu_us_per_task * 100) if sched_cpu_us_per_task > 0 else 0
+            print(f"  Sched CPU (from device log): {sched_cpu_us_per_task:.2f} us/task  (Exec/Sched_CPU = {exec_sched_cpu_ratio:.2f}%)")
+        print("  (Latency = dispatch to finish; Sched CPU = AICPU scheduler thread CPU time per task, from device log.)")
 
     print("=" * 160)
 
@@ -489,6 +538,7 @@ Examples:
     parser.add_argument('input', nargs='?', help='Input JSON file (.json). If not specified, uses the latest perf_swimlane_*.json file in outputs/ directory')
     parser.add_argument('-o', '--output', help='Output JSON file (default: outputs/merged_swimlane_<timestamp>.json)')
     parser.add_argument('-k', '--kernel-config', help='Path to kernel_config.py file for func_id to function name mapping')
+    parser.add_argument('--device-log', help='Path to device log file to extract scheduler loop overhead (PTO2 scheduler stats total=...us per thread)')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
 
     args = parser.parse_args()
@@ -577,8 +627,15 @@ Examples:
         print(f"  Output: {output_path}")
         print(f"\nTo visualize: Open https://ui.perfetto.dev/ and drag in {output_path}")
 
-        # Print task statistics
-        print_task_statistics(data['tasks'], func_names)
+        # Optional: parse sched CPU from device log
+        sched_cpu_us = None
+        if args.device_log:
+            sched_cpu_us = parse_sched_cpu_from_device_log(args.device_log, len(data['tasks']))
+            if args.verbose and sched_cpu_us is not None:
+                print(f"  Parsed sched CPU from device log: {sched_cpu_us:.2f} us/task")
+
+        # Print task statistics (incl. task execution vs scheduler overhead)
+        print_task_statistics(data['tasks'], func_names, sched_cpu_us_per_task=sched_cpu_us)
 
         return 0
 

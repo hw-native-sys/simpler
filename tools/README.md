@@ -5,6 +5,7 @@
 ## 工具列表
 
 - **[swimlane_converter.py](#swimlane_converterpy)** - 转换为 Chrome Trace Event 可视化格式
+- **[sched_overhead_analysis.py](#sched_overhead_analysispy)** - Scheduler 开销分析（Tail OH 分解）
 - **[perf_to_mermaid.py](#perf_to_mermaidpy)** - 转换为 Mermaid 依赖图
 
 ---
@@ -44,6 +45,7 @@ python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -
 | `input` | | 输入 JSON 文件（perf_swimlane_*.json）。如果省略，使用 outputs/ 中最新的文件 |
 | `--output` | `-o` | 输出 JSON 文件（默认：outputs/merged_swimlane_<timestamp>.json） |
 | `--kernel-config` | `-k` | kernel_config.py 文件路径，用于函数名映射 |
+| `--device-log` | | 设备日志文件路径，用于提取 scheduler CPU 开销 |
 | `--verbose` | `-v` | 启用详细输出 |
 
 ### 输出内容
@@ -58,31 +60,14 @@ python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -
 
 #### 2. 任务统计信息
 
-按函数分组的统计摘要（打印到控制台）：
+按函数分组的统计摘要（打印到控制台），包含 Exec/Latency 对比和调度开销分析：
 
-```
-========================================================================================================
-Task Statistics by Function
-========================================================================================================
-Func ID  Func Name                Count    Total (us)     Avg (us)     Min (us)     Max (us)
---------------------------------------------------------------------------------------------------------
-0        QK                          10       1502.50       150.25       120.50       180.30
-1        SF                          10       2001.00       200.10       180.20       220.50
-2        PV                          10       1758.00       175.80       160.00       190.40
-3        UP                          10       1005.00       100.50        90.10       110.20
---------------------------------------------------------------------------------------------------------
-TOTAL                                40       6266.50
-========================================================================================================
-```
+- **Exec**：AICore 上的 kernel 执行时间（end_time - start_time）
+- **Latency**：AICPU 视角的端到端延迟（finish_time - dispatch_time，包含 head OH + Exec + tail OH）
+- **Head/Tail OH**：调度头部/尾部开销
+- **Exec_%**：Exec / Latency 百分比（kernel 利用率）
 
-统计信息包括：
-- **Func ID**：kernel 配置中的函数标识符
-- **Func Name**：函数名称（来自 kernel_config.py 或自动生成）
-- **Count**：该函数的任务数量
-- **Total (us)**：该函数所有任务的总执行时间（微秒）
-- **Avg (us)**：每个任务的平均执行时间（微秒）
-- **Min (us)**：最小执行时间（微秒）
-- **Max (us)**：最大执行时间（微秒）
+传入 `--device-log` 时，还会输出 Sched CPU（AICPU scheduler 线程实际 CPU 时间 per task）。
 
 ### 与 run_example.py 集成
 
@@ -101,6 +86,45 @@ python examples/scripts/run_example.py \
 2. 从 `-k` 指定的 kernel_config.py 加载函数名
 3. 生成 `merged_swimlane_*.json` 用于可视化
 4. 将任务统计信息打印到控制台
+
+---
+
+## sched_overhead_analysis.py
+
+分析 AICPU scheduler 的调度开销，定量分解 Tail OH（任务完成到 scheduler 确认之间的延迟）的来源。
+
+### 功能概述
+
+`sched_overhead_analysis.py` 从两个数据源进行分析：
+1. **Perf profiling 数据**（`perf_swimlane_*.json`）：提取每个 task 的 Exec / Head OH / Tail OH 时间分解
+2. **设备日志**（device log）：解析 AICPU scheduler 线程的循环分解（scan / complete / dispatch / yield）、锁竞争和 fanout 统计
+
+### 基本用法
+
+```bash
+# 自动选取最新的 perf 数据和设备日志
+python3 tools/sched_overhead_analysis.py
+
+# 指定文件
+python3 tools/sched_overhead_analysis.py \
+    --perf-json outputs/perf_swimlane_20260210_143526.json \
+    --device-log ~/ascend/log/debug/device-0/device-*.log
+```
+
+### 命令行选项
+
+| 选项 | 说明 |
+|------|------|
+| `--perf-json` | perf_swimlane_*.json 文件路径。省略时自动选取 outputs/ 中最新的文件 |
+| `--device-log` | 设备日志文件路径。省略时自动选取 ~/ascend/log/debug/device-0/ 中最新的 .log |
+
+### 输出内容
+
+分三部分输出：
+
+- **Part 1：Per-task time breakdown** — Exec / Head OH / Tail OH 各占 Latency 的百分比
+- **Part 2：AICPU scheduler loop breakdown** — 各 scheduler 线程的循环统计、各阶段（scan / complete / dispatch / yield）耗时占比、锁竞争和 fanout 统计
+- **Part 3：Tail OH distribution & cause analysis** — Tail OH 分位数分布（P10~P99）、scheduler CPU time per task 分解（按占比降序）、Tail OH 与 scheduler loop 迭代的关联分析
 
 ---
 
