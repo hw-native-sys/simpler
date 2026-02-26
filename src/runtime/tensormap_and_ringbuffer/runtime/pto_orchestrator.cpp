@@ -407,8 +407,8 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     for (int i = 0; i < fanin_count; i++) {
         task->fanin_head = pto2_dep_list_prepend(&orch->dep_pool, task->fanin_head, fanin_temp[i]);
     }
-    // Use release semantics to ensure fanin list is visible before fanin_count
-    __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_RELEASE);
+    // Use SEQ_CST to pair with the scheduler's SEQ_CST fetch_add + load (IRIW on ARM)
+    __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_SEQ_CST);
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
 
@@ -419,7 +419,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // ready queue so scheduler threads can pick it up without an O(N) scan.
     if (orch->aicpu_fanin_refcount && fanin_count > 0) {
         int32_t slot = task_id & orch->aicpu_window_mask;
-        int32_t refcount = __atomic_load_n(&orch->aicpu_fanin_refcount[slot], __ATOMIC_ACQUIRE);
+        int32_t refcount = __atomic_load_n(&orch->aicpu_fanin_refcount[slot], __ATOMIC_SEQ_CST);
         if (refcount >= fanin_count) {
             // All producers already completed — push to orch ready queue
             int32_t tail = orch->orch_ready_tail;

@@ -654,7 +654,23 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 int32_t fanout_head = (int32_t)pto2_task->fanout_head;
                 pto2_fanout_unlock(pto2_task);
 
-                // Traverse fanout outside lock
+                // Traverse fanout (no lock)
+                //
+                // SEQ_CST on the refcount increment and fanin_count load breaks the IRIW
+                // (Independent Reads of Independent Writes) hazard with the orchestrator's
+                // Step 5 / Step 5b:
+                //
+                //   Thread 0 (here):           Thread 3 (orchestrator Step 5/5b):
+                //     fetch_add(refcount, SEQ_CST)   store(fanin_count=N, SEQ_CST)
+                //     load(fanin_count,  SEQ_CST)    load(refcount,       SEQ_CST)
+                //
+                // On ARM (IRIW is architecturally allowed with ACQ/REL), both threads could
+                // simultaneously read stale values — this thread sees fanin_count=0 and Step 5b
+                // sees refcount<N — leaving the consumer stuck forever.
+                //
+                // With SEQ_CST, C++ guarantees a single total order over all SEQ_CST ops.
+                // In any ordering the two writes fall, one of the two reads will observe the
+                // other thread's write, ensuring the consumer is enqueued exactly once.
                 int32_t fanout_len = 0;
                 int32_t current = fanout_head;
                 while (current > 0) {
@@ -662,9 +678,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                     PTO2DepListEntry* entry = &dep_list_pool[current];
                     int32_t consumer_id = entry->task_id;
                     int32_t consumer_slot = consumer_id & window_mask;
-                    int prev = __atomic_fetch_add(&s_pto2_fanin_refcount[consumer_slot], 1, __ATOMIC_ACQ_REL);
+                    int prev = __atomic_fetch_add(&s_pto2_fanin_refcount[consumer_slot], 1, __ATOMIC_SEQ_CST);
                     PTO2TaskDescriptor* consumer_desc = &task_descriptors[consumer_slot];
-                    int32_t fanin_count = __atomic_load_n(&consumer_desc->fanin_count, __ATOMIC_ACQUIRE);
+                    int32_t fanin_count = __atomic_load_n(&consumer_desc->fanin_count, __ATOMIC_SEQ_CST);
                     if (prev + 1 == fanin_count) {
                         __atomic_store_n(&s_pto2_task_completed[consumer_slot], 1, __ATOMIC_RELEASE);
                         int32_t wt = consumer_desc->worker_type;
