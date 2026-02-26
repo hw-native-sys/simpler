@@ -9,6 +9,7 @@
 #ifndef PLATFORM_A2A3SIM_AICORE_INNER_KERNEL_H_
 #define PLATFORM_A2A3SIM_AICORE_INNER_KERNEL_H_
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 
@@ -19,9 +20,11 @@
 #define __aicore__
 #endif
 
-// dcci (Data Cache Clean and Invalidate) - no-op in simulation
-// Use variadic macro to support both 2-arg and 3-arg calls
-#define dcci(...) ((void)0)
+// dcci (Data Cache Clean and Invalidate) - acquire fence in simulation
+// Hardware dcci invalidates cache to ensure fresh reads from shared memory.
+// In simulation, an acquire fence provides the equivalent ordering guarantee.
+// Use variadic macro to support both 2-arg and 3-arg calls.
+#define dcci(...) std::atomic_thread_fence(std::memory_order_acquire)
 
 // Cache coherency constants (no-op in simulation)
 #define ENTIRE_DATA_CACHE 0
