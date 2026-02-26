@@ -260,6 +260,47 @@ extern "C" int init_runtime_impl(Runtime *runtime,
         std::cout << "Ready queue shards: " << runtime->ready_queue_shards << "\n";
     }
 
+    // Read ring buffer size overrides from environment
+    {
+        const char* env_tw = std::getenv("PTO2_RING_TASK_WINDOW");
+        if (env_tw) {
+            int val = atoi(env_tw);
+            if (val >= 4 && (val & (val - 1)) == 0) {
+                runtime->pto2_task_window_size = val;
+            } else {
+                std::cerr << "PTO2_RING_TASK_WINDOW=" << env_tw
+                          << " invalid (must be power of 2, >= 4), ignored\n";
+            }
+        }
+        const char* env_hs = std::getenv("PTO2_RING_HEAP");
+        if (env_hs) {
+            int val = atoi(env_hs);
+            if (val >= 1024) {
+                runtime->pto2_heap_size = val;
+            } else {
+                std::cerr << "PTO2_RING_HEAP=" << env_hs
+                          << " too small (min 1024), ignored\n";
+            }
+        }
+        const char* env_dp = std::getenv("PTO2_RING_DEP_POOL");
+        if (env_dp) {
+            int val = atoi(env_dp);
+            if (val >= 16) {
+                runtime->pto2_dep_list_pool_size = val;
+            } else {
+                std::cerr << "PTO2_RING_DEP_POOL=" << env_dp
+                          << " too small (min 16), ignored\n";
+            }
+        }
+        if (runtime->pto2_task_window_size || runtime->pto2_heap_size || runtime->pto2_dep_list_pool_size) {
+            std::cout << "Ring buffer overrides:"
+                      << " task_window=" << (runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE)
+                      << " heap=" << (runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE)
+                      << " dep_pool=" << (runtime->pto2_dep_list_pool_size ? runtime->pto2_dep_list_pool_size : PTO2_DEP_LIST_POOL_SIZE)
+                      << "\n";
+        }
+    }
+
     // Set up device orchestration state
     runtime->set_orch_built_on_host(false);
     runtime->set_orch_args(device_args, func_args_count);

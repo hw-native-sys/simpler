@@ -193,11 +193,14 @@ void pto2_add_consumer_to_producer(
     // This synchronizes with scheduler's on_task_complete_threadsafe
     task_fanout_lock(producer);
 
-    // AICPU parallel mode: check if producer already completed before adding to fanout
+    // AICPU parallel mode: check if producer already completed before adding to fanout.
+    // Read completed FIRST (ACQUIRE) to establish happens-before with the scheduler's
+    // RELEASE stores (completed_by_task is stored before completed in program order).
+    // Then check completed_by_task to guard against stale state from recycled slots.
     if (orch->aicpu_task_completed) {
         int32_t prod_slot = producer_id & orch->aicpu_window_mask;
-        if (__atomic_load_n(&orch->aicpu_task_completed[prod_slot], __ATOMIC_ACQUIRE) >= 2) {
-            // Producer already completed, directly increment consumer's refcount
+        if (__atomic_load_n(&orch->aicpu_task_completed[prod_slot], __ATOMIC_ACQUIRE) >= 2 &&
+            __atomic_load_n(&orch->aicpu_completed_by_task[prod_slot], __ATOMIC_RELAXED) == producer_id) {
             int32_t cons_slot = consumer_id & orch->aicpu_window_mask;
             __atomic_fetch_add(&orch->aicpu_fanin_refcount[cons_slot], 1, __ATOMIC_ACQ_REL);
             task_fanout_unlock(producer);
@@ -262,6 +265,15 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     CYCLE_COUNT_LAP(g_orch_alloc_cycle);
 
     PTO2TaskDescriptor* task = pto2_task_ring_get(&orch->task_ring, task_id);
+
+    // Reset scheduler-side slot state for reuse.  The old task's fanout/lock
+    // protocol is fully complete by the time last_task_alive advances past it,
+    // so resetting here (after allocation) is safe.
+    if (orch->aicpu_task_completed) {
+        int32_t slot = task_id & orch->aicpu_window_mask;
+        __atomic_store_n(&orch->aicpu_task_completed[slot], 0, __ATOMIC_RELEASE);
+        __atomic_store_n(&orch->aicpu_completed_by_task[slot], -1, __ATOMIC_RELEASE);
+    }
 
     // Initialize task descriptor
     task->task_id = task_id;

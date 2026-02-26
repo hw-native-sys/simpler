@@ -139,6 +139,11 @@ public:
     int sche_cpu_num;  // Number of AICPU threads for scheduling
     int ready_queue_shards;  // Number of ready queue shards per core type (1..3, default 3)
 
+    // Ring buffer size overrides (0 = use compile-time defaults)
+    int pto2_task_window_size;
+    int pto2_heap_size;
+    int pto2_dep_list_pool_size;
+
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
