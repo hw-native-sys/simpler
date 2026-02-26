@@ -66,6 +66,8 @@ constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 // Maximum tasks for ready queue (PTO2 mode uses shared memory task count)
 constexpr int AICPU_MAX_READY_TASKS = 16384;
 constexpr int AICPU_READY_MASK = AICPU_MAX_READY_TASKS - 1;
+// One shard per scheduler thread: push to own shard (thread_idx % shards), pop own first + work stealing
+constexpr int PTO2_READY_QUEUE_SHARDS = MAX_AICPU_THREADS - 1;
 
 // Lightweight spinlock (avoids futex syscall overhead of std::mutex)
 struct SpinLock {
@@ -112,16 +114,16 @@ struct AicpuExecutor {
     int executing_task_ids_[MAX_CORES_PER_THREAD];
 
     // ===== Task queue state (FIFO circular queue, aligned with host_build_graph) =====
-    // ===== Spinlock-based MPMC ready queues (lighter than std::mutex) =====
-    SpinLock ready_queue_aic_lock_;
-    int ready_queue_aic_[AICPU_MAX_READY_TASKS];
-    int ready_queue_aic_head_{0};
-    int ready_queue_aic_tail_{0};
+    // ===== 3 shards per type: push to own shard (thread_idx % 3), pop own first + work stealing =====
+    SpinLock ready_queue_aic_lock_[PTO2_READY_QUEUE_SHARDS];
+    int ready_queue_aic_[PTO2_READY_QUEUE_SHARDS][AICPU_MAX_READY_TASKS];
+    int ready_queue_aic_head_[PTO2_READY_QUEUE_SHARDS]{0};
+    int ready_queue_aic_tail_[PTO2_READY_QUEUE_SHARDS]{0};
 
-    SpinLock ready_queue_aiv_lock_;
-    int ready_queue_aiv_[AICPU_MAX_READY_TASKS];
-    int ready_queue_aiv_head_{0};
-    int ready_queue_aiv_tail_{0};
+    SpinLock ready_queue_aiv_lock_[PTO2_READY_QUEUE_SHARDS];
+    int ready_queue_aiv_[PTO2_READY_QUEUE_SHARDS][AICPU_MAX_READY_TASKS];
+    int ready_queue_aiv_head_[PTO2_READY_QUEUE_SHARDS]{0};
+    int ready_queue_aiv_tail_[PTO2_READY_QUEUE_SHARDS]{0};
 
     // Task execution tracking
     std::atomic<int> completed_tasks_{0};
@@ -343,10 +345,12 @@ int AicpuExecutor::init(Runtime* runtime) {
     orchestrator_done_.store(orch_on_host, std::memory_order_release);
 
     // Initial ready tasks will be populated from PTO2 shared memory in resolve_and_dispatch_pto2
-    ready_queue_aic_head_ = 0;
-    ready_queue_aic_tail_ = 0;
-    ready_queue_aiv_head_ = 0;
-    ready_queue_aiv_tail_ = 0;
+    for (int s = 0; s < PTO2_READY_QUEUE_SHARDS; s++) {
+        ready_queue_aic_head_[s] = 0;
+        ready_queue_aic_tail_[s] = 0;
+        ready_queue_aiv_head_[s] = 0;
+        ready_queue_aiv_tail_[s] = 0;
+    }
 
     // Reset per-core dispatch timestamps and task counters
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
@@ -608,14 +612,15 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                     if (prev + 1 == fanin_count) {
                         __atomic_store_n(&s_pto2_task_completed[consumer_slot], 1, __ATOMIC_RELEASE);
                         int32_t wt = consumer_desc->worker_type;
+                        int my_shard = thread_idx % PTO2_READY_QUEUE_SHARDS;
                         if (wt == PTO2_WORKER_CUBE) {
-                            ready_queue_aic_lock_.lock();
-                            ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = consumer_id;
-                            ready_queue_aic_lock_.unlock();
+                            ready_queue_aic_lock_[my_shard].lock();
+                            ready_queue_aic_[my_shard][ready_queue_aic_tail_[my_shard]++ & AICPU_READY_MASK] = consumer_id;
+                            ready_queue_aic_lock_[my_shard].unlock();
                         } else {
-                            ready_queue_aiv_lock_.lock();
-                            ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = consumer_id;
-                            ready_queue_aiv_lock_.unlock();
+                            ready_queue_aiv_lock_[my_shard].lock();
+                            ready_queue_aiv_[my_shard][ready_queue_aiv_tail_[my_shard]++ & AICPU_READY_MASK] = consumer_id;
+                            ready_queue_aiv_lock_[my_shard].unlock();
                         }
                     }
                     current = entry->next_offset;
@@ -640,18 +645,25 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 if (status == AICoreStatus::IDLE && executing_task_ids_[core_id] == -1) {
                     Handshake* h = &hank[core_id];
                     int32_t task_id = -1;
+                    int my_shard = thread_idx % PTO2_READY_QUEUE_SHARDS;
                     if (h->core_type == CoreType::AIC) {
-                        ready_queue_aic_lock_.lock();
-                        if (ready_queue_aic_head_ < ready_queue_aic_tail_) {
-                            task_id = ready_queue_aic_[ready_queue_aic_head_++ & AICPU_READY_MASK];
+                        for (int k = 0; k < PTO2_READY_QUEUE_SHARDS && task_id < 0; k++) {
+                            int shard = (my_shard + k) % PTO2_READY_QUEUE_SHARDS;
+                            ready_queue_aic_lock_[shard].lock();
+                            if (ready_queue_aic_head_[shard] < ready_queue_aic_tail_[shard]) {
+                                task_id = ready_queue_aic_[shard][ready_queue_aic_head_[shard]++ & AICPU_READY_MASK];
+                            }
+                            ready_queue_aic_lock_[shard].unlock();
                         }
-                        ready_queue_aic_lock_.unlock();
                     } else {
-                        ready_queue_aiv_lock_.lock();
-                        if (ready_queue_aiv_head_ < ready_queue_aiv_tail_) {
-                            task_id = ready_queue_aiv_[ready_queue_aiv_head_++ & AICPU_READY_MASK];
+                        for (int k = 0; k < PTO2_READY_QUEUE_SHARDS && task_id < 0; k++) {
+                            int shard = (my_shard + k) % PTO2_READY_QUEUE_SHARDS;
+                            ready_queue_aiv_lock_[shard].lock();
+                            if (ready_queue_aiv_head_[shard] < ready_queue_aiv_tail_[shard]) {
+                                task_id = ready_queue_aiv_[shard][ready_queue_aiv_head_[shard]++ & AICPU_READY_MASK];
+                            }
+                            ready_queue_aiv_lock_[shard].unlock();
                         }
-                        ready_queue_aiv_lock_.unlock();
                     }
                     if (task_id >= 0) {
                         PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
@@ -709,14 +721,15 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                     // Mark as enqueued (state=1) to prevent double-enqueue
                     __atomic_store_n(&s_pto2_task_completed[slot], 1, __ATOMIC_RELEASE);
                     int32_t wt = t->worker_type;
+                    int my_shard = thread_idx % PTO2_READY_QUEUE_SHARDS;
                     if (wt == PTO2_WORKER_CUBE) {
-                        ready_queue_aic_lock_.lock();
-                        ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = idx;
-                        ready_queue_aic_lock_.unlock();
+                        ready_queue_aic_lock_[my_shard].lock();
+                        ready_queue_aic_[my_shard][ready_queue_aic_tail_[my_shard]++ & AICPU_READY_MASK] = idx;
+                        ready_queue_aic_lock_[my_shard].unlock();
                     } else {
-                        ready_queue_aiv_lock_.lock();
-                        ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = idx;
-                        ready_queue_aiv_lock_.unlock();
+                        ready_queue_aiv_lock_[my_shard].lock();
+                        ready_queue_aiv_[my_shard][ready_queue_aiv_tail_[my_shard]++ & AICPU_READY_MASK] = idx;
+                        ready_queue_aiv_lock_[my_shard].unlock();
                     }
                     made_progress = true;
                 }
@@ -746,14 +759,15 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
                 PTO2TaskDescriptor* t = &task_descriptors[slot];
                 int32_t wt = t->worker_type;
+                int my_shard = thread_idx % PTO2_READY_QUEUE_SHARDS;
                 if (wt == PTO2_WORKER_CUBE) {
-                    ready_queue_aic_lock_.lock();
-                    ready_queue_aic_[ready_queue_aic_tail_++ & AICPU_READY_MASK] = task_id;
-                    ready_queue_aic_lock_.unlock();
+                    ready_queue_aic_lock_[my_shard].lock();
+                    ready_queue_aic_[my_shard][ready_queue_aic_tail_[my_shard]++ & AICPU_READY_MASK] = task_id;
+                    ready_queue_aic_lock_[my_shard].unlock();
                 } else {
-                    ready_queue_aiv_lock_.lock();
-                    ready_queue_aiv_[ready_queue_aiv_tail_++ & AICPU_READY_MASK] = task_id;
-                    ready_queue_aiv_lock_.unlock();
+                    ready_queue_aiv_lock_[my_shard].lock();
+                    ready_queue_aiv_[my_shard][ready_queue_aiv_tail_[my_shard]++ & AICPU_READY_MASK] = task_id;
+                    ready_queue_aiv_lock_[my_shard].unlock();
                 }
                 made_progress = true;
             }
@@ -1076,10 +1090,12 @@ int AicpuExecutor::run(Runtime* runtime) {
 
 void AicpuExecutor::deinit() {
     // Cleanup runtime execution state
-    ready_queue_aic_head_ = 0;
-    ready_queue_aic_tail_ = 0;
-    ready_queue_aiv_head_ = 0;
-    ready_queue_aiv_tail_ = 0;
+    for (int s = 0; s < PTO2_READY_QUEUE_SHARDS; s++) {
+        ready_queue_aic_head_[s] = 0;
+        ready_queue_aic_tail_[s] = 0;
+        ready_queue_aiv_head_[s] = 0;
+        ready_queue_aiv_tail_[s] = 0;
+    }
 
     // Reset per-core dispatch timestamps and task counters
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
@@ -1129,8 +1145,11 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,
     DEV_ALWAYS("Progress: %d/%d tasks (%.1f%%)",
              completed, total, total > 0 ? completed * 100.0 / total : 0.0);
 
-    int aic_ready = ready_queue_aic_tail_ - ready_queue_aic_head_;
-    int aiv_ready = ready_queue_aiv_tail_ - ready_queue_aiv_head_;
+    int aic_ready = 0, aiv_ready = 0;
+    for (int s = 0; s < PTO2_READY_QUEUE_SHARDS; s++) {
+        aic_ready += ready_queue_aic_tail_[s] - ready_queue_aic_head_[s];
+        aiv_ready += ready_queue_aiv_tail_[s] - ready_queue_aiv_head_[s];
+    }
     DEV_ALWAYS("Ready Queues: AIC=%d, AIV=%d", aic_ready, aiv_ready);
 
     int busy_cores = 0;
