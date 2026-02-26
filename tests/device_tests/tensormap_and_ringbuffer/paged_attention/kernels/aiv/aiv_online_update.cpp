@@ -1,8 +1,8 @@
 // Online Softmax Update + Normalize Kernel (AIV)
 //
-// Operates on full tiles where M=q_tile_size, N=head_dim (128):
-//   Case1: oi/oi_new are (16, 128), mij/lij/mi/li are 16-element vectors
-//   Case2: oi/oi_new are (64, 128), mij/lij/mi/li are 64-element vectors
+// Operates on full tiles where M=q_tile_size, N=head_dim:
+//   Case1: oi/oi_new are (16, 128) row-major, mij/lij/mi/li are 16-element vectors
+//   Case2: oi/oi_new are (64, 128) row-major, mij/lij/mi/li are 64-element vectors
 //
 // Scalar layout strategy:
 //   M scalar floats stored contiguously in GM can be loaded as either:
@@ -232,7 +232,6 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t is_first = static_cast<uint64_t>(args[7]);
     uint64_t is_last = static_cast<uint64_t>(args[8]);
     uint64_t q_tile_size = static_cast<uint64_t>(mij->repeats[0]);
-    // args[10] = head_dim (128)
 
     if (q_tile_size == 16) {
         online_update_impl<16, 128>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);

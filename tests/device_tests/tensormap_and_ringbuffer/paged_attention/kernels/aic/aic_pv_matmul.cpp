@@ -87,7 +87,6 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* vj = reinterpret_cast<__gm__ Tensor*>(args[1]);
     __gm__ Tensor* oi_new = reinterpret_cast<__gm__ Tensor*>(args[2]);
     uint64_t q_tile_size = static_cast<uint64_t>(pij->repeats[0]);
-    // args[4] = block_size, args[5] = head_dim
 
     if (q_tile_size == 16) {
         pv_matmul_impl<16, 128, 128>(pij, vj, oi_new);

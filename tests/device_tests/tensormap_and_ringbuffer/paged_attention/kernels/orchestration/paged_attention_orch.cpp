@@ -185,6 +185,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
 
+                    // Single ONLINE_UPDATE per block for all head_dim values.
+                    // PV writes oi_tmp in row-major (M, head_dim); ONLINE_UPDATE reads it with
+                    // matching stride. The previous 2x(16,128) split for head_dim=256 had scalar
+                    // double-counting bugs and wrong stride mismatches; removed.
                     Tensor out_view = out.view({q_tile, head_dim}, {cur_offset, 0});
                     PTOParam params_up[] = {
                         make_input_param(mi),
@@ -197,7 +201,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                         make_scalar_param(is_first),
                         make_scalar_param(is_last),
                     };
-                    TIMED_SUBMIT_TASK(rt, FUNC_ONLINE_UPDATE, PTO2_WORKER_VECTOR, params_up, 9); // v2
+                    TIMED_SUBMIT_TASK(rt, FUNC_ONLINE_UPDATE, PTO2_WORKER_VECTOR, params_up, 9);
                 }
             }
         }

@@ -88,7 +88,6 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* kj = reinterpret_cast<__gm__ Tensor*>(args[1]);
     __gm__ Tensor* sij = reinterpret_cast<__gm__ Tensor*>(args[2]);
     uint64_t q_tile_size = static_cast<uint64_t>(qi->repeats[0]);
-    // args[4] = head_dim (128), args[5] = block_size
 
     if (q_tile_size == 16) {
         qk_matmul_impl<16, 128, 128>(qi, kj, sij);

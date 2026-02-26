@@ -43,6 +43,24 @@ ALL_CASES = {
         "context_len": 128,
         "max_model_len": 256,
     },
+    "CaseBatch2": {
+        "batch": 2,
+        "num_heads": 16,
+        "kv_head_num": 1,
+        "head_dim": 16,
+        "block_size": 16,
+        "context_len": 33,
+        "max_model_len": 256,
+    },
+    "CaseBatch4": {
+        "batch": 4,
+        "num_heads": 16,
+        "kv_head_num": 1,
+        "head_dim": 16,
+        "block_size": 16,
+        "context_len": 33,
+        "max_model_len": 256,
+    },
 }
 
 # Select case by env var PA_CASE, default to Case1
