@@ -137,6 +137,7 @@ public:
 
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;  // Number of AICPU threads for scheduling
+    int ready_queue_shards;  // Number of ready queue shards per core type (1..3, default 3)
 
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code

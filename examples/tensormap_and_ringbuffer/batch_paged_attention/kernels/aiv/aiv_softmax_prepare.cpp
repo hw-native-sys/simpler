@@ -33,7 +33,8 @@ static __aicore__ void softmax_prepare_batch_impl(
     float scale_value,
     uint64_t context_lens_ptr,
     uint64_t batch_count,
-    uint64_t block_idx) {
+    uint64_t block_idx,
+    uint64_t batch_start) {
 
     __gm__ float* sij_base = reinterpret_cast<__gm__ float*>(sij_batch->buffer.addr);
     __gm__ half* pij_base = reinterpret_cast<__gm__ half*>(pij_batch->buffer.addr);
@@ -71,12 +72,14 @@ static __aicore__ void softmax_prepare_batch_impl(
     TASSIGN(pijF16Tile, 3 * M * N * sizeof(float) + 2 * kAlignedRows * sizeof(float));
 
     for (uint64_t b = 0; b < batch_count; b++) {
-        int32_t cur_seq = ctx_lens[b];
+        int32_t cur_seq = ctx_lens[batch_start + b];
         uint64_t start = block_idx * N;
-        uint64_t valid_len = N;
-        if (start < (uint64_t)cur_seq) {
+        uint64_t valid_len;
+        if (start >= (uint64_t)cur_seq) {
+            valid_len = 0;
+        } else {
             uint64_t remaining = (uint64_t)cur_seq - start;
-            if (remaining < (uint64_t)N) valid_len = remaining;
+            valid_len = (remaining < (uint64_t)N) ? remaining : N;
         }
 
         __gm__ float* sij_addr = sij_base + b * M * N;
@@ -88,6 +91,30 @@ static __aicore__ void softmax_prepare_batch_impl(
         GlobalDataMxN_f16 pijGlobal(pij_addr);
         GlobalScalarDN mijGlobal(mij_addr);
         GlobalScalarDN lijGlobal(lij_addr);
+
+        if (valid_len == 0) {
+            // Block entirely beyond sequence: write mij=-1e30, lij=0, pij=0
+            // Use -1e30 instead of -inf to avoid NaN in online_update (exp(-inf - (-inf)) = NaN)
+            constexpr float NEG_LARGE = -1e30f;
+            for (int i = 0; i < kAlignedRows; i++) {
+                maxTile.SetValue(i, NEG_LARGE);
+                sumTile.SetValue(i, 0.0f);
+            }
+            for (int i = 0; i < M * N; i++) {
+                pijF16Tile.SetValue(i, static_cast<half>(0.0f));
+            }
+
+            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            TSTORE(mijGlobal, maxTile);
+            TSTORE(lijGlobal, sumTile);
+            TSTORE(pijGlobal, pijF16Tile);
+
+            if (b + 1 < batch_count) {
+                pipe_barrier(PIPE_ALL);
+            }
+            continue;
+        }
 
         TLOAD(sijTile, sijGlobal);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -139,8 +166,9 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t context_lens_ptr = static_cast<uint64_t>(args[5]);
     uint64_t batch_count = static_cast<uint64_t>(args[6]);
     uint64_t block_idx = static_cast<uint64_t>(args[7]);
+    uint64_t batch_start = static_cast<uint64_t>(args[8]);
 
     softmax_prepare_batch_impl<16, 16>(
         sij_batch, pij_batch, mij_batch, lij_batch,
-        scale_value, context_lens_ptr, batch_count, block_idx);
+        scale_value, context_lens_ptr, batch_count, block_idx, batch_start);
 }

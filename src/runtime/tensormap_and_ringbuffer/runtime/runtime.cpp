@@ -20,6 +20,7 @@ Runtime::Runtime() {
     memset(workers, 0, sizeof(workers));
     worker_count = 0;
     sche_cpu_num = 1;
+    ready_queue_shards = 3;
 
     // Initialize tensor pairs
     tensor_pair_count = 0;

@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iostream>
 #include <sys/time.h>
@@ -242,6 +243,22 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     }
     runtime->set_pto2_gm_sm_ptr(sm_ptr);
     runtime->record_tensor_pair(nullptr, sm_ptr, static_cast<size_t>(sm_size));
+
+    // Read ready queue shard count from environment for AICPU scheduler
+    {
+        const char* env_shards = std::getenv("PTO2_READY_QUEUE_SHARDS");
+        if (env_shards) {
+            int val = atoi(env_shards);
+            if (val >= 1 && val <= 16) {
+                runtime->ready_queue_shards = val;
+            } else {
+                std::cerr << "PTO2_READY_QUEUE_SHARDS=" << env_shards
+                          << " out of range [1,16], using default 3\n";
+                runtime->ready_queue_shards = 3;
+            }
+        }
+        std::cout << "Ready queue shards: " << runtime->ready_queue_shards << "\n";
+    }
 
     // Set up device orchestration state
     runtime->set_orch_built_on_host(false);

@@ -119,7 +119,23 @@ ALL_CASES = {
 
 # Select case by env var PA_CASE, default to Case1
 _selected = os.environ.get("PA_CASE", "Case1")
-PARAMS_LIST = [{"name": _selected, **ALL_CASES[_selected]}]
+_params = {"name": _selected, **ALL_CASES[_selected]}
+
+# Override context_len from env: PA_SEQ_LEN=33 (uniform) or PA_SEQ_LEN=33,64,128 (per-batch variable)
+_seq_env = os.environ.get("PA_SEQ_LEN")
+if _seq_env:
+    _seq_vals = [int(x.strip()) for x in _seq_env.split(",")]
+    if len(_seq_vals) == 1:
+        _params["context_len"] = _seq_vals[0]
+        _params["context_lens_list"] = None
+    else:
+        _params["context_len"] = max(_seq_vals)
+        _params["context_lens_list"] = _seq_vals
+    _max_seq = max(_seq_vals)
+    if _max_seq > _params["max_model_len"]:
+        _params["max_model_len"] = ((_max_seq + _params["block_size"] - 1) // _params["block_size"]) * _params["block_size"]
+
+PARAMS_LIST = [_params]
 
 
 def generate_inputs(params: dict) -> dict:
@@ -131,12 +147,26 @@ def generate_inputs(params: dict) -> dict:
     block_size = params["block_size"]
     context_len = params["context_len"]
     max_model_len = params["max_model_len"]
+    context_lens_list = params.get("context_lens_list")
 
     max_num_blocks_per_req = max_model_len // block_size
-    cur_valid_blocks = (context_len + block_size - 1) // block_size
-    total_blocks = batch * cur_valid_blocks
     scale_value = 1.0
     scale_bits = struct.unpack('I', struct.pack('f', scale_value))[0]
+
+    # Build per-batch context_lens tensor
+    if context_lens_list is not None:
+        seq_vals = context_lens_list
+        if len(seq_vals) < batch:
+            seq_vals = (seq_vals * ((batch + len(seq_vals) - 1) // len(seq_vals)))[:batch]
+        elif len(seq_vals) > batch:
+            seq_vals = seq_vals[:batch]
+        context_lens = torch.tensor(seq_vals, dtype=torch.int32)
+    else:
+        context_lens = torch.full((batch,), context_len, dtype=torch.int32)
+
+    max_ctx = int(context_lens.max().item())
+    cur_valid_blocks = (max_ctx + block_size - 1) // block_size
+    total_blocks = batch * cur_valid_blocks
 
     # Random block table: (batch, max_num_blocks_per_req) int32
     block_table = torch.randint(
@@ -145,9 +175,6 @@ def generate_inputs(params: dict) -> dict:
         size=(batch, max_num_blocks_per_req),
         dtype=torch.int32,
     )
-
-    # Context lens: all = context_len
-    context_lens = torch.full((batch,), context_len, dtype=torch.int32)
 
     config = torch.tensor(
         [batch, num_heads, kv_head_num, head_dim, block_size,
@@ -326,7 +353,10 @@ if __name__ == "__main__":
     print(f"=== Paged Attention Golden Test ({params['name']}) ===")
     print(f"batch={params['batch']}, num_heads={params['num_heads']}, head_dim={params['head_dim']}")
     print(f"kv_head_num={params['kv_head_num']}, block_size={params['block_size']}")
-    print(f"context_len={params['context_len']}")
+    if params.get('context_lens_list'):
+        print(f"context_lens (variable): {params['context_lens_list'][:8]}{'...' if len(params['context_lens_list']) > 8 else ''}")
+    else:
+        print(f"context_len={params['context_len']}")
 
     max_num_blocks = params['max_model_len'] // params['block_size']
     q_tile = min(params['num_heads'], 128)
