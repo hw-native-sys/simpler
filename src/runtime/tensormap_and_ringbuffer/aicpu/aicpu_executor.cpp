@@ -478,8 +478,13 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     int cur_thread_completed = 0;
     int cur_thread_tasks_in_flight = 0;
     int idle_iterations = 0;
-    const int MAX_IDLE_ITERATIONS = 50000000;
-    const int WARN_INTERVAL = 1000000;
+    const int MAX_IDLE_ITERATIONS = 800000;  // ~20s idle then scheduler gives up (avoid long hang)
+    const int STALL_LOG_INTERVAL = 50000;  // DEV_ALWAYS every N idle iters to debug hang
+    const int STALL_DUMP_READY_MAX = 8;
+    const int STALL_DUMP_WAIT_MAX = 4;
+    const int STALL_DUMP_CORE_MAX = 8;
+    const int PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
+    const int PROGRESS_LOG_INTERVAL = 25;       // log every N completions after threshold
     bool profiling_enabled = runtime->enable_profiling;
     int32_t last_reported_task_count = 0;
 
@@ -632,6 +637,14 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 cur_thread_completed++;
                 made_progress = true;
                 completed_tasks_.fetch_add(1, std::memory_order_release);
+                // Debug: periodic progress (thread 0 only) to find which task hangs
+                if (thread_idx == 0 && task_count > 0) {
+                    int32_t c = completed_tasks_.load(std::memory_order_relaxed);
+                    if (c <= PROGRESS_VERBOSE_THRESHOLD || c % PROGRESS_LOG_INTERVAL == 0 || c == task_count) {
+                        DEV_ALWAYS("PTO2 progress: completed=%d total=%d last_task_id=%d (%.1f%%)",
+                                  c, task_count, task_id, task_count > 0 ? 100.0 * c / task_count : 0.0);
+                    }
+                }
             }
         }
         CYCLE_COUNT_LAP(sched_complete_cycle);
@@ -776,9 +789,56 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
         if (!made_progress) {
             idle_iterations++;
-            if (idle_iterations % WARN_INTERVAL == 0) {
-                DEV_WARN("Thread %d: PTO2 %d idle iterations, %d/%d completed",
-                        thread_idx, idle_iterations, completed_tasks_.load(std::memory_order_acquire), task_count);
+            if (thread_idx == 0 && task_count > 0 && idle_iterations % STALL_LOG_INTERVAL == 0) {
+                int32_t c = completed_tasks_.load(std::memory_order_relaxed);
+                DEV_ALWAYS("PTO2 stall: no progress for %d iterations, completed=%d total=%d",
+                           idle_iterations, c, task_count);
+                // Scan all task slots to find truly stuck tasks
+                // state=0: not yet completed (may be waiting for deps or ready but not enqueued)
+                // state=1: enqueued in ready queue or dispatched to hardware
+                // state=2: completed by Phase 1
+                int cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
+                for (int si = 0; si < task_count; si++) {
+                    int32_t st  = __atomic_load_n(&s_pto2_task_completed[si], __ATOMIC_RELAXED);
+                    int32_t rc  = __atomic_load_n(&s_pto2_fanin_refcount[si],  __ATOMIC_RELAXED);
+                    int32_t fi  = __atomic_load_n(&task_descriptors[si].fanin_count, __ATOMIC_RELAXED);
+                    int32_t kid = task_descriptors[si].kernel_id;
+                    if (st == 2) continue; // Already done
+                    if (st == 1) { cnt_inflight++; continue; }
+                    // st == 0
+                    if (rc >= fi) {
+                        // Ready (all deps satisfied) but not enqueued — this is the real bug
+                        cnt_ready++;
+                        if (cnt_ready <= STALL_DUMP_READY_MAX) {
+                            DEV_ALWAYS("  STUCK-READY  slot=%d kernel_id=%d refcount=%d fanin=%d",
+                                       si, kid, rc, fi);
+                        }
+                    } else {
+                        cnt_waiting++;
+                        if (cnt_waiting <= STALL_DUMP_WAIT_MAX) {
+                            DEV_ALWAYS("  STUCK-WAIT   slot=%d kernel_id=%d refcount=%d fanin=%d",
+                                       si, kid, rc, fi);
+                        }
+                    }
+                }
+                DEV_ALWAYS("  scan result: stuck_ready=%d stuck_waiting=%d in_flight=%d",
+                           cnt_ready, cnt_waiting, cnt_inflight);
+                // Log this thread's dispatch state
+                DEV_ALWAYS("  thread=%d cur_in_flight=%d core_num=%d",
+                           thread_idx, cur_thread_tasks_in_flight, core_num);
+                for (int ci = 0; ci < core_num && ci < STALL_DUMP_CORE_MAX; ci++) {
+                    int cid = cur_thread_cores[ci];
+                    Handshake* hh = &hank[cid];
+                    int32_t hw_task_id = -1;
+                    int32_t hw_kernel = -1;
+                    if (hh->task != 0) {
+                        const PTO2DispatchPayload* pl = reinterpret_cast<const PTO2DispatchPayload*>((uintptr_t)hh->task);
+                        hw_task_id = pl->task_id;
+                        hw_kernel  = pl->kernel_id;
+                    }
+                    DEV_ALWAYS("    core=%d status=%d task_id=%d kernel_id=%d",
+                               cid, (int)hh->task_status, hw_task_id, hw_kernel);
+                }
             }
             if (idle_iterations > MAX_IDLE_ITERATIONS) {
                 DEV_ERROR("Thread %d: PTO2 timeout after %d idle iterations", thread_idx, idle_iterations);
@@ -1057,7 +1117,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             void* sm = runtime->get_pto2_gm_sm_ptr();
             PTO2SharedMemoryHeader* sm_header = static_cast<PTO2SharedMemoryHeader*>(sm);
             int32_t pto2_task_count = sm_header ? sm_header->current_task_index : 0;
-            DEV_INFO("Thread 3: PTO2 task count = %d", pto2_task_count);
+            DEV_ALWAYS("PTO2 total submitted tasks = %d", pto2_task_count);
             total_tasks_.store(pto2_task_count, std::memory_order_release);
             orchestrator_done_.store(true, std::memory_order_release);
             DEV_INFO("Thread 3: Set orchestrator_done=true");
