@@ -629,11 +629,30 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
                 DEV_DEBUG("Thread %d: Core %d completed PTO2 task %d", thread_idx, core_id, task_id);
 
-                // Acquire fanout_lock, mark completed (state=2), snapshot fanout_head
-                while (PTO2_EXCHANGE(&pto2_task->fanout_lock, 1) != 0) { PTO2_SPIN_PAUSE_LIGHT(); }
+                // Mark completed (state=2), then snapshot fanout_head under the per-task spinlock.
+                //
+                // WHY THE LOCK IS REQUIRED (device orchestration / AICPU parallel mode):
+                // The orchestrator (Thread 3) runs concurrently with the scheduler threads and
+                // may still be adding consumers to this task's fanout list via
+                // pto2_add_consumer_to_producer().  That function holds fanout_lock while it
+                // (a) checks the completion state and (b) prepends to fanout_head.
+                //
+                // Without the lock here we have a TOCTOU race:
+                //   1. Orch acquires lock, checks state=0 (task still running), plans insert.
+                //   2. Task finishes; we store state=2 (RELEASE) but haven't acquired the lock.
+                //   3. Orch inserts consumer X into fanout_head, releases lock.
+                //   4. We read the OLD fanout_head (before X was inserted) → X is never woken.
+                //
+                // By acquiring the lock AFTER storing state=2 we guarantee mutual exclusion:
+                //   • If Orch holds the lock first  → it writes fanout_head → we read it with X.
+                //   • If we acquire the lock first  → Orch's subsequent lock-acquire sees state=2
+                //     via the release/acquire pair and takes the early-return path, directly
+                //     incrementing X's fanin_refcount instead of touching fanout_head.
+                // Either way every consumer is accounted for exactly once.
                 __atomic_store_n(&s_pto2_task_completed[task_id & window_mask], 2, __ATOMIC_RELEASE);
-                int32_t fanout_head = pto2_task->fanout_head;
-                PTO2_STORE_RELEASE(&pto2_task->fanout_lock, 0);
+                pto2_fanout_lock(pto2_task);
+                int32_t fanout_head = (int32_t)pto2_task->fanout_head;
+                pto2_fanout_unlock(pto2_task);
 
                 // Traverse fanout outside lock
                 int32_t fanout_len = 0;

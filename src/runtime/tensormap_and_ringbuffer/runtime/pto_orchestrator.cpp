@@ -44,24 +44,6 @@ static int64_t  g_orch_submit_count = 0;
 #endif
 
 // =============================================================================
-// Per-Task Spinlock Implementation
-// =============================================================================
-
-/**
- * Acquire spinlock for task's fanout fields
- */
-static inline void task_fanout_lock(PTO2TaskDescriptor* task) {
-    while (PTO2_EXCHANGE(&task->fanout_lock, 1) != 0) {
-        PTO2_SPIN_PAUSE_LIGHT();
-    }
-}
-
-/**
- * Release spinlock for task's fanout fields
- */
-static inline void task_fanout_unlock(PTO2TaskDescriptor* task) { PTO2_STORE_RELEASE(&task->fanout_lock, 0); }
-
-// =============================================================================
 // Orchestrator Initialization
 // =============================================================================
 
@@ -203,7 +185,7 @@ void pto2_add_consumer_to_producer(
     PTO2OrchestratorState* orch, PTO2TaskDescriptor* producer, int32_t producer_id, int32_t consumer_id) {
     // Acquire per-task spinlock
     // This synchronizes with scheduler's on_task_complete_threadsafe
-    task_fanout_lock(producer);
+    pto2_fanout_lock(producer);
 
     // AICPU parallel mode: check if producer already completed before adding to fanout
     if (orch->aicpu_task_completed) {
@@ -212,7 +194,7 @@ void pto2_add_consumer_to_producer(
             // Producer already completed, directly increment consumer's refcount
             int32_t cons_slot = consumer_id & orch->aicpu_window_mask;
             __atomic_fetch_add(&orch->aicpu_fanin_refcount[cons_slot], 1, __ATOMIC_ACQ_REL);
-            task_fanout_unlock(producer);
+            pto2_fanout_unlock(producer);
             return;
         }
     }
@@ -234,7 +216,7 @@ void pto2_add_consumer_to_producer(
     }
 
     // Release spinlock
-    task_fanout_unlock(producer);
+    pto2_fanout_unlock(producer);
 }
 
 void* pto2_alloc_packed_buffer(PTO2OrchestratorState* orch, int32_t total_size) {
