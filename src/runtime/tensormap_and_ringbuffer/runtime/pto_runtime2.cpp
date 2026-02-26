@@ -105,7 +105,7 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
 
     // Initialize scheduler
     if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle,
-                              &rt->orchestrator.dep_pool)) {
+                              &rt->orchestrator.dep_pool, rt->gm_heap)) {
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt->gm_heap);
         pto2_sm_destroy(rt->sm_handle);
@@ -142,7 +142,7 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
     }
 
     if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle,
-                             &rt->orchestrator.dep_pool)) {
+                             &rt->orchestrator.dep_pool, rt->gm_heap)) {
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt);
         return NULL;

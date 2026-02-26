@@ -86,13 +86,15 @@ int32_t pto2_ready_queue_pop(PTO2ReadyQueue* queue) {
 // Scheduler Initialization
 // =============================================================================
 
-bool pto2_scheduler_init(PTO2SchedulerState* sched, 
+bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
-                          PTO2DepListPool* dep_pool) {
+                          PTO2DepListPool* dep_pool,
+                          void* heap_base) {
     memset(sched, 0, sizeof(PTO2SchedulerState));
-    
+
     sched->sm_handle = sm_handle;
     sched->dep_pool = dep_pool;
+    sched->heap_base = heap_base;
     
     // Get runtime task_window_size from shared memory header
     uint64_t window_size = sm_handle->header->task_window_size;
@@ -361,10 +363,7 @@ void pto2_scheduler_advance_ring_pointers(PTO2SchedulerState* sched) {
         PTO2TaskDescriptor* last_consumed = pto2_sm_get_task(sched->sm_handle, last_consumed_id);
         
         if (last_consumed->packed_buffer_end != NULL) {
-            // heap_tail = offset of end of last consumed task's buffer
-            // Note: This requires knowing the heap base, which should be passed in
-            // For now, we just track the relative position
-            sched->heap_tail = (int32_t)(intptr_t)last_consumed->packed_buffer_end;
+            sched->heap_tail = (uint64_t)((char*)last_consumed->packed_buffer_end - (char*)sched->heap_base);
         }
     }
     

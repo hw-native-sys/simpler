@@ -54,7 +54,10 @@ typedef struct PTO2SchedulerState {
 
     // Local copies of ring pointers (written to shared memory after update)
     int32_t last_task_alive;      // Task ring tail
-    uint64_t heap_tail;           // Heap ring tail
+    uint64_t heap_tail;           // Heap ring tail (offset from heap_base)
+
+    // Heap base address (for converting absolute pointers to offsets)
+    void* heap_base;
 
     // === DYNAMIC CONFIGURATION ===
     uint64_t task_window_size;    // Task window size (power of 2)
@@ -98,11 +101,13 @@ static inline int32_t pto2_task_slot(PTO2SchedulerState* sched, int32_t task_id)
  * @param sched      Scheduler state to initialize
  * @param sm_handle  Shared memory handle
  * @param dep_pool   Dependency list pool
+ * @param heap_base  Base address of GM heap (for pointer-to-offset conversion)
  * @return true on success
  */
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
-                          PTO2DepListPool* dep_pool);
+                          PTO2DepListPool* dep_pool,
+                          void* heap_base);
 
 /**
  * Destroy scheduler state and free resources
