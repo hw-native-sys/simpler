@@ -630,7 +630,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
             int core_id = cur_thread_cores[i];
             Handshake* h = &hank[core_id];
 
-            if (h->task_status == 0 && h->task != 0) {
+            if (__atomic_load_n(const_cast<int32_t*>(&h->task_status), __ATOMIC_ACQUIRE) == 0 && h->task != 0) {
                 Task* task = reinterpret_cast<Task*>(h->task);
                 h->task = 0;
 
@@ -698,7 +698,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                         task_id,
                         core_id);
                     h->task = reinterpret_cast<uint64_t>(task);
-                    h->task_status = 1;
+                    __atomic_store_n(const_cast<int32_t*>(&h->task_status), 1, __ATOMIC_RELEASE);
                     cur_thread_tasks_in_flight++;
                     made_progress = true;
                 }
