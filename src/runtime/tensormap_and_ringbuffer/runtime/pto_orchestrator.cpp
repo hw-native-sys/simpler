@@ -43,22 +43,11 @@ static int64_t  g_orch_submit_count = 0;
 #endif
 
 // =============================================================================
-// Per-Task Spinlock Implementation
+// Per-Task Spinlock Implementation (thin wrappers around the header helpers)
 // =============================================================================
 
-/**
- * Acquire spinlock for task's fanout fields
- */
-static inline void task_fanout_lock(PTO2TaskDescriptor* task) {
-    while (PTO2_EXCHANGE(&task->fanout_lock, 1) != 0) {
-        PTO2_SPIN_PAUSE_LIGHT();
-    }
-}
-
-/**
- * Release spinlock for task's fanout fields
- */
-static inline void task_fanout_unlock(PTO2TaskDescriptor* task) { PTO2_STORE_RELEASE(&task->fanout_lock, 0); }
+static inline void task_fanout_lock(PTO2TaskDescriptor* task)   { pto2_fanout_lock(task);   }
+static inline void task_fanout_unlock(PTO2TaskDescriptor* task) { pto2_fanout_unlock(task); }
 
 // =============================================================================
 // Orchestrator Initialization
@@ -300,9 +289,11 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     int32_t fanin_count = 0;
 
     task->param_count = num_params;
-    // Bulk copy all params at once
+    // Bulk copy param descriptors (type, tensor pointer, scalar); no tensor buffer content is copied.
     memcpy(task->params, params, num_params * sizeof(PTOParam));
-    // Copy tensor data into task-owned storage; redirect pointers
+    // Copy only Tensor *descriptors* (metadata: addr, size, strides, shape) into task-owned storage;
+    // redirect task->params[i].tensor to point to task->tensor_copies[i]. No allocation here;
+    // output buffer allocation happens in Step 3, and we write back buffer.addr to the caller's tensor.
     for (int i = 0; i < num_params; i++) {
         if (params[i].tensor) {
             task->tensor_copies[i] = *params[i].tensor;
@@ -362,6 +353,8 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
             }
 
             case PTOParamType::OUTPUT: {
+                // OUTPUT must have a non-null tensor (descriptor for shape/size); no allocation in make_tensor.
+                assert(params[i].tensor && "OUTPUT param must have a non-NULL tensor descriptor");
                 // Only allocate from ring buffer when caller did not provide an address
                 if (params[i].tensor->buffer.addr == 0) {
                     total_output_size += PTO2_ALIGN_UP(params[i].tensor->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
@@ -382,13 +375,14 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         task->packed_buffer_end = (char*)task->packed_buffer_base + total_output_size;
 
         // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(size, 1024)
+        // Allocation happens here only; no memcpy of buffer content. Caller's tensor gets addr written back.
         int32_t offset = 0;
         for (int i = 0; i < task->param_count; i++) {
             if (task->params[i].type == PTOParamType::OUTPUT) {
                 if (task->tensor_copies[i].buffer.addr == 0) {
                     uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
                     task->tensor_copies[i].buffer.addr = alloc_addr;
-                    // Write back through caller's pointer (implicit update)
+                    // Write back to caller's tensor so orchestration stack sees the allocated address (no copy)
                     params[i].tensor->buffer.addr = alloc_addr;
                     offset += PTO2_ALIGN_UP(task->tensor_copies[i].buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
@@ -414,13 +408,31 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 
     CYCLE_COUNT_LAP(g_orch_insert_cycle);
 
+#ifdef __aarch64__
+    // Flush tensor_copies[] to HBM so AICore (which reads from HBM via dcci)
+    // sees correct Tensor metadata (buffer.addr, start_offset, strides, repeats).
+    // Done here in the orchestrator (Thread 3) rather than in the scheduler's
+    // dispatch path to avoid inflating Tail OH and triggering timing-dependent
+    // dependency resolution races.
+    {
+        uintptr_t tc0 = (uintptr_t)task->tensor_copies & ~63ULL;
+        uintptr_t tc1 = (uintptr_t)(task->tensor_copies + num_params);
+        for (uintptr_t addr = tc0; addr < tc1; addr += 64) {
+            __asm__ volatile("dc cvac, %0" :: "r"(addr) : "memory");
+        }
+        __asm__ volatile("dsb sy" ::: "memory");
+    }
+#endif
+
     // === STEP 5: Finalize fanin list ===
     // First build the fanin list
     for (int i = 0; i < fanin_count; i++) {
         task->fanin_head = pto2_dep_list_prepend(&orch->dep_pool, task->fanin_head, fanin_temp[i]);
     }
-    // Use release semantics to ensure fanin list is visible before fanin_count
-    __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_RELEASE);
+    // SEQ_CST store: participates in the global total order with Phase 1's SEQ_CST
+    // fetch_add on s_pto2_fanin_refcount to prevent the IRIW hazard on ARM.
+    // (See comment above the fetch_add in aicpu_executor.cpp Phase 1 for details.)
+    __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_SEQ_CST);
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
 
@@ -431,7 +443,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // ready queue so scheduler threads can pick it up without an O(N) scan.
     if (orch->aicpu_fanin_refcount && fanin_count > 0) {
         int32_t slot = task_id & orch->aicpu_window_mask;
-        int32_t refcount = __atomic_load_n(&orch->aicpu_fanin_refcount[slot], __ATOMIC_ACQUIRE);
+        int32_t refcount = __atomic_load_n(&orch->aicpu_fanin_refcount[slot], __ATOMIC_SEQ_CST);
         if (refcount >= fanin_count) {
             // All producers already completed — push to orch ready queue
             int32_t tail = orch->orch_ready_tail;

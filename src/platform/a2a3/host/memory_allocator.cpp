@@ -26,6 +26,13 @@ void* MemoryAllocator::alloc(size_t size) {
     return ptr;
 }
 
+void MemoryAllocator::untrack(void* ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    ptr_set_.erase(ptr);
+}
+
 int MemoryAllocator::free(void* ptr) {
     if (ptr == nullptr) {
         return 0;
@@ -38,10 +45,14 @@ int MemoryAllocator::free(void* ptr) {
         return 0;
     }
 
-    // Free the memory
+    // Free the memory. CANN may return 507899 during teardown (known quirk); log as warning.
     int rc = rtFree(ptr);
     if (rc != 0) {
-        LOG_ERROR("rtFree failed: %d", rc);
+        if (rc == 507899) {
+            LOG_WARN("rtFree returned 507899 (CANN teardown quirk, non-fatal): %d", rc);
+        } else {
+            LOG_ERROR("rtFree failed: %d", rc);
+        }
         return rc;
     }
 
@@ -58,17 +69,21 @@ int MemoryAllocator::finalize() {
 
     int last_error = 0;
 
-    // Free all remaining tracked pointers
-    for (void* ptr : ptr_set_) {
+    // Free all remaining tracked pointers. On rtFree failure (e.g. CANN 507899),
+    // still remove from set to avoid double-free; continue freeing others.
+    for (auto it = ptr_set_.begin(); it != ptr_set_.end(); ) {
+        void* ptr = *it;
         int rc = rtFree(ptr);
         if (rc != 0) {
-            LOG_ERROR("rtFree failed during Finalize: %d", rc);
+            if (rc == 507899) {
+                LOG_WARN("rtFree during Finalize returned 507899 (CANN teardown quirk, non-fatal): %d", rc);
+            } else {
+                LOG_ERROR("rtFree failed during Finalize: %d", rc);
+            }
             last_error = rc;
         }
+        it = ptr_set_.erase(it);
     }
-
-    // Clear the set
-    ptr_set_.clear();
     finalized_ = true;
 
     return last_error;

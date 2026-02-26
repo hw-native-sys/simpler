@@ -354,4 +354,26 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 #define PTO2_EXCHANGE(ptr, val) \
     __atomic_exchange_n(ptr, val, __ATOMIC_ACQ_REL)
 
+// =============================================================================
+// Per-task fanout spinlock helpers
+//
+// Used by BOTH the orchestrator (pto_orchestrator.cpp) and the scheduler
+// (aicpu_executor.cpp). Placing them here ensures both translation units use
+// identical acquire/release semantics.
+//
+// The fanout_lock MUST be held whenever reading or writing fanout_head /
+// fanout_count, because the orchestrator adds consumers concurrently with the
+// scheduler traversing the list after task completion.
+// =============================================================================
+
+static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
+    while (PTO2_EXCHANGE(&task->fanout_lock, 1) != 0) {
+        PTO2_SPIN_PAUSE_LIGHT();
+    }
+}
+
+static inline void pto2_fanout_unlock(PTO2TaskDescriptor* task) {
+    PTO2_STORE_RELEASE(&task->fanout_lock, 0);
+}
+
 #endif // PTO_RUNTIME2_TYPES_H

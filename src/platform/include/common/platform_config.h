@@ -173,10 +173,12 @@ constexpr uint8_t PLATFORM_AICORE_BITMAP_LEN = 2;
 constexpr uint32_t PLATFORM_SUB_CORES_PER_AICORE = PLATFORM_CORES_PER_BLOCKDIM;
 
 /**
- * Maximum physical AICore count for DAV 2201 chip
+ * Maximum physical AICore count for DAV 2201 chip.
+ * MUST use 24 AIC + 48 AIV only. Do NOT use 25/50 (causes runtime failures).
  */
 namespace DAV_2201 {
-constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = 25;
+constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = 24;
+static_assert(PLATFORM_MAX_PHYSICAL_CORES == 24u, "Use 24 AIC + 48 AIV only; 25/50 is invalid");
 }
 
 #endif  // PLATFORM_COMMON_PLATFORM_CONFIG_H_

@@ -411,6 +411,9 @@ int DeviceRunner::run(Runtime& runtime,
     }
 
     std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
+    std::cout << "(AICPU progress/heap logs go to device log, not here. If this hangs, check: "
+              << "grep -E 'PTO2|HeapRing' $HOME/ascend/log/debug/device-" << device_id_ << "/*.log)"
+              << std::endl;
     // Synchronize streams
     rc = rtStreamSynchronize(stream_aicpu_);
     if (rc != 0) {
@@ -460,6 +463,25 @@ int DeviceRunner::finalize() {
         return 0;
     }
 
+    // Ensure we are on the correct device before any rtFree (finalize may run from
+    // destructor after Python/runtime_maker has run; current device might have changed).
+    if (device_id_ >= 0) {
+        int set_rc = rtSetDevice(static_cast<uint32_t>(device_id_));
+        if (set_rc != 0) {
+            LOG_ERROR("rtSetDevice(%d) failed: %d (non-fatal)", device_id_, set_rc);
+        }
+    }
+
+    // Ensure all device work (including any async copies) is complete before freeing.
+    // This can avoid rtFree returning 507899 when device is still busy.
+    // CANN rtDeviceSynchronize() takes no arguments (syncs current device).
+    {
+        int sync_rc = rtDeviceSynchronize();
+        if (sync_rc != 0) {
+            LOG_ERROR("rtDeviceSynchronize failed: %d (non-fatal, continuing finalize)", sync_rc);
+        }
+    }
+
     // Print handshake results before cleanup (reads from device memory)
     print_handshake_results();
 
@@ -472,21 +494,10 @@ int DeviceRunner::finalize() {
     // Cleanup AICPU SO
     so_info_.finalize();
 
-    // Clear kernel address mapping
-    func_id_to_addr_.clear();
-    binaries_loaded_ = false;
-
-    // Destroy streams
-    if (stream_aicpu_ != nullptr) {
-        rtStreamDestroy(stream_aicpu_);
-        stream_aicpu_ = nullptr;
-    }
-    if (stream_aicore_ != nullptr) {
-        rtStreamDestroy(stream_aicore_);
-        stream_aicore_ = nullptr;
-    }
-
-    // Cleanup performance profiling
+    // Cleanup performance profiling and free all device memory *before* destroying
+    // streams. CANN rtFree can fail (e.g. 507899) if streams are destroyed first.
+    // After halHostUnregister, CANN may have already freed the perf buffer; calling
+    // rtFree on it causes 507899. So we pass a callback that only untracks the pointer.
     if (perf_collector_.is_initialized()) {
         auto unregister_cb = [](void* host_ptr, int device_id, void* user_data) -> int {
             (void)user_data;
@@ -499,14 +510,29 @@ int DeviceRunner::finalize() {
 
         auto free_cb = [](void* dev_ptr, void* user_data) -> int {
             auto* allocator = static_cast<MemoryAllocator*>(user_data);
-            return allocator->free(dev_ptr);
+            allocator->untrack(dev_ptr);
+            return 0;
         };
 
         perf_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
     }
 
-    // Free all remaining allocations (including handshake buffer and binGmAddr)
+    // Free all remaining allocations (kernel binaries, regs, etc.) before stream destroy
     mem_alloc_.finalize();
+
+    // Clear kernel address mapping (no longer valid after mem_alloc_.finalize())
+    func_id_to_addr_.clear();
+    binaries_loaded_ = false;
+
+    // Destroy streams after all device memory is freed
+    if (stream_aicpu_ != nullptr) {
+        rtStreamDestroy(stream_aicpu_);
+        stream_aicpu_ = nullptr;
+    }
+    if (stream_aicore_ != nullptr) {
+        rtStreamDestroy(stream_aicore_);
+        stream_aicore_ = nullptr;
+    }
 
     device_id_ = -1;
     worker_count_ = 0;

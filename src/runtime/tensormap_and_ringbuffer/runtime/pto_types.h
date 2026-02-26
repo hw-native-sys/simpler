@@ -41,8 +41,9 @@ enum class PTOParamType : int32_t {
  * automatic dependency detection via TensorMap overlap checking.
  *
  * For OUTPUT params with tensor->buffer.addr == 0, the runtime allocates
- * a buffer and writes the address back through the pointer, implicitly
- * updating the caller's local Tensor. No manual sync needed.
+ * from the heap ring in pto2_submit_task (not in make_tensor) and writes the
+ * address back through the pointer. No buffer content is copied; input/inout
+ * tensors already point to their storage, so no memcpy on submit.
  *
  * Example:
  *   Tensor td_a = make_tensor_external(dev_a, size);

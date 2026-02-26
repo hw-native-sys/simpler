@@ -25,6 +25,13 @@ void* MemoryAllocator::alloc(size_t size) {
     return ptr;
 }
 
+void MemoryAllocator::untrack(void* ptr) {
+    if (ptr == nullptr) {
+        return;
+    }
+    ptr_set_.erase(ptr);
+}
+
 int MemoryAllocator::free(void* ptr) {
     if (ptr == nullptr) {
         return 0;

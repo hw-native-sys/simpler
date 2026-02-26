@@ -251,7 +251,9 @@ static inline Tensor make_tensor_external(
 
 /**
  * Create a Tensor for runtime-allocated output (addr=0).
- * The runtime fills in the actual address during pto2_submit_task.
+ * NO memory allocation: only records dtype, shape, and buffer.size in the Tensor struct.
+ * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
+ * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
  */
 static inline Tensor make_tensor(uint64_t size_bytes, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
     return Tensor::make_1d_contiguous(0, size_bytes, dtype, version);
@@ -259,7 +261,9 @@ static inline Tensor make_tensor(uint64_t size_bytes, DataType dtype = DataType:
 
 /**
  * Create a Tensor for runtime-allocated output (addr=0).
- * The runtime fills in the actual address during pto2_submit_task.
+ * NO memory allocation: only records dtype, shape, and buffer.size in the Tensor struct.
+ * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
+ * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
  */
 static inline Tensor make_tensor(
     const uint64_t shapes[], uint64_t ndims, DataType dtype = DataType::FLOAT32, int32_t version = 0) {

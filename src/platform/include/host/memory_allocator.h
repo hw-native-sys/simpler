@@ -54,6 +54,15 @@ public:
     void* alloc(size_t size);
 
     /**
+     * Remove pointer from tracking without freeing (e.g. after halHostUnregister
+     * which may have already freed the device memory; calling rtFree would fail with 507899).
+     *
+     * @param ptr  Memory pointer to remove from tracking
+     * @return 0 if removed, 0 if ptr not tracked (no-op)
+     */
+    void untrack(void* ptr);
+
+    /**
      * Free memory if tracked
      *
      * Checks if the pointer exists in the tracking set. If found, frees the

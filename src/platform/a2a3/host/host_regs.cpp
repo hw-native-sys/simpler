@@ -114,9 +114,10 @@ void get_aicore_regs(std::vector<int64_t>& regs, uint64_t device_id) {
     int rt = get_aicore_reg_info(aic, aiv, ADDR_MAP_TYPE_REG_AIC_CTRL, device_id);
 
     if (rt != 0) {
-        LOG_ERROR("get_aicore_reg_info failed, using placeholder addresses");
-        // Fallback: generate placeholder addresses
-        for (int i = 0; i < 25; i++) {
+        LOG_ERROR("get_aicore_reg_info failed (rc=%d), using placeholder addresses", rt);
+        LOG_WARN("Placeholder addresses are NOT valid AICore MMIO bases; AICore kernels will not run and the process may hang or never complete. Fix HAL/permissions and re-run.");
+        // Fallback: generate placeholder addresses (invalid for real execution)
+        for (int i = 0; i < DAV_2201::PLATFORM_MAX_PHYSICAL_CORES; i++) {
             aic.push_back(0xDEADBEEF00000000ULL + (i * 0x800000));  // 8M stride
             aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x100000);
             aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x200000);
