@@ -1,6 +1,6 @@
 # Commit Message Rules
 
-1. Do not add co-author lines (e.g., `Co-Authored-By:`) to commits.
+1. Do not add AI co-author lines (e.g., `Co-Authored-By:`) to commits.
 2. Use the format `Type: concise description` where Type is one of:
    - **Refactor** — restructuring without behavior change
    - **Fix** — bug fix

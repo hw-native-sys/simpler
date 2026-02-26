@@ -1,5 +1,9 @@
 # Terminology (Based on Ascend NPU Architecture)
 
+## Project Name
+
+- **simpler** = Simple/Simpler Runtime: The repository name for the PTO Runtime project
+
 ## Hardware Units
 
 - **AIC** = **AICore-CUBE**: Matrix computation unit for tensor operations (matmul, convolution)

@@ -1,64 +1,64 @@
-# Swimlane 性能分析工具
+# Swimlane Performance Analysis Tools
 
-本目录包含 PTO Runtime 的性能分析工具。
+This directory contains performance analysis tools for PTO Runtime.
 
-## 工具列表
+## Tools
 
-- **[swimlane_converter.py](#swimlane_converterpy)** - 转换为 Chrome Trace Event 可视化格式
-- **[perf_to_mermaid.py](#perf_to_mermaidpy)** - 转换为 Mermaid 依赖图
+- **[swimlane_converter.py](#swimlane_converterpy)** — Convert to Chrome Trace Event format for visualization
+- **[perf_to_mermaid.py](#perf_to_mermaidpy)** — Convert to Mermaid dependency graph
 
 ---
 
 ## swimlane_converter.py
 
-将性能分析数据 JSON 文件转换为 Chrome Trace Event 格式，以便在 Perfetto 中可视化。
+Converts performance profiling JSON data to Chrome Trace Event format for visualization in Perfetto.
 
-### 功能概述
+### Overview
 
-`swimlane_converter.py` 将 PTO Runtime 的性能分析数据（`perf_swimlane_*.json`）转换为可在 Perfetto 跟踪查看器（https://ui.perfetto.dev/）中可视化的格式。同时提供按函数分组的任务执行统计分析。
+`swimlane_converter.py` converts PTO Runtime profiling data (`perf_swimlane_*.json`) into a format viewable in the Perfetto trace viewer (https://ui.perfetto.dev/). It also provides per-function task execution statistics.
 
-### 基本用法
+### Basic Usage
 
 ```bash
-# 自动检测 outputs/ 目录中最新的性能分析文件
+# Auto-detect the latest profiling file in outputs/
 python3 tools/swimlane_converter.py
 
-# 指定输入文件
+# Specify input file
 python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json
 
-# 指定输出文件
+# Specify output file
 python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -o custom_output.json
 
-# 从 kernel_config.py 加载函数名映射
+# Load function name mapping from kernel_config.py
 python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
-# 详细模式（用于调试）
+# Verbose mode (for debugging)
 python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -v
 ```
 
-### 命令行选项
+### Command-Line Options
 
-| 选项 | 简写 | 说明 |
-|------|------|------|
-| `input` | | 输入 JSON 文件（perf_swimlane_*.json）。如果省略，使用 outputs/ 中最新的文件 |
-| `--output` | `-o` | 输出 JSON 文件（默认：outputs/merged_swimlane_<timestamp>.json） |
-| `--kernel-config` | `-k` | kernel_config.py 文件路径，用于函数名映射 |
-| `--verbose` | `-v` | 启用详细输出 |
+| Option | Short | Description |
+|--------|-------|-------------|
+| `input` | | Input JSON file (`perf_swimlane_*.json`). If omitted, uses the latest file in `outputs/` |
+| `--output` | `-o` | Output JSON file (default: `outputs/merged_swimlane_<timestamp>.json`) |
+| `--kernel-config` | `-k` | Path to `kernel_config.py` for function name mapping |
+| `--verbose` | `-v` | Enable verbose output |
 
-### 输出内容
+### Output
 
-工具生成两类输出：
+The tool produces two types of output:
 
-#### 1. Perfetto JSON 文件
+#### 1. Perfetto JSON File
 
-可在 Perfetto 中可视化的 Chrome Trace Event 格式 JSON 文件：
-- 文件位置：`outputs/merged_swimlane_<timestamp>.json`
-- 打开 https://ui.perfetto.dev/ 并拖入文件即可可视化
+A Chrome Trace Event format JSON file viewable in Perfetto:
+- File location: `outputs/merged_swimlane_<timestamp>.json`
+- Open https://ui.perfetto.dev/ and drag the file in to visualize
 
-#### 2. 任务统计信息
+#### 2. Task Statistics
 
-按函数分组的统计摘要（打印到控制台）：
+Per-function grouped statistics summary (printed to console):
 
 ```
 ========================================================================================================
@@ -75,84 +75,84 @@ TOTAL                                40       6266.50
 ========================================================================================================
 ```
 
-统计信息包括：
-- **Func ID**：kernel 配置中的函数标识符
-- **Func Name**：函数名称（来自 kernel_config.py 或自动生成）
-- **Count**：该函数的任务数量
-- **Total (us)**：该函数所有任务的总执行时间（微秒）
-- **Avg (us)**：每个任务的平均执行时间（微秒）
-- **Min (us)**：最小执行时间（微秒）
-- **Max (us)**：最大执行时间（微秒）
+Statistics include:
+- **Func ID**: Function identifier from kernel config
+- **Func Name**: Function name (from `kernel_config.py` or auto-generated)
+- **Count**: Number of tasks for this function
+- **Total (us)**: Total execution time across all tasks (microseconds)
+- **Avg (us)**: Average execution time per task (microseconds)
+- **Min (us)**: Minimum execution time (microseconds)
+- **Max (us)**: Maximum execution time (microseconds)
 
-### 与 run_example.py 集成
+### Integration with run_example.py
 
-启用性能分析运行测试时，转换器会自动调用：
+When running tests with profiling enabled, the converter is called automatically:
 
 ```bash
-# 运行测试并启用性能分析 - 测试通过后自动生成 merged_swimlane.json
+# Run test with profiling — merged_swimlane.json is generated automatically after pass
 python examples/scripts/run_example.py \
     -k examples/host_build_graph/vector_example/kernels \
     -g examples/host_build_graph/vector_example/golden.py \
     --enable-profiling
 ```
 
-测试通过后，工具将：
-1. 自动检测 outputs/ 中最新的 `perf_swimlane_*.json`
-2. 从 `-k` 指定的 kernel_config.py 加载函数名
-3. 生成 `merged_swimlane_*.json` 用于可视化
-4. 将任务统计信息打印到控制台
+After the test passes, the tool will:
+1. Auto-detect the latest `perf_swimlane_*.json` in `outputs/`
+2. Load function names from the `-k` kernel_config.py
+3. Generate `merged_swimlane_*.json` for visualization
+4. Print task statistics to the console
 
 ---
 
 ## perf_to_mermaid.py
 
-将性能分析数据转换为 Mermaid 流程图格式，可视化任务依赖关系。
+Converts performance profiling data to Mermaid flowchart format for visualizing task dependencies.
 
-### 功能概述
+### Overview
 
-`perf_to_mermaid.py` 将 PTO Runtime 的性能分析数据（`perf_swimlane_*.json`）转换为 Mermaid 流程图格式。生成的 Markdown 文件可以：
-- 在 GitHub/GitLab 中直接渲染
-- 在 https://mermaid.live/ 中查看
-- 在支持 Mermaid 的编辑器中查看（如 VS Code + Mermaid 插件）
+`perf_to_mermaid.py` converts PTO Runtime profiling data (`perf_swimlane_*.json`) into Mermaid flowchart format. The generated Markdown file can be:
+- Rendered directly in GitHub/GitLab
+- Viewed at https://mermaid.live/
+- Viewed in editors with Mermaid support (e.g., VS Code + Mermaid extension)
 
-### 基本用法
+### Basic Usage
 
 ```bash
-# 自动检测 outputs/ 目录中最新的性能分析文件
+# Auto-detect the latest profiling file in outputs/
 python3 tools/perf_to_mermaid.py
 
-# 指定输入文件
+# Specify input file
 python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json
 
-# 指定输出文件
+# Specify output file
 python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json -o diagram.md
 
-# 从 kernel_config.py 加载函数名映射
+# Load function name mapping from kernel_config.py
 python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
-# 使用紧凑样式（仅显示任务ID和函数名）
+# Use compact style (task ID and function name only)
 python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json --style compact
 
-# 详细模式
+# Verbose mode
 python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json -v
 ```
 
-### 命令行选项
+### Command-Line Options
 
-| 选项 | 简写 | 说明 |
-|------|------|------|
-| `input` | | 输入 JSON 文件（perf_swimlane_*.json）。如果省略，使用 outputs/ 中最新的文件 |
-| `--output` | `-o` | 输出 Markdown 文件（默认：outputs/mermaid_diagram_<timestamp>.md） |
-| `--kernel-config` | `-k` | kernel_config.py 文件路径，用于函数名映射 |
-| `--style` | | 节点样式：`detailed`（详细，包含核心和时间）或 `compact`（紧凑，仅函数名）|
-| `--verbose` | `-v` | 启用详细输出 |
+| Option | Short | Description |
+|--------|-------|-------------|
+| `input` | | Input JSON file (`perf_swimlane_*.json`). If omitted, uses the latest file in `outputs/` |
+| `--output` | `-o` | Output Markdown file (default: `outputs/mermaid_diagram_<timestamp>.md`) |
+| `--kernel-config` | `-k` | Path to `kernel_config.py` for function name mapping |
+| `--style` | | Node style: `detailed` (with core type and timing) or `compact` (function name only) |
+| `--verbose` | `-v` | Enable verbose output |
 
-### 输出内容
+### Output
 
-生成包含 Mermaid 流程图的 Markdown 文件：
+Generates a Markdown file containing a Mermaid flowchart:
 
-#### Detailed 样式（默认）
+#### Detailed Style (Default)
 
 ```mermaid
 flowchart TD
@@ -198,11 +198,11 @@ flowchart TD
 ```
 
 
-## 共同配置
+## Shared Configuration
 
-### 输入文件格式
+### Input File Format
 
-两个工具都接受相同的输入格式 - PTO Runtime 生成的 `perf_swimlane_*.json` 文件：
+Both tools accept the same input format — `perf_swimlane_*.json` files generated by PTO Runtime:
 
 ```json
 {
@@ -224,100 +224,99 @@ flowchart TD
 }
 ```
 
-### Kernel Config 格式
+### Kernel Config Format
 
-要在输出中显示有意义的函数名，需要提供 `kernel_config.py` 文件：
+To display meaningful function names in output, provide a `kernel_config.py` file:
 
 ```python
 KERNELS = [
     {
         "func_id": 0,
         "name": "QK",
-        # ... 其他字段
+        # ... other fields
     },
     {
         "func_id": 1,
         "name": "SF",
-        # ... 其他字段
+        # ... other fields
     },
 ]
 ```
 
-工具从 `KERNELS` 列表中提取 `func_id` 到 `name` 的映射。
+The tools extract the `func_id` → `name` mapping from the `KERNELS` list.
 
 ---
 
-## 工具选择建议
+## Tool Selection Guide
 
-### 使用 swimlane_converter.py 当你需要：
-- ✅ 查看详细的时间线执行视图
-- ✅ 分析任务在不同核心上的调度情况
-- ✅ 查看精确的执行时间和时间间隔
-- ✅ 获取任务执行的统计信息
-- ✅ 专业的性能分析和优化
+### Use swimlane_converter.py when you need to:
+- View detailed timeline execution
+- Analyze task scheduling across different cores
+- See precise execution times and intervals
+- Get task execution statistics
+- Perform professional performance analysis and optimization
 
-### 使用 perf_to_mermaid.py 当你需要：
-- ✅ 快速查看任务依赖关系
-- ✅ 在文档中嵌入依赖图
-- ✅ 在代码审查中分享依赖结构
-- ✅ 不需要时间线细节，只关注拓扑结构
-- ✅ 在 GitHub/GitLab 中直接查看
+### Use perf_to_mermaid.py when you need to:
+- Quickly view task dependency relationships
+- Embed dependency graphs in documentation
+- Share dependency structure in code reviews
+- Focus on topology without timeline details
+- View directly in GitHub/GitLab
 
-### 推荐工作流
+### Recommended Workflow
 
 ```bash
-# 1. 运行测试获取性能数据
+# 1. Run test to collect performance data
 python examples/scripts/run_example.py -k ./kernels -g ./golden.py --enable-profiling
 
-# 2. 生成 Perfetto 可视化（自动）
+# 2. Generate Perfetto visualization (automatic)
 # → outputs/merged_swimlane_*.json
 
-# 3. 生成 Mermaid 依赖图
+# 3. Generate Mermaid dependency graph
 python3 tools/perf_to_mermaid.py -k ./kernels/kernel_config.py
 
-# 4. 分析结果
-# - 详细性能分析：Perfetto (https://ui.perfetto.dev/)
-# - 依赖关系概览：Mermaid 图（GitHub/编辑器）
-# - 统计摘要：控制台输出
+# 4. Analyze results
+# - Detailed performance analysis: Perfetto (https://ui.perfetto.dev/)
+# - Dependency overview: Mermaid diagram (GitHub/editor)
+# - Statistics summary: Console output
 ```
 
 ---
 
-## 故障排查
+## Troubleshooting
 
-### 错误：找不到 perf_swimlane_*.json 文件
-- 确保使用 `--enable-profiling` 标志运行了测试
-- 检查 outputs/ 目录是否存在并包含性能分析数据
+### Error: Cannot find perf_swimlane_*.json file
+- Ensure you ran the test with the `--enable-profiling` flag
+- Check that the `outputs/` directory exists and contains profiling data
 
-### 警告：Kernel entry missing 'func_id' or 'name'
-- 检查 kernel_config.py 文件格式
-- 确保所有 KERNELS 条目都有 'func_id' 和 'name' 字段
+### Warning: Kernel entry missing 'func_id' or 'name'
+- Check the `kernel_config.py` file format
+- Ensure all `KERNELS` entries have both `func_id` and `name` fields
 
-### 错误：Unsupported version
-- 工具仅支持版本 1 的性能分析数据格式
-- 使用最新的 runtime 重新生成性能分析数据
+### Error: Unsupported version
+- The tools only support version 1 of the profiling data format
+- Regenerate profiling data with the latest runtime
 
-### Mermaid 图在 GitHub 上不显示
-- 确保文件是 `.md` 扩展名
-- 检查 Mermaid 语法是否正确
-- GitHub 有时需要刷新才能渲染 Mermaid 图
-
----
-
-## 输出文件说明
-
-| 文件 | 工具 | 用途 | 格式 |
-|------|------|------|------|
-| `perf_swimlane_*.json` | Runtime | 原始性能分析数据 | JSON |
-| `merged_swimlane_*.json` | swimlane_converter.py | Perfetto 可视化 | Chrome Trace Event JSON |
-| `mermaid_diagram_*.md` | perf_to_mermaid.py | 依赖关系图 | Markdown + Mermaid |
+### Mermaid diagram not rendering on GitHub
+- Ensure the file has a `.md` extension
+- Check that the Mermaid syntax is valid
+- GitHub may require a page refresh to render Mermaid diagrams
 
 ---
 
-## 相关资源
+## Output File Reference
 
-- [PTO Runtime 文档](../docs/)
-- [示例测试用例](../examples/)
+| File | Tool | Purpose | Format |
+|------|------|---------|--------|
+| `perf_swimlane_*.json` | Runtime | Raw profiling data | JSON |
+| `merged_swimlane_*.json` | swimlane_converter.py | Perfetto visualization | Chrome Trace Event JSON |
+| `mermaid_diagram_*.md` | perf_to_mermaid.py | Dependency graph | Markdown + Mermaid |
+
+---
+
+## Related Resources
+
+- [Example test cases](../examples/)
 - [Perfetto Trace Viewer](https://ui.perfetto.dev/)
 - [Mermaid Live Editor](https://mermaid.live/)
-- [Mermaid 文档](https://mermaid.js.org/)
+- [Mermaid Documentation](https://mermaid.js.org/)

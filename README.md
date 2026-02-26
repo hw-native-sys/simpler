@@ -1,4 +1,5 @@
-# PTO Runtime - Task Runtime Execution Framework
+# Simple/Simpler Runtime (simpler) - Task Runtime Execution Framework
+
 
 Modular runtime for building and executing task dependency runtimes on Ascend devices with coordinated AICPU and AICore execution. Three independently compiled programs work together through clearly defined APIs.
 

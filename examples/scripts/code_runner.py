@@ -748,6 +748,7 @@ class CodeRunner:
             import sys
             sys.stdout.flush()  # Ensure output is visible before potential hang
 
+            _t_launch_start = time.perf_counter()
             launch_runtime(
                 runtime,
                 aicpu_thread_num=self.aicpu_thread_num,
@@ -756,6 +757,8 @@ class CodeRunner:
                 aicpu_binary=aicpu_binary,
                 aicore_binary=aicore_binary,
             )
+            _t_launch_end = time.perf_counter()
+            logger.info(f">>> launch_runtime() took {_t_launch_end - _t_launch_start:.3f}s")
 
             logger.info("Launch completed successfully")  # Will only print if not hung
 
