@@ -407,7 +407,9 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     for (int i = 0; i < fanin_count; i++) {
         task->fanin_head = pto2_dep_list_prepend(&orch->dep_pool, task->fanin_head, fanin_temp[i]);
     }
-    // Use SEQ_CST to pair with the scheduler's SEQ_CST fetch_add + load (IRIW on ARM)
+    // SEQ_CST store: participates in the global total order with Phase 1's SEQ_CST
+    // fetch_add on s_pto2_fanin_refcount to prevent the IRIW hazard on ARM.
+    // (See comment above the fetch_add in aicpu_executor.cpp Phase 1 for details.)
     __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_SEQ_CST);
 
     CYCLE_COUNT_LAP(g_orch_fanin_cycle);
