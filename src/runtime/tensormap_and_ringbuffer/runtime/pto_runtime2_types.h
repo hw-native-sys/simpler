@@ -274,7 +274,6 @@ struct PTO2TaskDescriptor {
 
 
     PTOParam params[16];
-    Tensor tensor_copies[16];  // Owned tensor data (params[i].tensor points here)
     int param_count{0};
 };
 

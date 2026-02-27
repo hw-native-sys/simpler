@@ -57,8 +57,13 @@ enum class PTOParamType : int32_t {
  */
 struct PTOParam {
     PTOParamType type;         // PTOParamType::INPUT, PTOParamType::OUTPUT, or PTOParamType::SCALAR
-    Tensor* tensor;  // Pointer to caller's tensor descriptor (NULL for SCALAR)
+    Tensor tensor;             // Tensor value (default-constructed for SCALAR)
     uint64_t scalar_value;     // Raw value for PTOParamType::SCALAR (e.g., encoded float, int size)
+
+    PTOParam() : type(PTOParamType::SCALAR), tensor(), scalar_value(0) {}
+
+    PTOParam(PTOParamType type, const Tensor& tensor, uint64_t scalar_value):
+        type(type), tensor(tensor), scalar_value(scalar_value) {}
 };
 
 // =============================================================================
@@ -66,37 +71,21 @@ struct PTOParam {
 // =============================================================================
 
 static inline PTOParam make_scalar_param(uint64_t value) {
-    PTOParam p = {};
-    p.type = PTOParamType::SCALAR;
-    p.tensor = nullptr;
-    p.scalar_value = value;
-    return p;
+    return PTOParam(PTOParamType::SCALAR, Tensor(), value);
 }
 
 static inline PTOParam make_input_param(Tensor& tensor) {
-    assert(tensor.buffer.addr != 0 && "INPUT param must have a non-NULL buffer address");
-    PTOParam p = {};
-    p.type = PTOParamType::INPUT;
-    p.tensor = &tensor;
-    p.scalar_value = 0;
-    return p;
+    assert(tensor.data().buffer.addr != 0 && "INPUT param must have a non-NULL buffer address");
+    return PTOParam(PTOParamType::INPUT, tensor, 0);
 }
 
 static inline PTOParam make_output_param(Tensor& tensor) {
-    PTOParam p = {};
-    p.type = PTOParamType::OUTPUT;
-    p.tensor = &tensor;
-    p.scalar_value = 0;
-    return p;
+    return PTOParam(PTOParamType::OUTPUT, tensor, 0);
 }
 
 static inline PTOParam make_inout_param(Tensor& tensor) {
-    assert(tensor.buffer.addr != 0 && "INOUT param must have a non-NULL buffer address");
-    PTOParam p = {};
-    p.type = PTOParamType::INOUT;
-    p.tensor = &tensor;
-    p.scalar_value = 0;
-    return p;
+    assert(tensor.data().buffer.addr != 0 && "INOUT param must have a non-NULL buffer address");
+    return PTOParam(PTOParamType::INOUT, tensor, 0);
 }
 
 #endif  // ORCH_BUILD_GRAPH_PTO_TYPES_H

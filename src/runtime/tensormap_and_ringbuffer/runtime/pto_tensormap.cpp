@@ -24,6 +24,18 @@
 #include "tensor.h"
 
 // =============================================================================
+// TensorMap Lookup Chain Length Statistics (compile-time toggle)
+// =============================================================================
+#if PTO2_ORCH_PROFILING
+static uint64_t g_lookup_chain_total = 0;
+static uint64_t g_lookup_count = 0;
+static int32_t  g_lookup_chain_max = 0;
+static uint64_t g_lookup_overlap_checks = 0;
+static uint64_t g_lookup_overlap_hits = 0;
+static uint64_t g_insert_count = 0;
+#endif
+
+// =============================================================================
 // Initialization and Destruction
 // =============================================================================
 
@@ -151,7 +163,7 @@ void pto2_tensormap_reset(PTO2TensorMap* tm) {
 // Hash Function
 // =============================================================================
 
-uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, Tensor* tensor) {
+uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, const Tensor& tensor) {
     // ========================================================================
     // CRITICAL: Hash ONLY by base_ptr for correct overlap detection!
     // ========================================================================
@@ -169,7 +181,7 @@ uint32_t pto2_tensormap_hash(PTO2TensorMap* tm, Tensor* tensor) {
     //   Region A: base=X, offset=0   → bucket 5
     //   Region B: base=X, offset=128 → bucket 5   (CORRECT! Same bucket)
     //
-    uint64_t key = (uint64_t)(uintptr_t)tensor->buffer.addr;
+    uint64_t key = (uint64_t)(uintptr_t)tensor.data().buffer.addr;
 
     // Improve distribution by mixing bits (pointers often have aligned low bits)
     key = key ^ (key >> 16);
@@ -237,12 +249,15 @@ void pto2_tensormap_cleanup_retired(PTO2TensorMap* tm, int32_t old_last_task_ali
 // Lookup with Chain Truncation
 // =============================================================================
 
-void pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor, PTO2LookupResult* result) {
+void pto2_tensormap_lookup(PTO2TensorMap* tm, const Tensor &tensor, PTO2LookupResult* result) {
     uint32_t bucket = pto2_tensormap_hash(tm, tensor);
     int32_t* prev_ptr = &tm->buckets[bucket];  // For truncation
     int32_t offset = *prev_ptr;
 
     result->count = 0;
+#if PTO2_ORCH_PROFILING
+    int32_t chain_len = 0;
+#endif
 
     while (offset >= 0) {
         PTO2TensorMapEntry* entry = &tm->entry_pool[offset];
@@ -264,21 +279,39 @@ void pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor, PTO2LookupResult* 
                 offset = next;
             }
 
+#if PTO2_ORCH_PROFILING
+            g_lookup_chain_total += chain_len;
+            g_lookup_count++;
+            if (chain_len > g_lookup_chain_max) g_lookup_chain_max = chain_len;
+#endif
             return;
         }
 
+#if PTO2_ORCH_PROFILING
+        chain_len++;
+        g_lookup_overlap_checks++;
+#endif
         // Entry is valid - check if regions OVERLAP (not just exact match)
         // Since we hash only by base_ptr, all entries in this bucket have
         // potential to overlap. We must check actual byte-range overlap.
-        auto overlap_status = tensor->is_overlap(entry->tensor);
+        auto overlap_status = tensor.is_overlap(entry->tensor);
         if (overlap_status != OverlapStatus::NO_OVERLAP) {
             result->push(offset, overlap_status);
+#if PTO2_ORCH_PROFILING
+            g_lookup_overlap_hits++;
+#endif
         }
 
         // Move to next entry
         prev_ptr = &entry->next_in_bucket;
         offset = *prev_ptr;
     }
+
+#if PTO2_ORCH_PROFILING
+    g_lookup_chain_total += chain_len;
+    g_lookup_count++;
+    if (chain_len > g_lookup_chain_max) g_lookup_chain_max = chain_len;
+#endif
 }
 
 int32_t PTO2TensorMap::new_entry() {
@@ -313,7 +346,8 @@ void PTO2TensorMap::free_entry(int32_t entry_idx) {
     // Update predecessor's next pointer (O(1) via prev_in_bucket)
     if (entry->prev_in_bucket == -1) {
         // Entry is the head of its bucket chain, update bucket head
-        uint32_t bucket = pto2_tensormap_hash(this, &entry->tensor);
+        // Must compute hash BEFORE clearing tensor (tensor.data() needs valid tensor_pool)
+        uint32_t bucket = pto2_tensormap_hash(this, entry->tensor);
         buckets[bucket] = entry->next_in_bucket;
     } else {
         entry_pool[entry->prev_in_bucket].next_in_bucket = entry->next_in_bucket;
@@ -323,6 +357,9 @@ void PTO2TensorMap::free_entry(int32_t entry_idx) {
     if (entry->next_in_bucket >= 0) {
         entry_pool[entry->next_in_bucket].prev_in_bucket = entry->prev_in_bucket;
     }
+
+    // Clear tensor AFTER bucket chain manipulation (hash computation needs valid tensor)
+    entry->tensor = Tensor();
 
     free_entry_list[free_num++] = entry_idx;
     entry->in_bucket = false;
@@ -336,13 +373,16 @@ void PTO2TensorMap::free_entry(int32_t entry_idx) {
 // Insert
 // =============================================================================
 
-void pto2_tensormap_insert(PTO2TensorMap* tm, Tensor* tensor, int32_t producer_task_id, bool with_alloc) {
+void pto2_tensormap_insert(PTO2TensorMap* tm, const Tensor& tensor, int32_t producer_task_id, bool with_alloc) {
+#if PTO2_ORCH_PROFILING
+    g_insert_count++;
+#endif
     // Allocate entry from ring buffer pool
     int32_t entry_offset = tm->new_entry();
     PTO2TensorMapEntry* entry = &tm->entry_pool[entry_offset];
 
     // Initialize new entry
-    entry->tensor = *tensor;
+    entry->tensor = tensor;
     entry->producer_task_id = producer_task_id;
     entry->with_alloc = with_alloc;
 
@@ -456,3 +496,27 @@ void pto2_orchestrator_sync_tensormap(PTO2TensorMap* tm, bool force) {
         tm->orch->tensormap_last_cleanup = new_last_task_alive;
     }
 }
+
+// =============================================================================
+// TensorMap Lookup Profiling
+// =============================================================================
+#if PTO2_ORCH_PROFILING
+PTO2TensorMapProfilingData pto2_tensormap_get_profiling() {
+    PTO2TensorMapProfilingData d;
+    d.lookup_chain_total = g_lookup_chain_total;
+    d.lookup_count = g_lookup_count;
+    d.lookup_chain_max = g_lookup_chain_max;
+    d.overlap_checks = g_lookup_overlap_checks;
+    d.overlap_hits = g_lookup_overlap_hits;
+    d.insert_count = g_insert_count;
+
+    // Reset
+    g_lookup_chain_total = 0;
+    g_lookup_count = 0;
+    g_lookup_chain_max = 0;
+    g_lookup_overlap_checks = 0;
+    g_lookup_overlap_hits = 0;
+    g_insert_count = 0;
+    return d;
+}
+#endif

@@ -4,7 +4,7 @@
  * Computes: C_tile = C_tile + P (64x64 tile accumulation)
  * Uses TADD instruction
  *
- * Args (Tensor*):
+ * Args (TensorData*):
  *   args[0] = C_tile (INOUT: read + write accumulator)
  *   args[1] = P      (INPUT: matmul result to accumulate)
  */
@@ -26,8 +26,8 @@ using namespace pto;
 #endif
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* c_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* p_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ TensorData* c_tensor = reinterpret_cast<__gm__ TensorData*>(args[0]);
+    __gm__ TensorData* p_tensor = reinterpret_cast<__gm__ TensorData*>(args[1]);
 
     __gm__ float* c_ptr = reinterpret_cast<__gm__ float*>(c_tensor->buffer.addr) + c_tensor->start_offset;
     __gm__ float* p_ptr = reinterpret_cast<__gm__ float*>(p_tensor->buffer.addr) + p_tensor->start_offset;

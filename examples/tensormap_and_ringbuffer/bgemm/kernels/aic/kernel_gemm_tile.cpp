@@ -4,7 +4,7 @@
  * Computes: output = input_a @ input_b (64x64 tile matmul)
  * Uses TMATMUL instruction
  *
- * Args (Tensor*):
+ * Args (TensorData*):
  *   args[0] = input_a (INPUT)
  *   args[1] = input_b (INPUT)
  *   args[2] = output  (OUTPUT)
@@ -36,9 +36,9 @@ AICORE constexpr inline T CeilAlign(T num_1, T num_2) {
 }
 
 static __aicore__ void gemm_tile_impl(
-    __gm__ Tensor* input_a_tensor,
-    __gm__ Tensor* input_b_tensor,
-    __gm__ Tensor* output_tensor) {
+    __gm__ TensorData* input_a_tensor,
+    __gm__ TensorData* input_b_tensor,
+    __gm__ TensorData* output_tensor) {
 
     __gm__ float* input_a = reinterpret_cast<__gm__ float*>(input_a_tensor->buffer.addr) + input_a_tensor->start_offset;
     __gm__ float* input_b = reinterpret_cast<__gm__ float*>(input_b_tensor->buffer.addr) + input_b_tensor->start_offset;
@@ -101,9 +101,9 @@ static __aicore__ void gemm_tile_impl(
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* input_a = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* input_b = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* output  = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ TensorData* input_a = reinterpret_cast<__gm__ TensorData*>(args[0]);
+    __gm__ TensorData* input_b = reinterpret_cast<__gm__ TensorData*>(args[1]);
+    __gm__ TensorData* output  = reinterpret_cast<__gm__ TensorData*>(args[2]);
 
     gemm_tile_impl(input_a, input_b, output);
 }

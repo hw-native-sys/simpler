@@ -59,6 +59,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 __attribute__((visibility("default")))
 void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     (void)arg_count;
+    pto2_rt_init_tensor_pool(rt);
 
     // Extract device pointers (first 7)
     void* host_query = (void*)(uintptr_t)args[0];           // [batch, num_heads, head_dim]
@@ -123,6 +124,13 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                 Tensor li_update = make_tensor(li_shapes, 1, DataType::FLOAT32);
                 Tensor mi_update = make_tensor(mi_shapes, 1, DataType::FLOAT32);
 
+                uint64_t qi_shapes[2] = {q_tile, head_dim};
+                uint64_t qi_offsets[2] = {cur_offset, 0};
+                Tensor qi = query.view(qi_shapes, qi_offsets);
+                uint64_t out_view_shapes[2] = {q_tile, head_dim};
+                uint64_t out_view_offsets[2] = {cur_offset, 0};
+                Tensor out_view = out.view(out_view_shapes, out_view_offsets);
+
                 PTOParam params_inplace[] = {
                     make_output_param(oi),
                     make_output_param(li_update),
@@ -131,11 +139,12 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                 pto2_rt_submit_task(rt, FUNC_AIV_HUB, PTO2_WORKER_VECTOR, params_inplace, 3); // create_inplace
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
-                    Tensor qi = query.view({q_tile, head_dim}, {cur_offset, 0});
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
                     uint64_t valid_len = block_size < (cur_seq - bn * block_size) ? block_size : (cur_seq - bn * block_size);
-                    Tensor kj = key_cache.view({block_size, head_dim}, {cur_block_idx * block_size, 0});
-                    Tensor vj = value_cache.view({block_size, head_dim}, {cur_block_idx * block_size, 0});
+                    uint64_t kv_shapes[2] = {block_size, head_dim};
+                    uint64_t kv_offsets[2] = {cur_block_idx * block_size, 0};
+                    Tensor kj = key_cache.view(kv_shapes, kv_offsets);
+                    Tensor vj = value_cache.view(kv_shapes, kv_offsets);
 
                     uint64_t sij_shapes[2] = {q_tile, block_size};
                     Tensor sij = make_tensor(sij_shapes, 2, DataType::FLOAT32);
@@ -148,7 +157,9 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                     };
                     pto2_rt_submit_task(rt, FUNC_QK_MATMUL, PTO2_WORKER_CUBE, params_qk, 3); // c1
 
-                    Tensor sij_valid = sij.view({q_tile, valid_len}, {0, 0});
+                    uint64_t sij_valid_shapes[2] = {q_tile, valid_len};
+                    uint64_t sij_valid_offsets[2] = {0, 0};
+                    Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
                     Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
                     Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
                     PTOParam params_sf[] = {
@@ -173,14 +184,13 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
 
-                    Tensor out_view = out.view({q_tile, head_dim}, {cur_offset, 0});
                     PTOParam params_up[] = {
                         make_input_param(mi),
                         make_input_param(li),
                         make_input_param(oi_tmp),
                         make_inout_param(mi_update),
                         make_inout_param(li_update),
-                        make_output_param(oi),
+                        make_inout_param(oi),
                         make_output_param(out_view),
                         make_scalar_param(is_first),
                         make_scalar_param(is_last),

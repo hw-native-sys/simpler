@@ -68,6 +68,8 @@ struct PTO2RuntimeOps {
     void (*log_info)(const char* func, const char* fmt, ...);
     void (*log_debug)(const char* func, const char* fmt, ...);
     void (*log_always)(const char* func, const char* fmt, ...);
+
+    TensorPool* (*get_tensor_pool)(PTO2Runtime* rt);
 };
 
 /**

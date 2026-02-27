@@ -35,17 +35,13 @@ using namespace pto;
  *              args[3] = size (number of elements)
  */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
-    // Unpack arguments (order matches runtimemaker.cpp)
-    __gm__ Tensor* src0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* src1_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* out_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ float* src0 = reinterpret_cast<__gm__ float*>(src0_tensor->buffer.addr);
-    __gm__ float* src1 = reinterpret_cast<__gm__ float*>(src1_tensor->buffer.addr);
-    __gm__ float* out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr);
-    // __gm__ float* src0 = reinterpret_cast<__gm__ float*>(args[0]);
-    // __gm__ float* src1 = reinterpret_cast<__gm__ float*>(args[1]);
-    // __gm__ float* out = reinterpret_cast<__gm__ float*>(args[2]);
-    // int size = static_cast<int>(args[3]);
+    // Unpack arguments (TensorData* pointers from runtime)
+    __gm__ TensorData* src0_tensor = reinterpret_cast<__gm__ TensorData*>(args[0]);
+    __gm__ TensorData* src1_tensor = reinterpret_cast<__gm__ TensorData*>(args[1]);
+    __gm__ TensorData* out_tensor = reinterpret_cast<__gm__ TensorData*>(args[2]);
+    __gm__ float* src0 = reinterpret_cast<__gm__ float*>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
+    __gm__ float* src1 = reinterpret_cast<__gm__ float*>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
+    __gm__ float* out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
     // Configuration: float, 128, 128, 128, 128
     constexpr int kTRows_ = 128;

@@ -83,24 +83,22 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 __attribute__((visibility("default")))
 void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     (void)arg_count;
+    pto2_rt_init_tensor_pool(rt);
 
     void* arg_a_ptr = (void*)(uintptr_t)args[ARG_PTR_A];
     void* arg_b_ptr = (void*)(uintptr_t)args[ARG_PTR_B];
     void* arg_f_ptr = (void*)(uintptr_t)args[ARG_PTR_F];
-    size_t size_a = (size_t)args[ARG_SIZE_A];
-    size_t size_b = (size_t)args[ARG_SIZE_B];
-    size_t size_f = (size_t)args[ARG_SIZE_F];
     int SIZE = (int)(args[ARG_SIZE] & 0x7FFFFFFF);
 
     LOG_INFO(rt, "===============SIZE=%d", SIZE);
 
-    size_t BYTES = (size_t)SIZE * sizeof(float);
+    uint64_t ext_shapes[1] = {(uint64_t)SIZE};
+    Tensor ext_a = make_tensor_external(arg_a_ptr, ext_shapes, 1, DataType::FLOAT32);
+    Tensor ext_b = make_tensor_external(arg_b_ptr, ext_shapes, 1, DataType::FLOAT32);
+    Tensor ext_f = make_tensor_external(arg_f_ptr, ext_shapes, 1, DataType::FLOAT32);
 
-    Tensor ext_a = make_tensor_external(arg_a_ptr, size_a);
-    Tensor ext_b = make_tensor_external(arg_b_ptr, size_b);
-    Tensor ext_f = make_tensor_external(arg_f_ptr, size_f);
-
-    Tensor c = make_tensor(BYTES);  // c = a + b
+    uint64_t inter_shapes[1] = {(uint64_t)SIZE};
+    Tensor c = make_tensor(inter_shapes, 1, DataType::FLOAT32);  // c = a + b
 
     // t0: c = a + b (kernel_id=0, kernel_add) [outer scope]
     PTOParam params_t0[] = {
@@ -113,9 +111,9 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     // Inner scope: owns t1, t2, t3, t4; intermediates d, e, g release on scope end.
     // c flows in from outer scope (outer-scope tensors are visible to inner scopes).
     PTO2_SCOPE(rt) {
-        Tensor d = make_tensor(BYTES);  // d = c + 1
-        Tensor e = make_tensor(BYTES);  // e = c + 2
-        Tensor g = make_tensor(BYTES);  // g = d * e
+        Tensor d = make_tensor(inter_shapes, 1, DataType::FLOAT32);  // d = c + 1
+        Tensor e = make_tensor(inter_shapes, 1, DataType::FLOAT32);  // e = c + 2
+        Tensor g = make_tensor(inter_shapes, 1, DataType::FLOAT32);  // g = d * e
 
         // t1: d = c + 1 (kernel_id=1, kernel_add_scalar)
         PTOParam params_t1[] = {

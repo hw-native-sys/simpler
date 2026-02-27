@@ -43,6 +43,9 @@ struct PTO2OrchestratorState {
     PTO2TaskRing task_ring;    // Task slot allocation
     PTO2DepListPool dep_pool;  // Dependency list allocation
 
+    // === TENSOR POOL ===
+    TensorPool tensor_pool;
+
     // === TENSOR MAP (Private) ===
     PTO2TensorMap tensor_map;        // Producer lookup
     int32_t tensormap_last_cleanup;  // Last cleanup threshold

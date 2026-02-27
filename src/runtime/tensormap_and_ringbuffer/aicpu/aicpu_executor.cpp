@@ -409,7 +409,8 @@ static void build_pto2_payload(PTO2DispatchPayload* out, Runtime* runtime,
         } else {
             // Pass pointer to the Tensor (in task-owned storage), not the raw buffer address.
             // Kernels expect args[i] to be a Tensor* from which they read buffer.addr.
-            out->args[n++] = reinterpret_cast<uint64_t>(task->params[i].tensor);
+            task->params[i].tensor.data().update_start_offset();
+            out->args[n++] = reinterpret_cast<uint64_t>(&task->params[i].tensor.data());
         }
     }
 
@@ -1100,13 +1101,23 @@ int AicpuExecutor::run(Runtime* runtime) {
                 DEV_ALWAYS("  finalize+SM    : %.3fus (%.1f%%)", cycles_to_us(p.finalize_cycle), p.finalize_cycle * 100.0 / total);
                 DEV_ALWAYS("  scope_end      : %.3fus", cycles_to_us(p.scope_end_cycle));
                 DEV_ALWAYS("  avg/task       : %.3fus", cycles_to_us(total) / p.submit_count);
+
+                PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
+                DEV_ALWAYS("=== TensorMap Lookup Stats ===");
+                DEV_ALWAYS("  lookups        : %llu, inserts: %llu",
+                    (unsigned long long)tp.lookup_count, (unsigned long long)tp.insert_count);
+                DEV_ALWAYS("  chain walked   : total=%llu, avg=%.1f, max=%d",
+                    (unsigned long long)tp.lookup_chain_total,
+                    tp.lookup_count > 0 ? (double)tp.lookup_chain_total / tp.lookup_count : 0.0,
+                    tp.lookup_chain_max);
+                DEV_ALWAYS("  overlap checks : %llu, hits=%llu (%.1f%%)",
+                    (unsigned long long)tp.overlap_checks, (unsigned long long)tp.overlap_hits,
+                    tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0);
             }
 #endif
 
-            // Teardown runtime
+            // Signal orchestration complete in SM header (needs runtime alive)
             pto2_rt_orchestration_done(rt);
-            pto2_runtime_destroy(rt);
-            header->orchestrator_done = 1;
 
             // The orchestration .so no longer contains static output buffers
             // (heap is managed by the executor), so we can close immediately
@@ -1120,7 +1131,18 @@ int AicpuExecutor::run(Runtime* runtime) {
             DEV_ALWAYS("PTO2 total submitted tasks = %d", pto2_task_count);
             total_tasks_.store(pto2_task_count, std::memory_order_release);
             orchestrator_done_.store(true, std::memory_order_release);
-            DEV_INFO("Thread 3: Set orchestrator_done=true");
+            DEV_INFO("Thread 3: Set orchestrator_done=true, waiting for scheduler threads");
+
+            // Wait for all scheduler threads (0, 1, 2) to finish before destroying
+            // runtime. Scheduler threads access TensorPool via orch_ready_queue_
+            // and tensor.data() in build_pto2_payload — freeing early is use-after-free.
+            while (finished_count_.load(std::memory_order_acquire) < thread_num_ - 1) {
+                std::this_thread::yield();
+            }
+            DEV_INFO("Thread 3: All scheduler threads finished, destroying runtime");
+
+            // Safe to destroy — no scheduler thread accesses runtime data anymore
+            pto2_runtime_destroy(rt);
         }
         DEV_INFO("Thread 3: Orchestrator completed");
     } else {

@@ -1,252 +1,158 @@
+#pragma once
 
 #include <stdint.h>
-
-#ifndef NDEBUG
-#include <vector>
-#endif
+#include <memory.h>
 
 #include "common.h"
 #include "data_type.h"
-
-#pragma once
-
-#define RUNTIME_MAX_TENSOR_DIMS 8
-
-/**
- * Buffer Handle
- *
- * Represents a device memory buffer with address and total size in bytes.
- * This is the underlying memory allocation that a Tensor describes access patterns for.
- */
-struct PTOBufferHandle {
-    uint64_t addr;  // Device memory address (bytes)
-    uint64_t size;  // Total buffer size in bytes
-};
-
-#ifndef NDEBUG
-// 用于测试追踪 complex_overlap 是否被调用
-struct OverlapPathTracker {
-    static int& complex_overlap_call_count() {
-        static int count = 0;
-        return count;
-    }
-    static void reset() { complex_overlap_call_count() = 0; }
-    static void record_complex_call() { complex_overlap_call_count()++; }
-    static bool was_complex_called() { return complex_overlap_call_count() > 0; }
-};
-#endif
-
-enum class OverlapType {
-    Accurate = 0,
-    Fuzzy = 1,
-};
-
-enum class OverlapStatus {
-    NO_OVERLAP,
-    COVERED,
-    OTHER,
-};
-
-inline std::string to_str(OverlapStatus overlap_status) {
-    switch (overlap_status) {
-#define CASE(X)              \
-    case OverlapStatus::X: { \
-        return #X;           \
-    }
-        CASE(NO_OVERLAP)
-        CASE(COVERED)
-        CASE(OTHER)
-#undef CASE
-        default:
-            always_assert(false);
-    }
-    return "";
-}
-
-struct Segment {
-    uint64_t begin;
-    uint64_t end;
-
-    bool line_segment_intersection(const Segment& other) const { return end > other.begin && other.end > begin; }
-    bool contains(const Segment& other) const { return begin <= other.begin && other.end <= end; }
-};
-
-// 特殊值，表示 reshape 后需要分配新地址
-static constexpr uint64_t RESHAPE_NEEDS_ALLOC = UINT64_MAX;
+#include "tensor_pool.h"
 
 /**
  * Tensor descriptor for Task input/output
  *
- * Describes a strided memory access pattern on Global Memory (GM).
- * This allows expressing non-contiguous but regular memory layouts.
+ * Describes a memory access pattern on Global Memory (GM) using
+ * raw_shapes (underlying buffer dimensions), shapes (current view dimensions),
+ * and offsets (multi-dimensional offset into the buffer).
  *
- * IMPORTANT: After Phase 1 refactoring:
  * - `buffer` contains the underlying memory allocation (addr in bytes, size in bytes)
- * - `start_offset`, `strides[]`, `repeats[]` are in ELEMENTS
+ * - `raw_shapes[]`, `shapes[]`, `offsets[]` are in ELEMENTS
  * - `dtype` specifies element type for interpreting buffer contents
  *
- * Example: buffer.addr=base, dtype=FLOAT32, start_offset=7, strides=[10, 1], repeats=[3, 6]
- * Memory access pattern (from innermost to outermost dimension, in elements):
- *   - Start at buffer.addr + 7*4 bytes
- *   - Inner dim (strides[1]=1, repeats[1]=6): access 6 consecutive elements
- *   - Outer dim (strides[0]=10, repeats[0]=3): repeat 3 times with stride 10 elements
- * Result: [addr+28..addr+48], [addr+68..addr+88], [addr+108..addr+128] (byte offsets)
+ * Example: buffer.addr=base, dtype=FLOAT32, raw_shapes=[10, 6], shapes=[3, 6], offsets=[1, 0]
+ * Memory access pattern:
+ *   - Start at buffer.addr + (1*6+0)*4 = buffer.addr + 24 bytes
+ *   - Inner dim: access 6 consecutive elements
+ *   - Outer dim: 3 rows with stride 6 elements (derived from raw_shapes[1])
  */
 struct Tensor {
-    class ContiguousMemSegIterator {
-    public:
-        ContiguousMemSegIterator(const Tensor& tensor);
+    int32_t index;
 
-        void operator++();
-        void operator++(int) { ++*this; }
+    Tensor() : index(0) {}
 
-        const Segment& operator*() const { return cur_seg; }
-
-        bool is_end() const { return indexes_[0] >= tensor_.repeats[0]; }
-
-    private:
-        const Tensor& tensor_;
-        Segment cur_seg;
-        uint64_t indexes_[RUNTIME_MAX_TENSOR_DIMS];
-    };
-
-    PTOBufferHandle buffer;                     // Underlying memory buffer (addr in bytes, size in bytes)
-    uint64_t start_offset;                      // Starting offset from buffer.addr, unit: elements
-    uint64_t strides[RUNTIME_MAX_TENSOR_DIMS];  // Stride for each dimension, unit: elements
-    uint64_t repeats[RUNTIME_MAX_TENSOR_DIMS];  // Repeat count for each dimension
-    uint64_t ndims;                             // Number of dimensions used
-    DataType dtype;                             // Data type of tensor elements
-    int32_t version;                            // tensor的版本
-    OverlapType overlap_type;                   // 判断覆盖的方式
-
-    Tensor() : buffer{0, 0}, ndims(0), dtype(DataType::FLOAT32) {}
-
-    explicit Tensor(uint64_t addr,
+    Tensor(void* addr,
         uint64_t buffer_size_bytes,
-        uint64_t start_offset,
-        const uint64_t strides[],
-        const uint64_t repeats[],
+        const uint64_t raw_shapes[],
+        const uint64_t shapes[],
+        const uint64_t offsets[],
         uint64_t ndims,
         DataType dtype,
-        int32_t version,
-        OverlapType overlap_type = OverlapType::Accurate);
+        int32_t version) {
+        TensorPool& pool = TensorPool::instance();
+        index = pool.alloc();
+        pool.data[index].init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version);
+    }
 
-    Tensor(Tensor&& other);
+    Tensor(Tensor&& other) : index(other.index) { other.index = 0; }
 
-    Tensor(const Tensor& other)
-        : buffer(other.buffer),
-          start_offset(other.start_offset),
-          ndims(other.ndims),
-          dtype(other.dtype),
-          version(other.version),
-          overlap_type(other.overlap_type) {
-        for (uint64_t i = 0; i < ndims; i++) {
-            strides[i] = other.strides[i];
-            repeats[i] = other.repeats[i];
-        }
+    Tensor(const Tensor& other) : index(other.index) { TensorPool::instance().ref(index); }
+
+    Tensor& operator=(Tensor&& other) {
+        TensorPool::instance().deref(index);
+        index = other.index;
+        other.index = 0;
+        return *this;
     }
 
     Tensor& operator=(const Tensor& other) {
-        buffer = other.buffer;
-        start_offset = other.start_offset;
-        ndims = other.ndims;
-        dtype = other.dtype;
-        version = other.version;
-        overlap_type = other.overlap_type;
-        for (uint64_t i = 0; i < ndims; i++) {
-            strides[i] = other.strides[i];
-            repeats[i] = other.repeats[i];
+        if (index != other.index) {
+            TensorPool::instance().deref(index);
+            index = other.index;
+            TensorPool::instance().ref(index);
         }
         return *this;
     }
 
-    std::string dump() const;
-
-    bool is_valid_tensor() const;
-
-    Tensor& optimize();
-
-    void resort_strides();
-
-    void remove_redundant_dims();
-
-#ifndef NDEBUG
-    bool validate_memory_access_preserved(
-        uint64_t original_strides[], uint64_t original_repeats[], int32_t original_ndims) const;
-
-    std::vector<uint64_t> collect_all_offsets(
-        const uint64_t strides_arr[], const uint64_t repeats_arr[], int32_t dims) const;
-#endif
-
-    bool valid_view(const uint64_t shapes[], const uint64_t offsets[]) const;
-
-    bool valid_reshape(const uint64_t shapes[], uint64_t new_ndims) const;
-
-    bool valid_transpose(uint64_t x, uint64_t y) const { return x < ndims && y < ndims; }
-
-    Tensor view(const uint64_t shapes[], const uint64_t offsets[]) const;
-
-    Tensor view(const std::vector<uint64_t>& shapes, const std::vector<uint64_t>& offsets) const;
-
-    bool is_contiguous() const;
-
-    uint64_t numel() const;
-
-    Tensor reshape(const uint64_t shapes[], uint64_t new_ndims) const;
-
-    Tensor transpose(uint64_t x, uint64_t y) const;
-
-    Segment get_fuzzy_seg() const;
-
-    bool is_same_memref(const Tensor& other) const { return buffer.addr == other.buffer.addr; }
-
-    bool is_same_strides(const Tensor& other) const;
-
-    void offset_to_ndims(uint64_t offset_ndims[]) const;
-
-    uint64_t offset_ndim_to_1d(const uint64_t offset_ndims[]) const;
-    uint64_t offset_ndim_to_1d(const std::vector<uint64_t>& offset_ndims) const;
-
-    OverlapStatus is_overlap(const Tensor& pre_task_output) const;
-
-    bool complex_overlap(const Tensor& pre_task_output) const;
-
-    /**
-     * Create a 1D contiguous Tensor covering the entire buffer.
-     * strides={1}, repeats={size_elements}, ndims=1.
-     */
-    static Tensor make_1d_contiguous(
-        uint64_t addr, uint64_t size_bytes, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
-        uint64_t size_elements = size_bytes / get_element_size(dtype);
-        uint64_t strides[] = {1};
-        uint64_t repeats[] = {size_elements};
-        return Tensor(addr, size_bytes, 0, strides, repeats, 1, dtype, version);
+    ~Tensor() {
+        TensorPool::instance().deref(index);
     }
+
+    TensorData& data() { return TensorPool::instance().data[index]; }
+    const TensorData& data() const { return TensorPool::instance().data[index]; }
+
+    Tensor copy() const {
+        if (index == 0) {
+            return Tensor();
+        }
+        Tensor result;
+        TensorPool& pool = TensorPool::instance();
+        result.index = pool.alloc();
+        pool.data[result.index].init(pool.data[index]);
+        return result;
+    }
+
+    Tensor view(const uint64_t view_shapes[], const uint64_t view_offsets[]) const {
+        Tensor result;
+        TensorPool& pool = TensorPool::instance();
+        result.index = pool.alloc();
+        pool.data[result.index].init_with_view(pool.data[index], view_shapes, view_offsets);
+        return result;
+    }
+
+    bool is_contiguous() const { return data().is_contiguous(); }
+
+    bool valid_reshape(const uint64_t new_shapes[], uint64_t new_ndims) const {
+        const TensorData& tensor_data = data();
+        uint64_t x = 1;
+        for (size_t i = 0; i < tensor_data.ndims; i++) {
+            x *= tensor_data.shapes[i];
+        }
+        uint64_t y = 1;
+        for (size_t i = 0; i < new_ndims; i++) {
+            y *= new_shapes[i];
+        }
+        return x == y;
+    }
+
+    Tensor reshape(const uint64_t new_shapes[], uint64_t new_ndims) const {
+        debug_assert(valid_reshape(new_shapes, new_ndims));
+        always_assert(is_contiguous());
+        Tensor result = copy();
+        TensorData& result_tensor_data = result.data();
+        result_tensor_data.ndims = new_ndims;
+        for (uint64_t i = 0; i < new_ndims; i++) {
+            result_tensor_data.raw_shapes[i] = new_shapes[i];
+            result_tensor_data.shapes[i] = new_shapes[i];
+            result_tensor_data.offsets[i] = 0;
+        }
+        return result;
+    }
+
+    bool valid_transpose(uint64_t x, uint64_t y) const { return x < data().ndims && y < data().ndims; }
+
+    Tensor transpose(uint64_t x, uint64_t y) const {
+        debug_assert(valid_transpose(x, y));
+        Tensor result = copy();
+        TensorData& result_tensor_data = result.data();
+        std::swap(result_tensor_data.raw_shapes[x], result_tensor_data.raw_shapes[y]);
+        std::swap(result_tensor_data.shapes[x], result_tensor_data.shapes[y]);
+        std::swap(result_tensor_data.offsets[x], result_tensor_data.offsets[y]);
+        return result;
+    }
+
+    std::string dump() const { return data().dump(); }
+
+    uint64_t numel() const { return data().numel(); }
+
+    OverlapStatus is_overlap(const Tensor& pre_task_output) const { return data().is_overlap(pre_task_output.data()); }
 };
 
 // =============================================================================
 // Factory Helpers
 // =============================================================================
-
 /**
  * Create a Tensor for pre-allocated external memory.
  */
-static inline Tensor make_tensor_external(
-    void* addr, uint64_t size_bytes, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
-    return Tensor::make_1d_contiguous(reinterpret_cast<uint64_t>(addr), size_bytes, dtype, version);
-}
-
-/**
- * Create a Tensor for pre-allocated external memory.
- */
-static inline Tensor make_tensor_external(
-    void* addr, const uint64_t shapes[], uint64_t ndims, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
-    uint64_t strides[RUNTIME_MAX_TENSOR_DIMS];
-    strides[ndims - 1] = 1;
-    for (uint64_t i = ndims - 1; i > 0; i--) {
-        strides[i - 1] = strides[i] * shapes[i];
+static inline Tensor make_tensor_external(void* addr,
+    const uint64_t shapes[],
+    uint64_t ndims,
+    DataType dtype = DataType::FLOAT32,
+    int32_t version = 0) {
+    static uint64_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+    uint64_t total = 1;
+    for (uint64_t i = 0; i < ndims; i++) {
+        total *= shapes[i];
     }
-    return Tensor(reinterpret_cast<uint64_t>(addr), strides[0] * shapes[0] * get_element_size(dtype), 0, strides, shapes, ndims, dtype, version);
+    return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version);
 }
 
 /**
@@ -255,22 +161,14 @@ static inline Tensor make_tensor_external(
  * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
  * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
  */
-static inline Tensor make_tensor(uint64_t size_bytes, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
-    return Tensor::make_1d_contiguous(0, size_bytes, dtype, version);
-}
-
-/**
- * Create a Tensor for runtime-allocated output (addr=0).
- * NO memory allocation: only records dtype, shape, and buffer.size in the Tensor struct.
- * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
- * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
- */
-static inline Tensor make_tensor(
-    const uint64_t shapes[], uint64_t ndims, DataType dtype = DataType::FLOAT32, int32_t version = 0) {
-    uint64_t strides[RUNTIME_MAX_TENSOR_DIMS];
-    strides[ndims - 1] = 1;
-    for (uint64_t i = ndims - 1; i > 0; i--) {
-        strides[i - 1] = strides[i] * shapes[i];
+static inline Tensor make_tensor(const uint64_t shapes[],
+    uint64_t ndims,
+    DataType dtype = DataType::FLOAT32,
+    int32_t version = 0) {
+    static uint64_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+    uint64_t total = 1;
+    for (uint64_t i = 0; i < ndims; i++) {
+        total *= shapes[i];
     }
-    return Tensor(0, strides[0] * shapes[0] * get_element_size(dtype), 0, strides, shapes, ndims, dtype, version);
+    return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version);
 }

@@ -22,7 +22,7 @@ using namespace pto;
 #endif
 
 template <int M, int K, int N>
-static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm__ Tensor* sij) {
+static __aicore__ void qk_matmul_impl(__gm__ TensorData* qi, __gm__ TensorData* kj, __gm__ TensorData* sij) {
     __gm__ half* qi_addr = reinterpret_cast<__gm__ half*>(qi->buffer.addr);
     __gm__ half* kj_addr = reinterpret_cast<__gm__ half*>(kj->buffer.addr);
     __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
@@ -82,9 +82,9 @@ static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* qi = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* kj = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* sij = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ TensorData* qi = reinterpret_cast<__gm__ TensorData*>(args[0]);
+    __gm__ TensorData* kj = reinterpret_cast<__gm__ TensorData*>(args[1]);
+    __gm__ TensorData* sij = reinterpret_cast<__gm__ TensorData*>(args[2]);
 
     qk_matmul_impl<16, 16, 16>(qi, kj, sij);
 }

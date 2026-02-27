@@ -35,16 +35,21 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt) {
     pto2_orchestrator_done(&rt->orchestrator);
 }
 
+static TensorPool* get_tensor_pool_impl(PTO2Runtime* rt) {
+    return &rt->orchestrator.tensor_pool;
+}
+
 static const PTO2RuntimeOps s_runtime_ops = {
-    .submit_task        = submit_task_impl,
-    .scope_begin        = pto2_rt_scope_begin,
-    .scope_end          = pto2_rt_scope_end,
-    .orchestration_done = pto2_rt_orchestration_done,
-    .log_error          = unified_log_error,
-    .log_warn           = unified_log_warn,
-    .log_info           = unified_log_info,
-    .log_debug          = unified_log_debug,
-    .log_always         = unified_log_always,
+    .submit_task          = submit_task_impl,
+    .scope_begin          = pto2_rt_scope_begin,
+    .scope_end            = pto2_rt_scope_end,
+    .orchestration_done   = pto2_rt_orchestration_done,
+    .log_error            = unified_log_error,
+    .log_warn             = unified_log_warn,
+    .log_info             = unified_log_info,
+    .log_debug            = unified_log_debug,
+    .log_always           = unified_log_always,
+    .get_tensor_pool      = get_tensor_pool_impl,
 };
 
 // =============================================================================

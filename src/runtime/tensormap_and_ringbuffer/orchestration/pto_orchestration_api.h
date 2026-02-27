@@ -64,6 +64,8 @@ typedef struct PTO2RuntimeOps {
     void (*log_info)(const char* func, const char* fmt, ...);
     void (*log_debug)(const char* func, const char* fmt, ...);
     void (*log_always)(const char* func, const char* fmt, ...);
+
+    TensorPool* (*get_tensor_pool)(PTO2Runtime* rt);
 } PTO2RuntimeOps;
 
 /**
@@ -97,6 +99,10 @@ static inline void pto2_rt_scope_end(PTO2Runtime* rt) {
 
 static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) {
     rt->ops->orchestration_done(rt);
+}
+
+static inline void pto2_rt_init_tensor_pool(PTO2Runtime* rt) {
+    TensorPool::set_instance(rt->ops->get_tensor_pool(rt));
 }
 
 // =============================================================================

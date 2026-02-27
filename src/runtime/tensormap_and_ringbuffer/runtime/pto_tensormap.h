@@ -167,7 +167,7 @@ struct PTO2LookupResult {
  * @param tensor  Tensor to look up
  * @param result  Output: stack-allocated result buffer
  */
-void pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor, PTO2LookupResult* result);
+void pto2_tensormap_lookup(PTO2TensorMap* tm, const Tensor& tensor, PTO2LookupResult* result);
 
 /**
  * Insert a new entry (called when task produces output)
@@ -179,7 +179,7 @@ void pto2_tensormap_lookup(PTO2TensorMap* tm, Tensor* tensor, PTO2LookupResult* 
  * @param tensor            Tensor produced
  * @param producer_task_id  Task ID of producer
  */
-void pto2_tensormap_insert(PTO2TensorMap* tm, Tensor* tensor, int32_t producer_task_id, bool with_alloc);
+void pto2_tensormap_insert(PTO2TensorMap* tm, const Tensor& tensor, int32_t producer_task_id, bool with_alloc);
 
 /**
  * Cleanup stale entries for retired tasks
@@ -242,5 +242,25 @@ int32_t pto2_tensormap_valid_count(PTO2TensorMap* tm);
  * Also triggers cleanup if threshold has advanced significantly.
  */
 void pto2_orchestrator_sync_tensormap(PTO2TensorMap* tm, bool force = false);
+
+// =============================================================================
+// TensorMap Lookup Profiling
+// =============================================================================
+#ifndef PTO2_ORCH_PROFILING
+#define PTO2_ORCH_PROFILING 1
+#endif
+
+#if PTO2_ORCH_PROFILING
+struct PTO2TensorMapProfilingData {
+    uint64_t lookup_chain_total;
+    uint64_t lookup_count;
+    int32_t  lookup_chain_max;
+    uint64_t overlap_checks;
+    uint64_t overlap_hits;
+    uint64_t insert_count;
+};
+
+PTO2TensorMapProfilingData pto2_tensormap_get_profiling();
+#endif
 
 #endif  // PTO_TENSORMAP_H

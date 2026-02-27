@@ -26,15 +26,15 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void online_update_impl(__gm__ Tensor* mij,
-    __gm__ Tensor* lij,
-    __gm__ Tensor* oi_new,
-    __gm__ Tensor* mi,
-    __gm__ Tensor* li,
-    __gm__ Tensor* oi,
+static __aicore__ void online_update_impl(__gm__ TensorData* mij,
+    __gm__ TensorData* lij,
+    __gm__ TensorData* oi_new,
+    __gm__ TensorData* mi,
+    __gm__ TensorData* li,
+    __gm__ TensorData* oi,
     uint64_t is_first,
     uint64_t is_last,
-    __gm__ Tensor* dst) {
+    __gm__ TensorData* dst) {
     __gm__ float* mij_ptr = reinterpret_cast<__gm__ float*>(mij->buffer.addr);
     __gm__ float* lij_ptr = reinterpret_cast<__gm__ float*>(lij->buffer.addr);
     __gm__ float* oi_new_ptr = reinterpret_cast<__gm__ float*>(oi_new->buffer.addr);
@@ -222,16 +222,16 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* oi_new = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ Tensor* mi = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    __gm__ Tensor* li = reinterpret_cast<__gm__ Tensor*>(args[4]);
-    __gm__ Tensor* oi = reinterpret_cast<__gm__ Tensor*>(args[5]);
-    __gm__ Tensor* dst = reinterpret_cast<__gm__ Tensor*>(args[6]);
+    __gm__ TensorData* mij = reinterpret_cast<__gm__ TensorData*>(args[0]);
+    __gm__ TensorData* lij = reinterpret_cast<__gm__ TensorData*>(args[1]);
+    __gm__ TensorData* oi_new = reinterpret_cast<__gm__ TensorData*>(args[2]);
+    __gm__ TensorData* mi = reinterpret_cast<__gm__ TensorData*>(args[3]);
+    __gm__ TensorData* li = reinterpret_cast<__gm__ TensorData*>(args[4]);
+    __gm__ TensorData* oi = reinterpret_cast<__gm__ TensorData*>(args[5]);
+    __gm__ TensorData* dst = reinterpret_cast<__gm__ TensorData*>(args[6]);
     uint64_t is_first = static_cast<uint64_t>(args[7]);
     uint64_t is_last = static_cast<uint64_t>(args[8]);
-    uint64_t q_tile_size = static_cast<uint64_t>(mij->repeats[0]);
+    uint64_t q_tile_size = static_cast<uint64_t>(mij->shapes[0]);
     // args[10] = head_dim (128)
 
     if (q_tile_size == 16) {
