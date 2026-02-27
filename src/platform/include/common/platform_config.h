@@ -179,4 +179,40 @@ namespace DAV_2201 {
 constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = 25;
 }
 
+// =============================================================================
+// ACK/FIN Dual-State Register Protocol
+// =============================================================================
+
+/**
+ * AICPU-AICore task handshake protocol via COND register
+ *
+ * Register format: [bit 31: state | low 31 bits: task_id]
+ * State: ACK (0) = task received, FIN (1) = task completed
+ */
+
+#define TASK_ID_MASK       0x7FFFFFFFU
+#define TASK_STATE_MASK    0x80000000U
+
+#define TASK_ACK_STATE     0
+#define TASK_FIN_STATE     1
+
+#define EXTRACT_TASK_ID(regval)    ((int)((regval) & TASK_ID_MASK))
+#define EXTRACT_TASK_STATE(regval) ((int)(((regval) & TASK_STATE_MASK) >> 31))
+#define MAKE_ACK_VALUE(task_id)    ((uint64_t)((task_id) & TASK_ID_MASK))
+#define MAKE_FIN_VALUE(task_id)    ((uint64_t)(((task_id) & TASK_ID_MASK) | TASK_STATE_MASK))
+
+// This value is RESERVED and must never be used as a real task ID.
+#define AICORE_IDLE_TASK_ID        0x7FFFFFFFU
+#define AICORE_IDLE_VALUE          MAKE_FIN_VALUE(AICORE_IDLE_TASK_ID)
+
+// =============================================================================
+// Task State Constants
+// =============================================================================
+
+/**
+ * Invalid task ID sentinel value
+ * Used to indicate that pending_task_ids_ or running_task_ids_ slot is empty.
+ */
+constexpr int AICPU_TASK_INVALID = -1;
+
 #endif  // PLATFORM_COMMON_PLATFORM_CONFIG_H_

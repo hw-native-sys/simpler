@@ -65,7 +65,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // Report initial idle status via register
-    write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::IDLE));
+    write_reg(RegId::COND, AICORE_IDLE_VALUE);
 
     // Read per-core payload address from hank->task (written by AICPU before aicpu_ready)
     __gm__ PTO2DispatchPayload* my_payload =
@@ -89,12 +89,12 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
         // Execute task if new (task_id encoding: 0=idle, task_id+1=task)
         if (task_id != 0 && task_id != last_task_id) {
-            write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::BUSY));
-
             // Invalidate cache to read fresh payload written by AICPU
             dcci(my_payload, ENTIRE_DATA_CACHE);
 
             __gm__ PTO2DispatchPayload* payload = my_payload;
+
+            write_reg(RegId::COND, MAKE_ACK_VALUE(payload->task_id));
 
             // Performance profiling: record start time
             uint64_t start_time = 0;
@@ -115,7 +115,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             }
 
             last_task_id = task_id;
-            write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::IDLE));
+            write_reg(RegId::COND, MAKE_FIN_VALUE(payload->task_id));
         }
     }
 }

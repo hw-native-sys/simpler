@@ -32,13 +32,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
 
-    // Report initial idle status for task dispatch
-    write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::IDLE));
+    write_reg(RegId::COND, AICORE_IDLE_VALUE);
 
     bool profiling_enabled = runtime->enable_profiling;
     uint64_t kernel_ready_time = get_sys_cnt_aicore();
 
-    // Main loop: poll DATA_MAIN_BASE for task_id
     volatile uint32_t task_id = 0;
     volatile uint32_t last_task_id = 0;
 
@@ -48,12 +46,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             break;
         }
 
-        // Execute task if new (task_id encoding: 0=idle, task_id+1=task)
         if (task_id != 0 && task_id != last_task_id) {
-            write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::BUSY));
-            __gm__ Task* task_ptr = &(runtime->tasks[task_id - 1]);
+            uint32_t actual_task_id = task_id - 1;
+            write_reg(RegId::COND, MAKE_ACK_VALUE(actual_task_id));
+
+            __gm__ Task* task_ptr = &(runtime->tasks[actual_task_id]);
             uint64_t start_time = get_sys_cnt_aicore();
-            
+
             execute_task(task_ptr);
 
             if (profiling_enabled) {
@@ -65,7 +64,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             }
 
             last_task_id = task_id;
-            write_reg(RegId::COND, static_cast<uint64_t>(AICoreStatus::IDLE));
+
+            write_reg(RegId::COND, MAKE_FIN_VALUE(actual_task_id));
         }
     }
 }

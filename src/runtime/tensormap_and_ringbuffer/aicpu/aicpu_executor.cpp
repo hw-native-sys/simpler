@@ -110,7 +110,7 @@ struct AicpuExecutor {
     // Platform register base address array (set via get_platform_regs())
     uint64_t regs_{0};
 
-    // Track executing task_id per core (-1 = idle)
+    // Track executing task_id per core (AICPU_TASK_INVALID = idle)
     int executing_task_ids_[MAX_CORES_PER_THREAD];
 
     // ===== 3 shards per type: push to own shard (thread_idx % 3), pop own first + work stealing =====
@@ -372,9 +372,9 @@ int AicpuExecutor::init(Runtime* runtime) {
         return -1;
     }
 
-    // Initialize executing_task_ids_ to -1 (idle)
+    // Initialize executing_task_ids_ to AICPU_TASK_INVALID (idle)
     for (int i = 0; i < MAX_CORES_PER_THREAD; i++) {
-        executing_task_ids_[i] = -1;
+        executing_task_ids_[i] = AICPU_TASK_INVALID;
     }
 
     DEV_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num_);
@@ -569,8 +569,10 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             for (int i = 0; i < core_num; i++) {
                 int core_id = cur_thread_cores[i];
                 uint64_t reg_addr = core_id_to_reg_addr_[core_id];
-                AICoreStatus status = static_cast<AICoreStatus>(read_reg(reg_addr, RegId::COND));
-                if (status != AICoreStatus::IDLE || executing_task_ids_[core_id] >= 0) {
+                uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+                int reg_state = EXTRACT_TASK_STATE(reg_val);
+
+                if (reg_state != TASK_FIN_STATE || executing_task_ids_[core_id] != AICPU_TASK_INVALID) {
                     all_cores_idle = false; break;
                 }
             }
@@ -587,11 +589,20 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         for (int i = 0; i < core_num; i++) {
             int core_id = cur_thread_cores[i];
             uint64_t reg_addr = core_id_to_reg_addr_[core_id];
-            AICoreStatus status = static_cast<AICoreStatus>(read_reg(reg_addr, RegId::COND));
-            if (status == AICoreStatus::IDLE && executing_task_ids_[core_id] >= 0) {
+
+            // Read task_id and state from COND register
+            uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+            int reg_task_id = EXTRACT_TASK_ID(reg_val);
+            int reg_state = EXTRACT_TASK_STATE(reg_val);
+
+            // Only accept FIN state with matching task_id
+            if (executing_task_ids_[core_id] != AICPU_TASK_INVALID &&
+                reg_task_id == executing_task_ids_[core_id] &&
+                reg_state == TASK_FIN_STATE) {
+
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                 int32_t task_id = executing_task_ids_[core_id];
-                executing_task_ids_[core_id] = -1;
+                executing_task_ids_[core_id] = AICPU_TASK_INVALID;
 
                 // Write AICPU dispatch/finish timestamps into the PerfRecord
                 if (profiling_enabled) {
@@ -701,10 +712,11 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             for (int i = 0; i < core_num; i++) {
                 int core_id = cur_thread_cores[i];
                 uint64_t reg_addr = core_id_to_reg_addr_[core_id];
-                AICoreStatus status = static_cast<AICoreStatus>(read_reg(reg_addr, RegId::COND));
-                if (status == AICoreStatus::IDLE && executing_task_ids_[core_id] == -1) {
+                uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+                int reg_state = EXTRACT_TASK_STATE(reg_val);
+                if (reg_state == TASK_FIN_STATE && executing_task_ids_[core_id] == AICPU_TASK_INVALID) {
                     Handshake* h = &hank[core_id];
-                    int32_t task_id = -1;
+                    int32_t task_id = AICPU_TASK_INVALID;
 #if PTO2_ORCH_PROFILING
                     bool found_task = false;
                     bool is_stolen = false;
@@ -787,10 +799,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                             }
                             core_dispatch_counts_[core_id]++;
                         }
-                        // Pre-set COND=BUSY before writing task_id to prevent
-                        // false completion detection (AICPU seeing stale IDLE
-                        // before AICore has started the task)
-                        write_reg(reg_addr, RegId::COND, static_cast<uint64_t>(AICoreStatus::BUSY));
+
                         write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id + 1));
                         executing_task_ids_[core_id] = task_id;
                         cur_thread_tasks_in_flight++;
@@ -1297,7 +1306,7 @@ void AicpuExecutor::deinit() {
 
     // Reset register-related state
     for (int i = 0; i < MAX_CORES_PER_THREAD; i++) {
-        executing_task_ids_[i] = -1;
+        executing_task_ids_[i] = AICPU_TASK_INVALID;
         core_id_to_reg_addr_[i] = 0;
     }
     regs_ = 0;
@@ -1341,19 +1350,23 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,
         const char* core_type_str = core_type_to_string(h->core_type);
 
         uint64_t reg_addr = core_id_to_reg_addr_[core_id];
-        AICoreStatus status = static_cast<AICoreStatus>(read_reg(reg_addr, RegId::COND));
+        uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+        int reg_task_id = EXTRACT_TASK_ID(reg_val);
+        int reg_state = EXTRACT_TASK_STATE(reg_val);
         int task_id = executing_task_ids_[core_id];
 
-        if (status != AICoreStatus::IDLE || task_id >= 0) {
+        if (reg_state != TASK_FIN_STATE || task_id >= 0) {
             busy_cores++;
             if (task_id >= 0) {
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
-                DEV_ALWAYS("  Core %d [%s, BUSY]: COND=%d, task_id=%d, kernel_id=%d",
-                         core_id, core_type_str, static_cast<uint32_t>(status),
-                         payload->task_id, payload->kernel_id);
+                DEV_ALWAYS("  Core %d [%s, BUSY]: COND=0x%lx (reg_task_id=%d, reg_state=%s), executing_task_id=%d, kernel_id=%d",
+                        core_id, core_type_str, reg_val, reg_task_id,
+                        reg_state == TASK_FIN_STATE ? "FIN" : "ACK",
+                        payload->task_id, payload->kernel_id);
             } else {
-                DEV_ALWAYS("  Core %d [%s, BUSY]: COND=%d but task_id not tracked",
-                         core_id, core_type_str, static_cast<uint32_t>(status));
+                DEV_ALWAYS("  Core %d [%s, BUSY]: COND=0x%lx (reg_task_id=%d, reg_state=%s) but task_id not tracked",
+                        core_id, core_type_str, reg_val, reg_task_id,
+                        reg_state == TASK_FIN_STATE ? "FIN" : "ACK");
             }
         } else {
             idle_cores++;

@@ -48,7 +48,7 @@ __aicore__ inline uint64_t read_reg(RegId reg) {
 __aicore__ inline void write_reg(RegId reg, uint64_t value) {
     switch (reg) {
         case RegId::COND:
-            set_cond(static_cast<AICoreStatus>(static_cast<uint32_t>(value)));
+            set_cond(static_cast<uint32_t>(value));
             break;
         case RegId::DATA_MAIN_BASE:
         case RegId::FAST_PATH_ENABLE:
