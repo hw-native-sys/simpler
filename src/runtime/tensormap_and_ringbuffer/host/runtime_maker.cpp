@@ -18,10 +18,12 @@
 #include "../runtime/pto_shared_memory.h"
 #include "common/unified_log.h"
 #include "host/pto_runtime_c_api.h"  // For ArgType enum
+#include "common/platform_config.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <sys/time.h>
 
@@ -73,7 +75,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
     // Validate inputs
     if (runtime == nullptr) {
-        LOG_ERROR("Error: Runtime pointer is null");
+        LOG_ERROR("Runtime pointer is null");
         return -1;
     }
 
@@ -85,7 +87,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
             uint64_t addr = runtime->host_api.upload_kernel_binary(
                 kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
             if (addr == 0) {
-                LOG_ERROR("Error: Failed to upload kernel binary for func_id=%d", kernel_func_ids[i]);
+                LOG_ERROR("Failed to upload kernel binary for func_id=%d", kernel_func_ids[i]);
                 return -1;
             }
             runtime->set_function_bin_addr(kernel_func_ids[i], addr);
@@ -93,17 +95,17 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     }
 
     if (orch_so_binary == nullptr || orch_so_size == 0) {
-        LOG_ERROR("Error: Orchestration SO binary is required for device orchestration");
+        LOG_ERROR("Orchestration SO binary is required for device orchestration");
         return -1;
     }
 
     if (arg_types == nullptr || arg_sizes == nullptr) {
-        LOG_ERROR("Error: arg_types and arg_sizes are required for device orchestration");
+        LOG_ERROR("arg_types and arg_sizes are required for device orchestration");
         return -1;
     }
 
     if (func_args_count > RT2_MAX_DEVICE_ARGS) {
-        LOG_ERROR("Error: Too many arguments: %d (max %d)", func_args_count, RT2_MAX_DEVICE_ARGS);
+        LOG_ERROR("Too many arguments: %d (max %d)", func_args_count, RT2_MAX_DEVICE_ARGS);
         return -1;
     }
 
@@ -129,13 +131,13 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
                 void* dev_ptr = runtime->host_api.device_malloc(size);
                 if (dev_ptr == nullptr) {
-                    LOG_ERROR("Error: Failed to allocate device memory for arg %d", i);
+                    LOG_ERROR("Failed to allocate device memory for arg %d", i);
                     return -1;
                 }
 
                 int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
                 if (rc != 0) {
-                    LOG_ERROR("Error: Failed to copy arg %d to device", i);
+                    LOG_ERROR("Failed to copy arg %d to device", i);
                     runtime->host_api.device_free(dev_ptr);
                     return -1;
                 }
@@ -154,7 +156,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
                 void* dev_ptr = runtime->host_api.device_malloc(size);
                 if (dev_ptr == nullptr) {
-                    LOG_ERROR("Error: Failed to allocate device memory for arg %d", i);
+                    LOG_ERROR("Failed to allocate device memory for arg %d", i);
                     return -1;
                 }
 
@@ -172,13 +174,13 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
                 void* dev_ptr = runtime->host_api.device_malloc(size);
                 if (dev_ptr == nullptr) {
-                    LOG_ERROR("Error: Failed to allocate device memory for arg %d", i);
+                    LOG_ERROR("Failed to allocate device memory for arg %d", i);
                     return -1;
                 }
 
                 int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
                 if (rc != 0) {
-                    LOG_ERROR("Error: Failed to copy arg %d to device", i);
+                    LOG_ERROR("Failed to copy arg %d to device", i);
                     runtime->host_api.device_free(dev_ptr);
                     return -1;
                 }
@@ -191,7 +193,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
             }
 
             default:
-                LOG_ERROR("Error: Unknown arg_type %d for arg %d", arg_types[i], i);
+                LOG_ERROR("Unknown arg_type %d for arg %d", arg_types[i], i);
                 return -1;
         }
     }
@@ -201,12 +203,12 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     long long t_so_start = _now_ms();
     void* dev_so = runtime->host_api.device_malloc(orch_so_size);
     if (dev_so == nullptr) {
-        LOG_ERROR("Error: Failed to allocate device memory for orchestration SO");
+        LOG_ERROR("Failed to allocate device memory for orchestration SO");
         return -1;
     }
     int rc = runtime->host_api.copy_to_device(dev_so, orch_so_binary, orch_so_size);
     if (rc != 0) {
-        LOG_ERROR("Error: Failed to copy orchestration SO to device");
+        LOG_ERROR("Failed to copy orchestration SO to device");
         runtime->host_api.device_free(dev_so);
         return -1;
     }
@@ -223,7 +225,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     void* gm_heap = runtime->host_api.device_malloc(PTO2_HEAP_SIZE);
     long long t_heap_end = _now_ms();
     if (gm_heap == nullptr) {
-        LOG_ERROR("Error: Failed to allocate GM heap");
+        LOG_ERROR("Failed to allocate GM heap");
         return -1;
     }
     runtime->record_tensor_pair(nullptr, gm_heap, PTO2_HEAP_SIZE);
@@ -235,11 +237,28 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     void* sm_ptr = runtime->host_api.device_malloc(sm_size);
     long long t_sm_end = _now_ms();
     if (sm_ptr == nullptr) {
-        LOG_ERROR("Error: Failed to allocate PTO2 shared memory");
+        LOG_ERROR("Failed to allocate PTO2 shared memory");
         return -1;
     }
     runtime->set_pto2_gm_sm_ptr(sm_ptr);
     runtime->record_tensor_pair(nullptr, sm_ptr, static_cast<size_t>(sm_size));
+
+    // Read ready queue shard count from environment for AICPU scheduler
+    {
+        const char* env_shards = std::getenv("PTO2_READY_QUEUE_SHARDS");
+        if (env_shards) {
+            char* endptr;
+            long val = strtol(env_shards, &endptr, 10);
+            if (endptr != env_shards && *endptr == '\0' && val >= 1 && val <= PLATFORM_MAX_AICPU_THREADS) {
+                runtime->ready_queue_shards = static_cast<int>(val);
+            } else {
+                LOG_WARN("PTO2_READY_QUEUE_SHARDS=%s is invalid or out of range [1,%d], using default %d",
+                         env_shards, PLATFORM_MAX_AICPU_THREADS, RUNTIME_DEFAULT_READY_QUEUE_SHARDS);
+                runtime->ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
+            }
+        }
+        LOG_INFO("Ready queue shards: %d", runtime->ready_queue_shards);
+    }
 
     // Set up device orchestration state
     runtime->set_orch_built_on_host(false);
@@ -270,7 +289,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
  */
 extern "C" int validate_runtime_impl(Runtime *runtime) {
     if (runtime == nullptr) {
-        LOG_ERROR("Error: Runtime pointer is null");
+        LOG_ERROR("Runtime pointer is null");
         return -1;
     }
 
@@ -297,11 +316,10 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
             graph_out_ptr = host_header.graph_output_ptr;
             graph_out_size = host_header.graph_output_size;
             if (graph_out_ptr != 0) {
-                LOG_INFO("Graph output buffer: ptr=0x%llx, size=%llu",
-                         (unsigned long long)graph_out_ptr, (unsigned long long)graph_out_size);
+                LOG_INFO("Graph output buffer: ptr=0x%lx, size=%lu", (unsigned long)graph_out_ptr, (unsigned long)graph_out_size);
             }
         } else {
-            LOG_WARN("Warning: Failed to copy PTO2 header from device");
+            LOG_WARN("Failed to copy PTO2 header from device");
         }
     }
 
@@ -311,7 +329,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
 
         // Skip if device pointer is null
         if (pair.dev_ptr == nullptr) {
-            LOG_WARN("Warning: Tensor %d has null device pointer, skipping", i);
+            LOG_WARN("Tensor %d has null device pointer, skipping", i);
             continue;
         }
 
@@ -334,7 +352,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
 
         int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, src_ptr, copy_size);
         if (copy_rc != 0) {
-            LOG_ERROR("Error: Failed to copy tensor %d from device: %d", i, copy_rc);
+            LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
             rc = copy_rc;
         } else {
             LOG_INFO("Tensor %d: %zu bytes copied to host", i, pair.size);

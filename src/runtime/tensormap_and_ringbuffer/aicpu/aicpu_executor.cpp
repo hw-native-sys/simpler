@@ -66,7 +66,7 @@ constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 constexpr int AICPU_MAX_READY_TASKS = 16384;
 constexpr int AICPU_READY_MASK = AICPU_MAX_READY_TASKS - 1;
 // One shard per scheduler thread: push to own shard (thread_idx % shards), pop own first + work stealing
-constexpr int PTO2_READY_QUEUE_SHARDS = MAX_AICPU_THREADS - 1;
+// Runtime-configurable via env var PTO2_READY_QUEUE_SHARDS (1..MAX_AICPU_THREADS). Default=3.
 
 // Lightweight spinlock (avoids futex syscall overhead of std::mutex)
 struct SpinLock {
@@ -112,16 +112,18 @@ struct AicpuExecutor {
     // Track executing task_id per core (AICPU_TASK_INVALID = idle)
     int executing_task_ids_[MAX_CORES_PER_THREAD];
 
-    // ===== 3 shards per type: push to own shard (thread_idx % 3), pop own first + work stealing =====
-    SpinLock ready_queue_aic_lock_[PTO2_READY_QUEUE_SHARDS];
-    int ready_queue_aic_[PTO2_READY_QUEUE_SHARDS][AICPU_MAX_READY_TASKS];
-    int ready_queue_aic_head_[PTO2_READY_QUEUE_SHARDS]{0};
-    int ready_queue_aic_tail_[PTO2_READY_QUEUE_SHARDS]{0};
+    // ===== N shards per type: push to own shard (thread_idx % N), pop own first + work stealing =====
+    // active_shards_ is set at runtime (1..MAX_AICPU_THREADS) via env PTO2_READY_QUEUE_SHARDS
+    int active_shards_{3};
+    SpinLock ready_queue_aic_lock_[MAX_AICPU_THREADS];
+    int ready_queue_aic_[MAX_AICPU_THREADS][AICPU_MAX_READY_TASKS];
+    int ready_queue_aic_head_[MAX_AICPU_THREADS]{0};
+    int ready_queue_aic_tail_[MAX_AICPU_THREADS]{0};
 
-    SpinLock ready_queue_aiv_lock_[PTO2_READY_QUEUE_SHARDS];
-    int ready_queue_aiv_[PTO2_READY_QUEUE_SHARDS][AICPU_MAX_READY_TASKS];
-    int ready_queue_aiv_head_[PTO2_READY_QUEUE_SHARDS]{0};
-    int ready_queue_aiv_tail_[PTO2_READY_QUEUE_SHARDS]{0};
+    SpinLock ready_queue_aiv_lock_[MAX_AICPU_THREADS];
+    int ready_queue_aiv_[MAX_AICPU_THREADS][AICPU_MAX_READY_TASKS];
+    int ready_queue_aiv_head_[MAX_AICPU_THREADS]{0};
+    int ready_queue_aiv_tail_[MAX_AICPU_THREADS]{0};
 
     // Task execution tracking
     std::atomic<int> completed_tasks_{0};
@@ -192,7 +194,7 @@ inline void AicpuExecutor::enqueue_ready_task_with_profiling(
     uint64_t& hold_counter
 #endif
 ) {
-    int my_shard = thread_idx % PTO2_READY_QUEUE_SHARDS;
+    int my_shard = thread_idx % active_shards_;
 #if PTO2_ORCH_PROFILING
     uint64_t _l0 = get_sys_cnt_aicpu(), _l1, _l2;
 #endif
@@ -392,8 +394,12 @@ int AicpuExecutor::init(Runtime* runtime) {
     DEV_INFO("Init: orch_built_on_host=%d", orch_on_host ? 1 : 0);
     orchestrator_done_.store(orch_on_host, std::memory_order_release);
 
+    // Read ready queue shard count from Runtime (already validated by host)
+    active_shards_ = runtime->ready_queue_shards;
+    DEV_ALWAYS("Ready queue shards: %d (max=%d)", active_shards_, MAX_AICPU_THREADS);
+
     // Initial ready tasks will be populated from PTO2 shared memory in resolve_and_dispatch_pto2
-    for (int s = 0; s < PTO2_READY_QUEUE_SHARDS; s++) {
+    for (int s = 0; s < MAX_AICPU_THREADS; s++) {
         ready_queue_aic_head_[s] = 0;
         ready_queue_aic_tail_[s] = 0;
         ready_queue_aiv_head_[s] = 0;
@@ -720,10 +726,10 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                     bool found_task = false;
                     bool is_stolen = false;
 #endif
-                    int my_shard = thread_idx % PTO2_READY_QUEUE_SHARDS;
+                    int my_shard = thread_idx % active_shards_;
                     if (h->core_type == CoreType::AIC) {
-                        for (int k = 0; k < PTO2_READY_QUEUE_SHARDS && task_id < 0; k++) {
-                            int shard = (my_shard + k) % PTO2_READY_QUEUE_SHARDS;
+                        for (int k = 0; k < active_shards_ && task_id < 0; k++) {
+                            int shard = (my_shard + k) % active_shards_;
 #if PTO2_ORCH_PROFILING
                             uint64_t _l0 = get_sys_cnt_aicpu();
 #endif
@@ -751,8 +757,8 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 #endif
                         }
                     } else {
-                        for (int k = 0; k < PTO2_READY_QUEUE_SHARDS && task_id < 0; k++) {
-                            int shard = (my_shard + k) % PTO2_READY_QUEUE_SHARDS;
+                        for (int k = 0; k < active_shards_ && task_id < 0; k++) {
+                            int shard = (my_shard + k) % active_shards_;
 #if PTO2_ORCH_PROFILING
                             uint64_t _l0 = get_sys_cnt_aicpu();
 #endif
@@ -1276,8 +1282,8 @@ int AicpuExecutor::run(Runtime* runtime) {
 }
 
 void AicpuExecutor::deinit() {
-    // Cleanup runtime execution state
-    for (int s = 0; s < PTO2_READY_QUEUE_SHARDS; s++) {
+    // Cleanup runtime execution state (clear all max slots for safety)
+    for (int s = 0; s < MAX_AICPU_THREADS; s++) {
         ready_queue_aic_head_[s] = 0;
         ready_queue_aic_tail_[s] = 0;
         ready_queue_aiv_head_[s] = 0;
@@ -1333,11 +1339,11 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,
              completed, total, total > 0 ? completed * 100.0 / total : 0.0);
 
     int aic_ready = 0, aiv_ready = 0;
-    for (int s = 0; s < PTO2_READY_QUEUE_SHARDS; s++) {
+    for (int s = 0; s < active_shards_; s++) {
         aic_ready += ready_queue_aic_tail_[s] - ready_queue_aic_head_[s];
         aiv_ready += ready_queue_aiv_tail_[s] - ready_queue_aiv_head_[s];
     }
-    DEV_ALWAYS("Ready Queues (3 shards, per-thread push + work-steal pop): AIC=%d, AIV=%d", aic_ready, aiv_ready);
+    DEV_ALWAYS("Ready Queues (%d shards, per-thread push + work-steal pop): AIC=%d, AIV=%d", active_shards_, aic_ready, aiv_ready);
 
     int busy_cores = 0;
     int idle_cores = 0;

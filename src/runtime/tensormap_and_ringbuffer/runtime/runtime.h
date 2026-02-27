@@ -23,6 +23,7 @@
 
 #include "common/core_type.h"
 #include "common/perf_profiling.h"
+#include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
 
 // =============================================================================
@@ -34,6 +35,9 @@
 #define RUNTIME_MAX_TENSOR_PAIRS 64
 #define RUNTIME_MAX_FUNC_ID 32
 #define RUNTIME_MAX_ORCH_SO_SIZE (4 * 1024 * 1024)  // 1MB max for orchestration SO
+
+// Default ready queue shards: one shard per worker thread (total minus orchestrator)
+constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 1;
 
 // =============================================================================
 // Data Structures
@@ -137,6 +141,7 @@ public:
 
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;  // Number of AICPU threads for scheduling
+    int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code
