@@ -28,7 +28,8 @@ static __aicore__ void pv_matmul_batch_impl(
     uint64_t block_table_ptr,
     uint64_t batch_count,
     uint64_t block_idx,
-    uint64_t block_num) {
+    uint64_t block_num,
+    uint64_t batch_start) {
 
     __gm__ half* pij_base = reinterpret_cast<__gm__ half*>(pij_batch->buffer.addr);
     __gm__ half* val_base = reinterpret_cast<__gm__ half*>(value_cache->buffer.addr);
@@ -61,7 +62,7 @@ static __aicore__ void pv_matmul_batch_impl(
 
     for (uint64_t b = 0; b < batch_count; b++) {
         __gm__ half* pij_addr = pij_base + b * M * K;
-        int32_t phys_block = bt[b * block_num + block_idx];
+        int32_t phys_block = bt[(batch_start + b) * block_num + block_idx];
         __gm__ half* vj_addr = val_base + (uint64_t)phys_block * K * N;
         __gm__ float* oi_addr = oi_base + b * M * N;
 
@@ -102,8 +103,9 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t batch_count = static_cast<uint64_t>(args[4]);
     uint64_t block_idx = static_cast<uint64_t>(args[5]);
     uint64_t block_num = static_cast<uint64_t>(args[6]);
+    uint64_t batch_start = static_cast<uint64_t>(args[7]);
 
     pv_matmul_batch_impl<16, 16, 16>(
         pij_batch, value_cache, oi_new_batch,
-        block_table_ptr, batch_count, block_idx, block_num);
+        block_table_ptr, batch_count, block_idx, block_num, batch_start);
 }

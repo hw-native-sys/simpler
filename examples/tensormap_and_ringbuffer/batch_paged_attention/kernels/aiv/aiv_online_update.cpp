@@ -38,7 +38,8 @@ static __aicore__ void online_update_batch_impl(
     uint64_t is_last,
     uint64_t batch_count,
     uint64_t q_offset,
-    uint64_t num_heads) {
+    uint64_t num_heads,
+    uint64_t batch_start) {
 
     __gm__ float* mij_base = reinterpret_cast<__gm__ float*>(mij_batch->buffer.addr);
     __gm__ float* lij_base = reinterpret_cast<__gm__ float*>(lij_batch->buffer.addr);
@@ -95,7 +96,7 @@ static __aicore__ void online_update_batch_impl(
         __gm__ float* mi_ptr = mi_base + b * M;
         __gm__ float* li_ptr = li_base + b * M;
         __gm__ float* oi_ptr = oi_base + b * M * N;
-        __gm__ float* dst_ptr = out_base + (b * num_heads + q_offset) * N;
+        __gm__ float* dst_ptr = out_base + ((batch_start + b) * num_heads + q_offset) * N;
 
         GlobalDataMxN oiNewGlobal(oi_new_ptr);
         GlobalDataMxN oiGlobal(oi_ptr);
@@ -214,9 +215,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t batch_count = static_cast<uint64_t>(args[9]);
     uint64_t q_offset = static_cast<uint64_t>(args[10]);
     uint64_t num_heads = static_cast<uint64_t>(args[11]);
+    uint64_t batch_start = static_cast<uint64_t>(args[12]);
 
     online_update_batch_impl<16, 16>(
         mij_batch, lij_batch, oi_new_batch,
         mi_batch, li_batch, oi_batch, out,
-        is_first, is_last, batch_count, q_offset, num_heads);
+        is_first, is_last, batch_count, q_offset, num_heads, batch_start);
 }
