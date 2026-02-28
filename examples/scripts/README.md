@@ -180,7 +180,7 @@ def generate_inputs(params: dict) -> dict:
     Generate input and output tensors.
 
     Args:
-        params: Parameter dictionary (from PARAMS_LIST)
+        params: Parameter dictionary (from ALL_CASES)
 
     Returns:
         Dictionary containing all tensors (inputs + outputs)
@@ -205,10 +205,11 @@ def compute_golden(tensors: dict, params: dict) -> None:
     tensors["f"][:] = (a + b + 1) * (a + b + 2)
 
 # Optional: Multiple test cases
-PARAMS_LIST = [
-    {},  # Default parameters
-    # {"size": 1024},  # Other test cases
-]
+ALL_CASES = {
+    "Default": {},
+    # "Large": {"size": 1024},  # Other test cases
+}
+DEFAULT_CASE = "Default"
 ```
 
 ### Golden Script Interface Description
@@ -230,7 +231,8 @@ PARAMS_LIST = [
 #### Optional Configuration
 
 - **`__outputs__`**: Output tensor names list (or use `out_` prefix convention)
-- **`PARAMS_LIST`**: Test parameters list (default `[{}]`)
+- **`ALL_CASES`**: Dict of named parameter sets for parameterized tests
+- **`DEFAULT_CASE`**: Name of the default case to run
 - **`RTOL`**: Relative tolerance (default `1e-5`)
 - **`ATOL`**: Absolute tolerance (default `1e-5`)
 
@@ -402,14 +404,15 @@ Solutions:
 
 ### Q: How to add multiple test cases?
 
-Define `PARAMS_LIST` in `golden.py`:
+Define `ALL_CASES` and `DEFAULT_CASE` in `golden.py`:
 
 ```python
-PARAMS_LIST = [
-    {"size": 1024},
-    {"size": 2048},
-    {"size": 4096},
-]
+ALL_CASES = {
+    "Small": {"size": 1024},
+    "Medium": {"size": 2048},
+    "Large": {"size": 4096},
+}
+DEFAULT_CASE = "Small"
 
 def generate_inputs(params: dict) -> dict:
     size = params["size"]
@@ -419,6 +422,8 @@ def generate_inputs(params: dict) -> dict:
         "out_f": torch.zeros(size, dtype=torch.float32),
     }
 ```
+
+Then use `--all` to run all cases or `--case Medium` to run a specific one.
 
 ### Q: Are PyTorch tensors supported?
 

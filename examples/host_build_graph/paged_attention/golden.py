@@ -11,7 +11,6 @@ Args layout: [ptr_query, ..., ptr_config, size_query, ..., size_config]
 """
 
 import ctypes
-import os
 import struct
 import torch
 
@@ -43,9 +42,7 @@ ALL_CASES = {
     },
 }
 
-# Select case by env var PA_CASE, default to Case1
-_selected = os.environ.get("PA_CASE", "Case1")
-PARAMS_LIST = [{"name": _selected, **ALL_CASES[_selected]}]
+DEFAULT_CASE = "Case1"
 
 
 def generate_inputs(params: dict) -> list:
@@ -240,7 +237,7 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
 
 if __name__ == "__main__":
-    params = PARAMS_LIST[0]
+    params = {"name": DEFAULT_CASE, **ALL_CASES[DEFAULT_CASE]}
     result = generate_inputs(params)
     tensors = {name: tensor for name, tensor in result if isinstance(tensor, torch.Tensor)}
     compute_golden(tensors, params)

@@ -59,8 +59,9 @@ Golden.py interface:
         '''Compute expected outputs in-place'''
         tensors["out_f"][:] = tensors["a"] + 1
 
-    # Optional
-    PARAMS_LIST = [{"size": 1024}]  # Multiple test cases
+    # Optional — for parameterized test cases:
+    ALL_CASES = {"Case1": {"size": 1024}, "Case2": {"size": 2048}}
+    DEFAULT_CASE = "Case1"
     RTOL = 1e-5  # Relative tolerance
     ATOL = 1e-5  # Absolute tolerance
     __outputs__ = ["out_f"]  # Or use 'out_' prefix
@@ -117,7 +118,23 @@ Golden.py interface:
         help="Enable profiling and generate swimlane.json"
     )
 
+    parser.add_argument(
+        "--all",
+        action="store_true",
+        help="Run all test cases defined in ALL_CASES (default: run only DEFAULT_CASE)"
+    )
+
+    parser.add_argument(
+        "--case",
+        type=str,
+        default=None,
+        help="Run a specific test case by name (e.g., --case Case2)"
+    )
+
     args = parser.parse_args()
+
+    if args.all and args.case:
+        parser.error("--all and --case are mutually exclusive")
 
     # Determine log level from arguments
     log_level_str = None
@@ -179,6 +196,8 @@ Golden.py interface:
             device_id=args.device,
             platform=args.platform,
             enable_profiling=args.enable_profiling,
+            run_all_cases=args.all,
+            case_name=args.case,
         )
 
         runner.run()

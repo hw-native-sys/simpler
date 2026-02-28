@@ -37,7 +37,8 @@ Golden.py interface:
         tensors["out_f"][:] = tensors["a"] + tensors["b"]
 
     # Optional configuration
-    PARAMS_LIST = [{"size": 1024}, {"size": 2048}]  # Multiple test cases
+    ALL_CASES = {"Case1": {"size": 1024}, "Case2": {"size": 2048}}  # Multiple test cases
+    DEFAULT_CASE = "Case1"  # Default case to run
     RTOL = 1e-5  # Relative tolerance
     ATOL = 1e-5  # Absolute tolerance
     __outputs__ = ["out_f"]  # Explicit output names (or use 'out_' prefix)
@@ -335,6 +336,8 @@ class CodeRunner:
         device_id: Optional[int] = None,
         platform: str = "a2a3",
         enable_profiling: bool = False,
+        run_all_cases: bool = False,
+        case_name: Optional[str] = None,
     ):
         # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
         _setup_logging_if_needed()
@@ -356,8 +359,20 @@ class CodeRunner:
         self.kernels = self._kernel_config.KERNELS
         self.orchestration = self._kernel_config.ORCHESTRATION
 
-        # Extract golden configuration
-        self.params_list = getattr(self._golden_module, 'PARAMS_LIST', [{}])
+        # Extract golden configuration — determine which cases to run
+        all_cases = getattr(self._golden_module, 'ALL_CASES', {"Default": {}})
+        default_case = getattr(self._golden_module, 'DEFAULT_CASE', "Default")
+
+        if run_all_cases:
+            self.params_list = [{"name": name, **params} for name, params in all_cases.items()]
+            logger.info(f"Running all {len(self.params_list)} cases: {list(all_cases.keys())}")
+        elif case_name is not None:
+            if case_name not in all_cases:
+                raise ValueError(f"Case '{case_name}' not found. Available: {list(all_cases.keys())}")
+            self.params_list = [{"name": case_name, **all_cases[case_name]}]
+        else:
+            self.params_list = [{"name": default_case, **all_cases[default_case]}]
+
         self.rtol = getattr(self._golden_module, 'RTOL', 1e-5)
         self.atol = getattr(self._golden_module, 'ATOL', 1e-5)
         self.output_names = getattr(self._golden_module, '__outputs__', None)
@@ -814,8 +829,9 @@ class CodeRunner:
 
 
 def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",
-                       enable_profiling=False):
+                       enable_profiling=False, run_all_cases=False, case_name=None):
     """Factory: creates a CodeRunner based on kernel_config."""
     return CodeRunner(kernels_dir=kernels_dir, golden_path=golden_path,
                       device_id=device_id, platform=platform,
-                      enable_profiling=enable_profiling)
+                      enable_profiling=enable_profiling,
+                      run_all_cases=run_all_cases, case_name=case_name)

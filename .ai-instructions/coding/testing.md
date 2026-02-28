@@ -80,7 +80,8 @@ Output tensors are identified by one of:
 ### Optional configuration
 
 - `RTOL` / `ATOL`: Comparison tolerances (default: `1e-5`)
-- `PARAMS_LIST`: List of parameter dicts for parameterized tests
+- `ALL_CASES`: Dict of named parameter sets for parameterized tests
+- `DEFAULT_CASE`: Name of the default case to run
 
 ### `kernel_config.py` structure
 
