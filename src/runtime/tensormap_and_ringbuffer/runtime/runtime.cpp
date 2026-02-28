@@ -22,6 +22,9 @@ Runtime::Runtime() {
     worker_count = 0;
     sche_cpu_num = 1;
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
+    pto2_task_window_size = 0;
+    pto2_heap_size = 0;
+    pto2_dep_list_pool_size = 0;
 
     // Initialize tensor pairs
     tensor_pair_count = 0;

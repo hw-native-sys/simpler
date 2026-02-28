@@ -1131,6 +1131,19 @@ int AicpuExecutor::run(Runtime* runtime) {
                 DEV_INFO("Thread 3: No config function, using defaults");
             }
 
+            // Apply ring buffer size overrides from Runtime (set by host env vars)
+            if (runtime->pto2_task_window_size > 0) {
+                task_window_size = runtime->pto2_task_window_size;
+            }
+            if (runtime->pto2_heap_size > 0) {
+                heap_size = runtime->pto2_heap_size;
+            }
+            if (runtime->pto2_dep_list_pool_size > 0) {
+                dep_list_pool_size = runtime->pto2_dep_list_pool_size;
+            }
+            DEV_INFO("Thread 3: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%lu",
+                     (unsigned long)task_window_size, (unsigned long)heap_size, (unsigned long)dep_list_pool_size);
+
             if (expected_arg_count > 0 && arg_count < expected_arg_count) {
                 DEV_ERROR("Thread 3: arg_count %d < expected %d", arg_count, expected_arg_count);
                 dlclose(handle);
