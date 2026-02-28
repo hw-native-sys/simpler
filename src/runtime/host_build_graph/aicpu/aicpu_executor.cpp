@@ -667,7 +667,13 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                 }
 
                 // Resolve old running task dependencies (if exists)
+                // When pending task FINs directly, the running task was implicitly
+                // completed (AICore overwrote COND before we could read its FIN).
+                // Count it here to avoid losing completion.
                 if (prev_running_id != AICPU_TASK_INVALID) {
+                    cur_thread_completed++;
+                    completed_tasks_.fetch_add(1, std::memory_order_release);
+
                     Task* prev_running_task = runtime.get_task(prev_running_id);
                     resolve_task_dependencies(prev_running_task,
                         runtime,
@@ -714,7 +720,13 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                 pending_task_ids_[core_id] = AICPU_TASK_INVALID;
                 made_progress = true;
 
+                // When pending task ACKs, the old running task was implicitly
+                // completed (AICore overwrote COND before we could read its FIN).
+                // Count it here to avoid losing completion.
                 if (prev_running_id != AICPU_TASK_INVALID) {
+                    cur_thread_completed++;
+                    completed_tasks_.fetch_add(1, std::memory_order_release);
+
                     Task* prev_running_task = runtime.get_task(prev_running_id);
                     resolve_task_dependencies(prev_running_task,
                         runtime,
