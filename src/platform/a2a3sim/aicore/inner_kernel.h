@@ -35,6 +35,20 @@
 #define PIPE_ALL 0
 #define pipe_barrier(pipe) __sync_synchronize()
 
+// SPIN_WAIT_HINT - CPU pause hint + OS yield for idle polling loops in simulation.
+// In simulation, all AICore/AICPU threads share a small number of host CPU cores.
+// The CPU hint (pause/yield) reduces pipeline waste, and sched_yield() lets the OS
+// scheduler give time slices to threads doing real work (e.g., kernel execution),
+// preventing starvation-induced timeouts on resource-constrained CI runners.
+#include <sched.h>
+#if defined(__x86_64__)
+#define SPIN_WAIT_HINT() do { __builtin_ia32_pause(); sched_yield(); } while(0)
+#elif defined(__aarch64__)
+#define SPIN_WAIT_HINT() do { __asm__ volatile("yield" ::: "memory"); sched_yield(); } while(0)
+#else
+#define SPIN_WAIT_HINT() sched_yield()
+#endif
+
 // =============================================================================
 // System Counter Simulation
 // =============================================================================

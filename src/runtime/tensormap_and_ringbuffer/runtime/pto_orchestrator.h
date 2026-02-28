@@ -79,6 +79,7 @@ struct PTO2OrchestratorState {
     // === AICPU PARALLEL MODE (set by aicpu_executor, NULL when unused) ===
     int32_t* aicpu_fanin_refcount;
     volatile int32_t* aicpu_task_completed;
+    int32_t* aicpu_completed_by_task;  // task_id that set the completed state (for slot-reuse validation)
     int32_t aicpu_window_mask;
 
     // === ORCHESTRATOR READY QUEUE (early-return path → scheduler) ===

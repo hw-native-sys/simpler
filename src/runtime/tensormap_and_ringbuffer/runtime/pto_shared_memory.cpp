@@ -148,6 +148,7 @@ void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
     header->orchestrator_done = 0;
     header->last_task_alive = 0;
     header->heap_tail = 0;
+    header->heap_tail_gen = 0;
 
     // Layout info
     header->task_window_size = task_window_size;
@@ -181,7 +182,8 @@ void pto2_sm_reset(PTO2SharedMemoryHandle* handle) {
     header->orchestrator_done = 0;
     header->last_task_alive = 0;
     header->heap_tail = 0;
-    
+    header->heap_tail_gen = 0;
+
     header->graph_output_ptr = 0;
     header->graph_output_size = 0;
     // Clear task descriptors

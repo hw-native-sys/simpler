@@ -20,6 +20,9 @@
 // dcci (Data Cache Clean and Invalidate) is provided by CANN headers
 // No need to define it here - it's a hardware instruction
 
+// SPIN_WAIT_HINT - no-op on real hardware (AICore has dedicated polling support)
+#define SPIN_WAIT_HINT() ((void)0)
+
 /**
  * Read an AICore register via SPR access
  *

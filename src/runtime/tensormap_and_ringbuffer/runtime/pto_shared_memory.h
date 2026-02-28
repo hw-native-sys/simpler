@@ -50,7 +50,8 @@ typedef struct {
     // Written by Scheduler, Read by Orchestrator (for back-pressure)
     volatile uint64_t heap_tail;          // Heap ring free pointer (on-device, matches pto2_heap_ring_init)
     volatile int32_t last_task_alive;     // Task ring tail (oldest active task)
-    volatile int32_t _reserved;           // Explicit padding for 8-byte alignment
+    volatile int32_t heap_tail_gen;       // Ticket counter for serialized heap_tail writes
+                                          // (ensures concurrent threads write in task order)
 
     // === LAYOUT INFO (set once at init) ===
     uint64_t task_window_size;            // PTO2_TASK_WINDOW_SIZE

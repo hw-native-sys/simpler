@@ -373,9 +373,11 @@ void pto2_scheduler_advance_ring_pointers(PTO2SchedulerState* sched) {
 
 void pto2_scheduler_sync_to_sm(PTO2SchedulerState* sched) {
     PTO2SharedMemoryHeader* header = sched->sm_handle->header;
-    
+
     PTO2_STORE_RELEASE(&header->last_task_alive, sched->last_task_alive);
     PTO2_STORE_RELEASE(&header->heap_tail, sched->heap_tail);
+    // Keep generation in sync so AICPU mode sees a consistent starting state
+    PTO2_STORE_RELEASE(&header->heap_tail_gen, sched->last_task_alive);
 }
 
 // =============================================================================

@@ -88,7 +88,12 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         }
 
         // Execute task if new (task_id encoding: 0=idle, task_id+1=task)
-        if (task_id != 0 && task_id != last_task_id) {
+        if (task_id == 0 || task_id == last_task_id) {
+            SPIN_WAIT_HINT();
+            continue;
+        }
+
+        {
             // Invalidate cache to read fresh payload written by AICPU
             dcci(my_payload, ENTIRE_DATA_CACHE);
 

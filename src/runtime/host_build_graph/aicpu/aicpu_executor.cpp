@@ -4,6 +4,7 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
+#include "spin_hint.h"
 #include "aicpu/performance_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/memory_barrier.h"
@@ -953,6 +954,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                 LOG_ERROR("Thread %d: Timeout after %d idle iterations!", thread_idx, idle_iterations);
                 diagnose_stuck_state(runtime, thread_idx, cur_thread_cores, core_num, hank);
                 return -1;
+            } else {
+                SPIN_WAIT_HINT();
             }
         } else {
             idle_iterations = 0;

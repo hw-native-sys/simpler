@@ -46,7 +46,12 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             break;
         }
 
-        if (task_id != 0 && task_id != last_task_id) {
+        if (task_id == 0 || task_id == last_task_id) {
+            SPIN_WAIT_HINT();
+            continue;
+        }
+
+        {
             uint32_t actual_task_id = task_id - 1;
             write_reg(RegId::COND, MAKE_ACK_VALUE(actual_task_id));
 

@@ -17,6 +17,7 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
+#include "spin_hint.h"
 #include "runtime.h"
 #include "pto2_dispatch_payload.h"
 
@@ -135,6 +136,7 @@ struct AicpuExecutor {
     std::atomic<bool> pto2_init_complete_{false};  // init block finished; others wait for this
     std::atomic<int> next_scan_index_{0};
     std::atomic<bool> sm_header_ready_{false};  // Thread 3 sets after SM header init
+    std::atomic<bool> orch_pointers_ready_{false};  // Thread 3 sets after aicpu parallel mode pointers + orch_ready_queue are configured
 
     // Orchestrator ready queue pointers (set by Thread 3, read by scheduler threads)
     volatile int32_t* orch_ready_queue_{nullptr};
@@ -180,6 +182,7 @@ static AicpuExecutor g_aicpu_executor;
 static constexpr int PTO2_MAX_SLOTS = PTO2_TASK_WINDOW_SIZE;
 static int s_pto2_fanin_refcount[PTO2_MAX_SLOTS];
 static volatile int32_t s_pto2_task_completed[PTO2_MAX_SLOTS];
+static int32_t s_pto2_completed_by_task[PTO2_MAX_SLOTS];  // task_id that set completed state (for slot-reuse validation)
 static PTO2DispatchPayload s_pto2_payload_per_core[RUNTIME_MAX_WORKER];
 
 // ===== AicpuExecutor Method Implementations =====
@@ -482,13 +485,14 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     }
     DEV_INFO("Thread %d: sm_base=%p", thread_idx, sm_base);
 
-    // Device orchestration: wait for Thread 3 to initialize SM header
-    if (thread_num_ == 4 && !runtime->get_orch_built_on_host()) {
+    // Device orchestration: wait for last thread to initialize SM header
+    if (thread_num_ > 1 && !runtime->get_orch_built_on_host()) {
         while (!sm_header_ready_.load(std::memory_order_acquire)) {
         }
     }
 
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
+    void* gm_heap_base = runtime->get_pto2_gm_heap_ptr();  // For heap_tail offset calc
     DEV_INFO("Thread %d: header=%p, task_desc_offset=%d, dep_pool_offset=%d, window_size=%d",
              thread_idx, (void*)header, header->task_descriptors_offset,
              header->dep_list_pool_offset, header->task_window_size);
@@ -513,6 +517,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         DEV_INFO("Thread %d: doing one-time init", thread_idx);
         std::memset(s_pto2_fanin_refcount, 0, sizeof(s_pto2_fanin_refcount));
         std::memset((void*)s_pto2_task_completed, 0, sizeof(s_pto2_task_completed));
+        std::memset(s_pto2_completed_by_task, -1, sizeof(s_pto2_completed_by_task));
 
         // Assign perf buffers to cores early so profiling captures all tasks
         // (total_tasks written to header later when orchestrator completes)
@@ -524,6 +529,14 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         pto2_init_complete_.store(true, std::memory_order_release);
     } else {
         while (!pto2_init_complete_.load(std::memory_order_acquire)) {
+        }
+    }
+
+    // Wait for last thread to finish setting up aicpu parallel mode pointers
+    // and orch_ready_queue before entering the scheduling loop.
+    if (thread_num_ > 1 && !runtime->get_orch_built_on_host()) {
+        while (!orch_pointers_ready_.load(std::memory_order_acquire)) {
+            std::this_thread::yield();
         }
     }
 
@@ -650,6 +663,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 //     via the release/acquire pair and takes the early-return path, directly
                 //     incrementing X's fanin_refcount instead of touching fanout_head.
                 // Either way every consumer is accounted for exactly once.
+                __atomic_store_n(&s_pto2_completed_by_task[task_id & window_mask], task_id, __ATOMIC_RELEASE);
                 __atomic_store_n(&s_pto2_task_completed[task_id & window_mask], 2, __ATOMIC_RELEASE);
                 pto2_fanout_lock(pto2_task);
                 int32_t fanout_head = (int32_t)pto2_task->fanout_head;
@@ -700,6 +714,65 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 cur_thread_completed++;
                 made_progress = true;
                 completed_tasks_.fetch_add(1, std::memory_order_release);
+
+                // Advance last_task_alive for TaskRing flow control.
+                // Mark this task as fully consumed (state=3), then try to
+                // advance the watermark using lock-free CAS.
+                //
+                // ORDERING: Mark completed as state=3 and reset refcount BEFORE advancing last_task_alive.
+                // Once last_task_alive advances past a slot, the orchestrator can
+                // immediately reuse it. The early-return path in
+                // pto2_add_consumer_to_producer checks aicpu_task_completed[prod_slot];
+                // if we reset AFTER the CAS, the orchestrator could see stale state=3
+                // from the old task and incorrectly skip dependency setup.
+                __atomic_store_n(&s_pto2_task_completed[task_id & window_mask], 3, __ATOMIC_RELEASE);
+                {
+                    int32_t la = __atomic_load_n(&header->last_task_alive, __ATOMIC_ACQUIRE);
+                    int32_t cti = __atomic_load_n(&header->current_task_index, __ATOMIC_ACQUIRE);
+                    while (la < cti) {
+                        int32_t la_slot = la & window_mask;
+                        if (__atomic_load_n(&s_pto2_task_completed[la_slot], __ATOMIC_ACQUIRE) < 3)
+                            break;
+                        // Only reset refcount — the orchestrator's early-return path
+                        // (pto2_add_consumer_to_producer) MUST see completed >= 2 when
+                        // the producer has actually finished, per the fanout lock protocol.
+                        // completed_by_task guards against stale state from recycled slots:
+                        // the old task's completed_by_task won't match the new producer_id.
+                        __atomic_store_n(&s_pto2_fanin_refcount[la_slot], 0, __ATOMIC_RELEASE);
+                        // Advance last_task_alive to make this slot available.
+                        int32_t expected = la;
+                        if (__atomic_compare_exchange_n(&header->last_task_alive, &expected, la + 1,
+                                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+                            // Serialize heap_tail writes via ticket-based generation counter.
+                            // Without this, concurrent CAS winners can interleave their
+                            // heap_tail stores, causing stale regression (see design note below).
+                            //
+                            // DESIGN: heap_tail_gen tracks which task's tail was last written.
+                            // Each CAS winner waits for gen==la (its ticket), writes heap_tail,
+                            // then advances gen to la+1.  The critical section is ~3 instructions,
+                            // so the spin is effectively zero in the common (no-preemption) case.
+                            while (__atomic_load_n(&header->heap_tail_gen, __ATOMIC_ACQUIRE) != la) {
+                            }
+
+                            // Advance heap_tail for HeapRing flow control
+                            PTO2TaskDescriptor* consumed_t = &task_descriptors[la_slot];
+                            if (consumed_t->packed_buffer_end != nullptr) {
+                                uint64_t new_tail = (uint64_t)((char*)consumed_t->packed_buffer_end - (char*)gm_heap_base);
+                                if (new_tail <= header->heap_size) {
+                                    __atomic_store_n(&header->heap_tail, new_tail, __ATOMIC_RELEASE);
+                                }
+                            }
+
+                            // Release next writer
+                            __atomic_store_n(&header->heap_tail_gen, la + 1, __ATOMIC_RELEASE);
+
+                            la = la + 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+
                 // Debug: periodic progress (thread 0 only) to find which task hangs
                 if (thread_idx == 0 && task_count > 0) {
                     int32_t c = completed_tasks_.load(std::memory_order_relaxed);
@@ -936,13 +1009,18 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         hw_task_id = pl->task_id;
                         hw_kernel  = pl->kernel_id;
                     }
-                    DEV_ALWAYS("    core=%d status=%d task_id=%d kernel_id=%d",
-                               cid, (int)hh->task_status, hw_task_id, hw_kernel);
+                    uint64_t cond_reg = read_reg(core_id_to_reg_addr_[cid], RegId::COND);
+                    DEV_ALWAYS("    core=%d cond=0x%x(state=%d,id=%d) exec_id=%d payload_task=%d kernel=%d",
+                               cid, (unsigned)cond_reg,
+                               EXTRACT_TASK_STATE(cond_reg), EXTRACT_TASK_ID(cond_reg),
+                               executing_task_ids_[cid], hw_task_id, hw_kernel);
                 }
             }
             if (idle_iterations > MAX_IDLE_ITERATIONS) {
                 DEV_ERROR("Thread %d: PTO2 timeout after %d idle iterations", thread_idx, idle_iterations);
                 return -1;
+            } else {
+                SPIN_WAIT_HINT();
             }
         } else {
             idle_iterations = 0;
@@ -1190,6 +1268,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             if (ws == 0 || ws > PTO2_MAX_SLOTS) ws = PTO2_MAX_SLOTS;
             rt->orchestrator.aicpu_fanin_refcount = s_pto2_fanin_refcount;
             rt->orchestrator.aicpu_task_completed = s_pto2_task_completed;
+            rt->orchestrator.aicpu_completed_by_task = s_pto2_completed_by_task;
             rt->orchestrator.aicpu_window_mask = ws - 1;
 
             // Expose orchestrator ready queue to scheduler threads
@@ -1197,6 +1276,9 @@ int AicpuExecutor::run(Runtime* runtime) {
             orch_ready_tail_ = &rt->orchestrator.orch_ready_tail;
             orch_ready_head_ = &rt->orchestrator.orch_ready_head;
             orch_ready_capacity_ = PTO2OrchestratorState::ORCH_READY_QUEUE_SIZE;
+
+            // Signal scheduler threads: all pointers are ready, safe to start scheduling.
+            orch_pointers_ready_.store(true, std::memory_order_release);
 
             // Call orchestration wrapped in outer scope (matches old PTO2_ORCHESTRATION behavior)
             DEV_ALWAYS("Thread 3: Calling aicpu_orchestration_entry from SO");
@@ -1317,6 +1399,11 @@ void AicpuExecutor::deinit() {
     pto2_init_complete_.store(false, std::memory_order_release);
     next_scan_index_.store(0, std::memory_order_release);
     sm_header_ready_.store(false, std::memory_order_release);
+    orch_pointers_ready_.store(false, std::memory_order_release);
+    orch_ready_queue_ = nullptr;
+    orch_ready_tail_ = nullptr;
+    orch_ready_head_ = nullptr;
+    orch_ready_capacity_ = 0;
 
     // Reset core discovery state
     aic_count_ = 0;
