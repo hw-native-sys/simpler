@@ -10,7 +10,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include "common/unified_log.h"
 
 // =============================================================================
 // Task State Names
@@ -401,24 +401,23 @@ bool pto2_scheduler_is_done(PTO2SchedulerState* sched) {
 // =============================================================================
 
 void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
-    printf("=== Scheduler Statistics ===\n");
-    printf("last_task_alive:   %d\n", sched->last_task_alive);
-    printf("heap_tail:         %" PRIu64 "\n", sched->heap_tail);
-    printf("tasks_completed:   %lld\n", (long long)sched->tasks_completed);
-    printf("tasks_consumed:    %lld\n", (long long)sched->tasks_consumed);
-    printf("============================\n");
+    LOG_INFO("=== Scheduler Statistics ===");
+    LOG_INFO("last_task_alive:   %d", sched->last_task_alive);
+    LOG_INFO("heap_tail:         %" PRIu64, sched->heap_tail);
+    LOG_INFO("tasks_completed:   %lld", (long long)sched->tasks_completed);
+    LOG_INFO("tasks_consumed:    %lld", (long long)sched->tasks_consumed);
+    LOG_INFO("============================");
 }
 
 void pto2_scheduler_print_queues(PTO2SchedulerState* sched) {
-    printf("=== Ready Queues ===\n");
+    LOG_INFO("=== Ready Queues ===");
     
     const char* worker_names[] = {"CUBE", "VECTOR", "AI_CPU", "ACCELERATOR"};
     
     for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
-        printf("  %s: count=%" PRIu64 "\n", worker_names[i],
-               pto2_ready_queue_count(&sched->ready_queues[i]));
+        LOG_INFO("  %s: count=%" PRIu64, worker_names[i],
+                 pto2_ready_queue_count(&sched->ready_queues[i]));
     }
     
-    printf("====================\n");
+    LOG_INFO("====================");
 }
-

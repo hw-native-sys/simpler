@@ -7,6 +7,7 @@
 
 #include "runtime.h"
 #include "pto_shared_memory.h"
+#include "common/unified_log.h"
 
 // =============================================================================
 // Constructor
@@ -46,14 +47,14 @@ Runtime::Runtime() {
 
 void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
     if (tensor_pair_count >= RUNTIME_MAX_TENSOR_PAIRS) {
-        fprintf(stderr, "[Runtime] ERROR: Tensor pairs full (max=%d)\n", RUNTIME_MAX_TENSOR_PAIRS);
+        LOG_ERROR("[Runtime] Tensor pairs full (max=%d)", RUNTIME_MAX_TENSOR_PAIRS);
         return;
     }
     tensor_pairs[tensor_pair_count].host_ptr = host_ptr;
     tensor_pairs[tensor_pair_count].dev_ptr = dev_ptr;
     tensor_pairs[tensor_pair_count].size = size;
     tensor_pair_count++;
-    printf("Recorded tensor pair: host=%p dev=%p size=%zu\n", host_ptr, dev_ptr, size);
+    LOG_INFO("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
 }
 
 TensorPair* Runtime::get_tensor_pairs() {
@@ -101,8 +102,7 @@ void Runtime::set_device_orch_so(const void* data, size_t size) {
         return;
     }
     if (size > RUNTIME_MAX_ORCH_SO_SIZE) {
-        fprintf(stderr, "[Runtime] ERROR: Orchestration SO too large (%zu > %d)\n",
-                size, RUNTIME_MAX_ORCH_SO_SIZE);
+        LOG_ERROR("[Runtime] Orchestration SO too large (%zu > %d)", size, RUNTIME_MAX_ORCH_SO_SIZE);
         device_orch_so_size_ = 0;
         return;
     }

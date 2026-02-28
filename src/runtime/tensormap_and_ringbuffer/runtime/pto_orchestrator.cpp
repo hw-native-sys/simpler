@@ -10,10 +10,10 @@
 #include <inttypes.h>
 
 #include <assert.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#include "common/unified_log.h"
 #include "pto_tensormap.h"
 #include "tensor.h"
 
@@ -453,8 +453,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 
 void pto2_orchestrator_done(PTO2OrchestratorState* orch) {
     int32_t total_tasks = orch->task_ring.current_index;
-    fprintf(stdout, "=== [Orchestrator] total_tasks=%d ===\n", total_tasks);
-    fflush(stdout);
+    LOG_INFO("=== [Orchestrator] total_tasks=%d ===", total_tasks);
     PTO2_STORE_RELEASE(&orch->sm_handle->header->orchestrator_done, 1);
 }
 
@@ -476,29 +475,29 @@ bool pto2_orchestrator_has_space(PTO2OrchestratorState* orch) { return pto2_task
 // =============================================================================
 
 void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
-    printf("=== Orchestrator Statistics ===\n");
-    printf("Tasks submitted:     %lld\n", (long long)orch->tasks_submitted);
-    printf("Buffers allocated:   %lld\n", (long long)orch->buffers_allocated);
-    printf("Bytes allocated:     %lld\n", (long long)orch->bytes_allocated);
-    printf("Current scope depth: %d\n", orch->scope_stack_top + 1);
-    printf("Task ring active:    %d\n", pto2_task_ring_active_count(&orch->task_ring));
-    printf("Heap ring used:      %" PRIu64 " / %" PRIu64 "\n", orch->heap_ring.top, orch->heap_ring.size);
-    printf("Dep pool used:       %d / %d\n", pto2_dep_pool_used(&orch->dep_pool), orch->dep_pool.capacity);
-    printf("TensorMap valid:     %d\n", pto2_tensormap_valid_count(&orch->tensor_map));
-    printf("===============================\n");
+    LOG_INFO("=== Orchestrator Statistics ===");
+    LOG_INFO("Tasks submitted:     %lld", (long long)orch->tasks_submitted);
+    LOG_INFO("Buffers allocated:   %lld", (long long)orch->buffers_allocated);
+    LOG_INFO("Bytes allocated:     %lld", (long long)orch->bytes_allocated);
+    LOG_INFO("Current scope depth: %d", orch->scope_stack_top + 1);
+    LOG_INFO("Task ring active:    %d", pto2_task_ring_active_count(&orch->task_ring));
+    LOG_INFO("Heap ring used:      %" PRIu64 " / %" PRIu64, orch->heap_ring.top, orch->heap_ring.size);
+    LOG_INFO("Dep pool used:       %d / %d", pto2_dep_pool_used(&orch->dep_pool), orch->dep_pool.capacity);
+    LOG_INFO("TensorMap valid:     %d", pto2_tensormap_valid_count(&orch->tensor_map));
+    LOG_INFO("===============================");
 }
 
 void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
-    printf("=== Scope Stack ===\n");
-    printf("Depth: %d\n", orch->scope_stack_top + 1);
+    LOG_INFO("=== Scope Stack ===");
+    LOG_INFO("Depth: %d", orch->scope_stack_top + 1);
 
     for (int i = 0; i <= orch->scope_stack_top; i++) {
         int32_t begin = orch->scope_begins[i];
         int32_t end = (i < orch->scope_stack_top) ? orch->scope_begins[i + 1] : orch->scope_tasks_size;
-        printf("  [%d] tasks_owned = %d\n", i, end - begin);
+        LOG_INFO("  [%d] tasks_owned = %d", i, end - begin);
     }
 
-    printf("==================\n");
+    LOG_INFO("==================");
 }
 
 #if PTO2_ORCH_PROFILING

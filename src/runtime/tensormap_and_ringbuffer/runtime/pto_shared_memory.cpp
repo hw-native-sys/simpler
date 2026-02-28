@@ -11,7 +11,7 @@
 #include <inttypes.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
+#include "common/unified_log.h"
 
 // =============================================================================
 // Size Calculation
@@ -202,25 +202,22 @@ void pto2_sm_print_layout(PTO2SharedMemoryHandle* handle) {
     
     PTO2SharedMemoryHeader* h = handle->header;
     
-    printf("=== PTO2 Shared Memory Layout ===\n");
-    printf("Base address:       %p\n", handle->sm_base);
-    printf("Total size:         %" PRIu64 " bytes\n", h->total_size);
-    printf("\n");
-    printf("Task window size:   %" PRIu64 "\n", h->task_window_size);
-    printf("Heap size:          %" PRIu64 " bytes\n", h->heap_size);
-    printf("DepList pool size:  %" PRIu64 " entries\n", h->dep_list_pool_size);
-    printf("\n");
-    printf("Offsets:\n");
-    printf("  TaskDescriptors:  %" PRIu64 " (0x%" PRIx64 ")\n", h->task_descriptors_offset, h->task_descriptors_offset);
-    printf("  DepListPool:      %" PRIu64 " (0x%" PRIx64 ")\n", h->dep_list_pool_offset, h->dep_list_pool_offset);
-    printf("\n");
-    printf("Flow control:\n");
-    printf("  heap_top:           %" PRIu64 "\n", h->heap_top);
-    printf("  heap_tail:          %" PRIu64 "\n", h->heap_tail);
-    printf("  current_task_index: %d\n", h->current_task_index);
-    printf("  orchestrator_done:  %d\n", h->orchestrator_done);
-    printf("  last_task_alive:    %d\n", h->last_task_alive);
-    printf("================================\n");
+    LOG_INFO("=== PTO2 Shared Memory Layout ===");
+    LOG_INFO("Base address:       %p", handle->sm_base);
+    LOG_INFO("Total size:         %" PRIu64 " bytes", h->total_size);
+    LOG_INFO("Task window size:   %" PRIu64, h->task_window_size);
+    LOG_INFO("Heap size:          %" PRIu64 " bytes", h->heap_size);
+    LOG_INFO("DepList pool size:  %" PRIu64 " entries", h->dep_list_pool_size);
+    LOG_INFO("Offsets:");
+    LOG_INFO("  TaskDescriptors:  %" PRIu64 " (0x%" PRIx64 ")", h->task_descriptors_offset, h->task_descriptors_offset);
+    LOG_INFO("  DepListPool:      %" PRIu64 " (0x%" PRIx64 ")", h->dep_list_pool_offset, h->dep_list_pool_offset);
+    LOG_INFO("Flow control:");
+    LOG_INFO("  heap_top:           %" PRIu64, h->heap_top);
+    LOG_INFO("  heap_tail:          %" PRIu64, h->heap_tail);
+    LOG_INFO("  current_task_index: %d", h->current_task_index);
+    LOG_INFO("  orchestrator_done:  %d", h->orchestrator_done);
+    LOG_INFO("  last_task_alive:    %d", h->last_task_alive);
+    LOG_INFO("================================");
 }
 
 bool pto2_sm_validate(PTO2SharedMemoryHandle* handle) {

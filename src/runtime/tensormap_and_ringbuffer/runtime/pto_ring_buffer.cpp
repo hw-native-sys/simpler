@@ -10,8 +10,8 @@
 #include "pto_ring_buffer.h"
 #include <inttypes.h>
 #include <string.h>
-#include <stdio.h>
 #include <stdlib.h>  // for exit()
+#include "common/unified_log.h"
 
 // Set to 1 to enable periodic BLOCKED/Unblocked messages during spin-wait.
 #ifndef PTO2_SPIN_VERBOSE_LOGGING
@@ -50,7 +50,7 @@ void* pto2_heap_ring_alloc(PTO2HeapRing* ring, uint64_t size) {
         if (ptr != NULL) {
 #if PTO2_SPIN_VERBOSE_LOGGING
             if (notified) {
-                fprintf(stderr, "[HeapRing] Unblocked after %d spins\n", spin_count);
+                LOG_INFO("[HeapRing] Unblocked after %d spins", spin_count);
             }
 #endif
             return ptr;
@@ -65,10 +65,9 @@ void* pto2_heap_ring_alloc(PTO2HeapRing* ring, uint64_t size) {
             spin_count < PTO2_HEAP_SPIN_LIMIT) {
             uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
             uint64_t available = pto2_heap_ring_available(ring);
-            fprintf(stderr, "[HeapRing] BLOCKED: requesting %" PRIu64 " bytes, available=%" PRIu64 ", "
-                    "top=%" PRIu64 ", tail=%" PRIu64 ", spins=%d\n",
-                    size, available,
-                    ring->top, tail, spin_count);
+            LOG_WARN("[HeapRing] BLOCKED: requesting %" PRIu64 " bytes, available=%" PRIu64 ", "
+                     "top=%" PRIu64 ", tail=%" PRIu64 ", spins=%d",
+                     size, available, ring->top, tail, spin_count);
             notified = true;
         }
 #endif
@@ -76,20 +75,17 @@ void* pto2_heap_ring_alloc(PTO2HeapRing* ring, uint64_t size) {
         if (spin_count >= PTO2_HEAP_SPIN_LIMIT) {
             uint64_t tail = PTO2_LOAD_ACQUIRE(ring->tail_ptr);
             uint64_t available = pto2_heap_ring_available(ring);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "========================================\n");
-            fprintf(stderr, "FATAL: Heap Ring Deadlock Detected!\n");
-            fprintf(stderr, "========================================\n");
-            fprintf(stderr, "Orchestrator blocked waiting for heap space after %d spins.\n", spin_count);
-            fprintf(stderr, "  - Requested:     %" PRIu64 " bytes\n", size);
-            fprintf(stderr, "  - Available:     %" PRIu64 " bytes\n", available);
-            fprintf(stderr, "  - Heap top:      %" PRIu64 "\n", ring->top);
-            fprintf(stderr, "  - Heap tail:     %" PRIu64 "\n", tail);
-            fprintf(stderr, "  - Heap size:     %" PRIu64 "\n", ring->size);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "Solution: Increase PTO2_HEAP_SIZE (e.g. 256*1024 for 4 x 64KB outputs).\n");
-            fprintf(stderr, "========================================\n");
-            fprintf(stderr, "\n");
+            LOG_ERROR("========================================");
+            LOG_ERROR("FATAL: Heap Ring Deadlock Detected!");
+            LOG_ERROR("========================================");
+            LOG_ERROR("Orchestrator blocked waiting for heap space after %d spins.", spin_count);
+            LOG_ERROR("  - Requested:     %" PRIu64 " bytes", size);
+            LOG_ERROR("  - Available:     %" PRIu64 " bytes", available);
+            LOG_ERROR("  - Heap top:      %" PRIu64, ring->top);
+            LOG_ERROR("  - Heap tail:     %" PRIu64, tail);
+            LOG_ERROR("  - Heap size:     %" PRIu64, ring->size);
+            LOG_ERROR("Solution: Increase PTO2_HEAP_SIZE (e.g. 256*1024 for 4 x 64KB outputs).");
+            LOG_ERROR("========================================");
             exit(1);
         }
 
@@ -193,8 +189,7 @@ int32_t pto2_task_ring_alloc(PTO2TaskRing* ring) {
         if (task_id >= 0) {
 #if PTO2_SPIN_VERBOSE_LOGGING
             if (notified) {
-                fprintf(stderr, "[TaskRing] Unblocked after %d spins, task_id=%d\n", 
-                        spin_count, task_id);
+                LOG_INFO("[TaskRing] Unblocked after %d spins, task_id=%d", spin_count, task_id);
             }
 #endif
             return task_id;
@@ -209,10 +204,10 @@ int32_t pto2_task_ring_alloc(PTO2TaskRing* ring) {
             spin_count < PTO2_FLOW_CONTROL_SPIN_LIMIT) {
             int32_t last_alive = PTO2_LOAD_ACQUIRE(ring->last_alive_ptr);
             int32_t active_count = ring->current_index - last_alive;
-            fprintf(stderr, "[TaskRing] BLOCKED (Flow Control): current=%d, last_alive=%d, "
-                    "active=%d/%d (%.1f%%), spins=%d\n",
-                    ring->current_index, last_alive, active_count, ring->window_size,
-                    100.0 * active_count / ring->window_size, spin_count);
+            LOG_WARN("[TaskRing] BLOCKED (Flow Control): current=%d, last_alive=%d, "
+                     "active=%d/%d (%.1f%%), spins=%d",
+                     ring->current_index, last_alive, active_count, ring->window_size,
+                     100.0 * active_count / ring->window_size, spin_count);
             notified = true;
         }
 #endif
@@ -222,39 +217,30 @@ int32_t pto2_task_ring_alloc(PTO2TaskRing* ring) {
             int32_t last_alive = PTO2_LOAD_ACQUIRE(ring->last_alive_ptr);
             int32_t active_count = ring->current_index - last_alive;
             
-            fprintf(stderr, "\n");
-            fprintf(stderr, "========================================\n");
-            fprintf(stderr, "FATAL: Flow Control Deadlock Detected!\n");
-            fprintf(stderr, "========================================\n");
-            fprintf(stderr, "\n");
-            fprintf(stderr, "Task Ring is FULL and no progress after %d spins.\n", spin_count);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "Flow Control Status:\n");
-            fprintf(stderr, "  - Current task index:  %d\n", ring->current_index);
-            fprintf(stderr, "  - Last task alive:     %d\n", last_alive);
-            fprintf(stderr, "  - Active tasks:        %d\n", active_count);
-            fprintf(stderr, "  - Window size:         %d\n", ring->window_size);
-            fprintf(stderr, "  - Window utilization:  %.1f%%\n", 
-                    100.0 * active_count / ring->window_size);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "Root Cause:\n");
-            fprintf(stderr, "  Tasks cannot transition to CONSUMED state because:\n");
-            fprintf(stderr, "  - fanout_count includes 1 for the owning scope\n");
-            fprintf(stderr, "  - scope_end() requires orchestrator to continue\n");
-            fprintf(stderr, "  - But orchestrator is blocked waiting for task ring space\n");
-            fprintf(stderr, "  This creates a circular dependency (deadlock).\n");
-            fprintf(stderr, "\n");
-            fprintf(stderr, "Solution:\n");
-            fprintf(stderr, "  Current task_window_size: %d\n", ring->window_size);
-            fprintf(stderr, "  Default PTO2_TASK_WINDOW_SIZE: %d\n", PTO2_TASK_WINDOW_SIZE);
-            fprintf(stderr, "  Recommended: %d (at least 2x current active tasks)\n", 
-                    active_count * 2);
-            fprintf(stderr, "\n");
-            fprintf(stderr, "  Option 1: Change PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h\n");
-            fprintf(stderr, "  Option 2: Use pto2_runtime_create_threaded_custom() with larger\n");
-            fprintf(stderr, "            task_window_size parameter.\n");
-            fprintf(stderr, "========================================\n");
-            fprintf(stderr, "\n");
+            LOG_ERROR("========================================");
+            LOG_ERROR("FATAL: Flow Control Deadlock Detected!");
+            LOG_ERROR("========================================");
+            LOG_ERROR("Task Ring is FULL and no progress after %d spins.", spin_count);
+            LOG_ERROR("Flow Control Status:");
+            LOG_ERROR("  - Current task index:  %d", ring->current_index);
+            LOG_ERROR("  - Last task alive:     %d", last_alive);
+            LOG_ERROR("  - Active tasks:        %d", active_count);
+            LOG_ERROR("  - Window size:         %d", ring->window_size);
+            LOG_ERROR("  - Window utilization:  %.1f%%", 100.0 * active_count / ring->window_size);
+            LOG_ERROR("Root Cause:");
+            LOG_ERROR("  Tasks cannot transition to CONSUMED state because:");
+            LOG_ERROR("  - fanout_count includes 1 for the owning scope");
+            LOG_ERROR("  - scope_end() requires orchestrator to continue");
+            LOG_ERROR("  - But orchestrator is blocked waiting for task ring space");
+            LOG_ERROR("  This creates a circular dependency (deadlock).");
+            LOG_ERROR("Solution:");
+            LOG_ERROR("  Current task_window_size: %d", ring->window_size);
+            LOG_ERROR("  Default PTO2_TASK_WINDOW_SIZE: %d", PTO2_TASK_WINDOW_SIZE);
+            LOG_ERROR("  Recommended: %d (at least 2x current active tasks)", active_count * 2);
+            LOG_ERROR("  Option 1: Change PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
+            LOG_ERROR("  Option 2: Use pto2_runtime_create_threaded_custom() with larger");
+            LOG_ERROR("            task_window_size parameter.");
+            LOG_ERROR("========================================");
             
             // Abort program
             exit(1);

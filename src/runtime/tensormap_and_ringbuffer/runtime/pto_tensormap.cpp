@@ -15,11 +15,11 @@
 
 #include "pto_tensormap.h"
 
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "common.h"
+#include "common/unified_log.h"
 #include "pto_orchestrator.h"
 #include "tensor.h"
 
@@ -452,18 +452,18 @@ void pto2_tensormap_print_stats(PTO2TensorMap* tm) {
         }
     }
 
-    printf("=== TensorMap Statistics ===\n");
-    printf("Pool size:           %d\n", tm->pool_size);
-    printf("Pool next entry idx: %d\n", tm->next_entry_idx);
-    printf("Pool free_num:       %d\n", tm->free_num);
-    printf("Num buckets:         %d\n", tm->num_buckets);
-    printf("Valid entries:       %d\n", valid);
-    printf("Stale entries:       %d\n", stale);
-    printf("Empty buckets:       %d\n", empty_buckets);
-    printf("Max chain len:       %d\n", max_chain);
-    printf("Avg chain len:       %.2f\n", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
-    printf("Last task alive:     %d\n", tm->last_task_alive);
-    printf("============================\n");
+    LOG_INFO("=== TensorMap Statistics ===");
+    LOG_INFO("Pool size:           %d", tm->pool_size);
+    LOG_INFO("Pool next entry idx: %d", tm->next_entry_idx);
+    LOG_INFO("Pool free_num:       %d", tm->free_num);
+    LOG_INFO("Num buckets:         %d", tm->num_buckets);
+    LOG_INFO("Valid entries:       %d", valid);
+    LOG_INFO("Stale entries:       %d", stale);
+    LOG_INFO("Empty buckets:       %d", empty_buckets);
+    LOG_INFO("Max chain len:       %d", max_chain);
+    LOG_INFO("Avg chain len:       %.2f", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
+    LOG_INFO("Last task alive:     %d", tm->last_task_alive);
+    LOG_INFO("============================");
 }
 
 int32_t pto2_tensormap_valid_count(PTO2TensorMap* tm) {
