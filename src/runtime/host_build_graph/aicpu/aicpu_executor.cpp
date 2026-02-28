@@ -2,7 +2,6 @@
 #include <cstdint>
 #include <mutex>
 
-#include "aicpu/aicpu_regs.h"  // Register-based communication
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/performance_collector_aicpu.h"

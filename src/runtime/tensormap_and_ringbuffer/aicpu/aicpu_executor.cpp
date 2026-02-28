@@ -34,7 +34,6 @@
 // Register-based communication
 #include "common/platform_config.h"
 #include "aicpu/platform_regs.h"
-#include "aicpu/aicpu_regs.h"
 
 // Scheduler profiling helper
 #ifndef PTO2_ORCH_PROFILING
