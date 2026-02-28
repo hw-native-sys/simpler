@@ -179,7 +179,7 @@ def paged_attention(
             pij = torch.exp(sij - mij)
             pij = pij.masked_fill(~valid_mask, 0.0)
             pij = pij.masked_fill(~batch_mask, 0.0)
-            pij = pij.to(torch.bfloat16).to(torch.float32)
+            pij = pij.to(torch.float16).to(torch.float32)
             lij = pij.sum(dim=-1, keepdim=True)
 
             oi_new = torch.bmm(pij, vj_all)
