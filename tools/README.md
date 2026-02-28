@@ -16,7 +16,7 @@
 
 ### 功能概述
 
-`swimlane_converter.py` 将 PTO Runtime 的性能分析数据（`perf_swimlane_*.json`）转换为可在 Perfetto 跟踪查看器（https://ui.perfetto.dev/）中可视化的格式。同时提供按函数分组的任务执行统计分析。
+`swimlane_converter.py` 将 PTO Runtime 的性能分析数据（`perf_swimlane_*.json`）转换为可在 Perfetto 跟踪查看器（https://ui.perfetto.dev/）中可视化的格式。同时提供按函数分组的任务执行统计分析，并在解析到 device log 时输出 scheduler overhead deep-dive 报告。
 
 ### 基本用法
 
@@ -34,6 +34,9 @@ python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -
 python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
+# 使用指定 device id 自动选择 device log（device-<id>）
+python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -d 0
+
 # 详细模式（用于调试）
 python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -v
 ```
@@ -45,12 +48,25 @@ python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -
 | `input` | | 输入 JSON 文件（perf_swimlane_*.json）。如果省略，使用 outputs/ 中最新的文件 |
 | `--output` | `-o` | 输出 JSON 文件（默认：outputs/merged_swimlane_<timestamp>.json） |
 | `--kernel-config` | `-k` | kernel_config.py 文件路径，用于函数名映射 |
-| `--device-log` | | 设备日志文件路径，用于提取 scheduler CPU 开销 |
+| `--device-log` | | 设备日志文件/目录/glob 覆盖输入（优先级最高） |
+| `--device-id` | `-d` | 指定 device id，从 `device-<id>` 目录自动选择日志 |
 | `--verbose` | `-v` | 启用详细输出 |
+
+### device log 选择优先级
+
+`swimlane_converter.py` 和 `sched_overhead_analysis.py` 使用一致的解析规则：
+
+1. `--device-log`（文件/目录/glob）显式覆盖
+2. `-d/--device-id` 对应 `device-<id>` 目录
+3. 自动扫描 `device-*`，选择最接近 perf 时间戳的 `.log`
+
+log root 解析顺序：
+- `$ASCEND_WORK_PATH/log/debug/`
+- `~/ascend/log/debug/`（fallback）
 
 ### 输出内容
 
-工具生成两类输出：
+工具生成三类输出：
 
 #### 1. Perfetto JSON 文件
 
@@ -67,7 +83,15 @@ python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -
 - **Head/Tail OH**：调度头部/尾部开销
 - **Exec_%**：Exec / Latency 百分比（kernel 利用率）
 
-传入 `--device-log` 时，还会输出 Sched CPU（AICPU scheduler 线程实际 CPU 时间 per task）。
+解析到 device log 时，还会输出 Sched CPU（AICPU scheduler 线程实际 CPU 时间 per task）。
+
+#### 3. Scheduler overhead deep-dive（自动）
+
+当 device log 成功解析后，`swimlane_converter.py` 会直接调用 `sched_overhead_analysis` 的分析逻辑，并在同一次运行中输出：
+
+- Part 1: Per-task time breakdown
+- Part 2: AICPU scheduler loop breakdown
+- Part 3: Tail OH distribution & cause analysis
 
 ### 与 run_example.py 集成
 
@@ -84,8 +108,10 @@ python examples/scripts/run_example.py \
 测试通过后，工具将：
 1. 自动检测 outputs/ 中最新的 `perf_swimlane_*.json`
 2. 从 `-k` 指定的 kernel_config.py 加载函数名
-3. 生成 `merged_swimlane_*.json` 用于可视化
-4. 将任务统计信息打印到控制台
+3. 把运行时有效 device id（`-d`）透传给 `swimlane_converter.py`
+4. 自动解析 device log 并输出选择策略
+5. 生成 `merged_swimlane_*.json` 用于可视化
+6. 将任务统计与 scheduler overhead deep-dive 报告打印到控制台
 
 ---
 
@@ -105,6 +131,9 @@ python examples/scripts/run_example.py \
 # 自动选取最新的 perf 数据和设备日志
 python3 tools/sched_overhead_analysis.py
 
+# 指定 device id 自动选取 device-<id> 日志
+python3 tools/sched_overhead_analysis.py --perf-json outputs/perf_swimlane_20260210_143526.json -d 0
+
 # 指定文件
 python3 tools/sched_overhead_analysis.py \
     --perf-json outputs/perf_swimlane_20260210_143526.json \
@@ -116,7 +145,8 @@ python3 tools/sched_overhead_analysis.py \
 | 选项 | 说明 |
 |------|------|
 | `--perf-json` | perf_swimlane_*.json 文件路径。省略时自动选取 outputs/ 中最新的文件 |
-| `--device-log` | 设备日志文件路径。省略时自动选取 ~/ascend/log/debug/device-0/ 中最新的 .log |
+| `--device-log` | 设备日志文件/目录/glob 覆盖输入（优先级最高） |
+| `-d, --device-id` | 指定 device id，从 `device-<id>` 自动选取日志 |
 
 ### 输出内容
 
@@ -320,6 +350,14 @@ python3 tools/perf_to_mermaid.py -k ./kernels/kernel_config.py
 ### 错误：Unsupported version
 - 工具仅支持版本 1 的性能分析数据格式
 - 使用最新的 runtime 重新生成性能分析数据
+
+### 错误：Perf JSON missing required fields for scheduler overhead analysis
+- 该错误表示输入的 `perf_swimlane_*.json` 缺少 deep-dive 分析需要的字段（通常是 `dispatch_time_us` / `finish_time_us`）
+- `swimlane_converter.py` 的基础转换可继续成功，但 deep-dive 会跳过或失败
+- 处理路径：
+  1. 使用 `--enable-profiling` 重新跑一次，生成新的 `outputs/perf_swimlane_*.json`
+  2. 重新执行 `swimlane_converter.py` 或 `sched_overhead_analysis.py`
+  3. 检查 JSON 中每个 task 是否包含 `dispatch_time_us` 和 `finish_time_us`
 
 ### Mermaid 图在 GitHub 上不显示
 - 确保文件是 `.md` 扩展名

@@ -20,6 +20,16 @@ from pathlib import Path
 from datetime import datetime
 import importlib.util
 
+try:
+    from device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
+except ImportError:
+    from tools.device_log_resolver import infer_device_id_from_log_path, resolve_device_log_path
+
+try:
+    from sched_overhead_analysis import parse_scheduler_threads, run_analysis as run_sched_overhead_analysis
+except ImportError:
+    from tools.sched_overhead_analysis import parse_scheduler_threads, run_analysis as run_sched_overhead_analysis
+
 
 def read_perf_data(filepath):
     """Read performance data from JSON file.
@@ -111,23 +121,23 @@ def parse_sched_cpu_from_device_log(log_path, task_count):
     Returns:
         float: scheduler_us_per_task, or None if parsing failed / file missing
     """
-    import re
     path = Path(log_path)
     if not path.exists() or task_count <= 0:
         return None
-    pattern = re.compile(r'Thread \d+: completed=\d+ tasks in ([\d.]+)us')
-    totals = []
+
     try:
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
-            for line in f:
-                m = pattern.search(line)
-                if m:
-                    totals.append(float(m.group(1)))
+        threads = parse_scheduler_threads(path)
     except Exception:
         return None
-    if not totals:
+
+    if not threads:
         return None
-    return sum(totals) / task_count
+
+    total_sched_cpu_us = sum(t.get('total_us', 0.0) for t in threads.values())
+    if total_sched_cpu_us <= 0:
+        return None
+
+    return total_sched_cpu_us / task_count
 
 
 def print_task_statistics(tasks, func_id_to_name=None, sched_cpu_us_per_task=None):
@@ -531,6 +541,7 @@ Examples:
   %(prog)s perf_swimlane_20260210_143526.json   # Output: outputs/merged_swimlane_20260210_143526.json
   %(prog)s perf_swimlane_20260210_143526.json -o custom_output.json
   %(prog)s perf_swimlane_20260210_143526.json -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
+  %(prog)s perf_swimlane_20260210_143526.json -d 0
   %(prog)s perf_swimlane_20260210_143526.json -v
         """
     )
@@ -538,7 +549,8 @@ Examples:
     parser.add_argument('input', nargs='?', help='Input JSON file (.json). If not specified, uses the latest perf_swimlane_*.json file in outputs/ directory')
     parser.add_argument('-o', '--output', help='Output JSON file (default: outputs/merged_swimlane_<timestamp>.json)')
     parser.add_argument('-k', '--kernel-config', help='Path to kernel_config.py file for func_id to function name mapping')
-    parser.add_argument('--device-log', help='Path to device log file to extract scheduler loop overhead (PTO2 scheduler stats total=...us per thread)')
+    parser.add_argument('--device-log', help='Device log file/path/glob override used for scheduler analysis')
+    parser.add_argument('-d', '--device-id', help='Device id for auto-selection from device-<id>')
     parser.add_argument('-v', '--verbose', action='store_true', help='Verbose output')
 
     args = parser.parse_args()
@@ -619,6 +631,13 @@ Examples:
             outputs_dir.mkdir(exist_ok=True)  # Ensure outputs directory exists
             output_path = outputs_dir / f"merged_swimlane_{timestamp_part}.json"
 
+        # Resolve device log path for scheduler analysis
+        resolved_device_log, log_strategy = resolve_device_log_path(
+            device_id=args.device_id,
+            device_log=args.device_log,
+            perf_path=input_path,
+        )
+
         # Generate Perfetto JSON
         generate_chrome_trace_json(data['tasks'], str(output_path), func_names, args.verbose)
 
@@ -627,15 +646,44 @@ Examples:
         print(f"  Output: {output_path}")
         print(f"\nTo visualize: Open https://ui.perfetto.dev/ and drag in {output_path}")
 
+        if resolved_device_log is not None:
+            print(f"\nDevice log: {resolved_device_log}")
+            print(f"Selection: {log_strategy}")
+            inferred_device_id = infer_device_id_from_log_path(resolved_device_log)
+            if inferred_device_id is not None:
+                print(f"Inferred Device ID: {inferred_device_id}")
+        else:
+            print(f"\nDevice log: (not resolved)")
+            print(f"Selection: {log_strategy}")
+
         # Optional: parse sched CPU from device log
         sched_cpu_us = None
-        if args.device_log:
-            sched_cpu_us = parse_sched_cpu_from_device_log(args.device_log, len(data['tasks']))
+        if resolved_device_log is not None:
+            sched_cpu_us = parse_sched_cpu_from_device_log(resolved_device_log, len(data['tasks']))
             if args.verbose and sched_cpu_us is not None:
                 print(f"  Parsed sched CPU from device log: {sched_cpu_us:.2f} us/task")
 
         # Print task statistics (incl. task execution vs scheduler overhead)
         print_task_statistics(data['tasks'], func_names, sched_cpu_us_per_task=sched_cpu_us)
+
+        # Integrated deep-dive overhead analysis
+        if resolved_device_log is not None:
+            print("\n=== Scheduler Overhead Deep Dive ===")
+            deep_dive_rc = run_sched_overhead_analysis(
+                input_path,
+                resolved_device_log,
+                print_sources=True,
+                selection_strategy=log_strategy,
+            )
+            if deep_dive_rc != 0:
+                print(
+                    "Warning: Scheduler overhead deep-dive failed; conversion output is still available. "
+                    "Check the detailed error above for root cause and fix route "
+                    "(typically missing dispatch_time_us/finish_time_us in perf JSON).",
+                    file=sys.stderr,
+                )
+        else:
+            print("\n[Info] Scheduler overhead deep-dive skipped (no device log resolved).")
 
         return 0
 

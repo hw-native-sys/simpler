@@ -324,7 +324,7 @@ class CodeRunner:
     Args:
         kernels_dir: Path to kernels directory containing kernel_config.py
         golden_path: Path to golden.py script
-        device_id: Device ID (defaults to PTO_DEVICE_ID env var or 0)
+        device_id: Device ID (defaults to 0)
         platform: Platform name ("a2a3" for hardware, "a2a3sim" for simulation, default: "a2a3")
     """
 

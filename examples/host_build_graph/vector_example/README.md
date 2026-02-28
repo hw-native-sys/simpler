@@ -78,7 +78,7 @@ python examples/scripts/run_example.py \
   -k examples/host_build_graph/vector_example/kernels \
   -g examples/host_build_graph/vector_example/golden.py \
   -p a2a3 \
-  -d 9
+  -d 0
 
 # With verbose output
 python examples/scripts/run_example.py \
@@ -176,8 +176,7 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 # Or you can set it manually if you have it elsewhere:
 # export PTO_ISA_ROOT=/path/to/pto-isa
 
-# Optional
-export PTO_DEVICE_ID=0
+# Optional: choose device via CLI, e.g. `-d 0`
 ```
 
 ### For Simulation Platform (a2a3sim)

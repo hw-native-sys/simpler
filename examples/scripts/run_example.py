@@ -82,8 +82,8 @@ Golden.py interface:
     parser.add_argument(
         "-d", "--device",
         type=int,
-        default=None,
-        help="Device ID (default: from PTO_DEVICE_ID env or 0)"
+        default=0,
+        help="Device ID (default: 0)"
     )
 
     parser.add_argument(
@@ -196,7 +196,14 @@ Golden.py interface:
                 import subprocess
                 try:
                     # Call swimlane_converter.py with kernel_config.py path
-                    cmd = [sys.executable, str(swimlane_script), "-k", str(kernel_config_path)]
+                    cmd = [
+                        sys.executable,
+                        str(swimlane_script),
+                        "-k",
+                        str(kernel_config_path),
+                        "-d",
+                        str(args.device),
+                    ]
                     if log_level_str == "debug":
                         cmd.append("-v")
 

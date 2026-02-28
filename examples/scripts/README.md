@@ -299,8 +299,7 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/cann-8.5.0
 # Override if needed:
 # export PTO_ISA_ROOT=/path/to/pto-isa
 
-# Optional
-export PTO_DEVICE_ID=0
+# Optional: choose device via CLI, e.g. `-d 0`
 ```
 
 ### a2a3sim Platform (Simulation)
