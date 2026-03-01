@@ -36,7 +36,13 @@ int PerformanceCollector::initialize(Runtime& runtime,
 
     LOG_INFO("Initializing performance profiling");
 
+    if (num_aicore <= 0 || num_aicore > PLATFORM_MAX_CORES) {
+        LOG_ERROR("Invalid number of AICores: %d (max=%d)", num_aicore, PLATFORM_MAX_CORES);
+        return -1;
+    }
+
     device_id_ = device_id;
+    num_aicore_ = num_aicore;
 
     // Step 1: Calculate total memory size
     size_t total_size = calc_perf_data_size(num_aicore);
@@ -125,7 +131,7 @@ int PerformanceCollector::initialize(Runtime& runtime,
     return 0;
 }
 
-void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) {
+void PerformanceCollector::poll_and_collect(int expected_tasks) {
     if (perf_shared_mem_host_ == nullptr) {
         return;
     }
@@ -134,6 +140,7 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
 
     PerfDataHeader* header = get_perf_header(perf_shared_mem_host_);
     DoubleBuffer* buffers = get_double_buffers(perf_shared_mem_host_);
+    int num_aicore = num_aicore_;
 
     const auto timeout_duration = std::chrono::seconds(PLATFORM_PROF_TIMEOUT_SECONDS);
     std::optional<std::chrono::steady_clock::time_point> idle_start;
@@ -168,6 +175,7 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
     int buffers_processed = 0;
 
     collected_perf_records_.clear();
+    collected_perf_records_.resize(num_aicore);
     idle_start.reset();
     int empty_poll_count = 0;
     int last_logged_expected = -1;
@@ -237,7 +245,7 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
         LOG_DEBUG("  Records in buffer: %u", count);
 
         for (uint32_t i = 0; i < count && i < PLATFORM_PROF_BUFFER_SIZE; i++) {
-            collected_perf_records_.push_back(buf->records[i]);
+            collected_perf_records_[core_index].push_back(buf->records[i]);
             total_records_collected++;
         }
 
@@ -268,7 +276,14 @@ void PerformanceCollector::poll_and_collect(int num_aicore, int expected_tasks) 
 
 int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     // Step 1: Validate collected data
-    if (collected_perf_records_.empty()) {
+    bool has_any_records = false;
+    for (const auto& core_records : collected_perf_records_) {
+        if (!core_records.empty()) {
+            has_any_records = true;
+            break;
+        }
+    }
+    if (!has_any_records) {
         LOG_WARN("Warning: No performance data to export.");
         return -1;
     }
@@ -282,23 +297,39 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         }
     }
 
-    // Step 3: Sort records by task_id
-    std::vector<PerfRecord> sorted_records = collected_perf_records_;
-    std::sort(sorted_records.begin(), sorted_records.end(),
-              [](const PerfRecord& a, const PerfRecord& b) {
-                  return a.task_id < b.task_id;
+    // Step 3: Flatten per-core vectors into tagged records with core_id derived from index
+    struct TaggedRecord {
+        const PerfRecord* record;
+        uint32_t core_id;
+    };
+    std::vector<TaggedRecord> tagged_records;
+    size_t total_records = 0;
+    for (const auto& core_records : collected_perf_records_) {
+        total_records += core_records.size();
+    }
+    tagged_records.reserve(total_records);
+    for (size_t core_idx = 0; core_idx < collected_perf_records_.size(); core_idx++) {
+        for (const auto& record : collected_perf_records_[core_idx]) {
+            tagged_records.push_back({&record, static_cast<uint32_t>(core_idx)});
+        }
+    }
+
+    // Sort by task_id
+    std::sort(tagged_records.begin(), tagged_records.end(),
+              [](const TaggedRecord& a, const TaggedRecord& b) {
+                  return a.record->task_id < b.record->task_id;
               });
 
     // Step 4: Calculate base time (minimum kernel_ready_time)
     uint64_t base_time_cycles = UINT64_MAX;
-    for (const auto& record : sorted_records) {
-        if (record.kernel_ready_time < base_time_cycles) {
-            base_time_cycles = record.kernel_ready_time;
+    for (const auto& tagged : tagged_records) {
+        if (tagged.record->kernel_ready_time < base_time_cycles) {
+            base_time_cycles = tagged.record->kernel_ready_time;
         }
-        if (record.dispatch_time < base_time_cycles && record.dispatch_time > 0) {
-            base_time_cycles = record.dispatch_time;
+        if (tagged.record->dispatch_time < base_time_cycles && tagged.record->dispatch_time > 0) {
+            base_time_cycles = tagged.record->dispatch_time;
             LOG_WARN("Timestamp violation: dispatch_time (%lu) < base_time (%lu) for task %u, using dispatch_time as new base_time",
-                        record.dispatch_time, base_time_cycles, record.task_id);
+                        tagged.record->dispatch_time, base_time_cycles, tagged.record->task_id);
         }
     }
 
@@ -322,8 +353,9 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     outfile << "  \"version\": 1,\n";
     outfile << "  \"tasks\": [\n";
 
-    for (size_t i = 0; i < sorted_records.size(); ++i) {
-        const auto& record = sorted_records[i];
+    for (size_t i = 0; i < tagged_records.size(); ++i) {
+        const auto& tagged = tagged_records[i];
+        const auto& record = *tagged.record;
 
         // Convert times to microseconds
         double start_us = cycles_to_us(record.start_time - base_time_cycles);
@@ -338,7 +370,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         outfile << "    {\n";
         outfile << "      \"task_id\": " << record.task_id << ",\n";
         outfile << "      \"func_id\": " << record.func_id << ",\n";
-        outfile << "      \"core_id\": " << record.core_id << ",\n";
+        outfile << "      \"core_id\": " << tagged.core_id << ",\n";
         outfile << "      \"core_type\": \"" << core_type_str << "\",\n";
         outfile << "      \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us << ",\n";
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
@@ -347,16 +379,18 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
         outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
         outfile << "      \"fanout\": [";
-        for (int j = 0; j < record.fanout_count; ++j) {
+        int safe_fanout_count = (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT)
+                                ? record.fanout_count : 0;
+        for (int j = 0; j < safe_fanout_count; ++j) {
             outfile << record.fanout[j];
-            if (j < record.fanout_count - 1) {
+            if (j < safe_fanout_count - 1) {
                 outfile << ", ";
             }
         }
         outfile << "],\n";
         outfile << "      \"fanout_count\": " << record.fanout_count << "\n";
         outfile << "    }";
-        if (i < sorted_records.size() - 1) {
+        if (i < tagged_records.size() - 1) {
             outfile << ",";
         }
         outfile << "\n";
@@ -367,7 +401,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     // Step 9: Close file
     outfile.close();
 
-    uint32_t record_count = static_cast<uint32_t>(sorted_records.size());
+    uint32_t record_count = static_cast<uint32_t>(tagged_records.size());
     LOG_INFO("=== JSON Export Complete ===");
     LOG_INFO("File: %s", filepath.c_str());
     LOG_INFO("Records: %u", record_count);

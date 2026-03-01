@@ -116,7 +116,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
                 perf_aicore_record_task(perf_buf, payload->task_id, payload->kernel_id,
                                        start_time, end_time, kernel_ready_time,
-                                       block_idx, core_type);
+                                       core_type);
             }
 
             last_task_id = task_id;

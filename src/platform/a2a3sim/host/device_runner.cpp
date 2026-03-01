@@ -276,8 +276,8 @@ int DeviceRunner::run(Runtime& runtime,
     // Poll and collect performance data during execution (if enabled)
     std::thread collector_thread;
     if (runtime.enable_profiling) {
-        collector_thread = std::thread([this, &runtime, num_aicore]() {
-            poll_and_collect_performance_data(num_aicore, runtime.get_task_count());
+        collector_thread = std::thread([this, &runtime]() {
+            poll_and_collect_performance_data(runtime.get_task_count());
         });
     }
 
@@ -489,8 +489,8 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
                                        alloc_cb, nullptr, nullptr);
 }
 
-void DeviceRunner::poll_and_collect_performance_data(int num_aicore, int expected_tasks) {
-    perf_collector_.poll_and_collect(num_aicore, expected_tasks);
+void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
+    perf_collector_.poll_and_collect(expected_tasks);
 }
 
 int DeviceRunner::export_swimlane_json(const std::string& output_path) {

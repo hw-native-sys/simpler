@@ -140,10 +140,9 @@ public:
      * This is a synchronous polling function that should be called after
      * launching kernels but before thread synchronization.
      *
-     * @param num_cores Number of cores
      * @param expected_tasks Expected total number of tasks (used for exit condition)
      */
-    void poll_and_collect_performance_data(int num_cores, int expected_tasks);
+    void poll_and_collect_performance_data(int expected_tasks);
 
     /**
      * Export performance data to merged_swimlane.json

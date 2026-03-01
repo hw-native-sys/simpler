@@ -407,7 +407,7 @@ int DeviceRunner::run(Runtime& runtime,
 
     // Poll and collect performance data (must be before stream sync)
     if (runtime.enable_profiling) {
-        poll_and_collect_performance_data(runtime.worker_count, runtime.get_task_count());
+        poll_and_collect_performance_data(runtime.get_task_count());
     }
 
     std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
@@ -682,8 +682,8 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
                                        alloc_cb, register_cb, &mem_alloc_);
 }
 
-void DeviceRunner::poll_and_collect_performance_data(int num_aicore, int expected_tasks) {
-    perf_collector_.poll_and_collect(num_aicore, expected_tasks);
+void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
+    perf_collector_.poll_and_collect(expected_tasks);
 }
 
 int DeviceRunner::export_swimlane_json(const std::string& output_path) {

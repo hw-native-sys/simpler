@@ -83,7 +83,7 @@ log root 解析顺序：
 - **Head/Tail OH**：调度头部/尾部开销
 - **Exec_%**：Exec / Latency 百分比（kernel 利用率）
 
-解析到 device log 时，还会输出 Sched CPU（AICPU scheduler 线程实际 CPU 时间 per task）。
+解析到 device log 时，还会输出 Sched CPU（AICPU scheduler 线程实际 CPU 时间 per task）和 Exec/Sched_CPU 比率。
 
 #### 3. Scheduler overhead deep-dive（自动）
 

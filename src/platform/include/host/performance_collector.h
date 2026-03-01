@@ -106,10 +106,9 @@ public:
     /**
      * Poll and collect performance data from shared memory
      *
-     * @param num_aicore Number of cores
      * @param expected_tasks Expected total number of tasks (0 = auto-detect from header)
      */
-    void poll_and_collect(int num_aicore, int expected_tasks = 0);
+    void poll_and_collect(int expected_tasks = 0);
 
     /**
      * Export performance data to Chrome Trace Event Format
@@ -139,7 +138,7 @@ public:
     /**
      * Get collected records (for testing)
      */
-    const std::vector<PerfRecord>& get_records() const { return collected_perf_records_; }
+    const std::vector<std::vector<PerfRecord>>& get_records() const { return collected_perf_records_; }
 
 private:
     // Shared memory pointers
@@ -148,8 +147,11 @@ private:
     bool was_registered_{false};           // True if register_cb was called successfully
     int device_id_{-1};
 
-    // Collected data
-    std::vector<PerfRecord> collected_perf_records_;
+    // Configuration
+    int num_aicore_{0};
+
+    // Collected data (per-core vectors, indexed by core_index)
+    std::vector<std::vector<PerfRecord>> collected_perf_records_;
 };
 
 #endif  // PLATFORM_HOST_PERFORMANCE_COLLECTOR_H_

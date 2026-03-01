@@ -33,7 +33,6 @@
  * @param start_time Start timestamp
  * @param end_time End timestamp
  * @param kernel_ready_time Kernel ready timestamp
- * @param core_id Core ID
  * @param core_type Core type (AIC/AIV)
  */
 __aicore__ __attribute__((always_inline))
@@ -44,7 +43,6 @@ static inline void perf_aicore_record_task(
     uint64_t start_time,
     uint64_t end_time,
     uint64_t kernel_ready_time,
-    int core_id,
     CoreType core_type) {
 
     // Read current buffer count
@@ -63,7 +61,6 @@ static inline void perf_aicore_record_task(
     record->kernel_ready_time = kernel_ready_time;
     record->task_id = task_id;
     record->func_id = func_id;
-    record->core_id = core_id;
     record->core_type = core_type;
 
     perf_buf->count = idx + 1;

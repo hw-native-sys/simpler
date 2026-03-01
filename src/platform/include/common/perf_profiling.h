@@ -83,7 +83,6 @@ struct PerfRecord {
     // Task identification
     uint32_t task_id;         // Task unique identifier
     uint32_t func_id;         // Kernel function identifier
-    uint32_t core_id;         // Physical core ID (0-71)
     CoreType core_type;       // Core type (AIC/AIV)
 
     // Dependency relationship (fanout only)

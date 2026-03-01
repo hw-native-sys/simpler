@@ -41,6 +41,34 @@ if python_dir.exists():
 logger = logging.getLogger(__name__)
 
 
+def _get_device_log_dir(device_id):
+    """Return the device log directory using the same logic as device_log_resolver."""
+    ascend_work_path = os.environ.get("ASCEND_WORK_PATH")
+    if ascend_work_path:
+        root = Path(ascend_work_path).expanduser() / "log" / "debug"
+        if root.exists():
+            return root / f"device-{device_id}"
+    return Path.home() / "ascend" / "log" / "debug" / f"device-{device_id}"
+
+
+def _wait_for_new_device_log(log_dir, pre_run_logs, timeout=15, interval=0.5):
+    """Wait for a new device log file that wasn't present before the run.
+
+    CANN dlog writes device logs asynchronously, so the file may appear
+    a few seconds after the run completes.
+    """
+    import time
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if log_dir.exists():
+            current_logs = set(log_dir.glob("*.log"))
+            new_logs = current_logs - pre_run_logs
+            if new_logs:
+                return max(new_logs, key=lambda p: p.stat().st_mtime)
+        time.sleep(interval)
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run PTO runtime test with kernel config and golden script",
@@ -200,6 +228,15 @@ Golden.py interface:
             case_name=args.case,
         )
 
+        # Snapshot existing device logs before the run so we can identify the
+        # new log created by this run (CANN writes device logs asynchronously).
+        pre_run_device_logs = set()
+        device_log_dir = None
+        if args.enable_profiling and args.platform == "a2a3":
+            device_log_dir = _get_device_log_dir(args.device)
+            if device_log_dir.exists():
+                pre_run_device_logs = set(device_log_dir.glob("*.log"))
+
         runner.run()
         logger.info("=" * 60)
         logger.info("TEST PASSED")
@@ -214,15 +251,25 @@ Golden.py interface:
             if swimlane_script.exists():
                 import subprocess
                 try:
-                    # Call swimlane_converter.py with kernel_config.py path
                     cmd = [
                         sys.executable,
                         str(swimlane_script),
                         "-k",
                         str(kernel_config_path),
-                        "-d",
-                        str(args.device),
                     ]
+
+                    # Find the device log created by this run via snapshot diff
+                    if device_log_dir is not None:
+                        device_log_file = _wait_for_new_device_log(
+                            device_log_dir, pre_run_device_logs)
+                        if device_log_file:
+                            cmd += ["--device-log", str(device_log_file)]
+                        else:
+                            logger.warning("No new device log found, falling back to device-id")
+                            cmd += ["-d", str(args.device)]
+                    else:
+                        cmd += ["-d", str(args.device)]
+
                     if log_level_str == "debug":
                         cmd.append("-v")
 
