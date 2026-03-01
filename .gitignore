@@ -15,7 +15,9 @@ venv/
 outputs
 
 # claude local settings
+.claude/settings.json
 .claude/settings.local.json
+.claude/worktrees
 
 # Git cloned dependencies (not tracked in repo)
 examples/scripts/_deps/

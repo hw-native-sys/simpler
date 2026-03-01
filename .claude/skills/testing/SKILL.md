@@ -1,4 +1,9 @@
-# Testing Guide
+---
+name: testing
+description: Testing guide and pre-commit testing strategy for PTO Runtime. Use when running tests, adding tests, or deciding what to test before committing.
+---
+
+# Testing
 
 ## Test Types
 
@@ -15,14 +20,95 @@ pytest tests -v
 # All simulation tests
 ./ci.sh -p a2a3sim
 
-# All hardware tests (specify device range)
-./ci.sh -p a2a3 -d 4-7 --parallel
+# All hardware tests (auto-detect idle devices — see Pre-Commit Testing Strategy)
+./ci.sh -p a2a3 -d <range>
+
+# Single runtime
+./ci.sh -p a2a3sim -r host_build_graph
 
 # Single example
 python examples/scripts/run_example.py \
     -k examples/host_build_graph/vector_example/kernels \
     -g examples/host_build_graph/vector_example/golden.py \
     -p a2a3sim
+```
+
+## Pre-Commit Testing Strategy
+
+When changed files require testing (C++, Python, or CMake), follow these steps to decide **what** to test and **how**.
+
+### Step 1 — Platform Availability
+
+```bash
+command -v npu-smi &>/dev/null
+```
+
+| Result | Platforms to test |
+| ------ | ----------------- |
+| Found | `a2a3sim` (simulation) **and** `a2a3` (hardware) |
+| Not found | `a2a3sim` only |
+
+### Step 2 — Test Scope
+
+Run `git diff --name-only` (or `git diff --cached --name-only` for staged changes) and match the **first** applicable rule:
+
+| Changed paths | Scope | Command pattern |
+| ------------- | ----- | --------------- |
+| `src/platform/*` | Full (all runtimes) | `./ci.sh -p <platform>` |
+| `src/runtime/<rt>/*` | Single runtime | `./ci.sh -p <platform> -r <rt>` |
+| `examples/<rt>/<ex>/*` | Single example | `python examples/scripts/run_example.py -k <ex>/kernels -g <ex>/golden.py -p <platform>` |
+| Mixed (spans multiple categories) | Escalate to the **widest** matching scope | — |
+
+### Step 3 — Parallel Strategy
+
+**Simulation (`a2a3sim`)**: based on CPU core count.
+
+```bash
+CORES=$(nproc)
+```
+
+| Condition | Action |
+| --------- | ------ |
+| `CORES >= 16` | Append `--parallel` |
+| `CORES < 16` | Run sequentially (omit `--parallel`) |
+
+**Hardware (`a2a3`)**: based on idle NPU device count (see Step 4).
+
+| Condition | Action |
+| --------- | ------ |
+| 2+ idle devices | Append `--parallel` |
+| 1 idle device | Run sequentially |
+
+### Step 4 — Device Detection (hardware only)
+
+When testing on `a2a3`, detect idle devices:
+
+```bash
+npu-smi info
+```
+
+Pick devices whose **HBM-Usage is 0** and find the **longest consecutive sub-range** (at most 4). Pass as `-d <start>-<end>` (or `-d <id>` if only one idle device). If no idle device is found, skip hardware testing and warn.
+
+### Decision Tree
+
+```
+git diff --name-only
+  │
+  ├─ Only docs/config? ──→ SKIP tests
+  │
+  └─ Code changed?
+       │
+       ├─ Determine SCOPE (Step 2)
+       │    ├─ platform   → full
+       │    ├─ runtime    → single runtime
+       │    └─ example    → single example
+       │
+       ├─ Sim:  nproc >= 16?        ──→ --parallel
+       ├─ Dev:  idle devices >= 2?  ──→ --parallel
+       │
+       └─ npu-smi found?
+            ├─ Yes → sim + device (idle devs, max 4)
+            └─ No  → sim only
 ```
 
 ## Adding a New Example or Device Test
@@ -102,3 +188,7 @@ RUNTIME_CONFIG = {
     "block_dim": 3,
 }
 ```
+
+## Related Skills
+
+- **`git-commit`** — Complete commit workflow (runs testing as a prerequisite)
