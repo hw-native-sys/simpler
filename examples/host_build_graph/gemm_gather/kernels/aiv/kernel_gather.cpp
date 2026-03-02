@@ -4,11 +4,12 @@
  * out = src0[src1] with comm-isa shape: src0 (32, 1024) float, src1 (16, 64) int32, out (16, 64) float.
  * Reference: pto-comm-isa tests/npu/a2a3/src/st/testcase/tgather (runTGather1D).
  * Uses TGATHER on Vector pipe (PIPE_V).
+ * All logic in kernel_entry (same pattern as vector_example kernel_add.cpp) so set_flag/wait_flag
+ * are used only in __aicore__ context.
  */
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
-#include <pto/common/pto_tile.hpp>
 #include "tgather_common.h"
 
 using namespace pto;
@@ -21,8 +22,15 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-template <typename Tsrc0, typename Tsrc1, int kGRows0_, int kGCols0_, int kGRows1_, int kGCols1_>
-inline void runTGather1D_impl(__gm__ Tsrc0* out, __gm__ Tsrc0* src0, __gm__ Tsrc1* src1) {
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
+    __gm__ float* out = reinterpret_cast<__gm__ float*>(args[0]);
+    __gm__ float* src0 = reinterpret_cast<__gm__ float*>(args[1]);
+    __gm__ int32_t* src1 = reinterpret_cast<__gm__ int32_t*>(args[2]);
+
+    constexpr int kGRows0_ = GATHER_SRC0_ROWS;
+    constexpr int kGCols0_ = GATHER_SRC0_COLS;
+    constexpr int kGRows1_ = GATHER_SRC1_ROWS;
+    constexpr int kGCols1_ = GATHER_SRC1_COLS;
     constexpr int src0_row = kGRows0_;
     constexpr int src0_col = kGCols0_;
     constexpr int src1_row = kGRows1_;
@@ -32,17 +40,17 @@ inline void runTGather1D_impl(__gm__ Tsrc0* out, __gm__ Tsrc0* src0, __gm__ Tsrc
 
     using DynShapeDim5_src0 = pto::Shape<1, 1, 1, kGRows0_, kGCols0_>;
     using DynStridDim5_src0 = pto::Stride<1, 1, 1, kGCols0_, 1>;
-    using GlobalData_src0 = GlobalTensor<Tsrc0, DynShapeDim5_src0, DynStridDim5_src0>;
+    using GlobalData_src0 = GlobalTensor<float, DynShapeDim5_src0, DynStridDim5_src0>;
     using DynShapeDim5_src1 = pto::Shape<1, 1, 1, kGRows1_, kGCols1_>;
     using DynStridDim5_src1 = pto::Stride<1, 1, 1, kGCols1_, 1>;
-    using GlobalData_src1 = GlobalTensor<Tsrc1, DynShapeDim5_src1, DynStridDim5_src1>;
+    using GlobalData_src1 = GlobalTensor<int32_t, DynShapeDim5_src1, DynStridDim5_src1>;
     using DynShapeDim5_dst = pto::Shape<1, 1, 1, kGRows1_, kGCols1_>;
     using DynStridDim5_dst = pto::Stride<1, 1, 1, kGCols1_, 1>;
-    using GlobalData_dst = GlobalTensor<Tsrc0, DynShapeDim5_dst, DynStridDim5_dst>;
+    using GlobalData_dst = GlobalTensor<float, DynShapeDim5_dst, DynStridDim5_dst>;
 
-    using TileData_src0 = Tile<TileType::Vec, Tsrc0, kGRows0_, kGCols0_, BLayout::RowMajor, -1, -1>;
-    using TileData_src1 = Tile<TileType::Vec, Tsrc1, kGRows1_, kGCols1_, BLayout::RowMajor, -1, -1>;
-    using TileData_dst = Tile<TileType::Vec, Tsrc0, kGRows1_, kGCols1_, BLayout::RowMajor, -1, -1>;
+    using TileData_src0 = Tile<TileType::Vec, float, kGRows0_, kGCols0_, BLayout::RowMajor, -1, -1>;
+    using TileData_src1 = Tile<TileType::Vec, int32_t, kGRows1_, kGCols1_, BLayout::RowMajor, -1, -1>;
+    using TileData_dst = Tile<TileType::Vec, float, kGRows1_, kGCols1_, BLayout::RowMajor, -1, -1>;
 
     TileData_src0 src0Tile(src0_row, src0_col);
     TileData_src1 src1Tile(src1_row, src1_col);
@@ -64,14 +72,4 @@ inline void runTGather1D_impl(__gm__ Tsrc0* out, __gm__ Tsrc0* src0, __gm__ Tsrc
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(dstGlobal, dstTile);
-}
-
-extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
-    __gm__ float* out = reinterpret_cast<__gm__ float*>(args[0]);
-    __gm__ float* src0 = reinterpret_cast<__gm__ float*>(args[1]);
-    __gm__ int32_t* src1 = reinterpret_cast<__gm__ int32_t*>(args[2]);
-
-    runTGather1D_impl<float, int32_t,
-                      GATHER_SRC0_ROWS, GATHER_SRC0_COLS,
-                      GATHER_SRC1_ROWS, GATHER_SRC1_COLS>(out, src0, src1);
 }
