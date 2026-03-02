@@ -266,8 +266,6 @@ struct PTO2TaskDescriptor {
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
     void*    packed_buffer_end;   // End of packed buffer (for heap reclamation)
-    int32_t  output_index[PTO2_MAX_OUTPUTS]; // Offset of each output in params;
-    int32_t  num_outputs;         // Number of output buffers
 
     // Status flags
     bool     is_active;           // Task slot is in use

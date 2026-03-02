@@ -65,6 +65,7 @@ struct TensorData {
             this->shapes[i] = shapes[i];
             this->offsets[i] = offsets[i];
         }
+        ref_count = 1;
     }
 
     void init(const TensorData& other) {
@@ -77,6 +78,7 @@ struct TensorData {
             shapes[i] = other.shapes[i];
             offsets[i] = other.offsets[i];
         }
+        ref_count = 1;
     }
 
     void init_with_view(const TensorData& other, const uint64_t view_shapes[], const uint64_t view_offsets[]) {
@@ -89,6 +91,7 @@ struct TensorData {
             shapes[i] = view_shapes[i];
             offsets[i] = other.offsets[i] + view_offsets[i];
         }
+        ref_count = 1;
     }
 
     TensorData(TensorData&& other) = delete;
@@ -180,9 +183,7 @@ struct TensorData {
     bool is_same_memref(const TensorData& other) const { return buffer.addr == other.buffer.addr; }
 
     OverlapStatus is_overlap(const TensorData& pre_task_output) const {
-        if (!is_same_memref(pre_task_output)) {
-            return OverlapStatus::NO_OVERLAP;
-        }
+        debug_assert(is_same_memref(pre_task_output));
         debug_assert(version >= pre_task_output.version);
         if (version > pre_task_output.version) {
             return OverlapStatus::OTHER;
@@ -192,26 +193,20 @@ struct TensorData {
         // and offsets[i] + shapes[i] <= raw_shapes[i] is guaranteed by is_valid_tensor(),
         // so hyper-rectangle wrapping cannot happen.
         bool contains = true;
-        bool overlap = true;
         for (uint64_t i = 0; i < ndims; i++) {
             Segment input_range_dim_i{offsets[i], offsets[i] + shapes[i]};
             Segment output_range_dim_i{
                 pre_task_output.offsets[i], pre_task_output.offsets[i] + pre_task_output.shapes[i]};
             if (!input_range_dim_i.line_segment_intersection(output_range_dim_i)) {
-                overlap = false;
-                contains = false;
-                break;
+                return OverlapStatus::NO_OVERLAP;
             } else if (!input_range_dim_i.contains(output_range_dim_i)) {
                 contains = false;
             }
         }
         if (contains) {
             return OverlapStatus::COVERED;
-        } else if (overlap) {
-            return OverlapStatus::OTHER;
-        } else {
-            return OverlapStatus::NO_OVERLAP;
         }
+        return OverlapStatus::OTHER;
     }
 };
 
@@ -237,7 +232,6 @@ struct TensorPool {
             always_assert(next_index < TENSOR_DATA_MAX_SIZE);
             index = next_index++;
         }
-        data[index].ref_count = 1;
         return index;
     }
 
