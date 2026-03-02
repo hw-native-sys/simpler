@@ -4,10 +4,12 @@ Golden test for gemm_gather (a2a3).
 GEMM: C = A @ B, 64x64 float.
 Gather: out = src0[src1] (linear index), src0 (32, 1024), src1 (16, 64) int32, out (16, 64) float.
 Args: [A, B, C, src0, src1, out, size_A, size_B, size_C, size_src0, size_src1, size_out]
+code_runner passes torch tensors to compute_golden; use .numel() and .item() for compatibility.
 """
 
 import ctypes
 import numpy as np
+import torch
 
 __outputs__ = ["C", "out"]
 RTOL = 1e-3
@@ -61,6 +63,13 @@ def generate_inputs(params: dict) -> list:
     ]
 
 
+def _numel(x):
+    """Element count for both numpy and torch (code_runner passes torch tensors)."""
+    if hasattr(x, "numel") and callable(x.numel):
+        return x.numel()
+    return int(x.size)
+
+
 def compute_golden(tensors: dict, params: dict) -> None:
     A = tensors["A"].reshape(GEMM_TILE, GEMM_TILE)
     B = tensors["B"].reshape(GEMM_TILE, GEMM_TILE)
@@ -69,18 +78,19 @@ def compute_golden(tensors: dict, params: dict) -> None:
     src1 = tensors["src1"].reshape(GATHER_SRC1_ROWS, GATHER_SRC1_COLS)
     out = tensors["out"].reshape(GATHER_SRC1_ROWS, GATHER_SRC1_COLS)
 
-    # GEMM: C = A @ B
-    C[:] = np.matmul(A, B)
+    # GEMM: C = A @ B (tensors from code_runner are torch)
+    C.copy_(torch.matmul(A.float(), B.float()))
 
     # Gather: out[i,j] = src0.flatten()[src1[i,j]]
     src0_flat = src0.flatten()
+    n_src0 = _numel(src0_flat)
     for i in range(GATHER_SRC1_ROWS):
         for j in range(GATHER_SRC1_COLS):
-            idx = int(src1[i, j])
+            idx = int(src1[i, j].item() if hasattr(src1[i, j], "item") else src1[i, j])
             if idx < 0:
                 idx = 0
-            if idx >= src0_flat.size:
-                idx = src0_flat.size - 1
+            if idx >= n_src0:
+                idx = n_src0 - 1
             out[i, j] = src0_flat[idx]
 
     tensors["C"][:] = C.flatten()
