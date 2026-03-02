@@ -102,7 +102,7 @@ struct PTO2OrchestratorState {
             return NULL;
         }
 
-        void* buffer = pto2_heap_ring_alloc(&heap_ring, total_size);
+        void* buffer = heap_ring.pto2_heap_ring_alloc(total_size);
 
         buffers_allocated++;
         bytes_allocated += total_size;

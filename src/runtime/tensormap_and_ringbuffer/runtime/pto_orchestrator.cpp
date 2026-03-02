@@ -232,11 +232,11 @@ void pto2_add_consumer_to_producer(
     // Check if producer has already completed (scheduler mode)
     if (orch->scheduler) {
         PTO2SchedulerState* sched = orch->scheduler;
-        int32_t prod_slot = pto2_task_slot(sched, producer_id);
+        int32_t prod_slot = sched->pto2_task_slot(producer_id);
         int32_t prod_state = __atomic_load_n(&sched->task_state[prod_slot], __ATOMIC_ACQUIRE);
 
         if (prod_state >= PTO2_TASK_COMPLETED) {
-            int32_t cons_slot = pto2_task_slot(sched, consumer_id);
+            int32_t cons_slot = sched->pto2_task_slot(consumer_id);
             __atomic_fetch_add(&sched->fanin_refcount[cons_slot], 1, __ATOMIC_SEQ_CST);
         }
     }
@@ -250,7 +250,7 @@ void* pto2_alloc_packed_buffer(PTO2OrchestratorState* orch, int32_t total_size) 
         return NULL;
     }
 
-    void* buffer = pto2_heap_ring_alloc(&orch->heap_ring, total_size);
+    void* buffer = orch->heap_ring.pto2_heap_ring_alloc(total_size);
 
     orch->buffers_allocated++;
     orch->bytes_allocated += total_size;
@@ -277,7 +277,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
 
     // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
-    int32_t task_id = pto2_task_ring_alloc(&orch->task_ring);
+    int32_t task_id = orch->task_ring.pto2_task_ring_alloc();
 
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC);
 
@@ -462,7 +462,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // === STEP 6: Initialize task in scheduler ===
     // In multi-threaded mode, scheduler thread handles task initialization via polling
     if (orch->scheduler && orch->init_task_on_submit) {
-        pto2_scheduler_init_task(orch->scheduler, task_id, task);
+        orch->scheduler->init_task(task_id, task);
     }
 
     // === STEP 7: Update shared memory with current task index ===
