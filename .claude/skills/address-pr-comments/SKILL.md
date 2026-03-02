@@ -53,6 +53,8 @@ query {
 
 Filter to `isResolved: false` only.
 
+**If no unresolved comments exist:** Inform the user that all PR comments have been resolved and exit the workflow. Do not proceed to subsequent steps.
+
 ## Step 3: Classify Comments
 
 | Category | Description | Examples |
@@ -115,6 +117,7 @@ Then resolve thread with GraphQL `resolveReviewThread` mutation.
 | ----- | ------ |
 | PR not found | `gh pr list`; ask user to confirm |
 | Not authenticated | "Run: `gh auth login`" |
+| No unresolved comments | Inform user all comments resolved; exit workflow |
 | Unclear comment | Mark Category B for discussion |
 
 ## Checklist

@@ -56,7 +56,7 @@ A branch "needs a new branch" when the branch name matches `$DEFAULT_BRANCH`.
 | Yes | No (commits ahead) | Create new branch (commits carry over) |
 | Yes | No (nothing ahead) | Error — nothing to PR. Tell user to make changes first |
 | No | Yes | Commit on current branch via `/git-commit` |
-| No | No | Skip — already committed on a feature branch |
+| No | No | Validate commit message (see Step 4) |
 
 **If a new branch is needed:**
 
@@ -124,6 +124,43 @@ If more than 1 commit ahead, squash into a single commit:
 ```bash
 git reset --soft "$BASE_REF"
 git commit  # Re-commit with proper message via /git-commit conventions
+```
+
+### Validate Commit Message
+
+After ensuring exactly 1 commit ahead, check the commit message against `/git-commit` conventions:
+
+```bash
+git log -1 --format='%s'   # Subject line
+git log -1 --format='%b'   # Body
+```
+
+**Validation rules** (from `/git-commit` skill):
+
+| Rule | Check |
+| ---- | ----- |
+| Subject format | `Type: concise description` |
+| Valid types | Add, Fix, Update, Refactor, Support, Sim, CI |
+| Length | Under 72 characters |
+| Style | Imperative mood, no trailing period |
+| Body | Required if commit touches 3+ files |
+| Co-author | No AI co-author lines |
+
+**If the message does not comply**, amend it:
+
+```bash
+git commit --amend -m "Type: corrected description"
+```
+
+For multi-line messages with body:
+
+```bash
+git commit --amend -m "$(cat <<'EOF'
+Type: corrected description
+
+- What changed and why
+EOF
+)"
 ```
 
 ## Step 5: Push
