@@ -78,4 +78,68 @@ void perf_aicpu_flush_buffers(Runtime* runtime,
  */
 void perf_aicpu_update_total_tasks(Runtime* runtime, uint32_t total_tasks);
 
+/**
+ * Initialize AICPU phase profiling
+ *
+ * Sets up AicpuPhaseHeader and clears per-thread phase record buffers.
+ * Must be called once from thread 0 after perf_aicpu_init_profiling().
+ *
+ * @param runtime Runtime instance pointer
+ * @param num_sched_threads Number of scheduler threads
+ */
+void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads);
+
+/**
+ * Record a single scheduler phase
+ *
+ * Appends an AicpuPhaseRecord to the specified thread's buffer.
+ * Silently drops records when the buffer is full.
+ *
+ * @param thread_idx Scheduler thread index
+ * @param phase_id Phase identifier
+ * @param start_time Phase start timestamp
+ * @param end_time Phase end timestamp
+ * @param loop_iter Current loop iteration number
+ * @param tasks_processed Number of tasks processed in this phase
+ */
+void perf_aicpu_record_phase(int thread_idx,
+                              AicpuPhaseId phase_id,
+                              uint64_t start_time, uint64_t end_time,
+                              uint32_t loop_iter, uint32_t tasks_processed);
+
+/**
+ * Write orchestrator cumulative summary
+ *
+ * Writes the orchestrator's accumulated profiling data to shared memory
+ * for host-side collection.
+ *
+ * @param src Pointer to populated AicpuOrchSummary (magic field is set internally)
+ */
+void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src);
+
+/**
+ * Set orchestrator thread index for per-task phase recording
+ *
+ * Must be called once from the orchestrator thread before any
+ * perf_aicpu_record_orch_phase() calls.
+ *
+ * @param thread_idx Thread index for the orchestrator (typically num_sched_threads)
+ */
+void perf_aicpu_set_orch_thread_idx(int thread_idx);
+
+/**
+ * Record a single orchestrator phase
+ *
+ * Appends an AicpuPhaseRecord for one sub-step of pto2_submit_task().
+ * Uses the orchestrator's dedicated buffer slot (set via set_orch_thread_idx).
+ *
+ * @param phase_id Orchestrator phase identifier (ORCH_SYNC..ORCH_SCOPE_END)
+ * @param start_time Phase start timestamp
+ * @param end_time Phase end timestamp
+ * @param submit_idx Task submission index (acts as loop_iter)
+ */
+void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
+                                   uint64_t start_time, uint64_t end_time,
+                                   uint32_t submit_idx);
+
 #endif  // PLATFORM_AICPU_PERFORMANCE_COLLECTOR_AICPU_H_

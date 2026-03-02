@@ -427,8 +427,9 @@ int DeviceRunner::run(Runtime& runtime,
         return rc;
     }
 
-    // Print collected performance data (after stream sync)
+    // Collect phase data and print performance data (after stream sync)
     if (runtime.enable_profiling) {
+        perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
 

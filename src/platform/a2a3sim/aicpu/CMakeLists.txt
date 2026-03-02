@@ -50,6 +50,8 @@ target_compile_options(aicpu_kernel
     PRIVATE
         -Wall
         -Wextra
+        -Werror
+        -Wno-error=class-memaccess
         -fPIC
         -O3
         -g

@@ -55,8 +55,8 @@ def read_perf_data(filepath):
             raise ValueError(f"Missing required field: {field}")
 
     # Validate version
-    if data['version'] != 1:
-        raise ValueError(f"Unsupported version: {data['version']} (expected 1)")
+    if data['version'] not in [1, 2]:
+        raise ValueError(f"Unsupported version: {data['version']} (expected 1 or 2)")
 
     return data
 
@@ -286,7 +286,9 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_cpu_us_per_task=Non
 
 
 
-def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose=False):
+def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose=False,
+                                scheduler_phases=None, orchestrator_data=None,
+                                orchestrator_phases=None):
     """Generate Chrome Trace Event Format JSON from task data.
 
     Args:
@@ -299,10 +301,15 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
         output_path: Path to output JSON file
         func_id_to_name: Optional dict mapping func_id to function name
         verbose: Print progress information
+        scheduler_phases: Optional list of per-thread phase record lists (version 2)
+        orchestrator_data: Optional dict with orchestrator summary (version 2)
+        orchestrator_phases: Optional list of per-task orchestrator phase records (version 2)
 
-    Generates two processes in the trace:
+    Generates processes in the trace:
         - pid=1 "AICore View": start_time_us to end_time_us (kernel execution)
         - pid=2 "AICPU View": dispatch_time_us to finish_time_us (AICPU perspective)
+        - pid=3 "AICPU Scheduler": scheduler phase bars (version 2)
+        - pid=4 "AICPU Orchestrator": orchestrator phase bars or summary (version 2)
     """
     if verbose:
         print(f"Generating Chrome Trace JSON...")
@@ -327,11 +334,19 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
     # Step 2: Generate JSON events
     events = []
 
-    # Metadata event: Process names
+    # Metadata event: Process names and sort order
+    # Display order: Orchestrator (pid=4) → Scheduler (pid=3) → AICPU View (pid=2) → AICore View (pid=1)
     events.append({
         "args": {"name": "AICore View"},
         "cat": "__metadata",
         "name": "process_name",
+        "ph": "M",
+        "pid": 1
+    })
+    events.append({
+        "args": {"sort_index": 4},
+        "cat": "__metadata",
+        "name": "process_sort_index",
         "ph": "M",
         "pid": 1
     })
@@ -347,6 +362,13 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
             "args": {"name": "AICPU View"},
             "cat": "__metadata",
             "name": "process_name",
+            "ph": "M",
+            "pid": 2
+        })
+        events.append({
+            "args": {"sort_index": 3},
+            "cat": "__metadata",
+            "name": "process_sort_index",
             "ph": "M",
             "pid": 2
         })
@@ -519,6 +541,281 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
 
             flow_id += 1
 
+    # AICPU Scheduler phase events (version 2)
+    if scheduler_phases:
+        # Process metadata
+        events.append({
+            "args": {"name": "AICPU Scheduler"},
+            "cat": "__metadata",
+            "name": "process_name",
+            "ph": "M",
+            "pid": 3
+        })
+        events.append({
+            "args": {"sort_index": 2},
+            "cat": "__metadata",
+            "name": "process_sort_index",
+            "ph": "M",
+            "pid": 3
+        })
+
+        # Phase color mapping
+        phase_colors = {
+            "complete": "good",       # green
+            "dispatch": "terrible",   # red
+            "scan": "thread_state_running",  # blue
+            "early_ready": "yellow",  # yellow
+        }
+
+        for thread_idx, thread_records in enumerate(scheduler_phases):
+            tid = 3000 + thread_idx
+
+            # Thread name metadata
+            events.append({
+                "args": {"name": f"Sched_{thread_idx}"},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": 3,
+                "tid": tid
+            })
+
+            for record in thread_records:
+                phase = record.get("phase", "unknown")
+                start_us = record["start_time_us"]
+                end_us = record["end_time_us"]
+                dur = end_us - start_us
+                tasks_processed = record.get("tasks_processed", 0)
+
+                event = {
+                    "args": {
+                        "phase": phase,
+                        "loop_iter": record.get("loop_iter", 0),
+                        "tasks_processed": tasks_processed
+                    },
+                    "cat": "scheduler",
+                    "cname": phase_colors.get(phase, "generic_work"),
+                    "name": f"{phase}({tasks_processed})",
+                    "ph": "X",
+                    "pid": 3,
+                    "tid": tid,
+                    "ts": start_us,
+                    "dur": dur
+                }
+                events.append(event)
+
+    # AICPU Orchestrator event (version 2)
+    if orchestrator_phases or orchestrator_data:
+        # Process metadata
+        events.append({
+            "args": {"name": "AICPU Orchestrator"},
+            "cat": "__metadata",
+            "name": "process_name",
+            "ph": "M",
+            "pid": 4
+        })
+        events.append({
+            "args": {"sort_index": 1},
+            "cat": "__metadata",
+            "name": "process_sort_index",
+            "ph": "M",
+            "pid": 4
+        })
+
+        # Thread name metadata
+        events.append({
+            "args": {"name": "Orchestrator"},
+            "cat": "__metadata",
+            "name": "thread_name",
+            "ph": "M",
+            "pid": 4,
+            "tid": 4000
+        })
+
+    if orchestrator_phases:
+        # Per-task orchestrator phase bars
+        orch_phase_colors = {
+            "orch_sync": "thread_state_iowait",      # orange
+            "orch_alloc": "terrible",                  # red
+            "orch_params": "good",                     # green
+            "orch_lookup": "thread_state_running",     # blue
+            "orch_heap": "yellow",
+            "orch_insert": "olive",
+            "orch_fanin": "rail_animation",
+            "orch_finalize": "cq_build_passed",
+            "orch_scope_end": "generic_work",
+        }
+
+        for record in orchestrator_phases:
+            phase = record.get("phase", "unknown")
+            start_us = record["start_time_us"]
+            end_us = record["end_time_us"]
+            dur = end_us - start_us
+            submit_idx = record.get("submit_idx", 0)
+
+            # Strip "orch_" prefix for display name
+            display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
+
+            event = {
+                "args": {
+                    "phase": phase,
+                    "submit_idx": submit_idx
+                },
+                "cat": "orchestrator",
+                "cname": orch_phase_colors.get(phase, "generic_work"),
+                "name": f"{display_name}({submit_idx})",
+                "ph": "X",
+                "pid": 4,
+                "tid": 4000,
+                "ts": start_us,
+                "dur": dur
+            }
+            events.append(event)
+
+    elif orchestrator_data:
+        # Fallback: cumulative summary as single bar
+        orch_start = orchestrator_data["start_time_us"]
+        orch_end = orchestrator_data["end_time_us"]
+        orch_dur = orch_end - orch_start
+        phase_us = orchestrator_data.get("phase_us", {})
+
+        # Build args with phase breakdown (cumulative totals, shown in detail panel)
+        orch_args = {
+            "submit_count": orchestrator_data.get("submit_count", 0),
+        }
+        total_phase_us = sum(phase_us.values())
+        if total_phase_us > 0:
+            for phase_name, dur in phase_us.items():
+                if dur > 0:
+                    pct = dur / total_phase_us * 100
+                    orch_args[f"{phase_name}_us"] = round(dur, 3)
+                    orch_args[f"{phase_name}_%"] = round(pct, 1)
+
+        # Total orchestrator bar
+        events.append({
+            "args": orch_args,
+            "cat": "orchestrator",
+            "name": f"Orchestrator({orchestrator_data.get('submit_count', 0)} tasks)",
+            "ph": "X",
+            "pid": 4,
+            "tid": 4000,
+            "ts": orch_start,
+            "dur": orch_dur
+        })
+
+    # AICPU View fanout arrows (duplicate AICore View flow events using AICPU timestamps)
+    if has_aicpu_data:
+        for task in tasks:
+            src_finish_us = task.get('finish_time_us', 0)
+            if src_finish_us <= 0:
+                continue
+
+            src_tid = core_to_tid[task['core_id']]
+
+            for succ_task_id in task['fanout']:
+                if succ_task_id not in task_map:
+                    continue
+
+                succ_task = task_map[succ_task_id]
+                dst_dispatch_us = succ_task.get('dispatch_time_us', 0)
+                if dst_dispatch_us <= 0:
+                    continue
+
+                dst_tid = core_to_tid[succ_task['core_id']]
+
+                events.append({
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "dependency",
+                    "ph": "s",
+                    "pid": 2,
+                    "tid": src_tid,
+                    "ts": src_finish_us - 0.01
+                })
+                events.append({
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "dependency",
+                    "ph": "f",
+                    "pid": 2,
+                    "tid": dst_tid,
+                    "ts": dst_dispatch_us,
+                    "bp": "e"
+                })
+                flow_id += 1
+
+    # Scheduler DISPATCH → task execution arrows
+    if scheduler_phases and has_aicpu_data:
+        # Build index of DISPATCH phase records per thread for fast lookup
+        dispatch_phases_by_thread = {}
+        for thread_idx, thread_records in enumerate(scheduler_phases):
+            dispatch_records = [r for r in thread_records if r.get("phase") == "dispatch"]
+            if dispatch_records:
+                dispatch_phases_by_thread[thread_idx] = dispatch_records
+
+        for task in tasks:
+            dispatch_us = task.get('dispatch_time_us', 0)
+            if dispatch_us <= 0:
+                continue
+
+            # Find the scheduler DISPATCH phase that contains this dispatch timestamp
+            matched_thread = None
+            for thread_idx, dispatch_records in dispatch_phases_by_thread.items():
+                for dr in dispatch_records:
+                    if dr["start_time_us"] <= dispatch_us <= dr["end_time_us"]:
+                        matched_thread = thread_idx
+                        break
+                if matched_thread is not None:
+                    break
+
+            if matched_thread is not None:
+                sched_tid = 3000 + matched_thread
+                core_tid = core_to_tid[task['core_id']]
+
+                # Flow: scheduler DISPATCH → AICore View task start
+                events.append({
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "dispatch",
+                    "ph": "s",
+                    "pid": 3,
+                    "tid": sched_tid,
+                    "ts": dispatch_us
+                })
+                events.append({
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "dispatch",
+                    "ph": "f",
+                    "pid": 1,
+                    "tid": core_tid,
+                    "ts": task['start_time_us'],
+                    "bp": "e"
+                })
+                flow_id += 1
+
+                # Flow: scheduler DISPATCH → AICPU View task start
+                events.append({
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "dispatch",
+                    "ph": "s",
+                    "pid": 3,
+                    "tid": sched_tid,
+                    "ts": dispatch_us
+                })
+                events.append({
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "dispatch",
+                    "ph": "f",
+                    "pid": 2,
+                    "tid": core_tid,
+                    "ts": dispatch_us,
+                    "bp": "e"
+                })
+                flow_id += 1
+
     if verbose:
         print(f"  Total events: {len(events)}")
         print(f"  Flow events: {flow_id}")
@@ -638,8 +935,26 @@ Examples:
             perf_path=input_path,
         )
 
+        # Extract version 2 data if available
+        scheduler_phases = data.get('aicpu_scheduler_phases')
+        orchestrator_data = data.get('aicpu_orchestrator')
+        orchestrator_phases = data.get('aicpu_orchestrator_phases')
+
+        if args.verbose and data['version'] == 2:
+            if scheduler_phases:
+                total_phase_records = sum(len(t) for t in scheduler_phases)
+                print(f"  Scheduler threads: {len(scheduler_phases)}")
+                print(f"  Total phase records: {total_phase_records}")
+            if orchestrator_data:
+                print(f"  Orchestrator: {orchestrator_data.get('submit_count', 0)} tasks")
+            if orchestrator_phases:
+                print(f"  Orchestrator phases: {len(orchestrator_phases)} per-task records")
+
         # Generate Perfetto JSON
-        generate_chrome_trace_json(data['tasks'], str(output_path), func_names, args.verbose)
+        generate_chrome_trace_json(data['tasks'], str(output_path), func_names, args.verbose,
+                                   scheduler_phases=scheduler_phases,
+                                   orchestrator_data=orchestrator_data,
+                                   orchestrator_phases=orchestrator_phases)
 
         print(f"\n✓ Conversion complete")
         print(f"  Input:  {input_path}")

@@ -2,7 +2,7 @@
  * @file perf_profiling.h
  * @brief Performance profiling data structures
  *
- * Architecture: Fixed header + dynamic tail
+ * Architecture: Fixed header + dynamic tail + optional phase profiling region
  *
  * Memory layout:
  * ┌─────────────────────────────────────────────────────────────┐
@@ -19,9 +19,21 @@
  * │ ...                                                         │
  * ├─────────────────────────────────────────────────────────────┤
  * │ DoubleBuffer[num_cores-1]                                   │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ AicpuPhaseHeader (optional, present when phase profiling)   │
+ * │  - magic, num_sched_threads, records_per_thread             │
+ * │  - buffer_counts[PLATFORM_MAX_AICPU_THREADS]                │
+ * │  - orch_summary                                             │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ AicpuPhaseRecord[thread0][0..records_per_thread-1]          │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ AicpuPhaseRecord[thread1][0..records_per_thread-1]          │
+ * ├─────────────────────────────────────────────────────────────┤
+ * │ ...                                                         │
  * └─────────────────────────────────────────────────────────────┘
  *
- * Total size = sizeof(PerfDataHeader) + num_cores * sizeof(DoubleBuffer)
+ * Base size = sizeof(PerfDataHeader) + num_cores * sizeof(DoubleBuffer)
+ * With phases = Base + sizeof(AicpuPhaseHeader) + num_sched_threads * records_per_thread * sizeof(AicpuPhaseRecord)
  */
 
 #ifndef PLATFORM_COMMON_PERF_PROFILING_H_
@@ -179,6 +191,90 @@ struct PerfDataHeader {
 } __attribute__((aligned(64)));
 
 // =============================================================================
+// AICPU Phase Profiling - Scheduler and Orchestrator Records
+// =============================================================================
+
+/**
+ * AICPU phase identifier
+ *
+ * Scheduler phases (0-3): four phases in each scheduler loop iteration.
+ * Orchestrator phases (16-24): sub-steps within each pto2_submit_task() call.
+ */
+enum class AicpuPhaseId : uint32_t {
+    // Scheduler phases (0-3)
+    SCHED_COMPLETE    = 0,  // Process completed tasks (fanout traversal)
+    SCHED_DISPATCH    = 1,  // Dispatch ready tasks to idle cores
+    SCHED_SCAN        = 2,  // Incremental scan for root tasks
+    SCHED_EARLY_READY = 3,  // Drain orchestrator's early-ready queue
+    // Orchestrator phases (16-24)
+    ORCH_SYNC      = 16,  // tensormap sync
+    ORCH_ALLOC     = 17,  // task_ring_alloc
+    ORCH_PARAMS    = 18,  // param copy
+    ORCH_LOOKUP    = 19,  // tensormap lookup + dep
+    ORCH_HEAP      = 20,  // heap alloc
+    ORCH_INSERT    = 21,  // tensormap insert
+    ORCH_FANIN     = 22,  // fanin + early-ready
+    ORCH_FINALIZE  = 23,  // scheduler init + SM
+    ORCH_SCOPE_END = 24   // scope_end
+};
+
+/**
+ * Single AICPU scheduler phase record (32 bytes)
+ *
+ * Records one phase within one loop iteration of a scheduler thread.
+ * No thread_id field: identity is derived from array index (position = identity).
+ */
+struct AicpuPhaseRecord {
+    uint64_t start_time;       // Phase start timestamp
+    uint64_t end_time;         // Phase end timestamp
+    uint32_t loop_iter;        // Loop iteration number
+    AicpuPhaseId phase_id;     // Phase type
+    uint32_t tasks_processed;  // Tasks processed in this phase
+    uint32_t padding;          // Alignment padding
+};
+
+/**
+ * AICPU orchestrator cumulative summary
+ *
+ * Contains accumulated cycle counts from the orchestrator thread.
+ * Written once after orchestration completes.
+ */
+struct AicpuOrchSummary {
+    uint64_t start_time;       // Orchestrator start timestamp
+    uint64_t end_time;         // Orchestrator end timestamp
+    uint64_t sync_cycle;       // sync_tensormap phase
+    uint64_t alloc_cycle;      // task_ring_alloc phase
+    uint64_t params_cycle;     // param_copy phase
+    uint64_t lookup_cycle;     // lookup+dep phase
+    uint64_t heap_cycle;       // heap_alloc phase
+    uint64_t insert_cycle;     // tensormap_insert phase
+    uint64_t fanin_cycle;      // fanin+ready phase
+    uint64_t finalize_cycle;   // finalize+SM phase
+    uint64_t scope_end_cycle;  // scope_end phase
+    int64_t  submit_count;     // Total tasks submitted
+    uint32_t magic;            // Validation magic (AICPU_PHASE_MAGIC)
+    uint32_t padding;          // Alignment padding
+} __attribute__((aligned(64)));
+
+constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;  // "ACPH"
+constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;  // ~512KB per thread
+
+/**
+ * AICPU phase profiling header
+ *
+ * Located after the DoubleBuffer array in shared memory.
+ * Contains metadata and per-thread record counts.
+ */
+struct AicpuPhaseHeader {
+    uint32_t magic;                  // Validation magic (AICPU_PHASE_MAGIC)
+    uint32_t num_sched_threads;      // Number of scheduler threads
+    uint32_t records_per_thread;     // Max records per thread
+    uint32_t padding;                // Alignment padding
+    volatile uint32_t buffer_counts[PLATFORM_MAX_AICPU_THREADS];  // Per-thread record counts
+    AicpuOrchSummary orch_summary;   // Orchestrator cumulative data
+} __attribute__((aligned(64)));
+
+// =============================================================================
 // Helper Functions - Memory Layout
 // =============================================================================
 
@@ -248,6 +344,43 @@ inline void get_buffer_and_status(DoubleBuffer* db, uint32_t buffer_id,
         *buf = &db->buffer2;
         *status = &db->buffer2_status;
     }
+}
+
+/**
+ * Calculate total memory size including phase profiling region
+ *
+ * @param num_cores Number of AICore instances
+ * @param num_sched_threads Number of scheduler threads (typically 3)
+ * @return Total bytes needed
+ */
+inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_threads) {
+    return calc_perf_data_size(num_cores)
+         + sizeof(AicpuPhaseHeader)
+         + num_sched_threads * PLATFORM_PHASE_RECORDS_PER_THREAD * sizeof(AicpuPhaseRecord);
+}
+
+/**
+ * Get AicpuPhaseHeader pointer (located after DoubleBuffer array)
+ *
+ * @param base_ptr Shared memory base address
+ * @param num_cores Number of AICore instances
+ * @return AicpuPhaseHeader pointer
+ */
+inline AicpuPhaseHeader* get_phase_header(void* base_ptr, int num_cores) {
+    return (AicpuPhaseHeader*)((char*)base_ptr + calc_perf_data_size(num_cores));
+}
+
+/**
+ * Get AicpuPhaseRecord array for specified thread
+ *
+ * @param base_ptr Shared memory base address
+ * @param num_cores Number of AICore instances
+ * @param thread_idx Scheduler thread index
+ * @return AicpuPhaseRecord array pointer
+ */
+inline AicpuPhaseRecord* get_phase_records(void* base_ptr, int num_cores, int thread_idx) {
+    char* phase_start = (char*)get_phase_header(base_ptr, num_cores) + sizeof(AicpuPhaseHeader);
+    return (AicpuPhaseRecord*)(phase_start + thread_idx * PLATFORM_PHASE_RECORDS_PER_THREAD * sizeof(AicpuPhaseRecord));
 }
 
 #ifdef __cplusplus

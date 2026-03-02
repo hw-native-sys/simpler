@@ -8,6 +8,13 @@
 #include "common/unified_log.h"
 #include "common/platform_config.h"
 
+#include <cstring>
+
+// Cached phase profiling pointers (set during init, used on hot path)
+static AicpuPhaseHeader* s_phase_header = nullptr;
+static AicpuPhaseRecord* s_phase_records[PLATFORM_MAX_AICPU_THREADS] = {};
+static int s_orch_thread_idx = -1;
+
 /**
  * Enqueue ready buffer to per-thread queue
  *
@@ -289,4 +296,94 @@ void perf_aicpu_update_total_tasks(Runtime* runtime, uint32_t total_tasks) {
     PerfDataHeader* header = get_perf_header(perf_base);
     header->total_tasks = total_tasks;
     wmb();
+}
+
+void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads) {
+    void* perf_base = (void*)runtime->perf_data_base;
+    if (perf_base == nullptr) {
+        LOG_ERROR("perf_data_base is NULL, cannot initialize phase profiling");
+        return;
+    }
+
+    s_phase_header = get_phase_header(perf_base, runtime->worker_count);
+
+    s_phase_header->magic = AICPU_PHASE_MAGIC;
+    s_phase_header->num_sched_threads = num_sched_threads;
+    s_phase_header->records_per_thread = PLATFORM_PHASE_RECORDS_PER_THREAD;
+    s_phase_header->padding = 0;
+
+    for (int i = 0; i < PLATFORM_MAX_AICPU_THREADS; i++) {
+        s_phase_header->buffer_counts[i] = 0;
+    }
+
+    memset(&s_phase_header->orch_summary, 0, sizeof(AicpuOrchSummary));
+
+    // Cache per-thread record pointers and clear buffers
+    // Include orchestrator slot (index = num_sched_threads) if within bounds
+    int total_threads = (num_sched_threads < PLATFORM_MAX_AICPU_THREADS)
+                        ? num_sched_threads + 1 : num_sched_threads;
+    for (int t = 0; t < total_threads; t++) {
+        s_phase_records[t] = get_phase_records(perf_base, runtime->worker_count, t);
+        memset(s_phase_records[t], 0, PLATFORM_PHASE_RECORDS_PER_THREAD * sizeof(AicpuPhaseRecord));
+    }
+
+    wmb();
+
+    LOG_INFO("Phase profiling initialized: %d scheduler threads (+1 orch), %d records/thread",
+             num_sched_threads, PLATFORM_PHASE_RECORDS_PER_THREAD);
+}
+
+void perf_aicpu_record_phase(int thread_idx,
+                              AicpuPhaseId phase_id,
+                              uint64_t start_time, uint64_t end_time,
+                              uint32_t loop_iter, uint32_t tasks_processed) {
+    if (s_phase_header == nullptr) {
+        return;
+    }
+
+    uint32_t idx = s_phase_header->buffer_counts[thread_idx];
+
+    if (idx >= PLATFORM_PHASE_RECORDS_PER_THREAD) {
+        return;  // Buffer full, silently drop
+    }
+
+    AicpuPhaseRecord* record = &s_phase_records[thread_idx][idx];
+
+    record->start_time = start_time;
+    record->end_time = end_time;
+    record->loop_iter = loop_iter;
+    record->phase_id = phase_id;
+    record->tasks_processed = tasks_processed;
+    record->padding = 0;
+
+    s_phase_header->buffer_counts[thread_idx] = idx + 1;
+}
+
+void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src) {
+    if (s_phase_header == nullptr) {
+        return;
+    }
+
+    AicpuOrchSummary* dst = &s_phase_header->orch_summary;
+
+    memcpy(dst, src, sizeof(AicpuOrchSummary));
+    dst->magic = AICPU_PHASE_MAGIC;
+    dst->padding = 0;
+
+    wmb();
+
+    LOG_INFO("Orchestrator summary written: %lld tasks, %.3fus",
+             (long long)src->submit_count,
+             cycles_to_us(src->end_time - src->start_time));
+}
+
+void perf_aicpu_set_orch_thread_idx(int thread_idx) {
+    s_orch_thread_idx = thread_idx;
+}
+
+void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
+                                   uint64_t start_time, uint64_t end_time,
+                                   uint32_t submit_idx) {
+    if (s_orch_thread_idx < 0 || s_phase_header == nullptr) return;
+    perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, 0);
 }

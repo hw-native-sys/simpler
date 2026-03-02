@@ -136,6 +136,14 @@ public:
     bool is_initialized() const { return perf_shared_mem_host_ != nullptr; }
 
     /**
+     * Collect AICPU phase profiling data from shared memory
+     *
+     * Reads scheduler phase records and orchestrator summary from the
+     * phase profiling region. Must be called after AICPU threads have joined.
+     */
+    void collect_phase_data();
+
+    /**
      * Get collected records (for testing)
      */
     const std::vector<std::vector<PerfRecord>>& get_records() const { return collected_perf_records_; }
@@ -152,6 +160,12 @@ private:
 
     // Collected data (per-core vectors, indexed by core_index)
     std::vector<std::vector<PerfRecord>> collected_perf_records_;
+
+    // AICPU phase profiling data
+    std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
+    std::vector<AicpuPhaseRecord> collected_orch_phase_records_;
+    AicpuOrchSummary collected_orch_summary_{};
+    bool has_phase_data_{false};
 };
 
 #endif  // PLATFORM_HOST_PERFORMANCE_COLLECTOR_H_

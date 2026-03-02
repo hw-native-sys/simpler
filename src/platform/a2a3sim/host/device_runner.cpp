@@ -297,8 +297,9 @@ int DeviceRunner::run(Runtime& runtime,
 
     LOG_INFO("All threads completed");
 
-    // Print performance data after execution completes
+    // Collect AICPU phase data and print performance data after execution completes
     if (runtime.enable_profiling) {
+        perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
 

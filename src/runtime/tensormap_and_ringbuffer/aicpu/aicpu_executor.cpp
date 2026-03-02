@@ -523,6 +523,10 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         // (total_tasks written to header later when orchestrator completes)
         if (runtime->enable_profiling) {
             perf_aicpu_init_profiling(runtime);
+            // Initialize phase profiling for scheduler threads + orchestrator
+            int sched_threads = (thread_num_ == 4) ? 3 : thread_num_;
+            perf_aicpu_init_phase_profiling(runtime, sched_threads);
+            perf_aicpu_set_orch_thread_idx(sched_threads);
         }
 
         DEV_INFO("Thread %d: one-time init done", thread_idx);
@@ -568,6 +572,11 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     uint64_t sched_dispatch_miss_wait = 0, sched_dispatch_miss_hold = 0;
     uint64_t ready_pop_own = 0, ready_pop_steal = 0;
 #endif
+    // Phase profiling: per-phase task counters
+    uint32_t phase_complete_count = 0;
+    uint32_t phase_dispatch_count = 0;
+    uint32_t phase_scan_count = 0;
+    uint32_t phase_early_ready_count = 0;
     // Fanout traversal statistics: how many downstream deps were notified after task completions
     uint64_t fanout_edges_notified = 0;
     int32_t fanout_max_degree = 0;
@@ -577,6 +586,12 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         sched_loop_count++;
 #endif
         CYCLE_COUNT_START();
+        // Phase profiling: record start time for this iteration
+        uint64_t _t0_phase = _t0;
+        phase_complete_count = 0;
+        phase_dispatch_count = 0;
+        phase_scan_count = 0;
+        phase_early_ready_count = 0;
         // Dynamic task_count (Thread 3 sets total_tasks_ when orchestration completes)
         int32_t task_count = total_tasks_.load(std::memory_order_acquire);
         bool orch_done = orchestrator_done_.load(std::memory_order_acquire);
@@ -712,6 +727,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
                 cur_thread_tasks_in_flight--;
                 cur_thread_completed++;
+                phase_complete_count++;
                 made_progress = true;
                 completed_tasks_.fetch_add(1, std::memory_order_release);
 
@@ -784,6 +800,13 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             }
         }
         CYCLE_COUNT_LAP(sched_complete_cycle);
+#if PTO2_ORCH_PROFILING
+        if (profiling_enabled) {
+            perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_COMPLETE,
+                                    _t0_phase, _t1, static_cast<uint32_t>(sched_loop_count), phase_complete_count);
+            _t0_phase = _t1;
+        }
+#endif
 
         // Phase 2: Dispatch ready tasks to idle cores (register-based dispatch)
         if (cur_thread_tasks_in_flight < core_num) {
@@ -881,6 +904,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id + 1));
                         executing_task_ids_[core_id] = task_id;
                         cur_thread_tasks_in_flight++;
+                        phase_dispatch_count++;
                         made_progress = true;
                         DEV_DEBUG("Thread %d: Dispatching PTO2 task %d to core %d", thread_idx, task_id, core_id);
                     }
@@ -888,6 +912,13 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             }
         }
         CYCLE_COUNT_LAP(sched_dispatch_cycle);
+#if PTO2_ORCH_PROFILING
+        if (profiling_enabled) {
+            perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_DISPATCH,
+                                    _t0_phase, _t1, static_cast<uint32_t>(sched_loop_count), phase_dispatch_count);
+            _t0_phase = _t1;
+        }
+#endif
 
         // Incremental scan: discover root tasks (fanin_count == 0)
         {
@@ -922,11 +953,19 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         , sched_scan_ready_wait, sched_scan_ready_hold
 #endif
                     );
+                    phase_scan_count++;
                     made_progress = true;
                 }
             }
         }
         CYCLE_COUNT_LAP(sched_scan_cycle);
+#if PTO2_ORCH_PROFILING
+        if (profiling_enabled) {
+            perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_SCAN,
+                                    _t0_phase, _t1, static_cast<uint32_t>(sched_loop_count), phase_scan_count);
+            _t0_phase = _t1;
+        }
+#endif
 
         // Early-ready drain: tasks whose deps were already met at submit time
         // (orchestrator detected all producers completed → pushed to orch_ready_queue_)
@@ -955,10 +994,18 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                     , sched_early_ready_wait, sched_early_ready_hold
 #endif
                 );
+                phase_early_ready_count++;
                 made_progress = true;
             }
         }
         CYCLE_COUNT_LAP(sched_early_ready_cycle);
+#if PTO2_ORCH_PROFILING
+        if (profiling_enabled) {
+            perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_EARLY_READY,
+                                    _t0_phase, _t1, static_cast<uint32_t>(sched_loop_count), phase_early_ready_count);
+            _t0_phase = _t1;
+        }
+#endif
 
         if (!made_progress) {
             idle_iterations++;
@@ -1319,6 +1366,24 @@ int AicpuExecutor::run(Runtime* runtime) {
                 DEV_ALWAYS("  overlap checks : %llu, hits=%llu (%.1f%%)",
                     (unsigned long long)tp.overlap_checks, (unsigned long long)tp.overlap_hits,
                     tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0);
+
+                // Write orchestrator summary to shared memory for host-side export
+                if (runtime->enable_profiling) {
+                    AicpuOrchSummary orch_summary = {};
+                    orch_summary.start_time = orch_cycle_start;
+                    orch_summary.end_time = orch_cycle_end;
+                    orch_summary.sync_cycle = p.sync_cycle;
+                    orch_summary.alloc_cycle = p.alloc_cycle;
+                    orch_summary.params_cycle = p.params_cycle;
+                    orch_summary.lookup_cycle = p.lookup_cycle;
+                    orch_summary.heap_cycle = p.heap_cycle;
+                    orch_summary.insert_cycle = p.insert_cycle;
+                    orch_summary.fanin_cycle = p.fanin_cycle;
+                    orch_summary.finalize_cycle = p.finalize_cycle;
+                    orch_summary.scope_end_cycle = p.scope_end_cycle;
+                    orch_summary.submit_count = p.submit_count;
+                    perf_aicpu_write_orch_summary(&orch_summary);
+                }
             }
 #endif
 

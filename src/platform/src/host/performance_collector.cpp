@@ -44,8 +44,10 @@ int PerformanceCollector::initialize(Runtime& runtime,
     device_id_ = device_id;
     num_aicore_ = num_aicore;
 
-    // Step 1: Calculate total memory size
-    size_t total_size = calc_perf_data_size(num_aicore);
+    // Step 1: Calculate total memory size (with phase profiling region)
+    // All PLATFORM_MAX_AICPU_THREADS slots: scheduler threads + orchestrator thread
+    int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
+    size_t total_size = calc_perf_data_size_with_phases(num_aicore, num_phase_threads);
     size_t header_size = sizeof(PerfDataHeader);
     size_t single_db_size = sizeof(DoubleBuffer);
     size_t buffers_size = num_aicore * single_db_size;
@@ -274,6 +276,79 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
     LOG_INFO("Performance data collection complete");
 }
 
+void PerformanceCollector::collect_phase_data() {
+    if (perf_shared_mem_host_ == nullptr) {
+        return;
+    }
+
+    rmb();
+
+    AicpuPhaseHeader* phase_header = get_phase_header(perf_shared_mem_host_, num_aicore_);
+
+    // Validate magic
+    if (phase_header->magic != AICPU_PHASE_MAGIC) {
+        LOG_INFO("No phase profiling data found (magic mismatch: 0x%x vs 0x%x)",
+                 phase_header->magic, AICPU_PHASE_MAGIC);
+        return;
+    }
+
+    int num_sched_threads = phase_header->num_sched_threads;
+    if (num_sched_threads > PLATFORM_MAX_AICPU_THREADS) {
+        LOG_ERROR("Invalid num_sched_threads %d from shared memory (max=%d)",
+                  num_sched_threads, PLATFORM_MAX_AICPU_THREADS);
+        return;
+    }
+    LOG_INFO("Collecting phase data: %d scheduler threads", num_sched_threads);
+
+    // Read per-thread phase records
+    collected_phase_records_.clear();
+    collected_phase_records_.resize(num_sched_threads);
+
+    int total_phase_records = 0;
+    for (int t = 0; t < num_sched_threads; t++) {
+        uint32_t count = phase_header->buffer_counts[t];
+        if (count > PLATFORM_PHASE_RECORDS_PER_THREAD) {
+            count = PLATFORM_PHASE_RECORDS_PER_THREAD;
+        }
+
+        AicpuPhaseRecord* records = get_phase_records(perf_shared_mem_host_, num_aicore_, t);
+        collected_phase_records_[t].assign(records, records + count);
+        total_phase_records += count;
+        LOG_INFO("  Thread %d: %u phase records", t, count);
+    }
+
+    // Read orchestrator per-task phase records (slot = num_sched_threads)
+    collected_orch_phase_records_.clear();
+    if (num_sched_threads < PLATFORM_MAX_AICPU_THREADS) {
+        uint32_t orch_count = phase_header->buffer_counts[num_sched_threads];
+        if (orch_count > PLATFORM_PHASE_RECORDS_PER_THREAD) {
+            orch_count = PLATFORM_PHASE_RECORDS_PER_THREAD;
+        }
+        if (orch_count > 0) {
+            AicpuPhaseRecord* orch_records = get_phase_records(perf_shared_mem_host_, num_aicore_, num_sched_threads);
+            collected_orch_phase_records_.assign(orch_records, orch_records + orch_count);
+            total_phase_records += orch_count;
+            LOG_INFO("  Orchestrator: %u per-task phase records", orch_count);
+        }
+    }
+
+    // Read orchestrator summary
+    collected_orch_summary_ = phase_header->orch_summary;
+    bool orch_valid = (collected_orch_summary_.magic == AICPU_PHASE_MAGIC);
+
+    if (orch_valid) {
+        LOG_INFO("  Orchestrator: %lld tasks, %.3fus",
+                 (long long)collected_orch_summary_.submit_count,
+                 cycles_to_us(collected_orch_summary_.end_time - collected_orch_summary_.start_time));
+    } else {
+        LOG_INFO("  Orchestrator: no summary data");
+    }
+
+    has_phase_data_ = (total_phase_records > 0 || orch_valid);
+    LOG_INFO("Phase data collection complete: %d records (%zu orch), orch_summary=%s",
+             total_phase_records, collected_orch_phase_records_.size(), orch_valid ? "yes" : "no");
+}
+
 int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     // Step 1: Validate collected data
     bool has_any_records = false;
@@ -320,7 +395,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                   return a.record->task_id < b.record->task_id;
               });
 
-    // Step 4: Calculate base time (minimum kernel_ready_time)
+    // Step 4: Calculate base time (minimum kernel_ready_time, including phase timestamps)
     uint64_t base_time_cycles = UINT64_MAX;
     for (const auto& tagged : tagged_records) {
         if (tagged.record->kernel_ready_time < base_time_cycles) {
@@ -330,6 +405,27 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
             base_time_cycles = tagged.record->dispatch_time;
             LOG_WARN("Timestamp violation: dispatch_time (%lu) < base_time (%lu) for task %u, using dispatch_time as new base_time",
                         tagged.record->dispatch_time, base_time_cycles, tagged.record->task_id);
+        }
+    }
+
+    // Include phase record timestamps in base_time calculation
+    if (has_phase_data_) {
+        for (const auto& thread_records : collected_phase_records_) {
+            for (const auto& pr : thread_records) {
+                if (pr.start_time > 0 && pr.start_time < base_time_cycles) {
+                    base_time_cycles = pr.start_time;
+                }
+            }
+        }
+        for (const auto& pr : collected_orch_phase_records_) {
+            if (pr.start_time > 0 && pr.start_time < base_time_cycles) {
+                base_time_cycles = pr.start_time;
+            }
+        }
+        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC &&
+            collected_orch_summary_.start_time > 0 &&
+            collected_orch_summary_.start_time < base_time_cycles) {
+            base_time_cycles = collected_orch_summary_.start_time;
         }
     }
 
@@ -349,8 +445,9 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     }
 
     // Step 7: Write JSON data
+    int version = has_phase_data_ ? 2 : 1;
     outfile << "{\n";
-    outfile << "  \"version\": 1,\n";
+    outfile << "  \"version\": " << version << ",\n";
     outfile << "  \"tasks\": [\n";
 
     for (size_t i = 0; i < tagged_records.size(); ++i) {
@@ -395,8 +492,105 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         }
         outfile << "\n";
     }
-    outfile << "  ]\n";
-    outfile << "}\n";
+    outfile << "  ]";
+
+    // Step 8: Write phase profiling data (version 2)
+    if (has_phase_data_) {
+        // AICPU scheduler phases
+        outfile << ",\n  \"aicpu_scheduler_phases\": [\n";
+        for (size_t t = 0; t < collected_phase_records_.size(); t++) {
+            outfile << "    [\n";
+            const auto& thread_records = collected_phase_records_[t];
+            for (size_t r = 0; r < thread_records.size(); r++) {
+                const auto& pr = thread_records[r];
+                double start_us = cycles_to_us(pr.start_time - base_time_cycles);
+                double end_us = cycles_to_us(pr.end_time - base_time_cycles);
+
+                const char* phase_name = "unknown";
+                switch (pr.phase_id) {
+                    case AicpuPhaseId::SCHED_COMPLETE:    phase_name = "complete"; break;
+                    case AicpuPhaseId::SCHED_DISPATCH:    phase_name = "dispatch"; break;
+                    case AicpuPhaseId::SCHED_SCAN:        phase_name = "scan"; break;
+                    case AicpuPhaseId::SCHED_EARLY_READY: phase_name = "early_ready"; break;
+                    default: break;
+                }
+
+                outfile << "      {\"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
+                        << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
+                        << ", \"phase\": \"" << phase_name << "\""
+                        << ", \"loop_iter\": " << pr.loop_iter
+                        << ", \"tasks_processed\": " << pr.tasks_processed
+                        << "}";
+                if (r < thread_records.size() - 1) outfile << ",";
+                outfile << "\n";
+            }
+            outfile << "    ]";
+            if (t < collected_phase_records_.size() - 1) outfile << ",";
+            outfile << "\n";
+        }
+        outfile << "  ]";
+
+        // AICPU orchestrator summary
+        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC) {
+            double orch_start_us = cycles_to_us(collected_orch_summary_.start_time - base_time_cycles);
+            double orch_end_us = cycles_to_us(collected_orch_summary_.end_time - base_time_cycles);
+
+            outfile << ",\n  \"aicpu_orchestrator\": {\n";
+            outfile << "    \"start_time_us\": " << std::fixed << std::setprecision(3) << orch_start_us << ",\n";
+            outfile << "    \"end_time_us\": " << std::fixed << std::setprecision(3) << orch_end_us << ",\n";
+            outfile << "    \"submit_count\": " << collected_orch_summary_.submit_count << ",\n";
+            outfile << "    \"phase_us\": {\n";
+            outfile << "      \"sync\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.sync_cycle) << ",\n";
+            outfile << "      \"alloc\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.alloc_cycle) << ",\n";
+            outfile << "      \"params\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.params_cycle) << ",\n";
+            outfile << "      \"lookup\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.lookup_cycle) << ",\n";
+            outfile << "      \"heap\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.heap_cycle) << ",\n";
+            outfile << "      \"insert\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.insert_cycle) << ",\n";
+            outfile << "      \"fanin\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.fanin_cycle) << ",\n";
+            outfile << "      \"finalize\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.finalize_cycle) << ",\n";
+            outfile << "      \"scope_end\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.scope_end_cycle) << "\n";
+            outfile << "    }\n";
+            outfile << "  }";
+        }
+
+        // Per-task orchestrator phase records
+        if (!collected_orch_phase_records_.empty()) {
+            outfile << ",\n  \"aicpu_orchestrator_phases\": [\n";
+
+            // Map orchestrator phase IDs to names
+            auto orch_phase_name = [](AicpuPhaseId id) -> const char* {
+                switch (id) {
+                    case AicpuPhaseId::ORCH_SYNC:      return "orch_sync";
+                    case AicpuPhaseId::ORCH_ALLOC:     return "orch_alloc";
+                    case AicpuPhaseId::ORCH_PARAMS:    return "orch_params";
+                    case AicpuPhaseId::ORCH_LOOKUP:    return "orch_lookup";
+                    case AicpuPhaseId::ORCH_HEAP:      return "orch_heap";
+                    case AicpuPhaseId::ORCH_INSERT:    return "orch_insert";
+                    case AicpuPhaseId::ORCH_FANIN:     return "orch_fanin";
+                    case AicpuPhaseId::ORCH_FINALIZE:  return "orch_finalize";
+                    case AicpuPhaseId::ORCH_SCOPE_END: return "orch_scope_end";
+                    default: return "unknown";
+                }
+            };
+
+            for (size_t r = 0; r < collected_orch_phase_records_.size(); r++) {
+                const auto& pr = collected_orch_phase_records_[r];
+                double start_us = cycles_to_us(pr.start_time - base_time_cycles);
+                double end_us = cycles_to_us(pr.end_time - base_time_cycles);
+
+                outfile << "    {\"phase\": \"" << orch_phase_name(pr.phase_id) << "\""
+                        << ", \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
+                        << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
+                        << ", \"submit_idx\": " << pr.loop_iter
+                        << "}";
+                if (r < collected_orch_phase_records_.size() - 1) outfile << ",";
+                outfile << "\n";
+            }
+            outfile << "  ]";
+        }
+    }
+
+    outfile << "\n}\n";
 
     // Step 9: Close file
     outfile.close();
@@ -438,6 +632,9 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
     perf_shared_mem_host_ = nullptr;
     was_registered_ = false;
     collected_perf_records_.clear();
+    collected_phase_records_.clear();
+    collected_orch_phase_records_.clear();
+    has_phase_data_ = false;
     device_id_ = -1;
 
     LOG_DEBUG("Performance profiling cleanup complete");
