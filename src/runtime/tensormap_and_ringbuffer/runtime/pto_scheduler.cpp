@@ -113,6 +113,7 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
 
     // Initialize local copies of ring pointers
     sched->last_task_alive = 0;
+    sched->last_heap_consumed = 0;
     sched->heap_tail = 0;
 
     // Allocate per-task state arrays (dynamically sized based on runtime window_size)
@@ -174,8 +175,8 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
 
 void pto2_scheduler_reset(PTO2SchedulerState* sched) {
     sched->last_task_alive = 0;
+    sched->last_heap_consumed = 0;
     sched->heap_tail = 0;
-
     memset(sched->task_state, 0, sched->task_window_size * sizeof(PTO2TaskState));
     memset(sched->fanin_refcount, 0, sched->task_window_size * sizeof(int32_t));
     memset(sched->fanout_refcount, 0, sched->task_window_size * sizeof(int32_t));
@@ -202,50 +203,6 @@ int32_t pto2_scheduler_get_ready_task(PTO2SchedulerState* sched,
 // Task Completion Handling
 // =============================================================================
 
-/**
- * Check if task can transition to CONSUMED and handle if so
- *
- * NOTE: fanout_refcount is accessed atomically because it can be modified
- * by both orchestrator thread (via scope_end) and scheduler thread (via task_complete).
- */
-static void check_and_handle_consumed(PTO2SchedulerState* sched,
-                                       int32_t task_id,
-                                       PTO2TaskDescriptor* task) {
-    int32_t slot = sched->pto2_task_slot(task_id);
-
-    // Read fanout_count (set by orchestrator, only grows)
-    int32_t fanout_count = __atomic_load_n(&task->fanout_count, __ATOMIC_ACQUIRE);
-
-    // Read fanout_refcount atomically (modified by both orchestrator and scheduler threads)
-    int32_t refcount = __atomic_load_n(&sched->fanout_refcount[slot], __ATOMIC_ACQUIRE);
-
-    if (refcount != fanout_count) {
-        return;  // Not all references released yet
-    }
-
-    // Use CAS to atomically transition COMPLETED -> CONSUMED
-    // This prevents multiple threads from transitioning the same task
-    PTO2TaskState expected = PTO2_TASK_COMPLETED;
-    if (!__atomic_compare_exchange_n(&sched->task_state[slot], &expected, PTO2_TASK_CONSUMED,
-                                      false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        // CAS failed - either not COMPLETED or another thread already transitioned
-        return;
-    }
-
-    // Successfully transitioned to CONSUMED
-    __atomic_fetch_add(&sched->tasks_consumed, 1, __ATOMIC_RELAXED);
-
-    // Reset refcounts for slot reuse (ring buffer will reuse this slot)
-    // Use atomic store for fanout_refcount
-    __atomic_store_n(&sched->fanout_refcount[slot], 0, __ATOMIC_RELEASE);
-    __atomic_store_n(&sched->fanin_refcount[slot], 0, __ATOMIC_RELEASE);
-
-    // Try to advance ring pointers
-    if (task_id == sched->last_task_alive) {
-        pto2_scheduler_advance_ring_pointers(sched); // RISK: Multiple entries
-    }
-}
-
 void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id) {
     int32_t slot = sched->pto2_task_slot(task_id);
     PTO2TaskDescriptor* task = pto2_sm_get_task(sched->sm_handle, task_id);
@@ -261,7 +218,7 @@ void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id)
     int32_t fanout_head = PTO2_LOAD_ACQUIRE(&task->fanout_head);
     pto2_fanout_unlock(task);
 
-    // Traverse fanout chain OUTSIDE the lock to avoid blocking orchestrator
+    // Traverse fanout chain OUTSIDE the lock to notify consumers
     int32_t current = fanout_head;
     while (current > 0) {
         PTO2DepListEntry* entry = pto2_dep_pool_get(sched->dep_pool, current);
@@ -276,40 +233,54 @@ void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id)
         current = entry->next_offset;
     }
 
-    // === STEP 2: Update fanout_refcount of all producers ===
-    // This task is a consumer of its fanin producers - release references
-    current = task->fanin_head;
+    // === STEP 2: Mark CONSUMED and CAS-advance ring pointers ===
+    // Mark this task as fully processed. Once CONSUMED is visible, the CAS loop
+    // below (or another thread's) can advance last_task_alive past this slot.
+    __atomic_store_n(&sched->task_state[slot], PTO2_TASK_CONSUMED, __ATOMIC_RELEASE);
+    __atomic_fetch_add(&sched->tasks_consumed, 1, __ATOMIC_RELAXED);
 
-    while (current > 0) {
-        PTO2DepListEntry* entry = pto2_dep_pool_get(sched->dep_pool, current);
-        if (!entry) break;
+    // CAS-based lock-free advancement of last_task_alive (matches pre-migration logic).
+    // Multiple threads race to advance; CAS serializes winners.
+    PTO2SharedMemoryHeader* header = sched->sm_handle->header;
+    int32_t la = PTO2_LOAD_ACQUIRE(&header->last_task_alive);
+    int32_t cti = PTO2_LOAD_ACQUIRE(&header->current_task_index);
 
-        int32_t producer_id = entry->task_id;
-        pto2_scheduler_release_producer(sched, producer_id);
+    while (la < cti) {
+        int32_t la_slot = la & sched->task_window_mask;
+        if (__atomic_load_n(&sched->task_state[la_slot], __ATOMIC_ACQUIRE) != PTO2_TASK_CONSUMED)
+            break;
 
-        current = entry->next_offset;
+        // Reset fanin_refcount before exposing slot for reuse
+        __atomic_store_n(&sched->fanin_refcount[la_slot], 0, __ATOMIC_RELEASE);
+
+        // Atomically advance last_task_alive by 1
+        int32_t expected = la;
+        if (__atomic_compare_exchange_n(&header->last_task_alive, &expected, la + 1,
+                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            // Ticket-based heap_tail serialization: wait for our turn, then write
+            while (__atomic_load_n(&header->heap_tail_gen, __ATOMIC_ACQUIRE) != la) {
+                PTO2_SPIN_PAUSE_LIGHT();
+            }
+            PTO2TaskDescriptor* consumed_t = pto2_sm_get_task(sched->sm_handle, la);
+            if (consumed_t->packed_buffer_end != NULL) {
+                uint64_t new_tail = (uint64_t)((char*)consumed_t->packed_buffer_end - (char*)sched->heap_base);
+                PTO2_STORE_RELEASE(&header->heap_tail, new_tail);
+            }
+            PTO2_STORE_RELEASE(&header->heap_tail_gen, la + 1);
+            la = la + 1;
+        } else {
+            break;
+        }
     }
-
-    // === STEP 3: Check if this task can transition to CONSUMED ===
-    check_and_handle_consumed(sched, task_id, task);
 }
 
 void pto2_scheduler_on_scope_end(PTO2SchedulerState* sched,
                                   const int32_t* task_ids, int32_t count) {
-    for (int32_t i = 0; i < count; i++) {
-        pto2_scheduler_release_producer(sched, task_ids[i]);
-    }
-}
-
-void pto2_scheduler_release_producer(PTO2SchedulerState* sched, int32_t producer_id) {
-    int32_t slot = sched->pto2_task_slot(producer_id);
-    PTO2TaskDescriptor* producer = pto2_sm_get_task(sched->sm_handle, producer_id);
-
-    // Increment fanout_refcount atomically (called from both orchestrator and scheduler threads)
-    __atomic_fetch_add(&sched->fanout_refcount[slot], 1, __ATOMIC_ACQ_REL);
-
-    // Check if producer can transition to CONSUMED
-    check_and_handle_consumed(sched, producer_id, producer);
+    // Scope references are no longer on the critical path for ring advancement.
+    // Tasks transition to CONSUMED directly in on_task_complete.
+    (void)sched;
+    (void)task_ids;
+    (void)count;
 }
 
 // =============================================================================
@@ -317,41 +288,14 @@ void pto2_scheduler_release_producer(PTO2SchedulerState* sched, int32_t producer
 // =============================================================================
 
 void pto2_scheduler_advance_ring_pointers(PTO2SchedulerState* sched) {
-    PTO2SharedMemoryHeader* header = sched->sm_handle->header;
-    int32_t current_task_index = PTO2_LOAD_ACQUIRE(&header->current_task_index);
-
-    // Advance last_task_alive while tasks at that position are CONSUMED
-    while (sched->last_task_alive < current_task_index) {
-        int32_t slot = sched->pto2_task_slot(sched->last_task_alive);
-
-        if (sched->task_state[slot] != PTO2_TASK_CONSUMED) {
-            break;  // Found non-consumed task, stop advancing
-        }
-
-        sched->last_task_alive++;
-    }
-
-    // Update heap_tail based on last consumed task's buffer
-    if (sched->last_task_alive > 0) {
-        int32_t last_consumed_id = sched->last_task_alive - 1;
-        PTO2TaskDescriptor* last_consumed = pto2_sm_get_task(sched->sm_handle, last_consumed_id);
-
-        if (last_consumed->packed_buffer_end != NULL) {
-            sched->heap_tail = (uint64_t)((char*)last_consumed->packed_buffer_end - (char*)sched->heap_base);
-        }
-    }
-
-    // Write to shared memory for orchestrator flow control
-    pto2_scheduler_sync_to_sm(sched);
+    // Ring advancement is now handled inline by the CAS loop in on_task_complete.
+    // This function is retained for API compatibility but is a no-op.
+    (void)sched;
 }
 
 void pto2_scheduler_sync_to_sm(PTO2SchedulerState* sched) {
-    PTO2SharedMemoryHeader* header = sched->sm_handle->header;
-
-    PTO2_STORE_RELEASE(&header->last_task_alive, sched->last_task_alive);
-    PTO2_STORE_RELEASE(&header->heap_tail, sched->heap_tail);
-    // Keep generation in sync so AICPU mode sees a consistent starting state
-    PTO2_STORE_RELEASE(&header->heap_tail_gen, sched->last_task_alive);
+    // Sync is now handled inline by the CAS loop in on_task_complete.
+    (void)sched;
 }
 
 // =============================================================================
@@ -367,9 +311,10 @@ bool pto2_scheduler_is_done(PTO2SchedulerState* sched) {
         return false;
     }
 
-    // Check if all tasks have been consumed
+    // Check if all tasks have been consumed (read directly from shared memory)
     int32_t current_task_index = PTO2_LOAD_ACQUIRE(&header->current_task_index);
-    return sched->last_task_alive >= current_task_index;
+    int32_t last_alive = PTO2_LOAD_ACQUIRE(&header->last_task_alive);
+    return last_alive >= current_task_index;
 }
 
 // =============================================================================

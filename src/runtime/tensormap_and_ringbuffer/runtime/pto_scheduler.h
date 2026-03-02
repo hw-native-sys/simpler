@@ -60,7 +60,8 @@ struct PTO2SchedulerState {
     PTO2SharedMemoryHandle* sm_handle;
 
     // Local copies of ring pointers (written to shared memory after update)
-    int32_t last_task_alive;      // Task ring tail
+    int32_t last_task_alive;      // Task ring tail (advances on COMPLETED for slot reuse)
+    int32_t last_heap_consumed;   // Heap watermark (advances on CONSUMED for buffer reuse)
     uint64_t heap_tail;           // Heap ring tail (offset from heap_base)
 
     // Heap base address (for converting absolute pointers to offsets)
@@ -267,16 +268,6 @@ void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id)
  */
 void pto2_scheduler_on_scope_end(PTO2SchedulerState* sched,
                                   const int32_t* task_ids, int32_t count);
-
-/**
- * Increment fanout_refcount and check CONSUMED
- *
- * Used when consumer completes or scope ends.
- *
- * @param sched       Scheduler state
- * @param producer_id Producer task ID
- */
-void pto2_scheduler_release_producer(PTO2SchedulerState* sched, int32_t producer_id);
 
 // =============================================================================
 // Ring Pointer Management
