@@ -15,6 +15,7 @@
 
 #include "common/unified_log.h"
 #include "pto_tensormap.h"
+#include "pto_types.h"
 #include "tensor.h"
 
 // =============================================================================
@@ -81,7 +82,7 @@ bool pto2_orchestrator_init(
     pto2_dep_pool_init(&orch->dep_pool, sm_handle->dep_list_pool, (int32_t)sm_handle->header->dep_list_pool_size);
 
     // Initialize TensorMap
-    if (!pto2_tensormap_init_default(&orch->tensor_map)) {
+    if (!orch->tensor_map.init_default()) {
         return false;
     }
     orch->tensor_map.orch = orch;
@@ -95,7 +96,7 @@ bool pto2_orchestrator_init(
     if (!orch->scope_tasks || !orch->scope_begins) {
         free(orch->scope_tasks);
         free(orch->scope_begins);
-        pto2_tensormap_destroy(&orch->tensor_map);
+        orch->tensor_map.destroy();
         return false;
     }
     orch->scope_tasks_size = 0;
@@ -110,7 +111,7 @@ bool pto2_orchestrator_init(
 }
 
 void pto2_orchestrator_destroy(PTO2OrchestratorState* orch) {
-    pto2_tensormap_destroy(&orch->tensor_map);
+    orch->tensor_map.destroy();
 
     free(orch->scope_tasks);
     orch->scope_tasks = NULL;
@@ -122,7 +123,7 @@ void pto2_orchestrator_reset(PTO2OrchestratorState* orch) {
     pto2_heap_ring_reset(&orch->heap_ring);
     pto2_task_ring_reset(&orch->task_ring);
     pto2_dep_pool_reset(&orch->dep_pool);
-    pto2_tensormap_reset(&orch->tensor_map);
+    orch->tensor_map.reset();
 
     orch->tensormap_last_cleanup = 0;
     orch->scope_stack_top = -1;
@@ -268,12 +269,12 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     CYCLE_COUNT_START();
 
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
-    pto2_orchestrator_sync_tensormap(&orch->tensor_map);
+    orch->tensor_map.sync_tensormap();
 
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC);
 
     // Submission without an open scope is illegal
-    assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
+    always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
 
     // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
     int32_t task_id = pto2_task_ring_alloc(&orch->task_ring);
@@ -303,7 +304,6 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     task->fanout_count = 1;
     task->packed_buffer_base = NULL;
     task->packed_buffer_end = NULL;
-    task->num_outputs = 0;
     task->is_active = true;
 
     // Register this task in its owning scope
@@ -338,11 +338,10 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
             case PTOParamType::INPUT: {
                 // Look up producer via TensorMap
                 PTO2LookupResult lookup_result;
-                pto2_tensormap_lookup(&orch->tensor_map, p.tensor, &lookup_result);
+                orch->tensor_map.lookup(p.tensor, lookup_result);
 
                 for (int r = 0; r < lookup_result.count; r++) {
-                    int32_t entry_idx = lookup_result.entries[r].entry_idx;
-                    auto &entry = orch->tensor_map.entry_pool[entry_idx];
+                    PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
                     auto overlap_status = lookup_result.entries[r].overlap_status;
                     // Check if this producer is already in fanin list (avoid duplicates)
                     int producer_task_id = entry.producer_task_id;
@@ -370,7 +369,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                         // 应将前面的tensor从tensor map中剔除。
                         // 但是最开始的tensor除外，因为必须建立和最开始的task的依赖关系以保证tensor生命周期的正确管理
                         if (!entry.with_alloc) {
-                            pto2_tensormap_remove_entry(orch->tensor_map, entry_idx);
+                            orch->tensor_map.remove_entry(entry);
                         }
                     }
                 }
@@ -395,7 +394,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // === STEP 3: Allocate packed buffer from Heap Ring (may stall) ===
     // Each output slot is aligned to PTO2_PACKED_OUTPUT_ALIGN (1024B); gap after data is padding.
     if (total_output_size > 0) {
-        task->packed_buffer_base = pto2_alloc_packed_buffer(orch, total_output_size);
+        task->packed_buffer_base = orch->pto2_alloc_packed_buffer(total_output_size);
         task->packed_buffer_end = (char*)task->packed_buffer_base + total_output_size;
 
         // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(size, 1024)
@@ -410,7 +409,6 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                     tensor_data.buffer.addr = alloc_addr;
                     offset += PTO2_ALIGN_UP(tensor_data.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
-                task->output_index[task->num_outputs++] = i;
             }
         }
     }
@@ -423,7 +421,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         if (p.type == PTOParamType::OUTPUT || p.type == PTOParamType::INOUT) {
             // Register in TensorMap: this tensor is produced by task_id
             // Use task's tensor_copies (which has the heap-allocated address for outputs)
-            pto2_tensormap_insert(&orch->tensor_map, p.tensor, task_id, p.type == PTOParamType::OUTPUT);
+            orch->tensor_map.insert(p.tensor, task_id, p.type == PTOParamType::OUTPUT);
         }
     }
 
@@ -515,7 +513,7 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
     LOG_INFO("Task ring active:    %d", pto2_task_ring_active_count(&orch->task_ring));
     LOG_INFO("Heap ring used:      %" PRIu64 " / %" PRIu64, orch->heap_ring.top, orch->heap_ring.size);
     LOG_INFO("Dep pool used:       %d / %d", pto2_dep_pool_used(&orch->dep_pool), orch->dep_pool.capacity);
-    LOG_INFO("TensorMap valid:     %d", pto2_tensormap_valid_count(&orch->tensor_map));
+    LOG_INFO("TensorMap valid:     %d", orch->tensor_map.valid_count());
     LOG_INFO("===============================");
 }
 

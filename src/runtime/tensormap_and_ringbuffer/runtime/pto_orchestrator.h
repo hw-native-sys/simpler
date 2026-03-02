@@ -93,6 +93,25 @@ struct PTO2OrchestratorState {
     volatile int32_t orch_ready_queue[4096];
     volatile int32_t orch_ready_tail;  // written by orchestrator only
     volatile int32_t orch_ready_head;  // advanced by scheduler via CAS
+
+    /**
+     * Allocate packed output buffer for a task
+     */
+    void* pto2_alloc_packed_buffer(int32_t total_size) {
+        if (total_size <= 0) {
+            return NULL;
+        }
+
+        void* buffer = pto2_heap_ring_alloc(&heap_ring, total_size);
+
+        buffers_allocated++;
+        bytes_allocated += total_size;
+
+        // Update shared memory with new heap top
+        PTO2_STORE_RELEASE(&sm_handle->header->heap_top, heap_ring.top);
+
+        return buffer;
+    }
 };
 
 // =============================================================================
@@ -220,11 +239,6 @@ bool pto2_orchestrator_has_space(PTO2OrchestratorState* orch);
  */
 void pto2_add_consumer_to_producer(
     PTO2OrchestratorState* orch, PTO2TaskDescriptor* producer, int32_t producer_id, int32_t consumer_id);
-
-/**
- * Allocate packed output buffer for a task
- */
-void* pto2_alloc_packed_buffer(PTO2OrchestratorState* orch, int32_t total_size);
 
 // =============================================================================
 // Debug Utilities
