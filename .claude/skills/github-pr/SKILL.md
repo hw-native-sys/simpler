@@ -1,125 +1,248 @@
 ---
 name: github-pr
-description: Create a GitHub pull request after committing, rebasing, and pushing changes. Use when the user asks to create a PR, submit changes for review, or open a pull request.
+description: Create or update a GitHub pull request after committing, rebasing, and pushing changes. Use when the user asks to create a PR, submit changes for review, or open a pull request.
 ---
 
 # GitHub Pull Request Workflow
 
-Two developer roles use this repo differently:
+## Setup: Detect Context
 
-| Role | Remote setup | Push target | PR target |
-| ---- | ------------ | ----------- | --------- |
-| **Repo owner** | `origin` = this repo | Feature branch on `origin` | `origin/<default-branch>` |
-| **Fork contributor** | `origin` = fork, `upstream` = this repo | Feature branch on `origin` (fork) | `upstream/<default-branch>` |
+### 1. Authenticate
 
-## Step 1: Detect Role and Default Branch
+```bash
+gh auth status
+```
+
+If not authenticated, tell user to run `gh auth login` and **stop**.
+
+### 2. Detect Role
 
 ```bash
 ORIGIN_URL=$(git remote get-url origin)
 UPSTREAM_URL=$(git remote get-url upstream 2>/dev/null || echo "")
-```
-
-Detect the default branch:
-
-```bash
 DEFAULT_BRANCH=$(git remote show origin | sed -n 's/.*HEAD branch: \(.*\)/\1/p')
 ```
 
-**Decision logic**:
+Two developer roles use this repo differently:
 
-| `upstream` exists? | Role | Base ref |
-| ------------------ | ---- | -------- |
-| No | Repo owner | `origin/$DEFAULT_BRANCH` |
-| Yes | Fork contributor | `upstream/$DEFAULT_BRANCH` |
+| Role | `upstream` exists? | Push target | PR target |
+| ---- | ------------------ | ----------- | --------- |
+| **Repo owner** | No | `origin` | `origin/$DEFAULT_BRANCH` |
+| **Fork contributor** | Yes | `origin` (fork) | `upstream/$DEFAULT_BRANCH` |
 
-Set `BASE_REF` accordingly for all subsequent steps.
+Compute these variables once — all later steps use them without role conditionals:
 
-## Step 2: Prepare Branch and Commit
+| Variable | Repo owner | Fork contributor |
+| -------- | ---------- | ---------------- |
+| `BASE_REF` | `origin/$DEFAULT_BRANCH` | `upstream/$DEFAULT_BRANCH` |
+| `PUSH_REMOTE` | `origin` | `origin` |
+| `PR_REPO` | *(omit — same repo)* | `OWNER/REPO` from `upstream` URL |
+| `PR_HEAD` | `$BRANCH_NAME` | `FORK_OWNER:$BRANCH_NAME` (`FORK_OWNER` from `origin` URL) |
+
+### 3. Fetch and Gather State
+
+Single fetch for all remotes:
+
+```bash
+git fetch origin
+if [ -n "$UPSTREAM_URL" ]; then git fetch upstream; fi
+```
+
+Gather current state:
 
 ```bash
 BRANCH_NAME=$(git branch --show-current)
-git status --porcelain
-git fetch origin
-if [ -n "$UPSTREAM_URL" ]; then git fetch upstream; fi
+UNCOMMITTED=$(git status --porcelain)
 COMMITS_AHEAD=$(git rev-list HEAD --not "$BASE_REF" --count)
 ```
 
-A branch "needs a new branch" when the branch name matches `$DEFAULT_BRANCH`.
+### 4. Check for Existing PR
 
-**Validation**: If `COMMITS_AHEAD == 0` and no uncommitted changes, error — nothing to PR.
+```bash
+gh pr list --head "$BRANCH_NAME" --state open
+```
 
-**Decision logic**:
+### 5. Route
 
-| Needs new branch? | Uncommitted changes? | Action |
-| ------------------ | -------------------- | ------ |
-| Yes | Yes | Create new branch, then commit via `/git-commit` |
-| Yes | No (commits ahead) | Create new branch (commits carry over) |
-| Yes | No (nothing ahead) | Error — nothing to PR. Tell user to make changes first |
-| No | Yes | Commit on current branch via `/git-commit` |
-| No | No | Validate commit message (see Step 4) |
+| Existing PR? | On default branch? | Commits ahead? | Uncommitted? | Route |
+| ------------ | ------------------- | -------------- | ------------ | ----- |
+| No | * | * | * | **Path A** (create new PR) |
+| Yes | No | Ahead > 0 | * | **Path B** (update existing PR) |
+| Yes | No | 0 | Yes | **Path B** (commit + update) |
+| Yes | No | 0 | No | Already up to date — exit |
 
-**If a new branch is needed:**
+**Validation**: If no existing PR, `COMMITS_AHEAD == 0`, and no uncommitted changes — error. Nothing to PR.
 
-1. Auto-generate a branch name with a meaningful prefix based on the changes — do NOT ask the user:
+---
 
-| Change type | Prefix |
-| ----------- | ------ |
-| New feature | `feat/` |
-| Bug fix | `fix/` |
-| Refactoring | `refactor/` |
-| Documentation | `docs/` |
-| Tooling / CI | `support/` |
-| Test changes | `test/` |
+## Path A: Create New PR
 
-2. Create and switch:
+### A1. Prepare Branch
+
+Check the current branch and its relationship to the changes being PR'd:
+
+| Current branch | Commits ahead of `$BASE_REF`? | Commits related to current changes? | Action |
+| -------------- | ----------------------------- | ----------------------------------- | ------ |
+| `$DEFAULT_BRANCH` | — | — | Create new branch from HEAD |
+| Feature branch | Yes, all related | Yes | Continue on it |
+| Feature branch | Yes, unrelated commits exist | No | Stash → new branch from `$BASE_REF` → pop |
+| Feature branch | No (0 ahead) | Branch name fits | Continue on it (uncommitted changes only) |
+| Feature branch | No (0 ahead) | Branch name unrelated | Stash → new branch from `$BASE_REF` → pop |
+
+**Case 1 — On `$DEFAULT_BRANCH`**: Create and switch to a new branch:
 
 ```bash
 git checkout -b <branch-name>
 ```
 
-3. Commit via `/git-commit` skill (mandatory — runs review and testing).
+**Case 2 — Feature branch, all commits related**: Continue on it. No action needed.
 
-## Step 3: Check for Existing PR
+**Case 3 — Feature branch, unrelated commits exist**: The branch has commits that are not part of the changes you want to PR. Stash uncommitted work, create a new branch from `$BASE_REF`, and restore:
 
 ```bash
-BRANCH_NAME=$(git branch --show-current)
-gh pr list --head "$BRANCH_NAME" --state open
+git stash
+git checkout -b <branch-name> "$BASE_REF"
+git stash pop
 ```
 
-**If PR exists**: Display with `gh pr view`. Check if local branch is ahead of the remote tracking branch:
+To detect this: inspect `git log $BASE_REF..HEAD --oneline` and compare those commits against the staged/unstaged changes. If any existing commits touch unrelated files or features, treat the branch as unrelated.
+
+**Case 4 — Feature branch, 0 commits ahead, branch name fits**: Continue on it — only uncommitted changes will be committed.
+
+**Case 5 — Feature branch, 0 commits ahead, branch name unrelated**: The branch name doesn't match the intent of the uncommitted changes. Stash, create a new branch, and restore:
 
 ```bash
-git rev-list origin/"$BRANCH_NAME"..HEAD --count
+git stash
+git checkout -b <branch-name> "$BASE_REF"
+git stash pop
 ```
 
-- Ahead > 0 → continue to Step 4–5 to push updates, skip Step 6
-- Ahead == 0 → already up to date, exit
+See **[Branch Naming](#branch-naming)** for how to generate the name. Do NOT ask the user.
 
-## Step 4: Rebase onto Base
+### A2. Commit Changes
+
+If there are uncommitted changes, delegate to `/git-commit` (runs review and testing).
+
+If already committed, skip.
+
+### A3. Ensure Single Valid Commit
+
+Follow the **[shared procedure](#shared-ensure-single-valid-commit)** below.
+
+### A4. Rebase
 
 ```bash
-git fetch origin
-if [ -n "$UPSTREAM_URL" ]; then git fetch upstream; fi
 git rebase "$BASE_REF"
 ```
 
-**On conflicts**:
+On conflicts: resolve files, `git add`, `git rebase --continue`. If stuck: `git rebase --abort`.
+
+After rebase, re-run the **[shared procedure](#shared-ensure-single-valid-commit)** if the rebase introduced changes.
+
+### A5. Push
+
+Always push to `origin`. Never push to `upstream` or other remotes. Use `git` commands (not `gh`).
 
 ```bash
-git status                       # View conflicts
-# Edit files, remove markers
-git add path/to/resolved/file
-git rebase --continue
-# If stuck: git rebase --abort
+git push --set-upstream origin "$BRANCH_NAME"
 ```
 
-**After rebase**: Verify exactly 1 commit ahead of base (squash if needed):
+### A6. Create PR
 
 ```bash
-git rev-list HEAD --not "$BASE_REF" --count
+gh pr create \
+  --repo "$PR_REPO" \
+  --base "$DEFAULT_BRANCH" \
+  --head "$PR_HEAD" \
+  --title "Brief description" \
+  --body "$(cat <<'EOF'
+## Summary
+- Key change 1
+- Key change 2
+
+## Testing
+- [ ] Simulation tests pass
+- [ ] Hardware tests pass (if applicable)
+
+Fixes #ISSUE_NUMBER (if applicable)
+EOF
+)"
 ```
 
-If more than 1 commit ahead, squash into a single commit:
+Auto-generate title and body from the commit message. Keep title under 72 characters. Do NOT add AI co-author footers.
+
+### Checklist A
+
+- [ ] `gh auth status` passes
+- [ ] Branch created (if on default branch)
+- [ ] Changes committed via `/git-commit`
+- [ ] Exactly 1 valid commit ahead of base
+- [ ] Rebased onto `$BASE_REF`
+- [ ] Pushed to `origin`
+- [ ] PR created with clear title and summary
+
+---
+
+## Path B: Update Existing PR
+
+Display the existing PR with `gh pr view`.
+
+### B1. Commit Changes
+
+If there are uncommitted changes, delegate to `/git-commit`.
+
+If already committed, skip.
+
+### B2. Ensure Single Valid Commit
+
+Follow the **[shared procedure](#shared-ensure-single-valid-commit)** below.
+
+### B3. Rebase
+
+```bash
+git rebase "$BASE_REF"
+```
+
+On conflicts: resolve files, `git add`, `git rebase --continue`. If stuck: `git rebase --abort`.
+
+After rebase, re-run the **[shared procedure](#shared-ensure-single-valid-commit)** if the rebase introduced changes.
+
+### B4. Push
+
+```bash
+git push --force-with-lease origin "$BRANCH_NAME"
+```
+
+Always push to `origin`. Never push to `upstream` or other remotes.
+
+### B5. Update PR Title/Body
+
+If the commit message changed, update the PR to match:
+
+```bash
+gh pr edit --title "Updated title" --body "Updated body"
+```
+
+### Checklist B
+
+- [ ] `gh auth status` passes
+- [ ] Changes committed via `/git-commit`
+- [ ] Exactly 1 valid commit ahead of base
+- [ ] Rebased onto `$BASE_REF`
+- [ ] Force-pushed to `origin`
+- [ ] PR title/body updated (if commit changed)
+
+---
+
+## Shared: Ensure Single Valid Commit
+
+### Squash if Needed
+
+```bash
+COMMITS_AHEAD=$(git rev-list HEAD --not "$BASE_REF" --count)
+```
+
+If more than 1 commit ahead, squash:
 
 ```bash
 git reset --soft "$BASE_REF"
@@ -128,14 +251,10 @@ git commit  # Re-commit with proper message via /git-commit conventions
 
 ### Validate Commit Message
 
-After ensuring exactly 1 commit ahead, check the commit message against `/git-commit` conventions:
-
 ```bash
 git log -1 --format='%s'   # Subject line
 git log -1 --format='%b'   # Body
 ```
-
-**Validation rules** (from `/git-commit` skill):
 
 | Rule | Check |
 | ---- | ----- |
@@ -146,13 +265,13 @@ git log -1 --format='%b'   # Body
 | Body | Required if commit touches 3+ files |
 | Co-author | No AI co-author lines |
 
-**If the message does not comply**, amend it:
+If the message does not comply, amend:
 
 ```bash
 git commit --amend -m "Type: corrected description"
 ```
 
-For multi-line messages with body:
+For multi-line messages:
 
 ```bash
 git commit --amend -m "$(cat <<'EOF'
@@ -163,121 +282,53 @@ EOF
 )"
 ```
 
-## Step 5: Push
+---
 
-Use `git` commands (not `gh`) for push.
+## Post-Merge Cleanup (Repo Owner Only)
 
-**Repo owner** — push feature branch to `origin`:
-
-```bash
-# First push
-git push --set-upstream origin "$BRANCH_NAME"
-
-# After rebase
-git push --force-with-lease origin "$BRANCH_NAME"
-```
-
-**Fork contributor** — push to `origin` (their fork):
-
-```bash
-# First push
-git push --set-upstream origin "$BRANCH_NAME"
-
-# After rebase
-git push --force-with-lease origin "$BRANCH_NAME"
-```
-
-Both roles always push to `origin`. Never push to `upstream` or other remotes.
-
-## Step 6: Create PR
-
-```bash
-gh auth status
-```
-
-**If gh not authenticated**: Tell user to run `gh auth login` and stop.
-
-**Repo owner** — PR within the same repo:
-
-```bash
-gh pr create \
-  --base "$DEFAULT_BRANCH" \
-  --head "$BRANCH_NAME" \
-  --title "Brief description" \
-  --body "$(cat <<'EOF'
-## Summary
-- Key change 1
-- Key change 2
-
-## Testing
-- [ ] Simulation tests pass
-- [ ] Hardware tests pass (if applicable)
-
-Fixes #ISSUE_NUMBER (if applicable)
-EOF
-)"
-```
-
-**Fork contributor** — PR from fork to upstream:
-
-```bash
-gh pr create \
-  --repo OWNER/REPO \
-  --base "$DEFAULT_BRANCH" \
-  --head "FORK_OWNER:$BRANCH_NAME" \
-  --title "Brief description" \
-  --body "$(cat <<'EOF'
-## Summary
-- Key change 1
-- Key change 2
-
-## Testing
-- [ ] Simulation tests pass
-- [ ] Hardware tests pass (if applicable)
-
-Fixes #ISSUE_NUMBER (if applicable)
-EOF
-)"
-```
-
-Extract `OWNER/REPO` from `upstream` URL, `FORK_OWNER` from `origin` URL.
-
-**PR title/body**: Auto-generate from commit messages. Keep the title under 72 characters.
-
-**Important**: Do NOT add AI co-author footers or branding.
-
-## Step 7: Post-Merge Cleanup (Repo Owner Only)
-
-After the PR is merged, the repo owner should delete the feature branch:
+After the PR is merged:
 
 ```bash
 git checkout "$DEFAULT_BRANCH"
 git pull origin "$DEFAULT_BRANCH"
-git branch -d "$BRANCH_NAME"                   # Delete local branch
-git push origin --delete "$BRANCH_NAME"         # Delete remote branch
+git branch -d "$BRANCH_NAME"
+git push origin --delete "$BRANCH_NAME"
 ```
 
-Fork contributors do not need remote cleanup — their fork branches are independent.
+Fork contributors do not need remote cleanup.
 
-## Common Issues
+---
+
+## Reference
+
+### Branch Naming
+
+1. Determine the commit type prefix:
+
+| Commit type | Branch prefix |
+| ----------- | ------------- |
+| Add | `feat/` |
+| Fix | `fix/` |
+| Update | `feat/` |
+| Refactor | `refactor/` |
+| Support | `support/` |
+| Sim | `sim/` |
+| CI | `support/` |
+
+2. Take the commit subject description (after `Type: `), lowercase it, replace spaces and special characters with hyphens, strip trailing hyphens.
+
+3. Truncate to 50 characters.
+
+Example: `Refactor: inline ring buffer hot paths` → `refactor/inline-ring-buffer-hot-paths`
+
+### Common Issues
 
 | Issue | Solution |
 | ----- | -------- |
-| PR already exists | `gh pr view`, push if ahead, then exit |
-| Merge conflicts | Resolve, `git add`, `git rebase --continue` |
-| Push rejected | `git push --force-with-lease` |
-| gh not authenticated | Tell user to run `gh auth login` |
-| More than 1 commit | Squash with `git reset --soft` + re-commit |
+| `gh auth` fails | Tell user to run `gh auth login` |
+| PR already exists | Route to Path B |
+| Merge conflicts during rebase | Resolve, `git add`, `git rebase --continue` |
+| Push rejected (non-fast-forward) | `git push --force-with-lease` after rebase |
+| More than 1 commit ahead | Squash via `git reset --soft` + re-commit |
 | Can't detect role | Check `git remote -v` output |
-
-## Checklist
-
-- [ ] Role detected (repo owner vs fork contributor)
-- [ ] Branch prepared (created from main if needed)
-- [ ] Changes committed via `/git-commit`
-- [ ] No existing PR for this branch
-- [ ] Rebased onto latest base ref
-- [ ] Exactly 1 commit ahead of base
-- [ ] Pushed to `origin` (never other remotes)
-- [ ] PR created with clear title and summary
-- [ ] (Repo owner) Feature branch deleted after merge
+| Nothing to PR | Error — tell user to make changes first |
