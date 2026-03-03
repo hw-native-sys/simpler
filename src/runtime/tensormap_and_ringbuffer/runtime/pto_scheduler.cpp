@@ -82,6 +82,7 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
     sched->total_dispatch_cycles = 0;
+    sched->ring_advance_lock.store(0, std::memory_order_relaxed);
 
     // Get runtime task_window_size from shared memory header
     uint64_t window_size = sm_handle->header->task_window_size;
@@ -172,6 +173,7 @@ void pto2_scheduler_reset(PTO2SchedulerState* sched) {
 
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
+    sched->ring_advance_lock.store(0, std::memory_order_relaxed);
 }
 
 // =============================================================================

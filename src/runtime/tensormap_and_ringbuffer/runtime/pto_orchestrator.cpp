@@ -367,7 +367,7 @@ void pto2_submit_task(
             int32_t producer_task_id = fanin_temp[i];
             // Add this task to producer's fanout list (with spinlock)
             PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, producer_task_id);
-            producer->fanout_count.fetch_add(1, std::memory_order_relaxed);
+            producer->fanout_count.fetch_add(1, std::memory_order_release);
             int32_t prod_slot = sched->pto2_task_slot(producer_task_id);
             pto2_fanout_lock(producer);
             // Normal path: prepend consumer to producer's fanout list

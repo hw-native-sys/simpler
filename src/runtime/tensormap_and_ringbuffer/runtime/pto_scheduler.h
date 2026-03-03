@@ -166,6 +166,7 @@ struct PTO2SchedulerState {
     std::atomic<int64_t> tasks_completed;
     std::atomic<int64_t> tasks_consumed;
     int64_t total_dispatch_cycles;
+    std::atomic<int32_t> ring_advance_lock{0};  // Try-lock for advance_ring_pointers
 
     // =========================================================================
     // Inline hot-path methods
@@ -223,8 +224,12 @@ struct PTO2SchedulerState {
         fanout_refcount[slot].store(0, std::memory_order_release);
         fanin_refcount[slot].store(0, std::memory_order_release);
 
-        if (task_id == last_task_alive) {
+        // Try-lock — if another thread is advancing, it will scan our CONSUMED task
+        int32_t expected_lock = 0;
+        if (ring_advance_lock.compare_exchange_strong(expected_lock, 1,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
             advance_ring_pointers();
+            ring_advance_lock.store(0, std::memory_order_release);
         }
     }
 
