@@ -12,6 +12,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #ifdef __linux__
+#include <sched.h>
 #include <sys/mman.h>
 #endif
 
@@ -530,7 +531,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                 int32_t task_id = executing_task_ids_[core_id];
-                pto2_scheduler_on_task_complete(&rt->scheduler, task_id);
+                rt->scheduler.on_task_complete(task_id);
                 executing_task_ids_[core_id] = AICPU_TASK_INVALID;
 
                 // Write AICPU dispatch/finish timestamps into the PerfRecord
@@ -578,7 +579,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 if (reg_state == TASK_FIN_STATE && executing_task_ids_[core_id] == AICPU_TASK_INVALID) {
                     Handshake* h = &hank[core_id];
                     PTO2WorkerType wt = (h->core_type == CoreType::AIC) ? PTO2_WORKER_CUBE : PTO2_WORKER_VECTOR;
-                    int32_t task_id = pto2_scheduler_get_ready_task(&rt->scheduler, wt);
+                    int32_t task_id = rt->scheduler.get_ready_task(wt);
                     if (task_id >= 0) {
                         PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
                         PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
@@ -678,6 +679,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             } else {
                 SPIN_WAIT_HINT();
             }
+            PTO2_SPIN_PAUSE_LIGHT();
 #if PTO2_ORCH_PROFILING
             sched_yield_count++;
 #endif
@@ -1085,8 +1087,8 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,
     uint64_t aic_ready = 0, aiv_ready = 0;
     if (rt) {
         PTO2SchedulerState* sched = &rt->scheduler;
-        aic_ready = pto2_ready_queue_count(&sched->ready_queues[PTO2_WORKER_CUBE]);
-        aiv_ready = pto2_ready_queue_count(&sched->ready_queues[PTO2_WORKER_VECTOR]);
+        aic_ready = sched->ready_queues[PTO2_WORKER_CUBE].size();
+        aiv_ready = sched->ready_queues[PTO2_WORKER_VECTOR].size();
     }
     DEV_ALWAYS("Ready Queues: AIC=%lu, AIV=%lu", aic_ready, aiv_ready);
 

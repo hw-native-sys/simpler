@@ -41,15 +41,6 @@ void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
     ring->last_alive_ptr = last_alive_ptr;
 }
 
-int32_t pto2_task_ring_active_count(PTO2TaskRing* ring) {
-    int32_t last_alive = ring->last_alive_ptr->load(std::memory_order_acquire);
-    return ring->current_index - last_alive;
-}
-
-bool pto2_task_ring_has_space(PTO2TaskRing* ring) {
-    int32_t active = pto2_task_ring_active_count(ring);
-    return active < ring->window_size - 1;
-}
 
 void pto2_task_ring_reset(PTO2TaskRing* ring) {
     ring->current_index = 0;
@@ -69,54 +60,7 @@ void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t c
     
     // Initialize entry 0 as NULL marker
     pool->base[0].task_id = -1;
-    pool->base[0].next_offset = 0;
-}
-
-int32_t pto2_dep_pool_alloc_one(PTO2DepListPool* pool) {
-    if (pool->top >= pool->capacity) {
-        // Wrap around to beginning (old entries reclaimed with task ring)
-        pool->top = 1;  // Start from 1, 0 means NULL
-    }
-    return pool->top++;
-}
-
-int32_t pto2_dep_list_prepend(PTO2DepListPool* pool, int32_t current_head, int32_t task_id) {
-    // Allocate new entry
-    int32_t new_offset = pto2_dep_pool_alloc_one(pool);
-    if (new_offset <= 0) {
-        return current_head;  // Allocation failed, return unchanged
-    }
-    
-    PTO2DepListEntry* new_entry = &pool->base[new_offset];
-    
-    // Fill in new entry: points to old head
-    new_entry->task_id = task_id;
-    new_entry->next_offset = current_head;  // Link to previous head
-    
-    return new_offset;  // New head
-}
-
-void pto2_dep_list_iterate(PTO2DepListPool* pool, int32_t head,
-                            void (*callback)(int32_t task_id, void* ctx), void* ctx) {
-    int32_t current = head;
-    
-    while (current > 0 && current < pool->capacity) {
-        PTO2DepListEntry* entry = &pool->base[current];
-        callback(entry->task_id, ctx);
-        current = entry->next_offset;
-    }
-}
-
-int32_t pto2_dep_list_count(PTO2DepListPool* pool, int32_t head) {
-    int32_t count = 0;
-    int32_t current = head;
-    
-    while (current > 0 && current < pool->capacity) {
-        count++;
-        current = pool->base[current].next_offset;
-    }
-    
-    return count;
+    pool->base[0].next = nullptr;
 }
 
 void pto2_dep_pool_reset(PTO2DepListPool* pool) {
@@ -127,7 +71,7 @@ void pto2_dep_pool_reset(PTO2DepListPool* pool) {
     
     // Re-initialize entry 0 as NULL marker
     pool->base[0].task_id = -1;
-    pool->base[0].next_offset = 0;
+    pool->base[0].next = nullptr;
 }
 
 int32_t pto2_dep_pool_used(PTO2DepListPool* pool) {
