@@ -23,6 +23,19 @@
 #include "pto_ring_buffer.h"
 
 // =============================================================================
+// Completion Statistics (returned by on_task_complete for profiling)
+// =============================================================================
+
+/**
+ * Statistics from a single on_task_complete call.
+ * Used by executor profiling to replace old fanout/steal counters.
+ */
+struct PTO2CompletionStats {
+    int32_t fanout_edges;      // Number of fanout edges traversed
+    int32_t tasks_enqueued;    // Number of consumers that became READY
+};
+
+// =============================================================================
 // Ready Queue Structure
 // =============================================================================
 
@@ -80,6 +93,14 @@ struct PTO2SchedulerState {
     // Ready queues (one per worker type)
     PTO2ReadyQueue ready_queues[PTO2_NUM_WORKER_TYPES];
 
+    // Lock-free orchestrator pending queue (SPSC producer, MPMC consumer)
+    // Orchestrator pushes newly-ready tasks here instead of touching ready_queue spinlock.
+    // Scanner threads drain this into ready_queues during the scan phase.
+    int32_t* orch_pending;               // Circular buffer of task IDs
+    volatile int64_t orch_pending_head;  // Consumer position (CAS-based pop)
+    volatile int64_t orch_pending_tail;  // Producer position (store-release only)
+    int64_t orch_pending_capacity;       // = task_window_size
+
     // Dependency list pool reference
     PTO2DepListPool* dep_pool;
 
@@ -103,15 +124,14 @@ struct PTO2SchedulerState {
     // =============================================================================
 
     /**
-     * Signal that one fanin dependency has been satisfied
+     * Mark task READY if all fanin dependencies are satisfied (CAS only, no enqueue).
      *
-     * Atomically increments fanin_refcount. If the new count equals
-     * fanin_count, CAS PENDING -> READY and enqueue.
+     * Atomically increments fanin_refcount. If the new count equals fanin_count,
+     * CAS PENDING -> READY. Does NOT push to any queue — caller decides where.
      *
-     * @param task_id Task ID
-     * @param task    Task descriptor
+     * @return true if the task transitioned to READY
      */
-    void release_fanin_and_check_ready(int32_t task_id, PTO2TaskDescriptor* task) {
+    bool release_fanin_and_mark_ready(int32_t task_id, PTO2TaskDescriptor* task) {
         int32_t slot = pto2_task_slot(task_id);
 
         // Atomically increment fanin_refcount and check if all producers are done
@@ -125,8 +145,58 @@ struct PTO2SchedulerState {
             PTO2TaskState expected = PTO2_TASK_PENDING;
             if (__atomic_compare_exchange_n(&task_state[slot], &expected, PTO2_TASK_READY,
                                              false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-                pto2_ready_queue_push(&ready_queues[task->worker_type], task_id);
+                return true;
             }
+        }
+        return false;
+    }
+
+    /**
+     * Signal that one fanin dependency has been satisfied (on_task_complete path).
+     *
+     * Calls release_fanin_and_mark_ready, then pushes to the ready_queue if READY.
+     *
+     * @return true if the task was enqueued (became READY)
+     */
+    bool release_fanin_and_check_ready(int32_t task_id, PTO2TaskDescriptor* task) {
+        if (release_fanin_and_mark_ready(task_id, task)) {
+            pto2_ready_queue_push(&ready_queues[task->worker_type], task_id);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * Push task_id to orch_pending (single producer, lock-free).
+     * Only called by orchestrator thread.
+     */
+    void orch_pending_push(int32_t task_id) {
+        int64_t tail = __atomic_load_n(&orch_pending_tail, __ATOMIC_RELAXED);
+        orch_pending[tail % orch_pending_capacity] = task_id;
+        __atomic_store_n(&orch_pending_tail, tail + 1, __ATOMIC_RELEASE);
+    }
+
+    /**
+     * Try to pop one task_id from orch_pending (multi-consumer, CAS-based).
+     * Called by scanner threads.
+     *
+     * @param out_task_id  receives the popped task_id on success
+     * @return true if a task was popped
+     */
+    bool orch_pending_try_pop(int32_t* out_task_id) {
+        while (true) {
+            int64_t head = __atomic_load_n(&orch_pending_head, __ATOMIC_ACQUIRE);
+            int64_t tail = __atomic_load_n(&orch_pending_tail, __ATOMIC_ACQUIRE);
+            if (head >= tail) {
+                return false;  // empty
+            }
+            int32_t task_id = orch_pending[head % orch_pending_capacity];
+            if (__atomic_compare_exchange_n(&orch_pending_head, &head, head + 1,
+                                             false, __ATOMIC_ACQ_REL, __ATOMIC_RELAXED)) {
+                *out_task_id = task_id;
+                return true;
+            }
+            // CAS failed — another consumer won; retry
         }
     }
 
@@ -140,7 +210,9 @@ struct PTO2SchedulerState {
         // concurrent on_task_complete between Step 5 and Step 6.
         fanout_refcount[slot] = 0;
 
-        release_fanin_and_check_ready(task_id, task);
+        if (release_fanin_and_mark_ready(task_id, task)) {
+            orch_pending_push(task_id);  // Lock-free, no spinlock
+        }
     }
 };
 
@@ -252,8 +324,9 @@ int32_t pto2_scheduler_get_ready_task(PTO2SchedulerState* sched,
  *
  * @param sched   Scheduler state
  * @param task_id Completed task ID
+ * @return Completion statistics for profiling
  */
-void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id);
+PTO2CompletionStats pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id);
 
 /**
  * Handle scope end (called when orchestrator ends a scope)

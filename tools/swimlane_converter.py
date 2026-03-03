@@ -564,7 +564,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
             "complete": "good",       # green
             "dispatch": "terrible",   # red
             "scan": "thread_state_running",  # blue
-            "early_ready": "yellow",  # yellow
+            "idle": "yellow",         # yellow
         }
 
         for thread_idx, thread_records in enumerate(scheduler_phases):

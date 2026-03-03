@@ -213,10 +213,6 @@ void pto2_add_consumer_to_producer(
     if (orch->aicpu_task_completed) {
         int32_t prod_slot = producer_id & orch->aicpu_window_mask;
         if (__atomic_load_n(&orch->aicpu_task_completed[prod_slot], __ATOMIC_ACQUIRE) >= 2 &&
-            // RELAXED is sufficient: the ACQUIRE on aicpu_task_completed above
-            // synchronizes with the RELEASE on task_completed in the scheduler,
-            // and completed_by_task is stored (with RELEASE) sequenced-before
-            // task_completed — so it is visible after the ACQUIRE load above.
             __atomic_load_n(&orch->aicpu_completed_by_task[prod_slot], __ATOMIC_RELAXED) == producer_id) {
             int32_t cons_slot = consumer_id & orch->aicpu_window_mask;
             __atomic_fetch_add(&orch->aicpu_fanin_refcount[cons_slot], 1, __ATOMIC_ACQ_REL);
@@ -243,22 +239,6 @@ void pto2_add_consumer_to_producer(
 
     // Release spinlock
     pto2_fanout_unlock(producer);
-}
-
-void* pto2_alloc_packed_buffer(PTO2OrchestratorState* orch, int32_t total_size) {
-    if (total_size <= 0) {
-        return NULL;
-    }
-
-    void* buffer = orch->heap_ring.pto2_heap_ring_alloc(total_size);
-
-    orch->buffers_allocated++;
-    orch->bytes_allocated += total_size;
-
-    // Update shared memory with new heap top
-    PTO2_STORE_RELEASE(&orch->sm_handle->header->heap_top, orch->heap_ring.top);
-
-    return buffer;
 }
 
 void pto2_submit_task(PTO2OrchestratorState* orch,
@@ -309,16 +289,13 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     // Register this task in its owning scope
     scope_tasks_push(orch, task_id);
 
-    // Temporary storage for collecting output sizes
-    int32_t total_output_size = 0;
-
     // Temporary storage for fanin
     int32_t fanin_temp[PTO2_MAX_INPUTS];
     int32_t fanin_count = 0;
 
     task->param_count = num_params;
     for (int i = 0; i < num_params; i++) {
-        task->params[i].type = params[i].type; 
+        task->params[i].type = params[i].type;
         if (params[i].type == PTOParamType::SCALAR) {
             task->params[i].scalar_value = params[i].scalar_value;
         } else {
@@ -328,8 +305,28 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 
     CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS);
 
-    // === STEP 2: First pass - collect output sizes and process inputs ===
+    // Temporary storage for collecting output sizes
+    int32_t total_output_size = 0;
+    for (int i = 0; i < num_params; i++) {
+        PTOParam& p = task->params[i];
+        if (p.type != PTOParamType::OUTPUT) {
+            continue;
+        }
+        auto& tensor_data = p.tensor.data();
+        // Only allocate from ring buffer when caller did not provide an address
+        if (tensor_data.buffer.addr == 0) {
+            total_output_size += PTO2_ALIGN_UP(tensor_data.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+        }
+    }
 
+    if (total_output_size > 0) {
+        task->packed_buffer_base = orch->pto2_alloc_packed_buffer(total_output_size);
+        task->packed_buffer_end = (char*)task->packed_buffer_base + total_output_size;
+    }
+    CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP);
+
+    // === STEP 2: First pass - set output addr and process tensor ===
+    int32_t offset = 0;
     for (int i = 0; i < num_params; i++) {
         PTOParam& p = task->params[i];
 
@@ -358,10 +355,6 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                         if (fanin_count < PTO2_MAX_INPUTS) {
                             fanin_temp[fanin_count++] = producer_task_id;
                         }
-
-                        // Add this task to producer's fanout list (with spinlock)
-                        PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, producer_task_id);
-                        pto2_add_consumer_to_producer(orch, producer, producer_task_id, task_id);
                     }
                     if (p.type == PTOParamType::INOUT && overlap_status == OverlapStatus::COVERED) {
                         // inout因为会再次insert进tensor map，
@@ -378,9 +371,13 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 
             case PTOParamType::OUTPUT: {
                 auto &tensor_data = p.tensor.data();
-                // Only allocate from ring buffer when caller did not provide an address
+                // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(size, 1024)
+                // Allocation happens here only; no memcpy of buffer content. Caller's tensor gets addr written back.
                 if (tensor_data.buffer.addr == 0) {
-                    total_output_size += PTO2_ALIGN_UP(tensor_data.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                    uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
+                    tensor_data.buffer.addr = alloc_addr;
+                    offset += PTO2_ALIGN_UP(tensor_data.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+
                 }
                 break;
             }
@@ -391,29 +388,6 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP);
 
-    // === STEP 3: Allocate packed buffer from Heap Ring (may stall) ===
-    // Each output slot is aligned to PTO2_PACKED_OUTPUT_ALIGN (1024B); gap after data is padding.
-    if (total_output_size > 0) {
-        task->packed_buffer_base = orch->pto2_alloc_packed_buffer(total_output_size);
-        task->packed_buffer_end = (char*)task->packed_buffer_base + total_output_size;
-
-        // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(size, 1024)
-        // Allocation happens here only; no memcpy of buffer content. Caller's tensor gets addr written back.
-        int32_t offset = 0;
-        for (int i = 0; i < task->param_count; i++) {
-            PTOParam& p = task->params[i];
-            if (p.type == PTOParamType::OUTPUT) {
-                auto &tensor_data = p.tensor.data();
-                if (tensor_data.buffer.addr == 0) {
-                    uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
-                    tensor_data.buffer.addr = alloc_addr;
-                    offset += PTO2_ALIGN_UP(tensor_data.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
-                }
-            }
-        }
-    }
-
-    CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP);
 
     // === STEP 4: Second pass - register outputs in TensorMap ===
     for (int i = 0; i < num_params; i++) {
@@ -429,35 +403,45 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 
     // === STEP 5: Finalize fanin list ===
     // First build the fanin list
-    for (int i = 0; i < fanin_count; i++) {
-        task->fanin_head = pto2_dep_list_prepend(&orch->dep_pool, task->fanin_head, fanin_temp[i]);
+    if (orch->scheduler) {
+        PTO2SchedulerState* sched = orch->scheduler;
+        int32_t slot = sched->pto2_task_slot(task_id);
+
+        int32_t early_finished = 0;
+        task->fanin_count = fanin_count + 1; // +1 redundance for not being ready too early
+        for (int i = 0; i < fanin_count; i++) {
+            int32_t producer_task_id = fanin_temp[i];
+            // Add this task to producer's fanout list (with spinlock)
+            PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, producer_task_id);
+            pto2_fanout_lock(producer);
+            producer->fanout_head = pto2_dep_list_prepend(&orch->dep_pool, producer->fanout_head, task_id);
+            producer->fanout_count++;
+            // Normal path: prepend consumer to producer's fanout list
+            task->fanin_head = pto2_dep_list_prepend(&orch->dep_pool, task->fanin_head, producer_task_id);
+
+            int32_t prod_slot = sched->pto2_task_slot(producer_task_id);
+            int32_t prod_state = __atomic_load_n(&sched->task_state[prod_slot], __ATOMIC_ACQUIRE);
+            if (prod_state == PTO2_TASK_COMPLETED) {
+                // Early return optimization: if producer already completed, we can skip adding dependency and directly decrement fanin_count
+                early_finished++;
+            }
+            pto2_fanout_unlock(producer);
+        }
+        if (early_finished > 0) {
+            __atomic_fetch_add(&sched->fanin_refcount[slot], early_finished, __ATOMIC_SEQ_CST);
+        }
+    } else {
+        // No scheduler: just build fanin list + add to producers using pto2_add_consumer_to_producer
+        for (int i = 0; i < fanin_count; i++) {
+            task->fanin_head = pto2_dep_list_prepend(&orch->dep_pool, task->fanin_head, fanin_temp[i]);
+            PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, fanin_temp[i]);
+            pto2_add_consumer_to_producer(orch, producer, fanin_temp[i], task_id);
+        }
+        __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_SEQ_CST);
     }
-    // SEQ_CST store: participates in the global total order with Phase 1's SEQ_CST
-    // fetch_add on s_pto2_fanin_refcount to prevent the IRIW hazard on ARM.
-    // (See comment above the fetch_add in aicpu_executor.cpp Phase 1 for details.)
-    __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_SEQ_CST);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN);
 
-    // === STEP 5b: Check if task is already ready (all producers completed via early-return) ===
-    // In AICPU parallel mode, early-return in pto2_add_consumer_to_producer may have
-    // already incremented aicpu_fanin_refcount for this task.  Now that fanin_count is
-    // finalized, check if the task is already satisfied and push it to the orchestrator
-    // ready queue so scheduler threads can pick it up without an O(N) scan.
-    if (orch->aicpu_fanin_refcount && fanin_count > 0) {
-        int32_t slot = task_id & orch->aicpu_window_mask;
-        int32_t refcount = __atomic_load_n(&orch->aicpu_fanin_refcount[slot], __ATOMIC_SEQ_CST);
-        if (refcount >= fanin_count) {
-            // All producers already completed — push to orch ready queue
-            int32_t tail = orch->orch_ready_tail;
-            int32_t capacity = PTO2OrchestratorState::ORCH_READY_QUEUE_SIZE;
-            int32_t head = __atomic_load_n(&orch->orch_ready_head, __ATOMIC_ACQUIRE);
-            if (((tail + 1) & (capacity - 1)) != (head & (capacity - 1))) {
-                orch->orch_ready_queue[tail & (capacity - 1)] = task_id;
-                __atomic_store_n(&orch->orch_ready_tail, tail + 1, __ATOMIC_RELEASE);
-            }
-        }
-    }
 
     // === STEP 6: Initialize task in scheduler ===
     // In multi-threaded mode, scheduler thread handles task initialization via polling

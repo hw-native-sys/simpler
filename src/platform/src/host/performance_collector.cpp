@@ -511,7 +511,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                     case AicpuPhaseId::SCHED_COMPLETE:    phase_name = "complete"; break;
                     case AicpuPhaseId::SCHED_DISPATCH:    phase_name = "dispatch"; break;
                     case AicpuPhaseId::SCHED_SCAN:        phase_name = "scan"; break;
-                    case AicpuPhaseId::SCHED_EARLY_READY: phase_name = "early_ready"; break;
+                    case AicpuPhaseId::SCHED_IDLE_WAIT:    phase_name = "idle"; break;
                     default: break;
                 }
 

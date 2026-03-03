@@ -205,7 +205,7 @@ enum class AicpuPhaseId : uint32_t {
     SCHED_COMPLETE    = 0,  // Process completed tasks (fanout traversal)
     SCHED_DISPATCH    = 1,  // Dispatch ready tasks to idle cores
     SCHED_SCAN        = 2,  // Incremental scan for root tasks
-    SCHED_EARLY_READY = 3,  // Drain orchestrator's early-ready queue
+    SCHED_IDLE_WAIT    = 3,  // Idle time (no progress made)
     // Orchestrator phases (16-24)
     ORCH_SYNC      = 16,  // tensormap sync
     ORCH_ALLOC     = 17,  // task_ring_alloc

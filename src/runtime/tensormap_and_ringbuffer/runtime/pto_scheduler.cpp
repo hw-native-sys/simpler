@@ -148,6 +148,21 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
         }
     }
 
+    // Initialize orch_pending lock-free queue
+    sched->orch_pending_capacity = window_size;
+    sched->orch_pending = (int32_t*)malloc(window_size * sizeof(int32_t));
+    if (!sched->orch_pending) {
+        for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
+            pto2_ready_queue_destroy(&sched->ready_queues[i]);
+        }
+        free(sched->fanout_refcount);
+        free(sched->fanin_refcount);
+        free(sched->task_state);
+        return false;
+    }
+    sched->orch_pending_head = 0;
+    sched->orch_pending_tail = 0;
+
     return true;
 }
 
@@ -170,6 +185,11 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
     for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
         pto2_ready_queue_destroy(&sched->ready_queues[i]);
     }
+
+    if (sched->orch_pending) {
+        free(sched->orch_pending);
+        sched->orch_pending = NULL;
+    }
 }
 
 void pto2_scheduler_reset(PTO2SchedulerState* sched) {
@@ -183,6 +203,9 @@ void pto2_scheduler_reset(PTO2SchedulerState* sched) {
     for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
         pto2_ready_queue_reset(&sched->ready_queues[i]);
     }
+
+    sched->orch_pending_head = 0;
+    sched->orch_pending_tail = 0;
 
     sched->tasks_completed = 0;
     sched->tasks_consumed = 0;
@@ -246,7 +269,8 @@ static void check_and_handle_consumed(PTO2SchedulerState* sched,
     }
 }
 
-void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id) {
+PTO2CompletionStats pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id) {
+    PTO2CompletionStats stats = {0, 0};
     int32_t slot = sched->pto2_task_slot(task_id);
     PTO2TaskDescriptor* task = pto2_sm_get_task(sched->sm_handle, task_id);
 
@@ -271,7 +295,10 @@ void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id)
         PTO2TaskDescriptor* consumer = pto2_sm_get_task(sched->sm_handle, consumer_id);
 
         // Atomically increment consumer's fanin_refcount and check if consumer is now ready
-        sched->release_fanin_and_check_ready(consumer_id, consumer);
+        stats.fanout_edges++;
+        if (sched->release_fanin_and_check_ready(consumer_id, consumer)) {
+            stats.tasks_enqueued++;
+        }
 
         current = entry->next_offset;
     }
@@ -292,6 +319,8 @@ void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id)
 
     // === STEP 3: Check if this task can transition to CONSUMED ===
     check_and_handle_consumed(sched, task_id, task);
+
+    return stats;
 }
 
 void pto2_scheduler_on_scope_end(PTO2SchedulerState* sched,
