@@ -6,6 +6,7 @@
  */
 
 #include "runtime.h"
+#include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
 
@@ -149,8 +150,6 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
     PTO2TaskDescriptor* task_descriptors = reinterpret_cast<PTO2TaskDescriptor*>(
         static_cast<char*>(sm_base) + header->task_descriptors_offset);
-    PTO2DepListEntry* dep_list_pool = reinterpret_cast<PTO2DepListEntry*>(
-        static_cast<char*>(sm_base) + header->dep_list_pool_offset);
     int32_t window_mask = header->task_window_size - 1;
 
     uint32_t count = perf_buf->count;
@@ -165,12 +164,11 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
 
         // Fill fanout information by traversing the linked list
         record->fanout_count = 0;
-        int32_t fanout_offset = task->fanout_head.load(std::memory_order_acquire);
+        PTO2DepListEntry* cur = task->fanout_head;
 
-        while (fanout_offset != 0 && record->fanout_count < RUNTIME_MAX_FANOUT) {
-            PTO2DepListEntry* entry = &dep_list_pool[fanout_offset];
-            record->fanout[record->fanout_count++] = entry->task_id;
-            fanout_offset = entry->next_offset;
+        while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
+            record->fanout[record->fanout_count++] = cur->task_id;
+            cur = cur->next;
         }
     }
 }

@@ -168,7 +168,7 @@ void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
     
     // Initialize dep_list_pool entry 0 as NULL marker
     handle->dep_list_pool[0].task_id = -1;
-    handle->dep_list_pool[0].next_offset = 0;
+    handle->dep_list_pool[0].next = nullptr;
 }
 
 void pto2_sm_reset(PTO2SharedMemoryHandle* handle) {

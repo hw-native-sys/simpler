@@ -25,37 +25,113 @@
 #include "pto_ring_buffer.h"
 
 // =============================================================================
-// Ready Queue Structure
+// Ready Queue (Lock-free bounded MPMC — Vyukov design)
 // =============================================================================
 
 /**
- * Per-worker-type ready queue
- * Circular buffer of task IDs
+ * Per-slot entry: sequence counter for ABA safety + task payload
  */
-struct PTO2ReadyQueue {
-    int32_t* task_ids;    // Circular buffer of task IDs
-    uint64_t head;        // Dequeue position
-    uint64_t tail;        // Enqueue position
-    uint64_t capacity;    // Queue capacity
-    uint64_t count;       // Current number of tasks in queue
-    std::atomic<int32_t> spinlock; // Spinlock for thread-safe push/pop
+struct PTO2ReadyQueueSlot {
+    std::atomic<int64_t> sequence;
+    int32_t task_id;
+    int32_t _pad;
 };
 
 /**
- * Push task to ready queue
- * @return true if successful, false if queue is full
+ * Lock-free bounded MPMC queue (Dmitry Vyukov design)
+ *
+ * Key properties:
+ * - enqueue_pos and dequeue_pos on separate cache lines (no false sharing)
+ * - Per-slot sequence counter prevents ABA problem
+ * - Empty queue pop returns immediately (single atomic load, no lock)
+ * - CAS contention is split: producers only touch enqueue_pos,
+ *   consumers only touch dequeue_pos
  */
-bool pto2_ready_queue_push(PTO2ReadyQueue* queue, int32_t task_id);
+struct alignas(64) PTO2ReadyQueue {
+    PTO2ReadyQueueSlot* slots;
+    uint64_t capacity;
+    uint64_t mask;                          // capacity - 1
+    char _pad0[64 - 24];                   // Pad to own cache line
+
+    std::atomic<uint64_t> enqueue_pos;
+    char _pad1[64 - sizeof(std::atomic<uint64_t>)];     // Own cache line
+
+    std::atomic<uint64_t> dequeue_pos;
+    char _pad2[64 - sizeof(std::atomic<uint64_t>)];     // Own cache line
+
+    uint64_t size() {
+        uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
+        uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
+        return (e >= d) ? (e - d) : 0;
+    }
+
+    bool push(int32_t task_id) {
+        uint64_t pos;
+        PTO2ReadyQueueSlot* slot;
+        while (true) {
+            pos = enqueue_pos.load(std::memory_order_relaxed);
+            slot = &slots[pos & mask];
+            int64_t seq = slot->sequence.load(std::memory_order_acquire);
+            int64_t diff = seq - (int64_t)pos;
+            if (diff == 0) {
+                if (enqueue_pos.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed))
+                    break;
+            } else if (diff < 0) {
+                return false;  // Queue full
+            }
+        }
+
+        slot->task_id = task_id;
+        slot->sequence.store((int64_t)(pos + 1), std::memory_order_release);
+        return true;
+    }
+
+    int32_t pop() {
+        // Fast-path: skip slot load when queue is clearly empty
+        uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
+        uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
+        if (d >= e) {
+            return -1;
+        }
+
+        uint64_t pos;
+        PTO2ReadyQueueSlot* slot;
+        while (true) {
+            pos = dequeue_pos.load(std::memory_order_relaxed);
+            slot = &slots[pos & mask];
+            int64_t seq = slot->sequence.load(std::memory_order_acquire);
+            int64_t diff = seq - (int64_t)(pos + 1);
+            if (diff == 0) {
+                if (dequeue_pos.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed))
+                    break;
+            } else if (diff < 0) {
+                return -1;  // Queue empty
+            }
+        }
+
+        int32_t task_id = slot->task_id;
+        slot->sequence.store((int64_t)(pos + mask + 1), std::memory_order_release);
+        return task_id;
+    }
+};
+
+// Cold-path ready queue operations (defined in pto_scheduler.cpp)
+bool pto2_ready_queue_init(PTO2ReadyQueue* queue, uint64_t capacity);
+void pto2_ready_queue_destroy(PTO2ReadyQueue* queue);
+void pto2_ready_queue_reset(PTO2ReadyQueue* queue);
 
 // =============================================================================
 // Scheduler State
 // =============================================================================
 
 /**
- * Scheduler state structure (private to Scheduler)
+ * Scheduler state structure
  *
  * Contains dynamic state updated during task execution.
  * Separated from shared memory for cache efficiency.
+ * Hot-path methods are defined inline (implicitly inline as member functions).
  */
 struct PTO2SchedulerState {
     // Shared memory access
@@ -91,30 +167,76 @@ struct PTO2SchedulerState {
     std::atomic<int64_t> tasks_consumed;
     int64_t total_dispatch_cycles;
 
+    // =========================================================================
+    // Inline hot-path methods
+    // =========================================================================
 
-
-    /**
-    * Calculate task slot from task_id
-    * Uses runtime window_size instead of compile-time constant
-    */
-    inline int32_t pto2_task_slot(int32_t task_id) {
+    int32_t pto2_task_slot(int32_t task_id) {
         return task_id & task_window_mask;
     }
 
-    // =============================================================================
-    // Task State Management
-    // =============================================================================
+    void sync_to_sm() {
+        PTO2SharedMemoryHeader* header = sm_handle->header;
+        header->last_task_alive.store(last_task_alive, std::memory_order_release);
+        header->heap_tail.store(heap_tail, std::memory_order_release);
+        header->heap_tail_gen.store(last_task_alive, std::memory_order_release);
+    }
 
-    /**
-     * Signal that one fanin dependency has been satisfied
-     *
-     * Atomically increments fanin_refcount. If the new count equals
-     * fanin_count, CAS PENDING -> READY and enqueue.
-     *
-     * @param task_id Task ID
-     * @param task    Task descriptor
-     */
-    void release_fanin_and_check_ready(int32_t task_id, PTO2TaskDescriptor* task) {
+    void advance_ring_pointers() {
+        PTO2SharedMemoryHeader* header = sm_handle->header;
+        int32_t current_task_index = header->current_task_index.load(std::memory_order_acquire);
+
+        while (last_task_alive < current_task_index) {
+            int32_t slot = pto2_task_slot(last_task_alive);
+            if (task_state[slot].load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
+                break;
+            }
+            last_task_alive++;
+        }
+
+        if (last_task_alive > 0) {
+            int32_t last_consumed_id = last_task_alive - 1;
+            PTO2TaskDescriptor* last_consumed = pto2_sm_get_task(sm_handle, last_consumed_id);
+            if (last_consumed->packed_buffer_end != NULL) {
+                heap_tail = (uint64_t)((char*)last_consumed->packed_buffer_end - (char*)heap_base);
+            }
+        }
+
+        sync_to_sm();
+    }
+
+    void check_and_handle_consumed(int32_t task_id, PTO2TaskDescriptor* task) {
+        int32_t slot = pto2_task_slot(task_id);
+
+        int32_t fc = task->fanout_count.load(std::memory_order_acquire);
+        int32_t rc = fanout_refcount[slot].load(std::memory_order_acquire);
+
+        if (rc != fc) return;
+
+        PTO2TaskState expected = PTO2_TASK_COMPLETED;
+        if (!task_state[slot].compare_exchange_strong(expected, PTO2_TASK_CONSUMED,
+                                          std::memory_order_acq_rel, std::memory_order_acquire)) {
+            return;
+        }
+
+        tasks_consumed.fetch_add(1, std::memory_order_relaxed);
+        fanout_refcount[slot].store(0, std::memory_order_release);
+        fanin_refcount[slot].store(0, std::memory_order_release);
+
+        if (task_id == last_task_alive) {
+            advance_ring_pointers();
+        }
+    }
+
+    void release_producer(int32_t producer_id) {
+        int32_t slot = pto2_task_slot(producer_id);
+        PTO2TaskDescriptor* producer = pto2_sm_get_task(sm_handle, producer_id);
+        fanout_refcount[slot].fetch_add(1, std::memory_order_acq_rel);
+        check_and_handle_consumed(producer_id, producer);
+    }
+
+    void release_fanin_and_check_ready(int32_t task_id,
+                                        PTO2TaskDescriptor* task) {
         int32_t slot = pto2_task_slot(task_id);
 
         // Atomically increment fanin_refcount and check if all producers are done
@@ -122,13 +244,11 @@ struct PTO2SchedulerState {
         // release in init_task, making fanin_count visible — plain load suffices.
         int32_t new_refcount = fanin_refcount[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
 
-        // Check if all producers have completed
         if (new_refcount == task->fanin_count) {
-            // CAS PENDING -> READY to prevent double-enqueue from concurrent threads
             PTO2TaskState expected = PTO2_TASK_PENDING;
             if (task_state[slot].compare_exchange_strong(
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
-                pto2_ready_queue_push(&ready_queues[task->worker_type], task_id);
+                ready_queues[task->worker_type].push(task_id);
             }
         }
     }
@@ -145,178 +265,78 @@ struct PTO2SchedulerState {
 
         release_fanin_and_check_ready(task_id, task);
     }
+
+    void mark_running(int32_t task_id) {
+        int32_t slot = pto2_task_slot(task_id);
+        task_state[slot].store(PTO2_TASK_RUNNING, std::memory_order_relaxed);
+    }
+
+    int32_t get_ready_task(PTO2WorkerType worker_type) {
+        return ready_queues[worker_type].pop();
+    }
+
+    bool is_done() {
+        PTO2SharedMemoryHeader* header = sm_handle->header;
+        int32_t orch_done = header->orchestrator_done.load(std::memory_order_acquire);
+        if (!orch_done) return false;
+        int32_t current_task_index = header->current_task_index.load(std::memory_order_acquire);
+        return last_task_alive >= current_task_index;
+    }
+
+    void on_scope_end(const int32_t* task_ids, int32_t count) {
+        for (int32_t i = 0; i < count; i++) {
+            release_producer(task_ids[i]);
+        }
+    }
+
+    int32_t on_task_complete(int32_t task_id) {
+        int32_t slot = pto2_task_slot(task_id);
+        PTO2TaskDescriptor* task = pto2_sm_get_task(sm_handle, task_id);
+        int32_t fanout_notified = 0;
+
+        tasks_completed.fetch_add(1, std::memory_order_relaxed);
+        pto2_fanout_lock(task);
+        task_state[slot].store(PTO2_TASK_COMPLETED, std::memory_order_release);
+        PTO2DepListEntry* current = task->fanout_head;  // Protected by fanout_lock
+        pto2_fanout_unlock(task);
+
+        while (current != nullptr) {
+            fanout_notified++;
+            int32_t consumer_id = current->task_id;
+            PTO2TaskDescriptor* consumer = pto2_sm_get_task(sm_handle, consumer_id);
+            release_fanin_and_check_ready(consumer_id, consumer);
+            current = current->next;
+        }
+
+        current = task->fanin_head;
+        while (current != nullptr) {
+            int32_t producer_id = current->task_id;
+            release_producer(producer_id);
+            current = current->next;
+        }
+
+        check_and_handle_consumed(task_id, task);
+        return fanout_notified;
+    }
 };
 
 // =============================================================================
-// Scheduler API
+// Scheduler API (cold path, defined in pto_scheduler.cpp)
 // =============================================================================
 
-/**
- * Initialize scheduler state
- *
- * @param sched      Scheduler state to initialize
- * @param sm_handle  Shared memory handle
- * @param dep_pool   Dependency list pool
- * @param heap_base  Base address of GM heap (for pointer-to-offset conversion)
- * @return true on success
- */
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
                           PTO2DepListPool* dep_pool,
                           void* heap_base);
-
-/**
- * Destroy scheduler state and free resources
- */
 void pto2_scheduler_destroy(PTO2SchedulerState* sched);
-
-/**
- * Reset scheduler state for reuse
- */
 void pto2_scheduler_reset(PTO2SchedulerState* sched);
 
 // =============================================================================
-// Ready Queue Operations
+// Debug Utilities (cold path, defined in pto_scheduler.cpp)
 // =============================================================================
 
-/**
- * Initialize a ready queue
- */
-bool pto2_ready_queue_init(PTO2ReadyQueue* queue, uint64_t capacity);
-
-/**
- * Destroy ready queue
- */
-void pto2_ready_queue_destroy(PTO2ReadyQueue* queue);
-
-/**
- * Reset ready queue to empty
- */
-void pto2_ready_queue_reset(PTO2ReadyQueue* queue);
-
-/**
- * Pop task from ready queue
- * @return task_id, or -1 if queue is empty
- */
-int32_t pto2_ready_queue_pop(PTO2ReadyQueue* queue);
-
-/**
- * Check if ready queue is empty
- */
-static inline bool pto2_ready_queue_empty(PTO2ReadyQueue* queue) {
-    return queue->count == 0;
-}
-
-/**
- * Check if ready queue is full
- */
-static inline bool pto2_ready_queue_full(PTO2ReadyQueue* queue) {
-    return queue->count >= queue->capacity;
-}
-
-/**
- * Get ready queue count
- */
-static inline uint64_t pto2_ready_queue_count(PTO2ReadyQueue* queue) {
-    return queue->count;
-}
-
-// =============================================================================
-// Task State Management
-// =============================================================================
-
-/**
- * Mark task as RUNNING (dispatched to worker)
- */
-void pto2_scheduler_mark_running(PTO2SchedulerState* sched, int32_t task_id);
-
-/**
- * Get next ready task from queue for worker type
- *
- * @param sched       Scheduler state
- * @param worker_type Worker type to get task for
- * @return task_id, or -1 if no ready tasks
- */
-int32_t pto2_scheduler_get_ready_task(PTO2SchedulerState* sched,
-                                       PTO2WorkerType worker_type);
-
-// =============================================================================
-// Task Completion Handling
-// =============================================================================
-
-/**
- * Handle task completion
- *
- * Called by worker when task execution finishes:
- * 1. Sets task state to COMPLETED
- * 2. Updates fanin_refcount of all consumers (may make them READY)
- * 3. Updates fanout_refcount of all producers (may make them CONSUMED)
- * 4. Checks if this task can transition to CONSUMED
- *
- * @param sched   Scheduler state
- * @param task_id Completed task ID
- */
-void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id);
-
-/**
- * Handle scope end (called when orchestrator ends a scope)
- *
- * Increments fanout_refcount for each task in the provided list.
- * May transition some tasks to CONSUMED.
- *
- * @param sched     Scheduler state
- * @param task_ids  Array of task IDs owned by the ending scope
- * @param count     Number of task IDs in the array
- */
-void pto2_scheduler_on_scope_end(PTO2SchedulerState* sched,
-                                  const int32_t* task_ids, int32_t count);
-
-// =============================================================================
-// Ring Pointer Management
-// =============================================================================
-
-/**
- * Advance last_task_alive and heap_tail
- *
- * Called when a task transitions to CONSUMED.
- * Advances pointers if possible, updating shared memory.
- *
- * @param sched Scheduler state
- */
-void pto2_scheduler_advance_ring_pointers(PTO2SchedulerState* sched);
-
-/**
- * Sync scheduler state to shared memory
- * Writes last_task_alive and heap_tail
- */
-void pto2_scheduler_sync_to_sm(PTO2SchedulerState* sched);
-
-// =============================================================================
-// Scheduler Main Loop
-// =============================================================================
-
-/**
- * Check if all tasks are done (orchestrator finished and all tasks consumed)
- */
-bool pto2_scheduler_is_done(PTO2SchedulerState* sched);
-
-// =============================================================================
-// Debug Utilities
-// =============================================================================
-
-/**
- * Print scheduler statistics
- */
 void pto2_scheduler_print_stats(PTO2SchedulerState* sched);
-
-/**
- * Print ready queue states
- */
 void pto2_scheduler_print_queues(PTO2SchedulerState* sched);
-
-/**
- * Get task state as string
- */
 const char* pto2_task_state_name(PTO2TaskState state);
 
 #endif // PTO_SCHEDULER_H

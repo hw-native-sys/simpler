@@ -228,10 +228,10 @@ typedef struct {
  * 
  * Used for both fanin_list and fanout_list
  */
-typedef struct {
+struct PTO2DepListEntry {
     int32_t task_id;          // The dependent/dependency task ID
-    int32_t next_offset;      // Offset to next entry (0 = end of list)
-} PTO2DepListEntry;
+    PTO2DepListEntry* next;      // next entry
+};
 
 // =============================================================================
 // Task Descriptor
@@ -255,13 +255,13 @@ struct PTO2TaskDescriptor {
     int32_t worker_type;          // Target: CUBE, VECTOR, AI_CPU, ACCELERATOR
     // Dependency lists (linked list heads - offsets into DepListPool)
     // Fanin: producers this task depends on (set once at submission)
-    int32_t fanin_head;           // Offset to first fanin entry (0 = empty)
+    PTO2DepListEntry* fanin_head;           // Offset to first fanin entry (0 = empty)
     int32_t fanin_count;          // Number of producer dependencies
     
     // Fanout: consumers that depend on this task (grows as consumers submit)
     // PROTECTED BY fanout_lock
     std::atomic<int32_t> fanout_lock; // Per-task spinlock (0=unlocked, 1=locked)
-    std::atomic<int32_t> fanout_head; // Offset to first fanout entry (0 = empty)
+    PTO2DepListEntry* fanout_head;    // Pointer to first fanout entry (nullptr = empty), PROTECTED BY fanout_lock
     std::atomic<int32_t> fanout_count;// 1 (owning scope) + number of consumers
     
     // Packed output buffer (all outputs packed into single contiguous buffer)
@@ -340,8 +340,15 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 // =============================================================================
 
 static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
-    while (task->fanout_lock.exchange(1, std::memory_order_acq_rel) != 0) {
-        PTO2_SPIN_PAUSE_LIGHT();
+    for (;;) {
+        while (task->fanout_lock.load(std::memory_order_acquire) != 0) {
+            PTO2_SPIN_PAUSE_LIGHT();
+        }
+        int32_t expected = 0;
+        if (task->fanout_lock.compare_exchange_weak(expected, 1,
+                                        std::memory_order_acquire, std::memory_order_relaxed)) {
+            return;
+        }
     }
 }
 

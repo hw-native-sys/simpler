@@ -7,13 +7,15 @@
  */
 
 #include "pto_orchestrator.h"
-#include <inttypes.h>
 
 #include <assert.h>
+#include <inttypes.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include "common/unified_log.h"
+#include "pto_runtime2_types.h"
 #include "pto_tensormap.h"
 #include "pto_types.h"
 #include "tensor.h"
@@ -32,14 +34,14 @@ __attribute__((weak)) uint64_t get_sys_cnt_aicpu() { return 0; }
 __attribute__((weak)) void perf_aicpu_record_orch_phase(
     AicpuPhaseId, uint64_t, uint64_t, uint32_t) {}
 // Accumulated nanoseconds per sub-step
-static uint64_t g_orch_sync_cycle      = 0;  // tensormap sync
-static uint64_t g_orch_alloc_cycle     = 0;  // task ring alloc
-static uint64_t g_orch_params_cycle    = 0;  // param copy
-static uint64_t g_orch_lookup_cycle    = 0;  // tensormap lookup + dep building
-static uint64_t g_orch_heap_cycle      = 0;  // heap alloc + output assign
-static uint64_t g_orch_insert_cycle    = 0;  // tensormap insert
-static uint64_t g_orch_fanin_cycle     = 0;  // fanin list + early-return check
-static uint64_t g_orch_finalize_cycle  = 0;  // scheduler init + SM update
+static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
+static uint64_t g_orch_alloc_cycle = 0;      // task ring alloc
+static uint64_t g_orch_params_cycle = 0;     // param copy
+static uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
+static uint64_t g_orch_heap_cycle = 0;       // heap alloc + output assign
+static uint64_t g_orch_insert_cycle = 0;     // tensormap insert
+static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
+static uint64_t g_orch_finalize_cycle = 0;   // scheduler init + SM update
 static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
 static int64_t  g_orch_submit_count = 0;
 static uint32_t g_orch_submit_idx = 0;
@@ -183,7 +185,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
     int32_t count = orch->scope_tasks_size - begin;
 
     if (orch->scheduler && count > 0) {
-        pto2_scheduler_on_scope_end(orch->scheduler, &orch->scope_tasks[begin], count);
+        orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
     }
 
     // Rewind the task buffer — these entries are no longer needed
@@ -199,41 +201,8 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // =============================================================================
 // Task Submission
 // =============================================================================
-
-void pto2_add_consumer_to_producer(
-    PTO2OrchestratorState* orch, PTO2TaskDescriptor* producer, int32_t producer_id, int32_t consumer_id) {
-    // Acquire per-task spinlock
-    // This synchronizes with scheduler's on_task_complete_threadsafe
-    pto2_fanout_lock(producer);
-
-    // Normal path: prepend consumer to producer's fanout list
-    int32_t fanout_head = producer->fanout_head.load(std::memory_order_relaxed);
-    producer->fanout_head.store(
-        pto2_dep_list_prepend(&orch->dep_pool, fanout_head, consumer_id),
-        std::memory_order_relaxed);
-    producer->fanout_count.fetch_add(1, std::memory_order_relaxed);
-
-    // Check if producer has already completed (scheduler mode)
-    if (orch->scheduler) {
-        PTO2SchedulerState* sched = orch->scheduler;
-        int32_t prod_slot = sched->pto2_task_slot(producer_id);
-        int32_t prod_state = sched->task_state[prod_slot].load(std::memory_order_acquire);
-
-        if (prod_state >= PTO2_TASK_COMPLETED) {
-            int32_t cons_slot = sched->pto2_task_slot(consumer_id);
-            sched->fanin_refcount[cons_slot].fetch_add(1, std::memory_order_acq_rel);
-        }
-    }
-
-    // Release spinlock
-    pto2_fanout_unlock(producer);
-}
-
-void pto2_submit_task(PTO2OrchestratorState* orch,
-    int32_t kernel_id,
-    PTO2WorkerType worker_type,
-    PTOParam* params,
-    int32_t num_params) {
+void pto2_submit_task(
+    PTO2OrchestratorState* orch, int32_t kernel_id, PTO2WorkerType worker_type, PTOParam* params, int32_t num_params) {
     CYCLE_COUNT_START();
 
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
@@ -255,9 +224,9 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     task->task_id = task_id;
     task->kernel_id = kernel_id;
     task->worker_type = worker_type;
-    task->fanin_head = 0;
+    task->fanin_head = nullptr;
     task->fanin_count = 0;
-    task->fanout_head.store(0, std::memory_order_relaxed);
+    task->fanout_head = nullptr;
     task->fanout_lock.store(0, std::memory_order_relaxed);
     // Initial fanout_count = 1 (the owning scope holds one reference)
     task->fanout_count.store(1, std::memory_order_relaxed);
@@ -317,7 +286,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
                 orch->tensor_map.lookup(p.tensor, lookup_result);
 
                 for (int r = 0; r < lookup_result.count; r++) {
-                    PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
+                    PTO2TensorMapEntry& entry = *lookup_result.entries[r].entry;
                     auto overlap_status = lookup_result.entries[r].overlap_status;
                     // Check if this producer is already in fanin list (avoid duplicates)
                     int producer_task_id = entry.producer_task_id;
@@ -349,7 +318,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
             }
 
             case PTOParamType::OUTPUT: {
-                auto &tensor_data = p.tensor.data();
+                auto& tensor_data = p.tensor.data();
                 // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(size, 1024)
                 // Allocation happens here only; no memcpy of buffer content. Caller's tensor gets addr written back.
                 if (tensor_data.buffer.addr == 0) {
@@ -386,39 +355,35 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
         PTO2SchedulerState* sched = orch->scheduler;
         int32_t slot = sched->pto2_task_slot(task_id);
 
+        auto &dep_pool = orch->dep_pool;
+
         int32_t early_finished = 0;
-        task->fanin_count = fanin_count + 1; // +1 redundance for not being ready too early
+        task->fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
+        for (int i = 0; i < fanin_count; i++) {
+            int32_t producer_task_id = fanin_temp[i];
+            task->fanin_head = dep_pool.pto2_dep_list_prepend(task->fanin_head, producer_task_id);
+        }
         for (int i = 0; i < fanin_count; i++) {
             int32_t producer_task_id = fanin_temp[i];
             // Add this task to producer's fanout list (with spinlock)
             PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, producer_task_id);
-            pto2_fanout_lock(producer);
-            int32_t producer_fanout_head = producer->fanout_head.load(std::memory_order_relaxed);
-            producer->fanout_head.store(
-                pto2_dep_list_prepend(&orch->dep_pool, producer_fanout_head, task_id),
-                std::memory_order_relaxed);
             producer->fanout_count.fetch_add(1, std::memory_order_relaxed);
-            // Normal path: prepend consumer to producer's fanout list
-            task->fanin_head = pto2_dep_list_prepend(&orch->dep_pool, task->fanin_head, producer_task_id);
-
             int32_t prod_slot = sched->pto2_task_slot(producer_task_id);
+            pto2_fanout_lock(producer);
+            // Normal path: prepend consumer to producer's fanout list
             int32_t prod_state = sched->task_state[prod_slot].load(std::memory_order_acquire);
             if (prod_state >= PTO2_TASK_COMPLETED) {
+                // Early return optimization: if producer already completed, we can skip adding dependency and directly
+                // decrement fanin_count
                 early_finished++;
+            } else {
+                producer->fanout_head = dep_pool.pto2_dep_list_prepend(producer->fanout_head, task_id);
             }
             pto2_fanout_unlock(producer);
         }
         if (early_finished > 0) {
             sched->fanin_refcount[slot].fetch_add(early_finished, std::memory_order_acq_rel);
         }
-    } else {
-        // No scheduler: just build fanin list + add to producers using pto2_add_consumer_to_producer
-        for (int i = 0; i < fanin_count; i++) {
-            task->fanin_head = pto2_dep_list_prepend(&orch->dep_pool, task->fanin_head, fanin_temp[i]);
-            PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, fanin_temp[i]);
-            pto2_add_consumer_to_producer(orch, producer, fanin_temp[i], task_id);
-        }
-        task->fanin_count = fanin_count;
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN);
@@ -458,7 +423,7 @@ void pto2_orchestrator_wait_all(PTO2OrchestratorState* orch) {
     }
 
     // Spin-wait until scheduler reports all tasks done
-    while (!pto2_scheduler_is_done(orch->scheduler)) {
+    while (!orch->scheduler->is_done()) {
         PTO2_SPIN_PAUSE();
     }
 }
@@ -498,14 +463,14 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
 #if PTO2_ORCH_PROFILING
 PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
-    d.sync_cycle      = g_orch_sync_cycle;
-    d.alloc_cycle     = g_orch_alloc_cycle;
-    d.params_cycle    = g_orch_params_cycle;
-    d.lookup_cycle    = g_orch_lookup_cycle;
-    d.heap_cycle      = g_orch_heap_cycle;
-    d.insert_cycle    = g_orch_insert_cycle;
-    d.fanin_cycle     = g_orch_fanin_cycle;
-    d.finalize_cycle  = g_orch_finalize_cycle;
+    d.sync_cycle = g_orch_sync_cycle;
+    d.alloc_cycle = g_orch_alloc_cycle;
+    d.params_cycle = g_orch_params_cycle;
+    d.lookup_cycle = g_orch_lookup_cycle;
+    d.heap_cycle = g_orch_heap_cycle;
+    d.insert_cycle = g_orch_insert_cycle;
+    d.fanin_cycle = g_orch_fanin_cycle;
+    d.finalize_cycle = g_orch_finalize_cycle;
     d.scope_end_cycle = g_orch_scope_end_cycle;
     d.submit_count = g_orch_submit_count;
 

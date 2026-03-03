@@ -368,12 +368,18 @@ void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
 /**
  * Get number of active tasks in window
  */
-int32_t pto2_task_ring_active_count(PTO2TaskRing* ring);
+static inline int32_t pto2_task_ring_active_count(PTO2TaskRing* ring) {
+    int32_t last_alive = ring->last_alive_ptr->load(std::memory_order_acquire);
+    return ring->current_index - last_alive;
+}
 
 /**
  * Check if task ring has space for more tasks
  */
-bool pto2_task_ring_has_space(PTO2TaskRing* ring);
+static inline bool pto2_task_ring_has_space(PTO2TaskRing* ring) {
+    int32_t active = pto2_task_ring_active_count(ring);
+    return active < ring->window_size - 1;
+}
 
 /**
  * Get task descriptor by ID
@@ -397,12 +403,48 @@ void pto2_task_ring_reset(PTO2TaskRing* ring);
  * Ring buffer for allocating linked list entries.
  * Supports O(1) prepend operation for fanin/fanout lists.
  */
-typedef struct {
+struct PTO2DepListPool {
     PTO2DepListEntry* base;   // Pool base address (from shared memory)
     int32_t capacity;         // Total number of entries
     int32_t top;              // Next allocation position (starts from 1, 0=NULL)
-    
-} PTO2DepListPool;
+
+    /**
+     * Allocate a single entry from the pool
+     *
+     * @return Offset to allocated entry (0 means allocation failed)
+     */
+    int32_t alloc() {
+        if (top >= capacity) {
+            top = 1;
+        }
+        return top++;
+    }
+
+    /**
+     * Prepend a task ID to a dependency list
+     *
+     * O(1) operation: allocates new entry and links to current head.
+     *
+     * @param current_head  Current list head offset (0 = empty list)
+     * @param task_id       Task ID to prepend
+     * @return New head offset
+     */
+    PTO2DepListEntry* pto2_dep_list_prepend(PTO2DepListEntry* cur, int32_t task_id) {
+        int32_t new_index = alloc();
+        PTO2DepListEntry& new_entry = base[new_index];
+        new_entry.task_id = task_id;
+        new_entry.next = cur;
+        return &new_entry;
+    }
+
+    /**
+    * Get entry by offset
+    */
+    PTO2DepListEntry* pto2_dep_pool_get(int32_t offset) {
+        if (offset <= 0) return NULL;
+        return &base[offset];
+    }
+};
 
 /**
  * Initialize dependency list pool
@@ -412,51 +454,6 @@ typedef struct {
  * @param capacity  Total number of entries
  */
 void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t capacity);
-
-/**
- * Allocate a single entry from the pool
- * 
- * @param pool  Dependency list pool
- * @return Offset to allocated entry (0 means allocation failed)
- */
-int32_t pto2_dep_pool_alloc_one(PTO2DepListPool* pool);
-
-/**
- * Prepend a task ID to a dependency list
- * 
- * O(1) operation: allocates new entry and links to current head.
- * 
- * @param pool          Dependency list pool
- * @param current_head  Current list head offset (0 = empty list)
- * @param task_id       Task ID to prepend
- * @return New head offset
- */
-int32_t pto2_dep_list_prepend(PTO2DepListPool* pool, int32_t current_head, int32_t task_id);
-
-/**
- * Get entry by offset
- */
-static inline PTO2DepListEntry* pto2_dep_pool_get(PTO2DepListPool* pool, int32_t offset) {
-    if (offset <= 0) return NULL;
-    return &pool->base[offset];
-}
-
-/**
- * Iterate through a dependency list
- * Calls callback for each task ID in the list.
- * 
- * @param pool      Dependency list pool
- * @param head      List head offset
- * @param callback  Function to call for each entry
- * @param ctx       User context passed to callback
- */
-void pto2_dep_list_iterate(PTO2DepListPool* pool, int32_t head,
-                            void (*callback)(int32_t task_id, void* ctx), void* ctx);
-
-/**
- * Count entries in a dependency list
- */
-int32_t pto2_dep_list_count(PTO2DepListPool* pool, int32_t head);
 
 /**
  * Reset dependency list pool
