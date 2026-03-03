@@ -25,13 +25,13 @@
 // =============================================================================
 // TensorMap Lookup Chain Length Statistics (compile-time toggle)
 // =============================================================================
-#if PTO2_ORCH_PROFILING
-static uint64_t g_lookup_chain_total = 0;
-static uint64_t g_lookup_count = 0;
-static int32_t  g_lookup_chain_max = 0;
-static uint64_t g_lookup_overlap_checks = 0;
-static uint64_t g_lookup_overlap_hits = 0;
-static uint64_t g_insert_count = 0;
+#if PTO2_TENSORMAP_PROFILING
+uint64_t g_lookup_chain_total = 0;
+uint64_t g_lookup_count = 0;
+int32_t  g_lookup_chain_max = 0;
+uint64_t g_lookup_overlap_checks = 0;
+uint64_t g_lookup_overlap_hits = 0;
+uint64_t g_insert_count = 0;
 #endif
 
 // =============================================================================
@@ -253,7 +253,7 @@ void PTO2TensorMap::sync_tensormap() {
 // =============================================================================
 // TensorMap Lookup Profiling
 // =============================================================================
-#if PTO2_ORCH_PROFILING
+#if PTO2_TENSORMAP_PROFILING
 PTO2TensorMapProfilingData pto2_tensormap_get_profiling() {
     PTO2TensorMapProfilingData d;
     d.lookup_chain_total = g_lookup_chain_total;

@@ -39,6 +39,22 @@
 struct PTO2OrchestratorState;  // forward declare
 
 // =============================================================================
+// TensorMap Lookup Profiling (must precede inline lookup/insert methods)
+// =============================================================================
+#ifndef PTO2_TENSORMAP_PROFILING
+#define PTO2_TENSORMAP_PROFILING 0
+#endif
+
+#if PTO2_TENSORMAP_PROFILING
+extern uint64_t g_lookup_chain_total;
+extern uint64_t g_lookup_count;
+extern int32_t  g_lookup_chain_max;
+extern uint64_t g_lookup_overlap_checks;
+extern uint64_t g_lookup_overlap_hits;
+extern uint64_t g_insert_count;
+#endif
+
+// =============================================================================
 // TensorMap Structure
 // =============================================================================
 
@@ -212,8 +228,15 @@ struct PTO2TensorMap {
         PTO2TensorMapEntry* cur_entry = *prev_ptr;
 
         result.count = 0;
+#if PTO2_TENSORMAP_PROFILING
+        g_lookup_count++;
+        int32_t chain_len = 0;
+#endif
 
         while (cur_entry != nullptr) {
+#if PTO2_TENSORMAP_PROFILING
+            chain_len++;
+#endif
             // Check validity first
             if (!entry_valid(*cur_entry)) {
                 // ========== STALE ENTRY: Truncate chain here ==========
@@ -227,16 +250,22 @@ struct PTO2TensorMap {
                     remove_entry(*cur_entry);
                     cur_entry = next_entry;
                 }
-                return;
+                break;
             }
 
             // Entry is valid - check if regions OVERLAP (not just exact match)
             // Since we hash only by base_ptr, all entries in this bucket have
             // potential to overlap. We must check actual byte-range overlap.
             if (query_tensor_data.buffer.addr == cur_entry->addr) {
+#if PTO2_TENSORMAP_PROFILING
+                g_lookup_overlap_checks++;
+#endif
                 auto overlap_status = query_tensor_data.is_overlap(cur_entry->tensor.data());
                 if (overlap_status != OverlapStatus::NO_OVERLAP) {
                     result.push(cur_entry, overlap_status);
+#if PTO2_TENSORMAP_PROFILING
+                    g_lookup_overlap_hits++;
+#endif
                 }
             }
 
@@ -244,6 +273,10 @@ struct PTO2TensorMap {
             prev_ptr = &cur_entry->next_in_bucket;
             cur_entry = *prev_ptr;
         }
+#if PTO2_TENSORMAP_PROFILING
+        g_lookup_chain_total += chain_len;
+        if (chain_len > g_lookup_chain_max) g_lookup_chain_max = chain_len;
+#endif
     }
 
     /**
@@ -256,6 +289,9 @@ struct PTO2TensorMap {
      * @param producer_task_id  Task ID of producer
      */
     void insert(const Tensor& tensor, int32_t producer_task_id, bool with_alloc) {
+#if PTO2_TENSORMAP_PROFILING
+        g_insert_count++;
+#endif
         // Allocate entry from ring buffer pool
         PTO2TensorMapEntry* entry = new_entry();
 
@@ -394,14 +430,7 @@ struct PTO2TensorMap {
     void sync_tensormap();
 };
 
-// =============================================================================
-// TensorMap Lookup Profiling
-// =============================================================================
-#ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 1
-#endif
-
-#if PTO2_ORCH_PROFILING
+#if PTO2_TENSORMAP_PROFILING
 struct PTO2TensorMapProfilingData {
     uint64_t lookup_chain_total;
     uint64_t lookup_count;

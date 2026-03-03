@@ -229,11 +229,11 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch);
 // Orchestrator Profiling Data
 // =============================================================================
 
-#ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 1
+#ifndef PTO2_PROFILING
+#define PTO2_PROFILING 1
 #endif
 
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
 struct PTO2OrchProfilingData {
     uint64_t sync_cycle;
     uint64_t alloc_cycle;

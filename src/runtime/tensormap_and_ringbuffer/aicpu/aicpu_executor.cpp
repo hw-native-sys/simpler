@@ -38,11 +38,11 @@
 #include "aicpu/platform_regs.h"
 
 // Scheduler profiling helper
-#ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 1
+#ifndef PTO2_PROFILING
+#define PTO2_PROFILING 1
 #endif
 
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
 // Accumulated nanoseconds per sub-step
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
@@ -473,21 +473,31 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     int32_t last_reported_task_count = 0;
 
     // Scheduler profiling counters
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
     uint64_t sched_scan_cycle = 0;
-    uint64_t sched_orch_drain_cycle = 0;
     uint64_t sched_complete_cycle = 0;
     uint64_t sched_dispatch_cycle = 0;
-    uint64_t sched_yield_cycle = 0;
+    uint64_t sched_idle_cycle = 0;
     uint64_t sched_loop_count = 0;
-    uint64_t sched_yield_count = 0;
+    uint64_t notify_edges_total = 0;
+    int32_t  notify_max_degree = 0;
+    uint64_t notify_tasks_enqueued = 0;
+    uint64_t fanin_edges_total = 0;
+    int32_t  fanin_max_degree = 0;
+    uint64_t pop_hit = 0;
+    uint64_t pop_miss = 0;
+    uint32_t phase_complete_count = 0;
+    uint32_t phase_dispatch_count = 0;
 #endif
 
     while (true) {
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
         sched_loop_count++;
 #endif
         CYCLE_COUNT_START();
+#if PTO2_PROFILING
+        uint64_t _t0_phase = _t0;
+#endif
         // Dynamic task_count (Thread 3 sets total_tasks_ when orchestration completes)
         int32_t task_count = total_tasks_.load(std::memory_order_acquire);
         bool orch_done = orchestrator_done_.load(std::memory_order_acquire);
@@ -531,7 +541,15 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                 int32_t task_id = executing_task_ids_[core_id];
-                rt->scheduler.on_task_complete(task_id);
+                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id);
+#if PTO2_PROFILING
+                notify_edges_total += cstats.fanout_edges;
+                if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
+                notify_tasks_enqueued += cstats.tasks_enqueued;
+                fanin_edges_total += cstats.fanin_edges;
+                if (cstats.fanin_edges > fanin_max_degree) fanin_max_degree = cstats.fanin_edges;
+                phase_complete_count++;
+#endif
                 executing_task_ids_[core_id] = AICPU_TASK_INVALID;
 
                 // Write AICPU dispatch/finish timestamps into the PerfRecord
@@ -568,6 +586,14 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             }
         }
         CYCLE_COUNT_LAP(sched_complete_cycle);
+#if PTO2_PROFILING
+        if (profiling_enabled && phase_complete_count > 0) {
+            perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_COMPLETE,
+                                    _t0_phase, _t1, sched_loop_count, phase_complete_count);
+            _t0_phase = _t1;
+            phase_complete_count = 0;
+        }
+#endif
 
         // Phase 2: Dispatch ready tasks to idle cores (register-based dispatch)
         if (cur_thread_tasks_in_flight < core_num) {
@@ -581,6 +607,10 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                     PTO2WorkerType wt = (h->core_type == CoreType::AIC) ? PTO2_WORKER_CUBE : PTO2_WORKER_VECTOR;
                     int32_t task_id = rt->scheduler.get_ready_task(wt);
                     if (task_id >= 0) {
+#if PTO2_PROFILING
+                        pop_hit++;
+                        phase_dispatch_count++;
+#endif
                         PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
                         PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                         build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
@@ -598,11 +628,23 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         cur_thread_tasks_in_flight++;
                         made_progress = true;
                         DEV_DEBUG("Thread %d: Dispatching PTO2 task %d to core %d", thread_idx, task_id, core_id);
+                    } else {
+#if PTO2_PROFILING
+                        pop_miss++;
+#endif
                     }
                 }
             }
         }
         CYCLE_COUNT_LAP(sched_dispatch_cycle);
+#if PTO2_PROFILING
+        if (profiling_enabled && phase_dispatch_count > 0) {
+            perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_DISPATCH,
+                                    _t0_phase, _t1, sched_loop_count, phase_dispatch_count);
+            _t0_phase = _t1;
+            phase_dispatch_count = 0;
+        }
+#endif
 
         // Update perf header total_tasks if visible tasks have changed
         {
@@ -617,6 +659,13 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             }
         }
         CYCLE_COUNT_LAP(sched_scan_cycle);
+#if PTO2_PROFILING
+        if (profiling_enabled) {
+            perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_SCAN,
+                                    _t0_phase, _t1, sched_loop_count, 0);
+            _t0_phase = _t1;
+        }
+#endif
 
         if (!made_progress) {
             idle_iterations++;
@@ -680,44 +729,64 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 SPIN_WAIT_HINT();
             }
             PTO2_SPIN_PAUSE_LIGHT();
-#if PTO2_ORCH_PROFILING
-            sched_yield_count++;
+            CYCLE_COUNT_LAP(sched_idle_cycle);
+#if PTO2_PROFILING
+            if (profiling_enabled) {
+                perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT,
+                                        _t0_phase, _t1, sched_loop_count, 0);
+                _t0_phase = _t1;
+            }
 #endif
-            CYCLE_COUNT_LAP(sched_yield_cycle);
         } else {
             idle_iterations = 0;
         }
     }
 
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
+    if (profiling_enabled) {
     uint64_t sched_total =
-        sched_scan_cycle + sched_orch_drain_cycle + sched_complete_cycle + sched_dispatch_cycle + sched_yield_cycle;
+        sched_complete_cycle + sched_scan_cycle + sched_dispatch_cycle + sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;  // avoid div-by-zero
-    DEV_ALWAYS("Thread %d: PTO2 scheduler stats: loops=%llu, completed=%d, total=%.3fus",
+    double tasks_per_loop = sched_loop_count > 0 ? (double)cur_thread_completed / sched_loop_count : 0.0;
+    DEV_ALWAYS("Thread %d: completed=%d tasks in %.3fus (%llu loops, %.1f tasks/loop)",
         thread_idx,
-        (unsigned long long)sched_loop_count,
         cur_thread_completed,
-        cycles_to_us(sched_total));
-    DEV_ALWAYS(
-        "Thread %d:   scan=%.3fus (%.1f%%), orch_drain=%.3fus (%.1f%%), complete=%.3fus (%.1f%%), dispatch=%.3fus "
-        "(%.1f%%)",
+        cycles_to_us(sched_total),
+        (unsigned long long)sched_loop_count,
+        tasks_per_loop);
+    DEV_ALWAYS("Thread %d: --- Phase Breakdown ---", thread_idx);
+    double notify_avg = cur_thread_completed > 0
+        ? (double)notify_edges_total / cur_thread_completed : 0.0;
+    double fanin_avg = cur_thread_completed > 0
+        ? (double)fanin_edges_total / cur_thread_completed : 0.0;
+    DEV_ALWAYS("Thread %d:   complete:    %.3fus (%.1f%%)  [fanout: edges=%llu, max_degree=%d, avg=%.1f]  [fanin: edges=%llu, max_degree=%d, avg=%.1f]",
         thread_idx,
-        cycles_to_us(sched_scan_cycle),
-        sched_scan_cycle * 100.0 / sched_total,
-        cycles_to_us(sched_orch_drain_cycle),
-        sched_orch_drain_cycle * 100.0 / sched_total,
         cycles_to_us(sched_complete_cycle),
         sched_complete_cycle * 100.0 / sched_total,
-        cycles_to_us(sched_dispatch_cycle),
-        sched_dispatch_cycle * 100.0 / sched_total);
-    DEV_ALWAYS("Thread %d:   yield=%.3fus (%.1f%%, %llu calls, avg=%.1fus)",
+        (unsigned long long)notify_edges_total,
+        notify_max_degree,
+        notify_avg,
+        (unsigned long long)fanin_edges_total,
+        fanin_max_degree,
+        fanin_avg);
+    DEV_ALWAYS("Thread %d:   scan:        %.3fus (%.1f%%)",
         thread_idx,
-        cycles_to_us(sched_yield_cycle),
-        sched_yield_cycle * 100.0 / sched_total,
-        (unsigned long long)sched_yield_count,
-        sched_yield_count > 0 ? cycles_to_us(sched_yield_cycle) / sched_yield_count : 0.0);
-
-    DEV_ALWAYS("Thread %d: PTO2 execution complete, completed %d tasks", thread_idx, cur_thread_completed);
+        cycles_to_us(sched_scan_cycle),
+        sched_scan_cycle * 100.0 / sched_total);
+    uint64_t pop_total = pop_hit + pop_miss;
+    double pop_hit_rate = pop_total > 0 ? pop_hit * 100.0 / pop_total : 0.0;
+    DEV_ALWAYS("Thread %d:   dispatch:    %.3fus (%.1f%%)  [pop: hit=%llu, miss=%llu, hit_rate=%.1f%%]",
+        thread_idx,
+        cycles_to_us(sched_dispatch_cycle),
+        sched_dispatch_cycle * 100.0 / sched_total,
+        (unsigned long long)pop_hit,
+        (unsigned long long)pop_miss,
+        pop_hit_rate);
+    DEV_ALWAYS("Thread %d:   idle:        %.3fus (%.1f%%)",
+        thread_idx,
+        cycles_to_us(sched_idle_cycle),
+        sched_idle_cycle * 100.0 / sched_total);
+    }
 #endif
 
     // Flush performance buffers for cores managed by this thread
@@ -911,54 +980,56 @@ int AicpuExecutor::run(Runtime* runtime) {
                 cycles_to_us(orch_cycle_end - orch_cycle_start));
 
             // Print orchestrator profiling data
-#if PTO2_ORCH_PROFILING
-            {
+#if PTO2_PROFILING
+            if (runtime->enable_profiling) {
                 PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
                 uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle +
                                  p.lookup_cycle + p.heap_cycle + p.insert_cycle +
                                  p.fanin_cycle + p.finalize_cycle;
-                DEV_ALWAYS("=== Orchestrator Profiling: %lld tasks, total=%.3fus ===",
+                if (total == 0) total = 1;  // avoid div-by-zero
+                DEV_ALWAYS("Thread 3: === Orchestrator Profiling: %lld tasks, total=%.3fus ===",
                          (long long)p.submit_count, cycles_to_us(total));
-                DEV_ALWAYS("  sync_tensormap : %.3fus (%.1f%%)", cycles_to_us(p.sync_cycle), p.sync_cycle * 100.0 / total);
-                DEV_ALWAYS("  task_ring_alloc: %.3fus (%.1f%%)", cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total);
-                DEV_ALWAYS("  param_copy     : %.3fus (%.1f%%)", cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total);
-                DEV_ALWAYS("  lookup+dep     : %.3fus (%.1f%%)", cycles_to_us(p.lookup_cycle), p.lookup_cycle * 100.0 / total);
-                DEV_ALWAYS("  heap_alloc     : %.3fus (%.1f%%)", cycles_to_us(p.heap_cycle), p.heap_cycle * 100.0 / total);
-                DEV_ALWAYS("  tensormap_ins  : %.3fus (%.1f%%)", cycles_to_us(p.insert_cycle), p.insert_cycle * 100.0 / total);
-                DEV_ALWAYS("  fanin+ready    : %.3fus (%.1f%%)", cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total);
-                DEV_ALWAYS("  finalize+SM    : %.3fus (%.1f%%)", cycles_to_us(p.finalize_cycle), p.finalize_cycle * 100.0 / total);
-                DEV_ALWAYS("  scope_end      : %.3fus", cycles_to_us(p.scope_end_cycle));
-                DEV_ALWAYS("  avg/task       : %.3fus", cycles_to_us(total) / p.submit_count);
+                DEV_ALWAYS("Thread 3:   sync_tensormap : %.3fus (%.1f%%)", cycles_to_us(p.sync_cycle), p.sync_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread 3:   task_ring_alloc: %.3fus (%.1f%%)", cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread 3:   param_copy     : %.3fus (%.1f%%)", cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread 3:   lookup+dep     : %.3fus (%.1f%%)", cycles_to_us(p.lookup_cycle), p.lookup_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread 3:   heap_alloc     : %.3fus (%.1f%%)", cycles_to_us(p.heap_cycle), p.heap_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread 3:   tensormap_ins  : %.3fus (%.1f%%)", cycles_to_us(p.insert_cycle), p.insert_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread 3:   fanin+ready    : %.3fus (%.1f%%)", cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread 3:   finalize+SM    : %.3fus (%.1f%%)", cycles_to_us(p.finalize_cycle), p.finalize_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread 3:   scope_end      : %.3fus", cycles_to_us(p.scope_end_cycle));
+                DEV_ALWAYS("Thread 3:   avg/task       : %.3fus",
+                    p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0);
 
+#if PTO2_TENSORMAP_PROFILING
                 PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
-                DEV_ALWAYS("=== TensorMap Lookup Stats ===");
-                DEV_ALWAYS("  lookups        : %llu, inserts: %llu",
+                DEV_ALWAYS("Thread 3: === TensorMap Lookup Stats ===");
+                DEV_ALWAYS("Thread 3:   lookups        : %llu, inserts: %llu",
                     (unsigned long long)tp.lookup_count, (unsigned long long)tp.insert_count);
-                DEV_ALWAYS("  chain walked   : total=%llu, avg=%.1f, max=%d",
+                DEV_ALWAYS("Thread 3:   chain walked   : total=%llu, avg=%.1f, max=%d",
                     (unsigned long long)tp.lookup_chain_total,
                     tp.lookup_count > 0 ? (double)tp.lookup_chain_total / tp.lookup_count : 0.0,
                     tp.lookup_chain_max);
-                DEV_ALWAYS("  overlap checks : %llu, hits=%llu (%.1f%%)",
+                DEV_ALWAYS("Thread 3:   overlap checks : %llu, hits=%llu (%.1f%%)",
                     (unsigned long long)tp.overlap_checks, (unsigned long long)tp.overlap_hits,
                     tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0);
+#endif
 
                 // Write orchestrator summary to shared memory for host-side export
-                if (runtime->enable_profiling) {
-                    AicpuOrchSummary orch_summary = {};
-                    orch_summary.start_time = orch_cycle_start;
-                    orch_summary.end_time = orch_cycle_end;
-                    orch_summary.sync_cycle = p.sync_cycle;
-                    orch_summary.alloc_cycle = p.alloc_cycle;
-                    orch_summary.params_cycle = p.params_cycle;
-                    orch_summary.lookup_cycle = p.lookup_cycle;
-                    orch_summary.heap_cycle = p.heap_cycle;
-                    orch_summary.insert_cycle = p.insert_cycle;
-                    orch_summary.fanin_cycle = p.fanin_cycle;
-                    orch_summary.finalize_cycle = p.finalize_cycle;
-                    orch_summary.scope_end_cycle = p.scope_end_cycle;
-                    orch_summary.submit_count = p.submit_count;
-                    perf_aicpu_write_orch_summary(&orch_summary);
-                }
+                AicpuOrchSummary orch_summary = {};
+                orch_summary.start_time = orch_cycle_start;
+                orch_summary.end_time = orch_cycle_end;
+                orch_summary.sync_cycle = p.sync_cycle;
+                orch_summary.alloc_cycle = p.alloc_cycle;
+                orch_summary.params_cycle = p.params_cycle;
+                orch_summary.lookup_cycle = p.lookup_cycle;
+                orch_summary.heap_cycle = p.heap_cycle;
+                orch_summary.insert_cycle = p.insert_cycle;
+                orch_summary.fanin_cycle = p.fanin_cycle;
+                orch_summary.finalize_cycle = p.finalize_cycle;
+                orch_summary.scope_end_cycle = p.scope_end_cycle;
+                orch_summary.submit_count = p.submit_count;
+                perf_aicpu_write_orch_summary(&orch_summary);
             }
 #endif
 
@@ -975,7 +1046,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             PTO2SharedMemoryHeader* sm_header = static_cast<PTO2SharedMemoryHeader*>(sm);
             int32_t pto2_task_count =
                 sm_header ? sm_header->current_task_index.load(std::memory_order_acquire) : 0;
-            DEV_ALWAYS("PTO2 total submitted tasks = %d", pto2_task_count);
+            DEV_ALWAYS("Thread 3: PTO2 total submitted tasks = %d", pto2_task_count);
             total_tasks_.store(pto2_task_count, std::memory_order_release);
             orchestrator_done_.store(true, std::memory_order_release);
             DEV_INFO("Thread 3: Set orchestrator_done=true, waiting for scheduler threads");

@@ -23,7 +23,7 @@
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
 // =============================================================================
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
 #include "aicpu/device_time.h"
 #include "aicpu/performance_collector_aicpu.h"
 // Weak fallback for builds that don't link device_time.cpp (e.g. host).
@@ -177,7 +177,7 @@ void pto2_scope_begin(PTO2OrchestratorState* orch) {
 void pto2_scope_end(PTO2OrchestratorState* orch) {
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
 
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
     uint64_t _se0 = get_sys_cnt_aicpu();
 #endif
 
@@ -191,7 +191,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
     // Rewind the task buffer — these entries are no longer needed
     orch->scope_tasks_size = begin;
 
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
     uint64_t _se1 = get_sys_cnt_aicpu();
     g_orch_scope_end_cycle += (_se1 - _se0);
     perf_aicpu_record_orch_phase(AicpuPhaseId::ORCH_SCOPE_END, _se0, _se1, g_orch_submit_idx);
@@ -401,7 +401,7 @@ void pto2_submit_task(
     CYCLE_COUNT_LAP_RECORD(g_orch_finalize_cycle, AicpuPhaseId::ORCH_FINALIZE);
 
     orch->tasks_submitted++;
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
     g_orch_submit_count++;
     g_orch_submit_idx++;
 #endif
@@ -460,7 +460,7 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
     LOG_INFO("==================");
 }
 
-#if PTO2_ORCH_PROFILING
+#if PTO2_PROFILING
 PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
     d.sync_cycle = g_orch_sync_cycle;

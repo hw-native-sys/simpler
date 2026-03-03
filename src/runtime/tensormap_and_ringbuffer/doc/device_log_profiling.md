@@ -37,18 +37,18 @@ Thread 3 loads the orchestration `.so` via `dlopen`, calls `aicpu_orchestration_
 Thread 3: Calling aicpu_orchestration_entry from SO
 aicpu_orchestration_entry ">>>>>> batch = 64"
 Thread 3: aicpu_orchestration_entry returned, cost 20943.940us
-=== Orchestrator Profiling: 16704 tasks, total=14601.580us ===
-  sync_tensormap : 286.300us (2.0%)
-  task_ring_alloc: 380.400us (2.6%)
-  param_copy     : 2147.800us (14.7%)
-  lookup+dep     : 7290.300us (49.9%)
-  heap_alloc     : 701.500us (4.8%)
-  tensormap_ins  : 1890.380us (12.9%)
-  fanin+ready    : 1207.400us (8.3%)
-  finalize+SM    : 697.500us (4.8%)
-  scope_end      : 364.080us
-  avg/task       : 0.874us
-PTO2 total submitted tasks = 16704
+Thread 3: === Orchestrator Profiling: 16704 tasks, total=14601.580us ===
+Thread 3:   sync_tensormap : 286.300us (2.0%)
+Thread 3:   task_ring_alloc: 380.400us (2.6%)
+Thread 3:   param_copy     : 2147.800us (14.7%)
+Thread 3:   lookup+dep     : 7290.300us (49.9%)
+Thread 3:   heap_alloc     : 701.500us (4.8%)
+Thread 3:   tensormap_ins  : 1890.380us (12.9%)
+Thread 3:   fanin+ready    : 1207.400us (8.3%)
+Thread 3:   finalize+SM    : 697.500us (4.8%)
+Thread 3:   scope_end      : 364.080us
+Thread 3:   avg/task       : 0.874us
+Thread 3: PTO2 total submitted tasks = 16704
 ```
 
 ### Field Reference
@@ -79,26 +79,17 @@ PTO2 total submitted tasks = 16704
 
 ## Block 2: PTO2 Scheduler Summary
 
-Each of the 3 scheduler threads (Thread 0, 1, 2) prints its own summary after completing all tasks. The output has three sub-sections: **summary**, **phase breakdown**, and **lock contention**.
+Each of the 3 scheduler threads (Thread 0, 1, 2) prints its own summary after completing all tasks. The output has two sub-sections: **summary** and **phase breakdown**.
 
-### Example (Thread 0, from the same run)
+### Example (Thread 0, from a different run: batch=1, 1044 tasks)
 
 ```
-Thread 0: === PTO2 Scheduler Summary ===
-Thread 0: completed=6068 tasks in 31398us (977 loops, 6.2 tasks/loop)
-Thread 0: --- Phase Breakdown (execution order) ---
-Thread 0:   scan:            2295us ( 7.3%)
-Thread 0:   early_ready:       77us ( 0.2%)  (deps already met at submit time)
-Thread 0:   complete:       11374us (36.2%)  [fanout: edges=7578, max_degree=20, avg=1.2]
-Thread 0:   dispatch:       17651us (56.2%)  [steal: own=4443, steal=1625, pct=26.8%]
-Thread 0: --- Lock Contention (ready_q) ---
-Thread 0:   total:         wait= 8366us hold= 4144us
-Thread 0:   scan:          wait=  318us hold=  704us
-Thread 0:   early_ready:   wait=    0us hold=    0us
-Thread 0:   complete:      wait= 1374us hold=  781us
-Thread 0:   dispatch:      wait= 6674us hold= 2659us
-Thread 0:     hit:         wait= 1361us hold=  551us (dequeued task)
-Thread 0:     miss:        wait= 5313us hold= 2108us (empty queue)
+Thread 0: completed=352 tasks in 3477.420us (147 loops, 2.4 tasks/loop)
+Thread 0: --- Phase Breakdown ---
+Thread 0:   complete:    1485.020us (42.7%)  [fanout: edges=432, max_degree=2, avg=1.2]  [fanin: edges=320, max_degree=3, avg=0.9]
+Thread 0:   scan:        14.400us (0.4%)
+Thread 0:   dispatch:    1973.060us (56.7%)  [pop: hit=352, miss=3043, hit_rate=10.4%]
+Thread 0:   idle:        4.940us (0.1%)
 ```
 
 ### Summary Line
@@ -116,52 +107,26 @@ Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
 
 ### Phase Breakdown
 
-The scheduler loop runs four phases in order each iteration. Each phase's time is accumulated across all loop iterations.
+The scheduler loop runs four phases each iteration. Each phase's time is accumulated across all loop iterations.
 
 | Phase | What it does | Inline stats |
 |-------|-------------|-------------|
-| **scan** | Scans newly submitted tasks in shared memory; enqueues root tasks (those with `fanin_count == 0`) into the ready queue | — |
-| **early_ready** | Drains the orchestrator's ready queue (tasks whose dependencies were all satisfied at submit time, detected via Step 5b in `pto2_submit_task`) | — |
-| **complete** | Polls register `COND` on each managed core; when a core becomes `IDLE`, traverses the completed task's fanout list, increments consumer refcounts, and enqueues newly ready consumers | `edges`: total fanout edges traversed; `max_degree`: largest fanout list; `avg`: average fanout per completed task |
-| **dispatch** | For each idle core, pops a task from the ready queue (own shard first, then work-stealing from other shards), builds the dispatch payload, and writes the task to the core's register | `own`: tasks dequeued from own shard; `steal`: tasks stolen from other shards; `pct`: steal percentage |
+| **complete** | Polls handshake on each managed core; when a core completes, traverses fanout list (notify consumers) and fanin list (release producers) via `on_task_complete` | `fanout`: edges/max_degree/avg for consumer notification; `fanin`: edges/max_degree/avg for producer release |
+| **scan** | Updates the perf profiling header with latest scheduler state | — |
+| **dispatch** | For each idle core, pops a task from the ready queue via `pto2_scheduler_get_ready_task`, builds the dispatch payload, and writes the task to the core's handshake register | `pop`: `hit` = successful pops (task dispatched), `miss` = empty queue pops, `hit_rate` = hit/(hit+miss) |
+| **idle** | Scheduler loop iteration where no progress was made (no completions, no dispatches) | — |
 
 **Interpreting phase percentages:**
 
-- **dispatch** is typically the largest (~55%) because it includes both ready-queue pops (with lock contention) and the actual register writes + payload construction.
-- **complete** is the second largest (~36%) because fanout traversal involves atomic operations (`SEQ_CST` fetch_add on refcounts) and conditional ready-queue pushes.
-- **scan** is small (~7%) — it only runs until all submitted tasks have been scanned.
-- **early_ready** is negligible in most cases.
+- **dispatch** is typically the largest (~55-60%) because it includes ready-queue pops (with spinlock), payload construction, and cache flush (`dc cvac` + `dsb sy`).
+- **complete** is the second largest (~40-45%) because it traverses both fanout (CAS-based fanin decrement, conditional ready-queue push) and fanin (release_producer, check_consumed, ring pointer advancement).
+- **scan** is small (<1%) — only updates the perf header.
+- **idle** is negligible when tasks are flowing; high idle% indicates the scheduler is starved.
 
-### Lock Contention (ready_q)
+**Interpreting pop hit_rate:**
 
-Ready queues are sharded (one shard per scheduler thread). Access is protected by per-shard spinlocks. This section reports cumulative lock **wait** (time spinning to acquire) and **hold** (time from acquire to release) for each phase.
-
-```
-Thread N:   total:         wait=Xus hold=Yus        # sum across all phases
-Thread N:   scan:          wait=Xus hold=Yus        # lock during root-task enqueue
-Thread N:   early_ready:   wait=Xus hold=Yus        # lock during orch-ready drain
-Thread N:   complete:      wait=Xus hold=Yus        # lock during fanout push
-Thread N:   dispatch:      wait=Xus hold=Yus        # lock during ready-queue pop (sum of hit+miss)
-Thread N:     hit:         wait=Xus hold=Yus        # pop attempts that dequeued a task
-Thread N:     miss:        wait=Xus hold=Yus        # pop attempts on empty queue
-```
-
-**Key observations from the example:**
-
-| Metric | Thread 0 | Thread 1 | Thread 2 |
-|--------|----------|----------|----------|
-| completed | 6068 | 5997 | 4639 |
-| total time (us) | 31398 | 31410 | 31406 |
-| dispatch % | 56.2% | 56.0% | 60.5% |
-| complete % | 36.2% | 36.7% | 35.4% |
-| steal % | 26.8% | 25.8% | 41.4% |
-| lock wait (us) | 8366 | 9176 | 8807 |
-| lock hold (us) | 4144 | 4688 | 3971 |
-
-- **Lock contention is moderate**: total wait ~8-9ms out of ~31ms total time (~27-30%).
-- **dispatch.miss dominates wait time**: most lock wait comes from polling empty queues, not actual contention. Thread 0's dispatch miss wait = 5313us vs hit wait = 1361us.
-- **Work stealing is active**: Thread 2 steals 41.4% of its tasks, indicating it finishes its own shard's tasks faster and helps drain other shards.
-- **Threads are well-balanced**: all three complete within ~31ms, despite different task counts (Thread 2 has fewer tasks but higher steal rate).
+- **High hit_rate (>50%)**: Ready queue is well-supplied; dispatch is efficient.
+- **Low hit_rate (<10%)**: Ready queue is mostly empty when cores become idle. The bottleneck is upstream (orchestrator submission speed or fanout resolution latency), not dispatch itself.
 
 ### Per-Task Averages
 
@@ -169,10 +134,9 @@ Divide each thread's phase times by its `completed` count to get per-task schedu
 
 | Metric | Formula | Typical value |
 |--------|---------|---------------|
-| Scheduling overhead per task | total_time / completed | ~5-7 us/task |
-| Lock overhead per task | (total_wait + total_hold) / completed | ~1.5-2.5 us/task |
-| Dispatch per task | dispatch_time / completed | ~3-4 us/task |
-| Complete per task | complete_time / completed | ~2-3 us/task |
+| Scheduling overhead per task | total_time / completed | ~5-10 us/task |
+| Dispatch per task | dispatch_time / completed | ~3-6 us/task |
+| Complete per task | complete_time / completed | ~2-4 us/task |
 
 ---
 
@@ -186,7 +150,7 @@ When `--enable-profiling` is used, the host terminal prints a **Task Statistics 
 | Avg scheduling overhead | `sum(thread_total) / total_tasks` (device log) | Time AICPU spends scheduling each task |
 | Sched/Exec ratio | scheduling / execution | Scheduling overhead relative to kernel execution |
 
-A high sched/exec ratio (e.g., >3x) indicates that scheduling overhead dominates, and optimizations should target the scheduler's non-lock paths (dispatch polling, fanout traversal) before reducing lock contention.
+A high sched/exec ratio (e.g., >3x) indicates that scheduling overhead dominates, and optimizations should target the scheduler's dispatch hot path (cache flush, payload construction) or upstream task flow.
 
 ---
 
@@ -196,12 +160,9 @@ A high sched/exec ratio (e.g., >3x) indicates that scheduling overhead dominates
 # Find the latest device log for device 2
 ls -t $HOME/ascend/log/debug/device-2/device-*.log | head -1
 
-# Extract orchestrator profiling
-grep -E "Orchestrator Profiling|sync_tensormap|task_ring_alloc|param_copy|lookup\+dep|heap_alloc|tensormap_ins|fanin\+ready|finalize\+SM|scope_end|avg/task" <logfile>
+# Extract orchestrator profiling (Thread 3)
+grep "Thread 3:" <logfile>
 
-# Extract scheduler summary
-grep -E "Scheduler Summary|completed=|Phase Breakdown|scan:|early_ready:|complete:|dispatch:" <logfile>
-
-# Extract lock contention
-grep -E "Lock Contention|total:|scan:|early_ready:|complete:|dispatch:|hit:|miss:" <logfile>
+# Extract scheduler profiling (Threads 0/1/2)
+grep -E "Thread [012]:" <logfile>
 ```

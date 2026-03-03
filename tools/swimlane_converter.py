@@ -137,10 +137,20 @@ def parse_sched_cpu_from_device_log(log_path, task_count):
     if total_sched_cpu_us <= 0:
         return None
 
-    return total_sched_cpu_us / task_count
+    total_completed = sum(t.get('completed', 0) for t in threads.values())
+    if task_count > 0 and total_completed > 0 and abs(total_completed - task_count) / task_count > 0.5:
+        print(f"Warning: device log has {total_completed} completed tasks "
+              f"but perf JSON has {task_count}; skipping Sched CPU metric "
+              f"(device log may be from a different run)", file=sys.stderr)
+        return None
+
+    return {
+        'us_per_task': total_sched_cpu_us / task_count,
+        'num_sched_threads': len(threads),
+    }
 
 
-def print_task_statistics(tasks, func_id_to_name=None, sched_cpu_us_per_task=None):
+def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
     """Print task statistics grouped by func_id.
 
     Exec = kernel execution time (end_time_us - start_time_us) on AICore.
@@ -152,8 +162,8 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_cpu_us_per_task=Non
     Args:
         tasks: List of task dicts
         func_id_to_name: Optional dict mapping func_id to function name
-        sched_cpu_us_per_task: Optional AICPU scheduler CPU time per task (us),
-            parsed from device log
+        sched_info: Optional dict with 'us_per_task' (float) and 'num_sched_threads' (int),
+            parsed from device log by parse_sched_cpu_from_device_log()
     """
     from collections import defaultdict
 
@@ -204,13 +214,12 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_cpu_us_per_task=Non
             max_finish_time = max(max_finish_time, finish_time)
 
     # Print statistics
-    print("\n" + "=" * 160)
+    print("\n" + "=" * 110)
     print("Task Statistics by Function")
     print("  Exec = kernel time on AICore; Latency = dispatch->finish (incl. head OH + Exec + tail OH)")
-    print("=" * 160)
-    print(f"{'Func_ID':<8} {'Func_Name':<12} {'Count':^6} {'Total_Exec/Latency(us)':^25} {'Avg_Exec/Latency(us)':^23} "
-          f"{'Min_Exec/Latency(us)':^23} {'Max_Exec/Latency(us)':^23} {'Avg_Head/Tail_OH(us)':^23} {'Exec_%':^8}")
-    print("-" * 160)
+    print("=" * 110)
+    print(f"{'Func_ID':<8} {'Func_Name':<12} {'Count':>5}   {'Avg Exec(us)':>12}  {'Avg Latency(us)':>15}  {'Exec%':>6}   {'Avg Head OH(us)':>15}  {'Avg Tail OH(us)':>15}")
+    print("-" * 110)
 
     # Sort by func_id for consistent output
     total_count = 0
@@ -222,8 +231,6 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_cpu_us_per_task=Non
         count = len(durations)
         sum_duration = sum(durations)
         avg_duration = sum_duration / count
-        min_duration = min(durations)
-        max_duration = max(durations)
 
         # Accumulate totals
         total_count += count
@@ -235,34 +242,22 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_cpu_us_per_task=Non
         else:
             func_name = f"Func_{func_id}"
 
-        # Calculate averages for new metrics
+        # Calculate averages
         avg_head_overhead = sum(stats['head_overheads']) / len(stats['head_overheads']) if stats['head_overheads'] else 0
         avg_tail_overhead = sum(stats['tail_overheads']) / len(stats['tail_overheads']) if stats['tail_overheads'] else 0
         avg_latency = stats['total_latency'] / count if count > 0 else 0
-        min_latency = min(stats['latencies']) if stats['latencies'] else 0
-        max_latency = max(stats['latencies']) if stats['latencies'] else 0
-        total_latency = stats['total_latency']
 
         # Calculate execution ratio: total_exec_time / total_latency
         exec_ratio = (stats['total_exec_time'] / stats['total_latency'] * 100) if stats['total_latency'] > 0 else 0
 
-        # Format combined exec/latency values
-        total_combined = f"{sum_duration:.2f}/{total_latency:.2f}"
-        avg_combined = f"{avg_duration:.2f}/{avg_latency:.2f}"
-        min_combined = f"{min_duration:.2f}/{min_latency:.2f}"
-        max_combined = f"{max_duration:.2f}/{max_latency:.2f}"
-        overhead_combined = f"{avg_head_overhead:.2f}/{avg_tail_overhead:.2f}"
-
-        print(f"{func_id:<8} {func_name:<12} {count:^6} {total_combined:^25} {avg_combined:^23} "
-              f"{min_combined:^23} {max_combined:^23} {overhead_combined:^23} {exec_ratio:^7.2f}%")
+        print(f"{func_id:<8} {func_name:<12} {count:>5}   {avg_duration:>12.2f}  {avg_latency:>15.2f}  {exec_ratio:>5.1f}%   {avg_head_overhead:>15.2f}  {avg_tail_overhead:>15.2f}")
 
     # Print total row
-    print("-" * 160)
+    print("-" * 110)
 
     # Calculate total latency (sum of all latencies)
     total_latency_sum = sum(stats['total_latency'] for stats in func_stats.values())
-    total_combined = f"{total_duration:.2f}/{total_latency_sum:.2f}"
-    print(f"{'TOTAL':<21} {total_count:^6} {total_combined:^25}")
+    print(f"{'TOTAL':<21} {total_count:>5}   {total_duration:>12.2f}  {total_latency_sum:>15.2f}")
 
     # Print total test execution time
     if min_dispatch_time != float('inf') and max_finish_time != float('-inf'):
@@ -276,12 +271,19 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_cpu_us_per_task=Non
         exec_latency_ratio_pct = total_duration / total_latency_sum * 100
         print("\n--- Task execution vs Scheduler overhead ---")
         print(f"  Per-task (all):  Avg Exec = {avg_exec_us:.2f} us,  Avg Latency (dispatch->finish) = {avg_latency_us:.2f} us,  Exec/Latency = {exec_latency_ratio_pct:.2f}%")
-        if sched_cpu_us_per_task is not None:
-            exec_sched_cpu_ratio = (avg_exec_us / sched_cpu_us_per_task * 100) if sched_cpu_us_per_task > 0 else 0
-            print(f"  Sched CPU (from device log): {sched_cpu_us_per_task:.2f} us/task  (Exec/Sched_CPU = {exec_sched_cpu_ratio:.2f}%)")
-        print("  (Latency = dispatch to finish; Sched CPU = AICPU scheduler thread CPU time per task, from device log.)")
+        if sched_info is not None:
+            sched_cpu = sched_info['us_per_task']
+            num_cores = len(set(t['core_id'] for t in tasks))
+            exec_sched_ratio = (avg_exec_us / sched_cpu * 100) if sched_cpu > 0 else 0
+            per_core_exec = avg_exec_us / num_cores if num_cores > 0 else 0
+            per_core_ratio = (per_core_exec / sched_cpu * 100) if sched_cpu > 0 else 0
+            num_threads = sched_info['num_sched_threads']
+            print(f"  Sched CPU (from device log): {sched_cpu:.2f} us/task  (Exec/Sched = {exec_sched_ratio:.1f}%, PerCore/Sched = {per_core_ratio:.1f}%)")
+            print(f"  (Latency = dispatch→finish; Sched CPU = scheduler thread CPU per task; PerCore = avg_exec/{num_cores}_cores vs sched_cpu, {num_threads} sched threads)")
+        else:
+            print("  (Latency = dispatch→finish; Sched CPU = scheduler thread CPU per task)")
 
-    print("=" * 160)
+    print("=" * 110)
 
 
 
@@ -564,7 +566,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
             "complete": "good",       # green
             "dispatch": "terrible",   # red
             "scan": "thread_state_running",  # blue
-            "early_ready": "yellow",  # yellow
+            "idle": "yellow",  # yellow
         }
 
         for thread_idx, thread_records in enumerate(scheduler_phases):
@@ -972,14 +974,14 @@ Examples:
             print(f"Selection: {log_strategy}")
 
         # Optional: parse sched CPU from device log
-        sched_cpu_us = None
+        sched_info = None
         if resolved_device_log is not None:
-            sched_cpu_us = parse_sched_cpu_from_device_log(resolved_device_log, len(data['tasks']))
-            if args.verbose and sched_cpu_us is not None:
-                print(f"  Parsed sched CPU from device log: {sched_cpu_us:.2f} us/task")
+            sched_info = parse_sched_cpu_from_device_log(resolved_device_log, len(data['tasks']))
+            if args.verbose and sched_info is not None:
+                print(f"  Parsed sched CPU from device log: {sched_info['us_per_task']:.2f} us/task")
 
         # Print task statistics (incl. task execution vs scheduler overhead)
-        print_task_statistics(data['tasks'], func_names, sched_cpu_us_per_task=sched_cpu_us)
+        print_task_statistics(data['tasks'], func_names, sched_info=sched_info)
 
         # Integrated deep-dive overhead analysis
         if resolved_device_log is not None:

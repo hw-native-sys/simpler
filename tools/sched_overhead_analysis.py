@@ -37,19 +37,11 @@ def parse_scheduler_threads(log_path):
 
     Expected log format (per thread):
         Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
-        Thread N: --- Phase Breakdown (execution order) ---
-        Thread N:   scan:            Xus (Y%)
-        Thread N:   early_ready:     Xus (Y%)  (deps already met at submit time)
-        Thread N:   complete:        Xus (Y%)  [fanout: edges=A, max_degree=B, avg=C]
-        Thread N:   dispatch:        Xus (Y%)  [steal: own=A, steal=B, pct=C%]
-        Thread N: --- Lock Contention (ready_q) ---
-        Thread N:   total:         wait= Xus hold= Yus
-        Thread N:   scan:          wait= Xus hold= Yus
-        Thread N:   early_ready:   wait= Xus hold= Yus
-        Thread N:   complete:      wait= Xus hold= Yus
-        Thread N:   dispatch:      wait= Xus hold= Yus
-        Thread N:     hit:         wait= Xus hold= Yus (dequeued task)
-        Thread N:     miss:        wait= Xus hold= Yus (empty queue)
+        Thread N: --- Phase Breakdown ---
+        Thread N:   complete:    Xus (Y%)  [fanout: edges=A, max_degree=B, avg=C]  [fanin: edges=D, max_degree=E, avg=F]
+        Thread N:   scan:        Xus (Y%)
+        Thread N:   dispatch:    Xus (Y%)  [pop: hit=A, miss=B, hit_rate=C%]
+        Thread N:   idle:        Xus (Y%)
     """
     threads = {}
     with open(log_path, 'r', errors='ignore') as f:
@@ -65,24 +57,12 @@ def parse_scheduler_threads(log_path):
                     'tasks_per_loop': float(m.group(5)),
                 }
 
-            # Phase: scan (distinguished from lock scan by absence of "wait=")
-            m = re.search(r'Thread (\d+):\s+scan:\s+([\d.]+)us \(\s*([\d.]+)%\)', line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]['scan_us'] = float(m.group(2))
-                    threads[tid]['scan_pct'] = float(m.group(3))
-
-            # Phase: early_ready
-            m = re.search(r'Thread (\d+):\s+early_ready:\s+([\d.]+)us \(\s*([\d.]+)%\)', line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]['early_ready_us'] = float(m.group(2))
-                    threads[tid]['early_ready_pct'] = float(m.group(3))
-
-            # Phase: complete [fanout: edges=X, max_degree=Y, avg=Z]
-            m = re.search(r'Thread (\d+):\s+complete:\s+([\d.]+)us \(\s*([\d.]+)%\)\s+\[fanout: edges=(\d+), max_degree=(\d+), avg=([\d.]+)\]', line)
+            # Phase: complete [fanout: edges=X, max_degree=Y, avg=Z]  [fanin: edges=D, max_degree=E, avg=F]
+            m = re.search(
+                r'Thread (\d+):\s+complete:\s+([\d.]+)us \(\s*([\d.]+)%\)'
+                r'\s+\[fanout: edges=(\d+), max_degree=(\d+), avg=([\d.]+)\]'
+                r'\s+\[fanin: edges=(\d+), max_degree=(\d+), avg=([\d.]+)\]',
+                line)
             if m:
                 tid = int(m.group(1))
                 if tid in threads:
@@ -91,73 +71,36 @@ def parse_scheduler_threads(log_path):
                     threads[tid]['fanout_edges'] = int(m.group(4))
                     threads[tid]['fanout_max_degree'] = int(m.group(5))
                     threads[tid]['fanout_avg'] = float(m.group(6))
+                    threads[tid]['fanin_edges'] = int(m.group(7))
+                    threads[tid]['fanin_max_degree'] = int(m.group(8))
+                    threads[tid]['fanin_avg'] = float(m.group(9))
 
-            # Phase: dispatch [steal: own=X, steal=Y, pct=Z%]
-            m = re.search(r'Thread (\d+):\s+dispatch:\s+([\d.]+)us \(\s*([\d.]+)%\)\s+\[steal: own=(\d+), steal=(\d+), pct=([\d.]+)%\]', line)
+            # Phase: scan
+            m = re.search(r'Thread (\d+):\s+scan:\s+([\d.]+)us \(\s*([\d.]+)%\)', line)
+            if m:
+                tid = int(m.group(1))
+                if tid in threads:
+                    threads[tid]['scan_us'] = float(m.group(2))
+                    threads[tid]['scan_pct'] = float(m.group(3))
+
+            # Phase: dispatch [pop: hit=X, miss=Y, hit_rate=Z%]
+            m = re.search(r'Thread (\d+):\s+dispatch:\s+([\d.]+)us \(\s*([\d.]+)%\)\s+\[pop: hit=(\d+), miss=(\d+), hit_rate=([\d.]+)%\]', line)
             if m:
                 tid = int(m.group(1))
                 if tid in threads:
                     threads[tid]['dispatch_us'] = float(m.group(2))
                     threads[tid]['dispatch_pct'] = float(m.group(3))
-                    threads[tid]['steal_own'] = int(m.group(4))
-                    threads[tid]['steal_steal'] = int(m.group(5))
-                    threads[tid]['steal_pct'] = float(m.group(6))
+                    threads[tid]['pop_hit'] = int(m.group(4))
+                    threads[tid]['pop_miss'] = int(m.group(5))
+                    threads[tid]['pop_hit_rate'] = float(m.group(6))
 
-            # Lock: total
-            m = re.search(r'Thread (\d+):\s+total:\s+wait=\s*(\d+)us hold=\s*(\d+)us', line)
+            # Phase: idle
+            m = re.search(r'Thread (\d+):\s+idle:\s+([\d.]+)us \(\s*([\d.]+)%\)', line)
             if m:
                 tid = int(m.group(1))
                 if tid in threads:
-                    threads[tid]['lock_wait_us'] = int(m.group(2))
-                    threads[tid]['lock_hold_us'] = int(m.group(3))
-
-            # Lock: scan
-            m = re.search(r'Thread (\d+):\s+scan:\s+wait=\s*(\d+)us hold=\s*(\d+)us', line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]['lock_scan_wait'] = int(m.group(2))
-                    threads[tid]['lock_scan_hold'] = int(m.group(3))
-
-            # Lock: early_ready
-            m = re.search(r'Thread (\d+):\s+early_ready:\s+wait=\s*(\d+)us hold=\s*(\d+)us', line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]['lock_early_ready_wait'] = int(m.group(2))
-                    threads[tid]['lock_early_ready_hold'] = int(m.group(3))
-
-            # Lock: complete
-            m = re.search(r'Thread (\d+):\s+complete:\s+wait=\s*(\d+)us hold=\s*(\d+)us', line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]['lock_complete_wait'] = int(m.group(2))
-                    threads[tid]['lock_complete_hold'] = int(m.group(3))
-
-            # Lock: dispatch
-            m = re.search(r'Thread (\d+):\s+dispatch:\s+wait=\s*(\d+)us hold=\s*(\d+)us', line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]['lock_dispatch_wait'] = int(m.group(2))
-                    threads[tid]['lock_dispatch_hold'] = int(m.group(3))
-
-            # Lock: dispatch hit
-            m = re.search(r'Thread (\d+):\s+hit:\s+wait=\s*(\d+)us hold=\s*(\d+)us', line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]['lock_dispatch_hit_wait'] = int(m.group(2))
-                    threads[tid]['lock_dispatch_hit_hold'] = int(m.group(3))
-
-            # Lock: dispatch miss
-            m = re.search(r'Thread (\d+):\s+miss:\s+wait=\s*(\d+)us hold=\s*(\d+)us', line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]['lock_dispatch_miss_wait'] = int(m.group(2))
-                    threads[tid]['lock_dispatch_miss_hold'] = int(m.group(3))
+                    threads[tid]['idle_us'] = float(m.group(2))
+                    threads[tid]['idle_pct'] = float(m.group(3))
 
     return threads
 
@@ -304,12 +247,12 @@ def run_analysis(perf_path, log_path, print_sources=True, selection_strategy=Non
     print()
 
     # Phase breakdown
-    phases = ['scan', 'early_ready', 'complete', 'dispatch']
+    phases = ['complete', 'scan', 'dispatch', 'idle']
     phase_labels = {
-        'scan':        'Scan (discover new root tasks)',
-        'early_ready': 'Early ready (deps met at submit time)',
-        'complete':    'Complete (poll handshake, resolve fanout)',
+        'complete':    'Complete (poll handshake, resolve deps)',
+        'scan':        'Scan (update perf header)',
         'dispatch':    'Dispatch (pop queue, build payload, flush)',
+        'idle':        'Idle (spinning, no progress)',
     }
 
     fmt3 = "  {:<50} {:>11} {:>10} {:>14}"
@@ -328,42 +271,22 @@ def run_analysis(perf_path, log_path, print_sources=True, selection_strategy=Non
     # Fanout stats (from complete phase)
     fanout_edges = sum(t.get('fanout_edges', 0) for t in threads.values())
     fanout_max = max((t.get('fanout_max_degree', 0) for t in threads.values()), default=0)
-    fanout_avg_weighted = sum(t.get('fanout_avg', 0) * t.get('fanout_edges', 0) for t in threads.values())
-    fanout_avg = fanout_avg_weighted / fanout_edges if fanout_edges > 0 else 0
-    print(f'  Fanout: total edges={fanout_edges}, max_degree={fanout_max}, avg_degree={fanout_avg:.1f}')
+    fanout_avg = fanout_edges / total_completed if total_completed > 0 else 0
+    print(f'  Fanout (notify consumers): total edges={fanout_edges}, max_degree={fanout_max}, avg_degree={fanout_avg:.1f}')
+
+    # Fanin stats (from complete phase)
+    fanin_edges = sum(t.get('fanin_edges', 0) for t in threads.values())
+    fanin_max = max((t.get('fanin_max_degree', 0) for t in threads.values()), default=0)
+    fanin_avg = fanin_edges / total_completed if total_completed > 0 else 0
+    print(f'  Fanin  (release producers): total edges={fanin_edges}, max_degree={fanin_max}, avg_degree={fanin_avg:.1f}')
     print()
 
-    # Work stealing stats (from dispatch phase)
-    steal_own = sum(t.get('steal_own', 0) for t in threads.values())
-    steal_steal = sum(t.get('steal_steal', 0) for t in threads.values())
-    steal_total = steal_own + steal_steal
-    steal_pct = steal_steal / steal_total * 100 if steal_total > 0 else 0
-    print(f'  Work stealing: own={steal_own}, stolen={steal_steal} ({steal_pct:.1f}% steal rate)')
-    print()
-
-    # Lock contention breakdown
-    fmt4 = "  {:<50} {:>11} {:>10}"
-    print(fmt4.format('Lock contention (ready_q)', 'Total (us)', '% of total'))
-    print('  ' + '-' * 75)
-    lock_wait = sum(t.get('lock_wait_us', 0) for t in threads.values())
-    lock_hold = sum(t.get('lock_hold_us', 0) for t in threads.values())
-    print(fmt4.format('  wait (spinning for lock)', str(lock_wait), f'{lock_wait/total_us*100:.1f}%' if total_us > 0 else '0.0%'))
-    print(fmt4.format('  hold (inside critical section)', str(lock_hold), f'{lock_hold/total_us*100:.1f}%' if total_us > 0 else '0.0%'))
-    print()
-
-    # Lock wait breakdown by phase
-    print('  Lock wait by phase:')
-    for p in phases:
-        w = sum(t.get(f'lock_{p}_wait', 0) for t in threads.values())
-        h = sum(t.get(f'lock_{p}_hold', 0) for t in threads.values())
-        print(f'    {p:<14}  wait={w:>6} us  hold={h:>6} us')
-    # Dispatch hit/miss sub-breakdown
-    hit_w = sum(t.get('lock_dispatch_hit_wait', 0) for t in threads.values())
-    hit_h = sum(t.get('lock_dispatch_hit_hold', 0) for t in threads.values())
-    miss_w = sum(t.get('lock_dispatch_miss_wait', 0) for t in threads.values())
-    miss_h = sum(t.get('lock_dispatch_miss_hold', 0) for t in threads.values())
-    print(f'      {"hit":<12}  wait={hit_w:>6} us  hold={hit_h:>6} us  (dequeued task)')
-    print(f'      {"miss":<12}  wait={miss_w:>6} us  hold={miss_h:>6} us  (empty queue)')
+    # Pop stats (from dispatch phase)
+    pop_hit = sum(t.get('pop_hit', 0) for t in threads.values())
+    pop_miss = sum(t.get('pop_miss', 0) for t in threads.values())
+    pop_total = pop_hit + pop_miss
+    pop_hit_rate = pop_hit / pop_total * 100 if pop_total > 0 else 0
+    print(f'  Pop: hit={pop_hit}, miss={pop_miss}, hit_rate={pop_hit_rate:.1f}%')
 
     print()
     print('=' * 90)
@@ -391,75 +314,29 @@ def run_analysis(perf_path, log_path, print_sources=True, selection_strategy=Non
     avg_tail_oh = sum(tails) / n
     loop_ratio = avg_tail_oh / avg_loop_us if avg_loop_us > 0 else 0
     print(f'  Avg scheduler loop iteration: {avg_loop_us:.1f} us (approx avg polling interval per loop)')
-    if n_threads > 0:
-        print(f'  With {n_threads} threads sharing {total_loops} loops over {total_us/n_threads:.0f} us wall each:')
-    print()
-
-    print('  Scheduler CPU time breakdown (per completed task):')
-
-    # Build phase data with sub-items for sorting
-    phase_details = {
-        'dispatch': {
-            'label': 'Dispatch phase (build payload + cache flush)',
-            'total': phase_totals.get('dispatch', 0),
-            'sub_items': [
-                ('Lock wait (ready_q pop)', sum(t.get('lock_dispatch_wait', 0) for t in threads.values())),
-                ('Lock hold + build + dc cvac/civac + dsb sy', phase_totals.get('dispatch', 0) - sum(t.get('lock_dispatch_wait', 0) for t in threads.values())),
-            ]
-        },
-        'complete': {
-            'label': 'Complete phase (poll + fanout resolve)',
-            'total': phase_totals.get('complete', 0),
-            'sub_items': [
-                ('Lock wait (ready_q push)', sum(t.get('lock_complete_wait', 0) for t in threads.values())),
-                ('Fanout traversal + atomic ops', phase_totals.get('complete', 0) - sum(t.get('lock_complete_wait', 0) for t in threads.values())),
-            ]
-        },
-        'scan': {
-            'label': 'Scan phase (new task discovery)',
-            'total': phase_totals.get('scan', 0),
-            'sub_items': []
-        },
-        'early_ready': {
-            'label': 'Early ready (deps met at submit time)',
-            'total': phase_totals.get('early_ready', 0),
-            'sub_items': []
-        },
-    }
-
-    # Sort by total descending
-    for _, detail in sorted(phase_details.items(), key=lambda x: x[1]['total'], reverse=True):
-        per_task = detail['total'] / total_completed if total_completed > 0 else 0
-        pct = detail['total'] / total_us * 100 if total_us > 0 else 0
-        print(f'    - {detail["label"]:<50} {per_task:.2f} us/task  ({pct:.1f}% of scheduler CPU)')
-        for sub_label, sub_total in detail['sub_items']:
-            sub_per_task = sub_total / total_completed if total_completed > 0 else 0
-            print(f'        {sub_label:<48} {sub_per_task:.2f} us/task')
-
     print()
     print(f'  Avg Tail OH = {avg_tail_oh:.1f} us ~= {loop_ratio:.1f} x avg loop iteration ({avg_loop_us:.1f} us)')
     print(f'  -> On average, a completed task waits ~{loop_ratio:.1f} loop iterations before being detected')
     print()
 
-    # Data-driven insight: find the dominant phase (excluding early_ready which is typically trivial)
+    # Data-driven insight: find the dominant phase (excluding idle which is not useful work)
     work_phases = {p: phase_totals.get(p, 0) for p in ['scan', 'complete', 'dispatch']}
     dominant_phase = max(work_phases, key=work_phases.get)
     dominant_pct = work_phases[dominant_phase] / total_us * 100 if total_us > 0 else 0
     print(f'  Key insight: {phase_labels[dominant_phase].split(" (")[0]} phase consumes ~{dominant_pct:.0f}% of scheduler CPU.')
     if dominant_phase == 'dispatch':
-        dispatch_total = phase_totals.get('dispatch', 0)
-        dispatch_lock_pct = sum(t.get('lock_dispatch_wait', 0) for t in threads.values()) / dispatch_total * 100 if dispatch_total > 0 else 0
-        print(f'  Within dispatch, lock contention accounts for {dispatch_lock_pct:.0f}% of time.')
-        if miss_w > hit_w:
-            print(f'  Dispatch miss (empty queue) dominates lock wait: miss={miss_w}us vs hit={hit_w}us.')
-        print('  Cache flush (dc cvac + dsb sy) is the dominant non-lock cost.')
+        print(f'  Pop hit_rate={pop_hit_rate:.1f}%: {"low hit rate suggests ready queue often empty" if pop_hit_rate < 50 else "good hit rate"}.')
+        print('  Cache flush (dc cvac + dsb sy) is the dominant non-pop cost.')
     elif dominant_phase == 'complete':
-        complete_total = phase_totals.get('complete', 0)
-        complete_lock_pct = sum(t.get('lock_complete_wait', 0) for t in threads.values()) / complete_total * 100 if complete_total > 0 else 0
-        print(f'  Within complete, lock contention accounts for {complete_lock_pct:.0f}% of time.')
-        print('  Fanout traversal and atomic ops dominate the non-lock cost.')
+        total_edges = fanout_edges + fanin_edges
+        print(f'  Fanout: avg_degree={fanout_avg:.1f}, max_degree={fanout_max}.')
+        print(f'  Fanin:  avg_degree={fanin_avg:.1f}, max_degree={fanin_max}.')
+        if fanin_edges > fanout_edges:
+            print('  Fanin traversal (release_producer + check_consumed) dominates the complete phase.')
+        else:
+            print('  Fanout traversal and atomic ops dominate the complete phase.')
     elif dominant_phase == 'scan':
-        print('  Scan phase overhead indicates too many root tasks or inefficient task graph traversal.')
+        print('  Scan phase overhead indicates frequent perf header updates.')
     print('=' * 90)
 
     return 0

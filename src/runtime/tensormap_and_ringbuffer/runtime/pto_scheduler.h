@@ -18,6 +18,12 @@
 #ifndef PTO_SCHEDULER_H
 #define PTO_SCHEDULER_H
 
+// PTO2_PROFILING must be defined before inline methods that use it.
+// Default ON; disable with -DPTO2_PROFILING=0.
+#ifndef PTO2_PROFILING
+#define PTO2_PROFILING 1
+#endif
+
 #include <atomic>
 
 #include "pto_runtime2_types.h"
@@ -125,6 +131,15 @@ void pto2_ready_queue_reset(PTO2ReadyQueue* queue);
 // =============================================================================
 // Scheduler State
 // =============================================================================
+
+/**
+ * Statistics returned by on_task_complete
+ */
+struct PTO2CompletionStats {
+    int32_t fanout_edges;      // Number of fanout edges traversed (notify consumers)
+    int32_t tasks_enqueued;    // Number of consumers that became READY
+    int32_t fanin_edges;       // Number of fanin edges traversed (release producers)
+};
 
 /**
  * Scheduler state structure
@@ -235,7 +250,7 @@ struct PTO2SchedulerState {
         check_and_handle_consumed(producer_id, producer);
     }
 
-    void release_fanin_and_check_ready(int32_t task_id,
+    bool release_fanin_and_check_ready(int32_t task_id,
                                         PTO2TaskDescriptor* task) {
         int32_t slot = pto2_task_slot(task_id);
 
@@ -249,8 +264,10 @@ struct PTO2SchedulerState {
             if (task_state[slot].compare_exchange_strong(
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 ready_queues[task->worker_type].push(task_id);
+                return true;
             }
         }
+        return false;
     }
 
     void init_task(int32_t task_id, PTO2TaskDescriptor* task) {
@@ -289,10 +306,10 @@ struct PTO2SchedulerState {
         }
     }
 
-    int32_t on_task_complete(int32_t task_id) {
+    PTO2CompletionStats on_task_complete(int32_t task_id) {
+        PTO2CompletionStats stats = {0, 0, 0};
         int32_t slot = pto2_task_slot(task_id);
         PTO2TaskDescriptor* task = pto2_sm_get_task(sm_handle, task_id);
-        int32_t fanout_notified = 0;
 
         tasks_completed.fetch_add(1, std::memory_order_relaxed);
         pto2_fanout_lock(task);
@@ -301,10 +318,16 @@ struct PTO2SchedulerState {
         pto2_fanout_unlock(task);
 
         while (current != nullptr) {
-            fanout_notified++;
             int32_t consumer_id = current->task_id;
             PTO2TaskDescriptor* consumer = pto2_sm_get_task(sm_handle, consumer_id);
+#if PTO2_PROFILING
+            stats.fanout_edges++;
+            if (release_fanin_and_check_ready(consumer_id, consumer)) {
+                stats.tasks_enqueued++;
+            }
+#else
             release_fanin_and_check_ready(consumer_id, consumer);
+#endif
             current = current->next;
         }
 
@@ -312,11 +335,14 @@ struct PTO2SchedulerState {
         while (current != nullptr) {
             int32_t producer_id = current->task_id;
             release_producer(producer_id);
+#if PTO2_PROFILING
+            stats.fanin_edges++;
+#endif
             current = current->next;
         }
 
         check_and_handle_consumed(task_id, task);
-        return fanout_notified;
+        return stats;
     }
 };
 
