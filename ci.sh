@@ -5,6 +5,7 @@ PLATFORM=""
 DEVICE_RANGE=""
 PARALLEL=false
 RUNTIME=""
+PTO_ISA_COMMIT=""
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -18,6 +19,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -r|--runtime)
             RUNTIME="$2"
+            shift 2
+            ;;
+        -c|--pto-isa-commit)
+            PTO_ISA_COMMIT="$2"
             shift 2
             ;;
         --parallel)
@@ -86,6 +91,12 @@ cleanup() {
 }
 trap cleanup INT TERM
 trap 'rm -rf "$LOG_DIR"' EXIT
+
+# Build commit flag for run_example.py
+commit_flag=()
+if [[ -n "$PTO_ISA_COMMIT" ]]; then
+    commit_flag=(-c "$PTO_ISA_COMMIT")
+fi
 
 # ---- Discover all tasks ----
 EXAMPLES_DIR="examples"
@@ -175,7 +186,7 @@ run_hw_task() {
         echo "========================================"
         python examples/scripts/run_example.py \
             -k "${dir}/kernels" -g "${dir}/golden.py" \
-            -p a2a3 -d "$device_id"
+            -p a2a3 -d "$device_id" "${commit_flag[@]}"
     } > "$task_log" 2>&1
     local rc=$?
     local elapsed=$(( SECONDS - start_time ))
@@ -213,7 +224,7 @@ if [[ "$PARALLEL" == "false" ]]; then
         echo "========================================"
         if python examples/scripts/run_example.py \
             -k "${dir}/kernels" -g "${dir}/golden.py" \
-            -p a2a3sim; then
+            -p a2a3sim "${commit_flag[@]}"; then
             echo "${name}:a2a3sim|PASS" >> "$RESULTS_FILE"
         else
             echo "${name}:a2a3sim|FAIL" >> "$RESULTS_FILE"
@@ -234,7 +245,7 @@ else
             echo "Running: $name (a2a3sim)"
             echo "========================================"
             if python examples/scripts/run_example.py \
-                -k "${dir}/kernels" -g "${dir}/golden.py" -p a2a3sim; then
+                -k "${dir}/kernels" -g "${dir}/golden.py" -p a2a3sim $COMMIT_FLAG; then
                 echo "${name}:a2a3sim|PASS" >> "$RESULTS_FILE"
             else
                 echo "${name}:a2a3sim|FAIL" >> "$RESULTS_FILE"

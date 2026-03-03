@@ -159,6 +159,13 @@ Golden.py interface:
         help="Run a specific test case by name (e.g., --case Case2)"
     )
 
+    parser.add_argument(
+        "-c", "--pto-isa-commit",
+        type=str,
+        default=None,
+        help="Checkout PTO-ISA at this commit (e.g., -c 1b22fea)"
+    )
+
     args = parser.parse_args()
 
     if args.all and args.case:
@@ -226,6 +233,7 @@ Golden.py interface:
             enable_profiling=args.enable_profiling,
             run_all_cases=args.all,
             case_name=args.case,
+            pto_isa_commit=args.pto_isa_commit,
         )
 
         # Snapshot existing device logs before the run so we can identify the

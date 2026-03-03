@@ -153,12 +153,13 @@ def _is_git_available() -> bool:
 _PTO_ISA_REPO = "https://gitcode.com/cann/pto-isa.git"
 
 
-def _clone_pto_isa(verbose: bool = False) -> bool:
+def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None) -> bool:
     """
-    Clone pto-isa repository.
+    Clone pto-isa repository, optionally at a specific commit.
 
     Args:
         verbose: Print detailed progress information
+        commit: If provided, checkout this commit after cloning
 
     Returns:
         True if successful, False otherwise
@@ -202,8 +203,21 @@ def _clone_pto_isa(verbose: bool = False) -> bool:
                 logger.warning(f"Failed to clone pto-isa:\n{result.stderr}")
             return False
 
+        # Checkout specific commit if requested
+        if commit:
+            result = subprocess.run(
+                ["git", "checkout", commit],
+                capture_output=True, text=True,
+                cwd=str(clone_path), timeout=30
+            )
+            if result.returncode != 0:
+                if verbose:
+                    logger.warning(f"Failed to checkout pto-isa commit {commit}:\n{result.stderr}")
+                return False
+
         if verbose:
-            logger.info(f"pto-isa cloned successfully to: {clone_path}")
+            suffix = f" at commit {commit}" if commit else ""
+            logger.info(f"pto-isa cloned successfully{suffix}: {clone_path}")
 
         return True
 
@@ -217,7 +231,56 @@ def _clone_pto_isa(verbose: bool = False) -> bool:
         return False
 
 
-def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
+def _checkout_pto_isa_commit(clone_path: Path, commit: str, verbose: bool = False) -> None:
+    """Checkout the specified commit if the existing clone is at a different revision."""
+    import subprocess
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True, cwd=str(clone_path), timeout=5
+        )
+        current = result.stdout.strip() if result.returncode == 0 else ""
+        if current and not commit.startswith(current) and not current.startswith(commit):
+            if verbose:
+                logger.info(f"pto-isa at {current}, checking out {commit}...")
+            subprocess.run(
+                ["git", "fetch", "origin"], capture_output=True, text=True,
+                cwd=str(clone_path), timeout=120, check=True
+            )
+            subprocess.run(
+                ["git", "checkout", commit], capture_output=True, text=True,
+                cwd=str(clone_path), timeout=30, check=True
+            )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"Failed to checkout pto-isa commit {commit}: "
+                       f"{e.stderr if hasattr(e, 'stderr') else e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error checking out pto-isa commit {commit}: {e}")
+
+
+def _update_pto_isa_to_latest(clone_path: Path, verbose: bool = False) -> None:
+    """Fetch and reset existing clone to the remote default branch."""
+    import subprocess
+    try:
+        if verbose:
+            logger.info("Updating pto-isa to latest...")
+        subprocess.run(
+            ["git", "fetch", "origin"], capture_output=True, text=True,
+            cwd=str(clone_path), timeout=120, check=True
+        )
+        # Use origin/HEAD which tracks the remote's default branch
+        subprocess.run(
+            ["git", "reset", "--hard", "origin/HEAD"], capture_output=True, text=True,
+            cwd=str(clone_path), timeout=30, check=True
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+        logger.warning(f"Failed to update pto-isa to latest: "
+                       f"{e.stderr if hasattr(e, 'stderr') else e}")
+    except Exception as e:
+        logger.warning(f"Unexpected error updating pto-isa: {e}")
+
+
+def _ensure_pto_isa_root(verbose: bool = False, commit: Optional[str] = None) -> Optional[str]:
     """
     Ensure PTO_ISA_ROOT is available, either from environment or cloned repo.
 
@@ -228,6 +291,7 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
 
     Args:
         verbose: Print detailed progress information
+        commit: If provided, checkout this specific commit
 
     Returns:
         PTO_ISA_ROOT path if successful, None otherwise
@@ -246,7 +310,7 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
     if not _is_pto_isa_cloned():
         if verbose:
             logger.info("PTO_ISA_ROOT not set, cloning pto-isa repository...")
-        if not _clone_pto_isa(verbose=verbose):
+        if not _clone_pto_isa(verbose=verbose, commit=commit):
             if verbose:
                 logger.warning("Failed to automatically clone pto-isa.")
                 logger.warning("You can manually clone it with:")
@@ -255,6 +319,10 @@ def _ensure_pto_isa_root(verbose: bool = False) -> Optional[str]:
                 logger.warning("Or set PTO_ISA_ROOT to an existing pto-isa installation:")
                 logger.warning("  export PTO_ISA_ROOT=/path/to/pto-isa")
             return None
+    elif commit:
+        _checkout_pto_isa_commit(clone_path, commit, verbose=verbose)
+    else:
+        _update_pto_isa_to_latest(clone_path, verbose=verbose)
 
     # Verify clone has expected content
     include_dir = clone_path / "include"
@@ -338,6 +406,7 @@ class CodeRunner:
         enable_profiling: bool = False,
         run_all_cases: bool = False,
         case_name: Optional[str] = None,
+        pto_isa_commit: Optional[str] = None,
     ):
         # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
         _setup_logging_if_needed()
@@ -350,6 +419,7 @@ class CodeRunner:
 
         # Resolve device ID
         self.device_id = device_id if device_id is not None else 0
+        self.pto_isa_commit = pto_isa_commit
 
         # Load configurations
         self._kernel_config = self._load_kernel_config()
@@ -618,7 +688,7 @@ class CodeRunner:
         from elf_parser import extract_text_section
 
         # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
-        pto_isa_root = _ensure_pto_isa_root(verbose=True)
+        pto_isa_root = _ensure_pto_isa_root(verbose=True, commit=self.pto_isa_commit)
         if pto_isa_root is None:
             raise EnvironmentError(
                 "PTO_ISA_ROOT could not be resolved.\n"
@@ -829,9 +899,11 @@ class CodeRunner:
 
 
 def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",
-                       enable_profiling=False, run_all_cases=False, case_name=None):
+                       enable_profiling=False, run_all_cases=False, case_name=None,
+                       pto_isa_commit=None):
     """Factory: creates a CodeRunner based on kernel_config."""
     return CodeRunner(kernels_dir=kernels_dir, golden_path=golden_path,
                       device_id=device_id, platform=platform,
                       enable_profiling=enable_profiling,
-                      run_all_cases=run_all_cases, case_name=case_name)
+                      run_all_cases=run_all_cases, case_name=case_name,
+                      pto_isa_commit=pto_isa_commit)
