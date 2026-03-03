@@ -57,15 +57,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run simulation examples
-        id: sim
-        run: ./ci.sh -p a2a3sim
-        continue-on-error: true
-
-      - name: Retry sim with pinned PTO-ISA on failure
-        if: steps.sim.outcome == 'failure'
-        run: |
-          rm -rf examples/scripts/_deps/pto-isa
-          ./ci.sh -p a2a3sim --pto-isa-commit 1b22fea
+        run: ./ci.sh -p a2a3sim -c 1b22fea -t 600
 
   run-example-on-device:
     runs-on: self-hosted
@@ -78,4 +70,4 @@ jobs:
       - name: Run on-device examples
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          source /home/github-ci/Ascend/ascend-toolkit/latest/bin/setenv.bash && ./ci.sh -p a2a3 -d 4-7 --parallel
+          source /home/github-ci/Ascend/ascend-toolkit/latest/bin/setenv.bash && ./ci.sh -p a2a3 -d 4-7 --parallel -t 600

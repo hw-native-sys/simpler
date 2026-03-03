@@ -6,6 +6,7 @@ DEVICE_RANGE=""
 PARALLEL=false
 RUNTIME=""
 PTO_ISA_COMMIT=""
+TIMEOUT=600  # 10 minutes default
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -23,6 +24,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -c|--pto-isa-commit)
             PTO_ISA_COMMIT="$2"
+            shift 2
+            ;;
+        -t|--timeout)
+            TIMEOUT="$2"
             shift 2
             ;;
         --parallel)
@@ -85,18 +90,44 @@ RESULTS_FILE="${LOG_DIR}/results.txt"
 touch "$RESULTS_FILE"
 
 cleanup() {
+    kill $WATCHDOG_PID 2>/dev/null
     kill 0 2>/dev/null
     rm -rf "$LOG_DIR"
     exit 130
 }
 trap cleanup INT TERM
-trap 'rm -rf "$LOG_DIR"' EXIT
+trap 'kill $WATCHDOG_PID 2>/dev/null; rm -rf "$LOG_DIR"' EXIT
 
-# Build commit flag for run_example.py
+# Watchdog: abort CI if it exceeds the timeout
+(
+    sleep "$TIMEOUT"
+    echo ""
+    echo "========================================"
+    echo "[CI] TIMEOUT: exceeded ${TIMEOUT}s ($(( TIMEOUT / 60 ))min) limit, aborting"
+    echo "========================================"
+    kill -TERM $$ 2>/dev/null
+) &
+WATCHDOG_PID=$!
+
+# commit_flag starts empty (try latest PTO-ISA first).
+# If -c is given AND a test fails, pin_pto_isa_on_failure sets commit_flag.
 commit_flag=()
-if [[ -n "$PTO_ISA_COMMIT" ]]; then
+
+# Pin PTO-ISA to the specified commit on first failure.
+# On first failure: cleans cached clone, sets commit_flag, returns 0 (caller retries).
+# On subsequent failures (already pinned): returns 1 (real failure).
+pin_pto_isa_on_failure() {
+    if [[ -z "$PTO_ISA_COMMIT" ]]; then
+        return 1  # No fallback commit configured
+    fi
+    if [[ ${#commit_flag[@]} -gt 0 ]]; then
+        return 1  # Already pinned, real failure
+    fi
+    echo "[CI] First failure detected, pinning PTO-ISA to commit $PTO_ISA_COMMIT"
+    rm -rf examples/scripts/_deps/pto-isa
     commit_flag=(-c "$PTO_ISA_COMMIT")
-fi
+    return 0  # Pinned, caller should retry
+}
 
 # ---- Discover all tasks ----
 EXAMPLES_DIR="examples"
@@ -215,7 +246,7 @@ if [[ "$PARALLEL" == "false" ]]; then
             fi
         done
     done
-    # SIM tasks
+    # SIM tasks (with pin-on-first-failure for PTO-ISA)
     for i in "${!SIM_TASK_NAMES[@]}"; do
         name="${SIM_TASK_NAMES[$i]}"
         dir="${SIM_TASK_DIRS[$i]}"
@@ -226,6 +257,15 @@ if [[ "$PARALLEL" == "false" ]]; then
             -k "${dir}/kernels" -g "${dir}/golden.py" \
             -p a2a3sim "${commit_flag[@]}"; then
             echo "${name}:a2a3sim|PASS" >> "$RESULTS_FILE"
+        elif pin_pto_isa_on_failure; then
+            echo "[CI] Retrying: $name with pinned PTO-ISA"
+            if python examples/scripts/run_example.py \
+                -k "${dir}/kernels" -g "${dir}/golden.py" \
+                -p a2a3sim "${commit_flag[@]}"; then
+                echo "${name}:a2a3sim|PASS" >> "$RESULTS_FILE"
+            else
+                echo "${name}:a2a3sim|FAIL" >> "$RESULTS_FILE"
+            fi
         else
             echo "${name}:a2a3sim|FAIL" >> "$RESULTS_FILE"
         fi
@@ -245,7 +285,7 @@ else
             echo "Running: $name (a2a3sim)"
             echo "========================================"
             if python examples/scripts/run_example.py \
-                -k "${dir}/kernels" -g "${dir}/golden.py" -p a2a3sim $COMMIT_FLAG; then
+                -k "${dir}/kernels" -g "${dir}/golden.py" -p a2a3sim "${commit_flag[@]}"; then
                 echo "${name}:a2a3sim|PASS" >> "$RESULTS_FILE"
             else
                 echo "${name}:a2a3sim|FAIL" >> "$RESULTS_FILE"
