@@ -132,6 +132,7 @@ struct AicpuExecutor {
     int shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores, int core_num);
     int run(Runtime* runtime);
     void deinit();
+    void emergency_shutdown();
     void diagnose_stuck_state(Runtime* runtime, int thread_idx, const int* cur_thread_cores,
                               int core_num, Handshake* hank);
 };
@@ -151,6 +152,12 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     Handshake* all_hanks = (Handshake*)runtime->workers;
     cores_total_num_ = runtime->worker_count;
 
+    // Validate cores_total_num_ before using as array index
+    if (cores_total_num_ == 0 || cores_total_num_ > MAX_CORES_PER_THREAD) {
+        DEV_ERROR("Invalid cores_total_num %d (expected 1-%d)", cores_total_num_, MAX_CORES_PER_THREAD);
+        return -1;
+    }
+
     aic_count_ = 0;
     aiv_count_ = 0;
 
@@ -163,7 +170,11 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
         all_hanks[i].aicpu_ready = 1;
     }
 
+    // Get platform physical cores count for validation
+    uint32_t max_physical_cores_count = platform_get_physical_cores_count();
+
     // Step 2: Wait for all cores to respond, collect core type and register addresses
+    bool handshake_failed = false;
     for (int i = 0; i < cores_total_num_; i++) {
         Handshake* hank = &all_hanks[i];
         while (hank->aicore_done == 0) {
@@ -172,6 +183,14 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
 
         CoreType type = hank->core_type;
         uint32_t physical_core_id = hank->physical_core_id;
+
+        // Validate physical_core_id before using as array index
+        if (physical_core_id >= max_physical_cores_count) {
+            DEV_ERROR("Core %d reported invalid physical_core_id=%u (platform max=%u)",
+                      i, physical_core_id, max_physical_cores_count);
+            handshake_failed = true;
+            continue;
+        }
 
         // Get register address using physical_core_id
         uint64_t* regs = reinterpret_cast<uint64_t*>(regs_);
@@ -195,11 +214,15 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
 
         core_id_to_reg_addr_[i] = reg_addr;
 
-        // Initialize fast path registers
+        // Initialize AICore registers (platform-specific)
         if (reg_addr != 0) {
-            write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
-            write_reg(reg_addr, RegId::DATA_MAIN_BASE, 0);
+            platform_init_aicore_regs(reg_addr);
         }
+    }
+
+    if (handshake_failed) {
+        emergency_shutdown();
+        return -1;
     }
 
     DEV_INFO("Core discovery complete: %d AIC, %d AIV", aic_count_, aiv_count_);
@@ -277,6 +300,11 @@ int AicpuExecutor::init(Runtime* runtime) {
         return -1;
     }
 
+    // Initialize core_id_to_reg_addr_ array to 0 before handshake
+    for (int i = 0; i < MAX_CORES_PER_THREAD; i++) {
+        core_id_to_reg_addr_[i] = 0;
+    }
+
     // Use handshake mechanism to discover cores (aligned with host_build_graph)
     int rc = handshake_all_cores(runtime);
     if (rc != 0) {
@@ -287,12 +315,6 @@ int AicpuExecutor::init(Runtime* runtime) {
 
     // Dynamically assign cores to threads
     assign_cores_to_threads();
-
-    if (cores_total_num_ > MAX_CORES_PER_THREAD * MAX_AICPU_THREADS) {
-        DEV_ERROR("Total cores %d exceeds maximum", cores_total_num_);
-        init_failed_.store(true, std::memory_order_release);
-        return -1;
-    }
 
     // Initialize executing_task_ids_ to AICPU_TASK_INVALID (idle)
     for (int i = 0; i < MAX_CORES_PER_THREAD; i++) {
@@ -345,8 +367,7 @@ int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* 
         int core_id = cur_thread_cores[i];
         uint64_t reg_addr = core_id_to_reg_addr_[core_id];
         if (reg_addr != 0) {
-            write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
-            write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
+            platform_deinit_aicore_regs(reg_addr);
         } else {
             DEV_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
         }
@@ -1034,6 +1055,18 @@ void AicpuExecutor::deinit() {
     finished_.store(false, std::memory_order_release);
 
     DEV_INFO("DeInit: AicpuExecutor reset complete");
+}
+
+void AicpuExecutor::emergency_shutdown() {
+    DEV_WARN("Emergency shutdown: sending exit signal to all initialized cores");
+
+    for (int i = 0; i < cores_total_num_; i++) {
+        if (core_id_to_reg_addr_[i] != 0) {
+            platform_deinit_aicore_regs(core_id_to_reg_addr_[i]);
+        }
+    }
+
+    DEV_WARN("Emergency shutdown complete");
 }
 
 void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int thread_idx,

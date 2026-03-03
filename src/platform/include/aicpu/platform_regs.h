@@ -61,5 +61,34 @@ uint64_t read_reg(uint64_t reg_base_addr, RegId reg);
  */
 void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value);
 
+/**
+ * Initialize AICore registers after core discovery
+ *
+ * This function performs platform-agnostic register initialization that works
+ * for both a2a3 and a2a3sim, including enabling fast path control and clearing
+ * dispatch registers.
+ *
+ * @param reg_addr  Register base address of the AICore
+ */
+void platform_init_aicore_regs(uint64_t reg_addr);
+
+/**
+ * Deinitialize AICore registers before termination
+ *
+ * This function sends exit signal and closes fast path control.
+ *
+ * @param reg_addr  Register base address of the AICore
+ */
+void platform_deinit_aicore_regs(uint64_t reg_addr);
+
+/**
+ * Get physical core count for current platform
+ *
+ * This function returns the maximum valid physical_core_id value (exclusive upper bound).
+ * Used for validating physical_core_id from AICore handshake before using as array index.
+ *
+ * @return Physical core count (exclusive upper bound)
+ */
+uint32_t platform_get_physical_cores_count();
 
 #endif  // PLATFORM_AICPU_PLATFORM_REGS_H_

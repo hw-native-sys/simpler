@@ -5,6 +5,7 @@
  * Provides unified interface for:
  * 1. Platform register base address management (set/get_platform_regs)
  * 2. Register read/write operations with optimized memory barriers
+ * 3. Platform-agnostic AICore register initialization/deinitialization
  *
  * Memory Barrier Strategy:
  * - read_reg: Full barriers (__sync_synchronize) to ensure store-load ordering
@@ -17,6 +18,7 @@
 
 #include <cstdint>
 #include "aicpu/platform_regs.h"
+#include "common/platform_config.h"
 
 static uint64_t g_platform_regs = 0;
 
@@ -52,4 +54,24 @@ void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
     *ptr = static_cast<uint32_t>(value);
 
     __sync_synchronize();
+}
+
+void platform_init_aicore_regs(uint64_t reg_addr) {
+    // Both a2a3 and a2a3sim require fast path control to be enabled before use
+    write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
+
+    // Initialize task dispatch register to idle state
+    write_reg(reg_addr, RegId::DATA_MAIN_BASE, 0);
+}
+
+void platform_deinit_aicore_regs(uint64_t reg_addr) {
+    // Send exit signal to AICore
+    write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
+
+    // Close fast path control
+    write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
+}
+
+uint32_t platform_get_physical_cores_count() {
+    return DAV_2201::PLATFORM_MAX_PHYSICAL_CORES * PLATFORM_CORES_PER_BLOCKDIM;
 }

@@ -78,7 +78,6 @@ class KernelCompiler:
             List of include directory paths (e.g., for device_runner.h, core_type.h)
         """
         return [
-            str(self.platform_dir / "host"),
             str(self.platform_dir.parent / "include"),  # For common headers like core_type.h
         ]
 
