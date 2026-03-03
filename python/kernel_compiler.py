@@ -72,14 +72,17 @@ class KernelCompiler:
 
     def get_platform_include_dirs(self) -> List[str]:
         """
-        Get platform-specific include directories for orchestration compilation.
+        Get platform-specific include directories for compilation.
 
         Returns:
-            List of include directory paths (e.g., for device_runner.h, core_type.h)
+            List of include directory paths:
+            - Public platform interface (src/platform/include)
+            - Platform-internal common directory (src/platform/<platform>/common)
+              for inner_platform_config.h
         """
         return [
-            str(self.platform_dir / "host"),
-            str(self.platform_dir.parent / "include"),  # For common headers like core_type.h
+            str(self.platform_dir.parent / "include"),  # Public interface
+            str(self.platform_dir / "common"),          # Platform-internal config
         ]
 
     def get_orchestration_include_dirs(self, runtime_name: str) -> List[str]:

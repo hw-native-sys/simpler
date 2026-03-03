@@ -317,6 +317,9 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
         all_hanks[i].aicpu_ready = 1;
     }
 
+    // Get platform physical cores count for validation
+    uint32_t max_physical_cores_count = platform_get_physical_cores_count();
+
     // Step 2: Wait for all cores to respond and collect core type information
     for (int i = 0; i < cores_total_num_; i++) {
         Handshake* hank = &all_hanks[i];
@@ -328,6 +331,13 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
 
         CoreType type = hank->core_type;
         uint32_t physical_core_id = hank->physical_core_id;
+
+        // Validate physical_core_id before using as array index
+        if (physical_core_id >= max_physical_cores_count) {
+            LOG_ERROR("Core %d reported invalid physical_core_id=%u (platform max=%u)",
+                      i, physical_core_id, max_physical_cores_count);
+            return -1;
+        }
 
         // Get register address using physical_core_id
         uint64_t* regs = reinterpret_cast<uint64_t*>(regs_);
@@ -359,8 +369,7 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
             reg_addr);
 
         if (reg_addr != 0) {
-            write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
-            write_reg(reg_addr, RegId::DATA_MAIN_BASE, 0);
+            platform_init_aicore_regs(reg_addr);
         }
     }
 
@@ -542,8 +551,7 @@ int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* 
 
         uint64_t reg_addr = core_id_to_reg_addr_[core_id];
         if (reg_addr != 0) {
-            write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
-            write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
+            platform_deinit_aicore_regs(reg_addr);
         } else {
             LOG_ERROR("Thread %d: Core %d has invalid register address", thread_idx, core_id);
         }

@@ -7,8 +7,8 @@
  * hardware capabilities and platform design decisions.
  *
  * Configuration Hierarchy:
- * - Base: PLATFORM_MAX_BLOCKDIM (platform capacity)
- * - Derived: All other limits calculated from base configuration
+ * - Base: Platform-specific constants (defined in inner_platform_config.h)
+ * - Derived: Calculated limits based on platform capacity
  */
 
 #ifndef PLATFORM_COMMON_PLATFORM_CONFIG_H_
@@ -16,15 +16,23 @@
 
 #include <cstdint>
 
-// =============================================================================
-// Base Platform Configuration
-// =============================================================================
-
 /**
- * Maximum block dimension supported by platform
- * This is the fundamental platform capacity constraint.
+ * Include platform-specific configuration
+ *
+ * The correct platform variant is selected via include path:
+ * - Python compilation: kernel_compiler.py adds platform/<platform>/common
+ * - CMake compilation: CMakeLists.txt adds ../common
+ *
+ * This finds the platform-specific inner_platform_config.h:
+ * - a2a3: src/platform/a2a3/common/inner_platform_config.h
+ * - a2a3sim: src/platform/a2a3sim/common/inner_platform_config.h
+ * - a5: src/platform/a5/common/inner_platform_config.h (future)
  */
-constexpr int PLATFORM_MAX_BLOCKDIM = 24;
+#include "inner_platform_config.h"
+
+// =============================================================================
+// Architecture Constants (common across all platforms)
+// =============================================================================
 
 /**
  * Core composition per block dimension
@@ -34,32 +42,34 @@ constexpr int PLATFORM_CORES_PER_BLOCKDIM = 3;
 constexpr int PLATFORM_AIC_CORES_PER_BLOCKDIM = 1;
 constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
 
-/**
- * Maximum AICPU scheduling threads
- * Determines parallelism level of the AICPU task scheduler.
- */
-constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
+// =============================================================================
+// Base Platform Configuration (defined in inner_platform_config.h)
+// =============================================================================
+// Platform capacity constraints:
+//   - PLATFORM_MAX_BLOCKDIM              : Maximum block dimension supported by platform
+//   - PLATFORM_MAX_AICPU_THREADS         : Maximum AICPU scheduling threads
+//
+// These values vary by platform (a2a3: 24/4, a5: 32/8, etc.)
+// =============================================================================
 
 // =============================================================================
-// Derived Platform Limits
+// Derived Platform Limits (calculated from base configuration)
 // =============================================================================
 
 /**
  * Maximum cores per AICPU thread
  *
  * When running with 1 AICPU thread and MAX_BLOCKDIM blocks,
- * one thread must manage all cores:
- * - MAX_AIC_PER_THREAD = MAX_BLOCKDIM * AIC_CORES_PER_BLOCKDIM = 24 * 1 = 24
- * - MAX_AIV_PER_THREAD = MAX_BLOCKDIM * AIV_CORES_PER_BLOCKDIM = 24 * 2 = 48
+ * one thread must manage all cores.
  */
 constexpr int PLATFORM_MAX_AIC_PER_THREAD =
-    PLATFORM_MAX_BLOCKDIM * PLATFORM_AIC_CORES_PER_BLOCKDIM;  // 24
+    PLATFORM_MAX_BLOCKDIM * PLATFORM_AIC_CORES_PER_BLOCKDIM;
 
 constexpr int PLATFORM_MAX_AIV_PER_THREAD =
-    PLATFORM_MAX_BLOCKDIM * PLATFORM_AIV_CORES_PER_BLOCKDIM;  // 48
+    PLATFORM_MAX_BLOCKDIM * PLATFORM_AIV_CORES_PER_BLOCKDIM;
 
 constexpr int PLATFORM_MAX_CORES_PER_THREAD =
-    PLATFORM_MAX_AIC_PER_THREAD + PLATFORM_MAX_AIV_PER_THREAD;  // 72
+    PLATFORM_MAX_AIC_PER_THREAD + PLATFORM_MAX_AIV_PER_THREAD;
 
 // =============================================================================
 // Performance Profiling Configuration
@@ -67,10 +77,10 @@ constexpr int PLATFORM_MAX_CORES_PER_THREAD =
 
 /**
  * Maximum number of cores that can be profiled simultaneously
- * Calculated as: MAX_BLOCKDIM * CORES_PER_BLOCKDIM = 24 * 3 = 72
+ * Calculated as: MAX_BLOCKDIM * CORES_PER_BLOCKDIM
  */
 constexpr int PLATFORM_MAX_CORES =
-    PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BLOCKDIM;  // 72
+    PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BLOCKDIM;
 
 /**
  * Performance buffer capacity for each double buffer
@@ -83,7 +93,7 @@ constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
  * Queue holds (core_index, buffer_id) entries for buffers ready to be read by Host.
  * Capacity = PLATFORM_MAX_CORES * 2 (each core has 2 buffers: ping and pong)
  */
-constexpr int PLATFORM_PROF_READYQUEUE_SIZE = PLATFORM_MAX_CORES * 2;  // 144
+constexpr int PLATFORM_PROF_READYQUEUE_SIZE = PLATFORM_MAX_CORES * 2;
 
 /**
  * System counter frequency (get_sys_cnt)
@@ -108,15 +118,18 @@ inline double cycles_to_us(uint64_t cycles) {
 // =============================================================================
 // Register Communication Configuration
 // =============================================================================
-
-// Register offsets for AICore SPR access
-constexpr uint32_t REG_SPR_DATA_MAIN_BASE_OFFSET = 0xA0;  // Task dispatch (AICPU→AICore)
-constexpr uint32_t REG_SPR_COND_OFFSET = 0x4C8;           // Status (AICore→AICPU): 0=IDLE, 1=BUSY
-constexpr uint32_t REG_SPR_FAST_PATH_ENABLE_OFFSET = 0x18;
-
-// Fast path control values
-constexpr uint32_t REG_SPR_FAST_PATH_OPEN = 0xE;
-constexpr uint32_t REG_SPR_FAST_PATH_CLOSE = 0xF;
+// Platform-specific register offsets (defined in inner_platform_config.h):
+//   - REG_SPR_DATA_MAIN_BASE_OFFSET      : Task dispatch register (AICPU→AICore)
+//                                          a2a3: 0xA0, a5: 0xD4 (SU_KIS_DATA_MAIN_BASE_L)
+//   - REG_SPR_COND_OFFSET                : Status register (AICore→AICPU)
+//                                          a2a3: 0x4C8, a5: 0x5108 (SU_SPR_CONDITION_L)
+//   - REG_SPR_FAST_PATH_ENABLE_OFFSET    : Fast path control (0 = not supported)
+//                                          a2a3: 0x18, a5: 0 (not supported)
+//
+// Fast path control values (defined in inner_platform_config.h):
+//   - REG_SPR_FAST_PATH_OPEN             : Enable fast path
+//   - REG_SPR_FAST_PATH_CLOSE            : Disable fast path
+// =============================================================================
 
 // Exit signal for AICore shutdown
 constexpr uint32_t AICORE_EXIT_SIGNAL = 0x7FFFFFF0;
@@ -171,13 +184,6 @@ constexpr uint8_t PLATFORM_AICORE_BITMAP_LEN = 2;
  * Hardware architecture: 1 AICore = 1 AIC + 2 AIV sub-cores
  */
 constexpr uint32_t PLATFORM_SUB_CORES_PER_AICORE = PLATFORM_CORES_PER_BLOCKDIM;
-
-/**
- * Maximum physical AICore count for DAV 2201 chip
- */
-namespace DAV_2201 {
-constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = 25;
-}
 
 // =============================================================================
 // ACK/FIN Dual-State Register Protocol
