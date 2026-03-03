@@ -8,8 +8,8 @@
 
 #include "pto_scheduler.h"
 #include <inttypes.h>
+#include <new>
 #include <stdlib.h>
-#include <string.h>
 #include "common/unified_log.h"
 
 // =============================================================================
@@ -41,7 +41,7 @@ bool pto2_ready_queue_init(PTO2ReadyQueue* queue, uint64_t capacity) {
     queue->tail = 0;
     queue->capacity = capacity;
     queue->count = 0;
-    queue->spinlock = 0;
+    queue->spinlock.store(0, std::memory_order_relaxed);
 
     return true;
 }
@@ -60,7 +60,7 @@ void pto2_ready_queue_reset(PTO2ReadyQueue* queue) {
 }
 
 bool pto2_ready_queue_push(PTO2ReadyQueue* queue, int32_t task_id) {
-    while (__atomic_exchange_n(&queue->spinlock, 1, __ATOMIC_ACQUIRE)) {
+    while (queue->spinlock.exchange(1, std::memory_order_acquire)) {
         PTO2_SPIN_PAUSE_LIGHT();
     }
 
@@ -72,12 +72,12 @@ bool pto2_ready_queue_push(PTO2ReadyQueue* queue, int32_t task_id) {
         result = true;
     }
 
-    __atomic_store_n(&queue->spinlock, 0, __ATOMIC_RELEASE);
+    queue->spinlock.store(0, std::memory_order_release);
     return result;
 }
 
 int32_t pto2_ready_queue_pop(PTO2ReadyQueue* queue) {
-    while (__atomic_exchange_n(&queue->spinlock, 1, __ATOMIC_ACQUIRE)) {
+    while (queue->spinlock.exchange(1, std::memory_order_acquire)) {
         PTO2_SPIN_PAUSE_LIGHT();
     }
 
@@ -88,7 +88,7 @@ int32_t pto2_ready_queue_pop(PTO2ReadyQueue* queue) {
         queue->count--;
     }
 
-    __atomic_store_n(&queue->spinlock, 0, __ATOMIC_RELEASE);
+    queue->spinlock.store(0, std::memory_order_release);
     return task_id;
 }
 
@@ -100,11 +100,15 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
                           PTO2DepListPool* dep_pool,
                           void* heap_base) {
-    memset(sched, 0, sizeof(PTO2SchedulerState));
-
     sched->sm_handle = sm_handle;
     sched->dep_pool = dep_pool;
     sched->heap_base = heap_base;
+    sched->task_state = nullptr;
+    sched->fanin_refcount = nullptr;
+    sched->fanout_refcount = nullptr;
+    sched->tasks_completed.store(0, std::memory_order_relaxed);
+    sched->tasks_consumed.store(0, std::memory_order_relaxed);
+    sched->total_dispatch_cycles = 0;
 
     // Get runtime task_window_size from shared memory header
     uint64_t window_size = sm_handle->header->task_window_size;
@@ -117,21 +121,24 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
     sched->heap_tail = 0;
 
     // Allocate per-task state arrays (dynamically sized based on runtime window_size)
-    sched->task_state = (PTO2TaskState*)calloc(window_size, sizeof(PTO2TaskState));
+    sched->task_state = new (std::nothrow) std::atomic<PTO2TaskState>[window_size];
     if (!sched->task_state) {
         return false;
     }
 
-    sched->fanin_refcount = (int32_t*)calloc(window_size, sizeof(int32_t));
+    sched->fanin_refcount = new (std::nothrow) std::atomic<int32_t>[window_size];
     if (!sched->fanin_refcount) {
-        free(sched->task_state);
+        delete[] sched->task_state;
+        sched->task_state = nullptr;
         return false;
     }
 
-    sched->fanout_refcount = (int32_t*)calloc(window_size, sizeof(int32_t));
+    sched->fanout_refcount = new (std::nothrow) std::atomic<int32_t>[window_size];
     if (!sched->fanout_refcount) {
-        free(sched->fanin_refcount);
-        free(sched->task_state);
+        delete[] sched->fanin_refcount;
+        delete[] sched->task_state;
+        sched->fanin_refcount = nullptr;
+        sched->task_state = nullptr;
         return false;
     }
 
@@ -142,9 +149,12 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
             for (int j = 0; j < i; j++) {
                 pto2_ready_queue_destroy(&sched->ready_queues[j]);
             }
-            free(sched->fanout_refcount);
-            free(sched->fanin_refcount);
-            free(sched->task_state);
+            delete[] sched->fanout_refcount;
+            delete[] sched->fanin_refcount;
+            delete[] sched->task_state;
+            sched->fanout_refcount = nullptr;
+            sched->fanin_refcount = nullptr;
+            sched->task_state = nullptr;
             return false;
         }
     }
@@ -154,18 +164,18 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
 
 void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
     if (sched->task_state) {
-        free(sched->task_state);
-        sched->task_state = NULL;
+        delete[] sched->task_state;
+        sched->task_state = nullptr;
     }
 
     if (sched->fanin_refcount) {
-        free(sched->fanin_refcount);
-        sched->fanin_refcount = NULL;
+        delete[] sched->fanin_refcount;
+        sched->fanin_refcount = nullptr;
     }
 
     if (sched->fanout_refcount) {
-        free(sched->fanout_refcount);
-        sched->fanout_refcount = NULL;
+        delete[] sched->fanout_refcount;
+        sched->fanout_refcount = nullptr;
     }
 
     for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
@@ -177,21 +187,23 @@ void pto2_scheduler_reset(PTO2SchedulerState* sched) {
     sched->last_task_alive = 0;
     sched->last_heap_consumed = 0;
     sched->heap_tail = 0;
-    memset(sched->task_state, 0, sched->task_window_size * sizeof(PTO2TaskState));
-    memset(sched->fanin_refcount, 0, sched->task_window_size * sizeof(int32_t));
-    memset(sched->fanout_refcount, 0, sched->task_window_size * sizeof(int32_t));
+    for (uint64_t i = 0; i < sched->task_window_size; i++) {
+        sched->task_state[i].store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+        sched->fanin_refcount[i].store(0, std::memory_order_relaxed);
+        sched->fanout_refcount[i].store(0, std::memory_order_relaxed);
+    }
 
     for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
         pto2_ready_queue_reset(&sched->ready_queues[i]);
     }
 
-    sched->tasks_completed = 0;
-    sched->tasks_consumed = 0;
+    sched->tasks_completed.store(0, std::memory_order_relaxed);
+    sched->tasks_consumed.store(0, std::memory_order_relaxed);
 }
 
 void pto2_scheduler_mark_running(PTO2SchedulerState* sched, int32_t task_id) {
     int32_t slot = sched->pto2_task_slot(task_id);
-    sched->task_state[slot] = PTO2_TASK_RUNNING;
+    sched->task_state[slot].store(PTO2_TASK_RUNNING, std::memory_order_relaxed);
 }
 
 int32_t pto2_scheduler_get_ready_task(PTO2SchedulerState* sched,
@@ -213,9 +225,9 @@ void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id)
     // skip this producer (prod_state >= COMPLETED), so no new entries can be
     // appended to the fanout list. Traversal outside the lock is safe.
     pto2_fanout_lock(task);
-    __atomic_store_n(&sched->task_state[slot], PTO2_TASK_COMPLETED, __ATOMIC_RELEASE);
-    __atomic_fetch_add(&sched->tasks_completed, 1, __ATOMIC_RELAXED);
-    int32_t fanout_head = PTO2_LOAD_ACQUIRE(&task->fanout_head);
+    sched->task_state[slot].store(PTO2_TASK_COMPLETED, std::memory_order_release);
+    sched->tasks_completed.fetch_add(1, std::memory_order_relaxed);
+    int32_t fanout_head = task->fanout_head.load(std::memory_order_acquire);
     pto2_fanout_unlock(task);
 
     // Traverse fanout chain OUTSIDE the lock to notify consumers
@@ -236,37 +248,37 @@ void pto2_scheduler_on_task_complete(PTO2SchedulerState* sched, int32_t task_id)
     // === STEP 2: Mark CONSUMED and CAS-advance ring pointers ===
     // Mark this task as fully processed. Once CONSUMED is visible, the CAS loop
     // below (or another thread's) can advance last_task_alive past this slot.
-    __atomic_store_n(&sched->task_state[slot], PTO2_TASK_CONSUMED, __ATOMIC_RELEASE);
-    __atomic_fetch_add(&sched->tasks_consumed, 1, __ATOMIC_RELAXED);
+    sched->task_state[slot].store(PTO2_TASK_CONSUMED, std::memory_order_release);
+    sched->tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 
     // CAS-based lock-free advancement of last_task_alive (matches pre-migration logic).
     // Multiple threads race to advance; CAS serializes winners.
     PTO2SharedMemoryHeader* header = sched->sm_handle->header;
-    int32_t la = PTO2_LOAD_ACQUIRE(&header->last_task_alive);
-    int32_t cti = PTO2_LOAD_ACQUIRE(&header->current_task_index);
+    int32_t la = header->last_task_alive.load(std::memory_order_acquire);
+    int32_t cti = header->current_task_index.load(std::memory_order_acquire);
 
     while (la < cti) {
         int32_t la_slot = la & sched->task_window_mask;
-        if (__atomic_load_n(&sched->task_state[la_slot], __ATOMIC_ACQUIRE) != PTO2_TASK_CONSUMED)
+        if (sched->task_state[la_slot].load(std::memory_order_acquire) != PTO2_TASK_CONSUMED)
             break;
 
         // Reset fanin_refcount before exposing slot for reuse
-        __atomic_store_n(&sched->fanin_refcount[la_slot], 0, __ATOMIC_RELEASE);
+        sched->fanin_refcount[la_slot].store(0, std::memory_order_release);
 
         // Atomically advance last_task_alive by 1
         int32_t expected = la;
-        if (__atomic_compare_exchange_n(&header->last_task_alive, &expected, la + 1,
-                false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        if (header->last_task_alive.compare_exchange_strong(
+                expected, la + 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
             // Ticket-based heap_tail serialization: wait for our turn, then write
-            while (__atomic_load_n(&header->heap_tail_gen, __ATOMIC_ACQUIRE) != la) {
+            while (header->heap_tail_gen.load(std::memory_order_acquire) != la) {
                 PTO2_SPIN_PAUSE_LIGHT();
             }
             PTO2TaskDescriptor* consumed_t = pto2_sm_get_task(sched->sm_handle, la);
             if (consumed_t->packed_buffer_end != NULL) {
                 uint64_t new_tail = (uint64_t)((char*)consumed_t->packed_buffer_end - (char*)sched->heap_base);
-                PTO2_STORE_RELEASE(&header->heap_tail, new_tail);
+                header->heap_tail.store(new_tail, std::memory_order_release);
             }
-            PTO2_STORE_RELEASE(&header->heap_tail_gen, la + 1);
+            header->heap_tail_gen.store(la + 1, std::memory_order_release);
             la = la + 1;
         } else {
             break;
@@ -306,14 +318,14 @@ bool pto2_scheduler_is_done(PTO2SchedulerState* sched) {
     PTO2SharedMemoryHeader* header = sched->sm_handle->header;
 
     // Check if orchestrator has finished
-    int32_t orch_done = PTO2_LOAD_ACQUIRE(&header->orchestrator_done);
+    int32_t orch_done = header->orchestrator_done.load(std::memory_order_acquire);
     if (!orch_done) {
         return false;
     }
 
     // Check if all tasks have been consumed (read directly from shared memory)
-    int32_t current_task_index = PTO2_LOAD_ACQUIRE(&header->current_task_index);
-    int32_t last_alive = PTO2_LOAD_ACQUIRE(&header->last_task_alive);
+    int32_t current_task_index = header->current_task_index.load(std::memory_order_acquire);
+    int32_t last_alive = header->last_task_alive.load(std::memory_order_acquire);
     return last_alive >= current_task_index;
 }
 
@@ -325,8 +337,8 @@ void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
     LOG_INFO("=== Scheduler Statistics ===");
     LOG_INFO("last_task_alive:   %d", sched->last_task_alive);
     LOG_INFO("heap_tail:         %" PRIu64, sched->heap_tail);
-    LOG_INFO("tasks_completed:   %lld", (long long)sched->tasks_completed);
-    LOG_INFO("tasks_consumed:    %lld", (long long)sched->tasks_consumed);
+    LOG_INFO("tasks_completed:   %lld", (long long)sched->tasks_completed.load(std::memory_order_relaxed));
+    LOG_INFO("tasks_consumed:    %lld", (long long)sched->tasks_consumed.load(std::memory_order_relaxed));
     LOG_INFO("============================");
 }
 

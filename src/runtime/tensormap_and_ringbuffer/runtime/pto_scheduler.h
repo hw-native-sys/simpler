@@ -18,6 +18,8 @@
 #ifndef PTO_SCHEDULER_H
 #define PTO_SCHEDULER_H
 
+#include <atomic>
+
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 #include "pto_ring_buffer.h"
@@ -30,14 +32,14 @@
  * Per-worker-type ready queue
  * Circular buffer of task IDs
  */
-typedef struct {
+struct PTO2ReadyQueue {
     int32_t* task_ids;    // Circular buffer of task IDs
     uint64_t head;        // Dequeue position
     uint64_t tail;        // Enqueue position
     uint64_t capacity;    // Queue capacity
     uint64_t count;       // Current number of tasks in queue
-    int32_t spinlock;     // Spinlock for thread-safe push/pop
-} PTO2ReadyQueue;
+    std::atomic<int32_t> spinlock; // Spinlock for thread-safe push/pop
+};
 
 /**
  * Push task to ready queue
@@ -74,9 +76,9 @@ struct PTO2SchedulerState {
     // === PRIVATE DATA (not in shared memory) ===
 
     // Per-task state arrays (dynamically allocated, indexed by task_id & task_window_mask)
-    PTO2TaskState* task_state;        // PENDING/READY/RUNNING/COMPLETED/CONSUMED
-    int32_t* fanin_refcount;          // Dynamic: counts completed producers
-    int32_t* fanout_refcount;         // Dynamic: counts released references
+    std::atomic<PTO2TaskState>* task_state; // PENDING/READY/RUNNING/COMPLETED/CONSUMED
+    std::atomic<int32_t>* fanin_refcount;   // Dynamic: counts completed producers
+    std::atomic<int32_t>* fanout_refcount;  // Dynamic: counts released references
 
     // Ready queues (one per worker type)
     PTO2ReadyQueue ready_queues[PTO2_NUM_WORKER_TYPES];
@@ -85,8 +87,8 @@ struct PTO2SchedulerState {
     PTO2DepListPool* dep_pool;
 
     // Statistics
-    int64_t tasks_completed;
-    int64_t tasks_consumed;
+    std::atomic<int64_t> tasks_completed;
+    std::atomic<int64_t> tasks_consumed;
     int64_t total_dispatch_cycles;
 
 
@@ -118,14 +120,14 @@ struct PTO2SchedulerState {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // release in init_task, making fanin_count visible — plain load suffices.
-        int32_t new_refcount = __atomic_fetch_add(&fanin_refcount[slot], 1, __ATOMIC_ACQ_REL) + 1;
+        int32_t new_refcount = fanin_refcount[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
 
         // Check if all producers have completed
         if (new_refcount == task->fanin_count) {
             // CAS PENDING -> READY to prevent double-enqueue from concurrent threads
             PTO2TaskState expected = PTO2_TASK_PENDING;
-            if (__atomic_compare_exchange_n(&task_state[slot], &expected, PTO2_TASK_READY,
-                                             false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            if (task_state[slot].compare_exchange_strong(
+                    expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 pto2_ready_queue_push(&ready_queues[task->worker_type], task_id);
             }
         }
@@ -134,12 +136,12 @@ struct PTO2SchedulerState {
     void init_task(int32_t task_id, PTO2TaskDescriptor* task) {
         int32_t slot = pto2_task_slot(task_id);
 
-        task_state[slot] = PTO2_TASK_PENDING; // Orchestrator is the unique owner
+        task_state[slot].store(PTO2_TASK_PENDING, std::memory_order_relaxed); // Orchestrator is the unique owner
 
         // Reset fanout_refcount for new task lifecycle.
         // Do NOT reset fanin_refcount — it may have been incremented by
         // concurrent on_task_complete between Step 5 and Step 6.
-        fanout_refcount[slot] = 0;
+        fanout_refcount[slot].store(0, std::memory_order_relaxed);
 
         release_fanin_and_check_ready(task_id, task);
     }

@@ -62,7 +62,7 @@ struct PTO2HeapRing {
     uint64_t top;         // Allocation pointer (local copy)
 
     // Reference to shared memory tail (for back-pressure)
-    volatile uint64_t* tail_ptr;  // Points to header->heap_tail
+    std::atomic<uint64_t>* tail_ptr;  // Points to header->heap_tail
 
     /**
      * Allocate memory from heap ring
@@ -101,7 +101,7 @@ struct PTO2HeapRing {
 #if PTO2_SPIN_VERBOSE_LOGGING
             // Periodic block notification
             if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count < PTO2_HEAP_SPIN_LIMIT) {
-                uint64_t tail = PTO2_LOAD_ACQUIRE(tail_ptr);
+                uint64_t tail = tail_ptr->load(std::memory_order_acquire);
                 uint64_t available = pto2_heap_ring_available();
                 LOG_WARN("[HeapRing] BLOCKED: requesting %" PRIu64 " bytes, available=%" PRIu64
                      ", top=%" PRIu64 ", tail=%" PRIu64 ", spins=%d",
@@ -111,7 +111,7 @@ struct PTO2HeapRing {
 #endif
 
             if (spin_count >= PTO2_HEAP_SPIN_LIMIT) {
-                uint64_t tail = PTO2_LOAD_ACQUIRE(tail_ptr);
+                uint64_t tail = tail_ptr->load(std::memory_order_acquire);
                 uint64_t available = pto2_heap_ring_available();
                 LOG_ERROR("========================================");
                 LOG_ERROR("FATAL: Heap Ring Deadlock Detected!");
@@ -142,7 +142,7 @@ struct PTO2HeapRing {
         alloc_size = PTO2_ALIGN_UP(alloc_size, PTO2_ALIGN_SIZE);
 
         // Read latest tail from shared memory (Scheduler updates this)
-        uint64_t tail = PTO2_LOAD_ACQUIRE(tail_ptr);
+        uint64_t tail = tail_ptr->load(std::memory_order_acquire);
 
         if (top >= tail) {
             // Case 1: top is at or ahead of tail (normal case)
@@ -190,7 +190,7 @@ struct PTO2HeapRing {
      * Get available space in heap ring
      */
     uint64_t pto2_heap_ring_available() {
-        uint64_t tail = PTO2_LOAD_ACQUIRE(tail_ptr);
+        uint64_t tail = tail_ptr->load(std::memory_order_acquire);
 
         if (top >= tail) {
             // Space at end + space at beginning (if any)
@@ -213,7 +213,7 @@ struct PTO2HeapRing {
  * @param tail_ptr  Pointer to shared memory heap_tail
  */
 void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
-                          volatile uint64_t* tail_ptr);
+                          std::atomic<uint64_t>* tail_ptr);
 
 /**
  * Reset heap ring to initial state
@@ -236,7 +236,7 @@ struct PTO2TaskRing {
     int32_t current_index;            // Next task to allocate (absolute ID)
     
     // Reference to shared memory last_task_alive (for back-pressure)
-    volatile int32_t* last_alive_ptr;  // Points to header->last_task_alive
+    std::atomic<int32_t>* last_alive_ptr;  // Points to header->last_task_alive
 
     /**
      * Allocate a task slot from task ring
@@ -270,7 +270,7 @@ struct PTO2TaskRing {
 #if PTO2_SPIN_VERBOSE_LOGGING
             // Periodic block notification
             if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count < PTO2_FLOW_CONTROL_SPIN_LIMIT) {
-                int32_t last_alive = PTO2_LOAD_ACQUIRE(last_alive_ptr);
+                int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
                 int32_t active_count = current_index - last_alive;
                 LOG_WARN("[TaskRing] BLOCKED (Flow Control): current=%d, last_alive=%d, "
                      "active=%d/%d (%.1f%%), spins=%d",
@@ -282,7 +282,7 @@ struct PTO2TaskRing {
 
             // Check for potential deadlock
             if (spin_count >= PTO2_FLOW_CONTROL_SPIN_LIMIT) {
-                int32_t last_alive = PTO2_LOAD_ACQUIRE(last_alive_ptr);
+                int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
                 int32_t active_count = current_index - last_alive;
 
                 LOG_ERROR("========================================");
@@ -325,7 +325,7 @@ struct PTO2TaskRing {
      */
     int32_t pto2_task_ring_try_alloc() {
         // Read latest last_task_alive from shared memory
-        int32_t last_alive = PTO2_LOAD_ACQUIRE(last_alive_ptr);
+        int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
         int32_t current = current_index;
 
         // Calculate number of active tasks (handles wrap-around)
@@ -363,7 +363,7 @@ struct PTO2TaskRing {
  * @param last_alive_ptr  Pointer to shared memory last_task_alive
  */
 void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
-                          int32_t window_size, volatile int32_t* last_alive_ptr);
+                          int32_t window_size, std::atomic<int32_t>* last_alive_ptr);
 
 /**
  * Get number of active tasks in window

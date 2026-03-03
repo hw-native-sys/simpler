@@ -76,12 +76,6 @@ struct PTO2OrchestratorState {
     int64_t buffers_allocated;
     int64_t bytes_allocated;
 
-    // === AICPU PARALLEL MODE (set by aicpu_executor, NULL when unused) ===
-    int32_t* aicpu_fanin_refcount;
-    volatile int32_t* aicpu_task_completed;
-    int32_t* aicpu_completed_by_task;  // task_id that set the completed state (for slot-reuse validation)
-    int32_t aicpu_window_mask;
-
     /**
      * Allocate packed output buffer for a task
      */
@@ -96,7 +90,7 @@ struct PTO2OrchestratorState {
         bytes_allocated += total_size;
 
         // Update shared memory with new heap top
-        PTO2_STORE_RELEASE(&sm_handle->header->heap_top, heap_ring.top);
+        sm_handle->header->heap_top.store(heap_ring.top, std::memory_order_release);
 
         return buffer;
     }

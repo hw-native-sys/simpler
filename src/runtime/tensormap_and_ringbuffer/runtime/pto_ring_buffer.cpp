@@ -18,7 +18,7 @@
 // =============================================================================
 
 void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
-                          volatile uint64_t* tail_ptr) {
+                          std::atomic<uint64_t>* tail_ptr) {
     ring->base = base;
     ring->size = size;
     ring->top = 0;
@@ -34,7 +34,7 @@ void pto2_heap_ring_reset(PTO2HeapRing* ring) {
 // =============================================================================
 
 void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
-                          int32_t window_size, volatile int32_t* last_alive_ptr) {
+                          int32_t window_size, std::atomic<int32_t>* last_alive_ptr) {
     ring->descriptors = descriptors;
     ring->window_size = window_size;
     ring->current_index = 0;
@@ -42,7 +42,7 @@ void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
 }
 
 int32_t pto2_task_ring_active_count(PTO2TaskRing* ring) {
-    int32_t last_alive = PTO2_LOAD_ACQUIRE(ring->last_alive_ptr);
+    int32_t last_alive = ring->last_alive_ptr->load(std::memory_order_acquire);
     return ring->current_index - last_alive;
 }
 

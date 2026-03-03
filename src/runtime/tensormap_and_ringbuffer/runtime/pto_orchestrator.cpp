@@ -134,9 +134,9 @@ void pto2_orchestrator_reset(PTO2OrchestratorState* orch) {
     orch->bytes_allocated = 0;
 
     // Reset shared memory header
-    orch->sm_handle->header->current_task_index = 0;
-    orch->sm_handle->header->heap_top = 0;
-    orch->sm_handle->header->orchestrator_done = 0;
+    orch->sm_handle->header->current_task_index.store(0, std::memory_order_relaxed);
+    orch->sm_handle->header->heap_top.store(0, std::memory_order_relaxed);
+    orch->sm_handle->header->orchestrator_done.store(0, std::memory_order_relaxed);
 }
 
 void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler) {
@@ -206,34 +206,22 @@ void pto2_add_consumer_to_producer(
     // This synchronizes with scheduler's on_task_complete_threadsafe
     pto2_fanout_lock(producer);
 
-    // AICPU parallel mode: check if producer already completed before adding to fanout.
-    // Read completed FIRST (ACQUIRE) to establish happens-before with the scheduler's
-    // RELEASE stores (completed_by_task is stored before completed in program order).
-    // Then check completed_by_task to guard against stale state from recycled slots.
-    if (orch->aicpu_task_completed) {
-        int32_t prod_slot = producer_id & orch->aicpu_window_mask;
-        if (__atomic_load_n(&orch->aicpu_task_completed[prod_slot], __ATOMIC_ACQUIRE) >= 2 &&
-            __atomic_load_n(&orch->aicpu_completed_by_task[prod_slot], __ATOMIC_RELAXED) == producer_id) {
-            int32_t cons_slot = consumer_id & orch->aicpu_window_mask;
-            __atomic_fetch_add(&orch->aicpu_fanin_refcount[cons_slot], 1, __ATOMIC_ACQ_REL);
-            pto2_fanout_unlock(producer);
-            return;
-        }
-    }
-
     // Normal path: prepend consumer to producer's fanout list
-    producer->fanout_head = pto2_dep_list_prepend(&orch->dep_pool, producer->fanout_head, consumer_id);
-    producer->fanout_count++;
+    int32_t fanout_head = producer->fanout_head.load(std::memory_order_relaxed);
+    producer->fanout_head.store(
+        pto2_dep_list_prepend(&orch->dep_pool, fanout_head, consumer_id),
+        std::memory_order_relaxed);
+    producer->fanout_count.fetch_add(1, std::memory_order_relaxed);
 
     // Check if producer has already completed (scheduler mode)
     if (orch->scheduler) {
         PTO2SchedulerState* sched = orch->scheduler;
         int32_t prod_slot = sched->pto2_task_slot(producer_id);
-        int32_t prod_state = __atomic_load_n(&sched->task_state[prod_slot], __ATOMIC_ACQUIRE);
+        int32_t prod_state = sched->task_state[prod_slot].load(std::memory_order_acquire);
 
         if (prod_state >= PTO2_TASK_COMPLETED) {
             int32_t cons_slot = sched->pto2_task_slot(consumer_id);
-            __atomic_fetch_add(&sched->fanin_refcount[cons_slot], 1, __ATOMIC_SEQ_CST);
+            sched->fanin_refcount[cons_slot].fetch_add(1, std::memory_order_acq_rel);
         }
     }
 
@@ -263,25 +251,16 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 
     PTO2TaskDescriptor* task = pto2_task_ring_get(&orch->task_ring, task_id);
 
-    // Reset scheduler-side slot state for reuse.  The old task's fanout/lock
-    // protocol is fully complete by the time last_task_alive advances past it,
-    // so resetting here (after allocation) is safe.
-    if (orch->aicpu_task_completed) {
-        int32_t slot = task_id & orch->aicpu_window_mask;
-        __atomic_store_n(&orch->aicpu_task_completed[slot], 0, __ATOMIC_RELEASE);
-        __atomic_store_n(&orch->aicpu_completed_by_task[slot], -1, __ATOMIC_RELEASE);
-    }
-
     // Initialize task descriptor
     task->task_id = task_id;
     task->kernel_id = kernel_id;
     task->worker_type = worker_type;
     task->fanin_head = 0;
     task->fanin_count = 0;
-    task->fanout_head = 0;
-    task->fanout_lock = 0;
+    task->fanout_head.store(0, std::memory_order_relaxed);
+    task->fanout_lock.store(0, std::memory_order_relaxed);
     // Initial fanout_count = 1 (the owning scope holds one reference)
-    task->fanout_count = 1;
+    task->fanout_count.store(1, std::memory_order_relaxed);
     task->packed_buffer_base = NULL;
     task->packed_buffer_end = NULL;
     task->is_active = true;
@@ -414,20 +393,23 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
             // Add this task to producer's fanout list (with spinlock)
             PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, producer_task_id);
             pto2_fanout_lock(producer);
-            producer->fanout_head = pto2_dep_list_prepend(&orch->dep_pool, producer->fanout_head, task_id);
-            producer->fanout_count++;
+            int32_t producer_fanout_head = producer->fanout_head.load(std::memory_order_relaxed);
+            producer->fanout_head.store(
+                pto2_dep_list_prepend(&orch->dep_pool, producer_fanout_head, task_id),
+                std::memory_order_relaxed);
+            producer->fanout_count.fetch_add(1, std::memory_order_relaxed);
             // Normal path: prepend consumer to producer's fanout list
             task->fanin_head = pto2_dep_list_prepend(&orch->dep_pool, task->fanin_head, producer_task_id);
 
             int32_t prod_slot = sched->pto2_task_slot(producer_task_id);
-            int32_t prod_state = __atomic_load_n(&sched->task_state[prod_slot], __ATOMIC_ACQUIRE);
+            int32_t prod_state = sched->task_state[prod_slot].load(std::memory_order_acquire);
             if (prod_state >= PTO2_TASK_COMPLETED) {
                 early_finished++;
             }
             pto2_fanout_unlock(producer);
         }
         if (early_finished > 0) {
-            __atomic_fetch_add(&sched->fanin_refcount[slot], early_finished, __ATOMIC_SEQ_CST);
+            sched->fanin_refcount[slot].fetch_add(early_finished, std::memory_order_acq_rel);
         }
     } else {
         // No scheduler: just build fanin list + add to producers using pto2_add_consumer_to_producer
@@ -436,7 +418,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
             PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, fanin_temp[i]);
             pto2_add_consumer_to_producer(orch, producer, fanin_temp[i], task_id);
         }
-        __atomic_store_n(&task->fanin_count, fanin_count, __ATOMIC_SEQ_CST);
+        task->fanin_count = fanin_count;
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN);
@@ -449,7 +431,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
     }
 
     // === STEP 7: Update shared memory with current task index ===
-    PTO2_STORE_RELEASE(&orch->sm_handle->header->current_task_index, orch->task_ring.current_index);
+    orch->sm_handle->header->current_task_index.store(orch->task_ring.current_index, std::memory_order_release);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_finalize_cycle, AicpuPhaseId::ORCH_FINALIZE);
 
@@ -467,7 +449,7 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
 void pto2_orchestrator_done(PTO2OrchestratorState* orch) {
     int32_t total_tasks = orch->task_ring.current_index;
     LOG_INFO("=== [Orchestrator] total_tasks=%d ===", total_tasks);
-    PTO2_STORE_RELEASE(&orch->sm_handle->header->orchestrator_done, 1);
+    orch->sm_handle->header->orchestrator_done.store(1, std::memory_order_release);
 }
 
 void pto2_orchestrator_wait_all(PTO2OrchestratorState* orch) {

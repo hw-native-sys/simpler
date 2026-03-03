@@ -78,8 +78,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     }
 
     // Phase 3: Main execution loop - poll register for tasks until exit signal
-    volatile uint32_t task_id = 0;
-    volatile uint32_t last_task_id = 0;
+    uint32_t task_id = 0;
+    uint32_t last_task_id = 0;
 
     while (true) {
         task_id = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));

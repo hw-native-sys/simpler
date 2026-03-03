@@ -165,7 +165,7 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
 
         // Fill fanout information by traversing the linked list
         record->fanout_count = 0;
-        int32_t fanout_offset = task->fanout_head;
+        int32_t fanout_offset = task->fanout_head.load(std::memory_order_acquire);
 
         while (fanout_offset != 0 && record->fanout_count < RUNTIME_MAX_FANOUT) {
             PTO2DepListEntry* entry = &dep_list_pool[fanout_offset];

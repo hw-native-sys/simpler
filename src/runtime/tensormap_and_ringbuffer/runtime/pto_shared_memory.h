@@ -15,7 +15,7 @@
  * Design principles:
  * - Only data needed for Orchestrator<->Scheduler communication is here
  * - TensorMap, scope_stack, ready_queues are in private memory
- * - Flow control via volatile pointers (no locks needed for single-word R/W)
+ * - Flow control via atomic counters/flags (no locks needed for single-word R/W)
  * 
  * Based on: docs/runtime_buffer_manager_methods.md
  */
@@ -43,15 +43,15 @@ typedef struct {
     // === FLOW CONTROL POINTERS ===
 
     // Written by Orchestrator, Read by Scheduler
-    volatile uint64_t heap_top;           // Heap ring allocation pointer
-    volatile int32_t current_task_index;  // Task ring head (next to allocate)
-    volatile int32_t orchestrator_done;   // Flag: orchestration complete
+    std::atomic<uint64_t> heap_top;           // Heap ring allocation pointer
+    std::atomic<int32_t> current_task_index;  // Task ring head (next to allocate)
+    std::atomic<int32_t> orchestrator_done;   // Flag: orchestration complete
     
     // Written by Scheduler, Read by Orchestrator (for back-pressure)
-    volatile uint64_t heap_tail;          // Heap ring free pointer (on-device, matches pto2_heap_ring_init)
-    volatile int32_t last_task_alive;     // Task ring tail (oldest active task)
-    volatile int32_t heap_tail_gen;       // Ticket counter for serialized heap_tail writes
-                                          // (ensures concurrent threads write in task order)
+    std::atomic<uint64_t> heap_tail;          // Heap ring free pointer (on-device, matches pto2_heap_ring_init)
+    std::atomic<int32_t> last_task_alive;     // Task ring tail (oldest active task)
+    std::atomic<int32_t> heap_tail_gen;       // Ticket counter for serialized heap_tail writes
+                                              // (ensures concurrent threads write in task order)
 
     // === LAYOUT INFO (set once at init) ===
     uint64_t task_window_size;            // PTO2_TASK_WINDOW_SIZE
@@ -67,8 +67,8 @@ typedef struct {
 
     // Graph output for copy-back (set by orchestrator when using packed buffer)
     // Host finalize copies from this address instead of dev_ptr when non-zero
-    volatile uint64_t graph_output_ptr;   // Address where final output was written (packed buffer)
-    volatile uint64_t graph_output_size;  // Size in bytes
+    std::atomic<uint64_t> graph_output_ptr;   // Address where final output was written (packed buffer)
+    std::atomic<uint64_t> graph_output_size;  // Size in bytes
 
     // Padding to 128-byte cache line
     uint64_t _padding[4];

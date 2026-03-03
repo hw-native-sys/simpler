@@ -143,12 +143,12 @@ void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
     PTO2SharedMemoryHeader* header = handle->header;
     
     // Flow control pointers (start at 0)
-    header->current_task_index = 0;
-    header->heap_top = 0;
-    header->orchestrator_done = 0;
-    header->last_task_alive = 0;
-    header->heap_tail = 0;
-    header->heap_tail_gen = 0;
+    header->current_task_index.store(0, std::memory_order_relaxed);
+    header->heap_top.store(0, std::memory_order_relaxed);
+    header->orchestrator_done.store(0, std::memory_order_relaxed);
+    header->last_task_alive.store(0, std::memory_order_relaxed);
+    header->heap_tail.store(0, std::memory_order_relaxed);
+    header->heap_tail_gen.store(0, std::memory_order_relaxed);
 
     // Layout info
     header->task_window_size = task_window_size;
@@ -163,8 +163,8 @@ void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
     header->dep_list_pool_offset = offset;
     
     header->total_size = handle->sm_size;
-    header->graph_output_ptr = 0;
-    header->graph_output_size = 0;
+    header->graph_output_ptr.store(0, std::memory_order_relaxed);
+    header->graph_output_size.store(0, std::memory_order_relaxed);
     
     // Initialize dep_list_pool entry 0 as NULL marker
     handle->dep_list_pool[0].task_id = -1;
@@ -177,15 +177,15 @@ void pto2_sm_reset(PTO2SharedMemoryHandle* handle) {
     PTO2SharedMemoryHeader* header = handle->header;
 
     // Reset flow control pointers
-    header->current_task_index = 0;
-    header->heap_top = 0;
-    header->orchestrator_done = 0;
-    header->last_task_alive = 0;
-    header->heap_tail = 0;
-    header->heap_tail_gen = 0;
+    header->current_task_index.store(0, std::memory_order_relaxed);
+    header->heap_top.store(0, std::memory_order_relaxed);
+    header->orchestrator_done.store(0, std::memory_order_relaxed);
+    header->last_task_alive.store(0, std::memory_order_relaxed);
+    header->heap_tail.store(0, std::memory_order_relaxed);
+    header->heap_tail_gen.store(0, std::memory_order_relaxed);
 
-    header->graph_output_ptr = 0;
-    header->graph_output_size = 0;
+    header->graph_output_ptr.store(0, std::memory_order_relaxed);
+    header->graph_output_size.store(0, std::memory_order_relaxed);
     // Clear task descriptors
     memset(handle->task_descriptors, 0, 
            header->task_window_size * sizeof(PTO2TaskDescriptor));
@@ -214,11 +214,11 @@ void pto2_sm_print_layout(PTO2SharedMemoryHandle* handle) {
     LOG_INFO("  TaskDescriptors:  %" PRIu64 " (0x%" PRIx64 ")", h->task_descriptors_offset, h->task_descriptors_offset);
     LOG_INFO("  DepListPool:      %" PRIu64 " (0x%" PRIx64 ")", h->dep_list_pool_offset, h->dep_list_pool_offset);
     LOG_INFO("Flow control:");
-    LOG_INFO("  heap_top:           %" PRIu64, h->heap_top);
-    LOG_INFO("  heap_tail:          %" PRIu64, h->heap_tail);
-    LOG_INFO("  current_task_index: %d", h->current_task_index);
-    LOG_INFO("  orchestrator_done:  %d", h->orchestrator_done);
-    LOG_INFO("  last_task_alive:    %d", h->last_task_alive);
+    LOG_INFO("  heap_top:           %" PRIu64, h->heap_top.load(std::memory_order_acquire));
+    LOG_INFO("  heap_tail:          %" PRIu64, h->heap_tail.load(std::memory_order_acquire));
+    LOG_INFO("  current_task_index: %d", h->current_task_index.load(std::memory_order_acquire));
+    LOG_INFO("  orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
+    LOG_INFO("  last_task_alive:    %d", h->last_task_alive.load(std::memory_order_acquire));
     LOG_INFO("================================");
 }
 
@@ -238,10 +238,14 @@ bool pto2_sm_validate(PTO2SharedMemoryHandle* handle) {
     if ((uintptr_t)handle->dep_list_pool % PTO2_ALIGN_SIZE != 0) return false;
     
     // Check flow control pointer sanity
-    if (h->current_task_index < 0) return false;
-    if (h->last_task_alive < 0) return false;
-    if (h->heap_top > h->heap_size) return false;
-    if (h->heap_tail > h->heap_size) return false;
+    int32_t current_task_index = h->current_task_index.load(std::memory_order_acquire);
+    int32_t last_task_alive = h->last_task_alive.load(std::memory_order_acquire);
+    uint64_t heap_top = h->heap_top.load(std::memory_order_acquire);
+    uint64_t heap_tail = h->heap_tail.load(std::memory_order_acquire);
+    if (current_task_index < 0) return false;
+    if (last_task_alive < 0) return false;
+    if (heap_top > h->heap_size) return false;
+    if (heap_tail > h->heap_size) return false;
     
     return true;
 }

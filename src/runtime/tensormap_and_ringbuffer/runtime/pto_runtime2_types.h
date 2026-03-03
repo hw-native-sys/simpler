@@ -14,6 +14,7 @@
 #ifndef PTO_RUNTIME2_TYPES_H
 #define PTO_RUNTIME2_TYPES_H
 
+#include <atomic>
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
@@ -259,9 +260,9 @@ struct PTO2TaskDescriptor {
     
     // Fanout: consumers that depend on this task (grows as consumers submit)
     // PROTECTED BY fanout_lock
-    volatile int32_t fanout_lock; // Per-task spinlock (0=unlocked, 1=locked)
-    volatile int32_t fanout_head; // Offset to first fanout entry (0 = empty)
-    volatile int32_t fanout_count;// 1 (owning scope) + number of consumers
+    std::atomic<int32_t> fanout_lock; // Per-task spinlock (0=unlocked, 1=locked)
+    std::atomic<int32_t> fanout_head; // Offset to first fanout entry (0 = empty)
+    std::atomic<int32_t> fanout_count;// 1 (owning scope) + number of consumers
     
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
@@ -304,16 +305,10 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
  */
 #if defined(__aarch64__)
     #define PTO2_MEMORY_BARRIER()     __asm__ __volatile__("dmb sy" ::: "memory")
-    #define PTO2_LOAD_ACQUIRE(ptr)    __atomic_load_n(ptr, __ATOMIC_ACQUIRE)
-    #define PTO2_STORE_RELEASE(ptr, val) __atomic_store_n(ptr, val, __ATOMIC_RELEASE)
 #elif defined(__x86_64__)
     #define PTO2_MEMORY_BARRIER()     __asm__ __volatile__("mfence" ::: "memory")
-    #define PTO2_LOAD_ACQUIRE(ptr)    __atomic_load_n(ptr, __ATOMIC_ACQUIRE)
-    #define PTO2_STORE_RELEASE(ptr, val) __atomic_store_n(ptr, val, __ATOMIC_RELEASE)
 #else
     #define PTO2_MEMORY_BARRIER()     __sync_synchronize()
-    #define PTO2_LOAD_ACQUIRE(ptr)    __atomic_load_n(ptr, __ATOMIC_ACQUIRE)
-    #define PTO2_STORE_RELEASE(ptr, val) __atomic_store_n(ptr, val, __ATOMIC_RELEASE)
 #endif
 
 /**
@@ -332,25 +327,6 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
     #define PTO2_SPIN_PAUSE_LIGHT()   ((void)0)
 #endif
 
-/**
- * Atomic compare-and-swap
- */
-#define PTO2_CAS(ptr, expected, desired) \
-    __atomic_compare_exchange_n(ptr, expected, desired, false, \
-                                __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)
-
-/**
- * Atomic fetch-and-add
- */
-#define PTO2_FETCH_ADD(ptr, val) \
-    __atomic_fetch_add(ptr, val, __ATOMIC_ACQ_REL)
-
-/**
- * Atomic exchange
- */
-#define PTO2_EXCHANGE(ptr, val) \
-    __atomic_exchange_n(ptr, val, __ATOMIC_ACQ_REL)
-
 // =============================================================================
 // Per-task fanout spinlock helpers
 //
@@ -364,13 +340,13 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 // =============================================================================
 
 static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
-    while (PTO2_EXCHANGE(&task->fanout_lock, 1) != 0) {
+    while (task->fanout_lock.exchange(1, std::memory_order_acq_rel) != 0) {
         PTO2_SPIN_PAUSE_LIGHT();
     }
 }
 
 static inline void pto2_fanout_unlock(PTO2TaskDescriptor* task) {
-    PTO2_STORE_RELEASE(&task->fanout_lock, 0);
+    task->fanout_lock.store(0, std::memory_order_release);
 }
 
 #endif // PTO_RUNTIME2_TYPES_H

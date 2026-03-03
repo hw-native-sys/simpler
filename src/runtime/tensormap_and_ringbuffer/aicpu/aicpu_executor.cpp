@@ -326,7 +326,8 @@ int AicpuExecutor::init(Runtime* runtime) {
     // Initialize runtime execution state
     // Task count comes from PTO2 shared memory
     if (runtime->get_pto2_gm_sm_ptr()) {
-        int32_t pto2_count = *static_cast<const volatile int32_t*>(runtime->get_pto2_gm_sm_ptr());
+        auto* header = static_cast<PTO2SharedMemoryHeader*>(runtime->get_pto2_gm_sm_ptr());
+        int32_t pto2_count = header->current_task_index.load(std::memory_order_acquire);
         total_tasks_.store(pto2_count > 0 ? pto2_count : 0, std::memory_order_release);
     } else {
         total_tasks_.store(0, std::memory_order_release);
@@ -604,7 +605,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
         // Update perf header total_tasks if visible tasks have changed
         {
-            int32_t visible = __atomic_load_n(&header->current_task_index, __ATOMIC_ACQUIRE);
+            int32_t visible = header->current_task_index.load(std::memory_order_acquire);
             if (profiling_enabled && visible > 0 && visible != last_reported_task_count) {
                 perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(visible));
 
@@ -627,9 +628,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 int cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
                 for (int si = 0; si < task_count; si++) {
                     int32_t slot = si & window_mask;
-                    PTO2TaskState st = (PTO2TaskState)__atomic_load_n(&sched->task_state[slot], __ATOMIC_RELAXED);
-                    int32_t rc  = __atomic_load_n(&sched->fanin_refcount[slot], __ATOMIC_RELAXED);
-                    int32_t fi  = __atomic_load_n(&task_descriptors[slot].fanin_count, __ATOMIC_RELAXED);
+                    PTO2TaskState st = sched->task_state[slot].load(std::memory_order_relaxed);
+                    int32_t rc = sched->fanin_refcount[slot].load(std::memory_order_relaxed);
+                    int32_t fi = task_descriptors[slot].fanin_count;
                     int32_t kid = task_descriptors[slot].kernel_id;
                     if (st >= PTO2_TASK_COMPLETED) continue; // Already done
                     if (st == PTO2_TASK_READY || st == PTO2_TASK_RUNNING) { cnt_inflight++; continue; }
@@ -970,7 +971,8 @@ int AicpuExecutor::run(Runtime* runtime) {
             // Device mode: task count lives in PTO2 shared memory
             void* sm = runtime->get_pto2_gm_sm_ptr();
             PTO2SharedMemoryHeader* sm_header = static_cast<PTO2SharedMemoryHeader*>(sm);
-            int32_t pto2_task_count = sm_header ? sm_header->current_task_index : 0;
+            int32_t pto2_task_count =
+                sm_header ? sm_header->current_task_index.load(std::memory_order_acquire) : 0;
             DEV_ALWAYS("PTO2 total submitted tasks = %d", pto2_task_count);
             total_tasks_.store(pto2_task_count, std::memory_order_release);
             orchestrator_done_.store(true, std::memory_order_release);
