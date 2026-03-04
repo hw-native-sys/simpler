@@ -338,6 +338,8 @@ class CodeRunner:
         enable_profiling: bool = False,
         run_all_cases: bool = False,
         case_name: Optional[str] = None,
+        n_devices: Optional[int] = None,
+        first_device_id: Optional[int] = None,
     ):
         # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
         _setup_logging_if_needed()
@@ -346,6 +348,8 @@ class CodeRunner:
         self.golden_path = Path(golden_path).resolve()
         self.platform = platform
         self.enable_profiling = enable_profiling
+        self.run_all_cases = run_all_cases
+        self.case_name = case_name
         self.project_root = _get_project_root()
 
         # Resolve device ID
@@ -383,6 +387,9 @@ class CodeRunner:
         self.aicpu_thread_num = runtime_config.get('aicpu_thread_num', 3)
         self.block_dim = runtime_config.get('block_dim', 24)
         self.runtime_name = runtime_config.get('runtime', 'host_build_graph')
+        # Multi-device: CLI overrides config
+        self.n_devices = n_devices if n_devices is not None else runtime_config.get('n_devices', 1)
+        self.first_device_id = first_device_id if first_device_id is not None else runtime_config.get('first_device_id', 0)
 
     def _load_kernel_config(self):
         """Load kernel_config.py from kernels directory."""
@@ -599,6 +606,48 @@ class CodeRunner:
 
         return func_args, arg_types, arg_sizes
 
+    def _run_multi_device(self) -> None:
+        """Run on multiple devices in parallel: spawn N subprocesses (run_example.py -d <device_id>), wait for all."""
+        import subprocess
+
+        run_example_path = Path(__file__).resolve().parent / "run_example.py"
+        if not run_example_path.exists():
+            raise FileNotFoundError(f"run_example.py not found: {run_example_path}")
+
+        device_ids = list(range(self.first_device_id, self.first_device_id + self.n_devices))
+        logger.info(f"=== Multi-device: running on devices {device_ids} (parallel) ===")
+
+        base_cmd = [
+            sys.executable,
+            str(run_example_path),
+            "-k", str(self.kernels_dir),
+            "-g", str(self.golden_path),
+            "-p", self.platform,
+        ]
+        if self.run_all_cases:
+            base_cmd.append("--all")
+        elif self.case_name is not None:
+            base_cmd.extend(["--case", self.case_name])
+
+        procs = []
+        for did in device_ids:
+            cmd = base_cmd + ["-d", str(did)]
+            logger.info(f"Spawning device {did}: {' '.join(cmd)}")
+            procs.append((did, subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)))
+
+        failed = []
+        for did, proc in procs:
+            stdout, stderr = proc.communicate()
+            if proc.returncode != 0:
+                failed.append((did, proc.returncode, stdout, stderr))
+                logger.error(f"Device {did} failed (exit {proc.returncode}):\nstderr: {stderr}\nstdout: {stdout}")
+            else:
+                logger.info(f"Device {did}: PASS")
+
+        if failed:
+            err_msg = "; ".join(f"device {d}: exit {r}" for d, r, _, _ in failed)
+            raise RuntimeError(f"Multi-device run failed: {err_msg}")
+
     def run(self) -> None:
         """
         Execute the full test flow:
@@ -611,7 +660,15 @@ class CodeRunner:
            - Generate inputs using golden.py
            - Initialize and launch runtime
            - Finalize and compare with golden
+
+        If n_devices > 1, runs N subprocesses in parallel (one per device), each executing
+        single-card run_example.py -d <device_id>, then aggregates return codes.
         """
+        # Multi-card branch: parallel subprocesses, no single-card build/launch
+        if self.n_devices > 1:
+            self._run_multi_device()
+            return
+
         # Import runtime modules (deferred import to avoid top-level dependency)
         from runtime_builder import RuntimeBuilder
         from bindings import bind_host_binary, set_device, launch_runtime
@@ -829,9 +886,11 @@ class CodeRunner:
 
 
 def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",
-                       enable_profiling=False, run_all_cases=False, case_name=None):
+                       enable_profiling=False, run_all_cases=False, case_name=None,
+                       n_devices=None, first_device_id=None):
     """Factory: creates a CodeRunner based on kernel_config."""
     return CodeRunner(kernels_dir=kernels_dir, golden_path=golden_path,
                       device_id=device_id, platform=platform,
                       enable_profiling=enable_profiling,
-                      run_all_cases=run_all_cases, case_name=case_name)
+                      run_all_cases=run_all_cases, case_name=case_name,
+                      n_devices=n_devices, first_device_id=first_device_id)

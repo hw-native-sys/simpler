@@ -116,6 +116,20 @@ Golden.py interface:
     )
 
     parser.add_argument(
+        "--n-devices",
+        type=int,
+        default=None,
+        help="Number of devices to run on (multi-card). Overrides kernel_config RUNTIME_CONFIG. Default from config or 1."
+    )
+
+    parser.add_argument(
+        "--first-device",
+        type=int,
+        default=None,
+        help="First device ID for multi-card (e.g. 4 with --n-devices 4 uses devices 4,5,6,7). Overrides kernel_config."
+    )
+
+    parser.add_argument(
         "-p", "--platform",
         default="a2a3",
         choices=["a2a3", "a2a3sim"],
@@ -226,6 +240,8 @@ Golden.py interface:
             enable_profiling=args.enable_profiling,
             run_all_cases=args.all,
             case_name=args.case,
+            n_devices=args.n_devices,
+            first_device_id=args.first_device,
         )
 
         # Snapshot existing device logs before the run so we can identify the
