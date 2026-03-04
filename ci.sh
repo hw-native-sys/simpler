@@ -199,225 +199,296 @@ echo "Discovered ${#HW_TASK_NAMES[@]} hardware tasks, ${#SIM_TASK_NAMES[@]} simu
 
 MAX_RETRIES=3
 
-# Run a single HW task on a specific device.
-# Writes result to RESULTS_FILE as: name:a2a3|PASS_or_FAIL|device:ID|round:N
-# Usage: run_hw_task <name> <dir> <device_id> <round>
-run_hw_task() {
-    local name="$1"
-    local dir="$2"
-    local device_id="$3"
-    local round="$4"
+# ---- Unified task runner ----
+# Runs a single task and records the result.
+# Log naming: ${safe_name}_${platform}_attempt${attempt}.log
+# Result format: name|platform|PASS/FAIL|device:X|attempt:N|Xs
+run_task() {
+    local name="$1" dir="$2" platform="$3" attempt="$4" device_id="$5"
     local safe_name="${name//[:\/]/_}"
-    local task_log="${LOG_DIR}/${safe_name}_hw_round${round}.log"
+    local task_log="${LOG_DIR}/${safe_name}_${platform}_attempt${attempt}.log"
     local start_time=$SECONDS
 
-    {
-        echo "========================================"
-        echo "[Device $device_id] Running: $name (round $round/$MAX_RETRIES)"
-        echo "========================================"
-        python examples/scripts/run_example.py \
-            -k "${dir}/kernels" -g "${dir}/golden.py" \
-            -p a2a3 -d "$device_id" "${commit_flag[@]}"
-    } > "$task_log" 2>&1
+    local -a cmd
+    cmd=(python examples/scripts/run_example.py
+        -k "${dir}/kernels" -g "${dir}/golden.py"
+        -p "$platform" "${commit_flag[@]}")
+    [[ -n "$device_id" ]] && cmd+=(-d "$device_id")
+
+    # Progress to stdout (not captured in log)
+    echo "[${platform}${device_id:+:dev${device_id}}] Running: $name (attempt $attempt)"
+
+    # Command output to log file only
+    "${cmd[@]}" > "$task_log" 2>&1
     local rc=$?
     local elapsed=$(( SECONDS - start_time ))
 
+    local status
     if [[ $rc -eq 0 ]]; then
-        echo "${name}:a2a3|PASS|device:${device_id}|round:${round}|${elapsed}s" >> "$RESULTS_FILE"
+        status="PASS"
+        echo "[${platform}${device_id:+:dev${device_id}}] PASS: $name (${elapsed}s)"
     else
-        echo "${name}:a2a3|FAIL|device:${device_id}|round:${round}|${elapsed}s" >> "$RESULTS_FILE"
+        status="FAIL"
+        echo "[${platform}${device_id:+:dev${device_id}}] FAIL: $name (${elapsed}s)"
     fi
+    echo "${name}|${platform}|${status}|device:${device_id:-sim}|attempt:${attempt}|${elapsed}s" \
+        >> "$RESULTS_FILE"
     return $rc
 }
 
-# ---- Sequential mode ----
-if [[ "$PARALLEL" == "false" ]]; then
-    # HW tasks: run with retry across different devices
-    for i in "${!HW_TASK_NAMES[@]}"; do
-        name="${HW_TASK_NAMES[$i]}"
-        dir="${HW_TASK_DIRS[$i]}"
-        passed=false
-        for round in $(seq 1 $MAX_RETRIES); do
-            dev_idx=$(( (round - 1) % NUM_DEVICES ))
-            device_id="${DEVICES[$dev_idx]}"
-            if run_hw_task "$name" "$dir" "$device_id" "$round"; then
-                passed=true
-                break
-            fi
-        done
-    done
-    # SIM tasks (with pin-on-first-failure for PTO-ISA)
-    for i in "${!SIM_TASK_NAMES[@]}"; do
-        name="${SIM_TASK_NAMES[$i]}"
-        dir="${SIM_TASK_DIRS[$i]}"
-        echo "========================================"
-        echo "Running: $name (a2a3sim)"
-        echo "========================================"
-        if python examples/scripts/run_example.py \
-            -k "${dir}/kernels" -g "${dir}/golden.py" \
-            -p a2a3sim "${commit_flag[@]}"; then
-            echo "${name}:a2a3sim|PASS" >> "$RESULTS_FILE"
-        elif pin_pto_isa_on_failure; then
-            echo "[CI] Retrying: $name with pinned PTO-ISA"
-            if python examples/scripts/run_example.py \
-                -k "${dir}/kernels" -g "${dir}/golden.py" \
-                -p a2a3sim "${commit_flag[@]}"; then
-                echo "${name}:a2a3sim|PASS" >> "$RESULTS_FILE"
-            else
-                echo "${name}:a2a3sim|FAIL" >> "$RESULTS_FILE"
-            fi
-        else
-            echo "${name}:a2a3sim|FAIL" >> "$RESULTS_FILE"
-        fi
-    done
-else
-    # ---- Parallel mode ----
-    # Sim tasks: launch all in parallel (no device constraint)
-    declare -a SIM_PIDS=()
-    for i in "${!SIM_TASK_NAMES[@]}"; do
-        name="${SIM_TASK_NAMES[$i]}"
-        dir="${SIM_TASK_DIRS[$i]}"
-        safe_name="${name//[:\/]/_}"
-        log_file="${LOG_DIR}/${safe_name}_sim.log"
+# ---- SIM executor ----
+# run_sim_tasks <attempt> <idx1> <idx2> ...
+# Sets SIM_FAILURES to array of failed indices after return.
+run_sim_tasks() {
+    local attempt="$1"; shift
+    local indices=("$@")
+    local sim_marker="${LOG_DIR}/sim_results_$$.txt"
+    local run_parallel="$PARALLEL"
+    > "$sim_marker"
 
-        (
-            echo "========================================"
-            echo "Running: $name (a2a3sim)"
-            echo "========================================"
-            if python examples/scripts/run_example.py \
-                -k "${dir}/kernels" -g "${dir}/golden.py" -p a2a3sim "${commit_flag[@]}"; then
-                echo "${name}:a2a3sim|PASS" >> "$RESULTS_FILE"
-            else
-                echo "${name}:a2a3sim|FAIL" >> "$RESULTS_FILE"
-            fi
-        ) > "$log_file" 2>&1 &
-        SIM_PIDS+=($!)
-    done
+    # Pinned retries share one _deps/pto-isa clone path; parallel clone races can fail.
+    if [[ "$attempt" -gt 0 && ${#commit_flag[@]} -gt 0 && "$run_parallel" == "true" ]]; then
+        echo "[CI] SIM retry uses pinned PTO-ISA; running retries sequentially to avoid clone races"
+        run_parallel=false
+    fi
 
-    # HW tasks: dynamic work-stealing with retry
-    # Each device worker atomically grabs tasks from a shared queue.
-    # This naturally balances load — faster workers pick up more tasks.
-
-    PENDING_INDICES=()
-    for i in "${!HW_TASK_NAMES[@]}"; do
-        PENDING_INDICES+=("$i")
-    done
-
-    QUEUE_LOCK="${LOG_DIR}/queue.lock"
-
-    for round in $(seq 1 $MAX_RETRIES); do
-        [[ ${#PENDING_INDICES[@]} -eq 0 ]] && break
-
-        echo "---- HW round $round/$MAX_RETRIES: ${#PENDING_INDICES[@]} tasks ----"
-
-        TASK_QUEUE="${LOG_DIR}/task_queue_round${round}.txt"
-        ROUND_MARKER="${LOG_DIR}/round_${round}_results.txt"
-        printf '%s\n' "${PENDING_INDICES[@]}" > "$TASK_QUEUE"
-        touch "$ROUND_MARKER"
-
-        # Launch one worker per device; each grabs tasks dynamically
-        declare -a HW_PIDS=()
-        for d in $(seq 0 $((NUM_DEVICES - 1))); do
-            device_id="${DEVICES[$d]}"
-            worker_log="${LOG_DIR}/device_${device_id}_round${round}.log"
-
+    if [[ "$run_parallel" == "true" ]]; then
+        local -a pids=()
+        for idx in "${indices[@]}"; do
             (
-                while true; do
-                    # Atomically pop the next task index from the queue
-                    idx=$(flock "$QUEUE_LOCK" bash -c "
-                        idx=\$(head -n1 \"$TASK_QUEUE\" 2>/dev/null)
-                        if [[ -z \"\$idx\" ]]; then exit 1; fi
-                        sed -i '1d' \"$TASK_QUEUE\"
-                        echo \"\$idx\"
-                    ") || break
-
-                    name="${HW_TASK_NAMES[$idx]}"
-                    dir="${HW_TASK_DIRS[$idx]}"
-                    run_hw_task "$name" "$dir" "$device_id" "$round"
-                    rc=$?
-                    if [[ $rc -eq 0 ]]; then
-                        echo "${idx}|PASS" >> "$ROUND_MARKER"
-                    else
-                        echo "${idx}|FAIL" >> "$ROUND_MARKER"
-                    fi
-                done
-            ) > "$worker_log" 2>&1 &
-            HW_PIDS+=($!)
+                if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" a2a3sim "$attempt"; then
+                    echo "${idx}|PASS" >> "$sim_marker"
+                else
+                    echo "${idx}|FAIL" >> "$sim_marker"
+                fi
+            ) &
+            pids+=($!)
         done
-
-        # Wait for this round to finish
-        for pid in "${HW_PIDS[@]}"; do
-            wait "$pid" 2>/dev/null || true
-        done
-
-        # Collect failures for next round
-        NEXT_PENDING=()
-        while IFS='|' read -r idx result; do
-            if [[ "$result" == "FAIL" ]]; then
-                NEXT_PENDING+=("$idx")
+        for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+    else
+        for idx in "${indices[@]}"; do
+            if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" a2a3sim "$attempt"; then
+                echo "${idx}|PASS" >> "$sim_marker"
+            else
+                echo "${idx}|FAIL" >> "$sim_marker"
             fi
-        done < "$ROUND_MARKER"
+        done
+    fi
 
-        PENDING_INDICES=("${NEXT_PENDING[@]}")
+    SIM_FAILURES=()
+    while IFS='|' read -r idx result; do
+        [[ "$result" == "FAIL" ]] && SIM_FAILURES+=("$idx")
+    done < "$sim_marker"
+}
+
+# ---- HW executor: continuous shared queue ----
+# run_hw_tasks <idx1> <idx2> ...
+# Workers pop "idx:attempt" entries, run, re-enqueue on failure.
+# Sets HW_FAILURES to array of indices that exhausted MAX_RETRIES after return.
+run_hw_tasks() {
+    local indices=("$@")
+    local queue="${LOG_DIR}/hw_queue_$$.txt"
+    local lock="${LOG_DIR}/hw_queue_$$.lock"
+    local hw_marker="${LOG_DIR}/hw_results_$$.txt"
+    > "$queue"
+    > "$hw_marker"
+
+    # Seed queue
+    for idx in "${indices[@]}"; do
+        echo "${idx}:0" >> "$queue"
     done
 
-    # Wait for sim tasks too
-    for pid in "${SIM_PIDS[@]}"; do
-        wait "$pid" 2>/dev/null || true
+    # Launch one worker per device
+    local -a pids=()
+    for d in $(seq 0 $((NUM_DEVICES - 1))); do
+        local device_id="${DEVICES[$d]}"
+        (
+            while true; do
+                # Atomically pop the next entry from the queue
+                entry=$(flock "$lock" bash -c "
+                    entry=\$(head -n1 \"$queue\" 2>/dev/null)
+                    if [[ -z \"\$entry\" ]]; then exit 1; fi
+                    sed -i '1d' \"$queue\"
+                    echo \"\$entry\"
+                ") || break
+
+                IFS=':' read -r idx attempt <<< "$entry"
+
+                if run_task "${HW_TASK_NAMES[$idx]}" "${HW_TASK_DIRS[$idx]}" a2a3 "$attempt" "$device_id"; then
+                    echo "${idx}|PASS" >> "$hw_marker"
+                else
+                    next=$((attempt + 1))
+                    if [[ $next -lt $MAX_RETRIES ]]; then
+                        flock "$lock" bash -c "echo '${idx}:${next}' >> \"$queue\""
+                    else
+                        echo "${idx}|FAIL" >> "$hw_marker"
+                    fi
+                fi
+            done
+        ) &
+        pids+=($!)
     done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+
+    HW_FAILURES=()
+    while IFS='|' read -r idx result; do
+        [[ "$result" == "FAIL" ]] && HW_FAILURES+=("$idx")
+    done < "$hw_marker"
+}
+
+# ---- Main flow: two-pass per phase ----
+
+# SIM phase
+if [[ ${#SIM_TASK_NAMES[@]} -gt 0 ]]; then
+    ALL_SIM=($(seq 0 $((${#SIM_TASK_NAMES[@]} - 1))))
+    echo "---- SIM: ${#ALL_SIM[@]} tasks ----"
+    run_sim_tasks 0 "${ALL_SIM[@]}"
+    if [[ ${#SIM_FAILURES[@]} -gt 0 ]] && pin_pto_isa_on_failure; then
+        echo "[CI] Retrying ${#SIM_FAILURES[@]} SIM failures with pinned PTO-ISA"
+        run_sim_tasks 1 "${SIM_FAILURES[@]}"
+    fi
+fi
+
+# HW phase
+if [[ ${#HW_TASK_NAMES[@]} -gt 0 ]]; then
+    ALL_HW=($(seq 0 $((${#HW_TASK_NAMES[@]} - 1))))
+    echo "---- HW: ${#ALL_HW[@]} tasks on ${NUM_DEVICES} devices ----"
+    run_hw_tasks "${ALL_HW[@]}"
+    if [[ ${#HW_FAILURES[@]} -gt 0 ]] && pin_pto_isa_on_failure; then
+        echo "[CI] Retrying ${#HW_FAILURES[@]} HW failures with pinned PTO-ISA"
+        run_hw_tasks "${HW_FAILURES[@]}"
+    fi
 fi
 
 # ---- Print summary ----
 # Deduplicate results: a task may have multiple entries (fail then pass on retry).
-# Keep the last result per task name — the final outcome.
+# Keep the last result per task name+platform — the final outcome.
+# Use composite key (task_name|platform) so SIM and HW results don't collide.
 declare -A FINAL_RESULTS=()
-declare -A FINAL_EXTRA=()
+declare -A FINAL_DISPLAY=()
+declare -A FINAL_PLATFORM=()
+declare -A FINAL_DEVICE=()
+declare -A FINAL_ATTEMPT=()
+declare -A FINAL_TIMING=()
 declare -a TASK_ORDER=()
 
-while IFS='|' read -r task_name result extra1 extra2 timing; do
-    if [[ -z "${FINAL_RESULTS[$task_name]+x}" ]]; then
-        TASK_ORDER+=("$task_name")
+while IFS='|' read -r task_name platform result extra1 extra2 timing; do
+    key="${task_name}|${platform}"
+    if [[ -z "${FINAL_RESULTS[$key]+x}" ]]; then
+        TASK_ORDER+=("$key")
     fi
-    FINAL_RESULTS["$task_name"]="$result"
-    FINAL_EXTRA["$task_name"]="${extra1:+$extra1, }${extra2:+$extra2, }${timing}"
+    FINAL_RESULTS["$key"]="$result"
+    FINAL_DISPLAY["$key"]="$task_name"
+    FINAL_PLATFORM["$key"]="$platform"
+    FINAL_DEVICE["$key"]="${extra1#device:}"
+    FINAL_ATTEMPT["$key"]="${extra2#attempt:}"
+    FINAL_TIMING["$key"]="$timing"
 done < "$RESULTS_FILE"
-
-echo ""
-echo "========================================"
-echo "          CI RESULTS SUMMARY"
-echo "========================================"
-printf "%-55s %s\n" "TASK" "RESULT"
-printf "%-55s %s\n" "----" "------"
 
 FAIL_COUNT=0
 PASS_COUNT=0
-for task_name in "${TASK_ORDER[@]}"; do
-    result="${FINAL_RESULTS[$task_name]}"
-    extra="${FINAL_EXTRA[$task_name]}"
+declare -a FAIL_KEYS=()
+for key in "${TASK_ORDER[@]}"; do
+    result="${FINAL_RESULTS[$key]}"
     if [[ "$result" == "FAIL" ]]; then
-        printf "%-55s \033[31mFAIL\033[0m  (%s)\n" "$task_name" "$extra"
         ((FAIL_COUNT++))
-        # Print all round logs inline
-        safe_name="${task_name//[:\/]/_}"
-        for round_log in "${LOG_DIR}/${safe_name}_hw_round"*.log "${LOG_DIR}/${safe_name}_sim.log"; do
-            if [[ -f "$round_log" ]]; then
-                echo "--- LOG: $(basename "$round_log") ---"
-                cat "$round_log"
-                echo "--- END ---"
-                echo ""
-            fi
-        done
+        FAIL_KEYS+=("$key")
     else
-        printf "%-55s \033[32mPASS\033[0m  (%s)\n" "$task_name" "$extra"
         ((PASS_COUNT++))
     fi
 done
 
-echo "========================================"
+# Print failure logs first (long output goes here, before the summary table)
+for key in "${FAIL_KEYS[@]}"; do
+    IFS='|' read -r task_name platform <<< "$key"
+    safe_name="${task_name//[:\/]/_}"
+    for attempt_log in "${LOG_DIR}/${safe_name}_${platform}_attempt"*.log; do
+        if [[ -f "$attempt_log" ]]; then
+            echo "--- LOG: ${task_name} ($(basename "$attempt_log")) ---"
+            cat "$attempt_log"
+            echo "--- END ---"
+            echo ""
+        fi
+    done
+done
+
+# Print clean summary table last so it is always visible
+echo ""
+
+if [[ -t 1 ]]; then
+    COLOR_RED=$'\033[31m'
+    COLOR_GREEN=$'\033[32m'
+    COLOR_RESET=$'\033[0m'
+else
+    COLOR_RED=""
+    COLOR_GREEN=""
+    COLOR_RESET=""
+fi
+
+TASK_COL_WIDTH=4
+for key in "${TASK_ORDER[@]}"; do
+    task_name="${FINAL_DISPLAY[$key]}"
+    if [[ ${#task_name} -gt $TASK_COL_WIDTH ]]; then
+        TASK_COL_WIDTH=${#task_name}
+    fi
+done
+if [[ $TASK_COL_WIDTH -lt 40 ]]; then TASK_COL_WIDTH=40; fi
+if [[ $TASK_COL_WIDTH -gt 72 ]]; then TASK_COL_WIDTH=72; fi
+
+SUMMARY_TITLE="CI RESULTS SUMMARY"
+SUMMARY_HEADER=$(printf "%-*s %-8s %-6s %-7s %-6s %s" \
+    "$TASK_COL_WIDTH" "TASK" "PLATFORM" "DEVICE" "ATTEMPT" "TIME" "RESULT")
+SUMMARY_WIDTH=${#SUMMARY_HEADER}
+if [[ ${#SUMMARY_TITLE} -gt $SUMMARY_WIDTH ]]; then
+    SUMMARY_WIDTH=${#SUMMARY_TITLE}
+fi
+SUMMARY_BORDER=$(printf '%*s' "$SUMMARY_WIDTH" '' | tr ' ' '=')
+
+TITLE_PAD_LEFT=$(( (SUMMARY_WIDTH - ${#SUMMARY_TITLE}) / 2 ))
+TITLE_PAD_RIGHT=$(( SUMMARY_WIDTH - ${#SUMMARY_TITLE} - TITLE_PAD_LEFT ))
+SUMMARY_TITLE_LINE=$(printf "%*s%s%*s" \
+    "$TITLE_PAD_LEFT" "" "$SUMMARY_TITLE" "$TITLE_PAD_RIGHT" "")
+
+echo "$SUMMARY_BORDER"
+echo "$SUMMARY_TITLE_LINE"
+echo "$SUMMARY_BORDER"
+
+TASK_DIVIDER=$(printf '%*s' "$TASK_COL_WIDTH" '' | tr ' ' '-')
+printf "%s\n" "$SUMMARY_HEADER"
+printf "%-*s %-8s %-6s %-7s %-6s %s\n" "$TASK_COL_WIDTH" "$TASK_DIVIDER" "--------" "------" "-------" "----" "------"
+
+for key in "${TASK_ORDER[@]}"; do
+    task_name="${FINAL_DISPLAY[$key]}"
+    result="${FINAL_RESULTS[$key]}"
+
+    if [[ ${#task_name} -gt $TASK_COL_WIDTH ]]; then
+        task_display="${task_name:0:$((TASK_COL_WIDTH - 3))}..."
+    else
+        task_display="$task_name"
+    fi
+
+    platform="${FINAL_PLATFORM[$key]}"
+    device="${FINAL_DEVICE[$key]}"
+    attempt="${FINAL_ATTEMPT[$key]}"
+    timing="${FINAL_TIMING[$key]}"
+
+    if [[ "$result" == "FAIL" ]]; then
+        printf "%-*s %-8s %-6s %-7s %-6s %sFAIL%s\n" \
+            "$TASK_COL_WIDTH" "$task_display" "$platform" "$device" "$attempt" "$timing" \
+            "$COLOR_RED" "$COLOR_RESET"
+    else
+        printf "%-*s %-8s %-6s %-7s %-6s %sPASS%s\n" \
+            "$TASK_COL_WIDTH" "$task_display" "$platform" "$device" "$attempt" "$timing" \
+            "$COLOR_GREEN" "$COLOR_RESET"
+    fi
+done
+
+echo "$SUMMARY_BORDER"
 echo "Total: $((PASS_COUNT + FAIL_COUNT))  Passed: $PASS_COUNT  Failed: $FAIL_COUNT"
-echo "========================================"
+echo "$SUMMARY_BORDER"
 
 if [[ $FAIL_COUNT -gt 0 || $OVERALL_EXIT -ne 0 ]]; then
     exit 1
+else
+    echo "All tests passed!"
 fi
-echo "All tests passed!"
