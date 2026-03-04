@@ -424,7 +424,6 @@ void pto2_orchestrator_wait_all(PTO2OrchestratorState* orch) {
 
     // Spin-wait until scheduler reports all tasks done
     while (!orch->scheduler->is_done()) {
-        PTO2_SPIN_PAUSE();
     }
 }
 

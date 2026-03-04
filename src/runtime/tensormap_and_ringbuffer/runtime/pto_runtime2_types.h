@@ -297,37 +297,6 @@ typedef int64_t (*PTO2CycleCostFunc)(void** args, int32_t num_args);
 typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 
 // =============================================================================
-// Utility Macros
-// =============================================================================
-
-/**
- * Memory barrier macros for different architectures
- */
-#if defined(__aarch64__)
-    #define PTO2_MEMORY_BARRIER()     __asm__ __volatile__("dmb sy" ::: "memory")
-#elif defined(__x86_64__)
-    #define PTO2_MEMORY_BARRIER()     __asm__ __volatile__("mfence" ::: "memory")
-#else
-    #define PTO2_MEMORY_BARRIER()     __sync_synchronize()
-#endif
-
-/**
- * Pause instruction for spin-wait loops
- * Include sched_yield() to prevent CPU starvation of other threads
- */
-#include <sched.h>
-#if defined(__aarch64__)
-    #define PTO2_SPIN_PAUSE()         do { __asm__ __volatile__("yield" ::: "memory"); sched_yield(); } while(0)
-    #define PTO2_SPIN_PAUSE_LIGHT()   __asm__ __volatile__("yield" ::: "memory")
-#elif defined(__x86_64__)
-    #define PTO2_SPIN_PAUSE()         do { __builtin_ia32_pause(); sched_yield(); } while(0)
-    #define PTO2_SPIN_PAUSE_LIGHT()   __builtin_ia32_pause()
-#else
-    #define PTO2_SPIN_PAUSE()         sched_yield()
-    #define PTO2_SPIN_PAUSE_LIGHT()   ((void)0)
-#endif
-
-// =============================================================================
 // Per-task fanout spinlock helpers
 //
 // Used by BOTH the orchestrator (pto_orchestrator.cpp) and the scheduler
@@ -342,7 +311,6 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
     for (;;) {
         while (task->fanout_lock.load(std::memory_order_acquire) != 0) {
-            PTO2_SPIN_PAUSE_LIGHT();
         }
         int32_t expected = 0;
         if (task->fanout_lock.compare_exchange_weak(expected, 1,

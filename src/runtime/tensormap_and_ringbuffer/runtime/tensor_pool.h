@@ -35,7 +35,7 @@ struct Segment {
     bool contains(const Segment& other) const { return begin <= other.begin && other.end <= end; }
 };
 
-struct TensorData {
+struct alignas(64) TensorData {
     int32_t ref_count;                             // Reference count (managed by TensorPool, NOT copied by init())
     int32_t version;                               // tensor的版本
     PTOBufferHandle buffer;                        // Underlying memory buffer (addr in bytes, size in bytes)

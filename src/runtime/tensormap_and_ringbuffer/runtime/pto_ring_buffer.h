@@ -126,8 +126,6 @@ struct PTO2HeapRing {
                 LOG_ERROR("========================================");
                 exit(1);
             }
-
-            PTO2_SPIN_PAUSE();
         }
     }
 
@@ -313,8 +311,6 @@ struct PTO2TaskRing {
                 // Abort program
                 exit(1);
             }
-
-            PTO2_SPIN_PAUSE();
         }
     }
 

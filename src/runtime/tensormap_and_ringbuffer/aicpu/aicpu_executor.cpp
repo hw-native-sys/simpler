@@ -6,7 +6,6 @@
 #include <cstring>
 #include <mutex>
 #include <string>
-#include <thread>
 
 #include <dlfcn.h>
 #include <fcntl.h>
@@ -454,7 +453,6 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         pto2_init_complete_.store(true, std::memory_order_release);
     } else {
         while (!pto2_init_complete_.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
         }
     }
 
@@ -728,14 +726,8 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             } else {
                 SPIN_WAIT_HINT();
             }
-            PTO2_SPIN_PAUSE_LIGHT();
-            CYCLE_COUNT_LAP(sched_idle_cycle);
-#if PTO2_PROFILING
-            if (profiling_enabled) {
-                perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT,
-                                        _t0_phase, _t1, sched_loop_count, 0);
-                _t0_phase = _t1;
-            }
+#if PTO2_ORCH_PROFILING
+            sched_yield_count++;
 #endif
         } else {
             idle_iterations = 0;
@@ -799,6 +791,28 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
 int AicpuExecutor::run(Runtime* runtime) {
     int thread_idx = thread_idx_++;
+
+#ifdef __linux__
+    {
+        // Detect available CPU cores and bind each thread to a distinct core.
+        cpu_set_t available;
+        CPU_ZERO(&available);
+        sched_getaffinity(0, sizeof(available), &available);
+        int avail_cores[CPU_SETSIZE];
+        int avail_count = 0;
+        for (int c = 0; c < CPU_SETSIZE && avail_count < MAX_AICPU_THREADS; c++) {
+            if (CPU_ISSET(c, &available)) {
+                avail_cores[avail_count++] = c;
+            }
+        }
+        if (thread_idx < avail_count) {
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+            CPU_SET(avail_cores[thread_idx], &cpuset);
+            sched_setaffinity(0, sizeof(cpuset), &cpuset);
+        }
+    }
+#endif
 
     DEV_INFO("Thread %d: Start", thread_idx);
 
@@ -968,7 +982,6 @@ int AicpuExecutor::run(Runtime* runtime) {
 
             // Wait for scheduler's one-time init to complete
             while (!pto2_init_complete_.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
             }
 
             // Call orchestration wrapped in outer scope (matches old PTO2_ORCHESTRATION behavior)
@@ -1055,7 +1068,6 @@ int AicpuExecutor::run(Runtime* runtime) {
             // runtime. Scheduler threads access TensorPool via orch_ready_queue_
             // and tensor.data() in build_pto2_payload — freeing early is use-after-free.
             while (finished_count_.load(std::memory_order_acquire) < thread_num_ - 1) {
-                std::this_thread::yield();
             }
             DEV_INFO("Thread 3: All scheduler threads finished, destroying runtime");
 
@@ -1069,7 +1081,6 @@ int AicpuExecutor::run(Runtime* runtime) {
         // Device orchestration: wait for Thread 3 to initialize SM header
         if (!runtime->get_orch_built_on_host()) {
             while (!runtime_init_ready_.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
             }
         }
         always_assert(rt != nullptr);
