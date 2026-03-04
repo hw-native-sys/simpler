@@ -855,6 +855,35 @@ def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3"
                       compiled_artifacts=compiled_artifacts, prebuilt_dir=prebuilt_dir)
 
 
+def run_on_device(
+    device_id: int,
+    artifacts: dict,
+    kernels_dir: str,
+    golden_path: str,
+    platform: str = "a2a3",
+    enable_profiling: bool = False,
+    run_all_cases: bool = False,
+    case_name: Optional[str] = None,
+) -> None:
+    """
+    Worker entry for multiprocessing: create CodeRunner and run.
+    Must be at module level so child process can import without running main().
+    """
+    runner = create_code_runner(
+        kernels_dir=kernels_dir,
+        golden_path=golden_path,
+        device_id=device_id,
+        platform=platform,
+        enable_profiling=enable_profiling,
+        run_all_cases=run_all_cases,
+        case_name=case_name,
+        n_devices=1,
+        first_device_id=device_id,
+        compiled_artifacts=artifacts,
+    )
+    runner.run()
+
+
 # =============================================================================
 # PTOCompiler - compile once, run many
 # =============================================================================

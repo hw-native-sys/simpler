@@ -199,19 +199,6 @@ Golden.py interface:
         help="Run a specific test case by name (e.g., --case Case2)"
     )
 
-    parser.add_argument(
-        "--run-only",
-        action="store_true",
-        help="(Internal) Skip compile, load from --prebuilt-dir and run"
-    )
-
-    parser.add_argument(
-        "--prebuilt-dir",
-        type=str,
-        default=None,
-        help="(Internal) Path to pre-built artifacts directory"
-    )
-
     args = parser.parse_args()
 
     if args.all and args.case:
@@ -269,38 +256,9 @@ Golden.py interface:
 
     # Import and run
     try:
-        import tempfile
-        import subprocess
+        from concurrent.futures import ProcessPoolExecutor, as_completed
 
-        from code_runner import create_code_runner, create_compiler, _write_artifacts_to_dir
-
-        # Run-only mode: subprocess loading from prebuilt dir (no compile)
-        if getattr(args, 'run_only', False) and args.prebuilt_dir:
-            runner = create_code_runner(
-                kernels_dir=str(args.kernels),
-                golden_path=str(args.golden),
-                device_id=args.device,
-                platform=args.platform,
-                enable_profiling=args.enable_profiling,
-                run_all_cases=args.all,
-                case_name=args.case,
-                n_devices=1,
-                first_device_id=args.device,
-                prebuilt_dir=args.prebuilt_dir,
-            )
-            pre_run_device_logs = set()
-            device_log_dir = None
-            if args.enable_profiling and args.platform == "a2a3":
-                device_log_dir = _get_device_log_dir(args.device)
-                if device_log_dir.exists():
-                    pre_run_device_logs = set(device_log_dir.glob("*.log"))
-            runner.run()
-            logger.info("=" * 60)
-            logger.info("TEST PASSED")
-            logger.info("=" * 60)
-            if args.enable_profiling:
-                return _run_profiling_swimlane(args, kernels_path, project_root, device_log_dir, pre_run_device_logs, log_level_str)
-            return 0
+        from code_runner import create_code_runner, create_compiler, run_on_device
 
         # Compile first
         compiler = create_compiler(kernels_dir=str(args.kernels), platform=args.platform)
@@ -316,51 +274,38 @@ Golden.py interface:
         first_device_id = args.first_device if args.first_device is not None else runtime_config.get("first_device_id", 0)
 
         if n_devices > 1:
-            # Multi-device: write artifacts, spawn N subprocesses in parallel
+            # Multi-device: create N CodeRunner instances, run in parallel via ProcessPoolExecutor
             device_ids = list(range(first_device_id, first_device_id + n_devices))
             logger.info(f"=== Multi-device: compile done, running on devices {device_ids} (parallel) ===")
-            prebuilt_dir = Path(tempfile.mkdtemp(prefix="pto_prebuilt_"))
-            try:
-                _write_artifacts_to_dir(artifacts, prebuilt_dir)
-                run_example_path = script_dir / "run_example.py"
-                base_cmd = [
-                    sys.executable,
-                    str(run_example_path),
-                    "--run-only",
-                    "--prebuilt-dir", str(prebuilt_dir),
-                    "-k", str(args.kernels),
-                    "-g", str(args.golden),
-                    "-p", args.platform,
-                ]
-                if args.enable_profiling:
-                    base_cmd.append("--enable-profiling")
-                if args.all:
-                    base_cmd.append("--all")
-                elif args.case:
-                    base_cmd.extend(["--case", args.case])
 
-                procs = []
-                for did in device_ids:
-                    cmd = base_cmd + ["-d", str(did)]
-                    logger.info(f"Spawning device {did}: {' '.join(cmd[:12])}...")
-                    procs.append((did, subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)))
-
-                failed = []
-                for did, proc in procs:
-                    stdout, stderr = proc.communicate()
-                    if proc.returncode != 0:
-                        failed.append((did, proc.returncode, stdout, stderr))
-                        logger.error(f"Device {did} failed (exit {proc.returncode}):\nstderr: {stderr}\nstdout: {stdout}")
-                    else:
+            failed = []
+            with ProcessPoolExecutor(max_workers=n_devices) as executor:
+                futures = {
+                    executor.submit(
+                        run_on_device,
+                        did,
+                        artifacts,
+                        str(args.kernels),
+                        str(args.golden),
+                        args.platform,
+                        args.enable_profiling,
+                        args.all,
+                        args.case,
+                    ): did
+                    for did in device_ids
+                }
+                for fut in as_completed(futures):
+                    did = futures[fut]
+                    try:
+                        fut.result()
                         logger.info(f"Device {did}: PASS")
+                    except Exception as e:
+                        failed.append((did, e))
+                        logger.error(f"Device {did} failed: {e}")
 
-                if failed:
-                    err_msg = "; ".join(f"device {d}: exit {r}" for d, r, _, _ in failed)
-                    raise RuntimeError(f"Multi-device run failed: {err_msg}")
-            finally:
-                import shutil
-                if prebuilt_dir.exists():
-                    shutil.rmtree(prebuilt_dir, ignore_errors=True)
+            if failed:
+                err_msg = "; ".join(f"device {d}: {e}" for d, e in failed)
+                raise RuntimeError(f"Multi-device run failed: {err_msg}")
 
             logger.info("=" * 60)
             logger.info("TEST PASSED (all devices)")

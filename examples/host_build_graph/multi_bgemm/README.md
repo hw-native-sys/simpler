@@ -27,7 +27,7 @@ python examples/scripts/run_example.py \
 ## 行为说明
 
 - 与 **bgemm** 使用同一套 orchestration（`build_bgemm_graph`）、同一套 kernel（GEMM + tile_add）、同一套 golden。
-- **编译与运行分离**：主进程先 `compile()` 一次，将产物写入临时目录，再并行 spawn N 个子进程；每个子进程只做 set_device → init → launch → finalize，**跳过 build**，无重复编译。
+- **编译与运行分离**：主进程先 `compile()` 一次，创建 N 个 CodeRunner（传入 compiled_artifacts），通过 `ProcessPoolExecutor` 多进程并行执行各 `runner.run()`，**无重复编译**。
 - 不引入 HCCL、通信算子或建联逻辑；与后续多卡通信方案兼容（通信 case 将使用独立 C++ 入口）。
 
 ## 目录结构
