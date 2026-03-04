@@ -223,8 +223,6 @@ void pto2_submit_task(
     // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
     int32_t task_id = orch->task_ring.pto2_task_ring_alloc();
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id);
-
     PTO2TaskDescriptor* task = pto2_task_ring_get(&orch->task_ring, task_id);
 
     // Initialize task descriptor
@@ -243,6 +241,8 @@ void pto2_submit_task(
 
     // Register this task in its owning scope
     scope_tasks_push(orch, task_id);
+
+    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id);
 
     // Temporary storage for fanin
     int32_t fanin_temp[PTO2_MAX_INPUTS];

@@ -64,14 +64,15 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     uint64_t prof_param_extract = 0;
-    uint64_t prof_ext_tensor    = 0;
-    uint64_t prof_make_tensor   = 0;
-    uint64_t prof_tensor_view   = 0;
-    uint64_t prof_param_setup   = 0;
-    uint64_t prof_submit_task   = 0;
-    int      prof_submit_count  = 0;
-    int      prof_make_count    = 0;
-    int      prof_view_count    = 0;
+    uint64_t prof_ext_tensor = 0;
+    uint64_t prof_scope = 0;
+    uint64_t prof_make_tensor = 0;
+    uint64_t prof_tensor_view = 0;
+    uint64_t prof_param_setup = 0;
+    uint64_t prof_submit_task = 0;
+    int prof_submit_count = 0;
+    int prof_make_count = 0;
+    int prof_view_count = 0;
 
     CYCLE_COUNT_START();
 
@@ -126,10 +127,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     // Tensor context_lens = make_tensor_external(host_context_lens, context_lens_size);
     Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
     CYCLE_COUNT_LAP(prof_ext_tensor);
-    LOG_DEBUG(rt, "query=%s", query.dump().c_str());
-    LOG_DEBUG(rt, "key_cache=%s", key_cache.dump().c_str());
-    LOG_DEBUG(rt, "value_cache=%s", value_cache.dump().c_str());
-    LOG_DEBUG(rt, "out=%s", out.dump().c_str());
+    // LOG_DEBUG(rt, "query=%s", query.dump().c_str());
+    // LOG_DEBUG(rt, "key_cache=%s", key_cache.dump().c_str());
+    // LOG_DEBUG(rt, "value_cache=%s", value_cache.dump().c_str());
+    // LOG_DEBUG(rt, "out=%s", out.dump().c_str());
 
     int total_tasks = 0;
 
@@ -138,8 +139,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
             PTO2_SCOPE(rt) {
+                CYCLE_COUNT_LAP(prof_scope);
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
-                CYCLE_COUNT_START();
 
                 uint64_t oi_shapes[2] = {q_tile, head_dim};
                 uint64_t li_shapes[1] = {q_tile};
@@ -255,11 +256,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     CYCLE_COUNT_LAP(prof_submit_task);
                 }
             }
+            CYCLE_COUNT_LAP(prof_scope);
         }
     }
 
     uint64_t total = prof_param_extract + prof_ext_tensor + prof_make_tensor +
-                     prof_tensor_view + prof_param_setup + prof_submit_task;
+                     prof_tensor_view + prof_param_setup + prof_submit_task + prof_scope;
     LOG_ALWAYS(rt, "=== PagedAttn Orch Profiling: %d submits, %d makes, %d views, total=%.3fus ===",
         prof_submit_count, prof_make_count, prof_view_count, cycles_to_us(total));
     if (total > 0) {
@@ -273,8 +275,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
         LOG_ALWAYS(rt, "  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_view_count, cycles_to_us(prof_tensor_view), prof_tensor_view * 100.0 / total,
             prof_view_count > 0 ? cycles_to_us(prof_tensor_view) / prof_view_count : 0.0);
-        LOG_ALWAYS(rt, "  param_setup      : %7.3fus (%5.1f%%)",
-            cycles_to_us(prof_param_setup), prof_param_setup * 100.0 / total);
+        LOG_ALWAYS(rt,
+            "  param_setup      : %7.3fus (%5.1f%%)",
+            cycles_to_us(prof_param_setup),
+            prof_param_setup * 100.0 / total);
+        LOG_ALWAYS(rt, "  scope            : %7.3fus (%5.1f%%)", cycles_to_us(prof_scope), prof_scope * 100.0 / total);
         LOG_ALWAYS(rt, "  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_submit_count, cycles_to_us(prof_submit_task), prof_submit_task * 100.0 / total,
             prof_submit_count > 0 ? cycles_to_us(prof_submit_task) / prof_submit_count : 0.0);

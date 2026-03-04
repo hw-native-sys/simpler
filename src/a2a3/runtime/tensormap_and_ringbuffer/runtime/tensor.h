@@ -53,15 +53,15 @@ struct Segment {
  *   - Outer dim: 3 rows with stride 6 elements (derived from raw_shapes[1])
  */
 struct Tensor {
-    // === Data fields (same layout as former Tensor) ===
-    int32_t version;                               // Tensor version for overlap detection
+    // === Data fields (same layout as former TensorData) ===
     PTOBufferHandle buffer;                        // Underlying memory buffer (addr in bytes, size in bytes)
-    uint64_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
-    uint64_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
-    uint64_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
+    int32_t version;                               // Tensor version for overlap detection
     uint64_t start_offset;                         // Cached 1D element offset (precomputed from raw_shapes + offsets)
     uint64_t ndims;                                // Number of dimensions used
     DataType dtype;                                // Data type of tensor elements
+    uint64_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
+    uint64_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
+    uint64_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
 
     Tensor() = default;
     Tensor(const Tensor&) = default;
@@ -103,9 +103,9 @@ struct Tensor {
 
     void init(const Tensor& other) {
         buffer = other.buffer;
+        version = other.version;
         ndims = other.ndims;
         dtype = other.dtype;
-        version = other.version;
         for (uint64_t i = 0; i < ndims; i++) {
             raw_shapes[i] = other.raw_shapes[i];
             shapes[i] = other.shapes[i];
