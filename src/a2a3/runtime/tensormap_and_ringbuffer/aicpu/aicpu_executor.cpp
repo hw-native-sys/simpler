@@ -222,7 +222,8 @@ struct AicpuExecutor {
         int32_t& cur_thread_completed,
         bool& made_progress,
         int32_t deferred_release_ids[],
-        int32_t& deferred_release_count
+        int32_t& deferred_release_count,
+        PTO2LocalReadyBuffer& local_buf
 #if PTO2_PROFILING
         ,
         bool profiling_enabled,
@@ -262,20 +263,20 @@ struct AicpuExecutor {
                 executing_task_ids[core_id] = AICPU_TASK_INVALID;
 #if PTO2_SCHED_PROFILING
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
-                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id, thread_idx);
+                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id, thread_idx, &local_buf);
                 notify_edges_total += cstats.fanout_edges;
                 if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
                 notify_tasks_enqueued += cstats.tasks_enqueued;
                 phase_complete_count++;
 #elif PTO2_PROFILING
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
-                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id);
+                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id, &local_buf);
                 notify_edges_total += cstats.fanout_edges;
                 if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
                 notify_tasks_enqueued += cstats.tasks_enqueued;
                 phase_complete_count++;
 #else
-                rt->scheduler.on_task_complete(task_id);
+                rt->scheduler.on_task_complete(task_id, &local_buf);
 #endif
                 if (deferred_release_count < 64) {
                     deferred_release_ids[deferred_release_count++] = task_id;
@@ -846,12 +847,21 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     uint64_t pop_miss = 0;
     uint32_t phase_complete_count = 0;
     uint32_t phase_dispatch_count = 0;
+    uint64_t local_dispatch_count = 0;
+    uint64_t local_overflow_count = 0;
 #if PTO2_SCHED_PROFILING
     uint64_t sched_complete_perf_cycle = 0;
     uint64_t sched_dispatch_pop_cycle = 0;
     uint64_t sched_dispatch_setup_cycle = 0;
 #endif
 #endif
+
+    // Local-first dispatch buffer (stack-allocated, one per scheduling thread).
+    // Initialized once; must be empty at the start of each iteration.
+    constexpr int LOCAL_READY_CAP = 64;
+    int32_t local_task_ids[LOCAL_READY_CAP];
+    PTO2LocalReadyBuffer local_buf;
+    local_buf.reset(local_task_ids, LOCAL_READY_CAP);
     int32_t deferred_release_ids[128];
     int32_t deferred_release_count = 0;
 
@@ -907,12 +917,14 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
         // Check AIC running cores
         bool try_completed = false;
+        always_assert(local_buf.count == 0);  // Invariant: previous iteration fully consumed
         if (tracker.aic().running_count > 0) {
             try_completed = true;
             check_running_cores_for_completion<CoreType::AIC>(
                 thread_idx, tracker.aic(), hank, executing_task_ids,
                 completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_ids, deferred_release_count
+                deferred_release_ids, deferred_release_count,
+                local_buf
 #if PTO2_PROFILING
                 , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
                 notify_edges_total, notify_max_degree, notify_tasks_enqueued,
@@ -930,7 +942,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             check_running_cores_for_completion<CoreType::AIV>(
                 thread_idx, tracker.aiv(), hank, executing_task_ids,
                 completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_ids, deferred_release_count
+                deferred_release_ids, deferred_release_count,
+                local_buf
 #if PTO2_PROFILING
                 , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
                 notify_edges_total, notify_max_degree, notify_tasks_enqueued,
@@ -969,8 +982,65 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         }
 #endif
 
-        // Phase 2: Dispatch ready tasks to idle cores (register-based dispatch)
+        // Phase 2: Local dispatch — match local_buf tasks to idle cores (zero MPMC operations)
+        // Phase 3: Global queue — push overflow to readyQ + fill remaining idle cores from readyQ
         bool try_pushed = false;
+
+        // Local dispatch: drain local_buf, match to idle cores by type
+        int32_t overflow_ids[LOCAL_READY_CAP];
+        int overflow_count = 0;
+        while (local_buf.count > 0) {
+            int32_t task_id = local_buf.pop();
+            PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
+            CoreType ct_type = static_cast<CoreType>(task->worker_type);
+            CoreTypeTracker& ct = (ct_type == CoreType::AIC) ? tracker.aic() : tracker.aiv();
+
+            if (ct.idle_count > 0) {
+                try_pushed = true;
+                int32_t idle_idx = ct.idle_count - 1;
+                int32_t core_id = ct.idle[idle_idx];
+                PTO2TaskPayload* task_pl = &task_payloads[task_id & window_mask];
+                PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
+                if (ct_type == CoreType::AIC) {
+                    build_pto2_payload<CoreType::AIC>(payload, runtime, task, task_pl);
+                } else {
+                    build_pto2_payload<CoreType::AIV>(payload, runtime, task, task_pl);
+                }
+#if PTO2_PROFILING
+                if (profiling_enabled) {
+                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                    if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE) {
+                        perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
+                        core_dispatch_counts_[core_id] = 0;
+                    }
+                    core_dispatch_counts_[core_id]++;
+                }
+                pop_hit++;
+                phase_dispatch_count++;
+                local_dispatch_count++;
+#endif
+                write_reg(core_id_to_reg_addr_[core_id], RegId::DATA_MAIN_BASE,
+                          static_cast<uint64_t>(task_id + 1));
+                ct.move_idle_to_running(idle_idx);
+                executing_task_ids[core_id] = task_id;
+                made_progress = true;
+                DEV_DEBUG("Thread %d: Dispatching PTO2 task %d to core %d (local)",
+                          thread_idx, task_id, core_id);
+            } else {
+                overflow_ids[overflow_count++] = task_id;
+#if PTO2_PROFILING
+                local_overflow_count++;
+#endif
+            }
+        }
+
+        // Push overflow to global readyQ
+        for (int i = 0; i < overflow_count; i++) {
+            PTO2TaskDescriptor* task = &task_descriptors[overflow_ids[i] & window_mask];
+            rt->scheduler.ready_queues[task->worker_type].push(overflow_ids[i]);
+        }
+
+        // Global dispatch: fill remaining idle cores from global readyQ
         // Process AIC cores if CUBE queue has tasks
         if (tracker.aic().idle_count > 0 && rt->scheduler.ready_queues[PTO2_WORKER_CUBE].size() > 0) {
             try_pushed = true;
@@ -1195,6 +1265,16 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             (unsigned long long)pop_hit,
             (unsigned long long)pop_miss,
             pop_hit_rate);
+        uint64_t global_dispatch_count = pop_hit - local_dispatch_count;
+        uint64_t total_dispatched = local_dispatch_count + global_dispatch_count;
+        double local_hit_rate = total_dispatched > 0
+            ? local_dispatch_count * 100.0 / total_dispatched : 0.0;
+        DEV_ALWAYS("Thread %d:     local_disp   : local=%llu, global=%llu, overflow=%llu, local_rate=%.1f%%",
+            thread_idx,
+            (unsigned long long)local_dispatch_count,
+            (unsigned long long)global_dispatch_count,
+            (unsigned long long)local_overflow_count,
+            local_hit_rate);
 
         // Level 2: dispatch sub-phases (percentage relative to dispatch)
         uint64_t d_parent = sched_dispatch_cycle > 0 ? sched_dispatch_cycle : 1;

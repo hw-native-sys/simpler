@@ -46,6 +46,43 @@ struct PTO2ReadyQueueSlot {
 };
 
 /**
+ * Thread-local ready buffer for local-first dispatch optimization.
+ *
+ * One buffer per scheduling thread (mixed worker types).
+ * Initialized once before the scheduling loop; must be empty at
+ * the start of each iteration (verified by always_assert).
+ *
+ * Phase 1 fills this buffer via on_task_complete().
+ * Phase 2 drains it: matched tasks dispatch to idle cores,
+ * unmatched tasks are stored in an overflow array for Phase 3.
+ * Phase 3 pushes overflow to global readyQ and fills remaining
+ * idle cores from global readyQ.
+ */
+struct PTO2LocalReadyBuffer {
+    int32_t* task_ids = nullptr;  // Points to caller's stack array
+    int count = 0;
+    int capacity = 0;
+
+    void reset(int32_t* buf, int cap) {
+        task_ids = buf;
+        count = 0;
+        capacity = cap;
+    }
+
+    bool try_push(int32_t task_id) {
+        if (task_ids && count < capacity) {
+            task_ids[count++] = task_id;
+            return true;
+        }
+        return false;
+    }
+
+    int32_t pop() {
+        return (count > 0) ? task_ids[--count] : -1;  // LIFO: better cache locality
+    }
+};
+
+/**
  * Lock-free bounded MPMC queue (Dmitry Vyukov design)
  *
  * Key properties:
@@ -392,7 +429,8 @@ struct PTO2SchedulerState {
 #endif
 
     bool release_fanin_and_check_ready(int32_t task_id,
-                                        PTO2TaskDescriptor* task) {
+                                        PTO2TaskDescriptor* task,
+                                        PTO2LocalReadyBuffer* local_buf = nullptr) {
         int32_t slot = pto2_task_slot(task_id);
 
         // Atomically increment fanin_refcount and check if all producers are done
@@ -401,7 +439,14 @@ struct PTO2SchedulerState {
         int32_t new_refcount = fanin_refcount[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == task->fanin_count) {
-            ready_queues[task->worker_type].push(task_id);
+            // Local-first: try thread-local buffer before global queue
+            bool pushed_local = false;
+            if (local_buf) {
+                pushed_local = local_buf->try_push(task_id);
+            }
+            if (!pushed_local) {
+                ready_queues[task->worker_type].push(task_id);
+            }
             return true;
         }
         return false;
@@ -409,7 +454,8 @@ struct PTO2SchedulerState {
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     bool release_fanin_and_check_ready(int32_t task_id, PTO2TaskDescriptor* task,
-                                        uint64_t& atomic_count, uint64_t& push_wait) {
+                                        uint64_t& atomic_count, uint64_t& push_wait,
+                                        PTO2LocalReadyBuffer* local_buf = nullptr) {
         int32_t slot = pto2_task_slot(task_id);
 
         int32_t new_refcount = fanin_refcount[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -420,7 +466,14 @@ struct PTO2SchedulerState {
             if (task_state[slot].compare_exchange_strong(
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
-                ready_queues[task->worker_type].push(task_id, atomic_count, push_wait);
+                // Local-first: try thread-local buffer before global queue
+                bool pushed_local = false;
+                if (local_buf) {
+                    pushed_local = local_buf->try_push(task_id);
+                }
+                if (!pushed_local) {
+                    ready_queues[task->worker_type].push(task_id, atomic_count, push_wait);
+                }
                 return true;
             }
         }
@@ -474,13 +527,16 @@ struct PTO2SchedulerState {
     }
 
 #if PTO2_SCHED_PROFILING
-    PTO2CompletionStats on_task_complete(int32_t task_id, int thread_idx) {
+    PTO2CompletionStats on_task_complete(int32_t task_id, int thread_idx,
+                                          PTO2LocalReadyBuffer* local_buf = nullptr) {
         PTO2CompletionStats stats = {0, 0, 0};
 #elif PTO2_PROFILING
-    PTO2CompletionStats on_task_complete(int32_t task_id) {
+    PTO2CompletionStats on_task_complete(int32_t task_id,
+                                          PTO2LocalReadyBuffer* local_buf = nullptr) {
         PTO2CompletionStats stats = {0, 0, 0};
 #else
-    void on_task_complete(int32_t task_id) {
+    void on_task_complete(int32_t task_id,
+                           PTO2LocalReadyBuffer* local_buf = nullptr) {
 #endif
         int32_t slot = pto2_task_slot(task_id);
         PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(sm_handle, task_id);
@@ -528,17 +584,17 @@ struct PTO2SchedulerState {
 #endif
 #if PTO2_SCHED_PROFILING
             if (release_fanin_and_check_ready(consumer_id, consumer,
-                                               fanout_atomics, push_wait)) {
+                                               fanout_atomics, push_wait, local_buf)) {
 #if PTO2_PROFILING
                 stats.tasks_enqueued++;
 #endif
             }
 #elif PTO2_PROFILING
-            if (release_fanin_and_check_ready(consumer_id, consumer)) {
+            if (release_fanin_and_check_ready(consumer_id, consumer, local_buf)) {
                 stats.tasks_enqueued++;
             }
 #else
-            release_fanin_and_check_ready(consumer_id, consumer);
+            release_fanin_and_check_ready(consumer_id, consumer, local_buf);
 #endif
             current = current->next;
         }
