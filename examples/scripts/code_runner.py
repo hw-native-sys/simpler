@@ -617,12 +617,15 @@ class CodeRunner:
         device_ids = list(range(self.first_device_id, self.first_device_id + self.n_devices))
         logger.info(f"=== Multi-device: running on devices {device_ids} (parallel) ===")
 
+        # Child must run single-card: pass --n-devices 1 so it does not re-enter multi-card branch
+        # (same -k/-g loads kernel_config with n_devices=2; without this, child would spawn again)
         base_cmd = [
             sys.executable,
             str(run_example_path),
             "-k", str(self.kernels_dir),
             "-g", str(self.golden_path),
             "-p", self.platform,
+            "--n-devices", "1",
         ]
         if self.run_all_cases:
             base_cmd.append("--all")
