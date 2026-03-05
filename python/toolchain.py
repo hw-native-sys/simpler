@@ -102,10 +102,14 @@ class Gxx15Toolchain(Toolchain):
         ]
 
     def get_cmake_args(self) -> List[str]:
-        return [
-            "-DCMAKE_C_COMPILER=gcc",
-            "-DCMAKE_CXX_COMPILER=g++",
+        # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
+        cc = os.environ.get("CC", "gcc")
+        cxx = os.environ.get("CXX", "g++")
+        args = [
+            f"-DCMAKE_C_COMPILER={cc}",
+            f"-DCMAKE_CXX_COMPILER={cxx}",
         ]
+        return args
 
 
 class GxxToolchain(Toolchain):
@@ -119,9 +123,12 @@ class GxxToolchain(Toolchain):
         return ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
 
     def get_cmake_args(self) -> List[str]:
+        # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
+        cc = os.environ.get("CC", "gcc")
+        cxx = os.environ.get("CXX", "g++")
         args = [
-            "-DCMAKE_C_COMPILER=gcc",
-            "-DCMAKE_CXX_COMPILER=g++",
+            f"-DCMAKE_C_COMPILER={cc}",
+            f"-DCMAKE_CXX_COMPILER={cxx}",
         ]
         if self.ascend_home_path:
             args.append(f"-DASCEND_HOME_PATH={self.ascend_home_path}")

@@ -134,14 +134,6 @@ enum class RegId : uint32_t {
 };
 
 /**
- * AICore execution status (communicated via COND register)
- */
-enum class AICoreStatus : uint32_t {
-    IDLE = 0,
-    BUSY = 1,
-};
-
-/**
  * Map RegId to hardware register offset
  */
 constexpr uint32_t reg_offset(RegId reg) {
@@ -159,12 +151,6 @@ constexpr uint32_t SIM_REG_BLOCK_SIZE = 0x500;
 // =============================================================================
 // Hardware Configuration Constants
 // =============================================================================
-
-/**
- * AICore register bitmap buffer length
- * Used for querying valid AICore cores via HAL API
- */
-constexpr uint8_t PLATFORM_AICORE_BITMAP_LEN = 2;
 
 /**
  * Number of sub-cores per AICore

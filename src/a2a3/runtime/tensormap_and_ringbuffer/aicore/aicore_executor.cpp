@@ -3,7 +3,7 @@
 #include "pto2_dispatch_payload.h"
 #include "common/perf_profiling.h"
 #include "aicore/performance_collector_aicore.h"
-#include "common/platform_config.h"  // Register-based communication (RegId, AICoreStatus)
+#include "common/platform_config.h"  // Register-based communication
 
 /**
  * Unified function pointer type for kernel dispatch

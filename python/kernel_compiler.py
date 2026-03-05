@@ -50,15 +50,17 @@ class KernelCompiler:
         """
         self.platform = platform
         self.project_root = Path(__file__).parent.parent
-        self.platform_dir = self.project_root / "src" / "platform" / platform
 
-        if platform not in ("a2a3", "a2a3sim"):
-            raise ValueError(
-                f"Unknown platform: {platform}. Supported: a2a3, a2a3sim"
-            )
+        # Map platform to architecture directory
+        if platform in ("a2a3", "a2a3sim"):
+            self.platform_dir = self.project_root / "src" / "a2a3" / "platform"
+        elif platform in ("a5", "a5sim"):
+            self.platform_dir = self.project_root / "src" / "a5" / "platform"
+        else:
+            raise ValueError(f"Unknown platform: {platform}")
 
         # Create toolchain objects based on platform
-        if platform == "a2a3":
+        if platform in ("a2a3", "a5"):
             env_manager.ensure("ASCEND_HOME_PATH")
             self.ccec = CCECToolchain()
             self.aarch64 = Aarch64GxxToolchain()
@@ -78,7 +80,7 @@ class KernelCompiler:
             List of include directory paths (e.g., for device_runner.h, core_type.h)
         """
         return [
-            str(self.platform_dir.parent / "include"),  # For common headers like core_type.h
+            str(self.platform_dir / "include"),  # For common headers like core_type.h
         ]
 
     def get_orchestration_include_dirs(self, runtime_name: str) -> List[str]:
@@ -94,7 +96,15 @@ class KernelCompiler:
             List of include directory paths:
             [runtime_dir, platform_host_dir, platform_include_dir]
         """
-        runtime_dir = str(self.project_root / "src" / "runtime" / runtime_name / "runtime")
+        # Map platform to runtime architecture
+        if self.platform in ("a2a3", "a2a3sim"):
+            arch = "a2a3"
+        elif self.platform in ("a5", "a5sim"):
+            arch = "a5"  # Phase 2: A5 uses A5 runtime
+        else:
+            arch = "a2a3"
+
+        runtime_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "runtime")
         return [runtime_dir] + self.get_platform_include_dirs()
 
     def _get_orchestration_config(self, runtime_name: str) -> Tuple[List[str], List[str]]:
@@ -111,7 +121,15 @@ class KernelCompiler:
         Returns:
             (include_dirs, source_files) — both as absolute paths, or ([], [])
         """
-        config_path = self.project_root / "src" / "runtime" / runtime_name / "build_config.py"
+        # Map platform to runtime architecture
+        if self.platform in ("a2a3", "a2a3sim"):
+            arch = "a2a3"
+        elif self.platform in ("a5", "a5sim"):
+            arch = "a5"  # Phase 2: A5 uses A5 runtime
+        else:
+            arch = "a2a3"
+
+        config_path = self.project_root / "src" / arch / "runtime" / runtime_name / "build_config.py"
         if not config_path.is_file():
             return [], []
 
@@ -265,7 +283,12 @@ class KernelCompiler:
         # Determine toolchain from C++ (with fallback to platform-based logic)
         incore_toolchain = self._get_toolchain(
             get_incore_compiler,
-            {"a2a3": ToolchainType.CCEC, "a2a3sim": ToolchainType.HOST_GXX_15}
+            {
+                "a2a3": ToolchainType.CCEC,
+                "a2a3sim": ToolchainType.HOST_GXX_15,
+                "a5": ToolchainType.CCEC,  # Phase 1: A5 uses same as A2A3
+                "a5sim": ToolchainType.HOST_GXX_15  # Phase 1: A5sim uses same as A2A3sim
+            }
         )
 
         # Dispatch based on toolchain
@@ -348,7 +371,12 @@ class KernelCompiler:
         # Resolve toolchain: HOST_GXX needs no runtime-specific extras
         toolchain_type = self._get_toolchain(
             get_orchestration_compiler,
-            {"a2a3": ToolchainType.AARCH64_GXX, "a2a3sim": ToolchainType.HOST_GXX}
+            {
+                "a2a3": ToolchainType.AARCH64_GXX,
+                "a2a3sim": ToolchainType.HOST_GXX,
+                "a5": ToolchainType.AARCH64_GXX,  # Phase 1: A5 uses same as A2A3
+                "a5sim": ToolchainType.HOST_GXX  # Phase 1: A5sim uses same as A2A3sim
+            }
         )
         toolchain = self.aarch64 if toolchain_type == ToolchainType.AARCH64_GXX else self.host_gxx
 

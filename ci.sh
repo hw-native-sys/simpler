@@ -41,11 +41,26 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Discover all runtimes from src/{arch}/runtime/
+ALL_RUNTIMES=()
+for arch_dir in src/*/runtime; do
+    if [[ -d "$arch_dir" ]]; then
+        for rt_dir in "$arch_dir"/*; do
+            if [[ -d "$rt_dir" && -f "$rt_dir/build_config.py" ]]; then
+                rt_name=$(basename "$rt_dir")
+                # Add to list if not already present
+                if [[ ! " ${ALL_RUNTIMES[*]} " =~ " ${rt_name} " ]]; then
+                    ALL_RUNTIMES+=("$rt_name")
+                fi
+            fi
+        done
+    fi
+done
+
 # Validate runtime if specified
 if [[ -n "$RUNTIME" ]]; then
-    VALID_RUNTIMES=("host_build_graph" "aicpu_build_graph" "tensormap_and_ringbuffer")
     RUNTIME_VALID=false
-    for r in "${VALID_RUNTIMES[@]}"; do
+    for r in "${ALL_RUNTIMES[@]}"; do
         if [[ "$RUNTIME" == "$r" ]]; then
             RUNTIME_VALID=true
             break
@@ -53,7 +68,7 @@ if [[ -n "$RUNTIME" ]]; then
     done
     if [[ "$RUNTIME_VALID" == "false" ]]; then
         echo "Unknown runtime: $RUNTIME"
-        echo "Valid runtimes: ${VALID_RUNTIMES[*]}"
+        echo "Valid runtimes: ${ALL_RUNTIMES[*]}"
         exit 1
     fi
 fi
@@ -75,10 +90,60 @@ echo "Running tests on $OS..."
 
 OVERALL_EXIT=0
 
+# Dynamically discover platform-to-runtime mapping from src/ directory structure
+# Use parallel arrays instead of associative arrays for bash 3 compatibility
+PLATFORM_KEYS=()
+PLATFORM_VALUES=()
+
+for arch_dir in src/*/; do
+    [[ -d "$arch_dir" ]] || continue
+    arch=$(basename "$arch_dir")
+
+    # Get runtimes for this architecture
+    runtimes=()
+    rt_dir="${arch_dir}runtime"
+    if [[ -d "$rt_dir" ]]; then
+        for rt in "$rt_dir"/*; do
+            if [[ -d "$rt" && -f "$rt/build_config.py" ]]; then
+                runtimes+=($(basename "$rt"))
+            fi
+        done
+    fi
+
+    # Sort runtimes
+    IFS=$'\n' runtimes=($(sort <<<"${runtimes[*]}"))
+    unset IFS
+    runtime_str="${runtimes[*]}"
+
+    # Add platforms if they exist
+    if [[ -d "${arch_dir}platform/onboard" ]]; then
+        PLATFORM_KEYS+=("$arch")
+        PLATFORM_VALUES+=("$runtime_str")
+    fi
+    if [[ -d "${arch_dir}platform/sim" ]]; then
+        PLATFORM_KEYS+=("${arch}sim")
+        PLATFORM_VALUES+=("$runtime_str")
+    fi
+done
+
+# Helper function to get platform runtimes (bash 3 compatible)
+get_platform_runtimes() {
+    local platform="$1"
+    local i
+    for i in "${!PLATFORM_KEYS[@]}"; do
+        if [[ "${PLATFORM_KEYS[$i]}" == "$platform" ]]; then
+            echo "${PLATFORM_VALUES[$i]}"
+            return 0
+        fi
+    done
+    echo ""
+}
+
 # Run pytest synchronously first
-if [[ -d "tests" && "$OS" == "Linux" && "$PLATFORM" != "a2a3sim" ]]; then
-    echo "Running pytest tests..."
-    if ! pytest tests -v; then
+# Skip pytest for all simulation platforms (a2a3sim, a5sim, etc.)
+if [[ -d "tests" && "$OS" == "Linux" && ! "$PLATFORM" =~ sim$ ]]; then
+    echo "Running pytest tests for platform: $PLATFORM..."
+    if ! pytest tests -v --platform="$PLATFORM"; then
         echo "PYTEST FAILED"
         OVERALL_EXIT=1
     fi
@@ -146,19 +211,28 @@ while IFS= read -r -d '' example_dir; do
     [[ -f "$kernel_config" && -f "$golden" ]] || continue
 
     example_name="${example_dir#$EXAMPLES_DIR/}"
+    example_runtime="${example_name%%/*}"  # Extract runtime from path
 
     # Filter by runtime if specified
     if [[ -n "$RUNTIME" && "$example_name" != "$RUNTIME"/* ]]; then
         continue
     fi
 
+    # Filter by platform's supported runtimes
     if [[ -n "$PLATFORM" ]]; then
-        if [[ "$PLATFORM" == "a2a3" ]]; then
-            HW_TASK_NAMES+=("example:${example_name}")
-            HW_TASK_DIRS+=("${example_dir}")
-        else
+        platform_runtimes="$(get_platform_runtimes "$PLATFORM")"
+        if [[ ! " $platform_runtimes " =~ " $example_runtime " ]]; then
+            continue  # Skip unsupported runtime for this platform
+        fi
+    fi
+
+    if [[ -n "$PLATFORM" ]]; then
+        if [[ "$PLATFORM" =~ sim$ ]]; then
             SIM_TASK_NAMES+=("example:${example_name}")
             SIM_TASK_DIRS+=("${example_dir}")
+        else
+            HW_TASK_NAMES+=("example:${example_name}")
+            HW_TASK_DIRS+=("${example_dir}")
         fi
     elif [[ "$OS" == "Darwin" ]]; then
         SIM_TASK_NAMES+=("example:${example_name}")
@@ -174,7 +248,7 @@ done < <(find "$EXAMPLES_DIR" -mindepth 1 -type d -print0 | sort -z)
 # Discover device tests (hardware only)
 if [[ -d "$DEVICE_TESTS_DIR" ]]; then
     RUN_DEVICE_TESTS=false
-    [[ "$PLATFORM" == "a2a3" ]] && RUN_DEVICE_TESTS=true
+    [[ -n "$PLATFORM" && ! "$PLATFORM" =~ sim$ ]] && RUN_DEVICE_TESTS=true
     [[ -z "$PLATFORM" && "$OS" == "Linux" ]] && RUN_DEVICE_TESTS=true
 
     if [[ "$RUN_DEVICE_TESTS" == "true" ]]; then
@@ -183,19 +257,34 @@ if [[ -d "$DEVICE_TESTS_DIR" ]]; then
             golden="${test_dir}/golden.py"
             [[ -f "$kernel_config" && -f "$golden" ]] || continue
             test_name="${test_dir#$DEVICE_TESTS_DIR/}"
+            test_runtime="${test_name%%/*}"  # Extract runtime from path
+
             # Filter by runtime if specified
             if [[ -n "$RUNTIME" && "$test_name" != "$RUNTIME"/* ]]; then
                 continue
             fi
+
+            # Filter by platform's supported runtimes
+            if [[ -n "$PLATFORM" ]]; then
+                platform_runtimes="$(get_platform_runtimes "$PLATFORM")"
+                if [[ ! " $platform_runtimes " =~ " $test_runtime " ]]; then
+                    continue  # Skip unsupported runtime for this platform
+                fi
+            fi
+
             HW_TASK_NAMES+=("device_test:${test_name}")
             HW_TASK_DIRS+=("${test_dir}")
         done < <(find "$DEVICE_TESTS_DIR" -mindepth 1 -type d -print0 | sort -z)
     else
-        echo "Skipping device tests (a2a3 hardware only)"
+        echo "Skipping device tests (hardware platforms only)"
     fi
 fi
 
 echo "Discovered ${#HW_TASK_NAMES[@]} hardware tasks, ${#SIM_TASK_NAMES[@]} simulation tasks"
+
+# Determine platforms for execution
+HW_PLATFORM="${PLATFORM:-a2a3}"
+SIM_PLATFORM="${PLATFORM:-a2a3sim}"
 
 MAX_RETRIES=3
 
@@ -256,7 +345,7 @@ run_sim_tasks() {
         local -a pids=()
         for idx in "${indices[@]}"; do
             (
-                if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" a2a3sim "$attempt"; then
+                if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" "$SIM_PLATFORM" "$attempt"; then
                     echo "${idx}|PASS" >> "$sim_marker"
                 else
                     echo "${idx}|FAIL" >> "$sim_marker"
@@ -267,7 +356,7 @@ run_sim_tasks() {
         for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
     else
         for idx in "${indices[@]}"; do
-            if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" a2a3sim "$attempt"; then
+            if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" "$SIM_PLATFORM" "$attempt"; then
                 echo "${idx}|PASS" >> "$sim_marker"
             else
                 echo "${idx}|FAIL" >> "$sim_marker"
@@ -314,7 +403,7 @@ run_hw_tasks() {
 
                 IFS=':' read -r idx attempt <<< "$entry"
 
-                if run_task "${HW_TASK_NAMES[$idx]}" "${HW_TASK_DIRS[$idx]}" a2a3 "$attempt" "$device_id"; then
+                if run_task "${HW_TASK_NAMES[$idx]}" "${HW_TASK_DIRS[$idx]}" "$HW_PLATFORM" "$attempt" "$device_id"; then
                     echo "${idx}|PASS" >> "$hw_marker"
                 else
                     next=$((attempt + 1))
@@ -364,42 +453,85 @@ fi
 # Deduplicate results: a task may have multiple entries (fail then pass on retry).
 # Keep the last result per task name+platform — the final outcome.
 # Use composite key (task_name|platform) so SIM and HW results don't collide.
-declare -A FINAL_RESULTS=()
-declare -A FINAL_DISPLAY=()
-declare -A FINAL_PLATFORM=()
-declare -A FINAL_DEVICE=()
-declare -A FINAL_ATTEMPT=()
-declare -A FINAL_TIMING=()
-declare -a TASK_ORDER=()
+# Use parallel arrays for bash 3 compatibility
+FINAL_KEYS=()
+FINAL_RESULTS=()
+FINAL_DISPLAY=()
+FINAL_PLATFORM=()
+FINAL_DEVICE=()
+FINAL_ATTEMPT=()
+FINAL_TIMING=()
+TASK_ORDER=()
+
+# Helper functions for key-value operations (bash 3 compatible)
+find_key_index() {
+    local key="$1"
+    local i
+    for i in "${!FINAL_KEYS[@]}"; do
+        if [[ "${FINAL_KEYS[$i]}" == "$key" ]]; then
+            echo "$i"
+            return 0
+        fi
+    done
+    echo ""
+}
+
+set_result() {
+    local key="$1"
+    local result="$2"
+    local display="$3"
+    local platform="$4"
+    local device="$5"
+    local attempt="$6"
+    local timing="$7"
+
+    local idx
+    idx=$(find_key_index "$key")
+
+    if [[ -z "$idx" ]]; then
+        # New key
+        FINAL_KEYS+=("$key")
+        FINAL_RESULTS+=("$result")
+        FINAL_DISPLAY+=("$display")
+        FINAL_PLATFORM+=("$platform")
+        FINAL_DEVICE+=("$device")
+        FINAL_ATTEMPT+=("$attempt")
+        FINAL_TIMING+=("$timing")
+        TASK_ORDER+=("$key")
+    else
+        # Update existing key
+        FINAL_RESULTS[$idx]="$result"
+        FINAL_DISPLAY[$idx]="$display"
+        FINAL_PLATFORM[$idx]="$platform"
+        FINAL_DEVICE[$idx]="$device"
+        FINAL_ATTEMPT[$idx]="$attempt"
+        FINAL_TIMING[$idx]="$timing"
+    fi
+}
 
 while IFS='|' read -r task_name platform result extra1 extra2 timing; do
     key="${task_name}|${platform}"
-    if [[ -z "${FINAL_RESULTS[$key]+x}" ]]; then
-        TASK_ORDER+=("$key")
-    fi
-    FINAL_RESULTS["$key"]="$result"
-    FINAL_DISPLAY["$key"]="$task_name"
-    FINAL_PLATFORM["$key"]="$platform"
-    FINAL_DEVICE["$key"]="${extra1#device:}"
-    FINAL_ATTEMPT["$key"]="${extra2#attempt:}"
-    FINAL_TIMING["$key"]="$timing"
+    device="${extra1#device:}"
+    attempt="${extra2#attempt:}"
+    set_result "$key" "$result" "$task_name" "$platform" "$device" "$attempt" "$timing"
 done < "$RESULTS_FILE"
 
 FAIL_COUNT=0
 PASS_COUNT=0
-declare -a FAIL_KEYS=()
-for key in "${TASK_ORDER[@]}"; do
-    result="${FINAL_RESULTS[$key]}"
+FAIL_KEYS=()
+for i in "${!TASK_ORDER[@]}"; do
+    result="${FINAL_RESULTS[$i]}"
     if [[ "$result" == "FAIL" ]]; then
         ((FAIL_COUNT++))
-        FAIL_KEYS+=("$key")
+        FAIL_KEYS+=("$i")
     else
         ((PASS_COUNT++))
     fi
 done
 
 # Print failure logs first (long output goes here, before the summary table)
-for key in "${FAIL_KEYS[@]}"; do
+for i in "${FAIL_KEYS[@]}"; do
+    key="${TASK_ORDER[$i]}"
     IFS='|' read -r task_name platform <<< "$key"
     safe_name="${task_name//[:\/]/_}"
     for attempt_log in "${LOG_DIR}/${safe_name}_${platform}_attempt"*.log; do
@@ -426,8 +558,8 @@ else
 fi
 
 TASK_COL_WIDTH=4
-for key in "${TASK_ORDER[@]}"; do
-    task_name="${FINAL_DISPLAY[$key]}"
+for i in "${!TASK_ORDER[@]}"; do
+    task_name="${FINAL_DISPLAY[$i]}"
     if [[ ${#task_name} -gt $TASK_COL_WIDTH ]]; then
         TASK_COL_WIDTH=${#task_name}
     fi
@@ -457,9 +589,9 @@ TASK_DIVIDER=$(printf '%*s' "$TASK_COL_WIDTH" '' | tr ' ' '-')
 printf "%s\n" "$SUMMARY_HEADER"
 printf "%-*s %-8s %-6s %-7s %-6s %s\n" "$TASK_COL_WIDTH" "$TASK_DIVIDER" "--------" "------" "-------" "----" "------"
 
-for key in "${TASK_ORDER[@]}"; do
-    task_name="${FINAL_DISPLAY[$key]}"
-    result="${FINAL_RESULTS[$key]}"
+for i in "${!TASK_ORDER[@]}"; do
+    task_name="${FINAL_DISPLAY[$i]}"
+    result="${FINAL_RESULTS[$i]}"
 
     if [[ ${#task_name} -gt $TASK_COL_WIDTH ]]; then
         task_display="${task_name:0:$((TASK_COL_WIDTH - 3))}..."
@@ -467,10 +599,10 @@ for key in "${TASK_ORDER[@]}"; do
         task_display="$task_name"
     fi
 
-    platform="${FINAL_PLATFORM[$key]}"
-    device="${FINAL_DEVICE[$key]}"
-    attempt="${FINAL_ATTEMPT[$key]}"
-    timing="${FINAL_TIMING[$key]}"
+    platform="${FINAL_PLATFORM[$i]}"
+    device="${FINAL_DEVICE[$i]}"
+    attempt="${FINAL_ATTEMPT[$i]}"
+    timing="${FINAL_TIMING[$i]}"
 
     if [[ "$result" == "FAIL" ]]; then
         printf "%-*s %-8s %-6s %-7s %-6s %sFAIL%s\n" \
