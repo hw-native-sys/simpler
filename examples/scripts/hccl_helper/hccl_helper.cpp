@@ -74,7 +74,6 @@ struct HcclDeviceContext {
     uint64_t windowsOut[HCCL_MAX_RANK_NUM];
 };
 
-static constexpr int HCCL_SUCCESS = 0;
 static constexpr int RT_STREAM_PRIORITY_DEFAULT = 0;
 
 // ---------------------------------------------------------------------------
@@ -94,7 +93,9 @@ int hccl_helper_get_root_info(int device_id, void* out_buf, unsigned buf_size) {
     aclError e = aclrtSetDevice(device_id);
     if (e != ACL_SUCCESS)
         return -static_cast<int>(e);
-    int ret = HcclGetRootInfo(out_buf);
+    // HcclGetRootInfo expects HcclRootInfo* (opaque struct, typically 1024 bytes)
+    auto* root = reinterpret_cast<HcclRootInfo*>(out_buf);
+    int ret = HcclGetRootInfo(root);
     return (ret == HCCL_SUCCESS) ? 0 : -ret;
 }
 
@@ -127,13 +128,13 @@ int hccl_helper_init_comm(
     if (rtRet != 0 || stream == nullptr)
         return rtRet != 0 ? -rtRet : -1;
 
-    void* comm = nullptr;
+    HcclComm comm = nullptr;
+    auto* root = reinterpret_cast<const HcclRootInfo*>(root_info);
     int hret = HcclCommInitRootInfo(
         static_cast<uint32_t>(n_ranks),
-        const_cast<void*>(root_info),
+        root,
         static_cast<uint32_t>(rank_id),
-        &comm
-    );
+        &comm);
     if (hret != HCCL_SUCCESS || comm == nullptr) {
         rtStreamDestroy(stream);
         return hret != HCCL_SUCCESS ? -hret : -1;
