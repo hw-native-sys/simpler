@@ -478,6 +478,8 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     uint64_t sched_complete_cycle = 0;
     uint64_t sched_dispatch_cycle = 0;
     uint64_t sched_idle_cycle = 0;
+    uint64_t complete_probe_count = 0;
+    uint64_t complete_hit_count = 0;
     uint64_t sched_loop_count = 0;
     uint64_t notify_edges_total = 0;
     int32_t  notify_max_degree = 0;
@@ -535,9 +537,18 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             int reg_state = EXTRACT_TASK_STATE(reg_val);
 
             // Only accept FIN state with matching task_id
-            if (executing_task_ids_[core_id] != AICPU_TASK_INVALID &&
-                reg_task_id == executing_task_ids_[core_id] &&
-                reg_state == TASK_FIN_STATE) {
+            bool completed_match = (executing_task_ids_[core_id] != AICPU_TASK_INVALID &&
+                                    reg_task_id == executing_task_ids_[core_id] &&
+                                    reg_state == TASK_FIN_STATE);
+#if PTO2_PROFILING
+            if (profiling_enabled) {
+                complete_probe_count++;
+                if (completed_match) {
+                    complete_hit_count++;
+                }
+            }
+#endif
+            if (completed_match) {
 
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                 int32_t task_id = executing_task_ids_[core_id];
@@ -769,6 +780,15 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         (unsigned long long)fanin_edges_total,
         fanin_max_degree,
         fanin_avg);
+    uint64_t complete_miss_count = (complete_probe_count > complete_hit_count)
+        ? (complete_probe_count - complete_hit_count) : 0;
+    double complete_hit_rate = complete_probe_count > 0
+        ? complete_hit_count * 100.0 / complete_probe_count : 0.0;
+    DEV_ALWAYS("Thread %d:     complete_poll: hit=%llu, miss=%llu, hit_rate=%.1f%%",
+        thread_idx,
+        (unsigned long long)complete_hit_count,
+        (unsigned long long)complete_miss_count,
+        complete_hit_rate);
     DEV_ALWAYS("Thread %d:   scan:        %.3fus (%.1f%%)",
         thread_idx,
         cycles_to_us(sched_scan_cycle),
