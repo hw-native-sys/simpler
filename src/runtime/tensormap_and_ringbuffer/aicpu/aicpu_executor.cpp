@@ -467,7 +467,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     const int STALL_DUMP_READY_MAX = 8;
     const int STALL_DUMP_WAIT_MAX = 4;
     const int STALL_DUMP_CORE_MAX = 8;
-    bool profiling_enabled = runtime->enable_profiling; 
+    bool profiling_enabled = runtime->enable_profiling;
     int32_t last_reported_task_count = 0;
 
     // Scheduler profiling counters
@@ -578,7 +578,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 cur_thread_tasks_in_flight--;
                 cur_thread_completed++;
                 made_progress = true;
-		comp_task_cnt++;
+                comp_task_cnt++;
             }
         }
         completed_tasks_.fetch_add(comp_task_cnt, std::memory_order_release);
@@ -586,11 +586,11 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 #if PTO2_PROFILING
         // Debug: periodic progress (thread 0 only) to find which task hangs
         if (thread_idx == 0 && task_count > 0) {
-               int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-               if (c <= PROGRESS_VERBOSE_THRESHOLD || c % PROGRESS_LOG_INTERVAL == 0 || c == task_count) {
-                    DEV_ALWAYS("PTO2 progress: completed=%d total=%d (%.1f%%)",
-                              c, task_count, task_count > 0 ? 100.0 * c / task_count : 0.0);
-               }
+            int32_t c = completed_tasks_.load(std::memory_order_relaxed);
+            if (c <= PROGRESS_VERBOSE_THRESHOLD || c % PROGRESS_LOG_INTERVAL == 0 || c == task_count) {
+                DEV_ALWAYS("PTO2 progress: completed=%d total=%d (%.1f%%)",
+                          c, task_count, task_count > 0 ? 100.0 * c / task_count : 0.0);
+            }
         }
         if (profiling_enabled && phase_complete_count > 0) {
             perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_COMPLETE,
@@ -798,7 +798,8 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     clock_gettime(CLOCK_MONOTONIC, &end_time);
     uint64_t start = (uint64_t)start_time.tv_sec * 1000000000 + start_time.tv_nsec;
     uint64_t end = (uint64_t)end_time.tv_sec * 1000000000 + end_time.tv_nsec;
-    DEV_ALWAYS("thread_idx,%d, scheduler_time/ns,%d", thread_idx, (end - start));
+    DEV_ALWAYS("thread_idx,%d, scheduler_time/ns,%llu",
+               thread_idx, static_cast<unsigned long long>(end - start));
     // Flush performance buffers for cores managed by this thread
     if (profiling_enabled) {
         perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, core_num);
