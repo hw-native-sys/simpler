@@ -467,13 +467,13 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     const int STALL_DUMP_READY_MAX = 8;
     const int STALL_DUMP_WAIT_MAX = 4;
     const int STALL_DUMP_CORE_MAX = 8;
-    const int PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
-    const int PROGRESS_LOG_INTERVAL = 25;       // log every N completions after threshold
-    bool profiling_enabled = runtime->enable_profiling;
+    bool profiling_enabled = runtime->enable_profiling; 
     int32_t last_reported_task_count = 0;
 
     // Scheduler profiling counters
 #if PTO2_PROFILING
+    const int PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
+    const int PROGRESS_LOG_INTERVAL = 25;       // log every N completions after threshold
     uint64_t sched_scan_cycle = 0;
     uint64_t sched_complete_cycle = 0;
     uint64_t sched_dispatch_cycle = 0;
@@ -489,6 +489,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     uint32_t phase_complete_count = 0;
     uint32_t phase_dispatch_count = 0;
 #endif
+
+    struct timespec start_time;
+    clock_gettime(CLOCK_MONOTONIC, &start_time);
 
     while (true) {
 #if PTO2_PROFILING
@@ -525,6 +528,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         // tail overhead (time from AICore done to AICPU recording finish).
 
         // Phase 1: Process completed tasks (register-based completion detection)
+        int comp_task_cnt = 0;
         for (int i = 0; i < core_num; i++) {
             int core_id = cur_thread_cores[i];
             uint64_t reg_addr = core_id_to_reg_addr_[core_id];
@@ -541,14 +545,16 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                 int32_t task_id = executing_task_ids_[core_id];
-                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id);
 #if PTO2_PROFILING
+                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id);
                 notify_edges_total += cstats.fanout_edges;
                 if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
                 notify_tasks_enqueued += cstats.tasks_enqueued;
                 fanin_edges_total += cstats.fanin_edges;
                 if (cstats.fanin_edges > fanin_max_degree) fanin_max_degree = cstats.fanin_edges;
                 phase_complete_count++;
+#else
+                rt->scheduler.on_task_complete(task_id);
 #endif
                 executing_task_ids_[core_id] = AICPU_TASK_INVALID;
 
@@ -568,25 +574,24 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         }
                     }
                 }
-
                 DEV_DEBUG("Thread %d: Core %d completed PTO2 task %d", thread_idx, core_id, task_id);
-
                 cur_thread_tasks_in_flight--;
                 cur_thread_completed++;
                 made_progress = true;
-                completed_tasks_.fetch_add(1, std::memory_order_release);
-                // Debug: periodic progress (thread 0 only) to find which task hangs
-                if (thread_idx == 0 && task_count > 0) {
-                    int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-                    if (c <= PROGRESS_VERBOSE_THRESHOLD || c % PROGRESS_LOG_INTERVAL == 0 || c == task_count) {
-                        DEV_ALWAYS("PTO2 progress: completed=%d total=%d last_task_id=%d (%.1f%%)",
-                                  c, task_count, task_id, task_count > 0 ? 100.0 * c / task_count : 0.0);
-                    }
-                }
+		comp_task_cnt++;
             }
         }
+        completed_tasks_.fetch_add(comp_task_cnt, std::memory_order_release);
         CYCLE_COUNT_LAP(sched_complete_cycle);
 #if PTO2_PROFILING
+        // Debug: periodic progress (thread 0 only) to find which task hangs
+        if (thread_idx == 0 && task_count > 0) {
+               int32_t c = completed_tasks_.load(std::memory_order_relaxed);
+               if (c <= PROGRESS_VERBOSE_THRESHOLD || c % PROGRESS_LOG_INTERVAL == 0 || c == task_count) {
+                    DEV_ALWAYS("PTO2 progress: completed=%d total=%d (%.1f%%)",
+                              c, task_count, task_count > 0 ? 100.0 * c / task_count : 0.0);
+               }
+        }
         if (profiling_enabled && phase_complete_count > 0) {
             perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_COMPLETE,
                                     _t0_phase, _t1, sched_loop_count, phase_complete_count);
@@ -789,6 +794,11 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     }
 #endif
 
+    struct timespec end_time;
+    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    uint64_t start = (uint64_t)start_time.tv_sec * 1000000000 + start_time.tv_nsec;
+    uint64_t end = (uint64_t)end_time.tv_sec * 1000000000 + end_time.tv_nsec;
+    DEV_ALWAYS("thread_idx,%d, scheduler_time/ns,%d", thread_idx, (end - start));
     // Flush performance buffers for cores managed by this thread
     if (profiling_enabled) {
         perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, core_num);
