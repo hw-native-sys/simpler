@@ -124,7 +124,8 @@ def hccl_init_comm(
     stream = c_void_p()
 
     buf = create_string_buffer(len(root_info))
-    buf.raw[: len(root_info)] = root_info
+    # copy bytes into mutable buffer
+    ctypes.memmove(buf, root_info, len(root_info))
 
     ret = _lib_helper.hccl_helper_init_comm(
         rank_id,
