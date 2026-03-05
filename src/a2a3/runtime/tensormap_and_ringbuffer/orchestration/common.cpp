@@ -68,6 +68,7 @@ static std::string addr_to_line(const char* executable, void* addr,
  * 通过 dladdr 定位每个栈帧所在的共享库，并用相对地址调用 addr2line
  */
 std::string get_stacktrace(int skip_frames) {
+    (void)skip_frames;  // May be unused on non-Linux platforms
     std::string result;
 #ifdef __linux__
     const int max_frames = 64;
