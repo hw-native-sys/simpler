@@ -704,8 +704,16 @@ class CodeRunner:
 
         from concurrent.futures import ThreadPoolExecutor, Future
 
+        # Map platform to runtime architecture
+        if self.platform in ("a2a3", "a2a3sim"):
+            arch = "a2a3"
+        elif self.platform in ("a5", "a5sim"):
+            arch = "a5"  # Phase 2: A5 uses A5 runtime
+        else:
+            arch = "a2a3"
+
         runtime_include_dirs = [
-            os.path.join(self.project_root, "src", "runtime", self.runtime_name, "runtime")
+            os.path.join(self.project_root, "src", arch, "runtime", self.runtime_name, "runtime")
         ]
 
         def _build_runtime():
@@ -725,7 +733,7 @@ class CodeRunner:
                 pto_isa_root=pto_isa_root,
                 extra_include_dirs=runtime_include_dirs,
             )
-            if self.platform == "a2a3sim":
+            if self.platform.endswith("sim"):
                 kernel_bin = incore_o
             else:
                 kernel_bin = extract_text_section(incore_o)

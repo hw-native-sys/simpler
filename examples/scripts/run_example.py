@@ -118,8 +118,8 @@ Golden.py interface:
     parser.add_argument(
         "-p", "--platform",
         default="a2a3",
-        choices=["a2a3", "a2a3sim"],
-        help="Platform name: 'a2a3' for hardware, 'a2a3sim' for simulation (default: a2a3)"
+        choices=["a2a3", "a2a3sim", "a5", "a5sim"],
+        help="Platform name: 'a2a3'/'a5' for hardware, 'a2a3sim'/'a5sim' for simulation (default: a2a3)"
     )
 
     parser.add_argument(

@@ -22,13 +22,22 @@ class RuntimeBuilder:
         Initialize RuntimeBuilder with platform selection.
 
         Args:
-            platform: Target platform ("a2a3" or "a2a3sim")
+            platform: Target platform ("a2a3", "a2a3sim", "a5", or "a5sim")
         """
         self.platform = platform
 
         runtime_root = Path(__file__).parent.parent
         self.runtime_root = runtime_root
-        self.runtime_dir = runtime_root / "src" / "runtime"
+
+        # Map platform to architecture-specific runtime directory
+        if platform in ("a2a3", "a2a3sim"):
+            arch = "a2a3"
+        elif platform in ("a5", "a5sim"):
+            arch = "a5"  # Phase 2: A5 uses A5 runtime
+        else:
+            raise ValueError(f"Unknown platform: {platform}")
+
+        self.runtime_dir = runtime_root / "src" / arch / "runtime"
 
         # Discover available runtime implementations
         self._runtimes = {}

@@ -65,21 +65,30 @@ class RuntimeCompiler:
     def __init__(self, platform: str = "a2a3"):
         self.platform = platform
         self.project_root = Path(__file__).parent.parent
-        self.platform_dir = self.project_root / "src" / "platform" / platform
+
+        # Map platform name to architecture path
+        if platform == "a2a3":
+            self.platform_dir = self.project_root / "src" / "a2a3" / "platform" / "onboard"
+        elif platform == "a2a3sim":
+            self.platform_dir = self.project_root / "src" / "a2a3" / "platform" / "sim"
+        elif platform == "a5":
+            self.platform_dir = self.project_root / "src" / "a5" / "platform" / "onboard"
+        elif platform == "a5sim":
+            self.platform_dir = self.project_root / "src" / "a5" / "platform" / "sim"
+        else:
+            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
 
         if not self.platform_dir.is_dir():
             raise ValueError(
                 f"Platform '{platform}' not found at {self.platform_dir}"
             )
 
-        if platform == "a2a3":
-            self._init_a2a3()
-        elif platform == "a2a3sim":
-            self._init_a2a3sim()
+        if platform in ("a2a3", "a5"):
+            self._init_a2a3()  # Phase 1: A5 uses A2A3 toolchain
+        elif platform in ("a2a3sim", "a5sim"):
+            self._init_a2a3sim()  # Phase 1: A5sim uses A2A3sim toolchain
         else:
-            raise ValueError(
-                f"Unknown platform: {platform}. Supported: a2a3, a2a3sim"
-            )
+            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
 
     def _init_a2a3(self):
         """Initialize toolchains for real a2a3 hardware."""

@@ -16,12 +16,10 @@
 class MemoryAllocator;
 
 /**
- * Get AICore register base addresses for all cores
- *
- * @param regs Output vector (AIC cores followed by AIV cores)
- * @param device_id Device ID
+ * AICore bitmap buffer length for DAV_2201
+ * Used for querying valid AICore cores via halGetDeviceInfoByBuff
  */
-void get_aicore_regs(std::vector<int64_t>& regs, uint64_t device_id);
+constexpr uint8_t PLATFORM_AICORE_MAP_BUFF_LEN = 2;
 
 /**
  * Initialize AICore register addresses for runtime
