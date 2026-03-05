@@ -286,7 +286,8 @@ Golden.py interface:
             import multiprocessing as mp
             from hccl_bindings import hccl_get_root_info, HCCL_ROOT_INFO_BYTES
 
-            root_info_arr = mp.Array("b", HCCL_ROOT_INFO_BYTES)
+            # Shared buffer for HcclRootInfo: use unsigned char ('B') to match bytes 0-255
+            root_info_arr = mp.Array("B", HCCL_ROOT_INFO_BYTES)
             barrier = mp.Barrier(n_devices)
 
             def _comm_worker(rank_id):
