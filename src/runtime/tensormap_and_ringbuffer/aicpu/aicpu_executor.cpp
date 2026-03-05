@@ -491,7 +491,10 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 #endif
 
     struct timespec start_time;
-    clock_gettime(CLOCK_MONOTONIC, &start_time);
+    if (clock_gettime(CLOCK_MONOTONIC, &start_time) != 0) {
+        DEV_ERROR("clock_gettime for start_time failed, aborting dispatch. errno=%d", errno);
+        return -1;
+    }
 
     while (true) {
 #if PTO2_PROFILING
@@ -795,7 +798,10 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 #endif
 
     struct timespec end_time;
-    clock_gettime(CLOCK_MONOTONIC, &end_time);
+    if (clock_gettime(CLOCK_MONOTONIC, &end_time) != 0) {
+        DEV_WARN("clock_gettime for end_time failed, scheduler timing will be inaccurate. errno=%d", errno);
+        end_time = start_time;
+    }
     uint64_t start = (uint64_t)start_time.tv_sec * 1000000000 + start_time.tv_nsec;
     uint64_t end = (uint64_t)end_time.tv_sec * 1000000000 + end_time.tv_nsec;
     DEV_ALWAYS("thread_idx,%d, scheduler_time/ns,%llu",
