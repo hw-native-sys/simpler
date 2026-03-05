@@ -60,12 +60,17 @@ Only proceed with the comments the user explicitly selects. Do NOT auto-resolve 
 
 ## Step 6: Work Location Setup
 
-Work directly on the PR branch. If not already on `$HEAD_BRANCH`, checkout and pull:
+Work directly on the PR branch. Setup depends on permission level:
 
+**For owner/write permission:**
 ```bash
 git checkout $HEAD_BRANCH
 git pull "$PUSH_REMOTE" "$HEAD_BRANCH"
 ```
+
+**For maintainer permission (cross-fork PR):**
+
+Run [checkout-fork-branch](../../lib/github/checkout-fork-branch.md) to create/switch to the local working branch and set the push refspec.
 
 If in a worktree on different branch, offer to create new worktree or switch to main repo.
 

@@ -5,10 +5,15 @@ description: Create or update a GitHub pull request after committing, rebasing, 
 
 # GitHub Pull Request Workflow
 
+## Input
+
+Accept optional PR number (`123`, `#123`) to update a specific PR, or no input (auto-detect from current branch).
+
 ## Setup
 
 1. [Setup](../../lib/github/setup.md) — authenticate and detect context (role, remotes, state)
-2. [Lookup PR](../../lib/github/lookup-pr.md) by branch name to check for existing PR
+2. [Lookup PR](../../lib/github/lookup-pr.md) by PR number (if provided) or branch name to check for existing PR
+3. **If PR number provided:** Run [detect-permission](../../lib/github/detect-permission.md) to setup cross-fork push target
 
 ## Route
 
@@ -95,6 +100,12 @@ Auto-generate title and body from the commit message. Keep title under 72 charac
 ## Path B: Update Existing PR
 
 Display the existing PR with `gh pr view`.
+
+### B0. Setup Work Branch (if updating cross-fork PR)
+
+If PR number was provided and permission is "maintainer" (cross-fork with maintainerCanModify), run [checkout-fork-branch](../../lib/github/checkout-fork-branch.md) to create/switch to the local working branch and set the push refspec.
+
+For owner/write permission, work directly on the existing branch.
 
 ### B1. Commit Changes
 

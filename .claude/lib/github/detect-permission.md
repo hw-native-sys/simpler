@@ -45,7 +45,7 @@ case "$PERMISSION" in
     FORK_REMOTE="pr-$PR_NUMBER"
     if ! git remote | grep -q "^${FORK_REMOTE}$"; then
       git remote add "$FORK_REMOTE" \
-        "https://github.com/$HEAD_REPO_OWNER/$HEAD_REPO_NAME.git"
+        "git@github.com:$HEAD_REPO_OWNER/$HEAD_REPO_NAME.git"
     fi
     git fetch "$FORK_REMOTE" "$HEAD_BRANCH"
     PUSH_REMOTE="$FORK_REMOTE"
