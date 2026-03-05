@@ -458,7 +458,8 @@ int hccl_helper_init_comm(
 
     *out_comm = comm;
     *out_ctx_ptr = deviceCtxPtr;
-    *out_win_base = hostCtx.windowsIn[rank_id];
+    // 使用 HcclDeviceContext 自带的 rankId 作为本地窗口索引，避免 Python 侧 rank_id 与 HCCL 内部 localUsrRankId 不一致
+    *out_win_base = hostCtx.windowsIn[hostCtx.rankId];
     *out_stream = stream;
     return 0;
 }
