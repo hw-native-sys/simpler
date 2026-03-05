@@ -9,53 +9,32 @@ Intelligently triage PR review comments, address actionable feedback, and resolv
 
 ## Input
 
-Accept PR number (`123`, `#123`) or branch name (`feature-branch`).
+Accept PR number (`123`, `#123`), branch name (`feature-branch`), or no input (auto-detect).
 
-## Workflow
+## Setup
 
-1. Match input to PR
-2. Fetch unresolved comments
-3. Classify comments
-4. Get user confirmation on ALL comments
-5. Address user-selected comments with code changes
-6. Reply and resolve threads
+1. [Setup](../../lib/github/setup.md) — authenticate and detect context (role, remotes, state)
 
 ## Step 1: Match Input to PR
 
-```bash
-# PR number
-gh pr view <number> --json number,title,headRefName,state
+Use [lookup-pr](../../lib/github/lookup-pr.md) to find the PR.
 
-# Branch name
-git branch --show-current
-gh pr list --head <branch> --json number,title,state
-```
+- If PR number or branch name provided: use "By PR number" or "By branch name" lookup
+- If no input: auto-detect from current branch, or list open PRs for user selection
 
-## Step 2: Fetch Unresolved Comments
+Validate PR state: OPEN (continue), CLOSED (warn), MERGED (exit).
 
-```bash
-gh api graphql -f query='
-query {
-  repository(owner: "ChaoWao", name: "simpler") {
-    pullRequest(number: <number>) {
-      reviewThreads(first: 50) {
-        nodes {
-          id isResolved
-          comments(first: 1) {
-            nodes { id databaseId body path line }
-          }
-        }
-      }
-    }
-  }
-}'
-```
+## Step 2: Detect Permission
 
-Filter to `isResolved: false` only.
+Run [detect-permission](../../lib/github/detect-permission.md) to determine push access.
 
-**If no unresolved comments exist:** Inform the user that all PR comments have been resolved and exit the workflow. Do not proceed to subsequent steps.
+## Step 3: Fetch Unresolved Comments
 
-## Step 3: Classify Comments
+Run [fetch-comments](../../lib/github/fetch-comments.md).
+
+If no unresolved comments exist, inform user and exit.
+
+## Step 4: Classify Comments
 
 | Category | Description | Examples |
 | -------- | ----------- | -------- |
@@ -65,7 +44,7 @@ Filter to `isResolved: false` only.
 
 Present summary showing category, file:line, and issue for each comment. For Category B, explain why code may already comply with `.claude/rules/`.
 
-## Step 4: Get User Confirmation
+## Step 5: Get User Confirmation
 
 **Always let the user decide which comments to address and which to skip.** Present ALL unresolved comments (A, B, and C) in a numbered list with their classification and brief summary.
 
@@ -79,55 +58,43 @@ Ask the user to specify which comments to address, skip, or discuss:
 
 Only proceed with the comments the user explicitly selects. Do NOT auto-resolve any comment without user consent.
 
-## Step 5: Address Comments
+## Step 6: Work Location Setup
 
-For user-selected comments only:
+Work directly on the PR branch. If not already on `$HEAD_BRANCH`, checkout and pull:
+
+```bash
+git checkout $HEAD_BRANCH
+git pull "$PUSH_REMOTE" "$HEAD_BRANCH"
+```
+
+If in a worktree on different branch, offer to create new worktree or switch to main repo.
+
+## Step 7: Address Comments
+
+For each "Address" comment:
 
 1. Read files with Read tool
 2. Make changes with Edit tool
-3. Commit using `/git-commit` skill
+3. After all changes, commit using `/git-commit` skill
 
-## Step 6: Resolve Comments
+Then run [commit-and-push](../../lib/github/commit-and-push.md):
+1. Rebase onto `$BASE_REF`
+2. Ensure single valid commit (squash with original PR commit)
+3. Push (update push with `--force-with-lease` to `$PUSH_REMOTE`)
 
-Reply using:
+## Step 8: Reply and Resolve
 
-```bash
-gh api repos/ChaoWao/simpler/pulls/<number>/comments/<comment_id>/replies -f body="..."
-```
-
-Then resolve thread with GraphQL `resolveReviewThread` mutation.
-
-**Response templates:**
-
-- Fixed: "Fixed in `<commit>` — description"
-- Skip: "Current code follows `.claude/rules/<file>`"
-- Acknowledged: "Acknowledged, thank you!"
-
-## Best Practices
-
-| Area | Guidelines |
-| ---- | ---------- |
-| **Analysis** | Reference `.claude/rules/`; when unsure → Category B |
-| **Changes** | Read full context; minimal edits; follow project conventions |
-| **Communication** | Be respectful; explain reasoning; reference rules |
-
-## Error Handling
-
-| Error | Action |
-| ----- | ------ |
-| PR not found | `gh pr list`; ask user to confirm |
-| Not authenticated | "Run: `gh auth login`" |
-| No unresolved comments | Inform user all comments resolved; exit workflow |
-| Unclear comment | Mark Category B for discussion |
+Use [reply-and-resolve](../../lib/github/reply-and-resolve.md) for each comment.
 
 ## Checklist
 
-- [ ] PR matched and validated
+- [ ] PR matched, permission determined, comments fetched and classified
 - [ ] Unresolved comments fetched and classified
 - [ ] ALL comments presented to user for selection
 - [ ] Code changes made and committed (use `/git-commit`)
-- [ ] Changes pushed to `origin`
-- [ ] All comments replied to and resolved
+- [ ] Changes pushed (single valid commit, squashed with original PR commit)
+- [ ] All selected comments replied to and resolved
+- [ ] Summary presented
 
 ## Remember
 
