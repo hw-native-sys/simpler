@@ -13,24 +13,26 @@ description: Testing guide and pre-commit testing strategy for PTO Runtime. Use 
 
 ## Running Tests
 
+**Important**: Always read `.github/workflows/ci.yml` first to extract the current `-c` (pto-isa commit) and `-t` (timeout) flags. These ensure reproducible builds by pinning the PTO-ISA dependency to a known-good commit.
+
 ```bash
 # Python unit tests
 pytest tests -v
 
-# All simulation tests
-./ci.sh -p a2a3sim
+# All simulation tests (extract -c and -t from ci.yml)
+./ci.sh -p a2a3sim -c <commit> -t <timeout>
 
-# All hardware tests (auto-detect idle devices — see Pre-Commit Testing Strategy)
-./ci.sh -p a2a3 -d <range>
+# All hardware tests (extract -c and -t from ci.yml, auto-detect idle devices)
+./ci.sh -p a2a3 -d <range> -c <commit> -t <timeout>
 
 # Single runtime
-./ci.sh -p a2a3sim -r host_build_graph
+./ci.sh -p a2a3sim -r host_build_graph -c <commit> -t <timeout>
 
 # Single example
 python examples/scripts/run_example.py \
     -k examples/host_build_graph/vector_example/kernels \
     -g examples/host_build_graph/vector_example/golden.py \
-    -p a2a3sim
+    -p a2a3sim -c <commit>
 ```
 
 ## Pre-Commit Testing Strategy
