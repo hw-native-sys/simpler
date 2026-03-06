@@ -18,12 +18,6 @@
 #ifndef PTO_SCHEDULER_H
 #define PTO_SCHEDULER_H
 
-// PTO2_PROFILING must be defined before inline methods that use it.
-// Default ON; disable with -DPTO2_PROFILING=0.
-#ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
-#endif
-
 #include <atomic>
 
 #include "pto_runtime2_types.h"

@@ -37,11 +37,6 @@
 #include "common/platform_config.h"
 #include "aicpu/platform_regs.h"
 
-// Scheduler profiling helper
-#ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
-#endif
-
 #if PTO2_PROFILING
 // Accumulated nanoseconds per sub-step
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
