@@ -50,10 +50,33 @@ def generate_inputs(params: dict) -> list:
     if N <= 0:
         raise ValueError(f"N must be positive, got {N}")
 
+    # Prevent integer overflow in orchestration (task_idx = b * M + m or b * N + n)
+    INT32_MAX = 2**31 - 1
+    if batch * M > INT32_MAX:
+        raise ValueError(f"batch * M = {batch * M} exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
+    if batch * N > INT32_MAX:
+        raise ValueError(f"batch * N = {batch * N} exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
+
     # Fixed sizes: matmul 128x128x128, add 64x128
     matmul_size = 128
     add_rows = 64
     add_cols = 128
+
+    # Prevent excessive memory allocation
+    total_matmul_elements = batch * M * matmul_size * matmul_size
+    total_add_elements = batch * N * add_rows * add_cols
+
+    # Limit single tensor to 10GB (adjustable based on system)
+    MAX_TENSOR_GB = 10
+    MAX_ELEMENTS = MAX_TENSOR_GB * 1024**3 // 4  # 4 bytes per float32
+
+    matmul_gb = total_matmul_elements * 4 / 1024**3
+    add_gb = total_add_elements * 4 / 1024**3
+
+    if total_matmul_elements > MAX_ELEMENTS:
+        raise ValueError(f"Matmul tensor too large: {matmul_gb:.2f} GB (max {MAX_TENSOR_GB} GB)")
+    if total_add_elements > MAX_ELEMENTS:
+        raise ValueError(f"Add tensor too large: {add_gb:.2f} GB (max {MAX_TENSOR_GB} GB)")
 
     # If random_seed is False, use fixed seed (42); if True, use random seed
     if not random_seed:

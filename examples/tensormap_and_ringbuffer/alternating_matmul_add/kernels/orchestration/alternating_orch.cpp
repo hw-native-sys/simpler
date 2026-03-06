@@ -1,14 +1,14 @@
 /**
  * Alternating Matmul-Add Orchestration Function (tensormap_and_ringbuffer Runtime)
  *
- * Submits independent matmul and add tasks in fixed alternating order.
+ * Submits independent matmul and add tasks per batch.
  *
  * Configuration (from config tensor):
  *   - batch: Number of batches
  *   - M: Number of matmul tasks per batch
  *   - N: Number of add tasks per batch
  *
- * Task pattern: [matmul_0, add_0, matmul_1, add_1, ...]
+ * Task pattern per batch: [matmul_0, ..., matmul_{M-1}, add_0, ..., add_{N-1}]
  * All tasks are completely independent (no dependencies).
  *
  * Args layout: [ptr_A, ptr_B, ptr_C, ptr_X, ptr_Y, ptr_Z,
@@ -93,15 +93,15 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     uint64_t matmul_tile_shapes[1] = {MATMUL_ELEMS};
     uint64_t add_tile_shapes[1] = {ADD_ELEMS};
 
-    int total_matmul = batch * M;
-    int total_add = batch * N;
-    int max_tasks = (total_matmul > total_add) ? total_matmul : total_add;
+    int total_matmul = 0;
+    int total_add = 0;
 
-    for (int i = 0; i < max_tasks; i++) {
-        if (i < total_matmul) {
-            uint64_t offset = (uint64_t)i * MATMUL_ELEMS;
-
-
+    // Iterate over batches: for each batch, submit all M matmul tasks, then all N add tasks
+    for (int b = 0; b < batch; b++) {
+        // First, submit all M matmul tasks for this batch
+        for (int m = 0; m < M; m++) {
+            int task_idx = b * M + m;
+            uint64_t offset = (uint64_t)task_idx * MATMUL_ELEMS;
             uint64_t view_offsets[1] = {offset};
 
             Tensor A_view = ext_A.view(matmul_tile_shapes, view_offsets);
@@ -115,12 +115,13 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
             };
             pto2_rt_submit_task(rt, FUNC_MATMUL, PTO2_WORKER_CUBE,
                                params_matmul, 3);
+            total_matmul++;
         }
 
-        if (i < total_add) {
-            uint64_t offset = (uint64_t)i * ADD_ELEMS;
-
-
+        // Then, submit all N add tasks for this batch
+        for (int n = 0; n < N; n++) {
+            int task_idx = b * N + n;
+            uint64_t offset = (uint64_t)task_idx * ADD_ELEMS;
             uint64_t view_offsets[1] = {offset};
 
             Tensor X_view = ext_X.view(add_tile_shapes, view_offsets);
@@ -134,6 +135,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
             };
             pto2_rt_submit_task(rt, FUNC_ADD, PTO2_WORKER_VECTOR,
                                params_add, 3);
+            total_add++;
         }
     }
 
