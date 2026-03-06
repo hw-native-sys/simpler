@@ -73,8 +73,16 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     int batch = (int)config[0];
     int M = (int)config[1];
     int N = (int)config[2];
+    int matmul_batch = (int)config[3];
+    int add_batch = (int)config[4];
 
-    LOG_INFO(rt, "[alternating_orch] Batch: %d, M: %d, N: %d", batch, M, N);
+    LOG_INFO(rt, "[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d",
+             batch, M, N, matmul_batch, add_batch);
+
+    int total_matmul_tasks = batch * M;
+    int total_add_tasks = batch * N;
+    int num_matmul_groups = total_matmul_tasks / matmul_batch;
+    int num_add_groups = total_add_tasks / add_batch;
 
     uint64_t ext_A_shapes[1] = {size_A / sizeof(float)};
     Tensor ext_A = make_tensor_external(dev_A, ext_A_shapes, 1, DataType::FLOAT32);
@@ -90,57 +98,55 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     uint64_t ext_Z_shapes[1] = {size_Z / sizeof(float)};
     Tensor ext_Z = make_tensor_external(dev_Z, ext_Z_shapes, 1, DataType::FLOAT32);
 
-    uint64_t matmul_tile_shapes[1] = {MATMUL_ELEMS};
-    uint64_t add_tile_shapes[1] = {ADD_ELEMS};
-
     int total_matmul = 0;
     int total_add = 0;
 
-    // Iterate over batches: for each batch, submit all M matmul tasks, then all N add tasks
-    for (int b = 0; b < batch; b++) {
-        // First, submit all M matmul tasks for this batch
-        for (int m = 0; m < M; m++) {
-            int task_idx = b * M + m;
-            uint64_t offset = (uint64_t)task_idx * MATMUL_ELEMS;
-            uint64_t view_offsets[1] = {offset};
+    // Submit matmul groups
+    for (int group_idx = 0; group_idx < num_matmul_groups; group_idx++) {
+        int start_task_idx = group_idx * matmul_batch;
+        uint64_t offset = (uint64_t)start_task_idx * MATMUL_ELEMS;
+        uint64_t group_size = (uint64_t)matmul_batch * MATMUL_ELEMS;
 
-            Tensor A_view = ext_A.view(matmul_tile_shapes, view_offsets);
-            Tensor B_view = ext_B.view(matmul_tile_shapes, view_offsets);
-            Tensor C_view = ext_C.view(matmul_tile_shapes, view_offsets);
+        uint64_t matmul_group_shapes[1] = {group_size};
+        uint64_t view_offsets[1] = {offset};
 
-            PTOParam params_matmul[] = {
-                make_input_param(A_view),
-                make_input_param(B_view),
-                make_output_param(C_view),
-            };
-            pto2_rt_submit_task(rt, FUNC_MATMUL, PTO2_WORKER_CUBE,
-                               params_matmul, 3);
-            total_matmul++;
-        }
+        Tensor A_view = ext_A.view(matmul_group_shapes, view_offsets);
+        Tensor B_view = ext_B.view(matmul_group_shapes, view_offsets);
+        Tensor C_view = ext_C.view(matmul_group_shapes, view_offsets);
 
-        // Then, submit all N add tasks for this batch
-        for (int n = 0; n < N; n++) {
-            int task_idx = b * N + n;
-            uint64_t offset = (uint64_t)task_idx * ADD_ELEMS;
-            uint64_t view_offsets[1] = {offset};
-
-            Tensor X_view = ext_X.view(add_tile_shapes, view_offsets);
-            Tensor Y_view = ext_Y.view(add_tile_shapes, view_offsets);
-            Tensor Z_view = ext_Z.view(add_tile_shapes, view_offsets);
-
-            PTOParam params_add[] = {
-                make_input_param(X_view),
-                make_input_param(Y_view),
-                make_output_param(Z_view),
-            };
-            pto2_rt_submit_task(rt, FUNC_ADD, PTO2_WORKER_VECTOR,
-                               params_add, 3);
-            total_add++;
-        }
+        PTOParam params_matmul[] = {
+            make_input_param(A_view),
+            make_input_param(B_view),
+            make_output_param(C_view),
+        };
+        pto2_rt_submit_task(rt, FUNC_MATMUL, PTO2_WORKER_CUBE, params_matmul, 3);
+        total_matmul++;
     }
 
-    LOG_INFO(rt, "[alternating_orch] Submitted %d matmul tasks and %d add tasks",
-                  total_matmul, total_add);
+    // Submit add groups
+    for (int group_idx = 0; group_idx < num_add_groups; group_idx++) {
+        int start_task_idx = group_idx * add_batch;
+        uint64_t offset = (uint64_t)start_task_idx * ADD_ELEMS;
+        uint64_t group_size = (uint64_t)add_batch * ADD_ELEMS;
+
+        uint64_t add_group_shapes[1] = {group_size};
+        uint64_t view_offsets[1] = {offset};
+
+        Tensor X_view = ext_X.view(add_group_shapes, view_offsets);
+        Tensor Y_view = ext_Y.view(add_group_shapes, view_offsets);
+        Tensor Z_view = ext_Z.view(add_group_shapes, view_offsets);
+
+        PTOParam params_add[] = {
+            make_input_param(X_view),
+            make_input_param(Y_view),
+            make_output_param(Z_view),
+        };
+        pto2_rt_submit_task(rt, FUNC_ADD, PTO2_WORKER_VECTOR, params_add, 3);
+        total_add++;
+    }
+
+    LOG_INFO(rt, "[alternating_orch] Submitted %d matmul groups and %d add groups",
+             total_matmul, total_add);
 }
 
 }  // extern "C"

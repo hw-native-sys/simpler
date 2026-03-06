@@ -25,15 +25,16 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
+static __aicore__ inline int get_num_tiles(__gm__ TensorData* tensor, uint64_t tile_elems) {
+    uint64_t total_elems = tensor->shapes[0];
+    return static_cast<int>(total_elems / tile_elems);
+}
+
 template <int ROWS, int COLS>
 static __aicore__ void add_impl(
-    __gm__ TensorData* src0_tensor,
-    __gm__ TensorData* src1_tensor,
-    __gm__ TensorData* out_tensor) {
-
-    __gm__ float* src0 = reinterpret_cast<__gm__ float*>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
-    __gm__ float* src1 = reinterpret_cast<__gm__ float*>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
-    __gm__ float* out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr) + out_tensor->start_offset;
+    __gm__ float* src0,
+    __gm__ float* src1,
+    __gm__ float* out) {
 
     using DynShapeDim5 = Shape<1, 1, 1, ROWS, COLS>;
     using DynStridDim5 = Stride<1, 1, 1, COLS, 1>;
@@ -59,12 +60,27 @@ static __aicore__ void add_impl(
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(dstGlobal, dstTile);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 }
 
-extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ TensorData* src0_tensor = reinterpret_cast<__gm__ TensorData*>(args[0]);
     __gm__ TensorData* src1_tensor = reinterpret_cast<__gm__ TensorData*>(args[1]);
     __gm__ TensorData* out_tensor = reinterpret_cast<__gm__ TensorData*>(args[2]);
 
-    add_impl<64, 128>(src0_tensor, src1_tensor, out_tensor);
+    constexpr uint64_t TILE_ELEMS = 64 * 128;
+    int num_tiles = get_num_tiles(src0_tensor, TILE_ELEMS);
+
+    __gm__ float* base_src0 = reinterpret_cast<__gm__ float*>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
+    __gm__ float* base_src1 = reinterpret_cast<__gm__ float*>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
+    __gm__ float* base_out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr) + out_tensor->start_offset;
+
+    for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
+        __gm__ float* src0_ptr = base_src0 + (tile_idx * TILE_ELEMS);
+        __gm__ float* src1_ptr = base_src1 + (tile_idx * TILE_ELEMS);
+        __gm__ float* out_ptr = base_out + (tile_idx * TILE_ELEMS);
+
+        add_impl<64, 128>(src0_ptr, src1_ptr, out_ptr);
+    }
 }

@@ -19,20 +19,24 @@ ATOL = 1e-3
 
 ALL_CASES = {
     "case1": {
-        "batch": 32,
-        "M": 1,  # Number of matmul tasks per batch
-        "N": 1,  # Number of add tasks per batch
-        "random_seed": False,  # False = use fixed seed (42), True = random seed
+        "batch": 512,
+        "M": 2,  # Number of matmul tasks per batch
+        "N": 5,  # Number of add tasks per batch
+        "random_seed": True,  # False = use fixed seed (42), True = random seed
+        "matmul_batch": 2,  # Number of matmul tiles per task
+        "add_batch": 5,  # Number of add tiles per task
     },
     "case2": {
-        "batch": 64,
+        "batch": 1024,
         "M": 1,
         "N": 1,
-        "random_seed": True,
+        "random_seed": False,
+        "matmul_batch": 1,
+        "add_batch": 1,
     },
 }
 
-DEFAULT_CASE = "case1"
+DEFAULT_CASE = "case2"
 
 
 def generate_inputs(params: dict) -> list:
@@ -41,6 +45,8 @@ def generate_inputs(params: dict) -> list:
     M = params["M"]
     N = params["N"]
     random_seed = params.get("random_seed", False)
+    matmul_batch = params.get("matmul_batch", 1)
+    add_batch = params.get("add_batch", 1)
 
     # Validate parameters
     if batch <= 0:
@@ -49,13 +55,32 @@ def generate_inputs(params: dict) -> list:
         raise ValueError(f"M must be positive, got {M}")
     if N <= 0:
         raise ValueError(f"N must be positive, got {N}")
+    if matmul_batch <= 0:
+        raise ValueError(f"matmul_batch must be positive, got {matmul_batch}")
+    if add_batch <= 0:
+        raise ValueError(f"add_batch must be positive, got {add_batch}")
+
+    # Validate divisibility for task grouping
+    total_matmul_tasks = batch * M
+    total_add_tasks = batch * N
+
+    if total_matmul_tasks % matmul_batch != 0:
+        raise ValueError(
+            f"total_matmul_tasks ({total_matmul_tasks}) must be "
+            f"divisible by matmul_batch ({matmul_batch})"
+        )
+    if total_add_tasks % add_batch != 0:
+        raise ValueError(
+            f"total_add_tasks ({total_add_tasks}) must be "
+            f"divisible by add_batch ({add_batch})"
+        )
 
     # Prevent integer overflow in orchestration (task_idx = b * M + m or b * N + n)
     INT32_MAX = 2**31 - 1
-    if batch * M > INT32_MAX:
-        raise ValueError(f"batch * M = {batch * M} exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
-    if batch * N > INT32_MAX:
-        raise ValueError(f"batch * N = {batch * N} exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
+    if total_matmul_tasks > INT32_MAX:
+        raise ValueError(f"total_matmul_tasks ({total_matmul_tasks}) exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
+    if total_add_tasks > INT32_MAX:
+        raise ValueError(f"total_add_tasks ({total_add_tasks}) exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
 
     # Fixed sizes: matmul 128x128x128, add 64x128
     matmul_size = 128
@@ -102,7 +127,7 @@ def generate_inputs(params: dict) -> list:
     Y_flat = Y.flatten()
     Z_flat = Z.flatten()
 
-    config = torch.tensor([batch, M, N], dtype=torch.int64)
+    config = torch.tensor([batch, M, N, matmul_batch, add_batch], dtype=torch.int64)
 
     return [
         ("A", A_flat),

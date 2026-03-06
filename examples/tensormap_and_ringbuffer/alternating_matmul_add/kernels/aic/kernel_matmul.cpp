@@ -35,15 +35,16 @@ AICORE constexpr inline T CeilAlign(T num_1, T num_2) {
     return (num_1 + num_2 - 1) / num_2 * num_2;
 }
 
+static __aicore__ inline int get_num_tiles(__gm__ TensorData* tensor, uint64_t tile_elems) {
+    uint64_t total_elems = tensor->shapes[0];
+    return static_cast<int>(total_elems / tile_elems);
+}
+
 template <int TILE>
 static __aicore__ void matmul_impl(
-    __gm__ TensorData* input_a_tensor,
-    __gm__ TensorData* input_b_tensor,
-    __gm__ TensorData* output_tensor) {
-
-    __gm__ float* input_a = reinterpret_cast<__gm__ float*>(input_a_tensor->buffer.addr) + input_a_tensor->start_offset;
-    __gm__ float* input_b = reinterpret_cast<__gm__ float*>(input_b_tensor->buffer.addr) + input_b_tensor->start_offset;
-    __gm__ float* output  = reinterpret_cast<__gm__ float*>(output_tensor->buffer.addr)  + output_tensor->start_offset;
+    __gm__ float* input_a,
+    __gm__ float* input_b,
+    __gm__ float* output) {
 
     constexpr int blockAlign = C0_SIZE_BYTE / sizeof(float);
     constexpr int M = CeilAlign<int>(TILE, 16);
@@ -98,6 +99,9 @@ static __aicore__ void matmul_impl(
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
     TSTORE(dstGlobal, cTile);
+
+    set_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_FIX, PIPE_MTE2, EVENT_ID0);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
@@ -105,5 +109,18 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ TensorData* input_b = reinterpret_cast<__gm__ TensorData*>(args[1]);
     __gm__ TensorData* output  = reinterpret_cast<__gm__ TensorData*>(args[2]);
 
-    matmul_impl<128>(input_a, input_b, output);
+    constexpr uint64_t TILE_ELEMS = 128 * 128;
+    int num_tiles = get_num_tiles(input_a, TILE_ELEMS);
+
+    __gm__ float* base_a = reinterpret_cast<__gm__ float*>(input_a->buffer.addr) + input_a->start_offset;
+    __gm__ float* base_b = reinterpret_cast<__gm__ float*>(input_b->buffer.addr) + input_b->start_offset;
+    __gm__ float* base_c = reinterpret_cast<__gm__ float*>(output->buffer.addr) + output->start_offset;
+
+    for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
+        __gm__ float* a_ptr = base_a + (tile_idx * TILE_ELEMS);
+        __gm__ float* b_ptr = base_b + (tile_idx * TILE_ELEMS);
+        __gm__ float* c_ptr = base_c + (tile_idx * TILE_ELEMS);
+
+        matmul_impl<128>(a_ptr, b_ptr, c_ptr);
+    }
 }
