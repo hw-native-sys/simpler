@@ -166,6 +166,9 @@ private:
     std::vector<AicpuPhaseRecord> collected_orch_phase_records_;
     AicpuOrchSummary collected_orch_summary_{};
     bool has_phase_data_{false};
+
+    // Core-to-thread mapping (core_id → scheduler thread index, -1 = unassigned)
+    std::vector<int8_t> core_to_thread_;
 };
 
 #endif  // PLATFORM_HOST_PERFORMANCE_COLLECTOR_H_

@@ -345,6 +345,15 @@ void PerformanceCollector::collect_phase_data() {
     }
 
     has_phase_data_ = (total_phase_records > 0 || orch_valid);
+
+    // Read core-to-thread mapping
+    int num_cores = static_cast<int>(phase_header->num_cores);
+    if (num_cores > 0 && num_cores <= PLATFORM_MAX_CORES) {
+        core_to_thread_.assign(phase_header->core_to_thread,
+                                phase_header->core_to_thread + num_cores);
+        LOG_INFO("  Core-to-thread mapping: %d cores", num_cores);
+    }
+
     LOG_INFO("Phase data collection complete: %d records (%zu orch), orch_summary=%s",
              total_phase_records, collected_orch_phase_records_.size(), orch_valid ? "yes" : "no");
 }
@@ -582,12 +591,23 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                         << ", \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
                         << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
                         << ", \"submit_idx\": " << pr.loop_iter
+                        << ", \"task_id\": " << static_cast<int32_t>(pr.tasks_processed)
                         << "}";
                 if (r < collected_orch_phase_records_.size() - 1) outfile << ",";
                 outfile << "\n";
             }
             outfile << "  ]";
         }
+    }
+
+    // Core-to-thread mapping
+    if (!core_to_thread_.empty()) {
+        outfile << ",\n  \"core_to_thread\": [";
+        for (size_t i = 0; i < core_to_thread_.size(); i++) {
+            outfile << static_cast<int>(core_to_thread_[i]);
+            if (i < core_to_thread_.size() - 1) outfile << ", ";
+        }
+        outfile << "]";
     }
 
     outfile << "\n}\n";
@@ -634,6 +654,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
     collected_perf_records_.clear();
     collected_phase_records_.clear();
     collected_orch_phase_records_.clear();
+    core_to_thread_.clear();
     has_phase_data_ = false;
     device_id_ = -1;
 

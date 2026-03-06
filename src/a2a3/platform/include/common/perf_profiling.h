@@ -269,8 +269,9 @@ struct AicpuPhaseHeader {
     uint32_t magic;                  // Validation magic (AICPU_PHASE_MAGIC)
     uint32_t num_sched_threads;      // Number of scheduler threads
     uint32_t records_per_thread;     // Max records per thread
-    uint32_t padding;                // Alignment padding
+    uint32_t num_cores;              // Total number of cores with valid assignments
     volatile uint32_t buffer_counts[PLATFORM_MAX_AICPU_THREADS];  // Per-thread record counts
+    int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
     AicpuOrchSummary orch_summary;   // Orchestrator cumulative data
 } __attribute__((aligned(64)));
 

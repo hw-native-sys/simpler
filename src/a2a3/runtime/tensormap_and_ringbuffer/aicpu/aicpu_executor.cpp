@@ -1093,6 +1093,15 @@ int AicpuExecutor::run(Runtime* runtime) {
 #endif
 #endif
 
+#if PTO2_PROFILING
+            // Write core-to-thread mapping (one-time, after orchestration)
+            if (runtime->enable_profiling) {
+                int sched_threads = (thread_num_ == 4) ? 3 : thread_num_;
+                perf_aicpu_write_core_assignments(core_assignments_, core_count_per_thread_,
+                                                   sched_threads, cores_total_num_);
+            }
+#endif
+
             // Signal orchestration complete in SM header (needs runtime alive)
             pto2_rt_orchestration_done(rt);
 

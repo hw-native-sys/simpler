@@ -290,7 +290,7 @@ def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
 
 def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose=False,
                                 scheduler_phases=None, orchestrator_data=None,
-                                orchestrator_phases=None):
+                                orchestrator_phases=None, core_to_thread=None):
     """Generate Chrome Trace Event Format JSON from task data.
 
     Args:
@@ -306,6 +306,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
         scheduler_phases: Optional list of per-thread phase record lists (version 2)
         orchestrator_data: Optional dict with orchestrator summary (version 2)
         orchestrator_phases: Optional list of per-task orchestrator phase records (version 2)
+        core_to_thread: Optional list mapping core_id (index) to scheduler thread index (-1 = unassigned)
 
     Generates processes in the trace:
         - pid=1 "AICore View": start_time_us to end_time_us (kernel execution)
@@ -654,18 +655,26 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
             end_us = record["end_time_us"]
             dur = end_us - start_us
             submit_idx = record.get("submit_idx", 0)
+            task_id = record.get("task_id", -1)
 
             # Strip "orch_" prefix for display name
             display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
 
+            # Show task_id in name for task-specific phases
+            if task_id >= 0:
+                label = f"{display_name}(t{task_id})"
+            else:
+                label = f"{display_name}({submit_idx})"
+
             event = {
                 "args": {
                     "phase": phase,
-                    "submit_idx": submit_idx
+                    "submit_idx": submit_idx,
+                    "task_id": task_id
                 },
                 "cat": "orchestrator",
                 "cname": orch_phase_colors.get(phase, "generic_work"),
-                "name": f"{display_name}({submit_idx})",
+                "name": label,
                 "ph": "X",
                 "pid": 4,
                 "tid": 4000,
@@ -748,27 +757,49 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
 
     # Scheduler DISPATCH → task execution arrows
     if scheduler_phases and has_aicpu_data:
-        # Build index of DISPATCH phase records per thread for fast lookup
-        dispatch_phases_by_thread = {}
-        for thread_idx, thread_records in enumerate(scheduler_phases):
-            dispatch_records = [r for r in thread_records if r.get("phase") == "dispatch"]
-            if dispatch_records:
-                dispatch_phases_by_thread[thread_idx] = dispatch_records
+        # Build core_id → scheduler thread mapping.
+        # Prefer explicit core_to_thread from perf JSON (written by AICPU after orchestration).
+        # Fall back to voting heuristic for older data without the mapping.
+        core_to_sched_thread = {}
+
+        if core_to_thread:
+            for core_id, thread_idx in enumerate(core_to_thread):
+                if thread_idx >= 0:
+                    core_to_sched_thread[core_id] = thread_idx
+            if verbose:
+                print(f"  Core-to-thread mapping: {len(core_to_sched_thread)} cores (from perf JSON)")
+        else:
+            # Fallback: infer via voting (for perf JSON without core_to_thread field)
+            dispatch_phases_by_thread = {}
+            for thread_idx, thread_records in enumerate(scheduler_phases):
+                dispatch_records = [r for r in thread_records if r.get("phase") == "dispatch"]
+                if dispatch_records:
+                    dispatch_phases_by_thread[thread_idx] = dispatch_records
+
+            from collections import defaultdict
+            core_thread_votes = defaultdict(lambda: defaultdict(int))
+            for task in tasks:
+                dispatch_us = task.get('dispatch_time_us', 0)
+                if dispatch_us <= 0:
+                    continue
+                core_id = task['core_id']
+                for thread_idx, dispatch_records in dispatch_phases_by_thread.items():
+                    for dr in dispatch_records:
+                        if dr["start_time_us"] <= dispatch_us <= dr["end_time_us"]:
+                            core_thread_votes[core_id][thread_idx] += 1
+                            break
+
+            for core_id, votes in core_thread_votes.items():
+                core_to_sched_thread[core_id] = max(votes, key=votes.get)
+            if verbose:
+                print(f"  Core-to-thread mapping: {len(core_to_sched_thread)} cores (inferred via voting)")
 
         for task in tasks:
             dispatch_us = task.get('dispatch_time_us', 0)
             if dispatch_us <= 0:
                 continue
 
-            # Find the scheduler DISPATCH phase that contains this dispatch timestamp
-            matched_thread = None
-            for thread_idx, dispatch_records in dispatch_phases_by_thread.items():
-                for dr in dispatch_records:
-                    if dr["start_time_us"] <= dispatch_us <= dr["end_time_us"]:
-                        matched_thread = thread_idx
-                        break
-                if matched_thread is not None:
-                    break
+            matched_thread = core_to_sched_thread.get(task['core_id'])
 
             if matched_thread is not None:
                 sched_tid = 3000 + matched_thread
@@ -817,6 +848,61 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                     "bp": "e"
                 })
                 flow_id += 1
+
+    # Orchestrator FINALIZE → Scheduler DISPATCH arrows (per task_id)
+    if orchestrator_phases and scheduler_phases:
+        # Collect orch_finalize records keyed by task_id
+        orch_finalize_by_task = {}
+        for record in orchestrator_phases:
+            if record.get("phase") == "orch_finalize":
+                tid = record.get("task_id", -1)
+                if tid >= 0:
+                    orch_finalize_by_task[tid] = record
+
+        # Use core_to_sched_thread mapping (built above) to find the correct
+        # scheduler thread for each task's core.
+        if orch_finalize_by_task and has_aicpu_data:
+            for task in tasks:
+                tid = task.get('task_id')
+                if tid is None or tid not in orch_finalize_by_task:
+                    continue
+
+                dispatch_us = task.get('dispatch_time_us', 0)
+                if dispatch_us <= 0:
+                    continue
+
+                finalize_rec = orch_finalize_by_task[tid]
+                # Use finalize start_time: init_task() runs at the beginning of FINALIZE,
+                # making the task dispatchable before FINALIZE ends. Using start avoids
+                # reverse arrows when the scheduler dispatches during FINALIZE.
+                finalize_start_us = finalize_rec["start_time_us"]
+
+                matched_thread = core_to_sched_thread.get(task['core_id'])
+
+                if matched_thread is not None:
+                    sched_tid = 3000 + matched_thread
+
+                    # Flow: Orchestrator finalize start → Scheduler DISPATCH
+                    events.append({
+                        "cat": "flow",
+                        "id": flow_id,
+                        "name": "orch→dispatch",
+                        "ph": "s",
+                        "pid": 4,
+                        "tid": 4000,
+                        "ts": finalize_start_us
+                    })
+                    events.append({
+                        "cat": "flow",
+                        "id": flow_id,
+                        "name": "orch→dispatch",
+                        "ph": "f",
+                        "pid": 3,
+                        "tid": sched_tid,
+                        "ts": dispatch_us,
+                        "bp": "e"
+                    })
+                    flow_id += 1
 
     if verbose:
         print(f"  Total events: {len(events)}")
@@ -941,6 +1027,7 @@ Examples:
         scheduler_phases = data.get('aicpu_scheduler_phases')
         orchestrator_data = data.get('aicpu_orchestrator')
         orchestrator_phases = data.get('aicpu_orchestrator_phases')
+        core_to_thread = data.get('core_to_thread')
 
         if args.verbose and data['version'] == 2:
             if scheduler_phases:
@@ -951,12 +1038,15 @@ Examples:
                 print(f"  Orchestrator: {orchestrator_data.get('submit_count', 0)} tasks")
             if orchestrator_phases:
                 print(f"  Orchestrator phases: {len(orchestrator_phases)} per-task records")
+            if core_to_thread:
+                print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 
         # Generate Perfetto JSON
         generate_chrome_trace_json(data['tasks'], str(output_path), func_names, args.verbose,
                                    scheduler_phases=scheduler_phases,
                                    orchestrator_data=orchestrator_data,
-                                   orchestrator_phases=orchestrator_phases)
+                                   orchestrator_phases=orchestrator_phases,
+                                   core_to_thread=core_to_thread)
 
         print(f"\n✓ Conversion complete")
         print(f"  Input:  {input_path}")

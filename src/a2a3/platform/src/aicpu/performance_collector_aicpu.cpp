@@ -310,12 +310,13 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads) {
     s_phase_header->magic = AICPU_PHASE_MAGIC;
     s_phase_header->num_sched_threads = num_sched_threads;
     s_phase_header->records_per_thread = PLATFORM_PHASE_RECORDS_PER_THREAD;
-    s_phase_header->padding = 0;
+    s_phase_header->num_cores = 0;
 
     for (int i = 0; i < PLATFORM_MAX_AICPU_THREADS; i++) {
         s_phase_header->buffer_counts[i] = 0;
     }
 
+    memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
     memset(&s_phase_header->orch_summary, 0, sizeof(AicpuOrchSummary));
 
     // Cache per-thread record pointers and clear buffers
@@ -383,7 +384,32 @@ void perf_aicpu_set_orch_thread_idx(int thread_idx) {
 
 void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
                                    uint64_t start_time, uint64_t end_time,
-                                   uint32_t submit_idx) {
+                                   uint32_t submit_idx, uint32_t task_id) {
     if (s_orch_thread_idx < 0 || s_phase_header == nullptr) return;
-    perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, 0);
+    perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
+}
+
+void perf_aicpu_write_core_assignments(const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD],
+                                        const int* core_counts,
+                                        int num_threads,
+                                        int total_cores) {
+    if (s_phase_header == nullptr) {
+        return;
+    }
+
+    memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
+    s_phase_header->num_cores = static_cast<uint32_t>(total_cores);
+
+    for (int t = 0; t < num_threads; t++) {
+        for (int i = 0; i < core_counts[t]; i++) {
+            int core_id = core_assignments[t][i];
+            if (core_id >= 0 && core_id < PLATFORM_MAX_CORES) {
+                s_phase_header->core_to_thread[core_id] = static_cast<int8_t>(t);
+            }
+        }
+    }
+
+    wmb();
+
+    LOG_INFO("Core-to-thread mapping written: %d cores, %d threads", total_cores, num_threads);
 }

@@ -32,7 +32,7 @@ __attribute__((weak)) uint64_t get_sys_cnt_aicpu() { return 0; }
 // Weak fallback for builds that don't link performance_collector_aicpu.cpp.
 // The strong symbol from the AICPU build wins when profiling is available.
 __attribute__((weak)) void perf_aicpu_record_orch_phase(
-    AicpuPhaseId, uint64_t, uint64_t, uint32_t) {}
+    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
 // Accumulated nanoseconds per sub-step
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // task ring alloc
@@ -59,16 +59,16 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 #endif
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id) do { \
+#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid) do { \
     _t1 = get_sys_cnt_aicpu(); \
     acc += (_t1 - _t0); \
-    perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx); \
+    perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
     _t0 = _t1; \
 } while(0)
 #else
 #define CYCLE_COUNT_START()
 #define CYCLE_COUNT_LAP(acc)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id)
+#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)
 #endif
 
 // =============================================================================
@@ -208,7 +208,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 #if PTO2_PROFILING
     uint64_t _se1 = get_sys_cnt_aicpu();
     g_orch_scope_end_cycle += (_se1 - _se0);
-    perf_aicpu_record_orch_phase(AicpuPhaseId::ORCH_SCOPE_END, _se0, _se1, g_orch_submit_idx);
+    perf_aicpu_record_orch_phase(AicpuPhaseId::ORCH_SCOPE_END, _se0, _se1, g_orch_submit_idx, -1);
 #endif
 }
 
@@ -222,7 +222,7 @@ void pto2_submit_task(
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
     orch->tensor_map.sync_tensormap();
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC);
+    CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, -1);
 
     // Submission without an open scope is illegal
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
@@ -230,7 +230,7 @@ void pto2_submit_task(
     // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
     int32_t task_id = orch->task_ring.pto2_task_ring_alloc();
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC);
+    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id);
 
     PTO2TaskDescriptor* task = pto2_task_ring_get(&orch->task_ring, task_id);
 
@@ -265,7 +265,7 @@ void pto2_submit_task(
         }
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS);
+    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, task_id);
 #if PTO2_ORCH_PROFILING
     g_orch_params_atomic_count += 2;  // fanout_lock.store + fanout_count.store
 #endif
@@ -288,7 +288,7 @@ void pto2_submit_task(
         task->packed_buffer_base = orch->pto2_alloc_packed_buffer(total_output_size);
         task->packed_buffer_end = (char*)task->packed_buffer_base + total_output_size;
     }
-    CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP);
+    CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP, task_id);
 #if PTO2_ORCH_PROFILING
     if (total_output_size > 0) {
         g_orch_heap_atomic_count += 1;  // heap_top.store in pto2_alloc_packed_buffer
@@ -356,7 +356,7 @@ void pto2_submit_task(
         }
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP);
+    CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id);
 
 
     // === STEP 4: Second pass - register outputs in TensorMap ===
@@ -369,7 +369,7 @@ void pto2_submit_task(
         }
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT);
+    CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT, task_id);
 
     // === STEP 5: Finalize fanin list ===
     // First build the fanin list
@@ -416,7 +416,7 @@ void pto2_submit_task(
 #endif
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN);
+    CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN, task_id);
 
 
     // === STEP 6: Initialize task in scheduler ===
@@ -428,7 +428,7 @@ void pto2_submit_task(
     // === STEP 7: Update shared memory with current task index ===
     orch->sm_handle->header->current_task_index.store(orch->task_ring.current_index, std::memory_order_release);
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_finalize_cycle, AicpuPhaseId::ORCH_FINALIZE);
+    CYCLE_COUNT_LAP_RECORD(g_orch_finalize_cycle, AicpuPhaseId::ORCH_FINALIZE, task_id);
 #if PTO2_ORCH_PROFILING
     // task_state.store + fanout_refcount.store + fanin_refcount.fetch_add
     // + current_task_index.store = 4
