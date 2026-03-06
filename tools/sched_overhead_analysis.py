@@ -35,18 +35,22 @@ def auto_select_perf_json():
 def parse_scheduler_threads(log_path):
     """Parse device log for PTO2 scheduler stats per thread.
 
-    Expected log format (per thread):
+    Supports two formats:
+    1. Detailed (PTO2_SCHED_PROFILING=1):
         Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
         Thread N: --- Phase Breakdown ---
         Thread N:   complete:    Xus (Y%)  [fanout: edges=A, max_degree=B, avg=C]  [fanin: edges=D, max_degree=E, avg=F]
         Thread N:   scan:        Xus (Y%)
         Thread N:   dispatch:    Xus (Y%)  [pop: hit=A, miss=B, hit_rate=C%]
         Thread N:   idle:        Xus (Y%)
+
+    2. Summary (PTO2_SCHED_PROFILING=0):
+        Thread N: Scheduler summary: total_time=Xus, loops=Y, tasks_scheduled=Z
     """
     threads = {}
     with open(log_path, 'r', errors='ignore') as f:
         for line in f:
-            # Summary: Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
+            # Detailed format: Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
             m = re.search(r'Thread (\d+): completed=(\d+) tasks in ([\d.]+)us \((\d+) loops, ([\d.]+) tasks/loop\)', line)
             if m:
                 tid = int(m.group(1))
@@ -55,6 +59,22 @@ def parse_scheduler_threads(log_path):
                     'total_us': float(m.group(3)),
                     'loops': int(m.group(4)),
                     'tasks_per_loop': float(m.group(5)),
+                }
+
+            # Summary format: Thread N: Scheduler summary: total_time=Xus, loops=Y, tasks_scheduled=Z
+            m = re.search(r'Thread (\d+): Scheduler summary: total_time=([\d.]+)us, loops=(\d+), tasks_scheduled=(\d+)', line)
+            if m:
+                tid = int(m.group(1))
+                total_us = float(m.group(2))
+                loops = int(m.group(3))
+                completed = int(m.group(4))
+                tasks_per_loop = completed / loops if loops > 0 else 0.0
+                threads[tid] = {
+                    'completed': completed,
+                    'total_us': total_us,
+                    'loops': loops,
+                    'tasks_per_loop': tasks_per_loop,
+                    'format': 'summary',  # Mark as summary format
                 }
 
             # Phase: complete [fanout: edges=X, max_degree=Y, avg=Z]  [fanin: edges=D, max_degree=E, avg=F]

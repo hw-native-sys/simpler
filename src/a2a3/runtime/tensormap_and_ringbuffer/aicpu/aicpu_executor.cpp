@@ -435,6 +435,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     if (!pto2_init_done_.exchange(true, std::memory_order_acq_rel)) {
         DEV_INFO("Thread %d: doing one-time init", thread_idx);
 
+#if PTO2_PROFILING
         // Assign perf buffers to cores early so profiling captures all tasks
         // (total_tasks written to header later when orchestrator completes)
         if (runtime->enable_profiling) {
@@ -444,6 +445,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             perf_aicpu_init_phase_profiling(runtime, sched_threads);
             perf_aicpu_set_orch_thread_idx(sched_threads);
         }
+#endif
 
         DEV_INFO("Thread %d: one-time init done", thread_idx);
         pto2_init_complete_.store(true, std::memory_order_release);
@@ -464,8 +466,10 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     const int STALL_DUMP_CORE_MAX = 8;
     const int PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
     const int PROGRESS_LOG_INTERVAL = 25;       // log every N completions after threshold
+#if PTO2_PROFILING
     bool profiling_enabled = runtime->enable_profiling;
     int32_t last_reported_task_count = 0;
+#endif
 
     // Scheduler profiling counters
 #if PTO2_PROFILING
@@ -544,10 +548,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             }
 #endif
             if (completed_match) {
-
-                PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                 int32_t task_id = executing_task_ids_[core_id];
 #if PTO2_PROFILING
+                PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                 PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id);
                 notify_edges_total += cstats.fanout_edges;
                 if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
@@ -560,6 +563,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 #endif
                 executing_task_ids_[core_id] = AICPU_TASK_INVALID;
 
+#if PTO2_PROFILING
                 // Write AICPU dispatch/finish timestamps into the PerfRecord
                 if (profiling_enabled) {
                     Handshake* h = &hank[core_id];
@@ -576,6 +580,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         }
                     }
                 }
+#endif
 
                 DEV_DEBUG("Thread %d: Core %d completed PTO2 task %d", thread_idx, core_id, task_id);
 
@@ -622,6 +627,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
                         PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                         build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
+#if PTO2_PROFILING
                         // Performance profiling: check if buffer needs switching
                         if (profiling_enabled) {
                             dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
@@ -631,6 +637,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                             }
                             core_dispatch_counts_[core_id]++;
                         }
+#endif
                         write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id + 1));
                         executing_task_ids_[core_id] = task_id;
                         cur_thread_tasks_in_flight++;
@@ -654,6 +661,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         }
 #endif
 
+#if PTO2_PROFILING
         // Update perf header total_tasks if visible tasks have changed
         {
             int32_t visible = header->current_task_index.load(std::memory_order_acquire);
@@ -666,6 +674,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 last_reported_task_count = visible;
             }
         }
+#endif
         CYCLE_COUNT_LAP(sched_scan_cycle);
 #if PTO2_PROFILING
         if (profiling_enabled) {
@@ -751,11 +760,15 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     }
 
 #if PTO2_PROFILING
-    if (profiling_enabled) {
+    // Scheduler summary logging (always print when PTO2_PROFILING=1)
     uint64_t sched_total =
         sched_complete_cycle + sched_scan_cycle + sched_dispatch_cycle + sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;  // avoid div-by-zero
+
+#if PTO2_SCHED_PROFILING
     double tasks_per_loop = sched_loop_count > 0 ? (double)cur_thread_completed / sched_loop_count : 0.0;
+
+    // Detailed output with full phase breakdown
     DEV_ALWAYS("Thread %d: completed=%d tasks in %.3fus (%llu loops, %.1f tasks/loop)",
         thread_idx,
         cur_thread_completed,
@@ -803,13 +816,21 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         thread_idx,
         cycles_to_us(sched_idle_cycle),
         sched_idle_cycle * 100.0 / sched_total);
-    }
+#endif
+    // Summary line (always print when PTO2_PROFILING=1)
+    DEV_ALWAYS("Thread %d: Scheduler summary: total_time=%.3fus, loops=%llu, tasks_scheduled=%d",
+        thread_idx,
+        cycles_to_us(sched_total),
+        (unsigned long long)sched_loop_count,
+        cur_thread_completed);
 #endif
 
+#if PTO2_PROFILING
     // Flush performance buffers for cores managed by this thread
     if (profiling_enabled) {
         perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, core_num);
     }
+#endif
 
     return cur_thread_completed;
 }
@@ -1002,57 +1023,58 @@ int AicpuExecutor::run(Runtime* runtime) {
 
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
-            if (runtime->enable_profiling) {
-                PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
-                uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle +
-                                 p.lookup_cycle + p.heap_cycle + p.insert_cycle +
-                                 p.fanin_cycle + p.finalize_cycle;
-                if (total == 0) total = 1;  // avoid div-by-zero
-                DEV_ALWAYS("Thread %d: === Orchestrator Profiling: %lld tasks, total=%.3fus ===", thread_idx,
-                         (long long)p.submit_count, cycles_to_us(total));
-                DEV_ALWAYS("Thread %d:   sync_tensormap : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.sync_cycle), p.sync_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread %d:   task_ring_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
-                    cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
-                    cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
-                    (unsigned long long)p.alloc_atomic_count);
-                DEV_ALWAYS("Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%llu", thread_idx,
-                    cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total,
-                    (unsigned long long)p.params_atomic_count);
-                DEV_ALWAYS("Thread %d:   lookup+dep     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.lookup_cycle), p.lookup_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread %d:   heap_alloc     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
-                    cycles_to_us(p.heap_cycle), p.heap_cycle * 100.0 / total,
-                    cycles_to_us(p.heap_cycle - p.heap_wait_cycle), cycles_to_us(p.heap_wait_cycle),
-                    (unsigned long long)p.heap_atomic_count);
-                DEV_ALWAYS("Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.insert_cycle), p.insert_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
-                    cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
-                    cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle),
-                    (unsigned long long)p.fanin_atomic_count);
-                DEV_ALWAYS("Thread %d:   finalize+SM    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
-                    cycles_to_us(p.finalize_cycle), p.finalize_cycle * 100.0 / total,
-                    cycles_to_us(p.finalize_cycle - p.finalize_wait_cycle), cycles_to_us(p.finalize_wait_cycle),
-                    (unsigned long long)p.finalize_atomic_count);
-                DEV_ALWAYS("Thread %d:   scope_end      : %.3fus  atomics=%llu", thread_idx,
-                    cycles_to_us(p.scope_end_cycle),
-                    (unsigned long long)p.scope_end_atomic_count);
-                DEV_ALWAYS("Thread %d:   avg/task       : %.3fus", thread_idx,
-                    p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0);
+            PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
+            uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle +
+                             p.lookup_cycle + p.heap_cycle + p.insert_cycle +
+                             p.fanin_cycle + p.finalize_cycle;
+            if (total == 0) total = 1;  // avoid div-by-zero
+            DEV_ALWAYS("Thread %d: === Orchestrator Profiling: %lld tasks, total=%.3fus ===", thread_idx,
+                     (long long)p.submit_count, cycles_to_us(total));
+            DEV_ALWAYS("Thread %d:   sync_tensormap : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.sync_cycle), p.sync_cycle * 100.0 / total);
+            DEV_ALWAYS("Thread %d:   task_ring_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
+                cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
+                cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
+                (unsigned long long)p.alloc_atomic_count);
+            DEV_ALWAYS("Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%llu", thread_idx,
+                cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total,
+                (unsigned long long)p.params_atomic_count);
+            DEV_ALWAYS("Thread %d:   lookup+dep     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.lookup_cycle), p.lookup_cycle * 100.0 / total);
+            DEV_ALWAYS("Thread %d:   heap_alloc     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
+                cycles_to_us(p.heap_cycle), p.heap_cycle * 100.0 / total,
+                cycles_to_us(p.heap_cycle - p.heap_wait_cycle), cycles_to_us(p.heap_wait_cycle),
+                (unsigned long long)p.heap_atomic_count);
+            DEV_ALWAYS("Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.insert_cycle), p.insert_cycle * 100.0 / total);
+            DEV_ALWAYS("Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
+                cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
+                cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle),
+                (unsigned long long)p.fanin_atomic_count);
+            DEV_ALWAYS("Thread %d:   finalize+SM    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
+                cycles_to_us(p.finalize_cycle), p.finalize_cycle * 100.0 / total,
+                cycles_to_us(p.finalize_cycle - p.finalize_wait_cycle), cycles_to_us(p.finalize_wait_cycle),
+                (unsigned long long)p.finalize_atomic_count);
+            DEV_ALWAYS("Thread %d:   scope_end      : %.3fus  atomics=%llu", thread_idx,
+                cycles_to_us(p.scope_end_cycle),
+                (unsigned long long)p.scope_end_atomic_count);
+            DEV_ALWAYS("Thread %d:   avg/task       : %.3fus", thread_idx,
+                p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0);
 
 #if PTO2_TENSORMAP_PROFILING
-                PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
-                DEV_ALWAYS("Thread %d: === TensorMap Lookup Stats ===", thread_idx);
-                DEV_ALWAYS("Thread %d:   lookups        : %llu, inserts: %llu", thread_idx,
-                    (unsigned long long)tp.lookup_count, (unsigned long long)tp.insert_count);
-                DEV_ALWAYS("Thread %d:   chain walked   : total=%llu, avg=%.1f, max=%d", thread_idx,
-                    (unsigned long long)tp.lookup_chain_total,
-                    tp.lookup_count > 0 ? (double)tp.lookup_chain_total / tp.lookup_count : 0.0,
-                    tp.lookup_chain_max);
-                DEV_ALWAYS("Thread %d:   overlap checks : %llu, hits=%llu (%.1f%%)", thread_idx,
-                    (unsigned long long)tp.overlap_checks, (unsigned long long)tp.overlap_hits,
-                    tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0);
+            PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
+            DEV_ALWAYS("Thread %d: === TensorMap Lookup Stats ===", thread_idx);
+            DEV_ALWAYS("Thread %d:   lookups        : %llu, inserts: %llu", thread_idx,
+                (unsigned long long)tp.lookup_count, (unsigned long long)tp.insert_count);
+            DEV_ALWAYS("Thread %d:   chain walked   : total=%llu, avg=%.1f, max=%d", thread_idx,
+                (unsigned long long)tp.lookup_chain_total,
+                tp.lookup_count > 0 ? (double)tp.lookup_chain_total / tp.lookup_count : 0.0,
+                tp.lookup_chain_max);
+            DEV_ALWAYS("Thread %d:   overlap checks : %llu, hits=%llu (%.1f%%)", thread_idx,
+                (unsigned long long)tp.overlap_checks, (unsigned long long)tp.overlap_hits,
+                tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0);
 #endif
 
-                // Write orchestrator summary to shared memory for host-side export
+#if PTO2_PROFILING
+            // Write orchestrator summary to shared memory for host-side export (only if profiling enabled)
+            if (runtime->enable_profiling) {
                 AicpuOrchSummary orch_summary = {};
                 orch_summary.start_time = orch_cycle_start;
                 orch_summary.end_time = orch_cycle_end;
@@ -1068,6 +1090,7 @@ int AicpuExecutor::run(Runtime* runtime) {
                 orch_summary.submit_count = p.submit_count;
                 perf_aicpu_write_orch_summary(&orch_summary);
             }
+#endif
 #endif
 
             // Signal orchestration complete in SM header (needs runtime alive)

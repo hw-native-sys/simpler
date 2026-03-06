@@ -26,15 +26,31 @@
 // =============================================================================
 
 #ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
+#define PTO2_PROFILING 0
 #endif
 
 #ifndef PTO2_ORCH_PROFILING
-#define PTO2_ORCH_PROFILING 1
+#define PTO2_ORCH_PROFILING 0
 #endif
 
-#if PTO2_ORCH_PROFILING
-#include "aicpu/device_time.h"
+#ifndef PTO2_SCHED_PROFILING
+#define PTO2_SCHED_PROFILING 0
+#endif
+
+#ifndef PTO2_TENSORMAP_PROFILING
+#define PTO2_TENSORMAP_PROFILING 0
+#endif
+
+#if PTO2_ORCH_PROFILING && !PTO2_PROFILING
+#error "PTO2_ORCH_PROFILING requires PTO2_PROFILING=1"
+#endif
+
+#if PTO2_SCHED_PROFILING && !PTO2_PROFILING
+#error "PTO2_SCHED_PROFILING requires PTO2_PROFILING=1"
+#endif
+
+#if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
+#error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
 #endif
 
 // =============================================================================
@@ -354,6 +370,10 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 // fanout_count, because the orchestrator adds consumers concurrently with the
 // scheduler traversing the list after task completion.
 // =============================================================================
+
+#if PTO2_ORCH_PROFILING
+#include "aicpu/device_time.h"
+#endif
 
 static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
 #if PTO2_ORCH_PROFILING
