@@ -1086,7 +1086,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             // Call orchestration wrapped in outer scope (matches old PTO2_ORCHESTRATION behavior)
             DEV_INFO("Thread %d: Calling aicpu_orchestration_entry from SO", thread_idx);
 #if PTO2_PROFILING
-            DEV_ALWAYS("BENCHMARK: thread=%d orch_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+            DEV_ALWAYS("Thread=%d orch_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             PTO2_SCOPE(rt) { orch_func(rt, args, arg_count); }
@@ -1199,7 +1199,7 @@ int AicpuExecutor::run(Runtime* runtime) {
 
 #if PTO2_PROFILING
             // Benchmark: record orchestrator end timestamp before waiting for schedulers
-            DEV_ALWAYS("BENCHMARK: thread=%d end=%llu",
+            DEV_ALWAYS("Thread=%d end=%llu",
                        thread_idx, (unsigned long long)get_sys_cnt_aicpu());
 #endif
 
@@ -1232,7 +1232,7 @@ int AicpuExecutor::run(Runtime* runtime) {
 
 #if PTO2_PROFILING
         // Benchmark: record scheduler end timestamp before shutdown cleanup
-        DEV_ALWAYS("BENCHMARK: thread=%d end=%llu",
+        DEV_ALWAYS("Thread=%d end=%llu",
                    thread_idx, (unsigned long long)get_sys_cnt_aicpu());
 #endif
 

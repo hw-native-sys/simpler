@@ -29,6 +29,7 @@ import argparse
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 
 # Get script and project directories
@@ -57,7 +58,6 @@ def _wait_for_new_device_log(log_dir, pre_run_logs, timeout=15, interval=0.5):
     CANN dlog writes device logs asynchronously, so the file may appear
     a few seconds after the run completes.
     """
-    import time
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if log_dir.exists():
@@ -173,6 +173,14 @@ Golden.py interface:
         help="Path for the temporal files"
     )
 
+    parser.add_argument(
+        "-n", "--rounds",
+        type=int,
+        default=None,
+        metavar="ROUNDS",
+        help="Number of rounds to run per case (overrides kernel_config RUNTIME_CONFIG['rounds'])"
+    )
+
     args = parser.parse_args()
 
     if args.all and args.case:
@@ -242,6 +250,7 @@ Golden.py interface:
             case_name=args.case,
             pto_isa_commit=args.pto_isa_commit,
             build_dir=args.savetemp,
+            repeat_rounds=args.rounds,
         )
 
         # Snapshot existing device logs before the run so we can identify the

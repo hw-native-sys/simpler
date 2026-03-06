@@ -433,6 +433,7 @@ class CodeRunner:
         case_name: Optional[str] = None,
         pto_isa_commit: Optional[str] = None,
         build_dir: Optional[str] = None,
+        repeat_rounds: Optional[int] = None,
     ):
         # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
         _setup_logging_if_needed()
@@ -480,6 +481,7 @@ class CodeRunner:
         self.aicpu_thread_num = runtime_config.get('aicpu_thread_num', 3)
         self.block_dim = runtime_config.get('block_dim', 24)
         self.runtime_name = runtime_config.get('runtime', 'host_build_graph')
+        self.repeat_rounds = repeat_rounds if repeat_rounds is not None else runtime_config.get('rounds', 1)
 
     def _load_kernel_config(self):
         """Load kernel_config.py from kernels directory."""
@@ -833,61 +835,46 @@ class CodeRunner:
             if run_env:
                 logger.debug(f"Runtime init env overrides: {run_env}")
 
-            # Enable profiling if requested (must be before initialize)
-            if self.enable_profiling:
-                runtime.enable_profiling(True)
-                logger.info("Profiling enabled")
-
-            _t_init_start = time.perf_counter()
-            with _temporary_env(run_env):
-                runtime.initialize(
-                    orch_so_binary,
-                    self.orchestration["function_name"],
-                    func_args,
-                    arg_types=arg_types,
-                    arg_sizes=arg_sizes,
-                    kernel_binaries=kernel_binaries,
-                )
-            _t_init_end = time.perf_counter()
-            logger.info(f">>> runtime.initialize() took {_t_init_end - _t_init_start:.3f}s")
-
-            # Save expected values BEFORE hardware execution (outputs will be overwritten)
+            # Golden
             golden = {k: v.clone() for k, v in outputs.items()}
-            # Convert to dict for compute_golden (may expect numpy-like interface)
             golden_with_inputs = {**inputs, **golden}
             _t_golden_start = time.perf_counter()
             self._golden_module.compute_golden(golden_with_inputs, params)
             _t_golden_end = time.perf_counter()
             logger.info(f">>> compute_golden() took {_t_golden_end - _t_golden_start:.3f}s")
-            logger.info(f">>> Total init-to-launch: {_t_golden_end - _t_init_start:.3f}s "
-                        f"(initialize={_t_init_end - _t_init_start:.3f}s, "
-                        f"golden={_t_golden_end - _t_golden_start:.3f}s)")
 
-            # Launch runtime
-            logger.info("=== Launching Runtime ===")
-            logger.debug(f"Device ID: {self.device_id}")
-            logger.debug(f"AICPU threads: {self.aicpu_thread_num}, Block dim: {self.block_dim}")
-            import sys
-            sys.stdout.flush()  # Ensure output is visible before potential hang
+            for round_idx in range(self.repeat_rounds):
+                if self.repeat_rounds > 1:
+                    logger.info(f"--- Round {round_idx + 1}/{self.repeat_rounds} ---")
 
-            launch_runtime(
-                runtime,
-                aicpu_thread_num=self.aicpu_thread_num,
-                block_dim=self.block_dim,
-                device_id=self.device_id,
-                aicpu_binary=aicpu_binary,
-                aicore_binary=aicore_binary,
-            )
+                runtime = Runtime()
 
-            logger.info("Launch completed successfully")  # Will only print if not hung
+                # Enable profiling if requested (only first round)
+                if self.enable_profiling and round_idx == 0:
+                    runtime.enable_profiling(True)
+                    logger.info("Profiling enabled")
 
-            # Finalize
-            logger.info("=== Finalizing Runtime ===")
-            runtime.finalize()
+                with _temporary_env(run_env):
+                    runtime.initialize(
+                        orch_so_binary,
+                        self.orchestration["function_name"],
+                        func_args,
+                        arg_types=arg_types,
+                        arg_sizes=arg_sizes,
+                        kernel_binaries=kernel_binaries,
+                    )
 
-            # Compute golden and compare
-            logger.info("=== Comparing Results ===")
-            self._compare_with_golden(outputs, golden)
+                launch_runtime(
+                    runtime,
+                    aicpu_thread_num=self.aicpu_thread_num,
+                    block_dim=self.block_dim,
+                    device_id=self.device_id,
+                    aicpu_binary=aicpu_binary,
+                    aicore_binary=aicore_binary,
+                )
+
+                runtime.finalize()
+                self._compare_with_golden(outputs, golden)
 
             logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
 
@@ -937,10 +924,11 @@ class CodeRunner:
 
 def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",
                        enable_profiling=False, run_all_cases=False, case_name=None,
-                       pto_isa_commit=None, build_dir=None):
+                       pto_isa_commit=None, build_dir=None, repeat_rounds=None):
     """Factory: creates a CodeRunner based on kernel_config."""
     return CodeRunner(kernels_dir=kernels_dir, golden_path=golden_path,
                       device_id=device_id, platform=platform,
                       enable_profiling=enable_profiling,
                       run_all_cases=run_all_cases, case_name=case_name,
-                      pto_isa_commit=pto_isa_commit, build_dir=build_dir)
+                      pto_isa_commit=pto_isa_commit, build_dir=build_dir,
+                      repeat_rounds=repeat_rounds)
