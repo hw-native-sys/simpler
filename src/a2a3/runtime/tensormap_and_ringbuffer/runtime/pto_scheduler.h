@@ -172,9 +172,10 @@ struct PTO2SchedulerState {
     PTO2DepListPool* dep_pool;
 
     // Statistics
+#if PTO2_PROFILING
     std::atomic<int64_t> tasks_completed;
     std::atomic<int64_t> tasks_consumed;
-    int64_t total_dispatch_cycles;
+#endif
     std::atomic<int32_t> ring_advance_lock{0};  // Try-lock for advance_ring_pointers
 
     // =========================================================================
@@ -229,7 +230,9 @@ struct PTO2SchedulerState {
             return;
         }
 
+#if PTO2_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
+#endif
         fanout_refcount[slot].store(0, std::memory_order_release);
         fanin_refcount[slot].store(0, std::memory_order_release);
 
@@ -310,7 +313,9 @@ struct PTO2SchedulerState {
         int32_t slot = pto2_task_slot(task_id);
         PTO2TaskDescriptor* task = pto2_sm_get_task(sm_handle, task_id);
 
+#if PTO2_PROFILING
         tasks_completed.fetch_add(1, std::memory_order_relaxed);
+#endif
         pto2_fanout_lock(task);
         task_state[slot].store(PTO2_TASK_COMPLETED, std::memory_order_release);
         PTO2DepListEntry* current = task->fanout_head;  // Protected by fanout_lock

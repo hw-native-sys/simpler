@@ -79,9 +79,10 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
     sched->task_state = nullptr;
     sched->fanin_refcount = nullptr;
     sched->fanout_refcount = nullptr;
+#if PTO2_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
-    sched->total_dispatch_cycles = 0;
+#endif
     sched->ring_advance_lock.store(0, std::memory_order_relaxed);
 
     // Get runtime task_window_size from shared memory header
@@ -171,8 +172,10 @@ void pto2_scheduler_reset(PTO2SchedulerState* sched) {
         pto2_ready_queue_reset(&sched->ready_queues[i]);
     }
 
+#if PTO2_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
+#endif
     sched->ring_advance_lock.store(0, std::memory_order_relaxed);
 }
 
@@ -184,8 +187,10 @@ void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
     LOG_INFO("=== Scheduler Statistics ===");
     LOG_INFO("last_task_alive:   %d", sched->last_task_alive);
     LOG_INFO("heap_tail:         %" PRIu64, sched->heap_tail);
+#if PTO2_PROFILING
     LOG_INFO("tasks_completed:   %lld", (long long)sched->tasks_completed.load(std::memory_order_relaxed));
     LOG_INFO("tasks_consumed:    %lld", (long long)sched->tasks_consumed.load(std::memory_order_relaxed));
+#endif
     LOG_INFO("============================");
 }
 

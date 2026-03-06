@@ -72,9 +72,11 @@ struct PTO2OrchestratorState {
     uint64_t gm_heap_size;   // Size of GM heap
 
     // === STATISTICS ===
+#if PTO2_PROFILING
     int64_t tasks_submitted;
     int64_t buffers_allocated;
     int64_t bytes_allocated;
+#endif
 
     /**
      * Allocate packed output buffer for a task
@@ -86,8 +88,10 @@ struct PTO2OrchestratorState {
 
         void* buffer = heap_ring.pto2_heap_ring_alloc(total_size);
 
+#if PTO2_PROFILING
         buffers_allocated++;
         bytes_allocated += total_size;
+#endif
 
         // Update shared memory with new heap top
         sm_handle->header->heap_top.store(heap_ring.top, std::memory_order_release);

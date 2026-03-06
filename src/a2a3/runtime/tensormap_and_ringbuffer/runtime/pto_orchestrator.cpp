@@ -131,9 +131,11 @@ void pto2_orchestrator_reset(PTO2OrchestratorState* orch) {
     orch->scope_stack_top = -1;
     orch->scope_tasks_size = 0;
 
+#if PTO2_PROFILING
     orch->tasks_submitted = 0;
     orch->buffers_allocated = 0;
     orch->bytes_allocated = 0;
+#endif
 
     // Reset shared memory header
     orch->sm_handle->header->current_task_index.store(0, std::memory_order_relaxed);
@@ -400,8 +402,8 @@ void pto2_submit_task(
 
     CYCLE_COUNT_LAP_RECORD(g_orch_finalize_cycle, AicpuPhaseId::ORCH_FINALIZE);
 
-    orch->tasks_submitted++;
 #if PTO2_PROFILING
+    orch->tasks_submitted++;
     g_orch_submit_count++;
     g_orch_submit_idx++;
 #endif
@@ -436,9 +438,11 @@ bool pto2_orchestrator_has_space(PTO2OrchestratorState* orch) { return pto2_task
 
 void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
     LOG_INFO("=== Orchestrator Statistics ===");
+#if PTO2_PROFILING
     LOG_INFO("Tasks submitted:     %lld", (long long)orch->tasks_submitted);
     LOG_INFO("Buffers allocated:   %lld", (long long)orch->buffers_allocated);
     LOG_INFO("Bytes allocated:     %lld", (long long)orch->bytes_allocated);
+#endif
     LOG_INFO("Current scope depth: %d", orch->scope_stack_top + 1);
     LOG_INFO("Task ring active:    %d", pto2_task_ring_active_count(&orch->task_ring));
     LOG_INFO("Heap ring used:      %" PRIu64 " / %" PRIu64, orch->heap_ring.top, orch->heap_ring.size);

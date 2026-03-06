@@ -547,14 +547,16 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                 int32_t task_id = executing_task_ids_[core_id];
-                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id);
 #if PTO2_PROFILING
+                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id);
                 notify_edges_total += cstats.fanout_edges;
                 if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
                 notify_tasks_enqueued += cstats.tasks_enqueued;
                 fanin_edges_total += cstats.fanin_edges;
                 if (cstats.fanin_edges > fanin_max_degree) fanin_max_degree = cstats.fanin_edges;
                 phase_complete_count++;
+#else
+                rt->scheduler.on_task_complete(task_id);
 #endif
                 executing_task_ids_[core_id] = AICPU_TASK_INVALID;
 
@@ -585,8 +587,8 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 if (thread_idx == 0 && task_count > 0) {
                     int32_t c = completed_tasks_.load(std::memory_order_relaxed);
                     if (c <= PROGRESS_VERBOSE_THRESHOLD || c % PROGRESS_LOG_INTERVAL == 0 || c == task_count) {
-                        DEV_ALWAYS("PTO2 progress: completed=%d total=%d last_task_id=%d (%.1f%%)",
-                                  c, task_count, task_id, task_count > 0 ? 100.0 * c / task_count : 0.0);
+                        DEV_ALWAYS("Thread %d: PTO2 progress: completed=%d total=%d last_task_id=%d (%.1f%%)",
+                                  thread_idx, c, task_count, task_id, task_count > 0 ? 100.0 * c / task_count : 0.0);
                     }
                 }
             }
@@ -824,16 +826,16 @@ int AicpuExecutor::run(Runtime* runtime) {
     if (thread_num_ == 4 && thread_idx == 3) {
         rt = nullptr;
         if (runtime->get_orch_built_on_host()) {
-            DEV_INFO("Thread 3: Host orchestration mode, no-op");
+            DEV_INFO("Thread %d: Host orchestration mode, no-op", thread_idx);
         } else {
-            DEV_INFO("Thread 3: Device orchestration, loading SO via dlopen");
+            DEV_INFO("Thread %d: Device orchestration, loading SO via dlopen", thread_idx);
 
             // Get SO binary from runtime
             const void* so_data = runtime->get_device_orch_so_data();
             size_t so_size = runtime->get_device_orch_so_size();
 
             if (so_data == nullptr || so_size == 0) {
-                DEV_ERROR("Thread 3: Device orchestration SO not set");
+                DEV_ERROR("Thread %d: Device orchestration SO not set", thread_idx);
                 return -1;
             }
 
@@ -858,24 +860,24 @@ int AicpuExecutor::run(Runtime* runtime) {
 
                 int fd = open(so_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
                 if (fd < 0) {
-                    DEV_INFO("Thread 3: Cannot create SO at %s (errno=%d), trying next path",
+                    DEV_INFO("Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx,
                              so_path, errno);
                     continue;
                 }
                 ssize_t written = write(fd, so_data, so_size);
                 close(fd);
                 if (written != static_cast<ssize_t>(so_size)) {
-                    DEV_INFO("Thread 3: Cannot write SO to %s (errno=%d), trying next path",
+                    DEV_INFO("Thread %d: Cannot write SO to %s (errno=%d), trying next path", thread_idx,
                              so_path, errno);
                     unlink(so_path);
                     continue;
                 }
                 file_created = true;
-                DEV_INFO("Thread 3: Created SO file at %s (%zu bytes)", so_path, so_size);
+                DEV_INFO("Thread %d: Created SO file at %s (%zu bytes)", thread_idx, so_path, so_size);
             }
 
             if (!file_created) {
-                DEV_ERROR("Thread 3: Failed to create SO file in any candidate path");
+                DEV_ERROR("Thread %d: Failed to create SO file in any candidate path", thread_idx);
                 return -1;
             }
 
@@ -884,11 +886,11 @@ int AicpuExecutor::run(Runtime* runtime) {
             void* handle = dlopen(so_path, RTLD_LAZY | RTLD_LOCAL);
             const char* dlopen_err = dlerror();
             if (handle == nullptr) {
-                DEV_ERROR("Thread 3: dlopen failed: %s", dlopen_err ? dlopen_err : "unknown");
+                DEV_ERROR("Thread %d: dlopen failed: %s", thread_idx, dlopen_err ? dlopen_err : "unknown");
                 unlink(so_path);
                 return -1;
             }
-            DEV_INFO("Thread 3: dlopen succeeded, handle=%p", handle);
+            DEV_INFO("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
 
             // Get the config function to read orchestration parameters
             dlerror();
@@ -901,13 +903,13 @@ int AicpuExecutor::run(Runtime* runtime) {
                 reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, "aicpu_orchestration_entry"));
             const char* dlsym_error = dlerror();
             if (dlsym_error != nullptr) {
-                DEV_ERROR("Thread 3: dlsym failed: %s", dlsym_error);
+                DEV_ERROR("Thread %d: dlsym failed: %s", thread_idx, dlsym_error);
                 dlclose(handle);
                 unlink(so_path);
                 return -1;
             }
             if (orch_func == nullptr) {
-                DEV_ERROR("Thread 3: dlsym returned NULL for aicpu_orchestration_entry");
+                DEV_ERROR("Thread %d: dlsym returned NULL for aicpu_orchestration_entry", thread_idx);
                 dlclose(handle);
                 unlink(so_path);
                 return -1;
@@ -915,9 +917,9 @@ int AicpuExecutor::run(Runtime* runtime) {
 
             uint64_t* args = runtime->get_orch_args();
             int arg_count = runtime->get_orch_arg_count();
-            DEV_INFO("Thread 3: sm_ptr=%p, arg_count=%d", runtime->get_pto2_gm_sm_ptr(), arg_count);
+            DEV_INFO("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_pto2_gm_sm_ptr(), arg_count);
             for (int i = 0; i < arg_count && i < 20; i++) {
-                DEV_INFO("Thread 3: args[%d] = 0x%lx", i, args[i]);
+                DEV_INFO("Thread %d: args[%d] = 0x%lx", thread_idx, i, args[i]);
             }
 
             // Read config from orchestration SO (or use defaults)
@@ -928,13 +930,13 @@ int AicpuExecutor::run(Runtime* runtime) {
             if (config_func) {
                 PTO2OrchestrationConfig cfg = config_func(args, arg_count);
                 expected_arg_count = cfg.expected_arg_count;
-                DEV_INFO("Thread 3: Config: expected_args=%d", expected_arg_count);
+                DEV_INFO("Thread %d: Config: expected_args=%d", thread_idx, expected_arg_count);
             } else {
-                DEV_INFO("Thread 3: No config function, using defaults");
+                DEV_INFO("Thread %d: No config function, using defaults", thread_idx);
             }
 
             if (expected_arg_count > 0 && arg_count < expected_arg_count) {
-                DEV_ERROR("Thread 3: arg_count %d < expected %d", arg_count, expected_arg_count);
+                DEV_ERROR("Thread %d: arg_count %d < expected %d", thread_idx, arg_count, expected_arg_count);
                 dlclose(handle);
                 unlink(so_path);
                 return -1;
@@ -950,7 +952,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             if (runtime->pto2_dep_list_pool_size > 0) {
                 dep_list_pool_size = runtime->pto2_dep_list_pool_size;
             }
-            DEV_INFO("Thread 3: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%lu",
+            DEV_INFO("Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%lu", thread_idx,
                      (unsigned long)task_window_size, (unsigned long)heap_size, (unsigned long)dep_list_pool_size);
 
             // Get GM heap from runtime (dedicated field)
@@ -963,7 +965,7 @@ int AicpuExecutor::run(Runtime* runtime) {
                 pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size,
                                             heap_size, dep_list_pool_size);
             if (!sm_handle) {
-                DEV_ERROR("Thread 3: Failed to create shared memory handle");
+                DEV_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
                 dlclose(handle);
                 unlink(so_path);
                 return -1;
@@ -972,7 +974,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE,
                                                             sm_handle, gm_heap, heap_size);
             if (!rt) {
-                DEV_ERROR("Thread 3: Failed to create PTO2Runtime");
+                DEV_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
                 pto2_sm_destroy(sm_handle);
                 dlclose(handle);
                 unlink(so_path);
@@ -987,12 +989,16 @@ int AicpuExecutor::run(Runtime* runtime) {
             }
 
             // Call orchestration wrapped in outer scope (matches old PTO2_ORCHESTRATION behavior)
-            DEV_ALWAYS("Thread 3: Calling aicpu_orchestration_entry from SO");
+            DEV_INFO("Thread %d: Calling aicpu_orchestration_entry from SO", thread_idx);
+#if PTO2_PROFILING
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
+#endif
             PTO2_SCOPE(rt) { orch_func(rt, args, arg_count); }
+#if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
-            DEV_ALWAYS("Thread 3: aicpu_orchestration_entry returned, cost %.3fus",
+            DEV_ALWAYS("Thread %d: aicpu_orchestration_entry returned, cost %.3fus", thread_idx,
                 cycles_to_us(orch_cycle_end - orch_cycle_start));
+#endif
 
             // Print orchestrator profiling data
 #if PTO2_PROFILING
@@ -1002,30 +1008,30 @@ int AicpuExecutor::run(Runtime* runtime) {
                                  p.lookup_cycle + p.heap_cycle + p.insert_cycle +
                                  p.fanin_cycle + p.finalize_cycle;
                 if (total == 0) total = 1;  // avoid div-by-zero
-                DEV_ALWAYS("Thread 3: === Orchestrator Profiling: %lld tasks, total=%.3fus ===",
+                DEV_ALWAYS("Thread %d: === Orchestrator Profiling: %lld tasks, total=%.3fus ===", thread_idx,
                          (long long)p.submit_count, cycles_to_us(total));
-                DEV_ALWAYS("Thread 3:   sync_tensormap : %.3fus (%.1f%%)", cycles_to_us(p.sync_cycle), p.sync_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread 3:   task_ring_alloc: %.3fus (%.1f%%)", cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread 3:   param_copy     : %.3fus (%.1f%%)", cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread 3:   lookup+dep     : %.3fus (%.1f%%)", cycles_to_us(p.lookup_cycle), p.lookup_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread 3:   heap_alloc     : %.3fus (%.1f%%)", cycles_to_us(p.heap_cycle), p.heap_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread 3:   tensormap_ins  : %.3fus (%.1f%%)", cycles_to_us(p.insert_cycle), p.insert_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread 3:   fanin+ready    : %.3fus (%.1f%%)", cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread 3:   finalize+SM    : %.3fus (%.1f%%)", cycles_to_us(p.finalize_cycle), p.finalize_cycle * 100.0 / total);
-                DEV_ALWAYS("Thread 3:   scope_end      : %.3fus", cycles_to_us(p.scope_end_cycle));
-                DEV_ALWAYS("Thread 3:   avg/task       : %.3fus",
+                DEV_ALWAYS("Thread %d:   sync_tensormap : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.sync_cycle), p.sync_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread %d:   task_ring_alloc: %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread %d:   param_copy     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread %d:   lookup+dep     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.lookup_cycle), p.lookup_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread %d:   heap_alloc     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.heap_cycle), p.heap_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.insert_cycle), p.insert_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread %d:   fanin+ready    : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread %d:   finalize+SM    : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.finalize_cycle), p.finalize_cycle * 100.0 / total);
+                DEV_ALWAYS("Thread %d:   scope_end      : %.3fus", thread_idx, cycles_to_us(p.scope_end_cycle));
+                DEV_ALWAYS("Thread %d:   avg/task       : %.3fus", thread_idx,
                     p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0);
 
 #if PTO2_TENSORMAP_PROFILING
                 PTO2TensorMapProfilingData tp = pto2_tensormap_get_profiling();
-                DEV_ALWAYS("Thread 3: === TensorMap Lookup Stats ===");
-                DEV_ALWAYS("Thread 3:   lookups        : %llu, inserts: %llu",
+                DEV_ALWAYS("Thread %d: === TensorMap Lookup Stats ===", thread_idx);
+                DEV_ALWAYS("Thread %d:   lookups        : %llu, inserts: %llu", thread_idx,
                     (unsigned long long)tp.lookup_count, (unsigned long long)tp.insert_count);
-                DEV_ALWAYS("Thread 3:   chain walked   : total=%llu, avg=%.1f, max=%d",
+                DEV_ALWAYS("Thread %d:   chain walked   : total=%llu, avg=%.1f, max=%d", thread_idx,
                     (unsigned long long)tp.lookup_chain_total,
                     tp.lookup_count > 0 ? (double)tp.lookup_chain_total / tp.lookup_count : 0.0,
                     tp.lookup_chain_max);
-                DEV_ALWAYS("Thread 3:   overlap checks : %llu, hits=%llu (%.1f%%)",
+                DEV_ALWAYS("Thread %d:   overlap checks : %llu, hits=%llu (%.1f%%)", thread_idx,
                     (unsigned long long)tp.overlap_checks, (unsigned long long)tp.overlap_hits,
                     tp.overlap_checks > 0 ? tp.overlap_hits * 100.0 / tp.overlap_checks : 0.0);
 #endif
@@ -1061,10 +1067,12 @@ int AicpuExecutor::run(Runtime* runtime) {
             PTO2SharedMemoryHeader* sm_header = static_cast<PTO2SharedMemoryHeader*>(sm);
             int32_t pto2_task_count =
                 sm_header ? sm_header->current_task_index.load(std::memory_order_acquire) : 0;
-            DEV_ALWAYS("Thread 3: PTO2 total submitted tasks = %d", pto2_task_count);
+#if PTO2_PROFILING
+            DEV_ALWAYS("Thread %d: PTO2 total submitted tasks = %d", thread_idx, pto2_task_count);
+#endif
             total_tasks_.store(pto2_task_count, std::memory_order_release);
             orchestrator_done_.store(true, std::memory_order_release);
-            DEV_INFO("Thread 3: Set orchestrator_done=true, waiting for scheduler threads");
+            DEV_INFO("Thread %d: Set orchestrator_done=true, waiting for scheduler threads", thread_idx);
 
             // Wait for all scheduler threads (0, 1, 2) to finish before destroying
             // runtime. Scheduler threads access TensorPool via orch_ready_queue_
@@ -1072,12 +1080,12 @@ int AicpuExecutor::run(Runtime* runtime) {
             while (finished_count_.load(std::memory_order_acquire) < thread_num_ - 1) {
                 std::this_thread::yield();
             }
-            DEV_INFO("Thread 3: All scheduler threads finished, destroying runtime");
+            DEV_INFO("Thread %d: All scheduler threads finished, destroying runtime", thread_idx);
 
             // Safe to destroy — no scheduler thread accesses runtime data anymore
             pto2_runtime_destroy(rt);
         }
-        DEV_INFO("Thread 3: Orchestrator completed");
+        DEV_INFO("Thread %d: Orchestrator completed", thread_idx);
     } else {
         // Note: Handshake already completed in init() via handshake_all_cores()
 
