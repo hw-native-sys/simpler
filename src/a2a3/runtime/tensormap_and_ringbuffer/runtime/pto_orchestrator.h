@@ -233,7 +233,7 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch);
 // Orchestrator Profiling Data
 // =============================================================================
 
-#if PTO2_PROFILING
+#if PTO2_ORCH_PROFILING
 struct PTO2OrchProfilingData {
     uint64_t sync_cycle;
     uint64_t alloc_cycle;
@@ -245,6 +245,18 @@ struct PTO2OrchProfilingData {
     uint64_t finalize_cycle;
     uint64_t scope_end_cycle;
     int64_t  submit_count;
+    // Wait time tracking for blocking phases
+    uint64_t alloc_wait_cycle;      // Cycles spent waiting in task_ring_alloc
+    uint64_t heap_wait_cycle;       // Cycles spent waiting in heap_ring_alloc
+    uint64_t fanin_wait_cycle;      // Cycles spent waiting in fanout_lock
+    uint64_t finalize_wait_cycle;   // Cycles spent in ready queue push CAS retries
+    // Atomic operation counts per phase
+    uint64_t alloc_atomic_count;
+    uint64_t params_atomic_count;
+    uint64_t heap_atomic_count;
+    uint64_t fanin_atomic_count;
+    uint64_t finalize_atomic_count;
+    uint64_t scope_end_atomic_count;
 };
 
 /**

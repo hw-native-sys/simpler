@@ -1,13 +1,13 @@
 /**
  * PTO Runtime2 - Core Type Definitions
- * 
+ *
  * This header defines all fundamental types used by the PTO Runtime2 system:
  * - Configuration constants
  * - Worker types and task states
  * - Tensor regions and task parameters
  * - Task descriptors with fanin/fanout tracking
  * - Dependency list entries
- * 
+ *
  * Based on: docs/runtime_buffer_manager_methods.md
  */
 
@@ -27,6 +27,14 @@
 
 #ifndef PTO2_PROFILING
 #define PTO2_PROFILING 1
+#endif
+
+#ifndef PTO2_ORCH_PROFILING
+#define PTO2_ORCH_PROFILING 1
+#endif
+
+#if PTO2_ORCH_PROFILING
+#include "aicpu/device_time.h"
 #endif
 
 // =============================================================================
@@ -87,10 +95,10 @@ typedef enum {
 
 /**
  * Task state enumeration
- * 
+ *
  * State transitions:
  *   PENDING -> READY -> RUNNING -> COMPLETED -> CONSUMED
- * 
+ *
  * Conditions:
  *   PENDING->READY:     fanin_refcount == fanin_count
  *   COMPLETED->CONSUMED: fanout_refcount == fanout_count && state == COMPLETED
@@ -164,7 +172,7 @@ typedef enum {
 
 /**
  * Raw tensor (storage provider)
- * 
+ *
  * The raw tensor owns the actual memory allocation.
  * Multiple logical tensors can share the same raw tensor (aliasing).
  */
@@ -177,18 +185,18 @@ typedef struct {
 
 /**
  * Logical tensor structure
- * 
+ *
  * A "view" into raw tensor storage with specific layout.
  * Supports multi-dimensional tensors with strides (for view/reshape/transpose).
- * 
+ *
  * Memory footprint is determined by:
  *   - storage_offset: byte offset from raw_base to first element
  *   - shape[d]: number of elements in dimension d
  *   - strides[d]: byte offset between consecutive elements in dimension d
- * 
+ *
  * For element at indices [i0, i1, ..., i_{n-1}]:
  *   byte_offset = storage_offset + sum(i_d * strides[d])
- * 
+ *
  * Examples:
  *   - Contiguous row-major (3,4): shape=[3,4], strides=[4*elem_size, elem_size]
  *   - Transposed (4,3): shape=[4,3], strides=[elem_size, 4*elem_size]
@@ -198,32 +206,32 @@ typedef struct {
     // === Raw tensor reference (shared storage) ===
     void*    raw_base;            // Pointer to raw tensor's base (for aliasing check)
     int64_t  raw_total_size;      // Total size of raw tensor in bytes
-    
+
     // === Storage offset ===
     int64_t  storage_offset;      // Byte offset from raw_base to first element
-    
+
     // === Shape and strides ===
     int64_t  shape[PTO2_MAX_TENSOR_DIM];    // Size in each dimension
     int64_t  strides[PTO2_MAX_TENSOR_DIM];  // Byte stride in each dimension
     int32_t  ndim;                          // Number of dimensions (0 = scalar)
-    
+
     // === Precomputed bounding box (for fast overlap detection) ===
     int64_t  min_byte_offset;     // First byte accessed (relative to raw_base)
     int64_t  max_byte_offset;     // Last byte accessed (relative to raw_base)
-    
+
     // === Element info ===
     int64_t  elem_size;           // Size of each element in bytes
     int64_t  numel;               // Total number of elements
-    
+
     // === Extraction tracking ===
     PTO2TensorExtractionType extraction_type;  // How this tensor was created
     bool     is_contiguous;       // True if memory is contiguous (no gaps)
                                   // Equivalent to layout_depth == 1
-    
+
     // === Layout history for HBB overlap detection ===
     int32_t  layout_depth;                           // Number of layout ops (1=simple)
     PTO2LayoutOp layout_ops[PTO2_MAX_LAYOUT_DEPTH];  // Derivation history
-    
+
 } PTO2LogicalTensor;
 
 // =============================================================================
@@ -233,7 +241,7 @@ typedef struct {
 /**
  * Dependency list entry (singly-linked list node)
  * Stored in DepListPool ring buffer
- * 
+ *
  * Used for both fanin_list and fanout_list
  */
 struct PTO2DepListEntry {
@@ -247,10 +255,10 @@ struct PTO2DepListEntry {
 
 /**
  * Task descriptor structure
- * 
+ *
  * Stored in the TaskDescriptor ring buffer in shared memory.
  * Contains both static info (set at submission) and dynamic state.
- * 
+ *
  * Concurrency notes:
  * - fanout_head, fanout_count protected by fanout_lock (per-task spinlock)
  * - fanin_head, fanin_count set once at submission, read-only after
@@ -265,13 +273,13 @@ struct PTO2TaskDescriptor {
     // Fanin: producers this task depends on (set once at submission)
     PTO2DepListEntry* fanin_head;           // Offset to first fanin entry (0 = empty)
     int32_t fanin_count;          // Number of producer dependencies
-    
+
     // Fanout: consumers that depend on this task (grows as consumers submit)
     // PROTECTED BY fanout_lock
     std::atomic<int32_t> fanout_lock; // Per-task spinlock (0=unlocked, 1=locked)
     PTO2DepListEntry* fanout_head;    // Pointer to first fanout entry (nullptr = empty), PROTECTED BY fanout_lock
     std::atomic<int32_t> fanout_count;// 1 (owning scope) + number of consumers
-    
+
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
     void*    packed_buffer_end;   // End of packed buffer (for heap reclamation)
@@ -348,15 +356,38 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 // =============================================================================
 
 static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
+#if PTO2_ORCH_PROFILING
+    uint64_t t0 = get_sys_cnt_aicpu();
+    bool contended = false;
+    uint32_t atomic_ops = 0;
+#endif
+
     for (;;) {
         while (task->fanout_lock.load(std::memory_order_acquire) != 0) {
+#if PTO2_ORCH_PROFILING
+            contended = true;
+            atomic_ops++;  // each load = 1 atomic
+#endif
             PTO2_SPIN_PAUSE_LIGHT();
         }
         int32_t expected = 0;
         if (task->fanout_lock.compare_exchange_weak(expected, 1,
                                         std::memory_order_acquire, std::memory_order_relaxed)) {
+#if PTO2_ORCH_PROFILING
+            atomic_ops++;  // successful CAS = 1 atomic
+            extern uint64_t g_orch_fanin_atomic_count;
+            g_orch_fanin_atomic_count += atomic_ops;
+            if (contended) {
+                extern uint64_t g_orch_fanin_wait_cycle;
+                g_orch_fanin_wait_cycle += (get_sys_cnt_aicpu() - t0);
+            }
+#endif
             return;
         }
+#if PTO2_ORCH_PROFILING
+        contended = true;
+        atomic_ops++;  // failed CAS = 1 atomic
+#endif
     }
 }
 

@@ -68,19 +68,51 @@ struct alignas(64) PTO2ReadyQueue {
     bool push(int32_t task_id) {
         uint64_t pos;
         PTO2ReadyQueueSlot* slot;
+#if PTO2_ORCH_PROFILING
+        uint64_t t0 = get_sys_cnt_aicpu();
+        bool contended = false;
+        uint32_t atomic_ops = 0;
+#endif
         while (true) {
             pos = enqueue_pos.load(std::memory_order_relaxed);
             slot = &slots[pos & mask];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
             int64_t diff = seq - (int64_t)pos;
+#if PTO2_ORCH_PROFILING
+            atomic_ops += 2;  // enqueue_pos.load + sequence.load
+#endif
             if (diff == 0) {
                 if (enqueue_pos.compare_exchange_weak(pos, pos + 1,
-                        std::memory_order_relaxed, std::memory_order_relaxed))
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+#if PTO2_ORCH_PROFILING
+                    atomic_ops++;  // successful CAS
+#endif
                     break;
+                }
+#if PTO2_ORCH_PROFILING
+                contended = true;
+                atomic_ops++;  // failed CAS
+#endif
             } else if (diff < 0) {
                 return false;  // Queue full
             }
+#if PTO2_ORCH_PROFILING
+            else {
+                contended = true;  // diff > 0: slot not yet released, spin
+            }
+#endif
         }
+#if PTO2_ORCH_PROFILING
+        atomic_ops++;  // final sequence.store
+        {
+            extern uint64_t g_orch_finalize_atomic_count;
+            g_orch_finalize_atomic_count += atomic_ops;
+        }
+        if (contended) {
+            extern uint64_t g_orch_finalize_wait_cycle;
+            g_orch_finalize_wait_cycle += (get_sys_cnt_aicpu() - t0);
+        }
+#endif
 
         slot->task_id = task_id;
         slot->sequence.store((int64_t)(pos + 1), std::memory_order_release);
@@ -222,13 +254,33 @@ struct PTO2SchedulerState {
         int32_t fc = task->fanout_count.load(std::memory_order_acquire);
         int32_t rc = fanout_refcount[slot].load(std::memory_order_acquire);
 
+#if PTO2_ORCH_PROFILING
+        {
+            extern uint64_t g_orch_scope_end_atomic_count;
+            g_orch_scope_end_atomic_count += 2;  // fanout_count.load + fanout_refcount.load
+        }
+#endif
+
         if (rc != fc) return;
 
         PTO2TaskState expected = PTO2_TASK_COMPLETED;
         if (!task_state[slot].compare_exchange_strong(expected, PTO2_TASK_CONSUMED,
                                           std::memory_order_acq_rel, std::memory_order_acquire)) {
+#if PTO2_ORCH_PROFILING
+            {
+                extern uint64_t g_orch_scope_end_atomic_count;
+                g_orch_scope_end_atomic_count += 1;  // failed CAS
+            }
+#endif
             return;
         }
+
+#if PTO2_ORCH_PROFILING
+        {
+            extern uint64_t g_orch_scope_end_atomic_count;
+            g_orch_scope_end_atomic_count += 1;  // successful CAS
+        }
+#endif
 
 #if PTO2_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
@@ -236,19 +288,44 @@ struct PTO2SchedulerState {
         fanout_refcount[slot].store(0, std::memory_order_release);
         fanin_refcount[slot].store(0, std::memory_order_release);
 
+#if PTO2_ORCH_PROFILING
+        {
+            extern uint64_t g_orch_scope_end_atomic_count;
+            g_orch_scope_end_atomic_count += 2;  // fanout_refcount.store + fanin_refcount.store
+        }
+#endif
+
         // Try-lock — if another thread is advancing, it will scan our CONSUMED task
         int32_t expected_lock = 0;
         if (ring_advance_lock.compare_exchange_strong(expected_lock, 1,
                 std::memory_order_acquire, std::memory_order_relaxed)) {
             advance_ring_pointers();
             ring_advance_lock.store(0, std::memory_order_release);
+#if PTO2_ORCH_PROFILING
+            {
+                extern uint64_t g_orch_scope_end_atomic_count;
+                g_orch_scope_end_atomic_count += 2;  // try-lock CAS + unlock store
+            }
+#endif
         }
+#if PTO2_ORCH_PROFILING
+        else {
+            extern uint64_t g_orch_scope_end_atomic_count;
+            g_orch_scope_end_atomic_count += 1;  // failed try-lock CAS
+        }
+#endif
     }
 
     void release_producer(int32_t producer_id) {
         int32_t slot = pto2_task_slot(producer_id);
         PTO2TaskDescriptor* producer = pto2_sm_get_task(sm_handle, producer_id);
         fanout_refcount[slot].fetch_add(1, std::memory_order_acq_rel);
+#if PTO2_ORCH_PROFILING
+        {
+            extern uint64_t g_orch_scope_end_atomic_count;
+            g_orch_scope_end_atomic_count += 1;  // fanout_refcount.fetch_add
+        }
+#endif
         check_and_handle_consumed(producer_id, producer);
     }
 
@@ -265,6 +342,12 @@ struct PTO2SchedulerState {
             PTO2TaskState expected = PTO2_TASK_PENDING;
             if (task_state[slot].compare_exchange_strong(
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
+#if PTO2_ORCH_PROFILING
+                {
+                    extern uint64_t g_orch_finalize_atomic_count;
+                    g_orch_finalize_atomic_count += 1;  // CAS(task_state PENDING→READY)
+                }
+#endif
                 ready_queues[task->worker_type].push(task_id);
                 return true;
             }

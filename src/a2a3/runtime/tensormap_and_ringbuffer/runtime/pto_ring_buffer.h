@@ -83,6 +83,10 @@ struct PTO2HeapRing {
 #if PTO2_SPIN_VERBOSE_LOGGING
         bool notified = false;
 #endif
+#if PTO2_ORCH_PROFILING
+        uint64_t wait_start = 0;
+        bool waiting = false;
+#endif
 
         while (1) {
             void* ptr = pto2_heap_ring_try_alloc(size);
@@ -92,11 +96,24 @@ struct PTO2HeapRing {
                     LOG_INFO("[HeapRing] Unblocked after %d spins", spin_count);
                 }
 #endif
+#if PTO2_ORCH_PROFILING
+                if (waiting) {
+                    extern uint64_t g_orch_heap_wait_cycle;
+                    g_orch_heap_wait_cycle += (get_sys_cnt_aicpu() - wait_start);
+                }
+                {
+                    extern uint64_t g_orch_heap_atomic_count;
+                    g_orch_heap_atomic_count += spin_count + 1;  // spin_count retries + 1 success (each try_alloc = 1 load)
+                }
+#endif
                 return ptr;
             }
 
             // No space available, spin-wait
             spin_count++;
+#if PTO2_ORCH_PROFILING
+            if (!waiting) { wait_start = get_sys_cnt_aicpu(); waiting = true; }
+#endif
 
 #if PTO2_SPIN_VERBOSE_LOGGING
             // Periodic block notification
@@ -252,6 +269,10 @@ struct PTO2TaskRing {
 #if PTO2_SPIN_VERBOSE_LOGGING
         bool notified = false;
 #endif
+#if PTO2_ORCH_PROFILING
+        uint64_t wait_start = 0;
+        bool waiting = false;
+#endif
 
         while (1) {
             int32_t task_id = pto2_task_ring_try_alloc();
@@ -261,11 +282,24 @@ struct PTO2TaskRing {
                     LOG_INFO("[TaskRing] Unblocked after %d spins, task_id=%d", spin_count, task_id);
                 }
 #endif
+#if PTO2_ORCH_PROFILING
+                if (waiting) {
+                    extern uint64_t g_orch_alloc_wait_cycle;
+                    g_orch_alloc_wait_cycle += (get_sys_cnt_aicpu() - wait_start);
+                }
+                {
+                    extern uint64_t g_orch_alloc_atomic_count;
+                    g_orch_alloc_atomic_count += spin_count + 1;  // spin_count retries + 1 success (each try_alloc = 1 load)
+                }
+#endif
                 return task_id;
             }
 
             // Window is full, spin-wait (with yield to prevent CPU starvation)
             spin_count++;
+#if PTO2_ORCH_PROFILING
+            if (!waiting) { wait_start = get_sys_cnt_aicpu(); waiting = true; }
+#endif
 
 #if PTO2_SPIN_VERBOSE_LOGGING
             // Periodic block notification

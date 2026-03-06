@@ -45,6 +45,18 @@ static uint64_t g_orch_finalize_cycle = 0;   // scheduler init + SM update
 static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
 static int64_t  g_orch_submit_count = 0;
 static uint32_t g_orch_submit_idx = 0;
+#if PTO2_ORCH_PROFILING
+uint64_t g_orch_alloc_wait_cycle = 0;
+uint64_t g_orch_heap_wait_cycle = 0;
+uint64_t g_orch_fanin_wait_cycle = 0;
+uint64_t g_orch_finalize_wait_cycle = 0;
+uint64_t g_orch_alloc_atomic_count = 0;
+uint64_t g_orch_params_atomic_count = 0;
+uint64_t g_orch_heap_atomic_count = 0;
+uint64_t g_orch_fanin_atomic_count = 0;
+uint64_t g_orch_finalize_atomic_count = 0;
+uint64_t g_orch_scope_end_atomic_count = 0;
+#endif
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
 #define CYCLE_COUNT_LAP_RECORD(acc, phase_id) do { \
@@ -254,6 +266,9 @@ void pto2_submit_task(
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS);
+#if PTO2_ORCH_PROFILING
+    g_orch_params_atomic_count += 2;  // fanout_lock.store + fanout_count.store
+#endif
 
     // Temporary storage for collecting output sizes
     int32_t total_output_size = 0;
@@ -274,6 +289,11 @@ void pto2_submit_task(
         task->packed_buffer_end = (char*)task->packed_buffer_base + total_output_size;
     }
     CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP);
+#if PTO2_ORCH_PROFILING
+    if (total_output_size > 0) {
+        g_orch_heap_atomic_count += 1;  // heap_top.store in pto2_alloc_packed_buffer
+    }
+#endif
 
     // === STEP 2: First pass - set output addr and process tensor ===
     int32_t offset = 0;
@@ -386,6 +406,14 @@ void pto2_submit_task(
         if (early_finished > 0) {
             sched->fanin_refcount[slot].fetch_add(early_finished, std::memory_order_acq_rel);
         }
+#if PTO2_ORCH_PROFILING
+        // Per producer: fetch_add(fanout_count) + load(task_state) + store(unlock) = 3 atomics
+        // Lock atomics (loads + CAS) are counted inside pto2_fanout_lock
+        g_orch_fanin_atomic_count += fanin_count * 3;
+        if (early_finished > 0) {
+            g_orch_fanin_atomic_count += 1;  // fanin_refcount.fetch_add
+        }
+#endif
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN);
@@ -401,6 +429,12 @@ void pto2_submit_task(
     orch->sm_handle->header->current_task_index.store(orch->task_ring.current_index, std::memory_order_release);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_finalize_cycle, AicpuPhaseId::ORCH_FINALIZE);
+#if PTO2_ORCH_PROFILING
+    // task_state.store + fanout_refcount.store + fanin_refcount.fetch_add
+    // + current_task_index.store = 4
+    // Conditional CAS(task_state PENDING→READY) and push() atomics counted inside push()
+    g_orch_finalize_atomic_count += 4;
+#endif
 
 #if PTO2_PROFILING
     orch->tasks_submitted++;
@@ -464,7 +498,7 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
     LOG_INFO("==================");
 }
 
-#if PTO2_PROFILING
+#if PTO2_ORCH_PROFILING
 PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
     d.sync_cycle = g_orch_sync_cycle;
@@ -477,6 +511,16 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     d.finalize_cycle = g_orch_finalize_cycle;
     d.scope_end_cycle = g_orch_scope_end_cycle;
     d.submit_count = g_orch_submit_count;
+    d.alloc_wait_cycle = g_orch_alloc_wait_cycle;
+    d.heap_wait_cycle = g_orch_heap_wait_cycle;
+    d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
+    d.finalize_wait_cycle = g_orch_finalize_wait_cycle;
+    d.alloc_atomic_count = g_orch_alloc_atomic_count;
+    d.params_atomic_count = g_orch_params_atomic_count;
+    d.heap_atomic_count = g_orch_heap_atomic_count;
+    d.fanin_atomic_count = g_orch_fanin_atomic_count;
+    d.finalize_atomic_count = g_orch_finalize_atomic_count;
+    d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
     g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_params_cycle = 0;
@@ -484,6 +528,16 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     g_orch_fanin_cycle = g_orch_finalize_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
     g_orch_submit_idx = 0;
+    g_orch_alloc_wait_cycle = 0;
+    g_orch_heap_wait_cycle = 0;
+    g_orch_fanin_wait_cycle = 0;
+    g_orch_finalize_wait_cycle = 0;
+    g_orch_alloc_atomic_count = 0;
+    g_orch_params_atomic_count = 0;
+    g_orch_heap_atomic_count = 0;
+    g_orch_fanin_atomic_count = 0;
+    g_orch_finalize_atomic_count = 0;
+    g_orch_scope_end_atomic_count = 0;
     return d;
 }
 #endif
