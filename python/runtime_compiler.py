@@ -32,10 +32,13 @@ class BuildTarget:
         """Generate CMake arguments list from toolchain args + custom directories."""
         inc = ";".join(os.path.abspath(d) for d in include_dirs)
         src = ";".join(os.path.abspath(d) for d in source_dirs)
-        return self.toolchain.get_cmake_args() + [
+        args = self.toolchain.get_cmake_args() + [
             f"-DCUSTOM_INCLUDE_DIRS={inc}",
             f"-DCUSTOM_SOURCE_DIRS={src}",
         ]
+        if logger.isEnabledFor(logging.DEBUG):
+            args.append("--log-level=VERBOSE")
+        return args
 
 
 class RuntimeCompiler:

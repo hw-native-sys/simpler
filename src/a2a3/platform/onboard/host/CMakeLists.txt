@@ -39,6 +39,9 @@ else()
 endif()
 
 # Create shared library
+list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
+message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
+message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 
 # C++ standard (applied only to C++ files)
