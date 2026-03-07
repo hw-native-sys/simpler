@@ -26,7 +26,7 @@
 // =============================================================================
 
 #ifndef PTO2_PROFILING
-#define PTO2_PROFILING 0
+#define PTO2_PROFILING 1
 #endif
 
 #ifndef PTO2_ORCH_PROFILING
@@ -371,43 +371,49 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 // scheduler traversing the list after task completion.
 // =============================================================================
 
-#if PTO2_ORCH_PROFILING
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
 #include "aicpu/device_time.h"
 #endif
 
-static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
-#if PTO2_ORCH_PROFILING
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+static inline void pto2_fanout_lock(PTO2TaskDescriptor* task,
+                                     uint64_t& atomic_count, uint64_t& wait_cycle) {
     uint64_t t0 = get_sys_cnt_aicpu();
     bool contended = false;
     uint32_t atomic_ops = 0;
-#endif
 
     for (;;) {
         while (task->fanout_lock.load(std::memory_order_acquire) != 0) {
-#if PTO2_ORCH_PROFILING
             contended = true;
             atomic_ops++;  // each load = 1 atomic
-#endif
             PTO2_SPIN_PAUSE_LIGHT();
         }
         int32_t expected = 0;
         if (task->fanout_lock.compare_exchange_weak(expected, 1,
                                         std::memory_order_acquire, std::memory_order_relaxed)) {
-#if PTO2_ORCH_PROFILING
             atomic_ops++;  // successful CAS = 1 atomic
-            extern uint64_t g_orch_fanin_atomic_count;
-            g_orch_fanin_atomic_count += atomic_ops;
+            atomic_count += atomic_ops;
             if (contended) {
-                extern uint64_t g_orch_fanin_wait_cycle;
-                g_orch_fanin_wait_cycle += (get_sys_cnt_aicpu() - t0);
+                wait_cycle += (get_sys_cnt_aicpu() - t0);
             }
-#endif
             return;
         }
-#if PTO2_ORCH_PROFILING
         contended = true;
         atomic_ops++;  // failed CAS = 1 atomic
+    }
+}
 #endif
+
+static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
+    for (;;) {
+        while (task->fanout_lock.load(std::memory_order_acquire) != 0) {
+            PTO2_SPIN_PAUSE_LIGHT();
+        }
+        int32_t expected = 0;
+        if (task->fanout_lock.compare_exchange_weak(expected, 1,
+                                        std::memory_order_acquire, std::memory_order_relaxed)) {
+            return;
+        }
     }
 }
 

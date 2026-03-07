@@ -10,7 +10,48 @@
 #include <inttypes.h>
 #include <new>
 #include <stdlib.h>
+#include <utility>
 #include "common/unified_log.h"
+
+// =============================================================================
+// Scheduler Profiling Counters
+// =============================================================================
+
+#if PTO2_SCHED_PROFILING
+#include "common/platform_config.h"
+
+uint64_t g_sched_lock_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_fanout_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_fanin_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_self_consumed_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_lock_wait_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_push_wait_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_pop_wait_cycle[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_lock_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_fanout_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_fanin_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_self_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_pop_atomic_count[PLATFORM_MAX_AICPU_THREADS] = {};
+uint64_t g_sched_complete_count[PLATFORM_MAX_AICPU_THREADS] = {};
+
+PTO2SchedProfilingData pto2_scheduler_get_profiling(int thread_idx) {
+    PTO2SchedProfilingData d;
+    d.lock_cycle = std::exchange(g_sched_lock_cycle[thread_idx], 0);
+    d.fanout_cycle = std::exchange(g_sched_fanout_cycle[thread_idx], 0);
+    d.fanin_cycle = std::exchange(g_sched_fanin_cycle[thread_idx], 0);
+    d.self_consumed_cycle = std::exchange(g_sched_self_consumed_cycle[thread_idx], 0);
+    d.lock_wait_cycle = std::exchange(g_sched_lock_wait_cycle[thread_idx], 0);
+    d.push_wait_cycle = std::exchange(g_sched_push_wait_cycle[thread_idx], 0);
+    d.pop_wait_cycle = std::exchange(g_sched_pop_wait_cycle[thread_idx], 0);
+    d.lock_atomic_count = std::exchange(g_sched_lock_atomic_count[thread_idx], 0);
+    d.fanout_atomic_count = std::exchange(g_sched_fanout_atomic_count[thread_idx], 0);
+    d.fanin_atomic_count = std::exchange(g_sched_fanin_atomic_count[thread_idx], 0);
+    d.self_atomic_count = std::exchange(g_sched_self_atomic_count[thread_idx], 0);
+    d.pop_atomic_count = std::exchange(g_sched_pop_atomic_count[thread_idx], 0);
+    d.complete_count = std::exchange(g_sched_complete_count[thread_idx], 0);
+    return d;
+}
+#endif
 
 // =============================================================================
 // Task State Names

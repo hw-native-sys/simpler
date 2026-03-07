@@ -489,6 +489,11 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     uint64_t pop_miss = 0;
     uint32_t phase_complete_count = 0;
     uint32_t phase_dispatch_count = 0;
+#if PTO2_SCHED_PROFILING
+    uint64_t sched_complete_perf_cycle = 0;
+    uint64_t sched_dispatch_pop_cycle = 0;
+    uint64_t sched_dispatch_setup_cycle = 0;
+#endif
 #endif
 
     while (true) {
@@ -549,7 +554,16 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 #endif
             if (completed_match) {
                 int32_t task_id = executing_task_ids_[core_id];
-#if PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
+                PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
+                PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id, thread_idx);
+                notify_edges_total += cstats.fanout_edges;
+                if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
+                notify_tasks_enqueued += cstats.tasks_enqueued;
+                fanin_edges_total += cstats.fanin_edges;
+                if (cstats.fanin_edges > fanin_max_degree) fanin_max_degree = cstats.fanin_edges;
+                phase_complete_count++;
+#elif PTO2_PROFILING
                 PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
                 PTO2CompletionStats cstats = rt->scheduler.on_task_complete(task_id);
                 notify_edges_total += cstats.fanout_edges;
@@ -566,6 +580,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 #if PTO2_PROFILING
                 // Write AICPU dispatch/finish timestamps into the PerfRecord
                 if (profiling_enabled) {
+#if PTO2_SCHED_PROFILING
+                    uint64_t t_perf_start = get_sys_cnt_aicpu();
+#endif
                     Handshake* h = &hank[core_id];
                     uint64_t finish_ts = get_sys_cnt_aicpu();
                     PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
@@ -579,6 +596,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                                                                         finish_ts);
                         }
                     }
+#if PTO2_SCHED_PROFILING
+                    sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
+#endif
                 }
 #endif
 
@@ -618,11 +638,23 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                 if (reg_state == TASK_FIN_STATE && executing_task_ids_[core_id] == AICPU_TASK_INVALID) {
                     Handshake* h = &hank[core_id];
                     PTO2WorkerType wt = (h->core_type == CoreType::AIC) ? PTO2_WORKER_CUBE : PTO2_WORKER_VECTOR;
+#if PTO2_SCHED_PROFILING
+                    extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
+                    uint64_t t_pop_start = get_sys_cnt_aicpu();
+                    int32_t task_id = rt->scheduler.get_ready_task(wt,
+                                         g_sched_pop_atomic_count[thread_idx],
+                                         g_sched_pop_wait_cycle[thread_idx]);
+                    sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
+#else
                     int32_t task_id = rt->scheduler.get_ready_task(wt);
+#endif
                     if (task_id >= 0) {
 #if PTO2_PROFILING
                         pop_hit++;
                         phase_dispatch_count++;
+#endif
+#if PTO2_SCHED_PROFILING
+                        uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
                         PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
                         PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
@@ -642,6 +674,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         executing_task_ids_[core_id] = task_id;
                         cur_thread_tasks_in_flight++;
                         made_progress = true;
+#if PTO2_SCHED_PROFILING
+                        sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+#endif
                         DEV_DEBUG("Thread %d: Dispatching PTO2 task %d to core %d", thread_idx, task_id, core_id);
                     } else {
 #if PTO2_PROFILING
@@ -766,56 +801,85 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     if (sched_total == 0) sched_total = 1;  // avoid div-by-zero
 
 #if PTO2_SCHED_PROFILING
-    double tasks_per_loop = sched_loop_count > 0 ? (double)cur_thread_completed / sched_loop_count : 0.0;
+    // Two-level tree display: sub-phase breakdown within complete and dispatch
+    {
+        PTO2SchedProfilingData sp = pto2_scheduler_get_profiling(thread_idx);
+        uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
+        uint64_t complete_poll = (sched_complete_cycle > otc_total + sched_complete_perf_cycle)
+            ? (sched_complete_cycle - otc_total - sched_complete_perf_cycle) : 0;
+        uint64_t dispatch_poll = (sched_dispatch_cycle > sched_dispatch_pop_cycle + sched_dispatch_setup_cycle)
+            ? (sched_dispatch_cycle - sched_dispatch_pop_cycle - sched_dispatch_setup_cycle) : 0;
 
-    // Detailed output with full phase breakdown
-    DEV_ALWAYS("Thread %d: completed=%d tasks in %.3fus (%llu loops, %.1f tasks/loop)",
-        thread_idx,
-        cur_thread_completed,
-        cycles_to_us(sched_total),
-        (unsigned long long)sched_loop_count,
-        tasks_per_loop);
-    DEV_ALWAYS("Thread %d: --- Phase Breakdown ---", thread_idx);
-    double notify_avg = cur_thread_completed > 0
-        ? (double)notify_edges_total / cur_thread_completed : 0.0;
-    double fanin_avg = cur_thread_completed > 0
-        ? (double)fanin_edges_total / cur_thread_completed : 0.0;
-    DEV_ALWAYS("Thread %d:   complete:    %.3fus (%.1f%%)  [fanout: edges=%llu, max_degree=%d, avg=%.1f]  [fanin: edges=%llu, max_degree=%d, avg=%.1f]",
-        thread_idx,
-        cycles_to_us(sched_complete_cycle),
-        sched_complete_cycle * 100.0 / sched_total,
-        (unsigned long long)notify_edges_total,
-        notify_max_degree,
-        notify_avg,
-        (unsigned long long)fanin_edges_total,
-        fanin_max_degree,
-        fanin_avg);
-    uint64_t complete_miss_count = (complete_probe_count > complete_hit_count)
-        ? (complete_probe_count - complete_hit_count) : 0;
-    double complete_hit_rate = complete_probe_count > 0
-        ? complete_hit_count * 100.0 / complete_probe_count : 0.0;
-    DEV_ALWAYS("Thread %d:     complete_poll: hit=%llu, miss=%llu, hit_rate=%.1f%%",
-        thread_idx,
-        (unsigned long long)complete_hit_count,
-        (unsigned long long)complete_miss_count,
-        complete_hit_rate);
-    DEV_ALWAYS("Thread %d:   scan:        %.3fus (%.1f%%)",
-        thread_idx,
-        cycles_to_us(sched_scan_cycle),
-        sched_scan_cycle * 100.0 / sched_total);
-    uint64_t pop_total = pop_hit + pop_miss;
-    double pop_hit_rate = pop_total > 0 ? pop_hit * 100.0 / pop_total : 0.0;
-    DEV_ALWAYS("Thread %d:   dispatch:    %.3fus (%.1f%%)  [pop: hit=%llu, miss=%llu, hit_rate=%.1f%%]",
-        thread_idx,
-        cycles_to_us(sched_dispatch_cycle),
-        sched_dispatch_cycle * 100.0 / sched_total,
-        (unsigned long long)pop_hit,
-        (unsigned long long)pop_miss,
-        pop_hit_rate);
-    DEV_ALWAYS("Thread %d:   idle:        %.3fus (%.1f%%)",
-        thread_idx,
-        cycles_to_us(sched_idle_cycle),
-        sched_idle_cycle * 100.0 / sched_total);
+        DEV_ALWAYS("Thread %d: === Scheduler Phase Breakdown: total=%.3fus, %d tasks ===",
+            thread_idx, cycles_to_us(sched_total), cur_thread_completed);
+
+        // Level 1: complete
+        DEV_ALWAYS("Thread %d:   complete       : %.3fus (%.1f%%)",
+            thread_idx, cycles_to_us(sched_complete_cycle),
+            sched_complete_cycle * 100.0 / sched_total);
+
+        // Level 2: complete sub-phases (percentage relative to complete)
+        uint64_t c_parent = sched_complete_cycle > 0 ? sched_complete_cycle : 1;
+        DEV_ALWAYS("Thread %d:     poll         : %.3fus (%.1f%%)",
+            thread_idx, cycles_to_us(complete_poll),
+            complete_poll * 100.0 / c_parent);
+        DEV_ALWAYS("Thread %d:     otc_lock     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
+            thread_idx, cycles_to_us(sp.lock_cycle),
+            sp.lock_cycle * 100.0 / c_parent,
+            cycles_to_us(sp.lock_cycle - sp.lock_wait_cycle), cycles_to_us(sp.lock_wait_cycle),
+            (unsigned long long)sp.lock_atomic_count);
+        DEV_ALWAYS("Thread %d:     otc_fanout   : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
+            thread_idx, cycles_to_us(sp.fanout_cycle),
+            sp.fanout_cycle * 100.0 / c_parent,
+            cycles_to_us(sp.fanout_cycle - sp.push_wait_cycle), cycles_to_us(sp.push_wait_cycle),
+            (unsigned long long)sp.fanout_atomic_count);
+        DEV_ALWAYS("Thread %d:     otc_fanin    : %.3fus (%.1f%%)  atomics=%llu",
+            thread_idx, cycles_to_us(sp.fanin_cycle),
+            sp.fanin_cycle * 100.0 / c_parent,
+            (unsigned long long)sp.fanin_atomic_count);
+        DEV_ALWAYS("Thread %d:     otc_self     : %.3fus (%.1f%%)  atomics=%llu",
+            thread_idx, cycles_to_us(sp.self_consumed_cycle),
+            sp.self_consumed_cycle * 100.0 / c_parent,
+            (unsigned long long)sp.self_atomic_count);
+        DEV_ALWAYS("Thread %d:     perf         : %.3fus (%.1f%%)",
+            thread_idx, cycles_to_us(sched_complete_perf_cycle),
+            sched_complete_perf_cycle * 100.0 / c_parent);
+
+        // Level 1: dispatch
+        DEV_ALWAYS("Thread %d:   dispatch       : %.3fus (%.1f%%)",
+            thread_idx, cycles_to_us(sched_dispatch_cycle),
+            sched_dispatch_cycle * 100.0 / sched_total);
+
+        // Level 2: dispatch sub-phases (percentage relative to dispatch)
+        uint64_t d_parent = sched_dispatch_cycle > 0 ? sched_dispatch_cycle : 1;
+        DEV_ALWAYS("Thread %d:     poll         : %.3fus (%.1f%%)",
+            thread_idx, cycles_to_us(dispatch_poll),
+            dispatch_poll * 100.0 / d_parent);
+        DEV_ALWAYS("Thread %d:     pop          : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
+            thread_idx, cycles_to_us(sched_dispatch_pop_cycle),
+            sched_dispatch_pop_cycle * 100.0 / d_parent,
+            cycles_to_us(sched_dispatch_pop_cycle - sp.pop_wait_cycle), cycles_to_us(sp.pop_wait_cycle),
+            (unsigned long long)sp.pop_atomic_count);
+        DEV_ALWAYS("Thread %d:     setup        : %.3fus (%.1f%%)",
+            thread_idx, cycles_to_us(sched_dispatch_setup_cycle),
+            sched_dispatch_setup_cycle * 100.0 / d_parent);
+
+        // Level 1: scan
+        DEV_ALWAYS("Thread %d:   scan           : %.3fus (%.1f%%)",
+            thread_idx, cycles_to_us(sched_scan_cycle),
+            sched_scan_cycle * 100.0 / sched_total);
+
+        // Level 1: idle
+        DEV_ALWAYS("Thread %d:   idle           : %.3fus (%.1f%%)",
+            thread_idx, cycles_to_us(sched_idle_cycle),
+            sched_idle_cycle * 100.0 / sched_total);
+
+        // Average per completion
+        if (cur_thread_completed > 0) {
+            DEV_ALWAYS("Thread %d:   avg/complete   : %.3fus",
+                thread_idx, cycles_to_us(sched_complete_cycle) / cur_thread_completed);
+        }
+    }
 #endif
     // Summary line (always print when PTO2_PROFILING=1)
     DEV_ALWAYS("Thread %d: Scheduler summary: total_time=%.3fus, loops=%llu, tasks_scheduled=%d",

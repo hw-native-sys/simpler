@@ -24,6 +24,12 @@
 #include "pto_shared_memory.h"
 #include "pto_ring_buffer.h"
 
+#if PTO2_SCHED_PROFILING
+#include "aicpu/device_time.h"
+#define PTO2_SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
+#define PTO2_SCHED_CYCLE_LAP(acc) do { _st1 = get_sys_cnt_aicpu(); acc += (_st1 - _st0); _st0 = _st1; } while(0)
+#endif
+
 // =============================================================================
 // Ready Queue (Lock-free bounded MPMC — Vyukov design)
 // =============================================================================
@@ -68,56 +74,64 @@ struct alignas(64) PTO2ReadyQueue {
     bool push(int32_t task_id) {
         uint64_t pos;
         PTO2ReadyQueueSlot* slot;
-#if PTO2_ORCH_PROFILING
-        uint64_t t0 = get_sys_cnt_aicpu();
-        bool contended = false;
-        uint32_t atomic_ops = 0;
-#endif
         while (true) {
             pos = enqueue_pos.load(std::memory_order_relaxed);
             slot = &slots[pos & mask];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
             int64_t diff = seq - (int64_t)pos;
-#if PTO2_ORCH_PROFILING
-            atomic_ops += 2;  // enqueue_pos.load + sequence.load
-#endif
             if (diff == 0) {
                 if (enqueue_pos.compare_exchange_weak(pos, pos + 1,
                         std::memory_order_relaxed, std::memory_order_relaxed)) {
-#if PTO2_ORCH_PROFILING
-                    atomic_ops++;  // successful CAS
-#endif
                     break;
                 }
-#if PTO2_ORCH_PROFILING
-                contended = true;
-                atomic_ops++;  // failed CAS
-#endif
             } else if (diff < 0) {
                 return false;  // Queue full
             }
-#if PTO2_ORCH_PROFILING
-            else {
-                contended = true;  // diff > 0: slot not yet released, spin
-            }
-#endif
         }
-#if PTO2_ORCH_PROFILING
-        atomic_ops++;  // final sequence.store
-        {
-            extern uint64_t g_orch_finalize_atomic_count;
-            g_orch_finalize_atomic_count += atomic_ops;
-        }
-        if (contended) {
-            extern uint64_t g_orch_finalize_wait_cycle;
-            g_orch_finalize_wait_cycle += (get_sys_cnt_aicpu() - t0);
-        }
-#endif
 
         slot->task_id = task_id;
         slot->sequence.store((int64_t)(pos + 1), std::memory_order_release);
         return true;
     }
+
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+    bool push(int32_t task_id, uint64_t& atomic_count, uint64_t& wait_cycle) {
+        uint64_t pos;
+        PTO2ReadyQueueSlot* slot;
+        uint64_t t0 = get_sys_cnt_aicpu();
+        bool contended = false;
+        uint32_t atomic_ops = 0;
+        while (true) {
+            pos = enqueue_pos.load(std::memory_order_relaxed);
+            slot = &slots[pos & mask];
+            int64_t seq = slot->sequence.load(std::memory_order_acquire);
+            int64_t diff = seq - (int64_t)pos;
+            atomic_ops += 2;  // enqueue_pos.load + sequence.load
+            if (diff == 0) {
+                if (enqueue_pos.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    atomic_ops++;  // successful CAS
+                    break;
+                }
+                contended = true;
+                atomic_ops++;  // failed CAS
+            } else if (diff < 0) {
+                return false;  // Queue full
+            } else {
+                contended = true;  // diff > 0: slot not yet released, spin
+            }
+        }
+        atomic_ops++;  // final sequence.store
+        atomic_count += atomic_ops;
+        if (contended) {
+            wait_cycle += (get_sys_cnt_aicpu() - t0);
+        }
+
+        slot->task_id = task_id;
+        slot->sequence.store((int64_t)(pos + 1), std::memory_order_release);
+        return true;
+    }
+#endif
 
     int32_t pop() {
         // Fast-path: skip slot load when queue is clearly empty
@@ -147,6 +161,54 @@ struct alignas(64) PTO2ReadyQueue {
         slot->sequence.store((int64_t)(pos + mask + 1), std::memory_order_release);
         return task_id;
     }
+
+#if PTO2_SCHED_PROFILING
+    int32_t pop(uint64_t& atomic_count, uint64_t& wait_cycle) {
+        // Fast-path: skip slot load when queue is clearly empty
+        uint64_t d = dequeue_pos.load(std::memory_order_relaxed);
+        uint64_t e = enqueue_pos.load(std::memory_order_relaxed);
+        atomic_count += 2;  // dequeue_pos.load + enqueue_pos.load
+        if (d >= e) {
+            return -1;
+        }
+
+        uint64_t pos;
+        PTO2ReadyQueueSlot* slot;
+        uint64_t t0 = get_sys_cnt_aicpu();
+        bool contended = false;
+        uint32_t atomic_ops = 0;
+        while (true) {
+            pos = dequeue_pos.load(std::memory_order_relaxed);
+            slot = &slots[pos & mask];
+            int64_t seq = slot->sequence.load(std::memory_order_acquire);
+            int64_t diff = seq - (int64_t)(pos + 1);
+            atomic_ops += 2;  // dequeue_pos.load + sequence.load
+            if (diff == 0) {
+                if (dequeue_pos.compare_exchange_weak(pos, pos + 1,
+                        std::memory_order_relaxed, std::memory_order_relaxed)) {
+                    atomic_ops++;  // successful CAS
+                    break;
+                }
+                contended = true;
+                atomic_ops++;  // failed CAS
+            } else if (diff < 0) {
+                atomic_count += atomic_ops;
+                return -1;  // Queue empty
+            } else {
+                contended = true;
+            }
+        }
+        atomic_ops++;  // final sequence.store
+        atomic_count += atomic_ops;
+        if (contended) {
+            wait_cycle += (get_sys_cnt_aicpu() - t0);
+        }
+
+        int32_t task_id = slot->task_id;
+        slot->sequence.store((int64_t)(pos + mask + 1), std::memory_order_release);
+        return task_id;
+    }
+#endif
 };
 
 // Cold-path ready queue operations (defined in pto_scheduler.cpp)
@@ -254,33 +316,13 @@ struct PTO2SchedulerState {
         int32_t fc = task->fanout_count.load(std::memory_order_acquire);
         int32_t rc = fanout_refcount[slot].load(std::memory_order_acquire);
 
-#if PTO2_ORCH_PROFILING
-        {
-            extern uint64_t g_orch_scope_end_atomic_count;
-            g_orch_scope_end_atomic_count += 2;  // fanout_count.load + fanout_refcount.load
-        }
-#endif
-
         if (rc != fc) return;
 
         PTO2TaskState expected = PTO2_TASK_COMPLETED;
         if (!task_state[slot].compare_exchange_strong(expected, PTO2_TASK_CONSUMED,
                                           std::memory_order_acq_rel, std::memory_order_acquire)) {
-#if PTO2_ORCH_PROFILING
-            {
-                extern uint64_t g_orch_scope_end_atomic_count;
-                g_orch_scope_end_atomic_count += 1;  // failed CAS
-            }
-#endif
             return;
         }
-
-#if PTO2_ORCH_PROFILING
-        {
-            extern uint64_t g_orch_scope_end_atomic_count;
-            g_orch_scope_end_atomic_count += 1;  // successful CAS
-        }
-#endif
 
 #if PTO2_PROFILING
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
@@ -288,12 +330,43 @@ struct PTO2SchedulerState {
         fanout_refcount[slot].store(0, std::memory_order_release);
         fanin_refcount[slot].store(0, std::memory_order_release);
 
-#if PTO2_ORCH_PROFILING
-        {
-            extern uint64_t g_orch_scope_end_atomic_count;
-            g_orch_scope_end_atomic_count += 2;  // fanout_refcount.store + fanin_refcount.store
+        // Try-lock — if another thread is advancing, it will scan our CONSUMED task
+        int32_t expected_lock = 0;
+        if (ring_advance_lock.compare_exchange_strong(expected_lock, 1,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            advance_ring_pointers();
+            ring_advance_lock.store(0, std::memory_order_release);
         }
+    }
+
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+    void check_and_handle_consumed(int32_t task_id, PTO2TaskDescriptor* task,
+                                    uint64_t& atomic_count) {
+        int32_t slot = pto2_task_slot(task_id);
+
+        int32_t fc = task->fanout_count.load(std::memory_order_acquire);
+        int32_t rc = fanout_refcount[slot].load(std::memory_order_acquire);
+
+        atomic_count += 2;  // fanout_count.load + fanout_refcount.load
+
+        if (rc != fc) return;
+
+        PTO2TaskState expected = PTO2_TASK_COMPLETED;
+        if (!task_state[slot].compare_exchange_strong(expected, PTO2_TASK_CONSUMED,
+                                          std::memory_order_acq_rel, std::memory_order_acquire)) {
+            atomic_count += 1;  // failed CAS
+            return;
+        }
+
+        atomic_count += 1;  // successful CAS
+
+#if PTO2_PROFILING
+        tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
+        fanout_refcount[slot].store(0, std::memory_order_release);
+        fanin_refcount[slot].store(0, std::memory_order_release);
+
+        atomic_count += 2;  // fanout_refcount.store + fanin_refcount.store
 
         // Try-lock — if another thread is advancing, it will scan our CONSUMED task
         int32_t expected_lock = 0;
@@ -301,33 +374,29 @@ struct PTO2SchedulerState {
                 std::memory_order_acquire, std::memory_order_relaxed)) {
             advance_ring_pointers();
             ring_advance_lock.store(0, std::memory_order_release);
-#if PTO2_ORCH_PROFILING
-            {
-                extern uint64_t g_orch_scope_end_atomic_count;
-                g_orch_scope_end_atomic_count += 2;  // try-lock CAS + unlock store
-            }
-#endif
+            atomic_count += 2;  // try-lock CAS + unlock store
+        } else {
+            atomic_count += 1;  // failed try-lock CAS
         }
-#if PTO2_ORCH_PROFILING
-        else {
-            extern uint64_t g_orch_scope_end_atomic_count;
-            g_orch_scope_end_atomic_count += 1;  // failed try-lock CAS
-        }
-#endif
     }
+#endif
 
     void release_producer(int32_t producer_id) {
         int32_t slot = pto2_task_slot(producer_id);
         PTO2TaskDescriptor* producer = pto2_sm_get_task(sm_handle, producer_id);
         fanout_refcount[slot].fetch_add(1, std::memory_order_acq_rel);
-#if PTO2_ORCH_PROFILING
-        {
-            extern uint64_t g_orch_scope_end_atomic_count;
-            g_orch_scope_end_atomic_count += 1;  // fanout_refcount.fetch_add
-        }
-#endif
         check_and_handle_consumed(producer_id, producer);
     }
+
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+    void release_producer(int32_t producer_id, uint64_t& atomic_count) {
+        int32_t slot = pto2_task_slot(producer_id);
+        PTO2TaskDescriptor* producer = pto2_sm_get_task(sm_handle, producer_id);
+        fanout_refcount[slot].fetch_add(1, std::memory_order_acq_rel);
+        atomic_count += 1;  // fanout_refcount.fetch_add
+        check_and_handle_consumed(producer_id, producer, atomic_count);
+    }
+#endif
 
     bool release_fanin_and_check_ready(int32_t task_id,
                                         PTO2TaskDescriptor* task) {
@@ -342,18 +411,33 @@ struct PTO2SchedulerState {
             PTO2TaskState expected = PTO2_TASK_PENDING;
             if (task_state[slot].compare_exchange_strong(
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
-#if PTO2_ORCH_PROFILING
-                {
-                    extern uint64_t g_orch_finalize_atomic_count;
-                    g_orch_finalize_atomic_count += 1;  // CAS(task_state PENDING→READY)
-                }
-#endif
                 ready_queues[task->worker_type].push(task_id);
                 return true;
             }
         }
         return false;
     }
+
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+    bool release_fanin_and_check_ready(int32_t task_id, PTO2TaskDescriptor* task,
+                                        uint64_t& atomic_count, uint64_t& push_wait) {
+        int32_t slot = pto2_task_slot(task_id);
+
+        int32_t new_refcount = fanin_refcount[slot].fetch_add(1, std::memory_order_acq_rel) + 1;
+        atomic_count += 1;  // fanin_refcount.fetch_add
+
+        if (new_refcount == task->fanin_count) {
+            PTO2TaskState expected = PTO2_TASK_PENDING;
+            if (task_state[slot].compare_exchange_strong(
+                    expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
+                atomic_count += 1;  // CAS(task_state PENDING→READY)
+                ready_queues[task->worker_type].push(task_id, atomic_count, push_wait);
+                return true;
+            }
+        }
+        return false;
+    }
+#endif
 
     void init_task(int32_t task_id, PTO2TaskDescriptor* task) {
         int32_t slot = pto2_task_slot(task_id);
@@ -365,7 +449,14 @@ struct PTO2SchedulerState {
         // concurrent on_task_complete between Step 5 and Step 6.
         fanout_refcount[slot].store(0, std::memory_order_relaxed);
 
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+        extern uint64_t g_orch_finalize_atomic_count;
+        extern uint64_t g_orch_finalize_wait_cycle;
+        release_fanin_and_check_ready(task_id, task,
+                                       g_orch_finalize_atomic_count, g_orch_finalize_wait_cycle);
+#else
         release_fanin_and_check_ready(task_id, task);
+#endif
     }
 
     void mark_running(int32_t task_id) {
@@ -377,6 +468,13 @@ struct PTO2SchedulerState {
         return ready_queues[worker_type].pop();
     }
 
+#if PTO2_SCHED_PROFILING
+    int32_t get_ready_task(PTO2WorkerType worker_type,
+                           uint64_t& atomic_count, uint64_t& wait_cycle) {
+        return ready_queues[worker_type].pop(atomic_count, wait_cycle);
+    }
+#endif
+
     bool is_done() {
         PTO2SharedMemoryHeader* header = sm_handle->header;
         int32_t orch_done = header->orchestrator_done.load(std::memory_order_acquire);
@@ -386,12 +484,23 @@ struct PTO2SchedulerState {
     }
 
     void on_scope_end(const int32_t* task_ids, int32_t count) {
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+        extern uint64_t g_orch_scope_end_atomic_count;
+        for (int32_t i = 0; i < count; i++) {
+            release_producer(task_ids[i], g_orch_scope_end_atomic_count);
+        }
+#else
         for (int32_t i = 0; i < count; i++) {
             release_producer(task_ids[i]);
         }
+#endif
     }
 
+#if PTO2_SCHED_PROFILING
+    PTO2CompletionStats on_task_complete(int32_t task_id, int thread_idx) {
+#else
     PTO2CompletionStats on_task_complete(int32_t task_id) {
+#endif
         PTO2CompletionStats stats = {0, 0, 0};
         int32_t slot = pto2_task_slot(task_id);
         PTO2TaskDescriptor* task = pto2_sm_get_task(sm_handle, task_id);
@@ -399,16 +508,52 @@ struct PTO2SchedulerState {
 #if PTO2_PROFILING
         tasks_completed.fetch_add(1, std::memory_order_relaxed);
 #endif
+
+#if PTO2_SCHED_PROFILING
+        extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
+        extern uint64_t g_sched_fanin_cycle[], g_sched_self_consumed_cycle[];
+        extern uint64_t g_sched_lock_atomic_count[], g_sched_lock_wait_cycle[];
+        extern uint64_t g_sched_fanout_atomic_count[], g_sched_push_wait_cycle[];
+        extern uint64_t g_sched_fanin_atomic_count[], g_sched_self_atomic_count[];
+        extern uint64_t g_sched_complete_count[];
+        uint64_t lock_atomics = 0, lock_wait = 0;
+        PTO2_SCHED_CYCLE_START();
+#endif
+
+#if PTO2_SCHED_PROFILING
+        pto2_fanout_lock(task, lock_atomics, lock_wait);
+#else
         pto2_fanout_lock(task);
+#endif
         task_state[slot].store(PTO2_TASK_COMPLETED, std::memory_order_release);
         PTO2DepListEntry* current = task->fanout_head;  // Protected by fanout_lock
         pto2_fanout_unlock(task);
 
+#if PTO2_SCHED_PROFILING
+        lock_atomics += 2;  // state.store + unlock.store
+        g_sched_lock_atomic_count[thread_idx] += lock_atomics;
+        g_sched_lock_wait_cycle[thread_idx] += lock_wait;
+        PTO2_SCHED_CYCLE_LAP(g_sched_lock_cycle[thread_idx]);
+#endif
+
+        // Fanout: notify consumers
+#if PTO2_SCHED_PROFILING
+        uint64_t fanout_atomics = 0, push_wait = 0;
+#endif
         while (current != nullptr) {
             int32_t consumer_id = current->task_id;
             PTO2TaskDescriptor* consumer = pto2_sm_get_task(sm_handle, consumer_id);
 #if PTO2_PROFILING
             stats.fanout_edges++;
+#endif
+#if PTO2_SCHED_PROFILING
+            if (release_fanin_and_check_ready(consumer_id, consumer,
+                                               fanout_atomics, push_wait)) {
+#if PTO2_PROFILING
+                stats.tasks_enqueued++;
+#endif
+            }
+#elif PTO2_PROFILING
             if (release_fanin_and_check_ready(consumer_id, consumer)) {
                 stats.tasks_enqueued++;
             }
@@ -418,17 +563,46 @@ struct PTO2SchedulerState {
             current = current->next;
         }
 
+#if PTO2_SCHED_PROFILING
+        g_sched_fanout_atomic_count[thread_idx] += fanout_atomics;
+        g_sched_push_wait_cycle[thread_idx] += push_wait;
+        PTO2_SCHED_CYCLE_LAP(g_sched_fanout_cycle[thread_idx]);
+#endif
+
+        // Fanin: release producers
+#if PTO2_SCHED_PROFILING
+        uint64_t fanin_atomics = 0;
+#endif
         current = task->fanin_head;
         while (current != nullptr) {
             int32_t producer_id = current->task_id;
+#if PTO2_SCHED_PROFILING
+            release_producer(producer_id, fanin_atomics);
+#else
             release_producer(producer_id);
+#endif
 #if PTO2_PROFILING
             stats.fanin_edges++;
 #endif
             current = current->next;
         }
 
+#if PTO2_SCHED_PROFILING
+        g_sched_fanin_atomic_count[thread_idx] += fanin_atomics;
+        PTO2_SCHED_CYCLE_LAP(g_sched_fanin_cycle[thread_idx]);
+#endif
+
+        // Self consumed check
+#if PTO2_SCHED_PROFILING
+        uint64_t self_atomics = 0;
+        check_and_handle_consumed(task_id, task, self_atomics);
+        g_sched_self_atomic_count[thread_idx] += self_atomics;
+        PTO2_SCHED_CYCLE_LAP(g_sched_self_consumed_cycle[thread_idx]);
+        g_sched_complete_count[thread_idx]++;
+#else
         check_and_handle_consumed(task_id, task);
+#endif
+
         return stats;
     }
 };
@@ -451,5 +625,39 @@ void pto2_scheduler_reset(PTO2SchedulerState* sched);
 void pto2_scheduler_print_stats(PTO2SchedulerState* sched);
 void pto2_scheduler_print_queues(PTO2SchedulerState* sched);
 const char* pto2_task_state_name(PTO2TaskState state);
+
+// =============================================================================
+// Scheduler Profiling Data
+// =============================================================================
+
+#if PTO2_SCHED_PROFILING
+struct PTO2SchedProfilingData {
+    // Sub-phase cycle breakdown within on_task_complete
+    uint64_t lock_cycle;           // pto2_fanout_lock + state store + unlock
+    uint64_t fanout_cycle;         // fanout traversal
+    uint64_t fanin_cycle;          // fanin traversal
+    uint64_t self_consumed_cycle;  // self check_and_handle_consumed
+
+    // Wait times
+    uint64_t lock_wait_cycle;      // spin-wait in fanout_lock
+    uint64_t push_wait_cycle;      // CAS contention in push()
+    uint64_t pop_wait_cycle;       // CAS contention in pop()
+
+    // Atomic counts per sub-phase
+    uint64_t lock_atomic_count;
+    uint64_t fanout_atomic_count;
+    uint64_t fanin_atomic_count;
+    uint64_t self_atomic_count;
+    uint64_t pop_atomic_count;
+
+    int64_t  complete_count;
+};
+
+/**
+ * Get and reset scheduler profiling data for a specific thread.
+ * Returns accumulated profiling data and resets counters.
+ */
+PTO2SchedProfilingData pto2_scheduler_get_profiling(int thread_idx);
+#endif
 
 #endif // PTO_SCHEDULER_H

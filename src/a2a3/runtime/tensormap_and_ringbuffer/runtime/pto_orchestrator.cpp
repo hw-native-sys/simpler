@@ -56,6 +56,14 @@ uint64_t g_orch_heap_atomic_count = 0;
 uint64_t g_orch_fanin_atomic_count = 0;
 uint64_t g_orch_finalize_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
+#elif PTO2_SCHED_PROFILING
+// When only PTO2_SCHED_PROFILING is enabled, shared methods still need
+// orch counters as targets for orchestrator-context calls.
+uint64_t g_orch_fanin_atomic_count = 0;
+uint64_t g_orch_fanin_wait_cycle = 0;
+uint64_t g_orch_finalize_atomic_count = 0;
+uint64_t g_orch_finalize_wait_cycle = 0;
+uint64_t g_orch_scope_end_atomic_count = 0;
 #endif
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
@@ -391,7 +399,11 @@ void pto2_submit_task(
             PTO2TaskDescriptor* producer = pto2_task_ring_get(&orch->task_ring, producer_task_id);
             producer->fanout_count.fetch_add(1, std::memory_order_release);
             int32_t prod_slot = sched->pto2_task_slot(producer_task_id);
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+            pto2_fanout_lock(producer, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
+#else
             pto2_fanout_lock(producer);
+#endif
             // Normal path: prepend consumer to producer's fanout list
             int32_t prod_state = sched->task_state[prod_slot].load(std::memory_order_acquire);
             if (prod_state >= PTO2_TASK_COMPLETED) {
@@ -406,7 +418,7 @@ void pto2_submit_task(
         if (early_finished > 0) {
             sched->fanin_refcount[slot].fetch_add(early_finished, std::memory_order_acq_rel);
         }
-#if PTO2_ORCH_PROFILING
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
         // Per producer: fetch_add(fanout_count) + load(task_state) + store(unlock) = 3 atomics
         // Lock atomics (loads + CAS) are counted inside pto2_fanout_lock
         g_orch_fanin_atomic_count += fanin_count * 3;
@@ -429,7 +441,7 @@ void pto2_submit_task(
     orch->sm_handle->header->current_task_index.store(orch->task_ring.current_index, std::memory_order_release);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_finalize_cycle, AicpuPhaseId::ORCH_FINALIZE, task_id);
-#if PTO2_ORCH_PROFILING
+#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     // task_state.store + fanout_refcount.store + fanin_refcount.fetch_add
     // + current_task_index.store = 4
     // Conditional CAS(task_state PENDING→READY) and push() atomics counted inside push()
