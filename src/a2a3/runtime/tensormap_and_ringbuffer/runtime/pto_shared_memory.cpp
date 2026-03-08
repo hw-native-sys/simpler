@@ -171,30 +171,6 @@ void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
     handle->dep_list_pool[0].next = nullptr;
 }
 
-void pto2_sm_reset(PTO2SharedMemoryHandle* handle) {
-    if (!handle) return;
-    
-    PTO2SharedMemoryHeader* header = handle->header;
-
-    // Reset flow control pointers
-    header->current_task_index.store(0, std::memory_order_relaxed);
-    header->heap_top.store(0, std::memory_order_relaxed);
-    header->orchestrator_done.store(0, std::memory_order_relaxed);
-    header->last_task_alive.store(0, std::memory_order_relaxed);
-    header->heap_tail.store(0, std::memory_order_relaxed);
-    header->heap_tail_gen.store(0, std::memory_order_relaxed);
-
-    header->graph_output_ptr.store(0, std::memory_order_relaxed);
-    header->graph_output_size.store(0, std::memory_order_relaxed);
-    // Clear task descriptors
-    memset(handle->task_descriptors, 0, 
-           header->task_window_size * sizeof(PTO2TaskDescriptor));
-    
-    // Clear dependency list pool (keep entry 0 as NULL marker)
-    memset(handle->dep_list_pool + 1, 0,
-           header->dep_list_pool_size * sizeof(PTO2DepListEntry));
-}
-
 // =============================================================================
 // Debug Utilities
 // =============================================================================

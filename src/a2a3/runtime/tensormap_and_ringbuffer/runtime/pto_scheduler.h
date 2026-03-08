@@ -214,7 +214,6 @@ struct alignas(64) PTO2ReadyQueue {
 // Cold-path ready queue operations (defined in pto_scheduler.cpp)
 bool pto2_ready_queue_init(PTO2ReadyQueue* queue, uint64_t capacity);
 void pto2_ready_queue_destroy(PTO2ReadyQueue* queue);
-void pto2_ready_queue_reset(PTO2ReadyQueue* queue);
 
 // =============================================================================
 // Scheduler State
@@ -616,7 +615,6 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2DepListPool* dep_pool,
                           void* heap_base);
 void pto2_scheduler_destroy(PTO2SchedulerState* sched);
-void pto2_scheduler_reset(PTO2SchedulerState* sched);
 
 // =============================================================================
 // Debug Utilities (cold path, defined in pto_scheduler.cpp)

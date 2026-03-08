@@ -197,11 +197,6 @@ struct PTO2TensorMap {
     void destroy();
 
     /**
-     * Reset TensorMap to empty state
-     */
-    void reset();
-
-    /**
      * Update validity threshold from shared memory
      * Called periodically to refresh the lazy invalidation threshold.
      *

@@ -98,14 +98,6 @@ void pto2_ready_queue_destroy(PTO2ReadyQueue* queue) {
     }
 }
 
-void pto2_ready_queue_reset(PTO2ReadyQueue* queue) {
-    queue->enqueue_pos.store(0, std::memory_order_relaxed);
-    queue->dequeue_pos.store(0, std::memory_order_relaxed);
-    for (uint64_t i = 0; i < queue->capacity; i++) {
-        queue->slots[i].sequence.store((int64_t)i, std::memory_order_relaxed);
-    }
-}
-
 // =============================================================================
 // Scheduler Initialization
 // =============================================================================
@@ -197,27 +189,6 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
     for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
         pto2_ready_queue_destroy(&sched->ready_queues[i]);
     }
-}
-
-void pto2_scheduler_reset(PTO2SchedulerState* sched) {
-    sched->last_task_alive = 0;
-    sched->last_heap_consumed = 0;
-    sched->heap_tail = 0;
-    for (uint64_t i = 0; i < sched->task_window_size; i++) {
-        sched->task_state[i].store(PTO2_TASK_PENDING, std::memory_order_relaxed);
-        sched->fanin_refcount[i].store(0, std::memory_order_relaxed);
-        sched->fanout_refcount[i].store(0, std::memory_order_relaxed);
-    }
-
-    for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
-        pto2_ready_queue_reset(&sched->ready_queues[i]);
-    }
-
-#if PTO2_PROFILING
-    sched->tasks_completed.store(0, std::memory_order_relaxed);
-    sched->tasks_consumed.store(0, std::memory_order_relaxed);
-#endif
-    sched->ring_advance_lock.store(0, std::memory_order_relaxed);
 }
 
 // =============================================================================

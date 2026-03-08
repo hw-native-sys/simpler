@@ -137,32 +137,6 @@ void PTO2TensorMap::destroy() {
     }
 }
 
-void PTO2TensorMap::reset() {
-    // Reset all buckets to empty
-    for (int32_t i = 0; i < num_buckets; i++) {
-        buckets[i] = nullptr;
-    }
-
-    // Reset all entries
-    for (int32_t i = 0; i < pool_size; i++) {
-        entry_pool[i].bucket_index = -1;
-        entry_pool[i].next_in_bucket = nullptr;
-        entry_pool[i].prev_in_bucket = nullptr;
-        entry_pool[i].next_in_task = nullptr;
-        entry_pool[i].prev_in_task = nullptr;
-        entry_pool[i].producer_task_id = -1;
-    }
-
-    // Reset per-task entry tracking
-    for (int32_t i = 0; i < pool_size; i++) {
-        task_entry_head[i] = nullptr;
-    }
-
-    next_entry_idx = 0;
-    free_num = 0;
-    last_task_alive = 0;
-}
-
 // =============================================================================
 // Debug Utilities
 // =============================================================================

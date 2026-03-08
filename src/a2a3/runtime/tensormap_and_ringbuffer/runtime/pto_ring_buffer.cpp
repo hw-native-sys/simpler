@@ -25,10 +25,6 @@ void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
     ring->tail_ptr = tail_ptr;
 }
 
-void pto2_heap_ring_reset(PTO2HeapRing* ring) {
-    ring->top = 0;
-}
-
 // =============================================================================
 // Task Ring Buffer Implementation
 // =============================================================================
@@ -41,14 +37,6 @@ void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
     ring->last_alive_ptr = last_alive_ptr;
 }
 
-
-void pto2_task_ring_reset(PTO2TaskRing* ring) {
-    ring->current_index = 0;
-    
-    // Clear all task descriptors
-    memset(ring->descriptors, 0, ring->window_size * sizeof(PTO2TaskDescriptor));
-}
-
 // =============================================================================
 // Dependency List Pool Implementation
 // =============================================================================
@@ -59,17 +47,6 @@ void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t c
     pool->top = 1;  // Start from 1, 0 means NULL/empty
     
     // Initialize entry 0 as NULL marker
-    pool->base[0].task_id = -1;
-    pool->base[0].next = nullptr;
-}
-
-void pto2_dep_pool_reset(PTO2DepListPool* pool) {
-    pool->top = 1;
-    
-    // Clear pool (optional, for debugging)
-    memset(pool->base + 1, 0, (pool->capacity - 1) * sizeof(PTO2DepListEntry));
-    
-    // Re-initialize entry 0 as NULL marker
     pool->base[0].task_id = -1;
     pool->base[0].next = nullptr;
 }

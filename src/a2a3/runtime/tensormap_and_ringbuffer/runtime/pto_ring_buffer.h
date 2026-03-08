@@ -232,11 +232,6 @@ struct PTO2HeapRing {
 void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
                           std::atomic<uint64_t>* tail_ptr);
 
-/**
- * Reset heap ring to initial state
- */
-void pto2_heap_ring_reset(PTO2HeapRing* ring);
-
 // =============================================================================
 // Task Ring Buffer
 // =============================================================================
@@ -422,11 +417,6 @@ static inline PTO2TaskDescriptor* pto2_task_ring_get(PTO2TaskRing* ring, int32_t
     return &ring->descriptors[task_id & (ring->window_size - 1)];
 }
 
-/**
- * Reset task ring to initial state
- */
-void pto2_task_ring_reset(PTO2TaskRing* ring);
-
 // =============================================================================
 // Dependency List Pool
 // =============================================================================
@@ -488,11 +478,6 @@ struct PTO2DepListPool {
  * @param capacity  Total number of entries
  */
 void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t capacity);
-
-/**
- * Reset dependency list pool
- */
-void pto2_dep_pool_reset(PTO2DepListPool* pool);
 
 /**
  * Get pool usage statistics

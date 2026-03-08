@@ -174,16 +174,6 @@ void pto2_runtime_destroy(PTO2Runtime* rt) {
     free(rt);
 }
 
-void pto2_runtime_reset(PTO2Runtime* rt) {
-    if (!rt) return;
-
-    pto2_orchestrator_reset(&rt->orchestrator);
-    pto2_scheduler_reset(&rt->scheduler);
-    pto2_sm_reset(rt->sm_handle);
-
-    rt->total_cycles = 0;
-}
-
 void pto2_runtime_set_mode(PTO2Runtime* rt, PTO2RuntimeMode mode) {
     if (rt) {
         rt->mode = mode;

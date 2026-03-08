@@ -162,12 +162,6 @@ void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
                           uint64_t dep_list_pool_size);
 
 /**
- * Reset shared memory to initial state (for reuse)
- * Clears all task descriptors and resets pointers
- */
-void pto2_sm_reset(PTO2SharedMemoryHandle* handle);
-
-/**
  * Get task descriptor by task ID
  * Uses runtime window_size for ring buffer indexing (not compile-time constant)
  */

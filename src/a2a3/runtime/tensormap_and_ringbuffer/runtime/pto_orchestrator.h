@@ -122,11 +122,6 @@ bool pto2_orchestrator_init(
 void pto2_orchestrator_destroy(PTO2OrchestratorState* orch);
 
 /**
- * Reset orchestrator state for reuse
- */
-void pto2_orchestrator_reset(PTO2OrchestratorState* orch);
-
-/**
  * Set scheduler reference (for simulated mode)
  */
 void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler);

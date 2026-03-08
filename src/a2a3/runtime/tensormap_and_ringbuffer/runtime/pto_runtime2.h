@@ -146,11 +146,6 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
 void pto2_runtime_destroy(PTO2Runtime* rt);
 
 /**
- * Reset runtime for reuse (keeps allocations, clears state)
- */
-void pto2_runtime_reset(PTO2Runtime* rt);
-
-/**
  * Set execution mode
  */
 void pto2_runtime_set_mode(PTO2Runtime* rt, PTO2RuntimeMode mode);

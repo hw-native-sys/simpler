@@ -141,28 +141,6 @@ void pto2_orchestrator_destroy(PTO2OrchestratorState* orch) {
     orch->scope_begins = NULL;
 }
 
-void pto2_orchestrator_reset(PTO2OrchestratorState* orch) {
-    pto2_heap_ring_reset(&orch->heap_ring);
-    pto2_task_ring_reset(&orch->task_ring);
-    pto2_dep_pool_reset(&orch->dep_pool);
-    orch->tensor_map.reset();
-
-    orch->tensormap_last_cleanup = 0;
-    orch->scope_stack_top = -1;
-    orch->scope_tasks_size = 0;
-
-#if PTO2_PROFILING
-    orch->tasks_submitted = 0;
-    orch->buffers_allocated = 0;
-    orch->bytes_allocated = 0;
-#endif
-
-    // Reset shared memory header
-    orch->sm_handle->header->current_task_index.store(0, std::memory_order_relaxed);
-    orch->sm_handle->header->heap_top.store(0, std::memory_order_relaxed);
-    orch->sm_handle->header->orchestrator_done.store(0, std::memory_order_relaxed);
-}
-
 void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler) {
     orch->scheduler = scheduler;
     orch->init_task_on_submit = true;  // Default: initialize task on submit
