@@ -1073,7 +1073,7 @@ int AicpuExecutor::run(Runtime* runtime) {
                 std::this_thread::yield();
             }
 
-            // Call orchestration wrapped in outer scope (matches old PTO2_ORCHESTRATION behavior)
+            // Call orchestration function wrapped in an outer scope
             DEV_INFO("Thread %d: Calling aicpu_orchestration_entry from SO", thread_idx);
 #if PTO2_PROFILING
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
