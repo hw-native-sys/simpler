@@ -412,6 +412,8 @@ run_hw_tasks() {
                     else
                         echo "${idx}|FAIL" >> "$hw_marker"
                     fi
+                    echo "[${HW_PLATFORM}:dev${device_id}] Device quarantined after failure"
+                    break
                 fi
             done
         ) &
