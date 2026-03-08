@@ -21,6 +21,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
+    // Invalidate cache before first read to avoid stale aicpu_ready from previous round
+    dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
     while (my_hank->aicpu_ready == 0) {
         dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
     }
