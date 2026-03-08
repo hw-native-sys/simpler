@@ -1196,6 +1196,7 @@ int AicpuExecutor::run(Runtime* runtime) {
 
             // Safe to destroy — no scheduler thread accesses runtime data anymore
             pto2_runtime_destroy(rt);
+            rt = nullptr;
         }
         DEV_INFO("Thread %d: Orchestrator completed", thread_idx);
     } else {
@@ -1236,6 +1237,9 @@ void AicpuExecutor::deinit() {
         dispatch_timestamps_[i] = 0;
         core_dispatch_counts_[i] = 0;
     }
+
+    // Clear per-core dispatch payloads to prevent stale data on next round
+    memset(s_pto2_payload_per_core, 0, sizeof(s_pto2_payload_per_core));
 
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_.store(0, std::memory_order_release);

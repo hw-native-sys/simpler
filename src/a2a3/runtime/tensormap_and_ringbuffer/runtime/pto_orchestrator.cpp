@@ -133,6 +133,7 @@ bool pto2_orchestrator_init(
 }
 
 void pto2_orchestrator_destroy(PTO2OrchestratorState* orch) {
+    TensorPool::set_instance(nullptr);
     orch->tensor_map.destroy();
 
     free(orch->scope_tasks);

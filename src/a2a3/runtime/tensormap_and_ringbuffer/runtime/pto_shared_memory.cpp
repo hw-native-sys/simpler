@@ -119,6 +119,19 @@ PTO2SharedMemoryHandle* pto2_sm_create_from_buffer(void* sm_base,
     handle->dep_list_pool = (PTO2DepListEntry*)ptr;
 
     pto2_sm_init_header(handle, task_window_size, heap_size, dep_list_pool_size);
+
+    // Zero task descriptors and dep list pool.
+    // On multi-round execution the SM buffer may be reused at the same device
+    // address.  PTO2TaskDescriptor contains Tensor members whose move-assignment
+    // calls TensorPool::deref(old_index).  Stale nonzero indices from a previous
+    // round would corrupt the fresh TensorPool.  Zeroing ensures index==0 (no-op
+    // deref) for every slot before new tasks are written.
+    memset(handle->task_descriptors, 0,
+           task_window_size * sizeof(PTO2TaskDescriptor));
+    // Skip slot 0 (sentinel: task_id=-1, next=nullptr; deref(0) is a no-op)
+    memset(handle->dep_list_pool + 1, 0,
+           dep_list_pool_size * sizeof(PTO2DepListEntry));
+
     return handle;
 }
 
