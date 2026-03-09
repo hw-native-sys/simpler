@@ -27,6 +27,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
     }
 
+    // Clear stale EXIT_SIGNAL from previous round before entering main loop
+    write_reg(RegId::DATA_MAIN_BASE, 0);
+
     // Report physical core ID and core type for AICPU
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;

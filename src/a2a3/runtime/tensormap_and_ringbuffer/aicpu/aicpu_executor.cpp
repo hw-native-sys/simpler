@@ -127,7 +127,7 @@ struct AicpuExecutor {
     int resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx, const int* cur_thread_cores, int core_num);
     int shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores, int core_num);
     int run(Runtime* runtime);
-    void deinit();
+    void deinit(Runtime* runtime);
     void emergency_shutdown();
     void diagnose_stuck_state(Runtime* runtime, int thread_idx, const int* cur_thread_cores,
                               int core_num, Handshake* hank);
@@ -145,7 +145,7 @@ static PTO2DispatchPayload s_pto2_payload_per_core[RUNTIME_MAX_WORKER];
  * Sets up register addresses for fast dispatch.
  */
 int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
-    Handshake* all_hanks = (Handshake*)runtime->workers;
+    Handshake* all_handshakes = (Handshake*)runtime->workers;
     cores_total_num_ = runtime->worker_count;
 
     // Validate cores_total_num_ before using as array index
@@ -162,8 +162,8 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     // Step 1: Write per-core payload addresses and send handshake signal
     // task must be written BEFORE aicpu_ready so AICore sees it after waking up
     for (int i = 0; i < cores_total_num_; i++) {
-        all_hanks[i].task = reinterpret_cast<uint64_t>(&s_pto2_payload_per_core[i]);
-        all_hanks[i].aicpu_ready = 1;
+        all_handshakes[i].task = reinterpret_cast<uint64_t>(&s_pto2_payload_per_core[i]);
+        all_handshakes[i].aicpu_ready = 1;
     }
 
     // Get platform physical cores count for validation
@@ -172,7 +172,7 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     // Step 2: Wait for all cores to respond, collect core type and register addresses
     bool handshake_failed = false;
     for (int i = 0; i < cores_total_num_; i++) {
-        Handshake* hank = &all_hanks[i];
+        Handshake* hank = &all_handshakes[i];
         while (hank->aicore_done == 0) {
             // Spin wait for core to respond
         }
@@ -210,7 +210,7 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
 
         core_id_to_reg_addr_[i] = reg_addr;
 
-        // Initialize AICore registers (platform-specific)
+        // Initialize AICore registers after discovery (first round)
         if (reg_addr != 0) {
             platform_init_aicore_regs(reg_addr);
         }
@@ -1231,7 +1231,15 @@ int AicpuExecutor::run(Runtime* runtime) {
     return 0;
 }
 
-void AicpuExecutor::deinit() {
+void AicpuExecutor::deinit(Runtime* runtime) {
+    // === Exit cleanup: reset all inter-round state ===
+
+    // 1. Invalidate AICPU cache for Runtime address range.
+    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
+    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
+    cache_invalidate_range(runtime, sizeof(Runtime));
+
+    // === Existing reset logic ===
     // Reset per-core dispatch timestamps and task counters
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
@@ -1259,6 +1267,9 @@ void AicpuExecutor::deinit() {
         core_id_to_reg_addr_[i] = 0;
     }
     regs_ = 0;
+
+    // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
+    rt = nullptr;
 
     DEV_INFO("DeInit: Runtime execution state reset");
 
@@ -1394,7 +1405,7 @@ extern "C" int aicpu_execute(Runtime* runtime) {
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
         DEV_INFO("aicpu_execute: Last thread finished, cleaning up");
-        g_aicpu_executor.deinit();
+        g_aicpu_executor.deinit(runtime);
     }
 
     DEV_INFO("%s", "aicpu_execute: Kernel execution completed successfully");

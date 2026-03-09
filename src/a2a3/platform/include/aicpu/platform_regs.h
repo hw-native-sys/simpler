@@ -17,6 +17,7 @@
 #define PLATFORM_AICPU_PLATFORM_REGS_H_
 
 #include <cstdint>
+#include <cstddef>
 #include "common/platform_config.h"
 
 #ifdef __cplusplus
@@ -90,5 +91,21 @@ void platform_deinit_aicore_regs(uint64_t reg_addr);
  * @return Physical core count (exclusive upper bound)
  */
 uint32_t platform_get_physical_cores_count();
+
+/**
+ * Invalidate data cache for a memory range.
+ *
+ * On ARM64 AICPU, DMA writes from the host (rtMemcpy) go directly to HBM
+ * without invalidating the AICPU's data cache.  When rtMalloc returns the
+ * same device address across rounds, the AICPU may read stale cached data
+ * instead of the fresh values written by the host.
+ *
+ * On real hardware (onboard): performs DC CIVAC per cache line + DSB/ISB.
+ * On simulation (sim): no-op.
+ *
+ * @param addr  Start address of the memory range
+ * @param size  Size of the memory range in bytes
+ */
+void cache_invalidate_range(const void* addr, size_t size);
 
 #endif  // PLATFORM_AICPU_PLATFORM_REGS_H_

@@ -11,6 +11,8 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_malloc.h"
+#include "aicpu/platform_regs.h"
+#include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "runtime.h"
 
@@ -203,7 +205,7 @@ struct AicpuExecutor {
     int resolve_and_dispatch(Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num);
     int shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores, int core_num);
     int run(Runtime* runtime);
-    void deinit();
+    void deinit(Runtime* runtime);
     void diagnose_stuck_state(
         Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num, Handshake* hank);
 };
@@ -326,7 +328,7 @@ int AicpuExecutor::init(Runtime* runtime) {
  * @return 0 on success, -1 on failure
  */
 int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
-    Handshake* all_hanks = (Handshake*)runtime->workers;
+    Handshake* all_handshakes = (Handshake*)runtime->workers;
     cores_total_num_ = runtime->worker_count;
 
     if (cores_total_num_ == 0) {
@@ -347,12 +349,12 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
 
     // Step 1: Send handshake signal to all cores
     for (int i = 0; i < cores_total_num_; i++) {
-        all_hanks[i].aicpu_ready = 1;
+        all_handshakes[i].aicpu_ready = 1;
     }
 
     // Step 2: Wait for all cores to respond and collect core type information
     for (int i = 0; i < cores_total_num_; i++) {
-        Handshake* hank = &all_hanks[i];
+        Handshake* hank = &all_handshakes[i];
 
         // Wait for aicore_done signal
         while (hank->aicore_done == 0) {
@@ -467,13 +469,13 @@ void AicpuExecutor::assign_cores_to_threads() {
  * Shutdown AICore - Send quit signal to all AICore kernels
  */
 int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores, int core_num) {
-    Handshake* all_hanks = (Handshake*)runtime->workers;
+    Handshake* all_handshakes = (Handshake*)runtime->workers;
 
     DEV_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
 
     for (int i = 0; i < core_num; i++) {
         int core_id = cur_thread_cores[i];
-        Handshake* hank = &all_hanks[core_id];
+        Handshake* hank = &all_handshakes[core_id];
         DEV_INFO("Thread %d: AICPU hank addr = 0x%lx", thread_idx, (uint64_t)hank);
         hank->control = 1;
     }
@@ -802,7 +804,15 @@ int AicpuExecutor::run(Runtime* runtime) {
     return final_rc;
 }
 
-void AicpuExecutor::deinit() {
+void AicpuExecutor::deinit(Runtime* runtime) {
+    // === Exit cleanup: reset all inter-round state ===
+
+    // 1. Invalidate AICPU cache for Runtime address range.
+    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
+    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
+    cache_invalidate_range(runtime, sizeof(Runtime));
+
+    // === Existing reset logic ===
     // Cleanup runtime execution state
     ready_count_aic_.store(0, std::memory_order_release);
     ready_count_aiv_.store(0, std::memory_order_release);
@@ -939,7 +949,7 @@ extern "C" int aicpu_execute(Runtime* runtime) {
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
         DEV_INFO("aicpu_execute: Last thread finished, cleaning up");
-        g_aicpu_executor.deinit();
+        g_aicpu_executor.deinit(runtime);
     }
 
     DEV_INFO("%s", "aicpu_execute: Kernel execution completed successfully");

@@ -59,6 +59,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         dcci(my_hank, SINGLE_CACHE_LINE);
     }
 
+    // Clear stale EXIT_SIGNAL from previous round before entering main loop
+    write_reg(RegId::DATA_MAIN_BASE, 0);
+
     // Phase 2: Report physical core ID and core type, signal ready
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
