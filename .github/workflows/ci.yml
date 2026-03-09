@@ -70,4 +70,4 @@ jobs:
       - name: Run on-device examples
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          source /home/github-ci/Ascend/ascend-toolkit/latest/bin/setenv.bash && ./ci.sh -p a2a3 -d 4-7 --parallel -c 1b22fea -t 600
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a2a3 -d ${DEVICE_RANGE} --parallel -c 1b22fea -t 600
