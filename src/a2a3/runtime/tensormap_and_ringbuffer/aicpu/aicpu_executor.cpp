@@ -451,7 +451,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
         pto2_init_complete_.store(true, std::memory_order_release);
     } else {
         while (!pto2_init_complete_.load(std::memory_order_acquire)) {
-            std::this_thread::yield();
+            SPIN_WAIT_HINT();
         }
     }
 
@@ -1082,7 +1082,7 @@ int AicpuExecutor::run(Runtime* runtime) {
 
             // Wait for scheduler's one-time init to complete
             while (!pto2_init_complete_.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
+                SPIN_WAIT_HINT();
             }
 
             // Call orchestration function wrapped in an outer scope
@@ -1209,7 +1209,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             // runtime. Scheduler threads read tensor_data pointers from task descriptors
             // that point into the task descriptor's inline TensorData — freeing early is use-after-free.
             while (finished_count_.load(std::memory_order_acquire) < thread_num_ - 1) {
-                std::this_thread::yield();
+                SPIN_WAIT_HINT();
             }
             DEV_INFO("Thread %d: All scheduler threads finished, destroying runtime", thread_idx);
 
@@ -1224,7 +1224,7 @@ int AicpuExecutor::run(Runtime* runtime) {
         // Device orchestration: wait for Thread 3 to initialize SM header
         if (!runtime->get_orch_built_on_host()) {
             while (!runtime_init_ready_.load(std::memory_order_acquire)) {
-                std::this_thread::yield();
+                SPIN_WAIT_HINT();
             }
         }
         always_assert(rt != nullptr);
