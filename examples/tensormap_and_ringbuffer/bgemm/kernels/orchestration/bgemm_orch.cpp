@@ -62,8 +62,10 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
+void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
+    (void)orch_thread_num;
+    (void)orch_thread_index;
 
     void* dev_A = (void*)(uintptr_t)args[ARG_PTR_A];
     void* dev_B = (void*)(uintptr_t)args[ARG_PTR_B];

@@ -49,7 +49,7 @@
 // Device orchestration function signature (loaded via dlopen).
 // The orchestration .so receives a PTO2Runtime* (with ops table populated)
 // instead of a raw shared-memory pointer.
-typedef void (*DeviceOrchestrationFunc)(PTO2Runtime* rt, uint64_t* args, int arg_count);
+typedef void (*DeviceOrchestrationFunc)(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index);
 
 // Config function exported by orchestration .so
 typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(uint64_t* args, int arg_count);
@@ -1090,7 +1090,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             DEV_ALWAYS("Thread=%d orch_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
 #endif
-            PTO2_SCOPE(rt) { orch_func(rt, args, arg_count); }
+            PTO2_SCOPE(rt) { orch_func(rt, args, arg_count, 1, 0); }
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             DEV_ALWAYS("Thread %d: aicpu_orchestration_entry returned, cost %.3fus", thread_idx,

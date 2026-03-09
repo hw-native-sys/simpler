@@ -62,7 +62,9 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+    (void)orch_thread_num;
+    (void)orch_thread_index;
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
     uint64_t prof_scope = 0;
