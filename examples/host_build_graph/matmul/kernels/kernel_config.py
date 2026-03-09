@@ -30,5 +30,6 @@ KERNELS = [
 RUNTIME_CONFIG = {
     "runtime": "host_build_graph",
     "aicpu_thread_num": 3,
+    "orch_thread_num": 0,
     "block_dim": 3,
 }

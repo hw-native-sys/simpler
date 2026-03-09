@@ -59,8 +59,6 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 __attribute__((visibility("default")))
 void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
-    (void)orch_thread_num;
-    (void)orch_thread_index;
 
     // Extract device pointers (first 7)
     void* host_query = (void*)(uintptr_t)args[0];           // [batch, num_heads, head_dim]
@@ -95,7 +93,13 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
 
     (void)kv_head_num;
 
-    LOG_INFO(rt, "batch = %lu", (unsigned long)batch);
+    // Partition batch across orchestrators
+    uint64_t b_start = batch * orch_thread_index / orch_thread_num;
+    uint64_t b_end = batch * (orch_thread_index + 1) / orch_thread_num;
+
+    LOG_INFO(rt, "orch_idx=%d/%d batch=%lu b_range=[%lu,%lu)",
+             orch_thread_index, orch_thread_num,
+             (unsigned long)batch, (unsigned long)b_start, (unsigned long)b_end);
 
     // Compute actual tensor shapes from buffer sizes (not from max block_num)
     uint64_t query_shapes[2] = {batch * num_heads, head_dim};
@@ -112,7 +116,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     LOG_DEBUG(rt, "value_cache=%s", value_cache.dump().c_str());
     LOG_DEBUG(rt, "out=%s", out.dump().c_str());
 
-    for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
+    for (uint64_t b_idx = b_start; b_idx < b_end; b_idx++) {
         uint64_t cur_seq = host_context_lens[b_idx];
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
@@ -202,8 +206,9 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
         }
     }
 
-    LOG_INFO(rt, "tasks submitted for batch=%lu, num_heads=%lu",
-                  (unsigned long)batch, (unsigned long)num_heads);
+    LOG_INFO(rt, "orch_idx=%d: tasks submitted for batch=[%lu,%lu), num_heads=%lu",
+                  orch_thread_index, (unsigned long)b_start, (unsigned long)b_end,
+                  (unsigned long)num_heads);
 }
 
 }  // extern "C"

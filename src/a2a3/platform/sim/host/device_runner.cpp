@@ -146,18 +146,37 @@ int DeviceRunner::run(Runtime& runtime,
 
     // Validate block_dim
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
-        LOG_ERROR("block_dim (%d) must be in range [1, %d]", 
+        LOG_ERROR("block_dim (%d) must be in range [1, %d]",
                        block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;
     }
 
-    // Validate even distribution: block_dim must be divisible by scheduler thread count
-    // When launch_aicpu_num == 4: 3 schedulers + 1 orchestrator (thread 3 has 0 cores)
-    int scheduler_thread_num = (launch_aicpu_num == 4) ? 3 : launch_aicpu_num;
-    if (block_dim % scheduler_thread_num != 0) {
-        LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
-                       block_dim, scheduler_thread_num);
+    // Validate orchestrator configuration
+    int scheduler_thread_num = launch_aicpu_num - runtime.orch_thread_num;
+
+    if (runtime.orch_thread_num > launch_aicpu_num) {
+        LOG_ERROR("orch_thread_num (%d) cannot exceed aicpu_thread_num (%d)",
+                  runtime.orch_thread_num, launch_aicpu_num);
         return -1;
+    }
+
+    // Validate even core distribution for initial scheduler threads
+    // All-orchestrator mode (scheduler_thread_num == 0): cores assigned post-transition
+    if (scheduler_thread_num > 0) {
+        if (block_dim % scheduler_thread_num != 0) {
+            LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
+                      block_dim, scheduler_thread_num);
+            return -1;
+        }
+    } else {
+        LOG_INFO("All %d threads are orchestrators, cores will be assigned after orchestration completes",
+                 launch_aicpu_num);
+        // Post-transition: all threads become schedulers
+        if (block_dim % launch_aicpu_num != 0) {
+            LOG_WARN("block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
+                     "some threads will have different core counts after transition",
+                     block_dim, launch_aicpu_num);
+        }
     }
 
     // Ensure device is initialized

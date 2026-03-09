@@ -63,8 +63,6 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 __attribute__((visibility("default")))
 void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
-    (void)orch_thread_num;
-    (void)orch_thread_index;
 
     void* host_query = (void*)(uintptr_t)args[0];
     void* host_key_cache = (void*)(uintptr_t)args[1];
@@ -120,9 +118,10 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
         uint64_t q_offset = q_idx * q_tile;
 
-        for (uint64_t batch_start = 0; batch_start < batch; batch_start += IN_CORE_BATCH) {
-            uint64_t chunk_bc = batch - batch_start;
+        for (uint64_t chunk_idx = orch_thread_index; chunk_idx < num_chunks; chunk_idx += orch_thread_num) {
+            uint64_t chunk_bc = batch - chunk_idx * IN_CORE_BATCH;
             if (chunk_bc > IN_CORE_BATCH) chunk_bc = IN_CORE_BATCH;
+            uint64_t batch_start = chunk_idx * IN_CORE_BATCH;
 
             PTO2_SCOPE(rt) {
                 uint64_t oi_acc_shapes[2] = {chunk_bc * q_tile, head_dim};
