@@ -306,6 +306,16 @@ public:
     uint64_t upload_kernel_binary(int func_id, const uint8_t* bin_data, size_t bin_size);
 
     /**
+     * Remove a kernel binary from device memory
+     *
+     * Frees the device memory allocated for the kernel and removes the
+     * cached entry. This should be called during per-case cleanup.
+     *
+     * @param func_id   Function identifier to remove
+     */
+    void remove_kernel_binary(int func_id);
+
+    /**
      * Ensure device is set and streams are created (minimal initialization)
      *
      * This is called by set_device() C API to enable memory allocation

@@ -182,6 +182,16 @@ public:
      */
     uint64_t upload_kernel_binary(int func_id, const uint8_t* bin_data, size_t bin_size);
 
+    /**
+     * Remove a kernel binary from memory
+     *
+     * Closes the dlopen handle and removes the cached entry.
+     * This should be called during per-case cleanup.
+     *
+     * @param func_id   Function identifier to remove
+     */
+    void remove_kernel_binary(int func_id);
+
 private:
     DeviceRunner() = default;
     ~DeviceRunner();

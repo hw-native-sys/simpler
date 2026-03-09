@@ -342,14 +342,17 @@ int DeviceRunner::finalize() {
         perf_collector_.finalize(nullptr, free_cb, nullptr);
     }
 
-    // Close all dlopen'd kernel libraries
-    for (auto& pair : func_id_to_addr_) {
-        MappedKernel& kernel = pair.second;
-        if (kernel.dl_handle != nullptr) {
-            dlclose(kernel.dl_handle);
-            LOG_DEBUG("Closed dlopen kernel: func_id=%d", pair.first);
-            kernel.dl_handle = nullptr;
-            kernel.func_addr = 0;
+    // Kernel binaries should have been removed by validate_runtime_impl()
+    if (!func_id_to_addr_.empty()) {
+        LOG_ERROR("finalize() called with %zu kernel binaries still cached",
+                  func_id_to_addr_.size());
+        // Cleanup leaked handles
+        for (auto& pair : func_id_to_addr_) {
+            MappedKernel& kernel = pair.second;
+            if (kernel.dl_handle != nullptr) {
+                dlclose(kernel.dl_handle);
+                LOG_DEBUG("Closed leaked kernel: func_id=%d", pair.first);
+            }
         }
     }
     func_id_to_addr_.clear();
@@ -448,6 +451,21 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data
                   func_id, kernel.func_addr, handle);
 
     return kernel.func_addr;
+}
+
+void DeviceRunner::remove_kernel_binary(int func_id) {
+    auto it = func_id_to_addr_.find(func_id);
+    if (it == func_id_to_addr_.end()) {
+        return;
+    }
+
+    MappedKernel& kernel = it->second;
+    if (kernel.dl_handle != nullptr) {
+        dlclose(kernel.dl_handle);
+        LOG_DEBUG("Removed kernel binary (dlclose): func_id=%d, handle=%p", func_id, kernel.dl_handle);
+    }
+
+    func_id_to_addr_.erase(it);
 }
 
 // =============================================================================

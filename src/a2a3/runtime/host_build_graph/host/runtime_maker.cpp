@@ -212,12 +212,8 @@ int validate_runtime_impl(Runtime *runtime) {
     int kernel_count = runtime->get_registered_kernel_count();
     for (int i = 0; i < kernel_count; i++) {
         int func_id = runtime->get_registered_kernel_func_id(i);
-        uint64_t addr = runtime->get_function_bin_addr(func_id);
-        if (addr != 0) {
-            void* gm_addr = reinterpret_cast<void*>(addr - sizeof(uint64_t));
-            runtime->host_api.device_free(gm_addr);
-            runtime->set_function_bin_addr(func_id, 0);
-        }
+        runtime->host_api.remove_kernel_binary(func_id);
+        runtime->set_function_bin_addr(func_id, 0);
     }
     if (kernel_count > 0) {
         LOG_INFO("Freed %d kernel binaries", kernel_count);

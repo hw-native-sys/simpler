@@ -495,7 +495,17 @@ int DeviceRunner::finalize() {
     // Cleanup AICPU SO
     so_info_.finalize();
 
-    // Clear kernel address mapping
+    // Kernel binaries should have been removed by validate_runtime_impl()
+    if (!func_id_to_addr_.empty()) {
+        LOG_ERROR("finalize() called with %zu kernel binaries still cached (memory leak)",
+                  func_id_to_addr_.size());
+        // Cleanup leaked binaries to prevent memory leaks
+        for (const auto& pair : func_id_to_addr_) {
+            void* gm_addr = reinterpret_cast<void*>(pair.second);
+            mem_alloc_.free(gm_addr);
+            LOG_DEBUG("Freed leaked kernel binary: func_id=%d, addr=0x%lx", pair.first, pair.second);
+        }
+    }
     func_id_to_addr_.clear();
     binaries_loaded_ = false;
 
@@ -631,37 +641,43 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data
 
     LOG_DEBUG("Uploading kernel binary: func_id=%d, size=%zu bytes", func_id, bin_size);
 
-    // Allocate device GM memory (size field + binary data)
-    uint64_t alloc_size = sizeof(uint64_t) + bin_size;
-    void* gm_addr = mem_alloc_.alloc(alloc_size);
+    // Allocate device GM memory for kernel binary
+    void* gm_addr = mem_alloc_.alloc(bin_size);
     if (gm_addr == nullptr) {
         LOG_ERROR("Failed to allocate device GM memory for kernel func_id=%d", func_id);
         return 0;
     }
 
-    // Build host buffer with CoreFunctionBin structure (size + data)
-    std::vector<uint8_t> host_buf(alloc_size);
-    uint64_t* size_ptr = reinterpret_cast<uint64_t*>(host_buf.data());
-    *size_ptr = bin_size;
-    std::memcpy(host_buf.data() + sizeof(uint64_t), bin_data, bin_size);
-
-    // Copy to device
-    int rc = rtMemcpy(gm_addr, alloc_size, host_buf.data(), alloc_size, RT_MEMCPY_HOST_TO_DEVICE);
+    // Copy kernel binary to device
+    int rc = rtMemcpy(gm_addr, bin_size, bin_data, bin_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy to device failed: %d", rc);
         mem_alloc_.free(gm_addr);
         return 0;
     }
 
-    // Calculate function_bin_addr (skip size field to get actual code address)
-    uint64_t function_bin_addr = reinterpret_cast<uint64_t>(gm_addr) + sizeof(uint64_t);
-
-    // Cache for later reuse and cleanup
+    // Cache the kernel address
+    uint64_t function_bin_addr = reinterpret_cast<uint64_t>(gm_addr);
     func_id_to_addr_[func_id] = function_bin_addr;
 
     LOG_DEBUG("  func_id=%d -> function_bin_addr=0x%lx", func_id, function_bin_addr);
 
     return function_bin_addr;
+}
+
+void DeviceRunner::remove_kernel_binary(int func_id) {
+    auto it = func_id_to_addr_.find(func_id);
+    if (it == func_id_to_addr_.end()) {
+        return;
+    }
+
+    uint64_t function_bin_addr = it->second;
+    void* gm_addr = reinterpret_cast<void*>(function_bin_addr);
+
+    mem_alloc_.free(gm_addr);
+    func_id_to_addr_.erase(it);
+
+    LOG_DEBUG("Removed kernel binary: func_id=%d, addr=0x%lx", func_id, function_bin_addr);
 }
 
 int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, int device_id) {

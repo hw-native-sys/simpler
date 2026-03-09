@@ -41,6 +41,7 @@ void device_free(void* dev_ptr);
 int copy_to_device(void* dev_ptr, const void* host_ptr, size_t size);
 int copy_from_device(void* host_ptr, const void* dev_ptr, size_t size);
 uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t* bin_data, size_t bin_size);
+void remove_kernel_binary_wrapper(int func_id);
 
 /* ===========================================================================
  * Runtime API Implementation
@@ -79,6 +80,7 @@ int init_runtime(RuntimeHandle runtime,
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
         r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
+        r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
 
         // Delegate kernel registration, SO loading, and orchestration to init_runtime_impl
         int result = init_runtime_impl(r, orch_so_binary, orch_so_size,
@@ -153,6 +155,15 @@ uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t* bin_data, size
         return runner.upload_kernel_binary(func_id, bin_data, bin_size);
     } catch (...) {
         return 0;
+    }
+}
+
+void remove_kernel_binary_wrapper(int func_id) {
+    try {
+        DeviceRunner& runner = DeviceRunner::get();
+        runner.remove_kernel_binary(func_id);
+    } catch (...) {
+        // Ignore errors during cleanup
     }
 }
 
