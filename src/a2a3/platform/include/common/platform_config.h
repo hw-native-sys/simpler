@@ -79,11 +79,21 @@ constexpr int PLATFORM_MAX_CORES =
 constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 
 /**
+ * Phase profiling ring buffer depth per thread
+ * More buffers = less chance of data loss when Host is slow to drain.
+ * Memory cost per thread: PHASE_RING_DEPTH * ~512KB = ~8MB (4 threads = ~32MB total).
+ */
+constexpr int PLATFORM_PHASE_RING_DEPTH = 16;
+
+/**
  * Ready queue capacity for performance data collection
  * Queue holds (core_index, buffer_id) entries for buffers ready to be read by Host.
- * Capacity = PLATFORM_MAX_CORES * 2 (each core has 2 buffers: ping and pong)
+ * Includes both PerfRecord and PhaseRecord entries:
+ *   PerfRecord: PLATFORM_MAX_CORES * 2 (each core has 2 buffers)
+ *   Phase:      PLATFORM_MAX_AICPU_THREADS * PLATFORM_PHASE_RING_DEPTH
  */
-constexpr int PLATFORM_PROF_READYQUEUE_SIZE = PLATFORM_MAX_CORES * 2;  // 144
+constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
+    PLATFORM_MAX_CORES * 2 + PLATFORM_MAX_AICPU_THREADS * PLATFORM_PHASE_RING_DEPTH;  // 208
 
 /**
  * System counter frequency (get_sys_cnt)

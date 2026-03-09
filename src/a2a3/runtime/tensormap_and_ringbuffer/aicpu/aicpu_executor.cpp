@@ -903,6 +903,7 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     // Flush performance buffers for cores managed by this thread
     if (profiling_enabled) {
         perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, core_num);
+        perf_aicpu_flush_phase_buffers(thread_idx);
     }
 #endif
 
@@ -1174,6 +1175,8 @@ int AicpuExecutor::run(Runtime* runtime) {
                 int sched_threads = (thread_num_ == 4) ? 3 : thread_num_;
                 perf_aicpu_write_core_assignments(core_assignments_, core_count_per_thread_,
                                                    sched_threads, cores_total_num_);
+                // Flush orchestrator's phase record buffer
+                perf_aicpu_flush_phase_buffers(sched_threads);
             }
 #endif
 

@@ -159,4 +159,14 @@ void perf_aicpu_write_core_assignments(const int core_assignments[][PLATFORM_MAX
                                         int num_threads,
                                         int total_cores);
 
+/**
+ * Flush remaining phase records for a thread
+ *
+ * Marks the current WRITING phase buffer as READY and enqueues it
+ * for host collection. Called at thread exit (analogous to perf_aicpu_flush_buffers).
+ *
+ * @param thread_idx Thread index (scheduler thread or orchestrator)
+ */
+void perf_aicpu_flush_phase_buffers(int thread_idx);
+
 #endif  // PLATFORM_AICPU_PERFORMANCE_COLLECTOR_AICPU_H_

@@ -182,6 +182,20 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
     int empty_poll_count = 0;
     int last_logged_expected = -1;
 
+    // Pre-allocate phase record storage for double-buffer collection during polling
+    AicpuPhaseHeader* phase_header = get_phase_header(perf_shared_mem_host_, num_aicore_);
+    int num_sched_for_poll = 0;
+    if (phase_header->magic == AICPU_PHASE_MAGIC) {
+        num_sched_for_poll = phase_header->num_sched_threads;
+        if (num_sched_for_poll > PLATFORM_MAX_AICPU_THREADS) {
+            LOG_WARN("num_sched_threads %d capped to %d", num_sched_for_poll, PLATFORM_MAX_AICPU_THREADS);
+            num_sched_for_poll = PLATFORM_MAX_AICPU_THREADS;
+        }
+        collected_phase_records_.clear();
+        collected_phase_records_.resize(num_sched_for_poll);
+        collected_orch_phase_records_.clear();
+    }
+
     int current_thread = 0;
 
     while (total_records_collected < expected_tasks) {
@@ -227,32 +241,86 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
         empty_poll_count = 0;
 
         ReadyQueueEntry entry = header->queues[current_thread][head];
-        uint32_t core_index = entry.core_index;
-        uint32_t buffer_id = entry.buffer_id;
+        uint32_t raw_buffer_id = entry.buffer_id;
+        bool is_phase = (raw_buffer_id & PHASE_BUFFER_FLAG) != 0;
+        uint32_t buffer_id = raw_buffer_id & ~PHASE_BUFFER_FLAG;
 
-        if (core_index >= static_cast<uint32_t>(num_aicore)) {
-            LOG_ERROR("Invalid core_index %u (max=%d)", core_index, num_aicore);
-            break;
+        if (is_phase) {
+            // Phase buffer entry: core_index stores thread_idx, buffer_id is 1-based ring index
+            uint32_t thread_idx = entry.core_index;
+            if (thread_idx >= static_cast<uint32_t>(PLATFORM_MAX_AICPU_THREADS)) {
+                LOG_ERROR("Invalid phase thread_idx %u (max=%d)", thread_idx, PLATFORM_MAX_AICPU_THREADS);
+                header->queue_heads[current_thread] = (head + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
+                wmb();
+                continue;
+            }
+            uint32_t ring_idx = buffer_id - 1;  // Convert 1-based to 0-based
+            if (ring_idx >= static_cast<uint32_t>(PLATFORM_PHASE_RING_DEPTH)) {
+                LOG_ERROR("Invalid phase ring_idx %u for thread %u (buffer_id=%u)",
+                         ring_idx, thread_idx, buffer_id);
+                header->queue_heads[current_thread] = (head + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
+                wmb();
+                continue;
+            }
+            PhaseRingBuffer* ring = get_phase_ring_buffer(perf_shared_mem_host_, num_aicore_, thread_idx);
+            PhaseBuffer* pbuf = nullptr;
+            volatile BufferStatus* pstatus = nullptr;
+            get_phase_buffer_by_idx(ring, ring_idx, &pbuf, &pstatus);
+
+            rmb();
+            uint32_t count = pbuf->count;
+            if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
+                count = PLATFORM_PHASE_RECORDS_PER_THREAD;
+            }
+
+            LOG_DEBUG("Processing phase: thread=%u, buffer=%u, count=%u", thread_idx, buffer_id, count);
+
+            // Store phase records: scheduler threads → collected_phase_records_,
+            // orchestrator thread → collected_orch_phase_records_
+            if (thread_idx < static_cast<uint32_t>(num_sched_for_poll)) {
+                for (uint32_t i = 0; i < count; i++) {
+                    collected_phase_records_[thread_idx].push_back(pbuf->records[i]);
+                }
+            } else {
+                for (uint32_t i = 0; i < count; i++) {
+                    collected_orch_phase_records_.push_back(pbuf->records[i]);
+                }
+            }
+
+            pbuf->count = 0;
+            *pstatus = BufferStatus::IDLE;
+            // Phase records don't count toward total_records_collected
+        } else {
+            // PerfRecord buffer entry (original logic)
+            uint32_t core_index = entry.core_index;
+
+            if (core_index >= static_cast<uint32_t>(num_aicore)) {
+                LOG_ERROR("Invalid core_index %u (max=%d)", core_index, num_aicore);
+                header->queue_heads[current_thread] = (head + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
+                wmb();
+                continue;
+            }
+
+            LOG_DEBUG("Processing: thread=%d, core=%u, buffer=%u", current_thread, core_index, buffer_id);
+
+            DoubleBuffer* db = &buffers[core_index];
+            PerfBuffer* buf = nullptr;
+            volatile BufferStatus* status = nullptr;
+            get_buffer_and_status(db, buffer_id, &buf, &status);
+
+            rmb();
+            uint32_t count = buf->count;
+            LOG_DEBUG("  Records in buffer: %u", count);
+
+            for (uint32_t i = 0; i < count && i < PLATFORM_PROF_BUFFER_SIZE; i++) {
+                collected_perf_records_[core_index].push_back(buf->records[i]);
+                total_records_collected++;
+            }
+
+            buf->count = 0;
+            *status = BufferStatus::IDLE;
         }
 
-        LOG_DEBUG("Processing: thread=%d, core=%u, buffer=%u", current_thread, core_index, buffer_id);
-
-        DoubleBuffer* db = &buffers[core_index];
-        PerfBuffer* buf = nullptr;
-        volatile BufferStatus* status = nullptr;
-        get_buffer_and_status(db, buffer_id, &buf, &status);
-
-        rmb();
-        uint32_t count = buf->count;
-        LOG_DEBUG("  Records in buffer: %u", count);
-
-        for (uint32_t i = 0; i < count && i < PLATFORM_PROF_BUFFER_SIZE; i++) {
-            collected_perf_records_[core_index].push_back(buf->records[i]);
-            total_records_collected++;
-        }
-
-        buf->count = 0;
-        *status = BufferStatus::IDLE;
         header->queue_heads[current_thread] = (head + 1) % PLATFORM_PROF_READYQUEUE_SIZE;
         wmb();
 
@@ -298,38 +366,54 @@ void PerformanceCollector::collect_phase_data() {
                   num_sched_threads, PLATFORM_MAX_AICPU_THREADS);
         return;
     }
-    LOG_INFO("Collecting phase data: %d scheduler threads", num_sched_threads);
+    LOG_INFO("Collecting remaining phase data: %d scheduler threads", num_sched_threads);
 
-    // Read per-thread phase records
-    collected_phase_records_.clear();
-    collected_phase_records_.resize(num_sched_threads);
-
-    int total_phase_records = 0;
-    for (int t = 0; t < num_sched_threads; t++) {
-        uint32_t count = phase_header->buffer_counts[t];
-        if (count > PLATFORM_PHASE_RECORDS_PER_THREAD) {
-            count = PLATFORM_PHASE_RECORDS_PER_THREAD;
-        }
-
-        AicpuPhaseRecord* records = get_phase_records(perf_shared_mem_host_, num_aicore_, t);
-        collected_phase_records_[t].assign(records, records + count);
-        total_phase_records += count;
-        LOG_INFO("  Thread %d: %u phase records", t, count);
+    // Ensure collected_phase_records_ is allocated (may already have data from poll_and_collect)
+    int total_slots = (num_sched_threads < PLATFORM_MAX_AICPU_THREADS)
+                      ? num_sched_threads + 1 : num_sched_threads;
+    if (collected_phase_records_.size() < static_cast<size_t>(num_sched_threads)) {
+        collected_phase_records_.resize(num_sched_threads);
     }
 
-    // Read orchestrator per-task phase records (slot = num_sched_threads)
-    collected_orch_phase_records_.clear();
-    if (num_sched_threads < PLATFORM_MAX_AICPU_THREADS) {
-        uint32_t orch_count = phase_header->buffer_counts[num_sched_threads];
-        if (orch_count > PLATFORM_PHASE_RECORDS_PER_THREAD) {
-            orch_count = PLATFORM_PHASE_RECORDS_PER_THREAD;
+    // Scan remaining PhaseRingBuffers (READY or WRITING with data)
+    int total_phase_records = 0;
+    for (int t = 0; t < total_slots; t++) {
+        PhaseRingBuffer* ring = get_phase_ring_buffer(perf_shared_mem_host_, num_aicore_, t);
+
+        for (int idx = 0; idx < PLATFORM_PHASE_RING_DEPTH; idx++) {
+            PhaseBuffer* pbuf = nullptr;
+            volatile BufferStatus* pstatus = nullptr;
+            get_phase_buffer_by_idx(ring, idx, &pbuf, &pstatus);
+
+            rmb();
+            BufferStatus st = *pstatus;
+            if ((st == BufferStatus::READY || st == BufferStatus::WRITING) && pbuf->count > 0) {
+                uint32_t count = pbuf->count;
+                if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
+                    count = PLATFORM_PHASE_RECORDS_PER_THREAD;
+                }
+
+                // Scheduler threads go to collected_phase_records_, orchestrator to orch
+                if (t < num_sched_threads) {
+                    for (uint32_t i = 0; i < count; i++) {
+                        collected_phase_records_[t].push_back(pbuf->records[i]);
+                    }
+                } else {
+                    for (uint32_t i = 0; i < count; i++) {
+                        collected_orch_phase_records_.push_back(pbuf->records[i]);
+                    }
+                }
+                total_phase_records += count;
+            }
         }
-        if (orch_count > 0) {
-            AicpuPhaseRecord* orch_records = get_phase_records(perf_shared_mem_host_, num_aicore_, num_sched_threads);
-            collected_orch_phase_records_.assign(orch_records, orch_records + orch_count);
-            total_phase_records += orch_count;
-            LOG_INFO("  Orchestrator: %u per-task phase records", orch_count);
-        }
+    }
+
+    // Log per-thread totals
+    for (int t = 0; t < num_sched_threads; t++) {
+        LOG_INFO("  Thread %d: %zu phase records", t, collected_phase_records_[t].size());
+    }
+    if (!collected_orch_phase_records_.empty()) {
+        LOG_INFO("  Orchestrator: %zu per-task phase records", collected_orch_phase_records_.size());
     }
 
     // Read orchestrator summary
@@ -354,8 +438,8 @@ void PerformanceCollector::collect_phase_data() {
         LOG_INFO("  Core-to-thread mapping: %d cores", num_cores);
     }
 
-    LOG_INFO("Phase data collection complete: %d records (%zu orch), orch_summary=%s",
-             total_phase_records, collected_orch_phase_records_.size(), orch_valid ? "yes" : "no");
+    LOG_INFO("Phase data collection complete: %d remaining records, orch_summary=%s",
+             total_phase_records, orch_valid ? "yes" : "no");
 }
 
 int PerformanceCollector::export_swimlane_json(const std::string& output_path) {

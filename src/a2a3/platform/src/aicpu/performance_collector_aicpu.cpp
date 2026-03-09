@@ -12,7 +12,10 @@
 
 // Cached phase profiling pointers (set during init, used on hot path)
 static AicpuPhaseHeader* s_phase_header = nullptr;
-static AicpuPhaseRecord* s_phase_records[PLATFORM_MAX_AICPU_THREADS] = {};
+static PhaseRingBuffer* s_phase_rings[PLATFORM_MAX_AICPU_THREADS] = {};
+static PhaseBuffer* s_current_phase_buf[PLATFORM_MAX_AICPU_THREADS] = {};
+static uint32_t s_phase_write_idx[PLATFORM_MAX_AICPU_THREADS] = {};
+static PerfDataHeader* s_perf_header = nullptr;
 static int s_orch_thread_idx = -1;
 
 /**
@@ -306,32 +309,100 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads) {
     }
 
     s_phase_header = get_phase_header(perf_base, runtime->worker_count);
+    s_perf_header = get_perf_header(perf_base);
 
     s_phase_header->magic = AICPU_PHASE_MAGIC;
     s_phase_header->num_sched_threads = num_sched_threads;
     s_phase_header->records_per_thread = PLATFORM_PHASE_RECORDS_PER_THREAD;
     s_phase_header->num_cores = 0;
 
-    for (int i = 0; i < PLATFORM_MAX_AICPU_THREADS; i++) {
-        s_phase_header->buffer_counts[i] = 0;
-    }
-
     memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
     memset(&s_phase_header->orch_summary, 0, sizeof(AicpuOrchSummary));
 
-    // Cache per-thread record pointers and clear buffers
-    // Include orchestrator slot (index = num_sched_threads) if within bounds
+    // Initialize per-thread PhaseRingBuffers (scheduler threads + orchestrator slot)
     int total_threads = (num_sched_threads < PLATFORM_MAX_AICPU_THREADS)
                         ? num_sched_threads + 1 : num_sched_threads;
     for (int t = 0; t < total_threads; t++) {
-        s_phase_records[t] = get_phase_records(perf_base, runtime->worker_count, t);
-        memset(s_phase_records[t], 0, PLATFORM_PHASE_RECORDS_PER_THREAD * sizeof(AicpuPhaseRecord));
+        PhaseRingBuffer* ring = get_phase_ring_buffer(perf_base, runtime->worker_count, t);
+        memset(ring, 0, sizeof(PhaseRingBuffer));
+
+        // First buffer starts as WRITING, rest as IDLE
+        ring->buffer_status[0] = BufferStatus::WRITING;
+        for (int i = 1; i < PLATFORM_PHASE_RING_DEPTH; i++) {
+            ring->buffer_status[i] = BufferStatus::IDLE;
+        }
+
+        s_phase_rings[t] = ring;
+        s_current_phase_buf[t] = &ring->buffers[0];
+        s_phase_write_idx[t] = 0;
+        s_phase_header->current_buffer_idx[t] = 0;
+    }
+
+    // Clear remaining slots
+    for (int t = total_threads; t < PLATFORM_MAX_AICPU_THREADS; t++) {
+        s_phase_rings[t] = nullptr;
+        s_current_phase_buf[t] = nullptr;
+        s_phase_write_idx[t] = 0;
+        s_phase_header->current_buffer_idx[t] = 0;
     }
 
     wmb();
 
-    LOG_INFO("Phase profiling initialized: %d scheduler threads (+1 orch), %d records/thread",
-             num_sched_threads, PLATFORM_PHASE_RECORDS_PER_THREAD);
+    LOG_INFO("Phase profiling initialized: %d scheduler threads (+1 orch), %d records/buffer, ring depth %d",
+             num_sched_threads, PLATFORM_PHASE_RECORDS_PER_THREAD, PLATFORM_PHASE_RING_DEPTH);
+}
+
+/**
+ * Switch phase buffer when current buffer is full (non-blocking ring buffer version)
+ *
+ * Marks the full buffer as READY, enqueues it to the per-thread ready queue,
+ * and advances to the next buffer in the ring. Never spins or blocks.
+ * If the next buffer is not IDLE, it is forcibly reclaimed (data discarded).
+ */
+static void switch_phase_buffer(int thread_idx) {
+    PhaseRingBuffer* ring = s_phase_rings[thread_idx];
+    if (ring == nullptr) return;
+
+    uint32_t cur_idx = s_phase_write_idx[thread_idx];
+
+    LOG_INFO("Thread %d: phase ring[%u] is full (count=%u)",
+             thread_idx, cur_idx, ring->buffers[cur_idx].count);
+
+    // Mark current buffer as READY
+    ring->buffer_status[cur_idx] = BufferStatus::READY;
+
+    // Enqueue full buffer with PHASE_BUFFER_FLAG (buffer_id is 1-based: idx+1)
+    int rc = enqueue_ready_buffer(s_perf_header, thread_idx, thread_idx,
+                                  (cur_idx + 1) | PHASE_BUFFER_FLAG);
+    if (rc != 0) {
+        LOG_ERROR("Thread %d: failed to enqueue phase ring[%u] (queue full), discarding data",
+                 thread_idx, cur_idx);
+        // Revert: discard data and keep writing to current buffer
+        ring->buffer_status[cur_idx] = BufferStatus::WRITING;
+        ring->buffers[cur_idx].count = 0;
+        wmb();
+        return;
+    }
+
+    // Advance to next buffer in ring (non-blocking)
+    uint32_t next_idx = (cur_idx + 1) % PLATFORM_PHASE_RING_DEPTH;
+
+    rmb();
+    if (ring->buffer_status[next_idx] != BufferStatus::IDLE) {
+        LOG_WARN("Thread %d: phase ring[%u] not idle (status=%u), discarding and reusing",
+                 thread_idx, next_idx, static_cast<uint32_t>(ring->buffer_status[next_idx]));
+    }
+
+    ring->buffers[next_idx].count = 0;
+    ring->buffer_status[next_idx] = BufferStatus::WRITING;
+
+    s_phase_write_idx[thread_idx] = next_idx;
+    s_current_phase_buf[thread_idx] = &ring->buffers[next_idx];
+    s_phase_header->current_buffer_idx[thread_idx] = next_idx;
+
+    wmb();
+
+    LOG_INFO("Thread %d: switched to phase ring[%u]", thread_idx, next_idx);
 }
 
 void perf_aicpu_record_phase(int thread_idx,
@@ -342,14 +413,22 @@ void perf_aicpu_record_phase(int thread_idx,
         return;
     }
 
-    uint32_t idx = s_phase_header->buffer_counts[thread_idx];
+    PhaseBuffer* buf = s_current_phase_buf[thread_idx];
+    if (buf == nullptr) return;
+
+    uint32_t idx = buf->count;
 
     if (idx >= PLATFORM_PHASE_RECORDS_PER_THREAD) {
-        return;  // Buffer full, silently drop
+        // Buffer full, switch to alternate
+        switch_phase_buffer(thread_idx);
+        buf = s_current_phase_buf[thread_idx];
+        idx = buf->count;
+        if (idx >= PLATFORM_PHASE_RECORDS_PER_THREAD) {
+            return;  // Ring buffer not available or switch failed; drop this record
+        }
     }
 
-    AicpuPhaseRecord* record = &s_phase_records[thread_idx][idx];
-
+    AicpuPhaseRecord* record = &buf->records[idx];
     record->start_time = start_time;
     record->end_time = end_time;
     record->loop_iter = loop_iter;
@@ -357,7 +436,7 @@ void perf_aicpu_record_phase(int thread_idx,
     record->tasks_processed = tasks_processed;
     record->padding = 0;
 
-    s_phase_header->buffer_counts[thread_idx] = idx + 1;
+    buf->count = idx + 1;
 }
 
 void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src) {
@@ -387,6 +466,35 @@ void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
                                    uint32_t submit_idx, uint32_t task_id) {
     if (s_orch_thread_idx < 0 || s_phase_header == nullptr) return;
     perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
+}
+
+void perf_aicpu_flush_phase_buffers(int thread_idx) {
+    if (s_phase_header == nullptr || s_perf_header == nullptr) {
+        return;
+    }
+
+    PhaseBuffer* buf = s_current_phase_buf[thread_idx];
+    if (buf == nullptr || buf->count == 0) {
+        return;
+    }
+
+    PhaseRingBuffer* ring = s_phase_rings[thread_idx];
+    uint32_t cur_idx = s_phase_write_idx[thread_idx];
+
+    ring->buffer_status[cur_idx] = BufferStatus::READY;
+
+    int rc = enqueue_ready_buffer(s_perf_header, thread_idx, thread_idx,
+                                  (cur_idx + 1) | PHASE_BUFFER_FLAG);
+    if (rc == 0) {
+        LOG_INFO("Thread %d: flushed phase ring[%u] with %u records",
+                 thread_idx, cur_idx, buf->count);
+    } else {
+        LOG_ERROR("Thread %d: failed to enqueue phase ring[%u] (queue full), data lost!",
+                 thread_idx, cur_idx);
+        ring->buffer_status[cur_idx] = BufferStatus::WRITING;
+    }
+
+    wmb();
 }
 
 void perf_aicpu_write_core_assignments(const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD],

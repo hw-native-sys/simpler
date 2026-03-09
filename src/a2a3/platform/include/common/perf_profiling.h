@@ -22,18 +22,20 @@
  * ├─────────────────────────────────────────────────────────────┤
  * │ AicpuPhaseHeader (optional, present when phase profiling)   │
  * │  - magic, num_sched_threads, records_per_thread             │
- * │  - buffer_counts[PLATFORM_MAX_AICPU_THREADS]                │
+ * │  - current_buffer_idx[PLATFORM_MAX_AICPU_THREADS]           │
  * │  - orch_summary                                             │
  * ├─────────────────────────────────────────────────────────────┤
- * │ AicpuPhaseRecord[thread0][0..records_per_thread-1]          │
+ * │ PhaseRingBuffer[thread0]                                    │
+ * │  - buffers[0..N-1] (PhaseBuffer ring, N=PHASE_RING_DEPTH)  │
+ * │  - buffer_status[0..N-1]                                    │
  * ├─────────────────────────────────────────────────────────────┤
- * │ AicpuPhaseRecord[thread1][0..records_per_thread-1]          │
+ * │ PhaseRingBuffer[thread1]                                    │
  * ├─────────────────────────────────────────────────────────────┤
  * │ ...                                                         │
  * └─────────────────────────────────────────────────────────────┘
  *
  * Base size = sizeof(PerfDataHeader) + num_cores * sizeof(DoubleBuffer)
- * With phases = Base + sizeof(AicpuPhaseHeader) + num_sched_threads * records_per_thread * sizeof(AicpuPhaseRecord)
+ * With phases = Base + sizeof(AicpuPhaseHeader) + num_threads * sizeof(PhaseRingBuffer)
  */
 
 #ifndef PLATFORM_COMMON_PERF_PROFILING_H_
@@ -152,10 +154,14 @@ struct DoubleBuffer {
  *
  * When a buffer on a core is full, AICPU adds this entry to the queue.
  * Host retrieves entries from the queue to locate (core_index, buffer_id) for reading.
+ *
+ * Entry types (distinguished by PHASE_BUFFER_FLAG in buffer_id):
+ * - PerfRecord entry: core_index = core ID, buffer_id = 1 or 2
+ * - Phase entry:      core_index = thread_idx, buffer_id = (ring_idx+1) | PHASE_BUFFER_FLAG
  */
 struct ReadyQueueEntry {
-    uint32_t core_index;      // Core index (0 ~ num_cores-1)
-    uint32_t buffer_id;       // Buffer ID (1=buffer1, 2=buffer2)
+    uint32_t core_index;      // Core index (0 ~ num_cores-1), or thread_idx for phase entries
+    uint32_t buffer_id;       // PerfRecord: 1 or 2; Phase: (ring_idx+1) | PHASE_BUFFER_FLAG
 } __attribute__((aligned(16)));
 
 // =============================================================================
@@ -260,17 +266,46 @@ constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;  // "ACPH"
 constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;  // ~512KB per thread
 
 /**
+ * Flag bit in ReadyQueueEntry.buffer_id to distinguish phase entries from core entries.
+ * Phase entry: buffer_id = (ring_idx+1) | PHASE_BUFFER_FLAG
+ */
+constexpr uint32_t PHASE_BUFFER_FLAG = 0x80000000;
+
+/**
+ * Fixed-size phase record buffer (analogous to PerfBuffer)
+ *
+ * Capacity: PLATFORM_PHASE_RECORDS_PER_THREAD
+ */
+struct PhaseBuffer {
+    AicpuPhaseRecord records[PLATFORM_PHASE_RECORDS_PER_THREAD];
+    volatile uint32_t count;
+} __attribute__((aligned(64)));
+
+/**
+ * Per-thread phase ring buffer with status management
+ *
+ * N independent PhaseBuffers with independent status fields, forming a ring.
+ * AICPU manages buffer allocation and status transitions (IDLE→WRITING→READY).
+ * Host reads ready buffers and resets status to idle (READY→IDLE).
+ * Ring depth is PLATFORM_PHASE_RING_DEPTH (default 16).
+ */
+struct PhaseRingBuffer {
+    PhaseBuffer buffers[PLATFORM_PHASE_RING_DEPTH];
+    volatile BufferStatus buffer_status[PLATFORM_PHASE_RING_DEPTH];
+} __attribute__((aligned(64)));
+
+/**
  * AICPU phase profiling header
  *
  * Located after the DoubleBuffer array in shared memory.
- * Contains metadata and per-thread record counts.
+ * Contains metadata and per-thread buffer tracking.
  */
 struct AicpuPhaseHeader {
     uint32_t magic;                  // Validation magic (AICPU_PHASE_MAGIC)
     uint32_t num_sched_threads;      // Number of scheduler threads
-    uint32_t records_per_thread;     // Max records per thread
+    uint32_t records_per_thread;     // Max records per PhaseBuffer
     uint32_t num_cores;              // Total number of cores with valid assignments
-    volatile uint32_t buffer_counts[PLATFORM_MAX_AICPU_THREADS];  // Per-thread record counts
+    uint32_t current_buffer_idx[PLATFORM_MAX_AICPU_THREADS];  // Per-thread active ring index (0..N-1)
     int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
     AicpuOrchSummary orch_summary;   // Orchestrator cumulative data
 } __attribute__((aligned(64)));
@@ -351,13 +386,13 @@ inline void get_buffer_and_status(DoubleBuffer* db, uint32_t buffer_id,
  * Calculate total memory size including phase profiling region
  *
  * @param num_cores Number of AICore instances
- * @param num_sched_threads Number of scheduler threads (typically 3)
+ * @param num_sched_threads Number of phase profiling threads (scheduler + orchestrator)
  * @return Total bytes needed
  */
 inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_threads) {
     return calc_perf_data_size(num_cores)
          + sizeof(AicpuPhaseHeader)
-         + num_sched_threads * PLATFORM_PHASE_RECORDS_PER_THREAD * sizeof(AicpuPhaseRecord);
+         + num_sched_threads * sizeof(PhaseRingBuffer);
 }
 
 /**
@@ -372,16 +407,40 @@ inline AicpuPhaseHeader* get_phase_header(void* base_ptr, int num_cores) {
 }
 
 /**
- * Get AicpuPhaseRecord array for specified thread
+ * Get PhaseRingBuffer array start address (located after AicpuPhaseHeader)
  *
  * @param base_ptr Shared memory base address
  * @param num_cores Number of AICore instances
- * @param thread_idx Scheduler thread index
- * @return AicpuPhaseRecord array pointer
+ * @return PhaseRingBuffer array pointer
  */
-inline AicpuPhaseRecord* get_phase_records(void* base_ptr, int num_cores, int thread_idx) {
-    char* phase_start = (char*)get_phase_header(base_ptr, num_cores) + sizeof(AicpuPhaseHeader);
-    return (AicpuPhaseRecord*)(phase_start + thread_idx * PLATFORM_PHASE_RECORDS_PER_THREAD * sizeof(AicpuPhaseRecord));
+inline PhaseRingBuffer* get_phase_ring_buffers(void* base_ptr, int num_cores) {
+    return (PhaseRingBuffer*)((char*)get_phase_header(base_ptr, num_cores) + sizeof(AicpuPhaseHeader));
+}
+
+/**
+ * Get PhaseRingBuffer for specified thread
+ *
+ * @param base_ptr Shared memory base address
+ * @param num_cores Number of AICore instances
+ * @param thread_idx Thread index
+ * @return PhaseRingBuffer pointer
+ */
+inline PhaseRingBuffer* get_phase_ring_buffer(void* base_ptr, int num_cores, int thread_idx) {
+    return &get_phase_ring_buffers(base_ptr, num_cores)[thread_idx];
+}
+
+/**
+ * Get phase buffer pointer and status pointer by ring index
+ *
+ * @param ring PhaseRingBuffer pointer
+ * @param idx Ring buffer index (0..PLATFORM_PHASE_RING_DEPTH-1)
+ * @param[out] buf PhaseBuffer pointer
+ * @param[out] status Status pointer
+ */
+inline void get_phase_buffer_by_idx(PhaseRingBuffer* ring, uint32_t idx,
+                                     PhaseBuffer** buf, volatile BufferStatus** status) {
+    *buf = &ring->buffers[idx];
+    *status = &ring->buffer_status[idx];
 }
 
 #ifdef __cplusplus
