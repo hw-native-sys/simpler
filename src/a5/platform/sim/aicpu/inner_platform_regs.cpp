@@ -1,0 +1,37 @@
+/**
+ * @file inner_platform_regs.cpp
+ * @brief AICPU register read/write for simulation (a5sim)
+ *
+ * Simulated registers are two compact 4KB pages per core (8KB total).
+ * sparse_reg_ptr() remaps hardware offsets to this layout:
+ *   offset < 0x5000  -> page 0: reg_base + offset
+ *   offset >= 0x5000 -> page 1: reg_base + 0x1000 + (offset - 0x5000)
+ */
+
+#include <cstdint>
+#include "aicpu/platform_regs.h"
+#include "common/platform_config.h"
+
+uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
+    uint32_t offset = reg_offset(reg);
+    volatile uint8_t* reg_base = reinterpret_cast<volatile uint8_t*>(reg_base_addr);
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(
+        sparse_reg_ptr(reg_base, offset));
+
+    __sync_synchronize();
+    uint64_t value = static_cast<uint64_t>(*ptr);
+    __sync_synchronize();
+
+    return value;
+}
+
+void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
+    uint32_t offset = reg_offset(reg);
+    volatile uint8_t* reg_base = reinterpret_cast<volatile uint8_t*>(reg_base_addr);
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(
+        sparse_reg_ptr(reg_base, offset));
+
+    __sync_synchronize();
+    *ptr = static_cast<uint32_t>(value);
+    __sync_synchronize();
+}
