@@ -249,17 +249,6 @@ public:
     int export_swimlane_json(const std::string& output_path = "outputs");
 
     /**
-     * Clean cached resources - lightweight cleanup between tests
-     *
-     * Cleans up test-specific resources while preserving device resources for reuse:
-     * - Frees kernel memory from global memory allocator
-     * - Clears kernel address cache
-     *
-     * @return 0 on success, error code on failure
-     */
-    int clean_cache();
-
-    /**
      * Cleanup all resources
      *
      * Frees all device memory, destroys streams, and resets state.

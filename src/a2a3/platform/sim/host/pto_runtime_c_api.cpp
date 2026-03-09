@@ -197,13 +197,6 @@ int finalize_runtime(RuntimeHandle runtime) {
         Runtime* r = static_cast<Runtime*>(runtime);
         int rc = validate_runtime_impl(r);
 
-        // Clean cached resources before finalization
-        DeviceRunner& runner = DeviceRunner::get();
-        runner.clean_cache();
-
-        // Finalize DeviceRunner (clears last_runtime_ to avoid dangling pointer)
-        runner.finalize();
-
         // Call destructor (user will call free())
         r->~Runtime();
         return rc;

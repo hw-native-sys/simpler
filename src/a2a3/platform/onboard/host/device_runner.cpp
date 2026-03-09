@@ -383,6 +383,10 @@ int DeviceRunner::run(Runtime& runtime,
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -392,6 +396,10 @@ int DeviceRunner::run(Runtime& runtime,
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", launch_aicpu_num);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -401,6 +409,10 @@ int DeviceRunner::run(Runtime& runtime,
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.args.runtime_args);
     if (rc != 0) {
         LOG_ERROR("launch_aicore_kernel failed: %d", rc);
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -415,6 +427,10 @@ int DeviceRunner::run(Runtime& runtime,
     rc = rtStreamSynchronize(stream_aicpu_);
     if (rc != 0) {
         LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -423,6 +439,10 @@ int DeviceRunner::run(Runtime& runtime,
     rc = rtStreamSynchronize(stream_aicore_);
     if (rc != 0) {
         LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -433,7 +453,15 @@ int DeviceRunner::run(Runtime& runtime,
         export_swimlane_json();
     }
 
-    // Note: FinalizeRuntimeArgs is deferred to Finalize() so PrintHandshakeResults can access device data
+    // Print handshake results (reads from device memory, must be before free)
+    print_handshake_results();
+
+    // Free per-run resources
+    if (kernel_args_.args.regs != 0) {
+        mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+        kernel_args_.args.regs = 0;
+    }
+    kernel_args_.finalize_runtime_args();
 
     return 0;
 }
@@ -456,30 +484,10 @@ void DeviceRunner::print_handshake_results() {
     }
 }
 
-int DeviceRunner::clean_cache() {
-    if (stream_aicpu_ == nullptr) {
-        return 0;  // Nothing to cleanup if device not initialized
-    }
-    for (const auto& [func_id, addr] : func_id_to_addr_) {
-        void* gm_addr = reinterpret_cast<void*>(addr - sizeof(uint64_t));
-        mem_alloc_.free(gm_addr);
-    }
-    func_id_to_addr_.clear();
-
-    LOG_INFO("DeviceRunner: cache cleaned (test-specific resources only)");
-    return 0;
-}
-
 int DeviceRunner::finalize() {
     if (stream_aicpu_ == nullptr) {
         return 0;
     }
-
-    // Print handshake results before cleanup (reads from device memory)
-    print_handshake_results();
-
-    // Cleanup runtime args (deferred from Run)
-    kernel_args_.finalize_runtime_args();
 
     // Cleanup kernel args (deviceArgs)
     kernel_args_.finalize_device_args();

@@ -157,17 +157,6 @@ public:
     int export_swimlane_json(const std::string& output_path = "outputs");
 
     /**
-     * Clean cached resources - lightweight cleanup between tests
-     *
-     * Cleans up test-specific resources while preserving device resources for reuse:
-     * - Closes dlopen'd kernel libraries (different tests may have different kernels)
-     * - Clears kernel address cache
-     *
-     * @return 0 on success, error code on failure
-     */
-    int clean_cache();
-
-    /**
      * Cleanup all resources
      *
      * Use this for final cleanup when no more tests will run.
