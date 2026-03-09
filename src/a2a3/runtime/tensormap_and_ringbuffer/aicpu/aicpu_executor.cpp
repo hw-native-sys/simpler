@@ -174,7 +174,6 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     for (int i = 0; i < cores_total_num_; i++) {
         Handshake* hank = &all_handshakes[i];
         while (hank->aicore_done == 0) {
-            // Spin wait for core to respond
         }
 
         CoreType type = hank->core_type;
@@ -1084,7 +1083,7 @@ int AicpuExecutor::run(Runtime* runtime) {
                 SPIN_WAIT_HINT();
             }
 
-            // Call orchestration function wrapped in an outer scope
+            // Call orchestration wrapped in outer scope (matches old PTO2_ORCHESTRATION behavior)
             DEV_INFO("Thread %d: Calling aicpu_orchestration_entry from SO", thread_idx);
 #if PTO2_PROFILING
             DEV_ALWAYS("BENCHMARK: thread=%d orch_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
@@ -1256,14 +1255,11 @@ int AicpuExecutor::run(Runtime* runtime) {
 }
 
 void AicpuExecutor::deinit(Runtime* runtime) {
-    // === Exit cleanup: reset all inter-round state ===
-
     // 1. Invalidate AICPU cache for Runtime address range.
     //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
     cache_invalidate_range(runtime, sizeof(Runtime));
 
-    // === Existing reset logic ===
     // Reset per-core dispatch timestamps and task counters
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
