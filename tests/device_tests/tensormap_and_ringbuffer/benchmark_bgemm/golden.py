@@ -24,10 +24,10 @@ SUPPORTED_INCORE_DATA_SIZES = {16, 32, 64, 128}
 
 ALL_CASES = {
     "Case1": {
-        "matmul_add_task_num": 64,
+        "matmul_add_task_num": 500,
         "incore_task_granularity": {
-            "incore_data_size": 128,
-            "incore_loop": 4,
+            "incore_data_size": 64,
+            "incore_loop": 6,
         },
         "grid_k": 2,
     },

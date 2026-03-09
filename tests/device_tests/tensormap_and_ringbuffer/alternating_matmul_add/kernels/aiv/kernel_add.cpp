@@ -69,7 +69,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* src1_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
     __gm__ Tensor* out_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
 
-    constexpr uint64_t TILE_ELEMS = 64 * 128;
+    constexpr uint64_t TILE_ELEMS = 64 * 64;
     int num_tiles = get_num_tiles(src0_tensor, TILE_ELEMS);
 
     __gm__ float* base_src0 = reinterpret_cast<__gm__ float*>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
@@ -81,6 +81,6 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
         __gm__ float* src1_ptr = base_src1 + (tile_idx * TILE_ELEMS);
         __gm__ float* out_ptr = base_out + (tile_idx * TILE_ELEMS);
 
-        add_impl<64, 128>(src0_ptr, src1_ptr, out_ptr);
+        add_impl<64, 64>(src0_ptr, src1_ptr, out_ptr);
     }
 }

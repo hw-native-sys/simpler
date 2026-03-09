@@ -37,8 +37,8 @@
 #define ARG_SIZE_Z     11
 #define ARG_PTR_CONFIG 12
 
-static constexpr uint64_t MATMUL_ELEMS = 128 * 128;
-static constexpr uint64_t ADD_ELEMS = 64 * 128;
+static constexpr uint64_t MATMUL_ELEMS = 64 * 64;
+static constexpr uint64_t ADD_ELEMS = 64 * 64;
 
 extern "C" {
 

@@ -19,24 +19,25 @@ ATOL = 1e-3
 
 ALL_CASES = {
     "case1": {
+        "batch": 500,
+        "M": 6,
+        "N": 6,
+        "random_seed": False,
+        "matmul_batch": 6,
+        "add_batch": 6,
+    },
+    "case2": {
         "batch": 512,
         "M": 2,  # Number of matmul tasks per batch
         "N": 5,  # Number of add tasks per batch
         "random_seed": True,  # False = use fixed seed (42), True = random seed
-        "matmul_batch": 2,  # Number of matmul tiles per task
+        "matmul_batch": 4,  # Number of matmul tiles per task
         "add_batch": 5,  # Number of add tiles per task
     },
-    "case2": {
-        "batch": 1024,
-        "M": 1,
-        "N": 1,
-        "random_seed": False,
-        "matmul_batch": 1,
-        "add_batch": 1,
-    },
+    
 }
 
-DEFAULT_CASE = "case2"
+DEFAULT_CASE = "case1"
 
 
 def generate_inputs(params: dict) -> list:
@@ -83,9 +84,9 @@ def generate_inputs(params: dict) -> list:
         raise ValueError(f"total_add_tasks ({total_add_tasks}) exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
 
     # Fixed sizes: matmul 128x128x128, add 64x128
-    matmul_size = 128
+    matmul_size = 64
     add_rows = 64
-    add_cols = 128
+    add_cols = 64
 
     # Prevent excessive memory allocation
     total_matmul_elements = batch * M * matmul_size * matmul_size
@@ -153,9 +154,9 @@ def compute_golden(tensors: dict, params: dict) -> None:
     N = params["N"]
 
     # Fixed sizes: matmul 128x128x128, add 64x128
-    matmul_size = 128
+    matmul_size = 64
     add_rows = 64
-    add_cols = 128
+    add_cols = 64
 
     A = torch.as_tensor(tensors["A"]).reshape(batch, M, matmul_size, matmul_size)
     B = torch.as_tensor(tensors["B"]).reshape(batch, M, matmul_size, matmul_size)
