@@ -143,6 +143,7 @@ public:
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;  // Number of AICPU threads for scheduling
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
+    int orch_thread_num;     // Number of orchestrator threads (default 1)
 
     // Ring buffer size overrides (0 = use compile-time defaults)
     uint64_t pto2_task_window_size;

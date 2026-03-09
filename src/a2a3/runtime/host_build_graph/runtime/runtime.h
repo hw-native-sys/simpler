@@ -187,6 +187,7 @@ public:
 
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;  // Number of AICPU threads for scheduling
+    int orch_thread_num;  // Number of orchestrator threads (unused, for API compatibility)
 
     // Profiling support
     bool enable_profiling;                  // Enable profiling flag

@@ -39,5 +39,6 @@ KERNELS = [
 RUNTIME_CONFIG = {
     "runtime": "tensormap_and_ringbuffer",
     "aicpu_thread_num": 4,
+    "orch_thread_num": 1,  # All 4 threads as orchestrators
     "block_dim": 24,
 }

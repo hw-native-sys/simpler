@@ -247,6 +247,7 @@ public:
 
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;  // Number of AICPU threads for scheduling
+    int orch_thread_num;  // Number of orchestrator threads (unused, for API compatibility)
 
     /**
      * Orchestration payload (auto-populated by init_runtime_impl, consumed by AICPU orchestration).

@@ -133,6 +133,7 @@ class RuntimeLibraryLoader:
             c_size_t,           # aicpu_size
             POINTER(c_uint8),   # aicore_binary
             c_size_t,           # aicore_size
+            c_int,              # orch_thread_num
         ]
         self.lib.launch_runtime.restype = c_int
 
@@ -476,6 +477,7 @@ def launch_runtime(
     device_id: int,
     aicpu_binary: bytes,
     aicore_binary: bytes,
+    orch_thread_num: int = 1,
 ) -> None:
     """
 
@@ -491,6 +493,7 @@ def launch_runtime(
         device_id: Device ID (0-15)
         aicpu_binary: Binary data of AICPU shared object
         aicore_binary: Binary data of AICore kernel
+        orch_thread_num: Number of orchestrator threads (default 1)
 
     Raises:
         RuntimeError: If not initialized or execution fails
@@ -513,6 +516,7 @@ def launch_runtime(
         len(aicpu_binary),
         aicore_array,
         len(aicore_binary),
+        orch_thread_num,
     )
     if rc != 0:
         raise RuntimeError(f"launch_runtime failed: {rc}")
