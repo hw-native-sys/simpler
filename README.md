@@ -322,6 +322,21 @@ host_binary = compiler.compile("host", include_dirs, source_dirs)        # → .
 
 Each component is compiled independently with its own toolchain, allowing modular development.
 
+### Cross-platform Platform-Isolation Requirement
+
+When preprocessor guards are used to isolate platform code paths, the `__aarch64__`
+block must be placed at the very beginning of the conditional chain.
+
+```cpp
+#if defined(__aarch64__)
+// aarch64 path (must be first)
+#elif defined(__x86_64__)
+// x86_64 host simulation path
+#else
+// other platforms
+#endif
+```
+
 ## Usage
 
 ### Quick Start - Python Example
