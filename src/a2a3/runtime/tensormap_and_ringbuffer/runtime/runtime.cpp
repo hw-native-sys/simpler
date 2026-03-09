@@ -40,6 +40,9 @@ Runtime::Runtime() {
     // Initialize device orchestration SO binary
     device_orch_so_size_ = 0;
 
+    // Initialize kernel binary tracking
+    registered_kernel_count_ = 0;
+
     // Initialize function address mapping
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
         func_id_to_addr_[i] = 0;
@@ -131,7 +134,23 @@ uint64_t Runtime::get_function_bin_addr(int func_id) const {
 void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
     if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
         func_id_to_addr_[func_id] = addr;
+        if (addr != 0 && registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
+            registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
+        }
     }
+}
+
+int Runtime::get_registered_kernel_count() const {
+    return registered_kernel_count_;
+}
+
+int Runtime::get_registered_kernel_func_id(int index) const {
+    if (index < 0 || index >= registered_kernel_count_) return -1;
+    return registered_kernel_func_ids_[index];
+}
+
+void Runtime::clear_registered_kernels() {
+    registered_kernel_count_ = 0;
 }
 
 // =============================================================================

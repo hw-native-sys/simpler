@@ -305,6 +305,25 @@ int validate_runtime_impl(Runtime* runtime) {
     std::cout << "Freed " << freed_allocs << " recorded device allocation(s) and " << freed_pairs
               << " tensor-pair device pointer(s)\n";
 
+    // Cleanup kernel binaries allocated in init_runtime_impl
+    int kernel_freed = 0;
+    int kernel_count = runtime->get_registered_kernel_count();
+    for (int i = 0; i < kernel_count; i++) {
+        int func_id = runtime->get_registered_kernel_func_id(i);
+        uint64_t addr = runtime->get_function_bin_addr(func_id);
+        if (addr != 0) {
+            // Kernel binary is stored at (addr - sizeof(uint64_t))
+            void* gm_addr = reinterpret_cast<void*>(addr - sizeof(uint64_t));
+            runtime->host_api.device_free(gm_addr);
+            runtime->set_function_bin_addr(func_id, 0);
+            kernel_freed++;
+        }
+    }
+    if (kernel_freed > 0) {
+        std::cout << "Freed " << kernel_freed << " kernel binaries\n";
+    }
+    runtime->clear_registered_kernels();
+
     // Note: AICPU orchestration plugin bytes are embedded in `Runtime` and do not
     // require device_free(). (They may be overwritten next run.)
 

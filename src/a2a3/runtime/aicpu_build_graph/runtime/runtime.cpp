@@ -38,6 +38,9 @@ Runtime::Runtime() {
     tensor_pair_count = 0;
     device_alloc_count = 0;
 
+    // Initialize kernel binary tracking
+    registered_kernel_count_ = 0;
+
     orch_argc = 0;
     memset(orch_args, 0, sizeof(orch_args));
     memset(kernel_addrs, 0, sizeof(kernel_addrs));

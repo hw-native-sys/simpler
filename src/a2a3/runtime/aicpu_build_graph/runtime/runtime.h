@@ -336,6 +336,10 @@ private:
     DeviceAlloc device_allocs[RUNTIME_MAX_TENSOR_PAIRS];
     int device_alloc_count;
 
+    // Kernel binary tracking for cleanup
+    int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
+    int registered_kernel_count_;
+
 public:
     /**
      * Constructor - zero-initialize all arrays
@@ -430,7 +434,19 @@ public:
             return;
         }
         kernel_addrs[func_id] = addr;
+        if (addr != 0 && registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
+            registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
+        }
     }
+
+    int get_registered_kernel_count() const { return registered_kernel_count_; }
+
+    int get_registered_kernel_func_id(int index) const {
+        if (index < 0 || index >= registered_kernel_count_) return -1;
+        return registered_kernel_func_ids_[index];
+    }
+
+    void clear_registered_kernels() { registered_kernel_count_ = 0; }
 
     /**
      * Get initially ready tasks (fanin == 0) as entry point for execution

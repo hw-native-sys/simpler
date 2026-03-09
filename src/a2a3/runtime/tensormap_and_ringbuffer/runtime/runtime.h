@@ -161,6 +161,10 @@ private:
     TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
     int tensor_pair_count;
 
+    // Kernel binary tracking for cleanup
+    int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
+    int registered_kernel_count_;
+
     // Device orchestration: when false, orchestration runs on device (thread 3)
     bool orch_built_on_host_;
     void* pto2_gm_sm_ptr_;  // GM pointer to PTO2 shared memory (device)
@@ -239,6 +243,10 @@ public:
 
     uint64_t get_function_bin_addr(int func_id) const;
     void set_function_bin_addr(int func_id, uint64_t addr);
+
+    int get_registered_kernel_count() const;
+    int get_registered_kernel_func_id(int index) const;
+    void clear_registered_kernels();
 
     // =========================================================================
     // Deprecated API (for platform compatibility, always returns 0/nullptr)
