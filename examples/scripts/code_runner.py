@@ -407,6 +407,7 @@ class CodeRunner:
         run_all_cases: bool = False,
         case_name: Optional[str] = None,
         pto_isa_commit: Optional[str] = None,
+        build_dir: Optional[str] = None,
     ):
         # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
         _setup_logging_if_needed()
@@ -420,6 +421,7 @@ class CodeRunner:
         # Resolve device ID
         self.device_id = device_id if device_id is not None else 0
         self.pto_isa_commit = pto_isa_commit
+        self.build_dir = build_dir
 
         # Load configurations
         self._kernel_config = self._load_kernel_config()
@@ -717,12 +719,13 @@ class CodeRunner:
         ]
 
         def _build_runtime():
-            return builder.build(self.runtime_name)
+            return builder.build(self.runtime_name, self.build_dir)
 
         def _compile_orchestration():
             return kernel_compiler.compile_orchestration(
                 self.runtime_name,
                 self.orchestration["source"],
+                build_dir=self.build_dir,
             )
 
         def _compile_one_kernel(kernel):
@@ -732,6 +735,7 @@ class CodeRunner:
                 core_type=kernel["core_type"],
                 pto_isa_root=pto_isa_root,
                 extra_include_dirs=runtime_include_dirs,
+                build_dir=self.build_dir,
             )
             if self.platform.endswith("sim"):
                 kernel_bin = incore_o
@@ -908,10 +912,10 @@ class CodeRunner:
 
 def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",
                        enable_profiling=False, run_all_cases=False, case_name=None,
-                       pto_isa_commit=None):
+                       pto_isa_commit=None, build_dir=None):
     """Factory: creates a CodeRunner based on kernel_config."""
     return CodeRunner(kernels_dir=kernels_dir, golden_path=golden_path,
                       device_id=device_id, platform=platform,
                       enable_profiling=enable_profiling,
                       run_all_cases=run_all_cases, case_name=case_name,
-                      pto_isa_commit=pto_isa_commit)
+                      pto_isa_commit=pto_isa_commit, build_dir=build_dir)

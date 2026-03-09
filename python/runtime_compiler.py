@@ -3,7 +3,7 @@ import os
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 from toolchain import Toolchain, CCECToolchain, Aarch64GxxToolchain, GxxToolchain
 import env_manager
 import multiprocessing
@@ -157,6 +157,7 @@ class RuntimeCompiler:
         target_platform: str,
         include_dirs: List[str],
         source_dirs: List[str],
+        build_dir: Optional[str],
     ) -> bytes:
         """
         Compile binary for the specified target platform.
@@ -165,6 +166,7 @@ class RuntimeCompiler:
             target_platform: Target platform ("aicore", "aicpu", or "host")
             include_dirs: List of include directory paths
             source_dirs: List of source directory paths
+            build_dir: The directory path for compiling. When None, use a temporal path.
 
         Returns:
             Compiled binary data as bytes
@@ -189,10 +191,23 @@ class RuntimeCompiler:
         cmake_args = target.gen_cmake_args(include_dirs, source_dirs)
         cmake_source_dir = target.get_root_dir()
         binary_name = target.get_binary_name()
+        platform = target_platform.upper()
 
-        return self._run_compilation(
-            cmake_source_dir, cmake_args, binary_name, platform=target_platform.upper()
-        )
+        def _build(build_dir: str):
+            return self._run_compilation(
+                cmake_source_dir,
+                cmake_args,
+                binary_name,
+                platform=platform,
+                build_dir=build_dir,
+            )
+        if build_dir is None:
+            with tempfile.TemporaryDirectory(prefix=f"{platform.lower()}_build_", dir="/tmp") as build_dir:
+                return _build(build_dir)
+        else:
+            platform_build_dir = Path(os.path.realpath(build_dir)) / f"{platform.lower()}"
+            os.makedirs(platform_build_dir, exist_ok=True)
+            return _build(platform_build_dir)
 
     def _run_build_step(
         self,
@@ -241,7 +256,8 @@ class RuntimeCompiler:
         cmake_source_dir: str,
         cmake_args: List[str],
         binary_name: str,
-        platform: str = "AICore"
+        platform: str = "AICore",
+        build_dir: Optional[str] = None,
     ) -> bytes:
         """
         Run CMake configuration and Make build in a temporary directory.
@@ -259,23 +275,22 @@ class RuntimeCompiler:
             RuntimeError: If CMake or Make fails
             FileNotFoundError: If output binary not found
         """
-        with tempfile.TemporaryDirectory(prefix=f"{platform.lower()}_build_", dir="/tmp") as build_dir:
-            cmake_cmd = ["cmake", cmake_source_dir] + cmake_args
-            self._run_build_step(cmake_cmd, build_dir, platform, "CMake configuration")
+        cmake_cmd = ["cmake", cmake_source_dir] + cmake_args
+        self._run_build_step(cmake_cmd, build_dir, platform, "CMake configuration")
 
-            make_cmd = ["make", f"-j{min(multiprocessing.cpu_count(), 32)}", "VERBOSE=1"]
-            self._run_build_step(make_cmd, build_dir, platform, "Make build")
+        make_cmd = ["make", f"-j{min(multiprocessing.cpu_count(), 32)}", "VERBOSE=1"]
+        self._run_build_step(make_cmd, build_dir, platform, "Make build")
 
-            # Read the compiled binary
-            binary_path = os.path.join(build_dir, binary_name)
-            if not os.path.isfile(binary_path):
-                raise FileNotFoundError(
-                    f"Compiled binary not found: {binary_path}. "
-                    f"Expected output file name: {binary_name}"
-                )
+        # Read the compiled binary
+        binary_path = os.path.join(build_dir, binary_name)
+        if not os.path.isfile(binary_path):
+            raise FileNotFoundError(
+                f"Compiled binary not found: {binary_path}. "
+                f"Expected output file name: {binary_name}"
+            )
 
-            with open(binary_path, "rb") as f:
-                binary_data = f.read()
+        with open(binary_path, "rb") as f:
+            binary_data = f.read()
 
         return binary_data
 

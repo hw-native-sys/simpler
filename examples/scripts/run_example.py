@@ -166,6 +166,13 @@ Golden.py interface:
         help="Checkout PTO-ISA at this commit (e.g., -c 1b22fea)"
     )
 
+    parser.add_argument(
+        "--savetemp",
+        type=str,
+        default=None,
+        help="Path for the temporal files"
+    )
+
     args = parser.parse_args()
 
     if args.all and args.case:
@@ -234,6 +241,7 @@ Golden.py interface:
             run_all_cases=args.all,
             case_name=args.case,
             pto_isa_commit=args.pto_isa_commit,
+            build_dir=args.savetemp,
         )
 
         # Snapshot existing device logs before the run so we can identify the
