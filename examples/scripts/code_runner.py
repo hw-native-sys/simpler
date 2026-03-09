@@ -41,7 +41,7 @@ Golden.py interface:
     DEFAULT_CASE = "Case1"  # Default case to run
     RTOL = 1e-5  # Relative tolerance
     ATOL = 1e-5  # Absolute tolerance
-    __outputs__ = ["out_f"]  # Explicit output names (or use 'out_' prefix)
+    __outputs__ = ["out_f"]  # Output tensor names
 """
 
 import importlib.util
@@ -517,27 +517,24 @@ class CodeRunner:
 
     def _identify_outputs(self, tensors: Dict[str, torch.Tensor]) -> Tuple[Dict, Dict]:
         """
-        Separate inputs and outputs from tensor dict.
-
-        Uses either explicit __outputs__ list or 'out_' prefix convention.
+        Separate inputs and outputs from tensor dict using __outputs__.
 
         Returns:
             Tuple of (inputs_dict, outputs_dict)
         """
-        if self.output_names:
-            # Use explicit output names
-            outputs = {k: v for k, v in tensors.items() if k in self.output_names}
-            inputs = {k: v for k, v in tensors.items() if k not in self.output_names}
-        else:
-            # Use 'out_' prefix convention
-            outputs = {k: v for k, v in tensors.items() if k.startswith('out_')}
-            inputs = {k: v for k, v in tensors.items() if not k.startswith('out_')}
+        if not self.output_names:
+            raise ValueError(
+                "No output tensors identified. "
+                "Define __outputs__ = ['tensor_name'] in golden.py"
+            )
+
+        output_set = set(self.output_names)
+        outputs = {k: v for k, v in tensors.items() if k in output_set}
+        inputs = {k: v for k, v in tensors.items() if k not in output_set}
 
         if not outputs:
             raise ValueError(
-                "No output tensors identified. Either:\n"
-                "1. Define __outputs__ = ['tensor_name'] in golden.py, or\n"
-                "2. Use 'out_' prefix for output tensor names (e.g., 'out_result')"
+                f"None of __outputs__ = {self.output_names} found in tensors: {list(tensors.keys())}"
             )
 
         return inputs, outputs
@@ -561,20 +558,27 @@ class CodeRunner:
         """
         import ctypes
         import numpy as np
-        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR
 
-        # Identify outputs
-        if self.output_names:
-            output_set = set(self.output_names)
-        else:
-            output_set = set()
+        if not self.output_names:
+            raise ValueError(
+                "No output tensors identified. "
+                "Define __outputs__ = ['tensor_name'] in golden.py"
+            )
+        output_set = set(self.output_names)
+
+        # First pass: collect all tensor names from generate_inputs
+        all_tensor_names = {name for name, value in args_list
+                           if isinstance(value, (torch.Tensor, np.ndarray))}
+        # Tensors in both generate_inputs and __outputs__ are INOUT
+        inout_set = output_set & all_tensor_names
 
         func_args = []
         arg_types = []
         arg_sizes = []
         args = {}    # all named items: tensors + scalars → passed to compute_golden
         inputs = {}  # tensor inputs only → for logging
-        outputs = {} # tensor outputs only → for comparison
+        outputs = {} # tensor outputs (and inouts) → for comparison
 
         for item in args_list:
             if not (isinstance(item, tuple) and len(item) == 2):
@@ -595,7 +599,10 @@ class CodeRunner:
                 nbytes = tensor.element_size() * tensor.numel()
                 arg_sizes.append(nbytes)
 
-                if name in output_set or (not output_set and name.startswith('out_')):
+                if name in inout_set:
+                    arg_types.append(ARG_INOUT_PTR)
+                    outputs[name] = tensor
+                elif name in output_set:
                     arg_types.append(ARG_OUTPUT_PTR)
                     outputs[name] = tensor
                 else:
@@ -621,9 +628,7 @@ class CodeRunner:
 
         if not outputs:
             raise ValueError(
-                "No output tensors identified. Either:\n"
-                "1. Define __outputs__ = ['tensor_name'] in golden.py, or\n"
-                "2. Use 'out_' prefix for output tensor names (e.g., 'out_result')"
+                f"None of __outputs__ = {self.output_names} found in generate_inputs args"
             )
 
         return func_args, arg_types, arg_sizes, args, inputs, outputs
@@ -644,7 +649,7 @@ class CodeRunner:
         Returns:
             Tuple of (func_args, arg_types, arg_sizes)
         """
-        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR
 
         # Determine tensor order
         if self.tensor_order:
@@ -652,11 +657,14 @@ class CodeRunner:
         else:
             order = list(tensors.keys())
 
-        # Identify outputs
-        if self.output_names:
-            output_set = set(self.output_names)
-        else:
-            output_set = {k for k in tensors.keys() if k.startswith('out_')}
+        # Identify outputs; tensors in both generate_inputs and __outputs__ are INOUT
+        if not self.output_names:
+            raise ValueError(
+                "No output tensors identified. "
+                "Define __outputs__ = ['tensor_name'] in golden.py"
+            )
+        output_set = set(self.output_names)
+        inout_set = output_set & set(tensors.keys())
 
         # First pass: ensure all tensors are CPU and contiguous (update dict in place)
         for name in order:
@@ -676,8 +684,9 @@ class CodeRunner:
             tensor = tensors[name]
             func_args.append(tensor.data_ptr())
 
-            # Determine arg type based on whether it's an output
-            if name in output_set:
+            if name in inout_set:
+                arg_types.append(ARG_INOUT_PTR)
+            elif name in output_set:
                 arg_types.append(ARG_OUTPUT_PTR)
             else:
                 arg_types.append(ARG_INPUT_PTR)
@@ -855,9 +864,14 @@ class CodeRunner:
             _t_golden_end = time.perf_counter()
             logger.info(f">>> compute_golden() took {_t_golden_end - _t_golden_start:.3f}s")
 
+            initial_outputs = {k: v.clone() for k, v in outputs.items()}
+
             for round_idx in range(self.repeat_rounds):
                 if self.repeat_rounds > 1:
                     logger.info(f"--- Round {round_idx + 1}/{self.repeat_rounds} ---")
+
+                for k, v in initial_outputs.items():
+                    outputs[k].copy_(v)
 
                 runtime = Runtime()
 
