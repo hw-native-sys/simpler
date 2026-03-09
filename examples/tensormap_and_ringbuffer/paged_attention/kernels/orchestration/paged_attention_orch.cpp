@@ -59,7 +59,6 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 __attribute__((visibility("default")))
 void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     (void)arg_count;
-    pto2_rt_init_tensor_pool(rt);
 
     // Extract device pointers (first 7)
     void* host_query = (void*)(uintptr_t)args[0];           // [batch, num_heads, head_dim]

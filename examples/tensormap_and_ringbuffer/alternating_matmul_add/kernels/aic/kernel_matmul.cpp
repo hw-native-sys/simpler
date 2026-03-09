@@ -4,7 +4,7 @@
  * Computes: C = A @ B (TILE x TILE x TILE matmul)
  * Uses TMATMUL instruction
  *
- * Args (TensorData*):
+ * Args (Tensor*):
  *   args[0] = A (INPUT)  - TILE x TILE
  *   args[1] = B (INPUT)  - TILE x TILE
  *   args[2] = C (OUTPUT) - TILE x TILE
@@ -35,7 +35,7 @@ AICORE constexpr inline T CeilAlign(T num_1, T num_2) {
     return (num_1 + num_2 - 1) / num_2 * num_2;
 }
 
-static __aicore__ inline int get_num_tiles(__gm__ TensorData* tensor, uint64_t tile_elems) {
+static __aicore__ inline int get_num_tiles(__gm__ Tensor* tensor, uint64_t tile_elems) {
     uint64_t total_elems = tensor->shapes[0];
     return static_cast<int>(total_elems / tile_elems);
 }
@@ -105,9 +105,9 @@ static __aicore__ void matmul_impl(
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ TensorData* input_a = reinterpret_cast<__gm__ TensorData*>(args[0]);
-    __gm__ TensorData* input_b = reinterpret_cast<__gm__ TensorData*>(args[1]);
-    __gm__ TensorData* output  = reinterpret_cast<__gm__ TensorData*>(args[2]);
+    __gm__ Tensor* input_a = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* input_b = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* output  = reinterpret_cast<__gm__ Tensor*>(args[2]);
 
     constexpr uint64_t TILE_ELEMS = 128 * 128;
     int num_tiles = get_num_tiles(input_a, TILE_ELEMS);

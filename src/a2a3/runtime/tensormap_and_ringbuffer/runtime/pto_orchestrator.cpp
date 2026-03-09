@@ -136,14 +136,10 @@ bool pto2_orchestrator_init(
     orch->scope_stack_top = -1;
     orch->scope_stack_capacity = max_depth;
 
-    orch->tensor_pool.init();
-    TensorPool::set_instance(&orch->tensor_pool);
-
     return true;
 }
 
 void pto2_orchestrator_destroy(PTO2OrchestratorState* orch) {
-    TensorPool::set_instance(nullptr);
     orch->tensor_map.destroy();
 
     free(orch->scope_tasks);
@@ -254,11 +250,11 @@ void pto2_submit_task(
 
     task->param_count = num_params;
     for (int i = 0; i < num_params; i++) {
-        task->params[i].type = params[i].type;
-        if (params[i].type == PTOParamType::SCALAR) {
-            task->params[i].scalar_value = params[i].scalar_value;
+        task->is_tensor[i] = params[i].type != PTOParamType::SCALAR;
+        if (task->is_tensor[i]) {
+            task->tensors[i].copy(*params[i].tensor);
         } else {
-            task->params[i].tensor = std::move(params[i].tensor);
+            task->scalar_value[i] = params[i].scalar_value;
         }
     }
 
@@ -270,14 +266,12 @@ void pto2_submit_task(
     // Temporary storage for collecting output sizes
     int32_t total_output_size = 0;
     for (int i = 0; i < num_params; i++) {
-        PTOParam& p = task->params[i];
-        if (p.type != PTOParamType::OUTPUT) {
+        if (params[i].type != PTOParamType::OUTPUT) {
             continue;
         }
-        auto& tensor_data = p.tensor.data();
         // Only allocate from ring buffer when caller did not provide an address
-        if (tensor_data.buffer.addr == 0) {
-            total_output_size += PTO2_ALIGN_UP(tensor_data.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+        if (task->tensors[i].buffer.addr == 0) {
+            total_output_size += PTO2_ALIGN_UP(task->tensors[i].buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
 
@@ -295,14 +289,14 @@ void pto2_submit_task(
     // === STEP 2: First pass - set output addr and process tensor ===
     int32_t offset = 0;
     for (int i = 0; i < num_params; i++) {
-        PTOParam& p = task->params[i];
+        PTOParamType ptype = params[i].type;
 
-        switch (p.type) {
+        switch (ptype) {
             case PTOParamType::INOUT:
             case PTOParamType::INPUT: {
                 // Look up producer via TensorMap
                 PTO2LookupResult lookup_result;
-                orch->tensor_map.lookup(p.tensor, lookup_result);
+                orch->tensor_map.lookup(task->tensors[i], lookup_result);
 
                 for (int r = 0; r < lookup_result.count; r++) {
                     PTO2TensorMapEntry& entry = *lookup_result.entries[r].entry;
@@ -323,7 +317,7 @@ void pto2_submit_task(
                             fanin_temp[fanin_count++] = producer_task_id;
                         }
                     }
-                    if (p.type == PTOParamType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                    if (ptype == PTOParamType::INOUT && overlap_status == OverlapStatus::COVERED) {
                         // inout因为会再次insert进tensor map，
                         // 因此为了尽量减少依赖构建个数（尽可能构造链式依赖），当该tensor完全覆盖前面的tensor时，
                         // 应将前面的tensor从tensor map中剔除。
@@ -337,14 +331,13 @@ void pto2_submit_task(
             }
 
             case PTOParamType::OUTPUT: {
-                auto& tensor_data = p.tensor.data();
-                // Offsets: each output at 1024B-aligned slot; slot size = ALIGN_UP(size, 1024)
-                // Allocation happens here only; no memcpy of buffer content. Caller's tensor gets addr written back.
-                if (tensor_data.buffer.addr == 0) {
+                auto& tensor = task->tensors[i];
+                if (tensor.buffer.addr == 0) {
                     uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)task->packed_buffer_base + offset);
-                    tensor_data.buffer.addr = alloc_addr;
-                    offset += PTO2_ALIGN_UP(tensor_data.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
-
+                    tensor.buffer.addr = alloc_addr;
+                    // Write back allocated address to caller's original Tensor
+                    params[i].tensor->buffer.addr = alloc_addr;
+                    offset += PTO2_ALIGN_UP(tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
                 break;
             }
@@ -358,11 +351,10 @@ void pto2_submit_task(
 
     // === STEP 4: Second pass - register outputs in TensorMap ===
     for (int i = 0; i < num_params; i++) {
-        PTOParam& p = task->params[i];
-        if (p.type == PTOParamType::OUTPUT || p.type == PTOParamType::INOUT) {
+        PTOParamType ptype = params[i].type;
+        if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
             // Register in TensorMap: this tensor is produced by task_id
-            // Use task's tensor_copies (which has the heap-allocated address for outputs)
-            orch->tensor_map.insert(p.tensor, task_id, p.type == PTOParamType::OUTPUT);
+            orch->tensor_map.insert(task->tensors[i], task_id, ptype == PTOParamType::OUTPUT);
         }
     }
 

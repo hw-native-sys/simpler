@@ -387,13 +387,13 @@ static void build_pto2_payload(PTO2DispatchPayload* out, Runtime* runtime,
     int n = 0;
 
     for (int i = 0; i < task->param_count; i++) {
-        if (task->params[i].type == PTOParamType::SCALAR) {
-            out->args[n++] = task->params[i].scalar_value;
+        if (!task->is_tensor[i]) {
+            out->args[n++] = task->scalar_value[i];
         } else {
-            // Pass pointer to the Tensor (in task-owned storage), not the raw buffer address.
-            // Kernels expect args[i] to be a Tensor* from which they read buffer.addr.
-            task->params[i].tensor.data().update_start_offset();
-            out->args[n++] = reinterpret_cast<uint64_t>(&task->params[i].tensor.data());
+            // Pass pointer to TensorData in task descriptor's inline tensor storage.
+            // Kernels expect args[i] to be a TensorData* from which they read buffer.addr.
+            out->args[n++] = reinterpret_cast<uint64_t>(&task->tensors[i]);
+            task->tensors[i].update_start_offset();
         }
     }
 
@@ -630,12 +630,22 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 
         // Phase 2: Dispatch ready tasks to idle cores (register-based dispatch)
         if (cur_thread_tasks_in_flight < core_num) {
+            bool cube_queue_empty = false, vector_queue_empty = false;
             for (int i = 0; i < core_num; i++) {
+                if (cube_queue_empty && vector_queue_empty) {
+#if PTO2_SCHED_PROFILING
+                    pop_miss++;
+#endif
+                    break;
+                }
                 int core_id = cur_thread_cores[i];
+                // Skip cores that are still executing (avoid unnecessary MMIO read)
+                if (executing_task_ids_[core_id] != AICPU_TASK_INVALID) continue;
+
                 uint64_t reg_addr = core_id_to_reg_addr_[core_id];
                 uint64_t reg_val = read_reg(reg_addr, RegId::COND);
                 int reg_state = EXTRACT_TASK_STATE(reg_val);
-                if (reg_state == TASK_FIN_STATE && executing_task_ids_[core_id] == AICPU_TASK_INVALID) {
+                if (reg_state == TASK_FIN_STATE) {
                     Handshake* h = &hank[core_id];
                     PTO2WorkerType wt = (h->core_type == CoreType::AIC) ? PTO2_WORKER_CUBE : PTO2_WORKER_VECTOR;
 #if PTO2_SCHED_PROFILING
@@ -679,6 +689,8 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
 #endif
                         DEV_DEBUG("Thread %d: Dispatching PTO2 task %d to core %d", thread_idx, task_id, core_id);
                     } else {
+                        if (wt == PTO2_WORKER_CUBE) cube_queue_empty = true;
+                        else vector_queue_empty = true;
 #if PTO2_PROFILING
                         pop_miss++;
 #endif
@@ -1194,8 +1206,8 @@ int AicpuExecutor::run(Runtime* runtime) {
 #endif
 
             // Wait for all scheduler threads (0, 1, 2) to finish before destroying
-            // runtime. Scheduler threads access TensorPool via orch_ready_queue_
-            // and tensor.data() in build_pto2_payload — freeing early is use-after-free.
+            // runtime. Scheduler threads read tensor_data pointers from task descriptors
+            // that point into the task descriptor's inline TensorData — freeing early is use-after-free.
             while (finished_count_.load(std::memory_order_acquire) < thread_num_ - 1) {
                 std::this_thread::yield();
             }

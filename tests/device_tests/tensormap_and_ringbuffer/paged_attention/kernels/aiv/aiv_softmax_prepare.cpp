@@ -31,11 +31,11 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void softmax_prepare_impl(__gm__ TensorData* sij,
+static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     float scale_value,
-    __gm__ TensorData* pij,
-    __gm__ TensorData* mij,
-    __gm__ TensorData* lij) {
+    __gm__ Tensor* pij,
+    __gm__ Tensor* mij,
+    __gm__ Tensor* lij) {
     uint64_t valid_len = static_cast<uint64_t>(sij->shapes[1]);
     __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
     __gm__ bfloat16_t* pij_addr = reinterpret_cast<__gm__ bfloat16_t*>(pij->buffer.addr);
@@ -111,16 +111,16 @@ static __aicore__ void softmax_prepare_impl(__gm__ TensorData* sij,
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ TensorData* sij = reinterpret_cast<__gm__ TensorData*>(args[0]);
+    __gm__ Tensor* sij = reinterpret_cast<__gm__ Tensor*>(args[0]);
     union {
         uint64_t u;
         float f;
     } scale_conv;
     scale_conv.u = static_cast<uint64_t>(args[1]);
     float scale_value = scale_conv.f;
-    __gm__ TensorData* pij = reinterpret_cast<__gm__ TensorData*>(args[2]);
-    __gm__ TensorData* mij = reinterpret_cast<__gm__ TensorData*>(args[3]);
-    __gm__ TensorData* lij = reinterpret_cast<__gm__ TensorData*>(args[4]);
+    __gm__ Tensor* pij = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[3]);
+    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[4]);
     uint64_t q_tile_size = static_cast<uint64_t>(sij->shapes[0]);
 
     if (q_tile_size == 16) {

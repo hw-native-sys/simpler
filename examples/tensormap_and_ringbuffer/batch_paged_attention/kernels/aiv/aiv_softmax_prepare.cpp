@@ -26,10 +26,10 @@ using namespace pto;
 
 template <int M, int N>
 static __aicore__ void softmax_prepare_batch_impl(
-    __gm__ TensorData* sij_batch,
-    __gm__ TensorData* pij_batch,
-    __gm__ TensorData* mij_batch,
-    __gm__ TensorData* lij_batch,
+    __gm__ Tensor* sij_batch,
+    __gm__ Tensor* pij_batch,
+    __gm__ Tensor* mij_batch,
+    __gm__ Tensor* lij_batch,
     float scale_value,
     uint64_t context_lens_ptr,
     uint64_t batch_count,
@@ -165,10 +165,10 @@ static __aicore__ void softmax_prepare_batch_impl(
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ TensorData* sij_batch = reinterpret_cast<__gm__ TensorData*>(args[0]);
-    __gm__ TensorData* pij_batch = reinterpret_cast<__gm__ TensorData*>(args[1]);
-    __gm__ TensorData* mij_batch = reinterpret_cast<__gm__ TensorData*>(args[2]);
-    __gm__ TensorData* lij_batch = reinterpret_cast<__gm__ TensorData*>(args[3]);
+    __gm__ Tensor* sij_batch = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* pij_batch = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* mij_batch = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ Tensor* lij_batch = reinterpret_cast<__gm__ Tensor*>(args[3]);
     union { uint64_t u; float f; } scale_conv;
     scale_conv.u = static_cast<uint64_t>(args[4]);
     float scale_value = scale_conv.f;

@@ -381,6 +381,14 @@ struct PTO2TaskRing {
         // Window is full
         return -1;
     }
+
+    
+    /**
+    * Get task descriptor by ID
+    */
+    PTO2TaskDescriptor& get_task(int32_t task_id) {
+        return descriptors[task_id & (window_size - 1)];
+    }
 };
 
 /**

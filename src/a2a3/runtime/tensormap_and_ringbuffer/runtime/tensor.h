@@ -3,9 +3,37 @@
 #include <stdint.h>
 #include <memory.h>
 
+#include <sstream>
+
 #include "common.h"
 #include "data_type.h"
-#include "tensor_pool.h"
+
+constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
+
+/**
+ * Buffer Handle
+ *
+ * Represents a device memory buffer with address and total size in bytes.
+ * This is the underlying memory allocation that a Tensor describes access patterns for.
+ */
+struct PTOBufferHandle {
+    uint64_t addr;  // Device memory address (bytes)
+    uint64_t size;  // Total buffer size in bytes
+};
+
+enum class OverlapStatus {
+    NO_OVERLAP,
+    COVERED,
+    OTHER,
+};
+
+struct Segment {
+    uint64_t begin;
+    uint64_t end;
+
+    bool line_segment_intersection(const Segment& other) const { return end > other.begin && other.end > begin; }
+    bool contains(const Segment& other) const { return begin <= other.begin && other.end <= end; }
+};
 
 /**
  * Tensor descriptor for Task input/output
@@ -25,9 +53,22 @@
  *   - Outer dim: 3 rows with stride 6 elements (derived from raw_shapes[1])
  */
 struct Tensor {
-    int32_t index;
+    // === Data fields (same layout as former Tensor) ===
+    int32_t version;                               // Tensor version for overlap detection
+    PTOBufferHandle buffer;                        // Underlying memory buffer (addr in bytes, size in bytes)
+    uint64_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
+    uint64_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
+    uint64_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
+    uint64_t start_offset;                         // Cached 1D element offset (precomputed from raw_shapes + offsets)
+    uint64_t ndims;                                // Number of dimensions used
+    DataType dtype;                                // Data type of tensor elements
 
-    Tensor() : index(0) {}
+    Tensor() = default;
+    Tensor(const Tensor&) = default;
+    Tensor& operator=(const Tensor&) = default;
+    Tensor(Tensor&&) = default;
+    Tensor& operator=(Tensor&&) = default;
+    ~Tensor() = default;
 
     Tensor(void* addr,
         uint64_t buffer_size_bytes,
@@ -37,65 +78,88 @@ struct Tensor {
         uint64_t ndims,
         DataType dtype,
         int32_t version) {
-        TensorPool& pool = TensorPool::instance();
-        index = pool.alloc();
-        pool.data[index].init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version);
+        init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version);
     }
 
-    Tensor(Tensor&& other) : index(other.index) { other.index = 0; }
-
-    Tensor(const Tensor& other) : index(other.index) { TensorPool::instance().ref(index); }
-
-    Tensor& operator=(Tensor&& other) {
-        TensorPool::instance().deref(index);
-        index = other.index;
-        other.index = 0;
-        return *this;
-    }
-
-    Tensor& operator=(const Tensor& other) {
-        if (index != other.index) {
-            TensorPool::instance().deref(index);
-            index = other.index;
-            TensorPool::instance().ref(index);
+    // --- Initialization ---
+    void init(void* addr,
+        uint64_t buffer_size_bytes,
+        const uint64_t in_raw_shapes[],
+        const uint64_t in_shapes[],
+        const uint64_t in_offsets[],
+        uint64_t in_ndims,
+        DataType in_dtype,
+        int32_t in_version) {
+        buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
+        ndims = in_ndims;
+        dtype = in_dtype;
+        version = in_version;
+        for (uint64_t i = 0; i < in_ndims; i++) {
+            raw_shapes[i] = in_raw_shapes[i];
+            shapes[i] = in_shapes[i];
+            offsets[i] = in_offsets[i];
         }
-        return *this;
     }
 
-    ~Tensor() {
-        TensorPool::instance().deref(index);
-    }
-
-    TensorData& data() { return TensorPool::instance().data[index]; }
-    const TensorData& data() const { return TensorPool::instance().data[index]; }
-
-    Tensor copy() const {
-        if (index == 0) {
-            return Tensor();
+    void init(const Tensor& other) {
+        buffer = other.buffer;
+        ndims = other.ndims;
+        dtype = other.dtype;
+        version = other.version;
+        for (uint64_t i = 0; i < ndims; i++) {
+            raw_shapes[i] = other.raw_shapes[i];
+            shapes[i] = other.shapes[i];
+            offsets[i] = other.offsets[i];
         }
-        Tensor result;
-        TensorPool& pool = TensorPool::instance();
-        result.index = pool.alloc();
-        pool.data[result.index].init(pool.data[index]);
-        return result;
+    }
+
+    void init_with_view(const Tensor& other, const uint64_t view_shapes[], const uint64_t view_offsets[]) {
+        buffer = other.buffer;
+        ndims = other.ndims;
+        dtype = other.dtype;
+        version = other.version;
+        for (uint64_t i = 0; i < ndims; i++) {
+            raw_shapes[i] = other.raw_shapes[i];
+            shapes[i] = view_shapes[i];
+            offsets[i] = other.offsets[i] + view_offsets[i];
+        }
+    }
+
+    // --- Operations ---
+    void update_start_offset() {
+        uint64_t result = 0;
+        uint64_t stride = 1;
+        for (int i = static_cast<int>(ndims) - 1; i >= 0; i--) {
+            result += offsets[i] * stride;
+            stride *= raw_shapes[i];
+        }
+        start_offset = result;
+    }
+
+    void copy(const Tensor &other) {
+        init(other);
     }
 
     Tensor view(const uint64_t view_shapes[], const uint64_t view_offsets[]) const {
         Tensor result;
-        TensorPool& pool = TensorPool::instance();
-        result.index = pool.alloc();
-        pool.data[result.index].init_with_view(pool.data[index], view_shapes, view_offsets);
+        result.init_with_view(*this, view_shapes, view_offsets);
         return result;
     }
 
-    bool is_contiguous() const { return data().is_contiguous(); }
+    bool is_contiguous() const {
+        if (ndims == 0) {
+            return true;
+        }
+        for (uint64_t i = 1; i < ndims; i++) {
+            if (shapes[i] != raw_shapes[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
 
     bool valid_reshape(const uint64_t new_shapes[], uint64_t new_ndims) const {
-        const TensorData& tensor_data = data();
-        uint64_t x = 1;
-        for (size_t i = 0; i < tensor_data.ndims; i++) {
-            x *= tensor_data.shapes[i];
-        }
+        uint64_t x = numel();
         uint64_t y = 1;
         for (size_t i = 0; i < new_ndims; i++) {
             y *= new_shapes[i];
@@ -106,35 +170,105 @@ struct Tensor {
     Tensor reshape(const uint64_t new_shapes[], uint64_t new_ndims) const {
         debug_assert(valid_reshape(new_shapes, new_ndims));
         always_assert(is_contiguous());
-        Tensor result = copy();
-        TensorData& result_tensor_data = result.data();
-        result_tensor_data.ndims = new_ndims;
+        Tensor result;
+        result.copy(*this);
+        result.ndims = new_ndims;
         for (uint64_t i = 0; i < new_ndims; i++) {
-            result_tensor_data.raw_shapes[i] = new_shapes[i];
-            result_tensor_data.shapes[i] = new_shapes[i];
-            result_tensor_data.offsets[i] = 0;
+            result.raw_shapes[i] = new_shapes[i];
+            result.shapes[i] = new_shapes[i];
+            result.offsets[i] = 0;
         }
         return result;
     }
 
-    bool valid_transpose(uint64_t x, uint64_t y) const { return x < data().ndims && y < data().ndims; }
+    bool valid_transpose(uint64_t x, uint64_t y) const { return x < ndims && y < ndims; }
 
     Tensor transpose(uint64_t x, uint64_t y) const {
         debug_assert(valid_transpose(x, y));
-        Tensor result = copy();
-        TensorData& result_tensor_data = result.data();
-        std::swap(result_tensor_data.raw_shapes[x], result_tensor_data.raw_shapes[y]);
-        std::swap(result_tensor_data.shapes[x], result_tensor_data.shapes[y]);
-        std::swap(result_tensor_data.offsets[x], result_tensor_data.offsets[y]);
+        Tensor result;
+        result.copy(*this);
+        std::swap(result.raw_shapes[x], result.raw_shapes[y]);
+        std::swap(result.shapes[x], result.shapes[y]);
+        std::swap(result.offsets[x], result.offsets[y]);
         return result;
     }
 
-    std::string dump() const { return data().dump(); }
+    uint64_t numel() const {
+        if (ndims == 0) {
+            return 0;
+        }
+        uint64_t total = 1;
+        for (uint64_t i = 0; i < ndims; i++) {
+            total *= shapes[i];
+        }
+        return total;
+    }
 
-    uint64_t numel() const { return data().numel(); }
+    bool is_same_memref(const Tensor& other) const { return buffer.addr == other.buffer.addr; }
 
-    OverlapStatus is_overlap(const Tensor& pre_task_output) const { return data().is_overlap(pre_task_output.data()); }
+    OverlapStatus is_overlap(const Tensor& pre_task_output) const {
+        debug_assert(is_same_memref(pre_task_output));
+        debug_assert(version >= pre_task_output.version);
+        if (version > pre_task_output.version) {
+            return OverlapStatus::OTHER;
+        }
+        bool contains = true;
+        for (uint64_t i = 0; i < ndims; i++) {
+            Segment input_range_dim_i{offsets[i], offsets[i] + shapes[i]};
+            Segment output_range_dim_i{
+                pre_task_output.offsets[i], pre_task_output.offsets[i] + pre_task_output.shapes[i]};
+            if (!input_range_dim_i.line_segment_intersection(output_range_dim_i)) {
+                return OverlapStatus::NO_OVERLAP;
+            } else if (!input_range_dim_i.contains(output_range_dim_i)) {
+                contains = false;
+            }
+        }
+        if (contains) {
+            return OverlapStatus::COVERED;
+        }
+        return OverlapStatus::OTHER;
+    }
+
+    std::string dump() const {
+        std::stringstream ss;
+        std::string indent = "    ";
+        ss << "{" << std::endl;
+        ss << indent << "buffer.addr: " << buffer.addr << std::endl;
+        ss << indent << "buffer.size: " << buffer.size << " bytes" << std::endl;
+        ss << indent << "dtype: " << get_dtype_name(dtype) << std::endl;
+        ss << indent << "ndims: " << ndims << std::endl;
+        ss << indent << "version: " << version << std::endl;
+
+        ss << indent << "raw_shapes: [";
+        for (uint64_t i = 0; i < ndims; i++) {
+            if (i > 0) {
+                ss << ", ";
+            }
+            ss << raw_shapes[i];
+        }
+        ss << "]" << std::endl;
+        ss << indent << "shapes: [";
+        for (uint64_t i = 0; i < ndims; i++) {
+            if (i > 0) {
+                ss << ", ";
+            }
+            ss << shapes[i];
+        }
+        ss << "]" << std::endl;
+        ss << indent << "offsets: [";
+        for (uint64_t i = 0; i < ndims; i++) {
+            if (i > 0) {
+                ss << ", ";
+            }
+            ss << offsets[i];
+        }
+        ss << "]" << std::endl;
+        ss << "}" << std::endl;
+        return ss.str();
+    }
 };
+
+using TensorData = Tensor;
 
 // =============================================================================
 // Factory Helpers

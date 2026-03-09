@@ -63,7 +63,6 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
 }
 
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
-    pto2_rt_init_tensor_pool(rt);
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor    = 0;
     uint64_t prof_make_tensor   = 0;

@@ -80,7 +80,6 @@ struct PTO2TensorMapEntry {
     PTO2TensorMapEntry* prev_in_task;      // Offset to prev entry for same task (-1 = head is task_entry_head[slot])
     int32_t bucket_index;      // != -1 if entry is linked in a bucket chain
                                // CRITICAL: Must be set -1 before overwriting!
-    uint64_t addr;
     Tensor tensor;             // Tensor descriptor key
 };
 
@@ -151,7 +150,7 @@ struct PTO2TensorMap {
         // Update predecessor's next pointer (O(1) via prev_in_bucket)
         if (entry.prev_in_bucket == nullptr) {
             // Entry is the head of its bucket chain, update bucket head
-            // Must compute hash BEFORE clearing tensor (tensor.data() needs valid tensor_pool)
+            // Must compute hash BEFORE clearing tensor
             buckets[entry.bucket_index] = entry.next_in_bucket;
         } else {
             entry.prev_in_bucket->next_in_bucket = entry.next_in_bucket;
@@ -217,8 +216,7 @@ struct PTO2TensorMap {
      * @param result  Output: stack-allocated result buffer
      */
     void lookup(const Tensor& tensor, PTO2LookupResult& result) {
-        auto& query_tensor_data = tensor.data();
-        uint32_t bucket_index = hash(query_tensor_data.buffer.addr);
+        uint32_t bucket_index = hash(tensor.buffer.addr);
         PTO2TensorMapEntry** prev_ptr = &buckets[bucket_index];  // For truncation
         PTO2TensorMapEntry* cur_entry = *prev_ptr;
 
@@ -251,11 +249,11 @@ struct PTO2TensorMap {
             // Entry is valid - check if regions OVERLAP (not just exact match)
             // Since we hash only by base_ptr, all entries in this bucket have
             // potential to overlap. We must check actual byte-range overlap.
-            if (query_tensor_data.buffer.addr == cur_entry->addr) {
+            if (tensor.buffer.addr == cur_entry->tensor.buffer.addr) {
 #if PTO2_TENSORMAP_PROFILING
                 g_lookup_overlap_checks++;
 #endif
-                auto overlap_status = query_tensor_data.is_overlap(cur_entry->tensor.data());
+                auto overlap_status = tensor.is_overlap(cur_entry->tensor);
                 if (overlap_status != OverlapStatus::NO_OVERLAP) {
                     result.push(cur_entry, overlap_status);
 #if PTO2_TENSORMAP_PROFILING
@@ -291,13 +289,12 @@ struct PTO2TensorMap {
         PTO2TensorMapEntry* entry = new_entry();
 
         // Initialize new entry
-        entry->tensor = tensor;
+        entry->tensor.copy(tensor);
         entry->producer_task_id = producer_task_id;
         entry->with_alloc = with_alloc;
 
         // Insert at head of hash bucket (maintains task_id descending order)
-        entry->addr = tensor.data().buffer.addr;
-        entry->bucket_index = hash(entry->addr);
+        entry->bucket_index = hash(tensor.buffer.addr);
         entry->next_in_bucket = buckets[entry->bucket_index];
         // Update old head's prev pointer
         if (entry->next_in_bucket != nullptr) {

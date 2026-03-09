@@ -37,13 +37,9 @@ enum class PTOParamType : int32_t {
 /**
  * Parameter Descriptor for pto_submit_task
  *
- * Each parameter holds a pointer to the caller's Tensor for
- * automatic dependency detection via TensorMap overlap checking.
- *
- * For OUTPUT params with tensor->buffer.addr == 0, the runtime allocates
- * from the heap ring in pto2_submit_task (not in make_tensor) and writes the
- * address back through the pointer. No buffer content is copied; input/inout
- * tensors already point to their storage, so no memcpy on submit.
+ * Holds a pointer to the caller's Tensor (reference semantics). The runtime
+ * copies the Tensor into the task descriptor for scheduler access, and
+ * writes allocated OUTPUT addresses back through the pointer.
  *
  * Example:
  *   Tensor td_a = make_tensor_external(dev_a, size);
@@ -53,17 +49,12 @@ enum class PTOParamType : int32_t {
  *       make_output_param(td_c),
  *   };
  *   pto2_rt_submit_task(rt, func_id, worker_type, params, 2);
- *   // td_c.buffer.addr is already updated - no explicit sync needed
+ *   // td_c.buffer.addr is already updated via pointer write-back
  */
 struct PTOParam {
     PTOParamType type;         // PTOParamType::INPUT, PTOParamType::OUTPUT, or PTOParamType::SCALAR
-    Tensor tensor;             // Tensor value (default-constructed for SCALAR)
-    uint64_t scalar_value;     // Raw value for PTOParamType::SCALAR (e.g., encoded float, int size)
-
-    PTOParam() : type(PTOParamType::SCALAR), tensor(), scalar_value(0) {}
-
-    PTOParam(PTOParamType type, const Tensor& tensor, uint64_t scalar_value):
-        type(type), tensor(tensor), scalar_value(scalar_value) {}
+    Tensor* tensor{nullptr};   // Pointer to caller's Tensor (reference semantics)
+    uint64_t scalar_value{0};  // Raw value for PTOParamType::SCALAR (e.g., encoded float, int size)
 };
 
 // =============================================================================
@@ -71,21 +62,33 @@ struct PTOParam {
 // =============================================================================
 
 static inline PTOParam make_scalar_param(uint64_t value) {
-    return PTOParam(PTOParamType::SCALAR, Tensor(), value);
+    PTOParam p;
+    p.type = PTOParamType::SCALAR;
+    p.scalar_value = value;
+    return p;
 }
 
 static inline PTOParam make_input_param(Tensor& tensor) {
-    assert(tensor.data().buffer.addr != 0 && "INPUT param must have a non-NULL buffer address");
-    return PTOParam(PTOParamType::INPUT, tensor, 0);
+    assert(tensor.buffer.addr != 0 && "INPUT param must have a non-NULL buffer address");
+    PTOParam p;
+    p.type = PTOParamType::INPUT;
+    p.tensor = &tensor;
+    return p;
 }
 
 static inline PTOParam make_output_param(Tensor& tensor) {
-    return PTOParam(PTOParamType::OUTPUT, tensor, 0);
+    PTOParam p;
+    p.type = PTOParamType::OUTPUT;
+    p.tensor = &tensor;
+    return p;
 }
 
 static inline PTOParam make_inout_param(Tensor& tensor) {
-    assert(tensor.data().buffer.addr != 0 && "INOUT param must have a non-NULL buffer address");
-    return PTOParam(PTOParamType::INOUT, tensor, 0);
+    assert(tensor.buffer.addr != 0 && "INOUT param must have a non-NULL buffer address");
+    PTOParam p;
+    p.type = PTOParamType::INOUT;
+    p.tensor = &tensor;
+    return p;
 }
 
 #endif  // ORCH_BUILD_GRAPH_PTO_TYPES_H

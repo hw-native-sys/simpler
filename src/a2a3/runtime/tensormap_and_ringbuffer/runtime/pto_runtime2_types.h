@@ -303,8 +303,9 @@ struct PTO2TaskDescriptor {
     // Status flags
     bool     is_active;           // Task slot is in use
 
-
-    PTOParam params[16];
+    Tensor tensors[16];           // Value copies of tensors for scheduler access
+    uint64_t scalar_value[16];
+    bool is_tensor[16];
     int param_count{0};
 };
 
