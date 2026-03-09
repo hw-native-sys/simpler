@@ -45,6 +45,7 @@ Golden.py interface:
 """
 
 import importlib.util
+import fcntl
 import logging
 import os
 import sys
@@ -289,6 +290,8 @@ def _ensure_pto_isa_root(verbose: bool = False, commit: Optional[str] = None) ->
     2. If not, tries to clone pto-isa repository
     3. Returns the resolved path
 
+    Uses a file lock to prevent parallel processes from racing on the clone.
+
     Args:
         verbose: Print detailed progress information
         commit: If provided, checkout this specific commit
@@ -305,6 +308,19 @@ def _ensure_pto_isa_root(verbose: bool = False, commit: Optional[str] = None) ->
 
     # Try to use cloned repository
     clone_path = _get_pto_isa_clone_path()
+
+    # Use a file lock so only one process clones at a time
+    lock_path = clone_path.parent / ".pto-isa.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "w") as lock_fd:
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        return _ensure_pto_isa_root_locked(clone_path, verbose=verbose, commit=commit)
+
+
+def _ensure_pto_isa_root_locked(
+    clone_path: Path, verbose: bool = False, commit: Optional[str] = None
+) -> Optional[str]:
+    """Inner logic for _ensure_pto_isa_root, called while holding the file lock."""
 
     # Clone if needed
     if not _is_pto_isa_cloned():

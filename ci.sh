@@ -319,6 +319,9 @@ run_task() {
     else
         status="FAIL"
         echo "[${platform}${device_id:+:dev${device_id}}] FAIL: $name (${elapsed}s)"
+        echo "--- LOG: $name (attempt $attempt) ---"
+        cat "$task_log"
+        echo "--- END ---"
     fi
     echo "${name}|${platform}|${status}|device:${device_id:-sim}|attempt:${attempt}|${elapsed}s" \
         >> "$RESULTS_FILE"
