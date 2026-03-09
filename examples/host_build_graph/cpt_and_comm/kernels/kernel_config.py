@@ -11,7 +11,11 @@ _KERNELS_ROOT = Path(__file__).parent
 
 ORCHESTRATION = {
     "source": str(_KERNELS_ROOT / "orchestration" / "cpt_and_comm_orch.cpp"),
-    "function_name": "build_cpt_and_comm_graph",
+    "function_name": "build_cpt_compute_graph",
+}
+
+ORCHESTRATION_COMM = {
+    "function_name": "build_cpt_comm_graph",
 }
 
 KERNELS = [

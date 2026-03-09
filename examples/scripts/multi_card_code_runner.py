@@ -369,6 +369,7 @@ class CodeRunner:
         # Extract kernel configuration
         self.kernels = self._kernel_config.KERNELS
         self.orchestration = self._kernel_config.ORCHESTRATION
+        self.orchestration_comm = getattr(self._kernel_config, 'ORCHESTRATION_COMM', None)
 
         # Extract golden configuration — determine which cases to run
         all_cases = getattr(self._golden_module, 'ALL_CASES', {"Default": {}})
@@ -637,6 +638,7 @@ class CodeRunner:
             aicore_binary = artifacts["aicore_binary"]
             kernel_binaries = artifacts["kernel_binaries"]
             orch_func_name = artifacts["orch_func_name"]
+            orch_comm_func_name = artifacts.get("orch_comm_func_name")
             logger.info(f"=== Using pre-built artifacts ({len(kernel_binaries)} kernels) ===")
         else:
             # Build path
@@ -717,6 +719,7 @@ class CodeRunner:
 
             logger.info(f"Compiled {len(kernel_binaries)} kernel(s)")
             orch_func_name = self.orchestration["function_name"]
+            orch_comm_func_name = self.orchestration_comm["function_name"] if self.orchestration_comm else None
 
         # Load runtime and set device
         logger.info(f"=== Loading Runtime ({len(host_binary)} bytes) ===")
@@ -756,78 +759,34 @@ class CodeRunner:
             logger.debug(f"Tensor order: {list(tensors.keys())}")
             logger.debug(f"func_args count: {len(func_args)}")
 
-            # Create and initialize runtime (including kernel registration)
-            logger.info("=== Initializing Runtime ===")
-            runtime = Runtime()
+            # Save expected values BEFORE hardware execution (outputs will be overwritten)
+            golden = {k: v.clone() for k, v in outputs.items()}
+            golden_with_inputs = {**inputs, **golden}
+            _t_golden_start = time.perf_counter()
+            self._golden_module.compute_golden(golden_with_inputs, params)
+            _t_golden_end = time.perf_counter()
+            logger.info(f">>> compute_golden() took {_t_golden_end - _t_golden_start:.3f}s")
 
             # Build environment for runtime initialization
             run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
             if run_env:
                 logger.debug(f"Runtime init env overrides: {run_env}")
 
-            # Enable profiling if requested (must be before initialize)
-            if self.enable_profiling:
-                runtime.enable_profiling(True)
-                logger.info("Profiling enabled")
+            has_comm = comm_context and "comm" in comm_context and "stream" in comm_context
+            two_phase = has_comm and orch_comm_func_name is not None
 
-            _t_init_start = time.perf_counter()
-            with _temporary_env(run_env):
-                runtime.initialize(
-                    orch_so_binary,
-                    orch_func_name,
-                    func_args,
-                    arg_types=arg_types,
-                    arg_sizes=arg_sizes,
-                    kernel_binaries=kernel_binaries,
+            if two_phase:
+                self._run_two_phase(
+                    Runtime, orch_so_binary, orch_func_name, orch_comm_func_name,
+                    func_args, arg_types, arg_sizes, kernel_binaries,
+                    aicpu_binary, aicore_binary, run_env, comm_context,
                 )
-            _t_init_end = time.perf_counter()
-            logger.info(f">>> runtime.initialize() took {_t_init_end - _t_init_start:.3f}s")
-
-            # Save expected values BEFORE hardware execution (outputs will be overwritten)
-            golden = {k: v.clone() for k, v in outputs.items()}
-            # Convert to dict for compute_golden (may expect numpy-like interface)
-            golden_with_inputs = {**inputs, **golden}
-            _t_golden_start = time.perf_counter()
-            self._golden_module.compute_golden(golden_with_inputs, params)
-            _t_golden_end = time.perf_counter()
-            logger.info(f">>> compute_golden() took {_t_golden_end - _t_golden_start:.3f}s")
-            logger.info(f">>> Total init-to-launch: {_t_golden_end - _t_init_start:.3f}s "
-                        f"(initialize={_t_init_end - _t_init_start:.3f}s, "
-                        f"golden={_t_golden_end - _t_golden_start:.3f}s)")
-
-            # HcclBarrier before launch (when using comm)
-            if comm_context and "comm" in comm_context and "stream" in comm_context:
-                from hccl_bindings import hccl_barrier
-                hccl_barrier(comm_context["comm"], comm_context["stream"])
-                logger.info("HcclBarrier (pre-launch) done")
-
-            # Launch runtime
-            logger.info("=== Launching Runtime ===")
-            logger.debug(f"Device ID: {self.device_id}")
-            logger.debug(f"AICPU threads: {self.aicpu_thread_num}, Block dim: {self.block_dim}")
-            import sys
-            sys.stdout.flush()  # Ensure output is visible before potential hang
-
-            launch_runtime(
-                runtime,
-                aicpu_thread_num=self.aicpu_thread_num,
-                block_dim=self.block_dim,
-                device_id=self.device_id,
-                aicpu_binary=aicpu_binary,
-                aicore_binary=aicore_binary,
-            )
-
-            logger.info("Launch completed successfully")  # Will only print if not hung
-
-            # HcclBarrier after launch (when using comm)
-            if comm_context and "comm" in comm_context and "stream" in comm_context:
-                from hccl_bindings import hccl_barrier
-                hccl_barrier(comm_context["comm"], comm_context["stream"])
-                logger.info("HcclBarrier (post-launch) done")
-
-            # Finalize
-            logger.info("=== Finalizing Runtime ===")
-            runtime.finalize()
+            else:
+                self._run_single_phase(
+                    Runtime, orch_so_binary, orch_func_name,
+                    func_args, arg_types, arg_sizes, kernel_binaries,
+                    aicpu_binary, aicore_binary, run_env, comm_context, has_comm,
+                )
 
             # Compute golden and compare
             logger.info("=== Comparing Results ===")
@@ -838,6 +797,97 @@ class CodeRunner:
         logger.info("=" * 60)
         logger.info(f"=== All {total_cases} cases passed ===")
         logger.info("=" * 60)
+
+    def _init_and_launch(self, Runtime, orch_so_binary, func_name,
+                         func_args, arg_types, arg_sizes, kernel_binaries,
+                         aicpu_binary, aicore_binary, run_env, phase_label=""):
+        """Create a Runtime, initialize, launch, and finalize."""
+        from bindings import launch_runtime
+        label = f" ({phase_label})" if phase_label else ""
+
+        logger.info(f"=== Initializing Runtime{label} ===")
+        runtime = Runtime()
+        if self.enable_profiling:
+            runtime.enable_profiling(True)
+
+        with _temporary_env(run_env):
+            runtime.initialize(
+                orch_so_binary, func_name, func_args,
+                arg_types=arg_types, arg_sizes=arg_sizes,
+                kernel_binaries=kernel_binaries,
+            )
+
+        logger.info(f"=== Launching Runtime{label} ===")
+        import sys
+        sys.stdout.flush()
+
+        launch_runtime(
+            runtime,
+            aicpu_thread_num=self.aicpu_thread_num,
+            block_dim=self.block_dim,
+            device_id=self.device_id,
+            aicpu_binary=aicpu_binary,
+            aicore_binary=aicore_binary,
+        )
+        logger.info(f"Launch{label} completed")
+
+        logger.info(f"=== Finalizing Runtime{label} ===")
+        runtime.finalize()
+
+    def _run_single_phase(self, Runtime, orch_so_binary, orch_func_name,
+                          func_args, arg_types, arg_sizes, kernel_binaries,
+                          aicpu_binary, aicore_binary, run_env,
+                          comm_context, has_comm):
+        """Original single-phase execution path."""
+        if has_comm:
+            from hccl_bindings import hccl_barrier
+            hccl_barrier(comm_context["comm"], comm_context["stream"])
+            logger.info("HcclBarrier (pre-launch) done")
+
+        self._init_and_launch(
+            Runtime, orch_so_binary, orch_func_name,
+            func_args, arg_types, arg_sizes, kernel_binaries,
+            aicpu_binary, aicore_binary, run_env,
+        )
+
+        if has_comm:
+            from hccl_bindings import hccl_barrier
+            hccl_barrier(comm_context["comm"], comm_context["stream"])
+            logger.info("HcclBarrier (post-launch) done")
+
+    def _run_two_phase(self, Runtime, orch_so_binary,
+                       compute_func_name, comm_func_name,
+                       func_args, arg_types, arg_sizes, kernel_binaries,
+                       aicpu_binary, aicore_binary, run_env, comm_context):
+        """Two-phase execution: compute → barrier → comm."""
+        from hccl_bindings import hccl_barrier
+        comm = comm_context["comm"]
+        stream = comm_context["stream"]
+
+        hccl_barrier(comm, stream)
+        logger.info("HcclBarrier (pre-compute) done")
+
+        # Phase 1: compute (GEMM + WindowMemCopyIn)
+        self._init_and_launch(
+            Runtime, orch_so_binary, compute_func_name,
+            func_args, arg_types, arg_sizes, kernel_binaries,
+            aicpu_binary, aicore_binary, run_env, phase_label="compute",
+        )
+
+        # Cross-rank barrier: all ranks must finish writing to window
+        # before any rank reads via TGATHER
+        hccl_barrier(comm, stream)
+        logger.info("HcclBarrier (compute→comm) done — all ranks synchronized")
+
+        # Phase 2: comm (TGATHER + WindowMemCopyOut)
+        self._init_and_launch(
+            Runtime, orch_so_binary, comm_func_name,
+            func_args, arg_types, arg_sizes, kernel_binaries,
+            aicpu_binary, aicore_binary, run_env, phase_label="comm",
+        )
+
+        hccl_barrier(comm, stream)
+        logger.info("HcclBarrier (post-comm) done")
 
     def _compare_with_golden(
         self,
@@ -1005,6 +1055,7 @@ def _write_artifacts_to_dir(artifacts: dict, out_dir: Path) -> None:
         (out_dir / f"kernel_{func_id}.bin").write_bytes(bin_data)
     manifest = {
         "orch_func_name": artifacts["orch_func_name"],
+        "orch_comm_func_name": artifacts.get("orch_comm_func_name"),
         "kernel_func_ids": [k[0] for k in artifacts["kernel_binaries"]],
     }
     (out_dir / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
@@ -1025,6 +1076,7 @@ def _load_artifacts_from_dir(prebuilt_dir: Path) -> dict:
         "aicore_binary": (prebuilt_dir / "aicore.bin").read_bytes(),
         "kernel_binaries": kernel_binaries,
         "orch_func_name": manifest["orch_func_name"],
+        "orch_comm_func_name": manifest.get("orch_comm_func_name"),
     }
 
 
@@ -1044,6 +1096,7 @@ class PTOCompiler:
         )
         self.kernels = self._kernel_config.KERNELS
         self.orchestration = self._kernel_config.ORCHESTRATION
+        self.orchestration_comm = getattr(self._kernel_config, 'ORCHESTRATION_COMM', None)
         runtime_config = getattr(self._kernel_config, "RUNTIME_CONFIG", {})
         self.runtime_name = runtime_config.get("runtime", "host_build_graph")
         self.requires_comm = runtime_config.get("requires_comm", False)
@@ -1122,14 +1175,16 @@ class PTOCompiler:
 
         logger.info(f"PTOCompiler: Compiled {len(kernel_binaries)} kernel(s)")
 
-        return {
+        result = {
             "host_binary": host_binary,
             "orch_so_binary": orch_so_binary,
             "aicpu_binary": aicpu_binary,
             "aicore_binary": aicore_binary,
             "kernel_binaries": kernel_binaries,
             "orch_func_name": self.orchestration["function_name"],
+            "orch_comm_func_name": self.orchestration_comm["function_name"] if self.orchestration_comm else None,
         }
+        return result
 
 
 def create_compiler(kernels_dir, platform="a2a3"):
