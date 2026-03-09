@@ -301,7 +301,7 @@ void perf_aicpu_update_total_tasks(Runtime* runtime, uint32_t total_tasks) {
     wmb();
 }
 
-void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads) {
+void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, int num_orch_threads) {
     void* perf_base = (void*)runtime->perf_data_base;
     if (perf_base == nullptr) {
         LOG_ERROR("perf_data_base is NULL, cannot initialize phase profiling");
@@ -319,9 +319,12 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads) {
     memset(s_phase_header->core_to_thread, -1, sizeof(s_phase_header->core_to_thread));
     memset(&s_phase_header->orch_summary, 0, sizeof(AicpuOrchSummary));
 
-    // Initialize per-thread PhaseRingBuffers (scheduler threads + orchestrator slot)
-    int total_threads = (num_sched_threads < PLATFORM_MAX_AICPU_THREADS)
-                        ? num_sched_threads + 1 : num_sched_threads;
+    // Cache per-thread record pointers and clear buffers
+    // Include all threads: scheduler + orchestrator (orchestrators may become schedulers)
+    int total_threads = num_sched_threads + num_orch_threads;
+    if (total_threads > PLATFORM_MAX_AICPU_THREADS) {
+        total_threads = PLATFORM_MAX_AICPU_THREADS;
+    }
     for (int t = 0; t < total_threads; t++) {
         PhaseRingBuffer* ring = get_phase_ring_buffer(perf_base, runtime->worker_count, t);
         memset(ring, 0, sizeof(PhaseRingBuffer));
@@ -348,8 +351,8 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads) {
 
     wmb();
 
-    LOG_INFO("Phase profiling initialized: %d scheduler threads (+1 orch), %d records/buffer, ring depth %d",
-             num_sched_threads, PLATFORM_PHASE_RECORDS_PER_THREAD, PLATFORM_PHASE_RING_DEPTH);
+    LOG_INFO("Phase profiling initialized: %d scheduler + %d orch threads, %d records/thread, ring depth %d",
+             num_sched_threads, num_orch_threads, PLATFORM_PHASE_RECORDS_PER_THREAD, PLATFORM_PHASE_RING_DEPTH);
 }
 
 /**
@@ -406,7 +409,7 @@ static void switch_phase_buffer(int thread_idx) {
 }
 
 void perf_aicpu_record_phase(int thread_idx,
-                              AicpuPhaseId phase_id,
+    AicpuPhaseId phase_id,
                               uint64_t start_time, uint64_t end_time,
                               uint32_t loop_iter, uint32_t tasks_processed) {
     if (s_phase_header == nullptr) {

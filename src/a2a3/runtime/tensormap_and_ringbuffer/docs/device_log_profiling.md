@@ -64,7 +64,6 @@ Thread 3: PTO2 total submitted tasks = 16704
 | **heap_alloc** | `g_orch_heap_cycle` | Allocating packed output buffers from the heap ring |
 | **tensormap_ins** | `g_orch_insert_cycle` | Inserting output/inout tensors into the TensorMap |
 | **fanin+ready** | `g_orch_fanin_cycle` | Building the fanin list + checking if task is already ready (Step 5/5b) |
-| **finalize+SM** | `g_orch_finalize_cycle` | Initializing task in scheduler + updating shared memory `current_task_index` |
 | **scope_end** | `g_orch_scope_end_cycle` | `pto2_scope_end` overhead (notifying scheduler of scope completion) |
 | **avg/task** | `total / submit_count` | Average orchestrator time per task submission |
 

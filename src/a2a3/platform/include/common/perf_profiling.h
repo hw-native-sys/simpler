@@ -255,7 +255,6 @@ struct AicpuOrchSummary {
     uint64_t heap_cycle;       // heap_alloc phase
     uint64_t insert_cycle;     // tensormap_insert phase
     uint64_t fanin_cycle;      // fanin+ready phase
-    uint64_t finalize_cycle;   // finalize+SM phase
     uint64_t scope_end_cycle;  // scope_end phase
     int64_t  submit_count;     // Total tasks submitted
     uint32_t magic;            // Validation magic (AICPU_PHASE_MAGIC)

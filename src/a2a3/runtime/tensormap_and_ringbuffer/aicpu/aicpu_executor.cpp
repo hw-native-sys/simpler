@@ -1174,7 +1174,7 @@ int AicpuExecutor::run(Runtime* runtime) {
                 perf_aicpu_write_core_assignments(core_assignments_, core_count_per_thread_,
                                                    sched_threads, cores_total_num_);
                 // Flush orchestrator's phase record buffer
-                perf_aicpu_flush_phase_buffers(sched_threads);
+                perf_aicpu_flush_phase_buffers(thread_idx);
             }
 #endif
 

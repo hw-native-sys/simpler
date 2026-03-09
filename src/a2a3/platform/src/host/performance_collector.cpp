@@ -180,7 +180,6 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
     collected_perf_records_.resize(num_aicore);
     idle_start.reset();
     int empty_poll_count = 0;
-    int last_logged_expected = -1;
 
     // Pre-allocate phase record storage for double-buffer collection during polling
     AicpuPhaseHeader* phase_header = get_phase_header(perf_shared_mem_host_, num_aicore_);
@@ -200,15 +199,6 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
 
     while (total_records_collected < expected_tasks) {
         rmb();
-
-        int current_expected = static_cast<int>(header->total_tasks);
-        if (current_expected > expected_tasks) {
-            expected_tasks = current_expected;
-            if (last_logged_expected < 0) {
-                LOG_INFO("Updated expected_tasks to %d (orchestrator progress)", expected_tasks);
-                last_logged_expected = expected_tasks;
-            }
-        }
 
         uint32_t head = header->queue_heads[current_thread];
         uint32_t tail = header->queue_tails[current_thread];
@@ -327,10 +317,6 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
         buffers_processed++;
 
         current_thread = (current_thread + 1) % PLATFORM_MAX_AICPU_THREADS;
-    }
-
-    if (last_logged_expected >= 0 && expected_tasks != last_logged_expected) {
-        LOG_INFO("Final expected_tasks: %d (orchestration complete)", expected_tasks);
     }
 
     LOG_INFO("Total buffers processed: %d", buffers_processed);
@@ -640,7 +626,6 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
             outfile << "      \"heap\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.heap_cycle) << ",\n";
             outfile << "      \"insert\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.insert_cycle) << ",\n";
             outfile << "      \"fanin\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.fanin_cycle) << ",\n";
-            outfile << "      \"finalize\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.finalize_cycle) << ",\n";
             outfile << "      \"scope_end\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.scope_end_cycle) << "\n";
             outfile << "    }\n";
             outfile << "  }";
