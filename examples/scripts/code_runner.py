@@ -311,14 +311,23 @@ def _ensure_pto_isa_root(verbose: bool = False, commit: Optional[str] = None) ->
         if verbose:
             logger.info("PTO_ISA_ROOT not set, cloning pto-isa repository...")
         if not _clone_pto_isa(verbose=verbose, commit=commit):
+            # Another parallel process may have completed the clone
+            if not _is_pto_isa_cloned():
+                if verbose:
+                    logger.warning("Failed to automatically clone pto-isa.")
+                    logger.warning("You can manually clone it with:")
+                    logger.warning(f"  mkdir -p {clone_path.parent}")
+                    logger.warning(f"  git clone {_PTO_ISA_REPO} {clone_path}")
+                    logger.warning("Or set PTO_ISA_ROOT to an existing pto-isa installation:")
+                    logger.warning("  export PTO_ISA_ROOT=/path/to/pto-isa")
+                return None
             if verbose:
-                logger.warning("Failed to automatically clone pto-isa.")
-                logger.warning("You can manually clone it with:")
-                logger.warning(f"  mkdir -p {clone_path.parent}")
-                logger.warning(f"  git clone {_PTO_ISA_REPO} {clone_path}")
-                logger.warning("Or set PTO_ISA_ROOT to an existing pto-isa installation:")
-                logger.warning("  export PTO_ISA_ROOT=/path/to/pto-isa")
-            return None
+                logger.info("pto-isa already cloned by another process")
+            # Recovered from race — apply commit/update below
+            if commit:
+                _checkout_pto_isa_commit(clone_path, commit, verbose=verbose)
+            else:
+                _update_pto_isa_to_latest(clone_path, verbose=verbose)
     elif commit:
         _checkout_pto_isa_commit(clone_path, commit, verbose=verbose)
     else:
