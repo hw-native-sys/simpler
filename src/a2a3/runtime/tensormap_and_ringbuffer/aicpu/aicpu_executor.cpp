@@ -792,7 +792,6 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
             } else {
                 SPIN_WAIT_HINT();
             }
-            PTO2_SPIN_PAUSE_LIGHT();
             CYCLE_COUNT_LAP(sched_idle_cycle);
 #if PTO2_PROFILING
             if (profiling_enabled) {

@@ -344,20 +344,15 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
     #define PTO2_MEMORY_BARRIER()     __sync_synchronize()
 #endif
 
-/**
- * Pause instruction for spin-wait loops
- * Include sched_yield() to prevent CPU starvation of other threads
- */
-#include <sched.h>
-#if defined(__aarch64__)
-    #define PTO2_SPIN_PAUSE()         do { __asm__ __volatile__("yield" ::: "memory"); sched_yield(); } while(0)
-    #define PTO2_SPIN_PAUSE_LIGHT()   __asm__ __volatile__("yield" ::: "memory")
-#elif defined(__x86_64__)
-    #define PTO2_SPIN_PAUSE()         do { __builtin_ia32_pause(); sched_yield(); } while(0)
-    #define PTO2_SPIN_PAUSE_LIGHT()   __builtin_ia32_pause()
+// Spin-wait hint for AICPU threads.  On real hardware the AICPU has dedicated
+// ARM A55 cores — no OS yield is needed, so the hint is a no-op.  In simulation
+// all threads share host CPU cores, so we yield to prevent starvation.
+// This header is also compiled into the Host .so (for struct definitions only),
+// where the hint is never called — the fallback no-op keeps Host builds clean.
+#if __has_include("spin_hint.h")
+#include "spin_hint.h"
 #else
-    #define PTO2_SPIN_PAUSE()         sched_yield()
-    #define PTO2_SPIN_PAUSE_LIGHT()   ((void)0)
+#define SPIN_WAIT_HINT() ((void)0)
 #endif
 
 // =============================================================================
@@ -387,7 +382,7 @@ static inline void pto2_fanout_lock(PTO2TaskDescriptor* task,
         while (task->fanout_lock.load(std::memory_order_acquire) != 0) {
             contended = true;
             atomic_ops++;  // each load = 1 atomic
-            PTO2_SPIN_PAUSE_LIGHT();
+            SPIN_WAIT_HINT();
         }
         int32_t expected = 0;
         if (task->fanout_lock.compare_exchange_weak(expected, 1,
@@ -408,7 +403,7 @@ static inline void pto2_fanout_lock(PTO2TaskDescriptor* task,
 static inline void pto2_fanout_lock(PTO2TaskDescriptor* task) {
     for (;;) {
         while (task->fanout_lock.load(std::memory_order_acquire) != 0) {
-            PTO2_SPIN_PAUSE_LIGHT();
+            SPIN_WAIT_HINT();
         }
         int32_t expected = 0;
         if (task->fanout_lock.compare_exchange_weak(expected, 1,

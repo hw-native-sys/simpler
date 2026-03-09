@@ -144,7 +144,7 @@ struct PTO2HeapRing {
                 exit(1);
             }
 
-            PTO2_SPIN_PAUSE();
+            SPIN_WAIT_HINT();
         }
     }
 
@@ -343,7 +343,7 @@ struct PTO2TaskRing {
                 exit(1);
             }
 
-            PTO2_SPIN_PAUSE();
+            SPIN_WAIT_HINT();
         }
     }
 
