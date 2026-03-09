@@ -19,7 +19,10 @@ query($owner: String!, $repo: String!, $number: Int!) {
               body
               path
               line
+              originalLine
+              diffHunk
               author { login }
+              createdAt
             }
           }
         }
