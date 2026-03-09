@@ -86,10 +86,14 @@ class RuntimeCompiler:
                 f"Platform '{platform}' not found at {self.platform_dir}"
             )
 
-        if platform in ("a2a3", "a5"):
-            self._init_a2a3()  # Phase 1: A5 uses A2A3 toolchain
-        elif platform in ("a2a3sim", "a5sim"):
-            self._init_a2a3sim()  # Phase 1: A5sim uses A2A3sim toolchain
+        if platform == "a2a3":
+            self._init_a2a3()
+        elif platform == "a2a3sim":
+            self._init_a2a3sim()
+        elif platform == "a5":
+            self._init_a5()
+        elif platform == "a5sim":
+            self._init_a5sim()
         else:
             raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
 
@@ -98,7 +102,7 @@ class RuntimeCompiler:
         env_manager.ensure("ASCEND_HOME_PATH")
 
         # AICore: Bisheng CCE compiler
-        ccec = CCECToolchain()
+        ccec = CCECToolchain(platform="a2a3")
         self.aicore_target = BuildTarget(
             ccec, str(self.platform_dir / "aicore"), "aicore_kernel.o"
         )
@@ -118,6 +122,47 @@ class RuntimeCompiler:
 
     def _init_a2a3sim(self):
         """Initialize toolchains for simulation platform.
+        All targets use host gcc/g++ with platform-specific CMake dirs.
+        No Ascend SDK required.
+        """
+        self._ensure_host_compilers()
+        gxx = GxxToolchain()
+
+        self.aicore_target = BuildTarget(
+            gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so"
+        )
+        self.aicpu_target = BuildTarget(
+            gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so"
+        )
+        self.host_target = BuildTarget(
+            gxx, str(self.platform_dir / "host"), "libhost_runtime.so"
+        )
+
+    def _init_a5(self):
+        """Initialize toolchains for real a5 hardware."""
+        env_manager.ensure("ASCEND_HOME_PATH")
+
+        # AICore: Bisheng CCE compiler with A5 platform
+        ccec = CCECToolchain(platform="a5")
+        self.aicore_target = BuildTarget(
+            ccec, str(self.platform_dir / "aicore"), "aicore_kernel.o"
+        )
+
+        # AICPU: aarch64 cross-compiler
+        aarch64 = Aarch64GxxToolchain()
+        self.aicpu_target = BuildTarget(
+            aarch64, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so"
+        )
+
+        # Host: standard gcc/g++
+        self._ensure_host_compilers()
+        host_gxx = GxxToolchain()
+        self.host_target = BuildTarget(
+            host_gxx, str(self.platform_dir / "host"), "libhost_runtime.so"
+        )
+
+    def _init_a5sim(self):
+        """Initialize toolchains for A5 simulation platform.
         All targets use host gcc/g++ with platform-specific CMake dirs.
         No Ascend SDK required.
         """

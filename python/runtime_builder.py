@@ -80,7 +80,10 @@ class RuntimeBuilder:
         if name not in self._runtimes:
             available = ", ".join(self._runtimes.keys()) or "(none)"
             raise ValueError(
-                f"Runtime '{name}' not found. Available runtimes: {available}"
+                f"Runtime '{name}' is not available for platform '{self.platform}'.\n"
+                f"Available runtimes for {self.platform}: {available}\n"
+                f"Note: Different platforms may support different runtimes. "
+                f"Check {self.runtime_dir} for available implementations."
             )
 
         config_path = self._runtimes[name]

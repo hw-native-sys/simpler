@@ -727,6 +727,17 @@ class CodeRunner:
         # (they are independent — all only need kernel_compiler which is ready)
         logger.info(f"=== Building Runtime: {self.runtime_name} (platform: {self.platform}) ===")
         builder = RuntimeBuilder(platform=self.platform)
+
+        # Validate runtime exists before starting any compilation
+        available_runtimes = builder.list_runtimes()
+        if self.runtime_name not in available_runtimes:
+            available_str = ", ".join(available_runtimes) or "(none)"
+            raise ValueError(
+                f"Runtime '{self.runtime_name}' is not available for platform '{self.platform}'.\n"
+                f"Available runtimes for {self.platform}: {available_str}\n"
+                f"Note: Different platforms may support different runtimes."
+            )
+
         kernel_compiler = builder.get_kernel_compiler()
 
         from concurrent.futures import ThreadPoolExecutor, Future

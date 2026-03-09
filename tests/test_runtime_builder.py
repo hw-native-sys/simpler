@@ -136,7 +136,7 @@ class TestRuntimeBuilderBuildErrors:
         from runtime_builder import RuntimeBuilder
 
         builder = RuntimeBuilder(platform=default_test_platform)
-        with pytest.raises(ValueError, match="not found"):
+        with pytest.raises(ValueError, match="is not available for platform"):
             builder.build("nonexistent_runtime")
 
     def test_build_unknown_runtime_lists_available(self, default_test_platform):

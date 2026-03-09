@@ -62,7 +62,7 @@ class KernelCompiler:
         # Create toolchain objects based on platform
         if platform in ("a2a3", "a5"):
             env_manager.ensure("ASCEND_HOME_PATH")
-            self.ccec = CCECToolchain()
+            self.ccec = CCECToolchain(platform)
             self.aarch64 = Aarch64GxxToolchain()
             self.host_gxx = GxxToolchain()
         else:

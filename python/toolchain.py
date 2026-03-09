@@ -45,10 +45,23 @@ class Toolchain:
 class CCECToolchain(Toolchain):
     """Ascend ccec compiler for AICore kernels."""
 
-    def __init__(self):
+    def __init__(self, platform: str = "a2a3"):
         super().__init__()
-        self.cxx_path = os.path.join(self.ascend_home_path, "bin", "ccec")
-        self.linker_path = os.path.join(self.ascend_home_path, "bin", "ld.lld")
+        self.platform = platform
+
+        if platform in ("a5", "a5sim"):
+            self.cxx_path = os.path.join(
+                self.ascend_home_path, "tools", "bisheng_compiler", "bin", "ccec"
+            )
+            self.linker_path = os.path.join(
+                self.ascend_home_path, "tools", "bisheng_compiler", "bin", "ld.lld"
+            )
+        elif platform in ("a2a3", "a2a3sim"):
+            self.cxx_path = os.path.join(self.ascend_home_path, "bin", "ccec")
+            self.linker_path = os.path.join(self.ascend_home_path, "bin", "ld.lld")
+        else:
+            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+
         if not os.path.isfile(self.cxx_path):
             raise FileNotFoundError(
                 f"ccec compiler not found: {self.cxx_path}"
@@ -59,7 +72,14 @@ class CCECToolchain(Toolchain):
             )
 
     def get_compile_flags(self, core_type: str = "aiv", **kwargs) -> List[str]:
-        arch = "dav-c220-vec" if core_type == "aiv" else "dav-c220-cube"
+        # A5 uses dav-c310 architecture, A2A3 uses dav-c220
+        if self.platform in ("a5", "a5sim"):
+            arch = "dav-c310-vec" if core_type == "aiv" else "dav-c310-cube"
+        elif self.platform in ("a2a3", "a2a3sim"):
+            arch = "dav-c220-vec" if core_type == "aiv" else "dav-c220-cube"
+        else:
+            raise ValueError(f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+
         core_define = "__AIV__" if core_type == "aiv" else "__AIC__"
         return [
             "-c", "-O3", "-g", "-x", "cce",
