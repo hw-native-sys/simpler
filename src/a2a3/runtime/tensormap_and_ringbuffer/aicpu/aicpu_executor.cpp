@@ -1076,6 +1076,7 @@ int AicpuExecutor::run(Runtime* runtime) {
             // Call orchestration function wrapped in an outer scope
             DEV_INFO("Thread %d: Calling aicpu_orchestration_entry from SO", thread_idx);
 #if PTO2_PROFILING
+            DEV_ALWAYS("BENCHMARK: thread=%d orch_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             PTO2_SCOPE(rt) { orch_func(rt, args, arg_count); }
@@ -1186,6 +1187,12 @@ int AicpuExecutor::run(Runtime* runtime) {
             orchestrator_done_.store(true, std::memory_order_release);
             DEV_INFO("Thread %d: Set orchestrator_done=true, waiting for scheduler threads", thread_idx);
 
+#if PTO2_PROFILING
+            // Benchmark: record orchestrator end timestamp before waiting for schedulers
+            DEV_ALWAYS("BENCHMARK: thread=%d end=%llu",
+                       thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+#endif
+
             // Wait for all scheduler threads (0, 1, 2) to finish before destroying
             // runtime. Scheduler threads access TensorPool via orch_ready_queue_
             // and tensor.data() in build_pto2_payload — freeing early is use-after-free.
@@ -1212,6 +1219,12 @@ int AicpuExecutor::run(Runtime* runtime) {
         DEV_INFO("Thread %d: Starting PTO2 dispatch", thread_idx);
         int completed = resolve_and_dispatch_pto2(runtime, thread_idx, cur_thread_cores, my_cores);
         DEV_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+
+#if PTO2_PROFILING
+        // Benchmark: record scheduler end timestamp before shutdown cleanup
+        DEV_ALWAYS("BENCHMARK: thread=%d end=%llu",
+                   thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+#endif
 
         auto rc = shutdown_aicore(runtime, thread_idx, cur_thread_cores, my_cores);
         if (rc != 0) {
