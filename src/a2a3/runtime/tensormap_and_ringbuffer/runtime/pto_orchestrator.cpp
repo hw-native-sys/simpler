@@ -28,10 +28,20 @@
 #include "aicpu/performance_collector_aicpu.h"
 // Weak fallback for builds that don't link device_time.cpp (e.g. host).
 // The strong symbol from platform/.../device_time.cpp wins in the AICPU build.
-__attribute__((weak)) uint64_t get_sys_cnt_aicpu() { return 0; }
+//
+// IMPORTANT: visibility("hidden") is required to prevent the HOST .so from
+// exporting this weak fallback into the global dynamic symbol table via
+// RTLD_GLOBAL. Without it, when the AICPU .so is loaded and its PLT entry
+// for get_sys_cnt_aicpu is resolved, the dynamic linker finds the HOST .so's
+// weak definition first (already in global table) and uses it — returning 0.
+// With hidden visibility, the HOST .so does not export this symbol globally,
+// so the AICPU .so's PLT resolves to its own strong definition from
+// device_time.cpp.
+__attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 // Weak fallback for builds that don't link performance_collector_aicpu.cpp.
 // The strong symbol from the AICPU build wins when profiling is available.
-__attribute__((weak)) void perf_aicpu_record_orch_phase(
+// Also hidden to prevent HOST .so from polluting the global symbol table.
+__attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
     AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
 // Accumulated nanoseconds per sub-step
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
