@@ -59,7 +59,7 @@
 struct PTO2HeapRing {
     void*    base;        // GM_Heap_Base pointer
     uint64_t size;        // GM_Heap_Size (total heap size in bytes)
-    uint64_t top;         // Allocation pointer (local copy)
+    std::atomic<uint64_t>* top_ptr;  // Allocation pointer (shared atomic in SM header)
 
     // Reference to shared memory tail (for back-pressure)
     std::atomic<uint64_t>* tail_ptr;  // Points to header->heap_tail
@@ -119,23 +119,22 @@ struct PTO2HeapRing {
             // Periodic block notification
             if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count < PTO2_HEAP_SPIN_LIMIT) {
                 uint64_t tail = tail_ptr->load(std::memory_order_acquire);
-                uint64_t available = pto2_heap_ring_available();
-                LOG_WARN("[HeapRing] BLOCKED: requesting %" PRIu64 " bytes, available=%" PRIu64
+                uint64_t top = top_ptr->load(std::memory_order_acquire);
+                LOG_WARN("[HeapRing] BLOCKED: requesting %" PRIu64 " bytes"
                      ", top=%" PRIu64 ", tail=%" PRIu64 ", spins=%d",
-                     size, available, top, tail, spin_count);
+                     size, top, tail, spin_count);
                 notified = true;
             }
 #endif
 
             if (spin_count >= PTO2_HEAP_SPIN_LIMIT) {
                 uint64_t tail = tail_ptr->load(std::memory_order_acquire);
-                uint64_t available = pto2_heap_ring_available();
+                uint64_t top = top_ptr->load(std::memory_order_acquire);
                 LOG_ERROR("========================================");
                 LOG_ERROR("FATAL: Heap Ring Deadlock Detected!");
                 LOG_ERROR("========================================");
                 LOG_ERROR("Orchestrator blocked waiting for heap space after %d spins.", spin_count);
                 LOG_ERROR("  - Requested:     %" PRIu64 " bytes", size);
-                LOG_ERROR("  - Available:     %" PRIu64 " bytes", available);
                 LOG_ERROR("  - Heap top:      %" PRIu64, top);
                 LOG_ERROR("  - Heap tail:     %" PRIu64, tail);
                 LOG_ERROR("  - Heap size:     %" PRIu64, this->size);
@@ -149,7 +148,7 @@ struct PTO2HeapRing {
     }
 
     /**
-     * Try to allocate memory without stalling
+     * Try to allocate memory without stalling (thread-safe via CAS)
      *
      * @param size  Requested size in bytes
      * @return Pointer to allocated memory, or NULL if no space
@@ -158,48 +157,43 @@ struct PTO2HeapRing {
         // Align size for DMA efficiency
         alloc_size = PTO2_ALIGN_UP(alloc_size, PTO2_ALIGN_SIZE);
 
-        // Read latest tail from shared memory (Scheduler updates this)
-        uint64_t tail = tail_ptr->load(std::memory_order_acquire);
+        while (true) {
+            uint64_t top = top_ptr->load(std::memory_order_acquire);
+            // Read latest tail from shared memory (Scheduler updates this)
+            uint64_t tail = tail_ptr->load(std::memory_order_acquire);
+            uint64_t new_top;
+            void* result;
 
-        if (top >= tail) {
-            // Case 1: top is at or ahead of tail (normal case)
-            //   [....tail====top......]
-            //                   ^-- space_at_end = size - top
+            if (top >= tail) {
+                // Case 1: top is at or ahead of tail (normal case)
+                uint64_t space_at_end = size - top;
 
-            uint64_t space_at_end = size - top;
-
-            if (space_at_end >= alloc_size) {
-                // Enough space at end - allocate here
-                void* ptr = (char*)base + top;
-                top += alloc_size;
-                return ptr;
+                if (space_at_end >= alloc_size) {
+                    new_top = top + alloc_size;
+                    result = (char*)base + top;
+                } else if (tail > alloc_size) {
+                    // Wrap to beginning
+                    new_top = alloc_size;
+                    result = base;
+                } else {
+                    return NULL;
+                }
+            } else {
+                // Case 2: top has wrapped, tail is ahead
+                uint64_t gap = tail - top;
+                if (gap >= alloc_size) {
+                    new_top = top + alloc_size;
+                    result = (char*)base + top;
+                } else {
+                    return NULL;
+                }
             }
 
-            // Not enough space at end - check if we can wrap to beginning
-            // IMPORTANT: Don't split buffer, skip remaining space at end
-            if (tail > alloc_size) {
-                // Wrap to beginning (space available: [0, tail))
-                top = alloc_size;
-                return base;
+            if (top_ptr->compare_exchange_weak(top, new_top,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                return result;
             }
-
-            // Not enough space anywhere - return NULL
-            return NULL;
-
-        } else {
-            // Case 2: top has wrapped, tail is ahead
-            //   [====top....tail=====]
-            //         ^-- free space = tail - top
-
-            uint64_t gap = tail - top;
-            if (gap >= alloc_size) {
-                void* ptr = (char*)base + top;
-                top += alloc_size;
-                return ptr;
-            }
-
-            // Not enough space - return NULL
-            return NULL;
+            // CAS failed, retry with updated top
         }
     }
 
@@ -207,15 +201,14 @@ struct PTO2HeapRing {
      * Get available space in heap ring
      */
     uint64_t pto2_heap_ring_available() {
+        uint64_t top = top_ptr->load(std::memory_order_acquire);
         uint64_t tail = tail_ptr->load(std::memory_order_acquire);
 
         if (top >= tail) {
-            // Space at end + space at beginning (if any)
             uint64_t at_end = size - top;
             uint64_t at_begin = tail;
-            return at_end > at_begin ? at_end : at_begin;  // Max usable
+            return at_end > at_begin ? at_end : at_begin;
         } else {
-            // Contiguous space between top and tail
             return tail - top;
         }
     }
@@ -230,7 +223,8 @@ struct PTO2HeapRing {
  * @param tail_ptr  Pointer to shared memory heap_tail
  */
 void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
-                          std::atomic<uint64_t>* tail_ptr);
+                          std::atomic<uint64_t>* tail_ptr,
+                          std::atomic<uint64_t>* top_ptr);
 
 // =============================================================================
 // Task Ring Buffer
@@ -245,8 +239,8 @@ void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
 struct PTO2TaskRing {
     PTO2TaskDescriptor* descriptors;  // Task descriptor array (from shared memory)
     int32_t window_size;              // Window size (power of 2)
-    int32_t current_index;            // Next task to allocate (absolute ID)
-    
+    std::atomic<int32_t>* current_index_ptr;  // Shared atomic in SM header
+
     // Reference to shared memory last_task_alive (for back-pressure)
     std::atomic<int32_t>* last_alive_ptr;  // Points to header->last_task_alive
 
@@ -300,10 +294,11 @@ struct PTO2TaskRing {
             // Periodic block notification
             if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count < PTO2_FLOW_CONTROL_SPIN_LIMIT) {
                 int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
-                int32_t active_count = current_index - last_alive;
+                int32_t current = current_index_ptr->load(std::memory_order_acquire);
+                int32_t active_count = current - last_alive;
                 LOG_WARN("[TaskRing] BLOCKED (Flow Control): current=%d, last_alive=%d, "
                      "active=%d/%d (%.1f%%), spins=%d",
-                     current_index, last_alive, active_count, window_size,
+                     current, last_alive, active_count, window_size,
                      100.0 * active_count / window_size, spin_count);
                 notified = true;
             }
@@ -312,14 +307,15 @@ struct PTO2TaskRing {
             // Check for potential deadlock
             if (spin_count >= PTO2_FLOW_CONTROL_SPIN_LIMIT) {
                 int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
-                int32_t active_count = current_index - last_alive;
+                int32_t current = current_index_ptr->load(std::memory_order_acquire);
+                int32_t active_count = current - last_alive;
 
                 LOG_ERROR("========================================");
                 LOG_ERROR("FATAL: Flow Control Deadlock Detected!");
                 LOG_ERROR("========================================");
                 LOG_ERROR("Task Ring is FULL and no progress after %d spins.", spin_count);
                 LOG_ERROR("Flow Control Status:");
-                LOG_ERROR("  - Current task index:  %d", current_index);
+                LOG_ERROR("  - Current task index:  %d", current);
                 LOG_ERROR("  - Last task alive:     %d", last_alive);
                 LOG_ERROR("  - Active tasks:        %d", active_count);
                 LOG_ERROR("  - Window size:         %d", window_size);
@@ -348,47 +344,40 @@ struct PTO2TaskRing {
     }
 
     /**
-     * Try to allocate task slot without stalling
+     * Try to allocate task slot without stalling (thread-safe via fetch_add)
      *
      * @return Task ID, or -1 if window is full
      */
     int32_t pto2_task_ring_try_alloc() {
-        // Read latest last_task_alive from shared memory
+        // Optimistically allocate a task ID
+        int32_t task_id = current_index_ptr->fetch_add(1, std::memory_order_acq_rel);
         int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
-        int32_t current = current_index;
+        int32_t active_count = task_id - last_alive;
 
-        // Calculate number of active tasks (handles wrap-around)
-        int32_t active_count = current - last_alive;
-
-        // Check if there's room for one more task
-        // Leave at least 1 slot empty to distinguish full from empty
+        // Check if there's room (leave at least 1 slot empty)
         if (active_count < window_size - 1) {
-            int32_t task_id = current;
             int32_t slot = task_id & (window_size - 1);
-
-            // Mark slot as occupied (skip full memset — pto2_submit_task
-            // explicitly initializes all fields it needs)
             PTO2TaskDescriptor* task = &descriptors[slot];
             task->task_id = task_id;
-            task->is_active = true;
-
-            // Advance current index
-            current_index = current + 1;
-
             return task_id;
         }
 
-        // Window is full
+        // Window is full — roll back the optimistic increment
+        current_index_ptr->fetch_sub(1, std::memory_order_release);
         return -1;
     }
 
-    
+    int32_t get_task_slot(int32_t task_id) const { return task_id & (window_size - 1); }
+
     /**
     * Get task descriptor by ID
     */
-    PTO2TaskDescriptor& get_task(int32_t task_id) {
-        return descriptors[task_id & (window_size - 1)];
-    }
+    PTO2TaskDescriptor& get_task(int32_t task_id) { return descriptors[task_id & (window_size - 1)]; }
+
+    /**
+    * Get task descriptor by task slot
+    */
+    PTO2TaskDescriptor& get_task_by_slot(int32_t task_slot) { return descriptors[task_slot]; }
 };
 
 /**
@@ -400,14 +389,15 @@ struct PTO2TaskRing {
  * @param last_alive_ptr  Pointer to shared memory last_task_alive
  */
 void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
-                          int32_t window_size, std::atomic<int32_t>* last_alive_ptr);
+                          int32_t window_size, std::atomic<int32_t>* last_alive_ptr,
+                          std::atomic<int32_t>* current_index_ptr);
 
 /**
  * Get number of active tasks in window
  */
 static inline int32_t pto2_task_ring_active_count(PTO2TaskRing* ring) {
     int32_t last_alive = ring->last_alive_ptr->load(std::memory_order_acquire);
-    return ring->current_index - last_alive;
+    return ring->current_index_ptr->load(std::memory_order_acquire) - last_alive;
 }
 
 /**
@@ -441,15 +431,17 @@ struct PTO2DepListPool {
     int32_t top;              // Next allocation position (starts from 1, 0=NULL)
 
     /**
-     * Allocate a single entry from the pool
+     * Allocate a single entry from the pool (single-thread per pool instance)
      *
-     * @return Offset to allocated entry (0 means allocation failed)
+     * @return Reference to allocated entry
      */
-    int32_t alloc() {
-        if (top >= capacity) {
-            top = 1;
+    PTO2DepListEntry& alloc() {
+        int32_t idx = top++;
+        if (idx >= capacity) {
+            top = 2;  // Wrap around (skip entry 0 = NULL marker)
+            idx = 1;
         }
-        return top++;
+        return base[idx];
     }
 
     /**
@@ -462,8 +454,7 @@ struct PTO2DepListPool {
      * @return New head offset
      */
     PTO2DepListEntry* pto2_dep_list_prepend(PTO2DepListEntry* cur, int32_t task_id) {
-        int32_t new_index = alloc();
-        PTO2DepListEntry& new_entry = base[new_index];
+        PTO2DepListEntry& new_entry = alloc();
         new_entry.task_id = task_id;
         new_entry.next = cur;
         return &new_entry;

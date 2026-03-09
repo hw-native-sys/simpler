@@ -1,22 +1,22 @@
 /**
  * PTO Runtime2 - Shared Memory Layout
- * 
+ *
  * Defines the shared memory structure for Orchestrator-Scheduler communication.
- * 
+ *
  * Memory Layout:
  *   +---------------------------+
  *   | SharedMemoryHeader        |  (flow control + sync)
  *   +---------------------------+
  *   | TaskDescriptor[]          |  (ring buffer)
  *   +---------------------------+
- *   | DepListPool               |  (ring buffer for dependency lists)
+ *   | TaskPayload[]             |  (cold task data)
  *   +---------------------------+
- * 
+ *
  * Design principles:
  * - Only data needed for Orchestrator<->Scheduler communication is here
- * - TensorMap, scope_stack, ready_queues are in private memory
+ * - TensorMap, scope_stack, ready_queues, dep_pool are in private memory
  * - Flow control via atomic counters/flags (no locks needed for single-word R/W)
- * 
+ *
  * Based on: docs/runtime_buffer_manager_methods.md
  */
 
@@ -56,11 +56,9 @@ typedef struct {
     // === LAYOUT INFO (set once at init) ===
     uint64_t task_window_size;            // PTO2_TASK_WINDOW_SIZE
     uint64_t heap_size;                   // Total heap size
-    uint64_t dep_list_pool_size;          // Dependency list pool size
 
     // Offsets into shared memory (relative to SM_Base)
     uint64_t task_descriptors_offset;     // Offset to TaskDescriptor array
-    uint64_t dep_list_pool_offset;        // Offset to DepListPool
 
     // Total shared memory size (for validation)
     uint64_t total_size;
@@ -90,7 +88,7 @@ typedef struct {
     // Quick pointers into shared memory regions
     PTO2SharedMemoryHeader* header;
     PTO2TaskDescriptor*     task_descriptors;
-    PTO2DepListEntry*       dep_list_pool;
+    PTO2TaskPayload*        task_payloads;
     
     // Ownership flag
     bool    is_owner;             // True if this handle allocated the memory
@@ -103,27 +101,21 @@ typedef struct {
 
 /**
  * Calculate required shared memory size
- * 
+ *
  * @param task_window_size  Number of task slots
- * @param dep_list_pool_size Number of dependency list entries
  * @return Total bytes required
  */
-uint64_t pto2_sm_calculate_size(uint64_t task_window_size, uint64_t dep_list_pool_size);
+uint64_t pto2_sm_calculate_size(uint64_t task_window_size);
 
 /**
  * Create shared memory for Orchestrator and Scheduler
- * 
- * In simulated environment, allocates a single buffer.
- * In real environment, allocates PCIe-accessible or on-chip shared memory.
- * 
+ *
  * @param task_window_size  Number of task slots
  * @param heap_size         Heap size for output buffers
- * @param dep_list_pool_size Number of dependency list entries
  * @return Handle with both views, or NULL on failure
  */
 PTO2SharedMemoryHandle* pto2_sm_create(uint64_t task_window_size,
-                                        uint64_t heap_size,
-                                        uint64_t dep_list_pool_size);
+                                        uint64_t heap_size);
 
 /**
  * Create shared memory with default sizes
@@ -138,14 +130,12 @@ PTO2SharedMemoryHandle* pto2_sm_create_default(void);
  * @param sm_size            Total size in bytes
  * @param task_window_size   Number of task slots (must match buffer layout)
  * @param heap_size          Heap size (for layout; buffer has no heap region)
- * @param dep_list_pool_size Dependency list pool size (must match buffer layout)
  * @return Handle, or NULL on failure
  */
 PTO2SharedMemoryHandle* pto2_sm_create_from_buffer(void* sm_base,
                                                     uint64_t sm_size,
                                                     uint64_t task_window_size,
-                                                    uint64_t heap_size,
-                                                    uint64_t dep_list_pool_size);
+                                                    uint64_t heap_size);
 
 /**
  * Destroy shared memory and free resources
@@ -158,8 +148,7 @@ void pto2_sm_destroy(PTO2SharedMemoryHandle* handle);
  */
 void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
                           uint64_t task_window_size,
-                          uint64_t heap_size,
-                          uint64_t dep_list_pool_size);
+                          uint64_t heap_size);
 
 /**
  * Get task descriptor by task ID
@@ -172,12 +161,12 @@ static inline PTO2TaskDescriptor* pto2_sm_get_task(PTO2SharedMemoryHandle* handl
 }
 
 /**
- * Get dependency list entry by offset
+ * Get task descriptor by task slot
+ * Uses runtime window_size for ring buffer indexing (not compile-time constant)
  */
-static inline PTO2DepListEntry* pto2_sm_get_dep_entry(PTO2SharedMemoryHandle* handle,
-                                                       int32_t offset) {
-    if (offset <= 0) return NULL;  // 0 means empty/end
-    return &handle->dep_list_pool[offset];
+static inline PTO2TaskDescriptor& pto2_sm_get_task_by_slot(PTO2SharedMemoryHandle* handle,
+                                                    int32_t slot) {
+    return handle->task_descriptors[slot];
 }
 
 // =============================================================================

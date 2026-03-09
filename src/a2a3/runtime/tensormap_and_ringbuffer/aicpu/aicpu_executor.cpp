@@ -374,10 +374,10 @@ int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* 
 
 // Build PTO2DispatchPayload from PTO2TaskDescriptor.
 static void build_pto2_payload(PTO2DispatchPayload* out, Runtime* runtime,
-                               PTO2TaskDescriptor* task, PTO2TaskDescriptor* task_descriptors,
-                               PTO2DepListEntry* dep_list_pool, int32_t window_size) {
+                               PTO2TaskDescriptor* task, PTO2TaskPayload* task_payload,
+                               PTO2TaskDescriptor* task_descriptors,
+                               int32_t window_size) {
     (void)task_descriptors;
-    (void)dep_list_pool;
     (void)window_size;
     out->task_id = task->task_id;
     out->kernel_id = task->kernel_id;
@@ -385,14 +385,14 @@ static void build_pto2_payload(PTO2DispatchPayload* out, Runtime* runtime,
     out->function_bin_addr = runtime->get_function_bin_addr(task->kernel_id);
     int n = 0;
 
-    for (int i = 0; i < task->param_count; i++) {
-        if (!task->is_tensor[i]) {
-            out->args[n++] = task->scalar_value[i];
+    for (int i = 0; i < task_payload->param_count; i++) {
+        if (!task_payload->is_tensor[i]) {
+            out->args[n++] = task_payload->scalar_value[i];
         } else {
-            // Pass pointer to TensorData in task descriptor's inline tensor storage.
+            // Pass pointer to TensorData in task payload's inline tensor storage.
             // Kernels expect args[i] to be a TensorData* from which they read buffer.addr.
-            out->args[n++] = reinterpret_cast<uint64_t>(&task->tensors[i]);
-            task->tensors[i].update_start_offset();
+            out->args[n++] = reinterpret_cast<uint64_t>(&task_payload->tensors[i]);
+            task_payload->tensors[i].update_start_offset();
         }
     }
 
@@ -411,16 +411,17 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
     DEV_INFO("Thread %d: sm_base=%p", thread_idx, sm_base);
 
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
-    DEV_INFO("Thread %d: header=%p, task_desc_offset=%d, dep_pool_offset=%d, window_size=%d",
+    DEV_INFO("Thread %d: header=%p, task_desc_offset=%d, window_size=%d",
              thread_idx, (void*)header, header->task_descriptors_offset,
-             header->dep_list_pool_offset, header->task_window_size);
+             header->task_window_size);
 
     PTO2TaskDescriptor* task_descriptors = reinterpret_cast<PTO2TaskDescriptor*>(
         static_cast<char*>(sm_base) + header->task_descriptors_offset);
-    PTO2DepListEntry* dep_list_pool = reinterpret_cast<PTO2DepListEntry*>(
-        static_cast<char*>(sm_base) + header->dep_list_pool_offset);
-    DEV_INFO("Thread %d: task_descriptors=%p, dep_list_pool=%p",
-             thread_idx, (void*)task_descriptors, (void*)dep_list_pool);
+    PTO2TaskPayload* task_payloads = reinterpret_cast<PTO2TaskPayload*>(
+        reinterpret_cast<char*>(task_descriptors) +
+        PTO2_ALIGN_UP(header->task_window_size * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE));
+    DEV_INFO("Thread %d: task_descriptors=%p, task_payloads=%p",
+             thread_idx, (void*)task_descriptors, (void*)task_payloads);
 
     int32_t window_size = header->task_window_size;
     if (window_size <= 0 || window_size > PTO2_TASK_WINDOW_SIZE) window_size = PTO2_TASK_WINDOW_SIZE;
@@ -666,8 +667,9 @@ int AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int thread_idx,
                         uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
                         PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
+                        PTO2TaskPayload* task_pl = &task_payloads[task_id & window_mask];
                         PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
-                        build_pto2_payload(payload, runtime, task, task_descriptors, dep_list_pool, window_size);
+                        build_pto2_payload(payload, runtime, task, task_pl, task_descriptors, window_size);
 #if PTO2_PROFILING
                         // Performance profiling: check if buffer needs switching
                         if (profiling_enabled) {
@@ -1020,7 +1022,6 @@ int AicpuExecutor::run(Runtime* runtime) {
 
             // Read config from orchestration SO (or use defaults)
             uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
-            uint64_t dep_list_pool_size = PTO2_DEP_LIST_POOL_SIZE;
             uint64_t heap_size = PTO2_HEAP_SIZE;
             int expected_arg_count = 0;
             if (config_func) {
@@ -1045,21 +1046,18 @@ int AicpuExecutor::run(Runtime* runtime) {
             if (runtime->pto2_heap_size > 0) {
                 heap_size = runtime->pto2_heap_size;
             }
-            if (runtime->pto2_dep_list_pool_size > 0) {
-                dep_list_pool_size = runtime->pto2_dep_list_pool_size;
-            }
-            DEV_INFO("Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%lu", thread_idx,
-                     (unsigned long)task_window_size, (unsigned long)heap_size, (unsigned long)dep_list_pool_size);
+            DEV_INFO("Thread %d: Ring sizes: task_window=%lu, heap=%lu", thread_idx,
+                     (unsigned long)task_window_size, (unsigned long)heap_size);
 
             // Get GM heap from runtime (dedicated field)
             void* sm_ptr = runtime->get_pto2_gm_sm_ptr();
             void* gm_heap = runtime->get_pto2_gm_heap_ptr();
 
             // Create shared memory handle and runtime (ops table populated inside)
-            uint64_t sm_size = pto2_sm_calculate_size(task_window_size, dep_list_pool_size);
+            uint64_t sm_size = pto2_sm_calculate_size(task_window_size);
             PTO2SharedMemoryHandle* sm_handle =
                 pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size,
-                                            heap_size, dep_list_pool_size);
+                                            heap_size);
             if (!sm_handle) {
                 DEV_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
                 dlclose(handle);

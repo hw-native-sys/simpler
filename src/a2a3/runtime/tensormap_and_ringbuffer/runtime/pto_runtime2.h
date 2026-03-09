@@ -32,6 +32,9 @@
 #include "pto_scheduler.h"
 #include "pto_orchestrator.h"
 
+// Maximum number of orchestrator threads supported
+constexpr int PTO2_MAX_ORCH_THREADS = 4;
+
 // =============================================================================
 // Runtime Context
 // =============================================================================
@@ -82,7 +85,8 @@ struct PTO2Runtime {
 
     // Components
     PTO2SharedMemoryHandle* sm_handle;
-    PTO2OrchestratorState   orchestrator;
+    PTO2OrchestratorState   orchestrators[PTO2_MAX_ORCH_THREADS];
+    int                     orch_count;     // Number of active orchestrator states
     PTO2SchedulerState      scheduler;
 
     // GM Heap for output buffers
@@ -115,13 +119,11 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode);
  * @param mode             Execution mode
  * @param task_window_size Number of task slots
  * @param heap_size        Size of GM heap
- * @param dep_list_size    Size of dependency list pool
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
                                          uint64_t task_window_size,
-                                         uint64_t heap_size,
-                                         uint64_t dep_list_size);
+                                         uint64_t heap_size);
 
 /**
  * Create runtime from existing shared memory and GM heap (e.g. on device).
@@ -136,7 +138,8 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
 PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
                                           PTO2SharedMemoryHandle* sm_handle,
                                           void* gm_heap,
-                                          uint64_t heap_size);
+                                          uint64_t heap_size,
+                                          int orch_count = 1);
 
 /**
  * Destroy runtime and free all resources
@@ -147,6 +150,12 @@ void pto2_runtime_destroy(PTO2Runtime* rt);
  * Set execution mode
  */
 void pto2_runtime_set_mode(PTO2Runtime* rt, PTO2RuntimeMode mode);
+
+/**
+ * Set the orchestrator index for the current thread.
+ * Must be called before any orchestration API calls on a given thread.
+ */
+void pto2_set_orch_thread_idx(int idx);
 
 // =============================================================================
 // Orchestration API (called by orchestration function)

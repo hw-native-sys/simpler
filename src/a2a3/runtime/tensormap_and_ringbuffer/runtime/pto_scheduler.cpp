@@ -104,10 +104,8 @@ void pto2_ready_queue_destroy(PTO2ReadyQueue* queue) {
 
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
-                          PTO2DepListPool* dep_pool,
                           void* heap_base) {
     sched->sm_handle = sm_handle;
-    sched->dep_pool = dep_pool;
     sched->heap_base = heap_base;
     sched->task_state = nullptr;
     sched->fanin_refcount = nullptr;
@@ -154,9 +152,11 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
     // new[] default-initializes std::atomic<T> which leaves values indeterminate.
     // Scheduler logic (e.g. fanin_refcount fetch_add in release_fanin_and_check_ready)
     // assumes slots start at zero before init_task writes them.
-    memset(sched->task_state, 0, window_size * sizeof(std::atomic<PTO2TaskState>));
-    memset(sched->fanin_refcount, 0, window_size * sizeof(std::atomic<int32_t>));
-    memset(sched->fanout_refcount, 0, window_size * sizeof(std::atomic<int32_t>));
+    for (uint64_t i = 0; i < window_size; i++) {
+        sched->task_state[i].store(static_cast<PTO2TaskState>(0), std::memory_order_relaxed);
+        sched->fanin_refcount[i].store(0, std::memory_order_relaxed);
+        sched->fanout_refcount[i].store(0, std::memory_order_relaxed);
+    }
 
     // Initialize ready queues
     for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {

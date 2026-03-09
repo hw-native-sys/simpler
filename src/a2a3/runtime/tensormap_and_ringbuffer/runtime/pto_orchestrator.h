@@ -41,7 +41,8 @@ struct PTO2OrchestratorState {
     // === RING BUFFERS ===
     PTO2HeapRing heap_ring;    // Output buffer allocation
     PTO2TaskRing task_ring;    // Task slot allocation
-    PTO2DepListPool dep_pool;  // Dependency list allocation
+    PTO2DepListPool dep_pool;  // Dependency list storage (per-orchestrator, no atomics needed)
+    PTO2DepListEntry* dep_pool_cur_entry;
 
     // === TENSOR MAP (Private) ===
     PTO2TensorMap tensor_map;        // Producer lookup
@@ -90,8 +91,7 @@ struct PTO2OrchestratorState {
         bytes_allocated += total_size;
 #endif
 
-        // Update shared memory with new heap top
-        sm_handle->header->heap_top.store(heap_ring.top, std::memory_order_release);
+        // heap_top is now updated atomically inside pto2_heap_ring_alloc via CAS
 
         return buffer;
     }
@@ -111,7 +111,8 @@ struct PTO2OrchestratorState {
  * @return true on success
  */
 bool pto2_orchestrator_init(
-    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, uint64_t heap_size);
+    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, uint64_t heap_size,
+    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Destroy orchestrator state and free resources
@@ -234,7 +235,6 @@ struct PTO2OrchProfilingData {
     uint64_t heap_cycle;
     uint64_t insert_cycle;
     uint64_t fanin_cycle;
-    uint64_t finalize_cycle;
     uint64_t scope_end_cycle;
     int64_t  submit_count;
     // Wait time tracking for blocking phases
