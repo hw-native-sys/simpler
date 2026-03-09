@@ -195,19 +195,6 @@ void pto2_submit_task(PTO2OrchestratorState* orch,
  */
 void pto2_orchestrator_done(PTO2OrchestratorState* orch);
 
-/**
- * Wait for all tasks to complete
- *
- * Blocks until scheduler reports all tasks consumed.
- * Only valid in simulated mode or with shared address space.
- */
-void pto2_orchestrator_wait_all(PTO2OrchestratorState* orch);
-
-/**
- * Check if orchestrator has space for more tasks
- */
-bool pto2_orchestrator_has_space(PTO2OrchestratorState* orch);
-
 // =============================================================================
 // Debug Utilities
 // =============================================================================

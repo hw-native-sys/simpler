@@ -456,19 +456,6 @@ void pto2_orchestrator_done(PTO2OrchestratorState* orch) {
     orch->sm_handle->header->orchestrator_done.store(1, std::memory_order_release);
 }
 
-void pto2_orchestrator_wait_all(PTO2OrchestratorState* orch) {
-    if (!orch->scheduler) {
-        return;  // Can't wait without scheduler reference
-    }
-
-    // Spin-wait until scheduler reports all tasks done
-    while (!orch->scheduler->is_done()) {
-        SPIN_WAIT_HINT();
-    }
-}
-
-bool pto2_orchestrator_has_space(PTO2OrchestratorState* orch) { return pto2_task_ring_has_space(&orch->task_ring); }
-
 // =============================================================================
 // Debug Utilities
 // =============================================================================

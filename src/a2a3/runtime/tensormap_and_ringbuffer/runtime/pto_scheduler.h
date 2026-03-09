@@ -24,6 +24,8 @@
 #include "pto_shared_memory.h"
 #include "pto_ring_buffer.h"
 
+#include "common/core_type.h"
+
 #if PTO2_SCHED_PROFILING
 #include "aicpu/device_time.h"
 #define PTO2_SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
@@ -446,29 +448,17 @@ struct PTO2SchedulerState {
 #endif
     }
 
-    void mark_running(int32_t task_id) {
-        int32_t slot = pto2_task_slot(task_id);
-        task_state[slot].store(PTO2_TASK_RUNNING, std::memory_order_relaxed);
-    }
-
-    int32_t get_ready_task(PTO2WorkerType worker_type) {
-        return ready_queues[worker_type].pop();
+    template<CoreType CT>
+    int32_t get_ready_task() {
+        return ready_queues[static_cast<int32_t>(CT)].pop();
     }
 
 #if PTO2_SCHED_PROFILING
-    int32_t get_ready_task(PTO2WorkerType worker_type,
-                           uint64_t& atomic_count, uint64_t& wait_cycle) {
-        return ready_queues[worker_type].pop(atomic_count, wait_cycle);
+    template<CoreType CT>
+    int32_t get_ready_task(uint64_t& atomic_count, uint64_t& wait_cycle) {
+        return ready_queues[static_cast<int32_t>(CT)].pop(atomic_count, wait_cycle);
     }
 #endif
-
-    bool is_done() {
-        PTO2SharedMemoryHeader* header = sm_handle->header;
-        int32_t orch_done = header->orchestrator_done.load(std::memory_order_acquire);
-        if (!orch_done) return false;
-        int32_t current_task_index = header->current_task_index.load(std::memory_order_acquire);
-        return last_task_alive >= current_task_index;
-    }
 
     void on_scope_end(const int32_t* task_ids, int32_t count) {
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
