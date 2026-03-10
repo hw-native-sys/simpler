@@ -38,6 +38,9 @@ project_root = script_dir.parent.parent
 python_dir = project_root / "python"
 if python_dir.exists():
     sys.path.insert(0, str(python_dir))
+golden_dir = project_root / "golden"
+if golden_dir.exists():
+    sys.path.insert(0, str(golden_dir))
 
 logger = logging.getLogger(__name__)
 
