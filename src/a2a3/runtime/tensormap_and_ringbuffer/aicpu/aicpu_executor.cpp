@@ -221,7 +221,6 @@ struct AicpuExecutor {
         int32_t& completed_this_turn,
         int32_t& cur_thread_completed,
         bool& made_progress,
-        int32_t task_count,
         int32_t deferred_release_ids[],
         int32_t& deferred_release_count
 #if PTO2_PROFILING
@@ -329,17 +328,6 @@ struct AicpuExecutor {
                 cur_thread_completed++;
                 completed_this_turn++;
                 made_progress = true;
-                if (thread_idx == 0 && task_count > 0) {
-                    int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-                    if (c <= PROGRESS_VERBOSE_THRESHOLD || c % PROGRESS_LOG_INTERVAL == 0 || c == task_count) {
-                        DEV_ALWAYS("Thread %d: PTO2 progress: completed=%d total=%d last_task_id=%d (%.1f%%)",
-                            thread_idx,
-                            c,
-                            task_count,
-                            task_id,
-                            task_count > 0 ? 100.0 * c / task_count : 0.0);
-                    }
-                }
             }
         }
     }
@@ -835,6 +823,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     DEV_INFO("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_num);
     int32_t cur_thread_completed = 0;
     int32_t idle_iterations = 0;
+    int32_t last_progress_count = 0;
 #if PTO2_PROFILING
     bool profiling_enabled = runtime->enable_profiling;
 #endif
@@ -922,7 +911,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             try_completed = true;
             check_running_cores_for_completion<CoreType::AIC>(
                 thread_idx, tracker.aic(), hank, executing_task_ids,
-                completed_this_turn, cur_thread_completed, made_progress, task_count,
+                completed_this_turn, cur_thread_completed, made_progress,
                 deferred_release_ids, deferred_release_count
 #if PTO2_PROFILING
                 , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
@@ -940,7 +929,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             try_completed = true;
             check_running_cores_for_completion<CoreType::AIV>(
                 thread_idx, tracker.aiv(), hank, executing_task_ids,
-                completed_this_turn, cur_thread_completed, made_progress, task_count,
+                completed_this_turn, cur_thread_completed, made_progress,
                 deferred_release_ids, deferred_release_count
 #if PTO2_PROFILING
                 , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
@@ -953,7 +942,17 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             );
         }
         if (completed_this_turn > 0) {
-            completed_tasks_.fetch_add(completed_this_turn, std::memory_order_relaxed);
+            int32_t prev = completed_tasks_.fetch_add(completed_this_turn, std::memory_order_relaxed);
+            int32_t new_total = prev + completed_this_turn;
+            last_progress_count = new_total;
+            if (thread_idx == 0 && task_count > 0) {
+                if (new_total <= PROGRESS_VERBOSE_THRESHOLD
+                    || new_total / PROGRESS_LOG_INTERVAL != prev / PROGRESS_LOG_INTERVAL
+                    || new_total >= task_count) {
+                    DEV_ALWAYS("PTO2 progress: completed=%d total=%d (%.1f%%)",
+                               new_total, task_count, 100.0 * new_total / task_count);
+                }
+            }
         }
 
 #if PTO2_PROFILING
@@ -1037,8 +1036,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             idle_iterations++;
             if (thread_idx == 0 && task_count > 0 && idle_iterations % STALL_LOG_INTERVAL == 0) {
                 int32_t c = completed_tasks_.load(std::memory_order_relaxed);
-                DEV_ALWAYS("PTO2 stall: no progress for %d iterations, completed=%d total=%d",
-                           idle_iterations, c, task_count);
+                DEV_ALWAYS("PTO2 stall: no progress for %d iterations, completed=%d total=%d (last progress at %d)",
+                           idle_iterations, c, task_count, last_progress_count);
                 // Scan all task slots to find truly stuck tasks using scheduler state
                 PTO2SchedulerState* sched = &rt->scheduler;
                 int32_t cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
