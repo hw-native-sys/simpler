@@ -19,6 +19,7 @@ EXAMPLES_DIR="$PROJECT_ROOT/tests/device_tests/tensormap_and_ringbuffer"
 # Each entry is just the directory name; kernels/ and golden.py are implied.
 # ---------------------------------------------------------------------------
 EXAMPLES=(
+    alternating_matmul_add
     benchmark_bgemm
     batch_paged_attention
     paged_attention

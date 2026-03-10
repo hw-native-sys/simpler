@@ -3,7 +3,7 @@ Golden test specification for alternating matmul-add test.
 
 Computation:
 - M independent matmul tasks per batch: C[b,m] = A[b,m] @ B[b,m] (128x128x128)
-- N independent add tasks per batch: Z[b,n] = X[b,n] + Y[b,n] (64x128)
+- N independent add tasks per batch: Z[b,n] = X[b,n] + Y[b,n] (128x128)
 
 Args layout: [ptr_A, ptr_B, ptr_C, ptr_X, ptr_Y, ptr_Z,
               size_A, size_B, size_C, size_X, size_Y, size_Z, ptr_config]
@@ -19,24 +19,25 @@ ATOL = 1e-3
 
 ALL_CASES = {
     "case1": {
+        "batch": 500,
+        "M": 4,
+        "N": 4,
+        "random_seed": False,
+        "matmul_batch": 4,
+        "add_batch": 4,
+    },
+    "case2": {
         "batch": 512,
         "M": 2,  # Number of matmul tasks per batch
         "N": 5,  # Number of add tasks per batch
         "random_seed": True,  # False = use fixed seed (42), True = random seed
-        "matmul_batch": 2,  # Number of matmul tiles per task
+        "matmul_batch": 4,  # Number of matmul tiles per task
         "add_batch": 5,  # Number of add tiles per task
     },
-    "case2": {
-        "batch": 1024,
-        "M": 1,
-        "N": 1,
-        "random_seed": False,
-        "matmul_batch": 1,
-        "add_batch": 1,
-    },
+    
 }
 
-DEFAULT_CASE = "case2"
+DEFAULT_CASE = "case1"
 
 
 def generate_inputs(params: dict) -> list:
@@ -82,9 +83,9 @@ def generate_inputs(params: dict) -> list:
     if total_add_tasks > INT32_MAX:
         raise ValueError(f"total_add_tasks ({total_add_tasks}) exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
 
-    # Fixed sizes: matmul 128x128x128, add 64x128
+    # Fixed sizes: matmul 128x128x128, add 128x128
     matmul_size = 128
-    add_rows = 64
+    add_rows = 128
     add_cols = 128
 
     # Prevent excessive memory allocation
@@ -110,12 +111,12 @@ def generate_inputs(params: dict) -> list:
         seed = int(time.time() * 1000) % (2**31)
     torch.manual_seed(seed)
 
-    # Matmul tensors: 128x128x128
+    # Matmul tensors: 64x64x64
     A = torch.randn(batch, M, matmul_size, matmul_size, dtype=torch.float32) * 0.01
     B = torch.randn(batch, M, matmul_size, matmul_size, dtype=torch.float32) * 0.01
     C = torch.zeros(batch, M, matmul_size, matmul_size, dtype=torch.float32)
 
-    # Add tensors: 64x128
+    # Add tensors: 64x64
     X = torch.randn(batch, N, add_rows, add_cols, dtype=torch.float32) * 0.01
     Y = torch.randn(batch, N, add_rows, add_cols, dtype=torch.float32) * 0.01
     Z = torch.zeros(batch, N, add_rows, add_cols, dtype=torch.float32)
@@ -152,9 +153,9 @@ def compute_golden(tensors: dict, params: dict) -> None:
     M = params["M"]
     N = params["N"]
 
-    # Fixed sizes: matmul 128x128x128, add 64x128
+    # Fixed sizes: matmul 128x128x128, add 128x128
     matmul_size = 128
-    add_rows = 64
+    add_rows = 128
     add_cols = 128
 
     A = torch.as_tensor(tensors["A"]).reshape(batch, M, matmul_size, matmul_size)

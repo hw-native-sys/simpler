@@ -23,6 +23,14 @@ ATOL = 1e-3
 SUPPORTED_INCORE_DATA_SIZES = {16, 32, 64, 128}
 
 ALL_CASES = {
+    "Case0": {
+        "matmul_add_task_num": 500,
+        "incore_task_granularity": {
+            "incore_data_size": 128,
+            "incore_loop": 4,
+        },
+        "grid_k": 2,
+    },
     "Case1": {
         "matmul_add_task_num": 64,
         "incore_task_granularity": {
@@ -57,7 +65,7 @@ ALL_CASES = {
     },
 }
 
-DEFAULT_CASE = "Case1"
+DEFAULT_CASE = "Case0"
 
 
 def generate_inputs(params: dict) -> list:

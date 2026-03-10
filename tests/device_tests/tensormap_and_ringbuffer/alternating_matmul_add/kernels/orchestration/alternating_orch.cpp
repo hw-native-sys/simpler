@@ -8,7 +8,7 @@
  *   - M: Number of matmul tasks per batch
  *   - N: Number of add tasks per batch
  *
- * Task pattern per batch: [matmul_0, ..., matmul_{M-1}, add_0, ..., add_{N-1}]
+ * Task pattern: interleaved [matmul_0, add_0, matmul_1, add_1, ...]
  * All tasks are completely independent (no dependencies).
  *
  * Args layout: [ptr_A, ptr_B, ptr_C, ptr_X, ptr_Y, ptr_Z,
@@ -38,7 +38,7 @@
 #define ARG_PTR_CONFIG 12
 
 static constexpr uint64_t MATMUL_ELEMS = 128 * 128;
-static constexpr uint64_t ADD_ELEMS = 64 * 128;
+static constexpr uint64_t ADD_ELEMS = 128 * 128;
 
 extern "C" {
 
@@ -100,48 +100,51 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     int total_matmul = 0;
     int total_add = 0;
 
-    // Submit matmul groups
-    for (int group_idx = 0; group_idx < num_matmul_groups; group_idx++) {
-        int start_task_idx = group_idx * matmul_batch;
-        uint64_t offset = (uint64_t)start_task_idx * MATMUL_ELEMS;
-        uint64_t group_size = (uint64_t)matmul_batch * MATMUL_ELEMS;
+    int max_groups = num_matmul_groups > num_add_groups ? num_matmul_groups : num_add_groups;
 
-        uint64_t matmul_group_shapes[1] = {group_size};
-        uint64_t view_offsets[1] = {offset};
+    // Interleaved submit: matmul and add groups alternate
+    for (int group_idx = 0; group_idx < max_groups; group_idx++) {
+        if (group_idx < num_matmul_groups) {
+            int start_task_idx = group_idx * matmul_batch;
+            uint64_t offset = (uint64_t)start_task_idx * MATMUL_ELEMS;
+            uint64_t group_size = (uint64_t)matmul_batch * MATMUL_ELEMS;
 
-        Tensor A_view = ext_A.view(matmul_group_shapes, view_offsets);
-        Tensor B_view = ext_B.view(matmul_group_shapes, view_offsets);
-        Tensor C_view = ext_C.view(matmul_group_shapes, view_offsets);
+            uint64_t matmul_group_shapes[1] = {group_size};
+            uint64_t view_offsets[1] = {offset};
 
-        PTOParam params_matmul[] = {
-            make_input_param(A_view),
-            make_input_param(B_view),
-            make_output_param(C_view),
-        };
-        pto2_rt_submit_task(rt, FUNC_MATMUL, PTO2_WORKER_CUBE, params_matmul, 3);
-        total_matmul++;
-    }
+            Tensor A_view = ext_A.view(matmul_group_shapes, view_offsets);
+            Tensor B_view = ext_B.view(matmul_group_shapes, view_offsets);
+            Tensor C_view = ext_C.view(matmul_group_shapes, view_offsets);
 
-    // Submit add groups
-    for (int group_idx = 0; group_idx < num_add_groups; group_idx++) {
-        int start_task_idx = group_idx * add_batch;
-        uint64_t offset = (uint64_t)start_task_idx * ADD_ELEMS;
-        uint64_t group_size = (uint64_t)add_batch * ADD_ELEMS;
+            PTOParam params_matmul[] = {
+                make_input_param(A_view),
+                make_input_param(B_view),
+                make_output_param(C_view),
+            };
+            pto2_rt_submit_task(rt, FUNC_MATMUL, PTO2_WORKER_CUBE, params_matmul, 3);
+            total_matmul++;
+        }
 
-        uint64_t add_group_shapes[1] = {group_size};
-        uint64_t view_offsets[1] = {offset};
+        if (group_idx < num_add_groups) {
+            int start_task_idx = group_idx * add_batch;
+            uint64_t offset = (uint64_t)start_task_idx * ADD_ELEMS;
+            uint64_t group_size = (uint64_t)add_batch * ADD_ELEMS;
 
-        Tensor X_view = ext_X.view(add_group_shapes, view_offsets);
-        Tensor Y_view = ext_Y.view(add_group_shapes, view_offsets);
-        Tensor Z_view = ext_Z.view(add_group_shapes, view_offsets);
+            uint64_t add_group_shapes[1] = {group_size};
+            uint64_t view_offsets[1] = {offset};
 
-        PTOParam params_add[] = {
-            make_input_param(X_view),
-            make_input_param(Y_view),
-            make_output_param(Z_view),
-        };
-        pto2_rt_submit_task(rt, FUNC_ADD, PTO2_WORKER_VECTOR, params_add, 3);
-        total_add++;
+            Tensor X_view = ext_X.view(add_group_shapes, view_offsets);
+            Tensor Y_view = ext_Y.view(add_group_shapes, view_offsets);
+            Tensor Z_view = ext_Z.view(add_group_shapes, view_offsets);
+
+            PTOParam params_add[] = {
+                make_input_param(X_view),
+                make_input_param(Y_view),
+                make_output_param(Z_view),
+            };
+            pto2_rt_submit_task(rt, FUNC_ADD, PTO2_WORKER_VECTOR, params_add, 3);
+            total_add++;
+        }
     }
 
     LOG_INFO(rt, "[alternating_orch] Submitted %d matmul groups and %d add groups",
