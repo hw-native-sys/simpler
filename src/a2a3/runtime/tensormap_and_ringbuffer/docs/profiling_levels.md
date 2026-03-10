@@ -94,13 +94,22 @@ Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 
 **Scheduler output:**
 ```
-Thread X: completed=XXX tasks in XXXus (XXX loops, X.X tasks/loop)
-Thread X: --- Phase Breakdown ---
-Thread X:   complete:    XXXus (XX.X%)  [fanout: edges=XXX, max_degree=X, avg=X.X]  [fanin: edges=XXX, max_degree=X, avg=X.X]
-Thread X:     complete_poll: hit=XXX, miss=XXX, hit_rate=XX.X%
-Thread X:   scan:        XXXus (XX.X%)
-Thread X:   dispatch:    XXXus (XX.X%)  [pop: hit=XXX, miss=XXX, hit_rate=XX.X%]
-Thread X:   idle:        XXXus (XX.X%)
+Thread X: === Scheduler Phase Breakdown: total=XXXus, XXX tasks ===
+Thread X:   complete       : XXXus (XX.X%)  [fanout: edges=XXX, max_degree=X, avg=X.X]  [fanin: edges=XXX, max_degree=X, avg=X.X]
+Thread X:     poll         : XXXus (XX.X%)  hit=XXX, miss=XXX, hit_rate=XX.X%
+Thread X:     otc_lock     : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
+Thread X:     otc_fanout   : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
+Thread X:     otc_fanin    : XXXus (XX.X%)  atomics=XXX
+Thread X:     otc_self     : XXXus (XX.X%)  atomics=XXX
+Thread X:     perf         : XXXus (XX.X%)
+Thread X:   dispatch       : XXXus (XX.X%)  [pop: hit=XXX, miss=XXX, hit_rate=XX.X%]
+Thread X:     poll         : XXXus (XX.X%)
+Thread X:     pop          : XXXus (XX.X%)  work=XXXus wait=XXXus  atomics=XXX
+Thread X:     setup        : XXXus (XX.X%)
+Thread X:   scan           : XXXus (XX.X%)
+Thread X:   idle           : XXXus (XX.X%)
+Thread X:   avg/complete   : XXXus
+Thread X: Scheduler summary: total_time=XXXus, loops=XXX, tasks_scheduled=XXX
 ```
 
 ---

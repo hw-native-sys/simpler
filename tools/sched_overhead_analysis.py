@@ -38,20 +38,12 @@ def parse_scheduler_threads(log_path):
     Supports three formats:
     1. New two-level tree (PTO2_SCHED_PROFILING=1):
         Thread N: === Scheduler Phase Breakdown: total=Xus, Y tasks ===
-        Thread N:   complete       : Xus (Y%)
-        Thread N:   dispatch       : Xus (Y%)
+        Thread N:   complete       : Xus (Y%)  [fanout: edges=A, max_degree=B, avg=C]  [fanin: edges=D, max_degree=E, avg=F]
+        Thread N:   dispatch       : Xus (Y%)  [pop: hit=A, miss=B, hit_rate=C%]
         Thread N:   scan           : Xus (Y%)
         Thread N:   idle           : Xus (Y%)
 
-    2. Legacy detailed (PTO2_SCHED_PROFILING=1):
-        Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
-        Thread N: --- Phase Breakdown ---
-        Thread N:   complete:    Xus (Y%)  [fanout: edges=A, max_degree=B, avg=C]  [fanin: edges=D, max_degree=E, avg=F]
-        Thread N:   scan:        Xus (Y%)
-        Thread N:   dispatch:    Xus (Y%)  [pop: hit=A, miss=B, hit_rate=C%]
-        Thread N:   idle:        Xus (Y%)
-
-    3. Summary (PTO2_SCHED_PROFILING=0):
+    2. Summary (PTO2_SCHED_PROFILING=0):
         Thread N: Scheduler summary: total_time=Xus, loops=Y, tasks_scheduled=Z
     """
     threads = {}
@@ -67,17 +59,6 @@ def parse_scheduler_threads(log_path):
                     'format': 'two-level',
                 }
 
-            # Legacy detailed format: Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
-            m = re.search(r'Thread (\d+): completed=(\d+) tasks in ([\d.]+)us \((\d+) loops, ([\d.]+) tasks/loop\)', line)
-            if m:
-                tid = int(m.group(1))
-                threads[tid] = {
-                    'completed': int(m.group(2)),
-                    'total_us': float(m.group(3)),
-                    'loops': int(m.group(4)),
-                    'tasks_per_loop': float(m.group(5)),
-                }
-
             # Summary format: Thread N: Scheduler summary: total_time=Xus, loops=Y, tasks_scheduled=Z
             m = re.search(r'Thread (\d+): Scheduler summary: total_time=([\d.]+)us, loops=(\d+), tasks_scheduled=(\d+)', line)
             if m:
@@ -86,26 +67,22 @@ def parse_scheduler_threads(log_path):
                 loops = int(m.group(3))
                 completed = int(m.group(4))
                 tasks_per_loop = completed / loops if loops > 0 else 0.0
-                threads[tid] = {
-                    'completed': completed,
-                    'total_us': total_us,
-                    'loops': loops,
-                    'tasks_per_loop': tasks_per_loop,
-                    'format': 'summary',  # Mark as summary format
-                }
-
-            # New format phase lines: Thread N:   complete       : Xus (Y%)
-            m = re.search(r'Thread (\d+):\s+(complete|dispatch|scan|idle)\s+:\s+([\d.]+)us \(\s*([\d.]+)%\)', line)
-            if m:
-                tid = int(m.group(1))
                 if tid in threads:
-                    phase = m.group(2)
-                    threads[tid][f'{phase}_us'] = float(m.group(3))
-                    threads[tid][f'{phase}_pct'] = float(m.group(4))
+                    # Enrich existing entry (e.g. two-level) with loop stats
+                    threads[tid]['loops'] = loops
+                    threads[tid]['tasks_per_loop'] = tasks_per_loop
+                else:
+                    threads[tid] = {
+                        'completed': completed,
+                        'total_us': total_us,
+                        'loops': loops,
+                        'tasks_per_loop': tasks_per_loop,
+                        'format': 'summary',
+                    }
 
-            # Legacy phase: complete [fanout: edges=X, max_degree=Y, avg=Z]  [fanin: edges=D, max_degree=E, avg=F]
+            # New format: complete with fanout/fanin stats
             m = re.search(
-                r'Thread (\d+):\s+complete:\s+([\d.]+)us \(\s*([\d.]+)%\)'
+                r'Thread (\d+):\s+complete\s+:\s+([\d.]+)us \(\s*([\d.]+)%\)'
                 r'\s+\[fanout: edges=(\d+), max_degree=(\d+), avg=([\d.]+)\]'
                 r'\s+\[fanin: edges=(\d+), max_degree=(\d+), avg=([\d.]+)\]',
                 line)
@@ -120,17 +97,13 @@ def parse_scheduler_threads(log_path):
                     threads[tid]['fanin_edges'] = int(m.group(7))
                     threads[tid]['fanin_max_degree'] = int(m.group(8))
                     threads[tid]['fanin_avg'] = float(m.group(9))
+                continue
 
-            # Legacy phase: scan
-            m = re.search(r'Thread (\d+):\s+scan:\s+([\d.]+)us \(\s*([\d.]+)%\)', line)
-            if m:
-                tid = int(m.group(1))
-                if tid in threads:
-                    threads[tid]['scan_us'] = float(m.group(2))
-                    threads[tid]['scan_pct'] = float(m.group(3))
-
-            # Phase: dispatch [pop: hit=X, miss=Y, hit_rate=Z%]
-            m = re.search(r'Thread (\d+):\s+dispatch:\s+([\d.]+)us \(\s*([\d.]+)%\)\s+\[pop: hit=(\d+), miss=(\d+), hit_rate=([\d.]+)%\]', line)
+            # New format: dispatch with pop stats
+            m = re.search(
+                r'Thread (\d+):\s+dispatch\s+:\s+([\d.]+)us \(\s*([\d.]+)%\)'
+                r'\s+\[pop: hit=(\d+), miss=(\d+), hit_rate=([\d.]+)%\]',
+                line)
             if m:
                 tid = int(m.group(1))
                 if tid in threads:
@@ -139,14 +112,17 @@ def parse_scheduler_threads(log_path):
                     threads[tid]['pop_hit'] = int(m.group(4))
                     threads[tid]['pop_miss'] = int(m.group(5))
                     threads[tid]['pop_hit_rate'] = float(m.group(6))
+                continue
 
-            # Phase: idle
-            m = re.search(r'Thread (\d+):\s+idle:\s+([\d.]+)us \(\s*([\d.]+)%\)', line)
+            # New format: scan and idle (no extra stats)
+            m = re.search(r'Thread (\d+):\s+(scan|idle)\s+:\s+([\d.]+)us \(\s*([\d.]+)%\)', line)
             if m:
                 tid = int(m.group(1))
                 if tid in threads:
-                    threads[tid]['idle_us'] = float(m.group(2))
-                    threads[tid]['idle_pct'] = float(m.group(3))
+                    phase = m.group(2)
+                    threads[tid][f'{phase}_us'] = float(m.group(3))
+                    threads[tid][f'{phase}_pct'] = float(m.group(4))
+                continue
 
     return threads
 

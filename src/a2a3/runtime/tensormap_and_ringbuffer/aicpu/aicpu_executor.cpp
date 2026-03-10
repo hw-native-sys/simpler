@@ -1143,15 +1143,28 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             thread_idx, cycles_to_us(sched_total), cur_thread_completed);
 
         // Level 1: complete
-        DEV_ALWAYS("Thread %d:   complete       : %.3fus (%.1f%%)",
+        double notify_avg = cur_thread_completed > 0
+            ? (double)notify_edges_total / cur_thread_completed : 0.0;
+        double fanin_avg = cur_thread_completed > 0
+            ? (double)fanin_edges_total / cur_thread_completed : 0.0;
+        DEV_ALWAYS("Thread %d:   complete       : %.3fus (%.1f%%)  [fanout: edges=%llu, max_degree=%d, avg=%.1f]  [fanin: edges=%llu, max_degree=%d, avg=%.1f]",
             thread_idx, cycles_to_us(sched_complete_cycle),
-            sched_complete_cycle * 100.0 / sched_total);
+            sched_complete_cycle * 100.0 / sched_total,
+            (unsigned long long)notify_edges_total, notify_max_degree, notify_avg,
+            (unsigned long long)fanin_edges_total, fanin_max_degree, fanin_avg);
 
         // Level 2: complete sub-phases (percentage relative to complete)
         uint64_t c_parent = sched_complete_cycle > 0 ? sched_complete_cycle : 1;
-        DEV_ALWAYS("Thread %d:     poll         : %.3fus (%.1f%%)",
+        uint64_t complete_miss_count = (complete_probe_count > complete_hit_count)
+            ? (complete_probe_count - complete_hit_count) : 0;
+        double complete_hit_rate = complete_probe_count > 0
+            ? complete_hit_count * 100.0 / complete_probe_count : 0.0;
+        DEV_ALWAYS("Thread %d:     poll         : %.3fus (%.1f%%)  hit=%llu, miss=%llu, hit_rate=%.1f%%",
             thread_idx, cycles_to_us(complete_poll),
-            complete_poll * 100.0 / c_parent);
+            complete_poll * 100.0 / c_parent,
+            (unsigned long long)complete_hit_count,
+            (unsigned long long)complete_miss_count,
+            complete_hit_rate);
         DEV_ALWAYS("Thread %d:     otc_lock     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
             thread_idx, cycles_to_us(sp.lock_cycle),
             sp.lock_cycle * 100.0 / c_parent,
@@ -1175,9 +1188,14 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             sched_complete_perf_cycle * 100.0 / c_parent);
 
         // Level 1: dispatch
-        DEV_ALWAYS("Thread %d:   dispatch       : %.3fus (%.1f%%)",
+        uint64_t pop_total = pop_hit + pop_miss;
+        double pop_hit_rate = pop_total > 0 ? pop_hit * 100.0 / pop_total : 0.0;
+        DEV_ALWAYS("Thread %d:   dispatch       : %.3fus (%.1f%%)  [pop: hit=%llu, miss=%llu, hit_rate=%.1f%%]",
             thread_idx, cycles_to_us(sched_dispatch_cycle),
-            sched_dispatch_cycle * 100.0 / sched_total);
+            sched_dispatch_cycle * 100.0 / sched_total,
+            (unsigned long long)pop_hit,
+            (unsigned long long)pop_miss,
+            pop_hit_rate);
 
         // Level 2: dispatch sub-phases (percentage relative to dispatch)
         uint64_t d_parent = sched_dispatch_cycle > 0 ? sched_dispatch_cycle : 1;
