@@ -19,6 +19,9 @@
 #include <pto/pto-inst.hpp>
 
 using namespace pto;
+template <int64_t SN1 = DYNAMIC, int64_t SN2 = DYNAMIC, int64_t SN3 = DYNAMIC,
+          int64_t SN4 = DYNAMIC, int64_t SN5 = DYNAMIC>
+using PTOStride = pto::Stride<SN1, SN2, SN3, SN4, SN5>;
 
 #ifndef __gm__
 #define __gm__
@@ -40,9 +43,9 @@ static __aicore__ void softmax_prepare_impl(__gm__ uint8_t* sij_raw, float scale
 
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
-    using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
-    using GlobalDataMxN_bf16 = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
-    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, Stride<1, 1, 1, 1, 1>, Layout::DN>;
+    using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, PTOStride<1, 1, 1, N, 1>>;
+    using GlobalDataMxN_bf16 = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, N>, PTOStride<1, 1, 1, N, 1>>;
+    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, PTOStride<1, 1, 1, 1, 1>, Layout::DN>;
 
     GlobalDataMxN sijGlobal(sij);
     GlobalDataMxN_bf16 pijGlobal(pij);

@@ -11,6 +11,9 @@
 #include <pto/pto-inst.hpp>
 
 using namespace pto;
+template <int64_t SN1 = DYNAMIC, int64_t SN2 = DYNAMIC, int64_t SN3 = DYNAMIC,
+          int64_t SN4 = DYNAMIC, int64_t SN5 = DYNAMIC>
+using PTOStride = pto::Stride<SN1, SN2, SN3, SN4, SN5>;
 
 #ifndef __gm__
 #define __gm__
@@ -43,7 +46,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     // Half types for input and output
     using DynShapeDim5Half = Shape<1, 1, 1, vRows, vCols>;
-    using DynStridDim5Half = Stride<1, 1, 1, kTCols_, 1>;
+    using DynStridDim5Half = PTOStride<1, 1, 1, kTCols_, 1>;
     using GlobalDataHalf = GlobalTensor<half, DynShapeDim5Half, DynStridDim5Half>;
     using TileDataHalf = Tile<TileType::Vec, half, kTRows_, kTCols_, BLayout::RowMajor, -1, -1>;
 

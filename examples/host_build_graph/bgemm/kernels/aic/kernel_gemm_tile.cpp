@@ -11,6 +11,9 @@
 #include <pto/common/pto_tile.hpp>
 
 using namespace pto;
+template <int64_t SN1 = DYNAMIC, int64_t SN2 = DYNAMIC, int64_t SN3 = DYNAMIC,
+          int64_t SN4 = DYNAMIC, int64_t SN5 = DYNAMIC>
+using PTOStride = pto::Stride<SN1, SN2, SN3, SN4, SN5>;
 
 #ifndef __gm__
 #define __gm__
@@ -40,11 +43,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     constexpr int N = CeilAlign<int>(TILE, blockAlign);
 
     using GlobalDataA = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        PTOStride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
     using GlobalDataB = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        PTOStride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
     using GlobalDataC = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        PTOStride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
 
     GlobalDataA src0Global(input_a);
     GlobalDataB src1Global(input_b);

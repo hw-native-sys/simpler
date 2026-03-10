@@ -12,6 +12,9 @@
 #include <pto/pto-inst.hpp>
 
 using namespace pto;
+template <int64_t SN1 = DYNAMIC, int64_t SN2 = DYNAMIC, int64_t SN3 = DYNAMIC,
+          int64_t SN4 = DYNAMIC, int64_t SN5 = DYNAMIC>
+using PTOStride = pto::Stride<SN1, SN2, SN3, SN4, SN5>;
 
 #ifndef __gm__
 #define __gm__
@@ -50,11 +53,11 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     // Global tensor types
     using GlobalDataSrc0 = GlobalTensor<half, Shape<1, 1, 1, validM, validK>,
-        Stride<validM * validK, validM * validK, validM * validK, validK, 1>>;
+        PTOStride<validM * validK, validM * validK, validM * validK, validK, 1>>;
     using GlobalDataSrc1 = GlobalTensor<half, Shape<1, 1, 1, validK, validN>,
-        Stride<validK * validN, validK * validN, validK * validN, validN, 1>>;
+        PTOStride<validK * validN, validK * validN, validK * validN, validN, 1>>;
     using GlobalDataOut = GlobalTensor<float, Shape<1, 1, 1, validM, validN>,
-        Stride<validM * validN, validM * validN, validM * validN, validN, 1>>;
+        PTOStride<validM * validN, validM * validN, validM * validN, validN, 1>>;
 
     GlobalDataSrc0 src0Global(src0);
     GlobalDataSrc1 src1Global(src1);

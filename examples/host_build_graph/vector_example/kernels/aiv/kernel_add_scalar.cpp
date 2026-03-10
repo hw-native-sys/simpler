@@ -13,6 +13,9 @@
 #include <pto/pto-inst.hpp>
 
 using namespace pto;
+template <int64_t SN1 = DYNAMIC, int64_t SN2 = DYNAMIC, int64_t SN3 = DYNAMIC,
+          int64_t SN4 = DYNAMIC, int64_t SN5 = DYNAMIC>
+using PTOStride = pto::Stride<SN1, SN2, SN3, SN4, SN5>;
 
 #ifndef __gm__
 #define __gm__
@@ -54,7 +57,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     constexpr int vCols = 128;
 
     using DynShapeDim5 = Shape<1, 1, 1, vRows, vCols>;
-    using DynStridDim5 = Stride<1, 1, 1, kTCols_, 1>;
+    using DynStridDim5 = PTOStride<1, 1, 1, kTCols_, 1>;
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
     using TileData = Tile<TileType::Vec, float, kTRows_, kTCols_, BLayout::RowMajor, -1, -1>;
 

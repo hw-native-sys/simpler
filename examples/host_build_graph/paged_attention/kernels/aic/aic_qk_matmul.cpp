@@ -10,6 +10,9 @@
 #include <pto/pto-inst.hpp>
 
 using namespace pto;
+template <int64_t SN1 = DYNAMIC, int64_t SN2 = DYNAMIC, int64_t SN3 = DYNAMIC,
+          int64_t SN4 = DYNAMIC, int64_t SN5 = DYNAMIC>
+using PTOStride = pto::Stride<SN1, SN2, SN3, SN4, SN5>;
 
 #ifndef __gm__
 #define __gm__
@@ -28,10 +31,10 @@ static __aicore__ void qk_matmul_impl(__gm__ uint8_t* qi_raw, __gm__ uint8_t* kj
     __gm__ float*      sij = reinterpret_cast<__gm__ float*>(sij_raw);
 
     // qi (M, K) fp16 in ND (row-major) layout
-    using GlobalA   = GlobalTensor<half, Shape<1, 1, 1, M, K>, Stride<M*K, M*K, M*K, K, 1>>;
+    using GlobalA   = GlobalTensor<half, Shape<1, 1, 1, M, K>, PTOStride<M*K, M*K, M*K, K, 1>>;
     // kj stored as (N, K) row-major = (K, N) column-major -> DN layout
-    using GlobalB   = GlobalTensor<half, Shape<1, 1, 1, K, N>, Stride<K*N, K*N, K*N, 1, K>, Layout::DN>;
-    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<M*N, M*N, M*N, N, 1>>;
+    using GlobalB   = GlobalTensor<half, Shape<1, 1, 1, K, N>, PTOStride<K*N, K*N, K*N, 1, K>, Layout::DN>;
+    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, PTOStride<M*N, M*N, M*N, N, 1>>;
 
     GlobalA   qiGlobal(qi);
     GlobalB   kjGlobal(kj);
