@@ -34,6 +34,7 @@ Examples:
 import argparse
 import logging
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -99,6 +100,38 @@ def _wait_for_new_device_log(log_dir, pre_run_logs, timeout=15, interval=0.5):
                 return max(new_logs, key=lambda p: p.stat().st_mtime)
         time.sleep(interval)
     return None
+
+
+def _ensure_hccl_helper_built():
+    """Ensure libhccl_helper.so is built. Build if build dir or .so is missing."""
+    hccl_helper_dir = script_dir / "hccl_helper"
+    build_dir = hccl_helper_dir / "build"
+    lib_path = build_dir / "libhccl_helper.so"
+    if lib_path.exists():
+        return
+    logger.info("HCCL helper not built, compiling...")
+    build_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.run(
+            ["cmake", ".."],
+            cwd=str(build_dir),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        subprocess.run(
+            ["make"],
+            cwd=str(build_dir),
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        logger.info("HCCL helper built successfully")
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"HCCL helper build failed: {e}\n"
+            "Ensure CANN env is set: source /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash"
+        ) from e
 
 
 def main():
@@ -265,6 +298,9 @@ Golden.py interface:
         from concurrent.futures import ProcessPoolExecutor, as_completed
 
         from multi_card_code_runner import create_code_runner, create_compiler, run_on_device, run_on_device_comm
+
+        # Ensure HCCL helper is built (for multi-card comm) before compile
+        _ensure_hccl_helper_built()
 
         # Compile first
         compiler = create_compiler(kernels_dir=str(args.kernels), platform=args.platform)
