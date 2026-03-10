@@ -549,17 +549,6 @@ struct PTO2SchedulerState {
         PTO2_SCHED_CYCLE_LAP(g_sched_fanout_cycle[thread_idx]);
 #endif
 
-        // Self consumed check
-#if PTO2_SCHED_PROFILING
-        uint64_t self_atomics = 0;
-        check_and_handle_consumed(slot, task, self_atomics);
-        g_sched_self_atomic_count[thread_idx] += self_atomics;
-        PTO2_SCHED_CYCLE_LAP(g_sched_self_consumed_cycle[thread_idx]);
-        g_sched_complete_count[thread_idx]++;
-#else
-        check_and_handle_consumed(slot, task);
-#endif
-
 #if PTO2_PROFILING
         return stats;
 #endif
@@ -574,6 +563,9 @@ struct PTO2SchedulerState {
     int32_t on_task_release(int32_t task_id, int32_t thread_idx) {
         PTO2_SCHED_CYCLE_START();
         extern uint64_t g_sched_fanin_cycle[], g_sched_fanin_atomic_count[];
+        extern uint64_t g_sched_self_atomic_count[];
+        extern uint64_t g_sched_self_consumed_cycle[];
+        extern uint64_t g_sched_complete_count[];
         uint64_t fanin_atomics = 0;
 #else
     int32_t on_task_release(int32_t task_id) {
@@ -591,6 +583,17 @@ struct PTO2SchedulerState {
 #if PTO2_SCHED_PROFILING
         g_sched_fanin_atomic_count[thread_idx] += fanin_atomics;
         PTO2_SCHED_CYCLE_LAP(g_sched_fanin_cycle[thread_idx]);
+#endif
+
+        // Self consumed check
+#if PTO2_SCHED_PROFILING
+        uint64_t self_atomics = 0;
+        check_and_handle_consumed(slot, task, self_atomics);
+        g_sched_self_atomic_count[thread_idx] += self_atomics;
+        PTO2_SCHED_CYCLE_LAP(g_sched_self_consumed_cycle[thread_idx]);
+        g_sched_complete_count[thread_idx]++;
+#else
+        check_and_handle_consumed(slot, pto2_sm_get_task_by_slot(sm_handle, slot));
 #endif
         return fanin_edges;
     }
