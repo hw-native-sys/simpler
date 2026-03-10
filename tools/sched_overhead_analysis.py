@@ -114,14 +114,16 @@ def parse_scheduler_threads(log_path):
                     threads[tid]['pop_hit_rate'] = float(m.group(6))
                 continue
 
-            # New format: scan and idle (no extra stats)
-            m = re.search(r'Thread (\d+):\s+(scan|idle)\s+:\s+([\d.]+)us \(\s*([\d.]+)%\)', line)
+            # New format: scan with optional enqueue count, and idle (no extra stats)
+            m = re.search(r'Thread (\d+):\s+(scan|idle)\s+:\s+([\d.]+)us \(\s*([\d.]+)%\)(?:\s+\[enqueue: (\d+)\])?', line)
             if m:
                 tid = int(m.group(1))
                 if tid in threads:
                     phase = m.group(2)
                     threads[tid][f'{phase}_us'] = float(m.group(3))
                     threads[tid][f'{phase}_pct'] = float(m.group(4))
+                    if m.group(5) is not None:
+                        threads[tid]['scan_enqueue'] = int(m.group(5))
                 continue
 
     return threads
@@ -309,6 +311,11 @@ def run_analysis(perf_path, log_path, print_sources=True, selection_strategy=Non
     pop_total = pop_hit + pop_miss
     pop_hit_rate = pop_hit / pop_total * 100 if pop_total > 0 else 0
     print(f'  Pop: hit={pop_hit}, miss={pop_miss}, hit_rate={pop_hit_rate:.1f}%')
+
+    # Scan enqueue stats (from scan phase, orch_pending drain)
+    scan_enqueue = sum(t.get('scan_enqueue', 0) for t in threads.values())
+    if scan_enqueue > 0:
+        print(f'  Scan enqueue (orch_pending drain): total={scan_enqueue}')
 
     print()
     print('=' * 90)

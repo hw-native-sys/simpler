@@ -175,6 +175,37 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
         }
     }
 
+    // Initialize orch_pending buffer (SPMC: orchestrator pushes, scheduler threads pop)
+    if (window_size == 0 || window_size > PTO2_TASK_WINDOW_SIZE) {
+        for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
+            pto2_ready_queue_destroy(&sched->ready_queues[i]);
+        }
+        delete[] sched->fanout_refcount;
+        delete[] sched->fanin_refcount;
+        delete[] sched->task_state;
+        sched->fanout_refcount = nullptr;
+        sched->fanin_refcount = nullptr;
+        sched->task_state = nullptr;
+        return false;
+    }
+    sched->orch_pending_capacity = window_size;
+    sched->orch_pending_mask = window_size - 1;
+    sched->orch_pending_buf = new (std::nothrow) int32_t[window_size];
+    if (!sched->orch_pending_buf) {
+        for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
+            pto2_ready_queue_destroy(&sched->ready_queues[i]);
+        }
+        delete[] sched->fanout_refcount;
+        delete[] sched->fanin_refcount;
+        delete[] sched->task_state;
+        sched->fanout_refcount = nullptr;
+        sched->fanin_refcount = nullptr;
+        sched->task_state = nullptr;
+        return false;
+    }
+    sched->orch_pending_head.store(0, std::memory_order_relaxed);
+    sched->orch_pending_tail.store(0, std::memory_order_relaxed);
+
     return true;
 }
 
@@ -192,6 +223,11 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
     if (sched->fanout_refcount) {
         delete[] sched->fanout_refcount;
         sched->fanout_refcount = nullptr;
+    }
+
+    if (sched->orch_pending_buf) {
+        delete[] sched->orch_pending_buf;
+        sched->orch_pending_buf = nullptr;
     }
 
     for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {

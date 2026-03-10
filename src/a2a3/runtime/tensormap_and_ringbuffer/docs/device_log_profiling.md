@@ -86,7 +86,7 @@ Each of the 3 scheduler threads (Thread 0, 1, 2) prints its own summary after co
 Thread 0: completed=352 tasks in 3477.420us (147 loops, 2.4 tasks/loop)
 Thread 0: --- Phase Breakdown ---
 Thread 0:   complete:    1485.020us (42.7%)  [fanout: edges=432, max_degree=2, avg=1.2]  [fanin: edges=320, max_degree=3, avg=0.9]
-Thread 0:   scan:        14.400us (0.4%)
+Thread 0:   scan:        14.400us (0.4%)  [enqueue: 120]
 Thread 0:   dispatch:    1973.060us (56.7%)  [pop: hit=352, miss=3043, hit_rate=10.4%]
 Thread 0:   idle:        4.940us (0.1%)
 ```
@@ -111,7 +111,7 @@ The scheduler loop runs four phases each iteration. Each phase's time is accumul
 | Phase | What it does | Inline stats |
 |-------|-------------|-------------|
 | **complete** | Polls handshake on each managed core; when a core completes, traverses fanout list (notify consumers) and fanin list (release producers) via `on_task_complete` | `fanout`: edges/max_degree/avg for consumer notification; `fanin`: edges/max_degree/avg for producer release |
-| **scan** | Updates the perf profiling header with latest scheduler state | — |
+| **scan** | Drains the `orch_pending` SPMC buffer (orchestrator→ready queue transfer) and updates the perf profiling header with latest scheduler state | `enqueue`: number of tasks drained from `orch_pending` into ready queues |
 | **dispatch** | For each idle core, pops a task from the ready queue via `pto2_scheduler_get_ready_task`, builds the dispatch payload, and writes the task to the core's handshake register | `pop`: `hit` = successful pops (task dispatched), `miss` = empty queue pops, `hit_rate` = hit/(hit+miss) |
 | **idle** | Scheduler loop iteration where no progress was made (no completions, no dispatches) | — |
 
@@ -119,7 +119,7 @@ The scheduler loop runs four phases each iteration. Each phase's time is accumul
 
 - **dispatch** is typically the largest (~55-60%) because it includes ready-queue pops (with spinlock), payload construction, and cache flush (`dc cvac` + `dsb sy`).
 - **complete** is the second largest (~40-45%) because it traverses both fanout (CAS-based fanin decrement, conditional ready-queue push) and fanin (release_producer, check_consumed, ring pointer advancement).
-- **scan** is small (<1%) — only updates the perf header.
+- **scan** is typically small (<1%) — drains `orch_pending` (tasks made ready by the orchestrator) into ready queues and updates the perf header.
 - **idle** is negligible when tasks are flowing; high idle% indicates the scheduler is starved.
 
 **Interpreting pop hit_rate:**

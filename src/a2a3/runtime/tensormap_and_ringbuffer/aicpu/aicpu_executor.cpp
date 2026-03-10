@@ -847,6 +847,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     uint64_t pop_miss = 0;
     uint32_t phase_complete_count = 0;
     uint32_t phase_dispatch_count = 0;
+    uint32_t phase_scan_enqueue = 0;
+    uint64_t scan_enqueue_total = 0;
     uint64_t local_dispatch_count = 0;
     uint64_t local_overflow_count = 0;
 #if PTO2_SCHED_PROFILING
@@ -980,6 +982,33 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             }
             CYCLE_COUNT_LAP(sched_complete_cycle);
         }
+#endif
+
+        // Scan phase: drain orch_pending into ready_queues
+        {
+            int32_t pending_task_id;
+            while ((pending_task_id = rt->scheduler.orch_pending_try_pop()) >= 0) {
+                PTO2TaskDescriptor* ptask = &task_descriptors[pending_task_id & window_mask];
+                if (ptask->worker_type >= 0 && ptask->worker_type < PTO2_NUM_WORKER_TYPES) {
+                    rt->scheduler.ready_queues[ptask->worker_type].push(pending_task_id);
+                    made_progress = true;
+#if PTO2_PROFILING
+                    phase_scan_enqueue++;
+#endif
+                } else {
+                    DEV_ERROR("Invalid worker_type %d for task %d", ptask->worker_type, pending_task_id);
+                }
+            }
+        }
+        CYCLE_COUNT_LAP(sched_scan_cycle);
+#if PTO2_PROFILING
+        scan_enqueue_total += phase_scan_enqueue;
+        if (profiling_enabled && phase_scan_enqueue > 0) {
+            perf_aicpu_record_phase(
+                thread_idx, AicpuPhaseId::SCHED_SCAN, _t0_phase, _t1, sched_loop_count, phase_scan_enqueue);
+            _t0_phase = _t1;
+        }
+        phase_scan_enqueue = 0;
 #endif
 
         // Phase 2: Local dispatch — match local_buf tasks to idle cores (zero MPMC operations)
@@ -1291,9 +1320,10 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             sched_dispatch_setup_cycle * 100.0 / d_parent);
 
         // Level 1: scan
-        DEV_ALWAYS("Thread %d:   scan           : %.3fus (%.1f%%)",
+        DEV_ALWAYS("Thread %d:   scan           : %.3fus (%.1f%%)  [enqueue: %llu]",
             thread_idx, cycles_to_us(sched_scan_cycle),
-            sched_scan_cycle * 100.0 / sched_total);
+            sched_scan_cycle * 100.0 / sched_total,
+            (unsigned long long)scan_enqueue_total);
 
         // Level 1: idle
         DEV_ALWAYS("Thread %d:   idle           : %.3fus (%.1f%%)",
