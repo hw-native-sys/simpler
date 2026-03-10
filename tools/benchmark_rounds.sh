@@ -21,6 +21,7 @@ EXAMPLES_DIR="$PROJECT_ROOT/tests/device_tests/tensormap_and_ringbuffer"
 EXAMPLES=(
     alternating_matmul_add
     benchmark_bgemm
+    paged_attention_unroll
     batch_paged_attention
     paged_attention
 )

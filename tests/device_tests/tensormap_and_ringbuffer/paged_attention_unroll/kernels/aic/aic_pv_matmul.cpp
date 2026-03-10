@@ -109,9 +109,6 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ float* oi_base = reinterpret_cast<__gm__ float*>(oi_new->buffer.addr) + oi_new->start_offset;
 
     uint64_t q_tile_size = static_cast<uint64_t>(pij_buf->shapes[0]);
-    if (n_blocks > 1) {
-        q_tile_size /= n_blocks;
-    }
 
     if (q_tile_size == 16) {
         pv_matmul_n_impl<16, 128, 128>(pij_base, val_base, oi_base, n_blocks, block_indices);

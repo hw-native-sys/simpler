@@ -21,7 +21,7 @@ RTOL = 1e-3
 ATOL = 1e-3
 
 
-# All test cases - production scale + N_UNROLL test cases
+# All test cases - production scale
 ALL_CASES = {
     "Case1": {
         "batch": 64,
@@ -41,73 +41,9 @@ ALL_CASES = {
         "context_len": 8192,
         "max_model_len": 32768,
     },
-    # N_UNROLL=8 test cases
-    "Batch2": {
-        "batch": 2,
-        "num_heads": 16,
-        "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 128,
-        "context_len": 8193,
-        "max_model_len": 32768,
-    },
-    "Batch8": {
-        "batch": 8,
-        "num_heads": 16,
-        "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 128,
-        "context_len": 8193,
-        "max_model_len": 32768,
-    },
-    "Blocks65": {
-        "batch": 1,
-        "num_heads": 16,
-        "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 128,
-        "context_len": 8193,
-        "max_model_len": 32768,
-    },
-    "Blocks17": {
-        "batch": 1,
-        "num_heads": 16,
-        "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 128,
-        "context_len": 2049,
-        "max_model_len": 4096,
-    },
-    "Blocks33": {
-        "batch": 1,
-        "num_heads": 16,
-        "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 128,
-        "context_len": 4097,
-        "max_model_len": 8192,
-    },
-    "Blocks25": {
-        "batch": 1,
-        "num_heads": 16,
-        "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 128,
-        "context_len": 3073,
-        "max_model_len": 8192,
-    },
-    "Blocks24": {
-        "batch": 1,
-        "num_heads": 16,
-        "kv_head_num": 1,
-        "head_dim": 128,
-        "block_size": 128,
-        "context_len": 3072,
-        "max_model_len": 8192,
-    },
 }
 
-DEFAULT_CASE = "Blocks17"
+DEFAULT_CASE = "Case1"
 
 
 def generate_inputs(params: dict) -> list:

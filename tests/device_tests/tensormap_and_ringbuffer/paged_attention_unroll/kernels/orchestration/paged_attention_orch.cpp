@@ -2,7 +2,7 @@
  * Paged Attention Orchestration Function V2 - N_UNROLL=8, 4 Tasks Per Group
  *
  * Batches up to N_UNROLL blocks per group. Each group submits exactly 4 tasks:
- *   1. QK matmul:  qi @ K^T for n_blocks → sij_buf (n_blocks * q_tile, block_size)
+ *   1. QK matmul:  qi @ K^T for n_blocks → sij_buf (q_tile, n_blocks * block_size)
  *   2. Softmax:    two-pass over sij_buf → pij_buf, mi, li
  *   3. PV matmul:  SplitK accumulated P @ V → oi_new (q_tile, head_dim)
  *   4. Update:     online softmax accumulation with group-level mi, li, oi_new
@@ -178,7 +178,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     uint64_t valid_len_last = std::min(block_size, cur_seq - last_block_seq_start);
 
                     // === Task 1: Batched QK matmul ===
-                    uint64_t sij_buf_shapes[2] = {n_blocks * q_tile, block_size};
+                    uint64_t sij_buf_shapes[2] = {q_tile, n_blocks * block_size};
                     Tensor sij_buf = make_tensor(sij_buf_shapes, 2, DataType::FLOAT32);
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
@@ -203,7 +203,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     CYCLE_COUNT_LAP(prof_submit_task);
 
                     // === Task 2: Two-pass softmax over all blocks in group ===
-                    uint64_t pij_buf_shapes[2] = {n_blocks * q_tile, block_size};
+                    uint64_t pij_buf_shapes[2] = {q_tile, n_blocks * block_size};
                     Tensor pij_buf = make_tensor(pij_buf_shapes, 2, data_type);
                     Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
                     Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
