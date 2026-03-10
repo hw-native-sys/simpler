@@ -294,13 +294,32 @@ int DeviceRunner::run(Runtime& runtime,
         return -1;
     }
 
-    // Validate even distribution: block_dim must be divisible by scheduler thread count
-    // When launch_aicpu_num == 4: 3 schedulers + 1 orchestrator (thread 3 has 0 cores)
-    int scheduler_thread_num = (launch_aicpu_num == 4) ? 3 : launch_aicpu_num;
-    if (block_dim % scheduler_thread_num != 0) {
-        LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
-                      block_dim, scheduler_thread_num);
+    // Validate orchestrator configuration
+    int scheduler_thread_num = launch_aicpu_num - runtime.orch_thread_num;
+
+    if (runtime.orch_thread_num > launch_aicpu_num) {
+        LOG_ERROR("orch_thread_num (%d) cannot exceed aicpu_thread_num (%d)",
+                  runtime.orch_thread_num, launch_aicpu_num);
         return -1;
+    }
+
+    // Validate even core distribution for initial scheduler threads
+    // All-orchestrator mode (scheduler_thread_num == 0): cores assigned post-transition
+    if (scheduler_thread_num > 0) {
+        if (block_dim % scheduler_thread_num != 0) {
+            LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
+                      block_dim, scheduler_thread_num);
+            return -1;
+        }
+    } else {
+        LOG_INFO("All %d threads are orchestrators, cores will be assigned after orchestration completes",
+                 launch_aicpu_num);
+        // Post-transition: all threads become schedulers
+        if (block_dim % launch_aicpu_num != 0) {
+            LOG_WARN("block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
+                     "some threads will have different core counts after transition",
+                     block_dim, launch_aicpu_num);
+        }
     }
 
     // Ensure device is initialized (lazy initialization)
@@ -368,6 +387,8 @@ int DeviceRunner::run(Runtime& runtime,
             LOG_ERROR("init_performance_profiling failed: %d", rc);
             return rc;
         }
+        // Start memory management thread
+        perf_collector_.start_memory_manager();
     }
 
     std::cout << "\n=== Initialize runtime args ===" << '\n';
@@ -383,6 +404,10 @@ int DeviceRunner::run(Runtime& runtime,
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -392,6 +417,10 @@ int DeviceRunner::run(Runtime& runtime,
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", launch_aicpu_num);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -401,13 +430,20 @@ int DeviceRunner::run(Runtime& runtime,
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.args.runtime_args);
     if (rc != 0) {
         LOG_ERROR("launch_aicore_kernel failed: %d", rc);
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
 
-    // Poll and collect performance data (must be before stream sync)
+    // Poll and collect performance data in a separate collector thread
+    std::thread collector_thread;
     if (runtime.enable_profiling) {
-        poll_and_collect_performance_data(runtime.get_task_count());
+        collector_thread = std::thread([this, &runtime]() {
+            poll_and_collect_performance_data(runtime.get_task_count());
+        });
     }
 
     std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
@@ -415,6 +451,13 @@ int DeviceRunner::run(Runtime& runtime,
     rc = rtStreamSynchronize(stream_aicpu_);
     if (rc != 0) {
         LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
+        if (runtime.enable_profiling && collector_thread.joinable()) {
+            collector_thread.join();
+        }
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
@@ -423,17 +466,39 @@ int DeviceRunner::run(Runtime& runtime,
     rc = rtStreamSynchronize(stream_aicore_);
     if (rc != 0) {
         LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
+        if (runtime.enable_profiling && collector_thread.joinable()) {
+            collector_thread.join();
+        }
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
         kernel_args_.finalize_runtime_args();
         return rc;
     }
 
-    // Collect phase data and print performance data (after stream sync)
+    // Wait for collector thread to finish
+    if (runtime.enable_profiling && collector_thread.joinable()) {
+        collector_thread.join();
+    }
+
+    // Stop memory management, drain remaining buffers, collect phase data, export
     if (runtime.enable_profiling) {
+        perf_collector_.stop_memory_manager();
+        perf_collector_.drain_remaining_buffers();
         perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
 
-    // Note: FinalizeRuntimeArgs is deferred to Finalize() so PrintHandshakeResults can access device data
+    // Print handshake results (reads from device memory, must be before free)
+    print_handshake_results();
+
+    // Free per-run resources
+    if (kernel_args_.args.regs != 0) {
+        mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+        kernel_args_.args.regs = 0;
+    }
+    kernel_args_.finalize_runtime_args();
 
     return 0;
 }
@@ -456,30 +521,10 @@ void DeviceRunner::print_handshake_results() {
     }
 }
 
-int DeviceRunner::clean_cache() {
-    if (stream_aicpu_ == nullptr) {
-        return 0;  // Nothing to cleanup if device not initialized
-    }
-    for (const auto& [func_id, addr] : func_id_to_addr_) {
-        void* gm_addr = reinterpret_cast<void*>(addr - sizeof(uint64_t));
-        mem_alloc_.free(gm_addr);
-    }
-    func_id_to_addr_.clear();
-
-    LOG_INFO("DeviceRunner: cache cleaned (test-specific resources only)");
-    return 0;
-}
-
 int DeviceRunner::finalize() {
     if (stream_aicpu_ == nullptr) {
         return 0;
     }
-
-    // Print handshake results before cleanup (reads from device memory)
-    print_handshake_results();
-
-    // Cleanup runtime args (deferred from Run)
-    kernel_args_.finalize_runtime_args();
 
     // Cleanup kernel args (deviceArgs)
     kernel_args_.finalize_device_args();
@@ -487,7 +532,17 @@ int DeviceRunner::finalize() {
     // Cleanup AICPU SO
     so_info_.finalize();
 
-    // Clear kernel address mapping
+    // Kernel binaries should have been removed by validate_runtime_impl()
+    if (!func_id_to_addr_.empty()) {
+        LOG_ERROR("finalize() called with %zu kernel binaries still cached (memory leak)",
+                  func_id_to_addr_.size());
+        // Cleanup leaked binaries to prevent memory leaks
+        for (const auto& pair : func_id_to_addr_) {
+            void* gm_addr = reinterpret_cast<void*>(pair.second);
+            mem_alloc_.free(gm_addr);
+            LOG_DEBUG("Freed leaked kernel binary: func_id=%d, addr=0x%lx", pair.first, pair.second);
+        }
+    }
     func_id_to_addr_.clear();
     binaries_loaded_ = false;
 
@@ -623,37 +678,43 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data
 
     LOG_DEBUG("Uploading kernel binary: func_id=%d, size=%zu bytes", func_id, bin_size);
 
-    // Allocate device GM memory (size field + binary data)
-    uint64_t alloc_size = sizeof(uint64_t) + bin_size;
-    void* gm_addr = mem_alloc_.alloc(alloc_size);
+    // Allocate device GM memory for kernel binary
+    void* gm_addr = mem_alloc_.alloc(bin_size);
     if (gm_addr == nullptr) {
         LOG_ERROR("Failed to allocate device GM memory for kernel func_id=%d", func_id);
         return 0;
     }
 
-    // Build host buffer with CoreFunctionBin structure (size + data)
-    std::vector<uint8_t> host_buf(alloc_size);
-    uint64_t* size_ptr = reinterpret_cast<uint64_t*>(host_buf.data());
-    *size_ptr = bin_size;
-    std::memcpy(host_buf.data() + sizeof(uint64_t), bin_data, bin_size);
-
-    // Copy to device
-    int rc = rtMemcpy(gm_addr, alloc_size, host_buf.data(), alloc_size, RT_MEMCPY_HOST_TO_DEVICE);
+    // Copy kernel binary to device
+    int rc = rtMemcpy(gm_addr, bin_size, bin_data, bin_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy to device failed: %d", rc);
         mem_alloc_.free(gm_addr);
         return 0;
     }
 
-    // Calculate function_bin_addr (skip size field to get actual code address)
-    uint64_t function_bin_addr = reinterpret_cast<uint64_t>(gm_addr) + sizeof(uint64_t);
-
-    // Cache for later reuse and cleanup
+    // Cache the kernel address
+    uint64_t function_bin_addr = reinterpret_cast<uint64_t>(gm_addr);
     func_id_to_addr_[func_id] = function_bin_addr;
 
     LOG_DEBUG("  func_id=%d -> function_bin_addr=0x%lx", func_id, function_bin_addr);
 
     return function_bin_addr;
+}
+
+void DeviceRunner::remove_kernel_binary(int func_id) {
+    auto it = func_id_to_addr_.find(func_id);
+    if (it == func_id_to_addr_.end()) {
+        return;
+    }
+
+    uint64_t function_bin_addr = it->second;
+    void* gm_addr = reinterpret_cast<void*>(function_bin_addr);
+
+    mem_alloc_.free(gm_addr);
+    func_id_to_addr_.erase(it);
+
+    LOG_DEBUG("Removed kernel binary: func_id=%d, addr=0x%lx", func_id, function_bin_addr);
 }
 
 int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, int device_id) {
@@ -679,8 +740,14 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
+    // Define free callback (a5: use MemoryAllocator)
+    auto free_cb = [](void* dev_ptr, void* user_data) -> int {
+        auto* allocator = static_cast<MemoryAllocator*>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
     return perf_collector_.initialize(runtime, num_aicore, device_id,
-                                       alloc_cb, register_cb, &mem_alloc_);
+                                       alloc_cb, register_cb, free_cb, &mem_alloc_);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {

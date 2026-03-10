@@ -86,8 +86,9 @@ void perf_aicpu_update_total_tasks(Runtime* runtime, uint32_t total_tasks);
  *
  * @param runtime Runtime instance pointer
  * @param num_sched_threads Number of scheduler threads
+ * @param num_orch_threads Number of orchestrator threads (may become schedulers after transition)
  */
-void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads);
+void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, int num_orch_threads = 1);
 
 /**
  * Record a single scheduler phase
@@ -137,9 +138,36 @@ void perf_aicpu_set_orch_thread_idx(int thread_idx);
  * @param start_time Phase start timestamp
  * @param end_time Phase end timestamp
  * @param submit_idx Task submission index (acts as loop_iter)
+ * @param task_id Task ID (stored in tasks_processed field for task tracking)
  */
 void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
                                    uint64_t start_time, uint64_t end_time,
-                                   uint32_t submit_idx);
+                                   uint32_t submit_idx, uint32_t task_id);
+
+/**
+ * Write core-to-thread assignment mapping to shared memory
+ *
+ * Records which scheduler thread manages each core_id.
+ * Called once after orchestration completes (not on the scheduler hot path).
+ *
+ * @param core_assignments 2D array [thread_idx][i] = core_id
+ * @param core_counts Per-thread core count array
+ * @param num_threads Number of scheduler threads
+ * @param total_cores Total number of cores
+ */
+void perf_aicpu_write_core_assignments(const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD],
+                                        const int* core_counts,
+                                        int num_threads,
+                                        int total_cores);
+
+/**
+ * Flush remaining phase records for a thread
+ *
+ * Marks the current WRITING phase buffer as READY and enqueues it
+ * for host collection. Called at thread exit (analogous to perf_aicpu_flush_buffers).
+ *
+ * @param thread_idx Thread index (scheduler thread or orchestrator)
+ */
+void perf_aicpu_flush_phase_buffers(int thread_idx);
 
 #endif  // PLATFORM_AICPU_PERFORMANCE_COLLECTOR_AICPU_H_

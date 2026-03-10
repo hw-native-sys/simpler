@@ -28,6 +28,7 @@ else()
 endif()
 list(LENGTH ALL_SOURCES NUM_SOURCES)
 message(STATUS "AICore kernel: ${NUM_SOURCES} source files")
+message(VERBOSE "AICore kernel sources: ${ALL_SOURCES}")
 
 # Output files
 set(AICORE_KERNEL_OBJ ${CMAKE_CURRENT_BINARY_DIR}/aicore_kernel.o)

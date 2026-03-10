@@ -33,6 +33,9 @@ else()
     message(FATAL_ERROR "MUST set CUSTOM_SOURCE_DIRS to build AICPU kernel")
 endif()
 
+list(LENGTH AICPU_KERNEL_SOURCES NUM_AICPU_KERNEL_SOURCES)
+message(STATUS "AICpu kernel: ${NUM_AICPU_KERNEL_SOURCES} source files")
+message(VERBOSE "AICpu kernel sources: ${AICPU_KERNEL_SOURCES}")
 add_library(aicpu_kernel SHARED ${AICPU_KERNEL_SOURCES})
 
 # Compile options (common to both C and C++)

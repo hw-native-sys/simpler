@@ -38,6 +38,7 @@ void device_free(void* dev_ptr);
 int copy_to_device(void* dev_ptr, const void* host_ptr, size_t size);
 int copy_from_device(void* host_ptr, const void* dev_ptr, size_t size);
 uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t* bin_data, size_t bin_size);
+void remove_kernel_binary_wrapper(int func_id);
 
 /* ===========================================================================
  */
@@ -75,6 +76,7 @@ int init_runtime(RuntimeHandle runtime,
         r->host_api.copy_to_device = copy_to_device;
         r->host_api.copy_from_device = copy_from_device;
         r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
+        r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
 
         LOG_DEBUG("About to call init_runtime_impl, r=%p", (void*)r);
 
@@ -157,6 +159,15 @@ uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t* bin_data, size
     }
 }
 
+void remove_kernel_binary_wrapper(int func_id) {
+    try {
+        DeviceRunner& runner = DeviceRunner::get();
+        runner.remove_kernel_binary(func_id);
+    } catch (...) {
+        // Ignore errors during cleanup
+    }
+}
+
 int launch_runtime(RuntimeHandle runtime,
     int aicpu_thread_num,
     int block_dim,
@@ -164,7 +175,8 @@ int launch_runtime(RuntimeHandle runtime,
     const uint8_t* aicpu_binary,
     size_t aicpu_size,
     const uint8_t* aicore_binary,
-    size_t aicore_size) {
+    size_t aicore_size,
+    int orch_thread_num) {
     if (runtime == NULL) {
         return -1;
     }
@@ -180,6 +192,7 @@ int launch_runtime(RuntimeHandle runtime,
 
         // Run the runtime (device initialization is handled internally)
         Runtime* r = static_cast<Runtime*>(runtime);
+        r->orch_thread_num = orch_thread_num;
         return runner.run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
     } catch (...) {
         return -1;
@@ -194,10 +207,6 @@ int finalize_runtime(RuntimeHandle runtime) {
         Runtime* r = static_cast<Runtime*>(runtime);
         int rc = validate_runtime_impl(r);
 
-        // Clean cached resources to prepare for next test
-        DeviceRunner& runner = DeviceRunner::get();
-        runner.clean_cache();
-        
         // Call destructor (user will call free())
         r->~Runtime();
         return rc;

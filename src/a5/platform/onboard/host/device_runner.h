@@ -249,15 +249,14 @@ public:
     int export_swimlane_json(const std::string& output_path = "outputs");
 
     /**
-     * Clean cached resources - lightweight cleanup between tests
+     * Remove a kernel binary from device memory
      *
-     * Cleans up test-specific resources while preserving device resources for reuse:
-     * - Frees kernel memory from global memory allocator
-     * - Clears kernel address cache
+     * Frees the device memory allocated for the kernel and removes the
+     * cached entry. This should be called during per-case cleanup.
      *
-     * @return 0 on success, error code on failure
+     * @param func_id   Function identifier to remove
      */
-    int clean_cache();
+    void remove_kernel_binary(int func_id);
 
     /**
      * Cleanup all resources

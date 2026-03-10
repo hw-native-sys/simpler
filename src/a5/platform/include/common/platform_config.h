@@ -73,17 +73,30 @@ constexpr int PLATFORM_MAX_CORES =
     PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BLOCKDIM;  // 108
 
 /**
- * Performance buffer capacity for each double buffer
- * Number of PerfRecord entries per buffer (ping or pong)
+ * Performance buffer capacity per buffer
+ * Number of PerfRecord entries per dynamically allocated PerfBuffer
  */
 constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
 
 /**
- * Ready queue capacity for performance data collection
- * Queue holds (core_index, buffer_id) entries for buffers ready to be read by Host.
- * Capacity = PLATFORM_MAX_CORES * 2 (each core has 2 buffers: ping and pong)
+ * Number of buffer slots per core/thread for dynamic profiling
+ * Host dynamically allocates buffers and writes addresses into these slots.
+ * Device reads slot addresses when switching buffers.
+ * Using 8 slots (ring buffer) instead of 2 (double-buffer) to tolerate
+ * Host-side latency in replacing full buffers.
  */
-constexpr int PLATFORM_PROF_READYQUEUE_SIZE = PLATFORM_MAX_CORES * 2;  // 216
+constexpr int PLATFORM_PROF_SLOT_COUNT = 8;
+
+/**
+ * Ready queue capacity for performance data collection
+ * Queue holds ReadyQueueEntry structs for buffers ready to be read by Host.
+ * Includes both PerfRecord and PhaseRecord entries:
+ *   PerfRecord: PLATFORM_MAX_CORES * PLATFORM_PROF_SLOT_COUNT
+ *   Phase:      PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_SLOT_COUNT
+ */
+constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
+    PLATFORM_MAX_CORES * PLATFORM_PROF_SLOT_COUNT
+    + PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_SLOT_COUNT;  // 872
 
 /**
  * System counter frequency (get_sys_cnt)

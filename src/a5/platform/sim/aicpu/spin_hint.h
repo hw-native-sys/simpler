@@ -18,10 +18,10 @@
 
 #include <sched.h>
 
-#if defined(__x86_64__)
-#define SPIN_WAIT_HINT() do { __builtin_ia32_pause(); sched_yield(); } while(0)
-#elif defined(__aarch64__)
+#if defined(__aarch64__)
 #define SPIN_WAIT_HINT() do { __asm__ volatile("yield" ::: "memory"); sched_yield(); } while(0)
+#elif defined(__x86_64__)
+#define SPIN_WAIT_HINT() do { __builtin_ia32_pause(); sched_yield(); } while(0)
 #else
 #define SPIN_WAIT_HINT() sched_yield()
 #endif

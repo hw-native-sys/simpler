@@ -151,13 +151,32 @@ int DeviceRunner::run(Runtime& runtime,
         return -1;
     }
 
-    // Validate even distribution: block_dim must be divisible by scheduler thread count
-    // When launch_aicpu_num == 4: 3 schedulers + 1 orchestrator (thread 3 has 0 cores)
-    int scheduler_thread_num = (launch_aicpu_num == 4) ? 3 : launch_aicpu_num;
-    if (block_dim % scheduler_thread_num != 0) {
-        LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
-                       block_dim, scheduler_thread_num);
+    // Validate orchestrator configuration
+    int scheduler_thread_num = launch_aicpu_num - runtime.orch_thread_num;
+
+    if (runtime.orch_thread_num > launch_aicpu_num) {
+        LOG_ERROR("orch_thread_num (%d) cannot exceed aicpu_thread_num (%d)",
+                  runtime.orch_thread_num, launch_aicpu_num);
         return -1;
+    }
+
+    // Validate even core distribution for initial scheduler threads
+    // All-orchestrator mode (scheduler_thread_num == 0): cores assigned post-transition
+    if (scheduler_thread_num > 0) {
+        if (block_dim % scheduler_thread_num != 0) {
+            LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
+                      block_dim, scheduler_thread_num);
+            return -1;
+        }
+    } else {
+        LOG_INFO("All %d threads are orchestrators, cores will be assigned after orchestration completes",
+                 launch_aicpu_num);
+        // Post-transition: all threads become schedulers
+        if (block_dim % launch_aicpu_num != 0) {
+            LOG_WARN("block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
+                     "some threads will have different core counts after transition",
+                     block_dim, launch_aicpu_num);
+        }
     }
 
     // Ensure device is initialized
@@ -218,6 +237,8 @@ int DeviceRunner::run(Runtime& runtime,
             LOG_ERROR("init_performance_profiling failed: %d", rc);
             return rc;
         }
+        // Start memory management thread
+        perf_collector_.start_memory_manager();
     }
 
     // Allocate simulated register blocks for all AICore cores
@@ -300,11 +321,16 @@ int DeviceRunner::run(Runtime& runtime,
 
     LOG_INFO("All threads completed");
 
-    // Collect AICPU phase data and print performance data after execution completes
+    // Stop memory management, drain remaining buffers, collect phase data, export
     if (runtime.enable_profiling) {
+        perf_collector_.stop_memory_manager();
+        perf_collector_.drain_remaining_buffers();
         perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
+
+    // Print handshake results at end of run
+    print_handshake_results();
 
     return 0;
 }
@@ -325,38 +351,11 @@ void DeviceRunner::print_handshake_results() {
     }
 }
 
-int DeviceRunner::clean_cache() {
-    // Skip if not initialized
-    if (device_id_ == -1) {
-        return 0;
-    }
-
-    // Only cleanup test-specific resources:
-
-    // 1. Close dlopen'd kernel libraries (different tests may have different kernels)
-    for (auto& pair : func_id_to_addr_) {
-        MappedKernel& kernel = pair.second;
-        if (kernel.dl_handle != nullptr) {
-            dlclose(kernel.dl_handle);
-            LOG_DEBUG("Closed dlopen kernel: func_id=%d", pair.first);
-            kernel.dl_handle = nullptr;
-            kernel.func_addr = 0;
-        }
-    }
-    func_id_to_addr_.clear();
-
-    LOG_INFO("DeviceRunner(sim): cache cleaned (test-specific resources only)");
-    return 0;
-}
-
 int DeviceRunner::finalize() {
     // Skip if already finalized
     if (device_id_ == -1 && aicpu_so_handle_ == nullptr && aicore_so_handle_ == nullptr) {
         return 0;
     }
-
-    // Print handshake results before cleanup
-    print_handshake_results();
 
     // Cleanup performance profiling
     if (perf_collector_.is_initialized()) {
@@ -369,14 +368,17 @@ int DeviceRunner::finalize() {
         perf_collector_.finalize(nullptr, free_cb, nullptr);
     }
 
-    // Close all dlopen'd kernel libraries
-    for (auto& pair : func_id_to_addr_) {
-        MappedKernel& kernel = pair.second;
-        if (kernel.dl_handle != nullptr) {
-            dlclose(kernel.dl_handle);
-            LOG_DEBUG("Closed dlopen kernel: func_id=%d", pair.first);
-            kernel.dl_handle = nullptr;
-            kernel.func_addr = 0;
+    // Kernel binaries should have been removed by validate_runtime_impl()
+    if (!func_id_to_addr_.empty()) {
+        LOG_ERROR("finalize() called with %zu kernel binaries still cached",
+                  func_id_to_addr_.size());
+        // Cleanup leaked handles
+        for (auto& pair : func_id_to_addr_) {
+            MappedKernel& kernel = pair.second;
+            if (kernel.dl_handle != nullptr) {
+                dlclose(kernel.dl_handle);
+                LOG_DEBUG("Closed leaked kernel: func_id=%d", pair.first);
+            }
         }
     }
     func_id_to_addr_.clear();
@@ -477,6 +479,21 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data
     return kernel.func_addr;
 }
 
+void DeviceRunner::remove_kernel_binary(int func_id) {
+    auto it = func_id_to_addr_.find(func_id);
+    if (it == func_id_to_addr_.end()) {
+        return;
+    }
+
+    MappedKernel& kernel = it->second;
+    if (kernel.dl_handle != nullptr) {
+        dlclose(kernel.dl_handle);
+        LOG_DEBUG("Removed kernel binary (dlclose): func_id=%d, handle=%p", func_id, kernel.dl_handle);
+    }
+
+    func_id_to_addr_.erase(it);
+}
+
 // =============================================================================
 // Performance Profiling Implementation
 // =============================================================================
@@ -488,9 +505,16 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
         return malloc(size);
     };
 
-    // Simulation: no registration needed (pass nullptr)
+    // Define free callback (a5sim: use free)
+    auto free_cb = [](void* dev_ptr, void* user_data) -> int {
+        (void)user_data;
+        free(dev_ptr);
+        return 0;
+    };
+
+    // Simulation: no registration needed (pass nullptr for register_cb)
     return perf_collector_.initialize(runtime, num_aicore, device_id,
-                                       alloc_cb, nullptr, nullptr);
+                                       alloc_cb, nullptr, free_cb, nullptr);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {

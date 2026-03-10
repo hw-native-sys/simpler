@@ -20,11 +20,16 @@
 #define __aicore__
 #endif
 
-// dcci (Data Cache Clean and Invalidate) - acquire fence in simulation
-// Hardware dcci invalidates cache to ensure fresh reads from shared memory.
-// In simulation, an acquire fence provides the equivalent ordering guarantee.
+// dcci (Data Cache Clean and Invalidate) - full fence in simulation
+// Hardware dcci has two roles:
+//   - without CACHELINE_OUT: invalidate (read from memory) -> acquire semantics
+//   - with CACHELINE_OUT: write-back/flush (write to memory) -> release semantics
+// On aarch64, acquire-only fences do NOT prevent store-store reordering across the
+// barrier, so using acquire for the flush direction causes a race: the AICPU can
+// observe the COND register FIN signal before perf_buf->count is visible.
+// Using seq_cst (dmb ish / full barrier) covers both directions safely.
 // Use variadic macro to support both 2-arg and 3-arg calls.
-#define dcci(...) std::atomic_thread_fence(std::memory_order_acquire)
+#define dcci(...) std::atomic_thread_fence(std::memory_order_seq_cst)
 
 // Cache coherency constants (no-op in simulation)
 #define ENTIRE_DATA_CACHE 0

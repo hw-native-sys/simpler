@@ -39,6 +39,9 @@ else()
 endif()
 
 # Create shared library
+list(LENGTH HOST_RUNTIME_SOURCES NUM_HOST_RUNTIME_SOURCES)
+message(STATUS "Host runtime: ${NUM_HOST_RUNTIME_SOURCES} source files")
+message(VERBOSE "Host runtime sources: ${HOST_RUNTIME_SOURCES}")
 add_library(host_runtime SHARED ${HOST_RUNTIME_SOURCES})
 
 # C++ standard (applied only to C++ files)
@@ -68,7 +71,7 @@ target_include_directories(host_runtime
         ${ASCEND_HOME_PATH}/pkg_inc
         ${ASCEND_HOME_PATH}/pkg_inc/runtime
         ${ASCEND_HOME_PATH}/pkg_inc/profiling
-        ${ASCEND_HOME_PATH}/aarch64-linux/include/driver
+        ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
 
 target_link_directories(host_runtime
