@@ -158,8 +158,8 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
         sched->fanout_refcount[i].store(0, std::memory_order_relaxed);
     }
 
-    // Initialize ready queues
-    for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
+    // Initialize ready queues (one per resource shape)
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         if (!pto2_ready_queue_init(&sched->ready_queues[i], PTO2_READY_QUEUE_SIZE)) {
             // Cleanup on failure
             for (int j = 0; j < i; j++) {
@@ -194,7 +194,7 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
         sched->fanout_refcount = nullptr;
     }
 
-    for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         pto2_ready_queue_destroy(&sched->ready_queues[i]);
     }
 }
@@ -217,10 +217,10 @@ void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
 void pto2_scheduler_print_queues(PTO2SchedulerState* sched) {
     LOG_INFO("=== Ready Queues ===");
 
-    const char* worker_names[] = {"CUBE", "VECTOR", "AI_CPU", "ACCELERATOR"};
+    const char* shape_names[] = {"AIC_ONLY", "AIV_X1", "AIV_X2", "AIC_AIV_X1", "AIC_AIV_X2"};
 
-    for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
-        LOG_INFO("  %s: count=%" PRIu64, worker_names[i],
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        LOG_INFO("  %s: count=%" PRIu64, shape_names[i],
                  sched->ready_queues[i].size());
     }
 
