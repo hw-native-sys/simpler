@@ -47,6 +47,8 @@ void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t c
     pool->base = base;
     pool->capacity = capacity;
     pool->top = 1;  // Start from 1, 0 means NULL/empty
+    pool->tail = 1; // Match initial top (no reclaimable entries yet)
+    pool->high_water = 0;
 
     // Initialize entry 0 as NULL marker
     pool->base[0].task_id = -1;
@@ -54,9 +56,9 @@ void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t c
 }
 
 int32_t pto2_dep_pool_used(PTO2DepListPool* pool) {
-    return pool->top - 1;
+    return pool->top - pool->tail;
 }
 
 int32_t pto2_dep_pool_available(PTO2DepListPool* pool) {
-    return pool->capacity - pool->top;
+    return pool->capacity - (pool->top - pool->tail);
 }

@@ -79,7 +79,7 @@
 #define PTO2_SCOPE_TASKS_INIT_CAP 65536     // Initial capacity for scope task buffer
 
 // Ready queue
-#define PTO2_READY_QUEUE_SIZE     65536   // Per-worker-type queue size (16x larger to avoid queue full)
+#define PTO2_READY_QUEUE_SIZE     65536   // Per-worker-type queue size
 
 // Memory alignment
 #define PTO2_ALIGN_SIZE           64      // Cache line alignment
@@ -314,6 +314,7 @@ struct PTO2TaskPayload {
     int param_count{0};
     int32_t fanin_tasks[PTO2_MAX_INPUTS];   // Producer task IDs (cold path, used by on_task_release)
     int32_t fanin_actual_count{0};           // Actual fanin count (without the +1 redundance)
+    int32_t dep_pool_mark{0};                // Dep pool top after this task's submission (for reclamation)
 };
 
 // =============================================================================

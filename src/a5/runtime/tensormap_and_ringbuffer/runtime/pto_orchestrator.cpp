@@ -117,9 +117,10 @@ bool pto2_orchestrator_init(
     }
     pto2_dep_pool_init(&orch->dep_pool, dep_entries, dep_pool_capacity);
     orch->dep_pool_cur_entry = nullptr;
+    orch->dep_pool_last_reclaimed = 0;
 
     // Initialize TensorMap
-    if (!orch->tensor_map.init_default()) {
+    if (!orch->tensor_map.init_default(sm_handle->header->task_window_size)) {
         free(dep_entries);
         return false;
     }
@@ -224,6 +225,20 @@ void pto2_submit_task(
 
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
     orch->tensor_map.sync_tensormap();
+
+    // Reclaim dead dep pool entries based on scheduler's last_task_alive
+    {
+        int32_t last_alive = orch->sm_handle->header->last_task_alive.load(std::memory_order_acquire);
+        if (last_alive > orch->dep_pool_last_reclaimed && last_alive > 0) {
+            int32_t newest_consumed = last_alive - 1;
+            int32_t slot_rc = orch->task_ring.get_task_slot(newest_consumed);
+            int32_t mark = orch->sm_handle->task_payloads[slot_rc].dep_pool_mark;
+            if (mark > 0) {
+                orch->dep_pool.advance_tail(mark);
+            }
+            orch->dep_pool_last_reclaimed = last_alive;
+        }
+    }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, -1);
 
@@ -437,6 +452,9 @@ void pto2_submit_task(
 #endif
     }
 
+    // Record dep pool watermark for this task (used by tail reclamation)
+    payload->dep_pool_mark = orch->dep_pool.top;
+
     CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN, task_id);
 
 #if PTO2_PROFILING
@@ -453,6 +471,10 @@ void pto2_submit_task(
 void pto2_orchestrator_done(PTO2OrchestratorState* orch) {
     int32_t total_tasks = orch->task_ring.current_index_ptr->load(std::memory_order_acquire);
     LOG_INFO("=== [Orchestrator] total_tasks=%d ===", total_tasks);
+    LOG_INFO("=== [DepPool] top=%d tail=%d used=%d high_water=%d capacity=%d ===",
+             orch->dep_pool.top, orch->dep_pool.tail,
+             orch->dep_pool.top - orch->dep_pool.tail,
+             orch->dep_pool.high_water, orch->dep_pool.capacity);
     orch->sm_handle->header->orchestrator_done.store(1, std::memory_order_release);
 }
 

@@ -124,7 +124,8 @@ struct PTO2TensorMap {
 
     // Per-task entry tracking (for efficient bucket cleanup)
     PTO2TensorMapEntry** task_entry_head;  // Per-task head offset (-1 = no entries)
-                               // Indexed by task_id % TASK_WINDOW_SIZE
+                               // Indexed by task_id % task_window_size
+    int32_t task_window_size;  // Runtime task window size (for slot masking)
 
     // Validity threshold (for lazy invalidation)
     int32_t last_task_alive;  // Cached value from shared memory
@@ -183,12 +184,12 @@ struct PTO2TensorMap {
      * @param pool_size   Size of entry pool
      * @return true on success, false on allocation failure
      */
-    bool init(int32_t num_buckets, int32_t pool_size);
+    bool init(int32_t num_buckets, int32_t pool_size, int32_t task_window_size);
 
     /**
      * Initialize TensorMap with default sizes
      */
-    bool init_default();
+    bool init_default(int32_t task_window_size);
 
     /**
      * Destroy TensorMap and free resources
@@ -304,7 +305,7 @@ struct PTO2TensorMap {
         entry->prev_in_bucket = nullptr;  // New head has no predecessor
 
         // Link to task's entry list (for cleanup)
-        int32_t task_slot = producer_task_id & (PTO2_TASK_WINDOW_SIZE - 1);
+        int32_t task_slot = producer_task_id & (task_window_size - 1);
         entry->next_in_task = task_entry_head[task_slot];
         entry->prev_in_task = nullptr;  // New head has no predecessor
         // Update old head's prev pointer
@@ -326,7 +327,7 @@ struct PTO2TensorMap {
     void cleanup_retired(int32_t old_last_task_alive, int32_t new_last_task_alive) {
         // Iterate through retired tasks and remove their entries from bucket chains
         for (int32_t task_id = old_last_task_alive; task_id < new_last_task_alive; task_id++) {
-            int32_t task_slot = task_id & (PTO2_TASK_WINDOW_SIZE - 1);
+            int32_t task_slot = task_id & (task_window_size - 1);
             PTO2TensorMapEntry* cur_entry = task_entry_head[task_slot];
 
             while (cur_entry != nullptr) {
@@ -380,7 +381,7 @@ struct PTO2TensorMap {
         // Update predecessor's next pointer (O(1) via prev_in_task)
         if (entry.prev_in_task == nullptr) {
             // Entry is the head of its task chain, update task_entry_head
-            int32_t task_slot = entry.producer_task_id & (PTO2_TASK_WINDOW_SIZE - 1);
+            int32_t task_slot = entry.producer_task_id & (task_window_size - 1);
             task_entry_head[task_slot] = entry.next_in_task;
         } else {
             entry.prev_in_task->next_in_task = entry.next_in_task;

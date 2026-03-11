@@ -421,14 +421,20 @@ static inline PTO2TaskDescriptor* pto2_task_ring_get(PTO2TaskRing* ring, int32_t
 
 /**
  * Dependency list pool structure
- * 
- * Ring buffer for allocating linked list entries.
- * Supports O(1) prepend operation for fanin/fanout lists.
+ *
+ * True ring buffer for allocating linked list entries.
+ * Entries are reclaimed when their producer tasks become CONSUMED,
+ * as tracked by the orchestrator via dep_pool_mark per task.
+ *
+ * Linear counters (top, tail) grow monotonically; the physical index
+ * is obtained via modulo: base[linear_index % capacity].
  */
 struct PTO2DepListPool {
-    PTO2DepListEntry* base;   // Pool base address (from shared memory)
+    PTO2DepListEntry* base;   // Pool base address
     int32_t capacity;         // Total number of entries
-    int32_t top;              // Next allocation position (starts from 1, 0=NULL)
+    int32_t top;              // Linear next-allocation counter (starts from 1)
+    int32_t tail;             // Linear first-alive counter (entries before this are dead)
+    int32_t high_water;       // Peak concurrent usage (top - tail)
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)
@@ -436,12 +442,33 @@ struct PTO2DepListPool {
      * @return Reference to allocated entry
      */
     PTO2DepListEntry& alloc() {
-        int32_t idx = top++;
-        if (idx >= capacity) {
-            top = 2;  // Wrap around (skip entry 0 = NULL marker)
-            idx = 1;
+        int32_t used = top - tail;
+        if (used >= capacity) {
+            LOG_ERROR("========================================");
+            LOG_ERROR("FATAL: Dependency Pool Overflow!");
+            LOG_ERROR("========================================");
+            LOG_ERROR("DepListPool exhausted: %d entries alive (capacity=%d).", used, capacity);
+            LOG_ERROR("  - Pool top:      %d (linear)", top);
+            LOG_ERROR("  - Pool tail:     %d (linear)", tail);
+            LOG_ERROR("  - High water:    %d", high_water);
+            LOG_ERROR("========================================");
+            exit(1);
         }
+        int32_t idx = top % capacity;
+        top++;
+        used++;
+        if (used > high_water) high_water = used;
         return base[idx];
+    }
+
+    /**
+     * Advance the tail pointer, reclaiming dead entries.
+     * Called by the orchestrator based on last_task_alive advancement.
+     */
+    void advance_tail(int32_t new_tail) {
+        if (new_tail > tail) {
+            tail = new_tail;
+        }
     }
 
     /**

@@ -38,7 +38,7 @@ uint64_t g_insert_count = 0;
 // Initialization and Destruction
 // =============================================================================
 
-bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size) {
+bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t new_task_window_size) {
     // Validate power of 2 for fast modulo
     if ((new_num_buckets & (new_num_buckets - 1)) != 0) {
         return false;  // num_buckets must be power of 2
@@ -90,7 +90,7 @@ bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size) {
     }
 
     // Allocate per-task entry tracking
-    task_entry_head = (PTO2TensorMapEntry**)malloc(new_pool_size * sizeof(PTO2TensorMapEntry*));
+    task_entry_head = (PTO2TensorMapEntry**)malloc(new_task_window_size * sizeof(PTO2TensorMapEntry*));
     if (!task_entry_head) {
         free(entry_pool);
         free(buckets);
@@ -102,17 +102,19 @@ bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size) {
     }
 
     // Initialize all task entry heads to -1 (no entries)
-    for (int32_t i = 0; i < PTO2_TASK_WINDOW_SIZE; i++) {
+    for (int32_t i = 0; i < new_task_window_size; i++) {
         task_entry_head[i] = nullptr;
     }
+
+    task_window_size = new_task_window_size;
 
     last_task_alive = 0;
 
     return true;
 }
 
-bool PTO2TensorMap::init_default() {
-    return init(PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE);
+bool PTO2TensorMap::init_default(int32_t new_task_window_size) {
+    return init(PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE, new_task_window_size);
 }
 
 void PTO2TensorMap::destroy() {

@@ -44,6 +44,7 @@ struct PTO2OrchestratorState {
     PTO2TaskRing task_ring;    // Task slot allocation
     PTO2DepListPool dep_pool;  // Dependency list storage (per-orchestrator, no atomics needed)
     PTO2DepListEntry* dep_pool_cur_entry;
+    int32_t dep_pool_last_reclaimed;  // last_task_alive value at last reclamation
 
     // === TENSOR MAP (Private) ===
     PTO2TensorMap tensor_map;        // Producer lookup

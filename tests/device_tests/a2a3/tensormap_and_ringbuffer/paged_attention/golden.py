@@ -23,7 +23,7 @@ ALL_CASES = {
         "dtype": "bfloat16",
     },
     "Case2": {
-        "batch": 64,
+        "batch": 256,
         "num_heads": 64,
         "kv_head_num": 1,
         "head_dim": 128,
