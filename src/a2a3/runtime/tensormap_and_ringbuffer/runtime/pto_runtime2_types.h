@@ -21,6 +21,7 @@
 
 #include "pto_types.h"
 #include "pto_submit_types.h"
+#include "pto2_dispatch_payload.h"
 
 // =============================================================================
 // Profiling Configuration
@@ -317,6 +318,7 @@ struct PTO2TaskDescriptor {
  * for the scheduler's hot completion path (~80 bytes vs ~2912 bytes).
  */
 struct PTO2TaskPayload {
+    PTO2DispatchPayload dispatch;  // function_bin_addr + args[], built in-place at dispatch time
     Tensor tensors[16];
     uint64_t scalar_value[16];
     bool is_tensor[16];
