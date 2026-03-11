@@ -9,7 +9,7 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  run-example-on-sim:
+  run-example-on-a2a3sim:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -56,8 +56,58 @@ jobs:
           pip install pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
-      - name: Run simulation examples
+      - name: Run simulation examples (a2a3sim)
         run: ./ci.sh -p a2a3sim -c 1b22fea -t 600
+
+  run-example-on-a5sim:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10']
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up C++ compiler
+        run: |
+          if [[ "${{ runner.os }}" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+            if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
+          else
+            brew install gcc@15 || brew install gcc
+            if command -v g++-15; then
+              echo "CXX=g++-15" >> $GITHUB_ENV
+            else
+              echo "CXX=g++" >> $GITHUB_ENV
+            fi
+          fi
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install numpy
+          pip install ml_dtypes
+          pip install pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run simulation examples (a5sim)
+        run: ./ci.sh -p a5sim -c 1b22fea -t 600
 
   run-example-on-device:
     runs-on: self-hosted
