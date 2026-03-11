@@ -24,6 +24,13 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
 __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int core_idx, CoreType core_type) {
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[core_idx]);
 
+    // In multi-round execution the DeviceRunner singleton keeps AICore threads alive
+    // across rounds. DATA_MAIN_BASE still holds the EXIT_SIGNAL from the previous
+    // round, so clear it before the handshake wait. Clearing after the wait would
+    // race with AICPU, which may finish all tasks and write a new EXIT_SIGNAL while
+    // this thread is descheduled between the wait and the clear.
+    write_reg(RegId::DATA_MAIN_BASE, 0);
+
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {
         dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
