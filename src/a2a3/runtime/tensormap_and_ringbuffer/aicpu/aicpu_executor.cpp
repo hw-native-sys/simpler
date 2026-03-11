@@ -707,6 +707,23 @@ void AicpuExecutor::reassign_cores_for_all_threads() {
         }
     }
 
+    // Restore a single core's running/idle state into its new thread's tracker
+    auto reassign_core = [&](int32_t worker_id, CoreTypeTracker& type_tracker,
+                             CoreStateTracker& tracker, int32_t thread_idx) {
+        core_assignments_[thread_idx][core_count_per_thread_[thread_idx]++] = worker_id;
+        for (int32_t j = 0; j < running_count; j++) {
+            if (running_cores[j] == worker_id) {
+                type_tracker.running[type_tracker.running_count++] = worker_id;
+                executing_task_ids_[thread_idx][worker_id] = running_task_ids[j];
+                return;
+            }
+        }
+        if (was_idle[worker_id]) {
+            type_tracker.idle[type_tracker.idle_count++] = worker_id;
+            tracker.core_idle[worker_id] = true;
+        }
+    };
+
     // Assign whole clusters round-robin across all threads
     for (int32_t ci = 0; ci < aic_count_; ci++) {
         int32_t t = ci % thread_num_;
@@ -718,53 +735,9 @@ void AicpuExecutor::reassign_cores_for_all_threads() {
 
         tracker.clusters[tracker.cluster_count++] = {aic_wid, {aiv0_wid, aiv1_wid}};
 
-        // Assign AIC core
-        core_assignments_[t][core_count_per_thread_[t]++] = aic_wid;
-        bool aic_is_running = false;
-        for (int32_t j = 0; j < running_count; j++) {
-            if (running_cores[j] == aic_wid) {
-                tracker.aic().running[tracker.aic().running_count++] = aic_wid;
-                executing_task_ids_[t][aic_wid] = running_task_ids[j];
-                aic_is_running = true;
-                break;
-            }
-        }
-        if (!aic_is_running && was_idle[aic_wid]) {
-            tracker.aic().idle[tracker.aic().idle_count++] = aic_wid;
-            tracker.core_idle[aic_wid] = true;
-        }
-
-        // Assign AIV0 core
-        core_assignments_[t][core_count_per_thread_[t]++] = aiv0_wid;
-        bool aiv0_is_running = false;
-        for (int32_t j = 0; j < running_count; j++) {
-            if (running_cores[j] == aiv0_wid) {
-                tracker.aiv().running[tracker.aiv().running_count++] = aiv0_wid;
-                executing_task_ids_[t][aiv0_wid] = running_task_ids[j];
-                aiv0_is_running = true;
-                break;
-            }
-        }
-        if (!aiv0_is_running && was_idle[aiv0_wid]) {
-            tracker.aiv().idle[tracker.aiv().idle_count++] = aiv0_wid;
-            tracker.core_idle[aiv0_wid] = true;
-        }
-
-        // Assign AIV1 core
-        core_assignments_[t][core_count_per_thread_[t]++] = aiv1_wid;
-        bool aiv1_is_running = false;
-        for (int32_t j = 0; j < running_count; j++) {
-            if (running_cores[j] == aiv1_wid) {
-                tracker.aiv().running[tracker.aiv().running_count++] = aiv1_wid;
-                executing_task_ids_[t][aiv1_wid] = running_task_ids[j];
-                aiv1_is_running = true;
-                break;
-            }
-        }
-        if (!aiv1_is_running && was_idle[aiv1_wid]) {
-            tracker.aiv().idle[tracker.aiv().idle_count++] = aiv1_wid;
-            tracker.core_idle[aiv1_wid] = true;
-        }
+        reassign_core(aic_wid, tracker.aic(), tracker, t);
+        reassign_core(aiv0_wid, tracker.aiv(), tracker, t);
+        reassign_core(aiv1_wid, tracker.aiv(), tracker, t);
     }
 
     // Log final distribution for verification
