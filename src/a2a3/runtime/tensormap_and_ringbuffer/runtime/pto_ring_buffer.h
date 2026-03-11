@@ -358,7 +358,7 @@ struct PTO2TaskRing {
         if (active_count < window_size - 1) {
             int32_t slot = task_id & (window_size - 1);
             PTO2TaskDescriptor* task = &descriptors[slot];
-            task->task_id = task_id;
+            task->mixed_task_id = task_id;
             return task_id;
         }
 

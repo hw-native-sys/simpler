@@ -20,6 +20,7 @@
 #include <stddef.h>
 
 #include "pto_types.h"
+#include "pto_submit_types.h"
 
 // =============================================================================
 // Profiling Configuration
@@ -79,7 +80,7 @@
 #define PTO2_SCOPE_TASKS_INIT_CAP 65536     // Initial capacity for scope task buffer
 
 // Ready queue
-#define PTO2_READY_QUEUE_SIZE     65536   // Per-worker-type queue size (16x larger to avoid queue full)
+#define PTO2_READY_QUEUE_SIZE     65536   // Per-shape queue size (16x larger to avoid queue full)
 
 // Memory alignment
 #define PTO2_ALIGN_SIZE           64      // Cache line alignment
@@ -282,13 +283,21 @@ struct PTO2DepListEntry {
  * - Other fields set by Orchestrator, read by Scheduler
  */
 struct PTO2TaskDescriptor {
-    // Task identification
-    int32_t task_id;              // Unique task identifier (absolute, not wrapped)
-    int32_t kernel_id;            // InCore function to execute
-    int32_t worker_type;          // Target: CUBE, VECTOR, AI_CPU, ACCELERATOR
+    // Mixed-task identification
+    int32_t mixed_task_id;            // Canonical mixed-task ID
+
+    // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
+    int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
+
+    // Active subtask mask: bit0=AIC, bit1=AIV0, bit2=AIV1
+    uint8_t active_mask;
+
+    // Completion aggregation: each subtask sets its done bit atomically
+    std::atomic<uint8_t> subtask_done_mask;
+
     // Dependency lists (linked list heads - offsets into DepListPool)
     // Fanin: producers this task depends on (set once at submission)
-    int32_t fanin_count;          // Number of producer dependencies
+    int32_t fanin_count;              // Number of producer dependencies
 
     // Fanout: consumers that depend on this task (grows as consumers submit)
     // PROTECTED BY fanout_lock
