@@ -880,7 +880,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     constexpr int LOCAL_READY_CAP_PER_TYPE = 64;
     int32_t local_aic_ids[LOCAL_READY_CAP_PER_TYPE];
     int32_t local_aiv_ids[LOCAL_READY_CAP_PER_TYPE];
-    PTO2LocalReadyBuffer local_bufs[2];  // [0]=AIC, [1]=AIV
+    PTO2LocalReadyBuffer local_bufs[PTO2_LOCAL_DISPATCH_TYPE_NUM];  // [0]=AIC, [1]=AIV
     local_bufs[0].reset(local_aic_ids, LOCAL_READY_CAP_PER_TYPE);
     local_bufs[1].reset(local_aiv_ids, LOCAL_READY_CAP_PER_TYPE);
     int32_t deferred_release_ids[128];

@@ -56,6 +56,9 @@ struct PTO2ReadyQueueSlot {
  * dispatch_ready_tasks_to_idle_cores drains them: local-first via
  * get_ready_task, then remaining tasks pushed to global readyQ.
  */
+// Number of CoreType values eligible for local dispatch (AIC=0, AIV=1)
+static constexpr int PTO2_LOCAL_DISPATCH_TYPE_NUM = 2;
+
 struct PTO2LocalReadyBuffer {
     int32_t* task_ids = nullptr;  // Points to caller's stack array
     int count = 0;
@@ -439,7 +442,7 @@ struct PTO2SchedulerState {
         if (new_refcount == task->fanin_count) {
             // Local-first: try per-CoreType thread-local buffer before global queue
             bool pushed_local = false;
-            if (local_bufs && task->worker_type < 2) {
+            if (local_bufs && task->worker_type >= 0 && task->worker_type < PTO2_LOCAL_DISPATCH_TYPE_NUM) {
                 pushed_local = local_bufs[task->worker_type].try_push(task_id);
             }
             if (!pushed_local) {
@@ -466,7 +469,7 @@ struct PTO2SchedulerState {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
                 // Local-first: try per-CoreType thread-local buffer before global queue
                 bool pushed_local = false;
-                if (local_bufs && task->worker_type < 2) {
+                if (local_bufs && task->worker_type >= 0 && task->worker_type < PTO2_LOCAL_DISPATCH_TYPE_NUM) {
                     pushed_local = local_bufs[task->worker_type].try_push(task_id);
                 }
                 if (!pushed_local) {
