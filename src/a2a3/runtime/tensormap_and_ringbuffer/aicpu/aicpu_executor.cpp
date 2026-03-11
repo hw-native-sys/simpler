@@ -38,7 +38,7 @@
 #include "common/platform_config.h"
 #include "aicpu/platform_regs.h"
 
-#define DISCARD_THREAD_NUM 1
+#define DISCARD_THREAD_NUM 2
 
 // Core type definitions
 #include "common/core_type.h"
@@ -1354,10 +1354,12 @@ static inline int32_t _popcount_u64(uint64_t v) {
 
 void AicpuExecutor::apply_simpler_aicpu_affinity(int32_t thread_idx) {
     // Only enable this policy for the requested scenario:
-    // - total 5 AICPU threads
+    // - total 6 AICPU threads
     // - exactly 2 CPU clusters (0..3, 4..7)
-    // - 3 scheduler threads + 1 orchestrator threads + 1 discarded thread (so we can drop 1 and still have 1 orch + 3 sched active)
-    //if (thread_num_ != 5 || sched_thread_num_ != 3 || orch_thread_num_ != 2) return;
+    // - 3 scheduler threads + 1 orchestrator thread + 2 discarded threads (4 active, 2 dropped)
+    if (thread_num_ != 6 || sched_thread_num_ != 3 || orch_thread_num_ != 1) {
+        return;
+    }
 
     constexpr int32_t AICPU_CORES_PER_CHIP = 8;  // 2 clusters * 4 cores
 
@@ -1405,68 +1407,82 @@ void AicpuExecutor::apply_simpler_aicpu_affinity(int32_t thread_idx) {
 
         DEV_INFO("AICPU affinity(simpler): major=%d(cnt=%d) minor=%d(cnt=%d)", major_id, major_cnt, minor_id, minor_cnt);
 
-        for (int32_t tid = 0; tid < thread_num_; ++tid) thread_role_[tid] = ThreadRole::DROP;
+        for (int32_t tid = 0; tid < thread_num_; ++tid) {
+            thread_role_[tid] = ThreadRole::DROP;
+        }
 
         // Helpers: identify sched/orch tid ranges.
         auto is_sched_tid = [&](int32_t tid) { return tid >= 0 && tid < sched_thread_num_; };
         auto is_orch_tid  = [&](int32_t tid) { return tid >= sched_thread_num_ && tid < thread_num_; };
 
-        // Ensure 3 scheduler threads are SCHED (prefer those in major cluster).
+        // 6-thread scenario: require a strict 4+2 distribution between the two clusters.
+        // The 4-thread major cluster will host 3 scheduler threads + 1 orchestrator thread.
+        // The 2-thread minor cluster will host 2 DROP threads.
+        if (!(major_cnt == 4 && minor_cnt == 2)) {
+            // 例如 3+3 等情况，直接报错并禁用绑核策略。
+            DEV_ERROR("AICPU affinity(simpler): unsupported topology for 6 threads, "
+                      "expected 4+2 distribution but got major=%d minor=%d",
+                      major_cnt, minor_cnt);
+            affinity_sched_cpuoff_.store(-2, std::memory_order_release);
+            affinity_orch_cpuoff_.store(-2, std::memory_order_release);
+            // 回退到默认角色：前 3 个 tid 作为 SCHED，第一个 orch tid 作为 ORCH，其余 DROP。
+            for (int32_t tid = 0; tid < sched_thread_num_; ++tid) {
+                thread_role_[tid] = ThreadRole::SCHED;
+            }
+            int32_t default_orch = (sched_thread_num_ < thread_num_) ? sched_thread_num_ : -1;
+            if (default_orch >= 0) {
+                thread_role_[default_orch] = ThreadRole::ORCH;
+            }
+            roles_ready_.store(1, std::memory_order_release);
+            return;
+        }
+
+        // 1) 先确保 3 个 scheduler 线程存在并标记为 SCHED（优先在 major cluster 内）。
         for (int32_t i = 0; i < clusters[major_id].count; ++i) {
             int32_t tid = clusters[major_id].tids[i];
-            if (is_sched_tid(tid)) thread_role_[tid] = ThreadRole::SCHED;
+            if (is_sched_tid(tid)) {
+                thread_role_[tid] = ThreadRole::SCHED;
+            }
         }
         for (int32_t tid = 0; tid < sched_thread_num_; ++tid) {
-            // If any sched tid not in major, keep it SCHED but warn (this violates the intended mapping).
             if (thread_role_[tid] != ThreadRole::SCHED) {
                 DEV_WARN("AICPU affinity(simpler): sched tid %d not in major cluster, forcing SCHED", tid);
                 thread_role_[tid] = ThreadRole::SCHED;
             }
         }
 
-        // Pick ORCH and DROP among the 2 orchestrator threads according to 4+1 / 3+2.
+        // 2) 在 major cluster 中选择一个 orch tid，绑定到同一个 cluster。
         int32_t orch_tid = -1;
-        int32_t drop_tid = -1;
-
-        // Collect orch tids in each cluster.
-        int32_t orch_in_major[2]; int32_t n_om = 0;
-        int32_t orch_in_minor[2]; int32_t n_on = 0;
         for (int32_t i = 0; i < clusters[major_id].count; ++i) {
             int32_t tid = clusters[major_id].tids[i];
-            if (is_orch_tid(tid)) orch_in_major[n_om++] = tid;
+            if (is_orch_tid(tid)) {
+                orch_tid = tid;
+                break;
+            }
         }
-        for (int32_t i = 0; i < clusters[minor_id].count; ++i) {
-            int32_t tid = clusters[minor_id].tids[i];
-            if (is_orch_tid(tid)) orch_in_minor[n_on++] = tid;
-        }
-
-        if (major_cnt == 4 && minor_cnt == 1) {
-            // 4+1: ORCH+3SCHED in major; the lone thread in minor is dropped.
-            orch_tid = (n_om > 0) ? orch_in_major[0] : (sched_thread_num_);  // fallback to first orch tid
-            drop_tid = clusters[minor_id].tids[0];
-            affinity_sched_cpuoff_.store(major_id * CPUS_PER_CLUSTER, std::memory_order_release);
-            affinity_orch_cpuoff_.store(major_id * CPUS_PER_CLUSTER, std::memory_order_release);
-        } else if (major_cnt == 3 && minor_cnt == 2) {
-            // 3+2: 3 sched in major; pick one orch in minor; other in minor dropped.
-            orch_tid = (n_on > 0) ? orch_in_minor[0] : (sched_thread_num_);  // fallback
-            // drop: prefer other orch tid in minor, else second minor tid
-            if (n_on > 1) drop_tid = orch_in_minor[1];
-            else drop_tid = (clusters[minor_id].count > 1) ? clusters[minor_id].tids[1] : -1;
-            affinity_sched_cpuoff_.store(major_id * CPUS_PER_CLUSTER, std::memory_order_release);
-            affinity_orch_cpuoff_.store(minor_id * CPUS_PER_CLUSTER, std::memory_order_release);
-        } else {
-            DEV_WARN("AICPU affinity(simpler): unexpected distribution, disabling bind");
+        if (orch_tid < 0) {
+            DEV_ERROR("AICPU affinity(simpler): no ORCH candidate found in major cluster for 6-thread 4+2 topology");
             affinity_sched_cpuoff_.store(-2, std::memory_order_release);
             affinity_orch_cpuoff_.store(-2, std::memory_order_release);
+            // 即使没有找到合适的 orch tid，也保证至少有一个 ORCH 角色以避免死锁。
+            int32_t fallback_orch = (sched_thread_num_ < thread_num_) ? sched_thread_num_ : -1;
+            if (fallback_orch >= 0) {
+                thread_role_[fallback_orch] = ThreadRole::ORCH;
+            }
+            roles_ready_.store(1, std::memory_order_release);
+            return;
         }
+        thread_role_[orch_tid] = ThreadRole::ORCH;
 
-        if (orch_tid >= 0 && orch_tid < thread_num_) thread_role_[orch_tid] = ThreadRole::ORCH;
-        if (drop_tid >= 0 && drop_tid < thread_num_) thread_role_[drop_tid] = ThreadRole::DROP;
+        // 3) minor cluster 中的两个线程保持为 DROP。
+        // 4) 将调度线程和 ORCH 线程都“逻辑上”绑定到 major cluster。
+        affinity_sched_cpuoff_.store(major_id * CPUS_PER_CLUSTER, std::memory_order_release);
+        affinity_orch_cpuoff_.store(major_id * CPUS_PER_CLUSTER, std::memory_order_release);
 
-        DEV_INFO("AICPU affinity(simpler): roles orch_tid=%d drop_tid=%d sched_cpuoff=%d orch_cpuoff=%d",
-                 orch_tid, drop_tid,
-                 affinity_sched_cpuoff_.load(std::memory_order_relaxed),
-                 affinity_orch_cpuoff_.load(std::memory_order_relaxed));
+        DEV_INFO("AICPU affinity(simpler): 6-thread 4+2 topology selected, "
+                 "major=%d(cnt=%d) minor=%d(cnt=%d) orch_tid=%d sched_cpuoff=%d",
+                 major_id, major_cnt, minor_id, minor_cnt,
+                 orch_tid, affinity_sched_cpuoff_.load(std::memory_order_relaxed));
 
         roles_ready_.store(1, std::memory_order_release);
     }

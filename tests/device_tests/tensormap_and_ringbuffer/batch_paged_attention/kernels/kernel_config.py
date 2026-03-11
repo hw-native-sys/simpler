@@ -38,10 +38,10 @@ KERNELS = [
 # Runtime configuration
 RUNTIME_CONFIG = {
     "runtime": "tensormap_and_ringbuffer",
-    # Affinity test: launch 5 AICPU threads total.
-    # Scheduler threads are fixed at 3, orchestration threads at 1.the left 1 is dropped
-    # Runtime will drop one thread based on 4+1 / 3+2 cluster distribution.
-    "aicpu_thread_num": 5,
+    # Affinity test: launch 6 AICPU threads total.
+    # Scheduler threads are fixed at 3, orchestration threads at 1. the left 2 are dropped
+    # Runtime will drop two threads based on 4+2 cluster distribution (must not be 3+3).
+    "aicpu_thread_num": 6,
     "orch_thread_num": 1,
     "block_dim": 24,
 }
