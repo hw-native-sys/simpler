@@ -38,7 +38,7 @@
 #include "common/platform_config.h"
 #include "aicpu/platform_regs.h"
 
-#define DISCARD_THREAD_NUM 1
+#define DISCARD_THREAD_NUM 3
 
 // Core type definitions
 #include "common/core_type.h"

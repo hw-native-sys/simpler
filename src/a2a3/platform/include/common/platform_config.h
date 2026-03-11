@@ -50,7 +50,7 @@ constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
  *   threads to be dropped from scheduling but still participate in
  *   affinity / OS-level behavior.
  */
-constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 5;
+constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 7;
 
 // =============================================================================
 // Derived Platform Limits

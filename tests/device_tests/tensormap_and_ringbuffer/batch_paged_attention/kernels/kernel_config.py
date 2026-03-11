@@ -41,7 +41,7 @@ RUNTIME_CONFIG = {
     # Affinity test: launch 5 AICPU threads total.
     # Scheduler threads are fixed at 3, orchestration threads at 1.the left 1 is dropped
     # Runtime will drop one thread based on 4+1 / 3+2 cluster distribution.
-    "aicpu_thread_num": 5,
+    "aicpu_thread_num": 7,
     "orch_thread_num": 1,
     "block_dim": 24,
 }
