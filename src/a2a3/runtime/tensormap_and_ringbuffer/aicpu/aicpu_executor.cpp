@@ -605,9 +605,27 @@ void AicpuExecutor::assign_cores_to_threads() {
  * Writes into new_core_assignments_ / new_core_count_per_thread_.
  */
 void AicpuExecutor::reassign_cores_for_all_threads() {
-    // Calculate how many AIC/AIV each thread should have
+    // Calculate how many AIC/AIV each active (non-DROP) thread should have.
+    // After orchestration completes, all SCHED + ORCH threads become schedulers.
 
-    DEV_INFO("Reassigning cores for all %d threads: %d AIC, %d AIV", thread_num_, aic_count_, aiv_count_);
+    // Build list of active threads (exclude DROP threads).
+    int32_t active_tids[MAX_AICPU_THREADS];
+    int32_t active_count = 0;
+    for (int32_t t = 0; t < thread_num_; ++t) {
+        if (thread_role_[t] != ThreadRole::DROP) {
+            active_tids[active_count++] = t;
+        } else {
+            core_count_per_thread_[t] = 0;
+        }
+    }
+
+    if (active_count == 0) {
+        DEV_ERROR("reassign_cores_for_all_threads: no active threads (all DROP)");
+        return;
+    }
+
+    DEV_INFO("Reassigning cores for %d active threads (total=%d): %d AIC, %d AIV",
+             active_count, thread_num_, aic_count_, aiv_count_);
 
     int32_t aic_running_cores[128];
     int32_t aic_running_task_ids[128];
@@ -650,7 +668,7 @@ void AicpuExecutor::reassign_cores_for_all_threads() {
         }
     }
     for (int32_t i = 0; i < aic_count_; i++) {
-        int32_t thread_idx = i % thread_num_;
+        int32_t thread_idx = active_tids[i % active_count];
         int32_t core_id = aic_cores_[i].worker_id;
         core_assignments_[thread_idx][core_count_per_thread_[thread_idx]++] = core_id;
         bool found = false;
@@ -672,7 +690,7 @@ void AicpuExecutor::reassign_cores_for_all_threads() {
         }
     }
     for (int32_t i = 0; i < aiv_count_; i++) {
-        int32_t thread_idx = i % thread_num_;
+        int32_t thread_idx = active_tids[i % active_count];
         int32_t core_id = aiv_cores_[i].worker_id;
         core_assignments_[thread_idx][core_count_per_thread_[thread_idx]++] = core_id;
         bool found = false;
@@ -697,10 +715,11 @@ void AicpuExecutor::reassign_cores_for_all_threads() {
     // Log final distribution for verification
     DEV_INFO("Core reassignment complete:");
     for (int32_t t = 0; t < thread_num_; t++) {
-        DEV_INFO("  Thread %d: %d cores (AIC: running=%d idle=%d, AIV: running=%d idle=%d)",
+        DEV_INFO("  Thread %d: %d cores (AIC: running=%d idle=%d, AIV: running=%d idle=%d, role=%d)",
                  t, core_count_per_thread_[t],
                  trackers_[t].aic().running_count, trackers_[t].aic().idle_count,
-                 trackers_[t].aiv().running_count, trackers_[t].aiv().idle_count);
+                 trackers_[t].aiv().running_count, trackers_[t].aiv().idle_count,
+                 static_cast<int32_t>(thread_role_[t]));
     }
 }
 
