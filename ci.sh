@@ -200,8 +200,10 @@ DEVICE_TESTS_DIR="tests/device_tests"
 
 declare -a HW_TASK_NAMES=()
 declare -a HW_TASK_DIRS=()
+declare -a HW_TASK_PLATS=()
 declare -a SIM_TASK_NAMES=()
 declare -a SIM_TASK_DIRS=()
+declare -a SIM_TASK_PLATS=()
 
 # Discover examples
 while IFS= read -r -d '' example_dir; do
@@ -211,15 +213,21 @@ while IFS= read -r -d '' example_dir; do
     [[ -f "$kernel_config" && -f "$golden" ]] || continue
 
     example_name="${example_dir#$EXAMPLES_DIR/}"
-    example_runtime="${example_name%%/*}"  # Extract runtime from path
+    example_arch="${example_name%%/*}"  # Extract arch (a2a3/a5) from path
+    example_rest="${example_name#*/}"
+    example_runtime="${example_rest%%/*}"  # Extract runtime from path
 
     # Filter by runtime if specified
-    if [[ -n "$RUNTIME" && "$example_name" != "$RUNTIME"/* ]]; then
+    if [[ -n "$RUNTIME" && "$example_runtime" != "$RUNTIME" ]]; then
         continue
     fi
 
-    # Filter by platform's supported runtimes
+    # Filter by platform's arch and supported runtimes
     if [[ -n "$PLATFORM" ]]; then
+        platform_base="${PLATFORM%sim}"
+        if [[ "$example_arch" != "$platform_base" ]]; then
+            continue  # Skip examples not matching platform arch
+        fi
         platform_runtimes="$(get_platform_runtimes "$PLATFORM")"
         if [[ ! " $platform_runtimes " =~ " $example_runtime " ]]; then
             continue  # Skip unsupported runtime for this platform
@@ -230,18 +238,23 @@ while IFS= read -r -d '' example_dir; do
         if [[ "$PLATFORM" =~ sim$ ]]; then
             SIM_TASK_NAMES+=("example:${example_name}")
             SIM_TASK_DIRS+=("${example_dir}")
+            SIM_TASK_PLATS+=("${PLATFORM}")
         else
             HW_TASK_NAMES+=("example:${example_name}")
             HW_TASK_DIRS+=("${example_dir}")
+            HW_TASK_PLATS+=("${PLATFORM}")
         fi
     elif [[ "$OS" == "Darwin" ]]; then
         SIM_TASK_NAMES+=("example:${example_name}")
         SIM_TASK_DIRS+=("${example_dir}")
+        SIM_TASK_PLATS+=("${example_arch}sim")
     else
         HW_TASK_NAMES+=("example:${example_name}")
         HW_TASK_DIRS+=("${example_dir}")
+        HW_TASK_PLATS+=("${example_arch}")
         SIM_TASK_NAMES+=("example:${example_name}")
         SIM_TASK_DIRS+=("${example_dir}")
+        SIM_TASK_PLATS+=("${example_arch}sim")
     fi
 done < <(find "$EXAMPLES_DIR" -mindepth 1 -type d -print0 | sort -z)
 
@@ -257,15 +270,21 @@ if [[ -d "$DEVICE_TESTS_DIR" ]]; then
             golden="${test_dir}/golden.py"
             [[ -f "$kernel_config" && -f "$golden" ]] || continue
             test_name="${test_dir#$DEVICE_TESTS_DIR/}"
-            test_runtime="${test_name%%/*}"  # Extract runtime from path
+            test_arch="${test_name%%/*}"  # Extract arch (a2a3/a5) from path
+            test_rest="${test_name#*/}"
+            test_runtime="${test_rest%%/*}"  # Extract runtime from path
 
             # Filter by runtime if specified
-            if [[ -n "$RUNTIME" && "$test_name" != "$RUNTIME"/* ]]; then
+            if [[ -n "$RUNTIME" && "$test_runtime" != "$RUNTIME" ]]; then
                 continue
             fi
 
-            # Filter by platform's supported runtimes
+            # Filter by platform's arch and supported runtimes
             if [[ -n "$PLATFORM" ]]; then
+                platform_base="${PLATFORM%sim}"
+                if [[ "$test_arch" != "$platform_base" ]]; then
+                    continue  # Skip tests not matching platform arch
+                fi
                 platform_runtimes="$(get_platform_runtimes "$PLATFORM")"
                 if [[ ! " $platform_runtimes " =~ " $test_runtime " ]]; then
                     continue  # Skip unsupported runtime for this platform
@@ -274,6 +293,7 @@ if [[ -d "$DEVICE_TESTS_DIR" ]]; then
 
             HW_TASK_NAMES+=("device_test:${test_name}")
             HW_TASK_DIRS+=("${test_dir}")
+            HW_TASK_PLATS+=("${PLATFORM:-${test_arch}}")
         done < <(find "$DEVICE_TESTS_DIR" -mindepth 1 -type d -print0 | sort -z)
     else
         echo "Skipping device tests (hardware platforms only)"
@@ -282,10 +302,6 @@ fi
 
 echo "Discovered ${#HW_TASK_NAMES[@]} hardware tasks, ${#SIM_TASK_NAMES[@]} simulation tasks"
 
-# Determine platforms for execution
-HW_PLATFORM="${PLATFORM:-a2a3}"
-SIM_PLATFORM="${PLATFORM:-a2a3sim}"
-
 MAX_RETRIES=3
 
 # ---- Unified task runner ----
@@ -293,7 +309,7 @@ MAX_RETRIES=3
 # Log naming: ${safe_name}_${platform}_attempt${attempt}.log
 # Result format: name|platform|PASS/FAIL|device:X|attempt:N|Xs
 run_task() {
-    local name="$1" dir="$2" platform="$3" attempt="$4" device_id="$5"
+    local name="$1" dir="$2" platform="$3" attempt="$4" device_id="$5" print_log_on_fail="${6:-true}"
     local safe_name="${name//[:\/]/_}"
     local task_log="${LOG_DIR}/${safe_name}_${platform}_attempt${attempt}.log"
     local start_time=$SECONDS
@@ -319,9 +335,11 @@ run_task() {
     else
         status="FAIL"
         echo "[${platform}${device_id:+:dev${device_id}}] FAIL: $name (${elapsed}s)"
-        echo "--- LOG: $name (attempt $attempt) ---"
-        cat "$task_log"
-        echo "--- END ---"
+        if [[ "$print_log_on_fail" == "true" ]]; then
+            echo "--- LOG: $name (attempt $attempt) ---"
+            cat "$task_log"
+            echo "--- END ---"
+        fi
     fi
     echo "${name}|${platform}|${status}|device:${device_id:-sim}|attempt:${attempt}|${elapsed}s" \
         >> "$RESULTS_FILE"
@@ -348,7 +366,7 @@ run_sim_tasks() {
         local -a pids=()
         for idx in "${indices[@]}"; do
             (
-                if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" "$SIM_PLATFORM" "$attempt"; then
+                if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" "${SIM_TASK_PLATS[$idx]}" "$attempt"; then
                     echo "${idx}|PASS" >> "$sim_marker"
                 else
                     echo "${idx}|FAIL" >> "$sim_marker"
@@ -359,7 +377,7 @@ run_sim_tasks() {
         for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
     else
         for idx in "${indices[@]}"; do
-            if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" "$SIM_PLATFORM" "$attempt"; then
+            if run_task "${SIM_TASK_NAMES[$idx]}" "${SIM_TASK_DIRS[$idx]}" "${SIM_TASK_PLATS[$idx]}" "$attempt"; then
                 echo "${idx}|PASS" >> "$sim_marker"
             else
                 echo "${idx}|FAIL" >> "$sim_marker"
@@ -406,7 +424,7 @@ run_hw_tasks() {
 
                 IFS=':' read -r idx attempt <<< "$entry"
 
-                if run_task "${HW_TASK_NAMES[$idx]}" "${HW_TASK_DIRS[$idx]}" "$HW_PLATFORM" "$attempt" "$device_id"; then
+                if run_task "${HW_TASK_NAMES[$idx]}" "${HW_TASK_DIRS[$idx]}" "${HW_TASK_PLATS[$idx]}" "$attempt" "$device_id" "false"; then
                     echo "${idx}|PASS" >> "$hw_marker"
                 else
                     next=$((attempt + 1))
@@ -414,9 +432,14 @@ run_hw_tasks() {
                         flock "$lock" bash -c "echo '${idx}:${next}' >> \"$queue\""
                     else
                         echo "${idx}|FAIL" >> "$hw_marker"
+                        local safe_name="${HW_TASK_NAMES[$idx]//[:\/]/_}"
+                        local last_log="${LOG_DIR}/${safe_name}_${HW_TASK_PLATS[$idx]}_attempt${attempt}.log"
+                        echo "--- LOG: ${HW_TASK_NAMES[$idx]} (attempt $attempt) ---"
+                        cat "$last_log"
+                        echo "--- END ---"
+                        echo "[${HW_TASK_PLATS[$idx]}:dev${device_id}] Device quarantined after exhausting retries"
+                        break
                     fi
-                    echo "[${HW_PLATFORM}:dev${device_id}] Device quarantined after failure"
-                    break
                 fi
             done
         ) &
@@ -606,7 +629,7 @@ for i in "${!TASK_ORDER[@]}"; do
 
     platform="${FINAL_PLATFORM[$i]}"
     device="${FINAL_DEVICE[$i]}"
-    attempt="${FINAL_ATTEMPT[$i]}"
+    attempt=$(( FINAL_ATTEMPT[$i] + 1 ))
     timing="${FINAL_TIMING[$i]}"
 
     if [[ "$result" == "FAIL" ]]; then
