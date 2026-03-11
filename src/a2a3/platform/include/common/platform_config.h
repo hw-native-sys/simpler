@@ -35,11 +35,22 @@ constexpr int PLATFORM_AIC_CORES_PER_BLOCKDIM = 1;
 constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
 
 /**
- * Maximum AICPU scheduling threads
- * Determines parallelism level of the AICPU task scheduler.
+ * Maximum AICPU scheduling threads (logical)
+ * - Used by runtime scheduler, ready queue sharding and profiling.
+ * - Represents the maximum number of threads that actively participate
+ *   in task scheduling and phase profiling.
  */
-//constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
-constexpr int PLATFORM_MAX_AICPU_THREADS = 5;
+constexpr int PLATFORM_MAX_AICPU_THREADS = 4;
+
+/**
+ * Maximum AICPU launch threads (physical)
+ * - Upper bound for the number of AICPU threads that can be launched
+ *   by Host / AICPU kernels.
+ * - Can be larger than PLATFORM_MAX_AICPU_THREADS to allow one or more
+ *   threads to be dropped from scheduling but still participate in
+ *   affinity / OS-level behavior.
+ */
+constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 5;
 
 // =============================================================================
 // Derived Platform Limits

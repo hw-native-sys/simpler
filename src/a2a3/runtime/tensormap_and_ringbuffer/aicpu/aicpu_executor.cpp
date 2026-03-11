@@ -60,7 +60,11 @@ typedef void (*DeviceOrchestrationFunc)(PTO2Runtime* rt, uint64_t* args, int32_t
 // Config function exported by orchestration .so
 typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(uint64_t* args, int32_t arg_count);
 
-constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
+// Maximum number of physical AICPU threads that can enter this executor.
+// This may be larger than PLATFORM_MAX_AICPU_THREADS (logical scheduler
+// threads) to allow one or more threads to be dropped from scheduling while
+// still participating in affinity decisions.
+constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
 constexpr int32_t MAX_AIC_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD;
 constexpr int32_t MAX_AIV_PER_THREAD = PLATFORM_MAX_AIV_PER_THREAD;
 constexpr int32_t MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;

@@ -281,9 +281,9 @@ int DeviceRunner::run(Runtime& runtime,
     int launch_aicpu_num) {
 
     // Validate launch_aicpu_num
-    if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
+    if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]",
-                      launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
+                      launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH);
         return -1;
     }
 
