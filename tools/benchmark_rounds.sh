@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Benchmark wrapper: run examples on a2a3 hardware,
+# Benchmark wrapper: run examples on hardware,
 # then parse device-log timing lines to report per-round latency.
 #
 # Usage:
-#   ./tools/benchmark_rounds.sh [-d <device>] [-n <rounds>]
+#   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>]
 #
 # Runs all examples listed in EXAMPLES array and prints timing for each.
 
@@ -12,10 +12,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
-EXAMPLES_DIR="$PROJECT_ROOT/tests/device_tests/tensormap_and_ringbuffer"
 
 # ---------------------------------------------------------------------------
-# Examples to benchmark (paths relative to examples/tensormap_and_ringbuffer/)
+# Examples to benchmark (paths relative to tests/device_tests/<arch>/tensormap_and_ringbuffer/)
 # Each entry is just the directory name; kernels/ and golden.py are implied.
 # ---------------------------------------------------------------------------
 EXAMPLES=(
@@ -31,10 +30,15 @@ EXAMPLES=(
 # ---------------------------------------------------------------------------
 DEVICE_ID=0
 ROUNDS=10
+PLATFORM=a2a3
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
+        -p|--platform)
+            PLATFORM="$2"
+            shift 2
+            ;;
         -d|--device)
             DEVICE_ID="$2"
             shift 2
@@ -48,9 +52,10 @@ while [[ $# -gt 0 ]]; do
 benchmark_rounds.sh — run all examples and report per-round timing from device logs
 
 Usage:
-  ./tools/benchmark_rounds.sh [-d <device>] [-n <rounds>]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>]
 
 Options:
+  -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 10)
   -h, --help     Show this help
@@ -68,6 +73,11 @@ USAGE
             ;;
     esac
 done
+
+# ---------------------------------------------------------------------------
+# Derive arch from platform and set examples directory
+# ---------------------------------------------------------------------------
+EXAMPLES_DIR="$PROJECT_ROOT/tests/device_tests/${PLATFORM}/tensormap_and_ringbuffer"
 
 # ---------------------------------------------------------------------------
 # Resolve device log directory (mirrors run_example.py / device_log_resolver.py)
@@ -192,7 +202,7 @@ for example in "${EXAMPLES[@]}"; do
     # Run example
     if ! python3 "$RUN_EXAMPLE" \
             -k "$KERNELS_DIR" -g "$GOLDEN" \
-            -p a2a3 -d "$DEVICE_ID" \
+            -p "$PLATFORM" -d "$DEVICE_ID" \
             -n "$ROUNDS" \
             "${EXTRA_ARGS[@]}" > /dev/null 2>&1; then
         echo "  FAILED: run_example.py returned non-zero"
