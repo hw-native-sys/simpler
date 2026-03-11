@@ -539,7 +539,7 @@ struct PTO2SchedulerState {
                            PTO2LocalReadyBuffer* local_buf = nullptr) {
 #endif
         int32_t slot = pto2_task_slot(task_id);
-        PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(sm_handle, task_id);
+        PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(sm_handle, slot);
 
 #if PTO2_PROFILING
         tasks_completed.fetch_add(1, std::memory_order_relaxed);

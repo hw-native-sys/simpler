@@ -397,8 +397,6 @@ void pto2_submit_task(
             // Add this task to producer's fanout list (with spinlock)
             int32_t prod_slot = task_ring.get_task_slot(producer_task_id);
             PTO2TaskDescriptor& producer = task_ring.get_task_by_slot(prod_slot);
-            orch->dep_pool_cur_entry->task_id = task_id;
-            orch->dep_pool_cur_entry->next = producer.fanout_head;
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
             pto2_fanout_lock(producer, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
 #else
@@ -412,6 +410,8 @@ void pto2_submit_task(
                 // decrement fanin_count
                 early_finished++;
             } else {
+                orch->dep_pool_cur_entry->task_id = task_id;
+                orch->dep_pool_cur_entry->next = producer.fanout_head;
                 producer.fanout_head = orch->dep_pool_cur_entry;
             }
             pto2_fanout_unlock(producer);
