@@ -1,9 +1,13 @@
 /**
  * @file pto2_dispatch_payload.h
- * @brief Handshake dispatch payload aligned with runtime2 PTO2TaskDescriptor
+ * @brief Minimal dispatch payload for AICore kernel execution
  *
- * Shared between AICPU (pack from PTO2TaskDescriptor) and AICore (unpack to run kernel).
- * When merging runtime2 into rt2, Handshake.task points to PTO2DispatchPayload.
+ * Shared between AICPU (builds in-place) and AICore (reads to run kernel).
+ * Handshake.task points to PTO2DispatchPayload embedded in PTO2TaskPayload.
+ *
+ * Only contains fields AICore needs to execute: function address + arguments.
+ * Metadata (task_id, kernel_id, core_type) lives in PTO2TaskDescriptor and
+ * is accessed by AICPU when needed (profiling, diagnostics).
  */
 
 #ifndef RT2_PTO2_DISPATCH_PAYLOAD_H_
@@ -11,24 +15,19 @@
 
 #include <stdint.h>
 
-#include "common/core_type.h"
-
 /** Max arguments per task; must match RUNTIME_MAX_ARGS and PTO2_MAX_OUTPUTS */
 #ifndef PTO2_DISPATCH_MAX_ARGS
 #define PTO2_DISPATCH_MAX_ARGS 32
 #endif
 
 /**
- * Dispatch payload: execution-relevant fields from PTO2TaskDescriptor.
- * AICPU packs this from PTO2TaskDescriptor; AICore unpacks to run kernel.
+ * Dispatch payload: minimal execution interface for AICore.
+ * Layout: function_bin_addr followed by args[].
+ * AICore reads function_bin_addr, casts to UnifiedKernelFunc, calls with args.
  */
 struct PTO2DispatchPayload {
-    int32_t task_id;           /**< Task ID (for completion_queue) */
-    int32_t kernel_id;         /**< InCore function id (debug/trace) */
-    CoreType core_type;        /**< AIC or AIV */
     uint64_t function_bin_addr; /**< Kernel entry in GM: (UnifiedKernelFunc)function_bin_addr */
-    int32_t num_args;          /**< Number of valid args[] */
-    uint64_t args[PTO2_DISPATCH_MAX_ARGS]; /**< Kernel arguments (GM pointers) */
+    uint64_t args[PTO2_DISPATCH_MAX_ARGS]; /**< Kernel arguments (GM pointers + scalars) */
 };
 
 #endif  // RT2_PTO2_DISPATCH_PAYLOAD_H_

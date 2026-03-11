@@ -359,7 +359,6 @@ void pto2_submit_task(
 
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id);
 
-
     // === STEP 4: Second pass - register outputs in TensorMap ===
     for (int i = 0; i < num_params; i++) {
         PTOParamType ptype = params[i].type;

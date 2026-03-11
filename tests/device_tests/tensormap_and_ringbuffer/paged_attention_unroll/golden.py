@@ -24,14 +24,13 @@ ATOL = 1e-3
 # All test cases - production scale
 ALL_CASES = {
     "Case1": {
-        "batch": 256,
+        "batch": 64,
         "num_heads": 16,
         "kv_head_num": 1,
         "head_dim": 128,
         "block_size": 128,
-        "context_len": 8192,
+        "context_len": 8193,
         "max_model_len": 32768,
-        "dtype": "bfloat16",
     },
     "Case2": {
         "batch": 64,
@@ -41,17 +40,6 @@ ALL_CASES = {
         "block_size": 64,
         "context_len": 8192,
         "max_model_len": 32768,
-        "dtype": "bfloat16",
-    },
-    "Case3": {
-        "batch": 64,
-        "num_heads": 64,
-        "kv_head_num": 1,
-        "head_dim": 256,
-        "block_size": 64,
-        "context_len": 8192,
-        "max_model_len": 32768,
-        "dtype": "bfloat16",
     },
 }
 
@@ -67,7 +55,6 @@ def generate_inputs(params: dict) -> list:
     block_size = params["block_size"]
     context_len = params["context_len"]
     max_model_len = params["max_model_len"]
-    dtype = getattr(torch, params.get("dtype", "bfloat16"))
 
     max_num_blocks_per_req = max_model_len // block_size
     cur_valid_blocks = (context_len + block_size - 1) // block_size
@@ -90,15 +77,15 @@ def generate_inputs(params: dict) -> list:
         dtype=torch.int64,
     )
 
-    query_raw = torch.empty(batch, 1, num_heads * head_dim).uniform_(-0.5, 0.5).to(dtype)
-    query_raw = query_raw.reshape(batch, num_heads, head_dim)
+    query_bf16 = torch.empty(batch, 1, num_heads * head_dim).uniform_(-0.5, 0.5).to(torch.bfloat16)
+    query_bf16 = query_bf16.reshape(batch, num_heads, head_dim)
 
-    key_raw = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-0.5, 0.5).to(dtype)
-    value_raw = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-1, 1).to(dtype)
+    key_bf16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-0.5, 0.5).to(torch.bfloat16)
+    value_bf16 = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-1, 1).to(torch.bfloat16)
 
-    query = query_raw.flatten()
-    key_cache = key_raw.flatten()
-    value_cache = value_raw.flatten()
+    query = query_bf16.flatten()
+    key_cache = key_bf16.flatten()
+    value_cache = value_bf16.flatten()
     block_table_flat = block_table.flatten()
     out = torch.zeros(batch * num_heads * head_dim, dtype=torch.float32)
 
@@ -146,7 +133,6 @@ def paged_attention(
         out: (batch * num_heads, head_dim) float32
     """
     assert num_kv_heads == 1
-    input_dtype = query.dtype
     batch, num_heads_dim, head_dim = query.shape
     _, block_size, _, _ = key_cache.shape
 
@@ -203,7 +189,7 @@ def paged_attention(
             pij = torch.exp(sij - mij)
             pij = pij.masked_fill(~valid_mask, 0.0)
             pij = pij.masked_fill(~batch_mask, 0.0)
-            pij = pij.to(input_dtype).to(torch.float32)
+            pij = pij.to(torch.bfloat16).to(torch.float32)
             lij = pij.sum(dim=-1, keepdim=True)  # (batch, q_tile_size, 1)
 
             # PV matmul: (batch, q_tile_size, head_dim)

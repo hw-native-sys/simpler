@@ -13,12 +13,12 @@ ATOL = 1e-3
 
 ALL_CASES = {
     "Case1": {
-        "batch": 256,
+        "batch": 64,
         "num_heads": 16,
         "kv_head_num": 1,
         "head_dim": 128,
         "block_size": 128,
-        "context_len": 8192,
+        "context_len": 8193,
         "max_model_len": 32768,
         "dtype": "bfloat16",
     },
@@ -32,13 +32,14 @@ ALL_CASES = {
         "max_model_len": 32768,
         "dtype": "bfloat16",
     },
-    "Case3": {
+    "CaseVarSeq": {
         "batch": 64,
-        "num_heads": 64,
+        "num_heads": 16,
         "kv_head_num": 1,
-        "head_dim": 256,
-        "block_size": 64,
-        "context_len": 8192,
+        "head_dim": 128,
+        "block_size": 128,
+        "context_len": 8193,
+        "context_lens_list": [8193, 4096, 1024, 256, 8000, 512, 2048, 7777],
         "max_model_len": 32768,
         "dtype": "bfloat16",
     },
