@@ -12,6 +12,7 @@
 #include <stdint.h>
 
 #include "common/core_type.h"
+#include "pto_submit_types.h"
 
 /** Max arguments per task; must match RUNTIME_MAX_ARGS and PTO2_MAX_OUTPUTS */
 #ifndef PTO2_DISPATCH_MAX_ARGS
@@ -23,7 +24,8 @@
  * AICPU packs this from PTO2TaskDescriptor; AICore unpacks to run kernel.
  */
 struct PTO2DispatchPayload {
-    int32_t task_id;           /**< Task ID (for completion_queue) */
+    int32_t mixed_task_id;     /**< Mixed-task ID (for completion aggregation) */
+    PTO2SubtaskSlot subslot;   /**< Which subtask slot this dispatch represents */
     int32_t kernel_id;         /**< InCore function id (debug/trace) */
     CoreType core_type;        /**< AIC or AIV */
     uint64_t function_bin_addr; /**< Kernel entry in GM: (UnifiedKernelFunc)function_bin_addr */

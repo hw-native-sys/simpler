@@ -124,7 +124,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                     make_output_param(P),
                     make_input_param(ext_config),
                 };
-                pto2_rt_submit_task(rt, FUNC_GEMM_TILE, PTO2_WORKER_CUBE,
+                pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE,
                                    params_gemm, 4);
                 total_gemm++;
 
@@ -133,7 +133,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                     make_input_param(P),
                     make_input_param(ext_config),
                 };
-                pto2_rt_submit_task(rt, FUNC_TILE_ADD, PTO2_WORKER_VECTOR,
+                pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD,
                                    params_add, 3);
                 total_add++;
             }

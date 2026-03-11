@@ -106,7 +106,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
             __gm__ PTO2DispatchPayload* payload = my_payload;
 
-            write_reg(RegId::COND, MAKE_ACK_VALUE(payload->task_id));
+            write_reg(RegId::COND, MAKE_ACK_VALUE(payload->mixed_task_id));
 
             // Performance profiling: record start time
             uint64_t start_time = 0;
@@ -121,13 +121,13 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-                perf_aicore_record_task(perf_buf, payload->task_id, payload->kernel_id,
+                perf_aicore_record_task(perf_buf, payload->mixed_task_id, payload->kernel_id,
                                        start_time, end_time, kernel_ready_time,
                                        core_type);
             }
 
             last_task_id = task_id;
-            write_reg(RegId::COND, MAKE_FIN_VALUE(payload->task_id));
+            write_reg(RegId::COND, MAKE_FIN_VALUE(payload->mixed_task_id));
         }
     }
 

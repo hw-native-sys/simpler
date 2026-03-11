@@ -107,7 +107,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
         make_input_param(ext_b),
         make_output_param(c),
     };
-    pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, params_t0, 3); // kernel_add
+    pto2_rt_submit_aiv_task(rt, 0, params_t0, 3); // kernel_add
 
     // Inner scope: owns t1, t2, t3, t4; intermediates d, e, g release on scope end.
     // c flows in from outer scope (outer-scope tensors are visible to inner scopes).
@@ -123,7 +123,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             make_output_param(d),
             make_scalar_param((uint64_t)3),
         };
-        pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, params_t1, 3); // kernel_add_scalar
+        pto2_rt_submit_aiv_task(rt, 1, params_t1, 3); // kernel_add_scalar
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
         PTOParam params_t2[] = {
@@ -132,7 +132,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             make_output_param(e),
             make_scalar_param((uint64_t)3),
         };
-        pto2_rt_submit_task(rt, 1, PTO2_WORKER_VECTOR, params_t2, 3); // kernel_add_scalar
+        pto2_rt_submit_aiv_task(rt, 1, params_t2, 3); // kernel_add_scalar
 
         // t3: g = d * e (kernel_id=2, kernel_mul)
         PTOParam params_t3[] = {
@@ -141,7 +141,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             make_output_param(g),
             make_scalar_param((uint64_t)3),
         };
-        pto2_rt_submit_task(rt, 2, PTO2_WORKER_VECTOR, params_t3, 3); // kernel_mul
+        pto2_rt_submit_aiv_task(rt, 2, params_t3, 3); // kernel_mul
 
         // t4: f = g + c (kernel_id=0, kernel_add)
         PTOParam params_t4[] = {
@@ -149,7 +149,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             make_input_param(c),
             make_output_param(ext_f),
         };
-        pto2_rt_submit_task(rt, 0, PTO2_WORKER_VECTOR, params_t4, 3); // kernel_add
+        pto2_rt_submit_aiv_task(rt, 0, params_t4, 3); // kernel_add
     }  // inner scope ends: releases d, e, g
 }
 

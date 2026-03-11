@@ -135,7 +135,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     make_output_param(li_batch),
                     make_output_param(mi_batch),
                 };
-                pto2_rt_submit_task(rt, FUNC_AIV_HUB, PTO2_WORKER_VECTOR, params_hub, 3);
+                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_hub, 3);
 
                 for (uint64_t bn = 0; bn < max_bn; bn++) {
                     uint64_t sij_shapes[2] = {chunk_bc * q_tile, block_size};
@@ -160,7 +160,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         make_scalar_param(num_heads),
                         make_scalar_param(batch_start),
                     };
-                    pto2_rt_submit_task(rt, FUNC_QK_MATMUL, PTO2_WORKER_CUBE, params_qk, 10);
+                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk, 10);
 
                     PTOParam params_sf[] = {
                         make_input_param(sij_b),
@@ -173,7 +173,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         make_scalar_param(bn),
                         make_scalar_param(batch_start),
                     };
-                    pto2_rt_submit_task(rt, FUNC_SOFTMAX_PREPARE, PTO2_WORKER_VECTOR, params_sf, 9);
+                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf, 9);
 
                     PTOParam params_pv[] = {
                         make_input_param(pij_b),
@@ -185,7 +185,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         make_scalar_param(block_num),
                         make_scalar_param(batch_start),
                     };
-                    pto2_rt_submit_task(rt, FUNC_PV_MATMUL, PTO2_WORKER_CUBE, params_pv, 8);
+                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv, 8);
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == max_bn - 1) ? 1 : 0;
@@ -204,7 +204,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         make_scalar_param(num_heads),
                         make_scalar_param(batch_start),
                     };
-                    pto2_rt_submit_task(rt, FUNC_ONLINE_UPDATE, PTO2_WORKER_VECTOR, params_up, 13);
+                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up, 13);
                 }
             }
         }

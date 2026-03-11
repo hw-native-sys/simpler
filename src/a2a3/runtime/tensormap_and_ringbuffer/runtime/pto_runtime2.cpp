@@ -26,11 +26,10 @@ void pto2_set_orch_thread_idx(int idx) {
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================
 
-static void submit_task_impl(PTO2Runtime* rt, int32_t kernel_id,
-                             PTO2WorkerType worker_type,
+static void submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                              PTOParam* params, int32_t num_params) {
-    pto2_submit_task(&rt->orchestrators[pto2_current_orch_idx], kernel_id, worker_type,
-                     params, num_params);
+    pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
+                           params, num_params);
 }
 
 void pto2_rt_scope_begin(PTO2Runtime* rt) {

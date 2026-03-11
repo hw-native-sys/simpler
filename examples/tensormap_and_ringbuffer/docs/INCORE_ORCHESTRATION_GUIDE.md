@@ -31,17 +31,28 @@ Validate `arg_count` in `aicpu_orchestration_config` and interpret pointers as d
 2. Wrap orchestration in scopes with `PTO2_SCOPE(rt)` to control tensor lifetimes.
 3. Use `make_tensor_external` for input/output buffers and `make_tensor` for intermediates.
 4. Build `PTOParam` arrays with `make_input_param`, `make_output_param`, `make_inout_param`, and `make_scalar_param`.
-5. Submit tasks with `pto2_rt_submit_task(rt, func_id, worker_type, params, num_params)`.
+5. Submit tasks with one of:
+   - `pto2_rt_submit_aic_task(rt, kernel_id, params, num_params)` — AIC (CUBE) task
+   - `pto2_rt_submit_aiv_task(rt, kernel_id, params, num_params)` — AIV (VECTOR) task
+   - `pto2_rt_submit_task(rt, mixed_kernels, params, num_params)` — mixed task with a `MixedKernels` struct
 
 Dependencies are inferred by TensorMap from input/inout/output tensors, so you do not add explicit edges.
 
-## Worker Types And Kernel IDs
-- Worker types come from `pto_orchestration_api.h` (`PTO2_WORKER_CUBE`, `PTO2_WORKER_VECTOR`, etc.).
+## Submit API And Kernel IDs
+- Submit helpers are defined in `pto_orchestration_api.h`.
+- `pto2_rt_submit_aic_task` and `pto2_rt_submit_aiv_task` are convenience wrappers around `pto2_rt_submit_task` with a `MixedKernels` struct.
+- For mixed AIC+AIV tasks, construct a `MixedKernels` struct directly:
+  ```cpp
+  MixedKernels mk;
+  mk.aic_kernel_id = FUNC_QK;
+  mk.aiv0_kernel_id = FUNC_SF;
+  pto2_rt_submit_task(rt, mk, params, num_params);
+  ```
 - Kernel `func_id` values are defined in `kernels/kernel_config.py` under `KERNELS`.
 
 ## Completion Semantics
 Do not call `pto2_rt_orchestration_done` yourself in device mode. The executor wraps the entry call in an outer scope and signals completion after `aicpu_orchestration_entry` returns.
 
 ## Examples
-- `examples/tensormap_and_ringbuffer/vector_example/kernels/orchestration/example_orchestration.cpp`
-- `examples/tensormap_and_ringbuffer/bgemm/kernels/orchestration/bgemm_orch.cpp`
+- `examples/tensormap_and_ringbuffer/vector_example/kernels/orchestration/example_orchestration.cpp` (AIV-only tasks)
+- `examples/tensormap_and_ringbuffer/bgemm/kernels/orchestration/bgemm_orch.cpp` (mixed AIC + AIV tasks)

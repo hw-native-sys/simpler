@@ -121,7 +121,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                 make_input_param(B_view),
                 make_output_param(C_view),
             };
-            pto2_rt_submit_task(rt, FUNC_MATMUL, PTO2_WORKER_CUBE, params_matmul, 3);
+            pto2_rt_submit_aic_task(rt, FUNC_MATMUL, params_matmul, 3);
             total_matmul++;
         }
 
@@ -142,7 +142,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                 make_input_param(Y_view),
                 make_output_param(Z_view),
             };
-            pto2_rt_submit_task(rt, FUNC_ADD, PTO2_WORKER_VECTOR, params_add, 3);
+            pto2_rt_submit_aiv_task(rt, FUNC_ADD, params_add, 3);
             total_add++;
         }
     }

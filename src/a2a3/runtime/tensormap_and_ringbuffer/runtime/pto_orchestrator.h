@@ -20,6 +20,7 @@
 
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
+#include "pto_submit_types.h"
 #include "pto_scheduler.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
@@ -178,9 +179,8 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  * @param params      Array of task parameters
  * @param num_params  Number of parameters
  */
-void pto2_submit_task(PTO2OrchestratorState* orch,
-    int32_t kernel_id,
-    PTO2WorkerType worker_type,
+void pto2_submit_mixed_task(PTO2OrchestratorState* orch,
+    const MixedKernels& mixed_kernels,
     PTOParam* params,
     int32_t num_params);
 

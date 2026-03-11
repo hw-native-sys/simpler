@@ -318,23 +318,31 @@ When `pto2_submit_task` processes parameters:
 
 ## 6. Task Descriptor and States
 
-### 6.1 PTO2TaskDescriptor
+### 6.1 PTO2TaskDescriptor (Hot Path)
 
 | Field | Description |
 |-------|-------------|
-| `task_id` | Monotonically increasing ID |
-| `kernel_id` | Function ID (maps to compiled kernel binary) |
-| `worker_type` | CUBE (AIC), VECTOR (AIV), AI_CPU, or ACCELERATOR |
-| `fanin_head` | Head of fanin dependency list (pointer into DepListPool) |
+| `mixed_task_id` | Canonical mixed-task ID (monotonically increasing) |
+| `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
+| `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
+| `subtask_done_mask` | Atomic bitmask; each subtask sets its done bit on completion |
 | `fanin_count` | Number of producer dependencies |
 | `fanout_lock` | Per-task spinlock for concurrent fanout modification |
 | `fanout_head` | Head of fanout consumer list (pointer, protected by `fanout_lock`) |
 | `fanout_count` | 1 (scope ref) + number of consumers |
 | `packed_buffer_base` | Start of packed buffer in GM Heap |
 | `packed_buffer_end` | End of packed buffer (for heap reclamation) |
-| `is_active` | Task slot is in use |
-| `params[16]` | Tensor and scalar parameters (`PTOParam` array) |
+
+### 6.1b PTO2TaskPayload (Cold Path)
+
+| Field | Description |
+|-------|-------------|
+| `tensors[16]` | Tensor descriptors for parameters |
+| `scalar_value[16]` | Scalar parameter values |
+| `is_tensor[16]` | Whether each parameter is tensor or scalar |
 | `param_count` | Number of valid parameters |
+| `fanin_tasks[]` | Producer task IDs (used by `on_task_release`) |
+| `fanin_actual_count` | Actual fanin count |
 
 ### 6.2 Task State Machine
 
@@ -406,8 +414,8 @@ Scopes control the lifetime of intermediate buffers. Each scope:
 ```cpp
 PTO2_SCOPE(rt) {
     // Tasks submitted here belong to this scope
-    pto2_rt_submit_task(rt, FUNC_QK, PTO2_WORKER_CUBE, params, n);
-    pto2_rt_submit_task(rt, FUNC_SF, PTO2_WORKER_VECTOR, params, n);
+    pto2_rt_submit_aic_task(rt, FUNC_QK, params, n);
+    pto2_rt_submit_aiv_task(rt, FUNC_SF, params, n);
 }
 // scope_end: scope reference released from all tasks above
 ```
@@ -435,11 +443,11 @@ Each scheduler thread runs a tight loop with two main phases:
 
 **Phase 1 — Completion Handling**:
 - Poll register `COND` on each managed core
-- When `TASK_FIN_STATE` detected: record completion timestamps, mark `task_state[slot] = COMPLETED`, acquire fanout lock, traverse fanout list (incrementing consumers' `fanin_refcount`), mark `task_state[slot] = CONSUMED`, advance `last_task_alive` watermark
+- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(mixed_task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, trigger `on_mixed_task_complete(mixed_task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
 
 **Phase 2 — Dispatch**:
-- For each idle core: pop a task from the ready queue (lock-free MPMC Vyukov queue, one per worker type)
-- Build `PTO2DispatchPayload` from `TaskDescriptor`
+- For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
+- Build `PTO2DispatchPayload` from `TaskDescriptor` with `mixed_task_id`, `subslot`, `kernel_id`, and `core_type`
 - Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE`
 
 After these phases, the scheduler updates profiling headers and checks for termination (all tasks completed and orchestrator done).
@@ -448,9 +456,9 @@ After these phases, the scheduler updates profiling headers and checks for termi
 
 Ready queues use a lock-free bounded MPMC (Vyukov) design:
 
-- One `PTO2ReadyQueue` per worker type (4 types: CUBE, VECTOR, AI_CPU, ACCELERATOR)
-- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks
-- **Pop**: scheduler threads pop from the queue matching the idle core's worker type
+- One `PTO2ReadyQueue` per resource shape (5 shapes: `AIC_ONLY`, `AIV_X1`, `AIV_X2`, `AIC_AIV_X1`, `AIC_AIV_X2`)
+- **Push**: any thread (orchestrator via `init_task`, or scheduler on completion) pushes newly-ready tasks to the queue matching `pto2_active_mask_to_shape(task->active_mask)`
+- **Pop**: scheduler threads pop from the queue matching the idle core's resource shape
 - Per-slot sequence counters prevent ABA problems
 - `enqueue_pos` and `dequeue_pos` are on separate cache lines to avoid false sharing
 
@@ -505,8 +513,10 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 
 | Field | Description |
 |-------|-------------|
-| `task_id` | Task identifier |
-| `kernel_id` | Function ID |
+| `mixed_task_id` | Mixed-task identifier (for completion aggregation) |
+| `subslot` | Which subtask slot this dispatch represents (`AIC`, `AIV0`, or `AIV1`) |
+| `kernel_id` | Function ID for this subtask slot |
+| `core_type` | AIC or AIV |
 | `function_bin_addr` | GM address of compiled kernel binary |
 | `num_args` | Number of arguments |
 | `args[]` | Tensor addresses and scalar values |
@@ -557,7 +567,9 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 
 | Function/Macro | Purpose |
 |----------------|---------|
-| `pto2_rt_submit_task(rt, kernel_id, worker_type, params, n)` | Submit a task with parameters |
+| `pto2_rt_submit_task(rt, mixed_kernels, params, n)` | Submit a mixed task with `MixedKernels` struct |
+| `pto2_rt_submit_aic_task(rt, kernel_id, params, n)` | Convenience: submit AIC-only task |
+| `pto2_rt_submit_aiv_task(rt, kernel_id, params, n)` | Convenience: submit AIV-only task |
 | `PTO2_SCOPE(rt) { ... }` | RAII scope for buffer lifetime |
 | `pto2_rt_orchestration_done(rt)` | Signal orchestration complete |
 | `pto2_rt_init_tensor_pool(rt)` | Initialize tensor pool for `make_tensor()` |
@@ -573,14 +585,17 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 | `make_inout_param(tensor)` | INOUT parameter — read then written |
 | `make_scalar_param(value)` | 64-bit scalar parameter |
 
-### 11.3 Worker Types
+### 11.3 Resource Shapes
 
-| Type | Target |
-|------|--------|
-| `PTO2_WORKER_CUBE` | AIC cores (matrix multiplication) |
-| `PTO2_WORKER_VECTOR` | AIV cores (vector operations) |
-| `PTO2_WORKER_AI_CPU` | AICPU (scalar ops, control flow) |
-| `PTO2_WORKER_ACCELERATOR` | Fixed-function accelerators (DMA, etc.) |
+Tasks are queued by resource shape, which is derived from the `active_mask` in the `MixedKernels` struct:
+
+| Shape | Active Mask | Description |
+|-------|-------------|-------------|
+| `AIC_ONLY` | AIC only | AIC cores (matrix multiplication) |
+| `AIV_X1` | AIV0 or AIV1 only | Single AIV core (vector operations) |
+| `AIV_X2` | AIV0 + AIV1 | Two AIV cores |
+| `AIC_AIV_X1` | AIC + one AIV | AIC + single AIV core |
+| `AIC_AIV_X2` | AIC + AIV0 + AIV1 | Full cluster (AIC + two AIV cores) |
 
 ### 11.4 Orchestration Export Interface
 

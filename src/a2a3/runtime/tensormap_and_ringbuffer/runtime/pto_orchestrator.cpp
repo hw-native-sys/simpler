@@ -218,9 +218,26 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // =============================================================================
 // Task Submission
 // =============================================================================
-void pto2_submit_task(
-    PTO2OrchestratorState* orch, int32_t kernel_id, PTO2WorkerType worker_type, PTOParam* params, int32_t num_params) {
+void pto2_submit_mixed_task(
+    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, PTOParam* params, int32_t num_params) {
     CYCLE_COUNT_START();
+
+    // === Validate submit inputs ===
+    uint8_t active_mask = pto2_mixed_kernels_to_active_mask(mixed_kernels);
+    always_assert(active_mask != 0 && "MixedKernels must have at least one active slot");
+    always_assert((params != nullptr || num_params == 0) && "params must not be null when num_params > 0");
+
+    // Normalize single-AIV tasks: if only aiv1 is set, move it to the aiv0 slot.
+    // This guarantees the dispatch path can always use PTO2SubtaskSlot::AIV0 for
+    // AIV_X1 and AIC_AIV_X1 shapes without inspecting active_mask.
+    MixedKernels normalized = mixed_kernels;
+    bool has_aiv0 = (active_mask & PTO2_SUBTASK_MASK_AIV0) != 0;
+    bool has_aiv1 = (active_mask & PTO2_SUBTASK_MASK_AIV1) != 0;
+    if (has_aiv1 && !has_aiv0) {
+        normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
+        normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
+        active_mask = pto2_mixed_kernels_to_active_mask(normalized);
+    }
 
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
     orch->tensor_map.sync_tensormap();
@@ -238,10 +255,13 @@ void pto2_submit_task(
     PTO2TaskDescriptor& task = task_ring.get_task_by_slot(slot);
     PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[slot];
 
-    // Initialize task descriptor
-    task.task_id = task_id;
-    task.kernel_id = kernel_id;
-    task.worker_type = worker_type;
+    // Initialize mixed-task descriptor
+    task.mixed_task_id = task_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
+    task.active_mask = active_mask;
+    task.subtask_done_mask.store(0, std::memory_order_relaxed);
     task.fanin_count = 0;
     task.fanout_head = nullptr;
     task.fanout_lock.store(0, std::memory_order_relaxed);
@@ -364,7 +384,7 @@ void pto2_submit_task(
     for (int i = 0; i < num_params; i++) {
         PTOParamType ptype = params[i].type;
         if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
-            // Register in TensorMap: this tensor is produced by task_id
+            // Register in TensorMap: this tensor is produced by task_id (mixed_task_id)
             orch->tensor_map.insert(payload->tensors[i], task_id, ptype == PTOParamType::OUTPUT);
         }
     }
@@ -377,7 +397,7 @@ void pto2_submit_task(
         PTO2SchedulerState* sched = orch->scheduler;
 
         // Initialize scheduler state BEFORE adding to producer fanout lists,
-        // so concurrent on_task_complete can safely access task_state/fanout_refcount.
+        // so concurrent on_mixed_task_complete can safely access task_state/fanout_refcount.
         sched->task_state[slot].store(PTO2_TASK_PENDING, std::memory_order_relaxed);
         sched->fanout_refcount[slot].store(0, std::memory_order_relaxed);
 
@@ -425,7 +445,8 @@ void pto2_submit_task(
         int32_t new_rc = sched->fanin_refcount[slot].fetch_add(initial_refcount, std::memory_order_acq_rel)
                          + initial_refcount;
         if (new_rc >= fanin_count + 1) {
-            sched->ready_queues[task.worker_type].push(task_id);
+            PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
+            sched->ready_queues[static_cast<int32_t>(shape)].push(task_id);
         }
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
         // Per producer: fetch_add(fanout_count) + load(task_state) + store(unlock) = 3 atomics

@@ -141,7 +141,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     make_output_param(li_update),
                     make_output_param(mi_update),
                 };
-                pto2_rt_submit_task(rt, FUNC_AIV_HUB, PTO2_WORKER_VECTOR, params_inplace, 3); // create_inplace
+                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace, 3); // create_inplace
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
@@ -160,7 +160,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         make_input_param(kj),
                         make_output_param(sij),
                     };
-                    pto2_rt_submit_task(rt, FUNC_QK_MATMUL, PTO2_WORKER_CUBE, params_qk, 3); // c1
+                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk, 3); // c1
 
                     uint64_t sij_valid_shapes[2] = {q_tile, valid_len};
                     uint64_t sij_valid_offsets[2] = {0, 0};
@@ -174,7 +174,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         make_output_param(mi),
                         make_output_param(li),
                     };
-                    pto2_rt_submit_task(rt, FUNC_SOFTMAX_PREPARE, PTO2_WORKER_VECTOR, params_sf, 5); // v1
+                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf, 5); // v1
 
                     uint64_t oi_tmp_shapes[2] = {q_tile, head_dim};
                     Tensor oi_tmp = make_tensor(oi_tmp_shapes, 2, DataType::FLOAT32);
@@ -184,7 +184,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         make_input_param(vj),
                         make_output_param(oi_tmp),
                     };
-                    pto2_rt_submit_task(rt, FUNC_PV_MATMUL, PTO2_WORKER_CUBE, params_pv, 3); // c2
+                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv, 3); // c2
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
@@ -200,7 +200,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         make_scalar_param(is_first),
                         make_scalar_param(is_last),
                     };
-                    pto2_rt_submit_task(rt, FUNC_ONLINE_UPDATE, PTO2_WORKER_VECTOR, params_up, 9); // v2
+                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up, 9); // v2
                 }
             }
         }
