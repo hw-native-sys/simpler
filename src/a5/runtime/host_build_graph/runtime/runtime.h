@@ -132,6 +132,7 @@ struct HostApi {
     int (*copy_to_device)(void* dev_ptr, const void* host_ptr, size_t size);
     int (*copy_from_device)(void* host_ptr, const void* dev_ptr, size_t size);
     uint64_t (*upload_kernel_binary)(int func_id, const uint8_t* bin_data, size_t bin_size);
+    void (*remove_kernel_binary)(int func_id);
 };
 
 /**
@@ -186,6 +187,7 @@ public:
 
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;  // Number of AICPU threads for scheduling
+    int orch_thread_num;  // Number of orchestrator threads (unused, for API compatibility)
 
     // Profiling support
     bool enable_profiling;                  // Enable profiling flag
@@ -207,6 +209,10 @@ private:
 
     // Function address mapping (for API compatibility with rt2)
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
+
+    // Kernel binary tracking for cleanup
+    int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
+    int registered_kernel_count_;
 
 public:
     /**
@@ -355,8 +361,20 @@ public:
     void set_function_bin_addr(int func_id, uint64_t addr) {
         if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
             func_id_to_addr_[func_id] = addr;
+            if (addr != 0 && registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
+                registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
+            }
         }
     }
+
+    int get_registered_kernel_count() const { return registered_kernel_count_; }
+
+    int get_registered_kernel_func_id(int index) const {
+        if (index < 0 || index >= registered_kernel_count_) return -1;
+        return registered_kernel_func_ids_[index];
+    }
+
+    void clear_registered_kernels() { registered_kernel_count_ = 0; }
 
     // =========================================================================
     // Host API (host-only, not copied to device)

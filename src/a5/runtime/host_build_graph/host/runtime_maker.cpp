@@ -208,6 +208,18 @@ int validate_runtime_impl(Runtime *runtime) {
     }
     LOG_INFO("Freed %d device tensors", tensor_pair_count);
 
+    // Cleanup kernel binaries
+    int kernel_count = runtime->get_registered_kernel_count();
+    for (int i = 0; i < kernel_count; i++) {
+        int func_id = runtime->get_registered_kernel_func_id(i);
+        runtime->host_api.remove_kernel_binary(func_id);
+        runtime->set_function_bin_addr(func_id, 0);
+    }
+    if (kernel_count > 0) {
+        LOG_INFO("Freed %d kernel binaries", kernel_count);
+    }
+    runtime->clear_registered_kernels();
+
     // Clear tensor pairs
     runtime->clear_tensor_pairs();
 

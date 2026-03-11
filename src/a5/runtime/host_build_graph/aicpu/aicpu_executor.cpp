@@ -96,7 +96,7 @@ struct AicpuExecutor {
     int resolve_and_dispatch(Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num);
     int shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores);
     int run(Runtime* runtime);
-    void deinit();
+    void deinit(Runtime* runtime);
     void emergency_shutdown();
     void diagnose_stuck_state(
         Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num, Handshake* hank);
@@ -299,7 +299,7 @@ int AicpuExecutor::init(Runtime* runtime) {
  * @return 0 on success, -1 on failure
  */
 int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
-    Handshake* all_hanks = (Handshake*)runtime->workers;
+    Handshake* all_handshakes = (Handshake*)runtime->workers;
     cores_total_num_ = runtime->worker_count;
 
     // Validate cores_total_num_ before using as array index
@@ -315,7 +315,7 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
 
     // Step 1: Send handshake signal to all cores
     for (int i = 0; i < cores_total_num_; i++) {
-        all_hanks[i].aicpu_ready = 1;
+        all_handshakes[i].aicpu_ready = 1;
     }
 
     // Get platform physical cores count for validation
@@ -324,7 +324,7 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     // Step 2: Wait for all cores to respond and collect core type information
     bool handshake_failed = false;
     for (int i = 0; i < cores_total_num_; i++) {
-        Handshake* hank = &all_hanks[i];
+        Handshake* hank = &all_handshakes[i];
 
         // Wait for aicore_done signal
         while (hank->aicore_done == 0) {
@@ -371,6 +371,7 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
             physical_core_id,
             reg_addr);
 
+        // Initialize AICore registers after discovery (first round)
         if (reg_addr != 0) {
             platform_init_aicore_regs(reg_addr);
         }
@@ -548,13 +549,13 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime* runtime) {
  * Shutdown AICore - Send quit signal to all AICore kernels
  */
 int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
-    Handshake* all_hanks = (Handshake*)runtime->workers;
+    Handshake* all_handshakes = (Handshake*)runtime->workers;
 
     LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, thread_cores_num_);
 
     for (int i = 0; i < thread_cores_num_; i++) {
         int core_id = cur_thread_cores[i];
-        Handshake* hank = &all_hanks[core_id];
+        Handshake* hank = &all_handshakes[core_id];
         LOG_INFO("Thread %d: AICPU hank addr = 0x%lx", thread_idx, (uint64_t)hank);
 
         uint64_t reg_addr = core_id_to_reg_addr_[core_id];
@@ -581,8 +582,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
 
     // Timeout detection using idle iteration counting
     int idle_iterations = 0;
-    const int MAX_IDLE_ITERATIONS = 4000000;
-    const int WARN_INTERVAL = 2000000;
+    const int MAX_IDLE_ITERATIONS = 50000000;
+    const int WARN_INTERVAL = 1000000;
     bool made_progress = false;
 
     int verification_warning_count = 0;
@@ -1015,7 +1016,15 @@ int AicpuExecutor::run(Runtime* runtime) {
     return 0;
 }
 
-void AicpuExecutor::deinit() {
+void AicpuExecutor::deinit(Runtime* runtime) {
+    // === Exit cleanup: reset all inter-round state ===
+
+    // 1. Invalidate AICPU cache for Runtime address range.
+    //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
+    //    bypasses this cache. Invalidating now ensures next round reads from HBM.
+    cache_invalidate_range(runtime, sizeof(Runtime));
+
+    // === Existing reset logic ===
     ready_count_aic_.store(0, std::memory_order_release);
     ready_count_aiv_.store(0, std::memory_order_release);
 
@@ -1208,7 +1217,7 @@ extern "C" int aicpu_execute(Runtime* runtime) {
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
         LOG_INFO("aicpu_execute: Last thread finished, cleaning up");
-        g_aicpu_executor.deinit();
+        g_aicpu_executor.deinit(runtime);
     }
 
     LOG_INFO("%s", "aicpu_execute: Kernel execution completed successfully");

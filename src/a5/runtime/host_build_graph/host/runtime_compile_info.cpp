@@ -5,7 +5,7 @@
 extern "C" {
 
 ToolchainType get_incore_compiler(void) {
-    if (strcmp(get_platform(), "a5") == 0) return TOOLCHAIN_CCEC;
+    if (strcmp(get_platform(), "a2a3") == 0) return TOOLCHAIN_CCEC;
     return TOOLCHAIN_HOST_GXX_15;
 }
 
