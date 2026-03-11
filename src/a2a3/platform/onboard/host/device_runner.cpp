@@ -387,6 +387,8 @@ int DeviceRunner::run(Runtime& runtime,
             LOG_ERROR("init_performance_profiling failed: %d", rc);
             return rc;
         }
+        // Start memory management thread
+        perf_collector_.start_memory_manager();
     }
 
     std::cout << "\n=== Initialize runtime args ===" << '\n';
@@ -436,9 +438,12 @@ int DeviceRunner::run(Runtime& runtime,
         return rc;
     }
 
-    // Poll and collect performance data (must be before stream sync)
+    // Poll and collect performance data in a separate collector thread
+    std::thread collector_thread;
     if (runtime.enable_profiling) {
-        poll_and_collect_performance_data(runtime.get_task_count());
+        collector_thread = std::thread([this, &runtime]() {
+            poll_and_collect_performance_data(runtime.get_task_count());
+        });
     }
 
     std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
@@ -446,6 +451,9 @@ int DeviceRunner::run(Runtime& runtime,
     rc = rtStreamSynchronize(stream_aicpu_);
     if (rc != 0) {
         LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
+        if (runtime.enable_profiling && collector_thread.joinable()) {
+            collector_thread.join();
+        }
         if (kernel_args_.args.regs != 0) {
             mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
             kernel_args_.args.regs = 0;
@@ -458,6 +466,9 @@ int DeviceRunner::run(Runtime& runtime,
     rc = rtStreamSynchronize(stream_aicore_);
     if (rc != 0) {
         LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
+        if (runtime.enable_profiling && collector_thread.joinable()) {
+            collector_thread.join();
+        }
         if (kernel_args_.args.regs != 0) {
             mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
             kernel_args_.args.regs = 0;
@@ -466,8 +477,15 @@ int DeviceRunner::run(Runtime& runtime,
         return rc;
     }
 
-    // Collect phase data and print performance data (after stream sync)
+    // Wait for collector thread to finish
+    if (runtime.enable_profiling && collector_thread.joinable()) {
+        collector_thread.join();
+    }
+
+    // Stop memory management, drain remaining buffers, collect phase data, export
     if (runtime.enable_profiling) {
+        perf_collector_.stop_memory_manager();
+        perf_collector_.drain_remaining_buffers();
         perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
@@ -722,8 +740,13 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
+    auto free_cb = [](void* dev_ptr, void* user_data) -> int {
+        auto* allocator = static_cast<MemoryAllocator*>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
     return perf_collector_.initialize(runtime, num_aicore, device_id,
-                                       alloc_cb, register_cb, &mem_alloc_);
+                                       alloc_cb, register_cb, free_cb, &mem_alloc_);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {

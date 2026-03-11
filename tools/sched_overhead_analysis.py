@@ -3,7 +3,9 @@
 
 Analyzes scheduling overhead from two sources:
   1. Per-task perf profiling data (perf_swimlane_*.json)
-  2. AICPU scheduler loop breakdown (device log)
+  2. AICPU scheduler loop breakdown:
+     - From perf JSON Phase data (version >= 2, preferred)
+     - From device log (fallback for older data or PTO2_SCHED_PROFILING=1 details)
 
 Usage:
     python sched_overhead_analysis.py                          # auto-select latest files
@@ -30,6 +32,72 @@ def auto_select_perf_json():
     if not files:
         raise FileNotFoundError(f"No perf_swimlane_*.json files found in {outputs_dir}")
     return files[0]
+
+
+def parse_scheduler_from_json_phases(data):
+    """Extract scheduler Phase breakdown from perf_swimlane JSON (version >= 2).
+
+    Computes per-thread loop counts, task counts, and phase totals
+    from aicpu_scheduler_phases records.
+
+    Returns:
+        dict: Thread data keyed by thread index, same schema as parse_scheduler_threads.
+              Returns empty dict if Phase data not available.
+    """
+    if data.get('version', 1) < 2:
+        return {}
+    phases_by_thread = data.get('aicpu_scheduler_phases', [])
+    if not phases_by_thread:
+        return {}
+
+    # Map JSON phase names to internal names
+    phase_map = {
+        'complete': 'complete',
+        'dispatch': 'dispatch',
+        'scan': 'scan',
+        'idle': 'idle',
+    }
+
+    threads = {}
+    for tid, records in enumerate(phases_by_thread):
+        if not records:
+            continue
+
+        phase_us = {p: 0.0 for p in ['complete', 'scan', 'dispatch', 'idle']}
+        total_tasks = 0
+        max_loop_iter = 0
+
+        for rec in records:
+            phase = phase_map.get(rec.get('phase', ''))
+            if phase is None:
+                continue
+            dur = rec.get('end_time_us', 0) - rec.get('start_time_us', 0)
+            if dur > 0:
+                phase_us[phase] += dur
+            if rec.get('tasks_processed', 0) > 0 and phase == 'complete':
+                total_tasks += rec['tasks_processed']
+            loop_iter = rec.get('loop_iter', 0)
+            if loop_iter > max_loop_iter:
+                max_loop_iter = loop_iter
+
+        total_us = sum(phase_us.values())
+        loops = max_loop_iter
+        tasks_per_loop = total_tasks / loops if loops > 0 else 0.0
+
+        t = {
+            'completed': total_tasks,
+            'total_us': total_us,
+            'loops': loops,
+            'tasks_per_loop': tasks_per_loop,
+            'format': 'json_phase',
+        }
+        for p, us in phase_us.items():
+            t[f'{p}_us'] = us
+            t[f'{p}_pct'] = us / total_us * 100 if total_us > 0 else 0
+
+        threads[tid] = t
+
+    return threads
 
 
 def parse_scheduler_threads(log_path):
@@ -245,12 +313,17 @@ def run_analysis(perf_path, log_path, print_sources=True, selection_strategy=Non
     print(fmt.format('Tail OH (finish-end)', f'{all_tail:.1f}', f'{all_tail/n_total:.2f}', f'{all_tail/all_latency*100:.1f}%'))
     print()
 
-    # === Part 2: AICPU scheduler loop breakdown from device log ===
-    threads = parse_scheduler_threads(log_path)
+    # === Part 2: AICPU scheduler loop breakdown ===
+    # Prefer JSON Phase data (version >= 2), fall back to device log
+    threads = parse_scheduler_from_json_phases(data)
+    phase_source = 'perf JSON phase data'
+    if not threads:
+        threads = parse_scheduler_threads(log_path)
+        phase_source = 'device log'
     n_threads = len(threads)
 
     print('=' * 90)
-    print('Part 2: AICPU scheduler loop breakdown (from device log)')
+    print('Part 2: AICPU scheduler loop breakdown (from ' + phase_source + ')')
     print(f'  {n_threads} scheduler threads')
     print('=' * 90)
     print()

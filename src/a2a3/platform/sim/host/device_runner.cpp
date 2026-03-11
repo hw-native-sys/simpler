@@ -237,6 +237,8 @@ int DeviceRunner::run(Runtime& runtime,
             LOG_ERROR("init_performance_profiling failed: %d", rc);
             return rc;
         }
+        // Start memory management thread
+        perf_collector_.start_memory_manager();
     }
 
     // Allocate simulated register blocks for all AICore cores
@@ -316,8 +318,10 @@ int DeviceRunner::run(Runtime& runtime,
 
     LOG_INFO("All threads completed");
 
-    // Collect AICPU phase data and print performance data after execution completes
+    // Stop memory management, drain remaining buffers, collect phase data, export
     if (runtime.enable_profiling) {
+        perf_collector_.stop_memory_manager();
+        perf_collector_.drain_remaining_buffers();
         perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
@@ -498,9 +502,16 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
         return malloc(size);
     };
 
+    // Define free callback (a2a3sim: use free)
+    auto free_cb = [](void* dev_ptr, void* user_data) -> int {
+        (void)user_data;  // Not needed for free
+        free(dev_ptr);
+        return 0;
+    };
+
     // Simulation: no registration needed (pass nullptr)
     return perf_collector_.initialize(runtime, num_aicore, device_id,
-                                       alloc_cb, nullptr, nullptr);
+                                       alloc_cb, nullptr, free_cb, nullptr);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
