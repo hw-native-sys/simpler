@@ -52,11 +52,11 @@ static __aicore__ void matmul_impl(
     constexpr int N = CeilAlign<int>(TILE, blockAlign);
 
     using GlobalDataA = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        pto::Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
     using GlobalDataB = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        pto::Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
     using GlobalDataC = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+        pto::Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
 
     GlobalDataA src0Global(input_a);
     GlobalDataB src1Global(input_b);

@@ -35,8 +35,8 @@ PTO Runtime compiles three independent programs (Host `.so`, AICPU `.so`, AICore
 ### Run a single example
 ```bash
 python examples/scripts/run_example.py \
-    -k examples/host_build_graph/vector_example/kernels \
-    -g examples/host_build_graph/vector_example/golden.py \
+    -k examples/a2a3/host_build_graph/vector_example/kernels \
+    -g examples/a2a3/host_build_graph/vector_example/golden.py \
     -p a2a3sim
 ```
 
