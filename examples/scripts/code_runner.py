@@ -151,7 +151,7 @@ def _is_git_available() -> bool:
         return False
 
 
-_PTO_ISA_REPO = "https://gitcode.com/cann/pto-isa.git"
+_PTO_ISA_REPO = "https://github.com/PTO-ISA/pto-isa.git"
 
 
 def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None) -> bool:
