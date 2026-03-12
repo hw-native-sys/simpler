@@ -35,6 +35,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     // Report physical core ID and core type for AICPU
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
+    STORE_RELEASE_FENCE();
     my_hank->aicore_done = block_idx + 1;
 
     dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);

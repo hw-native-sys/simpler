@@ -55,6 +55,18 @@
 #define SPIN_WAIT_HINT() sched_yield()
 #endif
 
+// STORE_RELEASE_FENCE - store-store barrier to prevent reordering of data writes
+// (physical_core_id, core_type) past the signal write (aicore_done) in handshake.
+// Without this fence, aarch64 can reorder stores to different addresses, causing
+// AICPU to read stale physical_core_id after observing aicore_done != 0.
+#if defined(__aarch64__)
+#define STORE_RELEASE_FENCE() __asm__ volatile("dmb ishst" ::: "memory")
+#elif defined(__x86_64__)
+#define STORE_RELEASE_FENCE() __asm__ volatile("" ::: "memory")
+#else
+#define STORE_RELEASE_FENCE() std::atomic_thread_fence(std::memory_order_release)
+#endif
+
 // =============================================================================
 // System Counter Simulation
 // =============================================================================

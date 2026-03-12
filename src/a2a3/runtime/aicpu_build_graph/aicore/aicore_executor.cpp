@@ -59,6 +59,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     // Phase 2: Signal AICore is ready and report core type
     my_hank->core_type = core_type;        // Report core type to AICPU
+    STORE_RELEASE_FENCE();
     my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
 
     // Phase 3: Main execution loop - poll for tasks until quit signal

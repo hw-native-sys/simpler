@@ -23,6 +23,9 @@
 // SPIN_WAIT_HINT - no-op on real hardware (AICore has dedicated polling support)
 #define SPIN_WAIT_HINT() ((void)0)
 
+// STORE_RELEASE_FENCE - no-op on real hardware (dcci handles cache coherency)
+#define STORE_RELEASE_FENCE() ((void)0)
+
 /**
  * Read an AICore register via SPR access
  *

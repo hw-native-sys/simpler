@@ -65,6 +65,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     // Phase 2: Report physical core ID and core type, signal ready
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->core_type = core_type;
+    STORE_RELEASE_FENCE();
     my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
