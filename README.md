@@ -70,10 +70,20 @@ python examples/scripts/run_example.py -k examples/host_build_graph/vector_examp
                                        -p a2a3sim
 ```
 
+By default, the auto-clone uses SSH (`git@github.com:...`). In CI or environments without SSH keys, use `--clone-protocol https`:
+```bash
+python examples/scripts/run_example.py -k examples/host_build_graph/vector_example/kernels \
+                                       -g examples/host_build_graph/vector_example/golden.py \
+                                       -p a2a3sim --clone-protocol https
+```
+
 **Manual Setup** (if auto-setup fails or you prefer manual control):
 ```bash
-# Clone pto-isa manually
+# Clone pto-isa manually (SSH)
 mkdir -p examples/scripts/_deps
+git clone --branch main git@github.com:PTO-ISA/pto-isa.git examples/scripts/_deps/pto-isa
+
+# Or use HTTPS
 git clone --branch main https://github.com/PTO-ISA/pto-isa.git examples/scripts/_deps/pto-isa
 
 # Set environment variable (optional - auto-detected if in standard location)
@@ -89,7 +99,7 @@ export PTO_ISA_ROOT=/path/to/your/pto-isa
 **Troubleshooting:**
 - If git is not available: Clone pto-isa manually and set `PTO_ISA_ROOT`
 - If clone fails due to network: Try again or clone manually
-- For CI/CD: Either rely on auto-clone or pre-clone in CI steps
+- If SSH clone fails (e.g., in CI): Use `--clone-protocol https` or clone manually with HTTPS
 
 Note: For the simulation platform (`a2a3sim`), PTO ISA headers are optional and only needed if your kernels use PTO ISA intrinsics.
 

@@ -7,6 +7,7 @@ PARALLEL=false
 RUNTIME=""
 PTO_ISA_COMMIT=""
 TIMEOUT=600  # 10 minutes default
+CLONE_PROTOCOL="https"  # Default to HTTPS in CI
 
 while [[ $# -gt 0 ]]; do
     case $1 in
@@ -28,6 +29,10 @@ while [[ $# -gt 0 ]]; do
             ;;
         -t|--timeout)
             TIMEOUT="$2"
+            shift 2
+            ;;
+        --clone-protocol)
+            CLONE_PROTOCOL="$2"
             shift 2
             ;;
         --parallel)
@@ -317,7 +322,7 @@ run_task() {
     local -a cmd
     cmd=(python examples/scripts/run_example.py
         -k "${dir}/kernels" -g "${dir}/golden.py"
-        -p "$platform" "${commit_flag[@]}")
+        -p "$platform" --clone-protocol "$CLONE_PROTOCOL" "${commit_flag[@]}")
     [[ -n "$device_id" ]] && cmd+=(-d "$device_id")
 
     # Progress to stdout (not captured in log)

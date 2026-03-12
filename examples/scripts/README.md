@@ -56,6 +56,7 @@ python examples/scripts/run_example.py \
 | `--verbose` | `-v` | Enable verbose output (equivalent to `--log-level debug`) | False |
 | `--silent` | | Enable silent mode (equivalent to `--log-level error`) | False |
 | `--log-level` | | Set log level: `error`, `warn`, `info`, `debug` | `info` |
+| `--clone-protocol` | | Git protocol for cloning pto-isa: `ssh` or `https` | `ssh` |
 
 ### Platform Description
 

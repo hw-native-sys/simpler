@@ -151,10 +151,19 @@ def _is_git_available() -> bool:
         return False
 
 
-_PTO_ISA_REPO = "https://github.com/PTO-ISA/pto-isa.git"
+_PTO_ISA_HTTPS = "https://github.com/PTO-ISA/pto-isa.git"
+_PTO_ISA_SSH = "git@github.com:PTO-ISA/pto-isa.git"
 
 
-def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None) -> bool:
+def _pto_isa_repo_url(clone_protocol: str = "ssh") -> str:
+    """Return the pto-isa clone URL for the given protocol."""
+    if clone_protocol == "https":
+        return _PTO_ISA_HTTPS
+    return _PTO_ISA_SSH
+
+
+def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None,
+                   clone_protocol: str = "ssh") -> bool:
     """
     Clone pto-isa repository, optionally at a specific commit.
 
@@ -188,10 +197,11 @@ def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None) -> bool:
             logger.info(f"Cloning pto-isa to {clone_path}...")
             logger.info("This may take a few moments on first run...")
 
+        repo_url = _pto_isa_repo_url(clone_protocol)
         result = subprocess.run(
             [
                 "git", "clone",
-                _PTO_ISA_REPO,
+                repo_url,
                 str(clone_path)
             ],
             capture_output=True,
@@ -281,7 +291,8 @@ def _update_pto_isa_to_latest(clone_path: Path, verbose: bool = False) -> None:
         logger.warning(f"Unexpected error updating pto-isa: {e}")
 
 
-def _ensure_pto_isa_root(verbose: bool = False, commit: Optional[str] = None) -> Optional[str]:
+def _ensure_pto_isa_root(verbose: bool = False, commit: Optional[str] = None,
+                         clone_protocol: str = "ssh") -> Optional[str]:
     """
     Ensure PTO_ISA_ROOT is available, either from environment or cloned repo.
 
@@ -314,11 +325,13 @@ def _ensure_pto_isa_root(verbose: bool = False, commit: Optional[str] = None) ->
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        return _ensure_pto_isa_root_locked(clone_path, verbose=verbose, commit=commit)
+        return _ensure_pto_isa_root_locked(clone_path, verbose=verbose, commit=commit,
+                                          clone_protocol=clone_protocol)
 
 
 def _ensure_pto_isa_root_locked(
-    clone_path: Path, verbose: bool = False, commit: Optional[str] = None
+    clone_path: Path, verbose: bool = False, commit: Optional[str] = None,
+    clone_protocol: str = "ssh",
 ) -> Optional[str]:
     """Inner logic for _ensure_pto_isa_root, called while holding the file lock."""
 
@@ -326,14 +339,15 @@ def _ensure_pto_isa_root_locked(
     if not _is_pto_isa_cloned():
         if verbose:
             logger.info("PTO_ISA_ROOT not set, cloning pto-isa repository...")
-        if not _clone_pto_isa(verbose=verbose, commit=commit):
+        if not _clone_pto_isa(verbose=verbose, commit=commit,
+                              clone_protocol=clone_protocol):
             # Another parallel process may have completed the clone
             if not _is_pto_isa_cloned():
                 if verbose:
                     logger.warning("Failed to automatically clone pto-isa.")
                     logger.warning("You can manually clone it with:")
                     logger.warning(f"  mkdir -p {clone_path.parent}")
-                    logger.warning(f"  git clone {_PTO_ISA_REPO} {clone_path}")
+                    logger.warning(f"  git clone {_pto_isa_repo_url(clone_protocol)} {clone_path}")
                     logger.warning("Or set PTO_ISA_ROOT to an existing pto-isa installation:")
                     logger.warning("  export PTO_ISA_ROOT=/path/to/pto-isa")
                 return None
@@ -434,6 +448,7 @@ class CodeRunner:
         pto_isa_commit: Optional[str] = None,
         build_dir: Optional[str] = None,
         repeat_rounds: Optional[int] = None,
+        clone_protocol: str = "ssh",
     ):
         # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
         _setup_logging_if_needed()
@@ -447,6 +462,7 @@ class CodeRunner:
         # Resolve device ID
         self.device_id = device_id if device_id is not None else 0
         self.pto_isa_commit = pto_isa_commit
+        self.clone_protocol = clone_protocol
         self.build_dir = build_dir
 
         # Load configurations
@@ -727,7 +743,8 @@ class CodeRunner:
         from elf_parser import extract_text_section
 
         # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
-        pto_isa_root = _ensure_pto_isa_root(verbose=True, commit=self.pto_isa_commit)
+        pto_isa_root = _ensure_pto_isa_root(verbose=True, commit=self.pto_isa_commit,
+                                          clone_protocol=self.clone_protocol)
         if pto_isa_root is None:
             raise EnvironmentError(
                 "PTO_ISA_ROOT could not be resolved.\n"
@@ -951,11 +968,13 @@ class CodeRunner:
 
 def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",
                        enable_profiling=False, run_all_cases=False, case_name=None,
-                       pto_isa_commit=None, build_dir=None, repeat_rounds=None):
+                       pto_isa_commit=None, build_dir=None, repeat_rounds=None,
+                       clone_protocol="ssh"):
     """Factory: creates a CodeRunner based on kernel_config."""
     return CodeRunner(kernels_dir=kernels_dir, golden_path=golden_path,
                       device_id=device_id, platform=platform,
                       enable_profiling=enable_profiling,
                       run_all_cases=run_all_cases, case_name=case_name,
                       pto_isa_commit=pto_isa_commit, build_dir=build_dir,
-                      repeat_rounds=repeat_rounds)
+                      repeat_rounds=repeat_rounds,
+                      clone_protocol=clone_protocol)

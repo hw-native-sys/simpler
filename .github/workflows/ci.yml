@@ -57,7 +57,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run simulation examples (a2a3sim)
-        run: ./ci.sh -p a2a3sim -c 1b22fea -t 600
+        run: ./ci.sh -p a2a3sim -c 1b22fea -t 600 --clone-protocol https
 
   run-example-on-a5sim:
     runs-on: ${{ matrix.os }}
@@ -107,7 +107,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
       - name: Run simulation examples (a5sim)
-        run: ./ci.sh -p a5sim -c 1b22fea -t 600
+        run: ./ci.sh -p a5sim -c 1b22fea -t 600 --clone-protocol https
 
   run-example-on-device:
     runs-on: self-hosted
@@ -120,4 +120,4 @@ jobs:
       - name: Run on-device examples
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a2a3 -d ${DEVICE_RANGE} --parallel -c 1b22fea -t 600
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a2a3 -d ${DEVICE_RANGE} --parallel -c 1b22fea -t 600 --clone-protocol https

@@ -206,12 +206,7 @@ The simulation platform (a2a3sim) emulates the AICPU/AICore execution model:
 
 ### Kernel Compilation Failed (a2a3)
 
-The test framework auto-clones pto-isa on first run. If this fails, clone it manually:
-```bash
-mkdir -p examples/scripts/_deps
-git clone --branch main https://github.com/PTO-ISA/pto-isa.git examples/scripts/_deps/pto-isa
-```
-Or set PTO_ISA_ROOT to an existing installation:
+The test framework auto-clones pto-isa on first run. If this fails, see [Test Framework Documentation](../../../scripts/README.md) for clone options, or set PTO_ISA_ROOT to an existing installation:
 ```bash
 export PTO_ISA_ROOT=/path/to/pto-isa
 ```

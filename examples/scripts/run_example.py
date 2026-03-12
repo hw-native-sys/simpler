@@ -41,6 +41,7 @@ if python_dir.exists():
 golden_dir = project_root / "golden"
 if golden_dir.exists():
     sys.path.insert(0, str(golden_dir))
+sys.path.insert(0, str(script_dir))
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +185,13 @@ Golden.py interface:
         help="Number of rounds to run per case (overrides kernel_config RUNTIME_CONFIG['rounds'])"
     )
 
+    parser.add_argument(
+        "--clone-protocol",
+        choices=["ssh", "https"],
+        default="ssh",
+        help="Git protocol for cloning pto-isa (default: ssh)"
+    )
+
     args = parser.parse_args()
 
     if args.all and args.case:
@@ -219,9 +227,6 @@ Golden.py interface:
     # Set environment variable for C++ side
     os.environ['PTO_LOG_LEVEL'] = log_level_str
 
-    # Add script_dir for code_runner (now co-located)
-    sys.path.insert(0, str(script_dir))
-
     # Validate paths
     kernels_path = Path(args.kernels)
     golden_path = Path(args.golden)
@@ -254,6 +259,7 @@ Golden.py interface:
             pto_isa_commit=args.pto_isa_commit,
             build_dir=args.savetemp,
             repeat_rounds=args.rounds,
+            clone_protocol=args.clone_protocol,
         )
 
         # Snapshot existing device logs before the run so we can identify the
