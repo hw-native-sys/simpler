@@ -236,6 +236,7 @@ enum class AicpuPhaseId : uint32_t {
     SCHED_DISPATCH    = 1,  // Dispatch ready tasks to idle cores
     SCHED_SCAN        = 2,  // Incremental scan for root tasks
     SCHED_IDLE_WAIT   = 3,  // Idle/spinning (no progress)
+    SCHED_PHASE_COUNT = 4,  // Sentinel: number of scheduler phases
     // Orchestrator phases (16-24)
     ORCH_SYNC      = 16,  // tensormap sync
     ORCH_ALLOC     = 17,  // task_ring_alloc

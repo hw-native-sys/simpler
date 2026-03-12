@@ -74,11 +74,13 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 #endif
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid) do { \
-    _t1 = get_sys_cnt_aicpu(); \
-    acc += (_t1 - _t0); \
-    _t0 = _t1; \
-} while(0)
+#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                    \
+    do {                                                                              \
+        _t1 = get_sys_cnt_aicpu();                                                    \
+        acc += (_t1 - _t0);                                                           \
+        perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
+        _t0 = _t1;                                                                    \
+    } while (0)
 #else
 #define CYCLE_COUNT_START()
 #define CYCLE_COUNT_LAP(acc)

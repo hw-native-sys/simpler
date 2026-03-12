@@ -625,15 +625,31 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
             "pid": 4
         })
 
-        # Thread name metadata
-        events.append({
-            "args": {"name": "Orchestrator"},
-            "cat": "__metadata",
-            "name": "thread_name",
-            "ph": "M",
-            "pid": 4,
-            "tid": 4000
-        })
+        # Normalize orchestrator_phases: support both per-thread nested format
+        # (list of lists) and legacy flat format (list of dicts)
+        orch_threads = orchestrator_phases if orchestrator_phases else []
+
+        # Thread name metadata for each orchestrator thread
+        for orch_idx in range(len(orch_threads)):
+            tid = 4000 + orch_idx
+            name = f"Orch_{orch_idx}"
+            events.append({
+                "args": {"name": name},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": 4,
+                "tid": tid
+            })
+        if not orch_threads and orchestrator_data:
+            events.append({
+                "args": {"name": "Orchestrator"},
+                "cat": "__metadata",
+                "name": "thread_name",
+                "ph": "M",
+                "pid": 4,
+                "tid": 4000
+            })
 
     if orchestrator_phases:
         # Per-task orchestrator phase bars
@@ -649,39 +665,41 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
             "orch_scope_end": "generic_work",
         }
 
-        for record in orchestrator_phases:
-            phase = record.get("phase", "unknown")
-            start_us = record["start_time_us"]
-            end_us = record["end_time_us"]
-            dur = end_us - start_us
-            submit_idx = record.get("submit_idx", 0)
-            task_id = record.get("task_id", -1)
+        for orch_idx, thread_records in enumerate(orch_threads):
+            tid = 4000 + orch_idx
+            for record in thread_records:
+                phase = record.get("phase", "unknown")
+                start_us = record["start_time_us"]
+                end_us = record["end_time_us"]
+                dur = end_us - start_us
+                submit_idx = record.get("submit_idx", 0)
+                task_id = record.get("task_id", -1)
 
-            # Strip "orch_" prefix for display name
-            display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
+                # Strip "orch_" prefix for display name
+                display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
 
-            # Show task_id in name for task-specific phases
-            if task_id >= 0:
-                label = f"{display_name}(t{task_id})"
-            else:
-                label = f"{display_name}({submit_idx})"
+                # Show task_id in name for task-specific phases
+                if task_id >= 0:
+                    label = f"{display_name}(t{task_id})"
+                else:
+                    label = f"{display_name}({submit_idx})"
 
-            event = {
-                "args": {
-                    "phase": phase,
-                    "submit_idx": submit_idx,
-                    "task_id": task_id
-                },
-                "cat": "orchestrator",
-                "cname": orch_phase_colors.get(phase, "generic_work"),
-                "name": label,
-                "ph": "X",
-                "pid": 4,
-                "tid": 4000,
-                "ts": start_us,
-                "dur": dur
-            }
-            events.append(event)
+                event = {
+                    "args": {
+                        "phase": phase,
+                        "submit_idx": submit_idx,
+                        "task_id": task_id
+                    },
+                    "cat": "orchestrator",
+                    "cname": orch_phase_colors.get(phase, "generic_work"),
+                    "name": label,
+                    "ph": "X",
+                    "pid": 4,
+                    "tid": tid,
+                    "ts": start_us,
+                    "dur": dur
+                }
+                events.append(event)
 
     elif orchestrator_data:
         # Fallback: cumulative summary as single bar
@@ -851,13 +869,14 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
 
     # Orchestrator FINALIZE → Scheduler DISPATCH arrows (per task_id)
     if orchestrator_phases and scheduler_phases:
-        # Collect orch_finalize records keyed by task_id
+        # Flatten per-thread orch phases and track source thread
         orch_finalize_by_task = {}
-        for record in orchestrator_phases:
-            if record.get("phase") == "orch_finalize":
-                tid = record.get("task_id", -1)
-                if tid >= 0:
-                    orch_finalize_by_task[tid] = record
+        for orch_idx, thread_records in enumerate(orch_threads):
+            for record in thread_records:
+                if record.get("phase") == "orch_finalize":
+                    task_id = record.get("task_id", -1)
+                    if task_id >= 0:
+                        orch_finalize_by_task[task_id] = (record, orch_idx)
 
         # Use core_to_sched_thread mapping (built above) to find the correct
         # scheduler thread for each task's core.
@@ -871,7 +890,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                 if dispatch_us <= 0:
                     continue
 
-                finalize_rec = orch_finalize_by_task[tid]
+                finalize_rec, orch_idx = orch_finalize_by_task[tid]
                 # Use finalize start_time: init_task() runs at the beginning of FINALIZE,
                 # making the task dispatchable before FINALIZE ends. Using start avoids
                 # reverse arrows when the scheduler dispatches during FINALIZE.
@@ -881,6 +900,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
 
                 if matched_thread is not None:
                     sched_tid = 3000 + matched_thread
+                    orch_tid = 4000 + orch_idx
 
                     # Flow: Orchestrator finalize start → Scheduler DISPATCH
                     events.append({
@@ -889,7 +909,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                         "name": "orch→dispatch",
                         "ph": "s",
                         "pid": 4,
-                        "tid": 4000,
+                        "tid": orch_tid,
                         "ts": finalize_start_us
                     })
                     events.append({
@@ -1037,7 +1057,9 @@ Examples:
             if orchestrator_data:
                 print(f"  Orchestrator: {orchestrator_data.get('submit_count', 0)} tasks")
             if orchestrator_phases:
-                print(f"  Orchestrator phases: {len(orchestrator_phases)} per-task records")
+                total_orch = sum(len(t) for t in orchestrator_phases)
+                print(f"  Orchestrator threads: {len(orchestrator_phases)}")
+                print(f"  Total orchestrator phase records: {total_orch}")
             if core_to_thread:
                 print(f"  Core-to-thread mapping: {len(core_to_thread)} cores")
 

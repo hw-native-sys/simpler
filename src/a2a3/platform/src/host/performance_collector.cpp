@@ -345,6 +345,15 @@ void ProfMemoryManager::mgmt_loop() {
 // PerformanceCollector Implementation
 // =============================================================================
 
+/**
+ * Check if a phase ID belongs to a scheduler phase (vs orchestrator phase).
+ * Scheduler phases: SCHED_COMPLETE(0), SCHED_DISPATCH(1), SCHED_SCAN(2), SCHED_IDLE_WAIT(3)
+ * Orchestrator phases: ORCH_SYNC(16) through ORCH_SCOPE_END(24)
+ */
+static bool is_scheduler_phase(AicpuPhaseId id) {
+    return static_cast<uint32_t>(id) < static_cast<uint32_t>(AicpuPhaseId::SCHED_PHASE_COUNT);
+}
+
 PerformanceCollector::~PerformanceCollector() {
     if (perf_shared_mem_host_ != nullptr) {
         LOG_WARN("PerformanceCollector destroyed without finalize()");
@@ -613,8 +622,7 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
             num_sched_for_poll = PLATFORM_MAX_AICPU_THREADS;
         }
         collected_phase_records_.clear();
-        collected_phase_records_.resize(num_sched_for_poll);
-        collected_orch_phase_records_.clear();
+        collected_phase_records_.resize(PLATFORM_MAX_AICPU_THREADS);
     }
 
     idle_start.reset();
@@ -664,14 +672,8 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
                 }
 
                 uint32_t tidx = info.index;
-                if (tidx < static_cast<uint32_t>(num_sched_for_poll)) {
-                    for (uint32_t i = 0; i < count; i++) {
-                        collected_phase_records_[tidx].push_back(buf->records[i]);
-                    }
-                } else {
-                    for (uint32_t i = 0; i < count; i++) {
-                        collected_orch_phase_records_.push_back(buf->records[i]);
-                    }
+                for (uint32_t i = 0; i < count; i++) {
+                    collected_phase_records_[tidx].push_back(buf->records[i]);
                 }
 
                 LOG_DEBUG("Collected %u phase records from thread %u", count, tidx);
@@ -722,9 +724,6 @@ void PerformanceCollector::drain_remaining_buffers() {
         if (num_sched > PLATFORM_MAX_AICPU_THREADS) {
             num_sched = PLATFORM_MAX_AICPU_THREADS;
         }
-        if (collected_phase_records_.size() < static_cast<size_t>(num_sched)) {
-            collected_phase_records_.resize(num_sched);
-        }
     }
 
     int drained_perf = 0;
@@ -754,14 +753,8 @@ void PerformanceCollector::drain_remaining_buffers() {
                 count = PLATFORM_PHASE_RECORDS_PER_THREAD;
             }
             uint32_t tidx = info.index;
-            if (tidx < static_cast<uint32_t>(num_sched)) {
-                for (uint32_t i = 0; i < count; i++) {
-                    collected_phase_records_[tidx].push_back(buf->records[i]);
-                }
-            } else {
-                for (uint32_t i = 0; i < count; i++) {
-                    collected_orch_phase_records_.push_back(buf->records[i]);
-                }
+            for (uint32_t i = 0; i < count; i++) {
+                collected_phase_records_[tidx].push_back(buf->records[i]);
             }
             drained_phase += count;
         }
@@ -803,11 +796,7 @@ void PerformanceCollector::collect_phase_data() {
     }
     LOG_INFO("Collecting remaining phase data: %d scheduler threads", num_sched_threads);
 
-    int total_slots = (num_sched_threads < PLATFORM_MAX_AICPU_THREADS)
-                      ? num_sched_threads + 1 : num_sched_threads;
-    if (collected_phase_records_.size() < static_cast<size_t>(num_sched_threads)) {
-        collected_phase_records_.resize(num_sched_threads);
-    }
+    int total_slots = PLATFORM_MAX_AICPU_THREADS;
 
     // Scan remaining PhaseBufferStates for active buffers with partial data.
     // READY buffers were already enqueued to the ReadyQueue and collected via
@@ -833,14 +822,8 @@ void PerformanceCollector::collect_phase_data() {
                     count = PLATFORM_PHASE_RECORDS_PER_THREAD;
                 }
 
-                if (t < num_sched_threads) {
-                    for (uint32_t i = 0; i < count; i++) {
-                        collected_phase_records_[t].push_back(pbuf->records[i]);
-                    }
-                } else {
-                    for (uint32_t i = 0; i < count; i++) {
-                        collected_orch_phase_records_.push_back(pbuf->records[i]);
-                    }
+                for (uint32_t i = 0; i < count; i++) {
+                    collected_phase_records_[t].push_back(pbuf->records[i]);
                 }
                 total_phase_records += count;
             }
@@ -848,11 +831,16 @@ void PerformanceCollector::collect_phase_data() {
     }
 
     // Log per-thread totals
-    for (int t = 0; t < num_sched_threads; t++) {
-        LOG_INFO("  Thread %d: %zu phase records", t, collected_phase_records_[t].size());
-    }
-    if (!collected_orch_phase_records_.empty()) {
-        LOG_INFO("  Orchestrator: %zu per-task phase records", collected_orch_phase_records_.size());
+    for (size_t t = 0; t < collected_phase_records_.size(); t++) {
+        if (!collected_phase_records_[t].empty()) {
+            size_t sched_count = 0, orch_count = 0;
+            for (const auto& r : collected_phase_records_[t]) {
+                if (is_scheduler_phase(r.phase_id)) sched_count++;
+                else orch_count++;
+            }
+            LOG_INFO("  Thread %zu: %zu records (sched=%zu, orch=%zu)",
+                     t, collected_phase_records_[t].size(), sched_count, orch_count);
+        }
     }
 
     // Read orchestrator summary
@@ -873,7 +861,6 @@ void PerformanceCollector::collect_phase_data() {
         for (const auto& v : collected_phase_records_) {
             if (!v.empty()) { has_accumulated = true; break; }
         }
-        if (!collected_orch_phase_records_.empty()) has_accumulated = true;
     }
     has_phase_data_ = (total_phase_records > 0 || orch_valid || has_accumulated);
 
@@ -957,11 +944,6 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                 }
             }
         }
-        for (const auto& pr : collected_orch_phase_records_) {
-            if (pr.start_time > 0 && pr.start_time < base_time_cycles) {
-                base_time_cycles = pr.start_time;
-            }
-        }
         if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC &&
             collected_orch_summary_.start_time > 0 &&
             collected_orch_summary_.start_time < base_time_cycles) {
@@ -1036,34 +1018,50 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
 
     // Step 8: Write phase profiling data (version 2)
     if (has_phase_data_) {
-        // AICPU scheduler phases
+        auto sched_phase_name = [](AicpuPhaseId id) -> const char* {
+            switch (id) {
+                case AicpuPhaseId::SCHED_COMPLETE:    return "complete";
+                case AicpuPhaseId::SCHED_DISPATCH:    return "dispatch";
+                case AicpuPhaseId::SCHED_SCAN:        return "scan";
+                case AicpuPhaseId::SCHED_IDLE_WAIT:   return "idle";
+                default: return "unknown";
+            }
+        };
+
+        auto orch_phase_name = [](AicpuPhaseId id) -> const char* {
+            switch (id) {
+                case AicpuPhaseId::ORCH_SYNC:      return "orch_sync";
+                case AicpuPhaseId::ORCH_ALLOC:     return "orch_alloc";
+                case AicpuPhaseId::ORCH_PARAMS:    return "orch_params";
+                case AicpuPhaseId::ORCH_LOOKUP:    return "orch_lookup";
+                case AicpuPhaseId::ORCH_HEAP:      return "orch_heap";
+                case AicpuPhaseId::ORCH_INSERT:    return "orch_insert";
+                case AicpuPhaseId::ORCH_FANIN:     return "orch_fanin";
+                case AicpuPhaseId::ORCH_FINALIZE:  return "orch_finalize";
+                case AicpuPhaseId::ORCH_SCOPE_END: return "orch_scope_end";
+                default: return "unknown";
+            }
+        };
+
+        // AICPU scheduler phases (filtered from unified collected_phase_records_)
         outfile << ",\n  \"aicpu_scheduler_phases\": [\n";
         for (size_t t = 0; t < collected_phase_records_.size(); t++) {
             outfile << "    [\n";
-            const auto& thread_records = collected_phase_records_[t];
-            for (size_t r = 0; r < thread_records.size(); r++) {
-                const auto& pr = thread_records[r];
+            bool first = true;
+            for (const auto& pr : collected_phase_records_[t]) {
+                if (!is_scheduler_phase(pr.phase_id)) continue;
                 double start_us = cycles_to_us(pr.start_time - base_time_cycles);
                 double end_us = cycles_to_us(pr.end_time - base_time_cycles);
-
-                const char* phase_name = "unknown";
-                switch (pr.phase_id) {
-                    case AicpuPhaseId::SCHED_COMPLETE:    phase_name = "complete"; break;
-                    case AicpuPhaseId::SCHED_DISPATCH:    phase_name = "dispatch"; break;
-                    case AicpuPhaseId::SCHED_SCAN:        phase_name = "scan"; break;
-                    case AicpuPhaseId::SCHED_IDLE_WAIT:   phase_name = "idle"; break;
-                    default: break;
-                }
-
+                if (!first) outfile << ",\n";
                 outfile << "      {\"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
                         << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
-                        << ", \"phase\": \"" << phase_name << "\""
+                        << ", \"phase\": \"" << sched_phase_name(pr.phase_id) << "\""
                         << ", \"loop_iter\": " << pr.loop_iter
                         << ", \"tasks_processed\": " << pr.tasks_processed
                         << "}";
-                if (r < thread_records.size() - 1) outfile << ",";
-                outfile << "\n";
+                first = false;
             }
+            if (!first) outfile << "\n";
             outfile << "    ]";
             if (t < collected_phase_records_.size() - 1) outfile << ",";
             outfile << "\n";
@@ -1092,37 +1090,35 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
             outfile << "  }";
         }
 
-        // Per-task orchestrator phase records
-        if (!collected_orch_phase_records_.empty()) {
+        // Per-task orchestrator phase records (filtered from unified collected_phase_records_)
+        bool has_orch_phases = false;
+        for (const auto& v : collected_phase_records_) {
+            for (const auto& r : v) {
+                if (!is_scheduler_phase(r.phase_id)) { has_orch_phases = true; break; }
+            }
+            if (has_orch_phases) break;
+        }
+        if (has_orch_phases) {
             outfile << ",\n  \"aicpu_orchestrator_phases\": [\n";
-
-            auto orch_phase_name = [](AicpuPhaseId id) -> const char* {
-                switch (id) {
-                    case AicpuPhaseId::ORCH_SYNC:      return "orch_sync";
-                    case AicpuPhaseId::ORCH_ALLOC:     return "orch_alloc";
-                    case AicpuPhaseId::ORCH_PARAMS:    return "orch_params";
-                    case AicpuPhaseId::ORCH_LOOKUP:    return "orch_lookup";
-                    case AicpuPhaseId::ORCH_HEAP:      return "orch_heap";
-                    case AicpuPhaseId::ORCH_INSERT:    return "orch_insert";
-                    case AicpuPhaseId::ORCH_FANIN:     return "orch_fanin";
-                    case AicpuPhaseId::ORCH_FINALIZE:  return "orch_finalize";
-                    case AicpuPhaseId::ORCH_SCOPE_END: return "orch_scope_end";
-                    default: return "unknown";
+            for (size_t t = 0; t < collected_phase_records_.size(); t++) {
+                outfile << "    [\n";
+                bool first = true;
+                for (const auto& pr : collected_phase_records_[t]) {
+                    if (is_scheduler_phase(pr.phase_id)) continue;
+                    double start_us = cycles_to_us(pr.start_time - base_time_cycles);
+                    double end_us = cycles_to_us(pr.end_time - base_time_cycles);
+                    if (!first) outfile << ",\n";
+                    outfile << "      {\"phase\": \"" << orch_phase_name(pr.phase_id) << "\""
+                            << ", \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
+                            << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
+                            << ", \"submit_idx\": " << pr.loop_iter
+                            << ", \"task_id\": " << static_cast<int32_t>(pr.tasks_processed)
+                            << "}";
+                    first = false;
                 }
-            };
-
-            for (size_t r = 0; r < collected_orch_phase_records_.size(); r++) {
-                const auto& pr = collected_orch_phase_records_[r];
-                double start_us = cycles_to_us(pr.start_time - base_time_cycles);
-                double end_us = cycles_to_us(pr.end_time - base_time_cycles);
-
-                outfile << "    {\"phase\": \"" << orch_phase_name(pr.phase_id) << "\""
-                        << ", \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
-                        << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
-                        << ", \"submit_idx\": " << pr.loop_iter
-                        << ", \"task_id\": " << static_cast<int32_t>(pr.tasks_processed)
-                        << "}";
-                if (r < collected_orch_phase_records_.size() - 1) outfile << ",";
+                if (!first) outfile << "\n";
+                outfile << "    ]";
+                if (t < collected_phase_records_.size() - 1) outfile << ",";
                 outfile << "\n";
             }
             outfile << "  ]";
@@ -1243,7 +1239,6 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
     was_registered_ = false;
     collected_perf_records_.clear();
     collected_phase_records_.clear();
-    collected_orch_phase_records_.clear();
     core_to_thread_.clear();
     has_phase_data_ = false;
     device_id_ = -1;

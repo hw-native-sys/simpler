@@ -1684,6 +1684,13 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
 
             pto2_set_orch_thread_idx(orch_idx);
 
+#if PTO2_PROFILING
+            // Each orchestrator thread sets its own phase buffer index (thread-local)
+            if (runtime->enable_profiling) {
+                perf_aicpu_set_orch_thread_idx(thread_idx);
+            }
+#endif
+
             // Call orchestration function wrapped in an outer scope
             DEV_ALWAYS("Thread %d: Calling aicpu_orchestration_entry from SO (orch_idx=%d/(0~%d))",
                        thread_idx, orch_idx, orch_thread_num_ - 1);

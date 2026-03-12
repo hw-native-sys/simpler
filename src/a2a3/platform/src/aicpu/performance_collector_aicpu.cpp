@@ -25,7 +25,7 @@ static PerfBufferState* s_perf_buffer_states[PLATFORM_MAX_CORES] = {};
 static PhaseBufferState* s_phase_buffer_states[PLATFORM_MAX_AICPU_THREADS] = {};
 static PhaseBuffer* s_current_phase_buf[PLATFORM_MAX_AICPU_THREADS] = {};
 
-static int s_orch_thread_idx = -1;
+static __thread int s_orch_thread_idx = -1;
 
 /**
  * Enqueue ready buffer to per-thread queue
