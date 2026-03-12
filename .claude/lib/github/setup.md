@@ -27,7 +27,7 @@ DEFAULT_BRANCH="main"
 
 ```bash
 if ! git remote | grep -q "^upstream$"; then
-  git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+  git remote add upstream "git@github.com:$UPSTREAM_REPO.git"
 fi
 git fetch upstream
 ```
