@@ -34,6 +34,7 @@ Runtime::Runtime() {
     orch_built_on_host_ = true;
     pto2_gm_sm_ptr_ = nullptr;
     pto2_gm_heap_ptr_ = nullptr;
+    pto2_slot_states_ptr_ = nullptr;
     orch_args_ = nullptr;
     orch_arg_count_ = 0;
 
@@ -93,6 +94,7 @@ int Runtime::get_orch_arg_count() const { return orch_arg_count_; }
 void Runtime::set_orch_built_on_host(bool v) { orch_built_on_host_ = v; }
 void Runtime::set_pto2_gm_sm_ptr(void* p) { pto2_gm_sm_ptr_ = p; }
 void Runtime::set_pto2_gm_heap(void* p) { pto2_gm_heap_ptr_ = p; }
+void Runtime::set_pto2_slot_states_ptr(void* p) { pto2_slot_states_ptr_ = p; }
 void Runtime::set_orch_args(uint64_t* args, int count) {
     orch_arg_count_ = count <= RUNTIME_MAX_ARGS ? count : RUNTIME_MAX_ARGS;
     if (args && orch_arg_count_ > 0) {
@@ -165,10 +167,14 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         return;
     }
 
-    // Get PTO2 data structures
+    // Get slot states for fanout traversal
+    PTO2TaskSlotState* slot_states = static_cast<PTO2TaskSlotState*>(pto2_slot_states_ptr_);
+    if (slot_states == nullptr) {
+        return;
+    }
+
+    // Get window mask from shared memory header
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
-    PTO2TaskDescriptor* task_descriptors = reinterpret_cast<PTO2TaskDescriptor*>(
-        static_cast<char*>(sm_base) + header->task_descriptors_offset);
     int32_t window_mask = header->task_window_size - 1;
 
     uint32_t count = perf_buf->count;
@@ -177,13 +183,13 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         PerfRecord* record = &perf_buf->records[i];
         int32_t task_id = record->task_id;
 
-        // Get TaskDescriptor from PTO2 shared memory
+        // Get slot state for fanout traversal
         int32_t slot = task_id & window_mask;
-        PTO2TaskDescriptor* task = &task_descriptors[slot];
+        PTO2TaskSlotState& ss = slot_states[slot];
 
         // Fill fanout information by traversing the linked list
         record->fanout_count = 0;
-        PTO2DepListEntry* cur = task->fanout_head;
+        PTO2DepListEntry* cur = ss.fanout_head;
 
         while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
             record->fanout[record->fanout_count++] = cur->task_id;

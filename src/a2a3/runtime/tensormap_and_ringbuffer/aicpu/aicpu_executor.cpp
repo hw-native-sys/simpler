@@ -219,6 +219,12 @@ struct AicpuExecutor {
     uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
     uint32_t core_dispatch_counts_[RUNTIME_MAX_WORKER]; // Per-core total dispatched task counter (for buffer management)
 
+    uint64_t* func_id_to_addr_;
+    uint64_t get_function_bin_addr(int func_id) const {
+        if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
+        return func_id_to_addr_[func_id];
+    }
+
     // ===== Methods =====
     int32_t init(Runtime* runtime);
     int32_t handshake_all_cores(Runtime* runtime);
@@ -235,10 +241,9 @@ struct AicpuExecutor {
     // Build slim PTO2DispatchPayload: only function_bin_addr + args.
     // Metadata (mixed_task_id, subslot, kernel_id, core_type) stays in TaskDescriptor.
     void build_pto2_payload(PTO2DispatchPayload* out,
-        Runtime* runtime,
         int32_t kernel_id,
         PTO2TaskPayload* task_pl) {
-        out->function_bin_addr = runtime->get_function_bin_addr(kernel_id);
+        out->function_bin_addr = get_function_bin_addr(kernel_id);
         int32_t n = 0;
         for (int32_t i = 0; i < task_pl->param_count; i++) {
             if (!task_pl->is_tensor[i]) {
@@ -480,7 +485,7 @@ struct AicpuExecutor {
     ) {
         PTO2DispatchPayload* payload = &s_pto2_payload_per_core[core_id];
         int32_t slot_idx = static_cast<int32_t>(subslot);
-        build_pto2_payload(payload, runtime, task->kernel_id[slot_idx], task_pl);
+        build_pto2_payload(payload, task->kernel_id[slot_idx], task_pl);
         s_executing_subslot[core_id] = subslot;
 #if PTO2_PROFILING
         if (profiling_enabled) {
@@ -765,6 +770,8 @@ int32_t AicpuExecutor::init(Runtime* runtime) {
         return -1;
     }
 
+    func_id_to_addr_ = runtime->func_id_to_addr_;
+
     // Read execution parameters from runtime
     thread_num_ = runtime->sche_cpu_num;
     orch_thread_num_ = runtime->orch_thread_num;
@@ -947,13 +954,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
     // Local-first dispatch buffers (stack-allocated, one per CoreType per scheduling thread).
     // Initialized once; must be empty at the start of each iteration.
-    constexpr int LOCAL_READY_CAP_PER_TYPE = 64;
+    constexpr int LOCAL_READY_CAP_PER_TYPE = 256;
     int32_t local_aic_ids[LOCAL_READY_CAP_PER_TYPE];
     int32_t local_aiv_ids[LOCAL_READY_CAP_PER_TYPE];
     PTO2LocalReadyBuffer local_bufs[PTO2_LOCAL_DISPATCH_TYPE_NUM];  // [0]=AIC, [1]=AIV
     local_bufs[0].reset(local_aic_ids, LOCAL_READY_CAP_PER_TYPE);
     local_bufs[1].reset(local_aiv_ids, LOCAL_READY_CAP_PER_TYPE);
-    int32_t deferred_release_ids[128];
+    int32_t deferred_release_ids[256];
     int32_t deferred_release_count = 0;
 
     bool cores_released = false;
@@ -1046,6 +1053,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             );
         }
         if (completed_this_turn > 0) {
+#if PTO2_SCHED_PROFILING
+            rt->scheduler.tasks_completed.fetch_add(completed_this_turn, std::memory_order_relaxed);
+#endif
             int32_t prev = completed_tasks_.fetch_add(completed_this_turn, std::memory_order_relaxed);
             int32_t new_total = prev + completed_this_turn;
             last_progress_count = new_total;
@@ -1063,13 +1073,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         if (!try_completed) {
             CYCLE_COUNT_LAP(sched_idle_cycle);
         } else {
+            CYCLE_COUNT_LAP(sched_complete_cycle);
             if (profiling_enabled && phase_complete_count > 0) {
                 perf_aicpu_record_phase(
                     thread_idx, AicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, sched_loop_count, phase_complete_count);
                 _t0_phase = _t1;
                 phase_complete_count = 0;
             }
-            CYCLE_COUNT_LAP(sched_complete_cycle);
         }
 #endif
 
@@ -1226,13 +1236,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         if (!try_pushed) {
             CYCLE_COUNT_LAP(sched_idle_cycle);
         } else {
+            CYCLE_COUNT_LAP(sched_dispatch_cycle);
             if (profiling_enabled && phase_dispatch_count > 0) {
                 perf_aicpu_record_phase(
                     thread_idx, AicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, sched_loop_count, phase_dispatch_count);
                 _t0_phase = _t1;
                 phase_dispatch_count = 0;
             }
-            CYCLE_COUNT_LAP(sched_dispatch_cycle);
 #endif
         }
 
@@ -1264,9 +1274,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 int32_t cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
                 for (int32_t si = 0; si < task_count; si++) {
                     int32_t slot = si & window_mask;
-                    PTO2TaskState st = sched->task_state[slot].load(std::memory_order_relaxed);
-                    int32_t rc = sched->fanin_refcount[slot].load(std::memory_order_relaxed);
-                    int32_t fi = task_descriptors[slot].fanin_count;
+                    PTO2TaskState st = sched->slot_states[slot].task_state.load(std::memory_order_relaxed);
+                    int32_t rc = sched->slot_states[slot].fanin_refcount.load(std::memory_order_relaxed);
+                    int32_t fi = sched->slot_states[slot].fanin_count;
                     int32_t kid = task_descriptors[slot].kernel_id[0];
                     if (st >= PTO2_TASK_COMPLETED) continue; // Already done
                     if (st == PTO2_TASK_READY || st == PTO2_TASK_RUNNING) { cnt_inflight++; continue; }
@@ -1340,12 +1350,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 SPIN_WAIT_HINT();
             }
 #if PTO2_PROFILING
+            CYCLE_COUNT_LAP(sched_idle_cycle);
             if (profiling_enabled) {
                 perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT,
                                         _t0_phase, _t1, sched_loop_count, 0);
                 _t0_phase = _t1;
             }
-            CYCLE_COUNT_LAP(sched_idle_cycle);
 #endif
         }
     }
@@ -1633,6 +1643,9 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     unlink(so_path);
                     return -1;
                 }
+
+                // Wire up slot_states pointer for profiling (complete_perf_records)
+                runtime->set_pto2_slot_states_ptr(rt->scheduler.slot_states);
 
                 // Store shared state for other orchestrator threads
                 orch_func_ = orch_func;

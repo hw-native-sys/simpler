@@ -52,7 +52,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
+void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
 
     void* dev_A = (void*)(uintptr_t)args[ARG_PTR_A];
@@ -75,6 +75,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     int matmul_batch = (int)config[3];
     int add_batch = (int)config[4];
 
+    LOG_ALWAYS(rt, "[alternating_orch] thread num: %d, idx: %d", orch_thread_num, orch_thread_index);
     LOG_INFO(rt, "[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d",
              batch, M, N, matmul_batch, add_batch);
 
@@ -103,7 +104,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     int max_groups = num_matmul_groups > num_add_groups ? num_matmul_groups : num_add_groups;
 
     // Interleaved submit: matmul and add groups alternate
-    for (int group_idx = 0; group_idx < max_groups; group_idx++) {
+    for (int group_idx = orch_thread_index; group_idx < max_groups; group_idx += orch_thread_num) {
         if (group_idx < num_matmul_groups) {
             int start_task_idx = group_idx * matmul_batch;
             uint64_t offset = (uint64_t)start_task_idx * MATMUL_ELEMS;
@@ -147,7 +148,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
         }
     }
 
-    LOG_INFO(rt, "[alternating_orch] Submitted %d matmul groups and %d add groups",
+    LOG_ALWAYS(rt, "[alternating_orch] Submitted %d matmul groups and %d add groups",
              total_matmul, total_add);
 }
 
