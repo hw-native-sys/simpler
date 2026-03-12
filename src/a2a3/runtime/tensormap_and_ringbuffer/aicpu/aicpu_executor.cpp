@@ -345,6 +345,7 @@ struct AicpuExecutor {
                             if (fe > fanin_max_degree) fanin_max_degree = fe;
 #endif
                         }
+                        deferred_release_ids[deferred_release_count++] = mixed_task_id;
                     }
                 }
                 ct.move_running_to_idle(i);

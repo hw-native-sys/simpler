@@ -13,7 +13,7 @@ ATOL = 1e-3
 
 ALL_CASES = {
     "Case1": {
-        "batch": 64,
+        "batch": 256,
         "num_heads": 16,
         "kv_head_num": 1,
         "head_dim": 128,
