@@ -34,14 +34,21 @@ Validate PR state: OPEN (continue), CLOSED (warn user), MERGED (exit).
 
 ## Step 2: Add Remote (if needed)
 
-```bash
-FORK_REMOTE="pr-$PR_NUMBER"
+If the PR head is on the canonical repo (`$HEAD_REPO_OWNER == $UPSTREAM_OWNER`), use the existing `upstream` remote. Otherwise, use the PR author's username as the remote name.
 
-if git remote | grep -q "^${FORK_REMOTE}$"; then
-  echo "Remote '$FORK_REMOTE' already exists, fetching latest..."
+```bash
+if [ "$HEAD_REPO_OWNER" = "$UPSTREAM_OWNER" ]; then
+  # PR branch is on the canonical repo — use upstream
+  FORK_REMOTE="upstream"
 else
-  git remote add "$FORK_REMOTE" \
-    "git@github.com:$HEAD_REPO_OWNER/$HEAD_REPO_NAME.git"
+  # PR branch is on a fork — use author name as remote
+  FORK_REMOTE="$HEAD_REPO_OWNER"
+  if git remote | grep -q "^${FORK_REMOTE}$"; then
+    echo "Remote '$FORK_REMOTE' already exists, fetching latest..."
+  else
+    git remote add "$FORK_REMOTE" \
+      "git@github.com:$HEAD_REPO_OWNER/$HEAD_REPO_NAME.git"
+  fi
 fi
 
 git fetch "$FORK_REMOTE" "$HEAD_BRANCH"
@@ -62,4 +69,4 @@ Checked out PR #$PR_NUMBER ($PR_AUTHOR)
   Push:   PUSH_REMOTE=$FORK_REMOTE  BRANCH_NAME=$LOCAL_BRANCH:$HEAD_BRANCH
 ```
 
-Remind user that `/github-pr $PR_NUMBER` and `/address-pr-comments $PR_NUMBER` will pick up the correct push target automatically.
+Remind user that `/github-pr` and `/address-pr-comments` will pick up the correct push target automatically (via upstream tracking).

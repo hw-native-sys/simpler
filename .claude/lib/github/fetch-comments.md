@@ -2,12 +2,13 @@
 
 Fetches all unresolved review threads for a given PR.
 
+**Important:** Inline values directly into the GraphQL query string. Do NOT use `-f`/`-F` flags with GraphQL `$variables` — bash mangles the `$` signs. See [common-issues](./common-issues.md) for details.
+
 ```bash
-COMMENTS_JSON=$(gh api graphql -f owner="$PR_REPO_OWNER" -f repo="$PR_REPO_NAME" -F number=$PR_NUMBER \
-  -f query='
-query($owner: String!, $repo: String!, $number: Int!) {
-  repository(owner: $owner, name: $repo) {
-    pullRequest(number: $number) {
+gh api graphql -f query='
+query {
+  repository(owner: "OWNER", name: "REPO") {
+    pullRequest(number: NUMBER) {
       reviewThreads(first: 100) {
         nodes {
           id
@@ -29,21 +30,22 @@ query($owner: String!, $repo: String!, $number: Int!) {
       }
     }
   }
-}')
+}'
+```
 
-# Filter to unresolved threads only
-UNRESOLVED=$(echo "$COMMENTS_JSON" | jq '.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)')
+Replace `OWNER`, `REPO`, `NUMBER` with actual values (e.g., `"ChaoWao"`, `"simpler"`, `276`).
 
-# Check if we hit the pagination limit
-THREAD_COUNT=$(echo "$COMMENTS_JSON" | jq '.data.repository.pullRequest.reviewThreads.nodes | length')
-if [ "$THREAD_COUNT" -eq 100 ]; then
-  echo "Warning: PR has 100+ review threads. Some threads may not be fetched."
-  echo "Consider manually checking the PR for additional unresolved comments."
-fi
+Use `--jq` to filter unresolved threads:
+
+```bash
+gh api graphql -f query='...' \
+  --jq '[.data.repository.pullRequest.reviewThreads.nodes[] | select(.isResolved == false)]'
 ```
 
 **Limits:**
-- `reviewThreads(first: 100)`: Fetches up to 100 threads. PRs with more threads will show a warning.
-- `comments(first: 50)`: Fetches up to 50 comments per thread. Sufficient for most review discussions.
+- `reviewThreads(first: 100)`: Fetches up to 100 threads.
+- `comments(first: 50)`: Fetches up to 50 comments per thread.
 
-Output: JSON array of unresolved threads with their comments.
+Output: JSON array of unresolved threads. Each thread has:
+- `id` — GraphQL node ID (for resolving via mutation)
+- `comments.nodes[].databaseId` — REST API ID (for replying)

@@ -42,10 +42,16 @@ case "$PERMISSION" in
     WORK_BRANCH="$HEAD_BRANCH"
     ;;
   maintainer)
-    FORK_REMOTE="pr-$PR_NUMBER"
-    if ! git remote | grep -q "^${FORK_REMOTE}$"; then
-      git remote add "$FORK_REMOTE" \
-        "git@github.com:$HEAD_REPO_OWNER/$HEAD_REPO_NAME.git"
+    if [ "$HEAD_REPO_OWNER" = "$UPSTREAM_OWNER" ]; then
+      # PR branch is on canonical repo — use upstream
+      FORK_REMOTE="upstream"
+    else
+      # PR branch is on a fork — use author name as remote
+      FORK_REMOTE="$HEAD_REPO_OWNER"
+      if ! git remote | grep -q "^${FORK_REMOTE}$"; then
+        git remote add "$FORK_REMOTE" \
+          "git@github.com:$HEAD_REPO_OWNER/$HEAD_REPO_NAME.git"
+      fi
     fi
     git fetch "$FORK_REMOTE" "$HEAD_BRANCH"
     PUSH_REMOTE="$FORK_REMOTE"
@@ -56,8 +62,4 @@ esac
 
 ## Cleanup After Push
 
-```bash
-if [ "$PERMISSION" = "maintainer" ]; then
-  git remote remove "$FORK_REMOTE" 2>/dev/null || true
-fi
-```
+Do NOT remove the fork remote — it is reused by upstream tracking for auto-detection in `/github-pr` and `/address-pr-comments`.

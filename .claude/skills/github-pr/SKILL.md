@@ -12,8 +12,23 @@ Accept optional PR number (`123`, `#123`) to update a specific PR, or no input (
 ## Setup
 
 1. [Setup](../../lib/github/setup.md) — authenticate and detect context (role, remotes, state)
-2. [Lookup PR](../../lib/github/lookup-pr.md) by PR number (if provided) or branch name to check for existing PR
-3. **If PR number provided:** Run [detect-permission](../../lib/github/detect-permission.md) to setup cross-fork push target
+2. **Auto-detect cross-fork PR context**: If no PR number provided and on a `pr-*-work` branch, check upstream tracking to detect cross-fork push target:
+   ```bash
+   if [ -z "$PR_NUMBER" ]; then
+     UPSTREAM=$(git rev-parse --abbrev-ref "@{upstream}" 2>/dev/null || echo "")
+     if [ -n "$UPSTREAM" ]; then
+       UPSTREAM_REMOTE=$(echo "$UPSTREAM" | cut -d'/' -f1)
+       # Check if upstream remote is NOT origin/upstream (i.e. it's a fork remote)
+       if [ "$UPSTREAM_REMOTE" != "origin" ] && [ "$UPSTREAM_REMOTE" != "upstream" ]; then
+         PUSH_REMOTE="$UPSTREAM_REMOTE"
+         HEAD_BRANCH=$(echo "$UPSTREAM" | cut -d'/' -f2-)
+         BRANCH_NAME="$BRANCH_NAME:$HEAD_BRANCH"
+       fi
+     fi
+   fi
+   ```
+3. [Lookup PR](../../lib/github/lookup-pr.md) by PR number (if provided) or by upstream head branch (`$HEAD_BRANCH` with `--head "$UPSTREAM_REMOTE:$HEAD_BRANCH"` for cross-fork) or by local branch name to check for existing PR
+4. **If PR number provided:** Run [detect-permission](../../lib/github/detect-permission.md) to setup cross-fork push target
 
 ## Route
 
@@ -136,7 +151,7 @@ gh pr edit --title "Updated title" --body "Updated body"
 - [ ] Changes committed via `/git-commit`
 - [ ] Exactly 1 valid commit ahead of base
 - [ ] Rebased onto `$BASE_REF`
-- [ ] Force-pushed to `origin`
+- [ ] Force-pushed to `$PUSH_REMOTE`
 - [ ] PR title/body updated (if commit changed)
 
 ---

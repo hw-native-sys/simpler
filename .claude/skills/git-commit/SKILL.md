@@ -108,7 +108,16 @@ x  Support: update stuff           # Vague, no body for multi-file change
 
 ## Co-Author Policy
 
-**Never** add AI co-author lines (e.g., `Co-Authored-By:`). Commits reflect human authorship only.
+**Never** add AI co-author lines. Commits reflect human authorship only.
+
+**Exception — squash with multiple human authors:** When squashing commits from different people (e.g., updating someone else's PR), preserve all other human authors with `Co-authored-by:` trailers — one per author. This is passed in by `commit-and-push` when it detects other authors before squashing.
+
+```text
+Fix: resolve cross-pipeline race in softmax_prepare
+
+Co-authored-by: Alice <alice@example.com>
+Co-authored-by: Bob <bob@example.com>
+```
 
 ## Post-Commit Verification
 

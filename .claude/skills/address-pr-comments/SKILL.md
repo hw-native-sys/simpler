@@ -14,13 +14,25 @@ Accept PR number (`123`, `#123`), branch name (`feature-branch`), or no input (a
 ## Setup
 
 1. [Setup](../../lib/github/setup.md) — authenticate and detect context (role, remotes, state)
+2. **Auto-detect cross-fork PR context**: If no PR number provided, check upstream tracking to detect cross-fork push target:
+   ```bash
+   UPSTREAM=$(git rev-parse --abbrev-ref "@{upstream}" 2>/dev/null || echo "")
+   if [ -n "$UPSTREAM" ]; then
+     UPSTREAM_REMOTE=$(echo "$UPSTREAM" | cut -d'/' -f1)
+     if [ "$UPSTREAM_REMOTE" != "origin" ] && [ "$UPSTREAM_REMOTE" != "upstream" ]; then
+       PUSH_REMOTE="$UPSTREAM_REMOTE"
+       HEAD_BRANCH=$(echo "$UPSTREAM" | cut -d'/' -f2-)
+     fi
+   fi
+   ```
 
 ## Step 1: Match Input to PR
 
 Use [lookup-pr](../../lib/github/lookup-pr.md) to find the PR.
 
 - If PR number or branch name provided: use "By PR number" or "By branch name" lookup
-- If no input: auto-detect from current branch, or list open PRs for user selection
+- If no input and cross-fork detected (from step 2): search with `--head "$UPSTREAM_REMOTE:$HEAD_BRANCH"`
+- If no input and no cross-fork: auto-detect from current branch, or list open PRs for user selection
 
 Validate PR state: OPEN (continue), CLOSED (warn), MERGED (exit).
 
@@ -89,7 +101,23 @@ Then run [commit-and-push](../../lib/github/commit-and-push.md):
 
 ## Step 8: Reply and Resolve
 
-Use [reply-and-resolve](../../lib/github/reply-and-resolve.md) for each comment.
+For each comment, **both steps are mandatory** (see [reply-and-resolve](../../lib/github/reply-and-resolve.md)):
+
+1. **Reply** using the comment's `databaseId`:
+   ```bash
+   gh api "repos/${PR_REPO_OWNER}/${PR_REPO_NAME}/pulls/${PR_NUMBER}/comments/${COMMENT_DATABASE_ID}/replies" \
+     -f body='Fixed — description of change'
+   ```
+
+2. **Resolve the thread** using the thread's GraphQL node `id` (from fetch-comments, NOT the databaseId):
+   ```bash
+   gh api graphql -f query='
+   mutation { resolveReviewThread(input: {threadId: "THREAD_NODE_ID"}) {
+     thread { isResolved }
+   }}'
+   ```
+
+**Important:** The thread `id` comes from `reviewThreads.nodes[].id` in the fetch-comments GraphQL response. Each thread contains comments — use the thread's `id` to resolve, and the comment's `databaseId` to reply.
 
 ## Checklist
 
@@ -104,3 +132,5 @@ Use [reply-and-resolve](../../lib/github/reply-and-resolve.md) for each comment.
 ## Remember
 
 **Not all comments require code changes.** Evaluate against `.claude/rules/` first. When in doubt, consult user.
+
+**Shell escaping:** See [common-issues](../../lib/github/common-issues.md) for `gh api` quoting pitfalls (use single quotes for `--jq` and `-f body=`).

@@ -14,3 +14,61 @@ Troubleshooting reference for GitHub workflows.
 | PR is merged | Exit — cannot modify merged PR |
 | No unresolved comments | Inform user all comments resolved; exit |
 | No push access | Ask PR author to enable "Allow edits from maintainers" |
+
+## Shell Escaping Pitfalls
+
+### `gh api --jq` with `!=`
+
+Bash history expansion treats `!` as special. Use single quotes for jq expressions:
+
+```bash
+# BAD — bash escapes != to \!=
+gh api ... --jq ".[] | select(.position != null)"
+
+# GOOD — single quotes prevent expansion
+gh api ... --jq '.[] | select(.position != null)'
+```
+
+### `gh api -f body=` with special characters
+
+Always use single quotes for body text to avoid issues with backticks, `$`, `!`, etc.:
+
+```bash
+# BAD — backticks and $ get interpreted
+gh api ... -f body="Fixed — changed to \`grep -F \"<$EMAIL>\"\`"
+
+# GOOD — single quotes, no escaping needed
+gh api ... -f body='Fixed — changed to grep -F for precise matching.'
+```
+
+If the body must contain single quotes, use a heredoc or keep the message simple.
+
+### `gh api graphql` with variables
+
+Do NOT use `-f`/`-F` flags to pass GraphQL `$variables`. Bash mangles `$` signs even inside single-quoted query strings when combined with `-f` flags. Instead, inline values directly:
+
+```bash
+# BAD — $owner/$repo/$number clash with bash
+gh api graphql -f owner="ChaoWao" -f repo="simpler" -F number=276 \
+  -f query='query($owner: String!, $repo: String!, $number: Int!) { ... }'
+
+# GOOD — inline values, no variables
+gh api graphql -f query='query {
+  repository(owner: "'"$PR_REPO_OWNER"'", name: "'"$PR_REPO_NAME"'") {
+    pullRequest(number: '"$PR_NUMBER"') { ... }
+  }
+}'
+```
+
+### `gh api` output piped to python
+
+`gh api` may output extra lines beyond the JSON payload. Do NOT pipe to `python3 -c "json.load(sys.stdin)"`. Use `--jq` or `jq` instead:
+
+```bash
+# BAD — python chokes on extra lines
+gh api ... 2>&1 | python3 -c "import json, sys; json.load(sys.stdin)"
+
+# GOOD — use --jq inline or pipe to jq
+gh api ... --jq '.data.repository'
+gh api ... | jq '.data.repository'
+```

@@ -42,12 +42,18 @@ COMMITS_AHEAD=$(git rev-list HEAD --not "$BASE_REF" --count 2>/dev/null || echo 
 
 ### Squash procedure (when `COMMITS_AHEAD > 1`)
 
-1. Soft-reset to base:
+1. Collect other human authors before squashing (to preserve attribution):
+   ```bash
+   CURRENT_USER_EMAIL=$(git config user.email)
+   OTHER_AUTHORS=$(git log "$BASE_REF"..HEAD --format='%aN <%aE>' \
+     | grep -v -F "<$CURRENT_USER_EMAIL>" | sort -u)
+   ```
+2. Soft-reset to base:
    ```bash
    git reset --soft "$BASE_REF"
    ```
-2. All changes are now staged. Delegate to `/git-commit` to create a single commit with a proper message based on the combined diff.
-3. **Re-verify** the count:
+3. All changes are now staged. Delegate to `/git-commit` to create a single commit with a proper message based on the combined diff. If `OTHER_AUTHORS` is non-empty, append `Co-authored-by:` trailers for each human author.
+4. **Re-verify** the count:
    ```bash
    COMMITS_AHEAD=$(git rev-list HEAD --not "$BASE_REF" --count)
    # Must be exactly 1. If not, something went wrong — do NOT push.
