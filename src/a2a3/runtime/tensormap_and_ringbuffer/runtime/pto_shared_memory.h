@@ -160,15 +160,6 @@ static inline PTO2TaskDescriptor* pto2_sm_get_task(PTO2SharedMemoryHandle* handl
     return &handle->task_descriptors[task_id & window_mask];
 }
 
-/**
- * Get task descriptor by task slot
- * Uses runtime window_size for ring buffer indexing (not compile-time constant)
- */
-static inline PTO2TaskDescriptor& pto2_sm_get_task_by_slot(PTO2SharedMemoryHandle* handle,
-                                                    int32_t slot) {
-    return handle->task_descriptors[slot];
-}
-
 // =============================================================================
 // Debug Utilities
 // =============================================================================

@@ -349,7 +349,11 @@ struct alignas(64) PTO2TaskSlotState {
     std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
 
     PTO2TaskPayload* payload;
+
+    PTO2TaskDescriptor* task;
 };
+
+static_assert(sizeof(PTO2TaskSlotState) == 64);
 
 // =============================================================================
 // Cycle Cost Function Type

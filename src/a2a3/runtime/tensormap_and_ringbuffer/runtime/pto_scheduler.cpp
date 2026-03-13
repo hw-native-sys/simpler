@@ -85,7 +85,7 @@ bool pto2_ready_queue_init(PTO2ReadyQueue* queue, uint64_t capacity) {
 
     for (uint64_t i = 0; i < capacity; i++) {
         queue->slots[i].sequence.store((int64_t)i, std::memory_order_relaxed);
-        queue->slots[i].task_slot = -1;
+        queue->slots[i].slot_state = nullptr;
     }
 
     return true;

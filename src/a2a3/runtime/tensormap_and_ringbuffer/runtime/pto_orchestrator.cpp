@@ -327,6 +327,7 @@ void pto2_submit_mixed_task(
         slot_state.fanout_refcount.store(0, std::memory_order_release);
         slot_state.fanin_refcount.store(0, std::memory_order_release);
         slot_state.payload = payload;
+        slot_state.task = &task;
         scope_tasks_push(orch, &slot_state);
     } else {
         scope_tasks_push(orch, nullptr);
@@ -507,7 +508,7 @@ void pto2_submit_mixed_task(
                          + initial_refcount;
         if (new_rc >= fanin_count + 1) {
             PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
-            sched->ready_queues[static_cast<int32_t>(shape)].push(slot);
+            sched->ready_queues[static_cast<int32_t>(shape)].push(&cur_slot_state);
         }
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
         // Per producer: fetch_add(fanout_count) + load(task_state) + store(unlock) = 3 atomics
