@@ -36,10 +36,6 @@
 #define SINGLE_CACHE_LINE 0
 #define CACHELINE_OUT 0
 
-// pipe_barrier - memory barrier in simulation (hardware pipeline synchronization)
-#define PIPE_ALL 0
-#define pipe_barrier(pipe) __sync_synchronize()
-
 // SPIN_WAIT_HINT - CPU pause hint + OS yield for idle polling loops in simulation.
 // In simulation, all AICore/AICPU threads share a small number of host CPU cores.
 // The CPU hint (pause/yield) reduces pipeline waste, and sched_yield() lets the OS

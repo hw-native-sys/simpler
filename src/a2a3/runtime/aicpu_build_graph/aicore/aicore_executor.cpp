@@ -27,8 +27,9 @@ typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
  * All kernels unpack their own arguments from the args array.
  *
  * @param task Pointer to task in global memory (null during initialization)
+ * @param pipe_sync_fn Compile-time determined pipeline sync function (AIC or AIV specific)
  */
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task) {
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task, PipeSyncFunc pipe_sync_fn) {
     // Null task pointer indicates no work assigned (initialization state)
     if (task == nullptr) {
         return;
@@ -45,11 +46,10 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* 
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)task->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
 
-    // Ensure all memory writes are visible to other cores
-    pipe_barrier(PIPE_ALL);
+    pipe_sync_fn();
 }
 
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type) {
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type, PipeSyncFunc pipe_sync_fn) {
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
@@ -74,7 +74,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         // Execute task if assigned (task != 0 means valid Task* pointer)
         if (my_hank->task_status == 1 && my_hank->task != 0) {
             __gm__ Task* task_ptr = reinterpret_cast<__gm__ Task*>(my_hank->task);
-            execute_task(task_ptr);
+            execute_task(task_ptr, pipe_sync_fn);
             // Mark task as complete (task_status: 0=idle, 1=busy)
             my_hank->task_status = 0;
         }

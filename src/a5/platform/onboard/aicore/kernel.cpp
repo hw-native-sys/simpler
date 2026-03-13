@@ -21,7 +21,23 @@ class Runtime;
 [[block_local]] int block_idx;
 [[block_local]] CoreType core_type;
 
-extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type);
+extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type, PipeSyncFunc pipe_sync_fn);
+
+/**
+ * Pipeline synchronization function
+ *
+ * AIV cores: Wait for PIPE_MTE3 (store pipeline)
+ * AIC cores: Wait for PIPE_FIX (cube unit pipeline)
+ */
+ __aicore__ inline void pipe_sync_aiv() {
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+}
+
+__aicore__ inline void pipe_sync_aic() {
+    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+}
 
 /**
  * Kernel entry point with control loop
@@ -47,5 +63,7 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime
     block_idx = get_block_idx();
     core_type = CoreType::AIC;
 #endif
-    aicore_execute(runtime, block_idx, core_type);
+
+    PipeSyncFunc pipe_sync_fn = (core_type == CoreType::AIV) ? pipe_sync_aiv : pipe_sync_aic;
+    aicore_execute(runtime, block_idx, core_type, pipe_sync_fn);
 }

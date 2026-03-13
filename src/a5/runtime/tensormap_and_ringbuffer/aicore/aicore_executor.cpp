@@ -20,8 +20,9 @@ typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
  * matching ref_runtime implementation for a2a3 compatibility.
  *
  * @param task_ptr Pointer to PTO2DispatchPayload in global memory
+ * @param pipe_sync_fn Compile-time determined pipeline sync function (AIC or AIV specific)
  */
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ void* task_ptr) {
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ void* task_ptr, PipeSyncFunc pipe_sync_fn) {
     __gm__ PTO2DispatchPayload* payload = reinterpret_cast<__gm__ PTO2DispatchPayload*>(task_ptr);
     if (payload == nullptr || payload->function_bin_addr == 0) {
         return;
@@ -30,8 +31,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ void* 
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(payload->args));
 
-    // Ensure all memory writes are visible to other cores
-    pipe_barrier(PIPE_ALL);
+    pipe_sync_fn();
 }
 
 /**
@@ -48,8 +48,9 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ void* 
  * @param runtime Pointer to Runtime in global memory
  * @param core_idx Core index (core ID)
  * @param core_type Core type (AIC or AIV)
+ * @param pipe_sync_fn Compile-time determined pipeline sync function (AIC or AIV specific)
  */
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int core_idx, CoreType core_type) {
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int core_idx, CoreType core_type, PipeSyncFunc pipe_sync_fn) {
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[core_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
@@ -112,7 +113,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             }
 
             // Execute the task
-            execute_task(reinterpret_cast<__gm__ void*>(payload));
+            execute_task(reinterpret_cast<__gm__ void*>(payload), pipe_sync_fn);
 
             // Performance profiling: record task execution
             if (profiling_enabled) {

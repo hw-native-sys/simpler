@@ -6,18 +6,17 @@
 
 typedef void (*KernelFunc)(__gm__ int64_t*);
 
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task) {
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task, PipeSyncFunc pipe_sync_fn) {
     if (task->function_bin_addr == 0) {
         return;
     }
     KernelFunc kernel = (KernelFunc)task->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
 
-    // Ensure all memory writes are visible to other cores
-    pipe_barrier(PIPE_ALL);
+    pipe_sync_fn();
 }
 
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int core_idx, CoreType core_type) {
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int core_idx, CoreType core_type, PipeSyncFunc pipe_sync_fn) {
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[core_idx]);
 
     // In multi-round execution the DeviceRunner singleton keeps AICore threads alive
@@ -69,7 +68,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             __gm__ Task* task_ptr = &(runtime->tasks[actual_task_id]);
             uint64_t start_time = get_sys_cnt_aicore();
 
-            execute_task(task_ptr);
+            execute_task(task_ptr, pipe_sync_fn);
 
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();

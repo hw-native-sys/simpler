@@ -19,8 +19,12 @@ typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
  * Reads function_bin_addr and args from the dispatch payload.
  *
  * @param payload Pointer to PTO2DispatchPayload in global memory
+ * @param pipe_sync_fn Compile-time determined pipeline sync function (AIC or AIV specific)
  */
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2DispatchPayload* payload) {
+__aicore__ __attribute__((always_inline)) static void execute_task(
+    __gm__ PTO2DispatchPayload* payload,
+    PipeSyncFunc pipe_sync_fn
+) {
     if (payload == nullptr || payload->function_bin_addr == 0) {
         return;
     }
@@ -28,8 +32,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(payload->args));
 
-    // Ensure all memory writes are visible to other cores
-    pipe_barrier(PIPE_ALL);
+    pipe_sync_fn();
 }
 
 /**
@@ -46,8 +49,9 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * @param runtime Pointer to Runtime in global memory
  * @param block_idx Block index (core ID)
  * @param core_type Core type (AIC or AIV)
+ * @param pipe_sync_fn Compile-time determined pipeline sync function (AIC or AIV specific)
  */
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type) {
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type, PipeSyncFunc pipe_sync_fn) {
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
 
     // In multi-round execution the DeviceRunner singleton keeps AICore threads alive
@@ -115,7 +119,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             }
 
             // Execute the task
-            execute_task(payload);
+            execute_task(payload, pipe_sync_fn);
 
             // Performance profiling: record task execution
             // (func_id and core_type are filled by AICPU at completion time)

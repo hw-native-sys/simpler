@@ -44,4 +44,10 @@
 
 #include "inner_kernel.h"
 
+// =============================================================================
+// Pipeline Synchronization Function Pointer Type
+// =============================================================================
+
+typedef void (*PipeSyncFunc)();
+
 #endif  // PLATFORM_AICORE_H_
