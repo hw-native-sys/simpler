@@ -424,10 +424,10 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    bool release_fanin_and_check_ready(int32_t task_id,
+    bool release_fanin_and_check_ready(int32_t slot,
                                         PTO2TaskDescriptor* task,
                                         PTO2LocalReadyBuffer* local_bufs = nullptr) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(task_id);
+        PTO2TaskSlotState& slot_state = get_slot_state_by_slot(slot);
 
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
@@ -438,6 +438,7 @@ struct PTO2SchedulerState {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
+            int32_t task_id = task->mixed_task_id;
             bool pushed_local = false;
             if (local_bufs) {
                 int32_t buf_idx = (task->active_mask & 0x01) ? 0 : 1;
@@ -452,10 +453,10 @@ struct PTO2SchedulerState {
     }
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    bool release_fanin_and_check_ready(int32_t task_id, PTO2TaskDescriptor* task,
+    bool release_fanin_and_check_ready(int32_t slot, PTO2TaskDescriptor* task,
                                         uint64_t& atomic_count, uint64_t& push_wait,
                                         PTO2LocalReadyBuffer* local_bufs = nullptr) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(task_id);
+        PTO2TaskSlotState& slot_state = get_slot_state_by_slot(slot);
 
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
@@ -467,6 +468,7 @@ struct PTO2SchedulerState {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
                 // Local-first: try per-CoreType thread-local buffer before global queue
                 PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
+                int32_t task_id = task->mixed_task_id;
                 bool pushed_local = false;
                 if (local_bufs) {
                     int32_t buf_idx = (task->active_mask & 0x01) ? 0 : 1;
@@ -483,7 +485,8 @@ struct PTO2SchedulerState {
 #endif
 
     void init_task(int32_t task_id, PTO2TaskDescriptor* task) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(task_id);
+        int32_t slot = get_task_slot(task_id);
+        PTO2TaskSlotState& slot_state = get_slot_state_by_slot(slot);
 
         slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed); // Orchestrator is the unique owner
 
@@ -495,10 +498,10 @@ struct PTO2SchedulerState {
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
         extern uint64_t g_orch_finalize_atomic_count;
         extern uint64_t g_orch_finalize_wait_cycle;
-        release_fanin_and_check_ready(task_id, task,
+        release_fanin_and_check_ready(slot, task,
                                        g_orch_finalize_atomic_count, g_orch_finalize_wait_cycle);
 #else
-        release_fanin_and_check_ready(task_id, task);
+        release_fanin_and_check_ready(slot, task);
 #endif
     }
 
@@ -622,24 +625,23 @@ struct PTO2SchedulerState {
         uint64_t fanout_atomics = 0, push_wait = 0;
 #endif
         while (current != nullptr) {
-            int32_t consumer_id = current->task_id;
-            PTO2TaskDescriptor* consumer = pto2_sm_get_task(sm_handle, consumer_id);
+            PTO2TaskDescriptor& consumer = pto2_sm_get_task_by_slot(sm_handle, current->task_slot);
 #if PTO2_PROFILING
             stats.fanout_edges++;
 #endif
 #if PTO2_SCHED_PROFILING
-            if (release_fanin_and_check_ready(consumer_id, consumer,
+            if (release_fanin_and_check_ready(current->task_slot, &consumer,
                                                fanout_atomics, push_wait, local_bufs)) {
 #if PTO2_PROFILING
                 stats.tasks_enqueued++;
 #endif
             }
 #elif PTO2_PROFILING
-            if (release_fanin_and_check_ready(consumer_id, consumer, local_bufs)) {
+            if (release_fanin_and_check_ready(current->task_slot, &consumer, local_bufs)) {
                 stats.tasks_enqueued++;
             }
 #else
-            release_fanin_and_check_ready(consumer_id, consumer, local_bufs);
+            release_fanin_and_check_ready(current->task_slot, &consumer, local_bufs);
 #endif
             current = current->next;
         }

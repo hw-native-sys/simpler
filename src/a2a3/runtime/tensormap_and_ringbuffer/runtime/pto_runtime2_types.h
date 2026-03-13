@@ -263,7 +263,7 @@ typedef struct {
  * Used for both fanin_list and fanout_list
  */
 struct PTO2DepListEntry {
-    int32_t task_id;          // The dependent/dependency task ID
+    int32_t task_slot;        // Consumer task slot (pre-computed from task_id)
     PTO2DepListEntry* next;      // next entry
 };
 

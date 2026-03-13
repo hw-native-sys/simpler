@@ -176,6 +176,8 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
     // Get window mask from shared memory header
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
     int32_t window_mask = header->task_window_size - 1;
+    PTO2TaskDescriptor* task_descriptors = reinterpret_cast<PTO2TaskDescriptor*>(
+        static_cast<char*>(sm_base) + header->task_descriptors_offset);
 
     uint32_t count = perf_buf->count;
 
@@ -192,7 +194,7 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         PTO2DepListEntry* cur = ss.fanout_head;
 
         while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
-            record->fanout[record->fanout_count++] = cur->task_id;
+            record->fanout[record->fanout_count++] = task_descriptors[cur->task_slot].mixed_task_id;
             cur = cur->next;
         }
     }
