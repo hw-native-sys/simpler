@@ -323,7 +323,7 @@ struct AicpuExecutor {
 #else
                     rt->scheduler.on_mixed_task_complete(slot_state, local_bufs);
 #endif
-                    if (deferred_release_count < 64) {
+                    if (deferred_release_count < 256) {
                         deferred_release_slot_states[deferred_release_count++] = &slot_state;
                     } else {
                         DEV_ALWAYS("Thread %d: release", thread_idx);
@@ -1078,7 +1078,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         for (int bi = 0; bi < PTO2_LOCAL_DISPATCH_TYPE_NUM; bi++) {
             while (local_bufs[bi].count > 0) {
                 PTO2TaskSlotState* slot_state = local_bufs[bi].pop();
-                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state->task->active_mask);
+                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state->active_mask);
                 int32_t ci = tracker.find_cluster_for_shape(shape);
 
                 if (ci >= 0) {

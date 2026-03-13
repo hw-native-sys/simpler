@@ -116,6 +116,7 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
     sched->ring_advance_lock.store(0, std::memory_order_relaxed);
 
     // Initialize local copies of ring pointers
+    sched->task_window_mask = sm_handle->header->task_window_size - 1;
     sched->last_task_alive = 0;
     sched->last_heap_consumed = 0;
     sched->heap_tail = 0;

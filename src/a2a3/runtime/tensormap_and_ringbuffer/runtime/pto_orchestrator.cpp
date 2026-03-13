@@ -310,15 +310,13 @@ void pto2_submit_mixed_task(
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
-    task.active_mask = active_mask;
-    task.subtask_done_mask.store(0, std::memory_order_relaxed);
     task.packed_buffer_base = NULL;
     task.packed_buffer_end = NULL;
 
     // Initialize slot state (scheduler-private)
     PTO2SchedulerState* sched = orch->scheduler;
     if (sched) {
-        PTO2TaskSlotState& slot_state = sched->slot_states[slot];
+        PTO2TaskSlotState& slot_state = sched->get_slot_state_by_slot(slot);
         slot_state.fanin_count = 0;
         slot_state.fanout_head = nullptr;
         slot_state.fanout_lock.store(0, std::memory_order_relaxed);
@@ -328,6 +326,8 @@ void pto2_submit_mixed_task(
         slot_state.fanin_refcount.store(0, std::memory_order_release);
         slot_state.payload = payload;
         slot_state.task = &task;
+        slot_state.active_mask = active_mask;
+        slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
         scope_tasks_push(orch, &slot_state);
     } else {
         scope_tasks_push(orch, nullptr);
@@ -472,7 +472,7 @@ void pto2_submit_mixed_task(
         cur_slot_state.fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
         payload->fanin_actual_count = fanin_count;
         for (int i = 0; i < fanin_count; i++) {
-            payload->fanin_slot_states[i] = &sched->slot_states[task_ring.get_task_slot(fanin_temp[i])];
+            payload->fanin_slot_states[i] = &sched->get_slot_state_by_slot(task_ring.get_task_slot(fanin_temp[i]));
         }
         for (int i = 0; i < fanin_count; i++) {
             int32_t producer_task_id = fanin_temp[i];

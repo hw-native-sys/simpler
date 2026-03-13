@@ -288,12 +288,6 @@ struct PTO2TaskDescriptor {
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
 
-    // Active subtask mask: bit0=AIC, bit1=AIV0, bit2=AIV1
-    uint8_t active_mask;
-
-    // Completion aggregation: each subtask sets its done bit atomically
-    std::atomic<uint8_t> subtask_done_mask;
-
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
     void*    packed_buffer_end;   // End of packed buffer (for heap reclamation)
@@ -352,6 +346,10 @@ struct alignas(64) PTO2TaskSlotState {
     PTO2TaskPayload* payload;
 
     PTO2TaskDescriptor* task;
+
+    // Hot-path completion fields (moved from TaskDescriptor to avoid cross-struct access)
+    uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
+    std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);

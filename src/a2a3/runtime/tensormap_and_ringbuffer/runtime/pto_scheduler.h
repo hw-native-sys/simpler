@@ -290,6 +290,7 @@ struct PTO2SchedulerState {
     void* heap_base;
 
     // === PRIVATE DATA (not in shared memory) ===
+    int32_t task_window_mask;
 
     // Per-task slot state (dynamically allocated, indexed by task_id & task_window_mask)
     // Consolidates task_state, fanin/fanout refcounts, and dependency metadata
@@ -309,13 +310,9 @@ struct PTO2SchedulerState {
     // =========================================================================
     // Inline hot-path methods
     // =========================================================================
-
-    int32_t get_task_slot(int32_t task_id) {
-        return task_id & (sm_handle->header->task_window_size - 1);
-    }
-
+    PTO2TaskSlotState& get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
     PTO2TaskSlotState& get_slot_state_by_task_id(int32_t task_id) {
-        return slot_states[task_id & (sm_handle->header->task_window_size - 1)];
+        return slot_states[task_id & task_window_mask];
     }
 
     void sync_to_sm() {
@@ -339,9 +336,10 @@ struct PTO2SchedulerState {
 
         if (last_task_alive > 0) {
             int32_t last_consumed_id = last_task_alive - 1;
-            PTO2TaskDescriptor* last_consumed = pto2_sm_get_task(sm_handle, last_consumed_id);
-            if (last_consumed->packed_buffer_end != NULL) {
-                heap_tail = (uint64_t)((char*)last_consumed->packed_buffer_end - (char*)heap_base);
+            PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(last_consumed_id);
+            PTO2TaskDescriptor& task = *slot_state.task;
+            if (task.packed_buffer_end != NULL) {
+                heap_tail = (uint64_t)((char*)task.packed_buffer_end - (char*)heap_base);
             }
         }
 
@@ -428,10 +426,10 @@ struct PTO2SchedulerState {
         if (new_refcount == slot_state.fanin_count) {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.task->active_mask);
+            PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
             bool pushed_local = false;
             if (local_bufs) {
-                int32_t buf_idx = (slot_state.task->active_mask & 0x01) ? 0 : 1;
+                int32_t buf_idx = (slot_state.active_mask & 0x01) ? 0 : 1;
                 pushed_local = local_bufs[buf_idx].try_push(&slot_state);
             }
             if (!pushed_local) {
@@ -455,10 +453,10 @@ struct PTO2SchedulerState {
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
                 // Local-first: try per-CoreType thread-local buffer before global queue
-                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.task->active_mask);
+                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
                 bool pushed_local = false;
                 if (local_bufs) {
-                    int32_t buf_idx = (slot_state.task->active_mask & 0x01) ? 0 : 1;
+                    int32_t buf_idx = (slot_state.active_mask & 0x01) ? 0 : 1;
                     pushed_local = local_bufs[buf_idx].try_push(&slot_state);
                 }
                 if (!pushed_local) {
@@ -505,7 +503,7 @@ struct PTO2SchedulerState {
      * Pushes the task back into its shape-based queue.
      */
     void requeue_ready_task(PTO2TaskSlotState& slot_state) {
-        PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.task->active_mask);
+        PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
         ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
     }
 
@@ -531,10 +529,10 @@ struct PTO2SchedulerState {
      */
     bool on_subtask_complete(PTO2TaskSlotState& slot_state, PTO2SubtaskSlot subslot) {
         uint8_t done_bit = (1u << static_cast<uint8_t>(subslot));
-        uint8_t prev_mask = slot_state.task->subtask_done_mask.fetch_or(done_bit, std::memory_order_acq_rel);
+        uint8_t prev_mask = slot_state.subtask_done_mask.fetch_or(done_bit, std::memory_order_acq_rel);
         uint8_t new_mask = prev_mask | done_bit;
 
-        return new_mask == slot_state.task->active_mask;
+        return new_mask == slot_state.active_mask;
     }
 
     /**
