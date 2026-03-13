@@ -290,10 +290,6 @@ struct PTO2SchedulerState {
     // Heap base address (for converting absolute pointers to offsets)
     void* heap_base;
 
-    // === DYNAMIC CONFIGURATION ===
-    uint64_t task_window_size;    // Task window size (power of 2)
-    uint64_t task_window_mask;    // task_window_size - 1 (for fast modulo)
-
     // === PRIVATE DATA (not in shared memory) ===
 
     // Per-task slot state (dynamically allocated, indexed by task_id & task_window_mask)
@@ -316,11 +312,13 @@ struct PTO2SchedulerState {
     // =========================================================================
 
     int32_t get_task_slot(int32_t task_id) {
-        return task_id & task_window_mask;
+        return task_id & (sm_handle->header->task_window_size - 1);
     }
 
     PTO2TaskSlotState& get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
-    PTO2TaskSlotState& get_slot_state_by_task_id(int32_t task_id) { return slot_states[task_id & task_window_mask]; }
+    PTO2TaskSlotState& get_slot_state_by_task_id(int32_t task_id) {
+        return slot_states[task_id & (sm_handle->header->task_window_size - 1)];
+    }
 
     void sync_to_sm() {
         PTO2SharedMemoryHeader* header = sm_handle->header;
@@ -409,15 +407,13 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    void release_producer(int32_t producer_id) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(producer_id);
+    void release_producer(PTO2TaskSlotState& slot_state) {
         slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
         check_and_handle_consumed(slot_state);
     }
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    void release_producer(int32_t producer_id, uint64_t& atomic_count) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(producer_id);
+    void release_producer(PTO2TaskSlotState& slot_state, uint64_t& atomic_count) {
         slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
         atomic_count += 1;  // fanout_refcount.fetch_add
         check_and_handle_consumed(slot_state, atomic_count);
@@ -482,27 +478,6 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    void init_task(int32_t task_id, PTO2TaskDescriptor* task) {
-        int32_t slot = get_task_slot(task_id);
-        PTO2TaskSlotState& slot_state = get_slot_state_by_slot(slot);
-
-        slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed); // Orchestrator is the unique owner
-
-        // Reset fanout_refcount for new task lifecycle.
-        // Do NOT reset fanin_refcount — it may have been incremented by
-        // concurrent on_task_complete between Step 5 and Step 6.
-        slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
-
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-        extern uint64_t g_orch_finalize_atomic_count;
-        extern uint64_t g_orch_finalize_wait_cycle;
-        release_fanin_and_check_ready(slot, task,
-                                       g_orch_finalize_atomic_count, g_orch_finalize_wait_cycle);
-#else
-        release_fanin_and_check_ready(slot, task);
-#endif
-    }
-
     int32_t get_ready_task(PTO2ResourceShape shape) {
         return ready_queues[static_cast<int32_t>(shape)].pop();
     }
@@ -542,15 +517,15 @@ struct PTO2SchedulerState {
         ready_queues[static_cast<int32_t>(shape)].push(task_slot);
     }
 
-    void on_scope_end(const int32_t* task_ids, int32_t count) {
+    void on_scope_end(PTO2TaskSlotState** task_slot_states, int32_t count) {
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
         extern uint64_t g_orch_scope_end_atomic_count;
         for (int32_t i = 0; i < count; i++) {
-            release_producer(task_ids[i], g_orch_scope_end_atomic_count);
+            release_producer(*task_slot_states[i], g_orch_scope_end_atomic_count);
         }
 #else
         for (int32_t i = 0; i < count; i++) {
-            release_producer(task_ids[i]);
+            release_producer(*task_slot_states[i]);
         }
 #endif
     }
@@ -562,10 +537,7 @@ struct PTO2SchedulerState {
      *
      * @return true if this subtask was the last one, completing the mixed task.
      */
-    bool on_subtask_complete(int32_t mixed_task_id, PTO2SubtaskSlot subslot) {
-        int32_t slot = get_task_slot(mixed_task_id);
-        PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(sm_handle, slot);
-
+    bool on_subtask_complete(PTO2TaskDescriptor& task, PTO2SubtaskSlot subslot) {
         uint8_t done_bit = (1u << static_cast<uint8_t>(subslot));
         uint8_t prev_mask = task.subtask_done_mask.fetch_or(done_bit, std::memory_order_acq_rel);
         uint8_t new_mask = prev_mask | done_bit;
@@ -579,20 +551,20 @@ struct PTO2SchedulerState {
      * (i.e., on_subtask_complete returned true).
      * Handles fanout notification, fanin release, and self-consumption check.
      */
-#if PTO2_SCHED_PROFILING
-    PTO2CompletionStats on_mixed_task_complete(int32_t mixed_task_id, int thread_idx,
-                                               PTO2LocalReadyBuffer* local_bufs = nullptr) {
-        PTO2CompletionStats stats = {0, 0, 0, true};
-#elif PTO2_PROFILING
-    PTO2CompletionStats on_mixed_task_complete(int32_t mixed_task_id,
-                                               PTO2LocalReadyBuffer* local_bufs = nullptr) {
-        PTO2CompletionStats stats = {0, 0, 0, true};
+#if PTO2_SCHED_PROFILING || PTO2_PROFILING
+    PTO2CompletionStats
 #else
-    void on_mixed_task_complete(int32_t mixed_task_id,
-                                PTO2LocalReadyBuffer* local_bufs = nullptr) {
+    void
 #endif
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(mixed_task_id);
+    on_mixed_task_complete(PTO2TaskSlotState& slot_state, 
+#if PTO2_SCHED_PROFILING
+        int thread_idx,
+#endif
 
+        PTO2LocalReadyBuffer* local_bufs = nullptr) {
+#if PTO2_SCHED_PROFILING || PTO2_PROFILING
+        PTO2CompletionStats stats = {0, 0, 0, true};
+#endif
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
         extern uint64_t g_sched_lock_atomic_count[], g_sched_lock_wait_cycle[];
@@ -660,7 +632,7 @@ struct PTO2SchedulerState {
      */
 
 #if PTO2_SCHED_PROFILING
-    int32_t on_task_release(int32_t task_id, int32_t thread_idx) {
+    int32_t on_task_release(PTO2TaskSlotState& slot_state, int32_t thread_idx) {
         PTO2_SCHED_CYCLE_START();
         extern uint64_t g_sched_fanin_cycle[], g_sched_fanin_atomic_count[];
         extern uint64_t g_sched_self_atomic_count[];
@@ -668,16 +640,15 @@ struct PTO2SchedulerState {
         extern uint64_t g_sched_complete_count[];
         uint64_t fanin_atomics = 0;
 #else
-    int32_t on_task_release(int32_t task_id) {
+    int32_t on_task_release(PTO2TaskSlotState& slot_state) {
 #endif
-        int32_t slot = get_task_slot(task_id);
-        PTO2TaskPayload* payload = &sm_handle->task_payloads[slot];
+        PTO2TaskPayload* payload = slot_state.payload;
         int32_t fanin_edges = payload->fanin_actual_count;
         for (int32_t i = 0; i < fanin_edges; i++) {
 #if PTO2_SCHED_PROFILING
-            release_producer(payload->fanin_tasks[i], fanin_atomics);
+            release_producer(get_slot_state_by_slot(payload->fanin_task_slots[i]), fanin_atomics);
 #else
-            release_producer(payload->fanin_tasks[i]);
+            release_producer(get_slot_state_by_slot(payload->fanin_task_slots[i]));
 #endif
         }
 #if PTO2_SCHED_PROFILING
@@ -688,12 +659,12 @@ struct PTO2SchedulerState {
         // Self consumed check
 #if PTO2_SCHED_PROFILING
         uint64_t self_atomics = 0;
-        check_and_handle_consumed(get_slot_state_by_slot(slot), self_atomics);
+        check_and_handle_consumed(slot_state, self_atomics);
         g_sched_self_atomic_count[thread_idx] += self_atomics;
         PTO2_SCHED_CYCLE_LAP(g_sched_self_consumed_cycle[thread_idx]);
         g_sched_complete_count[thread_idx]++;
 #else
-        check_and_handle_consumed(get_slot_state_by_slot(slot));
+        check_and_handle_consumed(slot_state);
 #endif
         return fanin_edges;
     }

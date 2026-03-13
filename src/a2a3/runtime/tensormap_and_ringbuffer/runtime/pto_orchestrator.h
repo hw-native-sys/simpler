@@ -54,7 +54,7 @@ struct PTO2OrchestratorState {
     // Single contiguous buffer of task IDs, partitioned by scope level.
     // scope_begins[i] is the index into scope_tasks where scope i starts.
     // Tasks for the top scope occupy [scope_begins[top], scope_tasks_size).
-    int32_t* scope_tasks;          // Flat buffer of task IDs (all scopes concatenated)
+    PTO2TaskSlotState** scope_tasks; // Flat buffer of taskSlotState (all scopes concatenated)
     int32_t scope_tasks_size;       // Number of task IDs currently in the buffer
     int32_t scope_tasks_capacity;   // Allocated capacity of scope_tasks
     int32_t* scope_begins;         // scope_begins[i] = start index of scope i in scope_tasks

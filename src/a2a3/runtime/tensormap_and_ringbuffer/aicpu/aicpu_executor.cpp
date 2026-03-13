@@ -261,7 +261,7 @@ struct AicpuExecutor {
         int32_t& completed_this_turn,
         int32_t& cur_thread_completed,
         bool& made_progress,
-        int32_t deferred_release_ids[],
+        PTO2TaskSlotState* deferred_release_slot_states[],
         int32_t& deferred_release_count,
         PTO2LocalReadyBuffer* local_bufs
 #if PTO2_PROFILING
@@ -303,35 +303,38 @@ struct AicpuExecutor {
                 executing_task_ids[core_id] = AICPU_TASK_INVALID;
                 int32_t mixed_task_id = task_id;
                 PTO2SubtaskSlot subslot = s_executing_subslot[core_id];
+                PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(rt->scheduler.sm_handle, rt->scheduler.get_task_slot(mixed_task_id));
 
                 // Two-stage completion: mark subtask done, then handle mixed-task completion
-                bool mixed_complete = rt->scheduler.on_subtask_complete(mixed_task_id, subslot);
+                bool mixed_complete = rt->scheduler.on_subtask_complete(task, subslot);
                 if (mixed_complete) {
+                    PTO2TaskSlotState& slot_state = rt->scheduler.get_slot_state_by_task_id(mixed_task_id);
 #if PTO2_SCHED_PROFILING
-                    PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(mixed_task_id, thread_idx, local_bufs);
+                    PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(slot_state, thread_idx, local_bufs);
                     notify_edges_total += cstats.fanout_edges;
                     if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
                     notify_tasks_enqueued += cstats.tasks_enqueued;
                     phase_complete_count++;
 #elif PTO2_PROFILING
-                    PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(mixed_task_id, local_bufs);
+                    PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(slot_state, local_bufs);
                     notify_edges_total += cstats.fanout_edges;
                     if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
                     notify_tasks_enqueued += cstats.tasks_enqueued;
                     phase_complete_count++;
 #else
-                    rt->scheduler.on_mixed_task_complete(mixed_task_id, local_bufs);
+                    rt->scheduler.on_mixed_task_complete(slot_state, local_bufs);
 #endif
                     if (deferred_release_count < 64) {
-                        deferred_release_ids[deferred_release_count++] = mixed_task_id;
+                        deferred_release_slot_states[deferred_release_count++] = &slot_state;
                     } else {
                         DEV_ALWAYS("Thread %d: release", thread_idx);
                         while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
-                            int32_t fe =
-                                rt->scheduler.on_task_release(deferred_release_ids[--deferred_release_count], thread_idx);
+                            int32_t fe = rt->scheduler.on_task_release(
+                                *deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
-                            int32_t fe = rt->scheduler.on_task_release(deferred_release_ids[--deferred_release_count]);
+                            int32_t fe =
+                                rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
                             (void)fe;
 #if PTO2_PROFILING
@@ -339,7 +342,7 @@ struct AicpuExecutor {
                             if (fe > fanin_max_degree) fanin_max_degree = fe;
 #endif
                         }
-                        deferred_release_ids[deferred_release_count++] = mixed_task_id;
+                        deferred_release_slot_states[deferred_release_count++] = &slot_state;
                     }
                 }
                 ct.move_running_to_idle(i);
@@ -883,13 +886,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     DEV_INFO("Thread %d: task_descriptors=%p",
              thread_idx, (void*)task_descriptors);
 
-    int32_t window_size = header->task_window_size;
-    if (window_size <= 0 || window_size > PTO2_TASK_WINDOW_SIZE) window_size = PTO2_TASK_WINDOW_SIZE;
-    int32_t window_mask = window_size - 1;
-
     Handshake* hank = static_cast<Handshake*>(runtime->workers);
     DEV_INFO("Thread %d: hank=%p, window_size=%d",
-             thread_idx, (void*)hank, window_size);
+             thread_idx, (void*)hank, header->task_window_size);
 
     // One-time init: assign perf buffers (one thread does it; others wait)
     if (!pto2_init_done_.exchange(true, std::memory_order_acq_rel)) {
@@ -957,7 +956,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     PTO2LocalReadyBuffer local_bufs[PTO2_LOCAL_DISPATCH_TYPE_NUM];  // [0]=AIC, [1]=AIV
     local_bufs[0].reset(local_aic_ids, LOCAL_READY_CAP_PER_TYPE);
     local_bufs[1].reset(local_aiv_ids, LOCAL_READY_CAP_PER_TYPE);
-    int32_t deferred_release_ids[256];
+    PTO2TaskSlotState* deferred_release_slot_states[256];
     int32_t deferred_release_count = 0;
 
     bool cores_released = false;
@@ -1018,7 +1017,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             check_running_cores_for_completion<CoreType::AIC>(
                 thread_idx, tracker.aic(), tracker.core_idle, hank, executing_task_ids,
                 completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_ids, deferred_release_count,
+                deferred_release_slot_states, deferred_release_count,
                 local_bufs
 #if PTO2_PROFILING
                 , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
@@ -1037,7 +1036,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             check_running_cores_for_completion<CoreType::AIV>(
                 thread_idx, tracker.aiv(), tracker.core_idle, hank, executing_task_ids,
                 completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_ids, deferred_release_count,
+                deferred_release_slot_states, deferred_release_count,
                 local_bufs
 #if PTO2_PROFILING
                 , profiling_enabled, complete_probe_count, complete_hit_count, phase_complete_count,
@@ -1253,9 +1252,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             // freeing heap space for the orchestrator without blocking completion polling.
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
-                int32_t fe = rt->scheduler.on_task_release(deferred_release_ids[--deferred_release_count], thread_idx);
+                int32_t fe = rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
-                int32_t fe = rt->scheduler.on_task_release(deferred_release_ids[--deferred_release_count]);
+                int32_t fe = rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
                 (void)fe;
 #if PTO2_PROFILING
@@ -1272,7 +1271,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 PTO2SchedulerState* sched = &rt->scheduler;
                 int32_t cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
                 for (int32_t si = 0; si < task_count; si++) {
-                    int32_t slot = si & window_mask;
+                    int32_t slot = sched->get_task_slot(si);
                     PTO2TaskState st = sched->slot_states[slot].task_state.load(std::memory_order_relaxed);
                     int32_t rc = sched->slot_states[slot].fanin_refcount.load(std::memory_order_relaxed);
                     int32_t fi = sched->slot_states[slot].fanin_count;
@@ -1310,7 +1309,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     int32_t hw_kernel = -1;
                     if (sw_tid >= 0) {
                         int32_t diag_slot = static_cast<int32_t>(s_executing_subslot[cid]);
-                        hw_kernel = task_descriptors[sw_tid & window_mask].kernel_id[diag_slot];
+                        hw_kernel = task_descriptors[sched->get_task_slot(sw_tid)].kernel_id[diag_slot];
                     }
                     uint64_t cond_reg = read_reg(core_id_to_reg_addr_[cid], RegId::COND);
                     DEV_ALWAYS("    core=%d cond=0x%x(state=%d,id=%d) exec_id=%d kernel=%d",
@@ -1325,7 +1324,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     int32_t hw_kernel = -1;
                     if (sw_tid >= 0) {
                         int32_t diag_slot = static_cast<int32_t>(s_executing_subslot[cid]);
-                        hw_kernel = task_descriptors[sw_tid & window_mask].kernel_id[diag_slot];
+                        hw_kernel = task_descriptors[sched->get_task_slot(sw_tid)].kernel_id[diag_slot];
                     }
                     uint64_t cond_reg = read_reg(core_id_to_reg_addr_[cid], RegId::COND);
                     DEV_ALWAYS("    core=%d cond=0x%x(state=%d,id=%d) exec_id=%d kernel=%d",

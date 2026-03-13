@@ -303,6 +303,23 @@ struct PTO2TaskDescriptor {
 // =============================================================================
 
 /**
+ * Task payload data (cold path - only accessed during orchestration and dispatch)
+ *
+ * Separated from PTO2TaskDescriptor to keep the descriptor cache-friendly
+ * for the scheduler's hot completion path (~80 bytes vs ~2912 bytes).
+ */
+struct PTO2TaskPayload {
+    PTO2DispatchPayload dispatch;  // function_bin_addr + args[], built in-place at dispatch time
+    Tensor tensors[16];
+    uint64_t scalar_value[16];
+    bool is_tensor[16];
+    int param_count{0};
+    int32_t fanin_task_slots[PTO2_MAX_INPUTS]; // Producer task slots (cold path, used by on_task_release)
+    int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
+    int32_t dep_pool_mark{0};                  // Dep pool top after this task's submission (for reclamation)
+};
+
+/**
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
  *
  * Consolidates all hot-path scheduling fields into a single cache-friendly
@@ -329,24 +346,9 @@ struct alignas(64) PTO2TaskSlotState {
     int32_t fanin_count;                      // Number of producer dependencies (set once)
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
-    std::atomic<int32_t> fanout_refcount;    // Dynamic: counts released references
-};
+    std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
 
-/**
- * Task payload data (cold path - only accessed during orchestration and dispatch)
- *
- * Separated from PTO2TaskDescriptor to keep the descriptor cache-friendly
- * for the scheduler's hot completion path (~80 bytes vs ~2912 bytes).
- */
-struct PTO2TaskPayload {
-    PTO2DispatchPayload dispatch;  // function_bin_addr + args[], built in-place at dispatch time
-    Tensor tensors[16];
-    uint64_t scalar_value[16];
-    bool is_tensor[16];
-    int param_count{0};
-    int32_t fanin_tasks[PTO2_MAX_INPUTS];   // Producer task IDs (cold path, used by on_task_release)
-    int32_t fanin_actual_count{0};           // Actual fanin count (without the +1 redundance)
-    int32_t dep_pool_mark{0};                // Dep pool top after this task's submission (for reclamation)
+    PTO2TaskPayload* payload;
 };
 
 // =============================================================================

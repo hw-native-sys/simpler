@@ -132,7 +132,7 @@ bool pto2_orchestrator_init(
     // Initialize scope stack: one flat buffer for task IDs + one array for begin offsets
     uint64_t max_depth = PTO2_MAX_SCOPE_DEPTH;
     int32_t init_cap = PTO2_SCOPE_TASKS_INIT_CAP;
-    orch->scope_tasks = (int32_t*)malloc(init_cap * sizeof(int32_t));
+    orch->scope_tasks = (PTO2TaskSlotState**)malloc(init_cap * sizeof(PTO2TaskSlotState*));
     orch->scope_begins = (int32_t*)malloc(max_depth * sizeof(int32_t));
     if (!orch->scope_tasks || !orch->scope_begins) {
         free(orch->scope_tasks);
@@ -176,15 +176,15 @@ void pto2_orchestrator_set_scheduler_mode(
 // Scope Management
 // =============================================================================
 
-static void scope_tasks_push(PTO2OrchestratorState* orch, int32_t task_id) {
+static void scope_tasks_push(PTO2OrchestratorState* orch, PTO2TaskSlotState *task_slot_state) {
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
         int32_t new_cap = orch->scope_tasks_capacity * 2;
-        int32_t* new_buf = (int32_t*)realloc(orch->scope_tasks, new_cap * sizeof(int32_t));
+        PTO2TaskSlotState** new_buf = (PTO2TaskSlotState**)realloc(orch->scope_tasks, new_cap * sizeof(PTO2TaskSlotState*));
         assert(new_buf && "Failed to grow scope task buffer");
         orch->scope_tasks = new_buf;
         orch->scope_tasks_capacity = new_cap;
     }
-    orch->scope_tasks[orch->scope_tasks_size++] = task_id;
+    orch->scope_tasks[orch->scope_tasks_size++] = task_slot_state;
 }
 
 void pto2_scope_begin(PTO2OrchestratorState* orch) {
@@ -326,10 +326,14 @@ void pto2_submit_mixed_task(
         slot_state.fanout_count = 1;
         slot_state.fanout_refcount.store(0, std::memory_order_release);
         slot_state.fanin_refcount.store(0, std::memory_order_release);
+        slot_state.payload = payload;
+        scope_tasks_push(orch, &slot_state);
+    } else {
+        scope_tasks_push(orch, nullptr);
     }
 
     // Register this task in its owning scope
-    scope_tasks_push(orch, task_id);
+    
 
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id);
 
@@ -467,7 +471,7 @@ void pto2_submit_mixed_task(
         cur_slot_state.fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
         payload->fanin_actual_count = fanin_count;
         for (int i = 0; i < fanin_count; i++) {
-            payload->fanin_tasks[i] = fanin_temp[i];
+            payload->fanin_task_slots[i] = task_ring.get_task_slot(fanin_temp[i]);
         }
         for (int i = 0; i < fanin_count; i++) {
             int32_t producer_task_id = fanin_temp[i];
