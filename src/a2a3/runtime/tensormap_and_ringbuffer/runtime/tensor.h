@@ -11,6 +11,24 @@
 constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
 
 /**
+ * Tensor Layout
+ *
+ * Defines memory layout for the last two dimensions (row-major vs column-major).
+ * - ND: Row-major for all dimensions
+ *       2D [M, N]: stride = [N, 1]
+ *       3D [D, M, N]: stride = [M*N, N, 1]
+ * - DN: Column-major for LAST TWO dimensions only
+ *       2D [M, N]: stride = [1, M] (transposed)
+ *       3D [D, M, N]: stride = [M*N, 1, M] (only M,N swapped)
+ *
+ * Note: DN does NOT reverse all dimensions, only the last two.
+ */
+enum class TensorLayout {
+    ND = 0,  // Normal Dimensions
+    DN = 1   // Last two Dimensions transposed (col-major for last 2D)
+};
+
+/**
  * Buffer Handle
  *
  * Represents a device memory buffer with address and total size in bytes.
@@ -45,6 +63,7 @@ struct Segment {
  * - `buffer` contains the underlying memory allocation (addr in bytes, size in bytes)
  * - `raw_shapes[]`, `shapes[]`, `offsets[]` are in ELEMENTS
  * - `dtype` specifies element type for interpreting buffer contents
+ * - `layout` specifies the relationship between logical (shapes) and physical (raw_shapes) dimensions
  *
  * Example: buffer.addr=base, dtype=FLOAT32, raw_shapes=[10, 6], shapes=[3, 6], offsets=[1, 0]
  * Memory access pattern:
@@ -59,6 +78,7 @@ struct Tensor {
     uint64_t start_offset;                         // Cached 1D element offset (precomputed from raw_shapes + offsets)
     uint64_t ndims;                                // Number of dimensions used
     DataType dtype;                                // Data type of tensor elements
+    TensorLayout layout;                           // Tensor layout (ND or DN) for logical-to-physical dimension mapping
     uint64_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
     uint64_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
     uint64_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
@@ -77,8 +97,9 @@ struct Tensor {
         const uint64_t offsets[],
         uint64_t ndims,
         DataType dtype,
-        int32_t version) {
-        init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version);
+        int32_t version,
+        TensorLayout layout = TensorLayout::ND) {
+        init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version, layout);
     }
 
     // --- Initialization ---
@@ -89,11 +110,13 @@ struct Tensor {
         const uint64_t in_offsets[],
         uint64_t in_ndims,
         DataType in_dtype,
-        int32_t in_version) {
+        int32_t in_version,
+        TensorLayout in_layout = TensorLayout::ND) {
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
         ndims = in_ndims;
         dtype = in_dtype;
         version = in_version;
+        layout = in_layout;
         for (uint64_t i = 0; i < in_ndims; i++) {
             raw_shapes[i] = in_raw_shapes[i];
             shapes[i] = in_shapes[i];
@@ -106,6 +129,7 @@ struct Tensor {
         version = other.version;
         ndims = other.ndims;
         dtype = other.dtype;
+        layout = other.layout;
         for (uint64_t i = 0; i < ndims; i++) {
             raw_shapes[i] = other.raw_shapes[i];
             shapes[i] = other.shapes[i];
@@ -118,6 +142,7 @@ struct Tensor {
         ndims = other.ndims;
         dtype = other.dtype;
         version = other.version;
+        layout = other.layout;
         for (uint64_t i = 0; i < ndims; i++) {
             raw_shapes[i] = other.raw_shapes[i];
             shapes[i] = view_shapes[i];
@@ -142,7 +167,20 @@ struct Tensor {
 
     Tensor view(const uint64_t view_shapes[], const uint64_t view_offsets[]) const {
         Tensor result;
-        result.init_with_view(*this, view_shapes, view_offsets);
+        if (layout == TensorLayout::DN && ndims >= 2) {
+            always_assert(ndims <= RUNTIME_MAX_TENSOR_DIMS);
+            uint64_t adjusted_offsets[RUNTIME_MAX_TENSOR_DIMS];
+            // Keep leading dimensions unchanged
+            for (uint64_t i = 0; i < ndims - 2; i++) {
+                adjusted_offsets[i] = view_offsets[i];
+            }
+            // Swap only the last two dimensions (DN reverses row/col order)
+            adjusted_offsets[ndims - 2] = view_offsets[ndims - 1];
+            adjusted_offsets[ndims - 1] = view_offsets[ndims - 2];
+            result.init_with_view(*this, view_shapes, adjusted_offsets);
+        } else {
+            result.init_with_view(*this, view_shapes, view_offsets);
+        }
         return result;
     }
 
@@ -238,6 +276,7 @@ struct Tensor {
         ss << indent << "dtype: " << get_dtype_name(dtype) << std::endl;
         ss << indent << "ndims: " << ndims << std::endl;
         ss << indent << "version: " << version << std::endl;
+        ss << indent << "layout: " << (layout == TensorLayout::ND ? "ND" : "DN") << std::endl;
 
         ss << indent << "raw_shapes: [";
         for (uint64_t i = 0; i < ndims; i++) {
@@ -275,18 +314,48 @@ using TensorData = Tensor;
 // =============================================================================
 /**
  * Create a Tensor for pre-allocated external memory.
+ *
+ * @param addr: Base address of the buffer
+ * @param shapes: Logical shape (user's view, DN-aware)
+ * @param ndims: Number of dimensions
+ * @param dtype: Data type
+ * @param version: Version for dependency tracking
+ * @param layout: Memory layout (ND=row-major, DN=col-major for last 2 dims)
+ *
+ * Note: For DN layout, raw_shapes (physical layout) will have the last two
+ * dimensions swapped compared to the logical shapes.
  */
 static inline Tensor make_tensor_external(void* addr,
     const uint64_t shapes[],
     uint64_t ndims,
     DataType dtype = DataType::FLOAT32,
-    int32_t version = 0) {
+    int32_t version = 0,
+    TensorLayout layout = TensorLayout::ND) {
     static uint64_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
     uint64_t total = 1;
     for (uint64_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version);
+
+    // For DN layout, raw_shapes (physical memory layout) needs last two dims swapped
+    always_assert(ndims <= RUNTIME_MAX_TENSOR_DIMS);
+    uint64_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];
+    if (layout == TensorLayout::DN && ndims >= 2) {
+        // Copy leading dimensions unchanged
+        for (uint64_t i = 0; i < ndims - 2; i++) {
+            raw_shapes[i] = shapes[i];
+        }
+        // Swap last two dimensions for physical layout
+        raw_shapes[ndims - 2] = shapes[ndims - 1];
+        raw_shapes[ndims - 1] = shapes[ndims - 2];
+    } else {
+        // ND layout or ndims < 2: raw_shapes = shapes
+        for (uint64_t i = 0; i < ndims; i++) {
+            raw_shapes[i] = shapes[i];
+        }
+    }
+
+    return Tensor(addr, total * get_element_size(dtype), raw_shapes, shapes, zero_offsets, ndims, dtype, version, layout);
 }
 
 /**
@@ -294,15 +363,44 @@ static inline Tensor make_tensor_external(void* addr,
  * NO memory allocation: only records dtype, shape, and buffer.size in the Tensor struct.
  * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
  * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
+ *
+ * @param shapes: Logical shape (user's view, DN-aware)
+ * @param ndims: Number of dimensions
+ * @param dtype: Data type
+ * @param version: Version for dependency tracking
+ * @param layout: Memory layout (ND=row-major, DN=col-major for last 2 dims)
+ *
+ * Note: For DN layout, raw_shapes (physical layout) will have the last two
+ * dimensions swapped compared to the logical shapes.
  */
 static inline Tensor make_tensor(const uint64_t shapes[],
     uint64_t ndims,
     DataType dtype = DataType::FLOAT32,
-    int32_t version = 0) {
+    int32_t version = 0,
+    TensorLayout layout = TensorLayout::ND) {
     static uint64_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
     uint64_t total = 1;
     for (uint64_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version);
+
+    // For DN layout, raw_shapes (physical memory layout) needs last two dims swapped
+    always_assert(ndims <= RUNTIME_MAX_TENSOR_DIMS);
+    uint64_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];
+    if (layout == TensorLayout::DN && ndims >= 2) {
+        // Copy leading dimensions unchanged
+        for (uint64_t i = 0; i < ndims - 2; i++) {
+            raw_shapes[i] = shapes[i];
+        }
+        // Swap last two dimensions for physical layout
+        raw_shapes[ndims - 2] = shapes[ndims - 1];
+        raw_shapes[ndims - 1] = shapes[ndims - 2];
+    } else {
+        // ND layout or ndims < 2: raw_shapes = shapes
+        for (uint64_t i = 0; i < ndims; i++) {
+            raw_shapes[i] = shapes[i];
+        }
+    }
+
+    return Tensor(0, total * get_element_size(dtype), raw_shapes, shapes, zero_offsets, ndims, dtype, version, layout);
 }
