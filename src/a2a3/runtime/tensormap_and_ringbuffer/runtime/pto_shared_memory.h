@@ -68,7 +68,7 @@ typedef struct {
     std::atomic<uint64_t> graph_output_ptr;   // Address where final output was written (packed buffer)
     std::atomic<uint64_t> graph_output_size;  // Size in bytes
 
-    // Padding to 128-byte cache line
+    // Padding to cache-line-aligned size (ALIGN_UP to PTO2_ALIGN_SIZE)
     uint64_t _padding[4];
 
 } PTO2SharedMemoryHeader;

@@ -264,6 +264,39 @@ void pto2_submit_mixed_task(
     // Submission without an open scope is illegal
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
 
+    // === Scope deadlock pre-check ===
+    // Tasks within a scope hold a fanout_count reference released only at scope_end.
+    // If scope task count >= window_size, no slots can ever be reclaimed → deadlock.
+    {
+        int32_t scope_task_count = orch->scope_tasks_size - orch->scope_begins[orch->scope_stack_top];
+        if (scope_task_count >= orch->task_ring.window_size - 1) {
+            int32_t total_submitted = orch->task_ring.current_index_ptr->load(std::memory_order_acquire);
+            int32_t last_alive = orch->task_ring.last_alive_ptr->load(std::memory_order_acquire);
+            int32_t active_count = total_submitted - last_alive;
+
+            LOG_ERROR("========================================");
+            LOG_ERROR("FATAL: Scope Deadlock Detected!");
+            LOG_ERROR("========================================");
+            LOG_ERROR("Tasks in current scope (%d) >= task_window_size (%d).",
+                      scope_task_count, orch->task_ring.window_size);
+            LOG_ERROR("  scope_depth:        %d", orch->scope_stack_top + 1);
+            LOG_ERROR("  scope_task_count:   %d", scope_task_count);
+            LOG_ERROR("  total_submitted:    %d", total_submitted);
+            LOG_ERROR("  last_task_alive:    %d", last_alive);
+            LOG_ERROR("  active_tasks:       %d / %d", active_count, orch->task_ring.window_size);
+            LOG_ERROR("Root Cause:");
+            LOG_ERROR("  Tasks within a scope hold a fanout_count reference that is only");
+            LOG_ERROR("  released at scope_end. When scope task count >= window_size,");
+            LOG_ERROR("  no slots can be reclaimed -> deadlock.");
+            LOG_ERROR("Solution:");
+            LOG_ERROR("  1. Reduce tasks per scope (use batching/unroll)");
+            LOG_ERROR("  2. Increase PTO2_TASK_WINDOW_SIZE (current: %d)", orch->task_ring.window_size);
+            LOG_ERROR("  3. Split work across multiple scopes");
+            LOG_ERROR("========================================");
+            exit(1);
+        }
+    }
+
     // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
     auto& task_ring = orch->task_ring;
     int32_t task_id = task_ring.pto2_task_ring_alloc();
