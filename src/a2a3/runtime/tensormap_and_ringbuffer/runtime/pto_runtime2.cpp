@@ -84,6 +84,10 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
         return NULL;
     }
 
+    // Set consumed_window_size (default = 4 × task_window_size)
+    uint64_t consumed_window_size = task_window_size * 4;
+    rt->sm_handle->header->consumed_window_size = consumed_window_size;
+
     // Allocate GM heap for output buffers
     rt->gm_heap_size = heap_size;
     #if defined(_POSIX_C_SOURCE) && _POSIX_C_SOURCE >= 200112L
@@ -112,7 +116,7 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
     }
 
     // Initialize scheduler
-    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle, rt->gm_heap)) {
+    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle, rt->gm_heap, consumed_window_size)) {
         pto2_orchestrator_destroy(&rt->orchestrators[0]);
         free(rt->gm_heap);
         pto2_sm_destroy(rt->sm_handle);
@@ -158,8 +162,13 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
         }
     }
 
-    // Initialize scheduler
-    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle, rt->gm_heap)) {
+    // Initialize scheduler (consumed_window_size must be set in header by host)
+    uint64_t cws = sm_handle->header->consumed_window_size;
+    if (cws == 0) {
+        cws = sm_handle->header->task_window_size * 4;
+        sm_handle->header->consumed_window_size = cws;
+    }
+    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle, rt->gm_heap, cws)) {
         for (int i = 0; i < orch_count; i++) {
             pto2_orchestrator_destroy(&rt->orchestrators[i]);
         }

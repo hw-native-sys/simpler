@@ -12,7 +12,7 @@
  * 2. TaskRing - Task slot allocation
  *    - Fixed window size (TASK_WINDOW_SIZE)
  *    - Wrap-around modulo window size
- *    - Implicit reclamation via last_task_alive advancement
+ *    - Implicit reclamation via last_task_released advancement
  *    - Back-pressure: stalls when window is full
  * 
  * 3. DepListPool - Dependency list entry allocation
@@ -241,8 +241,8 @@ struct PTO2TaskRing {
     int32_t window_size;              // Window size (power of 2)
     std::atomic<int32_t>* current_index_ptr;  // Shared atomic in SM header
 
-    // Reference to shared memory last_task_alive (for back-pressure)
-    std::atomic<int32_t>* last_alive_ptr;  // Points to header->last_task_alive
+    // Reference to shared memory last_task_released (for back-pressure)
+    std::atomic<int32_t>* last_released_ptr;  // Points to header->last_task_released
 
     /**
      * Allocate a task slot from task ring
@@ -293,12 +293,12 @@ struct PTO2TaskRing {
 #if PTO2_SPIN_VERBOSE_LOGGING
             // Periodic block notification
             if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count < PTO2_FLOW_CONTROL_SPIN_LIMIT) {
-                int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
+                int32_t last_released = last_released_ptr->load(std::memory_order_acquire);
                 int32_t current = current_index_ptr->load(std::memory_order_acquire);
-                int32_t active_count = current - last_alive;
-                LOG_WARN("[TaskRing] BLOCKED (Flow Control): current=%d, last_alive=%d, "
+                int32_t active_count = current - last_released;
+                LOG_WARN("[TaskRing] BLOCKED (Flow Control): current=%d, last_released=%d, "
                      "active=%d/%d (%.1f%%), spins=%d",
-                     current, last_alive, active_count, window_size,
+                     current, last_released, active_count, window_size,
                      100.0 * active_count / window_size, spin_count);
                 notified = true;
             }
@@ -306,9 +306,9 @@ struct PTO2TaskRing {
 
             // Check for potential deadlock
             if (spin_count >= PTO2_FLOW_CONTROL_SPIN_LIMIT) {
-                int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
+                int32_t last_released = last_released_ptr->load(std::memory_order_acquire);
                 int32_t current = current_index_ptr->load(std::memory_order_acquire);
-                int32_t active_count = current - last_alive;
+                int32_t active_count = current - last_released;
 
                 LOG_ERROR("========================================");
                 LOG_ERROR("FATAL: Flow Control Deadlock Detected!");
@@ -316,15 +316,16 @@ struct PTO2TaskRing {
                 LOG_ERROR("Task Ring is FULL and no progress after %d spins.", spin_count);
                 LOG_ERROR("Flow Control Status:");
                 LOG_ERROR("  - Current task index:  %d", current);
-                LOG_ERROR("  - Last task alive:     %d", last_alive);
+                LOG_ERROR("  - Last task released:  %d", last_released);
                 LOG_ERROR("  - Active tasks:        %d", active_count);
                 LOG_ERROR("  - Window size:         %d", window_size);
                 LOG_ERROR("  - Window utilization:  %.1f%%", 100.0 * active_count / window_size);
                 LOG_ERROR("Root Cause:");
-                LOG_ERROR("  Tasks cannot transition to CONSUMED state because:");
-                LOG_ERROR("  - fanout_count includes 1 for the owning scope");
-                LOG_ERROR("  - scope_end() requires orchestrator to continue");
-                LOG_ERROR("  - But orchestrator is blocked waiting for task ring space");
+                LOG_ERROR("  Main ring is full: no tasks are reaching RELEASED state.");
+                LOG_ERROR("  Possible reasons:");
+                LOG_ERROR("  - Scheduler threads are not making progress");
+                LOG_ERROR("  - Tasks are blocked waiting for dependencies");
+                LOG_ERROR("  - Deferred release backlog is not being flushed");
                 LOG_ERROR("  This creates a circular dependency (deadlock).");
                 LOG_ERROR("Solution:");
                 LOG_ERROR("  Current task_window_size: %d", window_size);
@@ -351,8 +352,8 @@ struct PTO2TaskRing {
     int32_t pto2_task_ring_try_alloc() {
         // Optimistically allocate a task ID
         int32_t task_id = current_index_ptr->fetch_add(1, std::memory_order_acq_rel);
-        int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
-        int32_t active_count = task_id - last_alive;
+        int32_t last_released = last_released_ptr->load(std::memory_order_acquire);
+        int32_t active_count = task_id - last_released;
 
         // Check if there's room (leave at least 1 slot empty)
         if (active_count < window_size - 1) {
@@ -386,18 +387,18 @@ struct PTO2TaskRing {
  * @param ring            Task ring to initialize
  * @param descriptors     Task descriptor array from shared memory
  * @param window_size     Window size (must be power of 2)
- * @param last_alive_ptr  Pointer to shared memory last_task_alive
+ * @param last_released_ptr  Pointer to shared memory last_task_released
  */
 void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
-                          int32_t window_size, std::atomic<int32_t>* last_alive_ptr,
+                          int32_t window_size, std::atomic<int32_t>* last_released_ptr,
                           std::atomic<int32_t>* current_index_ptr);
 
 /**
  * Get number of active tasks in window
  */
 static inline int32_t pto2_task_ring_active_count(PTO2TaskRing* ring) {
-    int32_t last_alive = ring->last_alive_ptr->load(std::memory_order_acquire);
-    return ring->current_index_ptr->load(std::memory_order_acquire) - last_alive;
+    int32_t last_released = ring->last_released_ptr->load(std::memory_order_acquire);
+    return ring->current_index_ptr->load(std::memory_order_acquire) - last_released;
 }
 
 /**
@@ -463,7 +464,7 @@ struct PTO2DepListPool {
 
     /**
      * Advance the tail pointer, reclaiming dead entries.
-     * Called by the orchestrator based on last_task_alive advancement.
+     * Called by the orchestrator based on last_task_released advancement.
      */
     void advance_tail(int32_t new_tail) {
         if (new_tail > tail) {

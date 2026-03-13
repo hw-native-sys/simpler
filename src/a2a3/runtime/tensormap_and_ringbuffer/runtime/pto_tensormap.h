@@ -63,7 +63,7 @@ extern uint64_t g_insert_count;
  * Maps tensor region -> producer task ID
  *
  * Stored in ring buffer pool with lazy invalidation:
- * - Entry is valid only if producer_task_id >= last_task_alive
+ * - Entry is valid only if producer_task_id >= last_task_consumed
  * - Stale entries ignored during lookup
  * - Pool wraps around, overwriting stale entries
  *
@@ -128,7 +128,7 @@ struct PTO2TensorMap {
     int32_t task_window_size;  // Runtime task window size (for slot masking)
 
     // Validity threshold (for lazy invalidation)
-    int32_t last_task_alive;  // Cached value from shared memory
+    int32_t last_task_consumed;  // Cached value from shared memory
 
     PTO2OrchestratorState* orch{nullptr};
 
@@ -200,9 +200,9 @@ struct PTO2TensorMap {
      * Update validity threshold from shared memory
      * Called periodically to refresh the lazy invalidation threshold.
      *
-     * @param last_task_alive  Current value from shared memory
+     * @param last_task_consumed  Current value from shared memory
      */
-    void sync_validity(int32_t last_task_alive) { this->last_task_alive = last_task_alive; }
+    void sync_validity(int32_t last_task_consumed) { this->last_task_consumed = last_task_consumed; }
 
     /**
      * Lookup producer for a tensor region
@@ -318,15 +318,15 @@ struct PTO2TensorMap {
     /**
      * Cleanup stale entries for retired tasks
      *
-     * Called periodically by Orchestrator when last_task_alive advances.
+     * Called periodically by Orchestrator when last_task_consumed advances.
      * Removes entries from bucket chains for tasks in [old, new) range.
      *
-     * @param old_last_task_alive  Previous threshold
-     * @param new_last_task_alive  New threshold
+     * @param old_last_task_consumed  Previous threshold
+     * @param new_last_task_consumed  New threshold
      */
-    void cleanup_retired(int32_t old_last_task_alive, int32_t new_last_task_alive) {
+    void cleanup_retired(int32_t old_last_task_consumed, int32_t new_last_task_consumed) {
         // Iterate through retired tasks and remove their entries from bucket chains
-        for (int32_t task_id = old_last_task_alive; task_id < new_last_task_alive; task_id++) {
+        for (int32_t task_id = old_last_task_consumed; task_id < new_last_task_consumed; task_id++) {
             int32_t task_slot = task_id & (task_window_size - 1);
             PTO2TensorMapEntry* cur_entry = task_entry_head[task_slot];
 
@@ -364,7 +364,7 @@ struct PTO2TensorMap {
      * Check if entry is valid (producer has not retired)
      */
     bool entry_valid(const PTO2TensorMapEntry& entry) const {
-        return entry.producer_task_id >= last_task_alive;
+        return entry.producer_task_id >= last_task_consumed;
     }
 
     void remove_entry(PTO2TensorMapEntry& entry) {

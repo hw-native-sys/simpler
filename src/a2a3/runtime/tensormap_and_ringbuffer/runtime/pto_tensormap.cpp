@@ -108,7 +108,7 @@ bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t
 
     task_window_size = new_task_window_size;
 
-    last_task_alive = 0;
+    last_task_consumed = 0;
 
     return true;
 }
@@ -193,7 +193,7 @@ void PTO2TensorMap::print_stats() {
     LOG_INFO("Empty buckets:       %d", empty_buckets);
     LOG_INFO("Max chain len:       %d", max_chain);
     LOG_INFO("Avg chain len:       %.2f", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
-    LOG_INFO("Last task alive:     %d", last_task_alive);
+    LOG_INFO("Last task consumed:  %d", last_task_consumed);
     LOG_INFO("============================");
 }
 
@@ -213,13 +213,13 @@ void PTO2TensorMap::sync_tensormap() {
     constexpr int MIN_FREE_NUM = 1024;
     always_assert(orch != nullptr);
     while(true) {
-        // Read current last_task_alive from shared memory
-        int32_t new_last_task_alive =
-            orch->sm_handle->header->last_task_alive.load(std::memory_order_acquire);
-        sync_validity(new_last_task_alive);
-        if ((pool_size - next_entry_idx + free_num < MIN_FREE_NUM) || new_last_task_alive - orch->tensormap_last_cleanup >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
-            cleanup_retired(orch->tensormap_last_cleanup, new_last_task_alive);
-            orch->tensormap_last_cleanup = new_last_task_alive;
+        // Read current last_task_consumed from shared memory
+        int32_t new_last_task_consumed =
+            orch->sm_handle->header->last_task_consumed.load(std::memory_order_acquire);
+        sync_validity(new_last_task_consumed);
+        if ((pool_size - next_entry_idx + free_num < MIN_FREE_NUM) || new_last_task_consumed - orch->tensormap_last_cleanup >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
+            cleanup_retired(orch->tensormap_last_cleanup, new_last_task_consumed);
+            orch->tensormap_last_cleanup = new_last_task_consumed;
         } else {
             break;
         }

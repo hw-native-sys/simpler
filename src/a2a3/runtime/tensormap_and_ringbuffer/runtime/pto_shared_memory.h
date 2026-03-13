@@ -49,12 +49,14 @@ typedef struct {
     
     // Written by Scheduler, Read by Orchestrator (for back-pressure)
     std::atomic<uint64_t> heap_tail;          // Heap ring free pointer (on-device, matches pto2_heap_ring_init)
-    std::atomic<int32_t> last_task_alive;     // Task ring tail (oldest active task)
+    std::atomic<int32_t> last_task_consumed;  // Consumed ring tail (oldest unconsumed task, drives heap reclaim)
+    std::atomic<int32_t> last_task_released;  // Main ring tail (oldest unreleased task, drives slot reclaim)
     std::atomic<int32_t> heap_tail_gen;       // Ticket counter for serialized heap_tail writes
                                               // (ensures concurrent threads write in task order)
 
     // === LAYOUT INFO (set once at init) ===
-    uint64_t task_window_size;            // PTO2_TASK_WINDOW_SIZE
+    uint64_t task_window_size;            // Main ring capacity (PTO2_TASK_WINDOW_SIZE)
+    uint64_t consumed_window_size;        // Consumed ring capacity (default = 4 × task_window_size)
     uint64_t heap_size;                   // Total heap size
 
     // Offsets into shared memory (relative to SM_Base)
@@ -69,7 +71,7 @@ typedef struct {
     std::atomic<uint64_t> graph_output_size;  // Size in bytes
 
     // Padding to cache-line-aligned size (ALIGN_UP to PTO2_ALIGN_SIZE)
-    uint64_t _padding[4];
+    uint64_t _padding[3];
 
 } PTO2SharedMemoryHeader;
 
