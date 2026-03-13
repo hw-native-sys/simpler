@@ -42,7 +42,7 @@
  */
 struct PTO2ReadyQueueSlot {
     std::atomic<int64_t> sequence;
-    int32_t task_id;
+    int32_t task_slot;
     int32_t _pad;
 };
 
@@ -61,26 +61,26 @@ struct PTO2ReadyQueueSlot {
 static constexpr int PTO2_LOCAL_DISPATCH_TYPE_NUM = 2;
 
 struct PTO2LocalReadyBuffer {
-    int32_t* task_ids = nullptr;  // Points to caller's stack array
+    int32_t* task_slots = nullptr;  // Points to caller's stack array
     int count = 0;
     int capacity = 0;
 
     void reset(int32_t* buf, int cap) {
-        task_ids = buf;
+        task_slots = buf;
         count = 0;
         capacity = cap;
     }
 
-    bool try_push(int32_t task_id) {
-        if (task_ids && count < capacity) {
-            task_ids[count++] = task_id;
+    bool try_push(int32_t task_slot) {
+        if (task_slots && count < capacity) {
+            task_slots[count++] = task_slot;
             return true;
         }
         return false;
     }
 
     int32_t pop() {
-        return (count > 0) ? task_ids[--count] : -1;  // LIFO: better cache locality
+        return (count > 0) ? task_slots[--count] : -1;  // LIFO: better cache locality
     }
 };
 
@@ -112,7 +112,7 @@ struct alignas(64) PTO2ReadyQueue {
         return (e >= d) ? (e - d) : 0;
     }
 
-    bool push(int32_t task_id) {
+    bool push(int32_t task_slot) {
         uint64_t pos;
         PTO2ReadyQueueSlot* slot;
         while (true) {
@@ -130,13 +130,13 @@ struct alignas(64) PTO2ReadyQueue {
             }
         }
 
-        slot->task_id = task_id;
+        slot->task_slot = task_slot;
         slot->sequence.store((int64_t)(pos + 1), std::memory_order_release);
         return true;
     }
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    bool push(int32_t task_id, uint64_t& atomic_count, uint64_t& wait_cycle) {
+    bool push(int32_t task_slot, uint64_t& atomic_count, uint64_t& wait_cycle) {
         uint64_t pos;
         PTO2ReadyQueueSlot* slot;
         uint64_t t0 = get_sys_cnt_aicpu();
@@ -168,7 +168,7 @@ struct alignas(64) PTO2ReadyQueue {
             wait_cycle += (get_sys_cnt_aicpu() - t0);
         }
 
-        slot->task_id = task_id;
+        slot->task_slot = task_slot;
         slot->sequence.store((int64_t)(pos + 1), std::memory_order_release);
         return true;
     }
@@ -198,9 +198,9 @@ struct alignas(64) PTO2ReadyQueue {
             }
         }
 
-        int32_t task_id = slot->task_id;
+        int32_t task_slot = slot->task_slot;
         slot->sequence.store((int64_t)(pos + mask + 1), std::memory_order_release);
-        return task_id;
+        return task_slot;
     }
 
 #if PTO2_SCHED_PROFILING
@@ -245,9 +245,9 @@ struct alignas(64) PTO2ReadyQueue {
             wait_cycle += (get_sys_cnt_aicpu() - t0);
         }
 
-        int32_t task_id = slot->task_id;
+        int32_t task_slot = slot->task_slot;
         slot->sequence.store((int64_t)(pos + mask + 1), std::memory_order_release);
-        return task_id;
+        return task_slot;
     }
 #endif
 };
@@ -438,14 +438,13 @@ struct PTO2SchedulerState {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
-            int32_t task_id = task->mixed_task_id;
             bool pushed_local = false;
             if (local_bufs) {
                 int32_t buf_idx = (task->active_mask & 0x01) ? 0 : 1;
-                pushed_local = local_bufs[buf_idx].try_push(task_id);
+                pushed_local = local_bufs[buf_idx].try_push(slot);
             }
             if (!pushed_local) {
-                ready_queues[static_cast<int32_t>(shape)].push(task_id);
+                ready_queues[static_cast<int32_t>(shape)].push(slot);
             }
             return true;
         }
@@ -468,14 +467,13 @@ struct PTO2SchedulerState {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
                 // Local-first: try per-CoreType thread-local buffer before global queue
                 PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
-                int32_t task_id = task->mixed_task_id;
                 bool pushed_local = false;
                 if (local_bufs) {
                     int32_t buf_idx = (task->active_mask & 0x01) ? 0 : 1;
-                    pushed_local = local_bufs[buf_idx].try_push(task_id);
+                    pushed_local = local_bufs[buf_idx].try_push(slot);
                 }
                 if (!pushed_local) {
-                    ready_queues[static_cast<int32_t>(shape)].push(task_id, atomic_count, push_wait);
+                    ready_queues[static_cast<int32_t>(shape)].push(slot, atomic_count, push_wait);
                 }
                 return true;
             }
@@ -538,11 +536,10 @@ struct PTO2SchedulerState {
      * Requeue a ready task that could not be dispatched (no suitable cluster).
      * Pushes the task back into its shape-based queue.
      */
-    void requeue_ready_task(int32_t task_id) {
-        int32_t slot = get_task_slot(task_id);
-        PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(sm_handle, slot);
+    void requeue_ready_task(int32_t task_slot) {
+        PTO2TaskDescriptor& task = pto2_sm_get_task_by_slot(sm_handle, task_slot);
         PTO2ResourceShape shape = pto2_active_mask_to_shape(task.active_mask);
-        ready_queues[static_cast<int32_t>(shape)].push(task_id);
+        ready_queues[static_cast<int32_t>(shape)].push(task_slot);
     }
 
     void on_scope_end(const int32_t* task_ids, int32_t count) {

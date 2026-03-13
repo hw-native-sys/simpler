@@ -453,13 +453,13 @@ struct AicpuExecutor {
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
         uint64_t t_pop_start = get_sys_cnt_aicpu();
-        int32_t task_id = rt->scheduler.get_ready_task(shape,
+        int32_t task_slot = rt->scheduler.get_ready_task(shape,
             g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]);
         sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
-        int32_t task_id = rt->scheduler.get_ready_task(shape);
+        int32_t task_slot = rt->scheduler.get_ready_task(shape);
 #endif
-        if (task_id >= 0) {
+        if (task_slot >= 0) {
 #if PTO2_PROFILING
             pop_hit++;
 #endif
@@ -468,7 +468,7 @@ struct AicpuExecutor {
             pop_miss++;
 #endif
         }
-        return task_id;
+        return task_slot;
     }
 
     void dispatch_subtask_to_core(
@@ -1085,18 +1085,19 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         bool try_pushed = false;
 
         // Local dispatch: drain both per-CoreType local_bufs, match to idle clusters by shape
-        int32_t overflow_ids[LOCAL_READY_CAP_PER_TYPE * PTO2_LOCAL_DISPATCH_TYPE_NUM];
+        int32_t overflow_slots[LOCAL_READY_CAP_PER_TYPE * PTO2_LOCAL_DISPATCH_TYPE_NUM];
         int overflow_count = 0;
         for (int bi = 0; bi < PTO2_LOCAL_DISPATCH_TYPE_NUM; bi++) {
             while (local_bufs[bi].count > 0) {
-                int32_t task_id = local_bufs[bi].pop();
-                PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
+                int32_t task_slot = local_bufs[bi].pop();
+                PTO2TaskDescriptor* task = &task_descriptors[task_slot];
                 PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
                 int32_t ci = tracker.find_cluster_for_shape(shape);
 
                 if (ci >= 0) {
                     try_pushed = true;
-                    PTO2TaskPayload* task_pl = &task_payloads[task_id & window_mask];
+                    PTO2TaskPayload* task_pl = &task_payloads[task_slot];
+                    int32_t task_id = task->mixed_task_id;
                     Cluster& c = tracker.clusters[ci];
 #if PTO2_SCHED_PROFILING
                     uint64_t t_setup_start = get_sys_cnt_aicpu();
@@ -1143,7 +1144,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     DEV_DEBUG("Thread %d: Dispatching %s task %d to cluster %d (local)",
                               thread_idx, shape_name(shape), task_id, ci);
                 } else {
-                    overflow_ids[overflow_count++] = task_id;
+                    overflow_slots[overflow_count++] = task_slot;
 #if PTO2_PROFILING
                     local_overflow_count++;
 #endif
@@ -1153,9 +1154,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
         // Push overflow to global readyQ (shape-based)
         for (int i = 0; i < overflow_count; i++) {
-            PTO2TaskDescriptor* task = &task_descriptors[overflow_ids[i] & window_mask];
+            PTO2TaskDescriptor* task = &task_descriptors[overflow_slots[i]];
             PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
-            rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(overflow_ids[i]);
+            rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(overflow_slots[i]);
         }
 
         // Phase 3: Global dispatch — fill remaining idle cores from global readyQ (cluster-based)
@@ -1169,7 +1170,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 int32_t ci = tracker.find_cluster_for_shape(shape);
                 if (ci < 0) break;
 
-                int32_t task_id = pop_ready_task(shape, thread_idx
+                int32_t task_slot = pop_ready_task(shape, thread_idx
 #if PTO2_PROFILING
                     , pop_hit, pop_miss
 #endif
@@ -1177,7 +1178,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     , sched_dispatch_pop_cycle
 #endif
                 );
-                if (task_id < 0) break;
+                if (task_slot < 0) break;
 
                 try_pushed = true;
 #if PTO2_PROFILING
@@ -1187,8 +1188,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
                 Cluster& c = tracker.clusters[ci];
-                PTO2TaskDescriptor* task = &task_descriptors[task_id & window_mask];
-                PTO2TaskPayload* task_pl = &task_payloads[task_id & window_mask];
+                PTO2TaskDescriptor* task = &task_descriptors[task_slot];
+                PTO2TaskPayload* task_pl = &task_payloads[task_slot];
+                int32_t task_id = task->mixed_task_id;
                 ResourceCount rc = shape_resource_count(shape);
 
                 if (rc.aic) {
