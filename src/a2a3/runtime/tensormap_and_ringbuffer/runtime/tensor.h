@@ -36,7 +36,7 @@ struct Segment {
 };
 
 /**
- * Tensor descriptor for Task input/output
+ * Tensor descriptor for Task input/output (128B = 2 cache lines)
  *
  * Describes a memory access pattern on Global Memory (GM) using
  * raw_shapes (underlying buffer dimensions), shapes (current view dimensions),
@@ -46,22 +46,21 @@ struct Segment {
  * - `raw_shapes[]`, `shapes[]`, `offsets[]` are in ELEMENTS
  * - `dtype` specifies element type for interpreting buffer contents
  *
- * Example: buffer.addr=base, dtype=FLOAT32, raw_shapes=[10, 6], shapes=[3, 6], offsets=[1, 0]
- * Memory access pattern:
- *   - Start at buffer.addr + (1*6+0)*4 = buffer.addr + 24 bytes
- *   - Inner dim: access 6 consecutive elements
- *   - Outer dim: 3 rows with stride 6 elements (derived from raw_shapes[1])
+ * Layout: cache line 1 holds hot-path fields (buffer, start_offset, version,
+ * dtype, ndims, shapes); cache line 2 holds warm-path fields (raw_shapes, offsets).
  */
-struct Tensor {
-    // === Data fields (same layout as former TensorData) ===
+struct alignas(64) Tensor {
+    // === Cache line 1 (64B) — hot path ===
     PTOBufferHandle buffer;                        // Underlying memory buffer (addr in bytes, size in bytes)
-    int32_t version;                               // Tensor version for overlap detection
     uint64_t start_offset;                         // Cached 1D element offset (precomputed from raw_shapes + offsets)
-    uint64_t ndims;                                // Number of dimensions used
+    int32_t version;                               // Tensor version for overlap detection
     DataType dtype;                                // Data type of tensor elements
-    uint64_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
-    uint64_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
-    uint64_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
+    uint32_t ndims;                                // Number of dimensions used
+    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
+
+    // === Cache line 2 (64B) — warm path ===
+    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
+    uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
 
     Tensor() = default;
     Tensor(const Tensor&) = default;
@@ -72,10 +71,10 @@ struct Tensor {
 
     Tensor(void* addr,
         uint64_t buffer_size_bytes,
-        const uint64_t raw_shapes[],
-        const uint64_t shapes[],
-        const uint64_t offsets[],
-        uint64_t ndims,
+        const uint32_t raw_shapes[],
+        const uint32_t shapes[],
+        const uint32_t offsets[],
+        uint32_t ndims,
         DataType dtype,
         int32_t version) {
         init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version);
@@ -84,17 +83,17 @@ struct Tensor {
     // --- Initialization ---
     void init(void* addr,
         uint64_t buffer_size_bytes,
-        const uint64_t in_raw_shapes[],
-        const uint64_t in_shapes[],
-        const uint64_t in_offsets[],
-        uint64_t in_ndims,
+        const uint32_t in_raw_shapes[],
+        const uint32_t in_shapes[],
+        const uint32_t in_offsets[],
+        uint32_t in_ndims,
         DataType in_dtype,
         int32_t in_version) {
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
         ndims = in_ndims;
         dtype = in_dtype;
         version = in_version;
-        for (uint64_t i = 0; i < in_ndims; i++) {
+        for (uint32_t i = 0; i < in_ndims; i++) {
             raw_shapes[i] = in_raw_shapes[i];
             shapes[i] = in_shapes[i];
             offsets[i] = in_offsets[i];
@@ -103,22 +102,23 @@ struct Tensor {
 
     void init(const Tensor& other) {
         buffer = other.buffer;
+        start_offset = other.start_offset;
         version = other.version;
         ndims = other.ndims;
         dtype = other.dtype;
-        for (uint64_t i = 0; i < ndims; i++) {
+        for (uint32_t i = 0; i < ndims; i++) {
             raw_shapes[i] = other.raw_shapes[i];
             shapes[i] = other.shapes[i];
             offsets[i] = other.offsets[i];
         }
     }
 
-    void init_with_view(const Tensor& other, const uint64_t view_shapes[], const uint64_t view_offsets[]) {
+    void init_with_view(const Tensor& other, const uint32_t view_shapes[], const uint32_t view_offsets[]) {
         buffer = other.buffer;
         ndims = other.ndims;
         dtype = other.dtype;
         version = other.version;
-        for (uint64_t i = 0; i < ndims; i++) {
+        for (uint32_t i = 0; i < ndims; i++) {
             raw_shapes[i] = other.raw_shapes[i];
             shapes[i] = view_shapes[i];
             offsets[i] = other.offsets[i] + view_offsets[i];
@@ -140,7 +140,7 @@ struct Tensor {
         init(other);
     }
 
-    Tensor view(const uint64_t view_shapes[], const uint64_t view_offsets[]) const {
+    Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[]) const {
         Tensor result;
         result.init_with_view(*this, view_shapes, view_offsets);
         return result;
@@ -150,7 +150,7 @@ struct Tensor {
         if (ndims == 0) {
             return true;
         }
-        for (uint64_t i = 1; i < ndims; i++) {
+        for (uint32_t i = 1; i < ndims; i++) {
             if (shapes[i] != raw_shapes[i]) {
                 return false;
             }
@@ -158,22 +158,22 @@ struct Tensor {
         return true;
     }
 
-    bool valid_reshape(const uint64_t new_shapes[], uint64_t new_ndims) const {
+    bool valid_reshape(const uint32_t new_shapes[], uint32_t new_ndims) const {
         uint64_t x = numel();
         uint64_t y = 1;
-        for (size_t i = 0; i < new_ndims; i++) {
+        for (uint32_t i = 0; i < new_ndims; i++) {
             y *= new_shapes[i];
         }
         return x == y;
     }
 
-    Tensor reshape(const uint64_t new_shapes[], uint64_t new_ndims) const {
+    Tensor reshape(const uint32_t new_shapes[], uint32_t new_ndims) const {
         debug_assert(valid_reshape(new_shapes, new_ndims));
         always_assert(is_contiguous());
         Tensor result;
         result.copy(*this);
         result.ndims = new_ndims;
-        for (uint64_t i = 0; i < new_ndims; i++) {
+        for (uint32_t i = 0; i < new_ndims; i++) {
             result.raw_shapes[i] = new_shapes[i];
             result.shapes[i] = new_shapes[i];
             result.offsets[i] = 0;
@@ -181,9 +181,9 @@ struct Tensor {
         return result;
     }
 
-    bool valid_transpose(uint64_t x, uint64_t y) const { return x < ndims && y < ndims; }
+    bool valid_transpose(uint32_t x, uint32_t y) const { return x < ndims && y < ndims; }
 
-    Tensor transpose(uint64_t x, uint64_t y) const {
+    Tensor transpose(uint32_t x, uint32_t y) const {
         debug_assert(valid_transpose(x, y));
         Tensor result;
         result.copy(*this);
@@ -198,7 +198,7 @@ struct Tensor {
             return 0;
         }
         uint64_t total = 1;
-        for (uint64_t i = 0; i < ndims; i++) {
+        for (uint32_t i = 0; i < ndims; i++) {
             total *= shapes[i];
         }
         return total;
@@ -213,10 +213,10 @@ struct Tensor {
             return OverlapStatus::OTHER;
         }
         bool contains = true;
-        for (uint64_t i = 0; i < ndims; i++) {
-            Segment input_range_dim_i{offsets[i], offsets[i] + shapes[i]};
+        for (uint32_t i = 0; i < ndims; i++) {
+            Segment input_range_dim_i{offsets[i], offsets[i] + (uint64_t)shapes[i]};
             Segment output_range_dim_i{
-                pre_task_output.offsets[i], pre_task_output.offsets[i] + pre_task_output.shapes[i]};
+                pre_task_output.offsets[i], pre_task_output.offsets[i] + (uint64_t)pre_task_output.shapes[i]};
             if (!input_range_dim_i.line_segment_intersection(output_range_dim_i)) {
                 return OverlapStatus::NO_OVERLAP;
             } else if (!input_range_dim_i.contains(output_range_dim_i)) {
@@ -240,7 +240,7 @@ struct Tensor {
         ss << indent << "version: " << version << std::endl;
 
         ss << indent << "raw_shapes: [";
-        for (uint64_t i = 0; i < ndims; i++) {
+        for (uint32_t i = 0; i < ndims; i++) {
             if (i > 0) {
                 ss << ", ";
             }
@@ -248,7 +248,7 @@ struct Tensor {
         }
         ss << "]" << std::endl;
         ss << indent << "shapes: [";
-        for (uint64_t i = 0; i < ndims; i++) {
+        for (uint32_t i = 0; i < ndims; i++) {
             if (i > 0) {
                 ss << ", ";
             }
@@ -256,7 +256,7 @@ struct Tensor {
         }
         ss << "]" << std::endl;
         ss << indent << "offsets: [";
-        for (uint64_t i = 0; i < ndims; i++) {
+        for (uint32_t i = 0; i < ndims; i++) {
             if (i > 0) {
                 ss << ", ";
             }
@@ -268,6 +268,8 @@ struct Tensor {
     }
 };
 
+static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 bytes)");
+
 using TensorData = Tensor;
 
 // =============================================================================
@@ -277,13 +279,13 @@ using TensorData = Tensor;
  * Create a Tensor for pre-allocated external memory.
  */
 static inline Tensor make_tensor_external(void* addr,
-    const uint64_t shapes[],
-    uint64_t ndims,
+    const uint32_t shapes[],
+    uint32_t ndims,
     DataType dtype = DataType::FLOAT32,
     int32_t version = 0) {
-    static uint64_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
     uint64_t total = 1;
-    for (uint64_t i = 0; i < ndims; i++) {
+    for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
     return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version);
@@ -295,13 +297,13 @@ static inline Tensor make_tensor_external(void* addr,
  * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
  * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
  */
-static inline Tensor make_tensor(const uint64_t shapes[],
-    uint64_t ndims,
+static inline Tensor make_tensor(const uint32_t shapes[],
+    uint32_t ndims,
     DataType dtype = DataType::FLOAT32,
     int32_t version = 0) {
-    static uint64_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
     uint64_t total = 1;
-    for (uint64_t i = 0; i < ndims; i++) {
+    for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
     return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version);

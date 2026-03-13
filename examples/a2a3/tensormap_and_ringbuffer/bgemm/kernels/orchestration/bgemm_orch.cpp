@@ -39,7 +39,7 @@ static constexpr int GRID_K = 4;
 static constexpr int GRID_N = 4;
 static constexpr int BATCH = 2;
 
-static constexpr uint64_t TILE_ELEMS = TILE * TILE;           // 4096 elements
+static constexpr uint32_t TILE_ELEMS = TILE * TILE;           // 4096 elements
 static constexpr uint64_t TILE_BYTES = TILE_ELEMS * sizeof(float);  // 16384 bytes
 
 // Args layout: [ptr_A, ptr_B, ptr_C, size_A, size_B, size_C, elem_count]
@@ -78,39 +78,39 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                   GRID_M, GRID_K, GRID_N, BATCH, TILE);
 
     // Create 1D external tensors for the full A, B, C arrays
-    uint64_t ext_A_shapes[1] = {size_A / sizeof(float)};
+    uint32_t ext_A_shapes[1] = {(uint32_t)(size_A / sizeof(float))};
     Tensor ext_A = make_tensor_external(dev_A, ext_A_shapes, 1, DataType::FLOAT32);
-    uint64_t ext_B_shapes[1] = {size_B / sizeof(float)};
+    uint32_t ext_B_shapes[1] = {(uint32_t)(size_B / sizeof(float))};
     Tensor ext_B = make_tensor_external(dev_B, ext_B_shapes, 1, DataType::FLOAT32);
-    uint64_t ext_C_shapes[1] = {size_C / sizeof(float)};
+    uint32_t ext_C_shapes[1] = {(uint32_t)(size_C / sizeof(float))};
     Tensor ext_C = make_tensor_external(dev_C, ext_C_shapes, 1, DataType::FLOAT32);
 
-    uint64_t tile_shapes[1] = {TILE_ELEMS};
+    uint32_t tile_shapes[1] = {TILE_ELEMS};
 
     for (int batch = 0; batch < BATCH; batch++) {
         for (int m_idx = 0; m_idx < GRID_M; m_idx++) {
             for (int n_idx = 0; n_idx < GRID_N; n_idx++) {
                 PTO2_SCOPE(rt) {
-                    uint64_t c_elem_offset =
-                        ((uint64_t)batch * GRID_M * GRID_N +
-                         (uint64_t)m_idx * GRID_N +
-                         (uint64_t)n_idx) * TILE_ELEMS;
-                    uint64_t c_view_offsets[1] = {c_elem_offset};
+                    uint32_t c_elem_offset =
+                        ((uint32_t)batch * GRID_M * GRID_N +
+                         (uint32_t)m_idx * GRID_N +
+                         (uint32_t)n_idx) * TILE_ELEMS;
+                    uint32_t c_view_offsets[1] = {c_elem_offset};
                     Tensor C_view = ext_C.view(tile_shapes, c_view_offsets);
 
                     for (int k_idx = 0; k_idx < GRID_K; k_idx++) {
-                        uint64_t a_elem_offset =
-                            ((uint64_t)batch * GRID_M * GRID_K +
-                             (uint64_t)m_idx * GRID_K +
-                             (uint64_t)k_idx) * TILE_ELEMS;
-                        uint64_t b_elem_offset =
-                            ((uint64_t)batch * GRID_K * GRID_N +
-                             (uint64_t)k_idx * GRID_N +
-                             (uint64_t)n_idx) * TILE_ELEMS;
+                        uint32_t a_elem_offset =
+                            ((uint32_t)batch * GRID_M * GRID_K +
+                             (uint32_t)m_idx * GRID_K +
+                             (uint32_t)k_idx) * TILE_ELEMS;
+                        uint32_t b_elem_offset =
+                            ((uint32_t)batch * GRID_K * GRID_N +
+                             (uint32_t)k_idx * GRID_N +
+                             (uint32_t)n_idx) * TILE_ELEMS;
 
-                        uint64_t a_view_offsets[1] = {a_elem_offset};
+                        uint32_t a_view_offsets[1] = {a_elem_offset};
                         Tensor A_view = ext_A.view(tile_shapes, a_view_offsets);
-                        uint64_t b_view_offsets[1] = {b_elem_offset};
+                        uint32_t b_view_offsets[1] = {b_elem_offset};
                         Tensor B_view = ext_B.view(tile_shapes, b_view_offsets);
                         Tensor P = make_tensor(tile_shapes, 1, DataType::FLOAT32);
 

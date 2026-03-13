@@ -80,20 +80,20 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
              tile_size, grid_m, grid_n, grid_k, num_groups, incore_loop);
 
     // Create 1D external tensors for the full A, B, C arrays
-    uint64_t ext_A_shapes[1] = {size_A / sizeof(float)};
+    uint32_t ext_A_shapes[1] = {(uint32_t)(size_A / sizeof(float))};
     Tensor ext_A = make_tensor_external(dev_A, ext_A_shapes, 1, DataType::FLOAT32);
-    uint64_t ext_B_shapes[1] = {size_B / sizeof(float)};
+    uint32_t ext_B_shapes[1] = {(uint32_t)(size_B / sizeof(float))};
     Tensor ext_B = make_tensor_external(dev_B, ext_B_shapes, 1, DataType::FLOAT32);
-    uint64_t ext_C_shapes[1] = {size_C / sizeof(float)};
+    uint32_t ext_C_shapes[1] = {(uint32_t)(size_C / sizeof(float))};
     Tensor ext_C = make_tensor_external(dev_C, ext_C_shapes, 1, DataType::FLOAT32);
 
     // Wrap config as a device tensor so AICore kernels can read tile_size directly
-    uint64_t config_shapes[1] = {4};  // [tile_size, grid_k, num_groups, incore_loop]
+    uint32_t config_shapes[1] = {4};  // [tile_size, grid_k, num_groups, incore_loop]
     Tensor ext_config = make_tensor_external(dev_config, config_shapes, 1, DataType::INT64);
 
-    uint64_t tile_shapes[1] = {tile_elems};
+    uint32_t tile_shapes[1] = {(uint32_t)tile_elems};
     uint64_t group_tile_elems = (uint64_t)incore_loop * tile_elems;
-    uint64_t group_shapes[1] = {group_tile_elems};
+    uint32_t group_shapes[1] = {(uint32_t)group_tile_elems};
 
     int total_gemm = 0;
     int total_add = 0;
@@ -102,8 +102,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     // C layout:   [incore_loop * num_groups, tile_size, tile_size]
     for (int group_idx = 0; group_idx < num_groups; group_idx++) {
         PTO2_SCOPE(rt) {
-            uint64_t c_elem_offset = (uint64_t)group_idx * group_tile_elems;
-            uint64_t c_view_offsets[1] = {c_elem_offset};
+            uint32_t c_elem_offset = (uint32_t)((uint64_t)group_idx * group_tile_elems);
+            uint32_t c_view_offsets[1] = {c_elem_offset};
             Tensor C_view = ext_C.view(group_shapes, c_view_offsets);
 
             for (int k_idx = 0; k_idx < grid_k; k_idx++) {
@@ -112,9 +112,9 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
                 uint64_t ab_offset =
                     ((uint64_t)group_idx * grid_k + (uint64_t)k_idx) * group_tile_elems;
 
-                uint64_t a_view_offsets[1] = {ab_offset};
+                uint32_t a_view_offsets[1] = {(uint32_t)ab_offset};
                 Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
-                uint64_t b_view_offsets[1] = {ab_offset};
+                uint32_t b_view_offsets[1] = {(uint32_t)ab_offset};
                 Tensor B_view = ext_B.view(group_shapes, b_view_offsets);
                 Tensor P = make_tensor(group_shapes, 1, DataType::FLOAT32);
 

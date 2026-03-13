@@ -93,12 +93,12 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
 
     LOG_INFO(rt, "===============SIZE=%d", SIZE);
 
-    uint64_t ext_shapes[1] = {(uint64_t)SIZE};
+    uint32_t ext_shapes[1] = {(uint32_t)SIZE};
     Tensor ext_a = make_tensor_external(arg_a_ptr, ext_shapes, 1, DataType::FLOAT32);
     Tensor ext_b = make_tensor_external(arg_b_ptr, ext_shapes, 1, DataType::FLOAT32);
     Tensor ext_f = make_tensor_external(arg_f_ptr, ext_shapes, 1, DataType::FLOAT32);
 
-    uint64_t inter_shapes[1] = {(uint64_t)SIZE};
+    uint32_t inter_shapes[1] = {(uint32_t)SIZE};
     Tensor c = make_tensor(inter_shapes, 1, DataType::FLOAT32);  // c = a + b
 
     // t0: c = a + b (kernel_id=0, kernel_add) [outer scope]

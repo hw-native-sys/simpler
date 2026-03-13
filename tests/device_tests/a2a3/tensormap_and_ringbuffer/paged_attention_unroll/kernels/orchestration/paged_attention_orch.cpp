@@ -117,10 +117,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
 
     LOG_ALWAYS(rt, ">>>>>> batch = %lu", (unsigned long)batch);
 
-    uint64_t query_shapes[2] = {batch * num_heads, head_dim};
-    uint64_t key_cache_shapes[2] = {batch * block_num * block_size, head_dim};
-    uint64_t value_cache_shapes[2] = {batch * block_num * block_size, head_dim};
-    uint64_t out_shapes[2] = {batch * num_heads, head_dim};
+    uint32_t query_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
+    uint32_t key_cache_shapes[2] = {(uint32_t)(batch * block_num * block_size), (uint32_t)head_dim};
+    uint32_t value_cache_shapes[2] = {(uint32_t)(batch * block_num * block_size), (uint32_t)head_dim};
+    uint32_t out_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
     Tensor query = make_tensor_external(host_query, query_shapes, 2, data_type);
     Tensor key_cache = make_tensor_external(host_key_cache, key_cache_shapes, 2, data_type);
     Tensor value_cache = make_tensor_external(host_value_cache, value_cache_shapes, 2, data_type);
@@ -135,20 +135,20 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
                 CYCLE_COUNT_START();
 
-                uint64_t oi_shapes[2] = {q_tile, head_dim};
-                uint64_t li_shapes[1] = {q_tile};
-                uint64_t mi_shapes[1] = {q_tile};
+                uint32_t oi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+                uint32_t li_shapes[1] = {(uint32_t)q_tile};
+                uint32_t mi_shapes[1] = {(uint32_t)q_tile};
                 Tensor oi = make_tensor(oi_shapes, 2, DataType::FLOAT32);
                 Tensor li_update = make_tensor(li_shapes, 1, DataType::FLOAT32);
                 Tensor mi_update = make_tensor(mi_shapes, 1, DataType::FLOAT32);
                 prof_make_count += 3;
                 CYCLE_COUNT_LAP(prof_make_tensor);
 
-                uint64_t qi_shapes[2] = {q_tile, head_dim};
-                uint64_t qi_offsets[2] = {cur_offset, 0};
+                uint32_t qi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+                uint32_t qi_offsets[2] = {(uint32_t)cur_offset, 0};
                 Tensor qi = query.view(qi_shapes, qi_offsets);
-                uint64_t out_view_shapes[2] = {q_tile, head_dim};
-                uint64_t out_view_offsets[2] = {cur_offset, 0};
+                uint32_t out_view_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+                uint32_t out_view_offsets[2] = {(uint32_t)cur_offset, 0};
                 Tensor out_view = out.view(out_view_shapes, out_view_offsets);
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);
@@ -178,7 +178,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     uint64_t valid_len_last = std::min(block_size, cur_seq - last_block_seq_start);
 
                     // === Task 1: Batched QK matmul ===
-                    uint64_t sij_buf_shapes[2] = {q_tile, n_blocks * block_size};
+                    uint32_t sij_buf_shapes[2] = {(uint32_t)q_tile, (uint32_t)(n_blocks * block_size)};
                     Tensor sij_buf = make_tensor(sij_buf_shapes, 2, DataType::FLOAT32);
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
@@ -203,7 +203,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     CYCLE_COUNT_LAP(prof_submit_task);
 
                     // === Task 2: Two-pass softmax over all blocks in group ===
-                    uint64_t pij_buf_shapes[2] = {q_tile, n_blocks * block_size};
+                    uint32_t pij_buf_shapes[2] = {(uint32_t)q_tile, (uint32_t)(n_blocks * block_size)};
                     Tensor pij_buf = make_tensor(pij_buf_shapes, 2, data_type);
                     Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
                     Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
@@ -225,7 +225,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     CYCLE_COUNT_LAP(prof_submit_task);
 
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
-                    uint64_t oi_new_shapes[2] = {q_tile, head_dim};
+                    uint32_t oi_new_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                     Tensor oi_new = make_tensor(oi_new_shapes, 2, DataType::FLOAT32);
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);

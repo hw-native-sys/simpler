@@ -61,7 +61,7 @@
 #define ARG_SIZE_N  28
 #define ARG_SIZE_O  29
 
-static constexpr uint64_t TILE_ELEMS = 128 * 128;
+static constexpr uint32_t TILE_ELEMS = 128 * 128;
 
 extern "C" {
 
@@ -102,20 +102,20 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     LOG_INFO(rt, "[mixed_orch] num_iters=%d", num_iters);
 
     // Input tensors (shared across all tasks)
-    uint64_t ab_shapes[1] = {TILE_ELEMS};
+    uint32_t ab_shapes[1] = {TILE_ELEMS};
     Tensor ext_A = make_tensor_external(dev_A, ab_shapes, 1, DataType::FLOAT32);
     Tensor ext_B = make_tensor_external(dev_B, ab_shapes, 1, DataType::FLOAT32);
 
-    uint64_t de_shapes[1] = {TILE_ELEMS};
+    uint32_t de_shapes[1] = {TILE_ELEMS};
     Tensor ext_D = make_tensor_external(dev_D, de_shapes, 1, DataType::FLOAT32);
     Tensor ext_E = make_tensor_external(dev_E, de_shapes, 1, DataType::FLOAT32);
 
-    uint64_t gh_shapes[1] = {TILE_ELEMS};
+    uint32_t gh_shapes[1] = {TILE_ELEMS};
     Tensor ext_G = make_tensor_external(dev_G, gh_shapes, 1, DataType::FLOAT32);
     Tensor ext_H = make_tensor_external(dev_H, gh_shapes, 1, DataType::FLOAT32);
 
     // Output tensors (full buffers, one slice per iteration)
-    uint64_t out_shapes[1] = {(uint64_t)num_iters * TILE_ELEMS};
+    uint32_t out_shapes[1] = {(uint32_t)num_iters * TILE_ELEMS};
     Tensor ext_C = make_tensor_external(dev_C, out_shapes, 1, DataType::FLOAT32);
     Tensor ext_F = make_tensor_external(dev_F, out_shapes, 1, DataType::FLOAT32);
     Tensor ext_I = make_tensor_external(dev_I, out_shapes, 1, DataType::FLOAT32);
@@ -128,8 +128,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
 
     for (int i = 0; i < num_iters; i++) {
         PTO2_SCOPE(rt) {
-            uint64_t view_shapes[1] = {TILE_ELEMS};
-            uint64_t view_offsets[1] = {(uint64_t)i * TILE_ELEMS};
+            uint32_t view_shapes[1] = {TILE_ELEMS};
+            uint32_t view_offsets[1] = {(uint32_t)i * TILE_ELEMS};
 
             Tensor C_view = ext_C.view(view_shapes, view_offsets);
             Tensor F_view = ext_F.view(view_shapes, view_offsets);

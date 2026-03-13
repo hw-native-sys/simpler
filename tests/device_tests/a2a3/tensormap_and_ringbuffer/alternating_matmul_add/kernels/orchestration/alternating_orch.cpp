@@ -84,18 +84,18 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     int num_matmul_groups = total_matmul_tasks / matmul_batch;
     int num_add_groups = total_add_tasks / add_batch;
 
-    uint64_t ext_A_shapes[1] = {size_A / sizeof(float)};
+    uint32_t ext_A_shapes[1] = {(uint32_t)(size_A / sizeof(float))};
     Tensor ext_A = make_tensor_external(dev_A, ext_A_shapes, 1, DataType::FLOAT32);
-    uint64_t ext_B_shapes[1] = {size_B / sizeof(float)};
+    uint32_t ext_B_shapes[1] = {(uint32_t)(size_B / sizeof(float))};
     Tensor ext_B = make_tensor_external(dev_B, ext_B_shapes, 1, DataType::FLOAT32);
-    uint64_t ext_C_shapes[1] = {size_C / sizeof(float)};
+    uint32_t ext_C_shapes[1] = {(uint32_t)(size_C / sizeof(float))};
     Tensor ext_C = make_tensor_external(dev_C, ext_C_shapes, 1, DataType::FLOAT32);
 
-    uint64_t ext_X_shapes[1] = {size_X / sizeof(float)};
+    uint32_t ext_X_shapes[1] = {(uint32_t)(size_X / sizeof(float))};
     Tensor ext_X = make_tensor_external(dev_X, ext_X_shapes, 1, DataType::FLOAT32);
-    uint64_t ext_Y_shapes[1] = {size_Y / sizeof(float)};
+    uint32_t ext_Y_shapes[1] = {(uint32_t)(size_Y / sizeof(float))};
     Tensor ext_Y = make_tensor_external(dev_Y, ext_Y_shapes, 1, DataType::FLOAT32);
-    uint64_t ext_Z_shapes[1] = {size_Z / sizeof(float)};
+    uint32_t ext_Z_shapes[1] = {(uint32_t)(size_Z / sizeof(float))};
     Tensor ext_Z = make_tensor_external(dev_Z, ext_Z_shapes, 1, DataType::FLOAT32);
 
     int total_matmul = 0;
@@ -110,8 +110,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             uint64_t offset = (uint64_t)start_task_idx * MATMUL_ELEMS;
             uint64_t group_size = (uint64_t)matmul_batch * MATMUL_ELEMS;
 
-            uint64_t matmul_group_shapes[1] = {group_size};
-            uint64_t view_offsets[1] = {offset};
+            uint32_t matmul_group_shapes[1] = {(uint32_t)group_size};
+            uint32_t view_offsets[1] = {(uint32_t)offset};
 
             Tensor A_view = ext_A.view(matmul_group_shapes, view_offsets);
             Tensor B_view = ext_B.view(matmul_group_shapes, view_offsets);
@@ -131,8 +131,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             uint64_t offset = (uint64_t)start_task_idx * ADD_ELEMS;
             uint64_t group_size = (uint64_t)add_batch * ADD_ELEMS;
 
-            uint64_t add_group_shapes[1] = {group_size};
-            uint64_t view_offsets[1] = {offset};
+            uint32_t add_group_shapes[1] = {(uint32_t)group_size};
+            uint32_t view_offsets[1] = {(uint32_t)offset};
 
             Tensor X_view = ext_X.view(add_group_shapes, view_offsets);
             Tensor Y_view = ext_Y.view(add_group_shapes, view_offsets);

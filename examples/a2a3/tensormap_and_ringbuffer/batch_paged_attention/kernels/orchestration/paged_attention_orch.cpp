@@ -98,11 +98,11 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
         if (bn_b > max_bn) max_bn = bn_b;
     }
 
-    uint64_t query_shapes[2] = {batch * num_heads, head_dim};
+    uint32_t query_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
     uint64_t kv_total_rows = key_cache_size / (head_dim * elem_size);
-    uint64_t key_cache_shapes[2] = {kv_total_rows, head_dim};
-    uint64_t value_cache_shapes[2] = {kv_total_rows, head_dim};
-    uint64_t out_shapes[2] = {batch * num_heads, head_dim};
+    uint32_t key_cache_shapes[2] = {(uint32_t)kv_total_rows, (uint32_t)head_dim};
+    uint32_t value_cache_shapes[2] = {(uint32_t)kv_total_rows, (uint32_t)head_dim};
+    uint32_t out_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
 
     Tensor query = make_tensor_external(host_query, query_shapes, 2, data_type);
     Tensor key_cache = make_tensor_external(host_key_cache, key_cache_shapes, 2, data_type);
@@ -124,8 +124,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             uint64_t batch_start = chunk_idx * IN_CORE_BATCH;
 
             PTO2_SCOPE(rt) {
-                uint64_t oi_acc_shapes[2] = {chunk_bc * q_tile, head_dim};
-                uint64_t scalar_acc_shapes[1] = {chunk_bc * q_tile};
+                uint32_t oi_acc_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)head_dim};
+                uint32_t scalar_acc_shapes[1] = {(uint32_t)(chunk_bc * q_tile)};
                 Tensor oi_batch = make_tensor(oi_acc_shapes, 2, DataType::FLOAT32);
                 Tensor li_batch = make_tensor(scalar_acc_shapes, 1, DataType::FLOAT32);
                 Tensor mi_batch = make_tensor(scalar_acc_shapes, 1, DataType::FLOAT32);
@@ -138,9 +138,9 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_hub, 3);
 
                 for (uint64_t bn = 0; bn < max_bn; bn++) {
-                    uint64_t sij_shapes[2] = {chunk_bc * q_tile, block_size};
-                    uint64_t vec_shapes[1] = {chunk_bc * q_tile};
-                    uint64_t oi_new_shapes[2] = {chunk_bc * q_tile, head_dim};
+                    uint32_t sij_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)block_size};
+                    uint32_t vec_shapes[1] = {(uint32_t)(chunk_bc * q_tile)};
+                    uint32_t oi_new_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)head_dim};
 
                     Tensor sij_b = make_tensor(sij_shapes, 2, DataType::FLOAT32);
                     Tensor pij_b = make_tensor(sij_shapes, 2, data_type);
