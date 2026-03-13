@@ -3,9 +3,9 @@
  *
  * The Scheduler is responsible for:
  * 1. Maintaining per-resource-shape ready queues
- * 2. Tracking task state (PENDING -> READY -> RUNNING -> COMPLETED -> CONSUMED)
+ * 2. Tracking task state (PENDING -> READY -> RUNNING -> COMPLETED -> RELEASED -> CONSUMED)
  * 3. Managing fanin/fanout refcounts for dependency resolution
- * 4. Advancing last_task_alive for heap reclamation
+ * 4. Dual waterline advancement (last_task_released for main ring, last_task_consumed for heap)
  * 5. Two-stage mixed-task completion (subtask done bits → mixed-task complete)
  *
  * The Scheduler runs on Device AI_CPU and processes:
@@ -274,7 +274,8 @@ struct PTO2CompletionStats {
  * Scheduler state structure
  *
  * Contains dynamic state updated during task execution.
- * Separated from shared memory for cache efficiency.
+ * Uses dual ring buffers: main ring (short-lived fanin state) and
+ * consumed ring (long-lived fanout/task_state).
  * Hot-path methods are defined inline (implicitly inline as member functions).
  */
 struct PTO2SchedulerState {
@@ -283,7 +284,8 @@ struct PTO2SchedulerState {
     PTO2TaskDescriptor*     task_descriptors;
 
     // Local copies of ring pointers (written to shared memory after update)
-    int32_t last_task_alive;      // Task ring tail (advances on COMPLETED for slot reuse)
+    int32_t last_task_consumed;   // Consumed ring tail (drives heap reclamation)
+    int32_t last_task_released;   // Main ring tail (drives slot reclamation)
     int32_t last_heap_consumed;   // Heap watermark (advances on CONSUMED for buffer reuse)
     uint64_t heap_tail;           // Heap ring tail (offset from heap_base)
 
@@ -291,15 +293,20 @@ struct PTO2SchedulerState {
     void* heap_base;
 
     // === DYNAMIC CONFIGURATION ===
-    uint64_t task_window_size;    // Task window size (power of 2)
+    uint64_t task_window_size;    // Main ring capacity (power of 2)
     uint64_t task_window_mask;    // task_window_size - 1 (for fast modulo)
+    uint64_t consumed_window_size;  // Consumed ring capacity (default = 4 × task_window_size)
+    uint64_t consumed_window_mask;  // consumed_window_size - 1
 
     // === PRIVATE DATA (not in shared memory) ===
 
-    // Per-task slot state (dynamically allocated, indexed by task_id & task_window_mask)
-    // Consolidates task_state, fanin/fanout refcounts, and dependency metadata
-    // into a single cache-friendly structure (32 bytes per slot).
-    PTO2TaskSlotState* slot_states;
+    // Consumed ring: long-lived per-task state (task_state, fanout tracking, heap ptr)
+    // Indexed by task_id & consumed_window_mask
+    PTO2ConsumedRingEntry* consumed_ring;
+
+    // Main slot states: short-lived fanin tracking only
+    // Indexed by task_id & task_window_mask
+    PTO2MainSlotState* main_slot_states;
 
     // Ready queues (one per resource shape)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
@@ -309,7 +316,8 @@ struct PTO2SchedulerState {
     std::atomic<int64_t> tasks_completed;
     std::atomic<int64_t> tasks_consumed;
 #endif
-    std::atomic<int32_t> ring_advance_lock{0};  // Try-lock for advance_ring_pointers
+    std::atomic<int32_t> ring_advance_lock{0};       // Try-lock for advance_consumed_ring_pointers
+    std::atomic<int32_t> main_ring_advance_lock{0};  // Try-lock for advance_main_ring_pointers
 
     // =========================================================================
     // Inline hot-path methods
@@ -319,44 +327,74 @@ struct PTO2SchedulerState {
         return task_id & task_window_mask;
     }
 
-    PTO2TaskSlotState& get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
-    PTO2TaskSlotState& get_slot_state_by_task_id(int32_t task_id) { return slot_states[task_id & task_window_mask]; }
+    PTO2ConsumedRingEntry& get_consumed_entry(int32_t task_id) {
+        return consumed_ring[task_id & consumed_window_mask];
+    }
+
+    PTO2MainSlotState& get_main_slot(int32_t task_id) {
+        return main_slot_states[task_id & task_window_mask];
+    }
 
     void sync_to_sm() {
         PTO2SharedMemoryHeader* header = sm_handle->header;
-        header->last_task_alive.store(last_task_alive, std::memory_order_release);
+        header->last_task_consumed.store(last_task_consumed, std::memory_order_release);
+        header->last_task_released.store(last_task_released, std::memory_order_release);
         header->heap_tail.store(heap_tail, std::memory_order_release);
-        header->heap_tail_gen.store(last_task_alive, std::memory_order_release);
+        header->heap_tail_gen.store(last_task_consumed, std::memory_order_release);
     }
 
-    void advance_ring_pointers() {
+    /**
+     * Advance consumed ring watermark: scan CONSUMED tasks, update heap_tail.
+     * Drives heap reclamation.
+     */
+    void advance_consumed_ring_pointers() {
         PTO2SharedMemoryHeader* header = sm_handle->header;
         int32_t current_task_index = header->current_task_index.load(std::memory_order_acquire);
 
-        while (last_task_alive < current_task_index) {
-            PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(last_task_alive);
-            if (slot_state.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
+        while (last_task_consumed < current_task_index) {
+            PTO2ConsumedRingEntry& entry = get_consumed_entry(last_task_consumed);
+            if (entry.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
                 break;
             }
-            last_task_alive++;
+            last_task_consumed++;
         }
 
-        if (last_task_alive > 0) {
-            int32_t last_consumed_id = last_task_alive - 1;
-            PTO2TaskDescriptor* last_consumed = pto2_sm_get_task(sm_handle, last_consumed_id);
-            if (last_consumed->packed_buffer_end != NULL) {
-                heap_tail = (uint64_t)((char*)last_consumed->packed_buffer_end - (char*)heap_base);
+        if (last_task_consumed > 0) {
+            PTO2ConsumedRingEntry& last_entry = get_consumed_entry(last_task_consumed - 1);
+            if (last_entry.packed_buffer_end != nullptr) {
+                heap_tail = (uint64_t)((char*)last_entry.packed_buffer_end - (char*)heap_base);
             }
         }
 
         sync_to_sm();
     }
 
-    void check_and_handle_consumed(PTO2TaskSlotState& slot_state) {
-        if (slot_state.fanout_refcount.load(std::memory_order_acquire) != slot_state.fanout_count) return;
+    /**
+     * Advance main ring watermark: scan RELEASED tasks.
+     * Drives main ring slot (descriptor + payload) reclamation.
+     */
+    void advance_main_ring_pointers() {
+        PTO2SharedMemoryHeader* header = sm_handle->header;
+        int32_t current_task_index = header->current_task_index.load(std::memory_order_acquire);
 
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(expected, PTO2_TASK_CONSUMED,
+        while (last_task_released < current_task_index) {
+            PTO2ConsumedRingEntry& entry = get_consumed_entry(last_task_released);
+            if (entry.task_state.load(std::memory_order_acquire) < PTO2_TASK_RELEASED) {
+                break;
+            }
+            last_task_released++;
+        }
+
+        header->last_task_released.store(last_task_released, std::memory_order_release);
+    }
+
+    void check_and_handle_consumed(PTO2ConsumedRingEntry& entry) {
+        if (entry.fanout_refcount.load(std::memory_order_acquire) != entry.fanout_count) return;
+
+        // CAS from RELEASED→CONSUMED (not COMPLETED→CONSUMED)
+        // If task is still COMPLETED (not yet RELEASED), CAS fails safely.
+        PTO2TaskState expected = PTO2_TASK_RELEASED;
+        if (!entry.task_state.compare_exchange_strong(expected, PTO2_TASK_CONSUMED,
                                           std::memory_order_acq_rel, std::memory_order_acquire)) {
             return;
         }
@@ -369,22 +407,22 @@ struct PTO2SchedulerState {
         int32_t expected_lock = 0;
         if (ring_advance_lock.compare_exchange_strong(expected_lock, 1,
                 std::memory_order_acquire, std::memory_order_relaxed)) {
-            advance_ring_pointers();
+            advance_consumed_ring_pointers();
             ring_advance_lock.store(0, std::memory_order_release);
         }
     }
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-    void check_and_handle_consumed(PTO2TaskSlotState& slot_state, uint64_t& atomic_count) {
-        int32_t fc = slot_state.fanout_count;
-        int32_t rc = slot_state.fanout_refcount.load(std::memory_order_acquire);
+    void check_and_handle_consumed(PTO2ConsumedRingEntry& entry, uint64_t& atomic_count) {
+        int32_t fc = entry.fanout_count;
+        int32_t rc = entry.fanout_refcount.load(std::memory_order_acquire);
 
         atomic_count += 2;  // fanout_count.load + fanout_refcount.load
 
         if (rc != fc) return;
 
-        PTO2TaskState expected = PTO2_TASK_COMPLETED;
-        if (!slot_state.task_state.compare_exchange_strong(expected, PTO2_TASK_CONSUMED,
+        PTO2TaskState expected = PTO2_TASK_RELEASED;
+        if (!entry.task_state.compare_exchange_strong(expected, PTO2_TASK_CONSUMED,
                                           std::memory_order_acq_rel, std::memory_order_acquire)) {
             atomic_count += 1;  // failed CAS
             return;
@@ -400,7 +438,7 @@ struct PTO2SchedulerState {
         int32_t expected_lock = 0;
         if (ring_advance_lock.compare_exchange_strong(expected_lock, 1,
                 std::memory_order_acquire, std::memory_order_relaxed)) {
-            advance_ring_pointers();
+            advance_consumed_ring_pointers();
             ring_advance_lock.store(0, std::memory_order_release);
             atomic_count += 2;  // try-lock CAS + unlock store
         } else {
@@ -410,31 +448,31 @@ struct PTO2SchedulerState {
 #endif
 
     void release_producer(int32_t producer_id) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(producer_id);
-        slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
-        check_and_handle_consumed(slot_state);
+        PTO2ConsumedRingEntry& entry = get_consumed_entry(producer_id);
+        entry.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
+        check_and_handle_consumed(entry);
     }
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     void release_producer(int32_t producer_id, uint64_t& atomic_count) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(producer_id);
-        slot_state.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
+        PTO2ConsumedRingEntry& entry = get_consumed_entry(producer_id);
+        entry.fanout_refcount.fetch_add(1, std::memory_order_acq_rel);
         atomic_count += 1;  // fanout_refcount.fetch_add
-        check_and_handle_consumed(slot_state, atomic_count);
+        check_and_handle_consumed(entry, atomic_count);
     }
 #endif
 
     bool release_fanin_and_check_ready(int32_t task_id,
                                         PTO2TaskDescriptor* task,
                                         PTO2LocalReadyBuffer* local_bufs = nullptr) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(task_id);
+        PTO2MainSlotState& main_slot = get_main_slot(task_id);
 
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // release in init_task, making fanin_count visible — plain load suffices.
-        int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
+        int32_t new_refcount = main_slot.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
-        if (new_refcount == slot_state.fanin_count) {
+        if (new_refcount == main_slot.fanin_count) {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             PTO2ResourceShape shape = pto2_active_mask_to_shape(task->active_mask);
@@ -455,14 +493,15 @@ struct PTO2SchedulerState {
     bool release_fanin_and_check_ready(int32_t task_id, PTO2TaskDescriptor* task,
                                         uint64_t& atomic_count, uint64_t& push_wait,
                                         PTO2LocalReadyBuffer* local_bufs = nullptr) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(task_id);
+        PTO2MainSlotState& main_slot = get_main_slot(task_id);
 
-        int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
+        int32_t new_refcount = main_slot.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
 
-        if (new_refcount == slot_state.fanin_count) {
+        if (new_refcount == main_slot.fanin_count) {
+            PTO2ConsumedRingEntry& entry = get_consumed_entry(task_id);
             PTO2TaskState expected = PTO2_TASK_PENDING;
-            if (slot_state.task_state.compare_exchange_strong(
+            if (entry.task_state.compare_exchange_strong(
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
                 // Local-first: try per-CoreType thread-local buffer before global queue
@@ -483,14 +522,14 @@ struct PTO2SchedulerState {
 #endif
 
     void init_task(int32_t task_id, PTO2TaskDescriptor* task) {
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(task_id);
+        PTO2ConsumedRingEntry& entry = get_consumed_entry(task_id);
 
-        slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed); // Orchestrator is the unique owner
+        entry.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
 
         // Reset fanout_refcount for new task lifecycle.
         // Do NOT reset fanin_refcount — it may have been incremented by
         // concurrent on_task_complete between Step 5 and Step 6.
-        slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
+        entry.fanout_refcount.store(0, std::memory_order_relaxed);
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
         extern uint64_t g_orch_finalize_atomic_count;
@@ -591,7 +630,7 @@ struct PTO2SchedulerState {
     void on_mixed_task_complete(int32_t mixed_task_id,
                                 PTO2LocalReadyBuffer* local_bufs = nullptr) {
 #endif
-        PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(mixed_task_id);
+        PTO2ConsumedRingEntry& entry = get_consumed_entry(mixed_task_id);
 
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_lock_cycle[], g_sched_fanout_cycle[];
@@ -602,13 +641,13 @@ struct PTO2SchedulerState {
 #endif
 
 #if PTO2_SCHED_PROFILING
-        pto2_fanout_lock(slot_state, lock_atomics, lock_wait);
+        pto2_fanout_lock(entry, lock_atomics, lock_wait);
 #else
-        pto2_fanout_lock(slot_state);
+        pto2_fanout_lock(entry);
 #endif
-        slot_state.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
-        PTO2DepListEntry* current = slot_state.fanout_head;  // Protected by fanout_lock
-        pto2_fanout_unlock(slot_state);
+        entry.task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
+        PTO2DepListEntry* current = entry.fanout_head;  // Protected by fanout_lock
+        pto2_fanout_unlock(entry);
 
 #if PTO2_SCHED_PROFILING
         lock_atomics += 2;  // state.store + unlock.store
@@ -656,7 +695,12 @@ struct PTO2SchedulerState {
     }
 
     /**
-     * Cold path: release producers (fanin traversal) + check self for CONSUMED.
+     * Cold path: release producers (fanin traversal) + transition to RELEASED.
+     *
+     * SAFETY: payload->fanin_tasks must be fully read BEFORE setting RELEASED,
+     * because advance_main_ring_pointers() may reclaim the main ring slot
+     * once RELEASED is visible.
+     *
      * Returns fanin edge count for profiling.
      */
 
@@ -674,6 +718,8 @@ struct PTO2SchedulerState {
         int32_t slot = get_task_slot(task_id);
         PTO2TaskPayload* payload = &sm_handle->task_payloads[slot];
         int32_t fanin_edges = payload->fanin_actual_count;
+
+        // Read all fanin producer IDs from payload BEFORE marking RELEASED
         for (int32_t i = 0; i < fanin_edges; i++) {
 #if PTO2_SCHED_PROFILING
             release_producer(payload->fanin_tasks[i], fanin_atomics);
@@ -686,15 +732,27 @@ struct PTO2SchedulerState {
         PTO2_SCHED_CYCLE_LAP(g_sched_fanin_cycle[thread_idx]);
 #endif
 
-        // Self consumed check
+        // Transition to RELEASED — payload is no longer needed
+        PTO2ConsumedRingEntry& entry = get_consumed_entry(task_id);
+        entry.task_state.store(PTO2_TASK_RELEASED, std::memory_order_release);
+
+        // Try to advance main ring watermark
+        int32_t expected_lock = 0;
+        if (main_ring_advance_lock.compare_exchange_strong(expected_lock, 1,
+                std::memory_order_acquire, std::memory_order_relaxed)) {
+            advance_main_ring_pointers();
+            main_ring_advance_lock.store(0, std::memory_order_release);
+        }
+
+        // Self consumed check — fanout_refcount may already equal fanout_count
 #if PTO2_SCHED_PROFILING
         uint64_t self_atomics = 0;
-        check_and_handle_consumed(get_slot_state_by_slot(slot), self_atomics);
+        check_and_handle_consumed(entry, self_atomics);
         g_sched_self_atomic_count[thread_idx] += self_atomics;
         PTO2_SCHED_CYCLE_LAP(g_sched_self_consumed_cycle[thread_idx]);
         g_sched_complete_count[thread_idx]++;
 #else
-        check_and_handle_consumed(get_slot_state_by_slot(slot));
+        check_and_handle_consumed(entry);
 #endif
         return fanin_edges;
     }
@@ -706,7 +764,8 @@ struct PTO2SchedulerState {
 
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
-                          void* heap_base);
+                          void* heap_base,
+                          uint64_t consumed_window_size);
 void pto2_scheduler_destroy(PTO2SchedulerState* sched);
 
 // =============================================================================

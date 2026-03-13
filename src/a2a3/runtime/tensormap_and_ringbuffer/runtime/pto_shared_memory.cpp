@@ -144,12 +144,14 @@ void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
     header->current_task_index.store(0, std::memory_order_relaxed);
     header->heap_top.store(0, std::memory_order_relaxed);
     header->orchestrator_done.store(0, std::memory_order_relaxed);
-    header->last_task_alive.store(0, std::memory_order_relaxed);
+    header->last_task_consumed.store(0, std::memory_order_relaxed);
+    header->last_task_released.store(0, std::memory_order_relaxed);
     header->heap_tail.store(0, std::memory_order_relaxed);
     header->heap_tail_gen.store(0, std::memory_order_relaxed);
 
     // Layout info
     header->task_window_size = task_window_size;
+    header->consumed_window_size = 0;  // Set by runtime creation (default = 4 × task_window_size)
     header->heap_size = heap_size;
 
     // Calculate offsets
@@ -182,7 +184,8 @@ void pto2_sm_print_layout(PTO2SharedMemoryHandle* handle) {
     LOG_INFO("  heap_tail:          %" PRIu64, h->heap_tail.load(std::memory_order_acquire));
     LOG_INFO("  current_task_index: %d", h->current_task_index.load(std::memory_order_acquire));
     LOG_INFO("  orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
-    LOG_INFO("  last_task_alive:    %d", h->last_task_alive.load(std::memory_order_acquire));
+    LOG_INFO("  last_task_consumed: %d", h->last_task_consumed.load(std::memory_order_acquire));
+    LOG_INFO("  last_task_released: %d", h->last_task_released.load(std::memory_order_acquire));
     LOG_INFO("================================");
 }
 
@@ -201,11 +204,13 @@ bool pto2_sm_validate(PTO2SharedMemoryHandle* handle) {
 
     // Check flow control pointer sanity
     int32_t current_task_index = h->current_task_index.load(std::memory_order_acquire);
-    int32_t last_task_alive = h->last_task_alive.load(std::memory_order_acquire);
+    int32_t last_task_consumed = h->last_task_consumed.load(std::memory_order_acquire);
+    int32_t last_task_released = h->last_task_released.load(std::memory_order_acquire);
     uint64_t heap_top = h->heap_top.load(std::memory_order_acquire);
     uint64_t heap_tail = h->heap_tail.load(std::memory_order_acquire);
     if (current_task_index < 0) return false;
-    if (last_task_alive < 0) return false;
+    if (last_task_consumed < 0) return false;
+    if (last_task_released < 0) return false;
     if (heap_top > h->heap_size) return false;
     if (heap_tail > h->heap_size) return false;
 

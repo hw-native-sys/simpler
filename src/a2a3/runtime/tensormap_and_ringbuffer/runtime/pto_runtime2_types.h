@@ -115,18 +115,23 @@ typedef enum {
  * Task state enumeration
  *
  * State transitions:
- *   PENDING -> READY -> RUNNING -> COMPLETED -> CONSUMED
+ *   PENDING -> READY -> RUNNING -> COMPLETED -> RELEASED -> CONSUMED
  *
  * Conditions:
- *   PENDING->READY:     fanin_refcount == fanin_count
- *   COMPLETED->CONSUMED: fanout_refcount == fanout_count && state == COMPLETED
+ *   PENDING->READY:      fanin_refcount == fanin_count
+ *   COMPLETED->RELEASED: on_task_release() finishes reading payload
+ *   RELEASED->CONSUMED:  fanout_refcount == fanout_count && state == RELEASED
+ *
+ * RELEASED unlocks main ring slot reclamation (descriptor + payload).
+ * CONSUMED unlocks consumed ring slot + heap reclamation.
  */
 typedef enum {
     PTO2_TASK_PENDING = 0,    // Waiting for dependencies (fanin_refcount < fanin_count)
     PTO2_TASK_READY = 1,      // All dependencies satisfied, waiting in ready queue
     PTO2_TASK_RUNNING = 2,    // Currently executing on a worker
     PTO2_TASK_COMPLETED = 3,  // Execution finished, output may still be in use
-    PTO2_TASK_CONSUMED = 4    // Output fully consumed, buffers can be released
+    PTO2_TASK_RELEASED = 4,   // Payload read complete, main ring slot can be reclaimed
+    PTO2_TASK_CONSUMED = 5    // Output fully consumed, consumed ring + heap can be released
 } PTO2TaskState;
 
 // =============================================================================
@@ -295,41 +300,54 @@ struct PTO2TaskDescriptor {
 
     // Packed output buffer (all outputs packed into single contiguous buffer)
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
-    void*    packed_buffer_end;   // End of packed buffer (for heap reclamation)
+    // NOTE: packed_buffer_end moved to PTO2ConsumedRingEntry for lifecycle separation
 };
 
 // =============================================================================
-// Per-Slot Scheduling State
+// Consumed Ring Entry (long-lived scheduling state, AICPU-private)
 // =============================================================================
 
 /**
- * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
+ * Per-task consumed ring entry (scheduler-private, NOT in shared memory)
  *
- * Consolidates all hot-path scheduling fields into a single cache-friendly
- * structure (32 bytes = half a cache line). Accessing any field of a task's
- * slot state brings all related fields into the same cache line.
+ * Contains fields that must survive until CONSUMED state:
+ * - task_state, fanout tracking, packed_buffer_end, dep_pool_mark
  *
- * Concurrency notes:
- * - fanout_head, fanout_count protected by fanout_lock (per-task spinlock)
- * - fanin_count set once at submission, read-only after (hot path for ready check)
- * - task_state, fanin_refcount, fanout_refcount updated atomically
+ * Indexed by task_id & consumed_window_mask (4× main ring capacity).
+ * Cache-line aligned for atomic access efficiency.
  */
-struct alignas(64) PTO2TaskSlotState {
-    // Fanout lock + list (accessed together under lock in on_task_complete)
-    std::atomic<int32_t> fanout_lock;       // Per-task spinlock (0=unlocked, 1=locked)
+struct alignas(64) PTO2ConsumedRingEntry {
+    // Task state (completion, consumed check)
+    std::atomic<PTO2TaskState> task_state;   // PENDING→...→CONSUMED
+
+    // Fanout tracking (accessed in check_and_handle_consumed / release_producer)
+    std::atomic<int32_t> fanout_refcount;    // Dynamic: counts released references
     int32_t fanout_count;                    // 1 (owning scope) + number of consumers
 
+    // Fanout lock + list (accessed together under lock in on_task_complete)
+    std::atomic<int32_t> fanout_lock;        // Per-task spinlock (0=unlocked, 1=locked)
     PTO2DepListEntry* fanout_head;           // Pointer to first fanout entry (nullptr = empty)
 
-    // Task state (completion, consumed check, ready check)
-    std::atomic<PTO2TaskState> task_state;   // PENDING/READY/RUNNING/COMPLETED/CONSUMED
+    // Heap reclamation pointer (drives heap_tail via consumed watermark)
+    void* packed_buffer_end;                 // End of packed buffer in GM Heap
 
-    // Fanin (accessed together in release_fanin_and_check_ready)
+    // Dep pool reclamation watermark
+    int32_t dep_pool_mark;                   // Dep pool top after this task's submission
+};
+
+// =============================================================================
+// Main Slot State (short-lived fanin tracking, AICPU-private)
+// =============================================================================
+
+/**
+ * Per-task main slot state (scheduler-private, NOT in shared memory)
+ *
+ * Contains only fanin tracking fields, freed at RELEASED state.
+ * Indexed by task_id & task_window_mask (same as main ring).
+ */
+struct alignas(64) PTO2MainSlotState {
     std::atomic<int32_t> fanin_refcount;     // Dynamic: counts completed producers
     int32_t fanin_count;                      // Number of producer dependencies (set once)
-
-    // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
-    std::atomic<int32_t> fanout_refcount;    // Dynamic: counts released references
 };
 
 /**
@@ -346,7 +364,7 @@ struct PTO2TaskPayload {
     int param_count{0};
     int32_t fanin_tasks[PTO2_MAX_INPUTS];   // Producer task IDs (cold path, used by on_task_release)
     int32_t fanin_actual_count{0};           // Actual fanin count (without the +1 redundance)
-    int32_t dep_pool_mark{0};                // Dep pool top after this task's submission (for reclamation)
+    // NOTE: dep_pool_mark moved to PTO2ConsumedRingEntry for lifecycle separation
 };
 
 // =============================================================================
@@ -412,20 +430,20 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 #endif
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state,
+static inline void pto2_fanout_lock(PTO2ConsumedRingEntry& entry,
                                      uint64_t& atomic_count, uint64_t& wait_cycle) {
     uint64_t t0 = get_sys_cnt_aicpu();
     bool contended = false;
     uint32_t atomic_ops = 0;
 
     for (;;) {
-        while (slot_state.fanout_lock.load(std::memory_order_acquire) != 0) {
+        while (entry.fanout_lock.load(std::memory_order_acquire) != 0) {
             contended = true;
             atomic_ops++;  // each load = 1 atomic
             SPIN_WAIT_HINT();
         }
         int32_t expected = 0;
-        if (slot_state.fanout_lock.compare_exchange_weak(expected, 1,
+        if (entry.fanout_lock.compare_exchange_weak(expected, 1,
                                         std::memory_order_acquire, std::memory_order_relaxed)) {
             atomic_ops++;  // successful CAS = 1 atomic
             atomic_count += atomic_ops;
@@ -440,21 +458,21 @@ static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state,
 }
 #endif
 
-static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state) {
+static inline void pto2_fanout_lock(PTO2ConsumedRingEntry& entry) {
     for (;;) {
-        while (slot_state.fanout_lock.load(std::memory_order_acquire) != 0) {
+        while (entry.fanout_lock.load(std::memory_order_acquire) != 0) {
             SPIN_WAIT_HINT();
         }
         int32_t expected = 0;
-        if (slot_state.fanout_lock.compare_exchange_weak(expected, 1,
+        if (entry.fanout_lock.compare_exchange_weak(expected, 1,
                                         std::memory_order_acquire, std::memory_order_relaxed)) {
             return;
         }
     }
 }
 
-static inline void pto2_fanout_unlock(PTO2TaskSlotState& slot_state) {
-    slot_state.fanout_lock.store(0, std::memory_order_release);
+static inline void pto2_fanout_unlock(PTO2ConsumedRingEntry& entry) {
+    entry.fanout_lock.store(0, std::memory_order_release);
 }
 
 #endif // PTO_RUNTIME2_TYPES_H

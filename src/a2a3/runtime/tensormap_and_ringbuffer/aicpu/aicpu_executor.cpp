@@ -1271,9 +1271,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 int32_t cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
                 for (int32_t si = 0; si < task_count; si++) {
                     int32_t slot = si & window_mask;
-                    PTO2TaskState st = sched->slot_states[slot].task_state.load(std::memory_order_relaxed);
-                    int32_t rc = sched->slot_states[slot].fanin_refcount.load(std::memory_order_relaxed);
-                    int32_t fi = sched->slot_states[slot].fanin_count;
+                    PTO2TaskState st = sched->get_consumed_entry(si).task_state.load(std::memory_order_relaxed);
+                    int32_t rc = sched->get_main_slot(si).fanin_refcount.load(std::memory_order_relaxed);
+                    int32_t fi = sched->get_main_slot(si).fanin_count;
                     int32_t kid = task_descriptors[slot].kernel_id[0];
                     if (st >= PTO2_TASK_COMPLETED) continue; // Already done
                     if (st == PTO2_TASK_READY || st == PTO2_TASK_RUNNING) { cnt_inflight++; continue; }
@@ -1614,6 +1614,10 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 if (runtime->pto2_heap_size > 0) {
                     heap_size = runtime->pto2_heap_size;
                 }
+                uint64_t consumed_window_size = task_window_size * 4;  // default
+                if (runtime->pto2_consumed_window_size > 0) {
+                    consumed_window_size = runtime->pto2_consumed_window_size;
+                }
                 DEV_INFO("Thread %d: Ring sizes: task_window=%lu, heap=%lu",
                          thread_idx, (unsigned long)task_window_size, (unsigned long)heap_size);
 
@@ -1631,6 +1635,9 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     return -1;
                 }
 
+                // Set consumed_window_size before runtime creation
+                sm_handle->header->consumed_window_size = consumed_window_size;
+
                 rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE,
                                                  sm_handle, gm_heap, heap_size, orch_thread_num_);
                 if (!rt) {
@@ -1641,8 +1648,8 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     return -1;
                 }
 
-                // Wire up slot_states pointer for profiling (complete_perf_records)
-                runtime->set_pto2_slot_states_ptr(rt->scheduler.slot_states);
+                // Wire up consumed_ring pointer for profiling (complete_perf_records)
+                runtime->set_pto2_consumed_ring_ptr(rt->scheduler.consumed_ring);
 
                 // Store shared state for other orchestrator threads
                 orch_func_ = orch_func;

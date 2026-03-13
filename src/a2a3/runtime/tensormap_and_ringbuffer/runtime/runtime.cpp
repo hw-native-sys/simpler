@@ -26,6 +26,7 @@ Runtime::Runtime() {
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     pto2_task_window_size = 0;
     pto2_heap_size = 0;
+    pto2_consumed_window_size = 0;
 
     // Initialize tensor pairs
     tensor_pair_count = 0;
@@ -34,7 +35,7 @@ Runtime::Runtime() {
     orch_built_on_host_ = true;
     pto2_gm_sm_ptr_ = nullptr;
     pto2_gm_heap_ptr_ = nullptr;
-    pto2_slot_states_ptr_ = nullptr;
+    pto2_consumed_ring_ptr_ = nullptr;
     orch_args_ = nullptr;
     orch_arg_count_ = 0;
 
@@ -94,7 +95,7 @@ int Runtime::get_orch_arg_count() const { return orch_arg_count_; }
 void Runtime::set_orch_built_on_host(bool v) { orch_built_on_host_ = v; }
 void Runtime::set_pto2_gm_sm_ptr(void* p) { pto2_gm_sm_ptr_ = p; }
 void Runtime::set_pto2_gm_heap(void* p) { pto2_gm_heap_ptr_ = p; }
-void Runtime::set_pto2_slot_states_ptr(void* p) { pto2_slot_states_ptr_ = p; }
+void Runtime::set_pto2_consumed_ring_ptr(void* p) { pto2_consumed_ring_ptr_ = p; }
 void Runtime::set_orch_args(uint64_t* args, int count) {
     orch_arg_count_ = count <= RUNTIME_MAX_ARGS ? count : RUNTIME_MAX_ARGS;
     if (args && orch_arg_count_ > 0) {
@@ -167,15 +168,15 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         return;
     }
 
-    // Get slot states for fanout traversal
-    PTO2TaskSlotState* slot_states = static_cast<PTO2TaskSlotState*>(pto2_slot_states_ptr_);
-    if (slot_states == nullptr) {
+    // Get consumed ring entries for fanout traversal
+    PTO2ConsumedRingEntry* consumed_ring = static_cast<PTO2ConsumedRingEntry*>(pto2_consumed_ring_ptr_);
+    if (consumed_ring == nullptr) {
         return;
     }
 
-    // Get window mask from shared memory header
+    // Get consumed window mask from shared memory header
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
-    int32_t window_mask = header->task_window_size - 1;
+    int32_t consumed_window_mask = header->consumed_window_size - 1;
 
     uint32_t count = perf_buf->count;
 
@@ -183,13 +184,13 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         PerfRecord* record = &perf_buf->records[i];
         int32_t task_id = record->task_id;
 
-        // Get slot state for fanout traversal
-        int32_t slot = task_id & window_mask;
-        PTO2TaskSlotState& ss = slot_states[slot];
+        // Get consumed ring entry for fanout traversal
+        int32_t slot = task_id & consumed_window_mask;
+        PTO2ConsumedRingEntry& cr = consumed_ring[slot];
 
         // Fill fanout information by traversing the linked list
         record->fanout_count = 0;
-        PTO2DepListEntry* cur = ss.fanout_head;
+        PTO2DepListEntry* cur = cr.fanout_head;
 
         while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
             record->fanout[record->fanout_count++] = cur->task_id;
