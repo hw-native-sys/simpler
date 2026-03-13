@@ -341,7 +341,7 @@ When `pto2_submit_task` processes parameters:
 | `scalar_value[16]` | Scalar parameter values |
 | `is_tensor[16]` | Whether each parameter is tensor or scalar |
 | `param_count` | Number of valid parameters |
-| `fanin_task_slots[]` | Producer task slots (used by `on_task_release`) |
+| `fanin_slot_states[]` | Producer slot state pointers (used by `on_task_release`) |
 | `fanin_actual_count` | Actual fanin count |
 
 ### 6.2 Task State Machine

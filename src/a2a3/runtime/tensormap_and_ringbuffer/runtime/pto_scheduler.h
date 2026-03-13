@@ -314,7 +314,6 @@ struct PTO2SchedulerState {
         return task_id & (sm_handle->header->task_window_size - 1);
     }
 
-    PTO2TaskSlotState& get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
     PTO2TaskSlotState& get_slot_state_by_task_id(int32_t task_id) {
         return slot_states[task_id & (sm_handle->header->task_window_size - 1)];
     }
@@ -639,9 +638,9 @@ struct PTO2SchedulerState {
         int32_t fanin_edges = payload->fanin_actual_count;
         for (int32_t i = 0; i < fanin_edges; i++) {
 #if PTO2_SCHED_PROFILING
-            release_producer(get_slot_state_by_slot(payload->fanin_task_slots[i]), fanin_atomics);
+            release_producer(*payload->fanin_slot_states[i], fanin_atomics);
 #else
-            release_producer(get_slot_state_by_slot(payload->fanin_task_slots[i]));
+            release_producer(*payload->fanin_slot_states[i]);
 #endif
         }
 #if PTO2_SCHED_PROFILING

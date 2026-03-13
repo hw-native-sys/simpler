@@ -315,7 +315,7 @@ struct PTO2TaskPayload {
     uint64_t scalar_value[16];
     bool is_tensor[16];
     int param_count{0};
-    int32_t fanin_task_slots[PTO2_MAX_INPUTS]; // Producer task slots (cold path, used by on_task_release)
+    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (cold path, used by on_task_release)
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
     int32_t dep_pool_mark{0};                  // Dep pool top after this task's submission (for reclamation)
 };

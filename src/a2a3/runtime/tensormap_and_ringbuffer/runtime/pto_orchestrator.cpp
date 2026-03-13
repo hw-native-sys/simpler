@@ -472,7 +472,7 @@ void pto2_submit_mixed_task(
         cur_slot_state.fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
         payload->fanin_actual_count = fanin_count;
         for (int i = 0; i < fanin_count; i++) {
-            payload->fanin_task_slots[i] = task_ring.get_task_slot(fanin_temp[i]);
+            payload->fanin_slot_states[i] = &sched->slot_states[task_ring.get_task_slot(fanin_temp[i])];
         }
         for (int i = 0; i < fanin_count; i++) {
             int32_t producer_task_id = fanin_temp[i];
