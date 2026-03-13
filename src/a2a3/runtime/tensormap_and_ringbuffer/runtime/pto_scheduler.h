@@ -587,7 +587,7 @@ struct PTO2SchedulerState {
         uint64_t fanout_atomics = 0, push_wait = 0;
 #endif
         while (current != nullptr) {
-            PTO2TaskSlotState& consumer_slot = get_slot_state_by_slot(current->task_slot);
+            PTO2TaskSlotState& consumer_slot = *current->slot_state;
 #if PTO2_PROFILING
             stats.fanout_edges++;
 #endif

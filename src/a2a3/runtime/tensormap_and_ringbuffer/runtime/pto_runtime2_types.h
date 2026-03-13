@@ -262,9 +262,10 @@ typedef struct {
  *
  * Used for both fanin_list and fanout_list
  */
+struct PTO2TaskSlotState;  // Forward declaration
 struct PTO2DepListEntry {
-    int32_t task_slot;        // Consumer task slot (pre-computed from task_id)
-    PTO2DepListEntry* next;      // next entry
+    PTO2TaskSlotState* slot_state;    // Consumer slot state (direct pointer)
+    PTO2DepListEntry* next;           // next entry
 };
 
 // =============================================================================

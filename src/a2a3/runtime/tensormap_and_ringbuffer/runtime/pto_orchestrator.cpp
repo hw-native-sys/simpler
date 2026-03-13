@@ -479,7 +479,7 @@ void pto2_submit_mixed_task(
             // Add this task to producer's fanout list (with spinlock)
             int32_t prod_slot = task_ring.get_task_slot(producer_task_id);
             PTO2TaskSlotState& producer_slot_state = sched->slot_states[prod_slot];
-            orch->dep_pool_cur_entry->task_slot = slot;
+            orch->dep_pool_cur_entry->slot_state = &cur_slot_state;
             orch->dep_pool_cur_entry->next = producer_slot_state.fanout_head;
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
             pto2_fanout_lock(producer_slot_state, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);

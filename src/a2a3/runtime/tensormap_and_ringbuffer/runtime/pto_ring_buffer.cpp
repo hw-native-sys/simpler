@@ -51,7 +51,7 @@ void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t c
     pool->high_water = 0;
 
     // Initialize entry 0 as NULL marker
-    pool->base[0].task_slot = -1;
+    pool->base[0].slot_state = nullptr;
     pool->base[0].next = nullptr;
 }
 

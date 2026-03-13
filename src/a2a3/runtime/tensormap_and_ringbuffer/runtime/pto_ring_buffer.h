@@ -480,9 +480,9 @@ struct PTO2DepListPool {
      * @param task_slot     Task slot to prepend
      * @return New head offset
      */
-    PTO2DepListEntry* pto2_dep_list_prepend(PTO2DepListEntry* cur, int32_t task_slot) {
+    PTO2DepListEntry* pto2_dep_list_prepend(PTO2DepListEntry* cur, PTO2TaskSlotState* slot_state) {
         PTO2DepListEntry& new_entry = alloc();
-        new_entry.task_slot = task_slot;
+        new_entry.slot_state = slot_state;
         new_entry.next = cur;
         return &new_entry;
     }
