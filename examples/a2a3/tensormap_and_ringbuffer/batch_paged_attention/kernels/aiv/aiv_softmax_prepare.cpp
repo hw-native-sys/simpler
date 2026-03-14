@@ -120,26 +120,8 @@ static __aicore__ void softmax_prepare_batch_impl(
 
         TileSijDyn sijDynTile(static_cast<size_t>(valid_len));
         TASSIGN(sijDynTile, 0x0);
-        // TFILLPAD_INPLACE alone is insufficient at small N (block_size<=32);
-        // manually fill invalid columns with -inf as a workaround.
         TFILLPAD_INPLACE(sijPadTile, sijDynTile);
-        if (valid_len < static_cast<uint64_t>(N)) {
-            // Ensure PIPE_V vcopy completes before PIPE_S SetValue to avoid UB memory race;
-            set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-            constexpr float NEG_INF = -__builtin_huge_valf();
-            for (int r = 0; r < M; r++) {
-                for (uint64_t c = valid_len; c < N; c++) {
-                    sijTile.SetValue(static_cast<uint32_t>(r * N + c), NEG_INF);
-                }
-            }
-            // Ensure PIPE_S scalar UB writes are visible to subsequent PIPE_V ops.
-            // dsb(DSB_UB) is a hardware-only intrinsic; in simulation there are no
-            // real pipelines so the barrier is unnecessary and DSB_UB is undefined.
-#ifdef DSB_UB
-            dsb(DSB_UB);
-#endif
-        }
+        pipe_barrier(PIPE_V);
 
         TMULS(sijTile, sijTile, scale_value);
         pipe_barrier(PIPE_V);

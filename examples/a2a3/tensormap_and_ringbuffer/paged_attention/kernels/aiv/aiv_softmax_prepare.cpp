@@ -6,10 +6,6 @@
 // filled with -inf before softmax, ensuring exp(-inf)=0 so that invalid
 // key positions contribute zero attention weight.
 //
-// Uses TFILLPAD_INPLACE for vector pipeline state setup, then patches with
-// scalar SetValue writes to fix a hardware bug in TFILLPAD's vcopy broadcast
-// path at small N (N=16).
-//
 // Computes:
 //   sij_masked = pad(sij, valid_len, -inf)
 //   sij_scale = sij_masked * scale
@@ -87,33 +83,9 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-    // Mask columns [valid_len, N) with -inf.
-    // Use TFILLPAD_INPLACE for the main fill, then patch with SetValue for
-    // cases where TFILLPAD's vcopy broadcast path fails at small N.
+    // manually fill invalid columns with -inf as a workaround.
     TFILLPAD_INPLACE(sijPadTile, sijDynTile);
-    // Patch: SetValue ensures correctness for valid_len <= N/2 where
-    // TFILLPAD's PadRightRemainingRows vcopy has a hardware issue.
-    if (valid_len < static_cast<uint64_t>(N)) {
-        // Cross-pipeline sync: wait for PIPE_V vcopy in TFILLPAD to complete
-        // before PIPE_S scalar SetValue writes to the same UB addresses.
-        // Without this, PIPE_V vcopy and PIPE_S SetValue race on UB memory,
-        // causing sporadic FAIL when vcopy finishes after SetValue.
-        // Pattern from TFillPad.hpp Handle32BAlignedPad_Byte (PtoSetWaitFlag).
-        set_flag(PIPE_V, PIPE_S, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_S, EVENT_ID0);
-        constexpr float NEG_INF = -__builtin_huge_valf();
-        for (int r = 0; r < M; r++) {
-            for (uint64_t c = valid_len; c < N; c++) {
-                sijTile.SetValue(static_cast<uint32_t>(r * N + c), NEG_INF);
-            }
-        }
-        // Ensure PIPE_S scalar UB writes are visible to subsequent PIPE_V ops.
-        // dsb(DSB_UB) is a hardware-only intrinsic; in simulation there are no
-        // real pipelines so the barrier is unnecessary and DSB_UB is undefined.
-#ifdef DSB_UB
-        dsb(DSB_UB);
-#endif
-    }
+    pipe_barrier(PIPE_V);
 
     TMULS(sijTile, sijTile, scale_value);
     pipe_barrier(PIPE_V);

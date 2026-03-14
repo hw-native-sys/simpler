@@ -125,6 +125,7 @@ static __aicore__ void softmax_prepare_batch_impl(
         TileSijDyn sijDynTile(static_cast<size_t>(valid_len));
         TASSIGN(sijDynTile, 0x0);
         TFILLPAD_INPLACE(sijPadTile, sijDynTile);
+        pipe_barrier(PIPE_V);
 
         TMULS(sijTile, sijTile, scale_value);
         pipe_barrier(PIPE_V);

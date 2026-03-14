@@ -90,6 +90,7 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     // Mask columns [valid_len, N) with -inf. sijDynTile provides the valid boundary,
     // sijPadTile provides PadValue::Min as the fill value. No-op when valid_len == N.
     TFILLPAD_INPLACE(sijPadTile, sijDynTile);
+    pipe_barrier(PIPE_V);
 
     TMULS(sijTile, sijTile, scale_value);
     pipe_barrier(PIPE_V);
