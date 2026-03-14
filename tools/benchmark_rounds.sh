@@ -20,9 +20,9 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 EXAMPLES=(
     alternating_matmul_add
     benchmark_bgemm
+    paged_attention
     paged_attention_unroll
     batch_paged_attention
-    paged_attention
 )
 
 # ---------------------------------------------------------------------------
@@ -100,7 +100,7 @@ parse_timing() {
     local log_file="$1"
 
     local timing
-    timing=$(grep -E 'Thread=[0-9]+ (orch_start|end)=' "$log_file" || true)
+    timing=$(grep -E 'round=[0-9]+.*(orch_start|end)=' "$log_file" || true)
 
     if [[ -z "$timing" ]]; then
         echo "  (no benchmark timing data — was PTO2_PROFILING enabled?)"
@@ -109,34 +109,39 @@ parse_timing() {
 
     echo "$timing" | awk '
     /orch_start=/ {
-        if (round > 0 && max_end > 0) {
-            elapsed = max_end - orch_start
-            results[round - 1] = elapsed / 50.0
-            count++
-        }
-        round++
-        match($0, /orch_start=([0-9]+)/, m)
-        orch_start = m[1] + 0
-        max_end = 0
+        match($0, /round=([0-9]+)/, mr)
+        r = mr[1] + 0
+        match($0, /orch_start=([0-9]+)/, ms)
+        val = ms[1] + 0
+        if (!(r in min_start) || val < min_start[r]) min_start[r] = val
+        if (r > max_round) max_round = r
     }
     /end=/ {
-        match($0, /end=([0-9]+)/, m)
-        val = m[1] + 0
-        if (val > max_end) max_end = val
+        match($0, /round=([0-9]+)/, mr)
+        r = mr[1] + 0
+        match($0, /end=([0-9]+)/, me)
+        val = me[1] + 0
+        if (!(r in max_end) || val > max_end[r]) max_end[r] = val
+        if (r > max_round) max_round = r
     }
     END {
-        if (round > 0 && max_end > 0) {
-            results[round - 1] = (max_end - orch_start) / 50.0
-            count++
+        count = 0
+        for (r = 0; r <= max_round; r++) {
+            if ((r in min_start) && (r in max_end)) {
+                results[r] = (max_end[r] - min_start[r]) / 50.0
+                count++
+            }
         }
         if (count == 0) { print "  (no rounds parsed)"; exit 1 }
 
         printf "  %-8s  %12s\n", "Round", "Elapsed (us)"
         printf "  %-8s  %12s\n", "-----", "------------"
         sum_v = 0
-        for (i = 0; i < count; i++) {
-            printf "  %-8d  %12.1f\n", i, results[i]
-            sum_v += results[i]
+        for (r = 0; r <= max_round; r++) {
+            if ((r in min_start) && (r in max_end)) {
+                printf "  %-8d  %12.1f\n", r, results[r]
+                sum_v += results[r]
+            }
         }
         printf "\n  Avg: %.1f us  (%d rounds)\n", sum_v / count, count
     }'

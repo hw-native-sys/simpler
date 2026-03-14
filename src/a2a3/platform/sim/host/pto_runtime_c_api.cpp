@@ -175,7 +175,8 @@ int launch_runtime(RuntimeHandle runtime,
                    size_t aicpu_size,
                    const uint8_t* aicore_binary,
                    size_t aicore_size,
-                   int orch_thread_num) {
+                   int orch_thread_num,
+                   int round_idx) {
     if (runtime == NULL) {
         return -1;
     }
@@ -196,6 +197,7 @@ int launch_runtime(RuntimeHandle runtime,
 
         Runtime* r = static_cast<Runtime*>(runtime);
         r->orch_thread_num = orch_thread_num;
+        r->round_idx = round_idx;
         return runner.run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
     } catch (...) {
         return -1;

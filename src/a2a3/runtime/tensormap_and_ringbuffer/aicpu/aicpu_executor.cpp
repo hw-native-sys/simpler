@@ -1676,7 +1676,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             DEV_ALWAYS("Thread %d: Calling aicpu_orchestration_entry from SO (orch_idx=%d/(0~%d))",
                        thread_idx, orch_idx, orch_thread_num_ - 1);
 #if PTO2_PROFILING
-            DEV_ALWAYS("Thread=%d orch_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+            DEV_ALWAYS("Thread=%d round=%d orch_start=%llu", thread_idx, runtime->round_idx, (unsigned long long)get_sys_cnt_aicpu());
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             PTO2_SCOPE(rt) { orch_func_(rt, orch_args_cached_, orch_arg_count_cached_, orch_thread_num_, orch_idx); }
@@ -1786,7 +1786,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 DEV_INFO("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
 #if PTO2_PROFILING
                 // Benchmark: record orchestrator end timestamp before waiting for schedulers
-                DEV_ALWAYS("BENCHMARK: thread=%d end=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+                DEV_ALWAYS("BENCHMARK: thread=%d round=%d end=%llu", thread_idx, runtime->round_idx, (unsigned long long)get_sys_cnt_aicpu());
 #endif
                 transition_requested_.store(true, std::memory_order_release);
 
@@ -1838,8 +1838,8 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
         int32_t shutdown_count = core_count_per_thread_[thread_idx];
 #if PTO2_PROFILING
         // Benchmark: record scheduler end timestamp before shutdown cleanup
-        DEV_ALWAYS("Thread=%d end=%llu",
-                   thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+        DEV_ALWAYS("Thread=%d round=%d end=%llu",
+                   thread_idx, runtime->round_idx, (unsigned long long)get_sys_cnt_aicpu());
 #endif
         auto rc = shutdown_aicore(runtime, thread_idx, shutdown_cores, shutdown_count);
         if (rc != 0) {

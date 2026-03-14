@@ -915,6 +915,7 @@ class CodeRunner:
                     aicpu_binary=aicpu_binary,
                     aicore_binary=aicore_binary,
                     orch_thread_num=self.orch_thread_num,
+                    round_idx=round_idx,
                 )
 
                 runtime.finalize()

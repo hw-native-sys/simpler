@@ -161,6 +161,7 @@ int copy_from_device(void* host_ptr, const void* dev_ptr, size_t size);
  * @param aicore_binary    AICore kernel binary data
  * @param aicore_size      Size of AICore binary in bytes
  * @param orch_thread_num  Number of orchestrator threads (default 1)
+ * @param round_idx        Current round index (0-based, for benchmark logging)
  * @return 0 on success, error code on failure
  */
 int launch_runtime(RuntimeHandle runtime,
@@ -171,7 +172,8 @@ int launch_runtime(RuntimeHandle runtime,
     size_t aicpu_size,
     const uint8_t* aicore_binary,
     size_t aicore_size,
-    int orch_thread_num);
+    int orch_thread_num,
+    int round_idx);
 
 /**
  * Finalize and cleanup a runtime instance.
