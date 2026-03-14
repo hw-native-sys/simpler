@@ -46,6 +46,9 @@
 // Flow control spin limit - if exceeded, likely deadlock due to scope/fanout_count
 #define PTO2_FLOW_CONTROL_SPIN_LIMIT  100000
 
+// Dep pool spin limit - if exceeded, dep pool capacity too small for workload
+#define PTO2_DEP_POOL_SPIN_LIMIT      100000
+
 // =============================================================================
 // Heap Ring Buffer
 // =============================================================================
@@ -80,6 +83,7 @@ struct PTO2HeapRing {
 
         // Spin-wait if insufficient space (back-pressure from Scheduler)
         int spin_count = 0;
+        uint64_t prev_tail = tail_ptr->load(std::memory_order_acquire);
 #if PTO2_SPIN_VERBOSE_LOGGING
         bool notified = false;
 #endif
@@ -115,30 +119,46 @@ struct PTO2HeapRing {
             if (!waiting) { wait_start = get_sys_cnt_aicpu(); waiting = true; }
 #endif
 
+            // Progress detection: reset spin counter if heap_tail advances
+            uint64_t cur_tail = tail_ptr->load(std::memory_order_acquire);
+            if (cur_tail != prev_tail) {
+#if PTO2_SPIN_VERBOSE_LOGGING
+                LOG_INFO("[HeapRing] Progress: tail %" PRIu64 " -> %" PRIu64 " (reset spin_count=%d)",
+                         prev_tail, cur_tail, spin_count);
+#endif
+                spin_count = 0;
+                prev_tail = cur_tail;
+            }
+
 #if PTO2_SPIN_VERBOSE_LOGGING
             // Periodic block notification
-            if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count < PTO2_HEAP_SPIN_LIMIT) {
-                uint64_t tail = tail_ptr->load(std::memory_order_acquire);
+            if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count > 0 && spin_count < PTO2_HEAP_SPIN_LIMIT) {
                 uint64_t top = top_ptr->load(std::memory_order_acquire);
                 LOG_WARN("[HeapRing] BLOCKED: requesting %" PRIu64 " bytes"
                      ", top=%" PRIu64 ", tail=%" PRIu64 ", spins=%d",
-                     size, top, tail, spin_count);
+                     size, top, cur_tail, spin_count);
                 notified = true;
             }
 #endif
 
             if (spin_count >= PTO2_HEAP_SPIN_LIMIT) {
-                uint64_t tail = tail_ptr->load(std::memory_order_acquire);
                 uint64_t top = top_ptr->load(std::memory_order_acquire);
                 LOG_ERROR("========================================");
                 LOG_ERROR("FATAL: Heap Ring Deadlock Detected!");
                 LOG_ERROR("========================================");
-                LOG_ERROR("Orchestrator blocked waiting for heap space after %d spins.", spin_count);
+                LOG_ERROR("Orchestrator blocked waiting for heap space after %d spins (no tail progress).", spin_count);
                 LOG_ERROR("  - Requested:     %" PRIu64 " bytes", size);
                 LOG_ERROR("  - Heap top:      %" PRIu64, top);
-                LOG_ERROR("  - Heap tail:     %" PRIu64, tail);
+                LOG_ERROR("  - Heap tail:     %" PRIu64 " (stuck here)", cur_tail);
                 LOG_ERROR("  - Heap size:     %" PRIu64, this->size);
-                LOG_ERROR("Solution: Increase PTO2_HEAP_SIZE (e.g. 256*1024 for 4 x 64KB outputs).");
+                LOG_ERROR("  - Available:     %" PRIu64 " bytes", pto2_heap_ring_available());
+                LOG_ERROR("Diagnosis:");
+                LOG_ERROR("  heap_tail is not advancing, which means last_task_alive");
+                LOG_ERROR("  is stuck. Check TaskRing diagnostics for root cause.");
+                LOG_ERROR("Solution: Increase heap size or investigate task stall.");
+                LOG_ERROR("  Compile-time: PTO2_HEAP_SIZE in pto_runtime2_types.h");
+                LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<power-of-2 bytes> (e.g. %lu)",
+                          (unsigned long)(this->size * 2));
                 LOG_ERROR("========================================");
                 exit(1);
             }
@@ -255,6 +275,7 @@ struct PTO2TaskRing {
     int32_t pto2_task_ring_alloc() {
         // Spin-wait if window is full (back-pressure from Scheduler)
         int spin_count = 0;
+        int32_t prev_last_alive = last_alive_ptr->load(std::memory_order_acquire);
 #if PTO2_SPIN_VERBOSE_LOGGING
         bool notified = false;
 #endif
@@ -290,52 +311,56 @@ struct PTO2TaskRing {
             if (!waiting) { wait_start = get_sys_cnt_aicpu(); waiting = true; }
 #endif
 
+            // Progress detection: reset spin counter if last_task_alive advances
+            int32_t cur_last_alive = last_alive_ptr->load(std::memory_order_acquire);
+            if (cur_last_alive > prev_last_alive) {
+#if PTO2_SPIN_VERBOSE_LOGGING
+                LOG_INFO("[TaskRing] Progress: last_alive %d -> %d (reset spin_count=%d)",
+                         prev_last_alive, cur_last_alive, spin_count);
+#endif
+                spin_count = 0;
+                prev_last_alive = cur_last_alive;
+            }
+
 #if PTO2_SPIN_VERBOSE_LOGGING
             // Periodic block notification
-            if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count < PTO2_FLOW_CONTROL_SPIN_LIMIT) {
-                int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
+            if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count > 0 && spin_count < PTO2_FLOW_CONTROL_SPIN_LIMIT) {
                 int32_t current = current_index_ptr->load(std::memory_order_acquire);
-                int32_t active_count = current - last_alive;
+                int32_t active_count = current - cur_last_alive;
                 LOG_WARN("[TaskRing] BLOCKED (Flow Control): current=%d, last_alive=%d, "
                      "active=%d/%d (%.1f%%), spins=%d",
-                     current, last_alive, active_count, window_size,
+                     current, cur_last_alive, active_count, window_size,
                      100.0 * active_count / window_size, spin_count);
                 notified = true;
             }
 #endif
 
-            // Check for potential deadlock
+            // Deadlock: no progress after SPIN_LIMIT spins
             if (spin_count >= PTO2_FLOW_CONTROL_SPIN_LIMIT) {
-                int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
                 int32_t current = current_index_ptr->load(std::memory_order_acquire);
-                int32_t active_count = current - last_alive;
+                int32_t active_count = current - cur_last_alive;
 
                 LOG_ERROR("========================================");
                 LOG_ERROR("FATAL: Flow Control Deadlock Detected!");
                 LOG_ERROR("========================================");
                 LOG_ERROR("Task Ring is FULL and no progress after %d spins.", spin_count);
-                LOG_ERROR("Flow Control Status:");
                 LOG_ERROR("  - Current task index:  %d", current);
-                LOG_ERROR("  - Last task alive:     %d", last_alive);
-                LOG_ERROR("  - Active tasks:        %d", active_count);
-                LOG_ERROR("  - Window size:         %d", window_size);
+                LOG_ERROR("  - Last task alive:     %d (stuck here)", cur_last_alive);
+                LOG_ERROR("  - Active tasks:        %d / %d", active_count, window_size);
                 LOG_ERROR("  - Window utilization:  %.1f%%", 100.0 * active_count / window_size);
-                LOG_ERROR("Root Cause:");
-                LOG_ERROR("  Tasks cannot transition to CONSUMED state because:");
-                LOG_ERROR("  - fanout_count includes 1 for the owning scope");
-                LOG_ERROR("  - scope_end() requires orchestrator to continue");
-                LOG_ERROR("  - But orchestrator is blocked waiting for task ring space");
-                LOG_ERROR("  This creates a circular dependency (deadlock).");
+                LOG_ERROR("Diagnosis:");
+                LOG_ERROR("  last_task_alive is stuck at %d, meaning task %d",
+                          cur_last_alive, cur_last_alive);
+                LOG_ERROR("  cannot transition to CONSUMED. Possible causes:");
+                LOG_ERROR("  1. Task %d still executing (subtasks not complete)", cur_last_alive);
+                LOG_ERROR("  2. Task %d fanout not fully released (downstream not done)", cur_last_alive);
+                LOG_ERROR("  3. Scope reference not released (scope_end not called)");
+                LOG_ERROR("  4. Orchestrator blocked here -> can't call scope_end -> circular wait");
                 LOG_ERROR("Solution:");
-                LOG_ERROR("  Current task_window_size: %d", window_size);
-                LOG_ERROR("  Default PTO2_TASK_WINDOW_SIZE: %d", PTO2_TASK_WINDOW_SIZE);
-                LOG_ERROR("  Recommended: %d (at least 2x current active tasks)", active_count * 2);
-                LOG_ERROR("  Option 1: Change PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
-                LOG_ERROR("  Option 2: Use pto2_runtime_create_threaded_custom() with larger");
-                LOG_ERROR("            task_window_size parameter.");
+                LOG_ERROR("  Increase task window size (current: %d, recommended: %d)", window_size, active_count * 2);
+                LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
+                LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)", active_count * 2);
                 LOG_ERROR("========================================");
-
-                // Abort program
                 exit(1);
             }
 
@@ -451,6 +476,10 @@ struct PTO2DepListPool {
             LOG_ERROR("  - Pool top:      %d (linear)", top);
             LOG_ERROR("  - Pool tail:     %d (linear)", tail);
             LOG_ERROR("  - High water:    %d", high_water);
+            LOG_ERROR("Solution:");
+            LOG_ERROR("  Increase dep pool capacity (current: %d, recommended: %d).", capacity, capacity * 2);
+            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
+            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", capacity * 2);
             LOG_ERROR("========================================");
             exit(1);
         }

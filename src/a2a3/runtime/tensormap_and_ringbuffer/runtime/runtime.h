@@ -148,6 +148,7 @@ public:
     // Ring buffer size overrides (0 = use compile-time defaults)
     uint64_t pto2_task_window_size;
     uint64_t pto2_heap_size;
+    uint64_t pto2_dep_pool_size;
 
     // PTO2 integration: kernel_id -> GM function_bin_addr mapping
     // NOTE: Made public for direct access from aicore code

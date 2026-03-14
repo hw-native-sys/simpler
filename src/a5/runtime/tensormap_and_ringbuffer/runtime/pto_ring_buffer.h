@@ -46,6 +46,9 @@
 // Flow control spin limit - if exceeded, likely deadlock due to scope/fanout_count
 #define PTO2_FLOW_CONTROL_SPIN_LIMIT  100000
 
+// Dep pool spin limit - if exceeded, dep pool capacity too small for workload
+#define PTO2_DEP_POOL_SPIN_LIMIT      100000
+
 // =============================================================================
 // Heap Ring Buffer
 // =============================================================================
@@ -138,7 +141,10 @@ struct PTO2HeapRing {
                 LOG_ERROR("  - Heap top:      %" PRIu64, top);
                 LOG_ERROR("  - Heap tail:     %" PRIu64, tail);
                 LOG_ERROR("  - Heap size:     %" PRIu64, this->size);
-                LOG_ERROR("Solution: Increase PTO2_HEAP_SIZE (e.g. 256*1024 for 4 x 64KB outputs).");
+                LOG_ERROR("Solution: Increase heap size or investigate task stall.");
+                LOG_ERROR("  Compile-time: PTO2_HEAP_SIZE in pto_runtime2_types.h");
+                LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<power-of-2 bytes> (e.g. %lu)",
+                          (unsigned long)(this->size * 2));
                 LOG_ERROR("========================================");
                 exit(1);
             }
@@ -327,12 +333,9 @@ struct PTO2TaskRing {
                 LOG_ERROR("  - But orchestrator is blocked waiting for task ring space");
                 LOG_ERROR("  This creates a circular dependency (deadlock).");
                 LOG_ERROR("Solution:");
-                LOG_ERROR("  Current task_window_size: %d", window_size);
-                LOG_ERROR("  Default PTO2_TASK_WINDOW_SIZE: %d", PTO2_TASK_WINDOW_SIZE);
-                LOG_ERROR("  Recommended: %d (at least 2x current active tasks)", active_count * 2);
-                LOG_ERROR("  Option 1: Change PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
-                LOG_ERROR("  Option 2: Use pto2_runtime_create_threaded_custom() with larger");
-                LOG_ERROR("            task_window_size parameter.");
+                LOG_ERROR("  Increase task window size (current: %d, recommended: %d)", window_size, active_count * 2);
+                LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
+                LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)", active_count * 2);
                 LOG_ERROR("========================================");
 
                 // Abort program
@@ -451,6 +454,10 @@ struct PTO2DepListPool {
             LOG_ERROR("  - Pool top:      %d (linear)", top);
             LOG_ERROR("  - Pool tail:     %d (linear)", tail);
             LOG_ERROR("  - High water:    %d", high_water);
+            LOG_ERROR("Solution:");
+            LOG_ERROR("  Increase dep pool capacity (current: %d, recommended: %d).", capacity, capacity * 2);
+            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
+            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", capacity * 2);
             LOG_ERROR("========================================");
             exit(1);
         }

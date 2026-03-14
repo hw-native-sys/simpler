@@ -42,6 +42,36 @@ ALL_CASES = {
         "max_model_len": 32768,
         "dtype": "bfloat16",
     },
+    "Case4": {
+        "batch": 512,
+        "num_heads": 16,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 128,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16",
+    },
+    "Case5": {
+        "batch": 128,
+        "num_heads": 64,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 64,
+        "context_len": 16384,
+        "max_model_len": 32768,
+        "dtype": "bfloat16",
+    },
+    "Case6": {
+        "batch": 32,
+        "num_heads": 16,
+        "kv_head_num": 1,
+        "head_dim": 128,
+        "block_size": 128,
+        "context_len": 4096,
+        "max_model_len": 32768,
+        "dtype": "bfloat16",
+    },
 }
 
 DEFAULT_CASE = "Case1"

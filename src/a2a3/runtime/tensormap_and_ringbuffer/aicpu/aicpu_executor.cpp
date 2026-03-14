@@ -1598,8 +1598,12 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 if (runtime->pto2_heap_size > 0) {
                     heap_size = runtime->pto2_heap_size;
                 }
-                DEV_INFO("Thread %d: Ring sizes: task_window=%lu, heap=%lu",
-                         thread_idx, (unsigned long)task_window_size, (unsigned long)heap_size);
+                int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE;
+                if (runtime->pto2_dep_pool_size > 0) {
+                    dep_pool_capacity = static_cast<int32_t>(runtime->pto2_dep_pool_size);
+                }
+                DEV_INFO("Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d",
+                         thread_idx, (unsigned long)task_window_size, (unsigned long)heap_size, dep_pool_capacity);
 
                 void* sm_ptr = runtime->get_pto2_gm_sm_ptr();
                 void* gm_heap = runtime->get_pto2_gm_heap_ptr();
@@ -1616,7 +1620,8 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 }
 
                 rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE,
-                                                 sm_handle, gm_heap, heap_size, orch_thread_num_);
+                                                 sm_handle, gm_heap, heap_size, orch_thread_num_,
+                                                 dep_pool_capacity);
                 if (!rt) {
                     DEV_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
                     pto2_sm_destroy(sm_handle);

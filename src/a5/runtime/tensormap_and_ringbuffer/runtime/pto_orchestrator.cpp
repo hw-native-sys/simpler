@@ -171,6 +171,72 @@ void pto2_orchestrator_set_scheduler_mode(
 }
 
 // =============================================================================
+// Dep Pool Reclamation
+// =============================================================================
+
+/**
+ * Reclaim dead dep pool entries based on scheduler's last_task_alive.
+ * Safe to call multiple times — only advances tail forward.
+ */
+static void pto2_dep_pool_reclaim(PTO2OrchestratorState* orch) {
+    int32_t last_alive = orch->sm_handle->header->last_task_alive.load(std::memory_order_acquire);
+    if (last_alive > orch->dep_pool_last_reclaimed && last_alive > 0) {
+        int32_t newest_consumed = last_alive - 1;
+        int32_t slot_rc = orch->task_ring.get_task_slot(newest_consumed);
+        int32_t mark = orch->sm_handle->task_payloads[slot_rc].dep_pool_mark;
+        if (mark > 0) {
+            orch->dep_pool.advance_tail(mark);
+        }
+        orch->dep_pool_last_reclaimed = last_alive;
+    }
+}
+
+/**
+ * Ensure dep pool has at least `needed` entries available.
+ * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
+ */
+static void pto2_dep_pool_ensure_space(PTO2OrchestratorState* orch, int32_t needed) {
+    if (pto2_dep_pool_available(&orch->dep_pool) >= needed) return;
+
+    int spin_count = 0;
+    while (pto2_dep_pool_available(&orch->dep_pool) < needed) {
+        pto2_dep_pool_reclaim(orch);
+        if (pto2_dep_pool_available(&orch->dep_pool) >= needed) return;
+
+        spin_count++;
+        if (spin_count >= PTO2_DEP_POOL_SPIN_LIMIT) {
+            auto& pool = orch->dep_pool;
+            int32_t used = pool.top - pool.tail;
+            int32_t last_alive = orch->sm_handle->header->last_task_alive.load(std::memory_order_acquire);
+            int32_t current = orch->task_ring.current_index_ptr->load(std::memory_order_acquire);
+            LOG_ERROR("========================================");
+            LOG_ERROR("FATAL: Dependency Pool Deadlock Detected!");
+            LOG_ERROR("========================================");
+            LOG_ERROR("DepListPool cannot reclaim space after %d spins.", spin_count);
+            LOG_ERROR("  - Pool used:     %d / %d (%.1f%%)", used, pool.capacity,
+                      (pool.capacity > 0) ? (100.0 * used / pool.capacity) : 0.0);
+            LOG_ERROR("  - Pool top:      %d (linear)", pool.top);
+            LOG_ERROR("  - Pool tail:     %d (linear)", pool.tail);
+            LOG_ERROR("  - High water:    %d", pool.high_water);
+            LOG_ERROR("  - Needed:        %d entries", needed);
+            LOG_ERROR("  - last_task_alive: %d", last_alive);
+            LOG_ERROR("  - current_task:    %d", current);
+            LOG_ERROR("  - In-flight tasks: %d", current - last_alive);
+            LOG_ERROR("Root Cause:");
+            LOG_ERROR("  Too many concurrent tasks consuming dep pool entries");
+            LOG_ERROR("  relative to the pool capacity (%d).", pool.capacity);
+            LOG_ERROR("Solution:");
+            LOG_ERROR("  Increase dep pool capacity (current: %d, recommended: %d)", pool.capacity, pool.high_water * 2);
+            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
+            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", pool.high_water * 2);
+            LOG_ERROR("========================================");
+            exit(1);
+        }
+        SPIN_WAIT_HINT();
+    }
+}
+
+// =============================================================================
 // Scope Management
 // =============================================================================
 
@@ -227,18 +293,7 @@ void pto2_submit_task(
     orch->tensor_map.sync_tensormap();
 
     // Reclaim dead dep pool entries based on scheduler's last_task_alive
-    {
-        int32_t last_alive = orch->sm_handle->header->last_task_alive.load(std::memory_order_acquire);
-        if (last_alive > orch->dep_pool_last_reclaimed && last_alive > 0) {
-            int32_t newest_consumed = last_alive - 1;
-            int32_t slot_rc = orch->task_ring.get_task_slot(newest_consumed);
-            int32_t mark = orch->sm_handle->task_payloads[slot_rc].dep_pool_mark;
-            if (mark > 0) {
-                orch->dep_pool.advance_tail(mark);
-            }
-            orch->dep_pool_last_reclaimed = last_alive;
-        }
-    }
+    pto2_dep_pool_reclaim(orch);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, -1);
 
@@ -395,6 +450,9 @@ void pto2_submit_task(
         // so concurrent on_task_complete can safely access task_state/fanout_refcount.
         sched->task_state[slot].store(PTO2_TASK_PENDING, std::memory_order_relaxed);
         sched->fanout_refcount[slot].store(0, std::memory_order_relaxed);
+
+        // Ensure dep pool has space: fanin_count entries + 1 pre-alloc
+        pto2_dep_pool_ensure_space(orch, fanin_count + 1);
 
         auto& dep_pool = orch->dep_pool;
         if (orch->dep_pool_cur_entry == nullptr) {

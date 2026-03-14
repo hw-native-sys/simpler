@@ -68,7 +68,8 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode) {
 
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
                                          uint64_t task_window_size,
-                                         uint64_t heap_size) {
+                                         uint64_t heap_size,
+                                         int32_t dep_pool_capacity) {
     // Allocate runtime context
     PTO2Runtime* rt = (PTO2Runtime*)calloc(1, sizeof(PTO2Runtime));
     if (!rt) {
@@ -104,7 +105,7 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
 
     // Initialize first orchestrator
     if (!pto2_orchestrator_init(&rt->orchestrators[0], rt->sm_handle,
-                                 rt->gm_heap, heap_size)) {
+                                 rt->gm_heap, heap_size, dep_pool_capacity)) {
         free(rt->gm_heap);
         pto2_sm_destroy(rt->sm_handle);
         free(rt);
@@ -130,7 +131,8 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
                                           PTO2SharedMemoryHandle* sm_handle,
                                           void* gm_heap,
                                           uint64_t heap_size,
-                                          int orch_count) {
+                                          int orch_count,
+                                          int32_t dep_pool_capacity) {
     if (!sm_handle) return NULL;
     if (orch_count < 1) orch_count = 1;
     if (orch_count > PTO2_MAX_ORCH_THREADS) orch_count = PTO2_MAX_ORCH_THREADS;
@@ -149,7 +151,7 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
     // Initialize all orchestrator states
     for (int i = 0; i < orch_count; i++) {
         if (!pto2_orchestrator_init(&rt->orchestrators[i], rt->sm_handle,
-                                    rt->gm_heap, rt->gm_heap_size)) {
+                                    rt->gm_heap, rt->gm_heap_size, dep_pool_capacity)) {
             for (int j = 0; j < i; j++) {
                 pto2_orchestrator_destroy(&rt->orchestrators[j]);
             }

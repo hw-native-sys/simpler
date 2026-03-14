@@ -265,10 +265,12 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     {
         runtime->pto2_task_window_size  = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
         runtime->pto2_heap_size         = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
-        if (runtime->pto2_task_window_size || runtime->pto2_heap_size) {
-            LOG_INFO("Ring buffer overrides: task_window=%lu heap=%lu",
+        runtime->pto2_dep_pool_size     = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
+        if (runtime->pto2_task_window_size || runtime->pto2_heap_size || runtime->pto2_dep_pool_size) {
+            LOG_INFO("Ring buffer overrides: task_window=%lu heap=%lu dep_pool=%lu",
                      (unsigned long)(runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE),
-                     (unsigned long)(runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE));
+                     (unsigned long)(runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE),
+                     (unsigned long)(runtime->pto2_dep_pool_size ? runtime->pto2_dep_pool_size : PTO2_DEP_LIST_POOL_SIZE));
         }
     }
 

@@ -123,7 +123,8 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode);
  */
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
                                          uint64_t task_window_size,
-                                         uint64_t heap_size);
+                                         uint64_t heap_size,
+                                         int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Create runtime from existing shared memory and GM heap (e.g. on device).
@@ -139,7 +140,8 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
                                           PTO2SharedMemoryHandle* sm_handle,
                                           void* gm_heap,
                                           uint64_t heap_size,
-                                          int orch_count = 1);
+                                          int orch_count = 1,
+                                          int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Destroy runtime and free all resources
