@@ -108,16 +108,27 @@ parse_timing() {
     fi
 
     echo "$timing" | awk '
-    /orch_start=/ {
-        if (round > 0 && max_end > 0) {
-            elapsed = max_end - orch_start
-            results[round - 1] = elapsed / 50.0
+    function flush_round() {
+        if (round >= 0 && max_end > 0 && min_start > 0) {
+            results[round] = (max_end - min_start) / 50.0
             count++
         }
-        round++
+    }
+    BEGIN { round = 0; min_start = 0; max_end = 0; count = 0 }
+    /orch_start=/ {
+        match($0, /Thread=([0-9]+)/, tm)
+        tid = tm[1] + 0
+        if (tid in seen) {
+            flush_round()
+            round++
+            min_start = 0
+            max_end = 0
+            delete seen
+        }
+        seen[tid] = 1
         match($0, /orch_start=([0-9]+)/, m)
-        orch_start = m[1] + 0
-        max_end = 0
+        val = m[1] + 0
+        if (min_start == 0 || val < min_start) min_start = val
     }
     /end=/ {
         match($0, /end=([0-9]+)/, m)
@@ -125,10 +136,7 @@ parse_timing() {
         if (val > max_end) max_end = val
     }
     END {
-        if (round > 0 && max_end > 0) {
-            results[round - 1] = (max_end - orch_start) / 50.0
-            count++
-        }
+        flush_round()
         if (count == 0) { print "  (no rounds parsed)"; exit 1 }
 
         printf "  %-8s  %12s\n", "Round", "Elapsed (us)"
