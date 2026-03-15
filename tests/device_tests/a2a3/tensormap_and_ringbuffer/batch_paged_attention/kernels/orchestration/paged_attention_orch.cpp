@@ -138,75 +138,75 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_hub, 3);
 
                 for (uint64_t bn = 0; bn < max_bn; bn++) {
-                    PTO2_SCOPE(rt) {
-                        uint32_t sij_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)block_size};
-                        uint32_t vec_shapes[1] = {(uint32_t)(chunk_bc * q_tile)};
-                        uint32_t oi_new_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)head_dim};
+                    PTO2_SCOPE_GUARD(rt);
 
-                        Tensor sij_b = make_tensor(sij_shapes, 2, DataType::FLOAT32);
-                        Tensor pij_b = make_tensor(sij_shapes, 2, data_type);
-                        Tensor mij_b = make_tensor(vec_shapes, 1, DataType::FLOAT32);
-                        Tensor lij_b = make_tensor(vec_shapes, 1, DataType::FLOAT32);
-                        Tensor oi_new_b = make_tensor(oi_new_shapes, 2, DataType::FLOAT32);
+                    uint32_t sij_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)block_size};
+                    uint32_t vec_shapes[1] = {(uint32_t)(chunk_bc * q_tile)};
+                    uint32_t oi_new_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)head_dim};
 
-                        PTOParam params_qk[] = {
-                            make_input_param(query),
-                            make_input_param(key_cache),
-                            make_output_param(sij_b),
-                            make_scalar_param(bt_addr),
-                            make_scalar_param(chunk_bc),
-                            make_scalar_param(bn),
-                            make_scalar_param(q_offset),
-                            make_scalar_param(block_num),
-                            make_scalar_param(num_heads),
-                            make_scalar_param(batch_start),
-                        };
-                        pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk, 10);
+                    Tensor sij_b = make_tensor(sij_shapes, 2, DataType::FLOAT32);
+                    Tensor pij_b = make_tensor(sij_shapes, 2, data_type);
+                    Tensor mij_b = make_tensor(vec_shapes, 1, DataType::FLOAT32);
+                    Tensor lij_b = make_tensor(vec_shapes, 1, DataType::FLOAT32);
+                    Tensor oi_new_b = make_tensor(oi_new_shapes, 2, DataType::FLOAT32);
 
-                        PTOParam params_sf[] = {
-                            make_input_param(sij_b),
-                            make_output_param(pij_b),
-                            make_output_param(mij_b),
-                            make_output_param(lij_b),
-                            make_scalar_param(float_to_u64(scale_value)),
-                            make_scalar_param(cl_addr),
-                            make_scalar_param(chunk_bc),
-                            make_scalar_param(bn),
-                            make_scalar_param(batch_start),
-                        };
-                        pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf, 9);
+                    PTOParam params_qk[] = {
+                        make_input_param(query),
+                        make_input_param(key_cache),
+                        make_output_param(sij_b),
+                        make_scalar_param(bt_addr),
+                        make_scalar_param(chunk_bc),
+                        make_scalar_param(bn),
+                        make_scalar_param(q_offset),
+                        make_scalar_param(block_num),
+                        make_scalar_param(num_heads),
+                        make_scalar_param(batch_start),
+                    };
+                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk, 10);
 
-                        PTOParam params_pv[] = {
-                            make_input_param(pij_b),
-                            make_input_param(value_cache),
-                            make_output_param(oi_new_b),
-                            make_scalar_param(bt_addr),
-                            make_scalar_param(chunk_bc),
-                            make_scalar_param(bn),
-                            make_scalar_param(block_num),
-                            make_scalar_param(batch_start),
-                        };
-                        pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv, 8);
+                    PTOParam params_sf[] = {
+                        make_input_param(sij_b),
+                        make_output_param(pij_b),
+                        make_output_param(mij_b),
+                        make_output_param(lij_b),
+                        make_scalar_param(float_to_u64(scale_value)),
+                        make_scalar_param(cl_addr),
+                        make_scalar_param(chunk_bc),
+                        make_scalar_param(bn),
+                        make_scalar_param(batch_start),
+                    };
+                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf, 9);
 
-                        uint64_t is_first = (bn == 0) ? 1 : 0;
-                        uint64_t is_last = (bn == max_bn - 1) ? 1 : 0;
-                        PTOParam params_up[] = {
-                            make_input_param(mij_b),
-                            make_input_param(lij_b),
-                            make_input_param(oi_new_b),
-                            make_inout_param(mi_batch),
-                            make_inout_param(li_batch),
-                            make_output_param(oi_batch),
-                            make_output_param(out),
-                            make_scalar_param(is_first),
-                            make_scalar_param(is_last),
-                            make_scalar_param(chunk_bc),
-                            make_scalar_param(q_offset),
-                            make_scalar_param(num_heads),
-                            make_scalar_param(batch_start),
-                        };
-                        pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up, 13);
-                    }
+                    PTOParam params_pv[] = {
+                        make_input_param(pij_b),
+                        make_input_param(value_cache),
+                        make_output_param(oi_new_b),
+                        make_scalar_param(bt_addr),
+                        make_scalar_param(chunk_bc),
+                        make_scalar_param(bn),
+                        make_scalar_param(block_num),
+                        make_scalar_param(batch_start),
+                    };
+                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv, 8);
+
+                    uint64_t is_first = (bn == 0) ? 1 : 0;
+                    uint64_t is_last = (bn == max_bn - 1) ? 1 : 0;
+                    PTOParam params_up[] = {
+                        make_input_param(mij_b),
+                        make_input_param(lij_b),
+                        make_input_param(oi_new_b),
+                        make_inout_param(mi_batch),
+                        make_inout_param(li_batch),
+                        make_output_param(oi_batch),
+                        make_output_param(out),
+                        make_scalar_param(is_first),
+                        make_scalar_param(is_last),
+                        make_scalar_param(chunk_bc),
+                        make_scalar_param(q_offset),
+                        make_scalar_param(num_heads),
+                        make_scalar_param(batch_start),
+                    };
+                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up, 13);
                 }
             }
         }

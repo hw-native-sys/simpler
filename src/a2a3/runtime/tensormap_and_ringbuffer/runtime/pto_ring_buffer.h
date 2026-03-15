@@ -381,9 +381,6 @@ struct PTO2TaskRing {
 
         // Check if there's room (leave at least 1 slot empty)
         if (active_count < window_size - 1) {
-            int32_t slot = task_id & (window_size - 1);
-            PTO2TaskDescriptor* task = &descriptors[slot];
-            task->mixed_task_id = task_id;
             return task_id;
         }
 
@@ -539,5 +536,19 @@ void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t c
  */
 int32_t pto2_dep_pool_used(PTO2DepListPool* pool);
 int32_t pto2_dep_pool_available(PTO2DepListPool* pool);
+
+// =============================================================================
+// Ring Set (per-depth aggregate)
+// =============================================================================
+
+/**
+ * Groups a HeapRing, TaskRing, and DepPool into one per-depth unit.
+ * PTO2_MAX_RING_DEPTH instances provide independent reclamation per scope depth.
+ */
+struct PTO2RingSet {
+    PTO2HeapRing    heap_ring;
+    PTO2TaskRing    task_ring;
+    PTO2DepListPool dep_pool;
+};
 
 #endif // PTO_RING_BUFFER_H

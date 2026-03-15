@@ -279,25 +279,61 @@ struct PTO2CompletionStats {
 struct PTO2SchedulerState {
     // Shared memory access
     PTO2SharedMemoryHandle* sm_handle;
-    PTO2TaskDescriptor*     task_descriptors;
 
-    // Local copies of ring pointers (written to shared memory after update)
-    int32_t last_task_alive;      // Task ring tail (advances on COMPLETED for slot reuse)
-    int32_t last_heap_consumed;   // Heap watermark (advances on CONSUMED for buffer reuse)
-    uint64_t heap_tail;           // Heap ring tail (offset from heap_base)
+    // Per-ring state
+    struct RingSchedState {
+        PTO2TaskDescriptor* task_descriptors;
+        PTO2TaskSlotState* slot_states;
+        int32_t last_task_alive;
+        int32_t last_heap_consumed;
+        uint64_t heap_tail;
+        void* heap_base;
+        int32_t task_window_mask;
+        uint64_t task_window_size;
+        // Try-lock used to advance this ring's pointers (CONSUMED scanning + heap tail update).
+        std::atomic<int32_t> advance_lock;
 
-    // Heap base address (for converting absolute pointers to offsets)
-    void* heap_base;
+        bool init(PTO2SharedMemoryHandle* sm_handle, int32_t ring_id,
+                  void* gm_heap_base, uint64_t per_ring_heap_size);
+        void destroy();
 
-    // === PRIVATE DATA (not in shared memory) ===
-    int32_t task_window_mask;
+        PTO2TaskSlotState& get_slot_state_by_task_id(int32_t local_id) {
+            return slot_states[local_id & task_window_mask];
+        }
+        PTO2TaskSlotState& get_slot_state_by_slot(int32_t slot) {
+            return slot_states[slot];
+        }
 
-    // Per-task slot state (dynamically allocated, indexed by task_id & task_window_mask)
-    // Consolidates task_state, fanin/fanout refcounts, and dependency metadata
-    // into a single cache-friendly structure (32 bytes per slot).
-    PTO2TaskSlotState* slot_states;
+        void sync_to_sm(PTO2SharedMemoryRingHeader& ring) {
+            ring.fc.last_task_alive.store(last_task_alive, std::memory_order_release);
+            ring.fc.heap_tail.store(heap_tail, std::memory_order_release);
+        }
 
-    // Ready queues (one per resource shape)
+        void advance_ring_pointers(PTO2SharedMemoryRingHeader& ring) {
+            int32_t current_task_index = ring.fc.current_task_index.load(std::memory_order_acquire);
+
+            while (last_task_alive < current_task_index) {
+                PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(last_task_alive);
+                if (slot_state.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
+                    break;
+                }
+                last_task_alive++;
+            }
+
+            if (last_task_alive > 0) {
+                int32_t last_consumed_id = last_task_alive - 1;
+                PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(last_consumed_id);
+                PTO2TaskDescriptor& task = *slot_state.task;
+                if (task.packed_buffer_end != NULL) {
+                    heap_tail = (uint64_t)((char*)task.packed_buffer_end - (char*)heap_base);
+                }
+            }
+
+            sync_to_sm(ring);
+        }
+    } ring_sched_states[PTO2_MAX_RING_DEPTH];
+
+    // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
     // Statistics
@@ -305,45 +341,14 @@ struct PTO2SchedulerState {
     std::atomic<int64_t> tasks_completed;
     std::atomic<int64_t> tasks_consumed;
 #endif
-    std::atomic<int32_t> ring_advance_lock{0};  // Try-lock for advance_ring_pointers
-
     // =========================================================================
     // Inline hot-path methods
     // =========================================================================
-    PTO2TaskSlotState& get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
-    PTO2TaskSlotState& get_slot_state_by_task_id(int32_t task_id) {
-        return slot_states[task_id & task_window_mask];
+    PTO2TaskSlotState& get_slot_state(int32_t ring_id, int32_t local_id) {
+        return ring_sched_states[ring_id].get_slot_state_by_task_id(local_id);
     }
-
-    void sync_to_sm() {
-        PTO2SharedMemoryHeader* header = sm_handle->header;
-        header->last_task_alive.store(last_task_alive, std::memory_order_release);
-        header->heap_tail.store(heap_tail, std::memory_order_release);
-        header->heap_tail_gen.store(last_task_alive, std::memory_order_release);
-    }
-
-    void advance_ring_pointers() {
-        PTO2SharedMemoryHeader* header = sm_handle->header;
-        int32_t current_task_index = header->current_task_index.load(std::memory_order_acquire);
-
-        while (last_task_alive < current_task_index) {
-            PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(last_task_alive);
-            if (slot_state.task_state.load(std::memory_order_acquire) != PTO2_TASK_CONSUMED) {
-                break;
-            }
-            last_task_alive++;
-        }
-
-        if (last_task_alive > 0) {
-            int32_t last_consumed_id = last_task_alive - 1;
-            PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(last_consumed_id);
-            PTO2TaskDescriptor& task = *slot_state.task;
-            if (task.packed_buffer_end != NULL) {
-                heap_tail = (uint64_t)((char*)task.packed_buffer_end - (char*)heap_base);
-            }
-        }
-
-        sync_to_sm();
+    PTO2TaskSlotState& get_slot_state_by_slot(int32_t ring_id, int32_t slot) {
+        return ring_sched_states[ring_id].get_slot_state_by_slot(slot);
     }
 
     void check_and_handle_consumed(PTO2TaskSlotState& slot_state) {
@@ -359,12 +364,13 @@ struct PTO2SchedulerState {
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-        // Try-lock — if another thread is advancing, it will scan our CONSUMED task
+        int32_t ring_id = slot_state.ring_id;
+        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
-        if (ring_advance_lock.compare_exchange_strong(expected_lock, 1,
+        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(expected_lock, 1,
                 std::memory_order_acquire, std::memory_order_relaxed)) {
-            advance_ring_pointers();
-            ring_advance_lock.store(0, std::memory_order_release);
+            ring_sched_states[ring_id].advance_ring_pointers(sm_handle->header->rings[ring_id]);
+            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
         }
     }
 
@@ -390,12 +396,13 @@ struct PTO2SchedulerState {
         tasks_consumed.fetch_add(1, std::memory_order_relaxed);
 #endif
 
-        // Try-lock — if another thread is advancing, it will scan our CONSUMED task
+        int32_t ring_id = slot_state.ring_id;
+        // Try-lock — if another thread is advancing this ring, it will scan our CONSUMED task
         int32_t expected_lock = 0;
-        if (ring_advance_lock.compare_exchange_strong(expected_lock, 1,
+        if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(expected_lock, 1,
                 std::memory_order_acquire, std::memory_order_relaxed)) {
-            advance_ring_pointers();
-            ring_advance_lock.store(0, std::memory_order_release);
+            ring_sched_states[ring_id].advance_ring_pointers(sm_handle->header->rings[ring_id]);
+            ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
             atomic_count += 2;  // try-lock CAS + unlock store
         } else {
             atomic_count += 1;  // failed try-lock CAS
@@ -655,7 +662,7 @@ struct PTO2SchedulerState {
 
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
-                          void* heap_base);
+                          void* gm_heap_base, uint64_t per_ring_heap_size);
 void pto2_scheduler_destroy(PTO2SchedulerState* sched);
 
 // =============================================================================

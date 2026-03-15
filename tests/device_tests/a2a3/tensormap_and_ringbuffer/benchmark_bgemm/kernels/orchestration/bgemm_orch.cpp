@@ -101,42 +101,42 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     // A/B layout: [num_groups, grid_k, incore_loop, tile_size, tile_size]
     // C layout:   [incore_loop * num_groups, tile_size, tile_size]
     for (int group_idx = 0; group_idx < num_groups; group_idx++) {
-        PTO2_SCOPE(rt) {
-            uint32_t c_elem_offset = (uint32_t)((uint64_t)group_idx * group_tile_elems);
-            uint32_t c_view_offsets[1] = {c_elem_offset};
-            Tensor C_view = ext_C.view(group_shapes, c_view_offsets);
+        PTO2_SCOPE_GUARD(rt);
 
-            for (int k_idx = 0; k_idx < grid_k; k_idx++) {
-                // In layout [num_groups, grid_k, incore_loop, tile_size, tile_size],
-                // offset = (group_idx * grid_k + k_idx) * incore_loop * tile_elems
-                uint64_t ab_offset =
-                    ((uint64_t)group_idx * grid_k + (uint64_t)k_idx) * group_tile_elems;
+        uint32_t c_elem_offset = (uint32_t)((uint64_t)group_idx * group_tile_elems);
+        uint32_t c_view_offsets[1] = {c_elem_offset};
+        Tensor C_view = ext_C.view(group_shapes, c_view_offsets);
 
-                uint32_t a_view_offsets[1] = {(uint32_t)ab_offset};
-                Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
-                uint32_t b_view_offsets[1] = {(uint32_t)ab_offset};
-                Tensor B_view = ext_B.view(group_shapes, b_view_offsets);
-                Tensor P = make_tensor(group_shapes, 1, DataType::FLOAT32);
+        for (int k_idx = 0; k_idx < grid_k; k_idx++) {
+            // In layout [num_groups, grid_k, incore_loop, tile_size, tile_size],
+            // offset = (group_idx * grid_k + k_idx) * incore_loop * tile_elems
+            uint64_t ab_offset =
+                ((uint64_t)group_idx * grid_k + (uint64_t)k_idx) * group_tile_elems;
 
-                PTOParam params_gemm[] = {
-                    make_input_param(A_view),
-                    make_input_param(B_view),
-                    make_output_param(P),
-                    make_input_param(ext_config),
-                };
-                pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE,
-                                   params_gemm, 4);
-                total_gemm++;
+            uint32_t a_view_offsets[1] = {(uint32_t)ab_offset};
+            Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
+            uint32_t b_view_offsets[1] = {(uint32_t)ab_offset};
+            Tensor B_view = ext_B.view(group_shapes, b_view_offsets);
+            Tensor P = make_tensor(group_shapes, 1, DataType::FLOAT32);
 
-                PTOParam params_add[] = {
-                    make_inout_param(C_view),
-                    make_input_param(P),
-                    make_input_param(ext_config),
-                };
-                pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD,
-                                   params_add, 3);
-                total_add++;
-            }
+            PTOParam params_gemm[] = {
+                make_input_param(A_view),
+                make_input_param(B_view),
+                make_output_param(P),
+                make_input_param(ext_config),
+            };
+            pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE,
+                                params_gemm, 4);
+            total_gemm++;
+
+            PTOParam params_add[] = {
+                make_inout_param(C_view),
+                make_input_param(P),
+                make_input_param(ext_config),
+            };
+            pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD,
+                                params_add, 3);
+            total_add++;
         }
     }
 
