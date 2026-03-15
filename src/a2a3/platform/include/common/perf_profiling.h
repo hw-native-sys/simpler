@@ -75,9 +75,11 @@ struct PerfRecord {
     uint64_t finish_time;        // AICPU timestamp: when AICPU observed task completion (task_status back to 0)
 
     // Task identification
-    uint32_t task_id;         // Task unique identifier
+    uint32_t task_id;         // Register dispatch id (per-core monotonic counter, NOT mixed_task_id).
+                              // May collide across cores; use (ring_id, task_id, core_id) as unique key.
     uint32_t func_id;         // Kernel function identifier
     CoreType core_type;       // Core type (AIC/AIV)
+    uint8_t ring_id;          // Ring layer (0 for single-ring / legacy)
 
     // Dependency relationship (fanout only)
     int32_t fanout[RUNTIME_MAX_FANOUT];  // Successor task ID array

@@ -172,6 +172,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 CYCLE_COUNT_LAP(prof_submit_task);
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
+                    PTO2_SCOPE_GUARD(rt);
+
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
                     uint64_t valid_len = std::min(block_size, cur_seq - bn * block_size);
                     CYCLE_COUNT_LAP(prof_param_extract);

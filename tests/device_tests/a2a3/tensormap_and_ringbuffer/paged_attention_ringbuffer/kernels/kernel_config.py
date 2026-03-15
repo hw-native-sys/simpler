@@ -4,10 +4,14 @@ Paged Attention Ring Buffer Stress Test
 Reuses paged_attention kernels and orchestration with deliberately small
 ring buffer sizes to exercise and guard the ring buffer rotation logic.
 
+The orchestration uses an inner PTO2_SCOPE per block, allowing per-block
+ring resources to be reclaimed. Combined with small ring sizes, this
+stresses the back-pressure and reclamation paths.
+
 Environment overrides:
-  PTO2_RING_TASK_WINDOW = 1024  (vs default 65536)
-  PTO2_RING_HEAP        = 1MB   (vs default 1GB)
-  PTO2_RING_DEP_POOL    = 1024  (vs default 65536)
+  PTO2_RING_TASK_WINDOW = 128   (vs default 65536, 8x smaller than prev 1024)
+  PTO2_RING_HEAP        = 256KB (vs default 1GB,   4x smaller than prev 1MB)
+  PTO2_RING_DEP_POOL    = 256   (vs default 65536, 4x smaller than prev 1024)
 """
 
 from pathlib import Path
@@ -35,9 +39,9 @@ RUNTIME_CONFIG = {
     "block_dim": 24,
 }
 
-# Small ring buffer sizes to stress rotation/reclamation
+# Small ring buffer sizes — see module docstring for rationale.
 RUNTIME_ENV = {
-    "PTO2_RING_TASK_WINDOW": "1024",
-    "PTO2_RING_HEAP": "1048576",
-    "PTO2_RING_DEP_POOL": "1024",
+    "PTO2_RING_TASK_WINDOW": "128",
+    "PTO2_RING_HEAP": "262144",
+    "PTO2_RING_DEP_POOL": "256",
 }

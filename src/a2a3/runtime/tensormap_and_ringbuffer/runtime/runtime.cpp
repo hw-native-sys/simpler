@@ -169,14 +169,17 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
     }
 
     // Get slot states for fanout traversal
+    // With multi-ring, slot_states are per-ring inside the scheduler and
+    // pto2_slot_states_ptr_ is nullptr. Fanout and ring_id are filled on the
+    // AICPU side (aicpu_executor.cpp) where slot_state is directly available.
     PTO2TaskSlotState* slot_states = static_cast<PTO2TaskSlotState*>(pto2_slot_states_ptr_);
     if (slot_states == nullptr) {
         return;
     }
 
-    // Get window mask from shared memory header
+    // Get window mask from shared memory header (ring 0 for legacy single-ring path)
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
-    int32_t window_mask = header->task_window_size - 1;
+    int32_t window_mask = static_cast<int32_t>(header->rings[0].task_window_size) - 1;
 
     uint32_t count = perf_buf->count;
 
@@ -193,7 +196,16 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         PTO2DepListEntry* cur = ss.fanout_head;
 
         while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
-            record->fanout[record->fanout_count++] = cur->slot_state->task->mixed_task_id;
+            // PerfRecord.fanout stores 32-bit legacy task IDs. Our multi-ring task ID
+            // encodes ring_id in the upper 32 bits, so only the legacy single-ring
+            // case (ring_id==0) is representable here.
+            uint64_t mixed = pto2_task_id_raw(cur->slot_state->task->mixed_task_id);
+            if ((mixed >> 32) != 0) {
+                // Skip: cannot represent (ring_id, local_id) in a 32-bit fanout slot.
+                cur = cur->next;
+                continue;
+            }
+            record->fanout[record->fanout_count++] = static_cast<int32_t>(mixed & 0xFFFFFFFFu);
             cur = cur->next;
         }
     }

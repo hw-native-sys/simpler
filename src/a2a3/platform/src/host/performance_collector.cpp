@@ -991,6 +991,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         outfile << "      \"func_id\": " << record.func_id << ",\n";
         outfile << "      \"core_id\": " << tagged.core_id << ",\n";
         outfile << "      \"core_type\": \"" << core_type_str << "\",\n";
+        outfile << "      \"ring_id\": " << static_cast<int>(record.ring_id) << ",\n";
         outfile << "      \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us << ",\n";
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";

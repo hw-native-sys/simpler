@@ -61,6 +61,7 @@ The primary production runtime. Uses ring buffers for task slots and output memo
 - **Memory**: GM Heap ring for output buffer allocation
 - **Dependencies**: automatically derived from tensor read/write patterns via TensorMap
 - **Thread model**: 3 scheduler threads + 1 orchestrator thread on AICPU
+- **Multi-ring**: HeapRing, TaskRing, and DepPool are split into `PTO2_MAX_RING_DEPTH` (4) independent instances for nested scope isolation. See [MULTI_RING.md](MULTI_RING.md) for details.
 - **Use case**: production workloads; supports streaming, flow control, and large batch sizes
 
 ---
@@ -102,7 +103,7 @@ Two platform implementations exist under `src/platform/`, sharing a common inter
 
 ## 3. Shared Memory Layout
 
-The orchestrator and schedulers communicate through a contiguous shared memory region in Global Memory (GM):
+The orchestrator and schedulers communicate through a contiguous shared memory region in Global Memory (GM). Each ring level has its own TaskDescriptor and DepListPool sections. See [MULTI_RING.md §4.3–4.4](MULTI_RING.md) for the per-ring shared memory header and handle layout.
 
 ```
 ┌─────────────────────────────┐  offset 0
@@ -145,6 +146,8 @@ Alignment is 64 bytes (`PTO2_ALIGN_SIZE`).
 ---
 
 ## 4. Ring Buffer Mechanisms
+
+> **Multi-ring extension**: All three ring buffers (TaskRing, HeapRing, DepPool) are replicated per scope depth. Each ring level has independent watermarks and reclamation. See [MULTI_RING.md](MULTI_RING.md) for details.
 
 ### 4.1 Task Ring
 
@@ -322,7 +325,7 @@ When `pto2_submit_task` processes parameters:
 
 | Field | Description |
 |-------|-------------|
-| `mixed_task_id` | Canonical mixed-task ID (monotonically increasing) |
+| `mixed_task_id` | Canonical mixed-task ID (64-bit: `ring_id << 32 | local_id`). See [MULTI_RING.md §3](MULTI_RING.md). |
 | `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
 | `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
 | `subtask_done_mask` | Atomic bitmask; each subtask sets its done bit on completion |
@@ -369,7 +372,7 @@ In the scheduler's `task_state[]` array (`std::atomic<PTO2TaskState>`):
 The orchestrator runs on AICPU Thread 3 and builds the task graph by calling the user-provided orchestration function.
 
 Key members:
-- `task_ring`, `heap_ring`, `dep_pool`: ring buffer state
+- `rings[PTO2_MAX_RING_DEPTH]`: per-ring `PTO2RingSet` (HeapRing + TaskRing + DepPool). See [MULTI_RING.md §4.2](MULTI_RING.md).
 - `tensor_map`, `tensor_pool`: dependency tracking
 - `scope_tasks[]`, `scope_begins[]`, `scope_stack_top`: scope nesting stack (flat buffer partitioned by level)
 - `scheduler`: pointer to scheduler state (for simulated mode or `init_task_on_submit`)
@@ -493,7 +496,9 @@ Each AICore worker has a `Handshake` struct in shared memory:
 
 ### 9.2 Register-Based Dispatch
 
-Instead of polling `Handshake.task_status`, the production protocol uses hardware registers:
+Instead of polling `Handshake.task_status`, the production protocol uses hardware registers.
+
+> **Multi-ring note**: `mixed_task_id` is 64-bit but registers are 32-bit. A per-core monotonic dispatch counter (`s_dispatch_seq`) replaces `mixed_task_id` in register writes to prevent collisions. See [MULTI_RING.md §6](MULTI_RING.md).
 
 | Register | Direction | Usage |
 |----------|-----------|-------|

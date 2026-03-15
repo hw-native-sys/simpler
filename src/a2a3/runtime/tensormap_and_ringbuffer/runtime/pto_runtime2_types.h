@@ -60,14 +60,18 @@
 // =============================================================================
 
 // Task management
-// NOTE: PTO2_TASK_WINDOW_SIZE is now the DEFAULT value only.
+// NOTE: PTO2_TASK_WINDOW_SIZE is now a per-ring default value.
 // Actual window size is passed at runtime to pto2_runtime_create_threaded_custom().
 // Use pto2_task_slot(sched, task_id) for slot calculation.
-#define PTO2_TASK_WINDOW_SIZE     65536   // Default task window size (power of 2)
+#define PTO2_TASK_WINDOW_SIZE     16384   // Default per-ring task window size (power of 2)
 
-// Memory pools
-#define PTO2_HEAP_SIZE            (1024 * 1024 * 1024)  // 1GB default heap
-#define PTO2_DEP_LIST_POOL_SIZE    65536    // Dependency list pool entries
+// Multi-ring: number of independent ring layers (HeapRing + TaskRing + DepPool per layer)
+// Scope depth maps to ring index via: min(scope_depth, PTO2_MAX_RING_DEPTH - 1)
+#define PTO2_MAX_RING_DEPTH       4
+
+// Memory pools (per-ring defaults; total = value × PTO2_MAX_RING_DEPTH)
+#define PTO2_HEAP_SIZE            (256 * 1024 * 1024)  // 256MB per ring (1GB total)
+#define PTO2_DEP_LIST_POOL_SIZE    16384    // Per-ring dependency list pool entries
 #define PTO2_TENSORMAP_POOL_SIZE   (65536)   // TensorMap entry pool
 #define PTO2_TENSORMAP_NUM_BUCKETS 65536    // Power of 2 for fast hash
 
@@ -91,6 +95,49 @@
 
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
+
+// =============================================================================
+// Multi-Ring task_id Encoding
+// =============================================================================
+
+/**
+ * TaskId: 64-bit encoding used across Runtime2.
+ *
+ * raw encoding: (ring_id << 32) | local_id
+ *
+ * ring_id:  which ring layer (0..PTO2_MAX_RING_DEPTH-1)
+ * local_id: per-ring monotonic counter
+ */
+struct PTO2TaskId {
+    uint64_t raw;
+
+    constexpr PTO2TaskId() : raw(0) {}
+    constexpr explicit PTO2TaskId(uint64_t v) : raw(v) {}
+
+    constexpr uint8_t ring() const { return static_cast<uint8_t>(raw >> 32); }
+    constexpr uint32_t local() const { return static_cast<uint32_t>(raw & 0xFFFFFFFFu); }
+
+    constexpr bool operator==(const PTO2TaskId& other) const { return raw == other.raw; }
+    constexpr bool operator!=(const PTO2TaskId& other) const { return raw != other.raw; }
+};
+
+static_assert(sizeof(PTO2TaskId) == 8, "PTO2TaskId must stay 8 bytes (shared memory ABI)");
+
+static inline PTO2TaskId pto2_make_task_id(uint8_t ring_id, uint32_t local_id) {
+    return PTO2TaskId{(static_cast<uint64_t>(ring_id) << 32) | static_cast<uint64_t>(local_id)};
+}
+
+static inline uint8_t pto2_task_id_ring(PTO2TaskId task_id) {
+    return task_id.ring();
+}
+
+static inline uint32_t pto2_task_id_local(PTO2TaskId task_id) {
+    return task_id.local();
+}
+
+static inline uint64_t pto2_task_id_raw(PTO2TaskId task_id) {
+    return task_id.raw;
+}
 
 // =============================================================================
 // Worker Types
@@ -283,8 +330,8 @@ struct PTO2DepListEntry {
  * Fields set by Orchestrator at submission, read by Scheduler for dispatch.
  */
 struct PTO2TaskDescriptor {
-    // Mixed-task identification
-    int32_t mixed_task_id;            // Canonical mixed-task ID
+    // Mixed-task identification (encodes ring_id in upper 32 bits)
+    PTO2TaskId mixed_task_id;         // raw: (ring_id << 32) | local_id
 
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
@@ -351,6 +398,7 @@ struct alignas(64) PTO2TaskSlotState {
     // Hot-path completion fields (moved from TaskDescriptor to avoid cross-struct access)
     uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
     std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
+    uint8_t ring_id;                             // Ring layer this task belongs to (for per-ring reclamation)
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);

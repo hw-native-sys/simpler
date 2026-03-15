@@ -278,15 +278,16 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     uint64_t eff_heap_size = runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE;
     uint64_t eff_task_window_size = runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE;
 
-    // Allocate GM heap for orchestrator output buffers
+    // Allocate GM heap for orchestrator output buffers (all rings combined)
+    uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
     long long t_heap_start = _now_ms();
-    void* gm_heap = runtime->host_api.device_malloc(eff_heap_size);
+    void* gm_heap = runtime->host_api.device_malloc(total_heap_size);
     long long t_heap_end = _now_ms();
     if (gm_heap == nullptr) {
         LOG_ERROR("Failed to allocate GM heap");
         return -1;
     }
-    runtime->record_tensor_pair(nullptr, gm_heap, eff_heap_size);
+    runtime->record_tensor_pair(nullptr, gm_heap, total_heap_size);
     runtime->set_pto2_gm_heap(gm_heap);
 
     // Allocate PTO2 shared memory

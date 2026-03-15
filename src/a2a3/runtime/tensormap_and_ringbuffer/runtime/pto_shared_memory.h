@@ -3,13 +3,17 @@
  *
  * Defines the shared memory structure for Orchestrator-Scheduler communication.
  *
- * Memory Layout:
+ * Memory Layout (per-ring sections repeat for each ring 0..PTO2_MAX_RING_DEPTH-1):
  *   +---------------------------+
- *   | SharedMemoryHeader        |  (flow control + sync)
+ *   | SharedMemoryHeader        |  (per-ring flow control + sync)
  *   +---------------------------+
- *   | TaskDescriptor[]          |  (ring buffer)
+ *   | Ring 0: TaskDescriptor[]  |
+ *   | Ring 0: TaskPayload[]     |
  *   +---------------------------+
- *   | TaskPayload[]             |  (cold task data)
+ *   | Ring 1: TaskDescriptor[]  |
+ *   | Ring 1: TaskPayload[]     |
+ *   +---------------------------+
+ *   | ...                       |
  *   +---------------------------+
  *
  * Design principles:
@@ -33,32 +37,56 @@ extern "C" {
 // Shared Memory Header
 // =============================================================================
 
+struct PTO2SharedMemoryHandle;
+
 /**
- * Shared memory header structure
- * 
- * Contains flow control pointers and layout information.
+ * Per-ring flow control state in shared memory.
  * Written/read by Orchestrator and Scheduler for synchronization.
  */
-typedef struct {
-    // === FLOW CONTROL POINTERS ===
-
+struct PTO2RingFlowControl {
     // Written by Orchestrator, Read by Scheduler
     std::atomic<uint64_t> heap_top;           // Heap ring allocation pointer
     std::atomic<int32_t> current_task_index;  // Task ring head (next to allocate)
-    std::atomic<int32_t> orchestrator_done;   // Flag: orchestration complete
-    
+    int32_t _pad0;                            // Alignment padding
+
     // Written by Scheduler, Read by Orchestrator (for back-pressure)
-    std::atomic<uint64_t> heap_tail;          // Heap ring free pointer (on-device, matches pto2_heap_ring_init)
+    std::atomic<uint64_t> heap_tail;          // Heap ring free pointer
     std::atomic<int32_t> last_task_alive;     // Task ring tail (oldest active task)
-    std::atomic<int32_t> heap_tail_gen;       // Ticket counter for serialized heap_tail writes
-                                              // (ensures concurrent threads write in task order)
+    int32_t _pad1;                            // Alignment padding
 
-    // === LAYOUT INFO (set once at init) ===
-    uint64_t task_window_size;            // PTO2_TASK_WINDOW_SIZE
-    uint64_t heap_size;                   // Total heap size
+    void init() {
+        heap_top.store(0, std::memory_order_relaxed);
+        current_task_index.store(0, std::memory_order_relaxed);
+        heap_tail.store(0, std::memory_order_relaxed);
+        last_task_alive.store(0, std::memory_order_relaxed);
+    }
 
-    // Offsets into shared memory (relative to SM_Base)
-    uint64_t task_descriptors_offset;     // Offset to TaskDescriptor array
+    bool validate(PTO2SharedMemoryHandle* handle, int32_t ring_id) const;
+};
+
+/**
+ * Per-ring shared memory header section.
+ *
+ * Groups flow-control and layout info for a single ring to avoid parallel arrays.
+ */
+struct PTO2SharedMemoryRingHeader {
+    PTO2RingFlowControl fc;
+    uint64_t task_window_size;
+    uint64_t heap_size;
+    uint64_t task_descriptors_offset;  // Offset from SM base, in bytes
+};
+
+/**
+ * Shared memory header structure
+ *
+ * Contains per-ring flow control and global layout information.
+ */
+struct PTO2SharedMemoryHeader {
+    // === PER-RING FLOW CONTROL + LAYOUT INFO (set once at init) ===
+    PTO2SharedMemoryRingHeader rings[PTO2_MAX_RING_DEPTH];
+
+    // === GLOBAL FIELDS ===
+    std::atomic<int32_t> orchestrator_done;   // Flag: orchestration complete
 
     // Total shared memory size (for validation)
     uint64_t total_size;
@@ -68,10 +96,7 @@ typedef struct {
     std::atomic<uint64_t> graph_output_ptr;   // Address where final output was written (packed buffer)
     std::atomic<uint64_t> graph_output_size;  // Size in bytes
 
-    // Padding to cache-line-aligned size (ALIGN_UP to PTO2_ALIGN_SIZE)
-    uint64_t _padding[4];
-
-} PTO2SharedMemoryHeader;
+};
 
 // =============================================================================
 // Shared Memory Handle
@@ -81,19 +106,19 @@ typedef struct {
  * Handle for shared memory access
  * Provides both Orchestrator and Scheduler views of the same memory
  */
-typedef struct {
+struct PTO2SharedMemoryHandle {
     void*   sm_base;              // Base address of shared memory
     uint64_t sm_size;             // Total size of shared memory
 
-    // Quick pointers into shared memory regions
+    // Quick pointers into shared memory regions (per-ring)
     PTO2SharedMemoryHeader* header;
-    PTO2TaskDescriptor*     task_descriptors;
-    PTO2TaskPayload*        task_payloads;
-    
+    PTO2TaskDescriptor*     task_descriptors[PTO2_MAX_RING_DEPTH];
+    PTO2TaskPayload*        task_payloads[PTO2_MAX_RING_DEPTH];
+
     // Ownership flag
     bool    is_owner;             // True if this handle allocated the memory
-    
-} PTO2SharedMemoryHandle;
+
+};
 
 // =============================================================================
 // Shared Memory API
@@ -102,16 +127,24 @@ typedef struct {
 /**
  * Calculate required shared memory size
  *
- * @param task_window_size  Number of task slots
+ * @param task_window_size  Number of task slots per ring
  * @return Total bytes required
  */
 uint64_t pto2_sm_calculate_size(uint64_t task_window_size);
 
 /**
+ * Calculate required shared memory size for per-ring task windows.
+ *
+ * @param task_window_sizes  Array of window sizes per ring
+ * @return Total bytes required
+ */
+uint64_t pto2_sm_calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH]);
+
+/**
  * Create shared memory for Orchestrator and Scheduler
  *
- * @param task_window_size  Number of task slots
- * @param heap_size         Heap size for output buffers
+ * @param task_window_size  Number of task slots per ring
+ * @param heap_size         Heap size per ring for output buffers
  * @return Handle with both views, or NULL on failure
  */
 PTO2SharedMemoryHandle* pto2_sm_create(uint64_t task_window_size,
@@ -128,8 +161,8 @@ PTO2SharedMemoryHandle* pto2_sm_create_default(void);
  *
  * @param sm_base            Base address of pre-allocated buffer
  * @param sm_size            Total size in bytes
- * @param task_window_size   Number of task slots (must match buffer layout)
- * @param heap_size          Heap size (for layout; buffer has no heap region)
+ * @param task_window_size   Number of task slots per ring (must match buffer layout)
+ * @param heap_size          Heap size per ring (for layout; buffer has no heap region)
  * @return Handle, or NULL on failure
  */
 PTO2SharedMemoryHandle* pto2_sm_create_from_buffer(void* sm_base,
@@ -149,6 +182,14 @@ void pto2_sm_destroy(PTO2SharedMemoryHandle* handle);
 void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
                           uint64_t task_window_size,
                           uint64_t heap_size);
+
+/**
+ * Initialize shared memory header with per-ring layout information.
+ */
+void pto2_sm_init_header_per_ring(
+    PTO2SharedMemoryHandle* handle,
+    const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
+    const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]);
 
 // =============================================================================
 // Debug Utilities
