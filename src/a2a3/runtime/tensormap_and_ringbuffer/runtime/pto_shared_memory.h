@@ -81,7 +81,7 @@ struct PTO2SharedMemoryRingHeader {
  *
  * Contains per-ring flow control and global layout information.
  */
-struct PTO2SharedMemoryHeader {
+struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     // === PER-RING FLOW CONTROL + LAYOUT INFO (set once at init) ===
     PTO2SharedMemoryRingHeader rings[PTO2_MAX_RING_DEPTH];
 
@@ -96,7 +96,21 @@ struct PTO2SharedMemoryHeader {
     std::atomic<uint64_t> graph_output_ptr;   // Address where final output was written (packed buffer)
     std::atomic<uint64_t> graph_output_size;  // Size in bytes
 
+    // === ERROR REPORTING ===
+
+    // Orchestrator fatal error code (Orchestrator → Scheduler, AICPU → Host)
+    // Non-zero signals fatal error. Written by orchestrator, read by scheduler and host.
+    std::atomic<int32_t> orch_error_code;
+
+    // Scheduler error state (Scheduler → Host, independent of orchestrator)
+    // Written by scheduler threads on timeout; read by orchestrator and host.
+    std::atomic<int32_t> sched_error_bitmap;   // Bit X set = thread X had error
+    std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
+    std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
 };
+
+static_assert(sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0,
+              "PTO2SharedMemoryHeader must be aligned to cache line (PTO2_ALIGN_SIZE)");
 
 // =============================================================================
 // Shared Memory Handle

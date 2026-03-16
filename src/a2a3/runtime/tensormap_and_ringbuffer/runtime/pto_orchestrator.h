@@ -72,6 +72,11 @@ struct PTO2OrchestratorState {
     void* gm_heap_base;    // Base address of GM heap
     uint64_t gm_heap_size;   // Total size of GM heap (all rings)
 
+    // === FATAL ERROR ===
+    // Fatal error flag (single-thread access by orchestrator, no atomic needed)
+    // Cross-thread notification uses shared memory orch_error_code (atomic)
+    bool fatal;
+
     // === STATISTICS ===
 #if PTO2_PROFILING
     int64_t tasks_submitted;

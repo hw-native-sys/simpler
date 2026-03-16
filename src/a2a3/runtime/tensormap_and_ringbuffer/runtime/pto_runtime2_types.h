@@ -56,6 +56,20 @@
 #endif
 
 // =============================================================================
+// AICPU Error Codes (written to shared memory for Host-side diagnosis)
+// =============================================================================
+
+// Orchestrator errors (1-99): detected in orchestrator thread
+#define PTO2_ERROR_NONE                       0
+#define PTO2_ERROR_SCOPE_DEADLOCK             1
+#define PTO2_ERROR_HEAP_RING_DEADLOCK         2
+#define PTO2_ERROR_FLOW_CONTROL_DEADLOCK      3
+#define PTO2_ERROR_DEP_POOL_OVERFLOW          4
+
+// Scheduler errors (100+): detected in scheduler threads
+#define PTO2_ERROR_SCHEDULER_TIMEOUT          100
+
+// =============================================================================
 // Configuration Constants
 // =============================================================================
 

@@ -110,6 +110,7 @@ bool pto2_orchestrator_init(
     orch->sm_handle = sm_handle;
     orch->gm_heap_base = gm_heap;
     orch->gm_heap_size = heap_size * PTO2_MAX_RING_DEPTH;
+    orch->fatal = false;
 
     // Initialize per-ring resources
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -120,6 +121,7 @@ bool pto2_orchestrator_init(
         pto2_heap_ring_init(&orch->rings[r].heap_ring, ring_heap_base, heap_size,
                             &sm_handle->header->rings[r].fc.heap_tail,
                             &sm_handle->header->rings[r].fc.heap_top);
+        orch->rings[r].heap_ring.error_code_ptr = &sm_handle->header->orch_error_code;
 
         // Initialize task ring buffer
         pto2_task_ring_init(&orch->rings[r].task_ring,
@@ -127,6 +129,7 @@ bool pto2_orchestrator_init(
             sm_handle->header->rings[r].task_window_size,
             &sm_handle->header->rings[r].fc.last_task_alive,
             &sm_handle->header->rings[r].fc.current_task_index);
+        orch->rings[r].task_ring.error_code_ptr = &sm_handle->header->orch_error_code;
 
         // Allocate and initialize dependency list pool (per-ring)
         PTO2DepListEntry* dep_entries = (PTO2DepListEntry*)calloc(dep_pool_capacity, sizeof(PTO2DepListEntry));
@@ -138,6 +141,7 @@ bool pto2_orchestrator_init(
             return false;
         }
         pto2_dep_pool_init(&orch->rings[r].dep_pool, dep_entries, dep_pool_capacity);
+        orch->rings[r].dep_pool.error_code_ptr = &sm_handle->header->orch_error_code;
         orch->dep_pool_cur_entries[r] = nullptr;
         orch->dep_pool_last_reclaimed[r] = 0;
     }
@@ -292,6 +296,7 @@ static void scope_tasks_push(PTO2OrchestratorState* orch, PTO2TaskSlotState *tas
 }
 
 void pto2_scope_begin(PTO2OrchestratorState* orch) {
+    if (orch->fatal) { return; }
     assert(orch->scope_stack_top < (int32_t)(orch->scope_stack_capacity - 1) && "Scope stack overflow");
 
     ++orch->scope_stack_top;
@@ -299,6 +304,7 @@ void pto2_scope_begin(PTO2OrchestratorState* orch) {
 }
 
 void pto2_scope_end(PTO2OrchestratorState* orch) {
+    if (orch->fatal) { return; }
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
 
 #if PTO2_ORCH_PROFILING
@@ -327,6 +333,9 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // =============================================================================
 void pto2_submit_mixed_task(
     PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, PTOParam* params, int32_t num_params) {
+    // Fast path after fatal error — all subsequent submits are no-ops
+    if (orch->fatal) { return; }
+
     CYCLE_COUNT_START();
 
     // === Validate submit inputs ===
@@ -393,12 +402,16 @@ void pto2_submit_mixed_task(
             LOG_ERROR("     Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2>");
             LOG_ERROR("  3. Split work across multiple scopes");
             LOG_ERROR("========================================");
-            exit(1);
+            orch->sm_handle->header->orch_error_code.store(
+                PTO2_ERROR_SCOPE_DEADLOCK, std::memory_order_release);
+            orch->fatal = true;
+            return;
         }
     }
 
     // === STEP 1: Allocate task slot from Task Ring (blocks until available) ===
     int32_t local_id = task_ring.pto2_task_ring_alloc();
+    if (local_id < 0) { orch->fatal = true; return; }
     int32_t slot = task_ring.get_task_slot(local_id);
     PTO2TaskId mixed_task_id =
         pto2_make_task_id(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id));
@@ -474,6 +487,7 @@ void pto2_submit_mixed_task(
 
     if (total_output_size > 0) {
         task.packed_buffer_base = orch->pto2_alloc_packed_buffer(total_output_size);
+        if (!task.packed_buffer_base) { orch->fatal = true; return; }
         task.packed_buffer_end = (char*)task.packed_buffer_base + total_output_size;
     }
     CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP, local_id);
@@ -571,7 +585,7 @@ void pto2_submit_mixed_task(
 
         auto& dep_pool = orch->rings[ring_id].dep_pool;
         if (orch->dep_pool_cur_entries[ring_id] == nullptr) {
-            orch->dep_pool_cur_entries[ring_id] = &dep_pool.alloc();
+            orch->dep_pool_cur_entries[ring_id] = dep_pool.alloc();
         }
 
         int32_t early_finished = 0;
@@ -609,7 +623,7 @@ void pto2_submit_mixed_task(
             }
             pto2_fanout_unlock(producer_slot_state);
             if (producer_slot_state.fanout_head == orch->dep_pool_cur_entries[ring_id]) {
-                orch->dep_pool_cur_entries[ring_id] = &dep_pool.alloc();
+                orch->dep_pool_cur_entries[ring_id] = dep_pool.alloc();
             }
         }
         // Combined release: merge early_finished batch with the +1 init release

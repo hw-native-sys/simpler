@@ -60,6 +60,7 @@ constexpr int32_t MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 
 constexpr int32_t MAX_IDLE_ITERATIONS = 800000;  // ~20s idle then scheduler gives up (avoid long hang)
 constexpr int32_t STALL_LOG_INTERVAL = 50000;    // DEV_ALWAYS every N idle iters to debug hang
+constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
 constexpr int32_t STALL_DUMP_CORE_MAX = 8;
@@ -1006,6 +1007,20 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         if (tracker.aic().running_count == 0 && tracker.aiv().running_count == 0) {
             bool orch_done = orchestrator_done_;
             if (orch_done) {
+                // Check for orchestrator fatal error — exit immediately
+                int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
+                if (orch_err != PTO2_ERROR_NONE) {
+                    DEV_ERROR("Thread %d: Fatal error (code=%d), sending EXIT_SIGNAL to all cores. "
+                               "completed_tasks=%d, total_tasks=%d",
+                               thread_idx, orch_err,
+                               completed_tasks_.load(std::memory_order_relaxed),
+                               total_tasks_);
+                    emergency_shutdown(runtime);
+                    completed_.store(true, std::memory_order_release);
+                    break;
+                }
+
+                // Normal exit: all tasks complete
                 task_count = total_tasks_;
                 if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
                     completed_.store(true, std::memory_order_release);
@@ -1287,6 +1302,21 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 #endif
             }
             idle_iterations++;
+
+            // Check for orchestrator fatal error during idle (every 1024 iterations)
+            // orch_error_code is set in shared memory by the orchestrator's spin loop
+            // BEFORE orchestrator_done_ is set, so this catches errors earlier.
+            if (idle_iterations % FATAL_ERROR_CHECK_INTERVAL == 0) {
+                int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
+                if (orch_err != PTO2_ERROR_NONE) {
+                    DEV_ERROR("Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores",
+                               thread_idx, orch_err);
+                    emergency_shutdown(runtime);
+                    completed_.store(true, std::memory_order_release);
+                    break;
+                }
+            }
+
             if (thread_idx == 0 && task_count > 0 && idle_iterations % STALL_LOG_INTERVAL == 0) {
                 int32_t c = completed_tasks_.load(std::memory_order_relaxed);
                 DEV_ALWAYS("PTO2 stall: no progress for %d iterations, completed=%d total=%d (last progress at %d)",
@@ -1844,28 +1874,49 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(pto2_task_count));
                 }
                 orchestrator_done_ = true;
+                {
+                    int32_t orch_err = 0;
+                    void* sm = runtime->get_pto2_gm_sm_ptr();
+                    if (sm) {
+                        orch_err = static_cast<PTO2SharedMemoryHeader*>(sm)->orch_error_code.load(
+                            std::memory_order_relaxed);
+                    }
 
-                // Compute new core assignments for all threads and initialize donated slots
-                DEV_INFO("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
-#if PTO2_PROFILING
-                // Benchmark: record orchestrator end timestamp before waiting for schedulers
-                DEV_ALWAYS("BENCHMARK: thread=%d end=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
-#endif
-                transition_requested_.store(true, std::memory_order_release);
-
-                // Wait for scheduler threads to acknowledge transition request
-                // All-orchestrator mode (sched_thread_num_ == 0): skip the wait
-                if (sched_thread_num_ > 0) {
-                    while (wait_reassign_.load(std::memory_order_acquire) != sched_thread_num_) {
-                        if (completed_.load(std::memory_order_acquire)) {
-                            break;
-                        }
-                        SPIN_WAIT_HINT();
+                    // Fatal error: shutdown AICore immediately before core transition.
+                    if (orch_err != PTO2_ERROR_NONE) {
+                        emergency_shutdown(runtime);
+                        completed_.store(true, std::memory_order_release);
                     }
                 }
-                if (!completed_.load(std::memory_order_acquire)) {
-                    reassign_cores_for_all_threads();
+
+                // Skip core transition on fatal error — cores already shut down above
+                if (completed_.load(std::memory_order_acquire)) {
+                    // Signal transition to unblock scheduler threads waiting at core transition
+                    transition_requested_.store(true, std::memory_order_release);
                     reassigned_.store(true, std::memory_order_release);
+                } else {
+                    // Compute new core assignments for all threads and initialize donated slots
+                    DEV_INFO("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
+#if PTO2_PROFILING
+                    // Benchmark: record orchestrator end timestamp before waiting for schedulers
+                    DEV_ALWAYS("BENCHMARK: thread=%d end=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+#endif
+                    transition_requested_.store(true, std::memory_order_release);
+
+                    // Wait for scheduler threads to acknowledge transition request
+                    // All-orchestrator mode (sched_thread_num_ == 0): skip the wait
+                    if (sched_thread_num_ > 0) {
+                        while (wait_reassign_.load(std::memory_order_acquire) != sched_thread_num_) {
+                            if (completed_.load(std::memory_order_acquire)) {
+                                break;
+                            }
+                            SPIN_WAIT_HINT();
+                        }
+                    }
+                    if (!completed_.load(std::memory_order_acquire)) {
+                        reassign_cores_for_all_threads();
+                        reassigned_.store(true, std::memory_order_release);
+                    }
                 }
             } else {
                 // Non-last orchestrator: wait for last orchestrator to finish setup
@@ -1895,18 +1946,26 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
         always_assert(rt != nullptr);
         int32_t completed = resolve_and_dispatch_pto2(runtime, thread_idx);
         DEV_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+    }
 
-        // After transition, use new core assignments for shutdown
+    // Always shutdown AICore — even if completed_ was already true.
+    // platform_deinit_aicore_regs is idempotent; orchestrator threads have
+    // core_count_per_thread_ == 0 so they skip the loop harmlessly.
+    {
         const int32_t* shutdown_cores = core_assignments_[thread_idx];
         int32_t shutdown_count = core_count_per_thread_[thread_idx];
 #if PTO2_PROFILING
         // Benchmark: record scheduler end timestamp before shutdown cleanup
-        DEV_ALWAYS("Thread=%d end=%llu",
-                   thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+        if (shutdown_count > 0) {
+            DEV_ALWAYS("Thread=%d end=%llu",
+                       thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+        }
 #endif
-        auto rc = shutdown_aicore(runtime, thread_idx, shutdown_cores, shutdown_count);
-        if (rc != 0) {
-            return rc;
+        if (shutdown_count > 0) {
+            auto rc = shutdown_aicore(runtime, thread_idx, shutdown_cores, shutdown_count);
+            if (rc != 0) {
+                return rc;
+            }
         }
     }
 

@@ -191,6 +191,12 @@ void pto2_sm_init_header_per_ring(
     header->total_size = handle->sm_size;
     header->graph_output_ptr.store(0, std::memory_order_relaxed);
     header->graph_output_size.store(0, std::memory_order_relaxed);
+
+    // Error reporting
+    header->orch_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
+    header->sched_error_bitmap.store(0, std::memory_order_relaxed);
+    header->sched_error_code.store(PTO2_ERROR_NONE, std::memory_order_relaxed);
+    header->sched_error_thread.store(-1, std::memory_order_relaxed);
 }
 
 // =============================================================================
@@ -218,6 +224,11 @@ void pto2_sm_print_layout(PTO2SharedMemoryHandle* handle) {
         LOG_INFO("  last_task_alive:  %d", h->rings[r].fc.last_task_alive.load(std::memory_order_acquire));
     }
     LOG_INFO("orchestrator_done:  %d", h->orchestrator_done.load(std::memory_order_acquire));
+    LOG_INFO("Error state:");
+    LOG_INFO("  orch_error_code:    %d", h->orch_error_code.load(std::memory_order_relaxed));
+    LOG_INFO("  sched_error_bitmap: 0x%x", h->sched_error_bitmap.load(std::memory_order_relaxed));
+    LOG_INFO("  sched_error_code:   %d", h->sched_error_code.load(std::memory_order_relaxed));
+    LOG_INFO("  sched_error_thread: %d", h->sched_error_thread.load(std::memory_order_relaxed));
     LOG_INFO("================================");
 }
 
