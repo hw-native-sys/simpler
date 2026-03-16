@@ -15,6 +15,8 @@ description: Testing guide and pre-commit testing strategy for PTO Runtime. Use 
 
 **Important**: Always read `.github/workflows/ci.yml` first to extract the current `-c` (pto-isa commit) and `-t` (timeout) flags. These ensure reproducible builds by pinning the PTO-ISA dependency to a known-good commit.
 
+**IMPORTANT**: Never pipe `ci.sh --parallel` output through buffering commands like `| tail`, `| grep`, or `| head`. Parallel mode spawns background subprocesses whose stdout is interleaved; pipe filters buffer until the pipe closes (all children exit), producing zero visible output and appearing hung. Always capture full output directly (`2>&1` without pipes).
+
 ```bash
 # Python unit tests
 pytest tests -v
