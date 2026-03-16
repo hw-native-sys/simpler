@@ -18,19 +18,8 @@ thread_local volatile uint8_t* g_sim_reg_base = nullptr;
 thread_local uint32_t g_sim_physical_core_id = 0;
 
 // Declare the original function (defined in aicore_executor.cpp with weak linkage)
-void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type, PipeSyncFunc pipe_sync_fn);
+void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type);
 
-
-/**
- * Pipeline synchronization function - simulation version
- *
- * In simulation, set_flag/wait_flag are both __sync_synchronize(),
- * so this becomes a simple memory barrier regardless of core type.
- * We keep a simple implementation for architectural consistency with onboard.
- */
- inline void pipe_sync() {
-    __sync_synchronize();
-}
 // Wrapper with extern "C" for dlsym lookup
 // NOTE: physical_core_id stays in wrapper signature (DeviceRunner passes it for register indexing)
 extern "C" void aicore_execute_wrapper(__gm__ Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs) {
@@ -44,5 +33,5 @@ extern "C" void aicore_execute_wrapper(__gm__ Runtime* runtime, int block_idx, C
 
     g_sim_physical_core_id = physical_core_id;
 
-    aicore_execute(runtime, block_idx, core_type, pipe_sync);
+    aicore_execute(runtime, block_idx, core_type);
 }

@@ -21,16 +21,7 @@ class Runtime;
 [[block_local]] int block_idx;
 [[block_local]] CoreType core_type;
 
-extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type, PipeSyncFunc pipe_sync_fn);
-
-/**
- * Pipeline synchronization function
- *
- * On DAV_3510 (npu_arch_3101), set_flag/wait_flag always syncs PIPE_M→PIPE_V
- * regardless of the pipe parameters.
- */
-__aicore__ inline void pipe_sync() {
-}
+extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type);
 
 /**
  * Kernel entry point with control loop
@@ -57,6 +48,5 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime
     core_type = CoreType::AIC;
 #endif
 
-    PipeSyncFunc pipe_sync_fn = pipe_sync;
-    aicore_execute(runtime, block_idx, core_type, pipe_sync_fn);
+    aicore_execute(runtime, block_idx, core_type);
 }

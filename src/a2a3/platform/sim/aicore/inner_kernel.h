@@ -63,6 +63,11 @@
 #define STORE_RELEASE_FENCE() std::atomic_thread_fence(std::memory_order_release)
 #endif
 
+// FULL_MEMORY_BARRIER - full memory barrier preventing all load/store reordering.
+// Used after kernel execution to ensure all writes are visible before signalling
+// completion. Equivalent to dmb ish (aarch64) / mfence (x86).
+#define FULL_MEMORY_BARRIER() __sync_synchronize()
+
 // =============================================================================
 // System Counter Simulation
 // =============================================================================
@@ -114,7 +119,7 @@ extern thread_local uint32_t g_sim_physical_core_id;
  */
 inline uint64_t read_reg(RegId reg) {
     uint32_t offset = reg_offset(reg);
-    __sync_synchronize();
+    FULL_MEMORY_BARRIER();
     return static_cast<uint64_t>(
         *reinterpret_cast<volatile uint32_t*>(g_sim_reg_base + offset));
 }
@@ -129,7 +134,7 @@ inline void write_reg(RegId reg, uint64_t value) {
     uint32_t offset = reg_offset(reg);
     *reinterpret_cast<volatile uint32_t*>(g_sim_reg_base + offset) =
         static_cast<uint32_t>(value);
-    __sync_synchronize();
+    FULL_MEMORY_BARRIER();
 }
 
 /**

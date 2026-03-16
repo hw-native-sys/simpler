@@ -26,6 +26,9 @@
 // STORE_RELEASE_FENCE - no-op on real hardware (dcci handles cache coherency)
 #define STORE_RELEASE_FENCE() ((void)0)
 
+// FULL_MEMORY_BARRIER - no-op on real hardware (dcci handles full cache coherency)
+#define FULL_MEMORY_BARRIER() ((void)0)
+
 /**
  * Read an AICore register via SPR access
  *

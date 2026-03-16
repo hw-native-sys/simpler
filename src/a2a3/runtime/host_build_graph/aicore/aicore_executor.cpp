@@ -6,17 +6,16 @@
 
 typedef void (*KernelFunc)(__gm__ int64_t*);
 
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task, PipeSyncFunc pipe_sync_fn) {
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task) {
     if (task->function_bin_addr == 0) {
         return;
     }
     KernelFunc kernel = (KernelFunc)task->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
-
-    pipe_sync_fn();
+    FULL_MEMORY_BARRIER();
 }
 
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type, PipeSyncFunc pipe_sync_fn) {
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type) {
     __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
@@ -67,7 +66,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             __gm__ Task* task_ptr = &(runtime->tasks[actual_task_id]);
             uint64_t start_time = get_sys_cnt_aicore();
 
-            execute_task(task_ptr, pipe_sync_fn);
+            execute_task(task_ptr);
 
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();

@@ -103,4 +103,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     // TSTORE: Store result to GM
     TSTORE(dstGlobal, cTile);
+
+    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }

@@ -104,6 +104,9 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     TSTORE(mijGlobal, maxTile);
     TSTORE(lijGlobal, sumTile);
     TSTORE(pijGlobal, pijF16Tile);
+
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
