@@ -1,0 +1,18 @@
+{
+    "project_root": "..",
+    "examples_subdir": "tests/device_tests/${platform}/tensormap_and_ringbuffer",
+    "examples": [
+        "alternating_matmul_add",
+        "benchmark_bgemm",
+        "paged_attention_unroll",
+        "batch_paged_attention",
+        "paged_attention"
+    ],
+    "device_id": 0,
+    "rounds": 10,
+    "warmup_rounds": 2,
+    "platform": "a2a3",
+    "verbose": false,
+    "log": true,
+    "plot": false
+}
