@@ -208,7 +208,7 @@ def main():
     parser.add_argument('--style', choices=['detailed', 'compact'], default='detailed',
                         help='节点信息密度：detailed（详细，包含核心和时间）或 compact（紧凑，仅函数名）')
     parser.add_argument('--direction', choices=['TD', 'LR'], default='TD',
-                        help='流程图方向：TD（从上到下）或 LR（从左到右，默认）')
+                        help='流程图方向：TD（从上到下，默认）或 LR（从左到右）')
     parser.add_argument('-v', '--verbose', action='store_true', help='详细输出')
 
     args = parser.parse_args()
