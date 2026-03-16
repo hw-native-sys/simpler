@@ -86,6 +86,8 @@ struct Handshake {
     volatile uint64_t perf_records_addr;   // Performance records address
     volatile uint32_t perf_buffer_status;  // 0 = not full, 1 == full
     volatile uint32_t physical_core_id;     // Physical core ID
+    volatile uint32_t aicpu_regs_ready;    // AICPU register init done: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;     // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
 /**

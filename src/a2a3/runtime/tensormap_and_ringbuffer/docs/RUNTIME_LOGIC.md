@@ -502,11 +502,11 @@ Instead of polling `Handshake.task_status`, the production protocol uses hardwar
 
 | Register | Direction | Usage |
 |----------|-----------|-------|
-| `DATA_MAIN_BASE` | AICPU→AICore | Write `task_id + 1` to dispatch; `EXIT_SIGNAL` to shut down |
+| `DATA_MAIN_BASE` | AICPU→AICore | Write `task_id` to dispatch (idle=0x7FFFFFFD); `EXIT_SIGNAL` to shut down |
 | `COND` | AICore→AICPU | `[bit31=state, bits30:0=task_id]`: ACK (state=0) or FIN (state=1) |
 
 **AICore execution loop**:
-1. Poll `DATA_MAIN_BASE` for non-zero value
+1. Poll `DATA_MAIN_BASE` for value != AICPU_IDLE_TASK_ID
 2. Read payload from `Handshake.task`
 3. Write ACK to `COND`
 4. Execute kernel function via `func_id_to_addr` lookup

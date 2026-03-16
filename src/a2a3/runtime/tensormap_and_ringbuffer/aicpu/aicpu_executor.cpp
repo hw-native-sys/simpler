@@ -242,7 +242,7 @@ struct AicpuExecutor {
     int32_t shutdown_aicore(Runtime* runtime, int32_t thread_idx, const int32_t* cur_thread_cores, int32_t core_num);
     int32_t run(Runtime* runtime);
     void deinit(Runtime* runtime);
-    void emergency_shutdown();
+    void emergency_shutdown(Runtime* runtime);
     void diagnose_stuck_state(
         Runtime* runtime, int32_t thread_idx, const int32_t* cur_thread_cores, int32_t core_num, Handshake* hank);
 
@@ -530,7 +530,7 @@ struct AicpuExecutor {
             dispatch_seq_by_core_[core_id]++;
             reg_task_id = dispatch_seq_by_core_[core_id] & TASK_ID_MASK;
         }
-        write_reg(core_id_to_reg_addr_[core_id], RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id + 1));
+        write_reg(core_id_to_reg_addr_[core_id], RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
 
         CoreTypeTracker& ct = tracker.by_type[static_cast<int32_t>(core_type)];
         int32_t idle_idx = ct.find_idle_index(core_id);
@@ -577,10 +577,10 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     bool handshake_failed = false;
     for (int32_t i = 0; i < cores_total_num_; i++) {
         Handshake* hank = &all_handshakes[i];
-        while (hank->aicore_done == 0) {
+
+        while (hank->aicore_regs_ready == 0) {
         }
 
-        CoreType type = hank->core_type;
         uint32_t physical_core_id = hank->physical_core_id;
 
         // Validate physical_core_id before using as array index
@@ -594,6 +594,15 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime* runtime) {
         // Get register address using physical_core_id
         uint64_t* regs = reinterpret_cast<uint64_t*>(regs_);
         uint64_t reg_addr = regs[physical_core_id];
+
+        // Initialize AICore registers after discovery (first round)
+        platform_init_aicore_regs(reg_addr);
+        hank->aicpu_regs_ready = 1;
+
+        while (hank->aicore_done == 0) {
+        }
+
+        CoreType type = hank->core_type;
 
         if (type == CoreType::AIC) {
             aic_cores_[aic_count_].worker_id = i;
@@ -612,15 +621,10 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime* runtime) {
         }
 
         core_id_to_reg_addr_[i] = reg_addr;
-
-        // Initialize AICore registers after discovery (first round)
-        if (reg_addr != 0) {
-            platform_init_aicore_regs(reg_addr);
-        }
     }
 
     if (handshake_failed) {
-        emergency_shutdown();
+        emergency_shutdown(runtime);
         return -1;
     }
 
@@ -1986,10 +1990,12 @@ void AicpuExecutor::deinit(Runtime* runtime) {
     DEV_INFO("DeInit: AicpuExecutor reset complete");
 }
 
-void AicpuExecutor::emergency_shutdown() {
+void AicpuExecutor::emergency_shutdown(Runtime* runtime) {
     DEV_WARN("Emergency shutdown: sending exit signal to all initialized cores");
-
+    Handshake* all_handshakes = (Handshake*)runtime->workers;
     for (int32_t i = 0; i < cores_total_num_; i++) {
+        Handshake* hank = &all_handshakes[i];
+        hank->aicpu_regs_ready = 1;
         if (core_id_to_reg_addr_[i] != 0) {
             platform_deinit_aicore_regs(core_id_to_reg_addr_[i]);
         }

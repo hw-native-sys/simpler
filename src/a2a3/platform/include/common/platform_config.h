@@ -208,9 +208,15 @@ constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = 25;
 #define MAKE_ACK_VALUE(task_id)    ((uint64_t)((task_id) & TASK_ID_MASK))
 #define MAKE_FIN_VALUE(task_id)    ((uint64_t)(((task_id) & TASK_ID_MASK) | TASK_STATE_MASK))
 
-// This value is RESERVED and must never be used as a real task ID.
+// These values are RESERVED and must never be used as real task IDs.
+// Valid task IDs: 0 to 0x7FFFFFEF (2147483631)
 #define AICORE_IDLE_TASK_ID        0x7FFFFFFFU
 #define AICORE_IDLE_VALUE          MAKE_FIN_VALUE(AICORE_IDLE_TASK_ID)
+
+#define AICORE_EXIT_TASK_ID        0x7FFFFFFEU
+#define AICORE_EXITED_VALUE        MAKE_FIN_VALUE(AICORE_EXIT_TASK_ID)
+
+#define AICPU_IDLE_TASK_ID         0x7FFFFFFDU
 
 // =============================================================================
 // Task State Constants

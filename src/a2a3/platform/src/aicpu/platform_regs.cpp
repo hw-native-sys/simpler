@@ -61,13 +61,19 @@ void platform_init_aicore_regs(uint64_t reg_addr) {
     write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_OPEN);
 
     // Initialize task dispatch register to idle state
-    write_reg(reg_addr, RegId::DATA_MAIN_BASE, 0);
+    write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
 }
 
 void platform_deinit_aicore_regs(uint64_t reg_addr) {
     // Send exit signal to AICore
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICORE_EXIT_SIGNAL);
 
+    // Wait for AICore to acknowledge exit by writing AICORE_EXITED_VALUE to COND
+    while (read_reg(reg_addr, RegId::COND) != AICORE_EXITED_VALUE) {
+    }
+
+    // Initialize task dispatch register to idle state
+    write_reg(reg_addr, RegId::DATA_MAIN_BASE, AICPU_IDLE_TASK_ID);
     // Close fast path control
     write_reg(reg_addr, RegId::FAST_PATH_ENABLE, REG_SPR_FAST_PATH_CLOSE);
 }

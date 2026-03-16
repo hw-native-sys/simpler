@@ -58,59 +58,56 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         dcci(my_hank, SINGLE_CACHE_LINE);
     }
 
-    // Clear stale EXIT_SIGNAL from previous round before entering main loop
-    write_reg(RegId::DATA_MAIN_BASE, 0);
-
-    // Phase 2: Report physical core ID and core type, signal ready
+    // Phase 2: Report physical core ID, signal ready
     my_hank->physical_core_id = get_physical_core_id();
+    my_hank->aicore_regs_ready = 1;
+    dcci(&my_hank->aicore_regs_ready, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    while (my_hank->aicpu_regs_ready == 0) {
+        dcci(&my_hank->aicpu_regs_ready, SINGLE_CACHE_LINE);
+    }
+    // Report initial idle status via register
+    write_reg(RegId::COND, AICORE_IDLE_VALUE);
+
+    // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
     STORE_RELEASE_FENCE();
     my_hank->aicore_done = core_idx + 1;  // Signal ready (use core_idx + 1 to avoid 0)
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    // Report initial idle status via register
-    write_reg(RegId::COND, AICORE_IDLE_VALUE);
-
     // Read per-core payload address from hank->task (written by AICPU before aicpu_ready)
-    __gm__ PTO2DispatchPayload* my_payload =
+    __gm__ PTO2DispatchPayload* payload =
         reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
 
     bool profiling_enabled = runtime->enable_profiling;
-    uint64_t kernel_ready_time = 0;
-    if (profiling_enabled) {
-        kernel_ready_time = get_sys_cnt_aicore();
-    }
+    uint64_t kernel_ready_time = get_sys_cnt_aicore();
 
-    // Phase 3: Main execution loop - poll register for tasks until exit signal
-    uint32_t task_id = 0;
-    uint32_t last_task_id = 0;
+    // Phase 4: Main execution loop - poll register for tasks until exit signal
+    uint32_t task_id = AICPU_IDLE_TASK_ID;
+    uint32_t last_task_id = AICPU_IDLE_TASK_ID;
 
     while (true) {
         task_id = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
         if (task_id == AICORE_EXIT_SIGNAL) {
+            // Signal exit acknowledgment to AICPU
+            write_reg(RegId::COND, AICORE_EXITED_VALUE);
             break;
         }
 
-        // Execute task if new (task_id encoding: 0=idle, task_id+1=task)
-        if (task_id == 0 || task_id == last_task_id) {
+        // Execute task if new (task_id encoding: AICPU_IDLE_TASK_ID=idle, task_id=task)
+        if (task_id == AICPU_IDLE_TASK_ID || task_id == last_task_id) {
             SPIN_WAIT_HINT();
             continue;
         }
 
         {
             // Invalidate cache to read fresh payload written by AICPU
-            dcci(my_payload, ENTIRE_DATA_CACHE);
-
-            __gm__ PTO2DispatchPayload* payload = my_payload;
+            dcci(payload, ENTIRE_DATA_CACHE);
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(payload->task_id));
 
             // Performance profiling: record start time
-            uint64_t start_time = 0;
-            if (profiling_enabled) {
-                start_time = get_sys_cnt_aicore();
-            }
+            uint64_t start_time = get_sys_cnt_aicore();
 
             // Execute the task
             execute_task(reinterpret_cast<__gm__ void*>(payload), pipe_sync_fn);
@@ -130,5 +127,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     }
 
     // Flush all dirty cache lines to HBM before kernel exit.
-    dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 }
