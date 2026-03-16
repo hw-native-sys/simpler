@@ -351,18 +351,46 @@ struct AicpuExecutor {
                     Handshake* h = &hank[core_id];
                     uint64_t finish_ts = get_sys_cnt_aicpu();
                     PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
-                    rmb();
-                    uint32_t count = perf_buf->count;
-                    if (count > 0) {
-                        PerfRecord* record = &perf_buf->records[count - 1];
-                        if (record->task_id == static_cast<uint32_t>(task_id)) {
-                            // Fill metadata that AICore doesn't know
-                            int32_t perf_slot_idx = static_cast<int32_t>(s_executing_subslot[core_id]);
-                            record->func_id = slot_state.task->kernel_id[perf_slot_idx];
-                            record->core_type = CT;
-                            perf_aicpu_record_dispatch_and_finish_time(
-                                record, dispatch_timestamps_[core_id], finish_ts);
+                    PerfRecord* matched_record = nullptr;
+                    uint32_t observed_count = 0;
+                    constexpr int kPerfPatchRetries = 4;
+                    constexpr int kPerfScanWindow = 4;
+                    for (int retry = 0; retry < kPerfPatchRetries && matched_record == nullptr; retry++) {
+                        rmb();
+                        observed_count = perf_buf->count;
+                        if (observed_count == 0) {
+                            SPIN_WAIT_HINT();
+                            continue;
                         }
+                        if (observed_count > PLATFORM_PROF_BUFFER_SIZE) {
+                            observed_count = PLATFORM_PROF_BUFFER_SIZE;
+                        }
+                        int32_t start_idx = static_cast<int32_t>(observed_count) - 1;
+                        int32_t end_idx = start_idx - kPerfScanWindow + 1;
+                        if (end_idx < 0) {
+                            end_idx = 0;
+                        }
+                        for (int32_t ridx = start_idx; ridx >= end_idx; ridx--) {
+                            PerfRecord* candidate = &perf_buf->records[ridx];
+                            if (candidate->task_id == static_cast<uint32_t>(task_id)) {
+                                matched_record = candidate;
+                                break;
+                            }
+                        }
+                        if (matched_record == nullptr) {
+                            SPIN_WAIT_HINT();
+                        }
+                    }
+                    if (matched_record != nullptr) {
+                        // Fill metadata that AICore doesn't know
+                        int32_t perf_slot_idx = static_cast<int32_t>(s_executing_subslot[core_id]);
+                        matched_record->func_id = slot_state.task->kernel_id[perf_slot_idx];
+                        matched_record->core_type = CT;
+                        perf_aicpu_record_dispatch_and_finish_time(
+                            matched_record, dispatch_timestamps_[core_id], finish_ts);
+                    } else {
+                        DEV_WARN("Thread %d: failed to patch perf metadata for task %d on core %d (count=%u)",
+                                 thread_idx, task_id, core_id, observed_count);
                     }
 #if PTO2_SCHED_PROFILING
                     sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
@@ -1789,8 +1817,8 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 // Compute new core assignments for all threads and initialize donated slots
                 DEV_INFO("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
 #if PTO2_PROFILING
-                // Benchmark: record orchestrator end timestamp before waiting for schedulers
-                DEV_ALWAYS("BENCHMARK: thread=%d end=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+                // Record orchestrator end timestamp before waiting for schedulers
+                DEV_ALWAYS("Thread=%d end=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
 #endif
                 transition_requested_.store(true, std::memory_order_release);
 
