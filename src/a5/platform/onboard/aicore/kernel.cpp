@@ -26,17 +26,10 @@ extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, Co
 /**
  * Pipeline synchronization function
  *
- * AIV cores: Wait for PIPE_MTE3 (store pipeline)
- * AIC cores: Wait for PIPE_FIX (cube unit pipeline)
+ * On DAV_3510 (npu_arch_3101), set_flag/wait_flag always syncs PIPE_M→PIPE_V
+ * regardless of the pipe parameters.
  */
- __aicore__ inline void pipe_sync_aiv() {
-    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
-    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
-}
-
-__aicore__ inline void pipe_sync_aic() {
-    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
-    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+__aicore__ inline void pipe_sync() {
 }
 
 /**
@@ -64,6 +57,6 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime
     core_type = CoreType::AIC;
 #endif
 
-    PipeSyncFunc pipe_sync_fn = (core_type == CoreType::AIV) ? pipe_sync_aiv : pipe_sync_aic;
+    PipeSyncFunc pipe_sync_fn = pipe_sync;
     aicore_execute(runtime, block_idx, core_type, pipe_sync_fn);
 }
