@@ -17,7 +17,7 @@
 
 /** Max arguments per task; must match RUNTIME_MAX_ARGS and PTO2_MAX_OUTPUTS */
 #ifndef PTO2_DISPATCH_MAX_ARGS
-#define PTO2_DISPATCH_MAX_ARGS 32
+#define PTO2_DISPATCH_MAX_ARGS 128
 #endif
 
 /**

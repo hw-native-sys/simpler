@@ -70,6 +70,7 @@
 #define PTO2_TENSORMAP_NUM_BUCKETS 65536    // Power of 2 for fast hash
 
 // Task parameters
+#define PTO2_MAX_PARAMS           128     // Maximum parameters per task (tensors + scalars)
 #define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
 #define PTO2_MAX_INPUTS           16      // Maximum inputs per task
 #define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
@@ -308,9 +309,9 @@ struct PTO2TaskDescriptor {
  * for the scheduler's hot completion path (~80 bytes vs ~2912 bytes).
  */
 struct PTO2TaskPayload {
-    Tensor tensors[16];
-    uint64_t scalar_value[16];
-    bool is_tensor[16];
+    Tensor tensors[PTO2_MAX_PARAMS];
+    uint64_t scalar_value[PTO2_MAX_PARAMS];
+    bool is_tensor[PTO2_MAX_PARAMS];
     int param_count{0};
     int32_t fanin_tasks[PTO2_MAX_INPUTS];   // Producer task IDs (cold path, used by on_task_release)
     int32_t fanin_actual_count{0};           // Actual fanin count (without the +1 redundance)

@@ -18,6 +18,8 @@
 
 #include "tensor.h"
 
+#define N_UNROLL 64
+
 using namespace pto;
 
 #ifndef __gm__
@@ -94,8 +96,8 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ TensorData* key_cache = reinterpret_cast<__gm__ TensorData*>(args[1]);
     __gm__ TensorData* sij_buf = reinterpret_cast<__gm__ TensorData*>(args[2]);
     uint64_t n_blocks = static_cast<uint64_t>(args[3]);
-    uint64_t block_indices[8];
-    for (int j = 0; j < 8; j++) {
+    uint64_t block_indices[N_UNROLL];
+    for (uint64_t j = 0; j < n_blocks; j++) {
         block_indices[j] = static_cast<uint64_t>(args[4 + j]);
     }
 

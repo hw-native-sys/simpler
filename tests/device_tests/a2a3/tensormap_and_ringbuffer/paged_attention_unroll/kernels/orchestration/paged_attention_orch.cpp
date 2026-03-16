@@ -18,7 +18,7 @@
 
 #include "pto_orchestration_api.h"
 
-#define N_UNROLL 8
+#define N_UNROLL 64
 
 #define FUNC_QK_MATMUL 0
 #define FUNC_SOFTMAX_PREPARE 1
@@ -167,7 +167,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     uint64_t n_blocks = std::min((uint64_t)N_UNROLL, bn_this_batch - bn);
 
                     // Prepare block indices for this group
-                    uint64_t block_indices[8] = {};
+                    uint64_t block_indices[N_UNROLL] = {};
                     for (uint64_t i = 0; i < n_blocks; i++) {
                         block_indices[i] = host_block_table[b_idx * block_num + bn + i];
                     }
@@ -183,22 +183,15 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
 
-                    PTOParam params_qk[] = {
-                        make_input_param(qi),
-                        make_input_param(key_cache),
-                        make_output_param(sij_buf),
-                        make_scalar_param(n_blocks),
-                        make_scalar_param(block_indices[0]),
-                        make_scalar_param(block_indices[1]),
-                        make_scalar_param(block_indices[2]),
-                        make_scalar_param(block_indices[3]),
-                        make_scalar_param(block_indices[4]),
-                        make_scalar_param(block_indices[5]),
-                        make_scalar_param(block_indices[6]),
-                        make_scalar_param(block_indices[7]),
-                    };
+                    PTOParam params_qk[4 + N_UNROLL];
+                    params_qk[0] = make_input_param(qi);
+                    params_qk[1] = make_input_param(key_cache);
+                    params_qk[2] = make_output_param(sij_buf);
+                    params_qk[3] = make_scalar_param(n_blocks);
+                    for (int i = 0; i < N_UNROLL; i++)
+                        params_qk[4 + i] = make_scalar_param(block_indices[i]);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk, 12);
+                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk, 4 + N_UNROLL);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -230,22 +223,15 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
 
-                    PTOParam params_pv[] = {
-                        make_input_param(pij_buf),
-                        make_input_param(value_cache),
-                        make_output_param(oi_new),
-                        make_scalar_param(n_blocks),
-                        make_scalar_param(block_indices[0]),
-                        make_scalar_param(block_indices[1]),
-                        make_scalar_param(block_indices[2]),
-                        make_scalar_param(block_indices[3]),
-                        make_scalar_param(block_indices[4]),
-                        make_scalar_param(block_indices[5]),
-                        make_scalar_param(block_indices[6]),
-                        make_scalar_param(block_indices[7]),
-                    };
+                    PTOParam params_pv[4 + N_UNROLL];
+                    params_pv[0] = make_input_param(pij_buf);
+                    params_pv[1] = make_input_param(value_cache);
+                    params_pv[2] = make_output_param(oi_new);
+                    params_pv[3] = make_scalar_param(n_blocks);
+                    for (int i = 0; i < N_UNROLL; i++)
+                        params_pv[4 + i] = make_scalar_param(block_indices[i]);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv, 12);
+                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv, 4 + N_UNROLL);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
