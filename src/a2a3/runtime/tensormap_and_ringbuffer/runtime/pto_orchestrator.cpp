@@ -143,7 +143,6 @@ bool pto2_orchestrator_init(
         pto2_dep_pool_init(&orch->rings[r].dep_pool, dep_entries, dep_pool_capacity);
         orch->rings[r].dep_pool.error_code_ptr = &sm_handle->header->orch_error_code;
         orch->dep_pool_cur_entries[r] = nullptr;
-        orch->dep_pool_last_reclaimed[r] = 0;
     }
 
     // Initialize TensorMap with per-ring task window sizes
@@ -158,9 +157,6 @@ bool pto2_orchestrator_init(
         return false;
     }
     orch->tensor_map.orch = orch;
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        orch->tensormap_last_cleanup[r] = 0;
-    }
 
     // Initialize scope stack: one flat buffer for task IDs + one array for begin offsets
     uint64_t max_depth = PTO2_MAX_SCOPE_DEPTH;
@@ -203,40 +199,18 @@ void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerS
 }
 
 
-// =============================================================================
-// Dep Pool Reclamation
-// =============================================================================
-
-/**
- * Reclaim dead dep pool entries for a specific ring based on scheduler's last_task_alive.
- * Safe to call multiple times — only advances tail forward.
- */
-static void pto2_dep_pool_reclaim(PTO2OrchestratorState* orch, int32_t ring_id) {
-    int32_t last_alive =
-        orch->sm_handle->header->rings[ring_id].fc.last_task_alive.load(std::memory_order_acquire);
-    if (last_alive > orch->dep_pool_last_reclaimed[ring_id] && last_alive > 0) {
-        int32_t newest_consumed = last_alive - 1;
-        int32_t slot_rc = orch->rings[ring_id].task_ring.get_task_slot(newest_consumed);
-        int32_t mark = orch->sm_handle->task_payloads[ring_id][slot_rc].dep_pool_mark;
-        if (mark > 0) {
-            orch->rings[ring_id].dep_pool.advance_tail(mark);
-        }
-        orch->dep_pool_last_reclaimed[ring_id] = last_alive;
-    }
-}
-
 /**
  * Ensure dep pool for a specific ring has at least `needed` entries available.
  * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
  */
-static void pto2_dep_pool_ensure_space(PTO2OrchestratorState* orch, int32_t ring_id, int32_t needed) {
+static void pto2_dep_pool_ensure_space(PTO2OrchestratorState* orch, uint8_t ring_id, int32_t needed) {
     if (pto2_dep_pool_available(&orch->rings[ring_id].dep_pool) >= needed) return;
 
     int spin_count = 0;
     int32_t prev_last_alive =
         orch->sm_handle->header->rings[ring_id].fc.last_task_alive.load(std::memory_order_acquire);
     while (pto2_dep_pool_available(&orch->rings[ring_id].dep_pool) < needed) {
-        pto2_dep_pool_reclaim(orch, ring_id);
+        orch->rings[ring_id].dep_pool.reclaim(orch->scheduler, ring_id, prev_last_alive);
         if (pto2_dep_pool_available(&orch->rings[ring_id].dep_pool) >= needed) return;
 
         spin_count++;
@@ -334,7 +308,11 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 void pto2_submit_mixed_task(
     PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const PTOParam& params) {
     // Fast path after fatal error — all subsequent submits are no-ops
-    if (orch->fatal) { return; }
+    if (orch->fatal) {
+        return;
+    }
+    
+    PTO2SchedulerState* sched = orch->scheduler;
 
     // Validate PTOParam construction (errors recorded by add_input/add_output/etc.)
     if (params.has_error) {
@@ -370,14 +348,20 @@ void pto2_submit_mixed_task(
     }
 
     // === STEP 0: Sync TensorMap validity and optional cleanup ===
-    orch->tensor_map.sync_tensormap();
 
     // Determine which ring this task belongs to
-    int32_t ring_id = orch->current_ring_id();
+    uint8_t ring_id = orch->current_ring_id();
     auto& task_ring = orch->rings[ring_id].task_ring;
 
-    // Reclaim dead dep pool entries based on scheduler's last_task_alive
-    pto2_dep_pool_reclaim(orch, ring_id);
+    // Read current last_task_alive from shared memory for this ring
+    int32_t sm_last_task_alive =
+        orch->sm_handle->header->rings[ring_id].fc.last_task_alive.load(std::memory_order_acquire);
+
+    orch->tensor_map.sync_tensormap(ring_id, sm_last_task_alive);
+
+    if (sched) {
+        orch->rings[ring_id].dep_pool.reclaim(sched, ring_id, sm_last_task_alive);
+    }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, -1);
 
@@ -427,8 +411,7 @@ void pto2_submit_mixed_task(
     int32_t local_id = task_ring.pto2_task_ring_alloc();
     if (local_id < 0) { orch->fatal = true; return; }
     int32_t slot = task_ring.get_task_slot(local_id);
-    PTO2TaskId mixed_task_id =
-        pto2_make_task_id(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id));
+    PTO2TaskId mixed_task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
 
     PTO2TaskDescriptor& task = task_ring.get_task_by_slot(slot);
     PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[ring_id][slot];
@@ -444,21 +427,11 @@ void pto2_submit_mixed_task(
     for (int32_t j = 0; j < params.scalar_count; j += 8) {
         __builtin_prefetch(&payload->scalars[j], 1, 3);
     }
-    // Metadata area: tensor_count, scalar_count, fanin_slot_states[] — all in first 3 CLs
     __builtin_prefetch(payload, 1, 3);
     __builtin_prefetch(reinterpret_cast<char*>(payload) + 64, 1, 3);
     __builtin_prefetch(reinterpret_cast<char*>(payload) + 128, 1, 3);
 
-    // Initialize mixed-task descriptor
-    task.mixed_task_id = mixed_task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
-    task.packed_buffer_base = NULL;
-    task.packed_buffer_end = NULL;
-
     // Initialize slot state (scheduler-private)
-    PTO2SchedulerState* sched = orch->scheduler;
     if (sched) {
         auto& rs = sched->ring_sched_states[ring_id];
         PTO2TaskSlotState& slot_state = rs.get_slot_state_by_slot(slot);
@@ -473,7 +446,7 @@ void pto2_submit_mixed_task(
         slot_state.task = &task;
         slot_state.active_mask = active_mask;
         slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
-        slot_state.ring_id = static_cast<uint8_t>(ring_id);
+        slot_state.ring_id = ring_id;
         scope_tasks_push(orch, &slot_state);
     } else {
         scope_tasks_push(orch, nullptr);
@@ -496,10 +469,12 @@ void pto2_submit_mixed_task(
         }
     }
 
+    void* local_packed_base = nullptr;
+    void* local_packed_end = nullptr;
     if (total_output_size > 0) {
-        task.packed_buffer_base = orch->pto2_alloc_packed_buffer(total_output_size);
-        if (!task.packed_buffer_base) { orch->fatal = true; return; }
-        task.packed_buffer_end = (char*)task.packed_buffer_base + total_output_size;
+        local_packed_base = orch->pto2_alloc_packed_buffer(total_output_size);
+        if (!local_packed_base) { orch->fatal = true; return; }
+        local_packed_end = (char*)local_packed_base + total_output_size;
     }
     CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP, local_id);
 #if PTO2_ORCH_PROFILING
@@ -559,7 +534,7 @@ void pto2_submit_mixed_task(
             case PTOParamType::OUTPUT: {
                 Tensor& tensor = *params.tensors[i];
                 if (tensor.buffer.addr == 0) {
-                    uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)task.packed_buffer_base + offset);
+                    uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)local_packed_base + offset);
                     tensor.buffer.addr = alloc_addr;
                     offset += PTO2_ALIGN_UP(tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
                 }
@@ -582,6 +557,16 @@ void pto2_submit_mixed_task(
 
     CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT, local_id);
 
+    // === Batch-write task descriptor to GM (single cache line burst) ===
+    // Deferred from allocation phase to avoid scattered GM writes that get
+    // evicted by TensorMap lookup/insert cache pressure.
+    __builtin_prefetch(&task, 1, 1);
+    task.mixed_task_id = mixed_task_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
+    task.packed_buffer_base = local_packed_base;
+    task.packed_buffer_end = local_packed_end;
 
     // Prefetch producer slot_states and cur_slot_state (written at init but likely
     // evicted by lookup/insert/heap). param_copy below provides hide time.
@@ -657,6 +642,8 @@ void pto2_submit_mixed_task(
             PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
             sched->ready_queues[static_cast<int32_t>(shape)].push(&cur_slot_state);
         }
+        // Record dep pool watermark in local slot state (used by tail reclamation)
+        cur_slot_state.dep_pool_mark = orch->rings[ring_id].dep_pool.top;
 #if PTO2_ORCH_PROFILING
         // Per producer: fetch_add(fanout_count) + load(task_state) + store(unlock) = 3 atomics
         // Lock atomics (loads + CAS) are counted inside pto2_fanout_lock
@@ -666,9 +653,6 @@ void pto2_submit_mixed_task(
         }
 #endif
     }
-
-    // Record dep pool watermark for this task (used by tail reclamation)
-    payload->dep_pool_mark = orch->rings[ring_id].dep_pool.top;
 
     CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN, local_id);
 

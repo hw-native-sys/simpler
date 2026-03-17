@@ -198,6 +198,9 @@ struct PTO2TensorMap {
     // Per-ring validity threshold (for lazy invalidation)
     int32_t last_task_alives[PTO2_MAX_RING_DEPTH];  // Cached from shared memory per ring
 
+    // Per-ring cleanup progress (for periodic cleanup_retired)
+    int32_t last_cleanup[PTO2_MAX_RING_DEPTH]{};
+
     PTO2OrchestratorState* orch{nullptr};
 
     // new_entry目前不负责分配属性，仅分配内存
@@ -500,7 +503,7 @@ struct PTO2TensorMap {
      * Called periodically to refresh the lazy invalidation threshold.
      * Also triggers cleanup if threshold has advanced significantly.
      */
-    void sync_tensormap();
+    void sync_tensormap(uint8_t ring_id, int32_t sm_last_task_alive);
 };
 
 #if PTO2_TENSORMAP_PROFILING

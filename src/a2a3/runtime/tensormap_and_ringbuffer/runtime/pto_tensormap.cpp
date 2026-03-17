@@ -115,6 +115,7 @@ bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, const i
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         last_task_alives[r] = 0;
+        last_cleanup[r] = 0;
     }
 
     return true;
@@ -220,27 +221,13 @@ int32_t PTO2TensorMap::valid_count() {
     return count;
 }
 
-void PTO2TensorMap::sync_tensormap() {
-    constexpr int MIN_FREE_NUM = 1024;
-    always_assert(orch != nullptr);
-    while(true) {
-        bool did_cleanup = false;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            // Read current last_task_alive from shared memory for this ring
-            int32_t new_last_task_alive =
-                orch->sm_handle->header->rings[r].fc.last_task_alive.load(std::memory_order_acquire);
-            sync_validity(r, new_last_task_alive);
-            // Only attempt cleanup when last_task_alive has actually advanced;
-            // otherwise cleanup_retired would empty-loop and we'd spin forever.
-            if (new_last_task_alive <= orch->tensormap_last_cleanup[r]) continue;
-            if ((pool_size - next_entry_idx + free_num < MIN_FREE_NUM) ||
-                new_last_task_alive - orch->tensormap_last_cleanup[r] >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
-                cleanup_retired(r, orch->tensormap_last_cleanup[r], new_last_task_alive);
-                orch->tensormap_last_cleanup[r] = new_last_task_alive;
-                did_cleanup = true;
-            }
-        }
-        if (!did_cleanup) break;
+void PTO2TensorMap::sync_tensormap(uint8_t ring_id, int32_t sm_last_task_alive) {
+    sync_validity(ring_id, sm_last_task_alive);
+    // Only attempt cleanup when last_task_alive has actually advanced;
+    // otherwise cleanup_retired would empty-loop and we'd spin forever.
+    if (sm_last_task_alive - last_cleanup[ring_id] >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
+        cleanup_retired(ring_id, last_cleanup[ring_id], sm_last_task_alive);
+        last_cleanup[ring_id] = sm_last_task_alive;
     }
 }
 

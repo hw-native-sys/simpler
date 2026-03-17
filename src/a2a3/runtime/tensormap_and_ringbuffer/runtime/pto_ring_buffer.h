@@ -32,6 +32,8 @@
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
 
+struct PTO2SchedulerState;  // Forward declaration for dep_pool reclaim
+
 // Set to 1 to enable periodic BLOCKED/Unblocked messages during spin-wait.
 #ifndef PTO2_SPIN_VERBOSE_LOGGING
 #define PTO2_SPIN_VERBOSE_LOGGING 1
@@ -468,9 +470,20 @@ struct PTO2DepListPool {
     int32_t top;              // Linear next-allocation counter (starts from 1)
     int32_t tail;             // Linear first-alive counter (entries before this are dead)
     int32_t high_water;       // Peak concurrent usage (top - tail)
+    int32_t last_reclaimed{0}; // last_task_alive at last successful reclamation
 
     // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
     std::atomic<int32_t>* error_code_ptr = nullptr;
+
+    /**
+     * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
+     * Safe to call multiple times — only advances tail forward.
+     *
+     * @param sched              Scheduler state (for reading slot dep_pool_mark)
+     * @param ring_id            Ring layer index
+     * @param sm_last_task_alive Current last_task_alive from shared memory
+     */
+    void reclaim(PTO2SchedulerState* sched, uint8_t ring_id, int32_t sm_last_task_alive);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)

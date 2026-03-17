@@ -42,11 +42,9 @@ struct PTO2OrchestratorState {
     // === PER-RING RESOURCES ===
     PTO2RingSet rings[PTO2_MAX_RING_DEPTH];
     PTO2DepListEntry* dep_pool_cur_entries[PTO2_MAX_RING_DEPTH];
-    int32_t dep_pool_last_reclaimed[PTO2_MAX_RING_DEPTH];
 
     // === TENSOR MAP (Private) ===
     PTO2TensorMap tensor_map;        // Producer lookup
-    int32_t tensormap_last_cleanup[PTO2_MAX_RING_DEPTH];
 
     // === SCOPE STACK (Private) ===
     // Single contiguous buffer of task IDs, partitioned by scope level.
@@ -88,10 +86,10 @@ struct PTO2OrchestratorState {
      * Get current ring index from scope depth.
      * Maps scope depth to ring_id: min(scope_depth, PTO2_MAX_RING_DEPTH - 1)
      */
-    int32_t current_ring_id() const {
+    uint8_t current_ring_id() const {
         int32_t depth = scope_stack_top;
         if (depth < 0) depth = 0;
-        return depth < PTO2_MAX_RING_DEPTH ? depth : PTO2_MAX_RING_DEPTH - 1;
+        return depth < PTO2_MAX_RING_DEPTH ? static_cast<uint8_t>(depth) : PTO2_MAX_RING_DEPTH - 1;
     }
 
     /**
@@ -102,7 +100,7 @@ struct PTO2OrchestratorState {
             return NULL;
         }
 
-        int32_t rid = current_ring_id();
+        uint8_t rid = current_ring_id();
         void* buffer = rings[rid].heap_ring.pto2_heap_ring_alloc(total_size);
 
 #if PTO2_PROFILING

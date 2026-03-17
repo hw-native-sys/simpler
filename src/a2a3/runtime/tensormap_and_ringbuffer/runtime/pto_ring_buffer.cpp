@@ -12,6 +12,7 @@
 #include <string.h>
 #include <stdlib.h>  // for exit()
 #include "common/unified_log.h"
+#include "pto_scheduler.h"
 
 // =============================================================================
 // Heap Ring Buffer Implementation
@@ -49,10 +50,21 @@ void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t c
     pool->top = 1;  // Start from 1, 0 means NULL/empty
     pool->tail = 1; // Match initial top (no reclaimable entries yet)
     pool->high_water = 0;
+    pool->last_reclaimed = 0;
 
     // Initialize entry 0 as NULL marker
     pool->base[0].slot_state = nullptr;
     pool->base[0].next = nullptr;
+}
+
+void PTO2DepListPool::reclaim(PTO2SchedulerState* sched, uint8_t ring_id, int32_t sm_last_task_alive) {
+    if (sm_last_task_alive >= last_reclaimed + PTO2_DEP_POOL_CLEANUP_INTERVAL && sm_last_task_alive > 0) {
+        int32_t mark = sched->ring_sched_states[ring_id].get_slot_state_by_task_id(sm_last_task_alive - 1).dep_pool_mark;
+        if (mark > 0) {
+            advance_tail(mark);
+        }
+        last_reclaimed = sm_last_task_alive;
+    }
 }
 
 int32_t pto2_dep_pool_used(PTO2DepListPool* pool) {

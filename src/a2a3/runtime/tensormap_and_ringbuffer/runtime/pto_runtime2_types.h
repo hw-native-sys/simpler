@@ -103,6 +103,7 @@
 
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
+#define PTO2_DEP_POOL_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 
 // =============================================================================
 // Multi-Ring task_id Encoding
@@ -366,7 +367,7 @@ struct PTO2TaskPayload {
     int32_t tensor_count{0};
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
-    int32_t dep_pool_mark{0};                  // Dep pool top after this task's submission (for reclamation)
+    int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
     // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
@@ -425,6 +426,7 @@ struct alignas(64) PTO2TaskSlotState {
     uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
     std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
     uint8_t ring_id;                             // Ring layer this task belongs to (for per-ring reclamation)
+    int32_t dep_pool_mark{0};                    // Dep pool top after this task's submission (orchestrator-only, local memory)
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);
