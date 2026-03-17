@@ -131,6 +131,13 @@ struct alignas(64) Tensor {
     }
 
     void init(const Tensor& other) {
+        // Fast path: both flags true → copy only cache line 1 (64 bytes), skip CL2 entirely.
+        // Single memcpy compiles to 4 LDP/STP pairs on aarch64 — zero branches, zero loops.
+        if (other.is_all_offset_zero && other.is_raw_eq_shapes) {
+            memcpy(this, &other, 64);
+            return;
+        }
+        // Slow path: selective field copy with conditional CL2 access
         buffer = other.buffer;
         start_offset = other.start_offset;
         version = other.version;

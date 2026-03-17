@@ -362,17 +362,36 @@ struct PTO2TaskDescriptor {
 /**
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
- * Tensors and scalars are stored in separate compact arrays.
- * Dispatch order: tensor args first, then scalar args.
+ * Layout: metadata (counts, fanin pointers) packed in the first 3 cache lines,
+ * followed by bulk tensor and scalar data. This gives sequential write access
+ * during orchestration and groups scheduler-hot fields (fanin_actual_count +
+ * fanin_slot_states) together for on_task_release.
  */
 struct PTO2TaskPayload {
-    Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
-    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
+    // === Cache line 0 (64B) — metadata ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (cold path, used by on_task_release)
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
     int32_t dep_pool_mark{0};                  // Dep pool top after this task's submission (for reclamation)
+    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
+    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
+    Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
+    // === Cache lines 35-50 (1024B) — scalars ===
+    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
+
+    __attribute__((noinline))
+    void init(const PTOParam& params) {
+        tensor_count = params.tensor_count;
+        scalar_count = params.scalar_count;
+        auto src_tensors = params.tensors;
+        for (int32_t i = 0; i < params.tensor_count; i++) {
+            tensors[i].copy(*src_tensors[i]);
+        }
+        auto src_scalars = params.scalars;
+        for (int32_t i = 0; i < params.scalar_count; i++) {
+            scalars[i] = src_scalars[i];
+        }
+    }
 };
 
 /**

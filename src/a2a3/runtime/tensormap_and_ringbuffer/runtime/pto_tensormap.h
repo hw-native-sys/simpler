@@ -58,25 +58,98 @@ extern uint64_t g_insert_count;
 // =============================================================================
 
 /**
- * TensorMap entry structure
- * Maps tensor region -> producer task ID
+ * TensorMap entry structure — cache-line optimized for lookup
  *
- * Stored in ring buffer pool with lazy invalidation:
- * - Entry is valid only if local_id >= last_task_alives[ring_id]
- * - Stale entries skipped during lookup
- * - Pool wraps around, overwriting stale entries
+ * Cache line 1 (64B, lookup hot path):
+ *   next_in_bucket, producer_task_id, buffer_addr — chain traversal + validity + hash match
+ *   version, ndims, is_all_offset_zero, with_alloc, bucket_index — overlap fast path
+ *   shapes[5] — overlap comparison
+ *
+ * Cache line 2 (64B, insert/remove/slow-path only):
+ *   prev_in_bucket, next_in_task, prev_in_task — chain manipulation
+ *   offsets[5] — only read when !is_all_offset_zero
+ *
+ * When is_all_offset_zero is true, lookup touches only cache line 1.
+ * Entry size: 128B (2 cache lines) vs previous 192B (3 cache lines with embedded Tensor).
  */
-struct PTO2TensorMapEntry {
-    bool with_alloc{true};     // True if entry is task output, False if entry is task inout
-    PTO2TaskId producer_task_id;  // raw: (ring_id << 32) | local_id
-    PTO2TensorMapEntry* next_in_bucket;    // Offset to next entry in hash bucket (-1 = end)
-    PTO2TensorMapEntry* prev_in_bucket;    // Offset to prev entry in hash bucket (-1 = head is buckets[bucket])
-    PTO2TensorMapEntry* next_in_task;      // Offset to next entry for same task (-1 = end)
-    PTO2TensorMapEntry* prev_in_task;      // Offset to prev entry for same task (-1 = head is task_entry_head[slot])
-    int32_t bucket_index;      // != -1 if entry is linked in a bucket chain
-                               // CRITICAL: Must be set -1 before overwriting!
-    Tensor tensor;             // Tensor descriptor key
+struct alignas(64) PTO2TensorMapEntry {
+    // === Cache line 1 (64B) — lookup hot path ===
+    PTO2TensorMapEntry* next_in_bucket;    // 8B: next entry in hash bucket chain
+    PTO2TaskId producer_task_id;           // 8B: raw (ring_id << 32) | local_id
+    uint64_t buffer_addr;                  // 8B: tensor base address (hash key)
+    int32_t version;                       // 4B: tensor version for overlap detection
+    uint32_t ndims;                        // 4B: number of dimensions
+    int32_t bucket_index;                  // 4B: bucket index (-1 if unlinked)
+    bool is_all_offset_zero;               // 1B: fast-path flag
+    bool with_alloc;                       // 1B: true=OUTPUT, false=INOUT
+    // padding: 2B
+    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS]; // 20B: shape per dimension
+    // padding: 4B to fill 64B
+
+    // === Cache line 2 (64B) — insert/remove/slow-path ===
+    PTO2TensorMapEntry* prev_in_bucket;    // 8B: prev in hash bucket chain
+    PTO2TensorMapEntry* next_in_task;      // 8B: next entry for same task
+    PTO2TensorMapEntry* prev_in_task;      // 8B: prev entry for same task
+    uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS]; // 20B: only when !is_all_offset_zero
+    // padding: 20B to fill 64B
+
+    /**
+     * Copy overlap-relevant fields from a Tensor into this entry.
+     */
+    void copy_from_tensor(const Tensor& t) {
+        buffer_addr = t.buffer.addr;
+        version = t.version;
+        ndims = t.ndims;
+        is_all_offset_zero = t.is_all_offset_zero;
+        for (uint32_t i = 0; i < t.ndims; i++) {
+            shapes[i] = t.shapes[i];
+        }
+        if (!t.is_all_offset_zero) {
+            for (uint32_t i = 0; i < t.ndims; i++) {
+                offsets[i] = t.offsets[i];
+            }
+        }
+    }
+
+    /**
+     * Check overlap between input tensor and this entry (the producer output).
+     * Mirrors Tensor::is_overlap() logic but operates on entry fields directly.
+     */
+    OverlapStatus check_overlap(const Tensor& input) const {
+        debug_assert(input.buffer.addr == buffer_addr);
+        debug_assert(input.version >= version);
+        if (input.version > version) {
+            return OverlapStatus::OTHER;
+        }
+        // Fast path: both have zero offsets → ranges are [0, shape[i])
+        if (input.is_all_offset_zero && is_all_offset_zero) {
+            bool contains = true;
+            for (uint32_t i = 0; i < ndims; i++) {
+                if (input.shapes[i] < shapes[i]) {
+                    contains = false;
+                    break;
+                }
+            }
+            return contains ? OverlapStatus::COVERED : OverlapStatus::OTHER;
+        }
+        // Slow path: at least one has non-zero offsets
+        bool contains = true;
+        for (uint32_t i = 0; i < ndims; i++) {
+            uint64_t in_off = input.is_all_offset_zero ? 0 : input.offsets[i];
+            uint64_t ent_off = is_all_offset_zero ? 0 : offsets[i];
+            Segment in_range{in_off, in_off + (uint64_t)input.shapes[i]};
+            Segment ent_range{ent_off, ent_off + (uint64_t)shapes[i]};
+            if (!in_range.line_segment_intersection(ent_range)) {
+                return OverlapStatus::NO_OVERLAP;
+            } else if (!in_range.contains(ent_range)) {
+                contains = false;
+            }
+        }
+        return contains ? OverlapStatus::COVERED : OverlapStatus::OTHER;
+    }
 };
+
+static_assert(sizeof(PTO2TensorMapEntry) == 128, "TensorMapEntry must be exactly 2 cache lines (128 bytes)");
 
 /**
  * Stack-allocated lookup result (avoids heap allocation per lookup)
@@ -157,9 +230,6 @@ struct PTO2TensorMap {
             entry.next_in_bucket->prev_in_bucket = entry.prev_in_bucket;
         }
 
-        // Clear tensor AFTER bucket chain manipulation (hash computation needs valid tensor)
-        entry.tensor = Tensor();
-
         free_entry_list[free_num++] = &entry;
         entry.bucket_index = -1;
         entry.next_in_bucket = nullptr;
@@ -226,6 +296,7 @@ struct PTO2TensorMap {
             // entry_valid() + is_overlap() computation provides hide time.
             PTO2TensorMapEntry* next_entry = cur_entry->next_in_bucket;
             if (next_entry) __builtin_prefetch(next_entry, 0, 0);
+
 #if PTO2_TENSORMAP_PROFILING
             chain_len++;
 #endif
@@ -240,11 +311,17 @@ struct PTO2TensorMap {
             // Entry is valid - check if regions OVERLAP (not just exact match)
             // Since we hash only by base_ptr, all entries in this bucket have
             // potential to overlap. We must check actual byte-range overlap.
-            if (tensor.buffer.addr == cur_entry->tensor.buffer.addr) {
+            if (tensor.buffer.addr == cur_entry->buffer_addr) {
+                // Double prefetch: check_overlap provides enough hide time
+                // to also warm up the entry after next.
+                if (next_entry) {
+                    PTO2TensorMapEntry* next_next = next_entry->next_in_bucket;
+                    if (next_next) __builtin_prefetch(next_next, 0, 0);
+                }
 #if PTO2_TENSORMAP_PROFILING
                 g_lookup_overlap_checks++;
 #endif
-                auto overlap_status = tensor.is_overlap(cur_entry->tensor);
+                auto overlap_status = cur_entry->check_overlap(tensor);
                 if (overlap_status != OverlapStatus::NO_OVERLAP) {
                     result.push(cur_entry, overlap_status);
 #if PTO2_TENSORMAP_PROFILING
@@ -288,7 +365,7 @@ struct PTO2TensorMap {
         PTO2TensorMapEntry* entry = new_entry();
 
         // Initialize new entry
-        entry->tensor.copy(tensor);
+        entry->copy_from_tensor(tensor);
         entry->producer_task_id = producer_task_id;
         entry->with_alloc = with_alloc;
 
