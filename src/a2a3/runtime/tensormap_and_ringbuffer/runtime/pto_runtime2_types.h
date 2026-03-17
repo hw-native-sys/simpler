@@ -21,7 +21,6 @@
 
 #include "pto_types.h"
 #include "pto_submit_types.h"
-#include "pto2_dispatch_payload.h"
 
 // =============================================================================
 // Profiling Configuration
@@ -90,7 +89,8 @@
 #define PTO2_TENSORMAP_NUM_BUCKETS 65536    // Power of 2 for fast hash
 
 // Task parameters
-#define PTO2_MAX_PARAMS           128     // Maximum parameters per task (tensors + scalars)
+#define PTO2_MAX_TENSOR_PARAMS    16      // Maximum tensor parameters per task
+#define PTO2_MAX_SCALAR_PARAMS    128     // Maximum scalar parameters per task
 #define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
 #define PTO2_MAX_INPUTS           16      // Maximum inputs per task
 #define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
@@ -362,15 +362,14 @@ struct PTO2TaskDescriptor {
 /**
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
- * Separated from PTO2TaskDescriptor to keep the descriptor cache-friendly
- * for the scheduler's hot completion path (~80 bytes vs ~2912 bytes).
+ * Tensors and scalars are stored in separate compact arrays.
+ * Dispatch order: tensor args first, then scalar args.
  */
 struct PTO2TaskPayload {
-    PTO2DispatchPayload dispatch;  // function_bin_addr + args[], built in-place at dispatch time
-    Tensor tensors[PTO2_MAX_PARAMS];
-    uint64_t scalar_value[PTO2_MAX_PARAMS];
-    bool is_tensor[PTO2_MAX_PARAMS];
-    int param_count{0};
+    Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
+    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
+    int32_t tensor_count{0};
+    int32_t scalar_count{0};
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (cold path, used by on_task_release)
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
     int32_t dep_pool_mark{0};                  // Dep pool top after this task's submission (for reclamation)

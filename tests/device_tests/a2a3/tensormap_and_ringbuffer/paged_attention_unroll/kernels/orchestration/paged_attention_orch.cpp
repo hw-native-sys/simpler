@@ -127,9 +127,26 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
     CYCLE_COUNT_LAP(prof_ext_tensor);
 
+    // Prefetch first batch's block table data into cache (4 cache lines = 256 bytes)
+    for (int cl = 0; cl < N_UNROLL * (int)sizeof(int); cl += 64) {
+        __builtin_prefetch(reinterpret_cast<char*>(host_block_table) + cl, 0, 3);
+    }
+    __builtin_prefetch(&host_context_lens[0], 0, 3);
+
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint64_t cur_seq = host_context_lens[b_idx];
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
+        // Pre-compute block table base pointer for this batch
+        int* bt_base = host_block_table + b_idx * block_num;
+
+        // Prefetch next batch's block table + context_lens while processing current batch
+        if (b_idx + 1 < batch) {
+            int* bt_next = host_block_table + (b_idx + 1) * block_num;
+            for (int cl = 0; cl < N_UNROLL * (int)sizeof(int); cl += 64) {
+                __builtin_prefetch(reinterpret_cast<char*>(bt_next) + cl, 0, 3);
+            }
+            __builtin_prefetch(&host_context_lens[b_idx + 1], 0, 3);
+        }
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
             PTO2_SCOPE(rt) {
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
@@ -153,29 +170,27 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);
 
-                PTOParam params_inplace[] = {
-                    make_output_param(oi),
-                    make_output_param(li_update),
-                    make_output_param(mi_update),
-                };
+                PTOParam params_inplace;
+                params_inplace.add_output(oi);
+                params_inplace.add_output(li_update);
+                params_inplace.add_output(mi_update);
                 CYCLE_COUNT_LAP(prof_param_setup);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace, 3);
+                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace);
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
+
+                // Reusable PTOParam objects — reset() before each use avoids
+                // repeated stack-frame construction in the inner loop.
+                // params_qk must persist until params_pv.copy_scalars_from().
+                PTOParam params_qk, params_sf, params_pv, params_up;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
                     uint64_t n_blocks = std::min((uint64_t)N_UNROLL, bn_this_batch - bn);
 
-                    // Prepare block indices for this group
-                    uint64_t block_indices[N_UNROLL] = {};
-                    for (uint64_t i = 0; i < n_blocks; i++) {
-                        block_indices[i] = host_block_table[b_idx * block_num + bn + i];
-                    }
-                    CYCLE_COUNT_LAP(prof_param_extract);
-
                     // Valid length for last block in this group
                     uint64_t last_block_seq_start = (bn + n_blocks - 1) * block_size;
                     uint64_t valid_len_last = std::min(block_size, cur_seq - last_block_seq_start);
+                    CYCLE_COUNT_LAP(prof_param_extract);
 
                     // === Task 1: Batched QK matmul ===
                     uint32_t sij_buf_shapes[2] = {(uint32_t)q_tile, (uint32_t)(n_blocks * block_size)};
@@ -183,15 +198,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
 
-                    PTOParam params_qk[4 + N_UNROLL];
-                    params_qk[0] = make_input_param(qi);
-                    params_qk[1] = make_input_param(key_cache);
-                    params_qk[2] = make_output_param(sij_buf);
-                    params_qk[3] = make_scalar_param(n_blocks);
-                    for (int i = 0; i < N_UNROLL; i++)
-                        params_qk[4 + i] = make_scalar_param(block_indices[i]);
+                    params_qk.reset();
+                    params_qk.add_input(qi);
+                    params_qk.add_input(key_cache);
+                    params_qk.add_output(sij_buf);
+                    params_qk.add_scalar(n_blocks);
+                    params_qk.add_scalars_i32(bt_base + bn, N_UNROLL);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk, 4 + N_UNROLL);
+                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -203,17 +217,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     prof_make_count += 3;
                     CYCLE_COUNT_LAP(prof_make_tensor);
 
-                    PTOParam params_sf[] = {
-                        make_input_param(sij_buf),
-                        make_scalar_param(float_to_u64(scale_value)),
-                        make_output_param(pij_buf),
-                        make_output_param(mi),
-                        make_output_param(li),
-                        make_scalar_param(n_blocks),
-                        make_scalar_param(valid_len_last),
-                    };
+                    params_sf.reset();
+                    params_sf.add_input(sij_buf);
+                    params_sf.add_output(pij_buf);
+                    params_sf.add_output(mi);
+                    params_sf.add_output(li);
+                    params_sf.add_scalar(float_to_u64(scale_value));
+                    params_sf.add_scalar(n_blocks);
+                    params_sf.add_scalar(valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf, 7);
+                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -223,15 +236,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
 
-                    PTOParam params_pv[4 + N_UNROLL];
-                    params_pv[0] = make_input_param(pij_buf);
-                    params_pv[1] = make_input_param(value_cache);
-                    params_pv[2] = make_output_param(oi_new);
-                    params_pv[3] = make_scalar_param(n_blocks);
-                    for (int i = 0; i < N_UNROLL; i++)
-                        params_pv[4 + i] = make_scalar_param(block_indices[i]);
+                    params_pv.reset();
+                    params_pv.add_input(pij_buf);
+                    params_pv.add_input(value_cache);
+                    params_pv.add_output(oi_new);
+                    params_pv.add_scalar(n_blocks);
+                    params_pv.copy_scalars_from(params_qk, 1, N_UNROLL);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv, 4 + N_UNROLL);
+                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -240,19 +252,18 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
                     CYCLE_COUNT_LAP(prof_param_extract);
 
-                    PTOParam params_up[] = {
-                        make_input_param(mi),
-                        make_input_param(li),
-                        make_input_param(oi_new),
-                        make_inout_param(mi_update),
-                        make_inout_param(li_update),
-                        make_inout_param(oi),
-                        make_output_param(out_view),
-                        make_scalar_param(is_first),
-                        make_scalar_param(is_last),
-                    };
+                    params_up.reset();
+                    params_up.add_input(mi);
+                    params_up.add_input(li);
+                    params_up.add_input(oi_new);
+                    params_up.add_inout(mi_update);
+                    params_up.add_inout(li_update);
+                    params_up.add_inout(oi);
+                    params_up.add_output(out_view);
+                    params_up.add_scalar(is_first);
+                    params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up, 9);
+                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
                 }

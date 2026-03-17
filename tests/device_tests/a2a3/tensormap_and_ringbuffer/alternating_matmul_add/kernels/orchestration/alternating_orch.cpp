@@ -117,12 +117,11 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             Tensor B_view = ext_B.view(matmul_group_shapes, view_offsets);
             Tensor C_view = ext_C.view(matmul_group_shapes, view_offsets);
 
-            PTOParam params_matmul[] = {
-                make_input_param(A_view),
-                make_input_param(B_view),
-                make_output_param(C_view),
-            };
-            pto2_rt_submit_aic_task(rt, FUNC_MATMUL, params_matmul, 3);
+            PTOParam params_matmul;
+            params_matmul.add_input(A_view);
+            params_matmul.add_input(B_view);
+            params_matmul.add_output(C_view);
+            pto2_rt_submit_aic_task(rt, FUNC_MATMUL, params_matmul);
             total_matmul++;
         }
 
@@ -138,12 +137,11 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             Tensor Y_view = ext_Y.view(add_group_shapes, view_offsets);
             Tensor Z_view = ext_Z.view(add_group_shapes, view_offsets);
 
-            PTOParam params_add[] = {
-                make_input_param(X_view),
-                make_input_param(Y_view),
-                make_output_param(Z_view),
-            };
-            pto2_rt_submit_aiv_task(rt, FUNC_ADD, params_add, 3);
+            PTOParam params_add;
+            params_add.add_input(X_view);
+            params_add.add_input(Y_view);
+            params_add.add_output(Z_view);
+            pto2_rt_submit_aiv_task(rt, FUNC_ADD, params_add);
             total_add++;
         }
     }

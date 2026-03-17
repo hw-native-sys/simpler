@@ -222,6 +222,10 @@ struct PTO2TensorMap {
 #endif
 
         while (cur_entry != nullptr) {
+            // Prefetch next entry to hide pointer-chasing latency.
+            // entry_valid() + is_overlap() computation provides hide time.
+            PTO2TensorMapEntry* next_entry = cur_entry->next_in_bucket;
+            if (next_entry) __builtin_prefetch(next_entry, 0, 0);
 #if PTO2_TENSORMAP_PROFILING
             chain_len++;
 #endif
@@ -229,7 +233,7 @@ struct PTO2TensorMap {
             // rings can be interleaved, so a stale entry from one ring does NOT
             // imply subsequent entries from other rings are also stale)
             if (!entry_valid(*cur_entry)) {
-                cur_entry = cur_entry->next_in_bucket;
+                cur_entry = next_entry;
                 continue;
             }
 
@@ -250,7 +254,7 @@ struct PTO2TensorMap {
             }
 
             // Move to next entry
-            cur_entry = cur_entry->next_in_bucket;
+            cur_entry = next_entry;
         }
 #if PTO2_TENSORMAP_PROFILING
         g_lookup_chain_total += chain_len;
@@ -271,17 +275,26 @@ struct PTO2TensorMap {
 #if PTO2_TENSORMAP_PROFILING
         g_insert_count++;
 #endif
+        // Prefetch bucket head and task_entry_head early; new_entry() + field
+        // initialization below provides hide time for these RFOs.
+        uint32_t bucket_index = hash(tensor.buffer.addr);
+        __builtin_prefetch(&buckets[bucket_index], 1, 0);
+        auto ring_id = producer_task_id.ring();
+        auto local_id = producer_task_id.local();
+        int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
+        __builtin_prefetch(&task_entry_heads[ring_id][task_slot], 1, 0);
+
         // Allocate entry from ring buffer pool
         PTO2TensorMapEntry* entry = new_entry();
 
         // Initialize new entry
-        entry->tensor.copy(tensor);
+        entry->tensor = tensor;
         entry->producer_task_id = producer_task_id;
         entry->with_alloc = with_alloc;
 
         // Insert at head of hash bucket (maintains task_id descending order)
-        entry->bucket_index = hash(tensor.buffer.addr);
-        entry->next_in_bucket = buckets[entry->bucket_index];
+        entry->bucket_index = bucket_index;
+        entry->next_in_bucket = buckets[bucket_index];
         // Update old head's prev pointer
         if (entry->next_in_bucket != nullptr) {
             entry->next_in_bucket->prev_in_bucket = entry;
@@ -290,9 +303,6 @@ struct PTO2TensorMap {
         entry->prev_in_bucket = nullptr;  // New head has no predecessor
 
         // Link to task's entry list (for cleanup), indexed by ring and local slot
-        int32_t ring_id = static_cast<int32_t>(pto2_task_id_ring(producer_task_id));
-        int32_t local_id = static_cast<int32_t>(pto2_task_id_local(producer_task_id));
-        int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
         entry->next_in_task = task_entry_heads[ring_id][task_slot];
         entry->prev_in_task = nullptr;  // New head has no predecessor
         // Update old head's prev pointer

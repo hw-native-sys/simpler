@@ -180,15 +180,12 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  * 6. Initializes task state in scheduler
  *
  * @param orch        Orchestrator state
- * @param kernel_id   InCore function ID
- * @param worker_type Target worker type (CUBE, VECTOR, AI_CPU, ACCELERATOR)
- * @param params      Array of task parameters
- * @param num_params  Number of parameters
+ * @param mixed_kernels  Kernel IDs for AIC/AIV0/AIV1 slots
+ * @param params      Aggregated tensor and scalar parameters
  */
 void pto2_submit_mixed_task(PTO2OrchestratorState* orch,
     const MixedKernels& mixed_kernels,
-    PTOParam* params,
-    int32_t num_params);
+    const PTOParam& params);
 
 // =============================================================================
 // Flow Control

@@ -249,18 +249,18 @@ struct AicpuExecutor {
 
     // Build slim PTO2DispatchPayload: only function_bin_addr + args.
     // Metadata (mixed_task_id, subslot, kernel_id, core_type) stays in TaskDescriptor.
+    // Dispatch order: tensor args first, then scalar args.
     void build_pto2_payload(PTO2DispatchPayload& out,
         int32_t kernel_id,
         PTO2TaskPayload& task_pl) {
         out.function_bin_addr = get_function_bin_addr(kernel_id);
         int32_t n = 0;
-        for (int32_t i = 0; i < task_pl.param_count; i++) {
-            if (!task_pl.is_tensor[i]) {
-                out.args[n++] = task_pl.scalar_value[i];
-            } else {
-                out.args[n++] = reinterpret_cast<uint64_t>(&task_pl.tensors[i]);
-                task_pl.tensors[i].update_start_offset();
-            }
+        for (int32_t i = 0; i < task_pl.tensor_count; i++) {
+            task_pl.tensors[i].update_start_offset();
+            out.args[n++] = reinterpret_cast<uint64_t>(&task_pl.tensors[i]);
+        }
+        for (int32_t i = 0; i < task_pl.scalar_count; i++) {
+            out.args[n++] = task_pl.scalars[i];
         }
     }
 

@@ -22,7 +22,7 @@
 #include <stddef.h>
 
 // Type headers needed by orchestration
-#include "pto_types.h"          // PTOParam, make_input_param, make_output_param, etc.
+#include "pto_types.h"          // PTOParam, PTOTensorEntry, PTOParamType
 #include "tensor.h"             // Tensor, make_tensor, make_tensor_external
 #include "pto_submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
 
@@ -43,7 +43,7 @@ typedef struct PTO2Runtime PTO2Runtime;
  */
 typedef struct PTO2RuntimeOps {
     void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                        PTOParam* params, int32_t num_params);
+                        const PTOParam& params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
@@ -73,28 +73,28 @@ struct PTO2Runtime {
 // =============================================================================
 
 static inline void pto2_rt_submit_task(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                                        PTOParam* params, int32_t num_params) {
-    rt->ops->submit_task(rt, mixed_kernels, params, num_params);
+                                        const PTOParam& params) {
+    rt->ops->submit_task(rt, mixed_kernels, params);
 }
 
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
 static inline void pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id,
-                                            PTOParam* params, int32_t num_params) {
+                                            const PTOParam& params) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
-    rt->ops->submit_task(rt, mk, params, num_params);
+    rt->ops->submit_task(rt, mk, params);
 }
 
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
 static inline void pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id,
-                                            PTOParam* params, int32_t num_params) {
+                                            const PTOParam& params) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
-    rt->ops->submit_task(rt, mk, params, num_params);
+    rt->ops->submit_task(rt, mk, params);
 }
 
 static inline void pto2_rt_scope_begin(PTO2Runtime* rt) {

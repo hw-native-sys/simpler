@@ -27,9 +27,9 @@ void pto2_set_orch_thread_idx(int idx) {
 // =============================================================================
 
 static void submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                             PTOParam* params, int32_t num_params) {
+                             const PTOParam& params) {
     pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
-                           params, num_params);
+                           params);
 }
 
 void pto2_rt_scope_begin(PTO2Runtime* rt) {

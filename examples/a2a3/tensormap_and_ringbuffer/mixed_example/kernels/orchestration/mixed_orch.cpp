@@ -147,38 +147,35 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 mk.aic_kernel_id = FUNC_MATMUL;
                 mk.aiv0_kernel_id = FUNC_ADD;
                 mk.aiv1_kernel_id = FUNC_MUL;
-                PTOParam params[9] = {
-                    make_input_param(ext_A),
-                    make_input_param(ext_B),
-                    make_output_param(C_view),
-                    make_input_param(ext_D),
-                    make_input_param(ext_E),
-                    make_output_param(F_view),
-                    make_input_param(ext_G),
-                    make_input_param(ext_H),
-                    make_output_param(I_view),
-                };
-                pto2_rt_submit_task(rt, mk, params, 9);
+                PTOParam params;
+                params.add_input(ext_A);
+                params.add_input(ext_B);
+                params.add_output(C_view);
+                params.add_input(ext_D);
+                params.add_input(ext_E);
+                params.add_output(F_view);
+                params.add_input(ext_G);
+                params.add_input(ext_H);
+                params.add_output(I_view);
+                pto2_rt_submit_task(rt, mk, params);
             }
 
             // 2. AIC_ONLY: standalone matmul
             {
-                PTOParam params[3] = {
-                    make_input_param(ext_A),
-                    make_input_param(ext_B),
-                    make_output_param(J_view),
-                };
-                pto2_rt_submit_aic_task(rt, FUNC_MATMUL, params, 3);
+                PTOParam params;
+                params.add_input(ext_A);
+                params.add_input(ext_B);
+                params.add_output(J_view);
+                pto2_rt_submit_aic_task(rt, FUNC_MATMUL, params);
             }
 
             // 3. AIV_X1: standalone add
             {
-                PTOParam params[3] = {
-                    make_input_param(ext_D),
-                    make_input_param(ext_E),
-                    make_output_param(K_view),
-                };
-                pto2_rt_submit_aiv_task(rt, FUNC_ADD_STANDALONE, params, 3);
+                PTOParam params;
+                params.add_input(ext_D);
+                params.add_input(ext_E);
+                params.add_output(K_view);
+                pto2_rt_submit_aiv_task(rt, FUNC_ADD_STANDALONE, params);
             }
 
             // 4. AIV_X2: add (AIV0) + mul (AIV1)
@@ -186,15 +183,14 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 MixedKernels mk;
                 mk.aiv0_kernel_id = FUNC_ADD_STANDALONE;
                 mk.aiv1_kernel_id = FUNC_MUL_STANDALONE;
-                PTOParam params[6] = {
-                    make_input_param(ext_D),
-                    make_input_param(ext_E),
-                    make_output_param(L_view),
-                    make_input_param(ext_G),
-                    make_input_param(ext_H),
-                    make_output_param(M_view),
-                };
-                pto2_rt_submit_task(rt, mk, params, 6);
+                PTOParam params;
+                params.add_input(ext_D);
+                params.add_input(ext_E);
+                params.add_output(L_view);
+                params.add_input(ext_G);
+                params.add_input(ext_H);
+                params.add_output(M_view);
+                pto2_rt_submit_task(rt, mk, params);
             }
 
             // 5. AIC_AIV_X1: matmul (AIC) + add (AIV0)
@@ -202,15 +198,14 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 MixedKernels mk;
                 mk.aic_kernel_id = FUNC_MATMUL;
                 mk.aiv0_kernel_id = FUNC_ADD;
-                PTOParam params[6] = {
-                    make_input_param(ext_A),
-                    make_input_param(ext_B),
-                    make_output_param(N_view),
-                    make_input_param(ext_D),
-                    make_input_param(ext_E),
-                    make_output_param(O_view),
-                };
-                pto2_rt_submit_task(rt, mk, params, 6);
+                PTOParam params;
+                params.add_input(ext_A);
+                params.add_input(ext_B);
+                params.add_output(N_view);
+                params.add_input(ext_D);
+                params.add_input(ext_E);
+                params.add_output(O_view);
+                pto2_rt_submit_task(rt, mk, params);
             }
         }
     }

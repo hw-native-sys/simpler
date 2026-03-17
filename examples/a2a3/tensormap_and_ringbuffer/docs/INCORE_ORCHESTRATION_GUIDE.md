@@ -30,7 +30,20 @@ Validate `arg_count` in `aicpu_orchestration_config` and interpret pointers as d
 1. Call `pto2_rt_init_tensor_pool(rt)` at the start of `aicpu_orchestration_entry`.
 2. Wrap orchestration in scopes with `PTO2_SCOPE(rt)` to control tensor lifetimes.
 3. Use `make_tensor_external` for input/output buffers and `make_tensor` for intermediates.
-4. Build `PTOParam` arrays with `make_input_param`, `make_output_param`, `make_inout_param`, and `make_scalar_param`.
+4. Build `PTOParam` with `add_input`, `add_output`, `add_inout` for tensors and `add_scalar` for scalars.
+   > **Constraint**: All tensor parameters (`add_input` / `add_output` / `add_inout`) **must** be added before any scalar parameters (`add_scalar` / `add_scalars`). Violating this order will trigger an assertion failure. This is because the runtime dispatches tensor arguments first in kernel args, followed by scalars, and the layout must match.
+   ```cpp
+   // Correct
+   PTOParam p;
+   p.add_input(a);
+   p.add_output(b);
+   p.add_scalar(val);    // scalars after all tensors
+
+   // Wrong — triggers assertion
+   PTOParam p;
+   p.add_scalar(val);    // scalar added too early
+   p.add_input(a);       // assertion: "scalar must add after all tensor added"
+   ```
 5. Submit tasks with one of:
    - `pto2_rt_submit_aic_task(rt, kernel_id, params, num_params)` — AIC (CUBE) task
    - `pto2_rt_submit_aiv_task(rt, kernel_id, params, num_params)` — AIV (VECTOR) task

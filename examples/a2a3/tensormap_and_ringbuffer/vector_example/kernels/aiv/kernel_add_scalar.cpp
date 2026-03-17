@@ -30,14 +30,14 @@ using namespace pto;
  * Unified signature: all arguments passed via int64_t array
  * @param args  Argument array:
  *              args[0] = src pointer (input tensor)
- *              args[1] = scalar value (as uint64_t, needs conversion to float)
- *              args[2] = out pointer (output tensor)
+ *              args[1] = out pointer (output tensor)
+ *              args[2] = scalar value (as uint64_t, needs conversion to float)
  *              args[3] = size (number of elements)
  */
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
     // Unpack arguments (Tensor* pointers from runtime)
     __gm__ Tensor* src_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* out_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ Tensor* out_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
     __gm__ float* src = reinterpret_cast<__gm__ float*>(src_tensor->buffer.addr) + src_tensor->start_offset;
     __gm__ float* out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
@@ -46,7 +46,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
         uint64_t u64;
         float f32;
     } converter;
-    converter.u64 = args[1];
+    converter.u64 = args[2];
     float scalar = converter.f32;
 
     // Configuration: float, 128, 128, 128, 128

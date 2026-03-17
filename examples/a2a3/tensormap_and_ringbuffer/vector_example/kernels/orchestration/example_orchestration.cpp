@@ -102,12 +102,11 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     Tensor c = make_tensor(inter_shapes, 1, DataType::FLOAT32);  // c = a + b
 
     // t0: c = a + b (kernel_id=0, kernel_add) [outer scope]
-    PTOParam params_t0[] = {
-        make_input_param(ext_a),
-        make_input_param(ext_b),
-        make_output_param(c),
-    };
-    pto2_rt_submit_aiv_task(rt, 0, params_t0, 3); // kernel_add
+    PTOParam params_t0;
+    params_t0.add_input(ext_a);
+    params_t0.add_input(ext_b);
+    params_t0.add_output(c);
+    pto2_rt_submit_aiv_task(rt, 0, params_t0); // kernel_add
 
     // Inner scope: owns t1, t2, t3, t4; intermediates d, e, g release on scope end.
     // c flows in from outer scope (outer-scope tensors are visible to inner scopes).
@@ -117,39 +116,35 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
         Tensor g = make_tensor(inter_shapes, 1, DataType::FLOAT32);  // g = d * e
 
         // t1: d = c + 1 (kernel_id=1, kernel_add_scalar)
-        PTOParam params_t1[] = {
-            make_input_param(c),
-            make_scalar_param(float_to_u64(1.0f)),
-            make_output_param(d),
-            make_scalar_param((uint64_t)3),
-        };
-        pto2_rt_submit_aiv_task(rt, 1, params_t1, 3); // kernel_add_scalar
+        PTOParam params_t1;
+        params_t1.add_input(c);
+        params_t1.add_output(d);
+        params_t1.add_scalar(float_to_u64(1.0f));
+        params_t1.add_scalar((uint64_t)3);
+        pto2_rt_submit_aiv_task(rt, 1, params_t1); // kernel_add_scalar
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
-        PTOParam params_t2[] = {
-            make_input_param(c),
-            make_scalar_param(float_to_u64(2.0f)),
-            make_output_param(e),
-            make_scalar_param((uint64_t)3),
-        };
-        pto2_rt_submit_aiv_task(rt, 1, params_t2, 3); // kernel_add_scalar
+        PTOParam params_t2;
+        params_t2.add_input(c);
+        params_t2.add_output(e);
+        params_t2.add_scalar(float_to_u64(2.0f));
+        params_t2.add_scalar((uint64_t)3);
+        pto2_rt_submit_aiv_task(rt, 1, params_t2); // kernel_add_scalar
 
         // t3: g = d * e (kernel_id=2, kernel_mul)
-        PTOParam params_t3[] = {
-            make_input_param(d),
-            make_input_param(e),
-            make_output_param(g),
-            make_scalar_param((uint64_t)3),
-        };
-        pto2_rt_submit_aiv_task(rt, 2, params_t3, 3); // kernel_mul
+        PTOParam params_t3;
+        params_t3.add_input(d);
+        params_t3.add_input(e);
+        params_t3.add_output(g);
+        params_t3.add_scalar((uint64_t)3);
+        pto2_rt_submit_aiv_task(rt, 2, params_t3); // kernel_mul
 
         // t4: f = g + c (kernel_id=0, kernel_add)
-        PTOParam params_t4[] = {
-            make_input_param(g),
-            make_input_param(c),
-            make_output_param(ext_f),
-        };
-        pto2_rt_submit_aiv_task(rt, 0, params_t4, 3); // kernel_add
+        PTOParam params_t4;
+        params_t4.add_input(g);
+        params_t4.add_input(c);
+        params_t4.add_output(ext_f);
+        pto2_rt_submit_aiv_task(rt, 0, params_t4); // kernel_add
     }  // inner scope ends: releases d, e, g
 }
 

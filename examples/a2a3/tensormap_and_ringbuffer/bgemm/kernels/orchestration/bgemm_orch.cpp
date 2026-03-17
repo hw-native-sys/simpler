@@ -115,21 +115,19 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         Tensor P = make_tensor(tile_shapes, 1, DataType::FLOAT32);
 
                         // P = A[m,k] @ B[k,n]
-                        PTOParam params_gemm[] = {
-                            make_input_param(A_view),
-                            make_input_param(B_view),
-                            make_output_param(P),
-                        };
+                        PTOParam params_gemm;
+                        params_gemm.add_input(A_view);
+                        params_gemm.add_input(B_view);
+                        params_gemm.add_output(P);
                         pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE,
-                                           params_gemm, 3); // gemm
+                                           params_gemm); // gemm
 
                         // C[m,n] += P
-                        PTOParam params_add[] = {
-                            make_inout_param(C_view),
-                            make_input_param(P),
-                        };
+                        PTOParam params_add;
+                        params_add.add_inout(C_view);
+                        params_add.add_input(P);
                         pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD,
-                                           params_add, 2); // add
+                                           params_add); // add
                     }
                 }
             }
