@@ -88,13 +88,6 @@
 #define PTO2_TENSORMAP_POOL_SIZE   (65536)   // TensorMap entry pool
 #define PTO2_TENSORMAP_NUM_BUCKETS 65536    // Power of 2 for fast hash
 
-// Task parameters
-#define PTO2_MAX_TENSOR_PARAMS    16      // Maximum tensor parameters per task
-#define PTO2_MAX_SCALAR_PARAMS    128     // Maximum scalar parameters per task
-#define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
-#define PTO2_MAX_INPUTS           16      // Maximum inputs per task
-#define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
-
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH      64      // Maximum nesting depth
 #define PTO2_SCOPE_TASKS_INIT_CAP 65536     // Initial capacity for scope task buffer
@@ -379,7 +372,6 @@ struct PTO2TaskPayload {
     // === Cache lines 35-50 (1024B) — scalars ===
     uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
 
-    __attribute__((noinline))
     void init(const PTOParam& params) {
         tensor_count = params.tensor_count;
         scalar_count = params.scalar_count;
@@ -387,10 +379,11 @@ struct PTO2TaskPayload {
         for (int32_t i = 0; i < params.tensor_count; i++) {
             tensors[i].copy(*src_tensors[i]);
         }
-        auto src_scalars = params.scalars;
-        for (int32_t i = 0; i < params.scalar_count; i++) {
-            scalars[i] = src_scalars[i];
-        }
+        static_assert(sizeof(scalars) == sizeof(params.scalars));
+        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
+        // Eliminates branches; extra bytes within the same CL have zero additional cost.
+        memcpy(scalars, params.scalars,
+               PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
     }
 };
 

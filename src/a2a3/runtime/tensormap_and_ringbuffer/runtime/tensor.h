@@ -59,13 +59,15 @@ struct Segment {
 struct alignas(64) Tensor {
     // === Cache line 1 (64B) — hot path ===
     PTOBufferHandle buffer;                        // Underlying memory buffer (addr in bytes, size in bytes)
-    uint64_t start_offset;                         // Cached 1D element offset (precomputed from raw_shapes + offsets)
+    uint64_t start_offset;                         // Cached 1D element offset (precomputed from raw_shapes + offsets), only calc before incore, useless in orch
     int32_t version;                               // Tensor version for overlap detection
     DataType dtype;                                // Data type of tensor elements
     uint32_t ndims;                                // Number of dimensions used
     bool is_all_offset_zero;                       // True when all offsets[] are zero (skip offset read/write)
     bool is_raw_eq_shapes;                         // True when raw_shapes[] == shapes[] (skip raw_shapes read/write)
+    bool manual_dep;                               // True when dependency is managed manually (skip tensormap lookup/insert)
     uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
+    uint32_t __padding__;
 
     // === Cache line 2 (64B) — warm path ===
     uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
@@ -93,9 +95,10 @@ struct alignas(64) Tensor {
         DataType dtype,
         int32_t version,
         bool is_all_offset_zero = false,
-        bool is_raw_eq_shapes = false) {
+        bool is_raw_eq_shapes = false,
+        bool manual_dep = false) {
         init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version,
-             is_all_offset_zero, is_raw_eq_shapes);
+             is_all_offset_zero, is_raw_eq_shapes, manual_dep);
     }
 
     // --- Initialization ---
@@ -108,13 +111,15 @@ struct alignas(64) Tensor {
         DataType in_dtype,
         int32_t in_version,
         bool in_is_all_offset_zero = false,
-        bool in_is_raw_eq_shapes = false) {
+        bool in_is_raw_eq_shapes = false,
+        bool in_manual_dep = false) {
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
         ndims = in_ndims;
         dtype = in_dtype;
         version = in_version;
         is_all_offset_zero = in_is_all_offset_zero;
         is_raw_eq_shapes = in_is_raw_eq_shapes;
+        manual_dep = in_manual_dep;
         for (uint32_t i = 0; i < in_ndims; i++) {
             shapes[i] = in_shapes[i];
         }
@@ -131,23 +136,7 @@ struct alignas(64) Tensor {
     }
 
     void init(const Tensor& other) {
-        // Fast path: both flags true → copy only cache line 1 (64 bytes), skip CL2 entirely.
-        // Single memcpy compiles to 4 LDP/STP pairs on aarch64 — zero branches, zero loops.
-        if (other.is_all_offset_zero && other.is_raw_eq_shapes) {
-            memcpy(this, &other, 64);
-            return;
-        }
-        // Slow path: selective field copy with conditional CL2 access
-        buffer = other.buffer;
-        start_offset = other.start_offset;
-        version = other.version;
-        ndims = other.ndims;
-        dtype = other.dtype;
-        is_all_offset_zero = other.is_all_offset_zero;
-        is_raw_eq_shapes = other.is_raw_eq_shapes;
-        for (uint32_t i = 0; i < ndims; i++) {
-            shapes[i] = other.shapes[i];
-        }
+        memcpy(this, &other, 64); // fast copy cache line 1
         if (!other.is_raw_eq_shapes) {
             for (uint32_t i = 0; i < ndims; i++) {
                 raw_shapes[i] = other.raw_shapes[i];
@@ -160,11 +149,12 @@ struct alignas(64) Tensor {
         }
     }
 
-    void init_with_view(const Tensor& other, const uint32_t view_shapes[], const uint32_t view_offsets[]) {
+    void init_with_view(const Tensor& other, const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) {
         buffer = other.buffer;
         ndims = other.ndims;
         dtype = other.dtype;
         version = other.version;
+        manual_dep = in_manual_dep;
         // view always diverges shapes from raw_shapes, so is_raw_eq_shapes = false.
         // Read parent's effective raw_shapes (avoids parent cache line 2 when parent is_raw_eq_shapes).
         is_raw_eq_shapes = false;
@@ -213,9 +203,9 @@ struct alignas(64) Tensor {
         init(other);
     }
 
-    Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[]) const {
+    Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool manual_dep = false) const {
         Tensor result;
-        result.init_with_view(*this, view_shapes, view_offsets);
+        result.init_with_view(*this, view_shapes, view_offsets, manual_dep);
         return result;
     }
 
@@ -240,7 +230,7 @@ struct alignas(64) Tensor {
         return x == y;
     }
 
-    Tensor reshape(const uint32_t new_shapes[], uint32_t new_ndims) const {
+    Tensor reshape(const uint32_t new_shapes[], uint32_t new_ndims, bool manual_dep = false) const {
         debug_assert(valid_reshape(new_shapes, new_ndims));
         always_assert(is_contiguous());
         Tensor result;
@@ -248,6 +238,7 @@ struct alignas(64) Tensor {
         result.ndims = new_ndims;
         result.is_all_offset_zero = true;
         result.is_raw_eq_shapes = true;
+        result.manual_dep = manual_dep;
         for (uint32_t i = 0; i < new_ndims; i++) {
             result.shapes[i] = new_shapes[i];
         }
@@ -256,10 +247,11 @@ struct alignas(64) Tensor {
 
     bool valid_transpose(uint32_t x, uint32_t y) const { return x < ndims && y < ndims; }
 
-    Tensor transpose(uint32_t x, uint32_t y) const {
+    Tensor transpose(uint32_t x, uint32_t y, bool manual_dep = false) const {
         debug_assert(valid_transpose(x, y));
         Tensor result;
         result.copy(*this);
+        result.manual_dep = manual_dep;
         // transpose swaps the same dims in both arrays, so equality is preserved
         std::swap(result.shapes[x], result.shapes[y]);
         if (!result.is_raw_eq_shapes) {
@@ -283,44 +275,6 @@ struct alignas(64) Tensor {
     }
 
     bool is_same_memref(const Tensor& other) const { return buffer.addr == other.buffer.addr; }
-
-    OverlapStatus is_overlap(const Tensor& pre_task_output) const {
-        debug_assert(is_same_memref(pre_task_output));
-        debug_assert(version >= pre_task_output.version);
-        if (version > pre_task_output.version) {
-            return OverlapStatus::OTHER;
-        }
-        // Fast path: both tensors have zero offsets — ranges are [0, shape[i])
-        // Overlap is guaranteed; COVERED iff this->shapes[i] >= other.shapes[i] for all dims.
-        // Avoids reading offsets[] entirely (stays on cache line 1).
-        if (is_all_offset_zero && pre_task_output.is_all_offset_zero) {
-            bool contains = true;
-            for (uint32_t i = 0; i < ndims; i++) {
-                if (shapes[i] < pre_task_output.shapes[i]) {
-                    contains = false;
-                    break;
-                }
-            }
-            return contains ? OverlapStatus::COVERED : OverlapStatus::OTHER;
-        }
-        // Slow path: at least one tensor has non-zero offsets
-        bool contains = true;
-        for (uint32_t i = 0; i < ndims; i++) {
-            uint64_t this_off = is_all_offset_zero ? 0 : offsets[i];
-            uint64_t other_off = pre_task_output.is_all_offset_zero ? 0 : pre_task_output.offsets[i];
-            Segment input_range_dim_i{this_off, this_off + (uint64_t)shapes[i]};
-            Segment output_range_dim_i{other_off, other_off + (uint64_t)pre_task_output.shapes[i]};
-            if (!input_range_dim_i.line_segment_intersection(output_range_dim_i)) {
-                return OverlapStatus::NO_OVERLAP;
-            } else if (!input_range_dim_i.contains(output_range_dim_i)) {
-                contains = false;
-            }
-        }
-        if (contains) {
-            return OverlapStatus::COVERED;
-        }
-        return OverlapStatus::OTHER;
-    }
 
     std::string dump() const {
         std::stringstream ss;
@@ -363,6 +317,7 @@ struct alignas(64) Tensor {
 };
 
 static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 bytes)");
+static_assert(offsetof(Tensor, raw_shapes) == 64);
 
 using TensorData = Tensor;
 
@@ -376,6 +331,7 @@ static inline Tensor make_tensor_external(void* addr,
     const uint32_t shapes[],
     uint32_t ndims,
     DataType dtype = DataType::FLOAT32,
+    bool manual_dep = false,
     int32_t version = 0) {
     static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
     uint64_t total = 1;
@@ -383,7 +339,7 @@ static inline Tensor make_tensor_external(void* addr,
         total *= shapes[i];
     }
     return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true);
+                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
 }
 
 /**
@@ -395,6 +351,7 @@ static inline Tensor make_tensor_external(void* addr,
 static inline Tensor make_tensor(const uint32_t shapes[],
     uint32_t ndims,
     DataType dtype = DataType::FLOAT32,
+    bool manual_dep = false,
     int32_t version = 0) {
     static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
     uint64_t total = 1;
@@ -402,5 +359,5 @@ static inline Tensor make_tensor(const uint32_t shapes[],
         total *= shapes[i];
     }
     return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true);
+                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
 }

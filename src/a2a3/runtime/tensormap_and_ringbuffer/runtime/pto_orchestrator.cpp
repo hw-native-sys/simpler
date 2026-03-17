@@ -69,6 +69,7 @@ uint64_t g_orch_scope_end_atomic_count = 0;
     do {                                                                              \
         _t1 = get_sys_cnt_aicpu();                                                    \
         acc += (_t1 - _t0);                                                           \
+        perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
         _t0 = _t1;                                                                    \
     } while (0)
 #elif PTO2_PROFILING
@@ -500,6 +501,7 @@ void pto2_submit_mixed_task(
         switch (ptype) {
             case PTOParamType::INOUT:
             case PTOParamType::INPUT: {
+                if (params.tensors[i]->manual_dep) break;
                 // Look up producer via TensorMap (reads from cached stack tensor)
                 PTO2LookupResult lookup_result;
                 orch->tensor_map.lookup(*params.tensors[i], lookup_result);
@@ -557,7 +559,9 @@ void pto2_submit_mixed_task(
     for (int i = 0; i < params.tensor_count; i++) {
         PTOParamType ptype = params.tensor_types[i];
         if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
-            orch->tensor_map.insert(*params.tensors[i], mixed_task_id, ptype == PTOParamType::OUTPUT);
+            if (!params.tensors[i]->manual_dep) {
+                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, ptype == PTOParamType::OUTPUT);
+            }
         }
     }
 
