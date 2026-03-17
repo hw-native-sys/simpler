@@ -581,7 +581,7 @@ void pto2_submit_mixed_task(
     auto dst_tensors = payload->tensors;
     auto src_tensors = params.tensors;
     for (int32_t i = 0; i < params.tensor_count; i++) {
-        dst_tensors[i] = *src_tensors[i];
+        dst_tensors[i].copy(*src_tensors[i]);
     }
     auto dst_scalars = payload->scalars;
     auto src_scalars = params.scalars;

@@ -18,6 +18,10 @@
 #include <assert.h>
 #include <string.h>
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
 #include "tensor.h"
 
 // =============================================================================
@@ -117,24 +121,55 @@ struct PTOParam {
     /**
      * Widen int32 values to uint64 directly into the scalars array.
      * Avoids an intermediate uint64_t buffer when source data is int32.
+     * Uses NEON to process 4 elements per iteration on aarch64.
      */
     void add_scalars_i32(const int32_t* values, int count) {
         assert(scalar_count + count <= MAX_SCALARS && "Too many scalar params");
         uint64_t* dst = &scalars[scalar_count];
+#if defined(__aarch64__)
+        int i = 0;
+        for (; i + 4 <= count; i += 4) {
+            uint32x4_t v = vld1q_u32(reinterpret_cast<const uint32_t*>(values + i));
+            uint64x2_t lo = vmovl_u32(vget_low_u32(v));
+            uint64x2_t hi = vmovl_u32(vget_high_u32(v));
+            vst1q_u64(dst + i, lo);
+            vst1q_u64(dst + i + 2, hi);
+        }
+        for (; i < count; i++) {
+            dst[i] = static_cast<uint64_t>(static_cast<uint32_t>(values[i]));
+        }
+#else
         for (int i = 0; i < count; i++) {
             dst[i] = static_cast<uint64_t>(static_cast<uint32_t>(values[i]));
         }
+#endif
         scalar_count += count;
     }
 
     /**
      * Copy scalars from another PTOParam's scalar array.
      * Useful when multiple tasks share the same scalar data (e.g., block indices).
+     * Uses NEON to copy 32 bytes per iteration on aarch64.
      */
     void copy_scalars_from(const PTOParam& src, int src_offset, int count) {
         assert(src_offset + count <= src.scalar_count && "Source scalar range out of bounds");
         assert(scalar_count + count <= MAX_SCALARS && "Too many scalar params");
+#if defined(__aarch64__)
+        uint64_t* dst = &scalars[scalar_count];
+        const uint64_t* src_ptr = &src.scalars[src_offset];
+        int i = 0;
+        for (; i + 4 <= count; i += 4) {
+            uint64x2_t a = vld1q_u64(src_ptr + i);
+            uint64x2_t b = vld1q_u64(src_ptr + i + 2);
+            vst1q_u64(dst + i, a);
+            vst1q_u64(dst + i + 2, b);
+        }
+        for (; i < count; i++) {
+            dst[i] = src_ptr[i];
+        }
+#else
         memcpy(&scalars[scalar_count], &src.scalars[src_offset], count * sizeof(uint64_t));
+#endif
         scalar_count += count;
     }
 };

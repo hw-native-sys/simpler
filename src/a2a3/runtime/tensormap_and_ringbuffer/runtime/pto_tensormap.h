@@ -288,7 +288,7 @@ struct PTO2TensorMap {
         PTO2TensorMapEntry* entry = new_entry();
 
         // Initialize new entry
-        entry->tensor = tensor;
+        entry->tensor.copy(tensor);
         entry->producer_task_id = producer_task_id;
         entry->with_alloc = with_alloc;
 
