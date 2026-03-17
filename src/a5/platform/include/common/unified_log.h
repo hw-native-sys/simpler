@@ -11,6 +11,8 @@
 #ifndef PLATFORM_UNIFIED_LOG_H_
 #define PLATFORM_UNIFIED_LOG_H_
 
+#include <string.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -26,12 +28,14 @@ void unified_log_always(const char* func, const char* fmt, ...);
 }
 #endif
 
+#define __FILENAME__ (strrchr(__FILE__, '/') ? strrchr(__FILE__, '/') + 1 : __FILE__)
+
 // Convenience macros (automatically capture function name)
-#define LOG_ERROR(fmt, ...) unified_log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  unified_log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)  unified_log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_DEBUG(fmt, ...) unified_log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_ALWAYS(fmt, ...) unified_log_always(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) unified_log_error(__FUNCTION__, "[%s:%d] " fmt, __FILENAME__, __LINE__, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  unified_log_warn(__FUNCTION__, "[%s:%d] " fmt, __FILENAME__, __LINE__, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  unified_log_info(__FUNCTION__, "[%s:%d] " fmt, __FILENAME__, __LINE__, ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) unified_log_debug(__FUNCTION__, "[%s:%d] " fmt, __FILENAME__, __LINE__, ##__VA_ARGS__)
+#define LOG_ALWAYS(fmt, ...) unified_log_always(__FUNCTION__, "[%s:%d] " fmt, __FILENAME__, __LINE__, ##__VA_ARGS__)
 
 #endif  // PLATFORM_UNIFIED_LOG_H_
 

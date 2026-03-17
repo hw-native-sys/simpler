@@ -83,6 +83,7 @@ struct PTO2HeapRing {
 
         // Spin-wait if insufficient space (back-pressure from Scheduler)
         int spin_count = 0;
+        uint64_t prev_tail = tail_ptr->load(std::memory_order_acquire);
 #if PTO2_SPIN_VERBOSE_LOGGING
         bool notified = false;
 #endif
@@ -118,29 +119,42 @@ struct PTO2HeapRing {
             if (!waiting) { wait_start = get_sys_cnt_aicpu(); waiting = true; }
 #endif
 
+            // Progress detection: reset spin counter if heap_tail advances
+            uint64_t cur_tail = tail_ptr->load(std::memory_order_acquire);
+            if (cur_tail != prev_tail) {
+#if PTO2_SPIN_VERBOSE_LOGGING
+                LOG_INFO("[HeapRing] Progress: tail %" PRIu64 " -> %" PRIu64 " (reset spin_count=%d)",
+                         prev_tail, cur_tail, spin_count);
+#endif
+                spin_count = 0;
+                prev_tail = cur_tail;
+            }
+
 #if PTO2_SPIN_VERBOSE_LOGGING
             // Periodic block notification
-            if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count < PTO2_HEAP_SPIN_LIMIT) {
-                uint64_t tail = tail_ptr->load(std::memory_order_acquire);
+            if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count > 0 && spin_count < PTO2_HEAP_SPIN_LIMIT) {
                 uint64_t top = top_ptr->load(std::memory_order_acquire);
                 LOG_WARN("[HeapRing] BLOCKED: requesting %" PRIu64 " bytes"
                      ", top=%" PRIu64 ", tail=%" PRIu64 ", spins=%d",
-                     size, top, tail, spin_count);
+                     size, top, cur_tail, spin_count);
                 notified = true;
             }
 #endif
 
             if (spin_count >= PTO2_HEAP_SPIN_LIMIT) {
-                uint64_t tail = tail_ptr->load(std::memory_order_acquire);
                 uint64_t top = top_ptr->load(std::memory_order_acquire);
                 LOG_ERROR("========================================");
                 LOG_ERROR("FATAL: Heap Ring Deadlock Detected!");
                 LOG_ERROR("========================================");
-                LOG_ERROR("Orchestrator blocked waiting for heap space after %d spins.", spin_count);
+                LOG_ERROR("Orchestrator blocked waiting for heap space after %d spins (no tail progress).", spin_count);
                 LOG_ERROR("  - Requested:     %" PRIu64 " bytes", size);
                 LOG_ERROR("  - Heap top:      %" PRIu64, top);
-                LOG_ERROR("  - Heap tail:     %" PRIu64, tail);
+                LOG_ERROR("  - Heap tail:     %" PRIu64 " (stuck here)", cur_tail);
                 LOG_ERROR("  - Heap size:     %" PRIu64, this->size);
+                LOG_ERROR("  - Available:     %" PRIu64 " bytes", pto2_heap_ring_available());
+                LOG_ERROR("Diagnosis:");
+                LOG_ERROR("  heap_tail is not advancing, which means last_task_alive");
+                LOG_ERROR("  is stuck. Check TaskRing diagnostics for root cause.");
                 LOG_ERROR("Solution: Increase heap size or investigate task stall.");
                 LOG_ERROR("  Compile-time: PTO2_HEAP_SIZE in pto_runtime2_types.h");
                 LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<power-of-2 bytes> (e.g. %lu)",

@@ -360,9 +360,8 @@ private:
     // Collected data (per-core vectors, indexed by core_index)
     std::vector<std::vector<PerfRecord>> collected_perf_records_;
 
-    // AICPU phase profiling data
+    // AICPU phase profiling data (per-thread, mixed sched + orch records)
     std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
-    std::vector<AicpuPhaseRecord> collected_orch_phase_records_;
     AicpuOrchSummary collected_orch_summary_{};
     bool has_phase_data_{false};
 
