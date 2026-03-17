@@ -1,0 +1,138 @@
+name: Performance Issue
+description: Report a performance regression or optimization opportunity
+title: "[Performance] "
+labels: ["performance"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a performance issue! Please provide benchmark data to help us investigate.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      description: Which platform does this occur on?
+      options:
+        - a2a3 (Ascend 910B/C hardware)
+        - a2a3sim (Ascend 910B/C simulation)
+        - a5 (Ascend 950 hardware)
+        - a5sim (Ascend 950 simulation)
+        - All / Unknown
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime_variant
+    attributes:
+      label: Runtime Variant
+      description: Which runtime variant is affected?
+      options:
+        - tensormap_and_ringbuffer
+        - aicpu_build_graph
+        - host_build_graph
+        - All / Unknown
+    validations:
+      required: true
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: Brief description of the performance issue
+      placeholder: e.g., "paged_attention latency regressed by 10% after multi-ring changes"
+    validations:
+      required: true
+
+  - type: input
+    id: commit
+    attributes:
+      label: Git Commit ID
+      description: "Exact commit hash where the issue occurs. Run `git rev-parse HEAD` to get the current commit ID."
+      placeholder: e.g., f04cde8a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d
+    validations:
+      required: true
+
+  - type: input
+    id: cann_version
+    attributes:
+      label: CANN Version
+      description: "CANN toolkit version. Run `cat /usr/local/Ascend/ascend-toolkit/latest/version.cfg` or check with `npu-smi info`."
+      placeholder: e.g., 8.0.RC3.alpha003
+    validations:
+      required: false
+
+  - type: input
+    id: driver_version
+    attributes:
+      label: Driver Version
+      description: "Ascend driver version. Run `npu-smi info` and check the driver version line."
+      placeholder: e.g., 24.1.rc3
+    validations:
+      required: false
+
+  - type: dropdown
+    id: host_platform
+    attributes:
+      label: Host Platform
+      description: OS and CPU architecture of the host machine
+      options:
+        - Linux (x86_64)
+        - Linux (aarch64)
+        - macOS (aarch64)
+        - Other (please specify)
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: "How to reproduce the issue. Use `tools/benchmark_rounds.sh` if applicable."
+      placeholder: |
+        ```bash
+        ./tools/benchmark_rounds.sh -p a2a3 -d 4 -n 10
+        # Or run a specific example:
+        python examples/scripts/run_example.py \
+            -k tests/device_tests/a2a3/tensormap_and_ringbuffer/paged_attention/kernels \
+            -g tests/device_tests/a2a3/tensormap_and_ringbuffer/paged_attention/golden.py \
+            -p a2a3 -d 4 -n 10
+        ```
+      render: bash
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected_performance
+    attributes:
+      label: Expected Performance
+      description: What performance did you expect?
+      placeholder: e.g., "paged_attention should complete in ~58000 us based on baseline"
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual_performance
+    attributes:
+      label: Actual Performance
+      description: What performance did you observe?
+      placeholder: e.g., "paged_attention takes ~64000 us (10% regression)"
+    validations:
+      required: true
+
+  - type: textarea
+    id: profiling_data
+    attributes:
+      label: Profiling Data (Optional)
+      description: Any profiling results, device log timing, or benchmark_rounds.sh output
+      placeholder: Paste profiling output or benchmark results
+    validations:
+      required: false
+
+  - type: textarea
+    id: additional_context
+    attributes:
+      label: Additional Context
+      description: Any other information that might help
+    validations:
+      required: false

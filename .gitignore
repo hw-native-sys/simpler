@@ -27,3 +27,6 @@ outputs
 
 # Mid-work documentation
 .docs
+
+# Local issue tracking (per-developer, not shared)
+KNOWN_ISSUES.md
