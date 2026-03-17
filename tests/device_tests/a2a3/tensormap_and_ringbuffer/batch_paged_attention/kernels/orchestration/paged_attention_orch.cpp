@@ -137,17 +137,16 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_hub);
 
                 for (uint64_t bn = 0; bn < max_bn; bn++) {
-                    PTO2_SCOPE_GUARD(rt);
+                    PTO2_SCOPE(rt) {
+                        uint32_t sij_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)block_size};
+                        uint32_t vec_shapes[1] = {(uint32_t)(chunk_bc * q_tile)};
+                        uint32_t oi_new_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)head_dim};
 
-                    uint32_t sij_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)block_size};
-                    uint32_t vec_shapes[1] = {(uint32_t)(chunk_bc * q_tile)};
-                    uint32_t oi_new_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)head_dim};
-
-                    Tensor sij_b = make_tensor(sij_shapes, 2, DataType::FLOAT32);
-                    Tensor pij_b = make_tensor(sij_shapes, 2, data_type);
-                    Tensor mij_b = make_tensor(vec_shapes, 1, DataType::FLOAT32);
-                    Tensor lij_b = make_tensor(vec_shapes, 1, DataType::FLOAT32);
-                    Tensor oi_new_b = make_tensor(oi_new_shapes, 2, DataType::FLOAT32);
+                        Tensor sij_b = make_tensor(sij_shapes, 2, DataType::FLOAT32);
+                        Tensor pij_b = make_tensor(sij_shapes, 2, data_type);
+                        Tensor mij_b = make_tensor(vec_shapes, 1, DataType::FLOAT32);
+                        Tensor lij_b = make_tensor(vec_shapes, 1, DataType::FLOAT32);
+                        Tensor oi_new_b = make_tensor(oi_new_shapes, 2, DataType::FLOAT32);
 
                     PTOParam params_qk;
                     params_qk.add_input(query);
@@ -213,4 +212,5 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
              (unsigned long)num_chunks, (unsigned long)IN_CORE_BATCH);
 }
 
+}
 }  // extern "C"

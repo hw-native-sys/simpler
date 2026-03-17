@@ -77,12 +77,13 @@ static __aicore__ void qk_matmul_batch_impl(
         GlobalOut sijGlobal(sij_addr);
 
         TLOAD(aMatTile, qiGlobal);
-        TLOAD(bMatTile, kjGlobal);
-
         set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        TLOAD(bMatTile, kjGlobal);
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
 
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
         TMOV(aTile, aMatTile);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
         TMOV(bTile, bMatTile);
 
         set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);

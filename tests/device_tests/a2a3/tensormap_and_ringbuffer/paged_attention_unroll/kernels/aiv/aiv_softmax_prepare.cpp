@@ -7,8 +7,11 @@
 //
 // Pass 1: Iterate over n_blocks tiles, apply scale, mask last block,
 //         find global m = max over all blocks of rowmax(S_i * scale)
+//         Uses TRESHAPE for DN↔Row conversion to keep globalMax in UB
+//         (eliminates 63 × 4 GM round-trip operations).
 // Pass 2: Iterate again, compute P_i = exp(S_i * scale - m) -> bf16,
 //         accumulate l = sum over all blocks of rowsum(P_i)
+//         Uses double-buffered sij tiles to overlap TLOAD with computation.
 //
 // Two-pass ensures all P_i tiles share the same scale (global max),
 // enabling direct TMATMUL_ACC accumulation in the PV kernel.
@@ -61,110 +64,128 @@ static __aicore__ void softmax_prepare_n_impl(
     using TileScalarDN = Tile<TileType::Vec, float, kAlignedRows, 1, BLayout::ColMajor, M, 1>;
     using TileScalarND =
         Tile<TileType::Vec, float, kScalarRows, kScalarCols, BLayout::RowMajor, kScalarRows, kScalarCols>;
+    // RowMajor (1, M) tile for element-wise arithmetic via TRESHAPE
+    using TileScalarRow = Tile<TileType::Vec, float, 1, M, BLayout::RowMajor, 1, M>;
 
-    // --- UB memory layout ---
+    // --- UB memory layout (double-buffered sij) ---
     constexpr int kDataBytes = M * N * sizeof(float);
     constexpr int kScalarDNBytes = kAlignedRows * sizeof(float);
-    constexpr int kScalarNDBytes = kScalarRows * kScalarCols * sizeof(float);
 
-    TileVecMxN sijTile;
-    TileSijPad sijPadTile;
+    // Double-buffered sij tiles
+    TileVecMxN sijTile_A;
+    TileSijPad sijPadTile_A;
+    TileVecMxN sijTile_B;
+    TileSijPad sijPadTile_B;
     TileVecMxN pijTile;
     TileVecMxN tmpTile;
     TileVecMxN sumAccTile;
     TileScalarDN localMaxDN;
     TileScalarDN globalMaxDN;
-    TileScalarND maxND_a;
-    TileScalarND maxND_b;
     TileScalarDN sumDN;
     TileVecMxN_bf16 pijBf16Tile;
 
-    TASSIGN(sijTile, 0x0);
-    TASSIGN(sijPadTile, 0x0);
-    TASSIGN(pijTile, kDataBytes);
-    TASSIGN(tmpTile, 2 * kDataBytes);
-    TASSIGN(sumAccTile, 3 * kDataBytes);
-    int scalarBase = 4 * kDataBytes;
-    TASSIGN(localMaxDN, scalarBase);
-    TASSIGN(globalMaxDN, scalarBase + kScalarDNBytes);
-    TASSIGN(maxND_a, scalarBase + 2 * kScalarDNBytes);
-    TASSIGN(maxND_b, scalarBase + 2 * kScalarDNBytes + kScalarNDBytes);
-    TASSIGN(sumDN, scalarBase + 2 * kScalarDNBytes + 2 * kScalarNDBytes);
-    TASSIGN(pijBf16Tile, scalarBase + 2 * kScalarDNBytes + 2 * kScalarNDBytes + kScalarDNBytes);
+    // TRESHAPE aliases (same UB address as their DN counterparts)
+    TileScalarRow localMaxRow;
+    TileScalarRow globalMaxRow;
 
-    // GM scratch aliases (mij/lij output buffers double as scratch)
+    // ND alias for storing globalMax to GM
+    TileScalarND globalMaxND;
+
+    TASSIGN(sijTile_A, 0x0);
+    TASSIGN(sijPadTile_A, 0x0);
+    TASSIGN(sijTile_B, kDataBytes);
+    TASSIGN(sijPadTile_B, kDataBytes);
+    TASSIGN(pijTile, 2 * kDataBytes);
+    TASSIGN(tmpTile, 3 * kDataBytes);
+    TASSIGN(sumAccTile, 4 * kDataBytes);
+    int scalarBase = 5 * kDataBytes;
+    TASSIGN(localMaxDN, scalarBase);
+    TASSIGN(localMaxRow, scalarBase);                     // alias: same UB as localMaxDN
+    TASSIGN(globalMaxDN, scalarBase + kScalarDNBytes);
+    TASSIGN(globalMaxRow, scalarBase + kScalarDNBytes);   // alias: same UB as globalMaxDN
+    TASSIGN(globalMaxND, scalarBase + kScalarDNBytes);    // alias: same UB as globalMaxDN
+    TASSIGN(sumDN, scalarBase + 2 * kScalarDNBytes);
+    TASSIGN(pijBf16Tile, scalarBase + 3 * kScalarDNBytes);
+
+    // GM aliases (mij/lij output buffers)
     GlobalScalarND mijGlobalND(mij_addr);
-    GlobalScalarDN mijGlobalDN(mij_addr);
-    GlobalScalarND lijGlobalND(lij_addr);
     GlobalScalarDN lijGlobalDN(lij_addr);
 
-    // ======== Pass 1: Find global row max ========
+    // ======== Pass 1: Find global row max via TRESHAPE (no GM round-trip) ========
     for (uint64_t i = 0; i < n_blocks; i++) {
         GlobalDataMxN sijGlobal(sij_base + i * M * N);
-        TLOAD(sijTile, sijGlobal);
+        TLOAD(sijTile_A, sijGlobal);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
         if (i == n_blocks - 1 && valid_len_last < static_cast<uint64_t>(N)) {
             TileSijDyn sijDynTile(static_cast<size_t>(valid_len_last));
             TASSIGN(sijDynTile, 0x0);
-            TFILLPAD_INPLACE(sijPadTile, sijDynTile);
+            TFILLPAD_INPLACE(sijPadTile_A, sijDynTile);
         }
 
-        TMULS(sijTile, sijTile, scale_value);
+        TMULS(sijTile_A, sijTile_A, scale_value);
         pipe_barrier(PIPE_V);
-        TROWMAX(localMaxDN, sijTile, tmpTile);
+        TROWMAX(localMaxDN, sijTile_A, tmpTile);
 
+        // TRESHAPE: ColMajor(M,1) → RowMajor(1,M) for element-wise TMAX
+        TRESHAPE(localMaxRow, localMaxDN);
         if (i == 0) {
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            TSTORE(mijGlobalDN, localMaxDN);
+            pipe_barrier(PIPE_V);
+            TMAX(globalMaxRow, localMaxRow, localMaxRow);
         } else {
-            // Store local max to lij buffer (scratch) as DN, reload as ND for TMAX
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            TSTORE(lijGlobalDN, localMaxDN);
-
-            // Reload both as ND for TMAX
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            TLOAD(maxND_a, mijGlobalND);
-            TLOAD(maxND_b, lijGlobalND);
-
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-            TMAX(maxND_a, maxND_a, maxND_b);
-
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            TSTORE(mijGlobalND, maxND_a);
+            pipe_barrier(PIPE_V);
+            TMAX(globalMaxRow, globalMaxRow, localMaxRow);
         }
     }
 
-    // ======== Pass 2: Compute softmax with global max ========
+    // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for Pass 2's TROWEXPANDSUB
+    TRESHAPE(globalMaxDN, globalMaxRow);
+
+    // Store final global max to mij for online_update to consume
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(mijGlobalND, globalMaxND);
+
+    // ======== Pass 2: Compute softmax with double-buffered sij ========
+    // globalMaxDN is already in UB from TRESHAPE — no reload needed.
+    // Sync MTE3→MTE2 to ensure the mij TSTORE completed before first sij TLOAD.
     set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    TLOAD(globalMaxDN, mijGlobalDN);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+    // Pre-load first sij tile into buffer A
+    GlobalDataMxN sijGlobal_0(sij_base);
+    TLOAD(sijTile_A, sijGlobal_0);
 
     for (uint64_t i = 0; i < n_blocks; i++) {
-        GlobalDataMxN sijGlobal(sij_base + i * M * N);
         GlobalDataMxN_bf16 pijGlobal(pij_base + i * M * N);
 
-        TLOAD(sijTile, sijGlobal);
+        // Wait for current tile's TLOAD to complete
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
+        // TFILLPAD on current buffer if last block with partial valid length
         if (i == n_blocks - 1 && valid_len_last < static_cast<uint64_t>(N)) {
-            TileSijDyn sijDynTile(static_cast<size_t>(valid_len_last));
-            TASSIGN(sijDynTile, 0x0);
-            TFILLPAD_INPLACE(sijPadTile, sijDynTile);
+            TileSijDyn curSijDyn(static_cast<size_t>(valid_len_last));
+            if (i % 2 == 0) {
+                TASSIGN(curSijDyn, 0x0);
+                TFILLPAD_INPLACE(sijPadTile_A, curSijDyn);
+            } else {
+                TASSIGN(curSijDyn, static_cast<int>(kDataBytes));
+                TFILLPAD_INPLACE(sijPadTile_B, curSijDyn);
+            }
         }
 
-        TMULS(sijTile, sijTile, scale_value);
-        pipe_barrier(PIPE_V);
-        TROWEXPANDSUB(pijTile, sijTile, globalMaxDN);
+        // Compute on current buffer (select A or B based on iteration parity)
+        if (i % 2 == 0) {
+            TMULS(sijTile_A, sijTile_A, scale_value);
+            pipe_barrier(PIPE_V);
+            TROWEXPANDSUB(pijTile, sijTile_A, globalMaxDN);
+        } else {
+            TMULS(sijTile_B, sijTile_B, scale_value);
+            pipe_barrier(PIPE_V);
+            TROWEXPANDSUB(pijTile, sijTile_B, globalMaxDN);
+        }
         pipe_barrier(PIPE_V);
         TEXP(pijTile, pijTile);
         TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
@@ -176,13 +197,21 @@ static __aicore__ void softmax_prepare_n_impl(
             TADD(sumAccTile, sumAccTile, pijTile);
         }
 
+        // Store pij (must complete before next iteration's TCVT overwrites pijBf16Tile)
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         TSTORE(pijGlobal, pijBf16Tile);
 
+        // Prefetch next sij into alternate buffer (after TSTORE to avoid UB race)
         if (i + 1 < n_blocks) {
             set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
             wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+            GlobalDataMxN sijGlobal_next(sij_base + (i + 1) * M * N);
+            if (i % 2 == 0) {
+                TLOAD(sijTile_B, sijGlobal_next);
+            } else {
+                TLOAD(sijTile_A, sijGlobal_next);
+            }
         }
     }
 
@@ -190,9 +219,7 @@ static __aicore__ void softmax_prepare_n_impl(
     pipe_barrier(PIPE_V);
     TROWSUM(sumDN, sumAccTile, tmpTile);
 
-    // Store mij (global max) and lij (total sum)
-    // mij already contains the correct global max from Pass 1.
-    // Reload and store as DN to ensure consistent format for online_update.
+    // Store lij (total sum). mij already stored after Pass 1.
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(lijGlobalDN, sumDN);

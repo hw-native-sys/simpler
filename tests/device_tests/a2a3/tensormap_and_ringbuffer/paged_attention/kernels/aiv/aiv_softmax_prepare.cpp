@@ -99,16 +99,26 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     TROWEXPANDSUB(pijTile, sijTile, maxTile);
     pipe_barrier(PIPE_V);
     TEXP(pijTile, pijTile);
-    // Truncate pij to bf16 first, then compute lij from truncated values (matches golden)
+    // Truncate pij to bf16 first
+    pipe_barrier(PIPE_V);
     TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
-    TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
-    TROWSUM(sumTile, pijTile, tmpTile);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);        // pij bf16 ready, can store early
 
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    // Continue computing: bf16 → f32 and rowsum while pij store proceeds in parallel
+    pipe_barrier(PIPE_V);
+    TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
+    pipe_barrier(PIPE_V);
+    TROWSUM(sumTile, pijTile, tmpTile);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);        // sum ready
+
+    // Store pij (overlaps with TCVT + TROWSUM above)
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(mijGlobal, maxTile);
-    TSTORE(lijGlobal, sumTile);
     TSTORE(pijGlobal, pijBf16Tile);
+
+    // Store max and sum
+    TSTORE(mijGlobal, maxTile);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+    TSTORE(lijGlobal, sumTile);
 
     set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
     wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);

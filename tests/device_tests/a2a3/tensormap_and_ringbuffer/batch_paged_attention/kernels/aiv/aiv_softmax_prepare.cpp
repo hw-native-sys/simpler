@@ -134,16 +134,21 @@ static __aicore__ void softmax_prepare_batch_impl(
         TROWEXPANDSUB(pijTile, sijTile, maxTile);
         pipe_barrier(PIPE_V);
         TEXP(pijTile, pijTile);
+        pipe_barrier(PIPE_V);
         // Truncate pij to bf16 first, then compute lij from truncated values (matches golden)
         TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
-        TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
-        TROWSUM(sumTile, pijTile, tmpTile);
-
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+        pipe_barrier(PIPE_V);
+        TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
+        pipe_barrier(PIPE_V);
+        TROWSUM(sumTile, pijTile, tmpTile);
+        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        TSTORE(mijGlobal, maxTile);
-        TSTORE(lijGlobal, sumTile);
         TSTORE(pijGlobal, pijBf16Tile);
+        TSTORE(mijGlobal, maxTile);
+        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+        TSTORE(lijGlobal, sumTile);
 
         if (b + 1 < batch_count) {
             pipe_barrier(PIPE_ALL);

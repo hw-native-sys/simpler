@@ -8,6 +8,10 @@
 // Per-block vj addresses: value_cache base + block_indices lookup
 // Single output: oi_new (M, N) fp32 = sum of P_i @ V_i across all blocks
 //
+// Optimizations:
+//   - Double-buffered L1 tiles (ping/pong for A and B)
+//   - TLOAD(next pij+vj) overlaps with TMATMUL_ACC(current) via MTE2/PIPE_M parallelism
+//
 // Supports two tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128) -> (16, 128)
 //   Case2: (64,  64) @ ( 64, 128) -> (64, 128)
@@ -51,10 +55,13 @@ static __aicore__ void pv_matmul_n_impl(
     using RightTile = TileRight<bfloat16_t, K, N, K, N>;
     using AccTile = TileAcc<float, M, N, M, N>;
 
-    TileMatA aMatTile;
-    TileMatB bMatTile;
-    TASSIGN(aMatTile, 0x0);
-    TASSIGN(bMatTile, 0x20000);
+    // Double-buffered L1 tiles (ping/pong)
+    TileMatA aMatTile_ping, aMatTile_pong;
+    TileMatB bMatTile_ping, bMatTile_pong;
+    TASSIGN(aMatTile_ping, 0x0);
+    TASSIGN(aMatTile_pong, 0x10000);
+    TASSIGN(bMatTile_ping, 0x20000);
+    TASSIGN(bMatTile_pong, 0x30000);
 
     LeftTile aTile;
     RightTile bTile;
@@ -65,18 +72,28 @@ static __aicore__ void pv_matmul_n_impl(
 
     GlobalOut oiGlobal(oi_base);
 
+    // Pre-load first iteration's tiles into ping buffers
+    GlobalA pijGlobal_0(pij_base);
+    GlobalB vjGlobal_0(val_base + block_indices[0] * K * N);
+    TLOAD(aMatTile_ping, pijGlobal_0);
+    TLOAD(bMatTile_ping, vjGlobal_0);
+
     for (uint64_t i = 0; i < n_blocks; i++) {
-        GlobalA pijGlobal(pij_base + i * M * K);
-        GlobalB vjGlobal(val_base + block_indices[i] * K * N);
+        // Select current buffers based on iteration parity
+        TileMatA& curA = (i % 2 == 0) ? aMatTile_ping : aMatTile_pong;
+        TileMatB& curB = (i % 2 == 0) ? bMatTile_ping : bMatTile_pong;
 
-        TLOAD(aMatTile, pijGlobal);
-        TLOAD(bMatTile, vjGlobal);
-
+        // Wait for current TLOAD to complete
         set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
 
-        TMOV(aTile, aMatTile);
-        TMOV(bTile, bMatTile);
+        // Wait for previous matmul to complete (L0A/L0B safe to overwrite)
+        if (i > 0) {
+            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+        }
+
+        TMOV(aTile, curA);
+        TMOV(bTile, curB);
 
         set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
         wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
@@ -87,8 +104,17 @@ static __aicore__ void pv_matmul_n_impl(
             TMATMUL_ACC(cTile, cTile, aTile, bTile);
         }
 
-        set_flag(PIPE_M, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_M, PIPE_MTE2, EVENT_ID0);
+        // Prefetch next iteration's data (MTE2 overlaps with matmul completion)
+        if (i + 1 < n_blocks) {
+            // Signal matmul completion for next iteration's TMOV guard
+            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
+            TileMatA& nxtA = (i % 2 == 0) ? aMatTile_pong : aMatTile_ping;
+            TileMatB& nxtB = (i % 2 == 0) ? bMatTile_pong : bMatTile_ping;
+            GlobalA pijGlobal_next(pij_base + (i + 1) * M * K);
+            GlobalB vjGlobal_next(val_base + block_indices[i + 1] * K * N);
+            TLOAD(nxtA, pijGlobal_next);
+            TLOAD(nxtB, vjGlobal_next);
+        }
     }
 
     set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);

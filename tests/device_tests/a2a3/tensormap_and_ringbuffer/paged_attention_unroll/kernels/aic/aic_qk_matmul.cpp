@@ -7,6 +7,9 @@
 // Output layout: n_blocks contiguous (M, N) tiles stacked vertically.
 // Block i occupies sij[i*M : (i+1)*M, 0:N].
 //
+// Optimizations:
+//   - qi TLOAD hoisted before the loop (constant across all iterations)
+//
 // Supports two tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128).T -> (16, 128)
 //   Case2: (64, 128) @ (128,  64).T -> (64,  64)
@@ -61,17 +64,21 @@ static __aicore__ void qk_matmul_n_impl(
     TASSIGN(bTile, 0x0);
     TASSIGN(cTile, 0x0);
 
+    // Hoist qi TLOAD before the loop (qi is constant across all blocks)
+    GlobalA qiGlobal(qi_base);
+    TLOAD(aMatTile, qiGlobal);
+
     for (uint64_t i = 0; i < n_blocks; i++) {
-        GlobalA qiGlobal(qi_base);
         GlobalB kjGlobal(key_base + block_indices[i] * N * K);
         GlobalOut sijGlobal(sij_base + i * M * N);
 
-        TLOAD(aMatTile, qiGlobal);
+        // Load only B each iteration (qi already in L1 from hoist)
         TLOAD(bMatTile, kjGlobal);
 
         set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
 
+        // TMOV qi from L1→L0A (re-copy since TMATMUL consumed L0A) and kj from L1→L0B
         TMOV(aTile, aMatTile);
         TMOV(bTile, bMatTile);
 
