@@ -15,7 +15,6 @@
 #define ORCH_BUILD_GRAPH_PTO_TYPES_H
 
 #include <stdint.h>
-#include <assert.h>
 #include <string.h>
 
 #if defined(__aarch64__)
@@ -68,56 +67,78 @@ struct PTOParam {
     uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
     int32_t tensor_count{0};
     int32_t scalar_count{0};
+    bool has_error{false};
+    const char* error_msg{nullptr};
 
     void reset() {
         tensor_count = 0;
         scalar_count = 0;
+        has_error = false;
+        error_msg = nullptr;
     }
 
-    bool check_add_tensor_valid() const {
-        assert(scalar_count == 0 && "scalar must add after all tensor added");
+    void set_error(const char* msg) {
+        if (!has_error) {
+            has_error = true;
+            error_msg = msg;
+        }
+    }
+
+    bool check_add_tensor_valid() {
+        if (scalar_count != 0) {
+            set_error("add_input/add_output/add_inout called after add_scalar: "
+                      "all tensors must be added before any scalars");
+            return false;
+        }
+        if (tensor_count >= PTO2_MAX_TENSOR_PARAMS) {
+            set_error("Too many tensor params (exceeds PTO2_MAX_TENSOR_PARAMS=32)");
+            return false;
+        }
         return true;
     }
 
     void add_input(Tensor& t) {
-        if (!check_add_tensor_valid()) {
+        if (!check_add_tensor_valid()) { return; }
+        if (t.buffer.addr == 0) {
+            set_error("INPUT tensor must have a non-NULL buffer address");
             return;
         }
-        assert(t.buffer.addr != 0 && "INPUT param must have a non-NULL buffer address");
-        assert(tensor_count < PTO2_MAX_TENSOR_PARAMS && "Too many tensor params");
         tensors[tensor_count] = &t;
         tensor_types[tensor_count] = PTOParamType::INPUT;
         tensor_count++;
     }
 
     void add_output(Tensor& t) {
-        if (!check_add_tensor_valid()) {
-            return;
-        }
-        assert(tensor_count < PTO2_MAX_TENSOR_PARAMS && "Too many tensor params");
+        if (!check_add_tensor_valid()) { return; }
         tensors[tensor_count] = &t;
         tensor_types[tensor_count] = PTOParamType::OUTPUT;
         tensor_count++;
     }
 
     void add_inout(Tensor& t) {
-        if (!check_add_tensor_valid()) {
+        if (!check_add_tensor_valid()) { return; }
+        if (t.buffer.addr == 0) {
+            set_error("INOUT tensor must have a non-NULL buffer address");
             return;
         }
-        assert(t.buffer.addr != 0 && "INOUT param must have a non-NULL buffer address");
-        assert(tensor_count < PTO2_MAX_TENSOR_PARAMS && "Too many tensor params");
         tensors[tensor_count] = &t;
         tensor_types[tensor_count] = PTOParamType::INOUT;
         tensor_count++;
     }
 
     void add_scalar(uint64_t v) {
-        assert(scalar_count < PTO2_MAX_SCALAR_PARAMS && "Too many scalar params");
+        if (scalar_count >= PTO2_MAX_SCALAR_PARAMS) {
+            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+            return;
+        }
         scalars[scalar_count++] = v;
     }
 
     void add_scalars(const uint64_t* values, int count) {
-        assert(scalar_count + count <= PTO2_MAX_SCALAR_PARAMS && "Too many scalar params");
+        if (scalar_count + count > PTO2_MAX_SCALAR_PARAMS) {
+            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+            return;
+        }
         memcpy(&scalars[scalar_count], values, count * sizeof(uint64_t));
         scalar_count += count;
     }
@@ -129,7 +150,10 @@ struct PTOParam {
      * Uses NEON to process 4 elements per iteration on aarch64.
      */
     void add_scalars_i32(const int32_t* values, int count) {
-        assert(scalar_count + count <= PTO2_MAX_SCALAR_PARAMS && "Too many scalar params");
+        if (scalar_count + count > PTO2_MAX_SCALAR_PARAMS) {
+            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+            return;
+        }
         uint64_t* dst = &scalars[scalar_count];
 #if defined(__aarch64__)
         int i = 0;
@@ -154,13 +178,17 @@ struct PTOParam {
     /**
      * Copy scalars from another PTOParam's scalar array.
      * Useful when multiple tasks share the same scalar data (e.g., block indices).
-     * Rounds up to cache line boundary — both arrays are 1024B so no overrun.
      */
     void copy_scalars_from(const PTOParam& src, int src_offset, int count) {
-        assert(src_offset + count <= src.scalar_count && "Source scalar range out of bounds");
-        assert(scalar_count + count <= PTO2_MAX_SCALAR_PARAMS && "Too many scalar params");
-        size_t bytes = (count * sizeof(uint64_t) + 63) & ~size_t(63);
-        memcpy(&scalars[scalar_count], &src.scalars[src_offset], bytes);
+        if (src_offset + count > src.scalar_count) {
+            set_error("Source scalar range out of bounds in copy_scalars_from");
+            return;
+        }
+        if (scalar_count + count > PTO2_MAX_SCALAR_PARAMS) {
+            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+            return;
+        }
+        memcpy(&scalars[scalar_count], &src.scalars[src_offset], count * sizeof(uint64_t));
         scalar_count += count;
     }
 };

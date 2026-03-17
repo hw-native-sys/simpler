@@ -64,6 +64,7 @@
 #define PTO2_ERROR_HEAP_RING_DEADLOCK         2
 #define PTO2_ERROR_FLOW_CONTROL_DEADLOCK      3
 #define PTO2_ERROR_DEP_POOL_OVERFLOW          4
+#define PTO2_ERROR_INVALID_PARAM              5   // PTOParam construction error (invalid params)
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT          100

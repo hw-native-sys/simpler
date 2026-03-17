@@ -336,6 +336,21 @@ void pto2_submit_mixed_task(
     // Fast path after fatal error — all subsequent submits are no-ops
     if (orch->fatal) { return; }
 
+    // Validate PTOParam construction (errors recorded by add_input/add_output/etc.)
+    if (params.has_error) {
+        LOG_ERROR("========================================");
+        LOG_ERROR("FATAL: Invalid PTOParam Detected!");
+        LOG_ERROR("========================================");
+        LOG_ERROR("Error: %s", params.error_msg ? params.error_msg : "(unknown)");
+        LOG_ERROR("  tensor_count: %d, scalar_count: %d", params.tensor_count, params.scalar_count);
+        LOG_ERROR("This is a bug in the orchestration code.");
+        LOG_ERROR("========================================");
+        orch->sm_handle->header->orch_error_code.store(
+            PTO2_ERROR_INVALID_PARAM, std::memory_order_release);
+        orch->fatal = true;
+        return;
+    }
+
     CYCLE_COUNT_START();
 
     // === Validate submit inputs ===
