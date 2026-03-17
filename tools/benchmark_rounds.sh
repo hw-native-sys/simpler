@@ -3,7 +3,7 @@
 # then parse device-log timing lines to report per-round latency.
 #
 # Usage:
-#   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>]
+#   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-c <case>...]
 #
 # Runs all examples listed in EXAMPLES array and prints timing for each.
 
@@ -31,6 +31,7 @@ EXAMPLES=(
 DEVICE_ID=0
 ROUNDS=10
 PLATFORM=a2a3
+CASES=()
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -47,20 +48,27 @@ while [[ $# -gt 0 ]]; do
             ROUNDS="$2"
             shift 2
             ;;
+        -c|--case)
+            IFS=',' read -ra _cases <<< "$2"
+            CASES+=("${_cases[@]}")
+            shift 2
+            ;;
         --help|-h)
             cat <<'USAGE'
 benchmark_rounds.sh — run all examples and report per-round timing from device logs
 
 Usage:
-  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-c <case>]
 
 Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 10)
+  -c, --case     Run specific test case(s) by name; repeatable and comma-separated
+                   (e.g. --case Case1 -c Case2 or --case Case1,Case2)
   -h, --help     Show this help
 
-All other options are passed through to run_example.py (e.g. --case).
+All other options are passed through to run_example.py.
 
 Output:
   Average elapsed time in microseconds for each example.
@@ -142,11 +150,19 @@ parse_timing() {
         printf "  %-8s  %12s\n", "Round", "Elapsed (us)"
         printf "  %-8s  %12s\n", "-----", "------------"
         sum_v = 0
+        min_v = results[0]
+        max_v = results[0]
         for (i = 0; i < count; i++) {
             printf "  %-8d  %12.1f\n", i, results[i]
             sum_v += results[i]
+            if (results[i] < min_v) min_v = results[i]
+            if (results[i] > max_v) max_v = results[i]
         }
         printf "\n  Avg: %.1f us  (%d rounds)\n", sum_v / count, count
+        if (count > 2) {
+            trimmed = (sum_v - min_v - max_v) / (count - 2)
+            printf "  Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed, min_v, max_v
+        }
     }'
 }
 
@@ -182,6 +198,62 @@ wait_for_new_log() {
 }
 
 # ---------------------------------------------------------------------------
+# run_bench <example> <kernels_dir> <golden> [case_name]
+#   Run one benchmark invocation and parse timing from the resulting log.
+#   Sets global PASS / FAIL counters.
+# ---------------------------------------------------------------------------
+run_bench() {
+    local example="$1" kernels_dir="$2" golden="$3" case_name="${4:-}"
+
+    if [[ -n "$case_name" ]]; then
+        echo "  ---- $case_name ----"
+    fi
+
+    # Snapshot existing logs
+    local pre_log_file
+    pre_log_file=$(mktemp)
+    ls -1 "$DEVICE_LOG_DIR"/*.log 2>/dev/null | sort > "$pre_log_file" || true
+
+    # Build run command
+    local run_cmd=(
+        python3 "$RUN_EXAMPLE"
+        -k "$kernels_dir" -g "$golden"
+        -p "$PLATFORM" -d "$DEVICE_ID"
+        -n "$ROUNDS"
+    )
+    if [[ -n "$case_name" ]]; then
+        run_cmd+=(--case "$case_name")
+    fi
+    run_cmd+=("${EXTRA_ARGS[@]}")
+
+    # Run example
+    if ! "${run_cmd[@]}" > /dev/null 2>&1; then
+        echo "  FAILED: run_example.py returned non-zero"
+        rm -f "$pre_log_file"
+        ((FAIL++)) || true
+        return
+    fi
+
+    # Find new device log
+    local new_log
+    new_log=$(wait_for_new_log "$pre_log_file")
+    rm -f "$pre_log_file"
+
+    if [[ -z "$new_log" ]]; then
+        echo "  FAILED: no device log found in $DEVICE_LOG_DIR"
+        ((FAIL++)) || true
+        return
+    fi
+
+    echo "  Log: $new_log"
+    if parse_timing "$new_log"; then
+        ((PASS++)) || true
+    else
+        ((FAIL++)) || true
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 PASS=0
@@ -203,37 +275,12 @@ for example in "${EXAMPLES[@]}"; do
         continue
     fi
 
-    # Snapshot existing logs
-    PRE_LOG_FILE=$(mktemp)
-    ls -1 "$DEVICE_LOG_DIR"/*.log 2>/dev/null | sort > "$PRE_LOG_FILE" || true
-
-    # Run example
-    if ! python3 "$RUN_EXAMPLE" \
-            -k "$KERNELS_DIR" -g "$GOLDEN" \
-            -p "$PLATFORM" -d "$DEVICE_ID" \
-            -n "$ROUNDS" \
-            "${EXTRA_ARGS[@]}" > /dev/null 2>&1; then
-        echo "  FAILED: run_example.py returned non-zero"
-        rm -f "$PRE_LOG_FILE"
-        ((FAIL++)) || true
-        continue
-    fi
-
-    # Find new device log
-    NEW_LOG=$(wait_for_new_log "$PRE_LOG_FILE")
-    rm -f "$PRE_LOG_FILE"
-
-    if [[ -z "$NEW_LOG" ]]; then
-        echo "  FAILED: no device log found in $DEVICE_LOG_DIR"
-        ((FAIL++)) || true
-        continue
-    fi
-
-    echo "  Log: $NEW_LOG"
-    if parse_timing "$NEW_LOG"; then
-        ((PASS++)) || true
+    if [[ ${#CASES[@]} -gt 0 ]]; then
+        for c in "${CASES[@]}"; do
+            run_bench "$example" "$KERNELS_DIR" "$GOLDEN" "$c"
+        done
     else
-        ((FAIL++)) || true
+        run_bench "$example" "$KERNELS_DIR" "$GOLDEN"
     fi
 done
 
