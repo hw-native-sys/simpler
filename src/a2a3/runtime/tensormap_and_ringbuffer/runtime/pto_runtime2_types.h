@@ -88,13 +88,6 @@
 #define PTO2_TENSORMAP_POOL_SIZE   (65536)   // TensorMap entry pool
 #define PTO2_TENSORMAP_NUM_BUCKETS 65536    // Power of 2 for fast hash
 
-// Task parameters
-#define PTO2_MAX_TENSOR_PARAMS    16      // Maximum tensor parameters per task
-#define PTO2_MAX_SCALAR_PARAMS    128     // Maximum scalar parameters per task
-#define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
-#define PTO2_MAX_INPUTS           16      // Maximum inputs per task
-#define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
-
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH      64      // Maximum nesting depth
 #define PTO2_SCOPE_TASKS_INIT_CAP 65536     // Initial capacity for scope task buffer
@@ -362,17 +355,36 @@ struct PTO2TaskDescriptor {
 /**
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
- * Tensors and scalars are stored in separate compact arrays.
- * Dispatch order: tensor args first, then scalar args.
+ * Layout: metadata (counts, fanin pointers) packed in the first 3 cache lines,
+ * followed by bulk tensor and scalar data. This gives sequential write access
+ * during orchestration and groups scheduler-hot fields (fanin_actual_count +
+ * fanin_slot_states) together for on_task_release.
  */
 struct PTO2TaskPayload {
-    Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
-    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
+    // === Cache line 0 (64B) — metadata ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (cold path, used by on_task_release)
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
     int32_t dep_pool_mark{0};                  // Dep pool top after this task's submission (for reclamation)
+    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
+    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
+    Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
+    // === Cache lines 35-50 (1024B) — scalars ===
+    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
+
+    void init(const PTOParam& params) {
+        tensor_count = params.tensor_count;
+        scalar_count = params.scalar_count;
+        auto src_tensors = params.tensors;
+        for (int32_t i = 0; i < params.tensor_count; i++) {
+            tensors[i].copy(*src_tensors[i]);
+        }
+        static_assert(sizeof(scalars) == sizeof(params.scalars));
+        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
+        // Eliminates branches; extra bytes within the same CL have zero additional cost.
+        memcpy(scalars, params.scalars,
+               PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
+    }
 };
 
 /**

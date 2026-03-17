@@ -421,17 +421,18 @@ void pto2_submit_mixed_task(
     // Early write-prefetch payload GM cache lines to issue RFO in background.
     // ~130 lines of computation (output_size, lookup, insert) follow before
     // param_copy writes, giving ample time for prefetch to complete.
+    // Use locality=3 (PSTL1KEEP) so prefetched CLs survive lookup/insert eviction.
     for (int32_t i = 0; i < params.tensor_count; i++) {
-        __builtin_prefetch(&payload->tensors[i], 1, 0);
-        __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 0);
+        __builtin_prefetch(&payload->tensors[i], 1, 3);
+        __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 3);
     }
     for (int32_t j = 0; j < params.scalar_count; j += 8) {
-        __builtin_prefetch(&payload->scalars[j], 1, 0);
+        __builtin_prefetch(&payload->scalars[j], 1, 3);
     }
-    // Metadata area: tensor_count, scalar_count, fanin_slot_states[], fanin_actual_count
-    __builtin_prefetch(&payload->tensor_count, 1, 0);
-    __builtin_prefetch(&payload->fanin_slot_states[0], 1, 0);
-    __builtin_prefetch(&payload->fanin_slot_states[8], 1, 0);
+    // Metadata area: tensor_count, scalar_count, fanin_slot_states[] — all in first 3 CLs
+    __builtin_prefetch(payload, 1, 3);
+    __builtin_prefetch(reinterpret_cast<char*>(payload) + 64, 1, 3);
+    __builtin_prefetch(reinterpret_cast<char*>(payload) + 128, 1, 3);
 
     // Initialize mixed-task descriptor
     task.mixed_task_id = mixed_task_id;
@@ -500,6 +501,7 @@ void pto2_submit_mixed_task(
         switch (ptype) {
             case PTOParamType::INOUT:
             case PTOParamType::INPUT: {
+                if (params.tensors[i]->manual_dep) break;
                 // Look up producer via TensorMap (reads from cached stack tensor)
                 PTO2LookupResult lookup_result;
                 orch->tensor_map.lookup(*params.tensors[i], lookup_result);
@@ -557,7 +559,9 @@ void pto2_submit_mixed_task(
     for (int i = 0; i < params.tensor_count; i++) {
         PTOParamType ptype = params.tensor_types[i];
         if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
-            orch->tensor_map.insert(*params.tensors[i], mixed_task_id, ptype == PTOParamType::OUTPUT);
+            if (!params.tensors[i]->manual_dep) {
+                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, ptype == PTOParamType::OUTPUT);
+            }
         }
     }
 
@@ -574,20 +578,7 @@ void pto2_submit_mixed_task(
         }
     }
 
-    payload->tensor_count = params.tensor_count;
-    payload->scalar_count = params.scalar_count;
-    // === Copy tensors + scalars to GM payload ===
-    // dst cache lines already prefetched after slot allocation (early prefetch).
-    auto dst_tensors = payload->tensors;
-    auto src_tensors = params.tensors;
-    for (int32_t i = 0; i < params.tensor_count; i++) {
-        dst_tensors[i] = *src_tensors[i];
-    }
-    auto dst_scalars = payload->scalars;
-    auto src_scalars = params.scalars;
-    for (int32_t i = 0; i < params.scalar_count; i++) {
-        dst_scalars[i] = src_scalars[i];
-    }
+    payload->init(params);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, local_id);
 #if PTO2_ORCH_PROFILING

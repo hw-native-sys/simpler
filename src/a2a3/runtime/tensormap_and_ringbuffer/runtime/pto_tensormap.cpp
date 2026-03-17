@@ -57,13 +57,14 @@ bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, const i
 
     num_buckets = new_num_buckets;
 
-    // Allocate entry pool
-    entry_pool = (PTO2TensorMapEntry*)calloc(new_pool_size, sizeof(PTO2TensorMapEntry));
+    // Allocate entry pool (64-byte aligned for cache-line-aligned entries)
+    entry_pool = (PTO2TensorMapEntry*)aligned_alloc(alignof(PTO2TensorMapEntry), new_pool_size * sizeof(PTO2TensorMapEntry));
     if (!entry_pool) {
         free(buckets);
         buckets = NULL;
         return false;
     }
+    memset(entry_pool, 0, new_pool_size * sizeof(PTO2TensorMapEntry));
 
     // Allocate free entry list
     free_entry_list = (PTO2TensorMapEntry**)calloc(new_pool_size, sizeof(PTO2TensorMapEntry*));
