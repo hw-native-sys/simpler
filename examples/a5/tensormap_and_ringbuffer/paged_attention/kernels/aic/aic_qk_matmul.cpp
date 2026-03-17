@@ -28,10 +28,10 @@ static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm
     __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
 
     // qi (M, K) fp16 in ND (row-major) layout
-    using GlobalA = GlobalTensor<half, Shape<1, 1, 1, M, K>, pto::Stride<M * K, M * K, M * K, K, 1>>;
+    using GlobalA = GlobalTensor<half, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
     // kj stored as (N, K) row-major = (K, N) column-major -> DN layout
-    using GlobalB = GlobalTensor<half, Shape<1, 1, 1, K, N>, pto::Stride<K * N, K * N, K * N, 1, K>, Layout::DN>;
-    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<M * N, M * N, M * N, N, 1>>;
+    using GlobalB = GlobalTensor<half, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, 1, K>, Layout::DN>;
+    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<M * N, M * N, M * N, N, 1>>;
 
     GlobalA qiGlobal(qi_addr + qi->start_offset);
     GlobalB kjGlobal(kj_addr + kj->start_offset);
@@ -79,6 +79,9 @@ static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
     TSTORE(sijGlobal, cTile);
+
+    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {

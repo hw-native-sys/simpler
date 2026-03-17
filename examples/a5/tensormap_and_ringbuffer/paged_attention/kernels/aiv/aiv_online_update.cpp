@@ -52,14 +52,14 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
     // --- GlobalTensor types ---
 
     // Data (M, N) RowMajor
-    using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<1, 1, 1, N, 1>>;
+    using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
 
     // Scalar ND: M contiguous floats as (kScalarRows, kScalarCols) RowMajor
     using GlobalScalarND =
-        GlobalTensor<float, Shape<1, 1, 1, kScalarRows, kScalarCols>, pto::Stride<1, 1, 1, kScalarCols, 1>>;
+        GlobalTensor<float, Shape<1, 1, 1, kScalarRows, kScalarCols>, Stride<1, 1, 1, kScalarCols, 1>>;
 
     // Scalar DN: same M contiguous floats as (kAlignedRows, 1) ColMajor
-    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, pto::Stride<1, 1, 1, 1, 1>, Layout::DN>;
+    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, Stride<1, 1, 1, 1, 1>, Layout::DN>;
 
     // --- GlobalTensor instances ---
 
@@ -158,14 +158,22 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
         // Phase 2: Scalar arithmetic in RowMajor (kScalarRows, kScalarCols)
+        // pipe_barrier(PIPE_V) required between each dependent vector operation
         // to resolve RAW hazards on shared UB tiles.
         TMAX(miNewND, miND, mijND);  // mi_new = max(mi, mij)
+        pipe_barrier(PIPE_V);
         TSUB(alphaND, miND, miNewND);  // alpha = mi - mi_new
+        pipe_barrier(PIPE_V);
         TEXP(alphaND, alphaND);  // alpha = exp(mi - mi_new)
+        pipe_barrier(PIPE_V);
         TSUB(betaND, mijND, miNewND);  // beta = mij - mi_new
+        pipe_barrier(PIPE_V);
         TEXP(betaND, betaND);  // beta = exp(mij - mi_new)
+        pipe_barrier(PIPE_V);
         TMUL(liND, alphaND, liND);  // li = alpha * li
+        pipe_barrier(PIPE_V);
         TMUL(tmpND, betaND, lijND);  // tmp = beta * lij
+        pipe_barrier(PIPE_V);
         TADD(liND, liND, tmpND);  // li = alpha * li + beta * lij (= li_new)
 
         // Phase 3: Store scalar results to GM (ND format)
@@ -192,10 +200,12 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
         // Phase 5: Scale data tiles using row-broadcast multiply
         TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
         TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);  // oi_new *= beta
+        pipe_barrier(PIPE_V);
         TADD(oiTile, oiTile, oiNewTile);  // oi = alpha*oi + beta*oi_new
 
         if (is_last) {
             // Phase 6: Normalize and output
+            pipe_barrier(PIPE_V);
             TROWEXPANDDIV(oiTile, oiTile, liDN);  // dst = oi / li_new
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
@@ -207,6 +217,8 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
             TSTORE(oiGlobal, oiTile);
         }
     }
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {

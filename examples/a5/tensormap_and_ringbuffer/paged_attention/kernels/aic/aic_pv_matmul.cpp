@@ -28,9 +28,9 @@ static __aicore__ void pv_matmul_impl(__gm__ Tensor* pij, __gm__ Tensor* vj, __g
     __gm__ float* oi_addr = reinterpret_cast<__gm__ float*>(oi->buffer.addr);
 
     // pij (M, K) fp16, vj (K, N) fp16 in ND (row-major), oi_new (M, N) fp32
-    using GlobalA = GlobalTensor<half, Shape<1, 1, 1, M, K>, pto::Stride<M * K, M * K, M * K, K, 1>>;
-    using GlobalB = GlobalTensor<half, Shape<1, 1, 1, K, N>, pto::Stride<K * N, K * N, K * N, N, 1>>;
-    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<M * N, M * N, M * N, N, 1>>;
+    using GlobalA = GlobalTensor<half, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
+    using GlobalB = GlobalTensor<half, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, N, 1>>;
+    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<M * N, M * N, M * N, N, 1>>;
 
     GlobalA pijGlobal(pij_addr + pij->start_offset);
     GlobalB vjGlobal(vj_addr + vj->start_offset);
@@ -78,6 +78,9 @@ static __aicore__ void pv_matmul_impl(__gm__ Tensor* pij, __gm__ Tensor* vj, __g
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
     TSTORE(oiGlobal, cTile);
+
+    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {

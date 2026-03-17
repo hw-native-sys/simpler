@@ -26,6 +26,7 @@
 #define PTO_RUNTIME2_H
 
 #include "pto_runtime2_types.h"
+#include "pto_submit_types.h"
 #include "pto_shared_memory.h"
 #include "pto_ring_buffer.h"
 #include "pto_tensormap.h"
@@ -58,12 +59,12 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    void (*submit_task)(PTO2Runtime* rt, int32_t kernel_id,
-                        PTO2WorkerType worker_type,
-                        PTOParam* params, int32_t num_params);
+    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+                        const PTOParam& params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
+    bool (*is_fatal)(PTO2Runtime* rt);
 
     // Logging (populated by runtime, called by orchestration)
     void (*log_error)(const char* func, const char* fmt, ...);
@@ -123,7 +124,8 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode);
  */
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
                                          uint64_t task_window_size,
-                                         uint64_t heap_size);
+                                         uint64_t heap_size,
+                                         int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Create runtime from existing shared memory and GM heap (e.g. on device).
@@ -139,7 +141,8 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
                                           PTO2SharedMemoryHandle* sm_handle,
                                           void* gm_heap,
                                           uint64_t heap_size,
-                                          int orch_count = 1);
+                                          int orch_count = 1,
+                                          int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Destroy runtime and free all resources

@@ -42,9 +42,9 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
 
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
-    using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<1, 1, 1, N, 1>>;
-    using GlobalDataMxN_f16 = GlobalTensor<half, Shape<1, 1, 1, M, N>, pto::Stride<1, 1, 1, N, 1>>;
-    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, pto::Stride<1, 1, 1, 1, 1>, Layout::DN>;
+    using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
+    using GlobalDataMxN_f16 = GlobalTensor<half, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
+    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, Stride<1, 1, 1, 1, 1>, Layout::DN>;
 
     GlobalDataMxN sijGlobal(sij_addr + sij->start_offset);
     GlobalDataMxN_f16 pijGlobal(pij_addr + pij->start_offset);
@@ -83,11 +83,16 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
+    // manually fill invalid columns with -inf as a workaround.
     TFILLPAD_INPLACE(sijPadTile, sijDynTile);
+    pipe_barrier(PIPE_V);
 
     TMULS(sijTile, sijTile, scale_value);
+    pipe_barrier(PIPE_V);
     TROWMAX(maxTile, sijTile, tmpTile);
+    pipe_barrier(PIPE_V);
     TROWEXPANDSUB(pijTile, sijTile, maxTile);
+    pipe_barrier(PIPE_V);
     TEXP(pijTile, pijTile);
     // Truncate pij to fp16 first, then compute lij from truncated values (matches golden)
     TCVT(pijF16Tile, pijTile, RoundMode::CAST_ROUND);
@@ -99,19 +104,22 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     TSTORE(mijGlobal, maxTile);
     TSTORE(lijGlobal, sumTile);
     TSTORE(pijGlobal, pijF16Tile);
+
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* sij = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* pij = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[3]);
     union {
         uint64_t u;
         float f;
     } scale_conv;
-    scale_conv.u = static_cast<uint64_t>(args[1]);
+    scale_conv.u = static_cast<uint64_t>(args[4]);
     float scale_value = scale_conv.f;
-    __gm__ Tensor* pij = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[4]);
 
     softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij);
 }

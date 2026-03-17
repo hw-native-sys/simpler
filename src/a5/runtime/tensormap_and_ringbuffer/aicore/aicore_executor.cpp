@@ -16,13 +16,13 @@ typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
 /**
  * Execute task from PTO2DispatchPayload.
  *
- * Directly accesses PTO2DispatchPayload fields for task execution,
- * matching ref_runtime implementation for a2a3 compatibility.
+ * Reads function_bin_addr and args from the dispatch payload.
  *
- * @param task_ptr Pointer to PTO2DispatchPayload in global memory
+ * @param payload Pointer to PTO2DispatchPayload in global memory
  */
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ void* task_ptr) {
-    __gm__ PTO2DispatchPayload* payload = reinterpret_cast<__gm__ PTO2DispatchPayload*>(task_ptr);
+__aicore__ __attribute__((always_inline)) static void execute_task(
+    __gm__ PTO2DispatchPayload* payload
+) {
     if (payload == nullptr || payload->function_bin_addr == 0) {
         return;
     }
@@ -40,15 +40,15 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ void* 
  * 2. Report physical core ID and core type, signal AICore ready
  * 3. Poll DATA_MAIN_BASE register for task dispatch until exit signal
  *
- * Task dispatch uses PTO2DispatchPayload from per-core payload array.
- * Supports performance profiling when runtime->enable_profiling is true.
+ * Task dispatch reads PTO2DispatchPayload address from Handshake.task.
+ * Task ID is derived from the register value (task_id + 1 encoding).
  *
  * @param runtime Pointer to Runtime in global memory
- * @param core_idx Core index (core ID)
+ * @param block_idx Block index (core ID)
  * @param core_type Core type (AIC or AIV)
  */
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int core_idx, CoreType core_type) {
-    __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[core_idx]);
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type) {
+    __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {
@@ -68,11 +68,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
     STORE_RELEASE_FENCE();
-    my_hank->aicore_done = core_idx + 1;  // Signal ready (use core_idx + 1 to avoid 0)
+    my_hank->aicore_done = block_idx + 1;  // Signal ready (use block_idx + 1 to avoid 0)
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    // Read per-core payload address from hank->task (written by AICPU before aicpu_ready)
+    // Cache payload address (set once by AICPU during initialization, never changes)
     __gm__ PTO2DispatchPayload* payload =
         reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
 
@@ -80,46 +80,49 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     uint64_t kernel_ready_time = get_sys_cnt_aicore();
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
-    uint32_t task_id = AICPU_IDLE_TASK_ID;
-    uint32_t last_task_id = AICPU_IDLE_TASK_ID;
+    // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
+    uint32_t reg_val = AICPU_IDLE_TASK_ID;
+    uint32_t last_reg_val = AICPU_IDLE_TASK_ID;
 
     while (true) {
-        task_id = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
-        if (task_id == AICORE_EXIT_SIGNAL) {
+        reg_val = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+        if (reg_val == AICORE_EXIT_SIGNAL) {
             // Signal exit acknowledgment to AICPU
             write_reg(RegId::COND, AICORE_EXITED_VALUE);
             break;
         }
 
-        // Execute task if new (task_id encoding: AICPU_IDLE_TASK_ID=idle, task_id=task)
-        if (task_id == AICPU_IDLE_TASK_ID || task_id == last_task_id) {
+        // Execute task if new (reg_val encoding: AICPU_IDLE_TASK_ID=idle, task_id=task)
+        if (reg_val == AICPU_IDLE_TASK_ID || reg_val == last_reg_val) {
             SPIN_WAIT_HINT();
             continue;
         }
 
         {
-            // Invalidate cache to read fresh payload written by AICPU
+            uint32_t task_id = reg_val;  // Decode: register holds task_id directly
+
+            // Invalidate payload buffer (AICPU updates its content each dispatch)
             dcci(payload, ENTIRE_DATA_CACHE);
 
-            write_reg(RegId::COND, MAKE_ACK_VALUE(payload->task_id));
+            write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
 
             // Performance profiling: record start time
             uint64_t start_time = get_sys_cnt_aicore();
 
             // Execute the task
-            execute_task(reinterpret_cast<__gm__ void*>(payload));
+            execute_task(payload);
 
             // Performance profiling: record task execution
+            // (func_id and core_type are filled by AICPU at completion time)
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-                perf_aicore_record_task(perf_buf, payload->task_id, payload->kernel_id,
-                                       start_time, end_time, kernel_ready_time,
-                                       core_type);
+                perf_aicore_record_task(perf_buf, task_id,
+                                       start_time, end_time, kernel_ready_time);
             }
 
-            last_task_id = task_id;
-            write_reg(RegId::COND, MAKE_FIN_VALUE(payload->task_id));
+            last_reg_val = reg_val;
+            write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
         }
     }
 

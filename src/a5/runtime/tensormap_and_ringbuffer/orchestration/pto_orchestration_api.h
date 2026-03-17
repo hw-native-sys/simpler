@@ -22,18 +22,9 @@
 #include <stddef.h>
 
 // Type headers needed by orchestration
-#include "pto_types.h"          // PTOParam, make_input_param, make_output_param, etc.
+#include "pto_types.h"          // PTOParam, PTOTensorEntry, PTOParamType
 #include "tensor.h"             // Tensor, make_tensor, make_tensor_external
-
-// Worker type constants (duplicated from pto_runtime2_types.h to avoid
-// pulling in the full types header with its internal structures)
-typedef enum {
-    PTO2_WORKER_CUBE = 0,
-    PTO2_WORKER_VECTOR = 1,
-    PTO2_WORKER_AI_CPU = 2,
-    PTO2_WORKER_ACCELERATOR = 3,
-    PTO2_NUM_WORKER_TYPES = 4
-} PTO2WorkerType;
+#include "pto_submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
 
 // =============================================================================
 // Ops Table and Opaque Runtime
@@ -51,12 +42,12 @@ typedef struct PTO2Runtime PTO2Runtime;
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    void (*submit_task)(PTO2Runtime* rt, int32_t kernel_id,
-                        PTO2WorkerType worker_type,
-                        PTOParam* params, int32_t num_params);
+    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+                        const PTOParam& params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
+    bool (*is_fatal)(PTO2Runtime* rt);
 
     // Logging (populated by runtime, called by orchestration)
     void (*log_error)(const char* func, const char* fmt, ...);
@@ -81,10 +72,29 @@ struct PTO2Runtime {
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline void pto2_rt_submit_task(PTO2Runtime* rt, int32_t kernel_id,
-                                        PTO2WorkerType worker_type,
-                                        PTOParam* params, int32_t num_params) {
-    rt->ops->submit_task(rt, kernel_id, worker_type, params, num_params);
+static inline void pto2_rt_submit_task(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+                                        const PTOParam& params) {
+    rt->ops->submit_task(rt, mixed_kernels, params);
+}
+
+/**
+ * Convenience wrapper: submit an AIC-only task.
+ */
+static inline void pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id,
+                                            const PTOParam& params) {
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    rt->ops->submit_task(rt, mk, params);
+}
+
+/**
+ * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
+ */
+static inline void pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id,
+                                            const PTOParam& params) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    rt->ops->submit_task(rt, mk, params);
 }
 
 static inline void pto2_rt_scope_begin(PTO2Runtime* rt) {
@@ -97,6 +107,10 @@ static inline void pto2_rt_scope_end(PTO2Runtime* rt) {
 
 static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) {
     rt->ops->orchestration_done(rt);
+}
+
+static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) {
+    return rt->ops->is_fatal(rt);
 }
 
 // =============================================================================
