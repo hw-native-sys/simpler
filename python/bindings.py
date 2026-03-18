@@ -180,6 +180,22 @@ class RuntimeLibraryLoader:
         self.lib.enable_runtime_profiling.argtypes = [c_void_p, c_int]
         self.lib.enable_runtime_profiling.restype = c_int
 
+        # --- Distributed communication API (comm_*) ---
+        self.lib.comm_init.argtypes = [c_int, c_int, c_char_p]
+        self.lib.comm_init.restype = c_void_p
+
+        self.lib.comm_alloc_windows.argtypes = [c_void_p, c_size_t, POINTER(c_uint64)]
+        self.lib.comm_alloc_windows.restype = c_int
+
+        self.lib.comm_get_local_window_base.argtypes = [c_void_p, POINTER(c_uint64)]
+        self.lib.comm_get_local_window_base.restype = c_int
+
+        self.lib.comm_barrier.argtypes = [c_void_p]
+        self.lib.comm_barrier.restype = c_int
+
+        self.lib.comm_destroy.argtypes = [c_void_p]
+        self.lib.comm_destroy.restype = c_int
+
 
 # ============================================================================
 # Python Wrapper Classes
@@ -520,6 +536,123 @@ def launch_runtime(
     )
     if rc != 0:
         raise RuntimeError(f"launch_runtime failed: {rc}")
+
+
+# ============================================================================
+# Distributed Communication Functions
+# ============================================================================
+
+
+def comm_init(rank: int, nranks: int, rootinfo_path: str) -> int:
+    """
+    Initialize a distributed communicator for the given rank.
+
+    Args:
+        rank: This process's rank (0-based)
+        nranks: Total number of ranks
+        rootinfo_path: Filesystem path for root info exchange
+
+    Returns:
+        Opaque comm handle (as integer)
+
+    Raises:
+        RuntimeError: If not loaded or initialization fails
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    handle = _lib.comm_init(rank, nranks, rootinfo_path.encode('utf-8'))
+    if not handle:
+        raise RuntimeError(f"comm_init failed for rank {rank}")
+    return handle
+
+
+def comm_alloc_windows(handle: int, win_size: int) -> int:
+    """
+    Allocate RDMA / shared-memory windows.
+
+    Args:
+        handle: Comm handle from comm_init()
+        win_size: Window size hint (bytes per rank)
+
+    Returns:
+        Device pointer to CommDeviceContext struct
+
+    Raises:
+        RuntimeError: If allocation fails
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    device_ctx = c_uint64(0)
+    rc = _lib.comm_alloc_windows(ctypes.c_void_p(handle), win_size, ctypes.byref(device_ctx))
+    if rc != 0:
+        raise RuntimeError(f"comm_alloc_windows failed: {rc}")
+    return device_ctx.value
+
+
+def comm_get_local_window_base(handle: int) -> int:
+    """
+    Get the base address of this rank's local window.
+
+    Args:
+        handle: Comm handle from comm_init()
+
+    Returns:
+        Device-pointer base address
+
+    Raises:
+        RuntimeError: If query fails
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    base = c_uint64(0)
+    rc = _lib.comm_get_local_window_base(ctypes.c_void_p(handle), ctypes.byref(base))
+    if rc != 0:
+        raise RuntimeError(f"comm_get_local_window_base failed: {rc}")
+    return base.value
+
+
+def comm_barrier(handle: int) -> None:
+    """
+    Synchronize all ranks in the communicator.
+
+    Args:
+        handle: Comm handle from comm_init()
+
+    Raises:
+        RuntimeError: If barrier fails
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    rc = _lib.comm_barrier(ctypes.c_void_p(handle))
+    if rc != 0:
+        raise RuntimeError(f"comm_barrier failed: {rc}")
+
+
+def comm_destroy(handle: int) -> None:
+    """
+    Destroy the communicator and release all resources.
+
+    Args:
+        handle: Comm handle from comm_init()
+
+    Raises:
+        RuntimeError: If destruction fails
+    """
+    global _lib
+    if _lib is None:
+        raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
+
+    rc = _lib.comm_destroy(ctypes.c_void_p(handle))
+    if rc != 0:
+        raise RuntimeError(f"comm_destroy failed: {rc}")
 
 
 # ============================================================================
