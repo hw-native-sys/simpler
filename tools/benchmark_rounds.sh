@@ -120,7 +120,7 @@ parse_timing() {
     local log_file="$1"
 
     local timing
-    timing=$(grep -E 'Thread=[0-9]+ (orch_start|end)=' "$log_file" || true)
+    timing=$(grep -E 'Thread=[0-9]+ (orch_start|end)=|BENCHMARK: thread=[0-9]+ end=|Thread [0-9]+: Scheduler summary: total_time=' "$log_file" || true)
 
     if [[ -z "$timing" ]]; then
         echo "  (no benchmark timing data — was PTO2_PROFILING enabled?)"
@@ -129,51 +129,118 @@ parse_timing() {
 
     echo "$timing" | awk '
     function flush_round() {
-        if (round >= 0 && max_end > 0 && min_start > 0) {
-            results[round] = (max_end - min_start) / 50.0
+        if (round >= 0 && max_end > 0 && min_orch_start > 0) {
+            r_elapsed[round] = (max_end - min_orch_start) / 50.0
+
+            # Orch wall-clock: BENCHMARK end (= last orch finish) - earliest orch start
+            if (benchmark_end > 0)
+                r_orch[round] = (benchmark_end - min_orch_start) / 50.0
+
+            # Sched wall-clock: max(sched_end) - min(sched_start)
+            # Derive sched_start per thread: end_cycle - total_time_us * 50
+            min_ss = 0; max_se = 0
+            for (tid in sched_total_us) {
+                if (tid in thread_end) {
+                    ss = thread_end[tid] - sched_total_us[tid] * 50
+                    if (min_ss == 0 || ss < min_ss) min_ss = ss
+                    if (thread_end[tid] > max_se) max_se = thread_end[tid]
+                }
+            }
+            if (max_se > 0 && min_ss > 0)
+                r_sched[round] = (max_se - min_ss) / 50.0
+
             count++
         }
     }
-    BEGIN { round = 0; min_start = 0; max_end = 0; count = 0 }
+    BEGIN {
+        round = 0; min_orch_start = 0; max_end = 0; benchmark_end = 0; count = 0
+    }
     /orch_start=/ {
         match($0, /Thread=([0-9]+)/, tm)
         tid = tm[1] + 0
-        if (tid in seen) {
+        if (tid in orch_seen) {
             flush_round()
             round++
-            min_start = 0
-            max_end = 0
-            delete seen
+            min_orch_start = 0; max_end = 0; benchmark_end = 0
+            delete orch_seen; delete thread_end; delete sched_total_us
         }
-        seen[tid] = 1
+        orch_seen[tid] = 1
         match($0, /orch_start=([0-9]+)/, m)
         val = m[1] + 0
-        if (min_start == 0 || val < min_start) min_start = val
+        if (min_orch_start == 0 || val < min_orch_start) min_orch_start = val
     }
-    /end=/ {
-        match($0, /end=([0-9]+)/, m)
-        val = m[1] + 0
+    # Scheduler/orch thread end cycle (uppercase Thread=)
+    /Thread=[0-9]+ end=/ {
+        match($0, /Thread=([0-9]+)/, tm); tid = tm[1] + 0
+        match($0, /end=([0-9]+)/, m); val = m[1] + 0
+        thread_end[tid] = val
         if (val > max_end) max_end = val
+    }
+    # Orchestrator benchmark end cycle (lowercase thread=, last orch to finish)
+    /BENCHMARK:.*end=/ {
+        match($0, /end=([0-9]+)/, m)
+        benchmark_end = m[1] + 0
+    }
+    # Scheduler summary: extract thread id and total_time for sched_start derivation
+    /Scheduler summary: total_time=/ {
+        match($0, /Thread ([0-9]+):/, tm); tid = tm[1] + 0
+        match($0, /total_time=([0-9.]+)us/, m)
+        sched_total_us[tid] = m[1] + 0.0
     }
     END {
         flush_round()
         if (count == 0) { print "  (no rounds parsed)"; exit 1 }
 
-        printf "  %-8s  %12s\n", "Round", "Elapsed (us)"
-        printf "  %-8s  %12s\n", "-----", "------------"
-        sum_v = 0
-        min_v = results[0]
-        max_v = results[0]
+        # Detect whether orch/sched data is available
+        has_detail = 0
         for (i = 0; i < count; i++) {
-            printf "  %-8d  %12.1f\n", i, results[i]
-            sum_v += results[i]
-            if (results[i] < min_v) min_v = results[i]
-            if (results[i] > max_v) max_v = results[i]
+            if (r_orch[i] > 0 || r_sched[i] > 0) { has_detail = 1; break }
         }
-        printf "\n  Avg: %.1f us  (%d rounds)\n", sum_v / count, count
+
+        if (has_detail) {
+            printf "  %-8s  %12s  %12s  %12s\n", "Round", "Elapsed (us)", "Orch (us)", "Sched (us)"
+            printf "  %-8s  %12s  %12s  %12s\n", "-----", "------------", "---------", "----------"
+        } else {
+            printf "  %-8s  %12s\n", "Round", "Elapsed (us)"
+            printf "  %-8s  %12s\n", "-----", "------------"
+        }
+        sum_e = 0; min_e = r_elapsed[0]; max_e = r_elapsed[0]
+        sum_o = 0; min_o = r_orch[0]; max_o = r_orch[0]
+        sum_s = 0; min_s = r_sched[0]; max_s = r_sched[0]
+        for (i = 0; i < count; i++) {
+            if (has_detail)
+                printf "  %-8d  %12.1f  %12.1f  %12.1f\n", i, r_elapsed[i], r_orch[i], r_sched[i]
+            else
+                printf "  %-8d  %12.1f\n", i, r_elapsed[i]
+            sum_e += r_elapsed[i]
+            if (r_elapsed[i] < min_e) min_e = r_elapsed[i]
+            if (r_elapsed[i] > max_e) max_e = r_elapsed[i]
+            sum_o += r_orch[i]
+            if (r_orch[i] < min_o) min_o = r_orch[i]
+            if (r_orch[i] > max_o) max_o = r_orch[i]
+            sum_s += r_sched[i]
+            if (r_sched[i] < min_s) min_s = r_sched[i]
+            if (r_sched[i] > max_s) max_s = r_sched[i]
+        }
+        printf "\n  Avg: %.1f us  (%d rounds)\n", sum_e / count, count
         if (count > 2) {
-            trimmed = (sum_v - min_v - max_v) / (count - 2)
-            printf "  Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed, min_v, max_v
+            trimmed = (sum_e - min_e - max_e) / (count - 2)
+            printf "  Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed, min_e, max_e
+        }
+        if (has_detail) {
+            printf "\n  Orch  Avg: %.1f us", sum_o / count
+            if (count > 2) {
+                trimmed_o = (sum_o - min_o - max_o) / (count - 2)
+                printf "  Trimmed: %.1f us", trimmed_o
+            }
+            printf "  Total: %.1f us\n", sum_o
+
+            printf "  Sched Avg: %.1f us", sum_s / count
+            if (count > 2) {
+                trimmed_s = (sum_s - min_s - max_s) / (count - 2)
+                printf "  Trimmed: %.1f us", trimmed_s
+            }
+            printf "  Total: %.1f us\n", sum_s
         }
     }'
 }
