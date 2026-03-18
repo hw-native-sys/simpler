@@ -170,15 +170,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);
 
-                PTOParam params_inplace;
-                params_inplace.add_output(oi);
-                params_inplace.add_output(li_update);
-                params_inplace.add_output(mi_update);
-                CYCLE_COUNT_LAP(prof_param_setup);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace);
-                prof_submit_count++;
-                CYCLE_COUNT_LAP(prof_submit_task);
-
                 // Reusable PTOParam objects — reset() before each use avoids
                 // repeated stack-frame construction in the inner loop.
                 // params_qk must persist until params_pv.copy_scalars_from().
@@ -256,9 +247,15 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_up.add_input(mi);
                     params_up.add_input(li);
                     params_up.add_input(oi_new);
-                    params_up.add_inout(mi_update);
-                    params_up.add_inout(li_update);
-                    params_up.add_inout(oi);
+                    if (is_first) {
+                        params_up.add_output(mi_update);
+                        params_up.add_output(li_update);
+                        params_up.add_output(oi);
+                    } else {
+                        params_up.add_inout(mi_update);
+                        params_up.add_inout(li_update);
+                        params_up.add_inout(oi);
+                    }
                     params_up.add_output(out_view);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
