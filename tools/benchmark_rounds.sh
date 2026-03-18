@@ -5,7 +5,7 @@
 # Usage:
 #   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>]
 #
-# Runs all examples listed in EXAMPLES array and prints timing for each.
+# Edit the EXAMPLE_CASES map below to control which examples and cases to run.
 
 set -euo pipefail
 
@@ -14,10 +14,27 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 
 # ---------------------------------------------------------------------------
-# Examples to benchmark (paths relative to tests/device_tests/<arch>/tensormap_and_ringbuffer/)
-# Each entry is just the directory name; kernels/ and golden.py are implied.
+# Examples to benchmark and their case lists.
+# Key   = directory name under tests/device_tests/<platform>/tensormap_and_ringbuffer/
+# Value = comma-separated case names to run (empty string = run DEFAULT_CASE)
+#
+# Available cases per example (from golden.py ALL_CASES):
+#   alternating_matmul_add : Case1, Case2
+#   benchmark_bgemm        : Case0, Case1, Case2, Case3, Case4
+#   paged_attention_unroll : Case1, Case2, Case3
+#   batch_paged_attention  : Case1, Case2, Case3
+#   paged_attention        : Case1, Case2, Case3, Case4, Case5, Case6
 # ---------------------------------------------------------------------------
-EXAMPLES=(
+declare -A EXAMPLE_CASES=(
+    [alternating_matmul_add]=""
+    [benchmark_bgemm]=""
+    [paged_attention_unroll]="Case1,Case2"
+    [batch_paged_attention]=""
+    [paged_attention]=""
+)
+
+# Ordered list to control benchmark execution order
+EXAMPLE_ORDER=(
     alternating_matmul_add
     benchmark_bgemm
     paged_attention_unroll
@@ -61,6 +78,9 @@ Options:
   -h, --help     Show this help
 
 All other options are passed through to run_example.py (e.g. --case).
+
+Edit the EXAMPLE_CASES map at the top of this script to control which
+examples and cases to benchmark.
 
 Output:
   Average elapsed time in microseconds for each example.
@@ -142,11 +162,19 @@ parse_timing() {
         printf "  %-8s  %12s\n", "Round", "Elapsed (us)"
         printf "  %-8s  %12s\n", "-----", "------------"
         sum_v = 0
+        min_v = results[0]
+        max_v = results[0]
         for (i = 0; i < count; i++) {
             printf "  %-8d  %12.1f\n", i, results[i]
             sum_v += results[i]
+            if (results[i] < min_v) min_v = results[i]
+            if (results[i] > max_v) max_v = results[i]
         }
         printf "\n  Avg: %.1f us  (%d rounds)\n", sum_v / count, count
+        if (count > 2) {
+            trimmed = (sum_v - min_v - max_v) / (count - 2)
+            printf "  Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed, min_v, max_v
+        }
     }'
 }
 
@@ -182,12 +210,69 @@ wait_for_new_log() {
 }
 
 # ---------------------------------------------------------------------------
+# run_bench <example> <kernels_dir> <golden> [case_name]
+#   Run one benchmark invocation and parse timing from the resulting log.
+#   Sets global PASS / FAIL counters.
+# ---------------------------------------------------------------------------
+run_bench() {
+    local example="$1" kernels_dir="$2" golden="$3" case_name="${4:-}"
+
+    if [[ -n "$case_name" ]]; then
+        echo "  ---- $case_name ----"
+    fi
+
+    # Snapshot existing logs
+    local pre_log_file
+    pre_log_file=$(mktemp)
+    trap 'rm -f -- "$pre_log_file"' RETURN
+    ls -1 "$DEVICE_LOG_DIR"/*.log 2>/dev/null | sort > "$pre_log_file" || true
+
+    # Build run command
+    local run_cmd=(
+        python3 "$RUN_EXAMPLE"
+        -k "$kernels_dir" -g "$golden"
+        -p "$PLATFORM" -d "$DEVICE_ID"
+        -n "$ROUNDS"
+    )
+    if [[ -n "$case_name" ]]; then
+        run_cmd+=(--case "$case_name")
+    fi
+    run_cmd+=("${EXTRA_ARGS[@]}")
+
+    # Run example
+    if ! "${run_cmd[@]}" > /dev/null 2>&1; then
+        echo "  FAILED: run_example.py returned non-zero"
+        ((FAIL++)) || true
+        return
+    fi
+
+    # Find new device log
+    local new_log
+    new_log=$(wait_for_new_log "$pre_log_file")
+
+    if [[ -z "$new_log" ]]; then
+        echo "  FAILED: no device log found in $DEVICE_LOG_DIR"
+        ((FAIL++)) || true
+        return
+    fi
+
+    echo "  Log: $new_log"
+    if parse_timing "$new_log"; then
+        ((PASS++)) || true
+    else
+        ((FAIL++)) || true
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 PASS=0
 FAIL=0
 
-for example in "${EXAMPLES[@]}"; do
+for example in "${EXAMPLE_ORDER[@]}"; do
+    case_list="${EXAMPLE_CASES[$example]:-}"
+
     EXAMPLE_DIR="$EXAMPLES_DIR/$example"
     KERNELS_DIR="$EXAMPLE_DIR/kernels"
     GOLDEN="$EXAMPLE_DIR/golden.py"
@@ -203,46 +288,23 @@ for example in "${EXAMPLES[@]}"; do
         continue
     fi
 
-    # Snapshot existing logs
-    PRE_LOG_FILE=$(mktemp)
-    ls -1 "$DEVICE_LOG_DIR"/*.log 2>/dev/null | sort > "$PRE_LOG_FILE" || true
-
-    # Run example
-    if ! python3 "$RUN_EXAMPLE" \
-            -k "$KERNELS_DIR" -g "$GOLDEN" \
-            -p "$PLATFORM" -d "$DEVICE_ID" \
-            -n "$ROUNDS" \
-            "${EXTRA_ARGS[@]}" > /dev/null 2>&1; then
-        echo "  FAILED: run_example.py returned non-zero"
-        rm -f "$PRE_LOG_FILE"
-        ((FAIL++)) || true
-        continue
-    fi
-
-    # Find new device log
-    NEW_LOG=$(wait_for_new_log "$PRE_LOG_FILE")
-    rm -f "$PRE_LOG_FILE"
-
-    if [[ -z "$NEW_LOG" ]]; then
-        echo "  FAILED: no device log found in $DEVICE_LOG_DIR"
-        ((FAIL++)) || true
-        continue
-    fi
-
-    echo "  Log: $NEW_LOG"
-    if parse_timing "$NEW_LOG"; then
-        ((PASS++)) || true
+    if [[ -z "${case_list:-}" ]]; then
+        run_bench "$example" "$KERNELS_DIR" "$GOLDEN"
     else
-        ((FAIL++)) || true
+        IFS=',' read -ra cases <<< "$case_list"
+        for c in "${cases[@]}"; do
+            run_bench "$example" "$KERNELS_DIR" "$GOLDEN" "$c"
+        done
     fi
 done
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+TOTAL=$((PASS + FAIL))
 echo ""
 echo "================================================================"
-echo "  Benchmark complete: $PASS passed, $FAIL failed (${#EXAMPLES[@]} total)"
+echo "  Benchmark complete: $PASS passed, $FAIL failed ($TOTAL total)"
 echo "================================================================"
 
 [[ $FAIL -eq 0 ]]
