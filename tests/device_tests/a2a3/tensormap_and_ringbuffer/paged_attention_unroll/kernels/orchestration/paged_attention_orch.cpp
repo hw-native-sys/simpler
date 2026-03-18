@@ -181,7 +181,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
 
                 // Reusable PTOParam objects — reset() before each use avoids
                 // repeated stack-frame construction in the inner loop.
-                // params_qk must persist until params_pv.copy_scalars_from().
                 PTOParam params_qk, params_sf, params_pv, params_up;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
@@ -203,7 +202,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_qk.add_input(key_cache);
                     params_qk.add_output(sij_buf);
                     params_qk.add_scalar(n_blocks);
-                    params_qk.add_scalars_i32(bt_base + bn, N_UNROLL);
+                    params_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
                     pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);
                     prof_submit_count++;
@@ -241,7 +240,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_pv.add_input(value_cache);
                     params_pv.add_output(oi_new);
                     params_pv.add_scalar(n_blocks);
-                    params_pv.copy_scalars_from(params_qk, 1, N_UNROLL);
+                    params_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
                     pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);
                     prof_submit_count++;
