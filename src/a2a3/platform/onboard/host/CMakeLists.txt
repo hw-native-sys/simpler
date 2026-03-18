@@ -28,6 +28,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/host_log.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_log_host.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/performance_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -87,6 +88,8 @@ target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
+        hccl
+        hccl_fwk
         dl
 )
 
