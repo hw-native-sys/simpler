@@ -42,6 +42,8 @@ __aicore__ __attribute__((always_inline)) static void execute_task(
  *
  * Task dispatch reads PTO2DispatchPayload address from Handshake.task.
  * Task ID is derived from the register value (task_id + 1 encoding).
+ * With double-buffering, AICPU updates hank->task to point to the
+ * appropriate payload slot each dispatch.
  *
  * @param runtime Pointer to Runtime in global memory
  * @param block_idx Block index (core ID)
@@ -72,10 +74,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    // Cache payload address (set once by AICPU during initialization, never changes)
-    __gm__ PTO2DispatchPayload* payload =
-        reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
-
     bool profiling_enabled = runtime->enable_profiling;
     uint64_t kernel_ready_time = get_sys_cnt_aicore();
 
@@ -101,8 +99,12 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         {
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
 
-            // Invalidate payload buffer (AICPU updates its content each dispatch)
-            dcci(payload, ENTIRE_DATA_CACHE);
+            // Invalidate entire data cache to read fresh payload and hank->task
+            dcci(my_hank, ENTIRE_DATA_CACHE);
+
+            // Read per-task dispatch payload address (updated by AICPU each dispatch)
+            __gm__ PTO2DispatchPayload* payload =
+                reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
 
@@ -122,7 +124,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             }
 
             last_reg_val = reg_val;
-            write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
+
+            // Check if AICPU already dispatched a pending task
+            uint32_t next = static_cast<uint32_t>(read_reg(RegId::DATA_MAIN_BASE));
+            if (next == last_reg_val || next == AICPU_IDLE_TASK_ID) {
+                // No pending task — write FIN so AICPU knows this core is idle
+                write_reg(RegId::COND, MAKE_FIN_VALUE(task_id));
+            }
+            // Pending task exists — skip FIN; the next ACK implicitly signals completion
         }
     }
 
