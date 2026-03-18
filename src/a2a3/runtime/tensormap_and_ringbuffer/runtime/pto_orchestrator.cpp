@@ -639,8 +639,7 @@ void pto2_submit_mixed_task(
         int32_t new_rc = cur_slot_state.fanin_refcount.fetch_add(initial_refcount, std::memory_order_acq_rel)
                          + initial_refcount;
         if (new_rc >= fanin_count + 1) {
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
-            sched->ready_queues[static_cast<int32_t>(shape)].push(&cur_slot_state);
+            sched->ready_queues[0].push(&cur_slot_state);
         }
         // Record dep pool watermark in local slot state (used by tail reclamation)
         cur_slot_state.dep_pool_mark = orch->rings[ring_id].dep_pool.top;

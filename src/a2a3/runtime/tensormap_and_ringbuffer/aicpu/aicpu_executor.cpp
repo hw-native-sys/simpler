@@ -102,6 +102,19 @@ struct CoreTypeTracker {
         }
         return -1;
     }
+
+    int32_t take_last_idle() {
+        if (idle_count == 0) return -1;
+        int32_t core_id = idle[idle_count - 1];
+        idle_count--;
+        running[running_count++] = core_id;
+        return core_id;
+    }
+
+    int32_t peek_last_idle() const {
+        if (idle_count == 0) return -1;
+        return idle[idle_count - 1];
+    }
 };
 
 struct Cluster {
@@ -120,32 +133,6 @@ struct CoreStateTracker {
 
     template<CoreType CT>
     CoreTypeTracker& get() { return by_type[static_cast<int32_t>(CT)]; }
-
-    int32_t find_cluster_for_shape(PTO2ResourceShape shape) {
-        for (int32_t i = 0; i < cluster_count; i++) {
-            Cluster& c = clusters[i];
-            switch (shape) {
-            case PTO2ResourceShape::AIC_ONLY:
-                if (core_idle[c.aic_core_id]) return i;
-                break;
-            case PTO2ResourceShape::AIV_X1:
-                if (core_idle[c.aiv_core_ids[0]] || core_idle[c.aiv_core_ids[1]]) return i;
-                break;
-            case PTO2ResourceShape::AIV_X2:
-                if (core_idle[c.aiv_core_ids[0]] && core_idle[c.aiv_core_ids[1]]) return i;
-                break;
-            case PTO2ResourceShape::AIC_AIV_X1:
-                if (core_idle[c.aic_core_id] &&
-                    (core_idle[c.aiv_core_ids[0]] || core_idle[c.aiv_core_ids[1]])) return i;
-                break;
-            case PTO2ResourceShape::AIC_AIV_X2:
-                if (core_idle[c.aic_core_id] &&
-                    core_idle[c.aiv_core_ids[0]] && core_idle[c.aiv_core_ids[1]]) return i;
-                break;
-            }
-        }
-        return -1;
-    }
 };
 
 struct AicpuExecutor {
@@ -411,15 +398,8 @@ struct AicpuExecutor {
         }
     }
 
-    static const char* shape_name(PTO2ResourceShape shape) {
-        switch (shape) {
-        case PTO2ResourceShape::AIC_ONLY:   return "AIC_ONLY";
-        case PTO2ResourceShape::AIV_X1:     return "AIV_X1";
-        case PTO2ResourceShape::AIV_X2:     return "AIV_X2";
-        case PTO2ResourceShape::AIC_AIV_X1: return "AIC_AIV_X1";
-        case PTO2ResourceShape::AIC_AIV_X2: return "AIC_AIV_X2";
-        }
-        return "UNKNOWN";
+    static const char* shape_name(PTO2ResourceShape) {
+        return "UNIFIED";
     }
 
     struct ResourceCount {
@@ -427,44 +407,15 @@ struct AicpuExecutor {
         int32_t aiv;
     };
 
-    static constexpr ResourceCount shape_resource_count(PTO2ResourceShape shape) {
-        constexpr ResourceCount kTable[PTO2_NUM_RESOURCE_SHAPES] = {
-            {1, 0},  // AIC_ONLY    = 0
-            {0, 1},  // AIV_X1      = 1
-            {0, 2},  // AIV_X2      = 2
-            {1, 1},  // AIC_AIV_X1  = 3
-            {1, 2},  // AIC_AIV_X2  = 4
-        };
-        return kTable[static_cast<int>(shape)];
+    static ResourceCount get_task_resource_count(uint8_t active_mask) {
+        ResourceCount rc;
+        rc.aic = (active_mask & PTO2_SUBTASK_MASK_AIC) ? 1 : 0;
+        rc.aiv = ((active_mask & PTO2_SUBTASK_MASK_AIV0) ? 1 : 0) +
+                 ((active_mask & PTO2_SUBTASK_MASK_AIV1) ? 1 : 0);
+        return rc;
     }
 
-    /**
-     * Returns the dispatch probe order for a given scheduler thread.
-     * Widest shapes first to avoid consuming cluster resources with narrow tasks.
-     * Even/odd threads use different fallback orders (AIC-first vs AIV-first)
-     * to reduce contention on the same ready queue across adjacent threads.
-     */
-    static const PTO2ResourceShape* get_dispatch_order(int32_t thread_idx) {
-        // Even threads: AIC-first fallback after widest
-        static constexpr PTO2ResourceShape kEvenOrder[PTO2_NUM_RESOURCE_SHAPES] = {
-            PTO2ResourceShape::AIC_AIV_X2,
-            PTO2ResourceShape::AIC_AIV_X1,
-            PTO2ResourceShape::AIC_ONLY,
-            PTO2ResourceShape::AIV_X2,
-            PTO2ResourceShape::AIV_X1,
-        };
-        // Odd threads: AIV-first fallback after widest
-        static constexpr PTO2ResourceShape kOddOrder[PTO2_NUM_RESOURCE_SHAPES] = {
-            PTO2ResourceShape::AIC_AIV_X2,
-            PTO2ResourceShape::AIV_X2,
-            PTO2ResourceShape::AIC_AIV_X1,
-            PTO2ResourceShape::AIV_X1,
-            PTO2ResourceShape::AIC_ONLY,
-        };
-        return (thread_idx % 2 == 0) ? kEvenOrder : kOddOrder;
-    }
-
-    PTO2TaskSlotState* pop_ready_task(PTO2ResourceShape shape, int32_t thread_idx
+    PTO2TaskSlotState* pop_ready_task(int32_t thread_idx
 #if PTO2_SCHED_PROFILING
         , uint64_t& pop_hit, uint64_t& pop_miss
         , uint64_t& sched_dispatch_pop_cycle
@@ -474,11 +425,11 @@ struct AicpuExecutor {
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
         uint64_t t_pop_start = get_sys_cnt_aicpu();
-        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(shape,
+        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(
             g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]);
         sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
-        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(shape);
+        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task();
 #endif
         if (slot_state) {
 #if PTO2_SCHED_PROFILING
@@ -536,6 +487,47 @@ struct AicpuExecutor {
         CoreTypeTracker& ct = tracker.by_type[static_cast<int32_t>(core_type)];
         int32_t idle_idx = ct.find_idle_index(core_id);
         ct.move_idle_to_running(idle_idx);
+        tracker.core_idle[core_id] = false;
+        executing_reg_task_ids[core_id] = reg_task_id;
+    }
+
+    void dispatch_from_idle_pool(
+        Runtime* runtime, CoreStateTracker& tracker, int32_t* executing_reg_task_ids,
+        CoreType core_type, PTO2TaskSlotState& slot_state,
+        PTO2SubtaskSlot subslot
+#if PTO2_PROFILING
+        , bool profiling_enabled, int32_t thread_idx
+#endif
+    ) {
+        CoreTypeTracker& ct = tracker.by_type[static_cast<int32_t>(core_type)];
+        int32_t core_id = ct.take_last_idle();
+        if (core_id < 0) return;
+
+        PTO2DispatchPayload& payload = s_pto2_payload_per_core[core_id];
+        PTO2TaskDescriptor& task = *slot_state.task;
+        int32_t slot_idx = static_cast<int32_t>(subslot);
+        build_pto2_payload(payload, task.kernel_id[slot_idx], *slot_state.payload);
+        executing_subslot_by_core_[core_id] = subslot;
+        executing_slot_state_by_core_[core_id] = &slot_state;
+#if PTO2_PROFILING
+        if (profiling_enabled) {
+            dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+            if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE) {
+                perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
+                core_dispatch_counts_[core_id] = 0;
+            }
+            core_dispatch_counts_[core_id]++;
+        }
+#endif
+        dispatch_seq_by_core_[core_id]++;
+        uint32_t reg_task_id = dispatch_seq_by_core_[core_id] & TASK_ID_MASK;
+        while (reg_task_id == AICORE_IDLE_TASK_ID ||
+            (reg_task_id + 1) == AICORE_EXIT_SIGNAL) {
+            dispatch_seq_by_core_[core_id]++;
+            reg_task_id = dispatch_seq_by_core_[core_id] & TASK_ID_MASK;
+        }
+        write_reg(core_id_to_reg_addr_[core_id], RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
+
         tracker.core_idle[core_id] = false;
         executing_reg_task_ids[core_id] = reg_task_id;
     }
@@ -1064,7 +1056,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
         // Check AIC running cores
         bool try_completed = false;
-        always_assert(local_bufs[0].count == 0 && local_bufs[1].count == 0);  // Invariant: previous iteration fully consumed
+        always_assert(local_bufs[0].count == 0);  // Invariant: previous iteration fully consumed
         if (tracker.aic().running_count > 0) {
             try_completed = true;
             check_running_cores_for_completion<CoreType::AIC>(
@@ -1133,143 +1125,143 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 #endif
 
         // Phase 2: Local dispatch — drain local_bufs, match to idle clusters (zero MPMC operations)
-        // Phase 3: Global queue — push overflow to readyQ + fill remaining idle cores from readyQ
+        // Phase 2 & 3: Unified dispatch — drain local_bufs first, then global readyQ
+        // Break cluster constraint: use global AIC/AIV resource pools for maximum utilization
         bool try_pushed = false;
 
-        // Local dispatch: drain both per-CoreType local_bufs, match to idle clusters by shape
+        // Local dispatch: drain unified local_buf, allocate from global resource pools
         PTO2TaskSlotState* overflow_ptrs[LOCAL_READY_CAP_PER_TYPE * PTO2_LOCAL_DISPATCH_TYPE_NUM];
         int overflow_count = 0;
-        for (int bi = 0; bi < PTO2_LOCAL_DISPATCH_TYPE_NUM; bi++) {
-            while (local_bufs[bi].count > 0) {
-                PTO2TaskSlotState* slot_state = local_bufs[bi].pop();
-                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state->active_mask);
-                int32_t ci = tracker.find_cluster_for_shape(shape);
+        while (local_bufs[0].count > 0) {
+            PTO2TaskSlotState* slot_state = local_bufs[0].pop();
+            ResourceCount rc = get_task_resource_count(slot_state->active_mask);
 
-                if (ci >= 0) {
-                    try_pushed = true;
-                    Cluster& c = tracker.clusters[ci];
-#if PTO2_SCHED_PROFILING
-                    uint64_t t_setup_start = get_sys_cnt_aicpu();
-#endif
-                    ResourceCount rc = shape_resource_count(shape);
+            // Check global resource availability (no cluster constraint)
+            bool can_dispatch = true;
+            if (rc.aic > 0 && tracker.aic().idle_count < rc.aic) can_dispatch = false;
+            if (rc.aiv > 0 && tracker.aiv().idle_count < rc.aiv) can_dispatch = false;
 
-                    if (rc.aic) {
-                        dispatch_subtask_to_core(runtime, tracker, executing_reg_task_ids,
-                            c.aic_core_id, CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
-#if PTO2_PROFILING
-                            , profiling_enabled, thread_idx
-#endif
-                        );
-                    }
-                    if (rc.aiv >= 1) {
-                        int32_t aiv0 = tracker.core_idle[c.aiv_core_ids[0]] ? c.aiv_core_ids[0] : c.aiv_core_ids[1];
-                        dispatch_subtask_to_core(runtime, tracker, executing_reg_task_ids,
-                            aiv0, CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
-#if PTO2_PROFILING
-                            , profiling_enabled, thread_idx
-#endif
-                        );
-                    }
-                    if (rc.aiv >= 2) {
-                        dispatch_subtask_to_core(runtime, tracker, executing_reg_task_ids,
-                            c.aiv_core_ids[1], CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
-#if PTO2_PROFILING
-                            , profiling_enabled, thread_idx
-#endif
-                        );
-                    }
-#if PTO2_PROFILING
-                    phase_dispatch_count++;
-#endif
-#if PTO2_SCHED_PROFILING
-                    pop_hit++;
-                    local_dispatch_count++;
-                    sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
-#endif
-                    made_progress = true;
-                    DEV_DEBUG("Thread %d: Dispatching %s task %lld to cluster %d (local)",
-                        thread_idx,
-                        shape_name(shape),
-                        (long long)pto2_task_id_raw(slot_state->task->mixed_task_id),
-                        ci);
-                } else {
-                    overflow_ptrs[overflow_count++] = slot_state;
-#if PTO2_SCHED_PROFILING
-                    local_overflow_count++;
-#endif
-                }
-            }
-        }
-
-        // Push overflow to global readyQ (shape-based)
-        for (int i = 0; i < overflow_count; i++) {
-            rt->scheduler.requeue_ready_task(*overflow_ptrs[i]);
-        }
-
-        // Phase 3: Global dispatch — fill remaining idle cores from global readyQ (cluster-based)
-        const PTO2ResourceShape* dispatch_order = get_dispatch_order(thread_idx);
-
-        for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
-            PTO2ResourceShape shape = dispatch_order[si];
-            if (rt->scheduler.ready_queues[static_cast<int32_t>(shape)].size() == 0) continue;
-
-            while (true) {
-                int32_t ci = tracker.find_cluster_for_shape(shape);
-                if (ci < 0) break;
-
-                PTO2TaskSlotState* slot_state = pop_ready_task(shape, thread_idx
-#if PTO2_SCHED_PROFILING
-                    , pop_hit, pop_miss
-                    , sched_dispatch_pop_cycle
-#endif
-                );
-                if (!slot_state) break;
-
+            if (can_dispatch) {
                 try_pushed = true;
-#if PTO2_PROFILING
-                phase_dispatch_count++;
-#endif
 #if PTO2_SCHED_PROFILING
                 uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
-                Cluster& c = tracker.clusters[ci];
-                ResourceCount rc = shape_resource_count(shape);
-
-                if (rc.aic) {
-                    dispatch_subtask_to_core(runtime, tracker, executing_reg_task_ids,
-                        c.aic_core_id, CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
+                // Allocate AIC from global idle pool (O(1) fast path)
+                if (rc.aic > 0) {
+                    dispatch_from_idle_pool(runtime, tracker, executing_reg_task_ids,
+                        CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
                         , profiling_enabled, thread_idx
 #endif
                     );
                 }
+                // Allocate AIVs from global idle pool (O(1) fast path)
                 if (rc.aiv >= 1) {
-                    int32_t aiv_id = tracker.core_idle[c.aiv_core_ids[0]]
-                        ? c.aiv_core_ids[0] : c.aiv_core_ids[1];
-                    dispatch_subtask_to_core(runtime, tracker, executing_reg_task_ids,
-                        aiv_id, CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
+                    dispatch_from_idle_pool(runtime, tracker, executing_reg_task_ids,
+                        CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
                         , profiling_enabled, thread_idx
 #endif
                     );
                 }
                 if (rc.aiv >= 2) {
-                    dispatch_subtask_to_core(runtime, tracker, executing_reg_task_ids,
-                        c.aiv_core_ids[1], CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
+                    dispatch_from_idle_pool(runtime, tracker, executing_reg_task_ids,
+                        CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
                         , profiling_enabled, thread_idx
 #endif
                     );
                 }
-                made_progress = true;
+#if PTO2_PROFILING
+                phase_dispatch_count++;
+#endif
 #if PTO2_SCHED_PROFILING
+                pop_hit++;
+                local_dispatch_count++;
                 sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
-                DEV_DEBUG("Thread %d: Dispatching %s task %lld to cluster %d",
+                made_progress = true;
+                DEV_DEBUG("Thread %d: Dispatching task %lld (local, aic=%d aiv=%d) from global pools",
                     thread_idx,
-                    shape_name(shape),
                     (long long)pto2_task_id_raw(slot_state->task->mixed_task_id),
-                    ci);
+                    rc.aic, rc.aiv);
+            } else {
+                overflow_ptrs[overflow_count++] = slot_state;
+#if PTO2_SCHED_PROFILING
+                local_overflow_count++;
+#endif
+            }
+        }
+
+        // Push overflow to global readyQ
+        for (int i = 0; i < overflow_count; i++) {
+            rt->scheduler.requeue_ready_task(*overflow_ptrs[i]);
+        }
+
+        // Phase 3: Global dispatch — batch get tasks from unified readyQ and dispatch from global pools
+        if (tracker.aic().idle_count > 0 || tracker.aiv().idle_count > 0) {
+            // Batch get ready tasks (estimate max tasks we can dispatch based on resource availability)
+            int32_t max_batch = tracker.aic().idle_count + (tracker.aiv().idle_count / 2) + 1;
+            PTO2TaskSlotState* batch_tasks[256];
+            int32_t batch_count = rt->scheduler.get_ready_tasks_batch(batch_tasks, 
+                (max_batch > 256) ? 256 : max_batch);
+
+            for (int32_t bi = 0; bi < batch_count; bi++) {
+                PTO2TaskSlotState* slot_state = batch_tasks[bi];
+                ResourceCount rc = get_task_resource_count(slot_state->active_mask);
+
+                // Check global resource availability (no cluster constraint)
+                bool can_dispatch = true;
+                if (rc.aic > 0 && tracker.aic().idle_count < rc.aic) can_dispatch = false;
+                if (rc.aiv > 0 && tracker.aiv().idle_count < rc.aiv) can_dispatch = false;
+
+                if (can_dispatch) {
+                    try_pushed = true;
+#if PTO2_SCHED_PROFILING
+                    uint64_t t_setup_start = get_sys_cnt_aicpu();
+#endif
+                    // Allocate AIC from global idle pool (O(1) fast path)
+                    if (rc.aic > 0) {
+                        dispatch_from_idle_pool(runtime, tracker, executing_reg_task_ids,
+                            CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
+#if PTO2_PROFILING
+                            , profiling_enabled, thread_idx
+#endif
+                        );
+                    }
+                    // Allocate AIVs from global idle pool (O(1) fast path)
+                    if (rc.aiv >= 1) {
+                        dispatch_from_idle_pool(runtime, tracker, executing_reg_task_ids,
+                            CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
+#if PTO2_PROFILING
+                            , profiling_enabled, thread_idx
+#endif
+                        );
+                    }
+                    if (rc.aiv >= 2) {
+                        dispatch_from_idle_pool(runtime, tracker, executing_reg_task_ids,
+                            CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
+#if PTO2_PROFILING
+                            , profiling_enabled, thread_idx
+#endif
+                        );
+                    }
+                    made_progress = true;
+#if PTO2_PROFILING
+                    phase_dispatch_count++;
+#endif
+#if PTO2_SCHED_PROFILING
+                    pop_hit++;
+                    sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+#endif
+                    DEV_DEBUG("Thread %d: Dispatching task %lld (global, aic=%d aiv=%d) from global pools",
+                        thread_idx,
+                        (long long)pto2_task_id_raw(slot_state->task->mixed_task_id),
+                        rc.aic, rc.aiv);
+                } else {
+                    // Requeue task that couldn't be dispatched
+                    rt->scheduler.requeue_ready_task(*slot_state);
+                }
             }
         }
 
@@ -2079,16 +2071,11 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int32_t thread_idx,
     DEV_ALWAYS("Progress: %d/%d tasks (%.1f%%)",
              completed, total, total > 0 ? completed * 100.0 / total : 0.0);
 
-    uint64_t aic_ready = 0, aiv_ready = 0, aiv_x2_ready = 0, mixed_x1_ready = 0, mixed_x2_ready = 0;
+    uint64_t unified_ready = 0;
     if (rt) {
-        aic_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC_ONLY)].size();
-        aiv_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIV_X1)].size();
-        aiv_x2_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIV_X2)].size();
-        mixed_x1_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC_AIV_X1)].size();
-        mixed_x2_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC_AIV_X2)].size();
+        unified_ready = sched->ready_queues[0].size();
     }
-    DEV_ALWAYS("Ready Queues: AIC=%lu, AIV=%lu, AIV_X2=%lu, AIC_AIV_X1=%lu, AIC_AIV_X2=%lu",
-               aic_ready, aiv_ready, aiv_x2_ready, mixed_x1_ready, mixed_x2_ready);
+    DEV_ALWAYS("Ready Queue: UNIFIED=%lu", unified_ready);
 
     int32_t busy_cores = 0;
     int32_t idle_cores = 0;
@@ -2130,7 +2117,7 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int32_t thread_idx,
     DEV_ALWAYS("Summary: %d busy, %d idle", busy_cores, idle_cores);
 
     // Diagnose deadlock vs livelock
-    if (busy_cores == 0 && aic_ready == 0 && aiv_ready == 0 && completed < total) {
+    if (busy_cores == 0 && unified_ready == 0 && completed < total) {
         DEV_ALWAYS("*** DEADLOCK DETECTED ***");
         DEV_ALWAYS("All cores idle, no ready tasks, but %d tasks incomplete", total - completed);
         DEV_ALWAYS("Check PTO2 shared memory for task dependency state");

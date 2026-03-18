@@ -53,34 +53,23 @@ struct MixedKernels {
 };
 
 /**
- * Resource shape — classifies a MixedKernels into one of 5 queue buckets.
+ * Resource shape — unified single shape for simplified scheduling.
+ * All tasks now use a single global ready queue, eliminating shape-based classification.
+ * The active_mask still determines which cores (AIC/AIV) a task requires.
  */
 enum class PTO2ResourceShape : uint8_t {
-    AIC_ONLY    = 0,   // AIC only
-    AIV_X1      = 1,   // One AIV slot
-    AIV_X2      = 2,   // Both AIV slots
-    AIC_AIV_X1  = 3,   // AIC + one AIV
-    AIC_AIV_X2  = 4,   // AIC + both AIV
+    UNIFIED = 0,   // Single unified shape for all tasks
 };
 
-inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 5;
+inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 1;
 
 /**
  * Derive resource shape from active_mask.
- * Caller must ensure active_mask is valid (at least one bit set).
+ * Always returns UNIFIED shape since we no longer classify by resource type.
  */
 static inline PTO2ResourceShape pto2_active_mask_to_shape(uint8_t active_mask) {
-    bool has_aic = (active_mask & PTO2_SUBTASK_MASK_AIC) != 0;
-    int aiv_count = ((active_mask & PTO2_SUBTASK_MASK_AIV0) != 0)
-                  + ((active_mask & PTO2_SUBTASK_MASK_AIV1) != 0);
-
-    if (has_aic) {
-        if (aiv_count == 0) return PTO2ResourceShape::AIC_ONLY;
-        if (aiv_count == 1) return PTO2ResourceShape::AIC_AIV_X1;
-        return PTO2ResourceShape::AIC_AIV_X2;
-    }
-    if (aiv_count == 1) return PTO2ResourceShape::AIV_X1;
-    return PTO2ResourceShape::AIV_X2;
+    (void)active_mask;
+    return PTO2ResourceShape::UNIFIED;
 }
 
 /**
