@@ -476,6 +476,27 @@ struct PTO2DepListPool {
     std::atomic<int32_t>* error_code_ptr = nullptr;
 
     /**
+     * Initialize dependency list pool
+     *
+     * @param base      Pool base address from shared memory
+     * @param capacity  Total number of entries
+     */
+    void init(PTO2DepListEntry* in_base, int32_t in_capacity, std::atomic<int32_t>* in_error_code_ptr) {
+        base = in_base;
+        capacity = in_capacity;
+        top = 1;   // Start from 1, 0 means NULL/empty
+        tail = 1;  // Match initial top (no reclaimable entries yet)
+        high_water = 0;
+        last_reclaimed = 0;
+
+        // Initialize entry 0 as NULL marker
+        base[0].slot_state = nullptr;
+        base[0].next = nullptr;
+
+        error_code_ptr = in_error_code_ptr;
+    }
+
+    /**
      * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
      * Safe to call multiple times — only advances tail forward.
      *
@@ -483,7 +504,13 @@ struct PTO2DepListPool {
      * @param ring_id            Ring layer index
      * @param sm_last_task_alive Current last_task_alive from shared memory
      */
-    void reclaim(PTO2SchedulerState* sched, uint8_t ring_id, int32_t sm_last_task_alive);
+    void reclaim(PTO2SchedulerState& sched, uint8_t ring_id, int32_t sm_last_task_alive);
+
+    /**
+     * Ensure dep pool for a specific ring has at least `needed` entries available.
+     * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
+     */
+    void ensure_space(PTO2SchedulerState& sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)
@@ -536,7 +563,7 @@ struct PTO2DepListPool {
      * @param task_slot     Task slot to prepend
      * @return New head offset
      */
-    PTO2DepListEntry* pto2_dep_list_prepend(PTO2DepListEntry* cur, PTO2TaskSlotState* slot_state) {
+    PTO2DepListEntry* prepend(PTO2DepListEntry* cur, PTO2TaskSlotState* slot_state) {
         PTO2DepListEntry* new_entry = alloc();
         if (!new_entry) return nullptr;
         new_entry->slot_state = slot_state;
@@ -551,22 +578,15 @@ struct PTO2DepListPool {
         if (offset <= 0) return NULL;
         return &base[offset];
     }
+
+    int32_t used() const {
+        return top - tail;
+    }
+
+    int32_t available() const {
+        return capacity - used();
+    }
 };
-
-/**
- * Initialize dependency list pool
- * 
- * @param pool      Pool to initialize
- * @param base      Pool base address from shared memory
- * @param capacity  Total number of entries
- */
-void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t capacity);
-
-/**
- * Get pool usage statistics
- */
-int32_t pto2_dep_pool_used(PTO2DepListPool* pool);
-int32_t pto2_dep_pool_available(PTO2DepListPool* pool);
 
 // =============================================================================
 // Ring Set (per-depth aggregate)

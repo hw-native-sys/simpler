@@ -67,7 +67,6 @@ PTO2DepListPool dep_pool;
 
 // After: per-ring array
 PTO2RingSet rings[PTO2_MAX_RING_DEPTH];
-PTO2DepListEntry* dep_pool_cur_entries[PTO2_MAX_RING_DEPTH];
 int32_t dep_pool_last_reclaimed[PTO2_MAX_RING_DEPTH];
 ```
 

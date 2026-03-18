@@ -39,8 +39,18 @@ inline uint64_t get_sys_cnt_aicpu() {
     return ticks;
 }
 
+#ifdef ENABLE_PROFILING
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
-#define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
+#define CYCLE_COUNT_LAP(acc)       \
+    do {                           \
+        _t1 = get_sys_cnt_aicpu(); \
+        acc += (_t1 - _t0);        \
+        _t0 = _t1;                 \
+    } while (0)
+#else
+#define CYCLE_COUNT_START() (void)0
+#define CYCLE_COUNT_LAP(acc) (void)0
+#endif
 
 // Helper to encode float as uint64_t for scalar params
 static uint64_t float_to_u64(float f) {
@@ -70,15 +80,18 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
 __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
+#ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor    = 0;
     uint64_t prof_make_tensor   = 0;
     uint64_t prof_tensor_view   = 0;
     uint64_t prof_param_setup   = 0;
     uint64_t prof_submit_task   = 0;
+    uint64_t prof_scope_and_loop = 0;
     int      prof_submit_count  = 0;
     int      prof_make_count    = 0;
     int      prof_view_count    = 0;
+#endif
 
     CYCLE_COUNT_START();
 
@@ -115,8 +128,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     DataType data_type = DataType::BFLOAT16;
     CYCLE_COUNT_LAP(prof_param_extract);
 
-    LOG_ALWAYS(rt, ">>>>>> batch = %lu", (unsigned long)batch);
-
     uint32_t query_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
     uint32_t key_cache_shapes[2] = {(uint32_t)(batch * block_num * block_size), (uint32_t)head_dim};
     uint32_t value_cache_shapes[2] = {(uint32_t)(batch * block_num * block_size), (uint32_t)head_dim};
@@ -125,7 +136,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     Tensor key_cache = make_tensor_external(host_key_cache, key_cache_shapes, 2, data_type, false);
     Tensor value_cache = make_tensor_external(host_value_cache, value_cache_shapes, 2, data_type, false);
     Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
+
+#ifdef ENABLE_PROFILING
     CYCLE_COUNT_LAP(prof_ext_tensor);
+#endif
 
     // Prefetch first batch's block table data into cache (4 cache lines = 256 bytes)
     for (int cl = 0; cl < N_UNROLL * (int)sizeof(int); cl += 64) {
@@ -148,9 +162,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
             __builtin_prefetch(&host_context_lens[b_idx + 1], 0, 3);
         }
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
+            CYCLE_COUNT_LAP(prof_scope_and_loop);
             PTO2_SCOPE(rt) {
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
-                CYCLE_COUNT_START();
 
                 uint32_t oi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                 uint32_t li_shapes[1] = {(uint32_t)q_tile};
@@ -158,8 +172,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 Tensor oi = make_tensor(oi_shapes, 2, DataType::FLOAT32);
                 Tensor li_update = make_tensor(li_shapes, 1, DataType::FLOAT32, false);
                 Tensor mi_update = make_tensor(mi_shapes, 1, DataType::FLOAT32, false);
+#ifdef ENABLE_PROFILING
                 prof_make_count += 3;
                 CYCLE_COUNT_LAP(prof_make_tensor);
+#endif
 
                 uint32_t qi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                 uint32_t qi_offsets[2] = {(uint32_t)cur_offset, 0};
@@ -167,17 +183,20 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 uint32_t out_view_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                 uint32_t out_view_offsets[2] = {(uint32_t)cur_offset, 0};
                 Tensor out_view = out.view(out_view_shapes, out_view_offsets);
+#ifdef ENABLE_PROFILING
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);
-
+#endif
                 PTOParam params_inplace;
                 params_inplace.add_output(oi);
                 params_inplace.add_output(li_update);
                 params_inplace.add_output(mi_update);
                 CYCLE_COUNT_LAP(prof_param_setup);
                 pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace);
+#ifdef ENABLE_PROFILING
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
+#endif
 
                 // Reusable PTOParam objects — reset() before each use avoids
                 // repeated stack-frame construction in the inner loop.
@@ -195,8 +214,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     // === Task 1: Batched QK matmul ===
                     uint32_t sij_buf_shapes[2] = {(uint32_t)q_tile, (uint32_t)(n_blocks * block_size)};
                     Tensor sij_buf = make_tensor(sij_buf_shapes, 2, DataType::FLOAT32);
+#ifdef ENABLE_PROFILING
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
+#endif
 
                     params_qk.reset();
                     params_qk.add_input(qi);
@@ -206,16 +227,20 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_qk.add_scalars_i32(bt_base + bn, N_UNROLL);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);
+#ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
+#endif
 
                     // === Task 2: Two-pass softmax over all blocks in group ===
                     uint32_t pij_buf_shapes[2] = {(uint32_t)q_tile, (uint32_t)(n_blocks * block_size)};
                     Tensor pij_buf = make_tensor(pij_buf_shapes, 2, data_type);
                     Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
                     Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
+#ifdef ENABLE_PROFILING
                     prof_make_count += 3;
                     CYCLE_COUNT_LAP(prof_make_tensor);
+#endif
 
                     params_sf.reset();
                     params_sf.add_input(sij_buf);
@@ -227,14 +252,18 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_sf.add_scalar(valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf);
+#ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
+#endif
 
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
                     uint32_t oi_new_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                     Tensor oi_new = make_tensor(oi_new_shapes, 2, DataType::FLOAT32);
+#ifdef ENABLE_PROFILING
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
+#endif
 
                     params_pv.reset();
                     params_pv.add_input(pij_buf);
@@ -244,13 +273,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_pv.copy_scalars_from(params_qk, 1, N_UNROLL);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);
+#ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
+#endif
 
                     // === Task 4: Online update (per-group) ===
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
-                    CYCLE_COUNT_LAP(prof_param_extract);
 
                     params_up.reset();
                     params_up.add_input(mi);
@@ -264,15 +294,21 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up);
+#ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
+#endif
                 }
             }
+            CYCLE_COUNT_LAP(prof_scope_and_loop);
         }
     }
+    CYCLE_COUNT_LAP(prof_scope_and_loop);
 
+#ifdef ENABLE_PROFILING
     uint64_t total = prof_param_extract + prof_ext_tensor + prof_make_tensor +
-                     prof_tensor_view + prof_param_setup + prof_submit_task;
+                     prof_tensor_view + prof_param_setup + prof_submit_task +
+                     prof_scope_and_loop;
     LOG_ALWAYS(rt, "=== PagedAttn Orch Profiling: %d submits, %d makes, %d views, total=%.3fus ===",
         prof_submit_count, prof_make_count, prof_view_count, cycles_to_us(total));
     if (total > 0) {
@@ -291,7 +327,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
         LOG_ALWAYS(rt, "  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_submit_count, cycles_to_us(prof_submit_task), prof_submit_task * 100.0 / total,
             prof_submit_count > 0 ? cycles_to_us(prof_submit_task) / prof_submit_count : 0.0);
+        LOG_ALWAYS(rt, "  scope_and_loop   : %7.3fus (%5.1f%%)",
+            cycles_to_us(prof_scope_and_loop), prof_scope_and_loop * 100.0 / total);
     }
+#endif
 
 #undef CYCLE_COUNT_START
 #undef CYCLE_COUNT_LAP

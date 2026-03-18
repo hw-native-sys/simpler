@@ -116,7 +116,7 @@ static void get_aicore_regs(std::vector<int64_t>& regs, uint64_t device_id) {
     if (rt != 0) {
         LOG_ERROR("get_aicore_reg_info failed, using placeholder addresses");
         // Fallback: generate placeholder addresses
-        for (int i = 0; i < DAV_2201::PLATFORM_MAX_PHYSICAL_CORES; i++) {
+        for (uint32_t i = 0; i < DAV_2201::PLATFORM_MAX_PHYSICAL_CORES; i++) {
             aic.push_back(0xDEADBEEF00000000ULL + (i * 0x800000));  // 8M stride
             aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x100000);
             aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x200000);

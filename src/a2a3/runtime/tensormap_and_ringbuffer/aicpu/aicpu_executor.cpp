@@ -1777,34 +1777,53 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
-            uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle +
-                             p.lookup_cycle + p.heap_cycle + p.insert_cycle +
-                             p.fanin_cycle;
+            uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle + p.lookup_cycle + p.heap_cycle +
+                             p.insert_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero
-            DEV_ALWAYS("Thread %d: === Orchestrator Profiling: %lld tasks, total=%.3fus ===", thread_idx,
-                     (long long)p.submit_count, cycles_to_us(total));
-            DEV_ALWAYS("Thread %d:   sync_tensormap : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.sync_cycle), p.sync_cycle * 100.0 / total);
-            DEV_ALWAYS("Thread %d:   task_ring_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
-                cycles_to_us(p.alloc_cycle), p.alloc_cycle * 100.0 / total,
-                cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle), cycles_to_us(p.alloc_wait_cycle),
+            DEV_ALWAYS("Thread %d: === Orchestrator Profiling: %lld tasks, total=%.3fus ===",
+                thread_idx,
+                (long long)p.submit_count,
+                cycles_to_us(total));
+            DEV_ALWAYS("Thread %d:   task_ring_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
+                thread_idx,
+                cycles_to_us(p.alloc_cycle),
+                p.alloc_cycle * 100.0 / total,
+                cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle),
+                cycles_to_us(p.alloc_wait_cycle),
                 (unsigned long long)p.alloc_atomic_count);
-            DEV_ALWAYS("Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%llu", thread_idx,
-                cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total,
-                (unsigned long long)p.params_atomic_count);
-            DEV_ALWAYS("Thread %d:   lookup+dep     : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.lookup_cycle), p.lookup_cycle * 100.0 / total);
-            DEV_ALWAYS("Thread %d:   heap_alloc     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
-                cycles_to_us(p.heap_cycle), p.heap_cycle * 100.0 / total,
-                cycles_to_us(p.heap_cycle - p.heap_wait_cycle), cycles_to_us(p.heap_wait_cycle),
+            DEV_ALWAYS("Thread %d:   heap_alloc     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
+                thread_idx,
+                cycles_to_us(p.heap_cycle),
+                p.heap_cycle * 100.0 / total,
+                cycles_to_us(p.heap_cycle - p.heap_wait_cycle),
+                cycles_to_us(p.heap_wait_cycle),
                 (unsigned long long)p.heap_atomic_count);
-            DEV_ALWAYS("Thread %d:   tensormap_ins  : %.3fus (%.1f%%)", thread_idx, cycles_to_us(p.insert_cycle), p.insert_cycle * 100.0 / total);
-            DEV_ALWAYS("Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu", thread_idx,
-                cycles_to_us(p.fanin_cycle), p.fanin_cycle * 100.0 / total,
-                cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle), cycles_to_us(p.fanin_wait_cycle),
+            DEV_ALWAYS("Thread %d:   sync_tensormap : %.3fus (%.1f%%)",
+                thread_idx,
+                cycles_to_us(p.sync_cycle),
+                p.sync_cycle * 100.0 / total);
+            DEV_ALWAYS("Thread %d:   lookup+dep     : %.3fus (%.1f%%)",
+                thread_idx,
+                cycles_to_us(p.lookup_cycle),
+                p.lookup_cycle * 100.0 / total);
+            DEV_ALWAYS("Thread %d:   tensormap_ins  : %.3fus (%.1f%%)",
+                thread_idx,
+                cycles_to_us(p.insert_cycle),
+                p.insert_cycle * 100.0 / total);
+            DEV_ALWAYS("Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%llu",
+                thread_idx,
+                cycles_to_us(p.params_cycle),
+                p.params_cycle * 100.0 / total,
+                (unsigned long long)p.params_atomic_count);
+            DEV_ALWAYS("Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
+                thread_idx,
+                cycles_to_us(p.fanin_cycle),
+                p.fanin_cycle * 100.0 / total,
+                cycles_to_us(p.fanin_cycle - p.fanin_wait_cycle),
+                cycles_to_us(p.fanin_wait_cycle),
                 (unsigned long long)p.fanin_atomic_count);
-            DEV_ALWAYS("Thread %d:   scope_end      : %.3fus  atomics=%llu", thread_idx,
-                cycles_to_us(p.scope_end_cycle),
-                (unsigned long long)p.scope_end_atomic_count);
-            DEV_ALWAYS("Thread %d:   avg/task       : %.3fus", thread_idx,
+            DEV_ALWAYS("Thread %d:   avg/task       : %.3fus",
+                thread_idx,
                 p.submit_count > 0 ? cycles_to_us(total) / p.submit_count : 0.0);
 
 #if PTO2_TENSORMAP_PROFILING

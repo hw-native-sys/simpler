@@ -43,23 +43,9 @@ void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
 // =============================================================================
 // Dependency List Pool Implementation
 // =============================================================================
-
-void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t capacity) {
-    pool->base = base;
-    pool->capacity = capacity;
-    pool->top = 1;  // Start from 1, 0 means NULL/empty
-    pool->tail = 1; // Match initial top (no reclaimable entries yet)
-    pool->high_water = 0;
-    pool->last_reclaimed = 0;
-
-    // Initialize entry 0 as NULL marker
-    pool->base[0].slot_state = nullptr;
-    pool->base[0].next = nullptr;
-}
-
-void PTO2DepListPool::reclaim(PTO2SchedulerState* sched, uint8_t ring_id, int32_t sm_last_task_alive) {
+void PTO2DepListPool::reclaim(PTO2SchedulerState& sched, uint8_t ring_id, int32_t sm_last_task_alive) {
     if (sm_last_task_alive >= last_reclaimed + PTO2_DEP_POOL_CLEANUP_INTERVAL && sm_last_task_alive > 0) {
-        int32_t mark = sched->ring_sched_states[ring_id].get_slot_state_by_task_id(sm_last_task_alive - 1).dep_pool_mark;
+        int32_t mark = sched.ring_sched_states[ring_id].get_slot_state_by_task_id(sm_last_task_alive - 1).dep_pool_mark;
         if (mark > 0) {
             advance_tail(mark);
         }
@@ -67,10 +53,52 @@ void PTO2DepListPool::reclaim(PTO2SchedulerState* sched, uint8_t ring_id, int32_
     }
 }
 
-int32_t pto2_dep_pool_used(PTO2DepListPool* pool) {
-    return pool->top - pool->tail;
-}
+void PTO2DepListPool::ensure_space(
+    PTO2SchedulerState& sched, PTO2RingFlowControl& fc, uint8_t ring_id, int32_t needed) {
+    if (available() >= needed) return;
 
-int32_t pto2_dep_pool_available(PTO2DepListPool* pool) {
-    return pool->capacity - (pool->top - pool->tail);
+    int spin_count = 0;
+    int32_t prev_last_alive = fc.last_task_alive.load(std::memory_order_acquire);
+    while (available() < needed) {
+        reclaim(sched, ring_id, prev_last_alive);
+        if (available() >= needed) return;
+
+        spin_count++;
+
+        // Progress detection: reset spin counter if last_task_alive advances
+        int32_t cur_last_alive = fc.last_task_alive.load(std::memory_order_acquire);
+        if (cur_last_alive > prev_last_alive) {
+            spin_count = 0;
+            prev_last_alive = cur_last_alive;
+        }
+
+        if (spin_count >= PTO2_DEP_POOL_SPIN_LIMIT) {
+            int32_t current = fc.current_task_index.load(std::memory_order_acquire);
+            LOG_ERROR("========================================");
+            LOG_ERROR("FATAL: Dependency Pool Deadlock Detected! (ring %d)", ring_id);
+            LOG_ERROR("========================================");
+            LOG_ERROR("DepListPool cannot reclaim space after %d spins (no progress).", spin_count);
+            LOG_ERROR("  - Pool used:     %d / %d (%.1f%%)",
+                used(),
+                capacity,
+                (capacity > 0) ? (100.0 * used() / capacity) : 0.0);
+            LOG_ERROR("  - Pool top:      %d (linear)", top);
+            LOG_ERROR("  - Pool tail:     %d (linear)", tail);
+            LOG_ERROR("  - High water:    %d", high_water);
+            LOG_ERROR("  - Needed:        %d entries", needed);
+            LOG_ERROR("  - last_task_alive: %d (stuck here)", cur_last_alive);
+            LOG_ERROR("  - current_task:    %d", current);
+            LOG_ERROR("  - In-flight tasks: %d", current - cur_last_alive);
+            LOG_ERROR("Diagnosis:");
+            LOG_ERROR("  last_task_alive is not advancing, so dep pool tail");
+            LOG_ERROR("  cannot reclaim. Check TaskRing diagnostics for root cause.");
+            LOG_ERROR("Solution:");
+            LOG_ERROR("  Increase dep pool capacity (current: %d, recommended: %d)", capacity, high_water * 2);
+            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
+            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", high_water * 2);
+            LOG_ERROR("========================================");
+            exit(1);
+        }
+        SPIN_WAIT_HINT();
+    }
 }

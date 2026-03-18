@@ -41,7 +41,6 @@ struct PTO2OrchestratorState {
 
     // === PER-RING RESOURCES ===
     PTO2RingSet rings[PTO2_MAX_RING_DEPTH];
-    PTO2DepListEntry* dep_pool_cur_entries[PTO2_MAX_RING_DEPTH];
 
     // === TENSOR MAP (Private) ===
     PTO2TensorMap tensor_map;        // Producer lookup
