@@ -638,13 +638,13 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime* runtime) {
  * (Aligned with host_build_graph mechanism)
  */
 void AicpuExecutor::assign_cores_to_threads() {
-    // Cluster-aligned assignment: each cluster = 1 AIC + 2 AIV (adjacent pair)
+    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % divisor.
+    // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
     int32_t divisor = (sched_thread_num_ > 0) ? sched_thread_num_ : thread_num_;
     int32_t cluster_count = aic_count_;
-    int32_t clusters_per_thread = cluster_count / divisor;
 
-    DEV_INFO("Assigning cores: %d clusters, %d per thread (%d AIC, %d AIV)",
-             cluster_count, clusters_per_thread, aic_count_, aiv_count_);
+    DEV_INFO("Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)",
+             cluster_count, divisor, aic_count_, aiv_count_);
 
     for (int32_t i = 0; i < thread_num_; i++) {
         for (int32_t j = 0; j < MAX_CORES_PER_THREAD; j++) {
@@ -656,47 +656,51 @@ void AicpuExecutor::assign_cores_to_threads() {
         trackers_[i].aiv().idle_count = 0;
         trackers_[i].cluster_count = 0;
         memset(trackers_[i].core_idle, 0, sizeof(trackers_[i].core_idle));
+        core_count_per_thread_[i] = 0;
     }
 
-    for (int32_t t = 0; t < thread_num_; t++) {
-        if (sched_thread_num_ > 0 && t >= sched_thread_num_) {
-            // Orchestrator thread: no cores
-            core_count_per_thread_[t] = 0;
-            DEV_INFO("Thread %d: orchestrator (0 cores)", t);
-            continue;
-        }
+    // Mark orchestrator threads explicitly (no cores).
+    for (int32_t t = divisor; t < thread_num_; t++) {
+        DEV_INFO("Thread %d: orchestrator (0 cores)", t);
+    }
 
-        int32_t core_idx = 0;
+    // Per-sched-thread running core index used while filling core_assignments_.
+    int32_t core_idx[MAX_AICPU_THREADS] = {};
+
+    for (int32_t ci = 0; ci < cluster_count; ci++) {
+        int32_t t = ci % divisor;
         CoreStateTracker& tracker = trackers_[t];
+        int32_t& idx = core_idx[t];
 
-        for (int32_t c = 0; c < clusters_per_thread; c++) {
-            int32_t ci = t * clusters_per_thread + c;
-            int32_t aic_wid = aic_cores_[ci].worker_id;
-            int32_t aiv0_wid = aiv_cores_[2 * ci].worker_id;
-            int32_t aiv1_wid = aiv_cores_[2 * ci + 1].worker_id;
+        int32_t aic_wid  = aic_cores_[ci].worker_id;
+        int32_t aiv0_wid = aiv_cores_[2 * ci].worker_id;
+        int32_t aiv1_wid = aiv_cores_[2 * ci + 1].worker_id;
 
-            tracker.clusters[tracker.cluster_count++] = {aic_wid, {aiv0_wid, aiv1_wid}};
+        tracker.clusters[tracker.cluster_count++] = {aic_wid, {aiv0_wid, aiv1_wid}};
 
-            core_assignments_[t][core_idx++] = aic_wid;
-            tracker.aic().idle[tracker.aic().idle_count++] = aic_wid;
-            tracker.core_idle[aic_wid] = true;
+        core_assignments_[t][idx++] = aic_wid;
+        tracker.aic().idle[tracker.aic().idle_count++] = aic_wid;
+        tracker.core_idle[aic_wid] = true;
 
-            core_assignments_[t][core_idx++] = aiv0_wid;
-            core_assignments_[t][core_idx++] = aiv1_wid;
-            tracker.aiv().idle[tracker.aiv().idle_count++] = aiv0_wid;
-            tracker.aiv().idle[tracker.aiv().idle_count++] = aiv1_wid;
-            tracker.core_idle[aiv0_wid] = true;
-            tracker.core_idle[aiv1_wid] = true;
+        core_assignments_[t][idx++] = aiv0_wid;
+        core_assignments_[t][idx++] = aiv1_wid;
+        tracker.aiv().idle[tracker.aiv().idle_count++] = aiv0_wid;
+        tracker.aiv().idle[tracker.aiv().idle_count++] = aiv1_wid;
+        tracker.core_idle[aiv0_wid] = true;
+        tracker.core_idle[aiv1_wid] = true;
 
-            DEV_INFO("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)",
-                     t, ci, aic_wid, aiv0_wid, aiv1_wid);
-        }
-
-        core_count_per_thread_[t] = core_idx;
-        DEV_INFO("Thread %d: total %d cores (%d clusters)", t, core_idx, clusters_per_thread);
+        DEV_INFO("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)",
+                 t, ci, aic_wid, aiv0_wid, aiv1_wid);
     }
 
-    thread_cores_num_ = clusters_per_thread * 3;
+    for (int32_t t = 0; t < divisor; t++) {
+        core_count_per_thread_[t] = core_idx[t];
+        DEV_INFO("Thread %d: total %d cores (%d clusters)", t, core_idx[t], trackers_[t].cluster_count);
+    }
+
+    // Max clusters any single sched thread can hold: ceil(cluster_count / divisor).
+    int32_t max_clusters_per_thread = (cluster_count + divisor - 1) / divisor;
+    thread_cores_num_ = max_clusters_per_thread * 3;
 }
 
 /**
