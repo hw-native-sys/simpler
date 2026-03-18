@@ -367,9 +367,11 @@ struct AicpuExecutor {
                     uint32_t count = perf_buf->count;
                     if (count > 0) {
                         PerfRecord* record = &perf_buf->records[count - 1];
-                        if (record->task_id == static_cast<uint32_t>(expected_reg_task_id)) {
+                        if (record->mixed_task_id == static_cast<uint64_t>(expected_reg_task_id)) {
                             // Fill metadata that AICore doesn't know
                             int32_t perf_slot_idx = static_cast<int32_t>(executing_subslot_by_core_[core_id]);
+                            // Overwrite with full mixed_task_id for cross-view correlation.
+                            record->mixed_task_id = pto2_task_id_raw(slot_state.task->mixed_task_id);
                             record->func_id = slot_state.task->kernel_id[perf_slot_idx];
                             record->core_type = CT;
                             perf_aicpu_record_dispatch_and_finish_time(
@@ -384,10 +386,11 @@ struct AicpuExecutor {
                             record->fanout_count = 0;
                             PTO2DepListEntry* cur = slot_state.fanout_head;
                             while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
-                                record->fanout[record->fanout_count++] = static_cast<int32_t>(
-                                    pto2_task_id_local(cur->slot_state->task->mixed_task_id));
+                                record->fanout[record->fanout_count++] =
+                                    pto2_task_id_raw(cur->slot_state->task->mixed_task_id);
                                 cur = cur->next;
                             }
+                            record->fanout_filled = 1;
                         }
                     }
 #if PTO2_SCHED_PROFILING
@@ -1716,9 +1719,10 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 }
 #endif
 
-                // With multi-ring, slot_states are per-ring inside the scheduler.
-                // Fanout fill-in in complete_perf_records is disabled (slot_states_ptr = nullptr).
-                runtime->set_pto2_slot_states_ptr(nullptr);
+                // Register per-ring slot states for complete_perf_records fallback.
+                for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                    runtime->set_pto2_ring_slot_states_ptr(r, rt->scheduler.ring_sched_states[r].slot_states);
+                }
 
                 // Store shared state for other orchestrator threads
                 orch_func_ = orch_func;

@@ -58,7 +58,9 @@ static inline void perf_aicore_record_task(
     record->start_time = start_time;
     record->end_time = end_time;
     record->kernel_ready_time = kernel_ready_time;
-    record->task_id = task_id;
+    record->mixed_task_id = task_id;
+    record->fanout_count = 0;
+    record->fanout_filled = 0;
 
     perf_buf->count = idx + 1;
 

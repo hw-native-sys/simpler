@@ -632,7 +632,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                     uint32_t count = perf_buf->count;
                     if (count > 0) {
                         PerfRecord* record = &perf_buf->records[count - 1];
-                        if (record->task_id == static_cast<uint32_t>(completed_task_id)) {
+                        if (record->mixed_task_id == static_cast<uint64_t>(completed_task_id)) {
                             record->func_id = runtime.tasks[completed_task_id].func_id;
                             record->core_type = h->core_type;
                             perf_aicpu_record_dispatch_and_finish_time(
@@ -769,7 +769,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                     uint32_t count = perf_buf->count;
                     if (count > 0) {
                         PerfRecord* record = &perf_buf->records[count - 1];
-                        if (record->task_id == static_cast<uint32_t>(completed_task_id)) {
+                        if (record->mixed_task_id == static_cast<uint64_t>(completed_task_id)) {
                             record->func_id = runtime.tasks[completed_task_id].func_id;
                             record->core_type = h->core_type;
                             perf_aicpu_record_dispatch_and_finish_time(

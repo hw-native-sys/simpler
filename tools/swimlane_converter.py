@@ -150,6 +150,23 @@ def parse_sched_cpu_from_device_log(log_path, task_count):
     }
 
 
+def format_task_display(task_id):
+    """Format task id for labels.
+
+    task_id in perf JSON may be mixed_task_id (ring_id<<32 | local_id).
+    Display as:
+      - ring_id > 0: r{ring_id}t{local_id}
+      - ring_id == 0: t{local_id}
+    """
+    if not isinstance(task_id, int) or task_id < 0:
+        return str(task_id)
+    ring_id = (task_id >> 32) & 0xFFFFFFFF
+    local_id = task_id & 0xFFFFFFFF
+    if ring_id > 0:
+        return f"r{ring_id}t{local_id}"
+    return f"t{local_id}"
+
+
 def print_task_statistics(tasks, func_id_to_name=None, sched_info=None):
     """Print task statistics grouped by func_id.
 
@@ -425,11 +442,11 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
         func_id = task['func_id']
         if func_id_to_name and str(func_id) in func_id_to_name:
             func_name = func_id_to_name[str(func_id)]
-            # New format: FuncName(task_id)
-            task_name = f"{func_name}({task['task_id']})"
+            # New format: FuncName(t{task_id})
+            task_name = f"{func_name}({format_task_display(task['task_id'])})"
         else:
-            # Fallback format: Func_{func_id}(task_id)
-            task_name = f"Func_{func_id}({task['task_id']})"
+            # Fallback format: Func_{func_id}(t{task_id})
+            task_name = f"Func_{func_id}({format_task_display(task['task_id'])})"
 
         events.append({
             "args": {
@@ -468,9 +485,9 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
             func_id = task['func_id']
             if func_id_to_name and str(func_id) in func_id_to_name:
                 func_name = func_id_to_name[str(func_id)]
-                task_name = f"{func_name}({task['task_id']})"
+                task_name = f"{func_name}({format_task_display(task['task_id'])})"
             else:
-                task_name = f"Func_{func_id}({task['task_id']})"
+                task_name = f"Func_{func_id}({format_task_display(task['task_id'])})"
 
             events.append({
                 "args": {
@@ -680,7 +697,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
 
                 # Show task_id in name for task-specific phases
                 if task_id >= 0:
-                    label = f"{display_name}(t{task_id})"
+                    label = f"{display_name}({format_task_display(task_id)})"
                 else:
                     label = f"{display_name}({submit_idx})"
 
@@ -867,62 +884,63 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                 })
                 flow_id += 1
 
-    # Orchestrator FINALIZE → Scheduler DISPATCH arrows (per task_id)
-    if orchestrator_phases and scheduler_phases:
-        # Flatten per-thread orch phases and track source thread
-        orch_finalize_by_task = {}
+    # Orchestrator FANIN(end) → Scheduler DISPATCH(start) arrows (per mixed_task_id)
+    if orchestrator_phases and scheduler_phases and has_aicpu_data:
+        # Build mixed_task_id -> (fanin_record, orch_thread_idx); keep latest end_time_us on collision.
+        orch_fanin_by_task = {}
         for orch_idx, thread_records in enumerate(orch_threads):
             for record in thread_records:
-                if record.get("phase") == "orch_finalize":
-                    task_id = record.get("task_id", -1)
-                    if task_id >= 0:
-                        orch_finalize_by_task[task_id] = (record, orch_idx)
-
-        # Use core_to_sched_thread mapping (built above) to find the correct
-        # scheduler thread for each task's core.
-        if orch_finalize_by_task and has_aicpu_data:
-            for task in tasks:
-                tid = task.get('task_id')
-                if tid is None or tid not in orch_finalize_by_task:
+                if record.get("phase") != "orch_fanin":
                     continue
-
-                dispatch_us = task.get('dispatch_time_us', 0)
-                if dispatch_us <= 0:
+                task_id = record.get("task_id")
+                if not isinstance(task_id, int) or task_id < 0:
                     continue
+                prev = orch_fanin_by_task.get(task_id)
+                if prev is None or record.get("end_time_us", 0) > prev[0].get("end_time_us", 0):
+                    orch_fanin_by_task[task_id] = (record, orch_idx)
 
-                finalize_rec, orch_idx = orch_finalize_by_task[tid]
-                # Use finalize start_time: init_task() runs at the beginning of FINALIZE,
-                # making the task dispatchable before FINALIZE ends. Using start avoids
-                # reverse arrows when the scheduler dispatches during FINALIZE.
-                finalize_start_us = finalize_rec["start_time_us"]
+        for task in tasks:
+            task_id = task.get('task_id')
+            if task_id is None or task_id not in orch_fanin_by_task:
+                continue
 
-                matched_thread = core_to_sched_thread.get(task['core_id'])
+            dispatch_us = task.get('dispatch_time_us', 0)
+            if dispatch_us <= 0:
+                continue
 
-                if matched_thread is not None:
-                    sched_tid = 3000 + matched_thread
-                    orch_tid = 4000 + orch_idx
+            fanin_rec, orch_idx = orch_fanin_by_task[task_id]
+            fanin_end_us = fanin_rec.get("end_time_us", 0)
+            if fanin_end_us <= 0:
+                continue
 
-                    # Flow: Orchestrator finalize start → Scheduler DISPATCH
-                    events.append({
-                        "cat": "flow",
-                        "id": flow_id,
-                        "name": "orch→dispatch",
-                        "ph": "s",
-                        "pid": 4,
-                        "tid": orch_tid,
-                        "ts": finalize_start_us
-                    })
-                    events.append({
-                        "cat": "flow",
-                        "id": flow_id,
-                        "name": "orch→dispatch",
-                        "ph": "f",
-                        "pid": 3,
-                        "tid": sched_tid,
-                        "ts": dispatch_us,
-                        "bp": "e"
-                    })
-                    flow_id += 1
+            matched_thread = core_to_sched_thread.get(task['core_id'])
+            if matched_thread is None:
+                continue
+
+            sched_tid = 3000 + matched_thread
+            orch_tid = 4000 + orch_idx
+
+            # Flow: Orchestrator FANIN end → Scheduler DISPATCH start
+            events.append({
+                "cat": "flow",
+                "id": flow_id,
+                "name": "orch→dispatch",
+                "ph": "s",
+                "pid": 4,
+                "tid": orch_tid,
+                "ts": fanin_end_us
+            })
+            events.append({
+                "cat": "flow",
+                "id": flow_id,
+                "name": "orch→dispatch",
+                "ph": "f",
+                "pid": 3,
+                "tid": sched_tid,
+                "ts": dispatch_us,
+                "bp": "e"
+            })
+            flow_id += 1
 
     if verbose:
         print(f"  Total events: {len(events)}")
