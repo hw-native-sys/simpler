@@ -158,6 +158,12 @@ public:
 
     // Profiling support
     bool enable_profiling;    // Enable profiling flag
+
+    // Orchestrator-to-scheduler transition control
+    // When true, orchestrator threads convert to scheduler threads after orchestration completes.
+    // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
+    // Controlled via PTO2_ORCH_TO_SCHED environment variable.
+    bool orch_to_sched;
     uint64_t perf_data_base;  // Performance data shared memory base address (device-side)
 
 private:

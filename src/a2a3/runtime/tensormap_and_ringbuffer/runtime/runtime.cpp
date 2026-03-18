@@ -27,6 +27,7 @@ Runtime::Runtime() {
     pto2_task_window_size = 0;
     pto2_heap_size = 0;
     pto2_dep_pool_size = 0;
+    orch_to_sched = false;
 
     // Initialize tensor pairs
     tensor_pair_count = 0;
