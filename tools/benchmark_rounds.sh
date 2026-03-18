@@ -3,9 +3,9 @@
 # then parse device-log timing lines to report per-round latency.
 #
 # Usage:
-#   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-c <case>...]
+#   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>]
 #
-# Runs all examples listed in EXAMPLES array and prints timing for each.
+# Edit the EXAMPLE_CASES map below to control which examples and cases to run.
 
 set -euo pipefail
 
@@ -14,10 +14,27 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 
 # ---------------------------------------------------------------------------
-# Examples to benchmark (paths relative to tests/device_tests/<arch>/tensormap_and_ringbuffer/)
-# Each entry is just the directory name; kernels/ and golden.py are implied.
+# Examples to benchmark and their case lists.
+# Key   = directory name under tests/device_tests/<platform>/tensormap_and_ringbuffer/
+# Value = comma-separated case names to run (empty string = run DEFAULT_CASE)
+#
+# Available cases per example (from golden.py ALL_CASES):
+#   alternating_matmul_add : Case1, Case2
+#   benchmark_bgemm        : Case0, Case1, Case2, Case3, Case4
+#   paged_attention_unroll : Case1, Case2, Case3
+#   batch_paged_attention  : Case1, Case2, Case3
+#   paged_attention        : Case1, Case2, Case3, Case4, Case5, Case6
 # ---------------------------------------------------------------------------
-EXAMPLES=(
+declare -A EXAMPLE_CASES=(
+    [alternating_matmul_add]=""
+    [benchmark_bgemm]=""
+    [paged_attention_unroll]="Case1,Case2"
+    [batch_paged_attention]=""
+    [paged_attention]=""
+)
+
+# Ordered list to control benchmark execution order
+EXAMPLE_ORDER=(
     alternating_matmul_add
     benchmark_bgemm
     paged_attention_unroll
@@ -31,7 +48,6 @@ EXAMPLES=(
 DEVICE_ID=0
 ROUNDS=10
 PLATFORM=a2a3
-CASES=()
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -48,27 +64,21 @@ while [[ $# -gt 0 ]]; do
             ROUNDS="$2"
             shift 2
             ;;
-        -c|--case)
-            IFS=',' read -ra _cases <<< "$2"
-            CASES+=("${_cases[@]}")
-            shift 2
-            ;;
         --help|-h)
             cat <<'USAGE'
 benchmark_rounds.sh — run all examples and report per-round timing from device logs
 
 Usage:
-  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-c <case>]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>]
 
 Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 10)
-  -c, --case     Run specific test case(s) by name; repeatable and comma-separated
-                   (e.g. --case Case1 -c Case2 or --case Case1,Case2)
   -h, --help     Show this help
 
-All other options are passed through to run_example.py.
+Edit the EXAMPLE_CASES map at the top of this script to control which
+examples and cases to benchmark.
 
 Output:
   Average elapsed time in microseconds for each example.
@@ -212,6 +222,7 @@ run_bench() {
     # Snapshot existing logs
     local pre_log_file
     pre_log_file=$(mktemp)
+    trap 'rm -f -- "$pre_log_file"' RETURN
     ls -1 "$DEVICE_LOG_DIR"/*.log 2>/dev/null | sort > "$pre_log_file" || true
 
     # Build run command
@@ -229,7 +240,6 @@ run_bench() {
     # Run example
     if ! "${run_cmd[@]}" > /dev/null 2>&1; then
         echo "  FAILED: run_example.py returned non-zero"
-        rm -f "$pre_log_file"
         ((FAIL++)) || true
         return
     fi
@@ -237,7 +247,6 @@ run_bench() {
     # Find new device log
     local new_log
     new_log=$(wait_for_new_log "$pre_log_file")
-    rm -f "$pre_log_file"
 
     if [[ -z "$new_log" ]]; then
         echo "  FAILED: no device log found in $DEVICE_LOG_DIR"
@@ -259,7 +268,9 @@ run_bench() {
 PASS=0
 FAIL=0
 
-for example in "${EXAMPLES[@]}"; do
+for example in "${EXAMPLE_ORDER[@]}"; do
+    case_list="${EXAMPLE_CASES[$example]:-}"
+
     EXAMPLE_DIR="$EXAMPLES_DIR/$example"
     KERNELS_DIR="$EXAMPLE_DIR/kernels"
     GOLDEN="$EXAMPLE_DIR/golden.py"
@@ -275,21 +286,23 @@ for example in "${EXAMPLES[@]}"; do
         continue
     fi
 
-    if [[ ${#CASES[@]} -gt 0 ]]; then
-        for c in "${CASES[@]}"; do
+    IFS=',' read -ra cases <<< "${case_list:-}"
+    if [[ ${#cases[@]} -eq 0 || ( ${#cases[@]} -eq 1 && -z "${cases[0]}" ) ]]; then
+        run_bench "$example" "$KERNELS_DIR" "$GOLDEN"
+    else
+        for c in "${cases[@]}"; do
             run_bench "$example" "$KERNELS_DIR" "$GOLDEN" "$c"
         done
-    else
-        run_bench "$example" "$KERNELS_DIR" "$GOLDEN"
     fi
 done
 
 # ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
+TOTAL=$((PASS + FAIL))
 echo ""
 echo "================================================================"
-echo "  Benchmark complete: $PASS passed, $FAIL failed (${#EXAMPLES[@]} total)"
+echo "  Benchmark complete: $PASS passed, $FAIL failed ($TOTAL total)"
 echo "================================================================"
 
 [[ $FAIL -eq 0 ]]

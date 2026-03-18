@@ -18,7 +18,7 @@ RTOL = 1e-3
 ATOL = 1e-3
 
 ALL_CASES = {
-    "case1": {
+    "Case1": {
         "batch": 500,
         "M": 4,
         "N": 4,
@@ -26,7 +26,7 @@ ALL_CASES = {
         "matmul_batch": 4,
         "add_batch": 4,
     },
-    "case2": {
+    "Case2": {
         "batch": 512,
         "M": 2,  # Number of matmul tasks per batch
         "N": 5,  # Number of add tasks per batch
@@ -34,10 +34,10 @@ ALL_CASES = {
         "matmul_batch": 4,  # Number of matmul tiles per task
         "add_batch": 5,  # Number of add tiles per task
     },
-    
+
 }
 
-DEFAULT_CASE = "case1"
+DEFAULT_CASE = "Case1"
 
 
 def generate_inputs(params: dict) -> list:
