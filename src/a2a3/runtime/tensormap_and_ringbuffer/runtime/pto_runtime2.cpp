@@ -32,6 +32,22 @@ static void submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                            params);
 }
 
+static void submit_task_async_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+                                   const PTOParam& params, uint64_t event_output_gm_addr) {
+    pto2_submit_mixed_task_async(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
+                                 params, event_output_gm_addr);
+}
+
+static void submit_task_async_sdma_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+                                        const PTOParam& params, uint64_t event_output_gm_addr) {
+    pto2_submit_mixed_task_async_sdma(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
+                                      params, event_output_gm_addr);
+}
+
+static uint64_t get_sdma_workspace_impl(PTO2Runtime* rt) {
+    return rt->sdma_workspace_addr;
+}
+
 void pto2_rt_scope_begin(PTO2Runtime* rt) {
     pto2_scope_begin(&rt->orchestrators[pto2_current_orch_idx]);
 }
@@ -49,16 +65,19 @@ static bool is_fatal_impl(PTO2Runtime* rt) {
 }
 
 static const PTO2RuntimeOps s_runtime_ops = {
-    .submit_task          = submit_task_impl,
-    .scope_begin          = pto2_rt_scope_begin,
-    .scope_end            = pto2_rt_scope_end,
-    .orchestration_done   = pto2_rt_orchestration_done,
-    .is_fatal             = is_fatal_impl,
-    .log_error            = unified_log_error,
-    .log_warn             = unified_log_warn,
-    .log_info             = unified_log_info,
-    .log_debug            = unified_log_debug,
-    .log_always           = unified_log_always,
+    .submit_task            = submit_task_impl,
+    .submit_task_async      = submit_task_async_impl,
+    .submit_task_async_sdma = submit_task_async_sdma_impl,
+    .get_sdma_workspace     = get_sdma_workspace_impl,
+    .scope_begin            = pto2_rt_scope_begin,
+    .scope_end              = pto2_rt_scope_end,
+    .orchestration_done     = pto2_rt_orchestration_done,
+    .is_fatal               = is_fatal_impl,
+    .log_error              = unified_log_error,
+    .log_warn               = unified_log_warn,
+    .log_info               = unified_log_info,
+    .log_debug              = unified_log_debug,
+    .log_always             = unified_log_always,
 };
 
 // =============================================================================

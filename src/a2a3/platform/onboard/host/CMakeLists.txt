@@ -81,6 +81,30 @@ target_link_directories(host_runtime
         ${ASCEND_HOME_PATH}/runtime/lib64
 )
 
+# Detect HCCL library version: CANN 9.x ships hccl_v2 instead of hccl
+find_library(HCCL_LIB NAMES hccl PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+find_library(HCCL_V2_LIB NAMES hccl_v2 PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+
+if(HCCL_LIB)
+    set(HCCL_LINK_TARGETS hccl)
+    message(STATUS "Using HCCL library: hccl")
+elseif(HCCL_V2_LIB)
+    set(HCCL_LINK_TARGETS hccl_v2 hccl_plf)
+    target_compile_definitions(host_runtime PRIVATE HCCL_USE_V2_API=1)
+    message(STATUS "Using HCCL library: hccl_v2 + hccl_plf (CANN 9.x)")
+else()
+    message(WARNING "Neither hccl nor hccl_v2 found, linking against hccl and hoping for the best")
+    set(HCCL_LINK_TARGETS hccl)
+endif()
+
+# Optionally link nnopbase (provides aclCreateTensor/aclDestroyTensor for SdmaWorkspaceManager)
+find_library(NNOPBASE_LIB NAMES nnopbase PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+if(NNOPBASE_LIB)
+    set(NNOPBASE_LINK nnopbase)
+else()
+    set(NNOPBASE_LINK "")
+endif()
+
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
 # when performance profiling is enabled
@@ -88,8 +112,9 @@ target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
-        hccl
+        ${HCCL_LINK_TARGETS}
         hccl_fwk
+        ${NNOPBASE_LINK}
         dl
 )
 

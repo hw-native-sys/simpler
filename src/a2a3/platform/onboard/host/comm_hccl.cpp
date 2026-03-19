@@ -22,14 +22,65 @@
 #include "hccl/hccl_comm.h"
 #include "hccl/hccl_types.h"
 
-// Internal HCCL APIs (not in public headers)
+using CommTopo = uint32_t;
+
+// Internal HCCL APIs (not in public headers).
+// CANN 9.x renames all HCCL symbols with a V2 suffix and ships libhccl_v2.so.
+// The public header still declares weak non-V2 symbols, so we declare V2 variants
+// separately and dispatch via inline wrappers.
+#ifdef HCCL_USE_V2_API
+extern "C" HcclResult HcclGetRootInfoV2(HcclRootInfo* rootInfo);
+extern "C" HcclResult HcclCommInitRootInfoV2(uint32_t nRanks, const HcclRootInfo* rootInfo,
+                                              uint32_t rank, HcclComm* comm);
+extern "C" HcclResult HcclGetCommNameV2(HcclComm comm, char* commName);
+extern "C" HcclResult HcclBarrierV2(HcclComm comm, aclrtStream stream);
+extern "C" HcclResult HcclCommDestroyV2(HcclComm comm);
+extern "C" HcclResult HcclAllocComResourceByTilingV2(HcclComm comm, void* stream,
+                                                      void* mc2Tiling, void** commContext);
+extern "C" HcclResult HcomGetCommHandleByGroupV2(const char* group, HcclComm* commHandle);
+extern "C" HcclResult HcomGetL0TopoTypeExV2(const char* group, CommTopo* topoType,
+                                             uint32_t isSetDevice);
+
+static inline HcclResult hccl_get_root_info(HcclRootInfo* ri)
+    { return HcclGetRootInfoV2(ri); }
+static inline HcclResult hccl_comm_init_root_info(uint32_t n, const HcclRootInfo* ri, uint32_t r, HcclComm* c)
+    { return HcclCommInitRootInfoV2(n, ri, r, c); }
+static inline HcclResult hccl_get_comm_name(HcclComm c, char* name)
+    { return HcclGetCommNameV2(c, name); }
+static inline HcclResult hccl_barrier(HcclComm c, aclrtStream s)
+    { return HcclBarrierV2(c, s); }
+static inline HcclResult hccl_comm_destroy(HcclComm c)
+    { return HcclCommDestroyV2(c); }
+static inline HcclResult hccl_alloc_com_resource(HcclComm c, void* s, void* t, void** ctx)
+    { return HcclAllocComResourceByTilingV2(c, s, t, ctx); }
+static inline HcclResult hccl_get_comm_handle_by_group(const char* g, HcclComm* c)
+    { return HcomGetCommHandleByGroupV2(g, c); }
+static inline HcclResult hccl_get_l0_topo_type_ex(const char* g, CommTopo* t, uint32_t f)
+    { return HcomGetL0TopoTypeExV2(g, t, f); }
+#else
 extern "C" HcclResult HcclAllocComResourceByTiling(HcclComm comm, void* stream,
                                                     void* mc2Tiling, void** commContext);
 extern "C" HcclResult HcomGetCommHandleByGroup(const char* group, HcclComm* commHandle);
-
-using CommTopo = uint32_t;
 extern "C" HcclResult HcomGetL0TopoTypeEx(const char* group, CommTopo* topoType,
                                            uint32_t isSetDevice);
+
+static inline HcclResult hccl_get_root_info(HcclRootInfo* ri)
+    { return HcclGetRootInfo(ri); }
+static inline HcclResult hccl_comm_init_root_info(uint32_t n, const HcclRootInfo* ri, uint32_t r, HcclComm* c)
+    { return HcclCommInitRootInfo(n, ri, r, c); }
+static inline HcclResult hccl_get_comm_name(HcclComm c, char* name)
+    { return HcclGetCommName(c, name); }
+static inline HcclResult hccl_barrier(HcclComm c, aclrtStream s)
+    { return HcclBarrier(c, s); }
+static inline HcclResult hccl_comm_destroy(HcclComm c)
+    { return HcclCommDestroy(c); }
+static inline HcclResult hccl_alloc_com_resource(HcclComm c, void* s, void* t, void** ctx)
+    { return HcclAllocComResourceByTiling(c, s, t, ctx); }
+static inline HcclResult hccl_get_comm_handle_by_group(const char* g, HcclComm* c)
+    { return HcomGetCommHandleByGroup(g, c); }
+static inline HcclResult hccl_get_l0_topo_type_ex(const char* g, CommTopo* t, uint32_t f)
+    { return HcomGetL0TopoTypeEx(g, t, f); }
+#endif
 
 static constexpr uint32_t COMM_IS_NOT_SET_DEVICE = 0;
 static constexpr uint32_t COMM_TOPO_MESH = 0b1u;
@@ -299,7 +350,7 @@ extern "C" CommHandle comm_init(int rank, int nranks, const char* rootinfo_path)
     // RootInfo exchange
     HcclRootInfo rootInfo{};
     if (rank == 0) {
-        HcclResult hret = HcclGetRootInfo(&rootInfo);
+        HcclResult hret = hccl_get_root_info(&rootInfo);
         if (hret != HCCL_SUCCESS) {
             fprintf(stderr, "[comm rank 0] HcclGetRootInfo failed: %d\n", (int)hret);
             delete h;
@@ -322,7 +373,7 @@ extern "C" CommHandle comm_init(int rank, int nranks, const char* rootinfo_path)
     rtStreamCreate(&h->stream, RT_STREAM_PRIORITY_DEFAULT);
 
     // Init communicator
-    HcclResult hret = HcclCommInitRootInfo(
+    HcclResult hret = hccl_comm_init_root_info(
         static_cast<uint32_t>(nranks), &rootInfo, static_cast<uint32_t>(rank), &h->hccl_comm);
     if (hret != HCCL_SUCCESS) {
         fprintf(stderr, "[comm rank %d] HcclCommInitRootInfo failed: %d\n", rank, (int)hret);
@@ -338,15 +389,15 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t /*win_size*/, uint64_t* d
     if (!h || !device_ctx_out) return -1;
 
     char group[128] = {};
-    HcclResult hret = HcclGetCommName(h->hccl_comm, group);
+    HcclResult hret = hccl_get_comm_name(h->hccl_comm, group);
     if (hret != HCCL_SUCCESS) return -1;
 
     CommTopo topoType = 0;
-    hret = HcomGetL0TopoTypeEx(group, &topoType, COMM_IS_NOT_SET_DEVICE);
+    hret = hccl_get_l0_topo_type_ex(group, &topoType, COMM_IS_NOT_SET_DEVICE);
     if (hret != HCCL_SUCCESS) return -1;
 
     HcclComm commHandle = nullptr;
-    hret = HcomGetCommHandleByGroup(group, &commHandle);
+    hret = hccl_get_comm_handle_by_group(group, &commHandle);
     if (hret != HCCL_SUCCESS) return -1;
 
     // File barrier so all ranks have completed HcclCommInitRootInfo
@@ -372,7 +423,7 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t /*win_size*/, uint64_t* d
     strncpy(tiling.inner.algConfig, "BatchWrite=level0:fullmesh", ALG_CONFIG_SIZE - 1);
 
     void* ctxPtr = nullptr;
-    hret = HcclAllocComResourceByTiling(commHandle, h->stream, &tiling, &ctxPtr);
+    hret = hccl_alloc_com_resource(commHandle, h->stream, &tiling, &ctxPtr);
     if (hret != HCCL_SUCCESS || ctxPtr == nullptr) return -1;
 
     // Extract CommDeviceContext (topology-dependent)
@@ -451,7 +502,7 @@ extern "C" int comm_get_local_window_base(CommHandle h, uint64_t* base_out) {
 
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
-    HcclBarrier(h->hccl_comm, (aclrtStream)h->stream);
+    hccl_barrier(h->hccl_comm, (aclrtStream)h->stream);
     aclrtSynchronizeStream((aclrtStream)h->stream);
     return 0;
 }
@@ -463,7 +514,7 @@ extern "C" int comm_destroy(CommHandle h) {
         aclrtFree(h->device_ctx);
     }
     if (h->stream) rtStreamDestroy(h->stream);
-    if (h->hccl_comm) HcclCommDestroy(h->hccl_comm);
+    if (h->hccl_comm) hccl_comm_destroy(h->hccl_comm);
 
     // NOTE: Do NOT call aclrtResetDevice / aclFinalize here.
     // Device lifecycle is owned by DeviceRunner (static singleton) whose

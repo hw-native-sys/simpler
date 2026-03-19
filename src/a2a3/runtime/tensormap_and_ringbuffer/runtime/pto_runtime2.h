@@ -61,6 +61,11 @@ typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 struct PTO2RuntimeOps {
     void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                         const PTOParam& params);
+    void (*submit_task_async)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+                              const PTOParam& params, uint64_t event_output_gm_addr);
+    void (*submit_task_async_sdma)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+                                   const PTOParam& params, uint64_t event_output_gm_addr);
+    uint64_t (*get_sdma_workspace)(PTO2Runtime* rt);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
@@ -97,6 +102,9 @@ struct PTO2Runtime {
 
     // Mode
     PTO2RuntimeMode         mode;
+
+    // SDMA workspace address (0 = not available, set by host SdmaWorkspaceManager)
+    uint64_t                sdma_workspace_addr{0};
 
     // Statistics
     int64_t                 total_cycles;

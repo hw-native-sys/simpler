@@ -600,6 +600,60 @@ void pto2_submit_mixed_task(
 }
 
 // =============================================================================
+// Async Task Submission (deferred completion)
+// =============================================================================
+
+void pto2_submit_mixed_task_async(PTO2OrchestratorState* orch,
+    const MixedKernels& mixed_kernels,
+    const PTOParam& params,
+    uint64_t event_output_gm_addr) {
+    // Build a modified params with the event_output_gm_addr appended as the last scalar.
+    // The scheduler reads this from payload->scalars[scalar_count - 1] after AICore completes.
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+
+    // Submit via the normal path first — this sets up all dependency tracking,
+    // slot allocation, fanin/fanout, and heap allocation.
+    pto2_submit_mixed_task(orch, mixed_kernels, async_params);
+
+    if (orch->fatal) return;
+
+    // Now patch the slot state to mark this task as deferred completion.
+    PTO2SchedulerState* sched = orch->scheduler;
+    if (sched) {
+        // The task just submitted is the last one pushed to scope_tasks
+        PTO2TaskSlotState* slot_state = orch->scope_tasks[orch->scope_tasks_size - 1];
+        if (slot_state) {
+            slot_state->complete_in_future = 1;
+        }
+    }
+}
+
+// =============================================================================
+// Async SDMA Task Submission (deferred completion with indirect event handle)
+// =============================================================================
+
+void pto2_submit_mixed_task_async_sdma(PTO2OrchestratorState* orch,
+    const MixedKernels& mixed_kernels,
+    const PTOParam& params,
+    uint64_t event_output_gm_addr) {
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+
+    pto2_submit_mixed_task(orch, mixed_kernels, async_params);
+
+    if (orch->fatal) return;
+
+    PTO2SchedulerState* sched = orch->scheduler;
+    if (sched) {
+        PTO2TaskSlotState* slot_state = orch->scope_tasks[orch->scope_tasks_size - 1];
+        if (slot_state) {
+            slot_state->complete_in_future = 2;
+        }
+    }
+}
+
+// =============================================================================
 // Flow Control
 // =============================================================================
 

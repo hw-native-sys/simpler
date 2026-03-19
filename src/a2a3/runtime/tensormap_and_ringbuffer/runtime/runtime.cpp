@@ -97,6 +97,8 @@ void Runtime::set_orch_built_on_host(bool v) { orch_built_on_host_ = v; }
 void Runtime::set_pto2_gm_sm_ptr(void* p) { pto2_gm_sm_ptr_ = p; }
 void Runtime::set_pto2_gm_heap(void* p) { pto2_gm_heap_ptr_ = p; }
 void Runtime::set_pto2_slot_states_ptr(void* p) { pto2_slot_states_ptr_ = p; }
+void Runtime::set_sdma_workspace_addr(uint64_t addr) { sdma_workspace_addr_ = addr; }
+uint64_t Runtime::get_sdma_workspace_addr() const { return sdma_workspace_addr_; }
 void Runtime::set_orch_args(uint64_t* args, int count) {
     orch_arg_count_ = count <= RUNTIME_MAX_ARGS ? count : RUNTIME_MAX_ARGS;
     if (args && orch_arg_count_ > 0) {

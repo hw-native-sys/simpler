@@ -22,6 +22,7 @@
 #include "pto_runtime2.h"
 #include "pto_shared_memory.h"
 #include "pto_runtime2_types.h"
+#include "pto_async_wait.h"
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
@@ -279,7 +280,8 @@ struct AicpuExecutor {
         bool& made_progress,
         PTO2TaskSlotState* deferred_release_slot_states[],
         int32_t& deferred_release_count,
-        PTO2LocalReadyBuffer* local_bufs
+        PTO2LocalReadyBuffer* local_bufs,
+        PTO2AsyncWaitList& async_wait_list
 #if PTO2_PROFILING
         ,
         bool profiling_enabled,
@@ -326,6 +328,31 @@ struct AicpuExecutor {
                 // Two-stage completion: mark subtask done, then handle mixed-task completion
                 bool mixed_complete = rt->scheduler.on_subtask_complete(slot_state, subslot);
                 if (mixed_complete) {
+                    if (slot_state.complete_in_future == 1) {
+                        // Deferred completion (direct): last scalar IS the flag address
+                        uint64_t event_handle = slot_state.payload->scalars[slot_state.payload->scalar_count - 1];
+                        volatile uint32_t* flag_addr = reinterpret_cast<volatile uint32_t*>(
+                            static_cast<uintptr_t>(event_handle));
+                        async_wait_list.add_event_flag(&slot_state, flag_addr);
+                        DEV_DEBUG("Thread %d: deferred completion (direct) for task %d, flag_addr=0x%lx",
+                            thread_idx,
+                            static_cast<int32_t>(pto2_task_id_local(slot_state.task->mixed_task_id)),
+                            event_handle);
+                    } else if (slot_state.complete_in_future == 2) {
+                        // Deferred completion (indirect/SDMA): last scalar is GM buffer where
+                        // kernel writes the AsyncEvent handle (uint64_t, non-zero when ready).
+                        // Poll the GM buffer directly via async_wait_list — the lower 32 bits
+                        // of a valid GM pointer are non-zero on little-endian.
+                        // This avoids the race where an immediate dereference sees stale cache.
+                        uint64_t gm_buf_addr = slot_state.payload->scalars[slot_state.payload->scalar_count - 1];
+                        volatile uint32_t* flag_addr = reinterpret_cast<volatile uint32_t*>(
+                            static_cast<uintptr_t>(gm_buf_addr));
+                        async_wait_list.add_event_flag(&slot_state, flag_addr);
+                        DEV_DEBUG("Thread %d: deferred completion (indirect) for task %d, polling gm_buf=0x%lx",
+                            thread_idx,
+                            static_cast<int32_t>(pto2_task_id_local(slot_state.task->mixed_task_id)),
+                            gm_buf_addr);
+                    } else {
 #if PTO2_SCHED_PROFILING
                     PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(slot_state, thread_idx, local_bufs);
                     notify_edges_total += cstats.fanout_edges;
@@ -357,6 +384,7 @@ struct AicpuExecutor {
 #endif
                         }
                         deferred_release_slot_states[deferred_release_count++] = &slot_state;
+                    }
                     }
                 }
                 ct.move_running_to_idle(i);
@@ -409,7 +437,7 @@ struct AicpuExecutor {
                     expected_reg_task_id,
                     mixed_complete ? 1 : 0);
                 cur_thread_completed++;
-                if (mixed_complete) {
+                if (mixed_complete && !slot_state.complete_in_future) {
                     completed_this_turn++;
                 }
                 made_progress = true;
@@ -992,6 +1020,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     PTO2TaskSlotState* deferred_release_slot_states[256];
     int32_t deferred_release_count = 0;
 
+    PTO2AsyncWaitList async_wait_list;
+
     bool cores_released = false;
 
 #if PTO2_PROFILING
@@ -1007,7 +1037,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         uint64_t _t0_phase = _t0;
 #endif
         int32_t task_count = 0;
-        if (tracker.aic().running_count == 0 && tracker.aiv().running_count == 0) {
+        if (tracker.aic().running_count == 0 && tracker.aiv().running_count == 0
+            && async_wait_list.count == 0) {
             bool orch_done = orchestrator_done_;
             if (orch_done) {
                 // Check for orchestrator fatal error — exit immediately
@@ -1058,19 +1089,36 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         // Sched time = finish_ts - dispatch_ts; recording finish_ts here at loop start reduces
         // tail overhead (time from AICore done to AICPU recording finish).
 
+        // Invariant: previous iteration fully consumed local_bufs
+        always_assert(local_bufs[0].count == 0 && local_bufs[1].count == 0);
+
+        // Phase 0: Poll async completion conditions (deferred-completion tasks)
+        int32_t async_completed_this_turn = 0;
+        if (async_wait_list.count > 0) {
+            async_completed_this_turn = async_wait_list.poll_and_complete<false>(
+                &rt->scheduler, local_bufs,
+                deferred_release_slot_states, deferred_release_count
+#if PTO2_SCHED_PROFILING
+                , thread_idx
+#endif
+            );
+            if (async_completed_this_turn > 0) {
+                made_progress = true;
+            }
+        }
+
         // Phase 1: Check running cores for completion, process and move to idle
-        int32_t completed_this_turn = 0;
+        int32_t completed_this_turn = async_completed_this_turn;
 
         // Check AIC running cores
         bool try_completed = false;
-        always_assert(local_bufs[0].count == 0 && local_bufs[1].count == 0);  // Invariant: previous iteration fully consumed
         if (tracker.aic().running_count > 0) {
             try_completed = true;
             check_running_cores_for_completion<CoreType::AIC>(
                 thread_idx, tracker.aic(), hank,
                 completed_this_turn, cur_thread_completed, made_progress,
                 deferred_release_slot_states, deferred_release_count,
-                local_bufs
+                local_bufs, async_wait_list
 #if PTO2_PROFILING
                 , profiling_enabled, phase_complete_count
 #endif
@@ -1089,7 +1137,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 thread_idx, tracker.aiv(), hank,
                 completed_this_turn, cur_thread_completed, made_progress,
                 deferred_release_slot_states, deferred_release_count,
-                local_bufs
+                local_bufs, async_wait_list
 #if PTO2_PROFILING
                 , profiling_enabled, phase_complete_count
 #endif
@@ -1738,6 +1786,9 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 // With multi-ring, slot_states are per-ring inside the scheduler.
                 // Fanout fill-in in complete_perf_records is disabled (slot_states_ptr = nullptr).
                 runtime->set_pto2_slot_states_ptr(nullptr);
+
+                // Pass SDMA workspace address from host-side Runtime to device PTO2Runtime
+                rt->sdma_workspace_addr = runtime->get_sdma_workspace_addr();
 
                 // Store shared state for other orchestrator threads
                 orch_func_ = orch_func;

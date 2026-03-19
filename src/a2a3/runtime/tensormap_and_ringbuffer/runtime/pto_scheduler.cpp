@@ -135,6 +135,7 @@ bool PTO2SchedulerState::RingSchedState::init(
         slot_states[i].active_mask = 0;
         slot_states[i].subtask_done_mask.store(0, std::memory_order_relaxed);
         slot_states[i].ring_id = 0;
+        slot_states[i].complete_in_future = 0;
     }
 
     return true;

@@ -414,6 +414,7 @@ struct alignas(64) PTO2TaskSlotState {
     uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
     std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
     uint8_t ring_id;                             // Ring layer this task belongs to (for per-ring reclamation)
+    uint8_t complete_in_future{0};               // 1=deferred completion (async hw op), 0=run-to-completion
     int32_t dep_pool_mark{0};                    // Dep pool top after this task's submission (orchestrator-only, local memory)
 };
 

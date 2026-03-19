@@ -184,6 +184,32 @@ void pto2_submit_mixed_task(PTO2OrchestratorState* orch,
     const MixedKernels& mixed_kernels,
     const PTOParam& params);
 
+/**
+ * Submit an async task with deferred completion.
+ *
+ * Same as pto2_submit_mixed_task but sets complete_in_future=1 and appends
+ * event_output_gm_addr as a hidden scalar for the scheduler to read.
+ *
+ * @param event_output_gm_addr  GM address (8B) where the kernel writes
+ *                               the async event handle (e.g. &SdmaEventRecord)
+ */
+void pto2_submit_mixed_task_async(PTO2OrchestratorState* orch,
+    const MixedKernels& mixed_kernels,
+    const PTOParam& params,
+    uint64_t event_output_gm_addr);
+
+/**
+ * Submit an async task with SDMA deferred completion (complete_in_future=2).
+ *
+ * Same as pto2_submit_mixed_task_async but sets complete_in_future=2,
+ * indicating the scheduler should use two-level indirection to read
+ * the SdmaEventRecord* from the GM buffer and poll its flag field.
+ */
+void pto2_submit_mixed_task_async_sdma(PTO2OrchestratorState* orch,
+    const MixedKernels& mixed_kernels,
+    const PTOParam& params,
+    uint64_t event_output_gm_addr);
+
 // =============================================================================
 // Flow Control
 // =============================================================================

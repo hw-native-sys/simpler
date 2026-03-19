@@ -20,7 +20,7 @@ BUILD_CONFIG = {
         "source_dirs": ["aicpu", "runtime", "orchestration"]
     },
     "host": {
-        "include_dirs": ["runtime"],
+        "include_dirs": ["runtime", "../../../../3rd/pto-isa/include"],
         "source_dirs": ["host", "runtime", "orchestration"]
     },
     "orchestration": {
