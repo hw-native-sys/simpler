@@ -1,12 +1,12 @@
 /**
- * TREDUCE Orchestration — tensormap_and_ringbuffer runtime (PTO2 API).
+ * AllReduce Orchestration — tensormap_and_ringbuffer runtime (PTO2 API).
  *
  * All five arguments are passed as SCALAR params so the kernel receives
  * raw uint64_t values (device pointers + integers) in the same flat
  * args[] layout as host_build_graph / aicpu_build_graph.
  *
  * The Tensor/PTOParam system maps tensor params to Tensor-struct pointers
- * (not device addresses) — that would break the TREDUCE kernel which reads
+ * (not device addresses) — that would break the allreduce kernel which reads
  * args[] as raw pointers.  Using all-scalar avoids this incompatibility.
  *
  * args layout:
@@ -39,14 +39,13 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count,
 
     if (orch_thread_index != 0) return;
 
-    PTOParam params[5] = {
-        make_scalar_param(args[0]),
-        make_scalar_param(args[1]),
-        make_scalar_param(args[2]),
-        make_scalar_param(args[3]),
-        make_scalar_param(args[4]),
-    };
-    pto2_rt_submit_aiv_task(rt, 0, params, 5);
+    PTOParam params;
+    params.add_scalar(args[0]);
+    params.add_scalar(args[1]);
+    params.add_scalar(args[2]);
+    params.add_scalar(args[3]);
+    params.add_scalar(args[4]);
+    pto2_rt_submit_aiv_task(rt, 0, params);
 }
 
 }  // extern "C"

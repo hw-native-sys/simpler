@@ -47,23 +47,23 @@ python examples/scripts/run_example.py \
 Distributed examples are auto-detected when `kernel_config.py` contains a `DISTRIBUTED_CONFIG` dictionary. No separate script is needed — `run_example.py` handles it automatically:
 
 ```bash
-# Simulation (no hardware required, 8 ranks by default)
+# Simulation (no hardware required, 8 ranks by default from kernel_config)
 python examples/scripts/run_example.py \
-  -k examples/a2a3/host_build_graph/treduce_distributed/kernels \
-  -g examples/a2a3/host_build_graph/treduce_distributed/golden.py \
+  -k examples/a2a3/host_build_graph/allreduce_distributed/kernels \
+  -g examples/a2a3/host_build_graph/allreduce_distributed/golden.py \
   -p a2a3sim
 
-# Hardware platform
+# Hardware platform — pick specific devices (nranks inferred from device count)
 python examples/scripts/run_example.py \
-  -k examples/a2a3/host_build_graph/treduce_distributed/kernels \
-  -g examples/a2a3/host_build_graph/treduce_distributed/golden.py \
-  -p a2a3
+  -k examples/a2a3/host_build_graph/allreduce_distributed/kernels \
+  -g examples/a2a3/host_build_graph/allreduce_distributed/golden.py \
+  -p a2a3 --devices 0,1,2,3,4,5,6,7
 
-# Override rank count
+# Hardware platform — non-contiguous devices
 python examples/scripts/run_example.py \
-  -k examples/a2a3/host_build_graph/treduce_distributed/kernels \
-  -g examples/a2a3/host_build_graph/treduce_distributed/golden.py \
-  -p a2a3sim --nranks 4
+  -k examples/a2a3/host_build_graph/allreduce_distributed/kernels \
+  -g examples/a2a3/host_build_graph/allreduce_distributed/golden.py \
+  -p a2a3 --devices 2,4,5,7
 ```
 
 The framework spawns one worker process per rank, each using the backend-neutral `comm_*` API. On simulation (`a2a3sim`), ranks communicate via POSIX shared memory; on hardware (`a2a3`), they use HCCL over RDMA.
@@ -472,7 +472,7 @@ TEST FAILED: Output 'f' does not match golden
 ## Reference Examples
 
 - **Single-Card Example**: [examples/a2a3/host_build_graph/vector_example/](../a2a3/host_build_graph/vector_example/)
-- **Distributed Example**: [examples/a2a3/host_build_graph/treduce_distributed/](../a2a3/host_build_graph/treduce_distributed/)
+- **Distributed Example**: [examples/a2a3/host_build_graph/allreduce_distributed/](../a2a3/host_build_graph/allreduce_distributed/)
 
 ## FAQ
 
@@ -620,8 +620,8 @@ runner.run()  # Execute test
 from distributed_code_runner import DistributedCodeRunner
 
 runner = DistributedCodeRunner(
-    kernels_dir="examples/a2a3/host_build_graph/treduce_distributed/kernels",
-    golden_path="examples/a2a3/host_build_graph/treduce_distributed/golden.py",
+    kernels_dir="examples/a2a3/host_build_graph/allreduce_distributed/kernels",
+    golden_path="examples/a2a3/host_build_graph/allreduce_distributed/golden.py",
     platform="a2a3sim",
     nranks=8,
 )

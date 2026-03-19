@@ -291,12 +291,10 @@ extern "C" CommHandle comm_init(int rank, int nranks, const char* rootinfo_path)
         return nullptr;
     }
 
-    aRet = aclrtSetDevice(rank);
-    if (aRet != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] aclrtSetDevice failed: %d\n", rank, (int)aRet);
-        delete h;
-        return nullptr;
-    }
+    // NOTE: Do NOT call aclrtSetDevice here — the caller (distributed_worker)
+    // already set the correct physical device via set_device(device_id).
+    // Calling aclrtSetDevice(rank) would override the context when
+    // rank != device_id (e.g. devices=[2,4,5,7]).
 
     // RootInfo exchange
     HcclRootInfo rootInfo{};
@@ -467,8 +465,10 @@ extern "C" int comm_destroy(CommHandle h) {
     if (h->stream) rtStreamDestroy(h->stream);
     if (h->hccl_comm) HcclCommDestroy(h->hccl_comm);
 
-    aclrtResetDevice(h->rank);
-    aclFinalize();
+    // NOTE: Do NOT call aclrtResetDevice / aclFinalize here.
+    // Device lifecycle is owned by DeviceRunner (static singleton) whose
+    // destructor frees all tracked device memory before resetting the device.
+    // Resetting early would invalidate pointers still held by MemoryAllocator.
 
     delete h;
     return 0;

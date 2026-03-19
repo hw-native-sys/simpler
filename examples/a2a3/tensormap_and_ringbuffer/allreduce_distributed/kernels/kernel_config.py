@@ -1,6 +1,7 @@
 """
-Distributed TREDUCE kernel configuration — tensormap_and_ringbuffer runtime.
+Distributed AllReduce kernel configuration — tensormap_and_ringbuffer runtime.
 
+Every rank reads all inputs via RDMA and computes the sum locally.
 Device-side orchestration via PTO2Runtime API. The orchestration function
 wraps each arg as a PTOParam (tensor or scalar) and submits a single AIV task.
 """
@@ -10,14 +11,14 @@ from pathlib import Path
 _KERNELS_ROOT = Path(__file__).parent
 
 ORCHESTRATION = {
-    "source": str(_KERNELS_ROOT / "orchestration" / "treduce_orch.cpp"),
+    "source": str(_KERNELS_ROOT / "orchestration" / "allreduce_orch.cpp"),
     "function_name": "aicpu_orchestration_entry",
 }
 
 KERNELS = [
     {
         "func_id": 0,
-        "source": str(_KERNELS_ROOT / "aiv" / "treduce_kernel.cpp"),
+        "source": str(_KERNELS_ROOT / "aiv" / "allreduce_kernel.cpp"),
         "core_type": "aiv",
     },
 ]
@@ -46,10 +47,10 @@ DISTRIBUTED_CONFIG = {
     "root": 0,
     "win_sync_prefix": 256,
     "buffers": [
-        # Root rank reads every rank's input through CommRemotePtr(...), so the
+        # Every rank reads all ranks' inputs via CommRemotePtr, so the
         # input buffer must be placed in the shared RDMA window.
         {"name": "input",  "dtype": "float32", "count": 256, "placement": "window"},
-        # The output is produced and consumed locally on the root rank only.
+        # Each rank writes the reduced sum to its own local output.
         {"name": "output", "dtype": "float32", "count": 256, "placement": "device"},
     ],
     "inputs": ["input"],
