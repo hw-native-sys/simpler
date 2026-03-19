@@ -525,10 +525,9 @@ struct AicpuExecutor {
         // (same local_id) would cause a false-positive completion.
         dispatch_seq_by_core_[core_id]++;
         uint32_t reg_task_id = dispatch_seq_by_core_[core_id] & TASK_ID_MASK;
-        // Skip reserved sentinel values
-        while (reg_task_id == AICORE_IDLE_TASK_ID ||
-            (reg_task_id + 1) == AICORE_EXIT_SIGNAL) {
-            dispatch_seq_by_core_[core_id]++;
+        // Skip reserved sentinel range [AICORE_EXIT_SIGNAL, 0x7FFFFFFF]
+        if (reg_task_id >= AICORE_EXIT_SIGNAL) {
+            dispatch_seq_by_core_[core_id] += (TASK_ID_MASK - reg_task_id + 1);
             reg_task_id = dispatch_seq_by_core_[core_id] & TASK_ID_MASK;
         }
         write_reg(core_id_to_reg_addr_[core_id], RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
