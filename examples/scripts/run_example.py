@@ -311,26 +311,28 @@ Golden.py interface:
 
             logger.info("Detected DISTRIBUTED_CONFIG — using distributed runner")
             dist_cfg = getattr(_kc_mod, "DISTRIBUTED_CONFIG", {})
-            effective_nranks = args.nranks if args.nranks is not None else dist_cfg.get("nranks", 8)
+
             if args.devices is not None:
                 device_ids = _parse_device_spec(args.devices)
+                effective_nranks = len(device_ids)
             elif args.device_range is not None:
                 device_ids = _parse_device_spec(args.device_range)
+                effective_nranks = len(device_ids)
             else:
+                effective_nranks = args.nranks if args.nranks is not None else dist_cfg.get("nranks", 8)
                 device_ids = [args.device + i for i in range(effective_nranks)]
 
-            if args.devices is not None or args.device_range is not None:
-                if len(device_ids) != effective_nranks:
-                    raise ValueError(
-                        f"Device selection expands to {len(device_ids)} "
-                        f"devices, but distributed run needs {effective_nranks}"
-                    )
+            if args.nranks is not None and args.nranks != effective_nranks:
+                raise ValueError(
+                    f"--nranks={args.nranks} conflicts with device list "
+                    f"({effective_nranks} devices)"
+                )
 
             runner = DistributedCodeRunner(
                 kernels_dir=str(args.kernels),
                 golden_path=str(args.golden),
                 platform=args.platform,
-                nranks=args.nranks,
+                nranks=effective_nranks,
                 device_ids=device_ids,
                 build_dir=args.savetemp,
                 pto_isa_commit=args.pto_isa_commit,

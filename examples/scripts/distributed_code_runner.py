@@ -7,8 +7,8 @@ Python worker processes (one per rank) via distributed_worker.py.
 
 Usage:
     runner = DistributedCodeRunner(
-        kernels_dir="examples/a2a3/.../treduce_distributed/kernels",
-        golden_path="examples/a2a3/.../treduce_distributed/golden.py",
+        kernels_dir="examples/a2a3/.../allreduce_distributed/kernels",
+        golden_path="examples/a2a3/.../allreduce_distributed/golden.py",
         platform="a2a3", nranks=8,
     )
     runner.run()
@@ -388,11 +388,11 @@ class DistributedCodeRunner:
         output_names = dist.get("outputs", [])
         buf_map = {b["name"]: b for b in dist.get("buffers", [])}
 
-        root_dir = self.artifact_dir / f"rank_{self.root}"
-        actual_outputs = {}
-
+        # Compute expected outputs once (same for all ranks in allreduce).
+        seed_dir = self.artifact_dir / f"rank_{self.root}"
+        seed_outputs = {}
         for name in output_names:
-            path = root_dir / f"{name}.bin"
+            path = seed_dir / f"{name}.bin"
             if not path.exists():
                 logger.error(f"Output file not found: {path}")
                 return False
@@ -400,11 +400,9 @@ class DistributedCodeRunner:
             dtype = buf_map.get(name, {}).get("dtype", "float32")
             fmt_char, elem_sz = DTYPE_FORMAT.get(dtype, ("f", 4))
             count = len(raw) // elem_sz
-            actual_outputs[name] = list(struct.unpack(f"<{count}{fmt_char}", raw))
+            seed_outputs[name] = list(struct.unpack(f"<{count}{fmt_char}", raw))
 
-        expected_outputs = {
-            name: values.copy() for name, values in actual_outputs.items()
-        }
+        expected_outputs = {n: v.copy() for n, v in seed_outputs.items()}
         params = {"nranks": self.nranks, "root": self.root}
         golden.compute_golden(expected_outputs, params)
 
@@ -412,22 +410,34 @@ class DistributedCodeRunner:
         atol = getattr(golden, "ATOL", 1e-5)
 
         all_ok = True
-        for name in output_names:
-            actual = actual_outputs[name]
-            expected = expected_outputs[name]
-            mismatches = 0
-            for i, (a, e) in enumerate(zip(actual, expected)):
-                if abs(a - e) > atol + rtol * abs(e):
-                    if mismatches < 5:
-                        logger.error(f"  {name}[{i}]: got {a}, expected {e}")
-                    mismatches += 1
-            if mismatches > 0:
-                logger.error(f"VERIFY FAILED: {name} — {mismatches}/{len(actual)} mismatches")
-                all_ok = False
-            else:
-                logger.info(f"VERIFY PASSED: {name} — {len(actual)} elements correct")
-                if len(actual) >= 5:
-                    logger.info(f"  Sample: {actual[:5]}")
+        for rank in range(self.nranks):
+            rank_dir = self.artifact_dir / f"rank_{rank}"
+            for name in output_names:
+                path = rank_dir / f"{name}.bin"
+                if not path.exists():
+                    logger.error(f"Output file not found: {path}")
+                    all_ok = False
+                    continue
+                raw = path.read_bytes()
+                dtype = buf_map.get(name, {}).get("dtype", "float32")
+                fmt_char, elem_sz = DTYPE_FORMAT.get(dtype, ("f", 4))
+                count = len(raw) // elem_sz
+                actual = list(struct.unpack(f"<{count}{fmt_char}", raw))
+                expected = expected_outputs[name]
+
+                mismatches = 0
+                for i, (a, e) in enumerate(zip(actual, expected)):
+                    if abs(a - e) > atol + rtol * abs(e):
+                        if mismatches < 3:
+                            logger.error(f"  rank {rank} {name}[{i}]: got {a}, expected {e}")
+                        mismatches += 1
+                if mismatches > 0:
+                    logger.error(f"VERIFY FAILED: rank {rank} {name} — {mismatches}/{len(actual)} mismatches")
+                    all_ok = False
+                else:
+                    logger.info(f"VERIFY PASSED: rank {rank} {name} — {len(actual)} elements correct")
+                    if rank == 0 and len(actual) >= 5:
+                        logger.info(f"  Sample: {actual[:5]}")
 
         if all_ok:
             print("\n=== VERIFICATION PASSED ===\n")

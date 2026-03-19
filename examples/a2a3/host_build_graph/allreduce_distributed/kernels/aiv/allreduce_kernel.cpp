@@ -1,18 +1,15 @@
 /**
- * TREDUCE kernel for simpler's kernel_entry signature.
+ * AllReduce kernel for simpler's kernel_entry signature.
  *
- * Performs collective reduce (Sum) across multiple NPU ranks using PTO comm
- * instructions. Each rank's input data resides in an RDMA window;
- * the root rank gathers and sums all inputs into the output buffer.
- *
- * PTO communication instructions access remote data through GVA addresses
- * (windowsIn[]) via MTE2 DMA over HCCS; no bound stream is required.
+ * Every rank independently reads all ranks' inputs from the RDMA window,
+ * computes the element-wise sum, and writes the result to its own output.
+ * This is a symmetric allreduce — no designated root, all ranks active.
  *
  * args layout (all uint64_t, cast as needed):
  *   args[0] = __gm__ float* input   (device addr in RDMA window)
- *   args[1] = __gm__ float* output  (device addr, regular allocation)
+ *   args[1] = __gm__ float* output  (device addr, local)
  *   args[2] = int nranks
- *   args[3] = int root
+ *   args[3] = (unused, kept for ABI compatibility)
  *   args[4] = __gm__ CommDeviceContext* ctx  (device addr)
  */
 
@@ -30,7 +27,7 @@
 #define __aicore__ [aicore]
 #endif
 
-static constexpr size_t TREDUCE_COUNT = 256;
+static constexpr size_t ALLREDUCE_COUNT = 256;
 static constexpr int kMaxSupportedRanks = 16;
 
 template <typename T>
@@ -41,6 +38,7 @@ AICORE inline __gm__ T *CommRemotePtr(
     uint64_t offset = (uint64_t)localPtr - localBase;
     return (__gm__ T *)(ctx->windowsIn[pe] + offset);
 }
+
 
 extern "C" __aicore__ __attribute__((always_inline))
 void kernel_entry(__gm__ int64_t* args) {
@@ -57,36 +55,50 @@ void kernel_entry(__gm__ int64_t* args) {
                                    pto::DYNAMIC, pto::DYNAMIC>;
     using Global    = pto::GlobalTensor<float, ShapeDyn, StrideDyn,
                                          pto::Layout::ND>;
-    using TileData  = pto::Tile<pto::TileType::Vec, float, 1, TREDUCE_COUNT,
+    using TileData  = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT,
                                  pto::BLayout::RowMajor, -1, -1>;
 
     int my_rank = static_cast<int>(commCtx->rankId);
 
-    ShapeDyn shape(1, 1, 1, 1, TREDUCE_COUNT);
-    StrideDyn stride(TREDUCE_COUNT, TREDUCE_COUNT, TREDUCE_COUNT,
-                     TREDUCE_COUNT, 1);
+    ShapeDyn shape(1, 1, 1, 1, ALLREDUCE_COUNT);
+    StrideDyn stride(ALLREDUCE_COUNT, ALLREDUCE_COUNT, ALLREDUCE_COUNT,
+                     ALLREDUCE_COUNT, 1);
 
-    TileData accTile(1, TREDUCE_COUNT);
-    TileData recvTile(1, TREDUCE_COUNT);
+    TileData accTile(1, ALLREDUCE_COUNT);
+    TileData recvTile(1, ALLREDUCE_COUNT);
     TASSIGN(accTile, 0x0);
     TASSIGN(recvTile, 0x10000);
 
-    if (nranks <= 0 || nranks > kMaxSupportedRanks || root < 0 || root >= nranks) {
+    if (nranks <= 0 || nranks > kMaxSupportedRanks) {
         pipe_barrier(PIPE_ALL);
         return;
     }
 
-    if (my_rank == root) {
-        Global outputG(output, shape, stride);
-        Global tensors[kMaxSupportedRanks];
-        for (int i = 0; i < nranks; ++i) {
-            __gm__ float* remoteInput = CommRemotePtr(commCtx, input, i);
-            tensors[i] = Global(remoteInput, shape, stride);
-        }
-        pto::comm::ParallelGroup<Global> pg(tensors, nranks, root);
-        pto::comm::TREDUCE(pg, outputG, accTile, recvTile,
-                           pto::comm::ReduceOp::Sum);
+    // Every rank reads all inputs and sums them into its own output.
+    Global outputG(output, shape, stride);
+
+    __gm__ float* firstInput = CommRemotePtr(commCtx, input, 0);
+    Global firstG(firstInput, shape, stride);
+    TLOAD(accTile, firstG);
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+
+    for (int r = 1; r < nranks; ++r) {
+        __gm__ float* remoteInput = CommRemotePtr(commCtx, input, r);
+        Global remoteG(remoteInput, shape, stride);
+        TLOAD(recvTile, remoteG);
+        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        TADD(accTile, accTile, recvTile);
+        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
     }
+
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(outputG, accTile);
+    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 
     pipe_barrier(PIPE_ALL);
 }

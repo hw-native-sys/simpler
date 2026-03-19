@@ -1,12 +1,10 @@
 """
-Distributed TREDUCE kernel configuration.
+Distributed AllReduce kernel configuration — aicpu_build_graph runtime.
 
-Multi-card collective reduce (Sum) across N ranks using PTO comm instructions.
-Communication addresses are set up by the comm_* platform API.
-
-DISTRIBUTED_CONFIG is the "multi-card graph" — it describes buffer layout,
-args order, and artifact names. DistributedCodeRunner translates this into
-distributed_worker.py CLI arguments.
+Every rank reads all inputs via RDMA and computes the sum locally.
+The AICPU orchestration plugin reads args from runtime->orch_args[],
+builds the task graph via the aicpu_build_api, and publishes tasks for
+the AICPU scheduler threads.
 """
 
 from pathlib import Path
@@ -14,22 +12,26 @@ from pathlib import Path
 _KERNELS_ROOT = Path(__file__).parent
 
 ORCHESTRATION = {
-    "source": str(_KERNELS_ROOT / "orchestration" / "treduce_orch.cpp"),
-    "function_name": "build_treduce_graph",
+    "source": str(_KERNELS_ROOT / "orchestration" / "allreduce_orch.cpp"),
+    "function_name": "build_allreduce_graph",
 }
 
 KERNELS = [
     {
         "func_id": 0,
-        "source": str(_KERNELS_ROOT / "aiv" / "treduce_kernel.cpp"),
+        "source": str(_KERNELS_ROOT / "aiv" / "allreduce_kernel.cpp"),
         "core_type": "aiv",
     },
 ]
 
 RUNTIME_CONFIG = {
-    "runtime": "host_build_graph",
-    "aicpu_thread_num": 1,
-    "block_dim": 1,
+    "runtime": "aicpu_build_graph",
+    "aicpu_thread_num": 4,
+    "block_dim": 4,
+}
+
+RUNTIME_ENV = {
+    "PTO_AICPU_BUILD_GRAPH_BUILD_MODE": "1",
 }
 
 # Distributed layout contract consumed by DistributedCodeRunner/worker:
@@ -48,10 +50,10 @@ DISTRIBUTED_CONFIG = {
     "root": 0,
     "win_sync_prefix": 256,
     "buffers": [
-        # Root rank reads every rank's input through CommRemotePtr(...), so the
+        # Every rank reads all ranks' inputs via CommRemotePtr, so the
         # input buffer must be placed in the shared RDMA window.
         {"name": "input",  "dtype": "float32", "count": 256, "placement": "window"},
-        # The output is produced and consumed locally on the root rank only.
+        # Each rank writes the reduced sum to its own local output.
         {"name": "output", "dtype": "float32", "count": 256, "placement": "device"},
     ],
     "inputs": ["input"],

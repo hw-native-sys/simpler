@@ -97,9 +97,10 @@ def main():
     # ----------------------------------------------------------------
     from bindings import (
         bind_host_binary, set_device, launch_runtime,
-        device_malloc, copy_to_device, copy_from_device,
+        device_malloc, device_free, copy_to_device, copy_from_device,
         comm_init, comm_alloc_windows, comm_get_local_window_base,
         comm_barrier, comm_destroy,
+        ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR,
     )
 
     lib_path = artifact_dir / "libhost_runtime.so"
@@ -182,6 +183,8 @@ def main():
         kernel_binaries.append((k["func_id"], data))
 
     func_args = []
+    arg_types = []
+    arg_sizes = []
     for tok in args.args:
         if tok == "nranks":
             func_args.append(args.nranks)
@@ -195,6 +198,11 @@ def main():
                 sys.stderr.write(f"[rank {args.rank}] --arg: unknown token '{tok}'\n")
                 return 1
             func_args.append(b["dev_ptr"])
+        # In distributed mode, all memory is pre-allocated by the worker
+        # (RDMA windows / device_malloc). Pass everything as scalar so
+        # the runtime doesn't try to re-allocate or copy.
+        arg_types.append(ARG_SCALAR)
+        arg_sizes.append(0)
 
     sys.stderr.write(
         f"[rank {args.rank}] Launching kernel: {len(func_args)} args, "
@@ -206,6 +214,8 @@ def main():
         orch_binary,
         args.orch_func,
         func_args,
+        arg_types=arg_types,
+        arg_sizes=arg_sizes,
         kernel_binaries=kernel_binaries,
     )
 
@@ -244,6 +254,10 @@ def main():
     # ----------------------------------------------------------------
     # 8. Cleanup
     # ----------------------------------------------------------------
+    for b in buffers:
+        if b["placement"] == "device" and b.get("dev_ptr"):
+            device_free(b["dev_ptr"])
+
     comm_destroy(comm)
     sys.stderr.write(f"[rank {args.rank}] Done\n")
     return 0

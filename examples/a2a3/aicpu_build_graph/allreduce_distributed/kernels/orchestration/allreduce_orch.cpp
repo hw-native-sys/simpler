@@ -1,5 +1,5 @@
 /**
- * TREDUCE Orchestration — aicpu_build_graph runtime.
+ * AllReduce Orchestration — aicpu_build_graph runtime.
  *
  * This orchestration plugin runs on AICPU. It reads args from
  * runtime->orch_args[] (populated by init_runtime from func_args[])
@@ -16,7 +16,7 @@
 #include "runtime.h"
 #include <cstdint>
 
-extern "C" int build_treduce_graph(Runtime* runtime) {
+extern "C" int build_allreduce_graph(Runtime* runtime) {
     if (runtime == nullptr || runtime->orch_argc < 5) {
         return -1;
     }
