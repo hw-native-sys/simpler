@@ -228,6 +228,25 @@ int validate_runtime_impl(Runtime *runtime) {
     return rc;
 }
 
+int reinit_runtime_impl(Runtime* runtime,
+                    uint64_t* func_args,
+                    int func_args_count,
+                    int* arg_types,
+                    uint64_t* arg_sizes) {
+    (void)func_args;
+    (void)func_args_count;
+    (void)arg_types;
+    (void)arg_sizes;
+    LOG_ERROR("reinit_runtime_impl not supported for host_build_graph runtime");
+    return -1;
+}
+
+int validate_runtime_round_impl(Runtime* runtime) {
+    (void)runtime;
+    LOG_ERROR("validate_runtime_round_impl not supported for host_build_graph runtime");
+    return -1;
+}
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

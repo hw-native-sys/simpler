@@ -174,6 +174,41 @@ int launch_runtime(RuntimeHandle runtime,
     int orch_thread_num);
 
 /**
+ * Lightweight re-initialization for subsequent rounds within the same case.
+ *
+ * Skips kernel upload, GM heap allocation, shared memory allocation, and
+ * orchestration SO copy. Only re-copies input/inout tensor data to device
+ * using the existing device memory allocations from the first round.
+ *
+ * Must be called after a successful init_runtime() + finalize_runtime_round()
+ * sequence. The Runtime handle must not have been fully finalized.
+ *
+ * @param runtime         Runtime handle (previously initialized)
+ * @param func_args       Arguments for orchestration (host pointers, sizes, etc.)
+ * @param func_args_count Number of arguments
+ * @param arg_types       Array describing each argument's type (ArgType enum)
+ * @param arg_sizes       Array of sizes for pointer arguments (0 for scalars)
+ * @return 0 on success, -1 on failure
+ */
+int reinit_runtime(RuntimeHandle runtime,
+                   uint64_t* func_args,
+                   int func_args_count,
+                   int* arg_types,
+                   uint64_t* arg_sizes);
+
+/**
+ * Round-level finalize: copy results back but keep device resources alive.
+ *
+ * Copies output/inout tensors from device to host, but does NOT free
+ * device memory, kernel binaries, or call the Runtime destructor.
+ * Use this between rounds within the same case.
+ *
+ * @param runtime  Runtime handle to finalize for this round
+ * @return 0 on success, -1 on failure
+ */
+int finalize_runtime_round(RuntimeHandle runtime);
+
+/**
  * Finalize and cleanup a runtime instance.
  *
  * Validates results, frees device tensors, calls Runtime destructor.

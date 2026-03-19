@@ -141,6 +141,20 @@ class RuntimeLibraryLoader:
         self.lib.finalize_runtime.argtypes = [c_void_p]
         self.lib.finalize_runtime.restype = c_int
 
+        # reinit_runtime - lightweight re-init for subsequent rounds
+        self.lib.reinit_runtime.argtypes = [
+            c_void_p,               # runtime
+            POINTER(c_uint64),      # func_args
+            c_int,                  # func_args_count
+            POINTER(c_int),         # arg_types
+            POINTER(c_uint64),      # arg_sizes
+        ]
+        self.lib.reinit_runtime.restype = c_int
+
+        # finalize_runtime_round - copy results back without freeing resources
+        self.lib.finalize_runtime_round.argtypes = [c_void_p]
+        self.lib.finalize_runtime_round.restype = c_int
+
         # Note: register_kernel has been internalized into init_runtime
         # Kernel binaries are now passed directly to init_runtime()
 
@@ -209,6 +223,7 @@ class Runtime:
         size = lib.get_runtime_size()
         self._buffer = ctypes.create_string_buffer(size)
         self._handle = ctypes.cast(self._buffer, c_void_p)
+        self._initialized = False
 
     def initialize(
         self,
@@ -247,6 +262,20 @@ class Runtime:
 
         func_args = func_args or []
         func_args_count = len(func_args)
+
+        # If already initialized, delegate to lightweight reinit
+        if self._initialized:
+            rc = self.lib.reinit_runtime(
+                self._handle,
+                (c_uint64 * len(func_args))(*func_args) if func_args else None,
+                func_args_count,
+                (c_int * len(arg_types))(*arg_types) if arg_types else None,
+                (c_uint64 * len(arg_sizes))(*arg_sizes) if arg_sizes else None,
+            )
+            if rc == 0:
+                return
+            # Reinit not supported by this runtime, fallback to full finalize + init
+            self.finalize()
 
         # Convert func_args to ctypes array
         if func_args_count > 0:
@@ -310,6 +339,7 @@ class Runtime:
         )
         if rc != 0:
             raise RuntimeError(f"init_runtime failed: {rc}")
+        self._initialized = True
 
     def finalize(self) -> None:
         """
@@ -322,10 +352,76 @@ class Runtime:
         Raises:
             RuntimeError: If finalization fails
         """
+        if not self._initialized:
+            return
 
         rc = self.lib.finalize_runtime(self._handle)
         if rc != 0:
             raise RuntimeError(f"finalize_runtime failed: {rc}")
+        self._initialized = False
+
+    def reinitialize(
+        self,
+        func_args: Optional[List[int]] = None,
+        arg_types: Optional[List[int]] = None,
+        arg_sizes: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Lightweight re-initialization for subsequent rounds within the same case.
+
+        Skips kernel upload, GM heap/shared memory allocation, and orch SO copy.
+        Only re-copies input/inout tensor data to existing device memory.
+
+        Args:
+            func_args: Arguments for orchestration (host pointers, sizes, etc.)
+            arg_types: Array describing each argument's type
+            arg_sizes: Array of sizes for pointer arguments (0 for scalars)
+
+        Raises:
+            RuntimeError: If re-initialization fails
+        """
+        func_args = func_args or []
+        func_args_count = len(func_args)
+
+        if func_args_count > 0:
+            func_args_array = (c_uint64 * func_args_count)(*func_args)
+        else:
+            func_args_array = None
+
+        if arg_types is not None and len(arg_types) > 0:
+            arg_types_array = (c_int * len(arg_types))(*arg_types)
+        else:
+            arg_types_array = None
+
+        if arg_sizes is not None and len(arg_sizes) > 0:
+            arg_sizes_array = (c_uint64 * len(arg_sizes))(*arg_sizes)
+        else:
+            arg_sizes_array = None
+
+        rc = self.lib.reinit_runtime(
+            self._handle,
+            func_args_array,
+            func_args_count,
+            arg_types_array,
+            arg_sizes_array,
+        )
+        if rc != 0:
+            raise RuntimeError(f"reinit_runtime failed: {rc}")
+
+    def finalize_round(self) -> None:
+        """
+        Round-level finalize: copy results back but keep device resources alive.
+
+        Copies output/inout tensors from device to host without freeing
+        device memory or kernel binaries. Use between rounds in the same case.
+
+        Raises:
+            RuntimeError: If round finalization fails
+        """
+        rc = self.lib.finalize_runtime_round(self._handle)
+        if rc != 0:
+            # Not supported by this runtime, fallback to full finalize
+            self.finalize()
 
     def enable_profiling(self, enabled: bool = True) -> None:
         """

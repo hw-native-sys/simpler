@@ -319,6 +319,118 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 }
 
 /**
+ * Lightweight re-initialization for subsequent rounds within the same case.
+ *
+ * Skips kernel upload, GM heap/shared memory allocation, and orch SO copy.
+ * Only re-copies input/inout tensor data to existing device memory.
+ *
+ * @param runtime           Pointer to previously initialized Runtime
+ * @param func_args         Arguments for orchestration (host pointers, sizes, etc.)
+ * @param func_args_count   Number of arguments
+ * @param arg_types         Array describing each argument's type (ArgType enum)
+ * @param arg_sizes         Array of sizes for pointer arguments (0 for scalars)
+ * @return 0 on success, -1 on failure
+ */
+extern "C" int reinit_runtime_impl(Runtime *runtime,
+                    uint64_t* func_args,
+                    int func_args_count,
+                    int* arg_types,
+                    uint64_t* arg_sizes) {
+    if (runtime == nullptr) {
+        LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+
+    TensorPair* tensor_pairs = runtime->get_tensor_pairs();
+    int pair_idx = 0;
+
+    for (int i = 0; i < func_args_count; i++) {
+        if (arg_types[i] == ARG_SCALAR) continue;
+
+        if (pair_idx >= runtime->get_tensor_pair_count()) {
+            LOG_ERROR("reinit: tensor_pair index out of range at arg %d", i);
+            return -1;
+        }
+
+        const TensorPair& pair = tensor_pairs[pair_idx];
+        void* host_ptr = reinterpret_cast<void*>(func_args[i]);
+        size_t size = arg_sizes[i];
+
+        if (arg_types[i] == ARG_INPUT_PTR || arg_types[i] == ARG_INOUT_PTR) {
+            int rc = runtime->host_api.copy_to_device(pair.dev_ptr, host_ptr, size);
+            if (rc != 0) {
+                LOG_ERROR("reinit: failed to re-copy arg %d to device", i);
+                return -1;
+            }
+            LOG_INFO("reinit: arg %d re-copied %zu bytes", i, size);
+        }
+        pair_idx++;
+    }
+
+    LOG_INFO("reinit complete: re-copied %d tensor args", pair_idx);
+    return 0;
+}
+
+/**
+ * Round-level validate: copy results back but keep device resources alive.
+ *
+ * Same copy-back logic as validate_runtime_impl, but does NOT free
+ * device memory, kernel binaries, or clear tensor pairs.
+ *
+ * @param runtime  Pointer to Runtime
+ * @return 0 on success, -1 on failure
+ */
+extern "C" int validate_runtime_round_impl(Runtime *runtime) {
+    if (runtime == nullptr) {
+        LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+
+    int rc = 0;
+    LOG_INFO("=== Round Finalize: Copying Results Back ===");
+
+    TensorPair* tensor_pairs = runtime->get_tensor_pairs();
+    int tensor_pair_count = runtime->get_tensor_pair_count();
+
+    void* pto2_sm = runtime->get_pto2_gm_sm_ptr();
+    uint64_t graph_out_ptr = 0;
+    uint64_t graph_out_size = 0;
+
+    if (pto2_sm != nullptr) {
+        PTO2SharedMemoryHeader host_header;
+        int hdr_rc = runtime->host_api.copy_from_device(&host_header, pto2_sm, sizeof(PTO2SharedMemoryHeader));
+        if (hdr_rc == 0) {
+            graph_out_ptr = host_header.graph_output_ptr;
+            graph_out_size = host_header.graph_output_size;
+        }
+    }
+
+    bool first_output_tensor = true;
+    for (int i = 0; i < tensor_pair_count; i++) {
+        const TensorPair& pair = tensor_pairs[i];
+        if (pair.dev_ptr == nullptr || pair.host_ptr == nullptr) continue;
+
+        void* src_ptr = pair.dev_ptr;
+        size_t copy_size = pair.size;
+
+        if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
+            src_ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(graph_out_ptr));
+            copy_size = static_cast<size_t>(graph_out_size);
+            first_output_tensor = false;
+        }
+
+        int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, src_ptr, copy_size);
+        if (copy_rc != 0) {
+            LOG_ERROR("Round finalize: failed to copy tensor %d from device", i);
+            rc = copy_rc;
+        }
+    }
+
+    LOG_INFO("=== Round Finalize Complete ===");
+    return rc;
+}
+
+/**
  * Validate runtime results and cleanup.
  *
  * This function:
