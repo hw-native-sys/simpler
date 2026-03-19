@@ -59,15 +59,17 @@ static __aicore__ void pv_matmul_impl(__gm__ Tensor* pij, __gm__ Tensor* vj, __g
     TASSIGN(bTile, 0x0);
     TASSIGN(cTile, 0x0);
 
-    // Load pij and vj to L1
+    // Load pij and vj to L1 with separate events for pipeline overlap
     TLOAD(aMatTile, pijGlobal);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);     // A load done
     TLOAD(bMatTile, vjGlobal);
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);     // B load done
 
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+    // Move A to L0A as soon as A load completes (B may still be loading)
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-
-    // Move to L0A/L0B
     TMOV(aTile, aMatTile);
+    // Move B to L0B after B load completes
+    wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);
     TMOV(bTile, bMatTile);
 
     set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
@@ -80,6 +82,9 @@ static __aicore__ void pv_matmul_impl(__gm__ Tensor* pij, __gm__ Tensor* vj, __g
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
     TSTORE(oiGlobal, cTile);
+
+    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {

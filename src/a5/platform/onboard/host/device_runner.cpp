@@ -414,7 +414,8 @@ int DeviceRunner::run(Runtime& runtime,
 
     std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer===" << '\n';
     // Launch AICPU main kernel
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", launch_aicpu_num);
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer",
+                             PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         if (kernel_args_.args.regs != 0) {

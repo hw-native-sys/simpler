@@ -9,10 +9,12 @@ PTO Runtime2 uses a hierarchical profiling system with compile-time macros to co
 ## Profiling Macro Hierarchy
 
 ```
-PTO2_PROFILING (base level, default=0)
+PTO2_PROFILING (base level, default=1)
 ├── PTO2_ORCH_PROFILING (orchestrator, default=0, requires PTO2_PROFILING=1)
+|   └──PTO2_TENSORMAP_PROFILING (tensormap, default=0, requires PTO2_ORCH_PROFILING=1)
 ├── PTO2_SCHED_PROFILING (scheduler, default=0, requires PTO2_PROFILING=1)
-└── PTO2_TENSORMAP_PROFILING (tensormap, default=0, requires PTO2_PROFILING=1)
+└── --enable-profiling (Dump profiling merged swimlane json file for visualization, requires PTO2_PROFILING=1)
+
 ```
 
 ### Compile-Time Validation
@@ -28,8 +30,8 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 #error "PTO2_SCHED_PROFILING requires PTO2_PROFILING=1"
 #endif
 
-#if PTO2_TENSORMAP_PROFILING && !PTO2_PROFILING
-#error "PTO2_TENSORMAP_PROFILING requires PTO2_PROFILING=1"
+#if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
+#error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
 #endif
 ```
 
@@ -194,7 +196,7 @@ runtime->enable_profiling = true;
 
 ## Common Profiling Configurations
 
-### Development (default)
+### Development (minimal overhead)
 ```bash
 # No profiling overhead
 PTO2_PROFILING=0

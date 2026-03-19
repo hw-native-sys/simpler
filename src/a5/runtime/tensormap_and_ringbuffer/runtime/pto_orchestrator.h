@@ -20,6 +20,7 @@
 
 #include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
+#include "pto_submit_types.h"
 #include "pto_scheduler.h"
 #include "pto_shared_memory.h"
 #include "pto_tensormap.h"
@@ -38,22 +39,17 @@ struct PTO2OrchestratorState {
     // === SHARED MEMORY ACCESS ===
     PTO2SharedMemoryHandle* sm_handle;
 
-    // === RING BUFFERS ===
-    PTO2HeapRing heap_ring;    // Output buffer allocation
-    PTO2TaskRing task_ring;    // Task slot allocation
-    PTO2DepListPool dep_pool;  // Dependency list storage (per-orchestrator, no atomics needed)
-    PTO2DepListEntry* dep_pool_cur_entry;
-    int32_t dep_pool_last_reclaimed;  // last_task_alive value at last reclamation
+    // === PER-RING RESOURCES ===
+    PTO2RingSet rings[PTO2_MAX_RING_DEPTH];
 
     // === TENSOR MAP (Private) ===
     PTO2TensorMap tensor_map;        // Producer lookup
-    int32_t tensormap_last_cleanup;  // Last cleanup threshold
 
     // === SCOPE STACK (Private) ===
     // Single contiguous buffer of task IDs, partitioned by scope level.
     // scope_begins[i] is the index into scope_tasks where scope i starts.
     // Tasks for the top scope occupy [scope_begins[top], scope_tasks_size).
-    int32_t* scope_tasks;          // Flat buffer of task IDs (all scopes concatenated)
+    PTO2TaskSlotState** scope_tasks; // Flat buffer of taskSlotState (all scopes concatenated)
     int32_t scope_tasks_size;       // Number of task IDs currently in the buffer
     int32_t scope_tasks_capacity;   // Allocated capacity of scope_tasks
     int32_t* scope_begins;         // scope_begins[i] = start index of scope i in scope_tasks
@@ -64,11 +60,19 @@ struct PTO2OrchestratorState {
     // Note: In simulated mode, orchestrator and scheduler share address space
     // In real mode, they communicate via shared memory only
     PTO2SchedulerState* scheduler;  // For simulated mode only
-    bool init_task_on_submit;       // If true, call scheduler_init_task on submit
+#if PTO2_PROFILING
+    // Runtime profiling switch copied from Runtime::enable_profiling.
+    bool enable_profiling;
+#endif
 
     // === GM HEAP (for output buffers) ===
     void* gm_heap_base;    // Base address of GM heap
-    uint64_t gm_heap_size;   // Size of GM heap
+    uint64_t gm_heap_size;   // Total size of GM heap (all rings)
+
+    // === FATAL ERROR ===
+    // Fatal error flag (single-thread access by orchestrator, no atomic needed)
+    // Cross-thread notification uses shared memory orch_error_code (atomic)
+    bool fatal;
 
     // === STATISTICS ===
 #if PTO2_PROFILING
@@ -78,21 +82,30 @@ struct PTO2OrchestratorState {
 #endif
 
     /**
-     * Allocate packed output buffer for a task
+     * Get current ring index from scope depth.
+     * Maps scope depth to ring_id: min(scope_depth, PTO2_MAX_RING_DEPTH - 1)
+     */
+    uint8_t current_ring_id() const {
+        int32_t depth = scope_stack_top;
+        if (depth < 0) depth = 0;
+        return depth < PTO2_MAX_RING_DEPTH ? static_cast<uint8_t>(depth) : PTO2_MAX_RING_DEPTH - 1;
+    }
+
+    /**
+     * Allocate packed output buffer from current ring's heap
      */
     void* pto2_alloc_packed_buffer(int32_t total_size) {
         if (total_size <= 0) {
             return NULL;
         }
 
-        void* buffer = heap_ring.pto2_heap_ring_alloc(total_size);
+        uint8_t rid = current_ring_id();
+        void* buffer = rings[rid].heap_ring.pto2_heap_ring_alloc(total_size);
 
 #if PTO2_PROFILING
         buffers_allocated++;
         bytes_allocated += total_size;
 #endif
-
-        // heap_top is now updated atomically inside pto2_heap_ring_alloc via CAS
 
         return buffer;
     }
@@ -125,16 +138,6 @@ void pto2_orchestrator_destroy(PTO2OrchestratorState* orch);
  */
 void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler);
 
-/**
- * Set scheduler reference with mode control
- *
- * @param orch           Orchestrator state
- * @param scheduler      Scheduler state
- * @param init_on_submit If true, init task on submit (single-threaded mode)
- *                       If false, scheduler thread polls for new tasks (multi-threaded)
- */
-void pto2_orchestrator_set_scheduler_mode(
-    PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler, bool init_on_submit);
 
 // =============================================================================
 // Scope Management
@@ -174,16 +177,12 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  * 6. Initializes task state in scheduler
  *
  * @param orch        Orchestrator state
- * @param kernel_id   InCore function ID
- * @param worker_type Target worker type (CUBE, VECTOR, AI_CPU, ACCELERATOR)
- * @param params      Array of task parameters
- * @param num_params  Number of parameters
+ * @param mixed_kernels  Kernel IDs for AIC/AIV0/AIV1 slots
+ * @param params      Aggregated tensor and scalar parameters
  */
-void pto2_submit_task(PTO2OrchestratorState* orch,
-    int32_t kernel_id,
-    PTO2WorkerType worker_type,
-    PTOParam* params,
-    int32_t num_params);
+void pto2_submit_mixed_task(PTO2OrchestratorState* orch,
+    const MixedKernels& mixed_kernels,
+    const PTOParam& params);
 
 // =============================================================================
 // Flow Control
@@ -229,7 +228,6 @@ struct PTO2OrchProfilingData {
     uint64_t alloc_wait_cycle;      // Cycles spent waiting in task_ring_alloc
     uint64_t heap_wait_cycle;       // Cycles spent waiting in heap_ring_alloc
     uint64_t fanin_wait_cycle;      // Cycles spent waiting in fanout_lock
-    uint64_t finalize_wait_cycle;   // Cycles spent in ready queue push CAS retries
     // Atomic operation counts per phase
     uint64_t alloc_atomic_count;
     uint64_t params_atomic_count;

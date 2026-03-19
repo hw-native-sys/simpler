@@ -265,10 +265,12 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     {
         runtime->pto2_task_window_size  = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
         runtime->pto2_heap_size         = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
-        if (runtime->pto2_task_window_size || runtime->pto2_heap_size) {
-            LOG_INFO("Ring buffer overrides: task_window=%lu heap=%lu",
+        runtime->pto2_dep_pool_size     = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
+        if (runtime->pto2_task_window_size || runtime->pto2_heap_size || runtime->pto2_dep_pool_size) {
+            LOG_INFO("Ring buffer overrides: task_window=%lu heap=%lu dep_pool=%lu",
                      (unsigned long)(runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE),
-                     (unsigned long)(runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE));
+                     (unsigned long)(runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE),
+                     (unsigned long)(runtime->pto2_dep_pool_size ? runtime->pto2_dep_pool_size : PTO2_DEP_LIST_POOL_SIZE));
         }
     }
 
@@ -276,15 +278,16 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     uint64_t eff_heap_size = runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE;
     uint64_t eff_task_window_size = runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE;
 
-    // Allocate GM heap for orchestrator output buffers
+    // Allocate GM heap for orchestrator output buffers (all rings combined)
+    uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
     long long t_heap_start = _now_ms();
-    void* gm_heap = runtime->host_api.device_malloc(eff_heap_size);
+    void* gm_heap = runtime->host_api.device_malloc(total_heap_size);
     long long t_heap_end = _now_ms();
     if (gm_heap == nullptr) {
         LOG_ERROR("Failed to allocate GM heap");
         return -1;
     }
-    runtime->record_tensor_pair(nullptr, gm_heap, eff_heap_size);
+    runtime->record_tensor_pair(nullptr, gm_heap, total_heap_size);
     runtime->set_pto2_gm_heap(gm_heap);
 
     // Allocate PTO2 shared memory

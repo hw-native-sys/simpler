@@ -35,9 +35,9 @@ struct AicpuExecutor {
 
     int thread_num_{0};
     int cores_total_num_{0};
-    int thread_cores_num_{0};
-    int aic_per_thread_{0};  // Fixed number of AIC cores per thread
-    int aiv_per_thread_{0};  // Fixed number of AIV cores per thread
+    int thread_cores_num_[MAX_AICPU_THREADS]{};  // Total cores (AIC+AIV) assigned to each thread
+    int aic_per_thread_{0};  // Max AIC cores per thread (ceil), used as local queue cap
+    int aiv_per_thread_{0};  // Max AIV cores per thread (ceil), used as local queue cap
     int core_assignments_[MAX_AICPU_THREADS][MAX_CORES_PER_THREAD];
 
     // Core discovery arrays (space-time tradeoff: avoid sorting)
@@ -251,10 +251,7 @@ int AicpuExecutor::init(Runtime* runtime) {
         return -1;
     }
 
-    // Calculate cores per thread
-    thread_cores_num_ = cores_total_num_ / thread_num_;
-
-    LOG_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num_);
+    LOG_INFO("Config: threads=%d, cores=%d", thread_num_, cores_total_num_);
 
     for (int i = 0; i < cores_total_num_; i++) {
         pending_task_ids_[i] = AICPU_TASK_INVALID;
@@ -389,41 +386,31 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     return 0;
 }
 
-// Assign discovered cores to threads (requires even distribution)
+// Assign discovered cores to threads using round-robin
 void AicpuExecutor::assign_cores_to_threads() {
-    if (aic_count_ % thread_num_ != 0) {
-        LOG_ERROR("AIC cores (%d) cannot be evenly distributed to %d threads", aic_count_, thread_num_);
-        init_failed_.store(true, std::memory_order_release);
-        return;
-    }
+    // Round-robin: AIC core i → thread (i % thread_num_), AIV core i → thread (i % thread_num_).
+    // AIC and AIV are assigned independently; no cluster pairing is required.
+    // aic_per_thread_ / aiv_per_thread_ store the ceiling value and serve as local queue caps.
+    aic_per_thread_ = (aic_count_ + thread_num_ - 1) / thread_num_;
+    aiv_per_thread_ = (aiv_count_ + thread_num_ - 1) / thread_num_;
 
-    if (aiv_count_ % thread_num_ != 0) {
-        LOG_ERROR("AIV cores (%d) cannot be evenly distributed to %d threads", aiv_count_, thread_num_);
-        init_failed_.store(true, std::memory_order_release);
-        return;
-    }
-
-    aic_per_thread_ = aic_count_ / thread_num_;
-    aiv_per_thread_ = aiv_count_ / thread_num_;
-
-    LOG_INFO("Core Assignment: %d AIC/thread, %d AIV/thread", aic_per_thread_, aiv_per_thread_);
+    LOG_INFO("Core Assignment: %d AIC cores, %d AIV cores across %d threads (max %d AIC/thread, %d AIV/thread)",
+        aic_count_, aiv_count_, thread_num_, aic_per_thread_, aiv_per_thread_);
 
     for (int t = 0; t < thread_num_; t++) {
         int core_idx = 0;
 
-        // Assign AIC cores to this thread
-        int aic_start = t * aic_per_thread_;
-        int aic_end = (t + 1) * aic_per_thread_;
-        for (int i = aic_start; i < aic_end; i++) {
+        // Assign AIC cores: cores at indices t, t+thread_num_, t+2*thread_num_, ...
+        for (int i = t; i < aic_count_; i += thread_num_) {
             core_assignments_[t][core_idx++] = aic_cores_[i].worker_id;
         }
 
-        // Assign AIV cores to this thread
-        int aiv_start = t * aiv_per_thread_;
-        int aiv_end = (t + 1) * aiv_per_thread_;
-        for (int i = aiv_start; i < aiv_end; i++) {
+        // Assign AIV cores after AIC cores
+        for (int i = t; i < aiv_count_; i += thread_num_) {
             core_assignments_[t][core_idx++] = aiv_cores_[i].worker_id;
         }
+
+        thread_cores_num_[t] = core_idx;
 
         char log_buffer[256];
         int offset = 0;
@@ -431,18 +418,16 @@ void AicpuExecutor::assign_cores_to_threads() {
         offset += snprintf(
             log_buffer + offset, sizeof(log_buffer) - offset, "Thread %d: assigned %d cores - AIC[", t, core_idx);
 
-        for (int i = 0; i < aic_per_thread_; i++) {
-            if (i > 0) offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, ",");
-            offset +=
-                snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d", aic_cores_[aic_start + i].worker_id);
+        for (int k = 0, i = t; i < aic_count_; i += thread_num_, k++) {
+            if (k > 0) offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, ",");
+            offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d", aic_cores_[i].worker_id);
         }
 
         offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "] AIV[");
 
-        for (int i = 0; i < aiv_per_thread_; i++) {
-            if (i > 0) offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, ",");
-            offset +=
-                snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d", aiv_cores_[aiv_start + i].worker_id);
+        for (int k = 0, i = t; i < aiv_count_; i += thread_num_, k++) {
+            if (k > 0) offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, ",");
+            offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "%d", aiv_cores_[i].worker_id);
         }
 
         offset += snprintf(log_buffer + offset, sizeof(log_buffer) - offset, "]");
@@ -554,9 +539,9 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime* runtime) {
 int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
     Handshake* all_handshakes = (Handshake*)runtime->workers;
 
-    LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, thread_cores_num_);
+    LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, thread_cores_num_[thread_idx]);
 
-    for (int i = 0; i < thread_cores_num_; i++) {
+    for (int i = 0; i < thread_cores_num_[thread_idx]; i++) {
         int core_id = cur_thread_cores[i];
         Handshake* hank = &all_handshakes[core_id];
         LOG_INFO("Thread %d: AICPU hank addr = 0x%lx", thread_idx, (uint64_t)hank);
@@ -648,6 +633,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                     if (count > 0) {
                         PerfRecord* record = &perf_buf->records[count - 1];
                         if (record->task_id == static_cast<uint32_t>(completed_task_id)) {
+                            record->func_id = runtime.tasks[completed_task_id].func_id;
+                            record->core_type = h->core_type;
                             perf_aicpu_record_dispatch_and_finish_time(
                                 record, dispatch_timestamps_[core_id], finish_ts);
                         }
@@ -783,6 +770,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                     if (count > 0) {
                         PerfRecord* record = &perf_buf->records[count - 1];
                         if (record->task_id == static_cast<uint32_t>(completed_task_id)) {
+                            record->func_id = runtime.tasks[completed_task_id].func_id;
+                            record->core_type = h->core_type;
                             perf_aicpu_record_dispatch_and_finish_time(
                                 record, dispatch_timestamps_[core_id], finish_ts);
                         }
@@ -995,7 +984,7 @@ int AicpuExecutor::run(Runtime* runtime) {
     const int* cur_thread_cores = core_assignments_[thread_idx];
 
     LOG_INFO("Thread %d: Runtime has %d tasks", thread_idx, runtime->get_task_count());
-    int completed = resolve_and_dispatch(*runtime, thread_idx, cur_thread_cores, thread_cores_num_);
+    int completed = resolve_and_dispatch(*runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
 
     int rc = shutdown_aicore(runtime, thread_idx, cur_thread_cores);
@@ -1005,7 +994,7 @@ int AicpuExecutor::run(Runtime* runtime) {
 
     // Flush performance buffers for cores managed by this thread
     if (runtime->enable_profiling) {
-        perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, thread_cores_num_);
+        perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
 
     LOG_INFO("Thread %d: Completed", thread_idx);

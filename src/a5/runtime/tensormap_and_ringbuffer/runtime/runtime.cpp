@@ -26,6 +26,7 @@ Runtime::Runtime() {
     ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
     pto2_task_window_size = 0;
     pto2_heap_size = 0;
+    pto2_dep_pool_size = 0;
 
     // Initialize tensor pairs
     tensor_pair_count = 0;
@@ -34,6 +35,7 @@ Runtime::Runtime() {
     orch_built_on_host_ = true;
     pto2_gm_sm_ptr_ = nullptr;
     pto2_gm_heap_ptr_ = nullptr;
+    pto2_slot_states_ptr_ = nullptr;
     orch_args_ = nullptr;
     orch_arg_count_ = 0;
 
@@ -93,6 +95,7 @@ int Runtime::get_orch_arg_count() const { return orch_arg_count_; }
 void Runtime::set_orch_built_on_host(bool v) { orch_built_on_host_ = v; }
 void Runtime::set_pto2_gm_sm_ptr(void* p) { pto2_gm_sm_ptr_ = p; }
 void Runtime::set_pto2_gm_heap(void* p) { pto2_gm_heap_ptr_ = p; }
+void Runtime::set_pto2_slot_states_ptr(void* p) { pto2_slot_states_ptr_ = p; }
 void Runtime::set_orch_args(uint64_t* args, int count) {
     orch_arg_count_ = count <= RUNTIME_MAX_ARGS ? count : RUNTIME_MAX_ARGS;
     if (args && orch_arg_count_ > 0) {
@@ -165,11 +168,18 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         return;
     }
 
-    // Get PTO2 data structures
+    // Get slot states for fanout traversal
+    // With multi-ring, slot_states are per-ring inside the scheduler and
+    // pto2_slot_states_ptr_ is nullptr. Fanout and ring_id are filled on the
+    // AICPU side (aicpu_executor.cpp) where slot_state is directly available.
+    PTO2TaskSlotState* slot_states = static_cast<PTO2TaskSlotState*>(pto2_slot_states_ptr_);
+    if (slot_states == nullptr) {
+        return;
+    }
+
+    // Get window mask from shared memory header (ring 0 for legacy single-ring path)
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
-    PTO2TaskDescriptor* task_descriptors = reinterpret_cast<PTO2TaskDescriptor*>(
-        static_cast<char*>(sm_base) + header->task_descriptors_offset);
-    int32_t window_mask = header->task_window_size - 1;
+    int32_t window_mask = static_cast<int32_t>(header->rings[0].task_window_size) - 1;
 
     uint32_t count = perf_buf->count;
 
@@ -177,16 +187,25 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         PerfRecord* record = &perf_buf->records[i];
         int32_t task_id = record->task_id;
 
-        // Get TaskDescriptor from PTO2 shared memory
+        // Get slot state for fanout traversal
         int32_t slot = task_id & window_mask;
-        PTO2TaskDescriptor* task = &task_descriptors[slot];
+        PTO2TaskSlotState& ss = slot_states[slot];
 
         // Fill fanout information by traversing the linked list
         record->fanout_count = 0;
-        PTO2DepListEntry* cur = task->fanout_head;
+        PTO2DepListEntry* cur = ss.fanout_head;
 
         while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
-            record->fanout[record->fanout_count++] = cur->task_id;
+            // PerfRecord.fanout stores 32-bit legacy task IDs. Our multi-ring task ID
+            // encodes ring_id in the upper 32 bits, so only the legacy single-ring
+            // case (ring_id==0) is representable here.
+            uint64_t mixed = pto2_task_id_raw(cur->slot_state->task->mixed_task_id);
+            if ((mixed >> 32) != 0) {
+                // Skip: cannot represent (ring_id, local_id) in a 32-bit fanout slot.
+                cur = cur->next;
+                continue;
+            }
+            record->fanout[record->fanout_count++] = static_cast<int32_t>(mixed & 0xFFFFFFFFu);
             cur = cur->next;
         }
     }

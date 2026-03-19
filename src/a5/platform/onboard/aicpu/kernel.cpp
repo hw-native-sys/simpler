@@ -2,11 +2,11 @@
 
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
+#include "common/platform_config.h"
 #include "aicpu/device_log.h"
 #include "aicpu/platform_regs.h"
-
-// Forward declaration (no need for full runtime.h)
-class Runtime;
+#include "aicpu/platform_aicpu_affinity.h"
+#include "runtime.h"
 
 // Forward declaration of aicpu_execute (implemented in aicpu_executor.cpp)
 extern "C" int aicpu_execute(Runtime *arg);
@@ -70,6 +70,13 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
 
     // Store platform regs before calling aicpu_execute
     set_platform_regs(k_args->regs);
+
+    // Affinity gate: drop excess threads before entering runtime
+    if (!platform_aicpu_affinity_gate(runtime->sche_cpu_num,
+                                      PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
+        LOG_INFO("Thread dropped by cluster affinity");
+        return 0;
+    }
 
     LOG_INFO("%s", "DynTileFwkBackendKernelServer: Calling aicpu_execute with Runtime");
     int rc = aicpu_execute(runtime);

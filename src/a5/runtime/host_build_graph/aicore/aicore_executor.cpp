@@ -26,9 +26,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     // Phase 2: Report physical core ID, signal ready
     my_hank->physical_core_id = get_physical_core_id();
     my_hank->aicore_regs_ready = 1;
-    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dcci(&my_hank->aicore_regs_ready, SINGLE_CACHE_LINE, CACHELINE_OUT);
     while (my_hank->aicpu_regs_ready == 0) {
-        dcci(my_hank, SINGLE_CACHE_LINE);
+        dcci(&my_hank->aicpu_regs_ready, SINGLE_CACHE_LINE);
     }
     // Report initial idle status via register
     write_reg(RegId::COND, AICORE_IDLE_VALUE);
@@ -71,9 +71,8 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-                perf_aicore_record_task(perf_buf, task_ptr->task_id, task_ptr->func_id,
-                                      start_time, end_time, kernel_ready_time,
-                                      core_type);
+                perf_aicore_record_task(perf_buf, actual_task_id,
+                                      start_time, end_time, kernel_ready_time);
             }
 
             last_task_id = task_id;
@@ -83,5 +82,5 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     }
 
     // Flush all dirty cache lines to HBM before kernel exit.
-    dcci(my_hank, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+    dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 }

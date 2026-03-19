@@ -27,11 +27,12 @@
 #define PTO_RING_BUFFER_H
 
 #include <inttypes.h>
-#include <stdlib.h>  // for exit()
 
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
+
+struct PTO2SchedulerState;  // Forward declaration for dep_pool reclaim
 
 // Set to 1 to enable periodic BLOCKED/Unblocked messages during spin-wait.
 #ifndef PTO2_SPIN_VERBOSE_LOGGING
@@ -67,6 +68,9 @@ struct PTO2HeapRing {
     // Reference to shared memory tail (for back-pressure)
     std::atomic<uint64_t>* tail_ptr;  // Points to header->heap_tail
 
+    // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
+    std::atomic<int32_t>* error_code_ptr = nullptr;
+
     /**
      * Allocate memory from heap ring
      *
@@ -75,7 +79,7 @@ struct PTO2HeapRing {
      * Never splits a buffer across the wrap-around boundary.
      *
      * @param size  Requested size in bytes
-     * @return Pointer to allocated memory, never NULL (stalls instead)
+     * @return Pointer to allocated memory, or nullptr on fatal error
      */
     void* pto2_heap_ring_alloc(uint64_t size) {
         // Align size for DMA efficiency
@@ -160,7 +164,10 @@ struct PTO2HeapRing {
                 LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<power-of-2 bytes> (e.g. %lu)",
                           (unsigned long)(this->size * 2));
                 LOG_ERROR("========================================");
-                exit(1);
+                if (error_code_ptr) {
+                    error_code_ptr->store(PTO2_ERROR_HEAP_RING_DEADLOCK, std::memory_order_release);
+                }
+                return nullptr;
             }
 
             SPIN_WAIT_HINT();
@@ -264,6 +271,9 @@ struct PTO2TaskRing {
     // Reference to shared memory last_task_alive (for back-pressure)
     std::atomic<int32_t>* last_alive_ptr;  // Points to header->last_task_alive
 
+    // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
+    std::atomic<int32_t>* error_code_ptr = nullptr;
+
     /**
      * Allocate a task slot from task ring
      *
@@ -275,6 +285,7 @@ struct PTO2TaskRing {
     int32_t pto2_task_ring_alloc() {
         // Spin-wait if window is full (back-pressure from Scheduler)
         int spin_count = 0;
+        int32_t prev_last_alive = last_alive_ptr->load(std::memory_order_acquire);
 #if PTO2_SPIN_VERBOSE_LOGGING
         bool notified = false;
 #endif
@@ -310,50 +321,60 @@ struct PTO2TaskRing {
             if (!waiting) { wait_start = get_sys_cnt_aicpu(); waiting = true; }
 #endif
 
+            // Progress detection: reset spin counter if last_task_alive advances
+            int32_t cur_last_alive = last_alive_ptr->load(std::memory_order_acquire);
+            if (cur_last_alive > prev_last_alive) {
+#if PTO2_SPIN_VERBOSE_LOGGING
+                LOG_INFO("[TaskRing] Progress: last_alive %d -> %d (reset spin_count=%d)",
+                         prev_last_alive, cur_last_alive, spin_count);
+#endif
+                spin_count = 0;
+                prev_last_alive = cur_last_alive;
+            }
+
 #if PTO2_SPIN_VERBOSE_LOGGING
             // Periodic block notification
-            if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count < PTO2_FLOW_CONTROL_SPIN_LIMIT) {
-                int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
+            if (spin_count % PTO2_BLOCK_NOTIFY_INTERVAL == 0 && spin_count > 0 && spin_count < PTO2_FLOW_CONTROL_SPIN_LIMIT) {
                 int32_t current = current_index_ptr->load(std::memory_order_acquire);
-                int32_t active_count = current - last_alive;
+                int32_t active_count = current - cur_last_alive;
                 LOG_WARN("[TaskRing] BLOCKED (Flow Control): current=%d, last_alive=%d, "
                      "active=%d/%d (%.1f%%), spins=%d",
-                     current, last_alive, active_count, window_size,
+                     current, cur_last_alive, active_count, window_size,
                      100.0 * active_count / window_size, spin_count);
                 notified = true;
             }
 #endif
 
-            // Check for potential deadlock
+            // Deadlock: no progress after SPIN_LIMIT spins
             if (spin_count >= PTO2_FLOW_CONTROL_SPIN_LIMIT) {
-                int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
                 int32_t current = current_index_ptr->load(std::memory_order_acquire);
-                int32_t active_count = current - last_alive;
+                int32_t active_count = current - cur_last_alive;
 
                 LOG_ERROR("========================================");
                 LOG_ERROR("FATAL: Flow Control Deadlock Detected!");
                 LOG_ERROR("========================================");
                 LOG_ERROR("Task Ring is FULL and no progress after %d spins.", spin_count);
-                LOG_ERROR("Flow Control Status:");
                 LOG_ERROR("  - Current task index:  %d", current);
-                LOG_ERROR("  - Last task alive:     %d", last_alive);
-                LOG_ERROR("  - Active tasks:        %d", active_count);
-                LOG_ERROR("  - Window size:         %d", window_size);
+                LOG_ERROR("  - Last task alive:     %d (stuck here)", cur_last_alive);
+                LOG_ERROR("  - Active tasks:        %d / %d", active_count, window_size);
                 LOG_ERROR("  - Window utilization:  %.1f%%", 100.0 * active_count / window_size);
-                LOG_ERROR("Root Cause:");
-                LOG_ERROR("  Tasks cannot transition to CONSUMED state because:");
-                LOG_ERROR("  - fanout_count includes 1 for the owning scope");
-                LOG_ERROR("  - scope_end() requires orchestrator to continue");
-                LOG_ERROR("  - But orchestrator is blocked waiting for task ring space");
-                LOG_ERROR("  This creates a circular dependency (deadlock).");
+                LOG_ERROR("Diagnosis:");
+                LOG_ERROR("  last_task_alive is stuck at %d, meaning task %d",
+                          cur_last_alive, cur_last_alive);
+                LOG_ERROR("  cannot transition to CONSUMED. Possible causes:");
+                LOG_ERROR("  1. Task %d still executing (subtasks not complete)", cur_last_alive);
+                LOG_ERROR("  2. Task %d fanout not fully released (downstream not done)", cur_last_alive);
+                LOG_ERROR("  3. Scope reference not released (scope_end not called)");
+                LOG_ERROR("  4. Orchestrator blocked here -> can't call scope_end -> circular wait");
                 LOG_ERROR("Solution:");
                 LOG_ERROR("  Increase task window size (current: %d, recommended: %d)", window_size, active_count * 2);
                 LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
                 LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)", active_count * 2);
                 LOG_ERROR("========================================");
-
-                // Abort program
-                exit(1);
+                if (error_code_ptr) {
+                    error_code_ptr->store(PTO2_ERROR_FLOW_CONTROL_DEADLOCK, std::memory_order_release);
+                }
+                return -1;
             }
 
             SPIN_WAIT_HINT();
@@ -373,9 +394,6 @@ struct PTO2TaskRing {
 
         // Check if there's room (leave at least 1 slot empty)
         if (active_count < window_size - 1) {
-            int32_t slot = task_id & (window_size - 1);
-            PTO2TaskDescriptor* task = &descriptors[slot];
-            task->task_id = task_id;
             return task_id;
         }
 
@@ -452,13 +470,54 @@ struct PTO2DepListPool {
     int32_t top;              // Linear next-allocation counter (starts from 1)
     int32_t tail;             // Linear first-alive counter (entries before this are dead)
     int32_t high_water;       // Peak concurrent usage (top - tail)
+    int32_t last_reclaimed{0}; // last_task_alive at last successful reclamation
+
+    // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
+    std::atomic<int32_t>* error_code_ptr = nullptr;
+
+    /**
+     * Initialize dependency list pool
+     *
+     * @param base      Pool base address from shared memory
+     * @param capacity  Total number of entries
+     */
+    void init(PTO2DepListEntry* in_base, int32_t in_capacity, std::atomic<int32_t>* in_error_code_ptr) {
+        base = in_base;
+        capacity = in_capacity;
+        top = 1;   // Start from 1, 0 means NULL/empty
+        tail = 1;  // Match initial top (no reclaimable entries yet)
+        high_water = 0;
+        last_reclaimed = 0;
+
+        // Initialize entry 0 as NULL marker
+        base[0].slot_state = nullptr;
+        base[0].next = nullptr;
+
+        error_code_ptr = in_error_code_ptr;
+    }
+
+    /**
+     * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
+     * Safe to call multiple times — only advances tail forward.
+     *
+     * @param sched              Scheduler state (for reading slot dep_pool_mark)
+     * @param ring_id            Ring layer index
+     * @param sm_last_task_alive Current last_task_alive from shared memory
+     */
+    void reclaim(PTO2SchedulerState& sched, uint8_t ring_id, int32_t sm_last_task_alive);
+
+    /**
+     * Ensure dep pool for a specific ring has at least `needed` entries available.
+     * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
+     */
+    void ensure_space(PTO2SchedulerState& sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)
      *
-     * @return Reference to allocated entry
+     * @return Pointer to allocated entry, or nullptr on fatal error
      */
-    PTO2DepListEntry& alloc() {
+    PTO2DepListEntry* alloc() {
         int32_t used = top - tail;
         if (used >= capacity) {
             LOG_ERROR("========================================");
@@ -473,13 +532,16 @@ struct PTO2DepListPool {
             LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
             LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", capacity * 2);
             LOG_ERROR("========================================");
-            exit(1);
+            if (error_code_ptr) {
+                error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
+            }
+            return nullptr;
         }
         int32_t idx = top % capacity;
         top++;
         used++;
         if (used > high_water) high_water = used;
-        return base[idx];
+        return &base[idx];
     }
 
     /**
@@ -498,14 +560,15 @@ struct PTO2DepListPool {
      * O(1) operation: allocates new entry and links to current head.
      *
      * @param current_head  Current list head offset (0 = empty list)
-     * @param task_id       Task ID to prepend
+     * @param task_slot     Task slot to prepend
      * @return New head offset
      */
-    PTO2DepListEntry* pto2_dep_list_prepend(PTO2DepListEntry* cur, int32_t task_id) {
-        PTO2DepListEntry& new_entry = alloc();
-        new_entry.task_id = task_id;
-        new_entry.next = cur;
-        return &new_entry;
+    PTO2DepListEntry* prepend(PTO2DepListEntry* cur, PTO2TaskSlotState* slot_state) {
+        PTO2DepListEntry* new_entry = alloc();
+        if (!new_entry) return nullptr;
+        new_entry->slot_state = slot_state;
+        new_entry->next = cur;
+        return new_entry;
     }
 
     /**
@@ -515,21 +578,28 @@ struct PTO2DepListPool {
         if (offset <= 0) return NULL;
         return &base[offset];
     }
+
+    int32_t used() const {
+        return top - tail;
+    }
+
+    int32_t available() const {
+        return capacity - used();
+    }
 };
 
-/**
- * Initialize dependency list pool
- * 
- * @param pool      Pool to initialize
- * @param base      Pool base address from shared memory
- * @param capacity  Total number of entries
- */
-void pto2_dep_pool_init(PTO2DepListPool* pool, PTO2DepListEntry* base, int32_t capacity);
+// =============================================================================
+// Ring Set (per-depth aggregate)
+// =============================================================================
 
 /**
- * Get pool usage statistics
+ * Groups a HeapRing, TaskRing, and DepPool into one per-depth unit.
+ * PTO2_MAX_RING_DEPTH instances provide independent reclamation per scope depth.
  */
-int32_t pto2_dep_pool_used(PTO2DepListPool* pool);
-int32_t pto2_dep_pool_available(PTO2DepListPool* pool);
+struct PTO2RingSet {
+    PTO2HeapRing    heap_ring;
+    PTO2TaskRing    task_ring;
+    PTO2DepListPool dep_pool;
+};
 
 #endif // PTO_RING_BUFFER_H

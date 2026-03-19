@@ -85,7 +85,7 @@ bool pto2_ready_queue_init(PTO2ReadyQueue* queue, uint64_t capacity) {
 
     for (uint64_t i = 0; i < capacity; i++) {
         queue->slots[i].sequence.store((int64_t)i, std::memory_order_relaxed);
-        queue->slots[i].task_id = -1;
+        queue->slots[i].slot_state = nullptr;
     }
 
     return true;
@@ -102,75 +102,79 @@ void pto2_ready_queue_destroy(PTO2ReadyQueue* queue) {
 // Scheduler Initialization
 // =============================================================================
 
+bool PTO2SchedulerState::RingSchedState::init(
+    PTO2SharedMemoryHandle* sm_handle, int32_t ring_id,
+    void* gm_heap_base, uint64_t per_ring_heap_size) {
+    task_descriptors = sm_handle->task_descriptors[ring_id];
+    heap_base = (char*)gm_heap_base + ring_id * per_ring_heap_size;
+    task_window_size = sm_handle->header->rings[ring_id].task_window_size;
+    task_window_mask = static_cast<int32_t>(task_window_size - 1);
+    last_task_alive = 0;
+    last_heap_consumed = 0;
+    heap_tail = 0;
+    slot_states = nullptr;
+    advance_lock.store(0, std::memory_order_relaxed);
+
+    // Allocate per-task slot state array (dynamically sized based on runtime window_size)
+    slot_states = new (std::nothrow) PTO2TaskSlotState[task_window_size];
+    if (!slot_states) {
+        return false;
+    }
+
+    // Zero-initialize all per-task slot state fields.
+    for (uint64_t i = 0; i < task_window_size; i++) {
+        slot_states[i].fanout_lock.store(0, std::memory_order_relaxed);
+        slot_states[i].fanout_count = 0;
+        slot_states[i].fanout_head = nullptr;
+        slot_states[i].task_state.store(static_cast<PTO2TaskState>(0), std::memory_order_relaxed);
+        slot_states[i].fanin_refcount.store(0, std::memory_order_relaxed);
+        slot_states[i].fanin_count = 0;
+        slot_states[i].fanout_refcount.store(0, std::memory_order_relaxed);
+        slot_states[i].payload = nullptr;
+        slot_states[i].task = nullptr;
+        slot_states[i].active_mask = 0;
+        slot_states[i].subtask_done_mask.store(0, std::memory_order_relaxed);
+        slot_states[i].ring_id = 0;
+    }
+
+    return true;
+}
+
+void PTO2SchedulerState::RingSchedState::destroy() {
+    if (!slot_states) return;
+    delete[] slot_states;
+    slot_states = nullptr;
+}
+
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
                           PTO2SharedMemoryHandle* sm_handle,
-                          void* heap_base) {
+                          void* gm_heap_base, uint64_t per_ring_heap_size) {
     sched->sm_handle = sm_handle;
-    sched->heap_base = heap_base;
-    sched->task_state = nullptr;
-    sched->fanin_refcount = nullptr;
-    sched->fanout_refcount = nullptr;
-#if PTO2_PROFILING
+#if PTO2_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
     sched->tasks_consumed.store(0, std::memory_order_relaxed);
 #endif
-    sched->ring_advance_lock.store(0, std::memory_order_relaxed);
 
-    // Get runtime task_window_size from shared memory header
-    uint64_t window_size = sm_handle->header->task_window_size;
-    sched->task_window_size = window_size;
-    sched->task_window_mask = window_size - 1;  // For fast modulo (window_size must be power of 2)
-
-    // Initialize local copies of ring pointers
-    sched->last_task_alive = 0;
-    sched->last_heap_consumed = 0;
-    sched->heap_tail = 0;
-
-    // Allocate per-task state arrays (dynamically sized based on runtime window_size)
-    sched->task_state = new (std::nothrow) std::atomic<PTO2TaskState>[window_size];
-    if (!sched->task_state) {
-        return false;
+    // Initialize per-ring state
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        if (!sched->ring_sched_states[r].init(sm_handle, r, gm_heap_base, per_ring_heap_size)) {
+            for (int j = 0; j < r; j++) {
+                sched->ring_sched_states[j].destroy();
+            }
+            return false;
+        }
     }
 
-    sched->fanin_refcount = new (std::nothrow) std::atomic<int32_t>[window_size];
-    if (!sched->fanin_refcount) {
-        delete[] sched->task_state;
-        sched->task_state = nullptr;
-        return false;
-    }
-
-    sched->fanout_refcount = new (std::nothrow) std::atomic<int32_t>[window_size];
-    if (!sched->fanout_refcount) {
-        delete[] sched->fanin_refcount;
-        delete[] sched->task_state;
-        sched->fanin_refcount = nullptr;
-        sched->task_state = nullptr;
-        return false;
-    }
-
-    // Zero-initialize all per-task state arrays.
-    // new[] default-initializes std::atomic<T> which leaves values indeterminate.
-    // Scheduler logic (e.g. fanin_refcount fetch_add in release_fanin_and_check_ready)
-    // assumes slots start at zero before init_task writes them.
-    for (uint64_t i = 0; i < window_size; i++) {
-        sched->task_state[i].store(static_cast<PTO2TaskState>(0), std::memory_order_relaxed);
-        sched->fanin_refcount[i].store(0, std::memory_order_relaxed);
-        sched->fanout_refcount[i].store(0, std::memory_order_relaxed);
-    }
-
-    // Initialize ready queues
-    for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
+    // Initialize ready queues (one per resource shape, global)
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         if (!pto2_ready_queue_init(&sched->ready_queues[i], PTO2_READY_QUEUE_SIZE)) {
             // Cleanup on failure
             for (int j = 0; j < i; j++) {
                 pto2_ready_queue_destroy(&sched->ready_queues[j]);
             }
-            delete[] sched->fanout_refcount;
-            delete[] sched->fanin_refcount;
-            delete[] sched->task_state;
-            sched->fanout_refcount = nullptr;
-            sched->fanin_refcount = nullptr;
-            sched->task_state = nullptr;
+            for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                sched->ring_sched_states[r].destroy();
+            }
             return false;
         }
     }
@@ -179,22 +183,11 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
 }
 
 void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
-    if (sched->task_state) {
-        delete[] sched->task_state;
-        sched->task_state = nullptr;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        sched->ring_sched_states[r].destroy();
     }
 
-    if (sched->fanin_refcount) {
-        delete[] sched->fanin_refcount;
-        sched->fanin_refcount = nullptr;
-    }
-
-    if (sched->fanout_refcount) {
-        delete[] sched->fanout_refcount;
-        sched->fanout_refcount = nullptr;
-    }
-
-    for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         pto2_ready_queue_destroy(&sched->ready_queues[i]);
     }
 }
@@ -205,9 +198,15 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
 
 void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
     LOG_INFO("=== Scheduler Statistics ===");
-    LOG_INFO("last_task_alive:   %d", sched->last_task_alive);
-    LOG_INFO("heap_tail:         %" PRIu64, sched->heap_tail);
-#if PTO2_PROFILING
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        if (sched->ring_sched_states[r].last_task_alive > 0 ||
+            sched->ring_sched_states[r].heap_tail > 0) {
+            LOG_INFO("Ring %d:", r);
+            LOG_INFO("  last_task_alive: %d", sched->ring_sched_states[r].last_task_alive);
+            LOG_INFO("  heap_tail:       %" PRIu64, sched->ring_sched_states[r].heap_tail);
+        }
+    }
+#if PTO2_SCHED_PROFILING
     LOG_INFO("tasks_completed:   %lld", (long long)sched->tasks_completed.load(std::memory_order_relaxed));
     LOG_INFO("tasks_consumed:    %lld", (long long)sched->tasks_consumed.load(std::memory_order_relaxed));
 #endif
@@ -217,10 +216,10 @@ void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
 void pto2_scheduler_print_queues(PTO2SchedulerState* sched) {
     LOG_INFO("=== Ready Queues ===");
 
-    const char* worker_names[] = {"CUBE", "VECTOR", "AI_CPU", "ACCELERATOR"};
+    const char* shape_names[] = {"AIC_ONLY", "AIV_X1", "AIV_X2", "AIC_AIV_X1", "AIC_AIV_X2"};
 
-    for (int i = 0; i < PTO2_NUM_WORKER_TYPES; i++) {
-        LOG_INFO("  %s: count=%" PRIu64, worker_names[i],
+    for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        LOG_INFO("  %s: count=%" PRIu64, shape_names[i],
                  sched->ready_queues[i].size());
     }
 

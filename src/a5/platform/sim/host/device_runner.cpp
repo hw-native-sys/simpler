@@ -15,6 +15,7 @@
  */
 
 #include "device_runner.h"
+#include "aicpu/platform_aicpu_affinity.h"
 
 // Function pointer types for dynamically loaded executors
 typedef int (*aicpu_execute_func_t)(Runtime* runtime);
@@ -277,11 +278,15 @@ int DeviceRunner::run(Runtime& runtime,
     // Set platform regs in the AICPU .so before launching threads
     set_platform_regs_func_(kernel_args_.regs);
 
-    // Launch AICPU threads
-    LOG_INFO("Launching %d AICPU thread(s)", launch_aicpu_num);
+    // Launch AICPU threads (over-launch for affinity gate)
+    constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
+    LOG_INFO("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
     std::vector<std::thread> aicpu_threads;
-    for (int i = 0; i < launch_aicpu_num; i++) {
-        aicpu_threads.emplace_back([this, &runtime]() {
+    for (int i = 0; i < over_launch; i++) {
+        aicpu_threads.emplace_back([this, &runtime, launch_aicpu_num, over_launch]() {
+            if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
+                return;
+            }
             aicpu_execute_func_(&runtime);
         });
     }

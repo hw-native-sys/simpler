@@ -4,11 +4,11 @@
 //   Case1: oi/oi_new are (16, 128), mij/lij/mi/li are 16-element vectors
 //   Case2: oi/oi_new are (64, 128), mij/lij/mi/li are 64-element vectors
 //
-// Scalar layout strategy:
-//   M scalar floats stored contiguously in GM can be loaded as either:
-//   - ND (kScalarRows, kScalarCols) RowMajor for element-wise ops (TMAX, TSUB, TEXP, TMUL, TADD)
-//   - DN (kAlignedRows, 1) ColMajor for row-broadcast ops (TROWEXPANDMUL, TROWEXPANDDIV)
-//   Conversion between layouts uses GM round-trip: ND TSTORE → DN TLOAD.
+// Scalar layout strategy using TRESHAPE (zero-copy UB reshape):
+//   Scalars loaded as DN ColMajor (M, 1) for TROWEXPANDMUL/TROWEXPANDDIV.
+//   For element-wise ops (TMAX, TSUB, TEXP, etc.), TRESHAPE to RowMajor (1, M).
+//   After arithmetic, TRESHAPE back to ColMajor (M, 1) for row-broadcast ops.
+//   This eliminates the GM round-trip (TSTORE ND → TLOAD DN) used in the original.
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
@@ -43,11 +43,6 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
     __gm__ float* oi_ptr = reinterpret_cast<__gm__ float*>(oi->buffer.addr);
     __gm__ float* dst_ptr = reinterpret_cast<__gm__ float*>(dst->buffer.addr);
 
-    // Scalar tile dimensions for RowMajor layout:
-    // kScalarCols = 32 bytes / 4 bytes per float = 8 floats per row (one 32-byte block)
-    // kScalarRows = M / 8 (M=16 → 2 rows, M=64 → 8 rows)
-    constexpr int kScalarCols = 32 / sizeof(float);
-    constexpr int kScalarRows = M / kScalarCols;
     // Aligned rows for ColMajor DN tiles (32-byte alignment)
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
@@ -56,12 +51,14 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
     // Data (M, N) RowMajor
     using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<1, 1, 1, N, 1>>;
 
-    // Scalar ND: M contiguous floats as (kScalarRows, kScalarCols) RowMajor
+    // Scalar DN: M contiguous floats as (kAlignedRows, 1) ColMajor for TROWEXPAND ops and loading
+    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, pto::Stride<1, 1, 1, 1, 1>, Layout::DN>;
+
+    // Scalar ND: for storing mi_new and li_new back to GM
+    constexpr int kScalarCols = 32 / sizeof(float);
+    constexpr int kScalarRows = M / kScalarCols;
     using GlobalScalarND =
         GlobalTensor<float, Shape<1, 1, 1, kScalarRows, kScalarCols>, pto::Stride<1, 1, 1, kScalarCols, 1>>;
-
-    // Scalar DN: same M contiguous floats as (kAlignedRows, 1) ColMajor
-    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, pto::Stride<1, 1, 1, 1, 1>, Layout::DN>;
 
     // --- GlobalTensor instances ---
 
@@ -69,64 +66,69 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
     GlobalDataMxN oiGlobal(oi_ptr + oi->start_offset);
     GlobalDataMxN dstGlobal(dst_ptr + dst->start_offset);
 
-    // ND globals for scalar element-wise operations
-    GlobalScalarND mijGlobalND(mij_ptr + mij->start_offset);
-    GlobalScalarND lijGlobalND(lij_ptr + lij->start_offset);
-    GlobalScalarND miGlobalND(mi_ptr + mi->start_offset);
-    GlobalScalarND liGlobalND(li_ptr + li->start_offset);
-
-    // DN globals aliased to same GM for ColMajor reload (used after ND TSTORE)
+    // DN globals for loading scalars as ColMajor
     GlobalScalarDN mijGlobalDN(mij_ptr + mij->start_offset);
     GlobalScalarDN lijGlobalDN(lij_ptr + lij->start_offset);
+    GlobalScalarDN miGlobalDN(mi_ptr + mi->start_offset);
     GlobalScalarDN liGlobalDN(li_ptr + li->start_offset);
+
+    // ND globals for storing scalar results
+    GlobalScalarND miGlobalND(mi_ptr + mi->start_offset);
+    GlobalScalarND liGlobalND(li_ptr + li->start_offset);
 
     // --- Tile types ---
 
     using TileDataMxN = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N>;
+    using TileScalarDN = Tile<TileType::Vec, float, kAlignedRows, 1, BLayout::ColMajor, M, 1>;
+
+    // RowMajor (1, M) tiles for element-wise arithmetic via TRESHAPE
+    using TileScalarRow = Tile<TileType::Vec, float, 1, M, BLayout::RowMajor, 1, M>;
+
+    // ND tile for storing back to GM
     using TileScalarND =
         Tile<TileType::Vec, float, kScalarRows, kScalarCols, BLayout::RowMajor, kScalarRows, kScalarCols>;
-    using TileScalarDN = Tile<TileType::Vec, float, kAlignedRows, 1, BLayout::ColMajor, M, 1>;
 
     // --- UB memory layout ---
 
     constexpr int kDataBytes = M * N * sizeof(float);
-    constexpr int kScalarNDBytes = kScalarRows * kScalarCols * sizeof(float);
     constexpr int kScalarDNBytes = kAlignedRows * sizeof(float);
 
     // Data tiles
     TileDataMxN oiNewTile;
     TileDataMxN oiTile;
 
-    // Scalar ND tiles for element-wise arithmetic
-    TileScalarND mijND, lijND, miND, liND;
-    TileScalarND miNewND, alphaND, betaND, tmpND;
+    // Scalar DN tiles loaded from GM (ColMajor)
+    TileScalarDN mijDN, lijDN, miDN, liDN;
 
-    // Scalar DN tiles for TROWEXPAND operations
-    TileScalarDN alphaDN, betaDN, liDN;
+    // Temporary DN tiles for results
+    TileScalarDN miNewDN, alphaDN, betaDN, liNewDN, tmpDN;
 
     TASSIGN(oiNewTile, 0);
     TASSIGN(oiTile, kDataBytes);
-    TASSIGN(mijND, 2 * kDataBytes);
-    TASSIGN(lijND, 2 * kDataBytes + kScalarNDBytes);
-    TASSIGN(miND, 2 * kDataBytes + 2 * kScalarNDBytes);
-    TASSIGN(liND, 2 * kDataBytes + 3 * kScalarNDBytes);
-    TASSIGN(miNewND, 2 * kDataBytes + 4 * kScalarNDBytes);
-    TASSIGN(alphaND, 2 * kDataBytes + 5 * kScalarNDBytes);
-    TASSIGN(betaND, 2 * kDataBytes + 6 * kScalarNDBytes);
-    TASSIGN(tmpND, 2 * kDataBytes + 7 * kScalarNDBytes);
-    TASSIGN(alphaDN, 2 * kDataBytes + 8 * kScalarNDBytes);
-    TASSIGN(betaDN, 2 * kDataBytes + 8 * kScalarNDBytes + kScalarDNBytes);
-    TASSIGN(liDN, 2 * kDataBytes + 8 * kScalarNDBytes + 2 * kScalarDNBytes);
+    TASSIGN(mijDN, 2 * kDataBytes);
+    TASSIGN(lijDN, 2 * kDataBytes + kScalarDNBytes);
+    TASSIGN(miDN, 2 * kDataBytes + 2 * kScalarDNBytes);
+    TASSIGN(liDN, 2 * kDataBytes + 3 * kScalarDNBytes);
+    TASSIGN(miNewDN, 2 * kDataBytes + 4 * kScalarDNBytes);
+    TASSIGN(alphaDN, 2 * kDataBytes + 5 * kScalarDNBytes);
+    TASSIGN(betaDN, 2 * kDataBytes + 6 * kScalarDNBytes);
+    TASSIGN(liNewDN, 2 * kDataBytes + 7 * kScalarDNBytes);
+    TASSIGN(tmpDN, 2 * kDataBytes + 8 * kScalarDNBytes);
 
     if (is_first) {
         // --- First block: copy inputs to accumulators ---
         TLOAD(oiNewTile, oiNewGlobal);
-        TLOAD(mijND, mijGlobalND);
-        TLOAD(lijND, lijGlobalND);
+        TLOAD(mijDN, mijGlobalDN);
+        TLOAD(lijDN, lijGlobalDN);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-        // Passthrough to MTE3 (no V compute needed)
+        // Store mi = mij, li = lij, oi = oi_new
+        // Alias ND tiles to the same UB as DN tiles for storing as ND format
+        TileScalarND mijND, lijND;
+        TASSIGN(mijND, 2 * kDataBytes);           // alias same UB as mijDN
+        TASSIGN(lijND, 2 * kDataBytes + kScalarDNBytes);  // alias same UB as lijDN
+
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         TSTORE(miGlobalND, mijND);    // mi = mij
@@ -135,13 +137,10 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
 
         if (is_last) {
             // Single block: normalize dst = oi_new / lij
-            // lij stored to li buffer in ND format; reload as DN for TROWEXPANDDIV
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            TLOAD(liDN, liGlobalDN);
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-            TROWEXPANDDIV(oiNewTile, oiNewTile, liDN);
+            // lijDN already in ColMajor DN format, use directly for TROWEXPANDDIV
+            set_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID0);
+            TROWEXPANDDIV(oiNewTile, oiNewTile, lijDN);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
             TSTORE(dstGlobal, oiNewTile);
@@ -149,66 +148,75 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
     } else {
         // --- Subsequent blocks: accumulate ---
 
-        // Phase 1: Load all inputs
+        // Load all inputs
         TLOAD(oiNewTile, oiNewGlobal);
         TLOAD(oiTile, oiGlobal);
-        TLOAD(mijND, mijGlobalND);
-        TLOAD(lijND, lijGlobalND);
-        TLOAD(miND, miGlobalND);
-        TLOAD(liND, liGlobalND);
+        TLOAD(mijDN, mijGlobalDN);
+        TLOAD(lijDN, lijGlobalDN);
+        TLOAD(miDN, miGlobalDN);
+        TLOAD(liDN, liGlobalDN);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-        // Phase 2: Scalar arithmetic in RowMajor (kScalarRows, kScalarCols)
-        // to resolve RAW hazards on shared UB tiles.
-        TMAX(miNewND, miND, mijND);  // mi_new = max(mi, mij)
-        TSUB(alphaND, miND, miNewND);  // alpha = mi - mi_new
-        TEXP(alphaND, alphaND);  // alpha = exp(mi - mi_new)
-        TSUB(betaND, mijND, miNewND);  // beta = mij - mi_new
-        TEXP(betaND, betaND);  // beta = exp(mij - mi_new)
-        TMUL(liND, alphaND, liND);  // li = alpha * li
-        TMUL(tmpND, betaND, lijND);  // tmp = beta * lij
-        TADD(liND, liND, tmpND);  // li = alpha * li + beta * lij (= li_new)
+        // TRESHAPE: ColMajor(M,1) → RowMajor(1,M) for element-wise arithmetic
+        TileScalarRow miRow, mijRow, liRow, lijRow;
+        TRESHAPE(miRow, miDN);
+        TRESHAPE(mijRow, mijDN);
+        TRESHAPE(liRow, liDN);
+        TRESHAPE(lijRow, lijDN);
 
-        // Phase 3: Store scalar results to GM (ND format)
-        // mi_new → mi accumulator, li_new → li accumulator
-        // alpha → mij buffer (reuse), beta → lij buffer (reuse)
-        set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        TSTORE(miGlobalND, miNewND);   // persist mi_new
-        TSTORE(liGlobalND, liND);      // persist li_new
-        TSTORE(mijGlobalND, alphaND);  // temp: alpha to mij buffer
-        TSTORE(lijGlobalND, betaND);   // temp: beta to lij buffer
+        // Scalar arithmetic in RowMajor (1, M) layout
+        TileScalarRow miNewRow, alphaRow, betaRow, liNewRow, tmpRow;
+        TASSIGN(miNewRow, 2 * kDataBytes + 4 * kScalarDNBytes);
+        TASSIGN(alphaRow, 2 * kDataBytes + 5 * kScalarDNBytes);
+        TASSIGN(betaRow, 2 * kDataBytes + 6 * kScalarDNBytes);
+        TASSIGN(liNewRow, 2 * kDataBytes + 7 * kScalarDNBytes);
+        TASSIGN(tmpRow, 2 * kDataBytes + 8 * kScalarDNBytes);
 
-        // Phase 4: Reload alpha, beta (and li if last) as ColMajor DN
-        set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        TLOAD(alphaDN, mijGlobalDN);  // alpha from mij buffer as DN
-        TLOAD(betaDN, lijGlobalDN);   // beta from lij buffer as DN
-        if (is_last) {
-            TLOAD(liDN, liGlobalDN);  // li_new from li buffer as DN
-        }
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+        TMAX(miNewRow, miRow, mijRow);        // mi_new = max(mi, mij)
+        TSUB(alphaRow, miRow, miNewRow);      // alpha_exp = mi - mi_new
+        TEXP(alphaRow, alphaRow);             // alpha = exp(mi - mi_new)
+        TSUB(betaRow, mijRow, miNewRow);      // beta_exp = mij - mi_new
+        TEXP(betaRow, betaRow);               // beta = exp(mij - mi_new)
+        TMUL(tmpRow, alphaRow, liRow);        // alpha * li
+        TMUL(liNewRow, betaRow, lijRow);      // beta * lij
+        TADD(liNewRow, tmpRow, liNewRow);     // li_new = alpha*li + beta*lij
 
-        // Phase 5: Scale data tiles using row-broadcast multiply
+        // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for TROWEXPANDMUL
+        TRESHAPE(alphaDN, alphaRow);
+        TRESHAPE(betaDN, betaRow);
+
+        // Scale data tiles using row-broadcast multiply
         TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
-        TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);  // oi_new *= beta
-        TADD(oiTile, oiTile, oiNewTile);  // oi = alpha*oi + beta*oi_new
+        TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);   // oi_new *= beta
+        TADD(oiTile, oiTile, oiNewTile);              // oi = alpha*oi + beta*oi_new
+
+        // Store mi_new and li_new to GM (ND format)
+        // Alias ND tiles to the same UB locations as miNewRow and liNewRow
+        TileScalarND miNewND, liNewND;
+        TASSIGN(miNewND, 2 * kDataBytes + 4 * kScalarDNBytes);
+        TASSIGN(liNewND, 2 * kDataBytes + 7 * kScalarDNBytes);
 
         if (is_last) {
-            // Phase 6: Normalize and output
-            TROWEXPANDDIV(oiTile, oiTile, liDN);  // dst = oi / li_new
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+            // Normalize and output: dst = oi / li_new
+            TRESHAPE(liNewDN, liNewRow);
+            TROWEXPANDDIV(oiTile, oiTile, liNewDN);
+            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            TSTORE(miGlobalND, miNewND);   // persist mi_new
+            TSTORE(liGlobalND, liNewND);   // persist li_new
             TSTORE(dstGlobal, oiTile);
         } else {
-            // Phase 6: Store updated accumulators
-            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
-            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
+            // Store updated accumulators
+            set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+            TSTORE(miGlobalND, miNewND);   // persist mi_new
+            TSTORE(liGlobalND, liNewND);   // persist li_new
             TSTORE(oiGlobal, oiTile);
         }
     }
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {

@@ -40,6 +40,14 @@ constexpr int PLATFORM_AIV_CORES_PER_BLOCKDIM = 2;
  */
 constexpr int PLATFORM_MAX_AICPU_THREADS = 7;
 
+/**
+ * Maximum AICPU launch threads (physical)
+ * Upper bound for the number of AICPU threads that can be launched by Host.
+ * Can be larger than PLATFORM_MAX_AICPU_THREADS to allow threads to be dropped
+ * from scheduling while still participating in affinity (e.g. 6 launch, 4 active).
+ */
+constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
+
 // =============================================================================
 // Derived Platform Limits
 // =============================================================================

@@ -38,7 +38,7 @@ uint64_t g_insert_count = 0;
 // Initialization and Destruction
 // =============================================================================
 
-bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t new_task_window_size) {
+bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]) {
     // Validate power of 2 for fast modulo
     if ((new_num_buckets & (new_num_buckets - 1)) != 0) {
         return false;  // num_buckets must be power of 2
@@ -57,13 +57,14 @@ bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t
 
     num_buckets = new_num_buckets;
 
-    // Allocate entry pool
-    entry_pool = (PTO2TensorMapEntry*)calloc(new_pool_size, sizeof(PTO2TensorMapEntry));
+    // Allocate entry pool (64-byte aligned for cache-line-aligned entries)
+    entry_pool = (PTO2TensorMapEntry*)aligned_alloc(alignof(PTO2TensorMapEntry), new_pool_size * sizeof(PTO2TensorMapEntry));
     if (!entry_pool) {
         free(buckets);
         buckets = NULL;
         return false;
     }
+    memset(entry_pool, 0, new_pool_size * sizeof(PTO2TensorMapEntry));
 
     // Allocate free entry list
     free_entry_list = (PTO2TensorMapEntry**)calloc(new_pool_size, sizeof(PTO2TensorMapEntry*));
@@ -86,35 +87,42 @@ bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, int32_t
         entry_pool[i].prev_in_bucket = nullptr;
         entry_pool[i].next_in_task = nullptr;
         entry_pool[i].prev_in_task = nullptr;
-        entry_pool[i].producer_task_id = -1;
+        entry_pool[i].producer_task_id = PTO2TaskId{};
     }
 
-    // Allocate per-task entry tracking
-    task_entry_head = (PTO2TensorMapEntry**)malloc(new_task_window_size * sizeof(PTO2TensorMapEntry*));
-    if (!task_entry_head) {
-        free(entry_pool);
-        free(buckets);
-        free(free_entry_list);
-        entry_pool = NULL;
-        buckets = NULL;
-        free_entry_list = NULL;
-        return false;
+    // Allocate per-ring per-task entry tracking (each ring has its own window size)
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        task_entry_heads[r] = (PTO2TensorMapEntry**)malloc(new_task_window_sizes[r] * sizeof(PTO2TensorMapEntry*));
+        if (!task_entry_heads[r]) {
+            // Cleanup previously allocated rings
+            for (int j = 0; j < r; j++) {
+                free(task_entry_heads[j]);
+                task_entry_heads[j] = NULL;
+            }
+            free(entry_pool);
+            free(buckets);
+            free(free_entry_list);
+            entry_pool = NULL;
+            buckets = NULL;
+            free_entry_list = NULL;
+            return false;
+        }
+        for (int32_t i = 0; i < new_task_window_sizes[r]; i++) {
+            task_entry_heads[r][i] = nullptr;
+        }
+        task_window_sizes[r] = new_task_window_sizes[r];
     }
 
-    // Initialize all task entry heads to -1 (no entries)
-    for (int32_t i = 0; i < new_task_window_size; i++) {
-        task_entry_head[i] = nullptr;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        last_task_alives[r] = 0;
+        last_cleanup[r] = 0;
     }
-
-    task_window_size = new_task_window_size;
-
-    last_task_alive = 0;
 
     return true;
 }
 
-bool PTO2TensorMap::init_default(int32_t new_task_window_size) {
-    return init(PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE, new_task_window_size);
+bool PTO2TensorMap::init_default(const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]) {
+    return init(PTO2_TENSORMAP_NUM_BUCKETS, PTO2_TENSORMAP_POOL_SIZE, new_task_window_sizes);
 }
 
 void PTO2TensorMap::destroy() {
@@ -128,9 +136,11 @@ void PTO2TensorMap::destroy() {
         entry_pool = NULL;
     }
 
-    if (task_entry_head) {
-        free(task_entry_head);
-        task_entry_head = NULL;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        if (task_entry_heads[r]) {
+            free(task_entry_heads[r]);
+            task_entry_heads[r] = NULL;
+        }
     }
 
     if (free_entry_list) {
@@ -193,7 +203,9 @@ void PTO2TensorMap::print_stats() {
     LOG_INFO("Empty buckets:       %d", empty_buckets);
     LOG_INFO("Max chain len:       %d", max_chain);
     LOG_INFO("Avg chain len:       %.2f", non_empty_buckets > 0 ? (float)total_chain / non_empty_buckets : 0);
-    LOG_INFO("Last task alive:     %d", last_task_alive);
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        LOG_INFO("Last task alive[%d]: %d", r, last_task_alives[r]);
+    }
     LOG_INFO("============================");
 }
 
@@ -209,20 +221,13 @@ int32_t PTO2TensorMap::valid_count() {
     return count;
 }
 
-void PTO2TensorMap::sync_tensormap() {
-    constexpr int MIN_FREE_NUM = 1024;
-    always_assert(orch != nullptr);
-    while(true) {
-        // Read current last_task_alive from shared memory
-        int32_t new_last_task_alive =
-            orch->sm_handle->header->last_task_alive.load(std::memory_order_acquire);
-        sync_validity(new_last_task_alive);
-        if ((pool_size - next_entry_idx + free_num < MIN_FREE_NUM) || new_last_task_alive - orch->tensormap_last_cleanup >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
-            cleanup_retired(orch->tensormap_last_cleanup, new_last_task_alive);
-            orch->tensormap_last_cleanup = new_last_task_alive;
-        } else {
-            break;
-        }
+void PTO2TensorMap::sync_tensormap(uint8_t ring_id, int32_t sm_last_task_alive) {
+    sync_validity(ring_id, sm_last_task_alive);
+    // Only attempt cleanup when last_task_alive has actually advanced;
+    // otherwise cleanup_retired would empty-loop and we'd spin forever.
+    if (sm_last_task_alive - last_cleanup[ring_id] >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
+        cleanup_retired(ring_id, last_cleanup[ring_id], sm_last_task_alive);
+        last_cleanup[ring_id] = sm_last_task_alive;
     }
 }
 
