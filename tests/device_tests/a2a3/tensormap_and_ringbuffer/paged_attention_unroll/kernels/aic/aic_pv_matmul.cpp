@@ -9,8 +9,11 @@
 // Single output: oi_new (M, N) fp32 = sum of P_i @ V_i across all blocks
 //
 // Optimizations:
-//   - Double-buffered L1 tiles (ping/pong for A and B)
-//   - TLOAD(next pij+vj) overlaps with TMATMUL_ACC(current) via MTE2/PIPE_M parallelism
+//   - Double-buffered L1 tiles (ping/pong for A and B via MTE2)
+//   - Double-buffered L0 tiles (ping/pong for L0A and L0B via MTE1)
+//   - TLOAD(next) overlaps with TMATMUL(current) via MTE2/M-pipe parallelism
+//   - Canonical 3-stage pipeline: TLOAD(MTE2) → TMOV(MTE1) → TMATMUL(M)
+//   - Reverse-dependency events ensure buffer safety across iterations
 //
 // Supports two tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128) -> (16, 128)
@@ -53,67 +56,75 @@ static __aicore__ void pv_matmul_n_impl(
     using RightTile = TileRight<bfloat16_t, K, N, K, N>;
     using AccTile = TileAcc<float, M, N, M, N>;
 
-    // Double-buffered L1 tiles (ping/pong)
-    TileMatA aMatTile_ping, aMatTile_pong;
-    TileMatB bMatTile_ping, bMatTile_pong;
-    TASSIGN(aMatTile_ping, 0x0);
-    TASSIGN(aMatTile_pong, 0x10000);
-    TASSIGN(bMatTile_ping, 0x20000);
-    TASSIGN(bMatTile_pong, 0x30000);
+    // L1 memory layout: double-buffered A and B tiles (tightly packed)
+    constexpr int kATileBytes = M * K * static_cast<int>(sizeof(bfloat16_t));
+    constexpr int kBTileBytes = K * N * static_cast<int>(sizeof(bfloat16_t));
 
-    LeftTile aTile;
-    RightTile bTile;
+    TileMatA aMatTile[2];
+    TileMatB bMatTile[2];
+    TASSIGN(aMatTile[0], 0x0);
+    TASSIGN(aMatTile[1], kATileBytes);
+    TASSIGN(bMatTile[0], 2 * kATileBytes);
+    TASSIGN(bMatTile[1], 2 * kATileBytes + kBTileBytes);
+
+    // L0 memory layout: double-buffered L0A and L0B, single accumulator L0C
+    LeftTile aTile[2];
+    RightTile bTile[2];
     AccTile cTile;
-    TASSIGN(aTile, 0x0);
-    TASSIGN(bTile, 0x0);
+    TASSIGN(aTile[0], 0x0);
+    TASSIGN(aTile[1], kATileBytes);
+    TASSIGN(bTile[0], 0x0);
+    TASSIGN(bTile[1], kBTileBytes);
     TASSIGN(cTile, 0x0);
 
     GlobalOut oiGlobal(oi_base);
 
-    // Pre-load first iteration's tiles into ping buffers
-    GlobalA pijGlobal_0(pij_base);
-    GlobalB vjGlobal_0(val_base + block_table[0] * K * N);
-    TLOAD(aMatTile_ping, pijGlobal_0);
-    TLOAD(bMatTile_ping, vjGlobal_0);
+    // Seed reverse-dependency flags: all ping/pong buffers initially free
+    //   PIPE_MTE1 → PIPE_MTE2: L1 buffer [0/1] safe for TLOAD to overwrite
+    //   PIPE_M    → PIPE_MTE1: L0 buffer [0/1] safe for TMOV to overwrite
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+    set_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
 
     for (uint64_t i = 0; i < n_blocks; i++) {
-        // Select current buffers based on iteration parity
-        TileMatA& curA = (i % 2 == 0) ? aMatTile_ping : aMatTile_pong;
-        TileMatB& curB = (i % 2 == 0) ? bMatTile_ping : bMatTile_pong;
+        int cur = static_cast<int>(i % 2);
+        GlobalA pijGlobal(pij_base + i * M * K);
+        GlobalB vjGlobal(val_base + block_table[i] * K * N);
 
-        // Wait for current TLOAD to complete
-        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
-        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
+        // Stage 1: TLOAD (MTE2: GM → L1[cur])
+        // Wait for MTE1 to release L1[cur] (reverse dep from previous iteration)
+        wait_flag(PIPE_MTE1, PIPE_MTE2, (event_t)cur);
+        TLOAD(aMatTile[cur], pijGlobal);
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);   // forward: A in L1 ready
+        TLOAD(bMatTile[cur], vjGlobal);
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);   // forward: B in L1 ready
 
-        // Wait for previous matmul to complete (L0A/L0B safe to overwrite)
-        if (i > 0) {
-            wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-        }
+        // Stage 2: TMOV (MTE1: L1[cur] → L0[cur])
+        // Wait for M-pipe to release L0[cur] (reverse dep from previous iteration)
+        wait_flag(PIPE_M, PIPE_MTE1, (event_t)cur);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);  // forward: wait A loaded
+        TMOV(aTile[cur], aMatTile[cur]);
+        wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);  // forward: wait B loaded
+        TMOV(bTile[cur], bMatTile[cur]);
+        set_flag(PIPE_MTE1, PIPE_MTE2, (event_t)cur); // reverse: release L1[cur]
 
-        TMOV(aTile, curA);
-        TMOV(bTile, curB);
-
-        set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-        wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
-
+        // Stage 3: TMATMUL (M-pipe: L0A[cur] × L0B[cur] → L0C)
+        set_flag(PIPE_MTE1, PIPE_M, (event_t)cur);   // forward: L0[cur] ready
+        wait_flag(PIPE_MTE1, PIPE_M, (event_t)cur);
         if (i == 0) {
-            TMATMUL(cTile, aTile, bTile);
+            TMATMUL(cTile, aTile[cur], bTile[cur]);
         } else {
-            TMATMUL_ACC(cTile, cTile, aTile, bTile);
+            TMATMUL_ACC(cTile, cTile, aTile[cur], bTile[cur]);
         }
-
-        // Prefetch next iteration's data (MTE2 overlaps with matmul completion)
-        if (i + 1 < n_blocks) {
-            // Signal matmul completion for next iteration's TMOV guard
-            set_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
-            TileMatA& nxtA = (i % 2 == 0) ? aMatTile_pong : aMatTile_ping;
-            TileMatB& nxtB = (i % 2 == 0) ? bMatTile_pong : bMatTile_ping;
-            GlobalA pijGlobal_next(pij_base + (i + 1) * M * K);
-            GlobalB vjGlobal_next(val_base + block_table[i + 1] * K * N);
-            TLOAD(nxtA, pijGlobal_next);
-            TLOAD(nxtB, vjGlobal_next);
-        }
+        set_flag(PIPE_M, PIPE_MTE1, (event_t)cur);   // reverse: release L0[cur]
     }
+
+    // Drain outstanding reverse-dependency flags
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID0);
+    wait_flag(PIPE_MTE1, PIPE_MTE2, EVENT_ID1);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID0);
+    wait_flag(PIPE_M, PIPE_MTE1, EVENT_ID1);
 
     set_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);

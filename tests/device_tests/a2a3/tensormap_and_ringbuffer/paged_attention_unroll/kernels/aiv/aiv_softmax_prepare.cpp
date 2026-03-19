@@ -122,21 +122,22 @@ static __aicore__ void softmax_prepare_n_impl(
             TileSijDyn sijDynTile(static_cast<size_t>(valid_len_last));
             TASSIGN(sijDynTile, 0x0);
             TFILLPAD_INPLACE(sijPadTile_A, sijDynTile);
+            pipe_barrier(PIPE_V);
         }
 
         TMULS(sijTile_A, sijTile_A, scale_value);
         pipe_barrier(PIPE_V);
         TROWMAX(localMaxDN, sijTile_A, tmpTile);
+        pipe_barrier(PIPE_V);
 
         // TRESHAPE: ColMajor(M,1) → RowMajor(1,M) for element-wise TMAX
         TRESHAPE(localMaxRow, localMaxDN);
         if (i == 0) {
-            pipe_barrier(PIPE_V);
             TMAX(globalMaxRow, localMaxRow, localMaxRow);
         } else {
-            pipe_barrier(PIPE_V);
             TMAX(globalMaxRow, globalMaxRow, localMaxRow);
         }
+        pipe_barrier(PIPE_V);
     }
 
     // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for Pass 2's TROWEXPANDSUB
@@ -174,6 +175,7 @@ static __aicore__ void softmax_prepare_n_impl(
                 TASSIGN(curSijDyn, static_cast<int>(kDataBytes));
                 TFILLPAD_INPLACE(sijPadTile_B, curSijDyn);
             }
+            pipe_barrier(PIPE_V);
         }
 
         // Compute on current buffer (select A or B based on iteration parity)
@@ -188,9 +190,12 @@ static __aicore__ void softmax_prepare_n_impl(
         }
         pipe_barrier(PIPE_V);
         TEXP(pijTile, pijTile);
+        pipe_barrier(PIPE_V);
         TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
+        pipe_barrier(PIPE_V);
         TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
 
+        pipe_barrier(PIPE_V);
         if (i == 0) {
             TMULS(sumAccTile, pijTile, 1.0f);
         } else {
@@ -198,6 +203,7 @@ static __aicore__ void softmax_prepare_n_impl(
         }
 
         // Store pij (must complete before next iteration's TCVT overwrites pijBf16Tile)
+        pipe_barrier(PIPE_V);
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         TSTORE(pijGlobal, pijBf16Tile);

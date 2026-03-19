@@ -190,11 +190,13 @@ static __aicore__ void online_update_impl(__gm__ TensorData* mij,
         TADD(liNewRow, tmpRow, liNewRow);     // li_new = alpha*li + beta*lij
 
         // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for TROWEXPANDMUL
+        pipe_barrier(PIPE_V);
         TRESHAPE(alphaDN, alphaRow);
         TRESHAPE(betaDN, betaRow);
 
         // Scale data tiles using row-broadcast multiply
         TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
+        pipe_barrier(PIPE_V);
         TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);   // oi_new *= beta
         pipe_barrier(PIPE_V);
         TADD(oiTile, oiTile, oiNewTile);              // oi = alpha*oi + beta*oi_new
