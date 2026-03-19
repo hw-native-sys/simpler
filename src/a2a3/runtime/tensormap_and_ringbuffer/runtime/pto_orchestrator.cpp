@@ -390,10 +390,12 @@ void pto2_submit_mixed_task(
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, local_id);
 
     // === STEP 2: Calculate output size + heap alloc (read from params only, no GM access) ===
+    bool needs_alloc[PTO2_MAX_TENSOR_PARAMS] = {};
     int32_t total_output_size = 0;
     for (int i = 0; i < params.tensor_count; i++) {
         if (params.tensor_types[i] == PTOParamType::OUTPUT
             && params.tensors[i]->buffer.addr == 0) {
+            needs_alloc[i] = true;
             total_output_size += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
@@ -491,7 +493,7 @@ void pto2_submit_mixed_task(
         PTOParamType ptype = params.tensor_types[i];
         if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
             if (!params.tensors[i]->manual_dep) {
-                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, ptype == PTOParamType::OUTPUT);
+                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, ptype, needs_alloc[i]);
             }
         }
     }

@@ -23,8 +23,17 @@
 
 // Type headers needed by orchestration
 #include "pto_types.h"          // PTOParam, PTOTensorEntry, PTOParamType
-#include "tensor.h"             // Tensor, make_tensor, make_tensor_external
+#include "tensor.h"             // Tensor struct
 #include "pto_submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
+
+// Multi-ring: number of independent ring layers (HeapRing + TaskRing + DepPool per layer)
+// Scope depth maps to ring index via: min(scope_depth, PTO2_MAX_RING_DEPTH - 1)
+#define PTO2_MAX_RING_DEPTH 4
+
+// Thread-local scope depth for tensor factory functions.
+// Incremented/decremented by PTO2ScopeGuard and standalone scope wrappers.
+// Tensor ring selection clamps this depth to the runtime's valid ring range.
+static thread_local uint8_t __pto2_ring_id = 0;
 
 // =============================================================================
 // Ops Table and Opaque Runtime
@@ -99,10 +108,12 @@ static inline void pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id,
 
 static inline void pto2_rt_scope_begin(PTO2Runtime* rt) {
     rt->ops->scope_begin(rt);
+    __pto2_ring_id++;
 }
 
 static inline void pto2_rt_scope_end(PTO2Runtime* rt) {
     rt->ops->scope_end(rt);
+    __pto2_ring_id--;
 }
 
 static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) {
@@ -111,6 +122,59 @@ static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) {
 
 static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) {
     return rt->ops->is_fatal(rt);
+}
+
+// =============================================================================
+// Tensor Factory Functions
+// =============================================================================
+
+/**
+ * Create a Tensor for pre-allocated external memory.
+ */
+static inline Tensor make_tensor_external(void* addr,
+    const uint32_t shapes[],
+    uint32_t ndims,
+    DataType dtype = DataType::FLOAT32,
+    bool manual_dep = false,
+    int32_t version = 0) {
+    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+    uint64_t total = 1;
+    for (uint32_t i = 0; i < ndims; i++) {
+        total *= shapes[i];
+    }
+    return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
+                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep,
+                  TENSOR_RING_ID_NONE);
+}
+
+static inline Tensor make_tensor_with_ring(const uint32_t shapes[],
+    uint32_t ndims,
+    DataType dtype,
+    bool manual_dep,
+    int32_t version,
+    uint8_t ring_id) {
+    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
+    uint64_t total = 1;
+    for (uint32_t i = 0; i < ndims; i++) {
+        total *= shapes[i];
+    }
+    return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
+                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep, ring_id);
+}
+
+static inline uint8_t current_tensor_ring_id() {
+    return __pto2_ring_id < PTO2_MAX_RING_DEPTH ? __pto2_ring_id : PTO2_MAX_RING_DEPTH - 1;
+}
+
+/**
+ * Create a Tensor for runtime-allocated output (addr=0).
+ * Uses the thread-local scope depth set by PTO2ScopeGuard, clamped to the
+ * runtime ring range to match PTO2OrchestratorState::current_ring_id().
+ */
+static inline Tensor make_tensor(const uint32_t shapes[], uint32_t ndims,
+    DataType dtype = DataType::FLOAT32, bool manual_dep = false,
+    int32_t version = 0) {
+    return make_tensor_with_ring(shapes, ndims, dtype, manual_dep, version, current_tensor_ring_id());
 }
 
 // =============================================================================
@@ -133,10 +197,10 @@ static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) {
 class PTO2ScopeGuard {
 public:
     PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) {
-        rt_->ops->scope_begin(rt_);
+        pto2_rt_scope_begin(rt_);
     }
     ~PTO2ScopeGuard() {
-        rt_->ops->scope_end(rt_);
+        pto2_rt_scope_end(rt_);
     }
 private:
     PTO2Runtime* rt_;

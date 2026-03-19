@@ -9,6 +9,7 @@
 #include "data_type.h"
 
 constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
+constexpr uint8_t TENSOR_RING_ID_NONE = 0xFF;  // No ring assigned (external tensor)
 
 /**
  * Buffer Handle
@@ -66,6 +67,7 @@ struct alignas(64) Tensor {
     bool is_all_offset_zero;                       // True when all offsets[] are zero (skip offset read/write)
     bool is_raw_eq_shapes;                         // True when raw_shapes[] == shapes[] (skip raw_shapes read/write)
     bool manual_dep;                               // True when dependency is managed manually (skip tensormap lookup/insert)
+    uint8_t ring_id;                               // Ring that owns this tensor (TENSOR_RING_ID_NONE = unassigned)
     uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
     uint32_t __padding__;
 
@@ -96,9 +98,10 @@ struct alignas(64) Tensor {
         int32_t version,
         bool is_all_offset_zero = false,
         bool is_raw_eq_shapes = false,
-        bool manual_dep = false) {
+        bool manual_dep = false,
+        uint8_t in_ring_id = TENSOR_RING_ID_NONE) {
         init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version,
-             is_all_offset_zero, is_raw_eq_shapes, manual_dep);
+             is_all_offset_zero, is_raw_eq_shapes, manual_dep, in_ring_id);
     }
 
     // --- Initialization ---
@@ -112,7 +115,8 @@ struct alignas(64) Tensor {
         int32_t in_version,
         bool in_is_all_offset_zero = false,
         bool in_is_raw_eq_shapes = false,
-        bool in_manual_dep = false) {
+        bool in_manual_dep = false,
+        uint8_t in_ring_id = TENSOR_RING_ID_NONE) {
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
         ndims = in_ndims;
         dtype = in_dtype;
@@ -120,6 +124,7 @@ struct alignas(64) Tensor {
         is_all_offset_zero = in_is_all_offset_zero;
         is_raw_eq_shapes = in_is_raw_eq_shapes;
         manual_dep = in_manual_dep;
+        ring_id = in_ring_id;
         for (uint32_t i = 0; i < in_ndims; i++) {
             shapes[i] = in_shapes[i];
         }
@@ -155,6 +160,7 @@ struct alignas(64) Tensor {
         dtype = other.dtype;
         version = other.version;
         manual_dep = in_manual_dep;
+        ring_id = other.ring_id;
         // view always diverges shapes from raw_shapes, so is_raw_eq_shapes = false.
         // Read parent's effective raw_shapes (avoids parent cache line 2 when parent is_raw_eq_shapes).
         is_raw_eq_shapes = false;
@@ -285,6 +291,7 @@ struct alignas(64) Tensor {
         ss << indent << "dtype: " << get_dtype_name(dtype) << std::endl;
         ss << indent << "ndims: " << ndims << std::endl;
         ss << indent << "version: " << version << std::endl;
+        ss << indent << "ring_id: " << (unsigned)ring_id << std::endl;
 
         const uint32_t* rs = get_raw_shapes();
         ss << indent << "raw_shapes: [";
@@ -320,44 +327,3 @@ static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 
 static_assert(offsetof(Tensor, raw_shapes) == 64);
 
 using TensorData = Tensor;
-
-// =============================================================================
-// Factory Helpers
-// =============================================================================
-/**
- * Create a Tensor for pre-allocated external memory.
- */
-static inline Tensor make_tensor_external(void* addr,
-    const uint32_t shapes[],
-    uint32_t ndims,
-    DataType dtype = DataType::FLOAT32,
-    bool manual_dep = false,
-    int32_t version = 0) {
-    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
-    uint64_t total = 1;
-    for (uint32_t i = 0; i < ndims; i++) {
-        total *= shapes[i];
-    }
-    return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
-}
-
-/**
- * Create a Tensor for runtime-allocated output (addr=0).
- * NO memory allocation: only records dtype, shape, and buffer.size in the Tensor struct.
- * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
- * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
- */
-static inline Tensor make_tensor(const uint32_t shapes[],
-    uint32_t ndims,
-    DataType dtype = DataType::FLOAT32,
-    bool manual_dep = false,
-    int32_t version = 0) {
-    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
-    uint64_t total = 1;
-    for (uint32_t i = 0; i < ndims; i++) {
-        total *= shapes[i];
-    }
-    return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
-}
