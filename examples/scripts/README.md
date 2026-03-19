@@ -42,6 +42,32 @@ python examples/scripts/run_example.py \
   -p a2a3sim
 ```
 
+#### Running Distributed (Multi-Rank) Tests
+
+Distributed examples are auto-detected when `kernel_config.py` contains a `DISTRIBUTED_CONFIG` dictionary. No separate script is needed — `run_example.py` handles it automatically:
+
+```bash
+# Simulation (no hardware required, 8 ranks by default from kernel_config)
+python examples/scripts/run_example.py \
+  -k examples/a2a3/host_build_graph/allreduce_distributed/kernels \
+  -g examples/a2a3/host_build_graph/allreduce_distributed/golden.py \
+  -p a2a3sim
+
+# Hardware platform — pick specific devices (nranks inferred from device count)
+python examples/scripts/run_example.py \
+  -k examples/a2a3/host_build_graph/allreduce_distributed/kernels \
+  -g examples/a2a3/host_build_graph/allreduce_distributed/golden.py \
+  -p a2a3 --devices 0,1,2,3,4,5,6,7
+
+# Hardware platform — non-contiguous devices
+python examples/scripts/run_example.py \
+  -k examples/a2a3/host_build_graph/allreduce_distributed/kernels \
+  -g examples/a2a3/host_build_graph/allreduce_distributed/golden.py \
+  -p a2a3 --devices 2,4,5,7
+```
+
+The framework spawns one worker process per rank, each using the backend-neutral `comm_*` API. On simulation (`a2a3sim`), ranks communicate via POSIX shared memory; on hardware (`a2a3`), they use HCCL over RDMA.
+
 ## Command Line Arguments
 
 ### `run_example.py` Parameters
@@ -56,6 +82,7 @@ python examples/scripts/run_example.py \
 | `--verbose` | `-v` | Enable verbose output (equivalent to `--log-level debug`) | False |
 | `--silent` | | Enable silent mode (equivalent to `--log-level error`) | False |
 | `--log-level` | | Set log level: `error`, `warn`, `info`, `debug` | `info` |
+| `--nranks` | | Number of ranks for distributed tests | From `DISTRIBUTED_CONFIG` |
 | `--clone-protocol` | | Git protocol for cloning pto-isa: `ssh` or `https` | `ssh` |
 
 ### Platform Description
@@ -161,7 +188,54 @@ ORCHESTRATION = {
 }
 ```
 
-### 3. `golden.py` Format
+### 3. Distributed `kernel_config.py` Format
+
+To make a test distributed, add a `DISTRIBUTED_CONFIG` dictionary alongside the standard `KERNELS` and `ORCHESTRATION` fields:
+
+```python
+DISTRIBUTED_CONFIG = {
+    "nranks": 8,                          # Number of ranks
+    "root": 0,                            # Root rank for collective ops
+    "comm_include_dirs": [...],           # Extra include dirs for kernel compilation
+    "win_sync_prefix": 256,               # Bytes reserved before window buffers
+    "buffers": [
+        {"name": "input",  "dtype": "float32", "count": 256, "placement": "window"},
+        {"name": "output", "dtype": "float32", "count": 256, "placement": "device"},
+    ],
+    "inputs": ["input"],                  # Buffers to load from .bin files
+    "outputs": ["output"],                # Buffers to save after execution
+    "args": ["input", "output", "nranks", "root", "deviceCtx"],
+}
+```
+
+- **`placement: "window"`** — Buffer is allocated in the RDMA window region (accessible by all ranks).
+- **`placement: "device"`** — Buffer is allocated via `device_malloc` (local to each rank).
+- **`args`** — Tokens passed as orchestration function arguments. Special tokens: `nranks`, `root`, `deviceCtx` (pointer to `CommDeviceContext`).
+
+### 4. Distributed `golden.py` Format
+
+The golden script for distributed tests uses `generate_distributed_inputs` instead of `generate_inputs`:
+
+```python
+def generate_distributed_inputs(rank: int, nranks: int, root: int,
+                                 comm_ctx=None) -> list:
+    """Return a list of (name, data) tuples for this rank."""
+    input_data = [float(i + rank * 100) for i in range(256)]
+    output_data = [0.0] * 256
+    return [
+        ("input", input_data),
+        ("output", output_data),
+    ]
+
+def compute_golden(tensors: dict, params: dict) -> None:
+    """Compute expected output for the root rank (in-place)."""
+    nranks = params.get("nranks", 8)
+    output = tensors["output"]
+    for i in range(256):
+        output[i] = float(nranks * i + 100 * nranks * (nranks - 1) // 2)
+```
+
+### 5. Standard `golden.py` Format
 
 ```python
 import torch
@@ -365,6 +439,25 @@ TEST PASSED
 ============================================================
 ```
 
+### Distributed Test Success Example
+
+```
+[INFO] Detected DISTRIBUTED_CONFIG — using distributed runner
+[INFO] === Phase 1: Building runtime ===
+...
+[INFO] === Launching 8 workers ===
+[INFO] Rank 0: OK
+[INFO] Rank 1: OK
+...
+[INFO] Rank 7: OK
+[INFO] VERIFY PASSED: output — 256 elements correct
+[INFO]   Sample: [2800.0, 2808.0, 2816.0, 2824.0, 2832.0]
+
+============================================================
+TEST PASSED
+============================================================
+```
+
 ### Failure Example
 
 ```
@@ -378,8 +471,8 @@ TEST FAILED: Output 'f' does not match golden
 
 ## Reference Examples
 
-- **Hardware Example**: [examples/host_build_graph/vector_example/](../host_build_graph/vector_example/)
-- **Simulation Example**: [examples/host_build_graph/vector_example/](../host_build_graph/vector_example/)
+- **Single-Card Example**: [examples/a2a3/host_build_graph/vector_example/](../a2a3/host_build_graph/vector_example/)
+- **Distributed Example**: [examples/a2a3/host_build_graph/allreduce_distributed/](../a2a3/host_build_graph/allreduce_distributed/)
 
 ## FAQ
 
@@ -519,6 +612,21 @@ runner = create_code_runner(
 )
 
 runner.run()  # Execute test
+```
+
+### Distributed Programmatic Usage
+
+```python
+from distributed_code_runner import DistributedCodeRunner
+
+runner = DistributedCodeRunner(
+    kernels_dir="examples/a2a3/host_build_graph/allreduce_distributed/kernels",
+    golden_path="examples/a2a3/host_build_graph/allreduce_distributed/golden.py",
+    platform="a2a3sim",
+    nranks=8,
+)
+
+runner.run_all()  # compile, prepare data, launch workers, verify
 ```
 
 ## Related Documentation
