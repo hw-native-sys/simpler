@@ -1,0 +1,52 @@
+"""
+AscendC Vector Example — kernel_config.py
+
+Demonstrates integrating an AscendC operator (add_custom) into the PTO
+tensormap_and_ringbuffer runtime via single-TU compile + link.
+
+The AscendC kernel source is merged with a kernel_entry wrapper into a single
+translation unit, compiled with AscendC flags, then linked to resolve
+block-local relocations.
+
+Computation:
+  z = x + y          (AscendC add_custom, func_id=0)
+  w = z * z          (PTO kernel_mul,     func_id=1)
+
+The orchestration submits two AIV tasks in sequence.
+"""
+
+from pathlib import Path
+
+_KERNELS_ROOT = Path(__file__).parent
+
+ORCHESTRATION = {
+    "source": str(_KERNELS_ROOT / "orchestration" / "ascendc_orch.cpp"),
+    "function_name": "aicpu_orchestration_entry",
+}
+
+KERNELS = [
+    {
+        "func_id": 0,
+        "source": str(_KERNELS_ROOT / "ascendc" / "add_custom.cpp"),
+        "core_type": "aiv",
+        "compiler": "ascendc",
+        "ascendc_symbol": "add_custom",
+        "tensor_args": [
+            {"name": "x", "direction": "input"},
+            {"name": "y", "direction": "input"},
+            {"name": "z", "direction": "output"},
+        ],
+        "has_workspace": True,
+    },
+    {
+        "func_id": 1,
+        "source": str(_KERNELS_ROOT / "aiv" / "kernel_mul.cpp"),
+        "core_type": "aiv",
+    },
+]
+
+RUNTIME_CONFIG = {
+    "runtime": "tensormap_and_ringbuffer",
+    "aicpu_thread_num": 3,
+    "block_dim": 2,
+}

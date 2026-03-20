@@ -794,7 +794,13 @@ class CodeRunner:
             )
 
         def _compile_one_kernel(kernel):
-            logger.info(f"Compiling kernel: {kernel['source']} (func_id={kernel['func_id']})")
+            compiler_type = kernel.get("compiler", "pto")
+            logger.info(f"Compiling kernel: {kernel['source']} "
+                        f"(func_id={kernel['func_id']}, compiler={compiler_type})")
+
+            if compiler_type == "ascendc":
+                return _compile_one_ascendc_kernel(kernel)
+
             incore_o = kernel_compiler.compile_incore(
                 kernel["source"],
                 core_type=kernel["core_type"],
@@ -806,6 +812,35 @@ class CodeRunner:
                 kernel_bin = incore_o
             else:
                 kernel_bin = extract_text_section(incore_o)
+            return (kernel["func_id"], kernel_bin)
+
+        def _compile_one_ascendc_kernel(kernel):
+            from ascendc_compiler import AscendCCompiler, extract_kernel_artifacts
+
+            ascendc = AscendCCompiler(platform=self.platform)
+            tiling_data = None
+
+            kernel_meta_dir = kernel.get("kernel_meta_dir")
+            if kernel_meta_dir:
+                kernel_meta_dir = os.path.abspath(kernel_meta_dir)
+                _, tiling_data = extract_kernel_artifacts(kernel_meta_dir)
+
+            tiling_path = kernel.get("tiling_data_path")
+            if tiling_path and os.path.isfile(tiling_path):
+                with open(tiling_path, 'rb') as f:
+                    tiling_data = f.read()
+
+            combined_o = ascendc.compile_ascendc_kernel(
+                ascendc_kernel_source=kernel["source"],
+                ascendc_kernel_symbol=kernel.get("ascendc_symbol", "ascendc_kernel"),
+                tensor_args=kernel.get("tensor_args", []),
+                tiling_data=tiling_data,
+                core_type=kernel.get("core_type", "aiv"),
+                has_workspace=kernel.get("has_workspace", False),
+                extra_include_dirs=runtime_include_dirs,
+                build_dir=self.build_dir,
+            )
+            kernel_bin = extract_text_section(combined_o)
             return (kernel["func_id"], kernel_bin)
 
         # Launch all compilations concurrently

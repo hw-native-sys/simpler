@@ -102,6 +102,71 @@ class CCECToolchain(Toolchain):
         ]
 
 
+class AscendCToolchain(CCECToolchain):
+    """ccec compiler configured for AscendC kernel compilation.
+
+    AscendC uses a different dialect (--cce-aicore-lang) than PTO-ISA (-x cce),
+    plus automatic synchronization (--cce-auto-sync) and the full AscendC SDK
+    include tree.
+    """
+
+    def get_compile_flags(self, core_type: str = "aiv", **kwargs) -> List[str]:
+        if self.platform in ("a5", "a5sim"):
+            arch = "dav-c310-vec" if core_type == "aiv" else "dav-c310-cube"
+        elif self.platform in ("a2a3", "a2a3sim"):
+            arch = "dav-c220-vec" if core_type == "aiv" else "dav-c220-cube"
+        else:
+            raise ValueError(f"Unknown platform: {self.platform}")
+
+        flags = [
+            "-c", "-O3", "-std=c++17",
+            "--cce-aicore-lang",
+            "-DTILING_KEY_VAR=0",
+            "--cce-aicore-only",
+            f"--cce-aicore-arch={arch}",
+            "--cce-auto-sync",
+            "-mllvm", "-cce-aicore-stack-size=0x8000",
+            "-mllvm", "-cce-aicore-function-stack-size=0x8000",
+            "-mllvm", "-cce-aicore-record-overflow=false",
+        ]
+
+        # Force-include SDK version header if present
+        version_header = os.path.join(
+            self.ascend_home_path, "include", "ascendc", "asc_devkit_version.h"
+        )
+        if os.path.isfile(version_header):
+            flags.extend(["-include", version_header])
+
+        return flags
+
+    def get_ascendc_include_dirs(self) -> List[str]:
+        """Return AscendC SDK include directories (from bisheng_intf.cmake)."""
+        dk = os.path.join(self.ascend_home_path, "aarch64-linux")
+        asc = os.path.join(dk, "asc")
+        tikcfw = os.path.join(dk, "tikcpp", "tikcfw")
+
+        dirs = [
+            os.path.join(asc, "impl", "adv_api"),
+            os.path.join(asc, "impl", "basic_api"),
+            os.path.join(asc, "impl", "c_api"),
+            os.path.join(asc, "impl", "micro_api"),
+            os.path.join(asc, "impl", "simt_api"),
+            os.path.join(asc, "impl", "utils"),
+            os.path.join(asc, "include"),
+            os.path.join(asc, "include", "adv_api"),
+            os.path.join(asc, "include", "basic_api"),
+            os.path.join(asc, "include", "aicpu_api"),
+            os.path.join(asc, "include", "c_api"),
+            os.path.join(asc, "include", "micro_api"),
+            os.path.join(asc, "include", "simt_api"),
+            os.path.join(asc, "include", "utils"),
+            tikcfw,
+            os.path.join(tikcfw, "interface"),
+            os.path.join(tikcfw, "impl"),
+        ]
+        return [d for d in dirs if os.path.isdir(d)]
+
+
 class Gxx15Toolchain(Toolchain):
     """g++-15 compiler for simulation kernels."""
 
