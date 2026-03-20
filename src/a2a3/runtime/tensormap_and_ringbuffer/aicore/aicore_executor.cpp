@@ -14,21 +14,28 @@
 typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
 
 /**
- * Execute task from PTO2DispatchPayload.
+ * Execute task from PTO2DispatchDesc.
  *
- * Reads function_bin_addr and args from the dispatch payload.
+ * Reads function_bin_addrs[slot_idx] and args from the dispatch descriptor.
+ * The descriptor is pre-built by the Orchestrator at submit time, so this
+ * function performs no address computation—just a function pointer call.
  *
- * @param payload Pointer to PTO2DispatchPayload in global memory
+ * @param desc     Pointer to PTO2DispatchDesc in global memory
+ * @param slot_idx Subtask slot index (0=AIC, 1=AIV0, 2=AIV1)
  */
 __aicore__ __attribute__((always_inline)) static void execute_task(
-    __gm__ PTO2DispatchPayload* payload
+    __gm__ PTO2DispatchDesc* desc, uint32_t slot_idx
 ) {
-    if (payload == nullptr || payload->function_bin_addr == 0) {
+    if (desc == nullptr) {
+        return;
+    }
+    uint64_t func_addr = desc->function_bin_addrs[slot_idx];
+    if (func_addr == 0) {
         return;
     }
 
-    UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
-    kernel(reinterpret_cast<__gm__ int64_t*>(payload->args));
+    UnifiedKernelFunc kernel = (UnifiedKernelFunc)func_addr;
+    kernel(reinterpret_cast<__gm__ int64_t*>(desc->args));
     FULL_MEMORY_BARRIER();
 }
 
@@ -38,10 +45,13 @@ __aicore__ __attribute__((always_inline)) static void execute_task(
  * Implements the AICPU-AICore register-based dispatch protocol:
  * 1. Wait for AICPU ready signal via handshake buffer
  * 2. Report physical core ID and core type, signal AICore ready
- * 3. Poll DATA_MAIN_BASE register for task dispatch until exit signal
+ * 3. Cache per-core PTO2DispatchPerCore pointer from hank->task
+ * 4. Poll DATA_MAIN_BASE register for task dispatch until exit signal
  *
- * Task dispatch reads PTO2DispatchPayload address from Handshake.task.
- * Task ID is derived from the register value (task_id + 1 encoding).
+ * AICPU writes &s_pto2_payload_per_core[i] to hank->task before setting
+ * aicpu_ready=1. AICore caches this pointer and reads slot_idx + dispatch
+ * descriptor from it on each dispatch. reg_val is a monotonically increasing
+ * task ID used only for dispatch signaling and ACK/FIN protocol.
  *
  * @param runtime Pointer to Runtime in global memory
  * @param block_idx Block index (core ID)
@@ -72,9 +82,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
-    // Cache payload address (set once by AICPU during initialization, never changes)
-    __gm__ PTO2DispatchPayload* payload =
-        reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
+    // Cache per-core dispatch payload pointer (set by AICPU before aicpu_ready)
+    __gm__ PTO2DispatchPerCore* payload =
+        reinterpret_cast<__gm__ PTO2DispatchPerCore*>(my_hank->task);
 
     bool profiling_enabled = runtime->enable_profiling;
     uint64_t kernel_ready_time = get_sys_cnt_aicore();
@@ -106,14 +116,16 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
 
+            // Read slot_idx from per-core payload (written by AICPU before dispatch)
+            uint32_t slot_idx = payload->slot_idx;
+
             // Performance profiling: record start time
             uint64_t start_time = get_sys_cnt_aicore();
 
             // Execute the task
-            execute_task(payload);
+            execute_task(payload->dispatch, slot_idx);
 
             // Performance profiling: record task execution
-            // (func_id and core_type are filled by AICPU at completion time)
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;

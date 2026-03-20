@@ -4,7 +4,7 @@
 # This is a device-orchestration runtime where:
 # - AICPU thread 3 runs the orchestrator (builds task graph on device)
 # - AICPU threads 0/1/2 run schedulers (dispatch tasks to AICore)
-# - AICore executes tasks via PTO2DispatchPayload
+# - AICore executes tasks via PTO2DispatchDesc (precomputed by Orchestrator)
 #
 # The "orchestration" directory contains source files compiled into both
 # runtime targets AND the orchestration .so (e.g., tensor methods needed

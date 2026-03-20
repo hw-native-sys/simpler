@@ -70,7 +70,7 @@ constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions a
 static PTO2Runtime *rt{nullptr};
 
 // Per-core dispatch payload storage (one per physical core)
-static PTO2DispatchPayload s_pto2_payload_per_core[RUNTIME_MAX_WORKER];
+static PTO2DispatchPerCore s_pto2_payload_per_core[RUNTIME_MAX_WORKER];
 
 // Core information for discovery (with register address for fast dispatch)
 struct CoreInfo {
@@ -175,10 +175,6 @@ struct AicpuExecutor {
     uint64_t core_id_to_reg_addr_[MAX_CORES_PER_THREAD];
 
     // Per-core monotonic dispatch counter for register protocol uniqueness.
-    // Multi-ring task_ids can collide in the lower 32 bits (e.g., ring 0 local 0
-    // and ring 1 local 0 both truncate to 0), breaking the AICore's last_reg_val
-    // duplicate detection and causing false-positive COND completion. A per-core
-    // counter guarantees each dispatch writes a unique DATA_MAIN_BASE value.
     uint32_t dispatch_seq_by_core_[RUNTIME_MAX_WORKER]{};
 
     // Per-core subtask slot tracking (which PTO2SubtaskSlot is running on each core)
@@ -249,24 +245,6 @@ struct AicpuExecutor {
     void diagnose_stuck_state(
         Runtime* runtime, int32_t thread_idx, const int32_t* cur_thread_cores, int32_t core_num, Handshake* hank);
 
-    // Build slim PTO2DispatchPayload: only function_bin_addr + args.
-    // Metadata (mixed_task_id, subslot, kernel_id, core_type) stays in TaskDescriptor.
-    // Dispatch order: tensor args first, then scalar args.
-    void build_pto2_payload(PTO2DispatchPayload& out,
-        int32_t kernel_id,
-        PTO2TaskPayload& task_pl) {
-        out.function_bin_addr = get_function_bin_addr(kernel_id);
-        int32_t n = 0;
-        for (int32_t i = 0; i < task_pl.tensor_count; i++) {
-            task_pl.tensors[i].update_start_offset();
-            out.args[n++] = reinterpret_cast<uint64_t>(&task_pl.tensors[i]);
-        }
-        for (int32_t i = 0; i < task_pl.scalar_count; i++) {
-            out.args[n++] = task_pl.scalars[i];
-        }
-    }
-
-    // Template methods for Phase 1 and Phase 2
     template <CoreType CT>
     void check_running_cores_for_completion(int32_t thread_idx,
         CoreTypeTracker& ct,
@@ -510,10 +488,10 @@ struct AicpuExecutor {
 #if !PTO2_PROFILING
         (void)runtime;
 #endif
-        PTO2DispatchPayload& payload = s_pto2_payload_per_core[core_id];
-        PTO2TaskDescriptor& task = *slot_state.task;
-        int32_t slot_idx = static_cast<int32_t>(subslot);
-        build_pto2_payload(payload, task.kernel_id[slot_idx], *slot_state.payload);
+        // Set dispatch pointer and slot_idx for this core.
+        PTO2DispatchPerCore& payload = s_pto2_payload_per_core[core_id];
+        payload.dispatch = &slot_state.payload->dispatch;
+        payload.slot_idx = static_cast<uint32_t>(subslot);
         executing_subslot_by_core_[core_id] = subslot;
         executing_slot_state_by_core_[core_id] = &slot_state;
 #if PTO2_PROFILING
@@ -1721,6 +1699,11 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     rt->orchestrators[i].enable_profiling = runtime->enable_profiling;
                 }
 #endif
+
+                // Pass kernel address mapping to orchestrators for dispatch descriptor construction
+                for (int i = 0; i < orch_thread_num_; i++) {
+                    rt->orchestrators[i].func_id_to_addr = func_id_to_addr_;
+                }
 
                 // With multi-ring, slot_states are per-ring inside the scheduler.
                 // Fanout fill-in in complete_perf_records is disabled (slot_states_ptr = nullptr).

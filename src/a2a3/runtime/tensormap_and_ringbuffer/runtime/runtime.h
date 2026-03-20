@@ -10,7 +10,7 @@
  * - Device orchestration state (pto2_gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
  *
- * Task dispatch uses PTO2DispatchPayload from PTO2 shared memory.
+ * Task dispatch uses PTO2DispatchDesc from PTO2 shared memory (precomputed by Orchestrator).
  */
 
 #ifndef RUNTIME_H
@@ -71,7 +71,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
- * - task: Written by AICPU, read by AICore (0 = no task, non-zero = PTO2DispatchPayload*)
+ * - task: Written by AICPU, read by AICore (0 = not ready, non-zero = PTO2DispatchPerCore*)
  * - task_status: Written by both (AICPU=1 on dispatch, AICore=0 on completion)
  * - control: Written by AICPU, read by AICore (0 = continue, 1 = quit)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
@@ -79,7 +79,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
 struct Handshake {
     volatile uint32_t aicpu_ready;         // AICPU ready signal: 0=not ready, 1=ready
     volatile uint32_t aicore_done;         // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                // Task pointer: 0=no task, non-zero=PTO2DispatchPayload*
+    volatile uint64_t task;                // Init: PTO2DispatchPerCore* (set before aicpu_ready); runtime: unused
     volatile int32_t task_status;          // Task execution status: 0=idle, 1=busy
     volatile int32_t control;              // Control signal: 0=execute, 1=quit
     volatile CoreType core_type;           // Core type: CoreType::AIC or CoreType::AIV
@@ -116,7 +116,7 @@ struct HostApi {
 /**
  * Task structure - Compatibility stub for platform layer
  *
- * RT2 uses PTO2DispatchPayload instead of Task for task dispatch.
+ * RT2 uses PTO2DispatchDesc instead of Task for task dispatch.
  * This stub exists only for API compatibility with device_runner.cpp.
  * Since get_task_count() returns 0, this struct is never actually used.
  */
@@ -268,7 +268,7 @@ public:
     /** @deprecated Task count is now in PTO2 shared memory */
     int get_task_count() const { return 0; }
 
-    /** @deprecated RT2 uses PTO2DispatchPayload, not Task. Always returns nullptr. */
+    /** @deprecated RT2 uses PTO2DispatchDesc, not Task. Always returns nullptr. */
     Task* get_task(int) { return nullptr; }
 
     /** @deprecated Use PTO2 dispatch mode */
