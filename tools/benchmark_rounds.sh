@@ -50,6 +50,7 @@ DEVICE_ID=0
 ROUNDS=10
 PLATFORM=a2a3
 RUNTIME=tensormap_and_ringbuffer
+VERBOSE=0
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -70,18 +71,23 @@ while [[ $# -gt 0 ]]; do
             RUNTIME="$2"
             shift 2
             ;;
+        -v|--verbose)
+            VERBOSE=1
+            shift
+            ;;
         --help|-h)
             cat <<'USAGE'
 benchmark_rounds.sh — run all examples and report per-round timing from device logs
 
 Usage:
-  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-v]
 
 Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 10)
   -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), aicpu_build_graph
+  -v, --verbose  Save detailed run_example.py output to a timestamped log file
   -h, --help     Show this help
 
 All other options are passed through to run_example.py (e.g. --case).
@@ -100,6 +106,22 @@ USAGE
             ;;
     esac
 done
+
+# ---------------------------------------------------------------------------
+# Verbose logging setup
+# ---------------------------------------------------------------------------
+VERBOSE_LOG=""
+if [[ $VERBOSE -eq 1 ]]; then
+    mkdir -p "$PROJECT_ROOT/outputs"
+    VERBOSE_LOG="$PROJECT_ROOT/outputs/benchmark_$(date +%Y%m%d_%H%M%S).log"
+    echo "Verbose log: $VERBOSE_LOG"
+fi
+
+vlog() {
+    if [[ -n "$VERBOSE_LOG" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >> "$VERBOSE_LOG"
+    fi
+}
 
 # ---------------------------------------------------------------------------
 # Derive arch from platform and set examples directory
@@ -143,7 +165,7 @@ parse_timing() {
     local log_file="$1"
 
     local timing
-    timing=$(grep -E 'Thread [0-9]+: (orch_start|orch_end|sched_end|orch_stage_end)=' "$log_file" || true)
+    timing=$(grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end)' "$log_file" || true)
 
     if [[ -z "$timing" ]]; then
         echo "  (no benchmark timing data — was PTO2_PROFILING enabled?)"
@@ -151,30 +173,68 @@ parse_timing() {
     fi
 
     echo "$timing" | awk '
+    function new_round() {
+        flush_round()
+        round++
+        min_start = 0; max_end = 0
+        min_sched_start = 0; max_sched_end = 0
+        min_orch_start = 0; max_orch_end = 0
+        delete sched_seen
+        delete orch_seen
+    }
     function flush_round() {
         if (round >= 0 && max_end > 0 && min_start > 0) {
             results[round] = (max_end - min_start) / 50.0
+            if (max_sched_end > 0 && min_sched_start > 0)
+                sched_results[round] = (max_sched_end - min_sched_start) / 50.0
+            if (max_orch_end > 0 && min_orch_start > 0)
+                orch_results[round] = (max_orch_end - min_orch_start) / 50.0
             count++
         }
     }
-    BEGIN { round = 0; min_start = 0; max_end = 0; count = 0 }
+    BEGIN {
+        round = 0; count = 0
+        min_start = 0; max_end = 0
+        min_sched_start = 0; max_sched_end = 0
+        min_orch_start = 0; max_orch_end = 0
+        has_sched = 0; has_orch_end = 0
+    }
+    /sched_start=/ {
+        match($0, /Thread ([0-9]+):/, tm)
+        tid = tm[1] + 0
+        if (tid in sched_seen) new_round()
+        sched_seen[tid] = 1
+        has_sched = 1
+        match($0, /sched_start=([0-9]+)/, m)
+        val = m[1] + 0
+        if (min_sched_start == 0 || val < min_sched_start) min_sched_start = val
+        if (min_start == 0 || val < min_start) min_start = val
+    }
     /orch_start=/ {
         match($0, /Thread ([0-9]+):/, tm)
         tid = tm[1] + 0
-        if (tid in seen) {
-            flush_round()
-            round++
-            min_start = 0
-            max_end = 0
-            delete seen
-        }
-        seen[tid] = 1
+        if (tid in orch_seen) new_round()
+        orch_seen[tid] = 1
         match($0, /orch_start=([0-9]+)/, m)
         val = m[1] + 0
+        if (min_orch_start == 0 || val < min_orch_start) min_orch_start = val
         if (min_start == 0 || val < min_start) min_start = val
     }
-    /end=/ {
-        match($0, /end=([0-9]+)/, m)
+    /sched_end[^=]*=/ {
+        match($0, /sched_end[^=]*=([0-9]+)/, m)
+        val = m[1] + 0
+        if (val > max_sched_end) max_sched_end = val
+        if (val > max_end) max_end = val
+    }
+    /orch_end=/ {
+        match($0, /orch_end=([0-9]+)/, m)
+        val = m[1] + 0
+        has_orch_end = 1
+        if (val > max_orch_end) max_orch_end = val
+        if (val > max_end) max_end = val
+    }
+    /orch_stage_end=/ {
+        match($0, /orch_stage_end=([0-9]+)/, m)
         val = m[1] + 0
         if (val > max_end) max_end = val
     }
@@ -182,21 +242,56 @@ parse_timing() {
         flush_round()
         if (count == 0) { print "  (no rounds parsed)"; exit 1 }
 
-        printf "  %-8s  %12s\n", "Round", "Elapsed (us)"
-        printf "  %-8s  %12s\n", "-----", "------------"
-        sum_v = 0
-        min_v = results[0]
-        max_v = results[0]
+        show_sched = has_sched
+        show_orch = has_orch_end
+
+        # Header
+        hdr = sprintf("  %-8s  %12s", "Round", "Elapsed (us)")
+        sep = sprintf("  %-8s  %12s", "-----", "------------")
+        if (show_sched) { hdr = hdr sprintf("  %12s", "Sched (us)"); sep = sep sprintf("  %12s", "----------") }
+        if (show_orch)  { hdr = hdr sprintf("  %12s", "Orch (us)");  sep = sep sprintf("  %12s", "---------")  }
+        print hdr; print sep
+
+        sum_v = 0; min_v = results[0]; max_v = results[0]
+        sum_s = 0; min_s = sched_results[0]; max_s = sched_results[0]
+        sum_o = 0; min_o = orch_results[0]; max_o = orch_results[0]
+
         for (i = 0; i < count; i++) {
-            printf "  %-8d  %12.1f\n", i, results[i]
+            line = sprintf("  %-8d  %12.1f", i, results[i])
             sum_v += results[i]
             if (results[i] < min_v) min_v = results[i]
             if (results[i] > max_v) max_v = results[i]
+            if (show_sched) {
+                line = line sprintf("  %12.1f", sched_results[i])
+                sum_s += sched_results[i]
+                if (sched_results[i] < min_s) min_s = sched_results[i]
+                if (sched_results[i] > max_s) max_s = sched_results[i]
+            }
+            if (show_orch) {
+                line = line sprintf("  %12.1f", orch_results[i])
+                sum_o += orch_results[i]
+                if (orch_results[i] < min_o) min_o = orch_results[i]
+                if (orch_results[i] > max_o) max_o = orch_results[i]
+            }
+            print line
         }
-        printf "\n  Avg: %.1f us  (%d rounds)\n", sum_v / count, count
+
+        printf "\n  Avg: %.1f us", sum_v / count
+        if (show_sched) printf "  |  Sched Avg: %.1f us", sum_s / count
+        if (show_orch)  printf "  |  Orch Avg: %.1f us", sum_o / count
+        printf "  (%d rounds)\n", count
+
         if (count > 2) {
             trimmed = (sum_v - min_v - max_v) / (count - 2)
             printf "  Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed, min_v, max_v
+            if (show_sched) {
+                trimmed_s = (sum_s - min_s - max_s) / (count - 2)
+                printf "  Sched Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed_s, min_s, max_s
+            }
+            if (show_orch) {
+                trimmed_o = (sum_o - min_o - max_o) / (count - 2)
+                printf "  Orch Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed_o, min_o, max_o
+            }
         }
     }'
 }
@@ -263,8 +358,18 @@ run_bench() {
     run_cmd+=("${EXTRA_ARGS[@]}")
 
     # Run example
-    if ! "${run_cmd[@]}" > /dev/null 2>&1; then
+    vlog "Running: ${run_cmd[*]}"
+    local rc=0
+    if [[ -n "$VERBOSE_LOG" ]]; then
+        local run_output
+        run_output=$("${run_cmd[@]}" 2>&1) || rc=$?
+        if [[ -n "$run_output" ]]; then echo "$run_output" >> "$VERBOSE_LOG"; fi
+    else
+        "${run_cmd[@]}" > /dev/null 2>&1 || rc=$?
+    fi
+    if [[ $rc -ne 0 ]]; then
         echo "  FAILED: run_example.py returned non-zero"
+        vlog "FAILED: exit code $rc"
         ((FAIL++)) || true
         return
     fi
@@ -280,11 +385,34 @@ run_bench() {
     fi
 
     echo "  Log: $new_log"
-    if parse_timing "$new_log"; then
-        ((PASS++)) || true
-    else
+    local timing_output
+    local parse_rc=0
+    timing_output=$(parse_timing "$new_log") || parse_rc=$?
+    echo "$timing_output"
+
+    if [[ $parse_rc -ne 0 ]]; then
         ((FAIL++)) || true
+        return
     fi
+    ((PASS++)) || true
+
+    # Extract averages for summary table
+    local label="$example"
+    [[ -n "$case_name" ]] && label="$example ($case_name)"
+
+    local avg_line
+    avg_line=$(echo "$timing_output" | grep "^  Avg:" || true)
+    local avg_elapsed="-" avg_sched="-" avg_orch="-"
+    if [[ -n "$avg_line" ]]; then
+        avg_elapsed=$(echo "$avg_line" | awk '{print $2}')
+        avg_sched=$(echo "$avg_line" | grep -o 'Sched Avg: [0-9.]*' | awk '{print $3}') || avg_sched="-"
+        avg_orch=$(echo "$avg_line" | grep -o 'Orch Avg: [0-9.]*' | awk '{print $3}') || avg_orch="-"
+    fi
+
+    SUMMARY_NAMES+=("$label")
+    SUMMARY_ELAPSED+=("$avg_elapsed")
+    SUMMARY_SCHED+=("$avg_sched")
+    SUMMARY_ORCH+=("$avg_orch")
 }
 
 # ---------------------------------------------------------------------------
@@ -292,6 +420,12 @@ run_bench() {
 # ---------------------------------------------------------------------------
 PASS=0
 FAIL=0
+
+# Summary collection arrays
+SUMMARY_NAMES=()
+SUMMARY_ELAPSED=()
+SUMMARY_SCHED=()
+SUMMARY_ORCH=()
 
 echo ""
 echo "Runtime: $RUNTIME"
@@ -326,6 +460,51 @@ for example in "${EXAMPLE_ORDER[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
+# Performance Summary Table
+# ---------------------------------------------------------------------------
+if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
+    # Check if any sched/orch data exists across all runs
+    _has_sched=0
+    _has_orch=0
+    for _i in "${!SUMMARY_NAMES[@]}"; do
+        [[ "${SUMMARY_SCHED[$_i]}" != "-" ]] && _has_sched=1
+        [[ "${SUMMARY_ORCH[$_i]}" != "-" ]] && _has_orch=1
+    done
+
+    echo ""
+    echo "================================================================"
+    echo "  Performance Summary ($RUNTIME)"
+    echo "================================================================"
+    echo ""
+
+    # Header
+    _hdr=$(printf "  %-40s  %12s" "Example" "Elapsed (us)")
+    _sep=$(printf "  %-40s  %12s" "----------------------------------------" "------------")
+    if [[ $_has_sched -eq 1 ]]; then
+        _hdr=$(printf "%s  %12s" "$_hdr" "Sched (us)")
+        _sep=$(printf "%s  %12s" "$_sep" "------------")
+    fi
+    if [[ $_has_orch -eq 1 ]]; then
+        _hdr=$(printf "%s  %12s" "$_hdr" "Orch (us)")
+        _sep=$(printf "%s  %12s" "$_sep" "------------")
+    fi
+    echo "$_hdr"
+    echo "$_sep"
+
+    # Rows
+    for _i in "${!SUMMARY_NAMES[@]}"; do
+        _row=$(printf "  %-40s  %12s" "${SUMMARY_NAMES[$_i]}" "${SUMMARY_ELAPSED[$_i]}")
+        if [[ $_has_sched -eq 1 ]]; then
+            _row=$(printf "%s  %12s" "$_row" "${SUMMARY_SCHED[$_i]}")
+        fi
+        if [[ $_has_orch -eq 1 ]]; then
+            _row=$(printf "%s  %12s" "$_row" "${SUMMARY_ORCH[$_i]}")
+        fi
+        echo "$_row"
+    done
+fi
+
+# ---------------------------------------------------------------------------
 # Summary
 # ---------------------------------------------------------------------------
 TOTAL=$((PASS + FAIL))
@@ -333,5 +512,9 @@ echo ""
 echo "================================================================"
 echo "  Benchmark complete ($RUNTIME): $PASS passed, $FAIL failed ($TOTAL total)"
 echo "================================================================"
+
+if [[ -n "$VERBOSE_LOG" ]]; then
+    echo "  Verbose log saved to: $VERBOSE_LOG"
+fi
 
 [[ $FAIL -eq 0 ]]
