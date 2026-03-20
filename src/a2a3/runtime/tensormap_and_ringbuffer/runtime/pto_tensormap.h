@@ -443,8 +443,8 @@ struct PTO2TensorMap {
      * Check if entry is valid (producer has not retired)
      */
     bool entry_valid(const PTO2TensorMapEntry& entry) const {
-        int32_t ring_id = pto2_task_id_ring(entry.producer_task_id);
-        int32_t local_id = static_cast<int32_t>(pto2_task_id_local(entry.producer_task_id));
+        int32_t ring_id = entry.producer_task_id.ring();
+        int32_t local_id = static_cast<int32_t>(entry.producer_task_id.local());
         return local_id >= last_task_alives[ring_id];
     }
 
@@ -462,8 +462,8 @@ struct PTO2TensorMap {
         // Update predecessor's next pointer (O(1) via prev_in_task)
         if (entry.prev_in_task == nullptr) {
             // Entry is the head of its task chain, update task_entry_heads
-            int32_t ring_id = pto2_task_id_ring(entry.producer_task_id);
-            int32_t local_id = static_cast<int32_t>(pto2_task_id_local(entry.producer_task_id));
+            int32_t ring_id = entry.producer_task_id.ring();
+            int32_t local_id = static_cast<int32_t>(entry.producer_task_id.local());
             int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
             task_entry_heads[ring_id][task_slot] = entry.next_in_task;
         } else {

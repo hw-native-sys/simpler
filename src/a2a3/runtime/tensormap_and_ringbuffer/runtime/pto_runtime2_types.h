@@ -136,18 +136,6 @@ static inline PTO2TaskId pto2_make_task_id(uint8_t ring_id, uint32_t local_id) {
     return PTO2TaskId{(static_cast<uint64_t>(ring_id) << 32) | static_cast<uint64_t>(local_id)};
 }
 
-static inline uint8_t pto2_task_id_ring(PTO2TaskId task_id) {
-    return task_id.ring();
-}
-
-static inline uint32_t pto2_task_id_local(PTO2TaskId task_id) {
-    return task_id.local();
-}
-
-static inline uint64_t pto2_task_id_raw(PTO2TaskId task_id) {
-    return task_id.raw;
-}
-
 // =============================================================================
 // Worker Types
 // =============================================================================

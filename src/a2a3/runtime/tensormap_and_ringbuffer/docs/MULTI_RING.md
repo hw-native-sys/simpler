@@ -27,13 +27,14 @@ Task IDs are widened from 32-bit to 64-bit to carry the ring identity:
 mixed_task_id.raw = (ring_id << 32) | local_id
 ```
 
-Helper functions in `pto_runtime2_types.h`:
+`PTO2TaskId` exposes direct accessors in `pto_runtime2_types.h`:
 
-| Function | Purpose |
-|----------|---------|
+| API | Purpose |
+|-----|---------|
 | `pto2_make_task_id(ring_id, local_id)` | Compose a 64-bit task ID (`PTO2TaskId`) |
-| `pto2_task_id_ring(task_id)` | Extract `ring_id` (bits 63-32) |
-| `pto2_task_id_local(task_id)` | Extract `local_id` (bits 31-0) |
+| `task_id.ring()` | Extract `ring_id` (bits 63-32) |
+| `task_id.local()` | Extract `local_id` (bits 31-0) |
+| `task_id.raw` | Access the packed 64-bit encoding |
 
 Type changes:
 
@@ -130,8 +131,8 @@ Entry validity checks and `cleanup_retired` operate per-ring:
 
 ```cpp
 bool entry_valid(const PTO2TensorMapEntry& e) {
-    int32_t ring = pto2_task_id_ring(e.producer_task_id);
-    int32_t local = pto2_task_id_local(e.producer_task_id);
+    int32_t ring = e.producer_task_id.ring();
+    int32_t local = e.producer_task_id.local();
     return local >= last_task_alives[ring];
 }
 ```

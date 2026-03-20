@@ -200,13 +200,13 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
             // PerfRecord.fanout stores 32-bit legacy task IDs. Our multi-ring task ID
             // encodes ring_id in the upper 32 bits, so only the legacy single-ring
             // case (ring_id==0) is representable here.
-            uint64_t mixed = pto2_task_id_raw(cur->slot_state->task->mixed_task_id);
-            if ((mixed >> 32) != 0) {
+            PTO2TaskId mixed_task_id = cur->slot_state->task->mixed_task_id;
+            if (mixed_task_id.ring() != 0) {
                 // Skip: cannot represent (ring_id, local_id) in a 32-bit fanout slot.
                 cur = cur->next;
                 continue;
             }
-            record->fanout[record->fanout_count++] = static_cast<int32_t>(mixed & 0xFFFFFFFFu);
+            record->fanout[record->fanout_count++] = static_cast<int32_t>(mixed_task_id.local());
             cur = cur->next;
         }
     }

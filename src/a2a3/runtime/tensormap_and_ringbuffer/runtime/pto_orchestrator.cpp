@@ -271,7 +271,7 @@ void pto2_submit_mixed_task(
         return;
     }
 
-    
+
     // Determine which ring this task belongs to
     uint8_t ring_id = orch->current_ring_id();
     auto& task_ring = orch->rings[ring_id].task_ring;
@@ -343,7 +343,7 @@ void pto2_submit_mixed_task(
     PTO2TaskId mixed_task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
 
     PTO2TaskDescriptor& task = task_ring.get_task_by_slot(slot);
-    PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[ring_id][slot];    
+    PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[ring_id][slot];
 
     // Early write-prefetch payload GM cache lines to issue RFO in background.
     // ~130 lines of computation (output_size, lookup, insert) follow before
@@ -390,10 +390,12 @@ void pto2_submit_mixed_task(
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, local_id);
 
     // === STEP 2: Calculate output size + heap alloc (read from params only, no GM access) ===
+    bool needs_alloc[PTO2_MAX_TENSOR_PARAMS] = {};
     int32_t total_output_size = 0;
     for (int i = 0; i < params.tensor_count; i++) {
         if (params.tensor_types[i] == PTOParamType::OUTPUT
             && params.tensors[i]->buffer.addr == 0) {
+            needs_alloc[i] = true;
             total_output_size += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
@@ -491,7 +493,7 @@ void pto2_submit_mixed_task(
         PTOParamType ptype = params.tensor_types[i];
         if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
             if (!params.tensors[i]->manual_dep) {
-                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, ptype == PTOParamType::OUTPUT);
+                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, needs_alloc[i]);
             }
         }
     }

@@ -388,7 +388,7 @@ struct AicpuExecutor {
                             PTO2DepListEntry* cur = slot_state.fanout_head;
                             while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
                                 record->fanout[record->fanout_count++] = static_cast<int32_t>(
-                                    pto2_task_id_local(cur->slot_state->task->mixed_task_id));
+                                    cur->slot_state->task->mixed_task_id.local());
                                 cur = cur->next;
                             }
                         }
@@ -1186,7 +1186,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     DEV_DEBUG("Thread %d: Dispatching %s task %lld to cluster %d (local)",
                         thread_idx,
                         shape_name(shape),
-                        (long long)pto2_task_id_raw(slot_state->task->mixed_task_id),
+                        (long long)slot_state->task->mixed_task_id.raw,
                         ci);
                 } else {
                     overflow_ptrs[overflow_count++] = slot_state;
@@ -1264,7 +1264,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 DEV_DEBUG("Thread %d: Dispatching %s task %lld to cluster %d",
                     thread_idx,
                     shape_name(shape),
-                    (long long)pto2_task_id_raw(slot_state->task->mixed_task_id),
+                    (long long)slot_state->task->mixed_task_id.raw,
                     ci);
             }
         }
@@ -1347,13 +1347,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                             cnt_ready++;
                             if (cnt_ready <= STALL_DUMP_READY_MAX) {
                                 DEV_ALWAYS("  STUCK-READY  ring=%d task_id=%lld kernel_id=%d refcount=%d fanin=%d state=%d",
-                                            r, (long long)pto2_task_id_raw(slot_state.task->mixed_task_id), kid, rc, fi, (int32_t)st);
+                                            r, (long long)slot_state.task->mixed_task_id.raw, kid, rc, fi, (int32_t)st);
                             }
                         } else {
                             cnt_waiting++;
                             if (cnt_waiting <= STALL_DUMP_WAIT_MAX) {
                                 DEV_ALWAYS("  STUCK-WAIT   ring=%d task_id=%lld kernel_id=%d refcount=%d fanin=%d state=%d",
-                                            r, (long long)pto2_task_id_raw(slot_state.task->mixed_task_id), kid, rc, fi, (int32_t)st);
+                                            r, (long long)slot_state.task->mixed_task_id.raw, kid, rc, fi, (int32_t)st);
                             }
                         }
                     }

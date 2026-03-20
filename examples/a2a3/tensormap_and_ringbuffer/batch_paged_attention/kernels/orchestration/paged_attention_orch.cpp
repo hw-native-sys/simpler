@@ -191,7 +191,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     params_up.add_input(oi_new_b);
                     params_up.add_inout(mi_batch);
                     params_up.add_inout(li_batch);
-                    params_up.add_output(oi_batch);
+                    params_up.add_inout(oi_batch);
                     params_up.add_output(out);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
