@@ -389,7 +389,7 @@ static void switch_phase_buffer(int thread_idx) {
 void perf_aicpu_record_phase(int thread_idx,
     AicpuPhaseId phase_id,
                               uint64_t start_time, uint64_t end_time,
-                              uint32_t loop_iter, uint32_t tasks_processed) {
+                              uint32_t loop_iter, uint64_t tasks_processed) {
     if (s_phase_header == nullptr) {
         return;
     }
@@ -440,8 +440,7 @@ void perf_aicpu_record_phase(int thread_idx,
     record->end_time = end_time;
     record->loop_iter = loop_iter;
     record->phase_id = phase_id;
-    record->tasks_processed = tasks_processed;
-    record->padding = 0;
+    record->mixed_task_id = tasks_processed;
 
     buf->count = idx + 1;
 }
@@ -470,9 +469,9 @@ void perf_aicpu_set_orch_thread_idx(int thread_idx) {
 
 void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
                                    uint64_t start_time, uint64_t end_time,
-                                   uint32_t submit_idx, uint32_t task_id) {
+                                   uint32_t submit_idx, uint64_t mixed_task_id) {
     if (s_orch_thread_idx < 0 || s_phase_header == nullptr) return;
-    perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
+    perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, mixed_task_id);
 }
 
 void perf_aicpu_flush_phase_buffers(int thread_idx) {

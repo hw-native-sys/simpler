@@ -228,18 +228,20 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
 
     for (uint32_t i = 0; i < count; i++) {
         PerfRecord* record = &perf_buf->records[i];
-        uint32_t task_id = record->task_id;
+        // In host_build_graph, AICore writes a plain uint32_t dispatch counter into
+        // mixed_task_id (upper 32 bits are always 0), so truncating to uint32_t is safe.
+        uint32_t task_id = static_cast<uint32_t>(record->mixed_task_id);
 
         // Query Task by task_id (O(1) array indexing)
         Task* task = get_task(task_id);
+        record->fanout_count = 0;
         if (task != nullptr) {
             record->fanout_count = task->fanout_count;
 
             for (int32_t j = 0; j < task->fanout_count; j++) {
-                record->fanout[j] = task->fanout[j];
+                record->fanout[j] = static_cast<uint64_t>(task->fanout[j]);
             }
-        } else {
-            record->fanout_count = 0;
         }
+        record->fanout_filled = 1;
     }
 }

@@ -36,7 +36,9 @@ Runtime::Runtime() {
     orch_built_on_host_ = true;
     pto2_gm_sm_ptr_ = nullptr;
     pto2_gm_heap_ptr_ = nullptr;
-    pto2_slot_states_ptr_ = nullptr;
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        pto2_ring_slot_states_ptrs_[r] = nullptr;
+    }
     orch_args_ = nullptr;
     orch_arg_count_ = 0;
 
@@ -96,7 +98,11 @@ int Runtime::get_orch_arg_count() const { return orch_arg_count_; }
 void Runtime::set_orch_built_on_host(bool v) { orch_built_on_host_ = v; }
 void Runtime::set_pto2_gm_sm_ptr(void* p) { pto2_gm_sm_ptr_ = p; }
 void Runtime::set_pto2_gm_heap(void* p) { pto2_gm_heap_ptr_ = p; }
-void Runtime::set_pto2_slot_states_ptr(void* p) { pto2_slot_states_ptr_ = p; }
+void Runtime::set_pto2_ring_slot_states_ptr(int ring_id, void* p) {
+    if (ring_id >= 0 && ring_id < PTO2_MAX_RING_DEPTH) {
+        pto2_ring_slot_states_ptrs_[ring_id] = p;
+    }
+}
 void Runtime::set_orch_args(uint64_t* args, int count) {
     orch_arg_count_ = count <= RUNTIME_MAX_ARGS ? count : RUNTIME_MAX_ARGS;
     if (args && orch_arg_count_ > 0) {
@@ -165,49 +171,43 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
     // Get PTO2 shared memory context
     void* sm_base = get_pto2_gm_sm_ptr();
     if (sm_base == nullptr) {
-        // No PTO2 context, cannot complete records
         return;
     }
 
-    // Get slot states for fanout traversal
-    // With multi-ring, slot_states are per-ring inside the scheduler and
-    // pto2_slot_states_ptr_ is nullptr. Fanout and ring_id are filled on the
-    // AICPU side (aicpu_executor.cpp) where slot_state is directly available.
-    PTO2TaskSlotState* slot_states = static_cast<PTO2TaskSlotState*>(pto2_slot_states_ptr_);
-    if (slot_states == nullptr) {
-        return;
-    }
-
-    // Get window mask from shared memory header (ring 0 for legacy single-ring path)
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
-    int32_t window_mask = static_cast<int32_t>(header->rings[0].task_window_size) - 1;
-
     uint32_t count = perf_buf->count;
 
     for (uint32_t i = 0; i < count; i++) {
         PerfRecord* record = &perf_buf->records[i];
-        int32_t task_id = record->task_id;
 
-        // Get slot state for fanout traversal
-        int32_t slot = task_id & window_mask;
+        // Already filled by AICPU side at task completion time.
+        if (record->fanout_filled != 0) {
+            continue;
+        }
+
+        PTO2TaskId task_id{record->mixed_task_id};
+        uint8_t ring_id = task_id.ring();
+        if (ring_id >= PTO2_MAX_RING_DEPTH) {
+            continue;
+        }
+
+        PTO2TaskSlotState* slot_states = static_cast<PTO2TaskSlotState*>(pto2_ring_slot_states_ptrs_[ring_id]);
+        if (slot_states == nullptr) {
+            continue;
+        }
+
+        int32_t window_mask = static_cast<int32_t>(header->rings[ring_id].task_window_size) - 1;
+        int32_t slot = static_cast<int32_t>(task_id.local()) & window_mask;
         PTO2TaskSlotState& ss = slot_states[slot];
 
-        // Fill fanout information by traversing the linked list
-        record->fanout_count = 0;
+        // Fill fanout by traversing the linked list (best-effort: no lock, see aicpu_executor.cpp)
         PTO2DepListEntry* cur = ss.fanout_head;
-
+        record->fanout_count = 0;
         while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
-            // PerfRecord.fanout stores 32-bit legacy task IDs. Our multi-ring task ID
-            // encodes ring_id in the upper 32 bits, so only the legacy single-ring
-            // case (ring_id==0) is representable here.
-            uint64_t mixed = pto2_task_id_raw(cur->slot_state->task->mixed_task_id);
-            if ((mixed >> 32) != 0) {
-                // Skip: cannot represent (ring_id, local_id) in a 32-bit fanout slot.
-                cur = cur->next;
-                continue;
-            }
-            record->fanout[record->fanout_count++] = static_cast<int32_t>(mixed & 0xFFFFFFFFu);
+            record->fanout[record->fanout_count++] =
+                static_cast<uint64_t>(cur->slot_state->task->mixed_task_id);
             cur = cur->next;
         }
+        record->fanout_filled = 1;
     }
 }

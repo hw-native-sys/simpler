@@ -75,15 +75,16 @@ struct PerfRecord {
     uint64_t finish_time;        // AICPU timestamp: when AICPU observed task completion (task_status back to 0)
 
     // Task identification
-    uint32_t task_id;         // Register dispatch id (per-core monotonic counter, NOT mixed_task_id).
-                              // May collide across cores; use (ring_id, task_id, core_id) as unique key.
+    uint64_t mixed_task_id;   // pto2_task_id_raw (ring_id<<32 | local_id) for cross-view correlation.
+                              // Written by AICore as dispatch counter; overwritten by AICPU executor.
     uint32_t func_id;         // Kernel function identifier
     CoreType core_type;       // Core type (AIC/AIV)
     uint8_t ring_id;          // Ring layer (0 for single-ring / legacy)
 
     // Dependency relationship (fanout only)
-    int32_t fanout[RUNTIME_MAX_FANOUT];  // Successor task ID array
-    int32_t fanout_count;                 // Number of successor tasks
+    uint64_t fanout[RUNTIME_MAX_FANOUT];  // Successor task mixed_task_id array
+    int32_t fanout_count;                  // Number of successor tasks
+    uint8_t fanout_filled;                 // 1: fanout has been populated by AICPU or fallback
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(PerfRecord) % 64 == 0,
@@ -262,8 +263,10 @@ struct AicpuPhaseRecord {
     uint64_t end_time;         // Phase end timestamp
     uint32_t loop_iter;        // Loop iteration number
     AicpuPhaseId phase_id;     // Phase type
-    uint32_t tasks_processed;  // Tasks processed in this phase
-    uint32_t padding;          // Alignment padding
+    union {
+        uint64_t mixed_task_id;   // Orchestrator phases: pto2_task_id_raw for cross-view correlation
+        uint64_t tasks_processed; // Scheduler phases: number of tasks processed in this batch
+    };
 };
 
 /**
