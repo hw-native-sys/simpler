@@ -10,7 +10,7 @@ ToolchainType get_incore_compiler(void) {
 }
 
 ToolchainType get_orchestration_compiler(void) {
-    // aicpu_build_graph: orchestration plugin runs on AICPU (aarch64 on real hardware)
+    // aicpu_build_graph: a2a3 needs aarch64 cross-compile (AICPU is aarch64)
     if (strcmp(get_platform(), "a2a3") == 0) return TOOLCHAIN_AARCH64_GXX;
     return TOOLCHAIN_HOST_GXX;
 }

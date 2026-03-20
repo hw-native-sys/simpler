@@ -1,273 +1,195 @@
 /**
- * Paged Attention Orchestration - AICPU Build Graph Version
+ * Paged Attention Orchestration — Per-Block Version
+ * (aicpu_build_graph variant: explicit add_dependency, no TensorMap)
  *
- * Runs on AICPU. The framework has already allocated device memory for I/O
- * tensors and populated orch_args[] with device pointers and scalar values.
+ * For each batch, for each head tile, for each KV block:
+ *   1. QK matmul:  qi @ kj^T → sij (q_tile, block_size)
+ *   2. Softmax:    sij → pij, mi, li
+ *   3. PV matmul:  pij @ vj → oi_tmp (q_tile, head_dim)
+ *   4. Update:     online softmax accumulation
  *
- * orch_args[] layout (from TENSOR_ORDER in golden.py):
- *   orch_args[0]  = dev_query         (device ptr, bf16)
- *   orch_args[1]  = dev_key_cache     (device ptr, bf16)
- *   orch_args[2]  = dev_value_cache   (device ptr, bf16)
- *   orch_args[3]  = dev_block_table   (device ptr, int32)
- *   orch_args[4]  = dev_context_lens  (device ptr, int32)
- *   orch_args[5]  = dev_out           (device ptr, float32)
- *   orch_args[6]  = dev_config        (device ptr, int64)
- *   orch_args[7]  = query_nbytes      (scalar)
- *   orch_args[8]  = key_cache_nbytes  (scalar)
- *   orch_args[9]  = value_cache_nbytes(scalar)
- *   orch_args[10] = block_table_nbytes(scalar)
- *   orch_args[11] = context_lens_nbytes(scalar)
- *   orch_args[12] = out_nbytes        (scalar)
- *   orch_args[13] = config_nbytes     (scalar)
- *   orch_args[14] = element_count     (scalar, element count of first tensor)
- *
- * AICPU is on-device and can directly read dev_config, dev_context_lens,
- * and dev_block_table from HBM to determine graph structure.
- *
- * Supports production-scale paged attention with:
- *   Query: (batch, q_head_num, head_dim) bf16
- *   Key:   (total_blocks, block_size, kv_head_num, head_dim) bf16
- *   Value: (total_blocks, block_size, kv_head_num, head_dim) bf16
- *   Output: (batch * q_head_num, head_dim) float32
- *
- * Head tiling: q_tile_size = min(num_heads, 128)
- * GQA: kv_head_num can differ from q_head_num
+ * Dependency graph per block:
+ *   QK → Softmax → PV → Update
+ *              └──────────→ Update
+ *   Update(prev block) ──→ Update(this block)
+ *   Hub(init) ────────────→ Update(first block)
  */
 
 #include <cstdint>
+#include <cstring>
 
-#include "runtime.h"
+#include "pto_orchestration_api.h"
 
-#define FUNC_QK_MATMUL       0
+#define FUNC_QK_MATMUL 0
 #define FUNC_SOFTMAX_PREPARE 1
-#define FUNC_PV_MATMUL       2
-#define FUNC_ONLINE_UPDATE   3
+#define FUNC_PV_MATMUL 2
+#define FUNC_ONLINE_UPDATE 3
+#define FUNC_AIC_HUB 4
+#define FUNC_AIV_HUB 5
 
-namespace {
+// Helper to encode float as uint64_t for scalar params
+static uint64_t float_to_u64(float f) {
+    union {
+        float f32;
+        uint64_t u64;
+    } conv;
+    conv.u64 = 0;
+    conv.f32 = f;
+    return conv.u64;
+}
 
-// orch_args[] index constants
-constexpr int IDX_QUERY         = 0;
-constexpr int IDX_KEY_CACHE     = 1;
-constexpr int IDX_VALUE_CACHE   = 2;
-constexpr int IDX_BLOCK_TABLE   = 3;
-constexpr int IDX_CONTEXT_LENS  = 4;
-constexpr int IDX_OUT           = 5;
-constexpr int IDX_CONFIG        = 6;
+extern "C" {
 
-inline int min_int(int a, int b) { return (a < b) ? a : b; }
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
+    uint64_t* args, int arg_count) {
+    (void)args;
+    (void)arg_count;
+    return PTO2OrchestrationConfig{
+        .expected_arg_count = 10,
+    };
+}
 
-}  // namespace
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+    (void)arg_count;
+    (void)orch_thread_num;
+    (void)orch_thread_index;
 
-extern "C" int orchestration(Runtime* runtime) {
-    if (runtime == nullptr) {
-        return -1;
-    }
+    // Extract device pointers (first 7)
+    void* host_query = reinterpret_cast<void*>(args[0]);
+    void* host_key_cache = reinterpret_cast<void*>(args[1]);
+    void* host_value_cache = reinterpret_cast<void*>(args[2]);
+    int* host_block_table = reinterpret_cast<int*>(args[3]);
+    int* host_context_lens = reinterpret_cast<int*>(args[4]);
+    void* host_out = reinterpret_cast<void*>(args[5]);
+    int64_t* host_config = reinterpret_cast<int64_t*>(args[6]);
 
-    if (runtime->orch_argc < 14) {
-        return -1;
-    }
+    // Extract config parameters
+    uint64_t batch = static_cast<uint64_t>(static_cast<int>(host_config[0]));
+    uint64_t num_heads = static_cast<uint64_t>(static_cast<int>(host_config[1]));
+    uint64_t head_dim = static_cast<uint64_t>(static_cast<int>(host_config[3]));
+    uint64_t block_size = static_cast<uint64_t>(static_cast<int>(host_config[4]));
+    uint64_t block_num = static_cast<uint64_t>(static_cast<int>(host_config[5]));
+    union { uint32_t u; float f; } scale_conv;
+    scale_conv.u = static_cast<uint32_t>(host_config[6]);
+    float scale_value = scale_conv.f;
+    uint64_t q_head_num = num_heads;
+    uint64_t q_tile = std::min(num_heads, 128UL);
+    uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
+    DataType data_type = DataType::BFLOAT16;
 
-    const AicpuBuildApi& api = runtime->aicpu_build_api;
-    if (api.add_task == nullptr || api.add_successor_conditional == nullptr ||
-        api.publish_task == nullptr || api.device_malloc == nullptr) {
-        return -1;
-    }
+    uint32_t query_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
+    uint32_t key_cache_shapes[2] = {(uint32_t)(batch * block_num * block_size), (uint32_t)head_dim};
+    uint32_t value_cache_shapes[2] = {(uint32_t)(batch * block_num * block_size), (uint32_t)head_dim};
+    uint32_t out_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
+    Tensor query = make_tensor_external(host_query, query_shapes, 2, data_type, false);
+    Tensor key_cache = make_tensor_external(host_key_cache, key_cache_shapes, 2, data_type, false);
+    Tensor value_cache = make_tensor_external(host_value_cache, value_cache_shapes, 2, data_type, false);
+    Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
 
-    // Device pointers (already allocated and populated by the framework)
-    uint8_t* dev_query       = reinterpret_cast<uint8_t*>(runtime->orch_args[IDX_QUERY]);
-    uint8_t* dev_key_cache   = reinterpret_cast<uint8_t*>(runtime->orch_args[IDX_KEY_CACHE]);
-    uint8_t* dev_value_cache = reinterpret_cast<uint8_t*>(runtime->orch_args[IDX_VALUE_CACHE]);
-    int* dev_block_table     = reinterpret_cast<int*>(runtime->orch_args[IDX_BLOCK_TABLE]);
-    int* dev_context_lens    = reinterpret_cast<int*>(runtime->orch_args[IDX_CONTEXT_LENS]);
-    uint8_t* dev_out         = reinterpret_cast<uint8_t*>(runtime->orch_args[IDX_OUT]);
-    int64_t* dev_config      = reinterpret_cast<int64_t*>(runtime->orch_args[IDX_CONFIG]);
+    for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
+        uint64_t cur_seq = host_context_lens[b_idx];
+        uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
 
-    // Read config from device memory (AICPU can access HBM directly)
-    int batch          = static_cast<int>(dev_config[0]);
-    int num_heads      = static_cast<int>(dev_config[1]);
-    int kv_head_num    = static_cast<int>(dev_config[2]);
-    int head_dim       = static_cast<int>(dev_config[3]);
-    int block_size     = static_cast<int>(dev_config[4]);
-    int max_num_blocks = static_cast<int>(dev_config[5]);
-    uint64_t scale_value_bits = static_cast<uint64_t>(dev_config[6]);
+        for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
+            PTO2_SCOPE(rt) {
+                uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
 
-    int q_tile_size     = min_int(num_heads, 128);
-    int num_head_tiles  = (num_heads + q_tile_size - 1) / q_tile_size;
+                uint32_t oi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+                uint32_t li_shapes[1] = {(uint32_t)q_tile};
+                uint32_t mi_shapes[1] = {(uint32_t)q_tile};
+                Tensor oi = make_tensor(oi_shapes, 2, DataType::FLOAT32);
+                Tensor li_update = make_tensor(li_shapes, 1, DataType::FLOAT32, false);
+                Tensor mi_update = make_tensor(mi_shapes, 1, DataType::FLOAT32, false);
 
-    // Buffer sizes for per-block intermediates
-    size_t sij_size    = static_cast<size_t>(q_tile_size) * block_size * sizeof(float);
-    size_t pij_size    = static_cast<size_t>(q_tile_size) * block_size * sizeof(uint16_t);
-    size_t mij_size    = static_cast<size_t>(q_tile_size) * sizeof(float);
-    size_t lij_size    = mij_size;
-    size_t oi_new_size = static_cast<size_t>(q_tile_size) * head_dim * sizeof(float);
+                uint32_t qi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+                uint32_t qi_offsets[2] = {(uint32_t)cur_offset, 0};
+                Tensor qi = query.view(qi_shapes, qi_offsets);
+                uint32_t out_view_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+                uint32_t out_view_offsets[2] = {(uint32_t)cur_offset, 0};
+                Tensor out_view = out.view(out_view_shapes, out_view_offsets);
 
-    // Allocate per-block intermediate buffers on device (HBM)
-    int total_buffers = batch * max_num_blocks;
-    void** dev_sij_arr    = new void*[total_buffers];
-    void** dev_pij_arr    = new void*[total_buffers];
-    void** dev_mij_arr    = new void*[total_buffers];
-    void** dev_lij_arr    = new void*[total_buffers];
-    void** dev_oi_new_arr = new void*[total_buffers];
+                // Hub task: zero-initialize accumulators
+                PTOParam params_inplace;
+                params_inplace.add_output(oi);
+                params_inplace.add_output(li_update);
+                params_inplace.add_output(mi_update);
+                PTO2TaskId hub_task = pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace);
 
-    for (int i = 0; i < total_buffers; i++) {
-        dev_sij_arr[i]    = api.device_malloc(sij_size);
-        dev_pij_arr[i]    = api.device_malloc(pij_size);
-        dev_mij_arr[i]    = api.device_malloc(mij_size);
-        dev_lij_arr[i]    = api.device_malloc(lij_size);
-        dev_oi_new_arr[i] = api.device_malloc(oi_new_size);
-    }
+                PTO2TaskId prev_update_task = hub_task;
 
-    // Per-(batch, head_tile) accumulators
-    int total_accums = batch * num_head_tiles;
-    size_t mi_size = static_cast<size_t>(q_tile_size) * sizeof(float);
-    size_t li_size = mi_size;
-    size_t oi_size = static_cast<size_t>(q_tile_size) * head_dim * sizeof(float);
+                for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
+                    uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
+                    uint64_t valid_len = std::min(block_size, cur_seq - bn * block_size);
 
-    void** dev_mi_arr = new void*[total_accums];
-    void** dev_li_arr = new void*[total_accums];
-    void** dev_oi_arr = new void*[total_accums];
+                    // KV views for this block
+                    uint32_t kv_shapes[2] = {(uint32_t)block_size, (uint32_t)head_dim};
+                    uint32_t kv_offsets[2] = {(uint32_t)(cur_block_idx * block_size), 0};
+                    Tensor kj = key_cache.view(kv_shapes, kv_offsets);
+                    Tensor vj = value_cache.view(kv_shapes, kv_offsets);
 
-    for (int i = 0; i < total_accums; i++) {
-        dev_mi_arr[i] = api.device_malloc(mi_size);
-        dev_li_arr[i] = api.device_malloc(li_size);
-        dev_oi_arr[i] = api.device_malloc(oi_size);
-    }
+                    // === Task 1: QK matmul ===
+                    uint32_t sij_shapes[2] = {(uint32_t)q_tile, (uint32_t)block_size};
+                    Tensor sij = make_tensor(sij_shapes, 2, DataType::FLOAT32);
 
-    // Build the task graph
-    for (int b_idx = 0; b_idx < batch; b_idx++) {
-        int cur_seq = dev_context_lens[b_idx];
-        int bn_this_batch = (cur_seq + block_size - 1) / block_size;
+                    PTOParam params_qk;
+                    params_qk.add_input(qi);
+                    params_qk.add_input(kj);
+                    params_qk.add_output(sij);
+                    PTO2TaskId qk_task = pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);
 
-        for (int ht = 0; ht < num_head_tiles; ht++) {
-            int cur_offset = ht * q_tile_size;
+                    // === Task 2: Softmax ===
+                    uint32_t sij_valid_shapes[2] = {(uint32_t)q_tile, (uint32_t)valid_len};
+                    uint32_t sij_valid_offsets[2] = {0, 0};
+                    Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
 
-            // Query: (batch, q_head_num, head_dim) bf16
-            uint8_t* qi_ptr = dev_query
-                + static_cast<int64_t>(b_idx * num_heads + cur_offset) * head_dim * sizeof(uint16_t);
+                    Tensor pij_f16 = make_tensor(sij_shapes, 2, data_type);
+                    Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
+                    Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
 
-            // Output: (batch * q_head_num, head_dim) float32
-            uint8_t* out_ptr = dev_out
-                + static_cast<int64_t>(b_idx * num_heads + cur_offset) * head_dim * sizeof(float);
+                    PTOParam params_sf;
+                    params_sf.add_input(sij_valid);
+                    params_sf.add_output(pij_f16);
+                    params_sf.add_output(mi);
+                    params_sf.add_output(li);
+                    params_sf.add_scalar(float_to_u64(scale_value));
+                    PTO2TaskId sf_task = pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf);
+                    pto2_rt_add_dependency(rt, qk_task, sf_task);
 
-            // GQA: which kv_head this head tile maps to
-            int kv_head_idx = cur_offset / (num_heads / kv_head_num);
+                    // === Task 3: PV matmul ===
+                    uint32_t oi_tmp_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+                    Tensor oi_tmp = make_tensor(oi_tmp_shapes, 2, DataType::FLOAT32);
 
-            // Per-(batch, head_tile) accumulators
-            int accum_idx = b_idx * num_head_tiles + ht;
-            void* dev_mi = dev_mi_arr[accum_idx];
-            void* dev_li = dev_li_arr[accum_idx];
-            void* dev_oi = dev_oi_arr[accum_idx];
+                    PTOParam params_pv;
+                    params_pv.add_input(pij_f16);
+                    params_pv.add_input(vj);
+                    params_pv.add_output(oi_tmp);
+                    PTO2TaskId pv_task = pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);
+                    pto2_rt_add_dependency(rt, sf_task, pv_task);
 
-            int t_up_prev = -1;
+                    // === Task 4: Online update ===
+                    uint64_t is_first = (bn == 0) ? 1 : 0;
+                    uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
 
-            for (int bn = 0; bn < bn_this_batch; bn++) {
-                int cur_block_idx = dev_block_table[b_idx * max_num_blocks + bn];
-                int valid_len = min_int(block_size, cur_seq - bn * block_size);
+                    PTOParam params_up;
+                    params_up.add_input(mi);
+                    params_up.add_input(li);
+                    params_up.add_input(oi_tmp);
+                    params_up.add_inout(mi_update);
+                    params_up.add_inout(li_update);
+                    params_up.add_inout(oi);
+                    params_up.add_output(out_view);
+                    params_up.add_scalar(is_first);
+                    params_up.add_scalar(is_last);
+                    PTO2TaskId up_task = pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up);
+                    pto2_rt_add_dependency(rt, sf_task, up_task);
+                    pto2_rt_add_dependency(rt, pv_task, up_task);
+                    pto2_rt_add_dependency(rt, prev_update_task, up_task);
 
-                // Key: (total_blocks, block_size, kv_head_num, head_dim) bf16
-                uint8_t* kj_ptr = dev_key_cache
-                    + (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx)
-                      * head_dim * sizeof(uint16_t);
-
-                // Value: same layout as key
-                uint8_t* vj_ptr = dev_value_cache
-                    + (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx)
-                      * head_dim * sizeof(uint16_t);
-
-                int buf_idx = b_idx * max_num_blocks + bn;
-                void* dev_sij    = dev_sij_arr[buf_idx];
-                void* dev_pij    = dev_pij_arr[buf_idx];
-                void* dev_mij    = dev_mij_arr[buf_idx];
-                void* dev_lij    = dev_lij_arr[buf_idx];
-                void* dev_oi_new = dev_oi_new_arr[buf_idx];
-
-                // QK: qi(M, K) @ kj.T(K, N) -> sij(M, N)
-                uint64_t qk_args[6] = {
-                    reinterpret_cast<uint64_t>(qi_ptr),
-                    reinterpret_cast<uint64_t>(kj_ptr),
-                    reinterpret_cast<uint64_t>(dev_sij),
-                    static_cast<uint64_t>(q_tile_size),
-                    static_cast<uint64_t>(head_dim),
-                    static_cast<uint64_t>(block_size)
-                };
-                int t_qk = api.add_task(runtime, qk_args, 6, FUNC_QK_MATMUL, CoreType::AIC, 0);
-                if (t_qk < 0) return -1;
-
-                // SF: scale, rowmax, exp, rowsum -> pij, mij, lij
-                uint64_t sf_args[8] = {
-                    reinterpret_cast<uint64_t>(dev_sij),
-                    scale_value_bits,
-                    reinterpret_cast<uint64_t>(dev_pij),
-                    reinterpret_cast<uint64_t>(dev_mij),
-                    reinterpret_cast<uint64_t>(dev_lij),
-                    static_cast<uint64_t>(q_tile_size),
-                    static_cast<uint64_t>(block_size),
-                    static_cast<uint64_t>(valid_len)
-                };
-                int t_sf = api.add_task(runtime, sf_args, 8, FUNC_SOFTMAX_PREPARE, CoreType::AIV, 0);
-                if (t_sf < 0) return -1;
-
-                // PV: pij(M, K') @ vj(K', N') -> oi_new(M, N')
-                uint64_t pv_args[6] = {
-                    reinterpret_cast<uint64_t>(dev_pij),
-                    reinterpret_cast<uint64_t>(vj_ptr),
-                    reinterpret_cast<uint64_t>(dev_oi_new),
-                    static_cast<uint64_t>(q_tile_size),
-                    static_cast<uint64_t>(block_size),
-                    static_cast<uint64_t>(head_dim)
-                };
-                int t_pv = api.add_task(runtime, pv_args, 6, FUNC_PV_MATMUL, CoreType::AIC, 0);
-                if (t_pv < 0) return -1;
-
-                // Dependencies: QK -> SF -> PV
-                api.add_successor_conditional(runtime, t_qk, t_sf);
-                api.add_successor_conditional(runtime, t_sf, t_pv);
-
-                // Publish QK, SF, PV
-                api.publish_task(runtime, t_qk);
-                api.publish_task(runtime, t_sf);
-                api.publish_task(runtime, t_pv);
-
-                // Online Update: serialized across blocks
-                int is_first = (bn == 0) ? 1 : 0;
-                int is_last  = (bn == bn_this_batch - 1) ? 1 : 0;
-
-                uint64_t up_args[11] = {
-                    reinterpret_cast<uint64_t>(dev_mij),
-                    reinterpret_cast<uint64_t>(dev_lij),
-                    reinterpret_cast<uint64_t>(dev_oi_new),
-                    reinterpret_cast<uint64_t>(dev_mi),
-                    reinterpret_cast<uint64_t>(dev_li),
-                    reinterpret_cast<uint64_t>(dev_oi),
-                    static_cast<uint64_t>(is_first),
-                    static_cast<uint64_t>(is_last),
-                    reinterpret_cast<uint64_t>(out_ptr),
-                    static_cast<uint64_t>(q_tile_size),
-                    static_cast<uint64_t>(head_dim)
-                };
-                int t_up = api.add_task(runtime, up_args, 11, FUNC_ONLINE_UPDATE, CoreType::AIV, 0);
-                if (t_up < 0) return -1;
-
-                // UP depends on PV completing, and on previous UP (serialized)
-                api.add_successor_conditional(runtime, t_pv, t_up);
-                if (t_up_prev >= 0) {
-                    api.add_successor_conditional(runtime, t_up_prev, t_up);
+                    prev_update_task = up_task;
                 }
-                api.publish_task(runtime, t_up);
-
-                t_up_prev = t_up;
             }
         }
     }
-
-    delete[] dev_sij_arr;
-    delete[] dev_pij_arr;
-    delete[] dev_mij_arr;
-    delete[] dev_lij_arr;
-    delete[] dev_oi_new_arr;
-    delete[] dev_mi_arr;
-    delete[] dev_li_arr;
-    delete[] dev_oi_arr;
-
-    return 0;
 }
+
+}  // extern "C"

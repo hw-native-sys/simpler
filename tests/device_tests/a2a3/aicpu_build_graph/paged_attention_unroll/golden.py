@@ -1,4 +1,4 @@
-"""Paged Attention Golden - aicpu_build_graph test (production scale, bfloat16)."""
+"""Paged Attention Unroll Golden - aicpu_build_graph test (production scale, bfloat16)."""
 
 from paged_attention_golden import (
     generate_inputs as _generate_inputs,
@@ -32,6 +32,16 @@ ALL_CASES = {
         "max_model_len": 32768,
         "dtype": "bfloat16",
     },
+    "Case3": {
+        "batch": 64,
+        "num_heads": 64,
+        "kv_head_num": 1,
+        "head_dim": 256,
+        "block_size": 64,
+        "context_len": 8192,
+        "max_model_len": 32768,
+        "dtype": "bfloat16",
+    },
 }
 
 DEFAULT_CASE = "Case1"
@@ -42,4 +52,4 @@ def generate_inputs(params: dict) -> list:
 
 
 if __name__ == "__main__":
-    run_golden_test(ALL_CASES, DEFAULT_CASE, generate_inputs)
+    run_golden_test(ALL_CASES, DEFAULT_CASE, generate_inputs, label="Paged Attention Unroll")

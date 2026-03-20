@@ -1,124 +1,105 @@
 /**
  * AICPU orchestration for the vector example.
  *
- * Runs on AICPU. The framework has already allocated device memory for I/O
- * tensors and populated orch_args[] with device pointers and scalar values:
+ * DAG structure for formula: f = (a + b + 1) * (a + b + 2)
+ *   t0: c = a + b     (func_id=0, kernel_add)
+ *   t1: d = c + 1     (func_id=1, kernel_add_scalar)
+ *   t2: e = c + 2     (func_id=1, kernel_add_scalar)
+ *   t3: f = d * e     (func_id=2, kernel_mul)
+ *   Dependencies: t0->t1, t0->t2, t1->t3, t2->t3
  *
- *   orch_args[0] = dev_a      (input,  float[SIZE])
- *   orch_args[1] = dev_b      (input,  float[SIZE])
- *   orch_args[2] = dev_f      (output, float[SIZE])
- *   orch_args[3] = SIZE        (element count, scalar)
- *
- * This function allocates intermediate tensors via api.device_malloc() (HBM)
- * and builds the task dependency graph:
- *
- *   c = a + b        (task 0, func_id=0)
- *   d = c + 1.0      (task 1, func_id=1, depends on task 0)
- *   e = c + 2.0      (task 2, func_id=1, depends on task 0)
- *   f = d * e         (task 3, func_id=2, depends on tasks 1 and 2)
+ * Uses explicit add_dependency for all dependency edges (no TensorMap).
+ * Tasks are batch-published at scope_end.
  */
 
-#include <cstdint>
+#include <stddef.h>
+#include <stdint.h>
 
-#include "runtime.h"
+#include "pto_orchestration_api.h"
 
-namespace {
-union ScalarConverter {
-    float f32;
-    uint64_t u64;
-};
+// Args layout (from golden.py + runtime_maker.cpp extension):
+//   [a, b, f, size_a, size_b, size_f, SIZE]
+//   + [gm_heap, heap_size] appended by runtime_maker.cpp
+#define ARG_PTR_A 0
+#define ARG_PTR_B 1
+#define ARG_PTR_F 2
+#define ARG_SIZE  6
 
-constexpr int DEV_A = 0;
-constexpr int DEV_B = 1;
-constexpr int DEV_F = 2;
-constexpr int SIZE  = 3;
-}  // namespace
-
-extern "C" int orchestration(Runtime* runtime) {
-    if (runtime == nullptr) {
-        return -1;
-    }
-
-    if (runtime->orch_argc < SIZE + 1) {
-        return -1;
-    }
-
-    const uint64_t dev_a = runtime->orch_args[DEV_A];
-    const uint64_t dev_b = runtime->orch_args[DEV_B];
-    const uint64_t dev_f = runtime->orch_args[DEV_F];
-    const int size = static_cast<int>(runtime->orch_args[SIZE]);
-
-    if (dev_a == 0 || dev_b == 0 || dev_f == 0 || size <= 0) {
-        return -1;
-    }
-
-    const AicpuBuildApi& api = runtime->aicpu_build_api;
-    if (api.add_task == nullptr || api.add_successor_conditional == nullptr ||
-        api.publish_task == nullptr || api.device_malloc == nullptr) {
-        return -1;
-    }
-
-    // Allocate intermediate tensors on device (HBM, accessible by AIV cores).
-    // Note: malloc() on AICPU returns AICPU-local memory which AIV cores cannot access.
-    size_t bytes = static_cast<size_t>(size) * sizeof(float);
-    void* dev_c = api.device_malloc(bytes);
-    void* dev_d = api.device_malloc(bytes);
-    void* dev_e = api.device_malloc(bytes);
-    if (dev_c == nullptr || dev_d == nullptr || dev_e == nullptr) {
-        return -1;
-    }
-
-    // Task 0: c = a + b (func_id=0, AIV)
-    uint64_t args_t0[4];
-    args_t0[0] = dev_a;
-    args_t0[1] = dev_b;
-    args_t0[2] = reinterpret_cast<uint64_t>(dev_c);
-    args_t0[3] = static_cast<uint64_t>(size);
-    int t0 = api.add_task(runtime, args_t0, 4, 0, CoreType::AIV, 0);
-    if (t0 < 0) return -1;
-    api.publish_task(runtime, t0);
-
-    // Task 1: d = c + 1 (func_id=1, AIV)
-    ScalarConverter s1{};
-    s1.f32 = 1.0f;
-    uint64_t args_t1[4];
-    args_t1[0] = reinterpret_cast<uint64_t>(dev_c);
-    args_t1[1] = s1.u64;
-    args_t1[2] = reinterpret_cast<uint64_t>(dev_d);
-    args_t1[3] = static_cast<uint64_t>(size);
-    int t1 = api.add_task(runtime, args_t1, 4, 1, CoreType::AIV, 0);
-    if (t1 < 0) return -1;
-    api.add_successor_conditional(runtime, t0, t1);
-    api.publish_task(runtime, t1);
-
-    // Task 2: e = c + 2 (func_id=1, AIV)
-    ScalarConverter s2{};
-    s2.f32 = 2.0f;
-    uint64_t args_t2[4];
-    args_t2[0] = reinterpret_cast<uint64_t>(dev_c);
-    args_t2[1] = s2.u64;
-    args_t2[2] = reinterpret_cast<uint64_t>(dev_e);
-    args_t2[3] = static_cast<uint64_t>(size);
-    int t2 = api.add_task(runtime, args_t2, 4, 1, CoreType::AIV, 0);
-    if (t2 < 0) return -1;
-    api.add_successor_conditional(runtime, t0, t2);
-    api.publish_task(runtime, t2);
-
-    // Task 3: f = d * e (func_id=2, AIV)
-    uint64_t args_t3[4];
-    args_t3[0] = reinterpret_cast<uint64_t>(dev_d);
-    args_t3[1] = reinterpret_cast<uint64_t>(dev_e);
-    args_t3[2] = dev_f;
-    args_t3[3] = static_cast<uint64_t>(size);
-    int t3 = api.add_task(runtime, args_t3, 4, 2, CoreType::AIV, 0);
-    if (t3 < 0) return -1;
-    api.add_successor_conditional(runtime, t1, t3);
-    api.add_successor_conditional(runtime, t2, t3);
-    api.publish_task(runtime, t3);
-
-    if (runtime->kernel_addrs[0] == 0 || runtime->kernel_addrs[1] == 0 || runtime->kernel_addrs[2] == 0) {
-        return -1;
-    }
-
-    return 0;
+static uint64_t float_to_u64(float f) {
+    union {
+        float f32;
+        uint64_t u64;
+    } conv;
+    conv.u64 = 0;
+    conv.f32 = f;
+    return conv.u64;
 }
+
+extern "C" {
+
+__attribute__((visibility("default")))
+PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
+    (void)args;
+    (void)arg_count;
+    return PTO2OrchestrationConfig{
+        .expected_arg_count = 7,
+    };
+}
+
+__attribute__((visibility("default")))
+void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+    (void)arg_count;
+    (void)orch_thread_num;
+    (void)orch_thread_index;
+
+    void* arg_a_ptr = (void*)(uintptr_t)args[ARG_PTR_A];
+    void* arg_b_ptr = (void*)(uintptr_t)args[ARG_PTR_B];
+    void* arg_f_ptr = (void*)(uintptr_t)args[ARG_PTR_F];
+    int SIZE = (int)(args[ARG_SIZE] & 0x7FFFFFFF);
+
+    uint32_t shapes[1] = {(uint32_t)SIZE};
+    Tensor ext_a = make_tensor_external(arg_a_ptr, shapes, 1, DataType::FLOAT32);
+    Tensor ext_b = make_tensor_external(arg_b_ptr, shapes, 1, DataType::FLOAT32);
+    Tensor ext_f = make_tensor_external(arg_f_ptr, shapes, 1, DataType::FLOAT32);
+
+    // Intermediate tensors — allocated from HeapRing by the runtime
+    Tensor c = make_tensor(shapes, 1, DataType::FLOAT32);
+    Tensor d = make_tensor(shapes, 1, DataType::FLOAT32);
+    Tensor e = make_tensor(shapes, 1, DataType::FLOAT32);
+
+    PTO2_SCOPE(rt) {
+        // t0: c = a + b
+        PTOParam p0;
+        p0.add_input(ext_a);
+        p0.add_input(ext_b);
+        p0.add_output(c);
+        PTO2TaskId t0 = pto2_rt_submit_aiv_task(rt, 0, p0);
+
+        // t1: d = c + 1.0
+        PTOParam p1;
+        p1.add_input(c);
+        p1.add_output(d);
+        p1.add_scalar(float_to_u64(1.0f));
+        PTO2TaskId t1 = pto2_rt_submit_aiv_task(rt, 1, p1);
+        pto2_rt_add_dependency(rt, t0, t1);
+
+        // t2: e = c + 2.0
+        PTOParam p2;
+        p2.add_input(c);
+        p2.add_output(e);
+        p2.add_scalar(float_to_u64(2.0f));
+        PTO2TaskId t2 = pto2_rt_submit_aiv_task(rt, 1, p2);
+        pto2_rt_add_dependency(rt, t0, t2);
+
+        // t3: f = d * e
+        PTOParam p3;
+        p3.add_input(d);
+        p3.add_input(e);
+        p3.add_output(ext_f);
+        PTO2TaskId t3 = pto2_rt_submit_aiv_task(rt, 2, p3);
+        pto2_rt_add_dependency(rt, t1, t3);
+        pto2_rt_add_dependency(rt, t2, t3);
+    }  // scope_end: batch-publish all tasks
+}
+
+}  // extern "C"

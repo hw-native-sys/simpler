@@ -3,9 +3,9 @@
 # then parse device-log timing lines to report per-round latency.
 #
 # Usage:
-#   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>]
+#   ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>]
 #
-# Edit the EXAMPLE_CASES map below to control which examples and cases to run.
+# Edit the EXAMPLE_CASES maps below to control which examples and cases to run.
 
 set -euo pipefail
 
@@ -14,32 +14,33 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 
 # ---------------------------------------------------------------------------
-# Examples to benchmark and their case lists.
-# Key   = directory name under tests/device_tests/<platform>/tensormap_and_ringbuffer/
+# Examples to benchmark and their case lists, per runtime.
+# Key   = directory name under tests/device_tests/<platform>/<runtime>/
 # Value = comma-separated case names to run (empty string = run DEFAULT_CASE)
-#
-# Available cases per example (from golden.py ALL_CASES):
-#   alternating_matmul_add : Case1, Case2
-#   benchmark_bgemm        : Case0, Case1, Case2, Case3, Case4
-#   paged_attention_unroll : Case1, Case2, Case3
-#   batch_paged_attention  : Case1, Case2, Case3
-#   paged_attention        : Case1, Case2, Case3, Case4, Case5, Case6
 # ---------------------------------------------------------------------------
-declare -A EXAMPLE_CASES=(
+
+# --- tensormap_and_ringbuffer ---
+declare -A TMR_EXAMPLE_CASES=(
     [alternating_matmul_add]=""
     [benchmark_bgemm]=""
     [paged_attention_unroll]="Case1,Case2"
     [batch_paged_attention]=""
     [paged_attention]=""
 )
-
-# Ordered list to control benchmark execution order
-EXAMPLE_ORDER=(
+TMR_EXAMPLE_ORDER=(
     alternating_matmul_add
     benchmark_bgemm
     paged_attention_unroll
     batch_paged_attention
     paged_attention
+)
+
+# --- aicpu_build_graph ---
+declare -A ABG_EXAMPLE_CASES=(
+    [paged_attention_unroll]="Case1,Case2"
+)
+ABG_EXAMPLE_ORDER=(
+    paged_attention_unroll
 )
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,7 @@ EXAMPLE_ORDER=(
 DEVICE_ID=0
 ROUNDS=10
 PLATFORM=a2a3
+RUNTIME=tensormap_and_ringbuffer
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -64,17 +66,22 @@ while [[ $# -gt 0 ]]; do
             ROUNDS="$2"
             shift 2
             ;;
+        -r|--runtime)
+            RUNTIME="$2"
+            shift 2
+            ;;
         --help|-h)
             cat <<'USAGE'
 benchmark_rounds.sh — run all examples and report per-round timing from device logs
 
 Usage:
-  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>]
 
 Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 10)
+  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), aicpu_build_graph
   -h, --help     Show this help
 
 All other options are passed through to run_example.py (e.g. --case).
@@ -97,7 +104,23 @@ done
 # ---------------------------------------------------------------------------
 # Derive arch from platform and set examples directory
 # ---------------------------------------------------------------------------
-EXAMPLES_DIR="$PROJECT_ROOT/tests/device_tests/${PLATFORM}/tensormap_and_ringbuffer"
+EXAMPLES_DIR="$PROJECT_ROOT/tests/device_tests/${PLATFORM}/${RUNTIME}"
+
+# Select example cases and order based on runtime
+case "$RUNTIME" in
+    tensormap_and_ringbuffer)
+        declare -n EXAMPLE_CASES=TMR_EXAMPLE_CASES
+        EXAMPLE_ORDER=("${TMR_EXAMPLE_ORDER[@]}")
+        ;;
+    aicpu_build_graph)
+        declare -n EXAMPLE_CASES=ABG_EXAMPLE_CASES
+        EXAMPLE_ORDER=("${ABG_EXAMPLE_ORDER[@]}")
+        ;;
+    *)
+        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer or aicpu_build_graph."
+        exit 1
+        ;;
+esac
 
 # ---------------------------------------------------------------------------
 # Resolve device log directory (mirrors run_example.py / device_log_resolver.py)
@@ -270,6 +293,10 @@ run_bench() {
 PASS=0
 FAIL=0
 
+echo ""
+echo "Runtime: $RUNTIME"
+echo "Tests dir: $EXAMPLES_DIR"
+
 for example in "${EXAMPLE_ORDER[@]}"; do
     case_list="${EXAMPLE_CASES[$example]:-}"
 
@@ -304,7 +331,7 @@ done
 TOTAL=$((PASS + FAIL))
 echo ""
 echo "================================================================"
-echo "  Benchmark complete: $PASS passed, $FAIL failed ($TOTAL total)"
+echo "  Benchmark complete ($RUNTIME): $PASS passed, $FAIL failed ($TOTAL total)"
 echo "================================================================"
 
 [[ $FAIL -eq 0 ]]

@@ -1,11 +1,14 @@
 /**
  * Runtime Class - Implementation
  *
- * Task dependency management with circular ready queue.
- * Follows patterns from pto_runtime.c for consistency.
+ * Device execution and handshake control.
+ * Task graph construction is handled by PTO2Runtime.
  */
 
 #include "runtime.h"
+#include "pto_runtime2_types.h"
+#include "pto_shared_memory.h"
+#include "common/unified_log.h"
 
 // =============================================================================
 // Constructor
@@ -15,243 +18,38 @@ Runtime::Runtime() {
     // NOTE: host_api is initialized in InitRuntime() (host-only code)
     // because the CApi functions don't exist when compiled for device.
 
-    // Initialize task array (cannot use memset with atomic members)
-    for (int i = 0; i < RUNTIME_MAX_TASKS; i++) {
-        tasks[i].task_id = 0;
-        tasks[i].func_id = 0;
-        tasks[i].num_args = 0;
-        tasks[i].function_bin_addr = 0;
-        tasks[i].core_type = CoreType::AIV;  // Default to AIV
-        tasks[i].fanin = 0;
-        tasks[i].fanout_count = 0;
-        tasks[i].start_time = 0;
-        tasks[i].end_time = 0;
-        tasks[i].published = 0;
-        tasks[i].completed = 0;
-        memset(tasks[i].args, 0, sizeof(tasks[i].args));
-        memset(tasks[i].fanout, 0, sizeof(tasks[i].fanout));
-    }
-    next_task_id = 0;
-    initial_ready_count = 0;
+    // Initialize handshake buffers
+    memset(workers, 0, sizeof(workers));
     worker_count = 0;
     sche_cpu_num = 1;
+    orch_thread_num = 1;
+    ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
+    pto2_task_window_size = 0;
+    pto2_heap_size = 0;
+    pto2_dep_pool_size = 0;
+    orch_to_sched = false;
+
+    // Initialize tensor pairs
     tensor_pair_count = 0;
-    device_alloc_count = 0;
+
+    // Initialize device orchestration state
+    orch_built_on_host_ = true;
+    pto2_gm_sm_ptr_ = nullptr;
+    pto2_gm_heap_ptr_ = nullptr;
+    pto2_slot_states_ptr_ = nullptr;
+    orch_args_ = nullptr;
+    orch_arg_count_ = 0;
+
+    // Initialize device orchestration SO binary
+    device_orch_so_size_ = 0;
 
     // Initialize kernel binary tracking
     registered_kernel_count_ = 0;
 
-    orch_argc = 0;
-    memset(orch_args, 0, sizeof(orch_args));
-    memset(kernel_addrs, 0, sizeof(kernel_addrs));
-    aicpu_orch_so_size = 0;
-    memset(aicpu_orch_so_storage, 0, sizeof(aicpu_orch_so_storage));
-    memset(aicpu_orch_func_name, 0, sizeof(aicpu_orch_func_name));
-    strncpy(aicpu_orch_func_name, "orchestration", sizeof(aicpu_orch_func_name) - 1);
-    build_mode = 1;  // default to concurrent build||schedule
-    aicpu_build_api = {};
-}
-
-bool Runtime::try_set_aicpu_orch_so(const void* data, size_t size) {
-    if (data == nullptr || size == 0) {
-        aicpu_orch_so_size = 0;
-        return false;
+    // Initialize function address mapping
+    for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
+        func_id_to_addr_[i] = 0;
     }
-    if (size > sizeof(aicpu_orch_so_storage)) {
-        fprintf(stderr,
-            "[Runtime] ERROR: AICPU orchestration plugin too large (%zu > %zu)\n",
-            size,
-            sizeof(aicpu_orch_so_storage));
-        aicpu_orch_so_size = 0;
-        return false;
-    }
-    memcpy(aicpu_orch_so_storage, data, size);
-    aicpu_orch_so_size = size;
-    return true;
-}
-
-void Runtime::set_aicpu_orch_so(const void* data, size_t size) { (void)try_set_aicpu_orch_so(data, size); }
-
-const void* Runtime::get_aicpu_orch_so_data() const { return aicpu_orch_so_size > 0 ? aicpu_orch_so_storage : nullptr; }
-
-uint64_t Runtime::get_aicpu_orch_so_size() const { return aicpu_orch_so_size; }
-
-// =============================================================================
-// Task Management
-// =============================================================================
-
-int Runtime::add_task(uint64_t* args, int num_args, int func_id, CoreType core_type) {
-    // Check bounds
-    if (next_task_id >= RUNTIME_MAX_TASKS) {
-        fprintf(stderr, "[Runtime] ERROR: Task table full (max=%d)\n", RUNTIME_MAX_TASKS);
-        return -1;
-    }
-
-    if (num_args > RUNTIME_MAX_ARGS) {
-        fprintf(stderr, "[Runtime] ERROR: Too many args (%d > %d)\n", num_args, RUNTIME_MAX_ARGS);
-        return -1;
-    }
-
-    // Allocate task
-    int task_id = next_task_id++;
-    Task* task = &tasks[task_id];
-
-    // Initialize task fields
-    task->task_id = task_id;
-    task->func_id = func_id;
-    task->num_args = num_args;
-    if (args && num_args > 0) {
-        memcpy(task->args, args, num_args * sizeof(uint64_t));
-    }
-    task->function_bin_addr = 0;  // Set by AICPU builder for this runtime
-    task->core_type = core_type;  // Set core type
-    task->fanin = 0;
-    task->fanout_count = 0;
-    task->published.store(0, std::memory_order_release);
-    task->completed.store(0, std::memory_order_release);
-    memset(task->fanout, 0, sizeof(task->fanout));
-
-    return task_id;
-}
-
-void Runtime::add_successor(int from_task, int to_task) {
-    // Validate task IDs
-    if (from_task < 0 || from_task >= next_task_id) {
-        fprintf(stderr, "[Runtime] ERROR: Invalid from_task ID %d\n", from_task);
-        return;
-    }
-
-    if (to_task < 0 || to_task >= next_task_id) {
-        fprintf(stderr, "[Runtime] ERROR: Invalid to_task ID %d\n", to_task);
-        return;
-    }
-
-    Task* from = &tasks[from_task];
-    Task* to = &tasks[to_task];
-
-    // Add to_task to from_task's fanout
-    if (from->fanout_count >= RUNTIME_MAX_FANOUT) {
-        fprintf(stderr, "[Runtime] ERROR: Fanout overflow for task %d (max=%d)\n", from_task, RUNTIME_MAX_FANOUT);
-        return;
-    }
-
-    from->fanout[from->fanout_count++] = to_task;
-    to->fanin++;
-}
-
-void Runtime::add_successor_conditional(int from_task, int to_task) {
-    // Validate task IDs
-    if (from_task < 0 || from_task >= next_task_id) {
-        fprintf(stderr, "[Runtime] ERROR: Invalid from_task ID %d\n", from_task);
-        return;
-    }
-
-    if (to_task < 0 || to_task >= next_task_id) {
-        fprintf(stderr, "[Runtime] ERROR: Invalid to_task ID %d\n", to_task);
-        return;
-    }
-
-    Task* from = &tasks[from_task];
-    Task* to = &tasks[to_task];
-
-    if (from->fanout_count >= RUNTIME_MAX_FANOUT) {
-        fprintf(stderr, "[Runtime] ERROR: Fanout overflow for task %d (max=%d)\n", from_task, RUNTIME_MAX_FANOUT);
-        return;
-    }
-
-    from->fanout[from->fanout_count++] = to_task;
-
-    // If predecessor is already completed, dependency is already satisfied.
-    if (from->completed.load(std::memory_order_acquire) == 0) {
-        to->fanin.fetch_add(1, std::memory_order_acq_rel);
-    }
-}
-
-// =============================================================================
-// Query Methods
-// =============================================================================
-
-Task* Runtime::get_task(int task_id) {
-    if (task_id < 0 || task_id >= next_task_id) {
-        return nullptr;
-    }
-    return &tasks[task_id];
-}
-
-int Runtime::get_task_count() const { return next_task_id; }
-
-int Runtime::get_initial_ready_tasks(int* ready_tasks) {
-    initial_ready_count = 0;
-    for (int i = 0; i < next_task_id; i++) {
-        if (tasks[i].fanin == 0) {
-            initial_ready_tasks[initial_ready_count] = i;
-            if (ready_tasks != nullptr) {
-                ready_tasks[initial_ready_count] = i;
-            }
-            initial_ready_count++;
-        }
-    }
-    return initial_ready_count;
-}
-
-// =============================================================================
-// Utility Methods
-// =============================================================================
-
-void Runtime::print_runtime() const {
-    printf(
-        "\n===================================================================="
-        "============\n");
-    printf("[Runtime] Task Runtime Status\n");
-    printf(
-        "======================================================================"
-        "==========\n");
-    printf("  Total tasks: %d\n", next_task_id);
-
-    // Print initially ready tasks
-    printf("\nInitially Ready Tasks (fanin==0):\n");
-    printf(
-        "----------------------------------------------------------------------"
-        "----------\n");
-    printf("  ");
-    int ready_count = 0;
-    for (int i = 0; i < next_task_id; i++) {
-        if (tasks[i].fanin.load() == 0) {
-            if (ready_count > 0) printf(", ");
-            printf("%d", i);
-            ready_count++;
-        }
-    }
-    if (ready_count == 0) {
-        printf("(none)");
-    }
-    printf("\n  Count: %d\n", ready_count);
-
-    printf("\nTask Table:\n");
-    printf(
-        "----------------------------------------------------------------------"
-        "----------\n");
-
-    for (int i = 0; i < next_task_id; i++) {
-        const Task* t = &tasks[i];
-
-        printf("  Task %d: func_id=%d, fanin=%d, fanout=%d, args=%d [",
-            i,
-            t->func_id,
-            t->fanin.load(),
-            t->fanout_count,
-            t->num_args);
-
-        // Print fanout list
-        for (int j = 0; j < t->fanout_count; j++) {
-            printf("%d%s", t->fanout[j], j < t->fanout_count - 1 ? "," : "");
-        }
-        printf("]\n");
-    }
-
-    printf(
-        "======================================================================"
-        "==========\n\n");
 }
 
 // =============================================================================
@@ -260,52 +58,156 @@ void Runtime::print_runtime() const {
 
 void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
     if (tensor_pair_count >= RUNTIME_MAX_TENSOR_PAIRS) {
-        fprintf(stderr, "[Runtime] ERROR: Tensor pairs full (max=%d)\n", RUNTIME_MAX_TENSOR_PAIRS);
+        LOG_ERROR("[Runtime] Tensor pairs full (max=%d)", RUNTIME_MAX_TENSOR_PAIRS);
         return;
     }
     tensor_pairs[tensor_pair_count].host_ptr = host_ptr;
     tensor_pairs[tensor_pair_count].dev_ptr = dev_ptr;
     tensor_pairs[tensor_pair_count].size = size;
     tensor_pair_count++;
-    printf("Recorded tensor pair: host=%p dev=%p size=%zu\n", host_ptr, dev_ptr, size);
+    LOG_INFO("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
 }
 
-void Runtime::record_device_alloc(void* dev_ptr) {
-    if (dev_ptr == nullptr) {
+TensorPair* Runtime::get_tensor_pairs() {
+    return tensor_pairs;
+}
+
+int Runtime::get_tensor_pair_count() const {
+    return tensor_pair_count;
+}
+
+void Runtime::clear_tensor_pairs() {
+    tensor_pair_count = 0;
+}
+
+// =============================================================================
+// Device orchestration
+// =============================================================================
+
+bool Runtime::get_orch_built_on_host() const { return orch_built_on_host_; }
+void* Runtime::get_pto2_gm_sm_ptr() const { return pto2_gm_sm_ptr_; }
+void* Runtime::get_pto2_gm_heap_ptr() const { return pto2_gm_heap_ptr_; }
+uint64_t* Runtime::get_orch_args() const {
+    // Return embedded storage directly (not the pointer) so device code gets correct device address
+    // When Runtime is copied to device memory, computing address relative to 'this' gives valid device address
+    return orch_arg_count_ > 0 ? const_cast<uint64_t*>(orch_args_storage_) : nullptr;
+}
+int Runtime::get_orch_arg_count() const { return orch_arg_count_; }
+void Runtime::set_orch_built_on_host(bool v) { orch_built_on_host_ = v; }
+void Runtime::set_pto2_gm_sm_ptr(void* p) { pto2_gm_sm_ptr_ = p; }
+void Runtime::set_pto2_gm_heap(void* p) { pto2_gm_heap_ptr_ = p; }
+void Runtime::set_pto2_slot_states_ptr(void* p) { pto2_slot_states_ptr_ = p; }
+void Runtime::set_orch_args(uint64_t* args, int count) {
+    orch_arg_count_ = count <= RUNTIME_MAX_ARGS ? count : RUNTIME_MAX_ARGS;
+    if (args && orch_arg_count_ > 0) {
+        memcpy(orch_args_storage_, args, (size_t)orch_arg_count_ * sizeof(uint64_t));
+        // Note: We no longer store orch_args_ pointer as it would contain host address
+        // get_orch_args() now computes address from embedded storage directly
+    }
+}
+
+// Device orchestration SO binary (for dlopen on AICPU thread 3)
+// Copies data to internal storage to avoid lifetime issues with Python ctypes arrays
+void Runtime::set_device_orch_so(const void* data, size_t size) {
+    if (data == nullptr || size == 0) {
+        device_orch_so_size_ = 0;
         return;
     }
-    for (int i = 0; i < device_alloc_count; ++i) {
-        if (device_allocs[i].dev_ptr == dev_ptr) {
-            return;
+    if (size > RUNTIME_MAX_ORCH_SO_SIZE) {
+        LOG_ERROR("[Runtime] Orchestration SO too large (%zu > %d)", size, RUNTIME_MAX_ORCH_SO_SIZE);
+        device_orch_so_size_ = 0;
+        return;
+    }
+    memcpy(device_orch_so_storage_, data, size);
+    device_orch_so_size_ = size;
+}
+
+const void* Runtime::get_device_orch_so_data() const {
+    return device_orch_so_size_ > 0 ? device_orch_so_storage_ : nullptr;
+}
+
+size_t Runtime::get_device_orch_so_size() const {
+    return device_orch_so_size_;
+}
+
+uint64_t Runtime::get_function_bin_addr(int func_id) const {
+    if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
+    return func_id_to_addr_[func_id];
+}
+
+void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
+    if (func_id >= 0 && func_id < RUNTIME_MAX_FUNC_ID) {
+        func_id_to_addr_[func_id] = addr;
+        if (addr != 0 && registered_kernel_count_ < RUNTIME_MAX_FUNC_ID) {
+            registered_kernel_func_ids_[registered_kernel_count_++] = func_id;
         }
     }
-    if (device_alloc_count >= RUNTIME_MAX_TENSOR_PAIRS) {
-        fprintf(stderr, "[Runtime] ERROR: Device allocs full (max=%d)\n", RUNTIME_MAX_TENSOR_PAIRS);
-        return;
-    }
-    device_allocs[device_alloc_count].dev_ptr = dev_ptr;
-    device_alloc_count++;
 }
 
-TensorPair* Runtime::get_tensor_pairs() { return tensor_pairs; }
+int Runtime::get_registered_kernel_count() const {
+    return registered_kernel_count_;
+}
 
-int Runtime::get_tensor_pair_count() const { return tensor_pair_count; }
+int Runtime::get_registered_kernel_func_id(int index) const {
+    if (index < 0 || index >= registered_kernel_count_) return -1;
+    return registered_kernel_func_ids_[index];
+}
 
-DeviceAlloc* Runtime::get_device_allocs() { return device_allocs; }
-
-int Runtime::get_device_alloc_count() const { return device_alloc_count; }
-
-void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }
-
-void Runtime::clear_device_allocs() { device_alloc_count = 0; }
+void Runtime::clear_registered_kernels() {
+    registered_kernel_count_ = 0;
+}
 
 // =============================================================================
 // Performance Profiling
 // =============================================================================
 
 void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
-    // No-op for aicpu_build_graph.
-    // Task graph is managed by AICPU orchestration plugin, which handles
-    // performance record completion.
-    (void)perf_buf;
+    // Get PTO2 shared memory context
+    void* sm_base = get_pto2_gm_sm_ptr();
+    if (sm_base == nullptr) {
+        // No PTO2 context, cannot complete records
+        return;
+    }
+
+    // Get slot states for fanout traversal
+    // With multi-ring, slot_states are per-ring inside the scheduler and
+    // pto2_slot_states_ptr_ is nullptr. Fanout and ring_id are filled on the
+    // AICPU side (aicpu_executor.cpp) where slot_state is directly available.
+    PTO2TaskSlotState* slot_states = static_cast<PTO2TaskSlotState*>(pto2_slot_states_ptr_);
+    if (slot_states == nullptr) {
+        return;
+    }
+
+    // Get window mask from shared memory header (ring 0 for legacy single-ring path)
+    PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
+    int32_t window_mask = static_cast<int32_t>(header->rings[0].task_window_size) - 1;
+
+    uint32_t count = perf_buf->count;
+
+    for (uint32_t i = 0; i < count; i++) {
+        PerfRecord* record = &perf_buf->records[i];
+        int32_t task_id = record->task_id;
+
+        // Get slot state for fanout traversal
+        int32_t slot = task_id & window_mask;
+        PTO2TaskSlotState& ss = slot_states[slot];
+
+        // Fill fanout information by traversing the linked list
+        record->fanout_count = 0;
+        PTO2DepListEntry* cur = ss.fanout_head;
+
+        while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
+            // PerfRecord.fanout stores 32-bit legacy task IDs. Our multi-ring task ID
+            // encodes ring_id in the upper 32 bits, so only the legacy single-ring
+            // case (ring_id==0) is representable here.
+            uint64_t mixed = pto2_task_id_raw(cur->slot_state->task->mixed_task_id);
+            if ((mixed >> 32) != 0) {
+                // Skip: cannot represent (ring_id, local_id) in a 32-bit fanout slot.
+                cur = cur->next;
+                continue;
+            }
+            record->fanout[record->fanout_count++] = static_cast<int32_t>(mixed & 0xFFFFFFFFu);
+            cur = cur->next;
+        }
+    }
 }

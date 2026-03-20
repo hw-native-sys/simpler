@@ -27,9 +27,33 @@ Accept PR number (`123`, `#123`) with optional benchmark arguments:
 /benchmark-pr 123 -d 4 -n 20
 ```
 
-Extra arguments (`-d`, `-n`, etc.) are forwarded to `tools/benchmark_rounds.sh`.
+Extra arguments (`-d`, `-n`, `-r`, etc.) are forwarded to `tools/benchmark_rounds.sh`.
 
 **Defaults** (when not specified): `-d 0 -n 10 -p a2a3`
+
+## Runtime Selection
+
+`tools/benchmark_rounds.sh` supports `-r <runtime>` to select which runtime to benchmark:
+- `tensormap_and_ringbuffer` (default when `-r` is omitted)
+- `aicpu_build_graph`
+
+Each runtime has its own example list defined at the top of the script (`TMR_EXAMPLE_CASES` / `ABG_EXAMPLE_CASES`).
+
+**Auto-detection:** Determine which runtimes are affected by the PR by checking the diff:
+
+```bash
+RUNTIMES_TO_BENCH=()
+
+# Always benchmark TMR (it's the primary runtime)
+RUNTIMES_TO_BENCH+=(tensormap_and_ringbuffer)
+
+# If PR touches aicpu_build_graph files, also benchmark that runtime
+if git diff --name-only "$MERGE_BASE"..."pr-$PR_NUMBER" | grep -q 'aicpu_build_graph'; then
+  RUNTIMES_TO_BENCH+=(aicpu_build_graph)
+fi
+```
+
+Run `benchmark_rounds.sh` once per runtime, with `-r <runtime>` appended to the args. Report results in separate tables per runtime.
 
 ## Step 1: Setup and PR Resolution
 
@@ -142,7 +166,10 @@ BENCH_PR="tmp/benchmark_pr_${TIMESTAMP}.txt"
 git checkout "$MERGE_BASE" --quiet
 
 echo "Running baseline benchmark at merge-base ($MERGE_BASE)..."
-./tools/benchmark_rounds.sh $BENCH_ARGS 2>&1 | tee "$BENCH_BASELINE"
+for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
+  echo "--- Runtime: $RUNTIME ---"
+  ./tools/benchmark_rounds.sh $BENCH_ARGS -r "$RUNTIME" 2>&1 | tee "${BENCH_BASELINE%.txt}_${RUNTIME}.txt"
+done
 ```
 
 Capture the output. Parse trimmed averages per example from the output for comparison.
@@ -153,7 +180,10 @@ Capture the output. Parse trimmed averages per example from the output for compa
 git checkout "pr-$PR_NUMBER" --quiet
 
 echo "Running PR benchmark at HEAD ($HEAD_SHA)..."
-./tools/benchmark_rounds.sh $BENCH_ARGS 2>&1 | tee "$BENCH_PR"
+for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
+  echo "--- Runtime: $RUNTIME ---"
+  ./tools/benchmark_rounds.sh $BENCH_ARGS -r "$RUNTIME" 2>&1 | tee "${BENCH_PR%.txt}_${RUNTIME}.txt"
+done
 ```
 
 ## Step 7: Restore Working State
@@ -172,17 +202,25 @@ git branch -D "pr-$PR_NUMBER" 2>/dev/null || true
 
 Parse both output files to extract per-example trimmed averages, then compute the delta.
 
-Present results as a table:
+Present results as a table, **grouped by runtime** when multiple runtimes are benchmarked:
 
 ```
 PR #123: <PR title>
 Merge-base: <short SHA>  →  PR HEAD: <short SHA>
 Benchmark args: -d 4 -n 20
 
+### tensormap_and_ringbuffer
+
 Example                     Baseline (us)   PR (us)   Delta (us)   Change (%)
 --------------------------  -------------   -------   ----------   ----------
 alternating_matmul_add         1240.1        1235.5       -4.6       -0.37%
 benchmark_bgemm                 890.3         892.1       +1.8       +0.20%
+...
+
+### aicpu_build_graph
+
+Example                     Baseline (us)   PR (us)   Delta (us)   Change (%)
+--------------------------  -------------   -------   ----------   ----------
 paged_attention_unroll/Case1   2100.0        2050.3      -49.7       -2.37%
 ...
 

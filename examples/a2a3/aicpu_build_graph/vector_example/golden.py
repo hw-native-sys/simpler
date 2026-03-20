@@ -5,7 +5,7 @@ Computation:
     f = (a + b + 1) * (a + b + 2)
     where a=2.0, b=3.0, so f=42.0
 
-Args layout: [ptr_a, ptr_b, ptr_f, SIZE]
+Args layout: [ptr_a, ptr_b, ptr_f, size_a, size_b, size_f, SIZE]
 """
 
 import ctypes
@@ -30,11 +30,14 @@ def generate_inputs(params: dict) -> list:
         ("a", a),
         ("b", b),
         ("f", f),
+        ("size_a", ctypes.c_int64(a.nbytes)),
+        ("size_b", ctypes.c_int64(b.nbytes)),
+        ("size_f", ctypes.c_int64(f.nbytes)),
         ("SIZE", ctypes.c_int64(SIZE)),
     ]
 
 
 def compute_golden(tensors: dict, params: dict) -> None:
-    a = tensors["a"]
-    b = tensors["b"]
+    a = torch.as_tensor(tensors["a"])
+    b = torch.as_tensor(tensors["b"])
     tensors["f"][:] = (a + b + 1) * (a + b + 2)

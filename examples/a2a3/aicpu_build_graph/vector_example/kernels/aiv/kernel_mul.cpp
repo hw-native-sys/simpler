@@ -5,9 +5,9 @@
  */
 
 #include <cstdint>
-// clang-format off
-#include <pto/pto-inst.hpp>          // defines CPU stubs (incl. __gm__) under __CPU_SIM
-// clang-format on
+#include <pto/pto-inst.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -19,13 +19,13 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-// `a2a3sim` loads per-kernel binaries via dlopen+dlsym("kernel_entry").
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
-    __gm__ float* src0 = reinterpret_cast<__gm__ float*>(args[0]);
-    __gm__ float* src1 = reinterpret_cast<__gm__ float*>(args[1]);
-    __gm__ float* out = reinterpret_cast<__gm__ float*>(args[2]);
-    int size = static_cast<int>(args[3]);
-    (void)size;
+    __gm__ Tensor* src0_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* src1_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* out_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ float* src0 = reinterpret_cast<__gm__ float*>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
+    __gm__ float* src1 = reinterpret_cast<__gm__ float*>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
+    __gm__ float* out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
     constexpr int kTRows_ = 128;
     constexpr int kTCols_ = 128;
@@ -56,4 +56,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(dstGlobal, dstTile);
+
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }

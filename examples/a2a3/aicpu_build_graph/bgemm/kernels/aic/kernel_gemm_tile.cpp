@@ -3,12 +3,19 @@
  *
  * Computes: output = input_a @ input_b (64x64 tile matmul)
  * Uses TMATMUL instruction
+ *
+ * Args (Tensor*):
+ *   args[0] = input_a (INPUT)
+ *   args[1] = input_b (INPUT)
+ *   args[2] = output  (OUTPUT)
  */
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 #include <pto/common/constants.hpp>
 #include <pto/common/pto_tile.hpp>
+
+#include "tensor.h"
 
 using namespace pto;
 
@@ -28,10 +35,14 @@ AICORE constexpr inline T CeilAlign(T num_1, T num_2) {
     return (num_1 + num_2 - 1) / num_2 * num_2;
 }
 
-extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
-    __gm__ float* input_a = reinterpret_cast<__gm__ float*>(args[0]);
-    __gm__ float* input_b = reinterpret_cast<__gm__ float*>(args[1]);
-    __gm__ float* output = reinterpret_cast<__gm__ float*>(args[2]);
+static __aicore__ void gemm_tile_impl(
+    __gm__ Tensor* input_a_tensor,
+    __gm__ Tensor* input_b_tensor,
+    __gm__ Tensor* output_tensor) {
+
+    __gm__ float* input_a = reinterpret_cast<__gm__ float*>(input_a_tensor->buffer.addr) + input_a_tensor->start_offset;
+    __gm__ float* input_b = reinterpret_cast<__gm__ float*>(input_b_tensor->buffer.addr) + input_b_tensor->start_offset;
+    __gm__ float* output  = reinterpret_cast<__gm__ float*>(output_tensor->buffer.addr)  + output_tensor->start_offset;
 
     constexpr int TILE = 64;
     constexpr int blockAlign = C0_SIZE_BYTE / sizeof(float);
@@ -87,4 +98,15 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
     TSTORE(dstGlobal, cTile);
+
+    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+}
+
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    __gm__ Tensor* input_a = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* input_b = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* output  = reinterpret_cast<__gm__ Tensor*>(args[2]);
+
+    gemm_tile_impl(input_a, input_b, output);
 }

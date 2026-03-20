@@ -1,7 +1,7 @@
 """
-Paged Attention — aicpu_build_graph Runtime
+Paged Attention Unroll — aicpu_build_graph Runtime
 
-Kernels and orchestration config for paged attention (per-block version).
+Kernels and orchestration config for paged attention with N_UNROLL=64.
 Uses explicit add_dependency for task ordering, scope-end batch publish.
 
 AIC Kernels (Cube):
