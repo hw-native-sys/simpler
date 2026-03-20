@@ -1754,14 +1754,14 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             DEV_ALWAYS("Thread %d: Calling aicpu_orchestration_entry from SO (orch_idx=%d/(0~%d))",
                        thread_idx, orch_idx, orch_thread_num_ - 1);
 #if PTO2_PROFILING
-            DEV_ALWAYS("Thread=%d orch_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             PTO2_SCOPE(rt) { orch_func_(rt, orch_args_cached_, orch_arg_count_cached_, orch_thread_num_, orch_idx); }
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
-            DEV_ALWAYS("Thread %d: aicpu_orchestration_entry returned, cost %.3fus (orch_idx=%d)",
-                thread_idx, cycles_to_us(orch_cycle_end - orch_cycle_start), orch_idx);
+            DEV_ALWAYS("Thread %d: orch_start=%llu orch_func_cost=%.3fus (orch_idx=%d)",
+                thread_idx, (unsigned long long)orch_cycle_start,
+                cycles_to_us(orch_cycle_end - orch_cycle_start), orch_idx);
 #endif
 
             // Print orchestrator profiling data
@@ -1884,10 +1884,12 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     // Compute new core assignments for all threads and initialize donated slots
                     DEV_INFO("Thread %d: Set orchestrator_done=true, requesting core transition", thread_idx);
 #if PTO2_PROFILING
-                    // Benchmark: record orchestrator end timestamp before waiting for schedulers
-                    DEV_ALWAYS("BENCHMARK: thread=%d end=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+                    uint64_t orch_stage_end_ts = get_sys_cnt_aicpu();
 #endif
                     transition_requested_.store(true, std::memory_order_release);
+#if PTO2_PROFILING
+                    DEV_ALWAYS("Thread %d: orch_stage_end=%llu", thread_idx, (unsigned long long)orch_stage_end_ts);
+#endif
 
                     // Wait for scheduler threads to acknowledge transition request
                     // All-orchestrator mode (sched_thread_num_ == 0): skip the wait
@@ -1952,10 +1954,9 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
         const int32_t* shutdown_cores = core_assignments_[thread_idx];
         int32_t shutdown_count = core_count_per_thread_[thread_idx];
 #if PTO2_PROFILING
-        // Benchmark: record scheduler end timestamp before shutdown cleanup
         if (shutdown_count > 0) {
-            DEV_ALWAYS("Thread=%d end=%llu",
-                       thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+            uint64_t sched_end_ts = get_sys_cnt_aicpu();
+            DEV_ALWAYS("Thread %d: sched_end=%llu", thread_idx, (unsigned long long)sched_end_ts);
         }
 #endif
         if (shutdown_count > 0) {
