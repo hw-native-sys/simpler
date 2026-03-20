@@ -34,6 +34,12 @@ int init_runtime_impl(Runtime* runtime,
                     const size_t* kernel_sizes,
                     int kernel_count);
 int validate_runtime_impl(Runtime* runtime);
+int reinit_runtime_impl(Runtime* runtime,
+                    uint64_t* func_args,
+                    int func_args_count,
+                    int* arg_types,
+                    uint64_t* arg_sizes);
+int validate_runtime_round_impl(Runtime* runtime);
 
 /* Forward declarations */
 void* device_malloc(size_t size);
@@ -197,6 +203,34 @@ int launch_runtime(RuntimeHandle runtime,
         Runtime* r = static_cast<Runtime*>(runtime);
         r->orch_thread_num = orch_thread_num;
         return runner.run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int reinit_runtime(RuntimeHandle runtime,
+                   uint64_t* func_args,
+                   int func_args_count,
+                   int* arg_types,
+                   uint64_t* arg_sizes) {
+    if (runtime == NULL) {
+        return -1;
+    }
+    try {
+        Runtime* r = static_cast<Runtime*>(runtime);
+        return reinit_runtime_impl(r, func_args, func_args_count, arg_types, arg_sizes);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int finalize_runtime_round(RuntimeHandle runtime) {
+    if (runtime == NULL) {
+        return -1;
+    }
+    try {
+        Runtime* r = static_cast<Runtime*>(runtime);
+        return validate_runtime_round_impl(r);
     } catch (...) {
         return -1;
     }
