@@ -82,18 +82,20 @@ target_link_directories(host_runtime
 )
 
 # Detect HCCL library version: CANN 9.x ships hccl_v2 instead of hccl
-find_library(HCCL_LIB NAMES hccl PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+# Prioritize hccl_v2 since CANN 9.x may have both hccl.so and hccl_v2.so,
+# and hccl_v2 is the complete, actively-maintained library.
 find_library(HCCL_V2_LIB NAMES hccl_v2 PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+find_library(HCCL_LIB NAMES hccl PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
 
-if(HCCL_LIB)
-    set(HCCL_LINK_TARGETS hccl)
-    message(STATUS "Using HCCL library: hccl")
-elseif(HCCL_V2_LIB)
+if(HCCL_V2_LIB)
     set(HCCL_LINK_TARGETS hccl_v2 hccl_plf)
     target_compile_definitions(host_runtime PRIVATE HCCL_USE_V2_API=1)
     message(STATUS "Using HCCL library: hccl_v2 + hccl_plf (CANN 9.x)")
+elseif(HCCL_LIB)
+    set(HCCL_LINK_TARGETS hccl)
+    message(STATUS "Using HCCL library: hccl")
 else()
-    message(WARNING "Neither hccl nor hccl_v2 found, linking against hccl and hoping for the best")
+    message(WARNING "Neither hccl_v2 nor hccl found, linking against hccl and hoping for the best")
     set(HCCL_LINK_TARGETS hccl)
 endif()
 
