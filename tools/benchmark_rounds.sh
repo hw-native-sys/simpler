@@ -128,6 +128,13 @@ vlog() {
 # ---------------------------------------------------------------------------
 EXAMPLES_DIR="$PROJECT_ROOT/tests/device_tests/${PLATFORM}/${RUNTIME}"
 
+# Clock frequency (MHz) for converting cycle counts to microseconds
+case "$PLATFORM" in
+    a2a3) FREQ=50 ;;
+    a5)   FREQ=1000 ;;
+    *)    echo "ERROR: unsupported platform '$PLATFORM'. Use a2a3 or a5."; exit 1 ;;
+esac
+
 # Select example cases and order based on runtime
 case "$RUNTIME" in
     tensormap_and_ringbuffer)
@@ -172,7 +179,7 @@ parse_timing() {
         return 1
     fi
 
-    echo "$timing" | awk '
+    echo "$timing" | awk -v freq="$FREQ" '
     function new_round() {
         flush_round()
         round++
@@ -184,11 +191,11 @@ parse_timing() {
     }
     function flush_round() {
         if (round >= 0 && max_end > 0 && min_start > 0) {
-            results[round] = (max_end - min_start) / 50.0
+            results[round] = (max_end - min_start) / freq
             if (max_sched_end > 0 && min_sched_start > 0)
-                sched_results[round] = (max_sched_end - min_sched_start) / 50.0
+                sched_results[round] = (max_sched_end - min_sched_start) / freq
             if (max_orch_end > 0 && min_orch_start > 0)
-                orch_results[round] = (max_orch_end - min_orch_start) / 50.0
+                orch_results[round] = (max_orch_end - min_orch_start) / freq
             count++
         }
     }
