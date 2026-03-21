@@ -52,7 +52,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
 
     void* dev_A = (void*)(uintptr_t)args[ARG_PTR_A];
@@ -75,8 +75,8 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     int matmul_batch = (int)config[3];
     int add_batch = (int)config[4];
 
-    LOG_ALWAYS(rt, "[alternating_orch] thread num: %d, idx: %d", orch_thread_num, orch_thread_index);
-    LOG_INFO(rt, "[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d",
+    LOG_ALWAYS("[alternating_orch] thread num: %d, idx: %d", orch_thread_num, orch_thread_index);
+    LOG_INFO("[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d",
              batch, M, N, matmul_batch, add_batch);
 
     int total_matmul_tasks = batch * M;
@@ -121,7 +121,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             params_matmul.add_input(A_view);
             params_matmul.add_input(B_view);
             params_matmul.add_output(C_view);
-            pto2_rt_submit_aic_task(rt, FUNC_MATMUL, params_matmul);
+            pto2_rt_submit_aic_task(FUNC_MATMUL, params_matmul);
             total_matmul++;
         }
 
@@ -141,12 +141,12 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             params_add.add_input(X_view);
             params_add.add_input(Y_view);
             params_add.add_output(Z_view);
-            pto2_rt_submit_aiv_task(rt, FUNC_ADD, params_add);
+            pto2_rt_submit_aiv_task(FUNC_ADD, params_add);
             total_add++;
         }
     }
 
-    LOG_ALWAYS(rt, "[alternating_orch] Submitted %d matmul groups and %d add groups",
+    LOG_ALWAYS("[alternating_orch] Submitted %d matmul groups and %d add groups",
              total_matmul, total_add);
 }
 

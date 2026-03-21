@@ -46,9 +46,11 @@
 #endif
 
 // Device orchestration function signature (loaded via dlopen).
-// The orchestration .so receives a PTO2Runtime* (with ops table populated)
-// instead of a raw shared-memory pointer.
-typedef void (*DeviceOrchestrationFunc)(PTO2Runtime* rt, uint64_t* args, int32_t arg_count, int32_t orch_thread_num, int32_t orch_thread_index);
+// The executor binds the current thread's PTO2Runtime into orchestration TLS
+// before calling the user entry.
+typedef void (*DeviceOrchestrationFunc)(uint64_t* args, int32_t arg_count,
+                                        int32_t orch_thread_num, int32_t orch_thread_index);
+typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime* rt);
 
 // Config function exported by orchestration .so
 typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(uint64_t* args, int32_t arg_count);
@@ -223,6 +225,7 @@ struct AicpuExecutor {
 
     // Shared orchestration function pointer (loaded by first orch thread, used by all)
     DeviceOrchestrationFunc orch_func_{nullptr};
+    DeviceOrchestrationBindRuntimeFunc orch_bind_runtime_{nullptr};
     uint64_t* orch_args_cached_{nullptr};
     int32_t orch_arg_count_cached_{0};
 
@@ -1653,6 +1656,16 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     return -1;
                 }
 
+                dlerror();
+                auto bind_runtime_func = reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(
+                    dlsym(handle, "pto2_framework_bind_runtime"));
+                const char* bind_runtime_error = dlerror();
+                if (bind_runtime_error != nullptr) {
+                    DEV_INFO("Thread %d: Optional TLS runtime binder not found: %s",
+                             thread_idx, bind_runtime_error);
+                    bind_runtime_func = nullptr;
+                }
+
                 uint64_t* args = runtime->get_orch_args();
                 int32_t arg_count = runtime->get_orch_arg_count();
                 DEV_INFO("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_pto2_gm_sm_ptr(), arg_count);
@@ -1728,6 +1741,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
 
                 // Store shared state for other orchestrator threads
                 orch_func_ = orch_func;
+                orch_bind_runtime_ = bind_runtime_func;
                 orch_args_cached_ = args;
                 orch_arg_count_cached_ = arg_count;
                 orch_so_handle_ = handle;
@@ -1773,7 +1787,15 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
 #if PTO2_PROFILING
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
 #endif
-            PTO2_SCOPE(rt) { orch_func_(rt, orch_args_cached_, orch_arg_count_cached_, orch_thread_num_, orch_idx); }
+            if (orch_bind_runtime_ != nullptr) {
+                orch_bind_runtime_(rt);
+            }
+            pto2_rt_scope_begin(rt);
+            orch_func_(orch_args_cached_, orch_arg_count_cached_, orch_thread_num_, orch_idx);
+            pto2_rt_scope_end(rt);
+            if (orch_bind_runtime_ != nullptr) {
+                orch_bind_runtime_(nullptr);
+            }
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             DEV_ALWAYS("Thread %d: orch_start=%llu orch_func_cost=%.3fus (orch_idx=%d)",
@@ -2072,6 +2094,12 @@ void AicpuExecutor::deinit(Runtime* runtime) {
         executing_reg_task_ids_[i] = AICPU_TASK_INVALID;
     }
     regs_ = 0;
+    orch_func_ = nullptr;
+    orch_bind_runtime_ = nullptr;
+    orch_args_cached_ = nullptr;
+    orch_arg_count_cached_ = 0;
+    orch_so_handle_ = nullptr;
+    orch_so_path_[0] = '\0';
 
     // Clear file-scope PTO2Runtime pointer (freed by orchestrator thread before deinit)
     rt = nullptr;

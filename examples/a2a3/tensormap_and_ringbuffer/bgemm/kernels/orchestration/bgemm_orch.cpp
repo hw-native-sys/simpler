@@ -62,7 +62,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
     (void)orch_thread_num;
     (void)orch_thread_index;
@@ -74,7 +74,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     size_t size_B = (size_t)args[ARG_SIZE_B];
     size_t size_C = (size_t)args[ARG_SIZE_C];
 
-    LOG_INFO(rt, "[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d",
+    LOG_INFO("[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d",
                   GRID_M, GRID_K, GRID_N, BATCH, TILE);
 
     // Create 1D external tensors for the full A, B, C arrays
@@ -90,7 +90,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     for (int batch = 0; batch < BATCH; batch++) {
         for (int m_idx = 0; m_idx < GRID_M; m_idx++) {
             for (int n_idx = 0; n_idx < GRID_N; n_idx++) {
-                PTO2_SCOPE(rt) {
+                PTO2_SCOPE() {
                     uint32_t c_elem_offset =
                         ((uint32_t)batch * GRID_M * GRID_N +
                          (uint32_t)m_idx * GRID_N +
@@ -119,14 +119,14 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                         params_gemm.add_input(A_view);
                         params_gemm.add_input(B_view);
                         params_gemm.add_output(P);
-                        pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE,
+                        pto2_rt_submit_aic_task(FUNC_GEMM_TILE,
                                            params_gemm); // gemm
 
                         // C[m,n] += P
                         PTOParam params_add;
                         params_add.add_inout(C_view);
                         params_add.add_input(P);
-                        pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD,
+                        pto2_rt_submit_aiv_task(FUNC_TILE_ADD,
                                            params_add); // add
                     }
                 }
@@ -134,7 +134,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
         }
     }
 
-    LOG_INFO(rt, "[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each",
+    LOG_INFO("[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each",
                   BATCH, GRID_M, GRID_N, GRID_K);
 }
 

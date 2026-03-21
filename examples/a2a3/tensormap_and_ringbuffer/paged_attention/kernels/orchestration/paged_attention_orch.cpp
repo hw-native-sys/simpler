@@ -52,12 +52,12 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 /**
- * Orchestration entry — receives a PTO2Runtime* with ops table populated.
+ * Orchestration entry — runtime is bound implicitly by the framework.
  * The executor wraps this call in PTO2_SCOPE, so we are already inside
  * the outer scope on entry.
  */
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
 
     // Extract device pointers (first 7)
@@ -97,7 +97,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     uint64_t b_start = batch * orch_thread_index / orch_thread_num;
     uint64_t b_end = batch * (orch_thread_index + 1) / orch_thread_num;
 
-    LOG_INFO(rt, "orch_idx=%d/%d batch=%lu b_range=[%lu,%lu)",
+    LOG_INFO("orch_idx=%d/%d batch=%lu b_range=[%lu,%lu)",
              orch_thread_index, orch_thread_num,
              (unsigned long)batch, (unsigned long)b_start, (unsigned long)b_end);
 
@@ -111,16 +111,16 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     Tensor key_cache = make_tensor_external(host_key_cache, key_cache_shapes, 2, data_type);
     Tensor value_cache = make_tensor_external(host_value_cache, value_cache_shapes, 2, data_type);
     Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
-    LOG_DEBUG(rt, "query=%s", query.dump().c_str());
-    LOG_DEBUG(rt, "key_cache=%s", key_cache.dump().c_str());
-    LOG_DEBUG(rt, "value_cache=%s", value_cache.dump().c_str());
-    LOG_DEBUG(rt, "out=%s", out.dump().c_str());
+    LOG_DEBUG("query=%s", query.dump().c_str());
+    LOG_DEBUG("key_cache=%s", key_cache.dump().c_str());
+    LOG_DEBUG("value_cache=%s", value_cache.dump().c_str());
+    LOG_DEBUG("out=%s", out.dump().c_str());
 
     for (uint64_t b_idx = b_start; b_idx < b_end; b_idx++) {
         uint64_t cur_seq = host_context_lens[b_idx];
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
-            PTO2_SCOPE(rt) {
+            PTO2_SCOPE() {
                 uint32_t cur_offset = (uint32_t)(b_idx * q_head_num + q_idx * q_tile);
                 uint32_t oi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                 uint32_t li_shapes[1] = {(uint32_t)q_tile};
@@ -140,7 +140,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 params_inplace.add_output(oi);
                 params_inplace.add_output(li_update);
                 params_inplace.add_output(mi_update);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace); // create_inplace
+                pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace); // create_inplace
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
@@ -158,7 +158,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     params_qk.add_input(qi);
                     params_qk.add_input(kj);
                     params_qk.add_output(sij);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk); // c1
+                    pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk); // c1
 
                     uint32_t sij_valid_shapes[2] = {(uint32_t)q_tile, (uint32_t)valid_len};
                     uint32_t sij_valid_offsets[2] = {0, 0};
@@ -171,7 +171,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     params_sf.add_output(mi);
                     params_sf.add_output(li);
                     params_sf.add_scalar(float_to_u64(scale_value));
-                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf); // v1
+                    pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf); // v1
 
                     uint32_t oi_tmp_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                     Tensor oi_tmp = make_tensor(oi_tmp_shapes, 2, DataType::FLOAT32);
@@ -180,7 +180,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(oi_tmp);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv); // c2
+                    pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv); // c2
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
@@ -195,13 +195,13 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     params_up.add_output(out_view);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
-                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up); // v2
+                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up); // v2
                 }
             }
         }
     }
 
-    LOG_INFO(rt, "orch_idx=%d: tasks submitted for batch=[%lu,%lu), num_heads=%lu",
+    LOG_INFO("orch_idx=%d: tasks submitted for batch=[%lu,%lu), num_heads=%lu",
                   orch_thread_index, (unsigned long)b_start, (unsigned long)b_end,
                   (unsigned long)num_heads);
 }

@@ -61,7 +61,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
 
     void* host_query = (void*)(uintptr_t)args[0];
@@ -88,7 +88,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     DataType data_type = DataType::FLOAT16;
     uint64_t elem_size = get_element_size(data_type);
 
-    LOG_INFO(rt, "batch_paged_attention: batch=%lu, num_heads=%lu",
+    LOG_INFO("batch_paged_attention: batch=%lu, num_heads=%lu",
              (unsigned long)batch, (unsigned long)num_heads);
 
     uint64_t max_bn = 0;
@@ -123,7 +123,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
             if (chunk_bc > IN_CORE_BATCH) chunk_bc = IN_CORE_BATCH;
             uint64_t batch_start = chunk_idx * IN_CORE_BATCH;
 
-            PTO2_SCOPE(rt) {
+            PTO2_SCOPE() {
                 uint32_t oi_acc_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)head_dim};
                 uint32_t scalar_acc_shapes[1] = {(uint32_t)(chunk_bc * q_tile)};
                 Tensor oi_batch = make_tensor(oi_acc_shapes, 2, DataType::FLOAT32);
@@ -134,7 +134,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 params_hub.add_output(oi_batch);
                 params_hub.add_output(li_batch);
                 params_hub.add_output(mi_batch);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_hub);
+                pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_hub);
 
                 for (uint64_t bn = 0; bn < max_bn; bn++) {
                     uint32_t sij_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)block_size};
@@ -158,7 +158,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     params_qk.add_scalar(block_num);
                     params_qk.add_scalar(num_heads);
                     params_qk.add_scalar(batch_start);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);
+                    pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
 
                     PTOParam params_sf;
                     params_sf.add_input(sij_b);
@@ -170,7 +170,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     params_sf.add_scalar(chunk_bc);
                     params_sf.add_scalar(bn);
                     params_sf.add_scalar(batch_start);
-                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf);
+                    pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
 
                     PTOParam params_pv;
                     params_pv.add_input(pij_b);
@@ -181,7 +181,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     params_pv.add_scalar(bn);
                     params_pv.add_scalar(block_num);
                     params_pv.add_scalar(batch_start);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);
+                    pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == max_bn - 1) ? 1 : 0;
@@ -199,13 +199,13 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                     params_up.add_scalar(q_offset);
                     params_up.add_scalar(num_heads);
                     params_up.add_scalar(batch_start);
-                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up);
+                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
                 }
             }
         }
     }
 
-    LOG_INFO(rt, "batch_paged_attention: %lu tasks (batch=%lu, max_bn=%lu, chunks=%lu, IN_CORE_BATCH=%lu)",
+    LOG_INFO("batch_paged_attention: %lu tasks (batch=%lu, max_bn=%lu, chunks=%lu, IN_CORE_BATCH=%lu)",
              (unsigned long)(num_chunks * (1 + max_bn * 4)),
              (unsigned long)batch, (unsigned long)max_bn,
              (unsigned long)num_chunks, (unsigned long)IN_CORE_BATCH);

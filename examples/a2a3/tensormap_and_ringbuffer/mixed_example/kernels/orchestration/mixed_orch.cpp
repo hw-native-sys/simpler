@@ -75,7 +75,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
     (void)orch_thread_num;
     (void)orch_thread_index;
@@ -99,7 +99,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
 
     int num_iters = (int)(size_C / (TILE_ELEMS * sizeof(float)));
 
-    LOG_INFO(rt, "[mixed_orch] num_iters=%d", num_iters);
+    LOG_INFO("[mixed_orch] num_iters=%d", num_iters);
 
     // Input tensors (shared across all tasks)
     uint32_t ab_shapes[1] = {TILE_ELEMS};
@@ -127,7 +127,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
     Tensor ext_O = make_tensor_external(dev_O, out_shapes, 1, DataType::FLOAT32);
 
     for (int i = 0; i < num_iters; i++) {
-        PTO2_SCOPE(rt) {
+        PTO2_SCOPE() {
             uint32_t view_shapes[1] = {TILE_ELEMS};
             uint32_t view_offsets[1] = {(uint32_t)i * TILE_ELEMS};
 
@@ -157,7 +157,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 params.add_input(ext_G);
                 params.add_input(ext_H);
                 params.add_output(I_view);
-                pto2_rt_submit_task(rt, mk, params);
+                pto2_rt_submit_task(mk, params);
             }
 
             // 2. AIC_ONLY: standalone matmul
@@ -166,7 +166,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 params.add_input(ext_A);
                 params.add_input(ext_B);
                 params.add_output(J_view);
-                pto2_rt_submit_aic_task(rt, FUNC_MATMUL, params);
+                pto2_rt_submit_aic_task(FUNC_MATMUL, params);
             }
 
             // 3. AIV_X1: standalone add
@@ -175,7 +175,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 params.add_input(ext_D);
                 params.add_input(ext_E);
                 params.add_output(K_view);
-                pto2_rt_submit_aiv_task(rt, FUNC_ADD_STANDALONE, params);
+                pto2_rt_submit_aiv_task(FUNC_ADD_STANDALONE, params);
             }
 
             // 4. AIV_X2: add (AIV0) + mul (AIV1)
@@ -190,7 +190,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 params.add_input(ext_G);
                 params.add_input(ext_H);
                 params.add_output(M_view);
-                pto2_rt_submit_task(rt, mk, params);
+                pto2_rt_submit_task(mk, params);
             }
 
             // 5. AIC_AIV_X1: matmul (AIC) + add (AIV0)
@@ -205,12 +205,12 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, i
                 params.add_input(ext_D);
                 params.add_input(ext_E);
                 params.add_output(O_view);
-                pto2_rt_submit_task(rt, mk, params);
+                pto2_rt_submit_task(mk, params);
             }
         }
     }
 
-    LOG_INFO(rt, "[mixed_orch] Submitted %d iterations x 5 shapes = %d tasks", num_iters, num_iters * 5);
+    LOG_INFO("[mixed_orch] Submitted %d iterations x 5 shapes = %d tasks", num_iters, num_iters * 5);
 }
 
 }  // extern "C"

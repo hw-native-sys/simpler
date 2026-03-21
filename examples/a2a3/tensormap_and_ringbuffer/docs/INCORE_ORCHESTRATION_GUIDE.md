@@ -12,7 +12,7 @@ Your orchestration shared object must export:
 
 ```cpp
 extern "C" PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count);
-extern "C" void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count);
+extern "C" void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index);
 ```
 
 Both symbols are loaded by AICPU via `dlopen` in `src/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp`.

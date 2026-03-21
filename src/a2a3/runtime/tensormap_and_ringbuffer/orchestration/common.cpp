@@ -1,4 +1,5 @@
 #include "common.h"
+#include "pto_orchestration_api.h"
 
 #ifdef __linux__
 #include <cxxabi.h>
@@ -10,6 +11,22 @@
 #include <cstring>
 #include <vector>
 #endif
+
+struct PTO2Runtime;
+
+namespace {
+thread_local PTO2Runtime* g_pto2_current_runtime = nullptr;
+}
+
+extern "C" __attribute__((visibility("default"))) void pto2_framework_bind_runtime(PTO2Runtime* rt) {
+    g_pto2_current_runtime = rt;
+}
+
+// Keep current_runtime local to this .so so orchestration helpers do not
+// accidentally bind to the AICPU binary's same-named symbol.
+extern "C" __attribute__((visibility("hidden"))) PTO2Runtime* pto2_framework_current_runtime() {
+    return g_pto2_current_runtime;
+}
 
 /**
  * 使用 addr2line 将地址转换为 文件:行号 信息
@@ -77,7 +94,7 @@ std::string get_stacktrace(int skip_frames) {
     char** symbols = backtrace_symbols(buffer, nframes);
 
     if (symbols) {
-        result = "调用栈:\n";
+        result = "Stack trace:\n";
         for (int i = skip_frames; i < nframes; i++) {
             std::string frame_info;
 
@@ -132,8 +149,8 @@ std::string get_stacktrace(int skip_frames) {
 
 // AssertionError 构造函数
 static std::string build_assert_message(const char* condition, const char* file, int line) {
-    std::string msg = "断言失败: " + std::string(condition) + "\n";
-    msg += "  位置: " + std::string(file) + ":" + std::to_string(line) + "\n";
+    std::string msg = "Assertion failed: " + std::string(condition) + "\n";
+    msg += "  Location: " + std::string(file) + ":" + std::to_string(line) + "\n";
     msg += get_stacktrace(3);
     return msg;
 }
@@ -143,12 +160,11 @@ AssertionError::AssertionError(const char* condition, const char* file, int line
       condition_(condition), file_(file), line_(line) {}
 
 [[noreturn]] void assert_impl(const char* condition, const char* file, int line) {
-    fprintf(stderr, "\n========================================\n");
-    fprintf(stderr, "断言失败: %s\n", condition);
-    fprintf(stderr, "位置: %s:%d\n", file, line);
-    fprintf(stderr, "%s", get_stacktrace(2).c_str());
-    fprintf(stderr, "========================================\n\n");
-    fflush(stderr);
+    LOG_ERROR("\n========================================");
+    LOG_ERROR("Assertion failed: %s", condition);
+    LOG_ERROR("Location: %s:%d", file, line);
+    LOG_ERROR("%s", get_stacktrace(2).c_str());
+    LOG_ERROR("========================================\n");
 
     throw AssertionError(condition, file, line);
 }

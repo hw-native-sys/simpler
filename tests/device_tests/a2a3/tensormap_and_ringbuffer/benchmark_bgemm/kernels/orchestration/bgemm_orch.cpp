@@ -54,8 +54,10 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
+void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
+    (void)orch_thread_num;
+    (void)orch_thread_index;
 
     void* dev_A = (void*)(uintptr_t)args[ARG_PTR_A];
     void* dev_B = (void*)(uintptr_t)args[ARG_PTR_B];
@@ -76,7 +78,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     int grid_m = 1;
     int grid_n = 1;
 
-    LOG_INFO(rt, "[bgemm_orch] tile_size: %d, grid_m: %d, grid_n: %d, grid_k: %d, num_groups: %d, incore_loop: %d",
+    LOG_INFO("[bgemm_orch] tile_size: %d, grid_m: %d, grid_n: %d, grid_k: %d, num_groups: %d, incore_loop: %d",
              tile_size, grid_m, grid_n, grid_k, num_groups, incore_loop);
 
     // Create 1D external tensors for the full A, B, C arrays
@@ -101,7 +103,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
     // A/B layout: [num_groups, grid_k, incore_loop, tile_size, tile_size]
     // C layout:   [incore_loop * num_groups, tile_size, tile_size]
     for (int group_idx = 0; group_idx < num_groups; group_idx++) {
-        PTO2_SCOPE_GUARD(rt);
+        PTO2_SCOPE_GUARD();
 
         uint32_t c_elem_offset = (uint32_t)((uint64_t)group_idx * group_tile_elems);
         uint32_t c_view_offsets[1] = {c_elem_offset};
@@ -124,19 +126,19 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
             params_gemm.add_input(B_view);
             params_gemm.add_output(P);
             params_gemm.add_input(ext_config);
-            pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE, params_gemm);
+            pto2_rt_submit_aic_task(FUNC_GEMM_TILE, params_gemm);
             total_gemm++;
 
             PTOParam params_add;
             params_add.add_inout(C_view);
             params_add.add_input(P);
             params_add.add_input(ext_config);
-            pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD, params_add);
+            pto2_rt_submit_aiv_task(FUNC_TILE_ADD, params_add);
             total_add++;
         }
     }
 
-    LOG_INFO(rt, "[bgemm_orch] Submitted %d gemm tasks and %d add tasks (%d total)",
+    LOG_INFO("[bgemm_orch] Submitted %d gemm tasks and %d add tasks (%d total)",
              total_gemm, total_add, total_gemm + total_add);
 }
 

@@ -77,7 +77,7 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 #ifdef ENABLE_PROFILING
@@ -163,7 +163,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
         }
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
             CYCLE_COUNT_LAP(prof_scope_and_loop);
-            PTO2_SCOPE(rt) {
+            PTO2_SCOPE() {
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
 
                 uint32_t oi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
@@ -192,7 +192,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 params_inplace.add_output(li_update);
                 params_inplace.add_output(mi_update);
                 CYCLE_COUNT_LAP(prof_param_setup);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace);
+                pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace);
 #ifdef ENABLE_PROFILING
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
@@ -225,7 +225,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_qk.add_scalar(n_blocks);
                     params_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);
+                    pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -250,7 +250,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_sf.add_scalar(n_blocks);
                     params_sf.add_scalar(valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf);
+                    pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -271,7 +271,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_pv.add_scalar(n_blocks);
                     params_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);
+                    pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -292,7 +292,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up);
+                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -308,25 +308,25 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     uint64_t total = prof_param_extract + prof_ext_tensor + prof_make_tensor +
                      prof_tensor_view + prof_param_setup + prof_submit_task +
                      prof_scope_and_loop;
-    LOG_ALWAYS(rt, "=== PagedAttn Orch Profiling: %d submits, %d makes, %d views, total=%.3fus ===",
+    LOG_ALWAYS("=== PagedAttn Orch Profiling: %d submits, %d makes, %d views, total=%.3fus ===",
         prof_submit_count, prof_make_count, prof_view_count, cycles_to_us(total));
     if (total > 0) {
-        LOG_ALWAYS(rt, "  param_extract    : %7.3fus (%5.1f%%)",
+        LOG_ALWAYS("  param_extract    : %7.3fus (%5.1f%%)",
             cycles_to_us(prof_param_extract), prof_param_extract * 100.0 / total);
-        LOG_ALWAYS(rt, "  ext_tensor(x4)   : %7.3fus (%5.1f%%)",
+        LOG_ALWAYS("  ext_tensor(x4)   : %7.3fus (%5.1f%%)",
             cycles_to_us(prof_ext_tensor), prof_ext_tensor * 100.0 / total);
-        LOG_ALWAYS(rt, "  make_tensor(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
+        LOG_ALWAYS("  make_tensor(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_make_count, cycles_to_us(prof_make_tensor), prof_make_tensor * 100.0 / total,
             prof_make_count > 0 ? cycles_to_us(prof_make_tensor) / prof_make_count : 0.0);
-        LOG_ALWAYS(rt, "  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
+        LOG_ALWAYS("  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_view_count, cycles_to_us(prof_tensor_view), prof_tensor_view * 100.0 / total,
             prof_view_count > 0 ? cycles_to_us(prof_tensor_view) / prof_view_count : 0.0);
-        LOG_ALWAYS(rt, "  param_setup      : %7.3fus (%5.1f%%)",
+        LOG_ALWAYS("  param_setup      : %7.3fus (%5.1f%%)",
             cycles_to_us(prof_param_setup), prof_param_setup * 100.0 / total);
-        LOG_ALWAYS(rt, "  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
+        LOG_ALWAYS("  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_submit_count, cycles_to_us(prof_submit_task), prof_submit_task * 100.0 / total,
             prof_submit_count > 0 ? cycles_to_us(prof_submit_task) / prof_submit_count : 0.0);
-        LOG_ALWAYS(rt, "  scope_and_loop   : %7.3fus (%5.1f%%)",
+        LOG_ALWAYS("  scope_and_loop   : %7.3fus (%5.1f%%)",
             cycles_to_us(prof_scope_and_loop), prof_scope_and_loop * 100.0 / total);
     }
 #endif

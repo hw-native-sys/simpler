@@ -608,7 +608,7 @@ Each orchestration `.so` must export:
 
 ```cpp
 extern "C" PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count);
-extern "C" void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count);
+extern "C" void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index);
 ```
 
 ---
@@ -641,11 +641,11 @@ RUNTIME_CONFIG = {
 ### 12.2 Orchestration Structure
 
 ```cpp
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
+void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     // Unpack args: query, key_cache, value_cache, block_table, context_lens, out, config
     for (q_idx = 0; q_idx < q_loop; q_idx++) {
         for (batch_start = 0; batch_start < batch; batch_start += IN_CORE_BATCH) {
-            PTO2_SCOPE(rt) {
+            PTO2_SCOPE() {
                 // Allocate accumulator tensors (oi, li, mi) via make_tensor()
                 // Submit AIV_HUB to initialize accumulators
                 for (bn = 0; bn < max_bn; bn++) {

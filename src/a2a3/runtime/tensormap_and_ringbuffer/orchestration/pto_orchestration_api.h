@@ -79,6 +79,24 @@ static inline Tensor make_tensor(const uint32_t shapes[],
  */
 typedef struct PTO2Runtime PTO2Runtime;
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * Framework-internal TLS bridge.
+ *
+ * The executor binds the current thread's runtime before invoking
+ * aicpu_orchestration_entry(), so orchestration helpers can fetch the
+ * current PTO2Runtime without explicit parameter threading.
+ */
+PTO2Runtime* pto2_framework_current_runtime(void);
+void pto2_framework_bind_runtime(PTO2Runtime* rt);
+
+#ifdef __cplusplus
+}
+#endif
+
 /**
  * Function-pointer table for runtime operations.
  * Populated by the runtime; called by orchestration through inline wrappers.
@@ -114,16 +132,21 @@ struct PTO2Runtime {
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline void pto2_rt_submit_task(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                                        const PTOParam& params) {
+static inline PTO2Runtime* pto2_current_runtime() {
+    return pto2_framework_current_runtime();
+}
+
+static inline void pto2_rt_submit_task(const MixedKernels& mixed_kernels,
+                                       const PTOParam& params) {
+    PTO2Runtime* rt = pto2_current_runtime();
     rt->ops->submit_task(rt, mixed_kernels, params);
 }
 
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
-static inline void pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id,
-                                            const PTOParam& params) {
+static inline void pto2_rt_submit_aic_task(int32_t kernel_id, const PTOParam& params) {
+    PTO2Runtime* rt = pto2_current_runtime();
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
     rt->ops->submit_task(rt, mk, params);
@@ -132,26 +155,30 @@ static inline void pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id,
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
-static inline void pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id,
-                                            const PTOParam& params) {
+static inline void pto2_rt_submit_aiv_task(int32_t kernel_id, const PTOParam& params) {
+    PTO2Runtime* rt = pto2_current_runtime();
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     rt->ops->submit_task(rt, mk, params);
 }
 
-static inline void pto2_rt_scope_begin(PTO2Runtime* rt) {
+static inline void pto2_rt_scope_begin() {
+    PTO2Runtime* rt = pto2_current_runtime();
     rt->ops->scope_begin(rt);
 }
 
-static inline void pto2_rt_scope_end(PTO2Runtime* rt) {
+static inline void pto2_rt_scope_end() {
+    PTO2Runtime* rt = pto2_current_runtime();
     rt->ops->scope_end(rt);
 }
 
-static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) {
+static inline void pto2_rt_orchestration_done() {
+    PTO2Runtime* rt = pto2_current_runtime();
     rt->ops->orchestration_done(rt);
 }
 
-static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) {
+static inline bool pto2_rt_is_fatal() {
+    PTO2Runtime* rt = pto2_current_runtime();
     return rt->ops->is_fatal(rt);
 }
 
@@ -159,11 +186,11 @@ static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) {
 // Logging Macros for Orchestration (call through ops table)
 // =============================================================================
 
-#define LOG_ERROR(rt, fmt, ...) (rt)->ops->log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_WARN(rt, fmt, ...)  (rt)->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_INFO(rt, fmt, ...)  (rt)->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_DEBUG(rt, fmt, ...) (rt)->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_ALWAYS(rt, fmt, ...) (rt)->ops->log_always(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) pto2_current_runtime()->ops->log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  pto2_current_runtime()->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  pto2_current_runtime()->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) pto2_current_runtime()->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_ALWAYS(fmt, ...) pto2_current_runtime()->ops->log_always(__FUNCTION__, fmt, ##__VA_ARGS__)
 
 // =============================================================================
 // C++ Scope Guards and Macros
@@ -174,7 +201,7 @@ static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) {
  */
 class PTO2ScopeGuard {
 public:
-    PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) {
+    PTO2ScopeGuard() : rt_(pto2_current_runtime()) {
         rt_->ops->scope_begin(rt_);
     }
     ~PTO2ScopeGuard() {
@@ -187,15 +214,15 @@ private:
 #define _PTO2_CONCATENATE_IMPL(x, y) x ## y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
 
-#define PTO2_SCOPE_GUARD(rt) [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)(rt)
+#define PTO2_SCOPE_GUARD() [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)
 
 /**
  * Scoped block macro:
- *   PTO2_SCOPE(rt) {
- *       pto2_rt_submit_task(rt, ...);
+ *   PTO2_SCOPE() {
+ *       pto2_rt_submit_task(...);
  *   }
  */
-#define PTO2_SCOPE(rt) if (PTO2_SCOPE_GUARD(rt); true)
+#define PTO2_SCOPE() if (PTO2_SCOPE_GUARD(); true)
 
 // =============================================================================
 // Orchestration Config

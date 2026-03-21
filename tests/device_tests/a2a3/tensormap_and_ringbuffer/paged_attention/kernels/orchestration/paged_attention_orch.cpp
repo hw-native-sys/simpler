@@ -62,7 +62,7 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
     uint64_t prof_param_extract = 0;
@@ -112,7 +112,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     DataType data_type = DataType::BFLOAT16;  // 用例是float32的，这个考虑要如何扩展成其他类型
     CYCLE_COUNT_LAP(prof_param_extract);
 
-    LOG_ALWAYS(rt, ">>>>>> batch = %lu", (unsigned long)batch);
+    LOG_ALWAYS(">>>>>> batch = %lu", (unsigned long)batch);
 
     // query_size = batch * num_heads * head_dim * data_type
     // key_cache_size = batch * block_num * block_size * head_dim * data_type
@@ -129,10 +129,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     // Tensor context_lens = make_tensor_external(host_context_lens, context_lens_size);
     Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
     CYCLE_COUNT_LAP(prof_ext_tensor);
-    // LOG_DEBUG(rt, "query=%s", query.dump().c_str());
-    // LOG_DEBUG(rt, "key_cache=%s", key_cache.dump().c_str());
-    // LOG_DEBUG(rt, "value_cache=%s", value_cache.dump().c_str());
-    // LOG_DEBUG(rt, "out=%s", out.dump().c_str());
+    // LOG_DEBUG("query=%s", query.dump().c_str());
+    // LOG_DEBUG("key_cache=%s", key_cache.dump().c_str());
+    // LOG_DEBUG("value_cache=%s", value_cache.dump().c_str());
+    // LOG_DEBUG("out=%s", out.dump().c_str());
 
     int total_tasks = 0;
 
@@ -140,7 +140,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
         uint64_t cur_seq = host_context_lens[b_idx];
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
-            PTO2_SCOPE(rt) {
+            PTO2_SCOPE() {
                 CYCLE_COUNT_LAP(prof_scope);
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
 
@@ -166,12 +166,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 params_inplace.add_output(li_update);
                 params_inplace.add_output(mi_update);
                 CYCLE_COUNT_LAP(prof_param_setup);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace);
+                pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace);
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
-                    PTO2_SCOPE_GUARD(rt);
+                    PTO2_SCOPE_GUARD();
 
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
                     uint64_t valid_len = std::min(block_size, cur_seq - bn * block_size);
@@ -195,7 +195,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_qk.add_input(kj);
                     params_qk.add_output(sij);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);
+                    pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -217,7 +217,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_sf.add_output(li);
                     params_sf.add_scalar(float_to_u64(scale_value));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf);
+                    pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -231,7 +231,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_pv.add_input(vj);
                     params_pv.add_output(oi_tmp);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);
+                    pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
@@ -250,7 +250,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up);
+                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
                 }
@@ -261,25 +261,24 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
 
     uint64_t total = prof_param_extract + prof_ext_tensor + prof_make_tensor +
                      prof_tensor_view + prof_param_setup + prof_submit_task + prof_scope;
-    LOG_ALWAYS(rt, "=== PagedAttn Orch Profiling: %d submits, %d makes, %d views, total=%.3fus ===",
+    LOG_ALWAYS("=== PagedAttn Orch Profiling: %d submits, %d makes, %d views, total=%.3fus ===",
         prof_submit_count, prof_make_count, prof_view_count, cycles_to_us(total));
     if (total > 0) {
-        LOG_ALWAYS(rt, "  param_extract    : %7.3fus (%5.1f%%)",
+        LOG_ALWAYS("  param_extract    : %7.3fus (%5.1f%%)",
             cycles_to_us(prof_param_extract), prof_param_extract * 100.0 / total);
-        LOG_ALWAYS(rt, "  ext_tensor(x4)   : %7.3fus (%5.1f%%)",
+        LOG_ALWAYS("  ext_tensor(x4)   : %7.3fus (%5.1f%%)",
             cycles_to_us(prof_ext_tensor), prof_ext_tensor * 100.0 / total);
-        LOG_ALWAYS(rt, "  make_tensor(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
+        LOG_ALWAYS("  make_tensor(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_make_count, cycles_to_us(prof_make_tensor), prof_make_tensor * 100.0 / total,
             prof_make_count > 0 ? cycles_to_us(prof_make_tensor) / prof_make_count : 0.0);
-        LOG_ALWAYS(rt, "  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
+        LOG_ALWAYS("  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_view_count, cycles_to_us(prof_tensor_view), prof_tensor_view * 100.0 / total,
             prof_view_count > 0 ? cycles_to_us(prof_tensor_view) / prof_view_count : 0.0);
-        LOG_ALWAYS(rt,
-            "  param_setup      : %7.3fus (%5.1f%%)",
+        LOG_ALWAYS("  param_setup      : %7.3fus (%5.1f%%)",
             cycles_to_us(prof_param_setup),
             prof_param_setup * 100.0 / total);
-        LOG_ALWAYS(rt, "  scope            : %7.3fus (%5.1f%%)", cycles_to_us(prof_scope), prof_scope * 100.0 / total);
-        LOG_ALWAYS(rt, "  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
+        LOG_ALWAYS("  scope            : %7.3fus (%5.1f%%)", cycles_to_us(prof_scope), prof_scope * 100.0 / total);
+        LOG_ALWAYS("  submit_task(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_submit_count, cycles_to_us(prof_submit_task), prof_submit_task * 100.0 / total,
             prof_submit_count > 0 ? cycles_to_us(prof_submit_task) / prof_submit_count : 0.0);
     }
