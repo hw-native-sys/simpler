@@ -1,35 +1,40 @@
 """
 AscendC Kernel Compiler for PTO Runtime Integration
 
-Compiles AscendC operator sources into PTO-compatible kernel binaries by
-generating a merged source file that includes both the user's AscendC kernel
-and a wrapper ``kernel_entry`` that bridges PTO's Tensor-pointer convention
-to AscendC's raw GM-address convention.
+Wraps pre-compiled AscendC operator binaries (.o) into PTO-compatible kernel
+binaries.  The key bridge is a generated "wrapper kernel" that adapts PTO's
+unified kernel entry (int64_t* args with Tensor pointers) to AscendC's
+per-tensor GM_ADDR calling convention.
 
-Workflow:
-  1. Generate merged .cpp: kernel_entry wrapper (at offset 0) + #include user source
-  2. Compile with AscendC toolchain flags (--cce-aicore-lang) → single .o
-  3. Link with ld.lld (-e kernel_entry -Ttext=0) to resolve block-local relocations
-  4. extract_text_section(linked_elf) → kernel binary (done by caller)
+The AscendC kernel .o is compiled externally (e.g. via tikcpp_smoke +
+npu_op_kernel_options --save-temp-files).  This module only consumes the
+pre-compiled .o — it does NOT compile AscendC source code.
 
-The merged source suppresses ``__global__`` when including the user's kernel
-source, so the compiler allows ``kernel_entry`` to call the user's kernel
-function.  kernel_entry is defined first in the source to ensure it sits at
-.text offset 0 (PTO dispatches to offset 0).
+Workflow (compile wrapper + link):
+  1. Read pre-compiled kernel .o  (from kernel_meta/ or provided directly)
+  2. Generate wrapper .cpp  (kernel_entry + embedded tiling data)
+  3. Compile wrapper with PTO compiler (ccec -x cce) -> wrapper.o
+  4. Link: ld.lld -e kernel_entry -Ttext=0 wrapper.o kernel.o -> combined.elf
+  5. extract_text_section(combined.elf) -> kernel binary  (done by caller)
+
+The wrapper is always compiled with PTO flags (-x cce) because it only needs
+tensor.h and contains no AscendC code.
 
 Usage:
     compiler = AscendCCompiler(platform="a2a3")
-    kernel_o = compiler.compile_ascendc_kernel(
-        ascendc_kernel_source="/path/to/add_custom.cpp",
+    kernel_o, tiling = extract_kernel_artifacts("/path/to/kernel_meta")
+    combined = compiler.compile_ascendc_kernel(
+        ascendc_kernel_o=kernel_o,
         ascendc_kernel_symbol="add_custom",
         tensor_args=[
             {"name": "x", "direction": "input"},
             {"name": "y", "direction": "input"},
             {"name": "z", "direction": "output"},
         ],
+        tiling_data=tiling,
         core_type="aiv",
     )
-    # caller does: kernel_bin = extract_text_section(kernel_o)
+    # caller does: kernel_bin = extract_text_section(combined)
 """
 
 import json
@@ -41,7 +46,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import env_manager
-from toolchain import AscendCToolchain, CCECToolchain
+from toolchain import CCECToolchain
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +69,8 @@ def generate_wrapper_source(
       - Forwards the raw GM byte-addresses to the AscendC kernel function
       - Embeds static tiling data as a ``constexpr`` array when provided
 
+    Compiled with PTO flags (ccec -x cce).  Only needs tensor.h, no AscendC SDK.
+
     Args:
         ascendc_kernel_symbol: The ``extern "C"`` symbol name of the AscendC
             kernel entry function in the compiled .o (e.g. ``"add_custom"``).
@@ -81,6 +88,23 @@ def generate_wrapper_source(
 
     # --- header / includes ---------------------------------------------------
     lines.append('#include "tensor.h"')
+    lines.append('')
+    # Ensure __gm__ and __aicore__ are defined (PTO ccec -x cce uses [aicore])
+    lines.append('#ifndef __gm__')
+    lines.append('#define __gm__')
+    lines.append('#endif')
+    lines.append('#ifndef __aicore__')
+    lines.append('#define __aicore__ [aicore]')
+    lines.append('#endif')
+    lines.append('')
+
+    # --- AscendC kernel forward declaration ----------------------------------
+    param_strs = ['__gm__ uint8_t*'] * len(tensor_args)
+    if has_workspace:
+        param_strs.append('__gm__ uint8_t*')  # workspace
+    param_strs.append('__gm__ uint8_t*')       # tiling
+    decl_params = ', '.join(param_strs)
+    lines.append(f'extern "C" __aicore__ void {ascendc_kernel_symbol}({decl_params});')
     lines.append('')
 
     # --- embedded tiling data ------------------------------------------------
@@ -131,95 +155,8 @@ def generate_wrapper_source(
     return '\n'.join(lines)
 
 
-def generate_merged_source(
-    ascendc_kernel_source: str,
-    ascendc_kernel_symbol: str,
-    tensor_args: List[Dict[str, str]],
-    tiling_data: Optional[bytes] = None,
-    has_workspace: bool = False,
-) -> str:
-    """Generate a single-TU source: kernel_entry wrapper + #include user kernel.
-
-    kernel_entry is defined FIRST so it sits at offset 0 in .text (PTO
-    dispatches to offset 0).  The user's AscendC kernel source is included
-    AFTER, with ``__global__`` suppressed so the compiler treats the user's
-    kernel as a regular callable function rather than a top-level entry point.
-
-    Compiled as one translation unit with AscendC flags, so there are no
-    cross-TU relocations to resolve.
-    """
-    lines: List[str] = []
-
-    # Include kernel_operator.h first for AscendC types and intrinsics
-    lines.append('#include "kernel_operator.h"')
-    lines.append('#include "tensor.h"')
-    lines.append('')
-
-    # Forward-declare user's kernel function (without __global__)
-    param_types = ['__gm__ uint8_t*'] * len(tensor_args)
-    if has_workspace:
-        param_types.append('__gm__ uint8_t*')
-    param_types.append('__gm__ uint8_t*')  # tiling
-    fwd_params = ', '.join(param_types)
-    lines.append(f'extern "C" __aicore__ void {ascendc_kernel_symbol}({fwd_params});')
-    lines.append('')
-
-    # Embedded tiling data
-    if tiling_data is not None and len(tiling_data) > 0:
-        lines.append(f'static const uint8_t TILING_DATA[{len(tiling_data)}] = {{')
-        chunk = 16
-        for i in range(0, len(tiling_data), chunk):
-            segment = tiling_data[i:i + chunk]
-            hex_segment = ', '.join(f'0x{b:02x}' for b in segment)
-            trailing = ',' if i + chunk < len(tiling_data) else ''
-            lines.append(f'    {hex_segment}{trailing}')
-        lines.append('};')
-        lines.append('')
-
-    # kernel_entry wrapper — defined FIRST so it's at .text offset 0
-    # NOT __global__ — the PTO executor calls kernel functions via function
-    # pointers using the standard calling convention, not the __global__ entry
-    # convention.
-    lines.append('extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {')
-
-    for idx, ta in enumerate(tensor_args):
-        lines.append(f'    __gm__ Tensor* t_{ta["name"]} = '
-                     f'reinterpret_cast<__gm__ Tensor*>(args[{idx}]);')
-    lines.append('')
-
-    for ta in tensor_args:
-        lines.append(
-            f'    __gm__ uint8_t* gm_{ta["name"]} = '
-            f'reinterpret_cast<__gm__ uint8_t*>(t_{ta["name"]}->buffer.addr);'
-        )
-    lines.append('')
-
-    call_args = [f'gm_{ta["name"]}' for ta in tensor_args]
-    if has_workspace:
-        call_args.append('nullptr')
-    if tiling_data is not None and len(tiling_data) > 0:
-        call_args.append('(__gm__ uint8_t*)TILING_DATA')
-    else:
-        call_args.append('nullptr')
-    call_str = ', '.join(call_args)
-    lines.append(f'    {ascendc_kernel_symbol}({call_str});')
-
-    lines.append('}')
-    lines.append('')
-
-    # Include user's AscendC kernel source AFTER kernel_entry.
-    # Suppress __global__ so user's kernel becomes a regular __aicore__ function
-    # (the compiler forbids calling __global__ functions from other functions).
-    lines.append('#define __global__')
-    lines.append(f'#include "{ascendc_kernel_source}"')
-    lines.append('#undef __global__')
-    lines.append('')
-
-    return '\n'.join(lines)
-
-
 # ---------------------------------------------------------------------------
-# AscendC compilation helpers
+# AscendC artifact extraction
 # ---------------------------------------------------------------------------
 
 def extract_kernel_artifacts(
@@ -283,22 +220,26 @@ def extract_kernel_artifacts(
 # ---------------------------------------------------------------------------
 
 class AscendCCompiler:
-    """Compile AscendC operators into PTO-compatible kernel binaries.
+    """Wrap pre-compiled AscendC kernel binaries into PTO-compatible kernel entries.
+
+    Compile wrapper + link:
+      1. Write pre-compiled kernel .o to build dir
+      2. Generate + compile wrapper.o with PTO compiler (ccec -x cce)
+      3. Link wrapper.o + kernel.o via ld.lld (wrapper first -> offset 0)
+
+    The AscendC kernel .o must be compiled externally (e.g. via tikcpp_smoke
+    + npu_op_kernel_options --save-temp-files).
 
     Typical usage::
 
         compiler = AscendCCompiler(platform="a2a3")
-        kernel_o = compiler.compile_ascendc_kernel(
-            ascendc_kernel_source="path/to/add_custom.cpp",
+        combined = compiler.compile_ascendc_kernel(
+            ascendc_kernel_o=kernel_o_bytes,
             ascendc_kernel_symbol="add_custom",
-            tensor_args=[
-                {"name": "x", "direction": "input"},
-                {"name": "y", "direction": "input"},
-                {"name": "z", "direction": "output"},
-            ],
-            core_type="aiv",
+            tensor_args=[...],
+            tiling_data=tiling_bytes,
         )
-        kernel_bin = extract_text_section(kernel_o)
+        kernel_bin = extract_text_section(combined)
     """
 
     def __init__(self, platform: str = "a2a3"):
@@ -314,10 +255,8 @@ class AscendCCompiler:
 
         if platform in ("a2a3", "a5"):
             env_manager.ensure("ASCEND_HOME_PATH")
-            self.ascendc_toolchain = AscendCToolchain(platform)
             self.pto_toolchain = CCECToolchain(platform)
         else:
-            self.ascendc_toolchain = None
             self.pto_toolchain = None
 
     def _get_runtime_include_dir(self, runtime_name: str = "tensormap_and_ringbuffer") -> str:
@@ -326,8 +265,7 @@ class AscendCCompiler:
 
     def compile_ascendc_kernel(
         self,
-        ascendc_kernel_source: Optional[str] = None,
-        ascendc_kernel_o: Optional[bytes] = None,
+        ascendc_kernel_o: bytes,
         ascendc_kernel_symbol: str = "ascendc_kernel",
         tensor_args: Optional[List[Dict[str, str]]] = None,
         tiling_data: Optional[bytes] = None,
@@ -336,39 +274,32 @@ class AscendCCompiler:
         extra_include_dirs: Optional[List[str]] = None,
         build_dir: Optional[str] = None,
     ) -> bytes:
-        """Compile AscendC kernel into a PTO-compatible .o (single-TU).
+        """Wrap a pre-compiled AscendC kernel .o into a PTO-compatible linked ELF.
 
-        Generates a merged source file that ``#include``s the user's AscendC
-        kernel and appends a ``kernel_entry`` wrapper, then compiles everything
-        as one translation unit with AscendC flags.
+        Generates a PTO wrapper, compiles it with PTO flags, then links it with
+        the kernel .o so that ``kernel_entry`` sits at .text offset 0.
 
         The caller should run ``extract_text_section(result)`` on the output.
 
         Args:
-            ascendc_kernel_source: Path to AscendC kernel ``.cpp`` source.
-            ascendc_kernel_o: Pre-compiled AscendC kernel ``.o`` bytes.
-                If provided, a two-step compile+link is used instead.
+            ascendc_kernel_o: Pre-compiled kernel ``.o`` bytes (from external
+                AscendC compilation, e.g. tikcpp_smoke kernel_meta/).
             ascendc_kernel_symbol: ``extern "C"`` symbol of the AscendC kernel.
             tensor_args: Ordered tensor descriptor list for wrapper generation.
             tiling_data: Static tiling data blob (None = no tiling).
             core_type: ``"aiv"`` (vector) or ``"aic"`` (cube).
             has_workspace: Whether AscendC kernel expects a workspace pointer.
-            extra_include_dirs: Extra -I paths for compilation.
+            extra_include_dirs: Extra -I paths for wrapper compilation.
             build_dir: Working directory for intermediates.
 
         Returns:
-            Compiled .o bytes.
+            Linked ELF bytes (pass to ``extract_text_section``).
         """
-        if self.ascendc_toolchain is None:
+        if self.pto_toolchain is None:
             raise RuntimeError(
-                "AscendC kernel compilation requires a hardware platform (a2a3/a5). "
+                "AscendC kernel wrapping requires a hardware platform (a2a3/a5). "
                 "Simulation platforms are not supported."
             )
-
-        if ascendc_kernel_source is None and ascendc_kernel_o is None:
-            raise ValueError("Provide either ascendc_kernel_source or ascendc_kernel_o")
-        if ascendc_kernel_source is not None and ascendc_kernel_o is not None:
-            raise ValueError("Provide only one of ascendc_kernel_source or ascendc_kernel_o")
 
         if tensor_args is None:
             tensor_args = []
@@ -376,85 +307,14 @@ class AscendCCompiler:
         work_dir = build_dir or tempfile.mkdtemp(prefix="ascendc_build_")
         os.makedirs(work_dir, exist_ok=True)
 
-        if ascendc_kernel_o is not None:
-            return self._compile_with_prebuilt_o(
-                ascendc_kernel_o, ascendc_kernel_symbol, tensor_args,
-                tiling_data, core_type, has_workspace, extra_include_dirs, work_dir,
-            )
-
-        # --- Single-TU approach: merge kernel source + wrapper ---
-        ascendc_kernel_source = os.path.abspath(ascendc_kernel_source)
-
-        merged_src = generate_merged_source(
-            ascendc_kernel_source=ascendc_kernel_source,
-            ascendc_kernel_symbol=ascendc_kernel_symbol,
-            tensor_args=tensor_args,
-            tiling_data=tiling_data,
-            has_workspace=has_workspace,
-        )
-
-        merged_cpp_path = os.path.join(work_dir, "ascendc_merged.cpp")
-        with open(merged_cpp_path, 'w') as f:
-            f.write(merged_src)
-        logger.info(f"[AscendC] Generated merged source: {merged_cpp_path}")
-
-        output_o_path = os.path.join(work_dir, "ascendc_kernel.o")
-
-        # Build include dirs: AscendC SDK + runtime (for tensor.h) + source dir
-        ascendc_includes = self.ascendc_toolchain.get_ascendc_include_dirs()
-        ascendc_includes.append(self._get_runtime_include_dir())
-        ascendc_includes.append(os.path.dirname(ascendc_kernel_source))
-        if extra_include_dirs:
-            ascendc_includes.extend(
-                os.path.abspath(d) for d in extra_include_dirs
-            )
-
-        compile_cmd = [self.ascendc_toolchain.cxx_path]
-        compile_cmd += self.ascendc_toolchain.get_compile_flags(core_type=core_type)
-        for inc in ascendc_includes:
-            compile_cmd.append(f"-I{inc}")
-        compile_cmd.extend(["-o", output_o_path, merged_cpp_path])
-
-        logger.info(f"[AscendC] Compiling AscendC kernel: {ascendc_kernel_source}")
-        logger.debug(f"  Command: {' '.join(compile_cmd)}")
-        self._run(compile_cmd, "AscendC-Compile")
-
-        # Link to resolve block-local relocations (R_AICORE_BLOCK_LOCAL_OFFSET12
-        # for g_vecTPipePtr etc.).  extract_text_section extracts raw bytes without
-        # applying relocations, so we must link first.
-        linked_path = os.path.join(work_dir, "ascendc_linked.elf")
-        link_cmd = [
-            self.pto_toolchain.linker_path,
-            "-e", "kernel_entry", "-Ttext=0",
-            "-o", linked_path, output_o_path,
-        ]
-        logger.info("[AscendC] Linking to resolve block-local relocations")
-        self._run(link_cmd, "AscendC-Link")
-
-        with open(linked_path, 'rb') as f:
-            result_bytes = f.read()
-
-        logger.info(f"[AscendC] Linked binary: {len(result_bytes)} bytes")
-        return result_bytes
-
-    def _compile_with_prebuilt_o(
-        self,
-        ascendc_kernel_o: bytes,
-        ascendc_kernel_symbol: str,
-        tensor_args: List[Dict[str, str]],
-        tiling_data: Optional[bytes],
-        core_type: str,
-        has_workspace: bool,
-        extra_include_dirs: Optional[List[str]],
-        work_dir: str,
-    ) -> bytes:
-        """Fallback: pre-compiled .o needs wrapper + link."""
+        # --- Step 1: Write pre-compiled kernel .o -----------------------------
         kernel_o_path = os.path.join(work_dir, "ascendc_kernel.o")
         with open(kernel_o_path, 'wb') as f:
             f.write(ascendc_kernel_o)
-        logger.info(f"[AscendC] Using pre-compiled kernel .o ({len(ascendc_kernel_o)} bytes)")
+        logger.info(f"[AscendC] Using pre-compiled kernel .o "
+                    f"({len(ascendc_kernel_o)} bytes)")
 
-        # Generate + compile PTO wrapper with AscendC flags
+        # --- Step 2: Generate + compile wrapper with PTO flags ---------------
         wrapper_src = generate_wrapper_source(
             ascendc_kernel_symbol=ascendc_kernel_symbol,
             tensor_args=tensor_args,
@@ -465,30 +325,36 @@ class AscendCCompiler:
         wrapper_cpp_path = os.path.join(work_dir, "ascendc_wrapper.cpp")
         with open(wrapper_cpp_path, 'w') as f:
             f.write(wrapper_src)
+        logger.info(f"[AscendC] Generated wrapper: {wrapper_cpp_path}")
 
         wrapper_o_path = os.path.join(work_dir, "ascendc_wrapper.o")
         wrapper_includes = [self._get_runtime_include_dir()]
         if extra_include_dirs:
             wrapper_includes.extend(extra_include_dirs)
 
-        wrapper_cmd = [self.ascendc_toolchain.cxx_path]
-        wrapper_cmd += self.ascendc_toolchain.get_compile_flags(core_type=core_type)
+        wrapper_cmd = [self.pto_toolchain.cxx_path]
+        wrapper_cmd += self.pto_toolchain.get_compile_flags(core_type=core_type)
         for inc in wrapper_includes:
             wrapper_cmd.append(f"-I{os.path.abspath(inc)}")
         wrapper_cmd.extend(["-o", wrapper_o_path, wrapper_cpp_path])
-        self._run(wrapper_cmd, "AscendC-Wrapper")
 
-        # Full link to resolve cross-TU calls
-        combined_o_path = os.path.join(work_dir, "ascendc_combined.o")
+        logger.info("[AscendC] Compiling wrapper with PTO flags")
+        self._run(wrapper_cmd, "PTO-Wrapper")
+
+        # --- Step 3: Link wrapper.o + kernel.o -------------------------------
+        # wrapper.o listed FIRST so kernel_entry lands at .text offset 0
+        combined_path = os.path.join(work_dir, "ascendc_combined.elf")
         link_cmd = [
             self.pto_toolchain.linker_path,
             "-e", "kernel_entry", "-Ttext=0",
-            "-o", combined_o_path,
+            "-o", combined_path,
             wrapper_o_path, kernel_o_path,
         ]
+
+        logger.info("[AscendC] Linking wrapper.o + kernel.o")
         self._run(link_cmd, "AscendC-Link")
 
-        with open(combined_o_path, 'rb') as f:
+        with open(combined_path, 'rb') as f:
             result_bytes = f.read()
 
         logger.info(f"[AscendC] Combined binary: {len(result_bytes)} bytes")
@@ -497,7 +363,6 @@ class AscendCCompiler:
     def compile_from_kernel_meta(
         self,
         kernel_meta_dir: str,
-        ascendc_kernel_source: str,
         ascendc_kernel_symbol: str,
         tensor_args: List[Dict[str, str]],
         core_type: str = "aiv",
@@ -505,11 +370,15 @@ class AscendCCompiler:
         extra_include_dirs: Optional[List[str]] = None,
         build_dir: Optional[str] = None,
     ) -> bytes:
-        """Convenience: extract tiling from kernel_meta, then compile source."""
-        _, tiling_data = extract_kernel_artifacts(kernel_meta_dir)
+        """Convenience: extract .o and tiling from kernel_meta, then wrap+link."""
+        kernel_o, tiling_data = extract_kernel_artifacts(kernel_meta_dir)
+        if kernel_o is None:
+            raise FileNotFoundError(
+                f"No .o file found in kernel_meta: {kernel_meta_dir}"
+            )
 
         return self.compile_ascendc_kernel(
-            ascendc_kernel_source=ascendc_kernel_source,
+            ascendc_kernel_o=kernel_o,
             ascendc_kernel_symbol=ascendc_kernel_symbol,
             tensor_args=tensor_args,
             tiling_data=tiling_data,

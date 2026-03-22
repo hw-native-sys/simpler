@@ -1,12 +1,13 @@
 """
 AscendC Vector Example — kernel_config.py
 
-Demonstrates integrating an AscendC operator (add_custom) into the PTO
-tensormap_and_ringbuffer runtime via single-TU compile + link.
+Demonstrates integrating a pre-compiled AscendC operator (add_custom) into the
+PTO tensormap_and_ringbuffer runtime via wrapper generation + link.
 
-The AscendC kernel source is merged with a kernel_entry wrapper into a single
-translation unit, compiled with AscendC flags, then linked to resolve
-block-local relocations.
+The AscendC kernel .o is compiled externally (e.g. via tikcpp_smoke +
+npu_op_kernel_options --save-temp-files).  Simpler only generates a PTO wrapper
+(kernel_entry), compiles it with PTO flags (-x cce), and links it with the
+kernel .o so kernel_entry sits at .text offset 0.
 
 Computation:
   z = x + y          (AscendC add_custom, func_id=0)
@@ -27,7 +28,8 @@ ORCHESTRATION = {
 KERNELS = [
     {
         "func_id": 0,
-        "source": str(_KERNELS_ROOT / "ascendc" / "add_custom.cpp"),
+        # Pre-compiled AscendC kernel .o (produced by external AscendC build)
+        "source": str(_KERNELS_ROOT / "ascendc" / "add_custom.o"),
         "core_type": "aiv",
         "compiler": "ascendc",
         "ascendc_symbol": "add_custom",

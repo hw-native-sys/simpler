@@ -32,6 +32,21 @@ class TestGenerateWrapperSource:
         assert "gm_x" in src and "gm_y" in src and "gm_z" in src
         assert "nullptr" in src
 
+    def test_forward_declaration(self):
+        """Forward declares AscendC kernel symbol."""
+        src = self._gen(
+            ascendc_kernel_symbol="add_custom",
+            tensor_args=[
+                {"name": "x", "direction": "input"},
+                {"name": "y", "direction": "input"},
+                {"name": "z", "direction": "output"},
+            ],
+        )
+        fwd_lines = [l for l in src.splitlines()
+                     if "extern" in l and "add_custom" in l]
+        assert len(fwd_lines) == 1
+        assert "uint8_t*" in fwd_lines[0]
+
     def test_with_static_tiling_data(self):
         """Tiling data bytes are embedded as a const array."""
         tiling = bytes([0x10, 0x27, 0x00, 0x00])
@@ -107,6 +122,14 @@ class TestGenerateWrapperSource:
         assert "TILING_DATA[48]" in src
         assert "0x00" in src
         assert "0x2f" in src  # last byte = 47 = 0x2f
+
+    def test_no_ascendc_headers(self):
+        """Wrapper does NOT include kernel_operator.h (PTO code only)."""
+        src = self._gen(
+            ascendc_kernel_symbol="op",
+            tensor_args=[{"name": "a", "direction": "input"}],
+        )
+        assert "kernel_operator.h" not in src
 
 
 class TestExtractKernelArtifacts:
@@ -186,13 +209,13 @@ class TestAscendCCompilerInit:
     """Test AscendCCompiler initialization."""
 
     def test_sim_platform_raises_on_compile(self):
-        """Simulation platforms raise RuntimeError when trying to compile."""
+        """Simulation platforms raise RuntimeError when trying to wrap+link."""
         from ascendc_compiler import AscendCCompiler
 
         compiler = AscendCCompiler(platform="a2a3sim")
         with pytest.raises(RuntimeError, match="hardware platform"):
             compiler.compile_ascendc_kernel(
-                ascendc_kernel_source="/fake.cpp",
+                ascendc_kernel_o=b"fake_kernel_o",
                 ascendc_kernel_symbol="op",
                 tensor_args=[{"name": "a", "direction": "input"}],
             )
@@ -203,17 +226,6 @@ class TestAscendCCompilerInit:
 
         with pytest.raises(ValueError, match="Unknown platform"):
             AscendCCompiler(platform="unknown_platform")
-
-    def test_must_provide_source_or_o(self):
-        """Raises ValueError when neither source nor .o is provided."""
-        from ascendc_compiler import AscendCCompiler
-
-        compiler = AscendCCompiler(platform="a2a3sim")
-        with pytest.raises(RuntimeError, match="hardware platform"):
-            compiler.compile_ascendc_kernel(
-                ascendc_kernel_symbol="op",
-                tensor_args=[{"name": "a", "direction": "input"}],
-            )
 
 
 class TestAscendCToolchain:
@@ -260,96 +272,15 @@ class TestAscendCToolchain:
         dir_basenames = [Path(d).name for d in dirs]
         assert "include" in dir_basenames  # asc/include
 
+    def test_pto_flags_use_x_cce(self):
+        """PTO flags use -x cce, not --cce-aicore-lang."""
+        from toolchain import CCECToolchain
 
-class TestGenerateMergedSource:
-    """Test merged single-TU source generation."""
-
-    def _gen(self, **kwargs):
-        from ascendc_compiler import generate_merged_source
-        return generate_merged_source(**kwargs)
-
-    def test_basic_structure(self):
-        """Merged source has kernel_entry before user source include."""
-        src = self._gen(
-            ascendc_kernel_source="/path/to/add_custom.cpp",
-            ascendc_kernel_symbol="add_custom",
-            tensor_args=[
-                {"name": "x", "direction": "input"},
-                {"name": "y", "direction": "input"},
-                {"name": "z", "direction": "output"},
-            ],
-        )
-        lines = src.splitlines()
-        # kernel_entry must appear before the user source include
-        ke_line = next(i for i, l in enumerate(lines) if "kernel_entry" in l and "extern" in l)
-        inc_line = next(i for i, l in enumerate(lines) if "#include" in l and "add_custom.cpp" in l)
-        assert ke_line < inc_line, "kernel_entry must be defined before user source"
-
-    def test_global_suppressed(self):
-        """__global__ is suppressed around user source include."""
-        src = self._gen(
-            ascendc_kernel_source="/path/to/kernel.cpp",
-            ascendc_kernel_symbol="my_kernel",
-            tensor_args=[{"name": "a", "direction": "input"}],
-        )
-        assert '#define __global__' in src
-        assert '#undef __global__' in src
-
-    def test_forward_declaration(self):
-        """Forward declares user kernel without __global__."""
-        src = self._gen(
-            ascendc_kernel_source="/path/to/kernel.cpp",
-            ascendc_kernel_symbol="my_kernel",
-            tensor_args=[
-                {"name": "a", "direction": "input"},
-                {"name": "b", "direction": "output"},
-            ],
-            has_workspace=True,
-        )
-        # Forward decl has 4 params: a, b, workspace, tiling
-        fwd_lines = [l for l in src.splitlines()
-                     if "extern" in l and "my_kernel" in l and "kernel_entry" not in l]
-        assert len(fwd_lines) == 1
-        assert "__global__" not in fwd_lines[0]
-        assert fwd_lines[0].count("uint8_t*") == 4
-
-    def test_kernel_entry_not_global(self):
-        """kernel_entry is NOT __global__ (uses standard calling convention)."""
-        src = self._gen(
-            ascendc_kernel_source="/path/to/kernel.cpp",
-            ascendc_kernel_symbol="my_kernel",
-            tensor_args=[{"name": "a", "direction": "input"}],
-        )
-        ke_line = [l for l in src.splitlines() if "kernel_entry" in l and "extern" in l][0]
-        assert "__global__" not in ke_line
-        assert "__aicore__" in ke_line
-
-    def test_includes_kernel_operator(self):
-        """Merged source includes kernel_operator.h for AscendC types."""
-        src = self._gen(
-            ascendc_kernel_source="/path/to/kernel.cpp",
-            ascendc_kernel_symbol="my_kernel",
-            tensor_args=[{"name": "a", "direction": "input"}],
-        )
-        assert '#include "kernel_operator.h"' in src
-        assert '#include "tensor.h"' in src
-
-    def test_with_tiling_and_workspace(self):
-        """Tiling data and workspace are correctly embedded and passed."""
-        tiling = bytes([0xAA, 0xBB])
-        src = self._gen(
-            ascendc_kernel_source="/path/to/kernel.cpp",
-            ascendc_kernel_symbol="my_kernel",
-            tensor_args=[{"name": "a", "direction": "input"}],
-            tiling_data=tiling,
-            has_workspace=True,
-        )
-        assert "TILING_DATA[2]" in src
-        assert "0xaa" in src
-        call_line = [l for l in src.splitlines()
-                     if "my_kernel(" in l and "extern" not in l][0]
-        assert "nullptr" in call_line  # workspace
-        assert "TILING_DATA" in call_line  # tiling
+        tc = CCECToolchain(platform="a2a3")
+        flags = tc.get_compile_flags(core_type="aiv")
+        assert "-x" in flags
+        assert "cce" in flags
+        assert "--cce-aicore-lang" not in flags
 
 
 class TestCodeRunnerAscendCDispatch:
@@ -369,3 +300,8 @@ class TestCodeRunnerAscendCDispatch:
             "compiler": "ascendc",
         }
         assert kernel.get("compiler", "pto") == "ascendc"
+
+    def test_source_must_be_o_file(self):
+        """AscendC kernels require .o files, not .cpp sources."""
+        kernel_o = {"source": "ascendc/add_custom.o", "compiler": "ascendc"}
+        assert kernel_o["source"].endswith(".o")

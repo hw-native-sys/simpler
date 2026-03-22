@@ -1,15 +1,46 @@
 /**
- * AscendC AddCustom Operator
+ * AscendC AddCustom Operator — Reference Source
  *
- * Element-wise addition: z[i] = x[i] + y[i]
+ * This file shows the AscendC operator source that would be compiled
+ * externally using the AscendC toolchain (CMake + npu_op_kernel_options).
+ * It is provided for documentation purposes — the actual compilation is
+ * done outside of simpler using the AscendC build system.
  *
- * Uses AscendC double-buffered pipeline with CopyIn/Compute/CopyOut stages.
- * Static tiling: totalLength=16384 elements, tileNum=8 tiles.
+ * AscendC compilation produces:
+ *   1. A compiled .o file (the AICore kernel binary)
+ *   2. A tiling data blob (for static tiling, baked into the kernel)
  *
- * Calling convention (extern "C"):
+ * These artifacts are then consumed by simpler's AscendCCompiler, which
+ * wraps them with a PTO-compatible kernel_entry and registers the
+ * combined binary with the PTO runtime.
+ *
+ * To build this operator:
+ *   1. Place it in a tikcpp_smoke-style project structure
+ *   2. Configure CMakePresets.json for target SoC (e.g. Ascend910B)
+ *   3. Add to CMakeLists.txt:
+ *        npu_op_kernel_options(ascendc_kernels ALL OPTIONS --save-temp-files)
+ *   4. Build with: bash run.sh --is-dynamic=0
+ *   5. Find artifacts in: build_out/op_kernel/AddCustom_<soc>/kernel_<x>/kernel_meta/
+ *   6. Copy .o to this directory as add_custom.o
+ *
+ * The kernel entry symbol exported by AscendC compilation is typically
+ * the operator class name in snake_case — here "add_custom".
+ *
+ * Calling convention (after static tiling degeneration):
  *   void add_custom(__gm__ uint8_t* x, __gm__ uint8_t* y, __gm__ uint8_t* z,
  *                   __gm__ uint8_t* workspace, __gm__ uint8_t* tiling);
+ *
+ * With static tiling, the tiling parameter points to compile-time-fixed data
+ * that is embedded in the wrapper kernel by AscendCCompiler.
  */
+
+// ============================================================================
+// The following is a simplified pseudo-code representation of what AscendC
+// generates.  It is NOT directly compilable with PTO's ccec — it requires the
+// full AscendC header set (kernel_operator.h, etc.) from the CANN SDK.
+// ============================================================================
+
+#if 0  // Not compiled — reference only
 
 #include "kernel_operator.h"
 
@@ -80,11 +111,15 @@ private:
     uint32_t tileLength;
 };
 
+// Generated entry point (after static tiling degeneration)
 extern "C" __global__ __aicore__ void add_custom(
     __gm__ uint8_t* x, __gm__ uint8_t* y, __gm__ uint8_t* z,
     __gm__ uint8_t* workspace, __gm__ uint8_t* tiling)
 {
+    // Static tiling: totalLength and tileNum are fixed at compile time
     KernelAdd op;
-    op.Init(x, y, z, 16384, 8);
+    op.Init(x, y, z, /*totalLength=*/16384, /*tileNum=*/8);
     op.Process();
 }
+
+#endif
