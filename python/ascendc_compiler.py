@@ -99,10 +99,15 @@ def generate_wrapper_source(
     lines.append('')
 
     # --- AscendC kernel forward declaration ----------------------------------
+    # Tensor pointers are in GM address space; workspace and tiling use plain
+    # uint8_t* because the wrapper may embed tiling in const data (not GM) and
+    # PTO's ccec treats __gm__ as a real address-space qualifier.  The linker
+    # resolves symbols by name only, so parameter types don't need to match
+    # the AscendC side exactly.
     param_strs = ['__gm__ uint8_t*'] * len(tensor_args)
     if has_workspace:
-        param_strs.append('__gm__ uint8_t*')  # workspace
-    param_strs.append('__gm__ uint8_t*')       # tiling
+        param_strs.append('uint8_t*')  # workspace (nullptr from wrapper)
+    param_strs.append('uint8_t*')      # tiling (may be const data, not GM)
     decl_params = ', '.join(param_strs)
     lines.append(f'extern "C" __aicore__ void {ascendc_kernel_symbol}({decl_params});')
     lines.append('')
@@ -143,7 +148,7 @@ def generate_wrapper_source(
     if has_workspace:
         call_args.append('nullptr')
     if tiling_data is not None and len(tiling_data) > 0:
-        call_args.append('(__gm__ uint8_t*)TILING_DATA')
+        call_args.append('(uint8_t*)TILING_DATA')
     else:
         call_args.append('nullptr')
     call_str = ', '.join(call_args)

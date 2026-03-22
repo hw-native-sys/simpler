@@ -4,10 +4,14 @@ AscendC Vector Example — kernel_config.py
 Demonstrates integrating a pre-compiled AscendC operator (add_custom) into the
 PTO tensormap_and_ringbuffer runtime via wrapper generation + link.
 
-The AscendC kernel .o is compiled externally (e.g. via tikcpp_smoke +
-npu_op_kernel_options --save-temp-files).  Simpler only generates a PTO wrapper
-(kernel_entry), compiles it with PTO flags (-x cce), and links it with the
-kernel .o so kernel_entry sits at .text offset 0.
+The .o is compiled with AscendC toolchain (ccec --cce-aicore-lang) but adapted
+for PTO dispatch:
+  - No __global__ attribute (causes hang under PTO subroutine dispatch)
+  - No GetBlockNum()/GetBlockIdx() partitioning (PTO dispatches to single cores)
+  - Static tiling (constexpr values, no runtime tiling pointer)
+
+Simpler generates a PTO wrapper (kernel_entry), compiles it with PTO flags
+(-x cce), and links it with the kernel .o so kernel_entry sits at .text offset 0.
 
 Computation:
   z = x + y          (AscendC add_custom, func_id=0)
@@ -28,7 +32,8 @@ ORCHESTRATION = {
 KERNELS = [
     {
         "func_id": 0,
-        # Pre-compiled AscendC kernel .o (produced by external AscendC build)
+        # Pre-compiled AscendC kernel .o with static tiling degeneration
+        # (tiling values baked in at compile time, no runtime tiling needed)
         "source": str(_KERNELS_ROOT / "ascendc" / "add_custom.o"),
         "core_type": "aiv",
         "compiler": "ascendc",

@@ -60,7 +60,7 @@ class TestGenerateWrapperSource:
         )
         assert "TILING_DATA[4]" in src
         assert "0x10" in src and "0x27" in src
-        assert "(__gm__ uint8_t*)TILING_DATA" in src
+        assert "(uint8_t*)TILING_DATA" in src
         call_lines = [l for l in src.splitlines()
                       if "my_op(" in l and "extern" not in l]
         assert len(call_lines) == 1
