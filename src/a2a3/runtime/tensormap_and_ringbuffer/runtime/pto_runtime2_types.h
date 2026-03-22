@@ -21,6 +21,11 @@
 
 #include "pto_types.h"
 #include "pto_submit_types.h"
+#include "pto2_dispatch_payload.h"
+
+// Compile-time guard: tensor + scalar params must fit within dispatch.args[]
+static_assert(PTO2_MAX_TENSOR_PARAMS + PTO2_MAX_SCALAR_PARAMS <= PTO2_DISPATCH_MAX_ARGS,
+              "PTO2_MAX_TENSOR_PARAMS + PTO2_MAX_SCALAR_PARAMS exceeds PTO2_DISPATCH_MAX_ARGS");
 
 // =============================================================================
 // Profiling Configuration
@@ -346,9 +351,13 @@ struct PTO2TaskDescriptor {
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
  * Layout: metadata (counts, fanin pointers) packed in the first 3 cache lines,
- * followed by bulk tensor and scalar data. This gives sequential write access
- * during orchestration and groups scheduler-hot fields (fanin_actual_count +
- * fanin_slot_states) together for on_task_release.
+ * followed by the dispatch descriptor and bulk tensor data. Scalar values are
+ * written directly into dispatch.args[] (after tensor pointers), eliminating the
+ * separate scalars[] array.
+ *
+ * The Scheduler writes a pointer to dispatch into PTO2DispatchPerCore and
+ * signals AICore via DATA_MAIN_BASE register. AICore reads the dispatch
+ * descriptor in-place through the cached pointer.
  */
 struct PTO2TaskPayload {
     // === Cache line 0 (64B) — metadata ===
@@ -357,22 +366,39 @@ struct PTO2TaskPayload {
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
     int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
-    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
+    // === Dispatch descriptor (1048B) — built by Orchestrator, read by AICore ===
+    PTO2DispatchDesc dispatch;
+    // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
     Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
-    // === Cache lines 35-50 (1024B) — scalars ===
-    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
 
+    /**
+     * Initialize payload: copy tensors, build dispatch args.
+     *
+     * @param params            Task parameters (tensors + scalars)
+     */
     void init(const PTOParam& params) {
         tensor_count = params.tensor_count;
         scalar_count = params.scalar_count;
+
+        // Guard: tensor_count + scalar_count must not exceed dispatch.args[] capacity
+        int32_t total_args = params.tensor_count + params.scalar_count;
+        always_assert(total_args <= PTO2_DISPATCH_MAX_ARGS
+                      && "dispatch.args overflow: tensor_count + scalar_count > PTO2_DISPATCH_MAX_ARGS");
+
+        // 1. Copy tensors from PTOParam
         auto src_tensors = params.tensors;
         for (int32_t i = 0; i < params.tensor_count; i++) {
             tensors[i].copy(*src_tensors[i]);
         }
-        static_assert(sizeof(scalars) == sizeof(params.scalars));
-        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
-        // Eliminates branches; extra bytes within the same CL have zero additional cost.
-        memcpy(scalars, params.scalars,
+
+        // 2. Build dispatch.args[]: tensor pointers first, then scalar values
+        for (int32_t i = 0; i < params.tensor_count; i++) {
+            tensors[i].update_start_offset();
+            dispatch.args[i] = reinterpret_cast<uint64_t>(&tensors[i]);
+        }
+        // Bulk-copy scalars into dispatch.args[tensor_count..], rounded up to
+        // cache-line boundary (extra bytes within the same CL cost nothing).
+        memcpy(&dispatch.args[params.tensor_count], params.scalars,
                PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
     }
 };

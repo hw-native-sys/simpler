@@ -69,6 +69,9 @@ struct PTO2OrchestratorState {
     void* gm_heap_base;    // Base address of GM heap
     uint64_t gm_heap_size;   // Total size of GM heap (all rings)
 
+    // === FUNCTION ADDRESS MAPPING (for dispatch descriptor construction) ===
+    const uint64_t* func_id_to_addr;  // Kernel ID → GM function address (points to Runtime::func_id_to_addr_[])
+
     // === FATAL ERROR ===
     // Fatal error flag (single-thread access by orchestrator, no atomic needed)
     // Cross-thread notification uses shared memory orch_error_code (atomic)

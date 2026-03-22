@@ -353,8 +353,9 @@ void pto2_submit_mixed_task(
         __builtin_prefetch(&payload->tensors[i], 1, 3);
         __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 3);
     }
+    // Prefetch dispatch.args[] area (scalar values written directly here)
     for (int32_t i = 0; i < params.scalar_count; i += 8) {
-        __builtin_prefetch(&payload->scalars[i], 1, 3);
+        __builtin_prefetch(&payload->dispatch.args[params.tensor_count + i], 1, 3);
     }
     __builtin_prefetch(payload, 1, 3);
     __builtin_prefetch(reinterpret_cast<char*>(payload) + 64, 1, 3);
@@ -522,6 +523,16 @@ void pto2_submit_mixed_task(
     }
 
     payload->init(params);
+
+    // Fill per-slot function addresses for AICore dispatch
+    for (int32_t s = 0; s < PTO2_SUBTASK_SLOT_COUNT; s++) {
+        int32_t kid = task.kernel_id[s];
+        if (kid >= 0) {
+            payload->dispatch.function_bin_addrs[s] = orch->func_id_to_addr[kid];
+        } else {
+            payload->dispatch.function_bin_addrs[s] = 0;  // Clear inactive slot (prevent stale residue)
+        }
+    }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, local_id);
 #if PTO2_ORCH_PROFILING
