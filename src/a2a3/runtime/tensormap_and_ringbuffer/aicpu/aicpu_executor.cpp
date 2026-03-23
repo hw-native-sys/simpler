@@ -1063,8 +1063,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     bool cores_released = false;
 
 #if PTO2_PROFILING
-    // Benchmark: scheduler lifetime start timestamp (independent of enable_profiling)
-    DEV_ALWAYS("Thread %d: sched_start=%llu", thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+    uint64_t sched_start_ts = get_sys_cnt_aicpu();
 #endif
 
     while (true) {
@@ -1477,8 +1476,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 DEV_ERROR("Thread %d: PTO2 timeout after %d idle iterations", thread_idx, idle_iterations);
 #if PTO2_PROFILING
                 // Benchmark: scheduler lifetime end timestamp on timeout path
-                DEV_ALWAYS("Thread %d: sched_end(timeout)=%llu",
-                           thread_idx, (unsigned long long)get_sys_cnt_aicpu());
+                uint64_t sched_timeout_ts = get_sys_cnt_aicpu();
+                DEV_ALWAYS("Thread %d: sched_start=%llu sched_end(timeout)=%llu sched_cost=%.3fus",
+                           thread_idx, (unsigned long long)sched_start_ts,
+                           (unsigned long long)sched_timeout_ts,
+                           cycles_to_us(sched_timeout_ts - sched_start_ts));
 #endif
                 return -1;
             } else {
@@ -1496,6 +1498,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     }
 
 #if PTO2_PROFILING
+    // Record sched_end before any DEV_ALWAYS to avoid init cost contamination
+    uint64_t sched_end_ts = get_sys_cnt_aicpu();
+    DEV_ALWAYS("Thread %d: sched_start=%llu sched_end=%llu sched_cost=%.3fus",
+        thread_idx, (unsigned long long)sched_start_ts,
+        (unsigned long long)sched_end_ts,
+        cycles_to_us(sched_end_ts - sched_start_ts));
+
     // Scheduler summary logging (always print when PTO2_PROFILING=1)
     uint64_t sched_total =
         sched_complete_cycle + sched_scan_cycle + sched_dispatch_cycle + sched_idle_cycle;
@@ -1636,6 +1645,10 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
 
     // Orchestrator check
     if (thread_idx >= sched_thread_num_) {
+#if PTO2_PROFILING
+        uint64_t orch_cycle_start = 0;
+        int32_t pto2_submitted_tasks = -1;
+#endif
         int32_t orch_idx = thread_idx - sched_thread_num_;
         if (runtime->get_orch_built_on_host()) {
             DEV_INFO("Thread %d: Host orchestration mode, no-op (orch_idx=%d)", thread_idx, orch_idx);
@@ -1850,7 +1863,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
 #endif
 
 #if PTO2_PROFILING
-            uint64_t orch_cycle_start = get_sys_cnt_aicpu();
+            orch_cycle_start = get_sys_cnt_aicpu();
 #endif
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(rt);
@@ -1861,12 +1874,6 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(nullptr);
             }
-#if PTO2_PROFILING
-            uint64_t orch_cycle_end = get_sys_cnt_aicpu();
-            DEV_ALWAYS("Thread %d: orch_start=%llu orch_func_cost=%.3fus (orch_idx=%d)",
-                thread_idx, (unsigned long long)orch_cycle_start,
-                cycles_to_us(orch_cycle_end - orch_cycle_start), orch_idx);
-#endif
 
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
@@ -1980,7 +1987,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                         }
                     }
 #if PTO2_PROFILING
-                DEV_ALWAYS("PTO2 total submitted tasks = %d, already executed %d tasks", pto2_task_count, completed_tasks_.load(std::memory_order_acquire));
+                pto2_submitted_tasks = pto2_task_count;
 #endif
                 total_tasks_ = pto2_task_count;
                 if (runtime->enable_profiling && pto2_task_count > 0) {
@@ -2062,7 +2069,14 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
         }
 #if PTO2_PROFILING
         uint64_t orch_end_ts = get_sys_cnt_aicpu();
-        DEV_ALWAYS("Thread %d: orch_end=%llu", thread_idx, (unsigned long long)orch_end_ts);
+        DEV_ALWAYS("Thread %d: orch_start=%llu orch_end=%llu orch_cost=%.3fus",
+            thread_idx, (unsigned long long)orch_cycle_start,
+            (unsigned long long)orch_end_ts,
+            cycles_to_us(orch_end_ts - orch_cycle_start));
+        if (pto2_submitted_tasks >= 0) {
+            DEV_ALWAYS("PTO2 total submitted tasks = %d, already executed %d tasks",
+                pto2_submitted_tasks, completed_tasks_.load(std::memory_order_acquire));
+        }
 #endif
         DEV_INFO("Thread %d: Orchestrator completed (orch_idx=%d)", thread_idx, orch_idx);
     }
@@ -2088,10 +2102,6 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
         const int32_t* shutdown_cores = core_assignments_[thread_idx];
         int32_t shutdown_count = core_count_per_thread_[thread_idx];
         if (shutdown_count > 0) {
-#if PTO2_PROFILING
-            uint64_t sched_end_ts = get_sys_cnt_aicpu();
-            DEV_ALWAYS("Thread %d: sched_end=%llu", thread_idx, (unsigned long long)sched_end_ts);
-#endif
             auto rc = shutdown_aicore(runtime, thread_idx, shutdown_cores, shutdown_count);
             if (rc != 0) {
                 return rc;
