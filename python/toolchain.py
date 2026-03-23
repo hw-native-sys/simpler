@@ -107,8 +107,8 @@ class Gxx15Toolchain(Toolchain):
         super().__init__()
         self.cxx_path = "g++-15"
 
-    def get_compile_flags(self, **kwargs) -> List[str]:
-        return [
+    def get_compile_flags(self, core_type: str = "", **kwargs) -> List[str]:
+        flags = [
             "-shared", "-O2", "-fPIC",
             "-std=c++23",
             "-fpermissive",
@@ -118,6 +118,13 @@ class Gxx15Toolchain(Toolchain):
             "-DPTO_CPU_MAX_THREADS=1",
             "-DNDEBUG",
         ]
+        # g++ does not define __DAV_VEC__/__DAV_CUBE__ like ccec does,
+        # so we must add them explicitly based on core_type.
+        if core_type == "aiv":
+            flags.append("-D__DAV_VEC__")
+        elif core_type == "aic":
+            flags.append("-D__DAV_CUBE__")
+        return flags
 
     def get_cmake_args(self) -> List[str]:
         # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
