@@ -136,6 +136,18 @@ static inline PTO2TaskId pto2_make_task_id(uint8_t ring_id, uint32_t local_id) {
     return PTO2TaskId{(static_cast<uint64_t>(ring_id) << 32) | static_cast<uint64_t>(local_id)};
 }
 
+static inline uint8_t pto2_task_id_ring(PTO2TaskId task_id) {
+    return task_id.ring();
+}
+
+static inline uint32_t pto2_task_id_local(PTO2TaskId task_id) {
+    return task_id.local();
+}
+
+static inline uint64_t pto2_task_id_raw(PTO2TaskId task_id) {
+    return task_id.raw;
+}
+
 // =============================================================================
 // Worker Types
 // =============================================================================
@@ -355,8 +367,9 @@ struct PTO2TaskPayload {
     int32_t tensor_count{0};
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
-    int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
+    int32_t completion_count{0};               // Deferred completion conditions copied from PTOParam
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
+    PTO2DeferredCompletion completions[PTO2_MAX_COMPLETIONS_PER_TASK];
     // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
     // === Cache lines 35-50 (1024B) — scalars ===
@@ -370,10 +383,13 @@ struct PTO2TaskPayload {
             tensors[i].copy(*src_tensors[i]);
         }
         static_assert(sizeof(scalars) == sizeof(params.scalars));
+        static_assert(sizeof(completions) == sizeof(params.completions));
         // Round up to cache line boundary. Both arrays are 1024B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, params.scalars,
                PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
+        completion_count = params.completion_count;
+        memcpy(completions, params.completions, params.completion_count * sizeof(PTO2DeferredCompletion));
     }
 };
 
@@ -414,7 +430,6 @@ struct alignas(64) PTO2TaskSlotState {
     uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
     std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
     uint8_t ring_id;                             // Ring layer this task belongs to (for per-ring reclamation)
-    uint8_t complete_in_future{0};               // 1=deferred completion (async hw op), 0=run-to-completion
     int32_t dep_pool_mark{0};                    // Dep pool top after this task's submission (orchestrator-only, local memory)
 };
 

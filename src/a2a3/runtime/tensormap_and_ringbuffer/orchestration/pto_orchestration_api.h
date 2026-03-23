@@ -104,10 +104,6 @@ void pto2_framework_bind_runtime(PTO2Runtime* rt);
 typedef struct PTO2RuntimeOps {
     void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                         const PTOParam& params);
-    void (*submit_task_async)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                              const PTOParam& params, uint64_t event_output_gm_addr);
-    void (*submit_task_async_sdma)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                                   const PTOParam& params, uint64_t event_output_gm_addr);
     uint64_t (*get_sdma_workspace)(PTO2Runtime* rt);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
@@ -190,22 +186,28 @@ static inline void pto2_rt_submit_aiv_task(PTO2Runtime* rt,
 }
 
 /**
- * Submit a task with deferred completion (complete_in_future=1).
- * The kernel writes the async event handle to event_output_gm_addr.
- * The scheduler polls the event flag until the async operation completes.
+ * Submit a task with deferred completion.
+ * The kernel writes or updates the signal behind event_output_gm_addr, and the
+ * scheduler polls that address until the completion condition is satisfied.
  */
 static inline void pto2_rt_submit_task_async(const MixedKernels& mixed_kernels,
                                              const PTOParam& params,
                                              uint64_t event_output_gm_addr) {
     PTO2Runtime* rt = pto2_current_runtime();
-    rt->ops->submit_task_async(rt, mixed_kernels, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mixed_kernels, async_params);
 }
 
 static inline void pto2_rt_submit_task_async(PTO2Runtime* rt,
                                              const MixedKernels& mixed_kernels,
                                              const PTOParam& params,
                                              uint64_t event_output_gm_addr) {
-    rt->ops->submit_task_async(rt, mixed_kernels, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mixed_kernels, async_params);
 }
 
 static inline void pto2_rt_submit_aiv_task_async(int32_t kernel_id,
@@ -214,7 +216,10 @@ static inline void pto2_rt_submit_aiv_task_async(int32_t kernel_id,
     PTO2Runtime* rt = pto2_current_runtime();
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
-    rt->ops->submit_task_async(rt, mk, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
 }
 
 static inline void pto2_rt_submit_aiv_task_async(PTO2Runtime* rt,
@@ -223,7 +228,10 @@ static inline void pto2_rt_submit_aiv_task_async(PTO2Runtime* rt,
                                                  uint64_t event_output_gm_addr) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
-    rt->ops->submit_task_async(rt, mk, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
 }
 
 static inline void pto2_rt_submit_aic_task_async(int32_t kernel_id,
@@ -232,7 +240,10 @@ static inline void pto2_rt_submit_aic_task_async(int32_t kernel_id,
     PTO2Runtime* rt = pto2_current_runtime();
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
-    rt->ops->submit_task_async(rt, mk, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
 }
 
 static inline void pto2_rt_submit_aic_task_async(PTO2Runtime* rt,
@@ -241,21 +252,30 @@ static inline void pto2_rt_submit_aic_task_async(PTO2Runtime* rt,
                                                  uint64_t event_output_gm_addr) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
-    rt->ops->submit_task_async(rt, mk, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
 }
 
 static inline void pto2_rt_submit_task_async_sdma(const MixedKernels& mixed_kernels,
                                                   const PTOParam& params,
                                                   uint64_t event_output_gm_addr) {
     PTO2Runtime* rt = pto2_current_runtime();
-    rt->ops->submit_task_async_sdma(rt, mixed_kernels, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mixed_kernels, async_params);
 }
 
 static inline void pto2_rt_submit_task_async_sdma(PTO2Runtime* rt,
                                                   const MixedKernels& mixed_kernels,
                                                   const PTOParam& params,
                                                   uint64_t event_output_gm_addr) {
-    rt->ops->submit_task_async_sdma(rt, mixed_kernels, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mixed_kernels, async_params);
 }
 
 static inline void pto2_rt_submit_aiv_task_async_sdma(int32_t kernel_id,
@@ -264,7 +284,10 @@ static inline void pto2_rt_submit_aiv_task_async_sdma(int32_t kernel_id,
     PTO2Runtime* rt = pto2_current_runtime();
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
-    rt->ops->submit_task_async_sdma(rt, mk, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
 }
 
 static inline void pto2_rt_submit_aiv_task_async_sdma(PTO2Runtime* rt,
@@ -273,7 +296,10 @@ static inline void pto2_rt_submit_aiv_task_async_sdma(PTO2Runtime* rt,
                                                       uint64_t event_output_gm_addr) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
-    rt->ops->submit_task_async_sdma(rt, mk, params, event_output_gm_addr);
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
 }
 
 static inline uint64_t pto2_rt_get_sdma_workspace() {

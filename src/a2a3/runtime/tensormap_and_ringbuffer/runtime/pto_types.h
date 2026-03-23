@@ -29,6 +29,8 @@
 #define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
 #define PTO2_MAX_INPUTS           16      // Maximum inputs per task
 #define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
+// Deferred completion signals are bounded by the task's external input footprint.
+#define PTO2_MAX_COMPLETIONS_PER_TASK PTO2_MAX_INPUTS
 
 // =============================================================================
 // Parameter Types (for pto_submit_task API)
@@ -41,6 +43,17 @@ enum class PTOParamType : int32_t {
     INPUT = 0,   // Read-only input buffer
     OUTPUT = 1,  // Write-only output buffer (NULL addr: runtime allocates; non-NULL: use as-is)
     INOUT = 2,   // Read-then-write: consumer of prior producer + modifier for downstream
+};
+
+enum class PTO2CompletionType : int32_t {
+    EVENT_FLAG = 0,
+    COUNTER = 1,
+};
+
+struct PTO2DeferredCompletion {
+    PTO2CompletionType type{PTO2CompletionType::EVENT_FLAG};
+    uint64_t addr{0};
+    uint32_t expected_value{0};
 };
 
 /**
@@ -65,14 +78,17 @@ struct PTOParam {
     Tensor* tensors[PTO2_MAX_TENSOR_PARAMS];
     PTOParamType tensor_types[PTO2_MAX_TENSOR_PARAMS];
     uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
+    PTO2DeferredCompletion completions[PTO2_MAX_COMPLETIONS_PER_TASK];
     int32_t tensor_count{0};
     int32_t scalar_count{0};
+    int32_t completion_count{0};
     bool has_error{false};
     const char* error_msg{nullptr};
 
     void reset() {
         tensor_count = 0;
         scalar_count = 0;
+        completion_count = 0;
         has_error = false;
         error_msg = nullptr;
     }
@@ -82,6 +98,14 @@ struct PTOParam {
             has_error = true;
             error_msg = msg;
         }
+    }
+
+    bool check_add_completion_valid() {
+        if (completion_count >= PTO2_MAX_COMPLETIONS_PER_TASK) {
+            set_error("Too many deferred completion conditions for one task");
+            return false;
+        }
+        return true;
     }
 
     bool check_add_tensor_valid() {
@@ -190,6 +214,30 @@ struct PTOParam {
         }
         memcpy(&scalars[scalar_count], &src.scalars[src_offset], count * sizeof(uint64_t));
         scalar_count += count;
+    }
+
+    void add_completion_event_flag(uint64_t flag_addr) {
+        if (!check_add_completion_valid()) {
+            return;
+        }
+        completions[completion_count].type = PTO2CompletionType::EVENT_FLAG;
+        completions[completion_count].addr = flag_addr;
+        completions[completion_count].expected_value = 1;
+        completion_count++;
+    }
+
+    void add_completion_counter(uint64_t counter_addr, uint32_t expected_value) {
+        if (!check_add_completion_valid()) {
+            return;
+        }
+        completions[completion_count].type = PTO2CompletionType::COUNTER;
+        completions[completion_count].addr = counter_addr;
+        completions[completion_count].expected_value = expected_value;
+        completion_count++;
+    }
+
+    bool has_deferred_completion() const {
+        return completion_count > 0;
     }
 };
 

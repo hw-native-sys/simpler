@@ -49,9 +49,8 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count,
-                                int orch_thread_num, int orch_thread_index) {
-    (void)rt;
+void aicpu_orchestration_entry(uint64_t* args, int arg_count,
+                               int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
     (void)orch_thread_num;
     (void)orch_thread_index;
@@ -79,7 +78,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count,
         params_producer.add_input(ext_in);
         params_producer.add_output(ext_out);
         params_producer.add_scalar(sdma_workspace);
-        pto2_rt_submit_aiv_task_async_sdma(rt, 2, params_producer, event_handle_output_gm);
+        pto2_rt_submit_aiv_task_async_sdma(2, params_producer, event_handle_output_gm);
 
         LOG_INFO("async_demo: HW mode - submitted TPUT_ASYNC producer (func_id=2)");
     } else {
@@ -88,7 +87,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count,
         PTOParam params_producer;
         params_producer.add_input(ext_in);
         params_producer.add_output(ext_out);
-        pto2_rt_submit_aiv_task_async(rt, 0, params_producer, event_handle_output_gm);
+        pto2_rt_submit_aiv_task_async(0, params_producer, event_handle_output_gm);
 
         LOG_INFO("async_demo: Sim mode - submitted simulated producer (func_id=0)");
     }
@@ -97,7 +96,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count,
     PTOParam params_consumer;
     params_consumer.add_input(ext_out);
     params_consumer.add_output(ext_result);
-    pto2_rt_submit_aiv_task(rt, 1, params_consumer);
+    pto2_rt_submit_aiv_task(1, params_consumer);
 }
 
 }  // extern "C"

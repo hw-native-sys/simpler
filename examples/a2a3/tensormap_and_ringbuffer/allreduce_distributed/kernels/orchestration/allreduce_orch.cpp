@@ -32,8 +32,8 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count,
-                                int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(uint64_t* args, int arg_count,
+                               int orch_thread_num, int orch_thread_index) {
     (void)arg_count;
     (void)orch_thread_num;
 
@@ -45,7 +45,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count,
     params.add_scalar(args[2]);
     params.add_scalar(args[3]);
     params.add_scalar(args[4]);
-    pto2_rt_submit_aiv_task(rt, 0, params);
+    pto2_rt_submit_aiv_task(0, params);
 }
 
 }  // extern "C"

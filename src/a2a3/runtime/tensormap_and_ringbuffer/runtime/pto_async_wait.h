@@ -21,16 +21,6 @@
 #include "pto_runtime2_types.h"
 
 inline constexpr int32_t PTO2_MAX_ASYNC_WAITS = 64;
-inline constexpr int32_t PTO2_MAX_COMPLETIONS_PER_TASK = 4;
-
-// =============================================================================
-// Completion Condition Types
-// =============================================================================
-
-enum class PTO2CompletionType : uint8_t {
-    EVENT_FLAG = 0,
-    COUNTER    = 1,
-};
 
 struct PTO2CompletionCondition {
     PTO2CompletionType type;
@@ -51,6 +41,32 @@ struct PTO2CompletionCondition {
         return false;
     }
 };
+
+template <bool Profiling>
+#if PTO2_SCHED_PROFILING
+static inline PTO2CompletionStats pto2_complete_task(
+#else
+static inline void pto2_complete_task(
+#endif
+        PTO2SchedulerState* sched,
+        PTO2TaskSlotState& slot_state,
+        PTO2LocalReadyBuffer* local_bufs,
+        PTO2TaskSlotState** deferred_release_slot_states,
+        int32_t& deferred_release_count
+#if PTO2_SCHED_PROFILING
+        , int thread_idx
+#endif
+        ) {
+#if PTO2_SCHED_PROFILING
+    PTO2CompletionStats stats = sched->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
+#else
+    sched->on_mixed_task_complete(slot_state, local_bufs);
+#endif
+    deferred_release_slot_states[deferred_release_count++] = &slot_state;
+#if PTO2_SCHED_PROFILING
+    return stats;
+#endif
+}
 
 // =============================================================================
 // Async Wait Entry (one per deferred task)
@@ -145,8 +161,7 @@ struct PTO2AsyncWaitList {
 #endif
             ) {
         int32_t completed = 0;
-        int32_t i = 0;
-        while (i < count) {
+        for (int32_t i = count - 1; i >= 0; --i) {
             PTO2AsyncWaitEntry& entry = entries[i];
 
             for (int32_t c = 0; c < entry.condition_count; c++) {
@@ -159,19 +174,32 @@ struct PTO2AsyncWaitList {
 
             if (entry.waiting_completion_count <= 0) {
 #if PTO2_SCHED_PROFILING
-                sched->on_mixed_task_complete(*entry.slot_state, thread_idx, local_bufs);
+                auto stats = pto2_complete_task<Profiling>(
+                    sched,
+                    *entry.slot_state,
+                    local_bufs,
+                    deferred_release_slot_states,
+                    deferred_release_count,
+                    thread_idx
+                );
+                (void)stats;
 #else
-                sched->on_mixed_task_complete(*entry.slot_state, local_bufs);
+                pto2_complete_task<Profiling>(
+                    sched,
+                    *entry.slot_state,
+                    local_bufs,
+                    deferred_release_slot_states,
+                    deferred_release_count
+                );
 #endif
-                deferred_release_slot_states[deferred_release_count++] = entry.slot_state;
                 completed++;
 
                 // Swap-remove: replace with last entry
-                entries[i] = entries[count - 1];
-                count--;
-                // Don't increment i — re-check the swapped entry
-            } else {
-                i++;
+                int32_t last = count - 1;
+                if (i != last) {
+                    entries[i] = entries[last];
+                }
+                count = last;
             }
         }
         return completed;

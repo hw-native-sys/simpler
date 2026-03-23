@@ -75,6 +75,42 @@ static PTO2Runtime *rt{nullptr};
 // Per-core dispatch payload storage (one per physical core)
 static PTO2DispatchPayload s_pto2_payload_per_core[RUNTIME_MAX_WORKER];
 
+static bool register_deferred_completions(PTO2TaskSlotState& slot_state,
+                                          PTO2AsyncWaitList& async_wait_list,
+                                          int32_t thread_idx) {
+    if (slot_state.payload == nullptr || slot_state.payload->completion_count <= 0) {
+        return false;
+    }
+
+    for (int32_t i = 0; i < slot_state.payload->completion_count; ++i) {
+        const PTO2DeferredCompletion& completion = slot_state.payload->completions[i];
+        switch (completion.type) {
+            case PTO2CompletionType::EVENT_FLAG: {
+                volatile uint32_t* flag_addr = reinterpret_cast<volatile uint32_t*>(
+                    static_cast<uintptr_t>(completion.addr));
+                async_wait_list.add_event_flag(&slot_state, flag_addr);
+                DEV_DEBUG("Thread %d: deferred completion (event) for task %d, addr=0x%lx",
+                          thread_idx,
+                          static_cast<int32_t>(pto2_task_id_local(slot_state.task->mixed_task_id)),
+                          completion.addr);
+                break;
+            }
+            case PTO2CompletionType::COUNTER: {
+                volatile uint32_t* counter_addr = reinterpret_cast<volatile uint32_t*>(
+                    static_cast<uintptr_t>(completion.addr));
+                async_wait_list.add_counter(&slot_state, counter_addr, completion.expected_value);
+                DEV_DEBUG("Thread %d: deferred completion (counter) for task %d, addr=0x%lx, expected=%u",
+                          thread_idx,
+                          static_cast<int32_t>(pto2_task_id_local(slot_state.task->mixed_task_id)),
+                          completion.addr,
+                          completion.expected_value);
+                break;
+            }
+        }
+    }
+    return true;
+}
+
 // Core information for discovery (with register address for fast dispatch)
 struct CoreInfo {
     int32_t worker_id;              // Index in runtime.workers[]
@@ -328,46 +364,32 @@ struct AicpuExecutor {
                 // Two-stage completion: mark subtask done, then handle mixed-task completion
                 bool mixed_complete = rt->scheduler.on_subtask_complete(slot_state, subslot);
                 if (mixed_complete) {
-                    if (slot_state.complete_in_future == 1) {
-                        // Deferred completion (direct): last scalar IS the flag address
-                        uint64_t event_handle = slot_state.payload->scalars[slot_state.payload->scalar_count - 1];
-                        volatile uint32_t* flag_addr = reinterpret_cast<volatile uint32_t*>(
-                            static_cast<uintptr_t>(event_handle));
-                        async_wait_list.add_event_flag(&slot_state, flag_addr);
-                        DEV_DEBUG("Thread %d: deferred completion (direct) for task %d, flag_addr=0x%lx",
-                            thread_idx,
-                            static_cast<int32_t>(pto2_task_id_local(slot_state.task->mixed_task_id)),
-                            event_handle);
-                    } else if (slot_state.complete_in_future == 2) {
-                        // Deferred completion (indirect/SDMA): last scalar is GM buffer where
-                        // kernel writes the AsyncEvent handle (uint64_t, non-zero when ready).
-                        // Poll the GM buffer directly via async_wait_list — the lower 32 bits
-                        // of a valid GM pointer are non-zero on little-endian.
-                        // This avoids the race where an immediate dereference sees stale cache.
-                        uint64_t gm_buf_addr = slot_state.payload->scalars[slot_state.payload->scalar_count - 1];
-                        volatile uint32_t* flag_addr = reinterpret_cast<volatile uint32_t*>(
-                            static_cast<uintptr_t>(gm_buf_addr));
-                        async_wait_list.add_event_flag(&slot_state, flag_addr);
-                        DEV_DEBUG("Thread %d: deferred completion (indirect) for task %d, polling gm_buf=0x%lx",
-                            thread_idx,
-                            static_cast<int32_t>(pto2_task_id_local(slot_state.task->mixed_task_id)),
-                            gm_buf_addr);
+                    if (register_deferred_completions(slot_state, async_wait_list, thread_idx)) {
+                        // Deferred completion is now tracked by async_wait_list.
                     } else {
 #if PTO2_SCHED_PROFILING
-                    PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(slot_state, thread_idx, local_bufs);
+                    PTO2CompletionStats cstats = pto2_complete_task<false>(
+                        &rt->scheduler,
+                        slot_state,
+                        local_bufs,
+                        deferred_release_slot_states,
+                        deferred_release_count,
+                        thread_idx);
                     notify_edges_total += cstats.fanout_edges;
                     if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
                     notify_tasks_enqueued += cstats.tasks_enqueued;
                     phase_complete_count++;
 #else
-                    rt->scheduler.on_mixed_task_complete(slot_state, local_bufs);
+                    pto2_complete_task<false>(&rt->scheduler,
+                                              slot_state,
+                                              local_bufs,
+                                              deferred_release_slot_states,
+                                              deferred_release_count);
 #if PTO2_PROFILING
                     phase_complete_count++;
 #endif
 #endif
-                    if (deferred_release_count < 256) {
-                        deferred_release_slot_states[deferred_release_count++] = &slot_state;
-                    } else {
+                    if (deferred_release_count >= 256) {
                         DEV_ALWAYS("Thread %d: release", thread_idx);
                         while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
@@ -383,7 +405,6 @@ struct AicpuExecutor {
                             if (fe > fanin_max_degree) fanin_max_degree = fe;
 #endif
                         }
-                        deferred_release_slot_states[deferred_release_count++] = &slot_state;
                     }
                     }
                 }
@@ -437,7 +458,7 @@ struct AicpuExecutor {
                     expected_reg_task_id,
                     mixed_complete ? 1 : 0);
                 cur_thread_completed++;
-                if (mixed_complete && !slot_state.complete_in_future) {
+                if (mixed_complete && slot_state.payload != nullptr && slot_state.payload->completion_count == 0) {
                     completed_this_turn++;
                 }
                 made_progress = true;

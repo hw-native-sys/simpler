@@ -28,20 +28,7 @@ void pto2_set_orch_thread_idx(int idx) {
 
 static void submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                              const PTOParam& params) {
-    pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
-                           params);
-}
-
-static void submit_task_async_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                                   const PTOParam& params, uint64_t event_output_gm_addr) {
-    pto2_submit_mixed_task_async(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
-                                 params, event_output_gm_addr);
-}
-
-static void submit_task_async_sdma_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                                        const PTOParam& params, uint64_t event_output_gm_addr) {
-    pto2_submit_mixed_task_async_sdma(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
-                                      params, event_output_gm_addr);
+    rt->orchestrators[pto2_current_orch_idx].submit_task(mixed_kernels, params);
 }
 
 static uint64_t get_sdma_workspace_impl(PTO2Runtime* rt) {
@@ -66,8 +53,6 @@ static bool is_fatal_impl(PTO2Runtime* rt) {
 
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task            = submit_task_impl,
-    .submit_task_async      = submit_task_async_impl,
-    .submit_task_async_sdma = submit_task_async_sdma_impl,
     .get_sdma_workspace     = get_sdma_workspace_impl,
     .scope_begin            = pto2_rt_scope_begin,
     .scope_end              = pto2_rt_scope_end,

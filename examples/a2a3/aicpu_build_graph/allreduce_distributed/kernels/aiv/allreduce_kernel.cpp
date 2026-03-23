@@ -45,7 +45,6 @@ void kernel_entry(__gm__ int64_t* args) {
     __gm__ float* input  = reinterpret_cast<__gm__ float*>(args[0]);
     __gm__ float* output = reinterpret_cast<__gm__ float*>(args[1]);
     int nranks = static_cast<int>(args[2]);
-    int root   = static_cast<int>(args[3]);
     __gm__ CommDeviceContext* commCtx =
         reinterpret_cast<__gm__ CommDeviceContext*>(args[4]);
 
@@ -57,8 +56,6 @@ void kernel_entry(__gm__ int64_t* args) {
                                          pto::Layout::ND>;
     using TileData  = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT,
                                  pto::BLayout::RowMajor, -1, -1>;
-
-    int my_rank = static_cast<int>(commCtx->rankId);
 
     ShapeDyn shape(1, 1, 1, 1, ALLREDUCE_COUNT);
     StrideDyn stride(ALLREDUCE_COUNT, ALLREDUCE_COUNT, ALLREDUCE_COUNT,
