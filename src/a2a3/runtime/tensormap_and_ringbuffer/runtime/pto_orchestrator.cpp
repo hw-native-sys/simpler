@@ -247,8 +247,9 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // =============================================================================
 // Task Submission
 // =============================================================================
-void pto2_submit_mixed_task(
-    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const PTOParam& params) {
+void PTO2OrchestratorState::submit_task(
+    const MixedKernels& mixed_kernels, const PTOParam& params) {
+    PTO2OrchestratorState* orch = this;
     CYCLE_COUNT_START();
 
     // Fast path after fatal error — all subsequent submits are no-ops

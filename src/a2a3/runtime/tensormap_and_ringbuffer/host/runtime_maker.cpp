@@ -28,6 +28,13 @@
 #include <cerrno>
 #include <sys/time.h>
 
+#if __has_include("pto/npu/comm/async/sdma/sdma_workspace_manager.hpp")
+#include "pto/npu/comm/async/sdma/sdma_workspace_manager.hpp"
+#define PTO2_HAS_SDMA_WORKSPACE_MANAGER 1
+#else
+#define PTO2_HAS_SDMA_WORKSPACE_MANAGER 0
+#endif
+
 // Helper: return current time in milliseconds
 static long long _now_ms() {
     struct timeval tv;
@@ -310,6 +317,25 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     }
     runtime->set_pto2_gm_sm_ptr(sm_ptr);
     runtime->record_tensor_pair(nullptr, sm_ptr, static_cast<size_t>(sm_size));
+
+    // SDMA workspace initialization (controlled by PTO2_ENABLE_SDMA env var)
+#if PTO2_HAS_SDMA_WORKSPACE_MANAGER
+    {
+        const char* env_sdma = std::getenv("PTO2_ENABLE_SDMA");
+        if (env_sdma && env_sdma[0] == '1' && env_sdma[1] == '\0') {
+            LOG_INFO("SDMA workspace init requested (PTO2_ENABLE_SDMA=1)");
+            static pto::comm::sdma::SdmaWorkspaceManager sdma_manager;
+            if (sdma_manager.Init()) {
+                uint64_t ws_addr = reinterpret_cast<uint64_t>(sdma_manager.GetWorkspaceAddr());
+                runtime->set_sdma_workspace_addr(ws_addr);
+                LOG_INFO("SDMA workspace initialized: addr=0x%lx", (unsigned long)ws_addr);
+            } else {
+                LOG_WARN("SDMA workspace initialization failed, continuing without SDMA support");
+                runtime->set_sdma_workspace_addr(0);
+            }
+        }
+    }
+#endif
 
     // Set up device orchestration state
     runtime->set_orch_built_on_host(false);

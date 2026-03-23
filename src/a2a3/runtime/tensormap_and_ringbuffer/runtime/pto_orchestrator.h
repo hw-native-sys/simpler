@@ -109,6 +109,15 @@ struct PTO2OrchestratorState {
 
         return buffer;
     }
+
+    /**
+     * Submit a task and build its dependency/lifecycle metadata.
+     *
+     * Deferred completion is expressed via PTOParam::completions and handled
+     * inside the normal submit path, so the orchestrator exposes only one
+     * submission entry point.
+     */
+    void submit_task(const MixedKernels& mixed_kernels, const PTOParam& params);
 };
 
 // =============================================================================
@@ -164,25 +173,6 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
 // =============================================================================
 // Task Submission
 // =============================================================================
-
-/**
- * Submit a task with InCore function and parameters
- *
- * This is the main API for building the task graph:
- * 1. Allocates task slot from TaskRing (blocks until available)
- * 2. Allocates packed output buffer from HeapRing (blocks until available)
- * 3. Looks up inputs in TensorMap to find dependencies
- * 4. Updates producer's fanout_count/list (with spinlock)
- * 5. Registers outputs in TensorMap
- * 6. Initializes task state in scheduler
- *
- * @param orch        Orchestrator state
- * @param mixed_kernels  Kernel IDs for AIC/AIV0/AIV1 slots
- * @param params      Aggregated tensor and scalar parameters
- */
-void pto2_submit_mixed_task(PTO2OrchestratorState* orch,
-    const MixedKernels& mixed_kernels,
-    const PTOParam& params);
 
 // =============================================================================
 // Flow Control

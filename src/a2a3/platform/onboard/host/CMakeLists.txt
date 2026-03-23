@@ -28,6 +28,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/host_log.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_log_host.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/performance_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/comm_hccl.cpp"
 )
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
@@ -80,6 +81,25 @@ target_link_directories(host_runtime
         ${ASCEND_HOME_PATH}/runtime/lib64
 )
 
+# CANN 9.x exposes the working non-V2 HCCL entry points through libhcomm.
+# Link it explicitly so comm_hccl.cpp can follow the same initialization path
+# as the pto-isa communication tests.
+find_library(HCOMM_LIB NAMES hcomm PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+if(HCOMM_LIB)
+    set(HCCL_LINK_TARGETS hcomm)
+    message(STATUS "Using HCCL library: hcomm")
+else()
+    message(FATAL_ERROR "libhcomm not found under ${ASCEND_HOME_PATH}/lib64")
+endif()
+
+# Optionally link nnopbase (provides aclCreateTensor/aclDestroyTensor for SdmaWorkspaceManager)
+find_library(NNOPBASE_LIB NAMES nnopbase PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+if(NNOPBASE_LIB)
+    set(NNOPBASE_LINK nnopbase)
+else()
+    set(NNOPBASE_LINK "")
+endif()
+
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
 # when performance profiling is enabled
@@ -87,6 +107,8 @@ target_link_libraries(host_runtime
     PRIVATE
         runtime
         ascendcl
+        ${HCCL_LINK_TARGETS}
+        ${NNOPBASE_LINK}
         dl
 )
 

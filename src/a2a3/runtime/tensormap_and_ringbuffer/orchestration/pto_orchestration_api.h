@@ -104,6 +104,7 @@ void pto2_framework_bind_runtime(PTO2Runtime* rt);
 typedef struct PTO2RuntimeOps {
     void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                         const PTOParam& params);
+    uint64_t (*get_sdma_workspace)(PTO2Runtime* rt);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
@@ -162,8 +163,160 @@ static inline void pto2_rt_submit_aiv_task(int32_t kernel_id, const PTOParam& pa
     rt->ops->submit_task(rt, mk, params);
 }
 
+static inline void pto2_rt_submit_task(PTO2Runtime* rt,
+                                       const MixedKernels& mixed_kernels,
+                                       const PTOParam& params) {
+    rt->ops->submit_task(rt, mixed_kernels, params);
+}
+
+static inline void pto2_rt_submit_aic_task(PTO2Runtime* rt,
+                                           int32_t kernel_id,
+                                           const PTOParam& params) {
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    rt->ops->submit_task(rt, mk, params);
+}
+
+static inline void pto2_rt_submit_aiv_task(PTO2Runtime* rt,
+                                           int32_t kernel_id,
+                                           const PTOParam& params) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    rt->ops->submit_task(rt, mk, params);
+}
+
+/**
+ * Submit a task with deferred completion.
+ * The kernel writes or updates the signal behind event_output_gm_addr, and the
+ * scheduler polls that address until the completion condition is satisfied.
+ */
+static inline void pto2_rt_submit_task_async(const MixedKernels& mixed_kernels,
+                                             const PTOParam& params,
+                                             uint64_t event_output_gm_addr) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mixed_kernels, async_params);
+}
+
+static inline void pto2_rt_submit_task_async(PTO2Runtime* rt,
+                                             const MixedKernels& mixed_kernels,
+                                             const PTOParam& params,
+                                             uint64_t event_output_gm_addr) {
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mixed_kernels, async_params);
+}
+
+static inline void pto2_rt_submit_aiv_task_async(int32_t kernel_id,
+                                                 const PTOParam& params,
+                                                 uint64_t event_output_gm_addr) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
+}
+
+static inline void pto2_rt_submit_aiv_task_async(PTO2Runtime* rt,
+                                                 int32_t kernel_id,
+                                                 const PTOParam& params,
+                                                 uint64_t event_output_gm_addr) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
+}
+
+static inline void pto2_rt_submit_aic_task_async(int32_t kernel_id,
+                                                 const PTOParam& params,
+                                                 uint64_t event_output_gm_addr) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
+}
+
+static inline void pto2_rt_submit_aic_task_async(PTO2Runtime* rt,
+                                                 int32_t kernel_id,
+                                                 const PTOParam& params,
+                                                 uint64_t event_output_gm_addr) {
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
+}
+
+static inline void pto2_rt_submit_task_async_sdma(const MixedKernels& mixed_kernels,
+                                                  const PTOParam& params,
+                                                  uint64_t event_output_gm_addr) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mixed_kernels, async_params);
+}
+
+static inline void pto2_rt_submit_task_async_sdma(PTO2Runtime* rt,
+                                                  const MixedKernels& mixed_kernels,
+                                                  const PTOParam& params,
+                                                  uint64_t event_output_gm_addr) {
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mixed_kernels, async_params);
+}
+
+static inline void pto2_rt_submit_aiv_task_async_sdma(int32_t kernel_id,
+                                                      const PTOParam& params,
+                                                      uint64_t event_output_gm_addr) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
+}
+
+static inline void pto2_rt_submit_aiv_task_async_sdma(PTO2Runtime* rt,
+                                                      int32_t kernel_id,
+                                                      const PTOParam& params,
+                                                      uint64_t event_output_gm_addr) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    PTOParam async_params = params;
+    async_params.add_scalar(event_output_gm_addr);
+    async_params.add_completion_event_flag(event_output_gm_addr);
+    rt->ops->submit_task(rt, mk, async_params);
+}
+
+static inline uint64_t pto2_rt_get_sdma_workspace() {
+    PTO2Runtime* rt = pto2_current_runtime();
+    return rt->ops->get_sdma_workspace(rt);
+}
+
+static inline uint64_t pto2_rt_get_sdma_workspace(PTO2Runtime* rt) {
+    return rt->ops->get_sdma_workspace(rt);
+}
+
 static inline void pto2_rt_scope_begin() {
     PTO2Runtime* rt = pto2_current_runtime();
+    rt->ops->scope_begin(rt);
+}
+
+static inline void pto2_rt_scope_begin(PTO2Runtime* rt) {
     rt->ops->scope_begin(rt);
 }
 
@@ -172,13 +325,25 @@ static inline void pto2_rt_scope_end() {
     rt->ops->scope_end(rt);
 }
 
+static inline void pto2_rt_scope_end(PTO2Runtime* rt) {
+    rt->ops->scope_end(rt);
+}
+
 static inline void pto2_rt_orchestration_done() {
     PTO2Runtime* rt = pto2_current_runtime();
     rt->ops->orchestration_done(rt);
 }
 
+static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) {
+    rt->ops->orchestration_done(rt);
+}
+
 static inline bool pto2_rt_is_fatal() {
     PTO2Runtime* rt = pto2_current_runtime();
+    return rt->ops->is_fatal(rt);
+}
+
+static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) {
     return rt->ops->is_fatal(rt);
 }
 

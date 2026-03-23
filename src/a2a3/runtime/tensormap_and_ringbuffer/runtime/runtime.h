@@ -180,6 +180,7 @@ private:
     void* pto2_gm_sm_ptr_;  // GM pointer to PTO2 shared memory (device)
     void* pto2_gm_heap_ptr_;  // GM heap for orchestrator output buffers (device)
     void* pto2_slot_states_ptr_;  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
+    uint64_t sdma_workspace_addr_;  // SDMA workspace device address (0 = not available)
     uint64_t* orch_args_;   // Arguments for device orchestration
     int orch_arg_count_;
     uint64_t orch_args_storage_[RUNTIME_MAX_ARGS];  // Copy of args for device
@@ -246,6 +247,8 @@ public:
     void set_pto2_gm_sm_ptr(void* p);
     void set_pto2_gm_heap(void* p);
     void set_pto2_slot_states_ptr(void* p);
+    void set_sdma_workspace_addr(uint64_t addr);
+    uint64_t get_sdma_workspace_addr() const;
     void set_orch_args(uint64_t* args, int count);
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)

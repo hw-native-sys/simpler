@@ -28,8 +28,11 @@ void pto2_set_orch_thread_idx(int idx) {
 
 static void submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                              const PTOParam& params) {
-    pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
-                           params);
+    rt->orchestrators[pto2_current_orch_idx].submit_task(mixed_kernels, params);
+}
+
+static uint64_t get_sdma_workspace_impl(PTO2Runtime* rt) {
+    return rt->sdma_workspace_addr;
 }
 
 void pto2_rt_scope_begin(PTO2Runtime* rt) {
@@ -49,16 +52,17 @@ static bool is_fatal_impl(PTO2Runtime* rt) {
 }
 
 static const PTO2RuntimeOps s_runtime_ops = {
-    .submit_task          = submit_task_impl,
-    .scope_begin          = pto2_rt_scope_begin,
-    .scope_end            = pto2_rt_scope_end,
-    .orchestration_done   = pto2_rt_orchestration_done,
-    .is_fatal             = is_fatal_impl,
-    .log_error            = unified_log_error,
-    .log_warn             = unified_log_warn,
-    .log_info             = unified_log_info,
-    .log_debug            = unified_log_debug,
-    .log_always           = unified_log_always,
+    .submit_task            = submit_task_impl,
+    .get_sdma_workspace     = get_sdma_workspace_impl,
+    .scope_begin            = pto2_rt_scope_begin,
+    .scope_end              = pto2_rt_scope_end,
+    .orchestration_done     = pto2_rt_orchestration_done,
+    .is_fatal               = is_fatal_impl,
+    .log_error              = unified_log_error,
+    .log_warn               = unified_log_warn,
+    .log_info               = unified_log_info,
+    .log_debug              = unified_log_debug,
+    .log_always             = unified_log_always,
 };
 
 // =============================================================================
