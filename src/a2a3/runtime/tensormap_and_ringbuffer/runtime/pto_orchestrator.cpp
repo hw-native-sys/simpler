@@ -353,8 +353,8 @@ void pto2_submit_mixed_task(
         __builtin_prefetch(&payload->tensors[i], 1, 3);
         __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 3);
     }
-    for (int32_t i = 0; i < params.scalar_count; i += 8) {
-        __builtin_prefetch(&payload->scalars[i], 1, 3);
+    for (int32_t i = 0; i < params.tensor_count + params.scalar_count; i += 8) {
+        __builtin_prefetch(&payload->dispatch_args[i], 1, 3);
     }
     __builtin_prefetch(payload, 1, 3);
     __builtin_prefetch(reinterpret_cast<char*>(payload) + 64, 1, 3);

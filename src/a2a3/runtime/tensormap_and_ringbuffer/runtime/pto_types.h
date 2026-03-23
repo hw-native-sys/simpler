@@ -91,7 +91,7 @@ struct PTOParam {
             return false;
         }
         if (tensor_count >= PTO2_MAX_TENSOR_PARAMS) {
-            set_error("Too many tensor params (exceeds PTO2_MAX_TENSOR_PARAMS=32)");
+            set_error("Too many tensor params (exceeds PTO2_MAX_TENSOR_PARAMS=16)");
             return false;
         }
         return true;
@@ -128,7 +128,7 @@ struct PTOParam {
 
     void add_scalar(uint64_t v) {
         if (scalar_count >= PTO2_MAX_SCALAR_PARAMS) {
-            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS)");
             return;
         }
         scalars[scalar_count++] = v;
@@ -136,7 +136,7 @@ struct PTOParam {
 
     void add_scalars(const uint64_t* values, int count) {
         if (scalar_count + count > PTO2_MAX_SCALAR_PARAMS) {
-            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS)");
             return;
         }
         memcpy(&scalars[scalar_count], values, count * sizeof(uint64_t));
@@ -151,7 +151,7 @@ struct PTOParam {
      */
     void add_scalars_i32(const int32_t* values, int count) {
         if (scalar_count + count > PTO2_MAX_SCALAR_PARAMS) {
-            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS)");
             return;
         }
         uint64_t* dst = &scalars[scalar_count];
@@ -185,7 +185,7 @@ struct PTOParam {
             return;
         }
         if (scalar_count + count > PTO2_MAX_SCALAR_PARAMS) {
-            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS)");
             return;
         }
         memcpy(&scalars[scalar_count], &src.scalars[src_offset], count * sizeof(uint64_t));

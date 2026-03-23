@@ -10,7 +10,9 @@
  * - Device orchestration state (pto2_gm_sm_ptr_, orch_args_)
  * - Function address mapping (func_id_to_addr_)
  *
- * Task dispatch uses PTO2DispatchPayload from PTO2 shared memory.
+ * Task dispatch uses a per-core PTO2DispatchPayload written by the scheduler.
+ * The Orchestrator pre-builds dispatch_args[] in each task payload; the
+ * scheduler only fills function_bin_addr + args before signaling AICore.
  */
 
 #ifndef RUNTIME_H
@@ -52,9 +54,9 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * Protocol State Machine:
  * 1. Initialization: AICPU sets aicpu_ready=1
  * 2. Acknowledgment: AICore sets aicore_done=core_id+1
- * 3. Task Dispatch: AICPU assigns task pointer and sets task_status=1
- * 4. Task Execution: AICore reads task, executes, sets task_status=0
- * 5. Task Completion: AICPU reads task_status=0, clears task=0
+ * 3. Task Dispatch: AICPU writes DATA_MAIN_BASE after updating the per-core payload
+ * 4. Task Execution: AICore reads the cached PTO2DispatchPayload and executes
+ * 5. Task Completion: AICore writes FIN to COND; AICPU observes completion
  * 6. Shutdown: AICPU sets control=1, AICore exits
  *
  * Each AICore instance has its own handshake buffer to enable concurrent
@@ -71,7 +73,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
- * - task: Written by AICPU, read by AICore (0 = no task, non-zero = PTO2DispatchPayload*)
+ * - task: Written by AICPU, read by AICore (0 = not ready, non-zero = PTO2DispatchPayload*)
  * - task_status: Written by both (AICPU=1 on dispatch, AICore=0 on completion)
  * - control: Written by AICPU, read by AICore (0 = continue, 1 = quit)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
@@ -79,7 +81,7 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
 struct Handshake {
     volatile uint32_t aicpu_ready;         // AICPU ready signal: 0=not ready, 1=ready
     volatile uint32_t aicore_done;         // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                // Task pointer: 0=no task, non-zero=PTO2DispatchPayload*
+    volatile uint64_t task;                // Init: PTO2DispatchPayload* (set before aicpu_ready); runtime: unused
     volatile int32_t task_status;          // Task execution status: 0=idle, 1=busy
     volatile int32_t control;              // Control signal: 0=execute, 1=quit
     volatile CoreType core_type;           // Core type: CoreType::AIC or CoreType::AIV
