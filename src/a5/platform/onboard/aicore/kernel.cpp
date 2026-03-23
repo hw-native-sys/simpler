@@ -6,7 +6,7 @@
 
 class Runtime;
 
-#ifdef __AIV__
+#ifdef __DAV_VEC__
 #define KERNEL_ENTRY(x) \
     x##_0_mix_aiv  // 动态生成函数名 KERNEL_ENTRY(my_kernel) ->
                    // my_kernel_0_mix_aiv
@@ -40,7 +40,7 @@ extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, Co
  */
 extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime* runtime) {
     // Calculate block_idx for this core
-#ifdef __AIV__
+#ifdef __DAV_VEC__
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();
     core_type = CoreType::AIV;
 #else

@@ -80,13 +80,11 @@ class CCECToolchain(Toolchain):
         else:
             raise ValueError(f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a5, a5sim")
 
-        core_define = "__AIV__" if core_type == "aiv" else "__AIC__"
         return [
             "-c", "-O3", "-g", "-x", "cce",
             "-Wall", "-std=c++17",
             "--cce-aicore-only",
             f"--cce-aicore-arch={arch}",
-            f"-D{core_define}",
             "-mllvm", "-cce-aicore-stack-size=0x8000",
             "-mllvm", "-cce-aicore-function-stack-size=0x8000",
             "-mllvm", "-cce-aicore-record-overflow=false",

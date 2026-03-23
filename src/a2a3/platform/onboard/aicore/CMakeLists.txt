@@ -61,7 +61,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
     # Compile for AIC architecture
     add_custom_command(
         OUTPUT ${OBJ_AIC}
-        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} -D__AIC__ --cce-aicore-arch=dav-c220-cube
+        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c220-cube
                 -o ${OBJ_AIC} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
         COMMENT "Compiling ${SRC_NAME} for AIC"
@@ -70,7 +70,7 @@ foreach(SRC_FILE ${ALL_SOURCES})
     # Compile for AIV architecture
     add_custom_command(
         OUTPUT ${OBJ_AIV}
-        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} -D__AIV__ --cce-aicore-arch=dav-c220-vec
+        COMMAND ${BISHENG_CC} ${AICORE_FLAGS} ${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS} --cce-aicore-arch=dav-c220-vec
                 -o ${OBJ_AIV} ${SRC_FILE}
         DEPENDS ${SRC_FILE}
         COMMENT "Compiling ${SRC_NAME} for AIV"

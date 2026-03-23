@@ -33,7 +33,7 @@ extern "C" {
 #endif
 
 // Define __may_used_by_aicore__ qualifier for platform compatibility
-#if defined(__AIV__) || defined(__AIC__)
+#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
 #define __may_used_by_aicore__ __gm__
 #else
 #define __may_used_by_aicore__
