@@ -25,14 +25,12 @@ declare -A TMR_EXAMPLE_CASES=(
     [benchmark_bgemm]=""
     [paged_attention_unroll]="Case1,Case2"
     [batch_paged_attention]=""
-    [paged_attention]=""
 )
 TMR_EXAMPLE_ORDER=(
     alternating_matmul_add
     benchmark_bgemm
     paged_attention_unroll
     batch_paged_attention
-    paged_attention
 )
 
 # --- aicpu_build_graph ---
@@ -47,7 +45,7 @@ ABG_EXAMPLE_ORDER=(
 # Parse arguments
 # ---------------------------------------------------------------------------
 DEVICE_ID=0
-ROUNDS=10
+ROUNDS=100
 PLATFORM=a2a3
 RUNTIME=tensormap_and_ringbuffer
 VERBOSE=0
@@ -85,7 +83,7 @@ Usage:
 Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
-  -n, --rounds   Override number of rounds for each example (default: 10)
+  -n, --rounds   Override number of rounds for each example (default: 100)
   -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), aicpu_build_graph
   -v, --verbose  Save detailed run_example.py output to a timestamped log file
   -h, --help     Show this help
@@ -288,16 +286,40 @@ parse_timing() {
         if (show_orch)  printf "  |  Orch Avg: %.1f us", sum_o / count
         printf "  (%d rounds)\n", count
 
-        if (count > 2) {
-            trimmed = (sum_v - min_v - max_v) / (count - 2)
-            printf "  Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed, min_v, max_v
+        TRIM = 10
+        if (count > 2 * TRIM) {
+            # Insertion sort for each metric
+            for (i = 0; i < count; i++) sv[i] = results[i]
+            for (i = 1; i < count; i++) {
+                k = sv[i]; j = i - 1
+                while (j >= 0 && sv[j] > k) { sv[j+1] = sv[j]; j-- }
+                sv[j+1] = k
+            }
+            tc = count - 2 * TRIM; ts = 0
+            for (i = TRIM; i < count - TRIM; i++) ts += sv[i]
+            printf "  Trimmed Avg: %.1f us  (dropped %d low + %d high, %d rounds used)\n", ts / tc, TRIM, TRIM, tc
+
             if (show_sched) {
-                trimmed_s = (sum_s - min_s - max_s) / (count - 2)
-                printf "  Sched Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed_s, min_s, max_s
+                for (i = 0; i < count; i++) ss[i] = sched_results[i]
+                for (i = 1; i < count; i++) {
+                    k = ss[i]; j = i - 1
+                    while (j >= 0 && ss[j] > k) { ss[j+1] = ss[j]; j-- }
+                    ss[j+1] = k
+                }
+                ts2 = 0
+                for (i = TRIM; i < count - TRIM; i++) ts2 += ss[i]
+                printf "  Sched Trimmed Avg: %.1f us  (dropped %d low + %d high)\n", ts2 / tc, TRIM, TRIM
             }
             if (show_orch) {
-                trimmed_o = (sum_o - min_o - max_o) / (count - 2)
-                printf "  Orch Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed_o, min_o, max_o
+                for (i = 0; i < count; i++) so[i] = orch_results[i]
+                for (i = 1; i < count; i++) {
+                    k = so[i]; j = i - 1
+                    while (j >= 0 && so[j] > k) { so[j+1] = so[j]; j-- }
+                    so[j+1] = k
+                }
+                ts3 = 0
+                for (i = TRIM; i < count - TRIM; i++) ts3 += so[i]
+                printf "  Orch Trimmed Avg: %.1f us  (dropped %d low + %d high)\n", ts3 / tc, TRIM, TRIM
             }
         }
     }'
@@ -357,7 +379,7 @@ run_bench() {
         python3 "$RUN_EXAMPLE"
         -k "$kernels_dir" -g "$golden"
         -p "$PLATFORM" -d "$DEVICE_ID"
-        -n "$ROUNDS"
+        -n "$ROUNDS" --skip-golden
     )
     if [[ -n "$case_name" ]]; then
         run_cmd+=(--case "$case_name")

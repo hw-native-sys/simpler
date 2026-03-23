@@ -12,7 +12,6 @@ venv/
 .cache
 .vscode
 *bak
-outputs
 
 # claude local settings
 .claude/settings.json
@@ -24,6 +23,7 @@ examples/scripts/_deps/
 
 # Profiling files
 outputs
+tmp
 
 # Mid-work documentation
 .docs

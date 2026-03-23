@@ -192,6 +192,12 @@ Golden.py interface:
         help="Git protocol for cloning pto-isa (default: ssh)"
     )
 
+    parser.add_argument(
+        "--skip-golden",
+        action="store_true",
+        help="Skip golden computation and comparison (for benchmarking)"
+    )
+
     args = parser.parse_args()
 
     if args.all and args.case:
@@ -260,6 +266,7 @@ Golden.py interface:
             build_dir=args.savetemp,
             repeat_rounds=args.rounds,
             clone_protocol=args.clone_protocol,
+            skip_golden=args.skip_golden,
         )
 
         # Snapshot existing device logs before the run so we can identify the

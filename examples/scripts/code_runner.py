@@ -449,6 +449,7 @@ class CodeRunner:
         build_dir: Optional[str] = None,
         repeat_rounds: Optional[int] = None,
         clone_protocol: str = "ssh",
+        skip_golden: bool = False,
     ):
         # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
         _setup_logging_if_needed()
@@ -457,6 +458,7 @@ class CodeRunner:
         self.golden_path = Path(golden_path).resolve()
         self.platform = platform
         self.enable_profiling = enable_profiling
+        self.skip_golden = skip_golden
         self.project_root = _get_project_root()
 
         # Resolve device ID
@@ -874,12 +876,13 @@ class CodeRunner:
                 logger.debug(f"Runtime init env overrides: {run_env}")
 
             # Golden
-            golden = {k: v.clone() for k, v in outputs.items()}
-            golden_with_inputs = {**inputs, **golden}
-            _t_golden_start = time.perf_counter()
-            self._golden_module.compute_golden(golden_with_inputs, params)
-            _t_golden_end = time.perf_counter()
-            logger.info(f">>> compute_golden() took {_t_golden_end - _t_golden_start:.3f}s")
+            if not self.skip_golden:
+                golden = {k: v.clone() for k, v in outputs.items()}
+                golden_with_inputs = {**inputs, **golden}
+                _t_golden_start = time.perf_counter()
+                self._golden_module.compute_golden(golden_with_inputs, params)
+                _t_golden_end = time.perf_counter()
+                logger.info(f">>> compute_golden() took {_t_golden_end - _t_golden_start:.3f}s")
 
             initial_outputs = {k: v.clone() for k, v in outputs.items()}
 
@@ -918,7 +921,8 @@ class CodeRunner:
                 )
 
                 runtime.finalize()
-                self._compare_with_golden(outputs, golden)
+                if not self.skip_golden:
+                    self._compare_with_golden(outputs, golden)
 
             logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
 
@@ -969,7 +973,7 @@ class CodeRunner:
 def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",
                        enable_profiling=False, run_all_cases=False, case_name=None,
                        pto_isa_commit=None, build_dir=None, repeat_rounds=None,
-                       clone_protocol="ssh"):
+                       clone_protocol="ssh", skip_golden=False):
     """Factory: creates a CodeRunner based on kernel_config."""
     return CodeRunner(kernels_dir=kernels_dir, golden_path=golden_path,
                       device_id=device_id, platform=platform,
@@ -977,4 +981,5 @@ def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3"
                       run_all_cases=run_all_cases, case_name=case_name,
                       pto_isa_commit=pto_isa_commit, build_dir=build_dir,
                       repeat_rounds=repeat_rounds,
-                      clone_protocol=clone_protocol)
+                      clone_protocol=clone_protocol,
+                      skip_golden=skip_golden)
