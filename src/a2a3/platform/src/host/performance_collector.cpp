@@ -1191,7 +1191,6 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
         }
     }
 
-    AicpuPhaseHeader* phase_header = get_phase_header(perf_shared_mem_host_, num_aicore_);
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
     for (int t = 0; t < num_phase_threads; t++) {
         PhaseBufferState* state = get_phase_buffer_state(perf_shared_mem_host_, num_aicore_, t);
