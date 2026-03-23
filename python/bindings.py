@@ -181,7 +181,7 @@ class RuntimeLibraryLoader:
         self.lib.enable_runtime_profiling.restype = c_int
 
         # --- Distributed communication API (comm_*) ---
-        self.lib.comm_init.argtypes = [c_int, c_int, c_char_p]
+        self.lib.comm_init.argtypes = [c_int, c_int, c_int, c_char_p]
         self.lib.comm_init.restype = c_void_p
 
         self.lib.comm_alloc_windows.argtypes = [c_void_p, c_size_t, POINTER(c_uint64)]
@@ -543,13 +543,14 @@ def launch_runtime(
 # ============================================================================
 
 
-def comm_init(rank: int, nranks: int, rootinfo_path: str) -> int:
+def comm_init(rank: int, nranks: int, device_id: int, rootinfo_path: str) -> int:
     """
     Initialize a distributed communicator for the given rank.
 
     Args:
         rank: This process's rank (0-based)
         nranks: Total number of ranks
+        device_id: Physical device ID used by this process
         rootinfo_path: Filesystem path for root info exchange
 
     Returns:
@@ -562,7 +563,7 @@ def comm_init(rank: int, nranks: int, rootinfo_path: str) -> int:
     if _lib is None:
         raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
 
-    handle = _lib.comm_init(rank, nranks, rootinfo_path.encode('utf-8'))
+    handle = _lib.comm_init(rank, nranks, device_id, rootinfo_path.encode('utf-8'))
     if not handle:
         raise RuntimeError(f"comm_init failed for rank {rank}")
     return handle

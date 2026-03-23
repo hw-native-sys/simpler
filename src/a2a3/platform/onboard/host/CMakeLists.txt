@@ -81,22 +81,15 @@ target_link_directories(host_runtime
         ${ASCEND_HOME_PATH}/runtime/lib64
 )
 
-# Detect HCCL library version: CANN 9.x ships hccl_v2 instead of hccl
-# Prioritize hccl_v2 since CANN 9.x may have both hccl.so and hccl_v2.so,
-# and hccl_v2 is the complete, actively-maintained library.
-find_library(HCCL_V2_LIB NAMES hccl_v2 PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
-find_library(HCCL_LIB NAMES hccl PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
-
-if(HCCL_V2_LIB)
-    set(HCCL_LINK_TARGETS hccl_v2 hccl_plf)
-    target_compile_definitions(host_runtime PRIVATE HCCL_USE_V2_API=1)
-    message(STATUS "Using HCCL library: hccl_v2 + hccl_plf (CANN 9.x)")
-elseif(HCCL_LIB)
-    set(HCCL_LINK_TARGETS hccl)
-    message(STATUS "Using HCCL library: hccl")
+# CANN 9.x exposes the working non-V2 HCCL entry points through libhcomm.
+# Link it explicitly so comm_hccl.cpp can follow the same initialization path
+# as the pto-isa communication tests.
+find_library(HCOMM_LIB NAMES hcomm PATHS ${ASCEND_HOME_PATH}/lib64 NO_DEFAULT_PATH)
+if(HCOMM_LIB)
+    set(HCCL_LINK_TARGETS hcomm)
+    message(STATUS "Using HCCL library: hcomm")
 else()
-    message(WARNING "Neither hccl_v2 nor hccl found, linking against hccl and hoping for the best")
-    set(HCCL_LINK_TARGETS hccl)
+    message(FATAL_ERROR "libhcomm not found under ${ASCEND_HOME_PATH}/lib64")
 endif()
 
 # Optionally link nnopbase (provides aclCreateTensor/aclDestroyTensor for SdmaWorkspaceManager)
@@ -115,7 +108,6 @@ target_link_libraries(host_runtime
         runtime
         ascendcl
         ${HCCL_LINK_TARGETS}
-        hccl_fwk
         ${NNOPBASE_LINK}
         dl
 )

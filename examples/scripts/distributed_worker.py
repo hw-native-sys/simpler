@@ -105,14 +105,12 @@ def main():
 
     lib_path = artifact_dir / "libhost_runtime.so"
     Runtime = bind_host_binary(str(lib_path))
-    set_device(args.device_id)
-
-    sys.stderr.write(f"[rank {args.rank}] Library loaded, device {args.device_id} set\n")
+    sys.stderr.write(f"[rank {args.rank}] Library loaded\n")
 
     # ----------------------------------------------------------------
     # 2. Comm init + alloc windows
     # ----------------------------------------------------------------
-    comm = comm_init(args.rank, args.nranks, args.rootinfo_file)
+    comm = comm_init(args.rank, args.nranks, args.device_id, args.rootinfo_file)
 
     total_win = args.win_sync_prefix
     for b in buffers:
@@ -123,6 +121,9 @@ def main():
     local_base = comm_get_local_window_base(comm)
 
     sys.stderr.write(f"[rank {args.rank}] Comm initialized, local_base=0x{local_base:x}\n")
+
+    set_device(args.device_id)
+    sys.stderr.write(f"[rank {args.rank}] Device {args.device_id} set for runtime\n")
 
     # ----------------------------------------------------------------
     # 3. Allocate buffers

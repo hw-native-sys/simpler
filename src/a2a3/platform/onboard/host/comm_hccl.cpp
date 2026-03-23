@@ -24,45 +24,14 @@
 
 using CommTopo = uint32_t;
 
-// Internal HCCL APIs (not in public headers).
-// CANN 9.x renames all HCCL symbols with a V2 suffix and ships libhccl_v2.so.
-// The public header still declares weak non-V2 symbols, so we declare V2 variants
-// separately and dispatch via inline wrappers.
-#ifdef HCCL_USE_V2_API
-extern "C" HcclResult HcclGetRootInfoV2(HcclRootInfo* rootInfo);
-extern "C" HcclResult HcclCommInitRootInfoV2(uint32_t nRanks, const HcclRootInfo* rootInfo,
-                                              uint32_t rank, HcclComm* comm);
-extern "C" HcclResult HcclGetCommNameV2(HcclComm comm, char* commName);
-extern "C" HcclResult HcclBarrierV2(HcclComm comm, aclrtStream stream);
-extern "C" HcclResult HcclCommDestroyV2(HcclComm comm);
-extern "C" HcclResult HcclAllocComResourceByTilingV2(HcclComm comm, void* stream,
-                                                      void* mc2Tiling, void** commContext);
-extern "C" HcclResult HcomGetCommHandleByGroupV2(const char* group, HcclComm* commHandle);
-extern "C" HcclResult HcomGetL0TopoTypeExV2(const char* group, CommTopo* topoType,
-                                             uint32_t isSetDevice);
-
-static inline HcclResult hccl_get_root_info(HcclRootInfo* ri)
-    { return HcclGetRootInfoV2(ri); }
-static inline HcclResult hccl_comm_init_root_info(uint32_t n, const HcclRootInfo* ri, uint32_t r, HcclComm* c)
-    { return HcclCommInitRootInfoV2(n, ri, r, c); }
-static inline HcclResult hccl_get_comm_name(HcclComm c, char* name)
-    { return HcclGetCommNameV2(c, name); }
-static inline HcclResult hccl_barrier(HcclComm c, aclrtStream s)
-    { return HcclBarrierV2(c, s); }
-static inline HcclResult hccl_comm_destroy(HcclComm c)
-    { return HcclCommDestroyV2(c); }
-static inline HcclResult hccl_alloc_com_resource(HcclComm c, void* s, void* t, void** ctx)
-    { return HcclAllocComResourceByTilingV2(c, s, t, ctx); }
-static inline HcclResult hccl_get_comm_handle_by_group(const char* g, HcclComm* c)
-    { return HcomGetCommHandleByGroupV2(g, c); }
-static inline HcclResult hccl_get_l0_topo_type_ex(const char* g, CommTopo* t, uint32_t f)
-    { return HcomGetL0TopoTypeExV2(g, t, f); }
-#else
+// Internal HCCL helpers are exported by libhcomm on CANN 9.x.  The public
+// HCCL APIs below intentionally use the standard, non-V2 entry points to match
+// the working pto-isa initialization sequence.
 extern "C" HcclResult HcclAllocComResourceByTiling(HcclComm comm, void* stream,
-                                                    void* mc2Tiling, void** commContext);
+                                                   void* mc2Tiling, void** commContext);
 extern "C" HcclResult HcomGetCommHandleByGroup(const char* group, HcclComm* commHandle);
 extern "C" HcclResult HcomGetL0TopoTypeEx(const char* group, CommTopo* topoType,
-                                           uint32_t isSetDevice);
+                                          uint32_t isSetDevice);
 
 static inline HcclResult hccl_get_root_info(HcclRootInfo* ri)
     { return HcclGetRootInfo(ri); }
@@ -80,13 +49,13 @@ static inline HcclResult hccl_get_comm_handle_by_group(const char* g, HcclComm* 
     { return HcomGetCommHandleByGroup(g, c); }
 static inline HcclResult hccl_get_l0_topo_type_ex(const char* g, CommTopo* t, uint32_t f)
     { return HcomGetL0TopoTypeEx(g, t, f); }
-#endif
 
 static constexpr uint32_t COMM_IS_NOT_SET_DEVICE = 0;
 static constexpr uint32_t COMM_TOPO_MESH = 0b1u;
 
 using rtStream_t = void*;
 static constexpr int32_t RT_STREAM_PRIORITY_DEFAULT = 0;
+extern "C" int32_t rtSetDevice(int32_t device);
 extern "C" int32_t rtStreamCreate(rtStream_t* stream, int32_t priority);
 extern "C" int32_t rtStreamDestroy(rtStream_t stream);
 
@@ -325,7 +294,7 @@ static void file_barrier(const std::string& dir, int rank, int nranks, const std
 // API implementation
 // ============================================================================
 
-extern "C" CommHandle comm_init(int rank, int nranks, const char* rootinfo_path) {
+extern "C" CommHandle comm_init(int rank, int nranks, int device_id, const char* rootinfo_path) {
     auto* h = new (std::nothrow) CommHandle_{};
     if (!h) return nullptr;
 
@@ -342,10 +311,26 @@ extern "C" CommHandle comm_init(int rank, int nranks, const char* rootinfo_path)
         return nullptr;
     }
 
-    // NOTE: Do NOT call aclrtSetDevice here — the caller (distributed_worker)
-    // already set the correct physical device via set_device(device_id).
-    // Calling aclrtSetDevice(rank) would override the context when
-    // rank != device_id (e.g. devices=[2,4,5,7]).
+    if (rank == 0) {
+        int32_t rtRet = rtSetDevice(device_id);
+        if (rtRet != 0) {
+            fprintf(stderr, "[comm rank %d] rtSetDevice(%d) failed: %d\n",
+                    rank, device_id, rtRet);
+            delete h;
+            return nullptr;
+        }
+    }
+
+    // HCCL requires an ACL runtime context bound to the physical device.
+    // This cannot be inferred from rank because distributed runs may map
+    // ranks to arbitrary device lists (for example devices=[2,4,5,7]).
+    aRet = aclrtSetDevice(device_id);
+    if (aRet != ACL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] aclrtSetDevice(%d) failed: %d\n",
+                rank, device_id, (int)aRet);
+        delete h;
+        return nullptr;
+    }
 
     // RootInfo exchange
     HcclRootInfo rootInfo{};
@@ -368,6 +353,13 @@ extern "C" CommHandle comm_init(int rank, int nranks, const char* rootinfo_path)
         std::ifstream fin(rootinfo_path, std::ios::binary);
         fin.read(rootInfo.internal, HCCL_ROOT_INFO_BYTES);
     }
+
+    std::string barrier_dir = h->rootinfo_path;
+    auto last_slash = barrier_dir.rfind('/');
+    if (last_slash != std::string::npos) {
+        barrier_dir = barrier_dir.substr(0, last_slash);
+    }
+    file_barrier(barrier_dir, h->rank, h->nranks, "rootinfo_ready");
 
     // Create stream for HCCL operations
     rtStreamCreate(&h->stream, RT_STREAM_PRIORITY_DEFAULT);
@@ -403,8 +395,9 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t /*win_size*/, uint64_t* d
     // File barrier so all ranks have completed HcclCommInitRootInfo
     std::string barrier_dir = h->rootinfo_path;
     auto last_slash = barrier_dir.rfind('/');
-    if (last_slash != std::string::npos)
+    if (last_slash != std::string::npos) {
         barrier_dir = barrier_dir.substr(0, last_slash);
+    }
     file_barrier(barrier_dir, h->rank, h->nranks, "hccl_init");
 
     // Tiling configuration for HcclAllocComResourceByTiling

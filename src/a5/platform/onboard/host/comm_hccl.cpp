@@ -274,7 +274,7 @@ static void file_barrier(const std::string& dir, int rank, int nranks, const std
 // API implementation
 // ============================================================================
 
-extern "C" CommHandle comm_init(int rank, int nranks, const char* rootinfo_path) {
+extern "C" CommHandle comm_init(int rank, int nranks, int device_id, const char* rootinfo_path) {
     auto* h = new (std::nothrow) CommHandle_{};
     if (!h) return nullptr;
 
@@ -291,10 +291,16 @@ extern "C" CommHandle comm_init(int rank, int nranks, const char* rootinfo_path)
         return nullptr;
     }
 
-    // NOTE: Do NOT call aclrtSetDevice here — the caller (distributed_worker)
-    // already set the correct physical device via set_device(device_id).
-    // Calling aclrtSetDevice(rank) would override the context when
-    // rank != device_id (e.g. devices=[2,4,5,7]).
+    // HCCL requires an ACL runtime context bound to the physical device.
+    // This cannot be inferred from rank because distributed runs may map
+    // ranks to arbitrary device lists (for example devices=[2,4,5,7]).
+    aRet = aclrtSetDevice(device_id);
+    if (aRet != ACL_SUCCESS) {
+        fprintf(stderr, "[comm rank %d] aclrtSetDevice(%d) failed: %d\n",
+                rank, device_id, (int)aRet);
+        delete h;
+        return nullptr;
+    }
 
     // RootInfo exchange
     HcclRootInfo rootInfo{};

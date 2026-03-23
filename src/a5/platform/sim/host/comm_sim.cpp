@@ -68,9 +68,10 @@ struct CommHandle_ {
 // API implementation
 // ============================================================================
 
-extern "C" CommHandle comm_init(int rank, int nranks, const char* rootinfo_path) {
+extern "C" CommHandle comm_init(int rank, int nranks, int device_id, const char* rootinfo_path) {
     auto* h = new (std::nothrow) CommHandle_{};
     if (!h) return nullptr;
+    (void)device_id;
 
     h->rank = rank;
     h->nranks = nranks;

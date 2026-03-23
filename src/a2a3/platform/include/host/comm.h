@@ -32,11 +32,12 @@ typedef struct CommHandle_* CommHandle;
  *
  * @param rank           This process's rank (0-based).
  * @param nranks         Total number of ranks.
+ * @param device_id      Physical device ID used by this process.
  * @param rootinfo_path  Filesystem path used to exchange root info between
  *                       ranks (rank 0 writes, others read).
  * @return Opaque handle, or NULL on failure.
  */
-CommHandle comm_init(int rank, int nranks, const char* rootinfo_path);
+CommHandle comm_init(int rank, int nranks, int device_id, const char* rootinfo_path);
 
 /**
  * Allocate RDMA / shared-memory windows and populate the device context.
