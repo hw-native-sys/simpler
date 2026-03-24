@@ -642,6 +642,12 @@ Kernel uses macros:
 ./ci.sh
 ```
 
+## License
+
+This project is licensed under the **CANN Open Software License Agreement Version 2.0**.
+
+See the [LICENSE](LICENSE) file for the full license text.
+
 ## References
 
 - [src/platform/a2a3/host/](src/platform/a2a3/host/) - Host runtime implementation (real hardware)
