@@ -71,6 +71,9 @@ struct PTO2HeapRing {
     // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
     std::atomic<int32_t>* error_code_ptr = nullptr;
 
+    // Cached tail snapshot to reduce atomic loads in fast path.
+    uint64_t cached_tail = 0;
+
     /**
      * Allocate memory from heap ring
      *
@@ -132,6 +135,7 @@ struct PTO2HeapRing {
 #endif
                 spin_count = 0;
                 prev_tail = cur_tail;
+                cached_tail = cur_tail;
             }
 
 #if PTO2_SPIN_VERBOSE_LOGGING
@@ -186,34 +190,44 @@ struct PTO2HeapRing {
 
         while (true) {
             uint64_t top = top_ptr->load(std::memory_order_acquire);
-            // Read latest tail from shared memory (Scheduler updates this)
-            uint64_t tail = tail_ptr->load(std::memory_order_acquire);
             uint64_t new_top;
             void* result;
+            bool needs_refresh = false;
 
-            if (top >= tail) {
+            if (top >= cached_tail) {
                 // Case 1: top is at or ahead of tail (normal case)
                 uint64_t space_at_end = size - top;
-
                 if (space_at_end >= alloc_size) {
                     new_top = top + alloc_size;
                     result = (char*)base + top;
-                } else if (tail > alloc_size) {
+                } else if (cached_tail > alloc_size) {
                     // Wrap to beginning
                     new_top = alloc_size;
                     result = base;
                 } else {
-                    return NULL;
+                    needs_refresh = true;
                 }
             } else {
-                // Case 2: top has wrapped, tail is ahead
-                uint64_t gap = tail - top;
-                if (gap >= alloc_size) {
+                // Case 2: top wrapped; heap_tail is ahead of top (top < cached_tail here).
+                // cached_tail may lag the real tail; gap below is conservative and we refresh on failure.
+                uint64_t gap_maybe_smaller = cached_tail - top;
+                if (gap_maybe_smaller >= alloc_size) {
                     new_top = top + alloc_size;
                     result = (char*)base + top;
                 } else {
-                    return NULL;
+                    needs_refresh = true;
                 }
+            }
+
+            if (needs_refresh) {
+                uint64_t tail = tail_ptr->load(std::memory_order_acquire);
+                if (cached_tail != tail) {
+                    // tail has been updated, refresh cache and retry
+                    cached_tail = tail;
+                    continue;
+                }
+                // tail has not been updated, no space available
+                return NULL;
             }
 
             if (top_ptr->compare_exchange_weak(top, new_top,
@@ -273,6 +287,9 @@ struct PTO2TaskRing {
 
     // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
     std::atomic<int32_t>* error_code_ptr = nullptr;
+
+    // Cached last_alive snapshot to reduce atomic loads in fast path.
+    int32_t cached_last_alive = 0;
 
     /**
      * Allocate a task slot from task ring
@@ -389,10 +406,17 @@ struct PTO2TaskRing {
     int32_t pto2_task_ring_try_alloc() {
         // Optimistically allocate a task ID
         int32_t task_id = current_index_ptr->fetch_add(1, std::memory_order_acq_rel);
+        int32_t active_count_maybe_larger = task_id - cached_last_alive;
+
+        // Fast path: trust cached_last_alive first to avoid an extra atomic load.
+        if (active_count_maybe_larger < window_size - 1) {
+            return task_id;
+        }
+
+        // Slow path: refresh last_alive and validate with the true active count.
         int32_t last_alive = last_alive_ptr->load(std::memory_order_acquire);
         int32_t active_count = task_id - last_alive;
-
-        // Check if there's room (leave at least 1 slot empty)
+        cached_last_alive = last_alive;
         if (active_count < window_size - 1) {
             return task_id;
         }

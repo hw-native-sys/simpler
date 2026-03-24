@@ -25,6 +25,7 @@ void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
     ring->size = size;
     ring->top_ptr = top_ptr;
     ring->tail_ptr = tail_ptr;
+    ring->cached_tail = tail_ptr->load(std::memory_order_acquire);
 }
 
 // =============================================================================
@@ -38,6 +39,7 @@ void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
     ring->window_size = window_size;
     ring->current_index_ptr = current_index_ptr;
     ring->last_alive_ptr = last_alive_ptr;
+    ring->cached_last_alive = last_alive_ptr->load(std::memory_order_acquire);
 }
 
 // =============================================================================
