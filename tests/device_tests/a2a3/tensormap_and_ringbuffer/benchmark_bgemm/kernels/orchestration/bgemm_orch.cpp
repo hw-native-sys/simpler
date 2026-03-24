@@ -3,7 +3,7 @@
  *
  * Builds the task graph for tiled matrix multiplication: C = A @ B
  *
- * Configuration read from config tensor (set in golden.py):
+ * Configuration read from scalar OrchArgs (set in golden.py):
  *   - tile_size: tile dimension (tile_size x tile_size per tile)
  *   - grid_k: number of K-dimension partitions
  *   - num_groups: number of independent groups (= matmul_add_task_num / grid_k)
@@ -14,15 +14,7 @@
  *   B: [num_groups, grid_k, incore_loop, tile_size, tile_size]
  *   C: [incore_loop * num_groups, tile_size, tile_size]
  *
- * Task graph per group:
- *   for k in [0, grid_k):
- *     P[0..incore_loop-1] = A[group,k,0..incore_loop-1] @ B[group,k,0..incore_loop-1]
- *     C[group*incore_loop..] += P[0..incore_loop-1]
- *
- * Dependencies are automatic via TensorMap overlap detection.
- *
- * This file compiles as a standalone .so with zero runtime link dependencies.
- * All runtime calls go through the PTO2RuntimeOps function-pointer table.
+ * Args layout: [A, B, C, config]
  */
 
 #include <stddef.h>
@@ -33,42 +25,29 @@
 #define FUNC_GEMM_TILE 0
 #define FUNC_TILE_ADD  1
 
-// Args layout: [ptr_A, ptr_B, ptr_C, ptr_config, size_A, size_B, size_C]
-#define ARG_PTR_A      0
-#define ARG_PTR_B      1
-#define ARG_PTR_C      2
-#define ARG_PTR_CONFIG 3
-#define ARG_SIZE_A     4
-#define ARG_SIZE_B     5
-#define ARG_SIZE_C     6
-
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-    (void)args;
-    (void)arg_count;
+PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+    (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 7,
+        .expected_arg_count = 4,
     };
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
-    (void)arg_count;
+void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
-    void* dev_A = (void*)(uintptr_t)args[ARG_PTR_A];
-    void* dev_B = (void*)(uintptr_t)args[ARG_PTR_B];
-    void* dev_C = (void*)(uintptr_t)args[ARG_PTR_C];
-    void* dev_config = (void*)(uintptr_t)args[ARG_PTR_CONFIG];
-    size_t size_A = (size_t)args[ARG_SIZE_A];
-    size_t size_B = (size_t)args[ARG_SIZE_B];
-    size_t size_C = (size_t)args[ARG_SIZE_C];
+    // Tensor args
+    Tensor ext_A = orch_args[0].to_tensor();
+    Tensor ext_B = orch_args[1].to_tensor();
+    Tensor ext_C = orch_args[2].to_tensor();
+    Tensor ext_config = orch_args[3].to_tensor();
 
-    // Read config from golden.py
-    int64_t* host_config = (int64_t*)(uintptr_t)args[ARG_PTR_CONFIG];
+    // Read config from tensor data: [tile_size, grid_k, num_groups, incore_loop]
+    int64_t* host_config = orch_args[3].data<int64_t>();
     int tile_size = (int)host_config[0];
     int grid_k = (int)host_config[1];
     int num_groups = (int)host_config[2];
@@ -80,18 +59,6 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_nu
 
     LOG_INFO("[bgemm_orch] tile_size: %d, grid_m: %d, grid_n: %d, grid_k: %d, num_groups: %d, incore_loop: %d",
              tile_size, grid_m, grid_n, grid_k, num_groups, incore_loop);
-
-    // Create 1D external tensors for the full A, B, C arrays
-    uint32_t ext_A_shapes[1] = {(uint32_t)(size_A / sizeof(float))};
-    Tensor ext_A = make_tensor_external(dev_A, ext_A_shapes, 1, DataType::FLOAT32);
-    uint32_t ext_B_shapes[1] = {(uint32_t)(size_B / sizeof(float))};
-    Tensor ext_B = make_tensor_external(dev_B, ext_B_shapes, 1, DataType::FLOAT32);
-    uint32_t ext_C_shapes[1] = {(uint32_t)(size_C / sizeof(float))};
-    Tensor ext_C = make_tensor_external(dev_C, ext_C_shapes, 1, DataType::FLOAT32);
-
-    // Wrap config as a device tensor so AICore kernels can read tile_size directly
-    uint32_t config_shapes[1] = {4};  // [tile_size, grid_k, num_groups, incore_loop]
-    Tensor ext_config = make_tensor_external(dev_config, config_shapes, 1, DataType::INT64);
 
     uint32_t tile_shapes[1] = {(uint32_t)tile_elems};
     uint64_t group_tile_elems = (uint64_t)incore_loop * tile_elems;

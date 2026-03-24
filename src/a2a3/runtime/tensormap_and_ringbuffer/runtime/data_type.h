@@ -32,7 +32,7 @@ enum class DataType : uint32_t {
  * @return Size in bytes (0 for unknown types)
  */
 inline uint64_t get_element_size(DataType dtype) {
-    // 这里的顺序要和enum的顺序严格一致
+    // Order must match the enum definition exactly
     static uint64_t data_type_size[static_cast<int>(DataType::DATA_TYPE_NUM)] = {
         4, // case DataType::FLOAT32
         2, // DataType::FLOAT16

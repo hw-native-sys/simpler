@@ -17,14 +17,6 @@
 
 #include "pto_orchestration_api.h"
 
-// Args layout (from golden.py + runtime_maker.cpp extension):
-//   [a, b, f, size_a, size_b, size_f, SIZE]
-//   + [gm_heap, heap_size] appended by runtime_maker.cpp
-#define ARG_PTR_A 0
-#define ARG_PTR_B 1
-#define ARG_PTR_F 2
-#define ARG_SIZE  6
-
 static uint64_t float_to_u64(float f) {
     union {
         float f32;
@@ -38,29 +30,26 @@ static uint64_t float_to_u64(float f) {
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-    (void)args;
-    (void)arg_count;
+PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+    (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 7,
+        .expected_arg_count = 3,
     };
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
-    (void)arg_count;
+void aicpu_orchestration_entry(PTO2Runtime* rt, OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
-    void* arg_a_ptr = (void*)(uintptr_t)args[ARG_PTR_A];
-    void* arg_b_ptr = (void*)(uintptr_t)args[ARG_PTR_B];
-    void* arg_f_ptr = (void*)(uintptr_t)args[ARG_PTR_F];
-    int SIZE = (int)(args[ARG_SIZE] & 0x7FFFFFFF);
+    // golden shape = kernel shape, use to_tensor() directly
+    Tensor ext_a = orch_args[0].to_tensor();
+    Tensor ext_b = orch_args[1].to_tensor();
+    Tensor ext_f = orch_args[2].to_tensor();
 
-    uint32_t shapes[1] = {(uint32_t)SIZE};
-    Tensor ext_a = make_tensor_external(arg_a_ptr, shapes, 1, DataType::FLOAT32);
-    Tensor ext_b = make_tensor_external(arg_b_ptr, shapes, 1, DataType::FLOAT32);
-    Tensor ext_f = make_tensor_external(arg_f_ptr, shapes, 1, DataType::FLOAT32);
+    uint32_t SIZE = orch_args[0].tensor.shapes[0];
+
+    uint32_t shapes[1] = {SIZE};
 
     // Intermediate tensors — allocated from HeapRing by the runtime
     Tensor c = make_tensor(shapes, 1, DataType::FLOAT32);

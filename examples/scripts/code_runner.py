@@ -44,6 +44,7 @@ Golden.py interface:
     __outputs__ = ["out_f"]  # Output tensor names
 """
 
+import ctypes
 import importlib.util
 import fcntl
 import logging
@@ -55,6 +56,25 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+
+# =============================================================================
+# OrchArg constants — struct definition lives in bindings.py (single source)
+# =============================================================================
+
+ORCH_ARG_KIND_TENSOR = 0
+ORCH_ARG_KIND_SCALAR = 1
+
+# Maps torch dtype → DataType enum value (must match data_type.h)
+ORCH_ARG_DTYPE_MAP = {
+    torch.float32: 0,
+    torch.float16: 1,
+    torch.int32: 2,
+    torch.int16: 3,
+    torch.int8: 4,
+    torch.uint8: 5,
+    torch.bfloat16: 6,
+    torch.int64: 7,
+}
 
 logger = logging.getLogger(__name__)
 
@@ -424,7 +444,7 @@ class CodeRunner:
 
     This class automates:
     - Loading kernel_config.py and golden.py dynamically
-    - Building func_args automatically from torch tensors
+    - Building OrchArgC array automatically from torch tensors
     - Converting numpy arrays to torch tensors
     - Separating inputs and outputs based on naming convention
     - Running the full test flow
@@ -559,9 +579,9 @@ class CodeRunner:
 
     def _build_func_args_from_list(
         self, args_list: list
-    ) -> Tuple[List[int], List[int], List[int], Dict[str, Any], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    ) -> Tuple[list, List[int], List[int], Dict[str, Any], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Build func_args from an explicit argument list returned by generate_inputs.
+        Build OrchArgC array from an explicit argument list returned by generate_inputs.
 
         Every element must be a (name, value) pair where value is either:
         - torch.Tensor / numpy array: a tensor argument
@@ -571,12 +591,11 @@ class CodeRunner:
         passed to compute_golden, so compute_golden can reference any arg by name.
 
         Returns:
-            Tuple of (func_args, arg_types, arg_sizes, args, inputs, outputs)
+            Tuple of (orch_args, arg_types, arg_sizes, args, inputs, outputs)
             where args contains all named items, inputs/outputs contain tensor-only subsets.
         """
-        import ctypes
         import numpy as np
-        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR, OrchArgC, OrchArgC
 
         if not self.output_names:
             raise ValueError(
@@ -591,7 +610,7 @@ class CodeRunner:
         # Tensors in both generate_inputs and __outputs__ are INOUT
         inout_set = output_set & all_tensor_names
 
-        func_args = []
+        orch_args = []
         arg_types = []
         arg_sizes = []
         args = {}    # all named items: tensors + scalars → passed to compute_golden
@@ -613,7 +632,18 @@ class CodeRunner:
                 tensor = tensor.cpu().contiguous()
                 args[name] = tensor
 
-                func_args.append(tensor.data_ptr())
+                # Build OrchArg with tensor metadata
+                arg = OrchArgC()
+                arg.kind = ORCH_ARG_KIND_TENSOR
+                arg.u.tensor.data = tensor.data_ptr()
+                arg.u.tensor.ndims = tensor.ndim
+                if tensor.dtype not in ORCH_ARG_DTYPE_MAP:
+                    raise ValueError(f"Unsupported tensor dtype for OrchArg: {tensor.dtype}")
+                arg.u.tensor.dtype = ORCH_ARG_DTYPE_MAP[tensor.dtype]
+                for i, s in enumerate(tensor.shape):
+                    arg.u.tensor.shapes[i] = s
+                orch_args.append(arg)
+
                 nbytes = tensor.element_size() * tensor.numel()
                 arg_sizes.append(nbytes)
 
@@ -628,12 +658,15 @@ class CodeRunner:
                     inputs[name] = tensor
 
             elif isinstance(value, ctypes._SimpleCData):
+                arg = OrchArgC()
+                arg.kind = ORCH_ARG_KIND_SCALAR
                 if isinstance(value, (ctypes.c_float, ctypes.c_double)):
                     uint_type = ctypes.c_uint32 if isinstance(value, ctypes.c_float) else ctypes.c_uint64
                     bits = uint_type.from_buffer_copy(value).value
-                    func_args.append(bits)
+                    arg.u.scalar = bits
                 else:
-                    func_args.append(int(value.value))
+                    arg.u.scalar = int(value.value) & 0xFFFFFFFFFFFFFFFF
+                orch_args.append(arg)
                 args[name] = value.value
                 arg_types.append(ARG_SCALAR)
                 arg_sizes.append(0)
@@ -649,11 +682,11 @@ class CodeRunner:
                 f"None of __outputs__ = {self.output_names} found in generate_inputs args"
             )
 
-        return func_args, arg_types, arg_sizes, args, inputs, outputs
+        return orch_args, arg_types, arg_sizes, args, inputs, outputs
 
-    def _build_func_args(self, tensors: Dict[str, torch.Tensor]) -> Tuple[List[int], List[int], List[int]]:
+    def _build_func_args(self, tensors: Dict[str, torch.Tensor]) -> Tuple[list, List[int], List[int]]:
         """
-        Build func_args, arg_types, and arg_sizes from tensors dict (legacy path).
+        Build orch_args, arg_types, and arg_sizes from tensors dict (legacy path).
 
         Convention for orchestration function signature:
             int BuildGraph(Runtime* runtime, uint64_t* args, int arg_count)
@@ -665,9 +698,9 @@ class CodeRunner:
             tensors: Dict of torch tensors (will be modified to ensure contiguous)
 
         Returns:
-            Tuple of (func_args, arg_types, arg_sizes)
+            Tuple of (orch_args, arg_types, arg_sizes)
         """
-        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR, OrchArgC
 
         # Determine tensor order
         if self.tensor_order:
@@ -693,14 +726,23 @@ class CodeRunner:
                 )
             tensors[name] = tensors[name].cpu().contiguous()
 
-        func_args = []
+        orch_args = []
         arg_types = []
         arg_sizes = []
 
-        # Add pointers
+        # Add tensor pointers
         for name in order:
             tensor = tensors[name]
-            func_args.append(tensor.data_ptr())
+
+            arg = OrchArgC()
+            arg.kind = ORCH_ARG_KIND_TENSOR
+            arg.u.tensor.data = tensor.data_ptr()
+            arg.u.tensor.ndims = tensor.ndim
+            if tensor.dtype in ORCH_ARG_DTYPE_MAP:
+                arg.u.tensor.dtype = ORCH_ARG_DTYPE_MAP[tensor.dtype]
+            for i, s in enumerate(tensor.shape):
+                arg.u.tensor.shapes[i] = s
+            orch_args.append(arg)
 
             if name in inout_set:
                 arg_types.append(ARG_INOUT_PTR)
@@ -714,17 +756,23 @@ class CodeRunner:
         # Add sizes (as scalars)
         for name in order:
             tensor = tensors[name]
-            func_args.append(tensor.element_size() * tensor.numel())
+            arg = OrchArgC()
+            arg.kind = ORCH_ARG_KIND_SCALAR
+            arg.u.scalar = tensor.element_size() * tensor.numel()
+            orch_args.append(arg)
             arg_types.append(ARG_SCALAR)
             arg_sizes.append(0)
 
         # Add element count (as scalar)
         count = tensors[order[0]].numel()
-        func_args.append(count)
+        arg = OrchArgC()
+        arg.kind = ORCH_ARG_KIND_SCALAR
+        arg.u.scalar = count
+        orch_args.append(arg)
         arg_types.append(ARG_SCALAR)
         arg_sizes.append(0)
 
-        return func_args, arg_types, arg_sizes
+        return orch_args, arg_types, arg_sizes
 
     def run(self) -> None:
         """
@@ -850,13 +898,13 @@ class CodeRunner:
 
             if isinstance(result, list):
                 # New-style: generate_inputs returns flat argument list
-                func_args, arg_types, arg_sizes, args, inputs, outputs = \
+                orch_args, arg_types, arg_sizes, args, inputs, outputs = \
                     self._build_func_args_from_list(result)
                 tensors = args  # args contains all named items; compute_golden receives all
             else:
                 # Legacy: generate_inputs returns dict of tensors
                 tensors = {k: _to_torch(v) for k, v in result.items()}
-                func_args, arg_types, arg_sizes = self._build_func_args(tensors)
+                orch_args, arg_types, arg_sizes = self._build_func_args(tensors)
                 inputs, outputs = self._identify_outputs(tensors)
 
             logger.info(f"Inputs: {list(inputs.keys())}")
@@ -864,7 +912,7 @@ class CodeRunner:
 
             # Determine actual tensor order for debugging
             logger.debug(f"Tensor order: {list(tensors.keys())}")
-            logger.debug(f"func_args count: {len(func_args)}")
+            logger.debug(f"orch_args count: {len(orch_args)}")
 
             # Create and initialize runtime (including kernel registration)
             logger.info("=== Initializing Runtime ===")
@@ -904,7 +952,7 @@ class CodeRunner:
                     runtime.initialize(
                         orch_so_binary,
                         self.orchestration["function_name"],
-                        func_args,
+                        orch_args,
                         arg_types=arg_types,
                         arg_sizes=arg_sizes,
                         kernel_binaries=kernel_binaries,

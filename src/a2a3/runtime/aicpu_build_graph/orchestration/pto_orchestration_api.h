@@ -26,6 +26,16 @@
 #include "tensor.h"             // Tensor, make_tensor, make_tensor_external
 #include "pto_submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
 #include "pto_runtime2_types.h" // PTO2TaskId
+#include "orch_arg.h"           // OrchArg, OrchArgKind
+
+// OrchArg::to_tensor() — deferred definition (needs make_tensor_external from tensor.h)
+static_assert(ORCH_ARG_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "OrchArg and runtime max dims must match");
+inline Tensor OrchArg::to_tensor(bool manual_dep, int32_t version) const {
+    return make_tensor_external(
+        reinterpret_cast<void*>(static_cast<uintptr_t>(tensor.data)),
+        tensor.shapes, tensor.ndims, tensor.dtype,
+        manual_dep, version);
+}
 
 // =============================================================================
 // Ops Table and Opaque Runtime

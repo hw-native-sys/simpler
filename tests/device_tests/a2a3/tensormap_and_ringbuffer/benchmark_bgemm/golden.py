@@ -8,10 +8,11 @@ Configuration controlled by ALL_CASES parameters:
   - grid_k: number of K-dimension partitions
   - num_groups = matmul_add_task_num / grid_k
 
-Args layout: [ptr_A, ptr_B, ptr_C, ptr_config, size_A, size_B, size_C]
+Args layout: [A, B, C, config]
+  - A, B, C are tensors
+  - config is an int64 tensor [tile_size, grid_k, num_groups, incore_loop]
 """
 
-import ctypes
 import torch
 
 __outputs__ = ["C"]
@@ -116,9 +117,6 @@ def generate_inputs(params: dict) -> list:
         ("B", B_flat),
         ("C", C_flat),
         ("config", config),
-        ("size_A", ctypes.c_int64(A_flat.nbytes)),
-        ("size_B", ctypes.c_int64(B_flat.nbytes)),
-        ("size_C", ctypes.c_int64(C_flat.nbytes)),
     ]
 
 

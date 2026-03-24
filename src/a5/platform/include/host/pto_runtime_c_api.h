@@ -22,6 +22,8 @@
 
 #include "common/compile_strategy.h"
 
+struct OrchArg;
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -82,8 +84,8 @@ size_t get_runtime_size(void);
  * @param orch_so_binary    Orchestration shared library binary data
  * @param orch_so_size      Size of orchestration SO binary in bytes
  * @param orch_func_name    Name of the orchestration function to call
- * @param func_args         Arguments for orchestration (host pointers, sizes, etc.)
- * @param func_args_count   Number of arguments
+ * @param orch_args         Array of OrchArg describing orchestration arguments
+ * @param orch_args_count   Number of orchestration arguments
  * @param arg_types         Array describing each argument's type (ArgType enum)
  * @param arg_sizes         Array of sizes for pointer arguments (0 for scalars)
  * @param kernel_func_ids   Array of kernel function IDs (can be NULL if kernel_count == 0)
@@ -96,8 +98,8 @@ int init_runtime(RuntimeHandle runtime,
                 const uint8_t* orch_so_binary,
                 size_t orch_so_size,
                 const char* orch_func_name,
-                uint64_t* func_args,
-                int func_args_count,
+                const struct OrchArg* orch_args,
+                int orch_args_count,
                 int* arg_types,
                 uint64_t* arg_sizes,
                 const int* kernel_func_ids,

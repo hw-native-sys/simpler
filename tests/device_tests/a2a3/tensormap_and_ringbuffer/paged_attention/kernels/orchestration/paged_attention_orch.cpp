@@ -37,32 +37,17 @@ inline uint64_t get_sys_cnt_aicpu() {
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
 #define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
 
-// Helper to encode float as uint64_t for scalar params
-static uint64_t float_to_u64(float f) {
-    union {
-        float f32;
-        uint64_t u64;
-    } conv;
-    conv.u64 = 0;  // Clear upper bits
-    conv.f32 = f;
-    return conv.u64;
-}
-
 extern "C" {
-/**
- * Orchestration config — the executor reads these values to set up
- * shared memory and runtime before calling aicpu_orchestration_entry.
- */
+
 __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    uint64_t* args, int arg_count) {
-    (void)args;
-    (void)arg_count;
+    OrchArg* orch_args) {
+    (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 10,
+        .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
     uint64_t prof_param_extract = 0;
@@ -78,61 +63,44 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(uint64_t* 
 
     CYCLE_COUNT_START();
 
-    // Extract device pointers
-    // Extract pointers (first 7)
-    void* host_query = reinterpret_cast<void*>(args[0]);        // [batch, num_heads, head_dim]
-    void* host_key_cache = reinterpret_cast<void*>(args[1]);    // [batch, block_num, block_size, head_dim]
-    void* host_value_cache = reinterpret_cast<void*>(args[2]);  // [batch, block_num, block_size, head_dim]
-    int* host_block_table = reinterpret_cast<int*>(args[3]);    // [batch, block_num]
-    int* host_context_lens = reinterpret_cast<int*>(args[4]);   // [batch]
-    void* host_out = reinterpret_cast<void*>(args[5]);          // [batch, num_heads, head_dim]
-    int64_t* host_config = reinterpret_cast<int64_t*>(args[6]);
+    // Read dimensions from OrchArg tensor metadata
+    uint64_t batch     = orch_args[0].tensor.shapes[0];
+    uint64_t num_heads = orch_args[0].tensor.shapes[1];
+    uint64_t head_dim  = orch_args[0].tensor.shapes[2];
+    DataType data_type = orch_args[0].tensor.dtype;
 
-    // Extract sizes (next 3)
-    size_t query_size = static_cast<size_t>(args[7]);
-    size_t key_cache_size = static_cast<size_t>(args[8]);
-    size_t value_cache_size = static_cast<size_t>(args[9]);
+    uint64_t block_size = orch_args[1].tensor.shapes[1];
+    uint64_t block_num  = orch_args[3].tensor.shapes[1];
 
-    // Extract config parameters
-    uint64_t batch = static_cast<uint64_t>(static_cast<int>(host_config[0]));
-    uint64_t num_heads = static_cast<uint64_t>(static_cast<int>(host_config[1]));
-    int kv_head_num = static_cast<int>(host_config[2]);
-    uint64_t head_dim = static_cast<uint64_t>(static_cast<int>(host_config[3]));
-    uint64_t block_size = static_cast<uint64_t>(static_cast<int>(host_config[4]));
-    uint64_t block_num = static_cast<uint64_t>(static_cast<int>(host_config[5]));
-    union {
-        uint32_t u;
-        float f;
-    } scale_conv;
-    scale_conv.u = static_cast<uint32_t>(host_config[6]);
-    float scale_value = scale_conv.f;
+    uint64_t scale_value = orch_args[6].scalar;
+
     uint64_t q_head_num = num_heads;
     uint64_t q_tile = std::min(num_heads, 128UL);
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
-    DataType data_type = DataType::BFLOAT16;  // 用例是float32的，这个考虑要如何扩展成其他类型
     CYCLE_COUNT_LAP(prof_param_extract);
 
     LOG_ALWAYS(">>>>>> batch = %lu", (unsigned long)batch);
 
-    // query_size = batch * num_heads * head_dim * data_type
-    // key_cache_size = batch * block_num * block_size * head_dim * data_type
-    // value_cache_size = batch * block_num * block_size * head_dim * data_type
-    // out = batch * num_heads * head_dim * data_type
+    // Reshape tensors for kernel consumption (2D flattened)
+    void* query_ptr = orch_args[0].data<void>();
+    void* kc_ptr    = orch_args[1].data<void>();
+    void* vc_ptr    = orch_args[2].data<void>();
+    void* out_ptr   = orch_args[5].data<void>();
+
+    uint64_t total_blocks_count = orch_args[1].tensor.shapes[0];
+
     uint32_t query_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
-    uint32_t key_cache_shapes[2] = {(uint32_t)(batch * block_num * block_size), (uint32_t)head_dim};
-    uint32_t value_cache_shapes[2] = {(uint32_t)(batch * block_num * block_size), (uint32_t)head_dim};
+    uint32_t key_cache_shapes[2] = {(uint32_t)(total_blocks_count * block_size), (uint32_t)head_dim};
+    uint32_t value_cache_shapes[2] = {(uint32_t)(total_blocks_count * block_size), (uint32_t)head_dim};
     uint32_t out_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
-    Tensor query = make_tensor_external(host_query, query_shapes, 2, data_type);
-    Tensor key_cache = make_tensor_external(host_key_cache, key_cache_shapes, 2, data_type);
-    Tensor value_cache = make_tensor_external(host_value_cache, value_cache_shapes, 2, data_type);
-    // Tensor block_table = make_tensor_external(host_block_table, block_table_size);
-    // Tensor context_lens = make_tensor_external(host_context_lens, context_lens_size);
-    Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
+    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
+    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
+    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
+    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
     CYCLE_COUNT_LAP(prof_ext_tensor);
-    // LOG_DEBUG("query=%s", query.dump().c_str());
-    // LOG_DEBUG("key_cache=%s", key_cache.dump().c_str());
-    // LOG_DEBUG("value_cache=%s", value_cache.dump().c_str());
-    // LOG_DEBUG("out=%s", out.dump().c_str());
+
+    int* host_block_table  = orch_args[3].data<int>();
+    int* host_context_lens = orch_args[4].data<int>();
 
     int total_tasks = 0;
 
@@ -215,7 +183,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(uint64_t* 
                     params_sf.add_output(pij_f16);
                     params_sf.add_output(mi);
                     params_sf.add_output(li);
-                    params_sf.add_scalar(float_to_u64(scale_value));
+                    params_sf.add_scalar(scale_value);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     prof_submit_count++;

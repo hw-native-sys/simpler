@@ -9,6 +9,7 @@
 
 #include "device_runner.h"
 #include "common/unified_log.h"
+#include "orch_arg.h"
 #include "runtime.h"
 
 extern "C" {
@@ -22,8 +23,8 @@ int init_runtime_impl(Runtime* runtime,
                     const uint8_t* orch_so_binary,
                     size_t orch_so_size,
                     const char* orch_func_name,
-                    uint64_t* func_args,
-                    int func_args_count,
+                    const OrchArg* orch_args,
+                    int orch_args_count,
                     int* arg_types,
                     uint64_t* arg_sizes,
                     const int* kernel_func_ids,
@@ -52,8 +53,8 @@ int init_runtime(RuntimeHandle runtime,
                 const uint8_t* orch_so_binary,
                 size_t orch_so_size,
                 const char* orch_func_name,
-                uint64_t* func_args,
-                int func_args_count,
+                const OrchArg* orch_args,
+                int orch_args_count,
                 int* arg_types,
                 uint64_t* arg_sizes,
                 const int* kernel_func_ids,
@@ -82,7 +83,7 @@ int init_runtime(RuntimeHandle runtime,
 
         // Delegate kernel registration, SO loading, and orchestration to init_runtime_impl
         int result = init_runtime_impl(r, orch_so_binary, orch_so_size,
-                               orch_func_name, func_args, func_args_count,
+                               orch_func_name, orch_args, orch_args_count,
                                arg_types, arg_sizes,
                                kernel_func_ids, kernel_binaries,
                                kernel_sizes, kernel_count);

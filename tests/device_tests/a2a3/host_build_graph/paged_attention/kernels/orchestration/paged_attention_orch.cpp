@@ -5,13 +5,16 @@
  *   Query: (batch, q_head_num, head_dim) bf16
  *   Key:   (total_blocks, block_size, kv_head_num, head_dim) bf16 (NOT transposed)
  *   Value: (total_blocks, block_size, kv_head_num, head_dim) bf16
- *   Output: (batch * q_head_num, head_dim) float32
+ *   Output: (batch, q_head_num, head_dim) float32
  *
  * Head tiling: q_tile_size = min(num_heads, 128)
  * GQA: kv_head_num can differ from q_head_num
+ *
+ * OrchArg layout: [query, key_cache, value_cache, block_table, context_lens, out, scale]
  */
 
 #include "runtime.h"
+#include "orch_arg.h"
 #include <iostream>
 #include <algorithm>
 #include <cstring>
@@ -23,38 +26,45 @@
 
 extern "C" {
 
-int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count) {
-    if (arg_count < 14) {
-        std::cerr << "Expected at least 14 args, got " << arg_count << '\n';
+int build_paged_attention_graph(Runtime* runtime, const OrchArg* orch_args, int arg_count) {
+    if (arg_count < 7) {
+        std::cerr << "Expected at least 7 args, got " << arg_count << '\n';
         return -1;
     }
 
-    void* host_query = reinterpret_cast<void*>(args[0]);
-    void* host_key_cache = reinterpret_cast<void*>(args[1]);
-    void* host_value_cache = reinterpret_cast<void*>(args[2]);
-    int* host_block_table = reinterpret_cast<int*>(args[3]);
-    int* host_context_lens = reinterpret_cast<int*>(args[4]);
-    void* host_out = reinterpret_cast<void*>(args[5]);
-    int64_t* host_config = reinterpret_cast<int64_t*>(args[6]);
+    // Extract host pointers from OrchArg tensor metadata
+    void* host_query       = orch_args[0].data<void>();
+    void* host_key_cache   = orch_args[1].data<void>();
+    void* host_value_cache = orch_args[2].data<void>();
+    int*  host_block_table = orch_args[3].data<int>();
+    int*  host_context_lens = orch_args[4].data<int>();
+    void* host_out         = orch_args[5].data<void>();
 
-    size_t query_size = static_cast<size_t>(args[7]);
-    size_t key_cache_size = static_cast<size_t>(args[8]);
-    size_t value_cache_size = static_cast<size_t>(args[9]);
-    size_t block_table_size = static_cast<size_t>(args[10]);
-    size_t context_lens_size = static_cast<size_t>(args[11]);
-    size_t out_size = static_cast<size_t>(args[12]);
-    size_t config_size = static_cast<size_t>(args[13]);
+    // Extract sizes from OrchArg metadata
+    size_t query_size       = orch_args[0].nbytes();
+    size_t key_cache_size   = orch_args[1].nbytes();
+    size_t value_cache_size = orch_args[2].nbytes();
+    size_t out_size         = orch_args[5].nbytes();
 
-    int batch = static_cast<int>(host_config[0]);
-    int num_heads = static_cast<int>(host_config[1]);
-    int kv_head_num = static_cast<int>(host_config[2]);
-    int head_dim = static_cast<int>(host_config[3]);
-    int block_size = static_cast<int>(host_config[4]);
-    int max_num_blocks = static_cast<int>(host_config[5]);
-    uint64_t scale_value_bits = static_cast<uint64_t>(host_config[6]);
+    // Read dimensions from tensor shapes (uint32_t — matches OrchArg::tensor.shapes type)
+    // query: (batch, num_heads, head_dim)
+    uint32_t batch       = orch_args[0].tensor.shapes[0];
+    uint32_t num_heads   = orch_args[0].tensor.shapes[1];
+    uint32_t head_dim    = orch_args[0].tensor.shapes[2];
 
-    int q_tile_size = std::min(num_heads, 128);
-    int num_head_tiles = (num_heads + q_tile_size - 1) / q_tile_size;
+    // key_cache: (total_blocks, block_size, kv_head_num, head_dim)
+    uint32_t block_size  = orch_args[1].tensor.shapes[1];
+    uint32_t kv_head_num = orch_args[1].tensor.shapes[2];
+
+    // block_table: (batch, max_num_blocks_per_req)
+    uint32_t max_num_blocks = orch_args[3].tensor.shapes[1];
+
+    // scale: scalar float
+    float scale_value = orch_args[6].value_as<float>();
+    uint64_t scale_value_bits = orch_args[6].scalar;
+
+    uint32_t q_tile_size = std::min(num_heads, 128u);
+    uint32_t num_head_tiles = (num_heads + q_tile_size - 1) / q_tile_size;
 
     std::cout << "\n=== build_paged_attention_graph ===" << '\n';
     std::cout << "batch=" << batch << ", num_heads=" << num_heads
@@ -86,14 +96,14 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
     size_t oi_new_size = static_cast<size_t>(q_tile_size) * head_dim * sizeof(float);
 
     // Per-batch-per-block intermediate buffers
-    int total_buffers = batch * max_num_blocks;
+    uint32_t total_buffers = batch * max_num_blocks;
     void** dev_sij_arr    = new void*[total_buffers];
     void** dev_pij_arr    = new void*[total_buffers];
     void** dev_mij_arr    = new void*[total_buffers];
     void** dev_lij_arr    = new void*[total_buffers];
     void** dev_oi_new_arr = new void*[total_buffers];
 
-    for (int i = 0; i < total_buffers; i++) {
+    for (uint32_t i = 0; i < total_buffers; i++) {
         dev_sij_arr[i]    = runtime->host_api.device_malloc(sij_size);
         dev_pij_arr[i]    = runtime->host_api.device_malloc(pij_size);
         dev_mij_arr[i]    = runtime->host_api.device_malloc(mij_size);
@@ -102,7 +112,7 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
     }
 
     // Per-(batch, head_tile) accumulators
-    int total_accums = batch * num_head_tiles;
+    uint32_t total_accums = batch * num_head_tiles;
     size_t mi_size = static_cast<size_t>(q_tile_size) * sizeof(float);
     size_t li_size = mi_size;
     size_t oi_size = static_cast<size_t>(q_tile_size) * head_dim * sizeof(float);
@@ -111,7 +121,7 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
     void** dev_li_arr = new void*[total_accums];
     void** dev_oi_arr = new void*[total_accums];
 
-    for (int i = 0; i < total_accums; i++) {
+    for (uint32_t i = 0; i < total_accums; i++) {
         dev_mi_arr[i] = runtime->host_api.device_malloc(mi_size);
         dev_li_arr[i] = runtime->host_api.device_malloc(li_size);
         dev_oi_arr[i] = runtime->host_api.device_malloc(oi_size);
@@ -122,12 +132,12 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
 
     int total_tasks = 0;
 
-    for (int b_idx = 0; b_idx < batch; b_idx++) {
+    for (uint32_t b_idx = 0; b_idx < batch; b_idx++) {
         int cur_seq = host_context_lens[b_idx];
-        int bn_this_batch = (cur_seq + block_size - 1) / block_size;
+        uint32_t bn_this_batch = ((uint32_t)cur_seq + block_size - 1) / block_size;
 
-        for (int ht = 0; ht < num_head_tiles; ht++) {
-            int cur_offset = ht * q_tile_size;
+        for (uint32_t ht = 0; ht < num_head_tiles; ht++) {
+            uint32_t cur_offset = ht * q_tile_size;
 
             // Query: (batch, q_head_num, head_dim) bf16
             // qi points to heads [cur_offset .. cur_offset+q_tile_size) for batch b_idx
@@ -139,34 +149,31 @@ int build_paged_attention_graph(Runtime* runtime, uint64_t* args, int arg_count)
                 + static_cast<int64_t>(b_idx * num_heads + cur_offset) * head_dim * sizeof(float);
 
             // GQA: which kv_head this head tile maps to
-            int kv_head_idx = cur_offset / (num_heads / kv_head_num);
+            uint32_t kv_head_idx = cur_offset / (num_heads / kv_head_num);
 
             // Per-(batch, head_tile) accumulators
-            int accum_idx = b_idx * num_head_tiles + ht;
+            uint32_t accum_idx = b_idx * num_head_tiles + ht;
             void* dev_mi = dev_mi_arr[accum_idx];
             void* dev_li = dev_li_arr[accum_idx];
             void* dev_oi = dev_oi_arr[accum_idx];
 
             int t_up_prev = -1;
 
-            for (int bn = 0; bn < bn_this_batch; bn++) {
+            for (uint32_t bn = 0; bn < bn_this_batch; bn++) {
                 int cur_block_idx = host_block_table[b_idx * max_num_blocks + bn];
-                int valid_len = std::min(block_size, cur_seq - bn * block_size);
+                int valid_len = std::min((int)block_size, cur_seq - (int)(bn * block_size));
 
                 // Key: (total_blocks, block_size, kv_head_num, head_dim) bf16
-                // Stride to block: cur_block_idx * (block_size * kv_head_num * head_dim)
-                // Then offset to kv_head: kv_head_idx * head_dim (within each token row)
-                // But since we want contiguous (block_size, head_dim), and kv_head_num=1 makes it simple:
                 uint8_t* kj_ptr = reinterpret_cast<uint8_t*>(dev_key_cache)
                     + (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx)
                       * head_dim * sizeof(uint16_t);
 
-                // Value: (total_blocks, block_size, kv_head_num, head_dim) bf16 - same layout as key
+                // Value: (total_blocks, block_size, kv_head_num, head_dim) bf16
                 uint8_t* vj_ptr = reinterpret_cast<uint8_t*>(dev_value_cache)
                     + (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx)
                       * head_dim * sizeof(uint16_t);
 
-                int buf_idx = b_idx * max_num_blocks + bn;
+                uint32_t buf_idx = b_idx * max_num_blocks + bn;
                 void* dev_sij    = dev_sij_arr[buf_idx];
                 void* dev_pij    = dev_pij_arr[buf_idx];
                 void* dev_mij    = dev_mij_arr[buf_idx];

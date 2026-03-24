@@ -10,11 +10,10 @@ Covers all 5 resource shapes per iteration:
 
 All use 128x128 float32 tiles, repeated over num_iters slices.
 
-Args layout (30 args):
-  [ptr_A..ptr_O, size_A..size_O]
+Args layout (15 args): [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O]
+  Shape/dtype/size in OrchArg metadata.
 """
 
-import ctypes
 import torch
 
 __outputs__ = ["C", "F", "I", "J", "K", "L", "M", "N", "O"]
@@ -50,15 +49,15 @@ def generate_inputs(params: dict) -> list:
     H = torch.randn(TILE_ELEMS, dtype=torch.float32) * 0.01
 
     # Output buffers (num_iters slices each)
-    C = torch.zeros(num_iters, TILE_ELEMS, dtype=torch.float32)  # AIC_AIV_X2 matmul
-    F = torch.zeros(num_iters, TILE_ELEMS, dtype=torch.float32)  # AIC_AIV_X2 add
-    I = torch.zeros(num_iters, TILE_ELEMS, dtype=torch.float32)  # AIC_AIV_X2 mul
-    J = torch.zeros(num_iters, TILE_ELEMS, dtype=torch.float32)  # AIC_ONLY matmul
-    K = torch.zeros(num_iters, TILE_ELEMS, dtype=torch.float32)  # AIV_X1 add
-    L = torch.zeros(num_iters, TILE_ELEMS, dtype=torch.float32)  # AIV_X2 add
-    M = torch.zeros(num_iters, TILE_ELEMS, dtype=torch.float32)  # AIV_X2 mul
-    N = torch.zeros(num_iters, TILE_ELEMS, dtype=torch.float32)  # AIC_AIV_X1 matmul
-    O = torch.zeros(num_iters, TILE_ELEMS, dtype=torch.float32)  # AIC_AIV_X1 add
+    C = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    F = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    I = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    J = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    K = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    L = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    M = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    N = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    O = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
 
     A_flat = A.flatten()
     B_flat = B.flatten()
@@ -66,34 +65,19 @@ def generate_inputs(params: dict) -> list:
     return [
         ("A", A_flat),
         ("B", B_flat),
-        ("C", C.flatten()),
+        ("C", C),
         ("D", D),
         ("E", E),
-        ("F", F.flatten()),
+        ("F", F),
         ("G", G),
         ("H", H),
-        ("I", I.flatten()),
-        ("J", J.flatten()),
-        ("K", K.flatten()),
-        ("L", L.flatten()),
-        ("M", M.flatten()),
-        ("N", N.flatten()),
-        ("O", O.flatten()),
-        ("size_A", ctypes.c_int64(A_flat.nbytes)),
-        ("size_B", ctypes.c_int64(B_flat.nbytes)),
-        ("size_C", ctypes.c_int64(C.flatten().nbytes)),
-        ("size_D", ctypes.c_int64(D.nbytes)),
-        ("size_E", ctypes.c_int64(E.nbytes)),
-        ("size_F", ctypes.c_int64(F.flatten().nbytes)),
-        ("size_G", ctypes.c_int64(G.nbytes)),
-        ("size_H", ctypes.c_int64(H.nbytes)),
-        ("size_I", ctypes.c_int64(I.flatten().nbytes)),
-        ("size_J", ctypes.c_int64(J.flatten().nbytes)),
-        ("size_K", ctypes.c_int64(K.flatten().nbytes)),
-        ("size_L", ctypes.c_int64(L.flatten().nbytes)),
-        ("size_M", ctypes.c_int64(M.flatten().nbytes)),
-        ("size_N", ctypes.c_int64(N.flatten().nbytes)),
-        ("size_O", ctypes.c_int64(O.flatten().nbytes)),
+        ("I", I),
+        ("J", J),
+        ("K", K),
+        ("L", L),
+        ("M", M),
+        ("N", N),
+        ("O", O),
     ]
 
 

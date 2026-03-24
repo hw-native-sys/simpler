@@ -14,6 +14,7 @@
  */
 
 #include "runtime.h"  // Includes unified_log.h and provides LOG_* macros
+#include "orch_arg.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <cstddef>
@@ -27,12 +28,12 @@
 /**
  * Orchestration function signature.
  *
- * @param runtime   Pointer to Runtime to populate with tasks
- * @param args      Arguments array (host pointers, sizes, etc.)
- * @param arg_count Total number of arguments
+ * @param runtime    Pointer to Runtime to populate with tasks
+ * @param orch_args  OrchArg array with tensor metadata + scalar values
+ * @param arg_count  Total number of OrchArg entries
  * @return 0 on success, negative on error
  */
-typedef int (*OrchestrationFunc)(Runtime* runtime, uint64_t* args, int arg_count);
+typedef int (*OrchestrationFunc)(Runtime* runtime, const OrchArg* orch_args, int arg_count);
 
 #ifdef __cplusplus
 extern "C" {
@@ -53,8 +54,8 @@ extern "C" {
  * @param orch_so_binary    Orchestration shared library binary data
  * @param orch_so_size      Size of orchestration SO binary in bytes
  * @param orch_func_name    Name of the orchestration function to call
- * @param func_args         Arguments for orchestration (host pointers, sizes, etc.)
- * @param func_args_count   Number of arguments
+ * @param orch_args         OrchArg array with tensor metadata + scalar values
+ * @param orch_args_count   Number of OrchArg entries
  * @param arg_types         Array describing each argument's type (unused for host orchestration)
  * @param arg_sizes         Array of sizes for pointer arguments (unused for host orchestration)
  * @return 0 on success, -1 on failure
@@ -63,8 +64,8 @@ int init_runtime_impl(Runtime *runtime,
                     const uint8_t* orch_so_binary,
                     size_t orch_so_size,
                     const char* orch_func_name,
-                    uint64_t* func_args,
-                    int func_args_count,
+                    const OrchArg* orch_args,
+                    int orch_args_count,
                     int* arg_types,
                     uint64_t* arg_sizes,
                     const int* kernel_func_ids,
@@ -142,11 +143,11 @@ int init_runtime_impl(Runtime *runtime,
     runtime->clear_tensor_pairs();
 
     LOG_INFO("=== Calling Orchestration Function ===");
-    LOG_DEBUG("Args count: %d", func_args_count);
+    LOG_DEBUG("Args count: %d", orch_args_count);
 
     // Call orchestration function to build task graph
     // The orchestration function handles device memory allocation and copy-to-device
-    int rc = orch_func(runtime, func_args, func_args_count);
+    int rc = orch_func(runtime, orch_args, orch_args_count);
     if (rc != 0) {
         LOG_ERROR("Orchestration function failed with code %d", rc);
         runtime->clear_tensor_pairs();

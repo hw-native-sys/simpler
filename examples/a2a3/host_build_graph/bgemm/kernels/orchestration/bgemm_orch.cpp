@@ -19,6 +19,7 @@
  */
 
 #include "runtime.h"
+#include "orch_arg.h"
 #include <iostream>
 #include <vector>
 
@@ -32,18 +33,19 @@ constexpr int BATCH = 1;
 
 constexpr size_t TILE_BYTES = TILE * TILE * sizeof(float);
 
-int build_bgemm_graph(Runtime* runtime, uint64_t* args, int arg_count) {
-    if (arg_count < 6) {
-        std::cerr << "build_bgemm_graph: Expected at least 6 args, got " << arg_count << '\n';
+int build_bgemm_graph(Runtime* runtime, const OrchArg* orch_args, int arg_count) {
+    // Expected orch_args: [A, B, C] — 3 tensors
+    if (arg_count < 3) {
+        std::cerr << "build_bgemm_graph: Expected at least 3 args, got " << arg_count << '\n';
         return -1;
     }
 
-    void* host_A = reinterpret_cast<void*>(args[0]);
-    void* host_B = reinterpret_cast<void*>(args[1]);
-    void* host_C = reinterpret_cast<void*>(args[2]);
-    size_t size_A = static_cast<size_t>(args[3]);
-    size_t size_B = static_cast<size_t>(args[4]);
-    size_t size_C = static_cast<size_t>(args[5]);
+    void* host_A = orch_args[0].data<void>();
+    void* host_B = orch_args[1].data<void>();
+    void* host_C = orch_args[2].data<void>();
+    size_t size_A = orch_args[0].nbytes();
+    size_t size_B = orch_args[1].nbytes();
+    size_t size_C = orch_args[2].nbytes();
 
     std::cout << "\n=== build_bgemm_graph ===" << '\n';
     std::cout << "Grid: " << GRID_M << " x " << GRID_K << " x " << GRID_N << '\n';

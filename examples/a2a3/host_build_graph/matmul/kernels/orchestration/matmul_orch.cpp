@@ -11,7 +11,7 @@
  *       t3 (add+exp, AIV)
  *
  * This orchestration function:
- * 1. Receives host pointers and sizes in args
+ * 1. Receives OrchArg array with tensor metadata (pointers, shapes, dtypes)
  * 2. Allocates device memory via runtime->host_api
  * 3. Copies input data to device via runtime->host_api
  * 4. Records output tensor for copy-back during finalize
@@ -19,29 +19,30 @@
  */
 
 #include "runtime.h"
+#include "orch_arg.h"
 #include <iostream>
 #include <cstdint>
 
 extern "C" {
 
-int build_matmul_graph(Runtime* runtime, uint64_t* args, int arg_count) {
+int build_matmul_graph(Runtime* runtime, const OrchArg* orch_args, int arg_count) {
     // Validate argument count
-    // Expected args: [host_a, host_w1, host_w2, host_f, size_a, size_w1, size_w2, size_f, SIZE]
-    if (arg_count < 9) {
-        std::cerr << "build_matmul_graph: Expected at least 9 args, got " << arg_count << '\n';
+    // Expected orch_args: [a, w1, w2, f] — 4 tensors
+    if (arg_count < 4) {
+        std::cerr << "build_matmul_graph: Expected at least 4 args, got " << arg_count << '\n';
         return -1;
     }
 
-    // Extract arguments - host pointers and sizes
-    void* host_a  = reinterpret_cast<void*>(args[0]);
-    void* host_w1 = reinterpret_cast<void*>(args[1]);
-    void* host_w2 = reinterpret_cast<void*>(args[2]);
-    void* host_f  = reinterpret_cast<void*>(args[3]);
-    size_t size_a  = static_cast<size_t>(args[4]);
-    size_t size_w1 = static_cast<size_t>(args[5]);
-    size_t size_w2 = static_cast<size_t>(args[6]);
-    size_t size_f  = static_cast<size_t>(args[7]);
-    int SIZE = static_cast<int>(args[8]);
+    // Extract host pointers and sizes from OrchArg metadata
+    void* host_a  = orch_args[0].data<void>();
+    void* host_w1 = orch_args[1].data<void>();
+    void* host_w2 = orch_args[2].data<void>();
+    void* host_f  = orch_args[3].data<void>();
+    size_t size_a  = orch_args[0].nbytes();
+    size_t size_w1 = orch_args[1].nbytes();
+    size_t size_w2 = orch_args[2].nbytes();
+    size_t size_f  = orch_args[3].nbytes();
+    uint32_t SIZE = orch_args[0].tensor.shapes[0];
 
     std::cout << "\n=== build_matmul_graph: Creating Task Runtime ===" << '\n';
     std::cout << "Formula: F = exp(sqrt(log(A)) @ W1 + sqrt(log(A)) @ W2)\n";

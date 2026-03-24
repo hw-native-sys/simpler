@@ -48,12 +48,12 @@
 // Device orchestration function signature (loaded via dlopen).
 // The executor binds the current thread's PTO2Runtime into orchestration TLS
 // before calling the user entry.
-typedef void (*DeviceOrchestrationFunc)(uint64_t* args, int32_t arg_count,
+typedef void (*DeviceOrchestrationFunc)(OrchArg* orch_args,
                                         int32_t orch_thread_num, int32_t orch_thread_index);
 typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime* rt);
 
 // Config function exported by orchestration .so
-typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(uint64_t* args, int32_t arg_count);
+typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(OrchArg* orch_args);
 
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int32_t MAX_AIC_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD;
@@ -311,8 +311,7 @@ struct AicpuExecutor {
     // Shared orchestration function pointer (loaded by first orch thread, used by all)
     DeviceOrchestrationFunc orch_func_{nullptr};
     DeviceOrchestrationBindRuntimeFunc orch_bind_runtime_{nullptr};
-    uint64_t* orch_args_cached_{nullptr};
-    int32_t orch_arg_count_cached_{0};
+    OrchArg* orch_args_cached_{nullptr};
 
     uint64_t* func_id_to_addr_;
     uint64_t get_function_bin_addr(int func_id) const {
@@ -1683,18 +1682,24 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     bind_runtime_func = nullptr;
                 }
 
-                uint64_t* args = runtime->get_orch_args();
+                OrchArg* args = runtime->get_orch_args();
                 int32_t arg_count = runtime->get_orch_arg_count();
                 DEV_INFO("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_pto2_gm_sm_ptr(), arg_count);
                 for (int32_t i = 0; i < arg_count && i < 20; i++) {
-                    DEV_INFO("Thread %d: args[%d] = 0x%lx", thread_idx, i, args[i]);
+                    if (args[i].kind == OrchArgKind::TENSOR) {
+                        DEV_INFO("Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)",
+                                 thread_idx, i, (unsigned long)args[i].tensor.data, args[i].tensor.ndims, (unsigned)args[i].tensor.dtype);
+                    } else {
+                        DEV_INFO("Thread %d: orch_args[%d] = SCALAR(0x%lx)",
+                                 thread_idx, i, (unsigned long)args[i].scalar);
+                    }
                 }
 
                 uint64_t task_window_size = PTO2_TASK_WINDOW_SIZE;
                 uint64_t heap_size = PTO2_HEAP_SIZE;
                 int32_t expected_arg_count = 0;
                 if (config_func) {
-                    PTO2OrchestrationConfig cfg = config_func(args, arg_count);
+                    PTO2OrchestrationConfig cfg = config_func(args);
                     expected_arg_count = cfg.expected_arg_count;
                     DEV_INFO("Thread %d: Config: expected_args=%d", thread_idx, expected_arg_count);
                 } else {
@@ -1760,7 +1765,6 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 orch_func_ = orch_func;
                 orch_bind_runtime_ = bind_runtime_func;
                 orch_args_cached_ = args;
-                orch_arg_count_cached_ = arg_count;
                 orch_so_handle_ = handle;
                 snprintf(orch_so_path_, sizeof(orch_so_path_), "%s", so_path);
 
@@ -1808,7 +1812,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 orch_bind_runtime_(rt);
             }
             pto2_rt_scope_begin(rt);
-            orch_func_(orch_args_cached_, orch_arg_count_cached_, orch_thread_num_, orch_idx);
+            orch_func_(orch_args_cached_, orch_thread_num_, orch_idx);
             pto2_rt_scope_end(rt);
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(nullptr);
@@ -2103,7 +2107,6 @@ void AicpuExecutor::deinit(Runtime* runtime) {
     orch_func_ = nullptr;
     orch_bind_runtime_ = nullptr;
     orch_args_cached_ = nullptr;
-    orch_arg_count_cached_ = 0;
     orch_so_handle_ = nullptr;
     orch_so_path_[0] = '\0';
 

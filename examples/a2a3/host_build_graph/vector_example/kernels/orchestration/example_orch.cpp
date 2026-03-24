@@ -4,35 +4,35 @@
  * Builds the task graph for formula: (a + b + 1)(a + b + 2)
  *
  * This orchestration function:
- * 1. Receives host pointers and sizes in args
+ * 1. Receives OrchArg array with tensor metadata (pointers, shapes, dtypes)
  * 2. Allocates device memory via runtime->host_api
  * 3. Copies input data to device via runtime->host_api
  * 4. Records output tensor for copy-back during finalize
  * 5. Builds the task graph
  */
 
-// Include runtime.h first to get full Runtime class definition
 #include "runtime.h"
+#include "orch_arg.h"
 #include <iostream>
 
 extern "C" {
 
-int build_example_graph(Runtime* runtime, uint64_t* args, int arg_count) {
+int build_example_graph(Runtime* runtime, const OrchArg* orch_args, int arg_count) {
     // Validate argument count
-    // Expected args: [host_a, host_b, host_f, size_a, size_b, size_f, SIZE]
-    if (arg_count < 7) {
-        std::cerr << "build_example_graph: Expected at least 7 args, got " << arg_count << '\n';
+    // Expected orch_args: [a, b, f] — 3 tensors
+    if (arg_count < 3) {
+        std::cerr << "build_example_graph: Expected at least 3 args, got " << arg_count << '\n';
         return -1;
     }
 
-    // Extract arguments - host pointers and sizes
-    void* host_a = reinterpret_cast<void*>(args[0]);
-    void* host_b = reinterpret_cast<void*>(args[1]);
-    void* host_f = reinterpret_cast<void*>(args[2]);
-    size_t size_a = static_cast<size_t>(args[3]);
-    size_t size_b = static_cast<size_t>(args[4]);
-    size_t size_f = static_cast<size_t>(args[5]);
-    int SIZE = static_cast<int>(args[6]);
+    // Extract host pointers, sizes, and element count from OrchArg metadata
+    void* host_a = orch_args[0].data<void>();
+    void* host_b = orch_args[1].data<void>();
+    void* host_f = orch_args[2].data<void>();
+    size_t size_a = orch_args[0].nbytes();
+    size_t size_b = orch_args[1].nbytes();
+    size_t size_f = orch_args[2].nbytes();
+    uint32_t SIZE = orch_args[0].tensor.shapes[0];
 
     std::cout << "\n=== build_example_graph: Creating Task Runtime ===" << '\n';
     std::cout << "Formula: (a + b + 1)(a + b + 2)\n";

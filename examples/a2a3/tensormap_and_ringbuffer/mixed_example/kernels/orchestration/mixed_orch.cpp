@@ -8,13 +8,9 @@
  *   4. AIV_X2:     AIV0 add(D,E->L) + AIV1 mul(G,H->M)
  *   5. AIC_AIV_X1: AIC matmul(A,B->N) + AIV0 add(D,E->O)
  *
- * Args layout (30 args):
- *   [ptr_A, ptr_B, ptr_C, ptr_D, ptr_E, ptr_F,
- *    ptr_G, ptr_H, ptr_I, ptr_J, ptr_K, ptr_L,
- *    ptr_M, ptr_N, ptr_O,
- *    size_A, size_B, size_C, size_D, size_E, size_F,
- *    size_G, size_H, size_I, size_J, size_K, size_L,
- *    size_M, size_N, size_O]
+ * Args layout (15 args):
+ *   [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O]
+ *   Shape/dtype/size in OrchArg metadata.
  */
 
 #include <stddef.h>
@@ -30,101 +26,47 @@
 #define FUNC_ADD_STANDALONE 3   // AIV: reads args[0..2]
 #define FUNC_MUL_STANDALONE 4   // AIV1 in AIV_X2: reads args[3..5]
 
-#define ARG_PTR_A   0
-#define ARG_PTR_B   1
-#define ARG_PTR_C   2
-#define ARG_PTR_D   3
-#define ARG_PTR_E   4
-#define ARG_PTR_F   5
-#define ARG_PTR_G   6
-#define ARG_PTR_H   7
-#define ARG_PTR_I   8
-#define ARG_PTR_J   9
-#define ARG_PTR_K   10
-#define ARG_PTR_L   11
-#define ARG_PTR_M   12
-#define ARG_PTR_N   13
-#define ARG_PTR_O   14
-#define ARG_SIZE_A  15
-#define ARG_SIZE_B  16
-#define ARG_SIZE_C  17
-#define ARG_SIZE_D  18
-#define ARG_SIZE_E  19
-#define ARG_SIZE_F  20
-#define ARG_SIZE_G  21
-#define ARG_SIZE_H  22
-#define ARG_SIZE_I  23
-#define ARG_SIZE_J  24
-#define ARG_SIZE_K  25
-#define ARG_SIZE_L  26
-#define ARG_SIZE_M  27
-#define ARG_SIZE_N  28
-#define ARG_SIZE_O  29
-
 static constexpr uint32_t TILE_ELEMS = 128 * 128;
 
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-    (void)args;
-    (void)arg_count;
+PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+    (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 30,
+        .expected_arg_count = 15,
     };
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
-    (void)arg_count;
+void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
-    void* dev_A = (void*)(uintptr_t)args[ARG_PTR_A];
-    void* dev_B = (void*)(uintptr_t)args[ARG_PTR_B];
-    void* dev_C = (void*)(uintptr_t)args[ARG_PTR_C];
-    void* dev_D = (void*)(uintptr_t)args[ARG_PTR_D];
-    void* dev_E = (void*)(uintptr_t)args[ARG_PTR_E];
-    void* dev_F = (void*)(uintptr_t)args[ARG_PTR_F];
-    void* dev_G = (void*)(uintptr_t)args[ARG_PTR_G];
-    void* dev_H = (void*)(uintptr_t)args[ARG_PTR_H];
-    void* dev_I = (void*)(uintptr_t)args[ARG_PTR_I];
-    void* dev_J = (void*)(uintptr_t)args[ARG_PTR_J];
-    void* dev_K = (void*)(uintptr_t)args[ARG_PTR_K];
-    void* dev_L = (void*)(uintptr_t)args[ARG_PTR_L];
-    void* dev_M = (void*)(uintptr_t)args[ARG_PTR_M];
-    void* dev_N = (void*)(uintptr_t)args[ARG_PTR_N];
-    void* dev_O = (void*)(uintptr_t)args[ARG_PTR_O];
-    size_t size_C = (size_t)args[ARG_SIZE_C];
+    // Input tensors use to_tensor() — golden shape = kernel shape
+    Tensor ext_A = orch_args[0].to_tensor();
+    Tensor ext_B = orch_args[1].to_tensor();
+    Tensor ext_D = orch_args[3].to_tensor();
+    Tensor ext_E = orch_args[4].to_tensor();
+    Tensor ext_G = orch_args[6].to_tensor();
+    Tensor ext_H = orch_args[7].to_tensor();
 
-    int num_iters = (int)(size_C / (TILE_ELEMS * sizeof(float)));
+    // Output tensors — full buffers
+    Tensor ext_C = orch_args[2].to_tensor();
+    Tensor ext_F = orch_args[5].to_tensor();
+    Tensor ext_I = orch_args[8].to_tensor();
+    Tensor ext_J = orch_args[9].to_tensor();
+    Tensor ext_K = orch_args[10].to_tensor();
+    Tensor ext_L = orch_args[11].to_tensor();
+    Tensor ext_M = orch_args[12].to_tensor();
+    Tensor ext_N = orch_args[13].to_tensor();
+    Tensor ext_O = orch_args[14].to_tensor();
+
+    // Derive num_iters from output tensor size
+    uint32_t total_elems = orch_args[2].tensor.shapes[0];
+    int num_iters = (int)(total_elems / TILE_ELEMS);
 
     LOG_INFO("[mixed_orch] num_iters=%d", num_iters);
-
-    // Input tensors (shared across all tasks)
-    uint32_t ab_shapes[1] = {TILE_ELEMS};
-    Tensor ext_A = make_tensor_external(dev_A, ab_shapes, 1, DataType::FLOAT32);
-    Tensor ext_B = make_tensor_external(dev_B, ab_shapes, 1, DataType::FLOAT32);
-
-    uint32_t de_shapes[1] = {TILE_ELEMS};
-    Tensor ext_D = make_tensor_external(dev_D, de_shapes, 1, DataType::FLOAT32);
-    Tensor ext_E = make_tensor_external(dev_E, de_shapes, 1, DataType::FLOAT32);
-
-    uint32_t gh_shapes[1] = {TILE_ELEMS};
-    Tensor ext_G = make_tensor_external(dev_G, gh_shapes, 1, DataType::FLOAT32);
-    Tensor ext_H = make_tensor_external(dev_H, gh_shapes, 1, DataType::FLOAT32);
-
-    // Output tensors (full buffers, one slice per iteration)
-    uint32_t out_shapes[1] = {(uint32_t)num_iters * TILE_ELEMS};
-    Tensor ext_C = make_tensor_external(dev_C, out_shapes, 1, DataType::FLOAT32);
-    Tensor ext_F = make_tensor_external(dev_F, out_shapes, 1, DataType::FLOAT32);
-    Tensor ext_I = make_tensor_external(dev_I, out_shapes, 1, DataType::FLOAT32);
-    Tensor ext_J = make_tensor_external(dev_J, out_shapes, 1, DataType::FLOAT32);
-    Tensor ext_K = make_tensor_external(dev_K, out_shapes, 1, DataType::FLOAT32);
-    Tensor ext_L = make_tensor_external(dev_L, out_shapes, 1, DataType::FLOAT32);
-    Tensor ext_M = make_tensor_external(dev_M, out_shapes, 1, DataType::FLOAT32);
-    Tensor ext_N = make_tensor_external(dev_N, out_shapes, 1, DataType::FLOAT32);
-    Tensor ext_O = make_tensor_external(dev_O, out_shapes, 1, DataType::FLOAT32);
 
     for (int i = 0; i < num_iters; i++) {
         PTO2_SCOPE() {

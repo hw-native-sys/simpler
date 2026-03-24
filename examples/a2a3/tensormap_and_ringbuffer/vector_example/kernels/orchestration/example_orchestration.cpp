@@ -23,32 +23,6 @@
 
 #include "pto_orchestration_api.h"
 
-// =============================================================================
-// Args layout (from code_runner.py + runtime_maker.cpp extension):
-// Base args from code_runner.py: [tensors..., sizes..., SIZE]
-// Extended by runtime_maker.cpp: [..., gm_heap, heap_size] (always last 2)
-//
-// For this example (a+b+1)(a+b+2)+(a+b):
-//   [a, b, f, size_a, size_b, size_f, SIZE]
-//   + [gm_heap, heap_size] appended by runtime_maker.cpp
-//
-// Intermediate tensors (c, d, e, g) are allocated on-device by the runtime heap.
-// Generic access: gm_heap = args[arg_count - 2], heap_size = args[arg_count - 1]
-// =============================================================================
-
-// Tensor device pointers (order from code_runner.py: inputs, outputs)
-#define ARG_PTR_A 0
-#define ARG_PTR_B 1
-#define ARG_PTR_F 2  // output
-
-// Tensor sizes (same order as pointers)
-#define ARG_SIZE_A 3
-#define ARG_SIZE_B 4
-#define ARG_SIZE_F 5
-
-// Element count (scalar)
-#define ARG_SIZE 6
-
 // Helper to encode float as uint64_t for scalar params
 static uint64_t float_to_u64(float f) {
     union {
@@ -67,11 +41,10 @@ extern "C" {
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-    (void)args;
-    (void)arg_count;
+PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+    (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 7,
+        .expected_arg_count = 3,
     };
 }
 
@@ -81,24 +54,19 @@ PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count
  * the outer scope on entry.
  */
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
-    (void)arg_count;
+void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
-    void* arg_a_ptr = (void*)(uintptr_t)args[ARG_PTR_A];
-    void* arg_b_ptr = (void*)(uintptr_t)args[ARG_PTR_B];
-    void* arg_f_ptr = (void*)(uintptr_t)args[ARG_PTR_F];
-    int SIZE = (int)(args[ARG_SIZE] & 0x7FFFFFFF);
+    // golden shape = kernel shape, use to_tensor() directly
+    Tensor ext_a = orch_args[0].to_tensor();
+    Tensor ext_b = orch_args[1].to_tensor();
+    Tensor ext_f = orch_args[2].to_tensor();
 
-    LOG_INFO("===============SIZE=%d", SIZE);
+    uint32_t SIZE = orch_args[0].tensor.shapes[0];
+    LOG_INFO("===============SIZE=%u", SIZE);
 
-    uint32_t ext_shapes[1] = {(uint32_t)SIZE};
-    Tensor ext_a = make_tensor_external(arg_a_ptr, ext_shapes, 1, DataType::FLOAT32);
-    Tensor ext_b = make_tensor_external(arg_b_ptr, ext_shapes, 1, DataType::FLOAT32);
-    Tensor ext_f = make_tensor_external(arg_f_ptr, ext_shapes, 1, DataType::FLOAT32);
-
-    uint32_t inter_shapes[1] = {(uint32_t)SIZE};
+    uint32_t inter_shapes[1] = {SIZE};
     Tensor c = make_tensor(inter_shapes, 1, DataType::FLOAT32);  // c = a + b
 
     // t0: c = a + b (kernel_id=0, kernel_add) [outer scope]

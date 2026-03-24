@@ -21,6 +21,8 @@
  * Dependencies are explicit via pto2_rt_add_dependency:
  *   - gemm(k) -> add(k): add reads P which gemm produces
  *   - add(k-1) -> add(k): add reads/writes C_view (K accumulation chain)
+ *
+ * Args layout: [A, B, C]  — shape/dtype/size in OrchArg metadata
  */
 
 #include <stddef.h>
@@ -40,47 +42,27 @@ static constexpr int BATCH = 1;
 static constexpr uint32_t TILE_ELEMS = TILE * TILE;
 static constexpr uint64_t TILE_BYTES = TILE_ELEMS * sizeof(float);
 
-// Args layout: [ptr_A, ptr_B, ptr_C, size_A, size_B, size_C]
-#define ARG_PTR_A   0
-#define ARG_PTR_B   1
-#define ARG_PTR_C   2
-#define ARG_SIZE_A  3
-#define ARG_SIZE_B  4
-#define ARG_SIZE_C  5
-
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-    (void)args;
-    (void)arg_count;
+PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+    (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 6,
+        .expected_arg_count = 3,
     };
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
-    (void)arg_count;
+void aicpu_orchestration_entry(PTO2Runtime* rt, OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
-    void* dev_A = (void*)(uintptr_t)args[ARG_PTR_A];
-    void* dev_B = (void*)(uintptr_t)args[ARG_PTR_B];
-    void* dev_C = (void*)(uintptr_t)args[ARG_PTR_C];
-    size_t size_A = (size_t)args[ARG_SIZE_A];
-    size_t size_B = (size_t)args[ARG_SIZE_B];
-    size_t size_C = (size_t)args[ARG_SIZE_C];
+    Tensor ext_A = orch_args[0].to_tensor();
+    Tensor ext_B = orch_args[1].to_tensor();
+    Tensor ext_C = orch_args[2].to_tensor();
 
     LOG_INFO(rt, "[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d",
                   GRID_M, GRID_K, GRID_N, BATCH, TILE);
-
-    uint32_t ext_A_shapes[1] = {(uint32_t)(size_A / sizeof(float))};
-    Tensor ext_A = make_tensor_external(dev_A, ext_A_shapes, 1, DataType::FLOAT32);
-    uint32_t ext_B_shapes[1] = {(uint32_t)(size_B / sizeof(float))};
-    Tensor ext_B = make_tensor_external(dev_B, ext_B_shapes, 1, DataType::FLOAT32);
-    uint32_t ext_C_shapes[1] = {(uint32_t)(size_C / sizeof(float))};
-    Tensor ext_C = make_tensor_external(dev_C, ext_C_shapes, 1, DataType::FLOAT32);
 
     uint32_t tile_shapes[1] = {TILE_ELEMS};
 

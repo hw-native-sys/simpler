@@ -16,10 +16,9 @@ Computation:
     where A = e^4 (128x128, float16), W1 = W2 = 1/256 (128x128, float16)
     Result: F = exp(2) ~ 7.389
 
-Args layout: [ptr_a, ptr_w1, ptr_w2, ptr_f, size_a, size_w1, size_w2, size_f, SIZE]
+Args layout: [a, w1, w2, f] — shape/dtype/size in OrchArg metadata
 """
 
-import ctypes
 import torch
 
 __outputs__ = ["f"]
@@ -46,11 +45,6 @@ def generate_inputs(params: dict) -> list:
         ("w1", w1),
         ("w2", w2),
         ("f", f),
-        ("size_a", ctypes.c_int64(a.nbytes)),
-        ("size_w1", ctypes.c_int64(w1.nbytes)),
-        ("size_w2", ctypes.c_int64(w2.nbytes)),
-        ("size_f", ctypes.c_int64(f.nbytes)),
-        ("SIZE", ctypes.c_int64(SIZE)),
     ]
 
 

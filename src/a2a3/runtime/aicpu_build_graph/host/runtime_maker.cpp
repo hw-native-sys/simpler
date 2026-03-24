@@ -5,7 +5,7 @@
  * Supports device orchestration where AICPU thread 3 runs the orchestrator.
  *
  * init_runtime_impl:
- *   - Converts host pointers to device pointers based on arg_types
+ *   - Converts host OrchArg pointers to device pointers based on arg_types
  *   - Copies orchestration SO to device memory
  *   - Sets up runtime state for device orchestration
  *
@@ -86,8 +86,8 @@ extern "C" int init_runtime_impl(Runtime *runtime,
                     const uint8_t* orch_so_binary,
                     size_t orch_so_size,
                     const char* orch_func_name,
-                    uint64_t* func_args,
-                    int func_args_count,
+                    const OrchArg* orch_args,
+                    int orch_args_count,
                     int* arg_types,
                     uint64_t* arg_sizes,
                     const int* kernel_func_ids,
@@ -128,98 +128,71 @@ extern "C" int init_runtime_impl(Runtime *runtime,
         return -1;
     }
 
-    if (func_args_count > RT2_MAX_DEVICE_ARGS) {
-        LOG_ERROR("Too many arguments: %d (max %d)", func_args_count, RT2_MAX_DEVICE_ARGS);
+    if (orch_args_count > RT2_MAX_DEVICE_ARGS) {
+        LOG_ERROR("Too many arguments: %d (max %d)", orch_args_count, RT2_MAX_DEVICE_ARGS);
         return -1;
     }
 
-    LOG_INFO("RT2 init: %d arguments, device orchestration mode", func_args_count);
+    LOG_INFO("RT2 init: %d arguments, device orchestration mode", orch_args_count);
 
     long long t_total_start = _now_ms();
 
-    // Convert host pointers to device pointers based on arg_types
-    uint64_t device_args[RT2_MAX_DEVICE_ARGS];
+    // Copy OrchArgs and replace host tensor pointers with device pointers
+    OrchArg device_args[RT2_MAX_DEVICE_ARGS];
 
     long long t_args_start = _now_ms();
-    for (int i = 0; i < func_args_count; i++) {
-        switch (arg_types[i]) {
-            case ARG_SCALAR:
-                // Scalar value, pass directly
-                device_args[i] = func_args[i];
-                break;
+    for (int i = 0; i < orch_args_count; i++) {
+        device_args[i] = orch_args[i];  // Copy entire OrchArg (preserves metadata)
 
-            case ARG_INPUT_PTR: {
-                // Input pointer: allocate device memory, copy data
-                void* host_ptr = reinterpret_cast<void*>(func_args[i]);
-                size_t size = arg_sizes[i];
+        if (orch_args[i].kind == OrchArgKind::TENSOR) {
+            void* host_ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(orch_args[i].tensor.data));
+            size_t size = arg_sizes[i];
 
-                void* dev_ptr = runtime->host_api.device_malloc(size);
-                if (dev_ptr == nullptr) {
-                    LOG_ERROR("Failed to allocate device memory for arg %d", i);
-                    return -1;
-                }
-
-                int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
-                if (rc != 0) {
-                    LOG_ERROR("Failed to copy arg %d to device", i);
-                    runtime->host_api.device_free(dev_ptr);
-                    return -1;
-                }
-
-                device_args[i] = reinterpret_cast<uint64_t>(dev_ptr);
-                // Record for cleanup (no copy-back needed)
-                runtime->record_tensor_pair(nullptr, dev_ptr, size);
-                LOG_INFO("  Arg %d (input): %zu bytes at %p", i, size, dev_ptr);
-                break;
-            }
-
-            case ARG_OUTPUT_PTR: {
-                // Output pointer: allocate device memory, record for copy-back
-                void* host_ptr = reinterpret_cast<void*>(func_args[i]);
-                size_t size = arg_sizes[i];
-
-                void* dev_ptr = runtime->host_api.device_malloc(size);
-                if (dev_ptr == nullptr) {
-                    LOG_ERROR("Failed to allocate device memory for arg %d", i);
-                    return -1;
-                }
-
-                device_args[i] = reinterpret_cast<uint64_t>(dev_ptr);
-                // Record for copy-back during finalize
-                runtime->record_tensor_pair(host_ptr, dev_ptr, size);
-                LOG_INFO("  Arg %d (output): %zu bytes at %p", i, size, dev_ptr);
-                break;
-            }
-
-            case ARG_INOUT_PTR: {
-                // Input/output pointer: allocate, copy, record for copy-back
-                void* host_ptr = reinterpret_cast<void*>(func_args[i]);
-                size_t size = arg_sizes[i];
-
-                void* dev_ptr = runtime->host_api.device_malloc(size);
-                if (dev_ptr == nullptr) {
-                    LOG_ERROR("Failed to allocate device memory for arg %d", i);
-                    return -1;
-                }
-
-                int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
-                if (rc != 0) {
-                    LOG_ERROR("Failed to copy arg %d to device", i);
-                    runtime->host_api.device_free(dev_ptr);
-                    return -1;
-                }
-
-                device_args[i] = reinterpret_cast<uint64_t>(dev_ptr);
-                // Record for copy-back during finalize
-                runtime->record_tensor_pair(host_ptr, dev_ptr, size);
-                LOG_INFO("  Arg %d (inout): %zu bytes at %p", i, size, dev_ptr);
-                break;
-            }
-
-            default:
-                LOG_ERROR("Unknown arg_type %d for arg %d", arg_types[i], i);
+            void* dev_ptr = runtime->host_api.device_malloc(size);
+            if (dev_ptr == nullptr) {
+                LOG_ERROR("Failed to allocate device memory for arg %d", i);
                 return -1;
+            }
+
+            switch (arg_types[i]) {
+                case ARG_INPUT_PTR: {
+                    int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
+                    if (rc != 0) {
+                        LOG_ERROR("Failed to copy arg %d to device", i);
+                        runtime->host_api.device_free(dev_ptr);
+                        return -1;
+                    }
+                    runtime->record_tensor_pair(nullptr, dev_ptr, size);
+                    LOG_INFO("  Arg %d (input): %zu bytes at %p", i, size, dev_ptr);
+                    break;
+                }
+
+                case ARG_OUTPUT_PTR: {
+                    runtime->record_tensor_pair(host_ptr, dev_ptr, size);
+                    LOG_INFO("  Arg %d (output): %zu bytes at %p", i, size, dev_ptr);
+                    break;
+                }
+
+                case ARG_INOUT_PTR: {
+                    int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
+                    if (rc != 0) {
+                        LOG_ERROR("Failed to copy arg %d to device", i);
+                        runtime->host_api.device_free(dev_ptr);
+                        return -1;
+                    }
+                    runtime->record_tensor_pair(host_ptr, dev_ptr, size);
+                    LOG_INFO("  Arg %d (inout): %zu bytes at %p", i, size, dev_ptr);
+                    break;
+                }
+
+                default:
+                    LOG_ERROR("Unknown arg_type %d for tensor arg %d", arg_types[i], i);
+                    return -1;
+            }
+
+            device_args[i].tensor.data = reinterpret_cast<uint64_t>(dev_ptr);
         }
+        // SCALAR: no action needed, value already copied
     }
     long long t_args_end = _now_ms();
 
@@ -313,9 +286,9 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
     // Set up device orchestration state
     runtime->set_orch_built_on_host(false);
-    runtime->set_orch_args(device_args, func_args_count);
+    runtime->set_orch_args(device_args, orch_args_count);
 
-    LOG_INFO("Device orchestration ready: %d args", func_args_count);
+    LOG_INFO("Device orchestration ready: %d args", orch_args_count);
 
     long long t_total_end = _now_ms();
     LOG_INFO("TIMING: args_malloc_copy = %lldms", t_args_end - t_args_start);

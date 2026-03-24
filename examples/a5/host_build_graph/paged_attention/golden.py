@@ -1,4 +1,9 @@
-"""Paged Attention Golden - host_build_graph example (small scale, float16)."""
+"""Paged Attention Golden - host_build_graph example (small scale, float16).
+
+Args layout: [query, key_cache, value_cache, block_table, context_lens, out, scale]
+  - Tensors retain original multi-dimensional shapes (OrchArg metadata carries shape/dtype)
+  - scale is a scalar float parameter
+"""
 
 from paged_attention_golden import (
     generate_inputs as _generate_inputs,
@@ -38,7 +43,7 @@ DEFAULT_CASE = "Case1"
 
 
 def generate_inputs(params: dict) -> list:
-    return _generate_inputs(params, return_all_sizes=True)
+    return _generate_inputs(params)
 
 
 if __name__ == "__main__":

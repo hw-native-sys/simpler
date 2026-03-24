@@ -22,7 +22,7 @@ Usage:
     runtime.initialize(
         orch_so_binary,
         "build_example_graph",
-        func_args,
+        orch_args,
         kernel_binaries=kernel_binaries
     )
 
@@ -40,6 +40,7 @@ from ctypes import (
     c_char_p,
     c_int,
     c_int32,
+    c_uint32,
     c_void_p,
     c_uint8,
     c_uint64,
@@ -63,6 +64,39 @@ ARG_SCALAR = 0      # Scalar value, passed directly
 ARG_INPUT_PTR = 1   # Input pointer: device_malloc + copy_to_device
 ARG_OUTPUT_PTR = 2  # Output pointer: device_malloc + record for copy-back
 ARG_INOUT_PTR = 3   # Input/output: copy_to_device + copy-back
+
+
+# ============================================================================
+# OrchArg ctypes mirror (must match C++ struct OrchArg, 48 bytes)
+# ============================================================================
+ORCH_ARG_MAX_DIMS = 5
+
+
+class _OrchArgTensorC(ctypes.Structure):
+    _fields_ = [
+        ("data", c_uint64),
+        ("shapes", c_uint32 * ORCH_ARG_MAX_DIMS),
+        ("ndims", c_uint32),
+        ("dtype", c_uint32),
+    ]
+
+
+class _OrchArgUnionC(ctypes.Union):
+    _fields_ = [
+        ("tensor", _OrchArgTensorC),
+        ("scalar", c_uint64),
+    ]
+
+
+class OrchArgC(ctypes.Structure):
+    _fields_ = [
+        ("kind", c_uint32),
+        ("_pad", c_uint32),
+        ("u", _OrchArgUnionC),
+    ]
+
+
+assert ctypes.sizeof(OrchArgC) == 48
 
 
 # ============================================================================
@@ -112,8 +146,8 @@ class RuntimeLibraryLoader:
             POINTER(c_uint8),       # orch_so_binary
             c_size_t,               # orch_so_size
             c_char_p,               # orch_func_name
-            POINTER(c_uint64),      # func_args
-            c_int,                  # func_args_count
+            POINTER(OrchArgC),      # orch_args
+            c_int,                  # orch_args_count
             POINTER(c_int),         # arg_types
             POINTER(c_uint64),      # arg_sizes
             POINTER(c_int),         # kernel_func_ids (array of func_ids)
@@ -214,7 +248,7 @@ class Runtime:
         self,
         orch_so_binary: bytes,
         orch_func_name: str,
-        func_args: Optional[List[int]] = None,
+        orch_args: Optional[list] = None,
         arg_types: Optional[List[int]] = None,
         arg_sizes: Optional[List[int]] = None,
         kernel_binaries: Optional[List[Tuple[int, bytes]]] = None,
@@ -236,23 +270,23 @@ class Runtime:
         Args:
             orch_so_binary: Orchestration shared library binary data
             orch_func_name: Name of the orchestration function to call
-            func_args: Arguments for orchestration (host pointers, sizes, etc.)
-            arg_types: Array describing each argument's type (ARG_SCALAR, ARG_INPUT_PTR, etc.)
-            arg_sizes: Array of sizes for pointer arguments (0 for scalars)
+            orch_args: List of OrchArgC structs for orchestration
+            arg_types: Array describing each argument's IO direction (ARG_SCALAR, ARG_INPUT_PTR, etc.)
+            arg_sizes: Array of byte sizes for tensor arguments (0 for scalars)
             kernel_binaries: List of (func_id, binary_data) tuples for kernel registration
 
         Raises:
             RuntimeError: If initialization fails
         """
 
-        func_args = func_args or []
-        func_args_count = len(func_args)
+        orch_args = orch_args or []
+        orch_args_count = len(orch_args)
 
-        # Convert func_args to ctypes array
-        if func_args_count > 0:
-            func_args_array = (c_uint64 * func_args_count)(*func_args)
+        # Convert orch_args to ctypes array
+        if orch_args_count > 0:
+            orch_args_array = (OrchArgC * orch_args_count)(*orch_args)
         else:
-            func_args_array = None
+            orch_args_array = None
 
         # Convert arg_types to ctypes array
         if arg_types is not None and len(arg_types) > 0:
@@ -299,8 +333,8 @@ class Runtime:
             orch_so_array,
             len(orch_so_binary),
             orch_func_name.encode('utf-8'),
-            func_args_array,
-            func_args_count,
+            orch_args_array,
+            orch_args_count,
             arg_types_array,
             arg_sizes_array,
             func_ids_array,
@@ -596,7 +630,7 @@ def bind_host_binary(lib_path: Union[str, Path, bytes]) -> type:
         runtime.initialize(
             orch_so_binary,
             "build_example_graph",
-            func_args,
+            orch_args,
             kernel_binaries=kernel_binaries
         )
 

@@ -33,7 +33,7 @@ DEFAULT_CASE = "Case1"
 
 
 def generate_inputs(params: dict) -> list:
-    return _generate_inputs(params, return_all_sizes=False)
+    return _generate_inputs(params)
 
 
 if __name__ == "__main__":

@@ -39,57 +39,44 @@
 #define FUNC_AIC_HUB 4
 #define FUNC_AIV_HUB 5
 
-static uint64_t float_to_u64(float f) {
-    union {
-        float f32;
-        uint64_t u64;
-    } conv;
-    conv.u64 = 0;
-    conv.f32 = f;
-    return conv.u64;
-}
-
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-    (void)args;
-    (void)arg_count;
+PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+    (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 10,
+        .expected_arg_count = 7,
     };
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
-    (void)arg_count;
+void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
 
-    void* host_query = (void*)(uintptr_t)args[0];
-    void* host_key_cache = (void*)(uintptr_t)args[1];
-    void* host_value_cache = (void*)(uintptr_t)args[2];
-    int* host_block_table = (int*)(uintptr_t)args[3];
-    int* host_context_lens = (int*)(uintptr_t)args[4];
-    void* host_out = (void*)(uintptr_t)args[5];
-    int64_t* host_config = (int64_t*)(uintptr_t)args[6];
+    // Read dimensions from OrchArg tensor metadata
+    uint64_t batch     = orch_args[0].tensor.shapes[0];
+    uint64_t num_heads = orch_args[0].tensor.shapes[1];
+    uint64_t head_dim  = orch_args[0].tensor.shapes[2];
+    DataType data_type = orch_args[0].tensor.dtype;
 
-    size_t key_cache_size = (size_t)args[8];
+    uint64_t block_size = orch_args[1].tensor.shapes[1];
+    uint64_t block_num  = orch_args[3].tensor.shapes[1];
 
-    uint64_t batch = static_cast<uint64_t>(host_config[0]);
-    uint64_t num_heads = static_cast<uint64_t>(host_config[1]);
-    uint64_t head_dim = static_cast<uint64_t>(host_config[3]);
-    uint64_t block_size = static_cast<uint64_t>(host_config[4]);
-    uint64_t block_num = static_cast<uint64_t>(host_config[5]);
-    union { uint32_t u; float f; } scale_conv;
-    scale_conv.u = (uint32_t)host_config[6];
-    float scale_value = scale_conv.f;
+    uint64_t scale_value = orch_args[6].scalar;
 
     uint64_t q_tile = std::min(num_heads, 128UL);
     uint64_t q_loop = (num_heads + q_tile - 1) / q_tile;
-    DataType data_type = DataType::BFLOAT16;
     uint64_t elem_size = get_element_size(data_type);
 
     LOG_INFO("batch_paged_attention: batch=%lu, num_heads=%lu",
              (unsigned long)batch, (unsigned long)num_heads);
+
+    void* query_ptr = orch_args[0].data<void>();
+    void* kc_ptr    = orch_args[1].data<void>();
+    void* vc_ptr    = orch_args[2].data<void>();
+    void* out_ptr   = orch_args[5].data<void>();
+
+    int* host_block_table  = orch_args[3].data<int>();
+    int* host_context_lens = orch_args[4].data<int>();
 
     uint64_t max_bn = 0;
     for (uint64_t b = 0; b < batch; b++) {
@@ -99,15 +86,16 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_nu
     }
 
     uint32_t query_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
-    uint64_t kv_total_rows = key_cache_size / (head_dim * elem_size);
+    uint64_t total_blocks_count = orch_args[1].tensor.shapes[0];
+    uint64_t kv_total_rows = total_blocks_count * block_size;
     uint32_t key_cache_shapes[2] = {(uint32_t)kv_total_rows, (uint32_t)head_dim};
     uint32_t value_cache_shapes[2] = {(uint32_t)kv_total_rows, (uint32_t)head_dim};
     uint32_t out_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
 
-    Tensor query = make_tensor_external(host_query, query_shapes, 2, data_type);
-    Tensor key_cache = make_tensor_external(host_key_cache, key_cache_shapes, 2, data_type);
-    Tensor value_cache = make_tensor_external(host_value_cache, value_cache_shapes, 2, data_type);
-    Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
+    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
+    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
+    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
+    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
 
     uint64_t bt_addr = (uint64_t)(uintptr_t)host_block_table;
     uint64_t cl_addr = (uint64_t)(uintptr_t)host_context_lens;
@@ -166,7 +154,7 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_nu
                     params_sf.add_output(pij_b);
                     params_sf.add_output(mij_b);
                     params_sf.add_output(lij_b);
-                    params_sf.add_scalar(float_to_u64(scale_value));
+                    params_sf.add_scalar(scale_value);
                     params_sf.add_scalar(cl_addr);
                     params_sf.add_scalar(chunk_bc);
                     params_sf.add_scalar(bn);

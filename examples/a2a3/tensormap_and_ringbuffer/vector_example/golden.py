@@ -5,10 +5,9 @@ Computation:
     f = (a + b + 1) * (a + b + 2) + (a + b)
     where a=2.0, b=3.0, so f=47.0
 
-Args layout: [ptr_a, ptr_b, ptr_f, size_a, size_b, size_f, SIZE]
+Args layout: [a, b, f]  — shape/dtype/size in OrchArg metadata
 """
 
-import ctypes
 import torch
 
 __outputs__ = ["f"]
@@ -30,10 +29,6 @@ def generate_inputs(params: dict) -> list:
         ("a", a),
         ("b", b),
         ("f", f),
-        ("size_a", ctypes.c_int64(a.nbytes)),
-        ("size_b", ctypes.c_int64(b.nbytes)),
-        ("size_f", ctypes.c_int64(f.nbytes)),
-        ("SIZE", ctypes.c_int64(SIZE)),
     ]
 
 

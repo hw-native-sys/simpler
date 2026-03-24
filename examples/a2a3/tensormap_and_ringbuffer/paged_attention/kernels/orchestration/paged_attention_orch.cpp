@@ -25,73 +25,38 @@
 #define FUNC_AIC_HUB 4
 #define FUNC_AIV_HUB 5
 
-// Helper to encode float as uint64_t for scalar params
-static uint64_t float_to_u64(float f) {
-    union {
-        float f32;
-        uint64_t u64;
-    } conv;
-    conv.u64 = 0;  // Clear upper bits
-    conv.f32 = f;
-    return conv.u64;
-}
-
 extern "C" {
 
-/**
- * Orchestration config — the executor reads these values to set up
- * shared memory and runtime before calling aicpu_orchestration_entry.
- */
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count) {
-    (void)args;
-    (void)arg_count;
+PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+    (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 10,
+        .expected_arg_count = 7,
     };
 }
 
-/**
- * Orchestration entry — runtime is bound implicitly by the framework.
- * The executor wraps this call in PTO2_SCOPE, so we are already inside
- * the outer scope on entry.
- */
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
-    (void)arg_count;
+void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
+    // Read dimensions from OrchArg tensor metadata
+    // query: shape=[batch, num_heads, head_dim]
+    uint64_t batch     = orch_args[0].tensor.shapes[0];
+    uint64_t num_heads = orch_args[0].tensor.shapes[1];
+    uint64_t head_dim  = orch_args[0].tensor.shapes[2];
+    DataType data_type = orch_args[0].tensor.dtype;
 
-    // Extract device pointers (first 7)
-    void* host_query = (void*)(uintptr_t)args[0];           // [batch, num_heads, head_dim]
-    void* host_key_cache = (void*)(uintptr_t)args[1];       // [batch, block_num, block_size, head_dim]
-    void* host_value_cache = (void*)(uintptr_t)args[2];     // [batch, block_num, block_size, head_dim]
-    int* host_block_table = (int*)(uintptr_t)args[3];       // [batch, block_num]
-    int* host_context_lens = (int*)(uintptr_t)args[4];      // [batch]
-    void* host_out = (void*)(uintptr_t)args[5];             // [batch, num_heads, head_dim]
-    int64_t* host_config = (int64_t*)(uintptr_t)args[6];
+    // key_cache: shape=[total_blocks, block_size, kv_head_num, head_dim]
+    uint64_t block_size  = orch_args[1].tensor.shapes[1];
 
-    // Extract sizes (next 3 args after pointers)
-    size_t query_size = (size_t)args[7];
-    size_t key_cache_size = (size_t)args[8];
-    size_t value_cache_size = (size_t)args[9];
+    // block_table: shape=[batch, max_num_blocks_per_req]
+    uint64_t block_num = orch_args[3].tensor.shapes[1];
 
-    // Extract config parameters
-    uint64_t batch = (uint64_t)(int)host_config[0];
-    uint64_t num_heads = (uint64_t)(int)host_config[1];
-    int kv_head_num = (int)host_config[2];
-    uint64_t head_dim = (uint64_t)(int)host_config[3];
-    uint64_t block_size = (uint64_t)(int)host_config[4];
-    uint64_t block_num = (uint64_t)(int)host_config[5];
-    // Reinterpret scale_bits as float (golden.py packs float via struct.pack)
-    union { uint32_t u; float f; } scale_conv;
-    scale_conv.u = (uint32_t)host_config[6];
-    float scale_value = scale_conv.f;
+    // scale from scalar arg
+    uint64_t scale_value = orch_args[6].scalar;
+
     uint64_t q_head_num = num_heads;
     uint64_t q_tile = 16;
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
-    DataType data_type = DataType::FLOAT16;
     uint64_t elem_size = get_element_size(data_type);
-
-    (void)kv_head_num;
 
     // Partition batch across orchestrators
     uint64_t b_start = batch * orch_thread_index / orch_thread_num;
@@ -101,20 +66,31 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_nu
              orch_thread_index, orch_thread_num,
              (unsigned long)batch, (unsigned long)b_start, (unsigned long)b_end);
 
-    // Compute actual tensor shapes from buffer sizes (not from max block_num)
+    // Reshape tensors for kernel consumption (2D flattened)
+    void* query_ptr = orch_args[0].data<void>();
+    void* kc_ptr    = orch_args[1].data<void>();
+    void* vc_ptr    = orch_args[2].data<void>();
+    void* out_ptr   = orch_args[5].data<void>();
+
+    // Compute kv_total_rows from key_cache tensor metadata
+    uint64_t total_blocks_count = orch_args[1].tensor.shapes[0];
+    uint64_t kv_total_rows = total_blocks_count * block_size;
+
     uint32_t query_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
-    uint64_t kv_total_rows = key_cache_size / (head_dim * elem_size);
     uint32_t key_cache_shapes[2] = {(uint32_t)kv_total_rows, (uint32_t)head_dim};
     uint32_t value_cache_shapes[2] = {(uint32_t)kv_total_rows, (uint32_t)head_dim};
     uint32_t out_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
-    Tensor query = make_tensor_external(host_query, query_shapes, 2, data_type);
-    Tensor key_cache = make_tensor_external(host_key_cache, key_cache_shapes, 2, data_type);
-    Tensor value_cache = make_tensor_external(host_value_cache, value_cache_shapes, 2, data_type);
-    Tensor out = make_tensor_external(host_out, out_shapes, 2, DataType::FLOAT32);
+    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
+    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
+    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
+    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
     LOG_DEBUG("query=%s", query.dump().c_str());
     LOG_DEBUG("key_cache=%s", key_cache.dump().c_str());
     LOG_DEBUG("value_cache=%s", value_cache.dump().c_str());
     LOG_DEBUG("out=%s", out.dump().c_str());
+
+    int* host_block_table  = orch_args[3].data<int>();
+    int* host_context_lens = orch_args[4].data<int>();
 
     for (uint64_t b_idx = b_start; b_idx < b_end; b_idx++) {
         uint64_t cur_seq = host_context_lens[b_idx];
@@ -170,7 +146,7 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_nu
                     params_sf.add_output(pij_f16);
                     params_sf.add_output(mi);
                     params_sf.add_output(li);
-                    params_sf.add_scalar(float_to_u64(scale_value));
+                    params_sf.add_scalar(scale_value);
                     pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf); // v1
 
                     uint32_t oi_tmp_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};

@@ -25,6 +25,7 @@
 #include "tensor.h"             // Tensor
 #include "pto_types.h"          // PTOParam, PTOTensorEntry, PTOParamType
 #include "pto_submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
+#include "orch_arg.h"           // OrchArg, OrchArgKind
 
 // =============================================================================
 // Tensor Factory Helpers
@@ -66,6 +67,15 @@ static inline Tensor make_tensor(const uint32_t shapes[],
     }
     return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
                   /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
+}
+
+// OrchArg::to_tensor() — deferred definition (needs make_tensor_external above)
+static_assert(ORCH_ARG_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "OrchArg and runtime max dims must match");
+inline Tensor OrchArg::to_tensor(bool manual_dep, int32_t version) const {
+    return make_tensor_external(
+        reinterpret_cast<void*>(static_cast<uintptr_t>(tensor.data)),
+        tensor.shapes, tensor.ndims, tensor.dtype,
+        manual_dep, version);
 }
 
 // =============================================================================

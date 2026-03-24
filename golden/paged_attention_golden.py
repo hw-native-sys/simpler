@@ -6,23 +6,25 @@ and golden computation used by all paged_attention / batch_paged_attention
 examples and tests across runtime variants.
 
 Individual golden.py files import from this module and provide only their
-specific ALL_CASES, RTOL/ATOL, and return_all_sizes configuration.
+specific ALL_CASES, RTOL/ATOL configuration.
+
+Args layout (7 args):
+  [query, key_cache, value_cache, block_table, context_lens, out, scale]
+  - Tensors retain original multi-dimensional shapes (OrchArg metadata carries shape/dtype)
+  - scale is a scalar float parameter
 """
 
 import ctypes
-import struct
 import torch
 
 
-def generate_inputs(params: dict, return_all_sizes: bool = False) -> list:
+def generate_inputs(params: dict) -> list:
     """Generate input tensors and zeroed output tensor.
 
     Args:
         params: Dict with keys: batch, num_heads, kv_head_num, head_dim,
                 block_size, context_len, max_model_len, dtype.
                 Optional: context_lens_list (for variable sequence lengths).
-        return_all_sizes: If True, return size entries for all tensors (13 items).
-                          If False, return only size_query/key_cache/value_cache (10 items).
     """
     batch = params["batch"]
     num_heads = params["num_heads"]
@@ -38,7 +40,6 @@ def generate_inputs(params: dict, return_all_sizes: bool = False) -> list:
 
     max_num_blocks_per_req = max_model_len // block_size
     scale_value = 1.0
-    scale_bits = struct.unpack('I', struct.pack('f', scale_value))[0]
 
     # Build per-batch context_lens tensor
     if context_lens_list is not None:
@@ -62,46 +63,20 @@ def generate_inputs(params: dict, return_all_sizes: bool = False) -> list:
         dtype=torch.int32,
     )
 
-    config = torch.tensor(
-        [batch, num_heads, kv_head_num, head_dim, block_size,
-         max_num_blocks_per_req, scale_bits],
-        dtype=torch.int64,
-    )
+    query = torch.empty(batch, num_heads, head_dim).uniform_(-0.5, 0.5).to(dtype)
+    key_cache = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-0.5, 0.5).to(dtype)
+    value_cache = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-1, 1).to(dtype)
+    out = torch.zeros(batch, num_heads, head_dim, dtype=torch.float32)
 
-    query_raw = torch.empty(batch, 1, num_heads * head_dim).uniform_(-0.5, 0.5).to(dtype)
-    query_raw = query_raw.reshape(batch, num_heads, head_dim)
-
-    key_raw = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-0.5, 0.5).to(dtype)
-    value_raw = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-1, 1).to(dtype)
-
-    query = query_raw.flatten()
-    key_cache = key_raw.flatten()
-    value_cache = value_raw.flatten()
-    block_table_flat = block_table.flatten()
-    out = torch.zeros(batch * num_heads * head_dim, dtype=torch.float32)
-
-    result = [
-        ("query", query),
-        ("key_cache", key_cache),
-        ("value_cache", value_cache),
-        ("block_table", block_table_flat),
-        ("context_lens", context_lens),
-        ("out", out),
-        ("config", config),
-        ("size_query", ctypes.c_int64(query.nbytes)),
-        ("size_key_cache", ctypes.c_int64(key_cache.nbytes)),
-        ("size_value_cache", ctypes.c_int64(value_cache.nbytes)),
+    return [
+        ("query", query),                              # [batch, num_heads, head_dim]
+        ("key_cache", key_cache),                      # [total_blocks, block_size, kv_head_num, head_dim]
+        ("value_cache", value_cache),                  # [total_blocks, block_size, kv_head_num, head_dim]
+        ("block_table", block_table),                  # [batch, max_num_blocks_per_req]
+        ("context_lens", context_lens),                # [batch]
+        ("out", out),                                  # [batch, num_heads, head_dim]
+        ("scale", ctypes.c_float(scale_value)),        # scalar
     ]
-
-    if return_all_sizes:
-        result.extend([
-            ("size_block_table", ctypes.c_int64(block_table_flat.nbytes)),
-            ("size_context_lens", ctypes.c_int64(context_lens.nbytes)),
-            ("size_out", ctypes.c_int64(out.nbytes)),
-            ("size_config", ctypes.c_int64(config.nbytes)),
-        ])
-
-    return result
 
 
 def paged_attention(
@@ -200,7 +175,7 @@ def paged_attention(
 
         out[:, q_offset:q_offset + q_tile_size, :] = oi / li
 
-    return out.reshape(-1, head_dim)
+    return out
 
 
 def compute_golden(tensors: dict, params: dict) -> None:
@@ -231,7 +206,7 @@ def compute_golden(tensors: dict, params: dict) -> None:
         context_lens=context_lens,
     )
 
-    tensors["out"][:] = out.flatten()
+    tensors["out"][:] = out
 
 
 def run_golden_test(all_cases: dict, default_case: str, generate_inputs_fn, label: str = "Paged Attention"):
