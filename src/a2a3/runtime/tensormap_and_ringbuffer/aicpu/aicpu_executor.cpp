@@ -74,13 +74,27 @@ static PTO2Runtime *rt{nullptr};
 // Per-core dispatch payload storage (one aligned cache line per physical core)
 static PTO2DispatchPayload s_pto2_payload_per_core[RUNTIME_MAX_WORKER];
 
-// Core information for discovery (with register address for fast dispatch)
-struct CoreInfo {
-    int32_t worker_id;              // Index in runtime.workers[]
-    uint32_t physical_core_id;  // Hardware physical core ID (from AICore)
-    uint64_t reg_addr;          // Cached register address for fast access
-    CoreType core_type;
+// Per-core state: one cache line per core to eliminate false sharing
+// and co-locate all hot-path fields for minimal cache misses.
+struct alignas(64) CoreExecState {
+    // --- Hot fields (completion + dispatch, every iteration) ---
+    uint64_t reg_addr;                        // offset  0: register address (set once in handshake)
+    PTO2TaskSlotState* executing_slot_state;  // offset  8: slot state for running task
+    int32_t executing_reg_task_id;            // offset 16: register task ID (AICPU_TASK_INVALID = idle)
+    uint32_t dispatch_seq;                    // offset 20: monotonic dispatch counter
+    PTO2SubtaskSlot executing_subslot;        // offset 24: which subtask slot is running
+    uint8_t pad_[3];                          // offset 25: alignment padding
+#if PTO2_PROFILING
+    // --- Profiling fields (dispatch path, compile-time gated) ---
+    uint32_t dispatch_count;      // offset 28: dispatched task count (buffer mgmt)
+    uint64_t dispatch_timestamp;  // offset 32: AICPU dispatch timestamp
+#endif
+    // --- Cold fields (init/diagnostics only, never in hot path) ---
+    int32_t worker_id;          // index in runtime.workers[]
+    uint32_t physical_core_id;  // hardware physical core ID
+    CoreType core_type;         // AIC or AIV
 };
+static_assert(sizeof(CoreExecState) == 64, "CoreExecState must occupy exactly one cache line");
 
 // core_states_ encodes per-cluster core idle/running in 3 bits per cluster:
 //   bit i*3   = AIC of cluster i   (1 = idle, 0 = running)
@@ -90,6 +104,7 @@ struct CoreInfo {
 class alignas(64) CoreTracker {
 public:
     static inline int32_t MAX_CORE_PER_THREAD = 63;
+    static constexpr int32_t MAX_CLUSTERS = 63 / 3;
 
 public:
     CoreTracker() = default;
@@ -255,31 +270,18 @@ struct AicpuExecutor {
     int32_t core_count_per_thread_[MAX_AICPU_THREADS];  // Actual core count per thread
     int32_t core_assignments_[MAX_AICPU_THREADS][MAX_CORES_PER_THREAD];
 
-    // Core discovery arrays (with register addresses)
-    CoreInfo aic_cores_[MAX_CORES_PER_THREAD];
-    CoreInfo aiv_cores_[MAX_CORES_PER_THREAD];
+    // Per-core execution state, indexed by core_id (= worker_id)
+    CoreExecState core_exec_states_[RUNTIME_MAX_WORKER];
+
+    // Cluster-ordered worker_id lists for core assignment (init-only)
+    int32_t aic_worker_ids_[MAX_CORES_PER_THREAD];
+    int32_t aiv_worker_ids_[MAX_CORES_PER_THREAD];
     int32_t aic_count_{0};
     int32_t aiv_count_{0};
-
-    // Fast lookup: core_id -> reg_addr (for register-based dispatch)
-    uint64_t core_id_to_reg_addr_[MAX_CORES_PER_THREAD];
-
-    // Per-core monotonic dispatch counter for register protocol uniqueness.
-    uint32_t dispatch_seq_by_core_[RUNTIME_MAX_WORKER]{};
-
-    // Per-core subtask slot tracking (which PTO2SubtaskSlot is running on each core)
-    PTO2SubtaskSlot executing_subslot_by_core_[RUNTIME_MAX_WORKER]{};
-
-    // Per-core slot state tracking (PTO2TaskSlotState* for the running task on each core)
-    PTO2TaskSlotState* executing_slot_state_by_core_[RUNTIME_MAX_WORKER]{};
 
     // Platform register base address array (set via get_platform_regs())
     uint64_t regs_{0};
 
-    // Track executing register task_id per core (AICPU_TASK_INVALID = idle).
-    // NOTE: this is NOT the mixed_task_id; it is the per-core dispatch id used by the
-    // register protocol (derived from dispatch_seq_by_core_ and masked by TASK_ID_MASK).
-    int32_t executing_reg_task_ids_[MAX_CORES_PER_THREAD];
     CoreTracker core_trackers_[MAX_AICPU_THREADS];
 
     // ===== Task queue state (managed by scheduler ready queues) =====
@@ -311,10 +313,6 @@ struct AicpuExecutor {
     DeviceOrchestrationBindRuntimeFunc orch_bind_runtime_{nullptr};
     uint64_t* orch_args_cached_{nullptr};
     int32_t orch_arg_count_cached_{0};
-
-    // ===== Performance profiling state =====
-    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
-    uint32_t core_dispatch_counts_[RUNTIME_MAX_WORKER]; // Per-core total dispatched task counter (for buffer management)
 
     uint64_t* func_id_to_addr_;
     uint64_t get_function_bin_addr(int func_id) const {
@@ -369,9 +367,10 @@ struct AicpuExecutor {
         while (running_core_states.has_value()) {
             int32_t bit_pos = running_core_states.pop_first();
             int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
-            uint64_t reg_addr = core_id_to_reg_addr_[core_id];
+            CoreExecState& core_exec_state = core_exec_states_[core_id];
+            uint64_t reg_addr = core_exec_state.reg_addr;
 
-            int32_t expected_reg_task_id = executing_reg_task_ids_[core_id];
+            int32_t expected_reg_task_id = core_exec_state.executing_reg_task_id;
             uint64_t reg_val = read_reg(reg_addr, RegId::COND);
             int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
             int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
@@ -386,9 +385,9 @@ struct AicpuExecutor {
 #endif
 
             if (done) {
-                executing_reg_task_ids_[core_id] = AICPU_TASK_INVALID;
-                PTO2SubtaskSlot subslot = executing_subslot_by_core_[core_id];
-                PTO2TaskSlotState& slot_state = *executing_slot_state_by_core_[core_id];
+                core_exec_state.executing_reg_task_id = AICPU_TASK_INVALID;
+                PTO2SubtaskSlot subslot = core_exec_state.executing_subslot;
+                PTO2TaskSlotState& slot_state = *core_exec_state.executing_slot_state;
 
                 // Two-stage completion: mark subtask done, then handle mixed-task completion
                 bool mixed_complete = rt->scheduler.on_subtask_complete(slot_state, subslot);
@@ -441,11 +440,11 @@ struct AicpuExecutor {
                         PerfRecord* record = &perf_buf->records[count - 1];
                         if (record->task_id == static_cast<uint32_t>(expected_reg_task_id)) {
                             // Fill metadata that AICore doesn't know
-                            int32_t perf_slot_idx = static_cast<int32_t>(executing_subslot_by_core_[core_id]);
+                            int32_t perf_slot_idx = static_cast<int32_t>(core_exec_state.executing_subslot);
                             record->func_id = slot_state.task->kernel_id[perf_slot_idx];
                             record->core_type = CT;
                             perf_aicpu_record_dispatch_and_finish_time(
-                                record, dispatch_timestamps_[core_id], finish_ts);
+                                record, core_exec_state.dispatch_timestamp, finish_ts);
 
                             // Fill ring_id from slot state
                             record->ring_id = slot_state.ring_id;
@@ -536,9 +535,11 @@ struct AicpuExecutor {
         return (thread_idx % 2 == 0) ? kEvenOrder : kOddOrder;
     }
 
-    PTO2TaskSlotState* pop_ready_task(PTO2ResourceShape shape,
+    int pop_ready_tasks_batch(PTO2ResourceShape shape,
         int32_t thread_idx,
-        PTO2LocalReadyBuffer& local_buf
+        PTO2LocalReadyBuffer& local_buf,
+        PTO2TaskSlotState** out,
+        int max_count
 #if PTO2_SCHED_PROFILING
         ,
         uint64_t& pop_hit,
@@ -551,22 +552,19 @@ struct AicpuExecutor {
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
         uint64_t t_pop_start = get_sys_cnt_aicpu();
-        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(
-            shape, local_buf, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx], local_dispatch_count);
+        int count = rt->scheduler.get_ready_tasks_batch(
+            shape, local_buf, out, max_count,
+            g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx], local_dispatch_count);
         sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
-#else
-        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(shape, local_buf);
-#endif
-        if (slot_state) {
-#if PTO2_SCHED_PROFILING
-            pop_hit++;
-#endif
+        if (count > 0) {
+            pop_hit += count;
         } else {
-#if PTO2_SCHED_PROFILING
             pop_miss++;
-#endif
         }
-        return slot_state;
+#else
+        int count = rt->scheduler.get_ready_tasks_batch(shape, local_buf, out, max_count);
+#endif
+        return count;
     }
 
     void dispatch_subtask_to_core(Runtime* runtime,
@@ -584,21 +582,21 @@ struct AicpuExecutor {
 #if !PTO2_PROFILING
         (void)runtime;
 #endif
-        // Set function address and args pointer for this core payload.
+        CoreExecState& core_exec_state = core_exec_states_[core_id];
         PTO2DispatchPayload& payload = s_pto2_payload_per_core[core_id];
         int32_t slot_idx = static_cast<int32_t>(subslot);
         payload.function_bin_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
         payload.args = slot_state.payload->dispatch_args;
-        executing_subslot_by_core_[core_id] = subslot;
-        executing_slot_state_by_core_[core_id] = &slot_state;
+        core_exec_state.executing_subslot = subslot;
+        core_exec_state.executing_slot_state = &slot_state;
 #if PTO2_PROFILING
         if (profiling_enabled) {
-            dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-            if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE) {
+            core_exec_state.dispatch_timestamp = get_sys_cnt_aicpu();
+            if (core_exec_state.dispatch_count >= PLATFORM_PROF_BUFFER_SIZE) {
                 perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
-                core_dispatch_counts_[core_id] = 0;
+                core_exec_state.dispatch_count = 0;
             }
-            core_dispatch_counts_[core_id]++;
+            core_exec_state.dispatch_count++;
         }
 #endif
         // Per-core monotonic counter for register protocol uniqueness.
@@ -608,17 +606,17 @@ struct AicpuExecutor {
         // uses last_reg_val to detect new dispatches and would skip the
         // duplicate, while the stale COND register from the previous task
         // (same local_id) would cause a false-positive completion.
-        dispatch_seq_by_core_[core_id]++;
-        uint32_t reg_task_id = dispatch_seq_by_core_[core_id] & TASK_ID_MASK;
+        core_exec_state.dispatch_seq++;
+        uint32_t reg_task_id = core_exec_state.dispatch_seq & TASK_ID_MASK;
         // Skip reserved sentinel range [AICORE_EXIT_SIGNAL, 0x7FFFFFFF]
         if (reg_task_id >= AICORE_EXIT_SIGNAL) {
-            dispatch_seq_by_core_[core_id] += (TASK_ID_MASK - reg_task_id + 1);
-            reg_task_id = dispatch_seq_by_core_[core_id] & TASK_ID_MASK;
+            core_exec_state.dispatch_seq += (TASK_ID_MASK - reg_task_id + 1);
+            reg_task_id = core_exec_state.dispatch_seq & TASK_ID_MASK;
         }
-        write_reg(core_id_to_reg_addr_[core_id], RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
+        write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
 
         tracker.change_core_state(core_offset);
-        executing_reg_task_ids_[core_id] = reg_task_id;
+        core_exec_state.executing_reg_task_id = reg_task_id;
     }
 };
 
@@ -686,23 +684,18 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime* runtime) {
 
         CoreType type = hank->core_type;
 
+        core_exec_states_[i].reg_addr = reg_addr;
+        core_exec_states_[i].worker_id = i;
+        core_exec_states_[i].physical_core_id = physical_core_id;
+        core_exec_states_[i].core_type = type;
+
         if (type == CoreType::AIC) {
-            aic_cores_[aic_count_].worker_id = i;
-            aic_cores_[aic_count_].physical_core_id = physical_core_id;
-            aic_cores_[aic_count_].reg_addr = reg_addr;
-            aic_cores_[aic_count_].core_type = type;
-            aic_count_++;
+            aic_worker_ids_[aic_count_++] = i;
             DEV_INFO("Core %d: AIC, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
         } else {
-            aiv_cores_[aiv_count_].worker_id = i;
-            aiv_cores_[aiv_count_].physical_core_id = physical_core_id;
-            aiv_cores_[aiv_count_].reg_addr = reg_addr;
-            aiv_cores_[aiv_count_].core_type = type;
-            aiv_count_++;
+            aiv_worker_ids_[aiv_count_++] = i;
             DEV_INFO("Core %d: AIV, physical_id=%u, reg_addr=0x%lx", i, physical_core_id, reg_addr);
         }
-
-        core_id_to_reg_addr_[i] = reg_addr;
     }
 
     if (handshake_failed) {
@@ -737,7 +730,7 @@ bool AicpuExecutor::assign_cores_to_threads() {
              cluster_count, divisor, aic_count_, aiv_count_);
 
     for (int32_t i = 0; i < MAX_CORES_PER_THREAD; i++) {
-        executing_reg_task_ids_[i] = AICPU_TASK_INVALID;
+        core_exec_states_[i].executing_reg_task_id = AICPU_TASK_INVALID;
     }
 
     // Count clusters per thread first (round-robin may distribute unevenly)
@@ -763,9 +756,9 @@ bool AicpuExecutor::assign_cores_to_threads() {
         int32_t t = ci % divisor;
         int32_t& idx = core_idx[t];
 
-        int32_t aic_wid  = aic_cores_[ci].worker_id;
-        int32_t aiv0_wid = aiv_cores_[2 * ci].worker_id;
-        int32_t aiv1_wid = aiv_cores_[2 * ci + 1].worker_id;
+        int32_t aic_wid = aic_worker_ids_[ci];
+        int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
+        int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
 
         core_trackers_[t].set_cluster(cluster_idx_per_thread[t]++, aic_wid, aiv0_wid, aiv1_wid);
 
@@ -821,9 +814,9 @@ void AicpuExecutor::reassign_cores_for_all_threads() {
     for (int32_t ci = 0; ci < cluster_count; ci++) {
         int32_t t = ci % thread_num_;
 
-        int32_t aic_wid = aic_cores_[ci].worker_id;
-        int32_t aiv0_wid = aiv_cores_[2 * ci].worker_id;
-        int32_t aiv1_wid = aiv_cores_[2 * ci + 1].worker_id;
+        int32_t aic_wid = aic_worker_ids_[ci];
+        int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
+        int32_t aiv1_wid = aiv_worker_ids_[2 * ci + 1];
 
         int32_t cl_idx = cluster_idx_per_thread[t]++;
         core_trackers_[t].set_cluster(cl_idx, aic_wid, aiv0_wid, aiv1_wid);
@@ -892,10 +885,8 @@ int32_t AicpuExecutor::init(Runtime* runtime) {
         return -1;
     }
 
-    // Initialize core_id_to_reg_addr_ array to 0 before handshake
-    for (int32_t i = 0; i < MAX_CORES_PER_THREAD; i++) {
-        core_id_to_reg_addr_[i] = 0;
-    }
+    // Zero all per-core execution state before handshake
+    memset(core_exec_states_, 0, sizeof(core_exec_states_));
 
     // Use handshake mechanism to discover cores (aligned with host_build_graph)
     int32_t rc = handshake_all_cores(runtime);
@@ -932,17 +923,8 @@ int32_t AicpuExecutor::init(Runtime* runtime) {
 
     // Initial ready tasks will be populated via scheduler ready queues
 
-    // Reset per-core dispatch timestamps and task counters
-    for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
-        dispatch_timestamps_[i] = 0;
-        core_dispatch_counts_[i] = 0;
-    }
-
-    // Clear per-core dispatch payloads and subslot tracking
+    // Clear per-core dispatch payloads
     memset(s_pto2_payload_per_core, 0, sizeof(s_pto2_payload_per_core));
-    memset(dispatch_seq_by_core_, 0, sizeof(dispatch_seq_by_core_));
-    memset(executing_subslot_by_core_, 0, sizeof(executing_subslot_by_core_));
-    memset(executing_slot_state_by_core_, 0, sizeof(executing_slot_state_by_core_));
 
     DEV_INFO("Init: PTO2 mode, task count from shared memory");
 
@@ -964,7 +946,7 @@ int32_t AicpuExecutor::shutdown_aicore(Runtime* runtime, int32_t thread_idx, con
 
     for (int32_t i = 0; i < core_num; i++) {
         int32_t core_id = cur_thread_cores[i];
-        uint64_t reg_addr = core_id_to_reg_addr_[core_id];
+        uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
         if (reg_addr != 0) {
             platform_deinit_aicore_regs(reg_addr);
         } else {
@@ -1211,13 +1193,15 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 continue;
             }
             auto& local_buf = local_bufs[static_cast<int32_t>(shape)];
-            auto& ready_queue = rt->scheduler.ready_queues[static_cast<int32_t>(shape)];
-            if (local_buf.count == 0 && ready_queue.size() == 0) continue;
 
             while (valid_cluster_states.has_value()) {
-                PTO2TaskSlotState* slot_state = pop_ready_task(shape,
+                int want = valid_cluster_states.count();
+                PTO2TaskSlotState* batch[CoreTracker::MAX_CLUSTERS];
+                int got = pop_ready_tasks_batch(shape,
                     thread_idx,
-                    local_buf
+                    local_buf,
+                    batch,
+                    want
 #if PTO2_SCHED_PROFILING
                     ,
                     pop_hit,
@@ -1226,53 +1210,56 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     sched_dispatch_pop_cycle
 #endif
                 );
-                if (!slot_state) break;
+                if (got == 0) break;
 
-                try_pushed = true;
+                for (int bi = 0; bi < got; bi++) {
+                    PTO2TaskSlotState* slot_state = batch[bi];
+                    try_pushed = true;
 #if PTO2_PROFILING
-                phase_dispatch_count++;
+                    phase_dispatch_count++;
 #endif
 #if PTO2_SCHED_PROFILING
-                uint64_t t_setup_start = get_sys_cnt_aicpu();
+                    uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
-                auto current_valid_cluster_offset = valid_cluster_states.pop_first();
-                ResourceCount rc = shape_resource_count(shape);
+                    auto current_valid_cluster_offset = valid_cluster_states.pop_first();
+                    ResourceCount rc = shape_resource_count(shape);
 
-                if (rc.aic) {
-                    auto core_offset = tracker.get_aic_core_offset(current_valid_cluster_offset);
-                    dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIC
+                    if (rc.aic) {
+                        auto core_offset = tracker.get_aic_core_offset(current_valid_cluster_offset);
+                        dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
-                        , profiling_enabled
+                            , profiling_enabled
 #endif
-                    );
-                }
-                if (rc.aiv >= 1) {
-                    auto core_offset = tracker.is_aiv0_core_idle(current_valid_cluster_offset)
-                                       ? tracker.get_aiv0_core_offset(current_valid_cluster_offset)
-                                       : tracker.get_aiv1_core_offset(current_valid_cluster_offset);
-                    dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV0
+                        );
+                    }
+                    if (rc.aiv >= 1) {
+                        auto core_offset = tracker.is_aiv0_core_idle(current_valid_cluster_offset)
+                                           ? tracker.get_aiv0_core_offset(current_valid_cluster_offset)
+                                           : tracker.get_aiv1_core_offset(current_valid_cluster_offset);
+                        dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
-                        , profiling_enabled
+                            , profiling_enabled
 #endif
-                    );
-                }
-                if (rc.aiv >= 2) {
-                    auto core_offset = tracker.get_aiv1_core_offset(current_valid_cluster_offset);
-                    dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV1
+                        );
+                    }
+                    if (rc.aiv >= 2) {
+                        auto core_offset = tracker.get_aiv1_core_offset(current_valid_cluster_offset);
+                        dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
-                        , profiling_enabled
+                            , profiling_enabled
 #endif
-                    );
-                }
-                made_progress = true;
+                        );
+                    }
+                    made_progress = true;
 #if PTO2_SCHED_PROFILING
-                sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+                    sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
-                DEV_DEBUG("Thread %d: Dispatching %s task %lld to cluster_offset %d",
-                    thread_idx,
-                    shape_name(shape),
-                    (long long)slot_state->task->mixed_task_id.raw,
-                    current_valid_cluster_offset);
+                    DEV_DEBUG("Thread %d: Dispatching %s task %lld to cluster_offset %d",
+                        thread_idx,
+                        shape_name(shape),
+                        (long long)slot_state->task->mixed_task_id.raw,
+                        current_valid_cluster_offset);
+                }
 
                 // lazy update valid_cluster_states
                 if (!valid_cluster_states.has_value()) {
@@ -1281,6 +1268,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             }
         }
 
+        // requeue in global ready queue
         for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
             PTO2ResourceShape shape = dispatch_order[si];
             auto& local_buf = local_bufs[static_cast<int32_t>(shape)];
@@ -1288,8 +1276,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 #if PTO2_SCHED_PROFILING
             local_overflow_count += local_buf.count;
 #endif
-            while (local_buf.count > 0) {
-                ready_queue.push(local_buf.pop());
+            if (local_buf.count > 0) {
+                ready_queue.push_batch(local_buf.slot_states, local_buf.count);
+                local_buf.count = 0;
             }
         }
 
@@ -1397,13 +1386,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 while (dump_count < STALL_DUMP_CORE_MAX && (bp = all_running.pop_first()) >= 0) {
                     dump_count++;
                     int32_t cid = tracker.get_core_id_by_offset(bp);
-                    int32_t sw_tid = executing_reg_task_ids_[cid];
+                    int32_t sw_tid = core_exec_states_[cid].executing_reg_task_id;
                     int32_t hw_kernel = -1;
-                    if (sw_tid >= 0 && executing_slot_state_by_core_[cid]) {
-                        int32_t diag_slot = static_cast<int32_t>(executing_subslot_by_core_[cid]);
-                        hw_kernel = executing_slot_state_by_core_[cid]->task->kernel_id[diag_slot];
+                    if (sw_tid >= 0 && core_exec_states_[cid].executing_slot_state) {
+                        int32_t diag_slot = static_cast<int32_t>(core_exec_states_[cid].executing_subslot);
+                        hw_kernel = core_exec_states_[cid].executing_slot_state->task->kernel_id[diag_slot];
                     }
-                    uint64_t cond_reg = read_reg(core_id_to_reg_addr_[cid], RegId::COND);
+                    uint64_t cond_reg = read_reg(core_exec_states_[cid].reg_addr, RegId::COND);
                     DEV_ALWAYS("    core=%d cond=0x%x(state=%d,id=%d) exec_id=%d kernel=%d",
                                cid, (unsigned)cond_reg,
                                EXTRACT_TASK_STATE(cond_reg), EXTRACT_TASK_ID(cond_reg),
@@ -2082,17 +2071,14 @@ void AicpuExecutor::deinit(Runtime* runtime) {
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
     cache_invalidate_range(runtime, sizeof(Runtime));
 
-    // Reset per-core dispatch timestamps and task counters
+    // Reset all per-core execution state
     for (int32_t i = 0; i < RUNTIME_MAX_WORKER; i++) {
-        dispatch_timestamps_[i] = 0;
-        core_dispatch_counts_[i] = 0;
+        core_exec_states_[i] = {};
+        core_exec_states_[i].executing_reg_task_id = AICPU_TASK_INVALID;
     }
 
-    // Clear per-core dispatch payloads and subslot tracking
+    // Clear per-core dispatch payloads
     memset(s_pto2_payload_per_core, 0, sizeof(s_pto2_payload_per_core));
-    memset(dispatch_seq_by_core_, 0, sizeof(dispatch_seq_by_core_));
-    memset(executing_subslot_by_core_, 0, sizeof(executing_subslot_by_core_));
-    memset(executing_slot_state_by_core_, 0, sizeof(executing_slot_state_by_core_));
 
     completed_tasks_.store(0, std::memory_order_release);
     total_tasks_ = 0;
@@ -2113,11 +2099,6 @@ void AicpuExecutor::deinit(Runtime* runtime) {
     aic_count_ = 0;
     aiv_count_ = 0;
 
-    // Reset register-related state
-    for (int32_t i = 0; i < MAX_CORES_PER_THREAD; i++) {
-        core_id_to_reg_addr_[i] = 0;
-        executing_reg_task_ids_[i] = AICPU_TASK_INVALID;
-    }
     regs_ = 0;
     orch_func_ = nullptr;
     orch_bind_runtime_ = nullptr;
@@ -2146,8 +2127,8 @@ void AicpuExecutor::emergency_shutdown(Runtime* runtime) {
     for (int32_t i = 0; i < cores_total_num_; i++) {
         Handshake* hank = &all_handshakes[i];
         hank->aicpu_regs_ready = 1;
-        if (core_id_to_reg_addr_[i] != 0) {
-            platform_deinit_aicore_regs(core_id_to_reg_addr_[i]);
+        if (core_exec_states_[i].reg_addr != 0) {
+            platform_deinit_aicore_regs(core_exec_states_[i].reg_addr);
         }
     }
 
@@ -2186,19 +2167,19 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int32_t thread_idx,
         Handshake* h = &hank[core_id];
         const char* core_type_str = core_type_to_string(h->core_type);
 
-        uint64_t reg_addr = core_id_to_reg_addr_[core_id];
+        uint64_t reg_addr = core_exec_states_[core_id].reg_addr;
         uint64_t reg_val = read_reg(reg_addr, RegId::COND);
         int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
         int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
-        int32_t task_id = executing_reg_task_ids_[core_id];
+        int32_t task_id = core_exec_states_[core_id].executing_reg_task_id;
 
         if (reg_state != TASK_FIN_STATE || task_id >= 0) {
             busy_cores++;
             if (task_id >= 0) {
                 int32_t kernel_id = -1;
-                if (rt && rt->sm_handle && executing_slot_state_by_core_[core_id]) {
-                    int32_t diag_slot = static_cast<int32_t>(executing_subslot_by_core_[core_id]);
-                    kernel_id = executing_slot_state_by_core_[core_id]->task->kernel_id[diag_slot];
+                if (rt && rt->sm_handle && core_exec_states_[core_id].executing_slot_state) {
+                    int32_t diag_slot = static_cast<int32_t>(core_exec_states_[core_id].executing_subslot);
+                    kernel_id = core_exec_states_[core_id].executing_slot_state->task->kernel_id[diag_slot];
                 }
                 DEV_ALWAYS("  Core %d [%s, BUSY]: COND=0x%lx (reg_task_id=%d, reg_state=%s), executing_reg_task_id=%d, kernel_id=%d",
                         core_id, core_type_str, reg_val, reg_task_id,
