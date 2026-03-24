@@ -46,7 +46,7 @@ constexpr int PLATFORM_MAX_AICPU_THREADS = 7;
  * Can be larger than PLATFORM_MAX_AICPU_THREADS to allow threads to be dropped
  * from scheduling while still participating in affinity (e.g. 6 launch, 4 active).
  */
-constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 6;
+constexpr int PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH = 7;
 
 // =============================================================================
 // Derived Platform Limits

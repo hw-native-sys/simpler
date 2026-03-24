@@ -261,6 +261,15 @@ extern "C" int init_runtime_impl(Runtime *runtime,
         LOG_INFO("Ready queue shards: %d", runtime->ready_queue_shards);
     }
 
+    // Read orchestrator-to-scheduler transition flag from environment
+    {
+        const char* env_val = std::getenv("PTO2_ORCH_TO_SCHED");
+        if (env_val && (env_val[0] == '1' || env_val[0] == 't' || env_val[0] == 'T')) {
+            runtime->orch_to_sched = true;
+        }
+        LOG_INFO("Orchestrator-to-scheduler transition: %s", runtime->orch_to_sched ? "enabled" : "disabled");
+    }
+
     // Read ring buffer size overrides from environment
     {
         runtime->pto2_task_window_size  = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);

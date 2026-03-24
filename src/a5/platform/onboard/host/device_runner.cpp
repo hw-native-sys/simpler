@@ -304,11 +304,10 @@ int DeviceRunner::run(Runtime& runtime,
     }
 
     // Validate even core distribution for initial scheduler threads
-    // All-orchestrator mode (scheduler_thread_num == 0): cores assigned post-transition
     if (scheduler_thread_num > 0) {
         if (block_dim % scheduler_thread_num != 0) {
-            LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
-                      block_dim, scheduler_thread_num);
+            LOG_ERROR("block_dim (%d) not evenly divisible by scheduler_thread_num (%d)",
+                     block_dim, scheduler_thread_num);
             return -1;
         }
     } else {
@@ -413,9 +412,8 @@ int DeviceRunner::run(Runtime& runtime,
     }
 
     std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer===" << '\n';
-    // Launch AICPU main kernel
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer",
-                             PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH);
+    // Launch AICPU main kernel (over-launch for affinity gate)
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         if (kernel_args_.args.regs != 0) {
@@ -741,7 +739,6 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
-    // Define free callback (a5: use MemoryAllocator)
     auto free_cb = [](void* dev_ptr, void* user_data) -> int {
         auto* allocator = static_cast<MemoryAllocator*>(user_data);
         return allocator->free(dev_ptr);
