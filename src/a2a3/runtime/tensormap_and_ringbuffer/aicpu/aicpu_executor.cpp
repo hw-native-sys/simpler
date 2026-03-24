@@ -536,21 +536,26 @@ struct AicpuExecutor {
         return (thread_idx % 2 == 0) ? kEvenOrder : kOddOrder;
     }
 
-    PTO2TaskSlotState* pop_ready_task(PTO2ResourceShape shape, int32_t thread_idx
+    PTO2TaskSlotState* pop_ready_task(PTO2ResourceShape shape,
+        int32_t thread_idx,
+        PTO2LocalReadyBuffer& local_buf
 #if PTO2_SCHED_PROFILING
-        , uint64_t& pop_hit, uint64_t& pop_miss
-        , uint64_t& sched_dispatch_pop_cycle
+        ,
+        uint64_t& pop_hit,
+        uint64_t& pop_miss,
+        uint64_t& local_dispatch_count,
+        uint64_t& sched_dispatch_pop_cycle
 #endif
     ) {
         (void)thread_idx;
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
         uint64_t t_pop_start = get_sys_cnt_aicpu();
-        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(shape,
-            g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]);
+        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(
+            shape, local_buf, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx], local_dispatch_count);
         sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
-        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(shape);
+        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(shape, local_buf);
 #endif
         if (slot_state) {
 #if PTO2_SCHED_PROFILING
@@ -1051,12 +1056,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
     // Local-first dispatch buffers (stack-allocated, one per CoreType per scheduling thread).
     // Initialized once; must be empty at the start of each iteration.
-    constexpr int LOCAL_READY_CAP_PER_TYPE = 256;
-    PTO2TaskSlotState* local_aic_ptrs[LOCAL_READY_CAP_PER_TYPE];
-    PTO2TaskSlotState* local_aiv_ptrs[LOCAL_READY_CAP_PER_TYPE];
-    PTO2LocalReadyBuffer local_bufs[PTO2_LOCAL_DISPATCH_TYPE_NUM];  // [0]=AIC, [1]=AIV
-    local_bufs[0].reset(local_aic_ptrs, LOCAL_READY_CAP_PER_TYPE);
-    local_bufs[1].reset(local_aiv_ptrs, LOCAL_READY_CAP_PER_TYPE);
+    constexpr int LOCAL_READY_CAP_PER_TYPE = 64;
+    PTO2TaskSlotState* local_ptrs[PTO2_NUM_RESOURCE_SHAPES][LOCAL_READY_CAP_PER_TYPE];
+    PTO2LocalReadyBuffer local_bufs[PTO2_NUM_RESOURCE_SHAPES];
+    for (int32_t i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+        local_bufs[i].reset(local_ptrs[i], LOCAL_READY_CAP_PER_TYPE);
+    }
     PTO2TaskSlotState* deferred_release_slot_states[256];
     int32_t deferred_release_count = 0;
 
@@ -1130,7 +1135,6 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
         // Check AIC running cores
         bool try_completed = false;
-        always_assert(local_bufs[0].count == 0 && local_bufs[1].count == 0); // Invariant: previous iteration fully consumed
         if (tracker.has_running_cores<CoreType::AIC>()) {
             try_completed = true;
             check_running_cores_for_completion<CoreType::AIC>(
@@ -1198,94 +1202,28 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         }
 #endif
 
-        // Phase 2: Local dispatch — drain local_bufs, match to idle clusters (zero MPMC operations)
-        // Phase 3: Global queue — push overflow to readyQ + fill remaining idle cores from readyQ
         bool try_pushed = false;
-
-        // Local dispatch: drain both per-CoreType local_bufs, match to idle clusters by shape
-        PTO2TaskSlotState* overflow_ptrs[LOCAL_READY_CAP_PER_TYPE * PTO2_LOCAL_DISPATCH_TYPE_NUM];
-        int overflow_count = 0;
-        for (int bi = 0; bi < PTO2_LOCAL_DISPATCH_TYPE_NUM; bi++) {
-            while (local_bufs[bi].count > 0) {
-                PTO2TaskSlotState* slot_state = local_bufs[bi].pop();
-                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state->active_mask);
-                auto valid_cluster_offset_states = tracker.get_valid_cluster_offset_states(shape);
-
-                if (valid_cluster_offset_states.has_value()) {
-                    auto current_valid_cluster_offset = valid_cluster_offset_states.pop_first();
-                    try_pushed = true;
-#if PTO2_SCHED_PROFILING
-                    uint64_t t_setup_start = get_sys_cnt_aicpu();
-#endif
-                    ResourceCount rc = shape_resource_count(shape);
-
-                    if (rc.aic) {
-                        auto core_offset = tracker.get_aic_core_offset(current_valid_cluster_offset);
-                        dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIC
-#if PTO2_PROFILING
-                            , profiling_enabled
-#endif
-                        );
-                    }
-                    if (rc.aiv >= 1) {
-                        auto core_offset = tracker.is_aiv0_core_idle(current_valid_cluster_offset)
-                                           ? tracker.get_aiv0_core_offset(current_valid_cluster_offset)
-                                           : tracker.get_aiv1_core_offset(current_valid_cluster_offset);
-                        dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV0
-#if PTO2_PROFILING
-                            , profiling_enabled
-#endif
-                        );
-                    }
-                    if (rc.aiv >= 2) {
-                        auto core_offset = tracker.get_aiv1_core_offset(current_valid_cluster_offset);
-                        dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV1
-#if PTO2_PROFILING
-                            , profiling_enabled
-#endif
-                        );
-                    }
-#if PTO2_PROFILING
-                    phase_dispatch_count++;
-#endif
-#if PTO2_SCHED_PROFILING
-                    pop_hit++;
-                    local_dispatch_count++;
-                    sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
-#endif
-                    made_progress = true;
-                    DEV_DEBUG("Thread %d: Dispatching %s task %lld to cluster_offset %d (local)",
-                        thread_idx,
-                        shape_name(shape),
-                        (long long)slot_state->task->mixed_task_id.raw,
-                        current_valid_cluster_offset);
-                } else {
-                    overflow_ptrs[overflow_count++] = slot_state;
-#if PTO2_SCHED_PROFILING
-                    local_overflow_count++;
-#endif
-                }
-            }
-        }
-
-        // Push overflow to global readyQ (shape-based)
-        for (int i = 0; i < overflow_count; i++) {
-            rt->scheduler.requeue_ready_task(*overflow_ptrs[i]);
-        }
-
-        // Phase 3: Global dispatch — fill remaining idle cores from global readyQ (cluster-based)
         const PTO2ResourceShape* dispatch_order = get_dispatch_order(thread_idx);
-
         for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
             PTO2ResourceShape shape = dispatch_order[si];
-            if (rt->scheduler.ready_queues[static_cast<int32_t>(shape)].size() == 0) continue;
-
             auto valid_cluster_states = tracker.get_valid_cluster_offset_states(shape);
+            if (!valid_cluster_states.has_value()) {
+                continue;
+            }
+            auto& local_buf = local_bufs[static_cast<int32_t>(shape)];
+            auto& ready_queue = rt->scheduler.ready_queues[static_cast<int32_t>(shape)];
+            if (local_buf.count == 0 && ready_queue.size() == 0) continue;
+
             while (valid_cluster_states.has_value()) {
-                PTO2TaskSlotState* slot_state = pop_ready_task(shape, thread_idx
+                PTO2TaskSlotState* slot_state = pop_ready_task(shape,
+                    thread_idx,
+                    local_buf
 #if PTO2_SCHED_PROFILING
-                    , pop_hit, pop_miss
-                    , sched_dispatch_pop_cycle
+                    ,
+                    pop_hit,
+                    pop_miss,
+                    local_dispatch_count,
+                    sched_dispatch_pop_cycle
 #endif
                 );
                 if (!slot_state) break;
@@ -1340,6 +1278,18 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 if (!valid_cluster_states.has_value()) {
                     valid_cluster_states = tracker.get_valid_cluster_offset_states(shape);
                 }
+            }
+        }
+
+        for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
+            PTO2ResourceShape shape = dispatch_order[si];
+            auto& local_buf = local_bufs[static_cast<int32_t>(shape)];
+            auto& ready_queue = rt->scheduler.ready_queues[static_cast<int32_t>(shape)];
+#if PTO2_SCHED_PROFILING
+            local_overflow_count += local_buf.count;
+#endif
+            while (local_buf.count > 0) {
+                ready_queue.push(local_buf.pop());
             }
         }
 

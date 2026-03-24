@@ -550,7 +550,7 @@ void pto2_submit_mixed_task(
         }
         for (int i = 0; i < fanin_count; i++) {
             PTO2TaskSlotState& producer_slot_state = *fanin_states[i];
-#if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
+#if PTO2_ORCH_PROFILING
             pto2_fanout_lock(producer_slot_state, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
 #else
             pto2_fanout_lock(producer_slot_state);
