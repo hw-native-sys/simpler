@@ -107,6 +107,23 @@
 #define PTO2_DEP_POOL_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 
 // =============================================================================
+// Virtual Address for Deferred Heap Allocation
+// =============================================================================
+// OUTPUT tensors from make_tensor() get a virtual address (buffer identity)
+// at submit time for TensorMap dependency discovery. Physical allocation
+// is deferred to Scheduler dispatch time.
+//
+// Encoding: top 16 bits = 0xFFFF (flag), low 48 bits = monotonic sequence.
+// Real GM addresses on Ascend never have 0xFFFF in top 16 bits.
+
+static constexpr uint64_t PTO2_VIRTUAL_ADDR_FLAG = 0xFFFF'0000'0000'0000ULL;
+static constexpr uint64_t PTO2_VIRTUAL_ADDR_SEQ_MASK = ~PTO2_VIRTUAL_ADDR_FLAG;
+
+static inline bool pto2_is_virtual_addr(uint64_t addr) {
+    return (addr & PTO2_VIRTUAL_ADDR_FLAG) == PTO2_VIRTUAL_ADDR_FLAG;
+}
+
+// =============================================================================
 // Multi-Ring task_id Encoding
 // =============================================================================
 
@@ -334,7 +351,13 @@ struct PTO2TaskDescriptor {
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
 
+    // Total output size in bytes needing heap allocation (0 = no alloc needed).
+    // Set by Orchestrator, read by Scheduler at dispatch.
+    // Fits in the 4B natural padding after kernel_id[3] — sizeof unchanged.
+    int32_t total_output_size;
+
     // Packed output buffer (all outputs packed into single contiguous buffer)
+    // Set by Scheduler at dispatch, read during heap reclamation.
     void*    packed_buffer_base;  // Start of packed buffer in GM Heap
     void*    packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
@@ -359,7 +382,8 @@ struct PTO2TaskPayload {
     int32_t tensor_count{0};
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
-    int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
+    uint16_t output_alloc_mask{0};             // Bit i set = tensors[i] is OUTPUT needing heap alloc
+    uint16_t _reserved2{0};                    // Reserved for alignment
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
     // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
     Tensor tensors[PTO2_MAX_TENSOR_PARAMS];

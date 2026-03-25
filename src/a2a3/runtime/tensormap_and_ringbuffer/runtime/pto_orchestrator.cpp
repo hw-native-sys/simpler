@@ -49,18 +49,15 @@ static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // task ring alloc
 static uint64_t g_orch_params_cycle = 0;     // param copy
 static uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
-static uint64_t g_orch_heap_cycle = 0;       // heap alloc + output assign
 static uint64_t g_orch_insert_cycle = 0;     // tensormap insert
 static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
 static uint64_t g_orch_scope_end_cycle = 0;  // scope_end overhead
 static int64_t  g_orch_submit_count = 0;
 static uint32_t g_orch_submit_idx = 0;
 uint64_t g_orch_alloc_wait_cycle = 0;
-uint64_t g_orch_heap_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
 uint64_t g_orch_params_atomic_count = 0;
-uint64_t g_orch_heap_atomic_count = 0;
 uint64_t g_orch_fanin_atomic_count = 0;
 uint64_t g_orch_finalize_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
@@ -389,30 +386,19 @@ void pto2_submit_mixed_task(
 
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, local_id);
 
-    // === STEP 2: Calculate output size + heap alloc (read from params only, no GM access) ===
-    bool needs_alloc[PTO2_MAX_TENSOR_PARAMS] = {};
+    // === STEP 2: Calculate output size + assign virtual addresses ===
+    // Physical heap allocation is deferred to Scheduler dispatch time.
+    // Here we only compute total_output_size and output_alloc_mask metadata,
+    // and assign virtual addresses to OUTPUT tensors for TensorMap hashing.
     int32_t total_output_size = 0;
+    uint16_t output_alloc_mask = 0;
     for (int i = 0; i < params.tensor_count; i++) {
         if (params.tensor_types[i] == PTOParamType::OUTPUT
             && params.tensors[i]->buffer.addr == 0) {
-            needs_alloc[i] = true;
+            output_alloc_mask |= (1u << i);
             total_output_size += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
-
-    void* local_packed_base = nullptr;
-    void* local_packed_end = nullptr;
-    if (total_output_size > 0) {
-        local_packed_base = orch->pto2_alloc_packed_buffer(total_output_size);
-        if (!local_packed_base) { orch->fatal = true; return; }
-        local_packed_end = (char*)local_packed_base + total_output_size;
-    }
-    CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP, local_id);
-#if PTO2_ORCH_PROFILING
-    if (total_output_size > 0) {
-        g_orch_heap_atomic_count += 1;  // heap_top.store in pto2_alloc_packed_buffer
-    }
-#endif
 
     // === STEP 3: Sync TensorMap validity and optional cleanup ===
     // Read current last_task_alive from shared memory for this ring
@@ -426,8 +412,7 @@ void pto2_submit_mixed_task(
 
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, local_id);
 
-    // === STEP 4: Lookup inputs + assign output addrs (all from params, no GM) ===
-    int32_t offset = 0;
+    // === STEP 4: Lookup inputs + assign virtual output addrs ===
     for (int i = 0; i < params.tensor_count; i++) {
         PTOParamType ptype = params.tensor_types[i];
 
@@ -477,9 +462,9 @@ void pto2_submit_mixed_task(
             case PTOParamType::OUTPUT: {
                 Tensor& tensor = *params.tensors[i];
                 if (tensor.buffer.addr == 0) {
-                    uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)local_packed_base + offset);
-                    tensor.buffer.addr = alloc_addr;
-                    offset += PTO2_ALIGN_UP(tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                    // Assign virtual address for TensorMap hashing.
+                    // Physical allocation deferred to Scheduler dispatch.
+                    tensor.buffer.addr = PTO2_VIRTUAL_ADDR_FLAG | orch->next_vaddr_seq++;
                 }
                 break;
             }
@@ -493,7 +478,8 @@ void pto2_submit_mixed_task(
         PTOParamType ptype = params.tensor_types[i];
         if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
             if (!params.tensors[i]->manual_dep) {
-                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, needs_alloc[i]);
+                orch->tensor_map.insert(*params.tensors[i], mixed_task_id,
+                                        (output_alloc_mask & (1u << i)) != 0);
             }
         }
     }
@@ -508,8 +494,9 @@ void pto2_submit_mixed_task(
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
-    task.packed_buffer_base = local_packed_base;
-    task.packed_buffer_end = local_packed_end;
+    task.packed_buffer_base = nullptr;  // Set by Scheduler at dispatch
+    task.packed_buffer_end = nullptr;   // Set by Scheduler at dispatch
+    task.total_output_size = total_output_size;
 
     // Prefetch producer slot_states and cur_slot_state (written at init but likely
     // evicted by lookup/insert/heap). param_copy below provides hide time.
@@ -522,6 +509,7 @@ void pto2_submit_mixed_task(
     }
 
     payload->init(params);
+    payload->output_alloc_mask = output_alloc_mask;
 
     CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, local_id);
 #if PTO2_ORCH_PROFILING
@@ -669,33 +657,28 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     d.alloc_cycle = g_orch_alloc_cycle;
     d.params_cycle = g_orch_params_cycle;
     d.lookup_cycle = g_orch_lookup_cycle;
-    d.heap_cycle = g_orch_heap_cycle;
     d.insert_cycle = g_orch_insert_cycle;
     d.fanin_cycle = g_orch_fanin_cycle;
     d.scope_end_cycle = g_orch_scope_end_cycle;
     d.submit_count = g_orch_submit_count;
     d.alloc_wait_cycle = g_orch_alloc_wait_cycle;
-    d.heap_wait_cycle = g_orch_heap_wait_cycle;
     d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
     d.alloc_atomic_count = g_orch_alloc_atomic_count;
     d.params_atomic_count = g_orch_params_atomic_count;
-    d.heap_atomic_count = g_orch_heap_atomic_count;
     d.fanin_atomic_count = g_orch_fanin_atomic_count;
     d.finalize_atomic_count = g_orch_finalize_atomic_count;
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
     g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_params_cycle = 0;
-    g_orch_lookup_cycle = g_orch_heap_cycle = g_orch_insert_cycle = 0;
+    g_orch_lookup_cycle = g_orch_insert_cycle = 0;
     g_orch_fanin_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
     g_orch_submit_idx = 0;
     g_orch_alloc_wait_cycle = 0;
-    g_orch_heap_wait_cycle = 0;
     g_orch_fanin_wait_cycle = 0;
     g_orch_alloc_atomic_count = 0;
     g_orch_params_atomic_count = 0;
-    g_orch_heap_atomic_count = 0;
     g_orch_fanin_atomic_count = 0;
     g_orch_finalize_atomic_count = 0;
     g_orch_scope_end_atomic_count = 0;

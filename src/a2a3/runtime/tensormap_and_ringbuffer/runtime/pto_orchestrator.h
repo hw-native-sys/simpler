@@ -69,6 +69,12 @@ struct PTO2OrchestratorState {
     void* gm_heap_base;    // Base address of GM heap
     uint64_t gm_heap_size;   // Total size of GM heap (all rings)
 
+    // === VIRTUAL ADDRESS SEQUENCE ===
+    // Monotonically increasing counter for assigning virtual addresses to
+    // OUTPUT tensors. Used as TensorMap hash key; physical allocation is
+    // deferred to Scheduler dispatch time.
+    uint64_t next_vaddr_seq{1};
+
     // === FATAL ERROR ===
     // Fatal error flag (single-thread access by orchestrator, no atomic needed)
     // Cross-thread notification uses shared memory orch_error_code (atomic)
@@ -89,25 +95,6 @@ struct PTO2OrchestratorState {
         int32_t depth = scope_stack_top;
         if (depth < 0) depth = 0;
         return depth < PTO2_MAX_RING_DEPTH ? static_cast<uint8_t>(depth) : PTO2_MAX_RING_DEPTH - 1;
-    }
-
-    /**
-     * Allocate packed output buffer from current ring's heap
-     */
-    void* pto2_alloc_packed_buffer(int32_t total_size) {
-        if (total_size <= 0) {
-            return NULL;
-        }
-
-        uint8_t rid = current_ring_id();
-        void* buffer = rings[rid].heap_ring.pto2_heap_ring_alloc(total_size);
-
-#if PTO2_PROFILING
-        buffers_allocated++;
-        bytes_allocated += total_size;
-#endif
-
-        return buffer;
     }
 };
 
@@ -219,19 +206,16 @@ struct PTO2OrchProfilingData {
     uint64_t alloc_cycle;
     uint64_t params_cycle;
     uint64_t lookup_cycle;
-    uint64_t heap_cycle;
     uint64_t insert_cycle;
     uint64_t fanin_cycle;
     uint64_t scope_end_cycle;
     int64_t  submit_count;
     // Wait time tracking for blocking phases
     uint64_t alloc_wait_cycle;      // Cycles spent waiting in task_ring_alloc
-    uint64_t heap_wait_cycle;       // Cycles spent waiting in heap_ring_alloc
     uint64_t fanin_wait_cycle;      // Cycles spent waiting in fanout_lock
     // Atomic operation counts per phase
     uint64_t alloc_atomic_count;
     uint64_t params_atomic_count;
-    uint64_t heap_atomic_count;
     uint64_t fanin_atomic_count;
     uint64_t finalize_atomic_count;
     uint64_t scope_end_atomic_count;

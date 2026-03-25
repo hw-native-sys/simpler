@@ -934,6 +934,75 @@ int32_t AicpuExecutor::init(Runtime* runtime) {
     return 0;
 }
 
+// =============================================================================
+// Deferred Heap Allocation + Virtual Address Resolution
+// =============================================================================
+// Called at dispatch time (Scheduler thread) for each ready task, before any
+// subtask is sent to AICore.
+//
+// Phase 1 — OUTPUT allocation:
+//   If the task has outputs requiring heap memory (total_output_size > 0),
+//   try_alloc from the per-ring HeapRing.  On success, patch each OUTPUT
+//   tensor's virtual address to the physical address and record the mapping
+//   in vaddr_to_paddr[] so consumers can resolve their copies later.
+//   Returns false on heap exhaustion — the caller re-enqueues the task and
+//   processes completions to free heap space (non-blocking back-pressure).
+//
+// Phase 2 — INPUT/INOUT virtual address translation:
+//   Consumer payloads retain virtual addresses (payload->init() copies by value).
+//   Translate each remaining virtual address to a physical address via the
+//   mapping table written by the producer's Phase 1.
+
+static bool try_alloc_and_patch(PTO2TaskSlotState& slot_state) {
+    PTO2TaskDescriptor& task = *slot_state.task;
+    PTO2TaskPayload* payload = slot_state.payload;
+    auto& sched = rt->scheduler;
+
+    // === Phase 1: Allocate physical memory for OUTPUT tensors ===
+    if (task.total_output_size > 0 && task.packed_buffer_base == nullptr) {
+        // All orchestrators share the same heap ring pointers for each ring_id.
+        auto& heap = rt->orchestrators[0].rings[slot_state.ring_id].heap_ring;
+        void* buf = heap.pto2_heap_ring_try_alloc(static_cast<uint64_t>(task.total_output_size));
+        if (!buf) return false;  // Heap full — caller re-enqueues task
+
+        task.packed_buffer_base = buf;
+        task.packed_buffer_end = (char*)buf + task.total_output_size;
+
+        // Patch OUTPUT tensors and write virtual→physical mapping
+        uint16_t alloc_mask = payload->output_alloc_mask;
+        int32_t offset = 0;
+        for (int i = 0; i < payload->tensor_count; i++) {
+            if (alloc_mask & (1u << i)) {
+                uint64_t vaddr = payload->tensors[i].buffer.addr;
+                uint64_t paddr = reinterpret_cast<uint64_t>((char*)buf + offset);
+                payload->tensors[i].buffer.addr = paddr;
+
+                // Write mapping table entry
+                int32_t idx = static_cast<int32_t>(vaddr & PTO2_VIRTUAL_ADDR_SEQ_MASK)
+                            & sched.vaddr_map_mask;
+                sched.vaddr_to_paddr[idx] = paddr;
+
+                offset += PTO2_ALIGN_UP(payload->tensors[i].buffer.size,
+                                         PTO2_PACKED_OUTPUT_ALIGN);
+            }
+        }
+    }
+
+    // === Phase 2: Translate INPUT/INOUT virtual addresses via mapping table ===
+    for (int i = 0; i < payload->tensor_count; i++) {
+        uint64_t addr = payload->tensors[i].buffer.addr;
+        if (pto2_is_virtual_addr(addr)) {
+            int32_t idx = static_cast<int32_t>(addr & PTO2_VIRTUAL_ADDR_SEQ_MASK)
+                        & sched.vaddr_map_mask;
+            uint64_t paddr = sched.vaddr_to_paddr[idx];
+            always_assert(paddr != 0 && "Virtual address has no physical mapping in vaddr_to_paddr table");
+            payload->tensors[i].buffer.addr = paddr;
+        }
+    }
+
+    return true;
+}
+
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
@@ -1184,6 +1253,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 #endif
 
         bool try_pushed = false;
+        bool heap_full = false;
         const PTO2ResourceShape* dispatch_order = get_dispatch_order(thread_idx);
         for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES; si++) {
             PTO2ResourceShape shape = dispatch_order[si];
@@ -1213,6 +1283,19 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
                 for (int bi = 0; bi < got; bi++) {
                     PTO2TaskSlotState* slot_state = batch[bi];
+
+                    // Deferred heap allocation + virtual address resolution.
+                    // Must succeed before dispatching any subtask to AICore.
+                    if (!try_alloc_and_patch(*slot_state)) {
+                        // Heap full — re-enqueue this and remaining tasks,
+                        // then break to process completions (which free heap).
+                        for (int ri = bi; ri < got; ri++) {
+                            rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(batch[ri]);
+                        }
+                        heap_full = true;
+                        break;
+                    }
+
                     try_pushed = true;
 #if PTO2_PROFILING
                     phase_dispatch_count++;
@@ -1259,12 +1342,14 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                         (long long)slot_state->task->mixed_task_id.raw,
                         current_valid_cluster_offset);
                 }
+                if (heap_full) break;
 
                 // lazy update valid_cluster_states
                 if (!valid_cluster_states.has_value()) {
                     valid_cluster_states = tracker.get_valid_cluster_offset_states(shape);
                 }
             }
+            if (heap_full) break;
         }
 
         // requeue in global ready queue
@@ -1821,7 +1906,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
-            uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle + p.lookup_cycle + p.heap_cycle +
+            uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle + p.lookup_cycle +
                              p.insert_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero
             DEV_ALWAYS("Thread %d: === Orchestrator Profiling: %lld tasks, total=%.3fus ===",
@@ -1835,13 +1920,6 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle),
                 cycles_to_us(p.alloc_wait_cycle),
                 (unsigned long long)p.alloc_atomic_count);
-            DEV_ALWAYS("Thread %d:   heap_alloc     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
-                thread_idx,
-                cycles_to_us(p.heap_cycle),
-                p.heap_cycle * 100.0 / total,
-                cycles_to_us(p.heap_cycle - p.heap_wait_cycle),
-                cycles_to_us(p.heap_wait_cycle),
-                (unsigned long long)p.heap_atomic_count);
             DEV_ALWAYS("Thread %d:   sync_tensormap : %.3fus (%.1f%%)",
                 thread_idx,
                 cycles_to_us(p.sync_cycle),
@@ -1894,7 +1972,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 orch_summary.alloc_cycle = p.alloc_cycle;
                 orch_summary.params_cycle = p.params_cycle;
                 orch_summary.lookup_cycle = p.lookup_cycle;
-                orch_summary.heap_cycle = p.heap_cycle;
+                orch_summary.heap_cycle = 0;  // Heap allocation moved to Scheduler
                 orch_summary.insert_cycle = p.insert_cycle;
                 orch_summary.fanin_cycle = p.fanin_cycle;
                 orch_summary.scope_end_cycle = p.scope_end_cycle;

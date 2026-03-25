@@ -179,6 +179,38 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
         }
     }
 
+    // Initialize virtual address → physical address mapping table.
+    // Size = next_power_of_2(sum_of_all_ring_windows × PTO2_MAX_OUTPUTS).
+    // task_ring back-pressure guarantees at most window_size live tasks per ring,
+    // each with at most PTO2_MAX_OUTPUTS outputs, so the table cannot overflow.
+    {
+        int64_t total_window = 0;
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            total_window += sm_handle->header->rings[r].task_window_size;
+        }
+        int64_t required = total_window * PTO2_MAX_OUTPUTS;
+        sched->vaddr_map_size = 1;
+        while (sched->vaddr_map_size < required) {
+            sched->vaddr_map_size <<= 1;
+        }
+        sched->vaddr_map_mask = sched->vaddr_map_size - 1;
+        sched->vaddr_to_paddr = new (std::nothrow) uint64_t[sched->vaddr_map_size]();
+        if (!sched->vaddr_to_paddr) {
+            for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+                pto2_ready_queue_destroy(&sched->ready_queues[i]);
+            }
+            for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                sched->ring_sched_states[r].destroy();
+            }
+            return false;
+        }
+        LOG_INFO("vaddr mapping table: size=%d entries (%zu KB), "
+                 "total_window=%" PRId64 ", max_outputs=%d",
+                 sched->vaddr_map_size,
+                 (size_t)sched->vaddr_map_size * sizeof(uint64_t) / 1024,
+                 total_window, PTO2_MAX_OUTPUTS);
+    }
+
     return true;
 }
 
@@ -190,6 +222,9 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         pto2_ready_queue_destroy(&sched->ready_queues[i]);
     }
+
+    delete[] sched->vaddr_to_paddr;
+    sched->vaddr_to_paddr = nullptr;
 }
 
 // =============================================================================

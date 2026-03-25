@@ -465,6 +465,35 @@ struct PTO2SchedulerState {
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
+    // =========================================================================
+    // Virtual Address → Physical Address Mapping Table
+    // =========================================================================
+    // Resolves virtual address "residue" in consumer payloads at dispatch time.
+    // payload->init() copies tensors by value, so consumer payloads retain the
+    // virtual address assigned at submit time even after the producer payload
+    // is patched to a physical address.
+    //
+    // Table sizing:
+    //   max_live_vaddrs = sum_of_all_ring_window_sizes × PTO2_MAX_OUTPUTS
+    //   Default: (16384 × 4) × 16 = 1,048,576
+    //   Rounded up to next power of 2 for fast index masking (& instead of %).
+    //
+    // Safety: task_ring back-pressure caps live tasks at window_size per ring,
+    //   each with at most PTO2_MAX_OUTPUTS outputs, so the table cannot overflow.
+    //   Producer slots are held alive by fanout_refcount until all consumers
+    //   complete, so entries are never overwritten before being consumed.
+    //   A runtime INTERNAL_CHECK guards against mapping misses.
+    //
+    // Lifecycle: implicit ring-buffer — entries are overwritten when the
+    //   sequence wraps. No explicit free needed.
+    //
+    // Thread safety: producer dispatch writes → fanin_refcount.fetch_add(acq_rel)
+    //   → ready queue push/pop (acquire) → consumer dispatch reads.
+    //   The happens-before chain guarantees visibility across threads.
+    uint64_t* vaddr_to_paddr{nullptr};  // Dynamically allocated at init, freed at destroy
+    int32_t   vaddr_map_size{0};        // Table capacity (power of 2)
+    int32_t   vaddr_map_mask{0};        // = vaddr_map_size - 1 (for fast index)
+
     // Statistics
 #if PTO2_SCHED_PROFILING
     std::atomic<int64_t> tasks_completed;
