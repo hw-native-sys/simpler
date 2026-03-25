@@ -20,7 +20,7 @@
  *    - O(1) prepend operation
  *    - Implicit reclamation with task ring
  * 
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #ifndef PTO_RING_BUFFER_H

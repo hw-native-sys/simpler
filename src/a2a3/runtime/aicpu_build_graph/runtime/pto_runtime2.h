@@ -19,7 +19,7 @@
  *   3. Mark orchestration complete: pto2_orchestrator_done()
  *   4. Destroy runtime: pto2_runtime_destroy()
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #ifndef PTO_RUNTIME2_H

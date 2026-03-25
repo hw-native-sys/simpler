@@ -8,7 +8,7 @@
  * - Task descriptors with fanin/fanout tracking
  * - Dependency list entries
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #ifndef PTO_RUNTIME2_TYPES_H

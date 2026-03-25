@@ -26,7 +26,7 @@
  *   1. Same base_ptr (raw tensor pointer)
  *   2. Byte ranges [offset, offset+size) intersect
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #pragma once

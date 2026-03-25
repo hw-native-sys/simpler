@@ -4,7 +4,7 @@
  * Implements HeapRing, TaskRing, and DepListPool ring buffers
  * for zero-overhead memory management.
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #include "pto_ring_buffer.h"

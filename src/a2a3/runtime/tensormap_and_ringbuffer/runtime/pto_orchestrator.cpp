@@ -3,7 +3,7 @@
  *
  * Implements orchestrator state management, scope handling, and task submission.
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #include "pto_orchestrator.h"

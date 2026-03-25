@@ -10,7 +10,7 @@
  * 3. Automatic stale entry cleanup during lookup
  * 4. Periodic explicit cleanup for long chains
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #include "pto_tensormap.h"

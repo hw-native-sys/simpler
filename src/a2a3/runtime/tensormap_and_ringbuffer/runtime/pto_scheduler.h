@@ -13,7 +13,7 @@
  * - Buffer lifecycle based on fanout_refcount
  * - Ring pointer advancement for flow control
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #ifndef PTO_SCHEDULER_H

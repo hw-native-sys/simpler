@@ -5,11 +5,11 @@
 Each developer role has a designated working directory. Stay within your assigned area unless explicitly requested by the user.
 
 ### Platform Developer
-- **Working directory**: `src/platform/`
+- **Working directory**: `src/{arch}/platform/` (e.g., `src/a2a3/platform/`)
 - Write platform-specific logic and abstractions here
 
 ### Runtime Developer
-- **Working directory**: `src/runtime/`
+- **Working directory**: `src/{arch}/runtime/` (e.g., `src/a2a3/runtime/`)
 - Write runtime logic including host, aicpu, aicore, and common modules here
 
 ### Codegen Developer
@@ -18,7 +18,7 @@ Each developer role has a designated working directory. Stay within your assigne
 
 ## Architecture
 
-PTO Runtime compiles three independent programs (Host `.so`, AICPU `.so`, AICore `.o`) that communicate through handshake buffers on Ascend NPU devices. Three runtime variants live under `src/runtime/` (`host_build_graph`, `aicpu_build_graph`, `tensormap_and_ringbuffer`), two platform backends under `src/platform/` (`a2a3` = hardware, `a2a3sim` = simulation). See `README.md` for the full architecture diagram.
+PTO Runtime compiles three independent programs (Host `.so`, AICPU `.so`, AICore `.o`) that communicate through handshake buffers on Ascend NPU devices. Three runtime variants live under `src/{arch}/runtime/` (`host_build_graph`, `aicpu_build_graph`, `tensormap_and_ringbuffer`), two platform backends under `src/{arch}/platform/` (`onboard/` = hardware, `sim/` = simulation). See `README.md` for the full architecture diagram.
 
 ## Common Commands
 

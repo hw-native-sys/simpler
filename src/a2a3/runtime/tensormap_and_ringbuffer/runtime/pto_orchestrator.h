@@ -12,7 +12,7 @@
  * - Host CPU (lower latency for complex control, easier debugging)
  * - Device AI_CPU (lower latency for task submission)
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #ifndef PTO_ORCHESTRATOR_H

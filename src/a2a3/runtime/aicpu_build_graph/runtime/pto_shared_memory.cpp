@@ -4,7 +4,7 @@
  * Implements shared memory allocation, initialization, and management
  * for Orchestrator-Scheduler communication.
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #include "pto_shared_memory.h"

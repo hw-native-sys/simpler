@@ -28,8 +28,8 @@ python examples/scripts/run_example.py \
 
 ```bash
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph/vector_example/kernels \
-  -g examples/host_build_graph/vector_example/golden.py \
+  -k examples/a2a3/host_build_graph/vector_example/kernels \
+  -g examples/a2a3/host_build_graph/vector_example/golden.py \
   -p a2a3
 ```
 
@@ -37,8 +37,8 @@ python examples/scripts/run_example.py \
 
 ```bash
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph/vector_example/kernels \
-  -g examples/host_build_graph/vector_example/golden.py \
+  -k examples/a2a3/host_build_graph/vector_example/kernels \
+  -g examples/a2a3/host_build_graph/vector_example/golden.py \
   -p a2a3sim
 ```
 
@@ -378,8 +378,8 @@ TEST FAILED: Output 'f' does not match golden
 
 ## Reference Examples
 
-- **Hardware Example**: [examples/host_build_graph/vector_example/](../host_build_graph/vector_example/)
-- **Simulation Example**: [examples/host_build_graph/vector_example/](../host_build_graph/vector_example/)
+- **Hardware Example**: [examples/a2a3/host_build_graph/vector_example/](../a2a3/host_build_graph/vector_example/)
+- **Simulation Example**: [examples/a2a3/host_build_graph/vector_example/](../a2a3/host_build_graph/vector_example/)
 
 ## FAQ
 
@@ -501,7 +501,7 @@ python examples/scripts/run_example.py \
   -p a2a3sim
 ```
 
-Runtime implementation should be located at: `src/runtime/<runtime_name>/`
+Runtime implementation should be located at: `src/{arch}/runtime/<runtime_name>/`
 
 ### Programmatic Usage
 

@@ -11,7 +11,7 @@ Each program is compiled independently with its own toolchain and linked at runt
 
 ## Runtime Variants
 
-Three runtimes under `src/runtime/`, each providing a different graph-building strategy:
+Three runtimes under `src/{arch}/runtime/`, each providing a different graph-building strategy:
 - **`host_build_graph`** -- Host CPU builds the full task dependency graph before launching
 - **`aicpu_build_graph`** -- AICPU builds and manages the graph on-device
 - **`tensormap_and_ringbuffer`** -- Advanced runtime with tensor maps, ring buffers, shared memory, and multi-core orchestration
@@ -20,12 +20,12 @@ Each runtime has a `build_config.py` declaring its include/source directories fo
 
 ## Platform Backends
 
-Two backends under `src/platform/`:
+Two backends under `src/{arch}/platform/`:
 - **`a2a3`** -- Real Ascend hardware (requires CANN toolkit, `ccec` compiler for AICore, aarch64 cross-compiler for AICPU)
 - **`a2a3sim`** -- Thread-based simulation (g++ only, no device required, runs on Linux and macOS)
 
-Shared interfaces live in `src/platform/include/` (split into `host/`, `aicpu/`, `aicore/`, `common/`).
-Platform-specific implementations live in `src/platform/src/` and `src/platform/a2a3/` or `src/platform/a2a3sim/`.
+Shared interfaces live in `src/{arch}/platform/include/` (split into `host/`, `aicpu/`, `aicore/`, `common/`).
+Platform-specific implementations live in `src/{arch}/platform/src/` and `src/{arch}/platform/onboard/` or `src/{arch}/platform/sim/`.
 
 ## Compilation Pipeline
 

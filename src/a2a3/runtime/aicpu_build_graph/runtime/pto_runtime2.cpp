@@ -3,7 +3,7 @@
  *
  * Implements the unified runtime API that combines orchestrator and scheduler.
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #include "pto_runtime2.h"

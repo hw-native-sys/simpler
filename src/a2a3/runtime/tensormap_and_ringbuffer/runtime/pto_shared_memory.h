@@ -21,7 +21,7 @@
  * - TensorMap, scope_stack, ready_queues, dep_pool are in private memory
  * - Flow control via atomic counters/flags (no locks needed for single-word R/W)
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #ifndef PTO_SHARED_MEMORY_H

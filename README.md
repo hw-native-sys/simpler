@@ -20,8 +20,8 @@ The PTO Runtime consists of **three separate programs** that communicate through
          ▼                ▼                ▼
 ┌──────────────────┐  ┌──────────────────┐
 │   Host Runtime   │  │   Binary Data    │
-│ (src/platform/   │  │  (AICPU + AICore)│
-│  a2a3/host/)     │  └──────────────────┘
+│ (src/{arch}/     │  │  (AICPU + AICore)│
+│  platform/)      │  └──────────────────┘
 ├──────────────────┤         │
 │ DeviceRunner     │         │
 │ Runtime          │         │
@@ -35,8 +35,8 @@ The PTO Runtime consists of **three separate programs** that communicate through
     ┌────────────────────────────┐
     │  Ascend Device (Hardware)   │
     ├────────────────────────────┤
-    │ AICPU: Task Scheduler       │  (src/platform/a2a3/aicpu/)
-    │ AICore: Compute Kernels     │  (src/platform/a2a3/aicore/)
+    │ AICPU: Task Scheduler       │
+    │ AICore: Compute Kernels     │
     └────────────────────────────┘
 ```
 
@@ -65,15 +65,15 @@ The test framework automatically handles PTO_ISA_ROOT setup:
 **Automatic Setup (Recommended):**
 Just run your example - pto-isa will be cloned automatically on first run:
 ```bash
-python examples/scripts/run_example.py -k examples/host_build_graph/vector_example/kernels \
-                                       -g examples/host_build_graph/vector_example/golden.py \
+python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_example/kernels \
+                                       -g examples/a2a3/host_build_graph/vector_example/golden.py \
                                        -p a2a3sim
 ```
 
 By default, the auto-clone uses SSH (`git@github.com:...`). In CI or environments without SSH keys, use `--clone-protocol https`:
 ```bash
-python examples/scripts/run_example.py -k examples/host_build_graph/vector_example/kernels \
-                                       -g examples/host_build_graph/vector_example/golden.py \
+python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_example/kernels \
+                                       -g examples/a2a3/host_build_graph/vector_example/golden.py \
                                        -p a2a3sim --clone-protocol https
 ```
 
@@ -121,25 +121,24 @@ The simulation platform (`a2a3sim`) uses host threads to emulate AICPU/AICore ex
 
 ## Three Components
 
-### 1. Host Runtime (`src/platform/a2a3/host/`)
+### 1. Host Runtime (`src/{arch}/platform/*/host/`)
 **C++ library** - Device orchestration and management
 - `DeviceRunner`: Singleton managing device operations
-- `Runtime`: Task dependency runtime data structure
 - `MemoryAllocator`: Device tensor memory management
 - `pto_runtime_c_api.h`: Pure C API for Python bindings
 - Compiled to shared library (.so) at runtime
 
 **Key Responsibilities:**
 - Allocate/free device memory
-- Host ↔ Device data transfer
+- Host <-> Device data transfer
 - AICPU kernel launching and configuration
 - AICore kernel registration and loading
 - Runtime execution workflow coordination
 
-### 2. AICPU Kernel (`src/platform/a2a3/aicpu/`)
+### 2. AICPU Kernel (`src/{arch}/platform/*/aicpu/`)
 **Device program** - Task scheduler running on AICPU processor
 - `kernel.cpp`: Kernel entry points and handshake protocol
-- Runtime-specific executor in `src/runtime/host_build_graph/aicpu/`
+- Runtime-specific executor in `src/{arch}/runtime/*/aicpu/`
 - Compiled to device binary at build time
 
 **Key Responsibilities:**
@@ -149,10 +148,10 @@ The simulation platform (`a2a3sim`) uses host threads to emulate AICPU/AICore ex
 - Track task completion and update dependencies
 - Continue until all tasks complete
 
-### 3. AICore Kernel (`src/platform/a2a3/aicore/`)
+### 3. AICore Kernel (`src/{arch}/platform/*/aicore/`)
 **Device program** - Computation kernels executing on AICore processors
 - `kernel.cpp`: Task execution kernels (add, mul, etc.)
-- Runtime-specific executor in `src/runtime/host_build_graph/aicore/`
+- Runtime-specific executor in `src/{arch}/runtime/*/aicore/`
 - Compiled to object file (.o) at build time
 
 **Key Responsibilities:**
@@ -162,11 +161,26 @@ The simulation platform (`a2a3sim`) uses host threads to emulate AICPU/AICore ex
 - Signal task completion
 - Poll for next task or quit signal
 
+## Runtime Variants
+
+Three runtime implementations live under `src/{arch}/runtime/`, each providing a different graph-building strategy:
+
+### host_build_graph
+The Host CPU builds the full task dependency graph before launching execution. The graph is serialized to device memory and the AICPU scheduler dispatches tasks based on the pre-built dependency structure. Simplest runtime, good for static workloads.
+
+### aicpu_build_graph
+The AICPU builds and manages the task graph on-device. The host sends a compact description and the AICPU constructs the full graph locally, reducing host-device data transfer. Includes shared memory management, ring buffers, and a more capable scheduler.
+
+### tensormap_and_ringbuffer
+Advanced runtime with tensor maps, ring buffers, shared memory, and multi-core orchestration. Supports dynamic tensor management, pipelined execution via ring buffers, and orchestrator-driven multi-core dispatch. Designed for complex, high-throughput workloads.
+
+Each runtime has a `build_config.py` declaring its include/source directories for the three components (host, aicpu, aicore). The `RUNTIME_CONFIG.runtime` field in `kernel_config.py` selects which runtime to use.
+
 ## API Layers
 
 Three layers of APIs enable the separation:
 
-### Layer 1: C++ API (`src/platform/a2a3/host/device_runner.h`)
+### Layer 1: C++ API (`src/{arch}/platform/*/host/device_runner.h`)
 ```cpp
 DeviceRunner& runner = DeviceRunner::Get();
 runner.Init(device_id, num_cores, aicpu_bin, aicore_bin, pto_isa_root);
@@ -176,7 +190,7 @@ runner.Run(runtime);
 runner.Finalize();
 ```
 
-### Layer 2: C API (`src/platform/a2a3/host/pto_runtime_c_api.h`)
+### Layer 2: C API (`src/{arch}/platform/include/host/pto_runtime_c_api.h`)
 ```c
 int DeviceRunner_Init(device_id, num_cores, aicpu_binary, aicpu_size,
                       aicore_binary, aicore_size, pto_isa_root);
@@ -202,76 +216,68 @@ runtime.finalize()
 ```
 pto-runtime/
 ├── src/
-│   ├── platform/                       # Platform-specific implementations
-│   │   ├── a2a3/                       # Ascend A2/A3 platform
-│   │   │   ├── host/                   # Host runtime program
-│   │   │   │   ├── device_runner.h/cpp  # Device management
-│   │   │   │   ├── memory_allocator.h/cpp # Memory allocation
-│   │   │   │   ├── function_cache.h    # Kernel binary cache
-│   │   │   │   └── pto_runtime_c_api.h/cpp # C API for bindings
-│   │   │   ├── aicpu/                  # AICPU kernel (device program)
-│   │   │   │   ├── kernel.cpp          # Entry points & handshake
-│   │   │   │   └── device_log.h/cpp    # Device logging
-│   │   │   ├── aicore/                 # AICore kernel (device program)
-│   │   │   │   ├── kernel.cpp          # Task execution kernels
-│   │   │   │   └── aicore.h            # AICore header
-│   │   │   └── common/                 # Shared structures
-│   │   │       └── kernel_args.h       # Kernel argument structures
-│   │   │
-│   │   └── a2a3sim/                    # Thread-based simulation platform
-│   │       ├── host/                   # Simulation host runtime
-│   │       │   ├── device_runner.h/cpp  # Thread-based device emulation
-│   │       │   ├── memory_allocator.h/cpp # Host memory allocation
-│   │       │   └── pto_runtime_c_api.h/cpp # Same C API as a2a3
-│   │       ├── aicpu/                  # Simulation AICPU
-│   │       ├── aicore/                 # Simulation AICore
-│   │       └── common/                 # Shared structures
-│   │
-│   └── runtime/                        # Runtime implementations
-│       └── host_build_graph/           # Host-built graph runtime
-│           ├── build_config.py         # Build configuration
-│           ├── host/
-│           │   └── runtime_maker.cpp    # C++ runtime builder & validator
-│           ├── aicpu/
-│           │   └── aicpu_executor.cpp # Task scheduler implementation
-│           ├── aicore/
-│           │   └── aicore_executor.cpp # AICore task executor
-│           └── runtime/
-│               └── runtime.h/cpp       # Task runtime and handshake structures
+│   └── {arch}/                            # Architecture (e.g., a2a3)
+│       ├── platform/                      # Platform-specific implementations
+│       │   ├── include/                   # Shared platform interfaces
+│       │   │   ├── host/                  # Host API headers
+│       │   │   │   └── pto_runtime_c_api.h
+│       │   │   ├── aicpu/                 # AICPU headers
+│       │   │   ├── aicore/                # AICore headers
+│       │   │   └── common/                # Shared structures (kernel_args.h)
+│       │   ├── src/                       # Shared platform source
+│       │   ├── onboard/                   # Real hardware backend (a2a3)
+│       │   │   ├── host/                  # Hardware host runtime
+│       │   │   ├── aicpu/                 # Hardware AICPU kernel
+│       │   │   └── aicore/                # Hardware AICore kernel
+│       │   └── sim/                       # Simulation backend (a2a3sim)
+│       │       ├── host/                  # Simulation host runtime
+│       │       ├── aicpu/                 # Simulation AICPU
+│       │       └── aicore/                # Simulation AICore
+│       │
+│       └── runtime/                       # Runtime implementations
+│           ├── host_build_graph/          # Host-built graph runtime
+│           │   ├── build_config.py
+│           │   ├── host/
+│           │   ├── aicpu/
+│           │   ├── aicore/
+│           │   └── runtime/
+│           ├── aicpu_build_graph/         # AICPU-built graph runtime
+│           │   ├── build_config.py
+│           │   ├── host/
+│           │   ├── aicpu/
+│           │   ├── aicore/
+│           │   └── runtime/
+│           └── tensormap_and_ringbuffer/  # Advanced runtime
+│               ├── build_config.py
+│               ├── host/
+│               ├── aicpu/
+│               ├── aicore/
+│               └── runtime/
 │
-├── python/                             # Language bindings
-│   ├── bindings.py                      # ctypes wrapper (C → Python)
-│   ├── runtime_builder.py              # Python runtime builder
-│   ├── runtime_compiler.py              # Multi-platform runtime compiler
-│   ├── kernel_compiler.py               # Kernel compiler
-│   ├── elf_parser.py                   # ELF binary parser
-│   └── toolchain.py                    # Toolchain configuration
+├── python/                                # Language bindings
+│   ├── bindings.py                        # ctypes wrapper (C -> Python)
+│   ├── runtime_builder.py                 # Python runtime builder
+│   ├── runtime_compiler.py                # Multi-platform runtime compiler
+│   ├── kernel_compiler.py                 # Kernel compiler
+│   ├── elf_parser.py                      # ELF binary parser
+│   └── toolchain.py                       # Toolchain configuration
 │
-├── examples/                           # Working examples
-│   ├── scripts/                        # Test framework scripts
-│   │   ├── run_example.py                   # Main test runner
-│   │   ├── code_runner.py              # Test execution engine
-│   │   └── README.md                   # Test framework documentation
+├── examples/                              # Working examples
+│   ├── scripts/                           # Test framework scripts
+│   │   ├── run_example.py                 # Main test runner
+│   │   ├── code_runner.py                 # Test execution engine
+│   │   └── README.md                      # Test framework documentation
 │   │
-│   ├── host_build_graph_example/       # Host-built graph example (a2a3)
-│   │   ├── README.md                   # Example documentation
-│   │   ├── golden.py                   # Input generation and expected output
-│   │   └── kernels/
-│   │       ├── kernel_config.py        # Kernel configuration
-│   │       ├── aiv/                    # AIV kernels
-│   │       │   ├── kernel_add.cpp
-│   │       │   ├── kernel_add_scalar.cpp
-│   │       │   └── kernel_mul.cpp
-│   │       └── orchestration/
-│   │           └── example_orch.cpp    # Orchestration kernel
-│   │
-│   └── host_build_graph_sim_example/   # Simulation example (a2a3sim)
-│       ├── README.md                   # Example documentation
-│       ├── golden.py                   # Input generation and expected output
-│       └── kernels/                    # Simulation kernels (plain C++)
+│   └── a2a3/                              # Examples for a2a3 architecture
+│       ├── host_build_graph/              # Host-built graph examples
+│       │   └── vector_example/
+│       │       ├── golden.py
+│       │       └── kernels/
+│       ├── aicpu_build_graph/             # AICPU-built graph examples
+│       └── tensormap_and_ringbuffer/      # Advanced runtime examples
 │
-└── tests/                              # Test suite
-    └── test_runtime_builder.py         # Runtime builder tests
+└── tests/                                 # Test suite
+    └── test_runtime_builder.py            # Runtime builder tests
 ```
 
 ## Developer Guidelines
@@ -280,8 +286,8 @@ Each developer role has a designated working directory:
 
 | Role | Directory | Responsibility |
 |------|-----------|----------------|
-| **Platform Developer** | `src/platform/` | Platform-specific logic and abstractions |
-| **Runtime Developer** | `src/runtime/` | Runtime logic (host, aicpu, aicore, common) |
+| **Platform Developer** | `src/{arch}/platform/` | Platform-specific logic and abstractions |
+| **Runtime Developer** | `src/{arch}/runtime/` | Runtime logic (host, aicpu, aicore, common) |
 | **Codegen Developer** | `examples/` | Code generation examples and kernel implementations |
 
 **Rules:**
@@ -384,14 +390,14 @@ Use the test framework to run examples:
 ```bash
 # Hardware platform (requires Ascend device)
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph_example/kernels \
-  -g examples/host_build_graph_example/golden.py \
+  -k examples/a2a3/host_build_graph/vector_example/kernels \
+  -g examples/a2a3/host_build_graph/vector_example/golden.py \
   -p a2a3
 
 # Simulation platform (no hardware required)
 python examples/scripts/run_example.py \
-  -k examples/host_build_graph_sim_example/kernels \
-  -g examples/host_build_graph_sim_example/golden.py \
+  -k examples/a2a3/host_build_graph/vector_example/kernels \
+  -g examples/a2a3/host_build_graph/vector_example/golden.py \
   -p a2a3sim
 ```
 
@@ -524,55 +530,6 @@ struct Handshake {
 5. AICore sets `task_status = 0` (done) and `aicore_done`
 6. AICPU reads result and continues
 
-## Components in Detail
-
-### Host Runtime (`src/platform/a2a3/host/`)
-
-**DeviceRunner**: Singleton managing device operations
-- Allocate/free device tensor memory
-- Copy data between host and device
-- Launch AICPU and AICore kernels
-- Manage handshake buffers
-- Coordinate runtime execution
-
-**Runtime**: Task dependency runtime
-- Add tasks with arguments and function IDs
-- Add dependencies between tasks (fanin/fanout)
-- Query task information and dependency structure
-- Calculate topologically ready tasks
-
-**MemoryAllocator**: Device memory management
-- Allocate blocks from device GM memory
-- Track allocations automatically
-- Free with automatic cleanup on finalization
-
-**pto_runtime_c_api**: Pure C interface
-- Enables Python ctypes bindings
-- Wraps C++ classes as opaque pointers
-- Error codes: 0=success, negative=failure
-- All memory management in C++
-
-### AICPU Kernel (`src/platform/a2a3/aicpu/`)
-
-**kernel.cpp**: Kernel entry points
-- Initialization kernel: Sets up handshake protocol
-- Main scheduler kernel: Task scheduling loop
-- Handshake initialization and management
-
-**execute.cpp**: Task scheduler
-- Ready task identification
-- Task dispatch to cores
-- Dependency tracking and updates
-- Loop until completion
-
-### AICore Kernel (`src/platform/a2a3/aicore/`)
-
-**kernel.cpp**: Computation kernels
-- Task execution implementations
-- Kernel function pointers indexed by func_id
-- Memory access and PTO ISA operations
-- Handshake buffer polling
-
 ## Features
 
 ### Dynamic Kernel Compilation
@@ -600,7 +557,7 @@ Full Python API with ctypes:
 ## Configuration
 
 ### Compile-time Configuration (Runtime Limits)
-In [src/runtime/host_build_graph/runtime/runtime.h](src/runtime/host_build_graph/runtime/runtime.h):
+In [src/a2a3/runtime/host_build_graph/runtime/runtime.h](src/a2a3/runtime/host_build_graph/runtime/runtime.h):
 ```cpp
 #define RUNTIME_MAX_TASKS 131072   // Maximum number of tasks
 #define RUNTIME_MAX_ARGS 16        // Maximum arguments per task
@@ -650,11 +607,9 @@ See the [LICENSE](LICENSE) file for the full license text.
 
 ## References
 
-- [src/platform/a2a3/host/](src/platform/a2a3/host/) - Host runtime implementation (real hardware)
-- [src/platform/a2a3/aicpu/](src/platform/a2a3/aicpu/) - AICPU scheduler implementation
-- [src/platform/a2a3/aicore/](src/platform/a2a3/aicore/) - AICore kernel implementation
-- [src/platform/a2a3sim/](src/platform/a2a3sim/) - Thread-based simulation platform
-- [src/runtime/host_build_graph/](src/runtime/host_build_graph/) - Host-built graph runtime
-- [examples/host_build_graph_example/](examples/host_build_graph_example/) - Hardware example (a2a3)
-- [examples/host_build_graph_sim_example/](examples/host_build_graph_sim_example/) - Simulation example (a2a3sim)
+- [src/a2a3/platform/](src/a2a3/platform/) - Platform implementations (includes onboard and sim backends)
+- [src/a2a3/runtime/host_build_graph/](src/a2a3/runtime/host_build_graph/) - Host-built graph runtime
+- [src/a2a3/runtime/aicpu_build_graph/](src/a2a3/runtime/aicpu_build_graph/) - AICPU-built graph runtime
+- [src/a2a3/runtime/tensormap_and_ringbuffer/](src/a2a3/runtime/tensormap_and_ringbuffer/) - Advanced runtime
+- [examples/a2a3/](examples/a2a3/) - Examples for a2a3 architecture
 - [python/](python/) - Python bindings and compiler

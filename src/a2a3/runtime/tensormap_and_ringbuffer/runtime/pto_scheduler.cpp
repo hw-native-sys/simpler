@@ -3,7 +3,7 @@
  *
  * Implements scheduler state management, ready queues, and task lifecycle.
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #include "pto_scheduler.h"
