@@ -197,3 +197,33 @@ target_include_directories(test_scheduler_edge PRIVATE ${TMR_INCLUDE_DIRS})
 target_compile_definitions(test_scheduler_edge PRIVATE ${TMR_COMPILE_DEFS})
 target_link_libraries(test_scheduler_edge ${GTEST_LIBS} test_stubs pthread)
 add_test(NAME SchedulerEdge COMMAND test_scheduler_edge)
+
+# =============================================================================
+# Architectural coupling detection tests (full TMR runtime linkage)
+# =============================================================================
+add_executable(test_coupling test_coupling.cpp
+    ${TMR_RUNTIME}/pto_tensormap.cpp
+    ${TMR_RUNTIME}/pto_shared_memory.cpp
+    ${TMR_RUNTIME}/pto_ring_buffer.cpp
+    ${TMR_RUNTIME}/pto_scheduler.cpp
+    ${TMR_RUNTIME}/pto_orchestrator.cpp)
+target_include_directories(test_coupling PRIVATE ${TMR_INCLUDE_DIRS})
+target_compile_definitions(test_coupling PRIVATE ${TMR_COMPILE_DEFS})
+target_link_libraries(test_coupling ${GTEST_LIBS} test_stubs pthread)
+add_test(NAME Coupling COMMAND test_coupling)
+
+# =============================================================================
+# Stub-based coupling detection tests
+# pto_orchestrator.cpp is intentionally excluded — build success proves that
+# TensorMap + Scheduler + RingBuffer + SharedMemory are link-isolated from
+# the Orchestrator.
+# =============================================================================
+add_executable(test_coupling_stub test_coupling_stub.cpp
+    ${TMR_RUNTIME}/pto_ring_buffer.cpp
+    ${TMR_RUNTIME}/pto_scheduler.cpp
+    ${TMR_RUNTIME}/pto_shared_memory.cpp
+    ${TMR_RUNTIME}/pto_tensormap.cpp)
+target_include_directories(test_coupling_stub PRIVATE ${TMR_INCLUDE_DIRS})
+target_compile_definitions(test_coupling_stub PRIVATE ${TMR_COMPILE_DEFS})
+target_link_libraries(test_coupling_stub ${GTEST_LIBS} test_stubs pthread)
+add_test(NAME CouplingStub COMMAND test_coupling_stub)
