@@ -1,8 +1,8 @@
 /**
  * PTO Runtime2 - Ring Buffer Implementation
  *
- * Implements HeapRing, TaskRing, and DepListPool ring buffers
- * for zero-overhead memory management.
+ * Implements DepListPool ring buffer for zero-overhead dependency management.
+ * TaskAllocator methods are defined inline in pto_ring_buffer.h.
  *
  * Based on: docs/RUNTIME_LOGIC.md
  */
@@ -13,32 +13,6 @@
 #include <stdlib.h>  // for exit()
 #include "common/unified_log.h"
 #include "pto_scheduler.h"
-
-// =============================================================================
-// Heap Ring Buffer Implementation
-// =============================================================================
-
-void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
-                          std::atomic<uint64_t>* tail_ptr,
-                          std::atomic<uint64_t>* top_ptr) {
-    ring->base = base;
-    ring->size = size;
-    ring->top_ptr = top_ptr;
-    ring->tail_ptr = tail_ptr;
-}
-
-// =============================================================================
-// Task Ring Buffer Implementation
-// =============================================================================
-
-void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
-                          int32_t window_size, std::atomic<int32_t>* last_alive_ptr,
-                          std::atomic<int32_t>* current_index_ptr) {
-    ring->descriptors = descriptors;
-    ring->window_size = window_size;
-    ring->current_index_ptr = current_index_ptr;
-    ring->last_alive_ptr = last_alive_ptr;
-}
 
 // =============================================================================
 // Dependency List Pool Implementation

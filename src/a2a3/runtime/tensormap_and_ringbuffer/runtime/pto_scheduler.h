@@ -414,16 +414,12 @@ struct PTO2SchedulerState {
         PTO2TaskDescriptor* task_descriptors;
         PTO2TaskSlotState* slot_states;
         int32_t last_task_alive;
-        int32_t last_heap_consumed;
-        uint64_t heap_tail;
-        void* heap_base;
         int32_t task_window_mask;
         uint64_t task_window_size;
-        // Try-lock used to advance this ring's pointers (CONSUMED scanning + heap tail update).
+        // Try-lock used to advance this ring's last_task_alive pointer.
         std::atomic<int32_t> advance_lock;
 
-        bool init(PTO2SharedMemoryHandle* sm_handle, int32_t ring_id,
-                  void* gm_heap_base, uint64_t per_ring_heap_size);
+        bool init(PTO2SharedMemoryHandle* sm_handle, int32_t ring_id);
         void destroy();
 
         PTO2TaskSlotState& get_slot_state_by_task_id(int32_t local_id) {
@@ -435,7 +431,6 @@ struct PTO2SchedulerState {
 
         void sync_to_sm(PTO2SharedMemoryRingHeader& ring) {
             ring.fc.last_task_alive.store(last_task_alive, std::memory_order_release);
-            ring.fc.heap_tail.store(heap_tail, std::memory_order_release);
         }
 
         void advance_ring_pointers(PTO2SharedMemoryRingHeader& ring) {
@@ -447,15 +442,6 @@ struct PTO2SchedulerState {
                     break;
                 }
                 last_task_alive++;
-            }
-
-            if (last_task_alive > 0) {
-                int32_t last_consumed_id = last_task_alive - 1;
-                PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(last_consumed_id);
-                PTO2TaskDescriptor& task = *slot_state.task;
-                if (task.packed_buffer_end != NULL) {
-                    heap_tail = (uint64_t)((char*)task.packed_buffer_end - (char*)heap_base);
-                }
             }
 
             sync_to_sm(ring);
@@ -777,8 +763,7 @@ struct PTO2SchedulerState {
 // =============================================================================
 
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
-                          PTO2SharedMemoryHandle* sm_handle,
-                          void* gm_heap_base, uint64_t per_ring_heap_size);
+                          PTO2SharedMemoryHandle* sm_handle);
 void pto2_scheduler_destroy(PTO2SchedulerState* sched);
 
 // =============================================================================

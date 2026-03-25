@@ -91,24 +91,6 @@ struct PTO2OrchestratorState {
         return depth < PTO2_MAX_RING_DEPTH ? static_cast<uint8_t>(depth) : PTO2_MAX_RING_DEPTH - 1;
     }
 
-    /**
-     * Allocate packed output buffer from current ring's heap
-     */
-    void* pto2_alloc_packed_buffer(int32_t total_size) {
-        if (total_size <= 0) {
-            return NULL;
-        }
-
-        uint8_t rid = current_ring_id();
-        void* buffer = rings[rid].heap_ring.pto2_heap_ring_alloc(total_size);
-
-#if PTO2_PROFILING
-        buffers_allocated++;
-        bytes_allocated += total_size;
-#endif
-
-        return buffer;
-    }
 };
 
 // =============================================================================
@@ -169,12 +151,11 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  * Submit a task with InCore function and parameters
  *
  * This is the main API for building the task graph:
- * 1. Allocates task slot from TaskRing (blocks until available)
- * 2. Allocates packed output buffer from HeapRing (blocks until available)
- * 3. Looks up inputs in TensorMap to find dependencies
- * 4. Updates producer's fanout_count/list (with spinlock)
- * 5. Registers outputs in TensorMap
- * 6. Initializes task state in scheduler
+ * 1. Allocates task slot + packed output buffer via TaskAllocator (blocks until available)
+ * 2. Looks up inputs in TensorMap to find dependencies
+ * 3. Updates producer's fanout_count/list (with spinlock)
+ * 4. Registers outputs in TensorMap
+ * 5. Initializes task state in scheduler
  *
  * @param orch        Orchestrator state
  * @param mixed_kernels  Kernel IDs for AIC/AIV0/AIV1 slots
@@ -216,22 +197,19 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch);
 #if PTO2_ORCH_PROFILING
 struct PTO2OrchProfilingData {
     uint64_t sync_cycle;
-    uint64_t alloc_cycle;
+    uint64_t alloc_cycle;           // Combined task slot + heap allocation
     uint64_t params_cycle;
     uint64_t lookup_cycle;
-    uint64_t heap_cycle;
     uint64_t insert_cycle;
     uint64_t fanin_cycle;
     uint64_t scope_end_cycle;
     int64_t  submit_count;
     // Wait time tracking for blocking phases
-    uint64_t alloc_wait_cycle;      // Cycles spent waiting in task_ring_alloc
-    uint64_t heap_wait_cycle;       // Cycles spent waiting in heap_ring_alloc
+    uint64_t alloc_wait_cycle;      // Cycles spent waiting in unified alloc
     uint64_t fanin_wait_cycle;      // Cycles spent waiting in fanout_lock
     // Atomic operation counts per phase
     uint64_t alloc_atomic_count;
     uint64_t params_atomic_count;
-    uint64_t heap_atomic_count;
     uint64_t fanin_atomic_count;
     uint64_t finalize_atomic_count;
     uint64_t scope_end_atomic_count;

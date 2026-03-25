@@ -1816,27 +1816,20 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
-            uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle + p.lookup_cycle + p.heap_cycle +
+            uint64_t total = p.sync_cycle + p.alloc_cycle + p.params_cycle + p.lookup_cycle +
                              p.insert_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero
             DEV_ALWAYS("Thread %d: === Orchestrator Profiling: %lld tasks, total=%.3fus ===",
                 thread_idx,
                 (long long)p.submit_count,
                 cycles_to_us(total));
-            DEV_ALWAYS("Thread %d:   task_ring_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
+            DEV_ALWAYS("Thread %d:   task+heap_alloc: %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
                 thread_idx,
                 cycles_to_us(p.alloc_cycle),
                 p.alloc_cycle * 100.0 / total,
                 cycles_to_us(p.alloc_cycle - p.alloc_wait_cycle),
                 cycles_to_us(p.alloc_wait_cycle),
                 (unsigned long long)p.alloc_atomic_count);
-            DEV_ALWAYS("Thread %d:   heap_alloc     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
-                thread_idx,
-                cycles_to_us(p.heap_cycle),
-                p.heap_cycle * 100.0 / total,
-                cycles_to_us(p.heap_cycle - p.heap_wait_cycle),
-                cycles_to_us(p.heap_wait_cycle),
-                (unsigned long long)p.heap_atomic_count);
             DEV_ALWAYS("Thread %d:   sync_tensormap : %.3fus (%.1f%%)",
                 thread_idx,
                 cycles_to_us(p.sync_cycle),
@@ -1889,7 +1882,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 orch_summary.alloc_cycle = p.alloc_cycle;
                 orch_summary.params_cycle = p.params_cycle;
                 orch_summary.lookup_cycle = p.lookup_cycle;
-                orch_summary.heap_cycle = p.heap_cycle;
+                orch_summary.heap_cycle = 0;  // Now included in alloc_cycle
                 orch_summary.insert_cycle = p.insert_cycle;
                 orch_summary.fanin_cycle = p.fanin_cycle;
                 orch_summary.scope_end_cycle = p.scope_end_cycle;
