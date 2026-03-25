@@ -115,9 +115,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(OrchArg* o
     uint32_t key_cache_shapes[2] = {(uint32_t)(total_blocks_count * block_size), (uint32_t)head_dim};
     uint32_t value_cache_shapes[2] = {(uint32_t)(total_blocks_count * block_size), (uint32_t)head_dim};
     uint32_t out_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
-    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type, false);
-    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type, false);
-    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type, false);
+    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
+    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
+    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
     Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
 
     int* host_block_table  = orch_args[3].data<int>();
@@ -156,8 +156,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(OrchArg* o
                 uint32_t li_shapes[1] = {(uint32_t)q_tile};
                 uint32_t mi_shapes[1] = {(uint32_t)q_tile};
                 Tensor oi = make_tensor(oi_shapes, 2, DataType::FLOAT32);
-                Tensor li_update = make_tensor(li_shapes, 1, DataType::FLOAT32, false);
-                Tensor mi_update = make_tensor(mi_shapes, 1, DataType::FLOAT32, false);
+                Tensor li_update = make_tensor(li_shapes, 1, DataType::FLOAT32);
+                Tensor mi_update = make_tensor(mi_shapes, 1, DataType::FLOAT32);
 #ifdef ENABLE_PROFILING
                 prof_make_count += 3;
                 CYCLE_COUNT_LAP(prof_make_tensor);

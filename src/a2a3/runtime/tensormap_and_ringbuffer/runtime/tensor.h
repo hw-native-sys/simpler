@@ -45,6 +45,7 @@ struct Segment {
  * - `buffer` contains the underlying memory allocation (addr in bytes, size in bytes)
  * - `raw_shapes[]`, `shapes[]`, `offsets[]` are in ELEMENTS
  * - `dtype` specifies element type for interpreting buffer contents
+ * - `layout` specifies the relationship between logical (shapes) and physical (raw_shapes) dimensions
  *
  * Fast-path flags (both on cache line 1):
  * - is_all_offset_zero: when true, offsets[] are implicitly zero — skip offset read/write
@@ -62,12 +63,12 @@ struct alignas(64) Tensor {
     uint64_t start_offset;                         // Cached 1D element offset (precomputed from raw_shapes + offsets), only calc before incore, useless in orch
     int32_t version;                               // Tensor version for overlap detection
     DataType dtype;                                // Data type of tensor elements
+    TensorLayout layout;                           // Tensor layout (ND or DN) for logical-to-physical dimension mapping
     uint32_t ndims;                                // Number of dimensions used
     bool is_all_offset_zero;                       // True when all offsets[] are zero (skip offset read/write)
     bool is_raw_eq_shapes;                         // True when raw_shapes[] == shapes[] (skip raw_shapes read/write)
     bool manual_dep;                               // True when dependency is managed manually (skip tensormap lookup/insert)
     uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
-    uint32_t __padding__;
 
     // === Cache line 2 (64B) — warm path ===
     uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
@@ -94,11 +95,12 @@ struct alignas(64) Tensor {
         uint32_t ndims,
         DataType dtype,
         int32_t version,
+        TensorLayout layout = TensorLayout::ND,
         bool is_all_offset_zero = false,
         bool is_raw_eq_shapes = false,
         bool manual_dep = false) {
         init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version,
-             is_all_offset_zero, is_raw_eq_shapes, manual_dep);
+             layout, is_all_offset_zero, is_raw_eq_shapes, manual_dep);
     }
 
     // --- Initialization ---
@@ -110,6 +112,7 @@ struct alignas(64) Tensor {
         uint32_t in_ndims,
         DataType in_dtype,
         int32_t in_version,
+        TensorLayout in_layout = TensorLayout::ND,
         bool in_is_all_offset_zero = false,
         bool in_is_raw_eq_shapes = false,
         bool in_manual_dep = false) {
@@ -117,6 +120,7 @@ struct alignas(64) Tensor {
         ndims = in_ndims;
         dtype = in_dtype;
         version = in_version;
+        layout = in_layout;
         is_all_offset_zero = in_is_all_offset_zero;
         is_raw_eq_shapes = in_is_raw_eq_shapes;
         manual_dep = in_manual_dep;
@@ -205,7 +209,19 @@ struct alignas(64) Tensor {
 
     Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool manual_dep = false) const {
         Tensor result;
-        result.init_with_view(*this, view_shapes, view_offsets, manual_dep);
+        if (layout == TensorLayout::DN && ndims >= 2) {
+            always_assert(ndims <= RUNTIME_MAX_TENSOR_DIMS);
+            uint32_t adjusted_offsets[RUNTIME_MAX_TENSOR_DIMS];
+            for (uint32_t i = 0; i < ndims - 2; i++) {
+                adjusted_offsets[i] = view_offsets[i];
+            }
+            // Swap only the last two dimensions (DN reverses row/col order)
+            adjusted_offsets[ndims - 2] = view_offsets[ndims - 1];
+            adjusted_offsets[ndims - 1] = view_offsets[ndims - 2];
+            result.init_with_view(*this, view_shapes, adjusted_offsets, manual_dep);
+        } else {
+            result.init_with_view(*this, view_shapes, view_offsets, manual_dep);
+        }
         return result;
     }
 
@@ -285,6 +301,7 @@ struct alignas(64) Tensor {
         ss << indent << "dtype: " << get_dtype_name(dtype) << std::endl;
         ss << indent << "ndims: " << ndims << std::endl;
         ss << indent << "version: " << version << std::endl;
+        ss << indent << "layout: " << (layout == TensorLayout::ND ? "ND" : "DN") << std::endl;
 
         const uint32_t* rs = get_raw_shapes();
         ss << indent << "raw_shapes: [";
@@ -320,3 +337,60 @@ static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 
 static_assert(offsetof(Tensor, raw_shapes) == 64);
 
 using TensorData = Tensor;
+
+// =============================================================================
+// Layout Reinterpretation
+// =============================================================================
+
+/**
+ * Zero-cost layout reinterpretation.
+ *
+ * Returns a copy of src with the layout field changed to NewLayout.
+ * raw_shapes (physical layout) are unchanged; shapes[] last two dimensions
+ * are swapped to reflect the new logical interpretation.
+ *
+ * Uses Tensor::copy() for cache-line-aware copying — avoids touching
+ * cache line 2 when is_raw_eq_shapes and is_all_offset_zero are both true.
+ *
+ * Safe for both addr=0 (make_tensor) and addr!=0 (make_tensor_external)
+ * tensors — this is pure metadata reinterpretation, no data is moved.
+ */
+template<TensorLayout NewLayout>
+static inline Tensor reinterpret_layout(const Tensor& src) {
+    if (src.layout == NewLayout) {
+        return src;
+    }
+
+    always_assert(src.ndims >= 2 && src.ndims <= RUNTIME_MAX_TENSOR_DIMS);
+
+    Tensor dst;
+    dst.copy(src);
+    dst.layout = NewLayout;
+
+    if (src.is_raw_eq_shapes) {
+        // src is ND full tensor → dst is DN → materialize raw_shapes, set false
+        for (uint32_t i = 0; i < dst.ndims; i++) {
+            dst.raw_shapes[i] = src.shapes[i];
+        }
+        dst.is_raw_eq_shapes = false;
+    }
+
+    std::swap(dst.shapes[dst.ndims - 2], dst.shapes[dst.ndims - 1]);
+
+    // DN→ND: check if swap restores shapes == raw_shapes (full tensor round-trip)
+    if constexpr (NewLayout == TensorLayout::ND) {
+        if (!src.is_raw_eq_shapes) {
+            bool eq = true;
+            for (uint32_t i = 0; i < dst.ndims; i++) {
+                if (dst.shapes[i] != dst.raw_shapes[i]) { eq = false; break; }
+            }
+            dst.is_raw_eq_shapes = eq;
+        }
+    }
+
+    if (!dst.is_all_offset_zero) {
+        std::swap(dst.offsets[dst.ndims - 2], dst.offsets[dst.ndims - 1]);
+    }
+
+    return dst;
+}

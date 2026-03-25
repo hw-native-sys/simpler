@@ -45,6 +45,7 @@ struct OrchArg {
     // For simple cases where golden shape == kernel shape.
     // When reshape is needed, read fields manually and call make_tensor_external.
     // Defined in pto_orchestration_api.h (needs make_tensor_external).
+    template<TensorLayout Layout = TensorLayout::ND>
     Tensor to_tensor(bool manual_dep = false, int32_t version = 0) const;
 
     // Get raw pointer to tensor data (eliminates verbose double-cast)

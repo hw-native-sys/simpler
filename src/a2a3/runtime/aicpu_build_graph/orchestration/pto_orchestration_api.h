@@ -30,8 +30,9 @@
 
 // OrchArg::to_tensor() — deferred definition (needs make_tensor_external from tensor.h)
 static_assert(ORCH_ARG_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "OrchArg and runtime max dims must match");
+template<TensorLayout Layout>
 inline Tensor OrchArg::to_tensor(bool manual_dep, int32_t version) const {
-    return make_tensor_external(
+    return make_tensor_external<Layout>(
         reinterpret_cast<void*>(static_cast<uintptr_t>(tensor.data)),
         tensor.shapes, tensor.ndims, tensor.dtype,
         manual_dep, version);

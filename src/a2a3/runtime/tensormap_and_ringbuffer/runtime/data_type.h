@@ -26,6 +26,18 @@ enum class DataType : uint32_t {
 };
 
 /**
+ * Tensor Layout
+ *
+ * Defines memory layout for the last two dimensions (row-major vs column-major).
+ * - ND: Row-major for all dimensions
+ * - DN: Column-major for LAST TWO dimensions only
+ */
+enum class TensorLayout : uint32_t {
+    ND = 0,  // Normal Dimensions
+    DN = 1   // Last two Dimensions transposed (col-major for last 2D)
+};
+
+/**
  * Get the size in bytes of a single element of the given data type
  *
  * @param dtype Data type

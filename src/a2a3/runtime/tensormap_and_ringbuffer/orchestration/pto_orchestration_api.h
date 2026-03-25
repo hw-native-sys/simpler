@@ -33,7 +33,11 @@
 
 /**
  * Create a Tensor for pre-allocated external memory.
+ *
+ * For DN layout, raw_shapes (physical layout) will have the last two
+ * dimensions swapped compared to the logical shapes.
  */
+template<TensorLayout Layout = TensorLayout::ND>
 static inline Tensor make_tensor_external(void* addr,
     const uint32_t shapes[],
     uint32_t ndims,
@@ -45,8 +49,22 @@ static inline Tensor make_tensor_external(void* addr,
     for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
+    uint64_t buf_size = total * get_element_size(dtype);
+
+    if constexpr (Layout == TensorLayout::DN) {
+        always_assert(ndims >= 2 && ndims <= RUNTIME_MAX_TENSOR_DIMS);
+        uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];
+        for (uint32_t i = 0; i < ndims - 2; i++) raw_shapes[i] = shapes[i];
+        raw_shapes[ndims - 2] = shapes[ndims - 1];
+        raw_shapes[ndims - 1] = shapes[ndims - 2];
+        return Tensor(addr, buf_size, raw_shapes, shapes, zero_offsets,
+                      ndims, dtype, version, TensorLayout::DN,
+                      /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/false, manual_dep);
+    } else {
+        return Tensor(addr, buf_size, shapes, shapes, zero_offsets,
+                      ndims, dtype, version, TensorLayout::ND,
+                      /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
+    }
 }
 
 /**
@@ -54,7 +72,11 @@ static inline Tensor make_tensor_external(void* addr,
  * NO memory allocation: only records dtype, shape, and buffer.size in the Tensor struct.
  * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
  * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
+ *
+ * For DN layout, raw_shapes (physical layout) will have the last two
+ * dimensions swapped compared to the logical shapes.
  */
+template<TensorLayout Layout = TensorLayout::ND>
 static inline Tensor make_tensor(const uint32_t shapes[],
     uint32_t ndims,
     DataType dtype = DataType::FLOAT32,
@@ -65,14 +87,29 @@ static inline Tensor make_tensor(const uint32_t shapes[],
     for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
+    uint64_t buf_size = total * get_element_size(dtype);
+
+    if constexpr (Layout == TensorLayout::DN) {
+        always_assert(ndims >= 2 && ndims <= RUNTIME_MAX_TENSOR_DIMS);
+        uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];
+        for (uint32_t i = 0; i < ndims - 2; i++) raw_shapes[i] = shapes[i];
+        raw_shapes[ndims - 2] = shapes[ndims - 1];
+        raw_shapes[ndims - 1] = shapes[ndims - 2];
+        return Tensor(0, buf_size, raw_shapes, shapes, zero_offsets,
+                      ndims, dtype, version, TensorLayout::DN,
+                      /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/false, manual_dep);
+    } else {
+        return Tensor(0, buf_size, shapes, shapes, zero_offsets,
+                      ndims, dtype, version, TensorLayout::ND,
+                      /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
+    }
 }
 
 // OrchArg::to_tensor() — deferred definition (needs make_tensor_external above)
 static_assert(ORCH_ARG_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "OrchArg and runtime max dims must match");
+template<TensorLayout Layout>
 inline Tensor OrchArg::to_tensor(bool manual_dep, int32_t version) const {
-    return make_tensor_external(
+    return make_tensor_external<Layout>(
         reinterpret_cast<void*>(static_cast<uintptr_t>(tensor.data)),
         tensor.shapes, tensor.ndims, tensor.dtype,
         manual_dep, version);
