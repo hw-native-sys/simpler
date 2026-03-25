@@ -127,10 +127,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(OrchArg* o
     CYCLE_COUNT_LAP(prof_ext_tensor);
 #endif
 
-    // Prefetch first batch's block table data into cache (4 cache lines = 256 bytes)
-    for (int cl = 0; cl < N_UNROLL * (int)sizeof(int); cl += 64) {
-        __builtin_prefetch(reinterpret_cast<char*>(host_block_table) + cl, 0, 3);
-    }
+    // Prefetch first block host_context_lens data into cache
     __builtin_prefetch(&host_context_lens[0], 0, 3);
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
@@ -139,12 +136,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(OrchArg* o
         // Pre-compute block table base pointer for this batch
         int* bt_base = host_block_table + b_idx * block_num;
 
-        // Prefetch next batch's block table + context_lens while processing current batch
+        // Prefetch next block host_context_lens data while processing current batch
         if (b_idx + 1 < batch) {
-            int* bt_next = host_block_table + (b_idx + 1) * block_num;
-            for (int cl = 0; cl < N_UNROLL * (int)sizeof(int); cl += 64) {
-                __builtin_prefetch(reinterpret_cast<char*>(bt_next) + cl, 0, 3);
-            }
             __builtin_prefetch(&host_context_lens[b_idx + 1], 0, 3);
         }
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
