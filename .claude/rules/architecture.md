@@ -1,43 +1,25 @@
 # Architecture Quick Reference
 
-## Three-Program Model
+See [docs/architecture.md](../../docs/architecture.md) for the full diagram, API layers, execution flow, and handshake protocol.
 
-PTO Runtime compiles three separate programs per invocation:
-- **Host** (`.so`): Runs on host CPU. Manages device memory, builds the task graph, launches execution.
-- **AICPU** (`.so`): Runs on AICPU processor. Schedules tasks to AICore via handshake buffers.
-- **AICore** (`.o`): Runs on AICore compute cores. Executes computation kernels (add, mul, matmul, etc.).
+## Key Concepts
 
-Each program is compiled independently with its own toolchain and linked at runtime.
+- **Three programs**: Host `.so`, AICPU `.so`, AICore `.o` — compiled independently, linked at runtime
+- **Three runtimes** under `src/{arch}/runtime/`: `host_build_graph`, `aicpu_build_graph`, `tensormap_and_ringbuffer`
+- **Two platform backends** under `src/{arch}/platform/`: `onboard/` (hardware), `sim/` (simulation)
 
-## Runtime Variants
+## Build System Lookup
 
-Three runtimes under `src/{arch}/runtime/`, each providing a different graph-building strategy:
-- **`host_build_graph`** -- Host CPU builds the full task dependency graph before launching
-- **`aicpu_build_graph`** -- AICPU builds and manages the graph on-device
-- **`tensormap_and_ringbuffer`** -- Advanced runtime with tensor maps, ring buffers, shared memory, and multi-core orchestration
+| What | Where |
+|------|-------|
+| Runtime selection | `kernel_config.py` → `RUNTIME_CONFIG.runtime` |
+| Per-runtime build config | `src/{arch}/runtime/{runtime}/build_config.py` |
+| Compilation pipeline | `python/runtime_builder.py` → `runtime_compiler.py` → cmake |
+| Kernel compilation | `python/kernel_compiler.py` (one `.cpp` per `func_id`) |
+| Python bindings | `python/bindings.py` (ctypes wrappers for host `.so`) |
 
-Each runtime has a `build_config.py` declaring its include/source directories for the three components (host, aicpu, aicore). The `RUNTIME_CONFIG.runtime` field in `kernel_config.py` selects which runtime to use.
+## Example / Test Layout
 
-## Platform Backends
-
-Two backends under `src/{arch}/platform/`:
-- **`a2a3`** -- Real Ascend hardware (requires CANN toolkit, `ccec` compiler for AICore, aarch64 cross-compiler for AICPU)
-- **`a2a3sim`** -- Thread-based simulation (g++ only, no device required, runs on Linux and macOS)
-
-Shared interfaces live in `src/{arch}/platform/include/` (split into `host/`, `aicpu/`, `aicore/`, `common/`).
-Platform-specific implementations live in `src/{arch}/platform/src/` and `src/{arch}/platform/onboard/` or `src/{arch}/platform/sim/`.
-
-## Compilation Pipeline
-
-Python modules under `python/` drive the build:
-1. `kernel_compiler.py` -- compiles user-written kernel `.cpp` files (one per `func_id`)
-2. `runtime_compiler.py` -- compiles runtime sources for each component (host, aicpu, aicore)
-3. `runtime_builder.py` -- orchestrates the full build pipeline (compile + link)
-4. `bindings.py` -- provides ctypes wrappers for calling the host `.so` from Python
-
-## Example / Test Directory Layout
-
-Every example and device test follows this structure:
 ```
 my_example/
   golden.py              # generate_inputs() + compute_golden()

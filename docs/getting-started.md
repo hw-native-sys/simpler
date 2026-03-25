@@ -1,0 +1,197 @@
+# Getting Started
+
+## Cloning the Repository
+
+```bash
+git clone <repo-url>
+cd simpler
+```
+
+The pto-isa dependency will be automatically cloned when you first run an example that needs it.
+
+## PTO ISA Headers
+
+The pto-isa repository provides header files needed for kernel compilation on the `a2a3` (hardware) platform.
+
+The test framework automatically handles PTO_ISA_ROOT setup:
+1. Checks if `PTO_ISA_ROOT` is already set
+2. If not, clones pto-isa to `examples/scripts/_deps/pto-isa` on first run
+3. Passes the resolved path to the kernel compiler
+
+**Automatic Setup (Recommended):**
+Just run your example - pto-isa will be cloned automatically on first run:
+```bash
+python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_example/kernels \
+                                       -g examples/a2a3/host_build_graph/vector_example/golden.py \
+                                       -p a2a3sim
+```
+
+By default, the auto-clone uses SSH (`git@github.com:...`). In CI or environments without SSH keys, use `--clone-protocol https`:
+```bash
+python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_example/kernels \
+                                       -g examples/a2a3/host_build_graph/vector_example/golden.py \
+                                       -p a2a3sim --clone-protocol https
+```
+
+**Manual Setup** (if auto-setup fails or you prefer manual control):
+```bash
+mkdir -p examples/scripts/_deps
+git clone --branch main git@github.com:PTO-ISA/pto-isa.git examples/scripts/_deps/pto-isa
+
+# Or use HTTPS
+git clone --branch main https://github.com/PTO-ISA/pto-isa.git examples/scripts/_deps/pto-isa
+
+# Set environment variable (optional - auto-detected if in standard location)
+export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa
+```
+
+**Using a Different Location:**
+```bash
+export PTO_ISA_ROOT=/path/to/your/pto-isa
+```
+
+**Troubleshooting:**
+- If git is not available: Clone pto-isa manually and set `PTO_ISA_ROOT`
+- If clone fails due to network: Try again or clone manually
+- If SSH clone fails (e.g., in CI): Use `--clone-protocol https` or clone manually with HTTPS
+
+Note: For the simulation platform (`a2a3sim`), PTO ISA headers are optional and only needed if your kernels use PTO ISA intrinsics.
+
+## Prerequisites
+
+- CMake 3.15+
+- CANN toolkit with:
+  - `ccec` compiler (AICore Bisheng CCE)
+  - Cross-compiler for AICPU (aarch64-target-linux-gnu-gcc/g++)
+- Standard C/C++ compiler (gcc/g++) for host
+- Python 3 with development headers
+
+## Environment Setup
+
+```bash
+source /usr/local/Ascend/ascend-toolkit/latest/bin/setenv.bash
+export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
+```
+
+## Build Process
+
+The **RuntimeCompiler** class handles compilation of all three components separately:
+
+```python
+from runtime_compiler import RuntimeCompiler
+
+# For real Ascend hardware (requires CANN toolkit)
+compiler = RuntimeCompiler(platform="a2a3")
+
+# For simulation (no Ascend SDK needed)
+compiler = RuntimeCompiler(platform="a2a3sim")
+
+# Compile each component to independent binaries
+aicore_binary = compiler.compile("aicore", include_dirs, source_dirs)    # → .o file
+aicpu_binary = compiler.compile("aicpu", include_dirs, source_dirs)      # → .so file
+host_binary = compiler.compile("host", include_dirs, source_dirs)        # → .so file
+```
+
+**Toolchains used:**
+- **AICore**: Bisheng CCE (`ccec` compiler) → `.o` object file (a2a3 only)
+- **AICPU**: aarch64 cross-compiler → `.so` shared object (a2a3 only)
+- **Host**: Standard gcc/g++ → `.so` shared library
+- **HostSim**: Standard gcc/g++ for all targets (a2a3sim)
+
+## Quick Start
+
+### Running an Example
+
+```bash
+# Simulation platform (no hardware required)
+python examples/scripts/run_example.py \
+  -k examples/a2a3/host_build_graph/vector_example/kernels \
+  -g examples/a2a3/host_build_graph/vector_example/golden.py \
+  -p a2a3sim
+
+# Hardware platform (requires Ascend device)
+python examples/scripts/run_example.py \
+  -k examples/a2a3/host_build_graph/vector_example/kernels \
+  -g examples/a2a3/host_build_graph/vector_example/golden.py \
+  -p a2a3
+```
+
+Expected output:
+```
+=== Building Runtime: host_build_graph (platform: a2a3sim) ===
+...
+=== Comparing Results ===
+Comparing f: shape=(16384,), dtype=float32
+  f: PASS (16384/16384 elements matched)
+
+============================================================
+TEST PASSED
+============================================================
+```
+
+### Python API Example
+
+```python
+from bindings import bind_host_binary
+from runtime_compiler import RuntimeCompiler
+
+# Compile all binaries
+compiler = RuntimeCompiler()
+aicore_bin = compiler.compile("aicore", [...include_dirs...], [...source_dirs...])
+aicpu_bin = compiler.compile("aicpu", [...include_dirs...], [...source_dirs...])
+host_bin = compiler.compile("host", [...include_dirs...], [...source_dirs...])
+
+# Load and initialize runtime
+Runtime = bind_host_binary(host_bin)
+runtime = Runtime()
+runtime.initialize()
+
+# Execute runtime on device
+launch_runtime(runtime,
+               aicpu_thread_num=1,
+               block_dim=1,
+               device_id=9,
+               aicpu_binary=aicpu_bin,
+               aicore_binary=aicore_bin)
+
+runtime.finalize()
+```
+
+## Configuration
+
+### Compile-time Configuration (Runtime Limits)
+In `src/{arch}/runtime/host_build_graph/runtime/runtime.h`:
+```cpp
+#define RUNTIME_MAX_TASKS 131072   // Maximum number of tasks
+#define RUNTIME_MAX_ARGS 16        // Maximum arguments per task
+#define RUNTIME_MAX_FANOUT 512     // Maximum successors per task
+```
+
+### Runtime Configuration
+```python
+runner.init(
+    device_id=0,              # Device ID (0-15)
+    num_cores=3,              # Number of cores for handshake
+    aicpu_binary=...,         # AICPU .so binary
+    aicore_binary=...,        # AICore .o binary
+    pto_isa_root="/path/to/pto-isa"  # PTO-ISA headers location
+)
+```
+
+## Notes
+
+- **Device IDs**: 0-15 (typically device 9 used for examples)
+- **Handshake cores**: Usually 3 (1c2v configuration: 1 core, 2 vector units)
+- **Kernel compilation**: Requires `ASCEND_HOME_PATH` environment variable
+- **Memory management**: MemoryAllocator automatically tracks allocations
+- **Python requirement**: NumPy for efficient array operations
+
+## Logging
+
+Device logs written to `~/ascend/log/debug/device-<id>/`
+
+Kernel uses macros:
+- `DEV_INFO`: Informational messages
+- `DEV_DEBUG`: Debug messages
+- `DEV_WARN`: Warnings
+- `DEV_ERROR`: Error messages

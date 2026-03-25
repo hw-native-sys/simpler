@@ -1,24 +1,14 @@
 # Developer Guidelines
 
+See [docs/developer-guide.md](docs/developer-guide.md) for full directory structure, compilation pipeline, and conventions.
+
 ## Directory Ownership
 
-Each developer role has a designated working directory. Stay within your assigned area unless explicitly requested by the user.
-
-### Platform Developer
-- **Working directory**: `src/{arch}/platform/` (e.g., `src/a2a3/platform/`)
-- Write platform-specific logic and abstractions here
-
-### Runtime Developer
-- **Working directory**: `src/{arch}/runtime/` (e.g., `src/a2a3/runtime/`)
-- Write runtime logic including host, aicpu, aicore, and common modules here
-
-### Codegen Developer
-- **Working directory**: `examples/`
-- Write code generation examples and kernel implementations here
-
-## Architecture
-
-PTO Runtime compiles three independent programs (Host `.so`, AICPU `.so`, AICore `.o`) that communicate through handshake buffers on Ascend NPU devices. Three runtime variants live under `src/{arch}/runtime/` (`host_build_graph`, `aicpu_build_graph`, `tensormap_and_ringbuffer`), two platform backends under `src/{arch}/platform/` (`onboard/` = hardware, `sim/` = simulation). See `README.md` for the full architecture diagram.
+| Role | Working directory |
+|------|-------------------|
+| Platform Developer | `src/{arch}/platform/` |
+| Runtime Developer | `src/{arch}/runtime/` |
+| Codegen Developer | `examples/` |
 
 ## Common Commands
 
