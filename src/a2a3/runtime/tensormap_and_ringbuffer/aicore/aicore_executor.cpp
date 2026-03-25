@@ -29,7 +29,7 @@ __aicore__ __attribute__((always_inline)) static void execute_task(
 
     UnifiedKernelFunc kernel = (UnifiedKernelFunc)payload->function_bin_addr;
     kernel(reinterpret_cast<__gm__ int64_t*>(payload->args));
-    FULL_MEMORY_BARRIER();
+    dcci(payload, ENTIRE_DATA_CACHE, CACHELINE_OUT);
 }
 
 /**
