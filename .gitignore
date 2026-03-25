@@ -30,3 +30,6 @@ tmp
 
 # Local issue tracking (per-developer, not shared)
 KNOWN_ISSUES.md
+
+# Generated compilation database (clangd)
+compile_commands.json
