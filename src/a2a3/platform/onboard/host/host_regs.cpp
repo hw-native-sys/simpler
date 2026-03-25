@@ -164,6 +164,7 @@ int init_aicore_register_addresses(
     int ret = rtMemcpy(reg_ptr, regs_size, host_regs.data(), regs_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (ret != 0) {
         LOG_ERROR("Failed to copy register addresses to device (rc=%d)", ret);
+        allocator.free(reg_ptr);
         return -1;
     }
 

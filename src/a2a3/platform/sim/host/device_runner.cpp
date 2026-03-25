@@ -16,6 +16,7 @@
 
 #include "device_runner.h"
 #include "aicpu/platform_aicpu_affinity.h"
+#include "host/raii_scope_guard.h"
 
 // Function pointer types for dynamically loaded executors
 typedef int (*aicpu_execute_func_t)(Runtime* runtime);
@@ -241,6 +242,13 @@ int DeviceRunner::run(Runtime& runtime,
         perf_collector_.start_memory_manager();
     }
 
+    auto perf_cleanup = RAIIScopeGuard([this]() {
+        bool was_initialized = perf_collector_.is_initialized();
+        if (was_initialized) {
+            perf_collector_.stop_memory_manager();
+        }
+    });
+
     // Allocate simulated register blocks for all AICore cores
     size_t total_reg_size = num_aicore * SIM_REG_BLOCK_SIZE;
     void* reg_blocks = mem_alloc_.alloc(total_reg_size);
@@ -249,6 +257,10 @@ int DeviceRunner::run(Runtime& runtime,
         return -1;
     }
     std::memset(reg_blocks, 0, total_reg_size);
+
+    auto reg_blocks_cleanup = RAIIScopeGuard([this, reg_blocks]() {
+        mem_alloc_.free(reg_blocks);
+    });
 
     // Build array of per-core register base addresses
     size_t regs_array_size = num_aicore * sizeof(uint64_t);
@@ -262,6 +274,13 @@ int DeviceRunner::run(Runtime& runtime,
             static_cast<uint8_t*>(reg_blocks) + i * SIM_REG_BLOCK_SIZE);
     }
     kernel_args_.regs = reinterpret_cast<uint64_t>(regs_array);
+
+    auto regs_array_cleanup = RAIIScopeGuard([this]() {
+        if (kernel_args_.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.regs));
+            kernel_args_.regs = 0;
+        }
+    });
 
     LOG_INFO("Allocated simulated registers: %d cores x 0x%x bytes", num_aicore, SIM_REG_BLOCK_SIZE);
 
