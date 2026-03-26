@@ -144,6 +144,42 @@ get_platform_runtimes() {
     echo ""
 }
 
+# =============================================================================
+# Stage: Unit Tests (always run, no hardware or simulation needed)
+# =============================================================================
+
+SIMPLER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Python unit tests
+if [[ -d "tests/unit" ]]; then
+    echo "=== Running Python Unit Tests ==="
+    if ! pytest tests/unit/ -v --tb=short; then
+        echo "PYTHON UNIT TESTS FAILED"
+        OVERALL_EXIT=1
+    fi
+fi
+
+# C++ unit tests (GoogleTest)
+if [[ -d "tests/cpp" && -f "tests/cpp/CMakeLists.txt" ]]; then
+    echo "=== Running C++ Unit Tests ==="
+    CPP_BUILD_DIR="$SIMPLER_ROOT/tests/cpp/build"
+    mkdir -p "$CPP_BUILD_DIR"
+    if cmake -S "$SIMPLER_ROOT/tests/cpp" -B "$CPP_BUILD_DIR" -DCMAKE_BUILD_TYPE=Release 2>&1 && \
+       cmake --build "$CPP_BUILD_DIR" -j"$(nproc)" 2>&1; then
+        if ! ctest --test-dir "$CPP_BUILD_DIR" --output-on-failure; then
+            echo "C++ UNIT TESTS FAILED"
+            OVERALL_EXIT=1
+        fi
+    else
+        echo "C++ UNIT TEST BUILD FAILED"
+        OVERALL_EXIT=1
+    fi
+fi
+
+# =============================================================================
+# Stage: Integration Tests (pytest with platform-specific tests)
+# =============================================================================
+
 # Run pytest synchronously first
 # Skip pytest for all simulation platforms (a2a3sim, a5sim, etc.)
 if [[ -d "tests" && "$OS" == "Linux" && ! "$PLATFORM" =~ sim$ ]]; then
