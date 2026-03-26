@@ -58,23 +58,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 # =============================================================================
-# TaskArg constants — struct definition lives in bindings.py (single source)
+# TaskArg construction — uses nanobind bindings from task_interface
 # =============================================================================
 
-TASK_ARG_KIND_TENSOR = 0
-TASK_ARG_KIND_SCALAR = 1
-
-# Maps torch dtype → DataType enum value (must match data_type.h)
-TASK_ARG_DTYPE_MAP = {
-    torch.float32: 0,
-    torch.float16: 1,
-    torch.int32: 2,
-    torch.int16: 3,
-    torch.int8: 4,
-    torch.uint8: 5,
-    torch.bfloat16: 6,
-    torch.int64: 7,
-}
+from task_interface import (
+    TaskArgArray,
+    make_tensor_arg,
+    make_scalar_arg,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -444,7 +435,7 @@ class CodeRunner:
 
     This class automates:
     - Loading kernel_config.py and golden.py dynamically
-    - Building TaskArgC array automatically from torch tensors
+    - Building TaskArgArray automatically from torch tensors
     - Converting numpy arrays to torch tensors
     - Separating inputs and outputs based on naming convention
     - Running the full test flow
@@ -581,7 +572,7 @@ class CodeRunner:
         self, args_list: list
     ) -> Tuple[list, List[int], List[int], Dict[str, Any], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Build TaskArgC array from an explicit argument list returned by generate_inputs.
+        Build TaskArgArray from an explicit argument list returned by generate_inputs.
 
         Every element must be a (name, value) pair where value is either:
         - torch.Tensor / numpy array: a tensor argument
@@ -595,7 +586,7 @@ class CodeRunner:
             where args contains all named items, inputs/outputs contain tensor-only subsets.
         """
         import numpy as np
-        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR, TaskArgC, TaskArgC
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR
 
         if not self.output_names:
             raise ValueError(
@@ -610,7 +601,7 @@ class CodeRunner:
         # Tensors in both generate_inputs and __outputs__ are INOUT
         inout_set = output_set & all_tensor_names
 
-        orch_args = []
+        orch_args = TaskArgArray()
         arg_types = []
         arg_sizes = []
         args = {}    # all named items: tensors + scalars → passed to compute_golden
@@ -632,17 +623,7 @@ class CodeRunner:
                 tensor = tensor.cpu().contiguous()
                 args[name] = tensor
 
-                # Build TaskArg with tensor metadata
-                arg = TaskArgC()
-                arg.kind = TASK_ARG_KIND_TENSOR
-                arg.u.tensor.data = tensor.data_ptr()
-                arg.u.tensor.ndims = tensor.ndim
-                if tensor.dtype not in TASK_ARG_DTYPE_MAP:
-                    raise ValueError(f"Unsupported tensor dtype for TaskArg: {tensor.dtype}")
-                arg.u.tensor.dtype = TASK_ARG_DTYPE_MAP[tensor.dtype]
-                for i, s in enumerate(tensor.shape):
-                    arg.u.tensor.shapes[i] = s
-                orch_args.append(arg)
+                orch_args.append(make_tensor_arg(tensor))
 
                 nbytes = tensor.element_size() * tensor.numel()
                 arg_sizes.append(nbytes)
@@ -658,15 +639,7 @@ class CodeRunner:
                     inputs[name] = tensor
 
             elif isinstance(value, ctypes._SimpleCData):
-                arg = TaskArgC()
-                arg.kind = TASK_ARG_KIND_SCALAR
-                if isinstance(value, (ctypes.c_float, ctypes.c_double)):
-                    uint_type = ctypes.c_uint32 if isinstance(value, ctypes.c_float) else ctypes.c_uint64
-                    bits = uint_type.from_buffer_copy(value).value
-                    arg.u.scalar = bits
-                else:
-                    arg.u.scalar = int(value.value) & 0xFFFFFFFFFFFFFFFF
-                orch_args.append(arg)
+                orch_args.append(make_scalar_arg(value))
                 args[name] = value.value
                 arg_types.append(ARG_SCALAR)
                 arg_sizes.append(0)
@@ -700,7 +673,7 @@ class CodeRunner:
         Returns:
             Tuple of (orch_args, arg_types, arg_sizes)
         """
-        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR, TaskArgC
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR
 
         # Determine tensor order
         if self.tensor_order:
@@ -726,23 +699,14 @@ class CodeRunner:
                 )
             tensors[name] = tensors[name].cpu().contiguous()
 
-        orch_args = []
+        orch_args = TaskArgArray()
         arg_types = []
         arg_sizes = []
 
         # Add tensor pointers
         for name in order:
             tensor = tensors[name]
-
-            arg = TaskArgC()
-            arg.kind = TASK_ARG_KIND_TENSOR
-            arg.u.tensor.data = tensor.data_ptr()
-            arg.u.tensor.ndims = tensor.ndim
-            if tensor.dtype in TASK_ARG_DTYPE_MAP:
-                arg.u.tensor.dtype = TASK_ARG_DTYPE_MAP[tensor.dtype]
-            for i, s in enumerate(tensor.shape):
-                arg.u.tensor.shapes[i] = s
-            orch_args.append(arg)
+            orch_args.append(make_tensor_arg(tensor))
 
             if name in inout_set:
                 arg_types.append(ARG_INOUT_PTR)
@@ -756,19 +720,13 @@ class CodeRunner:
         # Add sizes (as scalars)
         for name in order:
             tensor = tensors[name]
-            arg = TaskArgC()
-            arg.kind = TASK_ARG_KIND_SCALAR
-            arg.u.scalar = tensor.element_size() * tensor.numel()
-            orch_args.append(arg)
+            orch_args.append(make_scalar_arg(tensor.element_size() * tensor.numel()))
             arg_types.append(ARG_SCALAR)
             arg_sizes.append(0)
 
         # Add element count (as scalar)
         count = tensors[order[0]].numel()
-        arg = TaskArgC()
-        arg.kind = TASK_ARG_KIND_SCALAR
-        arg.u.scalar = count
-        orch_args.append(arg)
+        orch_args.append(make_scalar_arg(count))
         arg_types.append(ARG_SCALAR)
         arg_sizes.append(0)
 

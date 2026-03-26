@@ -282,8 +282,16 @@ class Runtime:
         orch_args = orch_args or []
         orch_args_count = len(orch_args)
 
-        # Convert orch_args to ctypes array
-        if orch_args_count > 0:
+        # Convert orch_args to ctypes array.
+        # Accept either a nanobind TaskArgArray (from task_interface) or a
+        # plain list of TaskArgC structs.
+        from _task_interface import TaskArgArray as _NbTaskArgArray
+
+        if isinstance(orch_args, _NbTaskArgArray):
+            orch_args_array = cast(orch_args.ctypes_ptr(), POINTER(TaskArgC)) if orch_args_count > 0 else None
+            # Prevent GC of the nanobind array while the ctypes pointer is live
+            self._nb_args_ref = orch_args
+        elif orch_args_count > 0:
             orch_args_array = (TaskArgC * orch_args_count)(*orch_args)
         else:
             orch_args_array = None

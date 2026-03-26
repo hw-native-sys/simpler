@@ -144,16 +144,6 @@ get_platform_runtimes() {
     echo ""
 }
 
-# Run pytest synchronously first
-# Skip pytest for all simulation platforms (a2a3sim, a5sim, etc.)
-if [[ -d "tests" && "$OS" == "Linux" && ! "$PLATFORM" =~ sim$ ]]; then
-    echo "Running pytest tests for platform: $PLATFORM..."
-    if ! pytest tests -v --platform="$PLATFORM"; then
-        echo "PYTEST FAILED"
-        OVERALL_EXIT=1
-    fi
-fi
-
 # Setup temp directory for logs and results
 LOG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/ci_parallel_$$.XXXXXX")
 RESULTS_FILE="${LOG_DIR}/results.txt"

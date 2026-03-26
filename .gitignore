@@ -33,3 +33,7 @@ KNOWN_ISSUES.md
 
 # Generated compilation database (clangd)
 compile_commands.json
+
+# Built nanobind extensions
+python/_task_interface*.so
+python/_task_interface*.dylib

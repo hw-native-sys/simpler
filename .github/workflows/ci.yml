@@ -9,6 +9,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  pytest:
+    runs-on: self-hosted
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build nanobind extension
+        run: pip install .
+
+      - name: Run pytest
+        run: pytest tests -v
+
   run-example-on-a2a3sim:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
@@ -55,6 +68,9 @@ jobs:
           pip install ml_dtypes
           pip install pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Build nanobind extension
+        run: pip install .
 
       - name: Run simulation examples (a2a3sim)
         run: ./ci.sh -p a2a3sim -c 6622890 -t 600 --clone-protocol https
@@ -106,6 +122,9 @@ jobs:
           pip install pytest
           pip install torch --index-url https://download.pytorch.org/whl/cpu
 
+      - name: Build nanobind extension
+        run: pip install .
+
       - name: Run simulation examples (a5sim)
         run: ./ci.sh -p a5sim -c 6622890 -t 600 --clone-protocol https
 
@@ -116,6 +135,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+
+      - name: Build nanobind extension
+        run: pip install .
 
       - name: Run on-device examples
         run: |
