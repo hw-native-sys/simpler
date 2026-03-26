@@ -11,7 +11,7 @@ Covers all 5 resource shapes per iteration:
 All use 128x128 float32 tiles, repeated over num_iters slices.
 
 Args layout (15 args): [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O]
-  Shape/dtype/size in OrchArg metadata.
+  Shape/dtype/size in TaskArg metadata.
 """
 
 import torch

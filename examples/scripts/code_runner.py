@@ -58,14 +58,14 @@ from typing import Any, Dict, List, Optional, Tuple
 import torch
 
 # =============================================================================
-# OrchArg constants — struct definition lives in bindings.py (single source)
+# TaskArg constants — struct definition lives in bindings.py (single source)
 # =============================================================================
 
-ORCH_ARG_KIND_TENSOR = 0
-ORCH_ARG_KIND_SCALAR = 1
+TASK_ARG_KIND_TENSOR = 0
+TASK_ARG_KIND_SCALAR = 1
 
 # Maps torch dtype → DataType enum value (must match data_type.h)
-ORCH_ARG_DTYPE_MAP = {
+TASK_ARG_DTYPE_MAP = {
     torch.float32: 0,
     torch.float16: 1,
     torch.int32: 2,
@@ -444,7 +444,7 @@ class CodeRunner:
 
     This class automates:
     - Loading kernel_config.py and golden.py dynamically
-    - Building OrchArgC array automatically from torch tensors
+    - Building TaskArgC array automatically from torch tensors
     - Converting numpy arrays to torch tensors
     - Separating inputs and outputs based on naming convention
     - Running the full test flow
@@ -581,7 +581,7 @@ class CodeRunner:
         self, args_list: list
     ) -> Tuple[list, List[int], List[int], Dict[str, Any], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
         """
-        Build OrchArgC array from an explicit argument list returned by generate_inputs.
+        Build TaskArgC array from an explicit argument list returned by generate_inputs.
 
         Every element must be a (name, value) pair where value is either:
         - torch.Tensor / numpy array: a tensor argument
@@ -595,7 +595,7 @@ class CodeRunner:
             where args contains all named items, inputs/outputs contain tensor-only subsets.
         """
         import numpy as np
-        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR, OrchArgC, OrchArgC
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR, TaskArgC, TaskArgC
 
         if not self.output_names:
             raise ValueError(
@@ -632,14 +632,14 @@ class CodeRunner:
                 tensor = tensor.cpu().contiguous()
                 args[name] = tensor
 
-                # Build OrchArg with tensor metadata
-                arg = OrchArgC()
-                arg.kind = ORCH_ARG_KIND_TENSOR
+                # Build TaskArg with tensor metadata
+                arg = TaskArgC()
+                arg.kind = TASK_ARG_KIND_TENSOR
                 arg.u.tensor.data = tensor.data_ptr()
                 arg.u.tensor.ndims = tensor.ndim
-                if tensor.dtype not in ORCH_ARG_DTYPE_MAP:
-                    raise ValueError(f"Unsupported tensor dtype for OrchArg: {tensor.dtype}")
-                arg.u.tensor.dtype = ORCH_ARG_DTYPE_MAP[tensor.dtype]
+                if tensor.dtype not in TASK_ARG_DTYPE_MAP:
+                    raise ValueError(f"Unsupported tensor dtype for TaskArg: {tensor.dtype}")
+                arg.u.tensor.dtype = TASK_ARG_DTYPE_MAP[tensor.dtype]
                 for i, s in enumerate(tensor.shape):
                     arg.u.tensor.shapes[i] = s
                 orch_args.append(arg)
@@ -658,8 +658,8 @@ class CodeRunner:
                     inputs[name] = tensor
 
             elif isinstance(value, ctypes._SimpleCData):
-                arg = OrchArgC()
-                arg.kind = ORCH_ARG_KIND_SCALAR
+                arg = TaskArgC()
+                arg.kind = TASK_ARG_KIND_SCALAR
                 if isinstance(value, (ctypes.c_float, ctypes.c_double)):
                     uint_type = ctypes.c_uint32 if isinstance(value, ctypes.c_float) else ctypes.c_uint64
                     bits = uint_type.from_buffer_copy(value).value
@@ -700,7 +700,7 @@ class CodeRunner:
         Returns:
             Tuple of (orch_args, arg_types, arg_sizes)
         """
-        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR, OrchArgC
+        from bindings import ARG_SCALAR, ARG_INPUT_PTR, ARG_OUTPUT_PTR, ARG_INOUT_PTR, TaskArgC
 
         # Determine tensor order
         if self.tensor_order:
@@ -734,12 +734,12 @@ class CodeRunner:
         for name in order:
             tensor = tensors[name]
 
-            arg = OrchArgC()
-            arg.kind = ORCH_ARG_KIND_TENSOR
+            arg = TaskArgC()
+            arg.kind = TASK_ARG_KIND_TENSOR
             arg.u.tensor.data = tensor.data_ptr()
             arg.u.tensor.ndims = tensor.ndim
-            if tensor.dtype in ORCH_ARG_DTYPE_MAP:
-                arg.u.tensor.dtype = ORCH_ARG_DTYPE_MAP[tensor.dtype]
+            if tensor.dtype in TASK_ARG_DTYPE_MAP:
+                arg.u.tensor.dtype = TASK_ARG_DTYPE_MAP[tensor.dtype]
             for i, s in enumerate(tensor.shape):
                 arg.u.tensor.shapes[i] = s
             orch_args.append(arg)
@@ -756,8 +756,8 @@ class CodeRunner:
         # Add sizes (as scalars)
         for name in order:
             tensor = tensors[name]
-            arg = OrchArgC()
-            arg.kind = ORCH_ARG_KIND_SCALAR
+            arg = TaskArgC()
+            arg.kind = TASK_ARG_KIND_SCALAR
             arg.u.scalar = tensor.element_size() * tensor.numel()
             orch_args.append(arg)
             arg_types.append(ARG_SCALAR)
@@ -765,8 +765,8 @@ class CodeRunner:
 
         # Add element count (as scalar)
         count = tensors[order[0]].numel()
-        arg = OrchArgC()
-        arg.kind = ORCH_ARG_KIND_SCALAR
+        arg = TaskArgC()
+        arg.kind = TASK_ARG_KIND_SCALAR
         arg.u.scalar = count
         orch_args.append(arg)
         arg_types.append(ARG_SCALAR)
@@ -830,7 +830,8 @@ class CodeRunner:
             arch = "a2a3"
 
         runtime_include_dirs = [
-            os.path.join(self.project_root, "src", arch, "runtime", self.runtime_name, "runtime")
+            os.path.join(self.project_root, "src", arch, "runtime", self.runtime_name, "runtime"),
+            os.path.join(self.project_root, "src", "common", "task_interface"),
         ]
 
         def _build_runtime():

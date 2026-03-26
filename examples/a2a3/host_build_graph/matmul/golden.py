@@ -16,7 +16,7 @@ Computation:
     where A = e^4 (128x128, float16), W1 = W2 = 1/256 (128x128, float16)
     Result: F = exp(2) ~ 7.389
 
-Args layout: [a, w1, w2, f] — shape/dtype/size in OrchArg metadata
+Args layout: [a, w1, w2, f] — shape/dtype/size in TaskArg metadata
 """
 
 import torch

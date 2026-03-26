@@ -19,7 +19,7 @@
  */
 
 #include "runtime.h"
-#include "orch_arg.h"
+#include "task_arg.h"
 #include <iostream>
 #include <vector>
 
@@ -33,7 +33,7 @@ constexpr int BATCH = 1;
 
 constexpr size_t TILE_BYTES = TILE * TILE * sizeof(float);
 
-int build_bgemm_graph(Runtime* runtime, const OrchArg* orch_args, int arg_count) {
+int build_bgemm_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count) {
     // Expected orch_args: [A, B, C] — 3 tensors
     if (arg_count < 3) {
         std::cerr << "build_bgemm_graph: Expected at least 3 args, got " << arg_count << '\n';

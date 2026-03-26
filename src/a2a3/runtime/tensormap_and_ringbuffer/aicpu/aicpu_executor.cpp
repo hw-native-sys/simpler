@@ -48,12 +48,12 @@
 // Device orchestration function signature (loaded via dlopen).
 // The executor binds the current thread's PTO2Runtime into orchestration TLS
 // before calling the user entry.
-typedef void (*DeviceOrchestrationFunc)(OrchArg* orch_args,
+typedef void (*DeviceOrchestrationFunc)(TaskArg* orch_args,
                                         int32_t orch_thread_num, int32_t orch_thread_index);
 typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime* rt);
 
 // Config function exported by orchestration .so
-typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(OrchArg* orch_args);
+typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(TaskArg* orch_args);
 
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int32_t MAX_AIC_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD;
@@ -311,7 +311,7 @@ struct AicpuExecutor {
     // Shared orchestration function pointer (loaded by first orch thread, used by all)
     DeviceOrchestrationFunc orch_func_{nullptr};
     DeviceOrchestrationBindRuntimeFunc orch_bind_runtime_{nullptr};
-    OrchArg* orch_args_cached_{nullptr};
+    TaskArg* orch_args_cached_{nullptr};
 
     uint64_t* func_id_to_addr_;
     uint64_t get_function_bin_addr(int func_id) const {
@@ -1682,11 +1682,11 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     bind_runtime_func = nullptr;
                 }
 
-                OrchArg* args = runtime->get_orch_args();
+                TaskArg* args = runtime->get_orch_args();
                 int32_t arg_count = runtime->get_orch_arg_count();
                 DEV_INFO("Thread %d: sm_ptr=%p, arg_count=%d", thread_idx, runtime->get_pto2_gm_sm_ptr(), arg_count);
                 for (int32_t i = 0; i < arg_count && i < 20; i++) {
-                    if (args[i].kind == OrchArgKind::TENSOR) {
+                    if (args[i].kind == TaskArgKind::TENSOR) {
                         DEV_INFO("Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)",
                                  thread_idx, i, (unsigned long)args[i].tensor.data, args[i].tensor.ndims, (unsigned)args[i].tensor.dtype);
                     } else {

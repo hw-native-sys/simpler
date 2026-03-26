@@ -10,7 +10,7 @@
  *
  * Args layout (15 args):
  *   [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O]
- *   Shape/dtype/size in OrchArg metadata.
+ *   Shape/dtype/size in TaskArg metadata.
  */
 
 #include <stddef.h>
@@ -31,7 +31,7 @@ static constexpr uint32_t TILE_ELEMS = 128 * 128;
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 15,
@@ -39,28 +39,28 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
-    // Input tensors use to_tensor() — golden shape = kernel shape
-    Tensor ext_A = orch_args[0].to_tensor();
-    Tensor ext_B = orch_args[1].to_tensor();
-    Tensor ext_D = orch_args[3].to_tensor();
-    Tensor ext_E = orch_args[4].to_tensor();
-    Tensor ext_G = orch_args[6].to_tensor();
-    Tensor ext_H = orch_args[7].to_tensor();
+    // Input tensors use from_task_arg() — golden shape = kernel shape
+    Tensor ext_A = from_task_arg(orch_args[0]);
+    Tensor ext_B = from_task_arg(orch_args[1]);
+    Tensor ext_D = from_task_arg(orch_args[3]);
+    Tensor ext_E = from_task_arg(orch_args[4]);
+    Tensor ext_G = from_task_arg(orch_args[6]);
+    Tensor ext_H = from_task_arg(orch_args[7]);
 
     // Output tensors — full buffers
-    Tensor ext_C = orch_args[2].to_tensor();
-    Tensor ext_F = orch_args[5].to_tensor();
-    Tensor ext_I = orch_args[8].to_tensor();
-    Tensor ext_J = orch_args[9].to_tensor();
-    Tensor ext_K = orch_args[10].to_tensor();
-    Tensor ext_L = orch_args[11].to_tensor();
-    Tensor ext_M = orch_args[12].to_tensor();
-    Tensor ext_N = orch_args[13].to_tensor();
-    Tensor ext_O = orch_args[14].to_tensor();
+    Tensor ext_C = from_task_arg(orch_args[2]);
+    Tensor ext_F = from_task_arg(orch_args[5]);
+    Tensor ext_I = from_task_arg(orch_args[8]);
+    Tensor ext_J = from_task_arg(orch_args[9]);
+    Tensor ext_K = from_task_arg(orch_args[10]);
+    Tensor ext_L = from_task_arg(orch_args[11]);
+    Tensor ext_M = from_task_arg(orch_args[12]);
+    Tensor ext_N = from_task_arg(orch_args[13]);
+    Tensor ext_O = from_task_arg(orch_args[14]);
 
     // Derive num_iters from output tensor size
     uint32_t total_elems = orch_args[2].tensor.shapes[0];

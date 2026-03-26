@@ -11,7 +11,7 @@
  *       t3 (add+exp, AIV)
  *
  * This orchestration function:
- * 1. Receives OrchArg array with tensor metadata (pointers, shapes, dtypes)
+ * 1. Receives TaskArg array with tensor metadata (pointers, shapes, dtypes)
  * 2. Allocates device memory via runtime->host_api
  * 3. Copies input data to device via runtime->host_api
  * 4. Records output tensor for copy-back during finalize
@@ -19,13 +19,13 @@
  */
 
 #include "runtime.h"
-#include "orch_arg.h"
+#include "task_arg.h"
 #include <iostream>
 #include <cstdint>
 
 extern "C" {
 
-int build_matmul_graph(Runtime* runtime, const OrchArg* orch_args, int arg_count) {
+int build_matmul_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count) {
     // Validate argument count
     // Expected orch_args: [a, w1, w2, f] — 4 tensors
     if (arg_count < 4) {
@@ -33,7 +33,7 @@ int build_matmul_graph(Runtime* runtime, const OrchArg* orch_args, int arg_count
         return -1;
     }
 
-    // Extract host pointers and sizes from OrchArg metadata
+    // Extract host pointers and sizes from TaskArg metadata
     void* host_a  = orch_args[0].data<void>();
     void* host_w1 = orch_args[1].data<void>();
     void* host_w2 = orch_args[2].data<void>();

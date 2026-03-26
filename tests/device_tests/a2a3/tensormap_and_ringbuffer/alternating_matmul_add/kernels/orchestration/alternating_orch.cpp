@@ -3,7 +3,7 @@
  *
  * Submits independent matmul and add tasks per batch.
  *
- * Configuration read from scalar OrchArgs:
+ * Configuration read from scalar TaskArgs:
  *   - batch: Number of batches
  *   - M: Number of matmul tasks per batch
  *   - N: Number of add tasks per batch
@@ -30,7 +30,7 @@ static constexpr uint64_t ADD_ELEMS = 128 * 128;
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 11,
@@ -38,14 +38,14 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     // Tensor args
-    Tensor ext_A = orch_args[0].to_tensor();
-    Tensor ext_B = orch_args[1].to_tensor();
-    Tensor ext_C = orch_args[2].to_tensor();
-    Tensor ext_X = orch_args[3].to_tensor();
-    Tensor ext_Y = orch_args[4].to_tensor();
-    Tensor ext_Z = orch_args[5].to_tensor();
+    Tensor ext_A = from_task_arg(orch_args[0]);
+    Tensor ext_B = from_task_arg(orch_args[1]);
+    Tensor ext_C = from_task_arg(orch_args[2]);
+    Tensor ext_X = from_task_arg(orch_args[3]);
+    Tensor ext_Y = from_task_arg(orch_args[4]);
+    Tensor ext_Z = from_task_arg(orch_args[5]);
 
     // Scalar config args
     int batch = (int)orch_args[6].scalar;

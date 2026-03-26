@@ -56,7 +56,10 @@ See [tensormap_and_ringbuffer/docs/](../runtime/tensormap_and_ringbuffer/docs/):
 
 ## Shared Components
 
-Files shared identically across runtimes are extracted to `src/a2a3/runtime/common/`:
+Runtime-specific shared files are in `src/a2a3/runtime/common/`:
 - `pto_ring_buffer.h/cpp` — Ring buffer data structures (HeapRing, TaskRing, DepListPool)
 - `pto_submit_types.h` — Subtask types, MixedKernels, ResourceShape
-- `orch_arg.h` — Orchestration argument tagged union
+
+Cross-architecture shared files are in `src/common/task_interface/`:
+- `data_type.h` — DataType enum and element size helpers
+- `task_arg.h` — Task argument tagged union (host↔device data interface)

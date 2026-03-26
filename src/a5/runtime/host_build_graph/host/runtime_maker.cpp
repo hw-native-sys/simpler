@@ -14,7 +14,7 @@
  */
 
 #include "runtime.h"  // Includes unified_log.h and provides LOG_* macros
-#include "orch_arg.h"
+#include "task_arg.h"
 #include <stdint.h>
 #include <stddef.h>
 #include <cstddef>
@@ -29,11 +29,11 @@
  * Orchestration function signature.
  *
  * @param runtime    Pointer to Runtime to populate with tasks
- * @param orch_args  OrchArg array with tensor metadata + scalar values
- * @param arg_count  Total number of OrchArg entries
+ * @param orch_args  TaskArg array with tensor metadata + scalar values
+ * @param arg_count  Total number of TaskArg entries
  * @return 0 on success, negative on error
  */
-typedef int (*OrchestrationFunc)(Runtime* runtime, const OrchArg* orch_args, int arg_count);
+typedef int (*OrchestrationFunc)(Runtime* runtime, const TaskArg* orch_args, int arg_count);
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,8 +54,8 @@ extern "C" {
  * @param orch_so_binary    Orchestration shared library binary data
  * @param orch_so_size      Size of orchestration SO binary in bytes
  * @param orch_func_name    Name of the orchestration function to call
- * @param orch_args         OrchArg array with tensor metadata + scalar values
- * @param orch_args_count   Number of OrchArg entries
+ * @param orch_args         TaskArg array with tensor metadata + scalar values
+ * @param orch_args_count   Number of TaskArg entries
  * @param arg_types         Array describing each argument's type (unused for host orchestration)
  * @param arg_sizes         Array of sizes for pointer arguments (unused for host orchestration)
  * @return 0 on success, -1 on failure
@@ -64,7 +64,7 @@ int init_runtime_impl(Runtime *runtime,
                     const uint8_t* orch_so_binary,
                     size_t orch_so_size,
                     const char* orch_func_name,
-                    const OrchArg* orch_args,
+                    const TaskArg* orch_args,
                     int orch_args_count,
                     int* arg_types,
                     uint64_t* arg_sizes,

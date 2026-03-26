@@ -41,7 +41,7 @@ extern "C" {
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
@@ -54,14 +54,14 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
  * the outer scope on entry.
  */
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
-    // golden shape = kernel shape, use to_tensor() directly
-    Tensor ext_a = orch_args[0].to_tensor();
-    Tensor ext_b = orch_args[1].to_tensor();
-    Tensor ext_f = orch_args[2].to_tensor();
+    // golden shape = kernel shape, use from_task_arg() directly
+    Tensor ext_a = from_task_arg(orch_args[0]);
+    Tensor ext_b = from_task_arg(orch_args[1]);
+    Tensor ext_f = from_task_arg(orch_args[2]);
 
     uint32_t SIZE = orch_args[0].tensor.shapes[0];
     LOG_INFO("===============SIZE=%u", SIZE);

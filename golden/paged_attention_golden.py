@@ -10,7 +10,7 @@ specific ALL_CASES, RTOL/ATOL configuration.
 
 Args layout (7 args):
   [query, key_cache, value_cache, block_table, context_lens, out, scale]
-  - Tensors retain original multi-dimensional shapes (OrchArg metadata carries shape/dtype)
+  - Tensors retain original multi-dimensional shapes (TaskArg metadata carries shape/dtype)
   - scale is a scalar float parameter
 """
 

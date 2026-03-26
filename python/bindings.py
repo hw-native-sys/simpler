@@ -67,36 +67,36 @@ ARG_INOUT_PTR = 3   # Input/output: copy_to_device + copy-back
 
 
 # ============================================================================
-# OrchArg ctypes mirror (must match C++ struct OrchArg, 48 bytes)
+# TaskArg ctypes mirror (must match C++ struct TaskArg, 48 bytes)
 # ============================================================================
-ORCH_ARG_MAX_DIMS = 5
+TASK_ARG_MAX_DIMS = 5
 
 
-class _OrchArgTensorC(ctypes.Structure):
+class _TaskArgTensorC(ctypes.Structure):
     _fields_ = [
         ("data", c_uint64),
-        ("shapes", c_uint32 * ORCH_ARG_MAX_DIMS),
+        ("shapes", c_uint32 * TASK_ARG_MAX_DIMS),
         ("ndims", c_uint32),
         ("dtype", c_uint32),
     ]
 
 
-class _OrchArgUnionC(ctypes.Union):
+class _TaskArgUnionC(ctypes.Union):
     _fields_ = [
-        ("tensor", _OrchArgTensorC),
+        ("tensor", _TaskArgTensorC),
         ("scalar", c_uint64),
     ]
 
 
-class OrchArgC(ctypes.Structure):
+class TaskArgC(ctypes.Structure):
     _fields_ = [
         ("kind", c_uint32),
         ("_pad", c_uint32),
-        ("u", _OrchArgUnionC),
+        ("u", _TaskArgUnionC),
     ]
 
 
-assert ctypes.sizeof(OrchArgC) == 48
+assert ctypes.sizeof(TaskArgC) == 48
 
 
 # ============================================================================
@@ -146,7 +146,7 @@ class RuntimeLibraryLoader:
             POINTER(c_uint8),       # orch_so_binary
             c_size_t,               # orch_so_size
             c_char_p,               # orch_func_name
-            POINTER(OrchArgC),      # orch_args
+            POINTER(TaskArgC),      # orch_args
             c_int,                  # orch_args_count
             POINTER(c_int),         # arg_types
             POINTER(c_uint64),      # arg_sizes
@@ -270,7 +270,7 @@ class Runtime:
         Args:
             orch_so_binary: Orchestration shared library binary data
             orch_func_name: Name of the orchestration function to call
-            orch_args: List of OrchArgC structs for orchestration
+            orch_args: List of TaskArgC structs for orchestration
             arg_types: Array describing each argument's IO direction (ARG_SCALAR, ARG_INPUT_PTR, etc.)
             arg_sizes: Array of byte sizes for tensor arguments (0 for scalars)
             kernel_binaries: List of (func_id, binary_data) tuples for kernel registration
@@ -284,7 +284,7 @@ class Runtime:
 
         # Convert orch_args to ctypes array
         if orch_args_count > 0:
-            orch_args_array = (OrchArgC * orch_args_count)(*orch_args)
+            orch_args_array = (TaskArgC * orch_args_count)(*orch_args)
         else:
             orch_args_array = None
 

@@ -51,11 +51,10 @@ Runs all tests using thread-based simulation. No Ascend hardware needed.
 
 ### C++ Unit Tests (`tests/cpp/`)
 
-GoogleTest-based tests for the shared runtime components extracted to `src/{arch}/runtime/common/`:
+GoogleTest-based tests for shared components (`src/common/task_interface/` and `src/{arch}/runtime/common/`):
 
-- `test_ring_buffer.cpp` — PTO2HeapRing, PTO2TaskRing, PTO2DepListPool
-- `test_orch_arg.cpp` — OrchArg packing/unpacking, byte alignment, DMA copy semantics
-- `test_submit_types.cpp` — SubtaskSlot, MixedKernels, ResourceShape classification
+- `test_data_type.cpp` — DataType enum, get_element_size(), get_dtype_name()
+- `test_task_arg.cpp` — TaskArg packing/unpacking, byte alignment, nbytes(), DMA copy semantics
 
 Build and run independently:
 ```bash

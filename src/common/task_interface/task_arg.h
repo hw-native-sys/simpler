@@ -1,8 +1,8 @@
 /**
- * OrchArg - Tagged union for orchestration function arguments
+ * TaskArg - Tagged union for orchestration function arguments
  *
- * Each OrchArg carries either a Tensor (ptr/shape/ndims/dtype) or a Scalar
- * (uint64_t value). Host side builds an OrchArg[] array which is copied to
+ * Each TaskArg carries either a Tensor (ptr/shape/ndims/dtype) or a Scalar
+ * (uint64_t value). Host side builds a TaskArg[] array which is copied to
  * device; AICPU reads fields directly.
  *
  * This struct is trivially copyable (required for DMA) and fixed at 48 bytes.
@@ -16,20 +16,20 @@
 
 #include "data_type.h"
 
-constexpr int ORCH_ARG_MAX_DIMS = 5;
+constexpr int TASK_ARG_MAX_DIMS = 5;
 
-enum class OrchArgKind : uint32_t {
+enum class TaskArgKind : uint32_t {
     TENSOR = 0,
     SCALAR = 1,
 };
 
-struct OrchArg {
-    OrchArgKind kind;         // 4B: TENSOR or SCALAR
+struct TaskArg {
+    TaskArgKind kind;         // 4B: TENSOR or SCALAR
 
     union {
         struct {                                    // --- Tensor metadata ---
             uint64_t data;                          // Host/device memory address
-            uint32_t shapes[ORCH_ARG_MAX_DIMS];     // Shape per dim (element count)
+            uint32_t shapes[TASK_ARG_MAX_DIMS];     // Shape per dim (element count)
             uint32_t ndims;                         // Number of dimensions (1..5)
             DataType dtype;                         // DataType : uint32_t
         } tensor;                                   // 36B
@@ -61,5 +61,5 @@ struct OrchArg {
     }
 };
 
-static_assert(std::is_trivially_copyable<OrchArg>::value, "OrchArg must be trivially copyable for DMA");
-static_assert(sizeof(OrchArg) == 48, "OrchArg size must be exactly 48B for stable ABI");
+static_assert(std::is_trivially_copyable<TaskArg>::value, "TaskArg must be trivially copyable for DMA");
+static_assert(sizeof(TaskArg) == 48, "TaskArg size must be exactly 48B for stable ABI");

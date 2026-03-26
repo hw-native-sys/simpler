@@ -42,7 +42,7 @@
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
@@ -50,9 +50,9 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
 
-    // Read dimensions from OrchArg tensor metadata
+    // Read dimensions from TaskArg tensor metadata
     uint64_t batch     = orch_args[0].tensor.shapes[0];
     uint64_t num_heads = orch_args[0].tensor.shapes[1];
     uint64_t head_dim  = orch_args[0].tensor.shapes[2];

@@ -4,7 +4,7 @@
  * Builds the task graph for formula: (a + b + 1)(a + b + 2)
  *
  * This orchestration function:
- * 1. Receives OrchArg array with tensor metadata (pointers, shapes, dtypes)
+ * 1. Receives TaskArg array with tensor metadata (pointers, shapes, dtypes)
  * 2. Allocates device memory via runtime->host_api
  * 3. Copies input data to device via runtime->host_api
  * 4. Records output tensor for copy-back during finalize
@@ -12,12 +12,12 @@
  */
 
 #include "runtime.h"
-#include "orch_arg.h"
+#include "task_arg.h"
 #include <iostream>
 
 extern "C" {
 
-int build_example_graph(Runtime* runtime, const OrchArg* orch_args, int arg_count) {
+int build_example_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count) {
     // Validate argument count
     // Expected orch_args: [a, b, f] — 3 tensors
     if (arg_count < 3) {
@@ -25,7 +25,7 @@ int build_example_graph(Runtime* runtime, const OrchArg* orch_args, int arg_coun
         return -1;
     }
 
-    // Extract host pointers, sizes, and element count from OrchArg metadata
+    // Extract host pointers, sizes, and element count from TaskArg metadata
     void* host_a = orch_args[0].data<void>();
     void* host_b = orch_args[1].data<void>();
     void* host_f = orch_args[2].data<void>();

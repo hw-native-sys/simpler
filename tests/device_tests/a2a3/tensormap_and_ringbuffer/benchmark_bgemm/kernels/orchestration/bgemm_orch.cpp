@@ -3,7 +3,7 @@
  *
  * Builds the task graph for tiled matrix multiplication: C = A @ B
  *
- * Configuration read from scalar OrchArgs (set in golden.py):
+ * Configuration read from scalar TaskArgs (set in golden.py):
  *   - tile_size: tile dimension (tile_size x tile_size per tile)
  *   - grid_k: number of K-dimension partitions
  *   - num_groups: number of independent groups (= matmul_add_task_num / grid_k)
@@ -28,7 +28,7 @@
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 4,
@@ -36,15 +36,15 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
     // Tensor args
-    Tensor ext_A = orch_args[0].to_tensor();
-    Tensor ext_B = orch_args[1].to_tensor();
-    Tensor ext_C = orch_args[2].to_tensor();
-    Tensor ext_config = orch_args[3].to_tensor();
+    Tensor ext_A = from_task_arg(orch_args[0]);
+    Tensor ext_B = from_task_arg(orch_args[1]);
+    Tensor ext_C = from_task_arg(orch_args[2]);
+    Tensor ext_config = from_task_arg(orch_args[3]);
 
     // Read config from tensor data: [tile_size, grid_k, num_groups, incore_loop]
     int64_t* host_config = orch_args[3].data<int64_t>();

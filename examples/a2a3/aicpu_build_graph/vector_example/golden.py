@@ -5,7 +5,7 @@ Computation:
     f = (a + b + 1) * (a + b + 2)
     where a=2.0, b=3.0, so f=42.0
 
-Args layout: [a, b, f]  — shape/dtype/size in OrchArg metadata
+Args layout: [a, b, f]  — shape/dtype/size in TaskArg metadata
 """
 
 import torch

@@ -22,7 +22,7 @@
  *   - gemm(k) -> add(k): add reads P which gemm produces
  *   - add(k-1) -> add(k): add reads/writes C_view (K accumulation chain)
  *
- * Args layout: [A, B, C]  — shape/dtype/size in OrchArg metadata
+ * Args layout: [A, B, C]  — shape/dtype/size in TaskArg metadata
  */
 
 #include <stddef.h>
@@ -45,7 +45,7 @@ static constexpr uint64_t TILE_BYTES = TILE_ELEMS * sizeof(float);
 extern "C" {
 
 __attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
+PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
@@ -53,13 +53,13 @@ PTO2OrchestrationConfig aicpu_orchestration_config(OrchArg* orch_args) {
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, OrchArg* orch_args, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
-    Tensor ext_A = orch_args[0].to_tensor();
-    Tensor ext_B = orch_args[1].to_tensor();
-    Tensor ext_C = orch_args[2].to_tensor();
+    Tensor ext_A = from_task_arg(orch_args[0]);
+    Tensor ext_B = from_task_arg(orch_args[1]);
+    Tensor ext_C = from_task_arg(orch_args[2]);
 
     LOG_INFO(rt, "[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d",
                   GRID_M, GRID_K, GRID_N, BATCH, TILE);

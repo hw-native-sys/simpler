@@ -5,7 +5,7 @@
  * Supports device orchestration where AICPU thread 3 runs the orchestrator.
  *
  * init_runtime_impl:
- *   - Converts host OrchArg pointers to device pointers based on arg_types
+ *   - Converts host TaskArg pointers to device pointers based on arg_types
  *   - Copies orchestration SO to device memory
  *   - Sets up runtime state for device orchestration
  *
@@ -66,7 +66,7 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
  *
  * For rt2 runtime, orchestration runs on AICPU thread 3 (device-side).
  * This function:
- * - Copies OrchArg metadata and replaces host tensor pointers with device pointers
+ * - Copies TaskArg metadata and replaces host tensor pointers with device pointers
  * - Copies input data to device
  * - Records output tensors for copy-back
  * - Copies orchestration SO to device memory
@@ -76,8 +76,8 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
  * @param orch_so_binary    Orchestration shared library binary data
  * @param orch_so_size      Size of orchestration SO binary in bytes
  * @param orch_func_name    Name of the orchestration function (unused)
- * @param orch_args         OrchArg array with tensor metadata + scalar values
- * @param orch_args_count   Number of OrchArg entries
+ * @param orch_args         TaskArg array with tensor metadata + scalar values
+ * @param orch_args_count   Number of TaskArg entries
  * @param arg_types         Array describing each argument's IO direction (ArgType enum)
  * @param arg_sizes         Array of byte sizes for tensor arguments (0 for scalars)
  * @return 0 on success, -1 on failure
@@ -86,7 +86,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
                     const uint8_t* orch_so_binary,
                     size_t orch_so_size,
                     const char* orch_func_name,
-                    const OrchArg* orch_args,
+                    const TaskArg* orch_args,
                     int orch_args_count,
                     int* arg_types,
                     uint64_t* arg_sizes,
@@ -137,14 +137,14 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
     long long t_total_start = _now_ms();
 
-    // Copy OrchArgs and replace host tensor pointers with device pointers
-    OrchArg device_args[RT2_MAX_DEVICE_ARGS];
+    // Copy TaskArgs and replace host tensor pointers with device pointers
+    TaskArg device_args[RT2_MAX_DEVICE_ARGS];
 
     long long t_args_start = _now_ms();
     for (int i = 0; i < orch_args_count; i++) {
-        device_args[i] = orch_args[i];  // Copy entire OrchArg (preserves metadata)
+        device_args[i] = orch_args[i];  // Copy entire TaskArg (preserves metadata)
 
-        if (orch_args[i].kind == OrchArgKind::TENSOR) {
+        if (orch_args[i].kind == TaskArgKind::TENSOR) {
             void* host_ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(orch_args[i].tensor.data));
             size_t size = arg_sizes[i];
 

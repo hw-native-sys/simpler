@@ -4,7 +4,7 @@ Golden test specification for BGEMM (aicpu_build_graph Runtime).
 Computation: C = A @ B (tiled matrix multiplication)
 Configuration: 4x4x4 grid, 64x64 tiles
 
-Args layout: [A, B, C]  — shape/dtype/size in OrchArg metadata
+Args layout: [A, B, C]  — shape/dtype/size in TaskArg metadata
 """
 
 import numpy as np

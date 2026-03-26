@@ -4,14 +4,14 @@
 cmake_minimum_required(VERSION 3.16.3)
 
 # Build complete include list
-set(CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}")
-list(APPEND CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "-I${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+set(CMAKE_CUSTOM_INCLUDE_DIRS "")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
-        list(APPEND CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "-I${INC_DIR}")
+        list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")
     endforeach()
-    string(REPLACE ";" " " CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "${CMAKE_CUSTOM_INCLUDE_DIR_FLAGS}")
 else()
     message(FATAL_ERROR "MUST set CUSTOM_INCLUDE_DIRS to build with `Task` implementation")
 endif()
@@ -32,6 +32,12 @@ message(VERBOSE "AICore kernel sources: ${ALL_SOURCES}")
 
 # Output files
 set(AICORE_KERNEL_OBJ ${CMAKE_CURRENT_BINARY_DIR}/aicore_kernel.o)
+
+# Convert include dirs to -I flags for compiler command
+set(CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "")
+foreach(INC_DIR ${CMAKE_CUSTOM_INCLUDE_DIRS})
+    list(APPEND CMAKE_CUSTOM_INCLUDE_DIR_FLAGS "-I${INC_DIR}")
+endforeach()
 
 # Compiler flags
 set(AICORE_FLAGS

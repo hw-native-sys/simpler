@@ -9,7 +9,7 @@
 
 #include "device_runner.h"
 #include "common/unified_log.h"
-#include "orch_arg.h"
+#include "task_arg.h"
 #include "runtime.h"
 
 extern "C" {
@@ -23,7 +23,7 @@ int init_runtime_impl(Runtime* runtime,
                     const uint8_t* orch_so_binary,
                     size_t orch_so_size,
                     const char* orch_func_name,
-                    const OrchArg* orch_args,
+                    const TaskArg* orch_args,
                     int orch_args_count,
                     int* arg_types,
                     uint64_t* arg_sizes,
@@ -53,7 +53,7 @@ int init_runtime(RuntimeHandle runtime,
                 const uint8_t* orch_so_binary,
                 size_t orch_so_size,
                 const char* orch_func_name,
-                const OrchArg* orch_args,
+                const TaskArg* orch_args,
                 int orch_args_count,
                 int* arg_types,
                 uint64_t* arg_sizes,

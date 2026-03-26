@@ -10,11 +10,11 @@
  * Head tiling: q_tile_size = min(num_heads, 128)
  * GQA: kv_head_num can differ from q_head_num
  *
- * OrchArg layout: [query, key_cache, value_cache, block_table, context_lens, out, scale]
+ * TaskArg layout: [query, key_cache, value_cache, block_table, context_lens, out, scale]
  */
 
 #include "runtime.h"
-#include "orch_arg.h"
+#include "task_arg.h"
 #include <iostream>
 #include <algorithm>
 #include <cstring>
@@ -26,13 +26,13 @@
 
 extern "C" {
 
-int build_paged_attention_graph(Runtime* runtime, const OrchArg* orch_args, int arg_count) {
+int build_paged_attention_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count) {
     if (arg_count < 7) {
         std::cerr << "Expected at least 7 args, got " << arg_count << '\n';
         return -1;
     }
 
-    // Extract host pointers from OrchArg tensor metadata
+    // Extract host pointers from TaskArg tensor metadata
     void* host_query       = orch_args[0].data<void>();
     void* host_key_cache   = orch_args[1].data<void>();
     void* host_value_cache = orch_args[2].data<void>();
@@ -40,13 +40,13 @@ int build_paged_attention_graph(Runtime* runtime, const OrchArg* orch_args, int 
     int*  host_context_lens = orch_args[4].data<int>();
     void* host_out         = orch_args[5].data<void>();
 
-    // Extract sizes from OrchArg metadata
+    // Extract sizes from TaskArg metadata
     size_t query_size       = orch_args[0].nbytes();
     size_t key_cache_size   = orch_args[1].nbytes();
     size_t value_cache_size = orch_args[2].nbytes();
     size_t out_size         = orch_args[5].nbytes();
 
-    // Read dimensions from tensor shapes (uint32_t — matches OrchArg::tensor.shapes type)
+    // Read dimensions from tensor shapes (uint32_t — matches TaskArg::tensor.shapes type)
     // query: (batch, num_heads, head_dim)
     uint32_t batch       = orch_args[0].tensor.shapes[0];
     uint32_t num_heads   = orch_args[0].tensor.shapes[1];
