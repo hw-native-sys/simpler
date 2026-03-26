@@ -1814,9 +1814,6 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             pto2_rt_scope_begin(rt);
             orch_func_(orch_args_cached_, orch_thread_num_, orch_idx);
             pto2_rt_scope_end(rt);
-            if (orch_bind_runtime_ != nullptr) {
-                orch_bind_runtime_(nullptr);
-            }
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             (void)orch_cycle_end;
@@ -2064,6 +2061,11 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
         finished_.store(true, std::memory_order_release);
         // Destroy PTO2 runtime and close orchestration SO (moved from orchestrator path)
         if (!runtime->get_orch_built_on_host() && orch_so_handle_ != nullptr) {
+            // Clear the borrowed pointer in the orchestration SO before destroying
+            // rt, so g_pto2_current_runtime never points to freed memory.
+            if (orch_bind_runtime_ != nullptr) {
+                orch_bind_runtime_(nullptr);
+            }
             pto2_runtime_destroy(rt);
             dlclose(orch_so_handle_);
             unlink(orch_so_path_);

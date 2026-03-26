@@ -15,7 +15,11 @@
 struct PTO2Runtime;
 
 namespace {
-thread_local PTO2Runtime* g_pto2_current_runtime = nullptr;
+// Plain global (not thread_local) to avoid glibc TLSDESC stale-resolution
+// crash (BZ #32412) when the orchestration SO is dlclose'd/re-dlopen'd
+// between execution rounds.  All orchestrator threads bind the same rt
+// value, so per-thread storage is unnecessary.
+PTO2Runtime* g_pto2_current_runtime = nullptr;
 }
 
 extern "C" __attribute__((visibility("default"))) void pto2_framework_bind_runtime(PTO2Runtime* rt) {
