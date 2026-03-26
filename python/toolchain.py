@@ -49,18 +49,8 @@ class CCECToolchain(Toolchain):
         super().__init__()
         self.platform = platform
 
-        if platform in ("a5", "a5sim"):
-            self.cxx_path = os.path.join(
-                self.ascend_home_path, "tools", "bisheng_compiler", "bin", "ccec"
-            )
-            self.linker_path = os.path.join(
-                self.ascend_home_path, "tools", "bisheng_compiler", "bin", "ld.lld"
-            )
-        elif platform in ("a2a3", "a2a3sim"):
-            self.cxx_path = os.path.join(self.ascend_home_path, "bin", "ccec")
-            self.linker_path = os.path.join(self.ascend_home_path, "bin", "ld.lld")
-        else:
-            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+        self.cxx_path = os.path.join(self.ascend_home_path, "bin", "ccec")
+        self.linker_path = os.path.join(self.ascend_home_path, "bin", "ld.lld")
 
         if not os.path.isfile(self.cxx_path):
             raise FileNotFoundError(
