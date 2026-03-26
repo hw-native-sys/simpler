@@ -1,25 +1,25 @@
 /**
- * PTO RQ Kernel API — request queue abstraction for AICore kernels.
+ * PTO SQ Kernel API — send queue abstraction for AICore kernels.
  *
  * Two usage paths, both ending with CQ registration:
  *
  * Path 1 — High-level (send_request_entry, one-stop):
  *
  *   auto desc = pto2_sdma_descriptor(dst, src, scratch, context);
- *   uint64_t tag = pto2_send_request_entry(PTO2_ENGINE_SDMA, rq_id, desc);
+ *   uint64_t tag = pto2_send_request_entry(PTO2_ENGINE_SDMA, sq_id, desc);
  *   pto2_save_expected_completion(PTO2_ENGINE_SDMA, cq, tag);
  *   pto2_cq_flush();
  *
- * Path 2 — Low-level (rq_open + direct ISA instruction):
+ * Path 2 — Low-level (sq_open + direct ISA instruction):
  *
- *   auto session = pto2_rq_open(PTO2_ENGINE_SDMA, rq_id, scratch, context);
+ *   auto session = pto2_sq_open(PTO2_ENGINE_SDMA, sq_id, scratch, context);
  *   AsyncEvent event = TPUT_ASYNC(dst, src, session);  // or TGET_ASYNC
  *   pto2_save_expected_completion(cq, event);
  *   pto2_cq_flush();
  *
  * Layering:
- *   send_request_entry = rq_open + ISA instruction (syntactic sugar)
- *   rq_open            = session management (BuildAsyncSession wrapper)
+ *   send_request_entry = sq_open + ISA instruction (syntactic sugar)
+ *   sq_open            = session management (BuildAsyncSession wrapper)
  *
  * Requires:
  *   - PTO-ISA headers included before this header
@@ -27,8 +27,8 @@
  *   - HW build only (uses PTO-ISA async instructions)
  */
 
-#ifndef PTO_RQ_KERNEL_API_H
-#define PTO_RQ_KERNEL_API_H
+#ifndef PTO_SQ_KERNEL_API_H
+#define PTO_SQ_KERNEL_API_H
 
 #include "pto_cq_types.h"
 #include "pto_cq_kernel_api.h"
@@ -37,24 +37,24 @@
 #include <pto/comm/async/async_types.hpp>
 #include <pto/npu/comm/async/sdma/sdma_types.hpp>
 
-// RQ engine types — aliases for the unified PTO2_ENGINE_* constants
-#define PTO2_RQ_ENGINE_SDMA   PTO2_ENGINE_SDMA
-// #define PTO2_RQ_ENGINE_CCU    PTO2_ENGINE_CCU    // future
-// #define PTO2_RQ_ENGINE_URMA   PTO2_ENGINE_URMA   // future
+// SQ engine types — aliases for the unified PTO2_ENGINE_* constants
+#define PTO2_SQ_ENGINE_SDMA   PTO2_ENGINE_SDMA
+// #define PTO2_SQ_ENGINE_CCU    PTO2_ENGINE_CCU    // future
+// #define PTO2_SQ_ENGINE_URMA   PTO2_ENGINE_URMA   // future
 
-#define PTO2_RQ_ID_AUTO  UINT32_MAX
+#define PTO2_SQ_ID_AUTO  UINT32_MAX
 
 // ============================================================================
-// pto2_rq_open — build async session for a hardware engine queue
+// pto2_sq_open — build async session for a hardware engine queue
 //
 // This is the foundation layer. Both send_request_entry (high-level)
 // and direct ISA usage (low-level) go through this to obtain a session.
 // ============================================================================
 
 template <typename ScratchTile>
-inline __aicore__ pto::comm::AsyncSession pto2_rq_open(
-    uint32_t rq_type,
-    uint32_t rq_id,
+inline __aicore__ pto::comm::AsyncSession pto2_sq_open(
+    uint32_t sq_type,
+    uint32_t sq_id,
     ScratchTile& scratch,
     __gm__ uint8_t* context,
     uint32_t sync_id = 0,
@@ -63,7 +63,7 @@ inline __aicore__ pto::comm::AsyncSession pto2_rq_open(
 {
     pto::comm::AsyncSession session;
     pto::comm::BuildAsyncSession<pto::comm::DmaEngine::SDMA>(
-        scratch, context, session, sync_id, base_config, rq_id);
+        scratch, context, session, sync_id, base_config, sq_id);
     return session;
 }
 
@@ -133,20 +133,20 @@ pto2_sdma_tget_descriptor(
 }
 
 // ============================================================================
-// pto2_send_request_entry — high-level, sugar over rq_open + async ISA op
+// pto2_send_request_entry — high-level, sugar over sq_open + async ISA op
 //
-// Original design: tag = pto2_send_request_entry(RQ_TYPE, RQ_ID, descriptor)
-// Internally: rq_open(session params from desc) → async ISA op → tag
+// Original design: tag = pto2_send_request_entry(SQ_TYPE, SQ_ID, descriptor)
+// Internally: sq_open(session params from desc) → async ISA op → tag
 // ============================================================================
 
 template <typename GlobalDstData, typename GlobalSrcData, typename ScratchTile>
 inline __aicore__ uint64_t pto2_send_request_entry(
-    uint32_t rq_type,
-    uint32_t rq_id,
+    uint32_t sq_type,
+    uint32_t sq_id,
     PTO2SdmaDescriptor<GlobalDstData, GlobalSrcData, ScratchTile>& desc)
 {
-    pto::comm::AsyncSession session = pto2_rq_open(
-        rq_type, rq_id, desc.scratch, desc.context,
+    pto::comm::AsyncSession session = pto2_sq_open(
+        sq_type, sq_id, desc.scratch, desc.context,
         desc.sync_id, desc.base_config);
     if (!session.valid) return 0;
 
@@ -161,4 +161,4 @@ inline __aicore__ uint64_t pto2_send_request_entry(
     return event.valid() ? event.handle : 0;
 }
 
-#endif  // PTO_RQ_KERNEL_API_H
+#endif  // PTO_SQ_KERNEL_API_H

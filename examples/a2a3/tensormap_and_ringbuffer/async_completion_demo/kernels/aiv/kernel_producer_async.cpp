@@ -35,7 +35,7 @@
 
 using namespace pto;
 
-#include "pto_rq_kernel_api.h"
+#include "pto_sq_kernel_api.h"
 
 template <typename T>
 AICORE inline __gm__ T* CommRemotePtr(__gm__ CommDeviceContext* ctx, __gm__ T* local_ptr,
@@ -82,7 +82,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ uint8_t* context = reinterpret_cast<__gm__ uint8_t*>(static_cast<uintptr_t>(sdma_context));
 
     auto desc = pto2_sdma_tget_descriptor(outGlobalFlat, remoteInGlobalFlat, scratchTile, context);
-    uint64_t tag = pto2_send_request_entry(PTO2_ENGINE_SDMA, PTO2_RQ_ID_AUTO, desc);
+    uint64_t tag = pto2_send_request_entry(PTO2_ENGINE_SDMA, PTO2_SQ_ID_AUTO, desc);
     pto2_save_expected_completion(PTO2_ENGINE_SDMA, cq, tag);
 
     pto2_cq_flush(cq);

@@ -5,7 +5,7 @@
  * that the AICPU scheduler reads after the kernel returns.
  *
  * All overloads follow the (ENGINE, QUEUE, data...) parameter convention,
- * symmetric with pto2_send_request_entry(ENGINE, RQ_ID, desc) in the RQ API.
+ * symmetric with pto2_send_request_entry(ENGINE, SQ_ID, desc) in the SQ API.
  *
  * Usage in kernel code:
  *
@@ -23,7 +23,7 @@
 // Requires __gm__ and __aicore__ to be defined before including this header.
 // Kernel sources should define them (or include PTO-ISA headers) first.
 
-// Unified engine constants — shared by RQ and CQ APIs.
+// Unified engine constants — shared by SQ and CQ APIs.
 // Must match PTO2AsyncEngine in pto_types.h.
 #define PTO2_ENGINE_SDMA  0
 #define PTO2_ENGINE_ROCE  1
@@ -75,7 +75,7 @@ inline __aicore__ void pto2_cq_reset(volatile __gm__ PTO2CompletionQueue* cq) {
 /**
  * Register one expected completion condition in the CQ (full form).
  *
- * Parameter order: (ENGINE, QUEUE, data...) — symmetric with RQ API.
+ * Parameter order: (ENGINE, QUEUE, data...) — symmetric with SQ API.
  * Each call appends an entry and increments cq->count.
  * The caller must ensure total calls per task <= PTO2_CQ_MAX_ENTRIES.
  */
@@ -103,7 +103,7 @@ inline __aicore__ void pto2_save_expected_completion(
  * Simplified overload: (ENGINE, CQ, tag).
  *
  * Completion type is auto-determined: EVENT_FLAG with expected_value=0.
- * Symmetric with pto2_send_request_entry(ENGINE, RQ_ID, desc).
+ * Symmetric with pto2_send_request_entry(ENGINE, SQ_ID, desc).
  */
 inline __aicore__ void pto2_save_expected_completion(
     uint32_t engine,
