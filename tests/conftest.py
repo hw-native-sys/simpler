@@ -1,67 +1,28 @@
 """Pytest configuration for platform-aware testing."""
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
 
-
 PROJECT_ROOT = Path(__file__).parent.parent
 
+# Make tools/ importable so we can use the shared discovery module
+_tools_dir = str(PROJECT_ROOT / "tools")
+if _tools_dir not in sys.path:
+    sys.path.insert(0, _tools_dir)
 
-def discover_platforms() -> list[str]:
-    """Discover available platforms by scanning src/*/platform/{onboard,sim}/ directories.
-
-    Returns:
-        List of platform names (e.g., ["a2a3", "a2a3sim", "a5", "a5sim"])
-    """
-    platforms = []
-    src_dir = PROJECT_ROOT / "src"
-
-    if not src_dir.exists():
-        return platforms
-
-    for arch_dir in sorted(src_dir.iterdir()):
-        if not arch_dir.is_dir():
-            continue
-
-        arch_name = arch_dir.name
-        platform_dir = arch_dir / "platform"
-
-        if not platform_dir.exists():
-            continue
-
-        # Check for onboard (hardware) platform
-        if (platform_dir / "onboard").exists():
-            platforms.append(arch_name)
-
-        # Check for sim (simulation) platform
-        if (platform_dir / "sim").exists():
-            platforms.append(f"{arch_name}sim")
-
-    return platforms
+from test_catalog import (
+    discover_platforms,
+    discover_runtimes_for_arch,
+    arch_from_platform,
+)
 
 
-def discover_runtimes_for_arch(arch: str) -> list[str]:
-    """Discover available runtimes for a specific architecture.
-
-    Args:
-        arch: Architecture name (e.g., "a2a3", "a5")
-
-    Returns:
-        List of runtime names (e.g., ["host_build_graph", "aicpu_build_graph"])
-    """
-    runtime_dir = PROJECT_ROOT / "src" / arch / "runtime"
-
-    if not runtime_dir.exists():
-        return []
-
-    runtimes = []
-    for item in sorted(runtime_dir.iterdir()):
-        if item.is_dir() and (item / "build_config.py").exists():
-            runtimes.append(item.name)
-
-    return runtimes
+def pytest_configure(config):
+    """Register custom markers."""
+    config.addinivalue_line("markers", "requires_hardware: test needs Ascend toolchain and real device")
 
 
 def pytest_addoption(parser):
@@ -91,10 +52,7 @@ def default_test_platform(request):
 @pytest.fixture
 def test_arch(default_test_platform):
     """Extract architecture name from platform (e.g., 'a2a3sim' -> 'a2a3')."""
-    platform = default_test_platform
-    if platform.endswith("sim"):
-        return platform[:-3]
-    return platform
+    return arch_from_platform(default_test_platform)
 
 
 def pytest_generate_tests(metafunc):
@@ -116,13 +74,9 @@ def pytest_generate_tests(metafunc):
         # Build platform×runtime combinations
         test_params = []
         for platform in platforms:
-            # Extract architecture from platform name
-            arch = platform[:-3] if platform.endswith("sim") else platform
-
-            # Discover runtimes for this architecture
+            arch = arch_from_platform(platform)
             runtimes = discover_runtimes_for_arch(arch)
 
-            # Add all valid combinations
             for runtime in runtimes:
                 # Mark hardware platforms (non-sim) as requiring Ascend
                 marks = []
@@ -154,10 +108,7 @@ def pytest_collection_modifyitems(session, config, items):
     if not platform_filter:
         platform_filter = "a2a3sim"
 
-    # Extract architecture from platform
-    arch = platform_filter[:-3] if platform_filter.endswith("sim") else platform_filter
-
-    # Get available runtimes for this architecture
+    arch = arch_from_platform(platform_filter)
     available_runtimes = discover_runtimes_for_arch(arch)
 
     for item in items:

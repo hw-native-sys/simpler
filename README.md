@@ -47,7 +47,7 @@ See runtime docs per arch: [a2a3](src/a2a3/docs/runtimes.md), [a5](src/a5/docs/r
 ./ci.sh -p a2a3 -d 4-7 --parallel
 
 # Python unit tests
-pytest tests -v
+pytest tests -m "not requires_hardware" -v
 
 # C++ unit tests
 cmake -B tests/cpp/build -S tests/cpp && cmake --build tests/cpp/build && ctest --test-dir tests/cpp/build --output-on-failure

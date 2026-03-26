@@ -151,12 +151,14 @@ touch "$RESULTS_FILE"
 
 cleanup() {
     kill $WATCHDOG_PID 2>/dev/null
-    kill 0 2>/dev/null
+    # Kill only our child processes, not the entire process group.
+    # kill 0 would kill the GitHub Actions runner on self-hosted machines.
+    pkill -TERM -P $$ 2>/dev/null
     rm -rf "$LOG_DIR"
     exit 130
 }
 trap cleanup INT TERM
-trap 'kill $WATCHDOG_PID 2>/dev/null; rm -rf "$LOG_DIR"' EXIT
+trap 'kill $WATCHDOG_PID 2>/dev/null; pkill -TERM -P $$ 2>/dev/null; rm -rf "$LOG_DIR"' EXIT
 
 # Watchdog: abort CI if it exceeds the timeout
 (
@@ -191,7 +193,7 @@ pin_pto_isa_on_failure() {
 
 # ---- Discover all tasks ----
 EXAMPLES_DIR="examples"
-DEVICE_TESTS_DIR="tests/device_tests"
+DEVICE_TESTS_DIR="tests/st"
 
 declare -a HW_TASK_NAMES=()
 declare -a HW_TASK_DIRS=()

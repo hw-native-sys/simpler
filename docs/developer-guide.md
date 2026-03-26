@@ -41,9 +41,9 @@ pto-runtime/
 │       └── tensormap_and_ringbuffer/
 │
 ├── tests/                             # Test suite
-│   ├── cpp/                           # C++ unit tests (GoogleTest)
-│   ├── device_tests/                  # Device integration tests
-│   └── test_runtime_builder.py        # Python unit tests
+│   ├── ut/                           # Python unit tests
+│   ├── st/                           # Device scene tests (hardware-only)
+│   └── cpp/                          # C++ unit tests (GoogleTest)
 │
 └── docs/                              # Documentation
 ```

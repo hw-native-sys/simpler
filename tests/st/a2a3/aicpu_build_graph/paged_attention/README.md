@@ -58,14 +58,14 @@ Block n: QK -> SF -> PV --+
 ```bash
 # Run on hardware (specify device ID)
 python examples/scripts/run_example.py \
-  -k tests/device_tests/aicpu_build_graph/paged_attention/kernels \
-  -g tests/device_tests/aicpu_build_graph/paged_attention/golden.py \
+  -k tests/st/aicpu_build_graph/paged_attention/kernels \
+  -g tests/st/aicpu_build_graph/paged_attention/golden.py \
   -p a2a3 -d 0
 
 # Run multi-block test case
 PA_CASE=Case2 python examples/scripts/run_example.py \
-  -k tests/device_tests/aicpu_build_graph/paged_attention/kernels \
-  -g tests/device_tests/aicpu_build_graph/paged_attention/golden.py \
+  -k tests/st/aicpu_build_graph/paged_attention/kernels \
+  -g tests/st/aicpu_build_graph/paged_attention/golden.py \
   -p a2a3 -d 0
 ```
 

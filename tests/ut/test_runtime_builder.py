@@ -8,7 +8,7 @@ from unittest.mock import patch
 import pytest
 
 # Add python/ to path so we can import runtime_builder
-PROJECT_ROOT = Path(__file__).parent.parent
+PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "python"))
 
 
@@ -276,6 +276,7 @@ class TestRuntimeBuilderBuild:
 # --- Full integration tests (real compilation) ---
 
 
+@pytest.mark.requires_hardware
 class TestRuntimeBuilderIntegration:
     """Integration tests that actually compile all platform × runtime combinations.
 

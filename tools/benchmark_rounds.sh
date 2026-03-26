@@ -15,7 +15,7 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 
 # ---------------------------------------------------------------------------
 # Examples to benchmark and their case lists, per runtime.
-# Key   = directory name under tests/device_tests/<platform>/<runtime>/
+# Key   = directory name under tests/st/<platform>/<runtime>/
 # Value = comma-separated case names to run (empty string = run DEFAULT_CASE)
 # ---------------------------------------------------------------------------
 
@@ -124,7 +124,7 @@ vlog() {
 # ---------------------------------------------------------------------------
 # Derive arch from platform and set examples directory
 # ---------------------------------------------------------------------------
-EXAMPLES_DIR="$PROJECT_ROOT/tests/device_tests/${PLATFORM}/${RUNTIME}"
+EXAMPLES_DIR="$PROJECT_ROOT/tests/st/${PLATFORM}/${RUNTIME}"
 
 # Clock frequency (MHz) for converting cycle counts to microseconds
 case "$PLATFORM" in

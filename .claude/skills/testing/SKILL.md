@@ -7,9 +7,10 @@ description: Testing guide and pre-commit testing strategy for PTO Runtime. Use 
 
 ## Test Types
 
-1. **Python unit tests** (`tests/test_runtime_builder.py`): Standard pytest tests for the Python compilation pipeline. Run with `pytest tests -v`.
-2. **Simulation examples** (`examples/*/`): Full end-to-end tests running on `a2a3sim`. No hardware required, works on Linux and macOS.
-3. **Device tests** (`tests/device_tests/*/`): Hardware-only tests running on real Ascend devices via `a2a3`. Requires CANN toolkit.
+1. **Python unit tests (pyut)** (`tests/ut/`): Standard pytest tests for the Python compilation pipeline and nanobind bindings. Run with `pytest tests -m "not requires_hardware" -v`. Some tests require hardware (`@pytest.mark.requires_hardware`).
+2. **C++ unit tests (cpput)** (`tests/cpp/`): GoogleTest-based tests for pure C++ modules with no Python binding. Run with `cmake -B tests/cpp/build -S tests/cpp && cmake --build tests/cpp/build && ctest --test-dir tests/cpp/build --output-on-failure`.
+3. **Simulation examples** (`examples/{arch}/*/`): Small end-to-end examples running on both sim and hardware. No hardware required for sim mode, works on Linux and macOS.
+4. **Device scene tests** (`tests/st/{arch}/*/`): Hardware-only scene tests for large-scale and feature-rich scenarios. Running on real Ascend devices via `a2a3`. Requires CANN toolkit.
 
 ## Running Tests
 
@@ -18,8 +19,11 @@ description: Testing guide and pre-commit testing strategy for PTO Runtime. Use 
 **IMPORTANT**: Never pipe `ci.sh --parallel` output through buffering commands like `| tail`, `| grep`, or `| head`. Parallel mode spawns background subprocesses whose stdout is interleaved; pipe filters buffer until the pipe closes (all children exit), producing zero visible output and appearing hung. Always capture full output directly (`2>&1` without pipes).
 
 ```bash
-# Python unit tests
-pytest tests -v
+# Python unit tests (no hardware)
+pytest tests -m "not requires_hardware" -v
+
+# C++ unit tests (no hardware)
+cmake -B tests/cpp/build -S tests/cpp && cmake --build tests/cpp/build && ctest --test-dir tests/cpp/build --output-on-failure
 
 # All simulation tests (extract -c and -t from ci.yml)
 ./ci.sh -p a2a3sim -c <commit> -t <timeout>
@@ -32,8 +36,8 @@ pytest tests -v
 
 # Single example
 python examples/scripts/run_example.py \
-    -k examples/host_build_graph/vector_example/kernels \
-    -g examples/host_build_graph/vector_example/golden.py \
+    -k examples/a2a3/host_build_graph/vector_example/kernels \
+    -g examples/a2a3/host_build_graph/vector_example/golden.py \
     -p a2a3sim -c <commit>
 ```
 
@@ -41,7 +45,7 @@ python examples/scripts/run_example.py \
 
 When changed files require testing (C++, Python, or CMake), follow these steps to decide **what** to test and **how**.
 
-### Step 1 — Platform Availability
+### Step 1 — Platform Availability and Detection
 
 ```bash
 command -v npu-smi &>/dev/null
@@ -49,8 +53,17 @@ command -v npu-smi &>/dev/null
 
 | Result | Platforms to test |
 | ------ | ----------------- |
-| Found | `a2a3sim` (simulation) **and** `a2a3` (hardware) |
-| Not found | `a2a3sim` only |
+| Found | `<arch>sim` (simulation) **and** `<arch>` (hardware) |
+| Not found | Simulation only (default `a2a3sim`) |
+
+**When `npu-smi` is found**, detect the platform by parsing chip name from `npu-smi info` output:
+
+| Chip name contains | Platform |
+| ------------------ | -------- |
+| `910B` or `910C` | `a2a3` (sim: `a2a3sim`) |
+| `950` | `a5` (sim: `a5sim`) |
+
+Use the detected platform for all subsequent `-p` flags. If the chip name is unrecognized, warn and default to `a2a3`.
 
 ### Step 2 — Test Scope
 
@@ -58,9 +71,10 @@ Run `git diff --name-only` (or `git diff --cached --name-only` for staged change
 
 | Changed paths | Scope | Command pattern |
 | ------------- | ----- | --------------- |
-| `src/platform/*` | Full (all runtimes) | `./ci.sh -p <platform>` |
-| `src/runtime/<rt>/*` | Single runtime | `./ci.sh -p <platform> -r <rt>` |
-| `examples/<rt>/<ex>/*` | Single example | `python examples/scripts/run_example.py -k <ex>/kernels -g <ex>/golden.py -p <platform>` |
+| `src/{arch}/platform/*` | Full (all runtimes) | `./ci.sh -p <platform>` |
+| `src/{arch}/runtime/<rt>/*` | Single runtime | `./ci.sh -p <platform> -r <rt>` |
+| `examples/{arch}/<rt>/<ex>/*` | Single example | `python examples/scripts/run_example.py -k <ex>/kernels -g <ex>/golden.py -p <platform>` |
+| `tests/ut/*` or `tests/cpp/*` | Unit tests only | `pytest tests -m "not requires_hardware" -v` and/or `ctest` |
 | Mixed (spans multiple categories) | Escalate to the **widest** matching scope | — |
 
 ### Step 3 — Parallel Strategy
@@ -117,9 +131,9 @@ git diff --name-only
 
 ## Adding a New Example or Device Test
 
-1. Create a directory under the appropriate runtime:
-   - Examples: `examples/<runtime>/<name>/`
-   - Device tests: `tests/device_tests/<runtime>/<name>/`
+1. Create a directory under the appropriate arch and runtime:
+   - Examples: `examples/{arch}/<runtime>/<name>/`
+   - Device scene tests: `tests/st/{arch}/<runtime>/<name>/`
 2. Add `golden.py` implementing `generate_inputs(params)` and `compute_golden(tensors, params)`
 3. Add `kernels/kernel_config.py` with `KERNELS` list, `ORCHESTRATION` dict, and `RUNTIME_CONFIG`
 4. Add kernel source files under `kernels/aic/`, `kernels/aiv/`, and/or `kernels/orchestration/`

@@ -8,7 +8,7 @@ from pathlib import Path
 import pytest
 
 # Ensure python/ is on the import path so _task_interface and task_interface resolve
-_python_dir = str(Path(__file__).resolve().parent.parent / "python")
+_python_dir = str(Path(__file__).resolve().parent.parent.parent / "python")
 if _python_dir not in sys.path:
     sys.path.insert(0, _python_dir)
 

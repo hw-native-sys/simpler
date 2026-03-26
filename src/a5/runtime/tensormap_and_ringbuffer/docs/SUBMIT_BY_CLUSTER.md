@@ -205,8 +205,8 @@ Milestone command (device):
 
 ```bash
 python examples/scripts/run_example.py \
-  -k tests/device_tests/tensormap_and_ringbuffer/batch_paged_attention/kernels \
-  -g tests/device_tests/tensormap_and_ringbuffer/batch_paged_attention/golden.py \
+  -k tests/st/tensormap_and_ringbuffer/batch_paged_attention/kernels \
+  -g tests/st/tensormap_and_ringbuffer/batch_paged_attention/golden.py \
   -p a2a3 -d 9
 ```
 

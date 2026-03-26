@@ -9,20 +9,42 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  pytest:
-    runs-on: self-hosted
+  # ---------- Python unit tests (no hardware) ----------
+  ut-py:
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install numpy
+          pip install ml_dtypes
+          pip install pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
       - name: Build nanobind extension
         run: pip install .
 
-      - name: Run pytest
-        run: pytest tests -v
+      - name: Run unit tests
+        run: pytest tests -m "not requires_hardware" -v
 
-  run-example-on-a2a3sim:
+  # ---------- Simulation scene tests ----------
+  st-sim-a2a3:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -75,7 +97,7 @@ jobs:
       - name: Run simulation examples (a2a3sim)
         run: ./ci.sh -p a2a3sim -c 6622890 -t 600 --clone-protocol https
 
-  run-example-on-a5sim:
+  st-sim-a5:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -128,8 +150,26 @@ jobs:
       - name: Run simulation examples (a5sim)
         run: ./ci.sh -p a5sim -c 6622890 -t 600 --clone-protocol https
 
-  run-example-on-device:
-    runs-on: self-hosted
+  # ---------- Python unit tests (a2a3 hardware) ----------
+  ut-py-a2a3:
+    runs-on: [self-hosted, a2a3]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build nanobind extension
+        run: pip install .
+
+      - name: Run hardware unit tests (a2a3)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest tests -m requires_hardware --platform a2a3 -v
+
+  # ---------- Scene tests (a2a3 hardware) ----------
+  st-onboard-a2a3:
+    runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
 
     steps:
@@ -139,7 +179,42 @@ jobs:
       - name: Build nanobind extension
         run: pip install .
 
-      - name: Run on-device examples
+      - name: Run on-device examples (a2a3)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
           source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a2a3 -d ${DEVICE_RANGE} --parallel -c 6622890 -t 600 --clone-protocol https
+
+  # TODO: Uncomment when a5 hardware runner is available.
+  #       Add the "a5" label to the runner, matching [self-hosted, a5] below.
+  #
+  # ut-py-a5:
+  #   runs-on: [self-hosted, a5]
+  #   timeout-minutes: 30
+  #
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Build nanobind extension
+  #       run: pip install .
+  #
+  #     - name: Run hardware unit tests (a5)
+  #       run: |
+  #         export PATH="$HOME/.local/bin:$PATH"
+  #         source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest tests -m requires_hardware --platform a5 -v
+  #
+  # st-onboard-a5:
+  #   runs-on: [self-hosted, a5]
+  #   timeout-minutes: 60
+  #
+  #   steps:
+  #     - name: Checkout repository
+  #       uses: actions/checkout@v4
+  #
+  #     - name: Build nanobind extension
+  #       run: pip install .
+  #
+  #     - name: Run on-device examples (a5)
+  #       run: |
+  #         export PATH="$HOME/.local/bin:$PATH"
+  #         source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a5 -d ${DEVICE_RANGE} --parallel -c 6622890 -t 600 --clone-protocol https

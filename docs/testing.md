@@ -3,14 +3,14 @@
 ## Quick Reference
 
 ```bash
-# Simulation tests (no hardware required)
+# Unit tests (no hardware required)
+pytest tests -m "not requires_hardware" -v
+
+# Simulation scene tests (no hardware required)
 ./ci.sh -p a2a3sim
 
-# Hardware tests (requires Ascend device)
+# Hardware scene tests (requires Ascend device)
 ./ci.sh -p a2a3 -d 4-7 --parallel
-
-# Python unit tests
-pytest tests -v
 
 # C++ unit tests
 cmake -B tests/cpp/build -S tests/cpp && cmake --build tests/cpp/build && ctest --test-dir tests/cpp/build --output-on-failure
@@ -22,30 +22,53 @@ python examples/scripts/run_example.py \
     -p a2a3sim
 ```
 
-## CI Pipeline (`ci.sh`)
+## Test Organization
 
-The `ci.sh` script runs the full test suite:
+Three test categories:
 
-1. **C++ unit tests** — GoogleTest-based tests for shared runtime components (`tests/cpp/`)
-2. **Python unit tests** — `pytest tests -v`
-3. **Simulation/device tests** — Runs all examples and device tests for the specified platform
+| Category | Abbrev | Location | Runner | Description |
+|----------|--------|----------|--------|-------------|
+| System tests | st | `examples/`, `tests/st/` | `ci.sh` | Full end-to-end cases (compile + run + validate) |
+| Python unit tests | ut-py | `tests/ut/` | pytest | Unit tests for nanobind-exposed and Python modules |
+| C++ unit tests | ut-cpp | `tests/cpp/` | ctest (GoogleTest) | Unit tests for pure C++ modules |
 
-### Simulation Mode
+### Choosing ut-py vs ut-cpp
 
-```bash
-./ci.sh -p a2a3sim
+If a module is exposed via nanobind (used by both C++ and Python), test in **ut-py** (`tests/ut/`).
+If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/cpp/`).
+
+## Hardware Classification
+
+All three categories (st, ut-py, ut-cpp) need a way to specify hardware requirements. Three tiers:
+
+| Tier | ut-py (pytest marker) | ut-cpp (ctest label) | st (current mechanism) |
+|------|---------------------|--------------------|-----------------------|
+| No hardware | `-m "not requires_hardware"` | `-L no_hardware` | `examples/` on sim platform |
+| Any hardware | `-m requires_hardware` (no `--platform`) | `-L requires_hardware` | — |
+| Platform-specific | `-m requires_hardware --platform a2a3` | `-L requires_a2a3` | `tests/st/{arch}/` on device platform |
+
+For st, hardware classification is currently folder-based: `examples/` runs on both sim and device, `tests/st/` runs on device only. This works but may be unified with per-case metadata in the future (see [Future: Per-Case Device Filtering](#future-per-case-device-filtering)).
+
+## Test Directory Structure
+
 ```
+tests/
+  conftest.py          # pytest configuration (markers, fixtures, parametrization)
+  ut/                  # Python unit tests (ut-py)
+    test_task_interface.py
+    test_runtime_builder.py
+  st/                  # Hardware-only scene tests (large-scale, feature-rich)
+    a2a3/
+      host_build_graph/...
+      aicpu_build_graph/...
+      tensormap_and_ringbuffer/...
+    a5/...
+  cpp/                 # C++ unit tests (ut-cpp, GoogleTest)
 
-Runs all tests using thread-based simulation. No Ascend hardware needed.
-
-### Hardware Mode
-
-```bash
-./ci.sh -p a2a3 -d 4-7 --parallel
+examples/              # Small examples (sim + onboard)
+  a2a3/...
+  a5/...
 ```
-
-- `-d 4-7`: Use devices 4 through 7
-- `--parallel`: Run tests in parallel across devices
 
 ## Test Types
 
@@ -56,34 +79,47 @@ GoogleTest-based tests for shared components (`src/common/task_interface/` and `
 - `test_data_type.cpp` — DataType enum, get_element_size(), get_dtype_name()
 - `test_task_arg.cpp` — TaskArg packing/unpacking, byte alignment, nbytes(), DMA copy semantics
 
-Build and run independently:
 ```bash
 cmake -B tests/cpp/build -S tests/cpp
 cmake --build tests/cpp/build
 ctest --test-dir tests/cpp/build --output-on-failure
 ```
 
-### Python Unit Tests (`tests/`)
+### Python Unit Tests (`tests/ut/`)
 
-Tests for the Python build pipeline:
-- `test_runtime_builder.py` — RuntimeBuilder configuration and build flow
+Tests for the nanobind extension and the Python build pipeline:
+
+- `test_task_interface.py` — DataType, TaskArg, TaskArgArray, torch integration
+- `test_runtime_builder.py` — RuntimeBuilder discovery, error handling, build logic (mocked), and real compilation integration tests
 
 ```bash
-pytest tests -v
+# All non-hardware unit tests
+pytest tests -m "not requires_hardware" -v
+
+# Hardware integration tests only (requires Ascend toolchain)
+pytest tests -m requires_hardware --platform a2a3 -v
 ```
 
 ### Examples (`examples/{arch}/`)
 
-Working examples organized by runtime:
+Small, fast examples that run on both simulation and real hardware. Organized by runtime:
+
 - `host_build_graph/` — HBG examples
 - `aicpu_build_graph/` — ABG examples
 - `tensormap_and_ringbuffer/` — TMR examples
 
 Each example has a `golden.py` with `generate_inputs()` and `compute_golden()` for result validation.
 
-### Device Tests (`tests/device_tests/{arch}/`)
+### Device Scene Tests (`tests/st/{arch}/`)
 
-Integration tests that run on simulation or hardware, organized by runtime. Same structure as examples but focused on testing specific runtime behaviors and edge cases.
+Hardware-only scene tests for large-scale and feature-rich scenarios that are too slow or unsupported on simulation. Organized by runtime. Same structure as examples but focused on testing specific runtime behaviors and edge cases.
+
+| | `examples/` | `tests/st/` |
+|---|------------|-------------|
+| Runs on sim | Yes | No |
+| Runs on device | Yes | Yes |
+| Scale | Small, fast | Large, thorough |
+| Purpose | Examples + basic regression | Deep functionality/performance |
 
 ## Writing New Tests
 
@@ -101,10 +137,37 @@ target_link_libraries(test_my_component gtest_main)
 add_test(NAME test_my_component COMMAND test_my_component)
 ```
 
-### New Device Test
+### New Scene Test
 
-Create a directory under `tests/device_tests/{arch}/{runtime}/my_test/` with:
+Create a directory under `tests/st/{arch}/{runtime}/my_test/` with:
 - `golden.py` — Input generation and golden output computation
 - `kernels/kernel_config.py` — Kernel and runtime configuration
 
 The test will be automatically picked up by `ci.sh`.
+
+## CI Pipeline
+
+See [ci.md](ci.md) for the full CI pipeline documentation, including the job matrix, runner constraints, marker scheme, and `ci.sh` internals.
+
+## Future: Per-Case Device Filtering
+
+### Problem
+
+`examples/` and `tests/st/` can duplicate entire kernel directories when only input scale differs — `examples/` carries a small sim-friendly case, and `tests/st/` carries a large device-scale case with the same kernel code.
+
+### Proposed approach
+
+Each `golden.py` can optionally mark specific cases as device-only via a `device_only` flag in `ALL_CASES`:
+
+```python
+ALL_CASES = {
+    "SmallCase": {"batch": 1, "head_dim": 16, "dtype": "float16"},
+    "LargeCase": {"batch": 256, "head_dim": 128, "dtype": "bfloat16", "device_only": True},
+}
+```
+
+`code_runner.py` would filter out `device_only` cases on sim platforms. This allows a single directory to serve both sim smoke tests and device-scale tests without kernel duplication.
+
+### When separate directories are still needed
+
+When kernels themselves differ (e.g., templated tile sizes tuned for device), separate directories under `examples/` and `tests/st/` remain the correct approach.

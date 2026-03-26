@@ -12,28 +12,7 @@ See [docs/developer-guide.md](docs/developer-guide.md) for full directory struct
 
 ## Common Commands
 
-### Simulation tests (no hardware required)
-```bash
-./ci.sh -p a2a3sim
-```
-
-### Hardware tests (requires Ascend device)
-```bash
-./ci.sh -p a2a3 -d 4-7 --parallel
-```
-
-### Run a single example
-```bash
-python examples/scripts/run_example.py \
-    -k examples/a2a3/host_build_graph/vector_example/kernels \
-    -g examples/a2a3/host_build_graph/vector_example/golden.py \
-    -p a2a3sim
-```
-
-### Python unit tests
-```bash
-pytest tests -v
-```
+See [docs/testing.md](docs/testing.md) for the full testing guide (st, pyut, cpput) and [docs/ci.md](docs/ci.md) for CI pipeline details.
 
 ### Format C++ code
 ```bash
