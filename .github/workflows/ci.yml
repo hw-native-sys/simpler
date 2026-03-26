@@ -51,6 +51,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python-version: ['3.10']
+        runtime: [host_build_graph, aicpu_build_graph, tensormap_and_ringbuffer]
 
     steps:
       - name: Checkout repository
@@ -94,8 +95,8 @@ jobs:
       - name: Build nanobind extension
         run: pip install .
 
-      - name: Run simulation examples (a2a3sim)
-        run: ./ci.sh -p a2a3sim -c 6622890 -t 600 --clone-protocol https
+      - name: Run simulation examples (a2a3sim, ${{ matrix.runtime }})
+        run: ./ci.sh -p a2a3sim -r ${{ matrix.runtime }} -c 6622890 -t 600 --clone-protocol https
 
   st-sim-a5:
     runs-on: ${{ matrix.os }}
@@ -104,6 +105,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
         python-version: ['3.10']
+        runtime: [host_build_graph, tensormap_and_ringbuffer]
 
     steps:
       - name: Checkout repository
@@ -147,8 +149,8 @@ jobs:
       - name: Build nanobind extension
         run: pip install .
 
-      - name: Run simulation examples (a5sim)
-        run: ./ci.sh -p a5sim -c 6622890 -t 600 --clone-protocol https
+      - name: Run simulation examples (a5sim, ${{ matrix.runtime }})
+        run: ./ci.sh -p a5sim -r ${{ matrix.runtime }} -c 6622890 -t 600 --clone-protocol https
 
   # ---------- Python unit tests (a2a3 hardware) ----------
   ut-py-a2a3:
