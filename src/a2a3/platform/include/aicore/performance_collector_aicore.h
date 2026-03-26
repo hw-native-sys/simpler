@@ -35,36 +35,27 @@
  * @param task_id Register dispatch id (DATA_MAIN_BASE), stored in task_id low 32 bits
  * @param start_time Start timestamp
  * @param end_time End timestamp
- * @param kernel_ready_time Kernel ready timestamp
  */
 __aicore__ __attribute__((always_inline))
 static inline void perf_aicore_record_task(
     __gm__ PerfBuffer* perf_buf,
     uint32_t task_id,
     uint64_t start_time,
-    uint64_t end_time,
-    uint64_t kernel_ready_time) {
+    uint64_t end_time) {
 
-    // Read current buffer count
+    // Read current buffer count (AICPU owns the count, AICore reads only)
     dcci(&perf_buf->count, SINGLE_CACHE_LINE);
     uint32_t idx = perf_buf->count;
 
-    if (idx >= PLATFORM_PROF_BUFFER_SIZE) {
-        return;
-    }
-
     __gm__ PerfRecord* record = &perf_buf->records[idx];
 
-    // Write record data (func_id and core_type filled by AICPU at completion)
+    // Write record data (func_id, core_type, and count filled by AICPU at completion)
     record->start_time = start_time;
     record->end_time = end_time;
-    record->kernel_ready_time = kernel_ready_time;
     record->task_id = static_cast<uint64_t>(task_id);
 
-    perf_buf->count = idx + 1;
-
     // Flush cache to make data visible
-    dcci(record, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+    dcci(record, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
 }
 

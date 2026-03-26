@@ -29,17 +29,31 @@
 void perf_aicpu_init_profiling(Runtime* runtime);
 
 /**
- * Record dispatch and finish timestamps
+ * Complete a PerfRecord with AICPU-side metadata after AICore task completion
  *
- * Updates task record with AICPU-side timing information.
+ * Reads perf_buf->count, validates task_id match against the latest record,
+ * and fills all AICPU-side fields. Callers must pre-extract fanout into a
+ * plain int32_t array (platform layer cannot depend on runtime linked-list types).
  *
- * @param record PerfRecord pointer to update
- * @param dispatch_time Dispatch timestamp
- * @param finish_time Finish timestamp
+ * @param perf_buf         PerfBuffer pointer (from handshake perf_records_addr)
+ * @param expected_task_id Task ID to validate against the latest record
+ * @param func_id          Kernel function identifier
+ * @param core_type        Core type (AIC/AIV)
+ * @param dispatch_time    AICPU timestamp when task was dispatched
+ * @param finish_time      AICPU timestamp when task completion was observed
+ * @param ring_id          Ring layer (0 for single-ring / host_build_graph)
+ * @param fanout           Pre-extracted successor task ID array (nullptr if none)
+ * @param fanout_count     Number of entries in fanout array (0 if none)
  */
-void perf_aicpu_record_dispatch_and_finish_time(PerfRecord* record,
-                                                 uint64_t dispatch_time,
-                                                 uint64_t finish_time);
+int perf_aicpu_complete_record(PerfBuffer* perf_buf,
+                                uint32_t expected_task_id,
+                                uint32_t func_id,
+                                CoreType core_type,
+                                uint64_t dispatch_time,
+                                uint64_t finish_time,
+                                uint8_t ring_id,
+                                const int32_t* fanout,
+                                int32_t fanout_count);
 
 /**
  * Switch performance buffer when current buffer is full

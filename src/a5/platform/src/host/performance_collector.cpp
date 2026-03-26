@@ -922,16 +922,14 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                   return a.record->task_id < b.record->task_id;
               });
 
-    // Step 4: Calculate base time (minimum kernel_ready_time, including phase timestamps)
+    // Step 4: Calculate base time (minimum timestamp across all records)
     uint64_t base_time_cycles = UINT64_MAX;
     for (const auto& tagged : tagged_records) {
-        if (tagged.record->kernel_ready_time < base_time_cycles) {
-            base_time_cycles = tagged.record->kernel_ready_time;
+        if (tagged.record->start_time < base_time_cycles) {
+            base_time_cycles = tagged.record->start_time;
         }
-        if (tagged.record->dispatch_time < base_time_cycles && tagged.record->dispatch_time > 0) {
+        if (tagged.record->dispatch_time > 0 && tagged.record->dispatch_time < base_time_cycles) {
             base_time_cycles = tagged.record->dispatch_time;
-            LOG_WARN("Timestamp violation: dispatch_time (%lu) < base_time (%lu) for task %u, using dispatch_time as new base_time",
-                        tagged.record->dispatch_time, base_time_cycles, tagged.record->task_id);
         }
     }
 
@@ -980,7 +978,6 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         double start_us = cycles_to_us(record.start_time - base_time_cycles);
         double end_us = cycles_to_us(record.end_time - base_time_cycles);
         double duration_us = end_us - start_us;
-        double kernel_ready_us = cycles_to_us(record.kernel_ready_time - base_time_cycles);
         double dispatch_us = (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time - base_time_cycles) : 0.0;
         double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time - base_time_cycles) : 0.0;
 
@@ -994,7 +991,6 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         outfile << "      \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us << ",\n";
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
-        outfile << "      \"kernel_ready_time_us\": " << std::fixed << std::setprecision(3) << kernel_ready_us << ",\n";
         outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
         outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
         outfile << "      \"fanout\": [";

@@ -324,20 +324,6 @@ public:
     void clear_tensor_pairs();
 
     // =========================================================================
-    // Performance Profiling
-    // =========================================================================
-
-    /**
-     * Fill fanout information for performance records
-     *
-     * Extracts task dependency data from the task graph and populates
-     * fanout arrays in performance records.
-     *
-     * @param perf_buf Performance buffer containing records to complete
-     */
-    void complete_perf_records(PerfBuffer* perf_buf);
-
-    // =========================================================================
     // Device Orchestration (stub for API compatibility)
     // =========================================================================
 

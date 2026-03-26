@@ -80,7 +80,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
         reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
 
     bool profiling_enabled = runtime->enable_profiling;
-    uint64_t kernel_ready_time = get_sys_cnt_aicore();
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
@@ -120,7 +119,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
                 perf_aicore_record_task(perf_buf, task_id,
-                                       start_time, end_time, kernel_ready_time);
+                                       start_time, end_time);
             }
 
             last_reg_val = reg_val;

@@ -365,32 +365,26 @@ struct AicpuExecutor {
                     Handshake* h = &hank[core_id];
                     uint64_t finish_ts = get_sys_cnt_aicpu();
                     PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
-                    rmb();
-                    uint32_t count = perf_buf->count;
-                    if (count > 0) {
-                        PerfRecord* record = &perf_buf->records[count - 1];
-                        if (record->task_id == static_cast<uint32_t>(expected_reg_task_id)) {
-                            // Fill metadata that AICore doesn't know
-                            int32_t perf_slot_idx = static_cast<int32_t>(executing_subslot_by_core_[core_id]);
-                            record->func_id = slot_state.task->kernel_id[perf_slot_idx];
-                            record->core_type = CT;
-                            perf_aicpu_record_dispatch_and_finish_time(
-                                record, dispatch_timestamps_[core_id], finish_ts);
 
-                            // Fill ring_id from slot state
-                            record->ring_id = slot_state.ring_id;
+                    // Pre-extract fanout (platform layer cannot depend on PTO2DepListEntry)
+                    int32_t fanout_arr[RUNTIME_MAX_FANOUT];
+                    int32_t fanout_n = 0;
+                    PTO2DepListEntry* cur = slot_state.fanout_head;
+                    while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
+                        fanout_arr[fanout_n++] = static_cast<int32_t>(
+                            pto2_task_id_local(cur->slot_state->task->mixed_task_id));
+                        cur = cur->next;
+                    }
 
-                            // Fill fanout from slot_state's dependency linked list.
-                            // No lock: head-insert guarantees existing nodes' next pointers
-                            // are stable, so this snapshot is consistent (best-effort).
-                            record->fanout_count = 0;
-                            PTO2DepListEntry* cur = slot_state.fanout_head;
-                            while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
-                                record->fanout[record->fanout_count++] = static_cast<int32_t>(
-                                    pto2_task_id_local(cur->slot_state->task->mixed_task_id));
-                                cur = cur->next;
-                            }
-                        }
+                    int32_t perf_slot_idx = static_cast<int32_t>(executing_subslot_by_core_[core_id]);
+                    if (perf_aicpu_complete_record(perf_buf,
+                        static_cast<uint32_t>(expected_reg_task_id),
+                        slot_state.task->kernel_id[perf_slot_idx], CT,
+                        dispatch_timestamps_[core_id], finish_ts,
+                        slot_state.ring_id,
+                        fanout_arr, fanout_n) != 0) {
+                        DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task %u",
+                            core_id, expected_reg_task_id);
                     }
 #if PTO2_SCHED_PROFILING
                     sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
@@ -1728,7 +1722,6 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
 #endif
 
                 // With multi-ring, slot_states are per-ring inside the scheduler.
-                // Fanout fill-in in complete_perf_records is disabled (slot_states_ptr = nullptr).
                 runtime->set_pto2_slot_states_ptr(nullptr);
 
                 // Store shared state for other orchestrator threads

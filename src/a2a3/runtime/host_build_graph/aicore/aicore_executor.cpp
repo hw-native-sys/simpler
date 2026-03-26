@@ -41,7 +41,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     bool profiling_enabled = runtime->enable_profiling;
-    uint64_t kernel_ready_time = get_sys_cnt_aicore();
 
     volatile uint32_t task_id = AICPU_IDLE_TASK_ID;
     volatile uint32_t last_task_id = AICPU_IDLE_TASK_ID;
@@ -72,7 +71,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
                 perf_aicore_record_task(perf_buf, actual_task_id,
-                                      start_time, end_time, kernel_ready_time);
+                                      start_time, end_time);
             }
 
             last_task_id = task_id;

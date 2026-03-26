@@ -628,18 +628,19 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                 if (profiling_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
                     PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
-                    rmb();
-                    uint32_t count = perf_buf->count;
-                    if (count > 0) {
-                        PerfRecord* record = &perf_buf->records[count - 1];
-                        if (static_cast<uint32_t>(record->task_id) ==
-                            static_cast<uint32_t>(completed_task_id)) {
-                            record->func_id = runtime.tasks[completed_task_id].func_id;
-                            record->core_type = h->core_type;
-                            perf_aicpu_record_dispatch_and_finish_time(
-                                record, dispatch_timestamps_[core_id], finish_ts);
-                            record->task_id = static_cast<uint64_t>(completed_task_id);
-                        }
+                    Task* task = &runtime.tasks[completed_task_id];
+                    uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
+                    for (int i = 0; i < task->fanout_count; i++) {
+                        fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
+                    }
+                    if (perf_aicpu_complete_record(perf_buf,
+                        static_cast<uint32_t>(completed_task_id),
+                        static_cast<uint64_t>(completed_task_id),
+                        task->func_id, h->core_type,
+                        dispatch_timestamps_[core_id], finish_ts,
+                        fanout_arr, task->fanout_count) != 0) {
+                        DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task %d",
+                            core_id, completed_task_id);
                     }
                     dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                 }
@@ -767,18 +768,19 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                 if (profiling_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
                     PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
-                    rmb();
-                    uint32_t count = perf_buf->count;
-                    if (count > 0) {
-                        PerfRecord* record = &perf_buf->records[count - 1];
-                        if (static_cast<uint32_t>(record->task_id) ==
-                            static_cast<uint32_t>(completed_task_id)) {
-                            record->func_id = runtime.tasks[completed_task_id].func_id;
-                            record->core_type = h->core_type;
-                            perf_aicpu_record_dispatch_and_finish_time(
-                                record, dispatch_timestamps_[core_id], finish_ts);
-                            record->task_id = static_cast<uint64_t>(completed_task_id);
-                        }
+                    Task* task = &runtime.tasks[completed_task_id];
+                    uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
+                    for (int i = 0; i < task->fanout_count; i++) {
+                        fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
+                    }
+                    if (perf_aicpu_complete_record(perf_buf,
+                        static_cast<uint32_t>(completed_task_id),
+                        static_cast<uint64_t>(completed_task_id),
+                        task->func_id, h->core_type,
+                        dispatch_timestamps_[core_id], finish_ts,
+                        fanout_arr, task->fanout_count) != 0) {
+                        DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task %d",
+                            core_id, completed_task_id);
                     }
                     dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                 }

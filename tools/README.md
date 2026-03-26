@@ -373,7 +373,6 @@ log_path, strategy = resolve_device_log_path(
       "start_time_us": 100.0,
       "end_time_us": 250.5,
       "duration_us": 150.5,
-      "kernel_ready_time_us": 95.0,
       "fanout": [1, 2],
       "fanout_count": 2
     }

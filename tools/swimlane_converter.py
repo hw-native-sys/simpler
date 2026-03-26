@@ -320,7 +320,7 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
         tasks: List of task dicts with fields:
             - task_id, func_id, core_id, core_type
             - start_time_us, end_time_us, duration_us
-            - kernel_ready_time_us, fanout, fanout_count
+            - fanout, fanout_count
             - dispatch_time_us (optional, AICPU dispatch timestamp)
             - finish_time_us (optional, AICPU finish timestamp)
         output_path: Path to output JSON file
@@ -458,7 +458,6 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                 "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
                 "fanout-hint": fanout_str,
                 "duration-us": dur,
-                "kernel-ready-time-us": task['kernel_ready_time_us'],
                 "taskId": task['task_id']
             },
             "cat": "event",

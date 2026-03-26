@@ -114,15 +114,42 @@ void perf_aicpu_init_profiling(Runtime* runtime) {
     LOG_INFO("Performance profiling initialized for %d cores", runtime->worker_count);
 }
 
-void perf_aicpu_record_dispatch_and_finish_time(PerfRecord* record,
-                                                 uint64_t dispatch_time,
-                                                 uint64_t finish_time) {
+int perf_aicpu_complete_record(PerfBuffer* perf_buf,
+                                uint32_t expected_task_id,
+                                uint32_t func_id,
+                                CoreType core_type,
+                                uint64_t dispatch_time,
+                                uint64_t finish_time,
+                                uint8_t ring_id,
+                                const int32_t* fanout,
+                                int32_t fanout_count) {
     rmb();
+    uint32_t count = perf_buf->count;
+    if (count >= PLATFORM_PROF_BUFFER_SIZE) return -1;
 
+    PerfRecord* record = &perf_buf->records[count];
+    if (record->task_id != expected_task_id) return -1;
+
+    record->func_id = func_id;
+    record->core_type = core_type;
     record->dispatch_time = dispatch_time;
     record->finish_time = finish_time;
+    record->ring_id = ring_id;
 
+    if (fanout != nullptr && fanout_count > 0) {
+        int32_t n = (fanout_count > RUNTIME_MAX_FANOUT)
+                        ? RUNTIME_MAX_FANOUT : fanout_count;
+        for (int32_t i = 0; i < n; i++) {
+            record->fanout[i] = fanout[i];
+        }
+        record->fanout_count = n;
+    } else {
+        record->fanout_count = 0;
+    }
+
+    perf_buf->count = count + 1;
     wmb();
+    return 0;
 }
 
 void perf_aicpu_switch_buffer(Runtime* runtime, int core_id, int thread_idx) {
@@ -136,12 +163,10 @@ void perf_aicpu_switch_buffer(Runtime* runtime, int core_id, int thread_idx) {
         return;
     }
 
-    // Complete performance records (fill fanout info)
     PerfBuffer* full_buf = (PerfBuffer*)state->current_buf_ptr;
     if (full_buf == nullptr) {
         return;
     }
-    runtime->complete_perf_records(full_buf);
 
     LOG_INFO("Thread %d: Core %d buffer is full (count=%u)",
              thread_idx, core_id, full_buf->count);
@@ -228,8 +253,6 @@ void perf_aicpu_flush_buffers(Runtime* runtime,
         if (buf->count == 0) {
             continue;
         }
-
-        runtime->complete_perf_records(buf);
 
         uint32_t seq = state->current_buf_seq;
         int rc = enqueue_ready_buffer(s_perf_header, thread_idx, core_id,
