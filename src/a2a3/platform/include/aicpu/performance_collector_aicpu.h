@@ -101,12 +101,14 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, in
  * @param start_time Phase start timestamp
  * @param end_time Phase end timestamp
  * @param loop_iter Current loop iteration number
- * @param tasks_processed Number of tasks processed in this phase
+ * @param tasks_processed Number of tasks processed in this batch (scheduler phases), or
+ *                        full PTO2 task_id encoding (ring_id << 32) | local_id (orchestrator
+ *                        phases in multi-ring runtimes: tensormap_and_ringbuffer, aicpu_build_graph)
  */
 void perf_aicpu_record_phase(int thread_idx,
                               AicpuPhaseId phase_id,
                               uint64_t start_time, uint64_t end_time,
-                              uint32_t loop_iter, uint32_t tasks_processed);
+                              uint32_t loop_iter, uint64_t tasks_processed);
 
 /**
  * Write orchestrator cumulative summary
@@ -138,11 +140,13 @@ void perf_aicpu_set_orch_thread_idx(int thread_idx);
  * @param start_time Phase start timestamp
  * @param end_time Phase end timestamp
  * @param submit_idx Task submission index (acts as loop_iter)
- * @param task_id Task ID (stored in tasks_processed field for task tracking)
+ * @param task_id Task identifier. For multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph), this is the full PTO2 encoding:
+ *               (ring_id << 32) | local_id, enabling cross-view correlation between orchestrator
+ *               and scheduler swimlanes.
  */
 void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
                                    uint64_t start_time, uint64_t end_time,
-                                   uint32_t submit_idx, uint32_t task_id);
+                                   uint32_t submit_idx, uint64_t task_id);
 
 /**
  * Write core-to-thread assignment mapping to shared memory

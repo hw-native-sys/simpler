@@ -31,6 +31,15 @@
 // Use variadic macro to support both 2-arg and 3-arg calls.
 #define dcci(...) std::atomic_thread_fence(std::memory_order_seq_cst)
 
+// dsb / mem_dsb_t — CANN provides these on real AICore; perf_collector uses them after dcci flush.
+// Simulation: full fence (same strength as dcci above) so AICPU ordering matches hardware intent.
+typedef int mem_dsb_t;
+#define dsb(_kind)                                                                               \
+    do {                                                                                         \
+        (void)(_kind);                                                                           \
+        std::atomic_thread_fence(std::memory_order_seq_cst);                                    \
+    } while (0)
+
 // Cache coherency constants (no-op in simulation)
 #define ENTIRE_DATA_CACHE 0
 #define SINGLE_CACHE_LINE 0

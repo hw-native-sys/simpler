@@ -39,11 +39,11 @@ static __thread int s_orch_thread_idx = -1;
  * @return 0 on success, -1 if queue full
  */
 static int enqueue_ready_buffer(PerfDataHeader* header,
-                                 int thread_idx,
-                                 uint32_t core_index,
-                                 uint64_t buffer_ptr,
-                                 uint32_t buffer_seq,
-                                 uint32_t is_phase) {
+    int thread_idx,
+    uint32_t core_index,
+    uint64_t buffer_ptr,
+    uint32_t buffer_seq,
+    uint32_t is_phase) {
     uint32_t capacity = PLATFORM_PROF_READYQUEUE_SIZE;
     uint32_t current_tail = header->queue_tails[thread_idx];
     uint32_t current_head = header->queue_heads[thread_idx];
@@ -144,15 +144,15 @@ void perf_aicpu_switch_buffer(Runtime* runtime, int core_id, int thread_idx) {
     runtime->complete_perf_records(full_buf);
 
     LOG_INFO("Thread %d: Core %d buffer is full (count=%u)",
-             thread_idx, core_id, full_buf->count);
+         thread_idx, core_id, full_buf->count);
 
     // Enqueue to ReadyQueue
     uint32_t seq = state->current_buf_seq;
     int rc = enqueue_ready_buffer(s_perf_header, thread_idx, core_id,
-                                   state->current_buf_ptr, seq, 0);
+        state->current_buf_ptr, seq, 0);
     if (rc != 0) {
         LOG_ERROR("Thread %d: Core %d failed to enqueue buffer (queue full), data lost!",
-                 thread_idx, core_id);
+             thread_idx, core_id);
         // Revert: discard data and keep writing
         full_buf->count = 0;
         wmb();
@@ -180,12 +180,12 @@ void perf_aicpu_switch_buffer(Runtime* runtime, int core_id, int thread_idx) {
         h->perf_records_addr = new_buf_ptr;
         wmb();
 
-        LOG_INFO("Thread %d: Core %d switched to new buffer (addr=0x%lx)",
-                 thread_idx, core_id, new_buf_ptr);
+        LOG_INFO("Thread %d: Core %d switched to new buffer (addr=0x%lx)", 
+            thread_idx, core_id, new_buf_ptr);
     } else {
         // No free buffer available, stop profiling
-        LOG_WARN("Thread %d: Core %d no free buffer available, stopping profiling",
-                 thread_idx, core_id);
+        LOG_WARN("Thread %d: Core %d no free buffer available, stopping profiling", 
+            thread_idx, core_id);
         state->current_buf_ptr = 0;
         Handshake* h = &runtime->workers[core_id];
         h->perf_records_addr = 0;
@@ -193,10 +193,10 @@ void perf_aicpu_switch_buffer(Runtime* runtime, int core_id, int thread_idx) {
     }
 }
 
-void perf_aicpu_flush_buffers(Runtime* runtime,
-                               int thread_idx,
-                               const int* cur_thread_cores,
-                               int core_num) {
+void perf_aicpu_flush_buffers(Runtime* runtime, 
+    int thread_idx, 
+    const int* cur_thread_cores, 
+    int core_num) {
     if (!runtime->enable_profiling) {
         return;
     }
@@ -233,23 +233,23 @@ void perf_aicpu_flush_buffers(Runtime* runtime,
 
         uint32_t seq = state->current_buf_seq;
         int rc = enqueue_ready_buffer(s_perf_header, thread_idx, core_id,
-                                       buf_ptr, seq, 0);
+            buf_ptr, seq, 0);
         if (rc == 0) {
             LOG_INFO("Thread %d: Core %d flushed buffer with %u records",
-                     thread_idx, core_id, buf->count);
+                thread_idx, core_id, buf->count);
             flushed_count++;
             state->current_buf_ptr = 0;
             wmb();
         } else {
             LOG_ERROR("Thread %d: Core %d failed to enqueue buffer (queue full), data lost!",
-                     thread_idx, core_id);
+                thread_idx, core_id);
         }
     }
 
     wmb();
 
-    LOG_INFO("Thread %d: Performance buffer flush complete, %d buffers flushed",
-             thread_idx, flushed_count);
+    LOG_INFO("Thread %d: Performance buffer flush complete, %d buffers flushed", 
+        thread_idx, flushed_count);
 }
 
 void perf_aicpu_update_total_tasks(Runtime* runtime, uint32_t total_tasks) {
@@ -326,7 +326,7 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, in
     wmb();
 
     LOG_INFO("Phase profiling initialized: %d scheduler + %d orch threads, %d records/thread",
-             num_sched_threads, num_orch_threads, PLATFORM_PHASE_RECORDS_PER_THREAD);
+        num_sched_threads, num_orch_threads, PLATFORM_PHASE_RECORDS_PER_THREAD);
 }
 
 /**
@@ -344,15 +344,15 @@ static void switch_phase_buffer(int thread_idx) {
     if (full_buf == nullptr) return;
 
     LOG_INFO("Thread %d: phase buffer is full (count=%u)",
-             thread_idx, full_buf->count);
+        thread_idx, full_buf->count);
 
     // Enqueue to ReadyQueue
     uint32_t seq = state->current_buf_seq;
     int rc = enqueue_ready_buffer(s_perf_header, thread_idx, thread_idx,
-                                   state->current_buf_ptr, seq, 1);
+        state->current_buf_ptr, seq, 1);
     if (rc != 0) {
         LOG_ERROR("Thread %d: failed to enqueue phase buffer (queue full), discarding data",
-                 thread_idx);
+            thread_idx);
         full_buf->count = 0;
         wmb();
         return;
@@ -379,7 +379,7 @@ static void switch_phase_buffer(int thread_idx) {
     } else {
         // No free buffer available, drop subsequent records
         LOG_WARN("Thread %d: no free phase buffer available, dropping records until Host catches up",
-                 thread_idx);
+            thread_idx);
         s_current_phase_buf[thread_idx] = nullptr;
         state->current_buf_ptr = 0;
         wmb();
@@ -388,8 +388,8 @@ static void switch_phase_buffer(int thread_idx) {
 
 void perf_aicpu_record_phase(int thread_idx,
     AicpuPhaseId phase_id,
-                              uint64_t start_time, uint64_t end_time,
-                              uint32_t loop_iter, uint32_t tasks_processed) {
+    uint64_t start_time, uint64_t end_time,
+    uint32_t loop_iter, uint64_t tasks_processed) {
     if (s_phase_header == nullptr) {
         return;
     }
@@ -440,8 +440,7 @@ void perf_aicpu_record_phase(int thread_idx,
     record->end_time = end_time;
     record->loop_iter = loop_iter;
     record->phase_id = phase_id;
-    record->tasks_processed = tasks_processed;
-    record->padding = 0;
+    record->task_id = tasks_processed;
 
     buf->count = idx + 1;
 }
@@ -460,17 +459,17 @@ void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src) {
     wmb();
 
     LOG_INFO("Orchestrator summary written: %lld tasks, %.3fus",
-             (long long)src->submit_count,
-             cycles_to_us(src->end_time - src->start_time));
+        (long long)src->submit_count,
+        cycles_to_us(src->end_time - src->start_time));
 }
 
-void perf_aicpu_set_orch_thread_idx(int thread_idx) {
-    s_orch_thread_idx = thread_idx;
+void perf_aicpu_set_orch_thread_idx(int thread_idx) { 
+    s_orch_thread_idx = thread_idx; 
 }
 
 void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
-                                   uint64_t start_time, uint64_t end_time,
-                                   uint32_t submit_idx, uint32_t task_id) {
+    uint64_t start_time, uint64_t end_time,
+    uint32_t submit_idx, uint64_t task_id) {
     if (s_orch_thread_idx < 0 || s_phase_header == nullptr) return;
     perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
 }
@@ -497,25 +496,25 @@ void perf_aicpu_flush_phase_buffers(int thread_idx) {
 
     uint32_t seq = state->current_buf_seq;
     int rc = enqueue_ready_buffer(s_perf_header, thread_idx, thread_idx,
-                                   buf_ptr, seq, 1);
+        buf_ptr, seq, 1);
     if (rc == 0) {
         LOG_INFO("Thread %d: flushed phase buffer with %u records",
-                 thread_idx, buf->count);
+            thread_idx, buf->count);
         state->current_buf_ptr = 0;
         s_current_phase_buf[thread_idx] = nullptr;
         wmb();
     } else {
         LOG_ERROR("Thread %d: failed to enqueue phase buffer (queue full), data lost!",
-                 thread_idx);
+            thread_idx);
     }
 
     wmb();
 }
 
 void perf_aicpu_write_core_assignments(const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD],
-                                        const int* core_counts,
-                                        int num_threads,
-                                        int total_cores) {
+    const int* core_counts,
+    int num_threads,
+    int total_cores) {
     if (s_phase_header == nullptr) {
         return;
     }

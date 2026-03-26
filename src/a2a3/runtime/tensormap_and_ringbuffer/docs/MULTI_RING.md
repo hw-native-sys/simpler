@@ -24,7 +24,7 @@ Inner-scope tasks can now be reclaimed independently without waiting for outer-s
 Task IDs are widened from 32-bit to 64-bit to carry the ring identity:
 
 ```
-mixed_task_id.raw = (ring_id << 32) | local_id
+task_id.raw = (ring_id << 32) | local_id
 ```
 
 `PTO2TaskId` exposes direct accessors in `pto_runtime2_types.h`:
@@ -40,7 +40,7 @@ Type changes:
 
 | Field | Before | After |
 |-------|--------|-------|
-| `PTO2TaskDescriptor.mixed_task_id` | `int32_t` | `PTO2TaskId` |
+| `PTO2TaskDescriptor.task_id` | `int32_t` | `PTO2TaskId` |
 | `PTO2TensorMapEntry.producer_task_id` | `int32_t` | `PTO2TaskId` |
 | `PTO2TaskSlotState.ring_id` | N/A | `uint8_t` (new, denormalized for fast access) |
 
@@ -187,7 +187,7 @@ Note: dep entries from ring N's pool may appear in ring M's fanout lists. Reclam
 
 ## 6. AICPU Register Protocol Fix
 
-The AICore dispatch protocol uses 32-bit registers. With multi-ring, `mixed_task_id` truncation to 32-bit loses the `ring_id`, causing collisions:
+The AICore dispatch protocol uses 32-bit registers. With multi-ring, `task_id` truncation to 32-bit loses the `ring_id`, causing collisions:
 
 ```
 Ring 0, local_id=0  →  DATA_MAIN_BASE = 0 + 1 = 1
@@ -196,7 +196,7 @@ Ring 1, local_id=0  →  DATA_MAIN_BASE = 0 + 1 = 1  (collision!)
 
 AICore uses `last_reg_val` to detect new dispatches — identical values cause skipped tasks and false completions from stale COND registers.
 
-**Fix**: Per-core monotonic dispatch counter `s_dispatch_seq[core_id]` replaces `mixed_task_id` in register writes, guaranteeing unique `DATA_MAIN_BASE` values per core regardless of ring origin.
+**Fix**: Per-core monotonic dispatch counter `s_dispatch_seq[core_id]` replaces `task_id` in register writes, guaranteeing unique `DATA_MAIN_BASE` values per core regardless of ring origin.
 
 ## 7. Configuration
 

@@ -325,7 +325,7 @@ When `pto2_submit_task` processes parameters:
 
 | Field | Description |
 |-------|-------------|
-| `mixed_task_id` | Canonical mixed-task ID (64-bit: `ring_id << 32 | local_id`). See [MULTI_RING.md §3](MULTI_RING.md). |
+| `task_id` | Canonical mixed-task ID (64-bit: `ring_id << 32 | local_id`). See [MULTI_RING.md §3](MULTI_RING.md). |
 | `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
 | `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
 | `subtask_done_mask` | Atomic bitmask; each subtask sets its done bit on completion |
@@ -446,11 +446,11 @@ Each scheduler thread runs a tight loop with two main phases:
 
 **Phase 1 — Completion Handling**:
 - Poll register `COND` on each managed core
-- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(mixed_task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, trigger `on_mixed_task_complete(mixed_task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
+- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, trigger `on_mixed_task_complete(task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
 
 **Phase 2 — Dispatch**:
 - For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
-- Build `PTO2DispatchPayload` from `TaskDescriptor` with `mixed_task_id`, `subslot`, `kernel_id`, and `core_type`
+- Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
 - Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE`
 
 After these phases, the scheduler updates profiling headers and checks for termination (all tasks completed and orchestrator done).
@@ -498,7 +498,7 @@ Each AICore worker has a `Handshake` struct in shared memory:
 
 Instead of polling `Handshake.task_status`, the production protocol uses hardware registers.
 
-> **Multi-ring note**: `mixed_task_id` is 64-bit but registers are 32-bit. A per-core monotonic dispatch counter (`s_dispatch_seq`) replaces `mixed_task_id` in register writes to prevent collisions. See [MULTI_RING.md §6](MULTI_RING.md).
+> **Multi-ring note**: `task_id` is 64-bit but registers are 32-bit. A per-core monotonic dispatch counter (`s_dispatch_seq`) replaces `task_id` in register writes to prevent collisions. See [MULTI_RING.md §6](MULTI_RING.md).
 
 | Register | Direction | Usage |
 |----------|-----------|-------|
@@ -518,7 +518,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 
 | Field | Description |
 |-------|-------------|
-| `mixed_task_id` | Mixed-task identifier (for completion aggregation) |
+| `task_id` | Mixed-task identifier (for completion aggregation) |
 | `subslot` | Which subtask slot this dispatch represents (`AIC`, `AIV0`, or `AIV1`) |
 | `kernel_id` | Function ID for this subtask slot |
 | `core_type` | AIC or AIV |

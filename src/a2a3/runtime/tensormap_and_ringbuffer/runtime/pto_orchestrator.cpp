@@ -43,7 +43,7 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // The strong symbol from the AICPU build wins when profiling is available.
 // Also hidden to prevent HOST .so from polluting the global symbol table.
 __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
-    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
+    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // task ring alloc
@@ -78,7 +78,7 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 #include "aicpu/performance_collector_aicpu.h"
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
-    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
+    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
 static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_START()                                                           \
@@ -340,7 +340,7 @@ void pto2_submit_mixed_task(
     int32_t local_id = task_ring.pto2_task_ring_alloc();
     if (local_id < 0) { orch->fatal = true; return; }
     int32_t slot = task_ring.get_task_slot(local_id);
-    PTO2TaskId mixed_task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
+    PTO2TaskId task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
 
     PTO2TaskDescriptor& task = task_ring.get_task_by_slot(slot);
     PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[ring_id][slot];
@@ -387,7 +387,7 @@ void pto2_submit_mixed_task(
     PTO2TaskSlotState* fanin_states[PTO2_MAX_INPUTS];
     int32_t fanin_count = 0;
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id.raw);
 
     // === STEP 2: Calculate output size + heap alloc (read from params only, no GM access) ===
     bool needs_alloc[PTO2_MAX_TENSOR_PARAMS] = {};
@@ -407,7 +407,7 @@ void pto2_submit_mixed_task(
         if (!local_packed_base) { orch->fatal = true; return; }
         local_packed_end = (char*)local_packed_base + total_output_size;
     }
-    CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_heap_cycle, AicpuPhaseId::ORCH_HEAP, task_id.raw);
 #if PTO2_ORCH_PROFILING
     if (total_output_size > 0) {
         g_orch_heap_atomic_count += 1;  // heap_top.store in pto2_alloc_packed_buffer
@@ -424,7 +424,7 @@ void pto2_submit_mixed_task(
         orch->rings[ring_id].dep_pool.reclaim(*sched, ring_id, sm_last_task_alive);
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
     // === STEP 4: Lookup inputs + assign output addrs (all from params, no GM) ===
     int32_t offset = 0;
@@ -486,25 +486,25 @@ void pto2_submit_mixed_task(
         }
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id.raw);
 
     // === STEP 5: Register outputs/inouts in TensorMap (must be separate from lookup) ===
     for (int i = 0; i < params.tensor_count; i++) {
         PTOParamType ptype = params.tensor_types[i];
         if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
             if (!params.tensors[i]->manual_dep) {
-                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, needs_alloc[i]);
+                orch->tensor_map.insert(*params.tensors[i], task_id, needs_alloc[i]);
             }
         }
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_insert_cycle, AicpuPhaseId::ORCH_INSERT, task_id.raw);
 
     // === STEP 6: Batch-write to GM (single cache line burst) ===
     // Deferred from allocation phase to avoid scattered GM writes that get
     // evicted by TensorMap lookup/insert cache pressure.
     __builtin_prefetch(&task, 1, 1);
-    task.mixed_task_id = mixed_task_id;
+    task.task_id = task_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
@@ -523,7 +523,7 @@ void pto2_submit_mixed_task(
 
     payload->init(params);
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 #if PTO2_ORCH_PROFILING
     g_orch_params_atomic_count += 2;  // fanout_lock.store + fanout_count.store
 #endif
@@ -588,7 +588,7 @@ void pto2_submit_mixed_task(
 #endif
     }
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN, task_id.raw);
 
 #if PTO2_PROFILING
     orch->tasks_submitted++;

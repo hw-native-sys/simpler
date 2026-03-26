@@ -916,7 +916,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         }
     }
 
-    // Sort by task_id
+    // Sort by canonical task_id (64-bit PTO2 raw)
     std::sort(tagged_records.begin(), tagged_records.end(),
               [](const TaggedRecord& a, const TaggedRecord& b) {
                   return a.record->task_id < b.record->task_id;
@@ -930,7 +930,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         }
         if (tagged.record->dispatch_time < base_time_cycles && tagged.record->dispatch_time > 0) {
             base_time_cycles = tagged.record->dispatch_time;
-            LOG_WARN("Timestamp violation: dispatch_time (%lu) < base_time (%lu) for task %u, using dispatch_time as new base_time",
+            LOG_WARN("Timestamp violation: dispatch_time (%lu) < base_time (%lu) for task (task_id=%lu), using dispatch_time as new base_time",
                         tagged.record->dispatch_time, base_time_cycles, tagged.record->task_id);
         }
     }
@@ -991,7 +991,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         outfile << "      \"func_id\": " << record.func_id << ",\n";
         outfile << "      \"core_id\": " << tagged.core_id << ",\n";
         outfile << "      \"core_type\": \"" << core_type_str << "\",\n";
-        outfile << "      \"ring_id\": " << static_cast<int>(record.ring_id) << ",\n";
+        outfile << "      \"ring_id\": " << static_cast<int>(record.task_id >> 32) << ",\n";
         outfile << "      \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us << ",\n";
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
         outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
@@ -1113,7 +1113,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                             << ", \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
                             << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
                             << ", \"submit_idx\": " << pr.loop_iter
-                            << ", \"task_id\": " << static_cast<int32_t>(pr.tasks_processed)
+                            << ", \"task_id\": " << pr.task_id
                             << "}";
                     first = false;
                 }

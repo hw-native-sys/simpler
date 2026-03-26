@@ -437,25 +437,19 @@ struct AicpuExecutor {
                     uint32_t count = perf_buf->count;
                     if (count > 0) {
                         PerfRecord* record = &perf_buf->records[count - 1];
-                        if (record->task_id == static_cast<uint32_t>(expected_reg_task_id)) {
+                        if (static_cast<uint32_t>(record->task_id) == static_cast<uint32_t>(expected_reg_task_id)) {
                             // Fill metadata that AICore doesn't know
                             int32_t perf_slot_idx = static_cast<int32_t>(core_exec_state.executing_subslot);
                             record->func_id = slot_state.task->kernel_id[perf_slot_idx];
                             record->core_type = CT;
                             perf_aicpu_record_dispatch_and_finish_time(
                                 record, core_exec_state.dispatch_timestamp, finish_ts);
-
-                            // Fill ring_id from slot state
-                            record->ring_id = slot_state.ring_id;
-
-                            // Fill fanout from slot_state's dependency linked list.
-                            // No lock: head-insert guarantees existing nodes' next pointers
-                            // are stable, so this snapshot is consistent (best-effort).
+                            record->task_id = slot_state.task->task_id.raw;
                             record->fanout_count = 0;
                             PTO2DepListEntry* cur = slot_state.fanout_head;
                             while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
-                                record->fanout[record->fanout_count++] = static_cast<int32_t>(
-                                    cur->slot_state->task->mixed_task_id.local());
+                                const PTO2TaskId succ = cur->slot_state->task->task_id;
+                                record->fanout[record->fanout_count++] = succ.raw;
                                 cur = cur->next;
                             }
                         }
@@ -598,13 +592,13 @@ struct AicpuExecutor {
             core_exec_state.dispatch_count++;
         }
 #endif
-        // Per-core monotonic counter for register protocol uniqueness.
-        // mixed_task_id encodes (ring_id << 32 | local_id); truncation to
-        // uint32 loses ring_id, so tasks from different rings with the same
-        // local_id would write identical DATA_MAIN_BASE values. The AICore
-        // uses last_reg_val to detect new dispatches and would skip the
-        // duplicate, while the stale COND register from the previous task
-        // (same local_id) would cause a false-positive completion.
+        // Per-core monotonic counter for register protocol uniqueness (32-bit).
+        // PTO2 task_id encodes (ring_id << 32 | local_id); truncation to uint32 loses ring_id,
+        // so tasks from different rings with the same local_id would write identical DATA_MAIN_BASE
+        // values. The AICore uses last_reg_val to detect new dispatches and would skip the
+        // duplicate, while the stale COND register from the previous task (same local_id) would
+        // cause a false-positive completion.
+        // PerfRecord.task_id: register token (low 32) until AICPU overwrites with full (ring_id << 32 | local_id).
         core_exec_state.dispatch_seq++;
         uint32_t reg_task_id = core_exec_state.dispatch_seq & TASK_ID_MASK;
         // Skip reserved sentinel range [AICORE_EXIT_SIGNAL, 0x7FFFFFFF]
@@ -1256,7 +1250,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     DEV_DEBUG("Thread %d: Dispatching %s task %lld to cluster_offset %d",
                         thread_idx,
                         shape_name(shape),
-                        (long long)slot_state->task->mixed_task_id.raw,
+                        (long long)slot_state->task->task_id.raw,
                         current_valid_cluster_offset);
                 }
 
@@ -1359,13 +1353,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                             cnt_ready++;
                             if (cnt_ready <= STALL_DUMP_READY_MAX) {
                                 DEV_ALWAYS("  STUCK-READY  ring=%d task_id=%lld kernel_id=%d refcount=%d fanin=%d state=%d",
-                                            r, (long long)slot_state.task->mixed_task_id.raw, kid, rc, fi, (int32_t)st);
+                                            r, (long long)slot_state.task->task_id.raw, kid, rc, fi, (int32_t)st);
                             }
                         } else {
                             cnt_waiting++;
                             if (cnt_waiting <= STALL_DUMP_WAIT_MAX) {
                                 DEV_ALWAYS("  STUCK-WAIT   ring=%d task_id=%lld kernel_id=%d refcount=%d fanin=%d state=%d",
-                                            r, (long long)slot_state.task->mixed_task_id.raw, kid, rc, fi, (int32_t)st);
+                                            r, (long long)slot_state.task->task_id.raw, kid, rc, fi, (int32_t)st);
                             }
                         }
                     }

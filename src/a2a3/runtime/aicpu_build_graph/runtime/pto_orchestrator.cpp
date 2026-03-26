@@ -33,7 +33,7 @@
 // Weak fallback for builds that don't link device_time.cpp (e.g. host).
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
-    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
+    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 static uint64_t g_orch_alloc_cycle = 0;
 static uint64_t g_orch_params_cycle = 0;
 static uint64_t g_orch_heap_cycle = 0;
@@ -63,7 +63,7 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 #include "aicpu/performance_collector_aicpu.h"
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
-    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint32_t) {}
+    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_START()                                                           \
     bool _prof_active = orch->enable_profiling;                                       \
@@ -305,7 +305,7 @@ PTO2TaskId pto2_submit_mixed_task(
     int32_t local_id = task_ring.pto2_task_ring_alloc();
     if (local_id < 0) { orch->fatal = true; return invalid_id; }
     int32_t slot = task_ring.get_task_slot(local_id);
-    PTO2TaskId mixed_task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
+    PTO2TaskId task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
 
     PTO2TaskDescriptor& task = task_ring.get_task_by_slot(slot);
     PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[ring_id][slot];
@@ -388,7 +388,7 @@ PTO2TaskId pto2_submit_mixed_task(
 
     // === STEP 3: Write task descriptor and payload ===
     __builtin_prefetch(&task, 1, 1);
-    task.mixed_task_id = mixed_task_id;
+    task.task_id = task_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
@@ -415,7 +415,7 @@ PTO2TaskId pto2_submit_mixed_task(
     g_orch_submit_idx++;
 #endif
 
-    return mixed_task_id;
+    return task_id;
 }
 
 // =============================================================================

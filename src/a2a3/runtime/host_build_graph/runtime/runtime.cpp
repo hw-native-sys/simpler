@@ -228,7 +228,7 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
 
     for (uint32_t i = 0; i < count; i++) {
         PerfRecord* record = &perf_buf->records[i];
-        uint32_t task_id = record->task_id;
+        int task_id = static_cast<int>(record->task_id & 0xFFFFFFFFu);
 
         // Query Task by task_id (O(1) array indexing)
         Task* task = get_task(task_id);

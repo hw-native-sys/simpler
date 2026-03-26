@@ -184,10 +184,10 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
 
     for (uint32_t i = 0; i < count; i++) {
         PerfRecord* record = &perf_buf->records[i];
-        int32_t task_id = record->task_id;
+        uint32_t local_id = static_cast<uint32_t>(record->task_id & 0xFFFFFFFFu);
 
         // Get slot state for fanout traversal
-        int32_t slot = task_id & window_mask;
+        int32_t slot = static_cast<int32_t>(local_id) & window_mask;
         PTO2TaskSlotState& ss = slot_states[slot];
 
         // Fill fanout information by traversing the linked list
@@ -195,16 +195,8 @@ void Runtime::complete_perf_records(PerfBuffer* perf_buf) {
         PTO2DepListEntry* cur = ss.fanout_head;
 
         while (cur != nullptr && record->fanout_count < RUNTIME_MAX_FANOUT) {
-            // PerfRecord.fanout stores 32-bit legacy task IDs. Our multi-ring task ID
-            // encodes ring_id in the upper 32 bits, so only the legacy single-ring
-            // case (ring_id==0) is representable here.
-            PTO2TaskId mixed_task_id = cur->slot_state->task->mixed_task_id;
-            if (mixed_task_id.ring() != 0) {
-                // Skip: cannot represent (ring_id, local_id) in a 32-bit fanout slot.
-                cur = cur->next;
-                continue;
-            }
-            record->fanout[record->fanout_count++] = static_cast<int32_t>(mixed_task_id.local());
+            const PTO2TaskId succ = cur->slot_state->task->task_id;
+            record->fanout[record->fanout_count++] = succ.raw;
             cur = cur->next;
         }
     }

@@ -31,6 +31,29 @@ except ImportError:
     from tools.sched_overhead_analysis import parse_scheduler_threads, run_analysis as run_sched_overhead_analysis
 
 
+def format_task_display(task_id):
+    """Format PTO2 task_id for human-readable labels.
+
+    Layout: 64-bit raw = (ring_id << 32) | local_id (same as runtime PTO2TaskId).
+
+    Returns:
+        ``r{ring}t{local}`` when ring != 0 (e.g. r2t100), else ``t{local}`` for single-ring (ring 0).
+
+    For invalid or non-numeric values, returns str(task_id).
+    """
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return str(task_id)
+    if tid < 0:
+        tid &= (1 << 64) - 1
+    ring = (tid >> 32) & 0xFF
+    local = tid & 0xFFFFFFFF
+    if ring == 0:
+        return f"t{local}"
+    return f"r{ring}t{local}"
+
+
 def read_perf_data(filepath):
     """Read performance data from JSON file.
 
@@ -418,22 +441,21 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
         ts = task['start_time_us']
         dur = task['duration_us']
 
-        # Build fanout hint string
-        fanout_str = "[" + ", ".join(str(x) for x in task['fanout']) + "]"
+        # Build fanout hint string (packed ids → rXtY / tY for readability)
+        fanout_str = "[" + ", ".join(format_task_display(x) for x in task['fanout']) + "]"
 
         # Get function name if available
         func_id = task['func_id']
+        tdisp = format_task_display(task['task_id'])
         if func_id_to_name and str(func_id) in func_id_to_name:
             func_name = func_id_to_name[str(func_id)]
-            # New format: FuncName(task_id)
-            task_name = f"{func_name}({task['task_id']})"
+            task_name = f"{func_name}({tdisp})"
         else:
-            # Fallback format: Func_{func_id}(task_id)
-            task_name = f"Func_{func_id}({task['task_id']})"
+            task_name = f"Func_{func_id}({tdisp})"
 
         events.append({
             "args": {
-                "event-hint": f"Task:{task['task_id']}, FuncId:{func_id}, CoreId:{task['core_id']}",
+                "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
                 "fanout-hint": fanout_str,
                 "duration-us": dur,
                 "kernel-ready-time-us": task['kernel_ready_time_us'],
@@ -466,15 +488,16 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
 
             # Get function name if available
             func_id = task['func_id']
+            tdisp = format_task_display(task['task_id'])
             if func_id_to_name and str(func_id) in func_id_to_name:
                 func_name = func_id_to_name[str(func_id)]
-                task_name = f"{func_name}({task['task_id']})"
+                task_name = f"{func_name}({tdisp})"
             else:
-                task_name = f"Func_{func_id}({task['task_id']})"
+                task_name = f"Func_{func_id}({tdisp})"
 
             events.append({
                 "args": {
-                    "event-hint": f"Task:{task['task_id']}, FuncId:{func_id}, CoreId:{task['core_id']}",
+                    "event-hint": f"Task:{tdisp}, FuncId:{func_id}, CoreId:{task['core_id']}",
                     "dispatch-time-us": dispatch_us,
                     "finish-time-us": finish_us,
                     "aicpu-duration-us": aicpu_dur,
@@ -502,7 +525,10 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
         for succ_task_id in task['fanout']:
             if succ_task_id not in task_map:
                 if verbose:
-                    print(f"Warning: Task {task['task_id']} references non-existent successor {succ_task_id}")
+                    print(
+                        f"Warning: Task {format_task_display(task['task_id'])} (raw {task['task_id']}) "
+                        f"references non-existent successor {format_task_display(succ_task_id)} (raw {succ_task_id})"
+                    )
                 continue
 
             succ_task = task_map[succ_task_id]
@@ -678,9 +704,9 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                 # Strip "orch_" prefix for display name
                 display_name = phase.replace("orch_", "") if phase.startswith("orch_") else phase
 
-                # Show task_id in name for task-specific phases
+                # Show packed task_id as rXtY / tY for task-specific phases
                 if task_id >= 0:
-                    label = f"{display_name}(t{task_id})"
+                    label = f"{display_name}({format_task_display(task_id)})"
                 else:
                     label = f"{display_name}({submit_idx})"
 
@@ -867,34 +893,31 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                 })
                 flow_id += 1
 
-    # Orchestrator FINALIZE → Scheduler DISPATCH arrows (per task_id)
+    # Orchestrator → scheduler dispatch: anchor at orch_fanin end (not orch_finalize.start).
+    # Fanin completion ⇒ dependencies satisfied ⇒ task becomes dispatchable; tie flow to dispatch_time_us.
     if orchestrator_phases and scheduler_phases:
-        # Flatten per-thread orch phases and track source thread
-        orch_finalize_by_task = {}
+        orch_fanin_by_task = {}
         for orch_idx, thread_records in enumerate(orch_threads):
             for record in thread_records:
-                if record.get("phase") == "orch_finalize":
+                if record.get("phase") == "orch_fanin":
                     task_id = record.get("task_id", -1)
                     if task_id >= 0:
-                        orch_finalize_by_task[task_id] = (record, orch_idx)
+                        orch_fanin_by_task[task_id] = (record, orch_idx)
 
         # Use core_to_sched_thread mapping (built above) to find the correct
         # scheduler thread for each task's core.
-        if orch_finalize_by_task and has_aicpu_data:
+        if orch_fanin_by_task and has_aicpu_data:
             for task in tasks:
                 tid = task.get('task_id')
-                if tid is None or tid not in orch_finalize_by_task:
+                if tid is None or tid not in orch_fanin_by_task:
                     continue
 
                 dispatch_us = task.get('dispatch_time_us', 0)
                 if dispatch_us <= 0:
                     continue
 
-                finalize_rec, orch_idx = orch_finalize_by_task[tid]
-                # Use finalize start_time: init_task() runs at the beginning of FINALIZE,
-                # making the task dispatchable before FINALIZE ends. Using start avoids
-                # reverse arrows when the scheduler dispatches during FINALIZE.
-                finalize_start_us = finalize_rec["start_time_us"]
+                fanin_rec, orch_idx = orch_fanin_by_task[tid]
+                fanin_end_us = fanin_rec["end_time_us"]
 
                 matched_thread = core_to_sched_thread.get(task['core_id'])
 
@@ -902,20 +925,20 @@ def generate_chrome_trace_json(tasks, output_path, func_id_to_name=None, verbose
                     sched_tid = 3000 + matched_thread
                     orch_tid = 4000 + orch_idx
 
-                    # Flow: Orchestrator finalize start → Scheduler DISPATCH
+                    # Flow: fanin end → dispatch (dependencies ready → scheduler issues dispatch)
                     events.append({
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "orch→dispatch",
+                        "name": "fanin→dispatch",
                         "ph": "s",
                         "pid": 4,
                         "tid": orch_tid,
-                        "ts": finalize_start_us
+                        "ts": fanin_end_us
                     })
                     events.append({
                         "cat": "flow",
                         "id": flow_id,
-                        "name": "orch→dispatch",
+                        "name": "fanin→dispatch",
                         "ph": "f",
                         "pid": 3,
                         "tid": sched_tid,
