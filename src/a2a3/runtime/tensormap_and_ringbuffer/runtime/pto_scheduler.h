@@ -629,11 +629,15 @@ struct PTO2SchedulerState {
     void on_scope_end(PTO2TaskSlotState** task_slot_states, int32_t count) {
 #if PTO2_ORCH_PROFILING
         extern uint64_t g_orch_scope_end_atomic_count;
+        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
         for (int32_t i = 0; i < count; i++) {
+            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
             release_producer(*task_slot_states[i], g_orch_scope_end_atomic_count);
         }
 #else
+        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
         for (int32_t i = 0; i < count; i++) {
+            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
             release_producer(*task_slot_states[i]);
         }
 #endif

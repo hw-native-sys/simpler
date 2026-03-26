@@ -1817,6 +1817,10 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(nullptr);
             }
+#if PTO2_PROFILING
+            uint64_t orch_cycle_end = get_sys_cnt_aicpu();
+            (void)orch_cycle_end;
+#endif
 
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING

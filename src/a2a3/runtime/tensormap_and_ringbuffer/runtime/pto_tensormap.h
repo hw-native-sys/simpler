@@ -295,10 +295,7 @@ struct PTO2TensorMap {
 #endif
 
         while (cur_entry != nullptr) {
-            // Prefetch next entry to hide pointer-chasing latency.
-            // entry_valid() + is_overlap() computation provides hide time.
             PTO2TensorMapEntry* next_entry = cur_entry->next_in_bucket;
-            if (next_entry) __builtin_prefetch(next_entry, 0, 0);
 
 #if PTO2_TENSORMAP_PROFILING
             chain_len++;
@@ -315,12 +312,6 @@ struct PTO2TensorMap {
             // Since we hash only by base_ptr, all entries in this bucket have
             // potential to overlap. We must check actual byte-range overlap.
             if (tensor.buffer.addr == cur_entry->buffer_addr) {
-                // Double prefetch: check_overlap provides enough hide time
-                // to also warm up the entry after next.
-                if (next_entry) {
-                    PTO2TensorMapEntry* next_next = next_entry->next_in_bucket;
-                    if (next_next) __builtin_prefetch(next_next, 0, 0);
-                }
 #if PTO2_TENSORMAP_PROFILING
                 g_lookup_overlap_checks++;
 #endif
@@ -358,11 +349,9 @@ struct PTO2TensorMap {
         // Prefetch bucket head and task_entry_head early; new_entry() + field
         // initialization below provides hide time for these RFOs.
         uint32_t bucket_index = hash(tensor.buffer.addr);
-        __builtin_prefetch(&buckets[bucket_index], 1, 0);
         auto ring_id = producer_task_id.ring();
         auto local_id = producer_task_id.local();
         int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
-        __builtin_prefetch(&task_entry_heads[ring_id][task_slot], 1, 0);
 
         // Allocate entry from ring buffer pool
         PTO2TensorMapEntry* entry = new_entry();
@@ -429,23 +418,22 @@ struct PTO2TensorMap {
 
     /**
      * Compute hash for tensor addr
+     *
+     * Multiplicative hash using the golden-ratio constant.  Multiplication
+     * mixes ALL input bits into the high bits of the product, so aligned
+     * addresses (low bits all-zero) still distribute evenly.  We extract
+     * the top log2(num_buckets) bits which carry the most entropy.
      */
     uint32_t hash(uint64_t key) {
-        // Improve distribution by mixing bits (pointers often have aligned low bits)
-        key = key ^ (key >> 16);
-        key = key ^ (key >> 32);
-
-        // Use bitwise AND for power-of-2 modulo (faster than %)
-        return (uint32_t)(key & (num_buckets - 1));
+        key *= 0x9E3779B97F4A7C15ULL;
+        return static_cast<uint32_t>(key >> (64 - __builtin_ctz(num_buckets)));
     }
 
     /**
      * Check if entry is valid (producer has not retired)
      */
     bool entry_valid(const PTO2TensorMapEntry& entry) const {
-        int32_t ring_id = entry.producer_task_id.ring();
-        int32_t local_id = static_cast<int32_t>(entry.producer_task_id.local());
-        return local_id >= last_task_alives[ring_id];
+        return static_cast<int32_t>(entry.producer_task_id.local()) >= last_task_alives[entry.producer_task_id.ring()];
     }
 
     void remove_entry(PTO2TensorMapEntry& entry) {

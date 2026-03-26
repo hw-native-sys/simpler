@@ -88,7 +88,7 @@
 #define PTO2_HEAP_SIZE            (256 * 1024 * 1024)  // 256MB per ring (1GB total)
 #define PTO2_DEP_LIST_POOL_SIZE    16384    // Per-ring dependency list pool entries
 #define PTO2_TENSORMAP_POOL_SIZE   (65536)   // TensorMap entry pool
-#define PTO2_TENSORMAP_NUM_BUCKETS 65536    // Power of 2 for fast hash
+#define PTO2_TENSORMAP_NUM_BUCKETS 4096     // Power of 2 for fast hash (4096×8B=32KB fits L1)
 
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH      64      // Maximum nesting depth
@@ -379,10 +379,6 @@ struct PTO2TaskPayload {
         auto src_tensors = params.tensors;
         for (int32_t i = 0; i < params.tensor_count; i++) {
             tensors[i].copy(*src_tensors[i]);
-        }
-
-        // 2. Build dispatch_args[]: tensor pointers first, then scalar values
-        for (int32_t i = 0; i < params.tensor_count; i++) {
             tensors[i].update_start_offset();
             dispatch_args[i] = reinterpret_cast<uint64_t>(&tensors[i]);
         }
