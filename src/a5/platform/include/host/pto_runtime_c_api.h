@@ -87,7 +87,6 @@ size_t get_runtime_size(void);
  * @param orch_args         Array of TaskArg describing orchestration arguments
  * @param orch_args_count   Number of orchestration arguments
  * @param arg_types         Array describing each argument's type (ArgType enum)
- * @param arg_sizes         Array of sizes for pointer arguments (0 for scalars)
  * @param kernel_func_ids   Array of kernel function IDs (can be NULL if kernel_count == 0)
  * @param kernel_binaries   Array of pointers to kernel binary data
  * @param kernel_sizes      Array of kernel binary sizes in bytes
@@ -101,7 +100,6 @@ int init_runtime(RuntimeHandle runtime,
                 const struct TaskArg* orch_args,
                 int orch_args_count,
                 int* arg_types,
-                uint64_t* arg_sizes,
                 const int* kernel_func_ids,
                 const uint8_t* const* kernel_binaries,
                 const size_t* kernel_sizes,

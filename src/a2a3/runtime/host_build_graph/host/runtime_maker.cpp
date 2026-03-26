@@ -57,7 +57,6 @@ extern "C" {
  * @param orch_args         TaskArg array with tensor metadata + scalar values
  * @param orch_args_count   Number of TaskArg entries
  * @param arg_types         Array describing each argument's type (unused for host orchestration)
- * @param arg_sizes         Array of sizes for pointer arguments (unused for host orchestration)
  * @return 0 on success, -1 on failure
  */
 int init_runtime_impl(Runtime *runtime,
@@ -67,14 +66,12 @@ int init_runtime_impl(Runtime *runtime,
                     const TaskArg* orch_args,
                     int orch_args_count,
                     int* arg_types,
-                    uint64_t* arg_sizes,
                     const int* kernel_func_ids,
                     const uint8_t* const* kernel_binaries,
                     const size_t* kernel_sizes,
                     int kernel_count) {
     // Unused parameters for host orchestration
     (void)arg_types;
-    (void)arg_sizes;
 
     // Validate inputs
     if (runtime == nullptr) {

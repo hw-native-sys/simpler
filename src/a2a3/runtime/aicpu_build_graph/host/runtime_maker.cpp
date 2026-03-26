@@ -79,7 +79,6 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
  * @param func_args         Arguments for orchestration
  * @param func_args_count   Number of arguments
  * @param arg_types         Array describing each argument's type (ArgType enum)
- * @param arg_sizes         Array of sizes for pointer arguments (0 for scalars)
  * @return 0 on success, -1 on failure
  */
 extern "C" int init_runtime_impl(Runtime *runtime,
@@ -89,7 +88,6 @@ extern "C" int init_runtime_impl(Runtime *runtime,
                     const TaskArg* orch_args,
                     int orch_args_count,
                     int* arg_types,
-                    uint64_t* arg_sizes,
                     const int* kernel_func_ids,
                     const uint8_t* const* kernel_binaries,
                     const size_t* kernel_sizes,
@@ -123,8 +121,8 @@ extern "C" int init_runtime_impl(Runtime *runtime,
         return -1;
     }
 
-    if (arg_types == nullptr || arg_sizes == nullptr) {
-        LOG_ERROR("arg_types and arg_sizes are required for device orchestration");
+    if (arg_types == nullptr) {
+        LOG_ERROR("arg_types is required for device orchestration");
         return -1;
     }
 
@@ -146,7 +144,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
         if (orch_args[i].kind == TaskArgKind::TENSOR) {
             void* host_ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(orch_args[i].tensor.data));
-            size_t size = arg_sizes[i];
+            size_t size = static_cast<size_t>(orch_args[i].nbytes());
 
             void* dev_ptr = runtime->host_api.device_malloc(size);
             if (dev_ptr == nullptr) {
