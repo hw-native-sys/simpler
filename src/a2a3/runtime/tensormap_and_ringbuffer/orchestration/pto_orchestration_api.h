@@ -23,7 +23,7 @@
 
 // Type headers needed by orchestration
 #include "tensor.h"             // Tensor
-#include "pto_types.h"          // PTOParam, PTOTensorEntry, PTOParamType
+#include "pto_types.h"          // PTOParam, PTOTensorEntry, PTOParamType, PTO2AsyncEngine
 #include "pto_submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
 
 // =============================================================================
@@ -104,6 +104,8 @@ void pto2_framework_bind_runtime(PTO2Runtime* rt);
 typedef struct PTO2RuntimeOps {
     void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                         const PTOParam& params);
+    uint64_t (*get_async_context)(PTO2Runtime* rt, PTO2AsyncEngine engine);
+    uint64_t (*alloc_cq)(PTO2Runtime* rt);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
@@ -160,6 +162,103 @@ static inline void pto2_rt_submit_aiv_task(int32_t kernel_id, const PTOParam& pa
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     rt->ops->submit_task(rt, mk, params);
+}
+static inline uint64_t pto2_rt_get_async_context(PTO2AsyncEngine engine) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    return rt->ops->get_async_context(rt, engine);
+}
+
+static inline uint64_t pto2_rt_get_async_context(PTO2Runtime* rt, PTO2AsyncEngine engine) {
+    return rt->ops->get_async_context(rt, engine);
+}
+
+static inline uint64_t pto2_rt_get_sdma_context() {
+    return pto2_rt_get_async_context(PTO2_ASYNC_ENGINE_SDMA);
+}
+
+static inline uint64_t pto2_rt_get_sdma_context(PTO2Runtime* rt) {
+    return pto2_rt_get_async_context(rt, PTO2_ASYNC_ENGINE_SDMA);
+}
+
+// =============================================================================
+// CQ Model: Deferred Completion Wrappers
+// =============================================================================
+
+/**
+ * Allocate a zeroed per-task completion queue from the runtime pool.
+ * Returns the GM address (cast to uint64_t) or 0 on failure.
+ */
+static inline uint64_t pto2_rt_alloc_cq() {
+    PTO2Runtime* rt = pto2_current_runtime();
+    return rt->ops->alloc_cq(rt);
+}
+
+static inline uint64_t pto2_rt_alloc_cq(PTO2Runtime* rt) {
+    return rt->ops->alloc_cq(rt);
+}
+
+static inline void pto2_rt_expect_notification_counter(PTOParam& params,
+                                                       uint64_t counter_addr,
+                                                       uint32_t expected_value) {
+    params.has_launch_counter = true;
+    params.launch_counter_addr = counter_addr;
+    params.launch_counter_expected = expected_value;
+}
+
+/**
+ * Submit an AIV task with deferred completion (CQ model).
+ *
+ * The kernel decides at runtime how many async completions it has
+ * and writes them into the completion queue. The scheduler discovers
+ * completions by reading the CQ after all subtasks return.
+ *
+ * The CQ address is automatically appended as the last scalar
+ * so the kernel can access it from args[].
+ */
+static inline void pto2_rt_submit_aiv_task_deferred(int32_t kernel_id,
+                                                     PTOParam& params,
+                                                     uint64_t cq_addr) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    params.complete_in_future = true;
+    params.cq_addr = cq_addr;
+    params.add_scalar(cq_addr);
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    rt->ops->submit_task(rt, mk, params);
+}
+
+static inline void pto2_rt_submit_aiv_task_deferred(PTO2Runtime* rt,
+                                                     int32_t kernel_id,
+                                                     PTOParam& params,
+                                                     uint64_t cq_addr) {
+    params.complete_in_future = true;
+    params.cq_addr = cq_addr;
+    params.add_scalar(cq_addr);
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    rt->ops->submit_task(rt, mk, params);
+}
+
+static inline void pto2_rt_submit_aic_task_deferred(int32_t kernel_id,
+                                                     PTOParam& params,
+                                                     uint64_t cq_addr) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    params.complete_in_future = true;
+    params.cq_addr = cq_addr;
+    params.add_scalar(cq_addr);
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    rt->ops->submit_task(rt, mk, params);
+}
+
+static inline void pto2_rt_submit_task_deferred(const MixedKernels& mixed_kernels,
+                                                 PTOParam& params,
+                                                 uint64_t cq_addr) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    params.complete_in_future = true;
+    params.cq_addr = cq_addr;
+    params.add_scalar(cq_addr);
+    rt->ops->submit_task(rt, mixed_kernels, params);
 }
 
 static inline void pto2_rt_scope_begin() {

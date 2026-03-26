@@ -1,0 +1,141 @@
+/**
+ * PTO CQ Kernel API — inline functions for AICore kernels.
+ *
+ * These are NOT AICPU function calls. They are structured GM writes
+ * that the AICPU scheduler reads after the kernel returns.
+ *
+ * All overloads follow the (ENGINE, QUEUE, data...) parameter convention,
+ * symmetric with pto2_send_request_entry(ENGINE, RQ_ID, desc) in the RQ API.
+ *
+ * Usage in kernel code:
+ *
+ *   auto* cq = pto2_cq_get(args[CQ_ARG_IDX]);
+ *   pto2_save_expected_completion(PTO2_ENGINE_SDMA, cq,
+ *       PTO2_CQ_COMPLETION_EVENT_FLAG, flag_addr, 0);
+ *   pto2_cq_flush();
+ */
+
+#ifndef PTO_CQ_KERNEL_API_H
+#define PTO_CQ_KERNEL_API_H
+
+#include "pto_cq_types.h"
+
+// Requires __gm__ and __aicore__ to be defined before including this header.
+// Kernel sources should define them (or include PTO-ISA headers) first.
+
+// Unified engine constants — shared by RQ and CQ APIs.
+// Must match PTO2AsyncEngine in pto_types.h.
+#define PTO2_ENGINE_SDMA  0
+#define PTO2_ENGINE_ROCE  1
+#define PTO2_ENGINE_URMA  2
+#define PTO2_ENGINE_CCU   3
+
+// Completion type constants (must match PTO2CompletionType in pto_types.h)
+#define PTO2_CQ_COMPLETION_EVENT_FLAG        0
+#define PTO2_CQ_COMPLETION_EVENT_HANDLE_SLOT 1
+#define PTO2_CQ_COMPLETION_COUNTER           2
+
+inline __aicore__ void pto2_cq_writeback_gm_line(volatile __gm__ void* addr) {
+    __gm__ int32_t* gm_addr = (__gm__ int32_t*)addr;
+#if defined(SINGLE_CACHE_LINE) && defined(CACHELINE_OUT)
+    dcci(gm_addr, SINGLE_CACHE_LINE, CACHELINE_OUT);
+#elif defined(SINGLE_CACHE_LINE)
+    dcci(gm_addr, SINGLE_CACHE_LINE);
+#endif
+#if defined(DSB_DDR)
+    dsb(DSB_DDR);
+#endif
+}
+
+/**
+ * Obtain the completion queue pointer from a kernel scalar arg.
+ */
+inline __aicore__ volatile __gm__ PTO2CompletionQueue* pto2_cq_get(uint64_t addr) {
+    return reinterpret_cast<volatile __gm__ PTO2CompletionQueue*>(
+        static_cast<uintptr_t>(addr));
+}
+
+/**
+ * Reset the CQ header before the kernel appends completion entries.
+ *
+ * Runtime-owned CQ buffers may be reused across tasks, so kernels should
+ * explicitly republish an empty header before the first append.
+ */
+inline __aicore__ void pto2_cq_reset(volatile __gm__ PTO2CompletionQueue* cq) {
+    // Republish the header line even when the queue was already zeroed in a
+    // reused runtime buffer. Some hardware paths were observed to require an
+    // explicit header-state transition before the subsequent count increment
+    // became visible to the AICPU scheduler.
+    cq->count = -1;
+    pto2_cq_writeback_gm_line(&cq->count);
+    cq->count = 0;
+    pto2_cq_writeback_gm_line(&cq->count);
+}
+
+/**
+ * Register one expected completion condition in the CQ (full form).
+ *
+ * Parameter order: (ENGINE, QUEUE, data...) — symmetric with RQ API.
+ * Each call appends an entry and increments cq->count.
+ * The caller must ensure total calls per task <= PTO2_CQ_MAX_ENTRIES.
+ */
+inline __aicore__ void pto2_save_expected_completion(
+    uint32_t engine,
+    volatile __gm__ PTO2CompletionQueue* cq,
+    int32_t completion_type,
+    uint64_t addr,
+    uint32_t expected_value)
+{
+    int32_t idx = cq->count;
+    volatile __gm__ PTO2CQEntry* entry =
+        const_cast<volatile __gm__ PTO2CQEntry*>(&cq->entries[idx]);
+    entry->engine = engine;
+    entry->completion_type = completion_type;
+    entry->addr = addr;
+    entry->expected_value = expected_value;
+    pto2_cq_writeback_gm_line(entry);
+
+    cq->count = idx + 1;
+    pto2_cq_writeback_gm_line(&cq->count);
+}
+
+/**
+ * Simplified overload: (ENGINE, CQ, tag).
+ *
+ * Completion type is auto-determined: EVENT_FLAG with expected_value=0.
+ * Symmetric with pto2_send_request_entry(ENGINE, RQ_ID, desc).
+ */
+inline __aicore__ void pto2_save_expected_completion(
+    uint32_t engine,
+    volatile __gm__ PTO2CompletionQueue* cq,
+    uint64_t tag)
+{
+    pto2_save_expected_completion(engine, cq,
+                                  PTO2_CQ_COMPLETION_EVENT_FLAG, tag, 0);
+}
+
+/**
+ * Final flush before kernel returns. Ensures all CQ writes
+ * are visible to the AICPU scheduler.
+ */
+inline __aicore__ void pto2_cq_flush() {
+#if defined(PIPE_ALL)
+    pipe_barrier(PIPE_ALL);
+#endif
+}
+
+inline __aicore__ void pto2_cq_flush(volatile __gm__ PTO2CompletionQueue* cq) {
+#if defined(ENTIRE_DATA_CACHE) && defined(CACHELINE_OUT)
+    dcci((__gm__ int32_t*)cq, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+#elif defined(SINGLE_CACHE_LINE) && defined(CACHELINE_OUT)
+    dcci((__gm__ int32_t*)cq, SINGLE_CACHE_LINE, CACHELINE_OUT);
+#elif defined(SINGLE_CACHE_LINE)
+    dcci((__gm__ int32_t*)cq, SINGLE_CACHE_LINE);
+#endif
+#if defined(DSB_DDR)
+    dsb(DSB_DDR);
+#endif
+    pto2_cq_flush();
+}
+
+#endif  // PTO_CQ_KERNEL_API_H

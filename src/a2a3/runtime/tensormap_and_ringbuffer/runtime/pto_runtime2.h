@@ -32,6 +32,7 @@
 #include "pto_tensormap.h"
 #include "pto_scheduler.h"
 #include "pto_orchestrator.h"
+#include "pto_cq_types.h"
 
 // Maximum number of orchestrator threads supported
 constexpr int PTO2_MAX_ORCH_THREADS = 4;
@@ -61,6 +62,8 @@ typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 struct PTO2RuntimeOps {
     void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                         const PTOParam& params);
+    uint64_t (*get_async_context)(PTO2Runtime* rt, PTO2AsyncEngine engine);
+    uint64_t (*alloc_cq)(PTO2Runtime* rt);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
@@ -97,6 +100,14 @@ struct PTO2Runtime {
 
     // Mode
     PTO2RuntimeMode         mode;
+
+    // Per-engine async context addresses (0 = not available)
+    uint64_t                async_context_addrs[PTO2_NUM_ASYNC_ENGINES]{};
+
+    // Per-task completion queue pool (pre-allocated, bump-allocated per deferred task)
+    PTO2CompletionQueue*    cq_pool{nullptr};
+    int32_t                 cq_pool_size{0};
+    int32_t                 cq_pool_next{0};
 
     // Statistics
     int64_t                 total_cycles;

@@ -22,6 +22,7 @@
 #endif
 
 #include "tensor.h"
+#include "pto_cq_types.h"
 
 // Task parameters
 #define PTO2_MAX_TENSOR_PARAMS    16      // Maximum tensor parameters per task
@@ -29,6 +30,8 @@
 #define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
 #define PTO2_MAX_INPUTS           16      // Maximum inputs per task
 #define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
+// Max completion conditions per deferred task (matches CQ capacity)
+#define PTO2_MAX_COMPLETIONS_PER_TASK PTO2_CQ_MAX_ENTRIES
 
 // =============================================================================
 // Parameter Types (for pto_submit_task API)
@@ -41,6 +44,20 @@ enum class PTOParamType : int32_t {
     INPUT = 0,   // Read-only input buffer
     OUTPUT = 1,  // Write-only output buffer (NULL addr: runtime allocates; non-NULL: use as-is)
     INOUT = 2,   // Read-then-write: consumer of prior producer + modifier for downstream
+};
+
+typedef enum {
+    PTO2_ASYNC_ENGINE_SDMA = 0,   // System DMA
+    PTO2_ASYNC_ENGINE_ROCE = 1,   // RoCE RDMA (reserved)
+    PTO2_ASYNC_ENGINE_URMA  = 2,   // URMA cross-die memory ops (reserved)
+    PTO2_ASYNC_ENGINE_CCU  = 3,   // Cache coherence unit (reserved)
+    PTO2_NUM_ASYNC_ENGINES = 4
+} PTO2AsyncEngine;
+
+enum class PTO2CompletionType : int32_t {
+    EVENT_FLAG = 0,
+    EVENT_HANDLE_SLOT = 1,
+    COUNTER = 2,
 };
 
 /**
@@ -67,12 +84,25 @@ struct PTOParam {
     uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
     int32_t tensor_count{0};
     int32_t scalar_count{0};
+    bool complete_in_future{false};
+    uint64_t cq_addr{0};
+    // Pre-launch gating metadata.
+    // Current primary use case is notify-driven launch: the task stays out of
+    // READY until the local notify counter reaches the expected value.
+    bool has_launch_counter{false};
+    uint64_t launch_counter_addr{0};      // Usually a local notify-counter address.
+    uint32_t launch_counter_expected{0};  // Notify/counter threshold required for launch.
     bool has_error{false};
     const char* error_msg{nullptr};
 
     void reset() {
         tensor_count = 0;
         scalar_count = 0;
+        complete_in_future = false;
+        cq_addr = 0;
+        has_launch_counter = false;
+        launch_counter_addr = 0;
+        launch_counter_expected = 0;
         has_error = false;
         error_msg = nullptr;
     }

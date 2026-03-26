@@ -27,6 +27,72 @@
 
 #include "common/core_type.h"
 
+// Forward declarations for PTO2NotificationWaitList::poll_and_enqueue
+struct PTO2SchedulerState;
+struct PTO2LocalReadyBuffer;
+
+// =============================================================================
+// PTO2NotificationWaitList — pre-launch gating (thread-safe)
+// poll_and_enqueue() is defined in pto_async_wait.h after PTO2SchedulerState
+// =============================================================================
+
+inline constexpr int32_t PTO2_MAX_NOTIFICATION_WAITS = 64;
+
+struct PTO2NotificationWaitEntry {
+    PTO2TaskSlotState* slot_state{nullptr};
+    volatile uint32_t* counter_addr{nullptr};
+    uint32_t expected_value{0};
+};
+
+struct PTO2NotificationWaitList {
+    PTO2NotificationWaitEntry entries[PTO2_MAX_NOTIFICATION_WAITS];
+    std::atomic<int32_t> count{0};
+    std::atomic<int32_t> poll_lock{0};
+
+    bool add(PTO2TaskSlotState* slot, volatile uint32_t* addr, uint32_t expected) {
+        int32_t idx = count.fetch_add(1, std::memory_order_acq_rel);
+        if (idx >= PTO2_MAX_NOTIFICATION_WAITS || addr == nullptr) {
+            count.fetch_sub(1, std::memory_order_acq_rel);
+            return false;
+        }
+        entries[idx].slot_state = slot;
+        entries[idx].counter_addr = addr;
+        entries[idx].expected_value = expected;
+        return true;
+    }
+
+    int32_t get_count() const { return count.load(std::memory_order_acquire); }
+
+    bool try_lock_poll() {
+        int32_t expected = 0;
+        return poll_lock.compare_exchange_strong(expected, 1, std::memory_order_acquire);
+    }
+    void unlock_poll() { poll_lock.store(0, std::memory_order_release); }
+
+    void dump(int32_t thread_idx, int32_t max_entries = 4) const {
+#ifdef DEV_ALWAYS
+        int32_t cur = count.load(std::memory_order_acquire);
+        if (cur <= 0) return;
+        DEV_ALWAYS("Thread %d: notification_wait_list pending entries=%d", thread_idx, cur);
+        int32_t dump_count = cur < max_entries ? cur : max_entries;
+        for (int32_t i = 0; i < dump_count; ++i) {
+            const auto& e = entries[i];
+            int32_t tid = (e.slot_state && e.slot_state->task)
+                ? static_cast<int32_t>(e.slot_state->task->mixed_task_id.local()) : -1;
+            DEV_ALWAYS("  [%d] task=%d counter_addr=%p current=%u expected=%u",
+                       i, tid, (void*)e.counter_addr,
+                       e.counter_addr ? *e.counter_addr : 0, e.expected_value);
+        }
+#else
+        (void)thread_idx;
+        (void)max_entries;
+#endif
+    }
+
+    // poll_and_enqueue declared here, defined in pto_async_wait.h
+    int32_t poll_and_enqueue(PTO2SchedulerState* sched, PTO2LocalReadyBuffer* local_bufs);
+};
+
 #if PTO2_SCHED_PROFILING
 #include "aicpu/device_time.h"
 #define PTO2_SCHED_CYCLE_START() uint64_t _st0 = get_sys_cnt_aicpu(), _st1
@@ -336,6 +402,11 @@ struct PTO2SchedulerState {
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
+    // Pre-launch gating: shared across all scheduler threads.
+    // release_fanin_and_check_ready diverts tasks with has_launch_counter
+    // into this list instead of the ready queue.
+    PTO2NotificationWaitList notification_wait_list;
+
     // Statistics
 #if PTO2_SCHED_PROFILING
     std::atomic<int64_t> tasks_completed;
@@ -430,6 +501,14 @@ struct PTO2SchedulerState {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
 
         if (new_refcount == slot_state.fanin_count) {
+            if (slot_state.payload && slot_state.payload->has_launch_counter) {
+                auto* pl = slot_state.payload;
+                notification_wait_list.add(
+                    &slot_state,
+                    reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(pl->launch_counter_addr)),
+                    pl->launch_counter_expected);
+                return true;
+            }
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
@@ -450,6 +529,14 @@ struct PTO2SchedulerState {
         atomic_count += 1;  // fanin_refcount.fetch_add
 
         if (new_refcount == slot_state.fanin_count) {
+            if (slot_state.payload && slot_state.payload->has_launch_counter) {
+                auto* pl = slot_state.payload;
+                notification_wait_list.add(
+                    &slot_state,
+                    reinterpret_cast<volatile uint32_t*>(static_cast<uintptr_t>(pl->launch_counter_addr)),
+                    pl->launch_counter_expected);
+                return true;
+            }
             PTO2TaskState expected = PTO2_TASK_PENDING;
             if (slot_state.task_state.compare_exchange_strong(
                     expected, PTO2_TASK_READY, std::memory_order_acq_rel, std::memory_order_acquire)) {

@@ -73,6 +73,36 @@ def _wait_for_new_device_log(log_dir, pre_run_logs, timeout=15, interval=0.5):
     return None
 
 
+def _parse_device_spec(spec):
+    """Expand a device spec like '4-7' or '0,1,3,5' into device ids."""
+    if spec is None:
+        return None
+
+    spec = spec.strip()
+    if not spec:
+        raise ValueError("Device spec must not be empty")
+
+    device_ids = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if "-" in item:
+            start_str, end_str = item.split("-", 1)
+            start = int(start_str)
+            end = int(end_str)
+            if end < start:
+                raise ValueError(f"Invalid device range '{item}': end < start")
+            device_ids.extend(range(start, end + 1))
+        else:
+            device_ids.append(int(item))
+
+    if not device_ids:
+        raise ValueError("Device spec must contain at least one device")
+
+    return device_ids
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Run PTO runtime test with kernel config and golden script",
@@ -198,10 +228,33 @@ Golden.py interface:
         help="Skip golden computation and comparison (for benchmarking)"
     )
 
+    parser.add_argument(
+        "--nranks",
+        type=int,
+        default=None,
+        help="Override number of ranks for distributed tests (default: from kernel_config)"
+    )
+
+    parser.add_argument(
+        "--device-range",
+        type=str,
+        default=None,
+        help="Explicit device range for distributed tests (e.g., 4-7)"
+    )
+
+    parser.add_argument(
+        "--devices",
+        type=str,
+        default=None,
+        help="Explicit distributed device list, supports comma lists/ranges (e.g., 0,1,3,5 or 4-7)"
+    )
+
     args = parser.parse_args()
 
     if args.all and args.case:
         parser.error("--all and --case are mutually exclusive")
+    if args.device_range and args.devices:
+        parser.error("--device-range and --devices are mutually exclusive")
 
     # Determine log level from arguments
     log_level_str = None
@@ -252,6 +305,55 @@ Golden.py interface:
 
     # Import and run
     try:
+        # Detect DISTRIBUTED_CONFIG to choose runner
+        import importlib.util as _ilu
+        _kc_spec = _ilu.spec_from_file_location("_kc_check", kernel_config_path)
+        _kc_mod = _ilu.module_from_spec(_kc_spec)
+        _kc_spec.loader.exec_module(_kc_mod)
+        is_distributed = hasattr(_kc_mod, "DISTRIBUTED_CONFIG")
+
+        if is_distributed:
+            from distributed_code_runner import DistributedCodeRunner
+
+            logger.info("Detected DISTRIBUTED_CONFIG — using distributed runner")
+            dist_cfg = getattr(_kc_mod, "DISTRIBUTED_CONFIG", {})
+
+            if args.devices is not None:
+                device_ids = _parse_device_spec(args.devices)
+                effective_nranks = len(device_ids)
+            elif args.device_range is not None:
+                device_ids = _parse_device_spec(args.device_range)
+                effective_nranks = len(device_ids)
+            else:
+                effective_nranks = args.nranks if args.nranks is not None else dist_cfg.get("nranks", 8)
+                device_ids = [args.device + i for i in range(effective_nranks)]
+
+            if args.nranks is not None and args.nranks != effective_nranks:
+                raise ValueError(
+                    f"--nranks={args.nranks} conflicts with device list "
+                    f"({effective_nranks} devices)"
+                )
+
+            runner = DistributedCodeRunner(
+                kernels_dir=str(args.kernels),
+                golden_path=str(args.golden),
+                platform=args.platform,
+                nranks=effective_nranks,
+                device_ids=device_ids,
+                build_dir=args.savetemp,
+                pto_isa_commit=args.pto_isa_commit,
+                clone_protocol=args.clone_protocol,
+            )
+            success = runner.run_all()
+            if success:
+                logger.info("=" * 60)
+                logger.info("TEST PASSED")
+                logger.info("=" * 60)
+            else:
+                logger.error("TEST FAILED")
+                return 1
+            return 0
+
         from code_runner import create_code_runner
 
         runner = create_code_runner(
