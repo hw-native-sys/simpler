@@ -92,13 +92,13 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                 PTOParam params;
                 params.add_input(ext_A);
                 params.add_input(ext_B);
-                params.add_output(C_view);
+                params.add_inout(C_view);
                 params.add_input(ext_D);
                 params.add_input(ext_E);
-                params.add_output(F_view);
+                params.add_inout(F_view);
                 params.add_input(ext_G);
                 params.add_input(ext_H);
-                params.add_output(I_view);
+                params.add_inout(I_view);
                 pto2_rt_submit_task(mk, params);
             }
 
@@ -107,7 +107,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                 PTOParam params;
                 params.add_input(ext_A);
                 params.add_input(ext_B);
-                params.add_output(J_view);
+                params.add_inout(J_view);
                 pto2_rt_submit_aic_task(FUNC_MATMUL, params);
             }
 
@@ -116,7 +116,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                 PTOParam params;
                 params.add_input(ext_D);
                 params.add_input(ext_E);
-                params.add_output(K_view);
+                params.add_inout(K_view);
                 pto2_rt_submit_aiv_task(FUNC_ADD_STANDALONE, params);
             }
 
@@ -128,10 +128,10 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                 PTOParam params;
                 params.add_input(ext_D);
                 params.add_input(ext_E);
-                params.add_output(L_view);
+                params.add_inout(L_view);
                 params.add_input(ext_G);
                 params.add_input(ext_H);
-                params.add_output(M_view);
+                params.add_inout(M_view);
                 pto2_rt_submit_task(mk, params);
             }
 
@@ -143,10 +143,10 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                 PTOParam params;
                 params.add_input(ext_A);
                 params.add_input(ext_B);
-                params.add_output(N_view);
+                params.add_inout(N_view);
                 params.add_input(ext_D);
                 params.add_input(ext_E);
-                params.add_output(O_view);
+                params.add_inout(O_view);
                 pto2_rt_submit_task(mk, params);
             }
         }

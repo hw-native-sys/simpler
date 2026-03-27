@@ -48,18 +48,18 @@ One extra step versus get_tensor_data: wait for all consumers to finish (`fanout
 ## 4. add_output with Initial Value
 
 ```cpp
-params.add_output(tensor, initial_value);  // tensor must have addr == 0
+TensorCreateInfo ci(shapes, ndims, dtype);
+params.add_output(ci, initial_value);
 ```
 
 **Mechanism**:
-1. `add_output` sets `has_initial_value = true` and `initial_value` on the Tensor struct
-2. During orchestrator submit, after HeapRing allocation, the flag is checked
+1. `add_output(ci, initial_value)` copies `ci` into `PTOParam` and marks the create-info with an initial value
+2. During orchestrator submit, after HeapRing allocation, the output tensor is materialized from the copied create-info
 3. Fill strategy:
    - Small buffer (< 64 B): element-by-element memcpy directly into dst
    - Large buffer (≥ 64 B): fill the first 64 bytes as a template block, then bulk-memcpy in 64 B chunks; partial tail copy for remainder
-4. Flag cleared after consumption (`has_initial_value = false`)
 
-**Constraint**: `addr != 0` triggers an error — use `add_inout()` for already-allocated tensors.
+**Constraint**: existing tensors are write targets only through `add_inout()`.
 
 ## 5. Scalar Dependencies via 1-Element Tensors
 
@@ -67,12 +67,13 @@ Traditional scalars (`PTOParam::add_scalar`) are one-way inputs with no TensorMa
 
 ```cpp
 uint32_t shapes[1] = {1};
-Tensor scalar_tensor = make_tensor(shapes, 1, DataType::FLOAT32);
+TensorCreateInfo scalar_ci(shapes, 1, DataType::FLOAT32);
 
-// Submit with initial value
+// Submit with initial value and keep the returned tensor
 PTOParam params;
-params.add_output(scalar_tensor, float_to_u64(77.0f));
-pto2_rt_submit_aiv_task(FUNC_NOOP, params);
+params.add_output(scalar_ci, float_to_u64(77.0f));
+TaskOutputTensors outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params);
+const Tensor& scalar_tensor = outs.get_ref(0);
 
 // Orchestration-side blocking read (waits for kernel completion)
 uint32_t idx[1] = {0};

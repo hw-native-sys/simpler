@@ -69,7 +69,7 @@ Thread 3: PTO2 total submitted tasks = 16704
 
 ### Interpreting the Numbers
 
-- **cost > total**: The difference is overhead outside `pto2_submit_task` (the orchestration user code itself, scope_begin/end, make_tensor calls, etc.).
+- **cost > total**: The difference is overhead outside `pto2_submit_task` (the orchestration user code itself, scope_begin/end, TensorCreateInfo construction, etc.).
 - **lookup+dep** is typically the dominant cost (~50%) because it involves TensorMap hash lookups and building dependency edges with spinlock-protected fanout list insertions.
 - **param_copy** scales with the number of parameters per task.
 - **avg/task < 1us** indicates efficient graph construction.

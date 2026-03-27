@@ -2,13 +2,13 @@
  * Scalar Data Dependency Test Orchestration
  *
  * End-to-end test for get_tensor_data, set_tensor_data, and add_inout
- * with initial value support.
+ * with runtime-created outputs and initial value support.
  *
  * Flow:
- *   1. c = a + b           (kernel_add, internal tensor)
+ *   1. c = a + b           (kernel_add, runtime-created tensor)
  *   2. get_tensor_data(c, {0})   → check[0] = 2.0
  *   3. get_tensor_data(c, {100}) → check[1] = 102.0
- *   4. scalar_tensor = make_tensor({1}), add_output(scalar_tensor, 77.0f), submit noop
+ *   4. scalar_tensor = add_output(TensorCreateInfo, 77.0f), submit noop
  *   5. get_tensor_data(scalar_tensor, {0}) → check[2] = 77.0
  *   6. add_inout(scalar_tensor) (INOUT path), submit noop
  *   7. get_tensor_data(scalar_tensor, {0}) → check[3] = 77.0
@@ -17,7 +17,7 @@
  *  10. Orch set_tensor_data(d, {0}, 10.0) → kernel_add(d, a) → check[6] = 12.0
  *  11. WAW+WAR: kernel_add reads c → set_tensor_data(c, 88.0) auto-waits → check[7] = 88.0
  *  12. External WAR with INOUT: noop(ext_b as INOUT) → set_tensor_data(ext_b) → check[8] = 55.0
- *  13. result = a + b      (kernel_add, external output, ext_b[0] restored)
+ *  13. result = a + b      (kernel_add, external output via INOUT)
  */
 
 #include <stddef.h>
@@ -66,28 +66,27 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     (void)orch_thread_index;
 
     // External tensors from golden.py
-    Tensor ext_a      = from_task_arg(orch_args[0]);
-    Tensor ext_b      = from_task_arg(orch_args[1]);
-    Tensor ext_result  = from_task_arg(orch_args[2]);
-    Tensor ext_check   = from_task_arg(orch_args[3]);
+    Tensor ext_a = from_task_arg(orch_args[0]);
+    Tensor ext_b = from_task_arg(orch_args[1]);
+    Tensor ext_result = from_task_arg(orch_args[2]);
+    Tensor ext_check = from_task_arg(orch_args[3]);
 
     uint32_t SIZE = orch_args[0].tensor.shapes[0];
     LOG_INFO("scalar_data_test: SIZE=%u, check_size=%u",
              SIZE, orch_args[3].tensor.shapes[0]);
 
-    // =========================================================
-    // Step 1: c = a + b (internal tensor, kernel_add)
-    // =========================================================
     uint32_t inter_shapes[1] = {SIZE};
-    Tensor c = make_tensor(inter_shapes, 1, DataType::FLOAT32);
+    TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);
 
-    {
-        PTOParam params;
-        params.add_input(ext_a);
-        params.add_input(ext_b);
-        params.add_output(c);
-        pto2_rt_submit_aiv_task(FUNC_ADD, params);
-    }
+    // =========================================================
+    // Step 1: c = a + b (runtime-created tensor, kernel_add)
+    // =========================================================
+    PTOParam params_c;
+    params_c.add_input(ext_a);
+    params_c.add_input(ext_b);
+    params_c.add_output(inter_ci);
+    TaskOutputTensors c_outs = pto2_rt_submit_aiv_task(FUNC_ADD, params_c);
+    const Tensor& c = c_outs.get_ref(0);
 
     // =========================================================
     // Step 2: get_tensor_data(c, {0}) → check[0]
@@ -114,17 +113,16 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     set_tensor_data(ext_check, 1, check_idx, c100_raw);
 
     // =========================================================
-    // Step 4: add_inout with initial value (first use → OUTPUT path)
+    // Step 4: Runtime-created scalar output with initial value
     //   Runtime allocates HeapRing buffer, writes 77.0 to element [0]
     // =========================================================
     uint32_t scalar_shapes[1] = {1};
-    Tensor scalar_tensor = make_tensor(scalar_shapes, 1, DataType::FLOAT32);
+    TensorCreateInfo scalar_ci(scalar_shapes, 1, DataType::FLOAT32);
 
-    {
-        PTOParam params;
-        params.add_output(scalar_tensor, float_to_u64(77.0f));
-        pto2_rt_submit_aiv_task(FUNC_NOOP, params);
-    }
+    PTOParam params_scalar;
+    params_scalar.add_output(scalar_ci, float_to_u64(77.0f));
+    TaskOutputTensors scalar_outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params_scalar);
+    const Tensor& scalar_tensor = scalar_outs.get_ref(0);
 
     // =========================================================
     // Step 5: get_tensor_data(scalar_tensor, {0}) → check[2]
@@ -141,7 +139,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
 
     // =========================================================
     // Step 6: add_inout(scalar_tensor) second use → INOUT path
-    //   addr != 0, so registered as INOUT (no reallocation)
+    //   Buffer already exists, so the noop just registers dependency
     // =========================================================
     {
         PTOParam params;
@@ -190,24 +188,20 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     //   Orchestration writes d[0]=10.0 via set_tensor_data, then
     //   kernel_add reads d as input: e[0] = d[0] + a[0] = 12.0
     // =========================================================
-    Tensor d = make_tensor(inter_shapes, 1, DataType::FLOAT32);
-    {
-        PTOParam params;
-        params.add_output(d);
-        pto2_rt_submit_aiv_task(FUNC_NOOP, params);
-    }
+    PTOParam params_d;
+    params_d.add_output(inter_ci);
+    TaskOutputTensors d_outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params_d);
+    const Tensor& d = d_outs.get_ref(0);
 
     idx[0] = 0;
     set_tensor_data(d, 1, idx, float_to_u64(10.0f));
 
-    Tensor e = make_tensor(inter_shapes, 1, DataType::FLOAT32);
-    {
-        PTOParam params;
-        params.add_input(d);
-        params.add_input(ext_a);
-        params.add_output(e);
-        pto2_rt_submit_aiv_task(FUNC_ADD, params);
-    }
+    PTOParam params_e;
+    params_e.add_input(d);
+    params_e.add_input(ext_a);
+    params_e.add_output(inter_ci);
+    TaskOutputTensors e_outs = pto2_rt_submit_aiv_task(FUNC_ADD, params_e);
+    const Tensor& e = e_outs.get_ref(0);
 
     uint64_t e0_raw = get_tensor_data(e, 1, idx);
     LOG_INFO("Orch→AICore RAW: e[0] = %f (expected 12.0)",
@@ -232,13 +226,11 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     //   instead of add_input() so TensorMap tracks the access chain.
     // =========================================================
     {
-        // Submit kernel that reads c as INPUT (creates fanout on c's producer)
-        Tensor f = make_tensor(inter_shapes, 1, DataType::FLOAT32);
         PTOParam params;
         params.add_input(c);
         params.add_input(ext_b);
-        params.add_output(f);
-        pto2_rt_submit_aiv_task(FUNC_ADD, params);
+        params.add_output(inter_ci);
+        (void)pto2_rt_submit_aiv_task(FUNC_ADD, params);
     }
 
     // set_tensor_data auto-waits for producer + consumer before writing
@@ -268,7 +260,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     // =========================================================
     {
         PTOParam params;
-        params.add_inout(ext_b);   // INOUT: creates TensorMap entry (not INPUT!)
+        params.add_inout(ext_b);  // INOUT: creates TensorMap entry (not INPUT!)
         pto2_rt_submit_aiv_task(FUNC_NOOP, params);
     }
 
@@ -285,13 +277,13 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     set_tensor_data(ext_b, 1, idx, float_to_u64(0.0f));
 
     // =========================================================
-    // Step 13: result = a + b (external output, kernel_add)
+    // Step 13: result = a + b (external output via INOUT, kernel_add)
     // =========================================================
     {
         PTOParam params;
         params.add_input(ext_a);
         params.add_input(ext_b);
-        params.add_output(ext_result);
+        params.add_inout(ext_result);
         pto2_rt_submit_aiv_task(FUNC_ADD, params);
     }
 

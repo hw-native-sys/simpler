@@ -228,8 +228,8 @@ static inline uint64_t get_tensor_data(const Tensor& tensor,
  * consumer tracking via fanout_refcount.
  *
  * The tensor must already have an allocated buffer (addr != 0).
- * For make_tensor() outputs, call this only after the tensor has been
- * submitted as OUTPUT at least once (so HeapRing allocation has occurred).
+ * For runtime-created outputs, call this only on the Tensor returned by
+ * add_output(TensorCreateInfo) after submit returns.
  */
 static inline void set_tensor_data(Tensor& tensor,
                                    uint32_t ndims, const uint32_t indices[],

@@ -572,23 +572,22 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 
 | Function/Macro | Purpose |
 |----------------|---------|
-| `pto2_rt_submit_task(rt, mixed_kernels, params, n)` | Submit a mixed task with `MixedKernels` struct |
-| `pto2_rt_submit_aic_task(rt, kernel_id, params, n)` | Convenience: submit AIC-only task |
-| `pto2_rt_submit_aiv_task(rt, kernel_id, params, n)` | Convenience: submit AIV-only task |
-| `PTO2_SCOPE(rt) { ... }` | RAII scope for buffer lifetime |
-| `pto2_rt_orchestration_done(rt)` | Signal orchestration complete |
-| `pto2_rt_init_tensor_pool(rt)` | Initialize tensor pool for `make_tensor()` |
+| `pto2_rt_submit_task(mixed_kernels, params)` | Submit a mixed task with `MixedKernels` struct |
+| `pto2_rt_submit_aic_task(kernel_id, params)` | Convenience: submit AIC-only task |
+| `pto2_rt_submit_aiv_task(kernel_id, params)` | Convenience: submit AIV-only task |
+| `PTO2_SCOPE() { ... }` | RAII scope for buffer lifetime |
+| `pto2_rt_orchestration_done()` | Signal orchestration complete |
 
 ### 11.2 Parameter Construction
 
 | Function | Description |
 |----------|-------------|
 | `make_tensor_external(ptr, shapes, ndim, dtype)` | Wrap an existing device pointer as a tensor |
-| `make_tensor(shapes, ndim, dtype)` | Create an intermediate tensor (addr=0, allocated by runtime from heap) |
-| `make_input_param(tensor)` | INPUT parameter — read by the task |
-| `make_output_param(tensor)` | OUTPUT parameter — written by the task (auto-allocated if addr=0) |
-| `make_inout_param(tensor)` | INOUT parameter — read then written |
-| `make_scalar_param(value)` | 64-bit scalar parameter |
+| `TensorCreateInfo(shapes, ndim, dtype)` | Describe a runtime-created output buffer |
+| `PTOParam::add_input(tensor)` | INPUT parameter — read by the task |
+| `PTOParam::add_output(create_info)` | OUTPUT parameter — runtime allocates and returns a Tensor |
+| `PTOParam::add_inout(tensor)` | INOUT parameter — existing tensor read then written |
+| `PTOParam::add_scalar(value)` | 64-bit scalar parameter |
 
 ### 11.3 Resource Shapes
 
@@ -646,7 +645,7 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_nu
     for (q_idx = 0; q_idx < q_loop; q_idx++) {
         for (batch_start = 0; batch_start < batch; batch_start += IN_CORE_BATCH) {
             PTO2_SCOPE() {
-                // Allocate accumulator tensors (oi, li, mi) via make_tensor()
+                // Describe accumulator tensors (oi, li, mi) with TensorCreateInfo
                 // Submit AIV_HUB to initialize accumulators
                 for (bn = 0; bn < max_bn; bn++) {
                     // Allocate intermediate tensors (sij, pij, mij, lij, oi_new)

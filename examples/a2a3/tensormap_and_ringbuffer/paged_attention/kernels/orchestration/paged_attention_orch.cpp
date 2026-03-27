@@ -168,7 +168,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                     params_up.add_inout(mi_update);
                     params_up.add_inout(li_update);
                     params_up.add_inout(oi);
-                    params_up.add_output(out_view);
+                    params_up.add_inout(out_view);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);

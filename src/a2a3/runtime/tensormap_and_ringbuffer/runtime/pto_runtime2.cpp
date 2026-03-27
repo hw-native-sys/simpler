@@ -117,7 +117,7 @@ uint64_t pto2_get_tensor_data(PTO2Runtime* rt, const Tensor& tensor,
     if (tensor.buffer.addr == 0) {
         unified_log_error(__FUNCTION__,
             "get_tensor_data: buffer not allocated (addr=0). "
-            "make_tensor() tensors must be submitted as OUTPUT first.");
+            "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns.");
         return 0;
     }
 
@@ -140,7 +140,7 @@ void pto2_set_tensor_data(PTO2Runtime* rt, Tensor& tensor,
     if (tensor.buffer.addr == 0) {
         unified_log_error(__FUNCTION__,
             "set_tensor_data: buffer not allocated (addr=0). "
-            "make_tensor() tensors must be submitted as OUTPUT first.");
+            "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns.");
         return;
     }
 

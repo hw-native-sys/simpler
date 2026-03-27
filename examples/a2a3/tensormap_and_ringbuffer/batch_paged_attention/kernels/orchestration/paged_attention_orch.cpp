@@ -80,7 +80,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
     Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
     Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
-    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
+    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32, true);
 
     uint64_t bt_addr = (uint64_t)(uintptr_t)host_block_table;
     uint64_t cl_addr = (uint64_t)(uintptr_t)host_context_lens;
@@ -165,7 +165,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                     params_up.add_inout(mi_batch);
                     params_up.add_inout(li_batch);
                     params_up.add_inout(oi_batch);
-                    params_up.add_output(out);
+                    params_up.add_inout(out);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     params_up.add_scalar(chunk_bc);

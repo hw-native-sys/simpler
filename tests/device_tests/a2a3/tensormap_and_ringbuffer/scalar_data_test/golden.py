@@ -7,7 +7,7 @@ Computation:
   c = a + b (kernel, internal tensor)
   check[0] = GetTensorData(c, {0})     = a[0]+b[0] = 2.0+0.0 = 2.0
   check[1] = GetTensorData(c, {100})   = a[100]+b[100] = 2.0+100.0 = 102.0
-  scalar initialized to 77.0 via add_output(scalar, float_to_u64(77.0f))
+  scalar initialized to 77.0 via add_output(TensorCreateInfo, float_to_u64(77.0f))
   check[2] = GetTensorData(scalar, {0}) = 77.0
   second noop with add_inout(scalar), value preserved
   check[3] = GetTensorData(scalar, {0}) = 77.0
@@ -60,8 +60,8 @@ def compute_golden(tensors: dict, params: dict) -> None:
     check = torch.as_tensor(tensors["check"])
     check[0] = 2.0    # GetTensorData(c, {0}): c = a + b, c[0] = 2.0+0.0
     check[1] = 102.0  # GetTensorData(c, {100}): c[100] = 2.0+100.0
-    check[2] = 77.0   # add_inout initial value (first use, OUTPUT path)
-    check[3] = 77.0   # add_inout second use (INOUT path, value preserved)
+    check[2] = 77.0   # runtime-created scalar output initialized to 77.0
+    check[3] = 77.0   # second noop via add_inout preserves the value
     check[4] = 79.0   # orchestration arithmetic: 2.0 + 77.0
     check[5] = 42.0   # Orch set→get round-trip: SetTensorData then GetTensorData
     check[6] = 12.0   # Orch→AICore RAW: SetTensorData(d,10.0) + kernel_add(d,a) → 10.0+2.0

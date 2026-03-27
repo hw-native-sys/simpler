@@ -111,6 +111,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
     TensorCreateInfo sij_ci(sij_shapes, 2, DataType::FLOAT32);
     TensorCreateInfo pij_f16_ci(sij_shapes, 2, data_type);
 
+    prof_make_count += 4;
+    CYCLE_COUNT_LAP(prof_make_tensor);
+
     int total_tasks = 0;
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
@@ -121,8 +124,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                 CYCLE_COUNT_LAP(prof_scope);
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
 
-                prof_make_count += 4;
-                CYCLE_COUNT_LAP(prof_make_tensor);
                 uint32_t qi_offsets[2] = {(uint32_t)cur_offset, 0};
                 Tensor qi = query.view(tile2d_shapes, qi_offsets);
                 uint32_t out_view_offsets[2] = {(uint32_t)cur_offset, 0};
@@ -156,7 +157,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                     prof_view_count += 2;
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
-                    CYCLE_COUNT_LAP(prof_make_tensor);
 
                     PTOParam params_qk;
                     params_qk.add_input(qi);
@@ -174,7 +174,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                     prof_view_count += 1;
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
-                    CYCLE_COUNT_LAP(prof_make_tensor);
 
                     PTOParam params_sf;
                     params_sf.add_input(sij_valid);
@@ -190,7 +189,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
-                    CYCLE_COUNT_LAP(prof_make_tensor);
 
                     PTOParam params_pv;
                     params_pv.add_input(pij_f16);
@@ -213,7 +211,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                     params_up.add_inout(mi_update);
                     params_up.add_inout(li_update);
                     params_up.add_inout(oi);
-                    params_up.add_output(out_view);
+                    params_up.add_inout(out_view);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
@@ -235,7 +233,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
             cycles_to_us(prof_param_extract), prof_param_extract * 100.0 / total);
         LOG_ALWAYS("  ext_tensor(x4)   : %7.3fus (%5.1f%%)",
             cycles_to_us(prof_ext_tensor), prof_ext_tensor * 100.0 / total);
-        LOG_ALWAYS("  make_tensor(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
+        LOG_ALWAYS("  create_info(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",
             prof_make_count, cycles_to_us(prof_make_tensor), prof_make_tensor * 100.0 / total,
             prof_make_count > 0 ? cycles_to_us(prof_make_tensor) / prof_make_count : 0.0);
         LOG_ALWAYS("  tensor_view(x%d) : %7.3fus (%5.1f%%)  avg=%.3fus",

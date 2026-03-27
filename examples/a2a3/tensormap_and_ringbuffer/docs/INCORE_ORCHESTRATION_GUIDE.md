@@ -27,16 +27,16 @@ Arguments are constructed by `examples/scripts/code_runner.py` and passed throug
 Validate `arg_count` in `aicpu_orchestration_config` and interpret pointers as device addresses.
 
 ## Building The Graph
-1. Call `pto2_rt_init_tensor_pool(rt)` at the start of `aicpu_orchestration_entry`.
-2. Wrap orchestration in scopes with `PTO2_SCOPE(rt)` to control tensor lifetimes.
-3. Use `make_tensor_external` for input/output buffers and `make_tensor` for intermediates.
+1. Wrap orchestration in scopes with `PTO2_SCOPE()` to control tensor lifetimes.
+2. Use `make_tensor_external` for existing device buffers and `TensorCreateInfo` + `add_output(...)` for runtime-created intermediates.
+3. Use `add_inout(...)` for existing tensors that a kernel writes.
 4. Build `PTOParam` with `add_input`, `add_output`, `add_inout` for tensors and `add_scalar` for scalars.
    > **Constraint**: All tensor parameters (`add_input` / `add_output` / `add_inout`) **must** be added before any scalar parameters (`add_scalar` / `add_scalars`). Violating this order will trigger an assertion failure. This is because the runtime dispatches tensor arguments first in kernel args, followed by scalars, and the layout must match.
    ```cpp
    // Correct
    PTOParam p;
    p.add_input(a);
-   p.add_output(b);
+   p.add_inout(b);
    p.add_scalar(val);    // scalars after all tensors
 
    // Wrong — triggers assertion
@@ -59,7 +59,7 @@ Dependencies are inferred by TensorMap from input/inout/output tensors, so you d
   MixedKernels mk;
   mk.aic_kernel_id = FUNC_QK;
   mk.aiv0_kernel_id = FUNC_SF;
-  pto2_rt_submit_task(rt, mk, params, num_params);
+  pto2_rt_submit_task(mk, params);
   ```
 - Kernel `func_id` values are defined in `kernels/kernel_config.py` under `KERNELS`.
 
