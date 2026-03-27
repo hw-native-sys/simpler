@@ -221,6 +221,44 @@ int validate_runtime_impl(Runtime *runtime) {
     return rc;
 }
 
+int init_runtime_round_impl(Runtime* runtime,
+                        const TaskArg* orch_args,
+                        int orch_args_count,
+                        int* arg_types) {
+    (void)runtime;
+    (void)orch_args;
+    (void)orch_args_count;
+    (void)arg_types;
+    // No-op: host orchestration manages device memory directly,
+    // so there is no per-round data copy to perform.
+    return 0;
+}
+
+int validate_runtime_round_impl(Runtime* runtime) {
+    if (runtime == nullptr) {
+        LOG_ERROR("Runtime pointer is null");
+        return -1;
+    }
+
+    int rc = 0;
+
+    // Copy recorded tensors from device back to host (same as validate_runtime_impl
+    // but without freeing device memory or kernel binaries).
+    TensorPair* tensor_pairs = runtime->get_tensor_pairs();
+    int tensor_pair_count = runtime->get_tensor_pair_count();
+
+    for (int i = 0; i < tensor_pair_count; i++) {
+        const TensorPair& pair = tensor_pairs[i];
+        int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
+        if (copy_rc != 0) {
+            LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
+            rc = copy_rc;
+        }
+    }
+
+    return rc;
+}
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

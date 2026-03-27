@@ -164,6 +164,19 @@ class RuntimeLibraryLoader:
         self.lib.finalize_runtime.argtypes = [c_void_p]
         self.lib.finalize_runtime.restype = c_int
 
+        # init_runtime_round - per-round data copy (INPUT+INOUT) to device
+        self.lib.init_runtime_round.argtypes = [
+            c_void_p,               # runtime
+            POINTER(TaskArgC),      # orch_args
+            c_int,                  # orch_args_count
+            POINTER(c_int),         # arg_types
+        ]
+        self.lib.init_runtime_round.restype = c_int
+
+        # finalize_runtime_round - copy results back without freeing resources
+        self.lib.finalize_runtime_round.argtypes = [c_void_p]
+        self.lib.finalize_runtime_round.restype = c_int
+
         # Note: register_kernel has been internalized into init_runtime
         # Kernel binaries are now passed directly to init_runtime()
 
@@ -232,6 +245,32 @@ class Runtime:
         size = lib.get_runtime_size()
         self._buffer = ctypes.create_string_buffer(size)
         self._handle = ctypes.cast(self._buffer, c_void_p)
+        self._initialized = False
+
+    def _convert_orch_params(self, orch_args, arg_types):
+        """Convert orch_args and arg_types to ctypes arrays."""
+        orch_args = orch_args or []
+        orch_args_count = len(orch_args)
+
+        # Accept either a nanobind TaskArgArray (from task_interface) or a
+        # plain list of TaskArgC structs.
+        from _task_interface import TaskArgArray as _NbTaskArgArray
+
+        if isinstance(orch_args, _NbTaskArgArray):
+            orch_args_array = cast(orch_args.ctypes_ptr(), POINTER(TaskArgC)) if orch_args_count > 0 else None
+            # Prevent GC of the nanobind array while the ctypes pointer is live
+            self._nb_args_ref = orch_args
+        elif orch_args_count > 0:
+            orch_args_array = (TaskArgC * orch_args_count)(*orch_args)
+        else:
+            orch_args_array = None
+
+        if arg_types is not None and len(arg_types) > 0:
+            arg_types_array = (c_int * len(arg_types))(*arg_types)
+        else:
+            arg_types_array = None
+
+        return orch_args_array, orch_args_count, arg_types_array
 
     def initialize(
         self,
@@ -323,6 +362,7 @@ class Runtime:
         )
         if rc != 0:
             raise RuntimeError(f"init_runtime failed: {rc}")
+        self._initialized = True
 
     def finalize(self) -> None:
         """
@@ -335,10 +375,58 @@ class Runtime:
         Raises:
             RuntimeError: If finalization fails
         """
+        if not self._initialized:
+            return
 
         rc = self.lib.finalize_runtime(self._handle)
         if rc != 0:
             raise RuntimeError(f"finalize_runtime failed: {rc}")
+        self._initialized = False
+
+    def initialize_round(
+        self,
+        orch_args: Optional[list] = None,
+        arg_types: Optional[List[int]] = None,
+    ) -> None:
+        """
+        Per-round initialization: copy INPUT and INOUT tensor data to device.
+
+        Uses existing device memory allocations from initialize().
+        Called every round (including the first) before launch_runtime().
+
+        Args:
+            orch_args: List of TaskArgC structs for orchestration
+            arg_types: Array describing each argument's type
+
+        Raises:
+            RuntimeError: If round initialization fails
+        """
+        orch_args_array, orch_args_count, arg_types_array = \
+            self._convert_orch_params(orch_args, arg_types)
+
+        rc = self.lib.init_runtime_round(
+            self._handle,
+            orch_args_array,
+            orch_args_count,
+            arg_types_array,
+        )
+        if rc != 0:
+            raise RuntimeError(f"init_runtime_round failed: {rc}")
+
+    def finalize_round(self) -> None:
+        """
+        Round-level finalize: copy results back but keep device resources alive.
+
+        Copies output/inout tensors from device to host without freeing
+        device memory or kernel binaries. Use between rounds in the same case.
+
+        Raises:
+            RuntimeError: If round finalization fails
+        """
+        rc = self.lib.finalize_runtime_round(self._handle)
+        if rc != 0:
+            # Not supported by this runtime, fallback to full finalize
+            self.finalize()
 
     def enable_profiling(self, enabled: bool = True) -> None:
         """

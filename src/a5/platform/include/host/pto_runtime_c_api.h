@@ -161,6 +161,38 @@ int launch_runtime(RuntimeHandle runtime,
     int orch_thread_num);
 
 /**
+ * Per-round initialization: copy INPUT and INOUT tensor data to device.
+ *
+ * Uses existing device memory allocations from init_runtime().
+ * Called every round (including the first) before launch_runtime().
+ *
+ * Must be called after a successful init_runtime(). The Runtime handle
+ * must not have been fully finalized.
+ *
+ * @param runtime         Runtime handle (previously initialized)
+ * @param orch_args       Array of TaskArg describing orchestration arguments
+ * @param orch_args_count Number of orchestration arguments
+ * @param arg_types       Array describing each argument's type (ArgType enum)
+ * @return 0 on success, -1 on failure
+ */
+int init_runtime_round(RuntimeHandle runtime,
+                   const struct TaskArg* orch_args,
+                   int orch_args_count,
+                   int* arg_types);
+
+/**
+ * Round-level finalize: copy results back but keep device resources alive.
+ *
+ * Copies output/inout tensors from device to host, but does NOT free
+ * device memory, kernel binaries, or call the Runtime destructor.
+ * Use this between rounds within the same case.
+ *
+ * @param runtime  Runtime handle to finalize for this round
+ * @return 0 on success, -1 on failure
+ */
+int finalize_runtime_round(RuntimeHandle runtime);
+
+/**
  * Finalize and cleanup a runtime instance.
  *
  * Validates results, frees device tensors, calls Runtime destructor.

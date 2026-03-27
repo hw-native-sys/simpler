@@ -836,10 +836,6 @@ class CodeRunner:
             logger.debug(f"Tensor order: {list(tensors.keys())}")
             logger.debug(f"orch_args count: {len(orch_args)}")
 
-            # Create and initialize runtime (including kernel registration)
-            logger.info("=== Initializing Runtime ===")
-            runtime = Runtime()
-
             # Build environment for runtime initialization
             run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
             if run_env:
@@ -856,27 +852,32 @@ class CodeRunner:
 
             initial_outputs = {k: v.clone() for k, v in outputs.items()}
 
+            runtime = Runtime()
+
+            with _temporary_env(run_env):
+                runtime.initialize(
+                    orch_so_binary,
+                    self.orchestration["function_name"],
+                    orch_args,
+                    kernel_binaries=kernel_binaries,
+                )
+
             for round_idx in range(self.repeat_rounds):
                 if self.repeat_rounds > 1:
                     logger.info(f"--- Round {round_idx + 1}/{self.repeat_rounds} ---")
 
-                for k, v in initial_outputs.items():
-                    outputs[k].copy_(v)
+                t_round_start = time.perf_counter()
 
-                runtime = Runtime()
-
-                # Enable profiling if requested (only first round)
                 if self.enable_profiling and round_idx == 0:
                     runtime.enable_profiling(True)
                     logger.info("Profiling enabled")
 
-                with _temporary_env(run_env):
-                    runtime.initialize(
-                        orch_so_binary,
-                        self.orchestration["function_name"],
-                        orch_args,
-                        kernel_binaries=kernel_binaries,
-                    )
+                for k, v in initial_outputs.items():
+                    outputs[k].copy_(v)
+
+                runtime.initialize_round(
+                    orch_args,
+                )
 
                 launch_runtime(
                     runtime,
@@ -888,10 +889,14 @@ class CodeRunner:
                     orch_thread_num=self.orch_thread_num,
                 )
 
-                runtime.finalize()
+                runtime.finalize_round()
                 if not self.skip_golden:
                     self._compare_with_golden(outputs, golden)
 
+                t_round_end = time.perf_counter()
+                logger.info(f"HOST_TIMING round={round_idx} total_us={(t_round_end - t_round_start) * 1e6:.1f}")
+                
+            runtime.finalize()
             logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
 
         logger.info("=" * 60)
