@@ -66,12 +66,14 @@ struct alignas(64) Tensor {
     bool is_all_offset_zero;                       // True when all offsets[] are zero (skip offset read/write)
     bool is_raw_eq_shapes;                         // True when raw_shapes[] == shapes[] (skip raw_shapes read/write)
     bool manual_dep;                               // True when dependency is managed manually (skip tensormap lookup/insert)
+    bool has_initial_value{false};                 // True when initial_value should be written after HeapRing allocation
     uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
     uint32_t __padding__;
 
     // === Cache line 2 (64B) — warm path ===
     uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
     uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
+    uint64_t initial_value;                        // Pending initial value (valid when has_initial_value)
 
     Tensor() = default;
     Tensor(const Tensor&) = default;
@@ -181,6 +183,22 @@ struct alignas(64) Tensor {
             }
         }
         is_all_offset_zero = all_zero;
+    }
+
+    /// Compute 1D flat element offset from multi-dimensional indices.
+    /// Uses Horner's method (forward traversal, no stride variable).
+    uint64_t compute_flat_offset(const uint32_t indices[], uint32_t in_ndims) const {
+        if (in_ndims == 0) return 0;
+        const uint32_t* rs = get_raw_shapes();
+        uint64_t offset = 0;
+        if (is_all_offset_zero) {
+            for (uint32_t d = 0; d < in_ndims; d++)
+                offset = offset * rs[d] + indices[d];
+        } else {
+            for (uint32_t d = 0; d < in_ndims; d++)
+                offset = offset * rs[d] + indices[d] + offsets[d];
+        }
+        return offset;
     }
 
     // --- Operations ---

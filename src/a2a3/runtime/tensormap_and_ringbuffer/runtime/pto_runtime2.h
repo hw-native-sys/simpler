@@ -72,6 +72,14 @@ struct PTO2RuntimeOps {
     void (*log_info)(const char* func, const char* fmt, ...);
     void (*log_debug)(const char* func, const char* fmt, ...);
     void (*log_always)(const char* func, const char* fmt, ...);
+
+    // Cross-layer data access (orchestration reads/writes tensor values via runtime)
+    // Placed after logging to avoid shifting hot-path field offsets.
+    uint64_t (*get_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
+                                uint32_t ndims, const uint32_t indices[]);
+    void (*set_tensor_data)(PTO2Runtime* rt, Tensor& tensor,
+                            uint32_t ndims, const uint32_t indices[],
+                            uint64_t value);
 };
 
 /**
@@ -187,6 +195,21 @@ void pto2_rt_scope_end(PTO2Runtime* rt);
  * Signals that no more tasks will be submitted.
  */
 void pto2_rt_orchestration_done(PTO2Runtime* rt);
+
+/**
+ * Cross-layer data access: read a tensor value by waiting for its producer.
+ */
+uint64_t pto2_get_tensor_data(PTO2Runtime* rt, const Tensor& tensor,
+                              uint32_t ndims, const uint32_t indices[]);
+
+/**
+ * Cross-layer data access: write a value to a tensor at given indices.
+ * Waits for producer completion (WAW) and all consumers (WAR) via TensorMap.
+ * See set_tensor_data in pto_orchestration_api.h for full documentation.
+ */
+void pto2_set_tensor_data(PTO2Runtime* rt, Tensor& tensor,
+                          uint32_t ndims, const uint32_t indices[],
+                          uint64_t value);
 
 /**
  * Slim config struct exported by orchestration .so via aicpu_orchestration_config().

@@ -125,6 +125,14 @@ typedef struct PTO2RuntimeOps {
     void (*log_info)(const char* func, const char* fmt, ...);
     void (*log_debug)(const char* func, const char* fmt, ...);
     void (*log_always)(const char* func, const char* fmt, ...);
+
+    // Cross-layer data access (orchestration reads/writes tensor values via runtime)
+    // Placed after logging to avoid shifting hot-path field offsets.
+    uint64_t (*get_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
+                                uint32_t ndims, const uint32_t indices[]);
+    void (*set_tensor_data)(PTO2Runtime* rt, Tensor& tensor,
+                            uint32_t ndims, const uint32_t indices[],
+                            uint64_t value);
 } PTO2RuntimeOps;
 
 /**
@@ -201,6 +209,54 @@ static inline bool pto2_rt_is_fatal() {
 #define LOG_INFO(fmt, ...)  pto2_current_runtime()->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...) pto2_current_runtime()->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_ALWAYS(fmt, ...) pto2_current_runtime()->ops->log_always(__FUNCTION__, fmt, ##__VA_ARGS__)
+
+// =============================================================================
+// Cross-Layer Data Access
+// =============================================================================
+
+/**
+ * Read a value from a tensor at the given multi-dimensional indices.
+ *
+ * If the tensor has a producer in TensorMap, spin-waits until the producer
+ * task completes before reading. External tensors (make_tensor_external)
+ * are read immediately without waiting.
+ *
+ * Returns the raw bits as uint64_t; caller reinterprets via bit_cast.
+ */
+static inline uint64_t get_tensor_data(const Tensor& tensor,
+                                       uint32_t ndims, const uint32_t indices[]) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    return rt->ops->get_tensor_data(rt, tensor, ndims, indices);
+}
+
+/**
+ * Write a value to a tensor at the given multi-dimensional indices.
+ *
+ * If the tensor has a producer in TensorMap, spin-waits until the producer
+ * and all its consumers complete before writing (WAW + WAR safety).
+ * External tensors (make_tensor_external) with no TensorMap entry are
+ * written immediately without waiting.
+ *
+ * Limitation: TensorMap only tracks producers (OUTPUT/INOUT), not consumers
+ * that used the tensor as INPUT. If a kernel reads this tensor as INPUT
+ * (not INOUT) and the tensor has no TensorMap producer entry, set_tensor_data
+ * cannot detect the reader and may cause a data race.
+ *
+ * To ensure WAR safety for all access patterns, use add_inout() instead of
+ * add_input() for kernel parameters that may later be written via
+ * set_tensor_data. INOUT creates a TensorMap entry that enables automatic
+ * consumer tracking via fanout_refcount.
+ *
+ * The tensor must already have an allocated buffer (addr != 0).
+ * For make_tensor() outputs, call this only after the tensor has been
+ * submitted as OUTPUT at least once (so HeapRing allocation has occurred).
+ */
+static inline void set_tensor_data(Tensor& tensor,
+                                   uint32_t ndims, const uint32_t indices[],
+                                   uint64_t value) {
+    PTO2Runtime* rt = pto2_current_runtime();
+    rt->ops->set_tensor_data(rt, tensor, ndims, indices, value);
+}
 
 // =============================================================================
 // C++ Scope Guards and Macros

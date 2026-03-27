@@ -126,6 +126,32 @@ struct PTOParam {
         tensor_count++;
     }
 
+    /**
+     * Add an OUTPUT tensor with initial value.
+     *
+     * Registers as OUTPUT so the runtime allocates from HeapRing, then
+     * writes initial_value to the allocated buffer. The initial value is
+     * stored on the Tensor itself (has_initial_value flag on cache line 1,
+     * value on cache line 2) and consumed during HeapRing allocation in
+     * the submit path.
+     *
+     * The tensor must not have been allocated yet (addr must be 0).
+     * For already-allocated tensors, use add_inout() instead.
+     */
+    void add_output(Tensor& t, uint64_t initial_value) {
+        if (!check_add_tensor_valid()) { return; }
+        if (t.buffer.addr != 0) {
+            set_error("add_output with initial_value requires unallocated tensor (addr==0). "
+                      "Use add_inout() for already-allocated tensors");
+            return;
+        }
+        tensors[tensor_count] = &t;
+        t.has_initial_value = true;
+        t.initial_value = initial_value;
+        tensor_types[tensor_count] = PTOParamType::OUTPUT;
+        tensor_count++;
+    }
+
     void add_scalar(uint64_t v) {
         if (scalar_count >= PTO2_MAX_SCALAR_PARAMS) {
             set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS)");

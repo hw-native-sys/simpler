@@ -462,6 +462,23 @@ void pto2_submit_mixed_task(
                     uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)alloc_result.packed_base + offset);
                     tensor.buffer.addr = alloc_addr;
                     offset += PTO2_ALIGN_UP(tensor.buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+                    // Cache line 1 is hot (just wrote buffer.addr at offset 0).
+                    // has_initial_value sits on the same cache line (offset 39) — zero-cost check.
+                    if (tensor.has_initial_value) {
+                        uint64_t elem_size = get_element_size(tensor.dtype);
+                        tensor.has_initial_value = false;
+                        uint64_t total = tensor.buffer.size;
+                        char* dst = reinterpret_cast<char*>(alloc_addr);
+                        constexpr uint64_t BLK = 64;
+                        uint64_t blk = (total < BLK) ? total : BLK;
+                        for (uint64_t b = 0; b < blk; b += elem_size)
+                            memcpy(dst + b, &tensor.initial_value, elem_size);
+                        uint64_t off = blk;
+                        for (; off + blk <= total; off += blk)
+                            memcpy(dst + off, dst, blk);
+                        if (off < total)
+                            memcpy(dst + off, dst, total - off);
+                    }
                 }
                 break;
             }

@@ -106,6 +106,10 @@
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 #define PTO2_DEP_POOL_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 
+// get_tensor_data/set_tensor_data spin wait timeout in cycles.
+// ~10s on hardware (1.5 GHz counter), ~10s on simulation (chrono-based).
+constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
+
 // =============================================================================
 // Multi-Ring task_id Encoding
 // =============================================================================
