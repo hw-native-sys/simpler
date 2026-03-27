@@ -45,7 +45,6 @@ inline __aicore__ void pto2_save_expected_notification_counter(
     uint32_t expected_value)
 {
     pto2_save_expected_completion(PTO2_ENGINE_SDMA, cq,
-                                  PTO2_CQ_COMPLETION_COUNTER,
                                   (uint64_t)local_counter_addr,
                                   expected_value);
 }

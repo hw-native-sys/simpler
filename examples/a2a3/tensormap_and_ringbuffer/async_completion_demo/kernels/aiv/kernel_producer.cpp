@@ -86,8 +86,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
 
     volatile __gm__ PTO2CompletionQueue* cq = pto2_cq_get(cq_addr);
     pto2_cq_reset(cq);
-    pto2_save_expected_completion(PTO2_ENGINE_SDMA, cq,
-        PTO2_CQ_COMPLETION_EVENT_FLAG,
-        event_flag_addr, 0);
+    pto2_save_expected_completion(PTO2_ENGINE_SDMA, cq, event_flag_addr);
     pto2_cq_flush(cq);
 }

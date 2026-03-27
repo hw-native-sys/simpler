@@ -55,9 +55,7 @@ typedef enum {
 } PTO2AsyncEngine;
 
 enum class PTO2CompletionType : int32_t {
-    EVENT_FLAG = 0,
-    EVENT_HANDLE_SLOT = 1,
-    COUNTER = 2,
+    COUNTER = 0,
 };
 
 /**

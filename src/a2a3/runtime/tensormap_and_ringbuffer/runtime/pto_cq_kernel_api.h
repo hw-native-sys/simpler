@@ -10,8 +10,7 @@
  * Usage in kernel code:
  *
  *   auto* cq = pto2_cq_get(args[CQ_ARG_IDX]);
- *   pto2_save_expected_completion(PTO2_ENGINE_SDMA, cq,
- *       PTO2_CQ_COMPLETION_EVENT_FLAG, flag_addr, 0);
+ *   pto2_save_expected_completion(PTO2_ENGINE_SDMA, cq, tag);  // flag: expected=1
  *   pto2_cq_flush();
  */
 
@@ -31,9 +30,7 @@
 #define PTO2_ENGINE_CCU   3
 
 // Completion type constants (must match PTO2CompletionType in pto_types.h)
-#define PTO2_CQ_COMPLETION_EVENT_FLAG        0
-#define PTO2_CQ_COMPLETION_EVENT_HANDLE_SLOT 1
-#define PTO2_CQ_COMPLETION_COUNTER           2
+#define PTO2_CQ_COMPLETION_COUNTER           0
 
 inline __aicore__ void pto2_cq_writeback_gm_line(volatile __gm__ void* addr) {
     __gm__ int32_t* gm_addr = (__gm__ int32_t*)addr;
@@ -73,16 +70,19 @@ inline __aicore__ void pto2_cq_reset(volatile __gm__ PTO2CompletionQueue* cq) {
 }
 
 /**
- * Register one expected completion condition in the CQ (full form).
+ * Register one expected completion condition in the CQ.
  *
- * Parameter order: (ENGINE, QUEUE, data...) — symmetric with SQ API.
+ * All completion conditions are COUNTER type: the scheduler polls
+ * *addr >= expected_value.  Hardware flags (SDMA event flags) are
+ * the special case where expected_value = 1 (flag goes 0 → non-zero).
+ *
+ * Parameter order: (ENGINE, QUEUE, addr, expected) — symmetric with SQ API.
  * Each call appends an entry and increments cq->count.
  * The caller must ensure total calls per task <= PTO2_CQ_MAX_ENTRIES.
  */
 inline __aicore__ void pto2_save_expected_completion(
     uint32_t engine,
     volatile __gm__ PTO2CompletionQueue* cq,
-    int32_t completion_type,
     uint64_t addr,
     uint32_t expected_value)
 {
@@ -90,7 +90,7 @@ inline __aicore__ void pto2_save_expected_completion(
     volatile __gm__ PTO2CQEntry* entry =
         const_cast<volatile __gm__ PTO2CQEntry*>(&cq->entries[idx]);
     entry->engine = engine;
-    entry->completion_type = completion_type;
+    entry->completion_type = PTO2_CQ_COMPLETION_COUNTER;
     entry->addr = addr;
     entry->expected_value = expected_value;
     pto2_cq_writeback_gm_line(entry);
@@ -100,9 +100,10 @@ inline __aicore__ void pto2_save_expected_completion(
 }
 
 /**
- * Simplified overload: (ENGINE, CQ, tag).
+ * Simplified overload for hardware flags: (ENGINE, CQ, tag).
  *
- * Completion type is auto-determined: EVENT_FLAG with expected_value=0.
+ * Registers a COUNTER condition with expected_value=1.
+ * Equivalent to polling *tag_addr >= 1 (i.e. flag != 0).
  * Symmetric with pto2_send_request_entry(ENGINE, SQ_ID, desc).
  */
 inline __aicore__ void pto2_save_expected_completion(
@@ -110,8 +111,7 @@ inline __aicore__ void pto2_save_expected_completion(
     volatile __gm__ PTO2CompletionQueue* cq,
     uint64_t tag)
 {
-    pto2_save_expected_completion(engine, cq,
-                                  PTO2_CQ_COMPLETION_EVENT_FLAG, tag, 0);
+    pto2_save_expected_completion(engine, cq, tag, 1);
 }
 
 /**

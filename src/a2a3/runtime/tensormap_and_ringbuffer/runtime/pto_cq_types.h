@@ -10,7 +10,7 @@
 
 #include <stdint.h>
 
-#define PTO2_CQ_MAX_ENTRIES 16
+#define PTO2_CQ_MAX_ENTRIES 64
 
 /**
  * Single CQ entry written by a kernel via pto2_save_expected_completion().
