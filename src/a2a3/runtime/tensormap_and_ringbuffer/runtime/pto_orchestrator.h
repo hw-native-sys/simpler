@@ -161,7 +161,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  * @param mixed_kernels  Kernel IDs for AIC/AIV0/AIV1 slots
  * @param params      Aggregated tensor and scalar parameters
  */
-void pto2_submit_mixed_task(PTO2OrchestratorState* orch,
+TaskOutputTensors pto2_submit_mixed_task(PTO2OrchestratorState* orch,
     const MixedKernels& mixed_kernels,
     const PTOParam& params);
 

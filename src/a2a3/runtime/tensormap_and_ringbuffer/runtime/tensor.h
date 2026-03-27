@@ -36,6 +36,40 @@ struct Segment {
 };
 
 /**
+ * TensorCreateInfo — submit-time create-info for runtime-allocated outputs.
+ *
+ * Carries only what a fresh contiguous output needs:
+ *   dtype, ndims, raw_shapes (== shapes), manual_dep.
+ *
+ * Orchestration creates this on the stack and passes a pointer to
+ * PTOParam::add_output().  The object must stay alive until submit returns.
+ */
+struct TensorCreateInfo {
+    DataType dtype;
+    uint32_t ndims;
+    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];
+    bool     manual_dep;
+
+    TensorCreateInfo(const uint32_t shapes[],
+                     uint32_t ndims,
+                     DataType dtype = DataType::FLOAT32,
+                     bool manual_dep = false)
+        : dtype(dtype), ndims(ndims), manual_dep(manual_dep) {
+        for (uint32_t i = 0; i < ndims; i++) {
+            raw_shapes[i] = shapes[i];
+        }
+    }
+
+    uint64_t buffer_size_bytes() const {
+        uint64_t total = 1;
+        for (uint32_t i = 0; i < ndims; i++) {
+            total *= raw_shapes[i];
+        }
+        return total * get_element_size(dtype);
+    }
+};
+
+/**
  * Tensor descriptor for Task input/output (128B = 2 cache lines)
  *
  * Describes a memory access pattern on Global Memory (GM) using
@@ -55,6 +89,14 @@ struct Segment {
  *
  * Layout: cache line 1 holds hot-path fields (buffer, start_offset, version,
  * dtype, ndims, flags, shapes); cache line 2 holds warm-path fields (raw_shapes, offsets).
+ *
+ * Construction:
+ * Users cannot default-construct or directly construct a Tensor.
+ * Valid Tensors are obtained only through controlled entry points:
+ *   - make_tensor_external(...)
+ *   - from_task_arg(...)
+ *   - TaskOutputTensors returned by submit(...)
+ *   - Tensor::view() / reshape() / transpose() on an existing valid Tensor
  */
 struct alignas(64) Tensor {
     // === Cache line 1 (64B) — hot path ===
@@ -75,7 +117,7 @@ struct alignas(64) Tensor {
     uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
     uint64_t initial_value;                        // Pending initial value (valid when has_initial_value)
 
-    Tensor() = default;
+    // --- Copy / move / destroy are public (valid tensors can be freely copied) ---
     Tensor(const Tensor&) = default;
     Tensor& operator=(const Tensor&) = default;
     Tensor(Tensor&&) = default;
@@ -88,22 +130,7 @@ struct alignas(64) Tensor {
         return is_raw_eq_shapes ? shapes : raw_shapes;
     }
 
-    Tensor(void* addr,
-        uint64_t buffer_size_bytes,
-        const uint32_t raw_shapes[],
-        const uint32_t shapes[],
-        const uint32_t offsets[],
-        uint32_t ndims,
-        DataType dtype,
-        int32_t version,
-        bool is_all_offset_zero = false,
-        bool is_raw_eq_shapes = false,
-        bool manual_dep = false) {
-        init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version,
-             is_all_offset_zero, is_raw_eq_shapes, manual_dep);
-    }
-
-    // --- Initialization ---
+    // --- Initialization (operates on already-constructed Tensor) ---
     void init(void* addr,
         uint64_t buffer_size_bytes,
         const uint32_t in_raw_shapes[],
@@ -199,6 +226,13 @@ struct alignas(64) Tensor {
                 offset = offset * rs[d] + indices[d] + offsets[d];
         }
         return offset;
+    }
+
+    /// Materialize a TensorCreateInfo into this Tensor (fresh contiguous output).
+    void init_from_create_info(const TensorCreateInfo& ci, void* addr, int32_t version_val) {
+        init(addr, ci.buffer_size_bytes(), ci.raw_shapes, ci.raw_shapes, nullptr,
+             ci.ndims, ci.dtype, version_val,
+             /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, ci.manual_dep);
     }
 
     // --- Operations ---
@@ -332,9 +366,33 @@ struct alignas(64) Tensor {
         ss << "}" << std::endl;
         return ss.str();
     }
+
+private:
+    // Default and parameterized constructors are private.
+    // Valid Tensors come only from controlled entry points.
+    Tensor() = default;
+
+    Tensor(void* addr,
+        uint64_t buffer_size_bytes,
+        const uint32_t raw_shapes[],
+        const uint32_t shapes[],
+        const uint32_t offsets[],
+        uint32_t ndims,
+        DataType dtype,
+        int32_t version,
+        bool is_all_offset_zero = false,
+        bool is_raw_eq_shapes = false,
+        bool manual_dep = false) {
+        init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version,
+             is_all_offset_zero, is_raw_eq_shapes, manual_dep);
+    }
+
+    // Friends that need to construct Tensors
+    friend struct PTO2TaskPayload;
+    friend inline Tensor make_tensor_external(void* addr,
+        const uint32_t shapes[], uint32_t ndims, DataType dtype,
+        bool manual_dep, int32_t version);
 };
 
 static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 bytes)");
 static_assert(offsetof(Tensor, raw_shapes) == 64);
-
-using TensorData = Tensor;

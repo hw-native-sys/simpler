@@ -135,9 +135,9 @@ static __aicore__ void pv_matmul_n_impl(
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ TensorData* pij_buf = reinterpret_cast<__gm__ TensorData*>(args[0]);
-    __gm__ TensorData* value_cache = reinterpret_cast<__gm__ TensorData*>(args[1]);
-    __gm__ TensorData* oi_new = reinterpret_cast<__gm__ TensorData*>(args[2]);
+    __gm__ Tensor* pij_buf = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* value_cache = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* oi_new = reinterpret_cast<__gm__ Tensor*>(args[2]);
     uint64_t n_blocks = static_cast<uint64_t>(args[3]);
     __gm__ int32_t* block_table = reinterpret_cast<__gm__ int32_t*>(args[4]);
 

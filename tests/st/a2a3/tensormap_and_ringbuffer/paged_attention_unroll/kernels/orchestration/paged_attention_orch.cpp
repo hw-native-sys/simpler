@@ -130,6 +130,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
     // Prefetch first block host_context_lens data into cache
     __builtin_prefetch(&host_context_lens[0], 0, 3);
 
+    // Create infos are loop-invariant — shapes depend only on q_tile/head_dim
+    uint32_t oi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+    uint32_t li_shapes[1] = {(uint32_t)q_tile};
+    TensorCreateInfo tile2d_ci(oi_shapes, 2, DataType::FLOAT32);
+    TensorCreateInfo scalar_noinit_ci(li_shapes, 1, DataType::FLOAT32, false);
+    TensorCreateInfo scalar_ci(li_shapes, 1, DataType::FLOAT32);
+
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint64_t cur_seq = host_context_lens[b_idx];
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
@@ -145,12 +152,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
             PTO2_SCOPE() {
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
 
-                uint32_t oi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
-                uint32_t li_shapes[1] = {(uint32_t)q_tile};
-                uint32_t mi_shapes[1] = {(uint32_t)q_tile};
-                Tensor oi = make_tensor(oi_shapes, 2, DataType::FLOAT32);
-                Tensor li_update = make_tensor(li_shapes, 1, DataType::FLOAT32, false);
-                Tensor mi_update = make_tensor(mi_shapes, 1, DataType::FLOAT32, false);
 #ifdef ENABLE_PROFILING
                 prof_make_count += 3;
                 CYCLE_COUNT_LAP(prof_make_tensor);
@@ -167,11 +168,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
                 PTOParam params_inplace;
-                params_inplace.add_output(oi);
-                params_inplace.add_output(li_update);
-                params_inplace.add_output(mi_update);
+                params_inplace.add_output(tile2d_ci);
+                params_inplace.add_output(scalar_noinit_ci);
+                params_inplace.add_output(scalar_noinit_ci);
                 CYCLE_COUNT_LAP(prof_param_setup);
-                pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace);
+                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace);
+                const Tensor& oi = hub_outs.get_ref(0);
+                const Tensor& li_update = hub_outs.get_ref(1);
+                const Tensor& mi_update = hub_outs.get_ref(2);
 #ifdef ENABLE_PROFILING
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
@@ -191,7 +195,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
 
                     // === Task 1: Batched QK matmul ===
                     uint32_t sij_buf_shapes[2] = {(uint32_t)q_tile, (uint32_t)(n_blocks * block_size)};
-                    Tensor sij_buf = make_tensor(sij_buf_shapes, 2, DataType::FLOAT32);
+                    TensorCreateInfo sij_buf_ci(sij_buf_shapes, 2, DataType::FLOAT32);
 #ifdef ENABLE_PROFILING
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
@@ -200,11 +204,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                     params_qk.reset();
                     params_qk.add_input(qi);
                     params_qk.add_input(key_cache);
-                    params_qk.add_output(sij_buf);
+                    params_qk.add_output(sij_buf_ci);
                     params_qk.add_scalar(n_blocks);
                     params_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
+                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
+                    const Tensor& sij_buf = qk_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -212,9 +217,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
 
                     // === Task 2: Two-pass softmax over all blocks in group ===
                     uint32_t pij_buf_shapes[2] = {(uint32_t)q_tile, (uint32_t)(n_blocks * block_size)};
-                    Tensor pij_buf = make_tensor(pij_buf_shapes, 2, data_type);
-                    Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
-                    Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
+                    TensorCreateInfo pij_buf_ci(pij_buf_shapes, 2, data_type);
 #ifdef ENABLE_PROFILING
                     prof_make_count += 3;
                     CYCLE_COUNT_LAP(prof_make_tensor);
@@ -222,22 +225,23 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
 
                     params_sf.reset();
                     params_sf.add_input(sij_buf);
-                    params_sf.add_output(pij_buf);
-                    params_sf.add_output(mi);
-                    params_sf.add_output(li);
+                    params_sf.add_output(pij_buf_ci);
+                    params_sf.add_output(scalar_ci);
+                    params_sf.add_output(scalar_ci);
                     params_sf.add_scalar(scale_value);
                     params_sf.add_scalar(n_blocks);
                     params_sf.add_scalar(valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
+                    const Tensor& pij_buf = sf_outs.get_ref(0);
+                    const Tensor& mi = sf_outs.get_ref(1);
+                    const Tensor& li = sf_outs.get_ref(2);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 #endif
 
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
-                    uint32_t oi_new_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
-                    Tensor oi_new = make_tensor(oi_new_shapes, 2, DataType::FLOAT32);
 #ifdef ENABLE_PROFILING
                     prof_make_count += 1;
                     CYCLE_COUNT_LAP(prof_make_tensor);
@@ -246,11 +250,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                     params_pv.reset();
                     params_pv.add_input(pij_buf);
                     params_pv.add_input(value_cache);
-                    params_pv.add_output(oi_new);
+                    params_pv.add_output(tile2d_ci);
                     params_pv.add_scalar(n_blocks);
                     params_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
+                    const Tensor& oi_new = pv_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);

@@ -373,16 +373,26 @@ struct PTO2TaskPayload {
     /**
      * Initialize payload: copy tensors, build dispatch args.
      *
-     * @param params            Task parameters (tensors + scalars)
+     * For each param slot, the tensor source is determined by PTOParamType:
+     * - OUTPUT_CREATE → use materialized_outputs.output_ptr(out_idx++)
+     * - INPUT / OUTPUT / INOUT → use refs[i].tensor
+     *
+     * @param params                Task parameters (tensors + scalars)
+     * @param materialized_outputs  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const PTOParam& params) {
+    void init(const PTOParam& params, const TaskOutputTensors& materialized_outputs) {
         tensor_count = params.tensor_count;
         scalar_count = params.scalar_count;
 
-        // 1. Copy tensors from PTOParam
-        auto src_tensors = params.tensors;
+        int32_t out_idx = 0;
         for (int32_t i = 0; i < params.tensor_count; i++) {
-            tensors[i].copy(*src_tensors[i]);
+            const Tensor* src;
+            if (params.tensor_types[i] == PTOParamType::OUTPUT_CREATE) {
+                src = materialized_outputs.output_ptr(out_idx++);
+            } else {
+                src = params.refs[i].tensor;
+            }
+            tensors[i].copy(*src);
             tensors[i].update_start_offset();
             dispatch_args[i] = reinterpret_cast<uint64_t>(&tensors[i]);
         }

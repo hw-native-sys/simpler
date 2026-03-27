@@ -63,6 +63,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     uint32_t tile_shapes[1] = {(uint32_t)tile_elems};
     uint64_t group_tile_elems = (uint64_t)incore_loop * tile_elems;
     uint32_t group_shapes[1] = {(uint32_t)group_tile_elems};
+    TensorCreateInfo group_ci(group_shapes, 1, DataType::FLOAT32);
 
     int total_gemm = 0;
     int total_add = 0;
@@ -86,19 +87,17 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
             Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
             uint32_t b_view_offsets[1] = {(uint32_t)ab_offset};
             Tensor B_view = ext_B.view(group_shapes, b_view_offsets);
-            Tensor P = make_tensor(group_shapes, 1, DataType::FLOAT32);
-
             PTOParam params_gemm;
             params_gemm.add_input(A_view);
             params_gemm.add_input(B_view);
-            params_gemm.add_output(P);
+            params_gemm.add_output(group_ci);
             params_gemm.add_input(ext_config);
-            pto2_rt_submit_aic_task(FUNC_GEMM_TILE, params_gemm);
+            TaskOutputTensors gemm_outs = pto2_rt_submit_aic_task(FUNC_GEMM_TILE, params_gemm);
             total_gemm++;
 
             PTOParam params_add;
             params_add.add_inout(C_view);
-            params_add.add_input(P);
+            params_add.add_input(gemm_outs.get_ref(0));
             params_add.add_input(ext_config);
             pto2_rt_submit_aiv_task(FUNC_TILE_ADD, params_add);
             total_add++;

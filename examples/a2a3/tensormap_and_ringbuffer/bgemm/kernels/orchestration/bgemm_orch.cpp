@@ -64,6 +64,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                   GRID_M, GRID_K, GRID_N, BATCH, TILE);
 
     uint32_t tile_shapes[1] = {TILE_ELEMS};
+    TensorCreateInfo tile_ci(tile_shapes, 1, DataType::FLOAT32);
 
     for (int batch = 0; batch < BATCH; batch++) {
         for (int m_idx = 0; m_idx < GRID_M; m_idx++) {
@@ -90,20 +91,18 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                         Tensor A_view = ext_A.view(tile_shapes, a_view_offsets);
                         uint32_t b_view_offsets[1] = {b_elem_offset};
                         Tensor B_view = ext_B.view(tile_shapes, b_view_offsets);
-                        Tensor P = make_tensor(tile_shapes, 1, DataType::FLOAT32);
-
                         // P = A[m,k] @ B[k,n]
                         PTOParam params_gemm;
                         params_gemm.add_input(A_view);
                         params_gemm.add_input(B_view);
-                        params_gemm.add_output(P);
-                        pto2_rt_submit_aic_task(FUNC_GEMM_TILE,
+                        params_gemm.add_output(tile_ci);
+                        TaskOutputTensors gemm_outs = pto2_rt_submit_aic_task(FUNC_GEMM_TILE,
                                            params_gemm); // gemm
 
                         // C[m,n] += P
                         PTOParam params_add;
                         params_add.add_inout(C_view);
-                        params_add.add_input(P);
+                        params_add.add_input(gemm_outs.get_ref(0));
                         pto2_rt_submit_aiv_task(FUNC_TILE_ADD,
                                            params_add); // add
                     }

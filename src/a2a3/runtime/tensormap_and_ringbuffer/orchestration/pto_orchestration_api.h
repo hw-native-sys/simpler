@@ -22,8 +22,8 @@
 #include <stddef.h>
 
 // Type headers needed by orchestration
-#include "tensor.h"             // Tensor
-#include "pto_types.h"          // PTOParam, PTOTensorEntry, PTOParamType
+#include "tensor.h"             // Tensor, TensorCreateInfo
+#include "pto_types.h"          // PTOParam, TaskOutputTensors, PTOParamType
 #include "pto_submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
 #include "task_arg.h"           // TaskArg, TaskArgKind
 
@@ -34,7 +34,7 @@
 /**
  * Create a Tensor for pre-allocated external memory.
  */
-static inline Tensor make_tensor_external(void* addr,
+inline Tensor make_tensor_external(void* addr,
     const uint32_t shapes[],
     uint32_t ndims,
     DataType dtype = DataType::FLOAT32,
@@ -46,26 +46,6 @@ static inline Tensor make_tensor_external(void* addr,
         total *= shapes[i];
     }
     return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
-}
-
-/**
- * Create a Tensor for runtime-allocated output (addr=0).
- * NO memory allocation: only records dtype, shape, and buffer.size in the Tensor struct.
- * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
- * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
- */
-static inline Tensor make_tensor(const uint32_t shapes[],
-    uint32_t ndims,
-    DataType dtype = DataType::FLOAT32,
-    bool manual_dep = false,
-    int32_t version = 0) {
-    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
-    uint64_t total = 1;
-    for (uint32_t i = 0; i < ndims; i++) {
-        total *= shapes[i];
-    }
-    return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
                   /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
 }
 
@@ -112,7 +92,7 @@ void pto2_framework_bind_runtime(PTO2Runtime* rt);
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+    TaskOutputTensors (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                         const PTOParam& params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
@@ -154,30 +134,30 @@ static inline PTO2Runtime* pto2_current_runtime() {
     return pto2_framework_current_runtime();
 }
 
-static inline void pto2_rt_submit_task(const MixedKernels& mixed_kernels,
+static inline TaskOutputTensors pto2_rt_submit_task(const MixedKernels& mixed_kernels,
                                        const PTOParam& params) {
     PTO2Runtime* rt = pto2_current_runtime();
-    rt->ops->submit_task(rt, mixed_kernels, params);
+    return rt->ops->submit_task(rt, mixed_kernels, params);
 }
 
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
-static inline void pto2_rt_submit_aic_task(int32_t kernel_id, const PTOParam& params) {
+static inline TaskOutputTensors pto2_rt_submit_aic_task(int32_t kernel_id, const PTOParam& params) {
     PTO2Runtime* rt = pto2_current_runtime();
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
-    rt->ops->submit_task(rt, mk, params);
+    return rt->ops->submit_task(rt, mk, params);
 }
 
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
-static inline void pto2_rt_submit_aiv_task(int32_t kernel_id, const PTOParam& params) {
+static inline TaskOutputTensors pto2_rt_submit_aiv_task(int32_t kernel_id, const PTOParam& params) {
     PTO2Runtime* rt = pto2_current_runtime();
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
-    rt->ops->submit_task(rt, mk, params);
+    return rt->ops->submit_task(rt, mk, params);
 }
 
 static inline void pto2_rt_scope_begin() {
