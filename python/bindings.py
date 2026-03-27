@@ -58,15 +58,6 @@ _lib = None
 
 
 # ============================================================================
-# ArgType enum (must match pto_runtime_c_api.h)
-# ============================================================================
-ARG_SCALAR = 0      # Scalar value, passed directly
-ARG_INPUT_PTR = 1   # Input pointer: device_malloc + copy_to_device
-ARG_OUTPUT_PTR = 2  # Output pointer: device_malloc + record for copy-back
-ARG_INOUT_PTR = 3   # Input/output: copy_to_device + copy-back
-
-
-# ============================================================================
 # TaskArg ctypes mirror (must match C++ struct TaskArg, 48 bytes)
 # ============================================================================
 TASK_ARG_MAX_DIMS = 5
@@ -148,7 +139,6 @@ class RuntimeLibraryLoader:
             c_char_p,               # orch_func_name
             POINTER(TaskArgC),      # orch_args
             c_int,                  # orch_args_count
-            POINTER(c_int),         # arg_types
             POINTER(c_int),         # kernel_func_ids (array of func_ids)
             POINTER(POINTER(c_uint8)),  # kernel_binaries (array of binary pointers)
             POINTER(c_size_t),      # kernel_sizes (array of sizes)
@@ -248,7 +238,6 @@ class Runtime:
         orch_so_binary: bytes,
         orch_func_name: str,
         orch_args: Optional[list] = None,
-        arg_types: Optional[List[int]] = None,
         kernel_binaries: Optional[List[Tuple[int, bytes]]] = None,
     ) -> None:
         """
@@ -269,7 +258,6 @@ class Runtime:
             orch_so_binary: Orchestration shared library binary data
             orch_func_name: Name of the orchestration function to call
             orch_args: List of TaskArgC structs for orchestration
-            arg_types: Array describing each argument's IO direction (ARG_SCALAR, ARG_INPUT_PTR, etc.)
             kernel_binaries: List of (func_id, binary_data) tuples for kernel registration
 
         Raises:
@@ -292,12 +280,6 @@ class Runtime:
             orch_args_array = (TaskArgC * orch_args_count)(*orch_args)
         else:
             orch_args_array = None
-
-        # Convert arg_types to ctypes array
-        if arg_types is not None and len(arg_types) > 0:
-            arg_types_array = (c_int * len(arg_types))(*arg_types)
-        else:
-            arg_types_array = None
 
         # Convert orch_so_binary to ctypes array
         orch_so_array = (c_uint8 * len(orch_so_binary)).from_buffer_copy(orch_so_binary)
@@ -334,7 +316,6 @@ class Runtime:
             orch_func_name.encode('utf-8'),
             orch_args_array,
             orch_args_count,
-            arg_types_array,
             func_ids_array,
             binaries_array,
             sizes_array,

@@ -5,7 +5,7 @@
  * Supports device orchestration where AICPU thread 3 runs the orchestrator.
  *
  * init_runtime_impl:
- *   - Converts host TaskArg pointers to device pointers based on arg_types
+ *   - Converts host TaskArg pointers to device pointers (all tensors copied both directions)
  *   - Copies orchestration SO to device memory
  *   - Sets up runtime state for device orchestration
  *
@@ -17,7 +17,6 @@
 #include "../runtime/runtime.h"
 #include "../runtime/pto_shared_memory.h"
 #include "common/unified_log.h"
-#include "host/pto_runtime_c_api.h"  // For ArgType enum
 #include "common/platform_config.h"
 #include <stdint.h>
 #include <stddef.h>
@@ -67,8 +66,8 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
  * For rt2 runtime, orchestration runs on AICPU thread 3 (device-side).
  * This function:
  * - Copies TaskArg metadata and replaces host tensor pointers with device pointers
- * - Copies input data to device
- * - Records output tensors for copy-back
+ * - Copies all tensor data to device
+ * - Records all tensors for copy-back
  * - Copies orchestration SO to device memory
  * - Sets up runtime state for device orchestration
  *
@@ -78,7 +77,6 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
  * @param orch_func_name    Name of the orchestration function (unused)
  * @param orch_args         TaskArg array with tensor metadata + scalar values
  * @param orch_args_count   Number of TaskArg entries
- * @param arg_types         Array describing each argument's IO direction (ArgType enum)
  * @return 0 on success, -1 on failure
  */
 extern "C" int init_runtime_impl(Runtime *runtime,
@@ -87,7 +85,6 @@ extern "C" int init_runtime_impl(Runtime *runtime,
                     const char* orch_func_name,
                     const TaskArg* orch_args,
                     int orch_args_count,
-                    int* arg_types,
                     const int* kernel_func_ids,
                     const uint8_t* const* kernel_binaries,
                     const size_t* kernel_sizes,
@@ -121,11 +118,6 @@ extern "C" int init_runtime_impl(Runtime *runtime,
         return -1;
     }
 
-    if (arg_types == nullptr) {
-        LOG_ERROR("arg_types is required for device orchestration");
-        return -1;
-    }
-
     if (orch_args_count > RT2_MAX_DEVICE_ARGS) {
         LOG_ERROR("Too many arguments: %d (max %d)", orch_args_count, RT2_MAX_DEVICE_ARGS);
         return -1;
@@ -152,41 +144,14 @@ extern "C" int init_runtime_impl(Runtime *runtime,
                 return -1;
             }
 
-            switch (arg_types[i]) {
-                case ARG_INPUT_PTR: {
-                    int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
-                    if (rc != 0) {
-                        LOG_ERROR("Failed to copy arg %d to device", i);
-                        runtime->host_api.device_free(dev_ptr);
-                        return -1;
-                    }
-                    runtime->record_tensor_pair(nullptr, dev_ptr, size);
-                    LOG_INFO("  Arg %d (input): %zu bytes at %p", i, size, dev_ptr);
-                    break;
-                }
-
-                case ARG_OUTPUT_PTR: {
-                    runtime->record_tensor_pair(host_ptr, dev_ptr, size);
-                    LOG_INFO("  Arg %d (output): %zu bytes at %p", i, size, dev_ptr);
-                    break;
-                }
-
-                case ARG_INOUT_PTR: {
-                    int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
-                    if (rc != 0) {
-                        LOG_ERROR("Failed to copy arg %d to device", i);
-                        runtime->host_api.device_free(dev_ptr);
-                        return -1;
-                    }
-                    runtime->record_tensor_pair(host_ptr, dev_ptr, size);
-                    LOG_INFO("  Arg %d (inout): %zu bytes at %p", i, size, dev_ptr);
-                    break;
-                }
-
-                default:
-                    LOG_ERROR("Unknown arg_type %d for tensor arg %d", arg_types[i], i);
-                    return -1;
+            int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
+            if (rc != 0) {
+                LOG_ERROR("Failed to copy arg %d to device", i);
+                runtime->host_api.device_free(dev_ptr);
+                return -1;
             }
+            runtime->record_tensor_pair(host_ptr, dev_ptr, size);
+            LOG_INFO("  Arg %d (tensor): %zu bytes at %p", i, size, dev_ptr);
 
             device_args[i].tensor.data = reinterpret_cast<uint64_t>(dev_ptr);
         }

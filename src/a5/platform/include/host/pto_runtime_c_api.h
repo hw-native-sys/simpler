@@ -39,17 +39,6 @@ extern "C" {
  */
 
 /**
- * Argument type for init_runtime.
- * Describes how each argument should be handled for device orchestration.
- */
-typedef enum {
-    ARG_SCALAR = 0,      // Scalar value, passed directly
-    ARG_INPUT_PTR = 1,   // Input pointer: device_malloc + copy_to_device
-    ARG_OUTPUT_PTR = 2,  // Output pointer: device_malloc + record for copy-back
-    ARG_INOUT_PTR = 3,   // Input/output: copy_to_device + copy-back
-} ArgType;
-
-/**
  * Opaque pointer types for C interface.
  * These hide the C++ class implementations.
  */
@@ -86,7 +75,6 @@ size_t get_runtime_size(void);
  * @param orch_func_name    Name of the orchestration function to call
  * @param orch_args         Array of TaskArg describing orchestration arguments
  * @param orch_args_count   Number of orchestration arguments
- * @param arg_types         Array describing each argument's type (ArgType enum)
  * @param kernel_func_ids   Array of kernel function IDs (can be NULL if kernel_count == 0)
  * @param kernel_binaries   Array of pointers to kernel binary data
  * @param kernel_sizes      Array of kernel binary sizes in bytes
@@ -99,7 +87,6 @@ int init_runtime(RuntimeHandle runtime,
                 const char* orch_func_name,
                 const struct TaskArg* orch_args,
                 int orch_args_count,
-                int* arg_types,
                 const int* kernel_func_ids,
                 const uint8_t* const* kernel_binaries,
                 const size_t* kernel_sizes,
