@@ -48,13 +48,11 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
     errno = 0;
     unsigned long long val = strtoull(env, &endptr, 10);
     if (errno == ERANGE || endptr == env || *endptr != '\0' || val < min_val) {
-        LOG_WARN("%s=%s invalid (must be a valid integer >= %lu), ignored",
-                 name, env, (unsigned long)min_val);
+        LOG_WARN("%s=%s invalid (must be a valid integer >= %lu), ignored", name, env, (unsigned long)min_val);
         return 0;
     }
     if (require_power_of_2 && (val & (val - 1)) != 0) {
-        LOG_WARN("%s=%s invalid (must be a power of 2, >= %lu), ignored",
-                 name, env, (unsigned long)min_val);
+        LOG_WARN("%s=%s invalid (must be a power of 2, >= %lu), ignored", name, env, (unsigned long)min_val);
         return 0;
     }
     return static_cast<uint64_t>(val);
@@ -79,16 +77,16 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
  * @param func_args_count   Number of arguments
  * @return 0 on success, -1 on failure
  */
-extern "C" int init_runtime_impl(Runtime *runtime,
-                    const uint8_t* orch_so_binary,
-                    size_t orch_so_size,
-                    const char* orch_func_name,
-                    const TaskArg* orch_args,
-                    int orch_args_count,
-                    const int* kernel_func_ids,
-                    const uint8_t* const* kernel_binaries,
-                    const size_t* kernel_sizes,
-                    int kernel_count) {
+extern "C" int init_runtime_impl(Runtime* runtime,
+    const uint8_t* orch_so_binary,
+    size_t orch_so_size,
+    const char* orch_func_name,
+    const TaskArg* orch_args,
+    int orch_args_count,
+    const int* kernel_func_ids,
+    const uint8_t* const* kernel_binaries,
+    const size_t* kernel_sizes,
+    int kernel_count) {
     // Suppress unused parameter warning
     (void)orch_func_name;
 
@@ -99,12 +97,11 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     }
 
     // Register kernel binaries via platform-provided upload function
-    if (kernel_count > 0 && kernel_func_ids != nullptr &&
-        kernel_binaries != nullptr && kernel_sizes != nullptr) {
+    if (kernel_count > 0 && kernel_func_ids != nullptr && kernel_binaries != nullptr && kernel_sizes != nullptr) {
         LOG_INFO("Registering %d kernel(s) in init_runtime_impl", kernel_count);
         for (int i = 0; i < kernel_count; i++) {
-            uint64_t addr = runtime->host_api.upload_kernel_binary(
-                kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
+            uint64_t addr =
+                runtime->host_api.upload_kernel_binary(kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
             if (addr == 0) {
                 LOG_ERROR("Failed to upload kernel binary for func_id=%d", kernel_func_ids[i]);
                 return -1;
@@ -190,7 +187,9 @@ extern "C" int init_runtime_impl(Runtime *runtime,
                 runtime->ready_queue_shards = static_cast<int>(val);
             } else {
                 LOG_WARN("PTO2_READY_QUEUE_SHARDS=%s is invalid or out of range [1,%d], using default %d",
-                         env_shards, PLATFORM_MAX_AICPU_THREADS, RUNTIME_DEFAULT_READY_QUEUE_SHARDS);
+                    env_shards,
+                    PLATFORM_MAX_AICPU_THREADS,
+                    RUNTIME_DEFAULT_READY_QUEUE_SHARDS);
                 runtime->ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
             }
         }
@@ -208,20 +207,22 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
     // Read ring buffer size overrides from environment
     {
-        runtime->pto2_task_window_size  = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
-        runtime->pto2_heap_size         = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
-        runtime->pto2_dep_pool_size     = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
+        runtime->pto2_task_window_size = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
+        runtime->pto2_heap_size = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
+        runtime->pto2_dep_pool_size = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
         if (runtime->pto2_task_window_size || runtime->pto2_heap_size || runtime->pto2_dep_pool_size) {
             LOG_INFO("Ring buffer overrides: task_window=%lu heap=%lu dep_pool=%lu",
-                     (unsigned long)(runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE),
-                     (unsigned long)(runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE),
-                     (unsigned long)(runtime->pto2_dep_pool_size ? runtime->pto2_dep_pool_size : PTO2_DEP_LIST_POOL_SIZE));
+                (unsigned long)(runtime->pto2_task_window_size ? runtime->pto2_task_window_size
+                                                               : PTO2_TASK_WINDOW_SIZE),
+                (unsigned long)(runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE),
+                (unsigned long)(runtime->pto2_dep_pool_size ? runtime->pto2_dep_pool_size : PTO2_DEP_LIST_POOL_SIZE));
         }
     }
 
     // Resolve effective sizes (env override or compile-time default)
     uint64_t eff_heap_size = runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE;
-    uint64_t eff_task_window_size = runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE;
+    uint64_t eff_task_window_size =
+        runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE;
 
     // Allocate GM heap for orchestrator output buffers (all rings combined)
     uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
@@ -274,7 +275,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
  * @param runtime  Pointer to Runtime
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime) {
+extern "C" int validate_runtime_impl(Runtime* runtime) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -303,7 +304,9 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
             graph_out_ptr = host_header.graph_output_ptr;
             graph_out_size = host_header.graph_output_size;
             if (graph_out_ptr != 0) {
-                LOG_INFO("Graph output buffer: ptr=0x%lx, size=%lu", (unsigned long)graph_out_ptr, (unsigned long)graph_out_size);
+                LOG_INFO("Graph output buffer: ptr=0x%lx, size=%lu",
+                    (unsigned long)graph_out_ptr,
+                    (unsigned long)graph_out_size);
             }
         } else {
             LOG_WARN("Failed to copy PTO2 header from device");

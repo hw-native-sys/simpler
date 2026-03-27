@@ -20,7 +20,7 @@ namespace {
 // between execution rounds.  All orchestrator threads bind the same rt
 // value, so per-thread storage is unnecessary.
 PTO2Runtime* g_pto2_current_runtime = nullptr;
-}
+}  // namespace
 
 extern "C" __attribute__((visibility("default"))) void pto2_framework_bind_runtime(PTO2Runtime* rt) {
     g_pto2_current_runtime = rt;
@@ -38,8 +38,7 @@ extern "C" __attribute__((visibility("hidden"))) PTO2Runtime* pto2_framework_cur
  * 如果存在内联，同时通过 inline_chain 返回外层调用链
  */
 #ifdef __linux__
-static std::string addr_to_line(const char* executable, void* addr,
-                                std::string* inline_chain = nullptr) {
+static std::string addr_to_line(const char* executable, void* addr, std::string* inline_chain = nullptr) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "addr2line -e %s -f -C -p -i %p 2>/dev/null", executable, addr);
 
@@ -161,7 +160,9 @@ static std::string build_assert_message(const char* condition, const char* file,
 
 AssertionError::AssertionError(const char* condition, const char* file, int line)
     : std::runtime_error(build_assert_message(condition, file, line)),
-      condition_(condition), file_(file), line_(line) {}
+      condition_(condition),
+      file_(file),
+      line_(line) {}
 
 [[noreturn]] void assert_impl(const char* condition, const char* file, int line) {
     LOG_ERROR("\n========================================");

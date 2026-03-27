@@ -33,7 +33,6 @@ Usage:
     runtime.finalize()
 """
 
-
 from ctypes import (
     CDLL,
     POINTER,
@@ -99,9 +98,9 @@ from toolchain import ToolchainType
 # Runtime Library Loader
 # ============================================================================
 
+
 class RuntimeLibraryLoader:
     """Loads and manages the PTO runtime C API library."""
-
 
     def __init__(self, lib_path: Union[str, Path]):
         """
@@ -133,30 +132,30 @@ class RuntimeLibraryLoader:
 
         # init_runtime - placement new + register kernels + load SO + build runtime with orchestration
         self.lib.init_runtime.argtypes = [
-            c_void_p,               # runtime
-            POINTER(c_uint8),       # orch_so_binary
-            c_size_t,               # orch_so_size
-            c_char_p,               # orch_func_name
-            POINTER(TaskArgC),      # orch_args
-            c_int,                  # orch_args_count
-            POINTER(c_int),         # kernel_func_ids (array of func_ids)
+            c_void_p,  # runtime
+            POINTER(c_uint8),  # orch_so_binary
+            c_size_t,  # orch_so_size
+            c_char_p,  # orch_func_name
+            POINTER(TaskArgC),  # orch_args
+            c_int,  # orch_args_count
+            POINTER(c_int),  # kernel_func_ids (array of func_ids)
             POINTER(POINTER(c_uint8)),  # kernel_binaries (array of binary pointers)
-            POINTER(c_size_t),      # kernel_sizes (array of sizes)
-            c_int,                  # kernel_count
+            POINTER(c_size_t),  # kernel_sizes (array of sizes)
+            c_int,  # kernel_count
         ]
         self.lib.init_runtime.restype = c_int
 
         # launch_runtime - device init + execute runtime
         self.lib.launch_runtime.argtypes = [
-            c_void_p,           # runtime
-            c_int,              # aicpu_thread_num
-            c_int,              # block_dim
-            c_int,              # device_id
-            POINTER(c_uint8),   # aicpu_binary
-            c_size_t,           # aicpu_size
-            POINTER(c_uint8),   # aicore_binary
-            c_size_t,           # aicore_size
-            c_int,              # orch_thread_num
+            c_void_p,  # runtime
+            c_int,  # aicpu_thread_num
+            c_int,  # block_dim
+            c_int,  # device_id
+            POINTER(c_uint8),  # aicpu_binary
+            c_size_t,  # aicpu_size
+            POINTER(c_uint8),  # aicore_binary
+            c_size_t,  # aicore_size
+            c_int,  # orch_thread_num
         ]
         self.lib.launch_runtime.restype = c_int
 
@@ -208,6 +207,7 @@ class RuntimeLibraryLoader:
 # Python Wrapper Classes
 # ============================================================================
 
+
 class Runtime:
     """
 
@@ -216,7 +216,6 @@ class Runtime:
     Python wrapper around the C Runtime API.
     User allocates memory via ctypes buffer, C++ uses placement new.
     """
-
 
     def __init__(self, lib: CDLL):
         """
@@ -273,7 +272,11 @@ class Runtime:
         from _task_interface import TaskArgArray as _NbTaskArgArray
 
         if isinstance(orch_args, _NbTaskArgArray):
-            orch_args_array = cast(orch_args.ctypes_ptr(), POINTER(TaskArgC)) if orch_args_count > 0 else None
+            orch_args_array = (
+                cast(orch_args.ctypes_ptr(), POINTER(TaskArgC))
+                if orch_args_count > 0
+                else None
+            )
             # Prevent GC of the nanobind array while the ctypes pointer is live
             self._nb_args_ref = orch_args
         elif orch_args_count > 0:
@@ -313,7 +316,7 @@ class Runtime:
             self._handle,
             orch_so_array,
             len(orch_so_binary),
-            orch_func_name.encode('utf-8'),
+            orch_func_name.encode("utf-8"),
             orch_args_array,
             orch_args_count,
             func_ids_array,
@@ -478,7 +481,9 @@ def copy_from_device(host_ptr: int, dev_ptr: int, size: int) -> None:
     if _lib is None:
         raise RuntimeError("Runtime not loaded. Call bind_host_binary() first.")
 
-    rc = _lib.copy_from_device(ctypes.c_void_p(host_ptr), ctypes.c_void_p(dev_ptr), size)
+    rc = _lib.copy_from_device(
+        ctypes.c_void_p(host_ptr), ctypes.c_void_p(dev_ptr), size
+    )
     if rc != 0:
         raise RuntimeError(f"copy_from_device failed: {rc}")
 
@@ -539,6 +544,7 @@ def launch_runtime(
 # Compile Strategy Functions
 # ============================================================================
 
+
 def get_incore_compiler() -> ToolchainType:
     """
     Get the toolchain for incore kernel compilation.
@@ -583,6 +589,7 @@ def get_orchestration_compiler() -> ToolchainType:
 # Public API
 # ============================================================================
 
+
 def bind_host_binary(lib_path: Union[str, Path, bytes]) -> type:
     """
 
@@ -624,7 +631,7 @@ def bind_host_binary(lib_path: Union[str, Path, bytes]) -> type:
 
     # If bytes are provided, write to temporary file
     if isinstance(lib_path, bytes):
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.so') as f:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".so") as f:
             f.write(lib_path)
             lib_path = f.name
 

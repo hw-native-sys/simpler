@@ -22,7 +22,9 @@ from test_catalog import (
 
 def pytest_configure(config):
     """Register custom markers."""
-    config.addinivalue_line("markers", "requires_hardware: test needs Ascend toolchain and real device")
+    config.addinivalue_line(
+        "markers", "requires_hardware: test needs Ascend toolchain and real device"
+    )
 
 
 def pytest_addoption(parser):
@@ -31,7 +33,7 @@ def pytest_addoption(parser):
         "--platform",
         action="store",
         default=None,
-        help="Platform to test (e.g., a2a3sim, a5sim). If not specified, tests all platforms."
+        help="Platform to test (e.g., a2a3sim, a5sim). If not specified, tests all platforms.",
     )
 
 
@@ -81,17 +83,18 @@ def pytest_generate_tests(metafunc):
                 # Mark hardware platforms (non-sim) as requiring Ascend
                 marks = []
                 if not platform.endswith("sim"):
-                    marks.append(pytest.mark.skipif(
-                        not os.getenv("ASCEND_HOME_PATH"),
-                        reason=f"ASCEND_HOME_PATH not set; Ascend toolkit required for {platform}"
-                    ))
+                    marks.append(
+                        pytest.mark.skipif(
+                            not os.getenv("ASCEND_HOME_PATH"),
+                            reason=f"ASCEND_HOME_PATH not set; Ascend toolkit required for {platform}",
+                        )
+                    )
 
-                test_params.append(pytest.param(
-                    platform,
-                    runtime,
-                    marks=marks,
-                    id=f"{platform}-{runtime}"
-                ))
+                test_params.append(
+                    pytest.param(
+                        platform, runtime, marks=marks, id=f"{platform}-{runtime}"
+                    )
+                )
 
         # Apply parametrization
         metafunc.parametrize("platform,runtime_name", test_params)
@@ -115,13 +118,17 @@ def pytest_collection_modifyitems(session, config, items):
         # Skip aicpu_build_graph tests for architectures that don't have it
         if "test_discovers_aicpu_build_graph" in item.nodeid:
             if "aicpu_build_graph" not in available_runtimes:
-                item.add_marker(pytest.mark.skip(
-                    reason=f"aicpu_build_graph not available for {arch} architecture"
-                ))
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=f"aicpu_build_graph not available for {arch} architecture"
+                    )
+                )
 
         # Skip tensormap_and_ringbuffer tests for architectures that don't have it
         if "tensormap_and_ringbuffer" in item.nodeid:
             if "tensormap_and_ringbuffer" not in available_runtimes:
-                item.add_marker(pytest.mark.skip(
-                    reason=f"tensormap_and_ringbuffer not available for {arch} architecture"
-                ))
+                item.add_marker(
+                    pytest.mark.skip(
+                        reason=f"tensormap_and_ringbuffer not available for {arch} architecture"
+                    )
+                )

@@ -29,23 +29,23 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
     // Read dimensions from TaskArg tensor metadata
     // query: shape=[batch, num_heads, head_dim]
-    uint64_t batch     = orch_args[0].tensor.shapes[0];
+    uint64_t batch = orch_args[0].tensor.shapes[0];
     uint64_t num_heads = orch_args[0].tensor.shapes[1];
-    uint64_t head_dim  = orch_args[0].tensor.shapes[2];
+    uint64_t head_dim = orch_args[0].tensor.shapes[2];
     DataType data_type = orch_args[0].tensor.dtype;
 
     // key_cache: shape=[total_blocks, block_size, kv_head_num, head_dim]
@@ -63,9 +63,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
 
     // Reshape tensors for kernel consumption (2D flattened)
     void* query_ptr = orch_args[0].data<void>();
-    void* kc_ptr    = orch_args[1].data<void>();
-    void* vc_ptr    = orch_args[2].data<void>();
-    void* out_ptr   = orch_args[5].data<void>();
+    void* kc_ptr = orch_args[1].data<void>();
+    void* vc_ptr = orch_args[2].data<void>();
+    void* out_ptr = orch_args[5].data<void>();
 
     uint64_t total_blocks_count = orch_args[1].tensor.shapes[0];
 
@@ -78,7 +78,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
     Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type, false);
     Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
 
-    int* host_block_table  = orch_args[3].data<int>();
+    int* host_block_table = orch_args[3].data<int>();
     int* host_context_lens = orch_args[4].data<int>();
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {

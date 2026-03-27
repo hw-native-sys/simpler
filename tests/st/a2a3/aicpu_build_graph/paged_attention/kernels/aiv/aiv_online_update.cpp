@@ -126,7 +126,7 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
         // Store mi = mij, li = lij, oi = oi_new
         // Alias ND tiles to the same UB as DN tiles for storing as ND format
         TileScalarND mijND, lijND;
-        TASSIGN(mijND, 2 * kDataBytes);           // alias same UB as mijDN
+        TASSIGN(mijND, 2 * kDataBytes);                   // alias same UB as mijDN
         TASSIGN(lijND, 2 * kDataBytes + kScalarDNBytes);  // alias same UB as lijDN
 
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -173,21 +173,21 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
         TASSIGN(liNewRow, 2 * kDataBytes + 7 * kScalarDNBytes);
         TASSIGN(tmpRow, 2 * kDataBytes + 8 * kScalarDNBytes);
 
-        TMAX(miNewRow, miRow, mijRow);        // mi_new = max(mi, mij)
+        TMAX(miNewRow, miRow, mijRow);  // mi_new = max(mi, mij)
         pipe_barrier(PIPE_V);
-        TSUB(alphaRow, miRow, miNewRow);      // alpha_exp = mi - mi_new
+        TSUB(alphaRow, miRow, miNewRow);  // alpha_exp = mi - mi_new
         pipe_barrier(PIPE_V);
-        TEXP(alphaRow, alphaRow);             // alpha = exp(mi - mi_new)
+        TEXP(alphaRow, alphaRow);  // alpha = exp(mi - mi_new)
         pipe_barrier(PIPE_V);
-        TSUB(betaRow, mijRow, miNewRow);      // beta_exp = mij - mi_new
+        TSUB(betaRow, mijRow, miNewRow);  // beta_exp = mij - mi_new
         pipe_barrier(PIPE_V);
-        TEXP(betaRow, betaRow);               // beta = exp(mij - mi_new)
+        TEXP(betaRow, betaRow);  // beta = exp(mij - mi_new)
         pipe_barrier(PIPE_V);
-        TMUL(tmpRow, alphaRow, liRow);        // alpha * li
+        TMUL(tmpRow, alphaRow, liRow);  // alpha * li
         pipe_barrier(PIPE_V);
-        TMUL(liNewRow, betaRow, lijRow);      // beta * lij
+        TMUL(liNewRow, betaRow, lijRow);  // beta * lij
         pipe_barrier(PIPE_V);
-        TADD(liNewRow, tmpRow, liNewRow);     // li_new = alpha*li + beta*lij
+        TADD(liNewRow, tmpRow, liNewRow);  // li_new = alpha*li + beta*lij
 
         // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for TROWEXPANDMUL
         TRESHAPE(alphaDN, alphaRow);
@@ -195,9 +195,9 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
 
         // Scale data tiles using row-broadcast multiply
         TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
-        TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);   // oi_new *= beta
+        TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);  // oi_new *= beta
         pipe_barrier(PIPE_V);
-        TADD(oiTile, oiTile, oiNewTile);              // oi = alpha*oi + beta*oi_new
+        TADD(oiTile, oiTile, oiNewTile);  // oi = alpha*oi + beta*oi_new
 
         // Store mi_new and li_new to GM (ND format)
         // Alias ND tiles to the same UB locations as miNewRow and liNewRow
@@ -212,15 +212,15 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
             TROWEXPANDDIV(oiTile, oiTile, liNewDN);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            TSTORE(miGlobalND, miNewND);   // persist mi_new
-            TSTORE(liGlobalND, liNewND);   // persist li_new
+            TSTORE(miGlobalND, miNewND);  // persist mi_new
+            TSTORE(liGlobalND, liNewND);  // persist li_new
             TSTORE(dstGlobal, oiTile);
         } else {
             // Store updated accumulators
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            TSTORE(miGlobalND, miNewND);   // persist mi_new
-            TSTORE(liGlobalND, liNewND);   // persist li_new
+            TSTORE(miGlobalND, miNewND);  // persist mi_new
+            TSTORE(liGlobalND, liNewND);  // persist li_new
             TSTORE(oiGlobal, oiTile);
         }
     }

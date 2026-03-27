@@ -22,19 +22,18 @@ using namespace pto;
 #endif
 
 template <int M, int K, int N>
-static __aicore__ void pv_matmul_impl(__gm__ uint8_t* pij_raw, __gm__ uint8_t* vj_raw, __gm__ uint8_t* oi_raw)
-{
+static __aicore__ void pv_matmul_impl(__gm__ uint8_t* pij_raw, __gm__ uint8_t* vj_raw, __gm__ uint8_t* oi_raw) {
     __gm__ bfloat16_t* pij = reinterpret_cast<__gm__ bfloat16_t*>(pij_raw);
-    __gm__ bfloat16_t* vj  = reinterpret_cast<__gm__ bfloat16_t*>(vj_raw);
-    __gm__ float*      oi  = reinterpret_cast<__gm__ float*>(oi_raw);
+    __gm__ bfloat16_t* vj = reinterpret_cast<__gm__ bfloat16_t*>(vj_raw);
+    __gm__ float* oi = reinterpret_cast<__gm__ float*>(oi_raw);
 
     // pij (M, K) bf16, vj (K, N) bf16 in ND (row-major), oi_new (M, N) fp32
-    using GlobalA   = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, pto::Stride<M*K, M*K, M*K, K, 1>>;
-    using GlobalB   = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, pto::Stride<K*N, K*N, K*N, N, 1>>;
-    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<M*N, M*N, M*N, N, 1>>;
+    using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, pto::Stride<M * K, M * K, M * K, K, 1>>;
+    using GlobalB = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, pto::Stride<K * N, K * N, K * N, N, 1>>;
+    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<M * N, M * N, M * N, N, 1>>;
 
-    GlobalA   pijGlobal(pij);
-    GlobalB   vjGlobal(vj);
+    GlobalA pijGlobal(pij);
+    GlobalB vjGlobal(vj);
     GlobalOut oiGlobal(oi);
 
     // L1 Mat tiles: standard ND pattern for both A and B
@@ -42,18 +41,18 @@ static __aicore__ void pv_matmul_impl(__gm__ uint8_t* pij_raw, __gm__ uint8_t* v
     using TileMatB = Tile<TileType::Mat, bfloat16_t, K, N, BLayout::ColMajor, K, N, SLayout::RowMajor, 512>;
 
     // L0 tiles
-    using LeftTile  = TileLeft<bfloat16_t, M, K, M, K>;
+    using LeftTile = TileLeft<bfloat16_t, M, K, M, K>;
     using RightTile = TileRight<bfloat16_t, K, N, K, N>;
-    using AccTile   = TileAcc<float, M, N, M, N>;
+    using AccTile = TileAcc<float, M, N, M, N>;
 
     TileMatA aMatTile;
     TileMatB bMatTile;
     TASSIGN(aMatTile, 0x0);
     TASSIGN(bMatTile, 0x20000);
 
-    LeftTile  aTile;
+    LeftTile aTile;
     RightTile bTile;
-    AccTile   cTile;
+    AccTile cTile;
     TASSIGN(aTile, 0x0);
     TASSIGN(bTile, 0x0);
     TASSIGN(cTile, 0x0);
@@ -81,10 +80,9 @@ static __aicore__ void pv_matmul_impl(__gm__ uint8_t* pij_raw, __gm__ uint8_t* v
     TSTORE(oiGlobal, cTile);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
-{
-    __gm__ uint8_t* pij    = reinterpret_cast<__gm__ uint8_t*>(args[0]);
-    __gm__ uint8_t* vj     = reinterpret_cast<__gm__ uint8_t*>(args[1]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    __gm__ uint8_t* pij = reinterpret_cast<__gm__ uint8_t*>(args[0]);
+    __gm__ uint8_t* vj = reinterpret_cast<__gm__ uint8_t*>(args[1]);
     __gm__ uint8_t* oi_new = reinterpret_cast<__gm__ uint8_t*>(args[2]);
     int q_tile_size = static_cast<int>(args[3]);
     // args[4] = block_size, args[5] = head_dim

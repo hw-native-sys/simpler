@@ -53,9 +53,12 @@ inline CoreType core_type_from_string(const char* type_str) {
  */
 inline const char* core_type_to_string(CoreType core_type) {
     switch (core_type) {
-        case CoreType::AIC: return "AIC";
-        case CoreType::AIV: return "AIV";
-        default: return "UNKNOWN";
+        case CoreType::AIC:
+            return "AIC";
+        case CoreType::AIV:
+            return "AIV";
+        default:
+            return "UNKNOWN";
     }
 }
 

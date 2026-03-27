@@ -22,19 +22,21 @@
 #include <stddef.h>
 
 // Type headers needed by orchestration
-#include "pto_types.h"          // PTOParam, PTOTensorEntry, PTOParamType
-#include "tensor.h"             // Tensor, make_tensor, make_tensor_external
-#include "pto_submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
-#include "pto_runtime2_types.h" // PTO2TaskId
-#include "task_arg.h"           // TaskArg, TaskArgKind
+#include "pto_types.h"           // PTOParam, PTOTensorEntry, PTOParamType
+#include "tensor.h"              // Tensor, make_tensor, make_tensor_external
+#include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
+#include "pto_runtime2_types.h"  // PTO2TaskId
+#include "task_arg.h"            // TaskArg, TaskArgKind
 
 // Convert TaskArg to Tensor (needs make_tensor_external from tensor.h)
 static_assert(TASK_ARG_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "TaskArg and runtime max dims must match");
 inline Tensor from_task_arg(const TaskArg& arg, bool manual_dep = false, int32_t version = 0) {
-    return make_tensor_external(
-        reinterpret_cast<void*>(static_cast<uintptr_t>(arg.tensor.data)),
-        arg.tensor.shapes, arg.tensor.ndims, arg.tensor.dtype,
-        manual_dep, version);
+    return make_tensor_external(reinterpret_cast<void*>(static_cast<uintptr_t>(arg.tensor.data)),
+        arg.tensor.shapes,
+        arg.tensor.ndims,
+        arg.tensor.dtype,
+        manual_dep,
+        version);
 }
 
 // =============================================================================
@@ -53,8 +55,7 @@ typedef struct PTO2Runtime PTO2Runtime;
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    PTO2TaskId (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                              const PTOParam& params);
+    PTO2TaskId (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const PTOParam& params);
     void (*add_dependency)(PTO2Runtime* rt, PTO2TaskId producer, PTO2TaskId consumer);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
@@ -84,16 +85,15 @@ struct PTO2Runtime {
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline PTO2TaskId pto2_rt_submit_task(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                                        const PTOParam& params) {
+static inline PTO2TaskId pto2_rt_submit_task(
+    PTO2Runtime* rt, const MixedKernels& mixed_kernels, const PTOParam& params) {
     return rt->ops->submit_task(rt, mixed_kernels, params);
 }
 
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
-static inline PTO2TaskId pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id,
-                                            const PTOParam& params) {
+static inline PTO2TaskId pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id, const PTOParam& params) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, params);
@@ -102,8 +102,7 @@ static inline PTO2TaskId pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
-static inline PTO2TaskId pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id,
-                                            const PTOParam& params) {
+static inline PTO2TaskId pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id, const PTOParam& params) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, params);
@@ -116,29 +115,21 @@ static inline void pto2_rt_add_dependency(PTO2Runtime* rt, PTO2TaskId producer, 
     rt->ops->add_dependency(rt, producer, consumer);
 }
 
-static inline void pto2_rt_scope_begin(PTO2Runtime* rt) {
-    rt->ops->scope_begin(rt);
-}
+static inline void pto2_rt_scope_begin(PTO2Runtime* rt) { rt->ops->scope_begin(rt); }
 
-static inline void pto2_rt_scope_end(PTO2Runtime* rt) {
-    rt->ops->scope_end(rt);
-}
+static inline void pto2_rt_scope_end(PTO2Runtime* rt) { rt->ops->scope_end(rt); }
 
-static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) {
-    rt->ops->orchestration_done(rt);
-}
+static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) { rt->ops->orchestration_done(rt); }
 
-static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) {
-    return rt->ops->is_fatal(rt);
-}
+static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) { return rt->ops->is_fatal(rt); }
 
 // =============================================================================
 // Logging Macros for Orchestration (call through ops table)
 // =============================================================================
 
 #define LOG_ERROR(rt, fmt, ...) (rt)->ops->log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_WARN(rt, fmt, ...)  (rt)->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_INFO(rt, fmt, ...)  (rt)->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_WARN(rt, fmt, ...) (rt)->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_INFO(rt, fmt, ...) (rt)->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(rt, fmt, ...) (rt)->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_ALWAYS(rt, fmt, ...) (rt)->ops->log_always(__FUNCTION__, fmt, ##__VA_ARGS__)
 
@@ -151,17 +142,14 @@ static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) {
  */
 class PTO2ScopeGuard {
 public:
-    PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) {
-        rt_->ops->scope_begin(rt_);
-    }
-    ~PTO2ScopeGuard() {
-        rt_->ops->scope_end(rt_);
-    }
+    PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) { rt_->ops->scope_begin(rt_); }
+    ~PTO2ScopeGuard() { rt_->ops->scope_end(rt_); }
+
 private:
     PTO2Runtime* rt_;
 };
 
-#define _PTO2_CONCATENATE_IMPL(x, y) x ## y
+#define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
 
 #define PTO2_SCOPE_GUARD(rt) [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)(rt)
@@ -188,8 +176,8 @@ private:
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
 struct PTO2OrchestrationConfig {
-    int         expected_arg_count;
+    int expected_arg_count;
 };
 #endif
 
-#endif // PTO_ORCHESTRATION_API_H
+#endif  // PTO_ORCHESTRATION_API_H

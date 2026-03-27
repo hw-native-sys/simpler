@@ -30,11 +30,11 @@
 // =============================================================================
 
 enum class HostLogLevel {
-    ALWAYS = -1, // always logging
-    ERROR = 0,   // error level only
-    WARN = 1,    // warn level and above
-    INFO = 2,    // info level and above (default)
-    DEBUG = 3    // debug level (all messages)
+    ALWAYS = -1,  // always logging
+    ERROR = 0,    // error level only
+    WARN = 1,     // warn level and above
+    INFO = 2,     // info level and above (default)
+    DEBUG = 3     // debug level (all messages)
 };
 
 // =============================================================================
@@ -48,7 +48,7 @@ public:
 
     // Log a message with specified level
     void log(HostLogLevel level, const char* format, ...);
-    
+
     // Check if a log level is enabled
     bool is_enabled(HostLogLevel level) const;
 
@@ -58,7 +58,7 @@ public:
 private:
     HostLogger();
     ~HostLogger();
-    
+
     // Delete copy/move constructors
     HostLogger(const HostLogger&) = delete;
     HostLogger& operator=(const HostLogger&) = delete;
@@ -67,10 +67,10 @@ private:
 
     // Initialize from environment variables
     void init_from_env();
-    
+
     // Get level name string
     const char* get_level_name(HostLogLevel level) const;
-    
+
     // Get output file handle (FILE* for stdout/stderr or file)
     FILE* get_output_file(HostLogLevel level);
 
@@ -86,29 +86,28 @@ private:
 // Logging Macros (High-Level Interface)
 // =============================================================================
 
-#define HOST_LOG_ERROR(fmt, ...) \
-    do { \
+#define HOST_LOG_ERROR(fmt, ...)                                                 \
+    do {                                                                         \
         HostLogger::get_instance().log(HostLogLevel::ERROR, fmt, ##__VA_ARGS__); \
-    } while(0)
+    } while (0)
 
-#define HOST_LOG_WARN(fmt, ...) \
-    do { \
+#define HOST_LOG_WARN(fmt, ...)                                                 \
+    do {                                                                        \
         HostLogger::get_instance().log(HostLogLevel::WARN, fmt, ##__VA_ARGS__); \
-    } while(0)
+    } while (0)
 
-#define HOST_LOG_INFO(fmt, ...) \
-    do { \
-        if (HostLogger::get_instance().is_enabled(HostLogLevel::INFO)) { \
+#define HOST_LOG_INFO(fmt, ...)                                                     \
+    do {                                                                            \
+        if (HostLogger::get_instance().is_enabled(HostLogLevel::INFO)) {            \
             HostLogger::get_instance().log(HostLogLevel::INFO, fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
+        }                                                                           \
+    } while (0)
 
-#define HOST_LOG_DEBUG(fmt, ...) \
-    do { \
-        if (HostLogger::get_instance().is_enabled(HostLogLevel::DEBUG)) { \
+#define HOST_LOG_DEBUG(fmt, ...)                                                     \
+    do {                                                                             \
+        if (HostLogger::get_instance().is_enabled(HostLogLevel::DEBUG)) {            \
             HostLogger::get_instance().log(HostLogLevel::DEBUG, fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
+        }                                                                            \
+    } while (0)
 
-#endif // PLATFORM_HOST_LOG_H_
-
+#endif  // PLATFORM_HOST_LOG_H_

@@ -22,23 +22,22 @@
 #include "pto_orchestration_api.h"
 
 #define FUNC_MATMUL 0
-#define FUNC_ADD    1
+#define FUNC_ADD 1
 
 static constexpr uint64_t MATMUL_ELEMS = 128 * 128;
 static constexpr uint64_t ADD_ELEMS = 128 * 128;
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 11,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     // Tensor args
     Tensor ext_A = from_task_arg(orch_args[0]);
     Tensor ext_B = from_task_arg(orch_args[1]);
@@ -56,7 +55,11 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
 
     LOG_ALWAYS("[alternating_orch] thread num: %d, idx: %d", orch_thread_num, orch_thread_index);
     LOG_INFO("[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d",
-             batch, M, N, matmul_batch, add_batch);
+        batch,
+        M,
+        N,
+        matmul_batch,
+        add_batch);
 
     int total_matmul_tasks = batch * M;
     int total_add_tasks = batch * N;
@@ -111,8 +114,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         }
     }
 
-    LOG_ALWAYS("[alternating_orch] Submitted %d matmul groups and %d add groups",
-             total_matmul, total_add);
+    LOG_ALWAYS("[alternating_orch] Submitted %d matmul groups and %d add groups", total_matmul, total_add);
 }
 
 }  // extern "C"

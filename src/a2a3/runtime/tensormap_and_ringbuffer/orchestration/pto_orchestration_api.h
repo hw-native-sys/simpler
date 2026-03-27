@@ -22,10 +22,10 @@
 #include <stddef.h>
 
 // Type headers needed by orchestration
-#include "tensor.h"             // Tensor
-#include "pto_types.h"          // PTOParam, PTOTensorEntry, PTOParamType
-#include "pto_submit_types.h"   // MixedKernels, INVALID_KERNEL_ID, subtask slots
-#include "task_arg.h"           // TaskArg, TaskArgKind
+#include "tensor.h"            // Tensor
+#include "pto_types.h"         // PTOParam, PTOTensorEntry, PTOParamType
+#include "pto_submit_types.h"  // MixedKernels, INVALID_KERNEL_ID, subtask slots
+#include "task_arg.h"          // TaskArg, TaskArgKind
 
 // =============================================================================
 // Tensor Factory Helpers
@@ -45,8 +45,17 @@ static inline Tensor make_tensor_external(void* addr,
     for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
+    return Tensor(addr,
+        total * get_element_size(dtype),
+        shapes,
+        shapes,
+        zero_offsets,
+        ndims,
+        dtype,
+        version,
+        /*is_all_offset_zero=*/true,
+        /*is_raw_eq_shapes=*/true,
+        manual_dep);
 }
 
 /**
@@ -65,17 +74,28 @@ static inline Tensor make_tensor(const uint32_t shapes[],
     for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
+    return Tensor(0,
+        total * get_element_size(dtype),
+        shapes,
+        shapes,
+        zero_offsets,
+        ndims,
+        dtype,
+        version,
+        /*is_all_offset_zero=*/true,
+        /*is_raw_eq_shapes=*/true,
+        manual_dep);
 }
 
 // Convert TaskArg to Tensor (needs make_tensor_external above)
 static_assert(TASK_ARG_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "TaskArg and runtime max dims must match");
 inline Tensor from_task_arg(const TaskArg& arg, bool manual_dep = false, int32_t version = 0) {
-    return make_tensor_external(
-        reinterpret_cast<void*>(static_cast<uintptr_t>(arg.tensor.data)),
-        arg.tensor.shapes, arg.tensor.ndims, arg.tensor.dtype,
-        manual_dep, version);
+    return make_tensor_external(reinterpret_cast<void*>(static_cast<uintptr_t>(arg.tensor.data)),
+        arg.tensor.shapes,
+        arg.tensor.ndims,
+        arg.tensor.dtype,
+        manual_dep,
+        version);
 }
 
 // =============================================================================
@@ -112,8 +132,7 @@ void pto2_framework_bind_runtime(PTO2Runtime* rt);
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                        const PTOParam& params);
+    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const PTOParam& params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
@@ -128,11 +147,8 @@ typedef struct PTO2RuntimeOps {
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
-                                uint32_t ndims, const uint32_t indices[]);
-    void (*set_tensor_data)(PTO2Runtime* rt, Tensor& tensor,
-                            uint32_t ndims, const uint32_t indices[],
-                            uint64_t value);
+    uint64_t (*get_tensor_data)(PTO2Runtime* rt, const Tensor& tensor, uint32_t ndims, const uint32_t indices[]);
+    void (*set_tensor_data)(PTO2Runtime* rt, Tensor& tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
 } PTO2RuntimeOps;
 
 /**
@@ -150,12 +166,9 @@ struct PTO2Runtime {
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline PTO2Runtime* pto2_current_runtime() {
-    return pto2_framework_current_runtime();
-}
+static inline PTO2Runtime* pto2_current_runtime() { return pto2_framework_current_runtime(); }
 
-static inline void pto2_rt_submit_task(const MixedKernels& mixed_kernels,
-                                       const PTOParam& params) {
+static inline void pto2_rt_submit_task(const MixedKernels& mixed_kernels, const PTOParam& params) {
     PTO2Runtime* rt = pto2_current_runtime();
     rt->ops->submit_task(rt, mixed_kernels, params);
 }
@@ -205,8 +218,8 @@ static inline bool pto2_rt_is_fatal() {
 // =============================================================================
 
 #define LOG_ERROR(fmt, ...) pto2_current_runtime()->ops->log_error(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  pto2_current_runtime()->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)  pto2_current_runtime()->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...) pto2_current_runtime()->ops->log_warn(__FUNCTION__, fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...) pto2_current_runtime()->ops->log_info(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_DEBUG(fmt, ...) pto2_current_runtime()->ops->log_debug(__FUNCTION__, fmt, ##__VA_ARGS__)
 #define LOG_ALWAYS(fmt, ...) pto2_current_runtime()->ops->log_always(__FUNCTION__, fmt, ##__VA_ARGS__)
 
@@ -223,8 +236,7 @@ static inline bool pto2_rt_is_fatal() {
  *
  * Returns the raw bits as uint64_t; caller reinterprets via bit_cast.
  */
-static inline uint64_t get_tensor_data(const Tensor& tensor,
-                                       uint32_t ndims, const uint32_t indices[]) {
+static inline uint64_t get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[]) {
     PTO2Runtime* rt = pto2_current_runtime();
     return rt->ops->get_tensor_data(rt, tensor, ndims, indices);
 }
@@ -251,9 +263,7 @@ static inline uint64_t get_tensor_data(const Tensor& tensor,
  * For make_tensor() outputs, call this only after the tensor has been
  * submitted as OUTPUT at least once (so HeapRing allocation has occurred).
  */
-static inline void set_tensor_data(Tensor& tensor,
-                                   uint32_t ndims, const uint32_t indices[],
-                                   uint64_t value) {
+static inline void set_tensor_data(Tensor& tensor, uint32_t ndims, const uint32_t indices[], uint64_t value) {
     PTO2Runtime* rt = pto2_current_runtime();
     rt->ops->set_tensor_data(rt, tensor, ndims, indices, value);
 }
@@ -267,17 +277,14 @@ static inline void set_tensor_data(Tensor& tensor,
  */
 class PTO2ScopeGuard {
 public:
-    PTO2ScopeGuard() : rt_(pto2_current_runtime()) {
-        rt_->ops->scope_begin(rt_);
-    }
-    ~PTO2ScopeGuard() {
-        rt_->ops->scope_end(rt_);
-    }
+    PTO2ScopeGuard() : rt_(pto2_current_runtime()) { rt_->ops->scope_begin(rt_); }
+    ~PTO2ScopeGuard() { rt_->ops->scope_end(rt_); }
+
 private:
     PTO2Runtime* rt_;
 };
 
-#define _PTO2_CONCATENATE_IMPL(x, y) x ## y
+#define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
 
 #define PTO2_SCOPE_GUARD() [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)
@@ -304,8 +311,8 @@ private:
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
 struct PTO2OrchestrationConfig {
-    int         expected_arg_count;
+    int expected_arg_count;
 };
 #endif
 
-#endif // PTO_ORCHESTRATION_API_H
+#endif  // PTO_ORCHESTRATION_API_H

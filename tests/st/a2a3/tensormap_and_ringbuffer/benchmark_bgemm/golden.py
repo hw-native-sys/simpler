@@ -95,18 +95,32 @@ def generate_inputs(params: dict) -> list:
 
     num_groups = matmul_add_task_num // grid_k
 
-    A = torch.randn(incore_loop * num_groups, grid_k, tile_size, tile_size, dtype=torch.float32) * 0.01
-    B = torch.randn(incore_loop * num_groups, grid_k, tile_size, tile_size, dtype=torch.float32) * 0.01
+    A = (
+        torch.randn(
+            incore_loop * num_groups, grid_k, tile_size, tile_size, dtype=torch.float32
+        )
+        * 0.01
+    )
+    B = (
+        torch.randn(
+            incore_loop * num_groups, grid_k, tile_size, tile_size, dtype=torch.float32
+        )
+        * 0.01
+    )
     C = torch.zeros(incore_loop * num_groups, tile_size, tile_size, dtype=torch.float32)
 
     # Reshape A/B to [num_groups, grid_k, incore_loop, tile_size, tile_size]
     # so that incore_loop tiles are contiguous for each (group, k_idx)
     A = A.reshape(num_groups, incore_loop, grid_k, tile_size, tile_size)
-    A = A.permute(0, 2, 1, 3, 4).contiguous()  # [num_groups, grid_k, incore_loop, tile_size, tile_size]
+    A = A.permute(
+        0, 2, 1, 3, 4
+    ).contiguous()  # [num_groups, grid_k, incore_loop, tile_size, tile_size]
     B = B.reshape(num_groups, incore_loop, grid_k, tile_size, tile_size)
     B = B.permute(0, 2, 1, 3, 4).contiguous()
 
-    config = torch.tensor([tile_size, grid_k, num_groups, incore_loop], dtype=torch.int64)
+    config = torch.tensor(
+        [tile_size, grid_k, num_groups, incore_loop], dtype=torch.int64
+    )
 
     A_flat = A.flatten()
     B_flat = B.flatten()
@@ -129,9 +143,15 @@ def compute_golden(tensors: dict, params: dict) -> None:
     num_groups = params["matmul_add_task_num"] // grid_k
 
     # A/B layout: [num_groups, grid_k, incore_loop, tile_size, tile_size]
-    A = torch.as_tensor(tensors["A"]).reshape(num_groups, grid_k, incore_loop, tile_size, tile_size)
-    B = torch.as_tensor(tensors["B"]).reshape(num_groups, grid_k, incore_loop, tile_size, tile_size)
-    C = torch.as_tensor(tensors["C"]).reshape(incore_loop * num_groups, tile_size, tile_size)
+    A = torch.as_tensor(tensors["A"]).reshape(
+        num_groups, grid_k, incore_loop, tile_size, tile_size
+    )
+    B = torch.as_tensor(tensors["B"]).reshape(
+        num_groups, grid_k, incore_loop, tile_size, tile_size
+    )
+    C = torch.as_tensor(tensors["C"]).reshape(
+        incore_loop * num_groups, tile_size, tile_size
+    )
 
     C[:] = 0.0
 
@@ -147,7 +167,9 @@ def compute_golden(tensors: dict, params: dict) -> None:
 if __name__ == "__main__":
     params = {"name": DEFAULT_CASE, **ALL_CASES[DEFAULT_CASE]}
     result = generate_inputs(params)
-    tensors = {name: tensor for name, tensor in result if isinstance(tensor, torch.Tensor)}
+    tensors = {
+        name: tensor for name, tensor in result if isinstance(tensor, torch.Tensor)
+    }
     compute_golden(tensors, params)
 
     granularity = params["incore_task_granularity"]

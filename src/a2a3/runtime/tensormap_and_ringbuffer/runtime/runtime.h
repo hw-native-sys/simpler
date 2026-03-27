@@ -88,9 +88,9 @@ struct Handshake {
     volatile CoreType core_type;           // Core type: CoreType::AIC or CoreType::AIV
     volatile uint64_t perf_records_addr;   // Performance records address
     volatile uint32_t perf_buffer_status;  // 0 = not full, 1 == full
-    volatile uint32_t physical_core_id;     // Physical core ID
+    volatile uint32_t physical_core_id;    // Physical core ID
     volatile uint32_t aicpu_regs_ready;    // AICPU register init done: 0=pending, 1=done
-    volatile uint32_t aicore_regs_ready;     // AICore ID reported: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;   // AICore ID reported: 0=pending, 1=done
 } __attribute__((aligned(64)));
 
 /**
@@ -146,8 +146,8 @@ public:
     int worker_count;                       // Number of active workers
 
     // Execution parameters for AICPU scheduling
-    int sche_cpu_num;  // Number of AICPU threads for scheduling
-    int orch_thread_num;  // Number of orchestrator threads (default 1)
+    int sche_cpu_num;        // Number of AICPU threads for scheduling
+    int orch_thread_num;     // Number of orchestrator threads (default 1)
     int ready_queue_shards;  // Number of ready queue shards (1..MAX_AICPU_THREADS, default MAX-1)
 
     // Ring buffer size overrides (0 = use compile-time defaults)
@@ -160,7 +160,7 @@ public:
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
     // Profiling support
-    bool enable_profiling;    // Enable profiling flag
+    bool enable_profiling;  // Enable profiling flag
 
     // Orchestrator-to-scheduler transition control
     // When true, orchestrator threads convert to scheduler threads after orchestration completes.
@@ -180,10 +180,10 @@ private:
 
     // Device orchestration: when false, orchestration runs on device (thread 3)
     bool orch_built_on_host_;
-    void* pto2_gm_sm_ptr_;  // GM pointer to PTO2 shared memory (device)
-    void* pto2_gm_heap_ptr_;  // GM heap for orchestrator output buffers (device)
+    void* pto2_gm_sm_ptr_;        // GM pointer to PTO2 shared memory (device)
+    void* pto2_gm_heap_ptr_;      // GM heap for orchestrator output buffers (device)
     void* pto2_slot_states_ptr_;  // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
-    TaskArg* orch_args_;   // Arguments for device orchestration
+    TaskArg* orch_args_;          // Arguments for device orchestration
     int orch_arg_count_;
     TaskArg orch_args_storage_[RUNTIME_MAX_ARGS];  // Copy of args for device
 

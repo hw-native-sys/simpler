@@ -85,9 +85,7 @@ struct CoreFunctionBinCache {
      * Get pointer to binary data region
      * @return Pointer to start of binary data
      */
-    uint8_t* get_binary_data() {
-        return reinterpret_cast<uint8_t*>(get_offsets()) + num_kernels * sizeof(uint64_t);
-    }
+    uint8_t* get_binary_data() { return reinterpret_cast<uint8_t*>(get_offsets()) + num_kernels * sizeof(uint64_t); }
 
     /**
      * Get CoreFunctionBin by index

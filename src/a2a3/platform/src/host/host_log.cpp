@@ -18,19 +18,14 @@ HostLogger& HostLogger::get_instance() {
     return instance;
 }
 
-HostLogger::HostLogger() 
-    : current_level_(HostLogLevel::INFO),
-      log_file_path_(""),
-      log_file_handle_(nullptr),
-      initialized_(false) {
+HostLogger::HostLogger()
+    : current_level_(HostLogLevel::INFO), log_file_path_(""), log_file_handle_(nullptr), initialized_(false) {
     init_from_env();
 }
 
 HostLogger::~HostLogger() {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (log_file_handle_ != nullptr && 
-        log_file_handle_ != stdout && 
-        log_file_handle_ != stderr) {
+    if (log_file_handle_ != nullptr && log_file_handle_ != stdout && log_file_handle_ != stderr) {
         fclose(log_file_handle_);
         log_file_handle_ = nullptr;
     }
@@ -38,17 +33,17 @@ HostLogger::~HostLogger() {
 
 void HostLogger::init_from_env() {
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     // Parse PTO_LOG_LEVEL environment variable
     const char* level_str = std::getenv("PTO_LOG_LEVEL");
     if (level_str != nullptr) {
         std::string level(level_str);
-        
+
         // Convert to lowercase for comparison
         for (char& c : level) {
             c = std::tolower(c);
         }
-        
+
         // Map log level strings to enum values (1-to-1 mapping)
         if (level == "error") {
             current_level_ = HostLogLevel::ERROR;
@@ -66,19 +61,17 @@ void HostLogger::init_from_env() {
         // Default to INFO
         current_level_ = HostLogLevel::INFO;
     }
-    
+
     // Parse PTO_LOG_FILE environment variable
     const char* file_path = std::getenv("PTO_LOG_FILE");
     if (file_path != nullptr && strlen(file_path) > 0) {
         log_file_path_ = file_path;
-        
+
         // Close previous file handle if it exists
-        if (log_file_handle_ != nullptr && 
-            log_file_handle_ != stdout && 
-            log_file_handle_ != stderr) {
+        if (log_file_handle_ != nullptr && log_file_handle_ != stdout && log_file_handle_ != stderr) {
             fclose(log_file_handle_);
         }
-        
+
         // Open log file in append mode
         log_file_handle_ = fopen(log_file_path_.c_str(), "a");
         if (log_file_handle_ == nullptr) {
@@ -88,7 +81,7 @@ void HostLogger::init_from_env() {
             log_file_path_.clear();
         }
     }
-    
+
     initialized_ = true;
 }
 
@@ -123,7 +116,7 @@ FILE* HostLogger::get_output_file(HostLogLevel level) {
     if (log_file_handle_ != nullptr) {
         return log_file_handle_;
     }
-    
+
     // Otherwise, use stderr for ERROR/WARN, stdout for INFO/DEBUG
     if (level == HostLogLevel::ERROR || level == HostLogLevel::WARN) {
         return stderr;
@@ -137,30 +130,29 @@ void HostLogger::log(HostLogLevel level, const char* format, ...) {
     if (!is_enabled(level)) {
         return;
     }
-    
+
     std::lock_guard<std::mutex> lock(mutex_);
-    
+
     // Get output file
     FILE* output = get_output_file(level);
     if (output == nullptr) {
         return;
     }
-    
+
     // Print log level prefix (matching Python format)
     fprintf(output, "[%s] ", get_level_name(level));
-    
+
     // Print formatted message
     va_list args;
     va_start(args, format);
     vfprintf(output, format, args);
     va_end(args);
-    
+
     // Add newline if not already present
     if (format[strlen(format) - 1] != '\n') {
         fprintf(output, "\n");
     }
-    
+
     // Flush to ensure immediate output
     fflush(output);
 }
-

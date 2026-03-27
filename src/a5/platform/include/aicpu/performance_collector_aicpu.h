@@ -46,14 +46,14 @@ void perf_aicpu_init_profiling(Runtime* runtime);
  * @param fanout_count     Number of entries in fanout array (0 if none)
  */
 int perf_aicpu_complete_record(PerfBuffer* perf_buf,
-                                uint32_t expected_task_id,
-                                uint32_t func_id,
-                                CoreType core_type,
-                                uint64_t dispatch_time,
-                                uint64_t finish_time,
-                                uint8_t ring_id,
-                                const int32_t* fanout,
-                                int32_t fanout_count);
+    uint32_t expected_task_id,
+    uint32_t func_id,
+    CoreType core_type,
+    uint64_t dispatch_time,
+    uint64_t finish_time,
+    uint8_t ring_id,
+    const int32_t* fanout,
+    int32_t fanout_count);
 
 /**
  * Switch performance buffer when current buffer is full
@@ -76,10 +76,7 @@ void perf_aicpu_switch_buffer(Runtime* runtime, int core_id, int thread_idx);
  * @param cur_thread_cores Array of core IDs managed by this thread
  * @param core_num Number of cores managed by this thread
  */
-void perf_aicpu_flush_buffers(Runtime* runtime,
-                               int thread_idx,
-                               const int* cur_thread_cores,
-                               int core_num);
+void perf_aicpu_flush_buffers(Runtime* runtime, int thread_idx, const int* cur_thread_cores, int core_num);
 
 /**
  * Update total task count in performance header
@@ -118,9 +115,11 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, in
  * @param tasks_processed Number of tasks processed in this phase
  */
 void perf_aicpu_record_phase(int thread_idx,
-                              AicpuPhaseId phase_id,
-                              uint64_t start_time, uint64_t end_time,
-                              uint32_t loop_iter, uint32_t tasks_processed);
+    AicpuPhaseId phase_id,
+    uint64_t start_time,
+    uint64_t end_time,
+    uint32_t loop_iter,
+    uint32_t tasks_processed);
 
 /**
  * Write orchestrator cumulative summary
@@ -154,9 +153,8 @@ void perf_aicpu_set_orch_thread_idx(int thread_idx);
  * @param submit_idx Task submission index (acts as loop_iter)
  * @param task_id Task ID (stored in tasks_processed field for task tracking)
  */
-void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
-                                   uint64_t start_time, uint64_t end_time,
-                                   uint32_t submit_idx, uint32_t task_id);
+void perf_aicpu_record_orch_phase(
+    AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint32_t task_id);
 
 /**
  * Write core-to-thread assignment mapping to shared memory
@@ -170,9 +168,9 @@ void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
  * @param total_cores Total number of cores
  */
 void perf_aicpu_write_core_assignments(const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD],
-                                        const int* core_counts,
-                                        int num_threads,
-                                        int total_cores);
+    const int* core_counts,
+    int num_threads,
+    int total_cores);
 
 /**
  * Flush remaining phase records for a thread

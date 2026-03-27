@@ -19,22 +19,21 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-static __aicore__ void qk_matmul_impl(__gm__ uint8_t* qi_raw, __gm__ uint8_t* kj_raw, __gm__ uint8_t* sij_raw)
-{
+static __aicore__ void qk_matmul_impl(__gm__ uint8_t* qi_raw, __gm__ uint8_t* kj_raw, __gm__ uint8_t* sij_raw) {
     constexpr int M = 16, K = 16, N = 16;
 
-    __gm__ half* qi  = reinterpret_cast<__gm__ half*>(qi_raw);
-    __gm__ half* kj  = reinterpret_cast<__gm__ half*>(kj_raw);
-    __gm__ float*      sij = reinterpret_cast<__gm__ float*>(sij_raw);
+    __gm__ half* qi = reinterpret_cast<__gm__ half*>(qi_raw);
+    __gm__ half* kj = reinterpret_cast<__gm__ half*>(kj_raw);
+    __gm__ float* sij = reinterpret_cast<__gm__ float*>(sij_raw);
 
     // qi (M, K) fp16 in ND (row-major) layout
-    using GlobalA   = GlobalTensor<half, Shape<1, 1, 1, M, K>, Stride<M*K, M*K, M*K, K, 1>>;
+    using GlobalA = GlobalTensor<half, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
     // kj stored as (N, K) row-major = (K, N) column-major -> DN layout
-    using GlobalB   = GlobalTensor<half, Shape<1, 1, 1, K, N>, Stride<K*N, K*N, K*N, 1, K>, Layout::DN>;
-    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<M*N, M*N, M*N, N, 1>>;
+    using GlobalB = GlobalTensor<half, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, 1, K>, Layout::DN>;
+    using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<M * N, M * N, M * N, N, 1>>;
 
-    GlobalA   qiGlobal(qi);
-    GlobalB   kjGlobal(kj);
+    GlobalA qiGlobal(qi);
+    GlobalB kjGlobal(kj);
     GlobalOut sijGlobal(sij);
 
     // L1 Mat tiles: A is standard ND, B uses transposed-B pattern (RowMajor/ColMajor)
@@ -42,18 +41,18 @@ static __aicore__ void qk_matmul_impl(__gm__ uint8_t* qi_raw, __gm__ uint8_t* kj
     using TileMatB = Tile<TileType::Mat, half, K, N, BLayout::RowMajor, K, N, SLayout::ColMajor, 512>;
 
     // L0 tiles
-    using LeftTile  = TileLeft<half, M, K, M, K>;
+    using LeftTile = TileLeft<half, M, K, M, K>;
     using RightTile = TileRight<half, K, N, K, N>;
-    using AccTile   = TileAcc<float, M, N, M, N>;
+    using AccTile = TileAcc<float, M, N, M, N>;
 
     TileMatA aMatTile;
     TileMatB bMatTile;
     TASSIGN(aMatTile, 0x0);
     TASSIGN(bMatTile, 0x20000);
 
-    LeftTile  aTile;
+    LeftTile aTile;
     RightTile bTile;
-    AccTile   cTile;
+    AccTile cTile;
     TASSIGN(aTile, 0x0);
     TASSIGN(bTile, 0x0);
     TASSIGN(cTile, 0x0);
@@ -81,10 +80,9 @@ static __aicore__ void qk_matmul_impl(__gm__ uint8_t* qi_raw, __gm__ uint8_t* kj
     TSTORE(sijGlobal, cTile);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args)
-{
-    __gm__ uint8_t* qi  = reinterpret_cast<__gm__ uint8_t*>(args[0]);
-    __gm__ uint8_t* kj  = reinterpret_cast<__gm__ uint8_t*>(args[1]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
+    __gm__ uint8_t* qi = reinterpret_cast<__gm__ uint8_t*>(args[0]);
+    __gm__ uint8_t* kj = reinterpret_cast<__gm__ uint8_t*>(args[1]);
     __gm__ uint8_t* sij = reinterpret_cast<__gm__ uint8_t*>(args[2]);
 
     qk_matmul_impl(qi, kj, sij);

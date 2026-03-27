@@ -10,7 +10,12 @@ from typing import List, Optional, Tuple
 
 from bindings import get_incore_compiler, get_orchestration_compiler
 from toolchain import (
-    Toolchain, ToolchainType, CCECToolchain, Gxx15Toolchain, GxxToolchain, Aarch64GxxToolchain,
+    Toolchain,
+    ToolchainType,
+    CCECToolchain,
+    Gxx15Toolchain,
+    GxxToolchain,
+    Aarch64GxxToolchain,
 )
 import env_manager
 
@@ -104,11 +109,15 @@ class KernelCompiler:
         else:
             arch = "a2a3"
 
-        runtime_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "runtime")
+        runtime_dir = str(
+            self.project_root / "src" / arch / "runtime" / runtime_name / "runtime"
+        )
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
         return [runtime_dir, common_dir] + self.get_platform_include_dirs()
 
-    def _get_orchestration_config(self, runtime_name: str) -> Tuple[List[str], List[str]]:
+    def _get_orchestration_config(
+        self, runtime_name: str
+    ) -> Tuple[List[str], List[str]]:
         """
         Load the optional "orchestration" section from a runtime's build_config.py.
 
@@ -130,7 +139,14 @@ class KernelCompiler:
         else:
             arch = "a2a3"
 
-        config_path = self.project_root / "src" / arch / "runtime" / runtime_name / "build_config.py"
+        config_path = (
+            self.project_root
+            / "src"
+            / arch
+            / "runtime"
+            / runtime_name
+            / "build_config.py"
+        )
         if not config_path.is_file():
             return [], []
 
@@ -146,8 +162,7 @@ class KernelCompiler:
         config_dir = config_path.parent
 
         include_dirs = [
-            str((config_dir / p).resolve())
-            for p in orch_cfg.get("include_dirs", [])
+            str((config_dir / p).resolve()) for p in orch_cfg.get("include_dirs", [])
         ]
 
         source_files = []
@@ -161,13 +176,10 @@ class KernelCompiler:
         return include_dirs, source_files
 
     def _run_subprocess(
-        self,
-        cmd: List[str],
-        label: str,
-        error_hint: str = "Compiler not found"
+        self, cmd: List[str], label: str, error_hint: str = "Compiler not found"
     ) -> subprocess.CompletedProcess:
         """Run a subprocess command with standardized logging and error handling."""
-        logger.debug(f"[{label}] Command: {' '.join(cmd)}")        
+        logger.debug(f"[{label}] Command: {' '.join(cmd)}")
         try:
             result = subprocess.run(cmd, capture_output=True, text=True)
 
@@ -217,12 +229,14 @@ class KernelCompiler:
                 f"Compilation succeeded but output file not found: {output_path}"
             )
 
-        with open(output_path, 'rb') as f:
+        with open(output_path, "rb") as f:
             binary_data = f.read()
 
         if delete_output:
             os.remove(output_path)
-        logger.info(f"[{label}] Compilation {output_path} successful: {len(binary_data)} bytes")
+        logger.info(
+            f"[{label}] Compilation {output_path} successful: {len(binary_data)} bytes"
+        )
         return binary_data
 
     def _get_toolchain(self, strategy_fn, fallback_map: dict) -> ToolchainType:
@@ -248,13 +262,17 @@ class KernelCompiler:
             return fallback_map[self.platform]
 
     @staticmethod
-    def _make_temp_path(prefix: str, suffix: str, build_dir: Optional[str]=None) -> str:
+    def _make_temp_path(
+        prefix: str, suffix: str, build_dir: Optional[str] = None
+    ) -> str:
         """Create a unique temporary file path in /tmp via mkstemp.
 
         The file is created atomically to avoid races, then immediately
         closed so the caller can overwrite it with compiler output.
         """
-        fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=build_dir or "/tmp")
+        fd, path = tempfile.mkstemp(
+            prefix=prefix, suffix=suffix, dir=build_dir or "/tmp"
+        )
         os.close(fd)
         return path
 
@@ -292,8 +310,8 @@ class KernelCompiler:
                 "a2a3": ToolchainType.CCEC,
                 "a2a3sim": ToolchainType.HOST_GXX_15,
                 "a5": ToolchainType.CCEC,  # Phase 1: A5 uses same as A2A3
-                "a5sim": ToolchainType.HOST_GXX_15  # Phase 1: A5sim uses same as A2A3sim
-            }
+                "a5sim": ToolchainType.HOST_GXX_15,  # Phase 1: A5sim uses same as A2A3sim
+            },
         )
 
         # Dispatch based on toolchain
@@ -320,7 +338,8 @@ class KernelCompiler:
         output_path = self._make_temp_path(
             prefix=f"{os.path.basename(source_path)}.incore_",
             suffix=".o",
-            build_dir=build_dir)
+            build_dir=build_dir,
+        )
 
         # Build command from toolchain
         cmd = [self.ccec.cxx_path] + self.ccec.get_compile_flags(core_type=core_type)
@@ -338,7 +357,9 @@ class KernelCompiler:
         logger.debug(f"  Command: {' '.join(cmd)}")
 
         return self._compile_to_bytes(
-            cmd, output_path, "Incore",
+            cmd,
+            output_path,
+            "Incore",
             error_hint=f"ccec compiler not found at {self.ccec.cxx_path}",
             delete_output=build_dir is None,
         )
@@ -386,16 +407,21 @@ class KernelCompiler:
                 "a2a3": ToolchainType.AARCH64_GXX,
                 "a2a3sim": ToolchainType.HOST_GXX,
                 "a5": ToolchainType.AARCH64_GXX,  # Phase 1: A5 uses same as A2A3
-                "a5sim": ToolchainType.HOST_GXX  # Phase 1: A5sim uses same as A2A3sim
-            }
+                "a5sim": ToolchainType.HOST_GXX,  # Phase 1: A5sim uses same as A2A3sim
+            },
         )
-        toolchain = self.aarch64 if toolchain_type == ToolchainType.AARCH64_GXX else self.host_gxx
+        toolchain = (
+            self.aarch64
+            if toolchain_type == ToolchainType.AARCH64_GXX
+            else self.host_gxx
+        )
 
         # HOST_GXX: simulation build (host execution)
         # AARCH64_GXX: cross-compilation for supported runtimes
         #   Note: orchestration uses ops table via pto_orchestration_api.h (no extra runtime sources needed)
         return self._compile_orchestration_shared_lib(
-            source_path, toolchain,
+            source_path,
+            toolchain,
             extra_include_dirs=include_dirs,
             extra_sources=orch_sources or None,
             build_dir=build_dir,
@@ -430,7 +456,8 @@ class KernelCompiler:
         output_path = self._make_temp_path(
             prefix=f"{os.path.basename(source_path)}.orch_",
             suffix=".so",
-            build_dir=build_dir)
+            build_dir=build_dir,
+        )
 
         cmd = [toolchain.cxx_path] + toolchain.get_compile_flags()
 
@@ -459,7 +486,9 @@ class KernelCompiler:
         logger.debug(f"  Command: {' '.join(cmd)}")
 
         return self._compile_to_bytes(
-            cmd, output_path, "Orchestration",
+            cmd,
+            output_path,
+            "Orchestration",
             error_hint=f"{toolchain.cxx_path} not found. Please install it.",
             delete_output=build_dir is None,
         )
@@ -495,7 +524,8 @@ class KernelCompiler:
         output_path = self._make_temp_path(
             prefix=f"{os.path.basename(source_path)}.sim_",
             suffix=ext,
-            build_dir=build_dir)
+            build_dir=build_dir,
+        )
 
         # Build command from toolchain
         cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags()
@@ -518,7 +548,9 @@ class KernelCompiler:
         logger.debug(f"  Command: {' '.join(cmd)}")
 
         return self._compile_to_bytes(
-            cmd, output_path, "SimKernel",
+            cmd,
+            output_path,
+            "SimKernel",
             error_hint=f"{self.gxx15.cxx_path} not found. Please install g++-15.",
             delete_output=build_dir is None,
         )

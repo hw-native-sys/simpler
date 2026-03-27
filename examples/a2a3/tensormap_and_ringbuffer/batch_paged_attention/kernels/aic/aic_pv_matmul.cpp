@@ -21,8 +21,7 @@ using namespace pto;
 #endif
 
 template <int M, int K, int N>
-static __aicore__ void pv_matmul_batch_impl(
-    __gm__ Tensor* pij_batch,
+static __aicore__ void pv_matmul_batch_impl(__gm__ Tensor* pij_batch,
     __gm__ Tensor* value_cache,
     __gm__ Tensor* oi_new_batch,
     uint64_t block_table_ptr,
@@ -30,7 +29,6 @@ static __aicore__ void pv_matmul_batch_impl(
     uint64_t block_idx,
     uint64_t block_num,
     uint64_t batch_start) {
-
     __gm__ half* pij_base = reinterpret_cast<__gm__ half*>(pij_batch->buffer.addr);
     __gm__ half* val_base = reinterpret_cast<__gm__ half*>(value_cache->buffer.addr);
     __gm__ float* oi_base = reinterpret_cast<__gm__ float*>(oi_new_batch->buffer.addr);
@@ -106,6 +104,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t batch_start = static_cast<uint64_t>(args[7]);
 
     pv_matmul_batch_impl<16, 16, 16>(
-        pij_batch, value_cache, oi_new_batch,
-        block_table_ptr, batch_count, block_idx, block_num, batch_start);
+        pij_batch, value_cache, oi_new_batch, block_table_ptr, batch_count, block_idx, block_num, batch_start);
 }

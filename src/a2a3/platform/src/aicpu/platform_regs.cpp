@@ -22,17 +22,12 @@
 
 static uint64_t g_platform_regs = 0;
 
-void set_platform_regs(uint64_t regs) {
-    g_platform_regs = regs;
-}
+void set_platform_regs(uint64_t regs) { g_platform_regs = regs; }
 
-uint64_t get_platform_regs() {
-    return g_platform_regs;
-}
+uint64_t get_platform_regs() { return g_platform_regs; }
 
 uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
-    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(
-        reg_base_addr + reg_offset(reg));
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(reg_base_addr + reg_offset(reg));
 
     __sync_synchronize();
 
@@ -45,8 +40,7 @@ uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
 }
 
 void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
-    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(
-        reg_base_addr + reg_offset(reg));
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(reg_base_addr + reg_offset(reg));
 
     __sync_synchronize();
 

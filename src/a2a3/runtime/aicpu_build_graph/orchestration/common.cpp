@@ -17,8 +17,7 @@
  * 如果存在内联，同时通过 inline_chain 返回外层调用链
  */
 #ifdef __linux__
-static std::string addr_to_line(const char* executable, void* addr,
-                                std::string* inline_chain = nullptr) {
+static std::string addr_to_line(const char* executable, void* addr, std::string* inline_chain = nullptr) {
     char cmd[512];
     snprintf(cmd, sizeof(cmd), "addr2line -e %s -f -C -p -i %p 2>/dev/null", executable, addr);
 
@@ -140,7 +139,9 @@ static std::string build_assert_message(const char* condition, const char* file,
 
 AssertionError::AssertionError(const char* condition, const char* file, int line)
     : std::runtime_error(build_assert_message(condition, file, line)),
-      condition_(condition), file_(file), line_(line) {}
+      condition_(condition),
+      file_(file),
+      line_(line) {}
 
 [[noreturn]] void assert_impl(const char* condition, const char* file, int line) {
     fprintf(stderr, "\n========================================\n");

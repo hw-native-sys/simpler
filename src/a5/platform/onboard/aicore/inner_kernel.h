@@ -68,9 +68,7 @@ __aicore__ inline void write_reg(RegId reg, uint64_t value) {
  *
  * @return Physical core ID (masked to 12 bits)
  */
-__aicore__ inline uint32_t get_physical_core_id() {
-    return static_cast<uint32_t>(get_coreid()) & AICORE_COREID_MASK;
-}
+__aicore__ inline uint32_t get_physical_core_id() { return static_cast<uint32_t>(get_coreid()) & AICORE_COREID_MASK; }
 
 // =============================================================================
 // System Counter
@@ -81,8 +79,6 @@ __aicore__ inline uint32_t get_physical_core_id() {
  *
  * @return Hardware counter value (ticks)
  */
-__aicore__ __attribute__((always_inline)) inline uint64_t get_sys_cnt_aicore() {
-    return get_sys_cnt();
-}
+__aicore__ __attribute__((always_inline)) inline uint64_t get_sys_cnt_aicore() { return get_sys_cnt(); }
 
 #endif  // PLATFORM_A5_AICORE_INNER_KERNEL_H_

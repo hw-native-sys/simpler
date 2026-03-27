@@ -82,15 +82,15 @@ size_t get_runtime_size(void);
  * @return 0 on success, -1 on failure
  */
 int init_runtime(RuntimeHandle runtime,
-                const uint8_t* orch_so_binary,
-                size_t orch_so_size,
-                const char* orch_func_name,
-                const struct TaskArg* orch_args,
-                int orch_args_count,
-                const int* kernel_func_ids,
-                const uint8_t* const* kernel_binaries,
-                const size_t* kernel_sizes,
-                int kernel_count);
+    const uint8_t* orch_so_binary,
+    size_t orch_so_size,
+    const char* orch_func_name,
+    const struct TaskArg* orch_args,
+    int orch_args_count,
+    const int* kernel_func_ids,
+    const uint8_t* const* kernel_binaries,
+    const size_t* kernel_sizes,
+    int kernel_count);
 
 /* ===========================================================================
  * Device Memory API (for use by orchestration functions)
@@ -203,11 +203,7 @@ int set_device(int device_id);
  * @param dev_ptr   Device memory pointer
  * @param size      Size of tensor in bytes
  */
-void record_tensor_pair(RuntimeHandle runtime,
-                       void* host_ptr,
-                       void* dev_ptr,
-                       size_t size);
-
+void record_tensor_pair(RuntimeHandle runtime, void* host_ptr, void* dev_ptr, size_t size);
 
 /**
  * Enable or disable performance profiling for swimlane visualization.

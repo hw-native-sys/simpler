@@ -223,4 +223,3 @@ Final validation:
 3. Per-cluster concurrent capacity is lane-occupancy-driven, not a fixed constant.
 4. Submit-contract types live in one shared header-only surface.
 5. Resource-aware dispatch heuristics are allowed without a strict starvation-free guarantee.
-

@@ -68,17 +68,11 @@ void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
     LOG_INFO("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
 }
 
-TensorPair* Runtime::get_tensor_pairs() {
-    return tensor_pairs;
-}
+TensorPair* Runtime::get_tensor_pairs() { return tensor_pairs; }
 
-int Runtime::get_tensor_pair_count() const {
-    return tensor_pair_count;
-}
+int Runtime::get_tensor_pair_count() const { return tensor_pair_count; }
 
-void Runtime::clear_tensor_pairs() {
-    tensor_pair_count = 0;
-}
+void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }
 
 // =============================================================================
 // Device orchestration
@@ -124,9 +118,7 @@ const void* Runtime::get_device_orch_so_data() const {
     return device_orch_so_size_ > 0 ? device_orch_so_storage_ : nullptr;
 }
 
-size_t Runtime::get_device_orch_so_size() const {
-    return device_orch_so_size_;
-}
+size_t Runtime::get_device_orch_so_size() const { return device_orch_so_size_; }
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;
@@ -142,15 +134,11 @@ void Runtime::set_function_bin_addr(int func_id, uint64_t addr) {
     }
 }
 
-int Runtime::get_registered_kernel_count() const {
-    return registered_kernel_count_;
-}
+int Runtime::get_registered_kernel_count() const { return registered_kernel_count_; }
 
 int Runtime::get_registered_kernel_func_id(int index) const {
     if (index < 0 || index >= registered_kernel_count_) return -1;
     return registered_kernel_func_ids_[index];
 }
 
-void Runtime::clear_registered_kernels() {
-    registered_kernel_count_ = 0;
-}
+void Runtime::clear_registered_kernels() { registered_kernel_count_ = 0; }

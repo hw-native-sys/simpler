@@ -31,11 +31,7 @@ static __aicore__ inline int get_num_tiles(__gm__ Tensor* tensor, uint64_t tile_
 }
 
 template <int ROWS, int COLS>
-static __aicore__ void add_impl(
-    __gm__ float* src0,
-    __gm__ float* src1,
-    __gm__ float* out) {
-
+static __aicore__ void add_impl(__gm__ float* src0, __gm__ float* src1, __gm__ float* out) {
     using DynShapeDim5 = Shape<1, 1, 1, ROWS, COLS>;
     using DynStridDim5 = Stride<1, 1, 1, COLS, 1>;
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;

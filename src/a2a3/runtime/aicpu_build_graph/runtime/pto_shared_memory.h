@@ -50,9 +50,9 @@ struct PTO2RingFlowControl {
     int32_t _pad0;                            // Alignment padding
 
     // Written by Scheduler, Read by Orchestrator (for back-pressure)
-    std::atomic<uint64_t> heap_tail;          // Heap ring free pointer
-    std::atomic<int32_t> last_task_alive;     // Task ring tail (oldest active task)
-    int32_t _pad1;                            // Alignment padding
+    std::atomic<uint64_t> heap_tail;       // Heap ring free pointer
+    std::atomic<int32_t> last_task_alive;  // Task ring tail (oldest active task)
+    int32_t _pad1;                         // Alignment padding
 
     void init() {
         heap_top.store(0, std::memory_order_relaxed);
@@ -86,7 +86,7 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
     PTO2SharedMemoryRingHeader rings[PTO2_MAX_RING_DEPTH];
 
     // === GLOBAL FIELDS ===
-    std::atomic<int32_t> orchestrator_done;   // Flag: orchestration complete
+    std::atomic<int32_t> orchestrator_done;  // Flag: orchestration complete
 
     // Total shared memory size (for validation)
     uint64_t total_size;
@@ -104,13 +104,13 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
 
     // Scheduler error state (Scheduler → Host, independent of orchestrator)
     // Written by scheduler threads on timeout; read by orchestrator and host.
-    std::atomic<int32_t> sched_error_bitmap;   // Bit X set = thread X had error
-    std::atomic<int32_t> sched_error_code;     // Last scheduler error code (last-writer-wins)
-    std::atomic<int32_t> sched_error_thread;   // Thread index of last error writer
+    std::atomic<int32_t> sched_error_bitmap;  // Bit X set = thread X had error
+    std::atomic<int32_t> sched_error_code;    // Last scheduler error code (last-writer-wins)
+    std::atomic<int32_t> sched_error_thread;  // Thread index of last error writer
 };
 
 static_assert(sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0,
-              "PTO2SharedMemoryHeader must be aligned to cache line (PTO2_ALIGN_SIZE)");
+    "PTO2SharedMemoryHeader must be aligned to cache line (PTO2_ALIGN_SIZE)");
 
 // =============================================================================
 // Shared Memory Handle
@@ -121,17 +121,16 @@ static_assert(sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0,
  * Provides both Orchestrator and Scheduler views of the same memory
  */
 struct PTO2SharedMemoryHandle {
-    void*   sm_base;              // Base address of shared memory
-    uint64_t sm_size;             // Total size of shared memory
+    void* sm_base;     // Base address of shared memory
+    uint64_t sm_size;  // Total size of shared memory
 
     // Quick pointers into shared memory regions (per-ring)
     PTO2SharedMemoryHeader* header;
-    PTO2TaskDescriptor*     task_descriptors[PTO2_MAX_RING_DEPTH];
-    PTO2TaskPayload*        task_payloads[PTO2_MAX_RING_DEPTH];
+    PTO2TaskDescriptor* task_descriptors[PTO2_MAX_RING_DEPTH];
+    PTO2TaskPayload* task_payloads[PTO2_MAX_RING_DEPTH];
 
     // Ownership flag
-    bool    is_owner;             // True if this handle allocated the memory
-
+    bool is_owner;  // True if this handle allocated the memory
 };
 
 // =============================================================================
@@ -161,8 +160,7 @@ uint64_t pto2_sm_calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_M
  * @param heap_size         Heap size per ring for output buffers
  * @return Handle with both views, or NULL on failure
  */
-PTO2SharedMemoryHandle* pto2_sm_create(uint64_t task_window_size,
-                                        uint64_t heap_size);
+PTO2SharedMemoryHandle* pto2_sm_create(uint64_t task_window_size, uint64_t heap_size);
 
 /**
  * Create shared memory with default sizes
@@ -179,10 +177,8 @@ PTO2SharedMemoryHandle* pto2_sm_create_default(void);
  * @param heap_size          Heap size per ring (for layout; buffer has no heap region)
  * @return Handle, or NULL on failure
  */
-PTO2SharedMemoryHandle* pto2_sm_create_from_buffer(void* sm_base,
-                                                    uint64_t sm_size,
-                                                    uint64_t task_window_size,
-                                                    uint64_t heap_size);
+PTO2SharedMemoryHandle* pto2_sm_create_from_buffer(
+    void* sm_base, uint64_t sm_size, uint64_t task_window_size, uint64_t heap_size);
 
 /**
  * Destroy shared memory and free resources
@@ -193,15 +189,12 @@ void pto2_sm_destroy(PTO2SharedMemoryHandle* handle);
  * Initialize shared memory header with layout information
  * Called after memory is allocated
  */
-void pto2_sm_init_header(PTO2SharedMemoryHandle* handle,
-                          uint64_t task_window_size,
-                          uint64_t heap_size);
+void pto2_sm_init_header(PTO2SharedMemoryHandle* handle, uint64_t task_window_size, uint64_t heap_size);
 
 /**
  * Initialize shared memory header with per-ring layout information.
  */
-void pto2_sm_init_header_per_ring(
-    PTO2SharedMemoryHandle* handle,
+void pto2_sm_init_header_per_ring(PTO2SharedMemoryHandle* handle,
     const uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH],
     const uint64_t heap_sizes[PTO2_MAX_RING_DEPTH]);
 
@@ -224,4 +217,4 @@ bool pto2_sm_validate(PTO2SharedMemoryHandle* handle);
 }
 #endif
 
-#endif // PTO_SHARED_MEMORY_H
+#endif  // PTO_SHARED_MEMORY_H

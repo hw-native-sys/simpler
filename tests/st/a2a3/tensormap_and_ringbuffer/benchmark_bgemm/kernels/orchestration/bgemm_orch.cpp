@@ -23,20 +23,19 @@
 #include "pto_orchestration_api.h"
 
 #define FUNC_GEMM_TILE 0
-#define FUNC_TILE_ADD  1
+#define FUNC_TILE_ADD 1
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 4,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
@@ -58,7 +57,12 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     int grid_n = 1;
 
     LOG_INFO("[bgemm_orch] tile_size: %d, grid_m: %d, grid_n: %d, grid_k: %d, num_groups: %d, incore_loop: %d",
-             tile_size, grid_m, grid_n, grid_k, num_groups, incore_loop);
+        tile_size,
+        grid_m,
+        grid_n,
+        grid_k,
+        num_groups,
+        incore_loop);
 
     uint32_t tile_shapes[1] = {(uint32_t)tile_elems};
     uint64_t group_tile_elems = (uint64_t)incore_loop * tile_elems;
@@ -79,8 +83,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         for (int k_idx = 0; k_idx < grid_k; k_idx++) {
             // In layout [num_groups, grid_k, incore_loop, tile_size, tile_size],
             // offset = (group_idx * grid_k + k_idx) * incore_loop * tile_elems
-            uint64_t ab_offset =
-                ((uint64_t)group_idx * grid_k + (uint64_t)k_idx) * group_tile_elems;
+            uint64_t ab_offset = ((uint64_t)group_idx * grid_k + (uint64_t)k_idx) * group_tile_elems;
 
             uint32_t a_view_offsets[1] = {(uint32_t)ab_offset};
             Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
@@ -106,7 +109,9 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     }
 
     LOG_INFO("[bgemm_orch] Submitted %d gemm tasks and %d add tasks (%d total)",
-             total_gemm, total_add, total_gemm + total_add);
+        total_gemm,
+        total_add,
+        total_gemm + total_add);
 }
 
 }  // extern "C"

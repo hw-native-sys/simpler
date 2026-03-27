@@ -36,13 +36,8 @@
  * @param start_time Start timestamp
  * @param end_time End timestamp
  */
-__aicore__ __attribute__((always_inline))
-static inline void perf_aicore_record_task(
-    __gm__ PerfBuffer* perf_buf,
-    uint32_t task_id,
-    uint64_t start_time,
-    uint64_t end_time) {
-
+__aicore__ __attribute__((always_inline)) static inline void perf_aicore_record_task(
+    __gm__ PerfBuffer* perf_buf, uint32_t task_id, uint64_t start_time, uint64_t end_time) {
     // Read current buffer count (AICPU owns the count, AICore reads only)
     dcci(&perf_buf->count, SINGLE_CACHE_LINE);
     uint32_t idx = perf_buf->count;

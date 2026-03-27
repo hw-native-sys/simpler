@@ -44,9 +44,17 @@
 #include <sched.h>
 
 #if defined(__aarch64__)
-#define SPIN_WAIT_HINT() do { __asm__ volatile("yield" ::: "memory"); sched_yield(); } while(0)
+#define SPIN_WAIT_HINT()                        \
+    do {                                        \
+        __asm__ volatile("yield" ::: "memory"); \
+        sched_yield();                          \
+    } while (0)
 #elif defined(__x86_64__)
-#define SPIN_WAIT_HINT() do { __builtin_ia32_pause(); sched_yield(); } while(0)
+#define SPIN_WAIT_HINT()        \
+    do {                        \
+        __builtin_ia32_pause(); \
+        sched_yield();          \
+    } while (0)
 #else
 #define SPIN_WAIT_HINT() sched_yield()
 #endif
@@ -79,17 +87,14 @@
  */
 inline uint64_t get_sys_cnt_aicore() {
     auto now = std::chrono::high_resolution_clock::now();
-    uint64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-        now.time_since_epoch()
-    ).count();
+    uint64_t elapsed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(now.time_since_epoch()).count();
 
     // Convert nanoseconds to counter ticks
     constexpr uint64_t kNsPerSec = std::nano::den;
     uint64_t seconds = elapsed_ns / kNsPerSec;
     uint64_t remaining_ns = elapsed_ns % kNsPerSec;
 
-    uint64_t ticks = seconds * PLATFORM_PROF_SYS_CNT_FREQ +
-                     (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
+    uint64_t ticks = seconds * PLATFORM_PROF_SYS_CNT_FREQ + (remaining_ns * PLATFORM_PROF_SYS_CNT_FREQ) / kNsPerSec;
 
     return ticks;
 }
@@ -121,8 +126,7 @@ extern thread_local uint32_t g_sim_physical_core_id;
  */
 inline uint64_t read_reg(RegId reg) {
     uint32_t offset = reg_offset(reg);
-    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(
-        sparse_reg_ptr(g_sim_reg_base, offset));
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(sparse_reg_ptr(g_sim_reg_base, offset));
 
     FULL_MEMORY_BARRIER();
     return static_cast<uint64_t>(*ptr);
@@ -138,8 +142,7 @@ inline uint64_t read_reg(RegId reg) {
  */
 inline void write_reg(RegId reg, uint64_t value) {
     uint32_t offset = reg_offset(reg);
-    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(
-        sparse_reg_ptr(g_sim_reg_base, offset));
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(sparse_reg_ptr(g_sim_reg_base, offset));
 
     *ptr = static_cast<uint32_t>(value);
     FULL_MEMORY_BARRIER();
@@ -150,8 +153,6 @@ inline void write_reg(RegId reg, uint64_t value) {
  *
  * @return Physical core ID for the current simulated core
  */
-inline uint32_t get_physical_core_id() {
-    return g_sim_physical_core_id;
-}
+inline uint32_t get_physical_core_id() { return g_sim_physical_core_id; }
 
 #endif  // PLATFORM_A5SIM_AICORE_INNER_KERNEL_H_

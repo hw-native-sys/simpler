@@ -38,13 +38,11 @@ using namespace pto;
 #endif
 
 template <int M, int K, int N>
-static __aicore__ void pv_matmul_n_impl(
-    __gm__ bfloat16_t* pij_base,
+static __aicore__ void pv_matmul_n_impl(__gm__ bfloat16_t* pij_base,
     __gm__ bfloat16_t* val_base,
     __gm__ float* oi_base,
     uint64_t n_blocks,
     __gm__ int32_t* block_table) {
-
     using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, pto::Stride<M * K, M * K, M * K, K, 1>>;
     using GlobalB = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, pto::Stride<K * N, K * N, K * N, N, 1>>;
     using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<M * N, M * N, M * N, N, 1>>;
@@ -96,9 +94,9 @@ static __aicore__ void pv_matmul_n_impl(
         // Wait for MTE1 to release L1[cur] (reverse dep from previous iteration)
         wait_flag(PIPE_MTE1, PIPE_MTE2, (event_t)cur);
         TLOAD(aMatTile[cur], pijGlobal);
-        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);   // forward: A in L1 ready
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);  // forward: A in L1 ready
         TLOAD(bMatTile[cur], vjGlobal);
-        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);   // forward: B in L1 ready
+        set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);  // forward: B in L1 ready
 
         // Stage 2: TMOV (MTE1: L1[cur] → L0[cur])
         // Wait for M-pipe to release L0[cur] (reverse dep from previous iteration)
@@ -107,17 +105,17 @@ static __aicore__ void pv_matmul_n_impl(
         TMOV(aTile[cur], aMatTile[cur]);
         wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);  // forward: wait B loaded
         TMOV(bTile[cur], bMatTile[cur]);
-        set_flag(PIPE_MTE1, PIPE_MTE2, (event_t)cur); // reverse: release L1[cur]
+        set_flag(PIPE_MTE1, PIPE_MTE2, (event_t)cur);  // reverse: release L1[cur]
 
         // Stage 3: TMATMUL (M-pipe: L0A[cur] × L0B[cur] → L0C)
-        set_flag(PIPE_MTE1, PIPE_M, (event_t)cur);   // forward: L0[cur] ready
+        set_flag(PIPE_MTE1, PIPE_M, (event_t)cur);  // forward: L0[cur] ready
         wait_flag(PIPE_MTE1, PIPE_M, (event_t)cur);
         if (i == 0) {
             TMATMUL(cTile, aTile[cur], bTile[cur]);
         } else {
             TMATMUL_ACC(cTile, cTile, aTile[cur], bTile[cur]);
         }
-        set_flag(PIPE_M, PIPE_MTE1, (event_t)cur);   // reverse: release L0[cur]
+        set_flag(PIPE_M, PIPE_MTE1, (event_t)cur);  // reverse: release L0[cur]
     }
 
     // Drain outstanding reverse-dependency flags

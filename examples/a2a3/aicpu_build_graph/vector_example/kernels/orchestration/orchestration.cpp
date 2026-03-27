@@ -29,16 +29,15 @@ static uint64_t float_to_u64(float f) {
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 

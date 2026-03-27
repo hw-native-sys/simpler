@@ -28,7 +28,9 @@ class BuildTarget:
     def get_binary_name(self) -> str:
         return self._binary_name
 
-    def gen_cmake_args(self, include_dirs: List[str], source_dirs: List[str]) -> List[str]:
+    def gen_cmake_args(
+        self, include_dirs: List[str], source_dirs: List[str]
+    ) -> List[str]:
         """Generate CMake arguments list from toolchain args + custom directories."""
         inc = ";".join(os.path.abspath(d) for d in include_dirs)
         src = ";".join(os.path.abspath(d) for d in source_dirs)
@@ -56,6 +58,7 @@ class RuntimeCompiler:
 
     Use get_instance() to get a cached instance per platform.
     """
+
     _instances = {}
 
     @classmethod
@@ -71,20 +74,24 @@ class RuntimeCompiler:
 
         # Map platform name to architecture path
         if platform == "a2a3":
-            self.platform_dir = self.project_root / "src" / "a2a3" / "platform" / "onboard"
+            self.platform_dir = (
+                self.project_root / "src" / "a2a3" / "platform" / "onboard"
+            )
         elif platform == "a2a3sim":
             self.platform_dir = self.project_root / "src" / "a2a3" / "platform" / "sim"
         elif platform == "a5":
-            self.platform_dir = self.project_root / "src" / "a5" / "platform" / "onboard"
+            self.platform_dir = (
+                self.project_root / "src" / "a5" / "platform" / "onboard"
+            )
         elif platform == "a5sim":
             self.platform_dir = self.project_root / "src" / "a5" / "platform" / "sim"
         else:
-            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(
+                f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim"
+            )
 
         if not self.platform_dir.is_dir():
-            raise ValueError(
-                f"Platform '{platform}' not found at {self.platform_dir}"
-            )
+            raise ValueError(f"Platform '{platform}' not found at {self.platform_dir}")
 
         if platform == "a2a3":
             self._init_a2a3()
@@ -95,7 +102,9 @@ class RuntimeCompiler:
         elif platform == "a5sim":
             self._init_a5sim()
         else:
-            raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(
+                f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim"
+            )
 
     def _init_a2a3(self):
         """Initialize toolchains for real a2a3 hardware."""
@@ -181,20 +190,20 @@ class RuntimeCompiler:
 
     def _ensure_host_compilers(self):
         if not self._find_executable("gcc"):
-            raise FileNotFoundError("Host C compiler not found: gcc. Please install gcc.")
+            raise FileNotFoundError(
+                "Host C compiler not found: gcc. Please install gcc."
+            )
         if not self._find_executable("g++"):
-            raise FileNotFoundError("Host C++ compiler not found: g++. Please install g++.")
+            raise FileNotFoundError(
+                "Host C++ compiler not found: g++. Please install g++."
+            )
 
     @staticmethod
     def _find_executable(name: str) -> bool:
         """Check if an executable exists (either as absolute path or in PATH)."""
         if os.path.isfile(name) and os.access(name, os.X_OK):
             return True
-        result = subprocess.run(
-            ["which", name],
-            capture_output=True,
-            timeout=1
-        )
+        result = subprocess.run(["which", name], capture_output=True, timeout=1)
         return result.returncode == 0
 
     def compile(
@@ -246,11 +255,16 @@ class RuntimeCompiler:
                 platform=platform,
                 build_dir=build_dir,
             )
+
         if build_dir is None:
-            with tempfile.TemporaryDirectory(prefix=f"{platform.lower()}_build_", dir="/tmp") as build_dir:
+            with tempfile.TemporaryDirectory(
+                prefix=f"{platform.lower()}_build_", dir="/tmp"
+            ) as build_dir:
                 return _build(build_dir)
         else:
-            platform_build_dir = Path(os.path.realpath(build_dir)) / f"{platform.lower()}"
+            platform_build_dir = (
+                Path(os.path.realpath(build_dir)) / f"{platform.lower()}"
+            )
             os.makedirs(platform_build_dir, exist_ok=True)
             return _build(platform_build_dir)
 
@@ -338,4 +352,3 @@ class RuntimeCompiler:
             binary_data = f.read()
 
         return binary_data
-

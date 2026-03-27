@@ -13,5 +13,4 @@ ToolchainType get_orchestration_compiler(void) {
     // host_build_graph: always host g++ (orchestration runs on host)
     return TOOLCHAIN_HOST_GXX;
 }
-
 }

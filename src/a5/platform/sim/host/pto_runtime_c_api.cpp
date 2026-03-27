@@ -23,15 +23,15 @@ extern "C" {
  * ===========================================================================
  */
 int init_runtime_impl(Runtime* runtime,
-                    const uint8_t* orch_so_binary,
-                    size_t orch_so_size,
-                    const char* orch_func_name,
-                    const TaskArg* orch_args,
-                    int orch_args_count,
-                    const int* kernel_func_ids,
-                    const uint8_t* const* kernel_binaries,
-                    const size_t* kernel_sizes,
-                    int kernel_count);
+    const uint8_t* orch_so_binary,
+    size_t orch_so_size,
+    const char* orch_func_name,
+    const TaskArg* orch_args,
+    int orch_args_count,
+    const int* kernel_func_ids,
+    const uint8_t* const* kernel_binaries,
+    const size_t* kernel_sizes,
+    int kernel_count);
 int validate_runtime_impl(Runtime* runtime);
 
 /* Forward declarations */
@@ -47,20 +47,18 @@ void remove_kernel_binary_wrapper(int func_id);
  * ===========================================================================
  */
 
-size_t get_runtime_size(void) {
-    return sizeof(Runtime);
-}
+size_t get_runtime_size(void) { return sizeof(Runtime); }
 
 int init_runtime(RuntimeHandle runtime,
-                const uint8_t* orch_so_binary,
-                size_t orch_so_size,
-                const char* orch_func_name,
-                const TaskArg* orch_args,
-                int orch_args_count,
-                const int* kernel_func_ids,
-                const uint8_t* const* kernel_binaries,
-                const size_t* kernel_sizes,
-                int kernel_count) {
+    const uint8_t* orch_so_binary,
+    size_t orch_so_size,
+    const char* orch_func_name,
+    const TaskArg* orch_args,
+    int orch_args_count,
+    const int* kernel_func_ids,
+    const uint8_t* const* kernel_binaries,
+    const size_t* kernel_sizes,
+    int kernel_count) {
     if (runtime == NULL) {
         return -1;
     }
@@ -80,10 +78,16 @@ int init_runtime(RuntimeHandle runtime,
         r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
 
         // Delegate kernel registration, SO loading, and orchestration to init_runtime_impl
-        int result = init_runtime_impl(r, orch_so_binary, orch_so_size,
-                               orch_func_name, orch_args, orch_args_count,
-                               kernel_func_ids, kernel_binaries,
-                               kernel_sizes, kernel_count);
+        int result = init_runtime_impl(r,
+            orch_so_binary,
+            orch_so_size,
+            orch_func_name,
+            orch_args,
+            orch_args_count,
+            kernel_func_ids,
+            kernel_binaries,
+            kernel_sizes,
+            kernel_count);
 
         if (result != 0) {
             r->~Runtime();
@@ -164,14 +168,14 @@ void remove_kernel_binary_wrapper(int func_id) {
 }
 
 int launch_runtime(RuntimeHandle runtime,
-                   int aicpu_thread_num,
-                   int block_dim,
-                   int device_id,
-                   const uint8_t* aicpu_binary,
-                   size_t aicpu_size,
-                   const uint8_t* aicore_binary,
-                   size_t aicore_size,
-                   int orch_thread_num) {
+    int aicpu_thread_num,
+    int block_dim,
+    int device_id,
+    const uint8_t* aicpu_binary,
+    size_t aicpu_size,
+    const uint8_t* aicore_binary,
+    size_t aicore_size,
+    int orch_thread_num) {
     if (runtime == NULL) {
         return -1;
     }
@@ -237,10 +241,7 @@ int enable_runtime_profiling(RuntimeHandle runtime, int enabled) {
  * registration and stores addresses in Runtime's func_id_to_addr_[] array.
  */
 
-void record_tensor_pair(RuntimeHandle runtime,
-                       void* host_ptr,
-                       void* dev_ptr,
-                       size_t size) {
+void record_tensor_pair(RuntimeHandle runtime, void* host_ptr, void* dev_ptr, size_t size) {
     if (runtime == NULL) {
         return;
     }

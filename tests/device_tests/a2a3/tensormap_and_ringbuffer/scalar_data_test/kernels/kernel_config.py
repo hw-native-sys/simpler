@@ -18,8 +18,16 @@ ORCHESTRATION = {
 }
 
 KERNELS = [
-    {"func_id": 0, "source": str(_KERNELS_ROOT / "aiv" / "kernel_add.cpp"), "core_type": "aiv"},
-    {"func_id": 1, "source": str(_KERNELS_ROOT / "aiv" / "kernel_noop.cpp"), "core_type": "aiv"},
+    {
+        "func_id": 0,
+        "source": str(_KERNELS_ROOT / "aiv" / "kernel_add.cpp"),
+        "core_type": "aiv",
+    },
+    {
+        "func_id": 1,
+        "source": str(_KERNELS_ROOT / "aiv" / "kernel_noop.cpp"),
+        "core_type": "aiv",
+    },
 ]
 
 RUNTIME_CONFIG = {

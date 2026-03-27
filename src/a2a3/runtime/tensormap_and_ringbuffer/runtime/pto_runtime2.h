@@ -59,8 +59,7 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                        const PTOParam& params);
+    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const PTOParam& params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
@@ -75,11 +74,8 @@ struct PTO2RuntimeOps {
 
     // Cross-layer data access (orchestration reads/writes tensor values via runtime)
     // Placed after logging to avoid shifting hot-path field offsets.
-    uint64_t (*get_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
-                                uint32_t ndims, const uint32_t indices[]);
-    void (*set_tensor_data)(PTO2Runtime* rt, Tensor& tensor,
-                            uint32_t ndims, const uint32_t indices[],
-                            uint64_t value);
+    uint64_t (*get_tensor_data)(PTO2Runtime* rt, const Tensor& tensor, uint32_t ndims, const uint32_t indices[]);
+    void (*set_tensor_data)(PTO2Runtime* rt, Tensor& tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
 };
 
 /**
@@ -90,24 +86,24 @@ struct PTO2RuntimeOps {
  */
 struct PTO2Runtime {
     // Ops table (first field — used by orchestration .so via function pointers)
-    const PTO2RuntimeOps*   ops;
+    const PTO2RuntimeOps* ops;
 
     // Components
     PTO2SharedMemoryHandle* sm_handle;
-    PTO2OrchestratorState   orchestrators[PTO2_MAX_ORCH_THREADS];
-    int                     orch_count;     // Number of active orchestrator states
-    PTO2SchedulerState      scheduler;
+    PTO2OrchestratorState orchestrators[PTO2_MAX_ORCH_THREADS];
+    int orch_count;  // Number of active orchestrator states
+    PTO2SchedulerState scheduler;
 
     // GM Heap for output buffers
-    void*                   gm_heap;
-    uint64_t                  gm_heap_size;
-    bool                    gm_heap_owned;  // True if we allocated it
+    void* gm_heap;
+    uint64_t gm_heap_size;
+    bool gm_heap_owned;  // True if we allocated it
 
     // Mode
-    PTO2RuntimeMode         mode;
+    PTO2RuntimeMode mode;
 
     // Statistics
-    int64_t                 total_cycles;
+    int64_t total_cycles;
 };
 
 // =============================================================================
@@ -131,9 +127,9 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode);
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
-                                         uint64_t task_window_size,
-                                         uint64_t heap_size,
-                                         int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    uint64_t task_window_size,
+    uint64_t heap_size,
+    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Create runtime from existing shared memory and GM heap (e.g. on device).
@@ -146,11 +142,11 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
-                                          PTO2SharedMemoryHandle* sm_handle,
-                                          void* gm_heap,
-                                          uint64_t heap_size,
-                                          int orch_count = 1,
-                                          int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    PTO2SharedMemoryHandle* sm_handle,
+    void* gm_heap,
+    uint64_t heap_size,
+    int orch_count = 1,
+    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Destroy runtime and free all resources
@@ -199,17 +195,14 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt);
 /**
  * Cross-layer data access: read a tensor value by waiting for its producer.
  */
-uint64_t pto2_get_tensor_data(PTO2Runtime* rt, const Tensor& tensor,
-                              uint32_t ndims, const uint32_t indices[]);
+uint64_t pto2_get_tensor_data(PTO2Runtime* rt, const Tensor& tensor, uint32_t ndims, const uint32_t indices[]);
 
 /**
  * Cross-layer data access: write a value to a tensor at given indices.
  * Waits for producer completion (WAW) and all consumers (WAR) via TensorMap.
  * See set_tensor_data in pto_orchestration_api.h for full documentation.
  */
-void pto2_set_tensor_data(PTO2Runtime* rt, Tensor& tensor,
-                          uint32_t ndims, const uint32_t indices[],
-                          uint64_t value);
+void pto2_set_tensor_data(PTO2Runtime* rt, Tensor& tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
 
 /**
  * Slim config struct exported by orchestration .so via aicpu_orchestration_config().
@@ -218,8 +211,8 @@ void pto2_set_tensor_data(PTO2Runtime* rt, Tensor& tensor,
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
 struct PTO2OrchestrationConfig {
-    int         expected_arg_count;
+    int expected_arg_count;
 };
 #endif
 
-#endif // PTO_RUNTIME2_H
+#endif  // PTO_RUNTIME2_H

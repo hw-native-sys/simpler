@@ -36,7 +36,9 @@ def generate_inputs(params: dict) -> list:
     context_lens_list = params.get("context_lens_list")
     dtype = getattr(torch, params.get("dtype", "bfloat16"))
 
-    assert context_len >= 1, "context_len must be >= 1 to avoid division by zero in attention"
+    assert context_len >= 1, (
+        "context_len must be >= 1 to avoid division by zero in attention"
+    )
 
     max_num_blocks_per_req = max_model_len // block_size
     scale_value = 1.0
@@ -45,7 +47,9 @@ def generate_inputs(params: dict) -> list:
     if context_lens_list is not None:
         seq_vals = list(context_lens_list)
         if len(seq_vals) < batch:
-            seq_vals = (seq_vals * ((batch + len(seq_vals) - 1) // len(seq_vals)))[:batch]
+            seq_vals = (seq_vals * ((batch + len(seq_vals) - 1) // len(seq_vals)))[
+                :batch
+            ]
         elif len(seq_vals) > batch:
             seq_vals = seq_vals[:batch]
         context_lens = torch.tensor(seq_vals, dtype=torch.int32)
@@ -64,18 +68,29 @@ def generate_inputs(params: dict) -> list:
     )
 
     query = torch.empty(batch, num_heads, head_dim).uniform_(-0.5, 0.5).to(dtype)
-    key_cache = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-0.5, 0.5).to(dtype)
-    value_cache = torch.empty(total_blocks, block_size, kv_head_num, head_dim).uniform_(-1, 1).to(dtype)
+    key_cache = (
+        torch.empty(total_blocks, block_size, kv_head_num, head_dim)
+        .uniform_(-0.5, 0.5)
+        .to(dtype)
+    )
+    value_cache = (
+        torch.empty(total_blocks, block_size, kv_head_num, head_dim)
+        .uniform_(-1, 1)
+        .to(dtype)
+    )
     out = torch.zeros(batch, num_heads, head_dim, dtype=torch.float32)
 
     return [
-        ("query", query),                              # [batch, num_heads, head_dim]
-        ("key_cache", key_cache),                      # [total_blocks, block_size, kv_head_num, head_dim]
-        ("value_cache", value_cache),                  # [total_blocks, block_size, kv_head_num, head_dim]
-        ("block_table", block_table),                  # [batch, max_num_blocks_per_req]
-        ("context_lens", context_lens),                # [batch]
-        ("out", out),                                  # [batch, num_heads, head_dim]
-        ("scale", ctypes.c_float(scale_value)),        # scalar
+        ("query", query),  # [batch, num_heads, head_dim]
+        ("key_cache", key_cache),  # [total_blocks, block_size, kv_head_num, head_dim]
+        (
+            "value_cache",
+            value_cache,
+        ),  # [total_blocks, block_size, kv_head_num, head_dim]
+        ("block_table", block_table),  # [batch, max_num_blocks_per_req]
+        ("context_lens", context_lens),  # [batch]
+        ("out", out),  # [batch, num_heads, head_dim]
+        ("scale", ctypes.c_float(scale_value)),  # scalar
     ]
 
 
@@ -123,14 +138,16 @@ def paged_attention(
 
     for q_offset in range(0, num_heads_dim, q_tile):
         q_tile_size = min(q_tile, num_heads_dim - q_offset)
-        qi = query[:, q_offset:q_offset + q_tile_size, :].to(torch.float32)
+        qi = query[:, q_offset : q_offset + q_tile_size, :].to(torch.float32)
 
         oi = None
         li = None
         mi = None
 
         for bn in range(max_bn):
-            valid_lens = torch.clamp(context_lens - bn * block_size, min=0, max=block_size)
+            valid_lens = torch.clamp(
+                context_lens - bn * block_size, min=0, max=block_size
+            )
             active_mask = valid_lens > 0
 
             if not active_mask.any():
@@ -146,10 +163,10 @@ def paged_attention(
             pos = torch.arange(block_size, device=sij.device).unsqueeze(0)
             valid_mask = pos < valid_lens.unsqueeze(1)
             valid_mask = valid_mask.unsqueeze(1)
-            sij = sij.masked_fill(~valid_mask, float('-inf'))
+            sij = sij.masked_fill(~valid_mask, float("-inf"))
 
             batch_mask = active_mask.view(-1, 1, 1)
-            sij = sij.masked_fill(~batch_mask, float('-inf'))
+            sij = sij.masked_fill(~batch_mask, float("-inf"))
 
             mij = sij.max(dim=-1, keepdim=True)[0]
             mij = mij.clamp(min=-1e30)
@@ -173,7 +190,7 @@ def paged_attention(
                 oi = alpha * oi + beta * oi_new
                 mi = mi_new
 
-        out[:, q_offset:q_offset + q_tile_size, :] = oi / li
+        out[:, q_offset : q_offset + q_tile_size, :] = oi / li
 
     return out
 
@@ -209,27 +226,40 @@ def compute_golden(tensors: dict, params: dict) -> None:
     tensors["out"][:] = out
 
 
-def run_golden_test(all_cases: dict, default_case: str, generate_inputs_fn, label: str = "Paged Attention"):
+def run_golden_test(
+    all_cases: dict,
+    default_case: str,
+    generate_inputs_fn,
+    label: str = "Paged Attention",
+):
     """Run golden test for __main__ blocks."""
     params = {"name": default_case, **all_cases[default_case]}
     result = generate_inputs_fn(params)
-    tensors = {name: tensor for name, tensor in result if isinstance(tensor, torch.Tensor)}
+    tensors = {
+        name: tensor for name, tensor in result if isinstance(tensor, torch.Tensor)
+    }
     compute_golden(tensors, params)
 
     print(f"=== {label} Golden Test ({params['name']}) ===")
-    print(f"batch={params['batch']}, num_heads={params['num_heads']}, head_dim={params['head_dim']}")
+    print(
+        f"batch={params['batch']}, num_heads={params['num_heads']}, head_dim={params['head_dim']}"
+    )
     print(f"kv_head_num={params['kv_head_num']}, block_size={params['block_size']}")
-    if params.get('context_lens_list'):
-        ctx_list = params['context_lens_list']
-        print(f"context_lens (variable): {ctx_list[:8]}{'...' if len(ctx_list) > 8 else ''}")
+    if params.get("context_lens_list"):
+        ctx_list = params["context_lens_list"]
+        print(
+            f"context_lens (variable): {ctx_list[:8]}{'...' if len(ctx_list) > 8 else ''}"
+        )
     else:
         print(f"context_len={params['context_len']}")
 
-    max_num_blocks = params['max_model_len'] // params['block_size']
-    q_tile = min(params['num_heads'], 128)
+    max_num_blocks = params["max_model_len"] // params["block_size"]
+    q_tile = min(params["num_heads"], 128)
     print(f"max_num_blocks_per_req={max_num_blocks}, q_tile_size={q_tile}")
 
-    out = tensors["out"].reshape(params["batch"] * params["num_heads"], params["head_dim"])
+    out = tensors["out"].reshape(
+        params["batch"] * params["num_heads"], params["head_dim"]
+    )
     print(f"Output shape: {out.shape}")
     print(f"Output range: [{out.min():.4f}, {out.max():.4f}]")
     print(f"Output mean: {out.mean():.4f}")

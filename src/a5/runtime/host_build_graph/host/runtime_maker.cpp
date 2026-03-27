@@ -58,16 +58,16 @@ extern "C" {
  * @param orch_args_count   Number of TaskArg entries
  * @return 0 on success, -1 on failure
  */
-int init_runtime_impl(Runtime *runtime,
-                    const uint8_t* orch_so_binary,
-                    size_t orch_so_size,
-                    const char* orch_func_name,
-                    const TaskArg* orch_args,
-                    int orch_args_count,
-                    const int* kernel_func_ids,
-                    const uint8_t* const* kernel_binaries,
-                    const size_t* kernel_sizes,
-                    int kernel_count) {
+int init_runtime_impl(Runtime* runtime,
+    const uint8_t* orch_so_binary,
+    size_t orch_so_size,
+    const char* orch_func_name,
+    const TaskArg* orch_args,
+    int orch_args_count,
+    const int* kernel_func_ids,
+    const uint8_t* const* kernel_binaries,
+    const size_t* kernel_sizes,
+    int kernel_count) {
     // Validate inputs
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
@@ -75,12 +75,11 @@ int init_runtime_impl(Runtime *runtime,
     }
 
     // Register kernel binaries via platform-provided upload function
-    if (kernel_count > 0 && kernel_func_ids != NULL &&
-        kernel_binaries != NULL && kernel_sizes != NULL) {
+    if (kernel_count > 0 && kernel_func_ids != NULL && kernel_binaries != NULL && kernel_sizes != NULL) {
         LOG_INFO("Registering %d kernel(s) in init_runtime_impl", kernel_count);
         for (int i = 0; i < kernel_count; i++) {
-            uint64_t addr = runtime->host_api.upload_kernel_binary(
-                kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
+            uint64_t addr =
+                runtime->host_api.upload_kernel_binary(kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
             if (addr == 0) {
                 LOG_ERROR("Failed to upload kernel binary for func_id=%d", kernel_func_ids[i]);
                 return -1;
@@ -120,8 +119,7 @@ int init_runtime_impl(Runtime *runtime,
     }
 
     dlerror();  // Clear any existing error
-    OrchestrationFunc orch_func =
-        reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
+    OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
     const char* dlsym_error = dlerror();
     if (dlsym_error != nullptr) {
         LOG_ERROR("dlsym failed for '%s': %s", orch_func_name, dlsym_error);
@@ -166,7 +164,7 @@ int init_runtime_impl(Runtime *runtime,
  * @param runtime  Pointer to Runtime
  * @return 0 on success, -1 on failure
  */
-int validate_runtime_impl(Runtime *runtime) {
+int validate_runtime_impl(Runtime* runtime) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -222,5 +220,5 @@ int validate_runtime_impl(Runtime *runtime) {
 }
 
 #ifdef __cplusplus
-}  /* extern "C" */
+} /* extern "C" */
 #endif

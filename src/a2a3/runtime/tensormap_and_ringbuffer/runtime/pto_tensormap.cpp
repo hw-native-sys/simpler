@@ -28,7 +28,7 @@
 #if PTO2_TENSORMAP_PROFILING
 uint64_t g_lookup_chain_total = 0;
 uint64_t g_lookup_count = 0;
-int32_t  g_lookup_chain_max = 0;
+int32_t g_lookup_chain_max = 0;
 uint64_t g_lookup_overlap_checks = 0;
 uint64_t g_lookup_overlap_hits = 0;
 uint64_t g_insert_count = 0;
@@ -38,7 +38,8 @@ uint64_t g_insert_count = 0;
 // Initialization and Destruction
 // =============================================================================
 
-bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]) {
+bool PTO2TensorMap::init(
+    int32_t new_num_buckets, int32_t new_pool_size, const int32_t new_task_window_sizes[PTO2_MAX_RING_DEPTH]) {
     // Validate power of 2 for fast modulo
     if ((new_num_buckets & (new_num_buckets - 1)) != 0) {
         return false;  // num_buckets must be power of 2
@@ -58,7 +59,8 @@ bool PTO2TensorMap::init(int32_t new_num_buckets, int32_t new_pool_size, const i
     num_buckets = new_num_buckets;
 
     // Allocate entry pool (64-byte aligned for cache-line-aligned entries)
-    entry_pool = (PTO2TensorMapEntry*)aligned_alloc(alignof(PTO2TensorMapEntry), new_pool_size * sizeof(PTO2TensorMapEntry));
+    entry_pool =
+        (PTO2TensorMapEntry*)aligned_alloc(alignof(PTO2TensorMapEntry), new_pool_size * sizeof(PTO2TensorMapEntry));
     if (!entry_pool) {
         free(buckets);
         buckets = NULL;

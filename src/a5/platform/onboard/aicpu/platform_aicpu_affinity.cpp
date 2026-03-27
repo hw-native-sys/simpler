@@ -21,9 +21,7 @@ static std::atomic<int32_t> s_gate_ready{0};
 static int32_t s_thread_cpu[MAX_GATE_THREADS];
 static bool s_thread_survive[MAX_GATE_THREADS];
 
-static inline int32_t popcount64(uint64_t v) {
-    return __builtin_popcountll(static_cast<unsigned long long>(v));
-}
+static inline int32_t popcount64(uint64_t v) { return __builtin_popcountll(static_cast<unsigned long long>(v)); }
 
 bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched) {
     if (logical_count >= total_launched) {
@@ -60,8 +58,7 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
 
     // CAS winner does cluster classification
     int32_t expected = 0;
-    if (s_gate_init.compare_exchange_strong(expected, 1,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
+    if (s_gate_init.compare_exchange_strong(expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         // Initialize survive flags
         for (int32_t i = 0; i < total_launched; ++i) {
             s_thread_survive[i] = false;
@@ -88,7 +85,11 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
         int32_t minor_cnt = clusters[minor_id].count;
 
         LOG_INFO("AICPU affinity gate: major=%d(cnt=%d) minor=%d(cnt=%d) logical=%d",
-                 major_id, major_cnt, minor_id, minor_cnt, logical_count);
+            major_id,
+            major_cnt,
+            minor_id,
+            minor_cnt,
+            logical_count);
 
         if (major_cnt == logical_count && minor_cnt == (total_launched - logical_count)) {
             // Expected topology: major cluster threads survive
@@ -97,9 +98,11 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
             }
         } else {
             // Unexpected topology: fall back to first logical_count threads
-            LOG_WARN("AICPU affinity gate: unexpected topology (major=%d minor=%d), "
-                     "falling back to index-based cutoff",
-                     major_cnt, minor_cnt);
+            LOG_WARN(
+                "AICPU affinity gate: unexpected topology (major=%d minor=%d), "
+                "falling back to index-based cutoff",
+                major_cnt,
+                minor_cnt);
             for (int32_t i = 0; i < logical_count && i < total_launched; ++i) {
                 s_thread_survive[i] = true;
             }

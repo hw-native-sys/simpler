@@ -46,8 +46,8 @@ static bool get_pg_mask(uint64_t& valid, int64_t device_id) {
 /**
  * Retrieve AICore register base addresses via HAL API
  */
-static int get_aicore_reg_info(std::vector<int64_t>& aic, std::vector<int64_t>& aiv,
-                           const int& addr_type, int64_t device_id) {
+static int get_aicore_reg_info(
+    std::vector<int64_t>& aic, std::vector<int64_t>& aiv, const int& addr_type, int64_t device_id) {
     uint64_t valid = 0;
     if (!get_pg_mask(valid, device_id)) {
         // If can't get mask, assume all cores valid
@@ -58,9 +58,7 @@ static int get_aicore_reg_info(std::vector<int64_t>& aic, std::vector<int64_t>& 
     uint64_t core_stride = 8 * 1024 * 1024;  // 8M
     uint64_t sub_core_stride = 0x100000ULL;
 
-    auto is_valid = [&valid](int id) {
-        return (valid & (1ULL << id)) != 0;
-    };
+    auto is_valid = [&valid](int id) { return (valid & (1ULL << id)) != 0; };
 
     auto halFunc =
         (int (*)(int type, void* paramValue, size_t paramValueSize, void* outValue, size_t* outSizeRet))dlsym(
@@ -127,15 +125,10 @@ static void get_aicore_regs(std::vector<int64_t>& regs, uint64_t device_id) {
     regs.insert(regs.end(), aic.begin(), aic.end());
     regs.insert(regs.end(), aiv.begin(), aiv.end());
 
-    LOG_INFO("get_aicore_regs: Retrieved %zu AIC and %zu AIV register addresses",
-             aic.size(), aiv.size());
+    LOG_INFO("get_aicore_regs: Retrieved %zu AIC and %zu AIV register addresses", aic.size(), aiv.size());
 }
 
-int init_aicore_register_addresses(
-    uint64_t* runtime_regs_ptr,
-    uint64_t device_id,
-    MemoryAllocator& allocator) {
-
+int init_aicore_register_addresses(uint64_t* runtime_regs_ptr, uint64_t device_id, MemoryAllocator& allocator) {
     if (runtime_regs_ptr == nullptr) {
         LOG_ERROR("init_aicore_register_addresses: Invalid parameters");
         return -1;
@@ -172,7 +165,8 @@ int init_aicore_register_addresses(
     *runtime_regs_ptr = reinterpret_cast<uint64_t>(reg_ptr);
 
     LOG_INFO("Successfully initialized register addresses: %zu addresses at device 0x%llx",
-             host_regs.size(), *runtime_regs_ptr);
+        host_regs.size(),
+        *runtime_regs_ptr);
 
     return 0;
 }

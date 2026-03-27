@@ -62,9 +62,9 @@ static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm
 
     // Load A and B to L1 with separate events for pipeline overlap
     TLOAD(aMatTile, qiGlobal);
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);     // A load done
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);  // A load done
     TLOAD(bMatTile, kjGlobal);
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);     // B load done
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);  // B load done
 
     // Move A to L0A as soon as A load completes (B may still be loading)
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);

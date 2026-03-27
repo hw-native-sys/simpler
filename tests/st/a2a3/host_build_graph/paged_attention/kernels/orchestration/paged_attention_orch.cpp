@@ -19,10 +19,10 @@
 #include <algorithm>
 #include <cstring>
 
-#define FUNC_QK_MATMUL       0
+#define FUNC_QK_MATMUL 0
 #define FUNC_SOFTMAX_PREPARE 1
-#define FUNC_PV_MATMUL       2
-#define FUNC_ONLINE_UPDATE   3
+#define FUNC_PV_MATMUL 2
+#define FUNC_ONLINE_UPDATE 3
 
 extern "C" {
 
@@ -33,27 +33,27 @@ int build_paged_attention_graph(Runtime* runtime, const TaskArg* orch_args, int 
     }
 
     // Extract host pointers from TaskArg tensor metadata
-    void* host_query       = orch_args[0].data<void>();
-    void* host_key_cache   = orch_args[1].data<void>();
+    void* host_query = orch_args[0].data<void>();
+    void* host_key_cache = orch_args[1].data<void>();
     void* host_value_cache = orch_args[2].data<void>();
-    int*  host_block_table = orch_args[3].data<int>();
-    int*  host_context_lens = orch_args[4].data<int>();
-    void* host_out         = orch_args[5].data<void>();
+    int* host_block_table = orch_args[3].data<int>();
+    int* host_context_lens = orch_args[4].data<int>();
+    void* host_out = orch_args[5].data<void>();
 
     // Extract sizes from TaskArg metadata
-    size_t query_size       = orch_args[0].nbytes();
-    size_t key_cache_size   = orch_args[1].nbytes();
+    size_t query_size = orch_args[0].nbytes();
+    size_t key_cache_size = orch_args[1].nbytes();
     size_t value_cache_size = orch_args[2].nbytes();
-    size_t out_size         = orch_args[5].nbytes();
+    size_t out_size = orch_args[5].nbytes();
 
     // Read dimensions from tensor shapes (uint32_t — matches TaskArg::tensor.shapes type)
     // query: (batch, num_heads, head_dim)
-    uint32_t batch       = orch_args[0].tensor.shapes[0];
-    uint32_t num_heads   = orch_args[0].tensor.shapes[1];
-    uint32_t head_dim    = orch_args[0].tensor.shapes[2];
+    uint32_t batch = orch_args[0].tensor.shapes[0];
+    uint32_t num_heads = orch_args[0].tensor.shapes[1];
+    uint32_t head_dim = orch_args[0].tensor.shapes[2];
 
     // key_cache: (total_blocks, block_size, kv_head_num, head_dim)
-    uint32_t block_size  = orch_args[1].tensor.shapes[1];
+    uint32_t block_size = orch_args[1].tensor.shapes[1];
     uint32_t kv_head_num = orch_args[1].tensor.shapes[2];
 
     // block_table: (batch, max_num_blocks_per_req)
@@ -67,8 +67,8 @@ int build_paged_attention_graph(Runtime* runtime, const TaskArg* orch_args, int 
     uint32_t num_head_tiles = (num_heads + q_tile_size - 1) / q_tile_size;
 
     std::cout << "\n=== build_paged_attention_graph ===" << '\n';
-    std::cout << "batch=" << batch << ", num_heads=" << num_heads
-              << ", kv_head_num=" << kv_head_num << ", head_dim=" << head_dim << '\n';
+    std::cout << "batch=" << batch << ", num_heads=" << num_heads << ", kv_head_num=" << kv_head_num
+              << ", head_dim=" << head_dim << '\n';
     std::cout << "block_size=" << block_size << ", max_num_blocks=" << max_num_blocks << '\n';
     std::cout << "q_tile_size=" << q_tile_size << ", num_head_tiles=" << num_head_tiles << '\n';
 
@@ -89,25 +89,25 @@ int build_paged_attention_graph(Runtime* runtime, const TaskArg* orch_args, int 
     runtime->record_tensor_pair(host_out, dev_out, out_size);
 
     // Buffer sizes depend on q_tile_size and block_size
-    size_t sij_size    = static_cast<size_t>(q_tile_size) * block_size * sizeof(float);
-    size_t pij_size    = static_cast<size_t>(q_tile_size) * block_size * sizeof(uint16_t);
-    size_t mij_size    = static_cast<size_t>(q_tile_size) * sizeof(float);
-    size_t lij_size    = mij_size;
+    size_t sij_size = static_cast<size_t>(q_tile_size) * block_size * sizeof(float);
+    size_t pij_size = static_cast<size_t>(q_tile_size) * block_size * sizeof(uint16_t);
+    size_t mij_size = static_cast<size_t>(q_tile_size) * sizeof(float);
+    size_t lij_size = mij_size;
     size_t oi_new_size = static_cast<size_t>(q_tile_size) * head_dim * sizeof(float);
 
     // Per-batch-per-block intermediate buffers
     uint32_t total_buffers = batch * max_num_blocks;
-    void** dev_sij_arr    = new void*[total_buffers];
-    void** dev_pij_arr    = new void*[total_buffers];
-    void** dev_mij_arr    = new void*[total_buffers];
-    void** dev_lij_arr    = new void*[total_buffers];
+    void** dev_sij_arr = new void*[total_buffers];
+    void** dev_pij_arr = new void*[total_buffers];
+    void** dev_mij_arr = new void*[total_buffers];
+    void** dev_lij_arr = new void*[total_buffers];
     void** dev_oi_new_arr = new void*[total_buffers];
 
     for (uint32_t i = 0; i < total_buffers; i++) {
-        dev_sij_arr[i]    = runtime->host_api.device_malloc(sij_size);
-        dev_pij_arr[i]    = runtime->host_api.device_malloc(pij_size);
-        dev_mij_arr[i]    = runtime->host_api.device_malloc(mij_size);
-        dev_lij_arr[i]    = runtime->host_api.device_malloc(lij_size);
+        dev_sij_arr[i] = runtime->host_api.device_malloc(sij_size);
+        dev_pij_arr[i] = runtime->host_api.device_malloc(pij_size);
+        dev_mij_arr[i] = runtime->host_api.device_malloc(mij_size);
+        dev_lij_arr[i] = runtime->host_api.device_malloc(lij_size);
         dev_oi_new_arr[i] = runtime->host_api.device_malloc(oi_new_size);
     }
 
@@ -141,12 +141,12 @@ int build_paged_attention_graph(Runtime* runtime, const TaskArg* orch_args, int 
 
             // Query: (batch, q_head_num, head_dim) bf16
             // qi points to heads [cur_offset .. cur_offset+q_tile_size) for batch b_idx
-            uint8_t* qi_ptr = reinterpret_cast<uint8_t*>(dev_query)
-                + static_cast<int64_t>(b_idx * num_heads + cur_offset) * head_dim * sizeof(uint16_t);
+            uint8_t* qi_ptr = reinterpret_cast<uint8_t*>(dev_query) +
+                              static_cast<int64_t>(b_idx * num_heads + cur_offset) * head_dim * sizeof(uint16_t);
 
             // Output: (batch * q_head_num, head_dim) float32
-            uint8_t* out_ptr = reinterpret_cast<uint8_t*>(dev_out)
-                + static_cast<int64_t>(b_idx * num_heads + cur_offset) * head_dim * sizeof(float);
+            uint8_t* out_ptr = reinterpret_cast<uint8_t*>(dev_out) +
+                               static_cast<int64_t>(b_idx * num_heads + cur_offset) * head_dim * sizeof(float);
 
             // GQA: which kv_head this head tile maps to
             uint32_t kv_head_idx = cur_offset / (num_heads / kv_head_num);
@@ -164,57 +164,51 @@ int build_paged_attention_graph(Runtime* runtime, const TaskArg* orch_args, int 
                 int valid_len = std::min((int)block_size, cur_seq - (int)(bn * block_size));
 
                 // Key: (total_blocks, block_size, kv_head_num, head_dim) bf16
-                uint8_t* kj_ptr = reinterpret_cast<uint8_t*>(dev_key_cache)
-                    + (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx)
-                      * head_dim * sizeof(uint16_t);
+                uint8_t* kj_ptr = reinterpret_cast<uint8_t*>(dev_key_cache) +
+                                  (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx) *
+                                      head_dim * sizeof(uint16_t);
 
                 // Value: (total_blocks, block_size, kv_head_num, head_dim) bf16
-                uint8_t* vj_ptr = reinterpret_cast<uint8_t*>(dev_value_cache)
-                    + (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx)
-                      * head_dim * sizeof(uint16_t);
+                uint8_t* vj_ptr = reinterpret_cast<uint8_t*>(dev_value_cache) +
+                                  (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx) *
+                                      head_dim * sizeof(uint16_t);
 
                 uint32_t buf_idx = b_idx * max_num_blocks + bn;
-                void* dev_sij    = dev_sij_arr[buf_idx];
-                void* dev_pij    = dev_pij_arr[buf_idx];
-                void* dev_mij    = dev_mij_arr[buf_idx];
-                void* dev_lij    = dev_lij_arr[buf_idx];
+                void* dev_sij = dev_sij_arr[buf_idx];
+                void* dev_pij = dev_pij_arr[buf_idx];
+                void* dev_mij = dev_mij_arr[buf_idx];
+                void* dev_lij = dev_lij_arr[buf_idx];
                 void* dev_oi_new = dev_oi_new_arr[buf_idx];
 
                 // QK: qi(M, K) @ kj.T(K, N) -> sij(M, N)
-                uint64_t qk_args[6] = {
-                    reinterpret_cast<uint64_t>(qi_ptr),
+                uint64_t qk_args[6] = {reinterpret_cast<uint64_t>(qi_ptr),
                     reinterpret_cast<uint64_t>(kj_ptr),
                     reinterpret_cast<uint64_t>(dev_sij),
                     static_cast<uint64_t>(q_tile_size),
                     static_cast<uint64_t>(head_dim),
-                    static_cast<uint64_t>(block_size)
-                };
+                    static_cast<uint64_t>(block_size)};
                 int t_qk = runtime->add_task(qk_args, 6, FUNC_QK_MATMUL, CoreType::AIC);
                 total_tasks++;
 
                 // SF: scale, rowmax, exp, rowsum -> pij, mij, lij
-                uint64_t sf_args[8] = {
-                    reinterpret_cast<uint64_t>(dev_sij),
+                uint64_t sf_args[8] = {reinterpret_cast<uint64_t>(dev_sij),
                     scale_value_bits,
                     reinterpret_cast<uint64_t>(dev_pij),
                     reinterpret_cast<uint64_t>(dev_mij),
                     reinterpret_cast<uint64_t>(dev_lij),
                     static_cast<uint64_t>(q_tile_size),
                     static_cast<uint64_t>(block_size),
-                    static_cast<uint64_t>(valid_len)
-                };
+                    static_cast<uint64_t>(valid_len)};
                 int t_sf = runtime->add_task(sf_args, 8, FUNC_SOFTMAX_PREPARE, CoreType::AIV);
                 total_tasks++;
 
                 // PV: pij(M, K') @ vj(K', N') -> oi_new(M, N')
-                uint64_t pv_args[6] = {
-                    reinterpret_cast<uint64_t>(dev_pij),
+                uint64_t pv_args[6] = {reinterpret_cast<uint64_t>(dev_pij),
                     reinterpret_cast<uint64_t>(vj_ptr),
                     reinterpret_cast<uint64_t>(dev_oi_new),
                     static_cast<uint64_t>(q_tile_size),
                     static_cast<uint64_t>(block_size),
-                    static_cast<uint64_t>(head_dim)
-                };
+                    static_cast<uint64_t>(head_dim)};
                 int t_pv = runtime->add_task(pv_args, 6, FUNC_PV_MATMUL, CoreType::AIC);
                 total_tasks++;
 
@@ -223,10 +217,9 @@ int build_paged_attention_graph(Runtime* runtime, const TaskArg* orch_args, int 
 
                 // Online Update: serialized across blocks (each depends on previous)
                 int is_first = (bn == 0) ? 1 : 0;
-                int is_last  = (bn == bn_this_batch - 1) ? 1 : 0;
+                int is_last = (bn == bn_this_batch - 1) ? 1 : 0;
 
-                uint64_t up_args[11] = {
-                    reinterpret_cast<uint64_t>(dev_mij),
+                uint64_t up_args[11] = {reinterpret_cast<uint64_t>(dev_mij),
                     reinterpret_cast<uint64_t>(dev_lij),
                     reinterpret_cast<uint64_t>(dev_oi_new),
                     reinterpret_cast<uint64_t>(dev_mi),
@@ -236,8 +229,7 @@ int build_paged_attention_graph(Runtime* runtime, const TaskArg* orch_args, int 
                     static_cast<uint64_t>(is_last),
                     reinterpret_cast<uint64_t>(out_ptr),
                     static_cast<uint64_t>(q_tile_size),
-                    static_cast<uint64_t>(head_dim)
-                };
+                    static_cast<uint64_t>(head_dim)};
                 int t_up = runtime->add_task(up_args, 11, FUNC_ONLINE_UPDATE, CoreType::AIV);
                 total_tasks++;
 
@@ -264,5 +256,4 @@ int build_paged_attention_graph(Runtime* runtime, const TaskArg* orch_args, int 
 
     return 0;
 }
-
 }

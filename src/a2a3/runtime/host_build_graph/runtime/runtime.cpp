@@ -71,8 +71,8 @@ int Runtime::add_task(uint64_t* args, int num_args, int func_id, CoreType core_t
     if (args && num_args > 0) {
         memcpy(task->args, args, num_args * sizeof(uint64_t));
     }
-    task->function_bin_addr = 0;    // Will be set by host before copying to device
-    task->core_type = core_type;    // Set core type
+    task->function_bin_addr = 0;  // Will be set by host before copying to device
+    task->core_type = core_type;  // Set core type
     task->fanin = 0;
     task->fanout_count = 0;
     memset(task->fanout, 0, sizeof(task->fanout));
@@ -145,7 +145,7 @@ void Runtime::print_runtime() const {
     // Print initially ready tasks
     LOG_DEBUG("\nInitially Ready Tasks (fanin==0):");
     LOG_DEBUG("----------------------------------------------------------------------");
-    
+
     // Build ready tasks string
     char ready_tasks_str[1024] = "  ";
     int offset = 2;
@@ -175,8 +175,11 @@ void Runtime::print_runtime() const {
         char fanout_str[512];
         int fo_offset = 0;
         for (int j = 0; j < t->fanout_count && fo_offset < 500; j++) {
-            fo_offset += snprintf(fanout_str + fo_offset, sizeof(fanout_str) - fo_offset, 
-                                  "%d%s", t->fanout[j], j < t->fanout_count - 1 ? "," : "");
+            fo_offset += snprintf(fanout_str + fo_offset,
+                sizeof(fanout_str) - fo_offset,
+                "%d%s",
+                t->fanout[j],
+                j < t->fanout_count - 1 ? "," : "");
         }
 
         LOG_DEBUG("  Task %d: func_id=%d, fanin=%d, fanout=%d, args=%d [%s]",
@@ -207,14 +210,8 @@ void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
     LOG_DEBUG("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
 }
 
-TensorPair* Runtime::get_tensor_pairs() {
-    return tensor_pairs;
-}
+TensorPair* Runtime::get_tensor_pairs() { return tensor_pairs; }
 
-int Runtime::get_tensor_pair_count() const {
-    return tensor_pair_count;
-}
+int Runtime::get_tensor_pair_count() const { return tensor_pair_count; }
 
-void Runtime::clear_tensor_pairs() {
-    tensor_pair_count = 0;
-}
+void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }

@@ -35,13 +35,11 @@ using namespace pto;
 #endif
 
 template <int M, int K, int N>
-static __aicore__ void pv_matmul_n_impl(
-    __gm__ bfloat16_t* pij_base,
+static __aicore__ void pv_matmul_n_impl(__gm__ bfloat16_t* pij_base,
     __gm__ bfloat16_t* val_base,
     __gm__ float* oi_base,
     uint64_t n_blocks,
     __gm__ int32_t* block_table) {
-
     using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
     using GlobalB = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, N, 1>>;
     using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<M * N, M * N, M * N, N, 1>>;

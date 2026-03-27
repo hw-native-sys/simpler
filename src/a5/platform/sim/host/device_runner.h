@@ -45,8 +45,8 @@
  * proper handling of external symbols (e.g., std::exp) via PLT/GOT.
  */
 struct MappedKernel {
-    void* dl_handle{nullptr};    // dlopen handle
-    uint64_t func_addr{0};       // Function pointer address (from dlsym)
+    void* dl_handle{nullptr};  // dlopen handle
+    uint64_t func_addr{0};     // Function pointer address (from dlsym)
 };
 
 /**
@@ -122,11 +122,11 @@ public:
      * @return 0 on success
      */
     int run(Runtime& runtime,
-            int block_dim,
-            int device_id,
-            const std::vector<uint8_t>& aicpu_so_binary,
-            const std::vector<uint8_t>& aicore_kernel_binary,
-            int launch_aicpu_num = 1);
+        int block_dim,
+        int device_id,
+        const std::vector<uint8_t>& aicpu_so_binary,
+        const std::vector<uint8_t>& aicore_kernel_binary,
+        int launch_aicpu_num = 1);
 
     /**
      * Print handshake results
@@ -227,11 +227,10 @@ private:
     PerformanceCollector perf_collector_;
 
     // Private helper methods
-    int ensure_device_initialized(int device_id,
-                                  const std::vector<uint8_t>& aicpu_so_binary,
-                                  const std::vector<uint8_t>& aicore_kernel_binary);
-    int ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_binary,
-                               const std::vector<uint8_t>& aicore_kernel_binary);
+    int ensure_device_initialized(
+        int device_id, const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
+    int ensure_binaries_loaded(
+        const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
 
     /**
      * Initialize performance profiling shared memory

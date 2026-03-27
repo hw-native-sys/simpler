@@ -27,6 +27,7 @@ from _task_interface import (
 # DataType enum
 # ============================================================================
 
+
 class TestDataType:
     def test_enum_values_exist(self):
         assert DataType.FLOAT32 is not None
@@ -52,33 +53,39 @@ class TestDataType:
 
 
 class TestGetElementSize:
-    @pytest.mark.parametrize("dtype,expected", [
-        (DataType.FLOAT32, 4),
-        (DataType.FLOAT16, 2),
-        (DataType.INT32, 4),
-        (DataType.INT16, 2),
-        (DataType.INT8, 1),
-        (DataType.UINT8, 1),
-        (DataType.BFLOAT16, 2),
-        (DataType.INT64, 8),
-        (DataType.UINT64, 8),
-    ])
+    @pytest.mark.parametrize(
+        "dtype,expected",
+        [
+            (DataType.FLOAT32, 4),
+            (DataType.FLOAT16, 2),
+            (DataType.INT32, 4),
+            (DataType.INT16, 2),
+            (DataType.INT8, 1),
+            (DataType.UINT8, 1),
+            (DataType.BFLOAT16, 2),
+            (DataType.INT64, 8),
+            (DataType.UINT64, 8),
+        ],
+    )
     def test_element_sizes(self, dtype, expected):
         assert get_element_size(dtype) == expected
 
 
 class TestGetDtypeName:
-    @pytest.mark.parametrize("dtype,expected", [
-        (DataType.FLOAT32, "FLOAT32"),
-        (DataType.FLOAT16, "FLOAT16"),
-        (DataType.INT32, "INT32"),
-        (DataType.INT16, "INT16"),
-        (DataType.INT8, "INT8"),
-        (DataType.UINT8, "UINT8"),
-        (DataType.BFLOAT16, "BFLOAT16"),
-        (DataType.INT64, "INT64"),
-        (DataType.UINT64, "UINT64"),
-    ])
+    @pytest.mark.parametrize(
+        "dtype,expected",
+        [
+            (DataType.FLOAT32, "FLOAT32"),
+            (DataType.FLOAT16, "FLOAT16"),
+            (DataType.INT32, "INT32"),
+            (DataType.INT16, "INT16"),
+            (DataType.INT8, "INT8"),
+            (DataType.UINT8, "UINT8"),
+            (DataType.BFLOAT16, "BFLOAT16"),
+            (DataType.INT64, "INT64"),
+            (DataType.UINT64, "UINT64"),
+        ],
+    )
     def test_dtype_names(self, dtype, expected):
         assert get_dtype_name(dtype) == expected
 
@@ -86,6 +93,7 @@ class TestGetDtypeName:
 # ============================================================================
 # TaskArg
 # ============================================================================
+
 
 class TestTaskArg:
     def test_default_constructor(self):
@@ -166,6 +174,7 @@ class TestTaskArg:
 # TaskArgArray
 # ============================================================================
 
+
 class TestTaskArgArray:
     def test_empty(self):
         arr = TaskArgArray()
@@ -226,10 +235,12 @@ class TestTaskArgArray:
 # task_interface.py wrapper (torch integration)
 # ============================================================================
 
+
 class TestTaskInterfaceWrapper:
     def test_torch_dtype_to_datatype(self):
         from task_interface import torch_dtype_to_datatype
         import torch
+
         assert torch_dtype_to_datatype(torch.float32) == DataType.FLOAT32
         assert torch_dtype_to_datatype(torch.int8) == DataType.INT8
         assert torch_dtype_to_datatype(torch.bfloat16) == DataType.BFLOAT16
@@ -237,12 +248,14 @@ class TestTaskInterfaceWrapper:
     def test_torch_dtype_unsupported(self):
         from task_interface import torch_dtype_to_datatype
         import torch
+
         with pytest.raises(KeyError):
             torch_dtype_to_datatype(torch.complex64)
 
     def test_make_tensor_arg(self):
         from task_interface import make_tensor_arg
         import torch
+
         t = torch.zeros(4, 8, dtype=torch.float32)
         arg = make_tensor_arg(t)
         assert arg.kind == TaskArgKind.TENSOR
@@ -253,18 +266,21 @@ class TestTaskInterfaceWrapper:
 
     def test_make_scalar_arg_int(self):
         from task_interface import make_scalar_arg
+
         arg = make_scalar_arg(999)
         assert arg.kind == TaskArgKind.SCALAR
         assert arg.scalar == 999
 
     def test_make_scalar_arg_ctypes(self):
         from task_interface import make_scalar_arg
+
         arg = make_scalar_arg(ctypes.c_int64(42))
         assert arg.kind == TaskArgKind.SCALAR
         assert arg.scalar == 42
 
     def test_make_scalar_arg_float_ctypes(self):
         from task_interface import make_scalar_arg
+
         arg = make_scalar_arg(ctypes.c_float(1.5))
         assert arg.kind == TaskArgKind.SCALAR
         # Verify bit-cast: 1.5f = 0x3FC00000

@@ -70,8 +70,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-                perf_aicore_record_task(perf_buf, actual_task_id,
-                                      start_time, end_time);
+                perf_aicore_record_task(perf_buf, actual_task_id, start_time, end_time);
             }
 
             last_task_id = task_id;

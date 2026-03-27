@@ -47,7 +47,7 @@ struct PTO2OrchestratorState;  // forward declare
 #if PTO2_TENSORMAP_PROFILING
 extern uint64_t g_lookup_chain_total;
 extern uint64_t g_lookup_count;
-extern int32_t  g_lookup_chain_max;
+extern int32_t g_lookup_chain_max;
 extern uint64_t g_lookup_overlap_checks;
 extern uint64_t g_lookup_overlap_hits;
 extern uint64_t g_insert_count;
@@ -74,23 +74,23 @@ extern uint64_t g_insert_count;
  */
 struct alignas(64) PTO2TensorMapEntry {
     // === Cache line 1 (64B) — lookup hot path ===
-    PTO2TensorMapEntry* next_in_bucket;    // 8B: next entry in hash bucket chain
-    PTO2TaskId producer_task_id;           // 8B: raw (ring_id << 32) | local_id
-    uint64_t buffer_addr;                  // 8B: tensor base address (hash key)
-    int32_t version;                       // 4B: tensor version for overlap detection
-    uint32_t ndims;                        // 4B: number of dimensions
-    int32_t bucket_index;                  // 4B: bucket index (-1 if unlinked)
-    bool is_all_offset_zero;               // 1B: fast-path flag
-    bool with_alloc;                       // 1B: true=OUTPUT, false=INOUT
+    PTO2TensorMapEntry* next_in_bucket;  // 8B: next entry in hash bucket chain
+    PTO2TaskId producer_task_id;         // 8B: raw (ring_id << 32) | local_id
+    uint64_t buffer_addr;                // 8B: tensor base address (hash key)
+    int32_t version;                     // 4B: tensor version for overlap detection
+    uint32_t ndims;                      // 4B: number of dimensions
+    int32_t bucket_index;                // 4B: bucket index (-1 if unlinked)
+    bool is_all_offset_zero;             // 1B: fast-path flag
+    bool with_alloc;                     // 1B: true=OUTPUT, false=INOUT
     // padding: 2B
-    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS]; // 20B: shape per dimension
+    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // 20B: shape per dimension
     // padding: 4B to fill 64B
 
     // === Cache line 2 (64B) — insert/remove/slow-path ===
-    PTO2TensorMapEntry* prev_in_bucket;    // 8B: prev in hash bucket chain
-    PTO2TensorMapEntry* next_in_task;      // 8B: next entry for same task
-    PTO2TensorMapEntry* prev_in_task;      // 8B: prev entry for same task
-    uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS]; // 20B: only when !is_all_offset_zero
+    PTO2TensorMapEntry* prev_in_bucket;         // 8B: prev in hash bucket chain
+    PTO2TensorMapEntry* next_in_task;           // 8B: next entry for same task
+    PTO2TensorMapEntry* prev_in_task;           // 8B: prev entry for same task
+    uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];  // 20B: only when !is_all_offset_zero
     // padding: 20B to fill 64B
 
     /**
@@ -180,15 +180,15 @@ struct PTO2LookupResult {
  */
 struct PTO2TensorMap {
     // Hash table buckets (fixed size, power of 2)
-    PTO2TensorMapEntry** buckets;     // Array of offsets into entry_pool (-1 = empty)
-    int32_t num_buckets;  // Must be power of 2 for fast modulo
+    PTO2TensorMapEntry** buckets;  // Array of offsets into entry_pool (-1 = empty)
+    int32_t num_buckets;           // Must be power of 2 for fast modulo
 
     // Entry pool as ring buffer
-    PTO2TensorMapEntry* entry_pool;  // Ring buffer of entries
-    PTO2TensorMapEntry** free_entry_list;        // free entry ids
-    int32_t pool_size;               // Total pool capacity
-    int32_t next_entry_idx;          // id when next entry insert
-    int32_t free_num;                // free entry number in entry pool
+    PTO2TensorMapEntry* entry_pool;        // Ring buffer of entries
+    PTO2TensorMapEntry** free_entry_list;  // free entry ids
+    int32_t pool_size;                     // Total pool capacity
+    int32_t next_entry_idx;                // id when next entry insert
+    int32_t free_num;                      // free entry number in entry pool
 
     // Per-ring per-task entry tracking (for efficient bucket cleanup)
     // Indexed by [ring_id][local_id & (task_window_sizes[ring_id] - 1)]
@@ -217,7 +217,7 @@ struct PTO2TensorMap {
     }
 
     void free_entry(PTO2TensorMapEntry& entry) {
-        always_assert(entry.bucket_index != -1); // 必须保证仍在桶中
+        always_assert(entry.bucket_index != -1);  // 必须保证仍在桶中
 
         // Update predecessor's next pointer (O(1) via prev_in_bucket)
         if (entry.prev_in_bucket == nullptr) {
@@ -270,9 +270,7 @@ struct PTO2TensorMap {
      *
      * @param last_task_alive  Current value from shared memory
      */
-    void sync_validity(int32_t ring_id, int32_t last_task_alive) {
-        this->last_task_alives[ring_id] = last_task_alive;
-    }
+    void sync_validity(int32_t ring_id, int32_t last_task_alive) { this->last_task_alives[ring_id] = last_task_alive; }
 
     /**
      * Lookup producer for a tensor region
@@ -412,8 +410,7 @@ struct PTO2TensorMap {
                 // Only remove if this entry belongs to the retiring task
                 // (slot may have been reused by a newer task)
                 debug_assert(cur_entry->producer_task_id ==
-                             pto2_make_task_id(static_cast<uint8_t>(ring_id),
-                                               static_cast<uint32_t>(local_id)));
+                             pto2_make_task_id(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id)));
                 free_entry(*cur_entry);
                 cur_entry = next_entry;
             }
@@ -458,7 +455,7 @@ struct PTO2TensorMap {
      * Called during pool wrap-around to unlink reused entries.
      */
     void remove_from_task(PTO2TensorMapEntry& entry) {
-        always_assert(entry.bucket_index != -1); // 必须保证仍在桶中
+        always_assert(entry.bucket_index != -1);  // 必须保证仍在桶中
         // Update predecessor's next pointer (O(1) via prev_in_task)
         if (entry.prev_in_task == nullptr) {
             // Entry is the head of its task chain, update task_entry_heads
@@ -510,7 +507,7 @@ struct PTO2TensorMap {
 struct PTO2TensorMapProfilingData {
     uint64_t lookup_chain_total;
     uint64_t lookup_count;
-    int32_t  lookup_chain_max;
+    int32_t lookup_chain_max;
     uint64_t overlap_checks;
     uint64_t overlap_hits;
     uint64_t insert_count;

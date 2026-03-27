@@ -12,4 +12,3 @@ The A5 runtime layer currently contains a temporary copy of A2A3's `host_build_g
 - **Purpose**: Validate A5 platform layer functionality
 - **Source**: Copied from A2A3 baseline
 - **Status**: ⚠️ For validation only, not optimized for A5 hardware
-

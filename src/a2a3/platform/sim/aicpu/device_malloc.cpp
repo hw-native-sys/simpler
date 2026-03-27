@@ -10,10 +10,6 @@
 
 #include <cstdlib>
 
-void* aicpu_device_malloc(size_t size) {
-    return malloc(size);
-}
+void* aicpu_device_malloc(size_t size) { return malloc(size); }
 
-void aicpu_device_free(void* ptr) {
-    free(ptr);
-}
+void aicpu_device_free(void* ptr) { free(ptr); }

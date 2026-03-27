@@ -1,4 +1,3 @@
-
 import os
 from enum import IntEnum
 from typing import List, Optional
@@ -8,10 +7,11 @@ import env_manager
 # Must match compile_strategy.h
 class ToolchainType(IntEnum):
     """Toolchain types matching the C enum in compile_strategy.h."""
-    CCEC = 0           # ccec (Ascend AICore compiler)
-    HOST_GXX_15 = 1    # g++-15 (host, simulation kernels)
-    HOST_GXX = 2       # g++ (host, orchestration .so)
-    AARCH64_GXX = 3    # aarch64-target-linux-gnu-g++ (cross-compile)
+
+    CCEC = 0  # ccec (Ascend AICore compiler)
+    HOST_GXX_15 = 1  # g++-15 (host, simulation kernels)
+    HOST_GXX = 2  # g++ (host, orchestration .so)
+    AARCH64_GXX = 3  # aarch64-target-linux-gnu-g++ (cross-compile)
 
 
 class Toolchain:
@@ -53,13 +53,9 @@ class CCECToolchain(Toolchain):
         self.linker_path = os.path.join(self.ascend_home_path, "bin", "ld.lld")
 
         if not os.path.isfile(self.cxx_path):
-            raise FileNotFoundError(
-                f"ccec compiler not found: {self.cxx_path}"
-            )
+            raise FileNotFoundError(f"ccec compiler not found: {self.cxx_path}")
         if not os.path.isfile(self.linker_path):
-            raise FileNotFoundError(
-                f"ccec linker not found: {self.linker_path}"
-            )
+            raise FileNotFoundError(f"ccec linker not found: {self.linker_path}")
 
     def get_compile_flags(self, core_type: str = "aiv", **kwargs) -> List[str]:
         # A5 uses dav-c310 architecture, A2A3 uses dav-c220
@@ -68,18 +64,30 @@ class CCECToolchain(Toolchain):
         elif self.platform in ("a2a3", "a2a3sim"):
             arch = "dav-c220-vec" if core_type == "aiv" else "dav-c220-cube"
         else:
-            raise ValueError(f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a5, a5sim")
+            raise ValueError(
+                f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a5, a5sim"
+            )
 
         return [
-            "-c", "-O3", "-g", "-x", "cce",
-            "-Wall", "-std=c++17",
+            "-c",
+            "-O3",
+            "-g",
+            "-x",
+            "cce",
+            "-Wall",
+            "-std=c++17",
             "--cce-aicore-only",
             f"--cce-aicore-arch={arch}",
-            "-mllvm", "-cce-aicore-stack-size=0x8000",
-            "-mllvm", "-cce-aicore-function-stack-size=0x8000",
-            "-mllvm", "-cce-aicore-record-overflow=false",
-            "-mllvm", "-cce-aicore-addr-transform",
-            "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
+            "-mllvm",
+            "-cce-aicore-stack-size=0x8000",
+            "-mllvm",
+            "-cce-aicore-function-stack-size=0x8000",
+            "-mllvm",
+            "-cce-aicore-record-overflow=false",
+            "-mllvm",
+            "-cce-aicore-addr-transform",
+            "-mllvm",
+            "-cce-aicore-dcci-insert-for-scalar=false",
             "-DMEMORY_BASE",
         ]
 
@@ -99,7 +107,9 @@ class Gxx15Toolchain(Toolchain):
 
     def get_compile_flags(self, core_type: str = "", **kwargs) -> List[str]:
         flags = [
-            "-shared", "-O2", "-fPIC",
+            "-shared",
+            "-O2",
+            "-fPIC",
             "-std=c++23",
             "-fpermissive",
             "-Wno-macro-redefined",
@@ -156,21 +166,23 @@ class Aarch64GxxToolchain(Toolchain):
     def __init__(self):
         super().__init__()
         self.cxx_path = os.path.join(
-            self.ascend_home_path, "tools", "hcc", "bin",
+            self.ascend_home_path,
+            "tools",
+            "hcc",
+            "bin",
             "aarch64-target-linux-gnu-g++",
         )
         self.cc_path = os.path.join(
-            self.ascend_home_path, "tools", "hcc", "bin",
+            self.ascend_home_path,
+            "tools",
+            "hcc",
+            "bin",
             "aarch64-target-linux-gnu-gcc",
         )
         if not os.path.isfile(self.cc_path):
-            raise FileNotFoundError(
-                f"aarch64 C compiler not found: {self.cc_path}"
-            )
+            raise FileNotFoundError(f"aarch64 C compiler not found: {self.cc_path}")
         if not os.path.isfile(self.cxx_path):
-            raise FileNotFoundError(
-                f"aarch64 C++ compiler not found: {self.cxx_path}"
-            )
+            raise FileNotFoundError(f"aarch64 C++ compiler not found: {self.cxx_path}")
 
     def get_compile_flags(self, **kwargs) -> List[str]:
         return ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]

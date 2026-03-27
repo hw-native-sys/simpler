@@ -12,7 +12,7 @@
  *    - Ring buffer for linked list entries
  *    - O(1) prepend operation
  *    - Implicit reclamation with task ring
- * 
+ *
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
@@ -33,12 +33,12 @@ struct PTO2SchedulerState;  // Forward declaration for dep_pool reclaim
 #endif
 
 // Block notification interval (in spin counts)
-#define PTO2_BLOCK_NOTIFY_INTERVAL  10000
+#define PTO2_BLOCK_NOTIFY_INTERVAL 10000
 // Alloc spin limit - after this, report deadlock and exit
-#define PTO2_ALLOC_SPIN_LIMIT       100000
+#define PTO2_ALLOC_SPIN_LIMIT 100000
 
 // Dep pool spin limit - if exceeded, dep pool capacity too small for workload
-#define PTO2_DEP_POOL_SPIN_LIMIT      100000
+#define PTO2_DEP_POOL_SPIN_LIMIT 100000
 
 // =============================================================================
 // Task Allocator (unified task slot + heap buffer allocation)
@@ -48,10 +48,10 @@ struct PTO2SchedulerState;  // Forward declaration for dep_pool reclaim
  * Result of a unified task allocation.
  */
 struct PTO2TaskAllocResult {
-    int32_t task_id;      // Absolute task ID (not wrapped), -1 on failure
-    int32_t slot;         // task_id & (window_size - 1)
-    void* packed_base;    // Heap allocation result (nullptr if output_size == 0)
-    void* packed_end;     // packed_base + aligned output_size
+    int32_t task_id;    // Absolute task ID (not wrapped), -1 on failure
+    int32_t slot;       // task_id & (window_size - 1)
+    void* packed_base;  // Heap allocation result (nullptr if output_size == 0)
+    void* packed_end;   // packed_base + aligned output_size
 
     bool failed() const { return task_id < 0; }
 };
@@ -71,11 +71,13 @@ public:
     /**
      * Initialize the allocator with task ring and heap ring resources.
      */
-    void init(PTO2TaskDescriptor* descriptors, int32_t window_size,
-              std::atomic<int32_t>* current_index_ptr,
-              std::atomic<int32_t>* last_alive_ptr,
-              void* heap_base, uint64_t heap_size,
-              std::atomic<int32_t>* error_code_ptr) {
+    void init(PTO2TaskDescriptor* descriptors,
+        int32_t window_size,
+        std::atomic<int32_t>* current_index_ptr,
+        std::atomic<int32_t>* last_alive_ptr,
+        void* heap_base,
+        uint64_t heap_size,
+        std::atomic<int32_t>* error_code_ptr) {
         descriptors_ = descriptors;
         window_size_ = window_size;
         window_mask_ = window_size - 1;
@@ -101,8 +103,8 @@ public:
      * @return Allocation result; check failed() for errors
      */
     PTO2TaskAllocResult alloc(int32_t output_size) {
-        uint64_t aligned_size = output_size > 0
-            ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
+        uint64_t aligned_size =
+            output_size > 0 ? PTO2_ALIGN_UP(static_cast<uint64_t>(output_size), PTO2_ALIGN_SIZE) : 0;
 
         int spin_count = 0;
         int32_t prev_last_alive = last_alive_ptr_->load(std::memory_order_acquire);
@@ -116,15 +118,14 @@ public:
 
         while (true) {
             // Check both resources; commit only if both available
-            if (local_task_id_ - last_alive  + 1 < window_size_) {
+            if (local_task_id_ - last_alive + 1 < window_size_) {
                 void* heap_ptr = try_bump_heap(aligned_size);
                 if (heap_ptr) {
                     int32_t task_id = commit_task();
 #if PTO2_ORCH_PROFILING
                     record_wait(spin_count, wait_start, waiting);
 #endif
-                    return {task_id, task_id & window_mask_,
-                            heap_ptr, static_cast<char*>(heap_ptr) + aligned_size};
+                    return {task_id, task_id & window_mask_, heap_ptr, static_cast<char*>(heap_ptr) + aligned_size};
                 }
                 blocked_on_heap = true;
             } else {
@@ -134,7 +135,10 @@ public:
             // Spin: wait for scheduler to advance last_task_alive
             spin_count++;
 #if PTO2_ORCH_PROFILING
-            if (!waiting) { wait_start = get_sys_cnt_aicpu(); waiting = true; }
+            if (!waiting) {
+                wait_start = get_sys_cnt_aicpu();
+                waiting = true;
+            }
 #endif
             last_alive = last_alive_ptr_->load(std::memory_order_acquire);
             update_heap_tail(last_alive);
@@ -166,13 +170,9 @@ public:
     // Task descriptor accessors
     // =========================================================================
 
-    PTO2TaskDescriptor& task(int32_t task_id) const {
-        return descriptors_[task_id & window_mask_];
-    }
+    PTO2TaskDescriptor& task(int32_t task_id) const { return descriptors_[task_id & window_mask_]; }
 
-    PTO2TaskDescriptor& task_by_slot(int32_t slot) const {
-        return descriptors_[slot];
-    }
+    PTO2TaskDescriptor& task_by_slot(int32_t slot) const { return descriptors_[slot]; }
 
     // =========================================================================
     // State queries
@@ -207,14 +207,14 @@ private:
     std::atomic<int32_t>* last_alive_ptr_ = nullptr;
 
     // --- Heap ---
-    void*    heap_base_ = nullptr;
+    void* heap_base_ = nullptr;
     uint64_t heap_size_ = 0;
 
     // --- Local state (single-writer, no atomics needed) ---
-    int32_t  local_task_id_ = 0;      // Next task ID to allocate
-    uint64_t heap_top_ = 0;     // Current heap allocation pointer
-    uint64_t heap_tail_ = 0;    // Heap reclamation pointer (derived from consumed tasks)
-    int32_t  last_alive_seen_ = 0;    // last_task_alive at last heap_tail derivation
+    int32_t local_task_id_ = 0;    // Next task ID to allocate
+    uint64_t heap_top_ = 0;        // Current heap allocation pointer
+    uint64_t heap_tail_ = 0;       // Heap reclamation pointer (derived from consumed tasks)
+    int32_t last_alive_seen_ = 0;  // last_task_alive at last heap_tail derivation
 
     // --- Shared ---
     std::atomic<int32_t>* error_code_ptr_ = nullptr;
@@ -245,8 +245,7 @@ private:
         last_alive_seen_ = last_alive;
 
         PTO2TaskDescriptor& desc = descriptors_[(last_alive - 1) & window_mask_];
-        heap_tail_ = static_cast<uint64_t>(
-            static_cast<char*>(desc.packed_buffer_end) - static_cast<char*>(heap_base_));
+        heap_tail_ = static_cast<uint64_t>(static_cast<char*>(desc.packed_buffer_end) - static_cast<char*>(heap_base_));
     }
 
     /**
@@ -315,17 +314,21 @@ private:
         LOG_ERROR("========================================");
         LOG_ERROR("No progress after %d spins.", PTO2_ALLOC_SPIN_LIMIT);
         LOG_ERROR("  Task ring:  current=%d, last_alive=%d, active=%d/%d (%.1f%%)",
-                  local_task_id_, last_alive, active_tasks, window_size_,
-                  100.0 * active_tasks / window_size_);
-        LOG_ERROR("  Heap ring:  top=%" PRIu64 ", tail=%" PRIu64 ", size=%" PRIu64
-                  ", available=%" PRIu64,
-                  heap_top_, htail, heap_size_, heap_available());
+            local_task_id_,
+            last_alive,
+            active_tasks,
+            window_size_,
+            100.0 * active_tasks / window_size_);
+        LOG_ERROR("  Heap ring:  top=%" PRIu64 ", tail=%" PRIu64 ", size=%" PRIu64 ", available=%" PRIu64,
+            heap_top_,
+            htail,
+            heap_size_,
+            heap_available());
         if (heap_blocked) {
             LOG_ERROR("  Requested:  %d bytes", requested_output_size);
         }
         LOG_ERROR("Diagnosis:");
-        LOG_ERROR("  last_task_alive is stuck at %d, meaning task %d",
-                  last_alive, last_alive);
+        LOG_ERROR("  last_task_alive is stuck at %d, meaning task %d", last_alive, last_alive);
         LOG_ERROR("  cannot transition to CONSUMED. Possible causes:");
         LOG_ERROR("  1. Task %d still executing (subtasks not complete)", last_alive);
         LOG_ERROR("  2. Task %d fanout not fully released (downstream not done)", last_alive);
@@ -333,22 +336,18 @@ private:
         LOG_ERROR("  4. Orchestrator blocked here -> can't call scope_end -> circular wait");
         LOG_ERROR("Solution:");
         if (heap_blocked) {
-            LOG_ERROR("  Increase heap size (current: %" PRIu64 ", recommended: %" PRIu64 ")",
-                      heap_size_, heap_size_ * 2);
+            LOG_ERROR(
+                "  Increase heap size (current: %" PRIu64 ", recommended: %" PRIu64 ")", heap_size_, heap_size_ * 2);
             LOG_ERROR("  Compile-time: PTO2_HEAP_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<power-of-2 bytes> (e.g. %" PRIu64 ")",
-                      heap_size_ * 2);
+            LOG_ERROR("  Runtime env:  PTO2_RING_HEAP=<power-of-2 bytes> (e.g. %" PRIu64 ")", heap_size_ * 2);
         } else {
-            LOG_ERROR("  Increase task window size (current: %d, recommended: %d)",
-                      window_size_, active_tasks * 2);
+            LOG_ERROR("  Increase task window size (current: %d, recommended: %d)", window_size_, active_tasks * 2);
             LOG_ERROR("  Compile-time: PTO2_TASK_WINDOW_SIZE in pto_runtime2_types.h");
-            LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)",
-                      active_tasks * 2);
+            LOG_ERROR("  Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2> (e.g. %d)", active_tasks * 2);
         }
         LOG_ERROR("========================================");
         if (error_code_ptr_) {
-            int32_t code = heap_blocked ? PTO2_ERROR_HEAP_RING_DEADLOCK
-                                        : PTO2_ERROR_FLOW_CONTROL_DEADLOCK;
+            int32_t code = heap_blocked ? PTO2_ERROR_HEAP_RING_DEADLOCK : PTO2_ERROR_FLOW_CONTROL_DEADLOCK;
             error_code_ptr_->store(code, std::memory_order_release);
         }
     }
@@ -369,12 +368,12 @@ private:
  * is obtained via modulo: base[linear_index % capacity].
  */
 struct PTO2DepListPool {
-    PTO2DepListEntry* base;   // Pool base address
-    int32_t capacity;         // Total number of entries
-    int32_t top;              // Linear next-allocation counter (starts from 1)
-    int32_t tail;             // Linear first-alive counter (entries before this are dead)
-    int32_t high_water;       // Peak concurrent usage (top - tail)
-    int32_t last_reclaimed{0}; // last_task_alive at last successful reclamation
+    PTO2DepListEntry* base;     // Pool base address
+    int32_t capacity;           // Total number of entries
+    int32_t top;                // Linear next-allocation counter (starts from 1)
+    int32_t tail;               // Linear first-alive counter (entries before this are dead)
+    int32_t high_water;         // Peak concurrent usage (top - tail)
+    int32_t last_reclaimed{0};  // last_task_alive at last successful reclamation
 
     // Error code pointer for fatal error reporting (→ sm_header->orch_error_code)
     std::atomic<int32_t>* error_code_ptr = nullptr;
@@ -414,7 +413,7 @@ struct PTO2DepListPool {
      * Ensure dep pool for a specific ring has at least `needed` entries available.
      * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
      */
-    void ensure_space(PTO2SchedulerState& sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
+    void ensure_space(PTO2SchedulerState& sched, PTO2RingFlowControl& fc, uint8_t ring_id, int32_t needed);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)
@@ -476,20 +475,16 @@ struct PTO2DepListPool {
     }
 
     /**
-    * Get entry by offset
-    */
+     * Get entry by offset
+     */
     PTO2DepListEntry* pto2_dep_pool_get(int32_t offset) {
         if (offset <= 0) return NULL;
         return &base[offset];
     }
 
-    int32_t used() const {
-        return top - tail;
-    }
+    int32_t used() const { return top - tail; }
 
-    int32_t available() const {
-        return capacity - used();
-    }
+    int32_t available() const { return capacity - used(); }
 };
 
 // =============================================================================
@@ -502,7 +497,7 @@ struct PTO2DepListPool {
  */
 struct PTO2RingSet {
     PTO2TaskAllocator task_allocator;
-    PTO2DepListPool   dep_pool;
+    PTO2DepListPool dep_pool;
 };
 
-#endif // PTO_RING_BUFFER_H
+#endif  // PTO_RING_BUFFER_H

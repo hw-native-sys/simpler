@@ -63,28 +63,27 @@
  */
 struct PerfRecord {
     // Timing information (device clock timestamps)
-    uint64_t start_time;         // Task start timestamp (get_sys_cnt)
-    uint64_t end_time;           // Task end timestamp
-    uint64_t duration;           // Execution duration (end - start)
+    uint64_t start_time;  // Task start timestamp (get_sys_cnt)
+    uint64_t end_time;    // Task end timestamp
+    uint64_t duration;    // Execution duration (end - start)
 
     // AICPU-side timestamps (written by AICPU, not AICore)
-    uint64_t dispatch_time;      // AICPU timestamp: when task was dispatched to AICore (task_status set to 1)
-    uint64_t finish_time;        // AICPU timestamp: when AICPU observed task completion (task_status back to 0)
+    uint64_t dispatch_time;  // AICPU timestamp: when task was dispatched to AICore (task_status set to 1)
+    uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion (task_status back to 0)
 
     // Task identification
-    uint32_t task_id;         // Register dispatch id (per-core monotonic counter, NOT mixed_task_id).
-                              // May collide across cores; use (ring_id, task_id, core_id) as unique key.
-    uint32_t func_id;         // Kernel function identifier
-    CoreType core_type;       // Core type (AIC/AIV)
-    uint8_t ring_id;          // Ring layer (0 for single-ring / legacy)
+    uint32_t task_id;    // Register dispatch id (per-core monotonic counter, NOT mixed_task_id).
+                         // May collide across cores; use (ring_id, task_id, core_id) as unique key.
+    uint32_t func_id;    // Kernel function identifier
+    CoreType core_type;  // Core type (AIC/AIV)
+    uint8_t ring_id;     // Ring layer (0 for single-ring / legacy)
 
     // Dependency relationship (fanout only)
     int32_t fanout[RUNTIME_MAX_FANOUT];  // Successor task ID array
-    int32_t fanout_count;                 // Number of successor tasks
+    int32_t fanout_count;                // Number of successor tasks
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(PerfRecord) % 64 == 0,
-              "PerfRecord must be 64-byte aligned for optimal cache performance");
+static_assert(sizeof(PerfRecord) % 64 == 0, "PerfRecord must be 64-byte aligned for optimal cache performance");
 
 // =============================================================================
 // PerfBuffer - Fixed-Size Record Buffer
@@ -98,7 +97,7 @@ static_assert(sizeof(PerfRecord) % 64 == 0,
  */
 struct PerfBuffer {
     PerfRecord records[PLATFORM_PROF_BUFFER_SIZE];  // Record array
-    volatile uint32_t count;                         // Current record count
+    volatile uint32_t count;                        // Current record count
 } __attribute__((aligned(64)));
 
 // =============================================================================
@@ -122,13 +121,12 @@ struct PerfBuffer {
  */
 struct PerfFreeQueue {
     volatile uint64_t buffer_ptrs[PLATFORM_PROF_SLOT_COUNT];  // Free buffer addresses
-    volatile uint32_t head;  // Consumer read position (Device increments)
-    volatile uint32_t tail;  // Producer write position (Host increments)
-    uint32_t pad[13];        // Pad to 128 bytes (aligned to cache line)
+    volatile uint32_t head;                                   // Consumer read position (Device increments)
+    volatile uint32_t tail;                                   // Producer write position (Host increments)
+    uint32_t pad[13];                                         // Pad to 128 bytes (aligned to cache line)
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(PerfFreeQueue) == 128,
-              "PerfFreeQueue must be 128 bytes for cache alignment");
+static_assert(sizeof(PerfFreeQueue) == 128, "PerfFreeQueue must be 128 bytes for cache alignment");
 
 // =============================================================================
 // PerfBufferState - Per-Core/Thread Buffer State (Unified for PerfRecord and Phase)
@@ -153,14 +151,13 @@ static_assert(sizeof(PerfFreeQueue) == 128,
  * - current_buf_seq: Device writes (monotonic counter)
  */
 struct PerfBufferState {
-    PerfFreeQueue free_queue;            // SPSC queue of free buffer addresses
-    volatile uint64_t current_buf_ptr;   // Current active buffer (0 = none)
-    volatile uint32_t current_buf_seq;   // Sequence number for ordering
-    uint32_t pad[13];                    // Pad to 192 bytes (aligned to cache line)
+    PerfFreeQueue free_queue;           // SPSC queue of free buffer addresses
+    volatile uint64_t current_buf_ptr;  // Current active buffer (0 = none)
+    volatile uint32_t current_buf_seq;  // Sequence number for ordering
+    uint32_t pad[13];                   // Pad to 192 bytes (aligned to cache line)
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(PerfBufferState) == 192,
-              "PerfBufferState must be 192 bytes for cache alignment");
+static_assert(sizeof(PerfBufferState) == 192, "PerfBufferState must be 192 bytes for cache alignment");
 
 // Type alias for semantic clarity in Phase profiling context
 using PhaseBufferState = PerfBufferState;  // Per-thread Phase profiling
@@ -180,11 +177,11 @@ using PhaseBufferState = PerfBufferState;  // Per-thread Phase profiling
  * - Phase entry:      core_index = thread_idx, is_phase = 1
  */
 struct ReadyQueueEntry {
-    uint32_t core_index;      // Core index (0 ~ num_cores-1), or thread_idx for phase entries
-    uint32_t is_phase;        // 0 = PerfRecord, 1 = Phase
-    uint64_t buffer_ptr;      // Device pointer to the full buffer
-    uint32_t buffer_seq;      // Sequence number for ordering
-    uint32_t pad;             // Alignment padding
+    uint32_t core_index;  // Core index (0 ~ num_cores-1), or thread_idx for phase entries
+    uint32_t is_phase;    // 0 = PerfRecord, 1 = Phase
+    uint64_t buffer_ptr;  // Device pointer to the full buffer
+    uint32_t buffer_seq;  // Sequence number for ordering
+    uint32_t pad;         // Alignment padding
 } __attribute__((aligned(32)));
 
 // =============================================================================
@@ -215,8 +212,8 @@ struct PerfDataHeader {
     volatile uint32_t queue_tails[PLATFORM_MAX_AICPU_THREADS];  // Producer write positions (AICPU modifies)
 
     // Metadata (Host initializes, Device read-only)
-    uint32_t num_cores;                              // Actual number of cores launched
-    volatile uint32_t total_tasks;                   // Total tasks (AICPU writes after orchestration)
+    uint32_t num_cores;             // Actual number of cores launched
+    volatile uint32_t total_tasks;  // Total tasks (AICPU writes after orchestration)
 } __attribute__((aligned(64)));
 
 // =============================================================================
@@ -231,21 +228,21 @@ struct PerfDataHeader {
  */
 enum class AicpuPhaseId : uint32_t {
     // Scheduler phases (0-3)
-    SCHED_COMPLETE    = 0,  // Process completed tasks (fanout traversal)
-    SCHED_DISPATCH    = 1,  // Dispatch ready tasks to idle cores
-    SCHED_SCAN        = 2,  // Incremental scan for root tasks
-    SCHED_IDLE_WAIT   = 3,  // Idle/spinning (no progress)
+    SCHED_COMPLETE = 0,     // Process completed tasks (fanout traversal)
+    SCHED_DISPATCH = 1,     // Dispatch ready tasks to idle cores
+    SCHED_SCAN = 2,         // Incremental scan for root tasks
+    SCHED_IDLE_WAIT = 3,    // Idle/spinning (no progress)
     SCHED_PHASE_COUNT = 4,  // Sentinel: number of scheduler phases
     // Orchestrator phases (16-24)
-    ORCH_SYNC      = 16,  // tensormap sync
-    ORCH_ALLOC     = 17,  // task_ring_alloc
-    ORCH_PARAMS    = 18,  // param copy
-    ORCH_LOOKUP    = 19,  // tensormap lookup + dep
-    ORCH_HEAP      = 20,  // heap alloc
-    ORCH_INSERT    = 21,  // tensormap insert
-    ORCH_FANIN     = 22,  // fanin + early-ready
-    ORCH_FINALIZE  = 23,  // scheduler init + SM
-    ORCH_SCOPE_END = 24   // scope_end
+    ORCH_SYNC = 16,      // tensormap sync
+    ORCH_ALLOC = 17,     // task_ring_alloc
+    ORCH_PARAMS = 18,    // param copy
+    ORCH_LOOKUP = 19,    // tensormap lookup + dep
+    ORCH_HEAP = 20,      // heap alloc
+    ORCH_INSERT = 21,    // tensormap insert
+    ORCH_FANIN = 22,     // fanin + early-ready
+    ORCH_FINALIZE = 23,  // scheduler init + SM
+    ORCH_SCOPE_END = 24  // scope_end
 };
 
 /**
@@ -280,12 +277,12 @@ struct AicpuOrchSummary {
     uint64_t insert_cycle;     // tensormap_insert phase
     uint64_t fanin_cycle;      // fanin+ready phase
     uint64_t scope_end_cycle;  // scope_end phase
-    int64_t  submit_count;     // Total tasks submitted
+    int64_t submit_count;      // Total tasks submitted
     uint32_t magic;            // Validation magic (AICPU_PHASE_MAGIC)
     uint32_t padding;          // Alignment padding
 } __attribute__((aligned(64)));
 
-constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;  // "ACPH"
+constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;        // "ACPH"
 constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;  // ~512KB per thread
 
 /**
@@ -306,12 +303,12 @@ struct PhaseBuffer {
  * Contains metadata and per-thread tracking.
  */
 struct AicpuPhaseHeader {
-    uint32_t magic;                  // Validation magic (AICPU_PHASE_MAGIC)
-    uint32_t num_sched_threads;      // Number of scheduler threads
-    uint32_t records_per_thread;     // Max records per PhaseBuffer
-    uint32_t num_cores;              // Total number of cores with valid assignments
+    uint32_t magic;                             // Validation magic (AICPU_PHASE_MAGIC)
+    uint32_t num_sched_threads;                 // Number of scheduler threads
+    uint32_t records_per_thread;                // Max records per PhaseBuffer
+    uint32_t num_cores;                         // Total number of cores with valid assignments
     int8_t core_to_thread[PLATFORM_MAX_CORES];  // core_id → scheduler thread index (-1 = unassigned)
-    AicpuOrchSummary orch_summary;   // Orchestrator cumulative data
+    AicpuOrchSummary orch_summary;              // Orchestrator cumulative data
 } __attribute__((aligned(64)));
 
 // =============================================================================
@@ -341,9 +338,7 @@ inline size_t calc_perf_data_size(int num_cores) {
  * @param base_ptr Shared memory base address (device_ptr or host_ptr)
  * @return PerfDataHeader pointer
  */
-inline PerfDataHeader* get_perf_header(void* base_ptr) {
-    return (PerfDataHeader*)base_ptr;
-}
+inline PerfDataHeader* get_perf_header(void* base_ptr) { return (PerfDataHeader*)base_ptr; }
 
 /**
  * Get PerfBufferState array start address
@@ -374,9 +369,7 @@ inline PerfBufferState* get_perf_buffer_state(void* base_ptr, int core_index) {
  * @return Total bytes needed for header + all buffer states
  */
 inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_threads) {
-    return calc_perf_data_size(num_cores)
-         + sizeof(AicpuPhaseHeader)
-         + num_sched_threads * sizeof(PhaseBufferState);
+    return calc_perf_data_size(num_cores) + sizeof(AicpuPhaseHeader) + num_sched_threads * sizeof(PhaseBufferState);
 }
 
 /**

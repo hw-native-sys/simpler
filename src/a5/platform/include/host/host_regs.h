@@ -35,8 +35,8 @@ constexpr uint32_t REG_AICORE_MAP_SIZE = 0x300000;
 /**
  * Register offsets for AIV sub-cores relative to AICore base
  */
-constexpr uint64_t REG_AIV_FIRST_OFFSET = REG_SUB_CORE_STRIDE;        // 1M
-constexpr uint64_t REG_AIV_SECOND_OFFSET = 2 * REG_SUB_CORE_STRIDE;   // 2M
+constexpr uint64_t REG_AIV_FIRST_OFFSET = REG_SUB_CORE_STRIDE;       // 1M
+constexpr uint64_t REG_AIV_SECOND_OFFSET = 2 * REG_SUB_CORE_STRIDE;  // 2M
 
 /**
  * Initialize AICore register addresses for runtime
@@ -49,9 +49,6 @@ constexpr uint64_t REG_AIV_SECOND_OFFSET = 2 * REG_SUB_CORE_STRIDE;   // 2M
  * @param allocator Memory allocator for device memory
  * @return 0 on success, negative on failure
  */
-int init_aicore_register_addresses(
-    uint64_t* runtime_regs_ptr,
-    uint64_t device_id,
-    MemoryAllocator& allocator);
+int init_aicore_register_addresses(uint64_t* runtime_regs_ptr, uint64_t device_id, MemoryAllocator& allocator);
 
 #endif  // PLATFORM_HOST_HOST_REGS_H_

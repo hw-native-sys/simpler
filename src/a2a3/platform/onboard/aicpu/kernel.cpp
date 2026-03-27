@@ -72,8 +72,7 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
     set_platform_regs(k_args->regs);
 
     // Affinity gate: drop excess threads before entering runtime
-    if (!platform_aicpu_affinity_gate(runtime->sche_cpu_num,
-                                      PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
+    if (!platform_aicpu_affinity_gate(runtime->sche_cpu_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {
         LOG_INFO("Thread dropped by cluster affinity");
         return 0;
     }

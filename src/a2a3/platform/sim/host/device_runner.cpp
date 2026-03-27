@@ -20,7 +20,8 @@
 
 // Function pointer types for dynamically loaded executors
 typedef int (*aicpu_execute_func_t)(Runtime* runtime);
-typedef void (*aicore_execute_func_t)(Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs);
+typedef void (*aicore_execute_func_t)(
+    Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs);
 typedef void (*set_platform_regs_func_t)(uint64_t regs);
 
 // =============================================================================
@@ -32,19 +33,16 @@ DeviceRunner& DeviceRunner::get() {
     return runner;
 }
 
-DeviceRunner::~DeviceRunner() {
-    finalize();
-}
+DeviceRunner::~DeviceRunner() { finalize(); }
 
-int DeviceRunner::ensure_device_initialized(int device_id,
-                                            const std::vector<uint8_t>& aicpu_so_binary,
-                                            const std::vector<uint8_t>& aicore_kernel_binary) {
+int DeviceRunner::ensure_device_initialized(
+    int device_id, const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary) {
     device_id_ = device_id;
     return ensure_binaries_loaded(aicpu_so_binary, aicore_kernel_binary);
 }
 
-int DeviceRunner::ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_binary,
-                                         const std::vector<uint8_t>& aicore_kernel_binary) {
+int DeviceRunner::ensure_binaries_loaded(
+    const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary) {
     // Skip if already loaded
     if (aicpu_execute_func_ != nullptr && aicore_execute_func_ != nullptr) {
         return 0;
@@ -67,13 +65,13 @@ int DeviceRunner::ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_bi
             return -1;
         }
 
-        aicpu_execute_func_ = reinterpret_cast<int(*)(Runtime*)>(dlsym(aicpu_so_handle_, "aicpu_execute"));
+        aicpu_execute_func_ = reinterpret_cast<int (*)(Runtime*)>(dlsym(aicpu_so_handle_, "aicpu_execute"));
         if (aicpu_execute_func_ == nullptr) {
             LOG_ERROR("dlsym failed for aicpu_execute: %s", dlerror());
             return -1;
         }
 
-        set_platform_regs_func_ = reinterpret_cast<void(*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_regs"));
+        set_platform_regs_func_ = reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_regs"));
         if (set_platform_regs_func_ == nullptr) {
             LOG_ERROR("dlsym failed for set_platform_regs: %s", dlerror());
             return -1;
@@ -99,7 +97,8 @@ int DeviceRunner::ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_bi
             return -1;
         }
 
-        aicore_execute_func_ = reinterpret_cast<void(*)(Runtime*, int, CoreType, uint32_t, uint64_t)>(dlsym(aicore_so_handle_, "aicore_execute_wrapper"));
+        aicore_execute_func_ = reinterpret_cast<void (*)(Runtime*, int, CoreType, uint32_t, uint64_t)>(
+            dlsym(aicore_so_handle_, "aicore_execute_wrapper"));
         if (aicore_execute_func_ == nullptr) {
             LOG_ERROR("dlsym failed for aicore_execute_wrapper: %s", dlerror());
             return -1;
@@ -110,9 +109,7 @@ int DeviceRunner::ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_bi
     return 0;
 }
 
-void* DeviceRunner::allocate_tensor(size_t bytes) {
-    return mem_alloc_.alloc(bytes);
-}
+void* DeviceRunner::allocate_tensor(size_t bytes) { return mem_alloc_.alloc(bytes); }
 
 void DeviceRunner::free_tensor(void* dev_ptr) {
     if (dev_ptr != nullptr) {
@@ -133,23 +130,20 @@ int DeviceRunner::copy_from_device(void* host_ptr, const void* dev_ptr, size_t b
 }
 
 int DeviceRunner::run(Runtime& runtime,
-                      int block_dim,
-                      int device_id,
-                      const std::vector<uint8_t>& aicpu_so_binary,
-                      const std::vector<uint8_t>& aicore_kernel_binary,
-                      int launch_aicpu_num) {
-
+    int block_dim,
+    int device_id,
+    const std::vector<uint8_t>& aicpu_so_binary,
+    const std::vector<uint8_t>& aicore_kernel_binary,
+    int launch_aicpu_num) {
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
-        LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]",
-                       launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
+        LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
     }
 
     // Validate block_dim
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
-        LOG_ERROR("block_dim (%d) must be in range [1, %d]",
-                       block_dim, PLATFORM_MAX_BLOCKDIM);
+        LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;
     }
 
@@ -157,26 +151,28 @@ int DeviceRunner::run(Runtime& runtime,
     int scheduler_thread_num = launch_aicpu_num - runtime.orch_thread_num;
 
     if (runtime.orch_thread_num > launch_aicpu_num) {
-        LOG_ERROR("orch_thread_num (%d) cannot exceed aicpu_thread_num (%d)",
-                  runtime.orch_thread_num, launch_aicpu_num);
+        LOG_ERROR(
+            "orch_thread_num (%d) cannot exceed aicpu_thread_num (%d)", runtime.orch_thread_num, launch_aicpu_num);
         return -1;
     }
 
     // Validate even core distribution for initial scheduler threads
     if (scheduler_thread_num > 0) {
         if (block_dim % scheduler_thread_num != 0) {
-            LOG_ERROR("block_dim (%d) not evenly divisible by scheduler_thread_num (%d)",
-                     block_dim, scheduler_thread_num);
+            LOG_ERROR(
+                "block_dim (%d) not evenly divisible by scheduler_thread_num (%d)", block_dim, scheduler_thread_num);
             return -1;
         }
     } else {
-        LOG_INFO("All %d threads are orchestrators, cores will be assigned after orchestration completes",
-                 launch_aicpu_num);
+        LOG_INFO(
+            "All %d threads are orchestrators, cores will be assigned after orchestration completes", launch_aicpu_num);
         // Post-transition: all threads become schedulers
         if (block_dim % launch_aicpu_num != 0) {
-            LOG_WARN("block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
-                     "some threads will have different core counts after transition",
-                     block_dim, launch_aicpu_num);
+            LOG_WARN(
+                "block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
+                "some threads will have different core counts after transition",
+                block_dim,
+                launch_aicpu_num);
         }
     }
 
@@ -192,8 +188,7 @@ int DeviceRunner::run(Runtime& runtime,
     int num_aicore = block_dim * cores_per_blockdim_;
 
     if (num_aicore > RUNTIME_MAX_WORKER) {
-        LOG_ERROR("num_aicore (%d) exceeds RUNTIME_MAX_WORKER (%d)",
-                       num_aicore, RUNTIME_MAX_WORKER);
+        LOG_ERROR("num_aicore (%d) exceeds RUNTIME_MAX_WORKER (%d)", num_aicore, RUNTIME_MAX_WORKER);
         return -1;
     }
 
@@ -223,8 +218,7 @@ int DeviceRunner::run(Runtime& runtime,
         if (task != nullptr) {
             uint64_t addr = runtime.get_function_bin_addr(task->func_id);
             task->function_bin_addr = addr;
-            LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx",
-                          i, task->func_id, addr);
+            LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx", i, task->func_id, addr);
         }
     }
 
@@ -258,9 +252,7 @@ int DeviceRunner::run(Runtime& runtime,
     }
     std::memset(reg_blocks, 0, total_reg_size);
 
-    auto reg_blocks_cleanup = RAIIScopeGuard([this, reg_blocks]() {
-        mem_alloc_.free(reg_blocks);
-    });
+    auto reg_blocks_cleanup = RAIIScopeGuard([this, reg_blocks]() { mem_alloc_.free(reg_blocks); });
 
     // Build array of per-core register base addresses
     size_t regs_array_size = num_aicore * sizeof(uint64_t);
@@ -270,8 +262,7 @@ int DeviceRunner::run(Runtime& runtime,
         return -1;
     }
     for (int i = 0; i < num_aicore; i++) {
-        regs_array[i] = reinterpret_cast<uint64_t>(
-            static_cast<uint8_t*>(reg_blocks) + i * SIM_REG_BLOCK_SIZE);
+        regs_array[i] = reinterpret_cast<uint64_t>(static_cast<uint8_t*>(reg_blocks) + i * SIM_REG_BLOCK_SIZE);
     }
     kernel_args_.regs = reinterpret_cast<uint64_t>(regs_array);
 
@@ -320,9 +311,8 @@ int DeviceRunner::run(Runtime& runtime,
     // Poll and collect performance data during execution (if enabled)
     std::thread collector_thread;
     if (runtime.enable_profiling) {
-        collector_thread = std::thread([this, &runtime]() {
-            poll_and_collect_performance_data(runtime.get_task_count());
-        });
+        collector_thread =
+            std::thread([this, &runtime]() { poll_and_collect_performance_data(runtime.get_task_count()); });
     }
 
     // Wait for all threads to complete
@@ -363,11 +353,11 @@ void DeviceRunner::print_handshake_results() {
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
     for (int i = 0; i < worker_count_; i++) {
         LOG_DEBUG("  Core %d: aicore_done=%d aicpu_ready=%d control=%d task=%d",
-                      i,
-                      last_runtime_->workers[i].aicore_done,
-                      last_runtime_->workers[i].aicpu_ready,
-                      last_runtime_->workers[i].control,
-                      last_runtime_->workers[i].task);
+            i,
+            last_runtime_->workers[i].aicore_done,
+            last_runtime_->workers[i].aicpu_ready,
+            last_runtime_->workers[i].control,
+            last_runtime_->workers[i].task);
     }
 }
 
@@ -390,8 +380,7 @@ int DeviceRunner::finalize() {
 
     // Kernel binaries should have been removed by validate_runtime_impl()
     if (!func_id_to_addr_.empty()) {
-        LOG_ERROR("finalize() called with %zu kernel binaries still cached",
-                  func_id_to_addr_.size());
+        LOG_ERROR("finalize() called with %zu kernel binaries still cached", func_id_to_addr_.size());
         // Cleanup leaked handles
         for (auto& pair : func_id_to_addr_) {
             MappedKernel& kernel = pair.second;
@@ -493,8 +482,7 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data
 
     func_id_to_addr_[func_id] = kernel;
 
-    LOG_DEBUG("Registered kernel (dlopen): func_id=%d -> addr=0x%lx, handle=%p",
-                  func_id, kernel.func_addr, handle);
+    LOG_DEBUG("Registered kernel (dlopen): func_id=%d -> addr=0x%lx, handle=%p", func_id, kernel.func_addr, handle);
 
     return kernel.func_addr;
 }
@@ -533,8 +521,7 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
     };
 
     // Simulation: no registration needed (pass nullptr)
-    return perf_collector_.initialize(runtime, num_aicore, device_id,
-                                       alloc_cb, nullptr, free_cb, nullptr);
+    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, nullptr, free_cb, nullptr);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
@@ -544,4 +531,3 @@ void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
 int DeviceRunner::export_swimlane_json(const std::string& output_path) {
     return perf_collector_.export_swimlane_json(output_path);
 }
-

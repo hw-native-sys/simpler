@@ -29,11 +29,8 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
-    float scale_value,
-    __gm__ Tensor* pij,
-    __gm__ Tensor* mij,
-    __gm__ Tensor* lij) {
+static __aicore__ void softmax_prepare_impl(
+    __gm__ Tensor* sij, float scale_value, __gm__ Tensor* pij, __gm__ Tensor* mij, __gm__ Tensor* lij) {
     uint64_t valid_len = static_cast<uint64_t>(sij->shapes[1]);
     __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
     __gm__ half* pij_addr = reinterpret_cast<__gm__ half*>(pij->buffer.addr);

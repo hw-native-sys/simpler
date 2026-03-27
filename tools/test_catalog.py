@@ -60,7 +60,9 @@ def discover_platforms(project_root: Path | None = None) -> list[str]:
     return platforms
 
 
-def discover_runtimes_for_arch(arch: str, project_root: Path | None = None) -> list[str]:
+def discover_runtimes_for_arch(
+    arch: str, project_root: Path | None = None
+) -> list[str]:
     """Discover available runtimes for a specific architecture.
 
     Args:
@@ -107,11 +109,11 @@ def arch_from_platform(platform: str) -> str:
 class TestCase:
     """A discoverable test case (example or scene test)."""
 
-    name: str       # Relative name: "a2a3/host_build_graph/vector_example"
-    dir: str        # Full path to the case directory
-    arch: str       # Architecture: "a2a3", "a5"
-    runtime: str    # Runtime: "host_build_graph", etc.
-    source: str     # "example" or "st"
+    name: str  # Relative name: "a2a3/host_build_graph/vector_example"
+    dir: str  # Full path to the case directory
+    arch: str  # Architecture: "a2a3", "a5"
+    runtime: str  # Runtime: "host_build_graph", etc.
+    source: str  # "example" or "st"
 
 
 def _scan_case_dir(base_dir: Path, source: str) -> list[TestCase]:
@@ -152,13 +154,15 @@ def _scan_case_dir(base_dir: Path, source: str) -> list[TestCase]:
                 golden = case_dir / "golden.py"
                 if kernel_config.is_file() and golden.is_file():
                     name = f"{arch}/{runtime}/{case_dir.name}"
-                    cases.append(TestCase(
-                        name=name,
-                        dir=str(case_dir),
-                        arch=arch,
-                        runtime=runtime,
-                        source=source,
-                    ))
+                    cases.append(
+                        TestCase(
+                            name=name,
+                            dir=str(case_dir),
+                            arch=arch,
+                            runtime=runtime,
+                            source=source,
+                        )
+                    )
 
     return cases
 
@@ -194,8 +198,7 @@ def discover_test_cases(
         target_arch = arch_from_platform(platform)
         platform_runtimes = discover_runtimes_for_arch(target_arch, root)
         cases = [
-            c for c in cases
-            if c.arch == target_arch and c.runtime in platform_runtimes
+            c for c in cases if c.arch == target_arch and c.runtime in platform_runtimes
         ]
 
     # Apply runtime filter
@@ -227,10 +230,15 @@ def main():
     cases = sub.add_parser("cases", help="List discoverable test cases")
     cases.add_argument("--platform", default=None, help="Filter by platform")
     cases.add_argument("--runtime", default=None, help="Filter by runtime")
-    cases.add_argument("--source", default=None, choices=["example", "st"],
-                       help="Filter by source (example or st)")
-    cases.add_argument("--format", default="text", choices=["text", "json"],
-                       help="Output format")
+    cases.add_argument(
+        "--source",
+        default=None,
+        choices=["example", "st"],
+        help="Filter by source (example or st)",
+    )
+    cases.add_argument(
+        "--format", default="text", choices=["text", "json"], help="Output format"
+    )
 
     args = parser.parse_args()
 

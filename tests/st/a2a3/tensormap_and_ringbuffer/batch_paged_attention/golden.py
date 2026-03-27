@@ -52,4 +52,6 @@ def generate_inputs(params: dict) -> list:
 
 
 if __name__ == "__main__":
-    run_golden_test(ALL_CASES, DEFAULT_CASE, generate_inputs, label="Batch Paged Attention")
+    run_golden_test(
+        ALL_CASES, DEFAULT_CASE, generate_inputs, label="Batch Paged Attention"
+    )

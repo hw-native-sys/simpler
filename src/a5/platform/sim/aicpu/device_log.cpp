@@ -35,17 +35,17 @@ const char* TILE_FWK_DEVICE_MACHINE = "SIM_CPU";
 void init_log_switch() {
     // Read PTO_LOG_LEVEL environment variable
     const char* level_str = std::getenv("PTO_LOG_LEVEL");
-    
+
     if (level_str != nullptr) {
         // Convert to lowercase for comparison
         char level[64];
         strncpy(level, level_str, sizeof(level) - 1);
         level[sizeof(level) - 1] = '\0';
-        
+
         for (char* p = level; *p; ++p) {
             *p = tolower(*p);
         }
-        
+
         // Parse log level
         if (strcmp(level, "silent") == 0 || strcmp(level, "error") == 0) {
             // Silent/Error: only errors

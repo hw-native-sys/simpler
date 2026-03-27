@@ -40,22 +40,18 @@ AICORE constexpr inline T CeilAlign(T num_1, T num_2) {
 }
 
 template <int TILE>
-static __aicore__ void gemm_tile_impl(
-    __gm__ float* input_a,
-    __gm__ float* input_b,
-    __gm__ float* output) {
-
+static __aicore__ void gemm_tile_impl(__gm__ float* input_a, __gm__ float* input_b, __gm__ float* output) {
     constexpr int blockAlign = C0_SIZE_BYTE / sizeof(float);
     constexpr int M = CeilAlign<int>(TILE, 16);
     constexpr int K = CeilAlign<int>(TILE, blockAlign);
     constexpr int N = CeilAlign<int>(TILE, blockAlign);
 
-    using GlobalDataA = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
-    using GlobalDataB = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
-    using GlobalDataC = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+    using GlobalDataA =
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+    using GlobalDataB =
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+    using GlobalDataC =
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
 
     GlobalDataA src0Global(input_a);
     GlobalDataB src1Global(input_b);
@@ -109,8 +105,8 @@ static __aicore__ void gemm_tile_impl(
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ TensorData* input_a = reinterpret_cast<__gm__ TensorData*>(args[0]);
     __gm__ TensorData* input_b = reinterpret_cast<__gm__ TensorData*>(args[1]);
-    __gm__ TensorData* output  = reinterpret_cast<__gm__ TensorData*>(args[2]);
-    __gm__ TensorData* config  = reinterpret_cast<__gm__ TensorData*>(args[3]);
+    __gm__ TensorData* output = reinterpret_cast<__gm__ TensorData*>(args[2]);
+    __gm__ TensorData* config = reinterpret_cast<__gm__ TensorData*>(args[3]);
 
     __gm__ int64_t* cfg = reinterpret_cast<__gm__ int64_t*>(config->buffer.addr);
     uint64_t tile_size = static_cast<uint64_t>(cfg[0]);
@@ -127,11 +123,20 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
         __gm__ float* c_ptr = base_c + (tile_idx * tile_elems);
 
         switch (tile_size) {
-            case 16:  gemm_tile_impl<16>(a_ptr, b_ptr, c_ptr);  break;
-            case 32:  gemm_tile_impl<32>(a_ptr, b_ptr, c_ptr);  break;
-            case 64:  gemm_tile_impl<64>(a_ptr, b_ptr, c_ptr);  break;
-            case 128: gemm_tile_impl<128>(a_ptr, b_ptr, c_ptr); break;
-            default: break;
+            case 16:
+                gemm_tile_impl<16>(a_ptr, b_ptr, c_ptr);
+                break;
+            case 32:
+                gemm_tile_impl<32>(a_ptr, b_ptr, c_ptr);
+                break;
+            case 64:
+                gemm_tile_impl<64>(a_ptr, b_ptr, c_ptr);
+                break;
+            case 128:
+                gemm_tile_impl<128>(a_ptr, b_ptr, c_ptr);
+                break;
+            default:
+                break;
         }
     }
 }

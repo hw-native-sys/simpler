@@ -41,15 +41,16 @@ def _ensure_torch_map():
     if _TORCH_DTYPE_MAP is not None:
         return
     import torch
+
     _TORCH_DTYPE_MAP = {
-        torch.float32:  DataType.FLOAT32,
-        torch.float16:  DataType.FLOAT16,
-        torch.int32:    DataType.INT32,
-        torch.int16:    DataType.INT16,
-        torch.int8:     DataType.INT8,
-        torch.uint8:    DataType.UINT8,
+        torch.float32: DataType.FLOAT32,
+        torch.float16: DataType.FLOAT16,
+        torch.int32: DataType.INT32,
+        torch.int16: DataType.INT16,
+        torch.int8: DataType.INT8,
+        torch.uint8: DataType.UINT8,
         torch.bfloat16: DataType.BFLOAT16,
-        torch.int64:    DataType.INT64,
+        torch.int64: DataType.INT64,
     }
 
 
@@ -84,6 +85,7 @@ def make_scalar_arg(value) -> TaskArg:
     bit-cast to uint64.
     """
     import ctypes as _ct
+
     if isinstance(value, _ct._SimpleCData):
         if isinstance(value, (_ct.c_float, _ct.c_double)):
             uint_type = _ct.c_uint32 if isinstance(value, _ct.c_float) else _ct.c_uint64

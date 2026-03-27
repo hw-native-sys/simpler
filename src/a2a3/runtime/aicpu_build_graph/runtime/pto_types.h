@@ -24,11 +24,11 @@
 #include "tensor.h"
 
 // Task parameters
-#define PTO2_MAX_TENSOR_PARAMS    16      // Maximum tensor parameters per task
-#define PTO2_MAX_SCALAR_PARAMS    128     // Maximum scalar parameters per task
-#define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
-#define PTO2_MAX_INPUTS           16      // Maximum inputs per task
-#define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
+#define PTO2_MAX_TENSOR_PARAMS 16   // Maximum tensor parameters per task
+#define PTO2_MAX_SCALAR_PARAMS 128  // Maximum scalar parameters per task
+#define PTO2_MAX_OUTPUTS 16         // Maximum outputs per task
+#define PTO2_MAX_INPUTS 16          // Maximum inputs per task
+#define PTO2_MAX_INOUTS 8           // Maximum in-out params per task
 
 // =============================================================================
 // Parameter Types (for pto_submit_task API)
@@ -86,8 +86,9 @@ struct PTOParam {
 
     bool check_add_tensor_valid() {
         if (scalar_count != 0) {
-            set_error("add_input/add_output/add_inout called after add_scalar: "
-                      "all tensors must be added before any scalars");
+            set_error(
+                "add_input/add_output/add_inout called after add_scalar: "
+                "all tensors must be added before any scalars");
             return false;
         }
         if (tensor_count >= PTO2_MAX_TENSOR_PARAMS) {
@@ -98,7 +99,9 @@ struct PTOParam {
     }
 
     void add_input(Tensor& t) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         if (t.buffer.addr == 0) {
             set_error("INPUT tensor must have a non-NULL buffer address");
             return;
@@ -109,14 +112,18 @@ struct PTOParam {
     }
 
     void add_output(Tensor& t) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         tensors[tensor_count] = &t;
         tensor_types[tensor_count] = PTOParamType::OUTPUT;
         tensor_count++;
     }
 
     void add_inout(Tensor& t) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         if (t.buffer.addr == 0) {
             set_error("INOUT tensor must have a non-NULL buffer address");
             return;

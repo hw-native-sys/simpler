@@ -18,9 +18,8 @@
 // Heap Ring Buffer Implementation
 // =============================================================================
 
-void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
-                          std::atomic<uint64_t>* tail_ptr,
-                          std::atomic<uint64_t>* top_ptr) {
+void pto2_heap_ring_init(
+    PTO2HeapRing* ring, void* base, uint64_t size, std::atomic<uint64_t>* tail_ptr, std::atomic<uint64_t>* top_ptr) {
     ring->base = base;
     ring->size = size;
     ring->top_ptr = top_ptr;
@@ -31,9 +30,11 @@ void pto2_heap_ring_init(PTO2HeapRing* ring, void* base, uint64_t size,
 // Task Ring Buffer Implementation
 // =============================================================================
 
-void pto2_task_ring_init(PTO2TaskRing* ring, PTO2TaskDescriptor* descriptors,
-                          int32_t window_size, std::atomic<int32_t>* last_alive_ptr,
-                          std::atomic<int32_t>* current_index_ptr) {
+void pto2_task_ring_init(PTO2TaskRing* ring,
+    PTO2TaskDescriptor* descriptors,
+    int32_t window_size,
+    std::atomic<int32_t>* last_alive_ptr,
+    std::atomic<int32_t>* current_index_ptr) {
     ring->descriptors = descriptors;
     ring->window_size = window_size;
     ring->current_index_ptr = current_index_ptr;

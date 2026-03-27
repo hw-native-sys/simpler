@@ -25,8 +25,7 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void softmax_prepare_batch_impl(
-    __gm__ Tensor* sij_batch,
+static __aicore__ void softmax_prepare_batch_impl(__gm__ Tensor* sij_batch,
     __gm__ Tensor* pij_batch,
     __gm__ Tensor* mij_batch,
     __gm__ Tensor* lij_batch,
@@ -35,7 +34,6 @@ static __aicore__ void softmax_prepare_batch_impl(
     uint64_t batch_count,
     uint64_t block_idx,
     uint64_t batch_start) {
-
     __gm__ float* sij_base = reinterpret_cast<__gm__ float*>(sij_batch->buffer.addr);
     __gm__ half* pij_base = reinterpret_cast<__gm__ half*>(pij_batch->buffer.addr);
     __gm__ float* mij_base = reinterpret_cast<__gm__ float*>(mij_batch->buffer.addr);
@@ -151,7 +149,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* pij_batch = reinterpret_cast<__gm__ Tensor*>(args[1]);
     __gm__ Tensor* mij_batch = reinterpret_cast<__gm__ Tensor*>(args[2]);
     __gm__ Tensor* lij_batch = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    union { uint64_t u; float f; } scale_conv;
+    union {
+        uint64_t u;
+        float f;
+    } scale_conv;
     scale_conv.u = static_cast<uint64_t>(args[4]);
     float scale_value = scale_conv.f;
     uint64_t context_lens_ptr = static_cast<uint64_t>(args[5]);
@@ -160,6 +161,5 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t batch_start = static_cast<uint64_t>(args[8]);
 
     softmax_prepare_batch_impl<16, 16>(
-        sij_batch, pij_batch, mij_batch, lij_batch,
-        scale_value, context_lens_ptr, batch_count, block_idx, batch_start);
+        sij_batch, pij_batch, mij_batch, lij_batch, scale_value, context_lens_ptr, batch_count, block_idx, batch_start);
 }

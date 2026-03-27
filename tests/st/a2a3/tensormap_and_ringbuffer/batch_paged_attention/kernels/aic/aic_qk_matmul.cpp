@@ -25,8 +25,7 @@ using namespace pto;
 #endif
 
 template <int M, int K, int N>
-static __aicore__ void qk_matmul_batch_impl(
-    __gm__ Tensor* query,
+static __aicore__ void qk_matmul_batch_impl(__gm__ Tensor* query,
     __gm__ Tensor* key_cache,
     __gm__ Tensor* sij_batch,
     uint64_t block_table_ptr,
@@ -36,7 +35,6 @@ static __aicore__ void qk_matmul_batch_impl(
     uint64_t block_num,
     uint64_t num_heads,
     uint64_t batch_start) {
-
     __gm__ bfloat16_t* query_base = reinterpret_cast<__gm__ bfloat16_t*>(query->buffer.addr);
     __gm__ bfloat16_t* key_base = reinterpret_cast<__gm__ bfloat16_t*>(key_cache->buffer.addr);
     __gm__ float* sij_base = reinterpret_cast<__gm__ float*>(sij_batch->buffer.addr);
@@ -117,14 +115,26 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t q_tile_size = static_cast<uint64_t>(sij_batch->shapes[0] / batch_count);
 
     if (q_tile_size == 16) {
-        qk_matmul_batch_impl<16, 128, 128>(
-            query, key_cache, sij_batch,
-            block_table_ptr, batch_count, block_idx, q_offset, block_num, num_heads,
+        qk_matmul_batch_impl<16, 128, 128>(query,
+            key_cache,
+            sij_batch,
+            block_table_ptr,
+            batch_count,
+            block_idx,
+            q_offset,
+            block_num,
+            num_heads,
             batch_start);
     } else {
-        qk_matmul_batch_impl<64, 128, 64>(
-            query, key_cache, sij_batch,
-            block_table_ptr, batch_count, block_idx, q_offset, block_num, num_heads,
+        qk_matmul_batch_impl<64, 128, 64>(query,
+            key_cache,
+            sij_batch,
+            block_table_ptr,
+            batch_count,
+            block_idx,
+            q_offset,
+            block_num,
+            num_heads,
             batch_start);
     }
 }

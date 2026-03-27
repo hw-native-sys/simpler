@@ -16,8 +16,6 @@ def ensure(name: str) -> str:
         return cached
     value = os.environ.get(name)
     if not value:
-        raise EnvironmentError(
-            f"Environment variable '{name}' is not set."
-        )
+        raise EnvironmentError(f"Environment variable '{name}' is not set.")
     _cache[name] = value
     return value

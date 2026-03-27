@@ -19,10 +19,9 @@
  * 18 AICores per die.
  */
 static int get_aicore_reg_info(std::vector<int64_t>& regs, int64_t device_id) {
-
     // halResMap: Maps individual AICore resources (DAV_3510-specific)
-    auto halFunc = (int (*)(uint32_t devId, struct res_map_info* res_info, uint64_t* va,
-        uint32_t* len))dlsym(nullptr, "halResMap");
+    auto halFunc = (int (*)(uint32_t devId, struct res_map_info* res_info, uint64_t* va, uint32_t* len))dlsym(
+        nullptr, "halResMap");
 
     if (halFunc == nullptr) {
         LOG_ERROR("halResMap not found in symbol table");
@@ -101,11 +100,7 @@ static void get_aicore_regs(std::vector<int64_t>& regs, uint64_t device_id) {
     LOG_INFO("get_aicore_regs: Retrieved %zu register addresses", regs.size());
 }
 
-int init_aicore_register_addresses(
-    uint64_t* runtime_regs_ptr,
-    uint64_t device_id,
-    MemoryAllocator& allocator) {
-
+int init_aicore_register_addresses(uint64_t* runtime_regs_ptr, uint64_t device_id, MemoryAllocator& allocator) {
     if (runtime_regs_ptr == nullptr) {
         LOG_ERROR("init_aicore_register_addresses: Invalid parameters");
         return -1;
@@ -141,7 +136,8 @@ int init_aicore_register_addresses(
     *runtime_regs_ptr = reinterpret_cast<uint64_t>(reg_ptr);
 
     LOG_INFO("Successfully initialized register addresses: %zu addresses at device 0x%llx",
-             host_regs.size(), *runtime_regs_ptr);
+        host_regs.size(),
+        *runtime_regs_ptr);
 
     return 0;
 }

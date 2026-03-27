@@ -10,6 +10,16 @@ concurrency:
 
 jobs:
   # ---------- Python unit tests (no hardware) ----------
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.0
+        with:
+          extra_args: --all-files
+
   ut-py:
     runs-on: ubuntu-latest
     timeout-minutes: 10

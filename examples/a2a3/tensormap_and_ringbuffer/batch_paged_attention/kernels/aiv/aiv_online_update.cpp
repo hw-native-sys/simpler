@@ -26,8 +26,7 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void online_update_batch_impl(
-    __gm__ Tensor* mij_batch,
+static __aicore__ void online_update_batch_impl(__gm__ Tensor* mij_batch,
     __gm__ Tensor* lij_batch,
     __gm__ Tensor* oi_new_batch,
     __gm__ Tensor* mi_batch,
@@ -40,7 +39,6 @@ static __aicore__ void online_update_batch_impl(
     uint64_t q_offset,
     uint64_t num_heads,
     uint64_t batch_start) {
-
     __gm__ float* mij_base = reinterpret_cast<__gm__ float*>(mij_batch->buffer.addr);
     __gm__ float* lij_base = reinterpret_cast<__gm__ float*>(lij_batch->buffer.addr);
     __gm__ float* oi_new_base = reinterpret_cast<__gm__ float*>(oi_new_batch->buffer.addr);
@@ -217,8 +215,17 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t num_heads = static_cast<uint64_t>(args[11]);
     uint64_t batch_start = static_cast<uint64_t>(args[12]);
 
-    online_update_batch_impl<16, 16>(
-        mij_batch, lij_batch, oi_new_batch,
-        mi_batch, li_batch, oi_batch, out,
-        is_first, is_last, batch_count, q_offset, num_heads, batch_start);
+    online_update_batch_impl<16, 16>(mij_batch,
+        lij_batch,
+        oi_new_batch,
+        mi_batch,
+        li_batch,
+        oi_batch,
+        out,
+        is_first,
+        is_last,
+        batch_count,
+        q_offset,
+        num_heads,
+        batch_start);
 }

@@ -21,24 +21,24 @@
 // =============================================================================
 
 #ifdef __aarch64__
-    /**
-     * Read memory barrier (ARM64)
-     * Ensures all loads before this point complete before any loads after.
-     */
-    #define rmb() __asm__ __volatile__("dsb ld" ::: "memory")
+/**
+ * Read memory barrier (ARM64)
+ * Ensures all loads before this point complete before any loads after.
+ */
+#define rmb() __asm__ __volatile__("dsb ld" ::: "memory")
 
-    /**
-     * Write memory barrier (ARM64)
-     * Ensures all stores before this point complete before any stores after.
-     */
-    #define wmb() __asm__ __volatile__("dsb st" ::: "memory")
+/**
+ * Write memory barrier (ARM64)
+ * Ensures all stores before this point complete before any stores after.
+ */
+#define wmb() __asm__ __volatile__("dsb st" ::: "memory")
 #else
-    /**
-     * Compiler barrier (fallback for non-ARM64 platforms)
-     * Prevents compiler reordering but does not emit hardware barriers.
-     */
-    #define rmb() __asm__ __volatile__("" ::: "memory")
-    #define wmb() __asm__ __volatile__("" ::: "memory")
+/**
+ * Compiler barrier (fallback for non-ARM64 platforms)
+ * Prevents compiler reordering but does not emit hardware barriers.
+ */
+#define rmb() __asm__ __volatile__("" ::: "memory")
+#define wmb() __asm__ __volatile__("" ::: "memory")
 #endif
 
 #endif  // PLATFORM_COMMON_MEMORY_BARRIER_H_

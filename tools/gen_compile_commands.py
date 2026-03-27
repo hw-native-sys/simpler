@@ -63,7 +63,8 @@ def discover_runtimes(arch: str) -> list:
     if not runtime_base.is_dir():
         return []
     return sorted(
-        d.name for d in runtime_base.iterdir()
+        d.name
+        for d in runtime_base.iterdir()
         if d.is_dir() and (d / "build_config.py").exists()
     )
 
@@ -73,7 +74,8 @@ def discover_variants(arch: str) -> list:
     if not platform_base.is_dir():
         return []
     return sorted(
-        d.name for d in platform_base.iterdir()
+        d.name
+        for d in platform_base.iterdir()
         if d.is_dir() and d.name not in ("include", "src")
     )
 
@@ -105,8 +107,12 @@ def generate(arch: str, runtime_name: str, variant: str) -> list:
             continue
 
         target_cfg = build_config[target_name]
-        include_dirs = [str((runtime_dir / p).resolve()) for p in target_cfg["include_dirs"]]
-        source_dirs = [str((runtime_dir / p).resolve()) for p in target_cfg["source_dirs"]]
+        include_dirs = [
+            str((runtime_dir / p).resolve()) for p in target_cfg["include_dirs"]
+        ]
+        source_dirs = [
+            str((runtime_dir / p).resolve()) for p in target_cfg["source_dirs"]
+        ]
 
         target = getattr(compiler, f"{target_name}_target")
         cmake_args = target.gen_cmake_args(include_dirs, source_dirs)
@@ -133,11 +139,17 @@ def generate_for_arch(arch: str, default_runtime: str, default_variant: str) -> 
         return
 
     if default_runtime not in runtimes:
-        print(f"  {arch}: default runtime '{default_runtime}' not found, using {runtimes[0]}", file=sys.stderr)
+        print(
+            f"  {arch}: default runtime '{default_runtime}' not found, using {runtimes[0]}",
+            file=sys.stderr,
+        )
         default_runtime = runtimes[0]
 
     if default_variant not in variants:
-        print(f"  {arch}: default variant '{default_variant}' not found, using {variants[0]}", file=sys.stderr)
+        print(
+            f"  {arch}: default variant '{default_variant}' not found, using {variants[0]}",
+            file=sys.stderr,
+        )
         default_variant = variants[0]
 
     # Cache: (runtime, variant) → entries, to avoid duplicate cmake runs
@@ -153,17 +165,37 @@ def generate_for_arch(arch: str, default_runtime: str, default_variant: str) -> 
     for runtime in runtimes:
         entries = get_entries(runtime, default_variant)
         if entries:
-            output = PROJECT_ROOT / "src" / arch / "runtime" / runtime / "compile_commands.json"
+            output = (
+                PROJECT_ROOT
+                / "src"
+                / arch
+                / "runtime"
+                / runtime
+                / "compile_commands.json"
+            )
             write_compile_commands(entries, output)
-            print(f"  {output.relative_to(PROJECT_ROOT)}  ({len(entries)} entries, variant={default_variant})", file=sys.stderr)
+            print(
+                f"  {output.relative_to(PROJECT_ROOT)}  ({len(entries)} entries, variant={default_variant})",
+                file=sys.stderr,
+            )
 
     # Default runtime × every variant → platform variant dir
     for variant in variants:
         entries = get_entries(default_runtime, variant)
         if entries:
-            output = PROJECT_ROOT / "src" / arch / "platform" / variant / "compile_commands.json"
+            output = (
+                PROJECT_ROOT
+                / "src"
+                / arch
+                / "platform"
+                / variant
+                / "compile_commands.json"
+            )
             write_compile_commands(entries, output)
-            print(f"  {output.relative_to(PROJECT_ROOT)}  ({len(entries)} entries, runtime={default_runtime})", file=sys.stderr)
+            print(
+                f"  {output.relative_to(PROJECT_ROOT)}  ({len(entries)} entries, runtime={default_runtime})",
+                file=sys.stderr,
+            )
 
 
 def main():
@@ -171,14 +203,18 @@ def main():
         description="Generate compile_commands.json for clangd via cmake"
     )
     parser.add_argument(
-        "--default-runtime", default="tensormap_and_ringbuffer",
+        "--default-runtime",
+        default="tensormap_and_ringbuffer",
         help="Default runtime for platform variant generation (default: tensormap_and_ringbuffer)",
     )
     parser.add_argument(
-        "--default-variant", default="onboard",
+        "--default-variant",
+        default="onboard",
         help="Default platform variant for runtime generation (default: onboard)",
     )
-    parser.add_argument("--list", action="store_true", help="List available options per arch")
+    parser.add_argument(
+        "--list", action="store_true", help="List available options per arch"
+    )
     args = parser.parse_args()
 
     if args.list:

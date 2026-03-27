@@ -39,7 +39,12 @@
 #if PTO2_PROFILING
 // Accumulated nanoseconds per sub-step
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
-#define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
+#define CYCLE_COUNT_LAP(acc)       \
+    do {                           \
+        _t1 = get_sys_cnt_aicpu(); \
+        acc += (_t1 - _t0);        \
+        _t0 = _t1;                 \
+    } while (0)
 #else
 #define CYCLE_COUNT_START()
 #define CYCLE_COUNT_LAP(acc)
@@ -48,7 +53,8 @@
 // Device orchestration function signature (loaded via dlopen).
 // The orchestration .so receives a PTO2Runtime* (with ops table populated)
 // instead of a raw shared-memory pointer.
-typedef void (*DeviceOrchestrationFunc)(PTO2Runtime* rt, TaskArg* orch_args, int32_t orch_thread_num, int32_t orch_thread_index);
+typedef void (*DeviceOrchestrationFunc)(
+    PTO2Runtime* rt, TaskArg* orch_args, int32_t orch_thread_num, int32_t orch_thread_index);
 
 // Config function exported by orchestration .so
 typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(TaskArg* orch_args);
@@ -58,8 +64,8 @@ constexpr int32_t MAX_AIC_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD;
 constexpr int32_t MAX_AIV_PER_THREAD = PLATFORM_MAX_AIV_PER_THREAD;
 constexpr int32_t MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 
-constexpr int32_t MAX_IDLE_ITERATIONS = 800000;  // ~20s idle then scheduler gives up (avoid long hang)
-constexpr int32_t STALL_LOG_INTERVAL = 50000;    // DEV_ALWAYS every N idle iters to debug hang
+constexpr int32_t MAX_IDLE_ITERATIONS = 800000;       // ~20s idle then scheduler gives up (avoid long hang)
+constexpr int32_t STALL_LOG_INTERVAL = 50000;         // DEV_ALWAYS every N idle iters to debug hang
 constexpr int32_t FATAL_ERROR_CHECK_INTERVAL = 1024;  // Check orchestrator error every N idle iters
 constexpr int32_t STALL_DUMP_READY_MAX = 8;
 constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
@@ -67,14 +73,14 @@ constexpr int32_t STALL_DUMP_CORE_MAX = 8;
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
 
-static PTO2Runtime *rt{nullptr};
+static PTO2Runtime* rt{nullptr};
 
 // Per-core dispatch payload storage (one per physical core)
 static PTO2DispatchPayload s_pto2_payload_per_core[RUNTIME_MAX_WORKER];
 
 // Core information for discovery (with register address for fast dispatch)
 struct CoreInfo {
-    int32_t worker_id;              // Index in runtime.workers[]
+    int32_t worker_id;          // Index in runtime.workers[]
     uint32_t physical_core_id;  // Hardware physical core ID (from AICore)
     uint64_t reg_addr;          // Cached register address for fast access
     CoreType core_type;
@@ -117,30 +123,32 @@ struct CoreStateTracker {
     CoreTypeTracker& aic() { return by_type[0]; }
     CoreTypeTracker& aiv() { return by_type[1]; }
 
-    template<CoreType CT>
-    CoreTypeTracker& get() { return by_type[static_cast<int32_t>(CT)]; }
+    template <CoreType CT>
+    CoreTypeTracker& get() {
+        return by_type[static_cast<int32_t>(CT)];
+    }
 
     int32_t find_cluster_for_shape(PTO2ResourceShape shape, bool* core_idle) {
         for (int32_t i = 0; i < cluster_count; i++) {
             Cluster& c = clusters[i];
             switch (shape) {
-            case PTO2ResourceShape::AIC_ONLY:
-                if (core_idle[c.aic_core_id]) return i;
-                break;
-            case PTO2ResourceShape::AIV_X1:
-                if (core_idle[c.aiv_core_ids[0]] || core_idle[c.aiv_core_ids[1]]) return i;
-                break;
-            case PTO2ResourceShape::AIV_X2:
-                if (core_idle[c.aiv_core_ids[0]] && core_idle[c.aiv_core_ids[1]]) return i;
-                break;
-            case PTO2ResourceShape::AIC_AIV_X1:
-                if (core_idle[c.aic_core_id] &&
-                    (core_idle[c.aiv_core_ids[0]] || core_idle[c.aiv_core_ids[1]])) return i;
-                break;
-            case PTO2ResourceShape::AIC_AIV_X2:
-                if (core_idle[c.aic_core_id] &&
-                    core_idle[c.aiv_core_ids[0]] && core_idle[c.aiv_core_ids[1]]) return i;
-                break;
+                case PTO2ResourceShape::AIC_ONLY:
+                    if (core_idle[c.aic_core_id]) return i;
+                    break;
+                case PTO2ResourceShape::AIV_X1:
+                    if (core_idle[c.aiv_core_ids[0]] || core_idle[c.aiv_core_ids[1]]) return i;
+                    break;
+                case PTO2ResourceShape::AIV_X2:
+                    if (core_idle[c.aiv_core_ids[0]] && core_idle[c.aiv_core_ids[1]]) return i;
+                    break;
+                case PTO2ResourceShape::AIC_AIV_X1:
+                    if (core_idle[c.aic_core_id] && (core_idle[c.aiv_core_ids[0]] || core_idle[c.aiv_core_ids[1]]))
+                        return i;
+                    break;
+                case PTO2ResourceShape::AIC_AIV_X2:
+                    if (core_idle[c.aic_core_id] && core_idle[c.aiv_core_ids[0]] && core_idle[c.aiv_core_ids[1]])
+                        return i;
+                    break;
             }
         }
         return -1;
@@ -209,7 +217,7 @@ struct AicpuExecutor {
     std::atomic<bool> pto2_init_done_{false};
     std::atomic<bool> runtime_init_ready_{false};
     std::atomic<bool> pto2_init_complete_{false};  // init block finished; others wait for this
-    std::atomic<int32_t> orch_finished_count_{0};      // Number of orchestrator threads that have finished
+    std::atomic<int32_t> orch_finished_count_{0};  // Number of orchestrator threads that have finished
 
     // ===== Dynamic core transition state =====
     std::atomic<bool> transition_requested_{false};
@@ -227,7 +235,8 @@ struct AicpuExecutor {
 
     // ===== Performance profiling state =====
     uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
-    uint32_t core_dispatch_counts_[RUNTIME_MAX_WORKER]; // Per-core total dispatched task counter (for buffer management)
+    uint32_t
+        core_dispatch_counts_[RUNTIME_MAX_WORKER];  // Per-core total dispatched task counter (for buffer management)
 
     uint64_t* func_id_to_addr_;
     uint64_t get_function_bin_addr(int func_id) const {
@@ -251,9 +260,7 @@ struct AicpuExecutor {
     // Build slim PTO2DispatchPayload: only function_bin_addr + args.
     // Metadata (task_id, subslot, kernel_id, core_type) stays in TaskDescriptor.
     // Dispatch order: tensor args first, then scalar args.
-    void build_pto2_payload(PTO2DispatchPayload& out,
-        int32_t kernel_id,
-        PTO2TaskPayload& task_pl) {
+    void build_pto2_payload(PTO2DispatchPayload& out, int32_t kernel_id, PTO2TaskPayload& task_pl) {
         out.function_bin_addr = get_function_bin_addr(kernel_id);
         int32_t n = 0;
         for (int32_t i = 0; i < task_pl.tensor_count; i++) {
@@ -320,7 +327,8 @@ struct AicpuExecutor {
                 bool mixed_complete = rt->scheduler.on_subtask_complete(slot_state, subslot);
                 if (mixed_complete) {
 #if PTO2_SCHED_PROFILING
-                    PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(slot_state, thread_idx, local_bufs);
+                    PTO2CompletionStats cstats =
+                        rt->scheduler.on_mixed_task_complete(slot_state, thread_idx, local_bufs);
                     notify_edges_total += cstats.fanout_edges;
                     if (cstats.fanout_edges > notify_max_degree) notify_max_degree = cstats.fanout_edges;
                     notify_tasks_enqueued += cstats.tasks_enqueued;
@@ -374,13 +382,17 @@ struct AicpuExecutor {
 
                     int32_t perf_slot_idx = static_cast<int32_t>(executing_subslot_by_core_[core_id]);
                     if (perf_aicpu_complete_record(perf_buf,
-                        static_cast<uint32_t>(expected_reg_task_id),
-                        slot_state.task->task_id.raw,
-                        slot_state.task->kernel_id[perf_slot_idx], CT,
-                        dispatch_timestamps_[core_id], finish_ts,
-                        fanout_arr, fanout_n) != 0) {
+                            static_cast<uint32_t>(expected_reg_task_id),
+                            slot_state.task->task_id.raw,
+                            slot_state.task->kernel_id[perf_slot_idx],
+                            CT,
+                            dispatch_timestamps_[core_id],
+                            finish_ts,
+                            fanout_arr,
+                            fanout_n) != 0) {
                         DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task 0x%llx",
-                            core_id, (unsigned long long)slot_state.task->task_id.raw);
+                            core_id,
+                            (unsigned long long)slot_state.task->task_id.raw);
                     }
 #if PTO2_SCHED_PROFILING
                     sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
@@ -405,11 +417,16 @@ struct AicpuExecutor {
 
     static const char* shape_name(PTO2ResourceShape shape) {
         switch (shape) {
-        case PTO2ResourceShape::AIC_ONLY:   return "AIC_ONLY";
-        case PTO2ResourceShape::AIV_X1:     return "AIV_X1";
-        case PTO2ResourceShape::AIV_X2:     return "AIV_X2";
-        case PTO2ResourceShape::AIC_AIV_X1: return "AIC_AIV_X1";
-        case PTO2ResourceShape::AIC_AIV_X2: return "AIC_AIV_X2";
+            case PTO2ResourceShape::AIC_ONLY:
+                return "AIC_ONLY";
+            case PTO2ResourceShape::AIV_X1:
+                return "AIV_X1";
+            case PTO2ResourceShape::AIV_X2:
+                return "AIV_X2";
+            case PTO2ResourceShape::AIC_AIV_X1:
+                return "AIC_AIV_X1";
+            case PTO2ResourceShape::AIC_AIV_X2:
+                return "AIC_AIV_X2";
         }
         return "UNKNOWN";
     }
@@ -456,18 +473,21 @@ struct AicpuExecutor {
         return (thread_idx % 2 == 0) ? kEvenOrder : kOddOrder;
     }
 
-    PTO2TaskSlotState* pop_ready_task(PTO2ResourceShape shape, int32_t thread_idx
+    PTO2TaskSlotState* pop_ready_task(PTO2ResourceShape shape,
+        int32_t thread_idx
 #if PTO2_SCHED_PROFILING
-        , uint64_t& pop_hit, uint64_t& pop_miss
-        , uint64_t& sched_dispatch_pop_cycle
+        ,
+        uint64_t& pop_hit,
+        uint64_t& pop_miss,
+        uint64_t& sched_dispatch_pop_cycle
 #endif
     ) {
         (void)thread_idx;
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
         uint64_t t_pop_start = get_sys_cnt_aicpu();
-        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(shape,
-            g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]);
+        PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(
+            shape, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx]);
         sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
 #else
         PTO2TaskSlotState* slot_state = rt->scheduler.get_ready_task(shape);
@@ -581,7 +601,9 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime* runtime) {
         // Validate physical_core_id before using as array index
         if (physical_core_id >= max_physical_cores_count) {
             DEV_ERROR("Core %d reported invalid physical_core_id=%u (platform max=%u)",
-                      i, physical_core_id, max_physical_cores_count);
+                i,
+                physical_core_id,
+                max_physical_cores_count);
             handshake_failed = true;
             continue;
         }
@@ -638,14 +660,16 @@ void AicpuExecutor::assign_cores_to_threads() {
     int32_t cluster_count = aic_count_;
 
     DEV_INFO("Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)",
-             cluster_count, divisor, aic_count_, aiv_count_);
+        cluster_count,
+        divisor,
+        aic_count_,
+        aiv_count_);
 
     memset(core_idle_, true, sizeof(core_idle_));
     for (int32_t i = 0; i < MAX_CORES_PER_THREAD; i++) {
         executing_reg_task_ids_[i] = AICPU_TASK_INVALID;
     }
     for (int32_t i = 0; i < thread_num_; i++) {
-        
         trackers_[i].aic().running_count = 0;
         trackers_[i].aiv().running_count = 0;
         trackers_[i].aic().idle_count = 0;
@@ -667,7 +691,7 @@ void AicpuExecutor::assign_cores_to_threads() {
         CoreStateTracker& tracker = trackers_[t];
         int32_t& idx = core_idx[t];
 
-        int32_t aic_wid  = aic_cores_[ci].worker_id;
+        int32_t aic_wid = aic_cores_[ci].worker_id;
         int32_t aiv0_wid = aiv_cores_[2 * ci].worker_id;
         int32_t aiv1_wid = aiv_cores_[2 * ci + 1].worker_id;
 
@@ -681,8 +705,7 @@ void AicpuExecutor::assign_cores_to_threads() {
         tracker.aiv().idle[tracker.aiv().idle_count++] = aiv0_wid;
         tracker.aiv().idle[tracker.aiv().idle_count++] = aiv1_wid;
 
-        DEV_INFO("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)",
-                 t, ci, aic_wid, aiv0_wid, aiv1_wid);
+        DEV_INFO("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
     }
 
     for (int32_t t = 0; t < divisor; t++) {
@@ -701,8 +724,7 @@ void AicpuExecutor::assign_cores_to_threads() {
  * Writes into new_core_assignments_ / new_core_count_per_thread_.
  */
 void AicpuExecutor::reassign_cores_for_all_threads() {
-    DEV_INFO("Reassigning cores (cluster-aligned) for %d threads: %d AIC, %d AIV",
-             thread_num_, aic_count_, aiv_count_);
+    DEV_INFO("Reassigning cores (cluster-aligned) for %d threads: %d AIC, %d AIV", thread_num_, aic_count_, aiv_count_);
 
     // Collect running/idle state from all threads before reassignment
     bool running_cores[MAX_CORES_PER_THREAD];
@@ -730,15 +752,14 @@ void AicpuExecutor::reassign_cores_for_all_threads() {
     }
 
     // Restore a single core's running/idle state into its new thread's tracker
-    auto reassign_core =
-        [&](int32_t worker_id, CoreTypeTracker& type_tracker, int32_t thread_idx) {
-            core_assignments_[thread_idx][core_count_per_thread_[thread_idx]++] = worker_id;
-            if (running_cores[worker_id]) {
-                type_tracker.running[type_tracker.running_count++] = worker_id;
-            } else {
-                type_tracker.idle[type_tracker.idle_count++] = worker_id;
-            }
-        };
+    auto reassign_core = [&](int32_t worker_id, CoreTypeTracker& type_tracker, int32_t thread_idx) {
+        core_assignments_[thread_idx][core_count_per_thread_[thread_idx]++] = worker_id;
+        if (running_cores[worker_id]) {
+            type_tracker.running[type_tracker.running_count++] = worker_id;
+        } else {
+            type_tracker.idle[type_tracker.idle_count++] = worker_id;
+        }
+    };
 
     // Assign whole clusters round-robin across all threads
     for (int32_t ci = 0; ci < aic_count_; ci++) {
@@ -760,9 +781,13 @@ void AicpuExecutor::reassign_cores_for_all_threads() {
     DEV_INFO("Core reassignment complete:");
     for (int32_t t = 0; t < thread_num_; t++) {
         DEV_INFO("  Thread %d: %d cores, %d clusters (AIC: running=%d idle=%d, AIV: running=%d idle=%d)",
-                 t, core_count_per_thread_[t], trackers_[t].cluster_count,
-                 trackers_[t].aic().running_count, trackers_[t].aic().idle_count,
-                 trackers_[t].aiv().running_count, trackers_[t].aiv().idle_count);
+            t,
+            core_count_per_thread_[t],
+            trackers_[t].cluster_count,
+            trackers_[t].aic().running_count,
+            trackers_[t].aic().idle_count,
+            trackers_[t].aiv().running_count,
+            trackers_[t].aiv().idle_count);
     }
 }
 
@@ -865,7 +890,8 @@ int32_t AicpuExecutor::init(Runtime* runtime) {
 /**
  * Shutdown AICore - Send exit signal via registers to all AICore kernels
  */
-int32_t AicpuExecutor::shutdown_aicore(Runtime* runtime, int32_t thread_idx, const int32_t* cur_thread_cores, int32_t core_num) {
+int32_t AicpuExecutor::shutdown_aicore(
+    Runtime* runtime, int32_t thread_idx, const int32_t* cur_thread_cores, int32_t core_num) {
     (void)runtime;
     if (core_num == 0) return 0;
 
@@ -885,7 +911,7 @@ int32_t AicpuExecutor::shutdown_aicore(Runtime* runtime, int32_t thread_idx, con
 }
 
 int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t thread_idx) {
-    int32_t &core_num = core_count_per_thread_[thread_idx];
+    int32_t& core_num = core_count_per_thread_[thread_idx];
     CoreStateTracker& tracker = trackers_[thread_idx];
     DEV_INFO("Thread %d: resolve_and_dispatch_pto2 entry", thread_idx);
 
@@ -898,12 +924,16 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
     PTO2SharedMemoryHeader* header = static_cast<PTO2SharedMemoryHeader*>(sm_base);
     DEV_INFO("Thread %d: header=%p, task_desc_offset[0]=%lu, window_size=%lu",
-             thread_idx, (void*)header, (unsigned long)header->rings[0].task_descriptors_offset,
-             (unsigned long)header->rings[0].task_window_size);
+        thread_idx,
+        (void*)header,
+        (unsigned long)header->rings[0].task_descriptors_offset,
+        (unsigned long)header->rings[0].task_window_size);
 
     Handshake* hank = static_cast<Handshake*>(runtime->workers);
     DEV_INFO("Thread %d: hank=%p, window_size=%lu",
-             thread_idx, (void*)hank, (unsigned long)header->rings[0].task_window_size);
+        thread_idx,
+        (void*)hank,
+        (unsigned long)header->rings[0].task_window_size);
 
     // One-time init: assign perf buffers (one thread does it; others wait)
     if (!pto2_init_done_.exchange(true, std::memory_order_acq_rel)) {
@@ -949,10 +979,10 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
     uint64_t complete_probe_count = 0;
     uint64_t complete_hit_count = 0;
     uint64_t notify_edges_total = 0;
-    int32_t  notify_max_degree = 0;
+    int32_t notify_max_degree = 0;
     uint64_t notify_tasks_enqueued = 0;
     uint64_t fanin_edges_total = 0;
-    int32_t  fanin_max_degree = 0;
+    int32_t fanin_max_degree = 0;
     uint64_t pop_hit = 0;
     uint64_t pop_miss = 0;
     uint64_t local_dispatch_count = 0;
@@ -990,11 +1020,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 // Check for orchestrator fatal error — exit immediately
                 int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
                 if (orch_err != PTO2_ERROR_NONE) {
-                    DEV_ERROR("Thread %d: Fatal error (code=%d), sending EXIT_SIGNAL to all cores. "
-                               "completed_tasks=%d, total_tasks=%d",
-                               thread_idx, orch_err,
-                               completed_tasks_.load(std::memory_order_relaxed),
-                               total_tasks_);
+                    DEV_ERROR(
+                        "Thread %d: Fatal error (code=%d), sending EXIT_SIGNAL to all cores. "
+                        "completed_tasks=%d, total_tasks=%d",
+                        thread_idx,
+                        orch_err,
+                        completed_tasks_.load(std::memory_order_relaxed),
+                        total_tasks_);
                     emergency_shutdown(runtime);
                     completed_.store(true, std::memory_order_release);
                     break;
@@ -1004,7 +1036,10 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 task_count = total_tasks_;
                 if (task_count > 0 && completed_tasks_.load(std::memory_order_relaxed) >= task_count) {
                     completed_.store(true, std::memory_order_release);
-                    DEV_INFO("Thread %d: PTO2 completed tasks %d/%d", thread_idx, completed_tasks_.load(std::memory_order_relaxed), task_count);
+                    DEV_INFO("Thread %d: PTO2 completed tasks %d/%d",
+                        thread_idx,
+                        completed_tasks_.load(std::memory_order_relaxed),
+                        task_count);
                     break;
                 }
             }
@@ -1040,21 +1075,34 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
         // Check AIC running cores
         bool try_completed = false;
-        always_assert(local_bufs[0].count == 0 && local_bufs[1].count == 0);  // Invariant: previous iteration fully consumed
+        always_assert(
+            local_bufs[0].count == 0 && local_bufs[1].count == 0);  // Invariant: previous iteration fully consumed
         if (tracker.aic().running_count > 0) {
             try_completed = true;
-            check_running_cores_for_completion<CoreType::AIC>(
-                thread_idx, tracker.aic(), hank,
-                completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count,
+            check_running_cores_for_completion<CoreType::AIC>(thread_idx,
+                tracker.aic(),
+                hank,
+                completed_this_turn,
+                cur_thread_completed,
+                made_progress,
+                deferred_release_slot_states,
+                deferred_release_count,
                 local_bufs
 #if PTO2_PROFILING
-                , profiling_enabled, phase_complete_count
+                ,
+                profiling_enabled,
+                phase_complete_count
 #endif
 #if PTO2_SCHED_PROFILING
-                , complete_probe_count, complete_hit_count,
-                notify_edges_total, notify_max_degree, notify_tasks_enqueued,
-                fanin_edges_total, fanin_max_degree, sched_complete_perf_cycle
+                ,
+                complete_probe_count,
+                complete_hit_count,
+                notify_edges_total,
+                notify_max_degree,
+                notify_tasks_enqueued,
+                fanin_edges_total,
+                fanin_max_degree,
+                sched_complete_perf_cycle
 #endif
             );
         }
@@ -1062,18 +1110,30 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         // Check AIV running cores
         if (tracker.aiv().running_count > 0) {
             try_completed = true;
-            check_running_cores_for_completion<CoreType::AIV>(
-                thread_idx, tracker.aiv(), hank,
-                completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count,
+            check_running_cores_for_completion<CoreType::AIV>(thread_idx,
+                tracker.aiv(),
+                hank,
+                completed_this_turn,
+                cur_thread_completed,
+                made_progress,
+                deferred_release_slot_states,
+                deferred_release_count,
                 local_bufs
 #if PTO2_PROFILING
-                , profiling_enabled, phase_complete_count
+                ,
+                profiling_enabled,
+                phase_complete_count
 #endif
 #if PTO2_SCHED_PROFILING
-                , complete_probe_count, complete_hit_count,
-                notify_edges_total, notify_max_degree, notify_tasks_enqueued,
-                fanin_edges_total, fanin_max_degree, sched_complete_perf_cycle
+                ,
+                complete_probe_count,
+                complete_hit_count,
+                notify_edges_total,
+                notify_max_degree,
+                notify_tasks_enqueued,
+                fanin_edges_total,
+                fanin_max_degree,
+                sched_complete_perf_cycle
 #endif
             );
         }
@@ -1085,11 +1145,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             int32_t new_total = prev + completed_this_turn;
             last_progress_count = new_total;
             if (thread_idx == 0 && task_count > 0) {
-                if (new_total <= PROGRESS_VERBOSE_THRESHOLD
-                    || new_total / PROGRESS_LOG_INTERVAL != prev / PROGRESS_LOG_INTERVAL
-                    || new_total >= task_count) {
+                if (new_total <= PROGRESS_VERBOSE_THRESHOLD ||
+                    new_total / PROGRESS_LOG_INTERVAL != prev / PROGRESS_LOG_INTERVAL || new_total >= task_count) {
                     DEV_ALWAYS("PTO2 progress: completed=%d total=%d (%.1f%%)",
-                               new_total, task_count, 100.0 * new_total / task_count);
+                        new_total,
+                        task_count,
+                        100.0 * new_total / task_count);
                 }
             }
         }
@@ -1130,27 +1191,45 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     ResourceCount rc = shape_resource_count(shape);
 
                     if (rc.aic) {
-                        dispatch_subtask_to_core(runtime, tracker,
-                            c.aic_core_id, CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
+                        dispatch_subtask_to_core(runtime,
+                            tracker,
+                            c.aic_core_id,
+                            CoreType::AIC,
+                            *slot_state,
+                            PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
-                            , profiling_enabled, thread_idx
+                            ,
+                            profiling_enabled,
+                            thread_idx
 #endif
                         );
                     }
                     if (rc.aiv >= 1) {
                         int32_t aiv0 = core_idle_[c.aiv_core_ids[0]] ? c.aiv_core_ids[0] : c.aiv_core_ids[1];
-                        dispatch_subtask_to_core(runtime, tracker,
-                            aiv0, CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
+                        dispatch_subtask_to_core(runtime,
+                            tracker,
+                            aiv0,
+                            CoreType::AIV,
+                            *slot_state,
+                            PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
-                            , profiling_enabled, thread_idx
+                            ,
+                            profiling_enabled,
+                            thread_idx
 #endif
                         );
                     }
                     if (rc.aiv >= 2) {
-                        dispatch_subtask_to_core(runtime, tracker,
-                            c.aiv_core_ids[1], CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
+                        dispatch_subtask_to_core(runtime,
+                            tracker,
+                            c.aiv_core_ids[1],
+                            CoreType::AIV,
+                            *slot_state,
+                            PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
-                            , profiling_enabled, thread_idx
+                            ,
+                            profiling_enabled,
+                            thread_idx
 #endif
                         );
                     }
@@ -1193,10 +1272,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 int32_t ci = tracker.find_cluster_for_shape(shape, core_idle_);
                 if (ci < 0) break;
 
-                PTO2TaskSlotState* slot_state = pop_ready_task(shape, thread_idx
+                PTO2TaskSlotState* slot_state = pop_ready_task(shape,
+                    thread_idx
 #if PTO2_SCHED_PROFILING
-                    , pop_hit, pop_miss
-                    , sched_dispatch_pop_cycle
+                    ,
+                    pop_hit,
+                    pop_miss,
+                    sched_dispatch_pop_cycle
 #endif
                 );
                 if (!slot_state) break;
@@ -1212,28 +1294,45 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 ResourceCount rc = shape_resource_count(shape);
 
                 if (rc.aic) {
-                    dispatch_subtask_to_core(runtime, tracker,
-                        c.aic_core_id, CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
+                    dispatch_subtask_to_core(runtime,
+                        tracker,
+                        c.aic_core_id,
+                        CoreType::AIC,
+                        *slot_state,
+                        PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
-                        , profiling_enabled, thread_idx
+                        ,
+                        profiling_enabled,
+                        thread_idx
 #endif
                     );
                 }
                 if (rc.aiv >= 1) {
-                    int32_t aiv_id = core_idle_[c.aiv_core_ids[0]]
-                        ? c.aiv_core_ids[0] : c.aiv_core_ids[1];
-                    dispatch_subtask_to_core(runtime, tracker,
-                        aiv_id, CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
+                    int32_t aiv_id = core_idle_[c.aiv_core_ids[0]] ? c.aiv_core_ids[0] : c.aiv_core_ids[1];
+                    dispatch_subtask_to_core(runtime,
+                        tracker,
+                        aiv_id,
+                        CoreType::AIV,
+                        *slot_state,
+                        PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
-                        , profiling_enabled, thread_idx
+                        ,
+                        profiling_enabled,
+                        thread_idx
 #endif
                     );
                 }
                 if (rc.aiv >= 2) {
-                    dispatch_subtask_to_core(runtime, tracker,
-                        c.aiv_core_ids[1], CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
+                    dispatch_subtask_to_core(runtime,
+                        tracker,
+                        c.aiv_core_ids[1],
+                        CoreType::AIV,
+                        *slot_state,
+                        PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
-                        , profiling_enabled, thread_idx
+                        ,
+                        profiling_enabled,
+                        thread_idx
 #endif
                     );
                 }
@@ -1271,9 +1370,10 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             // freeing heap space for the orchestrator without blocking completion polling.
             while (deferred_release_count > 0) {
 #if PTO2_SCHED_PROFILING
-                int32_t fe = rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
+                int32_t fe =
+                    rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
 #else
-                int32_t fe = rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
+            int32_t fe = rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
                 (void)fe;
 #if PTO2_SCHED_PROFILING
@@ -1290,7 +1390,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 int32_t orch_err = header->orch_error_code.load(std::memory_order_acquire);
                 if (orch_err != PTO2_ERROR_NONE) {
                     DEV_ERROR("Thread %d: Fatal error detected (code=%d), sending EXIT_SIGNAL to all cores",
-                               thread_idx, orch_err);
+                        thread_idx,
+                        orch_err);
                     emergency_shutdown(runtime);
                     completed_.store(true, std::memory_order_release);
                     break;
@@ -1300,7 +1401,10 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             if (thread_idx == 0 && task_count > 0 && idle_iterations % STALL_LOG_INTERVAL == 0) {
                 int32_t c = completed_tasks_.load(std::memory_order_relaxed);
                 DEV_ALWAYS("PTO2 stall: no progress for %d iterations, completed=%d total=%d (last progress at %d)",
-                           idle_iterations, c, task_count, last_progress_count);
+                    idle_iterations,
+                    c,
+                    task_count,
+                    last_progress_count);
                 // Scan all task slots to find truly stuck tasks using scheduler state
                 PTO2SchedulerState* sched = &rt->scheduler;
                 PTO2SharedMemoryHeader* sm_header_diag = static_cast<PTO2SharedMemoryHeader*>(sm_base);
@@ -1314,33 +1418,56 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                         int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
                         int32_t fi = slot_state.fanin_count;
                         int32_t kid = slot_state.task->kernel_id[0];
-                        if (st >= PTO2_TASK_COMPLETED) continue; // Already done
-                        if (st == PTO2_TASK_READY || st == PTO2_TASK_RUNNING) { cnt_inflight++; continue; }
+                        if (st >= PTO2_TASK_COMPLETED) continue;  // Already done
+                        if (st == PTO2_TASK_READY || st == PTO2_TASK_RUNNING) {
+                            cnt_inflight++;
+                            continue;
+                        }
                         // PENDING
                         if (rc >= fi) {
                             // Ready (all deps satisfied) but not enqueued — this is the real bug
                             cnt_ready++;
                             if (cnt_ready <= STALL_DUMP_READY_MAX) {
-                                DEV_ALWAYS("  STUCK-READY  ring=%d task_id=%lld kernel_id=%d refcount=%d fanin=%d state=%d",
-                                            r, (long long)slot_state.task->task_id.raw, kid, rc, fi, (int32_t)st);
+                                DEV_ALWAYS(
+                                    "  STUCK-READY  ring=%d task_id=%lld kernel_id=%d refcount=%d fanin=%d state=%d",
+                                    r,
+                                    (long long)slot_state.task->task_id.raw,
+                                    kid,
+                                    rc,
+                                    fi,
+                                    (int32_t)st);
                             }
                         } else {
                             cnt_waiting++;
                             if (cnt_waiting <= STALL_DUMP_WAIT_MAX) {
-                                DEV_ALWAYS("  STUCK-WAIT   ring=%d task_id=%lld kernel_id=%d refcount=%d fanin=%d state=%d",
-                                            r, (long long)slot_state.task->task_id.raw, kid, rc, fi, (int32_t)st);
+                                DEV_ALWAYS(
+                                    "  STUCK-WAIT   ring=%d task_id=%lld kernel_id=%d refcount=%d fanin=%d state=%d",
+                                    r,
+                                    (long long)slot_state.task->task_id.raw,
+                                    kid,
+                                    rc,
+                                    fi,
+                                    (int32_t)st);
                             }
                         }
                     }
                 }
                 DEV_ALWAYS("  scan result: stuck_ready=%d stuck_waiting=%d in_flight=%d",
-                           cnt_ready, cnt_waiting, cnt_inflight);
+                    cnt_ready,
+                    cnt_waiting,
+                    cnt_inflight);
                 // Log this thread's dispatch state
                 int32_t total_idle = tracker.aic().idle_count + tracker.aiv().idle_count;
                 int32_t total_running = tracker.aic().running_count + tracker.aiv().running_count;
                 DEV_ALWAYS("  thread=%d idle_cores=%d (AIC=%d AIV=%d) running_cores=%d (AIC=%d AIV=%d) core_num=%d",
-                           thread_idx, total_idle, tracker.aic().idle_count, tracker.aiv().idle_count,
-                           total_running, tracker.aic().running_count, tracker.aiv().running_count, core_num);
+                    thread_idx,
+                    total_idle,
+                    tracker.aic().idle_count,
+                    tracker.aiv().idle_count,
+                    total_running,
+                    tracker.aic().running_count,
+                    tracker.aiv().running_count,
+                    core_num);
                 // Dump AIC running cores
                 for (int32_t ci = 0; ci < tracker.aic().running_count && ci < STALL_DUMP_CORE_MAX; ci++) {
                     int32_t cid = tracker.aic().running[ci];
@@ -1352,9 +1479,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     }
                     uint64_t cond_reg = read_reg(core_id_to_reg_addr_[cid], RegId::COND);
                     DEV_ALWAYS("    core=%d cond=0x%x(state=%d,id=%d) exec_id=%d kernel=%d",
-                               cid, (unsigned)cond_reg,
-                               EXTRACT_TASK_STATE(cond_reg), EXTRACT_TASK_ID(cond_reg),
-                               sw_tid, hw_kernel);
+                        cid,
+                        (unsigned)cond_reg,
+                        EXTRACT_TASK_STATE(cond_reg),
+                        EXTRACT_TASK_ID(cond_reg),
+                        sw_tid,
+                        hw_kernel);
                 }
                 // Dump AIV running cores
                 for (int32_t ci = 0; ci < tracker.aiv().running_count && ci < STALL_DUMP_CORE_MAX; ci++) {
@@ -1367,17 +1497,24 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     }
                     uint64_t cond_reg = read_reg(core_id_to_reg_addr_[cid], RegId::COND);
                     DEV_ALWAYS("    core=%d cond=0x%x(state=%d,id=%d) exec_id=%d kernel=%d",
-                               cid, (unsigned)cond_reg,
-                               EXTRACT_TASK_STATE(cond_reg), EXTRACT_TASK_ID(cond_reg),
-                               sw_tid, hw_kernel);
+                        cid,
+                        (unsigned)cond_reg,
+                        EXTRACT_TASK_STATE(cond_reg),
+                        EXTRACT_TASK_ID(cond_reg),
+                        sw_tid,
+                        hw_kernel);
                 }
                 // Dump cluster state
                 for (int32_t cli = 0; cli < tracker.cluster_count && cli < STALL_DUMP_CORE_MAX; cli++) {
                     Cluster& cl = tracker.clusters[cli];
                     DEV_ALWAYS("    cluster[%d] aic=%d(%s) aiv0=%d(%s) aiv1=%d(%s)",
-                               cli, cl.aic_core_id, core_idle_[cl.aic_core_id] ? "idle" : "busy",
-                               cl.aiv_core_ids[0], core_idle_[cl.aiv_core_ids[0]] ? "idle" : "busy",
-                               cl.aiv_core_ids[1], core_idle_[cl.aiv_core_ids[1]] ? "idle" : "busy");
+                        cli,
+                        cl.aic_core_id,
+                        core_idle_[cl.aic_core_id] ? "idle" : "busy",
+                        cl.aiv_core_ids[0],
+                        core_idle_[cl.aiv_core_ids[0]] ? "idle" : "busy",
+                        cl.aiv_core_ids[1],
+                        core_idle_[cl.aiv_core_ids[1]] ? "idle" : "busy");
                 }
             }
             if (idle_iterations > MAX_IDLE_ITERATIONS) {
@@ -1389,8 +1526,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(sched_idle_cycle);
             if (profiling_enabled) {
-                perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT,
-                                        _t0_phase, _t1, sched_loop_count, 0);
+                perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, sched_loop_count, 0);
                 _t0_phase = _t1;
             }
 #endif
@@ -1399,8 +1535,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
 #if PTO2_PROFILING
     // Scheduler summary logging (always print when PTO2_PROFILING=1)
-    uint64_t sched_total =
-        sched_complete_cycle + sched_scan_cycle + sched_dispatch_cycle + sched_idle_cycle;
+    uint64_t sched_total = sched_complete_cycle + sched_scan_cycle + sched_dispatch_cycle + sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;  // avoid div-by-zero
 
 #if PTO2_SCHED_PROFILING
@@ -1409,71 +1544,87 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         PTO2SchedProfilingData sp = pto2_scheduler_get_profiling(thread_idx);
         uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
         uint64_t complete_poll = (sched_complete_cycle > otc_total + sched_complete_perf_cycle)
-            ? (sched_complete_cycle - otc_total - sched_complete_perf_cycle) : 0;
+                                     ? (sched_complete_cycle - otc_total - sched_complete_perf_cycle)
+                                     : 0;
         uint64_t dispatch_poll = (sched_dispatch_cycle > sched_dispatch_pop_cycle + sched_dispatch_setup_cycle)
-            ? (sched_dispatch_cycle - sched_dispatch_pop_cycle - sched_dispatch_setup_cycle) : 0;
+                                     ? (sched_dispatch_cycle - sched_dispatch_pop_cycle - sched_dispatch_setup_cycle)
+                                     : 0;
 
         DEV_ALWAYS("Thread %d: === Scheduler Phase Breakdown: total=%.3fus, %d tasks ===",
-            thread_idx, cycles_to_us(sched_total), cur_thread_completed);
+            thread_idx,
+            cycles_to_us(sched_total),
+            cur_thread_completed);
 
         // Level 1: complete
-        double notify_avg = cur_thread_completed > 0
-            ? (double)notify_edges_total / cur_thread_completed : 0.0;
-        double fanin_avg = cur_thread_completed > 0
-            ? (double)fanin_edges_total / cur_thread_completed : 0.0;
-        DEV_ALWAYS("Thread %d:   complete       : %.3fus (%.1f%%)  [fanout: edges=%llu, max_degree=%d, avg=%.1f]  [fanin: edges=%llu, max_degree=%d, avg=%.1f]",
-            thread_idx, cycles_to_us(sched_complete_cycle),
+        double notify_avg = cur_thread_completed > 0 ? (double)notify_edges_total / cur_thread_completed : 0.0;
+        double fanin_avg = cur_thread_completed > 0 ? (double)fanin_edges_total / cur_thread_completed : 0.0;
+        DEV_ALWAYS(
+            "Thread %d:   complete       : %.3fus (%.1f%%)  [fanout: edges=%llu, max_degree=%d, avg=%.1f]  [fanin: "
+            "edges=%llu, max_degree=%d, avg=%.1f]",
+            thread_idx,
+            cycles_to_us(sched_complete_cycle),
             sched_complete_cycle * 100.0 / sched_total,
-            (unsigned long long)notify_edges_total, notify_max_degree, notify_avg,
-            (unsigned long long)fanin_edges_total, fanin_max_degree, fanin_avg);
+            (unsigned long long)notify_edges_total,
+            notify_max_degree,
+            notify_avg,
+            (unsigned long long)fanin_edges_total,
+            fanin_max_degree,
+            fanin_avg);
 
         // Level 2: complete sub-phases (percentage relative to complete)
         uint64_t c_parent = sched_complete_cycle > 0 ? sched_complete_cycle : 1;
-        uint64_t complete_miss_count = (complete_probe_count > complete_hit_count)
-            ? (complete_probe_count - complete_hit_count) : 0;
-        double complete_hit_rate = complete_probe_count > 0
-            ? complete_hit_count * 100.0 / complete_probe_count : 0.0;
+        uint64_t complete_miss_count =
+            (complete_probe_count > complete_hit_count) ? (complete_probe_count - complete_hit_count) : 0;
+        double complete_hit_rate = complete_probe_count > 0 ? complete_hit_count * 100.0 / complete_probe_count : 0.0;
         DEV_ALWAYS("Thread %d:     poll         : %.3fus (%.1f%%)  hit=%llu, miss=%llu, hit_rate=%.1f%%",
-            thread_idx, cycles_to_us(complete_poll),
+            thread_idx,
+            cycles_to_us(complete_poll),
             complete_poll * 100.0 / c_parent,
             (unsigned long long)complete_hit_count,
             (unsigned long long)complete_miss_count,
             complete_hit_rate);
         DEV_ALWAYS("Thread %d:     otc_lock     : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
-            thread_idx, cycles_to_us(sp.lock_cycle),
+            thread_idx,
+            cycles_to_us(sp.lock_cycle),
             sp.lock_cycle * 100.0 / c_parent,
-            cycles_to_us(sp.lock_cycle - sp.lock_wait_cycle), cycles_to_us(sp.lock_wait_cycle),
+            cycles_to_us(sp.lock_cycle - sp.lock_wait_cycle),
+            cycles_to_us(sp.lock_wait_cycle),
             (unsigned long long)sp.lock_atomic_count);
         DEV_ALWAYS("Thread %d:     otc_fanout   : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
-            thread_idx, cycles_to_us(sp.fanout_cycle),
+            thread_idx,
+            cycles_to_us(sp.fanout_cycle),
             sp.fanout_cycle * 100.0 / c_parent,
-            cycles_to_us(sp.fanout_cycle - sp.push_wait_cycle), cycles_to_us(sp.push_wait_cycle),
+            cycles_to_us(sp.fanout_cycle - sp.push_wait_cycle),
+            cycles_to_us(sp.push_wait_cycle),
             (unsigned long long)sp.fanout_atomic_count);
         DEV_ALWAYS("Thread %d:     otc_fanin    : %.3fus (%.1f%%)  atomics=%llu",
-            thread_idx, cycles_to_us(sp.fanin_cycle),
+            thread_idx,
+            cycles_to_us(sp.fanin_cycle),
             sp.fanin_cycle * 100.0 / c_parent,
             (unsigned long long)sp.fanin_atomic_count);
         DEV_ALWAYS("Thread %d:     otc_self     : %.3fus (%.1f%%)  atomics=%llu",
-            thread_idx, cycles_to_us(sp.self_consumed_cycle),
+            thread_idx,
+            cycles_to_us(sp.self_consumed_cycle),
             sp.self_consumed_cycle * 100.0 / c_parent,
             (unsigned long long)sp.self_atomic_count);
         DEV_ALWAYS("Thread %d:     perf         : %.3fus (%.1f%%)",
-            thread_idx, cycles_to_us(sched_complete_perf_cycle),
+            thread_idx,
+            cycles_to_us(sched_complete_perf_cycle),
             sched_complete_perf_cycle * 100.0 / c_parent);
 
         // Level 1: dispatch
         uint64_t pop_total = pop_hit + pop_miss;
         double pop_hit_rate = pop_total > 0 ? pop_hit * 100.0 / pop_total : 0.0;
         DEV_ALWAYS("Thread %d:   dispatch       : %.3fus (%.1f%%)  [pop: hit=%llu, miss=%llu, hit_rate=%.1f%%]",
-            thread_idx, cycles_to_us(sched_dispatch_cycle),
+            thread_idx,
+            cycles_to_us(sched_dispatch_cycle),
             sched_dispatch_cycle * 100.0 / sched_total,
             (unsigned long long)pop_hit,
             (unsigned long long)pop_miss,
             pop_hit_rate);
         uint64_t global_dispatch_count = pop_hit - local_dispatch_count;
         uint64_t total_dispatched = local_dispatch_count + global_dispatch_count;
-        double local_hit_rate = total_dispatched > 0
-            ? local_dispatch_count * 100.0 / total_dispatched : 0.0;
+        double local_hit_rate = total_dispatched > 0 ? local_dispatch_count * 100.0 / total_dispatched : 0.0;
         DEV_ALWAYS("Thread %d:     local_disp   : local=%llu, global=%llu, overflow=%llu, local_rate=%.1f%%",
             thread_idx,
             (unsigned long long)local_dispatch_count,
@@ -1484,31 +1635,38 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         // Level 2: dispatch sub-phases (percentage relative to dispatch)
         uint64_t d_parent = sched_dispatch_cycle > 0 ? sched_dispatch_cycle : 1;
         DEV_ALWAYS("Thread %d:     poll         : %.3fus (%.1f%%)",
-            thread_idx, cycles_to_us(dispatch_poll),
+            thread_idx,
+            cycles_to_us(dispatch_poll),
             dispatch_poll * 100.0 / d_parent);
         DEV_ALWAYS("Thread %d:     pop          : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%llu",
-            thread_idx, cycles_to_us(sched_dispatch_pop_cycle),
+            thread_idx,
+            cycles_to_us(sched_dispatch_pop_cycle),
             sched_dispatch_pop_cycle * 100.0 / d_parent,
-            cycles_to_us(sched_dispatch_pop_cycle - sp.pop_wait_cycle), cycles_to_us(sp.pop_wait_cycle),
+            cycles_to_us(sched_dispatch_pop_cycle - sp.pop_wait_cycle),
+            cycles_to_us(sp.pop_wait_cycle),
             (unsigned long long)sp.pop_atomic_count);
         DEV_ALWAYS("Thread %d:     setup        : %.3fus (%.1f%%)",
-            thread_idx, cycles_to_us(sched_dispatch_setup_cycle),
+            thread_idx,
+            cycles_to_us(sched_dispatch_setup_cycle),
             sched_dispatch_setup_cycle * 100.0 / d_parent);
 
         // Level 1: scan
         DEV_ALWAYS("Thread %d:   scan           : %.3fus (%.1f%%)",
-            thread_idx, cycles_to_us(sched_scan_cycle),
+            thread_idx,
+            cycles_to_us(sched_scan_cycle),
             sched_scan_cycle * 100.0 / sched_total);
 
         // Level 1: idle
         DEV_ALWAYS("Thread %d:   idle           : %.3fus (%.1f%%)",
-            thread_idx, cycles_to_us(sched_idle_cycle),
+            thread_idx,
+            cycles_to_us(sched_idle_cycle),
             sched_idle_cycle * 100.0 / sched_total);
 
         // Average per completion
         if (cur_thread_completed > 0) {
             DEV_ALWAYS("Thread %d:   avg/complete   : %.3fus",
-                thread_idx, cycles_to_us(sched_complete_cycle) / cur_thread_completed);
+                thread_idx,
+                cycles_to_us(sched_complete_cycle) / cur_thread_completed);
         }
     }
 #endif
@@ -1558,28 +1716,26 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 char so_path[256];
                 bool file_created = false;
                 const char* candidate_dirs[] = {
-                    "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device",
-                    "/usr/lib64",
-                    "/lib64",
-                    "/var/tmp",
-                    "/tmp"
-                };
+                    "/usr/lib64/aicpu_kernels/0/aicpu_kernels_device", "/usr/lib64", "/lib64", "/var/tmp", "/tmp"};
                 const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
 
                 for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                    snprintf(so_path, sizeof(so_path), "%s/libdevice_orch_%d.so",
-                             candidate_dirs[i], getpid());
+                    snprintf(so_path, sizeof(so_path), "%s/libdevice_orch_%d.so", candidate_dirs[i], getpid());
                     int32_t fd = open(so_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
                     if (fd < 0) {
                         DEV_INFO("Thread %d: Cannot create SO at %s (errno=%d), trying next path",
-                                 thread_idx, so_path, errno);
+                            thread_idx,
+                            so_path,
+                            errno);
                         continue;
                     }
                     ssize_t written = write(fd, so_data, so_size);
                     close(fd);
                     if (written != static_cast<ssize_t>(so_size)) {
                         DEV_INFO("Thread %d: Cannot write SO to %s (errno=%d), trying next path",
-                                 thread_idx, so_path, errno);
+                            thread_idx,
+                            so_path,
+                            errno);
                         unlink(so_path);
                         continue;
                     }
@@ -1603,8 +1759,8 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 DEV_INFO("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
 
                 dlerror();
-                auto config_func = reinterpret_cast<DeviceOrchestrationConfigFunc>(
-                    dlsym(handle, "aicpu_orchestration_config"));
+                auto config_func =
+                    reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, "aicpu_orchestration_config"));
 
                 dlerror();
                 DeviceOrchestrationFunc orch_func =
@@ -1629,10 +1785,14 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 for (int32_t i = 0; i < arg_count && i < 20; i++) {
                     if (args[i].kind == TaskArgKind::TENSOR) {
                         DEV_INFO("Thread %d: orch_args[%d] = TENSOR(data=0x%lx, ndims=%u, dtype=%u)",
-                                 thread_idx, i, (unsigned long)args[i].tensor.data, args[i].tensor.ndims, (unsigned)args[i].tensor.dtype);
+                            thread_idx,
+                            i,
+                            (unsigned long)args[i].tensor.data,
+                            args[i].tensor.ndims,
+                            (unsigned)args[i].tensor.dtype);
                     } else {
-                        DEV_INFO("Thread %d: orch_args[%d] = SCALAR(0x%lx)",
-                                 thread_idx, i, (unsigned long)args[i].scalar);
+                        DEV_INFO(
+                            "Thread %d: orch_args[%d] = SCALAR(0x%lx)", thread_idx, i, (unsigned long)args[i].scalar);
                     }
                 }
 
@@ -1665,15 +1825,17 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     dep_pool_capacity = static_cast<int32_t>(runtime->pto2_dep_pool_size);
                 }
                 DEV_INFO("Thread %d: Ring sizes: task_window=%lu, heap=%lu, dep_pool=%d",
-                         thread_idx, (unsigned long)task_window_size, (unsigned long)heap_size, dep_pool_capacity);
+                    thread_idx,
+                    (unsigned long)task_window_size,
+                    (unsigned long)heap_size,
+                    dep_pool_capacity);
 
                 void* sm_ptr = runtime->get_pto2_gm_sm_ptr();
                 void* gm_heap = runtime->get_pto2_gm_heap_ptr();
 
                 uint64_t sm_size = pto2_sm_calculate_size(task_window_size);
                 PTO2SharedMemoryHandle* sm_handle =
-                    pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size,
-                                                heap_size);
+                    pto2_sm_create_from_buffer(sm_ptr, sm_size, task_window_size, heap_size);
                 if (!sm_handle) {
                     DEV_ERROR("Thread %d: Failed to create shared memory handle", thread_idx);
                     dlclose(handle);
@@ -1681,9 +1843,8 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     return -1;
                 }
 
-                rt = pto2_runtime_create_from_sm(PTO2_MODE_EXECUTE,
-                                                 sm_handle, gm_heap, heap_size, orch_thread_num_,
-                                                 dep_pool_capacity);
+                rt = pto2_runtime_create_from_sm(
+                    PTO2_MODE_EXECUTE, sm_handle, gm_heap, heap_size, orch_thread_num_, dep_pool_capacity);
                 if (!rt) {
                     DEV_ERROR("Thread %d: Failed to create PTO2Runtime", thread_idx);
                     pto2_sm_destroy(sm_handle);
@@ -1746,7 +1907,9 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
 
             // Call orchestration function wrapped in an outer scope
             DEV_ALWAYS("Thread %d: Calling aicpu_orchestration_entry from SO (orch_idx=%d/(0~%d))",
-                       thread_idx, orch_idx, orch_thread_num_ - 1);
+                thread_idx,
+                orch_idx,
+                orch_thread_num_ - 1);
 #if PTO2_PROFILING
             uint64_t orch_cycle_start = get_sys_cnt_aicpu();
 #endif
@@ -1754,8 +1917,10 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
 #if PTO2_PROFILING
             uint64_t orch_cycle_end = get_sys_cnt_aicpu();
             DEV_ALWAYS("Thread %d: orch_start=%llu orch_func_cost=%.3fus (orch_idx=%d)",
-                thread_idx, (unsigned long long)orch_cycle_start,
-                cycles_to_us(orch_cycle_end - orch_cycle_start), orch_idx);
+                thread_idx,
+                (unsigned long long)orch_cycle_start,
+                cycles_to_us(orch_cycle_end - orch_cycle_start),
+                orch_idx);
 #endif
 
             // Print orchestrator profiling data
@@ -1836,14 +2001,15 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 void* sm = runtime->get_pto2_gm_sm_ptr();
                 PTO2SharedMemoryHeader* sm_header = static_cast<PTO2SharedMemoryHeader*>(sm);
                 int32_t pto2_task_count = 0;
-                    if (sm_header) {
-                        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-                            pto2_task_count +=
-                                sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
-                        }
+                if (sm_header) {
+                    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+                        pto2_task_count += sm_header->rings[r].fc.current_task_index.load(std::memory_order_acquire);
                     }
+                }
 #if PTO2_PROFILING
-                DEV_ALWAYS("PTO2 total submitted tasks = %d, already executed %d tasks", pto2_task_count, completed_tasks_.load(std::memory_order_acquire));
+                DEV_ALWAYS("PTO2 total submitted tasks = %d, already executed %d tasks",
+                    pto2_task_count,
+                    completed_tasks_.load(std::memory_order_acquire));
 #endif
                 total_tasks_ = pto2_task_count;
                 if (runtime->enable_profiling && pto2_task_count > 0) {
@@ -1854,8 +2020,8 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                     int32_t orch_err = 0;
                     void* sm = runtime->get_pto2_gm_sm_ptr();
                     if (sm) {
-                        orch_err = static_cast<PTO2SharedMemoryHeader*>(sm)->orch_error_code.load(
-                            std::memory_order_relaxed);
+                        orch_err =
+                            static_cast<PTO2SharedMemoryHeader*>(sm)->orch_error_code.load(std::memory_order_relaxed);
                     }
 
                     // Fatal error: shutdown AICore immediately before core transition.
@@ -1927,8 +2093,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
     }
 
     // Scheduler thread (orchestrator threads skip dispatch when orch_to_sched_ is false)
-    if (!completed_.load(std::memory_order_acquire) &&
-        (thread_idx < sched_thread_num_ || orch_to_sched_)) {
+    if (!completed_.load(std::memory_order_acquire) && (thread_idx < sched_thread_num_ || orch_to_sched_)) {
         DEV_ALWAYS("Thread %d: Starting PTO2 dispatch", thread_idx);
         // Device orchestration: wait for primary orchestrator to initialize SM header
         if (!runtime->get_orch_built_on_host()) {
@@ -2051,17 +2216,15 @@ void AicpuExecutor::emergency_shutdown(Runtime* runtime) {
     DEV_WARN("Emergency shutdown complete");
 }
 
-void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int32_t thread_idx,
-                                         const int32_t* cur_thread_cores, int32_t core_num,
-                                         Handshake* hank) {
+void AicpuExecutor::diagnose_stuck_state(
+    Runtime* runtime, int32_t thread_idx, const int32_t* cur_thread_cores, int32_t core_num, Handshake* hank) {
     (void)runtime;
     PTO2SchedulerState* sched = &rt->scheduler;
     DEV_ALWAYS("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
 
     int32_t completed = completed_tasks_.load(std::memory_order_acquire);
     int32_t total = total_tasks_;
-    DEV_ALWAYS("Progress: %d/%d tasks (%.1f%%)",
-             completed, total, total > 0 ? completed * 100.0 / total : 0.0);
+    DEV_ALWAYS("Progress: %d/%d tasks (%.1f%%)", completed, total, total > 0 ? completed * 100.0 / total : 0.0);
 
     uint64_t aic_ready = 0, aiv_ready = 0, aiv_x2_ready = 0, mixed_x1_ready = 0, mixed_x2_ready = 0;
     if (rt) {
@@ -2072,7 +2235,11 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int32_t thread_idx,
         mixed_x2_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC_AIV_X2)].size();
     }
     DEV_ALWAYS("Ready Queues: AIC=%lu, AIV=%lu, AIV_X2=%lu, AIC_AIV_X1=%lu, AIC_AIV_X2=%lu",
-               aic_ready, aiv_ready, aiv_x2_ready, mixed_x1_ready, mixed_x2_ready);
+        aic_ready,
+        aiv_ready,
+        aiv_x2_ready,
+        mixed_x1_ready,
+        mixed_x2_ready);
 
     int32_t busy_cores = 0;
     int32_t idle_cores = 0;
@@ -2097,14 +2264,23 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int32_t thread_idx,
                     int32_t diag_slot = static_cast<int32_t>(executing_subslot_by_core_[core_id]);
                     kernel_id = executing_slot_state_by_core_[core_id]->task->kernel_id[diag_slot];
                 }
-                DEV_ALWAYS("  Core %d [%s, BUSY]: COND=0x%lx (reg_task_id=%d, reg_state=%s), executing_reg_task_id=%d, kernel_id=%d",
-                        core_id, core_type_str, reg_val, reg_task_id,
-                        reg_state == TASK_FIN_STATE ? "FIN" : "ACK",
-                        task_id, kernel_id);
+                DEV_ALWAYS(
+                    "  Core %d [%s, BUSY]: COND=0x%lx (reg_task_id=%d, reg_state=%s), executing_reg_task_id=%d, "
+                    "kernel_id=%d",
+                    core_id,
+                    core_type_str,
+                    reg_val,
+                    reg_task_id,
+                    reg_state == TASK_FIN_STATE ? "FIN" : "ACK",
+                    task_id,
+                    kernel_id);
             } else {
                 DEV_ALWAYS("  Core %d [%s, BUSY]: COND=0x%lx (reg_task_id=%d, reg_state=%s) but task_id not tracked",
-                        core_id, core_type_str, reg_val, reg_task_id,
-                        reg_state == TASK_FIN_STATE ? "FIN" : "ACK");
+                    core_id,
+                    core_type_str,
+                    reg_val,
+                    reg_task_id,
+                    reg_state == TASK_FIN_STATE ? "FIN" : "ACK");
             }
         } else {
             idle_cores++;

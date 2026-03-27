@@ -14,13 +14,9 @@
 
 static uint64_t g_platform_regs = 0;
 
-void set_platform_regs(uint64_t regs) {
-    g_platform_regs = regs;
-}
+void set_platform_regs(uint64_t regs) { g_platform_regs = regs; }
 
-uint64_t get_platform_regs() {
-    return g_platform_regs;
-}
+uint64_t get_platform_regs() { return g_platform_regs; }
 
 void platform_init_aicore_regs(uint64_t reg_addr) {
     // Initialize task dispatch register to idle state

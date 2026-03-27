@@ -36,15 +36,13 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void softmax_prepare_n_impl(
-    __gm__ float* sij_base,
+static __aicore__ void softmax_prepare_n_impl(__gm__ float* sij_base,
     float scale_value,
     __gm__ bfloat16_t* pij_base,
     __gm__ float* mij_addr,
     __gm__ float* lij_addr,
     uint64_t n_blocks,
     uint64_t valid_len_last) {
-
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
     constexpr int kScalarCols = 32 / sizeof(float);
     constexpr int kScalarRows = M / kScalarCols;
@@ -100,10 +98,10 @@ static __aicore__ void softmax_prepare_n_impl(
     TASSIGN(sumAccTile, 4 * kDataBytes);
     int scalarBase = 5 * kDataBytes;
     TASSIGN(localMaxDN, scalarBase);
-    TASSIGN(localMaxRow, scalarBase);                     // alias: same UB as localMaxDN
+    TASSIGN(localMaxRow, scalarBase);  // alias: same UB as localMaxDN
     TASSIGN(globalMaxDN, scalarBase + kScalarDNBytes);
-    TASSIGN(globalMaxRow, scalarBase + kScalarDNBytes);   // alias: same UB as globalMaxDN
-    TASSIGN(globalMaxND, scalarBase + kScalarDNBytes);    // alias: same UB as globalMaxDN
+    TASSIGN(globalMaxRow, scalarBase + kScalarDNBytes);  // alias: same UB as globalMaxDN
+    TASSIGN(globalMaxND, scalarBase + kScalarDNBytes);   // alias: same UB as globalMaxDN
     TASSIGN(sumDN, scalarBase + 2 * kScalarDNBytes);
     TASSIGN(pijBf16Tile, scalarBase + 3 * kScalarDNBytes);
 
@@ -122,13 +120,11 @@ static __aicore__ void softmax_prepare_n_impl(
             TileSijDyn sijDynTile(static_cast<size_t>(valid_len_last));
             TASSIGN(sijDynTile, 0x0);
             TFILLPAD_INPLACE(sijPadTile_A, sijDynTile);
-            
         }
 
         TMULS(sijTile_A, sijTile_A, scale_value);
-        
+
         TROWMAX(localMaxDN, sijTile_A, tmpTile);
-        
 
         // TRESHAPE: ColMajor(M,1) → RowMajor(1,M) for element-wise TMAX
         TRESHAPE(localMaxRow, localMaxDN);
@@ -137,7 +133,6 @@ static __aicore__ void softmax_prepare_n_impl(
         } else {
             TMAX(globalMaxRow, globalMaxRow, localMaxRow);
         }
-        
     }
 
     // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for Pass 2's TROWEXPANDSUB
@@ -175,27 +170,25 @@ static __aicore__ void softmax_prepare_n_impl(
                 TASSIGN(curSijDyn, static_cast<int>(kDataBytes));
                 TFILLPAD_INPLACE(sijPadTile_B, curSijDyn);
             }
-            
         }
 
         // Compute on current buffer (select A or B based on iteration parity)
         if (i % 2 == 0) {
             TMULS(sijTile_A, sijTile_A, scale_value);
-            
+
             TROWEXPANDSUB(pijTile, sijTile_A, globalMaxDN);
         } else {
             TMULS(sijTile_B, sijTile_B, scale_value);
-            
+
             TROWEXPANDSUB(pijTile, sijTile_B, globalMaxDN);
         }
-        
+
         TEXP(pijTile, pijTile);
-        
+
         TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
-        
+
         TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
 
-        
         if (i == 0) {
             TMULS(sumAccTile, pijTile, 1.0f);
         } else {
@@ -203,7 +196,7 @@ static __aicore__ void softmax_prepare_n_impl(
         }
 
         // Store pij (must complete before next iteration's TCVT overwrites pijBf16Tile)
-        
+
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         TSTORE(pijGlobal, pijBf16Tile);
@@ -222,7 +215,7 @@ static __aicore__ void softmax_prepare_n_impl(
     }
 
     // Compute final row sum from accumulated pij values
-    
+
     TROWSUM(sumDN, sumAccTile, tmpTile);
 
     // Store lij (total sum). mij already stored after Pass 1.

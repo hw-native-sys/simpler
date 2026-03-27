@@ -21,20 +21,24 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-static __aicore__ void online_update_impl(__gm__ uint8_t* mij_raw, __gm__ uint8_t* lij_raw,
-                               __gm__ uint8_t* oi_new_raw, __gm__ uint8_t* mi_raw,
-                               __gm__ uint8_t* li_raw, __gm__ uint8_t* oi_raw,
-                               int is_first, int is_last, __gm__ uint8_t* dst_raw)
-{
+static __aicore__ void online_update_impl(__gm__ uint8_t* mij_raw,
+    __gm__ uint8_t* lij_raw,
+    __gm__ uint8_t* oi_new_raw,
+    __gm__ uint8_t* mi_raw,
+    __gm__ uint8_t* li_raw,
+    __gm__ uint8_t* oi_raw,
+    int is_first,
+    int is_last,
+    __gm__ uint8_t* dst_raw) {
     constexpr int M = 16, N = 16;
 
-    __gm__ float* mij_ptr    = reinterpret_cast<__gm__ float*>(mij_raw);
-    __gm__ float* lij_ptr    = reinterpret_cast<__gm__ float*>(lij_raw);
+    __gm__ float* mij_ptr = reinterpret_cast<__gm__ float*>(mij_raw);
+    __gm__ float* lij_ptr = reinterpret_cast<__gm__ float*>(lij_raw);
     __gm__ float* oi_new_ptr = reinterpret_cast<__gm__ float*>(oi_new_raw);
-    __gm__ float* mi_ptr     = reinterpret_cast<__gm__ float*>(mi_raw);
-    __gm__ float* li_ptr     = reinterpret_cast<__gm__ float*>(li_raw);
-    __gm__ float* oi_ptr     = reinterpret_cast<__gm__ float*>(oi_raw);
-    __gm__ float* dst_ptr    = reinterpret_cast<__gm__ float*>(dst_raw);
+    __gm__ float* mi_ptr = reinterpret_cast<__gm__ float*>(mi_raw);
+    __gm__ float* li_ptr = reinterpret_cast<__gm__ float*>(li_raw);
+    __gm__ float* oi_ptr = reinterpret_cast<__gm__ float*>(oi_raw);
+    __gm__ float* dst_ptr = reinterpret_cast<__gm__ float*>(dst_raw);
 
     // Scalar tile dimensions for RowMajor layout:
     // kScalarCols = 32 bytes / 4 bytes per float = 8 floats per row (one 32-byte block)
@@ -50,12 +54,11 @@ static __aicore__ void online_update_impl(__gm__ uint8_t* mij_raw, __gm__ uint8_
     using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
 
     // Scalar ND: M contiguous floats as (kScalarRows, kScalarCols) RowMajor
-    using GlobalScalarND = GlobalTensor<float, Shape<1, 1, 1, kScalarRows, kScalarCols>,
-                                        Stride<1, 1, 1, kScalarCols, 1>>;
+    using GlobalScalarND =
+        GlobalTensor<float, Shape<1, 1, 1, kScalarRows, kScalarCols>, Stride<1, 1, 1, kScalarCols, 1>>;
 
     // Scalar DN: same M contiguous floats as (kAlignedRows, 1) ColMajor
-    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>,
-                                        Stride<1, 1, 1, 1, 1>, Layout::DN>;
+    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, Stride<1, 1, 1, 1, 1>, Layout::DN>;
 
     // --- GlobalTensor instances ---
 
@@ -77,8 +80,8 @@ static __aicore__ void online_update_impl(__gm__ uint8_t* mij_raw, __gm__ uint8_
     // --- Tile types ---
 
     using TileDataMxN = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N>;
-    using TileScalarND = Tile<TileType::Vec, float, kScalarRows, kScalarCols,
-                              BLayout::RowMajor, kScalarRows, kScalarCols>;
+    using TileScalarND =
+        Tile<TileType::Vec, float, kScalarRows, kScalarCols, BLayout::RowMajor, kScalarRows, kScalarCols>;
     using TileScalarDN = Tile<TileType::Vec, float, kAlignedRows, 1, BLayout::ColMajor, M, 1>;
 
     // --- UB memory layout ---
@@ -123,9 +126,9 @@ static __aicore__ void online_update_impl(__gm__ uint8_t* mij_raw, __gm__ uint8_
         // Passthrough to MTE3 (no V compute needed)
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        TSTORE(miGlobalND, mijND);     // mi = mij
-        TSTORE(liGlobalND, lijND);     // li = lij
-        TSTORE(oiGlobal, oiNewTile);   // oi = oi_new
+        TSTORE(miGlobalND, mijND);    // mi = mij
+        TSTORE(liGlobalND, lijND);    // li = lij
+        TSTORE(oiGlobal, oiNewTile);  // oi = oi_new
 
         if (is_last) {
             // Single block: normalize dst = oi_new / lij
@@ -156,53 +159,53 @@ static __aicore__ void online_update_impl(__gm__ uint8_t* mij_raw, __gm__ uint8_
         // Phase 2: Scalar arithmetic in RowMajor (kScalarRows, kScalarCols)
         // pipe_barrier(PIPE_V) required between each dependent vector operation
         // to resolve RAW hazards on shared UB tiles.
-        TMAX(miNewND, miND, mijND);          // mi_new = max(mi, mij)
+        TMAX(miNewND, miND, mijND);  // mi_new = max(mi, mij)
         pipe_barrier(PIPE_V);
-        TSUB(alphaND, miND, miNewND);        // alpha = mi - mi_new
+        TSUB(alphaND, miND, miNewND);  // alpha = mi - mi_new
         pipe_barrier(PIPE_V);
-        TEXP(alphaND, alphaND);              // alpha = exp(mi - mi_new)
+        TEXP(alphaND, alphaND);  // alpha = exp(mi - mi_new)
         pipe_barrier(PIPE_V);
-        TSUB(betaND, mijND, miNewND);        // beta = mij - mi_new
+        TSUB(betaND, mijND, miNewND);  // beta = mij - mi_new
         pipe_barrier(PIPE_V);
-        TEXP(betaND, betaND);                // beta = exp(mij - mi_new)
+        TEXP(betaND, betaND);  // beta = exp(mij - mi_new)
         pipe_barrier(PIPE_V);
-        TMUL(liND, alphaND, liND);           // li = alpha * li
+        TMUL(liND, alphaND, liND);  // li = alpha * li
         pipe_barrier(PIPE_V);
-        TMUL(tmpND, betaND, lijND);          // tmp = beta * lij
+        TMUL(tmpND, betaND, lijND);  // tmp = beta * lij
         pipe_barrier(PIPE_V);
-        TADD(liND, liND, tmpND);             // li = alpha * li + beta * lij (= li_new)
+        TADD(liND, liND, tmpND);  // li = alpha * li + beta * lij (= li_new)
 
         // Phase 3: Store scalar results to GM (ND format)
         // mi_new -> mi accumulator, li_new -> li accumulator
         // alpha -> mij buffer (reuse), beta -> lij buffer (reuse)
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-        TSTORE(miGlobalND, miNewND);         // persist mi_new
-        TSTORE(liGlobalND, liND);            // persist li_new
-        TSTORE(mijGlobalND, alphaND);        // temp: alpha to mij buffer
-        TSTORE(lijGlobalND, betaND);         // temp: beta to lij buffer
+        TSTORE(miGlobalND, miNewND);   // persist mi_new
+        TSTORE(liGlobalND, liND);      // persist li_new
+        TSTORE(mijGlobalND, alphaND);  // temp: alpha to mij buffer
+        TSTORE(lijGlobalND, betaND);   // temp: beta to lij buffer
 
         // Phase 4: Reload alpha, beta (and li if last) as ColMajor DN
         set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
         wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-        TLOAD(alphaDN, mijGlobalDN);         // alpha from mij buffer as DN
-        TLOAD(betaDN, lijGlobalDN);          // beta from lij buffer as DN
+        TLOAD(alphaDN, mijGlobalDN);  // alpha from mij buffer as DN
+        TLOAD(betaDN, lijGlobalDN);   // beta from lij buffer as DN
         if (is_last) {
-            TLOAD(liDN, liGlobalDN);         // li_new from li buffer as DN
+            TLOAD(liDN, liGlobalDN);  // li_new from li buffer as DN
         }
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
 
         // Phase 5: Scale data tiles using row-broadcast multiply
         TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
-        TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);   // oi_new *= beta
+        TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);  // oi_new *= beta
         pipe_barrier(PIPE_V);
-        TADD(oiTile, oiTile, oiNewTile);               // oi = alpha*oi + beta*oi_new
+        TADD(oiTile, oiTile, oiNewTile);  // oi = alpha*oi + beta*oi_new
 
         if (is_last) {
             // Phase 6: Normalize and output
             pipe_barrier(PIPE_V);
-            TROWEXPANDDIV(oiTile, oiTile, liDN);      // dst = oi / li_new
+            TROWEXPANDDIV(oiTile, oiTile, liDN);  // dst = oi / li_new
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
             TSTORE(dstGlobal, oiTile);
@@ -216,15 +219,15 @@ static __aicore__ void online_update_impl(__gm__ uint8_t* mij_raw, __gm__ uint8_
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ uint8_t* mij    = reinterpret_cast<__gm__ uint8_t*>(args[0]);
-    __gm__ uint8_t* lij    = reinterpret_cast<__gm__ uint8_t*>(args[1]);
+    __gm__ uint8_t* mij = reinterpret_cast<__gm__ uint8_t*>(args[0]);
+    __gm__ uint8_t* lij = reinterpret_cast<__gm__ uint8_t*>(args[1]);
     __gm__ uint8_t* oi_new = reinterpret_cast<__gm__ uint8_t*>(args[2]);
-    __gm__ uint8_t* mi     = reinterpret_cast<__gm__ uint8_t*>(args[3]);
-    __gm__ uint8_t* li     = reinterpret_cast<__gm__ uint8_t*>(args[4]);
-    __gm__ uint8_t* oi     = reinterpret_cast<__gm__ uint8_t*>(args[5]);
-    int is_first  = static_cast<int>(args[6]);
-    int is_last   = static_cast<int>(args[7]);
-    __gm__ uint8_t* dst    = reinterpret_cast<__gm__ uint8_t*>(args[8]);
+    __gm__ uint8_t* mi = reinterpret_cast<__gm__ uint8_t*>(args[3]);
+    __gm__ uint8_t* li = reinterpret_cast<__gm__ uint8_t*>(args[4]);
+    __gm__ uint8_t* oi = reinterpret_cast<__gm__ uint8_t*>(args[5]);
+    int is_first = static_cast<int>(args[6]);
+    int is_last = static_cast<int>(args[7]);
+    __gm__ uint8_t* dst = reinterpret_cast<__gm__ uint8_t*>(args[8]);
 
     online_update_impl(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
 }

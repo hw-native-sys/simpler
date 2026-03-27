@@ -350,7 +350,7 @@ private:
     DeviceArgs device_args_;
 
     // Kernel binary management
-    bool binaries_loaded_{false};            // true after AICPU SO loaded
+    bool binaries_loaded_{false};              // true after AICPU SO loaded
     std::map<int, uint64_t> func_id_to_addr_;  // func_id -> function_bin_addr (device GM)
 
     // Performance profiling
@@ -370,9 +370,8 @@ private:
      * @param aicore_kernel_binary  Binary data of AICore kernel
      * @return 0 on success, error code on failure
      */
-    int ensure_device_initialized(int device_id,
-                                const std::vector<uint8_t>& aicpu_so_binary,
-                                const std::vector<uint8_t>& aicore_kernel_binary);
+    int ensure_device_initialized(
+        int device_id, const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
 
     /**
      * Load AICPU SO and initialize device args
@@ -385,7 +384,8 @@ private:
      * @param aicore_kernel_binary  Binary data of AICore kernel
      * @return 0 on success, error code on failure
      */
-    int ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
+    int ensure_binaries_loaded(
+        const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
 
     /**
      * Initialize performance profiling shared memory

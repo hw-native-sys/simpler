@@ -27,25 +27,24 @@
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     // Read dimensions from TaskArg tensor metadata
     // query: shape=[batch, num_heads, head_dim]
-    uint64_t batch     = orch_args[0].tensor.shapes[0];
+    uint64_t batch = orch_args[0].tensor.shapes[0];
     uint64_t num_heads = orch_args[0].tensor.shapes[1];
-    uint64_t head_dim  = orch_args[0].tensor.shapes[2];
+    uint64_t head_dim = orch_args[0].tensor.shapes[2];
     DataType data_type = orch_args[0].tensor.dtype;
 
     // key_cache: shape=[total_blocks, block_size, kv_head_num, head_dim]
-    uint64_t block_size  = orch_args[1].tensor.shapes[1];
+    uint64_t block_size = orch_args[1].tensor.shapes[1];
 
     // block_table: shape=[batch, max_num_blocks_per_req]
     uint64_t block_num = orch_args[3].tensor.shapes[1];
@@ -62,15 +61,19 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
     uint64_t b_start = batch * orch_thread_index / orch_thread_num;
     uint64_t b_end = batch * (orch_thread_index + 1) / orch_thread_num;
 
-    LOG_INFO(rt, "orch_idx=%d/%d batch=%lu b_range=[%lu,%lu)",
-             orch_thread_index, orch_thread_num,
-             (unsigned long)batch, (unsigned long)b_start, (unsigned long)b_end);
+    LOG_INFO(rt,
+        "orch_idx=%d/%d batch=%lu b_range=[%lu,%lu)",
+        orch_thread_index,
+        orch_thread_num,
+        (unsigned long)batch,
+        (unsigned long)b_start,
+        (unsigned long)b_end);
 
     // Reshape tensors for kernel consumption (2D flattened)
     void* query_ptr = orch_args[0].data<void>();
-    void* kc_ptr    = orch_args[1].data<void>();
-    void* vc_ptr    = orch_args[2].data<void>();
-    void* out_ptr   = orch_args[5].data<void>();
+    void* kc_ptr = orch_args[1].data<void>();
+    void* vc_ptr = orch_args[2].data<void>();
+    void* out_ptr = orch_args[5].data<void>();
 
     // Compute kv_total_rows from key_cache tensor metadata
     uint64_t total_blocks_count = orch_args[1].tensor.shapes[0];
@@ -89,7 +92,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
     LOG_DEBUG(rt, "value_cache=%s", value_cache.dump().c_str());
     LOG_DEBUG(rt, "out=%s", out.dump().c_str());
 
-    int* host_block_table  = orch_args[3].data<int>();
+    int* host_block_table = orch_args[3].data<int>();
     int* host_context_lens = orch_args[4].data<int>();
 
     for (uint64_t b_idx = b_start; b_idx < b_end; b_idx++) {
@@ -116,11 +119,12 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                 params_inplace.add_output(oi);
                 params_inplace.add_output(li_update);
                 params_inplace.add_output(mi_update);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace); // create_inplace
+                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace);  // create_inplace
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
-                    uint64_t valid_len = block_size < (cur_seq - bn * block_size) ? block_size : (cur_seq - bn * block_size);
+                    uint64_t valid_len =
+                        block_size < (cur_seq - bn * block_size) ? block_size : (cur_seq - bn * block_size);
                     uint32_t kv_shapes[2] = {(uint32_t)block_size, (uint32_t)head_dim};
                     uint32_t kv_offsets[2] = {(uint32_t)(cur_block_idx * block_size), 0};
                     Tensor kj = key_cache.view(kv_shapes, kv_offsets);
@@ -134,7 +138,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                     params_qk.add_input(qi);
                     params_qk.add_input(kj);
                     params_qk.add_output(sij);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk); // c1
+                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);  // c1
 
                     uint32_t sij_valid_shapes[2] = {(uint32_t)q_tile, (uint32_t)valid_len};
                     uint32_t sij_valid_offsets[2] = {0, 0};
@@ -147,7 +151,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                     params_sf.add_output(mi);
                     params_sf.add_output(li);
                     params_sf.add_scalar(scale_value);
-                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf); // v1
+                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf);  // v1
 
                     uint32_t oi_tmp_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                     Tensor oi_tmp = make_tensor(oi_tmp_shapes, 2, DataType::FLOAT32);
@@ -156,7 +160,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(oi_tmp);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv); // c2
+                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);  // c2
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
@@ -171,15 +175,18 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                     params_up.add_output(out_view);
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
-                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up); // v2
+                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up);  // v2
                 }
             }
         }
     }
 
-    LOG_INFO(rt, "orch_idx=%d: tasks submitted for batch=[%lu,%lu), num_heads=%lu",
-                  orch_thread_index, (unsigned long)b_start, (unsigned long)b_end,
-                  (unsigned long)num_heads);
+    LOG_INFO(rt,
+        "orch_idx=%d: tasks submitted for batch=[%lu,%lu), num_heads=%lu",
+        orch_thread_index,
+        (unsigned long)b_start,
+        (unsigned long)b_end,
+        (unsigned long)num_heads);
 }
 
 }  // extern "C"

@@ -39,7 +39,7 @@ static uint64_t g_orch_params_cycle = 0;
 static uint64_t g_orch_heap_cycle = 0;
 static uint64_t g_orch_fanin_cycle = 0;
 static uint64_t g_orch_scope_end_cycle = 0;
-static int64_t  g_orch_submit_count = 0;
+static int64_t g_orch_submit_count = 0;
 static uint32_t g_orch_submit_idx = 0;
 uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_heap_wait_cycle = 0;
@@ -50,7 +50,12 @@ uint64_t g_orch_heap_atomic_count = 0;
 uint64_t g_orch_fanin_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
 #define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
-#define CYCLE_COUNT_LAP(acc) do { _t1 = get_sys_cnt_aicpu(); acc += (_t1 - _t0); _t0 = _t1; } while(0)
+#define CYCLE_COUNT_LAP(acc)       \
+    do {                           \
+        _t1 = get_sys_cnt_aicpu(); \
+        acc += (_t1 - _t0);        \
+        _t0 = _t1;                 \
+    } while (0)
 #define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                    \
     do {                                                                              \
         _t1 = get_sys_cnt_aicpu();                                                    \
@@ -65,17 +70,19 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
     AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 static uint32_t g_orch_submit_idx = 0;
-#define CYCLE_COUNT_START()                                                           \
-    bool _prof_active = orch->enable_profiling;                                       \
+#define CYCLE_COUNT_START()                     \
+    bool _prof_active = orch->enable_profiling; \
     uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0
-#define CYCLE_COUNT_LAP(acc) do { } while(0)
-#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                    \
-    do {                                                                              \
-        if (_prof_active) {                                                           \
-            _t1 = get_sys_cnt_aicpu();                                                \
+#define CYCLE_COUNT_LAP(acc) \
+    do {                     \
+    } while (0)
+#define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)                                        \
+    do {                                                                                  \
+        if (_prof_active) {                                                               \
+            _t1 = get_sys_cnt_aicpu();                                                    \
             perf_aicpu_record_orch_phase((phase_id), _t0, _t1, g_orch_submit_idx, (tid)); \
-            _t0 = _t1;                                                                \
-        }                                                                             \
+            _t0 = _t1;                                                                    \
+        }                                                                                 \
     } while (0)
 #else
 #define CYCLE_COUNT_START()
@@ -87,8 +94,10 @@ static uint32_t g_orch_submit_idx = 0;
 // Orchestrator Initialization
 // =============================================================================
 
-bool pto2_orchestrator_init(
-    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, uint64_t heap_size,
+bool pto2_orchestrator_init(PTO2OrchestratorState* orch,
+    PTO2SharedMemoryHandle* sm_handle,
+    void* gm_heap,
+    uint64_t heap_size,
     int32_t dep_pool_capacity) {
     *orch = PTO2OrchestratorState{};
 
@@ -100,7 +109,7 @@ bool pto2_orchestrator_init(
     // Initialize per-ring resources
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         void* ring_heap_base = (char*)gm_heap + r * heap_size;
-        auto &fc = sm_handle->header->rings[r].fc;
+        auto& fc = sm_handle->header->rings[r].fc;
 
         pto2_heap_ring_init(&orch->rings[r].heap_ring, ring_heap_base, heap_size, &fc.heap_tail, &fc.heap_top);
         orch->rings[r].heap_ring.error_code_ptr = &sm_handle->header->orch_error_code;
@@ -163,10 +172,11 @@ void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerS
 // Scope Management
 // =============================================================================
 
-static void scope_tasks_push(PTO2OrchestratorState* orch, PTO2TaskSlotState *task_slot_state) {
+static void scope_tasks_push(PTO2OrchestratorState* orch, PTO2TaskSlotState* task_slot_state) {
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
         int32_t new_cap = orch->scope_tasks_capacity * 2;
-        PTO2TaskSlotState** new_buf = (PTO2TaskSlotState**)realloc(orch->scope_tasks, new_cap * sizeof(PTO2TaskSlotState*));
+        PTO2TaskSlotState** new_buf =
+            (PTO2TaskSlotState**)realloc(orch->scope_tasks, new_cap * sizeof(PTO2TaskSlotState*));
         assert(new_buf && "Failed to grow scope task buffer");
         orch->scope_tasks = new_buf;
         orch->scope_tasks_capacity = new_cap;
@@ -175,7 +185,9 @@ static void scope_tasks_push(PTO2OrchestratorState* orch, PTO2TaskSlotState *tas
 }
 
 void pto2_scope_begin(PTO2OrchestratorState* orch) {
-    if (orch->fatal) { return; }
+    if (orch->fatal) {
+        return;
+    }
     assert(orch->scope_stack_top < (int32_t)(orch->scope_stack_capacity - 1) && "Scope stack overflow");
 
     ++orch->scope_stack_top;
@@ -183,7 +195,9 @@ void pto2_scope_begin(PTO2OrchestratorState* orch) {
 }
 
 void pto2_scope_end(PTO2OrchestratorState* orch) {
-    if (orch->fatal) { return; }
+    if (orch->fatal) {
+        return;
+    }
     assert(orch->scope_stack_top >= 0 && "Scope stack underflow");
 
 #if PTO2_ORCH_PROFILING
@@ -248,8 +262,7 @@ PTO2TaskId pto2_submit_mixed_task(
         LOG_ERROR("Error: %s", params.error_msg ? params.error_msg : "(unknown)");
         LOG_ERROR("  tensor_count: %d, scalar_count: %d", params.tensor_count, params.scalar_count);
         LOG_ERROR("========================================");
-        orch->sm_handle->header->orch_error_code.store(
-            PTO2_ERROR_INVALID_PARAM, std::memory_order_release);
+        orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_PARAM, std::memory_order_release);
         orch->fatal = true;
         return invalid_id;
     }
@@ -285,8 +298,7 @@ PTO2TaskId pto2_submit_mixed_task(
             LOG_ERROR("========================================");
             LOG_ERROR("FATAL: Scope Deadlock Detected! (ring %d)", ring_id);
             LOG_ERROR("========================================");
-            LOG_ERROR("Tasks in current scope (%d) >= task_window_size (%d).",
-                      scope_task_count, task_ring.window_size);
+            LOG_ERROR("Tasks in current scope (%d) >= task_window_size (%d).", scope_task_count, task_ring.window_size);
             LOG_ERROR("  scope_depth:        %d", orch->scope_stack_top + 1);
             LOG_ERROR("  ring_id:            %d", ring_id);
             LOG_ERROR("  scope_task_count:   %d", scope_task_count);
@@ -294,8 +306,7 @@ PTO2TaskId pto2_submit_mixed_task(
             LOG_ERROR("  last_task_alive:    %d", last_alive);
             LOG_ERROR("  active_tasks:       %d / %d", active_count, task_ring.window_size);
             LOG_ERROR("========================================");
-            orch->sm_handle->header->orch_error_code.store(
-                PTO2_ERROR_SCOPE_DEADLOCK, std::memory_order_release);
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_SCOPE_DEADLOCK, std::memory_order_release);
             orch->fatal = true;
             return invalid_id;
         }
@@ -303,7 +314,10 @@ PTO2TaskId pto2_submit_mixed_task(
 
     // === STEP 1: Allocate task slot from Task Ring ===
     int32_t local_id = task_ring.pto2_task_ring_alloc();
-    if (local_id < 0) { orch->fatal = true; return invalid_id; }
+    if (local_id < 0) {
+        orch->fatal = true;
+        return invalid_id;
+    }
     int32_t slot = task_ring.get_task_slot(local_id);
     PTO2TaskId task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
 
@@ -353,8 +367,7 @@ PTO2TaskId pto2_submit_mixed_task(
     // === STEP 2: Heap allocation for OUTPUT tensors ===
     int32_t total_output_size = 0;
     for (int i = 0; i < params.tensor_count; i++) {
-        if (params.tensor_types[i] == PTOParamType::OUTPUT
-            && params.tensors[i]->buffer.addr == 0) {
+        if (params.tensor_types[i] == PTOParamType::OUTPUT && params.tensors[i]->buffer.addr == 0) {
             total_output_size += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
@@ -363,15 +376,17 @@ PTO2TaskId pto2_submit_mixed_task(
     void* local_packed_end = nullptr;
     if (total_output_size > 0) {
         local_packed_base = orch->pto2_alloc_packed_buffer(total_output_size);
-        if (!local_packed_base) { orch->fatal = true; return invalid_id; }
+        if (!local_packed_base) {
+            orch->fatal = true;
+            return invalid_id;
+        }
         local_packed_end = (char*)local_packed_base + total_output_size;
     }
 
     // Assign addresses to OUTPUT tensors
     int32_t offset = 0;
     for (int i = 0; i < params.tensor_count; i++) {
-        if (params.tensor_types[i] == PTOParamType::OUTPUT
-            && params.tensors[i]->buffer.addr == 0) {
+        if (params.tensor_types[i] == PTOParamType::OUTPUT && params.tensors[i]->buffer.addr == 0) {
             uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)local_packed_base + offset);
             params.tensors[i]->buffer.addr = alloc_addr;
             offset += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
@@ -389,7 +404,7 @@ PTO2TaskId pto2_submit_mixed_task(
     // === STEP 3: Write task descriptor and payload ===
     __builtin_prefetch(&task, 1, 1);
     task.task_id = task_id;
-    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)]  = normalized.aic_kernel_id;
+    task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = normalized.aic_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = normalized.aiv0_kernel_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV1)] = normalized.aiv1_kernel_id;
     task.packed_buffer_base = local_packed_base;
@@ -422,8 +437,7 @@ PTO2TaskId pto2_submit_mixed_task(
 // Explicit Dependency Management
 // =============================================================================
 
-void pto2_add_dependency(PTO2OrchestratorState* orch,
-                          PTO2TaskId producer_id, PTO2TaskId consumer_id) {
+void pto2_add_dependency(PTO2OrchestratorState* orch, PTO2TaskId producer_id, PTO2TaskId consumer_id) {
     if (orch->fatal) return;
 
     PTO2SchedulerState* sched = orch->scheduler;
@@ -492,7 +506,12 @@ void pto2_orchestrator_done(PTO2OrchestratorState* orch) {
         auto& pool = orch->rings[r].dep_pool;
         if (pool.top > 0) {
             LOG_INFO("=== [DepPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===",
-                     r, pool.top, pool.tail, pool.top - pool.tail, pool.high_water, pool.capacity);
+                r,
+                pool.top,
+                pool.tail,
+                pool.top - pool.tail,
+                pool.high_water,
+                pool.capacity);
         }
     }
     orch->sm_handle->header->orchestrator_done.store(1, std::memory_order_release);
@@ -517,12 +536,12 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
         int32_t active = pto2_task_ring_active_count(&orch->rings[r].task_ring);
         if (active > 0) {
             LOG_INFO("Ring %d task active:  %d", r, active);
-            LOG_INFO("Ring %d heap used:    %" PRIu64 " / %" PRIu64, r,
-                     orch->rings[r].heap_ring.top_ptr->load(std::memory_order_relaxed),
-                     orch->rings[r].heap_ring.size);
-            LOG_INFO("Ring %d dep pool:     %d / %d", r,
-                     orch->rings[r].dep_pool.used(),
-                     orch->rings[r].dep_pool.capacity);
+            LOG_INFO("Ring %d heap used:    %" PRIu64 " / %" PRIu64,
+                r,
+                orch->rings[r].heap_ring.top_ptr->load(std::memory_order_relaxed),
+                orch->rings[r].heap_ring.size);
+            LOG_INFO(
+                "Ring %d dep pool:     %d / %d", r, orch->rings[r].dep_pool.used(), orch->rings[r].dep_pool.capacity);
         }
     }
     LOG_INFO("===============================");

@@ -59,8 +59,7 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                        const PTOParam& params);
+    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const PTOParam& params);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
     void (*orchestration_done)(PTO2Runtime* rt);
@@ -82,24 +81,24 @@ struct PTO2RuntimeOps {
  */
 struct PTO2Runtime {
     // Ops table (first field — used by orchestration .so via function pointers)
-    const PTO2RuntimeOps*   ops;
+    const PTO2RuntimeOps* ops;
 
     // Components
     PTO2SharedMemoryHandle* sm_handle;
-    PTO2OrchestratorState   orchestrators[PTO2_MAX_ORCH_THREADS];
-    int                     orch_count;     // Number of active orchestrator states
-    PTO2SchedulerState      scheduler;
+    PTO2OrchestratorState orchestrators[PTO2_MAX_ORCH_THREADS];
+    int orch_count;  // Number of active orchestrator states
+    PTO2SchedulerState scheduler;
 
     // GM Heap for output buffers
-    void*                   gm_heap;
-    uint64_t                  gm_heap_size;
-    bool                    gm_heap_owned;  // True if we allocated it
+    void* gm_heap;
+    uint64_t gm_heap_size;
+    bool gm_heap_owned;  // True if we allocated it
 
     // Mode
-    PTO2RuntimeMode         mode;
+    PTO2RuntimeMode mode;
 
     // Statistics
-    int64_t                 total_cycles;
+    int64_t total_cycles;
 };
 
 // =============================================================================
@@ -123,9 +122,9 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode);
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
-                                         uint64_t task_window_size,
-                                         uint64_t heap_size,
-                                         int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    uint64_t task_window_size,
+    uint64_t heap_size,
+    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Create runtime from existing shared memory and GM heap (e.g. on device).
@@ -138,11 +137,11 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
-                                          PTO2SharedMemoryHandle* sm_handle,
-                                          void* gm_heap,
-                                          uint64_t heap_size,
-                                          int orch_count = 1,
-                                          int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    PTO2SharedMemoryHandle* sm_handle,
+    void* gm_heap,
+    uint64_t heap_size,
+    int orch_count = 1,
+    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Destroy runtime and free all resources
@@ -201,7 +200,7 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt);
  *   PTO2_SCOPE_END(rt);
  */
 #define PTO2_SCOPE_BEGIN(rt) pto2_rt_scope_begin(rt)
-#define PTO2_SCOPE_END(rt)   pto2_rt_scope_end(rt)
+#define PTO2_SCOPE_END(rt) pto2_rt_scope_end(rt)
 
 /**
  * RAII Scope Guard for C++
@@ -235,12 +234,9 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt);
  */
 class PTO2ScopeGuard {
 public:
-    PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) {
-        pto2_rt_scope_begin(rt_);
-    }
-    ~PTO2ScopeGuard() {
-        pto2_rt_scope_end(rt_);
-    }
+    PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) { pto2_rt_scope_begin(rt_); }
+    ~PTO2ScopeGuard() { pto2_rt_scope_end(rt_); }
+
 private:
     PTO2Runtime* rt_;
 };
@@ -254,7 +250,7 @@ private:
  *   PTO2_SCOPE_GUARD(rt);
  *   pto2_rt_submit_task(...);
  */
-#define _PTO2_CONCATENATE_IMPL(x, y) x ## y
+#define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
 #define PTO2_SCOPE_GUARD(rt) [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)(rt)
 
@@ -276,8 +272,8 @@ private:
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
 struct PTO2OrchestrationConfig {
-    int         expected_arg_count;
+    int expected_arg_count;
 };
 #endif
 
-#endif // PTO_RUNTIME2_H
+#endif  // PTO_RUNTIME2_H

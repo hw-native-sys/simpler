@@ -31,7 +31,7 @@
 #include "pto_orchestration_api.h"
 
 #define FUNC_GEMM_TILE 0
-#define FUNC_TILE_ADD  1
+#define FUNC_TILE_ADD 1
 
 static constexpr int TILE = 64;
 static constexpr int GRID_M = 4;
@@ -44,16 +44,15 @@ static constexpr uint64_t TILE_BYTES = TILE_ELEMS * sizeof(float);
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
@@ -61,8 +60,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
     Tensor ext_B = from_task_arg(orch_args[1]);
     Tensor ext_C = from_task_arg(orch_args[2]);
 
-    LOG_INFO(rt, "[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d",
-                  GRID_M, GRID_K, GRID_N, BATCH, TILE);
+    LOG_INFO(rt, "[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d", GRID_M, GRID_K, GRID_N, BATCH, TILE);
 
     uint32_t tile_shapes[1] = {TILE_ELEMS};
 
@@ -71,9 +69,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
             for (int n_idx = 0; n_idx < GRID_N; n_idx++) {
                 PTO2_SCOPE(rt) {
                     uint32_t c_elem_offset =
-                        ((uint32_t)batch * GRID_M * GRID_N +
-                         (uint32_t)m_idx * GRID_N +
-                         (uint32_t)n_idx) * TILE_ELEMS;
+                        ((uint32_t)batch * GRID_M * GRID_N + (uint32_t)m_idx * GRID_N + (uint32_t)n_idx) * TILE_ELEMS;
                     uint32_t c_view_offsets[1] = {c_elem_offset};
                     Tensor C_view = ext_C.view(tile_shapes, c_view_offsets);
 
@@ -82,13 +78,11 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
 
                     for (int k_idx = 0; k_idx < GRID_K; k_idx++) {
                         uint32_t a_elem_offset =
-                            ((uint32_t)batch * GRID_M * GRID_K +
-                             (uint32_t)m_idx * GRID_K +
-                             (uint32_t)k_idx) * TILE_ELEMS;
+                            ((uint32_t)batch * GRID_M * GRID_K + (uint32_t)m_idx * GRID_K + (uint32_t)k_idx) *
+                            TILE_ELEMS;
                         uint32_t b_elem_offset =
-                            ((uint32_t)batch * GRID_K * GRID_N +
-                             (uint32_t)k_idx * GRID_N +
-                             (uint32_t)n_idx) * TILE_ELEMS;
+                            ((uint32_t)batch * GRID_K * GRID_N + (uint32_t)k_idx * GRID_N + (uint32_t)n_idx) *
+                            TILE_ELEMS;
 
                         uint32_t a_view_offsets[1] = {a_elem_offset};
                         Tensor A_view = ext_A.view(tile_shapes, a_view_offsets);
@@ -124,8 +118,12 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
         }
     }
 
-    LOG_INFO(rt, "[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each",
-                  BATCH, GRID_M, GRID_N, GRID_K);
+    LOG_INFO(rt,
+        "[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each",
+        BATCH,
+        GRID_M,
+        GRID_N,
+        GRID_K);
 }
 
 }  // extern "C"

@@ -19,27 +19,26 @@
 #include "pto_orchestration_api.h"
 
 // Mixed-task kernels (args offset matches param position in mixed param list)
-#define FUNC_MATMUL         0   // AIC: reads args[0..2]
-#define FUNC_ADD            1   // AIV0 in mixed: reads args[3..5]
-#define FUNC_MUL            2   // AIV1 in mixed: reads args[6..8]
+#define FUNC_MATMUL 0  // AIC: reads args[0..2]
+#define FUNC_ADD 1     // AIV0 in mixed: reads args[3..5]
+#define FUNC_MUL 2     // AIV1 in mixed: reads args[6..8]
 // Standalone kernels (read args[0..2] or args[3..5])
-#define FUNC_ADD_STANDALONE 3   // AIV: reads args[0..2]
-#define FUNC_MUL_STANDALONE 4   // AIV1 in AIV_X2: reads args[3..5]
+#define FUNC_ADD_STANDALONE 3  // AIV: reads args[0..2]
+#define FUNC_MUL_STANDALONE 4  // AIV1 in AIV_X2: reads args[3..5]
 
 static constexpr uint32_t TILE_ELEMS = 128 * 128;
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 15,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 

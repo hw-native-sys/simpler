@@ -17,8 +17,7 @@
 template <typename F>
 class RAIIScopeGuard {
 public:
-    explicit RAIIScopeGuard(F fn)
-        : fn_(std::move(fn)), active_(true) {}
+    explicit RAIIScopeGuard(F fn) : fn_(std::move(fn)), active_(true) {}
 
     ~RAIIScopeGuard() {
         if (active_) {
@@ -26,17 +25,14 @@ public:
         }
     }
 
-    RAIIScopeGuard(RAIIScopeGuard&& other) noexcept
-        : fn_(std::move(other.fn_)), active_(other.active_) {
+    RAIIScopeGuard(RAIIScopeGuard&& other) noexcept : fn_(std::move(other.fn_)), active_(other.active_) {
         other.active_ = false;
     }
 
     RAIIScopeGuard(const RAIIScopeGuard&) = delete;
     RAIIScopeGuard& operator=(const RAIIScopeGuard&) = delete;
 
-    void dismiss() noexcept {
-        active_ = false;
-    }
+    void dismiss() noexcept { active_ = false; }
 
 private:
     F fn_;

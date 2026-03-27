@@ -36,13 +36,10 @@ AICORE constexpr inline T CeilAlign(T num_1, T num_2) {
 }
 
 static __aicore__ void gemm_tile_impl(
-    __gm__ Tensor* input_a_tensor,
-    __gm__ Tensor* input_b_tensor,
-    __gm__ Tensor* output_tensor) {
-
+    __gm__ Tensor* input_a_tensor, __gm__ Tensor* input_b_tensor, __gm__ Tensor* output_tensor) {
     __gm__ float* input_a = reinterpret_cast<__gm__ float*>(input_a_tensor->buffer.addr) + input_a_tensor->start_offset;
     __gm__ float* input_b = reinterpret_cast<__gm__ float*>(input_b_tensor->buffer.addr) + input_b_tensor->start_offset;
-    __gm__ float* output  = reinterpret_cast<__gm__ float*>(output_tensor->buffer.addr)  + output_tensor->start_offset;
+    __gm__ float* output = reinterpret_cast<__gm__ float*>(output_tensor->buffer.addr) + output_tensor->start_offset;
 
     constexpr int TILE = 64;
     constexpr int blockAlign = C0_SIZE_BYTE / sizeof(float);
@@ -50,12 +47,12 @@ static __aicore__ void gemm_tile_impl(
     constexpr int K = CeilAlign<int>(TILE, blockAlign);
     constexpr int N = CeilAlign<int>(TILE, blockAlign);
 
-    using GlobalDataA = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
-    using GlobalDataB = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
-    using GlobalDataC = GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>,
-        Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+    using GlobalDataA =
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+    using GlobalDataB =
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
+    using GlobalDataC =
+        GlobalTensor<float, Shape<1, 1, 1, TILE, TILE>, Stride<1 * TILE * TILE, 1 * TILE * TILE, TILE * TILE, TILE, 1>>;
 
     GlobalDataA src0Global(input_a);
     GlobalDataB src1Global(input_b);
@@ -106,7 +103,7 @@ static __aicore__ void gemm_tile_impl(
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* input_a = reinterpret_cast<__gm__ Tensor*>(args[0]);
     __gm__ Tensor* input_b = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* output  = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ Tensor* output = reinterpret_cast<__gm__ Tensor*>(args[2]);
 
     gemm_tile_impl(input_a, input_b, output);
 }

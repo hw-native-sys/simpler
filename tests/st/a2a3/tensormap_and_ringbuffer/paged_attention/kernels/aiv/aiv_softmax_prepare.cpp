@@ -31,11 +31,8 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
-    float scale_value,
-    __gm__ Tensor* pij,
-    __gm__ Tensor* mij,
-    __gm__ Tensor* lij) {
+static __aicore__ void softmax_prepare_impl(
+    __gm__ Tensor* sij, float scale_value, __gm__ Tensor* pij, __gm__ Tensor* mij, __gm__ Tensor* lij) {
     uint64_t valid_len = static_cast<uint64_t>(sij->shapes[1]);
     __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
     __gm__ bfloat16_t* pij_addr = reinterpret_cast<__gm__ bfloat16_t*>(pij->buffer.addr);
@@ -102,14 +99,14 @@ static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
     // Truncate pij to bf16 first
     pipe_barrier(PIPE_V);
     TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);        // pij bf16 ready, can store early
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);  // pij bf16 ready, can store early
 
     // Continue computing: bf16 → f32 and rowsum while pij store proceeds in parallel
     pipe_barrier(PIPE_V);
     TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
     pipe_barrier(PIPE_V);
     TROWSUM(sumTile, pijTile, tmpTile);
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);        // sum ready
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);  // sum ready
 
     // Store pij (overlaps with TCVT + TROWSUM above)
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);

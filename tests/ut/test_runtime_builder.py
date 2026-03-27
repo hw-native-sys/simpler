@@ -34,17 +34,29 @@ class TestRuntimeBuilderDiscovery:
         runtimes = builder.list_runtimes()
         assert "aicpu_build_graph" in runtimes
 
-    def test_runtime_dir_resolves_to_project_root(self, default_test_platform, test_arch):
+    def test_runtime_dir_resolves_to_project_root(
+        self, default_test_platform, test_arch
+    ):
         """runtime_dir resolves to src/{arch}/runtime/ under the project root."""
         from runtime_builder import RuntimeBuilder
 
         builder = RuntimeBuilder(platform=default_test_platform)
-        assert builder.runtime_dir == builder.runtime_root / "src" / test_arch / "runtime"
+        assert (
+            builder.runtime_dir == builder.runtime_root / "src" / test_arch / "runtime"
+        )
         assert builder.runtime_dir.is_dir()
 
     @patch("runtime_builder.RuntimeCompiler")
     @patch("runtime_builder.KernelCompiler")
-    def test_discovers_configs_in_runtime_dir(self, MockKernel, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch):
+    def test_discovers_configs_in_runtime_dir(
+        self,
+        MockKernel,
+        MockCompiler,
+        tmp_path,
+        monkeypatch,
+        default_test_platform,
+        test_arch,
+    ):
         """RuntimeBuilder discovers implementations in the runtime directory."""
         import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
@@ -54,16 +66,22 @@ class TestRuntimeBuilderDiscovery:
         # Set up fake runtime tree with architecture-specific structure
         rt_dir = tmp_path / "src" / test_arch / "runtime" / "my_runtime"
         rt_dir.mkdir(parents=True)
-        (rt_dir / "build_config.py").write_text(
-            "BUILD_CONFIG = {}\n"
-        )
+        (rt_dir / "build_config.py").write_text("BUILD_CONFIG = {}\n")
 
         builder = RuntimeBuilder(platform=default_test_platform)
         assert builder.list_runtimes() == ["my_runtime"]
 
     @patch("runtime_builder.RuntimeCompiler")
     @patch("runtime_builder.KernelCompiler")
-    def test_ignores_dirs_without_build_config(self, MockKernel, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch):
+    def test_ignores_dirs_without_build_config(
+        self,
+        MockKernel,
+        MockCompiler,
+        tmp_path,
+        monkeypatch,
+        default_test_platform,
+        test_arch,
+    ):
         """Directories without build_config.py are not listed."""
         import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
@@ -82,7 +100,15 @@ class TestRuntimeBuilderDiscovery:
 
     @patch("runtime_builder.RuntimeCompiler")
     @patch("runtime_builder.KernelCompiler")
-    def test_empty_runtime_dir(self, MockKernel, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch):
+    def test_empty_runtime_dir(
+        self,
+        MockKernel,
+        MockCompiler,
+        tmp_path,
+        monkeypatch,
+        default_test_platform,
+        test_arch,
+    ):
         """Empty src/{arch}/runtime/ directory yields no runtimes."""
         import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
@@ -96,7 +122,9 @@ class TestRuntimeBuilderDiscovery:
 
     @patch("runtime_builder.RuntimeCompiler")
     @patch("runtime_builder.KernelCompiler")
-    def test_missing_runtime_dir(self, MockKernel, MockCompiler, tmp_path, monkeypatch, default_test_platform):
+    def test_missing_runtime_dir(
+        self, MockKernel, MockCompiler, tmp_path, monkeypatch, default_test_platform
+    ):
         """Non-existent src/{arch}/runtime/ directory yields no runtimes."""
         import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
@@ -108,7 +136,15 @@ class TestRuntimeBuilderDiscovery:
 
     @patch("runtime_builder.RuntimeCompiler")
     @patch("runtime_builder.KernelCompiler")
-    def test_multiple_runtimes_sorted(self, MockKernel, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch):
+    def test_multiple_runtimes_sorted(
+        self,
+        MockKernel,
+        MockCompiler,
+        tmp_path,
+        monkeypatch,
+        default_test_platform,
+        test_arch,
+    ):
         """Multiple implementations are returned in sorted order."""
         import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
@@ -149,7 +185,15 @@ class TestRuntimeBuilderBuildErrors:
 
     @patch("runtime_builder.RuntimeCompiler")
     @patch("runtime_builder.KernelCompiler")
-    def test_build_empty_registry_shows_none(self, MockKernel, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch):
+    def test_build_empty_registry_shows_none(
+        self,
+        MockKernel,
+        MockCompiler,
+        tmp_path,
+        monkeypatch,
+        default_test_platform,
+        test_arch,
+    ):
         """ValueError message shows '(none)' when no runtimes exist."""
         import runtime_builder as rb_module
         from runtime_builder import RuntimeBuilder
@@ -171,6 +215,7 @@ class TestRuntimeBuilderBuild:
     @pytest.fixture(autouse=True)
     def _patch_runtime_root(self, monkeypatch, tmp_path):
         import runtime_builder as rb_module
+
         monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "python" / "rb.py"))
 
     def _make_runtime(self, tmp_path, test_arch):
@@ -200,7 +245,9 @@ class TestRuntimeBuilderBuild:
 
     @patch("runtime_builder.KernelCompiler")
     @patch("runtime_builder.RuntimeCompiler")
-    def test_build_returns_three_binaries(self, MockCompiler, MockKernel, tmp_path, default_test_platform, test_arch):
+    def test_build_returns_three_binaries(
+        self, MockCompiler, MockKernel, tmp_path, default_test_platform, test_arch
+    ):
         """build() returns (host_binary, aicpu_binary, aicore_binary)."""
         from runtime_builder import RuntimeBuilder
 
@@ -208,9 +255,9 @@ class TestRuntimeBuilderBuild:
 
         mock_instance = MockCompiler.get_instance.return_value
         mock_instance.compile.side_effect = [
-            b"aicore_bin",   # first call: aicore
-            b"aicpu_bin",    # second call: aicpu
-            b"host_bin",     # third call: host
+            b"aicore_bin",  # first call: aicore
+            b"aicpu_bin",  # second call: aicpu
+            b"host_bin",  # third call: host
         ]
 
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -220,7 +267,9 @@ class TestRuntimeBuilderBuild:
 
     @patch("runtime_builder.KernelCompiler")
     @patch("runtime_builder.RuntimeCompiler")
-    def test_build_calls_compiler_three_times(self, MockCompiler, MockKernel, tmp_path, default_test_platform, test_arch):
+    def test_build_calls_compiler_three_times(
+        self, MockCompiler, MockKernel, tmp_path, default_test_platform, test_arch
+    ):
         """build() invokes compiler.compile() exactly 3 times (aicore, aicpu, host)."""
         from runtime_builder import RuntimeBuilder
 
@@ -238,7 +287,9 @@ class TestRuntimeBuilderBuild:
 
     @patch("runtime_builder.KernelCompiler")
     @patch("runtime_builder.RuntimeCompiler")
-    def test_build_resolves_paths_relative_to_config(self, MockCompiler, MockKernel, tmp_path, default_test_platform, test_arch):
+    def test_build_resolves_paths_relative_to_config(
+        self, MockCompiler, MockKernel, tmp_path, default_test_platform, test_arch
+    ):
         """Include/source dirs are resolved relative to the build_config.py directory."""
         from runtime_builder import RuntimeBuilder
 
@@ -259,7 +310,9 @@ class TestRuntimeBuilderBuild:
 
     @patch("runtime_builder.KernelCompiler")
     @patch("runtime_builder.RuntimeCompiler")
-    def test_build_propagates_compiler_error(self, MockCompiler, MockKernel, tmp_path, default_test_platform, test_arch):
+    def test_build_propagates_compiler_error(
+        self, MockCompiler, MockKernel, tmp_path, default_test_platform, test_arch
+    ):
         """If RuntimeCompiler.compile() raises, build() propagates the exception."""
         from runtime_builder import RuntimeBuilder
 
@@ -305,6 +358,10 @@ class TestRuntimeBuilderIntegration:
         assert len(result) == 3
 
         host_binary, aicpu_binary, aicore_binary = result
-        for label, binary in [("host", host_binary), ("aicpu", aicpu_binary), ("aicore", aicore_binary)]:
+        for label, binary in [
+            ("host", host_binary),
+            ("aicpu", aicpu_binary),
+            ("aicore", aicore_binary),
+        ]:
             assert isinstance(binary, bytes), f"{label} binary is not bytes"
             assert len(binary) > 0, f"{label} binary is empty"

@@ -40,8 +40,7 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
@@ -53,8 +52,8 @@ PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
  * The executor wraps this call in PTO2_SCOPE, so we are already inside
  * the outer scope on entry.
  */
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
@@ -74,7 +73,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
     params_t0.add_output(c);
-    pto2_rt_submit_aiv_task(0, params_t0); // kernel_add
+    pto2_rt_submit_aiv_task(0, params_t0);  // kernel_add
 
     // Inner scope: owns t1, t2, t3, t4; intermediates d, e, g release on scope end.
     // c flows in from outer scope (outer-scope tensors are visible to inner scopes).
@@ -89,7 +88,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         params_t1.add_output(d);
         params_t1.add_scalar(float_to_u64(1.0f));
         params_t1.add_scalar((uint64_t)3);
-        pto2_rt_submit_aiv_task(1, params_t1); // kernel_add_scalar
+        pto2_rt_submit_aiv_task(1, params_t1);  // kernel_add_scalar
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
         PTOParam params_t2;
@@ -97,7 +96,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         params_t2.add_output(e);
         params_t2.add_scalar(float_to_u64(2.0f));
         params_t2.add_scalar((uint64_t)3);
-        pto2_rt_submit_aiv_task(1, params_t2); // kernel_add_scalar
+        pto2_rt_submit_aiv_task(1, params_t2);  // kernel_add_scalar
 
         // t3: g = d * e (kernel_id=2, kernel_mul)
         PTOParam params_t3;
@@ -105,14 +104,14 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         params_t3.add_input(e);
         params_t3.add_output(g);
         params_t3.add_scalar((uint64_t)3);
-        pto2_rt_submit_aiv_task(2, params_t3); // kernel_mul
+        pto2_rt_submit_aiv_task(2, params_t3);  // kernel_mul
 
         // t4: f = g + c (kernel_id=0, kernel_add)
         PTOParam params_t4;
         params_t4.add_input(g);
         params_t4.add_input(c);
         params_t4.add_output(ext_f);
-        pto2_rt_submit_aiv_task(0, params_t4); // kernel_add
+        pto2_rt_submit_aiv_task(0, params_t4);  // kernel_add
     }  // inner scope ends: releases d, e, g
 }
 

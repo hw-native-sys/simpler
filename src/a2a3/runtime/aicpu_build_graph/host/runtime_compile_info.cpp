@@ -14,5 +14,4 @@ ToolchainType get_orchestration_compiler(void) {
     if (strcmp(get_platform(), "a2a3") == 0) return TOOLCHAIN_AARCH64_GXX;
     return TOOLCHAIN_HOST_GXX;
 }
-
 }

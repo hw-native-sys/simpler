@@ -22,7 +22,8 @@ void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type);
 
 // Wrapper with extern "C" for dlsym lookup
 // NOTE: physical_core_id stays in wrapper signature (DeviceRunner passes it for register indexing)
-extern "C" void aicore_execute_wrapper(__gm__ Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs) {
+extern "C" void aicore_execute_wrapper(
+    __gm__ Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs) {
     // Set up simulated register base for this thread.
     // regs points to an array of uint64_t base addresses (one per core).
     // physical_core_id indexes into it to get this core's register block.

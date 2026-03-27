@@ -46,8 +46,7 @@ using PerfAllocCallback = void* (*)(size_t size, void* user_data);
  * @param[out] host_ptr Host-mapped pointer
  * @return 0 on success, error code on failure
  */
-using PerfRegisterCallback = int (*)(void* dev_ptr, size_t size, int device_id,
-                                      void* user_data, void** host_ptr);
+using PerfRegisterCallback = int (*)(void* dev_ptr, size_t size, int device_id, void* user_data, void** host_ptr);
 
 /**
  * Memory unregister callback
@@ -82,18 +81,18 @@ enum class ProfBufferType { PERF_RECORD, PHASE };
  */
 struct ReadyBufferInfo {
     ProfBufferType type;
-    uint32_t index;           // core_index (PERF_RECORD) or thread_idx (PHASE)
-    uint32_t slot_idx;        // Reserved (unused in free queue design)
-    void* dev_buffer_ptr;     // Device address of the full buffer
-    void* host_buffer_ptr;    // Host-mapped address (sim: same as dev)
-    uint32_t buffer_seq;      // Sequence number for ordering
+    uint32_t index;         // core_index (PERF_RECORD) or thread_idx (PHASE)
+    uint32_t slot_idx;      // Reserved (unused in free queue design)
+    void* dev_buffer_ptr;   // Device address of the full buffer
+    void* host_buffer_ptr;  // Host-mapped address (sim: same as dev)
+    uint32_t buffer_seq;    // Sequence number for ordering
 };
 
 /**
  * Notification that a buffer has been copied and can be freed
  */
 struct CopyDoneInfo {
-    void* dev_buffer_ptr;     // Device buffer to free
+    void* dev_buffer_ptr;  // Device buffer to free
 };
 
 /**
@@ -130,9 +129,14 @@ public:
      * @param user_data User context for callbacks
      * @param device_id Device ID for registration
      */
-    void start(void* shared_mem_host, int num_cores, int num_phase_threads,
-               PerfAllocCallback alloc_cb, PerfRegisterCallback register_cb,
-               PerfFreeCallback free_cb, void* user_data, int device_id);
+    void start(void* shared_mem_host,
+        int num_cores,
+        int num_phase_threads,
+        PerfAllocCallback alloc_cb,
+        PerfRegisterCallback register_cb,
+        PerfFreeCallback free_cb,
+        void* user_data,
+        int device_id);
 
     /**
      * Stop the memory management thread
@@ -213,8 +217,7 @@ private:
     void register_mapping(void* dev_ptr, void* host_ptr);
 
     // Process one ReadyQueue entry
-    void process_ready_entry(PerfDataHeader* header, int thread_idx,
-                              const ReadyQueueEntry& entry);
+    void process_ready_entry(PerfDataHeader* header, int thread_idx, const ReadyQueueEntry& entry);
 };
 
 // =============================================================================
@@ -257,12 +260,12 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(Runtime& runtime,
-                   int num_aicore,
-                   int device_id,
-                   PerfAllocCallback alloc_cb,
-                   PerfRegisterCallback register_cb,
-                   PerfFreeCallback free_cb,
-                   void* user_data);
+        int num_aicore,
+        int device_id,
+        PerfAllocCallback alloc_cb,
+        PerfRegisterCallback register_cb,
+        PerfFreeCallback free_cb,
+        void* user_data);
 
     /**
      * Start the memory management thread
@@ -305,9 +308,7 @@ public:
      * @param user_data User-provided context pointer
      * @return 0 on success, error code on failure
      */
-    int finalize(PerfUnregisterCallback unregister_cb,
-                 PerfFreeCallback free_cb,
-                 void* user_data);
+    int finalize(PerfUnregisterCallback unregister_cb, PerfFreeCallback free_cb, void* user_data);
 
     /**
      * Check if collector is initialized

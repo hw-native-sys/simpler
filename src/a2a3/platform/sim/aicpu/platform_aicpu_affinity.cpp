@@ -18,7 +18,9 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
 
     if (!survive) {
         LOG_INFO("AICPU affinity gate (sim): thread idx=%d DROPPED (logical=%d, launched=%d)",
-                 idx, logical_count, total_launched);
+            idx,
+            logical_count,
+            total_launched);
     }
 
     // Last thread resets state for next invocation

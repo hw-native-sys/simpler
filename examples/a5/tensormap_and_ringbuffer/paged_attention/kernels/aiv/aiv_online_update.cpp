@@ -159,14 +159,14 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
 
         // Phase 2: Scalar arithmetic in RowMajor (kScalarRows, kScalarCols)
         // to resolve RAW hazards on shared UB tiles.
-        TMAX(miNewND, miND, mijND);  // mi_new = max(mi, mij)
+        TMAX(miNewND, miND, mijND);    // mi_new = max(mi, mij)
         TSUB(alphaND, miND, miNewND);  // alpha = mi - mi_new
-        TEXP(alphaND, alphaND);  // alpha = exp(mi - mi_new)
+        TEXP(alphaND, alphaND);        // alpha = exp(mi - mi_new)
         TSUB(betaND, mijND, miNewND);  // beta = mij - mi_new
-        TEXP(betaND, betaND);  // beta = exp(mij - mi_new)
-        TMUL(liND, alphaND, liND);  // li = alpha * li
-        TMUL(tmpND, betaND, lijND);  // tmp = beta * lij
-        TADD(liND, liND, tmpND);  // li = alpha * li + beta * lij (= li_new)
+        TEXP(betaND, betaND);          // beta = exp(mij - mi_new)
+        TMUL(liND, alphaND, liND);     // li = alpha * li
+        TMUL(tmpND, betaND, lijND);    // tmp = beta * lij
+        TADD(liND, liND, tmpND);       // li = alpha * li + beta * lij (= li_new)
 
         // Phase 3: Store scalar results to GM (ND format)
         // mi_new -> mi accumulator, li_new -> li accumulator
@@ -192,7 +192,7 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
         // Phase 5: Scale data tiles using row-broadcast multiply
         TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
         TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);  // oi_new *= beta
-        TADD(oiTile, oiTile, oiNewTile);  // oi = alpha*oi + beta*oi_new
+        TADD(oiTile, oiTile, oiNewTile);              // oi = alpha*oi + beta*oi_new
 
         if (is_last) {
             // Phase 6: Normalize and output

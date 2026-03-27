@@ -34,7 +34,6 @@ ALL_CASES = {
         "matmul_batch": 4,  # Number of matmul tiles per task
         "add_batch": 5,  # Number of add tiles per task
     },
-
 }
 
 DEFAULT_CASE = "Case1"
@@ -79,9 +78,13 @@ def generate_inputs(params: dict) -> list:
     # Prevent integer overflow in orchestration (task_idx = b * M + m or b * N + n)
     INT32_MAX = 2**31 - 1
     if total_matmul_tasks > INT32_MAX:
-        raise ValueError(f"total_matmul_tasks ({total_matmul_tasks}) exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
+        raise ValueError(
+            f"total_matmul_tasks ({total_matmul_tasks}) exceeds INT32_MAX ({INT32_MAX}), risk of overflow"
+        )
     if total_add_tasks > INT32_MAX:
-        raise ValueError(f"total_add_tasks ({total_add_tasks}) exceeds INT32_MAX ({INT32_MAX}), risk of overflow")
+        raise ValueError(
+            f"total_add_tasks ({total_add_tasks}) exceeds INT32_MAX ({INT32_MAX}), risk of overflow"
+        )
 
     # Fixed sizes: matmul 128x128x128, add 128x128
     matmul_size = 128
@@ -100,9 +103,13 @@ def generate_inputs(params: dict) -> list:
     add_gb = total_add_elements * 4 / 1024**3
 
     if total_matmul_elements > MAX_ELEMENTS:
-        raise ValueError(f"Matmul tensor too large: {matmul_gb:.2f} GB (max {MAX_TENSOR_GB} GB)")
+        raise ValueError(
+            f"Matmul tensor too large: {matmul_gb:.2f} GB (max {MAX_TENSOR_GB} GB)"
+        )
     if total_add_elements > MAX_ELEMENTS:
-        raise ValueError(f"Add tensor too large: {add_gb:.2f} GB (max {MAX_TENSOR_GB} GB)")
+        raise ValueError(
+            f"Add tensor too large: {add_gb:.2f} GB (max {MAX_TENSOR_GB} GB)"
+        )
 
     # If random_seed is False, use fixed seed (42); if True, use random seed
     if not random_seed:

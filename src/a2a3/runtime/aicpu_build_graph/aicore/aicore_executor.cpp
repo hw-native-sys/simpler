@@ -20,9 +20,7 @@ typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
  *
  * @param payload Pointer to PTO2DispatchPayload in global memory
  */
-__aicore__ __attribute__((always_inline)) static void execute_task(
-    __gm__ PTO2DispatchPayload* payload
-) {
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2DispatchPayload* payload) {
     if (payload == nullptr || payload->function_bin_addr == 0) {
         return;
     }
@@ -73,8 +71,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
     // Cache payload address (set once by AICPU during initialization, never changes)
-    __gm__ PTO2DispatchPayload* payload =
-        reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
+    __gm__ PTO2DispatchPayload* payload = reinterpret_cast<__gm__ PTO2DispatchPayload*>(my_hank->task);
 
     bool profiling_enabled = runtime->enable_profiling;
 
@@ -116,8 +113,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
                 __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
-                perf_aicore_record_task(perf_buf, task_id,
-                                       start_time, end_time);
+                perf_aicore_record_task(perf_buf, task_id, start_time, end_time);
             }
 
             last_reg_val = reg_val;

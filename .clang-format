@@ -23,3 +23,6 @@ BinPackArguments: false
 
 # 访问修饰符(public/private/protected)的缩进偏移，-4表示与class对齐
 AccessModifierOffset: -4
+
+# Ascend headers have implicit order dependencies — do not reorder includes
+SortIncludes: Never

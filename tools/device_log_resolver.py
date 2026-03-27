@@ -34,7 +34,9 @@ def _latest_log_from_dir(log_dir: Path) -> Optional[Path]:
     if not log_dir.exists() or not log_dir.is_dir():
         return None
 
-    candidates = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+    candidates = sorted(
+        log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True
+    )
     if not candidates:
         return None
     return candidates[0]
@@ -80,7 +82,9 @@ def _resolve_explicit_device_log(device_log: str) -> Tuple[Optional[Path], str]:
     return None, f"explicit --device-log path not found: {path}"
 
 
-def _resolve_nearest_log(root: Path, perf_path: Optional[Path]) -> Tuple[Optional[Path], str]:
+def _resolve_nearest_log(
+    root: Path, perf_path: Optional[Path]
+) -> Tuple[Optional[Path], str]:
     device_dirs = sorted([p for p in root.glob("device-*") if p.is_dir()])
     if not device_dirs:
         return None, f"no device-* directories found under {root}"
@@ -100,7 +104,10 @@ def _resolve_nearest_log(root: Path, perf_path: Optional[Path]) -> Tuple[Optiona
 
     perf_ts = perf_dt.timestamp()
     best = min(candidates, key=lambda p: abs(p.stat().st_mtime - perf_ts))
-    return best, f"auto-scan device-* (closest log to perf timestamp {perf_dt:%Y-%m-%d %H:%M:%S})"
+    return (
+        best,
+        f"auto-scan device-* (closest log to perf timestamp {perf_dt:%Y-%m-%d %H:%M:%S})",
+    )
 
 
 def resolve_device_log_path(

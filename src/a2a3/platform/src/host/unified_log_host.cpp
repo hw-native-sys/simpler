@@ -21,11 +21,11 @@ void unified_log_error(const char* func, const char* fmt, ...) {
 void unified_log_warn(const char* func, const char* fmt, ...) {
     va_list args;
     va_start(args, fmt);
-    
+
     char buffer[2048];
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
-    
+
     HostLogger::get_instance().log(HostLogLevel::WARN, "%s: %s", func, buffer);
 }
 

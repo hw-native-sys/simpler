@@ -49,11 +49,14 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float* out = reinterpret_cast<__gm__ float*>(args[2]);
 
     // Global tensor types
-    using GlobalDataSrc0 = GlobalTensor<half, Shape<1, 1, 1, validM, validK>,
+    using GlobalDataSrc0 = GlobalTensor<half,
+        Shape<1, 1, 1, validM, validK>,
         Stride<validM * validK, validM * validK, validM * validK, validK, 1>>;
-    using GlobalDataSrc1 = GlobalTensor<half, Shape<1, 1, 1, validK, validN>,
+    using GlobalDataSrc1 = GlobalTensor<half,
+        Shape<1, 1, 1, validK, validN>,
         Stride<validK * validN, validK * validN, validK * validN, validN, 1>>;
-    using GlobalDataOut = GlobalTensor<float, Shape<1, 1, 1, validM, validN>,
+    using GlobalDataOut = GlobalTensor<float,
+        Shape<1, 1, 1, validM, validN>,
         Stride<validM * validN, validM * validN, validM * validN, validN, 1>>;
 
     GlobalDataSrc0 src0Global(src0);

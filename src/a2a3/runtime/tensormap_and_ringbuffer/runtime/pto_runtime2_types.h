@@ -60,15 +60,15 @@
 // =============================================================================
 
 // Orchestrator errors (1-99): detected in orchestrator thread
-#define PTO2_ERROR_NONE                       0
-#define PTO2_ERROR_SCOPE_DEADLOCK             1
-#define PTO2_ERROR_HEAP_RING_DEADLOCK         2
-#define PTO2_ERROR_FLOW_CONTROL_DEADLOCK      3
-#define PTO2_ERROR_DEP_POOL_OVERFLOW          4
-#define PTO2_ERROR_INVALID_PARAM              5   // PTOParam construction error (invalid params)
+#define PTO2_ERROR_NONE 0
+#define PTO2_ERROR_SCOPE_DEADLOCK 1
+#define PTO2_ERROR_HEAP_RING_DEADLOCK 2
+#define PTO2_ERROR_FLOW_CONTROL_DEADLOCK 3
+#define PTO2_ERROR_DEP_POOL_OVERFLOW 4
+#define PTO2_ERROR_INVALID_PARAM 5  // PTOParam construction error (invalid params)
 
 // Scheduler errors (100+): detected in scheduler threads
-#define PTO2_ERROR_SCHEDULER_TIMEOUT          100
+#define PTO2_ERROR_SCHEDULER_TIMEOUT 100
 
 // =============================================================================
 // Configuration Constants
@@ -78,33 +78,33 @@
 // NOTE: PTO2_TASK_WINDOW_SIZE is now a per-ring default value.
 // Actual window size is passed at runtime to pto2_runtime_create_threaded_custom().
 // Use pto2_task_slot(sched, task_id) for slot calculation.
-#define PTO2_TASK_WINDOW_SIZE     16384   // Default per-ring task window size (power of 2)
+#define PTO2_TASK_WINDOW_SIZE 16384  // Default per-ring task window size (power of 2)
 
 // Multi-ring: number of independent ring layers (HeapRing + TaskRing + DepPool per layer)
 // Scope depth maps to ring index via: min(scope_depth, PTO2_MAX_RING_DEPTH - 1)
-#define PTO2_MAX_RING_DEPTH       4
+#define PTO2_MAX_RING_DEPTH 4
 
 // Memory pools (per-ring defaults; total = value × PTO2_MAX_RING_DEPTH)
-#define PTO2_HEAP_SIZE            (256 * 1024 * 1024)  // 256MB per ring (1GB total)
-#define PTO2_DEP_LIST_POOL_SIZE    16384    // Per-ring dependency list pool entries
-#define PTO2_TENSORMAP_POOL_SIZE   (65536)   // TensorMap entry pool
+#define PTO2_HEAP_SIZE (256 * 1024 * 1024)  // 256MB per ring (1GB total)
+#define PTO2_DEP_LIST_POOL_SIZE 16384       // Per-ring dependency list pool entries
+#define PTO2_TENSORMAP_POOL_SIZE (65536)    // TensorMap entry pool
 #define PTO2_TENSORMAP_NUM_BUCKETS 4096     // Power of 2 for fast hash (4096×8B=32KB fits L1)
 
 // Scope management
-#define PTO2_MAX_SCOPE_DEPTH      64      // Maximum nesting depth
-#define PTO2_SCOPE_TASKS_INIT_CAP 65536     // Initial capacity for scope task buffer
+#define PTO2_MAX_SCOPE_DEPTH 64          // Maximum nesting depth
+#define PTO2_SCOPE_TASKS_INIT_CAP 65536  // Initial capacity for scope task buffer
 
 // Ready queue
-#define PTO2_READY_QUEUE_SIZE     65536   // Per-shape queue size
+#define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
 
 // Memory alignment
-#define PTO2_ALIGN_SIZE           64      // Cache line alignment
-#define PTO2_PACKED_OUTPUT_ALIGN  1024    // Each output in packed buffer aligned to 1024B; gap is padding
-#define PTO2_ALIGN_UP(x, align)   (((x) + (align) - 1) & ~((align) - 1))
+#define PTO2_ALIGN_SIZE 64             // Cache line alignment
+#define PTO2_PACKED_OUTPUT_ALIGN 1024  // Each output in packed buffer aligned to 1024B; gap is padding
+#define PTO2_ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))
 
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
-#define PTO2_DEP_POOL_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
+#define PTO2_DEP_POOL_CLEANUP_INTERVAL 64   // Cleanup every N retired tasks
 
 // get_tensor_data/set_tensor_data spin wait timeout in cycles.
 // ~10s on hardware (1.5 GHz counter), ~10s on simulation (chrono-based).
@@ -150,10 +150,10 @@ static inline PTO2TaskId pto2_make_task_id(uint8_t ring_id, uint32_t local_id) {
  * Each worker type has its own ready queue for load balancing
  */
 typedef enum {
-    PTO2_WORKER_CUBE = 0,       // AICore CUBE unit (matrix ops)
-    PTO2_WORKER_VECTOR = 1,     // AICore VECTOR unit (element-wise ops)
-    PTO2_WORKER_AI_CPU = 2,     // AI_CPU (scalar ops, control flow)
-    PTO2_WORKER_ACCELERATOR = 3,// Fixed-function accelerators (DMA, etc.)
+    PTO2_WORKER_CUBE = 0,         // AICore CUBE unit (matrix ops)
+    PTO2_WORKER_VECTOR = 1,       // AICore VECTOR unit (element-wise ops)
+    PTO2_WORKER_AI_CPU = 2,       // AI_CPU (scalar ops, control flow)
+    PTO2_WORKER_ACCELERATOR = 3,  // Fixed-function accelerators (DMA, etc.)
     PTO2_NUM_WORKER_TYPES = 4
 } PTO2WorkerType;
 
@@ -186,21 +186,21 @@ typedef enum {
 /**
  * Maximum dimensions supported for logical tensors
  */
-#define PTO2_MAX_TENSOR_DIM   8
+#define PTO2_MAX_TENSOR_DIM 8
 
 /**
  * Maximum depth of layout history for HBB overlap detection
  * Simple (contiguous) tensor has depth=1, non-contiguous has depth>1
  */
-#define PTO2_MAX_LAYOUT_DEPTH     8
+#define PTO2_MAX_LAYOUT_DEPTH 8
 
 /**
  * Layout operation type for HBB
  */
 typedef enum {
-    PTO2_LAYOUT_VIEW = 0,         // View/slice: records bounding box
-    PTO2_LAYOUT_RESHAPE = 1,      // Reshape: records new shape
-    PTO2_LAYOUT_TRANSPOSE = 2     // Transpose: records permutation
+    PTO2_LAYOUT_VIEW = 0,      // View/slice: records bounding box
+    PTO2_LAYOUT_RESHAPE = 1,   // Reshape: records new shape
+    PTO2_LAYOUT_TRANSPOSE = 2  // Transpose: records permutation
 } PTO2LayoutOpType;
 
 /**
@@ -210,9 +210,9 @@ typedef enum {
 typedef struct {
     PTO2LayoutOpType type;
     union {
-        struct {  // PTO2_LAYOUT_VIEW
-            int64_t bbox_min;     // First byte accessed
-            int64_t bbox_max;     // Last byte accessed
+        struct {               // PTO2_LAYOUT_VIEW
+            int64_t bbox_min;  // First byte accessed
+            int64_t bbox_max;  // Last byte accessed
         } view;
         struct {  // PTO2_LAYOUT_RESHAPE
             int32_t ndim;
@@ -229,13 +229,13 @@ typedef struct {
  * Tensor extraction type (for tracking how tensor was created)
  */
 typedef enum {
-    PTO2_TENSOR_RAW = 0,           // Original raw tensor (owns storage)
-    PTO2_TENSOR_VIEW = 1,          // view() - subset selection, shared storage
-    PTO2_TENSOR_RESHAPE = 2,       // reshape() - shape change, shared storage
-    PTO2_TENSOR_TRANSPOSE = 3,     // transpose() - dimension permute, shared storage
-    PTO2_TENSOR_DEEP_VIEW = 4,     // deep_view() - copied subset, new storage
-    PTO2_TENSOR_DEEP_RESHAPE = 5,  // deep_reshape() - copied reshape, new storage
-    PTO2_TENSOR_DEEP_TRANSPOSE = 6 // deep_transpose() - copied transpose, new storage
+    PTO2_TENSOR_RAW = 0,            // Original raw tensor (owns storage)
+    PTO2_TENSOR_VIEW = 1,           // view() - subset selection, shared storage
+    PTO2_TENSOR_RESHAPE = 2,        // reshape() - shape change, shared storage
+    PTO2_TENSOR_TRANSPOSE = 3,      // transpose() - dimension permute, shared storage
+    PTO2_TENSOR_DEEP_VIEW = 4,      // deep_view() - copied subset, new storage
+    PTO2_TENSOR_DEEP_RESHAPE = 5,   // deep_reshape() - copied reshape, new storage
+    PTO2_TENSOR_DEEP_TRANSPOSE = 6  // deep_transpose() - copied transpose, new storage
 } PTO2TensorExtractionType;
 
 /**
@@ -245,10 +245,10 @@ typedef enum {
  * Multiple logical tensors can share the same raw tensor (aliasing).
  */
 typedef struct {
-    void*    base_ptr;        // Base pointer of allocated memory
-    int64_t  total_size;      // Total size in bytes
-    int32_t  refcount;        // Number of logical tensors referencing this storage
-                              // (for memory management, 0 = can be freed)
+    void* base_ptr;      // Base pointer of allocated memory
+    int64_t total_size;  // Total size in bytes
+    int32_t refcount;    // Number of logical tensors referencing this storage
+                         // (for memory management, 0 = can be freed)
 } PTO2RawTensor;
 
 /**
@@ -272,32 +272,32 @@ typedef struct {
  */
 typedef struct {
     // === Raw tensor reference (shared storage) ===
-    void*    raw_base;            // Pointer to raw tensor's base (for aliasing check)
-    int64_t  raw_total_size;      // Total size of raw tensor in bytes
+    void* raw_base;          // Pointer to raw tensor's base (for aliasing check)
+    int64_t raw_total_size;  // Total size of raw tensor in bytes
 
     // === Storage offset ===
-    int64_t  storage_offset;      // Byte offset from raw_base to first element
+    int64_t storage_offset;  // Byte offset from raw_base to first element
 
     // === Shape and strides ===
-    int64_t  shape[PTO2_MAX_TENSOR_DIM];    // Size in each dimension
-    int64_t  strides[PTO2_MAX_TENSOR_DIM];  // Byte stride in each dimension
-    int32_t  ndim;                          // Number of dimensions (0 = scalar)
+    int64_t shape[PTO2_MAX_TENSOR_DIM];    // Size in each dimension
+    int64_t strides[PTO2_MAX_TENSOR_DIM];  // Byte stride in each dimension
+    int32_t ndim;                          // Number of dimensions (0 = scalar)
 
     // === Precomputed bounding box (for fast overlap detection) ===
-    int64_t  min_byte_offset;     // First byte accessed (relative to raw_base)
-    int64_t  max_byte_offset;     // Last byte accessed (relative to raw_base)
+    int64_t min_byte_offset;  // First byte accessed (relative to raw_base)
+    int64_t max_byte_offset;  // Last byte accessed (relative to raw_base)
 
     // === Element info ===
-    int64_t  elem_size;           // Size of each element in bytes
-    int64_t  numel;               // Total number of elements
+    int64_t elem_size;  // Size of each element in bytes
+    int64_t numel;      // Total number of elements
 
     // === Extraction tracking ===
     PTO2TensorExtractionType extraction_type;  // How this tensor was created
-    bool     is_contiguous;       // True if memory is contiguous (no gaps)
-                                  // Equivalent to layout_depth == 1
+    bool is_contiguous;                        // True if memory is contiguous (no gaps)
+                                               // Equivalent to layout_depth == 1
 
     // === Layout history for HBB overlap detection ===
-    int32_t  layout_depth;                           // Number of layout ops (1=simple)
+    int32_t layout_depth;                            // Number of layout ops (1=simple)
     PTO2LayoutOp layout_ops[PTO2_MAX_LAYOUT_DEPTH];  // Derivation history
 
 } PTO2LogicalTensor;
@@ -314,8 +314,8 @@ typedef struct {
  */
 struct PTO2TaskSlotState;  // Forward declaration
 struct PTO2DepListEntry {
-    PTO2TaskSlotState* slot_state;    // Consumer slot state (direct pointer)
-    PTO2DepListEntry* next;           // next entry
+    PTO2TaskSlotState* slot_state;  // Consumer slot state (direct pointer)
+    PTO2DepListEntry* next;         // next entry
 };
 
 // =============================================================================
@@ -333,14 +333,14 @@ struct PTO2DepListEntry {
  */
 struct PTO2TaskDescriptor {
     // Mixed-task identification (encodes ring_id in upper 32 bits)
-    PTO2TaskId task_id;         // raw: (ring_id << 32) | local_id
+    PTO2TaskId task_id;  // raw: (ring_id << 32) | local_id
 
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
 
     // Packed output buffer (all outputs packed into single contiguous buffer)
-    void*    packed_buffer_base;  // Start of packed buffer in GM Heap
-    void*    packed_buffer_end;   // End of packed buffer (for heap reclamation)
+    void* packed_buffer_base;  // Start of packed buffer in GM Heap
+    void* packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
 
 // =============================================================================
@@ -362,9 +362,9 @@ struct PTO2TaskPayload {
     // === Cache line 0 (64B) — metadata ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
-    int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
-    int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
-    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
+    int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
+    int32_t _reserved{0};           // Reserved (dep_pool_mark moved to SlotState for local access)
+    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS];  // Producer slot states (used by on_task_release)
     // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
     Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
     // === Pre-built args for AICore dispatch (1152B = 16 tensor ptrs + 128 scalars) ===
@@ -388,8 +388,9 @@ struct PTO2TaskPayload {
         }
         // Bulk-copy scalars into dispatch_args[tensor_count..], rounded up to
         // cache-line boundary (extra bytes within the same CL cost nothing).
-        memcpy(&dispatch_args[params.tensor_count], params.scalars,
-               PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
+        memcpy(&dispatch_args[params.tensor_count],
+            params.scalars,
+            PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
     }
 };
 
@@ -407,17 +408,17 @@ struct PTO2TaskPayload {
  */
 struct alignas(64) PTO2TaskSlotState {
     // Fanout lock + list (accessed together under lock in on_task_complete)
-    std::atomic<int32_t> fanout_lock;       // Per-task spinlock (0=unlocked, 1=locked)
-    int32_t fanout_count;                    // 1 (owning scope) + number of consumers
+    std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
+    int32_t fanout_count;              // 1 (owning scope) + number of consumers
 
-    PTO2DepListEntry* fanout_head;           // Pointer to first fanout entry (nullptr = empty)
+    PTO2DepListEntry* fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
     // Task state (completion, consumed check, ready check)
-    std::atomic<PTO2TaskState> task_state;   // PENDING/READY/RUNNING/COMPLETED/CONSUMED
+    std::atomic<PTO2TaskState> task_state;  // PENDING/READY/RUNNING/COMPLETED/CONSUMED
 
     // Fanin (accessed together in release_fanin_and_check_ready)
-    std::atomic<int32_t> fanin_refcount;     // Dynamic: counts completed producers
-    int32_t fanin_count;                      // Number of producer dependencies (set once)
+    std::atomic<int32_t> fanin_refcount;  // Dynamic: counts completed producers
+    int32_t fanin_count;                  // Number of producer dependencies (set once)
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
     std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
@@ -427,10 +428,10 @@ struct alignas(64) PTO2TaskSlotState {
     PTO2TaskDescriptor* task;
 
     // Hot-path completion fields (moved from TaskDescriptor to avoid cross-struct access)
-    uint8_t active_mask;                         // Bitmask of active subtask slots (set once)
-    std::atomic<uint8_t> subtask_done_mask;      // Each subtask sets its done bit on completion
-    uint8_t ring_id;                             // Ring layer this task belongs to (for per-ring reclamation)
-    int32_t dep_pool_mark{0};                    // Dep pool top after this task's submission (orchestrator-only, local memory)
+    uint8_t active_mask;                     // Bitmask of active subtask slots (set once)
+    std::atomic<uint8_t> subtask_done_mask;  // Each subtask sets its done bit on completion
+    uint8_t ring_id;                         // Ring layer this task belongs to (for per-ring reclamation)
+    int32_t dep_pool_mark{0};  // Dep pool top after this task's submission (orchestrator-only, local memory)
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);
@@ -463,11 +464,11 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
  * Memory barrier macros for different architectures
  */
 #if defined(__aarch64__)
-    #define PTO2_MEMORY_BARRIER()     __asm__ __volatile__("dmb sy" ::: "memory")
+#define PTO2_MEMORY_BARRIER() __asm__ __volatile__("dmb sy" ::: "memory")
 #elif defined(__x86_64__)
-    #define PTO2_MEMORY_BARRIER()     __asm__ __volatile__("mfence" ::: "memory")
+#define PTO2_MEMORY_BARRIER() __asm__ __volatile__("mfence" ::: "memory")
 #else
-    #define PTO2_MEMORY_BARRIER()     __sync_synchronize()
+#define PTO2_MEMORY_BARRIER() __sync_synchronize()
 #endif
 
 // Spin-wait hint for AICPU threads.  On real hardware the AICPU has dedicated
@@ -498,8 +499,7 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 #endif
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state,
-                                     uint64_t& atomic_count, uint64_t& wait_cycle) {
+static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state, uint64_t& atomic_count, uint64_t& wait_cycle) {
     uint64_t t0 = get_sys_cnt_aicpu();
     bool contended = false;
     uint32_t atomic_ops = 0;
@@ -511,8 +511,8 @@ static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state,
             SPIN_WAIT_HINT();
         }
         int32_t expected = 0;
-        if (slot_state.fanout_lock.compare_exchange_weak(expected, 1,
-                                        std::memory_order_acquire, std::memory_order_relaxed)) {
+        if (slot_state.fanout_lock.compare_exchange_weak(
+                expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
             atomic_ops++;  // successful CAS = 1 atomic
             atomic_count += atomic_ops;
             if (contended) {
@@ -532,8 +532,8 @@ static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state) {
             SPIN_WAIT_HINT();
         }
         int32_t expected = 0;
-        if (slot_state.fanout_lock.compare_exchange_weak(expected, 1,
-                                        std::memory_order_acquire, std::memory_order_relaxed)) {
+        if (slot_state.fanout_lock.compare_exchange_weak(
+                expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
             return;
         }
     }
@@ -543,4 +543,4 @@ static inline void pto2_fanout_unlock(PTO2TaskSlotState& slot_state) {
     slot_state.fanout_lock.store(0, std::memory_order_release);
 }
 
-#endif // PTO_RUNTIME2_TYPES_H
+#endif  // PTO_RUNTIME2_TYPES_H

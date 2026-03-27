@@ -30,10 +30,7 @@ using namespace pto;
 #endif
 
 template <int TILE>
-static __aicore__ void tile_add_impl(
-    __gm__ float* c_ptr,
-    __gm__ float* p_ptr) {
-
+static __aicore__ void tile_add_impl(__gm__ float* c_ptr, __gm__ float* p_ptr) {
     using DynShapeDim5 = Shape<1, 1, 1, TILE, TILE>;
     using DynStridDim5 = Stride<1, 1, 1, TILE, 1>;
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
@@ -68,7 +65,7 @@ static __aicore__ void tile_add_impl(
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ TensorData* c_tensor = reinterpret_cast<__gm__ TensorData*>(args[0]);
     __gm__ TensorData* p_tensor = reinterpret_cast<__gm__ TensorData*>(args[1]);
-    __gm__ TensorData* config   = reinterpret_cast<__gm__ TensorData*>(args[2]);
+    __gm__ TensorData* config = reinterpret_cast<__gm__ TensorData*>(args[2]);
 
     __gm__ int64_t* cfg = reinterpret_cast<__gm__ int64_t*>(config->buffer.addr);
     uint64_t tile_size = static_cast<uint64_t>(cfg[0]);
@@ -83,11 +80,20 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
         __gm__ float* p_ptr = base_p + (tile_idx * tile_elems);
 
         switch (tile_size) {
-            case 16:  tile_add_impl<16>(c_ptr, p_ptr);  break;
-            case 32:  tile_add_impl<32>(c_ptr, p_ptr);  break;
-            case 64:  tile_add_impl<64>(c_ptr, p_ptr);  break;
-            case 128: tile_add_impl<128>(c_ptr, p_ptr); break;
-            default: break;
+            case 16:
+                tile_add_impl<16>(c_ptr, p_ptr);
+                break;
+            case 32:
+                tile_add_impl<32>(c_ptr, p_ptr);
+                break;
+            case 64:
+                tile_add_impl<64>(c_ptr, p_ptr);
+                break;
+            case 128:
+                tile_add_impl<128>(c_ptr, p_ptr);
+                break;
+            default:
+                break;
         }
     }
 }

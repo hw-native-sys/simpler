@@ -26,7 +26,7 @@
  * AICore reads function_bin_addr, casts to UnifiedKernelFunc, calls with args.
  */
 struct PTO2DispatchPayload {
-    uint64_t function_bin_addr; /**< Kernel entry in GM: (UnifiedKernelFunc)function_bin_addr */
+    uint64_t function_bin_addr;            /**< Kernel entry in GM: (UnifiedKernelFunc)function_bin_addr */
     uint64_t args[PTO2_DISPATCH_MAX_ARGS]; /**< Kernel arguments (GM pointers + scalars) */
 };
 

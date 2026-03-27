@@ -36,15 +36,13 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void softmax_prepare_n_impl(
-    __gm__ float* sij_base,
+static __aicore__ void softmax_prepare_n_impl(__gm__ float* sij_base,
     float scale_value,
     __gm__ bfloat16_t* pij_base,
     __gm__ float* mij_addr,
     __gm__ float* lij_addr,
     uint64_t n_blocks,
     uint64_t valid_len_last) {
-
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
     constexpr int kScalarCols = 32 / sizeof(float);
     constexpr int kScalarRows = M / kScalarCols;
@@ -100,10 +98,10 @@ static __aicore__ void softmax_prepare_n_impl(
     TASSIGN(sumAccTile, 4 * kDataBytes);
     int scalarBase = 5 * kDataBytes;
     TASSIGN(localMaxDN, scalarBase);
-    TASSIGN(localMaxRow, scalarBase);                     // alias: same UB as localMaxDN
+    TASSIGN(localMaxRow, scalarBase);  // alias: same UB as localMaxDN
     TASSIGN(globalMaxDN, scalarBase + kScalarDNBytes);
-    TASSIGN(globalMaxRow, scalarBase + kScalarDNBytes);   // alias: same UB as globalMaxDN
-    TASSIGN(globalMaxND, scalarBase + kScalarDNBytes);    // alias: same UB as globalMaxDN
+    TASSIGN(globalMaxRow, scalarBase + kScalarDNBytes);  // alias: same UB as globalMaxDN
+    TASSIGN(globalMaxND, scalarBase + kScalarDNBytes);   // alias: same UB as globalMaxDN
     TASSIGN(sumDN, scalarBase + 2 * kScalarDNBytes);
     TASSIGN(pijBf16Tile, scalarBase + 3 * kScalarDNBytes);
 

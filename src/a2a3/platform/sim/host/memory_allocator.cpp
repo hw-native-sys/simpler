@@ -9,9 +9,7 @@
 #include <cstdlib>
 #include "common/unified_log.h"
 
-MemoryAllocator::~MemoryAllocator() {
-    finalize();
-}
+MemoryAllocator::~MemoryAllocator() { finalize(); }
 
 void* MemoryAllocator::alloc(size_t size) {
     void* ptr = std::malloc(size);

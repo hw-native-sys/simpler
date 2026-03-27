@@ -58,13 +58,19 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
     # check values written by orchestration via SetTensorData
     check = torch.as_tensor(tensors["check"])
-    check[0] = 2.0    # GetTensorData(c, {0}): c = a + b, c[0] = 2.0+0.0
+    check[0] = 2.0  # GetTensorData(c, {0}): c = a + b, c[0] = 2.0+0.0
     check[1] = 102.0  # GetTensorData(c, {100}): c[100] = 2.0+100.0
-    check[2] = 77.0   # add_inout initial value (first use, OUTPUT path)
-    check[3] = 77.0   # add_inout second use (INOUT path, value preserved)
-    check[4] = 79.0   # orchestration arithmetic: 2.0 + 77.0
-    check[5] = 42.0   # Orch set→get round-trip: SetTensorData then GetTensorData
-    check[6] = 12.0   # Orch→AICore RAW: SetTensorData(d,10.0) + kernel_add(d,a) → 10.0+2.0
-    check[7] = 88.0   # WAW+WAR: kernel reads c, SetTensorData(c,88.0) auto-waits for consumer
-    check[8] = 55.0   # External WAR: noop(ext_b INOUT) → SetTensorData(ext_b,55.0) auto-waits
+    check[2] = 77.0  # add_inout initial value (first use, OUTPUT path)
+    check[3] = 77.0  # add_inout second use (INOUT path, value preserved)
+    check[4] = 79.0  # orchestration arithmetic: 2.0 + 77.0
+    check[5] = 42.0  # Orch set→get round-trip: SetTensorData then GetTensorData
+    check[6] = (
+        12.0  # Orch→AICore RAW: SetTensorData(d,10.0) + kernel_add(d,a) → 10.0+2.0
+    )
+    check[7] = (
+        88.0  # WAW+WAR: kernel reads c, SetTensorData(c,88.0) auto-waits for consumer
+    )
+    check[8] = (
+        55.0  # External WAR: noop(ext_b INOUT) → SetTensorData(ext_b,55.0) auto-waits
+    )
     # check[9] remains 0.0 (sentinel)

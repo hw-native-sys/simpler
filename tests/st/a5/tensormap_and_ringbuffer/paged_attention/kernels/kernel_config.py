@@ -28,13 +28,43 @@ ORCHESTRATION = {
 # Kernel configs (aiv_normalize removed - merged into aiv_online_update)
 KERNELS = [
     # AIC kernels (matrix multiplication using Cube unit)
-    {"func_id": 0, "name": "QK", "source": str(_KERNELS_ROOT / "aic" / "aic_qk_matmul.cpp"),       "core_type": "aic"},
-    {"func_id": 2, "name": "PV", "source": str(_KERNELS_ROOT / "aic" / "aic_pv_matmul.cpp"),       "core_type": "aic"},
-    {"func_id": 4, "name": "AIC_HUB", "source": str(_KERNELS_ROOT / "aic" / "aic_hub.cpp"),       "core_type": "aic"},
+    {
+        "func_id": 0,
+        "name": "QK",
+        "source": str(_KERNELS_ROOT / "aic" / "aic_qk_matmul.cpp"),
+        "core_type": "aic",
+    },
+    {
+        "func_id": 2,
+        "name": "PV",
+        "source": str(_KERNELS_ROOT / "aic" / "aic_pv_matmul.cpp"),
+        "core_type": "aic",
+    },
+    {
+        "func_id": 4,
+        "name": "AIC_HUB",
+        "source": str(_KERNELS_ROOT / "aic" / "aic_hub.cpp"),
+        "core_type": "aic",
+    },
     # AIV kernels (vector operations)
-    {"func_id": 1, "name": "SF", "source": str(_KERNELS_ROOT / "aiv" / "aiv_softmax_prepare.cpp"), "core_type": "aiv"},
-    {"func_id": 3, "name": "UP", "source": str(_KERNELS_ROOT / "aiv" / "aiv_online_update.cpp"),   "core_type": "aiv"},
-    {"func_id": 5, "name": "AIV_HUB", "source": str(_KERNELS_ROOT / "aiv" / "aiv_hub.cpp"),       "core_type": "aiv"},
+    {
+        "func_id": 1,
+        "name": "SF",
+        "source": str(_KERNELS_ROOT / "aiv" / "aiv_softmax_prepare.cpp"),
+        "core_type": "aiv",
+    },
+    {
+        "func_id": 3,
+        "name": "UP",
+        "source": str(_KERNELS_ROOT / "aiv" / "aiv_online_update.cpp"),
+        "core_type": "aiv",
+    },
+    {
+        "func_id": 5,
+        "name": "AIV_HUB",
+        "source": str(_KERNELS_ROOT / "aiv" / "aiv_hub.cpp"),
+        "core_type": "aiv",
+    },
 ]
 
 # Runtime configuration

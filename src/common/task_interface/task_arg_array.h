@@ -17,7 +17,7 @@
 #include <vector>
 
 static_assert(std::is_trivially_copyable<TaskArg>::value,
-              "TaskArg must be trivially copyable for contiguous array access via data_ptr()");
+    "TaskArg must be trivially copyable for contiguous array access via data_ptr()");
 
 struct TaskArgArray {
     std::vector<TaskArg> args;
@@ -27,19 +27,15 @@ struct TaskArgArray {
     size_t size() const { return args.size(); }
 
     TaskArg& get(size_t idx) {
-        if (idx >= args.size())
-            throw std::out_of_range("TaskArgArray index out of range");
+        if (idx >= args.size()) throw std::out_of_range("TaskArgArray index out of range");
         return args[idx];
     }
 
     const TaskArg& get(size_t idx) const {
-        if (idx >= args.size())
-            throw std::out_of_range("TaskArgArray index out of range");
+        if (idx >= args.size()) throw std::out_of_range("TaskArgArray index out of range");
         return args[idx];
     }
 
     /// Raw address of the contiguous TaskArg buffer (for C interop)
-    uintptr_t data_ptr() const {
-        return reinterpret_cast<uintptr_t>(args.data());
-    }
+    uintptr_t data_ptr() const { return reinterpret_cast<uintptr_t>(args.data()); }
 };

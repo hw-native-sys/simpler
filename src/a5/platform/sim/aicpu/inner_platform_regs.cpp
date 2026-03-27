@@ -15,8 +15,7 @@
 uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
     uint32_t offset = reg_offset(reg);
     volatile uint8_t* reg_base = reinterpret_cast<volatile uint8_t*>(reg_base_addr);
-    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(
-        sparse_reg_ptr(reg_base, offset));
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(sparse_reg_ptr(reg_base, offset));
 
     __sync_synchronize();
     uint64_t value = static_cast<uint64_t>(*ptr);
@@ -28,8 +27,7 @@ uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
 void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
     uint32_t offset = reg_offset(reg);
     volatile uint8_t* reg_base = reinterpret_cast<volatile uint8_t*>(reg_base_addr);
-    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(
-        sparse_reg_ptr(reg_base, offset));
+    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(sparse_reg_ptr(reg_base, offset));
 
     __sync_synchronize();
     *ptr = static_cast<uint32_t>(value);

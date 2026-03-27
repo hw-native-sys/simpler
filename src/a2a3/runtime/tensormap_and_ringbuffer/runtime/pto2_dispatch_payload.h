@@ -38,8 +38,8 @@
  * Handshake.task) and reads both fields after each DATA_MAIN_BASE change.
  */
 struct alignas(64) PTO2DispatchPayload {
-    uint64_t function_bin_addr;    /**< Kernel entry address in GM (set by Scheduler) */
-    __gm__ uint64_t* args;         /**< Pre-built args in task payload GM (set by Scheduler) */
+    uint64_t function_bin_addr; /**< Kernel entry address in GM (set by Scheduler) */
+    __gm__ uint64_t* args;      /**< Pre-built args in task payload GM (set by Scheduler) */
 };
 
 #endif  // RT2_PTO2_DISPATCH_PAYLOAD_H_

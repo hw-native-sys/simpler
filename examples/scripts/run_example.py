@@ -213,7 +213,7 @@ Golden.py interface:
         log_level_str = "error"
     else:
         log_level_str = "info"
-    
+
     # Setup logging before any other operations
     level_map = {
         'error': logging.ERROR,
@@ -222,14 +222,14 @@ Golden.py interface:
         'debug': logging.DEBUG,
     }
     log_level = level_map.get(log_level_str.lower(), logging.INFO)
-    
+
     # Configure Python logging
     logging.basicConfig(
         level=log_level,
         format='[%(levelname)s] %(message)s',
         force=True
     )
-    
+
     # Set environment variable for C++ side
     os.environ['PTO_LOG_LEVEL'] = log_level_str
 

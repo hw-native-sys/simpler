@@ -29,14 +29,16 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void softmax_prepare_impl(__gm__ uint8_t* sij_raw, float scale_value,
-                                 __gm__ uint8_t* pij_raw, __gm__ uint8_t* mij_raw,
-                                 __gm__ uint8_t* lij_raw, int valid_len)
-{
-    __gm__ float*      sij = reinterpret_cast<__gm__ float*>(sij_raw);
+static __aicore__ void softmax_prepare_impl(__gm__ uint8_t* sij_raw,
+    float scale_value,
+    __gm__ uint8_t* pij_raw,
+    __gm__ uint8_t* mij_raw,
+    __gm__ uint8_t* lij_raw,
+    int valid_len) {
+    __gm__ float* sij = reinterpret_cast<__gm__ float*>(sij_raw);
     __gm__ bfloat16_t* pij = reinterpret_cast<__gm__ bfloat16_t*>(pij_raw);
-    __gm__ float*      mij = reinterpret_cast<__gm__ float*>(mij_raw);
-    __gm__ float*      lij = reinterpret_cast<__gm__ float*>(lij_raw);
+    __gm__ float* mij = reinterpret_cast<__gm__ float*>(mij_raw);
+    __gm__ float* lij = reinterpret_cast<__gm__ float*>(lij_raw);
 
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
@@ -52,8 +54,7 @@ static __aicore__ void softmax_prepare_impl(__gm__ uint8_t* sij_raw, float scale
     // Dynamic-cols tile: marks which columns are valid for TFILLPAD boundary
     using TileSijDyn = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, -1>;
     // Padded tile: TFILLPAD_INPLACE fills positions [valid_len, N) with -inf
-    using TileSijPad = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N,
-                            SLayout::NoneBox, 512, PadValue::Min>;
+    using TileSijPad = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N, SLayout::NoneBox, 512, PadValue::Min>;
 
     using TileVecMxN = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N>;
     using TileVecMxN_bf16 = Tile<TileType::Vec, bfloat16_t, M, N, BLayout::RowMajor, M, N>;
@@ -105,7 +106,10 @@ static __aicore__ void softmax_prepare_impl(__gm__ uint8_t* sij_raw, float scale
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ uint8_t* sij = reinterpret_cast<__gm__ uint8_t*>(args[0]);
-    union { uint64_t u; float f; } scale_conv;
+    union {
+        uint64_t u;
+        float f;
+    } scale_conv;
     scale_conv.u = static_cast<uint64_t>(args[1]);
     float scale_value = scale_conv.f;
     __gm__ uint8_t* pij = reinterpret_cast<__gm__ uint8_t*>(args[2]);

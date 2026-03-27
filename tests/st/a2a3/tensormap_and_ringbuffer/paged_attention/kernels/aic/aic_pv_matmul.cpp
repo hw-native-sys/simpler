@@ -61,9 +61,9 @@ static __aicore__ void pv_matmul_impl(__gm__ Tensor* pij, __gm__ Tensor* vj, __g
 
     // Load pij and vj to L1 with separate events for pipeline overlap
     TLOAD(aMatTile, pijGlobal);
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);     // A load done
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);  // A load done
     TLOAD(bMatTile, vjGlobal);
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);     // B load done
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);  // B load done
 
     // Move A to L0A as soon as A load completes (B may still be loading)
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);

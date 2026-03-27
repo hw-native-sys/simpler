@@ -25,24 +25,23 @@
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     // Read dimensions from TaskArg tensor metadata
-    uint64_t batch     = orch_args[0].tensor.shapes[0];
+    uint64_t batch = orch_args[0].tensor.shapes[0];
     uint64_t num_heads = orch_args[0].tensor.shapes[1];
-    uint64_t head_dim  = orch_args[0].tensor.shapes[2];
+    uint64_t head_dim = orch_args[0].tensor.shapes[2];
     DataType data_type = orch_args[0].tensor.dtype;
 
     uint64_t block_size = orch_args[1].tensor.shapes[1];
-    uint64_t block_num  = orch_args[3].tensor.shapes[1];
+    uint64_t block_num = orch_args[3].tensor.shapes[1];
 
     uint64_t scale_value = orch_args[6].scalar;
 
@@ -50,10 +49,9 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     uint64_t q_loop = (num_heads + q_tile - 1) / q_tile;
     uint64_t elem_size = get_element_size(data_type);
 
-    LOG_INFO("batch_paged_attention: batch=%lu, num_heads=%lu",
-             (unsigned long)batch, (unsigned long)num_heads);
+    LOG_INFO("batch_paged_attention: batch=%lu, num_heads=%lu", (unsigned long)batch, (unsigned long)num_heads);
 
-    int* host_block_table  = orch_args[3].data<int>();
+    int* host_block_table = orch_args[3].data<int>();
     int* host_context_lens = orch_args[4].data<int>();
 
     uint64_t max_bn = 0;
@@ -65,9 +63,9 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
 
     // Reshape tensors for kernel consumption (2D flattened)
     void* query_ptr = orch_args[0].data<void>();
-    void* kc_ptr    = orch_args[1].data<void>();
-    void* vc_ptr    = orch_args[2].data<void>();
-    void* out_ptr   = orch_args[5].data<void>();
+    void* kc_ptr = orch_args[1].data<void>();
+    void* vc_ptr = orch_args[2].data<void>();
+    void* out_ptr = orch_args[5].data<void>();
 
     uint64_t total_blocks_count = orch_args[1].tensor.shapes[0];
     uint64_t kv_total_rows = total_blocks_count * block_size;
@@ -179,9 +177,11 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     }
 
     LOG_INFO("batch_paged_attention: %lu tasks (batch=%lu, max_bn=%lu, chunks=%lu, IN_CORE_BATCH=%lu)",
-             (unsigned long)(num_chunks * (1 + max_bn * 4)),
-             (unsigned long)batch, (unsigned long)max_bn,
-             (unsigned long)num_chunks, (unsigned long)IN_CORE_BATCH);
+        (unsigned long)(num_chunks * (1 + max_bn * 4)),
+        (unsigned long)batch,
+        (unsigned long)max_bn,
+        (unsigned long)num_chunks,
+        (unsigned long)IN_CORE_BATCH);
 }
 
 }  // extern "C"
