@@ -209,7 +209,7 @@ void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
 void pto2_scheduler_print_queues(PTO2SchedulerState* sched) {
     LOG_INFO("=== Ready Queues ===");
 
-    const char* shape_names[] = {"AIC_ONLY", "AIV_X1", "AIV_X2", "AIC_AIV_X1", "AIC_AIV_X2"};
+    const char* shape_names[] = {"AIC", "AIV", "MIX"};
 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         LOG_INFO("  %s: count=%" PRIu64, shape_names[i],

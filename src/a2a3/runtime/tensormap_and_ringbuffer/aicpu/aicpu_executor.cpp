@@ -201,18 +201,12 @@ public:
 
     BitStates get_valid_cluster_offset_states(PTO2ResourceShape shape) const {
         switch (shape) {
-            case PTO2ResourceShape::AIC_ONLY:
+            case PTO2ResourceShape::AIC:
                 return core_states_ & aic_mask_;
-            case PTO2ResourceShape::AIV_X1:
-                return (((core_states_ & aiv_mask_) >> 1) | ((core_states_ & aiv_mask_) >> 2)) & aic_mask_;
-            case PTO2ResourceShape::AIV_X2:
-                return (((core_states_ & aiv_mask_) >> 1) & ((core_states_ & aiv_mask_) >> 2)) & aic_mask_;
-            case PTO2ResourceShape::AIC_AIV_X1:
-                return (((core_states_ & aiv_mask_) >> 1) | ((core_states_ & aiv_mask_) >> 2)) & core_states_ &
-                       aic_mask_;
-            case PTO2ResourceShape::AIC_AIV_X2:
-                return (((core_states_ & aiv_mask_) >> 1) & ((core_states_ & aiv_mask_) >> 2)) & core_states_ &
-                       aic_mask_;
+            case PTO2ResourceShape::AIV:
+                return ((core_states_ >> 1) | (core_states_ >> 2)) & aic_mask_;
+            case PTO2ResourceShape::MIX:
+                return (core_states_ >> 1) & (core_states_ >> 2) & core_states_ & aic_mask_;
         }
         return BitStates(0ULL);
     }
@@ -476,29 +470,14 @@ struct AicpuExecutor {
 
     static const char* shape_name(PTO2ResourceShape shape) {
         switch (shape) {
-        case PTO2ResourceShape::AIC_ONLY:   return "AIC_ONLY";
-        case PTO2ResourceShape::AIV_X1:     return "AIV_X1";
-        case PTO2ResourceShape::AIV_X2:     return "AIV_X2";
-        case PTO2ResourceShape::AIC_AIV_X1: return "AIC_AIV_X1";
-        case PTO2ResourceShape::AIC_AIV_X2: return "AIC_AIV_X2";
+            case PTO2ResourceShape::AIC:
+                return "AIC";
+            case PTO2ResourceShape::AIV:
+                return "AIV";
+            case PTO2ResourceShape::MIX:
+                return "MIX";
         }
         return "UNKNOWN";
-    }
-
-    struct ResourceCount {
-        int32_t aic;
-        int32_t aiv;
-    };
-
-    static constexpr ResourceCount shape_resource_count(PTO2ResourceShape shape) {
-        constexpr ResourceCount kTable[PTO2_NUM_RESOURCE_SHAPES] = {
-            {1, 0},  // AIC_ONLY    = 0
-            {0, 1},  // AIV_X1      = 1
-            {0, 2},  // AIV_X2      = 2
-            {1, 1},  // AIC_AIV_X1  = 3
-            {1, 2},  // AIC_AIV_X2  = 4
-        };
-        return kTable[static_cast<int>(shape)];
     }
 
     /**
@@ -510,19 +489,15 @@ struct AicpuExecutor {
     static const PTO2ResourceShape* get_dispatch_order(int32_t thread_idx) {
         // Even threads: AIC-first fallback after widest
         static constexpr PTO2ResourceShape kEvenOrder[PTO2_NUM_RESOURCE_SHAPES] = {
-            PTO2ResourceShape::AIC_AIV_X2,
-            PTO2ResourceShape::AIC_AIV_X1,
-            PTO2ResourceShape::AIC_ONLY,
-            PTO2ResourceShape::AIV_X2,
-            PTO2ResourceShape::AIV_X1,
+            PTO2ResourceShape::MIX,
+            PTO2ResourceShape::AIC,
+            PTO2ResourceShape::AIV,
         };
         // Odd threads: AIV-first fallback after widest
         static constexpr PTO2ResourceShape kOddOrder[PTO2_NUM_RESOURCE_SHAPES] = {
-            PTO2ResourceShape::AIC_AIV_X2,
-            PTO2ResourceShape::AIV_X2,
-            PTO2ResourceShape::AIC_AIV_X1,
-            PTO2ResourceShape::AIV_X1,
-            PTO2ResourceShape::AIC_ONLY,
+            PTO2ResourceShape::MIX,
+            PTO2ResourceShape::AIV,
+            PTO2ResourceShape::AIC,
         };
         return (thread_idx % 2 == 0) ? kEvenOrder : kOddOrder;
     }
@@ -1214,31 +1189,73 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                     uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
                     auto current_valid_cluster_offset = valid_cluster_states.pop_first();
-                    ResourceCount rc = shape_resource_count(shape);
-
-                    if (rc.aic) {
+                    if (shape == PTO2ResourceShape::MIX) {
+                        // Full-cluster scheduling: dispatch only to cores indicated by active_mask.
+                        // Unused cores in the cluster remain idle for single-core tasks.
+                        uint8_t mask = slot_state->active_mask;
+                        if (mask & PTO2_SUBTASK_MASK_AIC) {
+                            auto core_offset = tracker.get_aic_core_offset(current_valid_cluster_offset);
+                            dispatch_subtask_to_core(runtime,
+                                thread_idx,
+                                core_offset,
+                                *slot_state,
+                                PTO2SubtaskSlot::AIC
+#if PTO2_PROFILING
+                                ,
+                                profiling_enabled
+#endif
+                            );
+                        }
+                        if (mask & PTO2_SUBTASK_MASK_AIV0) {
+                            auto core_offset = tracker.get_aiv0_core_offset(current_valid_cluster_offset);
+                            dispatch_subtask_to_core(runtime,
+                                thread_idx,
+                                core_offset,
+                                *slot_state,
+                                PTO2SubtaskSlot::AIV0
+#if PTO2_PROFILING
+                                ,
+                                profiling_enabled
+#endif
+                            );
+                        }
+                        if (mask & PTO2_SUBTASK_MASK_AIV1) {
+                            auto core_offset = tracker.get_aiv1_core_offset(current_valid_cluster_offset);
+                            dispatch_subtask_to_core(runtime,
+                                thread_idx,
+                                core_offset,
+                                *slot_state,
+                                PTO2SubtaskSlot::AIV1
+#if PTO2_PROFILING
+                                ,
+                                profiling_enabled
+#endif
+                            );
+                        }
+                    } else if (shape == PTO2ResourceShape::AIC) {
                         auto core_offset = tracker.get_aic_core_offset(current_valid_cluster_offset);
-                        dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIC
+                        dispatch_subtask_to_core(runtime,
+                            thread_idx,
+                            core_offset,
+                            *slot_state,
+                            PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
-                            , profiling_enabled
+                            ,
+                            profiling_enabled
 #endif
                         );
-                    }
-                    if (rc.aiv >= 1) {
+                    } else {  // shape == PTO2ResourceShape::AIV
                         auto core_offset = tracker.is_aiv0_core_idle(current_valid_cluster_offset)
-                                           ? tracker.get_aiv0_core_offset(current_valid_cluster_offset)
-                                           : tracker.get_aiv1_core_offset(current_valid_cluster_offset);
-                        dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV0
+                                               ? tracker.get_aiv0_core_offset(current_valid_cluster_offset)
+                                               : tracker.get_aiv1_core_offset(current_valid_cluster_offset);
+                        dispatch_subtask_to_core(runtime,
+                            thread_idx,
+                            core_offset,
+                            *slot_state,
+                            PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
-                            , profiling_enabled
-#endif
-                        );
-                    }
-                    if (rc.aiv >= 2) {
-                        auto core_offset = tracker.get_aiv1_core_offset(current_valid_cluster_offset);
-                        dispatch_subtask_to_core(runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV1
-#if PTO2_PROFILING
-                            , profiling_enabled
+                            ,
+                            profiling_enabled
 #endif
                         );
                     }
@@ -2141,16 +2158,13 @@ void AicpuExecutor::diagnose_stuck_state(Runtime* runtime, int32_t thread_idx,
     DEV_ALWAYS("Progress: %d/%d tasks (%.1f%%)",
              completed, total, total > 0 ? completed * 100.0 / total : 0.0);
 
-    uint64_t aic_ready = 0, aiv_ready = 0, aiv_x2_ready = 0, mixed_x1_ready = 0, mixed_x2_ready = 0;
+    uint64_t aic_ready = 0, aiv_ready = 0, mix_ready = 0;
     if (rt) {
-        aic_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC_ONLY)].size();
-        aiv_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIV_X1)].size();
-        aiv_x2_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIV_X2)].size();
-        mixed_x1_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC_AIV_X1)].size();
-        mixed_x2_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC_AIV_X2)].size();
+        aic_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].size();
+        aiv_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIV)].size();
+        mix_ready = sched->ready_queues[static_cast<int32_t>(PTO2ResourceShape::MIX)].size();
     }
-    DEV_ALWAYS("Ready Queues: AIC=%lu, AIV=%lu, AIV_X2=%lu, AIC_AIV_X1=%lu, AIC_AIV_X2=%lu",
-               aic_ready, aiv_ready, aiv_x2_ready, mixed_x1_ready, mixed_x2_ready);
+    DEV_ALWAYS("Ready Queues: AIC=%lu, AIV=%lu, MIX=%lu", aic_ready, aiv_ready, mix_ready);
 
     int32_t busy_cores = 0;
     int32_t idle_cores = 0;

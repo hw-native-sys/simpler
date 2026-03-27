@@ -53,34 +53,30 @@ struct MixedKernels {
 };
 
 /**
- * Resource shape — classifies a MixedKernels into one of 5 queue buckets.
+ * Resource shape — classifies a MixedKernels into one of 3 scheduling buckets.
+ *
+ * Multi-subtask tasks (2+ active slots) are all scheduled as MIX, which
+ * requires a fully-idle cluster (1 AIC + 2 AIV).  The actual cores used
+ * are determined at dispatch time by active_mask — unused cores in the
+ * cluster remain idle and available for single-core tasks.
  */
 enum class PTO2ResourceShape : uint8_t {
-    AIC_ONLY    = 0,   // AIC only
-    AIV_X1      = 1,   // One AIV slot
-    AIV_X2      = 2,   // Both AIV slots
-    AIC_AIV_X1  = 3,   // AIC + one AIV
-    AIC_AIV_X2  = 4,   // AIC + both AIV
+    AIC = 0,   // Single AIC
+    AIV = 1,   // Single AIV
+    MIX = 2,   // Full cluster (dispatch uses active_mask)
 };
 
-inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 5;
+inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 3;
 
 /**
  * Derive resource shape from active_mask.
  * Caller must ensure active_mask is valid (at least one bit set).
  */
 static inline PTO2ResourceShape pto2_active_mask_to_shape(uint8_t active_mask) {
-    bool has_aic = (active_mask & PTO2_SUBTASK_MASK_AIC) != 0;
-    int aiv_count = ((active_mask & PTO2_SUBTASK_MASK_AIV0) != 0)
-                  + ((active_mask & PTO2_SUBTASK_MASK_AIV1) != 0);
-
-    if (has_aic) {
-        if (aiv_count == 0) return PTO2ResourceShape::AIC_ONLY;
-        if (aiv_count == 1) return PTO2ResourceShape::AIC_AIV_X1;
-        return PTO2ResourceShape::AIC_AIV_X2;
-    }
-    if (aiv_count == 1) return PTO2ResourceShape::AIV_X1;
-    return PTO2ResourceShape::AIV_X2;
+    int bit_count = __builtin_popcount(active_mask);
+    if (bit_count >= 2) return PTO2ResourceShape::MIX;
+    if (active_mask & PTO2_SUBTASK_MASK_AIC) return PTO2ResourceShape::AIC;
+    return PTO2ResourceShape::AIV;
 }
 
 /**

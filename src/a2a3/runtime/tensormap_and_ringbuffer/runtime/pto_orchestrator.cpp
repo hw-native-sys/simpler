@@ -275,13 +275,16 @@ void pto2_submit_mixed_task(
     uint8_t active_mask = pto2_mixed_kernels_to_active_mask(mixed_kernels);
     always_assert(active_mask != 0 && "MixedKernels must have at least one active slot");
 
-    // Normalize single-AIV tasks: if only aiv1 is set, move it to the aiv0 slot.
-    // This guarantees the dispatch path can always use PTO2SubtaskSlot::AIV0 for
-    // AIV_X1 and AIC_AIV_X1 shapes without inspecting active_mask.
+    // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
+    // it to the aiv0 slot.  This guarantees the dispatch path can always use
+    // PTO2SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
+    // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
+    // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
     MixedKernels normalized = mixed_kernels;
+    bool has_aic  = (active_mask & PTO2_SUBTASK_MASK_AIC) != 0;
     bool has_aiv0 = (active_mask & PTO2_SUBTASK_MASK_AIV0) != 0;
     bool has_aiv1 = (active_mask & PTO2_SUBTASK_MASK_AIV1) != 0;
-    if (has_aiv1 && !has_aiv0) {
+    if (!has_aic && has_aiv1 && !has_aiv0) {
         normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
         normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
         active_mask = pto2_mixed_kernels_to_active_mask(normalized);
