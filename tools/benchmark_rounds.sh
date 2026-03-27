@@ -49,6 +49,7 @@ ROUNDS=100
 PLATFORM=a2a3
 RUNTIME=tensormap_and_ringbuffer
 VERBOSE=0
+SHOW_HOST=0
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -73,12 +74,16 @@ while [[ $# -gt 0 ]]; do
             VERBOSE=1
             shift
             ;;
+        --show-host)
+            SHOW_HOST=1
+            shift
+            ;;
         --help|-h)
             cat <<'USAGE'
 benchmark_rounds.sh — run all examples and report per-round timing from device logs
 
 Usage:
-  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-v]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-v] [--show-host]
 
 Options:
   -p, --platform Platform to run on (default: a2a3)
@@ -86,6 +91,7 @@ Options:
   -n, --rounds   Override number of rounds for each example (default: 100)
   -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), aicpu_build_graph
   -v, --verbose  Save detailed run_example.py output to a timestamped log file
+  --show-host    Show Host (us) timing column (default: hidden)
   -h, --help     Show this help
 
 All other options are passed through to run_example.py (e.g. --case).
@@ -168,6 +174,7 @@ DEVICE_LOG_DIR="$LOG_ROOT/device-${DEVICE_ID}"
 # ---------------------------------------------------------------------------
 parse_timing() {
     local log_file="$1"
+    local host_timing_file="${2:-}"
 
     local timing
     timing=$(grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end)' "$log_file" || true)
@@ -177,7 +184,7 @@ parse_timing() {
         return 1
     fi
 
-    echo "$timing" | awk -v freq="$FREQ" '
+    echo "$timing" | awk -v freq="$FREQ" -v host_file="$host_timing_file" -v show_host="$SHOW_HOST" '
     function new_round() {
         flush_round()
         round++
@@ -203,6 +210,19 @@ parse_timing() {
         min_sched_start = 0; max_sched_end = 0
         min_orch_start = 0; max_orch_end = 0
         has_sched = 0; has_orch_end = 0
+        has_host = 0; host_count = 0
+        if (show_host == "1" && host_file != "") {
+            while ((getline hline < host_file) > 0) {
+                match(hline, /round=([0-9]+)/, hr)
+                match(hline, /total_us=([0-9.]+)/, hv)
+                if (hr[1] != "" && hv[1] != "") {
+                    host_results[hr[1] + 0] = hv[1] + 0.0
+                    host_count++
+                    has_host = 1
+                }
+            }
+            close(host_file)
+        }
     }
     /sched_start=/ {
         match($0, /Thread ([0-9]+):/, tm)
@@ -255,11 +275,13 @@ parse_timing() {
         sep = sprintf("  %-8s  %12s", "-----", "------------")
         if (show_sched) { hdr = hdr sprintf("  %12s", "Sched (us)"); sep = sep sprintf("  %12s", "----------") }
         if (show_orch)  { hdr = hdr sprintf("  %12s", "Orch (us)");  sep = sep sprintf("  %12s", "---------")  }
+        if (has_host)   { hdr = hdr sprintf("  %12s", "Host (us)");  sep = sep sprintf("  %12s", "---------")  }
         print hdr; print sep
 
         sum_v = 0; min_v = results[0]; max_v = results[0]
         sum_s = 0; min_s = sched_results[0]; max_s = sched_results[0]
         sum_o = 0; min_o = orch_results[0]; max_o = orch_results[0]
+        sum_h = 0; min_h = host_results[0]; max_h = host_results[0]
 
         for (i = 0; i < count; i++) {
             line = sprintf("  %-8d  %12.1f", i, results[i])
@@ -278,12 +300,19 @@ parse_timing() {
                 if (orch_results[i] < min_o) min_o = orch_results[i]
                 if (orch_results[i] > max_o) max_o = orch_results[i]
             }
+            if (has_host) {
+                line = line sprintf("  %12.1f", host_results[i])
+                sum_h += host_results[i]
+                if (host_results[i] < min_h) min_h = host_results[i]
+                if (host_results[i] > max_h) max_h = host_results[i]
+            }
             print line
         }
 
         printf "\n  Avg: %.1f us", sum_v / count
         if (show_sched) printf "  |  Sched Avg: %.1f us", sum_s / count
         if (show_orch)  printf "  |  Orch Avg: %.1f us", sum_o / count
+        if (has_host)   printf "  |  Host Avg: %.1f us", sum_h / count
         printf "  (%d rounds)\n", count
 
         TRIM = 10
@@ -320,6 +349,10 @@ parse_timing() {
                 ts3 = 0
                 for (i = TRIM; i < count - TRIM; i++) ts3 += so[i]
                 printf "  Orch Trimmed Avg: %.1f us  (dropped %d low + %d high)\n", ts3 / tc, TRIM, TRIM
+            }
+            if (has_host) {
+                trimmed_h = (sum_h - min_h - max_h) / (count - 2)
+                printf "  Host Trimmed Avg: %.1f us  (excluding min=%.1f, max=%.1f)\n", trimmed_h, min_h, max_h
             }
         }
     }'
@@ -386,15 +419,13 @@ run_bench() {
     fi
     run_cmd+=("${EXTRA_ARGS[@]}")
 
-    # Run example
+    # Run example (always capture output for HOST_TIMING extraction)
     vlog "Running: ${run_cmd[*]}"
     local rc=0
-    if [[ -n "$VERBOSE_LOG" ]]; then
-        local run_output
-        run_output=$("${run_cmd[@]}" 2>&1) || rc=$?
-        if [[ -n "$run_output" ]]; then echo "$run_output" >> "$VERBOSE_LOG"; fi
-    else
-        "${run_cmd[@]}" > /dev/null 2>&1 || rc=$?
+    local run_output
+    run_output=$("${run_cmd[@]}" 2>&1) || rc=$?
+    if [[ -n "$VERBOSE_LOG" && -n "$run_output" ]]; then
+        echo "$run_output" >> "$VERBOSE_LOG"
     fi
     if [[ $rc -ne 0 ]]; then
         echo "  FAILED: run_example.py returned non-zero"
@@ -414,9 +445,16 @@ run_bench() {
     fi
 
     echo "  Log: $new_log"
+
+    # Extract HOST_TIMING lines to temp file for parse_timing
+    local host_timing_file
+    host_timing_file=$(mktemp)
+    echo "$run_output" | grep 'HOST_TIMING' > "$host_timing_file" 2>/dev/null || true
+
     local timing_output
     local parse_rc=0
-    timing_output=$(parse_timing "$new_log") || parse_rc=$?
+    timing_output=$(parse_timing "$new_log" "$host_timing_file") || parse_rc=$?
+    rm -f "$host_timing_file"
     echo "$timing_output"
 
     if [[ $parse_rc -ne 0 ]]; then
@@ -431,17 +469,19 @@ run_bench() {
 
     local avg_line
     avg_line=$(echo "$timing_output" | grep "^  Avg:" || true)
-    local avg_elapsed="-" avg_sched="-" avg_orch="-"
+    local avg_elapsed="-" avg_sched="-" avg_orch="-" avg_host="-"
     if [[ -n "$avg_line" ]]; then
         avg_elapsed=$(echo "$avg_line" | awk '{print $2}')
         avg_sched=$(echo "$avg_line" | grep -o 'Sched Avg: [0-9.]*' | awk '{print $3}') || avg_sched="-"
         avg_orch=$(echo "$avg_line" | grep -o 'Orch Avg: [0-9.]*' | awk '{print $3}') || avg_orch="-"
+        avg_host=$(echo "$avg_line" | grep -o 'Host Avg: [0-9.]*' | awk '{print $3}') || avg_host="-"
     fi
 
     SUMMARY_NAMES+=("$label")
     SUMMARY_ELAPSED+=("$avg_elapsed")
     SUMMARY_SCHED+=("$avg_sched")
     SUMMARY_ORCH+=("$avg_orch")
+    SUMMARY_HOST+=("$avg_host")
 }
 
 # ---------------------------------------------------------------------------
@@ -455,6 +495,7 @@ SUMMARY_NAMES=()
 SUMMARY_ELAPSED=()
 SUMMARY_SCHED=()
 SUMMARY_ORCH=()
+SUMMARY_HOST=()
 
 echo ""
 echo "Runtime: $RUNTIME"
@@ -495,9 +536,11 @@ if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
     # Check if any sched/orch data exists across all runs
     _has_sched=0
     _has_orch=0
+    _has_host=0
     for _i in "${!SUMMARY_NAMES[@]}"; do
         [[ "${SUMMARY_SCHED[$_i]}" != "-" ]] && _has_sched=1
         [[ "${SUMMARY_ORCH[$_i]}" != "-" ]] && _has_orch=1
+        [[ $SHOW_HOST -eq 1 && "${SUMMARY_HOST[$_i]}" != "-" ]] && _has_host=1
     done
 
     echo ""
@@ -517,6 +560,10 @@ if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
         _hdr=$(printf "%s  %12s" "$_hdr" "Orch (us)")
         _sep=$(printf "%s  %12s" "$_sep" "------------")
     fi
+    if [[ $_has_host -eq 1 ]]; then
+        _hdr=$(printf "%s  %12s" "$_hdr" "Host (us)")
+        _sep=$(printf "%s  %12s" "$_sep" "------------")
+    fi
     echo "$_hdr"
     echo "$_sep"
 
@@ -528,6 +575,9 @@ if [[ ${#SUMMARY_NAMES[@]} -gt 0 ]]; then
         fi
         if [[ $_has_orch -eq 1 ]]; then
             _row=$(printf "%s  %12s" "$_row" "${SUMMARY_ORCH[$_i]}")
+        fi
+        if [[ $_has_host -eq 1 ]]; then
+            _row=$(printf "%s  %12s" "$_row" "${SUMMARY_HOST[$_i]}")
         fi
         echo "$_row"
     done
