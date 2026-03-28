@@ -1,3 +1,14 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 /**
  * AICPU orchestration for the vector example.
  *
@@ -15,30 +26,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"
-
-static uint64_t float_to_u64(float f) {
-    union {
-        float f32;
-        uint64_t u64;
-    } conv;
-    conv.u64 = 0;
-    conv.f32 = f;
-    return conv.u64;
-}
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
@@ -68,7 +68,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
         Arg args_t1;
         args_t1.add_input(c);
         args_t1.add_output(d);
-        args_t1.add_scalar(float_to_u64(1.0f));
+        args_t1.add_scalar(to_u64(1.0f));
         PTO2TaskId t1 = pto2_rt_submit_aiv_task(rt, 1, args_t1);
         pto2_rt_add_dependency(rt, t0, t1);
 
@@ -76,7 +76,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
         Arg args_t2;
         args_t2.add_input(c);
         args_t2.add_output(e);
-        args_t2.add_scalar(float_to_u64(2.0f));
+        args_t2.add_scalar(to_u64(2.0f));
         PTO2TaskId t2 = pto2_rt_submit_aiv_task(rt, 1, args_t2);
         pto2_rt_add_dependency(rt, t0, t2);
 

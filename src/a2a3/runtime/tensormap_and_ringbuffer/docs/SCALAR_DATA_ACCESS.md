@@ -9,12 +9,16 @@ During task graph construction, orchestration sometimes needs to read InCore ker
 ## 2. API
 
 ```cpp
-// Blocking read: returns raw uint64_t bit pattern at the given indices
-uint64_t get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[]);
+// Blocking read: returns value at the given indices (default: raw uint64_t bits)
+// Specify T for typed read: float val = get_tensor_data<float>(tensor, 1, idx);
+template<typename T = uint64_t>
+T get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[]);
 
-// Blocking write: stores value at the given indices
-void set_tensor_data(Tensor& tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
-```
+// Blocking write: stores value at the given indices (type deduced from argument)
+// Typed write: set_tensor_data(tensor, 1, idx, 42.0f);
+template<typename T = uint64_t>
+void set_tensor_data(Tensor& tensor, uint32_t ndims, const uint32_t indices[], T value);
+```text
 
 Both call into the runtime through the ops table — orchestration .so needs no runtime symbol linkage.
 
@@ -22,9 +26,9 @@ Both call into the runtime through the ops table — orchestration .so needs no 
 
 ### 3.1 get_tensor_data Flow
 
-```
+```text
 addr null-check → TensorMap lookup → spin-wait producer COMPLETED → compute flat offset → memcpy read
-```
+```text
 
 - **addr null-check**: `buffer.addr == 0` means unallocated — log error, return 0
 - **TensorMap lookup**: find producer task by `buffer.addr`
@@ -33,9 +37,9 @@ addr null-check → TensorMap lookup → spin-wait producer COMPLETED → comput
 
 ### 3.2 set_tensor_data Flow
 
-```
+```text
 addr null-check → TensorMap lookup → spin-wait producer COMPLETED → spin-wait consumers done → memcpy write
-```
+```text
 
 One extra step versus get_tensor_data: wait for all consumers to finish (`fanout_refcount >= fanout_count - 1`, excluding the scope reference).
 
@@ -50,7 +54,7 @@ One extra step versus get_tensor_data: wait for all consumers to finish (`fanout
 ```cpp
 TensorCreateInfo ci(shapes, ndims, dtype);
 args.add_output(ci, initial_value);
-```
+```text
 
 **Mechanism**:
 1. `add_output(ci, initial_value)` copies `ci` into `Arg` and marks the create-info with an initial value
@@ -71,14 +75,14 @@ TensorCreateInfo scalar_ci(shapes, 1, DataType::FLOAT32);
 
 // Submit with initial value and keep the returned tensor
 Arg args;
-args.add_output(scalar_ci, float_to_u64(77.0f));
+args.add_output(scalar_ci, 77.0f);
 TaskOutputTensors outs = pto2_rt_submit_aiv_task(FUNC_NOOP, args);
 const Tensor& scalar_tensor = outs.get_ref(0);
 
 // Orchestration-side blocking read (waits for kernel completion)
 uint32_t idx[1] = {0};
-uint64_t raw = get_tensor_data(scalar_tensor, 1, idx);
-```
+float val = get_tensor_data<float>(scalar_tensor, 1, idx);
+```text
 
 **Advantage**: Fully reuses existing TensorMap (producer tracking, fanin/fanout dependencies) — no new infrastructure needed.
 
