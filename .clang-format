@@ -1,25 +1,35 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 BasedOnStyle: Google
 IndentWidth: 4
+DerivePointerAlignment: false
+PointerAlignment: Left
 
-# 列宽限制，超过此宽度会自动换行
+# Max line width before auto-wrapping
 ColumnLimit: 120
 
-# 续行缩进宽度（函数参数换行等）
+# Continuation indent for wrapped lines (function args, etc.)
 ContinuationIndentWidth: 4
 
-# 开括号后的对齐方式：DontAlign 表示不对齐到括号位置
-# 可选值：Align, DontAlign, AlwaysBreak, BlockIndent
+# Alignment after open bracket: DontAlign avoids aligning to bracket
+# Options: Align, DontAlign, AlwaysBreak, BlockIndent
 AlignAfterOpenBracket: DontAlign
 
-# 允许函数声明的所有参数放到下一行
+# Allow all declaration parameters on the next line
 AllowAllParametersOfDeclarationOnNextLine: true
 
-# 允许函数调用的所有参数放到下一行
+# Allow all call arguments on the next line
 AllowAllArgumentsOnNextLine: true
 
-# 不紧凑排列参数，每个参数一行（如果需要换行的话）
+# One parameter per line when wrapping is needed
 BinPackParameters: false
 BinPackArguments: false
 
-# 访问修饰符(public/private/protected)的缩进偏移，-4表示与class对齐
+# Access modifier offset: -4 aligns with class keyword
 AccessModifierOffset: -4

@@ -10,7 +10,20 @@ concurrency:
 
 jobs:
   # ---------- Python unit tests (no hardware) ----------
+  pre-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Run pre-commit
+        uses: pre-commit/action@v3.0.0
+        with:
+          extra_args: --from-ref ${{ github.event.pull_request.base.sha }} --to-ref ${{ github.event.pull_request.head.sha }}
+
   ut-py:
+    needs: pre-commit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -45,6 +58,7 @@ jobs:
 
   # ---------- Simulation scene tests ----------
   st-sim-a2a3:
+    needs: pre-commit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -99,6 +113,7 @@ jobs:
         run: ./ci.sh -p a2a3sim -r ${{ matrix.runtime }} -c 6622890 -t 600 --clone-protocol https
 
   st-sim-a5:
+    needs: pre-commit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -154,6 +169,7 @@ jobs:
 
   # ---------- Python unit tests (a2a3 hardware) ----------
   ut-py-a2a3:
+    needs: pre-commit
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
 
@@ -171,6 +187,7 @@ jobs:
 
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
+    needs: pre-commit
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
 
@@ -190,6 +207,7 @@ jobs:
   #       Add the "a5" label to the runner, matching [self-hosted, a5] below.
   #
   # ut-py-a5:
+  #   needs: pre-commit
   #   runs-on: [self-hosted, a5]
   #   timeout-minutes: 30
   #
@@ -206,6 +224,7 @@ jobs:
   #         source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest tests -m requires_hardware --platform a5 -v
   #
   # st-onboard-a5:
+  #   needs: pre-commit
   #   runs-on: [self-hosted, a5]
   #   timeout-minutes: 60
   #

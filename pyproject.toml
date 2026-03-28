@@ -1,3 +1,12 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
 [build-system]
 requires = ["scikit-build-core>=0.10.0", "nanobind>=2.0.0", "cmake>=3.15"]
 build-backend = "scikit_build_core.build"
@@ -6,6 +15,50 @@ build-backend = "scikit_build_core.build"
 name = "simpler"
 version = "0.1.0"
 requires-python = ">=3.9"
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+required-version = "0.14.8"
+
+[tool.ruff.lint]
+select = [
+    "PL", # pylint, https://docs.astral.sh/ruff/rules/#pylint-pl
+    "I",  # isort, https://docs.astral.sh/ruff/rules/#isort-i
+    "E",  # pycodestyle errors, https://docs.astral.sh/ruff/rules/#error-e
+    "W",  # pycodestyle warnings, https://docs.astral.sh/ruff/rules/#warning-w
+    "F",  # pyflakes, https://docs.astral.sh/ruff/rules/#pyflakes-f
+    "UP", # pyupgrade, https://docs.astral.sh/ruff/rules/#pyupgrade-up
+]
+ignore = [
+  "ANN401",  # flake8-annotations: any-type
+  "PLR2004", # pylint: magic-value-comparison
+  "PLR0911", # too many return statements
+  "PLW2901", # pylint: redefined-loop-variable (DSL reassignment pattern)
+]
+fixable = ["ALL"]
+
+[tool.ruff.lint.pylint]
+max-statements = 100
+max-args = 10
+max-branches = 15
+
+[tool.ruff.format]
+quote-style = "double"
+skip-magic-trailing-comma = false
+line-ending = "lf"
+
+[tool.pyright]
+include = ["python", "tests"]
+exclude = ["**/__pycache__", "build", "dist", "tests/st"]
+typeCheckingMode = "basic"
+pythonVersion = "3.9"
+reportMissingTypeStubs = false
+reportMissingModuleSource = false
+reportCallIssue = false
+reportAssignmentType = false
+reportOperatorIssue = false
+reportRedeclaration = false
 
 [tool.scikit-build]
 wheel.packages = []
