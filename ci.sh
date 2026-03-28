@@ -1,4 +1,12 @@
 #!/bin/bash
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 
 # Parse arguments
 PLATFORM=""
@@ -161,6 +169,8 @@ trap cleanup INT TERM
 trap 'kill $WATCHDOG_PID 2>/dev/null; pkill -TERM -P $$ 2>/dev/null; rm -rf "$LOG_DIR"' EXIT
 
 # Watchdog: abort CI if it exceeds the timeout
+# Close inherited stdout/stderr so the watchdog's sleep doesn't hold pipe fds
+# open (which would block callers that capture output until sleep finishes).
 (
     sleep "$TIMEOUT"
     echo ""
@@ -168,7 +178,7 @@ trap 'kill $WATCHDOG_PID 2>/dev/null; pkill -TERM -P $$ 2>/dev/null; rm -rf "$LO
     echo "[CI] TIMEOUT: exceeded ${TIMEOUT}s ($(( TIMEOUT / 60 ))min) limit, aborting"
     echo "========================================"
     kill -TERM $$ 2>/dev/null
-) &
+) >/dev/null 2>&1 &
 WATCHDOG_PID=$!
 
 # commit_flag starts empty (try latest PTO-ISA first).
