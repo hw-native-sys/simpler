@@ -134,7 +134,7 @@ uint64_t pto2_get_tensor_data(PTO2Runtime* rt, const Tensor& tensor,
     return result;
 }
 
-void pto2_set_tensor_data(PTO2Runtime* rt, Tensor& tensor,
+void pto2_set_tensor_data(PTO2Runtime* rt, const Tensor& tensor,
                           uint32_t ndims, const uint32_t indices[],
                           uint64_t value) {
     if (tensor.buffer.addr == 0) {

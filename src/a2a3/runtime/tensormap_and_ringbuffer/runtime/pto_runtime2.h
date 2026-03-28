@@ -77,7 +77,7 @@ struct PTO2RuntimeOps {
     // Placed after logging to avoid shifting hot-path field offsets.
     uint64_t (*get_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
                                 uint32_t ndims, const uint32_t indices[]);
-    void (*set_tensor_data)(PTO2Runtime* rt, Tensor& tensor,
+    void (*set_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
                             uint32_t ndims, const uint32_t indices[],
                             uint64_t value);
 };
@@ -207,7 +207,7 @@ uint64_t pto2_get_tensor_data(PTO2Runtime* rt, const Tensor& tensor,
  * Waits for producer completion (WAW) and all consumers (WAR) via TensorMap.
  * See set_tensor_data in pto_orchestration_api.h for full documentation.
  */
-void pto2_set_tensor_data(PTO2Runtime* rt, Tensor& tensor,
+void pto2_set_tensor_data(PTO2Runtime* rt, const Tensor& tensor,
                           uint32_t ndims, const uint32_t indices[],
                           uint64_t value);
 

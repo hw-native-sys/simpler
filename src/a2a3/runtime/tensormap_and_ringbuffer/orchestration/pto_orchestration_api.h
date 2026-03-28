@@ -110,7 +110,7 @@ typedef struct PTO2RuntimeOps {
     // Placed after logging to avoid shifting hot-path field offsets.
     uint64_t (*get_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
                                 uint32_t ndims, const uint32_t indices[]);
-    void (*set_tensor_data)(PTO2Runtime* rt, Tensor& tensor,
+    void (*set_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
                             uint32_t ndims, const uint32_t indices[],
                             uint64_t value);
 } PTO2RuntimeOps;
@@ -231,7 +231,7 @@ static inline uint64_t get_tensor_data(const Tensor& tensor,
  * For runtime-created outputs, call this only on the Tensor returned by
  * add_output(TensorCreateInfo) after submit returns.
  */
-static inline void set_tensor_data(Tensor& tensor,
+static inline void set_tensor_data(const Tensor& tensor,
                                    uint32_t ndims, const uint32_t indices[],
                                    uint64_t value) {
     PTO2Runtime* rt = pto2_current_runtime();
