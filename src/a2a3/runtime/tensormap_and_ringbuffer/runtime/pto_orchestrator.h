@@ -159,11 +159,11 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  *
  * @param orch        Orchestrator state
  * @param mixed_kernels  Kernel IDs for AIC/AIV0/AIV1 slots
- * @param params      Aggregated tensor and scalar parameters
+ * @param args      Aggregated tensor and scalar parameters
  */
 TaskOutputTensors pto2_submit_mixed_task(PTO2OrchestratorState* orch,
     const MixedKernels& mixed_kernels,
-    const PTOParam& params);
+    const Arg& args);
 
 // =============================================================================
 // Flow Control
@@ -198,7 +198,7 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch);
 struct PTO2OrchProfilingData {
     uint64_t sync_cycle;
     uint64_t alloc_cycle;           // Combined task slot + heap allocation
-    uint64_t params_cycle;
+    uint64_t args_cycle;
     uint64_t lookup_cycle;
     uint64_t insert_cycle;
     uint64_t fanin_cycle;
@@ -209,7 +209,7 @@ struct PTO2OrchProfilingData {
     uint64_t fanin_wait_cycle;      // Cycles spent waiting in fanout_lock
     // Atomic operation counts per phase
     uint64_t alloc_atomic_count;
-    uint64_t params_atomic_count;
+    uint64_t args_atomic_count;
     uint64_t fanin_atomic_count;
     uint64_t finalize_atomic_count;
     uint64_t scope_end_atomic_count;

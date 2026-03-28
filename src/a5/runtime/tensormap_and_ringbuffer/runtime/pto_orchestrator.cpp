@@ -47,7 +47,7 @@ __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // task ring alloc
-static uint64_t g_orch_params_cycle = 0;     // param copy
+static uint64_t g_orch_args_cycle = 0;     // param copy
 static uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
 static uint64_t g_orch_heap_cycle = 0;       // heap alloc + output assign
 static uint64_t g_orch_insert_cycle = 0;     // tensormap insert
@@ -59,7 +59,7 @@ uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_heap_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
-uint64_t g_orch_params_atomic_count = 0;
+uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_heap_atomic_count = 0;
 uint64_t g_orch_fanin_atomic_count = 0;
 uint64_t g_orch_finalize_atomic_count = 0;
@@ -248,7 +248,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // Task Submission
 // =============================================================================
 void pto2_submit_mixed_task(
-    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const PTOParam& params) {
+    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const Arg& args) {
     CYCLE_COUNT_START();
 
     // Fast path after fatal error — all subsequent submits are no-ops
@@ -256,17 +256,17 @@ void pto2_submit_mixed_task(
         return;
     }
 
-    // Validate PTOParam construction (errors recorded by add_input/add_output/etc.)
-    if (params.has_error) {
+    // Validate Arg construction (errors recorded by add_input/add_output/etc.)
+    if (args.has_error) {
         LOG_ERROR("========================================");
-        LOG_ERROR("FATAL: Invalid PTOParam Detected!");
+        LOG_ERROR("FATAL: Invalid Arg Detected!");
         LOG_ERROR("========================================");
-        LOG_ERROR("Error: %s", params.error_msg ? params.error_msg : "(unknown)");
-        LOG_ERROR("  tensor_count: %d, scalar_count: %d", params.tensor_count, params.scalar_count);
+        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
+        LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count, args.scalar_count);
         LOG_ERROR("This is a bug in the orchestration code.");
         LOG_ERROR("========================================");
         orch->sm_handle->header->orch_error_code.store(
-            PTO2_ERROR_INVALID_PARAM, std::memory_order_release);
+            PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
         orch->fatal = true;
         return;
     }
@@ -349,11 +349,11 @@ void pto2_submit_mixed_task(
     // ~130 lines of computation (output_size, lookup, insert) follow before
     // param_copy writes, giving ample time for prefetch to complete.
     // Use locality=3 (PSTL1KEEP) so prefetched CLs survive lookup/insert eviction.
-    for (int32_t i = 0; i < params.tensor_count; i++) {
+    for (int32_t i = 0; i < args.tensor_count; i++) {
         __builtin_prefetch(&payload->tensors[i], 1, 3);
         __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 3);
     }
-    for (int32_t i = 0; i < params.scalar_count; i += 8) {
+    for (int32_t i = 0; i < args.scalar_count; i += 8) {
         __builtin_prefetch(&payload->scalars[i], 1, 3);
     }
     __builtin_prefetch(payload, 1, 3);
@@ -389,12 +389,12 @@ void pto2_submit_mixed_task(
 
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, local_id);
 
-    // === STEP 2: Calculate output size + heap alloc (read from params only, no GM access) ===
+    // === STEP 2: Calculate output size + heap alloc (read from args only, no GM access) ===
     int32_t total_output_size = 0;
-    for (int i = 0; i < params.tensor_count; i++) {
-        if (params.tensor_types[i] == PTOParamType::OUTPUT
-            && params.tensors[i]->buffer.addr == 0) {
-            total_output_size += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+    for (int i = 0; i < args.tensor_count; i++) {
+        if (args.tensor_types[i] == TensorArgType::OUTPUT
+            && args.tensors[i]->buffer.addr == 0) {
+            total_output_size += PTO2_ALIGN_UP(args.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
 
@@ -424,18 +424,18 @@ void pto2_submit_mixed_task(
 
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, local_id);
 
-    // === STEP 4: Lookup inputs + assign output addrs (all from params, no GM) ===
+    // === STEP 4: Lookup inputs + assign output addrs (all from args, no GM) ===
     int32_t offset = 0;
-    for (int i = 0; i < params.tensor_count; i++) {
-        PTOParamType ptype = params.tensor_types[i];
+    for (int i = 0; i < args.tensor_count; i++) {
+        TensorArgType ptype = args.tensor_types[i];
 
         switch (ptype) {
-            case PTOParamType::INOUT:
-            case PTOParamType::INPUT: {
-                if (params.tensors[i]->manual_dep) break;
+            case TensorArgType::INOUT:
+            case TensorArgType::INPUT: {
+                if (args.tensors[i]->manual_dep) break;
                 // Look up producer via TensorMap (reads from cached stack tensor)
                 PTO2LookupResult lookup_result;
-                orch->tensor_map.lookup(*params.tensors[i], lookup_result);
+                orch->tensor_map.lookup(*args.tensors[i], lookup_result);
 
                 for (int r = 0; r < lookup_result.count; r++) {
                     PTO2TensorMapEntry& entry = *lookup_result.entries[r].entry;
@@ -459,7 +459,7 @@ void pto2_submit_mixed_task(
                             fanin_states[fanin_count++] = prod_state;
                         }
                     }
-                    if (ptype == PTOParamType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                    if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
                         // inout因为会再次insert进tensor map，
                         // 因此为了尽量减少依赖构建个数（尽可能构造链式依赖），当该tensor完全覆盖前面的tensor时，
                         // 应将前面的tensor从tensor map中剔除。
@@ -472,8 +472,8 @@ void pto2_submit_mixed_task(
                 break;
             }
 
-            case PTOParamType::OUTPUT: {
-                Tensor& tensor = *params.tensors[i];
+            case TensorArgType::OUTPUT: {
+                Tensor& tensor = *args.tensors[i];
                 if (tensor.buffer.addr == 0) {
                     uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)local_packed_base + offset);
                     tensor.buffer.addr = alloc_addr;
@@ -487,11 +487,11 @@ void pto2_submit_mixed_task(
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, local_id);
 
     // === STEP 5: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    for (int i = 0; i < params.tensor_count; i++) {
-        PTOParamType ptype = params.tensor_types[i];
-        if (ptype == PTOParamType::OUTPUT || ptype == PTOParamType::INOUT) {
-            if (!params.tensors[i]->manual_dep) {
-                orch->tensor_map.insert(*params.tensors[i], mixed_task_id, ptype == PTOParamType::OUTPUT);
+    for (int i = 0; i < args.tensor_count; i++) {
+        TensorArgType ptype = args.tensor_types[i];
+        if (ptype == TensorArgType::OUTPUT || ptype == TensorArgType::INOUT) {
+            if (!args.tensors[i]->manual_dep) {
+                orch->tensor_map.insert(*args.tensors[i], mixed_task_id, ptype == TensorArgType::OUTPUT);
             }
         }
     }
@@ -519,11 +519,11 @@ void pto2_submit_mixed_task(
         }
     }
 
-    payload->init(params);
+    payload->init(args);
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, local_id);
+    CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, local_id);
 #if PTO2_ORCH_PROFILING
-    g_orch_params_atomic_count += 2;  // fanout_lock.store + fanout_count.store
+    g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
 #endif
 
     // === STEP 7: Finalize fanin list ===
@@ -665,7 +665,7 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
     d.sync_cycle = g_orch_sync_cycle;
     d.alloc_cycle = g_orch_alloc_cycle;
-    d.params_cycle = g_orch_params_cycle;
+    d.args_cycle = g_orch_args_cycle;
     d.lookup_cycle = g_orch_lookup_cycle;
     d.heap_cycle = g_orch_heap_cycle;
     d.insert_cycle = g_orch_insert_cycle;
@@ -676,14 +676,14 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     d.heap_wait_cycle = g_orch_heap_wait_cycle;
     d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
     d.alloc_atomic_count = g_orch_alloc_atomic_count;
-    d.params_atomic_count = g_orch_params_atomic_count;
+    d.args_atomic_count = g_orch_args_atomic_count;
     d.heap_atomic_count = g_orch_heap_atomic_count;
     d.fanin_atomic_count = g_orch_fanin_atomic_count;
     d.finalize_atomic_count = g_orch_finalize_atomic_count;
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
-    g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_params_cycle = 0;
+    g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
     g_orch_lookup_cycle = g_orch_heap_cycle = g_orch_insert_cycle = 0;
     g_orch_fanin_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
@@ -692,7 +692,7 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     g_orch_heap_wait_cycle = 0;
     g_orch_fanin_wait_cycle = 0;
     g_orch_alloc_atomic_count = 0;
-    g_orch_params_atomic_count = 0;
+    g_orch_args_atomic_count = 0;
     g_orch_heap_atomic_count = 0;
     g_orch_fanin_atomic_count = 0;
     g_orch_finalize_atomic_count = 0;

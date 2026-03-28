@@ -25,7 +25,7 @@
 
 /** Max dispatch arguments: 128 scalars + up to 16 tensor pointers */
 #ifndef PTO2_DISPATCH_MAX_ARGS
-#define PTO2_DISPATCH_MAX_ARGS (PTO2_MAX_SCALAR_PARAMS + PTO2_MAX_TENSOR_PARAMS)
+#define PTO2_DISPATCH_MAX_ARGS (MAX_SCALAR_ARGS + MAX_TENSOR_ARGS)
 #endif
 
 /**

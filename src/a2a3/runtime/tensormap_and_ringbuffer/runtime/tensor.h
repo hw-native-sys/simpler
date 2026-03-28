@@ -42,7 +42,7 @@ struct Segment {
  * dtype, ndims, raw_shapes (== shapes), manual_dep, and an optional
  * initial value fill.
  *
- * PTOParam::add_output() copies this value into PTOParam immediately, so the
+ * Arg::add_output() copies this value into Arg immediately, so the
  * original stack object does not need to outlive the add_output() call.
  */
 struct TensorCreateInfo {

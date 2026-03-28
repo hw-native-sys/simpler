@@ -14,7 +14,7 @@
  *   B: [num_groups, grid_k, incore_loop, tile_size, tile_size]
  *   C: [incore_loop * num_groups, tile_size, tile_size]
  *
- * Args layout: [A, B, C, config]
+ * Arg layout: [A, B, C, config]
  */
 
 #include <stddef.h>
@@ -87,7 +87,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
             Tensor A_view = ext_A.view(group_shapes, a_view_offsets);
             uint32_t b_view_offsets[1] = {(uint32_t)ab_offset};
             Tensor B_view = ext_B.view(group_shapes, b_view_offsets);
-            PTOParam params_gemm;
+            Arg params_gemm;
             params_gemm.add_input(A_view);
             params_gemm.add_input(B_view);
             params_gemm.add_output(group_ci);
@@ -95,7 +95,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
             TaskOutputTensors gemm_outs = pto2_rt_submit_aic_task(FUNC_GEMM_TILE, params_gemm);
             total_gemm++;
 
-            PTOParam params_add;
+            Arg params_add;
             params_add.add_inout(C_view);
             params_add.add_input(gemm_outs.get_ref(0));
             params_add.add_input(ext_config);

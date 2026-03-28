@@ -49,11 +49,11 @@ One extra step versus get_tensor_data: wait for all consumers to finish (`fanout
 
 ```cpp
 TensorCreateInfo ci(shapes, ndims, dtype);
-params.add_output(ci, initial_value);
+args.add_output(ci, initial_value);
 ```
 
 **Mechanism**:
-1. `add_output(ci, initial_value)` copies `ci` into `PTOParam` and marks the create-info with an initial value
+1. `add_output(ci, initial_value)` copies `ci` into `Arg` and marks the create-info with an initial value
 2. During orchestrator submit, after HeapRing allocation, the output tensor is materialized from the copied create-info
 3. Fill strategy:
    - Small buffer (< 64 B): element-by-element memcpy directly into dst
@@ -63,16 +63,16 @@ params.add_output(ci, initial_value);
 
 ## 5. Scalar Dependencies via 1-Element Tensors
 
-Traditional scalars (`PTOParam::add_scalar`) are one-way inputs with no TensorMap tracking. For cross-task scalar values, use a 1-element tensor as the carrier:
+Traditional scalars (`Arg::add_scalar`) are one-way inputs with no TensorMap tracking. For cross-task scalar values, use a 1-element tensor as the carrier:
 
 ```cpp
 uint32_t shapes[1] = {1};
 TensorCreateInfo scalar_ci(shapes, 1, DataType::FLOAT32);
 
 // Submit with initial value and keep the returned tensor
-PTOParam params;
-params.add_output(scalar_ci, float_to_u64(77.0f));
-TaskOutputTensors outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params);
+Arg args;
+args.add_output(scalar_ci, float_to_u64(77.0f));
+TaskOutputTensors outs = pto2_rt_submit_aiv_task(FUNC_NOOP, args);
 const Tensor& scalar_tensor = outs.get_ref(0);
 
 // Orchestration-side blocking read (waits for kernel completion)

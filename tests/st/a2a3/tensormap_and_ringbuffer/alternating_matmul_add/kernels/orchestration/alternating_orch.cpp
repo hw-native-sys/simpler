@@ -13,7 +13,7 @@
  * Task pattern: interleaved [matmul_0, add_0, matmul_1, add_1, ...]
  * All tasks are completely independent (no dependencies).
  *
- * Args layout: [A, B, C, X, Y, Z, batch, M_val, N_val, matmul_batch, add_batch]
+ * Arg layout: [A, B, C, X, Y, Z, batch, M_val, N_val, matmul_batch, add_batch]
  */
 
 #include <stddef.h>
@@ -82,7 +82,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
             Tensor B_view = ext_B.view(matmul_group_shapes, view_offsets);
             Tensor C_view = ext_C.view(matmul_group_shapes, view_offsets);
 
-            PTOParam params_matmul;
+            Arg params_matmul;
             params_matmul.add_input(A_view);
             params_matmul.add_input(B_view);
             params_matmul.add_inout(C_view);
@@ -102,7 +102,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
             Tensor Y_view = ext_Y.view(add_group_shapes, view_offsets);
             Tensor Z_view = ext_Z.view(add_group_shapes, view_offsets);
 
-            PTOParam params_add;
+            Arg params_add;
             params_add.add_input(X_view);
             params_add.add_input(Y_view);
             params_add.add_inout(Z_view);

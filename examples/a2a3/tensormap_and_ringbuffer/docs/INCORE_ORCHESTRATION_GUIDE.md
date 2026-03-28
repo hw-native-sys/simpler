@@ -30,24 +30,24 @@ Validate `arg_count` in `aicpu_orchestration_config` and interpret pointers as d
 1. Wrap orchestration in scopes with `PTO2_SCOPE()` to control tensor lifetimes.
 2. Use `make_tensor_external` for existing device buffers and `TensorCreateInfo` + `add_output(...)` for runtime-created intermediates.
 3. Use `add_inout(...)` for existing tensors that a kernel writes.
-4. Build `PTOParam` with `add_input`, `add_output`, `add_inout` for tensors and `add_scalar` for scalars.
+4. Build `Arg` with `add_input`, `add_output`, `add_inout` for tensors and `add_scalar` for scalars.
    > **Constraint**: All tensor parameters (`add_input` / `add_output` / `add_inout`) **must** be added before any scalar parameters (`add_scalar` / `add_scalars`). Violating this order will trigger an assertion failure. This is because the runtime dispatches tensor arguments first in kernel args, followed by scalars, and the layout must match.
    ```cpp
    // Correct
-   PTOParam p;
+   Arg p;
    p.add_input(a);
    p.add_inout(b);
    p.add_scalar(val);    // scalars after all tensors
 
    // Wrong — triggers assertion
-   PTOParam p;
+   Arg p;
    p.add_scalar(val);    // scalar added too early
    p.add_input(a);       // assertion: "scalar must add after all tensor added"
    ```
 5. Submit tasks with one of:
-   - `pto2_rt_submit_aic_task(rt, kernel_id, params, num_params)` — AIC (CUBE) task
-   - `pto2_rt_submit_aiv_task(rt, kernel_id, params, num_params)` — AIV (VECTOR) task
-   - `pto2_rt_submit_task(rt, mixed_kernels, params, num_params)` — mixed task with a `MixedKernels` struct
+   - `pto2_rt_submit_aic_task(kernel_id, args)` — AIC (CUBE) task
+   - `pto2_rt_submit_aiv_task(kernel_id, args)` — AIV (VECTOR) task
+   - `pto2_rt_submit_task(mixed_kernels, args)` — mixed task with a `MixedKernels` struct
 
 Dependencies are inferred by TensorMap from input/inout/output tensors, so you do not add explicit edges.
 
@@ -59,7 +59,7 @@ Dependencies are inferred by TensorMap from input/inout/output tensors, so you d
   MixedKernels mk;
   mk.aic_kernel_id = FUNC_QK;
   mk.aiv0_kernel_id = FUNC_SF;
-  pto2_rt_submit_task(mk, params);
+  pto2_rt_submit_task(mk, args);
   ```
 - Kernel `func_id` values are defined in `kernels/kernel_config.py` under `KERNELS`.
 

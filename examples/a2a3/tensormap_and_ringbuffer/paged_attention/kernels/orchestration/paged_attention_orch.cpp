@@ -113,7 +113,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                 uint32_t out_view_offsets[2] = {cur_offset, 0};
                 Tensor out_view = out.view(tile2d_shapes, out_view_offsets);
 
-                PTOParam params_inplace;
+                Arg params_inplace;
                 params_inplace.add_output(tile2d_ci);
                 params_inplace.add_output(scalar_ci);
                 params_inplace.add_output(scalar_ci);
@@ -130,7 +130,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                     Tensor kj = key_cache.view(kv_shapes, kv_offsets);
                     Tensor vj = value_cache.view(kv_shapes, kv_offsets);
 
-                    PTOParam params_qk;
+                    Arg params_qk;
                     params_qk.add_input(qi);
                     params_qk.add_input(kj);
                     params_qk.add_output(sij_ci);
@@ -140,7 +140,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                     uint32_t sij_valid_shapes[2] = {(uint32_t)q_tile, (uint32_t)valid_len};
                     uint32_t sij_valid_offsets[2] = {0, 0};
                     Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
-                    PTOParam params_sf;
+                    Arg params_sf;
                     params_sf.add_input(sij_valid);
                     params_sf.add_output(pij_f16_ci);
                     params_sf.add_output(scalar_ci);
@@ -151,7 +151,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                     const Tensor& mi = sf_outs.get_ref(1);
                     const Tensor& li = sf_outs.get_ref(2);
 
-                    PTOParam params_pv;
+                    Arg params_pv;
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(tile2d_ci);
@@ -161,7 +161,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
 
-                    PTOParam params_up;
+                    Arg params_up;
                     params_up.add_input(mi);
                     params_up.add_input(li);
                     params_up.add_input(oi_tmp);

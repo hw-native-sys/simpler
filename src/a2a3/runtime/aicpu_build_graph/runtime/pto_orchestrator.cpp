@@ -35,7 +35,7 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
     AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 static uint64_t g_orch_alloc_cycle = 0;
-static uint64_t g_orch_params_cycle = 0;
+static uint64_t g_orch_args_cycle = 0;
 static uint64_t g_orch_heap_cycle = 0;
 static uint64_t g_orch_fanin_cycle = 0;
 static uint64_t g_orch_scope_end_cycle = 0;
@@ -45,7 +45,7 @@ uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_heap_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
-uint64_t g_orch_params_atomic_count = 0;
+uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_heap_atomic_count = 0;
 uint64_t g_orch_fanin_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
@@ -231,7 +231,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // Task Submission (3-step: alloc, heap, write — no TensorMap)
 // =============================================================================
 PTO2TaskId pto2_submit_mixed_task(
-    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const PTOParam& params) {
+    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const Arg& args) {
     CYCLE_COUNT_START();
 
     PTO2TaskId invalid_id{};
@@ -240,16 +240,16 @@ PTO2TaskId pto2_submit_mixed_task(
         return invalid_id;
     }
 
-    // Validate PTOParam
-    if (params.has_error) {
+    // Validate Arg
+    if (args.has_error) {
         LOG_ERROR("========================================");
-        LOG_ERROR("FATAL: Invalid PTOParam Detected!");
+        LOG_ERROR("FATAL: Invalid Arg Detected!");
         LOG_ERROR("========================================");
-        LOG_ERROR("Error: %s", params.error_msg ? params.error_msg : "(unknown)");
-        LOG_ERROR("  tensor_count: %d, scalar_count: %d", params.tensor_count, params.scalar_count);
+        LOG_ERROR("Error: %s", args.error_msg ? args.error_msg : "(unknown)");
+        LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count, args.scalar_count);
         LOG_ERROR("========================================");
         orch->sm_handle->header->orch_error_code.store(
-            PTO2_ERROR_INVALID_PARAM, std::memory_order_release);
+            PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
         orch->fatal = true;
         return invalid_id;
     }
@@ -311,11 +311,11 @@ PTO2TaskId pto2_submit_mixed_task(
     PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[ring_id][slot];
 
     // Prefetch payload cache lines for write
-    for (int32_t i = 0; i < params.tensor_count; i++) {
+    for (int32_t i = 0; i < args.tensor_count; i++) {
         __builtin_prefetch(&payload->tensors[i], 1, 3);
         __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 3);
     }
-    for (int32_t i = 0; i < params.scalar_count; i += 8) {
+    for (int32_t i = 0; i < args.scalar_count; i += 8) {
         __builtin_prefetch(&payload->scalars[i], 1, 3);
     }
     __builtin_prefetch(payload, 1, 3);
@@ -352,10 +352,10 @@ PTO2TaskId pto2_submit_mixed_task(
 
     // === STEP 2: Heap allocation for OUTPUT tensors ===
     int32_t total_output_size = 0;
-    for (int i = 0; i < params.tensor_count; i++) {
-        if (params.tensor_types[i] == PTOParamType::OUTPUT
-            && params.tensors[i]->buffer.addr == 0) {
-            total_output_size += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+    for (int i = 0; i < args.tensor_count; i++) {
+        if (args.tensor_types[i] == TensorArgType::OUTPUT
+            && args.tensors[i]->buffer.addr == 0) {
+            total_output_size += PTO2_ALIGN_UP(args.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
 
@@ -369,12 +369,12 @@ PTO2TaskId pto2_submit_mixed_task(
 
     // Assign addresses to OUTPUT tensors
     int32_t offset = 0;
-    for (int i = 0; i < params.tensor_count; i++) {
-        if (params.tensor_types[i] == PTOParamType::OUTPUT
-            && params.tensors[i]->buffer.addr == 0) {
+    for (int i = 0; i < args.tensor_count; i++) {
+        if (args.tensor_types[i] == TensorArgType::OUTPUT
+            && args.tensors[i]->buffer.addr == 0) {
             uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)local_packed_base + offset);
-            params.tensors[i]->buffer.addr = alloc_addr;
-            offset += PTO2_ALIGN_UP(params.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
+            args.tensors[i]->buffer.addr = alloc_addr;
+            offset += PTO2_ALIGN_UP(args.tensors[i]->buffer.size, PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
 
@@ -396,9 +396,9 @@ PTO2TaskId pto2_submit_mixed_task(
     task.packed_buffer_end = local_packed_end;
 
     payload->fanin_actual_count = 0;
-    payload->init(params);
+    payload->init(args);
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
+    CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 
     // Record dep pool watermark
     if (sched) {
@@ -545,7 +545,7 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
 PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
     d.alloc_cycle = g_orch_alloc_cycle;
-    d.params_cycle = g_orch_params_cycle;
+    d.args_cycle = g_orch_args_cycle;
     d.heap_cycle = g_orch_heap_cycle;
     d.fanin_cycle = g_orch_fanin_cycle;
     d.scope_end_cycle = g_orch_scope_end_cycle;
@@ -554,13 +554,13 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     d.heap_wait_cycle = g_orch_heap_wait_cycle;
     d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
     d.alloc_atomic_count = g_orch_alloc_atomic_count;
-    d.params_atomic_count = g_orch_params_atomic_count;
+    d.args_atomic_count = g_orch_args_atomic_count;
     d.heap_atomic_count = g_orch_heap_atomic_count;
     d.fanin_atomic_count = g_orch_fanin_atomic_count;
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
-    g_orch_alloc_cycle = g_orch_params_cycle = 0;
+    g_orch_alloc_cycle = g_orch_args_cycle = 0;
     g_orch_heap_cycle = g_orch_fanin_cycle = 0;
     g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
@@ -569,7 +569,7 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     g_orch_heap_wait_cycle = 0;
     g_orch_fanin_wait_cycle = 0;
     g_orch_alloc_atomic_count = 0;
-    g_orch_params_atomic_count = 0;
+    g_orch_args_atomic_count = 0;
     g_orch_heap_atomic_count = 0;
     g_orch_fanin_atomic_count = 0;
     g_orch_scope_end_atomic_count = 0;
