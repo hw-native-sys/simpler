@@ -20,7 +20,7 @@
  *
  * Dependencies are automatic via TensorMap overlap detection.
  *
- * Args layout: [A, B, C]  — shape/dtype/size in TaskArg metadata
+ * Arg layout: [A, B, C]  — shape/dtype/size in TaskArg metadata
  */
 
 #include <stddef.h>
@@ -92,7 +92,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                         uint32_t b_view_offsets[1] = {b_elem_offset};
                         Tensor B_view = ext_B.view(tile_shapes, b_view_offsets);
                         // P = A[m,k] @ B[k,n]
-                        PTOParam params_gemm;
+                        Arg params_gemm;
                         params_gemm.add_input(A_view);
                         params_gemm.add_input(B_view);
                         params_gemm.add_output(tile_ci);
@@ -100,7 +100,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                                            params_gemm); // gemm
 
                         // C[m,n] += P
-                        PTOParam params_add;
+                        Arg params_add;
                         params_add.add_inout(C_view);
                         params_add.add_input(gemm_outs.get_ref(0));
                         pto2_rt_submit_aiv_task(FUNC_TILE_ADD,

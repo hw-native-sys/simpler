@@ -166,7 +166,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
-                PTOParam params_inplace;
+                Arg params_inplace;
                 params_inplace.add_output(tile2d_ci);
                 params_inplace.add_output(scalar_noinit_ci);
                 params_inplace.add_output(scalar_noinit_ci);
@@ -180,9 +180,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(TaskArg* o
                 CYCLE_COUNT_LAP(prof_submit_task);
 #endif
 
-                // Reusable PTOParam objects — reset() before each use avoids
+                // Reusable Arg objects — reset() before each use avoids
                 // repeated stack-frame construction in the inner loop.
-                PTOParam params_qk, params_sf, params_pv, params_up;
+                Arg params_qk, params_sf, params_pv, params_up;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
                     uint64_t n_blocks = std::min((uint64_t)N_UNROLL, bn_this_batch - bn);

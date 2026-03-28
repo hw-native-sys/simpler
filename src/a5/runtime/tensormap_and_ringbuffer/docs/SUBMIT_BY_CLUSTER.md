@@ -61,24 +61,24 @@ struct MixedKernels {
 
 static inline void pto2_rt_submit_task(PTO2Runtime* rt,
                                        const MixedKernels& mixed_kernels,
-                                       PTOParam* params,
-                                       int32_t num_params);
+                                       Arg* args,
+                                       int32_t num_args);
 
 static inline void pto2_rt_submit_aic_task(PTO2Runtime* rt,
                                            int32_t kernel_id,
-                                           PTOParam* params,
-                                           int32_t num_params);
+                                           Arg* args,
+                                           int32_t num_args);
 
 static inline void pto2_rt_submit_aiv_task(PTO2Runtime* rt,
                                            int32_t kernel_id,
-                                           PTOParam* params,
-                                           int32_t num_params);
+                                           Arg* args,
+                                           int32_t num_args);
 ```
 
 Rules:
 
 1. One submit call creates one `MixedTask`.
-2. All active slots share the same `params` and `num_params`.
+2. All active slots share the same `args` and `num_args`.
 3. At least one slot must be active.
 4. `aiv0_kernel_id` and `aiv1_kernel_id` are semantically equivalent.
 5. Wrappers are orchestration sugar only (inline in orchestration API); no dedicated runtime ops entries.
@@ -97,7 +97,7 @@ Rules:
 
 `PTO2TaskPayload` (cold path) carries:
 
-1. shared params/tensors/scalars copied once per mixed submit
+1. shared args/tensors/scalars copied once per mixed submit
 2. fanin mixed-task IDs
 3. other cold-path submit metadata
 

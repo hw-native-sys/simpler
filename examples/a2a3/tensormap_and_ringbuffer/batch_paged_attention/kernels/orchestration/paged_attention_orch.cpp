@@ -105,7 +105,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                 TensorCreateInfo sij_ci(sij_shapes, 2, DataType::FLOAT32);
                 TensorCreateInfo pij_ci(sij_shapes, 2, data_type);
 
-                PTOParam params_hub;
+                Arg params_hub;
                 params_hub.add_output(tile2d_ci);
                 params_hub.add_output(scalar_ci);
                 params_hub.add_output(scalar_ci);
@@ -115,7 +115,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                 const Tensor& mi_batch = hub_outs.get_ref(2);
 
                 for (uint64_t bn = 0; bn < max_bn; bn++) {
-                    PTOParam params_qk;
+                    Arg params_qk;
                     params_qk.add_input(query);
                     params_qk.add_input(key_cache);
                     params_qk.add_output(sij_ci);
@@ -129,7 +129,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                     TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor& sij_b = qk_outs.get_ref(0);
 
-                    PTOParam params_sf;
+                    Arg params_sf;
                     params_sf.add_input(sij_b);
                     params_sf.add_output(pij_ci);
                     params_sf.add_output(scalar_ci);
@@ -144,7 +144,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                     const Tensor& mij_b = sf_outs.get_ref(1);
                     const Tensor& lij_b = sf_outs.get_ref(2);
 
-                    PTOParam params_pv;
+                    Arg params_pv;
                     params_pv.add_input(pij_b);
                     params_pv.add_input(value_cache);
                     params_pv.add_output(tile2d_ci);
@@ -158,7 +158,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == max_bn - 1) ? 1 : 0;
-                    PTOParam params_up;
+                    Arg params_up;
                     params_up.add_input(mij_b);
                     params_up.add_input(lij_b);
                     params_up.add_input(oi_new_b);

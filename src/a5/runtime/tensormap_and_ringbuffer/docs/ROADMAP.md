@@ -26,7 +26,7 @@ void pto2_rt_free_cluster(PTO2Runtime* rt, int32_t cluster_id);
 
 // Submit a task constrained to a specific cluster.
 void pto2_rt_submit_task_clustered(PTO2Runtime* rt, int kernel_id,
-                                    int worker_type, PTOParam* params,
+                                    int worker_type, Arg* args,
                                     int n, int32_t cluster_id);
 ```
 
@@ -49,8 +49,8 @@ At the runtime level, the orchestration layer will **expand** a single `block_in
 // Orchestration expansion logic
 PTO2_SCOPE(rt) {
     for (int bid = 0; bid < block_dim; bid++) {
-        // ... build params with make_scalar_param(bid) ...
-        pto2_rt_submit_task(rt, KERNEL_FUNC_ID, PTO2_WORKER_VECTOR, params, 4);
+        // ... build args with make_scalar_param(bid) ...
+        pto2_rt_submit_task(rt, KERNEL_FUNC_ID, PTO2_WORKER_VECTOR, args, 4);
     }
 }
 ```

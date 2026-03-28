@@ -112,11 +112,11 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                 uint32_t out_view_offsets[2] = {cur_offset, 0};
                 Tensor out_view = out.view(out_view_shapes, out_view_offsets);
 
-                PTOParam params_inplace;
-                params_inplace.add_output(oi);
-                params_inplace.add_output(li_update);
-                params_inplace.add_output(mi_update);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace); // create_inplace
+                Arg args_inplace;
+                args_inplace.add_output(oi);
+                args_inplace.add_output(li_update);
+                args_inplace.add_output(mi_update);
+                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace); // create_inplace
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
@@ -130,48 +130,48 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                     Tensor sij = make_tensor(sij_shapes, 2, DataType::FLOAT32);
                     Tensor pij_f16 = make_tensor(sij_shapes, 2, data_type);
 
-                    PTOParam params_qk;
-                    params_qk.add_input(qi);
-                    params_qk.add_input(kj);
-                    params_qk.add_output(sij);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk); // c1
+                    Arg args_qk;
+                    args_qk.add_input(qi);
+                    args_qk.add_input(kj);
+                    args_qk.add_output(sij);
+                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk); // c1
 
                     uint32_t sij_valid_shapes[2] = {(uint32_t)q_tile, (uint32_t)valid_len};
                     uint32_t sij_valid_offsets[2] = {0, 0};
                     Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
                     Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
                     Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
-                    PTOParam params_sf;
-                    params_sf.add_input(sij_valid);
-                    params_sf.add_output(pij_f16);
-                    params_sf.add_output(mi);
-                    params_sf.add_output(li);
-                    params_sf.add_scalar(scale_value);
-                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf); // v1
+                    Arg args_sf;
+                    args_sf.add_input(sij_valid);
+                    args_sf.add_output(pij_f16);
+                    args_sf.add_output(mi);
+                    args_sf.add_output(li);
+                    args_sf.add_scalar(scale_value);
+                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf); // v1
 
                     uint32_t oi_tmp_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                     Tensor oi_tmp = make_tensor(oi_tmp_shapes, 2, DataType::FLOAT32);
 
-                    PTOParam params_pv;
-                    params_pv.add_input(pij_f16);
-                    params_pv.add_input(vj);
-                    params_pv.add_output(oi_tmp);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv); // c2
+                    Arg args_pv;
+                    args_pv.add_input(pij_f16);
+                    args_pv.add_input(vj);
+                    args_pv.add_output(oi_tmp);
+                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv); // c2
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
 
-                    PTOParam params_up;
-                    params_up.add_input(mi);
-                    params_up.add_input(li);
-                    params_up.add_input(oi_tmp);
-                    params_up.add_inout(mi_update);
-                    params_up.add_inout(li_update);
-                    params_up.add_inout(oi);
-                    params_up.add_output(out_view);
-                    params_up.add_scalar(is_first);
-                    params_up.add_scalar(is_last);
-                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up); // v2
+                    Arg args_up;
+                    args_up.add_input(mi);
+                    args_up.add_input(li);
+                    args_up.add_input(oi_tmp);
+                    args_up.add_inout(mi_update);
+                    args_up.add_inout(li_update);
+                    args_up.add_inout(oi);
+                    args_up.add_output(out_view);
+                    args_up.add_scalar(is_first);
+                    args_up.add_scalar(is_last);
+                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up); // v2
                 }
             }
         }

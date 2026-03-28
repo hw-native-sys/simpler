@@ -177,20 +177,20 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
                 // Hub task: zero-initialize oi, li_update, mi_update
-                PTOParam params_inplace;
-                params_inplace.add_output(oi);
-                params_inplace.add_output(li_update);
-                params_inplace.add_output(mi_update);
+                Arg args_inplace;
+                args_inplace.add_output(oi);
+                args_inplace.add_output(li_update);
+                args_inplace.add_output(mi_update);
                 CYCLE_COUNT_LAP(prof_param_setup);
-                PTO2TaskId hub_task = pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, params_inplace);
+                PTO2TaskId hub_task = pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace);
 #ifdef ENABLE_PROFILING
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
 #endif
 
-                // Reusable PTOParam objects — reset() before each use avoids
+                // Reusable Arg objects — reset() before each use avoids
                 // repeated stack-frame construction in the inner loop.
-                PTOParam params_qk, params_sf, params_pv, params_up;
+                Arg args_qk, args_sf, args_pv, args_up;
 
                 PTO2TaskId prev_update_task = hub_task;
 
@@ -210,14 +210,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-                    params_qk.reset();
-                    params_qk.add_input(qi);
-                    params_qk.add_input(key_cache);
-                    params_qk.add_output(sij_buf);
-                    params_qk.add_scalar(n_blocks);
-                    params_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
+                    args_qk.reset();
+                    args_qk.add_input(qi);
+                    args_qk.add_input(key_cache);
+                    args_qk.add_output(sij_buf);
+                    args_qk.add_scalar(n_blocks);
+                    args_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    PTO2TaskId qk_task = pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, params_qk);
+                    PTO2TaskId qk_task = pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -233,16 +233,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-                    params_sf.reset();
-                    params_sf.add_input(sij_buf);
-                    params_sf.add_output(pij_buf);
-                    params_sf.add_output(mi);
-                    params_sf.add_output(li);
-                    params_sf.add_scalar(scale_value);
-                    params_sf.add_scalar(n_blocks);
-                    params_sf.add_scalar(valid_len_last);
+                    args_sf.reset();
+                    args_sf.add_input(sij_buf);
+                    args_sf.add_output(pij_buf);
+                    args_sf.add_output(mi);
+                    args_sf.add_output(li);
+                    args_sf.add_scalar(scale_value);
+                    args_sf.add_scalar(n_blocks);
+                    args_sf.add_scalar(valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    PTO2TaskId sf_task = pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, params_sf);
+                    PTO2TaskId sf_task = pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
                     // QK → Softmax (sij_buf)
                     pto2_rt_add_dependency(rt, qk_task, sf_task);
 #ifdef ENABLE_PROFILING
@@ -258,14 +258,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-                    params_pv.reset();
-                    params_pv.add_input(pij_buf);
-                    params_pv.add_input(value_cache);
-                    params_pv.add_output(oi_new);
-                    params_pv.add_scalar(n_blocks);
-                    params_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
+                    args_pv.reset();
+                    args_pv.add_input(pij_buf);
+                    args_pv.add_input(value_cache);
+                    args_pv.add_output(oi_new);
+                    args_pv.add_scalar(n_blocks);
+                    args_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    PTO2TaskId pv_task = pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, params_pv);
+                    PTO2TaskId pv_task = pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
                     // Softmax → PV (pij_buf)
                     pto2_rt_add_dependency(rt, sf_task, pv_task);
 #ifdef ENABLE_PROFILING
@@ -277,18 +277,18 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(PTO2Runtim
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
 
-                    params_up.reset();
-                    params_up.add_input(mi);
-                    params_up.add_input(li);
-                    params_up.add_input(oi_new);
-                    params_up.add_inout(mi_update);
-                    params_up.add_inout(li_update);
-                    params_up.add_inout(oi);
-                    params_up.add_output(out_view);
-                    params_up.add_scalar(is_first);
-                    params_up.add_scalar(is_last);
+                    args_up.reset();
+                    args_up.add_input(mi);
+                    args_up.add_input(li);
+                    args_up.add_input(oi_new);
+                    args_up.add_inout(mi_update);
+                    args_up.add_inout(li_update);
+                    args_up.add_inout(oi);
+                    args_up.add_output(out_view);
+                    args_up.add_scalar(is_first);
+                    args_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    PTO2TaskId up_task = pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, params_up);
+                    PTO2TaskId up_task = pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up);
                     // Softmax → Update (mi, li)
                     pto2_rt_add_dependency(rt, sf_task, up_task);
                     // PV → Update (oi_new)

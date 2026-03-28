@@ -56,7 +56,7 @@
 #define PTO2_ERROR_HEAP_RING_DEADLOCK         2
 #define PTO2_ERROR_FLOW_CONTROL_DEADLOCK      3
 #define PTO2_ERROR_DEP_POOL_OVERFLOW          4
-#define PTO2_ERROR_INVALID_PARAM              5   // PTOParam construction error (invalid params)
+#define PTO2_ERROR_INVALID_ARGS               5   // Arg construction error (invalid args)
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT          100
@@ -236,22 +236,22 @@ struct PTO2TaskPayload {
     int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
     // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
-    Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
+    Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 35-50 (1024B) — scalars ===
-    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
+    uint64_t scalars[MAX_SCALAR_ARGS];
 
-    void init(const PTOParam& params) {
-        tensor_count = params.tensor_count;
-        scalar_count = params.scalar_count;
-        auto src_tensors = params.tensors;
-        for (int32_t i = 0; i < params.tensor_count; i++) {
+    void init(const Arg& args) {
+        tensor_count = args.tensor_count;
+        scalar_count = args.scalar_count;
+        auto src_tensors = args.tensors;
+        for (int32_t i = 0; i < args.tensor_count; i++) {
             tensors[i].copy(*src_tensors[i]);
         }
-        static_assert(sizeof(scalars) == sizeof(params.scalars));
+        static_assert(sizeof(scalars) == sizeof(args.scalars));
         // Round up to cache line boundary. Both arrays are 1024B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
-        memcpy(scalars, params.scalars,
-               PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
+        memcpy(scalars, args.scalars,
+               PTO2_ALIGN_UP(args.scalar_count * sizeof(uint64_t), 64));
     }
 };
 

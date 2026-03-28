@@ -2,7 +2,7 @@
  * Orchestration Build Graph Types - Data structures for orchestration runtime extensions
  *
  * Standalone header defining orchestration-specific types for:
- * - PTOParam: Aggregated parameter container for pto_submit_task API
+ * - Arg: Aggregated argument container for pto_submit_task API
  *
  * Tensor descriptor types (Tensor, PTOBufferHandle, PTOOverlapStrategy) are
  * defined in tensor.h.
@@ -23,28 +23,28 @@
 
 #include "tensor.h"
 
-// Task parameters
-#define PTO2_MAX_TENSOR_PARAMS    16      // Maximum tensor parameters per task
-#define PTO2_MAX_SCALAR_PARAMS    128     // Maximum scalar parameters per task
+// Task arguments
+#define MAX_TENSOR_ARGS    16      // Maximum tensor parameters per task
+#define MAX_SCALAR_ARGS    128     // Maximum scalar parameters per task
 #define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
 #define PTO2_MAX_INPUTS           16      // Maximum inputs per task
-#define PTO2_MAX_INOUTS           8       // Maximum in-out params per task
+#define PTO2_MAX_INOUTS           8       // Maximum in-out args per task
 
 // =============================================================================
-// Parameter Types (for pto_submit_task API)
+// Argument Types (for pto_submit_task API)
 // =============================================================================
 
 /**
- * Parameter Type - Distinguishes inputs, outputs, and in-place updates
+ * Argument Type - Distinguishes inputs, outputs, and in-place updates
  */
-enum class PTOParamType : int32_t {
+enum class TensorArgType : int32_t {
     INPUT = 0,   // Read-only input buffer
     OUTPUT = 1,  // Write-only output buffer (NULL addr: runtime allocates; non-NULL: use as-is)
     INOUT = 2,   // Read-then-write: consumer of prior producer + modifier for downstream
 };
 
 /**
- * Aggregated parameter container for pto_submit_task
+ * Aggregated argument container for pto_submit_task
  *
  * Tensor pointers and types are stored in separate parallel arrays for
  * efficient bulk copy: the runtime can memcpy the pointer array and type
@@ -54,17 +54,17 @@ enum class PTOParamType : int32_t {
  * Example:
  *   Tensor td_a = make_tensor_external(dev_a, shapes, 2);
  *   Tensor td_c = make_tensor(shapes, 2);
- *   PTOParam params;
- *   params.add_input(td_a);
- *   params.add_output(td_c);
- *   params.add_scalar(some_value);
- *   pto2_rt_submit_aic_task(rt, kernel_id, params);
+ *   Arg args;
+ *   args.add_input(td_a);
+ *   args.add_output(td_c);
+ *   args.add_scalar(some_value);
+ *   pto2_rt_submit_aic_task(rt, kernel_id, args);
  *   // td_c.buffer.addr is already updated via pointer write-back
  */
-struct PTOParam {
-    Tensor* tensors[PTO2_MAX_TENSOR_PARAMS];
-    PTOParamType tensor_types[PTO2_MAX_TENSOR_PARAMS];
-    uint64_t scalars[PTO2_MAX_SCALAR_PARAMS];
+struct Arg {
+    Tensor* tensors[MAX_TENSOR_ARGS];
+    TensorArgType tensor_types[MAX_TENSOR_ARGS];
+    uint64_t scalars[MAX_SCALAR_ARGS];
     int32_t tensor_count{0};
     int32_t scalar_count{0};
     bool has_error{false};
@@ -90,8 +90,8 @@ struct PTOParam {
                       "all tensors must be added before any scalars");
             return false;
         }
-        if (tensor_count >= PTO2_MAX_TENSOR_PARAMS) {
-            set_error("Too many tensor params (exceeds PTO2_MAX_TENSOR_PARAMS=32)");
+        if (tensor_count >= MAX_TENSOR_ARGS) {
+            set_error("Too many tensor args (exceeds MAX_TENSOR_ARGS=16)");
             return false;
         }
         return true;
@@ -104,14 +104,14 @@ struct PTOParam {
             return;
         }
         tensors[tensor_count] = &t;
-        tensor_types[tensor_count] = PTOParamType::INPUT;
+        tensor_types[tensor_count] = TensorArgType::INPUT;
         tensor_count++;
     }
 
     void add_output(Tensor& t) {
         if (!check_add_tensor_valid()) { return; }
         tensors[tensor_count] = &t;
-        tensor_types[tensor_count] = PTOParamType::OUTPUT;
+        tensor_types[tensor_count] = TensorArgType::OUTPUT;
         tensor_count++;
     }
 
@@ -122,21 +122,21 @@ struct PTOParam {
             return;
         }
         tensors[tensor_count] = &t;
-        tensor_types[tensor_count] = PTOParamType::INOUT;
+        tensor_types[tensor_count] = TensorArgType::INOUT;
         tensor_count++;
     }
 
     void add_scalar(uint64_t v) {
-        if (scalar_count >= PTO2_MAX_SCALAR_PARAMS) {
-            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+        if (scalar_count >= MAX_SCALAR_ARGS) {
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
         scalars[scalar_count++] = v;
     }
 
     void add_scalars(const uint64_t* values, int count) {
-        if (scalar_count + count > PTO2_MAX_SCALAR_PARAMS) {
-            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+        if (scalar_count + count > MAX_SCALAR_ARGS) {
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
         memcpy(&scalars[scalar_count], values, count * sizeof(uint64_t));
@@ -150,8 +150,8 @@ struct PTOParam {
      * Uses NEON to process 4 elements per iteration on aarch64.
      */
     void add_scalars_i32(const int32_t* values, int count) {
-        if (scalar_count + count > PTO2_MAX_SCALAR_PARAMS) {
-            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+        if (scalar_count + count > MAX_SCALAR_ARGS) {
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
         uint64_t* dst = &scalars[scalar_count];
@@ -176,16 +176,16 @@ struct PTOParam {
     }
 
     /**
-     * Copy scalars from another PTOParam's scalar array.
+     * Copy scalars from another Arg's scalar array.
      * Useful when multiple tasks share the same scalar data (e.g., block indices).
      */
-    void copy_scalars_from(const PTOParam& src, int src_offset, int count) {
+    void copy_scalars_from(const Arg& src, int src_offset, int count) {
         if (src_offset + count > src.scalar_count) {
             set_error("Source scalar range out of bounds in copy_scalars_from");
             return;
         }
-        if (scalar_count + count > PTO2_MAX_SCALAR_PARAMS) {
-            set_error("Too many scalar params (exceeds PTO2_MAX_SCALAR_PARAMS=128)");
+        if (scalar_count + count > MAX_SCALAR_ARGS) {
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
         memcpy(&scalars[scalar_count], &src.scalars[src_offset], count * sizeof(uint64_t));

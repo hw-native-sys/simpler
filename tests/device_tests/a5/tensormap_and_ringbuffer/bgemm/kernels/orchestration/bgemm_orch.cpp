@@ -22,7 +22,7 @@
  * Intermediate result P flows via TPUSH/TPOP (VEC_FIFO), bypassing GM.
  * Dependencies are automatic via TensorMap overlap detection.
  *
- * Args layout: [A, B, C]  — shape/dtype/size in TaskArg metadata
+ * Arg layout: [A, B, C]  — shape/dtype/size in TaskArg metadata
  */
 
  #include <stddef.h>
@@ -94,16 +94,16 @@
                          Tensor B_view = ext_B.view(tile_shapes, b_view_offsets);
  
                          // P = A[m,k] @ B[k,n], then C[m,n] += P
-                         PTOParam params;
-                         params.add_input(A_view);
-                         params.add_input(B_view);
-                         params.add_inout(C_view);
+                         Arg args;
+                         args.add_input(A_view);
+                         args.add_input(B_view);
+                         args.add_inout(C_view);
  
                          MixedKernels mk;
                          mk.aic_kernel_id  = FUNC_GEMM_TILE;
                          mk.aiv0_kernel_id = FUNC_TILE_ADD;
                          mk.aiv1_kernel_id = FUNC_TILE_ADD;
-                         pto2_rt_submit_task(rt, mk, params);
+                         pto2_rt_submit_task(rt, mk, args);
                      }
                  }
              }

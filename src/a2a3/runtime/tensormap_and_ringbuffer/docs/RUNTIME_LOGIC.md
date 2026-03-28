@@ -387,8 +387,8 @@ Key members:
 | 2 | Initialize task descriptor, copy parameters |
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers |
 | 4 | **Dependency**: `pto2_add_consumer_to_producer` for each producer found |
-| 5 | **Heap alloc**: `pto2_alloc_packed_buffer` for OUTPUT params (addr=0) |
-| 6 | **Insert**: register OUTPUT/INOUT params in TensorMap |
+| 5 | **Heap alloc**: `pto2_alloc_packed_buffer` for OUTPUT args (addr=0) |
+| 6 | **Insert**: register OUTPUT/INOUT args in TensorMap |
 | 7 | **Fanin**: finalize `fanin_count`; if `init_task_on_submit`, call scheduler's `init_task` |
 | 8 | **Publish**: `STORE_RELEASE(current_task_index)` makes task visible to scanners |
 
@@ -417,8 +417,8 @@ Scopes control the lifetime of intermediate buffers. Each scope:
 ```cpp
 PTO2_SCOPE(rt) {
     // Tasks submitted here belong to this scope
-    pto2_rt_submit_aic_task(rt, FUNC_QK, params, n);
-    pto2_rt_submit_aiv_task(rt, FUNC_SF, params, n);
+    pto2_rt_submit_aic_task(FUNC_QK, args);
+    pto2_rt_submit_aiv_task(FUNC_SF, args);
 }
 // scope_end: scope reference released from all tasks above
 ```
@@ -572,9 +572,9 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 
 | Function/Macro | Purpose |
 |----------------|---------|
-| `pto2_rt_submit_task(mixed_kernels, params)` | Submit a mixed task with `MixedKernels` struct |
-| `pto2_rt_submit_aic_task(kernel_id, params)` | Convenience: submit AIC-only task |
-| `pto2_rt_submit_aiv_task(kernel_id, params)` | Convenience: submit AIV-only task |
+| `pto2_rt_submit_task(mixed_kernels, args)` | Submit a mixed task with `MixedKernels` struct |
+| `pto2_rt_submit_aic_task(kernel_id, args)` | Convenience: submit AIC-only task |
+| `pto2_rt_submit_aiv_task(kernel_id, args)` | Convenience: submit AIV-only task |
 | `PTO2_SCOPE() { ... }` | RAII scope for buffer lifetime |
 | `pto2_rt_orchestration_done()` | Signal orchestration complete |
 
@@ -584,10 +584,10 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 |----------|-------------|
 | `make_tensor_external(ptr, shapes, ndim, dtype)` | Wrap an existing device pointer as a tensor |
 | `TensorCreateInfo(shapes, ndim, dtype)` | Describe a runtime-created output buffer |
-| `PTOParam::add_input(tensor)` | INPUT parameter — read by the task |
-| `PTOParam::add_output(create_info)` | OUTPUT parameter — runtime allocates and returns a Tensor |
-| `PTOParam::add_inout(tensor)` | INOUT parameter — existing tensor read then written |
-| `PTOParam::add_scalar(value)` | 64-bit scalar parameter |
+| `Arg::add_input(tensor)` | INPUT parameter — read by the task |
+| `Arg::add_output(create_info)` | OUTPUT parameter — runtime allocates and returns a Tensor |
+| `Arg::add_inout(tensor)` | INOUT parameter — existing tensor read then written |
+| `Arg::add_scalar(value)` | 64-bit scalar parameter |
 
 ### 11.3 Resource Shapes
 

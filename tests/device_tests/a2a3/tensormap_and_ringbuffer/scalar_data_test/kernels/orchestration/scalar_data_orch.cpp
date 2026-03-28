@@ -81,7 +81,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     // =========================================================
     // Step 1: c = a + b (runtime-created tensor, kernel_add)
     // =========================================================
-    PTOParam params_c;
+    Arg params_c;
     params_c.add_input(ext_a);
     params_c.add_input(ext_b);
     params_c.add_output(inter_ci);
@@ -119,7 +119,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     uint32_t scalar_shapes[1] = {1};
     TensorCreateInfo scalar_ci(scalar_shapes, 1, DataType::FLOAT32);
 
-    PTOParam params_scalar;
+    Arg params_scalar;
     params_scalar.add_output(scalar_ci, float_to_u64(77.0f));
     TaskOutputTensors scalar_outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params_scalar);
     const Tensor& scalar_tensor = scalar_outs.get_ref(0);
@@ -142,9 +142,9 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     //   Buffer already exists, so the noop just registers dependency
     // =========================================================
     {
-        PTOParam params;
-        params.add_inout(scalar_tensor);
-        pto2_rt_submit_aiv_task(FUNC_NOOP, params);
+        Arg args;
+        args.add_inout(scalar_tensor);
+        pto2_rt_submit_aiv_task(FUNC_NOOP, args);
     }
 
     // =========================================================
@@ -188,7 +188,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     //   Orchestration writes d[0]=10.0 via set_tensor_data, then
     //   kernel_add reads d as input: e[0] = d[0] + a[0] = 12.0
     // =========================================================
-    PTOParam params_d;
+    Arg params_d;
     params_d.add_output(inter_ci);
     TaskOutputTensors d_outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params_d);
     const Tensor& d = d_outs.get_ref(0);
@@ -196,7 +196,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     idx[0] = 0;
     set_tensor_data(d, 1, idx, float_to_u64(10.0f));
 
-    PTOParam params_e;
+    Arg params_e;
     params_e.add_input(d);
     params_e.add_input(ext_a);
     params_e.add_output(inter_ci);
@@ -226,11 +226,11 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     //   instead of add_input() so TensorMap tracks the access chain.
     // =========================================================
     {
-        PTOParam params;
-        params.add_input(c);
-        params.add_input(ext_b);
-        params.add_output(inter_ci);
-        (void)pto2_rt_submit_aiv_task(FUNC_ADD, params);
+        Arg args;
+        args.add_input(c);
+        args.add_input(ext_b);
+        args.add_output(inter_ci);
+        (void)pto2_rt_submit_aiv_task(FUNC_ADD, args);
     }
 
     // set_tensor_data auto-waits for producer + consumer before writing
@@ -259,9 +259,9 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     //   set_tensor_data auto-waits for the noop to complete.
     // =========================================================
     {
-        PTOParam params;
-        params.add_inout(ext_b);  // INOUT: creates TensorMap entry (not INPUT!)
-        pto2_rt_submit_aiv_task(FUNC_NOOP, params);
+        Arg args;
+        args.add_inout(ext_b);  // INOUT: creates TensorMap entry (not INPUT!)
+        pto2_rt_submit_aiv_task(FUNC_NOOP, args);
     }
 
     idx[0] = 0;
@@ -280,11 +280,11 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     // Step 13: result = a + b (external output via INOUT, kernel_add)
     // =========================================================
     {
-        PTOParam params;
-        params.add_input(ext_a);
-        params.add_input(ext_b);
-        params.add_inout(ext_result);
-        pto2_rt_submit_aiv_task(FUNC_ADD, params);
+        Arg args;
+        args.add_input(ext_a);
+        args.add_input(ext_b);
+        args.add_inout(ext_result);
+        pto2_rt_submit_aiv_task(FUNC_ADD, args);
     }
 
     LOG_INFO("scalar_data_test: orchestration complete");

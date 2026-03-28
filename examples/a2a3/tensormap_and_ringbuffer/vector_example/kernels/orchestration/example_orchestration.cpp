@@ -23,7 +23,7 @@
 
 #include "pto_orchestration_api.h"
 
-// Helper to encode float as uint64_t for scalar params
+// Helper to encode float as uint64_t for scalar args
 static uint64_t float_to_u64(float f) {
     union {
         float f32;
@@ -70,7 +70,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);
 
     // t0: c = a + b (kernel_id=0, kernel_add) [outer scope]
-    PTOParam params_t0;
+    Arg params_t0;
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
     params_t0.add_output(inter_ci);
@@ -81,7 +81,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     // c flows in from outer scope (outer-scope tensors are visible to inner scopes).
     PTO2_SCOPE() {
         // t1: d = c + 1 (kernel_id=1, kernel_add_scalar)
-        PTOParam params_t1;
+        Arg params_t1;
         params_t1.add_input(c);
         params_t1.add_output(inter_ci);
         params_t1.add_scalar(float_to_u64(1.0f));
@@ -90,7 +90,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         const Tensor& d = outs_t1.get_ref(0);
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
-        PTOParam params_t2;
+        Arg params_t2;
         params_t2.add_input(c);
         params_t2.add_output(inter_ci);
         params_t2.add_scalar(float_to_u64(2.0f));
@@ -99,7 +99,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         const Tensor& e = outs_t2.get_ref(0);
 
         // t3: g = d * e (kernel_id=2, kernel_mul)
-        PTOParam params_t3;
+        Arg params_t3;
         params_t3.add_input(d);
         params_t3.add_input(e);
         params_t3.add_output(inter_ci);
@@ -108,7 +108,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         const Tensor& g = outs_t3.get_ref(0);
 
         // t4: f = g + c (kernel_id=0, kernel_add)
-        PTOParam params_t4;
+        Arg params_t4;
         params_t4.add_input(g);
         params_t4.add_input(c);
         params_t4.add_inout(ext_f);

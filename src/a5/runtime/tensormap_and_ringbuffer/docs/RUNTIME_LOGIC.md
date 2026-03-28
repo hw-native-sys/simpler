@@ -387,8 +387,8 @@ Key members:
 | 2 | Initialize task descriptor, copy parameters |
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers |
 | 4 | **Dependency**: `pto2_add_consumer_to_producer` for each producer found |
-| 5 | **Heap alloc**: `pto2_alloc_packed_buffer` for OUTPUT params (addr=0) |
-| 6 | **Insert**: register OUTPUT/INOUT params in TensorMap |
+| 5 | **Heap alloc**: `pto2_alloc_packed_buffer` for OUTPUT args (addr=0) |
+| 6 | **Insert**: register OUTPUT/INOUT args in TensorMap |
 | 7 | **Fanin**: finalize `fanin_count`; if `init_task_on_submit`, call scheduler's `init_task` |
 | 8 | **Publish**: `STORE_RELEASE(current_task_index)` makes task visible to scanners |
 
@@ -417,8 +417,8 @@ Scopes control the lifetime of intermediate buffers. Each scope:
 ```cpp
 PTO2_SCOPE(rt) {
     // Tasks submitted here belong to this scope
-    pto2_rt_submit_aic_task(rt, FUNC_QK, params, n);
-    pto2_rt_submit_aiv_task(rt, FUNC_SF, params, n);
+    pto2_rt_submit_aic_task(rt, FUNC_QK, args, n);
+    pto2_rt_submit_aiv_task(rt, FUNC_SF, args, n);
 }
 // scope_end: scope reference released from all tasks above
 ```
@@ -572,9 +572,9 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 
 | Function/Macro | Purpose |
 |----------------|---------|
-| `pto2_rt_submit_task(rt, mixed_kernels, params, n)` | Submit a mixed task with `MixedKernels` struct |
-| `pto2_rt_submit_aic_task(rt, kernel_id, params, n)` | Convenience: submit AIC-only task |
-| `pto2_rt_submit_aiv_task(rt, kernel_id, params, n)` | Convenience: submit AIV-only task |
+| `pto2_rt_submit_task(rt, mixed_kernels, args, n)` | Submit a mixed task with `MixedKernels` struct |
+| `pto2_rt_submit_aic_task(rt, kernel_id, args, n)` | Convenience: submit AIC-only task |
+| `pto2_rt_submit_aiv_task(rt, kernel_id, args, n)` | Convenience: submit AIV-only task |
 | `PTO2_SCOPE(rt) { ... }` | RAII scope for buffer lifetime |
 | `pto2_rt_orchestration_done(rt)` | Signal orchestration complete |
 | `pto2_rt_init_tensor_pool(rt)` | Initialize tensor pool for `make_tensor()` |

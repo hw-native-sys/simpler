@@ -22,7 +22,7 @@
  *   - gemm(k) -> add(k): add reads P which gemm produces
  *   - add(k-1) -> add(k): add reads/writes C_view (K accumulation chain)
  *
- * Args layout: [A, B, C]  — shape/dtype/size in TaskArg metadata
+ * Arg layout: [A, B, C]  — shape/dtype/size in TaskArg metadata
  */
 
 #include <stddef.h>
@@ -97,17 +97,17 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                         Tensor P = make_tensor(tile_shapes, 1, DataType::FLOAT32);
 
                         // P = A[m,k] @ B[k,n]
-                        PTOParam params_gemm;
-                        params_gemm.add_input(A_view);
-                        params_gemm.add_input(B_view);
-                        params_gemm.add_output(P);
-                        PTO2TaskId t_gemm = pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE, params_gemm);
+                        Arg args_gemm;
+                        args_gemm.add_input(A_view);
+                        args_gemm.add_input(B_view);
+                        args_gemm.add_output(P);
+                        PTO2TaskId t_gemm = pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE, args_gemm);
 
                         // C[m,n] += P
-                        PTOParam params_add;
-                        params_add.add_inout(C_view);
-                        params_add.add_input(P);
-                        PTO2TaskId t_add = pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD, params_add);
+                        Arg args_add;
+                        args_add.add_inout(C_view);
+                        args_add.add_input(P);
+                        PTO2TaskId t_add = pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD, args_add);
 
                         // gemm -> add: add reads P which gemm produces
                         pto2_rt_add_dependency(rt, t_gemm, t_add);

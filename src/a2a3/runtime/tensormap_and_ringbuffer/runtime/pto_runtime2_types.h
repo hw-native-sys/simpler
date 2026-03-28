@@ -65,7 +65,7 @@
 #define PTO2_ERROR_HEAP_RING_DEADLOCK         2
 #define PTO2_ERROR_FLOW_CONTROL_DEADLOCK      3
 #define PTO2_ERROR_DEP_POOL_OVERFLOW          4
-#define PTO2_ERROR_INVALID_PARAM              5   // PTOParam construction error (invalid params)
+#define PTO2_ERROR_INVALID_ARGS              5   // Arg construction error (invalid args)
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT          100
@@ -366,31 +366,31 @@ struct PTO2TaskPayload {
     int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
     // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
-    Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
+    Tensor tensors[MAX_TENSOR_ARGS];
     // === Pre-built args for AICore dispatch (1152B = 16 tensor ptrs + 128 scalars) ===
     uint64_t dispatch_args[PTO2_DISPATCH_MAX_ARGS];
 
     /**
      * Initialize payload: copy tensors, build dispatch args.
      *
-     * For each param slot, the tensor source is determined by PTOParamType:
+     * For each param slot, the tensor source is determined by TensorArgType:
      * - OUTPUT → use materialized_outputs.output_ptr(out_idx++)
      * - INPUT / INOUT → use refs[i].tensor
      *
-     * @param params                Task parameters (tensors + scalars)
+     * @param args                Task arguments (tensors + scalars)
      * @param materialized_outputs  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const PTOParam& params, const TaskOutputTensors& materialized_outputs) {
-        tensor_count = params.tensor_count;
-        scalar_count = params.scalar_count;
+    void init(const Arg& args, const TaskOutputTensors& materialized_outputs) {
+        tensor_count = args.tensor_count;
+        scalar_count = args.scalar_count;
 
         int32_t out_idx = 0;
-        for (int32_t i = 0; i < params.tensor_count; i++) {
+        for (int32_t i = 0; i < args.tensor_count; i++) {
             const Tensor* src;
-            if (params.tensor_types[i] == PTOParamType::OUTPUT) {
+            if (args.tensor_types[i] == TensorArgType::OUTPUT) {
                 src = materialized_outputs.output_ptr(out_idx++);
             } else {
-                src = params.refs[i].tensor;
+                src = args.refs[i].tensor;
             }
             tensors[i].copy(*src);
             tensors[i].update_start_offset();
@@ -398,8 +398,8 @@ struct PTO2TaskPayload {
         }
         // Bulk-copy scalars into dispatch_args[tensor_count..], rounded up to
         // cache-line boundary (extra bytes within the same CL cost nothing).
-        memcpy(&dispatch_args[params.tensor_count], params.scalars,
-               PTO2_ALIGN_UP(params.scalar_count * sizeof(uint64_t), 64));
+        memcpy(&dispatch_args[args.tensor_count], args.scalars,
+               PTO2_ALIGN_UP(args.scalar_count * sizeof(uint64_t), 64));
     }
 };
 

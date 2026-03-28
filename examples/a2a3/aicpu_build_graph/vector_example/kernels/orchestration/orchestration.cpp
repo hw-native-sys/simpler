@@ -58,34 +58,34 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
 
     PTO2_SCOPE(rt) {
         // t0: c = a + b
-        PTOParam p0;
-        p0.add_input(ext_a);
-        p0.add_input(ext_b);
-        p0.add_output(c);
-        PTO2TaskId t0 = pto2_rt_submit_aiv_task(rt, 0, p0);
+        Arg args_t0;
+        args_t0.add_input(ext_a);
+        args_t0.add_input(ext_b);
+        args_t0.add_output(c);
+        PTO2TaskId t0 = pto2_rt_submit_aiv_task(rt, 0, args_t0);
 
         // t1: d = c + 1.0
-        PTOParam p1;
-        p1.add_input(c);
-        p1.add_output(d);
-        p1.add_scalar(float_to_u64(1.0f));
-        PTO2TaskId t1 = pto2_rt_submit_aiv_task(rt, 1, p1);
+        Arg args_t1;
+        args_t1.add_input(c);
+        args_t1.add_output(d);
+        args_t1.add_scalar(float_to_u64(1.0f));
+        PTO2TaskId t1 = pto2_rt_submit_aiv_task(rt, 1, args_t1);
         pto2_rt_add_dependency(rt, t0, t1);
 
         // t2: e = c + 2.0
-        PTOParam p2;
-        p2.add_input(c);
-        p2.add_output(e);
-        p2.add_scalar(float_to_u64(2.0f));
-        PTO2TaskId t2 = pto2_rt_submit_aiv_task(rt, 1, p2);
+        Arg args_t2;
+        args_t2.add_input(c);
+        args_t2.add_output(e);
+        args_t2.add_scalar(float_to_u64(2.0f));
+        PTO2TaskId t2 = pto2_rt_submit_aiv_task(rt, 1, args_t2);
         pto2_rt_add_dependency(rt, t0, t2);
 
         // t3: f = d * e
-        PTOParam p3;
-        p3.add_input(d);
-        p3.add_input(e);
-        p3.add_output(ext_f);
-        PTO2TaskId t3 = pto2_rt_submit_aiv_task(rt, 2, p3);
+        Arg args_t3;
+        args_t3.add_input(d);
+        args_t3.add_input(e);
+        args_t3.add_output(ext_f);
+        PTO2TaskId t3 = pto2_rt_submit_aiv_task(rt, 2, args_t3);
         pto2_rt_add_dependency(rt, t1, t3);
         pto2_rt_add_dependency(rt, t2, t3);
     }  // scope_end: batch-publish all tasks
