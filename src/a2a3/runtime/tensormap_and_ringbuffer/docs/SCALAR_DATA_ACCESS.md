@@ -18,7 +18,7 @@ T get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[]
 // Typed write: set_tensor_data(tensor, 1, idx, 42.0f);
 template<typename T = uint64_t>
 void set_tensor_data(Tensor& tensor, uint32_t ndims, const uint32_t indices[], T value);
-```
+```text
 
 Both call into the runtime through the ops table — orchestration .so needs no runtime symbol linkage.
 
@@ -26,9 +26,9 @@ Both call into the runtime through the ops table — orchestration .so needs no 
 
 ### 3.1 get_tensor_data Flow
 
-```
+```text
 addr null-check → TensorMap lookup → spin-wait producer COMPLETED → compute flat offset → memcpy read
-```
+```text
 
 - **addr null-check**: `buffer.addr == 0` means unallocated — log error, return 0
 - **TensorMap lookup**: find producer task by `buffer.addr`
@@ -37,9 +37,9 @@ addr null-check → TensorMap lookup → spin-wait producer COMPLETED → comput
 
 ### 3.2 set_tensor_data Flow
 
-```
+```text
 addr null-check → TensorMap lookup → spin-wait producer COMPLETED → spin-wait consumers done → memcpy write
-```
+```text
 
 One extra step versus get_tensor_data: wait for all consumers to finish (`fanout_refcount >= fanout_count - 1`, excluding the scope reference).
 
@@ -54,7 +54,7 @@ One extra step versus get_tensor_data: wait for all consumers to finish (`fanout
 ```cpp
 TensorCreateInfo ci(shapes, ndims, dtype);
 args.add_output(ci, initial_value);
-```
+```text
 
 **Mechanism**:
 1. `add_output(ci, initial_value)` copies `ci` into `Arg` and marks the create-info with an initial value
@@ -82,7 +82,7 @@ const Tensor& scalar_tensor = outs.get_ref(0);
 // Orchestration-side blocking read (waits for kernel completion)
 uint32_t idx[1] = {0};
 float val = get_tensor_data<float>(scalar_tensor, 1, idx);
-```
+```text
 
 **Advantage**: Fully reuses existing TensorMap (producer tracking, fanin/fanout dependencies) — no new infrastructure needed.
 

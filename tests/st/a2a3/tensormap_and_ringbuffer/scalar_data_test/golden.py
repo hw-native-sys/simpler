@@ -1,3 +1,12 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
 """
 Golden script for scalar data dependency test.
 
@@ -58,13 +67,13 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
     # check values written by orchestration via SetTensorData
     check = torch.as_tensor(tensors["check"])
-    check[0] = 2.0    # GetTensorData(c, {0}): c = a + b, c[0] = 2.0+0.0
+    check[0] = 2.0  # GetTensorData(c, {0}): c = a + b, c[0] = 2.0+0.0
     check[1] = 102.0  # GetTensorData(c, {100}): c[100] = 2.0+100.0
-    check[2] = 77.0   # runtime-created scalar output initialized to 77.0
-    check[3] = 77.0   # second noop via add_inout preserves the value
-    check[4] = 79.0   # orchestration arithmetic: 2.0 + 77.0
-    check[5] = 42.0   # Orch set→get round-trip: SetTensorData then GetTensorData
-    check[6] = 12.0   # Orch→AICore RAW: SetTensorData(d,10.0) + kernel_add(d,a) → 10.0+2.0
-    check[7] = 88.0   # WAW+WAR: kernel reads c, SetTensorData(c,88.0) auto-waits for consumer
-    check[8] = 55.0   # External WAR: noop(ext_b INOUT) → SetTensorData(ext_b,55.0) auto-waits
+    check[2] = 77.0  # runtime-created scalar output initialized to 77.0
+    check[3] = 77.0  # second noop via add_inout preserves the value
+    check[4] = 79.0  # orchestration arithmetic: 2.0 + 77.0
+    check[5] = 42.0  # Orch set→get round-trip: SetTensorData then GetTensorData
+    check[6] = 12.0  # Orch→AICore RAW: SetTensorData(d,10.0) + kernel_add(d,a) → 10.0+2.0
+    check[7] = 88.0  # WAW+WAR: kernel reads c, SetTensorData(c,88.0) auto-waits for consumer
+    check[8] = 55.0  # External WAR: noop(ext_b INOUT) → SetTensorData(ext_b,55.0) auto-waits
     # check[9] remains 0.0 (sentinel)
