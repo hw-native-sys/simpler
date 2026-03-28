@@ -1,5 +1,15 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
- * Example: aicpu_orchestration_entry 设备端编排
+ * Example: aicpu_orchestration_entry (device-side orchestration)
  *
  * DAG structure for formula: (a + b + 1)(a + b + 2) + (a + b)
  *   t0: c = a + b     (func_id=0, kernel_add)       [outer scope]
@@ -21,7 +31,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
 // Helper to encode float as uint64_t for scalar args
 static uint64_t float_to_u64(float f) {
@@ -40,9 +50,9 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
-    (void)orch_args;
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
+    const ChipStorageTaskArgs& orch_args) {
+    (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
     };
@@ -53,17 +63,17 @@ PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
  * The executor wraps this call in PTO2_SCOPE, so we are already inside
  * the outer scope on entry.
  */
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
-    (void)orch_thread_num;
-    (void)orch_thread_index;
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+    (void)orch_thread_num;    // NOLINT(readability/casting)
+    (void)orch_thread_index;  // NOLINT(readability/casting)
 
-    // golden shape = kernel shape, use from_task_arg() directly
-    Tensor ext_a = from_task_arg(orch_args[0]);
-    Tensor ext_b = from_task_arg(orch_args[1]);
-    Tensor ext_f = from_task_arg(orch_args[2]);
+    // golden shape = kernel shape, use from_tensor_arg() directly
+    Tensor ext_a = from_tensor_arg(orch_args.tensor(0));
+    Tensor ext_b = from_tensor_arg(orch_args.tensor(1));
+    Tensor ext_f = from_tensor_arg(orch_args.tensor(2));
 
-    uint32_t SIZE = orch_args[0].tensor.shapes[0];
+    uint32_t SIZE = orch_args.tensor(0).shapes[0];
     LOG_INFO("===============SIZE=%u", SIZE);
 
     uint32_t inter_shapes[1] = {SIZE};
@@ -74,7 +84,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     params_t0.add_input(ext_a);
     params_t0.add_input(ext_b);
     params_t0.add_output(inter_ci);
-    TaskOutputTensors outs_t0 = pto2_rt_submit_aiv_task(0, params_t0); // kernel_add
+    TaskOutputTensors outs_t0 = pto2_rt_submit_aiv_task(0, params_t0);  // kernel_add
     const Tensor& c = outs_t0.get_ref(0);
 
     // Inner scope: owns t1, t2, t3, t4; intermediates d, e, g release on scope end.
@@ -85,8 +95,8 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         params_t1.add_input(c);
         params_t1.add_output(inter_ci);
         params_t1.add_scalar(float_to_u64(1.0f));
-        params_t1.add_scalar((uint64_t)3);
-        TaskOutputTensors outs_t1 = pto2_rt_submit_aiv_task(1, params_t1); // kernel_add_scalar
+        params_t1.add_scalar(static_cast<uint64_t>(3));
+        TaskOutputTensors outs_t1 = pto2_rt_submit_aiv_task(1, params_t1);  // kernel_add_scalar
         const Tensor& d = outs_t1.get_ref(0);
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
@@ -94,8 +104,8 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         params_t2.add_input(c);
         params_t2.add_output(inter_ci);
         params_t2.add_scalar(float_to_u64(2.0f));
-        params_t2.add_scalar((uint64_t)3);
-        TaskOutputTensors outs_t2 = pto2_rt_submit_aiv_task(1, params_t2); // kernel_add_scalar
+        params_t2.add_scalar(static_cast<uint64_t>(3));
+        TaskOutputTensors outs_t2 = pto2_rt_submit_aiv_task(1, params_t2);  // kernel_add_scalar
         const Tensor& e = outs_t2.get_ref(0);
 
         // t3: g = d * e (kernel_id=2, kernel_mul)
@@ -103,8 +113,8 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         params_t3.add_input(d);
         params_t3.add_input(e);
         params_t3.add_output(inter_ci);
-        params_t3.add_scalar((uint64_t)3);
-        TaskOutputTensors outs_t3 = pto2_rt_submit_aiv_task(2, params_t3); // kernel_mul
+        params_t3.add_scalar(static_cast<uint64_t>(3));
+        TaskOutputTensors outs_t3 = pto2_rt_submit_aiv_task(2, params_t3);  // kernel_mul
         const Tensor& g = outs_t3.get_ref(0);
 
         // t4: f = g + c (kernel_id=0, kernel_add)
@@ -112,7 +122,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         params_t4.add_input(g);
         params_t4.add_input(c);
         params_t4.add_inout(ext_f);
-        pto2_rt_submit_aiv_task(0, params_t4); // kernel_add
+        pto2_rt_submit_aiv_task(0, params_t4);  // kernel_add
     }  // inner scope ends: releases d, e, g
 }
 

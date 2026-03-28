@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Orchestration Build Graph Types - Data structures for orchestration runtime extensions
  *
@@ -11,8 +21,8 @@
  * without type conflicts (Handshake, TensorPair, HostApi).
  */
 
-#ifndef ORCH_BUILD_GRAPH_PTO_TYPES_H
-#define ORCH_BUILD_GRAPH_PTO_TYPES_H
+#ifndef SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_TYPES_H_
+#define SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_TYPES_H_
 
 #include <stdint.h>
 #include <string.h>
@@ -21,27 +31,21 @@
 #include <arm_neon.h>
 #endif
 
-#include "tensor.h"
+#include "tensor.h"      // NOLINT(build/include_subdir)
+#include "tensor_arg.h"  // NOLINT(build/include_subdir) -- canonical TensorArgType definition
 
 // Task arguments
-#define MAX_TENSOR_ARGS    16      // Maximum tensor parameters per task
-#define MAX_SCALAR_ARGS    128     // Maximum scalar parameters per task
-#define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
-#define PTO2_MAX_INPUTS           16      // Maximum inputs per task
-#define PTO2_MAX_INOUTS           8       // Maximum in-out args per task
+#define MAX_TENSOR_ARGS 16   // Maximum tensor parameters per task
+#define MAX_SCALAR_ARGS 128  // Maximum scalar parameters per task
+#define PTO2_MAX_OUTPUTS 16  // Maximum outputs per task
+#define PTO2_MAX_INPUTS 16   // Maximum inputs per task
+#define PTO2_MAX_INOUTS 8    // Maximum in-out args per task
 
 // =============================================================================
 // Argument Types (for pto_submit_task API)
 // =============================================================================
 
-/**
- * Argument Type - Distinguishes inputs, outputs, and in-place updates
- */
-enum class TensorArgType : int32_t {
-    INPUT = 0,   // Read-only input buffer
-    OUTPUT = 1,  // Write-only output buffer (NULL addr: runtime allocates; non-NULL: use as-is)
-    INOUT = 2,   // Read-then-write: consumer of prior producer + modifier for downstream
-};
+// TensorArgType is defined in tensor_arg.h (included above)
 
 /**
  * Aggregated argument container for pto_submit_task
@@ -86,8 +90,9 @@ struct Arg {
 
     bool check_add_tensor_valid() {
         if (scalar_count != 0) {
-            set_error("add_input/add_output/add_inout called after add_scalar: "
-                      "all tensors must be added before any scalars");
+            set_error(
+                "add_input/add_output/add_inout called after add_scalar: "
+                "all tensors must be added before any scalars");
             return false;
         }
         if (tensor_count >= MAX_TENSOR_ARGS) {
@@ -98,7 +103,9 @@ struct Arg {
     }
 
     void add_input(Tensor& t) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         if (t.buffer.addr == 0) {
             set_error("INPUT tensor must have a non-NULL buffer address");
             return;
@@ -109,14 +116,18 @@ struct Arg {
     }
 
     void add_output(Tensor& t) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         tensors[tensor_count] = &t;
         tensor_types[tensor_count] = TensorArgType::OUTPUT;
         tensor_count++;
     }
 
     void add_inout(Tensor& t) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         if (t.buffer.addr == 0) {
             set_error("INOUT tensor must have a non-NULL buffer address");
             return;
@@ -193,4 +204,4 @@ struct Arg {
     }
 };
 
-#endif  // ORCH_BUILD_GRAPH_PTO_TYPES_H
+#endif  // SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_TYPES_H_

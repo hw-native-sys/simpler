@@ -1,38 +1,49 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Example Orchestration Function Implementation
  *
  * Builds the task graph for formula: (a + b + 1)(a + b + 2)
  *
  * This orchestration function:
- * 1. Receives TaskArg array with tensor metadata (pointers, shapes, dtypes)
+ * 1. Receives ChipStorageTaskArgs with tensor metadata (pointers, shapes, dtypes)
  * 2. Allocates device memory via runtime->host_api
  * 3. Copies input data to device via runtime->host_api
  * 4. Records output tensor for copy-back during finalize
  * 5. Builds the task graph
  */
 
-#include "runtime.h"
-#include "task_arg.h"
 #include <iostream>
+
+#include "runtime.h"    // NOLINT(build/include_subdir)
+#include "task_args.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
-int build_example_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count) {
+int build_example_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     // Validate argument count
     // Expected orch_args: [a, b, f] — 3 tensors
-    if (arg_count < 3) {
-        std::cerr << "build_example_graph: Expected at least 3 args, got " << arg_count << '\n';
+    if (orch_args.tensor_count() < 3) {
+        std::cerr << "build_example_graph: Expected at least 3 tensors, got " << orch_args.tensor_count() << '\n';
         return -1;
     }
 
-    // Extract host pointers, sizes, and element count from TaskArg metadata
-    void* host_a = orch_args[0].data<void>();
-    void* host_b = orch_args[1].data<void>();
-    void* host_f = orch_args[2].data<void>();
-    size_t size_a = orch_args[0].nbytes();
-    size_t size_b = orch_args[1].nbytes();
-    size_t size_f = orch_args[2].nbytes();
-    uint32_t SIZE = orch_args[0].tensor.shapes[0];
+    // Extract host pointers, sizes, and element count from tensor metadata
+    void* host_a = orch_args.tensor(0).data_as<void>();
+    void* host_b = orch_args.tensor(1).data_as<void>();
+    void* host_f = orch_args.tensor(2).data_as<void>();
+    size_t size_a = orch_args.tensor(0).nbytes();
+    size_t size_b = orch_args.tensor(1).nbytes();
+    size_t size_f = orch_args.tensor(2).nbytes();
+    uint32_t SIZE = orch_args.tensor(0).shapes[0];
 
     std::cout << "\n=== build_example_graph: Creating Task Runtime ===" << '\n';
     std::cout << "Formula: (a + b + 1)(a + b + 2)\n";
@@ -99,25 +110,25 @@ int build_example_graph(Runtime* runtime, const TaskArg* orch_args, int arg_coun
     args_t0[0] = reinterpret_cast<uint64_t>(dev_a);  // src0
     args_t0[1] = reinterpret_cast<uint64_t>(dev_b);  // src1
     args_t0[2] = reinterpret_cast<uint64_t>(dev_c);  // out
-    args_t0[3] = SIZE;                                // size
+    args_t0[3] = SIZE;                               // size
     int t0 = runtime->add_task(args_t0, 4, 0, CoreType::AIV);
 
     // Task 1: d = c + 1 (func_id=1: kernel_add_scalar, AIV)
     uint64_t args_t1[4];
     args_t1[0] = reinterpret_cast<uint64_t>(dev_c);  // src
     scalar_converter.f32 = 1.0f;
-    args_t1[1] = scalar_converter.u64;                // scalar=1.0
+    args_t1[1] = scalar_converter.u64;               // scalar=1.0
     args_t1[2] = reinterpret_cast<uint64_t>(dev_d);  // out
-    args_t1[3] = SIZE;                                // size
+    args_t1[3] = SIZE;                               // size
     int t1 = runtime->add_task(args_t1, 4, 1, CoreType::AIV);
 
     // Task 2: e = c + 2 (func_id=1: kernel_add_scalar, AIV)
     uint64_t args_t2[4];
     args_t2[0] = reinterpret_cast<uint64_t>(dev_c);  // src
     scalar_converter.f32 = 2.0f;
-    args_t2[1] = scalar_converter.u64;                // scalar=2.0
+    args_t2[1] = scalar_converter.u64;               // scalar=2.0
     args_t2[2] = reinterpret_cast<uint64_t>(dev_e);  // out
-    args_t2[3] = SIZE;                                // size
+    args_t2[3] = SIZE;                               // size
     int t2 = runtime->add_task(args_t2, 4, 1, CoreType::AIV);
 
     // Task 3: f = d * e (func_id=2: kernel_mul, AIV)
@@ -125,7 +136,7 @@ int build_example_graph(Runtime* runtime, const TaskArg* orch_args, int arg_coun
     args_t3[0] = reinterpret_cast<uint64_t>(dev_d);  // src0
     args_t3[1] = reinterpret_cast<uint64_t>(dev_e);  // src1
     args_t3[2] = reinterpret_cast<uint64_t>(dev_f);  // out
-    args_t3[3] = SIZE;                                // size
+    args_t3[3] = SIZE;                               // size
     int t3 = runtime->add_task(args_t3, 4, 2, CoreType::AIV);
 
     // Add dependencies

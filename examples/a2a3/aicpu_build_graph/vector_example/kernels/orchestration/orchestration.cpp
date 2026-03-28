@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * AICPU orchestration for the vector example.
  *
@@ -15,7 +25,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
 static uint64_t float_to_u64(float f) {
     union {
@@ -29,25 +39,25 @@ static uint64_t float_to_u64(float f) {
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
+    const ChipStorageTaskArgs& orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    PTO2Runtime* rt, const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;
     (void)orch_thread_index;
 
-    // golden shape = kernel shape, use from_task_arg() directly
-    Tensor ext_a = from_task_arg(orch_args[0]);
-    Tensor ext_b = from_task_arg(orch_args[1]);
-    Tensor ext_f = from_task_arg(orch_args[2]);
+    // golden shape = kernel shape, use from_tensor_arg() directly
+    Tensor ext_a = from_tensor_arg(orch_args.tensor(0));
+    Tensor ext_b = from_tensor_arg(orch_args.tensor(1));
+    Tensor ext_f = from_tensor_arg(orch_args.tensor(2));
 
-    uint32_t SIZE = orch_args[0].tensor.shapes[0];
+    uint32_t SIZE = orch_args.tensor(0).shapes[0];
 
     uint32_t shapes[1] = {SIZE};
 

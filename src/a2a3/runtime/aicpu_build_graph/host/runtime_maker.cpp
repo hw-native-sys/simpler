@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Runtime Builder - rt2 Implementation (Device Orchestration)
  *
@@ -5,7 +15,7 @@
  * Supports device orchestration where AICPU thread 3 runs the orchestrator.
  *
  * init_runtime_impl:
- *   - Converts host TaskArg pointers to device pointers (all tensors copied both directions)
+ *   - Converts host tensor pointers to device pointers (all tensors copied both directions)
  *   - Copies orchestration SO to device memory
  *   - Sets up runtime state for device orchestration
  *
@@ -14,28 +24,28 @@
  *   - Frees device memory
  */
 
-#include "../runtime/runtime.h"
-#include "../runtime/pto_shared_memory.h"
-#include "common/unified_log.h"
-#include "common/platform_config.h"
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <sys/time.h>
+
+#include <cerrno>
+#include <cinttypes>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
-#include <cerrno>
-#include <sys/time.h>
+
+#include "../runtime/pto_shared_memory.h"
+#include "../runtime/runtime.h"
+#include "common/platform_config.h"
+#include "common/unified_log.h"
 
 // Helper: return current time in milliseconds
-static long long _now_ms() {
+static int64_t _now_ms() {
     struct timeval tv;
     gettimeofday(&tv, nullptr);
-    return (long long)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+    return static_cast<int64_t>(tv.tv_sec) * 1000 + tv.tv_usec / 1000;
 }
-
-// Max args for device orchestration
-#define RT2_MAX_DEVICE_ARGS 32
 
 /**
  * Parse an environment variable as uint64_t with optional power-of-2 constraint.
@@ -46,15 +56,13 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
     if (!env) return 0;
     char* endptr;
     errno = 0;
-    unsigned long long val = strtoull(env, &endptr, 10);
+    uint64_t val = strtoull(env, &endptr, 10);
     if (errno == ERANGE || endptr == env || *endptr != '\0' || val < min_val) {
-        LOG_WARN("%s=%s invalid (must be a valid integer >= %lu), ignored",
-                 name, env, (unsigned long)min_val);
+        LOG_WARN("%s=%s invalid (must be a valid integer >= %" PRIu64 "), ignored", name, env, min_val);
         return 0;
     }
     if (require_power_of_2 && (val & (val - 1)) != 0) {
-        LOG_WARN("%s=%s invalid (must be a power of 2, >= %lu), ignored",
-                 name, env, (unsigned long)min_val);
+        LOG_WARN("%s=%s invalid (must be a power of 2, >= %" PRIu64 "), ignored", name, env, min_val);
         return 0;
     }
     return static_cast<uint64_t>(val);
@@ -75,22 +83,20 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
  * @param orch_so_binary    Orchestration shared library binary data
  * @param orch_so_size      Size of orchestration SO binary in bytes
  * @param orch_func_name    Name of the orchestration function (unused)
- * @param func_args         Arguments for orchestration
- * @param func_args_count   Number of arguments
+ * @param func_args         Separated tensor/scalar arguments
  * @return 0 on success, -1 on failure
  */
-extern "C" int init_runtime_impl(Runtime *runtime,
-                    const uint8_t* orch_so_binary,
-                    size_t orch_so_size,
-                    const char* orch_func_name,
-                    const TaskArg* orch_args,
-                    int orch_args_count,
-                    const int* kernel_func_ids,
-                    const uint8_t* const* kernel_binaries,
-                    const size_t* kernel_sizes,
-                    int kernel_count) {
+extern "C" int init_runtime_impl(Runtime* runtime,
+    const uint8_t* orch_so_binary,
+    size_t orch_so_size,
+    const char* orch_func_name,
+    const ChipStorageTaskArgs* orch_args,
+    const int* kernel_func_ids,
+    const uint8_t* const* kernel_binaries,
+    const size_t* kernel_sizes,
+    int kernel_count) {
     // Suppress unused parameter warning
-    (void)orch_func_name;
+    (void)orch_func_name;  // NOLINT(readability/casting)
 
     // Validate inputs
     if (runtime == nullptr) {
@@ -99,12 +105,11 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     }
 
     // Register kernel binaries via platform-provided upload function
-    if (kernel_count > 0 && kernel_func_ids != nullptr &&
-        kernel_binaries != nullptr && kernel_sizes != nullptr) {
+    if (kernel_count > 0 && kernel_func_ids != nullptr && kernel_binaries != nullptr && kernel_sizes != nullptr) {
         LOG_INFO("Registering %d kernel(s) in init_runtime_impl", kernel_count);
         for (int i = 0; i < kernel_count; i++) {
-            uint64_t addr = runtime->host_api.upload_kernel_binary(
-                kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
+            uint64_t addr =
+                runtime->host_api.upload_kernel_binary(kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
             if (addr == 0) {
                 LOG_ERROR("Failed to upload kernel binary for func_id=%d", kernel_func_ids[i]);
                 return -1;
@@ -118,49 +123,52 @@ extern "C" int init_runtime_impl(Runtime *runtime,
         return -1;
     }
 
-    if (orch_args_count > RT2_MAX_DEVICE_ARGS) {
-        LOG_ERROR("Too many arguments: %d (max %d)", orch_args_count, RT2_MAX_DEVICE_ARGS);
+    if (orch_args == nullptr) {
+        LOG_ERROR("orch_args pointer is null");
         return -1;
     }
 
-    LOG_INFO("RT2 init: %d arguments, device orchestration mode", orch_args_count);
+    int tensor_count = orch_args->tensor_count();
+    int scalar_count = orch_args->scalar_count();
+    LOG_INFO("RT2 init: %d tensors + %d scalars, device orchestration mode", tensor_count, scalar_count);
 
-    long long t_total_start = _now_ms();
+    int64_t t_total_start = _now_ms();
 
-    // Copy TaskArgs and replace host tensor pointers with device pointers
-    TaskArg device_args[RT2_MAX_DEVICE_ARGS];
+    // Build device args: copy from input, replace host tensor pointers with device pointers
+    ChipStorageTaskArgs device_args;
 
-    long long t_args_start = _now_ms();
-    for (int i = 0; i < orch_args_count; i++) {
-        device_args[i] = orch_args[i];  // Copy entire TaskArg (preserves metadata)
+    int64_t t_args_start = _now_ms();
+    for (int i = 0; i < tensor_count; i++) {
+        ContinuousTensor t = orch_args->tensor(i);
 
-        if (orch_args[i].kind == TaskArgKind::TENSOR) {
-            void* host_ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(orch_args[i].tensor.data));
-            size_t size = static_cast<size_t>(orch_args[i].nbytes());
+        void* host_ptr = reinterpret_cast<void*>(static_cast<uintptr_t>(t.data));
+        size_t size = static_cast<size_t>(t.nbytes());
 
-            void* dev_ptr = runtime->host_api.device_malloc(size);
-            if (dev_ptr == nullptr) {
-                LOG_ERROR("Failed to allocate device memory for arg %d", i);
-                return -1;
-            }
-
-            int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
-            if (rc != 0) {
-                LOG_ERROR("Failed to copy arg %d to device", i);
-                runtime->host_api.device_free(dev_ptr);
-                return -1;
-            }
-            runtime->record_tensor_pair(host_ptr, dev_ptr, size);
-            LOG_INFO("  Arg %d (tensor): %zu bytes at %p", i, size, dev_ptr);
-
-            device_args[i].tensor.data = reinterpret_cast<uint64_t>(dev_ptr);
+        void* dev_ptr = runtime->host_api.device_malloc(size);
+        if (dev_ptr == nullptr) {
+            LOG_ERROR("Failed to allocate device memory for tensor %d", i);
+            return -1;
         }
-        // SCALAR: no action needed, value already copied
+
+        int rc = runtime->host_api.copy_to_device(dev_ptr, host_ptr, size);
+        if (rc != 0) {
+            LOG_ERROR("Failed to copy tensor %d to device", i);
+            runtime->host_api.device_free(dev_ptr);
+            return -1;
+        }
+        runtime->record_tensor_pair(host_ptr, dev_ptr, size);
+        LOG_INFO("  Tensor %d: %zu bytes at %p", i, size, dev_ptr);
+
+        t.data = reinterpret_cast<uint64_t>(dev_ptr);
+        device_args.add_tensor(t);
     }
-    long long t_args_end = _now_ms();
+    for (int i = 0; i < scalar_count; i++) {
+        device_args.add_scalar(orch_args->scalar(i));
+    }
+    int64_t t_args_end = _now_ms();
 
     // Copy orchestration SO to device memory (AICPU cannot access host memory)
-    long long t_so_start = _now_ms();
+    int64_t t_so_start = _now_ms();
     void* dev_so = runtime->host_api.device_malloc(orch_so_size);
     if (dev_so == nullptr) {
         LOG_ERROR("Failed to allocate device memory for orchestration SO");
@@ -178,19 +186,21 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     runtime->set_device_orch_so(orch_so_binary, orch_so_size);
     runtime->record_tensor_pair(nullptr, dev_so, orch_so_size);
     LOG_INFO("Orchestration SO: %zu bytes copied to device", orch_so_size);
-    long long t_so_end = _now_ms();
+    int64_t t_so_end = _now_ms();
 
     // Read ready queue shard count from environment for AICPU scheduler
     {
         const char* env_shards = std::getenv("PTO2_READY_QUEUE_SHARDS");
         if (env_shards) {
             char* endptr;
-            long val = strtol(env_shards, &endptr, 10);
+            int64_t val = strtol(env_shards, &endptr, 10);
             if (endptr != env_shards && *endptr == '\0' && val >= 1 && val <= PLATFORM_MAX_AICPU_THREADS) {
                 runtime->ready_queue_shards = static_cast<int>(val);
             } else {
                 LOG_WARN("PTO2_READY_QUEUE_SHARDS=%s is invalid or out of range [1,%d], using default %d",
-                         env_shards, PLATFORM_MAX_AICPU_THREADS, RUNTIME_DEFAULT_READY_QUEUE_SHARDS);
+                    env_shards,
+                    PLATFORM_MAX_AICPU_THREADS,
+                    RUNTIME_DEFAULT_READY_QUEUE_SHARDS);
                 runtime->ready_queue_shards = RUNTIME_DEFAULT_READY_QUEUE_SHARDS;
             }
         }
@@ -208,26 +218,30 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
     // Read ring buffer size overrides from environment
     {
-        runtime->pto2_task_window_size  = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
-        runtime->pto2_heap_size         = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
-        runtime->pto2_dep_pool_size     = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
+        runtime->pto2_task_window_size = parse_env_uint64("PTO2_RING_TASK_WINDOW", 4, true);
+        runtime->pto2_heap_size = parse_env_uint64("PTO2_RING_HEAP", 1024, true);
+        runtime->pto2_dep_pool_size = parse_env_uint64("PTO2_RING_DEP_POOL", 4, false);
         if (runtime->pto2_task_window_size || runtime->pto2_heap_size || runtime->pto2_dep_pool_size) {
-            LOG_INFO("Ring buffer overrides: task_window=%lu heap=%lu dep_pool=%lu",
-                     (unsigned long)(runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE),
-                     (unsigned long)(runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE),
-                     (unsigned long)(runtime->pto2_dep_pool_size ? runtime->pto2_dep_pool_size : PTO2_DEP_LIST_POOL_SIZE));
+            LOG_INFO("Ring buffer overrides: task_window=%" PRIu64 " heap=%" PRIu64 " dep_pool=%" PRIu64,
+                static_cast<uint64_t>(
+                    runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE),
+                static_cast<uint64_t>(runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE),
+                static_cast<uint64_t>(runtime->pto2_dep_pool_size
+                                          ? runtime->pto2_dep_pool_size
+                                          : PTO2_DEP_LIST_POOL_SIZE));  // NOLINT(whitespace/line_length)
         }
     }
 
     // Resolve effective sizes (env override or compile-time default)
     uint64_t eff_heap_size = runtime->pto2_heap_size ? runtime->pto2_heap_size : PTO2_HEAP_SIZE;
-    uint64_t eff_task_window_size = runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE;
+    uint64_t eff_task_window_size =
+        runtime->pto2_task_window_size ? runtime->pto2_task_window_size : PTO2_TASK_WINDOW_SIZE;
 
     // Allocate GM heap for orchestrator output buffers (all rings combined)
     uint64_t total_heap_size = eff_heap_size * PTO2_MAX_RING_DEPTH;
-    long long t_heap_start = _now_ms();
+    int64_t t_heap_start = _now_ms();
     void* gm_heap = runtime->host_api.device_malloc(total_heap_size);
-    long long t_heap_end = _now_ms();
+    int64_t t_heap_end = _now_ms();
     if (gm_heap == nullptr) {
         LOG_ERROR("Failed to allocate GM heap");
         return -1;
@@ -236,10 +250,10 @@ extern "C" int init_runtime_impl(Runtime *runtime,
     runtime->set_pto2_gm_heap(gm_heap);
 
     // Allocate PTO2 shared memory
-    long long t_sm_start = _now_ms();
+    int64_t t_sm_start = _now_ms();
     uint64_t sm_size = pto2_sm_calculate_size(eff_task_window_size);
     void* sm_ptr = runtime->host_api.device_malloc(sm_size);
-    long long t_sm_end = _now_ms();
+    int64_t t_sm_end = _now_ms();
     if (sm_ptr == nullptr) {
         LOG_ERROR("Failed to allocate PTO2 shared memory");
         return -1;
@@ -249,16 +263,16 @@ extern "C" int init_runtime_impl(Runtime *runtime,
 
     // Set up device orchestration state
     runtime->set_orch_built_on_host(false);
-    runtime->set_orch_args(device_args, orch_args_count);
+    runtime->set_orch_args(device_args);
 
-    LOG_INFO("Device orchestration ready: %d args", orch_args_count);
+    LOG_INFO("Device orchestration ready: %d tensors + %d scalars", tensor_count, scalar_count);
 
-    long long t_total_end = _now_ms();
-    LOG_INFO("TIMING: args_malloc_copy = %lldms", t_args_end - t_args_start);
-    LOG_INFO("TIMING: orch_so_copy = %lldms", t_so_end - t_so_start);
-    LOG_INFO("TIMING: gm_heap_alloc(1GB) = %lldms", t_heap_end - t_heap_start);
-    LOG_INFO("TIMING: shared_mem_alloc = %lldms", t_sm_end - t_sm_start);
-    LOG_INFO("TIMING: total_init_runtime_impl = %lldms", t_total_end - t_total_start);
+    int64_t t_total_end = _now_ms();
+    LOG_INFO("TIMING: args_malloc_copy = %" PRId64 "ms", t_args_end - t_args_start);
+    LOG_INFO("TIMING: orch_so_copy = %" PRId64 "ms", t_so_end - t_so_start);
+    LOG_INFO("TIMING: gm_heap_alloc(1GB) = %" PRId64 "ms", t_heap_end - t_heap_start);
+    LOG_INFO("TIMING: shared_mem_alloc = %" PRId64 "ms", t_sm_end - t_sm_start);
+    LOG_INFO("TIMING: total_init_runtime_impl = %" PRId64 "ms", t_total_end - t_total_start);
 
     return 0;
 }
@@ -274,7 +288,7 @@ extern "C" int init_runtime_impl(Runtime *runtime,
  * @param runtime  Pointer to Runtime
  * @return 0 on success, -1 on failure
  */
-extern "C" int validate_runtime_impl(Runtime *runtime) {
+extern "C" int validate_runtime_impl(Runtime* runtime) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -303,7 +317,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
             graph_out_ptr = host_header.graph_output_ptr;
             graph_out_size = host_header.graph_output_size;
             if (graph_out_ptr != 0) {
-                LOG_INFO("Graph output buffer: ptr=0x%lx, size=%lu", (unsigned long)graph_out_ptr, (unsigned long)graph_out_size);
+                LOG_INFO("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
             }
         } else {
             LOG_WARN("Failed to copy PTO2 header from device");

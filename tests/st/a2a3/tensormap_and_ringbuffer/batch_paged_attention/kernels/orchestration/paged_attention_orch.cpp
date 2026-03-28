@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Batch Paged Attention Orchestration Function - Production Scale
  *
@@ -30,7 +40,10 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"
+#include <algorithm>
+#include <cinttypes>
+
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_QK_MATMUL 0
 #define FUNC_SOFTMAX_PREPARE 1
@@ -41,42 +54,40 @@
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
-    (void)orch_args;
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
+    const ChipStorageTaskArgs& orch_args) {
+    (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+    // Read dimensions from tensor metadata
+    uint64_t batch = orch_args.tensor(0).shapes[0];
+    uint64_t num_heads = orch_args.tensor(0).shapes[1];
+    uint64_t head_dim = orch_args.tensor(0).shapes[2];
+    DataType data_type = orch_args.tensor(0).dtype;
 
-    // Read dimensions from TaskArg tensor metadata
-    uint64_t batch     = orch_args[0].tensor.shapes[0];
-    uint64_t num_heads = orch_args[0].tensor.shapes[1];
-    uint64_t head_dim  = orch_args[0].tensor.shapes[2];
-    DataType data_type = orch_args[0].tensor.dtype;
+    uint64_t block_size = orch_args.tensor(1).shapes[1];
+    uint64_t block_num = orch_args.tensor(3).shapes[1];
 
-    uint64_t block_size = orch_args[1].tensor.shapes[1];
-    uint64_t block_num  = orch_args[3].tensor.shapes[1];
-
-    uint64_t scale_value = orch_args[6].scalar;
+    uint64_t scale_value = orch_args.scalar(0);
 
     uint64_t q_tile = std::min(num_heads, 128UL);
     uint64_t q_loop = (num_heads + q_tile - 1) / q_tile;
     uint64_t elem_size = get_element_size(data_type);
 
-    LOG_INFO("batch_paged_attention: batch=%lu, num_heads=%lu",
-             (unsigned long)batch, (unsigned long)num_heads);
+    LOG_INFO("batch_paged_attention: batch=%" PRIu64 ", num_heads=%" PRIu64, batch, num_heads);
 
-    void* query_ptr = orch_args[0].data<void>();
-    void* kc_ptr    = orch_args[1].data<void>();
-    void* vc_ptr    = orch_args[2].data<void>();
-    void* out_ptr   = orch_args[5].data<void>();
+    void* query_ptr = orch_args.tensor(0).data_as<void>();
+    void* kc_ptr = orch_args.tensor(1).data_as<void>();
+    void* vc_ptr = orch_args.tensor(2).data_as<void>();
+    void* out_ptr = orch_args.tensor(5).data_as<void>();
 
-    int* host_block_table  = orch_args[3].data<int>();
-    int* host_context_lens = orch_args[4].data<int>();
+    int* host_block_table = orch_args.tensor(3).data_as<int>();
+    int* host_context_lens = orch_args.tensor(4).data_as<int>();
 
     uint64_t max_bn = 0;
     for (uint64_t b = 0; b < batch; b++) {
@@ -85,20 +96,20 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         if (bn_b > max_bn) max_bn = bn_b;
     }
 
-    uint32_t query_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
-    uint64_t total_blocks_count = orch_args[1].tensor.shapes[0];
+    uint32_t query_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
+    uint64_t total_blocks_count = orch_args.tensor(1).shapes[0];
     uint64_t kv_total_rows = total_blocks_count * block_size;
-    uint32_t key_cache_shapes[2] = {(uint32_t)kv_total_rows, (uint32_t)head_dim};
-    uint32_t value_cache_shapes[2] = {(uint32_t)kv_total_rows, (uint32_t)head_dim};
-    uint32_t out_shapes[2] = {(uint32_t)(batch * num_heads), (uint32_t)head_dim};
+    uint32_t key_cache_shapes[2] = {static_cast<uint32_t>(kv_total_rows), static_cast<uint32_t>(head_dim)};
+    uint32_t value_cache_shapes[2] = {static_cast<uint32_t>(kv_total_rows), static_cast<uint32_t>(head_dim)};
+    uint32_t out_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
 
     Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
     Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
     Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
     Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32, true);
 
-    uint64_t bt_addr = (uint64_t)(uintptr_t)host_block_table;
-    uint64_t cl_addr = (uint64_t)(uintptr_t)host_context_lens;
+    uint64_t bt_addr = reinterpret_cast<uintptr_t>(host_block_table);
+    uint64_t cl_addr = reinterpret_cast<uintptr_t>(host_context_lens);
 
     constexpr uint64_t IN_CORE_BATCH = 16;
     uint64_t num_chunks = (batch + IN_CORE_BATCH - 1) / IN_CORE_BATCH;
@@ -112,8 +123,8 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
             uint64_t batch_start = chunk_idx * IN_CORE_BATCH;
 
             PTO2_SCOPE() {
-                uint32_t oi_acc_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)head_dim};
-                uint32_t scalar_acc_shapes[1] = {(uint32_t)(chunk_bc * q_tile)};
+                uint32_t oi_acc_shapes[2] = {static_cast<uint32_t>(chunk_bc * q_tile), static_cast<uint32_t>(head_dim)};
+                uint32_t scalar_acc_shapes[1] = {static_cast<uint32_t>(chunk_bc * q_tile)};
                 TensorCreateInfo oi_batch_ci(oi_acc_shapes, 2, DataType::FLOAT32);
                 TensorCreateInfo scalar_acc_ci(scalar_acc_shapes, 1, DataType::FLOAT32);
 
@@ -127,9 +138,9 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
                 const Tensor& mi_batch = hub_outs.get_ref(2);
 
                 // Inner-loop create infos: shapes are loop-invariant, hoist out of bn loop
-                uint32_t sij_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)block_size};
-                uint32_t vec_shapes[1] = {(uint32_t)(chunk_bc * q_tile)};
-                uint32_t oi_new_shapes[2] = {(uint32_t)(chunk_bc * q_tile), (uint32_t)head_dim};
+                uint32_t sij_shapes[2] = {static_cast<uint32_t>(chunk_bc * q_tile), static_cast<uint32_t>(block_size)};
+                uint32_t vec_shapes[1] = {static_cast<uint32_t>(chunk_bc * q_tile)};
+                uint32_t oi_new_shapes[2] = {static_cast<uint32_t>(chunk_bc * q_tile), static_cast<uint32_t>(head_dim)};
                 TensorCreateInfo sij_ci(sij_shapes, 2, DataType::FLOAT32);
                 TensorCreateInfo pij_ci(sij_shapes, 2, data_type);
                 TensorCreateInfo vec_ci(vec_shapes, 1, DataType::FLOAT32);
@@ -201,10 +212,13 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         }
     }
 
-    LOG_INFO("batch_paged_attention: %lu tasks (batch=%lu, max_bn=%lu, chunks=%lu, IN_CORE_BATCH=%lu)",
-             (unsigned long)(num_chunks * (1 + max_bn * 4)),
-             (unsigned long)batch, (unsigned long)max_bn,
-             (unsigned long)num_chunks, (unsigned long)IN_CORE_BATCH);
+    LOG_INFO("batch_paged_attention: %" PRIu64 " tasks (batch=%" PRIu64 ", max_bn=%" PRIu64 ", chunks=%" PRIu64
+             ", IN_CORE_BATCH=%" PRIu64 ")",
+        static_cast<uint64_t>(num_chunks * (1 + max_bn * 4)),
+        batch,
+        max_bn,
+        num_chunks,
+        IN_CORE_BATCH);
 }
 
 }  // extern "C"

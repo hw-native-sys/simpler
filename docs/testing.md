@@ -85,7 +85,6 @@ examples/              # Small examples (sim + onboard)
 GoogleTest-based tests for shared components (`src/common/task_interface/` and `src/{arch}/runtime/common/`):
 
 - `test_data_type.cpp` — DataType enum, get_element_size(), get_dtype_name()
-- `test_task_arg.cpp` — TaskArg packing/unpacking, byte alignment, nbytes(), DMA copy semantics
 
 ```bash
 cmake -B tests/cpp/build -S tests/cpp
@@ -97,7 +96,7 @@ ctest --test-dir tests/cpp/build --output-on-failure
 
 Tests for the nanobind extension and the Python build pipeline:
 
-- `test_task_interface.py` — DataType, TaskArg, TaskArgArray, torch integration
+- `test_task_interface.py` — DataType, ContinuousTensor, ChipStorageTaskArgs, torch integration
 - `test_runtime_builder.py` — RuntimeBuilder discovery, error handling, build logic (mocked), and real compilation integration tests
 
 ```bash

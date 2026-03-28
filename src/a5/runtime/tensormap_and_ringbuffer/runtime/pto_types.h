@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Orchestration Build Graph Types - Data structures for orchestration runtime extensions
  *
@@ -12,8 +22,8 @@
  * without type conflicts (Handshake, TensorPair, HostApi).
  */
 
-#ifndef ORCH_BUILD_GRAPH_PTO_TYPES_H
-#define ORCH_BUILD_GRAPH_PTO_TYPES_H
+#ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_TYPES_H_
+#define SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_TYPES_H_
 
 #include <stdint.h>
 #include <string.h>
@@ -22,14 +32,15 @@
 #include <arm_neon.h>
 #endif
 
-#include "tensor.h"
+#include "tensor.h"      // NOLINT(build/include_subdir)
+#include "tensor_arg.h"  // NOLINT(build/include_subdir) -- canonical TensorArgType definition
 
 // Task arguments
-#define MAX_TENSOR_ARGS    16      // Maximum tensor arguments per task
-#define MAX_SCALAR_ARGS    128     // Maximum scalar arguments per task
-#define PTO2_MAX_OUTPUTS          16      // Maximum outputs per task
-#define PTO2_MAX_INPUTS           16      // Maximum inputs per task
-#define PTO2_MAX_INOUTS           8       // Maximum in-out args per task
+#define MAX_TENSOR_ARGS 16   // Maximum tensor arguments per task
+#define MAX_SCALAR_ARGS 128  // Maximum scalar arguments per task
+#define PTO2_MAX_OUTPUTS 16  // Maximum outputs per task
+#define PTO2_MAX_INPUTS 16   // Maximum inputs per task
+#define PTO2_MAX_INOUTS 8    // Maximum in-out args per task
 
 // =============================================================================
 // Task Output Tensors (return value from submit)
@@ -48,7 +59,7 @@
  * binding get_ref() on an rvalue is compile-time rejected to prevent dangling.
  */
 class TaskOutputTensors {
-public:
+public:  // NOLINT(whitespace/indent)
     TaskOutputTensors() : output_count(0) {}
 
     uint32_t output_count;
@@ -57,21 +68,19 @@ public:
     uint32_t size() const { return output_count; }
 
     /// Borrow a materialized output tensor by index (lvalue only).
-    const Tensor& get_ref(uint32_t index) const & {
+    const Tensor& get_ref(uint32_t index) const& {
         always_assert(index < output_count);
         return *reinterpret_cast<const Tensor*>(_storage + index * sizeof(Tensor));
     }
-    const Tensor& get_ref(uint32_t index) const && = delete;
+    const Tensor& get_ref(uint32_t index) const&& = delete;
 
     /// Runtime-internal: writable pointer for materialization.
-    Tensor* output_ptr(uint32_t index) {
-        return reinterpret_cast<Tensor*>(_storage + index * sizeof(Tensor));
-    }
+    Tensor* output_ptr(uint32_t index) { return reinterpret_cast<Tensor*>(_storage + index * sizeof(Tensor)); }
     const Tensor* output_ptr(uint32_t index) const {
         return reinterpret_cast<const Tensor*>(_storage + index * sizeof(Tensor));
     }
 
-private:
+private:  // NOLINT(whitespace/indent)
     alignas(Tensor) unsigned char _storage[PTO2_MAX_OUTPUTS * sizeof(Tensor)];
 };
 
@@ -79,14 +88,7 @@ private:
 // Argument Types (for pto_submit_task API)
 // =============================================================================
 
-/**
- * Parameter Type - Distinguishes inputs, outputs, and in-place updates
- */
-enum class TensorArgType : int32_t {
-    INPUT = 0,   // Read-only input buffer
-    OUTPUT = 1,  // Write-only output from TensorCreateInfo (runtime allocates)
-    INOUT = 2,   // Read-then-write: consumer of prior producer + modifier for downstream
-};
+// TensorArgType is defined in tensor_arg.h (included above)
 
 /**
  * Tagged union for a single Arg slot — either a Tensor* or a TensorCreateInfo value.
@@ -144,8 +146,9 @@ struct Arg {
 
     bool check_add_tensor_valid() {
         if (scalar_count != 0) {
-            set_error("add_input/add_output/add_inout called after add_scalar: "
-                      "all tensors must be added before any scalars");
+            set_error(
+                "add_input/add_output/add_inout called after add_scalar: "
+                "all tensors must be added before any scalars");
             return false;
         }
         if (tensor_count >= MAX_TENSOR_ARGS) {
@@ -156,7 +159,9 @@ struct Arg {
     }
 
     void add_input(const Tensor& t) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         refs[tensor_count].tensor = &t;
         tensor_types[tensor_count] = TensorArgType::INPUT;
         tensor_count++;
@@ -165,7 +170,9 @@ struct Arg {
     /// Standard future-output path: runtime allocates buffer from heap,
     /// materializes Tensor into TaskOutputTensors.
     void add_output(const TensorCreateInfo& ci) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         refs[tensor_count].create_info = ci;
         tensor_types[tensor_count] = TensorArgType::OUTPUT;
         tensor_count++;
@@ -174,7 +181,9 @@ struct Arg {
     /// Runtime-allocated output with an initial element value replicated
     /// across the full buffer after HeapRing allocation.
     void add_output(const TensorCreateInfo& ci, uint64_t initial_value) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         refs[tensor_count].create_info = ci;
         refs[tensor_count].create_info.set_initial_value(initial_value);
         tensor_types[tensor_count] = TensorArgType::OUTPUT;
@@ -182,7 +191,9 @@ struct Arg {
     }
 
     void add_inout(const Tensor& t) {
-        if (!check_add_tensor_valid()) { return; }
+        if (!check_add_tensor_valid()) {
+            return;
+        }
         refs[tensor_count].tensor = &t;
         tensor_types[tensor_count] = TensorArgType::INOUT;
         tensor_count++;
@@ -255,4 +266,4 @@ struct Arg {
     }
 };
 
-#endif  // ORCH_BUILD_GRAPH_PTO_TYPES_H
+#endif  // SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_PTO_TYPES_H_

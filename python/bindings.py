@@ -51,8 +51,6 @@ from ctypes import (
     c_int,
     c_size_t,
     c_uint8,
-    c_uint32,
-    c_uint64,
     c_void_p,
     cast,
 )
@@ -61,39 +59,6 @@ from typing import Optional, Union
 
 # Module-level library reference
 _lib = None
-
-
-# ============================================================================
-# TaskArg ctypes mirror (must match C++ struct TaskArg, 48 bytes)
-# ============================================================================
-TASK_ARG_MAX_DIMS = 5
-
-
-class _TaskArgTensorC(ctypes.Structure):
-    _fields_ = [
-        ("data", c_uint64),
-        ("shapes", c_uint32 * TASK_ARG_MAX_DIMS),
-        ("ndims", c_uint32),
-        ("dtype", c_uint32),
-    ]
-
-
-class _TaskArgUnionC(ctypes.Union):
-    _fields_ = [
-        ("tensor", _TaskArgTensorC),
-        ("scalar", c_uint64),
-    ]
-
-
-class TaskArgC(ctypes.Structure):
-    _fields_ = [
-        ("kind", c_uint32),
-        ("_pad", c_uint32),
-        ("u", _TaskArgUnionC),
-    ]
-
-
-assert ctypes.sizeof(TaskArgC) == 48
 
 
 # ============================================================================
@@ -143,8 +108,7 @@ class RuntimeLibraryLoader:
             POINTER(c_uint8),  # orch_so_binary
             c_size_t,  # orch_so_size
             c_char_p,  # orch_func_name
-            POINTER(TaskArgC),  # orch_args
-            c_int,  # orch_args_count
+            c_void_p,  # orch_args (ChipStorageTaskArgs*)
             POINTER(c_int),  # kernel_func_ids (array of func_ids)
             POINTER(POINTER(c_uint8)),  # kernel_binaries (array of binary pointers)
             POINTER(c_size_t),  # kernel_sizes (array of sizes)
@@ -263,7 +227,7 @@ class Runtime:
         Args:
             orch_so_binary: Orchestration shared library binary data
             orch_func_name: Name of the orchestration function to call
-            orch_args: List of TaskArgC structs for orchestration
+            orch_args: ChipStorageTaskArgs with orchestration arguments
             kernel_binaries: List of (func_id, binary_data) tuples for kernel registration
 
         Raises:
@@ -271,40 +235,19 @@ class Runtime:
         """
 
         orch_args = orch_args or []
-        orch_args_count = len(orch_args)
 
-        # Convert orch_args to ctypes array.
-        # Accept either a nanobind ChipStorageTaskArgs or a plain list of TaskArgC structs.
+        # Convert orch_args to ctypes-compatible form for the C API.
+        # ChipStorageTaskArgs (nanobind): pass its C++ object address directly.
         from _task_interface import (  # pyright: ignore[reportMissingImports]
             ChipStorageTaskArgs as _NbChipStorageTaskArgs,  # noqa: PLC0415
         )
 
         if isinstance(orch_args, _NbChipStorageTaskArgs):
-            # Bridge: ChipStorageTaskArgs → flat TaskArgC[] (tensors first, scalars after)
-            orch_args_count = orch_args.tensor_count() + orch_args.scalar_count()  # pyright: ignore[reportAttributeAccessIssue]
-            if orch_args_count > 0:
-                orch_args_array = (TaskArgC * orch_args_count)()
-                idx = 0
-                for i in range(orch_args.tensor_count()):  # pyright: ignore[reportAttributeAccessIssue]
-                    ta = orch_args.tensor(i)  # pyright: ignore[reportAttributeAccessIssue]
-                    orch_args_array[idx].kind = 0  # TENSOR
-                    orch_args_array[idx].u.tensor.data = ta.data
-                    shapes = ta.shapes
-                    for d in range(ta.ndims):
-                        orch_args_array[idx].u.tensor.shapes[d] = shapes[d]
-                    orch_args_array[idx].u.tensor.ndims = ta.ndims
-                    orch_args_array[idx].u.tensor.dtype = ta.dtype.value
-                    idx += 1
-                for i in range(orch_args.scalar_count()):  # pyright: ignore[reportAttributeAccessIssue]
-                    orch_args_array[idx].kind = 1  # SCALAR
-                    orch_args_array[idx].u.scalar = orch_args.scalar(i)  # pyright: ignore[reportAttributeAccessIssue]
-                    idx += 1
-            else:
-                orch_args_array = None
-        elif orch_args_count > 0:
-            orch_args_array = (TaskArgC * orch_args_count)(*orch_args)
+            orch_args_ptr = c_void_p(orch_args.__ptr__())  # pyright: ignore[reportAttributeAccessIssue]
+        elif len(orch_args) == 0:
+            orch_args_ptr = None
         else:
-            orch_args_array = None
+            raise TypeError(f"orch_args must be a ChipStorageTaskArgs, got {type(orch_args)}")
 
         # Convert orch_so_binary to ctypes array
         orch_so_array = (c_uint8 * len(orch_so_binary)).from_buffer_copy(orch_so_binary)
@@ -339,8 +282,7 @@ class Runtime:
             orch_so_array,
             len(orch_so_binary),
             orch_func_name.encode("utf-8"),
-            orch_args_array,
-            orch_args_count,
+            orch_args_ptr,
             func_ids_array,
             binaries_array,
             sizes_array,

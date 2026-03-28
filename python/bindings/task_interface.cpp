@@ -13,7 +13,7 @@
  *
  * Wraps DataType, ContinuousTensor, ChipStorageTaskArgs, DynamicTaskArgs,
  * TaggedTaskArgs, TensorArgType, and helper functions from
- * data_type.h / tensor_arg.h / separated_args.h.
+ * data_type.h / tensor_arg.h / task_args.h.
  */
 
 #include <nanobind/nanobind.h>
@@ -26,9 +26,9 @@
 #include <stdexcept>
 #include <string>
 
-#include "data_type.h"       // NOLINT(build/include_subdir)
-#include "separated_args.h"  // NOLINT(build/include_subdir)
-#include "tensor_arg.h"      // NOLINT(build/include_subdir)
+#include "data_type.h"   // NOLINT(build/include_subdir)
+#include "task_args.h"   // NOLINT(build/include_subdir)
+#include "tensor_arg.h"  // NOLINT(build/include_subdir)
 
 namespace nb = nanobind;
 
@@ -180,7 +180,12 @@ NB_MODULE(_task_interface, m) {
         .def(
             "__len__",
             [](const ChipStorageTaskArgs& self) { return self.tensor_count() + self.scalar_count(); },
-            "Return total number of arguments (tensors + scalars).");
+            "Return total number of arguments (tensors + scalars).")
+
+        .def(
+            "__ptr__",
+            [](const ChipStorageTaskArgs& self) -> uint64_t { return reinterpret_cast<uint64_t>(&self); },
+            "Return the memory address of the underlying C++ object.");
 
     // --- TensorArgType enum ---
     nb::enum_<TensorArgType>(m, "TensorArgType")

@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Scalar Data Dependency Test Orchestration
  *
@@ -24,9 +34,9 @@
 #include <stdint.h>
 #include <string.h>
 
-#include "pto_orchestration_api.h"
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
-#define FUNC_ADD  0
+#define FUNC_ADD 0
 #define FUNC_NOOP 1
 
 static uint64_t float_to_u64(float f) {
@@ -50,30 +60,27 @@ static float u64_to_float(uint64_t u) {
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
-    (void)orch_args;
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
+    const ChipStorageTaskArgs& orch_args) {
+    (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 4,  // a, b, result, check
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(TaskArg* orch_args,
-                               int orch_thread_num,
-                               int orch_thread_index) {
-    (void)orch_thread_num;
-    (void)orch_thread_index;
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+    (void)orch_thread_num;    // NOLINT(readability/casting)
+    (void)orch_thread_index;  // NOLINT(readability/casting)
 
     // External tensors from golden.py
-    Tensor ext_a = from_task_arg(orch_args[0]);
-    Tensor ext_b = from_task_arg(orch_args[1]);
-    Tensor ext_result = from_task_arg(orch_args[2]);
-    Tensor ext_check = from_task_arg(orch_args[3]);
+    Tensor ext_a = from_tensor_arg(orch_args.tensor(0));
+    Tensor ext_b = from_tensor_arg(orch_args.tensor(1));
+    Tensor ext_result = from_tensor_arg(orch_args.tensor(2));
+    Tensor ext_check = from_tensor_arg(orch_args.tensor(3));
 
-    uint32_t SIZE = orch_args[0].tensor.shapes[0];
-    LOG_INFO("scalar_data_test: SIZE=%u, check_size=%u",
-             SIZE, orch_args[3].tensor.shapes[0]);
+    uint32_t SIZE = orch_args.tensor(0).shapes[0];
+    LOG_INFO("scalar_data_test: SIZE=%u, check_size=%u", SIZE, orch_args.tensor(3).shapes[0]);
 
     uint32_t inter_shapes[1] = {SIZE};
     TensorCreateInfo inter_ci(inter_shapes, 1, DataType::FLOAT32);
@@ -95,7 +102,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     uint32_t idx[1] = {0};
     uint64_t c0_raw = get_tensor_data(c, 1, idx);
     float c0_val = u64_to_float(c0_raw);
-    LOG_INFO("get_tensor_data(c, {0}) = %f (expected 2.0)", (double)c0_val);
+    LOG_INFO("get_tensor_data(c, {0}) = %f (expected 2.0)", static_cast<double>(c0_val));
 
     uint32_t check_idx[1] = {0};
     set_tensor_data(ext_check, 1, check_idx, c0_raw);
@@ -106,8 +113,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     // =========================================================
     idx[0] = 100;
     uint64_t c100_raw = get_tensor_data(c, 1, idx);
-    LOG_INFO("get_tensor_data(c, {100}) = %f (expected 102.0)",
-             (double)u64_to_float(c100_raw));
+    LOG_INFO("get_tensor_data(c, {100}) = %f (expected 102.0)", static_cast<double>(u64_to_float(c100_raw)));
 
     check_idx[0] = 1;
     set_tensor_data(ext_check, 1, check_idx, c100_raw);
@@ -131,8 +137,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     idx[0] = 0;
     uint64_t s0_raw = get_tensor_data(scalar_tensor, 1, idx);
     float s0_val = u64_to_float(s0_raw);
-    LOG_INFO("get_tensor_data(scalar_tensor, {0}) after init = %f (expected 77.0)",
-             (double)s0_val);
+    LOG_INFO("get_tensor_data(scalar_tensor, {0}) after init = %f (expected 77.0)", static_cast<double>(s0_val));
 
     check_idx[0] = 2;
     set_tensor_data(ext_check, 1, check_idx, s0_raw);
@@ -153,7 +158,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     // =========================================================
     uint64_t s1_raw = get_tensor_data(scalar_tensor, 1, idx);
     LOG_INFO("get_tensor_data(scalar_tensor, {0}) after 2nd noop = %f (expected 77.0)",
-             (double)u64_to_float(s1_raw));
+        static_cast<double>(u64_to_float(s1_raw)));  // NOLINT(whitespace/line_length)
 
     check_idx[0] = 3;
     set_tensor_data(ext_check, 1, check_idx, s1_raw);
@@ -164,7 +169,9 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     // =========================================================
     float combined = c0_val + s0_val;  // 2.0 + 77.0 = 79.0
     LOG_INFO("Orchestration arithmetic: %f + %f = %f",
-             (double)c0_val, (double)s0_val, (double)combined);
+        static_cast<double>(c0_val),
+        static_cast<double>(s0_val),
+        static_cast<double>(combined));  // NOLINT(whitespace/line_length)
 
     check_idx[0] = 4;
     set_tensor_data(ext_check, 1, check_idx, float_to_u64(combined));
@@ -177,8 +184,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     set_tensor_data(scalar_tensor, 1, idx, float_to_u64(42.0f));
     uint64_t rw_raw = get_tensor_data(scalar_tensor, 1, idx);
     float rw_val = u64_to_float(rw_raw);
-    LOG_INFO("set_tensor_data→get_tensor_data round-trip = %f (expected 42.0)",
-             (double)rw_val);
+    LOG_INFO("set_tensor_data→get_tensor_data round-trip = %f (expected 42.0)", static_cast<double>(rw_val));
 
     check_idx[0] = 5;
     set_tensor_data(ext_check, 1, check_idx, rw_raw);
@@ -204,8 +210,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     const Tensor& e = e_outs.get_ref(0);
 
     uint64_t e0_raw = get_tensor_data(e, 1, idx);
-    LOG_INFO("Orch→AICore RAW: e[0] = %f (expected 12.0)",
-             (double)u64_to_float(e0_raw));
+    LOG_INFO("Orch→AICore RAW: e[0] = %f (expected 12.0)", static_cast<double>(u64_to_float(e0_raw)));
 
     check_idx[0] = 6;
     set_tensor_data(ext_check, 1, check_idx, e0_raw);
@@ -230,7 +235,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
         args.add_input(c);
         args.add_input(ext_b);
         args.add_output(inter_ci);
-        (void)pto2_rt_submit_aiv_task(FUNC_ADD, args);
+        (void)pto2_rt_submit_aiv_task(FUNC_ADD, args);  // NOLINT(readability/casting)
     }
 
     // set_tensor_data auto-waits for producer + consumer before writing
@@ -238,7 +243,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     set_tensor_data(c, 1, idx, float_to_u64(88.0f));
     uint64_t waw_raw = get_tensor_data(c, 1, idx);
     LOG_INFO("WAW+WAR: set_tensor_data(c, 88.0) after consumer = %f (expected 88.0)",
-             (double)u64_to_float(waw_raw));
+        static_cast<double>(u64_to_float(waw_raw)));  // NOLINT(whitespace/line_length)
 
     check_idx[0] = 7;
     set_tensor_data(ext_check, 1, check_idx, waw_raw);
@@ -268,7 +273,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     set_tensor_data(ext_b, 1, idx, float_to_u64(55.0f));
     uint64_t ext_war_raw = get_tensor_data(ext_b, 1, idx);
     LOG_INFO("External WAR (INOUT): set_tensor_data(ext_b, 55.0) = %f (expected 55.0)",
-             (double)u64_to_float(ext_war_raw));
+        static_cast<double>(u64_to_float(ext_war_raw)));  // NOLINT(whitespace/line_length)
 
     check_idx[0] = 8;
     set_tensor_data(ext_check, 1, check_idx, ext_war_raw);

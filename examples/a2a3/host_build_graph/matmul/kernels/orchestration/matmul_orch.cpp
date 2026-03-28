@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Matmul Example Orchestration Function Implementation
  *
@@ -11,38 +21,39 @@
  *       t3 (add+exp, AIV)
  *
  * This orchestration function:
- * 1. Receives TaskArg array with tensor metadata (pointers, shapes, dtypes)
+ * 1. Receives ChipStorageTaskArgs with tensor metadata (pointers, shapes, dtypes)
  * 2. Allocates device memory via runtime->host_api
  * 3. Copies input data to device via runtime->host_api
  * 4. Records output tensor for copy-back during finalize
  * 5. Builds the task graph with 4 tasks (2 AIV + 2 AIC)
  */
 
-#include "runtime.h"
-#include "task_arg.h"
-#include <iostream>
 #include <cstdint>
+#include <iostream>
+
+#include "runtime.h"    // NOLINT(build/include_subdir)
+#include "task_args.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
-int build_matmul_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count) {
+int build_matmul_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     // Validate argument count
     // Expected orch_args: [a, w1, w2, f] — 4 tensors
-    if (arg_count < 4) {
-        std::cerr << "build_matmul_graph: Expected at least 4 args, got " << arg_count << '\n';
+    if (orch_args.tensor_count() < 4) {
+        std::cerr << "build_matmul_graph: Expected at least 4 tensors, got " << orch_args.tensor_count() << '\n';
         return -1;
     }
 
-    // Extract host pointers and sizes from TaskArg metadata
-    void* host_a  = orch_args[0].data<void>();
-    void* host_w1 = orch_args[1].data<void>();
-    void* host_w2 = orch_args[2].data<void>();
-    void* host_f  = orch_args[3].data<void>();
-    size_t size_a  = orch_args[0].nbytes();
-    size_t size_w1 = orch_args[1].nbytes();
-    size_t size_w2 = orch_args[2].nbytes();
-    size_t size_f  = orch_args[3].nbytes();
-    uint32_t SIZE = orch_args[0].tensor.shapes[0];
+    // Extract host pointers and sizes from tensor metadata
+    void* host_a = orch_args.tensor(0).data_as<void>();
+    void* host_w1 = orch_args.tensor(1).data_as<void>();
+    void* host_w2 = orch_args.tensor(2).data_as<void>();
+    void* host_f = orch_args.tensor(3).data_as<void>();
+    size_t size_a = orch_args.tensor(0).nbytes();
+    size_t size_w1 = orch_args.tensor(1).nbytes();
+    size_t size_w2 = orch_args.tensor(2).nbytes();
+    size_t size_f = orch_args.tensor(3).nbytes();
+    uint32_t SIZE = orch_args.tensor(0).shapes[0];
 
     std::cout << "\n=== build_matmul_graph: Creating Task Runtime ===" << '\n';
     std::cout << "Formula: F = exp(sqrt(log(A)) @ W1 + sqrt(log(A)) @ W2)\n";
@@ -93,8 +104,8 @@ int build_matmul_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count
     // Allocate intermediate tensors (b, c, d)
     // dev_b is half precision (output of log_sqrt kernel, input to matmul)
     // dev_c, dev_d are float precision (output of matmul kernels)
-    size_t BYTES_HALF = SIZE * sizeof(uint16_t);   // half = 2 bytes
-    size_t BYTES_FLOAT = SIZE * sizeof(float);     // float = 4 bytes
+    size_t BYTES_HALF = SIZE * sizeof(uint16_t);                 // half = 2 bytes
+    size_t BYTES_FLOAT = SIZE * sizeof(float);                   // float = 4 bytes
     void* dev_b = runtime->host_api.device_malloc(BYTES_HALF);   // sqrt(log(A)) - half output
     void* dev_c = runtime->host_api.device_malloc(BYTES_FLOAT);  // B @ W1 - float output
     void* dev_d = runtime->host_api.device_malloc(BYTES_FLOAT);  // B @ W2 - float output
@@ -111,13 +122,14 @@ int build_matmul_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count
         return -1;
     }
 
-    std::cout << "Allocated intermediate tensors: B (" << BYTES_HALF << " bytes, half), C (" << BYTES_FLOAT << " bytes, float), D (" << BYTES_FLOAT << " bytes, float)\n";
+    std::cout << "Allocated intermediate tensors: B (" << BYTES_HALF << " bytes, half), C (" << BYTES_FLOAT
+              << " bytes, float), D (" << BYTES_FLOAT << " bytes, float)\n";
 
     // Task 0: B = sqrt(log(A)) (func_id=0: kernel_log_sqrt, AIV)
     uint64_t args_t0[3];
     args_t0[0] = reinterpret_cast<uint64_t>(dev_a);  // src
     args_t0[1] = reinterpret_cast<uint64_t>(dev_b);  // out
-    args_t0[2] = SIZE;                                // size
+    args_t0[2] = SIZE;                               // size
     int t0 = runtime->add_task(args_t0, 3, 0, CoreType::AIV);
 
     // Task 1: C = B @ W1 (func_id=1: kernel_matmul, AIC)
@@ -125,7 +137,7 @@ int build_matmul_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count
     args_t1[0] = reinterpret_cast<uint64_t>(dev_b);   // src0 (left matrix)
     args_t1[1] = reinterpret_cast<uint64_t>(dev_w1);  // src1 (right matrix)
     args_t1[2] = reinterpret_cast<uint64_t>(dev_c);   // out
-    args_t1[3] = SIZE;                                 // size
+    args_t1[3] = SIZE;                                // size
     int t1 = runtime->add_task(args_t1, 4, 1, CoreType::AIC);
 
     // Task 2: D = B @ W2 (func_id=1: kernel_matmul, AIC)
@@ -133,7 +145,7 @@ int build_matmul_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count
     args_t2[0] = reinterpret_cast<uint64_t>(dev_b);   // src0 (left matrix)
     args_t2[1] = reinterpret_cast<uint64_t>(dev_w2);  // src1 (right matrix)
     args_t2[2] = reinterpret_cast<uint64_t>(dev_d);   // out
-    args_t2[3] = SIZE;                                 // size
+    args_t2[3] = SIZE;                                // size
     int t2 = runtime->add_task(args_t2, 4, 1, CoreType::AIC);
 
     // Task 3: F = exp(C + D) (func_id=2: kernel_add_exp, AIV)
@@ -141,7 +153,7 @@ int build_matmul_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count
     args_t3[0] = reinterpret_cast<uint64_t>(dev_c);  // src0
     args_t3[1] = reinterpret_cast<uint64_t>(dev_d);  // src1
     args_t3[2] = reinterpret_cast<uint64_t>(dev_f);  // out
-    args_t3[3] = SIZE;                                // size
+    args_t3[3] = SIZE;                               // size
     int t3 = runtime->add_task(args_t3, 4, 2, CoreType::AIV);
 
     // Add dependencies (diamond: t0→t1→t3, t0→t2→t3)

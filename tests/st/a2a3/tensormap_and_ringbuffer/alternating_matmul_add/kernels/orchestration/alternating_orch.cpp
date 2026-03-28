@@ -1,9 +1,19 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Alternating Matmul-Add Orchestration Function (tensormap_and_ringbuffer Runtime)
  *
  * Submits independent matmul and add tasks per batch.
  *
- * Configuration read from scalar TaskArgs:
+ * Configuration read from scalar args:
  *   - batch: Number of batches
  *   - M: Number of matmul tasks per batch
  *   - N: Number of add tasks per batch
@@ -19,44 +29,48 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "pto_orchestration_api.h"
+#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_MATMUL 0
-#define FUNC_ADD    1
+#define FUNC_ADD 1
 
 static constexpr uint64_t MATMUL_ELEMS = 128 * 128;
 static constexpr uint64_t ADD_ELEMS = 128 * 128;
 
 extern "C" {
 
-__attribute__((visibility("default")))
-PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
-    (void)orch_args;
+__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
+    const ChipStorageTaskArgs& orch_args) {
+    (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 11,
     };
 }
 
-__attribute__((visibility("default")))
-void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(
+    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
     // Tensor args
-    Tensor ext_A = from_task_arg(orch_args[0]);
-    Tensor ext_B = from_task_arg(orch_args[1]);
-    Tensor ext_C = from_task_arg(orch_args[2]);
-    Tensor ext_X = from_task_arg(orch_args[3]);
-    Tensor ext_Y = from_task_arg(orch_args[4]);
-    Tensor ext_Z = from_task_arg(orch_args[5]);
+    Tensor ext_A = from_tensor_arg(orch_args.tensor(0));
+    Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
+    Tensor ext_C = from_tensor_arg(orch_args.tensor(2));
+    Tensor ext_X = from_tensor_arg(orch_args.tensor(3));
+    Tensor ext_Y = from_tensor_arg(orch_args.tensor(4));
+    Tensor ext_Z = from_tensor_arg(orch_args.tensor(5));
 
     // Scalar config args
-    int batch = (int)orch_args[6].scalar;
-    int M = (int)orch_args[7].scalar;
-    int N = (int)orch_args[8].scalar;
-    int matmul_batch = (int)orch_args[9].scalar;
-    int add_batch = (int)orch_args[10].scalar;
+    int batch = static_cast<int>(orch_args.scalar(0));
+    int M = static_cast<int>(orch_args.scalar(1));
+    int N = static_cast<int>(orch_args.scalar(2));
+    int matmul_batch = static_cast<int>(orch_args.scalar(3));
+    int add_batch = static_cast<int>(orch_args.scalar(4));
 
     LOG_ALWAYS("[alternating_orch] thread num: %d, idx: %d", orch_thread_num, orch_thread_index);
     LOG_INFO("[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d",
-             batch, M, N, matmul_batch, add_batch);
+        batch,
+        M,
+        N,
+        matmul_batch,
+        add_batch);
 
     int total_matmul_tasks = batch * M;
     int total_add_tasks = batch * N;
@@ -72,11 +86,11 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
     for (int group_idx = orch_thread_index; group_idx < max_groups; group_idx += orch_thread_num) {
         if (group_idx < num_matmul_groups) {
             int start_task_idx = group_idx * matmul_batch;
-            uint64_t offset = (uint64_t)start_task_idx * MATMUL_ELEMS;
-            uint64_t group_size = (uint64_t)matmul_batch * MATMUL_ELEMS;
+            uint64_t offset = static_cast<uint64_t>(start_task_idx) * MATMUL_ELEMS;
+            uint64_t group_size = static_cast<uint64_t>(matmul_batch) * MATMUL_ELEMS;
 
-            uint32_t matmul_group_shapes[1] = {(uint32_t)group_size};
-            uint32_t view_offsets[1] = {(uint32_t)offset};
+            uint32_t matmul_group_shapes[1] = {static_cast<uint32_t>(group_size)};
+            uint32_t view_offsets[1] = {static_cast<uint32_t>(offset)};
 
             Tensor A_view = ext_A.view(matmul_group_shapes, view_offsets);
             Tensor B_view = ext_B.view(matmul_group_shapes, view_offsets);
@@ -92,11 +106,11 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
 
         if (group_idx < num_add_groups) {
             int start_task_idx = group_idx * add_batch;
-            uint64_t offset = (uint64_t)start_task_idx * ADD_ELEMS;
-            uint64_t group_size = (uint64_t)add_batch * ADD_ELEMS;
+            uint64_t offset = static_cast<uint64_t>(start_task_idx) * ADD_ELEMS;
+            uint64_t group_size = static_cast<uint64_t>(add_batch) * ADD_ELEMS;
 
-            uint32_t add_group_shapes[1] = {(uint32_t)group_size};
-            uint32_t view_offsets[1] = {(uint32_t)offset};
+            uint32_t add_group_shapes[1] = {static_cast<uint32_t>(group_size)};
+            uint32_t view_offsets[1] = {static_cast<uint32_t>(offset)};
 
             Tensor X_view = ext_X.view(add_group_shapes, view_offsets);
             Tensor Y_view = ext_Y.view(add_group_shapes, view_offsets);
@@ -111,8 +125,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch
         }
     }
 
-    LOG_ALWAYS("[alternating_orch] Submitted %d matmul groups and %d add groups",
-             total_matmul, total_add);
+    LOG_ALWAYS("[alternating_orch] Submitted %d matmul groups and %d add groups", total_matmul, total_add);
 }
 
 }  // extern "C"

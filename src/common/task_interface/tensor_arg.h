@@ -11,7 +11,6 @@
 /**
  * ContinuousTensor - Compact tensor descriptor for orchestration arguments
  *
- * Replaces the tensor branch of TaskArg with a dedicated struct (no tag byte).
  * 40 bytes, trivially copyable, suitable for DMA and device-side access.
  */
 

@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """
 Shared Paged Attention Golden Implementation.
 
@@ -10,11 +18,12 @@ specific ALL_CASES, RTOL/ATOL configuration.
 
 Args layout (7 args):
   [query, key_cache, value_cache, block_table, context_lens, out, scale]
-  - Tensors retain original multi-dimensional shapes (TaskArg metadata carries shape/dtype)
+  - Tensors retain original multi-dimensional shapes (ContinuousTensor metadata carries shape/dtype)
   - scale is a scalar float parameter
 """
 
 import ctypes
+
 import torch
 
 
@@ -69,13 +78,13 @@ def generate_inputs(params: dict) -> list:
     out = torch.zeros(batch, num_heads, head_dim, dtype=torch.float32)
 
     return [
-        ("query", query),                              # [batch, num_heads, head_dim]
-        ("key_cache", key_cache),                      # [total_blocks, block_size, kv_head_num, head_dim]
-        ("value_cache", value_cache),                  # [total_blocks, block_size, kv_head_num, head_dim]
-        ("block_table", block_table),                  # [batch, max_num_blocks_per_req]
-        ("context_lens", context_lens),                # [batch]
-        ("out", out),                                  # [batch, num_heads, head_dim]
-        ("scale", ctypes.c_float(scale_value)),        # scalar
+        ("query", query),  # [batch, num_heads, head_dim]
+        ("key_cache", key_cache),  # [total_blocks, block_size, kv_head_num, head_dim]
+        ("value_cache", value_cache),  # [total_blocks, block_size, kv_head_num, head_dim]
+        ("block_table", block_table),  # [batch, max_num_blocks_per_req]
+        ("context_lens", context_lens),  # [batch]
+        ("out", out),  # [batch, num_heads, head_dim]
+        ("scale", ctypes.c_float(scale_value)),  # scalar
     ]
 
 
@@ -123,7 +132,7 @@ def paged_attention(
 
     for q_offset in range(0, num_heads_dim, q_tile):
         q_tile_size = min(q_tile, num_heads_dim - q_offset)
-        qi = query[:, q_offset:q_offset + q_tile_size, :].to(torch.float32)
+        qi = query[:, q_offset : q_offset + q_tile_size, :].to(torch.float32)
 
         oi = None
         li = None
@@ -146,10 +155,10 @@ def paged_attention(
             pos = torch.arange(block_size, device=sij.device).unsqueeze(0)
             valid_mask = pos < valid_lens.unsqueeze(1)
             valid_mask = valid_mask.unsqueeze(1)
-            sij = sij.masked_fill(~valid_mask, float('-inf'))
+            sij = sij.masked_fill(~valid_mask, float("-inf"))
 
             batch_mask = active_mask.view(-1, 1, 1)
-            sij = sij.masked_fill(~batch_mask, float('-inf'))
+            sij = sij.masked_fill(~batch_mask, float("-inf"))
 
             mij = sij.max(dim=-1, keepdim=True)[0]
             mij = mij.clamp(min=-1e30)
@@ -166,6 +175,7 @@ def paged_attention(
                 li = lij
                 mi = mij
             else:
+                assert mi is not None and li is not None and oi is not None
                 mi_new = torch.maximum(mi, mij)
                 alpha = torch.exp(mi - mi_new)
                 beta = torch.exp(mij - mi_new)
@@ -173,7 +183,8 @@ def paged_attention(
                 oi = alpha * oi + beta * oi_new
                 mi = mi_new
 
-        out[:, q_offset:q_offset + q_tile_size, :] = oi / li
+        assert oi is not None and li is not None
+        out[:, q_offset : q_offset + q_tile_size, :] = oi / li
 
     return out
 
@@ -219,14 +230,14 @@ def run_golden_test(all_cases: dict, default_case: str, generate_inputs_fn, labe
     print(f"=== {label} Golden Test ({params['name']}) ===")
     print(f"batch={params['batch']}, num_heads={params['num_heads']}, head_dim={params['head_dim']}")
     print(f"kv_head_num={params['kv_head_num']}, block_size={params['block_size']}")
-    if params.get('context_lens_list'):
-        ctx_list = params['context_lens_list']
+    if params.get("context_lens_list"):
+        ctx_list = params["context_lens_list"]
         print(f"context_lens (variable): {ctx_list[:8]}{'...' if len(ctx_list) > 8 else ''}")
     else:
         print(f"context_len={params['context_len']}")
 
-    max_num_blocks = params['max_model_len'] // params['block_size']
-    q_tile = min(params['num_heads'], 128)
+    max_num_blocks = params["max_model_len"] // params["block_size"]
+    q_tile = min(params["num_heads"], 128)
     print(f"max_num_blocks_per_req={max_num_blocks}, q_tile_size={q_tile}")
 
     out = tensors["out"].reshape(params["batch"] * params["num_heads"], params["head_dim"])

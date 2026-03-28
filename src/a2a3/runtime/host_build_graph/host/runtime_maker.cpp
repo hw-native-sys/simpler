@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Runtime Builder - Generic Implementation
  *
@@ -13,27 +23,28 @@
  *   - Frees device memory
  */
 
-#include "runtime.h"  // Includes unified_log.h and provides LOG_* macros
-#include "task_arg.h"
-#include <stdint.h>
+#include <dlfcn.h>
+#include <fcntl.h>
 #include <stddef.h>
+#include <stdint.h>
+#include <unistd.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <dlfcn.h>
-#include <fcntl.h>
-#include <unistd.h>
+
+#include "runtime.h"    // Includes unified_log.h and provides LOG_* macros  // NOLINT(build/include_subdir)
+#include "task_args.h"  // NOLINT(build/include_subdir)
 
 /**
  * Orchestration function signature.
  *
  * @param runtime    Pointer to Runtime to populate with tasks
- * @param orch_args  TaskArg array with tensor metadata + scalar values
- * @param arg_count  Total number of TaskArg entries
+ * @param orch_args  Separated tensor/scalar arguments
  * @return 0 on success, negative on error
  */
-typedef int (*OrchestrationFunc)(Runtime* runtime, const TaskArg* orch_args, int arg_count);
+typedef int (*OrchestrationFunc)(Runtime* runtime, const ChipStorageTaskArgs& orch_args);
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,20 +65,18 @@ extern "C" {
  * @param orch_so_binary    Orchestration shared library binary data
  * @param orch_so_size      Size of orchestration SO binary in bytes
  * @param orch_func_name    Name of the orchestration function to call
- * @param orch_args         TaskArg array with tensor metadata + scalar values
- * @param orch_args_count   Number of TaskArg entries
+ * @param orch_args         Separated tensor/scalar arguments
  * @return 0 on success, -1 on failure
  */
-int init_runtime_impl(Runtime *runtime,
-                    const uint8_t* orch_so_binary,
-                    size_t orch_so_size,
-                    const char* orch_func_name,
-                    const TaskArg* orch_args,
-                    int orch_args_count,
-                    const int* kernel_func_ids,
-                    const uint8_t* const* kernel_binaries,
-                    const size_t* kernel_sizes,
-                    int kernel_count) {
+int init_runtime_impl(Runtime* runtime,
+    const uint8_t* orch_so_binary,
+    size_t orch_so_size,
+    const char* orch_func_name,
+    const ChipStorageTaskArgs* orch_args,
+    const int* kernel_func_ids,
+    const uint8_t* const* kernel_binaries,
+    const size_t* kernel_sizes,
+    int kernel_count) {
     // Validate inputs
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
@@ -75,12 +84,11 @@ int init_runtime_impl(Runtime *runtime,
     }
 
     // Register kernel binaries via platform-provided upload function
-    if (kernel_count > 0 && kernel_func_ids != NULL &&
-        kernel_binaries != NULL && kernel_sizes != NULL) {
+    if (kernel_count > 0 && kernel_func_ids != NULL && kernel_binaries != NULL && kernel_sizes != NULL) {
         LOG_INFO("Registering %d kernel(s) in init_runtime_impl", kernel_count);
         for (int i = 0; i < kernel_count; i++) {
-            uint64_t addr = runtime->host_api.upload_kernel_binary(
-                kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
+            uint64_t addr =
+                runtime->host_api.upload_kernel_binary(kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
             if (addr == 0) {
                 LOG_ERROR("Failed to upload kernel binary for func_id=%d", kernel_func_ids[i]);
                 return -1;
@@ -120,8 +128,7 @@ int init_runtime_impl(Runtime *runtime,
     }
 
     dlerror();  // Clear any existing error
-    OrchestrationFunc orch_func =
-        reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
+    OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
     const char* dlsym_error = dlerror();
     if (dlsym_error != nullptr) {
         LOG_ERROR("dlsym failed for '%s': %s", orch_func_name, dlsym_error);
@@ -135,11 +142,15 @@ int init_runtime_impl(Runtime *runtime,
     runtime->clear_tensor_pairs();
 
     LOG_INFO("=== Calling Orchestration Function ===");
-    LOG_DEBUG("Args count: %d", orch_args_count);
+
+    LOG_DEBUG("Args count: %d (%d tensors + %d scalars)",
+        orch_args->tensor_count() + orch_args->scalar_count(),
+        orch_args->tensor_count(),
+        orch_args->scalar_count());
 
     // Call orchestration function to build task graph
     // The orchestration function handles device memory allocation and copy-to-device
-    int rc = orch_func(runtime, orch_args, orch_args_count);
+    int rc = orch_func(runtime, *orch_args);
     if (rc != 0) {
         LOG_ERROR("Orchestration function failed with code %d", rc);
         runtime->clear_tensor_pairs();
@@ -166,7 +177,7 @@ int init_runtime_impl(Runtime *runtime,
  * @param runtime  Pointer to Runtime
  * @return 0 on success, -1 on failure
  */
-int validate_runtime_impl(Runtime *runtime) {
+int validate_runtime_impl(Runtime* runtime) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -222,5 +233,5 @@ int validate_runtime_impl(Runtime *runtime) {
 }
 
 #ifdef __cplusplus
-}  /* extern "C" */
+} /* extern "C" */
 #endif

@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """
 Golden test specification for mixed AIC+AIV example.
 
@@ -11,7 +19,7 @@ Covers all 5 resource shapes per iteration:
 All use 128x128 float32 tiles, repeated over num_iters slices.
 
 Args layout (15 args): [A, B, C, D, E, F, G, H, I, J, K, L, M, N, O]
-  Shape/dtype/size in TaskArg metadata.
+  Shape/dtype/size in ContinuousTensor metadata.
 """
 
 import torch
@@ -51,13 +59,13 @@ def generate_inputs(params: dict) -> list:
     # Output buffers (num_iters slices each)
     C = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
     F = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
-    I = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    I_out = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)  # noqa: E741
     J = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
     K = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
     L = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
     M = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
     N = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
-    O = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)
+    O_out = torch.zeros(num_iters * TILE_ELEMS, dtype=torch.float32)  # noqa: E741
 
     A_flat = A.flatten()
     B_flat = B.flatten()
@@ -71,13 +79,13 @@ def generate_inputs(params: dict) -> list:
         ("F", F),
         ("G", G),
         ("H", H),
-        ("I", I),
+        ("I", I_out),
         ("J", J),
         ("K", K),
         ("L", L),
         ("M", M),
         ("N", N),
-        ("O", O),
+        ("O", O_out),
     ]
 
 

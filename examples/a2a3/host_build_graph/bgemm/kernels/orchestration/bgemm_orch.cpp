@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * BGEMM Orchestration Function (Host Build Graph Runtime)
  *
@@ -18,10 +28,11 @@
  *     C[m,n] = C[m,n] + P    (tile_add on Vector core)
  */
 
-#include "runtime.h"
-#include "task_arg.h"
 #include <iostream>
 #include <vector>
+
+#include "runtime.h"    // NOLINT(build/include_subdir)
+#include "task_args.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
@@ -33,19 +44,19 @@ constexpr int BATCH = 1;
 
 constexpr size_t TILE_BYTES = TILE * TILE * sizeof(float);
 
-int build_bgemm_graph(Runtime* runtime, const TaskArg* orch_args, int arg_count) {
+int build_bgemm_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     // Expected orch_args: [A, B, C] — 3 tensors
-    if (arg_count < 3) {
-        std::cerr << "build_bgemm_graph: Expected at least 3 args, got " << arg_count << '\n';
+    if (orch_args.tensor_count() < 3) {
+        std::cerr << "build_bgemm_graph: Expected at least 3 tensors, got " << orch_args.tensor_count() << '\n';
         return -1;
     }
 
-    void* host_A = orch_args[0].data<void>();
-    void* host_B = orch_args[1].data<void>();
-    void* host_C = orch_args[2].data<void>();
-    size_t size_A = orch_args[0].nbytes();
-    size_t size_B = orch_args[1].nbytes();
-    size_t size_C = orch_args[2].nbytes();
+    void* host_A = orch_args.tensor(0).data_as<void>();
+    void* host_B = orch_args.tensor(1).data_as<void>();
+    void* host_C = orch_args.tensor(2).data_as<void>();
+    size_t size_A = orch_args.tensor(0).nbytes();
+    size_t size_B = orch_args.tensor(1).nbytes();
+    size_t size_C = orch_args.tensor(2).nbytes();
 
     std::cout << "\n=== build_bgemm_graph ===" << '\n';
     std::cout << "Grid: " << GRID_M << " x " << GRID_K << " x " << GRID_N << '\n';

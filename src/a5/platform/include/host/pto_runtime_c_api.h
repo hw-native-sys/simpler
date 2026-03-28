@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * PTO Runtime C API
  *
@@ -14,15 +24,14 @@
  * - Memory management: User allocates Runtime with malloc(get_runtime_size())
  */
 
-#ifndef PTO_RUNTIME_C_API_H
-#define PTO_RUNTIME_C_API_H
+#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_PTO_RUNTIME_C_API_H_
+#define SRC_A5_PLATFORM_INCLUDE_HOST_PTO_RUNTIME_C_API_H_
 
 #include <stddef.h>
 #include <stdint.h>
 
 #include "common/compile_strategy.h"
-
-struct TaskArg;
+#include "task_args.h"  // NOLINT(build/include_subdir)
 
 #ifdef __cplusplus
 extern "C" {
@@ -73,8 +82,7 @@ size_t get_runtime_size(void);
  * @param orch_so_binary    Orchestration shared library binary data
  * @param orch_so_size      Size of orchestration SO binary in bytes
  * @param orch_func_name    Name of the orchestration function to call
- * @param orch_args         Array of TaskArg describing orchestration arguments
- * @param orch_args_count   Number of orchestration arguments
+ * @param orch_args         Separated tensor/scalar arguments for orchestration
  * @param kernel_func_ids   Array of kernel function IDs (can be NULL if kernel_count == 0)
  * @param kernel_binaries   Array of pointers to kernel binary data
  * @param kernel_sizes      Array of kernel binary sizes in bytes
@@ -82,15 +90,14 @@ size_t get_runtime_size(void);
  * @return 0 on success, -1 on failure
  */
 int init_runtime(RuntimeHandle runtime,
-                const uint8_t* orch_so_binary,
-                size_t orch_so_size,
-                const char* orch_func_name,
-                const struct TaskArg* orch_args,
-                int orch_args_count,
-                const int* kernel_func_ids,
-                const uint8_t* const* kernel_binaries,
-                const size_t* kernel_sizes,
-                int kernel_count);
+    const uint8_t* orch_so_binary,
+    size_t orch_so_size,
+    const char* orch_func_name,
+    const ChipStorageTaskArgs* orch_args,
+    const int* kernel_func_ids,
+    const uint8_t* const* kernel_binaries,
+    const size_t* kernel_sizes,
+    int kernel_count);
 
 /* ===========================================================================
  * Device Memory API (for use by orchestration functions)
@@ -203,11 +210,7 @@ int set_device(int device_id);
  * @param dev_ptr   Device memory pointer
  * @param size      Size of tensor in bytes
  */
-void record_tensor_pair(RuntimeHandle runtime,
-                       void* host_ptr,
-                       void* dev_ptr,
-                       size_t size);
-
+void record_tensor_pair(RuntimeHandle runtime, void* host_ptr, void* dev_ptr, size_t size);
 
 /**
  * Enable or disable performance profiling for swimlane visualization.
@@ -226,4 +229,4 @@ int enable_runtime_profiling(RuntimeHandle runtime, int enabled);
 } /* extern "C" */
 #endif
 
-#endif /* PTO_RUNTIME_C_API_H */
+#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_PTO_RUNTIME_C_API_H_

@@ -1,10 +1,18 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """
 Golden test specification for BGEMM (Host Build Graph Runtime).
 
 Computation: C = A @ B (tiled matrix multiplication)
 Configuration: 4x4x4 grid, 64x64 tiles
 
-Args layout: [A, B, C] — shape/dtype/size in TaskArg metadata
+Args layout: [A, B, C] — shape/dtype/size in ContinuousTensor metadata
 """
 
 import numpy as np
@@ -52,7 +60,4 @@ def compute_golden(tensors: dict, params: dict) -> None:
         for m_idx in range(GRID_M):
             for n_idx in range(GRID_N):
                 for k_idx in range(GRID_K):
-                    C[batch, m_idx, n_idx] += np.matmul(
-                        A[batch, m_idx, k_idx],
-                        B[batch, k_idx, n_idx]
-                    )
+                    C[batch, m_idx, n_idx] += np.matmul(A[batch, m_idx, k_idx], B[batch, k_idx, n_idx])

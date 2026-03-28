@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * TaskArgs - Separated tensor + scalar argument storage
+ * TaskArgs - Tensor + scalar argument storage
  *
  * Template: TaskArgs<T, S, MaxT, MaxS, TensorTag=void>
  *   - Static:  MaxT>0, MaxS>0 — fixed-size arrays
