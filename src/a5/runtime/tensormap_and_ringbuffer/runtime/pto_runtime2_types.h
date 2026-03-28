@@ -8,7 +8,7 @@
  * - Task descriptors with fanin/fanout tracking
  * - Dependency list entries
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #ifndef PTO_RUNTIME2_TYPES_H
@@ -21,6 +21,7 @@
 
 #include "pto_types.h"
 #include "pto_submit_types.h"
+#include "pto2_dispatch_payload.h"
 
 // =============================================================================
 // Profiling Configuration
@@ -64,7 +65,7 @@
 #define PTO2_ERROR_HEAP_RING_DEADLOCK         2
 #define PTO2_ERROR_FLOW_CONTROL_DEADLOCK      3
 #define PTO2_ERROR_DEP_POOL_OVERFLOW          4
-#define PTO2_ERROR_INVALID_ARGS               5   // Arg construction error (invalid args)
+#define PTO2_ERROR_INVALID_ARGS              5   // Arg construction error (invalid args)
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT          100
@@ -87,7 +88,7 @@
 #define PTO2_HEAP_SIZE            (256 * 1024 * 1024)  // 256MB per ring (1GB total)
 #define PTO2_DEP_LIST_POOL_SIZE    16384    // Per-ring dependency list pool entries
 #define PTO2_TENSORMAP_POOL_SIZE   (65536)   // TensorMap entry pool
-#define PTO2_TENSORMAP_NUM_BUCKETS 65536    // Power of 2 for fast hash
+#define PTO2_TENSORMAP_NUM_BUCKETS 4096     // Power of 2 for fast hash (4096×8B=32KB fits L1)
 
 // Scope management
 #define PTO2_MAX_SCOPE_DEPTH      64      // Maximum nesting depth
@@ -104,6 +105,10 @@
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 #define PTO2_DEP_POOL_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
+
+// get_tensor_data/set_tensor_data spin wait timeout in cycles.
+// ~10s on hardware (1.5 GHz counter), ~10s on simulation (chrono-based).
+constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
 
 // =============================================================================
 // Multi-Ring task_id Encoding
@@ -134,18 +139,6 @@ static_assert(sizeof(PTO2TaskId) == 8, "PTO2TaskId must stay 8 bytes (shared mem
 
 static inline PTO2TaskId pto2_make_task_id(uint8_t ring_id, uint32_t local_id) {
     return PTO2TaskId{(static_cast<uint64_t>(ring_id) << 32) | static_cast<uint64_t>(local_id)};
-}
-
-static inline uint8_t pto2_task_id_ring(PTO2TaskId task_id) {
-    return task_id.ring();
-}
-
-static inline uint32_t pto2_task_id_local(PTO2TaskId task_id) {
-    return task_id.local();
-}
-
-static inline uint64_t pto2_task_id_raw(PTO2TaskId task_id) {
-    return task_id.raw;
 }
 
 // =============================================================================
@@ -340,7 +333,7 @@ struct PTO2DepListEntry {
  */
 struct PTO2TaskDescriptor {
     // Mixed-task identification (encodes ring_id in upper 32 bits)
-    PTO2TaskId mixed_task_id;         // raw: (ring_id << 32) | local_id
+    PTO2TaskId task_id;         // raw: (ring_id << 32) | local_id
 
     // Per-slot kernel IDs (INVALID_KERNEL_ID = inactive)
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
@@ -358,9 +351,12 @@ struct PTO2TaskDescriptor {
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
  * Layout: metadata (counts, fanin pointers) packed in the first 3 cache lines,
- * followed by bulk tensor and scalar data. This gives sequential write access
- * during orchestration and groups scheduler-hot fields (fanin_actual_count +
- * fanin_slot_states) together for on_task_release.
+ * followed by pre-built dispatch args and bulk tensor data. Scalar values are
+ * written directly into dispatch_args[] (after tensor pointers), eliminating
+ * the separate scalars[] array.
+ *
+ * The Scheduler writes function_bin_addr and a pointer to dispatch_args[] into
+ * PTO2DispatchPayload, then signals AICore via DATA_MAIN_BASE register.
  */
 struct PTO2TaskPayload {
     // === Cache line 0 (64B) — metadata ===
@@ -369,22 +365,40 @@ struct PTO2TaskPayload {
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
     int32_t _reserved{0};                      // Reserved (dep_pool_mark moved to SlotState for local access)
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
-    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
+    // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
     Tensor tensors[MAX_TENSOR_ARGS];
-    // === Cache lines 35-50 (1024B) — scalars ===
-    uint64_t scalars[MAX_SCALAR_ARGS];
+    // === Pre-built args for AICore dispatch (1152B = 16 tensor ptrs + 128 scalars) ===
+    uint64_t dispatch_args[PTO2_DISPATCH_MAX_ARGS];
 
-    void init(const Arg& args) {
+    /**
+     * Initialize payload: copy tensors, build dispatch args.
+     *
+     * For each param slot, the tensor source is determined by TensorArgType:
+     * - OUTPUT → use materialized_outputs.output_ptr(out_idx++)
+     * - INPUT / INOUT → use refs[i].tensor
+     *
+     * @param args                Task arguments (tensors + scalars)
+     * @param materialized_outputs  Materialized output tensors (from TensorCreateInfo path)
+     */
+    void init(const Arg& args, const TaskOutputTensors& materialized_outputs) {
         tensor_count = args.tensor_count;
         scalar_count = args.scalar_count;
-        auto src_tensors = args.tensors;
+
+        int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count; i++) {
-            tensors[i].copy(*src_tensors[i]);
+            const Tensor* src;
+            if (args.tensor_types[i] == TensorArgType::OUTPUT) {
+                src = materialized_outputs.output_ptr(out_idx++);
+            } else {
+                src = args.refs[i].tensor;
+            }
+            tensors[i].copy(*src);
+            tensors[i].update_start_offset();
+            dispatch_args[i] = reinterpret_cast<uint64_t>(&tensors[i]);
         }
-        static_assert(sizeof(scalars) == sizeof(args.scalars));
-        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
-        // Eliminates branches; extra bytes within the same CL have zero additional cost.
-        memcpy(scalars, args.scalars,
+        // Bulk-copy scalars into dispatch_args[tensor_count..], rounded up to
+        // cache-line boundary (extra bytes within the same CL cost nothing).
+        memcpy(&dispatch_args[args.tensor_count], args.scalars,
                PTO2_ALIGN_UP(args.scalar_count * sizeof(uint64_t), 64));
     }
 };

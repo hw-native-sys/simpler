@@ -154,7 +154,6 @@ static __aicore__ void online_update_impl(__gm__ uint8_t* mij_raw, __gm__ uint8_
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
         // Phase 2: Scalar arithmetic in RowMajor (kScalarRows, kScalarCols)
-        // to resolve RAW hazards on shared UB tiles.
         TMAX(miNewND, miND, mijND);          // mi_new = max(mi, mij)
         TSUB(alphaND, miND, miNewND);        // alpha = mi - mi_new
         TEXP(alphaND, alphaND);              // alpha = exp(mi - mi_new)

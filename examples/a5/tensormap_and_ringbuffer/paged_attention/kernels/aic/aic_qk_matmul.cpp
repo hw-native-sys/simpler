@@ -80,8 +80,6 @@ static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm
 
     TSTORE(sijGlobal, cTile);
 
-    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
-    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {

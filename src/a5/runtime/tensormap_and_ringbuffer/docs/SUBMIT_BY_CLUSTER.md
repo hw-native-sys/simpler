@@ -89,7 +89,7 @@ Rules:
 
 `PTO2TaskDescriptor` (hot path) carries mixed-task identity/state:
 
-1. `mixed_task_id`
+1. `task_id`
 2. `active_mask`
 3. `subtask_done_mask`
 4. `kernel_id[3]` for `(AIC, AIV0, AIV1)`
@@ -128,8 +128,8 @@ Queueing key is normalized resource shape (not raw slot label).
 
 1. Fanin release/readiness remains dependency-correct and graph-level.
 2. Two-stage completion:
-   - `on_subtask_complete(mixed_task_id, subslot)`
-   - `on_mixed_task_complete(mixed_task_id)` only when `subtask_done_mask == active_mask`
+   - `on_subtask_complete(task_id, subslot)`
+   - `on_mixed_task_complete(task_id)` only when `subtask_done_mask == active_mask`
 3. Downstream release is triggered once per mixed task completion, not once per subslot.
 
 ## 9. Executor Ownership and Numbering

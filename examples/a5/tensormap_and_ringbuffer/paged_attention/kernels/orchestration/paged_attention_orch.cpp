@@ -36,7 +36,7 @@ PTO2OrchestrationConfig aicpu_orchestration_config(TaskArg* orch_args) {
 }
 
 __attribute__((visibility("default")))
-void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
     // Read dimensions from TaskArg tensor metadata
     // query: shape=[batch, num_heads, head_dim]
     uint64_t batch     = orch_args[0].tensor.shapes[0];
@@ -62,7 +62,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
     uint64_t b_start = batch * orch_thread_index / orch_thread_num;
     uint64_t b_end = batch * (orch_thread_index + 1) / orch_thread_num;
 
-    LOG_INFO(rt, "orch_idx=%d/%d batch=%lu b_range=[%lu,%lu)",
+    LOG_INFO("orch_idx=%d/%d batch=%lu b_range=[%lu,%lu)",
              orch_thread_index, orch_thread_num,
              (unsigned long)batch, (unsigned long)b_start, (unsigned long)b_end);
 
@@ -84,39 +84,43 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
     Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
     Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
     Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
-    LOG_DEBUG(rt, "query=%s", query.dump().c_str());
-    LOG_DEBUG(rt, "key_cache=%s", key_cache.dump().c_str());
-    LOG_DEBUG(rt, "value_cache=%s", value_cache.dump().c_str());
-    LOG_DEBUG(rt, "out=%s", out.dump().c_str());
+    LOG_DEBUG("query=%s", query.dump().c_str());
+    LOG_DEBUG("key_cache=%s", key_cache.dump().c_str());
+    LOG_DEBUG("value_cache=%s", value_cache.dump().c_str());
+    LOG_DEBUG("out=%s", out.dump().c_str());
 
     int* host_block_table  = orch_args[3].data<int>();
     int* host_context_lens = orch_args[4].data<int>();
+
+    // Create infos are loop-invariant — shapes depend only on q_tile/head_dim/block_size
+    uint32_t tile2d_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+    uint32_t scalar_shapes[1] = {(uint32_t)q_tile};
+    uint32_t sij_shapes[2] = {(uint32_t)q_tile, (uint32_t)block_size};
+    TensorCreateInfo tile2d_ci(tile2d_shapes, 2, DataType::FLOAT32);
+    TensorCreateInfo scalar_ci(scalar_shapes, 1, DataType::FLOAT32);
+    TensorCreateInfo sij_ci(sij_shapes, 2, DataType::FLOAT32);
+    TensorCreateInfo pij_f16_ci(sij_shapes, 2, data_type);
 
     for (uint64_t b_idx = b_start; b_idx < b_end; b_idx++) {
         uint64_t cur_seq = host_context_lens[b_idx];
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
-            PTO2_SCOPE(rt) {
+            PTO2_SCOPE() {
                 uint32_t cur_offset = (uint32_t)(b_idx * q_head_num + q_idx * q_tile);
-                uint32_t oi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
-                uint32_t li_shapes[1] = {(uint32_t)q_tile};
-                uint32_t mi_shapes[1] = {(uint32_t)q_tile};
-                Tensor oi = make_tensor(oi_shapes, 2, DataType::FLOAT32);
-                Tensor li_update = make_tensor(li_shapes, 1, DataType::FLOAT32);
-                Tensor mi_update = make_tensor(mi_shapes, 1, DataType::FLOAT32);
 
-                uint32_t qi_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
                 uint32_t qi_offsets[2] = {cur_offset, 0};
-                Tensor qi = query.view(qi_shapes, qi_offsets);
-                uint32_t out_view_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
+                Tensor qi = query.view(tile2d_shapes, qi_offsets);
                 uint32_t out_view_offsets[2] = {cur_offset, 0};
-                Tensor out_view = out.view(out_view_shapes, out_view_offsets);
+                Tensor out_view = out.view(tile2d_shapes, out_view_offsets);
 
                 Arg args_inplace;
-                args_inplace.add_output(oi);
-                args_inplace.add_output(li_update);
-                args_inplace.add_output(mi_update);
-                pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace); // create_inplace
+                args_inplace.add_output(tile2d_ci);
+                args_inplace.add_output(scalar_ci);
+                args_inplace.add_output(scalar_ci);
+                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, args_inplace);
+                const Tensor& oi = hub_outs.get_ref(0);
+                const Tensor& li_update = hub_outs.get_ref(1);
+                const Tensor& mi_update = hub_outs.get_ref(2);
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
@@ -126,37 +130,33 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                     Tensor kj = key_cache.view(kv_shapes, kv_offsets);
                     Tensor vj = value_cache.view(kv_shapes, kv_offsets);
 
-                    uint32_t sij_shapes[2] = {(uint32_t)q_tile, (uint32_t)block_size};
-                    Tensor sij = make_tensor(sij_shapes, 2, DataType::FLOAT32);
-                    Tensor pij_f16 = make_tensor(sij_shapes, 2, data_type);
-
                     Arg args_qk;
                     args_qk.add_input(qi);
                     args_qk.add_input(kj);
-                    args_qk.add_output(sij);
-                    pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk); // c1
+                    args_qk.add_output(sij_ci);
+                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, args_qk);
+                    const Tensor& sij = qk_outs.get_ref(0);
 
                     uint32_t sij_valid_shapes[2] = {(uint32_t)q_tile, (uint32_t)valid_len};
                     uint32_t sij_valid_offsets[2] = {0, 0};
                     Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
-                    Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
-                    Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
                     Arg args_sf;
                     args_sf.add_input(sij_valid);
-                    args_sf.add_output(pij_f16);
-                    args_sf.add_output(mi);
-                    args_sf.add_output(li);
+                    args_sf.add_output(pij_f16_ci);
+                    args_sf.add_output(scalar_ci);
+                    args_sf.add_output(scalar_ci);
                     args_sf.add_scalar(scale_value);
-                    pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf); // v1
-
-                    uint32_t oi_tmp_shapes[2] = {(uint32_t)q_tile, (uint32_t)head_dim};
-                    Tensor oi_tmp = make_tensor(oi_tmp_shapes, 2, DataType::FLOAT32);
+                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, args_sf);
+                    const Tensor& pij_f16 = sf_outs.get_ref(0);
+                    const Tensor& mi = sf_outs.get_ref(1);
+                    const Tensor& li = sf_outs.get_ref(2);
 
                     Arg args_pv;
                     args_pv.add_input(pij_f16);
                     args_pv.add_input(vj);
-                    args_pv.add_output(oi_tmp);
-                    pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv); // c2
+                    args_pv.add_output(tile2d_ci);
+                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, args_pv);
+                    const Tensor& oi_tmp = pv_outs.get_ref(0);
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
@@ -168,16 +168,16 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
                     args_up.add_inout(mi_update);
                     args_up.add_inout(li_update);
                     args_up.add_inout(oi);
-                    args_up.add_output(out_view);
+                    args_up.add_inout(out_view);
                     args_up.add_scalar(is_first);
                     args_up.add_scalar(is_last);
-                    pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up); // v2
+                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, args_up);
                 }
             }
         }
     }
 
-    LOG_INFO(rt, "orch_idx=%d: tasks submitted for batch=[%lu,%lu), num_heads=%lu",
+    LOG_INFO("orch_idx=%d: tasks submitted for batch=[%lu,%lu), num_heads=%lu",
                   orch_thread_index, (unsigned long)b_start, (unsigned long)b_end,
                   (unsigned long)num_heads);
 }

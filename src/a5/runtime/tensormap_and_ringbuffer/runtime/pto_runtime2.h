@@ -19,7 +19,7 @@
  *   3. Mark orchestration complete: pto2_orchestrator_done()
  *   4. Destroy runtime: pto2_runtime_destroy()
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #ifndef PTO_RUNTIME2_H
@@ -59,7 +59,7 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    void (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
+    TaskOutputTensors (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
                         const Arg& args);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
@@ -72,6 +72,14 @@ struct PTO2RuntimeOps {
     void (*log_info)(const char* func, const char* fmt, ...);
     void (*log_debug)(const char* func, const char* fmt, ...);
     void (*log_always)(const char* func, const char* fmt, ...);
+
+    // Cross-layer data access (orchestration reads/writes tensor values via runtime)
+    // Placed after logging to avoid shifting hot-path field offsets.
+    uint64_t (*get_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
+                                uint32_t ndims, const uint32_t indices[]);
+    void (*set_tensor_data)(PTO2Runtime* rt, const Tensor& tensor,
+                            uint32_t ndims, const uint32_t indices[],
+                            uint64_t value);
 };
 
 /**
@@ -189,85 +197,19 @@ void pto2_rt_scope_end(PTO2Runtime* rt);
 void pto2_rt_orchestration_done(PTO2Runtime* rt);
 
 /**
- * Scope helper macros for C
- *
- * These macros provide scope management for C code.
- * For C++, prefer using PTO2_SCOPE_GUARD or PTO2_SCOPE (see below).
- *
- * Usage (C):
- *   PTO2_SCOPE_BEGIN(rt);
- *   pto2_rt_submit_task(...);
- *   pto2_rt_submit_task(...);
- *   PTO2_SCOPE_END(rt);
+ * Cross-layer data access: read a tensor value by waiting for its producer.
  */
-#define PTO2_SCOPE_BEGIN(rt) pto2_rt_scope_begin(rt)
-#define PTO2_SCOPE_END(rt)   pto2_rt_scope_end(rt)
+uint64_t pto2_get_tensor_data(PTO2Runtime* rt, const Tensor& tensor,
+                              uint32_t ndims, const uint32_t indices[]);
 
 /**
- * RAII Scope Guard for C++
- *
- * PTO2ScopeGuard is a C++ RAII wrapper that automatically manages scope lifetime.
- * It calls pto2_rt_scope_begin() on construction and pto2_rt_scope_end() on destruction,
- * ensuring proper cleanup even in error paths.
- *
- * Usage Option 1 - Direct instantiation (recommended):
- *   PTO2ScopeGuard scope_guard(rt);
- *   pto2_rt_submit_task(...);
- *   pto2_rt_submit_task(...);
- *   // scope automatically ends here when scope_guard destructor is called
- *
- * Usage Option 2 - Macro for anonymous guard:
- *   PTO2_SCOPE_GUARD(rt);
- *   pto2_rt_submit_task(...);
- *   // scope automatically ends at end of current block
- *
- * Usage Option 3 - Scoped block with if statement:
- *   PTO2_SCOPE(rt) {
- *       pto2_rt_submit_task(...);
- *       pto2_rt_submit_task(...);
- *   } // scope automatically ends here
- *
- * Benefits:
- * - Exception-safe: scope ends even if exceptions are thrown
- * - Error-safe: no need to manually call PTO2_SCOPE_END in error paths
- * - Cleaner code: less boilerplate, automatic cleanup
- * - Less error-prone: impossible to forget scope cleanup
+ * Cross-layer data access: write a value to a tensor at given indices.
+ * Waits for producer completion (WAW) and all consumers (WAR) via TensorMap.
+ * See set_tensor_data in pto_orchestration_api.h for full documentation.
  */
-class PTO2ScopeGuard {
-public:
-    PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) {
-        pto2_rt_scope_begin(rt_);
-    }
-    ~PTO2ScopeGuard() {
-        pto2_rt_scope_end(rt_);
-    }
-private:
-    PTO2Runtime* rt_;
-};
-
-/**
- * Macro to create an anonymous scope guard with a unique name.
- * The [[maybe_unused]] attribute suppresses warnings if the guard
- * variable is not explicitly used.
- *
- * Example:
- *   PTO2_SCOPE_GUARD(rt);
- *   pto2_rt_submit_task(...);
- */
-#define _PTO2_CONCATENATE_IMPL(x, y) x ## y
-#define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
-#define PTO2_SCOPE_GUARD(rt) [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)(rt)
-
-/**
- * Macro to create a scoped block with automatic scope management.
- * Uses if-statement initialization (C++17) to create guard and execute block.
- *
- * Example:
- *   PTO2_SCOPE(rt) {
- *       pto2_rt_submit_task(...);
- *   } // scope automatically ends here
- */
-#define PTO2_SCOPE(rt) if (PTO2_SCOPE_GUARD(rt); true)
+void pto2_set_tensor_data(PTO2Runtime* rt, const Tensor& tensor,
+                          uint32_t ndims, const uint32_t indices[],
+                          uint64_t value);
 
 /**
  * Slim config struct exported by orchestration .so via aicpu_orchestration_config().

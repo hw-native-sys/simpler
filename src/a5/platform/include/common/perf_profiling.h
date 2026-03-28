@@ -71,16 +71,17 @@ struct PerfRecord {
     uint64_t dispatch_time;      // AICPU timestamp: when task was dispatched to AICore (task_status set to 1)
     uint64_t finish_time;        // AICPU timestamp: when AICPU observed task completion (task_status back to 0)
 
-    // Task identification
-    uint32_t task_id;         // Register dispatch id (per-core monotonic counter, NOT mixed_task_id).
-                              // May collide across cores; use (ring_id, task_id, core_id) as unique key.
+    // AICore writes the register dispatch token (low 32 bits only) zero-extended into task_id.
+    // For multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph), AICPU overwrites
+    // with the full PTO2 encoding (ring_id << 32) | local_id after FIN/perf row match.
+    // For host_build_graph, task_id stays as the plain integer task index (ring_id = 0).
+    uint64_t task_id;
     uint32_t func_id;         // Kernel function identifier
     CoreType core_type;       // Core type (AIC/AIV)
-    uint8_t ring_id;          // Ring layer (0 for single-ring / legacy)
 
     // Dependency relationship (fanout only)
-    int32_t fanout[RUNTIME_MAX_FANOUT];  // Successor task ID array
-    int32_t fanout_count;                 // Number of successor tasks
+    uint64_t fanout[RUNTIME_MAX_FANOUT];  // Successor task task_id array
+    int32_t fanout_count;                  // Number of successor tasks
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(PerfRecord) % 64 == 0,
@@ -259,8 +260,11 @@ struct AicpuPhaseRecord {
     uint64_t end_time;         // Phase end timestamp
     uint32_t loop_iter;        // Loop iteration number
     AicpuPhaseId phase_id;     // Phase type
-    uint32_t tasks_processed;  // Tasks processed in this phase
-    uint32_t padding;          // Alignment padding
+    union {
+        uint64_t task_id;   // Multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph):
+                            // full PTO2 encoding (ring_id << 32) | local_id for cross-view correlation.
+        uint64_t tasks_processed; // Scheduler phases: number of tasks processed in this batch
+    };
 };
 
 /**

@@ -27,11 +27,12 @@
  * Writes performance metrics to the provided buffer. Buffer management
  * and status tracking are handled by AICPU.
  *
- * AICore records task_id and timestamps only. AICPU fills func_id and
- * core_type at completion time from TaskDescriptor.
+ * AICore writes PerfRecord.task_id as the register dispatch token (low 32 bits, zero-extended).
+ * For multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph), AICPU overwrites
+ * with the full (ring_id << 32) | local_id encoding after handshake match.
  *
  * @param perf_buf Performance buffer pointer
- * @param task_id Task ID
+ * @param task_id Register dispatch id (DATA_MAIN_BASE), stored in task_id low 32 bits
  * @param start_time Start timestamp
  * @param end_time End timestamp
  */
@@ -51,10 +52,11 @@ static inline void perf_aicore_record_task(
     // Write record data (func_id, core_type, and count filled by AICPU at completion)
     record->start_time = start_time;
     record->end_time = end_time;
-    record->task_id = task_id;
+    record->task_id = static_cast<uint64_t>(task_id);
 
     // Flush cache to make data visible
     dcci(record, SINGLE_CACHE_LINE, CACHELINE_OUT);
+    dsb((mem_dsb_t)0);
 }
 
 #endif  // PLATFORM_AICORE_PERFORMANCE_COLLECTOR_AICORE_H_

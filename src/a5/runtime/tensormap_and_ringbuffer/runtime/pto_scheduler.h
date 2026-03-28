@@ -13,7 +13,7 @@
  * - Buffer lifecycle based on fanout_refcount
  * - Ring pointer advancement for flow control
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #ifndef PTO_SCHEDULER_H
@@ -54,7 +54,7 @@ struct PTO2ReadyQueueSlot {
  *
  * Phase 1 fills per-CoreType buffers via on_task_complete().
  * dispatch_ready_tasks_to_idle_cores drains them: local-first via
- * get_ready_task, then remaining tasks pushed to global readyQ.
+ * get_ready_task_batch, then remaining tasks pushed to global readyQ.
  */
 // Number of CoreType values eligible for local dispatch (AIC=0, AIV=1)
 static constexpr int PTO2_LOCAL_DISPATCH_TYPE_NUM = 2;
@@ -132,6 +132,40 @@ struct alignas(64) PTO2ReadyQueue {
         slot->slot_state = slot_state;
         slot->sequence.store((int64_t)(pos + 1), std::memory_order_release);
         return true;
+    }
+
+    // Batch push: reserve count slots with a single CAS after confirming
+    // every target slot is available under the usual Vyukov sequence check.
+    void push_batch(PTO2TaskSlotState** items, int count) {
+        if (count == 0) return;
+
+        uint64_t pos;
+        while (true) {
+            pos = enqueue_pos.load(std::memory_order_relaxed);
+            bool ready = true;
+            for (int i = 0; i < count; i++) {
+                PTO2ReadyQueueSlot* slot = &slots[(pos + i) & mask];
+                int64_t seq = slot->sequence.load(std::memory_order_acquire);
+                int64_t diff = seq - (int64_t)(pos + i);
+                if (diff != 0) {
+                    ready = false;
+                    break;
+                }
+            }
+            if (!ready) {
+                continue;
+            }
+            if (enqueue_pos.compare_exchange_weak(pos, pos + count,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+
+        for (int i = 0; i < count; i++) {
+            PTO2ReadyQueueSlot* slot = &slots[(pos + i) & mask];
+            slot->slot_state = items[i];
+            slot->sequence.store((int64_t)(pos + i + 1), std::memory_order_release);
+        }
     }
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
@@ -249,6 +283,101 @@ struct alignas(64) PTO2ReadyQueue {
         return result;
     }
 #endif
+
+    // Batch pop: reserve a contiguous run of ready slots with a single CAS.
+    // Returns actual number of items popped (may be less than max_count).
+    int pop_batch(PTO2TaskSlotState** out, int max_count) {
+        uint64_t pos;
+        int count;
+        while (true) {
+            pos = dequeue_pos.load(std::memory_order_relaxed);
+            count = 0;
+            while (count < max_count) {
+                PTO2ReadyQueueSlot* slot = &slots[(pos + count) & mask];
+                int64_t seq = slot->sequence.load(std::memory_order_acquire);
+                int64_t diff = seq - (int64_t)(pos + count + 1);
+                if (diff == 0) {
+                    count++;
+                    continue;
+                }
+                if (diff < 0) {
+                    break;
+                }
+                count = -1;
+                break;
+            }
+            if (count == 0) return 0;
+            if (count < 0) continue;
+            if (dequeue_pos.compare_exchange_weak(pos, pos + count,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+
+        for (int i = 0; i < count; i++) {
+            PTO2ReadyQueueSlot* slot = &slots[(pos + i) & mask];
+            out[i] = slot->slot_state;
+            slot->sequence.store((int64_t)(pos + i + mask + 1), std::memory_order_release);
+        }
+        return count;
+    }
+
+#if PTO2_SCHED_PROFILING
+    int pop_batch(PTO2TaskSlotState** out, int max_count, uint64_t& atomic_count, uint64_t& wait_cycle) {
+        uint64_t pos;
+        int count;
+        uint64_t t0 = get_sys_cnt_aicpu();
+        bool contended = false;
+        uint32_t atomic_ops = 0;
+        while (true) {
+            pos = dequeue_pos.load(std::memory_order_relaxed);
+            atomic_ops++;  // dequeue_pos.load
+            count = 0;
+            while (count < max_count) {
+                PTO2ReadyQueueSlot* slot = &slots[(pos + count) & mask];
+                int64_t seq = slot->sequence.load(std::memory_order_acquire);
+                int64_t diff = seq - (int64_t)(pos + count + 1);
+                atomic_ops++;  // sequence.load
+                if (diff == 0) {
+                    count++;
+                    continue;
+                }
+                if (diff < 0) {
+                    break;
+                }
+                contended = true;
+                count = -1;
+                break;
+            }
+            if (count == 0) {
+                atomic_count += atomic_ops;
+                return 0;
+            }
+            if (count < 0) {
+                continue;
+            }
+            if (dequeue_pos.compare_exchange_weak(pos, pos + count,
+                    std::memory_order_relaxed, std::memory_order_relaxed)) {
+                atomic_ops++;  // successful CAS
+                break;
+            }
+            contended = true;
+            atomic_ops++;  // failed CAS
+        }
+
+        for (int i = 0; i < count; i++) {
+            PTO2ReadyQueueSlot* slot = &slots[(pos + i) & mask];
+            out[i] = slot->slot_state;
+            slot->sequence.store((int64_t)(pos + i + mask + 1), std::memory_order_release);
+            atomic_ops++;  // sequence.store
+        }
+        atomic_count += atomic_ops;
+        if (contended) {
+            wait_cycle += (get_sys_cnt_aicpu() - t0);
+        }
+        return count;
+    }
+#endif
 };
 
 // Cold-path ready queue operations (defined in pto_scheduler.cpp)
@@ -285,16 +414,12 @@ struct PTO2SchedulerState {
         PTO2TaskDescriptor* task_descriptors;
         PTO2TaskSlotState* slot_states;
         int32_t last_task_alive;
-        int32_t last_heap_consumed;
-        uint64_t heap_tail;
-        void* heap_base;
         int32_t task_window_mask;
         uint64_t task_window_size;
-        // Try-lock used to advance this ring's pointers (CONSUMED scanning + heap tail update).
+        // Try-lock used to advance this ring's last_task_alive pointer.
         std::atomic<int32_t> advance_lock;
 
-        bool init(PTO2SharedMemoryHandle* sm_handle, int32_t ring_id,
-                  void* gm_heap_base, uint64_t per_ring_heap_size);
+        bool init(PTO2SharedMemoryHandle* sm_handle, int32_t ring_id);
         void destroy();
 
         PTO2TaskSlotState& get_slot_state_by_task_id(int32_t local_id) {
@@ -306,7 +431,6 @@ struct PTO2SchedulerState {
 
         void sync_to_sm(PTO2SharedMemoryRingHeader& ring) {
             ring.fc.last_task_alive.store(last_task_alive, std::memory_order_release);
-            ring.fc.heap_tail.store(heap_tail, std::memory_order_release);
         }
 
         void advance_ring_pointers(PTO2SharedMemoryRingHeader& ring) {
@@ -318,15 +442,6 @@ struct PTO2SchedulerState {
                     break;
                 }
                 last_task_alive++;
-            }
-
-            if (last_task_alive > 0) {
-                int32_t last_consumed_id = last_task_alive - 1;
-                PTO2TaskSlotState& slot_state = get_slot_state_by_task_id(last_consumed_id);
-                PTO2TaskDescriptor& task = *slot_state.task;
-                if (task.packed_buffer_end != NULL) {
-                    heap_tail = (uint64_t)((char*)task.packed_buffer_end - (char*)heap_base);
-                }
             }
 
             sync_to_sm(ring);
@@ -423,8 +538,7 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    bool release_fanin_and_check_ready(PTO2TaskSlotState& slot_state,
-                                        PTO2LocalReadyBuffer* local_bufs = nullptr) {
+    bool release_fanin_and_check_ready(PTO2TaskSlotState& slot_state, PTO2LocalReadyBuffer* local_bufs = nullptr) {
         // Atomically increment fanin_refcount and check if all producers are done
         // ACQ_REL on fanin_refcount already synchronizes with the orchestrator's
         // init release, making fanin_count visible — plain load suffices.
@@ -434,12 +548,7 @@ struct PTO2SchedulerState {
             // Local-first: try per-CoreType thread-local buffer before global queue
             // Route by active_mask: AIC-containing tasks → buf[0], AIV-only → buf[1]
             PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
-            bool pushed_local = false;
-            if (local_bufs) {
-                int32_t buf_idx = (slot_state.active_mask & 0x01) ? 0 : 1;
-                pushed_local = local_bufs[buf_idx].try_push(&slot_state);
-            }
-            if (!pushed_local) {
+            if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                 ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
             }
             return true;
@@ -449,8 +558,9 @@ struct PTO2SchedulerState {
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
     bool release_fanin_and_check_ready(PTO2TaskSlotState& slot_state,
-                                        uint64_t& atomic_count, uint64_t& push_wait,
-                                        PTO2LocalReadyBuffer* local_bufs = nullptr) {
+        uint64_t& atomic_count,
+        uint64_t& push_wait,
+        PTO2LocalReadyBuffer* local_bufs = nullptr) {
         int32_t new_refcount = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
         atomic_count += 1;  // fanin_refcount.fetch_add
 
@@ -461,12 +571,7 @@ struct PTO2SchedulerState {
                 atomic_count += 1;  // CAS(task_state PENDING→READY)
                 // Local-first: try per-CoreType thread-local buffer before global queue
                 PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
-                bool pushed_local = false;
-                if (local_bufs) {
-                    int32_t buf_idx = (slot_state.active_mask & 0x01) ? 0 : 1;
-                    pushed_local = local_bufs[buf_idx].try_push(&slot_state);
-                }
-                if (!pushed_local) {
+                if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(&slot_state)) {
                     ready_queues[static_cast<int32_t>(shape)].push(&slot_state, atomic_count, push_wait);
                 }
                 return true;
@@ -476,52 +581,49 @@ struct PTO2SchedulerState {
     }
 #endif
 
-    PTO2TaskSlotState* get_ready_task(PTO2ResourceShape shape) {
-        return ready_queues[static_cast<int32_t>(shape)].pop();
-    }
-
-    template<CoreType CT>
-    PTO2TaskSlotState* get_ready_task(PTO2LocalReadyBuffer* local_bufs) {
-        constexpr int ct = static_cast<int>(CT);
-        if (local_bufs && local_bufs[ct].count > 0) {
-            return local_bufs[ct].pop();
+    int get_ready_tasks_batch(PTO2ResourceShape shape, PTO2LocalReadyBuffer& local_buf,
+                              PTO2TaskSlotState** out, int max_count) {
+        int count = 0;
+        while (count < max_count && local_buf.count > 0) {
+            out[count++] = local_buf.slot_states[--local_buf.count];
         }
-        return ready_queues[ct].pop();
+        int remaining = max_count - count;
+        if (remaining > 0) {
+            count += ready_queues[static_cast<int32_t>(shape)].pop_batch(out + count, remaining);
+        }
+        return count;
     }
 
 #if PTO2_SCHED_PROFILING
-    PTO2TaskSlotState* get_ready_task(PTO2ResourceShape shape, uint64_t& atomic_count, uint64_t& wait_cycle) {
-        return ready_queues[static_cast<int32_t>(shape)].pop(atomic_count, wait_cycle);
-    }
-
-    template<CoreType CT>
-    PTO2TaskSlotState* get_ready_task(PTO2LocalReadyBuffer* local_bufs,
-                           uint64_t& atomic_count, uint64_t& wait_cycle) {
-        constexpr int ct = static_cast<int>(CT);
-        if (local_bufs && local_bufs[ct].count > 0) {
-            return local_bufs[ct].pop();
+    int get_ready_tasks_batch(PTO2ResourceShape shape, PTO2LocalReadyBuffer& local_buf,
+                              PTO2TaskSlotState** out, int max_count,
+                              uint64_t& atomic_count, uint64_t& wait_cycle, uint64_t& local_dispatch_count) {
+        int count = 0;
+        while (count < max_count && local_buf.count > 0) {
+            local_dispatch_count++;
+            out[count++] = local_buf.slot_states[--local_buf.count];
         }
-        return ready_queues[ct].pop(atomic_count, wait_cycle);
+        int remaining = max_count - count;
+        if (remaining > 0) {
+            count += ready_queues[static_cast<int32_t>(shape)].pop_batch(
+                out + count, remaining, atomic_count, wait_cycle);
+        }
+        return count;
     }
 #endif
-
-    /**
-     * Requeue a ready task that could not be dispatched (no suitable cluster).
-     * Pushes the task back into its shape-based queue.
-     */
-    void requeue_ready_task(PTO2TaskSlotState& slot_state) {
-        PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
-        ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
-    }
 
     void on_scope_end(PTO2TaskSlotState** task_slot_states, int32_t count) {
 #if PTO2_ORCH_PROFILING
         extern uint64_t g_orch_scope_end_atomic_count;
+        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
         for (int32_t i = 0; i < count; i++) {
+            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
             release_producer(*task_slot_states[i], g_orch_scope_end_atomic_count);
         }
 #else
+        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
         for (int32_t i = 0; i < count; i++) {
+            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
             release_producer(*task_slot_states[i]);
         }
 #endif
@@ -661,8 +763,7 @@ struct PTO2SchedulerState {
 // =============================================================================
 
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
-                          PTO2SharedMemoryHandle* sm_handle,
-                          void* gm_heap_base, uint64_t per_ring_heap_size);
+                          PTO2SharedMemoryHandle* sm_handle);
 void pto2_scheduler_destroy(PTO2SchedulerState* sched);
 
 // =============================================================================

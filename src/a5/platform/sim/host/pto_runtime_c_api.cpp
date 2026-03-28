@@ -86,6 +86,11 @@ int init_runtime(RuntimeHandle runtime,
                                kernel_sizes, kernel_count);
 
         if (result != 0) {
+            // Clear SM pointer so validate_runtime_impl skips reading
+            // the uninitialized shared memory header (garbage graph_output_ptr
+            // could cause copy_from_device to access an invalid address).
+            r->set_pto2_gm_sm_ptr(nullptr);
+            validate_runtime_impl(r);
             r->~Runtime();
         }
 

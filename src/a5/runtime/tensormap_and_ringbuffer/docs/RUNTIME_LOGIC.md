@@ -325,7 +325,7 @@ When `pto2_submit_task` processes parameters:
 
 | Field | Description |
 |-------|-------------|
-| `mixed_task_id` | Canonical mixed-task ID (64-bit: `ring_id << 32 | local_id`). See [MULTI_RING.md §3](MULTI_RING.md). |
+| `task_id` | Canonical mixed-task ID (64-bit: `ring_id << 32 | local_id`). See [MULTI_RING.md §3](MULTI_RING.md). |
 | `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
 | `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
 | `subtask_done_mask` | Atomic bitmask; each subtask sets its done bit on completion |
@@ -417,8 +417,8 @@ Scopes control the lifetime of intermediate buffers. Each scope:
 ```cpp
 PTO2_SCOPE(rt) {
     // Tasks submitted here belong to this scope
-    pto2_rt_submit_aic_task(rt, FUNC_QK, args, n);
-    pto2_rt_submit_aiv_task(rt, FUNC_SF, args, n);
+    pto2_rt_submit_aic_task(FUNC_QK, args);
+    pto2_rt_submit_aiv_task(FUNC_SF, args);
 }
 // scope_end: scope reference released from all tasks above
 ```
@@ -446,11 +446,11 @@ Each scheduler thread runs a tight loop with two main phases:
 
 **Phase 1 — Completion Handling**:
 - Poll register `COND` on each managed core
-- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(mixed_task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, trigger `on_mixed_task_complete(mixed_task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
+- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, trigger `on_mixed_task_complete(task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
 
 **Phase 2 — Dispatch**:
 - For each idle core: pop a task from the matching shape-based ready queue (lock-free MPMC Vyukov queue, one per resource shape)
-- Build `PTO2DispatchPayload` from `TaskDescriptor` with `mixed_task_id`, `subslot`, `kernel_id`, and `core_type`
+- Build `PTO2DispatchPayload` from `TaskDescriptor` with `task_id`, `subslot`, `kernel_id`, and `core_type`
 - Write task pointer to `Handshake.task`, signal AICore via register `DATA_MAIN_BASE`
 
 After these phases, the scheduler updates profiling headers and checks for termination (all tasks completed and orchestrator done).
@@ -498,7 +498,7 @@ Each AICore worker has a `Handshake` struct in shared memory:
 
 Instead of polling `Handshake.task_status`, the production protocol uses hardware registers.
 
-> **Multi-ring note**: `mixed_task_id` is 64-bit but registers are 32-bit. A per-core monotonic dispatch counter (`s_dispatch_seq`) replaces `mixed_task_id` in register writes to prevent collisions. See [MULTI_RING.md §6](MULTI_RING.md).
+> **Multi-ring note**: `task_id` is 64-bit but registers are 32-bit. A per-core monotonic dispatch counter (`s_dispatch_seq`) replaces `task_id` in register writes to prevent collisions. See [MULTI_RING.md §6](MULTI_RING.md).
 
 | Register | Direction | Usage |
 |----------|-----------|-------|
@@ -518,7 +518,7 @@ Built by the scheduler from `PTO2TaskDescriptor`:
 
 | Field | Description |
 |-------|-------------|
-| `mixed_task_id` | Mixed-task identifier (for completion aggregation) |
+| `task_id` | Mixed-task identifier (for completion aggregation) |
 | `subslot` | Which subtask slot this dispatch represents (`AIC`, `AIV0`, or `AIV1`) |
 | `kernel_id` | Function ID for this subtask slot |
 | `core_type` | AIC or AIV |
@@ -572,23 +572,22 @@ The orchestration API is defined in `pto_orchestration_api.h`. Orchestration cod
 
 | Function/Macro | Purpose |
 |----------------|---------|
-| `pto2_rt_submit_task(rt, mixed_kernels, args, n)` | Submit a mixed task with `MixedKernels` struct |
-| `pto2_rt_submit_aic_task(rt, kernel_id, args, n)` | Convenience: submit AIC-only task |
-| `pto2_rt_submit_aiv_task(rt, kernel_id, args, n)` | Convenience: submit AIV-only task |
-| `PTO2_SCOPE(rt) { ... }` | RAII scope for buffer lifetime |
-| `pto2_rt_orchestration_done(rt)` | Signal orchestration complete |
-| `pto2_rt_init_tensor_pool(rt)` | Initialize tensor pool for `make_tensor()` |
+| `pto2_rt_submit_task(mixed_kernels, args)` | Submit a mixed task with `MixedKernels` struct |
+| `pto2_rt_submit_aic_task(kernel_id, args)` | Convenience: submit AIC-only task |
+| `pto2_rt_submit_aiv_task(kernel_id, args)` | Convenience: submit AIV-only task |
+| `PTO2_SCOPE() { ... }` | RAII scope for buffer lifetime |
+| `pto2_rt_orchestration_done()` | Signal orchestration complete |
 
 ### 11.2 Parameter Construction
 
 | Function | Description |
 |----------|-------------|
 | `make_tensor_external(ptr, shapes, ndim, dtype)` | Wrap an existing device pointer as a tensor |
-| `make_tensor(shapes, ndim, dtype)` | Create an intermediate tensor (addr=0, allocated by runtime from heap) |
-| `make_input_param(tensor)` | INPUT parameter — read by the task |
-| `make_output_param(tensor)` | OUTPUT parameter — written by the task (auto-allocated if addr=0) |
-| `make_inout_param(tensor)` | INOUT parameter — read then written |
-| `make_scalar_param(value)` | 64-bit scalar parameter |
+| `TensorCreateInfo(shapes, ndim, dtype)` | Describe a runtime-created output buffer |
+| `Arg::add_input(tensor)` | INPUT parameter — read by the task |
+| `Arg::add_output(create_info)` | OUTPUT parameter — runtime allocates and returns a Tensor |
+| `Arg::add_inout(tensor)` | INOUT parameter — existing tensor read then written |
+| `Arg::add_scalar(value)` | 64-bit scalar parameter |
 
 ### 11.3 Resource Shapes
 
@@ -608,7 +607,7 @@ Each orchestration `.so` must export:
 
 ```cpp
 extern "C" PTO2OrchestrationConfig aicpu_orchestration_config(uint64_t* args, int arg_count);
-extern "C" void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count);
+extern "C" void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index);
 ```
 
 ---
@@ -641,12 +640,12 @@ RUNTIME_CONFIG = {
 ### 12.2 Orchestration Structure
 
 ```cpp
-void aicpu_orchestration_entry(PTO2Runtime* rt, uint64_t* args, int arg_count) {
+void aicpu_orchestration_entry(uint64_t* args, int arg_count, int orch_thread_num, int orch_thread_index) {
     // Unpack args: query, key_cache, value_cache, block_table, context_lens, out, config
     for (q_idx = 0; q_idx < q_loop; q_idx++) {
         for (batch_start = 0; batch_start < batch; batch_start += IN_CORE_BATCH) {
-            PTO2_SCOPE(rt) {
-                // Allocate accumulator tensors (oi, li, mi) via make_tensor()
+            PTO2_SCOPE() {
+                // Describe accumulator tensors (oi, li, mi) with TensorCreateInfo
                 // Submit AIV_HUB to initialize accumulators
                 for (bn = 0; bn < max_bn; bn++) {
                     // Allocate intermediate tensors (sij, pij, mij, lij, oi_new)

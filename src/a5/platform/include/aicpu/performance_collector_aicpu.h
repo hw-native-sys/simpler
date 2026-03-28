@@ -33,26 +33,26 @@ void perf_aicpu_init_profiling(Runtime* runtime);
  *
  * Reads perf_buf->count, validates task_id match against the latest record,
  * and fills all AICPU-side fields. Callers must pre-extract fanout into a
- * plain int32_t array (platform layer cannot depend on runtime linked-list types).
+ * plain uint64_t array (platform layer cannot depend on runtime linked-list types).
  *
- * @param perf_buf         PerfBuffer pointer (from handshake perf_records_addr)
- * @param expected_task_id Task ID to validate against the latest record
- * @param func_id          Kernel function identifier
- * @param core_type        Core type (AIC/AIV)
- * @param dispatch_time    AICPU timestamp when task was dispatched
- * @param finish_time      AICPU timestamp when task completion was observed
- * @param ring_id          Ring layer (0 for single-ring / host_build_graph)
- * @param fanout           Pre-extracted successor task ID array (nullptr if none)
- * @param fanout_count     Number of entries in fanout array (0 if none)
+ * @param perf_buf              PerfBuffer pointer (from handshake perf_records_addr)
+ * @param expected_reg_task_id  Register dispatch token (low 32 bits) to validate
+ * @param task_id               Task identifier to write (PTO2 encoding or plain id)
+ * @param func_id               Kernel function identifier
+ * @param core_type             Core type (AIC/AIV)
+ * @param dispatch_time         AICPU timestamp when task was dispatched
+ * @param finish_time           AICPU timestamp when task completion was observed
+ * @param fanout                Pre-extracted successor task ID array (nullptr if none)
+ * @param fanout_count          Number of entries in fanout array (0 if none)
  */
 int perf_aicpu_complete_record(PerfBuffer* perf_buf,
-                                uint32_t expected_task_id,
+                                uint32_t expected_reg_task_id,
+                                uint64_t task_id,
                                 uint32_t func_id,
                                 CoreType core_type,
                                 uint64_t dispatch_time,
                                 uint64_t finish_time,
-                                uint8_t ring_id,
-                                const int32_t* fanout,
+                                const uint64_t* fanout,
                                 int32_t fanout_count);
 
 /**
@@ -115,12 +115,14 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, in
  * @param start_time Phase start timestamp
  * @param end_time Phase end timestamp
  * @param loop_iter Current loop iteration number
- * @param tasks_processed Number of tasks processed in this phase
+ * @param tasks_processed Number of tasks processed in this batch (scheduler phases), or
+ *                        full PTO2 task_id encoding (ring_id << 32) | local_id (orchestrator
+ *                        phases in multi-ring runtimes: tensormap_and_ringbuffer, aicpu_build_graph)
  */
 void perf_aicpu_record_phase(int thread_idx,
                               AicpuPhaseId phase_id,
                               uint64_t start_time, uint64_t end_time,
-                              uint32_t loop_iter, uint32_t tasks_processed);
+                              uint32_t loop_iter, uint64_t tasks_processed);
 
 /**
  * Write orchestrator cumulative summary
@@ -152,11 +154,13 @@ void perf_aicpu_set_orch_thread_idx(int thread_idx);
  * @param start_time Phase start timestamp
  * @param end_time Phase end timestamp
  * @param submit_idx Task submission index (acts as loop_iter)
- * @param task_id Task ID (stored in tasks_processed field for task tracking)
+ * @param task_id Task identifier. For multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph), this is the full PTO2 encoding:
+ *               (ring_id << 32) | local_id, enabling cross-view correlation between orchestrator
+ *               and scheduler swimlanes.
  */
 void perf_aicpu_record_orch_phase(AicpuPhaseId phase_id,
                                    uint64_t start_time, uint64_t end_time,
-                                   uint32_t submit_idx, uint32_t task_id);
+                                   uint32_t submit_idx, uint64_t task_id);
 
 /**
  * Write core-to-thread assignment mapping to shared memory

@@ -94,12 +94,14 @@ static __aicore__ void qk_matmul_n_impl(
             pipe_barrier(PIPE_ALL);
         }
     }
+    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ TensorData* qi = reinterpret_cast<__gm__ TensorData*>(args[0]);
-    __gm__ TensorData* key_cache = reinterpret_cast<__gm__ TensorData*>(args[1]);
-    __gm__ TensorData* sij_buf = reinterpret_cast<__gm__ TensorData*>(args[2]);
+    __gm__ Tensor* qi = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* key_cache = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* sij_buf = reinterpret_cast<__gm__ Tensor*>(args[2]);
     uint64_t n_blocks = static_cast<uint64_t>(args[3]);
     __gm__ int32_t* block_table = reinterpret_cast<__gm__ int32_t*>(args[4]);
 

@@ -249,16 +249,6 @@ public:
     int export_swimlane_json(const std::string& output_path = "outputs");
 
     /**
-     * Remove a kernel binary from device memory
-     *
-     * Frees the device memory allocated for the kernel and removes the
-     * cached entry. This should be called during per-case cleanup.
-     *
-     * @param func_id   Function identifier to remove
-     */
-    void remove_kernel_binary(int func_id);
-
-    /**
      * Cleanup all resources
      *
      * Frees all device memory, destroys streams, and resets state.
@@ -314,6 +304,16 @@ public:
      * @return Device GM address of kernel on success, 0 on error
      */
     uint64_t upload_kernel_binary(int func_id, const uint8_t* bin_data, size_t bin_size);
+
+    /**
+     * Remove a kernel binary from device memory
+     *
+     * Frees the device memory allocated for the kernel and removes the
+     * cached entry. This should be called during per-case cleanup.
+     *
+     * @param func_id   Function identifier to remove
+     */
+    void remove_kernel_binary(int func_id);
 
     /**
      * Ensure device is set and streams are created (minimal initialization)

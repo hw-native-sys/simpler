@@ -25,10 +25,9 @@
  * Arg layout: [A, B, C]  — shape/dtype/size in TaskArg metadata
  */
 
- #include <stddef.h>
- #include <stdint.h>
- 
- #include "pto_orchestration_api.h"
+#include <cstdint>
+
+#include "pto_orchestration_api.h"
  
  #define FUNC_GEMM_TILE 0
  #define FUNC_TILE_ADD  1
@@ -53,7 +52,7 @@
  }
  
  __attribute__((visibility("default")))
- void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
+ void aicpu_orchestration_entry(TaskArg* orch_args, int orch_thread_num, int orch_thread_index) {
      (void)orch_thread_num;
      (void)orch_thread_index;
  
@@ -62,7 +61,7 @@
      Tensor ext_B = from_task_arg(orch_args[1]);
      Tensor ext_C = from_task_arg(orch_args[2]);
  
-     LOG_INFO(rt, "[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d",
+     LOG_INFO("[bgemm_orch] Grid: %dx%dx%d, Batch: %d, Tile: %d",
                    GRID_M, GRID_K, GRID_N, BATCH, TILE);
  
      uint32_t tile_shapes[1] = {TILE_ELEMS};
@@ -70,7 +69,7 @@
      for (int batch = 0; batch < BATCH; batch++) {
          for (int m_idx = 0; m_idx < GRID_M; m_idx++) {
              for (int n_idx = 0; n_idx < GRID_N; n_idx++) {
-                 PTO2_SCOPE(rt) {
+                 PTO2_SCOPE() {
                      uint32_t c_elem_offset =
                          ((uint32_t)batch * GRID_M * GRID_N +
                           (uint32_t)m_idx * GRID_N +
@@ -103,14 +102,14 @@
                          mk.aic_kernel_id  = FUNC_GEMM_TILE;
                          mk.aiv0_kernel_id = FUNC_TILE_ADD;
                          mk.aiv1_kernel_id = FUNC_TILE_ADD;
-                         pto2_rt_submit_task(rt, mk, args);
+                         pto2_rt_submit_task(mk, args);
                      }
                  }
              }
          }
      }
  
-     LOG_INFO(rt, "[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each",
+     LOG_INFO("[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each",
                    BATCH, GRID_M, GRID_N, GRID_K);
  }
  

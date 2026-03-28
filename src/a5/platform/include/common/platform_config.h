@@ -202,7 +202,6 @@ inline volatile uint8_t* sparse_reg_ptr(volatile uint8_t* reg_base, uint32_t off
 // Hardware Configuration Constants
 // =============================================================================
 
-
 /**
  * Number of sub-cores per AICore
  * Hardware architecture: 1 AICore = 1 AIC + 2 AIV sub-cores

@@ -14,8 +14,8 @@
 
 // Include platform-specific timestamp implementation
 // Build system selects the correct inner_kernel.h based on platform:
-// - src/platform/a2a3/aicore/inner_kernel.h (real hardware)
-// - src/platform/a2a3sim/aicore/inner_kernel.h (simulation)
+// - src/a2a3/platform/onboard/aicore/inner_kernel.h (real hardware)
+// - src/a2a3/platform/sim/aicore/inner_kernel.h (simulation)
 // Both provide unified get_sys_cnt_aicore() interface
 #include "inner_kernel.h"
 

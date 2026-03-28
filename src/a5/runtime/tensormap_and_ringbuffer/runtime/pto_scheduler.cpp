@@ -3,7 +3,7 @@
  *
  * Implements scheduler state management, ready queues, and task lifecycle.
  *
- * Based on: docs/runtime_buffer_manager_methods.md
+ * Based on: docs/RUNTIME_LOGIC.md
  */
 
 #include "pto_scheduler.h"
@@ -103,15 +103,11 @@ void pto2_ready_queue_destroy(PTO2ReadyQueue* queue) {
 // =============================================================================
 
 bool PTO2SchedulerState::RingSchedState::init(
-    PTO2SharedMemoryHandle* sm_handle, int32_t ring_id,
-    void* gm_heap_base, uint64_t per_ring_heap_size) {
+    PTO2SharedMemoryHandle* sm_handle, int32_t ring_id) {
     task_descriptors = sm_handle->task_descriptors[ring_id];
-    heap_base = (char*)gm_heap_base + ring_id * per_ring_heap_size;
     task_window_size = sm_handle->header->rings[ring_id].task_window_size;
     task_window_mask = static_cast<int32_t>(task_window_size - 1);
     last_task_alive = 0;
-    last_heap_consumed = 0;
-    heap_tail = 0;
     slot_states = nullptr;
     advance_lock.store(0, std::memory_order_relaxed);
 
@@ -147,8 +143,7 @@ void PTO2SchedulerState::RingSchedState::destroy() {
 }
 
 bool pto2_scheduler_init(PTO2SchedulerState* sched,
-                          PTO2SharedMemoryHandle* sm_handle,
-                          void* gm_heap_base, uint64_t per_ring_heap_size) {
+                          PTO2SharedMemoryHandle* sm_handle) {
     sched->sm_handle = sm_handle;
 #if PTO2_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
@@ -157,7 +152,7 @@ bool pto2_scheduler_init(PTO2SchedulerState* sched,
 
     // Initialize per-ring state
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (!sched->ring_sched_states[r].init(sm_handle, r, gm_heap_base, per_ring_heap_size)) {
+        if (!sched->ring_sched_states[r].init(sm_handle, r)) {
             for (int j = 0; j < r; j++) {
                 sched->ring_sched_states[j].destroy();
             }
@@ -199,11 +194,9 @@ void pto2_scheduler_destroy(PTO2SchedulerState* sched) {
 void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
     LOG_INFO("=== Scheduler Statistics ===");
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        if (sched->ring_sched_states[r].last_task_alive > 0 ||
-            sched->ring_sched_states[r].heap_tail > 0) {
+        if (sched->ring_sched_states[r].last_task_alive > 0) {
             LOG_INFO("Ring %d:", r);
             LOG_INFO("  last_task_alive: %d", sched->ring_sched_states[r].last_task_alive);
-            LOG_INFO("  heap_tail:       %" PRIu64, sched->ring_sched_states[r].heap_tail);
         }
     }
 #if PTO2_SCHED_PROFILING
@@ -216,7 +209,7 @@ void pto2_scheduler_print_stats(PTO2SchedulerState* sched) {
 void pto2_scheduler_print_queues(PTO2SchedulerState* sched) {
     LOG_INFO("=== Ready Queues ===");
 
-    const char* shape_names[] = {"AIC_ONLY", "AIV_X1", "AIV_X2", "AIC_AIV_X1", "AIC_AIV_X2"};
+    const char* shape_names[] = {"AIC", "AIV", "MIX"};
 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         LOG_INFO("  %s: count=%" PRIu64, shape_names[i],

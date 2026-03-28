@@ -19,8 +19,8 @@
 #ifndef PLATFORM_AICPU_PLATFORM_REGS_H_
 #define PLATFORM_AICPU_PLATFORM_REGS_H_
 
-#include <cstddef>
 #include <cstdint>
+#include <cstddef>
 #include "common/platform_config.h"
 
 #ifdef __cplusplus

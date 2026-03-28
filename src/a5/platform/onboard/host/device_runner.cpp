@@ -12,6 +12,7 @@
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
 #include "host/host_regs.h"  // Register address retrieval
+#include "host/raii_scope_guard.h"
 
 // =============================================================================
 // Lazy-loaded HAL (ascend_hal) for profiling host-register only
@@ -47,6 +48,7 @@ HalHostUnregisterFn get_halHostUnregister() {
     }
     return reinterpret_cast<HalHostUnregisterFn>(dlsym(g_hal_handle, "halHostUnregister"));
 }
+
 }  // namespace
 
 // =============================================================================
@@ -379,6 +381,19 @@ int DeviceRunner::run(Runtime& runtime,
     }
     LOG_DEBUG("");
 
+    // Scope guards for cleanup on all exit paths
+    auto regs_cleanup = RAIIScopeGuard([this]() {
+        if (kernel_args_.args.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
+            kernel_args_.args.regs = 0;
+        }
+    });
+
+    auto runtime_args_cleanup = RAIIScopeGuard([this]() {
+        kernel_args_.finalize_runtime_args();
+    });
+
+
     // Initialize performance profiling if enabled
     if (runtime.enable_profiling) {
         rc = init_performance_profiling(runtime, num_aicore, device_id);
@@ -389,6 +404,13 @@ int DeviceRunner::run(Runtime& runtime,
         // Start memory management thread
         perf_collector_.start_memory_manager();
     }
+
+    auto perf_cleanup = RAIIScopeGuard([this]() {
+        bool was_initialized = perf_collector_.is_initialized();
+        if (was_initialized) {
+            perf_collector_.stop_memory_manager();
+        }
+    });
 
     std::cout << "\n=== Initialize runtime args ===" << '\n';
     // Initialize runtime args
@@ -403,11 +425,6 @@ int DeviceRunner::run(Runtime& runtime,
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
-        if (kernel_args_.args.regs != 0) {
-            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
-            kernel_args_.args.regs = 0;
-        }
-        kernel_args_.finalize_runtime_args();
         return rc;
     }
 
@@ -416,11 +433,6 @@ int DeviceRunner::run(Runtime& runtime,
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
-        if (kernel_args_.args.regs != 0) {
-            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
-            kernel_args_.args.regs = 0;
-        }
-        kernel_args_.finalize_runtime_args();
         return rc;
     }
 
@@ -429,56 +441,37 @@ int DeviceRunner::run(Runtime& runtime,
     rc = launch_aicore_kernel(stream_aicore_, kernel_args_.args.runtime_args);
     if (rc != 0) {
         LOG_ERROR("launch_aicore_kernel failed: %d", rc);
-        if (kernel_args_.args.regs != 0) {
-            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
-            kernel_args_.args.regs = 0;
-        }
-        kernel_args_.finalize_runtime_args();
         return rc;
     }
 
-    // Poll and collect performance data in a separate collector thread
-    std::thread collector_thread;
-    if (runtime.enable_profiling) {
-        collector_thread = std::thread([this, &runtime]() {
-            poll_and_collect_performance_data(runtime.get_task_count());
+    {
+        // Poll and collect performance data in a separate collector thread
+        std::thread collector_thread;
+        if (runtime.enable_profiling) {
+            collector_thread = std::thread([this, &runtime]() {
+                poll_and_collect_performance_data(runtime.get_task_count());
+            });
+        }
+        auto thread_guard = RAIIScopeGuard([&]() {
+            if (runtime.enable_profiling && collector_thread.joinable()) {
+                collector_thread.join();
+            }
         });
-    }
 
-    std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
-    // Synchronize streams
-    rc = rtStreamSynchronize(stream_aicpu_);
-    if (rc != 0) {
-        LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
-        if (runtime.enable_profiling && collector_thread.joinable()) {
-            collector_thread.join();
+        std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
+        // Synchronize streams
+        rc = rtStreamSynchronize(stream_aicpu_);
+        if (rc != 0) {
+            LOG_ERROR("rtStreamSynchronize (AICPU) failed: %d", rc);
+            return rc;
         }
-        if (kernel_args_.args.regs != 0) {
-            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
-            kernel_args_.args.regs = 0;
-        }
-        kernel_args_.finalize_runtime_args();
-        return rc;
-    }
 
-    std::cout << "\n=== rtStreamSynchronize stream_aicore_===" << '\n';
-    rc = rtStreamSynchronize(stream_aicore_);
-    if (rc != 0) {
-        LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
-        if (runtime.enable_profiling && collector_thread.joinable()) {
-            collector_thread.join();
+        std::cout << "\n=== rtStreamSynchronize stream_aicore_===" << '\n';
+        rc = rtStreamSynchronize(stream_aicore_);
+        if (rc != 0) {
+            LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
+            return rc;
         }
-        if (kernel_args_.args.regs != 0) {
-            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
-            kernel_args_.args.regs = 0;
-        }
-        kernel_args_.finalize_runtime_args();
-        return rc;
-    }
-
-    // Wait for collector thread to finish
-    if (runtime.enable_profiling && collector_thread.joinable()) {
-        collector_thread.join();
     }
 
     // Stop memory management, drain remaining buffers, collect phase data, export
@@ -491,13 +484,6 @@ int DeviceRunner::run(Runtime& runtime,
 
     // Print handshake results (reads from device memory, must be before free)
     print_handshake_results();
-
-    // Free per-run resources
-    if (kernel_args_.args.regs != 0) {
-        mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.args.regs));
-        kernel_args_.args.regs = 0;
-    }
-    kernel_args_.finalize_runtime_args();
 
     return 0;
 }

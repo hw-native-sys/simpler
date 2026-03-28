@@ -26,15 +26,15 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void online_update_impl(__gm__ TensorData* mij,
-    __gm__ TensorData* lij,
-    __gm__ TensorData* oi_new,
-    __gm__ TensorData* mi,
-    __gm__ TensorData* li,
-    __gm__ TensorData* oi,
+static __aicore__ void online_update_impl(__gm__ Tensor* mij,
+    __gm__ Tensor* lij,
+    __gm__ Tensor* oi_new,
+    __gm__ Tensor* mi,
+    __gm__ Tensor* li,
+    __gm__ Tensor* oi,
     uint64_t is_first,
     uint64_t is_last,
-    __gm__ TensorData* dst) {
+    __gm__ Tensor* dst) {
     __gm__ float* mij_ptr = reinterpret_cast<__gm__ float*>(mij->buffer.addr);
     __gm__ float* lij_ptr = reinterpret_cast<__gm__ float*>(lij->buffer.addr);
     __gm__ float* oi_new_ptr = reinterpret_cast<__gm__ float*>(oi_new->buffer.addr);
@@ -174,31 +174,21 @@ static __aicore__ void online_update_impl(__gm__ TensorData* mij,
         TASSIGN(tmpRow, 2 * kDataBytes + 8 * kScalarDNBytes);
 
         TMAX(miNewRow, miRow, mijRow);        // mi_new = max(mi, mij)
-        
         TSUB(alphaRow, miRow, miNewRow);      // alpha_exp = mi - mi_new
-        
         TEXP(alphaRow, alphaRow);             // alpha = exp(mi - mi_new)
-        
         TSUB(betaRow, mijRow, miNewRow);      // beta_exp = mij - mi_new
-        
         TEXP(betaRow, betaRow);               // beta = exp(mij - mi_new)
-        
         TMUL(tmpRow, alphaRow, liRow);        // alpha * li
-        
         TMUL(liNewRow, betaRow, lijRow);      // beta * lij
-        
         TADD(liNewRow, tmpRow, liNewRow);     // li_new = alpha*li + beta*lij
 
         // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for TROWEXPANDMUL
-        
         TRESHAPE(alphaDN, alphaRow);
         TRESHAPE(betaDN, betaRow);
 
         // Scale data tiles using row-broadcast multiply
         TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
-        
         TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);   // oi_new *= beta
-        
         TADD(oiTile, oiTile, oiNewTile);              // oi = alpha*oi + beta*oi_new
 
         // Store mi_new and li_new to GM (ND format)
@@ -210,7 +200,6 @@ static __aicore__ void online_update_impl(__gm__ TensorData* mij,
         if (is_last) {
             // Normalize and output: dst = oi / li_new
             TRESHAPE(liNewDN, liNewRow);
-            
             TROWEXPANDDIV(oiTile, oiTile, liNewDN);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -226,16 +215,18 @@ static __aicore__ void online_update_impl(__gm__ TensorData* mij,
             TSTORE(oiGlobal, oiTile);
         }
     }
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ TensorData* mij = reinterpret_cast<__gm__ TensorData*>(args[0]);
-    __gm__ TensorData* lij = reinterpret_cast<__gm__ TensorData*>(args[1]);
-    __gm__ TensorData* oi_new = reinterpret_cast<__gm__ TensorData*>(args[2]);
-    __gm__ TensorData* mi = reinterpret_cast<__gm__ TensorData*>(args[3]);
-    __gm__ TensorData* li = reinterpret_cast<__gm__ TensorData*>(args[4]);
-    __gm__ TensorData* oi = reinterpret_cast<__gm__ TensorData*>(args[5]);
-    __gm__ TensorData* dst = reinterpret_cast<__gm__ TensorData*>(args[6]);
+    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* oi_new = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ Tensor* mi = reinterpret_cast<__gm__ Tensor*>(args[3]);
+    __gm__ Tensor* li = reinterpret_cast<__gm__ Tensor*>(args[4]);
+    __gm__ Tensor* oi = reinterpret_cast<__gm__ Tensor*>(args[5]);
+    __gm__ Tensor* dst = reinterpret_cast<__gm__ Tensor*>(args[6]);
     uint64_t is_first = static_cast<uint64_t>(args[7]);
     uint64_t is_last = static_cast<uint64_t>(args[8]);
     uint64_t q_tile_size = static_cast<uint64_t>(mij->shapes[0]);

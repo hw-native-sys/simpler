@@ -1,33 +1,45 @@
 /**
  * @file pto2_dispatch_payload.h
- * @brief Minimal dispatch payload for AICore kernel execution
+ * @brief Per-core dispatch payload for AICore kernel execution
  *
- * Shared between AICPU (builds in-place) and AICore (reads to run kernel).
- * Handshake.task points to PTO2DispatchPayload embedded in PTO2TaskPayload.
+ * PTO2DispatchPayload holds the kernel function address and a pointer to the
+ * pre-built args[] array in the task payload. AICPU maintains a static array
+ * of these (one per core) and writes both fields before each dispatch. AICore
+ * caches a pointer to its per-core slot at startup and reads from it on each
+ * dispatch. The struct is cache-line aligned to avoid false sharing across
+ * concurrently dispatched cores.
  *
- * Only contains fields AICore needs to execute: function address + arguments.
- * Metadata (task_id, kernel_id, core_type) lives in PTO2TaskDescriptor and
- * is accessed by AICPU when needed (profiling, diagnostics).
+ * The args[] array (tensor GM pointers followed by scalar values) is built once
+ * by the Orchestrator at submit time in PTO2TaskPayload::init().
+ *
+ * The DATA_MAIN_BASE register protocol is unchanged from the base runtime:
+ * a monotonically increasing reg_task_id signals new work to AICore.
  */
 
 #ifndef RT2_PTO2_DISPATCH_PAYLOAD_H_
 #define RT2_PTO2_DISPATCH_PAYLOAD_H_
 
 #include <stdint.h>
+#include "pto_types.h"
+#include "common/qualifier.h"
 
-/** Max arguments per task; must match RUNTIME_MAX_ARGS and PTO2_MAX_OUTPUTS */
+/** Max dispatch arguments: 128 scalars + up to 16 tensor pointers */
 #ifndef PTO2_DISPATCH_MAX_ARGS
-#define PTO2_DISPATCH_MAX_ARGS 128
+#define PTO2_DISPATCH_MAX_ARGS (MAX_SCALAR_ARGS + MAX_TENSOR_ARGS)
 #endif
 
 /**
- * Dispatch payload: minimal execution interface for AICore.
- * Layout: function_bin_addr followed by args[].
- * AICore reads function_bin_addr, casts to UnifiedKernelFunc, calls with args.
+ * Per-core dispatch payload: function address + args pointer.
+ *
+ * AICPU maintains a static array s_pto2_payload_per_core[RUNTIME_MAX_WORKER].
+ * Before each dispatch, AICPU writes function_bin_addr (looked up from
+ * func_id_to_addr_[kernel_id]) and args (pointer to pre-built dispatch_args[]
+ * in PTO2TaskPayload). AICore caches a pointer to its slot at startup (via
+ * Handshake.task) and reads both fields after each DATA_MAIN_BASE change.
  */
-struct PTO2DispatchPayload {
-    uint64_t function_bin_addr; /**< Kernel entry in GM: (UnifiedKernelFunc)function_bin_addr */
-    uint64_t args[PTO2_DISPATCH_MAX_ARGS]; /**< Kernel arguments (GM pointers + scalars) */
+struct alignas(64) PTO2DispatchPayload {
+    uint64_t function_bin_addr;    /**< Kernel entry address in GM (set by Scheduler) */
+    __gm__ uint64_t* args;         /**< Pre-built args in task payload GM (set by Scheduler) */
 };
 
 #endif  // RT2_PTO2_DISPATCH_PAYLOAD_H_

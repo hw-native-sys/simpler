@@ -69,7 +69,7 @@ Thread 3: PTO2 total submitted tasks = 16704
 
 ### Interpreting the Numbers
 
-- **cost > total**: The difference is overhead outside `pto2_submit_task` (the orchestration user code itself, scope_begin/end, make_tensor calls, etc.).
+- **cost > total**: The difference is overhead outside `pto2_submit_task` (the orchestration user code itself, scope_begin/end, TensorCreateInfo construction, etc.).
 - **lookup+dep** is typically the dominant cost (~50%) because it involves TensorMap hash lookups and building dependency edges with spinlock-protected fanout list insertions.
 - **param_copy** scales with the number of parameters per task.
 - **avg/task < 1us** indicates efficient graph construction.
@@ -110,7 +110,7 @@ The scheduler loop runs four phases each iteration. Each phase's time is accumul
 
 | Phase | What it does | Inline stats |
 |-------|-------------|-------------|
-| **complete** | Polls handshake on each managed core; when a core completes, calls `on_subtask_complete(mixed_task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, triggers `on_mixed_task_complete` which traverses fanout list (notify consumers) and fanin list (release producers) | `fanout`: edges/max_degree/avg for consumer notification; `fanin`: edges/max_degree/avg for producer release |
+| **complete** | Polls handshake on each managed core; when a core completes, calls `on_subtask_complete(task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, triggers `on_mixed_task_complete` which traverses fanout list (notify consumers) and fanin list (release producers) | `fanout`: edges/max_degree/avg for consumer notification; `fanin`: edges/max_degree/avg for producer release |
 | **scan** | Updates the perf profiling header with latest scheduler state | — |
 | **dispatch** | For each idle core, pops a task from the shape-based ready queue via `get_ready_task(shape)`, builds the dispatch payload, and writes the task to the core's handshake register | `pop`: `hit` = successful pops (task dispatched), `miss` = empty queue pops, `hit_rate` = hit/(hit+miss) |
 | **idle** | Scheduler loop iteration where no progress was made (no completions, no dispatches) | — |

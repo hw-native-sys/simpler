@@ -16,6 +16,7 @@
 
 #include "device_runner.h"
 #include "aicpu/platform_aicpu_affinity.h"
+#include "host/raii_scope_guard.h"
 
 // Function pointer types for dynamically loaded executors
 typedef int (*aicpu_execute_func_t)(Runtime* runtime);
@@ -140,14 +141,14 @@ int DeviceRunner::run(Runtime& runtime,
 
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
-        LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", 
+        LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]",
                        launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
     }
 
     // Validate block_dim
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
-        LOG_ERROR("block_dim (%d) must be in range [1, %d]", 
+        LOG_ERROR("block_dim (%d) must be in range [1, %d]",
                        block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;
     }
@@ -162,11 +163,10 @@ int DeviceRunner::run(Runtime& runtime,
     }
 
     // Validate even core distribution for initial scheduler threads
-    // All-orchestrator mode (scheduler_thread_num == 0): cores assigned post-transition
     if (scheduler_thread_num > 0) {
         if (block_dim % scheduler_thread_num != 0) {
-            LOG_ERROR("block_dim (%d) must be evenly divisible by scheduler_thread_num (%d)",
-                      block_dim, scheduler_thread_num);
+            LOG_ERROR("block_dim (%d) not evenly divisible by scheduler_thread_num (%d)",
+                     block_dim, scheduler_thread_num);
             return -1;
         }
     } else {
@@ -242,6 +242,13 @@ int DeviceRunner::run(Runtime& runtime,
         perf_collector_.start_memory_manager();
     }
 
+    auto perf_cleanup = RAIIScopeGuard([this]() {
+        bool was_initialized = perf_collector_.is_initialized();
+        if (was_initialized) {
+            perf_collector_.stop_memory_manager();
+        }
+    });
+
     // Allocate simulated register blocks for all AICore cores
     // Using sparse mapping: 2 x 4KB pages per core instead of 24KB contiguous block
     size_t total_reg_size = num_aicore * SIM_REG_TOTAL_SIZE;
@@ -251,6 +258,10 @@ int DeviceRunner::run(Runtime& runtime,
         return -1;
     }
     std::memset(reg_blocks, 0, total_reg_size);
+
+    auto reg_blocks_cleanup = RAIIScopeGuard([this, reg_blocks]() {
+        mem_alloc_.free(reg_blocks);
+    });
 
     // Build array of per-core register base addresses
     // Each core gets a pointer to its 8KB region (containing two 4KB pages)
@@ -265,6 +276,13 @@ int DeviceRunner::run(Runtime& runtime,
             static_cast<uint8_t*>(reg_blocks) + i * SIM_REG_TOTAL_SIZE);
     }
     kernel_args_.regs = reinterpret_cast<uint64_t>(regs_array);
+
+    auto regs_array_cleanup = RAIIScopeGuard([this]() {
+        if (kernel_args_.regs != 0) {
+            mem_alloc_.free(reinterpret_cast<void*>(kernel_args_.regs));
+            kernel_args_.regs = 0;
+        }
+    });
 
     LOG_INFO("Allocated simulated registers: %d cores x 0x%x bytes (sparse: 2x4KB pages)",
              num_aicore, SIM_REG_TOTAL_SIZE);
@@ -512,12 +530,12 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
 
     // Define free callback (a5sim: use free)
     auto free_cb = [](void* dev_ptr, void* user_data) -> int {
-        (void)user_data;
+        (void)user_data;  // Not needed for free
         free(dev_ptr);
         return 0;
     };
 
-    // Simulation: no registration needed (pass nullptr for register_cb)
+    // Simulation: no registration needed (pass nullptr)
     return perf_collector_.initialize(runtime, num_aicore, device_id,
                                        alloc_cb, nullptr, free_cb, nullptr);
 }

@@ -25,8 +25,8 @@
 // =============================================================================
 // Platform-specific macros (__aicore__, dcci) are defined in inner_kernel.h
 // The build system selects the correct implementation based on platform:
-// - src/platform/a2a3/aicore/inner_kernel.h (real hardware)
-// - src/platform/a2a3sim/aicore/inner_kernel.h (simulation)
+// - src/a2a3/platform/onboard/aicore/inner_kernel.h (real hardware)
+// - src/a2a3/platform/sim/aicore/inner_kernel.h (simulation)
 
 #include "inner_kernel.h"
 

@@ -122,13 +122,10 @@ static __aicore__ void softmax_prepare_n_impl(
             TileSijDyn sijDynTile(static_cast<size_t>(valid_len_last));
             TASSIGN(sijDynTile, 0x0);
             TFILLPAD_INPLACE(sijPadTile_A, sijDynTile);
-            
         }
 
         TMULS(sijTile_A, sijTile_A, scale_value);
-        
         TROWMAX(localMaxDN, sijTile_A, tmpTile);
-        
 
         // TRESHAPE: ColMajor(M,1) → RowMajor(1,M) for element-wise TMAX
         TRESHAPE(localMaxRow, localMaxDN);
@@ -137,7 +134,6 @@ static __aicore__ void softmax_prepare_n_impl(
         } else {
             TMAX(globalMaxRow, globalMaxRow, localMaxRow);
         }
-        
     }
 
     // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for Pass 2's TROWEXPANDSUB
@@ -175,27 +171,20 @@ static __aicore__ void softmax_prepare_n_impl(
                 TASSIGN(curSijDyn, static_cast<int>(kDataBytes));
                 TFILLPAD_INPLACE(sijPadTile_B, curSijDyn);
             }
-            
         }
 
         // Compute on current buffer (select A or B based on iteration parity)
         if (i % 2 == 0) {
             TMULS(sijTile_A, sijTile_A, scale_value);
-            
             TROWEXPANDSUB(pijTile, sijTile_A, globalMaxDN);
         } else {
             TMULS(sijTile_B, sijTile_B, scale_value);
-            
             TROWEXPANDSUB(pijTile, sijTile_B, globalMaxDN);
         }
-        
         TEXP(pijTile, pijTile);
-        
         TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
-        
         TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
 
-        
         if (i == 0) {
             TMULS(sumAccTile, pijTile, 1.0f);
         } else {
@@ -203,7 +192,6 @@ static __aicore__ void softmax_prepare_n_impl(
         }
 
         // Store pij (must complete before next iteration's TCVT overwrites pijBf16Tile)
-        
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
         TSTORE(pijGlobal, pijBf16Tile);
@@ -222,20 +210,22 @@ static __aicore__ void softmax_prepare_n_impl(
     }
 
     // Compute final row sum from accumulated pij values
-    
     TROWSUM(sumDN, sumAccTile, tmpTile);
 
     // Store lij (total sum). mij already stored after Pass 1.
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(lijGlobalDN, sumDN);
+
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ TensorData* sij_buf = reinterpret_cast<__gm__ TensorData*>(args[0]);
-    __gm__ TensorData* pij_buf = reinterpret_cast<__gm__ TensorData*>(args[1]);
-    __gm__ TensorData* mij = reinterpret_cast<__gm__ TensorData*>(args[2]);
-    __gm__ TensorData* lij = reinterpret_cast<__gm__ TensorData*>(args[3]);
+    __gm__ Tensor* sij_buf = reinterpret_cast<__gm__ Tensor*>(args[0]);
+    __gm__ Tensor* pij_buf = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[3]);
     union {
         uint64_t u;
         float f;
