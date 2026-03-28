@@ -763,7 +763,13 @@ class CodeRunner:
             )
 
         def _compile_one_kernel(kernel):
-            logger.info(f"Compiling kernel: {kernel['source']} (func_id={kernel['func_id']})")
+            compiler_type = kernel.get("compiler", "pto")
+            logger.info(f"Compiling kernel: {kernel['source']} "
+                        f"(func_id={kernel['func_id']}, compiler={compiler_type})")
+
+            if compiler_type == "ascendc":
+                return _compile_one_ascendc_kernel(kernel)
+
             incore_o = kernel_compiler.compile_incore(
                 kernel["source"],
                 core_type=kernel["core_type"],
@@ -774,6 +780,54 @@ class CodeRunner:
                 kernel_bin = incore_o
             else:
                 kernel_bin = extract_text_section(incore_o)
+            return (kernel["func_id"], kernel_bin)
+
+        def _compile_one_ascendc_kernel(kernel):
+            from ascendc_compiler import AscendCCompiler, extract_kernel_artifacts
+
+            ascendc = AscendCCompiler(platform=self.platform)
+            tiling_data = None
+            ascendc_kernel_o = None
+
+            # Load pre-compiled .o from source path or kernel_meta
+            source_path = kernel["source"]
+            if source_path.endswith(".o"):
+                with open(source_path, 'rb') as f:
+                    ascendc_kernel_o = f.read()
+
+            # Extract from kernel_meta if provided
+            kernel_meta_dir = kernel.get("kernel_meta_dir")
+            if kernel_meta_dir:
+                kernel_meta_dir = os.path.abspath(kernel_meta_dir)
+                meta_o, tiling_data = extract_kernel_artifacts(kernel_meta_dir)
+                if ascendc_kernel_o is None and meta_o is not None:
+                    ascendc_kernel_o = meta_o
+
+            if ascendc_kernel_o is None:
+                raise ValueError(
+                    f"AscendC kernel requires a pre-compiled .o file. "
+                    f"Got source='{source_path}'. "
+                    f"Compile the AscendC kernel externally (e.g. via tikcpp_smoke) "
+                    f"and provide the .o path or kernel_meta_dir."
+                )
+
+            # Override tiling from explicit path
+            tiling_path = kernel.get("tiling_data_path")
+            if tiling_path and os.path.isfile(tiling_path):
+                with open(tiling_path, 'rb') as f:
+                    tiling_data = f.read()
+
+            combined_elf = ascendc.compile_ascendc_kernel(
+                ascendc_kernel_o=ascendc_kernel_o,
+                ascendc_kernel_symbol=kernel.get("ascendc_symbol", "ascendc_kernel"),
+                tensor_args=kernel.get("tensor_args", []),
+                tiling_data=tiling_data,
+                core_type=kernel.get("core_type", "aiv"),
+                has_workspace=kernel.get("has_workspace", False),
+                extra_include_dirs=runtime_include_dirs,
+                build_dir=self.build_dir,
+            )
+            kernel_bin = extract_text_section(combined_elf)
             return (kernel["func_id"], kernel_bin)
 
         # Launch all compilations concurrently
