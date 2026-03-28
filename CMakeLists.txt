@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 cmake_minimum_required(VERSION 3.15)
 
 # Support both scikit-build and native CMake builds
@@ -19,3 +27,12 @@ find_package(nanobind CONFIG REQUIRED)
 
 # Include Python bindings
 add_subdirectory(python/bindings)
+
+# Pre-build runtime binaries (persistent build dirs for incremental compilation)
+add_custom_target(build_runtimes ALL
+    COMMAND ${Python_EXECUTABLE}
+        ${CMAKE_SOURCE_DIR}/examples/scripts/build_runtimes.py
+        --lib-dir ${CMAKE_SOURCE_DIR}/build/lib
+        --cache-dir ${CMAKE_SOURCE_DIR}/build/cache
+    COMMENT "Building runtime binaries (incremental)..."
+)

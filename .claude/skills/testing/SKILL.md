@@ -18,6 +18,18 @@ description: Testing guide and pre-commit testing strategy for PTO Runtime. Use 
 
 **IMPORTANT**: Never pipe `ci.sh --parallel` output through buffering commands like `| tail`, `| grep`, or `| head`. Parallel mode spawns background subprocesses whose stdout is interleaved; pipe filters buffer until the pipe closes (all children exit), producing zero visible output and appearing hung. Always capture full output directly (`2>&1` without pipes).
 
+### Runtime rebuild decision
+
+Before running tests, determine whether runtime binaries need recompilation:
+
+| What changed | Rebuild needed? | How |
+| ------------ | --------------- | --- |
+| Runtime/platform C++ (`src/{arch}/runtime/`, `src/{arch}/platform/`) | Yes | Pass `--build` to `run_example.py`; `ci.sh` always rebuilds |
+| Nanobind bindings (`python/bindings/`) | Yes | Re-run `pip install -e .` |
+| Python-only code, examples, kernels | No | Just re-run the test |
+
+`ci.sh` relies on pre-built binaries from `pip install .`, so no `--build` flag is needed for CI runs. For single `run_example.py` invocations during development, pass `--build` when runtime C++ source has changed.
+
 ```bash
 # Python unit tests (no hardware)
 pytest tests -m "not requires_hardware" -v
@@ -34,8 +46,14 @@ cmake -B tests/cpp/build -S tests/cpp && cmake --build tests/cpp/build && ctest 
 # Single runtime
 ./ci.sh -p a2a3sim -r host_build_graph -c <commit> -t <timeout>
 
-# Single example
+# Single example (uses pre-built binaries)
 python examples/scripts/run_example.py \
+    -k examples/a2a3/host_build_graph/vector_example/kernels \
+    -g examples/a2a3/host_build_graph/vector_example/golden.py \
+    -p a2a3sim -c <commit>
+
+# Single example (recompile runtime from source, use after changing runtime C++)
+python examples/scripts/run_example.py --build \
     -k examples/a2a3/host_build_graph/vector_example/kernels \
     -g examples/a2a3/host_build_graph/vector_example/golden.py \
     -p a2a3sim -c <commit>
@@ -73,9 +91,11 @@ Run `git diff --name-only` (or `git diff --cached --name-only` for staged change
 | ------------- | ----- | --------------- |
 | `src/{arch}/platform/*` | Full (all runtimes) | `./ci.sh -p <platform>` |
 | `src/{arch}/runtime/<rt>/*` | Single runtime | `./ci.sh -p <platform> -r <rt>` |
-| `examples/{arch}/<rt>/<ex>/*` | Single example | `python examples/scripts/run_example.py -k <ex>/kernels -g <ex>/golden.py -p <platform>` |
+| `examples/{arch}/<rt>/<ex>/*` | Single example | `python examples/scripts/run_example.py --build -k <ex>/kernels -g <ex>/golden.py -p <platform>` |
 | `tests/ut/*` or `tests/cpp/*` | Unit tests only | `pytest tests -m "not requires_hardware" -v` and/or `ctest` |
 | Mixed (spans multiple categories) | Escalate to the **widest** matching scope | — |
+
+> **Note on `--build`**: When changed paths include `src/{arch}/runtime/` or `src/{arch}/platform/`, always use `--build` for single-example `run_example.py` commands. `ci.sh` uses pre-built binaries from `pip install .`, so runtime C++ changes require re-running `pip install -e .` before `ci.sh`.
 
 ### Step 3 — Parallel Strategy
 
@@ -109,7 +129,7 @@ Pick devices whose **HBM-Usage is 0** and find the **longest consecutive sub-ran
 
 ### Decision Tree
 
-```
+```text
 git diff --name-only
   │
   ├─ Only docs/config? ──→ SKIP tests
@@ -120,6 +140,10 @@ git diff --name-only
        │    ├─ platform   → full
        │    ├─ runtime    → single runtime
        │    └─ example    → single example
+       │
+       ├─ Runtime C++ changed (src/{arch}/)?
+       │    ├─ Yes → use --build for run_example.py (ci.sh auto-rebuilds)
+       │    └─ No  → omit --build (uses pre-built binaries)
        │
        ├─ Sim:  nproc >= 16?        ──→ --parallel
        ├─ Dev:  idle devices >= 2?  ──→ --parallel
@@ -149,12 +173,14 @@ git diff --name-only
 ### `generate_inputs` return format
 
 Returns a `list` of `(name, value)` pairs where value is either:
+
 - **`torch.Tensor` / numpy array**: A tensor argument. The framework handles `device_malloc`, `copy_to_device`, and copy-back based on `__outputs__`.
 - **ctypes scalar** (`ctypes.c_int64`, `ctypes.c_float`, etc.): A scalar value passed directly to the orchestration function. Integer types are zero-extended to uint64; `c_float` is bit-cast to uint32 then zero-extended; `c_double` is bit-cast to uint64.
 
 The list order defines the argument order in the orchestration's `uint64_t* args` array. All named items (tensors and scalars) are collected into the dict passed to `compute_golden`, so `compute_golden` can reference any argument by name.
 
 Example:
+
 ```python
 import ctypes
 import torch
@@ -178,6 +204,7 @@ def generate_inputs(params: dict) -> list:
 ### Declaring outputs
 
 Output tensors are identified by one of:
+
 - `__outputs__` list: e.g., `__outputs__ = ["f"]`
 - `out_` prefix convention: any tensor named `out_*` is treated as output
 

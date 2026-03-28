@@ -1,4 +1,12 @@
 #!/usr/bin/env python3
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """
 Simplified test runner for PTO runtime tests.
 
@@ -73,7 +81,7 @@ def _wait_for_new_device_log(log_dir, pre_run_logs, timeout=15, interval=0.5):
     return None
 
 
-def main():
+def main():  # noqa: PLR0912
     parser = argparse.ArgumentParser(
         description="Run PTO runtime test with kernel config and golden script",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -97,105 +105,100 @@ Golden.py interface:
     RTOL = 1e-5  # Relative tolerance
     ATOL = 1e-5  # Absolute tolerance
     __outputs__ = ["out_f"]  # Or use 'out_' prefix
-        """
+        """,
     )
 
     parser.add_argument(
-        "-k", "--kernels",
+        "-k",
+        "--kernels",
         required=True,
-        help="Path to kernels directory containing kernel_config.py"
+        help="Path to kernels directory containing kernel_config.py",
     )
 
-    parser.add_argument(
-        "-g", "--golden",
-        required=True,
-        help="Path to golden.py script"
-    )
+    parser.add_argument("-g", "--golden", required=True, help="Path to golden.py script")
+
+    parser.add_argument("-d", "--device", type=int, default=0, help="Device ID (default: 0)")
 
     parser.add_argument(
-        "-d", "--device",
-        type=int,
-        default=0,
-        help="Device ID (default: 0)"
-    )
-
-    parser.add_argument(
-        "-p", "--platform",
+        "-p",
+        "--platform",
         default="a2a3",
         choices=["a2a3", "a2a3sim", "a5", "a5sim"],
-        help="Platform name: 'a2a3'/'a5' for hardware, 'a2a3sim'/'a5sim' for simulation (default: a2a3)"
+        help="Platform name: 'a2a3'/'a5' for hardware, 'a2a3sim'/'a5sim' for simulation (default: a2a3)",
     )
 
     parser.add_argument(
-        "-v", "--verbose",
+        "-v",
+        "--verbose",
         action="store_true",
-        help="Enable verbose output (equivalent to --log-level debug)"
+        help="Enable verbose output (equivalent to --log-level debug)",
     )
 
     parser.add_argument(
         "--silent",
         action="store_true",
-        help="Silent mode - only show errors (equivalent to --log-level error)"
+        help="Silent mode - only show errors (equivalent to --log-level error)",
     )
 
     parser.add_argument(
         "--log-level",
         choices=["error", "warn", "info", "debug"],
-        help="Set log level explicitly (overrides --verbose and --silent)"
+        help="Set log level explicitly (overrides --verbose and --silent)",
     )
 
     parser.add_argument(
         "--enable-profiling",
         action="store_true",
-        help="Enable profiling and generate swimlane.json"
+        help="Enable profiling and generate swimlane.json",
     )
 
     parser.add_argument(
         "--all",
         action="store_true",
-        help="Run all test cases defined in ALL_CASES (default: run only DEFAULT_CASE)"
+        help="Run all test cases defined in ALL_CASES (default: run only DEFAULT_CASE)",
     )
 
     parser.add_argument(
         "--case",
         type=str,
         default=None,
-        help="Run a specific test case by name (e.g., --case Case2)"
+        help="Run a specific test case by name (e.g., --case Case2)",
     )
 
     parser.add_argument(
-        "-c", "--pto-isa-commit",
+        "-c",
+        "--pto-isa-commit",
         type=str,
         default=None,
-        help="Checkout PTO-ISA at this commit (e.g., -c 1b22fea)"
+        help="Checkout PTO-ISA at this commit (e.g., -c 1b22fea)",
     )
 
     parser.add_argument(
-        "--savetemp",
-        type=str,
-        default=None,
-        help="Path for the temporal files"
-    )
-
-    parser.add_argument(
-        "-n", "--rounds",
+        "-n",
+        "--rounds",
         type=int,
         default=None,
         metavar="ROUNDS",
-        help="Number of rounds to run per case (overrides kernel_config RUNTIME_CONFIG['rounds'])"
+        help="Number of rounds to run per case (overrides kernel_config RUNTIME_CONFIG['rounds'])",
     )
 
     parser.add_argument(
         "--clone-protocol",
         choices=["ssh", "https"],
         default="ssh",
-        help="Git protocol for cloning pto-isa (default: ssh)"
+        help="Git protocol for cloning pto-isa (default: ssh)",
     )
 
     parser.add_argument(
         "--skip-golden",
         action="store_true",
-        help="Skip golden computation and comparison (for benchmarking)"
+        help="Skip golden computation and comparison (for benchmarking)",
+    )
+
+    parser.add_argument(
+        "--build",
+        action="store_true",
+        help="Compile runtime from source instead of using pre-built binaries",
     )
 
     args = parser.parse_args()
@@ -213,25 +216,21 @@ Golden.py interface:
         log_level_str = "error"
     else:
         log_level_str = "info"
-    
+
     # Setup logging before any other operations
     level_map = {
-        'error': logging.ERROR,
-        'warn': logging.WARNING,
-        'info': logging.INFO,
-        'debug': logging.DEBUG,
+        "error": logging.ERROR,
+        "warn": logging.WARNING,
+        "info": logging.INFO,
+        "debug": logging.DEBUG,
     }
     log_level = level_map.get(log_level_str.lower(), logging.INFO)
-    
+
     # Configure Python logging
-    logging.basicConfig(
-        level=log_level,
-        format='[%(levelname)s] %(message)s',
-        force=True
-    )
-    
+    logging.basicConfig(level=log_level, format="[%(levelname)s] %(message)s", force=True)
+
     # Set environment variable for C++ side
-    os.environ['PTO_LOG_LEVEL'] = log_level_str
+    os.environ["PTO_LOG_LEVEL"] = log_level_str
 
     # Validate paths
     kernels_path = Path(args.kernels)
@@ -252,7 +251,7 @@ Golden.py interface:
 
     # Import and run
     try:
-        from code_runner import create_code_runner
+        from code_runner import create_code_runner  # noqa: PLC0415
 
         runner = create_code_runner(
             kernels_dir=str(args.kernels),
@@ -263,7 +262,7 @@ Golden.py interface:
             run_all_cases=args.all,
             case_name=args.case,
             pto_isa_commit=args.pto_isa_commit,
-            build_dir=args.savetemp,
+            build_runtime=args.build,
             repeat_rounds=args.rounds,
             clone_protocol=args.clone_protocol,
             skip_golden=args.skip_golden,
@@ -290,7 +289,8 @@ Golden.py interface:
             swimlane_script = project_root / "tools" / "swimlane_converter.py"
 
             if swimlane_script.exists():
-                import subprocess
+                import subprocess  # noqa: PLC0415
+
                 try:
                     cmd = [
                         sys.executable,
@@ -301,8 +301,7 @@ Golden.py interface:
 
                     # Find the device log created by this run via snapshot diff
                     if device_log_dir is not None:
-                        device_log_file = _wait_for_new_device_log(
-                            device_log_dir, pre_run_device_logs)
+                        device_log_file = _wait_for_new_device_log(device_log_dir, pre_run_device_logs)
                         if device_log_file:
                             cmd += ["--device-log", str(device_log_file)]
                         else:
@@ -334,7 +333,8 @@ Golden.py interface:
     except Exception as e:
         logger.error(f"TEST FAILED: {e}")
         if log_level_str == "debug":
-            import traceback
+            import traceback  # noqa: PLC0415
+
             traceback.print_exc()
         return 1
 

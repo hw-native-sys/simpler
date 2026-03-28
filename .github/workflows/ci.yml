@@ -75,9 +75,11 @@ jobs:
         run: |
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             sudo apt-get update
+            sudo apt-get install -y ninja-build
             sudo apt-get install -y g++-15 || sudo apt-get install -y g++
             if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
           else
+            brew install ninja
             brew install gcc@15 || brew install gcc
             if command -v g++-15; then
               echo "CXX=g++-15" >> $GITHUB_ENV
@@ -130,9 +132,11 @@ jobs:
         run: |
           if [[ "${{ runner.os }}" == "Linux" ]]; then
             sudo apt-get update
+            sudo apt-get install -y ninja-build
             sudo apt-get install -y g++-15 || sudo apt-get install -y g++
             if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
           else
+            brew install ninja
             brew install gcc@15 || brew install gcc
             if command -v g++-15; then
               echo "CXX=g++-15" >> $GITHUB_ENV

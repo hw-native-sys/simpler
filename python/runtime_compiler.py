@@ -1,12 +1,22 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 import logging
+import multiprocessing
 import os
+import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import List, Optional
-from toolchain import Toolchain, CCECToolchain, Aarch64GxxToolchain, GxxToolchain
+from typing import Optional, Union
+
 import env_manager
-import multiprocessing
+from toolchain import Aarch64GxxToolchain, CCECToolchain, GxxToolchain, Toolchain
 
 logger = logging.getLogger(__name__)
 
@@ -28,7 +38,7 @@ class BuildTarget:
     def get_binary_name(self) -> str:
         return self._binary_name
 
-    def gen_cmake_args(self, include_dirs: List[str], source_dirs: List[str]) -> List[str]:
+    def gen_cmake_args(self, include_dirs: list[str], source_dirs: list[str]) -> list[str]:
         """Generate CMake arguments list from toolchain args + custom directories."""
         inc = ";".join(os.path.abspath(d) for d in include_dirs)
         src = ";".join(os.path.abspath(d) for d in source_dirs)
@@ -56,6 +66,7 @@ class RuntimeCompiler:
 
     Use get_instance() to get a cached instance per platform.
     """
+
     _instances = {}
 
     @classmethod
@@ -82,9 +93,7 @@ class RuntimeCompiler:
             raise ValueError(f"Unknown platform: {platform}. Supported: a2a3, a2a3sim, a5, a5sim")
 
         if not self.platform_dir.is_dir():
-            raise ValueError(
-                f"Platform '{platform}' not found at {self.platform_dir}"
-            )
+            raise ValueError(f"Platform '{platform}' not found at {self.platform_dir}")
 
         if platform == "a2a3":
             self._init_a2a3()
@@ -103,22 +112,16 @@ class RuntimeCompiler:
 
         # AICore: Bisheng CCE compiler
         ccec = CCECToolchain(platform="a2a3")
-        self.aicore_target = BuildTarget(
-            ccec, str(self.platform_dir / "aicore"), "aicore_kernel.o"
-        )
+        self.aicore_target = BuildTarget(ccec, str(self.platform_dir / "aicore"), "aicore_kernel.o")
 
         # AICPU: aarch64 cross-compiler
         aarch64 = Aarch64GxxToolchain()
-        self.aicpu_target = BuildTarget(
-            aarch64, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so"
-        )
+        self.aicpu_target = BuildTarget(aarch64, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
 
         # Host: standard gcc/g++
         self._ensure_host_compilers()
         host_gxx = GxxToolchain()
-        self.host_target = BuildTarget(
-            host_gxx, str(self.platform_dir / "host"), "libhost_runtime.so"
-        )
+        self.host_target = BuildTarget(host_gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
 
     def _init_a2a3sim(self):
         """Initialize toolchains for simulation platform.
@@ -128,15 +131,9 @@ class RuntimeCompiler:
         self._ensure_host_compilers()
         gxx = GxxToolchain()
 
-        self.aicore_target = BuildTarget(
-            gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so"
-        )
-        self.aicpu_target = BuildTarget(
-            gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so"
-        )
-        self.host_target = BuildTarget(
-            gxx, str(self.platform_dir / "host"), "libhost_runtime.so"
-        )
+        self.aicore_target = BuildTarget(gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so")
+        self.aicpu_target = BuildTarget(gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
+        self.host_target = BuildTarget(gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
 
     def _init_a5(self):
         """Initialize toolchains for real a5 hardware."""
@@ -144,22 +141,16 @@ class RuntimeCompiler:
 
         # AICore: Bisheng CCE compiler with A5 platform
         ccec = CCECToolchain(platform="a5")
-        self.aicore_target = BuildTarget(
-            ccec, str(self.platform_dir / "aicore"), "aicore_kernel.o"
-        )
+        self.aicore_target = BuildTarget(ccec, str(self.platform_dir / "aicore"), "aicore_kernel.o")
 
         # AICPU: aarch64 cross-compiler
         aarch64 = Aarch64GxxToolchain()
-        self.aicpu_target = BuildTarget(
-            aarch64, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so"
-        )
+        self.aicpu_target = BuildTarget(aarch64, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
 
         # Host: standard gcc/g++
         self._ensure_host_compilers()
         host_gxx = GxxToolchain()
-        self.host_target = BuildTarget(
-            host_gxx, str(self.platform_dir / "host"), "libhost_runtime.so"
-        )
+        self.host_target = BuildTarget(host_gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
 
     def _init_a5sim(self):
         """Initialize toolchains for A5 simulation platform.
@@ -169,15 +160,9 @@ class RuntimeCompiler:
         self._ensure_host_compilers()
         gxx = GxxToolchain()
 
-        self.aicore_target = BuildTarget(
-            gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so"
-        )
-        self.aicpu_target = BuildTarget(
-            gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so"
-        )
-        self.host_target = BuildTarget(
-            gxx, str(self.platform_dir / "host"), "libhost_runtime.so"
-        )
+        self.aicore_target = BuildTarget(gxx, str(self.platform_dir / "aicore"), "libaicore_kernel.so")
+        self.aicpu_target = BuildTarget(gxx, str(self.platform_dir / "aicpu"), "libaicpu_kernel.so")
+        self.host_target = BuildTarget(gxx, str(self.platform_dir / "host"), "libhost_runtime.so")
 
     def _ensure_host_compilers(self):
         if not self._find_executable("gcc"):
@@ -190,20 +175,17 @@ class RuntimeCompiler:
         """Check if an executable exists (either as absolute path or in PATH)."""
         if os.path.isfile(name) and os.access(name, os.X_OK):
             return True
-        result = subprocess.run(
-            ["which", name],
-            capture_output=True,
-            timeout=1
-        )
+        result = subprocess.run(["which", name], check=False, capture_output=True, timeout=1)
         return result.returncode == 0
 
     def compile(
         self,
         target_platform: str,
-        include_dirs: List[str],
-        source_dirs: List[str],
-        build_dir: Optional[str],
-    ) -> bytes:
+        include_dirs: list[str],
+        source_dirs: list[str],
+        build_dir: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> Union[bytes, Path]:
         """
         Compile binary for the specified target platform.
 
@@ -212,9 +194,12 @@ class RuntimeCompiler:
             include_dirs: List of include directory paths
             source_dirs: List of source directory paths
             build_dir: The directory path for compiling. When None, use a temporal path.
+            output_dir: Directory to copy the final binary into. When set, returns Path.
+                        When None, returns bytes (backward-compatible).
 
         Returns:
-            Compiled binary data as bytes
+            If output_dir is set: Path to the compiled binary in output_dir.
+            If output_dir is None: Compiled binary data as bytes.
 
         Raises:
             ValueError: If target platform is invalid
@@ -228,35 +213,42 @@ class RuntimeCompiler:
         elif target_platform == "host":
             target = self.host_target
         else:
-            raise ValueError(
-                f"Invalid target platform: {target_platform}. "
-                "Must be 'aicore', 'aicpu', or 'host'."
-            )
+            raise ValueError(f"Invalid target platform: {target_platform}. Must be 'aicore', 'aicpu', or 'host'.")
 
         cmake_args = target.gen_cmake_args(include_dirs, source_dirs)
         cmake_source_dir = target.get_root_dir()
         binary_name = target.get_binary_name()
         platform = target_platform.upper()
 
-        def _build(build_dir: str):
-            return self._run_compilation(
+        def _build(actual_build_dir: str) -> Union[bytes, Path]:
+            binary_path = self._run_compilation(
                 cmake_source_dir,
                 cmake_args,
                 binary_name,
                 platform=platform,
-                build_dir=build_dir,
+                build_dir=actual_build_dir,
             )
+            if output_dir is not None:
+                od = Path(output_dir)
+                od.mkdir(parents=True, exist_ok=True)
+                dest = od / binary_name
+                shutil.copy2(binary_path, dest)
+                return dest
+            else:
+                with open(binary_path, "rb") as f:
+                    return f.read()
+
         if build_dir is None:
-            with tempfile.TemporaryDirectory(prefix=f"{platform.lower()}_build_", dir="/tmp") as build_dir:
-                return _build(build_dir)
+            with tempfile.TemporaryDirectory(prefix=f"{platform.lower()}_build_", dir="/tmp") as tmp_dir:
+                return _build(tmp_dir)
         else:
             platform_build_dir = Path(os.path.realpath(build_dir)) / f"{platform.lower()}"
             os.makedirs(platform_build_dir, exist_ok=True)
-            return _build(platform_build_dir)
+            return _build(str(platform_build_dir))
 
     def _run_build_step(
         self,
-        cmd: List[str],
+        cmd: list[str],
         cwd: str,
         platform: str,
         step_name: str,
@@ -277,9 +269,7 @@ class RuntimeCompiler:
         logger.debug(f"  Command: {' '.join(cmd)}")
 
         try:
-            result = subprocess.run(
-                cmd, cwd=cwd, check=False, capture_output=True, text=True
-            )
+            result = subprocess.run(cmd, cwd=cwd, check=False, capture_output=True, text=True)
 
             if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
                 logger.debug(f"[{platform}] {step_name} stdout:")
@@ -290,52 +280,60 @@ class RuntimeCompiler:
 
             if result.returncode != 0:
                 logger.error(f"[{platform}] {step_name} failed: {result.stderr}")
-                raise RuntimeError(
-                    f"{step_name} failed for {platform}: {result.stderr}"
-                )
+                raise RuntimeError(f"{step_name} failed for {platform}: {result.stderr}")
         except FileNotFoundError:
             raise RuntimeError(f"{step_name} not found. Please install {step_name}.")
 
     def _run_compilation(
         self,
         cmake_source_dir: str,
-        cmake_args: List[str],
+        cmake_args: list[str],
         binary_name: str,
         platform: str = "AICore",
         build_dir: Optional[str] = None,
-    ) -> bytes:
+    ) -> Path:
         """
-        Run CMake configuration and Make build in a temporary directory.
+        Run CMake configuration and Make build.
 
         Args:
             cmake_source_dir: Path to CMake source directory
             cmake_args: CMake command-line arguments
             binary_name: Name of output binary
             platform: Platform name for logging
+            build_dir: Build directory path
 
         Returns:
-            Compiled binary data as bytes
+            Path to compiled binary within the build directory.
 
         Raises:
             RuntimeError: If CMake or Make fails
             FileNotFoundError: If output binary not found
         """
-        cmake_cmd = ["cmake", cmake_source_dir] + cmake_args
+        if build_dir is None:
+            raise ValueError("build_dir must be set")
+
+        cmake_cmd = [
+            "cmake",
+            cmake_source_dir,
+            "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+        ] + cmake_args
         self._run_build_step(cmake_cmd, build_dir, platform, "CMake configuration")
 
-        make_cmd = ["make", f"-j{min(multiprocessing.cpu_count(), 32)}", "VERBOSE=1"]
-        self._run_build_step(make_cmd, build_dir, platform, "Make build")
+        build_cmd = [
+            "cmake",
+            "--build",
+            ".",
+            "--parallel",
+            str(min(multiprocessing.cpu_count(), 32)),
+            "--verbose",
+        ]
+        self._run_build_step(build_cmd, build_dir, platform, "Build")
 
-        # Read the compiled binary
-        binary_path = os.path.join(build_dir, binary_name)
-        if not os.path.isfile(binary_path):
+        # Return the path to the compiled binary
+        binary_path = Path(build_dir) / binary_name
+        if not binary_path.is_file():
             raise FileNotFoundError(
-                f"Compiled binary not found: {binary_path}. "
-                f"Expected output file name: {binary_name}"
+                f"Compiled binary not found: {binary_path}. Expected output file name: {binary_name}"
             )
 
-        with open(binary_path, "rb") as f:
-            binary_data = f.read()
-
-        return binary_data
-
+        return binary_path

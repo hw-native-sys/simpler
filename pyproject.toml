@@ -49,8 +49,9 @@ skip-magic-trailing-comma = false
 line-ending = "lf"
 
 [tool.pyright]
-include = ["python", "tests"]
+include = ["python", "tests", "examples/scripts"]
 exclude = ["**/__pycache__", "build", "dist", "tests/st"]
+extraPaths = ["python", "examples/scripts"]
 typeCheckingMode = "basic"
 pythonVersion = "3.9"
 reportMissingTypeStubs = false

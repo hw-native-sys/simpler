@@ -1,3 +1,11 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 """
 CodeRunner - Simplified test framework for PTO runtime tests.
 
@@ -45,27 +53,22 @@ Golden.py interface:
 """
 
 import ctypes
-import importlib.util
 import fcntl
+import importlib.util
 import logging
 import os
 import sys
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Optional
 
-import torch
+import torch  # type: ignore[import-not-found]
 
 # =============================================================================
 # TaskArg construction — uses nanobind bindings from task_interface
 # =============================================================================
-
-from task_interface import (
-    TaskArgArray,
-    make_tensor_arg,
-    make_scalar_arg,
-)
+from task_interface import TaskArgArray, make_scalar_arg, make_tensor_arg  # type: ignore[import-not-found]
 
 logger = logging.getLogger(__name__)
 
@@ -77,19 +80,15 @@ def _setup_logging_if_needed() -> None:
     """
     # Only setup if logging hasn't been configured yet
     if not logging.getLogger().hasHandlers():
-        level_str = os.environ.get('PTO_LOG_LEVEL', 'info')
+        level_str = os.environ.get("PTO_LOG_LEVEL", "info")
         level_map = {
-            'error': logging.ERROR,
-            'warn': logging.WARNING,
-            'info': logging.INFO,
-            'debug': logging.DEBUG,
+            "error": logging.ERROR,
+            "warn": logging.WARNING,
+            "info": logging.INFO,
+            "debug": logging.DEBUG,
         }
         log_level = level_map.get(level_str.lower(), logging.INFO)
-        logging.basicConfig(
-            level=log_level,
-            format='[%(levelname)s] %(message)s',
-            force=True
-        )
+        logging.basicConfig(level=log_level, format="[%(levelname)s] %(message)s", force=True)
 
 
 def _to_torch(tensor) -> torch.Tensor:
@@ -104,7 +103,8 @@ def _to_torch(tensor) -> torch.Tensor:
         return torch.as_tensor(tensor)
     except (TypeError, RuntimeError):
         # If direct conversion fails, fall back to numpy path
-        import numpy as np
+        import numpy as np  # noqa: PLC0415  # type: ignore[import-not-found]
+
         arr = np.asarray(tensor)
         return torch.from_numpy(arr)
 
@@ -150,13 +150,9 @@ def _is_pto_isa_cloned() -> bool:
 def _is_git_available() -> bool:
     """Check if git command is available."""
     try:
-        import subprocess
-        result = subprocess.run(
-            ["git", "--version"],
-            capture_output=True,
-            text=True,
-            timeout=5
-        )
+        import subprocess  # noqa: PLC0415
+
+        result = subprocess.run(["git", "--version"], check=False, capture_output=True, text=True, timeout=5)
         return result.returncode == 0
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return False
@@ -173,8 +169,7 @@ def _pto_isa_repo_url(clone_protocol: str = "ssh") -> str:
     return _PTO_ISA_SSH
 
 
-def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None,
-                   clone_protocol: str = "ssh") -> bool:
+def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None, clone_protocol: str = "ssh") -> bool:
     """
     Clone pto-isa repository, optionally at a specific commit.
 
@@ -185,7 +180,7 @@ def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None,
     Returns:
         True if successful, False otherwise
     """
-    import subprocess
+    import subprocess  # noqa: PLC0415
 
     if not _is_git_available():
         if verbose:
@@ -210,14 +205,11 @@ def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None,
 
         repo_url = _pto_isa_repo_url(clone_protocol)
         result = subprocess.run(
-            [
-                "git", "clone",
-                repo_url,
-                str(clone_path)
-            ],
+            ["git", "clone", repo_url, str(clone_path)],
+            check=False,
             capture_output=True,
             text=True,
-            timeout=300  # 5 minutes timeout
+            timeout=300,  # 5 minutes timeout
         )
 
         if result.returncode != 0:
@@ -229,8 +221,11 @@ def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None,
         if commit:
             result = subprocess.run(
                 ["git", "checkout", commit],
-                capture_output=True, text=True,
-                cwd=str(clone_path), timeout=30
+                check=False,
+                capture_output=True,
+                text=True,
+                cwd=str(clone_path),
+                timeout=30,
             )
             if result.returncode != 0:
                 if verbose:
@@ -255,55 +250,76 @@ def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None,
 
 def _checkout_pto_isa_commit(clone_path: Path, commit: str, verbose: bool = False) -> None:
     """Checkout the specified commit if the existing clone is at a different revision."""
-    import subprocess
+    import subprocess  # noqa: PLC0415
+
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, cwd=str(clone_path), timeout=5
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(clone_path),
+            timeout=5,
         )
         current = result.stdout.strip() if result.returncode == 0 else ""
         if current and not commit.startswith(current) and not current.startswith(commit):
             if verbose:
                 logger.info(f"pto-isa at {current}, checking out {commit}...")
             subprocess.run(
-                ["git", "fetch", "origin"], capture_output=True, text=True,
-                cwd=str(clone_path), timeout=120, check=True
+                ["git", "fetch", "origin"],
+                capture_output=True,
+                text=True,
+                cwd=str(clone_path),
+                timeout=120,
+                check=True,
             )
             subprocess.run(
-                ["git", "checkout", commit], capture_output=True, text=True,
-                cwd=str(clone_path), timeout=30, check=True
+                ["git", "checkout", commit],
+                capture_output=True,
+                text=True,
+                cwd=str(clone_path),
+                timeout=30,
+                check=True,
             )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"Failed to checkout pto-isa commit {commit}: "
-                       f"{e.stderr if hasattr(e, 'stderr') else e}")
+        logger.warning(f"Failed to checkout pto-isa commit {commit}: {e.stderr if hasattr(e, 'stderr') else e}")
     except Exception as e:
         logger.warning(f"Unexpected error checking out pto-isa commit {commit}: {e}")
 
 
 def _update_pto_isa_to_latest(clone_path: Path, verbose: bool = False) -> None:
     """Fetch and reset existing clone to the remote default branch."""
-    import subprocess
+    import subprocess  # noqa: PLC0415
+
     try:
         if verbose:
             logger.info("Updating pto-isa to latest...")
         subprocess.run(
-            ["git", "fetch", "origin"], capture_output=True, text=True,
-            cwd=str(clone_path), timeout=120, check=True
+            ["git", "fetch", "origin"],
+            capture_output=True,
+            text=True,
+            cwd=str(clone_path),
+            timeout=120,
+            check=True,
         )
         # Use origin/HEAD which tracks the remote's default branch
         subprocess.run(
-            ["git", "reset", "--hard", "origin/HEAD"], capture_output=True, text=True,
-            cwd=str(clone_path), timeout=30, check=True
+            ["git", "reset", "--hard", "origin/HEAD"],
+            capture_output=True,
+            text=True,
+            cwd=str(clone_path),
+            timeout=30,
+            check=True,
         )
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"Failed to update pto-isa to latest: "
-                       f"{e.stderr if hasattr(e, 'stderr') else e}")
+        logger.warning(f"Failed to update pto-isa to latest: {e.stderr if hasattr(e, 'stderr') else e}")
     except Exception as e:
         logger.warning(f"Unexpected error updating pto-isa: {e}")
 
 
-def _ensure_pto_isa_root(verbose: bool = False, commit: Optional[str] = None,
-                         clone_protocol: str = "ssh") -> Optional[str]:
+def _ensure_pto_isa_root(
+    verbose: bool = False, commit: Optional[str] = None, clone_protocol: str = "ssh"
+) -> Optional[str]:
     """
     Ensure PTO_ISA_ROOT is available, either from environment or cloned repo.
 
@@ -336,12 +352,13 @@ def _ensure_pto_isa_root(verbose: bool = False, commit: Optional[str] = None,
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     with open(lock_path, "w") as lock_fd:
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        return _ensure_pto_isa_root_locked(clone_path, verbose=verbose, commit=commit,
-                                          clone_protocol=clone_protocol)
+        return _ensure_pto_isa_root_locked(clone_path, verbose=verbose, commit=commit, clone_protocol=clone_protocol)
 
 
 def _ensure_pto_isa_root_locked(
-    clone_path: Path, verbose: bool = False, commit: Optional[str] = None,
+    clone_path: Path,
+    verbose: bool = False,
+    commit: Optional[str] = None,
     clone_protocol: str = "ssh",
 ) -> Optional[str]:
     """Inner logic for _ensure_pto_isa_root, called while holding the file lock."""
@@ -350,8 +367,7 @@ def _ensure_pto_isa_root_locked(
     if not _is_pto_isa_cloned():
         if verbose:
             logger.info("PTO_ISA_ROOT not set, cloning pto-isa repository...")
-        if not _clone_pto_isa(verbose=verbose, commit=commit,
-                              clone_protocol=clone_protocol):
+        if not _clone_pto_isa(verbose=verbose, commit=commit, clone_protocol=clone_protocol):
             # Another parallel process may have completed the clone
             if not _is_pto_isa_cloned():
                 if verbose:
@@ -384,7 +400,7 @@ def _ensure_pto_isa_root_locked(
     return str(clone_path.resolve())
 
 
-def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> Dict[str, str]:
+def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> dict[str, str]:
     """
     Optional per-example environment variables for runtime compilation.
 
@@ -399,7 +415,7 @@ def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> Dict[
     if not isinstance(runtime_env, dict):
         return {}
 
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     for k, v in runtime_env.items():
         if not isinstance(k, str):
             continue
@@ -414,7 +430,7 @@ def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> Dict[
 
 
 @contextmanager
-def _temporary_env(env_updates: Dict[str, str]):
+def _temporary_env(env_updates: dict[str, str]):
     """Temporarily apply env vars for the duration of the context."""
     old = {k: os.environ.get(k) for k in env_updates.keys()}
     for k, v in env_updates.items():
@@ -447,7 +463,7 @@ class CodeRunner:
         platform: Platform name ("a2a3" for hardware, "a2a3sim" for simulation, default: "a2a3")
     """
 
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         kernels_dir: str,
         golden_path: str,
@@ -457,7 +473,7 @@ class CodeRunner:
         run_all_cases: bool = False,
         case_name: Optional[str] = None,
         pto_isa_commit: Optional[str] = None,
-        build_dir: Optional[str] = None,
+        build_runtime: bool = False,
         repeat_rounds: Optional[int] = None,
         clone_protocol: str = "ssh",
         skip_golden: bool = False,
@@ -476,7 +492,7 @@ class CodeRunner:
         self.device_id = device_id if device_id is not None else 0
         self.pto_isa_commit = pto_isa_commit
         self.clone_protocol = clone_protocol
-        self.build_dir = build_dir
+        self.build_runtime = build_runtime
 
         # Load configurations
         self._kernel_config = self._load_kernel_config()
@@ -487,8 +503,8 @@ class CodeRunner:
         self.orchestration = self._kernel_config.ORCHESTRATION
 
         # Extract golden configuration — determine which cases to run
-        all_cases = getattr(self._golden_module, 'ALL_CASES', {"Default": {}})
-        default_case = getattr(self._golden_module, 'DEFAULT_CASE', "Default")
+        all_cases = getattr(self._golden_module, "ALL_CASES", {"Default": {}})
+        default_case = getattr(self._golden_module, "DEFAULT_CASE", "Default")
 
         if run_all_cases:
             self.params_list = [{"name": name, **params} for name, params in all_cases.items()]
@@ -500,27 +516,24 @@ class CodeRunner:
         else:
             self.params_list = [{"name": default_case, **all_cases[default_case]}]
 
-        self.rtol = getattr(self._golden_module, 'RTOL', 1e-5)
-        self.atol = getattr(self._golden_module, 'ATOL', 1e-5)
-        self.output_names = getattr(self._golden_module, '__outputs__', None)
-        self.tensor_order = getattr(self._golden_module, 'TENSOR_ORDER', None)
+        self.rtol = getattr(self._golden_module, "RTOL", 1e-5)
+        self.atol = getattr(self._golden_module, "ATOL", 1e-5)
+        self.output_names = getattr(self._golden_module, "__outputs__", None)
+        self.tensor_order = getattr(self._golden_module, "TENSOR_ORDER", None)
 
         # Runtime configuration - read from kernel_config or use defaults
-        runtime_config = getattr(self._kernel_config, 'RUNTIME_CONFIG', {})
-        self.aicpu_thread_num = runtime_config.get('aicpu_thread_num', 3)
-        self.orch_thread_num = runtime_config.get('orch_thread_num', 1)
-        self.block_dim = runtime_config.get('block_dim', 24)
-        self.runtime_name = runtime_config.get('runtime', 'host_build_graph')
-        self.repeat_rounds = repeat_rounds if repeat_rounds is not None else runtime_config.get('rounds', 1)
+        runtime_config = getattr(self._kernel_config, "RUNTIME_CONFIG", {})
+        self.aicpu_thread_num = runtime_config.get("aicpu_thread_num", 3)
+        self.orch_thread_num = runtime_config.get("orch_thread_num", 1)
+        self.block_dim = runtime_config.get("block_dim", 24)
+        self.runtime_name = runtime_config.get("runtime", "host_build_graph")
+        self.repeat_rounds = repeat_rounds if repeat_rounds is not None else runtime_config.get("rounds", 1)
 
     def _load_kernel_config(self):
         """Load kernel_config.py from kernels directory."""
         config_path = self.kernels_dir / "kernel_config.py"
         if not config_path.exists():
-            raise FileNotFoundError(
-                f"kernel_config.py not found in {self.kernels_dir}\n"
-                f"Expected: {config_path}"
-            )
+            raise FileNotFoundError(f"kernel_config.py not found in {self.kernels_dir}\nExpected: {config_path}")
         return _load_module_from_path(config_path, f"kernel_config_{id(self)}")
 
     def _load_golden_module(self):
@@ -531,20 +544,16 @@ class CodeRunner:
         module = _load_module_from_path(self.golden_path, f"golden_{id(self)}")
 
         # Validate required functions
-        if not hasattr(module, 'generate_inputs'):
+        if not hasattr(module, "generate_inputs"):
+            raise AttributeError(f"golden.py must define generate_inputs(params) function\nFile: {self.golden_path}")
+        if not hasattr(module, "compute_golden"):
             raise AttributeError(
-                f"golden.py must define generate_inputs(params) function\n"
-                f"File: {self.golden_path}"
-            )
-        if not hasattr(module, 'compute_golden'):
-            raise AttributeError(
-                f"golden.py must define compute_golden(tensors, params) function\n"
-                f"File: {self.golden_path}"
+                f"golden.py must define compute_golden(tensors, params) function\nFile: {self.golden_path}"
             )
 
         return module
 
-    def _identify_outputs(self, tensors: Dict[str, torch.Tensor]) -> Tuple[Dict, Dict]:
+    def _identify_outputs(self, tensors: dict[str, torch.Tensor]) -> tuple[dict, dict]:
         """
         Separate inputs and outputs from tensor dict using __outputs__.
 
@@ -552,25 +561,20 @@ class CodeRunner:
             Tuple of (inputs_dict, outputs_dict)
         """
         if not self.output_names:
-            raise ValueError(
-                "No output tensors identified. "
-                "Define __outputs__ = ['tensor_name'] in golden.py"
-            )
+            raise ValueError("No output tensors identified. Define __outputs__ = ['tensor_name'] in golden.py")
 
         output_set = set(self.output_names)
         outputs = {k: v for k, v in tensors.items() if k in output_set}
         inputs = {k: v for k, v in tensors.items() if k not in output_set}
 
         if not outputs:
-            raise ValueError(
-                f"None of __outputs__ = {self.output_names} found in tensors: {list(tensors.keys())}"
-            )
+            raise ValueError(f"None of __outputs__ = {self.output_names} found in tensors: {list(tensors.keys())}")
 
         return inputs, outputs
 
     def _build_func_args_from_list(
         self, args_list: list
-    ) -> Tuple[list, Dict[str, Any], Dict[str, torch.Tensor], Dict[str, torch.Tensor]]:
+    ) -> tuple[list, dict[str, Any], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """
         Build TaskArgArray from an explicit argument list returned by generate_inputs.
 
@@ -585,19 +589,16 @@ class CodeRunner:
             Tuple of (orch_args, args, inputs, outputs)
             where args contains all named items, inputs/outputs contain tensor-only subsets.
         """
-        import numpy as np
+        import numpy as np  # noqa: PLC0415  # type: ignore[import-not-found]
 
         if not self.output_names:
-            raise ValueError(
-                "No output tensors identified. "
-                "Define __outputs__ = ['tensor_name'] in golden.py"
-            )
+            raise ValueError("No output tensors identified. Define __outputs__ = ['tensor_name'] in golden.py")
         output_set = set(self.output_names)
 
         orch_args = TaskArgArray()
-        args = {}    # all named items: tensors + scalars → passed to compute_golden
+        args = {}  # all named items: tensors + scalars → passed to compute_golden
         inputs = {}  # tensor inputs only → for logging
-        outputs = {} # tensor outputs (and inouts) → for comparison
+        outputs = {}  # tensor outputs (and inouts) → for comparison
 
         for item in args_list:
             if not (isinstance(item, tuple) and len(item) == 2):
@@ -632,13 +633,11 @@ class CodeRunner:
                 )
 
         if not outputs:
-            raise ValueError(
-                f"None of __outputs__ = {self.output_names} found in generate_inputs args"
-            )
+            raise ValueError(f"None of __outputs__ = {self.output_names} found in generate_inputs args")
 
         return orch_args, args, inputs, outputs
 
-    def _build_func_args(self, tensors: Dict[str, torch.Tensor]) -> list:
+    def _build_func_args(self, tensors: dict[str, torch.Tensor]) -> list:
         """
         Build orch_args from tensors dict (legacy path).
 
@@ -663,10 +662,7 @@ class CodeRunner:
 
         # Identify outputs
         if not self.output_names:
-            raise ValueError(
-                "No output tensors identified. "
-                "Define __outputs__ = ['tensor_name'] in golden.py"
-            )
+            raise ValueError("No output tensors identified. Define __outputs__ = ['tensor_name'] in golden.py")
 
         # First pass: ensure all tensors are CPU and contiguous (update dict in place)
         for name in order:
@@ -695,7 +691,7 @@ class CodeRunner:
 
         return orch_args
 
-    def run(self) -> None:
+    def run(self) -> None:  # noqa: PLR0912
         """
         Execute the full test flow:
         1. Check environment
@@ -709,15 +705,17 @@ class CodeRunner:
            - Finalize and compare with golden
         """
         # Import runtime modules (deferred import to avoid top-level dependency)
-        from runtime_builder import RuntimeBuilder
-        from bindings import bind_host_binary, set_device, launch_runtime
-        from elf_parser import extract_text_section
+        from bindings import bind_host_binary, launch_runtime, set_device  # noqa: PLC0415
+        from elf_parser import extract_text_section  # noqa: PLC0415
+        from kernel_compiler import KernelCompiler  # noqa: PLC0415
+        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
-        pto_isa_root = _ensure_pto_isa_root(verbose=True, commit=self.pto_isa_commit,
-                                          clone_protocol=self.clone_protocol)
+        pto_isa_root = _ensure_pto_isa_root(
+            verbose=True, commit=self.pto_isa_commit, clone_protocol=self.clone_protocol
+        )
         if pto_isa_root is None:
-            raise EnvironmentError(
+            raise OSError(
                 "PTO_ISA_ROOT could not be resolved.\n"
                 "Please set it to the PTO-ISA root directory, e.g.:\n"
                 "  export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa"
@@ -738,9 +736,9 @@ class CodeRunner:
                 f"Note: Different platforms may support different runtimes."
             )
 
-        kernel_compiler = builder.get_kernel_compiler()
+        kernel_compiler = KernelCompiler(platform=self.platform)
 
-        from concurrent.futures import ThreadPoolExecutor, Future
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
 
         # Map platform to runtime architecture
         if self.platform in ("a2a3", "a2a3sim"):
@@ -756,13 +754,12 @@ class CodeRunner:
         ]
 
         def _build_runtime():
-            return builder.build(self.runtime_name, self.build_dir)
+            return builder.get_binaries(self.runtime_name, build=self.build_runtime)
 
         def _compile_orchestration():
             return kernel_compiler.compile_orchestration(
                 self.runtime_name,
                 self.orchestration["source"],
-                build_dir=self.build_dir,
             )
 
         def _compile_one_kernel(kernel):
@@ -772,7 +769,6 @@ class CodeRunner:
                 core_type=kernel["core_type"],
                 pto_isa_root=pto_isa_root,
                 extra_include_dirs=runtime_include_dirs,
-                build_dir=self.build_dir,
             )
             if self.platform.endswith("sim"):
                 kernel_bin = incore_o
@@ -788,11 +784,10 @@ class CodeRunner:
             fut_kernels = [executor.submit(_compile_one_kernel, k) for k in self.kernels]
 
             try:
-                host_binary, aicpu_binary, aicore_binary = fut_runtime.result()
+                runtime_result = fut_runtime.result()
             except Exception as e:
                 raise RuntimeError(
-                    f"Failed to build runtime '{self.runtime_name}' for platform '{self.platform}'.\n"
-                    f"Error: {e}"
+                    f"Failed to build runtime '{self.runtime_name}' for platform '{self.platform}'.\nError: {e}"
                 ) from e
 
             orch_so_binary = fut_orch.result()
@@ -801,8 +796,11 @@ class CodeRunner:
         logger.info(f"Compiled {len(kernel_binaries)} kernel(s)")
 
         # Step 2: Load runtime and set device
-        logger.info(f"=== Loading Runtime ({len(host_binary)} bytes) ===")
-        Runtime = bind_host_binary(host_binary)
+        binaries = runtime_result
+        logger.info(f"=== Loading Runtime ({binaries.host_path}) ===")
+        Runtime = bind_host_binary(binaries.host_path)
+        aicpu_binary = binaries.aicpu_path.read_bytes()
+        aicore_binary = binaries.aicore_path.read_bytes()
 
         logger.info(f"=== Setting Device {self.device_id} ===")
         set_device(self.device_id)
@@ -820,8 +818,7 @@ class CodeRunner:
 
             if isinstance(result, list):
                 # New-style: generate_inputs returns flat argument list
-                orch_args, args, inputs, outputs = \
-                    self._build_func_args_from_list(result)
+                orch_args, args, inputs, outputs = self._build_func_args_from_list(result)
                 tensors = args  # args contains all named items; compute_golden receives all
             else:
                 # Legacy: generate_inputs returns dict of tensors
@@ -900,12 +897,12 @@ class CodeRunner:
 
     def _compare_with_golden(
         self,
-        outputs: Dict[str, torch.Tensor],
-        golden: Dict[str, torch.Tensor],
+        outputs: dict[str, torch.Tensor],
+        golden: dict[str, torch.Tensor],
     ) -> None:
         """Compare hardware outputs with pre-computed golden values."""
         # Compare each output
-        for name in outputs:
+        for name in outputs:  # noqa: PLC0206
             actual = outputs[name]
             expected = golden[name]
             logger.info(f"Comparing {name}: shape={actual.shape}, dtype={actual.dtype}")
@@ -938,16 +935,32 @@ class CodeRunner:
             logger.info(f"  {name}: PASS ({matched}/{actual.numel()} elements matched)")
 
 
-def create_code_runner(kernels_dir, golden_path, device_id=None, platform="a2a3",
-                       enable_profiling=False, run_all_cases=False, case_name=None,
-                       pto_isa_commit=None, build_dir=None, repeat_rounds=None,
-                       clone_protocol="ssh", skip_golden=False):
+def create_code_runner(  # noqa: PLR0913
+    kernels_dir,
+    golden_path,
+    device_id=None,
+    platform="a2a3",
+    enable_profiling=False,
+    run_all_cases=False,
+    case_name=None,
+    pto_isa_commit=None,
+    build_runtime=False,
+    repeat_rounds=None,
+    clone_protocol="ssh",
+    skip_golden=False,
+):
     """Factory: creates a CodeRunner based on kernel_config."""
-    return CodeRunner(kernels_dir=kernels_dir, golden_path=golden_path,
-                      device_id=device_id, platform=platform,
-                      enable_profiling=enable_profiling,
-                      run_all_cases=run_all_cases, case_name=case_name,
-                      pto_isa_commit=pto_isa_commit, build_dir=build_dir,
-                      repeat_rounds=repeat_rounds,
-                      clone_protocol=clone_protocol,
-                      skip_golden=skip_golden)
+    return CodeRunner(
+        kernels_dir=kernels_dir,
+        golden_path=golden_path,
+        device_id=device_id,
+        platform=platform,
+        enable_profiling=enable_profiling,
+        run_all_cases=run_all_cases,
+        case_name=case_name,
+        pto_isa_commit=pto_isa_commit,
+        build_runtime=build_runtime,
+        repeat_rounds=repeat_rounds,
+        clone_protocol=clone_protocol,
+        skip_golden=skip_golden,
+    )

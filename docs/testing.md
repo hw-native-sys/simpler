@@ -15,19 +15,27 @@ pytest tests -m "not requires_hardware" -v
 # C++ unit tests
 cmake -B tests/cpp/build -S tests/cpp && cmake --build tests/cpp/build && ctest --test-dir tests/cpp/build --output-on-failure
 
-# Run a single example
+# Run a single example (uses pre-built runtime binaries)
 python examples/scripts/run_example.py \
     -k examples/a2a3/host_build_graph/vector_example/kernels \
     -g examples/a2a3/host_build_graph/vector_example/golden.py \
     -p a2a3sim
+
+# Run a single example with runtime recompilation (after changing runtime C++ source)
+python examples/scripts/run_example.py --build \
+    -k examples/a2a3/host_build_graph/vector_example/kernels \
+    -g examples/a2a3/host_build_graph/vector_example/golden.py \
+    -p a2a3sim
 ```
+
+> **`--build` flag**: By default, `run_example.py` loads pre-built binaries from `build/lib/`. Pass `--build` to recompile runtimes incrementally from source (uses persistent cmake cache in `build/cache/`). Use this when you've modified runtime C++ source under `src/`. See [developer-guide.md](developer-guide.md#build-workflow) for the full rebuild decision table.
 
 ## Test Organization
 
 Three test categories:
 
 | Category | Abbrev | Location | Runner | Description |
-|----------|--------|----------|--------|-------------|
+| -------- | ------ | -------- | ------ | ----------- |
 | System tests | st | `examples/`, `tests/st/` | `ci.sh` | Full end-to-end cases (compile + run + validate) |
 | Python unit tests | ut-py | `tests/ut/` | pytest | Unit tests for nanobind-exposed and Python modules |
 | C++ unit tests | ut-cpp | `tests/cpp/` | ctest (GoogleTest) | Unit tests for pure C++ modules |
@@ -42,7 +50,7 @@ If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/cpp/`
 All three categories (st, ut-py, ut-cpp) need a way to specify hardware requirements. Three tiers:
 
 | Tier | ut-py (pytest marker) | ut-cpp (ctest label) | st (current mechanism) |
-|------|---------------------|--------------------|-----------------------|
+| ---- | --------------------- | -------------------- | ---------------------- |
 | No hardware | `-m "not requires_hardware"` | `-L no_hardware` | `examples/` on sim platform |
 | Any hardware | `-m requires_hardware` (no `--platform`) | `-L requires_hardware` | — |
 | Platform-specific | `-m requires_hardware --platform a2a3` | `-L requires_a2a3` | `tests/st/{arch}/` on device platform |
@@ -51,7 +59,7 @@ For st, hardware classification is currently folder-based: `examples/` runs on b
 
 ## Test Directory Structure
 
-```
+```text
 tests/
   conftest.py          # pytest configuration (markers, fixtures, parametrization)
   ut/                  # Python unit tests (ut-py)
@@ -114,8 +122,8 @@ Each example has a `golden.py` with `generate_inputs()` and `compute_golden()` f
 
 Hardware-only scene tests for large-scale and feature-rich scenarios that are too slow or unsupported on simulation. Organized by runtime. Same structure as examples but focused on testing specific runtime behaviors and edge cases.
 
-| | `examples/` | `tests/st/` |
-|---|------------|-------------|
+| Attribute | `examples/` | `tests/st/` |
+| --------- | ----------- | ----------- |
 | Runs on sim | Yes | No |
 | Runs on device | Yes | Yes |
 | Scale | Small, fast | Large, thorough |
@@ -140,6 +148,7 @@ add_test(NAME test_my_component COMMAND test_my_component)
 ### New Scene Test
 
 Create a directory under `tests/st/{arch}/{runtime}/my_test/` with:
+
 - `golden.py` — Input generation and golden output computation
 - `kernels/kernel_config.py` — Kernel and runtime configuration
 
