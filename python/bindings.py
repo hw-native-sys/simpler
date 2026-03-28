@@ -1,3 +1,12 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+# ruff: noqa: PLW0602, PLW0603, PLC0415
 """
 
 PTO Runtime ctypes Bindings
@@ -33,25 +42,22 @@ Usage:
     runtime.finalize()
 """
 
-
+import ctypes
+import tempfile
 from ctypes import (
     CDLL,
     POINTER,
     c_char_p,
     c_int,
-    c_int32,
-    c_uint32,
-    c_void_p,
-    c_uint8,
-    c_uint64,
     c_size_t,
+    c_uint8,
+    c_uint32,
+    c_uint64,
+    c_void_p,
     cast,
 )
 from pathlib import Path
-from typing import Union, List, Optional, Tuple
-import ctypes
-import tempfile
-
+from typing import Optional, Union
 
 # Module-level library reference
 _lib = None
@@ -93,15 +99,15 @@ assert ctypes.sizeof(TaskArgC) == 48
 # ============================================================================
 # ToolchainType enum (defined in toolchain.py, must match compile_strategy.h)
 # ============================================================================
-from toolchain import ToolchainType
+from toolchain import ToolchainType  # noqa: E402
 
 # ============================================================================
 # Runtime Library Loader
 # ============================================================================
 
+
 class RuntimeLibraryLoader:
     """Loads and manages the PTO runtime C API library."""
-
 
     def __init__(self, lib_path: Union[str, Path]):
         """
@@ -133,30 +139,30 @@ class RuntimeLibraryLoader:
 
         # init_runtime - placement new + register kernels + load SO + build runtime with orchestration
         self.lib.init_runtime.argtypes = [
-            c_void_p,               # runtime
-            POINTER(c_uint8),       # orch_so_binary
-            c_size_t,               # orch_so_size
-            c_char_p,               # orch_func_name
-            POINTER(TaskArgC),      # orch_args
-            c_int,                  # orch_args_count
-            POINTER(c_int),         # kernel_func_ids (array of func_ids)
+            c_void_p,  # runtime
+            POINTER(c_uint8),  # orch_so_binary
+            c_size_t,  # orch_so_size
+            c_char_p,  # orch_func_name
+            POINTER(TaskArgC),  # orch_args
+            c_int,  # orch_args_count
+            POINTER(c_int),  # kernel_func_ids (array of func_ids)
             POINTER(POINTER(c_uint8)),  # kernel_binaries (array of binary pointers)
-            POINTER(c_size_t),      # kernel_sizes (array of sizes)
-            c_int,                  # kernel_count
+            POINTER(c_size_t),  # kernel_sizes (array of sizes)
+            c_int,  # kernel_count
         ]
         self.lib.init_runtime.restype = c_int
 
         # launch_runtime - device init + execute runtime
         self.lib.launch_runtime.argtypes = [
-            c_void_p,           # runtime
-            c_int,              # aicpu_thread_num
-            c_int,              # block_dim
-            c_int,              # device_id
-            POINTER(c_uint8),   # aicpu_binary
-            c_size_t,           # aicpu_size
-            POINTER(c_uint8),   # aicore_binary
-            c_size_t,           # aicore_size
-            c_int,              # orch_thread_num
+            c_void_p,  # runtime
+            c_int,  # aicpu_thread_num
+            c_int,  # block_dim
+            c_int,  # device_id
+            POINTER(c_uint8),  # aicpu_binary
+            c_size_t,  # aicpu_size
+            POINTER(c_uint8),  # aicore_binary
+            c_size_t,  # aicore_size
+            c_int,  # orch_thread_num
         ]
         self.lib.launch_runtime.restype = c_int
 
@@ -208,6 +214,7 @@ class RuntimeLibraryLoader:
 # Python Wrapper Classes
 # ============================================================================
 
+
 class Runtime:
     """
 
@@ -216,7 +223,6 @@ class Runtime:
     Python wrapper around the C Runtime API.
     User allocates memory via ctypes buffer, C++ uses placement new.
     """
-
 
     def __init__(self, lib: CDLL):
         """
@@ -238,7 +244,7 @@ class Runtime:
         orch_so_binary: bytes,
         orch_func_name: str,
         orch_args: Optional[list] = None,
-        kernel_binaries: Optional[List[Tuple[int, bytes]]] = None,
+        kernel_binaries: Optional[list[tuple[int, bytes]]] = None,
     ) -> None:
         """
 
@@ -268,14 +274,33 @@ class Runtime:
         orch_args_count = len(orch_args)
 
         # Convert orch_args to ctypes array.
-        # Accept either a nanobind TaskArgArray (from task_interface) or a
-        # plain list of TaskArgC structs.
-        from _task_interface import TaskArgArray as _NbTaskArgArray
+        # Accept either a nanobind ChipStorageTaskArgs or a plain list of TaskArgC structs.
+        from _task_interface import (  # pyright: ignore[reportMissingImports]
+            ChipStorageTaskArgs as _NbChipStorageTaskArgs,  # noqa: PLC0415
+        )
 
-        if isinstance(orch_args, _NbTaskArgArray):
-            orch_args_array = cast(orch_args.ctypes_ptr(), POINTER(TaskArgC)) if orch_args_count > 0 else None
-            # Prevent GC of the nanobind array while the ctypes pointer is live
-            self._nb_args_ref = orch_args
+        if isinstance(orch_args, _NbChipStorageTaskArgs):
+            # Bridge: ChipStorageTaskArgs → flat TaskArgC[] (tensors first, scalars after)
+            orch_args_count = orch_args.tensor_count() + orch_args.scalar_count()  # pyright: ignore[reportAttributeAccessIssue]
+            if orch_args_count > 0:
+                orch_args_array = (TaskArgC * orch_args_count)()
+                idx = 0
+                for i in range(orch_args.tensor_count()):  # pyright: ignore[reportAttributeAccessIssue]
+                    ta = orch_args.tensor(i)  # pyright: ignore[reportAttributeAccessIssue]
+                    orch_args_array[idx].kind = 0  # TENSOR
+                    orch_args_array[idx].u.tensor.data = ta.data
+                    shapes = ta.shapes
+                    for d in range(ta.ndims):
+                        orch_args_array[idx].u.tensor.shapes[d] = shapes[d]
+                    orch_args_array[idx].u.tensor.ndims = ta.ndims
+                    orch_args_array[idx].u.tensor.dtype = ta.dtype.value
+                    idx += 1
+                for i in range(orch_args.scalar_count()):  # pyright: ignore[reportAttributeAccessIssue]
+                    orch_args_array[idx].kind = 1  # SCALAR
+                    orch_args_array[idx].u.scalar = orch_args.scalar(i)  # pyright: ignore[reportAttributeAccessIssue]
+                    idx += 1
+            else:
+                orch_args_array = None
         elif orch_args_count > 0:
             orch_args_array = (TaskArgC * orch_args_count)(*orch_args)
         else:
@@ -313,7 +338,7 @@ class Runtime:
             self._handle,
             orch_so_array,
             len(orch_so_binary),
-            orch_func_name.encode('utf-8'),
+            orch_func_name.encode("utf-8"),
             orch_args_array,
             orch_args_count,
             func_ids_array,
@@ -539,6 +564,7 @@ def launch_runtime(
 # Compile Strategy Functions
 # ============================================================================
 
+
 def get_incore_compiler() -> ToolchainType:
     """
     Get the toolchain for incore kernel compilation.
@@ -583,6 +609,7 @@ def get_orchestration_compiler() -> ToolchainType:
 # Public API
 # ============================================================================
 
+
 def bind_host_binary(lib_path: Union[str, Path, bytes]) -> type:
     """
 
@@ -624,7 +651,7 @@ def bind_host_binary(lib_path: Union[str, Path, bytes]) -> type:
 
     # If bytes are provided, write to temporary file
     if isinstance(lib_path, bytes):
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.so') as f:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".so") as f:
             f.write(lib_path)
             lib_path = f.name
 
@@ -634,6 +661,6 @@ def bind_host_binary(lib_path: Union[str, Path, bytes]) -> type:
     # Create wrapper class with the loaded library
     class _Runtime(Runtime):
         def __init__(self):
-            super().__init__(_lib)
+            super().__init__(_lib)  # pyright: ignore[reportArgumentType]
 
     return _Runtime

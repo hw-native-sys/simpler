@@ -1,3 +1,12 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+# ruff: noqa: E402, PLC0415
 """Tests for the _task_interface nanobind extension and task_interface wrapper."""
 
 import ctypes
@@ -12,20 +21,22 @@ _python_dir = str(Path(__file__).resolve().parent.parent.parent / "python")
 if _python_dir not in sys.path:
     sys.path.insert(0, _python_dir)
 
-from _task_interface import (
+from _task_interface import (  # pyright: ignore[reportMissingImports]
+    CONTINUOUS_TENSOR_MAX_DIMS,
+    ChipStorageTaskArgs,
+    ContinuousTensor,
     DataType,
-    TaskArgKind,
-    TASK_ARG_MAX_DIMS,
-    get_element_size,
+    DynamicTaskArgs,
+    TaggedTaskArgs,
+    TensorArgType,
     get_dtype_name,
-    TaskArg,
-    TaskArgArray,
+    get_element_size,
 )
-
 
 # ============================================================================
 # DataType enum
 # ============================================================================
+
 
 class TestDataType:
     def test_enum_values_exist(self):
@@ -52,221 +63,418 @@ class TestDataType:
 
 
 class TestGetElementSize:
-    @pytest.mark.parametrize("dtype,expected", [
-        (DataType.FLOAT32, 4),
-        (DataType.FLOAT16, 2),
-        (DataType.INT32, 4),
-        (DataType.INT16, 2),
-        (DataType.INT8, 1),
-        (DataType.UINT8, 1),
-        (DataType.BFLOAT16, 2),
-        (DataType.INT64, 8),
-        (DataType.UINT64, 8),
-    ])
+    @pytest.mark.parametrize(
+        "dtype,expected",
+        [
+            (DataType.FLOAT32, 4),
+            (DataType.FLOAT16, 2),
+            (DataType.INT32, 4),
+            (DataType.INT16, 2),
+            (DataType.INT8, 1),
+            (DataType.UINT8, 1),
+            (DataType.BFLOAT16, 2),
+            (DataType.INT64, 8),
+            (DataType.UINT64, 8),
+        ],
+    )
     def test_element_sizes(self, dtype, expected):
         assert get_element_size(dtype) == expected
 
 
 class TestGetDtypeName:
-    @pytest.mark.parametrize("dtype,expected", [
-        (DataType.FLOAT32, "FLOAT32"),
-        (DataType.FLOAT16, "FLOAT16"),
-        (DataType.INT32, "INT32"),
-        (DataType.INT16, "INT16"),
-        (DataType.INT8, "INT8"),
-        (DataType.UINT8, "UINT8"),
-        (DataType.BFLOAT16, "BFLOAT16"),
-        (DataType.INT64, "INT64"),
-        (DataType.UINT64, "UINT64"),
-    ])
+    @pytest.mark.parametrize(
+        "dtype,expected",
+        [
+            (DataType.FLOAT32, "FLOAT32"),
+            (DataType.FLOAT16, "FLOAT16"),
+            (DataType.INT32, "INT32"),
+            (DataType.INT16, "INT16"),
+            (DataType.INT8, "INT8"),
+            (DataType.UINT8, "UINT8"),
+            (DataType.BFLOAT16, "BFLOAT16"),
+            (DataType.INT64, "INT64"),
+            (DataType.UINT64, "UINT64"),
+        ],
+    )
     def test_dtype_names(self, dtype, expected):
         assert get_dtype_name(dtype) == expected
-
-
-# ============================================================================
-# TaskArg
-# ============================================================================
-
-class TestTaskArg:
-    def test_default_constructor(self):
-        arg = TaskArg()
-        assert arg is not None
-
-    def test_make_tensor(self):
-        arg = TaskArg.make_tensor(0xDEAD, (4, 8), DataType.FLOAT32)
-        assert arg.kind == TaskArgKind.TENSOR
-        assert arg.tensor_data == 0xDEAD
-        assert arg.tensor_shapes == (4, 8)
-        assert arg.tensor_ndims == 2
-        assert arg.tensor_dtype == DataType.FLOAT32
-
-    def test_make_scalar(self):
-        arg = TaskArg.make_scalar(42)
-        assert arg.kind == TaskArgKind.SCALAR
-        assert arg.scalar == 42
-
-    def test_nbytes(self):
-        arg = TaskArg.make_tensor(0, (10, 20), DataType.FLOAT32)
-        assert arg.nbytes() == 10 * 20 * 4
-
-    def test_nbytes_int8(self):
-        arg = TaskArg.make_tensor(0, (256,), DataType.INT8)
-        assert arg.nbytes() == 256
-
-    def test_tensor_shapes_setter(self):
-        arg = TaskArg()
-        arg.kind = TaskArgKind.TENSOR
-        arg.tensor_shapes = (3, 5, 7)
-        assert arg.tensor_ndims == 3
-        assert arg.tensor_shapes == (3, 5, 7)
-
-    def test_set_tensor_shape(self):
-        arg = TaskArg.make_tensor(0, (10, 20, 30), DataType.INT32)
-        arg.set_tensor_shape(1, 99)
-        assert arg.tensor_shapes == (10, 99, 30)
-
-    def test_max_dims(self):
-        assert TASK_ARG_MAX_DIMS == 5
-        # 5 dims should work
-        arg = TaskArg.make_tensor(0, (1, 2, 3, 4, 5), DataType.INT32)
-        assert arg.tensor_ndims == 5
-
-    def test_exceed_max_dims(self):
-        with pytest.raises((ValueError, RuntimeError)):
-            TaskArg.make_tensor(0, (1, 2, 3, 4, 5, 6), DataType.INT32)
-
-    def test_repr_tensor(self):
-        arg = TaskArg.make_tensor(0x1000, (4, 8), DataType.FLOAT16)
-        r = repr(arg)
-        assert "TENSOR" in r
-        assert "4" in r
-        assert "8" in r
-        assert "FLOAT16" in r
-
-    def test_repr_scalar(self):
-        arg = TaskArg.make_scalar(123)
-        r = repr(arg)
-        assert "SCALAR" in r
-        assert "123" in r
-
-    def test_kind_readwrite(self):
-        arg = TaskArg()
-        arg.kind = TaskArgKind.SCALAR
-        assert arg.kind == TaskArgKind.SCALAR
-        arg.kind = TaskArgKind.TENSOR
-        assert arg.kind == TaskArgKind.TENSOR
-
-    def test_tensor_dtype_readwrite(self):
-        arg = TaskArg.make_tensor(0, (1,), DataType.FLOAT32)
-        arg.tensor_dtype = DataType.INT64
-        assert arg.tensor_dtype == DataType.INT64
-
-
-# ============================================================================
-# TaskArgArray
-# ============================================================================
-
-class TestTaskArgArray:
-    def test_empty(self):
-        arr = TaskArgArray()
-        assert len(arr) == 0
-
-    def test_append_and_len(self):
-        arr = TaskArgArray()
-        arr.append(TaskArg.make_scalar(1))
-        arr.append(TaskArg.make_scalar(2))
-        assert len(arr) == 2
-
-    def test_getitem(self):
-        arr = TaskArgArray()
-        arr.append(TaskArg.make_scalar(42))
-        assert arr[0].scalar == 42
-
-    def test_getitem_reference_internal(self):
-        arr = TaskArgArray()
-        arr.append(TaskArg.make_tensor(0, (10,), DataType.FLOAT32))
-        ref = arr[0]
-        ref.tensor_data = 0xBEEF
-        assert arr[0].tensor_data == 0xBEEF
-
-    def test_getitem_out_of_range(self):
-        arr = TaskArgArray()
-        with pytest.raises((IndexError, RuntimeError)):
-            arr[0]
-
-    def test_clear(self):
-        arr = TaskArgArray()
-        arr.append(TaskArg.make_scalar(1))
-        arr.clear()
-        assert len(arr) == 0
-
-    def test_ctypes_ptr_nonzero(self):
-        arr = TaskArgArray()
-        arr.append(TaskArg.make_scalar(99))
-        ptr = arr.ctypes_ptr()
-        assert isinstance(ptr, int)
-        assert ptr != 0
-
-    def test_ctypes_ptr_reads_correct_memory(self):
-        """Verify that ctypes can read the memory at ctypes_ptr()."""
-        arr = TaskArgArray()
-        arr.append(TaskArg.make_scalar(0x1234_5678_9ABC_DEF0))
-
-        ptr = arr.ctypes_ptr()
-        # TaskArg is 48 bytes. First 4 bytes = kind (SCALAR = 1)
-        kind_bytes = (ctypes.c_uint32).from_address(ptr)
-        assert kind_bytes.value == 1  # TaskArgKind::SCALAR
-
-        # Scalar value is at offset 8 (4 kind + 4 pad)
-        scalar_bytes = (ctypes.c_uint64).from_address(ptr + 8)
-        assert scalar_bytes.value == 0x1234_5678_9ABC_DEF0
 
 
 # ============================================================================
 # task_interface.py wrapper (torch integration)
 # ============================================================================
 
+
 class TestTaskInterfaceWrapper:
     def test_torch_dtype_to_datatype(self):
+        import torch  # pyright: ignore[reportMissingImports]
         from task_interface import torch_dtype_to_datatype
-        import torch
+
         assert torch_dtype_to_datatype(torch.float32) == DataType.FLOAT32
         assert torch_dtype_to_datatype(torch.int8) == DataType.INT8
         assert torch_dtype_to_datatype(torch.bfloat16) == DataType.BFLOAT16
 
     def test_torch_dtype_unsupported(self):
+        import torch  # pyright: ignore[reportMissingImports]
         from task_interface import torch_dtype_to_datatype
-        import torch
+
         with pytest.raises(KeyError):
             torch_dtype_to_datatype(torch.complex64)
 
     def test_make_tensor_arg(self):
+        import torch  # pyright: ignore[reportMissingImports]
         from task_interface import make_tensor_arg
-        import torch
+
         t = torch.zeros(4, 8, dtype=torch.float32)
         arg = make_tensor_arg(t)
-        assert arg.kind == TaskArgKind.TENSOR
-        assert arg.tensor_data == t.data_ptr()
-        assert arg.tensor_shapes == (4, 8)
-        assert arg.tensor_dtype == DataType.FLOAT32
+        assert isinstance(arg, ContinuousTensor)
+        assert arg.data == t.data_ptr()
+        assert arg.shapes == (4, 8)
+        assert arg.dtype == DataType.FLOAT32
         assert arg.nbytes() == 4 * 8 * 4
 
-    def test_make_scalar_arg_int(self):
-        from task_interface import make_scalar_arg
-        arg = make_scalar_arg(999)
-        assert arg.kind == TaskArgKind.SCALAR
-        assert arg.scalar == 999
+    def test_scalar_to_uint64_int(self):
+        from task_interface import scalar_to_uint64
 
-    def test_make_scalar_arg_ctypes(self):
-        from task_interface import make_scalar_arg
-        arg = make_scalar_arg(ctypes.c_int64(42))
-        assert arg.kind == TaskArgKind.SCALAR
-        assert arg.scalar == 42
+        assert scalar_to_uint64(999) == 999
 
-    def test_make_scalar_arg_float_ctypes(self):
-        from task_interface import make_scalar_arg
-        arg = make_scalar_arg(ctypes.c_float(1.5))
-        assert arg.kind == TaskArgKind.SCALAR
-        # Verify bit-cast: 1.5f = 0x3FC00000
+    def test_scalar_to_uint64_ctypes(self):
+        from task_interface import scalar_to_uint64
+
+        assert scalar_to_uint64(ctypes.c_int64(42)) == 42
+
+    def test_scalar_to_uint64_float_ctypes(self):
+        from task_interface import scalar_to_uint64
+
+        bits = scalar_to_uint64(ctypes.c_float(1.5))
         expected_bits = struct.unpack("I", struct.pack("f", 1.5))[0]
-        assert arg.scalar == expected_bits
+        assert bits == expected_bits
+
+
+# ============================================================================
+# ContinuousTensor
+# ============================================================================
+
+
+class TestContinuousTensor:
+    def test_default_constructor(self):
+        arg = ContinuousTensor()
+        assert arg is not None
+
+    def test_max_dims_constant(self):
+        assert CONTINUOUS_TENSOR_MAX_DIMS == 5
+
+    def test_make(self):
+        arg = ContinuousTensor.make(0xDEAD, (4, 8), DataType.FLOAT32)
+        assert arg.data == 0xDEAD
+        assert arg.shapes == (4, 8)
+        assert arg.ndims == 2
+        assert arg.dtype == DataType.FLOAT32
+
+    def test_nbytes(self):
+        arg = ContinuousTensor.make(0, (10, 20), DataType.FLOAT32)
+        assert arg.nbytes() == 10 * 20 * 4
+
+    def test_nbytes_int8(self):
+        arg = ContinuousTensor.make(0, (256,), DataType.INT8)
+        assert arg.nbytes() == 256
+
+    def test_shapes_setter(self):
+        arg = ContinuousTensor()
+        arg.shapes = (3, 5, 7)
+        assert arg.ndims == 3
+        assert arg.shapes == (3, 5, 7)
+
+    def test_max_dims(self):
+        arg = ContinuousTensor.make(0, (1, 2, 3, 4, 5), DataType.INT32)
+        assert arg.ndims == 5
+
+    def test_exceed_max_dims(self):
+        with pytest.raises((ValueError, RuntimeError)):
+            ContinuousTensor.make(0, (1, 2, 3, 4, 5, 6), DataType.INT32)
+
+    def test_dtype_readwrite(self):
+        arg = ContinuousTensor.make(0, (1,), DataType.FLOAT32)
+        arg.dtype = DataType.INT64
+        assert arg.dtype == DataType.INT64
+
+    def test_data_readwrite(self):
+        arg = ContinuousTensor.make(0x1000, (1,), DataType.FLOAT32)
+        assert arg.data == 0x1000
+        arg.data = 0x2000
+        assert arg.data == 0x2000
+
+    def test_repr(self):
+        arg = ContinuousTensor.make(0x1000, (4, 8), DataType.FLOAT16)
+        r = repr(arg)
+        assert "ContinuousTensor" in r
+        assert "4" in r
+        assert "8" in r
+        assert "FLOAT16" in r
+
+
+# ============================================================================
+# ChipStorageTaskArgs
+# ============================================================================
+
+
+class TestChipStorageTaskArgs:
+    def test_empty(self):
+        args = ChipStorageTaskArgs()
+        assert len(args) == 0
+        assert args.tensor_count() == 0
+        assert args.scalar_count() == 0
+
+    def test_add_tensor(self):
+        args = ChipStorageTaskArgs()
+        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
+        args.add_tensor(t)
+        assert args.tensor_count() == 1
+        assert args.scalar_count() == 0
+        assert len(args) == 1
+
+    def test_add_scalar(self):
+        args = ChipStorageTaskArgs()
+        args.add_scalar(42)
+        assert args.scalar_count() == 1
+        assert args.tensor_count() == 0
+        assert len(args) == 1
+
+    def test_mixed(self):
+        args = ChipStorageTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16))
+        args.add_scalar(99)
+        args.add_scalar(100)
+        assert args.tensor_count() == 2
+        assert args.scalar_count() == 2
+        assert len(args) == 4
+
+    def test_tensor_before_scalar_enforced(self):
+        args = ChipStorageTaskArgs()
+        args.add_scalar(42)
+        with pytest.raises(RuntimeError):
+            args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+
+    def test_tensor_access(self):
+        args = ChipStorageTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0xA, (4,), DataType.FLOAT32))
+        args.add_tensor(ContinuousTensor.make(0xB, (8,), DataType.INT32))
+        assert args.tensor(0).data == 0xA
+        assert args.tensor(1).data == 0xB
+        assert args.tensor(0).shapes == (4,)
+        assert args.tensor(1).shapes == (8,)
+
+    def test_scalar_access(self):
+        args = ChipStorageTaskArgs()
+        args.add_scalar(111)
+        args.add_scalar(222)
+        assert args.scalar(0) == 111
+        assert args.scalar(1) == 222
+
+    def test_tensor_out_of_range(self):
+        args = ChipStorageTaskArgs()
+        with pytest.raises((IndexError, RuntimeError)):
+            args.tensor(0)
+
+    def test_scalar_out_of_range(self):
+        args = ChipStorageTaskArgs()
+        with pytest.raises((IndexError, RuntimeError)):
+            args.scalar(0)
+
+    def test_clear(self):
+        args = ChipStorageTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0, (1,), DataType.INT8))
+        args.add_scalar(42)
+        args.clear()
+        assert len(args) == 0
+        assert args.tensor_count() == 0
+        assert args.scalar_count() == 0
+
+
+# ============================================================================
+# TensorArgType
+# ============================================================================
+
+
+class TestTensorArgType:
+    def test_enum_values(self):
+        assert TensorArgType.INPUT.value == 0
+        assert TensorArgType.OUTPUT.value == 1
+        assert TensorArgType.INOUT.value == 2
+
+    def test_enum_identity(self):
+        assert TensorArgType.INPUT is not None
+        assert TensorArgType.OUTPUT is not None
+        assert TensorArgType.INOUT is not None
+
+
+# ============================================================================
+# DynamicTaskArgs
+# ============================================================================
+
+
+class TestDynamicTaskArgs:
+    def test_empty(self):
+        args = DynamicTaskArgs()
+        assert len(args) == 0
+        assert args.tensor_count() == 0
+        assert args.scalar_count() == 0
+
+    def test_add_tensor(self):
+        args = DynamicTaskArgs()
+        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
+        args.add_tensor(t)
+        assert args.tensor_count() == 1
+        assert args.scalar_count() == 0
+        assert len(args) == 1
+
+    def test_add_scalar(self):
+        args = DynamicTaskArgs()
+        args.add_scalar(42)
+        assert args.scalar_count() == 1
+        assert args.tensor_count() == 0
+        assert len(args) == 1
+
+    def test_mixed(self):
+        args = DynamicTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16))
+        args.add_scalar(99)
+        args.add_scalar(100)
+        assert args.tensor_count() == 2
+        assert args.scalar_count() == 2
+        assert len(args) == 4
+
+    def test_tensor_before_scalar_enforced(self):
+        args = DynamicTaskArgs()
+        args.add_scalar(42)
+        with pytest.raises(RuntimeError):
+            args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+
+    def test_tensor_access(self):
+        args = DynamicTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0xA, (4,), DataType.FLOAT32))
+        args.add_tensor(ContinuousTensor.make(0xB, (8,), DataType.INT32))
+        assert args.tensor(0).data == 0xA
+        assert args.tensor(1).data == 0xB
+        assert args.tensor(0).shapes == (4,)
+        assert args.tensor(1).shapes == (8,)
+
+    def test_scalar_access(self):
+        args = DynamicTaskArgs()
+        args.add_scalar(111)
+        args.add_scalar(222)
+        assert args.scalar(0) == 111
+        assert args.scalar(1) == 222
+
+    def test_tensor_out_of_range(self):
+        args = DynamicTaskArgs()
+        with pytest.raises((IndexError, RuntimeError)):
+            args.tensor(0)
+
+    def test_scalar_out_of_range(self):
+        args = DynamicTaskArgs()
+        with pytest.raises((IndexError, RuntimeError)):
+            args.scalar(0)
+
+    def test_clear(self):
+        args = DynamicTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0, (1,), DataType.INT8))
+        args.add_scalar(42)
+        args.clear()
+        assert len(args) == 0
+        assert args.tensor_count() == 0
+        assert args.scalar_count() == 0
+
+    def test_no_capacity_limit(self):
+        """Dynamic variant should handle more than 16 tensors / 128 scalars."""
+        args = DynamicTaskArgs()
+        for i in range(20):
+            args.add_tensor(ContinuousTensor.make(i, (1,), DataType.INT8))
+        assert args.tensor_count() == 20
+
+    def test_many_scalars(self):
+        args = DynamicTaskArgs()
+        for i in range(200):
+            args.add_scalar(i)
+        assert args.scalar_count() == 200
+
+
+# ============================================================================
+# TaggedTaskArgs
+# ============================================================================
+
+
+class TestTaggedTaskArgs:
+    def test_empty(self):
+        args = TaggedTaskArgs()
+        assert len(args) == 0
+        assert args.tensor_count() == 0
+        assert args.scalar_count() == 0
+
+    def test_add_tensor_default_tag(self):
+        args = TaggedTaskArgs()
+        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
+        args.add_tensor(t)
+        assert args.tensor_count() == 1
+        assert args.tensor_tag(0) == TensorArgType.INPUT
+
+    def test_add_tensor_with_tag(self):
+        args = TaggedTaskArgs()
+        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
+        args.add_tensor(t, TensorArgType.OUTPUT)
+        assert args.tensor_tag(0) == TensorArgType.OUTPUT
+
+    def test_multiple_tensors_with_tags(self):
+        args = TaggedTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
+        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
+        args.add_tensor(ContinuousTensor.make(0x3, (4,), DataType.INT8), TensorArgType.INOUT)
+        assert args.tensor_count() == 3
+        assert args.tensor_tag(0) == TensorArgType.INPUT
+        assert args.tensor_tag(1) == TensorArgType.OUTPUT
+        assert args.tensor_tag(2) == TensorArgType.INOUT
+
+    def test_set_tensor_tag(self):
+        args = TaggedTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+        assert args.tensor_tag(0) == TensorArgType.INPUT
+        args.set_tensor_tag(0, TensorArgType.INOUT)
+        assert args.tensor_tag(0) == TensorArgType.INOUT
+
+    def test_tensor_before_scalar_enforced(self):
+        args = TaggedTaskArgs()
+        args.add_scalar(42)
+        with pytest.raises(RuntimeError):
+            args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+
+    def test_mixed_with_tags(self):
+        args = TaggedTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
+        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
+        args.add_scalar(99)
+        assert args.tensor_count() == 2
+        assert args.scalar_count() == 1
+        assert args.tensor(0).data == 0x1
+        assert args.tensor(1).data == 0x2
+        assert args.scalar(0) == 99
+
+    def test_clear(self):
+        args = TaggedTaskArgs()
+        args.add_tensor(ContinuousTensor.make(0, (1,), DataType.INT8), TensorArgType.OUTPUT)
+        args.add_scalar(42)
+        args.clear()
+        assert len(args) == 0
+        assert args.tensor_count() == 0
+        assert args.scalar_count() == 0
+
+    def test_tensor_tag_out_of_range(self):
+        args = TaggedTaskArgs()
+        with pytest.raises((IndexError, RuntimeError)):
+            args.tensor_tag(0)
+
+    def test_set_tensor_tag_out_of_range(self):
+        args = TaggedTaskArgs()
+        with pytest.raises((IndexError, RuntimeError)):
+            args.set_tensor_tag(0, TensorArgType.INPUT)

@@ -1,23 +1,34 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Nanobind Python extension for task_interface headers.
  *
- * Wraps DataType, TaskArgKind, TaskArg, and helper functions from
- * data_type.h / task_arg.h so Python can use the canonical C++ types
- * instead of maintaining parallel ctypes definitions.
+ * Wraps DataType, ContinuousTensor, ChipStorageTaskArgs, DynamicTaskArgs,
+ * TaggedTaskArgs, TensorArgType, and helper functions from
+ * data_type.h / tensor_arg.h / separated_args.h.
  */
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/string.h>
-#include <nanobind/stl/vector.h>
 #include <nanobind/stl/tuple.h>
-
-#include "data_type.h"
-#include "task_arg.h"
-#include "task_arg_array.h"
+#include <nanobind/stl/vector.h>
 
 #include <cstring>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+
+#include "data_type.h"       // NOLINT(build/include_subdir)
+#include "separated_args.h"  // NOLINT(build/include_subdir)
+#include "tensor_arg.h"      // NOLINT(build/include_subdir)
 
 namespace nb = nanobind;
 
@@ -26,171 +37,270 @@ namespace nb = nanobind;
 // ============================================================================
 
 NB_MODULE(_task_interface, m) {
-    m.doc() = "Nanobind bindings for task_interface (DataType, TaskArg)";
+    m.doc() = "Nanobind bindings for task_interface (DataType, ContinuousTensor, TaskArgs variants)";
 
     // --- DataType enum ---
     nb::enum_<DataType>(m, "DataType")
-        .value("FLOAT32",  DataType::FLOAT32)
-        .value("FLOAT16",  DataType::FLOAT16)
-        .value("INT32",    DataType::INT32)
-        .value("INT16",    DataType::INT16)
-        .value("INT8",     DataType::INT8)
-        .value("UINT8",    DataType::UINT8)
+        .value("FLOAT32", DataType::FLOAT32)
+        .value("FLOAT16", DataType::FLOAT16)
+        .value("INT32", DataType::INT32)
+        .value("INT16", DataType::INT16)
+        .value("INT8", DataType::INT8)
+        .value("UINT8", DataType::UINT8)
         .value("BFLOAT16", DataType::BFLOAT16)
-        .value("INT64",    DataType::INT64)
-        .value("UINT64",   DataType::UINT64);
-
-    // --- TaskArgKind enum ---
-    nb::enum_<TaskArgKind>(m, "TaskArgKind")
-        .value("TENSOR", TaskArgKind::TENSOR)
-        .value("SCALAR", TaskArgKind::SCALAR);
-
-    // --- Constants ---
-    m.attr("TASK_ARG_MAX_DIMS") = TASK_ARG_MAX_DIMS;
+        .value("INT64", DataType::INT64)
+        .value("UINT64", DataType::UINT64);
 
     // --- Free functions ---
-    m.def("get_element_size", &get_element_size,
-          nb::arg("dtype"),
-          "Return the byte size of a single element of the given DataType.");
+    m.def("get_element_size",
+        &get_element_size,
+        nb::arg("dtype"),
+        "Return the byte size of a single element of the given DataType.");
 
-    m.def("get_dtype_name",
-          [](DataType dt) -> std::string { return get_dtype_name(dt); },
-          nb::arg("dtype"),
-          "Return the string name of a DataType.");
+    m.def(
+        "get_dtype_name",
+        [](DataType dt) -> std::string { return get_dtype_name(dt); },
+        nb::arg("dtype"),
+        "Return the string name of a DataType.");
 
-    // --- TaskArg ---
-    nb::class_<TaskArg>(m, "TaskArg")
+    // --- Constants ---
+    m.attr("CONTINUOUS_TENSOR_MAX_DIMS") = CONTINUOUS_TENSOR_MAX_DIMS;
+
+    // --- ContinuousTensor ---
+    nb::class_<ContinuousTensor>(m, "ContinuousTensor")
         .def(nb::init<>())
 
-        // kind
-        .def_prop_rw("kind",
-            [](const TaskArg& self) { return self.kind; },
-            [](TaskArg& self, TaskArgKind k) { self.kind = k; })
+        .def_static(
+            "make",
+            [](uint64_t data, nb::tuple shapes, DataType dtype) -> ContinuousTensor {
+                size_t n = nb::len(shapes);
+                if (n > CONTINUOUS_TENSOR_MAX_DIMS)
+                    throw std::invalid_argument("shapes length exceeds CONTINUOUS_TENSOR_MAX_DIMS");
+                ContinuousTensor arg{};
+                arg.data = data;
+                arg.dtype = dtype;
+                arg.ndims = static_cast<uint32_t>(n);
+                for (size_t i = 0; i < n; ++i) arg.shapes[i] = nb::cast<uint32_t>(shapes[i]);
+                return arg;
+            },
+            nb::arg("data"),
+            nb::arg("shapes"),
+            nb::arg("dtype"),
+            "Create a ContinuousTensor from a data pointer, shape tuple, and dtype.")
 
-        // scalar (union field)
-        .def_prop_rw("scalar",
-            [](const TaskArg& self) -> uint64_t { return self.scalar; },
-            [](TaskArg& self, uint64_t v) { self.scalar = v; })
+        .def_prop_rw(
+            "data",
+            [](const ContinuousTensor& self) -> uint64_t { return self.data; },
+            [](ContinuousTensor& self, uint64_t v) { self.data = v; })
 
-        // tensor.data
-        .def_prop_rw("tensor_data",
-            [](const TaskArg& self) -> uint64_t { return self.tensor.data; },
-            [](TaskArg& self, uint64_t v) { self.tensor.data = v; })
-
-        // tensor.shapes — getter returns tuple[:ndims], setter writes + updates ndims
-        .def_prop_rw("tensor_shapes",
-            [](const TaskArg& self) -> nb::tuple {
-                uint32_t n = self.tensor.ndims;
-                if (n > TASK_ARG_MAX_DIMS) n = TASK_ARG_MAX_DIMS;
+        .def_prop_rw(
+            "shapes",
+            [](const ContinuousTensor& self) -> nb::tuple {
+                uint32_t n = self.ndims;
+                if (n > CONTINUOUS_TENSOR_MAX_DIMS) n = CONTINUOUS_TENSOR_MAX_DIMS;
                 nb::list lst;
-                for (uint32_t i = 0; i < n; ++i)
-                    lst.append(self.tensor.shapes[i]);
+                for (uint32_t i = 0; i < n; ++i) lst.append(self.shapes[i]);
                 return nb::tuple(lst);
             },
-            [](TaskArg& self, nb::tuple t) {
+            [](ContinuousTensor& self, nb::tuple t) {
                 size_t n = nb::len(t);
-                if (n > TASK_ARG_MAX_DIMS)
-                    throw std::invalid_argument(
-                        "shapes tuple length exceeds TASK_ARG_MAX_DIMS ("
-                        + std::to_string(TASK_ARG_MAX_DIMS) + ")");
-                for (size_t i = 0; i < n; ++i)
-                    self.tensor.shapes[i] = nb::cast<uint32_t>(t[i]);
-                self.tensor.ndims = static_cast<uint32_t>(n);
+                if (n > CONTINUOUS_TENSOR_MAX_DIMS)
+                    throw std::invalid_argument("shapes tuple length exceeds CONTINUOUS_TENSOR_MAX_DIMS (" +
+                                                std::to_string(CONTINUOUS_TENSOR_MAX_DIMS) + ")");
+                for (size_t i = 0; i < n; ++i) self.shapes[i] = nb::cast<uint32_t>(t[i]);
+                self.ndims = static_cast<uint32_t>(n);
             })
 
-        // tensor.ndims
-        .def_prop_rw("tensor_ndims",
-            [](const TaskArg& self) -> uint32_t { return self.tensor.ndims; },
-            [](TaskArg& self, uint32_t v) { self.tensor.ndims = v; })
+        .def_prop_rw(
+            "ndims",
+            [](const ContinuousTensor& self) -> uint32_t { return self.ndims; },
+            [](ContinuousTensor& self, uint32_t v) { self.ndims = v; })
 
-        // tensor.dtype
-        .def_prop_rw("tensor_dtype",
-            [](const TaskArg& self) -> DataType { return self.tensor.dtype; },
-            [](TaskArg& self, DataType dt) { self.tensor.dtype = dt; })
+        .def_prop_rw(
+            "dtype",
+            [](const ContinuousTensor& self) -> DataType { return self.dtype; },
+            [](ContinuousTensor& self, DataType dt) { self.dtype = dt; })
 
-        // set_tensor_shape(dim, val)
-        .def("set_tensor_shape",
-            [](TaskArg& self, uint32_t dim, uint32_t val) {
-                if (dim >= TASK_ARG_MAX_DIMS)
-                    throw std::out_of_range("dim >= TASK_ARG_MAX_DIMS");
-                self.tensor.shapes[dim] = val;
-            },
-            nb::arg("dim"), nb::arg("val"))
+        .def(
+            "nbytes",
+            [](const ContinuousTensor& self) -> uint64_t { return self.nbytes(); },
+            "Compute total bytes (product of shapes * element_size).")
 
-        // nbytes()
-        .def("nbytes",
-            [](const TaskArg& self) -> uint64_t { return self.nbytes(); },
-            "Compute total bytes for this tensor (product of shapes * element_size).")
+        .def("__repr__", [](const ContinuousTensor& self) -> std::string {
+            std::ostringstream os;
+            os << "ContinuousTensor(data=0x" << std::hex << self.data << std::dec << ", shapes=(";
+            for (uint32_t i = 0; i < self.ndims; ++i) {
+                if (i) os << ", ";
+                os << self.shapes[i];
+            }
+            os << "), dtype=" << get_dtype_name(self.dtype) << ")";
+            return os.str();
+        });
 
-        // Static factory: make_tensor
-        .def_static("make_tensor",
-            [](uint64_t data, nb::tuple shapes, DataType dtype) -> TaskArg {
-                size_t n = nb::len(shapes);
-                if (n > TASK_ARG_MAX_DIMS)
-                    throw std::invalid_argument(
-                        "shapes length exceeds TASK_ARG_MAX_DIMS");
-                TaskArg arg{};
-                arg.kind = TaskArgKind::TENSOR;
-                arg.tensor.data = data;
-                arg.tensor.dtype = dtype;
-                arg.tensor.ndims = static_cast<uint32_t>(n);
-                for (size_t i = 0; i < n; ++i)
-                    arg.tensor.shapes[i] = nb::cast<uint32_t>(shapes[i]);
-                return arg;
-            },
-            nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"),
-            "Create a TENSOR TaskArg from a data pointer, shape tuple, and dtype.")
-
-        // Static factory: make_scalar
-        .def_static("make_scalar",
-            [](uint64_t value) -> TaskArg {
-                TaskArg arg{};
-                arg.kind = TaskArgKind::SCALAR;
-                arg.scalar = value;
-                return arg;
-            },
-            nb::arg("value"),
-            "Create a SCALAR TaskArg with the given uint64 value.")
-
-        // __repr__
-        .def("__repr__",
-            [](const TaskArg& self) -> std::string {
-                std::ostringstream os;
-                if (self.kind == TaskArgKind::TENSOR) {
-                    os << "TaskArg(TENSOR, data=0x"
-                       << std::hex << self.tensor.data << std::dec
-                       << ", shapes=(";
-                    for (uint32_t i = 0; i < self.tensor.ndims; ++i) {
-                        if (i) os << ", ";
-                        os << self.tensor.shapes[i];
-                    }
-                    os << "), dtype=" << get_dtype_name(self.tensor.dtype)
-                       << ")";
-                } else {
-                    os << "TaskArg(SCALAR, value=" << self.scalar << ")";
-                }
-                return os.str();
-            });
-
-    // --- TaskArgArray ---
-    nb::class_<TaskArgArray>(m, "TaskArgArray")
+    // --- ChipStorageTaskArgs (fixed-size TaskArgs) ---
+    nb::class_<ChipStorageTaskArgs>(m, "ChipStorageTaskArgs")
         .def(nb::init<>())
 
-        .def("append", &TaskArgArray::append, nb::arg("arg"),
-             "Append a TaskArg to the array.")
+        .def("add_tensor",
+            &ChipStorageTaskArgs::add_tensor,
+            nb::arg("t"),
+            "Add a ContinuousTensor. Must be called before any add_scalar().")
 
-        .def("clear", &TaskArgArray::clear,
-             "Remove all elements.")
+        .def("add_scalar",
+            &ChipStorageTaskArgs::add_scalar,
+            nb::arg("s"),
+            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed.")
 
-        .def("__len__", &TaskArgArray::size)
-
-        .def("__getitem__",
-            static_cast<TaskArg& (TaskArgArray::*)(size_t)>(&TaskArgArray::get),
-            nb::arg("idx"),
+        .def(
+            "tensor",
+            [](const ChipStorageTaskArgs& self, int32_t i) -> const ContinuousTensor& {
+                if (i < 0 || i >= self.tensor_count())
+                    throw std::out_of_range("ChipStorageTaskArgs tensor index out of range");
+                return self.tensor(i);
+            },
+            nb::arg("i"),
             nb::rv_policy::reference_internal,
-            "Return a reference to the TaskArg at the given index.")
+            "Return the ContinuousTensor at index i.")
 
-        .def("ctypes_ptr", &TaskArgArray::data_ptr,
-             "Return the raw memory address of the contiguous TaskArg array "
-             "(for passing to ctypes CDLL calls).");
+        .def(
+            "scalar",
+            [](const ChipStorageTaskArgs& self, int32_t i) -> uint64_t {
+                if (i < 0 || i >= self.scalar_count())
+                    throw std::out_of_range("ChipStorageTaskArgs scalar index out of range");
+                return self.scalar(i);
+            },
+            nb::arg("i"),
+            "Return the scalar at index i.")
+
+        .def("tensor_count", &ChipStorageTaskArgs::tensor_count)
+        .def("scalar_count", &ChipStorageTaskArgs::scalar_count)
+
+        .def("clear", &ChipStorageTaskArgs::clear)
+
+        .def(
+            "__len__",
+            [](const ChipStorageTaskArgs& self) { return self.tensor_count() + self.scalar_count(); },
+            "Return total number of arguments (tensors + scalars).");
+
+    // --- TensorArgType enum ---
+    nb::enum_<TensorArgType>(m, "TensorArgType")
+        .value("INPUT", TensorArgType::INPUT)
+        .value("OUTPUT", TensorArgType::OUTPUT)
+        .value("INOUT", TensorArgType::INOUT);
+
+    // --- DynamicTaskArgs (vector-backed, no capacity limit) ---
+    nb::class_<DynamicTaskArgs>(m, "DynamicTaskArgs")
+        .def(nb::init<>())
+
+        .def("add_tensor",
+            &DynamicTaskArgs::add_tensor,
+            nb::arg("t"),
+            "Add a ContinuousTensor. Must be called before any add_scalar().")
+
+        .def("add_scalar",
+            &DynamicTaskArgs::add_scalar,
+            nb::arg("s"),
+            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed.")
+
+        .def(
+            "tensor",
+            [](const DynamicTaskArgs& self, int32_t i) -> const ContinuousTensor& {
+                if (i < 0 || i >= self.tensor_count())
+                    throw std::out_of_range("DynamicTaskArgs tensor index out of range");
+                return self.tensor(i);
+            },
+            nb::arg("i"),
+            nb::rv_policy::reference_internal,
+            "Return the ContinuousTensor at index i.")
+
+        .def(
+            "scalar",
+            [](const DynamicTaskArgs& self, int32_t i) -> uint64_t {
+                if (i < 0 || i >= self.scalar_count())
+                    throw std::out_of_range("DynamicTaskArgs scalar index out of range");
+                return self.scalar(i);
+            },
+            nb::arg("i"),
+            "Return the scalar at index i.")
+
+        .def("tensor_count", &DynamicTaskArgs::tensor_count)
+        .def("scalar_count", &DynamicTaskArgs::scalar_count)
+
+        .def("clear", &DynamicTaskArgs::clear)
+
+        .def(
+            "__len__",
+            [](const DynamicTaskArgs& self) { return self.tensor_count() + self.scalar_count(); },
+            "Return total number of arguments (tensors + scalars).");
+
+    // --- TaggedTaskArgs (fixed-size with per-tensor TensorArgType tags) ---
+    nb::class_<TaggedTaskArgs>(m, "TaggedTaskArgs")
+        .def(nb::init<>())
+
+        .def(
+            "add_tensor",
+            [](TaggedTaskArgs& self, const ContinuousTensor& t, TensorArgType tag) {
+                self.add_tensor(t);
+                self.tensor_tag(self.tensor_count() - 1) = tag;
+            },
+            nb::arg("t"),
+            nb::arg("tag") = TensorArgType::INPUT,
+            "Add a ContinuousTensor with an optional TensorArgType tag (default INPUT).")
+
+        .def("add_scalar",
+            &TaggedTaskArgs::add_scalar,
+            nb::arg("s"),
+            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed.")
+
+        .def(
+            "tensor",
+            [](const TaggedTaskArgs& self, int32_t i) -> const ContinuousTensor& {
+                if (i < 0 || i >= self.tensor_count())
+                    throw std::out_of_range("TaggedTaskArgs tensor index out of range");
+                return self.tensor(i);
+            },
+            nb::arg("i"),
+            nb::rv_policy::reference_internal,
+            "Return the ContinuousTensor at index i.")
+
+        .def(
+            "scalar",
+            [](const TaggedTaskArgs& self, int32_t i) -> uint64_t {
+                if (i < 0 || i >= self.scalar_count())
+                    throw std::out_of_range("TaggedTaskArgs scalar index out of range");
+                return self.scalar(i);
+            },
+            nb::arg("i"),
+            "Return the scalar at index i.")
+
+        .def(
+            "tensor_tag",
+            [](const TaggedTaskArgs& self, int32_t i) -> TensorArgType {
+                if (i < 0 || i >= self.tensor_count())
+                    throw std::out_of_range("TaggedTaskArgs tensor_tag index out of range");
+                return self.tensor_tag(i);
+            },
+            nb::arg("i"),
+            "Return the TensorArgType tag for the tensor at index i.")
+
+        .def(
+            "set_tensor_tag",
+            [](TaggedTaskArgs& self, int32_t i, TensorArgType tag) {
+                if (i < 0 || i >= self.tensor_count())
+                    throw std::out_of_range("TaggedTaskArgs set_tensor_tag index out of range");
+                self.tensor_tag(i) = tag;
+            },
+            nb::arg("i"),
+            nb::arg("tag"),
+            "Set the TensorArgType tag for the tensor at index i.")
+
+        .def("tensor_count", &TaggedTaskArgs::tensor_count)
+        .def("scalar_count", &TaggedTaskArgs::scalar_count)
+
+        .def("clear", &TaggedTaskArgs::clear)
+
+        .def(
+            "__len__",
+            [](const TaggedTaskArgs& self) { return self.tensor_count() + self.scalar_count(); },
+            "Return total number of arguments (tensors + scalars).");
 }

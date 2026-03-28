@@ -66,9 +66,9 @@ from typing import Any, Optional
 import torch  # type: ignore[import-not-found]
 
 # =============================================================================
-# TaskArg construction — uses nanobind bindings from task_interface
+# Argument construction — uses nanobind bindings from task_interface
 # =============================================================================
-from task_interface import TaskArgArray, make_scalar_arg, make_tensor_arg  # type: ignore[import-not-found]
+from task_interface import ChipStorageTaskArgs, make_tensor_arg, scalar_to_uint64  # type: ignore[import-not-found]
 
 logger = logging.getLogger(__name__)
 
@@ -451,7 +451,7 @@ class CodeRunner:
 
     This class automates:
     - Loading kernel_config.py and golden.py dynamically
-    - Building TaskArgArray automatically from torch tensors
+    - Building ChipStorageTaskArgs automatically from torch tensors
     - Converting numpy arrays to torch tensors
     - Separating inputs and outputs based on naming convention
     - Running the full test flow
@@ -576,7 +576,7 @@ class CodeRunner:
         self, args_list: list
     ) -> tuple[list, dict[str, Any], dict[str, torch.Tensor], dict[str, torch.Tensor]]:
         """
-        Build TaskArgArray from an explicit argument list returned by generate_inputs.
+        Build ChipStorageTaskArgs from an explicit argument list returned by generate_inputs.
 
         Every element must be a (name, value) pair where value is either:
         - torch.Tensor / numpy array: a tensor argument
@@ -595,7 +595,7 @@ class CodeRunner:
             raise ValueError("No output tensors identified. Define __outputs__ = ['tensor_name'] in golden.py")
         output_set = set(self.output_names)
 
-        orch_args = TaskArgArray()
+        orch_args = ChipStorageTaskArgs()
         args = {}  # all named items: tensors + scalars → passed to compute_golden
         inputs = {}  # tensor inputs only → for logging
         outputs = {}  # tensor outputs (and inouts) → for comparison
@@ -615,7 +615,7 @@ class CodeRunner:
                 tensor = tensor.cpu().contiguous()
                 args[name] = tensor
 
-                orch_args.append(make_tensor_arg(tensor))
+                orch_args.add_tensor(make_tensor_arg(tensor))
 
                 if name in output_set:
                     outputs[name] = tensor
@@ -623,7 +623,7 @@ class CodeRunner:
                     inputs[name] = tensor
 
             elif isinstance(value, ctypes._SimpleCData):
-                orch_args.append(make_scalar_arg(value))
+                orch_args.add_scalar(scalar_to_uint64(value))
                 args[name] = value.value
 
             else:
@@ -651,7 +651,7 @@ class CodeRunner:
             tensors: Dict of torch tensors (will be modified to ensure contiguous)
 
         Returns:
-            orch_args TaskArgArray
+            orch_args ChipStorageTaskArgs
         """
 
         # Determine tensor order
@@ -673,21 +673,21 @@ class CodeRunner:
                 )
             tensors[name] = tensors[name].cpu().contiguous()
 
-        orch_args = TaskArgArray()
+        orch_args = ChipStorageTaskArgs()
 
         # Add tensor pointers
         for name in order:
             tensor = tensors[name]
-            orch_args.append(make_tensor_arg(tensor))
+            orch_args.add_tensor(make_tensor_arg(tensor))
 
         # Add sizes (as scalars)
         for name in order:
             tensor = tensors[name]
-            orch_args.append(make_scalar_arg(tensor.element_size() * tensor.numel()))
+            orch_args.add_scalar(tensor.element_size() * tensor.numel())
 
         # Add element count (as scalar)
         count = tensors[order[0]].numel()
-        orch_args.append(make_scalar_arg(count))
+        orch_args.add_scalar(count)
 
         return orch_args
 
