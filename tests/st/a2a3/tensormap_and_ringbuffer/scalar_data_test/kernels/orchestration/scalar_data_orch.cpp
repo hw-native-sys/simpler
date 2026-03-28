@@ -22,31 +22,11 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include <string.h>
 
 #include "pto_orchestration_api.h"
 
 #define FUNC_ADD  0
 #define FUNC_NOOP 1
-
-static uint64_t float_to_u64(float f) {
-    union {
-        float f32;
-        uint64_t u64;
-    } conv;
-    conv.u64 = 0;
-    conv.f32 = f;
-    return conv.u64;
-}
-
-static float u64_to_float(uint64_t u) {
-    union {
-        uint64_t u64;
-        float f32;
-    } conv;
-    conv.u64 = u;
-    return conv.f32;
-}
 
 extern "C" {
 
@@ -93,24 +73,23 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     //   Tests TensorMap lookup + spin-wait for kernel completion
     // =========================================================
     uint32_t idx[1] = {0};
-    uint64_t c0_raw = get_tensor_data(c, 1, idx);
-    float c0_val = u64_to_float(c0_raw);
+    float c0_val = get_tensor_data<float>(c, 1, idx);
     LOG_INFO("get_tensor_data(c, {0}) = %f (expected 2.0)", (double)c0_val);
 
     uint32_t check_idx[1] = {0};
-    set_tensor_data(ext_check, 1, check_idx, c0_raw);
+    set_tensor_data(ext_check, 1, check_idx, c0_val);
 
     // =========================================================
     // Step 3: get_tensor_data(c, {100}) → check[1]
     //   Tests flat offset calculation for non-zero index
     // =========================================================
     idx[0] = 100;
-    uint64_t c100_raw = get_tensor_data(c, 1, idx);
+    float c100_val = get_tensor_data<float>(c, 1, idx);
     LOG_INFO("get_tensor_data(c, {100}) = %f (expected 102.0)",
-             (double)u64_to_float(c100_raw));
+             (double)c100_val);
 
     check_idx[0] = 1;
-    set_tensor_data(ext_check, 1, check_idx, c100_raw);
+    set_tensor_data(ext_check, 1, check_idx, c100_val);
 
     // =========================================================
     // Step 4: Runtime-created scalar output with initial value
@@ -120,7 +99,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     TensorCreateInfo scalar_ci(scalar_shapes, 1, DataType::FLOAT32);
 
     Arg params_scalar;
-    params_scalar.add_output(scalar_ci, float_to_u64(77.0f));
+    params_scalar.add_output(scalar_ci, 77.0f);
     TaskOutputTensors scalar_outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params_scalar);
     const Tensor& scalar_tensor = scalar_outs.get_ref(0);
 
@@ -129,13 +108,12 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     //   Verifies initial value was written correctly
     // =========================================================
     idx[0] = 0;
-    uint64_t s0_raw = get_tensor_data(scalar_tensor, 1, idx);
-    float s0_val = u64_to_float(s0_raw);
+    float s0_val = get_tensor_data<float>(scalar_tensor, 1, idx);
     LOG_INFO("get_tensor_data(scalar_tensor, {0}) after init = %f (expected 77.0)",
              (double)s0_val);
 
     check_idx[0] = 2;
-    set_tensor_data(ext_check, 1, check_idx, s0_raw);
+    set_tensor_data(ext_check, 1, check_idx, s0_val);
 
     // =========================================================
     // Step 6: add_inout(scalar_tensor) second use → INOUT path
@@ -151,12 +129,12 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     // Step 7: get_tensor_data(scalar_tensor, {0}) → check[3]
     //   Value should be preserved (noop kernel didn't modify it)
     // =========================================================
-    uint64_t s1_raw = get_tensor_data(scalar_tensor, 1, idx);
+    float s1_val = get_tensor_data<float>(scalar_tensor, 1, idx);
     LOG_INFO("get_tensor_data(scalar_tensor, {0}) after 2nd noop = %f (expected 77.0)",
-             (double)u64_to_float(s1_raw));
+             (double)s1_val);
 
     check_idx[0] = 3;
-    set_tensor_data(ext_check, 1, check_idx, s1_raw);
+    set_tensor_data(ext_check, 1, check_idx, s1_val);
 
     // =========================================================
     // Step 8: set_tensor_data with orchestration-computed value → check[4]
@@ -167,21 +145,20 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
              (double)c0_val, (double)s0_val, (double)combined);
 
     check_idx[0] = 4;
-    set_tensor_data(ext_check, 1, check_idx, float_to_u64(combined));
+    set_tensor_data(ext_check, 1, check_idx, combined);
 
     // =========================================================
     // Step 9: Orch set→get round-trip on internal tensor
     //   Validates that set_tensor_data writes are visible to get_tensor_data
     //   on the same tensor. Uses scalar_tensor (currently 77.0), overwrites to 42.0.
     // =========================================================
-    set_tensor_data(scalar_tensor, 1, idx, float_to_u64(42.0f));
-    uint64_t rw_raw = get_tensor_data(scalar_tensor, 1, idx);
-    float rw_val = u64_to_float(rw_raw);
+    set_tensor_data(scalar_tensor, 1, idx, 42.0f);
+    float rw_val = get_tensor_data<float>(scalar_tensor, 1, idx);
     LOG_INFO("set_tensor_data→get_tensor_data round-trip = %f (expected 42.0)",
              (double)rw_val);
 
     check_idx[0] = 5;
-    set_tensor_data(ext_check, 1, check_idx, rw_raw);
+    set_tensor_data(ext_check, 1, check_idx, rw_val);
 
     // =========================================================
     // Step 10: Orch→AICore RAW (set_tensor_data → kernel reads)
@@ -194,7 +171,7 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     const Tensor& d = d_outs.get_ref(0);
 
     idx[0] = 0;
-    set_tensor_data(d, 1, idx, float_to_u64(10.0f));
+    set_tensor_data(d, 1, idx, 10.0f);
 
     Arg params_e;
     params_e.add_input(d);
@@ -203,12 +180,12 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     TaskOutputTensors e_outs = pto2_rt_submit_aiv_task(FUNC_ADD, params_e);
     const Tensor& e = e_outs.get_ref(0);
 
-    uint64_t e0_raw = get_tensor_data(e, 1, idx);
+    float e0_val = get_tensor_data<float>(e, 1, idx);
     LOG_INFO("Orch→AICore RAW: e[0] = %f (expected 12.0)",
-             (double)u64_to_float(e0_raw));
+             (double)e0_val);
 
     check_idx[0] = 6;
-    set_tensor_data(ext_check, 1, check_idx, e0_raw);
+    set_tensor_data(ext_check, 1, check_idx, e0_val);
 
     // =========================================================
     // Step 11: WAW + WAR on internal tensor
@@ -235,13 +212,13 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
 
     // set_tensor_data auto-waits for producer + consumer before writing
     idx[0] = 0;
-    set_tensor_data(c, 1, idx, float_to_u64(88.0f));
-    uint64_t waw_raw = get_tensor_data(c, 1, idx);
+    set_tensor_data(c, 1, idx, 88.0f);
+    float waw_val = get_tensor_data<float>(c, 1, idx);
     LOG_INFO("WAW+WAR: set_tensor_data(c, 88.0) after consumer = %f (expected 88.0)",
-             (double)u64_to_float(waw_raw));
+             (double)waw_val);
 
     check_idx[0] = 7;
-    set_tensor_data(ext_check, 1, check_idx, waw_raw);
+    set_tensor_data(ext_check, 1, check_idx, waw_val);
 
     // =========================================================
     // Step 12: External tensor WAR — must use INOUT, not INPUT
@@ -265,16 +242,16 @@ void aicpu_orchestration_entry(TaskArg* orch_args,
     }
 
     idx[0] = 0;
-    set_tensor_data(ext_b, 1, idx, float_to_u64(55.0f));
-    uint64_t ext_war_raw = get_tensor_data(ext_b, 1, idx);
+    set_tensor_data(ext_b, 1, idx, 55.0f);
+    float ext_war_val = get_tensor_data<float>(ext_b, 1, idx);
     LOG_INFO("External WAR (INOUT): set_tensor_data(ext_b, 55.0) = %f (expected 55.0)",
-             (double)u64_to_float(ext_war_raw));
+             (double)ext_war_val);
 
     check_idx[0] = 8;
-    set_tensor_data(ext_check, 1, check_idx, ext_war_raw);
+    set_tensor_data(ext_check, 1, check_idx, ext_war_val);
 
     // Restore ext_b[0] for final result comparison
-    set_tensor_data(ext_b, 1, idx, float_to_u64(0.0f));
+    set_tensor_data(ext_b, 1, idx, 0.0f);
 
     // =========================================================
     // Step 13: result = a + b (external output via INOUT, kernel_add)

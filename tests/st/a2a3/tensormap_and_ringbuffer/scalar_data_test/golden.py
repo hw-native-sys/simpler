@@ -7,7 +7,7 @@ Computation:
   c = a + b (kernel, internal tensor)
   check[0] = GetTensorData(c, {0})     = a[0]+b[0] = 2.0+0.0 = 2.0
   check[1] = GetTensorData(c, {100})   = a[100]+b[100] = 2.0+100.0 = 102.0
-  scalar initialized to 77.0 via add_output(TensorCreateInfo, float_to_u64(77.0f))
+  scalar initialized to 77.0 via add_output(TensorCreateInfo, to_u64(77.0f))
   check[2] = GetTensorData(scalar, {0}) = 77.0
   second noop with add_inout(scalar), value preserved
   check[3] = GetTensorData(scalar, {0}) = 77.0

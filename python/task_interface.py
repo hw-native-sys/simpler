@@ -79,10 +79,17 @@ def make_tensor_arg(tensor) -> TaskArg:
 def make_scalar_arg(value) -> TaskArg:
     """Create a SCALAR ``TaskArg``.
 
-    *value* can be a Python int, a ctypes scalar (``c_int64``, ``c_float``, etc.),
-    or any object convertible to ``int``.  Float-typed ctypes scalars are
-    bit-cast to uint64.
+    *value* can be a Python int, float, a ctypes scalar (``c_int64``,
+    ``c_float``, etc.), or any object convertible to ``int``.
+
+    Python float values are converted to IEEE 754 single precision (32-bit)
+    and their bit pattern is zero-extended to uint64. This may cause a loss of
+    precision. For double precision, use ``ctypes.c_double``.
     """
+    import struct as _struct
+    if isinstance(value, float):
+        bits = _struct.unpack('<I', _struct.pack('<f', value))[0]
+        return TaskArg.make_scalar(bits)
     import ctypes as _ct
     if isinstance(value, _ct._SimpleCData):
         if isinstance(value, (_ct.c_float, _ct.c_double)):

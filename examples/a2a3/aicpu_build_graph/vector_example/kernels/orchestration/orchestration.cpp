@@ -17,16 +17,6 @@
 
 #include "pto_orchestration_api.h"
 
-static uint64_t float_to_u64(float f) {
-    union {
-        float f32;
-        uint64_t u64;
-    } conv;
-    conv.u64 = 0;
-    conv.f32 = f;
-    return conv.u64;
-}
-
 extern "C" {
 
 __attribute__((visibility("default")))
@@ -68,7 +58,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
         Arg args_t1;
         args_t1.add_input(c);
         args_t1.add_output(d);
-        args_t1.add_scalar(float_to_u64(1.0f));
+        args_t1.add_scalar(to_u64(1.0f));
         PTO2TaskId t1 = pto2_rt_submit_aiv_task(rt, 1, args_t1);
         pto2_rt_add_dependency(rt, t0, t1);
 
@@ -76,7 +66,7 @@ void aicpu_orchestration_entry(PTO2Runtime* rt, TaskArg* orch_args, int orch_thr
         Arg args_t2;
         args_t2.add_input(c);
         args_t2.add_output(e);
-        args_t2.add_scalar(float_to_u64(2.0f));
+        args_t2.add_scalar(to_u64(2.0f));
         PTO2TaskId t2 = pto2_rt_submit_aiv_task(rt, 1, args_t2);
         pto2_rt_add_dependency(rt, t0, t2);
 

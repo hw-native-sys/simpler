@@ -51,13 +51,10 @@ struct TaskArg {
         return reinterpret_cast<T*>(static_cast<uintptr_t>(tensor.data));
     }
 
-    // Reinterpret scalar bits as target type (compliant type-punning via memcpy)
+    // Reinterpret scalar bits as target type (delegates to from_u64)
     template<typename T>
     T value_as() const {
-        static_assert(sizeof(T) <= sizeof(uint64_t), "");
-        T result;
-        memcpy(&result, &scalar, sizeof(T));
-        return result;
+        return from_u64<T>(scalar);
     }
 };
 

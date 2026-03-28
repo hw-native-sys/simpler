@@ -1,13 +1,22 @@
 /**
- * Data Type Definitions for Orchestration Build Graph Runtime
+ * Data Type Definitions and Conversion Utilities
  *
- * Defines supported data types and helper functions for element size calculation.
+ * Defines supported data types, element size helpers, and type-safe
+ * packing/unpacking of values into uint64_t (the universal scalar storage
+ * type in the orchestration framework).
  */
 
 #ifndef ORCH_BUILD_GRAPH_DATA_TYPE_H
 #define ORCH_BUILD_GRAPH_DATA_TYPE_H
 
 #include <cstdint>
+
+#if __has_include(<type_traits>)
+#include <type_traits>
+#define PTO_HAS_TYPE_TRAITS 1
+#else
+#define PTO_HAS_TYPE_TRAITS 0
+#endif
 
 /**
  * Supported data types for tensor elements
@@ -76,6 +85,70 @@ inline const char* get_dtype_name(DataType dtype) {
         default:
             return "UNKNOWN";
     }
+}
+
+// =============================================================================
+// uint64_t Packing/Unpacking Utilities
+// =============================================================================
+
+// Kernel-callable qualifier: __may_used_by_aicore__ (from kernel_args.h)
+// signals an incore build where __aicore__ is available (ccec or sim).
+// In orchestration / host builds, PTO_DEVICE_FUNC expands to nothing.
+#ifdef __may_used_by_aicore__
+#define PTO_DEVICE_FUNC __aicore__
+#else
+#define PTO_DEVICE_FUNC
+#endif
+
+namespace detail {
+
+template<typename T>
+union U64Converter {
+    uint64_t bits;
+    T value;
+};
+
+}  // namespace detail
+
+/**
+ * Pack a value into uint64_t storage (zero-extends smaller types).
+ * Uses union-based type punning — works on both host and AICore (no memcpy).
+ *
+ *   uint64_t bits = to_u64(3.14f);        // float → uint64_t
+ *   uint64_t bits = to_u64(int32_t(42));  // int32 → uint64_t
+ */
+template<typename T>
+PTO_DEVICE_FUNC inline uint64_t to_u64(T value) {
+    static_assert(sizeof(T) <= sizeof(uint64_t),
+                  "to_u64: type must fit in 8 bytes");
+#if PTO_HAS_TYPE_TRAITS
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "to_u64: type must be trivially copyable");
+#endif
+    detail::U64Converter<T> conv;
+    conv.bits = 0;
+    conv.value = value;
+    return conv.bits;
+}
+
+/**
+ * Unpack a value from uint64_t storage.
+ * Uses union-based type punning — works on both host and AICore (no memcpy).
+ *
+ *   float f   = from_u64<float>(bits);
+ *   int32_t i = from_u64<int32_t>(bits);
+ */
+template<typename T>
+PTO_DEVICE_FUNC inline T from_u64(uint64_t bits) {
+    static_assert(sizeof(T) <= sizeof(uint64_t),
+                  "from_u64: type must fit in 8 bytes");
+#if PTO_HAS_TYPE_TRAITS
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "from_u64: type must be trivially copyable");
+#endif
+    detail::U64Converter<T> conv;
+    conv.bits = bits;
+    return conv.value;
 }
 
 #endif  // ORCH_BUILD_GRAPH_DATA_TYPE_H

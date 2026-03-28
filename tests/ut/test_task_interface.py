@@ -270,3 +270,11 @@ class TestTaskInterfaceWrapper:
         # Verify bit-cast: 1.5f = 0x3FC00000
         expected_bits = struct.unpack("I", struct.pack("f", 1.5))[0]
         assert arg.scalar == expected_bits
+
+    def test_make_scalar_arg_native_float(self):
+        from task_interface import make_scalar_arg
+        arg = make_scalar_arg(1.5)
+        assert arg.kind == TaskArgKind.SCALAR
+        # Native float bit-cast to IEEE 754 single precision (same as ctypes path)
+        expected_bits = struct.unpack("I", struct.pack("f", 1.5))[0]
+        assert arg.scalar == expected_bits
