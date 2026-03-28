@@ -49,19 +49,29 @@
  */
 class TaskOutputTensors {
 public:
-    TaskOutputTensors() : output_count(0) {}
+    TaskOutputTensors() : output_count_(0) {}
 
-    uint32_t output_count;
-
-    bool empty() const { return output_count == 0; }
-    uint32_t size() const { return output_count; }
+    bool empty() const { return output_count_ == 0; }
+    uint32_t size() const { return output_count_; }
 
     /// Borrow a materialized output tensor by index (lvalue only).
     const Tensor& get_ref(uint32_t index) const & {
-        always_assert(index < output_count);
+        always_assert(index < output_count_);
         return *reinterpret_cast<const Tensor*>(_storage + index * sizeof(Tensor));
     }
     const Tensor& get_ref(uint32_t index) const && = delete;
+
+    /// Runtime-internal: append one materialized output Tensor.
+    Tensor& materialize_output(const TensorCreateInfo& ci, void* addr, int32_t version) {
+        always_assert(output_count_ < PTO2_MAX_OUTPUTS);
+        Tensor* out = output_ptr(output_count_);
+        out->init_from_create_info(ci, addr, version);
+        if (ci.has_initial_value) {
+            fill_initial_value(addr, ci.buffer_size_bytes(), ci.dtype, ci.initial_value);
+        }
+        output_count_++;
+        return *out;
+    }
 
     /// Runtime-internal: writable pointer for materialization.
     Tensor* output_ptr(uint32_t index) {
@@ -72,6 +82,24 @@ public:
     }
 
 private:
+    static void fill_initial_value(void* addr, uint64_t buffer_size, DataType dtype,
+                                   uint64_t initial_value) {
+        uint64_t elem_size = get_element_size(dtype);
+        char* dst = reinterpret_cast<char*>(addr);
+        constexpr uint64_t BLK = 64;
+        uint64_t blk = (buffer_size < BLK) ? buffer_size : BLK;
+        for (uint64_t b = 0; b < blk; b += elem_size) {
+            memcpy(dst + b, &initial_value, elem_size);
+        }
+        uint64_t filled = blk;
+        while (filled < buffer_size) {
+            uint64_t copy_size = ((buffer_size - filled) < filled) ? (buffer_size - filled) : filled;
+            memcpy(dst + filled, dst, copy_size);
+            filled += copy_size;
+        }
+    }
+
+    uint32_t output_count_;
     alignas(Tensor) unsigned char _storage[PTO2_MAX_OUTPUTS * sizeof(Tensor)];
 };
 

@@ -414,23 +414,6 @@ TaskOutputTensors pto2_submit_mixed_task(
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
     // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
-    auto fill_initial_value = [](void* addr, uint64_t buffer_size, DataType dtype, uint64_t initial_value) {
-        uint64_t elem_size = get_element_size(dtype);
-        char* dst = reinterpret_cast<char*>(addr);
-        constexpr uint64_t BLK = 64;
-        uint64_t blk = (buffer_size < BLK) ? buffer_size : BLK;
-        for (uint64_t b = 0; b < blk; b += elem_size) {
-            memcpy(dst + b, &initial_value, elem_size);
-        }
-        uint64_t off = blk;
-        for (; off + blk <= buffer_size; off += blk) {
-            memcpy(dst + off, dst, blk);
-        }
-        if (off < buffer_size) {
-            memcpy(dst + off, dst, buffer_size - off);
-        }
-    };
-
     int32_t offset = 0;
     for (int i = 0; i < args.tensor_count; i++) {
         TensorArgType ptype = args.tensor_types[i];
@@ -479,13 +462,7 @@ TaskOutputTensors pto2_submit_mixed_task(
                 uint64_t buffer_size = ci.buffer_size_bytes();
                 uint64_t alloc_addr = reinterpret_cast<uint64_t>((char*)alloc_result.packed_base + offset);
                 offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
-                result.output_ptr(result.output_count)->init_from_create_info(
-                    ci, reinterpret_cast<void*>(alloc_addr), /*version=*/0);
-                if (ci.has_initial_value) {
-                    fill_initial_value(reinterpret_cast<void*>(alloc_addr), buffer_size,
-                                       ci.dtype, ci.initial_value);
-                }
-                result.output_count++;
+                result.materialize_output(ci, reinterpret_cast<void*>(alloc_addr), /*version=*/0);
                 break;
             }
         }
