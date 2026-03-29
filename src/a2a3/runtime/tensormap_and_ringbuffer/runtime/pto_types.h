@@ -32,6 +32,7 @@
 #include <arm_neon.h>
 #endif
 
+#include "task_args.h"   // NOLINT(build/include_subdir) -- TaskArgs base class
 #include "tensor.h"      // NOLINT(build/include_subdir)
 #include "tensor_arg.h"  // NOLINT(build/include_subdir) -- canonical TensorArgType definition
 
@@ -119,19 +120,20 @@ private:  // NOLINT(whitespace/indent)
 
 /**
  * Tagged union for a single Arg slot — either a Tensor* or a TensorCreateInfo value.
- * The active member is determined by TensorArgType (OUTPUT → create_info, else → tensor).
+ * The active member is determined by TensorArgType (OUTPUT → create_info, else → ptr).
  */
-union ArgRef {
-    const Tensor* tensor;
+union TensorRef {
+    const Tensor* ptr;
     TensorCreateInfo create_info;
-    ArgRef() : tensor(nullptr) {}
+    TensorRef() : ptr(nullptr) {}
 };
 
 /**
  * Aggregated argument container for pto_submit_task
  *
- * Each arg slot stores a ArgRef union (Tensor* or TensorCreateInfo*)
- * discriminated by the corresponding TensorArgType entry.
+ * Inherits storage from TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType>.
+ * Each tensor slot stores a TensorRef union (Tensor* or TensorCreateInfo)
+ * discriminated by the corresponding tag().
  * Tensors are dispatched first in kernel args, followed by scalars.
  *
  * Output arguments follow two distinct ownership models:
@@ -148,18 +150,12 @@ union ArgRef {
  *   TaskOutputTensors outs = pto2_rt_submit_aic_task(kernel_id, args);
  *   const Tensor& y = outs.get_ref(0);
  */
-struct Arg {
-    ArgRef refs[MAX_TENSOR_ARGS];
-    TensorArgType tensor_types[MAX_TENSOR_ARGS];
-    uint64_t scalars[MAX_SCALAR_ARGS];
-    int32_t tensor_count{0};
-    int32_t scalar_count{0};
+struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> {
     bool has_error{false};
     const char* error_msg{nullptr};
 
     void reset() {
-        tensor_count = 0;
-        scalar_count = 0;
+        clear();
         has_error = false;
         error_msg = nullptr;
     }
@@ -172,13 +168,13 @@ struct Arg {
     }
 
     bool check_add_tensor_valid() {
-        if (scalar_count != 0) {
+        if (scalar_count_ != 0) {
             set_error(
                 "add_input/add_output/add_inout called after add_scalar: "
                 "all tensors must be added before any scalars");
             return false;
         }
-        if (tensor_count >= MAX_TENSOR_ARGS) {
+        if (tensor_count_ >= MAX_TENSOR_ARGS) {
             set_error("Too many tensor args (exceeds MAX_TENSOR_ARGS=16)");
             return false;
         }
@@ -189,9 +185,9 @@ struct Arg {
         if (!check_add_tensor_valid()) {
             return;
         }
-        refs[tensor_count].tensor = &t;
-        tensor_types[tensor_count] = TensorArgType::INPUT;
-        tensor_count++;
+        tensors_[tensor_count_].ptr = &t;
+        tags_[tensor_count_] = TensorArgType::INPUT;
+        tensor_count_++;
     }
 
     /// Standard future-output path: runtime allocates buffer from heap,
@@ -200,9 +196,9 @@ struct Arg {
         if (!check_add_tensor_valid()) {
             return;
         }
-        refs[tensor_count].create_info = ci;
-        tensor_types[tensor_count] = TensorArgType::OUTPUT;
-        tensor_count++;
+        tensors_[tensor_count_].create_info = ci;
+        tags_[tensor_count_] = TensorArgType::OUTPUT;
+        tensor_count_++;
     }
 
     /// Runtime-allocated output with an initial element value replicated
@@ -211,36 +207,36 @@ struct Arg {
         if (!check_add_tensor_valid()) {
             return;
         }
-        refs[tensor_count].create_info = ci;
-        refs[tensor_count].create_info.set_initial_value(initial_value);
-        tensor_types[tensor_count] = TensorArgType::OUTPUT;
-        tensor_count++;
+        tensors_[tensor_count_].create_info = ci;
+        tensors_[tensor_count_].create_info.set_initial_value(initial_value);
+        tags_[tensor_count_] = TensorArgType::OUTPUT;
+        tensor_count_++;
     }
 
     void add_inout(const Tensor& t) {
         if (!check_add_tensor_valid()) {
             return;
         }
-        refs[tensor_count].tensor = &t;
-        tensor_types[tensor_count] = TensorArgType::INOUT;
-        tensor_count++;
+        tensors_[tensor_count_].ptr = &t;
+        tags_[tensor_count_] = TensorArgType::INOUT;
+        tensor_count_++;
     }
 
     void add_scalar(uint64_t v) {
-        if (scalar_count >= MAX_SCALAR_ARGS) {
+        if (scalar_count_ >= MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
-        scalars[scalar_count++] = v;
+        scalars_[scalar_count_++] = v;
     }
 
     void add_scalars(const uint64_t* values, int count) {
-        if (scalar_count + count > MAX_SCALAR_ARGS) {
+        if (scalar_count_ + count > MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
-        memcpy(&scalars[scalar_count], values, count * sizeof(uint64_t));
-        scalar_count += count;
+        memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
+        scalar_count_ += count;
     }
 
     /**
@@ -250,11 +246,11 @@ struct Arg {
      * Uses NEON to process 4 elements per iteration on aarch64.
      */
     void add_scalars_i32(const int32_t* values, int count) {
-        if (scalar_count + count > MAX_SCALAR_ARGS) {
+        if (scalar_count_ + count > MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
-        uint64_t* dst = &scalars[scalar_count];
+        uint64_t* dst = &scalars_[scalar_count_];
 #if defined(__aarch64__)
         int i = 0;
         for (; i + 4 <= count; i += 4) {
@@ -272,7 +268,7 @@ struct Arg {
             dst[i] = static_cast<uint64_t>(static_cast<uint32_t>(values[i]));
         }
 #endif
-        scalar_count += count;
+        scalar_count_ += count;
     }
 
     /**
@@ -280,16 +276,16 @@ struct Arg {
      * Useful when multiple tasks share the same scalar data (e.g., block indices).
      */
     void copy_scalars_from(const Arg& src, int src_offset, int count) {
-        if (src_offset + count > src.scalar_count) {
+        if (src_offset + count > src.scalar_count_) {
             set_error("Source scalar range out of bounds in copy_scalars_from");
             return;
         }
-        if (scalar_count + count > MAX_SCALAR_ARGS) {
+        if (scalar_count_ + count > MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
-        memcpy(&scalars[scalar_count], &src.scalars[src_offset], count * sizeof(uint64_t));
-        scalar_count += count;
+        memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
+        scalar_count_ += count;
     }
 };
 

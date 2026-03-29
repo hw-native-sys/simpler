@@ -58,6 +58,7 @@ git diff --staged  # Review before committing
 Separate from subject by a blank line. Explain **what** changed and **why**. Use bullet points for multiple items. Wrap at 72 characters.
 
 **When to include a body**:
+
 - Changes touch 3+ files
 - The "why" is not obvious from the subject alone
 - There are trade-offs, side effects, or migration notes
@@ -118,6 +119,16 @@ Fix: resolve cross-pipeline race in softmax_prepare
 Co-authored-by: Alice <alice@example.com>
 Co-authored-by: Bob <bob@example.com>
 ```
+
+## Pre-Commit Hook Policy
+
+**All pre-commit hook errors must be fixed before committing — including pre-existing ones.** When a hook (check-headers, cpplint, markdownlint, clang-format, etc.) reports errors in files touched by your commit, fix every error even if it existed before your changes. The principle: any file you modify must leave the commit with zero hook violations.
+
+- **Never use `SKIP=...` or `--no-verify`** to bypass failing hooks
+- **clang-format / markdownlint**: if hooks auto-fix files, re-stage and re-commit
+- **check-headers**: add missing copyright headers to files that lack them
+- **cpplint**: fix all reported issues (copyright, include_subdir NOLINT, casts, etc.)
+- If a fix is non-trivial (e.g., large refactor to eliminate C-style casts), add NOLINT comments only as a last resort and document why
 
 ## Post-Commit Verification
 

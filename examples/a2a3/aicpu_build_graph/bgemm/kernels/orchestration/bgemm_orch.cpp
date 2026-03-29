@@ -102,29 +102,28 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                         Tensor A_view = ext_A.view(tile_shapes, a_view_offsets);
                         uint32_t b_view_offsets[1] = {b_elem_offset};
                         Tensor B_view = ext_B.view(tile_shapes, b_view_offsets);
-                        Tensor P = make_tensor(tile_shapes, 1, DataType::FLOAT32);
 
                         // P = A[m,k] @ B[k,n]
                         Arg args_gemm;
                         args_gemm.add_input(A_view);
                         args_gemm.add_input(B_view);
-                        args_gemm.add_output(P);
-                        PTO2TaskId t_gemm = pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE, args_gemm);
+                        args_gemm.add_output(TensorCreateInfo(tile_shapes, 1, DataType::FLOAT32));
+                        SubmitResult r_gemm = pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE, args_gemm);
 
                         // C[m,n] += P
                         Arg args_add;
                         args_add.add_inout(C_view);
-                        args_add.add_input(P);
-                        PTO2TaskId t_add = pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD, args_add);
+                        args_add.add_input(r_gemm.outputs.get_ref(0));
+                        SubmitResult r_add = pto2_rt_submit_aiv_task(rt, FUNC_TILE_ADD, args_add);
 
                         // gemm -> add: add reads P which gemm produces
-                        pto2_rt_add_dependency(rt, t_gemm, t_add);
+                        pto2_rt_add_dependency(rt, r_gemm.task_id, r_add.task_id);
                         // K accumulation chain: previous add -> current add
                         if (has_last_add) {
-                            pto2_rt_add_dependency(rt, last_add_task, t_add);
+                            pto2_rt_add_dependency(rt, last_add_task, r_add.task_id);
                         }
 
-                        last_add_task = t_add;
+                        last_add_task = r_add.task_id;
                         has_last_add = true;
                     }
                 }

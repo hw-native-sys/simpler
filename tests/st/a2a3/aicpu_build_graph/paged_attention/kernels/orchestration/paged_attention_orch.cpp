@@ -106,10 +106,6 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 uint32_t oi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
                 uint32_t li_shapes[1] = {static_cast<uint32_t>(q_tile)};
                 uint32_t mi_shapes[1] = {static_cast<uint32_t>(q_tile)};
-                Tensor oi = make_tensor(oi_shapes, 2, DataType::FLOAT32);
-                Tensor li_update = make_tensor(li_shapes, 1, DataType::FLOAT32, false);
-                Tensor mi_update = make_tensor(mi_shapes, 1, DataType::FLOAT32, false);
-
                 uint32_t qi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
                 uint32_t qi_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
                 Tensor qi = query.view(qi_shapes, qi_offsets);
@@ -119,12 +115,15 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
 
                 // Hub task: zero-initialize accumulators
                 Arg args_inplace;
-                args_inplace.add_output(oi);
-                args_inplace.add_output(li_update);
-                args_inplace.add_output(mi_update);
-                PTO2TaskId hub_task = pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace);
+                args_inplace.add_output(TensorCreateInfo(oi_shapes, 2, DataType::FLOAT32));
+                args_inplace.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
+                args_inplace.add_output(TensorCreateInfo(mi_shapes, 1, DataType::FLOAT32));
+                SubmitResult r_hub = pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace);
+                const Tensor& oi = r_hub.outputs.get_ref(0);
+                const Tensor& li_update = r_hub.outputs.get_ref(1);
+                const Tensor& mi_update = r_hub.outputs.get_ref(2);
 
-                PTO2TaskId prev_update_task = hub_task;
+                PTO2TaskId prev_update_task = r_hub.task_id;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
@@ -138,63 +137,57 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
 
                     // === Task 1: QK matmul ===
                     uint32_t sij_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(block_size)};
-                    Tensor sij = make_tensor(sij_shapes, 2, DataType::FLOAT32);
 
                     Arg args_qk;
                     args_qk.add_input(qi);
                     args_qk.add_input(kj);
-                    args_qk.add_output(sij);
-                    PTO2TaskId qk_task = pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk);
+                    args_qk.add_output(TensorCreateInfo(sij_shapes, 2, DataType::FLOAT32));
+                    SubmitResult r_qk = pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk);
 
                     // === Task 2: Softmax ===
                     uint32_t sij_valid_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(valid_len)};
                     uint32_t sij_valid_offsets[2] = {0, 0};
-                    Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
-
-                    Tensor pij_f16 = make_tensor(sij_shapes, 2, data_type);
-                    Tensor li = make_tensor(li_shapes, 1, DataType::FLOAT32);
-                    Tensor mi = make_tensor(mi_shapes, 1, DataType::FLOAT32);
+                    Tensor sij_valid = r_qk.outputs.get_ref(0).view(sij_valid_shapes, sij_valid_offsets);
 
                     Arg args_sf;
                     args_sf.add_input(sij_valid);
-                    args_sf.add_output(pij_f16);
-                    args_sf.add_output(mi);
-                    args_sf.add_output(li);
+                    args_sf.add_output(TensorCreateInfo(sij_shapes, 2, data_type));
+                    args_sf.add_output(TensorCreateInfo(mi_shapes, 1, DataType::FLOAT32));
+                    args_sf.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
                     args_sf.add_scalar(scale_value);
-                    PTO2TaskId sf_task = pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
-                    pto2_rt_add_dependency(rt, qk_task, sf_task);
+                    SubmitResult r_sf = pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
+                    pto2_rt_add_dependency(rt, r_qk.task_id, r_sf.task_id);
 
                     // === Task 3: PV matmul ===
                     uint32_t oi_tmp_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
-                    Tensor oi_tmp = make_tensor(oi_tmp_shapes, 2, DataType::FLOAT32);
 
                     Arg args_pv;
-                    args_pv.add_input(pij_f16);
+                    args_pv.add_input(r_sf.outputs.get_ref(0));
                     args_pv.add_input(vj);
-                    args_pv.add_output(oi_tmp);
-                    PTO2TaskId pv_task = pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
-                    pto2_rt_add_dependency(rt, sf_task, pv_task);
+                    args_pv.add_output(TensorCreateInfo(oi_tmp_shapes, 2, DataType::FLOAT32));
+                    SubmitResult r_pv = pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
+                    pto2_rt_add_dependency(rt, r_sf.task_id, r_pv.task_id);
 
                     // === Task 4: Online update ===
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
 
                     Arg args_up;
-                    args_up.add_input(mi);
-                    args_up.add_input(li);
-                    args_up.add_input(oi_tmp);
+                    args_up.add_input(r_sf.outputs.get_ref(1));
+                    args_up.add_input(r_sf.outputs.get_ref(2));
+                    args_up.add_input(r_pv.outputs.get_ref(0));
                     args_up.add_inout(mi_update);
                     args_up.add_inout(li_update);
                     args_up.add_inout(oi);
-                    args_up.add_output(out_view);
+                    args_up.add_inout(out_view);
                     args_up.add_scalar(is_first);
                     args_up.add_scalar(is_last);
-                    PTO2TaskId up_task = pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up);
-                    pto2_rt_add_dependency(rt, sf_task, up_task);
-                    pto2_rt_add_dependency(rt, pv_task, up_task);
-                    pto2_rt_add_dependency(rt, prev_update_task, up_task);
+                    SubmitResult r_up = pto2_rt_submit_aiv_task(rt, FUNC_ONLINE_UPDATE, args_up);
+                    pto2_rt_add_dependency(rt, r_sf.task_id, r_up.task_id);
+                    pto2_rt_add_dependency(rt, r_pv.task_id, r_up.task_id);
+                    pto2_rt_add_dependency(rt, prev_update_task, r_up.task_id);
 
-                    prev_update_task = up_task;
+                    prev_update_task = r_up.task_id;
                 }
             }
         }
