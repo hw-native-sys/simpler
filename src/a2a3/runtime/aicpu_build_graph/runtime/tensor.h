@@ -1,12 +1,26 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 #pragma once
 
-#include <stdint.h>
 #include <memory.h>
+#include <stdint.h>
 
+#include <algorithm>
 #include <sstream>
+#include <string>
+#include <utility>
 
-#include "common.h"
-#include "data_type.h"
+#include "common.h"     // NOLINT(build/include_subdir)
+#include "data_type.h"  // NOLINT(build/include_subdir)
 
 constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
 
@@ -36,6 +50,43 @@ struct Segment {
 };
 
 /**
+ * TensorCreateInfo — metadata for runtime-allocated output tensors.
+ *
+ * Captures shape, dtype, and buffer size without allocating memory.
+ * Passed by value to Arg::add_output(); the runtime allocates from the heap
+ * and materializes a full Tensor via Tensor::init_from_create_info().
+ */
+struct TensorCreateInfo {
+    DataType dtype;
+    uint32_t ndims;
+    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];
+    bool manual_dep;
+    bool has_initial_value;
+    uint64_t initial_value;
+
+    TensorCreateInfo(
+        const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false)
+        : dtype(dtype), ndims(ndims), manual_dep(manual_dep), has_initial_value(false), initial_value(0) {
+        for (uint32_t i = 0; i < ndims; i++) {
+            raw_shapes[i] = shapes[i];
+        }
+    }
+
+    void set_initial_value(uint64_t value) {
+        has_initial_value = true;
+        initial_value = value;
+    }
+
+    uint64_t buffer_size_bytes() const {
+        uint64_t total = 1;
+        for (uint32_t i = 0; i < ndims; i++) {
+            total *= raw_shapes[i];
+        }
+        return total * get_element_size(dtype);
+    }
+};
+
+/**
  * Tensor descriptor for Task input/output (128B = 2 cache lines)
  *
  * Describes a memory access pattern on Global Memory (GM) using
@@ -58,15 +109,16 @@ struct Segment {
  */
 struct alignas(64) Tensor {
     // === Cache line 1 (64B) — hot path ===
-    PTOBufferHandle buffer;                        // Underlying memory buffer (addr in bytes, size in bytes)
-    uint64_t start_offset;                         // Cached 1D element offset (precomputed from raw_shapes + offsets), only calc before incore, useless in orch
-    int32_t version;                               // Tensor version for overlap detection
-    DataType dtype;                                // Data type of tensor elements
-    uint32_t ndims;                                // Number of dimensions used
-    bool is_all_offset_zero;                       // True when all offsets[] are zero (skip offset read/write)
-    bool is_raw_eq_shapes;                         // True when raw_shapes[] == shapes[] (skip raw_shapes read/write)
-    bool manual_dep;                               // True when dependency is managed manually (skip tensormap lookup/insert)
-    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];      // Current view shape per dimension
+    PTOBufferHandle buffer;   // Underlying memory buffer (addr in bytes, size in bytes)
+    uint64_t start_offset;    // Cached 1D element offset (precomputed from raw_shapes + offsets), only calc before
+                              // incore, useless in orch
+    int32_t version;          // Tensor version for overlap detection
+    DataType dtype;           // Data type of tensor elements
+    uint32_t ndims;           // Number of dimensions used
+    bool is_all_offset_zero;  // True when all offsets[] are zero (skip offset read/write)
+    bool is_raw_eq_shapes;    // True when raw_shapes[] == shapes[] (skip raw_shapes read/write)
+    bool manual_dep;          // True when dependency is managed manually (skip tensormap lookup/insert)
+    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // Current view shape per dimension
     uint32_t __padding__;
 
     // === Cache line 2 (64B) — warm path ===
@@ -82,9 +134,7 @@ struct alignas(64) Tensor {
 
     /// Return the effective raw_shapes pointer (shapes[] when is_raw_eq_shapes).
     /// Avoids cache line 2 access for the common case.
-    const uint32_t* get_raw_shapes() const {
-        return is_raw_eq_shapes ? shapes : raw_shapes;
-    }
+    const uint32_t* get_raw_shapes() const { return is_raw_eq_shapes ? shapes : raw_shapes; }
 
     Tensor(void* addr,
         uint64_t buffer_size_bytes,
@@ -97,8 +147,17 @@ struct alignas(64) Tensor {
         bool is_all_offset_zero = false,
         bool is_raw_eq_shapes = false,
         bool manual_dep = false) {
-        init(addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version,
-             is_all_offset_zero, is_raw_eq_shapes, manual_dep);
+        init(addr,
+            buffer_size_bytes,
+            raw_shapes,
+            shapes,
+            offsets,
+            ndims,
+            dtype,
+            version,
+            is_all_offset_zero,
+            is_raw_eq_shapes,
+            manual_dep);
     }
 
     // --- Initialization ---
@@ -136,7 +195,7 @@ struct alignas(64) Tensor {
     }
 
     void init(const Tensor& other) {
-        memcpy(this, &other, 64); // fast copy cache line 1
+        memcpy(this, &other, 64);  // fast copy cache line 1
         if (!other.is_raw_eq_shapes) {
             for (uint32_t i = 0; i < ndims; i++) {
                 raw_shapes[i] = other.raw_shapes[i];
@@ -149,7 +208,8 @@ struct alignas(64) Tensor {
         }
     }
 
-    void init_with_view(const Tensor& other, const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) {
+    void init_with_view(
+        const Tensor& other, const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) {
         buffer = other.buffer;
         ndims = other.ndims;
         dtype = other.dtype;
@@ -167,7 +227,10 @@ struct alignas(64) Tensor {
         bool all_zero = true;
         if (other.is_all_offset_zero) {
             for (uint32_t i = 0; i < ndims; i++) {
-                if (view_offsets[i] != 0) { all_zero = false; break; }
+                if (view_offsets[i] != 0) {
+                    all_zero = false;
+                    break;
+                }
             }
             if (!all_zero) {
                 for (uint32_t i = 0; i < ndims; i++) {
@@ -199,9 +262,7 @@ struct alignas(64) Tensor {
         start_offset = result;
     }
 
-    void copy(const Tensor &other) {
-        init(other);
-    }
+    void copy(const Tensor& other) { init(other); }
 
     Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool manual_dep = false) const {
         Tensor result;
@@ -276,6 +337,21 @@ struct alignas(64) Tensor {
 
     bool is_same_memref(const Tensor& other) const { return buffer.addr == other.buffer.addr; }
 
+    /// Materialize a TensorCreateInfo into this Tensor (fresh contiguous output).
+    void init_from_create_info(const struct TensorCreateInfo& ci, void* addr, int32_t version_val) {
+        init(addr,
+            ci.buffer_size_bytes(),
+            ci.raw_shapes,
+            ci.raw_shapes,
+            nullptr,
+            ci.ndims,
+            ci.dtype,
+            version_val,
+            /*is_all_offset_zero=*/true,
+            /*is_raw_eq_shapes=*/true,
+            ci.manual_dep);
+    }
+
     std::string dump() const {
         std::stringstream ss;
         std::string indent = "    ";
@@ -338,26 +414,15 @@ static inline Tensor make_tensor_external(void* addr,
     for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return Tensor(addr, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
-}
-
-/**
- * Create a Tensor for runtime-allocated output (addr=0).
- * NO memory allocation: only records dtype, shape, and buffer.size in the Tensor struct.
- * The runtime allocates from the heap ring and fills buffer.addr during pto2_submit_task
- * when this tensor is passed as OUTPUT param. No buffer content is ever copied.
- */
-static inline Tensor make_tensor(const uint32_t shapes[],
-    uint32_t ndims,
-    DataType dtype = DataType::FLOAT32,
-    bool manual_dep = false,
-    int32_t version = 0) {
-    static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
-    uint64_t total = 1;
-    for (uint32_t i = 0; i < ndims; i++) {
-        total *= shapes[i];
-    }
-    return Tensor(0, total * get_element_size(dtype), shapes, shapes, zero_offsets, ndims, dtype, version,
-                  /*is_all_offset_zero=*/true, /*is_raw_eq_shapes=*/true, manual_dep);
+    return Tensor(addr,
+        total * get_element_size(dtype),
+        shapes,
+        shapes,
+        zero_offsets,
+        ndims,
+        dtype,
+        version,
+        /*is_all_offset_zero=*/true,
+        /*is_raw_eq_shapes=*/true,
+        manual_dep);
 }

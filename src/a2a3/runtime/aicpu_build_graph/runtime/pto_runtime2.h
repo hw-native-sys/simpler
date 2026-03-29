@@ -1,3 +1,14 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 /**
  * PTO Runtime2 - Main Interface
  *
@@ -22,15 +33,15 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#ifndef PTO_RUNTIME2_H
-#define PTO_RUNTIME2_H
+#ifndef SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_H_
+#define SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_H_
 
-#include "pto_runtime2_types.h"
-#include "pto_submit_types.h"
-#include "pto_shared_memory.h"
-#include "pto_ring_buffer.h"
-#include "pto_scheduler.h"
-#include "pto_orchestrator.h"
+#include "pto_orchestrator.h"    // NOLINT(build/include_subdir)
+#include "pto_ring_buffer.h"     // NOLINT(build/include_subdir)
+#include "pto_runtime2_types.h"  // NOLINT(build/include_subdir)
+#include "pto_scheduler.h"       // NOLINT(build/include_subdir)
+#include "pto_shared_memory.h"   // NOLINT(build/include_subdir)
+#include "pto_submit_types.h"    // NOLINT(build/include_subdir)
 
 // Maximum number of orchestrator threads supported
 constexpr int PTO2_MAX_ORCH_THREADS = 4;
@@ -58,8 +69,7 @@ enum PTO2RuntimeMode {
 typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
-    PTO2TaskId (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                              const Arg& args);
+    SubmitResult (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const Arg& args);
     void (*add_dependency)(PTO2Runtime* rt, PTO2TaskId producer, PTO2TaskId consumer);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
@@ -82,24 +92,24 @@ struct PTO2RuntimeOps {
  */
 struct PTO2Runtime {
     // Ops table (first field — used by orchestration .so via function pointers)
-    const PTO2RuntimeOps*   ops;
+    const PTO2RuntimeOps* ops;
 
     // Components
     PTO2SharedMemoryHandle* sm_handle;
-    PTO2OrchestratorState   orchestrators[PTO2_MAX_ORCH_THREADS];
-    int                     orch_count;     // Number of active orchestrator states
-    PTO2SchedulerState      scheduler;
+    PTO2OrchestratorState orchestrators[PTO2_MAX_ORCH_THREADS];
+    int orch_count;  // Number of active orchestrator states
+    PTO2SchedulerState scheduler;
 
     // GM Heap for output buffers
-    void*                   gm_heap;
-    uint64_t                  gm_heap_size;
-    bool                    gm_heap_owned;  // True if we allocated it
+    void* gm_heap;
+    uint64_t gm_heap_size;
+    bool gm_heap_owned;  // True if we allocated it
 
     // Mode
-    PTO2RuntimeMode         mode;
+    PTO2RuntimeMode mode;
 
     // Statistics
-    int64_t                 total_cycles;
+    int64_t total_cycles;
 };
 
 // =============================================================================
@@ -123,9 +133,9 @@ PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode);
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
-                                         uint64_t task_window_size,
-                                         uint64_t heap_size,
-                                         int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    uint64_t task_window_size,
+    uint64_t heap_size,
+    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Create runtime from existing shared memory and GM heap (e.g. on device).
@@ -138,11 +148,11 @@ PTO2Runtime* pto2_runtime_create_custom(PTO2RuntimeMode mode,
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
-                                          PTO2SharedMemoryHandle* sm_handle,
-                                          void* gm_heap,
-                                          uint64_t heap_size,
-                                          int orch_count = 1,
-                                          int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    PTO2SharedMemoryHandle* sm_handle,
+    void* gm_heap,
+    uint64_t heap_size,
+    int orch_count = 1,
+    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
 
 /**
  * Destroy runtime and free all resources
@@ -201,7 +211,7 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt);
  *   PTO2_SCOPE_END(rt);
  */
 #define PTO2_SCOPE_BEGIN(rt) pto2_rt_scope_begin(rt)
-#define PTO2_SCOPE_END(rt)   pto2_rt_scope_end(rt)
+#define PTO2_SCOPE_END(rt) pto2_rt_scope_end(rt)
 
 /**
  * RAII Scope Guard for C++
@@ -234,14 +244,11 @@ void pto2_rt_orchestration_done(PTO2Runtime* rt);
  * - Less error-prone: impossible to forget scope cleanup
  */
 class PTO2ScopeGuard {
-public:
-    PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) {
-        pto2_rt_scope_begin(rt_);
-    }
-    ~PTO2ScopeGuard() {
-        pto2_rt_scope_end(rt_);
-    }
-private:
+public:  // NOLINT(whitespace/indent)
+    explicit PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) { pto2_rt_scope_begin(rt_); }
+    ~PTO2ScopeGuard() { pto2_rt_scope_end(rt_); }
+
+private:  // NOLINT(whitespace/indent)
     PTO2Runtime* rt_;
 };
 
@@ -254,7 +261,7 @@ private:
  *   PTO2_SCOPE_GUARD(rt);
  *   pto2_rt_submit_task(...);
  */
-#define _PTO2_CONCATENATE_IMPL(x, y) x ## y
+#define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
 #define PTO2_SCOPE_GUARD(rt) [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)(rt)
 
@@ -276,8 +283,8 @@ private:
 #ifndef PTO2_ORCHESTRATION_CONFIG_DEFINED
 #define PTO2_ORCHESTRATION_CONFIG_DEFINED
 struct PTO2OrchestrationConfig {
-    int         expected_arg_count;
+    int expected_arg_count;
 };
 #endif
 
-#endif // PTO_RUNTIME2_H
+#endif  // SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_H_

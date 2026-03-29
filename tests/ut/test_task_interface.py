@@ -418,13 +418,13 @@ class TestTaggedTaskArgs:
         t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
         args.add_tensor(t)
         assert args.tensor_count() == 1
-        assert args.tensor_tag(0) == TensorArgType.INPUT
+        assert args.tag(0) == TensorArgType.INPUT
 
     def test_add_tensor_with_tag(self):
         args = TaggedTaskArgs()
         t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
         args.add_tensor(t, TensorArgType.OUTPUT)
-        assert args.tensor_tag(0) == TensorArgType.OUTPUT
+        assert args.tag(0) == TensorArgType.OUTPUT
 
     def test_multiple_tensors_with_tags(self):
         args = TaggedTaskArgs()
@@ -432,16 +432,16 @@ class TestTaggedTaskArgs:
         args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
         args.add_tensor(ContinuousTensor.make(0x3, (4,), DataType.INT8), TensorArgType.INOUT)
         assert args.tensor_count() == 3
-        assert args.tensor_tag(0) == TensorArgType.INPUT
-        assert args.tensor_tag(1) == TensorArgType.OUTPUT
-        assert args.tensor_tag(2) == TensorArgType.INOUT
+        assert args.tag(0) == TensorArgType.INPUT
+        assert args.tag(1) == TensorArgType.OUTPUT
+        assert args.tag(2) == TensorArgType.INOUT
 
-    def test_set_tensor_tag(self):
+    def test_set_tag(self):
         args = TaggedTaskArgs()
         args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
-        assert args.tensor_tag(0) == TensorArgType.INPUT
-        args.set_tensor_tag(0, TensorArgType.INOUT)
-        assert args.tensor_tag(0) == TensorArgType.INOUT
+        assert args.tag(0) == TensorArgType.INPUT
+        args.set_tag(0, TensorArgType.INOUT)
+        assert args.tag(0) == TensorArgType.INOUT
 
     def test_tensor_before_scalar_enforced(self):
         args = TaggedTaskArgs()
@@ -469,12 +469,12 @@ class TestTaggedTaskArgs:
         assert args.tensor_count() == 0
         assert args.scalar_count() == 0
 
-    def test_tensor_tag_out_of_range(self):
+    def test_tag_out_of_range(self):
         args = TaggedTaskArgs()
         with pytest.raises((IndexError, RuntimeError)):
-            args.tensor_tag(0)
+            args.tag(0)
 
-    def test_set_tensor_tag_out_of_range(self):
+    def test_set_tag_out_of_range(self):
         args = TaggedTaskArgs()
         with pytest.raises((IndexError, RuntimeError)):
-            args.set_tensor_tag(0, TensorArgType.INPUT)
+            args.set_tag(0, TensorArgType.INPUT)

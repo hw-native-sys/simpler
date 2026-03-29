@@ -5,7 +5,7 @@
 ```text
 pto-runtime/
 ├── src/
-│   ├── common/task_interface/            # Cross-architecture shared headers (data_type.h, task_arg.h)
+│   ├── common/task_interface/            # Cross-architecture shared headers (data_type.h, tensor_arg.h, task_args.h)
 │   └── {arch}/                         # Architecture-specific code (a2a3, a5)
 │       ├── platform/                   # Platform-specific implementations
 │       │   ├── include/                # Shared headers (host/, aicpu/, aicore/, common/)

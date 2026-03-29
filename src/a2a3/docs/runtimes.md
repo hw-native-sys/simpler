@@ -5,7 +5,7 @@ Three runtime implementations live under `src/a2a3/runtime/`, each providing a d
 ## Comparison
 
 | Feature | host_build_graph | aicpu_build_graph | tensormap_and_ringbuffer |
-|---------|-----------------|-------------------|--------------------------|
+| ------- | ---------------- | ----------------- | ------------------------ |
 | Graph built on | Host CPU | AICPU (device) | AICPU (device) |
 | Task storage | Fixed `Task[]` array | Fixed `Task[]` array | Ring buffer (`PTO2TaskDescriptor[]`) |
 | Dependencies | Explicit edges | Explicit edges | Auto-derived via TensorMap |
@@ -48,6 +48,7 @@ The primary production runtime. Uses ring buffers for task slots and output memo
 - Supports streaming, flow control, large batch sizes, and multi-level profiling
 
 See [tensormap_and_ringbuffer/docs/](../runtime/tensormap_and_ringbuffer/docs/):
+
 - [RUNTIME_LOGIC.md](../runtime/tensormap_and_ringbuffer/docs/RUNTIME_LOGIC.md) — Full system design
 - [MULTI_RING.md](../runtime/tensormap_and_ringbuffer/docs/MULTI_RING.md) — Multi-ring buffer architecture
 - [SUBMIT_BY_CLUSTER.md](../runtime/tensormap_and_ringbuffer/docs/SUBMIT_BY_CLUSTER.md) — Cluster submission design
@@ -57,9 +58,12 @@ See [tensormap_and_ringbuffer/docs/](../runtime/tensormap_and_ringbuffer/docs/):
 ## Shared Components
 
 Runtime-specific shared files are in `src/a2a3/runtime/common/`:
+
 - `pto_ring_buffer.h/cpp` — Ring buffer data structures (HeapRing, TaskRing, DepListPool)
 - `pto_submit_types.h` — Subtask types, MixedKernels, ResourceShape
 
 Cross-architecture shared files are in `src/common/task_interface/`:
+
 - `data_type.h` — DataType enum and element size helpers
-- `task_arg.h` — Task argument tagged union (host↔device data interface)
+- `tensor_arg.h` — ContinuousTensor type (host↔device data transport)
+- `task_args.h` — TaskArgs template (separated tensor/scalar argument storage)

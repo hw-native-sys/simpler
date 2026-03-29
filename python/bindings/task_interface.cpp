@@ -246,7 +246,7 @@ NB_MODULE(_task_interface, m) {
             "add_tensor",
             [](TaggedTaskArgs& self, const ContinuousTensor& t, TensorArgType tag) {
                 self.add_tensor(t);
-                self.tensor_tag(self.tensor_count() - 1) = tag;
+                self.tag(self.tensor_count() - 1) = tag;
             },
             nb::arg("t"),
             nb::arg("tag") = TensorArgType::INPUT,
@@ -279,21 +279,20 @@ NB_MODULE(_task_interface, m) {
             "Return the scalar at index i.")
 
         .def(
-            "tensor_tag",
+            "tag",
             [](const TaggedTaskArgs& self, int32_t i) -> TensorArgType {
-                if (i < 0 || i >= self.tensor_count())
-                    throw std::out_of_range("TaggedTaskArgs tensor_tag index out of range");
-                return self.tensor_tag(i);
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaggedTaskArgs tag index out of range");
+                return self.tag(i);
             },
             nb::arg("i"),
             "Return the TensorArgType tag for the tensor at index i.")
 
         .def(
-            "set_tensor_tag",
+            "set_tag",
             [](TaggedTaskArgs& self, int32_t i, TensorArgType tag) {
                 if (i < 0 || i >= self.tensor_count())
-                    throw std::out_of_range("TaggedTaskArgs set_tensor_tag index out of range");
-                self.tensor_tag(i) = tag;
+                    throw std::out_of_range("TaggedTaskArgs set_tag index out of range");
+                self.tag(i) = tag;
             },
             nb::arg("i"),
             nb::arg("tag"),

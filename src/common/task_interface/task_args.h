@@ -20,7 +20,7 @@
  *
  * Optional TensorTag (e.g. TensorArgType for INPUT/OUTPUT/INOUT):
  *   - void (default): no per-tensor tag — pure transport/storage
- *   - real type: adds tensor_tags_ storage + tensor_tag(i) accessor
+ *   - real type: adds tags_ storage + tag(i) accessor
  *
  * Type aliases:
  *   ChipStorageTaskArgs = TaskArgs<ContinuousTensor, uint64_t, 16, 128>
@@ -43,19 +43,19 @@
 // Static array of tags (MaxT > 0, TensorTag != void)
 template <typename TensorTag, size_t MaxT>
 struct TensorTagMixin {
-    TensorTag tensor_tags_[MaxT]{};
+    TensorTag tags_[MaxT]{};
 
-    const TensorTag& tensor_tag(int32_t i) const { return tensor_tags_[i]; }
-    TensorTag& tensor_tag(int32_t i) { return tensor_tags_[i]; }
+    const TensorTag& tag(int32_t i) const { return tags_[i]; }
+    TensorTag& tag(int32_t i) { return tags_[i]; }
 };
 
 // Dynamic vector of tags (MaxT == 0, TensorTag != void)
 template <typename TensorTag>
 struct TensorTagMixin<TensorTag, 0> {
-    std::vector<TensorTag> tensor_tags_;
+    std::vector<TensorTag> tags_;
 
-    const TensorTag& tensor_tag(int32_t i) const { return tensor_tags_[static_cast<size_t>(i)]; }
-    TensorTag& tensor_tag(int32_t i) { return tensor_tags_[static_cast<size_t>(i)]; }
+    const TensorTag& tag(int32_t i) const { return tags_[static_cast<size_t>(i)]; }
+    TensorTag& tag(int32_t i) { return tags_[static_cast<size_t>(i)]; }
 };
 
 // Empty: TensorTag == void, static (zero overhead)
@@ -119,7 +119,7 @@ struct TaskArgs<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
         if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
         tensors_.push_back(t);
         if constexpr (!std::is_void_v<TensorTag>) {
-            this->tensor_tags_.push_back(TensorTag{});
+            this->tags_.push_back(TensorTag{});
         }
     }
 
@@ -141,7 +141,7 @@ struct TaskArgs<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
         tensors_.clear();
         scalars_.clear();
         if constexpr (!std::is_void_v<TensorTag>) {
-            this->tensor_tags_.clear();
+            this->tags_.clear();
         }
     }
 };
