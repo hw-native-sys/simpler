@@ -18,18 +18,30 @@ Benchmark runtime performance on Ascend hardware. Automatically detects whether 
 
 Optional benchmark arguments forwarded to `tools/benchmark_rounds.sh`:
 
-```
+```text
 /benchmark
 /benchmark -d 4 -n 50
+/benchmark -d 4 -d 6
 ```
 
-Extra arguments (`-d`, `-n`, `-r`, etc.) are forwarded to `tools/benchmark_rounds.sh`.
+Extra arguments (`-n`, `-r`, etc.) are forwarded to `tools/benchmark_rounds.sh`.
+
+### Device arguments (`-d`)
+
+The `-d` flag specifies NPU device IDs. The number of devices determines parallelism in compare mode:
+
+| `-d` count | Compare mode behavior |
+| ---------- | --------------------- |
+| One device (`-d 4`) | **Sequential**: baseline first, then current, both on the same device |
+| Two devices (`-d 4 -d 6`) | **Parallel**: baseline on first device, current on second device |
+| Zero (not specified) | Auto-detect idle devices (see Step 2) |
 
 **Defaults** (when not specified): use `benchmark_rounds.sh` defaults (device 0, 100 rounds, a2a3, tensormap_and_ringbuffer).
 
 ## Runtime Selection
 
 `tools/benchmark_rounds.sh` supports `-r <runtime>`:
+
 - `tensormap_and_ringbuffer` (default)
 - `aicpu_build_graph`
 
@@ -63,13 +75,15 @@ fi
 
 ## Step 2: Device Detection
 
-Detect idle NPU devices (HBM-Usage = 0):
+If `-d` was provided in args, skip detection and use the user-specified device(s).
+
+Otherwise, detect idle NPU devices (HBM-Usage = 0):
 
 ```bash
 npu-smi info
 ```
 
-Pick devices with **HBM-Usage = 0**. Find the longest consecutive sub-range (at most 4). If no idle device is found, prompt user to specify a device ID. If `-d` was provided in args, skip detection.
+Pick devices with **HBM-Usage = 0**. Find the longest consecutive sub-range (at most 4). If no idle device is found, prompt user to specify a device ID.
 
 ## Step 3: Pin PTO-ISA
 
@@ -98,33 +112,84 @@ mkdir -p tmp
 
 ### Compare Mode
 
-Use a **git worktree** for the baseline so the current workspace (with uncommitted changes) is never disturbed. Each run uses its own `./tools/benchmark_rounds.sh` so the script and `run_example.py` are always version-consistent.
+Use a **git worktree** for the baseline so the current workspace is never disturbed.
 
-**5a. Baseline (worktree at merge-base):**
+#### CRITICAL: Worktree needs runtime binaries built
+
+The worktree is a fresh checkout at merge-base — it has **no pre-built runtime binaries** (`build/lib/` is in `.gitignore` and not checked in). Running `benchmark_rounds.sh` directly in the worktree will fail with:
+
+```text
+Pre-built runtime binaries not found for '...' (platform=a2a3)
+```
+
+**You MUST run `python examples/scripts/build_runtimes.py` inside the worktree** before benchmarking. This builds the runtime `.so` files into the worktree's own `build/lib/` directory. Unlike `pip install -e .`, it does NOT modify the shared Python environment, so baseline and current workspaces remain fully independent.
+
+#### 5a. Create worktree and build binaries
 
 ```bash
 WORKTREE_DIR="tmp/worktree_baseline_${TIMESTAMP}"
 git worktree add "$WORKTREE_DIR" "$MERGE_BASE" --quiet
 
-for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
-  (cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh $BENCH_ARGS -r "$RUNTIME") \
-    2>&1 | tee "tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
-done
+# CRITICAL: build runtime binaries in worktree
+# Use cd inside the command — the Bash tool cwd does not persist across calls
+cd "$WORKTREE_DIR" && python examples/scripts/build_runtimes.py 2>&1 | tail -5
+```
 
+**IMPORTANT — Bash tool cwd**: The Bash tool resets to the primary working directory for each call. To run commands inside the worktree, you MUST use `cd "$WORKTREE_DIR" && <command>` in a single Bash call. Do NOT rely on a previous `cd` persisting.
+
+#### 5b. Run baseline
+
+```bash
+cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $BASELINE_DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+  2>&1 | tee "$PROJECT_ROOT/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
+```
+
+#### 5c. Run current
+
+```bash
+# Run current benchmark (from main workspace cwd, which is automatic)
+./tools/benchmark_rounds.sh -d $CURRENT_DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+  2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
+```
+
+#### 5d. Cleanup
+
+```bash
 git worktree remove "$WORKTREE_DIR" --force
 ```
 
-**5b. Current (workspace with changes):**
+#### Parallel execution (two devices)
 
-Run directly in the current workspace — uncommitted changes are compiled as-is:
+When two devices are available, run baseline and current in parallel. Since `build_runtimes.py` only builds into the local `build/lib/` without modifying the shared Python environment, both workspaces are fully independent.
 
 ```bash
-for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
-  ./tools/benchmark_rounds.sh $BENCH_ARGS -r "$RUNTIME" 2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
-done
+# 1. Build worktree binaries
+cd "$WORKTREE_DIR" && python examples/scripts/build_runtimes.py
+
+# 2. Launch both in parallel (background)
+#    Baseline — must cd into worktree in the command
+cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $DEVICE_BASELINE ... &
+#    Current — runs from main workspace cwd
+./tools/benchmark_rounds.sh -d $DEVICE_CURRENT ... &
 ```
 
-No stash, no checkout, no restore needed.
+#### Sequential execution (one device)
+
+```bash
+# 1. Build worktree binaries
+cd "$WORKTREE_DIR" && python examples/scripts/build_runtimes.py
+
+# 2. Run baseline from worktree
+cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+  2>&1 | tee "$PROJECT_ROOT/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
+
+# 3. Run current from main workspace
+./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+  2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
+
+# 4. Cleanup
+git worktree remove "$WORKTREE_DIR" --force
+```
 
 ## Step 6: Report Results
 
@@ -132,7 +197,7 @@ Parse `Trimmed Avg:` for elapsed and `Orch Trimmed Avg:` for orchestration time 
 
 ### Single Mode
 
-```
+```text
 Benchmark at: <short SHA>
 Args: -d 4 -n 100
 
@@ -147,9 +212,10 @@ benchmark_bgemm                       892.1       650.2
 
 Show comparison table with both Elapsed and Orch deltas, **grouped by runtime**:
 
-```
+```text
 Merge-base: <short SHA>  →  HEAD: <short SHA> (+ uncommitted)
 Args: -d 4 -n 100
+Device: baseline=4, current=4  (or baseline=4, current=6)
 
 ### tensormap_and_ringbuffer
 
@@ -163,6 +229,10 @@ benchmark_bgemm                890.3       892.1        +1.8       +0.20%
 
 Overall: X of Y examples improved, Z regressed
 ```
+
+If baseline and current ran on **different devices**, add a note:
+
+> Note: Baseline and current ran on different NPU devices (4 vs 6). Results within ±2% may reflect device-to-device variance rather than code changes. For definitive comparison, re-run on the same device with `/benchmark -d <single_device>`.
 
 **Interpretation:**
 
@@ -181,16 +251,19 @@ If any example shows > 5% regression, highlight it explicitly.
 | No idle device and no `-d` specified | Prompt user to specify device ID |
 | Benchmark script fails | Report which examples failed; continue with remaining |
 | No timing data | Warn: "No timing markers — ensure `PTO2_PROFILING` is enabled" |
-| All examples fail | Suggest specifying device with `-d`. Run `npu-smi info` to find idle devices |
+| All examples fail | Check: did you run `python examples/scripts/build_runtimes.py` in the worktree? |
 | Worktree creation fails | Fall back to stash/checkout approach or report error |
+| `Pre-built runtime binaries not found` | Run `python examples/scripts/build_runtimes.py` in that directory first |
 
 ## Checklist
 
 - [ ] Mode detected (single vs compare)
 - [ ] Idle device found or user-specified
 - [ ] PTO-ISA pinned to CI commit
-- [ ] Baseline completed in worktree (compare mode)
+- [ ] (Compare mode) Worktree created and `python examples/scripts/build_runtimes.py` run inside it
+- [ ] (Compare mode) Baseline completed from worktree (using `cd $WORKTREE_DIR && ./tools/benchmark_rounds.sh`)
 - [ ] Current completed in workspace
 - [ ] Worktree cleaned up (compare mode)
 - [ ] Results table presented with Elapsed + Orch times
+- [ ] (Compare mode) Device difference noted if applicable
 - [ ] (Compare mode) Regressions > 2% flagged
