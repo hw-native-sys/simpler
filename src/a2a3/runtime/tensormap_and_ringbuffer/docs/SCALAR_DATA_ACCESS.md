@@ -26,7 +26,7 @@ Both call into the runtime through the ops table — orchestration .so needs no 
 
 ### 3.1 get_tensor_data Flow
 
-```
+```text
 addr null-check → TensorMap lookup → spin-wait producer COMPLETED → compute flat offset → memcpy read
 ```
 
@@ -37,7 +37,7 @@ addr null-check → TensorMap lookup → spin-wait producer COMPLETED → comput
 
 ### 3.2 set_tensor_data Flow
 
-```
+```text
 addr null-check → TensorMap lookup → spin-wait producer COMPLETED → spin-wait consumers done → memcpy write
 ```
 
@@ -57,6 +57,7 @@ args.add_output(ci, initial_value);
 ```
 
 **Mechanism**:
+
 1. `add_output(ci, initial_value)` copies `ci` into `Arg` and marks the create-info with an initial value
 2. During orchestrator submit, after HeapRing allocation, the output tensor is materialized from the copied create-info
 3. Fill strategy:
@@ -89,6 +90,7 @@ float val = get_tensor_data<float>(scalar_tensor, 1, idx);
 ## 6. Data Hazard Analysis
 
 Three actors:
+
 - **Kernel**: InCore task submitted via add_input/add_output/add_inout (asynchronous execution)
 - **Orch Read**: orchestration calls `get_tensor_data` (blocking read)
 - **Orch Write**: orchestration calls `set_tensor_data` (blocking write)
@@ -96,7 +98,7 @@ Three actors:
 ### Hazard Matrix (earlier operation → later operation)
 
 | # | Earlier Op | Later Op | Hazard | Guarantee | Safe? |
-|---|------------|----------|--------|-----------|-------|
+| - | ---------- | -------- | ------ | --------- | ----- |
 | 1 | Kernel write (OUTPUT) | Orch Read | RAW | spin-wait producer COMPLETED | Yes |
 | 2 | Kernel write (OUTPUT) | Orch Write | WAW | spin-wait producer COMPLETED | Yes |
 | 3 | Kernel read (INPUT) | Orch Write | WAR | spin-wait fanout_refcount | **Needs INOUT** |
@@ -124,7 +126,7 @@ get/set_tensor_data are blocking calls, and orchestration is single-threaded ser
 `make_tensor_external()` creates tensors with a pre-set `buffer.addr` (pointing to host-allocated device memory).
 
 | Scenario | Behavior |
-|----------|----------|
+| -------- | -------- |
 | External tensor never submitted as OUTPUT/INOUT | No TensorMap entry — get/set execute immediately |
 | External tensor previously submitted as OUTPUT/INOUT | TensorMap has producer entry — get/set spin-wait |
 | External tensor submitted as INPUT, then set_tensor_data | **WAR risk** — must use INOUT instead (same as scenario #3) |

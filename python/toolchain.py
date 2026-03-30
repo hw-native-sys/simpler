@@ -1,17 +1,28 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+
+from __future__ import annotations
 
 import os
 from enum import IntEnum
-from typing import List, Optional
+
 import env_manager
 
 
 # Must match compile_strategy.h
 class ToolchainType(IntEnum):
     """Toolchain types matching the C enum in compile_strategy.h."""
-    CCEC = 0           # ccec (Ascend AICore compiler)
-    HOST_GXX_15 = 1    # g++-15 (host, simulation kernels)
-    HOST_GXX = 2       # g++ (host, orchestration .so)
-    AARCH64_GXX = 3    # aarch64-target-linux-gnu-g++ (cross-compile)
+
+    CCEC = 0  # ccec (Ascend AICore compiler)
+    HOST_GXX_15 = 1  # g++-15 (host, simulation kernels)
+    HOST_GXX = 2  # g++ (host, orchestration .so)
+    AARCH64_GXX = 3  # aarch64-target-linux-gnu-g++ (cross-compile)
 
 
 class Toolchain:
@@ -30,14 +41,16 @@ class Toolchain:
     - BuildTarget (in runtime_compiler.py): calls get_cmake_args() for CMake builds
     """
 
+    cxx_path: str
+
     def __init__(self):
         self.ascend_home_path = env_manager.get("ASCEND_HOME_PATH")
 
-    def get_compile_flags(self, **kwargs) -> List[str]:
+    def get_compile_flags(self, **kwargs) -> list[str]:
         """Return base compiler flags for direct invocation."""
         raise NotImplementedError
 
-    def get_cmake_args(self) -> List[str]:
+    def get_cmake_args(self) -> list[str]:
         """Return compiler-specific CMake -D arguments."""
         raise NotImplementedError
 
@@ -49,19 +62,18 @@ class CCECToolchain(Toolchain):
         super().__init__()
         self.platform = platform
 
+        if self.ascend_home_path is None:
+            raise RuntimeError("ASCEND_HOME_PATH is required for CCEC toolchain")
+
         self.cxx_path = os.path.join(self.ascend_home_path, "bin", "ccec")
         self.linker_path = os.path.join(self.ascend_home_path, "bin", "ld.lld")
 
         if not os.path.isfile(self.cxx_path):
-            raise FileNotFoundError(
-                f"ccec compiler not found: {self.cxx_path}"
-            )
+            raise FileNotFoundError(f"ccec compiler not found: {self.cxx_path}")
         if not os.path.isfile(self.linker_path):
-            raise FileNotFoundError(
-                f"ccec linker not found: {self.linker_path}"
-            )
+            raise FileNotFoundError(f"ccec linker not found: {self.linker_path}")
 
-    def get_compile_flags(self, core_type: str = "aiv", **kwargs) -> List[str]:
+    def get_compile_flags(self, core_type: str = "aiv", **kwargs) -> list[str]:
         # A5 uses dav-c310 architecture, A2A3 uses dav-c220
         if self.platform in ("a5", "a5sim"):
             arch = "dav-c310-vec" if core_type == "aiv" else "dav-c310-cube"
@@ -71,19 +83,29 @@ class CCECToolchain(Toolchain):
             raise ValueError(f"Unknown platform: {self.platform}. Supported: a2a3, a2a3sim, a5, a5sim")
 
         return [
-            "-c", "-O3", "-g", "-x", "cce",
-            "-Wall", "-std=c++17",
+            "-c",
+            "-O3",
+            "-g",
+            "-x",
+            "cce",
+            "-Wall",
+            "-std=c++17",
             "--cce-aicore-only",
             f"--cce-aicore-arch={arch}",
-            "-mllvm", "-cce-aicore-stack-size=0x8000",
-            "-mllvm", "-cce-aicore-function-stack-size=0x8000",
-            "-mllvm", "-cce-aicore-record-overflow=false",
-            "-mllvm", "-cce-aicore-addr-transform",
-            "-mllvm", "-cce-aicore-dcci-insert-for-scalar=false",
+            "-mllvm",
+            "-cce-aicore-stack-size=0x8000",
+            "-mllvm",
+            "-cce-aicore-function-stack-size=0x8000",
+            "-mllvm",
+            "-cce-aicore-record-overflow=false",
+            "-mllvm",
+            "-cce-aicore-addr-transform",
+            "-mllvm",
+            "-cce-aicore-dcci-insert-for-scalar=false",
             "-DMEMORY_BASE",
         ]
 
-    def get_cmake_args(self) -> List[str]:
+    def get_cmake_args(self) -> list[str]:
         return [
             f"-DBISHENG_CC={self.cxx_path}",
             f"-DBISHENG_LD={self.linker_path}",
@@ -97,9 +119,11 @@ class Gxx15Toolchain(Toolchain):
         super().__init__()
         self.cxx_path = "g++-15"
 
-    def get_compile_flags(self, core_type: str = "", **kwargs) -> List[str]:
+    def get_compile_flags(self, core_type: str = "", **kwargs) -> list[str]:
         flags = [
-            "-shared", "-O2", "-fPIC",
+            "-shared",
+            "-O2",
+            "-fPIC",
             "-std=c++23",
             "-fpermissive",
             "-Wno-macro-redefined",
@@ -116,15 +140,14 @@ class Gxx15Toolchain(Toolchain):
             flags.append("-D__DAV_CUBE__")
         return flags
 
-    def get_cmake_args(self) -> List[str]:
+    def get_cmake_args(self) -> list[str]:
         # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
         cc = os.environ.get("CC", "gcc")
         cxx = os.environ.get("CXX", "g++")
-        args = [
+        return [
             f"-DCMAKE_C_COMPILER={cc}",
             f"-DCMAKE_CXX_COMPILER={cxx}",
         ]
-        return args
 
 
 class GxxToolchain(Toolchain):
@@ -134,10 +157,10 @@ class GxxToolchain(Toolchain):
         super().__init__()
         self.cxx_path = "g++"
 
-    def get_compile_flags(self, **kwargs) -> List[str]:
+    def get_compile_flags(self, **kwargs) -> list[str]:
         return ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
 
-    def get_cmake_args(self) -> List[str]:
+    def get_cmake_args(self) -> list[str]:
         # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
         cc = os.environ.get("CC", "gcc")
         cxx = os.environ.get("CXX", "g++")
@@ -155,27 +178,33 @@ class Aarch64GxxToolchain(Toolchain):
 
     def __init__(self):
         super().__init__()
+
+        if self.ascend_home_path is None:
+            raise RuntimeError("ASCEND_HOME_PATH is required for aarch64 toolchain")
+
         self.cxx_path = os.path.join(
-            self.ascend_home_path, "tools", "hcc", "bin",
+            self.ascend_home_path,
+            "tools",
+            "hcc",
+            "bin",
             "aarch64-target-linux-gnu-g++",
         )
         self.cc_path = os.path.join(
-            self.ascend_home_path, "tools", "hcc", "bin",
+            self.ascend_home_path,
+            "tools",
+            "hcc",
+            "bin",
             "aarch64-target-linux-gnu-gcc",
         )
         if not os.path.isfile(self.cc_path):
-            raise FileNotFoundError(
-                f"aarch64 C compiler not found: {self.cc_path}"
-            )
+            raise FileNotFoundError(f"aarch64 C compiler not found: {self.cc_path}")
         if not os.path.isfile(self.cxx_path):
-            raise FileNotFoundError(
-                f"aarch64 C++ compiler not found: {self.cxx_path}"
-            )
+            raise FileNotFoundError(f"aarch64 C++ compiler not found: {self.cxx_path}")
 
-    def get_compile_flags(self, **kwargs) -> List[str]:
+    def get_compile_flags(self, **kwargs) -> list[str]:
         return ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
 
-    def get_cmake_args(self) -> List[str]:
+    def get_cmake_args(self) -> list[str]:
         return [
             f"-DCMAKE_C_COMPILER={self.cc_path}",
             f"-DCMAKE_CXX_COMPILER={self.cxx_path}",

@@ -1,3 +1,14 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 /**
  * Data Type Definitions and Conversion Utilities
  *
@@ -6,8 +17,8 @@
  * type in the orchestration framework).
  */
 
-#ifndef ORCH_BUILD_GRAPH_DATA_TYPE_H
-#define ORCH_BUILD_GRAPH_DATA_TYPE_H
+#ifndef SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_
+#define SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_
 
 #include <cstdint>
 
@@ -43,15 +54,15 @@ enum class DataType : uint32_t {
 inline uint64_t get_element_size(DataType dtype) {
     // Order must match the enum definition exactly
     static uint64_t data_type_size[static_cast<int>(DataType::DATA_TYPE_NUM)] = {
-        4, // case DataType::FLOAT32
-        2, // DataType::FLOAT16
-        4, // DataType::INT32
-        2, // DataType::INT16
-        1, // DataType::INT8
-        1, // DataType::UINT8
-        2, // DataType::BFLOAT16
-        8, // DataType::INT64
-        8, // DataType::UINT64
+        4,  // case DataType::FLOAT32
+        2,  // DataType::FLOAT16
+        4,  // DataType::INT32
+        2,  // DataType::INT16
+        1,  // DataType::INT8
+        1,  // DataType::UINT8
+        2,  // DataType::BFLOAT16
+        8,  // DataType::INT64
+        8,  // DataType::UINT64
     };
     return data_type_size[static_cast<int>(dtype)];
 }
@@ -102,7 +113,7 @@ inline const char* get_dtype_name(DataType dtype) {
 
 namespace detail {
 
-template<typename T>
+template <typename T>
 union U64Converter {
     uint64_t bits;
     T value;
@@ -117,13 +128,11 @@ union U64Converter {
  *   uint64_t bits = to_u64(3.14f);        // float → uint64_t
  *   uint64_t bits = to_u64(int32_t(42));  // int32 → uint64_t
  */
-template<typename T>
+template <typename T>
 PTO_DEVICE_FUNC inline uint64_t to_u64(T value) {
-    static_assert(sizeof(T) <= sizeof(uint64_t),
-                  "to_u64: type must fit in 8 bytes");
+    static_assert(sizeof(T) <= sizeof(uint64_t), "to_u64: type must fit in 8 bytes");
 #if PTO_HAS_TYPE_TRAITS
-    static_assert(std::is_trivially_copyable<T>::value,
-                  "to_u64: type must be trivially copyable");
+    static_assert(std::is_trivially_copyable<T>::value, "to_u64: type must be trivially copyable");
 #endif
     detail::U64Converter<T> conv;
     conv.bits = 0;
@@ -138,17 +147,15 @@ PTO_DEVICE_FUNC inline uint64_t to_u64(T value) {
  *   float f   = from_u64<float>(bits);
  *   int32_t i = from_u64<int32_t>(bits);
  */
-template<typename T>
+template <typename T>
 PTO_DEVICE_FUNC inline T from_u64(uint64_t bits) {
-    static_assert(sizeof(T) <= sizeof(uint64_t),
-                  "from_u64: type must fit in 8 bytes");
+    static_assert(sizeof(T) <= sizeof(uint64_t), "from_u64: type must fit in 8 bytes");
 #if PTO_HAS_TYPE_TRAITS
-    static_assert(std::is_trivially_copyable<T>::value,
-                  "from_u64: type must be trivially copyable");
+    static_assert(std::is_trivially_copyable<T>::value, "from_u64: type must be trivially copyable");
 #endif
     detail::U64Converter<T> conv;
     conv.bits = bits;
     return conv.value;
 }
 
-#endif  // ORCH_BUILD_GRAPH_DATA_TYPE_H
+#endif  // SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_
