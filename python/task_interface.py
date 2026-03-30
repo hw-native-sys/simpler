@@ -100,9 +100,10 @@ def scalar_to_uint64(value) -> int:
     precision. For double precision, use ``ctypes.c_double``.
     """
     import struct as _struct
+
     if isinstance(value, float):
-        bits = _struct.unpack('<I', _struct.pack('<f', value))[0]
-        return TaskArg.make_scalar(bits)
+        bits = _struct.unpack("<I", _struct.pack("<f", value))[0]
+        return bits
     import ctypes as _ct
 
     if isinstance(value, _ct._SimpleCData):

@@ -208,7 +208,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
     ///   params.add_output(ci, 77.0f);        // float initial value
     ///   params.add_output(ci, int32_t(0));    // int32 initial value
     ///   params.add_output(ci, uint64_t(val)); // existing usage unchanged
-    template<typename T = uint64_t>
+    template <typename T = uint64_t>
     void add_output(const TensorCreateInfo& ci, T initial_value) {
         if (!check_add_tensor_valid()) {
             return;
@@ -236,7 +236,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
      *   args.add_scalar(3.14f);           // float, auto bit-cast
      *   args.add_scalar(int32_t(42));     // int32, auto bit-cast
      */
-    template<typename T = uint64_t>
+    template <typename T = uint64_t>
     void add_scalar(T value) {
         if (scalar_count_ >= MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");

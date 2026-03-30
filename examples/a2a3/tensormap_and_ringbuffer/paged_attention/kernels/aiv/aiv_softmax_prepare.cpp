@@ -1,3 +1,14 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 // Softmax Preparation Kernel (AIV) with partial block masking
 //
 // Fixed tile size: sij is (16, 16)
@@ -16,8 +27,9 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
-#include "tensor.h"
+#include "tensor.h"  // NOLINT(build/include_subdir)
 
+// NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
 
 #ifndef __gm__
@@ -25,15 +37,12 @@ using namespace pto;
 #endif
 
 #ifndef __aicore__
-#define __aicore__ [aicore]
+#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
 #endif
 
 template <int M, int N>
-static __aicore__ void softmax_prepare_impl(__gm__ Tensor* sij,
-    float scale_value,
-    __gm__ Tensor* pij,
-    __gm__ Tensor* mij,
-    __gm__ Tensor* lij) {
+static __aicore__ void softmax_prepare_impl(
+    __gm__ Tensor* sij, float scale_value, __gm__ Tensor* pij, __gm__ Tensor* mij, __gm__ Tensor* lij) {
     uint64_t valid_len = static_cast<uint64_t>(sij->shapes[1]);
     __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
     __gm__ half* pij_addr = reinterpret_cast<__gm__ half*>(pij->buffer.addr);

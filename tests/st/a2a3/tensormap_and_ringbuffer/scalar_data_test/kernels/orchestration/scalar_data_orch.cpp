@@ -135,8 +135,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     //   Value should be preserved (noop kernel didn't modify it)
     // =========================================================
     float s1_val = get_tensor_data<float>(scalar_tensor, 1, idx);
-    LOG_INFO("get_tensor_data(scalar_tensor, {0}) after 2nd noop = %f (expected 77.0)",
-        static_cast<double>(s1_val));
+    LOG_INFO("get_tensor_data(scalar_tensor, {0}) after 2nd noop = %f (expected 77.0)", static_cast<double>(s1_val));
 
     check_idx[0] = 3;
     set_tensor_data(ext_check, 1, check_idx, s1_val);
@@ -219,8 +218,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     idx[0] = 0;
     set_tensor_data(c, 1, idx, 88.0f);
     float waw_val = get_tensor_data<float>(c, 1, idx);
-    LOG_INFO("WAW+WAR: set_tensor_data(c, 88.0) after consumer = %f (expected 88.0)",
-        static_cast<double>(waw_val));
+    LOG_INFO("WAW+WAR: set_tensor_data(c, 88.0) after consumer = %f (expected 88.0)", static_cast<double>(waw_val));
 
     check_idx[0] = 7;
     set_tensor_data(ext_check, 1, check_idx, waw_val);
@@ -249,8 +247,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     idx[0] = 0;
     set_tensor_data(ext_b, 1, idx, 55.0f);
     float ext_war_val = get_tensor_data<float>(ext_b, 1, idx);
-    LOG_INFO("External WAR (INOUT): set_tensor_data(ext_b, 55.0) = %f (expected 55.0)",
-        static_cast<double>(ext_war_val));
+    LOG_INFO(
+        "External WAR (INOUT): set_tensor_data(ext_b, 55.0) = %f (expected 55.0)", static_cast<double>(ext_war_val));
 
     check_idx[0] = 8;
     set_tensor_data(ext_check, 1, check_idx, ext_war_val);

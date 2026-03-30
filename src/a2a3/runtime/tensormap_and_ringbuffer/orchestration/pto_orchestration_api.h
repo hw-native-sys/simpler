@@ -219,7 +219,7 @@ static inline bool pto2_rt_is_fatal() {
  * task completes before reading. External tensors (make_tensor_external)
  * are read immediately without waiting.
  */
-template<typename T = uint64_t>
+template <typename T = uint64_t>
 static inline T get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[]) {
     PTO2Runtime* rt = pto2_current_runtime();
     return from_u64<T>(rt->ops->get_tensor_data(rt, tensor, ndims, indices));
@@ -252,7 +252,7 @@ static inline T get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint
  * For runtime-created outputs, call this only on the Tensor returned by
  * add_output(TensorCreateInfo) after submit returns.
  */
-template<typename T = uint64_t>
+template <typename T = uint64_t>
 static inline void set_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[], T value) {
     PTO2Runtime* rt = pto2_current_runtime();
     rt->ops->set_tensor_data(rt, tensor, ndims, indices, to_u64(value));
