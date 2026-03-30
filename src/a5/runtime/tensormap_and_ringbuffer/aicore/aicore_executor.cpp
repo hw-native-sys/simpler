@@ -16,6 +16,10 @@
 #include "pto2_dispatch_payload.h"   // NOLINT(build/include_subdir)
 #include "runtime.h"                 // NOLINT(build/include_subdir)
 
+#ifdef __CPU_SIM
+#include <dlfcn.h>
+#endif
+
 /**
  * Unified function pointer type for kernel dispatch
  *
@@ -23,6 +27,17 @@
  * This enables simple, switch-free dispatch.
  */
 typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
+
+#ifdef __CPU_SIM
+namespace {
+using CpuSimSetTaskCookieHook = void (*)(uint64_t);
+
+CpuSimSetTaskCookieHook resolve_cpu_sim_set_task_cookie_hook() {
+    static auto hook = reinterpret_cast<CpuSimSetTaskCookieHook>(dlsym(RTLD_DEFAULT, "pto_cpu_sim_set_task_cookie"));
+    return hook;
+}
+}  // namespace
+#endif
 
 /**
  * Execute task from PTO2DispatchPayload.
@@ -120,6 +135,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             uint64_t start_time = get_sys_cnt_aicore();
 
             // Execute the task
+#ifdef __CPU_SIM
+            if (auto hook = resolve_cpu_sim_set_task_cookie_hook(); hook != nullptr) {
+                hook(reinterpret_cast<uint64_t>(payload->args));
+            }
+#endif
             execute_task(payload);
 
             // Performance profiling: record task execution

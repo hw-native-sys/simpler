@@ -181,11 +181,14 @@ trap 'kill $WATCHDOG_PID 2>/dev/null; pkill -TERM -P $$ 2>/dev/null; rm -rf "$LO
 ) >/dev/null 2>&1 &
 WATCHDOG_PID=$!
 
-# commit_flag starts empty (try latest PTO-ISA first).
-# If -c is given AND a test fails, pin_pto_isa_on_failure sets commit_flag.
 commit_flag=()
+if [[ -n "$PTO_ISA_COMMIT" ]]; then
+    echo "[CI] Using pinned PTO-ISA commit from start: $PTO_ISA_COMMIT"
+    rm -rf examples/scripts/_deps/pto-isa
+    commit_flag=(-c "$PTO_ISA_COMMIT")
+fi
 
-# Pin PTO-ISA to the specified commit on first failure.
+# Legacy fallback path for callers that start on the latest PTO-ISA checkout.
 # On first failure: cleans cached clone, sets commit_flag, returns 0 (caller retries).
 # On subsequent failures (already pinned): returns 1 (real failure).
 pin_pto_isa_on_failure() {
