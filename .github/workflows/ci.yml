@@ -45,10 +45,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy
-          pip install ml_dtypes
-          pip install pytest
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements/ci.txt --index-url https://download.pytorch.org/whl/cpu
 
       - name: Build nanobind extension
         run: pip install .
@@ -103,10 +100,7 @@ jobs:
 
       - name: Install dependencies
         run: |
-          pip install numpy
-          pip install ml_dtypes
-          pip install pytest
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements/ci.txt --index-url https://download.pytorch.org/whl/cpu
 
       - name: Build nanobind extension
         run: pip install .

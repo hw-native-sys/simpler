@@ -1,0 +1,6 @@
+# CI Python dependencies for simpler.
+# Keep upper bounds here; Dependabot updates this file.
+numpy<=2.0.2
+ml_dtypes<=0.5.1
+pytest<=8.3.5
+torch<=2.6.0
