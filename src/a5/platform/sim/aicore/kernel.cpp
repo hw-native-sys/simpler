@@ -19,6 +19,7 @@ thread_local uint32_t g_sim_physical_core_id = 0;
 
 // Declare the original function (defined in aicore_executor.cpp with weak linkage)
 void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type);
+extern "C" void pto_cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim);
 
 // Wrapper with extern "C" for dlsym lookup
 // NOTE: physical_core_id stays in wrapper signature (DeviceRunner passes it for register indexing)
@@ -32,6 +33,20 @@ extern "C" void aicore_execute_wrapper(__gm__ Runtime* runtime, int block_idx, C
     }
 
     g_sim_physical_core_id = physical_core_id;
+    const uint32_t num_aic = static_cast<uint32_t>(runtime->worker_count / PLATFORM_CORES_PER_BLOCKDIM);
+    uint32_t cpu_block_idx = static_cast<uint32_t>(block_idx);
+    uint32_t subblock_id = 0;
+    uint32_t subblock_dim = 1;
 
+    if (core_type == CoreType::AIV && physical_core_id >= num_aic) {
+        const uint32_t aiv_offset = physical_core_id - num_aic;
+        cpu_block_idx = aiv_offset / PLATFORM_AIV_CORES_PER_BLOCKDIM;
+        subblock_id = aiv_offset % PLATFORM_AIV_CORES_PER_BLOCKDIM;
+        subblock_dim = PLATFORM_AIV_CORES_PER_BLOCKDIM;
+    } else {
+        cpu_block_idx = physical_core_id;
+    }
+
+    pto_cpu_sim_set_execution_context(cpu_block_idx, subblock_id, subblock_dim);
     aicore_execute(runtime, block_idx, core_type);
 }

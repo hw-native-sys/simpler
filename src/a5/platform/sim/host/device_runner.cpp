@@ -18,6 +18,71 @@
 #include "aicpu/platform_aicpu_affinity.h"
 #include "host/raii_scope_guard.h"
 
+namespace {
+thread_local uint32_t g_cpu_sim_block_idx = 0;
+thread_local uint32_t g_cpu_sim_subblock_id = 0;
+thread_local uint32_t g_cpu_sim_subblock_dim = 1;
+thread_local uint64_t g_cpu_sim_task_cookie = 0;
+std::mutex g_cpu_sim_shared_storage_mutex;
+std::map<std::string, void *> g_cpu_sim_shared_storage;
+
+void clear_cpu_sim_shared_storage()
+{
+    std::lock_guard<std::mutex> lock(g_cpu_sim_shared_storage_mutex);
+    for (auto &[key, storage] : g_cpu_sim_shared_storage) {
+        (void)key;
+        std::free(storage);
+    }
+    g_cpu_sim_shared_storage.clear();
+}
+}
+
+extern "C" void pto_cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim) {
+    g_cpu_sim_block_idx = block_idx;
+    g_cpu_sim_subblock_id = subblock_id;
+    g_cpu_sim_subblock_dim = (subblock_dim == 0) ? 1u : subblock_dim;
+}
+
+extern "C" void pto_cpu_sim_set_task_cookie(uint64_t task_cookie)
+{
+    g_cpu_sim_task_cookie = task_cookie;
+}
+
+extern "C" void pto_cpu_sim_get_execution_context(uint32_t *block_idx, uint32_t *subblock_id, uint32_t *subblock_dim)
+{
+    if (block_idx != nullptr) {
+        *block_idx = g_cpu_sim_block_idx;
+    }
+    if (subblock_id != nullptr) {
+        *subblock_id = g_cpu_sim_subblock_id;
+    }
+    if (subblock_dim != nullptr) {
+        *subblock_dim = g_cpu_sim_subblock_dim;
+    }
+}
+
+extern "C" uint64_t pto_cpu_sim_get_task_cookie()
+{
+    return g_cpu_sim_task_cookie;
+}
+
+extern "C" void *pto_cpu_sim_get_shared_storage(const char *key, size_t size)
+{
+    if (key == nullptr || size == 0) {
+        return nullptr;
+    }
+
+    std::lock_guard<std::mutex> lock(g_cpu_sim_shared_storage_mutex);
+    auto it = g_cpu_sim_shared_storage.find(key);
+    if (it != g_cpu_sim_shared_storage.end()) {
+        return it->second;
+    }
+
+    void *storage = std::calloc(1, size);
+    g_cpu_sim_shared_storage.emplace(key, storage);
+    return storage;
+}
+
 // Function pointer types for dynamically loaded executors
 typedef int (*aicpu_execute_func_t)(Runtime* runtime);
 typedef void (*aicore_execute_func_t)(Runtime* runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs);
@@ -138,6 +203,8 @@ int DeviceRunner::run(Runtime& runtime,
                       const std::vector<uint8_t>& aicpu_so_binary,
                       const std::vector<uint8_t>& aicore_kernel_binary,
                       int launch_aicpu_num) {
+
+    clear_cpu_sim_shared_storage();
 
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
@@ -429,6 +496,7 @@ int DeviceRunner::finalize() {
 
     // Free all remaining allocations
     mem_alloc_.finalize();
+    clear_cpu_sim_shared_storage();
 
     device_id_ = -1;
     worker_count_ = 0;
@@ -547,4 +615,3 @@ void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
 int DeviceRunner::export_swimlane_json(const std::string& output_path) {
     return perf_collector_.export_swimlane_json(output_path);
 }
-

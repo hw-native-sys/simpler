@@ -300,6 +300,7 @@ class KernelCompiler:
         if incore_toolchain == ToolchainType.HOST_GXX_15:
             return self._compile_incore_sim(
                 source_path,
+                core_type=core_type,
                 pto_isa_root=pto_isa_root,
                 extra_include_dirs=extra_include_dirs,
                 build_dir=build_dir,
@@ -467,6 +468,7 @@ class KernelCompiler:
     def _compile_incore_sim(
         self,
         source_path: str,
+        core_type: str = "aiv",
         pto_isa_root: Optional[str] = None,
         extra_include_dirs: Optional[List[str]] = None,
         build_dir: Optional[str] = None,
@@ -499,6 +501,14 @@ class KernelCompiler:
 
         # Build command from toolchain
         cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags()
+        if sys.platform == "darwin":
+            cmd.extend(["-Wl,-undefined,dynamic_lookup"])
+        if core_type == "aic":
+            cmd.append("-D__DAV_CUBE__")
+        elif core_type == "aiv":
+            cmd.append("-D__DAV_VEC__")
+        else:
+            raise ValueError(f"Unknown core_type for simulation kernel compilation: {core_type}")
 
         # Add PTO ISA header paths if provided
         if pto_isa_root:

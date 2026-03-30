@@ -74,3 +74,7 @@ set_target_properties(aicore_kernel PROPERTIES
     # This matches the hardcoded paths in Python/C++ code
     SUFFIX ".so"
 )
+
+if(APPLE)
+    target_link_options(aicore_kernel PRIVATE -Wl,-undefined,dynamic_lookup)
+endif()
