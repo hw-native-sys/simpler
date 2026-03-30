@@ -12,7 +12,6 @@
  * This enables simple, switch-free dispatch.
  */
 typedef void (*UnifiedKernelFunc)(__gm__ int64_t*);
-extern "C" void pto_cpu_sim_set_task_cookie(uint64_t task_cookie);
 
 /**
  * Execute task from PTO2DispatchPayload.
@@ -113,7 +112,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             uint64_t start_time = get_sys_cnt_aicore();
 
             // Execute the task
-            pto_cpu_sim_set_task_cookie(reinterpret_cast<uint64_t>(payload->args));
+            CPU_SIM_SET_TASK_COOKIE(reinterpret_cast<uint64_t>(payload->args));
             execute_task(payload);
 
             // Performance profiling: record task execution

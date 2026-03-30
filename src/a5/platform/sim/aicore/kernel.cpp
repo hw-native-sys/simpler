@@ -19,7 +19,6 @@ thread_local uint32_t g_sim_physical_core_id = 0;
 
 // Declare the original function (defined in aicore_executor.cpp with weak linkage)
 void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type);
-extern "C" void pto_cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim);
 
 // Wrapper with extern "C" for dlsym lookup
 // NOTE: physical_core_id stays in wrapper signature (DeviceRunner passes it for register indexing)

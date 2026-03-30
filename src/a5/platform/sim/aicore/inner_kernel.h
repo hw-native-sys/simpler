@@ -163,4 +163,19 @@ inline uint32_t get_physical_core_id() {
     return g_sim_physical_core_id;
 }
 
+// =============================================================================
+// CPU Simulation Context APIs
+// =============================================================================
+
+// Set execution context for the current simulation thread (block/subblock identity).
+// Called by kernel.cpp wrapper before aicore_execute().
+extern "C" void pto_cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim);
+
+// Set task cookie for the current simulation thread.
+// Called by aicore_executor before each task dispatch.
+extern "C" void pto_cpu_sim_set_task_cookie(uint64_t task_cookie);
+
+// CPU_SIM_SET_TASK_COOKIE - set task cookie in simulation, no-op on real hardware
+#define CPU_SIM_SET_TASK_COOKIE(cookie) pto_cpu_sim_set_task_cookie(cookie)
+
 #endif  // PLATFORM_A5SIM_AICORE_INNER_KERNEL_H_

@@ -85,4 +85,7 @@ __aicore__ __attribute__((always_inline)) inline uint64_t get_sys_cnt_aicore() {
     return get_sys_cnt();
 }
 
+// CPU_SIM_SET_TASK_COOKIE - no-op on real hardware (simulation only)
+#define CPU_SIM_SET_TASK_COOKIE(cookie) ((void)0)
+
 #endif  // PLATFORM_A5_AICORE_INNER_KERNEL_H_
