@@ -1,3 +1,14 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
 /**
  * @file performance_collector.cpp
  * @brief Platform-agnostic performance data collector implementation
@@ -8,14 +19,18 @@
 
 #include "host/performance_collector.h"
 
+#include <sys/stat.h>
+#include <sys/types.h>
+
 #include <algorithm>
 #include <chrono>
+#include <cinttypes>
+#include <ctime>
 #include <fstream>
 #include <iomanip>
 #include <optional>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <ctime>
+#include <string>
+#include <vector>
 
 #include "common/memory_barrier.h"
 #include "common/unified_log.h"
@@ -30,9 +45,14 @@ ProfMemoryManager::~ProfMemoryManager() {
     }
 }
 
-void ProfMemoryManager::start(void* shared_mem_host, int num_cores, int num_phase_threads,
-                               PerfAllocCallback alloc_cb, PerfRegisterCallback register_cb,
-                               PerfFreeCallback free_cb, void* user_data, int device_id) {
+void ProfMemoryManager::start(void* shared_mem_host,
+    int num_cores,
+    int num_phase_threads,
+    PerfAllocCallback alloc_cb,
+    PerfRegisterCallback register_cb,
+    PerfFreeCallback free_cb,
+    void* user_data,
+    int device_id) {
     shared_mem_host_ = shared_mem_host;
     num_cores_ = num_cores;
     num_phase_threads_ = num_phase_threads;
@@ -79,7 +99,7 @@ bool ProfMemoryManager::try_pop_ready(ReadyBufferInfo& info) {
 
 bool ProfMemoryManager::wait_pop_ready(ReadyBufferInfo& info, std::chrono::milliseconds timeout) {
     std::unique_lock<std::mutex> lock(ready_mutex_);
-    if (ready_cv_.wait_for(lock, timeout, [this]{ return !ready_queue_.empty(); })) {
+    if (ready_cv_.wait_for(lock, timeout, [this] { return !ready_queue_.empty(); })) {
         info = ready_queue_.front();
         ready_queue_.pop();
         return true;
@@ -138,12 +158,10 @@ void* ProfMemoryManager::resolve_host_ptr(void* dev_ptr) {
     return nullptr;
 }
 
-void ProfMemoryManager::register_mapping(void* dev_ptr, void* host_ptr) {
-    dev_to_host_[dev_ptr] = host_ptr;
-}
+void ProfMemoryManager::register_mapping(void* dev_ptr, void* host_ptr) { dev_to_host_[dev_ptr] = host_ptr; }
 
-void ProfMemoryManager::process_ready_entry(PerfDataHeader* /*header*/, int /*thread_idx*/,
-                                              const ReadyQueueEntry& entry) {
+void ProfMemoryManager::process_ready_entry(
+    PerfDataHeader* /*header*/, int /*thread_idx*/, const ReadyQueueEntry& entry) {
     bool is_phase = (entry.is_phase != 0);
     uint64_t old_dev_ptr = entry.buffer_ptr;
     uint32_t seq = entry.buffer_seq;
@@ -162,7 +180,7 @@ void ProfMemoryManager::process_ready_entry(PerfDataHeader* /*header*/, int /*th
         void* new_dev_ptr = alloc_and_register(sizeof(PhaseBuffer), &host_ptr);
         if (new_dev_ptr != nullptr) {
             // Initialize new buffer
-            PhaseBuffer* new_buf = (PhaseBuffer*)host_ptr;
+            PhaseBuffer* new_buf = reinterpret_cast<PhaseBuffer*>(host_ptr);
             new_buf->count = 0;
 
             // Push to free_queue (with overflow guard)
@@ -173,7 +191,8 @@ void ProfMemoryManager::process_ready_entry(PerfDataHeader* /*header*/, int /*th
                 LOG_ERROR("ProfMemoryManager: phase free_queue overflow for thread %u", tidx);
                 free_buffer(new_dev_ptr);
             } else {
-                state->free_queue.buffer_ptrs[tail % PLATFORM_PROF_SLOT_COUNT] = (uint64_t)new_dev_ptr;
+                state->free_queue.buffer_ptrs[tail % PLATFORM_PROF_SLOT_COUNT] =
+                    reinterpret_cast<uint64_t>(new_dev_ptr);
                 wmb();
                 state->free_queue.tail = tail + 1;
                 wmb();
@@ -183,9 +202,10 @@ void ProfMemoryManager::process_ready_entry(PerfDataHeader* /*header*/, int /*th
         }
 
         // Resolve host pointer of old buffer
-        void* old_host_ptr = resolve_host_ptr((void*)old_dev_ptr);
+        void* old_host_ptr = resolve_host_ptr(reinterpret_cast<void*>(old_dev_ptr));
         if (old_host_ptr == nullptr) {
-            LOG_ERROR("ProfMemoryManager: cannot resolve host ptr for phase buffer dev=%p", (void*)old_dev_ptr);
+            LOG_ERROR("ProfMemoryManager: cannot resolve host ptr for phase buffer dev=%p",
+                reinterpret_cast<void*>(old_dev_ptr));
             return;
         }
 
@@ -194,7 +214,7 @@ void ProfMemoryManager::process_ready_entry(PerfDataHeader* /*header*/, int /*th
         info.type = ProfBufferType::PHASE;
         info.index = tidx;
         info.slot_idx = 0;  // Not used in free queue design
-        info.dev_buffer_ptr = (void*)old_dev_ptr;
+        info.dev_buffer_ptr = reinterpret_cast<void*>(old_dev_ptr);
         info.host_buffer_ptr = old_host_ptr;
         info.buffer_seq = seq;
 
@@ -217,7 +237,7 @@ void ProfMemoryManager::process_ready_entry(PerfDataHeader* /*header*/, int /*th
         void* host_ptr = nullptr;
         void* new_dev_ptr = alloc_and_register(sizeof(PerfBuffer), &host_ptr);
         if (new_dev_ptr != nullptr) {
-            PerfBuffer* new_buf = (PerfBuffer*)host_ptr;
+            PerfBuffer* new_buf = reinterpret_cast<PerfBuffer*>(host_ptr);
             new_buf->count = 0;
 
             // Push to free_queue (with overflow guard)
@@ -228,7 +248,8 @@ void ProfMemoryManager::process_ready_entry(PerfDataHeader* /*header*/, int /*th
                 LOG_ERROR("ProfMemoryManager: perf free_queue overflow for core %u", core_index);
                 free_buffer(new_dev_ptr);
             } else {
-                state->free_queue.buffer_ptrs[tail % PLATFORM_PROF_SLOT_COUNT] = (uint64_t)new_dev_ptr;
+                state->free_queue.buffer_ptrs[tail % PLATFORM_PROF_SLOT_COUNT] =
+                    reinterpret_cast<uint64_t>(new_dev_ptr);
                 wmb();
                 state->free_queue.tail = tail + 1;
                 wmb();
@@ -237,9 +258,10 @@ void ProfMemoryManager::process_ready_entry(PerfDataHeader* /*header*/, int /*th
             LOG_ERROR("ProfMemoryManager: perf buffer alloc failed, device may lose data");
         }
 
-        void* old_host_ptr = resolve_host_ptr((void*)old_dev_ptr);
+        void* old_host_ptr = resolve_host_ptr(reinterpret_cast<void*>(old_dev_ptr));
         if (old_host_ptr == nullptr) {
-            LOG_ERROR("ProfMemoryManager: cannot resolve host ptr for perf buffer dev=%p", (void*)old_dev_ptr);
+            LOG_ERROR("ProfMemoryManager: cannot resolve host ptr for perf buffer dev=%p",
+                reinterpret_cast<void*>(old_dev_ptr));
             return;
         }
 
@@ -247,7 +269,7 @@ void ProfMemoryManager::process_ready_entry(PerfDataHeader* /*header*/, int /*th
         info.type = ProfBufferType::PERF_RECORD;
         info.index = core_index;
         info.slot_idx = 0;  // Not used in free queue design
-        info.dev_buffer_ptr = (void*)old_dev_ptr;
+        info.dev_buffer_ptr = reinterpret_cast<void*>(old_dev_ptr);
         info.host_buffer_ptr = old_host_ptr;
         info.buffer_seq = seq;
 
@@ -283,7 +305,10 @@ void ProfMemoryManager::mgmt_loop() {
             // Validate indices to prevent OOB access from corrupted shared memory
             if (head >= PLATFORM_PROF_READYQUEUE_SIZE || tail >= PLATFORM_PROF_READYQUEUE_SIZE) {
                 LOG_ERROR("mgmt_loop: invalid queue indices for thread %d: head=%u tail=%u (max=%d)",
-                          t, head, tail, PLATFORM_PROF_READYQUEUE_SIZE);
+                    t,
+                    head,
+                    tail,
+                    PLATFORM_PROF_READYQUEUE_SIZE);
                 continue;
             }
 
@@ -321,8 +346,7 @@ void ProfMemoryManager::mgmt_loop() {
         uint32_t head = hdr->queue_heads[t];
         uint32_t tail = hdr->queue_tails[t];
         if (head >= PLATFORM_PROF_READYQUEUE_SIZE || tail >= PLATFORM_PROF_READYQUEUE_SIZE) {
-            LOG_ERROR("mgmt_loop drain: invalid queue indices for thread %d: head=%u tail=%u",
-                      t, head, tail);
+            LOG_ERROR("mgmt_loop drain: invalid queue indices for thread %d: head=%u tail=%u", t, head, tail);
             continue;
         }
         while (head != tail) {
@@ -387,12 +411,12 @@ void* PerformanceCollector::alloc_single_buffer(size_t size, void** host_ptr_out
 }
 
 int PerformanceCollector::initialize(Runtime& runtime,
-                                      int num_aicore,
-                                      int device_id,
-                                      PerfAllocCallback alloc_cb,
-                                      PerfRegisterCallback register_cb,
-                                      PerfFreeCallback free_cb,
-                                      void* user_data) {
+    int num_aicore,
+    int device_id,
+    PerfAllocCallback alloc_cb,
+    PerfRegisterCallback register_cb,
+    PerfFreeCallback free_cb,
+    void* user_data) {
     if (perf_shared_mem_host_ != nullptr) {
         LOG_ERROR("PerformanceCollector already initialized");
         return -1;
@@ -421,8 +445,7 @@ int PerformanceCollector::initialize(Runtime& runtime,
     LOG_DEBUG("  Header size:          %zu bytes", sizeof(PerfDataHeader));
     LOG_DEBUG("  PerfBufferState size: %zu bytes each", sizeof(PerfBufferState));
     LOG_DEBUG("  PhaseBufferState size:%zu bytes each", sizeof(PhaseBufferState));
-    LOG_DEBUG("  Total shared memory:  %zu bytes (%zu KB)",
-              total_size, total_size / 1024);
+    LOG_DEBUG("  Total shared memory:  %zu bytes (%zu KB)", total_size, total_size / 1024);
 
     // Step 2: Allocate shared memory for slot arrays
     void* perf_dev_ptr = alloc_cb(total_size, user_data);
@@ -487,19 +510,18 @@ int PerformanceCollector::initialize(Runtime& runtime,
                 return -1;
             }
             // Initialize buffer
-            PerfBuffer* buf = (PerfBuffer*)host_buf_ptr;
+            PerfBuffer* buf = reinterpret_cast<PerfBuffer*>(host_buf_ptr);
             memset(buf, 0, sizeof(PerfBuffer));
             buf->count = 0;
 
             // Push to free_queue
-            state->free_queue.buffer_ptrs[s] = (uint64_t)dev_buf_ptr;
+            state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
         }
         wmb();
         state->free_queue.tail = PLATFORM_PROF_SLOT_COUNT;
         wmb();
     }
-    LOG_DEBUG("Initialized %d PerfBufferStates with %d buffers each",
-              num_aicore, PLATFORM_PROF_SLOT_COUNT);
+    LOG_DEBUG("Initialized %d PerfBufferStates with %d buffers each", num_aicore, PLATFORM_PROF_SLOT_COUNT);
 
     // Step 6: Initialize PhaseBufferStates and pre-fill free_queues
     for (int t = 0; t < num_phase_threads; t++) {
@@ -519,24 +541,23 @@ int PerformanceCollector::initialize(Runtime& runtime,
                 LOG_ERROR("Failed to allocate PhaseBuffer for thread %d, buffer %d", t, s);
                 return -1;
             }
-            PhaseBuffer* buf = (PhaseBuffer*)host_buf_ptr;
+            PhaseBuffer* buf = reinterpret_cast<PhaseBuffer*>(host_buf_ptr);
             memset(buf, 0, sizeof(PhaseBuffer));
             buf->count = 0;
 
             // Push to free_queue
-            state->free_queue.buffer_ptrs[s] = (uint64_t)dev_buf_ptr;
+            state->free_queue.buffer_ptrs[s] = reinterpret_cast<uint64_t>(dev_buf_ptr);
         }
         wmb();
         state->free_queue.tail = PLATFORM_PROF_SLOT_COUNT;
         wmb();
     }
-    LOG_DEBUG("Initialized %d PhaseBufferStates with %d buffers each",
-              num_phase_threads, PLATFORM_PROF_SLOT_COUNT);
+    LOG_DEBUG("Initialized %d PhaseBufferStates with %d buffers each", num_phase_threads, PLATFORM_PROF_SLOT_COUNT);
 
     wmb();
 
     // Step 7: Pass base address to Runtime
-    runtime.perf_data_base = (uint64_t)perf_dev_ptr;
+    runtime.perf_data_base = reinterpret_cast<uint64_t>(perf_dev_ptr);
     LOG_DEBUG("Set runtime.perf_data_base = 0x%lx", runtime.perf_data_base);
 
     perf_shared_mem_dev_ = perf_dev_ptr;
@@ -551,10 +572,14 @@ void PerformanceCollector::start_memory_manager() {
         return;
     }
 
-    memory_manager_.start(perf_shared_mem_host_, num_aicore_,
-                           PLATFORM_MAX_AICPU_THREADS,
-                           alloc_cb_, register_cb_, free_cb_,
-                           user_data_, device_id_);
+    memory_manager_.start(perf_shared_mem_host_,
+        num_aicore_,
+        PLATFORM_MAX_AICPU_THREADS,
+        alloc_cb_,
+        register_cb_,
+        free_cb_,
+        user_data_,
+        device_id_);
 }
 
 void PerformanceCollector::stop_memory_manager() {
@@ -592,7 +617,7 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
             auto elapsed = std::chrono::steady_clock::now() - idle_start.value();
             if (elapsed >= timeout_duration) {
                 LOG_ERROR("Timeout waiting for AICPU task count after %ld seconds",
-                         std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+                    std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
                 return;
             }
 
@@ -645,7 +670,7 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
             idle_start.reset();
 
             if (info.type == ProfBufferType::PERF_RECORD) {
-                PerfBuffer* buf = (PerfBuffer*)info.host_buffer_ptr;
+                PerfBuffer* buf = reinterpret_cast<PerfBuffer*>(info.host_buffer_ptr);
                 rmb();
                 uint32_t count = buf->count;
                 if (count > PLATFORM_PROF_BUFFER_SIZE) {
@@ -661,10 +686,13 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
                 }
 
                 LOG_DEBUG("Collected %u perf records from core %u (total: %d/%d)",
-                         count, core_index, total_records_collected, expected_tasks);
+                    count,
+                    core_index,
+                    total_records_collected,
+                    expected_tasks);
 
             } else {
-                PhaseBuffer* buf = (PhaseBuffer*)info.host_buffer_ptr;
+                PhaseBuffer* buf = reinterpret_cast<PhaseBuffer*>(info.host_buffer_ptr);
                 rmb();
                 uint32_t count = buf->count;
                 if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
@@ -691,9 +719,8 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
             auto elapsed = std::chrono::steady_clock::now() - idle_start.value();
             if (elapsed >= timeout_duration) {
                 LOG_ERROR("Performance data collection idle timeout after %ld seconds",
-                         std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
-                LOG_ERROR("Collected %d / %d records before timeout",
-                         total_records_collected, expected_tasks);
+                    std::chrono::duration_cast<std::chrono::seconds>(elapsed).count());
+                LOG_ERROR("Collected %d / %d records before timeout", total_records_collected, expected_tasks);
                 break;
             }
         }
@@ -703,8 +730,7 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
     LOG_INFO("Total records collected: %d", total_records_collected);
 
     if (total_records_collected < expected_tasks) {
-        LOG_WARN("Incomplete collection (%d / %d records)",
-                 total_records_collected, expected_tasks);
+        LOG_WARN("Incomplete collection (%d / %d records)", total_records_collected, expected_tasks);
     }
 
     LOG_INFO("Performance data collection complete");
@@ -732,7 +758,7 @@ void PerformanceCollector::drain_remaining_buffers() {
     ReadyBufferInfo info;
     while (memory_manager_.try_pop_ready(info)) {
         if (info.type == ProfBufferType::PERF_RECORD) {
-            PerfBuffer* buf = (PerfBuffer*)info.host_buffer_ptr;
+            PerfBuffer* buf = reinterpret_cast<PerfBuffer*>(info.host_buffer_ptr);
             rmb();
             uint32_t count = buf->count;
             if (count > PLATFORM_PROF_BUFFER_SIZE) {
@@ -746,7 +772,7 @@ void PerformanceCollector::drain_remaining_buffers() {
                 drained_perf += count;
             }
         } else {
-            PhaseBuffer* buf = (PhaseBuffer*)info.host_buffer_ptr;
+            PhaseBuffer* buf = reinterpret_cast<PhaseBuffer*>(info.host_buffer_ptr);
             rmb();
             uint32_t count = buf->count;
             if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
@@ -763,8 +789,7 @@ void PerformanceCollector::drain_remaining_buffers() {
     }
 
     if (drained_perf > 0 || drained_phase > 0) {
-        LOG_INFO("Drained remaining buffers: %d perf records, %d phase records",
-                 drained_perf, drained_phase);
+        LOG_INFO("Drained remaining buffers: %d perf records, %d phase records", drained_perf, drained_phase);
     }
 
     if (drained_phase > 0) {
@@ -783,15 +808,15 @@ void PerformanceCollector::collect_phase_data() {
 
     // Validate magic
     if (phase_header->magic != AICPU_PHASE_MAGIC) {
-        LOG_INFO("No phase profiling data found (magic mismatch: 0x%x vs 0x%x)",
-                 phase_header->magic, AICPU_PHASE_MAGIC);
+        LOG_INFO(
+            "No phase profiling data found (magic mismatch: 0x%x vs 0x%x)", phase_header->magic, AICPU_PHASE_MAGIC);
         return;
     }
 
     int num_sched_threads = phase_header->num_sched_threads;
     if (num_sched_threads > PLATFORM_MAX_AICPU_THREADS) {
-        LOG_ERROR("Invalid num_sched_threads %d from shared memory (max=%d)",
-                  num_sched_threads, PLATFORM_MAX_AICPU_THREADS);
+        LOG_ERROR(
+            "Invalid num_sched_threads %d from shared memory (max=%d)", num_sched_threads, PLATFORM_MAX_AICPU_THREADS);
         return;
     }
     LOG_INFO("Collecting remaining phase data: %d scheduler threads", num_sched_threads);
@@ -809,13 +834,14 @@ void PerformanceCollector::collect_phase_data() {
         rmb();
         uint64_t buf_ptr = state->current_buf_ptr;
         if (buf_ptr != 0) {
-            void* host_ptr = memory_manager_.resolve_host_ptr((void*)buf_ptr);
+            void* host_ptr = memory_manager_.resolve_host_ptr(reinterpret_cast<void*>(buf_ptr));
             if (host_ptr == nullptr) {
                 LOG_ERROR("collect_phase_data: no host mapping for dev_ptr=%p (thread %d)",
-                          (void*)buf_ptr, t);
+                    reinterpret_cast<void*>(buf_ptr),
+                    t);
                 continue;
             }
-            PhaseBuffer* pbuf = (PhaseBuffer*)host_ptr;
+            PhaseBuffer* pbuf = reinterpret_cast<PhaseBuffer*>(host_ptr);
             if (pbuf->count > 0) {
                 uint32_t count = pbuf->count;
                 if (count > static_cast<uint32_t>(PLATFORM_PHASE_RECORDS_PER_THREAD)) {
@@ -835,11 +861,16 @@ void PerformanceCollector::collect_phase_data() {
         if (!collected_phase_records_[t].empty()) {
             size_t sched_count = 0, orch_count = 0;
             for (const auto& r : collected_phase_records_[t]) {
-                if (is_scheduler_phase(r.phase_id)) sched_count++;
-                else orch_count++;
+                if (is_scheduler_phase(r.phase_id))
+                    sched_count++;
+                else
+                    orch_count++;
             }
             LOG_INFO("  Thread %zu: %zu records (sched=%zu, orch=%zu)",
-                     t, collected_phase_records_[t].size(), sched_count, orch_count);
+                t,
+                collected_phase_records_[t].size(),
+                sched_count,
+                orch_count);
         }
     }
 
@@ -848,9 +879,9 @@ void PerformanceCollector::collect_phase_data() {
     bool orch_valid = (collected_orch_summary_.magic == AICPU_PHASE_MAGIC);
 
     if (orch_valid) {
-        LOG_INFO("  Orchestrator: %lld tasks, %.3fus",
-                 (long long)collected_orch_summary_.submit_count,
-                 cycles_to_us(collected_orch_summary_.end_time - collected_orch_summary_.start_time));
+        LOG_INFO("  Orchestrator: %" PRId64 " tasks, %.3fus",
+            static_cast<int64_t>(collected_orch_summary_.submit_count),
+            cycles_to_us(collected_orch_summary_.end_time - collected_orch_summary_.start_time));
     } else {
         LOG_INFO("  Orchestrator: no summary data");
     }
@@ -859,7 +890,10 @@ void PerformanceCollector::collect_phase_data() {
     bool has_accumulated = has_phase_data_;
     if (!has_accumulated) {
         for (const auto& v : collected_phase_records_) {
-            if (!v.empty()) { has_accumulated = true; break; }
+            if (!v.empty()) {
+                has_accumulated = true;
+                break;
+            }
         }
     }
     has_phase_data_ = (total_phase_records > 0 || orch_valid || has_accumulated);
@@ -867,13 +901,13 @@ void PerformanceCollector::collect_phase_data() {
     // Read core-to-thread mapping
     int num_cores = static_cast<int>(phase_header->num_cores);
     if (num_cores > 0 && num_cores <= PLATFORM_MAX_CORES) {
-        core_to_thread_.assign(phase_header->core_to_thread,
-                                phase_header->core_to_thread + num_cores);
+        core_to_thread_.assign(phase_header->core_to_thread, phase_header->core_to_thread + num_cores);
         LOG_INFO("  Core-to-thread mapping: %d cores", num_cores);
     }
 
     LOG_INFO("Phase data collection complete: %d remaining records, orch_summary=%s",
-             total_phase_records, orch_valid ? "yes" : "no");
+        total_phase_records,
+        orch_valid ? "yes" : "no");
 }
 
 int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
@@ -917,10 +951,9 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     }
 
     // Sort by canonical task_id (64-bit PTO2 raw)
-    std::sort(tagged_records.begin(), tagged_records.end(),
-              [](const TaggedRecord& a, const TaggedRecord& b) {
-                  return a.record->task_id < b.record->task_id;
-              });
+    std::sort(tagged_records.begin(), tagged_records.end(), [](const TaggedRecord& a, const TaggedRecord& b) {
+        return a.record->task_id < b.record->task_id;
+    });
 
     // Step 4: Calculate base time (minimum timestamp across all records)
     uint64_t base_time_cycles = UINT64_MAX;
@@ -942,8 +975,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                 }
             }
         }
-        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC &&
-            collected_orch_summary_.start_time > 0 &&
+        if (collected_orch_summary_.magic == AICPU_PHASE_MAGIC && collected_orch_summary_.start_time > 0 &&
             collected_orch_summary_.start_time < base_time_cycles) {
             base_time_cycles = collected_orch_summary_.start_time;
         }
@@ -954,8 +986,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     std::tm* timeinfo = std::localtime(&now);
     char time_buffer[32];
     std::strftime(time_buffer, sizeof(time_buffer), "%Y%m%d_%H%M%S", timeinfo);
-    std::string filepath = output_path + "/perf_swimlane_"
-                          + std::string(time_buffer) + ".json";
+    std::string filepath = output_path + "/perf_swimlane_" + std::string(time_buffer) + ".json";
 
     // Step 6: Open JSON file for writing
     std::ofstream outfile(filepath);
@@ -995,8 +1026,8 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
         outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
         outfile << "      \"fanout\": [";
-        int safe_fanout_count = (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT)
-                                ? record.fanout_count : 0;
+        int safe_fanout_count =
+            (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT) ? record.fanout_count : 0;
         for (int j = 0; j < safe_fanout_count; ++j) {
             outfile << record.fanout[j];
             if (j < safe_fanout_count - 1) {
@@ -1017,26 +1048,41 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     if (has_phase_data_) {
         auto sched_phase_name = [](AicpuPhaseId id) -> const char* {
             switch (id) {
-                case AicpuPhaseId::SCHED_COMPLETE:    return "complete";
-                case AicpuPhaseId::SCHED_DISPATCH:    return "dispatch";
-                case AicpuPhaseId::SCHED_SCAN:        return "scan";
-                case AicpuPhaseId::SCHED_IDLE_WAIT:   return "idle";
-                default: return "unknown";
+                case AicpuPhaseId::SCHED_COMPLETE:
+                    return "complete";
+                case AicpuPhaseId::SCHED_DISPATCH:
+                    return "dispatch";
+                case AicpuPhaseId::SCHED_SCAN:
+                    return "scan";
+                case AicpuPhaseId::SCHED_IDLE_WAIT:
+                    return "idle";
+                default:
+                    return "unknown";
             }
         };
 
         auto orch_phase_name = [](AicpuPhaseId id) -> const char* {
             switch (id) {
-                case AicpuPhaseId::ORCH_SYNC:      return "orch_sync";
-                case AicpuPhaseId::ORCH_ALLOC:     return "orch_alloc";
-                case AicpuPhaseId::ORCH_PARAMS:    return "orch_params";
-                case AicpuPhaseId::ORCH_LOOKUP:    return "orch_lookup";
-                case AicpuPhaseId::ORCH_HEAP:      return "orch_heap";
-                case AicpuPhaseId::ORCH_INSERT:    return "orch_insert";
-                case AicpuPhaseId::ORCH_FANIN:     return "orch_fanin";
-                case AicpuPhaseId::ORCH_FINALIZE:  return "orch_finalize";
-                case AicpuPhaseId::ORCH_SCOPE_END: return "orch_scope_end";
-                default: return "unknown";
+                case AicpuPhaseId::ORCH_SYNC:
+                    return "orch_sync";
+                case AicpuPhaseId::ORCH_ALLOC:
+                    return "orch_alloc";
+                case AicpuPhaseId::ORCH_PARAMS:
+                    return "orch_params";
+                case AicpuPhaseId::ORCH_LOOKUP:
+                    return "orch_lookup";
+                case AicpuPhaseId::ORCH_HEAP:
+                    return "orch_heap";
+                case AicpuPhaseId::ORCH_INSERT:
+                    return "orch_insert";
+                case AicpuPhaseId::ORCH_FANIN:
+                    return "orch_fanin";
+                case AicpuPhaseId::ORCH_FINALIZE:
+                    return "orch_finalize";
+                case AicpuPhaseId::ORCH_SCOPE_END:
+                    return "orch_scope_end";
+                default:
+                    return "unknown";
             }
         };
 
@@ -1051,10 +1097,9 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                 double end_us = cycles_to_us(pr.end_time - base_time_cycles);
                 if (!first) outfile << ",\n";
                 outfile << "      {\"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
-                        << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
-                        << ", \"phase\": \"" << sched_phase_name(pr.phase_id) << "\""
-                        << ", \"loop_iter\": " << pr.loop_iter
-                        << ", \"tasks_processed\": " << pr.tasks_processed
+                        << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ", \"phase\": \""
+                        << sched_phase_name(pr.phase_id) << "\""
+                        << ", \"loop_iter\": " << pr.loop_iter << ", \"tasks_processed\": " << pr.tasks_processed
                         << "}";
                 first = false;
             }
@@ -1075,14 +1120,22 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
             outfile << "    \"end_time_us\": " << std::fixed << std::setprecision(3) << orch_end_us << ",\n";
             outfile << "    \"submit_count\": " << collected_orch_summary_.submit_count << ",\n";
             outfile << "    \"phase_us\": {\n";
-            outfile << "      \"sync\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.sync_cycle) << ",\n";
-            outfile << "      \"alloc\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.alloc_cycle) << ",\n";
-            outfile << "      \"params\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.params_cycle) << ",\n";
-            outfile << "      \"lookup\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.lookup_cycle) << ",\n";
-            outfile << "      \"heap\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.heap_cycle) << ",\n";
-            outfile << "      \"insert\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.insert_cycle) << ",\n";
-            outfile << "      \"fanin\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.fanin_cycle) << ",\n";
-            outfile << "      \"scope_end\": " << std::fixed << std::setprecision(3) << cycles_to_us(collected_orch_summary_.scope_end_cycle) << "\n";
+            outfile << "      \"sync\": " << std::fixed << std::setprecision(3)
+                    << cycles_to_us(collected_orch_summary_.sync_cycle) << ",\n";
+            outfile << "      \"alloc\": " << std::fixed << std::setprecision(3)
+                    << cycles_to_us(collected_orch_summary_.alloc_cycle) << ",\n";
+            outfile << "      \"params\": " << std::fixed << std::setprecision(3)
+                    << cycles_to_us(collected_orch_summary_.args_cycle) << ",\n";
+            outfile << "      \"lookup\": " << std::fixed << std::setprecision(3)
+                    << cycles_to_us(collected_orch_summary_.lookup_cycle) << ",\n";
+            outfile << "      \"heap\": " << std::fixed << std::setprecision(3)
+                    << cycles_to_us(collected_orch_summary_.heap_cycle) << ",\n";
+            outfile << "      \"insert\": " << std::fixed << std::setprecision(3)
+                    << cycles_to_us(collected_orch_summary_.insert_cycle) << ",\n";
+            outfile << "      \"fanin\": " << std::fixed << std::setprecision(3)
+                    << cycles_to_us(collected_orch_summary_.fanin_cycle) << ",\n";
+            outfile << "      \"scope_end\": " << std::fixed << std::setprecision(3)
+                    << cycles_to_us(collected_orch_summary_.scope_end_cycle) << "\n";
             outfile << "    }\n";
             outfile << "  }";
         }
@@ -1091,7 +1144,10 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
         bool has_orch_phases = false;
         for (const auto& v : collected_phase_records_) {
             for (const auto& r : v) {
-                if (!is_scheduler_phase(r.phase_id)) { has_orch_phases = true; break; }
+                if (!is_scheduler_phase(r.phase_id)) {
+                    has_orch_phases = true;
+                    break;
+                }
             }
             if (has_orch_phases) break;
         }
@@ -1108,9 +1164,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
                     outfile << "      {\"phase\": \"" << orch_phase_name(pr.phase_id) << "\""
                             << ", \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us
                             << ", \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us
-                            << ", \"submit_idx\": " << pr.loop_iter
-                            << ", \"task_id\": " << pr.task_id
-                            << "}";
+                            << ", \"submit_idx\": " << pr.loop_iter << ", \"task_id\": " << pr.task_id << "}";
                     first = false;
                 }
                 if (!first) outfile << "\n";
@@ -1145,9 +1199,7 @@ int PerformanceCollector::export_swimlane_json(const std::string& output_path) {
     return 0;
 }
 
-int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
-                                    PerfFreeCallback free_cb,
-                                    void* user_data) {
+int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFreeCallback free_cb, void* user_data) {
     if (perf_shared_mem_host_ == nullptr) {
         return 0;
     }
@@ -1166,7 +1218,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
 
         // Free current buffer if any
         if (state->current_buf_ptr != 0 && free_cb != nullptr) {
-            free_cb((void*)state->current_buf_ptr, user_data);
+            free_cb(reinterpret_cast<void*>(state->current_buf_ptr), user_data);
         }
 
         // Free all buffers in free_queue (limit iterations to max capacity)
@@ -1177,13 +1229,12 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
         while (head != tail && max_iters-- > 0) {
             uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
             if (buf_ptr != 0 && free_cb != nullptr) {
-                free_cb((void*)buf_ptr, user_data);
+                free_cb(reinterpret_cast<void*>(buf_ptr), user_data);
             }
             head++;
         }
         if (head != tail) {
-            LOG_WARN("finalize: perf free_queue not fully drained for core %d (head=%u tail=%u)",
-                     i, head, tail);
+            LOG_WARN("finalize: perf free_queue not fully drained for core %d (head=%u tail=%u)", i, head, tail);
         }
     }
 
@@ -1193,7 +1244,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
 
         // Free current buffer if any
         if (state->current_buf_ptr != 0 && free_cb != nullptr) {
-            free_cb((void*)state->current_buf_ptr, user_data);
+            free_cb(reinterpret_cast<void*>(state->current_buf_ptr), user_data);
         }
 
         // Free all buffers in free_queue (limit iterations to max capacity)
@@ -1204,13 +1255,12 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb,
         while (head != tail && max_iters-- > 0) {
             uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
             if (buf_ptr != 0 && free_cb != nullptr) {
-                free_cb((void*)buf_ptr, user_data);
+                free_cb(reinterpret_cast<void*>(buf_ptr), user_data);
             }
             head++;
         }
         if (head != tail) {
-            LOG_WARN("finalize: phase free_queue not fully drained for thread %d (head=%u tail=%u)",
-                     t, head, tail);
+            LOG_WARN("finalize: phase free_queue not fully drained for thread %d (head=%u tail=%u)", t, head, tail);
         }
     }
 

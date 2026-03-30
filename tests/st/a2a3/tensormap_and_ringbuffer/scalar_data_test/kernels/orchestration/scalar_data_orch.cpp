@@ -103,9 +103,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     // =========================================================
     uint32_t scalar_shapes[1] = {1};
     TensorCreateInfo scalar_ci(scalar_shapes, 1, DataType::FLOAT32);
+    scalar_ci.set_initial_value(77.0f);
 
     Arg params_scalar;
-    params_scalar.add_output(scalar_ci, 77.0f);
+    params_scalar.add_output(scalar_ci);
     TaskOutputTensors scalar_outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params_scalar);
     const Tensor& scalar_tensor = scalar_outs.get_ref(0);
 

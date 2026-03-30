@@ -391,19 +391,21 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param materialized_outputs  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const Arg& args, const TaskOutputTensors& materialized_outputs) {
+    void init(
+        const Arg& args, TaskOutputTensors& result, void* base_addr, uint64_t offsets[], uint64_t buffer_sizes[]) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
-        int32_t out_idx = 0;
+        // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
-            const Tensor* src;
-            if (args.tag(i) == TensorArgType::OUTPUT) {
-                src = materialized_outputs.output_ptr(out_idx++);
+            if (args.tag(i) != TensorArgType::OUTPUT) {
+                tensors[i].copy(*args.tensor(i).ptr);
             } else {
-                src = args.tensor(i).ptr;
+                tensors[i].init_from_create_info(*args.tensor(i).create_info,
+                    reinterpret_cast<void*>(reinterpret_cast<char*>(base_addr) + offsets[i]),
+                    buffer_sizes[i]);
+                result.materialize_output(tensors[i]);
             }
-            tensors[i].copy(*src);
             tensors[i].update_start_offset();
             dispatch_args[i] = reinterpret_cast<uint64_t>(&tensors[i]);
         }

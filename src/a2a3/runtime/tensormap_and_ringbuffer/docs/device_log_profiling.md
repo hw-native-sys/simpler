@@ -4,7 +4,7 @@
 
 AICPU logs (via `DEV_ALWAYS`) are written by CANN's **dlog** subsystem and do **not** appear in the `run_example.py` terminal output. They are written to CANN's device log directory:
 
-```
+```text
 $HOME/ascend/log/debug/device-<device_id>/device-<pid>_<timestamp>.log
 ```
 
@@ -19,7 +19,7 @@ ls -lt $HOME/ascend/log/debug/device-<device_id>/ | head -5
 A single run produces two profiling blocks in the device log:
 
 | Block | Emitted by | Function | Content |
-|-------|-----------|----------|---------|
+| ----- | ---------- | -------- | ------- |
 | **Orchestrator Profiling** | Thread 3 (orchestrator) | `aicpu_orchestration_entry` | Time breakdown of graph construction on device |
 | **PTO2 Scheduler Summary** | Threads 0/1/2 (schedulers) | `resolve_and_dispatch_pto2` | Per-thread scheduling statistics, phase timing, and lock contention |
 
@@ -33,7 +33,7 @@ Thread 3 loads the orchestration `.so` via `dlopen`, calls `aicpu_orchestration_
 
 ### Example (from a real run: batch=64, 16704 tasks)
 
-```
+```text
 Thread 3: Calling aicpu_orchestration_entry from SO
 aicpu_orchestration_entry ">>>>>> batch = 64"
 Thread 3: aicpu_orchestration_entry returned, cost 20943.940us
@@ -54,12 +54,12 @@ Thread 3: PTO2 total submitted tasks = 16704
 ### Field Reference
 
 | Field | Source (`pto_orchestrator.cpp`) | Description |
-|-------|-------------------------------|-------------|
+| ----- | ------------------------------- | ----------- |
 | **cost** | Wall-clock around `orch_func()` call | Total time including orchestration logic + scope overhead |
 | **total** | Sum of all sub-steps below | Accumulated time inside `pto2_submit_task` across all tasks |
 | **sync_tensormap** | `g_orch_sync_cycle` | TensorMap validity sync and optional cleanup before each submission |
 | **task_ring_alloc** | `g_orch_alloc_cycle` | Allocating a task slot from the task ring buffer |
-| **param_copy** | `g_orch_params_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
+| **param_copy** | `g_orch_args_cycle` | Copying param descriptors + tensor descriptor copies into task-owned storage |
 | **lookup+dep** | `g_orch_lookup_cycle` | TensorMap lookup for inputs/inouts + building fanin/fanout dependency edges |
 | **heap_alloc** | `g_orch_heap_cycle` | Allocating packed output buffers from the heap ring |
 | **tensormap_ins** | `g_orch_insert_cycle` | Inserting output/inout tensors into the TensorMap |
@@ -82,7 +82,7 @@ Each of the 3 scheduler threads (Thread 0, 1, 2) prints its own summary after co
 
 ### Example (Thread 0, from a different run: batch=1, 1044 tasks)
 
-```
+```text
 Thread 0: completed=352 tasks in 3477.420us (147 loops, 2.4 tasks/loop)
 Thread 0: --- Phase Breakdown ---
 Thread 0:   complete:    1485.020us (42.7%)  [fanout: edges=432, max_degree=2, avg=1.2]  [fanin: edges=320, max_degree=3, avg=0.9]
@@ -93,12 +93,12 @@ Thread 0:   idle:        4.940us (0.1%)
 
 ### Summary Line
 
-```
+```text
 Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
 ```
 
 | Field | Description |
-|-------|-------------|
+| ----- | ----------- |
 | **completed** | Number of tasks this thread processed to completion |
 | **Y us** | Total scheduler loop time (sum of all phase cycles) |
 | **Z loops** | Number of scheduler loop iterations |
@@ -109,7 +109,7 @@ Thread N: completed=X tasks in Yus (Z loops, W tasks/loop)
 The scheduler loop runs four phases each iteration. Each phase's time is accumulated across all loop iterations.
 
 | Phase | What it does | Inline stats |
-|-------|-------------|-------------|
+| ----- | ------------ | ------------ |
 | **complete** | Polls handshake on each managed core; when a core completes, calls `on_subtask_complete(task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, triggers `on_mixed_task_complete` which traverses fanout list (notify consumers) and fanin list (release producers) | `fanout`: edges/max_degree/avg for consumer notification; `fanin`: edges/max_degree/avg for producer release |
 | **scan** | Updates the perf profiling header with latest scheduler state | — |
 | **dispatch** | For each idle core, pops a task from the shape-based ready queue via `get_ready_task(shape)`, builds the dispatch payload, and writes the task to the core's handshake register | `pop`: `hit` = successful pops (task dispatched), `miss` = empty queue pops, `hit_rate` = hit/(hit+miss) |
@@ -132,7 +132,7 @@ The scheduler loop runs four phases each iteration. Each phase's time is accumul
 Divide each thread's phase times by its `completed` count to get per-task scheduling cost:
 
 | Metric | Formula | Typical value |
-|--------|---------|---------------|
+| ------ | ------- | ------------- |
 | Scheduling overhead per task | total_time / completed | ~5-10 us/task |
 | Dispatch per task | dispatch_time / completed | ~3-6 us/task |
 | Complete per task | complete_time / completed | ~2-4 us/task |
@@ -144,7 +144,7 @@ Divide each thread's phase times by its `completed` count to get per-task schedu
 When `--enable-profiling` is used, the host terminal prints a **Task Statistics by Function** table with `Total_Exec` (total AICore kernel execution time). Combined with device log data:
 
 | Metric | Source | Description |
-|--------|--------|-------------|
+| ------ | ------ | ----------- |
 | Avg kernel exec time | `Total_Exec / total_tasks` (host) | Time AICore spends executing each kernel |
 | Avg scheduling overhead | `sum(thread_total) / total_tasks` (device log) | Time AICPU spends scheduling each task |
 | Sched/Exec ratio | scheduling / execution | Scheduling overhead relative to kernel execution |

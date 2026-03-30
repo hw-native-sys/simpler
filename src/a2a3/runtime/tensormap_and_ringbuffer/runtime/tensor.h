@@ -55,28 +55,36 @@ struct Segment {
  * dtype, ndims, raw_shapes (== shapes), manual_dep, and an optional
  * initial value fill.
  *
- * Arg::add_output() copies this value into Arg immediately, so the
- * original stack object does not need to outlive the add_output() call.
+ * Layout (64B) is aligned with Tensor cacheline 1 so that
+ * init_from_create_info() can copy the entire cacheline with a single memcpy,
+ * then overwrite buffer.addr and buffer.size separately.
+ *
+ * Arg::add_output() stores a pointer to this object, so the original
+ * must remain valid (not a temporary) until after the submit call.
  */
-struct TensorCreateInfo {
-    DataType dtype;
-    uint32_t ndims;
-    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];
-    bool manual_dep;
-    bool has_initial_value;
-    uint64_t initial_value;
-
+class TensorCreateInfo {
+public:  // NOLINT(whitespace/indent)
     TensorCreateInfo(
         const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false)
-        : dtype(dtype), ndims(ndims), manual_dep(manual_dep), has_initial_value(false), initial_value(0) {
+        : initial_value(0),
+          has_initial_value(false),
+          version(0),
+          dtype(dtype),
+          ndims(ndims),
+          is_all_offset_zero(true),
+          is_raw_eq_shapes(true),
+          manual_dep(manual_dep) {
         for (uint32_t i = 0; i < ndims; i++) {
             raw_shapes[i] = shapes[i];
         }
     }
 
-    void set_initial_value(uint64_t value) {
+    void copy(const TensorCreateInfo& other) { memcpy(this, &other, sizeof(other)); }
+
+    template <typename T = uint64_t>
+    void set_initial_value(T value) {
         has_initial_value = true;
-        initial_value = value;
+        initial_value = to_u64(value);
     }
 
     uint64_t buffer_size_bytes() const {
@@ -86,7 +94,33 @@ struct TensorCreateInfo {
         }
         return total * get_element_size(dtype);
     }
+
+public:  // NOLINT(whitespace/indent)
+    // --- Bytes [0, 24): TensorCreateInfo-only fields ---
+    // These occupy the same positions as Tensor::buffer and Tensor::start_offset,
+    // which are overwritten after the memcpy in init_from_create_info().
+    uint64_t initial_value;
+    bool has_initial_value;
+    uint8_t __pad1__[7];
+    uint64_t __pad2__;  // → Tensor::start_offset (zeroed)
+
+    // --- Bytes [24, 64): Matches Tensor cacheline 1 layout ---
+    int32_t version;  // Always 0 for create-info outputs
+    DataType dtype;
+    uint32_t ndims;
+    bool is_all_offset_zero;  // Always true for create-info outputs
+    bool is_raw_eq_shapes;    // Always true for create-info outputs
+    bool manual_dep;
+    uint8_t __pad3__;
+    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // → Tensor::shapes
+    uint32_t __pad4__;
+
+    TensorCreateInfo() = default;
+
+    friend struct Arg;
 };
+
+static_assert(sizeof(TensorCreateInfo) == 64);
 
 /**
  * Tensor descriptor for Task input/output (128B = 2 cache lines)
@@ -184,12 +218,12 @@ struct alignas(64) Tensor {
     void init(const Tensor& other) {
         memcpy(this, &other, 64);  // fast copy cache line 1
         if (!other.is_raw_eq_shapes) {
-            for (uint32_t i = 0; i < ndims; i++) {
+            for (uint32_t i = 0; i < other.ndims; i++) {
                 raw_shapes[i] = other.raw_shapes[i];
             }
         }
         if (!other.is_all_offset_zero) {
-            for (uint32_t i = 0; i < ndims; i++) {
+            for (uint32_t i = 0; i < other.ndims; i++) {
                 offsets[i] = other.offsets[i];
             }
         }
@@ -248,18 +282,30 @@ struct alignas(64) Tensor {
     }
 
     /// Materialize a TensorCreateInfo into this Tensor (fresh contiguous output).
-    void init_from_create_info(const TensorCreateInfo& ci, void* addr, int32_t version_val) {
-        init(addr,
-            ci.buffer_size_bytes(),
-            ci.raw_shapes,
-            ci.raw_shapes,
-            nullptr,
-            ci.ndims,
-            ci.dtype,
-            version_val,
-            /*is_all_offset_zero=*/true,
-            /*is_raw_eq_shapes=*/true,
-            ci.manual_dep);
+    /// Single 64B memcpy covers the entire cacheline 1, then buffer is overwritten.
+    void init_from_create_info(const TensorCreateInfo& ci, void* addr, uint64_t buffer_size) {
+        memcpy(this, &ci, 64);
+        buffer = {reinterpret_cast<uint64_t>(addr), buffer_size};
+        if (ci.has_initial_value) {
+            fill_initial_value(ci.initial_value);
+        }
+    }
+
+    void fill_initial_value(uint64_t initial_value) {
+        always_assert(reinterpret_cast<char*>(buffer.addr) != nullptr);
+        uint64_t elem_size = get_element_size(dtype);
+        char* dst = reinterpret_cast<char*>(buffer.addr);
+        constexpr uint64_t BLK = 64;
+        uint64_t blk = (buffer.size < BLK) ? buffer.size : BLK;
+        for (uint64_t b = 0; b < blk; b += elem_size) {
+            memcpy(dst + b, &initial_value, elem_size);
+        }
+        uint64_t filled = blk;
+        while (filled < buffer.size) {
+            uint64_t copy_size = ((buffer.size - filled) < filled) ? (buffer.size - filled) : filled;
+            memcpy(dst + filled, dst, copy_size);
+            filled += copy_size;
+        }
     }
 
     // --- Operations ---
@@ -429,3 +475,13 @@ private:
 
 static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 bytes)");
 static_assert(offsetof(Tensor, raw_shapes) == 64);
+
+// TensorCreateInfo layout must match Tensor cacheline 1 for memcpy optimization
+static_assert(sizeof(TensorCreateInfo) == 64, "TensorCreateInfo must match Tensor cacheline 1 size (64 bytes)");
+static_assert(offsetof(TensorCreateInfo, version) == offsetof(Tensor, version));
+static_assert(offsetof(TensorCreateInfo, dtype) == offsetof(Tensor, dtype));
+static_assert(offsetof(TensorCreateInfo, ndims) == offsetof(Tensor, ndims));
+static_assert(offsetof(TensorCreateInfo, is_all_offset_zero) == offsetof(Tensor, is_all_offset_zero));
+static_assert(offsetof(TensorCreateInfo, is_raw_eq_shapes) == offsetof(Tensor, is_raw_eq_shapes));
+static_assert(offsetof(TensorCreateInfo, manual_dep) == offsetof(Tensor, manual_dep));
+static_assert(offsetof(TensorCreateInfo, raw_shapes) == offsetof(Tensor, shapes));

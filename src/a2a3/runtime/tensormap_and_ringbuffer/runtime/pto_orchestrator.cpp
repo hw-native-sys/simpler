@@ -58,7 +58,7 @@ __attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
-static uint64_t g_orch_params_cycle = 0;     // param copy
+static uint64_t g_orch_args_cycle = 0;       // param copy
 static uint64_t g_orch_lookup_cycle = 0;     // tensormap lookup + dep building
 static uint64_t g_orch_insert_cycle = 0;     // tensormap insert
 static uint64_t g_orch_fanin_cycle = 0;      // fanin list + early-return check
@@ -68,7 +68,7 @@ static uint32_t g_orch_submit_idx = 0;
 uint64_t g_orch_alloc_wait_cycle = 0;
 uint64_t g_orch_fanin_wait_cycle = 0;
 uint64_t g_orch_alloc_atomic_count = 0;
-uint64_t g_orch_params_atomic_count = 0;
+uint64_t g_orch_args_atomic_count = 0;
 uint64_t g_orch_fanin_atomic_count = 0;
 uint64_t g_orch_finalize_atomic_count = 0;
 uint64_t g_orch_scope_end_atomic_count = 0;
@@ -354,13 +354,14 @@ TaskOutputTensors pto2_submit_mixed_task(
     }
 
     // === Calculate output size (from runtime-created OUTPUT args) ===
-    bool needs_alloc[MAX_TENSOR_ARGS] = {};
+    uint64_t offsets[MAX_TENSOR_ARGS] = {};
+    uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
     int32_t total_output_size = 0;
     for (int i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) == TensorArgType::OUTPUT) {
-            needs_alloc[i] = true;
-            total_output_size +=
-                PTO2_ALIGN_UP(args.tensor(i).create_info.buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
+            offsets[i] = total_output_size;
+            buffer_sizes[i] = PTO2_ALIGN_UP(args.tensor(i).create_info->buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
+            total_output_size += buffer_sizes[i];
         }
     }
 
@@ -440,7 +441,6 @@ TaskOutputTensors pto2_submit_mixed_task(
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
     // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
-    int32_t offset = 0;
     for (int i = 0; i < args.tensor_count(); i++) {
         TensorArgType ptype = args.tag(i);
 
@@ -482,16 +482,8 @@ TaskOutputTensors pto2_submit_mixed_task(
                 }
                 break;
             }
-
-            case TensorArgType::OUTPUT: {
-                const TensorCreateInfo& ci = args.tensor(i).create_info;
-                uint64_t buffer_size = ci.buffer_size_bytes();
-                uint64_t alloc_addr =
-                    reinterpret_cast<uint64_t>(reinterpret_cast<char*>(alloc_result.packed_base) + offset);
-                offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
-                result.materialize_output(ci, reinterpret_cast<void*>(alloc_addr), /*version=*/0);
+            default:
                 break;
-            }
         }
     }
 
@@ -499,20 +491,19 @@ TaskOutputTensors pto2_submit_mixed_task(
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
     {
-        int32_t out_idx = 0;
         for (int i = 0; i < args.tensor_count(); i++) {
             TensorArgType ptype = args.tag(i);
-            if (ptype == TensorArgType::OUTPUT || ptype == TensorArgType::INOUT) {
-                bool skip_dep = (ptype == TensorArgType::OUTPUT) ? args.tensor(i).create_info.manual_dep
-                                                                 : args.tensor(i).ptr->manual_dep;
-                if (!skip_dep) {
-                    const Tensor& t =
-                        (ptype == TensorArgType::OUTPUT) ? *result.output_ptr(out_idx) : *args.tensor(i).ptr;
-                    orch->tensor_map.insert(t, task_id, needs_alloc[i]);
+            if (ptype == TensorArgType::INOUT) {
+                if (!args.tensor(i).ptr->manual_dep) {
+                    orch->tensor_map.insert(*args.tensor(i).ptr, task_id, false);
                 }
-            }
-            if (ptype == TensorArgType::OUTPUT) {
-                out_idx++;
+            } else if (ptype == TensorArgType::OUTPUT) {
+                if (!args.tensor(i).create_info->manual_dep) {
+                    orch->tensor_map.insert(*args.tensor(i).create_info,
+                        reinterpret_cast<void*>(reinterpret_cast<char*>(alloc_result.packed_base) + offsets[i]),
+                        task_id,
+                        true);
+                }
             }
         }
     }
@@ -540,11 +531,11 @@ TaskOutputTensors pto2_submit_mixed_task(
         }
     }
 
-    payload->init(args, result);
+    payload->init(args, result, alloc_result.packed_base, offsets, buffer_sizes);
 
-    CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
+    CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 #if PTO2_ORCH_PROFILING
-    g_orch_params_atomic_count += 2;  // fanout_lock.store + fanout_count.store
+    g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
 #endif
 
     // === STEP 6: Finalize fanin list ===
@@ -692,7 +683,7 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     PTO2OrchProfilingData d;
     d.sync_cycle = g_orch_sync_cycle;
     d.alloc_cycle = g_orch_alloc_cycle;
-    d.params_cycle = g_orch_params_cycle;
+    d.args_cycle = g_orch_args_cycle;
     d.lookup_cycle = g_orch_lookup_cycle;
     d.insert_cycle = g_orch_insert_cycle;
     d.fanin_cycle = g_orch_fanin_cycle;
@@ -701,13 +692,13 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     d.alloc_wait_cycle = g_orch_alloc_wait_cycle;
     d.fanin_wait_cycle = g_orch_fanin_wait_cycle;
     d.alloc_atomic_count = g_orch_alloc_atomic_count;
-    d.params_atomic_count = g_orch_params_atomic_count;
+    d.args_atomic_count = g_orch_args_atomic_count;
     d.fanin_atomic_count = g_orch_fanin_atomic_count;
     d.finalize_atomic_count = g_orch_finalize_atomic_count;
     d.scope_end_atomic_count = g_orch_scope_end_atomic_count;
 
     // Reset
-    g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_params_cycle = 0;
+    g_orch_sync_cycle = g_orch_alloc_cycle = g_orch_args_cycle = 0;
     g_orch_lookup_cycle = g_orch_insert_cycle = 0;
     g_orch_fanin_cycle = g_orch_scope_end_cycle = 0;
     g_orch_submit_count = 0;
@@ -715,7 +706,7 @@ PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     g_orch_alloc_wait_cycle = 0;
     g_orch_fanin_wait_cycle = 0;
     g_orch_alloc_atomic_count = 0;
-    g_orch_params_atomic_count = 0;
+    g_orch_args_atomic_count = 0;
     g_orch_fanin_atomic_count = 0;
     g_orch_finalize_atomic_count = 0;
     g_orch_scope_end_atomic_count = 0;

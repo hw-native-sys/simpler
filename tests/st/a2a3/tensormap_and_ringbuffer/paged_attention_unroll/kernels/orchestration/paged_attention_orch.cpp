@@ -175,7 +175,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 Tensor qi = query.view(qi_shapes, qi_offsets);
                 uint32_t out_view_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
                 uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                Tensor out_view = out.view(out_view_shapes, out_view_offsets);
+                Tensor out_view = out.view(out_view_shapes, out_view_offsets, true);
 #ifdef ENABLE_PROFILING
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);

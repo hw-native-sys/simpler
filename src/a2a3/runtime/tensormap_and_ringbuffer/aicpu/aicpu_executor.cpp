@@ -2026,7 +2026,7 @@ int32_t AicpuExecutor::run(Runtime* runtime) {
                 orch_summary.end_time = orch_cycle_end;
                 orch_summary.sync_cycle = p.sync_cycle;
                 orch_summary.alloc_cycle = p.alloc_cycle;
-                orch_summary.params_cycle = p.params_cycle;
+                orch_summary.args_cycle = p.args_cycle;
                 orch_summary.lookup_cycle = p.lookup_cycle;
                 orch_summary.heap_cycle = 0;  // Now included in alloc_cycle
                 orch_summary.insert_cycle = p.insert_cycle;

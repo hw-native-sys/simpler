@@ -53,14 +53,16 @@ One extra step versus get_tensor_data: wait for all consumers to finish (`fanout
 
 ```cpp
 TensorCreateInfo ci(shapes, ndims, dtype);
-args.add_output(ci, initial_value);
+ci.set_initial_value(initial_value);
+args.add_output(ci);
 ```
 
 **Mechanism**:
 
-1. `add_output(ci, initial_value)` copies `ci` into `Arg` and marks the create-info with an initial value
-2. During orchestrator submit, after HeapRing allocation, the output tensor is materialized from the copied create-info
-3. Fill strategy:
+1. `ci.set_initial_value(value)` marks the create-info with an initial value before submission
+2. `add_output(ci)` stores a pointer to `ci` in `Arg` (the original must remain valid until submit)
+3. During payload init, the output tensor is materialized via `init_from_create_info()` which triggers the fill
+4. Fill strategy:
    - Small buffer (< 64 B): element-by-element memcpy directly into dst
    - Large buffer (≥ 64 B): fill the first 64 bytes as a template block, then bulk-memcpy in 64 B chunks; partial tail copy for remainder
 
@@ -75,8 +77,9 @@ uint32_t shapes[1] = {1};
 TensorCreateInfo scalar_ci(shapes, 1, DataType::FLOAT32);
 
 // Submit with initial value and keep the returned tensor
+scalar_ci.set_initial_value(float_to_u64(77.0f));
 Arg args;
-args.add_output(scalar_ci, 77.0f);
+args.add_output(scalar_ci);
 TaskOutputTensors outs = pto2_rt_submit_aiv_task(FUNC_NOOP, args);
 const Tensor& scalar_tensor = outs.get_ref(0);
 

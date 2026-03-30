@@ -116,9 +116,10 @@ union TensorRef {
  *
  * Example:
  *   Tensor x = make_tensor_external(dev_a, shapes, 2);
+ *   TensorCreateInfo ci(shapes, 2);
  *   Arg args;
  *   args.add_input(x);
- *   args.add_output(TensorCreateInfo(shapes, 2));
+ *   args.add_output(ci);
  *   args.add_scalar(some_value);
  *   TaskOutputTensors outs = pto2_rt_submit_aic_task(kernel_id, args);
  *   const Tensor& y = outs.get_ref(0);

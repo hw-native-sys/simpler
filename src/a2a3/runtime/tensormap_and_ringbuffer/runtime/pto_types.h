@@ -69,47 +69,19 @@ public:  // NOLINT(whitespace/indent)
     /// Borrow a materialized output tensor by index (lvalue only).
     const Tensor& get_ref(uint32_t index) const& {
         always_assert(index < output_count_);
-        return *reinterpret_cast<const Tensor*>(_storage + index * sizeof(Tensor));
+        return *tensors_[index];
     }
     const Tensor& get_ref(uint32_t index) const&& = delete;
 
     /// Runtime-internal: append one materialized output Tensor.
-    Tensor& materialize_output(const TensorCreateInfo& ci, void* addr, int32_t version) {
+    void materialize_output(const Tensor& tensor) {
         always_assert(output_count_ < PTO2_MAX_OUTPUTS);
-        Tensor* out = output_ptr(output_count_);
-        out->init_from_create_info(ci, addr, version);
-        if (ci.has_initial_value) {
-            fill_initial_value(addr, ci.buffer_size_bytes(), ci.dtype, ci.initial_value);
-        }
-        output_count_++;
-        return *out;
-    }
-
-    /// Runtime-internal: writable pointer for materialization.
-    Tensor* output_ptr(uint32_t index) { return reinterpret_cast<Tensor*>(_storage + index * sizeof(Tensor)); }
-    const Tensor* output_ptr(uint32_t index) const {
-        return reinterpret_cast<const Tensor*>(_storage + index * sizeof(Tensor));
+        tensors_[output_count_++] = &tensor;
     }
 
 private:  // NOLINT(whitespace/indent)
-    static void fill_initial_value(void* addr, uint64_t buffer_size, DataType dtype, uint64_t initial_value) {
-        uint64_t elem_size = get_element_size(dtype);
-        char* dst = reinterpret_cast<char*>(addr);
-        constexpr uint64_t BLK = 64;
-        uint64_t blk = (buffer_size < BLK) ? buffer_size : BLK;
-        for (uint64_t b = 0; b < blk; b += elem_size) {
-            memcpy(dst + b, &initial_value, elem_size);
-        }
-        uint64_t filled = blk;
-        while (filled < buffer_size) {
-            uint64_t copy_size = ((buffer_size - filled) < filled) ? (buffer_size - filled) : filled;
-            memcpy(dst + filled, dst, copy_size);
-            filled += copy_size;
-        }
-    }
-
     uint32_t output_count_;
-    alignas(Tensor) unsigned char _storage[PTO2_MAX_OUTPUTS * sizeof(Tensor)];
+    const Tensor* tensors_[PTO2_MAX_OUTPUTS];
 };
 
 // =============================================================================
@@ -124,7 +96,7 @@ private:  // NOLINT(whitespace/indent)
  */
 union TensorRef {
     const Tensor* ptr;
-    TensorCreateInfo create_info;
+    const TensorCreateInfo* create_info;
     TensorRef() : ptr(nullptr) {}
 };
 
@@ -143,9 +115,10 @@ union TensorRef {
  *
  * Example:
  *   Tensor x = make_tensor_external(dev_a, shapes, 2);
+ *   TensorCreateInfo ci(shapes, 2);  // must outlive submit
  *   Arg args;
  *   args.add_input(x);
- *   args.add_output(TensorCreateInfo(shapes, 2));
+ *   args.add_output(ci);
  *   args.add_scalar(some_value);
  *   TaskOutputTensors outs = pto2_rt_submit_aic_task(kernel_id, args);
  *   const Tensor& y = outs.get_ref(0);
@@ -192,32 +165,18 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
 
     /// Standard future-output path: runtime allocates buffer from heap,
     /// materializes Tensor into TaskOutputTensors.
+    /// The TensorCreateInfo must outlive the submit call (pointer is stored).
     void add_output(const TensorCreateInfo& ci) {
         if (!check_add_tensor_valid()) {
             return;
         }
-        tensors_[tensor_count_].create_info = ci;
+        tensors_[tensor_count_].create_info = &ci;
         tags_[tensor_count_] = TensorArgType::OUTPUT;
         tensor_count_++;
     }
 
-    /// Runtime-allocated output with an initial element value replicated
-    /// across the full buffer after HeapRing allocation.
-    /// Type is deduced from initial_value; bit-cast to uint64_t internally.
-    ///
-    ///   params.add_output(ci, 77.0f);        // float initial value
-    ///   params.add_output(ci, int32_t(0));    // int32 initial value
-    ///   params.add_output(ci, uint64_t(val)); // existing usage unchanged
-    template <typename T = uint64_t>
-    void add_output(const TensorCreateInfo& ci, T initial_value) {
-        if (!check_add_tensor_valid()) {
-            return;
-        }
-        tensors_[tensor_count_].create_info = ci;
-        tensors_[tensor_count_].create_info.set_initial_value(to_u64(initial_value));
-        tags_[tensor_count_] = TensorArgType::OUTPUT;
-        tensor_count_++;
-    }
+    /// Prevent passing temporaries — the pointer would dangle before submit.
+    void add_output(TensorCreateInfo&&) = delete;
 
     void add_inout(const Tensor& t) {
         if (!check_add_tensor_valid()) {
