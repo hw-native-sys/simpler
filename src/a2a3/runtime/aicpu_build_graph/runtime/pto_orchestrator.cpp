@@ -256,7 +256,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // =============================================================================
 // Task Submission (3-step: alloc, heap, write — no TensorMap)
 // =============================================================================
-SubmitResult pto2_submit_mixed_task(PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const Arg& args) {
+SubmitResult pto2_submit_mixed_task(PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, Arg& args) {
     CYCLE_COUNT_START();
 
     SubmitResult result;
@@ -380,7 +380,7 @@ SubmitResult pto2_submit_mixed_task(PTO2OrchestratorState* orch, const MixedKern
     for (int i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) == TensorArgType::OUTPUT) {
             total_output_size +=
-                PTO2_ALIGN_UP(args.tensor(i).create_info.buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
+                PTO2_ALIGN_UP(args.tensor(i).create_info_ptr->buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
 
@@ -395,15 +395,19 @@ SubmitResult pto2_submit_mixed_task(PTO2OrchestratorState* orch, const MixedKern
         local_packed_end = reinterpret_cast<char*>(local_packed_base) + total_output_size;
     }
 
-    // Materialize OUTPUT tensors into TaskOutputTensors
+    // Materialize OUTPUT tensors into TaskOutputTensors, then swap
+    // create_info_ptr → tensor_ptr so all slots are uniformly tensor_ptr.
     int32_t offset = 0;
     for (int i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) == TensorArgType::OUTPUT) {
-            const TensorCreateInfo& ci = args.tensor(i).create_info;
+            const TensorCreateInfo& ci = *args.tensor(i).create_info_ptr;
             uint64_t buffer_size = ci.buffer_size_bytes();
             uint64_t alloc_addr = reinterpret_cast<uint64_t>(reinterpret_cast<char*>(local_packed_base) + offset);
             offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
-            result.outputs.materialize_output(ci, reinterpret_cast<void*>(alloc_addr), /*version=*/0);
+            Tensor& materialized = result.outputs.materialize_output(
+                ci, reinterpret_cast<void*>(alloc_addr), /*version=*/0);
+            // Swap: from this point on, this slot is tensor_ptr
+            args.tensor(i).tensor_ptr = &materialized;
         }
     }
 
@@ -425,7 +429,7 @@ SubmitResult pto2_submit_mixed_task(PTO2OrchestratorState* orch, const MixedKern
     task.packed_buffer_end = local_packed_end;
 
     payload->fanin_actual_count = 0;
-    payload->init(args, result.outputs);
+    payload->init(args);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 

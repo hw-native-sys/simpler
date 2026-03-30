@@ -37,7 +37,7 @@ void pto2_set_orch_thread_idx(int idx) { pto2_current_orch_idx = idx; }
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================
 
-static SubmitResult submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const Arg& args) {
+static SubmitResult submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels, Arg& args) {
     return pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels, args);
 }
 

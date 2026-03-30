@@ -256,18 +256,17 @@ struct PTO2TaskPayload {
     // === Cache lines 35-50 (1024B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
 
-    void init(const Arg& args, const TaskOutputTensors& materialized_outputs) {
+    /**
+     * Initialize payload: copy tensors + scalars.
+     *
+     * PRECONDITION: The orchestrator has already swapped all OUTPUT slots from
+     * create_info_ptr → tensor_ptr.  All slots are uniformly tensor_ptr.
+     */
+    void init(const Arg& args) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
-        int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
-            const Tensor* src;
-            if (args.tag(i) == TensorArgType::OUTPUT) {
-                src = materialized_outputs.output_ptr(out_idx++);
-            } else {
-                src = args.tensor(i).ptr;
-            }
-            tensors[i].copy(*src);
+            tensors[i].copy(*args.tensor(i).tensor_ptr);
         }
         // Round up to cache line boundary. Both arrays are 1024B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.

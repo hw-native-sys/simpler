@@ -114,10 +114,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 Tensor out_view = out.view(out_view_shapes, out_view_offsets);
 
                 // Hub task: zero-initialize accumulators
+                TensorCreateInfo oi_ci(oi_shapes, 2, DataType::FLOAT32);
+                TensorCreateInfo li_ci(li_shapes, 1, DataType::FLOAT32);
+                TensorCreateInfo mi_ci(mi_shapes, 1, DataType::FLOAT32);
                 Arg args_inplace;
-                args_inplace.add_output(TensorCreateInfo(oi_shapes, 2, DataType::FLOAT32));
-                args_inplace.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
-                args_inplace.add_output(TensorCreateInfo(mi_shapes, 1, DataType::FLOAT32));
+                args_inplace.add_output(oi_ci);
+                args_inplace.add_output(li_ci);
+                args_inplace.add_output(mi_ci);
                 SubmitResult r_hub = pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace);
                 const Tensor& oi = r_hub.outputs.get_ref(0);
                 const Tensor& li_update = r_hub.outputs.get_ref(1);
@@ -138,10 +141,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                     // === Task 1: QK matmul ===
                     uint32_t sij_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(block_size)};
 
+                    TensorCreateInfo sij_ci(sij_shapes, 2, DataType::FLOAT32);
                     Arg args_qk;
                     args_qk.add_input(qi);
                     args_qk.add_input(kj);
-                    args_qk.add_output(TensorCreateInfo(sij_shapes, 2, DataType::FLOAT32));
+                    args_qk.add_output(sij_ci);
                     SubmitResult r_qk = pto2_rt_submit_aic_task(rt, FUNC_QK_MATMUL, args_qk);
 
                     // === Task 2: Softmax ===
@@ -149,11 +153,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                     uint32_t sij_valid_offsets[2] = {0, 0};
                     Tensor sij_valid = r_qk.outputs.get_ref(0).view(sij_valid_shapes, sij_valid_offsets);
 
+                    TensorCreateInfo pij_ci(sij_shapes, 2, data_type);
+                    TensorCreateInfo mi_new_ci(mi_shapes, 1, DataType::FLOAT32);
+                    TensorCreateInfo li_new_ci(li_shapes, 1, DataType::FLOAT32);
                     Arg args_sf;
                     args_sf.add_input(sij_valid);
-                    args_sf.add_output(TensorCreateInfo(sij_shapes, 2, data_type));
-                    args_sf.add_output(TensorCreateInfo(mi_shapes, 1, DataType::FLOAT32));
-                    args_sf.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
+                    args_sf.add_output(pij_ci);
+                    args_sf.add_output(mi_new_ci);
+                    args_sf.add_output(li_new_ci);
                     args_sf.add_scalar(scale_value);
                     SubmitResult r_sf = pto2_rt_submit_aiv_task(rt, FUNC_SOFTMAX_PREPARE, args_sf);
                     pto2_rt_add_dependency(rt, r_qk.task_id, r_sf.task_id);
@@ -161,10 +168,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                     // === Task 3: PV matmul ===
                     uint32_t oi_tmp_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
 
+                    TensorCreateInfo oi_tmp_ci(oi_tmp_shapes, 2, DataType::FLOAT32);
                     Arg args_pv;
                     args_pv.add_input(r_sf.outputs.get_ref(0));
                     args_pv.add_input(vj);
-                    args_pv.add_output(TensorCreateInfo(oi_tmp_shapes, 2, DataType::FLOAT32));
+                    args_pv.add_output(oi_tmp_ci);
                     SubmitResult r_pv = pto2_rt_submit_aic_task(rt, FUNC_PV_MATMUL, args_pv);
                     pto2_rt_add_dependency(rt, r_sf.task_id, r_pv.task_id);
 

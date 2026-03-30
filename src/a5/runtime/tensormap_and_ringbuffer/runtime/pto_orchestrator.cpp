@@ -267,7 +267,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // Task Submission
 // =============================================================================
 TaskOutputTensors pto2_submit_mixed_task(
-    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const Arg& args) {
+    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, Arg& args) {
     CYCLE_COUNT_START();
 
     TaskOutputTensors result;
@@ -360,7 +360,7 @@ TaskOutputTensors pto2_submit_mixed_task(
         if (args.tag(i) == TensorArgType::OUTPUT) {
             needs_alloc[i] = true;
             total_output_size +=
-                PTO2_ALIGN_UP(args.tensor(i).create_info.buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
+                PTO2_ALIGN_UP(args.tensor(i).create_info_ptr->buffer_size_bytes(), PTO2_PACKED_OUTPUT_ALIGN);
         }
     }
 
@@ -464,10 +464,10 @@ TaskOutputTensors pto2_submit_mixed_task(
         switch (ptype) {
             case TensorArgType::INOUT:
             case TensorArgType::INPUT: {
-                if (args.tensor(i).ptr->manual_dep) break;
+                if (args.tensor(i).tensor_ptr->manual_dep) break;
                 // Look up producer via TensorMap (reads from cached stack tensor)
                 PTO2LookupResult lookup_result;
-                orch->tensor_map.lookup(*args.tensor(i).ptr, lookup_result);
+                orch->tensor_map.lookup(*args.tensor(i).tensor_ptr, lookup_result);
 
                 for (int r = 0; r < lookup_result.count; r++) {
                     PTO2TensorMapEntry& entry = *lookup_result.entries[r].entry;
@@ -501,7 +501,7 @@ TaskOutputTensors pto2_submit_mixed_task(
             }
 
             case TensorArgType::OUTPUT: {
-                const TensorCreateInfo& ci = args.tensor(i).create_info;
+                const TensorCreateInfo& ci = *args.tensor(i).create_info_ptr;
                 uint64_t buffer_size = ci.buffer_size_bytes();
                 uint64_t alloc_addr =
                     reinterpret_cast<uint64_t>(reinterpret_cast<char*>(alloc_result.packed_base) + offset);
@@ -511,6 +511,9 @@ TaskOutputTensors pto2_submit_mixed_task(
                 if (ci.has_initial_value) {
                     fill_initial_value(reinterpret_cast<void*>(alloc_addr), buffer_size, ci.dtype, ci.initial_value);
                 }
+                // Swap create_info_ptr → tensor_ptr: from this point on, this slot
+                // points at the materialized Tensor so all slots are uniformly tensor_ptr.
+                args.tensor(i).tensor_ptr = result.output_ptr(result.output_count);
                 result.output_count++;
                 break;
             }
@@ -520,21 +523,15 @@ TaskOutputTensors pto2_submit_mixed_task(
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id.raw);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
+    // After step 3, all OUTPUT slots have been swapped to tensor_ptr (pointing at
+    // materialized Tensors in TaskOutputTensors), so all slots are uniformly tensor_ptr.
     {
-        int32_t out_idx = 0;
         for (int i = 0; i < args.tensor_count(); i++) {
             TensorArgType ptype = args.tag(i);
             if (ptype == TensorArgType::OUTPUT || ptype == TensorArgType::INOUT) {
-                bool skip_dep = (ptype == TensorArgType::OUTPUT) ? args.tensor(i).create_info.manual_dep
-                                                                 : args.tensor(i).ptr->manual_dep;
-                if (!skip_dep) {
-                    const Tensor& t =
-                        (ptype == TensorArgType::OUTPUT) ? *result.output_ptr(out_idx) : *args.tensor(i).ptr;
-                    orch->tensor_map.insert(t, task_id, needs_alloc[i]);
+                if (!args.tensor(i).tensor_ptr->manual_dep) {
+                    orch->tensor_map.insert(*args.tensor(i).tensor_ptr, task_id, needs_alloc[i]);
                 }
-            }
-            if (ptype == TensorArgType::OUTPUT) {
-                out_idx++;
             }
         }
     }
@@ -562,7 +559,7 @@ TaskOutputTensors pto2_submit_mixed_task(
         }
     }
 
-    payload->init(args, result);
+    payload->init(args);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_params_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 #if PTO2_ORCH_PROFILING

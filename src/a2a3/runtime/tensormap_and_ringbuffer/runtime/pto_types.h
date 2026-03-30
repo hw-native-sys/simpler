@@ -119,33 +119,48 @@ private:  // NOLINT(whitespace/indent)
 // TensorArgType is defined in tensor_arg.h (included above)
 
 /**
- * Tagged union for a single Arg slot — either a Tensor* or a TensorCreateInfo value.
- * The active member is determined by TensorArgType (OUTPUT → create_info, else → ptr).
+ * Tagged union for a single Arg slot — pointer to either Tensor or TensorCreateInfo.
+ *
+ * Lifetime contract:
+ *   - INPUT / INOUT slots: tensor_ptr borrows from caller's Tensor (must outlive Arg).
+ *   - OUTPUT slots before submit: create_info_ptr borrows from caller's TensorCreateInfo
+ *     (must outlive the submit call — do NOT pass a temporary).
+ *   - OUTPUT slots after submit: the orchestrator overwrites create_info_ptr → tensor_ptr,
+ *     pointing at the materialized Tensor inside TaskOutputTensors.  This in-place
+ *     mutation is intentional: once materialized, all slots are uniformly tensor_ptr,
+ *     so payload->init() can dereference without branching on the tag.
+ *
+ * The active member is determined by TensorArgType:
+ *   OUTPUT (before materialization) → create_info_ptr
+ *   OUTPUT (after materialization)  → tensor_ptr  (swapped by orchestrator)
+ *   INPUT / INOUT                   → tensor_ptr
  */
 union TensorRef {
-    const Tensor* ptr;
-    TensorCreateInfo create_info;
-    TensorRef() : ptr(nullptr) {}
+    const Tensor* tensor_ptr;
+    const TensorCreateInfo* create_info_ptr;
+    TensorRef() : tensor_ptr(nullptr) {}
 };
 
 /**
  * Aggregated argument container for pto_submit_task
  *
  * Inherits storage from TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType>.
- * Each tensor slot stores a TensorRef union (Tensor* or TensorCreateInfo)
+ * Each tensor slot stores a TensorRef (pointer to Tensor or TensorCreateInfo)
  * discriminated by the corresponding tag().
  * Tensors are dispatched first in kernel args, followed by scalars.
  *
  * Output arguments follow two distinct ownership models:
  * - add_output(const TensorCreateInfo&): OUTPUT — runtime allocates buffer
  *   and materializes a new Tensor, returned via TaskOutputTensors.
+ *   The TensorCreateInfo must outlive the submit call (no temporaries).
  * - add_inout(const Tensor&): INOUT — reuses an existing Tensor as the write target.
  *
  * Example:
  *   Tensor x = make_tensor_external(dev_a, shapes, 2);
+ *   TensorCreateInfo out_ci(shapes, 2);  // must be a named variable
  *   Arg args;
  *   args.add_input(x);
- *   args.add_output(TensorCreateInfo(shapes, 2));
+ *   args.add_output(out_ci);
  *   args.add_scalar(some_value);
  *   TaskOutputTensors outs = pto2_rt_submit_aic_task(kernel_id, args);
  *   const Tensor& y = outs.get_ref(0);
@@ -185,39 +200,46 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
         if (!check_add_tensor_valid()) {
             return;
         }
-        tensors_[tensor_count_].ptr = &t;
+        tensors_[tensor_count_].tensor_ptr = &t;
         tags_[tensor_count_] = TensorArgType::INPUT;
         tensor_count_++;
     }
 
     /// Standard future-output path: runtime allocates buffer from heap,
     /// materializes Tensor into TaskOutputTensors.
+    /// IMPORTANT: ci must outlive the submit call — do NOT pass a temporary.
     void add_output(const TensorCreateInfo& ci) {
         if (!check_add_tensor_valid()) {
             return;
         }
-        tensors_[tensor_count_].create_info = ci;
+        tensors_[tensor_count_].create_info_ptr = &ci;
         tags_[tensor_count_] = TensorArgType::OUTPUT;
         tensor_count_++;
     }
+    void add_output(TensorCreateInfo&&) = delete;  // temporaries dangle — use a named variable
 
     /// Runtime-allocated output with an initial element value replicated
     /// across the full buffer after HeapRing allocation.
+    /// IMPORTANT: ci must outlive the submit call — do NOT pass a temporary.
+    /// Call ci.set_initial_value(v) before passing.
     void add_output(const TensorCreateInfo& ci, uint64_t initial_value) {
         if (!check_add_tensor_valid()) {
             return;
         }
-        tensors_[tensor_count_].create_info = ci;
-        tensors_[tensor_count_].create_info.set_initial_value(initial_value);
+        // Caller must have set initial_value on ci beforehand, or we set it
+        // via a const_cast since TensorCreateInfo is a POD we logically own.
+        const_cast<TensorCreateInfo&>(ci).set_initial_value(initial_value);
+        tensors_[tensor_count_].create_info_ptr = &ci;
         tags_[tensor_count_] = TensorArgType::OUTPUT;
         tensor_count_++;
     }
+    void add_output(TensorCreateInfo&&, uint64_t) = delete;  // temporaries dangle
 
     void add_inout(const Tensor& t) {
         if (!check_add_tensor_valid()) {
             return;
         }
-        tensors_[tensor_count_].ptr = &t;
+        tensors_[tensor_count_].tensor_ptr = &t;
         tags_[tensor_count_] = TensorArgType::INOUT;
         tensor_count_++;
     }

@@ -33,7 +33,7 @@ void pto2_set_orch_thread_idx(int idx) {
 // =============================================================================
 
 static TaskOutputTensors submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels,
-                             const Arg& args) {
+                             Arg& args) {
     return pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels,
                            args);
 }

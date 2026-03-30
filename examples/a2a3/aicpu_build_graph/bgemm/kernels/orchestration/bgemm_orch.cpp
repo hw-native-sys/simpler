@@ -104,10 +104,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                         Tensor B_view = ext_B.view(tile_shapes, b_view_offsets);
 
                         // P = A[m,k] @ B[k,n]
+                        TensorCreateInfo p_ci(tile_shapes, 1, DataType::FLOAT32);
                         Arg args_gemm;
                         args_gemm.add_input(A_view);
                         args_gemm.add_input(B_view);
-                        args_gemm.add_output(TensorCreateInfo(tile_shapes, 1, DataType::FLOAT32));
+                        args_gemm.add_output(p_ci);
                         SubmitResult r_gemm = pto2_rt_submit_aic_task(rt, FUNC_GEMM_TILE, args_gemm);
 
                         // C[m,n] += P

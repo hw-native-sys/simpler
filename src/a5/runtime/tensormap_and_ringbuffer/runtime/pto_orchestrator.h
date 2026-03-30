@@ -163,7 +163,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  */
 TaskOutputTensors pto2_submit_mixed_task(PTO2OrchestratorState* orch,
     const MixedKernels& mixed_kernels,
-    const Arg& args);
+    Arg& args);
 
 // =============================================================================
 // Flow Control

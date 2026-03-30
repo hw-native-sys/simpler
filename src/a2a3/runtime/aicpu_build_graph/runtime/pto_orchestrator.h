@@ -194,7 +194,7 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  * @param args      Aggregated tensor and scalar parameters
  * @return PTO2TaskId for use in pto2_add_dependency()
  */
-SubmitResult pto2_submit_mixed_task(PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const Arg& args);
+SubmitResult pto2_submit_mixed_task(PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, Arg& args);
 
 // =============================================================================
 // Explicit Dependency Management

@@ -62,7 +62,7 @@ typedef struct PTO2Runtime PTO2Runtime;
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    SubmitResult (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const Arg& args);
+    SubmitResult (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels, Arg& args);
     void (*add_dependency)(PTO2Runtime* rt, PTO2TaskId producer, PTO2TaskId consumer);
     void (*scope_begin)(PTO2Runtime* rt);
     void (*scope_end)(PTO2Runtime* rt);
@@ -92,14 +92,14 @@ struct PTO2Runtime {
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline SubmitResult pto2_rt_submit_task(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const Arg& args) {
+static inline SubmitResult pto2_rt_submit_task(PTO2Runtime* rt, const MixedKernels& mixed_kernels, Arg& args) {
     return rt->ops->submit_task(rt, mixed_kernels, args);
 }
 
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
-static inline SubmitResult pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id, const Arg& args) {
+static inline SubmitResult pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id, Arg& args) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, args);
@@ -108,7 +108,7 @@ static inline SubmitResult pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kern
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
-static inline SubmitResult pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id, const Arg& args) {
+static inline SubmitResult pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id, Arg& args) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, args);

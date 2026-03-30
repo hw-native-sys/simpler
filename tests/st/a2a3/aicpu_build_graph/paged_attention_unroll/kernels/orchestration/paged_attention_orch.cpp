@@ -189,10 +189,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
                 // Hub task: zero-initialize oi, li_update, mi_update
+                TensorCreateInfo oi_ci(oi_shapes, 2, DataType::FLOAT32);
+                TensorCreateInfo li_ci(li_shapes, 1, DataType::FLOAT32);
+                TensorCreateInfo mi_ci(mi_shapes, 1, DataType::FLOAT32);
                 Arg args_inplace;
-                args_inplace.add_output(TensorCreateInfo(oi_shapes, 2, DataType::FLOAT32));
-                args_inplace.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
-                args_inplace.add_output(TensorCreateInfo(mi_shapes, 1, DataType::FLOAT32));
+                args_inplace.add_output(oi_ci);
+                args_inplace.add_output(li_ci);
+                args_inplace.add_output(mi_ci);
                 CYCLE_COUNT_LAP(prof_param_setup);
                 SubmitResult r_hub = pto2_rt_submit_aiv_task(rt, FUNC_AIV_HUB, args_inplace);
                 const Tensor& oi = r_hub.outputs.get_ref(0);
@@ -229,7 +232,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                     args_qk.reset();
                     args_qk.add_input(qi);
                     args_qk.add_input(key_cache);
-                    args_qk.add_output(TensorCreateInfo(sij_buf_shapes, 2, DataType::FLOAT32));
+                    TensorCreateInfo sij_buf_ci(sij_buf_shapes, 2, DataType::FLOAT32);
+                    args_qk.add_output(sij_buf_ci);
                     args_qk.add_scalar(n_blocks);
                     args_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
@@ -249,9 +253,12 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
 
                     args_sf.reset();
                     args_sf.add_input(r_qk.outputs.get_ref(0));
-                    args_sf.add_output(TensorCreateInfo(pij_buf_shapes, 2, data_type));
-                    args_sf.add_output(TensorCreateInfo(mi_shapes, 1, DataType::FLOAT32));
-                    args_sf.add_output(TensorCreateInfo(li_shapes, 1, DataType::FLOAT32));
+                    TensorCreateInfo pij_buf_ci(pij_buf_shapes, 2, data_type);
+                    TensorCreateInfo mi_new_ci(mi_shapes, 1, DataType::FLOAT32);
+                    TensorCreateInfo li_new_ci(li_shapes, 1, DataType::FLOAT32);
+                    args_sf.add_output(pij_buf_ci);
+                    args_sf.add_output(mi_new_ci);
+                    args_sf.add_output(li_new_ci);
                     args_sf.add_scalar(scale_value);
                     args_sf.add_scalar(n_blocks);
                     args_sf.add_scalar(valid_len_last);
@@ -274,7 +281,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                     args_pv.reset();
                     args_pv.add_input(r_sf.outputs.get_ref(0));
                     args_pv.add_input(value_cache);
-                    args_pv.add_output(TensorCreateInfo(oi_new_shapes, 2, DataType::FLOAT32));
+                    TensorCreateInfo oi_new_ci(oi_new_shapes, 2, DataType::FLOAT32);
+                    args_pv.add_output(oi_new_ci);
                     args_pv.add_scalar(n_blocks);
                     args_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
