@@ -203,12 +203,18 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
 
     /// Runtime-allocated output with an initial element value replicated
     /// across the full buffer after HeapRing allocation.
-    void add_output(const TensorCreateInfo& ci, uint64_t initial_value) {
+    /// Type is deduced from initial_value; bit-cast to uint64_t internally.
+    ///
+    ///   params.add_output(ci, 77.0f);        // float initial value
+    ///   params.add_output(ci, int32_t(0));    // int32 initial value
+    ///   params.add_output(ci, uint64_t(val)); // existing usage unchanged
+    template<typename T = uint64_t>
+    void add_output(const TensorCreateInfo& ci, T initial_value) {
         if (!check_add_tensor_valid()) {
             return;
         }
         tensors_[tensor_count_].create_info = ci;
-        tensors_[tensor_count_].create_info.set_initial_value(initial_value);
+        tensors_[tensor_count_].create_info.set_initial_value(to_u64(initial_value));
         tags_[tensor_count_] = TensorArgType::OUTPUT;
         tensor_count_++;
     }
@@ -222,12 +228,21 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
         tensor_count_++;
     }
 
-    void add_scalar(uint64_t v) {
+    /**
+     * Add a scalar value. Type is deduced from the argument;
+     * the value is bit-cast to uint64_t for storage.
+     *
+     *   args.add_scalar(uint64_val);      // existing usage unchanged
+     *   args.add_scalar(3.14f);           // float, auto bit-cast
+     *   args.add_scalar(int32_t(42));     // int32, auto bit-cast
+     */
+    template<typename T = uint64_t>
+    void add_scalar(T value) {
         if (scalar_count_ >= MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
-        scalars_[scalar_count_++] = v;
+        scalars_[scalar_count_++] = to_u64(value);
     }
 
     void add_scalars(const uint64_t* values, int count) {

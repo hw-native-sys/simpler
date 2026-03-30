@@ -151,9 +151,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     __gm__ Tensor* pij_batch = reinterpret_cast<__gm__ Tensor*>(args[1]);
     __gm__ Tensor* mij_batch = reinterpret_cast<__gm__ Tensor*>(args[2]);
     __gm__ Tensor* lij_batch = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    union { uint64_t u; float f; } scale_conv;
-    scale_conv.u = static_cast<uint64_t>(args[4]);
-    float scale_value = scale_conv.f;
+    float scale_value = from_u64<float>(static_cast<uint64_t>(args[4]));
     uint64_t context_lens_ptr = static_cast<uint64_t>(args[5]);
     uint64_t batch_count = static_cast<uint64_t>(args[6]);
     uint64_t block_idx = static_cast<uint64_t>(args[7]);
