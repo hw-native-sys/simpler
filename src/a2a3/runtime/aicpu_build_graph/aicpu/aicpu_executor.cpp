@@ -25,14 +25,14 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
-#include "pto2_dispatch_payload.h"  // NOLINT(build/include_subdir)
-#include "runtime.h"                // NOLINT(build/include_subdir)
-#include "spin_hint.h"              // NOLINT(build/include_subdir)
+#include "pto2_dispatch_payload.h"
+#include "runtime.h"
+#include "spin_hint.h"
 
 // Runtime headers (full struct definition for create/destroy + PTO2_SCOPE)
-#include "pto_runtime2.h"        // NOLINT(build/include_subdir)
-#include "pto_runtime2_types.h"  // NOLINT(build/include_subdir)
-#include "pto_shared_memory.h"   // NOLINT(build/include_subdir)
+#include "pto_runtime2.h"
+#include "pto_runtime2_types.h"
+#include "pto_shared_memory.h"
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
@@ -46,6 +46,9 @@
 
 // Core type definitions
 #include "common/core_type.h"
+
+// CoreCallable for resolved dispatch address
+#include "callable.h"
 
 #if PTO2_PROFILING
 // Accumulated nanoseconds per sub-step
@@ -272,7 +275,9 @@ struct AicpuExecutor {
     // Metadata (task_id, subslot, kernel_id, core_type) stays in TaskDescriptor.
     // Dispatch order: tensor args first, then scalar args.
     void build_pto2_payload(PTO2DispatchPayload& out, int32_t kernel_id, PTO2TaskPayload& task_pl) {
-        out.function_bin_addr = get_function_bin_addr(kernel_id);
+        uint64_t callable_addr = get_function_bin_addr(kernel_id);
+        const CoreCallable* callable = reinterpret_cast<const CoreCallable*>(callable_addr);
+        out.function_bin_addr = callable->resolved_addr();
         int32_t n = 0;
         for (int32_t i = 0; i < task_pl.tensor_count; i++) {
             task_pl.tensors[i].update_start_offset();

@@ -18,12 +18,16 @@ Usage:
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CONTINUOUS_TENSOR_MAX_DIMS,
+    ArgDirection,
+    ChipCallable,
     ChipStorageTaskArgs,
     ContinuousTensor,
+    CoreCallable,
     DataType,
     DynamicTaskArgs,
     TaggedTaskArgs,
     TensorArgType,
+    arg_direction_name,
     get_dtype_name,
     get_element_size,
 )
@@ -38,6 +42,10 @@ __all__ = [
     "TensorArgType",
     "DynamicTaskArgs",
     "TaggedTaskArgs",
+    "ArgDirection",
+    "CoreCallable",
+    "ChipCallable",
+    "arg_direction_name",
     "torch_dtype_to_datatype",
     "make_tensor_arg",
     "scalar_to_uint64",

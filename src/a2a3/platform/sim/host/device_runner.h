@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Device Runner - Thread-Based Simulation
  *
@@ -11,20 +21,21 @@
  * - Kernel .text binaries are loaded into executable memory (mmap)
  */
 
-#ifndef RUNTIME_DEVICERUNNER_H
-#define RUNTIME_DEVICERUNNER_H
+#ifndef SRC_A2A3_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_
+#define SRC_A2A3_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_
+
+#include <dlfcn.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
-#include <dlfcn.h>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <string>
 #include <thread>
-#include <unistd.h>
 #include <vector>
 
 #include "common/core_type.h"
@@ -45,8 +56,8 @@
  * proper handling of external symbols (e.g., std::exp) via PLT/GOT.
  */
 struct MappedKernel {
-    void* dl_handle{nullptr};    // dlopen handle
-    uint64_t func_addr{0};       // Function pointer address (from dlsym)
+    void* dl_handle{nullptr};        // dlopen handle
+    uint8_t* callable_buf{nullptr};  // host-memory copy of CoreCallable (owns memory)
 };
 
 /**
@@ -62,7 +73,7 @@ struct MappedKernel {
  * - Kernel .text binaries are loaded into mmap'd executable memory
  */
 class DeviceRunner {
-public:
+ public:
     /**
      * Get singleton instance
      */
@@ -122,11 +133,11 @@ public:
      * @return 0 on success
      */
     int run(Runtime& runtime,
-            int block_dim,
-            int device_id,
-            const std::vector<uint8_t>& aicpu_so_binary,
-            const std::vector<uint8_t>& aicore_kernel_binary,
-            int launch_aicpu_num = 1);
+        int block_dim,
+        int device_id,
+        const std::vector<uint8_t>& aicpu_so_binary,
+        const std::vector<uint8_t>& aicore_kernel_binary,
+        int launch_aicpu_num = 1);
 
     /**
      * Print handshake results
@@ -192,7 +203,7 @@ public:
      */
     void remove_kernel_binary(int func_id);
 
-private:
+ private:
     DeviceRunner() = default;
     ~DeviceRunner();
 
@@ -217,9 +228,9 @@ private:
     // Dynamically loaded executor libraries and function pointers
     void* aicpu_so_handle_{nullptr};
     void* aicore_so_handle_{nullptr};
-    int (*aicpu_execute_func_)(Runtime*){nullptr};
-    void (*aicore_execute_func_)(Runtime*, int, CoreType, uint32_t, uint64_t){nullptr};
-    void (*set_platform_regs_func_)(uint64_t){nullptr};
+    int (*aicpu_execute_func_)(Runtime*){nullptr};                                       // NOLINT(readability/braces)
+    void (*aicore_execute_func_)(Runtime*, int, CoreType, uint32_t, uint64_t){nullptr};  // NOLINT(readability/braces)
+    void (*set_platform_regs_func_)(uint64_t){nullptr};                                  // NOLINT(readability/braces)
     std::string aicpu_so_path_;
     std::string aicore_so_path_;
 
@@ -227,11 +238,10 @@ private:
     PerformanceCollector perf_collector_;
 
     // Private helper methods
-    int ensure_device_initialized(int device_id,
-                                  const std::vector<uint8_t>& aicpu_so_binary,
-                                  const std::vector<uint8_t>& aicore_kernel_binary);
-    int ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_binary,
-                               const std::vector<uint8_t>& aicore_kernel_binary);
+    int ensure_device_initialized(
+        int device_id, const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
+    int ensure_binaries_loaded(
+        const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
 
     /**
      * Initialize performance profiling shared memory
@@ -246,4 +256,4 @@ private:
     int init_performance_profiling(Runtime& runtime, int num_aicore, int device_id);
 };
 
-#endif  // RUNTIME_DEVICERUNNER_H
+#endif  // SRC_A2A3_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

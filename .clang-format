@@ -31,5 +31,5 @@ AllowAllArgumentsOnNextLine: true
 BinPackParameters: false
 BinPackArguments: false
 
-# Access modifier offset: -4 aligns with class keyword
-AccessModifierOffset: -4
+# Access modifier offset: 1-space indent (matches Google cpplint expectation)
+AccessModifierOffset: -3

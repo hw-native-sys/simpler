@@ -23,12 +23,16 @@ if _python_dir not in sys.path:
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CONTINUOUS_TENSOR_MAX_DIMS,
+    ArgDirection,
+    ChipCallable,
     ChipStorageTaskArgs,
     ContinuousTensor,
+    CoreCallable,
     DataType,
     DynamicTaskArgs,
     TaggedTaskArgs,
     TensorArgType,
+    arg_direction_name,
     get_dtype_name,
     get_element_size,
 )
@@ -478,3 +482,175 @@ class TestTaggedTaskArgs:
         args = TaggedTaskArgs()
         with pytest.raises((IndexError, RuntimeError)):
             args.set_tag(0, TensorArgType.INPUT)
+
+
+# ============================================================================
+# ArgDirection
+# ============================================================================
+
+
+class TestArgDirection:
+    def test_enum_values(self):
+        assert ArgDirection.SCALAR.value == 0
+        assert ArgDirection.IN.value == 1
+        assert ArgDirection.OUT.value == 2
+        assert ArgDirection.INOUT.value == 3
+
+    @pytest.mark.parametrize(
+        "direction,expected",
+        [
+            (ArgDirection.SCALAR, "SCALAR"),
+            (ArgDirection.IN, "IN"),
+            (ArgDirection.OUT, "OUT"),
+            (ArgDirection.INOUT, "INOUT"),
+        ],
+    )
+    def test_arg_direction_name(self, direction, expected):
+        assert arg_direction_name(direction) == expected
+
+
+# ============================================================================
+# CoreCallable
+# ============================================================================
+
+
+class TestCoreCallable:
+    def test_build_and_access(self):
+        sig = [ArgDirection.IN, ArgDirection.OUT, ArgDirection.SCALAR]
+        binary = b"\x01\x02\x03\x04"
+        cc = CoreCallable.build(signature=sig, binary=binary)
+        assert cc.sig_count == 3
+        assert cc.sig(0) == ArgDirection.IN
+        assert cc.sig(1) == ArgDirection.OUT
+        assert cc.sig(2) == ArgDirection.SCALAR
+        assert cc.binary_size == 4
+
+    def test_empty_signature(self):
+        cc = CoreCallable.build(signature=[], binary=b"\xab")
+        assert cc.sig_count == 0
+        assert cc.binary_size == 1
+
+    def test_large_binary(self):
+        binary = bytes(range(256)) * 40  # 10240 bytes
+        cc = CoreCallable.build(signature=[ArgDirection.IN], binary=binary)
+        assert cc.binary_size == 10240
+
+    def test_empty_binary(self):
+        cc = CoreCallable.build(signature=[ArgDirection.IN, ArgDirection.OUT], binary=b"")
+        assert cc.sig_count == 2
+        assert cc.binary_size == 0
+
+    def test_buffer_ptr_and_size(self):
+        cc = CoreCallable.build(signature=[ArgDirection.IN], binary=b"\x00" * 100)
+        assert cc.buffer_ptr() != 0
+        assert cc.buffer_size() > 100
+
+    def test_sig_out_of_range(self):
+        cc = CoreCallable.build(signature=[ArgDirection.IN], binary=b"\x00")
+        with pytest.raises((IndexError, RuntimeError)):
+            cc.sig(1)
+        with pytest.raises((IndexError, RuntimeError)):
+            cc.sig(-1)
+
+    def test_repr(self):
+        cc = CoreCallable.build(signature=[ArgDirection.IN, ArgDirection.OUT], binary=b"\x00" * 8)
+        r = repr(cc)
+        assert "CoreCallable" in r
+        assert "sig_count=2" in r
+        assert "binary_size=8" in r
+
+
+# ============================================================================
+# ChipCallable
+# ============================================================================
+
+
+class TestChipCallable:
+    def _make_child(self, sig, binary):
+        return CoreCallable.build(signature=sig, binary=binary)
+
+    def test_build_with_children(self):
+        child0 = self._make_child([ArgDirection.IN], b"\x01\x02\x03\x04")
+        child1 = self._make_child([ArgDirection.OUT, ArgDirection.SCALAR], b"\x05\x06")
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
+            binary=b"\xaa" * 16,
+            children=[(10, child0), (20, child1)],
+        )
+        assert chip.sig_count == 3
+        assert chip.sig(0) == ArgDirection.IN
+        assert chip.sig(1) == ArgDirection.OUT
+        assert chip.sig(2) == ArgDirection.INOUT
+        assert chip.binary_size == 16
+        assert chip.child_count == 2
+        assert chip.child_func_id(0) == 10
+        assert chip.child_func_id(1) == 20
+
+    def test_child_alignment(self):
+        """All child offsets must be multiples of 64."""
+        child0 = self._make_child([ArgDirection.IN], b"\x01" * 7)
+        child1 = self._make_child([ArgDirection.OUT], b"\x02" * 100)
+        child2 = self._make_child([ArgDirection.SCALAR], b"\x03" * 1)
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN],
+            binary=b"\xbb" * 10,
+            children=[(1, child0), (2, child1), (3, child2)],
+        )
+        for i in range(chip.child_count):
+            assert chip.child_offset(i) % 64 == 0, f"child_offset({i}) = {chip.child_offset(i)} not aligned to 64"
+
+    def test_no_children(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.OUT],
+            binary=b"\xcc" * 32,
+            children=[],
+        )
+        assert chip.sig_count == 2
+        assert chip.binary_size == 32
+        assert chip.child_count == 0
+
+    def test_nested_child_access(self):
+        child = self._make_child([ArgDirection.IN, ArgDirection.OUT], b"\xdd" * 8)
+        chip = ChipCallable.build(
+            signature=[ArgDirection.SCALAR],
+            binary=b"\xee" * 4,
+            children=[(42, child)],
+        )
+        retrieved = chip.child(0)
+        assert retrieved.sig_count == 2
+        assert retrieved.sig(0) == ArgDirection.IN
+        assert retrieved.sig(1) == ArgDirection.OUT
+        assert retrieved.binary_size == 8
+
+    def test_child_out_of_range(self):
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN],
+            binary=b"\x00",
+            children=[],
+        )
+        with pytest.raises((IndexError, RuntimeError)):
+            chip.child(0)
+        with pytest.raises((IndexError, RuntimeError)):
+            chip.child_func_id(0)
+
+    def test_buffer_ptr_and_size(self):
+        child = self._make_child([ArgDirection.IN], b"\x00" * 50)
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN],
+            binary=b"\x00" * 100,
+            children=[(1, child)],
+        )
+        assert chip.buffer_ptr() != 0
+        assert chip.buffer_size() > 100
+
+    def test_repr(self):
+        child = self._make_child([ArgDirection.IN], b"\x00")
+        chip = ChipCallable.build(
+            signature=[ArgDirection.IN, ArgDirection.OUT],
+            binary=b"\x00" * 8,
+            children=[(1, child)],
+        )
+        r = repr(chip)
+        assert "ChipCallable" in r
+        assert "sig_count=2" in r
+        assert "child_count=1" in r

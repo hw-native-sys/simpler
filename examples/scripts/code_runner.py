@@ -68,7 +68,12 @@ import torch  # type: ignore[import-not-found]
 # =============================================================================
 # Argument construction — uses nanobind bindings from task_interface
 # =============================================================================
-from task_interface import ChipStorageTaskArgs, make_tensor_arg, scalar_to_uint64  # type: ignore[import-not-found]
+from task_interface import (  # type: ignore[import-not-found]
+    ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
+    CoreCallable,  # pyright: ignore[reportAttributeAccessIssue]
+    make_tensor_arg,
+    scalar_to_uint64,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -774,7 +779,9 @@ class CodeRunner:
                 kernel_bin = incore_o
             else:
                 kernel_bin = extract_text_section(incore_o)
-            return (kernel["func_id"], kernel_bin)
+            sig = kernel.get("signature", [])
+            callable_obj = CoreCallable.build(signature=sig, binary=kernel_bin)
+            return (kernel["func_id"], callable_obj)
 
         # Launch all compilations concurrently
         max_workers = 2 + len(self.kernels)  # runtime + orchestration + kernels

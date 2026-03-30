@@ -12,8 +12,9 @@
  * Nanobind Python extension for task_interface headers.
  *
  * Wraps DataType, ContinuousTensor, ChipStorageTaskArgs, DynamicTaskArgs,
- * TaggedTaskArgs, TensorArgType, and helper functions from
- * data_type.h / tensor_arg.h / task_args.h.
+ * TaggedTaskArgs, TensorArgType, ArgDirection, CoreCallable, ChipCallable,
+ * and helper functions from
+ * data_type.h / tensor_arg.h / task_args.h / arg_direction.h / callable.h.
  */
 
 #include <nanobind/nanobind.h>
@@ -25,10 +26,14 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
-#include "data_type.h"   // NOLINT(build/include_subdir)
-#include "task_args.h"   // NOLINT(build/include_subdir)
-#include "tensor_arg.h"  // NOLINT(build/include_subdir)
+#include "arg_direction.h"
+#include "callable.h"
+#include "data_type.h"
+#include "task_args.h"
+#include "tensor_arg.h"
 
 namespace nb = nanobind;
 
@@ -307,4 +312,180 @@ NB_MODULE(_task_interface, m) {
             "__len__",
             [](const TaggedTaskArgs& self) { return self.tensor_count() + self.scalar_count(); },
             "Return total number of arguments (tensors + scalars).");
+
+    // --- ArgDirection enum ---
+    nb::enum_<ArgDirection>(m, "ArgDirection")
+        .value("SCALAR", ArgDirection::SCALAR)
+        .value("IN", ArgDirection::IN)
+        .value("OUT", ArgDirection::OUT)
+        .value("INOUT", ArgDirection::INOUT);
+
+    m.def(
+        "arg_direction_name",
+        [](ArgDirection d) -> std::string { return arg_direction_name(d); },
+        nb::arg("direction"),
+        "Return the string name of an ArgDirection.");
+
+    // --- PyCoreCallable wrapper ---
+    struct PyCoreCallable {
+        std::vector<uint8_t> buffer_;
+        const CoreCallable& get() const { return *reinterpret_cast<const CoreCallable*>(buffer_.data()); }
+    };
+
+    nb::class_<PyCoreCallable>(m, "CoreCallable")
+        .def_static(
+            "build",
+            [](std::vector<ArgDirection> signature, nb::bytes binary) -> PyCoreCallable {
+                auto bin_ptr = reinterpret_cast<const void*>(binary.c_str());
+                auto bin_size = static_cast<uint32_t>(binary.size());
+                auto buf = make_callable<CORE_MAX_TENSOR_ARGS>(
+                    signature.data(), static_cast<int32_t>(signature.size()), bin_ptr, bin_size);
+                return PyCoreCallable{std::move(buf)};
+            },
+            nb::arg("signature"),
+            nb::arg("binary"),
+            "Build a CoreCallable from a signature list and binary bytes.")
+
+        .def(
+            "sig",
+            [](const PyCoreCallable& self, int32_t i) -> ArgDirection { return self.get().sig(i); },
+            nb::arg("i"),
+            "Return the ArgDirection at signature index i.")
+
+        .def_prop_ro(
+            "sig_count",
+            [](const PyCoreCallable& self) -> int32_t { return self.get().sig_count(); },
+            "Number of signature entries.")
+
+        .def_prop_ro(
+            "binary_size",
+            [](const PyCoreCallable& self) -> uint32_t { return self.get().binary_size(); },
+            "Size of the binary payload in bytes.")
+
+        .def(
+            "buffer_ptr",
+            [](const PyCoreCallable& self) -> uint64_t { return reinterpret_cast<uint64_t>(self.buffer_.data()); },
+            "Return the memory address of the underlying buffer.")
+
+        .def(
+            "buffer_size",
+            [](const PyCoreCallable& self) -> size_t { return self.buffer_.size(); },
+            "Return the total size of the underlying buffer in bytes.")
+
+        .def("__repr__", [](const PyCoreCallable& self) -> std::string {
+            const auto& c = self.get();
+            std::ostringstream os;
+            os << "CoreCallable(sig_count=" << c.sig_count() << ", binary_size=" << c.binary_size() << ")";
+            return os.str();
+        });
+
+    // --- PyChipCallable wrapper ---
+    struct PyChipCallable {
+        std::vector<uint8_t> buffer_;
+        const ChipCallable& get() const { return *reinterpret_cast<const ChipCallable*>(buffer_.data()); }
+    };
+
+    nb::class_<PyChipCallable>(m, "ChipCallable")
+        .def_static(
+            "build",
+            [](std::vector<ArgDirection> signature,
+                nb::bytes binary,
+                std::vector<std::tuple<int32_t, PyCoreCallable>> children) -> PyChipCallable {
+                auto bin_ptr = reinterpret_cast<const void*>(binary.c_str());
+                auto bin_size = static_cast<uint32_t>(binary.size());
+                auto child_count = static_cast<int32_t>(children.size());
+
+                std::vector<int32_t> func_ids(children.size());
+                std::vector<std::vector<uint8_t>> child_bufs(children.size());
+                for (size_t i = 0; i < children.size(); ++i) {
+                    func_ids[i] = std::get<0>(children[i]);
+                    child_bufs[i] = std::get<1>(children[i]).buffer_;
+                }
+
+                auto buf = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 32>(signature.data(),
+                    static_cast<int32_t>(signature.size()),
+                    bin_ptr,
+                    bin_size,
+                    func_ids.data(),
+                    child_bufs.data(),
+                    child_count);
+                return PyChipCallable{std::move(buf)};
+            },
+            nb::arg("signature"),
+            nb::arg("binary"),
+            nb::arg("children"),
+            "Build a ChipCallable from signature, binary, and list of (func_id, CoreCallable) children.")
+
+        .def(
+            "sig",
+            [](const PyChipCallable& self, int32_t i) -> ArgDirection { return self.get().sig(i); },
+            nb::arg("i"),
+            "Return the ArgDirection at signature index i.")
+
+        .def_prop_ro(
+            "sig_count",
+            [](const PyChipCallable& self) -> int32_t { return self.get().sig_count(); },
+            "Number of signature entries.")
+
+        .def_prop_ro(
+            "binary_size",
+            [](const PyChipCallable& self) -> uint32_t { return self.get().binary_size(); },
+            "Size of the binary payload in bytes.")
+
+        .def_prop_ro(
+            "child_count",
+            [](const PyChipCallable& self) -> int32_t { return self.get().child_count(); },
+            "Number of child callables.")
+
+        .def(
+            "child_func_id",
+            [](const PyChipCallable& self, int32_t i) -> int32_t { return self.get().child_func_id(i); },
+            nb::arg("i"),
+            "Return the func_id for child at index i.")
+
+        .def(
+            "child",
+            [](const PyChipCallable& self, int32_t i) -> PyCoreCallable {
+                const auto& parent = self.get();
+                const auto& c = parent.child(i);
+                // Reconstruct a PyCoreCallable by copying the child's raw bytes
+                auto offset = parent.child_offset(i);
+                const uint8_t* child_start = reinterpret_cast<const uint8_t*>(parent.storage_ + offset);
+                // Determine child size: from offset to next child or end of buffer
+                size_t child_size;
+                if (i + 1 < parent.child_count()) {
+                    child_size = parent.child_offset(i + 1) - offset;
+                } else {
+                    size_t header_size = offsetof(ChipCallable, storage_);
+                    child_size = self.buffer_.size() - header_size - offset;
+                }
+                std::vector<uint8_t> child_buf(child_start, child_start + child_size);
+                return PyCoreCallable{std::move(child_buf)};
+            },
+            nb::arg("i"),
+            "Return the CoreCallable child at index i.")
+
+        .def(
+            "child_offset",
+            [](const PyChipCallable& self, int32_t i) -> uint32_t { return self.get().child_offset(i); },
+            nb::arg("i"),
+            "Return the byte offset of child i within storage (must be multiple of 64).")
+
+        .def(
+            "buffer_ptr",
+            [](const PyChipCallable& self) -> uint64_t { return reinterpret_cast<uint64_t>(self.buffer_.data()); },
+            "Return the memory address of the underlying buffer.")
+
+        .def(
+            "buffer_size",
+            [](const PyChipCallable& self) -> size_t { return self.buffer_.size(); },
+            "Return the total size of the underlying buffer in bytes.")
+
+        .def("__repr__", [](const PyChipCallable& self) -> std::string {
+            const auto& c = self.get();
+            std::ostringstream os;
+            os << "ChipCallable(sig_count=" << c.sig_count() << ", binary_size=" << c.binary_size()
+               << ", child_count=" << c.child_count() << ")";
+            return os.str();
+        });
 }

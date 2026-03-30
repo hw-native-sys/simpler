@@ -49,7 +49,7 @@ repos:
           args:
             - --root=include
             - --linelength=120
-            - --filter=-whitespace/parens,-whitespace/indent_namespace,-runtime/references
+            - --filter=-whitespace/parens,-whitespace/indent_namespace,-runtime/references,-build/include_subdir
 
     # Markdown linting
     - repo: https://github.com/DavidAnson/markdownlint-cli2

@@ -23,7 +23,7 @@
  *   - real type: adds tags_ storage + tag(i) accessor
  *
  * Type aliases:
- *   ChipStorageTaskArgs = TaskArgs<ContinuousTensor, uint64_t, 16, 128>
+ *   ChipStorageTaskArgs = TaskArgs<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 128>
  */
 
 #pragma once
@@ -34,7 +34,8 @@
 #include <type_traits>
 #include <vector>
 
-#include "tensor_arg.h"  // NOLINT(build/include_subdir)
+#include "arg_direction.h"
+#include "tensor_arg.h"
 
 // ============================================================================
 // TensorTagMixin — conditionally provides per-tensor tag storage
@@ -151,10 +152,10 @@ struct TaskArgs<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
 // ============================================================================
 
 // Transport/storage: host → device, no per-tensor tags
-using ChipStorageTaskArgs = TaskArgs<ContinuousTensor, uint64_t, 16, 128>;
+using ChipStorageTaskArgs = TaskArgs<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 128>;
 
 // Dynamic variant (no capacity limit)
 using DynamicTaskArgs = TaskArgs<ContinuousTensor, uint64_t, 0, 0>;
 
 // Tagged variant with TensorArgType (for submit-time INPUT/OUTPUT/INOUT)
-using TaggedTaskArgs = TaskArgs<ContinuousTensor, uint64_t, 16, 128, TensorArgType>;
+using TaggedTaskArgs = TaskArgs<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 128, TensorArgType>;

@@ -25,14 +25,14 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
-#include "pto2_dispatch_payload.h"  // NOLINT(build/include_subdir)
-#include "runtime.h"                // NOLINT(build/include_subdir)
-#include "spin_hint.h"              // NOLINT(build/include_subdir)
+#include "pto2_dispatch_payload.h"
+#include "runtime.h"
+#include "spin_hint.h"
 
 // Runtime headers (full struct definition for create/destroy + PTO2_SCOPE)
-#include "pto_runtime2.h"        // NOLINT(build/include_subdir)
-#include "pto_runtime2_types.h"  // NOLINT(build/include_subdir)
-#include "pto_shared_memory.h"   // NOLINT(build/include_subdir)
+#include "pto_runtime2.h"
+#include "pto_runtime2_types.h"
+#include "pto_shared_memory.h"
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
@@ -46,6 +46,9 @@
 
 // Core type definitions
 #include "common/core_type.h"
+
+// CoreCallable for resolved dispatch address
+#include "callable.h"
 
 #if PTO2_PROFILING
 // Accumulated nanoseconds per sub-step
@@ -118,15 +121,15 @@ static_assert(sizeof(CoreExecState) == 64, "CoreExecState must occupy exactly on
 //   bit i*3+2 = AIV1 of cluster i
 // Max 21 clusters per tracker (63 bits in uint64_t).
 class alignas(64) CoreTracker {
-public:
+ public:
     static inline int32_t MAX_CORE_PER_THREAD = 63;
     static constexpr int32_t MAX_CLUSTERS = 63 / 3;
 
-public:
+ public:
     CoreTracker() = default;
 
     class BitStates {
-    public:  // NOLINT(whitespace/indent)
+     public:  // NOLINT(whitespace/indent)
         BitStates() = default;
 
         explicit BitStates(uint64_t states) : states_(states) {}
@@ -154,11 +157,11 @@ public:
             return pos;
         }
 
-    private:  // NOLINT(whitespace/indent)
+     private:  // NOLINT(whitespace/indent)
         uint64_t states_{0};
     };
 
-public:
+ public:
     void init(int32_t cluster_count) {
         cluster_count_ = cluster_count;
         aic_mask_.init();
@@ -254,7 +257,7 @@ public:
 
     int32_t get_core_id_by_offset(int32_t offset) const { return core_id_map_[offset]; }
 
-private:
+ private:
     int32_t cluster_count_;
     BitStates aic_mask_;
     BitStates aiv_mask_;
@@ -577,7 +580,9 @@ struct AicpuExecutor {
         CoreExecState& core_exec_state = core_exec_states_[core_id];
         PTO2DispatchPayload& payload = s_pto2_payload_per_core[core_id];
         int32_t slot_idx = static_cast<int32_t>(subslot);
-        payload.function_bin_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
+        uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
+        const CoreCallable* callable = reinterpret_cast<const CoreCallable*>(callable_addr);
+        payload.function_bin_addr = callable->resolved_addr();
         payload.args = slot_state.payload->dispatch_args;
         core_exec_state.executing_subslot = subslot;
         core_exec_state.executing_slot_state = &slot_state;

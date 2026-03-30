@@ -263,11 +263,13 @@ class Runtime:
             # Create array of binary pointers
             binary_ptrs = []
             sizes = []
-            for func_id, binary in kernel_binaries:
-                arr = (c_uint8 * len(binary)).from_buffer_copy(binary)
-                self._kernel_binary_arrays.append(arr)  # Keep reference
-                binary_ptrs.append(cast(arr, POINTER(c_uint8)))
-                sizes.append(len(binary))
+            for func_id, kernel_item in kernel_binaries:
+                buf_ptr = kernel_item.buffer_ptr()  # pyright: ignore[reportAttributeAccessIssue]
+                buf_size = kernel_item.buffer_size()  # pyright: ignore[reportAttributeAccessIssue]
+                ptr = cast(c_void_p(buf_ptr), POINTER(c_uint8))
+                binary_ptrs.append(ptr)
+                sizes.append(buf_size)
+                self._kernel_binary_arrays.append(kernel_item)
 
             binaries_array = (POINTER(c_uint8) * kernel_count)(*binary_ptrs)
             sizes_array = (c_size_t * kernel_count)(*sizes)

@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Device Runner Implementation
  *
@@ -9,8 +19,13 @@
 
 #include <dlfcn.h>
 
+#include <iostream>
+#include <string>
+#include <vector>
+
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
+#include "callable.h"
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
 
@@ -281,18 +296,15 @@ int DeviceRunner::run(Runtime& runtime,
     const std::vector<uint8_t>& aicpu_so_binary,
     const std::vector<uint8_t>& aicore_kernel_binary,
     int launch_aicpu_num) {
-
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
-        LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]",
-                      launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
+        LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
     }
 
     // Validate block_dim
     if (block_dim < 1 || block_dim > PLATFORM_MAX_BLOCKDIM) {
-        LOG_ERROR("block_dim (%d) must be in range [1, %d]",
-                      block_dim, PLATFORM_MAX_BLOCKDIM);
+        LOG_ERROR("block_dim (%d) must be in range [1, %d]", block_dim, PLATFORM_MAX_BLOCKDIM);
         return -1;
     }
 
@@ -300,26 +312,28 @@ int DeviceRunner::run(Runtime& runtime,
     int scheduler_thread_num = launch_aicpu_num - runtime.orch_thread_num;
 
     if (runtime.orch_thread_num > launch_aicpu_num) {
-        LOG_ERROR("orch_thread_num (%d) cannot exceed aicpu_thread_num (%d)",
-                  runtime.orch_thread_num, launch_aicpu_num);
+        LOG_ERROR(
+            "orch_thread_num (%d) cannot exceed aicpu_thread_num (%d)", runtime.orch_thread_num, launch_aicpu_num);
         return -1;
     }
 
     // Validate even core distribution for initial scheduler threads
     if (scheduler_thread_num > 0) {
         if (block_dim % scheduler_thread_num != 0) {
-            LOG_ERROR("block_dim (%d) not evenly divisible by scheduler_thread_num (%d)",
-                     block_dim, scheduler_thread_num);
+            LOG_ERROR(
+                "block_dim (%d) not evenly divisible by scheduler_thread_num (%d)", block_dim, scheduler_thread_num);
             return -1;
         }
     } else {
-        LOG_INFO("All %d threads are orchestrators, cores will be assigned after orchestration completes",
-                 launch_aicpu_num);
+        LOG_INFO(
+            "All %d threads are orchestrators, cores will be assigned after orchestration completes", launch_aicpu_num);
         // Post-transition: all threads become schedulers
         if (block_dim % launch_aicpu_num != 0) {
-            LOG_WARN("block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
-                     "some threads will have different core counts after transition",
-                     block_dim, launch_aicpu_num);
+            LOG_WARN(
+                "block_dim (%d) not evenly divisible by aicpu_thread_num (%d), "
+                "some threads will have different core counts after transition",
+                block_dim,
+                launch_aicpu_num);
         }
     }
 
@@ -336,8 +350,7 @@ int DeviceRunner::run(Runtime& runtime,
     int num_aicore = block_dim * cores_per_blockdim_;
     // Initialize handshake buffers in runtime
     if (num_aicore > RUNTIME_MAX_WORKER) {
-        LOG_ERROR("block_dim (%d) exceeds RUNTIME_MAX_WORKER (%d)",
-                      block_dim, RUNTIME_MAX_WORKER);
+        LOG_ERROR("block_dim (%d) exceeds RUNTIME_MAX_WORKER (%d)", block_dim, RUNTIME_MAX_WORKER);
         return -1;
     }
 
@@ -363,20 +376,19 @@ int DeviceRunner::run(Runtime& runtime,
         runtime.workers[i].task_status = 0;
         // Set core type: first 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
-        runtime.workers[i].perf_records_addr = (uint64_t)nullptr;
+        runtime.workers[i].perf_records_addr = static_cast<uint64_t>(0);
         runtime.workers[i].perf_buffer_status = 0;
     }
 
-    // Set function_bin_addr for all tasks from Runtime's func_id_to_addr_[] array
-    // (addresses were stored there during init_runtime via upload_kernel_binary)
+    // Set function_bin_addr for all tasks: func_id_to_addr_[] stores CoreCallable
+    // device address; compute binary code address using compile-time offset
     LOG_DEBUG("Setting function_bin_addr for Tasks");
     for (int i = 0; i < runtime.get_task_count(); i++) {
         Task* task = runtime.get_task(i);
         if (task != nullptr) {
-            uint64_t addr = runtime.get_function_bin_addr(task->func_id);
-            task->function_bin_addr = addr;
-            LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx",
-                          i, task->func_id, addr);
+            uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
+            task->function_bin_addr = callable_addr + CoreCallable::binary_data_offset();
+            LOG_DEBUG("Task %d (func_id=%d) -> function_bin_addr=0x%lx", i, task->func_id, task->function_bin_addr);
         }
     }
     LOG_DEBUG("");
@@ -389,10 +401,7 @@ int DeviceRunner::run(Runtime& runtime,
         }
     });
 
-    auto runtime_args_cleanup = RAIIScopeGuard([this]() {
-        kernel_args_.finalize_runtime_args();
-    });
-
+    auto runtime_args_cleanup = RAIIScopeGuard([this]() { kernel_args_.finalize_runtime_args(); });
 
     // Initialize performance profiling if enabled
     if (runtime.enable_profiling) {
@@ -430,7 +439,8 @@ int DeviceRunner::run(Runtime& runtime,
 
     std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer===" << '\n';
     // Launch AICPU main kernel (over-launch for affinity gate)
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH);
+    rc = launch_aicpu_kernel(
+        stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);
         return rc;
@@ -448,9 +458,8 @@ int DeviceRunner::run(Runtime& runtime,
         // Poll and collect performance data in a separate collector thread
         std::thread collector_thread;
         if (runtime.enable_profiling) {
-            collector_thread = std::thread([this, &runtime]() {
-                poll_and_collect_performance_data(runtime.get_task_count());
-            });
+            collector_thread =
+                std::thread([this, &runtime]() { poll_and_collect_performance_data(runtime.get_task_count()); });
         }
         auto thread_guard = RAIIScopeGuard([&]() {
             if (runtime.enable_profiling && collector_thread.joinable()) {
@@ -501,8 +510,11 @@ void DeviceRunner::print_handshake_results() {
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
     for (int i = 0; i < worker_count_; i++) {
         LOG_DEBUG("  Core %d: aicore_done=%d aicpu_ready=%d control=%d task=%d",
-                      i, workers[i].aicore_done, workers[i].aicpu_ready,
-                      workers[i].control, workers[i].task);
+            i,
+            workers[i].aicore_done,
+            workers[i].aicpu_ready,
+            workers[i].control,
+            workers[i].task);
     }
 }
 
@@ -519,8 +531,7 @@ int DeviceRunner::finalize() {
 
     // Kernel binaries should have been removed by validate_runtime_impl()
     if (!func_id_to_addr_.empty()) {
-        LOG_ERROR("finalize() called with %zu kernel binaries still cached (memory leak)",
-                  func_id_to_addr_.size());
+        LOG_ERROR("finalize() called with %zu kernel binaries still cached (memory leak)", func_id_to_addr_.size());
         // Cleanup leaked binaries to prevent memory leaks
         for (const auto& pair : func_id_to_addr_) {
             void* gm_addr = reinterpret_cast<void*>(pair.second);
@@ -654,7 +665,7 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data
         return 0;
     }
 
-    // Return cached address if already uploaded
+    // Return cached callable address if already uploaded
     auto it = func_id_to_addr_.find(func_id);
     if (it != func_id_to_addr_.end()) {
         LOG_INFO("Kernel func_id=%d already uploaded, returning cached address", func_id);
@@ -670,7 +681,15 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data
         return 0;
     }
 
-    // Copy kernel binary to device
+    // Set resolved_addr_ in host buffer before copying to device:
+    // AICPU will read this field to get the binary code address for dispatch
+    uint64_t callable_addr = reinterpret_cast<uint64_t>(gm_addr);
+    uint64_t binary_code_addr = callable_addr + CoreCallable::binary_data_offset();
+    // Write resolved_addr_ into the host-side buffer (the field lives at a fixed offset)
+    CoreCallable* host_callable = reinterpret_cast<CoreCallable*>(const_cast<uint8_t*>(bin_data));
+    host_callable->set_resolved_addr(binary_code_addr);
+
+    // Copy the full CoreCallable (header + binary) to device
     int rc = rtMemcpy(gm_addr, bin_size, bin_data, bin_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (rc != 0) {
         LOG_ERROR("rtMemcpy to device failed: %d", rc);
@@ -678,13 +697,11 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data
         return 0;
     }
 
-    // Cache the kernel address
-    uint64_t function_bin_addr = reinterpret_cast<uint64_t>(gm_addr);
-    func_id_to_addr_[func_id] = function_bin_addr;
+    func_id_to_addr_[func_id] = callable_addr;
 
-    LOG_DEBUG("  func_id=%d -> function_bin_addr=0x%lx", func_id, function_bin_addr);
+    LOG_DEBUG("  func_id=%d -> callable_addr=0x%lx, binary_code_addr=0x%lx", func_id, callable_addr, binary_code_addr);
 
-    return function_bin_addr;
+    return callable_addr;
 }
 
 void DeviceRunner::remove_kernel_binary(int func_id) {
@@ -710,8 +727,7 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
     };
 
     // Define registration callback (a2a3: use halHostRegister for shared memory)
-    auto register_cb = [](void* dev_ptr, size_t size, int device_id,
-                          void* user_data, void** host_ptr) -> int {
+    auto register_cb = [](void* dev_ptr, size_t size, int device_id, void* user_data, void** host_ptr) -> int {
         (void)user_data;  // Not needed for registration
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for profiling: %s", dlerror());
@@ -730,8 +746,7 @@ int DeviceRunner::init_performance_profiling(Runtime& runtime, int num_aicore, i
         return allocator->free(dev_ptr);
     };
 
-    return perf_collector_.initialize(runtime, num_aicore, device_id,
-                                       alloc_cb, register_cb, free_cb, &mem_alloc_);
+    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
@@ -741,4 +756,3 @@ void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
 int DeviceRunner::export_swimlane_json(const std::string& output_path) {
     return perf_collector_.export_swimlane_json(output_path);
 }
-

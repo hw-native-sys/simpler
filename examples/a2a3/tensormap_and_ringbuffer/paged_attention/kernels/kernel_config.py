@@ -6,7 +6,6 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-
 """
 Paged Attention Kernel and Orchestration Configuration
 
@@ -26,6 +25,8 @@ Note: aiv_normalize has been merged into aiv_online_update for efficiency.
 
 from pathlib import Path
 
+from task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
+
 _KERNELS_ROOT = Path(__file__).parent
 
 # Orchestration config
@@ -37,13 +38,49 @@ ORCHESTRATION = {
 # Kernel configs (aiv_normalize removed - merged into aiv_online_update)
 KERNELS = [
     # AIC kernels (matrix multiplication using Cube unit)
-    {"func_id": 0, "name": "QK", "source": str(_KERNELS_ROOT / "aic" / "aic_qk_matmul.cpp"), "core_type": "aic"},
-    {"func_id": 2, "name": "PV", "source": str(_KERNELS_ROOT / "aic" / "aic_pv_matmul.cpp"), "core_type": "aic"},
-    {"func_id": 4, "name": "AIC_HUB", "source": str(_KERNELS_ROOT / "aic" / "aic_hub.cpp"), "core_type": "aic"},
+    {
+        "func_id": 0,
+        "name": "QK",
+        "source": str(_KERNELS_ROOT / "aic" / "aic_qk_matmul.cpp"),
+        "core_type": "aic",
+        "signature": [D.IN, D.IN, D.OUT],
+    },
+    {
+        "func_id": 2,
+        "name": "PV",
+        "source": str(_KERNELS_ROOT / "aic" / "aic_pv_matmul.cpp"),
+        "core_type": "aic",
+        "signature": [D.IN, D.IN, D.OUT],
+    },
+    {
+        "func_id": 4,
+        "name": "AIC_HUB",
+        "source": str(_KERNELS_ROOT / "aic" / "aic_hub.cpp"),
+        "core_type": "aic",
+        "signature": [],
+    },
     # AIV kernels (vector operations)
-    {"func_id": 1, "name": "SF", "source": str(_KERNELS_ROOT / "aiv" / "aiv_softmax_prepare.cpp"), "core_type": "aiv"},
-    {"func_id": 3, "name": "UP", "source": str(_KERNELS_ROOT / "aiv" / "aiv_online_update.cpp"), "core_type": "aiv"},
-    {"func_id": 5, "name": "AIV_HUB", "source": str(_KERNELS_ROOT / "aiv" / "aiv_hub.cpp"), "core_type": "aiv"},
+    {
+        "func_id": 1,
+        "name": "SF",
+        "source": str(_KERNELS_ROOT / "aiv" / "aiv_softmax_prepare.cpp"),
+        "core_type": "aiv",
+        "signature": [D.IN, D.OUT, D.OUT, D.OUT],
+    },
+    {
+        "func_id": 3,
+        "name": "UP",
+        "source": str(_KERNELS_ROOT / "aiv" / "aiv_online_update.cpp"),
+        "core_type": "aiv",
+        "signature": [D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.INOUT, D.INOUT],
+    },
+    {
+        "func_id": 5,
+        "name": "AIV_HUB",
+        "source": str(_KERNELS_ROOT / "aiv" / "aiv_hub.cpp"),
+        "core_type": "aiv",
+        "signature": [],
+    },
 ]
 
 # Runtime configuration

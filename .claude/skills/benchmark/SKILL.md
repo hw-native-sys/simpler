@@ -28,12 +28,14 @@ Extra arguments (`-n`, `-r`, etc.) are forwarded to `tools/benchmark_rounds.sh`.
 
 ### Device arguments (`-d`)
 
-The `-d` flag specifies NPU device IDs. The number of devices determines parallelism in compare mode:
+The `-d` flag specifies NPU device IDs.
+
+**Hard rule: one benchmark process per device at any time.** Never run two benchmark processes on the same `-d` device concurrently — not two runtimes, not baseline + current, nothing. This prevents resource contention and ensures stable measurements.
 
 | `-d` count | Compare mode behavior |
 | ---------- | --------------------- |
-| One device (`-d 4`) | **Sequential**: baseline first, then current, both on the same device |
-| Two devices (`-d 4 -d 6`) | **Parallel**: baseline on first device, current on second device |
+| One device (`-d 4`) | **Sequential**: baseline first, then current, both on the same device. Multiple runtimes also run serially on that device. |
+| Two devices (`-d 4 -d 6`) | **Parallel per-runtime**: for each runtime, baseline on first device and current on second device can run in parallel (different devices). Multiple runtimes still run serially — finish one runtime on both devices before starting the next. |
 | Zero (not specified) | Auto-detect idle devices (see Step 2) |
 
 **Defaults** (when not specified): use `benchmark_rounds.sh` defaults (device 0, 100 rounds, a2a3, tensormap_and_ringbuffer).
@@ -56,7 +58,7 @@ if git diff --name-only "$MERGE_BASE"...HEAD | grep -q 'aicpu_build_graph'; then
 fi
 ```
 
-Run `benchmark_rounds.sh` once per runtime, with `-r <runtime>` appended. Report results in separate tables per runtime.
+Run `benchmark_rounds.sh` once per runtime, with `-r <runtime>` appended. **Runtimes are always benchmarked serially** — finish all baseline+current runs for one runtime before starting the next. This ensures no device ever runs two benchmark processes concurrently.
 
 ## Step 1: Detect Mode
 
@@ -160,18 +162,19 @@ git worktree remove "$WORKTREE_DIR" --force
 
 #### Parallel execution (two devices)
 
-When two devices are available, run baseline and current in parallel. Since `build_runtimes.py` only builds into the local `build/lib/` without modifying the shared Python environment, both workspaces are fully independent.
+When two devices are available, run baseline and current **for the same runtime** in parallel on separate devices. Since `build_runtimes.py` only builds into the local `build/lib/` without modifying the shared Python environment, both workspaces are fully independent.
 
 ```bash
-# 1. Build worktree binaries
-cd "$WORKTREE_DIR" && python examples/scripts/build_runtimes.py
-
-# 2. Launch both in parallel (background)
-#    Baseline — must cd into worktree in the command
-cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $DEVICE_BASELINE ... &
-#    Current — runs from main workspace cwd
-./tools/benchmark_rounds.sh -d $DEVICE_CURRENT ... &
+# For each runtime (serially):
+for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
+  # Baseline on device A, current on device B — parallel (different devices)
+  cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $DEVICE_BASELINE -r "$RUNTIME" ... &
+  ./tools/benchmark_rounds.sh -d $DEVICE_CURRENT -r "$RUNTIME" ... &
+  wait  # Both finish before starting next runtime
+done
 ```
+
+**Never launch the next runtime until the current one finishes on all devices.**
 
 #### Sequential execution (one device)
 
@@ -179,15 +182,18 @@ cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $DEVICE_BASELINE ... &
 # 1. Build worktree binaries
 cd "$WORKTREE_DIR" && python examples/scripts/build_runtimes.py
 
-# 2. Run baseline from worktree
-cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
-  2>&1 | tee "$PROJECT_ROOT/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
+# 2. For each runtime (serially — one device, one process at a time):
+for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
+  # Baseline first
+  cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+    2>&1 | tee "$PROJECT_ROOT/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
 
-# 3. Run current from main workspace
-./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
-  2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
+  # Then current
+  ./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+    2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
+done
 
-# 4. Cleanup
+# 3. Cleanup
 git worktree remove "$WORKTREE_DIR" --force
 ```
 
