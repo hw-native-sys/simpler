@@ -454,6 +454,12 @@ run_hw_tasks() {
     done
     for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
 
+    # Record tasks stranded in the queue after workers exited (quarantine).
+    # These were never popped, so they have no result in hw_marker yet.
+    while IFS=':' read -r idx attempt; do
+        [[ -n "$idx" ]] && echo "${idx}|FAIL" >> "$hw_marker"
+    done < "$queue"
+
     HW_FAILURES=()
     while IFS='|' read -r idx result; do
         [[ "$result" == "FAIL" ]] && HW_FAILURES+=("$idx")
