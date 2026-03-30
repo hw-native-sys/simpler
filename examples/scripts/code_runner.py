@@ -164,6 +164,8 @@ def _is_git_available() -> bool:
 
 _PTO_ISA_HTTPS = "https://github.com/PTO-ISA/pto-isa.git"
 _PTO_ISA_SSH = "git@github.com:PTO-ISA/pto-isa.git"
+# Temporary: pin pto-isa to a known-good commit until the dependency is managed properly
+_PTO_ISA_PINNED_COMMIT = "a6528046c30dbe974ee8eaf249d6a73056c651bf"
 
 
 def _pto_isa_repo_url(clone_protocol: str = "ssh") -> str:
@@ -365,14 +367,11 @@ def _ensure_pto_isa_root_locked(
             if verbose:
                 logger.info("pto-isa already cloned by another process")
             # Recovered from race — apply commit/update below
-            if commit:
-                _checkout_pto_isa_commit(clone_path, commit, verbose=verbose)
-            else:
-                _update_pto_isa_to_latest(clone_path, verbose=verbose)
+            _checkout_pto_isa_commit(clone_path, commit or _PTO_ISA_PINNED_COMMIT, verbose=verbose)
     elif commit:
         _checkout_pto_isa_commit(clone_path, commit, verbose=verbose)
     else:
-        _update_pto_isa_to_latest(clone_path, verbose=verbose)
+        _checkout_pto_isa_commit(clone_path, _PTO_ISA_PINNED_COMMIT, verbose=verbose)
 
     # Verify clone has expected content
     include_dir = clone_path / "include"
