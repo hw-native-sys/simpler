@@ -300,6 +300,7 @@ class KernelCompiler:
         if incore_toolchain == ToolchainType.HOST_GXX_15:
             return self._compile_incore_sim(
                 source_path,
+                core_type=core_type,
                 pto_isa_root=pto_isa_root,
                 extra_include_dirs=extra_include_dirs,
                 build_dir=build_dir,
@@ -467,24 +468,29 @@ class KernelCompiler:
     def _compile_incore_sim(
         self,
         source_path: str,
+        core_type: str,
         pto_isa_root: Optional[str] = None,
         extra_include_dirs: Optional[List[str]] = None,
         build_dir: Optional[str] = None,
     ) -> bytes:
         """
-        Compile a simulation kernel to .so/.dylib using g++-15.
+        Compile an InCore simulation kernel to .so/.dylib using g++-15.
 
         Args:
             source_path: Path to kernel source file (.cpp)
-            pto_isa_root: Path to PTO-ISA root directory (for PTO ISA headers)
-            extra_include_dirs: Additional include directories
+            core_type: Core type: "aic" (cube) or "aiv" (vector). Required so
+                the host sim compiler keeps the matching PTOAS sections.
+            pto_isa_root: Optional PTO-ISA root directory used to add header
+                search paths when the kernel includes PTO ISA headers.
+            extra_include_dirs: Additional include directories.
+            build_dir: Optional directory for the compiled shared library.
 
         Returns:
             Binary contents of the compiled .so/.dylib file
 
         Raises:
-            FileNotFoundError: If source file not found
-            RuntimeError: If compilation fails
+            FileNotFoundError: If source file is not found.
+            RuntimeError: If compilation fails.
         """
         source_path = os.path.abspath(source_path)
         if not os.path.isfile(source_path):
@@ -498,7 +504,7 @@ class KernelCompiler:
             build_dir=build_dir)
 
         # Build command from toolchain
-        cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags()
+        cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags(core_type=core_type)
 
         # Add PTO ISA header paths if provided
         if pto_isa_root:

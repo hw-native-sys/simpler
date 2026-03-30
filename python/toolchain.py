@@ -97,7 +97,7 @@ class Gxx15Toolchain(Toolchain):
         super().__init__()
         self.cxx_path = "g++-15"
 
-    def get_compile_flags(self, core_type: str = "", **kwargs) -> List[str]:
+    def get_compile_flags(self, core_type: str | None = None, **kwargs) -> List[str]:
         flags = [
             "-shared", "-O2", "-fPIC",
             "-std=c++23",
@@ -108,12 +108,15 @@ class Gxx15Toolchain(Toolchain):
             "-DPTO_CPU_MAX_THREADS=1",
             "-DNDEBUG",
         ]
-        # g++ does not define __DAV_VEC__/__DAV_CUBE__ like ccec does,
-        # so we must add them explicitly based on core_type.
-        if core_type == "aiv":
-            flags.append("-D__DAV_VEC__")
-        elif core_type == "aic":
-            flags.append("-D__DAV_CUBE__")
+        # g++ does not define core-specific macros like ccec does, so host sim
+        # must select the matching PTOAS section explicitly.
+        if core_type is not None:
+            if core_type == "aiv":
+                flags.extend(["-D__AIV__", "-D__DAV_VEC__"])
+            elif core_type == "aic":
+                flags.extend(["-D__AIC__", "-D__DAV_CUBE__"])
+            else:
+                raise ValueError(f"Unknown core_type: {core_type}. Supported: aic, aiv")
         return flags
 
     def get_cmake_args(self) -> List[str]:
