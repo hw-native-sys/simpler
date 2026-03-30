@@ -439,13 +439,6 @@ run_hw_tasks() {
                         flock "$lock" bash -c "echo '${idx}:${next}' >> \"$queue\""
                     else
                         echo "${idx}|FAIL" >> "$hw_marker"
-                        local safe_name="${HW_TASK_NAMES[$idx]//[:\/]/_}"
-                        local last_log="${LOG_DIR}/${safe_name}_${HW_TASK_PLATS[$idx]}_attempt${attempt}.log"
-                        echo "--- LOG: ${HW_TASK_NAMES[$idx]} (attempt $attempt) ---"
-                        cat "$last_log"
-                        echo "--- END ---"
-                        echo "[${HW_TASK_PLATS[$idx]}:dev${device_id}] Device quarantined after exhausting retries"
-                        break
                     fi
                 fi
             done
