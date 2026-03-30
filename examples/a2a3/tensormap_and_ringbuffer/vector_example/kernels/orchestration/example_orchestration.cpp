@@ -33,17 +33,6 @@
 
 #include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
-// Helper to encode float as uint64_t for scalar args
-static uint64_t float_to_u64(float f) {
-    union {
-        float f32;
-        uint64_t u64;
-    } conv;
-    conv.u64 = 0;  // Clear upper bits
-    conv.f32 = f;
-    return conv.u64;
-}
-
 extern "C" {
 
 /**
@@ -94,7 +83,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         Arg params_t1;
         params_t1.add_input(c);
         params_t1.add_output(inter_ci);
-        params_t1.add_scalar(float_to_u64(1.0f));
+        params_t1.add_scalar(to_u64(1.0f));
         params_t1.add_scalar(static_cast<uint64_t>(3));
         TaskOutputTensors outs_t1 = pto2_rt_submit_aiv_task(1, params_t1);  // kernel_add_scalar
         const Tensor& d = outs_t1.get_ref(0);
@@ -103,7 +92,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         Arg params_t2;
         params_t2.add_input(c);
         params_t2.add_output(inter_ci);
-        params_t2.add_scalar(float_to_u64(2.0f));
+        params_t2.add_scalar(to_u64(2.0f));
         params_t2.add_scalar(static_cast<uint64_t>(3));
         TaskOutputTensors outs_t2 = pto2_rt_submit_aiv_task(1, params_t2);  // kernel_add_scalar
         const Tensor& e = outs_t2.get_ref(0);

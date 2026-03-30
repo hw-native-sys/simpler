@@ -27,16 +27,6 @@
 
 #include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
 
-static uint64_t float_to_u64(float f) {
-    union {
-        float f32;
-        uint64_t u64;
-    } conv;
-    conv.u64 = 0;
-    conv.f32 = f;
-    return conv.u64;
-}
-
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
@@ -73,7 +63,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         Arg args_t1;
         args_t1.add_input(r0.outputs.get_ref(0));
         args_t1.add_output(TensorCreateInfo(shapes, 1, DataType::FLOAT32));
-        args_t1.add_scalar(float_to_u64(1.0f));
+        args_t1.add_scalar(to_u64(1.0f));
         SubmitResult r1 = pto2_rt_submit_aiv_task(rt, 1, args_t1);
         pto2_rt_add_dependency(rt, r0.task_id, r1.task_id);
 
@@ -81,7 +71,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         Arg args_t2;
         args_t2.add_input(r0.outputs.get_ref(0));
         args_t2.add_output(TensorCreateInfo(shapes, 1, DataType::FLOAT32));
-        args_t2.add_scalar(float_to_u64(2.0f));
+        args_t2.add_scalar(to_u64(2.0f));
         SubmitResult r2 = pto2_rt_submit_aiv_task(rt, 1, args_t2);
         pto2_rt_add_dependency(rt, r0.task_id, r2.task_id);
 

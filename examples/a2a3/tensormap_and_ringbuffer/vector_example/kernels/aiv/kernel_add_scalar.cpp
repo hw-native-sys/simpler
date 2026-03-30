@@ -42,12 +42,7 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     __gm__ float* out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
     // Convert scalar from uint64_t to float
-    union {
-        uint64_t u64;
-        float f32;
-    } converter;
-    converter.u64 = args[2];
-    float scalar = converter.f32;
+    float scalar = from_u64<float>(static_cast<uint64_t>(args[2]));
 
     // Configuration: float, 128, 128, 128, 128
     constexpr int kTRows_ = 128;

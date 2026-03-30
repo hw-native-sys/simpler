@@ -1,13 +1,22 @@
 /**
- * Data Type Definitions for Orchestration Build Graph Runtime
+ * Data Type Definitions and Conversion Utilities
  *
- * Defines supported data types and helper functions for element size calculation.
+ * Defines supported data types, element size helpers, and type-safe
+ * packing/unpacking of values into uint64_t (the universal scalar storage
+ * type in the orchestration framework).
  */
 
 #ifndef ORCH_BUILD_GRAPH_DATA_TYPE_H
 #define ORCH_BUILD_GRAPH_DATA_TYPE_H
 
 #include <cstdint>
+
+#if __has_include(<type_traits>)
+#include <type_traits>
+#define PTO_HAS_TYPE_TRAITS 1
+#else
+#define PTO_HAS_TYPE_TRAITS 0
+#endif
 
 /**
  * Supported data types for tensor elements
@@ -76,6 +85,82 @@ inline const char* get_dtype_name(DataType dtype) {
         default:
             return "UNKNOWN";
     }
+}
+
+// =============================================================================
+// uint64_t Packing/Unpacking Utilities
+// =============================================================================
+
+// Kernel-callable qualifier: when compiling for AICore (ccec compiler defines
+// __DAV_VEC__ or __DAV_CUBE__), PTO_DEVICE_FUNC adds the __aicore__ attribute.
+// In orchestration / host builds, PTO_DEVICE_FUNC expands to nothing.
+#if defined(__DAV_VEC__) || defined(__DAV_CUBE__)
+// Ensure __aicore__ is available (CCE attribute for bisheng compiler).
+// Platform headers (inner_kernel.h) normally define this, but data_type.h
+// may be included before them.
+#ifndef __aicore__
+#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
+#endif
+#define PTO_DEVICE_FUNC __aicore__
+#else
+#define PTO_DEVICE_FUNC
+#endif
+
+// -----------------------------------------------------------------------------
+// Unified template interface for all targets (AICore + CPU).
+//
+// ccec (Bisheng CCE compiler) does not support template *classes*, but does
+// support template *functions* with __aicore__ — verified by existing kernel
+// code (e.g. CeilAlign<T>, qk_matmul_impl<M,K,N>).  We use anonymous unions
+// inside each function body to avoid any template class dependency.
+//
+// Named convenience functions (from_u64_f32 etc.) are removed — use the
+// template form from_u64<T>() / to_u64() directly.
+// -----------------------------------------------------------------------------
+
+/**
+ * Pack a value into uint64_t storage (zero-extends smaller types).
+ *
+ *   uint64_t bits = to_u64(3.14f);        // float -> uint64_t
+ *   uint64_t bits = to_u64(int32_t(42));  // int32 -> uint64_t
+ */
+template<typename T>
+PTO_DEVICE_FUNC inline uint64_t to_u64(T value) {
+    static_assert(sizeof(T) <= sizeof(uint64_t),
+                  "to_u64: type must fit in 8 bytes");
+#if PTO_HAS_TYPE_TRAITS
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "to_u64: type must be trivially copyable");
+#endif
+    union {
+        uint64_t u;
+        T v;
+    } c;
+    c.u = 0;
+    c.v = value;
+    return c.u;
+}
+
+/**
+ * Unpack a value from uint64_t storage.
+ *
+ *   float f   = from_u64<float>(bits);
+ *   int32_t i = from_u64<int32_t>(bits);
+ */
+template<typename T>
+PTO_DEVICE_FUNC inline T from_u64(uint64_t bits) {
+    static_assert(sizeof(T) <= sizeof(uint64_t),
+                  "from_u64: type must fit in 8 bytes");
+#if PTO_HAS_TYPE_TRAITS
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "from_u64: type must be trivially copyable");
+#endif
+    union {
+        uint64_t u;
+        T v;
+    } c;
+    c.u = bits;
+    return c.v;
 }
 
 #endif  // ORCH_BUILD_GRAPH_DATA_TYPE_H
