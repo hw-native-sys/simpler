@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT_ROOT / "python"))
@@ -12,26 +14,22 @@ from kernel_compiler import KernelCompiler
 from toolchain import Gxx15Toolchain, ToolchainType
 
 
-def test_gxx15_aic_flags_define_cube_macros():
-    """AIC simulation builds must enable cube sections from PTOAS output."""
-    flags = Gxx15Toolchain().get_compile_flags(core_type="aic")
+@pytest.mark.parametrize(
+    ("core_type", "expected_flags", "unexpected_flags"),
+    [
+        ("aic", ["-D__AIC__", "-D__DAV_CUBE__"], ["-D__AIV__", "-D__DAV_VEC__"]),
+        ("aiv", ["-D__AIV__", "-D__DAV_VEC__"], ["-D__AIC__", "-D__DAV_CUBE__"]),
+    ],
+)
+def test_gxx15_flags_define_core_macros(core_type, expected_flags, unexpected_flags):
+    """Simulation builds must enable the correct PTOAS sections."""
+    flags = Gxx15Toolchain().get_compile_flags(core_type=core_type)
 
     assert "-D__CPU_SIM" in flags
-    assert "-D__AIC__" in flags
-    assert "-D__DAV_CUBE__" in flags
-    assert "-D__AIV__" not in flags
-    assert "-D__DAV_VEC__" not in flags
-
-
-def test_gxx15_aiv_flags_define_vec_macros():
-    """AIV simulation builds must enable vector sections from PTOAS output."""
-    flags = Gxx15Toolchain().get_compile_flags(core_type="aiv")
-
-    assert "-D__CPU_SIM" in flags
-    assert "-D__AIV__" in flags
-    assert "-D__DAV_VEC__" in flags
-    assert "-D__AIC__" not in flags
-    assert "-D__DAV_CUBE__" not in flags
+    for flag in expected_flags:
+        assert flag in flags
+    for flag in unexpected_flags:
+        assert flag not in flags
 
 
 @patch.object(KernelCompiler, "_compile_incore_sim", return_value=b"sim_kernel")
