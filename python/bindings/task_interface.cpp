@@ -31,6 +31,7 @@
 
 #include "arg_direction.h"
 #include "callable.h"
+#include "chip_worker.h"
 #include "data_type.h"
 #include "task_args.h"
 #include "tensor_arg.h"
@@ -500,4 +501,48 @@ NB_MODULE(_task_interface, m) {
                << ", child_count=" << c.child_count() << ")";
             return os.str();
         });
+
+    // --- CallConfig ---
+    nb::class_<CallConfig>(m, "CallConfig")
+        .def(nb::init<>())
+        .def_rw("block_dim", &CallConfig::block_dim)
+        .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
+        .def_rw("orch_thread_num", &CallConfig::orch_thread_num)
+        .def_rw("enable_profiling", &CallConfig::enable_profiling)
+        .def("__repr__", [](const CallConfig& self) -> std::string {
+            std::ostringstream os;
+            os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
+               << ", orch_thread_num=" << self.orch_thread_num
+               << ", enable_profiling=" << (self.enable_profiling ? "True" : "False") << ")";
+            return os.str();
+        });
+
+    // --- ChipWorker ---
+    nb::class_<ChipWorker>(m, "_ChipWorker")
+        .def(nb::init<>())
+        .def(
+            "init",
+            [](ChipWorker& self, int device_id, const std::string& host_lib_path, nb::bytes aicpu, nb::bytes aicore) {
+                self.init(device_id,
+                    host_lib_path,
+                    reinterpret_cast<const uint8_t*>(aicpu.c_str()),
+                    aicpu.size(),
+                    reinterpret_cast<const uint8_t*>(aicore.c_str()),
+                    aicore.size());
+            },
+            nb::arg("device_id"),
+            nb::arg("host_lib_path"),
+            nb::arg("aicpu_binary"),
+            nb::arg("aicore_binary"))
+        .def(
+            "run",
+            [](ChipWorker& self, const PyChipCallable& callable, ChipStorageTaskArgs& args, const CallConfig& config) {
+                self.run(callable.buffer_.data(), &args, config);
+            },
+            nb::arg("callable"),
+            nb::arg("args"),
+            nb::arg("config"))
+        .def("reset", &ChipWorker::reset)
+        .def_prop_ro("device_id", &ChipWorker::device_id)
+        .def_prop_ro("initialized", &ChipWorker::initialized);
 }

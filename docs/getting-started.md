@@ -14,12 +14,14 @@ The pto-isa dependency will be automatically cloned when you first run an exampl
 The pto-isa repository provides header files needed for kernel compilation on the `a2a3` (hardware) platform.
 
 The test framework automatically handles PTO_ISA_ROOT setup:
+
 1. Checks if `PTO_ISA_ROOT` is already set
 2. If not, clones pto-isa to `examples/scripts/_deps/pto-isa` on first run
 3. Passes the resolved path to the kernel compiler
 
 **Automatic Setup (Recommended):**
 Just run your example - pto-isa will be cloned automatically on first run:
+
 ```bash
 python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_example/kernels \
                                        -g examples/a2a3/host_build_graph/vector_example/golden.py \
@@ -27,6 +29,7 @@ python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_
 ```
 
 By default, the auto-clone uses SSH (`git@github.com:...`). In CI or environments without SSH keys, use `--clone-protocol https`:
+
 ```bash
 python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_example/kernels \
                                        -g examples/a2a3/host_build_graph/vector_example/golden.py \
@@ -34,6 +37,7 @@ python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_
 ```
 
 **Manual Setup** (if auto-setup fails or you prefer manual control):
+
 ```bash
 mkdir -p examples/scripts/_deps
 git clone --branch main git@github.com:PTO-ISA/pto-isa.git examples/scripts/_deps/pto-isa
@@ -46,11 +50,13 @@ export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa
 ```
 
 **Using a Different Location:**
+
 ```bash
 export PTO_ISA_ROOT=/path/to/your/pto-isa
 ```
 
 **Troubleshooting:**
+
 - If git is not available: Clone pto-isa manually and set `PTO_ISA_ROOT`
 - If clone fails due to network: Try again or clone manually
 - If SSH clone fails (e.g., in CI): Use `--clone-protocol https` or clone manually with HTTPS
@@ -93,6 +99,7 @@ host_binary = compiler.compile("host", include_dirs, source_dirs)        # → .
 ```
 
 **Toolchains used:**
+
 - **AICore**: Bisheng CCE (`ccec` compiler) → `.o` object file (a2a3 only)
 - **AICPU**: aarch64 cross-compiler → `.so` shared object (a2a3 only)
 - **Host**: Standard gcc/g++ → `.so` shared library
@@ -117,7 +124,8 @@ python examples/scripts/run_example.py \
 ```
 
 Expected output:
-```
+
+```text
 === Building Runtime: host_build_graph (platform: a2a3sim) ===
 ...
 === Comparing Results ===
@@ -132,35 +140,32 @@ TEST PASSED
 ### Python API Example
 
 ```python
-from bindings import bind_host_binary
-from runtime_compiler import RuntimeCompiler
+from task_interface import ChipWorker, CallConfig
+from runtime_builder import RuntimeBuilder
 
-# Compile all binaries
-compiler = RuntimeCompiler()
-aicore_bin = compiler.compile("aicore", [...include_dirs...], [...source_dirs...])
-aicpu_bin = compiler.compile("aicpu", [...include_dirs...], [...source_dirs...])
-host_bin = compiler.compile("host", [...include_dirs...], [...source_dirs...])
+# Build or locate pre-built runtime binaries
+builder = RuntimeBuilder(platform="a2a3sim")
+binaries = builder.get_binaries("tensormap_and_ringbuffer")
 
-# Load and initialize runtime
-Runtime = bind_host_binary(host_bin)
-runtime = Runtime()
-runtime.initialize()
+# Create worker and initialize with platform binaries
+worker = ChipWorker()
+worker.init(device_id=0, host_path=str(binaries.host_path),
+            aicpu_binary=binaries.aicpu_path.read_bytes(),
+            aicore_binary=binaries.aicore_path.read_bytes())
 
-# Execute runtime on device
-launch_runtime(runtime,
-               aicpu_thread_num=1,
-               block_dim=1,
-               device_id=9,
-               aicpu_binary=aicpu_bin,
-               aicore_binary=aicore_bin)
+# Execute callable on device
+worker.run(chip_callable, orch_args, CallConfig(block_dim=24))
 
-runtime.finalize()
+# Cleanup
+worker.reset()
 ```
 
 ## Configuration
 
 ### Compile-time Configuration (Runtime Limits)
+
 In `src/{arch}/runtime/host_build_graph/runtime/runtime.h`:
+
 ```cpp
 #define RUNTIME_MAX_TASKS 131072   // Maximum number of tasks
 #define RUNTIME_MAX_ARGS 16        // Maximum arguments per task
@@ -168,6 +173,7 @@ In `src/{arch}/runtime/host_build_graph/runtime/runtime.h`:
 ```
 
 ### Runtime Configuration
+
 ```python
 runner.init(
     device_id=0,              # Device ID (0-15)
@@ -191,6 +197,7 @@ runner.init(
 Device logs written to `~/ascend/log/debug/device-<id>/`
 
 Kernel uses macros:
+
 - `DEV_INFO`: Informational messages
 - `DEV_DEBUG`: Debug messages
 - `DEV_WARN`: Warnings

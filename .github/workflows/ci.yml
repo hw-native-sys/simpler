@@ -221,11 +221,23 @@ jobs:
       - name: Check A5 file changes
         id: check
         run: |
-          if git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }} \
-            | grep -qE '^(src/a5/|examples/a5/|tests/(st|device_tests)/a5/)'; then
+          FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
+
+          # Skip A5 only when ALL changed files are confined to a2a3-only or non-code paths.
+          # Shared code (src/common/, python/, examples/scripts/, build files) affects A5.
+          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|device_tests)/a2a3/)'
+          NON_CODE='^(docs/|\.docs/|\.claude/|KNOWN_ISSUES\.md$|\.gitignore$|README\.md$|\.pre-commit-config\.yaml$)'
+
+          # Filter out a2a3-only and non-code files; if anything remains, it may affect A5
+          REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
+
+          if [ -n "$REMAINING" ]; then
             echo "a5_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Files affecting A5:"
+            echo "$REMAINING"
           else
             echo "a5_changed=false" >> "$GITHUB_OUTPUT"
+            echo "All changes are a2a3-only or non-code; skipping A5"
           fi
   # TODO: Uncomment when a5 hardware runner is available.
   #       Add the "a5" label to the runner, matching [self-hosted, a5] below.
