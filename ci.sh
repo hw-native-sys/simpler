@@ -313,6 +313,7 @@ MAX_RETRIES=3
 
 # ---- Unified task runner ----
 # Runs a single task and records the result.
+# A5 on-board tasks are submitted via task-submit (privilege escalation) + npu-lock (device lock).
 # Log naming: ${safe_name}_${platform}_attempt${attempt}.log
 # Result format: name|platform|PASS/FAIL|device:X|attempt:N|Xs
 run_task() {
@@ -322,7 +323,7 @@ run_task() {
     local start_time=$SECONDS
 
     local -a cmd
-    cmd=(python examples/scripts/run_example.py
+    cmd=(env PYTHONDONTWRITEBYTECODE=1 python examples/scripts/run_example.py
         -k "${dir}/kernels" -g "${dir}/golden.py"
         -p "$platform" --clone-protocol "$CLONE_PROTOCOL" "${commit_flag[@]}")
     [[ -n "$device_id" ]] && cmd+=(-d "$device_id")
@@ -331,7 +332,20 @@ run_task() {
     echo "[${platform}${device_id:+:dev${device_id}}] Running: $name (attempt $attempt)"
 
     # Command output to log file only
-    "${cmd[@]}" > "$task_log" 2>&1
+    if [[ "$platform" == "a5" && -n "$device_id" ]]; then
+        if [[ "$(id -u)" -eq 0 ]]; then
+            # Already root (e.g. running inside task-daemon), use npu-lock directly
+            npu-lock "$device_id" -- "${cmd[@]}" > "$task_log" 2>&1
+        elif command -v task-submit &>/dev/null; then
+            local task_id
+            task_id=$(task-submit "npu-lock $device_id -- $(printf '%q ' "${cmd[@]}")")
+            task-submit --timeout "$TIMEOUT" --wait "$task_id" > "$task_log" 2>&1
+        else
+            "${cmd[@]}" > "$task_log" 2>&1
+        fi
+    else
+        "${cmd[@]}" > "$task_log" 2>&1
+    fi
     local rc=$?
     local elapsed=$(( SECONDS - start_time ))
 

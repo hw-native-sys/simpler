@@ -207,11 +207,31 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a2a3 -d ${DEVICE_RANGE} --parallel -c 6622890 -t 600 --clone-protocol https
 
+
+  # ---------- Detect A5 changes (runs on GitHub server, not A5 machine) ----------
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      a5_changed: ${{ steps.check.outputs.a5_changed }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Check A5 file changes
+        id: check
+        run: |
+          if git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }} \
+            | grep -qE '^(src/a5/|examples/a5/|tests/(st|device_tests)/a5/)'; then
+            echo "a5_changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "a5_changed=false" >> "$GITHUB_OUTPUT"
+          fi
   # TODO: Uncomment when a5 hardware runner is available.
   #       Add the "a5" label to the runner, matching [self-hosted, a5] below.
   #
   # ut-py-a5:
-  #   needs: pre-commit
+  #   needs: pre-commit detect-changes
   #   runs-on: [self-hosted, a5]
   #   timeout-minutes: 30
   #
@@ -227,19 +247,23 @@ jobs:
   #         export PATH="$HOME/.local/bin:$PATH"
   #         source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest tests -m requires_hardware --platform a5 -v
   #
-  # st-onboard-a5:
-  #   needs: pre-commit
-  #   runs-on: [self-hosted, a5]
-  #   timeout-minutes: 60
-  #
-  #   steps:
-  #     - name: Checkout repository
-  #       uses: actions/checkout@v4
-  #
-  #     - name: Build nanobind extension
-  #       run: pip install .
-  #
-  #     - name: Run on-device examples (a5)
-  #       run: |
-  #         export PATH="$HOME/.local/bin:$PATH"
-  #         source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a5 -d ${DEVICE_RANGE} --parallel -c 6622890 -t 600 --clone-protocol https
+
+  st-onboard-a5:
+    needs: [pre-commit, detect-changes]
+    if: needs.detect-changes.outputs.a5_changed == 'true'
+    runs-on: [self-hosted, a5]
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build nanobind extension
+        run: |
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash
+          PTO_ARCH=a5 pip install .
+
+      - name: Run on-device examples (a5)
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a5 -d ${DEVICE_RANGE} --parallel -c 6622890 -t 600 --clone-protocol https
