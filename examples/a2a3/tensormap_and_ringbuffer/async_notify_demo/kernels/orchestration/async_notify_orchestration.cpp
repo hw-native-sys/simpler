@@ -52,12 +52,6 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count,
     Tensor ext_out = make_tensor_external(out_ptr, shapes, 1, DataType::FLOAT32);
     Tensor ext_result = make_tensor_external(result_ptr, shapes, 1, DataType::FLOAT32);
 
-    uint64_t cq_notify = pto2_rt_alloc_cq();
-    if (cq_notify == 0) {
-        LOG_ERROR("async_notify_demo: rank %d failed CQ alloc", my_rank);
-        return;
-    }
-
     // Producer: normal run-to-completion task (sends TNOTIFY to peer)
     PTOParam params_producer;
     params_producer.add_input(ext_in);
@@ -67,20 +61,13 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count,
     pto2_rt_submit_aiv_task(0, params_producer);
 
     // NotifyWait: deferred task that waits for notification counter >= 1.
-    // Produces dummy_notify so the consumer can depend on it via TensorMap.
-    uint32_t dummy_shape[1] = { 1 };
-    Tensor dummy_notify = make_tensor(dummy_shape, 1, DataType::INT32);
+    // Returns a dependency token tensor for downstream tasks.
+    Tensor notify_token = pto2_rt_submit_notification_wait_task(
+        2, (uint64_t)(uintptr_t)notify_counter_ptr, 1);
 
-    PTOParam params_wait;
-    params_wait.add_output(dummy_notify);
-    params_wait.add_scalar((uint64_t)(uintptr_t)notify_counter_ptr);
-    params_wait.add_scalar((uint64_t)1);
-    pto2_rt_submit_aiv_task_deferred(2, params_wait, cq_notify);
-
-    // Consumer: depends on producer (via ext_out) and notify_wait (via dummy_notify).
-    // Guaranteed notify_counter >= 1 when this task runs.
+    // Consumer: depends on producer (via ext_out) and notify_wait (via token).
     PTOParam params_consumer;
-    params_consumer.add_input(dummy_notify);
+    params_consumer.add_input(notify_token);
     params_consumer.add_input(ext_out);
     params_consumer.add_output(ext_result);
     params_consumer.add_scalar((uint64_t)(uintptr_t)notify_counter_ptr);

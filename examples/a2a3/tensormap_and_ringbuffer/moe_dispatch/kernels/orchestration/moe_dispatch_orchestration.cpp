@@ -104,8 +104,7 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count,
 
     uint64_t sdma_context = pto2_rt_get_sdma_context();
     uint64_t cq_send = pto2_rt_alloc_cq();
-    uint64_t cq_notify = pto2_rt_alloc_cq();
-    if (sdma_context == 0 || cq_send == 0 || cq_notify == 0) {
+    if (sdma_context == 0 || cq_send == 0) {
         LOG_ERROR("moe_dispatch_v2: rank %d failed SDMA context or CQ alloc", my_rank);
         return;
     }
@@ -132,20 +131,14 @@ void aicpu_orchestration_entry(uint64_t* args, int arg_count,
     params_send.add_scalar(sdma_context);
     pto2_rt_submit_aiv_task_deferred(1, params_send, cq_send);
 
-    // Phase 1.5: NotifyWait — deferred task that waits for notification counter.
-    // Produces a dummy_notify tensor so RecvAssemble can depend on it via TensorMap.
-    uint32_t dummy_shape[1] = { 1 };
-    Tensor dummy_notify = make_tensor(dummy_shape, 1, DataType::INT32);
+    // Phase 1.5: NotifyWait — deferred wait for notification counter >= NUM_RANKS-1.
+    // Returns a dependency token for RecvAssemble via TensorMap.
+    Tensor notify_token = pto2_rt_submit_notification_wait_task(
+        3, notify_counter_addr, NUM_RANKS - 1);
 
-    PTOParam params_wait;
-    params_wait.add_output(dummy_notify);
-    params_wait.add_scalar(notify_counter_addr);
-    params_wait.add_scalar((uint64_t)(NUM_RANKS - 1));
-    pto2_rt_submit_aiv_task_deferred(3, params_wait, cq_notify);
-
-    // Phase 2: RecvAssemble (depends on NotifyWait via dummy_notify)
+    // Phase 2: RecvAssemble (depends on NotifyWait via notify_token)
     PTOParam params_recv;
-    params_recv.add_input(dummy_notify);
+    params_recv.add_input(notify_token);
     params_recv.add_input(ext_local_counts);
     params_recv.add_output(ext_expand_x);
     params_recv.add_output(ext_etn);

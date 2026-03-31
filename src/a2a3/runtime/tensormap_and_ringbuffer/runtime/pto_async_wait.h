@@ -185,8 +185,10 @@ struct PTO2AsyncWaitList {
             for (int32_t c = 0; c < entry.condition_count; c++) {
                 PTO2CompletionCondition& cond = entry.conditions[c];
                 if (!cond.satisfied) {
-                    // RDMA-written counters (e.g. TNOTIFY) bypass AICPU data cache.
-                    // Invalidate before reading to see the true memory value.
+                    // All current counter writers (SDMA engine flags, TNOTIFY
+                    // RDMA atomics) bypass AICPU data cache.  Invalidation is
+                    // needed so the poll reads the true GM value.  For any
+                    // hypothetical CPU-written counter this is a harmless no-op.
                     if (cond.counter_addr) {
                         cache_invalidate_range(
                             reinterpret_cast<const void*>(const_cast<const uint32_t*>(cond.counter_addr)),

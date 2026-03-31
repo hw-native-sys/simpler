@@ -28,7 +28,6 @@
 #include "common/core_type.h"
 
 struct PTO2SchedulerState;
-struct PTO2LocalReadyBuffer;
 
 #if PTO2_SCHED_PROFILING
 #include "aicpu/device_time.h"

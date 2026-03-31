@@ -253,6 +253,40 @@ static inline void pto2_rt_submit_task_deferred(const MixedKernels& mixed_kernel
     rt->ops->submit_task(rt, mixed_kernels, params);
 }
 
+/**
+ * Submit a notification-wait deferred task and return a dependency token.
+ *
+ * Encapsulates the boilerplate for creating a NotifyWait task:
+ *   1. Allocate a CQ
+ *   2. Create a 1-element dummy output tensor (dependency token)
+ *   3. Submit a deferred AIV task with (counter_addr, expected_value, cq_addr)
+ *
+ * The returned token tensor should be added as an input to any downstream
+ * task that depends on the notification completing.
+ *
+ * @param kernel_id      func_id of the NotifyWait kernel
+ * @param counter_addr   GM address of the notification counter (int32*)
+ * @param expected_value  threshold: task completes when *counter >= expected
+ * @return dependency token tensor (add as input to downstream tasks)
+ */
+static inline Tensor pto2_rt_submit_notification_wait_task(
+    int32_t kernel_id,
+    uint64_t counter_addr,
+    uint32_t expected_value) {
+    uint64_t cq_addr = pto2_rt_alloc_cq();
+
+    uint32_t dummy_shape[1] = { 1 };
+    Tensor token = make_tensor(dummy_shape, 1, DataType::INT32);
+
+    PTOParam params;
+    params.add_output(token);
+    params.add_scalar(counter_addr);
+    params.add_scalar(static_cast<uint64_t>(expected_value));
+    pto2_rt_submit_aiv_task_deferred(kernel_id, params, cq_addr);
+
+    return token;
+}
+
 static inline void pto2_rt_scope_begin() {
     PTO2Runtime* rt = pto2_current_runtime();
     rt->ops->scope_begin(rt);

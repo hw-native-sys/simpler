@@ -1083,25 +1083,6 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
     PTO2AsyncWaitList async_wait_list;
 
-    auto flush_deferred_releases = [&]() {
-        while (deferred_release_count > 0) {
-#if PTO2_SCHED_PROFILING
-            int32_t fe = rt->scheduler.on_task_release(
-                *deferred_release_slot_states[--deferred_release_count], thread_idx);
-#else
-            int32_t fe = rt->scheduler.on_task_release(
-                *deferred_release_slot_states[--deferred_release_count]);
-#endif
-            (void)fe;
-#if PTO2_SCHED_PROFILING
-            fanin_edges_total += fe;
-            if (fe > fanin_max_degree) {
-                fanin_max_degree = fe;
-            }
-#endif
-        }
-    };
-
     bool cores_released = false;
 
 #if PTO2_PROFILING
@@ -1172,9 +1153,6 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
 
         // Phase 0: Poll async completion conditions (deferred-completion tasks)
         int32_t async_completed_this_turn = 0;
-        if (deferred_release_count > MAX_DEFERRED_RELEASES - PTO2_MAX_ASYNC_WAITS) {
-            flush_deferred_releases();
-        }
         if (async_wait_list.count > 0) {
             PTO2AsyncPollResult poll_result = async_wait_list.poll_and_complete<false>(
                 &rt->scheduler, local_bufs,
