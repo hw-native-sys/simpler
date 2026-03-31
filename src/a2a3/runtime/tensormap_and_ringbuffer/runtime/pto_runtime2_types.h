@@ -31,9 +31,9 @@
 
 #include <atomic>
 
-#include "pto2_dispatch_payload.h"  // NOLINT(build/include_subdir)
-#include "pto_submit_types.h"       // NOLINT(build/include_subdir)
-#include "pto_types.h"              // NOLINT(build/include_subdir)
+#include "pto2_dispatch_payload.h"
+#include "pto_submit_types.h"
+#include "pto_types.h"
 
 // =============================================================================
 // Profiling Configuration
@@ -362,31 +362,32 @@ struct PTO2TaskDescriptor {
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
  * Layout: metadata (counts, fanin pointers) packed in the first 3 cache lines,
- * followed by pre-built dispatch args and bulk tensor data. Scalar values are
- * written directly into dispatch_args[] (after tensor pointers), eliminating
- * the separate scalars[] array.
- *
- * The Scheduler writes function_bin_addr and a pointer to dispatch_args[] into
- * PTO2DispatchPayload, then signals AICore via DATA_MAIN_BASE register.
+ * followed by bulk tensor and scalar data. This gives sequential write access
+ * during orchestration and groups scheduler-hot fields (fanin_actual_count +
+ * fanin_slot_states) together for on_task_release.
  */
 struct PTO2TaskPayload {
-    // === Cache line 0 (64B) — metadata ===
+    // === Cache lines 0-2 (192B) — metadata ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
     int32_t _reserved{0};           // Reserved (dep_pool_mark moved to SlotState for local access)
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS];  // Producer slot states (used by on_task_release)
-    // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
+    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
-    // === Pre-built args for AICore dispatch (1152B = 16 tensor ptrs + 128 scalars) ===
-    uint64_t dispatch_args[PTO2_DISPATCH_MAX_ARGS];
+    // === Cache lines 35-50 (1024B) — scalars ===
+    uint64_t scalars[MAX_SCALAR_ARGS];
+
+    // Layout verification (size checks that don't need offsetof).
+    static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
+    static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 1024, "scalar region must be 1024B (16 cache lines)");
 
     /**
-     * Initialize payload: copy tensors, build dispatch args.
+     * Initialize payload: copy tensors, store scalars.
      *
      * For each param slot, the tensor source is determined by TensorArgType:
-     * - OUTPUT → use materialized_outputs.output_ptr(out_idx++)
-     * - INPUT / INOUT → use refs[i].tensor
+     * - OUTPUT -> use materialized_outputs.output_ptr(out_idx++)
+     * - INPUT / INOUT -> use refs[i].tensor
      *
      * @param args                Task arguments (tensors + scalars)
      * @param materialized_outputs  Materialized output tensors (from TensorCreateInfo path)
@@ -407,15 +408,17 @@ struct PTO2TaskPayload {
                 result.materialize_output(tensors[i]);
             }
             tensors[i].update_start_offset();
-            dispatch_args[i] = reinterpret_cast<uint64_t>(&tensors[i]);
         }
-        // Bulk-copy scalars into dispatch_args[tensor_count..], rounded up to
-        // cache-line boundary (extra bytes within the same CL cost nothing).
-        memcpy(&dispatch_args[args.tensor_count()],
-            args.scalar_data(),
-            PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
+        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
+        // Eliminates branches; extra bytes within the same CL have zero additional cost.
+        memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
     }
 };
+
+// PTO2TaskPayload layout verification (offsetof requires complete type).
+static_assert(offsetof(PTO2TaskPayload, tensors) == 192, "tensors must start at byte 192 (cache line 3)");
+static_assert(offsetof(PTO2TaskPayload, scalars) == 192 + MAX_TENSOR_ARGS * sizeof(Tensor),
+    "scalars must immediately follow tensors");
 
 /**
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
@@ -500,7 +503,7 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 // This header is also compiled into the Host .so (for struct definitions only),
 // where the hint is never called — the fallback no-op keeps Host builds clean.
 #if __has_include("spin_hint.h")
-#include "spin_hint.h"  // NOLINT(build/include_subdir)
+#include "spin_hint.h"
 #else
 #define SPIN_WAIT_HINT() ((void)0)
 #endif

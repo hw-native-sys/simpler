@@ -17,7 +17,7 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#include "pto_orchestrator.h"  // NOLINT(build/include_subdir)
+#include "pto_orchestrator.h"
 
 #include <assert.h>
 #include <inttypes.h>
@@ -26,11 +26,11 @@
 #include <string.h>
 
 #include "common/unified_log.h"
-#include "pto_runtime2_types.h"  // NOLINT(build/include_subdir)
-#include "pto_shared_memory.h"   // NOLINT(build/include_subdir)
-#include "pto_tensormap.h"       // NOLINT(build/include_subdir)
-#include "pto_types.h"           // NOLINT(build/include_subdir)
-#include "tensor.h"              // NOLINT(build/include_subdir)
+#include "pto_runtime2_types.h"
+#include "pto_shared_memory.h"
+#include "pto_tensormap.h"
+#include "pto_types.h"
+#include "tensor.h"
 
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)
@@ -387,8 +387,8 @@ TaskOutputTensors pto2_submit_mixed_task(
         __builtin_prefetch(&payload->tensors[i], 1, 3);
         __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 3);
     }
-    for (int32_t i = 0; i < args.tensor_count() + args.scalar_count(); i += 8) {
-        __builtin_prefetch(&payload->dispatch_args[i], 1, 3);
+    for (int32_t i = 0; i < args.scalar_count(); i += 8) {
+        __builtin_prefetch(&payload->scalars[i], 1, 3);
     }
     __builtin_prefetch(payload, 1, 3);
     __builtin_prefetch(reinterpret_cast<char*>(payload) + 64, 1, 3);

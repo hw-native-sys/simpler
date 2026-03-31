@@ -21,8 +21,9 @@
  * - Function address mapping (func_id_to_addr_)
  *
  * Task dispatch uses a per-core PTO2DispatchPayload written by the scheduler.
- * The Orchestrator pre-builds dispatch_args[] in each task payload; the
- * scheduler only fills function_bin_addr + args before signaling AICore.
+ * At dispatch time, build_payload() copies tensor pointers and scalars from
+ * the task payload into the per-core args[], populates SPMD context, then
+ * signals AICore via DATA_MAIN_BASE.
  */
 
 #ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
@@ -36,8 +37,8 @@
 #include "common/core_type.h"
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"
-#include "pto2_dispatch_payload.h"  // NOLINT(build/include_subdir)
-#include "task_args.h"              // NOLINT(build/include_subdir)
+#include "pto2_dispatch_payload.h"
+#include "task_args.h"
 
 // =============================================================================
 // Configuration Macros
@@ -150,7 +151,7 @@ struct Task {
  * execution control and device orchestration state.
  */
 class Runtime {
-public:  // NOLINT(whitespace/indent)
+ public:  // NOLINT(whitespace/indent)
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
@@ -179,7 +180,7 @@ public:  // NOLINT(whitespace/indent)
     bool orch_to_sched;
     uint64_t perf_data_base;  // Performance data shared memory base address (device-side)
 
-private:  // NOLINT(whitespace/indent)
+ private:  // NOLINT(whitespace/indent)
     // Tensor pairs for host-device memory tracking
     TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
     int tensor_pair_count;
@@ -200,7 +201,7 @@ private:  // NOLINT(whitespace/indent)
     uint8_t device_orch_so_storage_[RUNTIME_MAX_ORCH_SO_SIZE];
     size_t device_orch_so_size_;
 
-public:  // NOLINT(whitespace/indent)
+ public:  // NOLINT(whitespace/indent)
     /**
      * Constructor - zero-initialize all arrays
      */
