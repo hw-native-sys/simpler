@@ -18,8 +18,9 @@
 #include <string>
 #include <utility>
 
-#include "common.h"     // NOLINT(build/include_subdir)
-#include "data_type.h"  // NOLINT(build/include_subdir)
+#include "common.h"       // NOLINT(build/include_subdir)
+#include "data_type.h"    // NOLINT(build/include_subdir)
+#include "pto_task_id.h"  // NOLINT(build/include_subdir)
 
 constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
 
@@ -57,20 +58,20 @@ struct Segment {
  *
  * Layout (64B) is aligned with Tensor cacheline 1 so that
  * init_from_create_info() can copy the entire cacheline with a single memcpy,
- * then overwrite buffer.addr and buffer.size separately.
+ * then overwrite buffer/owner metadata and refresh start_offset later.
  *
  * Arg::add_output() stores a pointer to this object, so the original
  * must remain valid (not a temporary) until after the submit call.
  */
-class TensorCreateInfo {
-public:  // NOLINT(whitespace/indent)
+class alignas(64) TensorCreateInfo {
+ public:  // NOLINT(whitespace/indent)
     TensorCreateInfo(
         const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false)
         : initial_value(0),
           has_initial_value(false),
           version(0),
-          dtype(dtype),
           ndims(ndims),
+          dtype(dtype),
           is_all_offset_zero(true),
           is_raw_eq_shapes(true),
           manual_dep(manual_dep) {
@@ -95,25 +96,25 @@ public:  // NOLINT(whitespace/indent)
         return total * get_element_size(dtype);
     }
 
-public:  // NOLINT(whitespace/indent)
-    // --- Bytes [0, 24): TensorCreateInfo-only fields ---
-    // These occupy the same positions as Tensor::buffer and Tensor::start_offset,
-    // which are overwritten after the memcpy in init_from_create_info().
+ public:  // NOLINT(whitespace/indent)
+    // --- Bytes [0, 32): TensorCreateInfo-only fields ---
+    // These occupy the same positions as Tensor::buffer, Tensor::owner_task_id,
+    // and Tensor::start_offset. The runtime overwrites owner metadata after the
+    // memcpy and refreshes start_offset during payload materialization.
     uint64_t initial_value;
     bool has_initial_value;
     uint8_t __pad1__[7];
-    uint64_t __pad2__;  // → Tensor::start_offset (zeroed)
+    uint64_t __pad2__;  // → Tensor::owner_task_id
+    uint64_t __pad3__;  // → Tensor::start_offset (zeroed)
 
-    // --- Bytes [24, 64): Matches Tensor cacheline 1 layout ---
+    // --- Bytes [32, 64): Matches Tensor cacheline 1 layout ---
     int32_t version;  // Always 0 for create-info outputs
-    DataType dtype;
     uint32_t ndims;
+    DataType dtype;
     bool is_all_offset_zero;  // Always true for create-info outputs
     bool is_raw_eq_shapes;    // Always true for create-info outputs
     bool manual_dep;
-    uint8_t __pad3__;
     uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // → Tensor::shapes
-    uint32_t __pad4__;
 
     TensorCreateInfo() = default;
 
@@ -137,12 +138,12 @@ static_assert(sizeof(TensorCreateInfo) == 64);
  * - is_all_offset_zero: when true, offsets[] are implicitly zero — skip offset read/write
  * - is_raw_eq_shapes: when true, raw_shapes[] == shapes[] — skip raw_shapes read/write,
  *   use shapes[] wherever raw_shapes would be needed
- * - manual_dep: when true, dependency tracking is managed manually
+ * - manual_dep: when true, keep creator retention only and skip OverlapMap dependency tracking
  *
  * When BOTH flags are true, cache line 2 is never accessed.
  *
- * Layout: cache line 1 holds hot-path fields (buffer, start_offset, version,
- * dtype, ndims, flags, shapes); cache line 2 holds warm-path fields (raw_shapes, offsets).
+ * Layout: cache line 1 holds hot-path fields (buffer, owner_task_id, start_offset,
+ * version, ndims, dtype, flags, shapes); cache line 2 holds warm-path fields (raw_shapes, offsets).
  *
  * Construction:
  * Users cannot default-construct or directly construct a Tensor.
@@ -154,21 +155,21 @@ static_assert(sizeof(TensorCreateInfo) == 64);
  */
 struct alignas(64) Tensor {
     // === Cache line 1 (64B) — hot path ===
-    PTOBufferHandle buffer;   // Underlying memory buffer (addr in bytes, size in bytes)
-    uint64_t start_offset;    // Cached 1D element offset (precomputed from raw_shapes + offsets), only calc before
-                              // incore, useless in orch
-    int32_t version;          // Tensor version for overlap detection
-    DataType dtype;           // Data type of tensor elements
-    uint32_t ndims;           // Number of dimensions used
-    bool is_all_offset_zero;  // True when all offsets[] are zero (skip offset read/write)
-    bool is_raw_eq_shapes;    // True when raw_shapes[] == shapes[] (skip raw_shapes read/write)
-    bool manual_dep;          // True when dependency is managed manually (skip tensormap lookup/insert)
+    PTOBufferHandle buffer;    // Underlying memory buffer (addr in bytes, size in bytes)
+    PTO2TaskId owner_task_id;  // Creator task; PTO2TaskId::invalid() for external tensors
+    uint64_t start_offset;     // Cached 1D element offset (precomputed from raw_shapes + offsets)
+    int32_t version;           // Tensor version for overlap detection
+    uint32_t ndims;            // Number of dimensions used
+    DataType dtype;            // Data type of tensor elements
+    bool is_all_offset_zero;   // True when all offsets[] are zero (skip offset read/write)
+    bool is_raw_eq_shapes;     // True when raw_shapes[] == shapes[] (skip raw_shapes read/write)
+    bool manual_dep;           // True when dependency tracking is creator-only (skip OverlapMap lookup/insert)
     uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // Current view shape per dimension
-    uint32_t __padding__;
 
     // === Cache line 2 (64B) — warm path ===
     uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
     uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
+    uint8_t _pad_cl2[24];                          // Tail padding (bytes 104–127)
 
     // --- Copy / move / destroy are public (valid tensors can be freely copied) ---
     Tensor(const Tensor&) = default;
@@ -213,6 +214,7 @@ struct alignas(64) Tensor {
                 offsets[i] = in_offsets[i];
             }
         }
+        owner_task_id = PTO2TaskId::invalid();
     }
 
     void init(const Tensor& other) {
@@ -265,6 +267,7 @@ struct alignas(64) Tensor {
             }
         }
         is_all_offset_zero = all_zero;
+        owner_task_id = other.owner_task_id;
     }
 
     /// Compute 1D flat element offset from multi-dimensional indices.
@@ -286,6 +289,7 @@ struct alignas(64) Tensor {
     void init_from_create_info(const TensorCreateInfo& ci, void* addr, uint64_t buffer_size) {
         memcpy(this, &ci, 64);
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size};
+        owner_task_id = PTO2TaskId::invalid();  // caller (orchestrator) overwrites with actual task_id
         if (ci.has_initial_value) {
             fill_initial_value(ci.initial_value);
         }
@@ -438,7 +442,7 @@ struct alignas(64) Tensor {
         return ss.str();
     }
 
-private:
+ private:
     // Default and parameterized constructors are private.
     // Valid Tensors come only from controlled entry points.
     Tensor() = default;
@@ -475,12 +479,14 @@ private:
 
 static_assert(sizeof(Tensor) == 128, "Tensor must be exactly 2 cache lines (128 bytes)");
 static_assert(offsetof(Tensor, raw_shapes) == 64);
+static_assert(offsetof(Tensor, owner_task_id) == 16, "owner_task_id must be at bytes 16-23 (cacheline 1)");
+static_assert(offsetof(Tensor, start_offset) == 24, "start_offset must be at bytes 24-31 (cacheline 1)");
 
 // TensorCreateInfo layout must match Tensor cacheline 1 for memcpy optimization
 static_assert(sizeof(TensorCreateInfo) == 64, "TensorCreateInfo must match Tensor cacheline 1 size (64 bytes)");
 static_assert(offsetof(TensorCreateInfo, version) == offsetof(Tensor, version));
-static_assert(offsetof(TensorCreateInfo, dtype) == offsetof(Tensor, dtype));
 static_assert(offsetof(TensorCreateInfo, ndims) == offsetof(Tensor, ndims));
+static_assert(offsetof(TensorCreateInfo, dtype) == offsetof(Tensor, dtype));
 static_assert(offsetof(TensorCreateInfo, is_all_offset_zero) == offsetof(Tensor, is_all_offset_zero));
 static_assert(offsetof(TensorCreateInfo, is_raw_eq_shapes) == offsetof(Tensor, is_raw_eq_shapes));
 static_assert(offsetof(TensorCreateInfo, manual_dep) == offsetof(Tensor, manual_dep));

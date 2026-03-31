@@ -99,7 +99,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
             Arg params_matmul;
             params_matmul.add_input(A_view);
             params_matmul.add_input(B_view);
-            params_matmul.add_inout(C_view);
+            params_matmul.add_output(C_view);
             pto2_rt_submit_aic_task(FUNC_MATMUL, params_matmul);
             total_matmul++;
         }
@@ -119,7 +119,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
             Arg params_add;
             params_add.add_input(X_view);
             params_add.add_input(Y_view);
-            params_add.add_inout(Z_view);
+            params_add.add_output(Z_view);
             pto2_rt_submit_aiv_task(FUNC_ADD, params_add);
             total_add++;
         }

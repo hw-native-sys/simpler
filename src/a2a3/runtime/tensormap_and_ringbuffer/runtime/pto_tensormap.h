@@ -73,7 +73,7 @@ extern uint64_t g_insert_count;
  *
  * Cache line 1 (64B, lookup hot path):
  *   next_in_bucket, producer_task_id, buffer_addr — chain traversal + validity + hash match
- *   version, ndims, is_all_offset_zero, with_alloc, bucket_index — overlap fast path
+ *   version, ndims, is_all_offset_zero, bucket_index — overlap fast path
  *   shapes[5] — overlap comparison
  *
  * Cache line 2 (64B, insert/remove/slow-path only):
@@ -88,14 +88,14 @@ struct alignas(64) PTO2TensorMapEntry {
     uint64_t buffer_addr;                // 8B: tensor base address (hash key)
     PTO2TensorMapEntry* next_in_bucket;  // 8B: next entry in hash bucket chain
     PTO2TaskId producer_task_id;         // 8B: raw (ring_id << 32) | local_id
-    int32_t version;                     // 4B: tensor version for overlap detection
     int32_t bucket_index;                // 4B: bucket index (-1 if unlinked)
+    uint32_t __padding0__;               // 4B: occupies Tensor::start_offset high half
+    int32_t version;                     // 4B: tensor version for overlap detection
     uint32_t ndims;                      // 4B: number of dimensions
+    DataType __padding_dtype__;          // 1B: occupies Tensor::dtype
     bool is_all_offset_zero;             // 1B: fast-path flag
-    bool with_alloc;                     // 1B: true=OUTPUT, false=INOUT
-    // padding: 2B
+    uint8_t __padding1__[2];
     uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // 20B: shape per dimension
-    // padding: 4B to fill 64B
 
     // === Cache line 2 (64B) — insert/remove/slow-path ===
     PTO2TensorMapEntry* prev_in_bucket;         // 8B: prev in hash bucket chain
@@ -164,6 +164,7 @@ static_assert(offsetof(PTO2TensorMapEntry, buffer_addr) == offsetof(Tensor, buff
 static_assert(offsetof(PTO2TensorMapEntry, version) == offsetof(Tensor, version));
 static_assert(offsetof(PTO2TensorMapEntry, ndims) == offsetof(Tensor, ndims));
 static_assert(offsetof(PTO2TensorMapEntry, is_all_offset_zero) == offsetof(Tensor, is_all_offset_zero));
+static_assert(offsetof(PTO2TensorMapEntry, shapes) == offsetof(Tensor, shapes));
 static_assert(
     offsetof(PTO2TensorMapEntry, prev_in_bucket) == 64, "TensorMapEntry must be exactly 2 cache lines (128 bytes)");
 
@@ -356,24 +357,10 @@ struct PTO2TensorMap {
      * @param tensor            Tensor produced
      * @param producer_task_id  Task ID of producer
      */
-    void insert(const Tensor& tensor, PTO2TaskId producer_task_id, bool with_alloc) {
+    void insert(const Tensor& tensor, PTO2TaskId producer_task_id) {
         PTO2TensorMapEntry* entry = new_entry();
         entry->copy_from_tensor(tensor);
-        link_entry(entry, tensor.buffer.addr, producer_task_id, with_alloc);
-    }
-
-    /**
-     * Insert a new entry from TensorCreateInfo (for deferred OUTPUT tensors)
-     *
-     * @param tensor_create_info  Create-info describing the output
-     * @param addr                Allocated buffer address
-     * @param producer_task_id    Task ID of producer
-     * @param with_alloc          True if runtime allocated the buffer
-     */
-    void insert(const TensorCreateInfo& tensor_create_info, void* addr, PTO2TaskId producer_task_id, bool with_alloc) {
-        PTO2TensorMapEntry* entry = new_entry();
-        entry->copy_tensor_create_info(tensor_create_info, reinterpret_cast<uint64_t>(addr));
-        link_entry(entry, reinterpret_cast<uint64_t>(addr), producer_task_id, with_alloc);
+        link_entry(entry, tensor.buffer.addr, producer_task_id);
     }
 
     /**
@@ -396,7 +383,7 @@ struct PTO2TensorMap {
                 // Only remove if this entry belongs to the retiring task
                 // (slot may have been reused by a newer task)
                 debug_assert(cur_entry->producer_task_id ==
-                             pto2_make_task_id(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id)));
+                             PTO2TaskId::make(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id)));
                 free_entry(*cur_entry);
                 cur_entry = next_entry;
             }
@@ -426,7 +413,7 @@ struct PTO2TensorMap {
     /**
      * Link an initialized entry into bucket and task chains.
      */
-    void link_entry(PTO2TensorMapEntry* entry, uint64_t addr, PTO2TaskId producer_task_id, bool with_alloc) {
+    void link_entry(PTO2TensorMapEntry* entry, uint64_t addr, PTO2TaskId producer_task_id) {
 #if PTO2_TENSORMAP_PROFILING
         g_insert_count++;
 #endif
@@ -436,7 +423,6 @@ struct PTO2TensorMap {
         int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
 
         entry->producer_task_id = producer_task_id;
-        entry->with_alloc = with_alloc;
 
         // Insert at head of hash bucket
         entry->bucket_index = bucket_index;

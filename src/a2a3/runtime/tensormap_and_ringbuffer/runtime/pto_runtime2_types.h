@@ -33,6 +33,7 @@
 
 #include "pto2_dispatch_payload.h"
 #include "pto_submit_types.h"
+#include "pto_task_id.h"
 #include "pto_types.h"
 
 // =============================================================================
@@ -77,7 +78,8 @@
 #define PTO2_ERROR_HEAP_RING_DEADLOCK 2
 #define PTO2_ERROR_FLOW_CONTROL_DEADLOCK 3
 #define PTO2_ERROR_DEP_POOL_OVERFLOW 4
-#define PTO2_ERROR_INVALID_ARGS 5  // Arg construction error (invalid args)
+#define PTO2_ERROR_INVALID_ARGS 5         // Arg construction error (invalid args)
+#define PTO2_ERROR_DEPENDENCY_OVERFLOW 6  // Too many unique fanin dependencies for one task
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT 100
@@ -127,31 +129,8 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
 // =============================================================================
 
 /**
- * TaskId: 64-bit encoding used across Runtime2.
- *
- * raw encoding: (ring_id << 32) | local_id
- *
- * ring_id:  which ring layer (0..PTO2_MAX_RING_DEPTH-1)
- * local_id: per-ring monotonic counter
+ * TaskId: defined in pto_task_id.h (included above).
  */
-struct PTO2TaskId {
-    uint64_t raw;
-
-    constexpr PTO2TaskId() : raw(0) {}
-    constexpr explicit PTO2TaskId(uint64_t v) : raw(v) {}
-
-    constexpr uint8_t ring() const { return static_cast<uint8_t>(raw >> 32); }
-    constexpr uint32_t local() const { return static_cast<uint32_t>(raw & 0xFFFFFFFFu); }
-
-    constexpr bool operator==(const PTO2TaskId& other) const { return raw == other.raw; }
-    constexpr bool operator!=(const PTO2TaskId& other) const { return raw != other.raw; }
-};
-
-static_assert(sizeof(PTO2TaskId) == 8, "PTO2TaskId must stay 8 bytes (shared memory ABI)");
-
-static inline PTO2TaskId pto2_make_task_id(uint8_t ring_id, uint32_t local_id) {
-    return PTO2TaskId{(static_cast<uint64_t>(ring_id) << 32) | static_cast<uint64_t>(local_id)};
-}
 
 // =============================================================================
 // Worker Types

@@ -189,6 +189,22 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
         tensor_count_++;
     }
 
+    /// Write-only existing tensor: skips OverlapMap lookup, depends on creator.
+    void add_output(const Tensor& t) {
+        if (!check_add_tensor_valid()) return;
+        tensors_[tensor_count_].ptr = &t;
+        tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING;
+        tensor_count_++;
+    }
+
+    /// No-dependency existing tensor: skips OverlapMap lookup, depends on creator only.
+    void add_no_dep(const Tensor& t) {
+        if (!check_add_tensor_valid()) return;
+        tensors_[tensor_count_].ptr = &t;
+        tags_[tensor_count_] = TensorArgType::NO_DEP;
+        tensor_count_++;
+    }
+
     /**
      * Add a scalar value. Type is deduced from the argument;
      * the value is bit-cast to uint64_t for storage.

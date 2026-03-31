@@ -114,6 +114,41 @@ static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)
 #endif
 
+static bool pto2_append_fanin_or_fail(PTO2OrchestratorState* orch,
+    PTO2TaskId task_id,
+    int32_t tensor_arg_index,
+    TensorArgType ptype,
+    PTO2TaskSlotState* prod_state,
+    PTO2TaskSlotState* fanin_states[],
+    int32_t* fanin_count,
+    const char* reason) {
+    for (int32_t j = 0; j < *fanin_count; j++) {
+        if (fanin_states[j] == prod_state) {
+            return true;
+        }
+    }
+
+    if (*fanin_count >= PTO2_MAX_INPUTS) {
+        LOG_ERROR("========================================");
+        LOG_ERROR("FATAL: Dependency Overflow Detected!");
+        LOG_ERROR("========================================");
+        LOG_ERROR("Task requires more than PTO2_MAX_INPUTS unique fanin dependencies.");
+        LOG_ERROR("  task_id.raw:        %" PRIu64, task_id.raw);
+        LOG_ERROR("  tensor_arg_index:   %d", tensor_arg_index);
+        LOG_ERROR("  tensor_arg_type:    %d", static_cast<int>(ptype));
+        LOG_ERROR("  fanin_count:        %d / %d", *fanin_count, PTO2_MAX_INPUTS);
+        LOG_ERROR("  reason:             %s", reason);
+        LOG_ERROR("This is a runtime dependency-tracking limit.");
+        LOG_ERROR("========================================");
+        orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_DEPENDENCY_OVERFLOW, std::memory_order_release);
+        orch->fatal = true;
+        return false;
+    }
+
+    fanin_states[(*fanin_count)++] = prod_state;
+    return true;
+}
+
 // =============================================================================
 // Orchestrator Initialization
 // =============================================================================
@@ -377,7 +412,7 @@ TaskOutputTensors pto2_submit_mixed_task(
 
     int32_t local_id = alloc_result.task_id;
     int32_t slot = alloc_result.slot;
-    PTO2TaskId task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
+    PTO2TaskId task_id = PTO2TaskId::make(ring_id, static_cast<uint32_t>(local_id));
 
     PTO2TaskDescriptor& task = allocator.task_by_slot(slot);
     PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[ring_id][slot];
@@ -446,47 +481,48 @@ TaskOutputTensors pto2_submit_mixed_task(
     // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
     for (int i = 0; i < args.tensor_count(); i++) {
         TensorArgType ptype = args.tag(i);
+        if (ptype == TensorArgType::OUTPUT) {
+            // Runtime-created OUTPUT tensors are not looked up in the TensorMap since they have no dependencies.
+            continue;
+        }
 
-        switch (ptype) {
-            case TensorArgType::INOUT:
-            case TensorArgType::INPUT: {
-                if (args.tensor(i).ptr->manual_dep) break;
-                // Look up producer via TensorMap (reads from cached stack tensor)
-                PTO2LookupResult lookup_result;
-                orch->tensor_map.lookup(*args.tensor(i).ptr, lookup_result);
+        const Tensor* tensor = args.tensor(i).ptr;
 
-                for (int r = 0; r < lookup_result.count; r++) {
-                    PTO2TensorMapEntry& entry = *lookup_result.entries[r].entry;
-                    auto overlap_status = lookup_result.entries[r].overlap_status;
-                    // Check if this producer is already in fanin list (avoid duplicates)
-                    auto prod_ring = entry.producer_task_id.ring();
-                    auto prod_local = entry.producer_task_id.local();
-                    PTO2TaskSlotState* prod_state =
-                        &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
-                    bool already_added = false;
-                    for (int j = 0; j < fanin_count; j++) {
-                        if (fanin_states[j] == prod_state) {
-                            already_added = true;
-                            break;
-                        }
-                    }
-
-                    if (!already_added) {
-                        // Add to fanin list (this task depends on producer)
-                        if (fanin_count < PTO2_MAX_INPUTS) {
-                            fanin_states[fanin_count++] = prod_state;
-                        }
-                    }
-                    if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
-                        if (!entry.with_alloc) {
-                            orch->tensor_map.remove_entry(entry);
-                        }
-                    }
-                }
-                break;
+        // Step A: creator retention — all existing tensors extend their creator lifetime.
+        PTO2TaskId owner = tensor->owner_task_id;
+        if (owner.is_valid() && sched != nullptr) {
+            PTO2TaskSlotState* prod_state =
+                &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
+            if (!pto2_append_fanin_or_fail(
+                    orch, task_id, i, ptype, prod_state, fanin_states, &fanin_count, "creator retention")) {
+                return result;
             }
-            default:
-                break;
+        }
+
+        // Step B: only INPUT/INOUT need modifier dependency lookup.
+        if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
+            continue;
+        }
+        if (tensor->manual_dep) {
+            continue;
+        }
+
+        PTO2LookupResult lookup_result;
+        orch->tensor_map.lookup(*tensor, lookup_result);
+
+        for (int r = 0; r < lookup_result.count; r++) {
+            PTO2TensorMapEntry& entry = *lookup_result.entries[r].entry;
+            auto overlap_status = lookup_result.entries[r].overlap_status;
+            auto prod_ring = entry.producer_task_id.ring();
+            auto prod_local = entry.producer_task_id.local();
+            PTO2TaskSlotState* prod_state = &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
+            if (!pto2_append_fanin_or_fail(
+                    orch, task_id, i, ptype, prod_state, fanin_states, &fanin_count, "overlap lookup")) {
+                return result;
+            }
+            if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                orch->tensor_map.remove_entry(entry);
+            }
         }
     }
 
@@ -496,16 +532,9 @@ TaskOutputTensors pto2_submit_mixed_task(
     {
         for (int i = 0; i < args.tensor_count(); i++) {
             TensorArgType ptype = args.tag(i);
-            if (ptype == TensorArgType::INOUT) {
+            if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
                 if (!args.tensor(i).ptr->manual_dep) {
-                    orch->tensor_map.insert(*args.tensor(i).ptr, task_id, false);
-                }
-            } else if (ptype == TensorArgType::OUTPUT) {
-                if (!args.tensor(i).create_info->manual_dep) {
-                    orch->tensor_map.insert(*args.tensor(i).create_info,
-                        reinterpret_cast<void*>(reinterpret_cast<char*>(alloc_result.packed_base) + offsets[i]),
-                        task_id,
-                        true);
+                    orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
                 }
             }
         }
@@ -535,6 +564,14 @@ TaskOutputTensors pto2_submit_mixed_task(
     }
 
     payload->init(args, result, alloc_result.packed_base, offsets, buffer_sizes);
+
+    // Write owner_task_id into materialized OUTPUT tensors so creator-only dependency
+    // tracking remains available even when manual_dep skips OverlapMap publication.
+    for (int i = 0; i < args.tensor_count(); i++) {
+        if (args.tag(i) == TensorArgType::OUTPUT) {
+            payload->tensors[i].owner_task_id = task_id;
+        }
+    }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 #if PTO2_ORCH_PROFILING

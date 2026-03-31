@@ -110,7 +110,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         Arg params_t4;
         params_t4.add_input(g);
         params_t4.add_input(c);
-        params_t4.add_inout(ext_f);
+        params_t4.add_output(ext_f);
         pto2_rt_submit_aiv_task(0, params_t4);  // kernel_add
     }  // inner scope ends: releases d, e, g
 }

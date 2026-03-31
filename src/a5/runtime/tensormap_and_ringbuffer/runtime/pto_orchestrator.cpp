@@ -514,6 +514,9 @@ TaskOutputTensors pto2_submit_mixed_task(
                 result.output_count++;
                 break;
             }
+
+            default:
+                break;
         }
     }
 

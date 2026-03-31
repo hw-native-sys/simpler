@@ -27,7 +27,7 @@ struct ContinuousTensor {
     uint64_t data;                                // Host/device memory address
     uint32_t shapes[CONTINUOUS_TENSOR_MAX_DIMS];  // Shape per dim (element count)
     uint32_t ndims;                               // Number of dimensions (1..5)
-    DataType dtype;                               // DataType : uint32_t
+    DataType dtype;                               // DataType : uint8_t
 
     uint64_t nbytes() const {
         uint64_t total = 1;
@@ -44,13 +44,15 @@ struct ContinuousTensor {
 static_assert(
     std::is_trivially_copyable<ContinuousTensor>::value, "ContinuousTensor must be trivially copyable for DMA");
 static_assert(
-    sizeof(ContinuousTensor) == 40, "ContinuousTensor size must be exactly 40B (36B fields + 4B tail padding)");
+    sizeof(ContinuousTensor) == 40, "ContinuousTensor size must be exactly 40B (33B fields + 7B tail padding)");
 
 /**
  * TensorArgType - Distinguishes inputs, outputs, and in-place updates
  */
 enum class TensorArgType : int32_t {
-    INPUT = 0,   // Read-only input buffer
-    OUTPUT = 1,  // Write-only output buffer (runtime allocates)
-    INOUT = 2,   // Read-then-write: modifier for downstream
+    INPUT = 0,            // Read-only input buffer
+    OUTPUT = 1,           // Write-only output buffer (runtime allocates)
+    INOUT = 2,            // Read-then-write: modifier for downstream
+    OUTPUT_EXISTING = 3,  // Write-only existing tensor: skips OverlapMap lookup, depends on creator
+    NO_DEP = 4,           // No-dependency existing tensor: skips OverlapMap lookup, no publish
 };

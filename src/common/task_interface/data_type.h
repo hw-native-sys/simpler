@@ -32,7 +32,7 @@
 /**
  * Supported data types for tensor elements
  */
-enum class DataType : uint32_t {
+enum class DataType : uint8_t {
     FLOAT32,   // 4 bytes
     FLOAT16,   // 2 bytes
     INT32,     // 4 bytes
@@ -44,6 +44,8 @@ enum class DataType : uint32_t {
     UINT64,    // 8 bytes
     DATA_TYPE_NUM,
 };
+
+static_assert(sizeof(DataType) == 1, "DataType must stay 1 byte");
 
 /**
  * Get the size in bytes of a single element of the given data type

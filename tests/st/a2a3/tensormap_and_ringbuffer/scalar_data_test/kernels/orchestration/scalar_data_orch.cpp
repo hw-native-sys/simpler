@@ -225,23 +225,23 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     set_tensor_data(ext_check, 1, check_idx, waw_val);
 
     // =========================================================
-    // Step 12: External tensor WAR — must use INOUT, not INPUT
+    // Step 12: External tensor WAR — must use add_output or add_inout, not add_input
     //
     //   For external tensors, using add_input() does NOT create a
     //   TensorMap entry. set_tensor_data would then write immediately
     //   without waiting for the reader kernel — a WAR data race.
     //
-    //   Using add_inout() creates a TensorMap entry, enabling
-    //   set_tensor_data to detect the producer via TensorMap lookup
+    //   Using add_output() (or add_inout()) creates a TensorMap entry,
+    //   enabling set_tensor_data to detect the producer via TensorMap lookup
     //   and wait for fanout_refcount (all consumers done).
     //
-    //   Here we submit noop with ext_b as INOUT (noop doesn't modify
-    //   data), then set_tensor_data overwrites ext_b[0] = 55.0.
+    //   Here we submit noop with ext_b as write-only output (noop doesn't
+    //   read data), then set_tensor_data overwrites ext_b[0] = 55.0.
     //   set_tensor_data auto-waits for the noop to complete.
     // =========================================================
     {
         Arg args;
-        args.add_inout(ext_b);  // INOUT: creates TensorMap entry (not INPUT!)
+        args.add_output(ext_b);  // write-only: creates TensorMap entry (not add_input!)
         pto2_rt_submit_aiv_task(FUNC_NOOP, args);
     }
 
@@ -258,13 +258,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     set_tensor_data(ext_b, 1, idx, 0.0f);
 
     // =========================================================
-    // Step 13: result = a + b (external output via INOUT, kernel_add)
+    // Step 13: result = a + b (external output via add_output, kernel_add)
     // =========================================================
     {
         Arg args;
         args.add_input(ext_a);
         args.add_input(ext_b);
-        args.add_inout(ext_result);
+        args.add_output(ext_result);
         pto2_rt_submit_aiv_task(FUNC_ADD, args);
     }
 

@@ -279,10 +279,22 @@ class RuntimeCompiler:
                 logger.debug(result.stderr)
 
             if result.returncode != 0:
-                logger.error(f"[{platform}] {step_name} failed: {result.stderr}")
-                raise RuntimeError(f"{step_name} failed for {platform}: {result.stderr}")
+                self._log_failed_build_output(platform, step_name, result)
+                raise RuntimeError(f"{step_name} failed for {platform} with exit code {result.returncode}")
         except FileNotFoundError:
             raise RuntimeError(f"{step_name} not found. Please install {step_name}.")
+
+    @staticmethod
+    def _log_failed_build_output(platform: str, step_name: str, result: subprocess.CompletedProcess) -> None:
+        """Emit captured build output at ERROR level so failures are visible by default."""
+        logger.error(f"[{platform}] {step_name} failed with exit code {result.returncode}")
+
+        if result.stdout:
+            logger.error(f"[{platform}] {step_name} stdout:\n{result.stdout.rstrip()}")
+        if result.stderr:
+            logger.error(f"[{platform}] {step_name} stderr:\n{result.stderr.rstrip()}")
+        if not result.stdout and not result.stderr:
+            logger.error(f"[{platform}] {step_name} produced no stdout/stderr output")
 
     def _run_compilation(
         self,

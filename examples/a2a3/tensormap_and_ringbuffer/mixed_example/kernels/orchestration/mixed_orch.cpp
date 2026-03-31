@@ -102,13 +102,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 Arg args;
                 args.add_input(ext_A);
                 args.add_input(ext_B);
-                args.add_inout(C_view);
+                args.add_output(C_view);
                 args.add_input(ext_D);
                 args.add_input(ext_E);
-                args.add_inout(F_view);
+                args.add_output(F_view);
                 args.add_input(ext_G);
                 args.add_input(ext_H);
-                args.add_inout(I_view);
+                args.add_output(I_view);
                 pto2_rt_submit_task(mk, args);
             }
 
@@ -117,7 +117,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 Arg args;
                 args.add_input(ext_A);
                 args.add_input(ext_B);
-                args.add_inout(J_view);
+                args.add_output(J_view);
                 pto2_rt_submit_aic_task(FUNC_MATMUL, args);
             }
 
@@ -126,7 +126,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 Arg args;
                 args.add_input(ext_D);
                 args.add_input(ext_E);
-                args.add_inout(K_view);
+                args.add_output(K_view);
                 pto2_rt_submit_aiv_task(FUNC_ADD_STANDALONE, args);
             }
 
@@ -138,10 +138,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 Arg args;
                 args.add_input(ext_D);
                 args.add_input(ext_E);
-                args.add_inout(L_view);
+                args.add_output(L_view);
                 args.add_input(ext_G);
                 args.add_input(ext_H);
-                args.add_inout(M_view);
+                args.add_output(M_view);
                 pto2_rt_submit_task(mk, args);
             }
 
@@ -153,10 +153,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 Arg args;
                 args.add_input(ext_A);
                 args.add_input(ext_B);
-                args.add_inout(N_view);
+                args.add_output(N_view);
                 args.add_input(ext_D);
                 args.add_input(ext_E);
-                args.add_inout(O_view);
+                args.add_output(O_view);
                 pto2_rt_submit_task(mk, args);
             }
         }
