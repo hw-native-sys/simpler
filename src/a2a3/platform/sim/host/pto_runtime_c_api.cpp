@@ -31,15 +31,7 @@ extern "C" {
  * Runtime Implementation Functions (defined in runtimemaker.cpp)
  * ===========================================================================
  */
-int init_runtime_impl(Runtime* runtime,
-    const uint8_t* orch_so_binary,
-    size_t orch_so_size,
-    const char* orch_func_name,
-    const ChipStorageTaskArgs* orch_args,
-    const int* kernel_func_ids,
-    const uint8_t* const* kernel_binaries,
-    const size_t* kernel_sizes,
-    int kernel_count);
+int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const ChipStorageTaskArgs* orch_args);
 int validate_runtime_impl(Runtime* runtime);
 
 /* Forward declarations */
@@ -57,15 +49,7 @@ void remove_kernel_binary_wrapper(int func_id);
 
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
-int init_runtime(RuntimeHandle runtime,
-    const uint8_t* orch_so_binary,
-    size_t orch_so_size,
-    const char* orch_func_name,
-    const ChipStorageTaskArgs* orch_args,
-    const int* kernel_func_ids,
-    const uint8_t* const* kernel_binaries,
-    const size_t* kernel_sizes,
-    int kernel_count) {
+int init_runtime(RuntimeHandle runtime, const ChipCallable* callable, const ChipStorageTaskArgs* orch_args) {
     if (runtime == NULL) {
         return -1;
     }
@@ -85,15 +69,7 @@ int init_runtime(RuntimeHandle runtime,
         r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
 
         // Delegate kernel registration, SO loading, and orchestration to init_runtime_impl
-        int result = init_runtime_impl(r,
-            orch_so_binary,
-            orch_so_size,
-            orch_func_name,
-            orch_args,
-            kernel_func_ids,
-            kernel_binaries,
-            kernel_sizes,
-            kernel_count);
+        int result = init_runtime_impl(r, callable, orch_args);
 
         if (result != 0) {
             // Clear SM pointer so validate_runtime_impl skips reading

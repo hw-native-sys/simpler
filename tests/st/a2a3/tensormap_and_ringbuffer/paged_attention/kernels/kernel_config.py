@@ -33,6 +33,7 @@ _KERNELS_ROOT = Path(__file__).parent
 ORCHESTRATION = {
     "source": str(_KERNELS_ROOT / "orchestration" / "paged_attention_orch.cpp"),
     "function_name": "build_paged_attention_graph",
+    "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
 }
 
 # Kernel configs (aiv_normalize removed - merged into aiv_online_update)

@@ -24,6 +24,7 @@ _PA_KERNELS = _KERNELS_ROOT.parent.parent / "paged_attention" / "kernels"
 ORCHESTRATION = {
     "source": str(_PA_KERNELS / "orchestration" / "paged_attention_orch.cpp"),
     "function_name": "aicpu_orchestration_entry",
+    "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
 }
 
 # Kernel configs — reuse paged_attention kernel sources

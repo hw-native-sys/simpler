@@ -22,6 +22,7 @@ _KERNELS_ROOT = Path(__file__).parent
 ORCHESTRATION = {
     "source": str(_KERNELS_ROOT / "orchestration" / "bgemm_orch.cpp"),
     "function_name": "aicpu_orchestration_entry",
+    "signature": [D.IN, D.IN, D.OUT],
 }
 
 KERNELS = [

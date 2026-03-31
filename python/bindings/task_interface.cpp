@@ -389,6 +389,7 @@ NB_MODULE(_task_interface, m) {
         .def_static(
             "build",
             [](std::vector<ArgDirection> signature,
+                std::string func_name,
                 nb::bytes binary,
                 std::vector<std::tuple<int32_t, PyCoreCallable>> children) -> PyChipCallable {
                 auto bin_ptr = reinterpret_cast<const void*>(binary.c_str());
@@ -404,6 +405,7 @@ NB_MODULE(_task_interface, m) {
 
                 auto buf = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 32>(signature.data(),
                     static_cast<int32_t>(signature.size()),
+                    func_name.c_str(),
                     bin_ptr,
                     bin_size,
                     func_ids.data(),
@@ -412,9 +414,10 @@ NB_MODULE(_task_interface, m) {
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("signature"),
+            nb::arg("func_name"),
             nb::arg("binary"),
             nb::arg("children"),
-            "Build a ChipCallable from signature, binary, and list of (func_id, CoreCallable) children.")
+            "Build a ChipCallable from signature, func_name, binary, and list of (func_id, CoreCallable) children.")
 
         .def(
             "sig",
@@ -431,6 +434,14 @@ NB_MODULE(_task_interface, m) {
             "binary_size",
             [](const PyChipCallable& self) -> uint32_t { return self.get().binary_size(); },
             "Size of the binary payload in bytes.")
+
+        .def_prop_ro(
+            "func_name",
+            [](const PyChipCallable& self) -> std::string {
+                const auto& c = self.get();
+                return std::string(c.func_name(), c.func_name_len());
+            },
+            "The orchestration function name.")
 
         .def_prop_ro(
             "child_count",
@@ -484,7 +495,8 @@ NB_MODULE(_task_interface, m) {
         .def("__repr__", [](const PyChipCallable& self) -> std::string {
             const auto& c = self.get();
             std::ostringstream os;
-            os << "ChipCallable(sig_count=" << c.sig_count() << ", binary_size=" << c.binary_size()
+            os << "ChipCallable(func_name=\"" << std::string(c.func_name(), c.func_name_len())
+               << "\", sig_count=" << c.sig_count() << ", binary_size=" << c.binary_size()
                << ", child_count=" << c.child_count() << ")";
             return os.str();
         });

@@ -18,22 +18,10 @@ Usage:
     from bindings import bind_host_binary, launch_runtime, set_device
 
     Runtime = bind_host_binary("/path/to/libpto_runtime.so")
-    set_device(0)  # Must be called before initialize with kernels
-
-    # Prepare kernel binaries as list of (func_id, binary_data) tuples
-    kernel_binaries = [
-        (0, kernel_add_binary),
-        (1, kernel_add_scalar_binary),
-        (2, kernel_mul_binary),
-    ]
+    set_device(0)  # Must be called before initialize
 
     runtime = Runtime()
-    runtime.initialize(
-        orch_so_binary,
-        "build_example_graph",
-        orch_args,
-        kernel_binaries=kernel_binaries
-    )
+    runtime.initialize(chip_callable, orch_args)
 
     launch_runtime(runtime, aicpu_thread_num=1, block_dim=1,
                  device_id=0, aicpu_binary=aicpu_bytes,
@@ -47,12 +35,10 @@ import tempfile
 from ctypes import (
     CDLL,
     POINTER,
-    c_char_p,
     c_int,
     c_size_t,
     c_uint8,
     c_void_p,
-    cast,
 )
 from pathlib import Path
 from typing import Optional, Union
@@ -102,17 +88,11 @@ class RuntimeLibraryLoader:
         self.lib.get_runtime_size.argtypes = []
         self.lib.get_runtime_size.restype = c_size_t
 
-        # init_runtime - placement new + register kernels + load SO + build runtime with orchestration
+        # init_runtime - placement new + unpack ChipCallable + register kernels + load SO
         self.lib.init_runtime.argtypes = [
             c_void_p,  # runtime
-            POINTER(c_uint8),  # orch_so_binary
-            c_size_t,  # orch_so_size
-            c_char_p,  # orch_func_name
-            c_void_p,  # orch_args (ChipStorageTaskArgs*)
-            POINTER(c_int),  # kernel_func_ids (array of func_ids)
-            POINTER(POINTER(c_uint8)),  # kernel_binaries (array of binary pointers)
-            POINTER(c_size_t),  # kernel_sizes (array of sizes)
-            c_int,  # kernel_count
+            c_void_p,  # callable (const ChipCallable*)
+            c_void_p,  # orch_args (const ChipStorageTaskArgs*)
         ]
         self.lib.init_runtime.restype = c_int
 
@@ -205,30 +185,20 @@ class Runtime:
 
     def initialize(
         self,
-        orch_so_binary: bytes,
-        orch_func_name: str,
+        chip_callable,
         orch_args: Optional[list] = None,
-        kernel_binaries: Optional[list[tuple[int, bytes]]] = None,
     ) -> None:
         """
 
-        Initialize the runtime structure with dynamic orchestration.
+        Initialize the runtime structure with a ChipCallable.
 
-        Calls init_runtime() in C++ which:
-        1. Registers kernel binaries and stores addresses in Runtime's func_id_to_addr_[]
-        2. Loads the orchestration SO, resolves the function, and calls it to build the task graph
-
-        The orchestration function is responsible for:
-        1. Allocating device memory
-        2. Copying data to device
-        3. Building the task graph
-        4. Recording tensor pairs for copy-back
+        Calls init_runtime() in C++ which unpacks the ChipCallable to:
+        1. Register kernel binaries (children) to device memory
+        2. Load the orchestration SO, resolve the function, and call it
 
         Args:
-            orch_so_binary: Orchestration shared library binary data
-            orch_func_name: Name of the orchestration function to call
+            chip_callable: ChipCallable containing orch binary, func_name, + kernel CoreCallables
             orch_args: ChipStorageTaskArgs with orchestration arguments
-            kernel_binaries: List of (func_id, binary_data) tuples for kernel registration
 
         Raises:
             RuntimeError: If initialization fails
@@ -249,46 +219,14 @@ class Runtime:
         else:
             raise TypeError(f"orch_args must be a ChipStorageTaskArgs, got {type(orch_args)}")
 
-        # Convert orch_so_binary to ctypes array
-        orch_so_array = (c_uint8 * len(orch_so_binary)).from_buffer_copy(orch_so_binary)
-
-        # Prepare kernel binary arrays
-        # Keep references to prevent garbage collection during C call
-        self._kernel_binary_arrays = []
-        if kernel_binaries and len(kernel_binaries) > 0:
-            kernel_count = len(kernel_binaries)
-            func_ids = [k[0] for k in kernel_binaries]
-            func_ids_array = (c_int * kernel_count)(*func_ids)
-
-            # Create array of binary pointers
-            binary_ptrs = []
-            sizes = []
-            for func_id, kernel_item in kernel_binaries:
-                buf_ptr = kernel_item.buffer_ptr()  # pyright: ignore[reportAttributeAccessIssue]
-                buf_size = kernel_item.buffer_size()  # pyright: ignore[reportAttributeAccessIssue]
-                ptr = cast(c_void_p(buf_ptr), POINTER(c_uint8))
-                binary_ptrs.append(ptr)
-                sizes.append(buf_size)
-                self._kernel_binary_arrays.append(kernel_item)
-
-            binaries_array = (POINTER(c_uint8) * kernel_count)(*binary_ptrs)
-            sizes_array = (c_size_t * kernel_count)(*sizes)
-        else:
-            kernel_count = 0
-            func_ids_array = None
-            binaries_array = None
-            sizes_array = None
+        # Pass ChipCallable pointer to C API
+        self._chip_callable = chip_callable  # prevent GC
+        callable_ptr = c_void_p(chip_callable.buffer_ptr())  # pyright: ignore[reportAttributeAccessIssue]
 
         rc = self.lib.init_runtime(
             self._handle,
-            orch_so_array,
-            len(orch_so_binary),
-            orch_func_name.encode("utf-8"),
+            callable_ptr,
             orch_args_ptr,
-            func_ids_array,
-            binaries_array,
-            sizes_array,
-            kernel_count,
         )
         if rc != 0:
             raise RuntimeError(f"init_runtime failed: {rc}")
@@ -571,18 +509,8 @@ def bind_host_binary(lib_path: Union[str, Path, bytes]) -> type:
         Runtime = bind_host_binary("/path/to/libpto_runtime.so")
         set_device(0)
 
-        kernel_binaries = [
-            (0, kernel_add_binary),
-            (1, kernel_mul_binary),
-        ]
-
         runtime = Runtime()
-        runtime.initialize(
-            orch_so_binary,
-            "build_example_graph",
-            orch_args,
-            kernel_binaries=kernel_binaries
-        )
+        runtime.initialize(chip_callable, orch_args)
 
         launch_runtime(runtime, aicpu_thread_num=1, block_dim=1,
                      device_id=0, aicpu_binary=aicpu_bytes,

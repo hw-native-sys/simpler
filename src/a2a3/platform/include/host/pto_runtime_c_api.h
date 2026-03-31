@@ -30,6 +30,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "callable.h"  // NOLINT(build/include_subdir)
 #include "common/compile_strategy.h"
 #include "task_args.h"  // NOLINT(build/include_subdir)
 
@@ -68,36 +69,22 @@ typedef void* RuntimeHandle;
 size_t get_runtime_size(void);
 
 /**
- * Initialize a runtime with dynamic orchestration and kernel binaries.
+ * Initialize a runtime with a ChipCallable and orchestration arguments.
  *
  * Uses placement new to construct Runtime in user-allocated memory.
- * Registers kernel binaries to device memory, storing addresses directly
- * in Runtime's func_id_to_addr_[] array.
- * Then loads the orchestration shared library from binary data, resolves the
- * specified function, and calls it to build the task graph.
+ * The ChipCallable bundles the orchestration binary, function name, and
+ * child kernel CoreCallables. This function uploads kernels to device memory,
+ * loads the orchestration shared library, and calls the orchestration function
+ * to build the task graph.
  *
- * IMPORTANT: set_device() MUST be called before this function if kernel_count > 0.
+ * IMPORTANT: set_device() MUST be called before this function.
  *
- * @param runtime           User-allocated memory of size get_runtime_size()
- * @param orch_so_binary    Orchestration shared library binary data
- * @param orch_so_size      Size of orchestration SO binary in bytes
- * @param orch_func_name    Name of the orchestration function to call
- * @param orch_args         Separated tensor/scalar arguments for orchestration
- * @param kernel_func_ids   Array of kernel function IDs (can be NULL if kernel_count == 0)
- * @param kernel_binaries   Array of pointers to kernel binary data
- * @param kernel_sizes      Array of kernel binary sizes in bytes
- * @param kernel_count      Number of kernels to register
+ * @param runtime   User-allocated memory of size get_runtime_size()
+ * @param callable  ChipCallable containing orch binary, func_name, and child kernels
+ * @param orch_args Separated tensor/scalar arguments for orchestration
  * @return 0 on success, -1 on failure
  */
-int init_runtime(RuntimeHandle runtime,
-    const uint8_t* orch_so_binary,
-    size_t orch_so_size,
-    const char* orch_func_name,
-    const ChipStorageTaskArgs* orch_args,
-    const int* kernel_func_ids,
-    const uint8_t* const* kernel_binaries,
-    const size_t* kernel_sizes,
-    int kernel_count);
+int init_runtime(RuntimeHandle runtime, const ChipCallable* callable, const ChipStorageTaskArgs* orch_args);
 
 /* ===========================================================================
  * Device Memory API (for use by orchestration functions)

@@ -574,6 +574,7 @@ class TestChipCallable:
         child1 = self._make_child([ArgDirection.OUT, ArgDirection.SCALAR], b"\x05\x06")
         chip = ChipCallable.build(
             signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
+            func_name="test_func",
             binary=b"\xaa" * 16,
             children=[(10, child0), (20, child1)],
         )
@@ -593,6 +594,7 @@ class TestChipCallable:
         child2 = self._make_child([ArgDirection.SCALAR], b"\x03" * 1)
         chip = ChipCallable.build(
             signature=[ArgDirection.IN],
+            func_name="test_func",
             binary=b"\xbb" * 10,
             children=[(1, child0), (2, child1), (3, child2)],
         )
@@ -602,6 +604,7 @@ class TestChipCallable:
     def test_no_children(self):
         chip = ChipCallable.build(
             signature=[ArgDirection.IN, ArgDirection.OUT],
+            func_name="test_func",
             binary=b"\xcc" * 32,
             children=[],
         )
@@ -613,6 +616,7 @@ class TestChipCallable:
         child = self._make_child([ArgDirection.IN, ArgDirection.OUT], b"\xdd" * 8)
         chip = ChipCallable.build(
             signature=[ArgDirection.SCALAR],
+            func_name="test_func",
             binary=b"\xee" * 4,
             children=[(42, child)],
         )
@@ -625,6 +629,7 @@ class TestChipCallable:
     def test_child_out_of_range(self):
         chip = ChipCallable.build(
             signature=[ArgDirection.IN],
+            func_name="test_func",
             binary=b"\x00",
             children=[],
         )
@@ -637,6 +642,7 @@ class TestChipCallable:
         child = self._make_child([ArgDirection.IN], b"\x00" * 50)
         chip = ChipCallable.build(
             signature=[ArgDirection.IN],
+            func_name="test_func",
             binary=b"\x00" * 100,
             children=[(1, child)],
         )
@@ -647,6 +653,7 @@ class TestChipCallable:
         child = self._make_child([ArgDirection.IN], b"\x00")
         chip = ChipCallable.build(
             signature=[ArgDirection.IN, ArgDirection.OUT],
+            func_name="test_func",
             binary=b"\x00" * 8,
             children=[(1, child)],
         )

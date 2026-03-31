@@ -32,6 +32,7 @@ _PA_KERNELS = Path(__file__).parent / ".." / ".." / "paged_attention" / "kernels
 ORCHESTRATION = {
     "source": str(_PA_KERNELS / "orchestration" / "paged_attention_orch.cpp"),
     "function_name": "build_paged_attention_graph",
+    "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
 }
 
 KERNELS = [

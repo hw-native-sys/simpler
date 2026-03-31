@@ -90,11 +90,15 @@ struct Callable<void, MaxSig, 0> {
 // Static parent: Callable<Child, MaxSig, MaxChildren> — FAM + children
 // ============================================================================
 
+static constexpr int CALLABLE_FUNC_NAME_MAX = 64;
+
 template <typename Child, int MaxSig, int MaxChildren>
 struct Callable {
     ArgDirection signature_[MaxSig];
     int32_t sig_count_;
     uint32_t binary_size_;
+    char func_name_[CALLABLE_FUNC_NAME_MAX];
+    uint32_t func_name_len_;
     int32_t child_func_ids_[MaxChildren];
     uint32_t child_offsets_[MaxChildren];
     int32_t child_count_;
@@ -107,6 +111,8 @@ struct Callable {
     int32_t sig_count() const { return sig_count_; }
     const void* binary_data() const { return storage_; }
     uint32_t binary_size() const { return binary_size_; }
+    const char* func_name() const { return func_name_; }
+    uint32_t func_name_len() const { return func_name_len_; }
 
     const Child& child(int32_t i) const {
         if (i < 0 || i >= child_count_) throw std::out_of_range("Callable: child index out of range");
@@ -128,6 +134,7 @@ struct Callable {
     template <typename C, int MS, int MC>
     friend std::vector<uint8_t> make_callable(const ArgDirection* sig,
         int32_t sig_count,
+        const char* func_name,
         const void* binary,
         uint32_t binary_size,
         const int32_t* child_func_ids,
@@ -226,6 +233,7 @@ std::vector<uint8_t> make_callable(
 template <typename Child, int MaxSig, int MaxChildren>
 std::vector<uint8_t> make_callable(const ArgDirection* sig,
     int32_t sig_count,
+    const char* func_name,
     const void* binary,
     uint32_t binary_size,
     const int32_t* child_func_ids,
@@ -251,6 +259,18 @@ std::vector<uint8_t> make_callable(const ArgDirection* sig,
     for (int32_t i = 0; i < sig_count; ++i) obj->signature_[i] = sig[i];
     obj->sig_count_ = sig_count;
     obj->binary_size_ = binary_size;
+
+    // Store func_name (null-terminated, truncated to CALLABLE_FUNC_NAME_MAX-1)
+    std::memset(obj->func_name_, 0, CALLABLE_FUNC_NAME_MAX);
+    if (func_name != nullptr) {
+        size_t name_len = std::strlen(func_name);
+        if (name_len >= CALLABLE_FUNC_NAME_MAX) name_len = CALLABLE_FUNC_NAME_MAX - 1;
+        std::memcpy(obj->func_name_, func_name, name_len);
+        obj->func_name_len_ = static_cast<uint32_t>(name_len);
+    } else {
+        obj->func_name_len_ = 0;
+    }
+
     if (binary_size > 0) std::memcpy(obj->storage_, binary, binary_size);
 
     for (int32_t i = 0; i < child_count; ++i) {

@@ -37,6 +37,7 @@
 
 #include "../runtime/pto_shared_memory.h"
 #include "../runtime/runtime.h"
+#include "callable.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 
@@ -79,44 +80,37 @@ static uint64_t parse_env_uint64(const char* name, uint64_t min_val, bool requir
  * - Copies orchestration SO to device memory
  * - Sets up runtime state for device orchestration
  *
- * @param runtime           Pointer to pre-constructed Runtime
- * @param orch_so_binary    Orchestration shared library binary data
- * @param orch_so_size      Size of orchestration SO binary in bytes
- * @param orch_func_name    Name of the orchestration function (unused)
- * @param orch_args         Separated tensor/scalar arguments
+ * @param runtime   Pointer to pre-constructed Runtime
+ * @param callable  ChipCallable containing orch binary, func_name, and child kernels
+ * @param orch_args Separated tensor/scalar arguments
  * @return 0 on success, -1 on failure
  */
-extern "C" int init_runtime_impl(Runtime* runtime,
-    const uint8_t* orch_so_binary,
-    size_t orch_so_size,
-    const char* orch_func_name,
-    const ChipStorageTaskArgs* orch_args,
-    const int* kernel_func_ids,
-    const uint8_t* const* kernel_binaries,
-    const size_t* kernel_sizes,
-    int kernel_count) {
-    // Suppress unused parameter warning
-    (void)orch_func_name;
-
+extern "C" int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const ChipStorageTaskArgs* orch_args) {
     // Validate inputs
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
     }
 
-    // Register kernel binaries via platform-provided upload function
-    if (kernel_count > 0 && kernel_func_ids != nullptr && kernel_binaries != nullptr && kernel_sizes != nullptr) {
-        LOG_INFO("Registering %d kernel(s) in init_runtime_impl", kernel_count);
-        for (int i = 0; i < kernel_count; i++) {
-            uint64_t addr =
-                runtime->host_api.upload_kernel_binary(kernel_func_ids[i], kernel_binaries[i], kernel_sizes[i]);
+    // Register kernel binaries from ChipCallable children
+    if (callable->child_count() > 0) {
+        LOG_INFO("Registering %d kernel(s) in init_runtime_impl", callable->child_count());
+        for (int32_t i = 0; i < callable->child_count(); i++) {
+            int func_id = callable->child_func_id(i);
+            const auto& kernel = callable->child(i);
+            uint64_t addr = runtime->host_api.upload_kernel_binary(func_id,
+                reinterpret_cast<const uint8_t*>(&kernel),
+                CoreCallable::binary_data_offset() + kernel.binary_size());
             if (addr == 0) {
-                LOG_ERROR("Failed to upload kernel binary for func_id=%d", kernel_func_ids[i]);
+                LOG_ERROR("Failed to upload kernel binary for func_id=%d", func_id);
                 return -1;
             }
-            runtime->set_function_bin_addr(kernel_func_ids[i], addr);
+            runtime->set_function_bin_addr(func_id, addr);
         }
     }
+
+    const uint8_t* orch_so_binary = static_cast<const uint8_t*>(callable->binary_data());
+    size_t orch_so_size = callable->binary_size();
 
     if (orch_so_binary == nullptr || orch_so_size == 0) {
         LOG_ERROR("Orchestration SO binary is required for device orchestration");

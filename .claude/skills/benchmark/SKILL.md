@@ -97,12 +97,26 @@ PTO_ISA_COMMIT=$(grep -oP '(?<=-c )\w+' .github/workflows/ci.yml | head -1)
 
 Append `-c $PTO_ISA_COMMIT` to benchmark args so `run_example.py` picks it up.
 
-## Step 4: Prepare
+## Step 4: Prepare — Compute Absolute Paths
+
+The Bash tool resets its working directory to the project root on every call. Relative paths like `cd worktree && ...` are fragile and easy to forget. **Compute absolute paths once, then use them everywhere.**
 
 ```bash
+PROJECT_ROOT="$(pwd)"                    # e.g. /home/user/simpler
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-mkdir -p tmp
+WORKTREE_ABS="${PROJECT_ROOT}/tmp/worktree_baseline_${TIMESTAMP}"
+mkdir -p "${PROJECT_ROOT}/tmp"
 ```
+
+Store `PROJECT_ROOT` and `WORKTREE_ABS` as shell variables in every Bash call that needs them (the Bash tool does not persist variables across calls). Use this pattern:
+
+```bash
+# Correct — self-contained, uses absolute path
+WORKTREE_ABS="/home/user/simpler/tmp/worktree_baseline_20260331_102302"
+"${WORKTREE_ABS}/tools/benchmark_rounds.sh" -d 2 ...
+```
+
+**Do NOT use `cd` + relative `./tools/...`** — this is the #1 source of silent errors (running the wrong workspace).
 
 ## Step 5: Run Benchmarks
 
@@ -116,40 +130,50 @@ mkdir -p tmp
 
 Use a **git worktree** for the baseline so the current workspace is never disturbed.
 
-#### CRITICAL: Worktree needs runtime binaries built
+#### CRITICAL: Worktree needs its own build environment
 
-The worktree is a fresh checkout at merge-base — it has **no pre-built runtime binaries** (`build/lib/` is in `.gitignore` and not checked in). Running `benchmark_rounds.sh` directly in the worktree will fail with:
+The worktree is a fresh checkout at merge-base — it has **no pre-built runtime binaries** and no compiled nanobind extension. Two things must be built:
 
-```text
-Pre-built runtime binaries not found for '...' (platform=a2a3)
-```
+1. **Runtime `.so` binaries** (`build/lib/`) — loaded via ctypes by `bindings.py`
+2. **Nanobind `_task_interface` extension** — compiled C++ Python bindings
 
-**You MUST run `python examples/scripts/build_runtimes.py` inside the worktree** before benchmarking. This builds the runtime `.so` files into the worktree's own `build/lib/` directory. Unlike `pip install -e .`, it does NOT modify the shared Python environment, so baseline and current workspaces remain fully independent.
+Pure Python files (`bindings.py`, `code_runner.py`) are resolved via `sys.path` relative to `run_example.py`'s `__file__`, so they correctly come from the worktree. But `_task_interface.*.so` is installed into site-packages by `pip install -e .` and is **shared system-wide**. Without isolation, the worktree would use the main workspace's nanobind extension — which may have incompatible API changes.
 
-#### 5a. Create worktree and build binaries
+**Solution: always create a venv in the worktree** (~26s overhead). This builds both the nanobind extension AND runtime binaries, fully isolating the baseline.
+
+#### 5a. Create worktree, venv, and build
+
+Inline the **absolute** worktree path (copy-paste the value, do not rely on shell variables persisting):
 
 ```bash
-WORKTREE_DIR="tmp/worktree_baseline_${TIMESTAMP}"
-git worktree add "$WORKTREE_DIR" "$MERGE_BASE" --quiet
+# Create worktree
+git worktree add "$WORKTREE_ABS" "$MERGE_BASE" --quiet
 
-# CRITICAL: build runtime binaries in worktree
-# Use cd inside the command — the Bash tool cwd does not persist across calls
-cd "$WORKTREE_DIR" && python examples/scripts/build_runtimes.py 2>&1 | tail -5
+# Create venv with system site-packages (for torch, numpy, etc.)
+python3 -m venv "${WORKTREE_ABS}/.venv" --system-site-packages
+
+# Install into venv — builds nanobind extension + runtime binaries
+"${WORKTREE_ABS}/.venv/bin/pip" install -e "${WORKTREE_ABS}" -q 2>&1 | tail -3
 ```
 
-**IMPORTANT — Bash tool cwd**: The Bash tool resets to the primary working directory for each call. To run commands inside the worktree, you MUST use `cd "$WORKTREE_DIR" && <command>` in a single Bash call. Do NOT rely on a previous `cd` persisting.
+This gives the worktree its own `_task_interface.*.so` in `.venv/lib/python3.*/site-packages/`, completely independent from the main workspace.
 
 #### 5b. Run baseline
 
+Activate the venv so `benchmark_rounds.sh` (which calls `python3`) picks up the worktree's nanobind extension and Python bindings:
+
 ```bash
-cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $BASELINE_DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
-  2>&1 | tee "$PROJECT_ROOT/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
+# WORKTREE_ABS must be the literal absolute path (e.g. /home/user/simpler/tmp/worktree_baseline_20260331)
+cd "$WORKTREE_ABS" && source .venv/bin/activate && pwd && ./tools/benchmark_rounds.sh -d $BASELINE_DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+  2>&1 | tee "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
 ```
+
+**Always include `pwd &&` after `cd` to verify you are in the correct directory.** If `pwd` does not print the worktree path, something went wrong — do not proceed.
 
 #### 5c. Run current
 
 ```bash
-# Run current benchmark (from main workspace cwd, which is automatic)
+# Runs from the main workspace (Bash tool default cwd)
 ./tools/benchmark_rounds.sh -d $CURRENT_DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
   2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
 ```
@@ -157,18 +181,24 @@ cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $BASELINE_DEVICE -c $PTO_IS
 #### 5d. Cleanup
 
 ```bash
-git worktree remove "$WORKTREE_DIR" --force
+git worktree remove "$WORKTREE_ABS" --force
+```
+
+If `git worktree remove` fails (e.g., cwd was inside the deleted worktree), use:
+
+```bash
+git -C "$PROJECT_ROOT" worktree remove "$WORKTREE_ABS" --force
 ```
 
 #### Parallel execution (two devices)
 
-When two devices are available, run baseline and current **for the same runtime** in parallel on separate devices. Since `build_runtimes.py` only builds into the local `build/lib/` without modifying the shared Python environment, both workspaces are fully independent.
+When two devices are available, run baseline and current **for the same runtime** in parallel on separate devices. The venv ensures the worktree has its own nanobind extension, so both workspaces are fully independent.
 
 ```bash
 # For each runtime (serially):
 for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
-  # Baseline on device A, current on device B — parallel (different devices)
-  cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $DEVICE_BASELINE -r "$RUNTIME" ... &
+  # Baseline on device A (from worktree with venv), current on device B (from main) — parallel
+  (cd "$WORKTREE_ABS" && source .venv/bin/activate && pwd && ./tools/benchmark_rounds.sh -d $DEVICE_BASELINE -r "$RUNTIME" ...) &
   ./tools/benchmark_rounds.sh -d $DEVICE_CURRENT -r "$RUNTIME" ... &
   wait  # Both finish before starting next runtime
 done
@@ -179,22 +209,19 @@ done
 #### Sequential execution (one device)
 
 ```bash
-# 1. Build worktree binaries
-cd "$WORKTREE_DIR" && python examples/scripts/build_runtimes.py
+# 1. Worktree + venv already created in step 5a
 
 # 2. For each runtime (serially — one device, one process at a time):
-for RUNTIME in "${RUNTIMES_TO_BENCH[@]}"; do
-  # Baseline first
-  cd "$WORKTREE_DIR" && ./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
-    2>&1 | tee "$PROJECT_ROOT/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
+#    Baseline first (from worktree with venv activated)
+cd "$WORKTREE_ABS" && source .venv/bin/activate && pwd && ./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+  2>&1 | tee "${PROJECT_ROOT}/tmp/benchmark_baseline_${TIMESTAMP}_${RUNTIME}.txt"
 
-  # Then current
-  ./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
-    2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
-done
+#    Then current (from main workspace — default cwd, no venv)
+./tools/benchmark_rounds.sh -d $DEVICE -c $PTO_ISA_COMMIT -r "$RUNTIME" \
+  2>&1 | tee "tmp/benchmark_current_${TIMESTAMP}_${RUNTIME}.txt"
 
 # 3. Cleanup
-git worktree remove "$WORKTREE_DIR" --force
+git -C "$PROJECT_ROOT" worktree remove "$WORKTREE_ABS" --force
 ```
 
 ## Step 6: Report Results
@@ -257,18 +284,20 @@ If any example shows > 5% regression, highlight it explicitly.
 | No idle device and no `-d` specified | Prompt user to specify device ID |
 | Benchmark script fails | Report which examples failed; continue with remaining |
 | No timing data | Warn: "No timing markers — ensure `PTO2_PROFILING` is enabled" |
-| All examples fail | Check: did you run `python examples/scripts/build_runtimes.py` in the worktree? |
+| All examples fail | Check: did you run `pip install -e .` in the worktree venv? |
 | Worktree creation fails | Fall back to stash/checkout approach or report error |
-| `Pre-built runtime binaries not found` | Run `python examples/scripts/build_runtimes.py` in that directory first |
+| `Pre-built runtime binaries not found` | The venv `pip install -e .` should have built these; re-run it |
+| `ModuleNotFoundError: _task_interface` | Venv not activated; add `source .venv/bin/activate &&` before the command |
 
 ## Checklist
 
 - [ ] Mode detected (single vs compare)
 - [ ] Idle device found or user-specified
 - [ ] PTO-ISA pinned to CI commit
-- [ ] (Compare mode) Worktree created and `python examples/scripts/build_runtimes.py` run inside it
-- [ ] (Compare mode) Baseline completed from worktree (using `cd $WORKTREE_DIR && ./tools/benchmark_rounds.sh`)
-- [ ] Current completed in workspace
+- [ ] `PROJECT_ROOT` and `WORKTREE_ABS` absolute paths computed
+- [ ] (Compare mode) Worktree created, venv built with `pip install -e .`
+- [ ] (Compare mode) Baseline completed — venv activated, `pwd` confirmed worktree path before running
+- [ ] Current completed in main workspace
 - [ ] Worktree cleaned up (compare mode)
 - [ ] Results table presented with Elapsed + Orch times
 - [ ] (Compare mode) Device difference noted if applicable

@@ -19,6 +19,7 @@
 
 #include <dlfcn.h>
 
+#include <cassert>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -684,6 +685,7 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t* bin_data
     // Set resolved_addr_ in host buffer before copying to device:
     // AICPU will read this field to get the binary code address for dispatch
     uint64_t callable_addr = reinterpret_cast<uint64_t>(gm_addr);
+    assert((callable_addr & (CALLABLE_ALIGN - 1)) == 0 && "device alloc must be CALLABLE_ALIGN-byte aligned");
     uint64_t binary_code_addr = callable_addr + CoreCallable::binary_data_offset();
     // Write resolved_addr_ into the host-side buffer (the field lives at a fixed offset)
     CoreCallable* host_callable = reinterpret_cast<CoreCallable*>(const_cast<uint8_t*>(bin_data));

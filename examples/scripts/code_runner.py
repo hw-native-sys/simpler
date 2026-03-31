@@ -69,6 +69,7 @@ import torch  # type: ignore[import-not-found]
 # Argument construction — uses nanobind bindings from task_interface
 # =============================================================================
 from task_interface import (  # type: ignore[import-not-found]
+    ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
     CoreCallable,  # pyright: ignore[reportAttributeAccessIssue]
     make_tensor_arg,
@@ -696,7 +697,7 @@ class CodeRunner:
 
         return orch_args
 
-    def run(self) -> None:  # noqa: PLR0912
+    def run(self) -> None:  # noqa: PLR0912, PLR0915
         """
         Execute the full test flow:
         1. Check environment
@@ -802,6 +803,15 @@ class CodeRunner:
 
         logger.info(f"Compiled {len(kernel_binaries)} kernel(s)")
 
+        # Build ChipCallable: bundle orch binary + all kernel CoreCallables
+        orch_sig = self.orchestration.get("signature", [])
+        chip_callable = ChipCallable.build(
+            signature=orch_sig,
+            func_name=self.orchestration["function_name"],
+            binary=orch_so_binary,
+            children=kernel_binaries,
+        )
+
         # Step 2: Load runtime and set device
         binaries = runtime_result
         logger.info(f"=== Loading Runtime ({binaries.host_path}) ===")
@@ -875,12 +885,7 @@ class CodeRunner:
                     logger.info("Profiling enabled")
 
                 with _temporary_env(run_env):
-                    runtime.initialize(
-                        orch_so_binary,
-                        self.orchestration["function_name"],
-                        orch_args,
-                        kernel_binaries=kernel_binaries,
-                    )
+                    runtime.initialize(chip_callable, orch_args)
 
                 launch_runtime(
                     runtime,
