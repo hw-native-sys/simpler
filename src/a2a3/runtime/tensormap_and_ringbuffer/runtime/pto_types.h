@@ -32,9 +32,10 @@
 #include <arm_neon.h>
 #endif
 
-#include "task_args.h"   // NOLINT(build/include_subdir) -- TaskArgs base class
-#include "tensor.h"      // NOLINT(build/include_subdir)
-#include "tensor_arg.h"  // NOLINT(build/include_subdir) -- canonical TensorArgType definition
+#include "pto_submit_types.h"  // NOLINT(build/include_subdir) -- PTO2LaunchSpec
+#include "task_args.h"         // NOLINT(build/include_subdir) -- TaskArgs base class
+#include "tensor.h"            // NOLINT(build/include_subdir)
+#include "tensor_arg.h"        // NOLINT(build/include_subdir) -- canonical TensorArgType definition
 
 // Task arguments
 #define MAX_TENSOR_ARGS 16   // Maximum tensor arguments per task
@@ -60,7 +61,7 @@
  * binding get_ref() on an rvalue is compile-time rejected to prevent dangling.
  */
 class TaskOutputTensors {
-public:  // NOLINT(whitespace/indent)
+ public:  // NOLINT(whitespace/indent)
     TaskOutputTensors() : output_count_(0) {}
 
     bool empty() const { return output_count_ == 0; }
@@ -79,7 +80,7 @@ public:  // NOLINT(whitespace/indent)
         tensors_[output_count_++] = &tensor;
     }
 
-private:  // NOLINT(whitespace/indent)
+ private:  // NOLINT(whitespace/indent)
     uint32_t output_count_;
     const Tensor* tensors_[PTO2_MAX_OUTPUTS];
 };
@@ -126,6 +127,7 @@ union TensorRef {
 struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> {
     bool has_error{false};
     const char* error_msg{nullptr};
+    PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
     void reset() {
         clear();

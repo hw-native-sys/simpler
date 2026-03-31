@@ -301,6 +301,9 @@ TaskOutputTensors pto2_submit_mixed_task(
     uint8_t active_mask = pto2_mixed_kernels_to_active_mask(mixed_kernels);
     always_assert(active_mask != 0 && "MixedKernels must have at least one active slot");
 
+    int16_t block_num = args.launch_spec.block_num();
+    always_assert(block_num >= 1 && "block_num must be >= 1");
+
     // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
     // it to the aiv0 slot.  This guarantees the dispatch path can always use
     // PTO2SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
@@ -547,6 +550,10 @@ TaskOutputTensors pto2_submit_mixed_task(
         // so concurrent on_mixed_task_complete can safely access task_state/fanout_refcount.
         cur_slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
         cur_slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
+        cur_slot_state.completed_subtasks.store(0, std::memory_order_relaxed);
+        cur_slot_state.total_required_subtasks = static_cast<int16_t>(block_num * __builtin_popcount(active_mask));
+        cur_slot_state.block_num = block_num;
+        cur_slot_state.next_block_idx = 0;
 
         auto& dep_pool = orch->rings[ring_id].dep_pool;
         // Ensure dep pool has space: fanin_count entries + 1 pre-alloc

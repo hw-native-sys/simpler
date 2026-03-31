@@ -455,9 +455,15 @@ struct alignas(64) PTO2TaskSlotState {
 
     // Hot-path completion fields (moved from TaskDescriptor to avoid cross-struct access)
     uint8_t active_mask;                     // Bitmask of active subtask slots (set once)
-    std::atomic<uint8_t> subtask_done_mask;  // Each subtask sets its done bit on completion
+    std::atomic<uint8_t> subtask_done_mask;  // Deprecated: superseded by completed_subtasks
     uint8_t ring_id;                         // Ring layer this task belongs to (for per-ring reclamation)
     int32_t dep_pool_mark{0};  // Dep pool top after this task's submission (orchestrator-only, local memory)
+
+    // SPMD multi-block (occupies the 8 tail bytes previously implicit padding)
+    std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
+    int16_t total_required_subtasks{0};          // = block_num * popcount(active_mask)
+    int16_t block_num{1};                        // Total logical blocks (set by orchestrator)
+    int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);
