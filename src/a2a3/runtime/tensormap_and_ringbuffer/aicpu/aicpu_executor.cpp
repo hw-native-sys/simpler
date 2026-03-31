@@ -562,6 +562,40 @@ struct AicpuExecutor {
         return count;
     }
 
+    /**
+     * Build per-core dispatch payload: copy tensor pointers and scalars into
+     * the per-core args[] array, then populate SPMD local context at the tail.
+     *
+     * Current phase (block_dim=1): block_idx is always 0, block_num is always 1.
+     * When block_dim>1 is implemented, block_idx will vary per dispatch and
+     * block_num will reflect the task's block_dim.
+     *
+     * GlobalContext (sub_block_id) is NOT written here — it is initialized once
+     * at runtime startup by init_global_context().
+     */
+    void build_payload(PTO2DispatchPayload& dispatch_payload, PTO2TaskSlotState& slot_state, PTO2SubtaskSlot subslot) {
+        int32_t slot_idx = static_cast<int32_t>(subslot);
+        uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
+        const CoreCallable* callable = reinterpret_cast<const CoreCallable*>(callable_addr);
+        dispatch_payload.function_bin_addr = callable->resolved_addr();
+        auto& payload = *slot_state.payload;
+        int n = 0;
+        for (int32_t i = 0; i < payload.tensor_count; i++) {
+            dispatch_payload.args[n++] = reinterpret_cast<uint64_t>(&payload.tensors[i]);
+        }
+        for (int32_t i = 0; i < payload.scalar_count; i++) {
+            dispatch_payload.args[n++] = payload.scalars[i];
+        }
+        // Per-dispatch local context (block_idx, block_num)
+        dispatch_payload.local_context.block_idx = 0;  // Phase 2: fixed
+        dispatch_payload.local_context.block_num = 1;  // Phase 2: fixed
+        // Store context pointers at fixed suffix positions in args[]
+        // (GlobalContext content is already set by init_global_context, but the
+        //  pointer must be written each dispatch since args[] is rebuilt entirely)
+        dispatch_payload.args[SPMD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
+        dispatch_payload.args[SPMD_GLOBAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.global_context);
+    }
+
     void dispatch_subtask_to_core(Runtime* runtime,
         int32_t thread_idx,
         int32_t core_offset,
@@ -579,11 +613,7 @@ struct AicpuExecutor {
 #endif
         CoreExecState& core_exec_state = core_exec_states_[core_id];
         PTO2DispatchPayload& payload = s_pto2_payload_per_core[core_id];
-        int32_t slot_idx = static_cast<int32_t>(subslot);
-        uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
-        const CoreCallable* callable = reinterpret_cast<const CoreCallable*>(callable_addr);
-        payload.function_bin_addr = callable->resolved_addr();
-        payload.args = slot_state.payload->dispatch_args;
+        build_payload(payload, slot_state, subslot);
         core_exec_state.executing_subslot = subslot;
         core_exec_state.executing_slot_state = &slot_state;
 #if PTO2_PROFILING
@@ -929,6 +959,19 @@ int32_t AicpuExecutor::init(Runtime* runtime) {
 
     // Clear per-core dispatch payloads
     memset(s_pto2_payload_per_core, 0, sizeof(s_pto2_payload_per_core));
+
+    // Initialize per-core GlobalContext (sub_block_id) based on cluster position.
+    // This is done once at startup and never modified afterwards.
+    for (int32_t t = 0; t < sched_thread_num_; t++) {
+        CoreTracker& tracker = core_trackers_[t];
+        for (int32_t c = 0; c < tracker.get_cluster_count(); c++) {
+            int32_t cluster_offset = c * 3;  // Each cluster = 1 AIC + 2 AIV
+            auto aiv0_id = tracker.get_core_id_by_offset(tracker.get_aiv0_core_offset(cluster_offset));
+            auto aiv1_id = tracker.get_core_id_by_offset(tracker.get_aiv1_core_offset(cluster_offset));
+            s_pto2_payload_per_core[aiv0_id].global_context.sub_block_id = 0;
+            s_pto2_payload_per_core[aiv1_id].global_context.sub_block_id = 1;
+        }
+    }
 
     DEV_INFO("Init: PTO2 mode, task count from shared memory");
 

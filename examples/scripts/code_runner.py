@@ -696,7 +696,7 @@ class CodeRunner:
 
         return orch_args
 
-    def run(self) -> None:  # noqa: PLR0912
+    def run(self) -> None:  # noqa: PLR0912, PLR0915
         """
         Execute the full test flow:
         1. Check environment
@@ -753,10 +753,24 @@ class CodeRunner:
         else:
             arch = "a2a3"
 
-        runtime_include_dirs = [
-            os.path.join(self.project_root, "src", arch, "runtime", self.runtime_name, "runtime"),
-            os.path.join(self.project_root, "src", "common", "task_interface"),
-        ]
+        runtime_base_dir = os.path.join(self.project_root, "src", arch, "runtime", self.runtime_name)
+
+        # Read include_dirs from build_config.py for kernel compilation
+        build_config_path = os.path.join(runtime_base_dir, "build_config.py")
+        runtime_include_dirs = []
+        if os.path.isfile(build_config_path):
+            import importlib.util  # noqa: PLC0415
+
+            spec = importlib.util.spec_from_file_location("build_config", build_config_path)
+            assert spec is not None and spec.loader is not None
+            bc_module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(bc_module)
+            aicore_cfg = bc_module.BUILD_CONFIG.get("aicore", {})
+            for p in aicore_cfg.get("include_dirs", []):
+                runtime_include_dirs.append(os.path.join(runtime_base_dir, p))
+        else:
+            runtime_include_dirs.append(os.path.join(runtime_base_dir, "runtime"))
+        runtime_include_dirs.append(os.path.join(self.project_root, "src", "common", "task_interface"))
 
         def _build_runtime():
             return builder.get_binaries(self.runtime_name, build=self.build_runtime)

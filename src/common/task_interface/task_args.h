@@ -95,6 +95,8 @@ struct TaskArgs : TensorTagMixin<TensorTag, MaxT> {
     S scalar(int32_t i) const { return scalars_[i]; }
     S& scalar(int32_t i) { return scalars_[i]; }
 
+    const S* scalars() const { return scalars_; }
+
     const T* tensor_data() const { return tensors_; }
     const S* scalar_data() const { return scalars_; }
 
