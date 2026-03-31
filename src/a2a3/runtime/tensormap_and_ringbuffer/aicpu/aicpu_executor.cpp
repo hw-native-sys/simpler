@@ -1116,8 +1116,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
         uint64_t _t0_phase = _t0;
 #endif
         int32_t task_count = 0;
-        if (!tracker.has_any_running_cores() && async_wait_list.count == 0
-            && rt->scheduler.notification_wait_list.get_count() == 0) {
+        if (!tracker.has_any_running_cores() && async_wait_list.count == 0) {
             bool orch_done = orchestrator_done_;
             if (orch_done) {
                 // Check for orchestrator fatal error — exit immediately
@@ -1200,18 +1199,6 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
             }
             async_completed_this_turn = poll_result.completed;
             if (async_completed_this_turn > 0) {
-                made_progress = true;
-            }
-        }
-
-        // Phase 0b: Poll notification counter conditions (pre-launch gating)
-        // Only one thread polls at a time to avoid double-enqueue races.
-        if (rt->scheduler.notification_wait_list.get_count() > 0 &&
-            rt->scheduler.notification_wait_list.try_lock_poll()) {
-            int32_t enqueued = rt->scheduler.notification_wait_list.poll_and_enqueue(
-                &rt->scheduler, local_bufs);
-            rt->scheduler.notification_wait_list.unlock_poll();
-            if (enqueued > 0) {
                 made_progress = true;
             }
         }
@@ -1457,7 +1444,6 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime* runtime, int32_t threa
                 DEV_ALWAYS("PTO2 stall: no progress for %d iterations, completed=%d total=%d (last progress at %d)",
                            idle_iterations, c, task_count, last_progress_count);
                 async_wait_list.dump(thread_idx, STALL_DUMP_WAIT_MAX);
-                rt->scheduler.notification_wait_list.dump(thread_idx, STALL_DUMP_WAIT_MAX);
                 // Scan all task slots to find truly stuck tasks using scheduler state
                 PTO2SchedulerState* sched = &rt->scheduler;
                 PTO2SharedMemoryHeader* sm_header_diag = static_cast<PTO2SharedMemoryHeader*>(sm_base);

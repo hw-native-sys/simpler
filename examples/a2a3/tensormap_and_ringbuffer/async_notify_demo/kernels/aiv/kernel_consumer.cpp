@@ -3,13 +3,14 @@
  *
  * Implements: result[i] = src[i] + notify_counter[0]
  *
- * This kernel is launch-gated: the scheduler only promotes it to READY after
- * both its fanin (producer complete) AND local notification counter >= 1.
+ * Depends on NotifyWait completing (via dummy tensor), guaranteeing
+ * the local notification counter >= 1 before this kernel runs.
  *
  * Kernel args layout (packed by scheduler):
- *   args[0] = &Tensor(src)            — input tensor struct pointer (producer's output)
- *   args[1] = &Tensor(result)         — output tensor struct pointer
- *   args[2] = notify_counter_addr     — local notify counter (window memory)
+ *   args[0] = &Tensor(dummy_notify)   — input (dependency token from NotifyWait)
+ *   args[1] = &Tensor(src)            — input tensor struct pointer (producer's output)
+ *   args[2] = &Tensor(result)         — output tensor struct pointer
+ *   args[3] = notify_counter_addr     — local notify counter (window memory)
  */
 
 #include <cstdint>
@@ -28,9 +29,10 @@ using namespace pto;
 #endif
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* src_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* result_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ int32_t* notify_counter = reinterpret_cast<__gm__ int32_t*>(args[2]);
+    // args[0] = dummy_notify tensor (dependency token, unused)
+    __gm__ Tensor* src_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
+    __gm__ Tensor* result_tensor = reinterpret_cast<__gm__ Tensor*>(args[2]);
+    __gm__ int32_t* notify_counter = reinterpret_cast<__gm__ int32_t*>(args[3]);
 
     __gm__ float* src =
         reinterpret_cast<__gm__ float*>(src_tensor->buffer.addr) + src_tensor->start_offset;

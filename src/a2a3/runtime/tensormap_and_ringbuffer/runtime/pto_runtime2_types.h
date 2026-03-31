@@ -365,9 +365,6 @@ struct PTO2TaskPayload {
     int32_t fanin_actual_count{0};             // Actual fanin count (without the +1 redundance)
     bool complete_in_future{false};            // CQ model: kernel decides completions at runtime
     uint64_t cq_addr{0};                       // CQ model: completion queue address for kernel to write
-    bool has_launch_counter{false};            // Pre-launch gating; today mainly used for notify-counter waits
-    uint64_t launch_counter_addr{0};           // Usually a local notify-counter address polled by scheduler
-    uint32_t launch_counter_expected{0};       // Notify/counter threshold required before READY
     PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS]; // Producer slot states (used by on_task_release)
     // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
     Tensor tensors[PTO2_MAX_TENSOR_PARAMS];
@@ -384,9 +381,6 @@ struct PTO2TaskPayload {
         scalar_count = params.scalar_count;
         complete_in_future = params.complete_in_future;
         cq_addr = params.cq_addr;
-        has_launch_counter = params.has_launch_counter;
-        launch_counter_addr = params.launch_counter_addr;
-        launch_counter_expected = params.launch_counter_expected;
 
         // 1. Copy tensors from PTOParam
         auto src_tensors = params.tensors;

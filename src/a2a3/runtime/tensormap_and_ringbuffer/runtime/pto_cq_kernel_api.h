@@ -117,25 +117,20 @@ inline __aicore__ void pto2_save_expected_completion(
 /**
  * Final flush before kernel returns. Ensures all CQ writes
  * are visible to the AICPU scheduler.
+ *
+ * Uses CCE compiler built-in enum constants (cache_line_t, dcci_dst_t,
+ * dsb_mode_t, pipe_t) which are available when compiling for AICore
+ * via the bisheng/CCE toolchain.  Previous #if-defined guards broke
+ * because these are C++ enums, not preprocessor macros.
  */
 inline __aicore__ void pto2_cq_flush() {
-#if defined(PIPE_ALL)
     pipe_barrier(PIPE_ALL);
-#endif
 }
 
 inline __aicore__ void pto2_cq_flush(volatile __gm__ PTO2CompletionQueue* cq) {
-#if defined(ENTIRE_DATA_CACHE) && defined(CACHELINE_OUT)
-    dcci((__gm__ int32_t*)cq, ENTIRE_DATA_CACHE, CACHELINE_OUT);
-#elif defined(SINGLE_CACHE_LINE) && defined(CACHELINE_OUT)
-    dcci((__gm__ int32_t*)cq, SINGLE_CACHE_LINE, CACHELINE_OUT);
-#elif defined(SINGLE_CACHE_LINE)
-    dcci((__gm__ int32_t*)cq, SINGLE_CACHE_LINE);
-#endif
-#if defined(DSB_DDR)
+    dcci((__gm__ int32_t*)cq, cache_line_t::ENTIRE_DATA_CACHE, dcci_dst_t::CACHELINE_OUT);
     dsb(DSB_DDR);
-#endif
-    pto2_cq_flush();
+    pipe_barrier(PIPE_ALL);
 }
 
 #endif  // PTO_CQ_KERNEL_API_H

@@ -2,7 +2,8 @@
 Async Notify Demo - Kernel and Orchestration Configuration
 
 Two hardware cards use TNOTIFY(AtomicAdd) for inter-rank notification.
-The consumer is launch-gated on the local notification counter >= 1.
+The consumer depends on a deferred NotifyWait task that polls the
+local notification counter >= 1 via the CQ mechanism.
 """
 
 import os
@@ -22,6 +23,7 @@ ORCHESTRATION = {
 KERNELS = [
     {"func_id": 0, "source": str(_KERNELS_ROOT / "aiv" / "kernel_producer_notify.cpp"), "core_type": "aiv"},
     {"func_id": 1, "source": str(_KERNELS_ROOT / "aiv" / "kernel_consumer.cpp"), "core_type": "aiv"},
+    {"func_id": 2, "source": str(_KERNELS_ROOT / "aiv" / "kernel_notify_wait.cpp"), "core_type": "aiv"},
 ]
 
 RUNTIME_CONFIG = {

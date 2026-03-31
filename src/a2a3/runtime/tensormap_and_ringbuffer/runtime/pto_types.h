@@ -84,12 +84,6 @@ struct PTOParam {
     int32_t scalar_count{0};
     bool complete_in_future{false};
     uint64_t cq_addr{0};
-    // Pre-launch gating metadata.
-    // Current primary use case is notify-driven launch: the task stays out of
-    // READY until the local notify counter reaches the expected value.
-    bool has_launch_counter{false};
-    uint64_t launch_counter_addr{0};      // Usually a local notify-counter address.
-    uint32_t launch_counter_expected{0};  // Notify/counter threshold required for launch.
     bool has_error{false};
     const char* error_msg{nullptr};
 
@@ -98,9 +92,6 @@ struct PTOParam {
         scalar_count = 0;
         complete_in_future = false;
         cq_addr = 0;
-        has_launch_counter = false;
-        launch_counter_addr = 0;
-        launch_counter_expected = 0;
         has_error = false;
         error_msg = nullptr;
     }

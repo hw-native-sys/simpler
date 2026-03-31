@@ -197,14 +197,6 @@ static inline uint64_t pto2_rt_alloc_cq(PTO2Runtime* rt) {
     return rt->ops->alloc_cq(rt);
 }
 
-static inline void pto2_rt_expect_notification_counter(PTOParam& params,
-                                                       uint64_t counter_addr,
-                                                       uint32_t expected_value) {
-    params.has_launch_counter = true;
-    params.launch_counter_addr = counter_addr;
-    params.launch_counter_expected = expected_value;
-}
-
 /**
  * Submit an AIV task with deferred completion (CQ model).
  *

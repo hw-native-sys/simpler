@@ -46,6 +46,7 @@ KERNELS = [
     {"func_id": 0, "source": str(_KERNELS_ROOT / "aiv" / "kernel_moe_prepare.cpp"),       "core_type": "aiv"},
     {"func_id": 1, "source": str(_KERNELS_ROOT / "aiv" / "kernel_moe_send_data.cpp"),     "core_type": "aiv"},
     {"func_id": 2, "source": str(_KERNELS_ROOT / "aiv" / "kernel_moe_recv_assemble.cpp"), "core_type": "aiv"},
+    {"func_id": 3, "source": str(_KERNELS_ROOT / "aiv" / "kernel_notify_wait.cpp"),       "core_type": "aiv"},
 ]
 
 RUNTIME_CONFIG = {

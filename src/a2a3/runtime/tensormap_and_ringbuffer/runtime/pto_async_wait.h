@@ -23,6 +23,8 @@
 #include "pto_runtime2_types.h"
 #include "pto_scheduler.h"
 
+extern void cache_invalidate_range(const void* addr, size_t size);
+
 inline constexpr int32_t PTO2_MAX_ASYNC_WAITS = 64;
 
 enum class PTO2CompletionPollState : uint8_t {
@@ -183,6 +185,13 @@ struct PTO2AsyncWaitList {
             for (int32_t c = 0; c < entry.condition_count; c++) {
                 PTO2CompletionCondition& cond = entry.conditions[c];
                 if (!cond.satisfied) {
+                    // RDMA-written counters (e.g. TNOTIFY) bypass AICPU data cache.
+                    // Invalidate before reading to see the true memory value.
+                    if (cond.counter_addr) {
+                        cache_invalidate_range(
+                            reinterpret_cast<const void*>(const_cast<const uint32_t*>(cond.counter_addr)),
+                            sizeof(uint32_t));
+                    }
                     PTO2CompletionPollResult poll = cond.test();
                     if (poll.state == PTO2CompletionPollState::FAILED) {
                         result.error_code = poll.error_code;
@@ -243,6 +252,7 @@ struct PTO2AsyncWaitList {
      */
     bool register_deferred(PTO2TaskSlotState& slot_state,
                            int32_t thread_idx, int32_t& error_code) {
+        (void)thread_idx;
         error_code = PTO2_ERROR_NONE;
         PTO2TaskPayload* payload = slot_state.payload;
         if (payload == nullptr || !payload->complete_in_future) return false;
@@ -259,6 +269,12 @@ struct PTO2AsyncWaitList {
 
         volatile PTO2CompletionQueue* cq = reinterpret_cast<volatile PTO2CompletionQueue*>(
             static_cast<uintptr_t>(payload->cq_addr));
+        // AICore kernel flushes its cache (dcci) before returning, but the
+        // AICPU may still hold a stale cache line for this CQ.  Invalidate
+        // before reading so we see the kernel's writes.
+        cache_invalidate_range(
+            const_cast<const void*>(reinterpret_cast<volatile void*>(cq)),
+            sizeof(PTO2CompletionQueue));
         int32_t cq_count = cq->count;
         if (cq_count <= 0) {
 #ifdef DEV_ALWAYS
@@ -337,40 +353,5 @@ struct PTO2AsyncWaitList {
 #endif
     }
 };
-
-// =============================================================================
-// PTO2NotificationWaitList::poll_and_enqueue — deferred definition
-// (struct declared in pto_scheduler.h, method body needs PTO2SchedulerState)
-// =============================================================================
-
-// Provided by platform: DC CIVAC + DSB + ISB on real hardware, no-op on sim.
-extern void cache_invalidate_range(const void* addr, size_t size);
-
-inline int32_t PTO2NotificationWaitList::poll_and_enqueue(
-        PTO2SchedulerState* sched, PTO2LocalReadyBuffer* local_bufs) {
-    // Called under try_lock_poll() — only one thread executes at a time.
-    int32_t cur = count.load(std::memory_order_acquire);
-    int32_t enqueued = 0;
-    for (int32_t i = cur - 1; i >= 0; --i) {
-        PTO2NotificationWaitEntry& e = entries[i];
-        // TNOTIFY writes arrive via RDMA, bypassing AICPU data cache.
-        // Invalidate the cache line to read the true memory value.
-        cache_invalidate_range(reinterpret_cast<const void*>(
-            const_cast<const uint32_t*>(e.counter_addr)), sizeof(uint32_t));
-        if (*e.counter_addr >= e.expected_value) {
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(e.slot_state->active_mask);
-            if (!local_bufs || !local_bufs[static_cast<int32_t>(shape)].try_push(e.slot_state)) {
-                sched->ready_queues[static_cast<int32_t>(shape)].push(e.slot_state);
-            }
-            enqueued++;
-            int32_t last = count.load(std::memory_order_acquire) - 1;
-            if (i != last) {
-                entries[i] = entries[last];
-            }
-            count.store(last, std::memory_order_release);
-        }
-    }
-    return enqueued;
-}
 
 #endif // PTO_ASYNC_WAIT_H
