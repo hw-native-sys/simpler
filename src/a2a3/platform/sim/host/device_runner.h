@@ -242,6 +242,7 @@ class DeviceRunner {
         int device_id, const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
     int ensure_binaries_loaded(
         const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
+    void unload_executor_binaries();
 
     /**
      * Initialize performance profiling shared memory

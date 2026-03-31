@@ -59,13 +59,11 @@ int DeviceRunner::ensure_device_initialized(
 
 int DeviceRunner::ensure_binaries_loaded(
     const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary) {
-    // Skip if already loaded
-    if (aicpu_execute_func_ != nullptr && aicore_execute_func_ != nullptr) {
-        return 0;
-    }
+    // Close any previously loaded binaries before reloading
+    unload_executor_binaries();
 
     // Write AICPU binary to temp file and dlopen
-    if (!aicpu_so_binary.empty() && aicpu_execute_func_ == nullptr) {
+    if (!aicpu_so_binary.empty()) {
         aicpu_so_path_ = "/tmp/aicpu_sim_" + std::to_string(getpid()) + ".so";
         std::ofstream ofs(aicpu_so_path_, std::ios::binary);
         if (!ofs) {
@@ -97,7 +95,7 @@ int DeviceRunner::ensure_binaries_loaded(
     }
 
     // Write AICore binary to temp file and dlopen
-    if (!aicore_kernel_binary.empty() && aicore_execute_func_ == nullptr) {
+    if (!aicore_kernel_binary.empty()) {
         aicore_so_path_ = "/tmp/aicore_sim_" + std::to_string(getpid()) + ".so";
         std::ofstream ofs(aicore_so_path_, std::ios::binary);
         if (!ofs) {
@@ -359,6 +357,12 @@ int DeviceRunner::run(Runtime& runtime,
     // Print handshake results at end of run
     print_handshake_results();
 
+    // Close executor .so files now while the process is healthy, rather than
+    // deferring to finalize()/destructor where static destruction order on
+    // macOS can cause segfaults (aicpu.so contains file-scope statics with
+    // std::mutex that crash when dlclosed during process teardown).
+    unload_executor_binaries();
+
     return 0;
 }
 
@@ -375,6 +379,29 @@ void DeviceRunner::print_handshake_results() {
             last_runtime_->workers[i].aicpu_ready,
             last_runtime_->workers[i].control,
             last_runtime_->workers[i].task);
+    }
+}
+
+void DeviceRunner::unload_executor_binaries() {
+    if (aicpu_so_handle_ != nullptr) {
+        dlclose(aicpu_so_handle_);
+        aicpu_so_handle_ = nullptr;
+        aicpu_execute_func_ = nullptr;
+        set_platform_regs_func_ = nullptr;
+    }
+    if (!aicpu_so_path_.empty()) {
+        std::remove(aicpu_so_path_.c_str());
+        aicpu_so_path_.clear();
+    }
+
+    if (aicore_so_handle_ != nullptr) {
+        dlclose(aicore_so_handle_);
+        aicore_so_handle_ = nullptr;
+        aicore_execute_func_ = nullptr;
+    }
+    if (!aicore_so_path_.empty()) {
+        std::remove(aicore_so_path_.c_str());
+        aicore_so_path_.clear();
     }
 }
 
@@ -410,26 +437,8 @@ int DeviceRunner::finalize() {
     }
     func_id_to_addr_.clear();
 
-    // Close dynamically loaded libraries and remove temp files
-    if (aicpu_so_handle_ != nullptr) {
-        dlclose(aicpu_so_handle_);
-        aicpu_so_handle_ = nullptr;
-        aicpu_execute_func_ = nullptr;
-    }
-    if (!aicpu_so_path_.empty()) {
-        std::remove(aicpu_so_path_.c_str());
-        aicpu_so_path_.clear();
-    }
-
-    if (aicore_so_handle_ != nullptr) {
-        dlclose(aicore_so_handle_);
-        aicore_so_handle_ = nullptr;
-        aicore_execute_func_ = nullptr;
-    }
-    if (!aicore_so_path_.empty()) {
-        std::remove(aicore_so_path_.c_str());
-        aicore_so_path_.clear();
-    }
+    // Close executor .so files (typically already closed by run(), this is a safety net)
+    unload_executor_binaries();
 
     // Free all remaining allocations
     mem_alloc_.finalize();
