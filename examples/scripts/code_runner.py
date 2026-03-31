@@ -69,8 +69,10 @@ import torch  # type: ignore[import-not-found]
 # Argument construction — uses nanobind bindings from task_interface
 # =============================================================================
 from task_interface import (  # type: ignore[import-not-found]
+    CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
+    ChipWorker,  # pyright: ignore[reportAttributeAccessIssue]
     CoreCallable,  # pyright: ignore[reportAttributeAccessIssue]
     make_tensor_arg,
     scalar_to_uint64,
@@ -701,17 +703,14 @@ class CodeRunner:
         """
         Execute the full test flow:
         1. Check environment
-        2. Build runtime
-        3. Load runtime and set device
-        4. Compile orchestration
-        5. Compile and register kernels
-        6. For each params in params_list:
+        2. Build runtime, orchestration, and kernels in parallel
+        3. Create ChipWorker
+        4. For each params in params_list:
            - Generate inputs using golden.py
-           - Initialize and launch runtime
-           - Finalize and compare with golden
+           - Run via ChipWorker
+           - Compare with golden
         """
         # Import runtime modules (deferred import to avoid top-level dependency)
-        from bindings import bind_host_binary, launch_runtime, set_device  # noqa: PLC0415
         from elf_parser import extract_text_section  # noqa: PLC0415
         from kernel_compiler import KernelCompiler  # noqa: PLC0415
         from runtime_builder import RuntimeBuilder  # noqa: PLC0415
@@ -826,17 +825,18 @@ class CodeRunner:
             children=kernel_binaries,
         )
 
-        # Step 2: Load runtime and set device
+        # Step 2: Create ChipWorker
         binaries = runtime_result
-        logger.info(f"=== Loading Runtime ({binaries.host_path}) ===")
-        Runtime = bind_host_binary(binaries.host_path)
-        aicpu_binary = binaries.aicpu_path.read_bytes()
-        aicore_binary = binaries.aicore_path.read_bytes()
+        logger.info(f"=== Creating ChipWorker (host: {binaries.host_path}, device: {self.device_id}) ===")
+        worker = ChipWorker()
+        worker.init(
+            self.device_id,
+            str(binaries.host_path),
+            binaries.aicpu_path.read_bytes(),
+            binaries.aicore_path.read_bytes(),
+        )
 
-        logger.info(f"=== Setting Device {self.device_id} ===")
-        set_device(self.device_id)
-
-        # Step 5: Run each parameter set
+        # Step 3: Run each parameter set
         total_cases = len(self.params_list)
         for case_idx, params in enumerate(self.params_list):
             logger.info("=" * 60)
@@ -864,10 +864,6 @@ class CodeRunner:
             logger.debug(f"Tensor order: {list(tensors.keys())}")
             logger.debug(f"orch_args count: {len(orch_args)}")
 
-            # Create and initialize runtime (including kernel registration)
-            logger.info("=== Initializing Runtime ===")
-            runtime = Runtime()
-
             # Build environment for runtime initialization
             run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
             if run_env:
@@ -891,32 +887,23 @@ class CodeRunner:
                 for k, v in initial_outputs.items():
                     outputs[k].copy_(v)
 
-                runtime = Runtime()
-
-                # Enable profiling if requested (only first round)
+                config = CallConfig()
+                config.block_dim = self.block_dim
+                config.aicpu_thread_num = self.aicpu_thread_num
+                config.orch_thread_num = self.orch_thread_num
                 if self.enable_profiling and round_idx == 0:
-                    runtime.enable_profiling(True)
+                    config.enable_profiling = True
                     logger.info("Profiling enabled")
 
                 with _temporary_env(run_env):
-                    runtime.initialize(chip_callable, orch_args)
+                    worker.run(chip_callable, orch_args, config)
 
-                launch_runtime(
-                    runtime,
-                    aicpu_thread_num=self.aicpu_thread_num,
-                    block_dim=self.block_dim,
-                    device_id=self.device_id,
-                    aicpu_binary=aicpu_binary,
-                    aicore_binary=aicore_binary,
-                    orch_thread_num=self.orch_thread_num,
-                )
-
-                runtime.finalize()
                 if not self.skip_golden:
                     self._compare_with_golden(outputs, golden)
 
             logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
 
+        worker.reset()
         logger.info("=" * 60)
         logger.info(f"=== All {total_cases} cases passed ===")
         logger.info("=" * 60)

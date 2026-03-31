@@ -19,6 +19,7 @@ Usage:
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CONTINUOUS_TENSOR_MAX_DIMS,
     ArgDirection,
+    CallConfig,
     ChipCallable,
     ChipStorageTaskArgs,
     ContinuousTensor,
@@ -27,6 +28,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     DynamicTaskArgs,
     TaggedTaskArgs,
     TensorArgType,
+    _ChipWorker,
     arg_direction_name,
     get_dtype_name,
     get_element_size,
@@ -45,6 +47,8 @@ __all__ = [
     "ArgDirection",
     "CoreCallable",
     "ChipCallable",
+    "CallConfig",
+    "ChipWorker",
     "arg_direction_name",
     "torch_dtype_to_datatype",
     "make_tensor_arg",
@@ -120,3 +124,57 @@ def scalar_to_uint64(value) -> int:
             return uint_type.from_buffer_copy(value).value
         return int(value.value) & 0xFFFFFFFFFFFFFFFF
     return int(value) & 0xFFFFFFFFFFFFFFFF
+
+
+class ChipWorker:
+    """Unified execution interface wrapping the host runtime C API.
+
+    Usage::
+
+        worker = ChipWorker()
+        worker.init(device_id=0, host_path="build/lib/.../host.so",
+                    aicpu_binary=aicpu_bytes, aicore_binary=aicore_bytes)
+        worker.run(chip_callable, orch_args, block_dim=24)
+        worker.reset()
+    """
+
+    def __init__(self):
+        self._impl = _ChipWorker()
+
+    def init(self, device_id, host_path, aicpu_binary, aicore_binary):
+        """Load host runtime library, cache platform binaries, and set device.
+
+        Args:
+            device_id: NPU device ID.
+            host_path: Path to the host runtime shared library (.so).
+            aicpu_binary: AICPU binary content (bytes).
+            aicore_binary: AICore binary content (bytes).
+        """
+        self._impl.init(device_id, str(host_path), aicpu_binary, aicore_binary)
+
+    def run(self, callable, args, config=None, **kwargs):
+        """Execute a callable synchronously.
+
+        Args:
+            callable: ChipCallable built from orchestration + kernel binaries.
+            args: ChipStorageTaskArgs for this invocation.
+            config: Optional CallConfig. If None, a default is created.
+            **kwargs: Overrides applied to config (e.g. block_dim=24).
+        """
+        if config is None:
+            config = CallConfig()
+        for k, v in kwargs.items():
+            setattr(config, k, v)
+        self._impl.run(callable, args, config)
+
+    def reset(self):
+        """Release runtime resources. The worker can be re-initialized after reset."""
+        self._impl.reset()
+
+    @property
+    def device_id(self):
+        return self._impl.device_id
+
+    @property
+    def initialized(self):
+        return self._impl.initialized

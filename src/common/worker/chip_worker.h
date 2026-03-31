@@ -1,0 +1,71 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
+
+#ifndef SRC_COMMON_WORKER_CHIP_WORKER_H_
+#define SRC_COMMON_WORKER_CHIP_WORKER_H_
+
+#include <cstdint>
+#include <string>
+#include <vector>
+
+struct CallConfig {
+    int block_dim = 24;
+    int aicpu_thread_num = 3;
+    int orch_thread_num = 1;
+    bool enable_profiling = false;
+};
+
+class ChipWorker {
+ public:
+    ChipWorker() = default;
+    ~ChipWorker();
+
+    ChipWorker(const ChipWorker&) = delete;
+    ChipWorker& operator=(const ChipWorker&) = delete;
+
+    void init(int device_id,
+        const std::string& host_lib_path,
+        const uint8_t* aicpu_binary,
+        size_t aicpu_size,
+        const uint8_t* aicore_binary,
+        size_t aicore_size);
+
+    void reset();
+
+    void run(const void* callable, const void* args, const CallConfig& config);
+
+    int device_id() const { return device_id_; }
+    bool initialized() const { return initialized_; }
+
+ private:
+    using SetDeviceFn = int (*)(int);
+    using GetRuntimeSizeFn = size_t (*)();
+    using InitRuntimeFn = int (*)(void*, const void*, const void*);
+    using LaunchRuntimeFn = int (*)(void*, int, int, int, const uint8_t*, size_t, const uint8_t*, size_t, int);
+    using FinalizeRuntimeFn = int (*)(void*);
+    using EnableProfilingFn = int (*)(void*, int);
+
+    void* lib_handle_ = nullptr;
+    SetDeviceFn set_device_fn_ = nullptr;
+    GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
+    InitRuntimeFn init_runtime_fn_ = nullptr;
+    LaunchRuntimeFn launch_runtime_fn_ = nullptr;
+    FinalizeRuntimeFn finalize_runtime_fn_ = nullptr;
+    EnableProfilingFn enable_profiling_fn_ = nullptr;
+
+    std::vector<uint8_t> runtime_buf_;
+    std::vector<uint8_t> aicpu_binary_;
+    std::vector<uint8_t> aicore_binary_;
+    int device_id_ = -1;
+    bool initialized_ = false;
+};
+
+#endif  // SRC_COMMON_WORKER_CHIP_WORKER_H_

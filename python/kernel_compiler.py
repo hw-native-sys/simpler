@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import Optional, Union
 
 import env_manager
-from bindings import get_incore_compiler, get_orchestration_compiler
 from toolchain import (
     Aarch64GxxToolchain,
     CCECToolchain,
@@ -227,27 +226,21 @@ class KernelCompiler:
         logger.info(f"[{label}] Compilation {output_path} successful: {len(binary_data)} bytes")
         return binary_data
 
-    def _get_toolchain(self, strategy_fn, fallback_map: dict) -> ToolchainType:
-        """Get toolchain from C++ library, with platform-based fallback.
+    def _get_toolchain(self, toolchain_map: dict) -> ToolchainType:
+        """Get toolchain for the current platform.
 
         Args:
-            strategy_fn: Callable that queries C++ for the toolchain
-                         (e.g., get_incore_compiler, get_orchestration_compiler)
-            fallback_map: Dict mapping platform name to ToolchainType fallback
+            toolchain_map: Dict mapping platform name to ToolchainType
 
         Returns:
-            ToolchainType for the current platform/runtime
+            ToolchainType for the current platform
 
         Raises:
-            ValueError: If platform has no fallback and library is not loaded
+            ValueError: If platform is not in the map
         """
-        try:
-            return strategy_fn()
-        except RuntimeError:
-            logger.debug("C++ library not loaded, using platform-based fallback")
-            if self.platform not in fallback_map:
-                raise ValueError(f"No toolchain fallback for platform: {self.platform}")
-            return fallback_map[self.platform]
+        if self.platform not in toolchain_map:
+            raise ValueError(f"No toolchain for platform: {self.platform}")
+        return toolchain_map[self.platform]
 
     @staticmethod
     def _make_temp_path(prefix: str, suffix: str, build_dir: Optional[str] = None) -> str:
@@ -287,9 +280,7 @@ class KernelCompiler:
             ValueError: If pto_isa_root is not provided (for a2a3) or core_type is invalid
             RuntimeError: If compilation fails
         """
-        # Determine toolchain from C++ (with fallback to platform-based logic)
         incore_toolchain = self._get_toolchain(
-            get_incore_compiler,
             {
                 "a2a3": ToolchainType.CCEC,
                 "a2a3sim": ToolchainType.HOST_GXX_15,
@@ -386,12 +377,11 @@ class KernelCompiler:
 
         # Resolve toolchain: HOST_GXX needs no runtime-specific extras
         toolchain_type = self._get_toolchain(
-            get_orchestration_compiler,
             {
                 "a2a3": ToolchainType.AARCH64_GXX,
                 "a2a3sim": ToolchainType.HOST_GXX,
-                "a5": ToolchainType.AARCH64_GXX,  # Phase 1: A5 uses same as A2A3
-                "a5sim": ToolchainType.HOST_GXX,  # Phase 1: A5sim uses same as A2A3sim
+                "a5": ToolchainType.AARCH64_GXX,
+                "a5sim": ToolchainType.HOST_GXX,
             },
         )
         toolchain: Union[GxxToolchain, Aarch64GxxToolchain]

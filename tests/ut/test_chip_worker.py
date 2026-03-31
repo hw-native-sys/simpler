@@ -1,0 +1,106 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+# ruff: noqa: E402
+"""Tests for CallConfig and ChipWorker state machine."""
+
+import sys
+from pathlib import Path
+
+import pytest
+
+# Ensure python/ is on the import path so _task_interface and task_interface resolve
+_python_dir = str(Path(__file__).resolve().parent.parent.parent / "python")
+if _python_dir not in sys.path:
+    sys.path.insert(0, _python_dir)
+
+from _task_interface import CallConfig, _ChipWorker  # pyright: ignore[reportMissingImports]
+
+# ============================================================================
+# CallConfig tests
+# ============================================================================
+
+
+class TestCallConfig:
+    def test_defaults(self):
+        config = CallConfig()
+        assert config.block_dim == 24
+        assert config.aicpu_thread_num == 3
+        assert config.orch_thread_num == 1
+        assert config.enable_profiling is False
+
+    def test_setters(self):
+        config = CallConfig()
+        config.block_dim = 32
+        config.aicpu_thread_num = 4
+        config.orch_thread_num = 2
+        config.enable_profiling = True
+        assert config.block_dim == 32
+        assert config.aicpu_thread_num == 4
+        assert config.orch_thread_num == 2
+        assert config.enable_profiling is True
+
+    def test_repr(self):
+        config = CallConfig()
+        r = repr(config)
+        assert "block_dim=24" in r
+        assert "enable_profiling=False" in r
+
+
+# ============================================================================
+# ChipWorker state machine tests
+# ============================================================================
+
+
+class TestChipWorkerStateMachine:
+    def test_initial_state(self):
+        worker = _ChipWorker()
+        assert worker.initialized is False
+        assert worker.device_id == -1
+
+    def test_run_before_init_raises(self):
+        from _task_interface import ChipCallable, ChipStorageTaskArgs  # noqa: PLC0415
+
+        worker = _ChipWorker()
+        config = CallConfig()
+        args = ChipStorageTaskArgs()
+
+        # Build a minimal ChipCallable for the test
+        callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
+
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.run(callable_obj, args, config)
+
+    def test_reset_idempotent(self):
+        worker = _ChipWorker()
+        # reset() on an uninitialized worker should not raise
+        worker.reset()
+        worker.reset()
+        assert worker.initialized is False
+
+    def test_init_with_nonexistent_lib_raises(self):
+        worker = _ChipWorker()
+        with pytest.raises(RuntimeError, match="dlopen"):
+            worker.init(0, "/nonexistent/libfoo.so", b"", b"")
+
+
+# ============================================================================
+# Python-level ChipWorker wrapper tests
+# ============================================================================
+
+
+class TestChipWorkerPython:
+    def test_import(self):
+        from task_interface import (  # noqa: PLC0415
+            CallConfig as PyCallConfig,  # pyright: ignore[reportAttributeAccessIssue]
+        )
+        from task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+
+        worker = ChipWorker()
+        assert worker.initialized is False
+        assert isinstance(PyCallConfig(), CallConfig)
