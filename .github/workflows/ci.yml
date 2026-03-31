@@ -112,7 +112,7 @@ jobs:
         run: pip install .
 
       - name: Run simulation examples (a2a3sim, ${{ matrix.runtime }})
-        run: ./ci.sh -p a2a3sim -r ${{ matrix.runtime }} -c 6622890 -t 600 --clone-protocol https
+        run: python tools/ci.py -p a2a3sim -r ${{ matrix.runtime }} -c 6622890 -t 600 --clone-protocol https
 
   st-sim-a5:
     needs: pre-commit
@@ -169,7 +169,7 @@ jobs:
         run: pip install .
 
       - name: Run simulation examples (a5sim, ${{ matrix.runtime }})
-        run: ./ci.sh -p a5sim -r ${{ matrix.runtime }} -c 6622890 -t 600 --clone-protocol https
+        run: python tools/ci.py -p a5sim -r ${{ matrix.runtime }} -c 6622890 -t 600 --clone-protocol https
 
   # ---------- Python unit tests (a2a3 hardware) ----------
   ut-py-a2a3:
@@ -205,7 +205,7 @@ jobs:
       - name: Run on-device examples (a2a3)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a2a3 -d ${DEVICE_RANGE} --parallel -c 6622890 -t 600 --clone-protocol https
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python tools/ci.py -p a2a3 -d ${DEVICE_RANGE} --parallel -c 6622890 -t 600 --clone-protocol https
 
 
   # ---------- Detect A5 changes (runs on GitHub server, not A5 machine) ----------
@@ -278,4 +278,4 @@ jobs:
       - name: Run on-device examples (a5)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && ./ci.sh -p a5 -d ${DEVICE_RANGE} --parallel -c 6622890 -t 600 --clone-protocol https
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python tools/ci.py -p a5 -d ${DEVICE_RANGE} --parallel -c 6622890 -t 600 --clone-protocol https
