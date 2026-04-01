@@ -595,9 +595,11 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime* runtime) {
     DEV_INFO("Handshaking with %d cores", cores_total_num_);
 
     // Step 1: Write per-core payload addresses and send handshake signal
-    // task must be written BEFORE aicpu_ready so AICore sees it after waking up
+    // OUT_OF_ORDER_STORE_BARRIER() ensures task is globally visible before
+    // aicpu_ready=1, so AICore reads the correct payload pointer after waking up.
     for (int32_t i = 0; i < cores_total_num_; i++) {
         all_handshakes[i].task = reinterpret_cast<uint64_t>(&s_pto2_payload_per_core[i]);
+        OUT_OF_ORDER_STORE_BARRIER();
         all_handshakes[i].aicpu_ready = 1;
     }
 
@@ -2232,6 +2234,7 @@ void AicpuExecutor::emergency_shutdown(Runtime* runtime) {
     Handshake* all_handshakes = reinterpret_cast<Handshake*>(runtime->workers);
     for (int32_t i = 0; i < cores_total_num_; i++) {
         Handshake* hank = &all_handshakes[i];
+        OUT_OF_ORDER_STORE_BARRIER();
         hank->aicpu_regs_ready = 1;
         if (core_id_to_reg_addr_[i] != 0) {
             platform_deinit_aicore_regs(core_id_to_reg_addr_[i]);
