@@ -272,7 +272,7 @@ private:
             if (space_at_end >= alloc_size) {
                 result = static_cast<char *>(heap_base_) + top;
                 heap_top_ = top + alloc_size;
-            } else if (tail > alloc_size) {
+            } else if (tail >= alloc_size) {
                 result = heap_base_;
                 heap_top_ = alloc_size;
             } else {
@@ -426,7 +426,7 @@ struct PTO2DepListPool {
      */
     PTO2DepListEntry *alloc() {
         int32_t used = top - tail;
-        if (used >= capacity) {
+        if (used >= capacity - 1) {
             LOG_ERROR("========================================");
             LOG_ERROR("FATAL: Dependency Pool Overflow!");
             LOG_ERROR("========================================");
@@ -444,7 +444,7 @@ struct PTO2DepListPool {
             }
             return nullptr;
         }
-        int32_t idx = top % capacity;
+        int32_t idx = static_cast<int32_t>((static_cast<uint32_t>(top) - 1) % (capacity - 1)) + 1;
         top++;
         used++;
         if (used > high_water) high_water = used;
