@@ -25,6 +25,8 @@ Runtime::Runtime() {
     // NOTE: host_api is initialized in InitRuntime() (host-only code)
     // because the CApi functions don't exist when compiled for device.
 
+    memset(workers, 0, sizeof(workers));
+
     // Initialize task array (cannot use memset with atomic members)
     for (int i = 0; i < RUNTIME_MAX_TASKS; i++) {
         tasks[i].task_id = 0;
@@ -43,6 +45,9 @@ Runtime::Runtime() {
     initial_ready_count = 0;
     worker_count = 0;
     sche_cpu_num = 1;
+    orch_thread_num = 1;
+    enable_profiling = false;
+    perf_data_base = 0;
     tensor_pair_count = 0;
 
     // Initialize kernel binary tracking

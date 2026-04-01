@@ -437,27 +437,6 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime *runtime) {
     ready_queue_aic_tail_ = 0;
     ready_queue_aiv_head_ = 0;
     ready_queue_aiv_tail_ = 0;
-    int initial_ready[RUNTIME_MAX_TASKS];
-    int initial_count = runtime->get_initial_ready_tasks(initial_ready);
-
-    LOG_INFO("Init: Found %d initially ready tasks", initial_count);
-
-    // Classify initial ready tasks by type
-    int initial_aic[RUNTIME_MAX_TASKS];
-    int initial_aiv[RUNTIME_MAX_TASKS];
-    int initial_aic_count = 0;
-    int initial_aiv_count = 0;
-
-    for (int i = 0; i < initial_count; i++) {
-        Task *task = runtime->get_task(initial_ready[i]);
-        if (task->core_type == CoreType::AIC) {
-            initial_aic[initial_aic_count++] = initial_ready[i];
-        } else {
-            initial_aiv[initial_aiv_count++] = initial_ready[i];
-        }
-    }
-
-    LOG_INFO("Init: Initial ready tasks by type: AIC=%d, AIV=%d", initial_aic_count, initial_aiv_count);
 
     for (int t = 0; t < MAX_AICPU_THREADS; t++) {
         cur_ready_queue_aic_head_[t] = 0;
@@ -466,50 +445,67 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime *runtime) {
         cur_ready_queue_aiv_tail_[t] = 0;
     }
 
+    int initial_count = 0;
+    int initial_aic_count = 0;
+    int initial_aiv_count = 0;
     int aic_shared_count = 0;
-    int thread_idx = 0;
-    for (int i = 0; i < initial_aic_count; i++) {
-        int task_id = initial_aic[i];
+    int aiv_shared_count = 0;
+    int next_aic_thread = 0;
+    int next_aiv_thread = 0;
 
-        int head = cur_ready_queue_aic_head_[thread_idx];
-        int tail = cur_ready_queue_aic_tail_[thread_idx];
-        int cur_size = (tail - head + MAX_CORES_PER_THREAD) % MAX_CORES_PER_THREAD;
+    auto enqueue_initial_task = [&](int task_id, CoreType core_type, int &next_thread_idx, int &shared_count) {
+        int thread_idx = next_thread_idx;
+        int *head_ptr = (core_type == CoreType::AIC) ? &cur_ready_queue_aic_head_[thread_idx] :
+                                                       &cur_ready_queue_aiv_head_[thread_idx];
+        int *tail_ptr = (core_type == CoreType::AIC) ? &cur_ready_queue_aic_tail_[thread_idx] :
+                                                       &cur_ready_queue_aiv_tail_[thread_idx];
+        int cur_size = (*tail_ptr - *head_ptr + MAX_CORES_PER_THREAD) % MAX_CORES_PER_THREAD;
+        int local_capacity = (core_type == CoreType::AIC) ? aic_per_thread_ : aiv_per_thread_;
 
-        if (cur_size < aic_per_thread_) {
-            cur_ready_queue_aic_[thread_idx][tail] = task_id;
-            cur_ready_queue_aic_tail_[thread_idx] = (tail + 1) % MAX_CORES_PER_THREAD;
-            LOG_INFO("Init: AIC task %d -> Thread %d local queue (size=%d)", task_id, thread_idx, cur_size + 1);
-        } else {
+        if (cur_size < local_capacity) {
+            if (core_type == CoreType::AIC) {
+                cur_ready_queue_aic_[thread_idx][*tail_ptr] = task_id;
+            } else {
+                cur_ready_queue_aiv_[thread_idx][*tail_ptr] = task_id;
+            }
+            *tail_ptr = (*tail_ptr + 1) % MAX_CORES_PER_THREAD;
+            LOG_INFO(
+                "Init: %s task %d -> Thread %d local queue (size=%d)", core_type == CoreType::AIC ? "AIC" : "AIV",
+                task_id, thread_idx, cur_size + 1
+            );
+        } else if (core_type == CoreType::AIC) {
             ready_queue_aic_[ready_queue_aic_tail_] = task_id;
             ready_queue_aic_tail_ = (ready_queue_aic_tail_ + 1) % RUNTIME_MAX_TASKS;
-            aic_shared_count++;
-        }
-
-        thread_idx = (thread_idx + 1) % thread_num_;
-    }
-    ready_count_aic_.store(aic_shared_count, std::memory_order_release);
-
-    int aiv_shared_count = 0;
-    thread_idx = 0;
-    for (int i = 0; i < initial_aiv_count; i++) {
-        int task_id = initial_aiv[i];
-
-        int head = cur_ready_queue_aiv_head_[thread_idx];
-        int tail = cur_ready_queue_aiv_tail_[thread_idx];
-        int cur_size = (tail - head + MAX_CORES_PER_THREAD) % MAX_CORES_PER_THREAD;
-
-        if (cur_size < aiv_per_thread_) {
-            cur_ready_queue_aiv_[thread_idx][tail] = task_id;
-            cur_ready_queue_aiv_tail_[thread_idx] = (tail + 1) % MAX_CORES_PER_THREAD;
-            LOG_INFO("Init: AIV task %d -> Thread %d local queue (size=%d)", task_id, thread_idx, cur_size + 1);
+            shared_count++;
         } else {
             ready_queue_aiv_[ready_queue_aiv_tail_] = task_id;
             ready_queue_aiv_tail_ = (ready_queue_aiv_tail_ + 1) % RUNTIME_MAX_TASKS;
-            aiv_shared_count++;
+            shared_count++;
         }
 
-        thread_idx = (thread_idx + 1) % thread_num_;
+        next_thread_idx = (thread_idx + 1) % thread_num_;
+    };
+
+    int task_count = runtime->get_task_count();
+    for (int task_id = 0; task_id < task_count; task_id++) {
+        Task *task = runtime->get_task(task_id);
+        if (task == nullptr || task->fanin.load(std::memory_order_acquire) != 0) {
+            continue;
+        }
+
+        initial_count++;
+        if (task->core_type == CoreType::AIC) {
+            initial_aic_count++;
+            enqueue_initial_task(task_id, CoreType::AIC, next_aic_thread, aic_shared_count);
+        } else {
+            initial_aiv_count++;
+            enqueue_initial_task(task_id, CoreType::AIV, next_aiv_thread, aiv_shared_count);
+        }
     }
+
+    LOG_INFO("Init: Found %d initially ready tasks", initial_count);
+    LOG_INFO("Init: Initial ready tasks by type: AIC=%d, AIV=%d", initial_aic_count, initial_aiv_count);
+    ready_count_aic_.store(aic_shared_count, std::memory_order_release);
     ready_count_aiv_.store(aiv_shared_count, std::memory_order_release);
 
     LOG_INFO(

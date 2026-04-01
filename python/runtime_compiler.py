@@ -329,7 +329,26 @@ class RuntimeCompiler:
             cmake_source_dir,
             "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
         ] + cmake_args
-        self._run_build_step(cmake_cmd, build_dir, platform, "CMake configuration")
+        try:
+            self._run_build_step(cmake_cmd, build_dir, platform, "CMake configuration")
+        except RuntimeError as exc:
+            # Persistent CMake cache dirs under build/cache can become invalid when the
+            # selected compiler or command-line cache entries change. In that case, wipe
+            # the target build dir and retry once with a clean configure.
+            build_path = Path(build_dir)
+            if not any(build_path.iterdir()):
+                raise
+            logger.warning(
+                "[%s] CMake configuration failed in cached build dir %s; clearing cache and retrying once",
+                platform,
+                build_dir,
+            )
+            shutil.rmtree(build_path)
+            build_path.mkdir(parents=True, exist_ok=True)
+            try:
+                self._run_build_step(cmake_cmd, build_dir, platform, "CMake configuration")
+            except RuntimeError:
+                raise exc
 
         build_cmd = [
             "cmake",

@@ -50,7 +50,6 @@ jobs:
 
   # ---------- Python unit tests (no hardware) ----------
   ut-py:
-    needs: pre-commit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -85,7 +84,6 @@ jobs:
 
   # ---------- Simulation scene tests ----------
   st-sim-a2a3:
-    needs: pre-commit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -108,11 +106,6 @@ jobs:
           else
             brew install ninja
             brew install gcc@15 || brew install gcc
-            if command -v g++-15; then
-              echo "CXX=g++-15" >> $GITHUB_ENV
-            else
-              echo "CXX=g++" >> $GITHUB_ENV
-            fi
           fi
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -142,7 +135,6 @@ jobs:
         run: ./ci.sh -p a2a3sim -r ${{ matrix.runtime }} -c 6622890 -t 600 --clone-protocol https
 
   st-sim-a5:
-    needs: pre-commit
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -165,11 +157,6 @@ jobs:
           else
             brew install ninja
             brew install gcc@15 || brew install gcc
-            if command -v g++-15; then
-              echo "CXX=g++-15" >> $GITHUB_ENV
-            else
-              echo "CXX=g++" >> $GITHUB_ENV
-            fi
           fi
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -200,7 +187,6 @@ jobs:
 
   # ---------- Python unit tests (a2a3 hardware) ----------
   ut-py-a2a3:
-    needs: pre-commit
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
 
@@ -218,7 +204,6 @@ jobs:
 
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
-    needs: pre-commit
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
 
@@ -270,7 +255,7 @@ jobs:
   #       Add the "a5" label to the runner, matching [self-hosted, a5] below.
   #
   # ut-py-a5:
-  #   needs: pre-commit detect-changes
+  #   needs: detect-changes
   #   runs-on: [self-hosted, a5]
   #   timeout-minutes: 30
   #
@@ -288,7 +273,7 @@ jobs:
   #
 
   st-onboard-a5:
-    needs: [pre-commit, detect-changes]
+    needs: detect-changes
     if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: [self-hosted, a5]
     timeout-minutes: 60
