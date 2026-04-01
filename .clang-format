@@ -16,7 +16,7 @@ TabWidth: 4
 UseTab: Never
 ContinuationIndentWidth: 4
 IndentCaseLabels: false
-IndentPPDirectives: AfterHash
+IndentPPDirectives: None
 NamespaceIndentation: None
 
 # --- Column limit ---

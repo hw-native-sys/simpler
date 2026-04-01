@@ -41,11 +41,13 @@ repos:
           types_or: [c++, c]
           exclude: ^3rdparty/
 
-    - repo: https://github.com/pocc/pre-commit-hooks
-      rev: v1.3.5
-      hooks:
-        - id: clang-tidy
-          exclude: ^3rdparty/
+    # Temporarily disable clang-tidy while the runtime sources are not
+    # lintable without a local compilation database.
+    # - repo: https://github.com/pocc/pre-commit-hooks
+    #   rev: v1.3.5
+    #   hooks:
+    #     - id: clang-tidy
+    #       exclude: ^3rdparty/
 
     - repo: https://github.com/cpplint/cpplint
       rev:  2.0.0
