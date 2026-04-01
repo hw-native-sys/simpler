@@ -1,10 +1,20 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 #include <atomic>
 #include <cstdint>
+#include <cstdio>
 #include <mutex>
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
-#include "spin_hint.h"
 #include "aicpu/performance_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "common/memory_barrier.h"
@@ -12,6 +22,7 @@
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "runtime.h"
+#include "spin_hint.h"
 
 constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
@@ -36,8 +47,8 @@ struct AicpuExecutor {
     int thread_num_{0};
     int cores_total_num_{0};
     int thread_cores_num_[MAX_AICPU_THREADS]{};  // Total cores (AIC+AIV) assigned to each thread
-    int aic_per_thread_{0};  // Max AIC cores per thread (ceil), used as local queue cap
-    int aiv_per_thread_{0};  // Max AIV cores per thread (ceil), used as local queue cap
+    int aic_per_thread_{0};                      // Max AIC cores per thread (ceil), used as local queue cap
+    int aiv_per_thread_{0};                      // Max AIV cores per thread (ceil), used as local queue cap
     int core_assignments_[MAX_AICPU_THREADS][MAX_CORES_PER_THREAD];
 
     // Core discovery arrays (space-time tradeoff: avoid sorting)
@@ -85,8 +96,8 @@ struct AicpuExecutor {
     std::atomic<int> finished_count_{0};
 
     // ===== Performance profiling state =====
-    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
-    uint32_t core_dispatch_counts_[RUNTIME_MAX_WORKER]; // Per-core total dispatched task counter
+    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];   // Per-core AICPU dispatch timestamp
+    uint32_t core_dispatch_counts_[RUNTIME_MAX_WORKER];  // Per-core total dispatched task counter
 
     // ===== Methods =====
     int init(Runtime* runtime);
@@ -296,7 +307,7 @@ int AicpuExecutor::init(Runtime* runtime) {
  * @return 0 on success, -1 on failure
  */
 int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
-    Handshake* all_handshakes = (Handshake*)runtime->workers;
+    Handshake* all_handshakes = reinterpret_cast<Handshake*>(runtime->workers);
     cores_total_num_ = runtime->worker_count;
 
     // Validate cores_total_num_ before using as array index
@@ -333,7 +344,9 @@ int AicpuExecutor::handshake_all_cores(Runtime* runtime) {
         // Validate physical_core_id before using as array index
         if (physical_core_id >= max_physical_cores_count) {
             LOG_ERROR("Core %d reported invalid physical_core_id=%u (platform max=%u)",
-                      i, physical_core_id, max_physical_cores_count);
+                i,
+                physical_core_id,
+                max_physical_cores_count);
             handshake_failed = true;
             continue;
         }
@@ -395,7 +408,11 @@ void AicpuExecutor::assign_cores_to_threads() {
     aiv_per_thread_ = (aiv_count_ + thread_num_ - 1) / thread_num_;
 
     LOG_INFO("Core Assignment: %d AIC cores, %d AIV cores across %d threads (max %d AIC/thread, %d AIV/thread)",
-        aic_count_, aiv_count_, thread_num_, aic_per_thread_, aiv_per_thread_);
+        aic_count_,
+        aiv_count_,
+        thread_num_,
+        aic_per_thread_,
+        aiv_per_thread_);
 
     for (int t = 0; t < thread_num_; t++) {
         int core_idx = 0;
@@ -537,7 +554,7 @@ void AicpuExecutor::classify_and_distribute_initial_tasks(Runtime* runtime) {
  * Shutdown AICore - Send quit signal to all AICore kernels
  */
 int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* cur_thread_cores) {
-    Handshake* all_handshakes = (Handshake*)runtime->workers;
+    Handshake* all_handshakes = reinterpret_cast<Handshake*>(runtime->workers);
 
     LOG_INFO("Thread %d: Shutting down %d cores", thread_idx, thread_cores_num_[thread_idx]);
 
@@ -561,7 +578,7 @@ int AicpuExecutor::shutdown_aicore(Runtime* runtime, int thread_idx, const int* 
  * Resolve dependencies and dispatch tasks using fast-path scheduling
  */
 int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const int* cur_thread_cores, int core_num) {
-    Handshake* hank = (Handshake*)runtime.workers;
+    Handshake* hank = reinterpret_cast<Handshake*>(runtime.workers);
 
     LOG_INFO("Thread %d: Starting execution with %d cores", thread_idx, core_num);
 
@@ -615,32 +632,34 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
             int reg_state = EXTRACT_TASK_STATE(reg_val);
 
             // Case 1: Pending task finished directly
-            if (reg_task_id == pending_task_ids_[core_id] &&
-                reg_state == TASK_FIN_STATE) {
-
+            if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
                 LOG_INFO("Thread %d: Core %d completed task %d (running_id=%d)",
-                         thread_idx, core_id, pending_task_ids_[core_id], running_task_ids_[core_id]);
-                
+                    thread_idx,
+                    core_id,
+                    pending_task_ids_[core_id],
+                    running_task_ids_[core_id]);
 
                 int completed_task_id = pending_task_ids_[core_id];
 
                 // Profiling
                 if (profiling_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
+                    PerfBuffer* perf_buf = reinterpret_cast<PerfBuffer*>(h->perf_records_addr);
                     Task* task = &runtime.tasks[completed_task_id];
                     uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
                     for (int i = 0; i < task->fanout_count; i++) {
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (perf_aicpu_complete_record(perf_buf,
-                        static_cast<uint32_t>(completed_task_id),
-                        static_cast<uint64_t>(completed_task_id),
-                        task->func_id, h->core_type,
-                        dispatch_timestamps_[core_id], finish_ts,
-                        fanout_arr, task->fanout_count) != 0) {
-                        DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task %d",
-                            core_id, completed_task_id);
+                            static_cast<uint32_t>(completed_task_id),
+                            static_cast<uint64_t>(completed_task_id),
+                            task->func_id,
+                            h->core_type,
+                            dispatch_timestamps_[core_id],
+                            finish_ts,
+                            fanout_arr,
+                            task->fanout_count) != 0) {
+                        DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task %d", core_id, completed_task_id);
                     }
                     dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                 }
@@ -695,8 +714,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                         cur_aiv_tail,
                         cur_aiv_ready_count);
 
-                    LOG_INFO("Thread %d: Core %d resolved old running task %d",
-                             thread_idx, core_id, prev_running_id);
+                    LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
                 }
 
                 Task* task = runtime.get_task(completed_task_id);
@@ -715,14 +733,12 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                 if (!dispatched && profiling_enabled) {
                     dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                 }
-            }
-
-            // Case 2: Pending task received ACK
-            else if (reg_task_id == pending_task_ids_[core_id] &&
-                     reg_state == TASK_ACK_STATE) {
-
+            } else if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_ACK_STATE) {  // Case 2: ACK
                 LOG_INFO("Thread %d: Core %d ACKed task %d (running_id=%d)",
-                         thread_idx, core_id, pending_task_ids_[core_id], running_task_ids_[core_id]);
+                    thread_idx,
+                    core_id,
+                    pending_task_ids_[core_id],
+                    running_task_ids_[core_id]);
 
                 int prev_running_id = running_task_ids_[core_id];
 
@@ -748,39 +764,38 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
                         cur_aiv_tail,
                         cur_aiv_ready_count);
 
-                    LOG_INFO("Thread %d: Core %d resolved old running task %d",
-                             thread_idx, core_id, prev_running_id);
+                    LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
                 }
 
                 // Core can accept new task now (pipeline!)
                 // Continue to Case 4 to dispatch next task
-            }
-
-            // Case 3: Running task finished
-            else if (reg_task_id == running_task_ids_[core_id] &&
-                     reg_state == TASK_FIN_STATE) {
-
+            } else if (reg_task_id == running_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {  // Case 3: FIN
                 LOG_INFO("Thread %d: Core %d completed task %d (pending_id=%d)",
-                         thread_idx, core_id, running_task_ids_[core_id], pending_task_ids_[core_id]);
+                    thread_idx,
+                    core_id,
+                    running_task_ids_[core_id],
+                    pending_task_ids_[core_id]);
 
                 int completed_task_id = running_task_ids_[core_id];
 
                 if (profiling_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    PerfBuffer* perf_buf = (PerfBuffer*)h->perf_records_addr;
+                    PerfBuffer* perf_buf = reinterpret_cast<PerfBuffer*>(h->perf_records_addr);
                     Task* task = &runtime.tasks[completed_task_id];
                     uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
                     for (int i = 0; i < task->fanout_count; i++) {
                         fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
                     }
                     if (perf_aicpu_complete_record(perf_buf,
-                        static_cast<uint32_t>(completed_task_id),
-                        static_cast<uint64_t>(completed_task_id),
-                        task->func_id, h->core_type,
-                        dispatch_timestamps_[core_id], finish_ts,
-                        fanout_arr, task->fanout_count) != 0) {
-                        DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task %d",
-                            core_id, completed_task_id);
+                            static_cast<uint32_t>(completed_task_id),
+                            static_cast<uint64_t>(completed_task_id),
+                            task->func_id,
+                            h->core_type,
+                            dispatch_timestamps_[core_id],
+                            finish_ts,
+                            fanout_arr,
+                            task->fanout_count) != 0) {
+                        DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task %d", core_id, completed_task_id);
                     }
                     dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                 }
@@ -910,7 +925,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime& runtime, int thread_idx, const 
 
             for (int i = 0; i < core_num; i++) {
                 int core_id = cur_thread_cores[i];
-                if (pending_task_ids_[core_id] != AICPU_TASK_INVALID || running_task_ids_[core_id] != AICPU_TASK_INVALID) {
+                if (pending_task_ids_[core_id] != AICPU_TASK_INVALID ||
+                    running_task_ids_[core_id] != AICPU_TASK_INVALID) {
                     all_cores_idle = false;
 
                     if (verification_warning_count == 0) {
@@ -1061,9 +1077,10 @@ void AicpuExecutor::deinit(Runtime* runtime) {
 
 void AicpuExecutor::emergency_shutdown(Runtime* runtime) {
     LOG_WARN("Emergency shutdown: sending exit signal to all initialized cores");
-    Handshake* all_handshakes = (Handshake*)runtime->workers;
+    Handshake* all_handshakes = reinterpret_cast<Handshake*>(runtime->workers);
     for (int i = 0; i < cores_total_num_; i++) {
         Handshake* hank = &all_handshakes[i];
+        OUT_OF_ORDER_STORE_BARRIER();
         hank->aicpu_regs_ready = 1;
         if (core_id_to_reg_addr_[i] != 0) {
             platform_deinit_aicore_regs(core_id_to_reg_addr_[i]);

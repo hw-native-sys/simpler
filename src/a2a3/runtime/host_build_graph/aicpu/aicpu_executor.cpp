@@ -1134,6 +1134,7 @@ void AicpuExecutor::emergency_shutdown(Runtime* runtime) {
     Handshake* all_handshakes = reinterpret_cast<Handshake*>(runtime->workers);
     for (int i = 0; i < cores_total_num_; i++) {
         Handshake* hank = &all_handshakes[i];
+        OUT_OF_ORDER_STORE_BARRIER();
         hank->aicpu_regs_ready = 1;
         if (core_id_to_reg_addr_[i] != 0) {
             platform_deinit_aicore_regs(core_id_to_reg_addr_[i]);
