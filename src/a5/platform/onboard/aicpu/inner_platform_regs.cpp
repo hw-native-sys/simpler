@@ -17,11 +17,13 @@
  * virtual address with no remapping.
  */
 
+// NOLINTBEGIN(clang-diagnostic-error)
 #include <cstdint>
 #include "aicpu/platform_regs.h"
 #include "common/platform_config.h"
+// NOLINTEND(clang-diagnostic-error)
 
-uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
+uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {  // NOLINT(bugprone-easily-swappable-parameters)
     uint32_t offset = reg_offset(reg);
     volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(reg_base_addr + offset);
 
@@ -32,7 +34,12 @@ uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
     return value;
 }
 
-void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
+uint64_t poll_reg(uint64_t reg_base_addr, RegId reg) {  // NOLINT(bugprone-easily-swappable-parameters)
+    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg));
+    return static_cast<uint64_t>(*ptr);
+}
+
+void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {  // NOLINT(bugprone-easily-swappable-parameters)
     uint32_t offset = reg_offset(reg);
     volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(reg_base_addr + offset);
 
