@@ -41,6 +41,12 @@ repos:
           types_or: [c++, c]
           exclude: ^3rdparty/
 
+    - repo: https://github.com/pocc/pre-commit-hooks
+      rev: v1.3.5
+      hooks:
+        - id: clang-tidy
+          exclude: ^3rdparty/
+
     - repo: https://github.com/cpplint/cpplint
       rev:  2.0.0
       hooks:
@@ -49,7 +55,7 @@ repos:
           args:
             - --root=include
             - --linelength=120
-            - --filter=-whitespace/parens,-whitespace/indent_namespace,-runtime/references,-build/include_subdir
+            - --filter=-whitespace,-build,-legal,-runtime,-readability,+readability/todo
 
     # Markdown linting
     - repo: https://github.com/DavidAnson/markdownlint-cli2
