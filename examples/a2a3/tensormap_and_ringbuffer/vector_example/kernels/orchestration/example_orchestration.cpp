@@ -39,8 +39,8 @@ extern "C" {
  * Orchestration config — the executor reads these values to set up
  * shared memory and runtime before calling aicpu_orchestration_entry.
  */
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const ChipStorageTaskArgs& orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
@@ -52,8 +52,8 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestrati
  * The executor wraps this call in PTO2_SCOPE, so we are already inside
  * the outer scope on entry.
  */
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;    // NOLINT(readability/casting)
     (void)orch_thread_index;  // NOLINT(readability/casting)
 
@@ -74,7 +74,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     params_t0.add_input(ext_b);
     params_t0.add_output(inter_ci);
     TaskOutputTensors outs_t0 = pto2_rt_submit_aiv_task(0, params_t0);  // kernel_add
-    const Tensor& c = outs_t0.get_ref(0);
+    const Tensor &c = outs_t0.get_ref(0);
 
     // Inner scope: owns t1, t2, t3, t4; intermediates d, e, g release on scope end.
     // c flows in from outer scope (outer-scope tensors are visible to inner scopes).
@@ -86,7 +86,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         params_t1.add_scalar(to_u64(1.0f));
         params_t1.add_scalar(static_cast<uint64_t>(3));
         TaskOutputTensors outs_t1 = pto2_rt_submit_aiv_task(1, params_t1);  // kernel_add_scalar
-        const Tensor& d = outs_t1.get_ref(0);
+        const Tensor &d = outs_t1.get_ref(0);
 
         // t2: e = c + 2 (kernel_id=1, kernel_add_scalar)
         Arg params_t2;
@@ -95,7 +95,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         params_t2.add_scalar(to_u64(2.0f));
         params_t2.add_scalar(static_cast<uint64_t>(3));
         TaskOutputTensors outs_t2 = pto2_rt_submit_aiv_task(1, params_t2);  // kernel_add_scalar
-        const Tensor& e = outs_t2.get_ref(0);
+        const Tensor &e = outs_t2.get_ref(0);
 
         // t3: g = d * e (kernel_id=2, kernel_mul)
         Arg params_t3;
@@ -104,7 +104,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         params_t3.add_output(inter_ci);
         params_t3.add_scalar(static_cast<uint64_t>(3));
         TaskOutputTensors outs_t3 = pto2_rt_submit_aiv_task(2, params_t3);  // kernel_mul
-        const Tensor& g = outs_t3.get_ref(0);
+        const Tensor &g = outs_t3.get_ref(0);
 
         // t4: f = g + c (kernel_id=0, kernel_add)
         Arg params_t4;

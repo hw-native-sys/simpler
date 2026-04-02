@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Element-wise Tensor Addition Kernel (for mixed task)
  *
@@ -28,17 +38,13 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-static __aicore__ inline int get_num_tiles(__gm__ Tensor* tensor, uint64_t tile_elems) {
+static __aicore__ inline int get_num_tiles(__gm__ Tensor *tensor, uint64_t tile_elems) {
     uint64_t total_elems = tensor->shapes[0];
     return static_cast<int>(total_elems / tile_elems);
 }
 
 template <int ROWS, int COLS>
-static __aicore__ void add_impl(
-    __gm__ float* src0,
-    __gm__ float* src1,
-    __gm__ float* out) {
-
+static __aicore__ void add_impl(__gm__ float *src0, __gm__ float *src1, __gm__ float *out) {
     using DynShapeDim5 = Shape<1, 1, 1, ROWS, COLS>;
     using DynStridDim5 = Stride<1, 1, 1, COLS, 1>;
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
@@ -67,22 +73,22 @@ static __aicore__ void add_impl(
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* src0_tensor = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    __gm__ Tensor* src1_tensor = reinterpret_cast<__gm__ Tensor*>(args[4]);
-    __gm__ Tensor* out_tensor = reinterpret_cast<__gm__ Tensor*>(args[5]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *src0_tensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *src1_tensor = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[5]);
 
     constexpr uint64_t TILE_ELEMS = 128 * 128;
     int num_tiles = get_num_tiles(src0_tensor, TILE_ELEMS);
 
-    __gm__ float* base_src0 = reinterpret_cast<__gm__ float*>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
-    __gm__ float* base_src1 = reinterpret_cast<__gm__ float*>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
-    __gm__ float* base_out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr) + out_tensor->start_offset;
+    __gm__ float *base_src0 = reinterpret_cast<__gm__ float *>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
+    __gm__ float *base_src1 = reinterpret_cast<__gm__ float *>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
+    __gm__ float *base_out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
-        __gm__ float* src0_ptr = base_src0 + (tile_idx * TILE_ELEMS);
-        __gm__ float* src1_ptr = base_src1 + (tile_idx * TILE_ELEMS);
-        __gm__ float* out_ptr = base_out + (tile_idx * TILE_ELEMS);
+        __gm__ float *src0_ptr = base_src0 + (tile_idx * TILE_ELEMS);
+        __gm__ float *src1_ptr = base_src1 + (tile_idx * TILE_ELEMS);
+        __gm__ float *out_ptr = base_out + (tile_idx * TILE_ELEMS);
 
         add_impl<128, 128>(src0_ptr, src1_ptr, out_ptr);
     }

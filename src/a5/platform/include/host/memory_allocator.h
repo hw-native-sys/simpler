@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * @file memory_allocator.h
  * @brief Memory Allocator - Centralized Memory Management
@@ -38,8 +48,8 @@ public:
     ~MemoryAllocator();
 
     // Prevent copying
-    MemoryAllocator(const MemoryAllocator&) = delete;
-    MemoryAllocator& operator=(const MemoryAllocator&) = delete;
+    MemoryAllocator(const MemoryAllocator &) = delete;
+    MemoryAllocator &operator=(const MemoryAllocator &) = delete;
 
     /**
      * Allocate memory and track the pointer
@@ -51,7 +61,7 @@ public:
      * @param size  Size in bytes to allocate
      * @return Memory pointer on success, nullptr on failure
      */
-    void* alloc(size_t size);
+    void *alloc(size_t size);
 
     /**
      * Free memory if tracked
@@ -67,7 +77,7 @@ public:
      * @param ptr  Memory pointer to free
      * @return 0 on success, error code on failure, 0 if ptr not tracked
      */
-    int free(void* ptr);
+    int free(void *ptr);
 
     /**
      * Free all remaining tracked allocations
@@ -88,7 +98,7 @@ public:
     size_t get_allocation_count() const { return ptr_set_.size(); }
 
 private:
-    std::set<void*> ptr_set_;
+    std::set<void *> ptr_set_;
     bool finalized_{false};
 };
 

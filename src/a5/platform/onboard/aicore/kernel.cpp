@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Minimal AICore Kernel
  */
@@ -8,7 +18,7 @@ class Runtime;
 
 #ifdef __DAV_VEC__
 #define KERNEL_ENTRY(x) \
-    x##_0_mix_aiv  // 动态生成函数名 KERNEL_ENTRY(my_kernel) ->
+    x##_0_mix_aiv  // Dynamically generate function name: KERNEL_ENTRY(my_kernel) ->
                    // my_kernel_0_mix_aiv
 #define block_idx block_idx_aiv
 #define core_type core_type_aiv
@@ -21,7 +31,7 @@ class Runtime;
 [[block_local]] int block_idx;
 [[block_local]] CoreType core_type;
 
-extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, CoreType core_type);
+extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
 
 /**
  * Kernel entry point with control loop
@@ -38,7 +48,7 @@ extern __aicore__ void aicore_execute(__gm__ Runtime* runtime, int block_idx, Co
  *
  * @param runtime Address of Runtime structure in device memory
  */
-extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime* runtime) {
+extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime *runtime) {
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();

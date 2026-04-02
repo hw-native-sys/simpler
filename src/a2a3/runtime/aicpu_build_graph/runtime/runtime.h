@@ -106,8 +106,8 @@ struct Handshake {
  * Used for copy-back during finalize.
  */
 struct TensorPair {
-    void* host_ptr;
-    void* dev_ptr;
+    void *host_ptr;
+    void *dev_ptr;
     size_t size;
 };
 
@@ -116,11 +116,11 @@ struct TensorPair {
  * Allows runtime to use pluggable device memory backends.
  */
 struct HostApi {
-    void* (*device_malloc)(size_t size);
-    void (*device_free)(void* dev_ptr);
-    int (*copy_to_device)(void* dev_ptr, const void* host_ptr, size_t size);
-    int (*copy_from_device)(void* host_ptr, const void* dev_ptr, size_t size);
-    uint64_t (*upload_kernel_binary)(int func_id, const uint8_t* bin_data, size_t bin_size);
+    void *(*device_malloc)(size_t size);
+    void (*device_free)(void *dev_ptr);
+    int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
+    int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    uint64_t (*upload_kernel_binary)(int func_id, const uint8_t *bin_data, size_t bin_size);
     void (*remove_kernel_binary)(int func_id);
 };
 
@@ -188,9 +188,9 @@ private:  // NOLINT(whitespace/indent)
 
     // Device orchestration: when false, orchestration runs on device (thread 3)
     bool orch_built_on_host_;
-    void* pto2_gm_sm_ptr_;                   // GM pointer to PTO2 shared memory (device)
-    void* pto2_gm_heap_ptr_;                 // GM heap for orchestrator output buffers (device)
-    void* pto2_slot_states_ptr_;             // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
+    void *pto2_gm_sm_ptr_;                   // GM pointer to PTO2 shared memory (device)
+    void *pto2_gm_heap_ptr_;                 // GM heap for orchestrator output buffers (device)
+    void *pto2_slot_states_ptr_;             // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)
@@ -211,12 +211,12 @@ public:  // NOLINT(whitespace/indent)
     /**
      * Record a host-device tensor pair for copy-back during finalize.
      */
-    void record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size);
+    void record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size);
 
     /**
      * Get pointer to tensor pairs array.
      */
-    TensorPair* get_tensor_pairs();
+    TensorPair *get_tensor_pairs();
 
     /**
      * Get number of recorded tensor pairs.
@@ -237,18 +237,18 @@ public:  // NOLINT(whitespace/indent)
     // =========================================================================
 
     bool get_orch_built_on_host() const;
-    void* get_pto2_gm_sm_ptr() const;
-    void* get_pto2_gm_heap_ptr() const;
-    const ChipStorageTaskArgs& get_orch_args() const;
+    void *get_pto2_gm_sm_ptr() const;
+    void *get_pto2_gm_heap_ptr() const;
+    const ChipStorageTaskArgs &get_orch_args() const;
     void set_orch_built_on_host(bool v);
-    void set_pto2_gm_sm_ptr(void* p);
-    void set_pto2_gm_heap(void* p);
-    void set_pto2_slot_states_ptr(void* p);
-    void set_orch_args(const ChipStorageTaskArgs& args);
+    void set_pto2_gm_sm_ptr(void *p);
+    void set_pto2_gm_heap(void *p);
+    void set_pto2_slot_states_ptr(void *p);
+    void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)
-    void set_device_orch_so(const void* data, size_t size);
-    const void* get_device_orch_so_data() const;
+    void set_device_orch_so(const void *data, size_t size);
+    const void *get_device_orch_so_data() const;
     size_t get_device_orch_so_size() const;
 
     uint64_t get_function_bin_addr(int func_id) const;
@@ -267,7 +267,7 @@ public:  // NOLINT(whitespace/indent)
     int get_task_count() const { return 0; }
 
     /** @deprecated RT2 uses PTO2DispatchPayload, not Task. Always returns nullptr. */
-    Task* get_task(int) { return nullptr; }
+    Task *get_task(int) { return nullptr; }
 
     /** @deprecated Use PTO2 dispatch mode */
     bool get_use_pto2_dispatch() const { return true; }

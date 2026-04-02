@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Device logging implementation for AICPU kernel
  */
@@ -12,7 +22,7 @@ bool g_is_log_enable_info = false;
 bool g_is_log_enable_warn = false;
 bool g_is_log_enable_error = false;
 
-const char* TILE_FWK_DEVICE_MACHINE = "AI_CPU";
+const char *TILE_FWK_DEVICE_MACHINE = "AI_CPU";
 
 void init_log_switch() {
     g_is_log_enable_debug = CheckLogLevel(AICPU, DLOG_DEBUG);
@@ -25,7 +35,7 @@ void init_log_switch() {
 // Platform-Specific Logging Functions (Real Hardware: use CANN dlog API)
 // =============================================================================
 
-void dev_log_debug(const char* func, const char* fmt, ...) {
+void dev_log_debug(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     char buffer[2048];
@@ -35,7 +45,7 @@ void dev_log_debug(const char* func, const char* fmt, ...) {
     dlog_debug(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
 }
 
-void dev_log_info(const char* func, const char* fmt, ...) {
+void dev_log_info(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     char buffer[2048];
@@ -44,7 +54,7 @@ void dev_log_info(const char* func, const char* fmt, ...) {
     dlog_info(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
 }
 
-void dev_log_warn(const char* func, const char* fmt, ...) {
+void dev_log_warn(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     char buffer[2048];
@@ -53,7 +63,7 @@ void dev_log_warn(const char* func, const char* fmt, ...) {
     dlog_warn(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
 }
 
-void dev_log_error(const char* func, const char* fmt, ...) {
+void dev_log_error(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     char buffer[2048];
@@ -62,7 +72,7 @@ void dev_log_error(const char* func, const char* fmt, ...) {
     dlog_error(AICPU, "%lu %s\n\"%s\"", GET_TID(), func, buffer);
 }
 
-void dev_log_always(const char* func, const char* fmt, ...) {
+void dev_log_always(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     char buffer[2048];

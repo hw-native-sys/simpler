@@ -40,16 +40,16 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const ChipStorageTaskArgs& orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 4,  // a, b, result, check
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;    // NOLINT(readability/casting)
     (void)orch_thread_index;  // NOLINT(readability/casting)
 
@@ -73,7 +73,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     params_c.add_input(ext_b);
     params_c.add_output(inter_ci);
     TaskOutputTensors c_outs = pto2_rt_submit_aiv_task(FUNC_ADD, params_c);
-    const Tensor& c = c_outs.get_ref(0);
+    const Tensor &c = c_outs.get_ref(0);
 
     // =========================================================
     // Step 2: get_tensor_data(c, {0}) → check[0]
@@ -108,7 +108,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     Arg params_scalar;
     params_scalar.add_output(scalar_ci);
     TaskOutputTensors scalar_outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params_scalar);
-    const Tensor& scalar_tensor = scalar_outs.get_ref(0);
+    const Tensor &scalar_tensor = scalar_outs.get_ref(0);
 
     // =========================================================
     // Step 5: get_tensor_data(scalar_tensor, {0}) → check[2]
@@ -146,10 +146,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     //   Tests set_tensor_data write + orchestration arithmetic
     // =========================================================
     float combined = c0_val + s0_val;  // 2.0 + 77.0 = 79.0
-    LOG_INFO("Orchestration arithmetic: %f + %f = %f",
-        static_cast<double>(c0_val),
-        static_cast<double>(s0_val),
-        static_cast<double>(combined));  // NOLINT(whitespace/line_length)
+    LOG_INFO(
+        "Orchestration arithmetic: %f + %f = %f", static_cast<double>(c0_val), static_cast<double>(s0_val),
+        static_cast<double>(combined)
+    );  // NOLINT(whitespace/line_length)
 
     check_idx[0] = 4;
     set_tensor_data(ext_check, 1, check_idx, combined);
@@ -174,7 +174,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     Arg params_d;
     params_d.add_output(inter_ci);
     TaskOutputTensors d_outs = pto2_rt_submit_aiv_task(FUNC_NOOP, params_d);
-    const Tensor& d = d_outs.get_ref(0);
+    const Tensor &d = d_outs.get_ref(0);
 
     idx[0] = 0;
     set_tensor_data(d, 1, idx, 10.0f);
@@ -184,7 +184,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     params_e.add_input(ext_a);
     params_e.add_output(inter_ci);
     TaskOutputTensors e_outs = pto2_rt_submit_aiv_task(FUNC_ADD, params_e);
-    const Tensor& e = e_outs.get_ref(0);
+    const Tensor &e = e_outs.get_ref(0);
 
     float e0_val = get_tensor_data<float>(e, 1, idx);
     LOG_INFO("Orch→AICore RAW: e[0] = %f (expected 12.0)", static_cast<double>(e0_val));
@@ -249,7 +249,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     set_tensor_data(ext_b, 1, idx, 55.0f);
     float ext_war_val = get_tensor_data<float>(ext_b, 1, idx);
     LOG_INFO(
-        "External WAR (INOUT): set_tensor_data(ext_b, 55.0) = %f (expected 55.0)", static_cast<double>(ext_war_val));
+        "External WAR (INOUT): set_tensor_data(ext_b, 55.0) = %f (expected 55.0)", static_cast<double>(ext_war_val)
+    );
 
     check_idx[0] = 8;
     set_tensor_data(ext_check, 1, check_idx, ext_war_val);

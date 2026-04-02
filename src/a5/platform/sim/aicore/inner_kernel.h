@@ -142,7 +142,7 @@ inline uint64_t get_sys_cnt_aicore() {
  * Set by the kernel wrapper before calling aicore_execute().
  * Points to the first 4KB page of the sparse register block.
  */
-extern thread_local volatile uint8_t* g_sim_reg_base;
+extern thread_local volatile uint8_t *g_sim_reg_base;
 
 /**
  * Per-thread simulated physical core ID.
@@ -160,7 +160,7 @@ extern thread_local uint32_t g_sim_physical_core_id;
  */
 inline uint64_t read_reg(RegId reg) {
     uint32_t offset = reg_offset(reg);
-    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(sparse_reg_ptr(g_sim_reg_base, offset));
+    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(g_sim_reg_base, offset));
 
     uint64_t val = static_cast<uint64_t>(*ptr);
     OUT_OF_ORDER_LOAD_BARRIER();
@@ -177,7 +177,7 @@ inline uint64_t read_reg(RegId reg) {
  */
 inline void write_reg(RegId reg, uint64_t value) {
     uint32_t offset = reg_offset(reg);
-    volatile uint32_t* ptr = reinterpret_cast<volatile uint32_t*>(sparse_reg_ptr(g_sim_reg_base, offset));
+    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(g_sim_reg_base, offset));
 
     *ptr = static_cast<uint32_t>(value);
     OUT_OF_ORDER_STORE_BARRIER();

@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Tile-based Element-wise Addition Kernel (Vector Core) - INOUT Pattern
  *
@@ -30,10 +40,7 @@ using namespace pto;
 #endif
 
 template <int TILE>
-static __aicore__ void tile_add_impl(
-    __gm__ float* c_ptr,
-    __gm__ float* p_ptr) {
-
+static __aicore__ void tile_add_impl(__gm__ float *c_ptr, __gm__ float *p_ptr) {
     using DynShapeDim5 = Shape<1, 1, 1, TILE, TILE>;
     using DynStridDim5 = Stride<1, 1, 1, TILE, 1>;
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
@@ -65,29 +72,38 @@ static __aicore__ void tile_add_impl(
     wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* c_tensor = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* p_tensor = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* config   = reinterpret_cast<__gm__ Tensor*>(args[2]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *c_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *p_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *config = reinterpret_cast<__gm__ Tensor *>(args[2]);
 
-    __gm__ int64_t* cfg = reinterpret_cast<__gm__ int64_t*>(config->buffer.addr);
+    __gm__ int64_t *cfg = reinterpret_cast<__gm__ int64_t *>(config->buffer.addr);
     uint64_t tile_size = static_cast<uint64_t>(cfg[0]);
     uint64_t tile_elems = tile_size * tile_size;
     int num_tiles = static_cast<int>(cfg[3]);
 
-    __gm__ float* base_c = reinterpret_cast<__gm__ float*>(c_tensor->buffer.addr) + c_tensor->start_offset;
-    __gm__ float* base_p = reinterpret_cast<__gm__ float*>(p_tensor->buffer.addr) + p_tensor->start_offset;
+    __gm__ float *base_c = reinterpret_cast<__gm__ float *>(c_tensor->buffer.addr) + c_tensor->start_offset;
+    __gm__ float *base_p = reinterpret_cast<__gm__ float *>(p_tensor->buffer.addr) + p_tensor->start_offset;
 
     for (int tile_idx = 0; tile_idx < num_tiles; tile_idx++) {
-        __gm__ float* c_ptr = base_c + (tile_idx * tile_elems);
-        __gm__ float* p_ptr = base_p + (tile_idx * tile_elems);
+        __gm__ float *c_ptr = base_c + (tile_idx * tile_elems);
+        __gm__ float *p_ptr = base_p + (tile_idx * tile_elems);
 
         switch (tile_size) {
-            case 16:  tile_add_impl<16>(c_ptr, p_ptr);  break;
-            case 32:  tile_add_impl<32>(c_ptr, p_ptr);  break;
-            case 64:  tile_add_impl<64>(c_ptr, p_ptr);  break;
-            case 128: tile_add_impl<128>(c_ptr, p_ptr); break;
-            default: break;
+        case 16:
+            tile_add_impl<16>(c_ptr, p_ptr);
+            break;
+        case 32:
+            tile_add_impl<32>(c_ptr, p_ptr);
+            break;
+        case 64:
+            tile_add_impl<64>(c_ptr, p_ptr);
+            break;
+        case 128:
+            tile_add_impl<128>(c_ptr, p_ptr);
+            break;
+        default:
+            break;
         }
     }
 }

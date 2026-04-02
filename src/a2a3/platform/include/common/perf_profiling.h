@@ -353,7 +353,7 @@ inline size_t calc_perf_data_size(int num_cores) {
  * @param base_ptr Shared memory base address (device_ptr or host_ptr)
  * @return PerfDataHeader pointer
  */
-inline PerfDataHeader* get_perf_header(void* base_ptr) { return reinterpret_cast<PerfDataHeader*>(base_ptr); }
+inline PerfDataHeader *get_perf_header(void *base_ptr) { return reinterpret_cast<PerfDataHeader *>(base_ptr); }
 
 /**
  * Get PerfBufferState array start address
@@ -361,8 +361,8 @@ inline PerfDataHeader* get_perf_header(void* base_ptr) { return reinterpret_cast
  * @param base_ptr Shared memory base address
  * @return PerfBufferState array pointer
  */
-inline PerfBufferState* get_perf_buffer_states(void* base_ptr) {
-    return reinterpret_cast<PerfBufferState*>(reinterpret_cast<char*>(base_ptr) + sizeof(PerfDataHeader));
+inline PerfBufferState *get_perf_buffer_states(void *base_ptr) {
+    return reinterpret_cast<PerfBufferState *>(reinterpret_cast<char *>(base_ptr) + sizeof(PerfDataHeader));
 }
 
 /**
@@ -372,7 +372,7 @@ inline PerfBufferState* get_perf_buffer_states(void* base_ptr) {
  * @param core_index Core index (0 ~ num_cores-1)
  * @return PerfBufferState pointer
  */
-inline PerfBufferState* get_perf_buffer_state(void* base_ptr, int core_index) {
+inline PerfBufferState *get_perf_buffer_state(void *base_ptr, int core_index) {
     return &get_perf_buffer_states(base_ptr)[core_index];
 }
 
@@ -394,8 +394,8 @@ inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_threa
  * @param num_cores Number of AICore instances
  * @return AicpuPhaseHeader pointer
  */
-inline AicpuPhaseHeader* get_phase_header(void* base_ptr, int num_cores) {
-    return reinterpret_cast<AicpuPhaseHeader*>(reinterpret_cast<char*>(base_ptr) + calc_perf_data_size(num_cores));
+inline AicpuPhaseHeader *get_phase_header(void *base_ptr, int num_cores) {
+    return reinterpret_cast<AicpuPhaseHeader *>(reinterpret_cast<char *>(base_ptr) + calc_perf_data_size(num_cores));
 }
 
 /**
@@ -405,9 +405,10 @@ inline AicpuPhaseHeader* get_phase_header(void* base_ptr, int num_cores) {
  * @param num_cores Number of AICore instances
  * @return PhaseBufferState array pointer
  */
-inline PhaseBufferState* get_phase_buffer_states(void* base_ptr, int num_cores) {
-    return reinterpret_cast<PhaseBufferState*>(
-        reinterpret_cast<char*>(get_phase_header(base_ptr, num_cores)) + sizeof(AicpuPhaseHeader));
+inline PhaseBufferState *get_phase_buffer_states(void *base_ptr, int num_cores) {
+    return reinterpret_cast<PhaseBufferState *>(
+        reinterpret_cast<char *>(get_phase_header(base_ptr, num_cores)) + sizeof(AicpuPhaseHeader)
+    );
 }
 
 /**
@@ -418,7 +419,7 @@ inline PhaseBufferState* get_phase_buffer_states(void* base_ptr, int num_cores) 
  * @param thread_idx Thread index
  * @return PhaseBufferState pointer
  */
-inline PhaseBufferState* get_phase_buffer_state(void* base_ptr, int num_cores, int thread_idx) {
+inline PhaseBufferState *get_phase_buffer_state(void *base_ptr, int num_cores, int thread_idx) {
     return &get_phase_buffer_states(base_ptr, num_cores)[thread_idx];
 }
 

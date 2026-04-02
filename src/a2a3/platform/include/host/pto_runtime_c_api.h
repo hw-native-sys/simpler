@@ -52,7 +52,7 @@ extern "C" {
  * Opaque pointer types for C interface.
  * These hide the C++ class implementations.
  */
-typedef void* RuntimeHandle;
+typedef void *RuntimeHandle;
 
 /* ===========================================================================
  * Runtime API
@@ -84,7 +84,7 @@ size_t get_runtime_size(void);
  * @param orch_args Separated tensor/scalar arguments for orchestration
  * @return 0 on success, -1 on failure
  */
-int init_runtime(RuntimeHandle runtime, const ChipCallable* callable, const ChipStorageTaskArgs* orch_args);
+int init_runtime(RuntimeHandle runtime, const ChipCallable *callable, const ChipStorageTaskArgs *orch_args);
 
 /* ===========================================================================
  * Device Memory API (for use by orchestration functions)
@@ -97,14 +97,14 @@ int init_runtime(RuntimeHandle runtime, const ChipCallable* callable, const Chip
  * @param size  Size in bytes to allocate
  * @return Device pointer on success, NULL on failure
  */
-void* device_malloc(size_t size);
+void *device_malloc(size_t size);
 
 /**
  * Free device memory.
  *
  * @param dev_ptr  Device pointer to free
  */
-void device_free(void* dev_ptr);
+void device_free(void *dev_ptr);
 
 /**
  * Copy data from host to device.
@@ -114,7 +114,7 @@ void device_free(void* dev_ptr);
  * @param size     Size in bytes to copy
  * @return 0 on success, error code on failure
  */
-int copy_to_device(void* dev_ptr, const void* host_ptr, size_t size);
+int copy_to_device(void *dev_ptr, const void *host_ptr, size_t size);
 
 /**
  * Copy data from device to host.
@@ -124,7 +124,7 @@ int copy_to_device(void* dev_ptr, const void* host_ptr, size_t size);
  * @param size     Size in bytes to copy
  * @return 0 on success, error code on failure
  */
-int copy_from_device(void* host_ptr, const void* dev_ptr, size_t size);
+int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size);
 
 /**
  * Execute a runtime on the device.
@@ -144,15 +144,10 @@ int copy_from_device(void* host_ptr, const void* dev_ptr, size_t size);
  * @param orch_thread_num  Number of orchestrator threads (default 1)
  * @return 0 on success, error code on failure
  */
-int launch_runtime(RuntimeHandle runtime,
-    int aicpu_thread_num,
-    int block_dim,
-    int device_id,
-    const uint8_t* aicpu_binary,
-    size_t aicpu_size,
-    const uint8_t* aicore_binary,
-    size_t aicore_size,
-    int orch_thread_num);
+int launch_runtime(
+    RuntimeHandle runtime, int aicpu_thread_num, int block_dim, int device_id, const uint8_t *aicpu_binary,
+    size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size, int orch_thread_num
+);
 
 /**
  * Finalize and cleanup a runtime instance.
@@ -197,7 +192,7 @@ int set_device(int device_id);
  * @param dev_ptr   Device memory pointer
  * @param size      Size of tensor in bytes
  */
-void record_tensor_pair(RuntimeHandle runtime, void* host_ptr, void* dev_ptr, size_t size);
+void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, size_t size);
 
 /**
  * Enable or disable performance profiling for swimlane visualization.

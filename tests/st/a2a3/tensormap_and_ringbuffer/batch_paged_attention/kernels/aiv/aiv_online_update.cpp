@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // Batched Online Softmax Update + Normalize Kernel (AIV)
 //
 // Processes batch_count batches in a single kernel invocation.
@@ -31,27 +41,17 @@ using namespace pto;
 
 template <int M, int N>
 static __aicore__ void online_update_batch_impl(
-    __gm__ Tensor* mij_batch,
-    __gm__ Tensor* lij_batch,
-    __gm__ Tensor* oi_new_batch,
-    __gm__ Tensor* mi_batch,
-    __gm__ Tensor* li_batch,
-    __gm__ Tensor* oi_batch,
-    __gm__ Tensor* out,
-    uint64_t is_first,
-    uint64_t is_last,
-    uint64_t batch_count,
-    uint64_t q_offset,
-    uint64_t num_heads,
-    uint64_t batch_start) {
-
-    __gm__ float* mij_base = reinterpret_cast<__gm__ float*>(mij_batch->buffer.addr);
-    __gm__ float* lij_base = reinterpret_cast<__gm__ float*>(lij_batch->buffer.addr);
-    __gm__ float* oi_new_base = reinterpret_cast<__gm__ float*>(oi_new_batch->buffer.addr);
-    __gm__ float* mi_base = reinterpret_cast<__gm__ float*>(mi_batch->buffer.addr);
-    __gm__ float* li_base = reinterpret_cast<__gm__ float*>(li_batch->buffer.addr);
-    __gm__ float* oi_base = reinterpret_cast<__gm__ float*>(oi_batch->buffer.addr);
-    __gm__ float* out_base = reinterpret_cast<__gm__ float*>(out->buffer.addr);
+    __gm__ Tensor *mij_batch, __gm__ Tensor *lij_batch, __gm__ Tensor *oi_new_batch, __gm__ Tensor *mi_batch,
+    __gm__ Tensor *li_batch, __gm__ Tensor *oi_batch, __gm__ Tensor *out, uint64_t is_first, uint64_t is_last,
+    uint64_t batch_count, uint64_t q_offset, uint64_t num_heads, uint64_t batch_start
+) {
+    __gm__ float *mij_base = reinterpret_cast<__gm__ float *>(mij_batch->buffer.addr);
+    __gm__ float *lij_base = reinterpret_cast<__gm__ float *>(lij_batch->buffer.addr);
+    __gm__ float *oi_new_base = reinterpret_cast<__gm__ float *>(oi_new_batch->buffer.addr);
+    __gm__ float *mi_base = reinterpret_cast<__gm__ float *>(mi_batch->buffer.addr);
+    __gm__ float *li_base = reinterpret_cast<__gm__ float *>(li_batch->buffer.addr);
+    __gm__ float *oi_base = reinterpret_cast<__gm__ float *>(oi_batch->buffer.addr);
+    __gm__ float *out_base = reinterpret_cast<__gm__ float *>(out->buffer.addr);
 
     constexpr int kScalarCols = 32 / sizeof(float);
     constexpr int kScalarRows = M / kScalarCols;
@@ -89,13 +89,13 @@ static __aicore__ void online_update_batch_impl(
     TASSIGN(tmpND, 2 * kDataBytes + 7 * kScalarNDBytes);
 
     for (uint64_t b = 0; b < batch_count; b++) {
-        __gm__ float* mij_ptr = mij_base + b * M;
-        __gm__ float* lij_ptr = lij_base + b * M;
-        __gm__ float* oi_new_ptr = oi_new_base + b * M * N;
-        __gm__ float* mi_ptr = mi_base + b * M;
-        __gm__ float* li_ptr = li_base + b * M;
-        __gm__ float* oi_ptr = oi_base + b * M * N;
-        __gm__ float* dst_ptr = out_base + ((batch_start + b) * num_heads + q_offset) * N;
+        __gm__ float *mij_ptr = mij_base + b * M;
+        __gm__ float *lij_ptr = lij_base + b * M;
+        __gm__ float *oi_new_ptr = oi_new_base + b * M * N;
+        __gm__ float *mi_ptr = mi_base + b * M;
+        __gm__ float *li_ptr = li_base + b * M;
+        __gm__ float *oi_ptr = oi_base + b * M * N;
+        __gm__ float *dst_ptr = out_base + ((batch_start + b) * num_heads + q_offset) * N;
 
         GlobalDataMxN oiNewGlobal(oi_new_ptr);
         GlobalDataMxN oiGlobal(oi_ptr);
@@ -189,14 +189,14 @@ static __aicore__ void online_update_batch_impl(
     }
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* mij_batch = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* lij_batch = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* oi_new_batch = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ Tensor* mi_batch = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    __gm__ Tensor* li_batch = reinterpret_cast<__gm__ Tensor*>(args[4]);
-    __gm__ Tensor* oi_batch = reinterpret_cast<__gm__ Tensor*>(args[5]);
-    __gm__ Tensor* out = reinterpret_cast<__gm__ Tensor*>(args[6]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *mij_batch = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *lij_batch = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *oi_new_batch = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *mi_batch = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *li_batch = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    __gm__ Tensor *oi_batch = reinterpret_cast<__gm__ Tensor *>(args[5]);
+    __gm__ Tensor *out = reinterpret_cast<__gm__ Tensor *>(args[6]);
     uint64_t is_first = static_cast<uint64_t>(args[7]);
     uint64_t is_last = static_cast<uint64_t>(args[8]);
     uint64_t batch_count = static_cast<uint64_t>(args[9]);
@@ -208,13 +208,13 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 
     if (q_tile_size == 16) {
         online_update_batch_impl<16, 128>(
-            mij_batch, lij_batch, oi_new_batch,
-            mi_batch, li_batch, oi_batch, out,
-            is_first, is_last, batch_count, q_offset, num_heads, batch_start);
+            mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count,
+            q_offset, num_heads, batch_start
+        );
     } else {
         online_update_batch_impl<64, 128>(
-            mij_batch, lij_batch, oi_new_batch,
-            mi_batch, li_batch, oi_batch, out,
-            is_first, is_last, batch_count, q_offset, num_heads, batch_start);
+            mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count,
+            q_offset, num_heads, batch_start
+        );
     }
 }

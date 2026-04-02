@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Runtime Class - Implementation
  *
@@ -48,7 +58,7 @@ Runtime::Runtime() {
 // Task Management
 // =============================================================================
 
-int Runtime::add_task(uint64_t* args, int num_args, int func_id, CoreType core_type) {
+int Runtime::add_task(uint64_t *args, int num_args, int func_id, CoreType core_type) {
     // Check bounds
     if (next_task_id >= RUNTIME_MAX_TASKS) {
         LOG_ERROR("[Runtime] Task table full (max=%d)", RUNTIME_MAX_TASKS);
@@ -62,7 +72,7 @@ int Runtime::add_task(uint64_t* args, int num_args, int func_id, CoreType core_t
 
     // Allocate task
     int task_id = next_task_id++;
-    Task* task = &tasks[task_id];
+    Task *task = &tasks[task_id];
 
     // Initialize task fields
     task->task_id = task_id;
@@ -71,8 +81,8 @@ int Runtime::add_task(uint64_t* args, int num_args, int func_id, CoreType core_t
     if (args && num_args > 0) {
         memcpy(task->args, args, num_args * sizeof(uint64_t));
     }
-    task->function_bin_addr = 0;    // Will be set by host before copying to device
-    task->core_type = core_type;    // Set core type
+    task->function_bin_addr = 0;  // Will be set by host before copying to device
+    task->core_type = core_type;  // Set core type
     task->fanin = 0;
     task->fanout_count = 0;
     memset(task->fanout, 0, sizeof(task->fanout));
@@ -92,8 +102,8 @@ void Runtime::add_successor(int from_task, int to_task) {
         return;
     }
 
-    Task* from = &tasks[from_task];
-    Task* to = &tasks[to_task];
+    Task *from = &tasks[from_task];
+    Task *to = &tasks[to_task];
 
     // Add to_task to from_task's fanout
     if (from->fanout_count >= RUNTIME_MAX_FANOUT) {
@@ -109,7 +119,7 @@ void Runtime::add_successor(int from_task, int to_task) {
 // Query Methods
 // =============================================================================
 
-Task* Runtime::get_task(int task_id) {
+Task *Runtime::get_task(int task_id) {
     if (task_id < 0 || task_id >= next_task_id) {
         return nullptr;
     }
@@ -118,7 +128,7 @@ Task* Runtime::get_task(int task_id) {
 
 int Runtime::get_task_count() const { return next_task_id; }
 
-int Runtime::get_initial_ready_tasks(int* ready_tasks) {
+int Runtime::get_initial_ready_tasks(int *ready_tasks) {
     initial_ready_count = 0;
     for (int i = 0; i < next_task_id; i++) {
         if (tasks[i].fanin == 0) {
@@ -145,7 +155,7 @@ void Runtime::print_runtime() const {
     // Print initially ready tasks
     LOG_DEBUG("\nInitially Ready Tasks (fanin==0):");
     LOG_DEBUG("----------------------------------------------------------------------");
-    
+
     // Build ready tasks string
     char ready_tasks_str[1024] = "  ";
     int offset = 2;
@@ -169,23 +179,22 @@ void Runtime::print_runtime() const {
     LOG_DEBUG("----------------------------------------------------------------------");
 
     for (int i = 0; i < next_task_id; i++) {
-        const Task* t = &tasks[i];
+        const Task *t = &tasks[i];
 
         // Build fanout string
         char fanout_str[512];
         int fo_offset = 0;
         for (int j = 0; j < t->fanout_count && fo_offset < 500; j++) {
-            fo_offset += snprintf(fanout_str + fo_offset, sizeof(fanout_str) - fo_offset, 
-                                  "%d%s", t->fanout[j], j < t->fanout_count - 1 ? "," : "");
+            fo_offset += snprintf(
+                fanout_str + fo_offset, sizeof(fanout_str) - fo_offset, "%d%s", t->fanout[j],
+                j < t->fanout_count - 1 ? "," : ""
+            );
         }
 
-        LOG_DEBUG("  Task %d: func_id=%d, fanin=%d, fanout=%d, args=%d [%s]",
-            i,
-            t->func_id,
-            t->fanin.load(),
-            t->fanout_count,
-            t->num_args,
-            fanout_str);
+        LOG_DEBUG(
+            "  Task %d: func_id=%d, fanin=%d, fanout=%d, args=%d [%s]", i, t->func_id, t->fanin.load(), t->fanout_count,
+            t->num_args, fanout_str
+        );
     }
 
     LOG_DEBUG("========================================================================");
@@ -195,7 +204,7 @@ void Runtime::print_runtime() const {
 // Tensor Pair Management
 // =============================================================================
 
-void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
+void Runtime::record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size) {
     if (tensor_pair_count >= RUNTIME_MAX_TENSOR_PAIRS) {
         LOG_ERROR("[Runtime] Tensor pairs full (max=%d)", RUNTIME_MAX_TENSOR_PAIRS);
         return;
@@ -207,14 +216,8 @@ void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
     LOG_DEBUG("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
 }
 
-TensorPair* Runtime::get_tensor_pairs() {
-    return tensor_pairs;
-}
+TensorPair *Runtime::get_tensor_pairs() { return tensor_pairs; }
 
-int Runtime::get_tensor_pair_count() const {
-    return tensor_pair_count;
-}
+int Runtime::get_tensor_pair_count() const { return tensor_pair_count; }
 
-void Runtime::clear_tensor_pairs() {
-    tensor_pair_count = 0;
-}
+void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }

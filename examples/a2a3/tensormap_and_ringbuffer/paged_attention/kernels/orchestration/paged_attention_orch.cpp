@@ -39,16 +39,16 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const ChipStorageTaskArgs& orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
     // Read dimensions from tensor metadata
     // query: shape=[batch, num_heads, head_dim]
     uint64_t batch = orch_args.tensor(0).shapes[0];
@@ -74,18 +74,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     uint64_t b_start = batch * orch_thread_index / orch_thread_num;
     uint64_t b_end = batch * (orch_thread_index + 1) / orch_thread_num;
 
-    LOG_INFO("orch_idx=%d/%d batch=%" PRIu64 " b_range=[%" PRIu64 ",%" PRIu64 ")",
-        orch_thread_index,
-        orch_thread_num,
-        batch,
-        b_start,
-        b_end);
+    LOG_INFO(
+        "orch_idx=%d/%d batch=%" PRIu64 " b_range=[%" PRIu64 ",%" PRIu64 ")", orch_thread_index, orch_thread_num, batch,
+        b_start, b_end
+    );
 
     // Reshape tensors for kernel consumption (2D flattened)
-    void* query_ptr = orch_args.tensor(0).data_as<void>();
-    void* kc_ptr = orch_args.tensor(1).data_as<void>();
-    void* vc_ptr = orch_args.tensor(2).data_as<void>();
-    void* out_ptr = orch_args.tensor(5).data_as<void>();
+    void *query_ptr = orch_args.tensor(0).data_as<void>();
+    void *kc_ptr = orch_args.tensor(1).data_as<void>();
+    void *vc_ptr = orch_args.tensor(2).data_as<void>();
+    void *out_ptr = orch_args.tensor(5).data_as<void>();
 
     // Compute kv_total_rows from key_cache tensor metadata
     uint64_t total_blocks_count = orch_args.tensor(1).shapes[0];
@@ -104,8 +102,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     LOG_DEBUG("value_cache=%s", value_cache.dump().c_str());
     LOG_DEBUG("out=%s", out.dump().c_str());
 
-    int* host_block_table = orch_args.tensor(3).data_as<int>();
-    int* host_context_lens = orch_args.tensor(4).data_as<int>();
+    int *host_block_table = orch_args.tensor(3).data_as<int>();
+    int *host_context_lens = orch_args.tensor(4).data_as<int>();
 
     // Create infos are loop-invariant — shapes depend only on q_tile/head_dim/block_size
     uint32_t tile2d_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
@@ -133,9 +131,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 params_inplace.add_output(scalar_ci);
                 params_inplace.add_output(scalar_ci);
                 TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace);
-                const Tensor& oi = hub_outs.get_ref(0);
-                const Tensor& li_update = hub_outs.get_ref(1);
-                const Tensor& mi_update = hub_outs.get_ref(2);
+                const Tensor &oi = hub_outs.get_ref(0);
+                const Tensor &li_update = hub_outs.get_ref(1);
+                const Tensor &mi_update = hub_outs.get_ref(2);
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
@@ -151,7 +149,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                     params_qk.add_input(kj);
                     params_qk.add_output(sij_ci);
                     TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
-                    const Tensor& sij = qk_outs.get_ref(0);
+                    const Tensor &sij = qk_outs.get_ref(0);
 
                     uint32_t sij_valid_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(valid_len)};
                     uint32_t sij_valid_offsets[2] = {0, 0};
@@ -163,16 +161,16 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                     params_sf.add_output(scalar_ci);
                     params_sf.add_scalar(scale_value);
                     TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
-                    const Tensor& pij_f16 = sf_outs.get_ref(0);
-                    const Tensor& mi = sf_outs.get_ref(1);
-                    const Tensor& li = sf_outs.get_ref(2);
+                    const Tensor &pij_f16 = sf_outs.get_ref(0);
+                    const Tensor &mi = sf_outs.get_ref(1);
+                    const Tensor &li = sf_outs.get_ref(2);
 
                     Arg params_pv;
                     params_pv.add_input(pij_f16);
                     params_pv.add_input(vj);
                     params_pv.add_output(tile2d_ci);
                     TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
-                    const Tensor& oi_tmp = pv_outs.get_ref(0);
+                    const Tensor &oi_tmp = pv_outs.get_ref(0);
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
@@ -193,11 +191,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         }
     }
 
-    LOG_INFO("orch_idx=%d: tasks submitted for batch=[%" PRIu64 ",%" PRIu64 "), num_heads=%" PRIu64,
-        orch_thread_index,
-        b_start,
-        b_end,
-        num_heads);
+    LOG_INFO(
+        "orch_idx=%d: tasks submitted for batch=[%" PRIu64 ",%" PRIu64 "), num_heads=%" PRIu64, orch_thread_index,
+        b_start, b_end, num_heads
+    );
 }
 
 }  // extern "C"

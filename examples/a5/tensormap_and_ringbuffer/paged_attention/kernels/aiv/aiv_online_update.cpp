@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // Online Softmax Update + Normalize Kernel (AIV)
 //
 // Fixed tile size: oi/oi_new are (16, 16), mij/lij/mi/li are 16-element vectors
@@ -24,22 +34,17 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void online_update_impl(__gm__ Tensor* mij,
-    __gm__ Tensor* lij,
-    __gm__ Tensor* oi_new,
-    __gm__ Tensor* mi,
-    __gm__ Tensor* li,
-    __gm__ Tensor* oi,
-    uint64_t is_first,
-    uint64_t is_last,
-    __gm__ Tensor* dst) {
-    __gm__ float* mij_ptr = reinterpret_cast<__gm__ float*>(mij->buffer.addr);
-    __gm__ float* lij_ptr = reinterpret_cast<__gm__ float*>(lij->buffer.addr);
-    __gm__ float* oi_new_ptr = reinterpret_cast<__gm__ float*>(oi_new->buffer.addr);
-    __gm__ float* mi_ptr = reinterpret_cast<__gm__ float*>(mi->buffer.addr);
-    __gm__ float* li_ptr = reinterpret_cast<__gm__ float*>(li->buffer.addr);
-    __gm__ float* oi_ptr = reinterpret_cast<__gm__ float*>(oi->buffer.addr);
-    __gm__ float* dst_ptr = reinterpret_cast<__gm__ float*>(dst->buffer.addr);
+static __aicore__ void online_update_impl(
+    __gm__ Tensor *mij, __gm__ Tensor *lij, __gm__ Tensor *oi_new, __gm__ Tensor *mi, __gm__ Tensor *li,
+    __gm__ Tensor *oi, uint64_t is_first, uint64_t is_last, __gm__ Tensor *dst
+) {
+    __gm__ float *mij_ptr = reinterpret_cast<__gm__ float *>(mij->buffer.addr);
+    __gm__ float *lij_ptr = reinterpret_cast<__gm__ float *>(lij->buffer.addr);
+    __gm__ float *oi_new_ptr = reinterpret_cast<__gm__ float *>(oi_new->buffer.addr);
+    __gm__ float *mi_ptr = reinterpret_cast<__gm__ float *>(mi->buffer.addr);
+    __gm__ float *li_ptr = reinterpret_cast<__gm__ float *>(li->buffer.addr);
+    __gm__ float *oi_ptr = reinterpret_cast<__gm__ float *>(oi->buffer.addr);
+    __gm__ float *dst_ptr = reinterpret_cast<__gm__ float *>(dst->buffer.addr);
 
     // Scalar tile dimensions for RowMajor layout:
     // kScalarCols = 32 bytes / 4 bytes per float = 8 floats per row (one 32-byte block)
@@ -159,14 +164,14 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
 
         // Phase 2: Scalar arithmetic in RowMajor (kScalarRows, kScalarCols)
         // to resolve RAW hazards on shared UB tiles.
-        TMAX(miNewND, miND, mijND);  // mi_new = max(mi, mij)
+        TMAX(miNewND, miND, mijND);    // mi_new = max(mi, mij)
         TSUB(alphaND, miND, miNewND);  // alpha = mi - mi_new
-        TEXP(alphaND, alphaND);  // alpha = exp(mi - mi_new)
+        TEXP(alphaND, alphaND);        // alpha = exp(mi - mi_new)
         TSUB(betaND, mijND, miNewND);  // beta = mij - mi_new
-        TEXP(betaND, betaND);  // beta = exp(mij - mi_new)
-        TMUL(liND, alphaND, liND);  // li = alpha * li
-        TMUL(tmpND, betaND, lijND);  // tmp = beta * lij
-        TADD(liND, liND, tmpND);  // li = alpha * li + beta * lij (= li_new)
+        TEXP(betaND, betaND);          // beta = exp(mij - mi_new)
+        TMUL(liND, alphaND, liND);     // li = alpha * li
+        TMUL(tmpND, betaND, lijND);    // tmp = beta * lij
+        TADD(liND, liND, tmpND);       // li = alpha * li + beta * lij (= li_new)
 
         // Phase 3: Store scalar results to GM (ND format)
         // mi_new -> mi accumulator, li_new -> li accumulator
@@ -192,7 +197,7 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
         // Phase 5: Scale data tiles using row-broadcast multiply
         TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
         TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);  // oi_new *= beta
-        TADD(oiTile, oiTile, oiNewTile);  // oi = alpha*oi + beta*oi_new
+        TADD(oiTile, oiTile, oiNewTile);              // oi = alpha*oi + beta*oi_new
 
         if (is_last) {
             // Phase 6: Normalize and output
@@ -209,14 +214,14 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
     }
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* oi_new = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ Tensor* mi = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    __gm__ Tensor* li = reinterpret_cast<__gm__ Tensor*>(args[4]);
-    __gm__ Tensor* oi = reinterpret_cast<__gm__ Tensor*>(args[5]);
-    __gm__ Tensor* dst = reinterpret_cast<__gm__ Tensor*>(args[6]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *mij = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *lij = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *oi_new = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *mi = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *li = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    __gm__ Tensor *oi = reinterpret_cast<__gm__ Tensor *>(args[5]);
+    __gm__ Tensor *dst = reinterpret_cast<__gm__ Tensor *>(args[6]);
     uint64_t is_first = static_cast<uint64_t>(args[7]);
     uint64_t is_last = static_cast<uint64_t>(args[8]);
 

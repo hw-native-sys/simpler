@@ -52,16 +52,16 @@ static constexpr uint32_t TILE_ELEMS = TILE * TILE;  // 4096 elements
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const ChipStorageTaskArgs& orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 3,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;    // NOLINT(readability/casting)
     (void)orch_thread_index;  // NOLINT(readability/casting)
 
@@ -80,7 +80,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
             for (int n_idx = 0; n_idx < GRID_N; n_idx++) {
                 PTO2_SCOPE() {
                     uint32_t c_elem_offset = (static_cast<uint32_t>(batch) * GRID_M * GRID_N +
-                                                 static_cast<uint32_t>(m_idx) * GRID_N + static_cast<uint32_t>(n_idx)) *
+                                              static_cast<uint32_t>(m_idx) * GRID_N + static_cast<uint32_t>(n_idx)) *
                                              TILE_ELEMS;
                     uint32_t c_view_offsets[1] = {c_elem_offset};
                     Tensor C_view = ext_C.view(tile_shapes, c_view_offsets);
@@ -88,11 +88,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                     for (int k_idx = 0; k_idx < GRID_K; k_idx++) {
                         uint32_t a_elem_offset =
                             (static_cast<uint32_t>(batch) * GRID_M * GRID_K + static_cast<uint32_t>(m_idx) * GRID_K +
-                                static_cast<uint32_t>(k_idx)) *
+                             static_cast<uint32_t>(k_idx)) *
                             TILE_ELEMS;
                         uint32_t b_elem_offset =
                             (static_cast<uint32_t>(batch) * GRID_K * GRID_N + static_cast<uint32_t>(k_idx) * GRID_N +
-                                static_cast<uint32_t>(n_idx)) *
+                             static_cast<uint32_t>(n_idx)) *
                             TILE_ELEMS;
 
                         uint32_t a_view_offsets[1] = {a_elem_offset};
@@ -105,25 +105,24 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                         params_gemm.add_input(B_view);
                         params_gemm.add_output(tile_ci);
                         TaskOutputTensors gemm_outs = pto2_rt_submit_aic_task(FUNC_GEMM_TILE,
-                            params_gemm);  // gemm
+                                                                              params_gemm);  // gemm
 
                         // C[m,n] += P
                         Arg params_add;
                         params_add.add_inout(C_view);
                         params_add.add_input(gemm_outs.get_ref(0));
                         pto2_rt_submit_aiv_task(FUNC_TILE_ADD,
-                            params_add);  // add
+                                                params_add);  // add
                     }
                 }
             }
         }
     }
 
-    LOG_INFO("[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each",
-        BATCH,
-        GRID_M,
-        GRID_N,
-        GRID_K);
+    LOG_INFO(
+        "[bgemm_orch] Submitted tasks for %d batches, %dx%d output tiles, %d K steps each", BATCH, GRID_M, GRID_N,
+        GRID_K
+    );
 }
 
 }  // extern "C"

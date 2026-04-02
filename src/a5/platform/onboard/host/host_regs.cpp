@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * @file host_regs.cpp
  * @brief Host-side AICore register address retrieval implementation
@@ -18,11 +28,11 @@
  * Each AICore has 3 sub-cores (1 AIC + 2 AIV), and the chip has 2 dies with
  * 18 AICores per die.
  */
-static int get_aicore_reg_info(std::vector<int64_t>& regs, int64_t device_id) {
-
+static int get_aicore_reg_info(std::vector<int64_t> &regs, int64_t device_id) {
     // halResMap: Maps individual AICore resources (DAV_3510-specific)
-    auto halFunc = (int (*)(uint32_t devId, struct res_map_info* res_info, uint64_t* va,
-        uint32_t* len))dlsym(nullptr, "halResMap");
+    auto halFunc = (int (*)(uint32_t devId, struct res_map_info *res_info, uint64_t *va, uint32_t *len))dlsym(
+        nullptr, "halResMap"
+    );
 
     if (halFunc == nullptr) {
         LOG_ERROR("halResMap not found in symbol table");
@@ -75,7 +85,7 @@ static int get_aicore_reg_info(std::vector<int64_t>& regs, int64_t device_id) {
     return 0;
 }
 
-static void get_aicore_regs(std::vector<int64_t>& regs, uint64_t device_id) {
+static void get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id) {
     int rt = get_aicore_reg_info(regs, device_id);
 
     if (rt != 0) {
@@ -101,11 +111,7 @@ static void get_aicore_regs(std::vector<int64_t>& regs, uint64_t device_id) {
     LOG_INFO("get_aicore_regs: Retrieved %zu register addresses", regs.size());
 }
 
-int init_aicore_register_addresses(
-    uint64_t* runtime_regs_ptr,
-    uint64_t device_id,
-    MemoryAllocator& allocator) {
-
+int init_aicore_register_addresses(uint64_t *runtime_regs_ptr, uint64_t device_id, MemoryAllocator &allocator) {
     if (runtime_regs_ptr == nullptr) {
         LOG_ERROR("init_aicore_register_addresses: Invalid parameters");
         return -1;
@@ -124,7 +130,7 @@ int init_aicore_register_addresses(
 
     // Step 2: Allocate device memory for register address array
     size_t regs_size = host_regs.size() * sizeof(int64_t);
-    void* reg_ptr = allocator.alloc(regs_size);
+    void *reg_ptr = allocator.alloc(regs_size);
     if (reg_ptr == nullptr) {
         LOG_ERROR("Failed to allocate device memory for register addresses");
         return -1;
@@ -141,8 +147,10 @@ int init_aicore_register_addresses(
     // Step 4: Store device pointer in output regs field
     *runtime_regs_ptr = reinterpret_cast<uint64_t>(reg_ptr);
 
-    LOG_INFO("Successfully initialized register addresses: %zu addresses at device 0x%llx",
-             host_regs.size(), *runtime_regs_ptr);
+    LOG_INFO(
+        "Successfully initialized register addresses: %zu addresses at device 0x%llx", host_regs.size(),
+        *runtime_regs_ptr
+    );
 
     return 0;
 }

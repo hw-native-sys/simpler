@@ -54,16 +54,16 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const ChipStorageTaskArgs& orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
     // Read dimensions from tensor metadata
     uint64_t batch = orch_args.tensor(0).shapes[0];
     uint64_t num_heads = orch_args.tensor(0).shapes[1];
@@ -81,13 +81,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
 
     LOG_INFO("batch_paged_attention: batch=%" PRIu64 ", num_heads=%" PRIu64, batch, num_heads);
 
-    void* query_ptr = orch_args.tensor(0).data_as<void>();
-    void* kc_ptr = orch_args.tensor(1).data_as<void>();
-    void* vc_ptr = orch_args.tensor(2).data_as<void>();
-    void* out_ptr = orch_args.tensor(5).data_as<void>();
+    void *query_ptr = orch_args.tensor(0).data_as<void>();
+    void *kc_ptr = orch_args.tensor(1).data_as<void>();
+    void *vc_ptr = orch_args.tensor(2).data_as<void>();
+    void *out_ptr = orch_args.tensor(5).data_as<void>();
 
-    int* host_block_table = orch_args.tensor(3).data_as<int>();
-    int* host_context_lens = orch_args.tensor(4).data_as<int>();
+    int *host_block_table = orch_args.tensor(3).data_as<int>();
+    int *host_context_lens = orch_args.tensor(4).data_as<int>();
 
     uint64_t max_bn = 0;
     for (uint64_t b = 0; b < batch; b++) {
@@ -133,9 +133,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 params_hub.add_output(scalar_acc_ci);
                 params_hub.add_output(scalar_acc_ci);
                 TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_hub);
-                const Tensor& oi_batch = hub_outs.get_ref(0);
-                const Tensor& li_batch = hub_outs.get_ref(1);
-                const Tensor& mi_batch = hub_outs.get_ref(2);
+                const Tensor &oi_batch = hub_outs.get_ref(0);
+                const Tensor &li_batch = hub_outs.get_ref(1);
+                const Tensor &mi_batch = hub_outs.get_ref(2);
 
                 // Inner-loop create infos: shapes are loop-invariant, hoist out of bn loop
                 uint32_t sij_shapes[2] = {static_cast<uint32_t>(chunk_bc * q_tile), static_cast<uint32_t>(block_size)};
@@ -160,7 +160,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                         params_qk.add_scalar(num_heads);
                         params_qk.add_scalar(batch_start);
                         TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
-                        const Tensor& sij_b = qk_outs.get_ref(0);
+                        const Tensor &sij_b = qk_outs.get_ref(0);
 
                         Arg params_sf;
                         params_sf.add_input(sij_b);
@@ -173,9 +173,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                         params_sf.add_scalar(bn);
                         params_sf.add_scalar(batch_start);
                         TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
-                        const Tensor& pij_b = sf_outs.get_ref(0);
-                        const Tensor& mij_b = sf_outs.get_ref(1);
-                        const Tensor& lij_b = sf_outs.get_ref(2);
+                        const Tensor &pij_b = sf_outs.get_ref(0);
+                        const Tensor &mij_b = sf_outs.get_ref(1);
+                        const Tensor &lij_b = sf_outs.get_ref(2);
 
                         Arg params_pv;
                         params_pv.add_input(pij_b);
@@ -187,7 +187,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                         params_pv.add_scalar(block_num);
                         params_pv.add_scalar(batch_start);
                         TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
-                        const Tensor& oi_new_b = pv_outs.get_ref(0);
+                        const Tensor &oi_new_b = pv_outs.get_ref(0);
 
                         uint64_t is_first = (bn == 0) ? 1 : 0;
                         uint64_t is_last = (bn == max_bn - 1) ? 1 : 0;
@@ -212,13 +212,11 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         }
     }
 
-    LOG_INFO("batch_paged_attention: %" PRIu64 " tasks (batch=%" PRIu64 ", max_bn=%" PRIu64 ", chunks=%" PRIu64
-             ", IN_CORE_BATCH=%" PRIu64 ")",
-        static_cast<uint64_t>(num_chunks * (1 + max_bn * 4)),
-        batch,
-        max_bn,
-        num_chunks,
-        IN_CORE_BATCH);
+    LOG_INFO(
+        "batch_paged_attention: %" PRIu64 " tasks (batch=%" PRIu64 ", max_bn=%" PRIu64 ", chunks=%" PRIu64
+        ", IN_CORE_BATCH=%" PRIu64 ")",
+        static_cast<uint64_t>(num_chunks * (1 + max_bn * 4)), batch, max_bn, num_chunks, IN_CORE_BATCH
+    );
 }
 
 }  // extern "C"

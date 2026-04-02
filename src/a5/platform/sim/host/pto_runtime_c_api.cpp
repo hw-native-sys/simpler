@@ -31,15 +31,15 @@ extern "C" {
  * Runtime Implementation Functions (defined in runtimemaker.cpp)
  * ===========================================================================
  */
-int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const ChipStorageTaskArgs* orch_args);
-int validate_runtime_impl(Runtime* runtime);
+int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const ChipStorageTaskArgs *orch_args);
+int validate_runtime_impl(Runtime *runtime);
 
 /* Forward declarations */
-void* device_malloc(size_t size);
-void device_free(void* dev_ptr);
-int copy_to_device(void* dev_ptr, const void* host_ptr, size_t size);
-int copy_from_device(void* host_ptr, const void* dev_ptr, size_t size);
-uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t* bin_data, size_t bin_size);
+void *device_malloc(size_t size);
+void device_free(void *dev_ptr);
+int copy_to_device(void *dev_ptr, const void *host_ptr, size_t size);
+int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size);
+uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t *bin_data, size_t bin_size);
 void remove_kernel_binary_wrapper(int func_id);
 
 /* ===========================================================================
@@ -49,7 +49,7 @@ void remove_kernel_binary_wrapper(int func_id);
 
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
-int init_runtime(RuntimeHandle runtime, const ChipCallable* callable, const ChipStorageTaskArgs* orch_args) {
+int init_runtime(RuntimeHandle runtime, const ChipCallable *callable, const ChipStorageTaskArgs *orch_args) {
     if (runtime == NULL) {
         return -1;
     }
@@ -58,7 +58,7 @@ int init_runtime(RuntimeHandle runtime, const ChipCallable* callable, const Chip
 
     try {
         // Placement new to construct Runtime in user-allocated memory
-        Runtime* r = new (runtime) Runtime();
+        Runtime *r = new (runtime) Runtime();
 
         // Initialize host API function pointers
         r->host_api.device_malloc = device_malloc;
@@ -91,54 +91,54 @@ int init_runtime(RuntimeHandle runtime, const ChipCallable* callable, const Chip
  * ===========================================================================
  */
 
-void* device_malloc(size_t size) {
+void *device_malloc(size_t size) {
     try {
-        DeviceRunner& runner = DeviceRunner::get();
+        DeviceRunner &runner = DeviceRunner::get();
         return runner.allocate_tensor(size);
     } catch (...) {
         return NULL;
     }
 }
 
-void device_free(void* dev_ptr) {
+void device_free(void *dev_ptr) {
     if (dev_ptr == NULL) {
         return;
     }
     try {
-        DeviceRunner& runner = DeviceRunner::get();
+        DeviceRunner &runner = DeviceRunner::get();
         runner.free_tensor(dev_ptr);
     } catch (...) {
         // Ignore errors during free
     }
 }
 
-int copy_to_device(void* dev_ptr, const void* host_ptr, size_t size) {
+int copy_to_device(void *dev_ptr, const void *host_ptr, size_t size) {
     if (dev_ptr == NULL || host_ptr == NULL) {
         return -1;
     }
     try {
-        DeviceRunner& runner = DeviceRunner::get();
+        DeviceRunner &runner = DeviceRunner::get();
         return runner.copy_to_device(dev_ptr, host_ptr, size);
     } catch (...) {
         return -1;
     }
 }
 
-int copy_from_device(void* host_ptr, const void* dev_ptr, size_t size) {
+int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     if (host_ptr == NULL || dev_ptr == NULL) {
         return -1;
     }
     try {
-        DeviceRunner& runner = DeviceRunner::get();
+        DeviceRunner &runner = DeviceRunner::get();
         return runner.copy_from_device(host_ptr, dev_ptr, size);
     } catch (...) {
         return -1;
     }
 }
 
-uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t* bin_data, size_t bin_size) {
+uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t *bin_data, size_t bin_size) {
     try {
-        DeviceRunner& runner = DeviceRunner::get();
+        DeviceRunner &runner = DeviceRunner::get();
         return runner.upload_kernel_binary(func_id, bin_data, bin_size);
     } catch (...) {
         return 0;
@@ -147,28 +147,23 @@ uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t* bin_data, size
 
 void remove_kernel_binary_wrapper(int func_id) {
     try {
-        DeviceRunner& runner = DeviceRunner::get();
+        DeviceRunner &runner = DeviceRunner::get();
         runner.remove_kernel_binary(func_id);
     } catch (...) {
         // Ignore errors during cleanup
     }
 }
 
-int launch_runtime(RuntimeHandle runtime,
-    int aicpu_thread_num,
-    int block_dim,
-    int device_id,
-    const uint8_t* aicpu_binary,
-    size_t aicpu_size,
-    const uint8_t* aicore_binary,
-    size_t aicore_size,
-    int orch_thread_num) {
+int launch_runtime(
+    RuntimeHandle runtime, int aicpu_thread_num, int block_dim, int device_id, const uint8_t *aicpu_binary,
+    size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size, int orch_thread_num
+) {
     if (runtime == NULL) {
         return -1;
     }
 
     try {
-        DeviceRunner& runner = DeviceRunner::get();
+        DeviceRunner &runner = DeviceRunner::get();
 
         // In simulation, binaries are ignored
         std::vector<uint8_t> aicpu_vec;
@@ -181,7 +176,7 @@ int launch_runtime(RuntimeHandle runtime,
             aicore_vec.assign(aicore_binary, aicore_binary + aicore_size);
         }
 
-        Runtime* r = static_cast<Runtime*>(runtime);
+        Runtime *r = static_cast<Runtime *>(runtime);
         r->orch_thread_num = orch_thread_num;
         return runner.run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
     } catch (...) {
@@ -194,7 +189,7 @@ int finalize_runtime(RuntimeHandle runtime) {
         return -1;
     }
     try {
-        Runtime* r = static_cast<Runtime*>(runtime);
+        Runtime *r = static_cast<Runtime *>(runtime);
         int rc = validate_runtime_impl(r);
 
         // Call destructor (user will call free())
@@ -215,7 +210,7 @@ int enable_runtime_profiling(RuntimeHandle runtime, int enabled) {
         return -1;
     }
     try {
-        Runtime* r = static_cast<Runtime*>(runtime);
+        Runtime *r = static_cast<Runtime *>(runtime);
         r->enable_profiling = (enabled != 0);
         return 0;
     } catch (...) {
@@ -228,11 +223,11 @@ int enable_runtime_profiling(RuntimeHandle runtime, int enabled) {
  * registration and stores addresses in Runtime's func_id_to_addr_[] array.
  */
 
-void record_tensor_pair(RuntimeHandle runtime, void* host_ptr, void* dev_ptr, size_t size) {
+void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, size_t size) {
     if (runtime == NULL) {
         return;
     }
-    Runtime* r = static_cast<Runtime*>(runtime);
+    Runtime *r = static_cast<Runtime *>(runtime);
     r->record_tensor_pair(host_ptr, dev_ptr, size);
 }
 

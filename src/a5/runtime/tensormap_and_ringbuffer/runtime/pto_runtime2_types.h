@@ -137,14 +137,16 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
 struct PTO2TaskId {
     uint64_t raw;
 
-    constexpr PTO2TaskId() : raw(0) {}
-    constexpr explicit PTO2TaskId(uint64_t v) : raw(v) {}
+    constexpr PTO2TaskId() :
+        raw(0) {}
+    constexpr explicit PTO2TaskId(uint64_t v) :
+        raw(v) {}
 
     constexpr uint8_t ring() const { return static_cast<uint8_t>(raw >> 32); }
     constexpr uint32_t local() const { return static_cast<uint32_t>(raw & 0xFFFFFFFFu); }
 
-    constexpr bool operator==(const PTO2TaskId& other) const { return raw == other.raw; }
-    constexpr bool operator!=(const PTO2TaskId& other) const { return raw != other.raw; }
+    constexpr bool operator==(const PTO2TaskId &other) const { return raw == other.raw; }
+    constexpr bool operator!=(const PTO2TaskId &other) const { return raw != other.raw; }
 };
 
 static_assert(sizeof(PTO2TaskId) == 8, "PTO2TaskId must stay 8 bytes (shared memory ABI)");
@@ -257,7 +259,7 @@ typedef enum {
  * Multiple logical tensors can share the same raw tensor (aliasing).
  */
 typedef struct {
-    void* base_ptr;      // Base pointer of allocated memory
+    void *base_ptr;      // Base pointer of allocated memory
     int64_t total_size;  // Total size in bytes
     int32_t refcount;    // Number of logical tensors referencing this storage
                          // (for memory management, 0 = can be freed)
@@ -284,7 +286,7 @@ typedef struct {
  */
 typedef struct {
     // === Raw tensor reference (shared storage) ===
-    void* raw_base;          // Pointer to raw tensor's base (for aliasing check)
+    void *raw_base;          // Pointer to raw tensor's base (for aliasing check)
     int64_t raw_total_size;  // Total size of raw tensor in bytes
 
     // === Storage offset ===
@@ -325,8 +327,8 @@ typedef struct {
  */
 struct PTO2TaskSlotState;  // Forward declaration
 struct PTO2DepListEntry {
-    PTO2TaskSlotState* slot_state;  // Consumer slot state (direct pointer)
-    PTO2DepListEntry* next;         // next entry
+    PTO2TaskSlotState *slot_state;  // Consumer slot state (direct pointer)
+    PTO2DepListEntry *next;         // next entry
 };
 
 // =============================================================================
@@ -350,8 +352,8 @@ struct PTO2TaskDescriptor {
     int32_t kernel_id[PTO2_SUBTASK_SLOT_COUNT];
 
     // Packed output buffer (all outputs packed into single contiguous buffer)
-    void* packed_buffer_base;  // Start of packed buffer in GM Heap
-    void* packed_buffer_end;   // End of packed buffer (for heap reclamation)
+    void *packed_buffer_base;  // Start of packed buffer in GM Heap
+    void *packed_buffer_end;   // End of packed buffer (for heap reclamation)
 };
 
 // =============================================================================
@@ -375,7 +377,7 @@ struct PTO2TaskPayload {
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
     int32_t _reserved{0};           // Reserved (dep_pool_mark moved to SlotState for local access)
-    PTO2TaskSlotState* fanin_slot_states[PTO2_MAX_INPUTS];  // Producer slot states (used by on_task_release)
+    PTO2TaskSlotState *fanin_slot_states[PTO2_MAX_INPUTS];  // Producer slot states (used by on_task_release)
     // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Pre-built args for AICore dispatch (1152B = 16 tensor ptrs + 128 scalars) ===
@@ -391,13 +393,13 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param materialized_outputs  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const Arg& args, const TaskOutputTensors& materialized_outputs) {
+    void init(const Arg &args, const TaskOutputTensors &materialized_outputs) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
         int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
-            const Tensor* src;
+            const Tensor *src;
             if (args.tag(i) == TensorArgType::OUTPUT) {
                 src = materialized_outputs.output_ptr(out_idx++);
             } else {
@@ -409,9 +411,10 @@ struct PTO2TaskPayload {
         }
         // Bulk-copy scalars into dispatch_args[tensor_count..], rounded up to
         // cache-line boundary (extra bytes within the same CL cost nothing).
-        memcpy(&dispatch_args[args.tensor_count()],
-            args.scalar_data(),
-            PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
+        memcpy(
+            &dispatch_args[args.tensor_count()], args.scalar_data(),
+            PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64)
+        );
     }
 };
 
@@ -432,7 +435,7 @@ struct alignas(64) PTO2TaskSlotState {
     std::atomic<int32_t> fanout_lock;  // Per-task spinlock (0=unlocked, 1=locked)
     int32_t fanout_count;              // 1 (owning scope) + number of consumers
 
-    PTO2DepListEntry* fanout_head;  // Pointer to first fanout entry (nullptr = empty)
+    PTO2DepListEntry *fanout_head;  // Pointer to first fanout entry (nullptr = empty)
 
     // Task state (completion, consumed check, ready check)
     std::atomic<PTO2TaskState> task_state;  // PENDING/READY/RUNNING/COMPLETED/CONSUMED
@@ -444,9 +447,9 @@ struct alignas(64) PTO2TaskSlotState {
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
     std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
 
-    PTO2TaskPayload* payload;
+    PTO2TaskPayload *payload;
 
-    PTO2TaskDescriptor* task;
+    PTO2TaskDescriptor *task;
 
     // Hot-path completion fields (moved from TaskDescriptor to avoid cross-struct access)
     uint8_t active_mask;                     // Bitmask of active subtask slots (set once)
@@ -465,7 +468,7 @@ static_assert(sizeof(PTO2TaskSlotState) == 64);
  * Cycle cost function pointer type
  * Returns estimated cycle count for the InCore function
  */
-typedef int64_t (*PTO2CycleCostFunc)(void** args, int32_t num_args);
+typedef int64_t (*PTO2CycleCostFunc)(void **args, int32_t num_args);
 
 // =============================================================================
 // InCore Function Type
@@ -475,7 +478,7 @@ typedef int64_t (*PTO2CycleCostFunc)(void** args, int32_t num_args);
  * InCore function signature
  * All InCore functions must match this signature
  */
-typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
+typedef void (*PTO2InCoreFunc)(void **args, int32_t num_args);
 
 // =============================================================================
 // Utility Macros
@@ -520,7 +523,7 @@ typedef void (*PTO2InCoreFunc)(void** args, int32_t num_args);
 #endif
 
 #if PTO2_ORCH_PROFILING || PTO2_SCHED_PROFILING
-static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state, uint64_t& atomic_count, uint64_t& wait_cycle) {
+static inline void pto2_fanout_lock(PTO2TaskSlotState &slot_state, uint64_t &atomic_count, uint64_t &wait_cycle) {
     uint64_t t0 = get_sys_cnt_aicpu();
     bool contended = false;
     uint32_t atomic_ops = 0;
@@ -533,7 +536,8 @@ static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state, uint64_t& ato
         }
         int32_t expected = 0;
         if (slot_state.fanout_lock.compare_exchange_weak(
-                expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+                expected, 1, std::memory_order_acquire, std::memory_order_relaxed
+            )) {
             atomic_ops++;  // successful CAS = 1 atomic
             atomic_count += atomic_ops;
             if (contended) {
@@ -547,20 +551,21 @@ static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state, uint64_t& ato
 }
 #endif
 
-static inline void pto2_fanout_lock(PTO2TaskSlotState& slot_state) {
+static inline void pto2_fanout_lock(PTO2TaskSlotState &slot_state) {
     for (;;) {
         while (slot_state.fanout_lock.load(std::memory_order_acquire) != 0) {
             SPIN_WAIT_HINT();
         }
         int32_t expected = 0;
         if (slot_state.fanout_lock.compare_exchange_weak(
-                expected, 1, std::memory_order_acquire, std::memory_order_relaxed)) {
+                expected, 1, std::memory_order_acquire, std::memory_order_relaxed
+            )) {
             return;
         }
     }
 }
 
-static inline void pto2_fanout_unlock(PTO2TaskSlotState& slot_state) {
+static inline void pto2_fanout_unlock(PTO2TaskSlotState &slot_state) {
     slot_state.fanout_lock.store(0, std::memory_order_release);
 }
 

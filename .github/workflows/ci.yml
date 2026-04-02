@@ -9,19 +9,46 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ---------- Python unit tests (no hardware) ----------
+  # ---------- Pre-commit hooks (format, lint, clang-tidy) ----------
   pre-commit:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - name: Install build and lint tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ clang-tidy
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Python dependencies
+        run: pip install numpy ml_dtypes
+
+      - name: Cache cmake build directories
+        uses: actions/cache@v3
+        with:
+          path: build/cache
+          key: cmake-sim-${{ runner.os }}-${{ hashFiles('src/**/CMakeLists.txt', 'src/**/build_config.py', 'python/runtime_compiler.py') }}
+          restore-keys: |
+            cmake-sim-${{ runner.os }}-
+
+      - name: Build sim runtimes (generates per-target compile_commands.json)
+        run: python examples/scripts/build_runtimes.py --platforms a2a3sim a5sim
+
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.0
         with:
           extra_args: --from-ref ${{ github.event.pull_request.base.sha }} --to-ref ${{ github.event.pull_request.head.sha }}
 
+  # ---------- Python unit tests (no hardware) ----------
   ut-py:
     needs: pre-commit
     runs-on: ubuntu-latest

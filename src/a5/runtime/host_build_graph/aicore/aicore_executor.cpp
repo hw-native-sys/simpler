@@ -15,19 +15,19 @@
 #include "common/platform_config.h"  // Platform configuration (C/C++ compatible)
 #include "runtime.h"                 // NOLINT(build/include_subdir)
 
-typedef void (*KernelFunc)(__gm__ int64_t*);
+typedef void (*KernelFunc)(__gm__ int64_t *);
 
-__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task* task) {
+__aicore__ __attribute__((always_inline)) static void execute_task(__gm__ Task *task) {
     if (task->function_bin_addr == 0) {
         return;
     }
     KernelFunc kernel = (KernelFunc)task->function_bin_addr;
-    kernel(reinterpret_cast<__gm__ int64_t*>(task->args));
+    kernel(reinterpret_cast<__gm__ int64_t *>(task->args));
     OUT_OF_ORDER_STORE_BARRIER();
 }
 
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, int core_idx, CoreType core_type) {
-    __gm__ Handshake* my_hank = (__gm__ Handshake*)(&runtime->workers[core_idx]);
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int core_idx, CoreType core_type) {
+    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[core_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {
@@ -74,14 +74,14 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime* runtime, in
             uint32_t actual_task_id = task_id;
             write_reg(RegId::COND, MAKE_ACK_VALUE(actual_task_id));
 
-            __gm__ Task* task_ptr = &(runtime->tasks[actual_task_id]);
+            __gm__ Task *task_ptr = &(runtime->tasks[actual_task_id]);
             uint64_t start_time = get_sys_cnt_aicore();
 
             execute_task(task_ptr);
 
             if (profiling_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                __gm__ PerfBuffer* perf_buf = (__gm__ PerfBuffer*)my_hank->perf_records_addr;
+                __gm__ PerfBuffer *perf_buf = (__gm__ PerfBuffer *)my_hank->perf_records_addr;
                 perf_aicore_record_task(perf_buf, actual_task_id, start_time, end_time);
             }
 

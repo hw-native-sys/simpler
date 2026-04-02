@@ -45,7 +45,7 @@
  * @param orch_args  Separated tensor/scalar arguments
  * @return 0 on success, negative on error
  */
-typedef int (*OrchestrationFunc)(Runtime* runtime, const ChipStorageTaskArgs& orch_args);
+typedef int (*OrchestrationFunc)(Runtime *runtime, const ChipStorageTaskArgs &orch_args);
 
 #ifdef __cplusplus
 extern "C" {
@@ -67,7 +67,7 @@ extern "C" {
  * @param orch_args Separated tensor/scalar arguments
  * @return 0 on success, -1 on failure
  */
-int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const ChipStorageTaskArgs* orch_args) {
+int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const ChipStorageTaskArgs *orch_args) {
     // Validate inputs
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
@@ -79,10 +79,11 @@ int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const Chip
         LOG_INFO("Registering %d kernel(s) in init_runtime_impl", callable->child_count());
         for (int32_t i = 0; i < callable->child_count(); i++) {
             int func_id = callable->child_func_id(i);
-            const auto& kernel = callable->child(i);
-            uint64_t addr = runtime->host_api.upload_kernel_binary(func_id,
-                reinterpret_cast<const uint8_t*>(&kernel),
-                CoreCallable::binary_data_offset() + kernel.binary_size());
+            const auto &kernel = callable->child(i);
+            uint64_t addr = runtime->host_api.upload_kernel_binary(
+                func_id, reinterpret_cast<const uint8_t *>(&kernel),
+                CoreCallable::binary_data_offset() + kernel.binary_size()
+            );
             if (addr == 0) {
                 LOG_ERROR("Failed to upload kernel binary for func_id=%d", func_id);
                 return -1;
@@ -91,9 +92,9 @@ int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const Chip
         }
     }
 
-    const uint8_t* orch_so_binary = static_cast<const uint8_t*>(callable->binary_data());
+    const uint8_t *orch_so_binary = static_cast<const uint8_t *>(callable->binary_data());
     size_t orch_so_size = callable->binary_size();
-    const char* orch_func_name = callable->func_name();
+    const char *orch_func_name = callable->func_name();
 
     if (orch_so_binary == nullptr || orch_so_size == 0 || orch_func_name[0] == '\0') {
         LOG_ERROR("Invalid orchestration parameters");
@@ -119,7 +120,7 @@ int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const Chip
     }
     close(fd);
 
-    void* handle = dlopen(fd_path, RTLD_NOW | RTLD_LOCAL);
+    void *handle = dlopen(fd_path, RTLD_NOW | RTLD_LOCAL);
     unlink(fd_path);
     if (handle == nullptr) {
         LOG_ERROR("dlopen failed: %s", dlerror());
@@ -128,7 +129,7 @@ int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const Chip
 
     dlerror();  // Clear any existing error
     OrchestrationFunc orch_func = reinterpret_cast<OrchestrationFunc>(dlsym(handle, orch_func_name));
-    const char* dlsym_error = dlerror();
+    const char *dlsym_error = dlerror();
     if (dlsym_error != nullptr) {
         LOG_ERROR("dlsym failed for '%s': %s", orch_func_name, dlsym_error);
         dlclose(handle);
@@ -142,10 +143,10 @@ int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const Chip
 
     LOG_INFO("=== Calling Orchestration Function ===");
 
-    LOG_DEBUG("Args count: %d (%d tensors + %d scalars)",
-        orch_args->tensor_count() + orch_args->scalar_count(),
-        orch_args->tensor_count(),
-        orch_args->scalar_count());
+    LOG_DEBUG(
+        "Args count: %d (%d tensors + %d scalars)", orch_args->tensor_count() + orch_args->scalar_count(),
+        orch_args->tensor_count(), orch_args->scalar_count()
+    );
 
     // Call orchestration function to build task graph
     // The orchestration function handles device memory allocation and copy-to-device
@@ -176,7 +177,7 @@ int init_runtime_impl(Runtime* runtime, const ChipCallable* callable, const Chip
  * @param runtime  Pointer to Runtime
  * @return 0 on success, -1 on failure
  */
-int validate_runtime_impl(Runtime* runtime) {
+int validate_runtime_impl(Runtime *runtime) {
     if (runtime == nullptr) {
         LOG_ERROR("Runtime pointer is null");
         return -1;
@@ -187,11 +188,11 @@ int validate_runtime_impl(Runtime* runtime) {
     LOG_INFO("=== Copying Results Back to Host ===");
 
     // Copy all recorded tensors from device back to host
-    TensorPair* tensor_pairs = runtime->get_tensor_pairs();
+    TensorPair *tensor_pairs = runtime->get_tensor_pairs();
     int tensor_pair_count = runtime->get_tensor_pair_count();
 
     for (int i = 0; i < tensor_pair_count; i++) {
-        const TensorPair& pair = tensor_pairs[i];
+        const TensorPair &pair = tensor_pairs[i];
         int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, pair.dev_ptr, pair.size);
         if (copy_rc != 0) {
             LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);

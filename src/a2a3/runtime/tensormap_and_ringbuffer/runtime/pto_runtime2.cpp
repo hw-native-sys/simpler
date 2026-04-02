@@ -45,17 +45,17 @@ void pto2_set_orch_thread_idx(int idx) { pto2_current_orch_idx = idx; }
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================
 
-static TaskOutputTensors submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const Arg& args) {
+static TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
     return pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels, args);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime* rt) { pto2_scope_begin(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrators[pto2_current_orch_idx]); }
 
-void pto2_rt_scope_end(PTO2Runtime* rt) { pto2_scope_end(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrators[pto2_current_orch_idx]); }
 
-void pto2_rt_orchestration_done(PTO2Runtime* rt) { pto2_orchestrator_done(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrators[pto2_current_orch_idx]); }
 
-static bool is_fatal_impl(PTO2Runtime* rt) { return rt->orchestrators[pto2_current_orch_idx].fatal; }
+static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[pto2_current_orch_idx].fatal; }
 
 // Wait for all producers of this tensor to be safe for data access.
 // Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
@@ -65,13 +65,13 @@ static bool is_fatal_impl(PTO2Runtime* rt) { return rt->orchestrators[pto2_curre
 // Uses cycle-based timeout (checked every 1024 spins).
 // Returns false on timeout (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
-static bool wait_for_tensor_ready(PTO2Runtime* rt, const Tensor& tensor, bool wait_for_consumers, const char* caller) {
-    PTO2OrchestratorState& orch = rt->orchestrators[pto2_current_orch_idx];
+static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
+    PTO2OrchestratorState &orch = rt->orchestrators[pto2_current_orch_idx];
 
     // Collect producer slot states from both maps, deduplicated by pointer.
     // +1: one creator slot + up to PTO2_LOOKUP_MAX_RESULTS modifier slots.
     constexpr int kMaxWait = PTO2_LOOKUP_MAX_RESULTS + 1;
-    PTO2TaskSlotState* slots[kMaxWait];
+    PTO2TaskSlotState *slots[kMaxWait];
     int slot_count = 0;
 
     // Step A: creator retention — read owner directly from tensor metadata
@@ -85,7 +85,7 @@ static bool wait_for_tensor_ready(PTO2Runtime* rt, const Tensor& tensor, bool wa
     orch.tensor_map.lookup(tensor, lookup_result);
     for (int r = 0; r < lookup_result.count; r++) {
         PTO2TaskId pid = lookup_result.entries[r].entry->producer_task_id;
-        PTO2TaskSlotState* s = &rt->scheduler.ring_sched_states[pid.ring()].get_slot_state_by_task_id(pid.local());
+        PTO2TaskSlotState *s = &rt->scheduler.ring_sched_states[pid.ring()].get_slot_state_by_task_id(pid.local());
         bool already = false;
         for (int j = 0; j < slot_count; j++) {
             if (slots[j] == s) {
@@ -100,7 +100,7 @@ static bool wait_for_tensor_ready(PTO2Runtime* rt, const Tensor& tensor, bool wa
 
     // Wait for each producer
     for (int p = 0; p < slot_count; p++) {
-        PTO2TaskSlotState& slot = *slots[p];
+        PTO2TaskSlotState &slot = *slots[p];
         uint8_t ring_id = slot.ring_id;
         int32_t local_id = static_cast<int32_t>(slot.task->task_id.local());
 
@@ -110,11 +110,11 @@ static bool wait_for_tensor_ready(PTO2Runtime* rt, const Tensor& tensor, bool wa
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
                 orch.fatal = true;
-                unified_log_error(caller,
-                    "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
+                unified_log_error(
+                    caller, "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
                     (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES,  // NOLINT(runtime/int)
-                    ring_id,
-                    local_id);
+                    ring_id, local_id
+                );
                 return false;
             }
         }
@@ -126,11 +126,11 @@ static bool wait_for_tensor_ready(PTO2Runtime* rt, const Tensor& tensor, bool wa
                 SPIN_WAIT_HINT();
                 if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
                     orch.fatal = true;
-                    unified_log_error(caller,
-                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
+                    unified_log_error(
+                        caller, "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
                         (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES,  // NOLINT(runtime/int)
-                        ring_id,
-                        local_id);
+                        ring_id, local_id
+                    );
                     return false;
                 }
             }
@@ -140,11 +140,12 @@ static bool wait_for_tensor_ready(PTO2Runtime* rt, const Tensor& tensor, bool wa
 }
 MAYBE_UNINITIALIZED_END
 
-uint64_t pto2_get_tensor_data(PTO2Runtime* rt, const Tensor& tensor, uint32_t ndims, const uint32_t indices[]) {
+uint64_t pto2_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     if (tensor.buffer.addr == 0) {
-        unified_log_error(__FUNCTION__,
-            "get_tensor_data: buffer not allocated (addr=0). "
-            "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns.");
+        unified_log_error(
+            __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
+                          "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns."
+        );
         return 0;
     }
 
@@ -154,18 +155,20 @@ uint64_t pto2_get_tensor_data(PTO2Runtime* rt, const Tensor& tensor, uint32_t nd
 
     uint64_t flat_offset = tensor.compute_flat_offset(indices, ndims);
     uint64_t elem_size = get_element_size(tensor.dtype);
-    const void* ptr = reinterpret_cast<const void*>(tensor.buffer.addr + flat_offset * elem_size);
+    const void *ptr = reinterpret_cast<const void *>(tensor.buffer.addr + flat_offset * elem_size);
     uint64_t result = 0;
     memcpy(&result, ptr, elem_size);
     return result;
 }
 
 void pto2_set_tensor_data(
-    PTO2Runtime* rt, const Tensor& tensor, uint32_t ndims, const uint32_t indices[], uint64_t value) {
+    PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
+) {
     if (tensor.buffer.addr == 0) {
-        unified_log_error(__FUNCTION__,
-            "set_tensor_data: buffer not allocated (addr=0). "
-            "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns.");
+        unified_log_error(
+            __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "
+                          "Use the Tensor returned by add_output(TensorCreateInfo) after submit returns."
+        );
         return;
     }
 
@@ -176,7 +179,7 @@ void pto2_set_tensor_data(
 
     uint64_t flat_offset = tensor.compute_flat_offset(indices, ndims);
     uint64_t elem_size = get_element_size(tensor.dtype);
-    void* ptr = reinterpret_cast<void*>(tensor.buffer.addr + flat_offset * elem_size);
+    void *ptr = reinterpret_cast<void *>(tensor.buffer.addr + flat_offset * elem_size);
     memcpy(ptr, &value, elem_size);
 }
 
@@ -199,14 +202,15 @@ static const PTO2RuntimeOps s_runtime_ops = {
 // Runtime Creation and Destruction
 // =============================================================================
 
-PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode) {
+PTO2Runtime *pto2_runtime_create(PTO2RuntimeMode mode) {
     return pto2_runtime_create_custom(mode, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE);
 }
 
-PTO2Runtime* pto2_runtime_create_custom(
-    PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity) {
+PTO2Runtime *pto2_runtime_create_custom(
+    PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity
+) {
     // Allocate runtime context
-    PTO2Runtime* rt = static_cast<PTO2Runtime*>(calloc(1, sizeof(PTO2Runtime)));
+    PTO2Runtime *rt = static_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
     if (!rt) {
         return NULL;
     }
@@ -262,17 +266,15 @@ PTO2Runtime* pto2_runtime_create_custom(
     return rt;
 }
 
-PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
-    PTO2SharedMemoryHandle* sm_handle,
-    void* gm_heap,
-    uint64_t heap_size,
-    int orch_count,
-    int32_t dep_pool_capacity) {
+PTO2Runtime *pto2_runtime_create_from_sm(
+    PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size, int orch_count,
+    int32_t dep_pool_capacity
+) {
     if (!sm_handle) return NULL;
     if (orch_count < 1) orch_count = 1;
     if (orch_count > PTO2_MAX_ORCH_THREADS) orch_count = PTO2_MAX_ORCH_THREADS;
 
-    PTO2Runtime* rt = static_cast<PTO2Runtime*>(calloc(1, sizeof(PTO2Runtime)));
+    PTO2Runtime *rt = static_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
     if (!rt) return NULL;
 
     rt->ops = &s_runtime_ops;
@@ -311,7 +313,7 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
     return rt;
 }
 
-void pto2_runtime_destroy(PTO2Runtime* rt) {
+void pto2_runtime_destroy(PTO2Runtime *rt) {
     if (!rt) return;
 
     pto2_scheduler_destroy(&rt->scheduler);
@@ -330,7 +332,7 @@ void pto2_runtime_destroy(PTO2Runtime* rt) {
     free(rt);
 }
 
-void pto2_runtime_set_mode(PTO2Runtime* rt, PTO2RuntimeMode mode) {
+void pto2_runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
     if (rt) {
         rt->mode = mode;
     }

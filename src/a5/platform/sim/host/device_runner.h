@@ -56,8 +56,8 @@
  * proper handling of external symbols (e.g., std::exp) via PLT/GOT.
  */
 struct MappedKernel {
-    void* dl_handle{nullptr};        // dlopen handle
-    uint8_t* callable_buf{nullptr};  // host-memory copy of CoreCallable (owns memory)
+    void *dl_handle{nullptr};        // dlopen handle
+    uint8_t *callable_buf{nullptr};  // host-memory copy of CoreCallable (owns memory)
 };
 
 /**
@@ -73,11 +73,11 @@ struct MappedKernel {
  * - Kernel .text binaries are loaded into mmap'd executable memory
  */
 class DeviceRunner {
- public:
+public:
     /**
      * Get singleton instance
      */
-    static DeviceRunner& get();
+    static DeviceRunner &get();
 
     /**
      * Allocate tensor memory (host memory in simulation)
@@ -85,14 +85,14 @@ class DeviceRunner {
      * @param bytes  Size of tensor in bytes
      * @return Pointer on success, nullptr on failure
      */
-    void* allocate_tensor(size_t bytes);
+    void *allocate_tensor(size_t bytes);
 
     /**
      * Free tensor memory
      *
      * @param dev_ptr  Pointer to free
      */
-    void free_tensor(void* dev_ptr);
+    void free_tensor(void *dev_ptr);
 
     /**
      * Copy data (memcpy in simulation)
@@ -102,7 +102,7 @@ class DeviceRunner {
      * @param bytes     Number of bytes to copy
      * @return 0 on success
      */
-    int copy_to_device(void* dev_ptr, const void* host_ptr, size_t bytes);
+    int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
 
     /**
      * Copy data (memcpy in simulation)
@@ -112,7 +112,7 @@ class DeviceRunner {
      * @param bytes     Number of bytes to copy
      * @return 0 on success
      */
-    int copy_from_device(void* host_ptr, const void* dev_ptr, size_t bytes);
+    int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
 
     /**
      * Execute a runtime using threads
@@ -132,12 +132,9 @@ class DeviceRunner {
      * @param launch_aicpu_num     Number of AICPU threads
      * @return 0 on success
      */
-    int run(Runtime& runtime,
-        int block_dim,
-        int device_id,
-        const std::vector<uint8_t>& aicpu_so_binary,
-        const std::vector<uint8_t>& aicore_kernel_binary,
-        int launch_aicpu_num = 1);
+    int
+    run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
 
     /**
      * Print handshake results
@@ -165,7 +162,7 @@ class DeviceRunner {
      * @param output_path Path to output directory (default: "outputs")
      * @return 0 on success, error code on failure
      */
-    int export_swimlane_json(const std::string& output_path = "outputs");
+    int export_swimlane_json(const std::string &output_path = "outputs");
 
     /**
      * Cleanup all resources
@@ -191,7 +188,7 @@ class DeviceRunner {
      * @param bin_size     Size of binary data in bytes
      * @return Function pointer address on success, 0 on error
      */
-    uint64_t upload_kernel_binary(int func_id, const uint8_t* bin_data, size_t bin_size);
+    uint64_t upload_kernel_binary(int func_id, const uint8_t *bin_data, size_t bin_size);
 
     /**
      * Remove a kernel binary from memory
@@ -203,7 +200,7 @@ class DeviceRunner {
      */
     void remove_kernel_binary(int func_id);
 
- private:
+private:
     DeviceRunner() = default;
     ~DeviceRunner();
 
@@ -223,14 +220,14 @@ class DeviceRunner {
     std::map<int, MappedKernel> func_id_to_addr_;
 
     // Runtime pointer for print_handshake_results
-    Runtime* last_runtime_{nullptr};
+    Runtime *last_runtime_{nullptr};
 
     // Dynamically loaded executor libraries and function pointers
-    void* aicpu_so_handle_{nullptr};
-    void* aicore_so_handle_{nullptr};
-    int (*aicpu_execute_func_)(Runtime*){nullptr};                                       // NOLINT(readability/braces)
-    void (*aicore_execute_func_)(Runtime*, int, CoreType, uint32_t, uint64_t){nullptr};  // NOLINT(readability/braces)
-    void (*set_platform_regs_func_)(uint64_t){nullptr};                                  // NOLINT(readability/braces)
+    void *aicpu_so_handle_{nullptr};
+    void *aicore_so_handle_{nullptr};
+    int (*aicpu_execute_func_)(Runtime *){nullptr};                                       // NOLINT(readability/braces)
+    void (*aicore_execute_func_)(Runtime *, int, CoreType, uint32_t, uint64_t){nullptr};  // NOLINT(readability/braces)
+    void (*set_platform_regs_func_)(uint64_t){nullptr};                                   // NOLINT(readability/braces)
     std::string aicpu_so_path_;
     std::string aicore_so_path_;
 
@@ -239,9 +236,11 @@ class DeviceRunner {
 
     // Private helper methods
     int ensure_device_initialized(
-        int device_id, const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
+        int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
+    );
     int ensure_binaries_loaded(
-        const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
+        const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
+    );
     void unload_executor_binaries();
 
     /**
@@ -254,7 +253,7 @@ class DeviceRunner {
      * @param device_id Device ID (ignored in simulation)
      * @return 0 on success, error code on failure
      */
-    int init_performance_profiling(Runtime& runtime, int num_aicore, int device_id);
+    int init_performance_profiling(Runtime &runtime, int num_aicore, int device_id);
 };
 
 #endif  // SRC_A5_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

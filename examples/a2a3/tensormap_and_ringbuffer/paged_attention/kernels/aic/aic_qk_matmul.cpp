@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // QK Matmul Kernel: qi(M, K) @ kj.T(K, N) -> sij(M, N)
 //
 // Fixed tile size: (16, 16) @ (16, 16).T -> (16, 16)
@@ -22,10 +32,10 @@ using namespace pto;
 #endif
 
 template <int M, int K, int N>
-static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm__ Tensor* sij) {
-    __gm__ half* qi_addr = reinterpret_cast<__gm__ half*>(qi->buffer.addr);
-    __gm__ half* kj_addr = reinterpret_cast<__gm__ half*>(kj->buffer.addr);
-    __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
+static __aicore__ void qk_matmul_impl(__gm__ Tensor *qi, __gm__ Tensor *kj, __gm__ Tensor *sij) {
+    __gm__ half *qi_addr = reinterpret_cast<__gm__ half *>(qi->buffer.addr);
+    __gm__ half *kj_addr = reinterpret_cast<__gm__ half *>(kj->buffer.addr);
+    __gm__ float *sij_addr = reinterpret_cast<__gm__ float *>(sij->buffer.addr);
 
     // qi (M, K) fp16 in ND (row-major) layout
     using GlobalA = GlobalTensor<half, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
@@ -84,10 +94,10 @@ static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm
     wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* qi = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* kj = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* sij = reinterpret_cast<__gm__ Tensor*>(args[2]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *qi = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *kj = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *sij = reinterpret_cast<__gm__ Tensor *>(args[2]);
 
     qk_matmul_impl<16, 16, 16>(qi, kj, sij);
 }

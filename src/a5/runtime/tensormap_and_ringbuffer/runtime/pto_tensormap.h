@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * PTO Runtime2 - TensorMap Interface
  *
@@ -47,7 +57,7 @@ struct PTO2OrchestratorState;  // forward declare
 #if PTO2_TENSORMAP_PROFILING
 extern uint64_t g_lookup_chain_total;
 extern uint64_t g_lookup_count;
-extern int32_t  g_lookup_chain_max;
+extern int32_t g_lookup_chain_max;
 extern uint64_t g_lookup_overlap_checks;
 extern uint64_t g_lookup_overlap_hits;
 extern uint64_t g_insert_count;
@@ -74,29 +84,29 @@ extern uint64_t g_insert_count;
  */
 struct alignas(64) PTO2TensorMapEntry {
     // === Cache line 1 (64B) — lookup hot path ===
-    PTO2TensorMapEntry* next_in_bucket;    // 8B: next entry in hash bucket chain
-    PTO2TaskId producer_task_id;           // 8B: raw (ring_id << 32) | local_id
-    uint64_t buffer_addr;                  // 8B: tensor base address (hash key)
-    int32_t version;                       // 4B: tensor version for overlap detection
-    uint32_t ndims;                        // 4B: number of dimensions
-    int32_t bucket_index;                  // 4B: bucket index (-1 if unlinked)
-    bool is_all_offset_zero;               // 1B: fast-path flag
-    bool with_alloc;                       // 1B: true=OUTPUT, false=INOUT
+    PTO2TensorMapEntry *next_in_bucket;  // 8B: next entry in hash bucket chain
+    PTO2TaskId producer_task_id;         // 8B: raw (ring_id << 32) | local_id
+    uint64_t buffer_addr;                // 8B: tensor base address (hash key)
+    int32_t version;                     // 4B: tensor version for overlap detection
+    uint32_t ndims;                      // 4B: number of dimensions
+    int32_t bucket_index;                // 4B: bucket index (-1 if unlinked)
+    bool is_all_offset_zero;             // 1B: fast-path flag
+    bool with_alloc;                     // 1B: true=OUTPUT, false=INOUT
     // padding: 2B
-    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS]; // 20B: shape per dimension
+    uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // 20B: shape per dimension
     // padding: 4B to fill 64B
 
     // === Cache line 2 (64B) — insert/remove/slow-path ===
-    PTO2TensorMapEntry* prev_in_bucket;    // 8B: prev in hash bucket chain
-    PTO2TensorMapEntry* next_in_task;      // 8B: next entry for same task
-    PTO2TensorMapEntry* prev_in_task;      // 8B: prev entry for same task
-    uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS]; // 20B: only when !is_all_offset_zero
+    PTO2TensorMapEntry *prev_in_bucket;         // 8B: prev in hash bucket chain
+    PTO2TensorMapEntry *next_in_task;           // 8B: next entry for same task
+    PTO2TensorMapEntry *prev_in_task;           // 8B: prev entry for same task
+    uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];  // 20B: only when !is_all_offset_zero
     // padding: 20B to fill 64B
 
     /**
      * Copy overlap-relevant fields from a Tensor into this entry.
      */
-    void copy_from_tensor(const Tensor& t) {
+    void copy_from_tensor(const Tensor &t) {
         buffer_addr = t.buffer.addr;
         version = t.version;
         ndims = t.ndims;
@@ -115,7 +125,7 @@ struct alignas(64) PTO2TensorMapEntry {
      * Check overlap between input tensor and this entry (the producer output).
      * Mirrors Tensor::is_overlap() logic but operates on entry fields directly.
      */
-    OverlapStatus check_overlap(const Tensor& input) const {
+    OverlapStatus check_overlap(const Tensor &input) const {
         debug_assert(input.buffer.addr == buffer_addr);
         debug_assert(input.version >= version);
         if (input.version > version) {
@@ -160,13 +170,13 @@ static_assert(sizeof(PTO2TensorMapEntry) == 128, "TensorMapEntry must be exactly
 // =============================================================================
 struct PTO2LookupResult {
     struct Entry {
-        PTO2TensorMapEntry* entry;
+        PTO2TensorMapEntry *entry;
         OverlapStatus overlap_status;
     };
     Entry entries[PTO2_LOOKUP_MAX_RESULTS];
     int32_t count{0};
 
-    void push(PTO2TensorMapEntry* entry, OverlapStatus s) {
+    void push(PTO2TensorMapEntry *entry, OverlapStatus s) {
         if (count < PTO2_LOOKUP_MAX_RESULTS) {
             entries[count++] = {entry, s};
         }
@@ -180,19 +190,19 @@ struct PTO2LookupResult {
  */
 struct PTO2TensorMap {
     // Hash table buckets (fixed size, power of 2)
-    PTO2TensorMapEntry** buckets;     // Array of offsets into entry_pool (-1 = empty)
-    int32_t num_buckets;  // Must be power of 2 for fast modulo
+    PTO2TensorMapEntry **buckets;  // Array of offsets into entry_pool (-1 = empty)
+    int32_t num_buckets;           // Must be power of 2 for fast modulo
 
     // Entry pool as ring buffer
-    PTO2TensorMapEntry* entry_pool;  // Ring buffer of entries
-    PTO2TensorMapEntry** free_entry_list;        // free entry ids
-    int32_t pool_size;               // Total pool capacity
-    int32_t next_entry_idx;          // id when next entry insert
-    int32_t free_num;                // free entry number in entry pool
+    PTO2TensorMapEntry *entry_pool;        // Ring buffer of entries
+    PTO2TensorMapEntry **free_entry_list;  // free entry ids
+    int32_t pool_size;                     // Total pool capacity
+    int32_t next_entry_idx;                // id when next entry insert
+    int32_t free_num;                      // free entry number in entry pool
 
     // Per-ring per-task entry tracking (for efficient bucket cleanup)
     // Indexed by [ring_id][local_id & (task_window_sizes[ring_id] - 1)]
-    PTO2TensorMapEntry** task_entry_heads[PTO2_MAX_RING_DEPTH];
+    PTO2TensorMapEntry **task_entry_heads[PTO2_MAX_RING_DEPTH];
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];  // Per-ring task window size (for slot masking)
 
     // Per-ring validity threshold (for lazy invalidation)
@@ -201,23 +211,23 @@ struct PTO2TensorMap {
     // Per-ring cleanup progress (for periodic cleanup_retired)
     int32_t last_cleanup[PTO2_MAX_RING_DEPTH]{};
 
-    PTO2OrchestratorState* orch{nullptr};
+    PTO2OrchestratorState *orch{nullptr};
 
-    // new_entry目前不负责分配属性，仅分配内存
-    PTO2TensorMapEntry* new_entry() {
+    // new_entry currently only allocates memory, not attributes
+    PTO2TensorMapEntry *new_entry() {
         if (free_num > 0) {
-            PTO2TensorMapEntry* res = free_entry_list[--free_num];
+            PTO2TensorMapEntry *res = free_entry_list[--free_num];
             debug_assert(res->bucket_index == -1);
             return res;
         }
         always_assert(next_entry_idx < pool_size);
-        PTO2TensorMapEntry* res = &entry_pool[next_entry_idx++];
+        PTO2TensorMapEntry *res = &entry_pool[next_entry_idx++];
         debug_assert(res->bucket_index == -1);
         return res;
     }
 
-    void free_entry(PTO2TensorMapEntry& entry) {
-        always_assert(entry.bucket_index != -1); // 必须保证仍在桶中
+    void free_entry(PTO2TensorMapEntry &entry) {
+        always_assert(entry.bucket_index != -1);  // Must ensure entry is still in a bucket
 
         // Update predecessor's next pointer (O(1) via prev_in_bucket)
         if (entry.prev_in_bucket == nullptr) {
@@ -270,9 +280,7 @@ struct PTO2TensorMap {
      *
      * @param last_task_alive  Current value from shared memory
      */
-    void sync_validity(int32_t ring_id, int32_t last_task_alive) {
-        this->last_task_alives[ring_id] = last_task_alive;
-    }
+    void sync_validity(int32_t ring_id, int32_t last_task_alive) { this->last_task_alives[ring_id] = last_task_alive; }
 
     /**
      * Lookup producer for a tensor region
@@ -284,9 +292,9 @@ struct PTO2TensorMap {
      * @param tensor  Tensor to look up
      * @param result  Output: stack-allocated result buffer
      */
-    void lookup(const Tensor& tensor, PTO2LookupResult& result) {
+    void lookup(const Tensor &tensor, PTO2LookupResult &result) {
         uint32_t bucket_index = hash(tensor.buffer.addr);
-        PTO2TensorMapEntry* cur_entry = buckets[bucket_index];
+        PTO2TensorMapEntry *cur_entry = buckets[bucket_index];
 
         result.count = 0;
 #if PTO2_TENSORMAP_PROFILING
@@ -295,7 +303,7 @@ struct PTO2TensorMap {
 #endif
 
         while (cur_entry != nullptr) {
-            PTO2TensorMapEntry* next_entry = cur_entry->next_in_bucket;
+            PTO2TensorMapEntry *next_entry = cur_entry->next_in_bucket;
 
 #if PTO2_TENSORMAP_PROFILING
             chain_len++;
@@ -342,7 +350,7 @@ struct PTO2TensorMap {
      * @param tensor            Tensor produced
      * @param producer_task_id  Task ID of producer
      */
-    void insert(const Tensor& tensor, PTO2TaskId producer_task_id, bool with_alloc) {
+    void insert(const Tensor &tensor, PTO2TaskId producer_task_id, bool with_alloc) {
 #if PTO2_TENSORMAP_PROFILING
         g_insert_count++;
 #endif
@@ -354,7 +362,7 @@ struct PTO2TensorMap {
         int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
 
         // Allocate entry from ring buffer pool
-        PTO2TensorMapEntry* entry = new_entry();
+        PTO2TensorMapEntry *entry = new_entry();
 
         // Initialize new entry
         entry->copy_from_tensor(tensor);
@@ -394,15 +402,16 @@ struct PTO2TensorMap {
         // Iterate through retired tasks on this ring and remove their entries
         for (int32_t local_id = old_last_task_alive; local_id < new_last_task_alive; local_id++) {
             int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
-            PTO2TensorMapEntry* cur_entry = task_entry_heads[ring_id][task_slot];
+            PTO2TensorMapEntry *cur_entry = task_entry_heads[ring_id][task_slot];
 
             while (cur_entry != nullptr) {
-                PTO2TensorMapEntry* next_entry = cur_entry->next_in_task;  // Save before clearing
+                PTO2TensorMapEntry *next_entry = cur_entry->next_in_task;  // Save before clearing
                 // Only remove if this entry belongs to the retiring task
                 // (slot may have been reused by a newer task)
-                debug_assert(cur_entry->producer_task_id ==
-                             pto2_make_task_id(static_cast<uint8_t>(ring_id),
-                                               static_cast<uint32_t>(local_id)));
+                debug_assert(
+                    cur_entry->producer_task_id ==
+                    pto2_make_task_id(static_cast<uint8_t>(ring_id), static_cast<uint32_t>(local_id))
+                );
                 free_entry(*cur_entry);
                 cur_entry = next_entry;
             }
@@ -432,11 +441,11 @@ struct PTO2TensorMap {
     /**
      * Check if entry is valid (producer has not retired)
      */
-    bool entry_valid(const PTO2TensorMapEntry& entry) const {
+    bool entry_valid(const PTO2TensorMapEntry &entry) const {
         return static_cast<int32_t>(entry.producer_task_id.local()) >= last_task_alives[entry.producer_task_id.ring()];
     }
 
-    void remove_entry(PTO2TensorMapEntry& entry) {
+    void remove_entry(PTO2TensorMapEntry &entry) {
         remove_from_task(entry);
         free_entry(entry);
     }
@@ -445,8 +454,8 @@ struct PTO2TensorMap {
      * Remove entry from its task chain (O(1) with prev pointer)
      * Called during pool wrap-around to unlink reused entries.
      */
-    void remove_from_task(PTO2TensorMapEntry& entry) {
-        always_assert(entry.bucket_index != -1); // 必须保证仍在桶中
+    void remove_from_task(PTO2TensorMapEntry &entry) {
+        always_assert(entry.bucket_index != -1);  // Must ensure entry is still in a bucket
         // Update predecessor's next pointer (O(1) via prev_in_task)
         if (entry.prev_in_task == nullptr) {
             // Entry is the head of its task chain, update task_entry_heads
@@ -498,7 +507,7 @@ struct PTO2TensorMap {
 struct PTO2TensorMapProfilingData {
     uint64_t lookup_chain_total;
     uint64_t lookup_count;
-    int32_t  lookup_chain_max;
+    int32_t lookup_chain_max;
     uint64_t overlap_checks;
     uint64_t overlap_hits;
     uint64_t insert_count;

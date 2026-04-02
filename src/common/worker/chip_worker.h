@@ -24,36 +24,34 @@ struct CallConfig {
 };
 
 class ChipWorker {
- public:
+public:
     ChipWorker() = default;
     ~ChipWorker();
 
-    ChipWorker(const ChipWorker&) = delete;
-    ChipWorker& operator=(const ChipWorker&) = delete;
+    ChipWorker(const ChipWorker &) = delete;
+    ChipWorker &operator=(const ChipWorker &) = delete;
 
-    void init(int device_id,
-        const std::string& host_lib_path,
-        const uint8_t* aicpu_binary,
-        size_t aicpu_size,
-        const uint8_t* aicore_binary,
-        size_t aicore_size);
+    void init(
+        int device_id, const std::string &host_lib_path, const uint8_t *aicpu_binary, size_t aicpu_size,
+        const uint8_t *aicore_binary, size_t aicore_size
+    );
 
     void reset();
 
-    void run(const void* callable, const void* args, const CallConfig& config);
+    void run(const void *callable, const void *args, const CallConfig &config);
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
 
- private:
+private:
     using SetDeviceFn = int (*)(int);
     using GetRuntimeSizeFn = size_t (*)();
-    using InitRuntimeFn = int (*)(void*, const void*, const void*);
-    using LaunchRuntimeFn = int (*)(void*, int, int, int, const uint8_t*, size_t, const uint8_t*, size_t, int);
-    using FinalizeRuntimeFn = int (*)(void*);
-    using EnableProfilingFn = int (*)(void*, int);
+    using InitRuntimeFn = int (*)(void *, const void *, const void *);
+    using LaunchRuntimeFn = int (*)(void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int);
+    using FinalizeRuntimeFn = int (*)(void *);
+    using EnableProfilingFn = int (*)(void *, int);
 
-    void* lib_handle_ = nullptr;
+    void *lib_handle_ = nullptr;
     SetDeviceFn set_device_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     InitRuntimeFn init_runtime_fn_ = nullptr;

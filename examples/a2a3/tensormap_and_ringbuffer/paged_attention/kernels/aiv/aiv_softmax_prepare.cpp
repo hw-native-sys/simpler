@@ -42,12 +42,13 @@ using namespace pto;
 
 template <int M, int N>
 static __aicore__ void softmax_prepare_impl(
-    __gm__ Tensor* sij, float scale_value, __gm__ Tensor* pij, __gm__ Tensor* mij, __gm__ Tensor* lij) {
+    __gm__ Tensor *sij, float scale_value, __gm__ Tensor *pij, __gm__ Tensor *mij, __gm__ Tensor *lij
+) {
     uint64_t valid_len = static_cast<uint64_t>(sij->shapes[1]);
-    __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
-    __gm__ half* pij_addr = reinterpret_cast<__gm__ half*>(pij->buffer.addr);
-    __gm__ float* mij_addr = reinterpret_cast<__gm__ float*>(mij->buffer.addr);
-    __gm__ float* lij_addr = reinterpret_cast<__gm__ float*>(lij->buffer.addr);
+    __gm__ float *sij_addr = reinterpret_cast<__gm__ float *>(sij->buffer.addr);
+    __gm__ half *pij_addr = reinterpret_cast<__gm__ half *>(pij->buffer.addr);
+    __gm__ float *mij_addr = reinterpret_cast<__gm__ float *>(mij->buffer.addr);
+    __gm__ float *lij_addr = reinterpret_cast<__gm__ float *>(lij->buffer.addr);
 
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
@@ -118,11 +119,11 @@ static __aicore__ void softmax_prepare_impl(
     wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* sij = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* pij = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[3]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *sij = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *pij = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *mij = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *lij = reinterpret_cast<__gm__ Tensor *>(args[3]);
     float scale_value = from_u64<float>(static_cast<uint64_t>(args[4]));
 
     softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij);

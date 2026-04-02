@@ -37,20 +37,15 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void softmax_prepare_batch_impl(__gm__ Tensor* sij_batch,
-    __gm__ Tensor* pij_batch,
-    __gm__ Tensor* mij_batch,
-    __gm__ Tensor* lij_batch,
-    float scale_value,
-    uint64_t context_lens_ptr,
-    uint64_t batch_count,
-    uint64_t block_idx,
-    uint64_t batch_start) {
-    __gm__ float* sij_base = reinterpret_cast<__gm__ float*>(sij_batch->buffer.addr);
-    __gm__ half* pij_base = reinterpret_cast<__gm__ half*>(pij_batch->buffer.addr);
-    __gm__ float* mij_base = reinterpret_cast<__gm__ float*>(mij_batch->buffer.addr);
-    __gm__ float* lij_base = reinterpret_cast<__gm__ float*>(lij_batch->buffer.addr);
-    __gm__ int32_t* ctx_lens = reinterpret_cast<__gm__ int32_t*>(context_lens_ptr);
+static __aicore__ void softmax_prepare_batch_impl(
+    __gm__ Tensor *sij_batch, __gm__ Tensor *pij_batch, __gm__ Tensor *mij_batch, __gm__ Tensor *lij_batch,
+    float scale_value, uint64_t context_lens_ptr, uint64_t batch_count, uint64_t block_idx, uint64_t batch_start
+) {
+    __gm__ float *sij_base = reinterpret_cast<__gm__ float *>(sij_batch->buffer.addr);
+    __gm__ half *pij_base = reinterpret_cast<__gm__ half *>(pij_batch->buffer.addr);
+    __gm__ float *mij_base = reinterpret_cast<__gm__ float *>(mij_batch->buffer.addr);
+    __gm__ float *lij_base = reinterpret_cast<__gm__ float *>(lij_batch->buffer.addr);
+    __gm__ int32_t *ctx_lens = reinterpret_cast<__gm__ int32_t *>(context_lens_ptr);
 
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
@@ -90,10 +85,10 @@ static __aicore__ void softmax_prepare_batch_impl(__gm__ Tensor* sij_batch,
             valid_len = (remaining < N) ? remaining : N;
         }
 
-        __gm__ float* sij_addr = sij_base + b * M * N;
-        __gm__ half* pij_addr = pij_base + b * M * N;
-        __gm__ float* mij_addr = mij_base + b * M;
-        __gm__ float* lij_addr = lij_base + b * M;
+        __gm__ float *sij_addr = sij_base + b * M * N;
+        __gm__ half *pij_addr = pij_base + b * M * N;
+        __gm__ float *mij_addr = mij_base + b * M;
+        __gm__ float *lij_addr = lij_base + b * M;
 
         GlobalDataMxN sijGlobal(sij_addr);
         GlobalDataMxN_f16 pijGlobal(pij_addr);
@@ -156,11 +151,11 @@ static __aicore__ void softmax_prepare_batch_impl(__gm__ Tensor* sij_batch,
     }
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* sij_batch = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* pij_batch = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* mij_batch = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ Tensor* lij_batch = reinterpret_cast<__gm__ Tensor*>(args[3]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *sij_batch = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *pij_batch = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *mij_batch = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *lij_batch = reinterpret_cast<__gm__ Tensor *>(args[3]);
     float scale_value = from_u64<float>(static_cast<uint64_t>(args[4]));
     uint64_t context_lens_ptr = static_cast<uint64_t>(args[5]);
     uint64_t batch_count = static_cast<uint64_t>(args[6]);
@@ -168,5 +163,6 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t batch_start = static_cast<uint64_t>(args[8]);
 
     softmax_prepare_batch_impl<16, 16>(
-        sij_batch, pij_batch, mij_batch, lij_batch, scale_value, context_lens_ptr, batch_count, block_idx, batch_start);
+        sij_batch, pij_batch, mij_batch, lij_batch, scale_value, context_lens_ptr, batch_count, block_idx, batch_start
+    );
 }

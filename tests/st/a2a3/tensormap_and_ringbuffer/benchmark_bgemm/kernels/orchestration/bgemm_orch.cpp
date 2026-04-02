@@ -37,16 +37,16 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const ChipStorageTaskArgs& orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 4,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;    // NOLINT(readability/casting)
     (void)orch_thread_index;  // NOLINT(readability/casting)
 
@@ -57,7 +57,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     Tensor ext_config = from_tensor_arg(orch_args.tensor(3));
 
     // Read config from tensor data: [tile_size, grid_k, num_groups, incore_loop]
-    int64_t* host_config = orch_args.tensor(3).data_as<int64_t>();
+    int64_t *host_config = orch_args.tensor(3).data_as<int64_t>();
     int tile_size = static_cast<int>(host_config[0]);
     int grid_k = static_cast<int>(host_config[1]);
     int num_groups = static_cast<int>(host_config[2]);
@@ -67,13 +67,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     int grid_m = 1;
     int grid_n = 1;
 
-    LOG_INFO("[bgemm_orch] tile_size: %d, grid_m: %d, grid_n: %d, grid_k: %d, num_groups: %d, incore_loop: %d",
-        tile_size,
-        grid_m,
-        grid_n,
-        grid_k,
-        num_groups,
-        incore_loop);
+    LOG_INFO(
+        "[bgemm_orch] tile_size: %d, grid_m: %d, grid_n: %d, grid_k: %d, num_groups: %d, incore_loop: %d", tile_size,
+        grid_m, grid_n, grid_k, num_groups, incore_loop
+    );
 
     uint32_t tile_shapes[1] = {static_cast<uint32_t>(tile_elems)};
     uint64_t group_tile_elems = static_cast<uint64_t>(incore_loop) * tile_elems;
@@ -119,10 +116,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
         }
     }
 
-    LOG_INFO("[bgemm_orch] Submitted %d gemm tasks and %d add tasks (%d total)",
-        total_gemm,
-        total_add,
-        total_gemm + total_add);
+    LOG_INFO(
+        "[bgemm_orch] Submitted %d gemm tasks and %d add tasks (%d total)", total_gemm, total_add,
+        total_gemm + total_add
+    );
 }
 
 }  // extern "C"

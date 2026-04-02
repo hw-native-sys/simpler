@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * @file function_cache.h
  * @brief Function Cache Structures for Kernel Binary Management
@@ -77,29 +87,27 @@ struct CoreFunctionBinCache {
      * Get offset array pointer
      * @return Pointer to array of offsets
      */
-    uint64_t* get_offsets() {
-        return reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(this) + sizeof(CoreFunctionBinCache));
+    uint64_t *get_offsets() {
+        return reinterpret_cast<uint64_t *>(reinterpret_cast<uint8_t *>(this) + sizeof(CoreFunctionBinCache));
     }
 
     /**
      * Get pointer to binary data region
      * @return Pointer to start of binary data
      */
-    uint8_t* get_binary_data() {
-        return reinterpret_cast<uint8_t*>(get_offsets()) + num_kernels * sizeof(uint64_t);
-    }
+    uint8_t *get_binary_data() { return reinterpret_cast<uint8_t *>(get_offsets()) + num_kernels * sizeof(uint64_t); }
 
     /**
      * Get CoreFunctionBin by index
      * @param index  Kernel index
      * @return Pointer to CoreFunctionBin structure, nullptr if invalid index
      */
-    CoreFunctionBin* get_kernel(uint64_t index) {
+    CoreFunctionBin *get_kernel(uint64_t index) {
         if (index >= num_kernels) {
             return nullptr;
         }
         uint64_t offset = get_offsets()[index];
-        return reinterpret_cast<CoreFunctionBin*>(get_binary_data() + offset);
+        return reinterpret_cast<CoreFunctionBin *>(get_binary_data() + offset);
     }
 
     /**

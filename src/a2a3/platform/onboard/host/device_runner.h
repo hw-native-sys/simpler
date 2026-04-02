@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Device Runner - Ascend Device Execution Utilities
  *
@@ -59,7 +69,7 @@ struct DeviceArgs {
  */
 struct KernelArgsHelper {
     KernelArgs args;
-    MemoryAllocator* allocator_{nullptr};
+    MemoryAllocator *allocator_{nullptr};
 
     /**
      * Initialize device arguments by allocating device memory and copying data
@@ -68,7 +78,7 @@ struct KernelArgsHelper {
      * @param allocator       Memory allocator to use
      * @return 0 on success, error code on failure
      */
-    int init_device_args(const DeviceArgs& host_device_args, MemoryAllocator& allocator);
+    int init_device_args(const DeviceArgs &host_device_args, MemoryAllocator &allocator);
 
     /**
      * Free device memory allocated for device arguments
@@ -84,7 +94,7 @@ struct KernelArgsHelper {
      * @param allocator  Memory allocator to use
      * @return 0 on success, error code on failure
      */
-    int init_runtime_args(const Runtime& host_runtime, MemoryAllocator& allocator);
+    int init_runtime_args(const Runtime &host_runtime, MemoryAllocator &allocator);
 
     /**
      * Free device memory allocated for runtime arguments
@@ -100,8 +110,8 @@ struct KernelArgsHelper {
      * is expected, enabling transparent device memory management while
      * maintaining API compatibility.
      */
-    operator KernelArgs*() { return &args; }
-    KernelArgs* operator&() { return &args; }
+    operator KernelArgs *() { return &args; }
+    KernelArgs *operator&() { return &args; }
 };
 
 /**
@@ -113,7 +123,7 @@ struct KernelArgsHelper {
 struct AicpuSoInfo {
     uint64_t aicpu_so_bin{0};
     uint64_t aicpu_so_len{0};
-    MemoryAllocator* allocator_{nullptr};
+    MemoryAllocator *allocator_{nullptr};
 
     /**
      * Load shared object binary data and copy to device memory
@@ -122,7 +132,7 @@ struct AicpuSoInfo {
      * @param allocator      Memory allocator to use
      * @return 0 on success, error code on failure
      */
-    int init(const std::vector<uint8_t>& aicpu_so_binary, MemoryAllocator& allocator);
+    int init(const std::vector<uint8_t> &aicpu_so_binary, MemoryAllocator &allocator);
 
     /**
      * Free device memory allocated for shared object
@@ -151,7 +161,7 @@ public:
      *
      * @return Reference to the singleton DeviceRunner instance
      */
-    static DeviceRunner& get();
+    static DeviceRunner &get();
 
     /**
      * Allocate device tensor memory
@@ -159,14 +169,14 @@ public:
      * @param bytes  Size of tensor in bytes
      * @return Device pointer on success, nullptr on failure
      */
-    void* allocate_tensor(size_t bytes);
+    void *allocate_tensor(size_t bytes);
 
     /**
      * Free device tensor memory
      *
      * @param dev_ptr  Device pointer to free
      */
-    void free_tensor(void* dev_ptr);
+    void free_tensor(void *dev_ptr);
 
     /**
      * Copy data from host to device
@@ -176,7 +186,7 @@ public:
      * @param bytes    Number of bytes to copy
      * @return 0 on success, error code on failure
      */
-    int copy_to_device(void* dev_ptr, const void* host_ptr, size_t bytes);
+    int copy_to_device(void *dev_ptr, const void *host_ptr, size_t bytes);
 
     /**
      * Copy data from device to host
@@ -186,7 +196,7 @@ public:
      * @param bytes    Number of bytes to copy
      * @return 0 on success, error code on failure
      */
-    int copy_from_device(void* host_ptr, const void* dev_ptr, size_t bytes);
+    int copy_from_device(void *host_ptr, const void *dev_ptr, size_t bytes);
 
     /**
      * Execute a runtime
@@ -210,12 +220,9 @@ public:
      * @param launch_aicpu_num      Number of AICPU instances (default: 1)
      * @return 0 on success, error code on failure
      */
-    int run(Runtime& runtime,
-        int block_dim,
-        int device_id,
-        const std::vector<uint8_t>& aicpu_so_binary,
-        const std::vector<uint8_t>& aicore_kernel_binary,
-        int launch_aicpu_num = 1);
+    int
+    run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
 
     /**
      * Print handshake results from device
@@ -246,7 +253,7 @@ public:
      * @param output_path Path to output directory (default: "outputs")
      * @return 0 on success, error code on failure
      */
-    int export_swimlane_json(const std::string& output_path = "outputs");
+    int export_swimlane_json(const std::string &output_path = "outputs");
 
     /**
      * Cleanup all resources
@@ -270,7 +277,7 @@ public:
      * @param aicpu_num    Number of AICPU instances to launch
      * @return 0 on success, error code on failure
      */
-    int launch_aicpu_kernel(rtStream_t stream, KernelArgs* k_args, const char* kernel_name, int aicpu_num);
+    int launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num);
 
     /**
      * Launch an AICore kernel
@@ -282,7 +289,7 @@ public:
      * @param runtime   Pointer to device runtime
      * @return 0 on success, error code on failure
      */
-    int launch_aicore_kernel(rtStream_t stream, Runtime* runtime);
+    int launch_aicore_kernel(rtStream_t stream, Runtime *runtime);
 
     /**
      * Upload a kernel binary to device memory
@@ -303,7 +310,7 @@ public:
      * @param bin_size  Size of binary data in bytes
      * @return Device GM address of kernel on success, 0 on error
      */
-    uint64_t upload_kernel_binary(int func_id, const uint8_t* bin_data, size_t bin_size);
+    uint64_t upload_kernel_binary(int func_id, const uint8_t *bin_data, size_t bin_size);
 
     /**
      * Remove a kernel binary from device memory
@@ -350,7 +357,7 @@ private:
     DeviceArgs device_args_;
 
     // Kernel binary management
-    bool binaries_loaded_{false};            // true after AICPU SO loaded
+    bool binaries_loaded_{false};              // true after AICPU SO loaded
     std::map<int, uint64_t> func_id_to_addr_;  // func_id -> function_bin_addr (device GM)
 
     // Performance profiling
@@ -370,9 +377,9 @@ private:
      * @param aicore_kernel_binary  Binary data of AICore kernel
      * @return 0 on success, error code on failure
      */
-    int ensure_device_initialized(int device_id,
-                                const std::vector<uint8_t>& aicpu_so_binary,
-                                const std::vector<uint8_t>& aicore_kernel_binary);
+    int ensure_device_initialized(
+        int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
+    );
 
     /**
      * Load AICPU SO and initialize device args
@@ -385,7 +392,9 @@ private:
      * @param aicore_kernel_binary  Binary data of AICore kernel
      * @return 0 on success, error code on failure
      */
-    int ensure_binaries_loaded(const std::vector<uint8_t>& aicpu_so_binary, const std::vector<uint8_t>& aicore_kernel_binary);
+    int ensure_binaries_loaded(
+        const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
+    );
 
     /**
      * Initialize performance profiling shared memory
@@ -398,7 +407,7 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_performance_profiling(Runtime& runtime, int num_aicore, int device_id);
+    int init_performance_profiling(Runtime &runtime, int num_aicore, int device_id);
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

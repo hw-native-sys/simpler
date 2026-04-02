@@ -109,9 +109,9 @@ struct LocalContext {
  * Single-AIV tasks have no intra-cluster communication, so sub_block_id
  * has no meaning and should not be used.
  */
-static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t* args) {
-    __gm__ GlobalContext* ctx =
-        reinterpret_cast<__gm__ GlobalContext*>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
+static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t *args) {
+    __gm__ GlobalContext *ctx =
+        reinterpret_cast<__gm__ GlobalContext *>(static_cast<uint64_t>(args[SPMD_GLOBAL_CONTEXT_INDEX]));
     return ctx->sub_block_id;
 }
 
@@ -120,9 +120,9 @@ static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t* args) {
  * Range: [0, get_block_num(args)).
  * Within the same task, different blocks receive different indices.
  */
-static __aicore__ inline int32_t get_block_idx(__gm__ int64_t* args) {
-    __gm__ LocalContext* ctx =
-        reinterpret_cast<__gm__ LocalContext*>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
+static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
+    __gm__ LocalContext *ctx =
+        reinterpret_cast<__gm__ LocalContext *>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
     return ctx->block_idx;
 }
 
@@ -134,8 +134,8 @@ static __aicore__ inline int32_t get_block_idx(__gm__ int64_t* args) {
  * Note: this is NOT the same as RUNTIME_CONFIG.block_dim in
  * kernel_config.py, which controls how many physical cores are launched.
  */
-static __aicore__ inline int32_t get_block_num(__gm__ int64_t* args) {
-    __gm__ LocalContext* ctx =
-        reinterpret_cast<__gm__ LocalContext*>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
+static __aicore__ inline int32_t get_block_num(__gm__ int64_t *args) {
+    __gm__ LocalContext *ctx =
+        reinterpret_cast<__gm__ LocalContext *>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
     return ctx->block_num;
 }

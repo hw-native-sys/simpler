@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // Two-Pass Softmax Kernel (AIV) for n_blocks tiles
 //
 // Input:  sij_buf (n_blocks * M, N) fp32 — QK results stacked vertically
@@ -37,14 +47,9 @@ using namespace pto;
 
 template <int M, int N>
 static __aicore__ void softmax_prepare_n_impl(
-    __gm__ float* sij_base,
-    float scale_value,
-    __gm__ bfloat16_t* pij_base,
-    __gm__ float* mij_addr,
-    __gm__ float* lij_addr,
-    uint64_t n_blocks,
-    uint64_t valid_len_last) {
-
+    __gm__ float *sij_base, float scale_value, __gm__ bfloat16_t *pij_base, __gm__ float *mij_addr,
+    __gm__ float *lij_addr, uint64_t n_blocks, uint64_t valid_len_last
+) {
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
     constexpr int kScalarCols = 32 / sizeof(float);
     constexpr int kScalarRows = M / kScalarCols;
@@ -100,10 +105,10 @@ static __aicore__ void softmax_prepare_n_impl(
     TASSIGN(sumAccTile, 4 * kDataBytes);
     int scalarBase = 5 * kDataBytes;
     TASSIGN(localMaxDN, scalarBase);
-    TASSIGN(localMaxRow, scalarBase);                     // alias: same UB as localMaxDN
+    TASSIGN(localMaxRow, scalarBase);  // alias: same UB as localMaxDN
     TASSIGN(globalMaxDN, scalarBase + kScalarDNBytes);
-    TASSIGN(globalMaxRow, scalarBase + kScalarDNBytes);   // alias: same UB as globalMaxDN
-    TASSIGN(globalMaxND, scalarBase + kScalarDNBytes);    // alias: same UB as globalMaxDN
+    TASSIGN(globalMaxRow, scalarBase + kScalarDNBytes);  // alias: same UB as globalMaxDN
+    TASSIGN(globalMaxND, scalarBase + kScalarDNBytes);   // alias: same UB as globalMaxDN
     TASSIGN(sumDN, scalarBase + 2 * kScalarDNBytes);
     TASSIGN(pijBf16Tile, scalarBase + 3 * kScalarDNBytes);
 
@@ -234,11 +239,11 @@ static __aicore__ void softmax_prepare_n_impl(
     wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* sij_buf = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* pij_buf = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[3]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *sij_buf = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *pij_buf = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *mij = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *lij = reinterpret_cast<__gm__ Tensor *>(args[3]);
     union {
         uint64_t u;
         float f;
@@ -248,10 +253,10 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
     uint64_t n_blocks = static_cast<uint64_t>(args[5]);
     uint64_t valid_len_last = static_cast<uint64_t>(args[6]);
 
-    __gm__ float* sij_base = reinterpret_cast<__gm__ float*>(sij_buf->buffer.addr) + sij_buf->start_offset;
-    __gm__ bfloat16_t* pij_base = reinterpret_cast<__gm__ bfloat16_t*>(pij_buf->buffer.addr) + pij_buf->start_offset;
-    __gm__ float* mij_addr = reinterpret_cast<__gm__ float*>(mij->buffer.addr) + mij->start_offset;
-    __gm__ float* lij_addr = reinterpret_cast<__gm__ float*>(lij->buffer.addr) + lij->start_offset;
+    __gm__ float *sij_base = reinterpret_cast<__gm__ float *>(sij_buf->buffer.addr) + sij_buf->start_offset;
+    __gm__ bfloat16_t *pij_base = reinterpret_cast<__gm__ bfloat16_t *>(pij_buf->buffer.addr) + pij_buf->start_offset;
+    __gm__ float *mij_addr = reinterpret_cast<__gm__ float *>(mij->buffer.addr) + mij->start_offset;
+    __gm__ float *lij_addr = reinterpret_cast<__gm__ float *>(lij->buffer.addr) + lij->start_offset;
 
     uint64_t q_tile_size = static_cast<uint64_t>(sij_buf->shapes[0]);
 

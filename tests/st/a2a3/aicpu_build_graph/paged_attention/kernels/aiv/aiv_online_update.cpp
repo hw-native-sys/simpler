@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // Online Softmax Update + Normalize Kernel (AIV)
 //
 // Operates on full tiles where M=q_tile_size, N=head_dim (128):
@@ -26,22 +36,17 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void online_update_impl(__gm__ Tensor* mij,
-    __gm__ Tensor* lij,
-    __gm__ Tensor* oi_new,
-    __gm__ Tensor* mi,
-    __gm__ Tensor* li,
-    __gm__ Tensor* oi,
-    uint64_t is_first,
-    uint64_t is_last,
-    __gm__ Tensor* dst) {
-    __gm__ float* mij_ptr = reinterpret_cast<__gm__ float*>(mij->buffer.addr);
-    __gm__ float* lij_ptr = reinterpret_cast<__gm__ float*>(lij->buffer.addr);
-    __gm__ float* oi_new_ptr = reinterpret_cast<__gm__ float*>(oi_new->buffer.addr);
-    __gm__ float* mi_ptr = reinterpret_cast<__gm__ float*>(mi->buffer.addr);
-    __gm__ float* li_ptr = reinterpret_cast<__gm__ float*>(li->buffer.addr);
-    __gm__ float* oi_ptr = reinterpret_cast<__gm__ float*>(oi->buffer.addr);
-    __gm__ float* dst_ptr = reinterpret_cast<__gm__ float*>(dst->buffer.addr);
+static __aicore__ void online_update_impl(
+    __gm__ Tensor *mij, __gm__ Tensor *lij, __gm__ Tensor *oi_new, __gm__ Tensor *mi, __gm__ Tensor *li,
+    __gm__ Tensor *oi, uint64_t is_first, uint64_t is_last, __gm__ Tensor *dst
+) {
+    __gm__ float *mij_ptr = reinterpret_cast<__gm__ float *>(mij->buffer.addr);
+    __gm__ float *lij_ptr = reinterpret_cast<__gm__ float *>(lij->buffer.addr);
+    __gm__ float *oi_new_ptr = reinterpret_cast<__gm__ float *>(oi_new->buffer.addr);
+    __gm__ float *mi_ptr = reinterpret_cast<__gm__ float *>(mi->buffer.addr);
+    __gm__ float *li_ptr = reinterpret_cast<__gm__ float *>(li->buffer.addr);
+    __gm__ float *oi_ptr = reinterpret_cast<__gm__ float *>(oi->buffer.addr);
+    __gm__ float *dst_ptr = reinterpret_cast<__gm__ float *>(dst->buffer.addr);
 
     // Aligned rows for ColMajor DN tiles (32-byte alignment)
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
@@ -126,7 +131,7 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
         // Store mi = mij, li = lij, oi = oi_new
         // Alias ND tiles to the same UB as DN tiles for storing as ND format
         TileScalarND mijND, lijND;
-        TASSIGN(mijND, 2 * kDataBytes);           // alias same UB as mijDN
+        TASSIGN(mijND, 2 * kDataBytes);                   // alias same UB as mijDN
         TASSIGN(lijND, 2 * kDataBytes + kScalarDNBytes);  // alias same UB as lijDN
 
         set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
@@ -173,21 +178,21 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
         TASSIGN(liNewRow, 2 * kDataBytes + 7 * kScalarDNBytes);
         TASSIGN(tmpRow, 2 * kDataBytes + 8 * kScalarDNBytes);
 
-        TMAX(miNewRow, miRow, mijRow);        // mi_new = max(mi, mij)
+        TMAX(miNewRow, miRow, mijRow);  // mi_new = max(mi, mij)
         pipe_barrier(PIPE_V);
-        TSUB(alphaRow, miRow, miNewRow);      // alpha_exp = mi - mi_new
+        TSUB(alphaRow, miRow, miNewRow);  // alpha_exp = mi - mi_new
         pipe_barrier(PIPE_V);
-        TEXP(alphaRow, alphaRow);             // alpha = exp(mi - mi_new)
+        TEXP(alphaRow, alphaRow);  // alpha = exp(mi - mi_new)
         pipe_barrier(PIPE_V);
-        TSUB(betaRow, mijRow, miNewRow);      // beta_exp = mij - mi_new
+        TSUB(betaRow, mijRow, miNewRow);  // beta_exp = mij - mi_new
         pipe_barrier(PIPE_V);
-        TEXP(betaRow, betaRow);               // beta = exp(mij - mi_new)
+        TEXP(betaRow, betaRow);  // beta = exp(mij - mi_new)
         pipe_barrier(PIPE_V);
-        TMUL(tmpRow, alphaRow, liRow);        // alpha * li
+        TMUL(tmpRow, alphaRow, liRow);  // alpha * li
         pipe_barrier(PIPE_V);
-        TMUL(liNewRow, betaRow, lijRow);      // beta * lij
+        TMUL(liNewRow, betaRow, lijRow);  // beta * lij
         pipe_barrier(PIPE_V);
-        TADD(liNewRow, tmpRow, liNewRow);     // li_new = alpha*li + beta*lij
+        TADD(liNewRow, tmpRow, liNewRow);  // li_new = alpha*li + beta*lij
 
         // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for TROWEXPANDMUL
         TRESHAPE(alphaDN, alphaRow);
@@ -195,9 +200,9 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
 
         // Scale data tiles using row-broadcast multiply
         TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
-        TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);   // oi_new *= beta
+        TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);  // oi_new *= beta
         pipe_barrier(PIPE_V);
-        TADD(oiTile, oiTile, oiNewTile);              // oi = alpha*oi + beta*oi_new
+        TADD(oiTile, oiTile, oiNewTile);  // oi = alpha*oi + beta*oi_new
 
         // Store mi_new and li_new to GM (ND format)
         // Alias ND tiles to the same UB locations as miNewRow and liNewRow
@@ -212,15 +217,15 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
             TROWEXPANDDIV(oiTile, oiTile, liNewDN);
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            TSTORE(miGlobalND, miNewND);   // persist mi_new
-            TSTORE(liGlobalND, liNewND);   // persist li_new
+            TSTORE(miGlobalND, miNewND);  // persist mi_new
+            TSTORE(liGlobalND, liNewND);  // persist li_new
             TSTORE(dstGlobal, oiTile);
         } else {
             // Store updated accumulators
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-            TSTORE(miGlobalND, miNewND);   // persist mi_new
-            TSTORE(liGlobalND, liNewND);   // persist li_new
+            TSTORE(miGlobalND, miNewND);  // persist mi_new
+            TSTORE(liGlobalND, liNewND);  // persist li_new
             TSTORE(oiGlobal, oiTile);
         }
     }
@@ -228,14 +233,14 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
     wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* oi_new = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ Tensor* mi = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    __gm__ Tensor* li = reinterpret_cast<__gm__ Tensor*>(args[4]);
-    __gm__ Tensor* oi = reinterpret_cast<__gm__ Tensor*>(args[5]);
-    __gm__ Tensor* dst = reinterpret_cast<__gm__ Tensor*>(args[6]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *mij = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *lij = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *oi_new = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *mi = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *li = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    __gm__ Tensor *oi = reinterpret_cast<__gm__ Tensor *>(args[5]);
+    __gm__ Tensor *dst = reinterpret_cast<__gm__ Tensor *>(args[6]);
     uint64_t is_first = static_cast<uint64_t>(args[7]);
     uint64_t is_last = static_cast<uint64_t>(args[8]);
     uint64_t q_tile_size = static_cast<uint64_t>(mij->shapes[0]);

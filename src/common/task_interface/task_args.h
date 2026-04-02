@@ -46,8 +46,8 @@ template <typename TensorTag, size_t MaxT>
 struct TensorTagMixin {
     TensorTag tags_[MaxT]{};
 
-    const TensorTag& tag(int32_t i) const { return tags_[i]; }
-    TensorTag& tag(int32_t i) { return tags_[i]; }
+    const TensorTag &tag(int32_t i) const { return tags_[i]; }
+    TensorTag &tag(int32_t i) { return tags_[i]; }
 };
 
 // Dynamic vector of tags (MaxT == 0, TensorTag != void)
@@ -55,8 +55,8 @@ template <typename TensorTag>
 struct TensorTagMixin<TensorTag, 0> {
     std::vector<TensorTag> tags_;
 
-    const TensorTag& tag(int32_t i) const { return tags_[static_cast<size_t>(i)]; }
-    TensorTag& tag(int32_t i) { return tags_[static_cast<size_t>(i)]; }
+    const TensorTag &tag(int32_t i) const { return tags_[static_cast<size_t>(i)]; }
+    TensorTag &tag(int32_t i) { return tags_[static_cast<size_t>(i)]; }
 };
 
 // Empty: TensorTag == void, static (zero overhead)
@@ -78,7 +78,7 @@ struct TaskArgs : TensorTagMixin<TensorTag, MaxT> {
     int32_t tensor_count_{0};
     int32_t scalar_count_{0};
 
-    void add_tensor(const T& t) {
+    void add_tensor(const T &t) {
         if (scalar_count_ > 0) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
         if (static_cast<size_t>(tensor_count_) >= MaxT) throw std::out_of_range("TaskArgs: tensor capacity exceeded");
         tensors_[tensor_count_++] = t;
@@ -89,16 +89,16 @@ struct TaskArgs : TensorTagMixin<TensorTag, MaxT> {
         scalars_[scalar_count_++] = s;
     }
 
-    const T& tensor(int32_t i) const { return tensors_[i]; }
-    T& tensor(int32_t i) { return tensors_[i]; }
+    const T &tensor(int32_t i) const { return tensors_[i]; }
+    T &tensor(int32_t i) { return tensors_[i]; }
 
     S scalar(int32_t i) const { return scalars_[i]; }
-    S& scalar(int32_t i) { return scalars_[i]; }
+    S &scalar(int32_t i) { return scalars_[i]; }
 
-    const S* scalars() const { return scalars_; }
+    const S *scalars() const { return scalars_; }
 
-    const T* tensor_data() const { return tensors_; }
-    const S* scalar_data() const { return scalars_; }
+    const T *tensor_data() const { return tensors_; }
+    const S *scalar_data() const { return scalars_; }
 
     int32_t tensor_count() const { return tensor_count_; }
     int32_t scalar_count() const { return scalar_count_; }
@@ -118,7 +118,7 @@ struct TaskArgs<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
     std::vector<T> tensors_;
     std::vector<S> scalars_;
 
-    void add_tensor(const T& t) {
+    void add_tensor(const T &t) {
         if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
         tensors_.push_back(t);
         if constexpr (!std::is_void_v<TensorTag>) {
@@ -128,14 +128,14 @@ struct TaskArgs<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
 
     void add_scalar(S s) { scalars_.push_back(s); }
 
-    const T& tensor(int32_t i) const { return tensors_[static_cast<size_t>(i)]; }
-    T& tensor(int32_t i) { return tensors_[static_cast<size_t>(i)]; }
+    const T &tensor(int32_t i) const { return tensors_[static_cast<size_t>(i)]; }
+    T &tensor(int32_t i) { return tensors_[static_cast<size_t>(i)]; }
 
     S scalar(int32_t i) const { return scalars_[static_cast<size_t>(i)]; }
-    S& scalar(int32_t i) { return scalars_[static_cast<size_t>(i)]; }
+    S &scalar(int32_t i) { return scalars_[static_cast<size_t>(i)]; }
 
-    const T* tensor_data() const { return tensors_.data(); }
-    const S* scalar_data() const { return scalars_.data(); }
+    const T *tensor_data() const { return tensors_.data(); }
+    const S *scalar_data() const { return scalars_.data(); }
 
     int32_t tensor_count() const { return static_cast<int32_t>(tensors_.size()); }
     int32_t scalar_count() const { return static_cast<int32_t>(scalars_.size()); }

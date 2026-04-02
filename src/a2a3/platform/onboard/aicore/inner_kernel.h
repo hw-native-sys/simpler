@@ -54,14 +54,14 @@
  */
 __aicore__ inline uint64_t read_reg(RegId reg) {
     switch (reg) {
-        case RegId::DATA_MAIN_BASE: {
-            uint32_t val;
-            __asm__ volatile("MOV %0, DATA_MAIN_BASE\n" : "=l"(val));
-            return static_cast<uint64_t>(val);
-        }
-        case RegId::COND:
-        case RegId::FAST_PATH_ENABLE:
-            return 0;
+    case RegId::DATA_MAIN_BASE: {
+        uint32_t val;
+        __asm__ volatile("MOV %0, DATA_MAIN_BASE\n" : "=l"(val));
+        return static_cast<uint64_t>(val);
+    }
+    case RegId::COND:
+    case RegId::FAST_PATH_ENABLE:
+        return 0;
     }
 }
 
@@ -73,12 +73,12 @@ __aicore__ inline uint64_t read_reg(RegId reg) {
  */
 __aicore__ inline void write_reg(RegId reg, uint64_t value) {
     switch (reg) {
-        case RegId::COND:
-            set_cond(static_cast<uint32_t>(value));
-            break;
-        case RegId::DATA_MAIN_BASE:
-        case RegId::FAST_PATH_ENABLE:
-            break;
+    case RegId::COND:
+        set_cond(static_cast<uint32_t>(value));
+        break;
+    case RegId::DATA_MAIN_BASE:
+    case RegId::FAST_PATH_ENABLE:
+        break;
     }
 }
 

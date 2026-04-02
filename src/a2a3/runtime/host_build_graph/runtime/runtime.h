@@ -130,8 +130,8 @@ struct Handshake {
  * Used for copy-back during finalize.
  */
 struct TensorPair {
-    void* host_ptr;
-    void* dev_ptr;
+    void *host_ptr;
+    void *dev_ptr;
     size_t size;
 };
 
@@ -140,11 +140,11 @@ struct TensorPair {
  * Allows runtime to use pluggable device memory backends.
  */
 struct HostApi {
-    void* (*device_malloc)(size_t size);
-    void (*device_free)(void* dev_ptr);
-    int (*copy_to_device)(void* dev_ptr, const void* host_ptr, size_t size);
-    int (*copy_from_device)(void* host_ptr, const void* dev_ptr, size_t size);
-    uint64_t (*upload_kernel_binary)(int func_id, const uint8_t* bin_data, size_t bin_size);
+    void *(*device_malloc)(size_t size);
+    void (*device_free)(void *dev_ptr);
+    int (*copy_to_device)(void *dev_ptr, const void *host_ptr, size_t size);
+    int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
+    uint64_t (*upload_kernel_binary)(int func_id, const uint8_t *bin_data, size_t bin_size);
     void (*remove_kernel_binary)(int func_id);
 };
 
@@ -193,7 +193,7 @@ typedef struct {
  * Dependencies are managed manually via add_successor().
  */
 class Runtime {
- public:
+public:
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
@@ -209,7 +209,7 @@ class Runtime {
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
 
- private:
+private:
     int next_task_id;  // Next available task ID
 
     // Initial ready tasks (computed once, read-only after)
@@ -227,7 +227,7 @@ class Runtime {
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
 
- public:
+public:
     /**
      * Constructor - zero-initialize all arrays
      */
@@ -246,7 +246,7 @@ class Runtime {
      * @param core_type Core type for this task (CoreType::AIC or CoreType::AIV)
      * @return Task ID (>= 0) on success, -1 on failure
      */
-    int add_task(uint64_t* args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
+    int add_task(uint64_t *args, int num_args, int func_id, CoreType core_type = CoreType::AIC);
 
     /**
      * Add a dependency edge: from_task -> to_task
@@ -269,7 +269,7 @@ class Runtime {
      * @param task_id  Task ID to query
      * @return Pointer to task, or nullptr if invalid ID
      */
-    Task* get_task(int task_id);
+    Task *get_task(int task_id);
 
     /**
      * Get the total number of tasks in the runtime
@@ -289,7 +289,7 @@ class Runtime {
      * nullptr)
      * @return Number of initially ready tasks
      */
-    int get_initial_ready_tasks(int* ready_tasks);
+    int get_initial_ready_tasks(int *ready_tasks);
 
     // =========================================================================
     // Utility Methods
@@ -313,14 +313,14 @@ class Runtime {
      * @param dev_ptr   Device memory pointer (source for copy-back)
      * @param size     Size of tensor in bytes
      */
-    void record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size);
+    void record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size);
 
     /**
      * Get pointer to tensor pairs array.
      *
      * @return Pointer to tensor pairs array
      */
-    TensorPair* get_tensor_pairs();
+    TensorPair *get_tensor_pairs();
 
     /**
      * Get number of recorded tensor pairs.
@@ -342,7 +342,7 @@ class Runtime {
      * Set PTO2 shared memory pointer (stub for host_build_graph).
      * This is a no-op for host orchestration; only used by rt2.
      */
-    void set_pto2_gm_sm_ptr(void*) { /* no-op */ }
+    void set_pto2_gm_sm_ptr(void *) { /* no-op */ }
 
     /**
      * Get function binary address by func_id.

@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * @file core_type.h
  * @brief Core type enumeration and utilities for AICore platform
@@ -32,7 +42,7 @@ enum class CoreType : int32_t {
  * @param type_str  String representation ("aic" or "aiv", case-insensitive)
  * @return Core type enum value, or CoreType::AIC if invalid
  */
-inline CoreType core_type_from_string(const char* type_str) {
+inline CoreType core_type_from_string(const char *type_str) {
     if (type_str == nullptr) {
         return CoreType::AIC;
     }
@@ -51,11 +61,14 @@ inline CoreType core_type_from_string(const char* type_str) {
  * @param core_type  Core type enum value
  * @return String representation ("AIC", "AIV", or "UNKNOWN")
  */
-inline const char* core_type_to_string(CoreType core_type) {
+inline const char *core_type_to_string(CoreType core_type) {
     switch (core_type) {
-        case CoreType::AIC: return "AIC";
-        case CoreType::AIV: return "AIV";
-        default: return "UNKNOWN";
+    case CoreType::AIC:
+        return "AIC";
+    case CoreType::AIV:
+        return "AIV";
+    default:
+        return "UNKNOWN";
     }
 }
 

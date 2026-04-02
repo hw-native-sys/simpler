@@ -28,7 +28,7 @@
 
 extern "C" {
 
-int build_example_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
+int build_example_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
     // Validate argument count
     // Expected orch_args: [a, b, f] — 3 tensors
     if (orch_args.tensor_count() < 3) {
@@ -37,9 +37,9 @@ int build_example_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) 
     }
 
     // Extract host pointers, sizes, and element count from tensor metadata
-    void* host_a = orch_args.tensor(0).data_as<void>();
-    void* host_b = orch_args.tensor(1).data_as<void>();
-    void* host_f = orch_args.tensor(2).data_as<void>();
+    void *host_a = orch_args.tensor(0).data_as<void>();
+    void *host_b = orch_args.tensor(1).data_as<void>();
+    void *host_f = orch_args.tensor(2).data_as<void>();
     size_t size_a = orch_args.tensor(0).nbytes();
     size_t size_b = orch_args.tensor(1).nbytes();
     size_t size_f = orch_args.tensor(2).nbytes();
@@ -52,7 +52,7 @@ int build_example_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) 
     // Allocate device memory and copy inputs
     std::cout << "\n=== Allocating Device Memory ===" << '\n';
 
-    void* dev_a = runtime->host_api.device_malloc(size_a);
+    void *dev_a = runtime->host_api.device_malloc(size_a);
     if (!dev_a) {
         std::cerr << "Error: Failed to allocate device memory for a\n";
         return -1;
@@ -60,7 +60,7 @@ int build_example_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) 
     runtime->host_api.copy_to_device(dev_a, host_a, size_a);
     std::cout << "Tensor a: " << size_a << " bytes copied to device\n";
 
-    void* dev_b = runtime->host_api.device_malloc(size_b);
+    void *dev_b = runtime->host_api.device_malloc(size_b);
     if (!dev_b) {
         std::cerr << "Error: Failed to allocate device memory for b\n";
         runtime->host_api.device_free(dev_a);
@@ -69,7 +69,7 @@ int build_example_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) 
     runtime->host_api.copy_to_device(dev_b, host_b, size_b);
     std::cout << "Tensor b: " << size_b << " bytes copied to device\n";
 
-    void* dev_f = runtime->host_api.device_malloc(size_f);
+    void *dev_f = runtime->host_api.device_malloc(size_f);
     if (!dev_f) {
         std::cerr << "Error: Failed to allocate device memory for f\n";
         runtime->host_api.device_free(dev_a);
@@ -82,9 +82,9 @@ int build_example_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) 
 
     // Allocate intermediate tensors (c, d, e)
     size_t BYTES = SIZE * sizeof(float);
-    void* dev_c = runtime->host_api.device_malloc(BYTES);
-    void* dev_d = runtime->host_api.device_malloc(BYTES);
-    void* dev_e = runtime->host_api.device_malloc(BYTES);
+    void *dev_c = runtime->host_api.device_malloc(BYTES);
+    void *dev_d = runtime->host_api.device_malloc(BYTES);
+    void *dev_e = runtime->host_api.device_malloc(BYTES);
 
     if (!dev_c || !dev_d || !dev_e) {
         std::cerr << "Error: Failed to allocate intermediate tensors\n";

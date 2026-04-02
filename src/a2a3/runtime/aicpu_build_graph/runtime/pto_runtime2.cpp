@@ -37,21 +37,21 @@ void pto2_set_orch_thread_idx(int idx) { pto2_current_orch_idx = idx; }
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================
 
-static SubmitResult submit_task_impl(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const Arg& args) {
+static SubmitResult submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
     return pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels, args);
 }
 
-static void add_dependency_impl(PTO2Runtime* rt, PTO2TaskId producer, PTO2TaskId consumer) {
+static void add_dependency_impl(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer) {
     pto2_add_dependency(&rt->orchestrators[pto2_current_orch_idx], producer, consumer);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime* rt) { pto2_scope_begin(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrators[pto2_current_orch_idx]); }
 
-void pto2_rt_scope_end(PTO2Runtime* rt) { pto2_scope_end(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrators[pto2_current_orch_idx]); }
 
-void pto2_rt_orchestration_done(PTO2Runtime* rt) { pto2_orchestrator_done(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrators[pto2_current_orch_idx]); }
 
-static bool is_fatal_impl(PTO2Runtime* rt) { return rt->orchestrators[pto2_current_orch_idx].fatal; }
+static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[pto2_current_orch_idx].fatal; }
 
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
@@ -71,14 +71,15 @@ static const PTO2RuntimeOps s_runtime_ops = {
 // Runtime Creation and Destruction
 // =============================================================================
 
-PTO2Runtime* pto2_runtime_create(PTO2RuntimeMode mode) {
+PTO2Runtime *pto2_runtime_create(PTO2RuntimeMode mode) {
     return pto2_runtime_create_custom(mode, PTO2_TASK_WINDOW_SIZE, PTO2_HEAP_SIZE);
 }
 
-PTO2Runtime* pto2_runtime_create_custom(
-    PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity) {
+PTO2Runtime *pto2_runtime_create_custom(
+    PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity
+) {
     // Allocate runtime context
-    PTO2Runtime* rt = reinterpret_cast<PTO2Runtime*>(calloc(1, sizeof(PTO2Runtime)));
+    PTO2Runtime *rt = reinterpret_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
     if (!rt) {
         return NULL;
     }
@@ -134,17 +135,15 @@ PTO2Runtime* pto2_runtime_create_custom(
     return rt;
 }
 
-PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
-    PTO2SharedMemoryHandle* sm_handle,
-    void* gm_heap,
-    uint64_t heap_size,
-    int orch_count,
-    int32_t dep_pool_capacity) {
+PTO2Runtime *pto2_runtime_create_from_sm(
+    PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size, int orch_count,
+    int32_t dep_pool_capacity
+) {
     if (!sm_handle) return NULL;
     if (orch_count < 1) orch_count = 1;
     if (orch_count > PTO2_MAX_ORCH_THREADS) orch_count = PTO2_MAX_ORCH_THREADS;
 
-    PTO2Runtime* rt = reinterpret_cast<PTO2Runtime*>(calloc(1, sizeof(PTO2Runtime)));
+    PTO2Runtime *rt = reinterpret_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
     if (!rt) return NULL;
 
     rt->ops = &s_runtime_ops;
@@ -183,7 +182,7 @@ PTO2Runtime* pto2_runtime_create_from_sm(PTO2RuntimeMode mode,
     return rt;
 }
 
-void pto2_runtime_destroy(PTO2Runtime* rt) {
+void pto2_runtime_destroy(PTO2Runtime *rt) {
     if (!rt) return;
 
     pto2_scheduler_destroy(&rt->scheduler);
@@ -202,7 +201,7 @@ void pto2_runtime_destroy(PTO2Runtime* rt) {
     free(rt);
 }
 
-void pto2_runtime_set_mode(PTO2Runtime* rt, PTO2RuntimeMode mode) {
+void pto2_runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode) {
     if (rt) {
         rt->mode = mode;
     }

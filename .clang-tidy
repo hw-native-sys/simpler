@@ -12,7 +12,32 @@ Checks: >
   bugprone-*,
   performance-*,
   modernize-*,
-  -modernize-use-trailing-return-type
+  -modernize-use-trailing-return-type,
+  -modernize-avoid-c-arrays,
+  -modernize-use-nodiscard,
+  -modernize-macro-to-enum,
+  -modernize-deprecated-headers,
+  -modernize-use-auto,
+  -modernize-use-nullptr,
+  -modernize-use-using,
+  -modernize-loop-convert,
+  -modernize-use-default-member-init,
+  -modernize-use-equals-delete,
+  -modernize-use-bool-literals,
+  -modernize-raw-string-literal,
+  -bugprone-easily-swappable-parameters,
+  -bugprone-narrowing-conversions,
+  -bugprone-reserved-identifier,
+  -bugprone-implicit-widening-of-multiplication-result,
+  -bugprone-multi-level-implicit-pointer-conversion,
+  -bugprone-branch-clone,
+  -bugprone-empty-catch,
+  -bugprone-lambda-function-name,
+  -bugprone-macro-parentheses,
+  -bugprone-infinite-loop,
+  -bugprone-argument-comment,
+  -performance-no-int-to-ptr,
+  -performance-enum-size
 
 WarningsAsErrors: '*'
 

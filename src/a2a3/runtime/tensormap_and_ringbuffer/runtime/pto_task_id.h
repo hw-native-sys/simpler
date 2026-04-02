@@ -43,8 +43,8 @@ struct PTO2TaskId {
     constexpr uint32_t local() const { return static_cast<uint32_t>(raw & 0xFFFFFFFFu); }
     constexpr bool is_valid() const { return raw != UINT64_MAX; }
 
-    constexpr bool operator==(const PTO2TaskId& other) const { return raw == other.raw; }
-    constexpr bool operator!=(const PTO2TaskId& other) const { return raw != other.raw; }
+    constexpr bool operator==(const PTO2TaskId &other) const { return raw == other.raw; }
+    constexpr bool operator!=(const PTO2TaskId &other) const { return raw != other.raw; }
 };
 
 static_assert(sizeof(PTO2TaskId) == 8, "PTO2TaskId must stay 8 bytes (shared memory ABI)");

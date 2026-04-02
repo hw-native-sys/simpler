@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * @file device_log.cpp
  * @brief Simulation Platform Log Implementation
@@ -26,7 +36,7 @@ bool g_is_log_enable_error = true;
 // Platform Constant
 // =============================================================================
 
-const char* TILE_FWK_DEVICE_MACHINE = "SIM_CPU";
+const char *TILE_FWK_DEVICE_MACHINE = "SIM_CPU";
 
 // =============================================================================
 // Log Initialization (Read from PTO_LOG_LEVEL environment variable)
@@ -34,18 +44,18 @@ const char* TILE_FWK_DEVICE_MACHINE = "SIM_CPU";
 
 void init_log_switch() {
     // Read PTO_LOG_LEVEL environment variable
-    const char* level_str = std::getenv("PTO_LOG_LEVEL");
-    
+    const char *level_str = std::getenv("PTO_LOG_LEVEL");
+
     if (level_str != nullptr) {
         // Convert to lowercase for comparison
         char level[64];
         strncpy(level, level_str, sizeof(level) - 1);
         level[sizeof(level) - 1] = '\0';
-        
-        for (char* p = level; *p; ++p) {
+
+        for (char *p = level; *p; ++p) {
             *p = tolower(*p);
         }
-        
+
         // Parse log level
         if (strcmp(level, "silent") == 0 || strcmp(level, "error") == 0) {
             // Silent/Error: only errors
@@ -85,7 +95,7 @@ void init_log_switch() {
 // Platform-Specific Logging Functions (Simulation: use printf)
 // =============================================================================
 
-void dev_log_debug(const char* func, const char* fmt, ...) {
+void dev_log_debug(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     printf("[DEBUG] %s: ", func);
@@ -94,7 +104,7 @@ void dev_log_debug(const char* func, const char* fmt, ...) {
     va_end(args);
 }
 
-void dev_log_info(const char* func, const char* fmt, ...) {
+void dev_log_info(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     printf("[INFO] %s: ", func);
@@ -103,7 +113,7 @@ void dev_log_info(const char* func, const char* fmt, ...) {
     va_end(args);
 }
 
-void dev_log_warn(const char* func, const char* fmt, ...) {
+void dev_log_warn(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     printf("[WARN] %s: ", func);
@@ -112,7 +122,7 @@ void dev_log_warn(const char* func, const char* fmt, ...) {
     va_end(args);
 }
 
-void dev_log_error(const char* func, const char* fmt, ...) {
+void dev_log_error(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     printf("[ERROR] %s: ", func);
@@ -121,7 +131,7 @@ void dev_log_error(const char* func, const char* fmt, ...) {
     va_end(args);
 }
 
-void dev_log_always(const char* func, const char* fmt, ...) {
+void dev_log_always(const char *func, const char *fmt, ...) {
     va_list args;
     va_start(args, fmt);
     printf("[ALWAYS] %s: ", func);

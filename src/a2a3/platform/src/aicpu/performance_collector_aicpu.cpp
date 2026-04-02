@@ -28,15 +28,15 @@
 #include "common/unified_log.h"
 
 // Cached pointers for hot-path access (set during init)
-static AicpuPhaseHeader* s_phase_header = nullptr;
-static PerfDataHeader* s_perf_header = nullptr;
+static AicpuPhaseHeader *s_phase_header = nullptr;
+static PerfDataHeader *s_perf_header = nullptr;
 
 // Per-core PerfBufferState cache
-static PerfBufferState* s_perf_buffer_states[PLATFORM_MAX_CORES] = {};
+static PerfBufferState *s_perf_buffer_states[PLATFORM_MAX_CORES] = {};
 
 // Per-thread PhaseBufferState cache
-static PhaseBufferState* s_phase_buffer_states[PLATFORM_MAX_AICPU_THREADS] = {};
-static PhaseBuffer* s_current_phase_buf[PLATFORM_MAX_AICPU_THREADS] = {};
+static PhaseBufferState *s_phase_buffer_states[PLATFORM_MAX_AICPU_THREADS] = {};
+static PhaseBuffer *s_current_phase_buf[PLATFORM_MAX_AICPU_THREADS] = {};
 
 static __thread int s_orch_thread_idx = -1;
 
@@ -51,12 +51,10 @@ static __thread int s_orch_thread_idx = -1;
  * @param is_phase 0 = PerfRecord, 1 = Phase
  * @return 0 on success, -1 if queue full
  */
-static int enqueue_ready_buffer(PerfDataHeader* header,
-    int thread_idx,
-    uint32_t core_index,
-    uint64_t buffer_ptr,
-    uint32_t buffer_seq,
-    uint32_t is_phase) {
+static int enqueue_ready_buffer(
+    PerfDataHeader *header, int thread_idx, uint32_t core_index, uint64_t buffer_ptr, uint32_t buffer_seq,
+    uint32_t is_phase
+) {
     uint32_t capacity = PLATFORM_PROF_READYQUEUE_SIZE;
     uint32_t current_tail = header->queue_tails[thread_idx];
     uint32_t current_head = header->queue_heads[thread_idx];
@@ -76,8 +74,8 @@ static int enqueue_ready_buffer(PerfDataHeader* header,
     return 0;
 }
 
-void perf_aicpu_init_profiling(Runtime* runtime) {
-    void* perf_base = reinterpret_cast<void*>(runtime->perf_data_base);
+void perf_aicpu_init_profiling(Runtime *runtime) {
+    void *perf_base = reinterpret_cast<void *>(runtime->perf_data_base);
     if (perf_base == nullptr) {
         LOG_ERROR("perf_data_base is NULL, cannot initialize profiling");
         return;
@@ -92,8 +90,8 @@ void perf_aicpu_init_profiling(Runtime* runtime) {
 
     // Pop first buffer from free_queue for each core
     for (int i = 0; i < runtime->worker_count; i++) {
-        Handshake* h = &runtime->workers[i];
-        PerfBufferState* state = get_perf_buffer_state(perf_base, i);
+        Handshake *h = &runtime->workers[i];
+        PerfBufferState *state = get_perf_buffer_state(perf_base, i);
 
         s_perf_buffer_states[i] = state;
 
@@ -110,7 +108,7 @@ void perf_aicpu_init_profiling(Runtime* runtime) {
             state->current_buf_seq = 0;
             wmb();
 
-            PerfBuffer* buf = reinterpret_cast<PerfBuffer*>(buf_ptr);
+            PerfBuffer *buf = reinterpret_cast<PerfBuffer *>(buf_ptr);
             buf->count = 0;
             h->perf_records_addr = buf_ptr;
 
@@ -127,20 +125,15 @@ void perf_aicpu_init_profiling(Runtime* runtime) {
     LOG_INFO("Performance profiling initialized for %d cores", runtime->worker_count);
 }
 
-int perf_aicpu_complete_record(PerfBuffer* perf_buf,
-    uint32_t expected_reg_task_id,
-    uint64_t task_id,
-    uint32_t func_id,
-    CoreType core_type,
-    uint64_t dispatch_time,
-    uint64_t finish_time,
-    const uint64_t* fanout,
-    int32_t fanout_count) {
+int perf_aicpu_complete_record(
+    PerfBuffer *perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
+    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
+) {
     rmb();
     uint32_t count = perf_buf->count;
     if (count >= PLATFORM_PROF_BUFFER_SIZE) return -1;
 
-    PerfRecord* record = &perf_buf->records[count];
+    PerfRecord *record = &perf_buf->records[count];
     if (static_cast<uint32_t>(record->task_id) != expected_reg_task_id) return -1;
 
     record->task_id = task_id;
@@ -164,18 +157,18 @@ int perf_aicpu_complete_record(PerfBuffer* perf_buf,
     return 0;
 }
 
-void perf_aicpu_switch_buffer(Runtime* runtime, int core_id, int thread_idx) {
-    void* perf_base = reinterpret_cast<void*>(runtime->perf_data_base);
+void perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx) {
+    void *perf_base = reinterpret_cast<void *>(runtime->perf_data_base);
     if (perf_base == nullptr) {
         return;
     }
 
-    PerfBufferState* state = s_perf_buffer_states[core_id];
+    PerfBufferState *state = s_perf_buffer_states[core_id];
     if (state == nullptr) {
         return;
     }
 
-    PerfBuffer* full_buf = reinterpret_cast<PerfBuffer*>(state->current_buf_ptr);
+    PerfBuffer *full_buf = reinterpret_cast<PerfBuffer *>(state->current_buf_ptr);
     if (full_buf == nullptr) {
         return;
     }
@@ -214,23 +207,23 @@ void perf_aicpu_switch_buffer(Runtime* runtime, int core_id, int thread_idx) {
     state->current_buf_seq = seq + 1;
     wmb();
 
-    PerfBuffer* new_buf = reinterpret_cast<PerfBuffer*>(new_buf_ptr);
+    PerfBuffer *new_buf = reinterpret_cast<PerfBuffer *>(new_buf_ptr);
     new_buf->count = 0;
 
     // Update handshake for AICore
-    Handshake* h = &runtime->workers[core_id];
+    Handshake *h = &runtime->workers[core_id];
     h->perf_records_addr = new_buf_ptr;
     wmb();
 
     LOG_INFO("Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
 
-void perf_aicpu_flush_buffers(Runtime* runtime, int thread_idx, const int* cur_thread_cores, int core_num) {
+void perf_aicpu_flush_buffers(Runtime *runtime, int thread_idx, const int *cur_thread_cores, int core_num) {
     if (!runtime->enable_profiling) {
         return;
     }
 
-    void* perf_base = reinterpret_cast<void*>(runtime->perf_data_base);
+    void *perf_base = reinterpret_cast<void *>(runtime->perf_data_base);
     if (perf_base == nullptr) {
         return;
     }
@@ -243,7 +236,7 @@ void perf_aicpu_flush_buffers(Runtime* runtime, int thread_idx, const int* cur_t
 
     for (int i = 0; i < core_num; i++) {
         int core_id = cur_thread_cores[i];
-        PerfBufferState* state = s_perf_buffer_states[core_id];
+        PerfBufferState *state = s_perf_buffer_states[core_id];
         if (state == nullptr) continue;
 
         rmb();
@@ -253,7 +246,7 @@ void perf_aicpu_flush_buffers(Runtime* runtime, int thread_idx, const int* cur_t
             continue;
         }
 
-        PerfBuffer* buf = reinterpret_cast<PerfBuffer*>(buf_ptr);
+        PerfBuffer *buf = reinterpret_cast<PerfBuffer *>(buf_ptr);
         if (buf->count == 0) {
             continue;
         }
@@ -275,19 +268,19 @@ void perf_aicpu_flush_buffers(Runtime* runtime, int thread_idx, const int* cur_t
     LOG_INFO("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
-void perf_aicpu_update_total_tasks(Runtime* runtime, uint32_t total_tasks) {
-    void* perf_base = reinterpret_cast<void*>(runtime->perf_data_base);
+void perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks) {
+    void *perf_base = reinterpret_cast<void *>(runtime->perf_data_base);
     if (perf_base == nullptr) {
         return;
     }
 
-    PerfDataHeader* header = get_perf_header(perf_base);
+    PerfDataHeader *header = get_perf_header(perf_base);
     header->total_tasks = total_tasks;
     wmb();
 }
 
-void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, int num_orch_threads) {
-    void* perf_base = reinterpret_cast<void*>(runtime->perf_data_base);
+void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads, int num_orch_threads) {
+    void *perf_base = reinterpret_cast<void *>(runtime->perf_data_base);
     if (perf_base == nullptr) {
         LOG_ERROR("perf_data_base is NULL, cannot initialize phase profiling");
         return;
@@ -311,7 +304,7 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, in
         total_threads = PLATFORM_MAX_AICPU_THREADS;
     }
     for (int t = 0; t < total_threads; t++) {
-        PhaseBufferState* state = get_phase_buffer_state(perf_base, runtime->worker_count, t);
+        PhaseBufferState *state = get_phase_buffer_state(perf_base, runtime->worker_count, t);
 
         s_phase_buffer_states[t] = state;
 
@@ -328,7 +321,7 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, in
             state->current_buf_seq = 0;
             wmb();
 
-            PhaseBuffer* buf = reinterpret_cast<PhaseBuffer*>(buf_ptr);
+            PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(buf_ptr);
             buf->count = 0;
             s_current_phase_buf[t] = buf;
 
@@ -348,10 +341,10 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, in
 
     wmb();
 
-    LOG_INFO("Phase profiling initialized: %d scheduler + %d orch threads, %d records/thread",
-        num_sched_threads,
-        num_orch_threads,
-        PLATFORM_PHASE_RECORDS_PER_THREAD);
+    LOG_INFO(
+        "Phase profiling initialized: %d scheduler + %d orch threads, %d records/thread", num_sched_threads,
+        num_orch_threads, PLATFORM_PHASE_RECORDS_PER_THREAD
+    );
 }
 
 /**
@@ -362,10 +355,10 @@ void perf_aicpu_init_phase_profiling(Runtime* runtime, int num_sched_threads, in
  * records are dropped (preserving already-enqueued data).
  */
 static void switch_phase_buffer(int thread_idx) {
-    PhaseBufferState* state = s_phase_buffer_states[thread_idx];
+    PhaseBufferState *state = s_phase_buffer_states[thread_idx];
     if (state == nullptr) return;
 
-    PhaseBuffer* full_buf = s_current_phase_buf[thread_idx];
+    PhaseBuffer *full_buf = s_current_phase_buf[thread_idx];
     if (full_buf == nullptr) return;
 
     LOG_INFO("Thread %d: phase buffer is full (count=%u)", thread_idx, full_buf->count);
@@ -393,7 +386,7 @@ static void switch_phase_buffer(int thread_idx) {
         state->current_buf_seq = seq + 1;
         wmb();
 
-        PhaseBuffer* new_buf = reinterpret_cast<PhaseBuffer*>(new_buf_ptr);
+        PhaseBuffer *new_buf = reinterpret_cast<PhaseBuffer *>(new_buf_ptr);
         new_buf->count = 0;
         s_current_phase_buf[thread_idx] = new_buf;
 
@@ -407,21 +400,19 @@ static void switch_phase_buffer(int thread_idx) {
     }
 }
 
-void perf_aicpu_record_phase(int thread_idx,
-    AicpuPhaseId phase_id,
-    uint64_t start_time,
-    uint64_t end_time,
-    uint32_t loop_iter,
-    uint64_t tasks_processed) {
+void perf_aicpu_record_phase(
+    int thread_idx, AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
+    uint64_t tasks_processed
+) {
     if (s_phase_header == nullptr) {
         return;
     }
 
-    PhaseBuffer* buf = s_current_phase_buf[thread_idx];
+    PhaseBuffer *buf = s_current_phase_buf[thread_idx];
 
     // Try to recover from nullptr (no buffer was available on previous switch)
     if (buf == nullptr) {
-        PhaseBufferState* state = s_phase_buffer_states[thread_idx];
+        PhaseBufferState *state = s_phase_buffer_states[thread_idx];
         if (state == nullptr) return;
 
         rmb();
@@ -436,7 +427,7 @@ void perf_aicpu_record_phase(int thread_idx,
             state->current_buf_seq = state->current_buf_seq + 1;
             wmb();
 
-            buf = reinterpret_cast<PhaseBuffer*>(buf_ptr);
+            buf = reinterpret_cast<PhaseBuffer *>(buf_ptr);
             buf->count = 0;
             s_current_phase_buf[thread_idx] = buf;
 
@@ -458,7 +449,7 @@ void perf_aicpu_record_phase(int thread_idx,
         }
     }
 
-    AicpuPhaseRecord* record = &buf->records[idx];
+    AicpuPhaseRecord *record = &buf->records[idx];
     record->start_time = start_time;
     record->end_time = end_time;
     record->loop_iter = loop_iter;
@@ -468,12 +459,12 @@ void perf_aicpu_record_phase(int thread_idx,
     buf->count = idx + 1;
 }
 
-void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src) {
+void perf_aicpu_write_orch_summary(const AicpuOrchSummary *src) {
     if (s_phase_header == nullptr) {
         return;
     }
 
-    AicpuOrchSummary* dst = &s_phase_header->orch_summary;
+    AicpuOrchSummary *dst = &s_phase_header->orch_summary;
 
     memcpy(dst, src, sizeof(AicpuOrchSummary));
     dst->magic = AICPU_PHASE_MAGIC;
@@ -481,15 +472,17 @@ void perf_aicpu_write_orch_summary(const AicpuOrchSummary* src) {
 
     wmb();
 
-    LOG_INFO("Orchestrator summary written: %" PRId64 " tasks, %.3fus",
-        static_cast<int64_t>(src->submit_count),
-        cycles_to_us(src->end_time - src->start_time));
+    LOG_INFO(
+        "Orchestrator summary written: %" PRId64 " tasks, %.3fus", static_cast<int64_t>(src->submit_count),
+        cycles_to_us(src->end_time - src->start_time)
+    );
 }
 
 void perf_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
 
 void perf_aicpu_record_orch_phase(
-    AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id) {
+    AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id
+) {
     if (s_orch_thread_idx < 0 || s_phase_header == nullptr) return;
     perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
 }
@@ -499,7 +492,7 @@ void perf_aicpu_flush_phase_buffers(int thread_idx) {
         return;
     }
 
-    PhaseBufferState* state = s_phase_buffer_states[thread_idx];
+    PhaseBufferState *state = s_phase_buffer_states[thread_idx];
     if (state == nullptr) return;
 
     rmb();
@@ -509,7 +502,7 @@ void perf_aicpu_flush_phase_buffers(int thread_idx) {
         return;
     }
 
-    PhaseBuffer* buf = reinterpret_cast<PhaseBuffer*>(buf_ptr);
+    PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(buf_ptr);
     if (buf->count == 0) {
         return;
     }
@@ -528,10 +521,10 @@ void perf_aicpu_flush_phase_buffers(int thread_idx) {
     wmb();
 }
 
-void perf_aicpu_write_core_assignments(const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD],
-    const int* core_counts,
-    int num_threads,
-    int total_cores) {
+void perf_aicpu_write_core_assignments(
+    const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD], const int *core_counts, int num_threads,
+    int total_cores
+) {
     if (s_phase_header == nullptr) {
         return;
     }

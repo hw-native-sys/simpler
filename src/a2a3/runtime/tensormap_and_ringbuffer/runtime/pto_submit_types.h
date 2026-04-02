@@ -92,7 +92,7 @@ static inline PTO2ResourceShape pto2_active_mask_to_shape(uint8_t active_mask) {
 /**
  * Compute active_mask from MixedKernels.
  */
-static inline uint8_t pto2_mixed_kernels_to_active_mask(const MixedKernels& mk) {
+static inline uint8_t pto2_mixed_kernels_to_active_mask(const MixedKernels &mk) {
     uint8_t mask = 0;
     if (mk.aic_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIC;
     if (mk.aiv0_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIV0;
@@ -108,12 +108,12 @@ static inline uint8_t pto2_mixed_kernels_to_active_mask(const MixedKernels& mk) 
  * block_idx in [0, block_num) via the per-dispatch LocalContext.
  */
 class PTO2LaunchSpec {
- public:
+public:
     constexpr PTO2LaunchSpec() = default;
 
     int16_t block_num() const { return block_num_; }
     void set_block_num(int16_t n) { block_num_ = n; }
 
- private:
+private:
     int16_t block_num_{1};
 };

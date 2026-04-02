@@ -39,16 +39,16 @@ static constexpr uint64_t ADD_ELEMS = 128 * 128;
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const ChipStorageTaskArgs& orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 11,
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
     // Tensor args
     Tensor ext_A = from_tensor_arg(orch_args.tensor(0));
     Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
@@ -65,12 +65,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
     int add_batch = static_cast<int>(orch_args.scalar(4));
 
     LOG_ALWAYS("[alternating_orch] thread num: %d, idx: %d", orch_thread_num, orch_thread_index);
-    LOG_INFO("[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d",
-        batch,
-        M,
-        N,
-        matmul_batch,
-        add_batch);
+    LOG_INFO(
+        "[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d", batch, M, N, matmul_batch,
+        add_batch
+    );
 
     int total_matmul_tasks = batch * M;
     int total_add_tasks = batch * N;

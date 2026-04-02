@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * PTO Runtime2 - Ring Buffer Implementation
  *
@@ -17,7 +27,7 @@
 // =============================================================================
 // Dependency List Pool Implementation
 // =============================================================================
-void PTO2DepListPool::reclaim(PTO2SchedulerState& sched, uint8_t ring_id, int32_t sm_last_task_alive) {
+void PTO2DepListPool::reclaim(PTO2SchedulerState &sched, uint8_t ring_id, int32_t sm_last_task_alive) {
     if (sm_last_task_alive >= last_reclaimed + PTO2_DEP_POOL_CLEANUP_INTERVAL && sm_last_task_alive > 0) {
         int32_t mark = sched.ring_sched_states[ring_id].get_slot_state_by_task_id(sm_last_task_alive - 1).dep_pool_mark;
         if (mark > 0) {
@@ -28,7 +38,8 @@ void PTO2DepListPool::reclaim(PTO2SchedulerState& sched, uint8_t ring_id, int32_
 }
 
 void PTO2DepListPool::ensure_space(
-    PTO2SchedulerState& sched, PTO2RingFlowControl& fc, uint8_t ring_id, int32_t needed) {
+    PTO2SchedulerState &sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed
+) {
     if (available() >= needed) return;
 
     int spin_count = 0;
@@ -52,10 +63,10 @@ void PTO2DepListPool::ensure_space(
             LOG_ERROR("FATAL: Dependency Pool Deadlock Detected! (ring %d)", ring_id);
             LOG_ERROR("========================================");
             LOG_ERROR("DepListPool cannot reclaim space after %d spins (no progress).", spin_count);
-            LOG_ERROR("  - Pool used:     %d / %d (%.1f%%)",
-                used(),
-                capacity,
-                (capacity > 0) ? (100.0 * used() / capacity) : 0.0);
+            LOG_ERROR(
+                "  - Pool used:     %d / %d (%.1f%%)", used(), capacity,
+                (capacity > 0) ? (100.0 * used() / capacity) : 0.0
+            );
             LOG_ERROR("  - Pool top:      %d (linear)", top);
             LOG_ERROR("  - Pool tail:     %d (linear)", tail);
             LOG_ERROR("  - High water:    %d", high_water);

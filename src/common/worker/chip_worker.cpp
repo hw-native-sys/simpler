@@ -19,10 +19,10 @@
 namespace {
 
 template <typename T>
-T load_symbol(void* handle, const char* name) {
+T load_symbol(void *handle, const char *name) {
     dlerror();  // clear any existing error
-    void* sym = dlsym(handle, name);
-    const char* err = dlerror();
+    void *sym = dlsym(handle, name);
+    const char *err = dlerror();
     if (err) {
         std::string msg = "dlsym failed for '";
         msg += name;
@@ -37,21 +37,19 @@ T load_symbol(void* handle, const char* name) {
 
 ChipWorker::~ChipWorker() { reset(); }
 
-void ChipWorker::init(int device_id,
-    const std::string& host_lib_path,
-    const uint8_t* aicpu_binary,
-    size_t aicpu_size,
-    const uint8_t* aicore_binary,
-    size_t aicore_size) {
+void ChipWorker::init(
+    int device_id, const std::string &host_lib_path, const uint8_t *aicpu_binary, size_t aicpu_size,
+    const uint8_t *aicore_binary, size_t aicore_size
+) {
     if (initialized_) {
         throw std::runtime_error("ChipWorker already initialized; call reset() first");
     }
 
     // Load the host runtime shared library
-    void* handle = dlopen(host_lib_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    void *handle = dlopen(host_lib_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
         std::string err = "dlopen failed: ";
-        const char* msg = dlerror();
+        const char *msg = dlerror();
         err += msg ? msg : "unknown error";
         throw std::runtime_error(err);
     }
@@ -106,12 +104,12 @@ void ChipWorker::reset() {
     initialized_ = false;
 }
 
-void ChipWorker::run(const void* callable, const void* args, const CallConfig& config) {
+void ChipWorker::run(const void *callable, const void *args, const CallConfig &config) {
     if (!initialized_) {
         throw std::runtime_error("ChipWorker not initialized; call init() first");
     }
 
-    void* rt = runtime_buf_.data();
+    void *rt = runtime_buf_.data();
 
     // 1. Placement new + build graph
     int rc = init_runtime_fn_(rt, callable, args);
@@ -128,15 +126,10 @@ void ChipWorker::run(const void* callable, const void* args, const CallConfig& c
     }
 
     // 3. Launch
-    rc = launch_runtime_fn_(rt,
-        config.aicpu_thread_num,
-        config.block_dim,
-        device_id_,
-        aicpu_binary_.data(),
-        aicpu_binary_.size(),
-        aicore_binary_.data(),
-        aicore_binary_.size(),
-        config.orch_thread_num);
+    rc = launch_runtime_fn_(
+        rt, config.aicpu_thread_num, config.block_dim, device_id_, aicpu_binary_.data(), aicpu_binary_.size(),
+        aicore_binary_.data(), aicore_binary_.size(), config.orch_thread_num
+    );
     if (rc != 0) {
         throw std::runtime_error("launch_runtime failed with code " + std::to_string(rc));
     }

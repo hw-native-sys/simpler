@@ -20,6 +20,7 @@
 #ifndef SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_
 #define SRC_COMMON_TASK_INTERFACE_DATA_TYPE_H_
 
+#include <array>
 #include <cstdint>
 
 #if __has_include(<type_traits>)
@@ -55,7 +56,7 @@ static_assert(sizeof(DataType) == 1, "DataType must stay 1 byte");
  */
 inline uint64_t get_element_size(DataType dtype) {
     // Order must match the enum definition exactly
-    static uint64_t data_type_size[static_cast<int>(DataType::DATA_TYPE_NUM)] = {
+    static std::array<uint64_t, static_cast<int>(DataType::DATA_TYPE_NUM)> data_type_size = {
         4,  // case DataType::FLOAT32
         2,  // DataType::FLOAT16
         4,  // DataType::INT32
@@ -75,28 +76,28 @@ inline uint64_t get_element_size(DataType dtype) {
  * @param dtype Data type
  * @return String name of the data type
  */
-inline const char* get_dtype_name(DataType dtype) {
+inline const char *get_dtype_name(DataType dtype) {
     switch (dtype) {
-        case DataType::FLOAT32:
-            return "FLOAT32";
-        case DataType::FLOAT16:
-            return "FLOAT16";
-        case DataType::INT32:
-            return "INT32";
-        case DataType::INT16:
-            return "INT16";
-        case DataType::INT8:
-            return "INT8";
-        case DataType::UINT8:
-            return "UINT8";
-        case DataType::BFLOAT16:
-            return "BFLOAT16";
-        case DataType::INT64:
-            return "INT64";
-        case DataType::UINT64:
-            return "UINT64";
-        default:
-            return "UNKNOWN";
+    case DataType::FLOAT32:
+        return "FLOAT32";
+    case DataType::FLOAT16:
+        return "FLOAT16";
+    case DataType::INT32:
+        return "INT32";
+    case DataType::INT16:
+        return "INT16";
+    case DataType::INT8:
+        return "INT8";
+    case DataType::UINT8:
+        return "UINT8";
+    case DataType::BFLOAT16:
+        return "BFLOAT16";
+    case DataType::INT64:
+        return "INT64";
+    case DataType::UINT64:
+        return "UINT64";
+    default:
+        return "UNKNOWN";
     }
 }
 
@@ -141,7 +142,7 @@ template <typename T>
 PTO_DEVICE_FUNC inline uint64_t to_u64(T value) {
     static_assert(sizeof(T) <= sizeof(uint64_t), "to_u64: type must fit in 8 bytes");
 #if PTO_HAS_TYPE_TRAITS
-    static_assert(std::is_trivially_copyable<T>::value, "to_u64: type must be trivially copyable");
+    static_assert(std::is_trivially_copyable_v<T>, "to_u64: type must be trivially copyable");
 #endif
     union {
         uint64_t u;
@@ -162,7 +163,7 @@ template <typename T>
 PTO_DEVICE_FUNC inline T from_u64(uint64_t bits) {
     static_assert(sizeof(T) <= sizeof(uint64_t), "from_u64: type must fit in 8 bytes");
 #if PTO_HAS_TYPE_TRAITS
-    static_assert(std::is_trivially_copyable<T>::value, "from_u64: type must be trivially copyable");
+    static_assert(std::is_trivially_copyable_v<T>, "from_u64: type must be trivially copyable");
 #endif
     union {
         uint64_t u;

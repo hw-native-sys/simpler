@@ -142,7 +142,7 @@ inline uint64_t get_sys_cnt_aicore() {
  * Set by the kernel wrapper before calling aicore_execute().
  * Points to a SIM_REG_BLOCK_SIZE-byte block allocated by DeviceRunner.
  */
-extern thread_local volatile uint8_t* g_sim_reg_base;
+extern thread_local volatile uint8_t *g_sim_reg_base;
 
 /**
  * Per-thread simulated physical core ID.
@@ -158,7 +158,7 @@ extern thread_local uint32_t g_sim_physical_core_id;
  */
 inline uint64_t read_reg(RegId reg) {
     uint32_t offset = reg_offset(reg);
-    uint64_t val = static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t*>(g_sim_reg_base + offset));
+    uint64_t val = static_cast<uint64_t>(*reinterpret_cast<volatile uint32_t *>(g_sim_reg_base + offset));
     OUT_OF_ORDER_LOAD_BARRIER();
     return val;
 }
@@ -171,7 +171,7 @@ inline uint64_t read_reg(RegId reg) {
  */
 inline void write_reg(RegId reg, uint64_t value) {
     uint32_t offset = reg_offset(reg);
-    *reinterpret_cast<volatile uint32_t*>(g_sim_reg_base + offset) = static_cast<uint32_t>(value);
+    *reinterpret_cast<volatile uint32_t *>(g_sim_reg_base + offset) = static_cast<uint32_t>(value);
     OUT_OF_ORDER_STORE_BARRIER();
 }
 

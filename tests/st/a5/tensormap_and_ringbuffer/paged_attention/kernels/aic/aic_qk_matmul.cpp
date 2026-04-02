@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // QK Matmul Kernel: qi(M, K) @ kj.T(K, N) -> sij(M, N)
 //
 // Supports two tile configurations via runtime dispatch:
@@ -24,10 +34,10 @@ using namespace pto;
 #endif
 
 template <int M, int K, int N>
-static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm__ Tensor* sij) {
-    __gm__ bfloat16_t* qi_addr = reinterpret_cast<__gm__ bfloat16_t*>(qi->buffer.addr);
-    __gm__ bfloat16_t* kj_addr = reinterpret_cast<__gm__ bfloat16_t*>(kj->buffer.addr);
-    __gm__ float* sij_addr = reinterpret_cast<__gm__ float*>(sij->buffer.addr);
+static __aicore__ void qk_matmul_impl(__gm__ Tensor *qi, __gm__ Tensor *kj, __gm__ Tensor *sij) {
+    __gm__ bfloat16_t *qi_addr = reinterpret_cast<__gm__ bfloat16_t *>(qi->buffer.addr);
+    __gm__ bfloat16_t *kj_addr = reinterpret_cast<__gm__ bfloat16_t *>(kj->buffer.addr);
+    __gm__ float *sij_addr = reinterpret_cast<__gm__ float *>(sij->buffer.addr);
 
     // qi (M, K) bf16 in ND (row-major) layout
     using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, pto::Stride<M * K, M * K, M * K, K, 1>>;
@@ -62,9 +72,9 @@ static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm
 
     // Load A and B to L1 with separate events for pipeline overlap
     TLOAD(aMatTile, qiGlobal);
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);     // A load done
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);  // A load done
     TLOAD(bMatTile, kjGlobal);
-    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);     // B load done
+    set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID1);  // B load done
 
     // Move A to L0A as soon as A load completes (B may still be loading)
     wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
@@ -88,10 +98,10 @@ static __aicore__ void qk_matmul_impl(__gm__ Tensor* qi, __gm__ Tensor* kj, __gm
     wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* qi = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* kj = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* sij = reinterpret_cast<__gm__ Tensor*>(args[2]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *qi = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *kj = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *sij = reinterpret_cast<__gm__ Tensor *>(args[2]);
     uint64_t q_tile_size = static_cast<uint64_t>(qi->shapes[0]);
     // args[4] = head_dim (128), args[5] = block_size
 

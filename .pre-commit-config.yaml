@@ -41,13 +41,20 @@ repos:
           types_or: [c++, c]
           exclude: ^3rdparty/
 
-    # Temporarily disable clang-tidy while the runtime sources are not
-    # lintable without a local compilation database.
-    # - repo: https://github.com/pocc/pre-commit-hooks
-    #   rev: v1.3.5
-    #   hooks:
-    #     - id: clang-tidy
-    #       exclude: ^3rdparty/
+    - repo: local
+      hooks:
+        - id: clang-tidy
+          name: clang-tidy
+          entry: python tests/lint/clang_tidy.py
+          language: python
+          types_or: [c++, c]
+          exclude: |
+            (?x)^(
+              3rdparty/|
+              python/bindings/|
+              .*/kernels/|
+              .*/aicore/
+            )
 
     - repo: https://github.com/cpplint/cpplint
       rev:  2.0.0

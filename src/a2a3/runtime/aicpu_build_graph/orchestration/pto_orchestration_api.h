@@ -40,10 +40,12 @@
 
 // Convert ContinuousTensor to Tensor (needs make_tensor_external from tensor.h)
 static_assert(
-    CONTINUOUS_TENSOR_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "ContinuousTensor and runtime max dims must match");
-inline Tensor from_tensor_arg(const ContinuousTensor& t, bool manual_dep = false, int32_t version = 0) {
+    CONTINUOUS_TENSOR_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "ContinuousTensor and runtime max dims must match"
+);
+inline Tensor from_tensor_arg(const ContinuousTensor &t, bool manual_dep = false, int32_t version = 0) {
     return make_tensor_external(
-        reinterpret_cast<void*>(static_cast<uintptr_t>(t.data)), t.shapes, t.ndims, t.dtype, manual_dep, version);
+        reinterpret_cast<void *>(static_cast<uintptr_t>(t.data)), t.shapes, t.ndims, t.dtype, manual_dep, version
+    );
 }
 
 // =============================================================================
@@ -62,19 +64,19 @@ typedef struct PTO2Runtime PTO2Runtime;
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    SubmitResult (*submit_task)(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const Arg& args);
-    void (*add_dependency)(PTO2Runtime* rt, PTO2TaskId producer, PTO2TaskId consumer);
-    void (*scope_begin)(PTO2Runtime* rt);
-    void (*scope_end)(PTO2Runtime* rt);
-    void (*orchestration_done)(PTO2Runtime* rt);
-    bool (*is_fatal)(PTO2Runtime* rt);
+    SubmitResult (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    void (*add_dependency)(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer);
+    void (*scope_begin)(PTO2Runtime *rt);
+    void (*scope_end)(PTO2Runtime *rt);
+    void (*orchestration_done)(PTO2Runtime *rt);
+    bool (*is_fatal)(PTO2Runtime *rt);
 
     // Logging (populated by runtime, called by orchestration)
-    void (*log_error)(const char* func, const char* fmt, ...);
-    void (*log_warn)(const char* func, const char* fmt, ...);
-    void (*log_info)(const char* func, const char* fmt, ...);
-    void (*log_debug)(const char* func, const char* fmt, ...);
-    void (*log_always)(const char* func, const char* fmt, ...);
+    void (*log_error)(const char *func, const char *fmt, ...);
+    void (*log_warn)(const char *func, const char *fmt, ...);
+    void (*log_info)(const char *func, const char *fmt, ...);
+    void (*log_debug)(const char *func, const char *fmt, ...);
+    void (*log_always)(const char *func, const char *fmt, ...);
 } PTO2RuntimeOps;
 
 /**
@@ -85,21 +87,21 @@ typedef struct PTO2RuntimeOps {
  * is well-defined (C struct layout guarantee).
  */
 struct PTO2Runtime {
-    const PTO2RuntimeOps* ops;
+    const PTO2RuntimeOps *ops;
 };
 
 // =============================================================================
 // Inline Convenience Wrappers (call through ops table)
 // =============================================================================
 
-static inline SubmitResult pto2_rt_submit_task(PTO2Runtime* rt, const MixedKernels& mixed_kernels, const Arg& args) {
+static inline SubmitResult pto2_rt_submit_task(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
     return rt->ops->submit_task(rt, mixed_kernels, args);
 }
 
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
-static inline SubmitResult pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kernel_id, const Arg& args) {
+static inline SubmitResult pto2_rt_submit_aic_task(PTO2Runtime *rt, int32_t kernel_id, const Arg &args) {
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, args);
@@ -108,7 +110,7 @@ static inline SubmitResult pto2_rt_submit_aic_task(PTO2Runtime* rt, int32_t kern
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
-static inline SubmitResult pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kernel_id, const Arg& args) {
+static inline SubmitResult pto2_rt_submit_aiv_task(PTO2Runtime *rt, int32_t kernel_id, const Arg &args) {
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, args);
@@ -117,17 +119,17 @@ static inline SubmitResult pto2_rt_submit_aiv_task(PTO2Runtime* rt, int32_t kern
 /**
  * Add an explicit dependency: consumer waits for producer to complete.
  */
-static inline void pto2_rt_add_dependency(PTO2Runtime* rt, PTO2TaskId producer, PTO2TaskId consumer) {
+static inline void pto2_rt_add_dependency(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer) {
     rt->ops->add_dependency(rt, producer, consumer);
 }
 
-static inline void pto2_rt_scope_begin(PTO2Runtime* rt) { rt->ops->scope_begin(rt); }
+static inline void pto2_rt_scope_begin(PTO2Runtime *rt) { rt->ops->scope_begin(rt); }
 
-static inline void pto2_rt_scope_end(PTO2Runtime* rt) { rt->ops->scope_end(rt); }
+static inline void pto2_rt_scope_end(PTO2Runtime *rt) { rt->ops->scope_end(rt); }
 
-static inline void pto2_rt_orchestration_done(PTO2Runtime* rt) { rt->ops->orchestration_done(rt); }
+static inline void pto2_rt_orchestration_done(PTO2Runtime *rt) { rt->ops->orchestration_done(rt); }
 
-static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) { return rt->ops->is_fatal(rt); }
+static inline bool pto2_rt_is_fatal(PTO2Runtime *rt) { return rt->ops->is_fatal(rt); }
 
 // =============================================================================
 // Logging Macros for Orchestration (call through ops table)
@@ -148,11 +150,14 @@ static inline bool pto2_rt_is_fatal(PTO2Runtime* rt) { return rt->ops->is_fatal(
  */
 class PTO2ScopeGuard {
 public:  // NOLINT(whitespace/indent)
-    explicit PTO2ScopeGuard(PTO2Runtime* rt) : rt_(rt) { rt_->ops->scope_begin(rt_); }
+    explicit PTO2ScopeGuard(PTO2Runtime *rt) :
+        rt_(rt) {
+        rt_->ops->scope_begin(rt_);
+    }
     ~PTO2ScopeGuard() { rt_->ops->scope_end(rt_); }
 
 private:  // NOLINT(whitespace/indent)
-    PTO2Runtime* rt_;
+    PTO2Runtime *rt_;
 };
 
 #define _PTO2_CONCATENATE_IMPL(x, y) x##y

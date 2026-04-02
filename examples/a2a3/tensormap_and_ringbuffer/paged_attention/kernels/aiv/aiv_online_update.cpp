@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // Online Softmax Update + Normalize Kernel (AIV)
 //
 // Fixed tile size: oi/oi_new are (16, 16), mij/lij/mi/li are 16-element vectors
@@ -24,22 +34,17 @@ using namespace pto;
 #endif
 
 template <int M, int N>
-static __aicore__ void online_update_impl(__gm__ Tensor* mij,
-    __gm__ Tensor* lij,
-    __gm__ Tensor* oi_new,
-    __gm__ Tensor* mi,
-    __gm__ Tensor* li,
-    __gm__ Tensor* oi,
-    uint64_t is_first,
-    uint64_t is_last,
-    __gm__ Tensor* dst) {
-    __gm__ float* mij_ptr = reinterpret_cast<__gm__ float*>(mij->buffer.addr);
-    __gm__ float* lij_ptr = reinterpret_cast<__gm__ float*>(lij->buffer.addr);
-    __gm__ float* oi_new_ptr = reinterpret_cast<__gm__ float*>(oi_new->buffer.addr);
-    __gm__ float* mi_ptr = reinterpret_cast<__gm__ float*>(mi->buffer.addr);
-    __gm__ float* li_ptr = reinterpret_cast<__gm__ float*>(li->buffer.addr);
-    __gm__ float* oi_ptr = reinterpret_cast<__gm__ float*>(oi->buffer.addr);
-    __gm__ float* dst_ptr = reinterpret_cast<__gm__ float*>(dst->buffer.addr);
+static __aicore__ void online_update_impl(
+    __gm__ Tensor *mij, __gm__ Tensor *lij, __gm__ Tensor *oi_new, __gm__ Tensor *mi, __gm__ Tensor *li,
+    __gm__ Tensor *oi, uint64_t is_first, uint64_t is_last, __gm__ Tensor *dst
+) {
+    __gm__ float *mij_ptr = reinterpret_cast<__gm__ float *>(mij->buffer.addr);
+    __gm__ float *lij_ptr = reinterpret_cast<__gm__ float *>(lij->buffer.addr);
+    __gm__ float *oi_new_ptr = reinterpret_cast<__gm__ float *>(oi_new->buffer.addr);
+    __gm__ float *mi_ptr = reinterpret_cast<__gm__ float *>(mi->buffer.addr);
+    __gm__ float *li_ptr = reinterpret_cast<__gm__ float *>(li->buffer.addr);
+    __gm__ float *oi_ptr = reinterpret_cast<__gm__ float *>(oi->buffer.addr);
+    __gm__ float *dst_ptr = reinterpret_cast<__gm__ float *>(dst->buffer.addr);
 
     // Scalar tile dimensions for RowMajor layout:
     // kScalarCols = 32 bytes / 4 bytes per float = 8 floats per row (one 32-byte block)
@@ -221,14 +226,14 @@ static __aicore__ void online_update_impl(__gm__ Tensor* mij,
     wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* mij = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* lij = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* oi_new = reinterpret_cast<__gm__ Tensor*>(args[2]);
-    __gm__ Tensor* mi = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    __gm__ Tensor* li = reinterpret_cast<__gm__ Tensor*>(args[4]);
-    __gm__ Tensor* oi = reinterpret_cast<__gm__ Tensor*>(args[5]);
-    __gm__ Tensor* dst = reinterpret_cast<__gm__ Tensor*>(args[6]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *mij = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *lij = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *oi_new = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *mi = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *li = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    __gm__ Tensor *oi = reinterpret_cast<__gm__ Tensor *>(args[5]);
+    __gm__ Tensor *dst = reinterpret_cast<__gm__ Tensor *>(args[6]);
     uint64_t is_first = static_cast<uint64_t>(args[7]);
     uint64_t is_last = static_cast<uint64_t>(args[8]);
 

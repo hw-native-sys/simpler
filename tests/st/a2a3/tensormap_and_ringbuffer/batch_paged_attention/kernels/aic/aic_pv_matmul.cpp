@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // Batched PV Matmul Kernel: for each batch b, pij(M, K) @ vj(K, N) -> oi_new(M, N)
 //
 // Processes batch_count batches in a single kernel invocation.
@@ -26,20 +36,14 @@ using namespace pto;
 
 template <int M, int K, int N>
 static __aicore__ void pv_matmul_batch_impl(
-    __gm__ Tensor* pij_batch,
-    __gm__ Tensor* value_cache,
-    __gm__ Tensor* oi_new_batch,
-    uint64_t block_table_ptr,
-    uint64_t batch_count,
-    uint64_t block_idx,
-    uint64_t block_num,
-    uint64_t batch_start) {
-
-    __gm__ bfloat16_t* pij_base = reinterpret_cast<__gm__ bfloat16_t*>(pij_batch->buffer.addr);
-    __gm__ bfloat16_t* val_base = reinterpret_cast<__gm__ bfloat16_t*>(value_cache->buffer.addr);
-    __gm__ float* oi_base = reinterpret_cast<__gm__ float*>(oi_new_batch->buffer.addr);
+    __gm__ Tensor *pij_batch, __gm__ Tensor *value_cache, __gm__ Tensor *oi_new_batch, uint64_t block_table_ptr,
+    uint64_t batch_count, uint64_t block_idx, uint64_t block_num, uint64_t batch_start
+) {
+    __gm__ bfloat16_t *pij_base = reinterpret_cast<__gm__ bfloat16_t *>(pij_batch->buffer.addr);
+    __gm__ bfloat16_t *val_base = reinterpret_cast<__gm__ bfloat16_t *>(value_cache->buffer.addr);
+    __gm__ float *oi_base = reinterpret_cast<__gm__ float *>(oi_new_batch->buffer.addr);
     // Block table values are always non-negative (physical block indices)
-    __gm__ int32_t* bt = reinterpret_cast<__gm__ int32_t*>(block_table_ptr);
+    __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_ptr);
 
     using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
     using GlobalB = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, N, 1>>;
@@ -65,10 +69,10 @@ static __aicore__ void pv_matmul_batch_impl(
     TASSIGN(cTile, 0x0);
 
     for (uint64_t b = 0; b < batch_count; b++) {
-        __gm__ bfloat16_t* pij_addr = pij_base + b * M * K;
+        __gm__ bfloat16_t *pij_addr = pij_base + b * M * K;
         int32_t phys_block = bt[(batch_start + b) * block_num + block_idx];
-        __gm__ bfloat16_t* vj_addr = val_base + (uint64_t)phys_block * K * N;
-        __gm__ float* oi_addr = oi_base + b * M * N;
+        __gm__ bfloat16_t *vj_addr = val_base + (uint64_t)phys_block * K * N;
+        __gm__ float *oi_addr = oi_base + b * M * N;
 
         GlobalA pijGlobal(pij_addr);
         GlobalB vjGlobal(vj_addr);
@@ -99,10 +103,10 @@ static __aicore__ void pv_matmul_batch_impl(
     }
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* pij_batch = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* value_cache = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* oi_new_batch = reinterpret_cast<__gm__ Tensor*>(args[2]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *pij_batch = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *value_cache = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *oi_new_batch = reinterpret_cast<__gm__ Tensor *>(args[2]);
     uint64_t block_table_ptr = static_cast<uint64_t>(args[3]);
     uint64_t batch_count = static_cast<uint64_t>(args[4]);
     uint64_t block_idx = static_cast<uint64_t>(args[5]);
@@ -113,11 +117,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 
     if (q_tile_size == 16) {
         pv_matmul_batch_impl<16, 128, 128>(
-            pij_batch, value_cache, oi_new_batch,
-            block_table_ptr, batch_count, block_idx, block_num, batch_start);
+            pij_batch, value_cache, oi_new_batch, block_table_ptr, batch_count, block_idx, block_num, batch_start
+        );
     } else {
         pv_matmul_batch_impl<64, 64, 128>(
-            pij_batch, value_cache, oi_new_batch,
-            block_table_ptr, batch_count, block_idx, block_num, batch_start);
+            pij_batch, value_cache, oi_new_batch, block_table_ptr, batch_count, block_idx, block_num, batch_start
+        );
     }
 }

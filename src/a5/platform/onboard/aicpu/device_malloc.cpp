@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * @file device_malloc.cpp
  * @brief Device Memory Allocation for Real Hardware (a5)
@@ -13,8 +23,8 @@
 #include <dlfcn.h>
 #include <cstdlib>
 
-using HalMemAllocFn = int (*)(void** pp, unsigned long long size, unsigned long long flag);
-using HalMemFreeFn = int (*)(void* pp);
+using HalMemAllocFn = int (*)(void **pp, unsigned long long size, unsigned long long flag);
+using HalMemFreeFn = int (*)(void *pp);
 
 static HalMemAllocFn g_halMemAlloc = nullptr;
 static HalMemFreeFn g_halMemFree = nullptr;
@@ -34,7 +44,7 @@ static void resolve_hal_mem_functions() {
     g_hal_resolved = true;
 }
 
-void* aicpu_device_malloc(size_t size) {
+void *aicpu_device_malloc(size_t size) {
     resolve_hal_mem_functions();
 
     if (g_halMemAlloc == nullptr) {
@@ -42,7 +52,7 @@ void* aicpu_device_malloc(size_t size) {
         return nullptr;
     }
 
-    void* ptr = nullptr;
+    void *ptr = nullptr;
     // halMemAlloc flag layout (ascend_hal_define.h):
     //   bit0~9:   devid (0 for local device)
     //   bit10~13: virt mem type (MEM_SVM=0x0 << 10)
@@ -57,7 +67,7 @@ void* aicpu_device_malloc(size_t size) {
     return ptr;
 }
 
-void aicpu_device_free(void* ptr) {
+void aicpu_device_free(void *ptr) {
     if (ptr == nullptr) {
         return;
     }

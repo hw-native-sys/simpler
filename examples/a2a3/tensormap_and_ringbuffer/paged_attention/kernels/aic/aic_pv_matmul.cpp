@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // PV Matmul Kernel: pij(M, K) @ vj(K, N) -> oi_new(M, N)
 //
 // Fixed tile size: (16, 16) @ (16, 16) -> (16, 16)
@@ -22,10 +32,10 @@ using namespace pto;
 #endif
 
 template <int M, int K, int N>
-static __aicore__ void pv_matmul_impl(__gm__ Tensor* pij, __gm__ Tensor* vj, __gm__ Tensor* oi) {
-    __gm__ half* pij_addr = reinterpret_cast<__gm__ half*>(pij->buffer.addr);
-    __gm__ half* vj_addr = reinterpret_cast<__gm__ half*>(vj->buffer.addr);
-    __gm__ float* oi_addr = reinterpret_cast<__gm__ float*>(oi->buffer.addr);
+static __aicore__ void pv_matmul_impl(__gm__ Tensor *pij, __gm__ Tensor *vj, __gm__ Tensor *oi) {
+    __gm__ half *pij_addr = reinterpret_cast<__gm__ half *>(pij->buffer.addr);
+    __gm__ half *vj_addr = reinterpret_cast<__gm__ half *>(vj->buffer.addr);
+    __gm__ float *oi_addr = reinterpret_cast<__gm__ float *>(oi->buffer.addr);
 
     // pij (M, K) fp16, vj (K, N) fp16 in ND (row-major), oi_new (M, N) fp32
     using GlobalA = GlobalTensor<half, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
@@ -83,10 +93,10 @@ static __aicore__ void pv_matmul_impl(__gm__ Tensor* pij, __gm__ Tensor* vj, __g
     wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* pij = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* vj = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* oi_new = reinterpret_cast<__gm__ Tensor*>(args[2]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *pij = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *vj = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *oi_new = reinterpret_cast<__gm__ Tensor *>(args[2]);
 
     pv_matmul_impl<16, 16, 16>(pij, vj, oi_new);
 }

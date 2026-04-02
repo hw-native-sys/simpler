@@ -27,16 +27,16 @@ std::string get_stacktrace(int skip_frames = 1);
  * Assertion failure exception with condition, file, line, and stack trace.
  */
 class AssertionError : public std::runtime_error {
- public:
-    AssertionError(const char* condition, const char* file, int line);
+public:
+    AssertionError(const char *condition, const char *file, int line);
 
-    const char* condition() const { return condition_; }
-    const char* file() const { return file_; }
+    const char *condition() const { return condition_; }
+    const char *file() const { return file_; }
     int line() const { return line_; }
 
- private:
-    const char* condition_;
-    const char* file_;
+private:
+    const char *condition_;
+    const char *file_;
     int line_;
 };
 
@@ -44,7 +44,7 @@ class AssertionError : public std::runtime_error {
  * Assertion failure handler.
  * Implemented in common.cpp.
  */
-[[noreturn]] void assert_impl(const char* condition, const char* file, int line);
+[[noreturn]] void assert_impl(const char *condition, const char *file, int line);
 
 /**
  * debug_assert macro:

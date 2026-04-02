@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Matrix Multiplication Kernel (AIC)
  *
@@ -42,19 +52,19 @@ constexpr int N = 128;
  *              args[2] = out pointer (output matrix, MxN, float)
  *              args[3] = size (number of elements, unused for matmul)
  */
-extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t* args) {
+extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
     // Unpack arguments - half input, float output
-    __gm__ half* src0 = reinterpret_cast<__gm__ half*>(args[0]);
-    __gm__ half* src1 = reinterpret_cast<__gm__ half*>(args[1]);
-    __gm__ float* out = reinterpret_cast<__gm__ float*>(args[2]);
+    __gm__ half *src0 = reinterpret_cast<__gm__ half *>(args[0]);
+    __gm__ half *src1 = reinterpret_cast<__gm__ half *>(args[1]);
+    __gm__ float *out = reinterpret_cast<__gm__ float *>(args[2]);
 
     // Global tensor types
-    using GlobalDataSrc0 = GlobalTensor<half, Shape<1, 1, 1, validM, validK>,
-        Stride<validM * validK, validM * validK, validM * validK, validK, 1>>;
-    using GlobalDataSrc1 = GlobalTensor<half, Shape<1, 1, 1, validK, validN>,
-        Stride<validK * validN, validK * validN, validK * validN, validN, 1>>;
-    using GlobalDataOut = GlobalTensor<float, Shape<1, 1, 1, validM, validN>,
-        Stride<validM * validN, validM * validN, validM * validN, validN, 1>>;
+    using GlobalDataSrc0 = GlobalTensor<
+        half, Shape<1, 1, 1, validM, validK>, Stride<validM * validK, validM * validK, validM * validK, validK, 1>>;
+    using GlobalDataSrc1 = GlobalTensor<
+        half, Shape<1, 1, 1, validK, validN>, Stride<validK * validN, validK * validN, validK * validN, validN, 1>>;
+    using GlobalDataOut = GlobalTensor<
+        float, Shape<1, 1, 1, validM, validN>, Stride<validM * validN, validM * validN, validM * validN, validN, 1>>;
 
     GlobalDataSrc0 src0Global(src0);
     GlobalDataSrc1 src1Global(src1);

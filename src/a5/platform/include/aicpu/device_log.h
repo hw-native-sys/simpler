@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * @file device_log.h
  * @brief Unified Device Logging Interface for AICPU
@@ -40,58 +50,58 @@ extern bool g_is_log_enable_warn;
 extern bool g_is_log_enable_error;
 
 // Platform constant (defined in platform-specific device_log.cpp)
-extern const char* TILE_FWK_DEVICE_MACHINE;
+extern const char *TILE_FWK_DEVICE_MACHINE;
 
 // =============================================================================
 // Platform-Specific Logging Functions (Low-Level Layer)
 // =============================================================================
 
 // Platform-specific logging functions (implemented in device_log.cpp)
-void dev_log_debug(const char* func, const char* fmt, ...);
-void dev_log_info(const char* func, const char* fmt, ...);
-void dev_log_warn(const char* func, const char* fmt, ...);
-void dev_log_error(const char* func, const char* fmt, ...);
-void dev_log_always(const char* func, const char* fmt, ...);
+void dev_log_debug(const char *func, const char *fmt, ...);
+void dev_log_info(const char *func, const char *fmt, ...);
+void dev_log_warn(const char *func, const char *fmt, ...);
+void dev_log_error(const char *func, const char *fmt, ...);
+void dev_log_always(const char *func, const char *fmt, ...);
 
 // =============================================================================
 // High-Level Logging Macros (Platform-Independent Layer)
 // =============================================================================
 
-#define D_DEV_LOGD(MODE_NAME, fmt, ...) \
-    do { \
-        if (is_log_enable_debug()) { \
+#define D_DEV_LOGD(MODE_NAME, fmt, ...)                      \
+    do {                                                     \
+        if (is_log_enable_debug()) {                         \
             dev_log_debug(__FUNCTION__, fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
+        }                                                    \
+    } while (0)
 
-#define D_DEV_LOGI(MODE_NAME, fmt, ...) \
-    do { \
-        if (is_log_enable_info()) { \
+#define D_DEV_LOGI(MODE_NAME, fmt, ...)                     \
+    do {                                                    \
+        if (is_log_enable_info()) {                         \
             dev_log_info(__FUNCTION__, fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
+        }                                                   \
+    } while (0)
 
-#define D_DEV_LOGW(MODE_NAME, fmt, ...) \
-    do { \
-        if (is_log_enable_warn()) { \
+#define D_DEV_LOGW(MODE_NAME, fmt, ...)                     \
+    do {                                                    \
+        if (is_log_enable_warn()) {                         \
             dev_log_warn(__FUNCTION__, fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
+        }                                                   \
+    } while (0)
 
-#define D_DEV_LOGE(MODE_NAME, fmt, ...) \
-    do { \
-        if (is_log_enable_error()) { \
+#define D_DEV_LOGE(MODE_NAME, fmt, ...)                      \
+    do {                                                     \
+        if (is_log_enable_error()) {                         \
             dev_log_error(__FUNCTION__, fmt, ##__VA_ARGS__); \
-        } \
-    } while(0)
+        }                                                    \
+    } while (0)
 
 // =============================================================================
 // Convenience Macros
 // =============================================================================
 
 #define DEV_DEBUG(fmt, args...) D_DEV_LOGD(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
-#define DEV_INFO(fmt, args...)  D_DEV_LOGI(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
-#define DEV_WARN(fmt, args...)  D_DEV_LOGW(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
+#define DEV_INFO(fmt, args...) D_DEV_LOGI(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
+#define DEV_WARN(fmt, args...) D_DEV_LOGW(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
 #define DEV_ERROR(fmt, args...) D_DEV_LOGE(TILE_FWK_DEVICE_MACHINE, fmt, ##args)
 #define DEV_ALWAYS(fmt, args...) dev_log_always(__FUNCTION__, fmt, ##args)
 
@@ -110,32 +120,32 @@ void dev_log_always(const char* func, const char* fmt, ...);
 // Conditional Check Macros
 // =============================================================================
 
-#define DEV_CHECK_COND_RETURN_VOID(cond, fmt, ...)          \
-    do {                                                    \
-        if (!(cond)) {                                      \
-            DEV_ERROR(fmt, ##__VA_ARGS__);                  \
-            DEV_ASSERT(0);                                  \
-            return;                                         \
-        }                                                   \
-    } while(0)
+#define DEV_CHECK_COND_RETURN_VOID(cond, fmt, ...) \
+    do {                                           \
+        if (!(cond)) {                             \
+            DEV_ERROR(fmt, ##__VA_ARGS__);         \
+            DEV_ASSERT(0);                         \
+            return;                                \
+        }                                          \
+    } while (0)
 
-#define DEV_CHECK_COND_RETURN(cond, retval, fmt, ...)       \
-    do {                                                    \
-        if (!(cond)) {                                      \
-            DEV_ERROR(fmt, ##__VA_ARGS__);                  \
-            DEV_ASSERT(0);                                  \
-            return (retval);                                \
-        }                                                   \
-    } while(0)
+#define DEV_CHECK_COND_RETURN(cond, retval, fmt, ...) \
+    do {                                              \
+        if (!(cond)) {                                \
+            DEV_ERROR(fmt, ##__VA_ARGS__);            \
+            DEV_ASSERT(0);                            \
+            return (retval);                          \
+        }                                             \
+    } while (0)
 
-#define DEV_CHECK_POINTER_NULL_RETURN_VOID(ptr, fmt, ...)   \
-    do {                                                    \
-        if ((ptr) == nullptr) {                             \
-            DEV_ERROR(fmt, ##__VA_ARGS__);                  \
-            DEV_ASSERT(0);                                  \
-            return;                                         \
-        }                                                   \
-    } while(0)
+#define DEV_CHECK_POINTER_NULL_RETURN_VOID(ptr, fmt, ...) \
+    do {                                                  \
+        if ((ptr) == nullptr) {                           \
+            DEV_ERROR(fmt, ##__VA_ARGS__);                \
+            DEV_ASSERT(0);                                \
+            return;                                       \
+        }                                                 \
+    } while (0)
 
 // =============================================================================
 // Helper Functions
@@ -143,8 +153,8 @@ void dev_log_always(const char* func, const char* fmt, ...);
 
 // Check if log level is enabled (inline for efficiency)
 inline bool is_log_enable_debug() { return g_is_log_enable_debug; }
-inline bool is_log_enable_info()  { return g_is_log_enable_info; }
-inline bool is_log_enable_warn()  { return g_is_log_enable_warn; }
+inline bool is_log_enable_info() { return g_is_log_enable_info; }
+inline bool is_log_enable_warn() { return g_is_log_enable_warn; }
 inline bool is_log_enable_error() { return g_is_log_enable_error; }
 
 // Initialize log switch (platform-specific implementation)

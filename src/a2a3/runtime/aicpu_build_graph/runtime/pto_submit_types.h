@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * PTO Submit Types - Shared submit-contract definitions
  *
@@ -21,7 +31,7 @@ inline constexpr int32_t PTO2_SUBTASK_SLOT_COUNT = 3;
  * Subtask slot indices
  */
 enum class PTO2SubtaskSlot : uint8_t {
-    AIC  = 0,
+    AIC = 0,
     AIV0 = 1,
     AIV1 = 2,
 };
@@ -29,7 +39,7 @@ enum class PTO2SubtaskSlot : uint8_t {
 /**
  * Subtask mask bits (for active_mask / subtask_done_mask)
  */
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC  = (1u << 0);  // 0x1
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);   // 0x1
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);  // 0x2
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV1 = (1u << 2);  // 0x4
 
@@ -56,11 +66,11 @@ struct MixedKernels {
  * Resource shape — classifies a MixedKernels into one of 5 queue buckets.
  */
 enum class PTO2ResourceShape : uint8_t {
-    AIC_ONLY    = 0,   // AIC only
-    AIV_X1      = 1,   // One AIV slot
-    AIV_X2      = 2,   // Both AIV slots
-    AIC_AIV_X1  = 3,   // AIC + one AIV
-    AIC_AIV_X2  = 4,   // AIC + both AIV
+    AIC_ONLY = 0,    // AIC only
+    AIV_X1 = 1,      // One AIV slot
+    AIV_X2 = 2,      // Both AIV slots
+    AIC_AIV_X1 = 3,  // AIC + one AIV
+    AIC_AIV_X2 = 4,  // AIC + both AIV
 };
 
 inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 5;
@@ -71,8 +81,7 @@ inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 5;
  */
 static inline PTO2ResourceShape pto2_active_mask_to_shape(uint8_t active_mask) {
     bool has_aic = (active_mask & PTO2_SUBTASK_MASK_AIC) != 0;
-    int aiv_count = ((active_mask & PTO2_SUBTASK_MASK_AIV0) != 0)
-                  + ((active_mask & PTO2_SUBTASK_MASK_AIV1) != 0);
+    int aiv_count = ((active_mask & PTO2_SUBTASK_MASK_AIV0) != 0) + ((active_mask & PTO2_SUBTASK_MASK_AIV1) != 0);
 
     if (has_aic) {
         if (aiv_count == 0) return PTO2ResourceShape::AIC_ONLY;
@@ -86,12 +95,12 @@ static inline PTO2ResourceShape pto2_active_mask_to_shape(uint8_t active_mask) {
 /**
  * Compute active_mask from MixedKernels.
  */
-static inline uint8_t pto2_mixed_kernels_to_active_mask(const MixedKernels& mk) {
+static inline uint8_t pto2_mixed_kernels_to_active_mask(const MixedKernels &mk) {
     uint8_t mask = 0;
-    if (mk.aic_kernel_id  != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIC;
+    if (mk.aic_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIC;
     if (mk.aiv0_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIV0;
     if (mk.aiv1_kernel_id != INVALID_KERNEL_ID) mask |= PTO2_SUBTASK_MASK_AIV1;
     return mask;
 }
 
-#endif // PTO_SUBMIT_TYPES_H
+#endif  // PTO_SUBMIT_TYPES_H

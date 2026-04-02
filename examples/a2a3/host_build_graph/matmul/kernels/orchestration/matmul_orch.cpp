@@ -36,7 +36,7 @@
 
 extern "C" {
 
-int build_matmul_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
+int build_matmul_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
     // Validate argument count
     // Expected orch_args: [a, w1, w2, f] — 4 tensors
     if (orch_args.tensor_count() < 4) {
@@ -45,10 +45,10 @@ int build_matmul_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     }
 
     // Extract host pointers and sizes from tensor metadata
-    void* host_a = orch_args.tensor(0).data_as<void>();
-    void* host_w1 = orch_args.tensor(1).data_as<void>();
-    void* host_w2 = orch_args.tensor(2).data_as<void>();
-    void* host_f = orch_args.tensor(3).data_as<void>();
+    void *host_a = orch_args.tensor(0).data_as<void>();
+    void *host_w1 = orch_args.tensor(1).data_as<void>();
+    void *host_w2 = orch_args.tensor(2).data_as<void>();
+    void *host_f = orch_args.tensor(3).data_as<void>();
     size_t size_a = orch_args.tensor(0).nbytes();
     size_t size_w1 = orch_args.tensor(1).nbytes();
     size_t size_w2 = orch_args.tensor(2).nbytes();
@@ -62,7 +62,7 @@ int build_matmul_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     // Allocate device memory and copy inputs
     std::cout << "\n=== Allocating Device Memory ===" << '\n';
 
-    void* dev_a = runtime->host_api.device_malloc(size_a);
+    void *dev_a = runtime->host_api.device_malloc(size_a);
     if (!dev_a) {
         std::cerr << "Error: Failed to allocate device memory for A\n";
         return -1;
@@ -70,7 +70,7 @@ int build_matmul_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     runtime->host_api.copy_to_device(dev_a, host_a, size_a);
     std::cout << "Tensor A: " << size_a << " bytes copied to device\n";
 
-    void* dev_w1 = runtime->host_api.device_malloc(size_w1);
+    void *dev_w1 = runtime->host_api.device_malloc(size_w1);
     if (!dev_w1) {
         std::cerr << "Error: Failed to allocate device memory for W1\n";
         runtime->host_api.device_free(dev_a);
@@ -79,7 +79,7 @@ int build_matmul_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     runtime->host_api.copy_to_device(dev_w1, host_w1, size_w1);
     std::cout << "Tensor W1: " << size_w1 << " bytes copied to device\n";
 
-    void* dev_w2 = runtime->host_api.device_malloc(size_w2);
+    void *dev_w2 = runtime->host_api.device_malloc(size_w2);
     if (!dev_w2) {
         std::cerr << "Error: Failed to allocate device memory for W2\n";
         runtime->host_api.device_free(dev_a);
@@ -89,7 +89,7 @@ int build_matmul_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     runtime->host_api.copy_to_device(dev_w2, host_w2, size_w2);
     std::cout << "Tensor W2: " << size_w2 << " bytes copied to device\n";
 
-    void* dev_f = runtime->host_api.device_malloc(size_f);
+    void *dev_f = runtime->host_api.device_malloc(size_f);
     if (!dev_f) {
         std::cerr << "Error: Failed to allocate device memory for F\n";
         runtime->host_api.device_free(dev_a);
@@ -106,9 +106,9 @@ int build_matmul_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     // dev_c, dev_d are float precision (output of matmul kernels)
     size_t BYTES_HALF = SIZE * sizeof(uint16_t);                 // half = 2 bytes
     size_t BYTES_FLOAT = SIZE * sizeof(float);                   // float = 4 bytes
-    void* dev_b = runtime->host_api.device_malloc(BYTES_HALF);   // sqrt(log(A)) - half output
-    void* dev_c = runtime->host_api.device_malloc(BYTES_FLOAT);  // B @ W1 - float output
-    void* dev_d = runtime->host_api.device_malloc(BYTES_FLOAT);  // B @ W2 - float output
+    void *dev_b = runtime->host_api.device_malloc(BYTES_HALF);   // sqrt(log(A)) - half output
+    void *dev_c = runtime->host_api.device_malloc(BYTES_FLOAT);  // B @ W1 - float output
+    void *dev_d = runtime->host_api.device_malloc(BYTES_FLOAT);  // B @ W2 - float output
 
     if (!dev_b || !dev_c || !dev_d) {
         std::cerr << "Error: Failed to allocate intermediate tensors\n";

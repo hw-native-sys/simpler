@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // Multi-block QK Matmul Kernel: qi(M, K) @ kj.T(K, N) -> sij(M, N) for each block
 //
 // Processes n_blocks blocks in a single kernel invocation.
@@ -33,12 +43,9 @@ using namespace pto;
 
 template <int M, int K, int N>
 static __aicore__ void qk_matmul_n_impl(
-    __gm__ bfloat16_t* qi_base,
-    __gm__ bfloat16_t* key_base,
-    __gm__ float* sij_base,
-    uint64_t n_blocks,
-    __gm__ int32_t* block_table) {
-
+    __gm__ bfloat16_t *qi_base, __gm__ bfloat16_t *key_base, __gm__ float *sij_base, uint64_t n_blocks,
+    __gm__ int32_t *block_table
+) {
     using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, pto::Stride<M * K, M * K, M * K, K, 1>>;
     using GlobalB = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, pto::Stride<K * N, K * N, K * N, 1, K>, Layout::DN>;
     using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<M * N, M * N, M * N, N, 1>>;
@@ -98,16 +105,16 @@ static __aicore__ void qk_matmul_n_impl(
     wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* qi = reinterpret_cast<__gm__ Tensor*>(args[0]);
-    __gm__ Tensor* key_cache = reinterpret_cast<__gm__ Tensor*>(args[1]);
-    __gm__ Tensor* sij_buf = reinterpret_cast<__gm__ Tensor*>(args[2]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *qi = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *key_cache = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *sij_buf = reinterpret_cast<__gm__ Tensor *>(args[2]);
     uint64_t n_blocks = static_cast<uint64_t>(args[3]);
-    __gm__ int32_t* block_table = reinterpret_cast<__gm__ int32_t*>(args[4]);
+    __gm__ int32_t *block_table = reinterpret_cast<__gm__ int32_t *>(args[4]);
 
-    __gm__ bfloat16_t* qi_base = reinterpret_cast<__gm__ bfloat16_t*>(qi->buffer.addr) + qi->start_offset;
-    __gm__ bfloat16_t* key_base = reinterpret_cast<__gm__ bfloat16_t*>(key_cache->buffer.addr);
-    __gm__ float* sij_base = reinterpret_cast<__gm__ float*>(sij_buf->buffer.addr) + sij_buf->start_offset;
+    __gm__ bfloat16_t *qi_base = reinterpret_cast<__gm__ bfloat16_t *>(qi->buffer.addr) + qi->start_offset;
+    __gm__ bfloat16_t *key_base = reinterpret_cast<__gm__ bfloat16_t *>(key_cache->buffer.addr);
+    __gm__ float *sij_base = reinterpret_cast<__gm__ float *>(sij_buf->buffer.addr) + sij_buf->start_offset;
 
     uint64_t q_tile_size = static_cast<uint64_t>(qi->shapes[0]);
 

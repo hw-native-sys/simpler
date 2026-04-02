@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * @file performance_collector_aicore.h
  * @brief AICore performance data collection interface
@@ -36,18 +46,13 @@
  * @param start_time Start timestamp
  * @param end_time End timestamp
  */
-__aicore__ __attribute__((always_inline))
-static inline void perf_aicore_record_task(
-    __gm__ PerfBuffer* perf_buf,
-    uint32_t task_id,
-    uint64_t start_time,
-    uint64_t end_time) {
-
+__aicore__ __attribute__((always_inline)) static inline void
+perf_aicore_record_task(__gm__ PerfBuffer *perf_buf, uint32_t task_id, uint64_t start_time, uint64_t end_time) {
     // Read current buffer count (AICPU owns the count, AICore reads only)
     dcci(&perf_buf->count, SINGLE_CACHE_LINE);
     uint32_t idx = perf_buf->count;
 
-    __gm__ PerfRecord* record = &perf_buf->records[idx];
+    __gm__ PerfRecord *record = &perf_buf->records[idx];
 
     // Write record data (func_id, core_type, and count filled by AICPU at completion)
     record->start_time = start_time;

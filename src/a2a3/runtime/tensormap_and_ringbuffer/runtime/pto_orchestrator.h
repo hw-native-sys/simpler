@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * PTO Runtime2 - Orchestrator Interface
  *
@@ -37,37 +47,37 @@
  */
 struct PTO2OrchestratorState {
     // === SHARED MEMORY ACCESS ===
-    PTO2SharedMemoryHandle* sm_handle;
+    PTO2SharedMemoryHandle *sm_handle;
 
     // === PER-RING RESOURCES ===
     PTO2RingSet rings[PTO2_MAX_RING_DEPTH];
 
     // === TENSOR MAP (Private) ===
-    PTO2TensorMap tensor_map;        // Producer lookup
+    PTO2TensorMap tensor_map;  // Producer lookup
 
     // === SCOPE STACK (Private) ===
     // Single contiguous buffer of task IDs, partitioned by scope level.
     // scope_begins[i] is the index into scope_tasks where scope i starts.
     // Tasks for the top scope occupy [scope_begins[top], scope_tasks_size).
-    PTO2TaskSlotState** scope_tasks; // Flat buffer of taskSlotState (all scopes concatenated)
-    int32_t scope_tasks_size;       // Number of task IDs currently in the buffer
-    int32_t scope_tasks_capacity;   // Allocated capacity of scope_tasks
-    int32_t* scope_begins;         // scope_begins[i] = start index of scope i in scope_tasks
-    int32_t scope_stack_top;       // Current top of stack (-1 = no scope open)
-    uint64_t scope_stack_capacity;   // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
+    PTO2TaskSlotState **scope_tasks;  // Flat buffer of taskSlotState (all scopes concatenated)
+    int32_t scope_tasks_size;         // Number of task IDs currently in the buffer
+    int32_t scope_tasks_capacity;     // Allocated capacity of scope_tasks
+    int32_t *scope_begins;            // scope_begins[i] = start index of scope i in scope_tasks
+    int32_t scope_stack_top;          // Current top of stack (-1 = no scope open)
+    uint64_t scope_stack_capacity;    // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
 
     // === SCHEDULER REFERENCE ===
     // Note: In simulated mode, orchestrator and scheduler share address space
     // In real mode, they communicate via shared memory only
-    PTO2SchedulerState* scheduler;  // For simulated mode only
+    PTO2SchedulerState *scheduler;  // For simulated mode only
 #if PTO2_PROFILING
     // Runtime profiling switch copied from Runtime::enable_profiling.
     bool enable_profiling;
 #endif
 
     // === GM HEAP (for output buffers) ===
-    void* gm_heap_base;    // Base address of GM heap
-    uint64_t gm_heap_size;   // Total size of GM heap (all rings)
+    void *gm_heap_base;     // Base address of GM heap
+    uint64_t gm_heap_size;  // Total size of GM heap (all rings)
 
     // === FATAL ERROR ===
     // Fatal error flag (single-thread access by orchestrator, no atomic needed)
@@ -90,7 +100,6 @@ struct PTO2OrchestratorState {
         if (depth < 0) depth = 0;
         return depth < PTO2_MAX_RING_DEPTH ? static_cast<uint8_t>(depth) : PTO2_MAX_RING_DEPTH - 1;
     }
-
 };
 
 // =============================================================================
@@ -107,19 +116,19 @@ struct PTO2OrchestratorState {
  * @return true on success
  */
 bool pto2_orchestrator_init(
-    PTO2OrchestratorState* orch, PTO2SharedMemoryHandle* sm_handle, void* gm_heap, uint64_t heap_size,
-    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE);
+    PTO2OrchestratorState *orch, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
+    int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
+);
 
 /**
  * Destroy orchestrator state and free resources
  */
-void pto2_orchestrator_destroy(PTO2OrchestratorState* orch);
+void pto2_orchestrator_destroy(PTO2OrchestratorState *orch);
 
 /**
  * Set scheduler reference (for simulated mode)
  */
-void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler);
-
+void pto2_orchestrator_set_scheduler(PTO2OrchestratorState *orch, PTO2SchedulerState *scheduler);
 
 // =============================================================================
 // Scope Management
@@ -132,7 +141,7 @@ void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerS
  * Tasks submitted while this scope is at the top of the stack are
  * owned by it and have their fanout_count initialized to 1.
  */
-void pto2_scope_begin(PTO2OrchestratorState* orch);
+void pto2_scope_begin(PTO2OrchestratorState *orch);
 
 /**
  * End current scope
@@ -141,7 +150,7 @@ void pto2_scope_begin(PTO2OrchestratorState* orch);
  * directly owned by that scope.
  * May trigger buffer release for tasks that are now fully consumed.
  */
-void pto2_scope_end(PTO2OrchestratorState* orch);
+void pto2_scope_end(PTO2OrchestratorState *orch);
 
 // =============================================================================
 // Task Submission
@@ -161,9 +170,8 @@ void pto2_scope_end(PTO2OrchestratorState* orch);
  * @param mixed_kernels  Kernel IDs for AIC/AIV0/AIV1 slots
  * @param args      Aggregated tensor and scalar parameters
  */
-TaskOutputTensors pto2_submit_mixed_task(PTO2OrchestratorState* orch,
-    const MixedKernels& mixed_kernels,
-    const Arg& args);
+TaskOutputTensors
+pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args);
 
 // =============================================================================
 // Flow Control
@@ -174,7 +182,7 @@ TaskOutputTensors pto2_submit_mixed_task(PTO2OrchestratorState* orch,
  *
  * Signals to scheduler that no more tasks will be submitted.
  */
-void pto2_orchestrator_done(PTO2OrchestratorState* orch);
+void pto2_orchestrator_done(PTO2OrchestratorState *orch);
 
 // =============================================================================
 // Debug Utilities
@@ -183,12 +191,12 @@ void pto2_orchestrator_done(PTO2OrchestratorState* orch);
 /**
  * Print orchestrator statistics
  */
-void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch);
+void pto2_orchestrator_print_stats(PTO2OrchestratorState *orch);
 
 /**
  * Print scope stack state
  */
-void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch);
+void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState *orch);
 
 // =============================================================================
 // Orchestrator Profiling Data
@@ -197,16 +205,16 @@ void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch);
 #if PTO2_ORCH_PROFILING
 struct PTO2OrchProfilingData {
     uint64_t sync_cycle;
-    uint64_t alloc_cycle;           // Combined task slot + heap allocation
+    uint64_t alloc_cycle;  // Combined task slot + heap allocation
     uint64_t args_cycle;
     uint64_t lookup_cycle;
     uint64_t insert_cycle;
     uint64_t fanin_cycle;
     uint64_t scope_end_cycle;
-    int64_t  submit_count;
+    int64_t submit_count;
     // Wait time tracking for blocking phases
-    uint64_t alloc_wait_cycle;      // Cycles spent waiting in unified alloc
-    uint64_t fanin_wait_cycle;      // Cycles spent waiting in fanout_lock
+    uint64_t alloc_wait_cycle;  // Cycles spent waiting in unified alloc
+    uint64_t fanin_wait_cycle;  // Cycles spent waiting in fanout_lock
     // Atomic operation counts per phase
     uint64_t alloc_atomic_count;
     uint64_t args_atomic_count;

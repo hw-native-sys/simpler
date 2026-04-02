@@ -34,16 +34,16 @@
 
 extern "C" {
 
-__attribute__((visibility("default"))) PTO2OrchestrationConfig aicpu_orchestration_config(
-    const ChipStorageTaskArgs& orch_args) {
+__attribute__((visibility("default"))) PTO2OrchestrationConfig
+aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;  // NOLINT(readability/casting)
     return PTO2OrchestrationConfig{
         .expected_arg_count = 1,
     };
 }
 
-static void submit_spmd_mix(
-    int32_t aic_id, int32_t aiv0_id, int32_t aiv1_id, Tensor& out, int16_t block_num, int64_t base_cl) {
+static void
+submit_spmd_mix(int32_t aic_id, int32_t aiv0_id, int32_t aiv1_id, Tensor &out, int16_t block_num, int64_t base_cl) {
     MixedKernels mk;
     mk.aic_kernel_id = aic_id;
     mk.aiv0_kernel_id = aiv0_id;
@@ -56,8 +56,8 @@ static void submit_spmd_mix(
     pto2_rt_submit_task(mk, args);
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    const ChipStorageTaskArgs& orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;  // NOLINT(readability/casting)
     if (orch_thread_index != 0) return;
 

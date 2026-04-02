@@ -66,7 +66,7 @@ Runtime::Runtime() {
 // Tensor Pair Management
 // =============================================================================
 
-void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
+void Runtime::record_tensor_pair(void *host_ptr, void *dev_ptr, size_t size) {
     if (tensor_pair_count >= RUNTIME_MAX_TENSOR_PAIRS) {
         LOG_ERROR("[Runtime] Tensor pairs full (max=%d)", RUNTIME_MAX_TENSOR_PAIRS);
         return;
@@ -78,7 +78,7 @@ void Runtime::record_tensor_pair(void* host_ptr, void* dev_ptr, size_t size) {
     LOG_INFO("Recorded tensor pair: host=%p dev=%p size=%zu", host_ptr, dev_ptr, size);
 }
 
-TensorPair* Runtime::get_tensor_pairs() { return tensor_pairs; }
+TensorPair *Runtime::get_tensor_pairs() { return tensor_pairs; }
 
 int Runtime::get_tensor_pair_count() const { return tensor_pair_count; }
 
@@ -89,18 +89,18 @@ void Runtime::clear_tensor_pairs() { tensor_pair_count = 0; }
 // =============================================================================
 
 bool Runtime::get_orch_built_on_host() const { return orch_built_on_host_; }
-void* Runtime::get_pto2_gm_sm_ptr() const { return pto2_gm_sm_ptr_; }
-void* Runtime::get_pto2_gm_heap_ptr() const { return pto2_gm_heap_ptr_; }
-const ChipStorageTaskArgs& Runtime::get_orch_args() const { return orch_args_storage_; }
+void *Runtime::get_pto2_gm_sm_ptr() const { return pto2_gm_sm_ptr_; }
+void *Runtime::get_pto2_gm_heap_ptr() const { return pto2_gm_heap_ptr_; }
+const ChipStorageTaskArgs &Runtime::get_orch_args() const { return orch_args_storage_; }
 void Runtime::set_orch_built_on_host(bool v) { orch_built_on_host_ = v; }
-void Runtime::set_pto2_gm_sm_ptr(void* p) { pto2_gm_sm_ptr_ = p; }
-void Runtime::set_pto2_gm_heap(void* p) { pto2_gm_heap_ptr_ = p; }
-void Runtime::set_pto2_slot_states_ptr(void* p) { pto2_slot_states_ptr_ = p; }
-void Runtime::set_orch_args(const ChipStorageTaskArgs& args) { orch_args_storage_ = args; }
+void Runtime::set_pto2_gm_sm_ptr(void *p) { pto2_gm_sm_ptr_ = p; }
+void Runtime::set_pto2_gm_heap(void *p) { pto2_gm_heap_ptr_ = p; }
+void Runtime::set_pto2_slot_states_ptr(void *p) { pto2_slot_states_ptr_ = p; }
+void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
 
 // Device orchestration SO binary (for dlopen on AICPU thread 3)
 // Copies data to internal storage to avoid lifetime issues with Python ctypes arrays
-void Runtime::set_device_orch_so(const void* data, size_t size) {
+void Runtime::set_device_orch_so(const void *data, size_t size) {
     if (data == nullptr || size == 0) {
         device_orch_so_size_ = 0;
         return;
@@ -114,7 +114,7 @@ void Runtime::set_device_orch_so(const void* data, size_t size) {
     device_orch_so_size_ = size;
 }
 
-const void* Runtime::get_device_orch_so_data() const {
+const void *Runtime::get_device_orch_so_data() const {
     return device_orch_so_size_ > 0 ? device_orch_so_storage_ : nullptr;
 }
 

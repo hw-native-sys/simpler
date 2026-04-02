@@ -44,16 +44,16 @@ constexpr int BATCH = 1;
 
 constexpr size_t TILE_BYTES = TILE * TILE * sizeof(float);
 
-int build_bgemm_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
+int build_bgemm_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
     // Expected orch_args: [A, B, C] — 3 tensors
     if (orch_args.tensor_count() < 3) {
         std::cerr << "build_bgemm_graph: Expected at least 3 tensors, got " << orch_args.tensor_count() << '\n';
         return -1;
     }
 
-    void* host_A = orch_args.tensor(0).data_as<void>();
-    void* host_B = orch_args.tensor(1).data_as<void>();
-    void* host_C = orch_args.tensor(2).data_as<void>();
+    void *host_A = orch_args.tensor(0).data_as<void>();
+    void *host_B = orch_args.tensor(1).data_as<void>();
+    void *host_C = orch_args.tensor(2).data_as<void>();
     size_t size_A = orch_args.tensor(0).nbytes();
     size_t size_B = orch_args.tensor(1).nbytes();
     size_t size_C = orch_args.tensor(2).nbytes();
@@ -62,18 +62,18 @@ int build_bgemm_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
     std::cout << "Grid: " << GRID_M << " x " << GRID_K << " x " << GRID_N << '\n';
 
     // Allocate device memory and copy inputs
-    void* dev_A = runtime->host_api.device_malloc(size_A);
+    void *dev_A = runtime->host_api.device_malloc(size_A);
     if (!dev_A) return -1;
     runtime->host_api.copy_to_device(dev_A, host_A, size_A);
 
-    void* dev_B = runtime->host_api.device_malloc(size_B);
+    void *dev_B = runtime->host_api.device_malloc(size_B);
     if (!dev_B) {
         runtime->host_api.device_free(dev_A);
         return -1;
     }
     runtime->host_api.copy_to_device(dev_B, host_B, size_B);
 
-    void* dev_C = runtime->host_api.device_malloc(size_C);
+    void *dev_C = runtime->host_api.device_malloc(size_C);
     if (!dev_C) {
         runtime->host_api.device_free(dev_A);
         runtime->host_api.device_free(dev_B);
@@ -84,7 +84,7 @@ int build_bgemm_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
 
     // Allocate intermediate P buffers (one per C tile)
     constexpr int NUM_P_BUFFERS = BATCH * GRID_M * GRID_N;
-    std::vector<void*> dev_P(NUM_P_BUFFERS, nullptr);
+    std::vector<void *> dev_P(NUM_P_BUFFERS, nullptr);
     for (int i = 0; i < NUM_P_BUFFERS; i++) {
         dev_P[i] = runtime->host_api.device_malloc(TILE_BYTES);
         if (!dev_P[i]) {
@@ -115,8 +115,8 @@ int build_bgemm_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
 
                     // Task 1: P = A[m,k] @ B[k,n] (gemm_tile on Cube core)
                     uint64_t args_gemm[6];
-                    args_gemm[0] = reinterpret_cast<uint64_t>(static_cast<char*>(dev_A) + A_offset);
-                    args_gemm[1] = reinterpret_cast<uint64_t>(static_cast<char*>(dev_B) + B_offset);
+                    args_gemm[0] = reinterpret_cast<uint64_t>(static_cast<char *>(dev_A) + A_offset);
+                    args_gemm[1] = reinterpret_cast<uint64_t>(static_cast<char *>(dev_B) + B_offset);
                     args_gemm[2] = reinterpret_cast<uint64_t>(dev_P[c_tile_idx]);
                     args_gemm[3] = TILE;
                     args_gemm[4] = TILE;
@@ -125,9 +125,9 @@ int build_bgemm_graph(Runtime* runtime, const ChipStorageTaskArgs& orch_args) {
 
                     // Task 2: C[m,n] = C[m,n] + P (tile_add on Vector core)
                     uint64_t args_add[5];
-                    args_add[0] = reinterpret_cast<uint64_t>(static_cast<char*>(dev_C) + C_offset);
+                    args_add[0] = reinterpret_cast<uint64_t>(static_cast<char *>(dev_C) + C_offset);
                     args_add[1] = reinterpret_cast<uint64_t>(dev_P[c_tile_idx]);
-                    args_add[2] = reinterpret_cast<uint64_t>(static_cast<char*>(dev_C) + C_offset);
+                    args_add[2] = reinterpret_cast<uint64_t>(static_cast<char *>(dev_C) + C_offset);
                     args_add[3] = TILE;
                     args_add[4] = TILE;
                     int t_add = runtime->add_task(args_add, 5, 1, CoreType::AIV);

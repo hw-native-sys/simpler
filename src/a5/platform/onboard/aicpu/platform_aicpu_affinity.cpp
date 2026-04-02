@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 #include "aicpu/platform_aicpu_affinity.h"
 
 #include <atomic>
@@ -21,9 +31,7 @@ static std::atomic<int32_t> s_gate_ready{0};
 static int32_t s_thread_cpu[MAX_GATE_THREADS];
 static bool s_thread_survive[MAX_GATE_THREADS];
 
-static inline int32_t popcount64(uint64_t v) {
-    return __builtin_popcountll(static_cast<unsigned long long>(v));
-}
+static inline int32_t popcount64(uint64_t v) { return __builtin_popcountll(static_cast<unsigned long long>(v)); }
 
 bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched) {
     if (logical_count >= total_launched) {
@@ -55,13 +63,11 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
 
     // Barrier: wait until all total_launched threads have reported
     while (popcount64(s_cpumask.load(std::memory_order_acquire)) < total_launched &&
-           s_reported.load(std::memory_order_acquire) < total_launched) {
-    }
+           s_reported.load(std::memory_order_acquire) < total_launched) {}
 
     // CAS winner does cluster classification
     int32_t expected = 0;
-    if (s_gate_init.compare_exchange_strong(expected, 1,
-            std::memory_order_acq_rel, std::memory_order_acquire)) {
+    if (s_gate_init.compare_exchange_strong(expected, 1, std::memory_order_acq_rel, std::memory_order_acquire)) {
         // Initialize survive flags
         for (int32_t i = 0; i < total_launched; ++i) {
             s_thread_survive[i] = false;
@@ -78,7 +84,7 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
             if (c < 0) continue;
             int32_t cluster_id = c / CPUS_PER_CLUSTER;
             if (cluster_id < 0 || cluster_id >= MAX_CLUSTERS) continue;
-            ClusterInfo& info = clusters[cluster_id];
+            ClusterInfo &info = clusters[cluster_id];
             if (info.count < MAX_GATE_THREADS) info.tids[info.count++] = tid;
         }
 
@@ -87,8 +93,10 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
         int32_t major_cnt = clusters[major_id].count;
         int32_t minor_cnt = clusters[minor_id].count;
 
-        LOG_INFO("AICPU affinity gate: major=%d(cnt=%d) minor=%d(cnt=%d) logical=%d",
-                 major_id, major_cnt, minor_id, minor_cnt, logical_count);
+        LOG_INFO(
+            "AICPU affinity gate: major=%d(cnt=%d) minor=%d(cnt=%d) logical=%d", major_id, major_cnt, minor_id,
+            minor_cnt, logical_count
+        );
 
         if (major_cnt == logical_count && minor_cnt == (total_launched - logical_count)) {
             // Expected topology: major cluster threads survive
@@ -97,9 +105,11 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
             }
         } else {
             // Unexpected topology: fall back to first logical_count threads
-            LOG_WARN("AICPU affinity gate: unexpected topology (major=%d minor=%d), "
-                     "falling back to index-based cutoff",
-                     major_cnt, minor_cnt);
+            LOG_WARN(
+                "AICPU affinity gate: unexpected topology (major=%d minor=%d), "
+                "falling back to index-based cutoff",
+                major_cnt, minor_cnt
+            );
             for (int32_t i = 0; i < logical_count && i < total_launched; ++i) {
                 s_thread_survive[i] = true;
             }
@@ -109,8 +119,7 @@ bool platform_aicpu_affinity_gate(int32_t logical_count, int32_t total_launched)
     }
 
     // Wait for classification to complete
-    while (s_gate_ready.load(std::memory_order_acquire) == 0) {
-    }
+    while (s_gate_ready.load(std::memory_order_acquire) == 0) {}
 
     bool survive = (idx < total_launched) ? s_thread_survive[idx] : false;
 

@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 // Softmax Preparation Kernel (AIV)
 //
 // Fixed tile size: sij is (16, 16)
@@ -21,16 +31,16 @@ using namespace pto;
 #define __aicore__ [aicore]
 #endif
 
-static __aicore__ void softmax_prepare_impl(__gm__ uint8_t* sij_raw, float scale_value,
-                                 __gm__ uint8_t* pij_raw, __gm__ uint8_t* mij_raw,
-                                 __gm__ uint8_t* lij_raw)
-{
+static __aicore__ void softmax_prepare_impl(
+    __gm__ uint8_t *sij_raw, float scale_value, __gm__ uint8_t *pij_raw, __gm__ uint8_t *mij_raw,
+    __gm__ uint8_t *lij_raw
+) {
     constexpr int M = 16, N = 16;
 
-    __gm__ float* sij = reinterpret_cast<__gm__ float*>(sij_raw);
-    __gm__ half*  pij = reinterpret_cast<__gm__ half*>(pij_raw);
-    __gm__ float* mij = reinterpret_cast<__gm__ float*>(mij_raw);
-    __gm__ float* lij = reinterpret_cast<__gm__ float*>(lij_raw);
+    __gm__ float *sij = reinterpret_cast<__gm__ float *>(sij_raw);
+    __gm__ half *pij = reinterpret_cast<__gm__ half *>(pij_raw);
+    __gm__ float *mij = reinterpret_cast<__gm__ float *>(mij_raw);
+    __gm__ float *lij = reinterpret_cast<__gm__ float *>(lij_raw);
 
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
@@ -81,14 +91,17 @@ static __aicore__ void softmax_prepare_impl(__gm__ uint8_t* sij_raw, float scale
     TSTORE(pijGlobal, pijF16Tile);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ uint8_t* sij = reinterpret_cast<__gm__ uint8_t*>(args[0]);
-    union { uint64_t u; float f; } scale_conv;
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ uint8_t *sij = reinterpret_cast<__gm__ uint8_t *>(args[0]);
+    union {
+        uint64_t u;
+        float f;
+    } scale_conv;
     scale_conv.u = static_cast<uint64_t>(args[1]);
     float scale_value = scale_conv.f;
-    __gm__ uint8_t* pij = reinterpret_cast<__gm__ uint8_t*>(args[2]);
-    __gm__ uint8_t* mij = reinterpret_cast<__gm__ uint8_t*>(args[3]);
-    __gm__ uint8_t* lij = reinterpret_cast<__gm__ uint8_t*>(args[4]);
+    __gm__ uint8_t *pij = reinterpret_cast<__gm__ uint8_t *>(args[2]);
+    __gm__ uint8_t *mij = reinterpret_cast<__gm__ uint8_t *>(args[3]);
+    __gm__ uint8_t *lij = reinterpret_cast<__gm__ uint8_t *>(args[4]);
 
     softmax_prepare_impl(sij, scale_value, pij, mij, lij);
 }

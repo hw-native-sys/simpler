@@ -1,3 +1,13 @@
+/*
+ * Copyright (c) PyPTO Contributors.
+ * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+ * CANN Open Software License Agreement Version 2.0 (the "License").
+ * Please refer to the License for details. You may not use this file except in compliance with the License.
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+ * See LICENSE in the root of the software repository for the full text of the License.
+ * -----------------------------------------------------------------------------------------------------------
+ */
 /**
  * Standalone Element-wise Multiplication Kernel (AIV1 slot)
  *
@@ -28,11 +38,7 @@ using namespace pto;
 #endif
 
 template <int ROWS, int COLS>
-static __aicore__ void mul_impl(
-    __gm__ float* src0,
-    __gm__ float* src1,
-    __gm__ float* out) {
-
+static __aicore__ void mul_impl(__gm__ float *src0, __gm__ float *src1, __gm__ float *out) {
     using DynShapeDim5 = Shape<1, 1, 1, ROWS, COLS>;
     using DynStridDim5 = Stride<1, 1, 1, COLS, 1>;
     using GlobalData = GlobalTensor<float, DynShapeDim5, DynStridDim5>;
@@ -61,14 +67,14 @@ static __aicore__ void mul_impl(
     wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
-    __gm__ Tensor* src0_tensor = reinterpret_cast<__gm__ Tensor*>(args[3]);
-    __gm__ Tensor* src1_tensor = reinterpret_cast<__gm__ Tensor*>(args[4]);
-    __gm__ Tensor* out_tensor = reinterpret_cast<__gm__ Tensor*>(args[5]);
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *src0_tensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *src1_tensor = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[5]);
 
-    __gm__ float* src0 = reinterpret_cast<__gm__ float*>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
-    __gm__ float* src1 = reinterpret_cast<__gm__ float*>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
-    __gm__ float* out = reinterpret_cast<__gm__ float*>(out_tensor->buffer.addr) + out_tensor->start_offset;
+    __gm__ float *src0 = reinterpret_cast<__gm__ float *>(src0_tensor->buffer.addr) + src0_tensor->start_offset;
+    __gm__ float *src1 = reinterpret_cast<__gm__ float *>(src1_tensor->buffer.addr) + src1_tensor->start_offset;
+    __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
     mul_impl<128, 128>(src0, src1, out);
 }

@@ -32,17 +32,17 @@ inline constexpr uint32_t CALLABLE_ALIGN = 64;
 
 static inline uint32_t callable_align_up(uint32_t size) { return (size + CALLABLE_ALIGN - 1) & ~(CALLABLE_ALIGN - 1); }
 
-inline const char* arg_direction_name(ArgDirection d) {
+inline const char *arg_direction_name(ArgDirection d) {
     switch (d) {
-        case ArgDirection::SCALAR:
-            return "SCALAR";
-        case ArgDirection::IN:
-            return "IN";
-        case ArgDirection::OUT:
-            return "OUT";
-        case ArgDirection::INOUT:
-            return "INOUT";
-        default:
-            return "UNKNOWN";
+    case ArgDirection::SCALAR:
+        return "SCALAR";
+    case ArgDirection::IN:
+        return "IN";
+    case ArgDirection::OUT:
+        return "OUT";
+    case ArgDirection::INOUT:
+        return "INOUT";
+    default:
+        return "UNKNOWN";
     }
 }

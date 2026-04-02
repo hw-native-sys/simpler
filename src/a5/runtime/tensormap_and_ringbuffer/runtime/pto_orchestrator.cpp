@@ -53,8 +53,8 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // Weak fallback for builds that don't link performance_collector_aicpu.cpp.
 // The strong symbol from the AICPU build wins when profiling is available.
 // Also hidden to prevent HOST .so from polluting the global symbol table.
-__attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
-    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
+__attribute__((weak, visibility("hidden"))) void
+perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 // Accumulated cycles per sub-step (only needed for ORCH_PROFILING export)
 static uint64_t g_orch_sync_cycle = 0;       // tensormap sync
 static uint64_t g_orch_alloc_cycle = 0;      // unified task+heap alloc
@@ -90,8 +90,8 @@ uint64_t g_orch_scope_end_atomic_count = 0;
 #include "aicpu/device_time.h"
 #include "aicpu/performance_collector_aicpu.h"
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
-__attribute__((weak, visibility("hidden"))) void perf_aicpu_record_orch_phase(
-    AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
+__attribute__((weak, visibility("hidden"))) void
+perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
 static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_START()                     \
@@ -118,11 +118,10 @@ static uint32_t g_orch_submit_idx = 0;
 // Orchestrator Initialization
 // =============================================================================
 
-bool pto2_orchestrator_init(PTO2OrchestratorState* orch,
-    PTO2SharedMemoryHandle* sm_handle,
-    void* gm_heap,
-    uint64_t heap_size,
-    int32_t dep_pool_capacity) {
+bool pto2_orchestrator_init(
+    PTO2OrchestratorState *orch, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
+    int32_t dep_pool_capacity
+) {
     *orch = PTO2OrchestratorState{};
 
     orch->sm_handle = sm_handle;
@@ -132,21 +131,18 @@ bool pto2_orchestrator_init(PTO2OrchestratorState* orch,
 
     // Initialize per-ring resources
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        void* ring_heap_base = reinterpret_cast<char*>(gm_heap) + r * heap_size;
-        auto& fc = sm_handle->header->rings[r].fc;
+        void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + r * heap_size;
+        auto &fc = sm_handle->header->rings[r].fc;
 
         // Initialize unified task allocator
-        orch->rings[r].task_allocator.init(sm_handle->task_descriptors[r],
-            sm_handle->header->rings[r].task_window_size,
-            &fc.current_task_index,
-            &fc.last_task_alive,
-            ring_heap_base,
-            heap_size,
-            &sm_handle->header->orch_error_code);
+        orch->rings[r].task_allocator.init(
+            sm_handle->task_descriptors[r], sm_handle->header->rings[r].task_window_size, &fc.current_task_index,
+            &fc.last_task_alive, ring_heap_base, heap_size, &sm_handle->header->orch_error_code
+        );
 
         // Allocate and initialize dependency list pool (per-ring)
-        PTO2DepListEntry* dep_entries =
-            reinterpret_cast<PTO2DepListEntry*>(calloc(dep_pool_capacity, sizeof(PTO2DepListEntry)));
+        PTO2DepListEntry *dep_entries =
+            reinterpret_cast<PTO2DepListEntry *>(calloc(dep_pool_capacity, sizeof(PTO2DepListEntry)));
         if (!dep_entries) {
             // Cleanup previously allocated rings
             for (int j = 0; j < r; j++) {
@@ -173,8 +169,8 @@ bool pto2_orchestrator_init(PTO2OrchestratorState* orch,
     // Initialize scope stack: one flat buffer for task IDs + one array for begin offsets
     uint64_t max_depth = PTO2_MAX_SCOPE_DEPTH;
     int32_t init_cap = PTO2_SCOPE_TASKS_INIT_CAP;
-    orch->scope_tasks = reinterpret_cast<PTO2TaskSlotState**>(malloc(init_cap * sizeof(PTO2TaskSlotState*)));
-    orch->scope_begins = reinterpret_cast<int32_t*>(malloc(max_depth * sizeof(int32_t)));
+    orch->scope_tasks = reinterpret_cast<PTO2TaskSlotState **>(malloc(init_cap * sizeof(PTO2TaskSlotState *)));
+    orch->scope_begins = reinterpret_cast<int32_t *>(malloc(max_depth * sizeof(int32_t)));
     if (!orch->scope_tasks || !orch->scope_begins) {
         free(orch->scope_tasks);
         free(orch->scope_begins);
@@ -192,7 +188,7 @@ bool pto2_orchestrator_init(PTO2OrchestratorState* orch,
     return true;
 }
 
-void pto2_orchestrator_destroy(PTO2OrchestratorState* orch) {
+void pto2_orchestrator_destroy(PTO2OrchestratorState *orch) {
     orch->tensor_map.destroy();
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -206,7 +202,7 @@ void pto2_orchestrator_destroy(PTO2OrchestratorState* orch) {
     orch->scope_begins = NULL;
 }
 
-void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerState* scheduler) {
+void pto2_orchestrator_set_scheduler(PTO2OrchestratorState *orch, PTO2SchedulerState *scheduler) {
     orch->scheduler = scheduler;
 }
 
@@ -214,11 +210,11 @@ void pto2_orchestrator_set_scheduler(PTO2OrchestratorState* orch, PTO2SchedulerS
 // Scope Management
 // =============================================================================
 
-static void scope_tasks_push(PTO2OrchestratorState* orch, PTO2TaskSlotState* task_slot_state) {
+static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state) {
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
         int32_t new_cap = orch->scope_tasks_capacity * 2;
-        PTO2TaskSlotState** new_buf =
-            reinterpret_cast<PTO2TaskSlotState**>(realloc(orch->scope_tasks, new_cap * sizeof(PTO2TaskSlotState*)));
+        PTO2TaskSlotState **new_buf =
+            reinterpret_cast<PTO2TaskSlotState **>(realloc(orch->scope_tasks, new_cap * sizeof(PTO2TaskSlotState *)));
         assert(new_buf && "Failed to grow scope task buffer");
         orch->scope_tasks = new_buf;
         orch->scope_tasks_capacity = new_cap;
@@ -226,7 +222,7 @@ static void scope_tasks_push(PTO2OrchestratorState* orch, PTO2TaskSlotState* tas
     orch->scope_tasks[orch->scope_tasks_size++] = task_slot_state;
 }
 
-void pto2_scope_begin(PTO2OrchestratorState* orch) {
+void pto2_scope_begin(PTO2OrchestratorState *orch) {
     if (orch->fatal) {
         return;
     }
@@ -236,7 +232,7 @@ void pto2_scope_begin(PTO2OrchestratorState* orch) {
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
 }
 
-void pto2_scope_end(PTO2OrchestratorState* orch) {
+void pto2_scope_end(PTO2OrchestratorState *orch) {
     if (orch->fatal) {
         return;
     }
@@ -266,8 +262,8 @@ void pto2_scope_end(PTO2OrchestratorState* orch) {
 // =============================================================================
 // Task Submission
 // =============================================================================
-TaskOutputTensors pto2_submit_mixed_task(
-    PTO2OrchestratorState* orch, const MixedKernels& mixed_kernels, const Arg& args) {
+TaskOutputTensors
+pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args) {
     CYCLE_COUNT_START();
 
     TaskOutputTensors result;
@@ -293,9 +289,9 @@ TaskOutputTensors pto2_submit_mixed_task(
 
     // Determine which ring this task belongs to
     uint8_t ring_id = orch->current_ring_id();
-    auto& allocator = orch->rings[ring_id].task_allocator;
-    PTO2SchedulerState* sched = orch->scheduler;
-    PTO2RingFlowControl& fc = orch->sm_handle->header->rings[ring_id].fc;
+    auto &allocator = orch->rings[ring_id].task_allocator;
+    PTO2SchedulerState *sched = orch->scheduler;
+    PTO2RingFlowControl &fc = orch->sm_handle->header->rings[ring_id].fc;
 
     // === Validate submit inputs ===
     uint8_t active_mask = pto2_mixed_kernels_to_active_mask(mixed_kernels);
@@ -331,7 +327,8 @@ TaskOutputTensors pto2_submit_mixed_task(
             LOG_ERROR("FATAL: Scope Deadlock Detected! (ring %d)", ring_id);
             LOG_ERROR("========================================");
             LOG_ERROR(
-                "Tasks in current scope (%d) >= task_window_size (%d).", scope_task_count, allocator.window_size());
+                "Tasks in current scope (%d) >= task_window_size (%d).", scope_task_count, allocator.window_size()
+            );
             LOG_ERROR("  scope_depth:        %d", orch->scope_stack_top + 1);
             LOG_ERROR("  ring_id:            %d", ring_id);
             LOG_ERROR("  scope_task_count:   %d", scope_task_count);
@@ -375,8 +372,8 @@ TaskOutputTensors pto2_submit_mixed_task(
     int32_t slot = alloc_result.slot;
     PTO2TaskId task_id = pto2_make_task_id(ring_id, static_cast<uint32_t>(local_id));
 
-    PTO2TaskDescriptor& task = allocator.task_by_slot(slot);
-    PTO2TaskPayload* payload = &orch->sm_handle->task_payloads[ring_id][slot];
+    PTO2TaskDescriptor &task = allocator.task_by_slot(slot);
+    PTO2TaskPayload *payload = &orch->sm_handle->task_payloads[ring_id][slot];
 
     // Early write-prefetch payload GM cache lines to issue RFO in background.
     // ~130 lines of computation (lookup, insert) follow before
@@ -384,19 +381,19 @@ TaskOutputTensors pto2_submit_mixed_task(
     // Use locality=3 (PSTL1KEEP) so prefetched CLs survive lookup/insert eviction.
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         __builtin_prefetch(&payload->tensors[i], 1, 3);
-        __builtin_prefetch(reinterpret_cast<char*>(&payload->tensors[i]) + 64, 1, 3);
+        __builtin_prefetch(reinterpret_cast<char *>(&payload->tensors[i]) + 64, 1, 3);
     }
     for (int32_t i = 0; i < args.tensor_count() + args.scalar_count(); i += 8) {
         __builtin_prefetch(&payload->dispatch_args[i], 1, 3);
     }
     __builtin_prefetch(payload, 1, 3);
-    __builtin_prefetch(reinterpret_cast<char*>(payload) + 64, 1, 3);
-    __builtin_prefetch(reinterpret_cast<char*>(payload) + 128, 1, 3);
+    __builtin_prefetch(reinterpret_cast<char *>(payload) + 64, 1, 3);
+    __builtin_prefetch(reinterpret_cast<char *>(payload) + 128, 1, 3);
 
     // Initialize slot state (scheduler-private)
     if (sched) {
-        auto& rs = sched->ring_sched_states[ring_id];
-        PTO2TaskSlotState& slot_state = rs.get_slot_state_by_slot(slot);
+        auto &rs = sched->ring_sched_states[ring_id];
+        PTO2TaskSlotState &slot_state = rs.get_slot_state_by_slot(slot);
         slot_state.fanin_count = 0;
         slot_state.fanout_head = nullptr;
         slot_state.fanout_lock.store(0, std::memory_order_relaxed);
@@ -415,7 +412,7 @@ TaskOutputTensors pto2_submit_mixed_task(
     }
 
     // Temporary storage for fanin (cached slot state pointers, avoids repeated ring/slot lookups)
-    PTO2TaskSlotState* fanin_states[PTO2_MAX_INPUTS];
+    PTO2TaskSlotState *fanin_states[PTO2_MAX_INPUTS];
     int32_t fanin_count = 0;
 
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id.raw);
@@ -440,9 +437,9 @@ TaskOutputTensors pto2_submit_mixed_task(
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
     // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
-    auto fill_initial_value = [](void* addr, uint64_t buffer_size, DataType dtype, uint64_t initial_value) {
+    auto fill_initial_value = [](void *addr, uint64_t buffer_size, DataType dtype, uint64_t initial_value) {
         uint64_t elem_size = get_element_size(dtype);
-        char* dst = reinterpret_cast<char*>(addr);
+        char *dst = reinterpret_cast<char *>(addr);
         constexpr uint64_t BLK = 64;
         uint64_t blk = (buffer_size < BLK) ? buffer_size : BLK;
         for (uint64_t b = 0; b < blk; b += elem_size) {
@@ -462,61 +459,61 @@ TaskOutputTensors pto2_submit_mixed_task(
         TensorArgType ptype = args.tag(i);
 
         switch (ptype) {
-            case TensorArgType::INOUT:
-            case TensorArgType::INPUT: {
-                if (args.tensor(i).ptr->manual_dep) break;
-                // Look up producer via TensorMap (reads from cached stack tensor)
-                PTO2LookupResult lookup_result;
-                orch->tensor_map.lookup(*args.tensor(i).ptr, lookup_result);
+        case TensorArgType::INOUT:
+        case TensorArgType::INPUT: {
+            if (args.tensor(i).ptr->manual_dep) break;
+            // Look up producer via TensorMap (reads from cached stack tensor)
+            PTO2LookupResult lookup_result;
+            orch->tensor_map.lookup(*args.tensor(i).ptr, lookup_result);
 
-                for (int r = 0; r < lookup_result.count; r++) {
-                    PTO2TensorMapEntry& entry = *lookup_result.entries[r].entry;
-                    auto overlap_status = lookup_result.entries[r].overlap_status;
-                    // Check if this producer is already in fanin list (avoid duplicates)
-                    auto prod_ring = entry.producer_task_id.ring();
-                    auto prod_local = entry.producer_task_id.local();
-                    PTO2TaskSlotState* prod_state =
-                        &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
-                    bool already_added = false;
-                    for (int j = 0; j < fanin_count; j++) {
-                        if (fanin_states[j] == prod_state) {
-                            already_added = true;
-                            break;
-                        }
-                    }
-
-                    if (!already_added) {
-                        // Add to fanin list (this task depends on producer)
-                        if (fanin_count < PTO2_MAX_INPUTS) {
-                            fanin_states[fanin_count++] = prod_state;
-                        }
-                    }
-                    if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
-                        if (!entry.with_alloc) {
-                            orch->tensor_map.remove_entry(entry);
-                        }
+            for (int r = 0; r < lookup_result.count; r++) {
+                PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
+                auto overlap_status = lookup_result.entries[r].overlap_status;
+                // Check if this producer is already in fanin list (avoid duplicates)
+                auto prod_ring = entry.producer_task_id.ring();
+                auto prod_local = entry.producer_task_id.local();
+                PTO2TaskSlotState *prod_state =
+                    &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
+                bool already_added = false;
+                for (int j = 0; j < fanin_count; j++) {
+                    if (fanin_states[j] == prod_state) {
+                        already_added = true;
+                        break;
                     }
                 }
-                break;
-            }
 
-            case TensorArgType::OUTPUT: {
-                const TensorCreateInfo& ci = args.tensor(i).create_info;
-                uint64_t buffer_size = ci.buffer_size_bytes();
-                uint64_t alloc_addr =
-                    reinterpret_cast<uint64_t>(reinterpret_cast<char*>(alloc_result.packed_base) + offset);
-                offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
-                result.output_ptr(result.output_count)
-                    ->init_from_create_info(ci, reinterpret_cast<void*>(alloc_addr), /*version=*/0);
-                if (ci.has_initial_value) {
-                    fill_initial_value(reinterpret_cast<void*>(alloc_addr), buffer_size, ci.dtype, ci.initial_value);
+                if (!already_added) {
+                    // Add to fanin list (this task depends on producer)
+                    if (fanin_count < PTO2_MAX_INPUTS) {
+                        fanin_states[fanin_count++] = prod_state;
+                    }
                 }
-                result.output_count++;
-                break;
+                if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                    if (!entry.with_alloc) {
+                        orch->tensor_map.remove_entry(entry);
+                    }
+                }
             }
+            break;
+        }
 
-            default:
-                break;
+        case TensorArgType::OUTPUT: {
+            const TensorCreateInfo &ci = args.tensor(i).create_info;
+            uint64_t buffer_size = ci.buffer_size_bytes();
+            uint64_t alloc_addr =
+                reinterpret_cast<uint64_t>(reinterpret_cast<char *>(alloc_result.packed_base) + offset);
+            offset += PTO2_ALIGN_UP(buffer_size, PTO2_PACKED_OUTPUT_ALIGN);
+            result.output_ptr(result.output_count)
+                ->init_from_create_info(ci, reinterpret_cast<void *>(alloc_addr), /*version=*/0);
+            if (ci.has_initial_value) {
+                fill_initial_value(reinterpret_cast<void *>(alloc_addr), buffer_size, ci.dtype, ci.initial_value);
+            }
+            result.output_count++;
+            break;
+        }
+
+        default:
+            break;
         }
     }
 
@@ -528,10 +525,10 @@ TaskOutputTensors pto2_submit_mixed_task(
         for (int i = 0; i < args.tensor_count(); i++) {
             TensorArgType ptype = args.tag(i);
             if (ptype == TensorArgType::OUTPUT || ptype == TensorArgType::INOUT) {
-                bool skip_dep = (ptype == TensorArgType::OUTPUT) ? args.tensor(i).create_info.manual_dep
-                                                                 : args.tensor(i).ptr->manual_dep;
+                bool skip_dep = (ptype == TensorArgType::OUTPUT) ? args.tensor(i).create_info.manual_dep :
+                                                                   args.tensor(i).ptr->manual_dep;
                 if (!skip_dep) {
-                    const Tensor& t =
+                    const Tensor &t =
                         (ptype == TensorArgType::OUTPUT) ? *result.output_ptr(out_idx) : *args.tensor(i).ptr;
                     orch->tensor_map.insert(t, task_id, needs_alloc[i]);
                 }
@@ -558,7 +555,7 @@ TaskOutputTensors pto2_submit_mixed_task(
     // Prefetch producer slot_states and cur_slot_state (written at init but likely
     // evicted by lookup/insert/heap). param_copy below provides hide time.
     if (sched) {
-        auto& rs = sched->ring_sched_states[ring_id];
+        auto &rs = sched->ring_sched_states[ring_id];
         __builtin_prefetch(&rs.get_slot_state_by_slot(slot), 1, 0);
         for (int i = 0; i < fanin_count; i++) {
             __builtin_prefetch(fanin_states[i], 1, 0);
@@ -575,14 +572,14 @@ TaskOutputTensors pto2_submit_mixed_task(
     // === STEP 6: Finalize fanin list ===
     // First build the fanin list
     if (sched) {
-        auto& rs = sched->ring_sched_states[ring_id];
-        PTO2TaskSlotState& cur_slot_state = rs.get_slot_state_by_slot(slot);
+        auto &rs = sched->ring_sched_states[ring_id];
+        PTO2TaskSlotState &cur_slot_state = rs.get_slot_state_by_slot(slot);
         // Initialize scheduler state BEFORE adding to producer fanout lists,
         // so concurrent on_mixed_task_complete can safely access task_state/fanout_refcount.
         cur_slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
         cur_slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
 
-        auto& dep_pool = orch->rings[ring_id].dep_pool;
+        auto &dep_pool = orch->rings[ring_id].dep_pool;
         // Ensure dep pool has space: fanin_count entries + 1 pre-alloc
         dep_pool.ensure_space(*sched, fc, ring_id, fanin_count + 1);
 
@@ -593,7 +590,7 @@ TaskOutputTensors pto2_submit_mixed_task(
             payload->fanin_slot_states[i] = fanin_states[i];
         }
         for (int i = 0; i < fanin_count; i++) {
-            PTO2TaskSlotState& producer_slot_state = *fanin_states[i];
+            PTO2TaskSlotState &producer_slot_state = *fanin_states[i];
 #if PTO2_ORCH_PROFILING
             pto2_fanout_lock(producer_slot_state, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
 #else
@@ -648,21 +645,18 @@ TaskOutputTensors pto2_submit_mixed_task(
 // Flow Control
 // =============================================================================
 
-void pto2_orchestrator_done(PTO2OrchestratorState* orch) {
+void pto2_orchestrator_done(PTO2OrchestratorState *orch) {
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         int32_t total_tasks = orch->rings[r].task_allocator.active_count();
         if (total_tasks > 0) {
             LOG_INFO("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
         }
-        auto& pool = orch->rings[r].dep_pool;
+        auto &pool = orch->rings[r].dep_pool;
         if (pool.top > 0) {
-            LOG_INFO("=== [DepPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===",
-                r,
-                pool.top,
-                pool.tail,
-                pool.top - pool.tail,
-                pool.high_water,
-                pool.capacity);
+            LOG_INFO(
+                "=== [DepPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===", r, pool.top, pool.tail,
+                pool.top - pool.tail, pool.high_water, pool.capacity
+            );
         }
     }
     orch->sm_handle->header->orchestrator_done.store(1, std::memory_order_release);
@@ -675,7 +669,7 @@ void pto2_orchestrator_done(PTO2OrchestratorState* orch) {
 // Debug Utilities
 // =============================================================================
 
-void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
+void pto2_orchestrator_print_stats(PTO2OrchestratorState *orch) {
     LOG_INFO("=== Orchestrator Statistics ===");
 #if PTO2_PROFILING
     LOG_INFO("Tasks submitted:     %" PRId64, orch->tasks_submitted);
@@ -687,19 +681,20 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState* orch) {
         int32_t active = orch->rings[r].task_allocator.active_count();
         if (active > 0) {
             LOG_INFO("Ring %d task active:  %d", r, active);
-            LOG_INFO("Ring %d heap used:    %" PRIu64 " / %" PRIu64,
-                r,
-                orch->rings[r].task_allocator.heap_top(),
-                orch->rings[r].task_allocator.heap_capacity());
             LOG_INFO(
-                "Ring %d dep pool:     %d / %d", r, orch->rings[r].dep_pool.used(), orch->rings[r].dep_pool.capacity);
+                "Ring %d heap used:    %" PRIu64 " / %" PRIu64, r, orch->rings[r].task_allocator.heap_top(),
+                orch->rings[r].task_allocator.heap_capacity()
+            );
+            LOG_INFO(
+                "Ring %d dep pool:     %d / %d", r, orch->rings[r].dep_pool.used(), orch->rings[r].dep_pool.capacity
+            );
         }
     }
     LOG_INFO("TensorMap valid:     %d", orch->tensor_map.valid_count());
     LOG_INFO("===============================");
 }
 
-void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState* orch) {
+void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState *orch) {
     LOG_INFO("=== Scope Stack ===");
     LOG_INFO("Depth: %d", orch->scope_stack_top + 1);
 

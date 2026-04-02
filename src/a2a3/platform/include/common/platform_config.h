@@ -164,7 +164,7 @@ constexpr uint32_t AICORE_COREID_MASK = 0x0FFF;
 /**
  * Register identifier for unified read_reg/write_reg interface
  */
-enum class RegId : uint32_t {
+enum class RegId : uint8_t {
     DATA_MAIN_BASE = 0,    // Task dispatch (AICPU→AICore)
     COND = 1,              // Status (AICore→AICPU)
     FAST_PATH_ENABLE = 2,  // Fast path control
@@ -175,12 +175,12 @@ enum class RegId : uint32_t {
  */
 constexpr uint32_t reg_offset(RegId reg) {
     switch (reg) {
-        case RegId::DATA_MAIN_BASE:
-            return REG_SPR_DATA_MAIN_BASE_OFFSET;
-        case RegId::COND:
-            return REG_SPR_COND_OFFSET;
-        case RegId::FAST_PATH_ENABLE:
-            return REG_SPR_FAST_PATH_ENABLE_OFFSET;
+    case RegId::DATA_MAIN_BASE:
+        return REG_SPR_DATA_MAIN_BASE_OFFSET;
+    case RegId::COND:
+        return REG_SPR_COND_OFFSET;
+    case RegId::FAST_PATH_ENABLE:
+        return REG_SPR_FAST_PATH_ENABLE_OFFSET;
     }
     return 0;  // unreachable: all RegId cases handled above
 }
@@ -219,8 +219,7 @@ constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = 25;
 #define TASK_ID_MASK 0x7FFFFFFFU
 #define TASK_STATE_MASK 0x80000000U
 
-#define TASK_ACK_STATE 0
-#define TASK_FIN_STATE 1
+enum : uint8_t { TASK_ACK_STATE = 0, TASK_FIN_STATE = 1 };
 
 #define EXTRACT_TASK_ID(regval) (static_cast<int>((regval) & TASK_ID_MASK))
 #define EXTRACT_TASK_STATE(regval) (static_cast<int>(((regval) & TASK_STATE_MASK) >> 31))
@@ -229,13 +228,14 @@ constexpr uint32_t PLATFORM_MAX_PHYSICAL_CORES = 25;
 
 // These values are RESERVED and must never be used as real task IDs.
 // Valid task IDs: 0 to 0x7FFFFFEF (2147483631)
-#define AICORE_IDLE_TASK_ID 0x7FFFFFFFU
+enum : uint32_t {
+    AICORE_IDLE_TASK_ID = 0x7FFFFFFFU,
+    AICORE_EXIT_TASK_ID = 0x7FFFFFFEU,
+    AICPU_IDLE_TASK_ID = 0x7FFFFFFDU,
+};
 #define AICORE_IDLE_VALUE MAKE_FIN_VALUE(AICORE_IDLE_TASK_ID)
 
-#define AICORE_EXIT_TASK_ID 0x7FFFFFFEU
 #define AICORE_EXITED_VALUE MAKE_FIN_VALUE(AICORE_EXIT_TASK_ID)
-
-#define AICPU_IDLE_TASK_ID 0x7FFFFFFDU
 
 // =============================================================================
 // Task State Constants

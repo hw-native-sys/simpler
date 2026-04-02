@@ -61,28 +61,29 @@
  * binding get_ref() on an rvalue is compile-time rejected to prevent dangling.
  */
 class TaskOutputTensors {
- public:  // NOLINT(whitespace/indent)
-    TaskOutputTensors() : output_count_(0) {}
+public:  // NOLINT(whitespace/indent)
+    TaskOutputTensors() :
+        output_count_(0) {}
 
     bool empty() const { return output_count_ == 0; }
     uint32_t size() const { return output_count_; }
 
     /// Borrow a materialized output tensor by index (lvalue only).
-    const Tensor& get_ref(uint32_t index) const& {
+    const Tensor &get_ref(uint32_t index) const & {
         always_assert(index < output_count_);
         return *tensors_[index];
     }
-    const Tensor& get_ref(uint32_t index) const&& = delete;
+    const Tensor &get_ref(uint32_t index) const && = delete;
 
     /// Runtime-internal: append one materialized output Tensor.
-    void materialize_output(const Tensor& tensor) {
+    void materialize_output(const Tensor &tensor) {
         always_assert(output_count_ < PTO2_MAX_OUTPUTS);
         tensors_[output_count_++] = &tensor;
     }
 
- private:  // NOLINT(whitespace/indent)
+private:  // NOLINT(whitespace/indent)
     uint32_t output_count_;
-    const Tensor* tensors_[PTO2_MAX_OUTPUTS];
+    const Tensor *tensors_[PTO2_MAX_OUTPUTS];
 };
 
 // =============================================================================
@@ -96,9 +97,10 @@ class TaskOutputTensors {
  * The active member is determined by TensorArgType (OUTPUT → create_info, else → ptr).
  */
 union TensorRef {
-    const Tensor* ptr;
-    const TensorCreateInfo* create_info;
-    TensorRef() : ptr(nullptr) {}
+    const Tensor *ptr;
+    const TensorCreateInfo *create_info;
+    TensorRef() :
+        ptr(nullptr) {}
 };
 
 /**
@@ -126,7 +128,7 @@ union TensorRef {
  */
 struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> {
     bool has_error{false};
-    const char* error_msg{nullptr};
+    const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
 
     void reset() {
@@ -135,7 +137,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
         error_msg = nullptr;
     }
 
-    void set_error(const char* msg) {
+    void set_error(const char *msg) {
         if (!has_error) {
             has_error = true;
             error_msg = msg;
@@ -146,7 +148,8 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
         if (scalar_count_ != 0) {
             set_error(
                 "add_input/add_output/add_inout called after add_scalar: "
-                "all tensors must be added before any scalars");
+                "all tensors must be added before any scalars"
+            );
             return false;
         }
         if (tensor_count_ >= MAX_TENSOR_ARGS) {
@@ -156,7 +159,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
         return true;
     }
 
-    void add_input(const Tensor& t) {
+    void add_input(const Tensor &t) {
         if (!check_add_tensor_valid()) {
             return;
         }
@@ -168,7 +171,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
     /// Standard future-output path: runtime allocates buffer from heap,
     /// materializes Tensor into TaskOutputTensors.
     /// The TensorCreateInfo must outlive the submit call (pointer is stored).
-    void add_output(const TensorCreateInfo& ci) {
+    void add_output(const TensorCreateInfo &ci) {
         if (!check_add_tensor_valid()) {
             return;
         }
@@ -178,9 +181,9 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
     }
 
     /// Prevent passing temporaries — the pointer would dangle before submit.
-    void add_output(TensorCreateInfo&&) = delete;
+    void add_output(TensorCreateInfo &&) = delete;
 
-    void add_inout(const Tensor& t) {
+    void add_inout(const Tensor &t) {
         if (!check_add_tensor_valid()) {
             return;
         }
@@ -190,7 +193,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
     }
 
     /// Write-only existing tensor: skips OverlapMap lookup, depends on creator.
-    void add_output(const Tensor& t) {
+    void add_output(const Tensor &t) {
         if (!check_add_tensor_valid()) return;
         tensors_[tensor_count_].ptr = &t;
         tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING;
@@ -198,7 +201,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
     }
 
     /// No-dependency existing tensor: skips OverlapMap lookup, depends on creator only.
-    void add_no_dep(const Tensor& t) {
+    void add_no_dep(const Tensor &t) {
         if (!check_add_tensor_valid()) return;
         tensors_[tensor_count_].ptr = &t;
         tags_[tensor_count_] = TensorArgType::NO_DEP;
@@ -222,7 +225,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
         scalars_[scalar_count_++] = to_u64(value);
     }
 
-    void add_scalars(const uint64_t* values, int count) {
+    void add_scalars(const uint64_t *values, int count) {
         if (scalar_count_ + count > MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
@@ -237,16 +240,16 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
      * (e.g., -1 → 0x00000000FFFFFFFF, not 0xFFFFFFFFFFFFFFFF).
      * Uses NEON to process 4 elements per iteration on aarch64.
      */
-    void add_scalars_i32(const int32_t* values, int count) {
+    void add_scalars_i32(const int32_t *values, int count) {
         if (scalar_count_ + count > MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
-        uint64_t* dst = &scalars_[scalar_count_];
+        uint64_t *dst = &scalars_[scalar_count_];
 #if defined(__aarch64__)
         int i = 0;
         for (; i + 4 <= count; i += 4) {
-            uint32x4_t v = vld1q_u32(reinterpret_cast<const uint32_t*>(values + i));
+            uint32x4_t v = vld1q_u32(reinterpret_cast<const uint32_t *>(values + i));
             uint64x2_t lo = vmovl_u32(vget_low_u32(v));
             uint64x2_t hi = vmovl_u32(vget_high_u32(v));
             vst1q_u64(dst + i, lo);
@@ -267,7 +270,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
      * Copy scalars from another Arg's scalar array.
      * Useful when multiple tasks share the same scalar data (e.g., block indices).
      */
-    void copy_scalars_from(const Arg& src, int src_offset, int count) {
+    void copy_scalars_from(const Arg &src, int src_offset, int count) {
         if (src_offset + count > src.scalar_count_) {
             set_error("Source scalar range out of bounds in copy_scalars_from");
             return;

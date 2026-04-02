@@ -45,8 +45,8 @@ struct Segment {
     uint64_t begin;
     uint64_t end;
 
-    bool line_segment_intersection(const Segment& other) const { return end > other.begin && other.end > begin; }
-    bool contains(const Segment& other) const { return begin <= other.begin && other.end <= end; }
+    bool line_segment_intersection(const Segment &other) const { return end > other.begin && other.end > begin; }
+    bool contains(const Segment &other) const { return begin <= other.begin && other.end <= end; }
 };
 
 /**
@@ -65,8 +65,13 @@ struct TensorCreateInfo {
     uint64_t initial_value;
 
     TensorCreateInfo(
-        const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false)
-        : dtype(dtype), ndims(ndims), manual_dep(manual_dep), has_initial_value(false), initial_value(0) {
+        const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false
+    ) :
+        dtype(dtype),
+        ndims(ndims),
+        manual_dep(manual_dep),
+        has_initial_value(false),
+        initial_value(0) {
         for (uint32_t i = 0; i < ndims; i++) {
             raw_shapes[i] = shapes[i];
         }
@@ -126,52 +131,33 @@ struct alignas(64) Tensor {
     uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
 
     Tensor() = default;
-    Tensor(const Tensor&) = default;
-    Tensor& operator=(const Tensor&) = default;
-    Tensor(Tensor&&) = default;
-    Tensor& operator=(Tensor&&) = default;
+    Tensor(const Tensor &) = default;
+    Tensor &operator=(const Tensor &) = default;
+    Tensor(Tensor &&) = default;
+    Tensor &operator=(Tensor &&) = default;
     ~Tensor() = default;
 
     /// Return the effective raw_shapes pointer (shapes[] when is_raw_eq_shapes).
     /// Avoids cache line 2 access for the common case.
-    const uint32_t* get_raw_shapes() const { return is_raw_eq_shapes ? shapes : raw_shapes; }
+    const uint32_t *get_raw_shapes() const { return is_raw_eq_shapes ? shapes : raw_shapes; }
 
-    Tensor(void* addr,
-        uint64_t buffer_size_bytes,
-        const uint32_t raw_shapes[],
-        const uint32_t shapes[],
-        const uint32_t offsets[],
-        uint32_t ndims,
-        DataType dtype,
-        int32_t version,
-        bool is_all_offset_zero = false,
-        bool is_raw_eq_shapes = false,
-        bool manual_dep = false) {
-        init(addr,
-            buffer_size_bytes,
-            raw_shapes,
-            shapes,
-            offsets,
-            ndims,
-            dtype,
-            version,
-            is_all_offset_zero,
-            is_raw_eq_shapes,
-            manual_dep);
+    Tensor(
+        void *addr, uint64_t buffer_size_bytes, const uint32_t raw_shapes[], const uint32_t shapes[],
+        const uint32_t offsets[], uint32_t ndims, DataType dtype, int32_t version, bool is_all_offset_zero = false,
+        bool is_raw_eq_shapes = false, bool manual_dep = false
+    ) {
+        init(
+            addr, buffer_size_bytes, raw_shapes, shapes, offsets, ndims, dtype, version, is_all_offset_zero,
+            is_raw_eq_shapes, manual_dep
+        );
     }
 
     // --- Initialization ---
-    void init(void* addr,
-        uint64_t buffer_size_bytes,
-        const uint32_t in_raw_shapes[],
-        const uint32_t in_shapes[],
-        const uint32_t in_offsets[],
-        uint32_t in_ndims,
-        DataType in_dtype,
-        int32_t in_version,
-        bool in_is_all_offset_zero = false,
-        bool in_is_raw_eq_shapes = false,
-        bool in_manual_dep = false) {
+    void init(
+        void *addr, uint64_t buffer_size_bytes, const uint32_t in_raw_shapes[], const uint32_t in_shapes[],
+        const uint32_t in_offsets[], uint32_t in_ndims, DataType in_dtype, int32_t in_version,
+        bool in_is_all_offset_zero = false, bool in_is_raw_eq_shapes = false, bool in_manual_dep = false
+    ) {
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size_bytes};
         ndims = in_ndims;
         dtype = in_dtype;
@@ -194,7 +180,7 @@ struct alignas(64) Tensor {
         }
     }
 
-    void init(const Tensor& other) {
+    void init(const Tensor &other) {
         memcpy(this, &other, 64);  // fast copy cache line 1
         if (!other.is_raw_eq_shapes) {
             for (uint32_t i = 0; i < ndims; i++) {
@@ -209,7 +195,8 @@ struct alignas(64) Tensor {
     }
 
     void init_with_view(
-        const Tensor& other, const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false) {
+        const Tensor &other, const uint32_t view_shapes[], const uint32_t view_offsets[], bool in_manual_dep = false
+    ) {
         buffer = other.buffer;
         ndims = other.ndims;
         dtype = other.dtype;
@@ -218,7 +205,7 @@ struct alignas(64) Tensor {
         // view always diverges shapes from raw_shapes, so is_raw_eq_shapes = false.
         // Read parent's effective raw_shapes (avoids parent cache line 2 when parent is_raw_eq_shapes).
         is_raw_eq_shapes = false;
-        const uint32_t* parent_raw = other.get_raw_shapes();
+        const uint32_t *parent_raw = other.get_raw_shapes();
         for (uint32_t i = 0; i < ndims; i++) {
             raw_shapes[i] = parent_raw[i];
             shapes[i] = view_shapes[i];
@@ -252,7 +239,7 @@ struct alignas(64) Tensor {
             start_offset = 0;
             return;
         }
-        const uint32_t* rs = get_raw_shapes();
+        const uint32_t *rs = get_raw_shapes();
         uint64_t result = 0;
         uint64_t stride = 1;
         for (int i = static_cast<int>(ndims) - 1; i >= 0; i--) {
@@ -262,7 +249,7 @@ struct alignas(64) Tensor {
         start_offset = result;
     }
 
-    void copy(const Tensor& other) { init(other); }
+    void copy(const Tensor &other) { init(other); }
 
     Tensor view(const uint32_t view_shapes[], const uint32_t view_offsets[], bool manual_dep = false) const {
         Tensor result;
@@ -335,34 +322,28 @@ struct alignas(64) Tensor {
         return total;
     }
 
-    bool is_same_memref(const Tensor& other) const { return buffer.addr == other.buffer.addr; }
+    bool is_same_memref(const Tensor &other) const { return buffer.addr == other.buffer.addr; }
 
     /// Materialize a TensorCreateInfo into this Tensor (fresh contiguous output).
-    void init_from_create_info(const struct TensorCreateInfo& ci, void* addr, int32_t version_val) {
-        init(addr,
-            ci.buffer_size_bytes(),
-            ci.raw_shapes,
-            ci.raw_shapes,
-            nullptr,
-            ci.ndims,
-            ci.dtype,
-            version_val,
+    void init_from_create_info(const struct TensorCreateInfo &ci, void *addr, int32_t version_val) {
+        init(
+            addr, ci.buffer_size_bytes(), ci.raw_shapes, ci.raw_shapes, nullptr, ci.ndims, ci.dtype, version_val,
             /*is_all_offset_zero=*/true,
-            /*is_raw_eq_shapes=*/true,
-            ci.manual_dep);
+            /*is_raw_eq_shapes=*/true, ci.manual_dep
+        );
     }
 
     std::string dump() const {
         std::stringstream ss;
         std::string indent = "    ";
-        ss << "{" << std::endl;
-        ss << indent << "buffer.addr: " << buffer.addr << std::endl;
-        ss << indent << "buffer.size: " << buffer.size << " bytes" << std::endl;
-        ss << indent << "dtype: " << get_dtype_name(dtype) << std::endl;
-        ss << indent << "ndims: " << ndims << std::endl;
-        ss << indent << "version: " << version << std::endl;
+        ss << "{" << '\n';
+        ss << indent << "buffer.addr: " << buffer.addr << '\n';
+        ss << indent << "buffer.size: " << buffer.size << " bytes" << '\n';
+        ss << indent << "dtype: " << get_dtype_name(dtype) << '\n';
+        ss << indent << "ndims: " << ndims << '\n';
+        ss << indent << "version: " << version << '\n';
 
-        const uint32_t* rs = get_raw_shapes();
+        const uint32_t *rs = get_raw_shapes();
         ss << indent << "raw_shapes: [";
         for (uint32_t i = 0; i < ndims; i++) {
             if (i > 0) {
@@ -370,7 +351,7 @@ struct alignas(64) Tensor {
             }
             ss << rs[i];
         }
-        ss << "]" << std::endl;
+        ss << "]" << '\n';
         ss << indent << "shapes: [";
         for (uint32_t i = 0; i < ndims; i++) {
             if (i > 0) {
@@ -378,7 +359,7 @@ struct alignas(64) Tensor {
             }
             ss << shapes[i];
         }
-        ss << "]" << std::endl;
+        ss << "]" << '\n';
         ss << indent << "offsets: [";
         for (uint32_t i = 0; i < ndims; i++) {
             if (i > 0) {
@@ -386,8 +367,8 @@ struct alignas(64) Tensor {
             }
             ss << (is_all_offset_zero ? 0u : offsets[i]);
         }
-        ss << "]" << std::endl;
-        ss << "}" << std::endl;
+        ss << "]" << '\n';
+        ss << "}" << '\n';
         return ss.str();
     }
 };
@@ -403,18 +384,17 @@ using TensorData = Tensor;
 /**
  * Create a Tensor for pre-allocated external memory.
  */
-static inline Tensor make_tensor_external(void* addr,
-    const uint32_t shapes[],
-    uint32_t ndims,
-    DataType dtype = DataType::FLOAT32,
-    bool manual_dep = false,
-    int32_t version = 0) {
+static inline Tensor make_tensor_external(
+    void *addr, const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false,
+    int32_t version = 0
+) {
     static uint32_t zero_offsets[RUNTIME_MAX_TENSOR_DIMS] = {};
     uint64_t total = 1;
     for (uint32_t i = 0; i < ndims; i++) {
         total *= shapes[i];
     }
-    return Tensor(addr,
+    return {
+        addr,
         total * get_element_size(dtype),
         shapes,
         shapes,
@@ -424,5 +404,6 @@ static inline Tensor make_tensor_external(void* addr,
         version,
         /*is_all_offset_zero=*/true,
         /*is_raw_eq_shapes=*/true,
-        manual_dep);
+        manual_dep
+    };
 }

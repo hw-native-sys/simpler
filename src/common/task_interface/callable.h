@@ -71,19 +71,19 @@ struct Callable<void, MaxSig, 0> {
     // Binary data is placed at the next CALLABLE_ALIGN boundary after the fixed fields.
     // storage_ sits between the fixed fields and the aligned binary; binary_data()
     // skips the padding automatically.
-    const void* binary_data() const { return reinterpret_cast<const char*>(this) + binary_data_offset(); }
+    const void *binary_data() const { return reinterpret_cast<const char *>(this) + binary_data_offset(); }
 
     static constexpr size_t binary_data_offset() {
         constexpr size_t raw = sizeof(ArgDirection) * MaxSig + sizeof(int32_t) + sizeof(uint32_t) + sizeof(uint64_t);
         return (raw + CALLABLE_ALIGN - 1) & ~(static_cast<size_t>(CALLABLE_ALIGN) - 1);
     }
 
- private:
+private:
     Callable() = default;
 
     template <int MS>
-    friend std::vector<uint8_t> make_callable(
-        const ArgDirection* sig, int32_t sig_count, const void* binary, uint32_t binary_size);
+    friend std::vector<uint8_t>
+    make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size);
 };
 
 // ============================================================================
@@ -109,14 +109,14 @@ struct Callable {
         return signature_[i];
     }
     int32_t sig_count() const { return sig_count_; }
-    const void* binary_data() const { return storage_; }
+    const void *binary_data() const { return storage_; }
     uint32_t binary_size() const { return binary_size_; }
-    const char* func_name() const { return func_name_; }
+    const char *func_name() const { return func_name_; }
     uint32_t func_name_len() const { return func_name_len_; }
 
-    const Child& child(int32_t i) const {
+    const Child &child(int32_t i) const {
         if (i < 0 || i >= child_count_) throw std::out_of_range("Callable: child index out of range");
-        return *reinterpret_cast<const Child*>(storage_ + child_offsets_[i]);
+        return *reinterpret_cast<const Child *>(storage_ + child_offsets_[i]);
     }
     int32_t child_func_id(int32_t i) const {
         if (i < 0 || i >= child_count_) throw std::out_of_range("Callable: child_func_id index out of range");
@@ -128,18 +128,14 @@ struct Callable {
         return child_offsets_[i];
     }
 
- private:
+private:
     Callable() = default;
 
     template <typename C, int MS, int MC>
-    friend std::vector<uint8_t> make_callable(const ArgDirection* sig,
-        int32_t sig_count,
-        const char* func_name,
-        const void* binary,
-        uint32_t binary_size,
-        const int32_t* child_func_ids,
-        const std::vector<uint8_t>* child_buffers,
-        int32_t child_count);
+    friend std::vector<uint8_t> make_callable(
+        const ArgDirection *sig, int32_t sig_count, const char *func_name, const void *binary, uint32_t binary_size,
+        const int32_t *child_func_ids, const std::vector<uint8_t> *child_buffers, int32_t child_count
+    );
 };
 
 // ============================================================================
@@ -157,7 +153,7 @@ struct Callable<void, 0, 0> {
         return signature_[static_cast<size_t>(i)];
     }
     int32_t sig_count() const { return static_cast<int32_t>(signature_.size()); }
-    const void* binary_data() const { return binary_.data(); }
+    const void *binary_data() const { return binary_.data(); }
     uint32_t binary_size() const { return static_cast<uint32_t>(binary_.size()); }
 };
 
@@ -179,10 +175,10 @@ struct Callable<Child, 0, 0> {
         return signature_[static_cast<size_t>(i)];
     }
     int32_t sig_count() const { return static_cast<int32_t>(signature_.size()); }
-    const void* binary_data() const { return binary_.data(); }
+    const void *binary_data() const { return binary_.data(); }
     uint32_t binary_size() const { return static_cast<uint32_t>(binary_.size()); }
 
-    const Child& child(int32_t i) const {
+    const Child &child(int32_t i) const {
         if (i < 0 || static_cast<size_t>(i) >= children_.size())
             throw std::out_of_range("Callable: child index out of range");
         return children_[static_cast<size_t>(i)];
@@ -207,8 +203,8 @@ using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 32>;
 // ============================================================================
 
 template <int MaxSig>
-std::vector<uint8_t> make_callable(
-    const ArgDirection* sig, int32_t sig_count, const void* binary, uint32_t binary_size) {
+std::vector<uint8_t>
+make_callable(const ArgDirection *sig, int32_t sig_count, const void *binary, uint32_t binary_size) {
     if (sig_count > MaxSig) throw std::invalid_argument("make_callable: sig_count exceeds MaxSig");
 
     using T = Callable<void, MaxSig, 0>;
@@ -216,8 +212,9 @@ std::vector<uint8_t> make_callable(
     size_t total_size = aligned_header + binary_size;
     std::vector<uint8_t> buf(total_size, 0);
 
-    T* obj = reinterpret_cast<T*>(buf.data());
-    for (int32_t i = 0; i < sig_count; ++i) obj->signature_[i] = sig[i];
+    T *obj = reinterpret_cast<T *>(buf.data());
+    for (int32_t i = 0; i < sig_count; ++i)
+        obj->signature_[i] = sig[i];
     obj->sig_count_ = sig_count;
     obj->binary_size_ = binary_size;
     obj->resolved_addr_ = 0;
@@ -231,14 +228,10 @@ std::vector<uint8_t> make_callable(
 // ============================================================================
 
 template <typename Child, int MaxSig, int MaxChildren>
-std::vector<uint8_t> make_callable(const ArgDirection* sig,
-    int32_t sig_count,
-    const char* func_name,
-    const void* binary,
-    uint32_t binary_size,
-    const int32_t* child_func_ids,
-    const std::vector<uint8_t>* child_buffers,
-    int32_t child_count) {
+std::vector<uint8_t> make_callable(
+    const ArgDirection *sig, int32_t sig_count, const char *func_name, const void *binary, uint32_t binary_size,
+    const int32_t *child_func_ids, const std::vector<uint8_t> *child_buffers, int32_t child_count
+) {
     if (sig_count > MaxSig) throw std::invalid_argument("make_callable: sig_count exceeds MaxSig");
     if (child_count > MaxChildren) throw std::invalid_argument("make_callable: child_count exceeds MaxChildren");
 
@@ -255,8 +248,9 @@ std::vector<uint8_t> make_callable(const ArgDirection* sig,
     size_t total_size = header_size + offset;
     std::vector<uint8_t> buf(total_size, 0);
 
-    T* obj = reinterpret_cast<T*>(buf.data());
-    for (int32_t i = 0; i < sig_count; ++i) obj->signature_[i] = sig[i];
+    T *obj = reinterpret_cast<T *>(buf.data());
+    for (int32_t i = 0; i < sig_count; ++i)
+        obj->signature_[i] = sig[i];
     obj->sig_count_ = sig_count;
     obj->binary_size_ = binary_size;
 
