@@ -47,7 +47,8 @@ ProfMemoryManager::~ProfMemoryManager() {
 
 void ProfMemoryManager::start(
     void *shared_mem_host, int num_cores, int num_phase_threads, PerfAllocCallback alloc_cb,
-    PerfRegisterCallback register_cb, PerfFreeCallback free_cb, void *user_data, int device_id
+    PerfRegisterCallback register_cb, PerfFreeCallback free_cb, void *user_data, int device_id,
+    PerfSetDeviceCallback set_device_cb
 ) {
     shared_mem_host_ = shared_mem_host;
     num_cores_ = num_cores;
@@ -57,6 +58,7 @@ void ProfMemoryManager::start(
     free_cb_ = free_cb;
     user_data_ = user_data;
     device_id_ = device_id;
+    set_device_cb_ = set_device_cb;
 
     running_.store(true);
     mgmt_thread_ = std::thread(&ProfMemoryManager::mgmt_loop, this);
@@ -188,6 +190,7 @@ void ProfMemoryManager::process_ready_entry(
         PhaseBufferState *state = get_phase_buffer_state(shared_mem_host_, num_cores_, tidx);
 
         // Replenish free_queue with up to 2 buffers (1 active + 1 spare).
+        // Source priority: recycled pool → drain done_queue → alloc (last resort).
         rmb();
         uint32_t head_val = state->free_queue.head;
         uint32_t tail = state->free_queue.tail;
@@ -337,6 +340,13 @@ void ProfMemoryManager::process_ready_entry(
 }
 
 void ProfMemoryManager::mgmt_loop() {
+    if (set_device_cb_ != nullptr) {
+        int rc = set_device_cb_(device_id_, user_data_);
+        if (rc != 0) {
+            LOG_ERROR("mgmt_loop: set_device_cb(%d) failed: %d", device_id_, rc);
+        }
+    }
+
     PerfDataHeader *header = get_perf_header(shared_mem_host_);
 
     while (running_.load()) {
@@ -442,7 +452,7 @@ void ProfMemoryManager::mgmt_loop() {
                 if (state->free_queue.tail - state->free_queue.head == 0) {
                     void *host_ptr = nullptr;
                     void *dev_ptr = alloc_and_register(sizeof(PerfBuffer), &host_ptr);
-                    if (dev_ptr == nullptr) break;
+                    if (dev_ptr == nullptr) break;  // HBM exhausted, stop trying
                     reinterpret_cast<PerfBuffer *>(host_ptr)->count = 0;
                     uint32_t t_val = state->free_queue.tail;
                     state->free_queue.buffer_ptrs[t_val % PLATFORM_PROF_SLOT_COUNT] =
@@ -450,7 +460,7 @@ void ProfMemoryManager::mgmt_loop() {
                     wmb();
                     state->free_queue.tail = t_val + 1;
                     wmb();
-                    break;
+                    break;  // One alloc per iteration to limit rtMalloc frequency
                 }
             }
         }
@@ -534,7 +544,7 @@ void *PerformanceCollector::alloc_single_buffer(size_t size, void **host_ptr_out
 
 int PerformanceCollector::initialize(
     Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfRegisterCallback register_cb,
-    PerfFreeCallback free_cb, void *user_data
+    PerfFreeCallback free_cb, void *user_data, PerfSetDeviceCallback set_device_cb
 ) {
     if (perf_shared_mem_host_ != nullptr) {
         LOG_ERROR("PerformanceCollector already initialized");
@@ -554,6 +564,7 @@ int PerformanceCollector::initialize(
     register_cb_ = register_cb;
     free_cb_ = free_cb;
     user_data_ = user_data;
+    set_device_cb_ = set_device_cb;
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
@@ -702,7 +713,7 @@ void PerformanceCollector::start_memory_manager() {
 
     memory_manager_.start(
         perf_shared_mem_host_, num_aicore_, PLATFORM_MAX_AICPU_THREADS, alloc_cb_, register_cb_, free_cb_, user_data_,
-        device_id_
+        device_id_, set_device_cb_
     );
 }
 
@@ -871,6 +882,7 @@ void PerformanceCollector::poll_and_collect(int expected_tasks) {
         } else {
             // Timeout on wait — check for execution complete signal or overall timeout
             if (execution_complete_.load()) {
+                // Device is done. Final non-blocking drain and exit.
                 ReadyBufferInfo drain_info;
                 while (memory_manager_.try_pop_ready(drain_info)) {
                     if (drain_info.type == ProfBufferType::PERF_RECORD) {
@@ -1368,7 +1380,7 @@ int PerformanceCollector::export_swimlane_json(const std::string &output_path) {
             outfile << "      \"alloc\": " << std::fixed << std::setprecision(3)
                     << cycles_to_us(collected_orch_summary_.alloc_cycle) << ",\n";
             outfile << "      \"params\": " << std::fixed << std::setprecision(3)
-                    << cycles_to_us(collected_orch_summary_.params_cycle) << ",\n";
+                    << cycles_to_us(collected_orch_summary_.args_cycle) << ",\n";
             outfile << "      \"lookup\": " << std::fixed << std::setprecision(3)
                     << cycles_to_us(collected_orch_summary_.lookup_cycle) << ",\n";
             outfile << "      \"heap\": " << std::fixed << std::setprecision(3)

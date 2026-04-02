@@ -579,7 +579,7 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
     };
 
     // Simulation: no registration needed (pass nullptr)
-    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, nullptr, free_cb, nullptr);
+    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, nullptr, free_cb, nullptr, nullptr);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {

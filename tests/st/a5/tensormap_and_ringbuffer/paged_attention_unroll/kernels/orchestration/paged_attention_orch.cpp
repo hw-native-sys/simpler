@@ -177,17 +177,17 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                 Tensor qi = query.view(qi_shapes, qi_offsets);
                 uint32_t out_view_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
                 uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                Tensor out_view = out.view(out_view_shapes, out_view_offsets);
+                Tensor out_view = out.view(out_view_shapes, out_view_offsets, true);
 #ifdef ENABLE_PROFILING
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);
 #endif
-                Arg args_inplace;
-                args_inplace.add_output(tile2d_ci);
-                args_inplace.add_output(scalar_noinit_ci);
-                args_inplace.add_output(scalar_noinit_ci);
+                Arg params_inplace;
+                params_inplace.add_output(tile2d_ci);
+                params_inplace.add_output(scalar_noinit_ci);
+                params_inplace.add_output(scalar_noinit_ci);
                 CYCLE_COUNT_LAP(prof_param_setup);
-                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, args_inplace);
+                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace);
                 const Tensor &oi = hub_outs.get_ref(0);
                 const Tensor &li_update = hub_outs.get_ref(1);
                 const Tensor &mi_update = hub_outs.get_ref(2);
@@ -198,7 +198,7 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
 
                 // Reusable Arg objects — reset() before each use avoids
                 // repeated stack-frame construction in the inner loop.
-                Arg args_qk, args_sf, args_pv, args_up;
+                Arg params_qk, params_sf, params_pv, params_up;
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn += N_UNROLL) {
                     uint64_t n_blocks = std::min(static_cast<uint64_t>(N_UNROLL), bn_this_batch - bn);
@@ -218,14 +218,14 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-                    args_qk.reset();
-                    args_qk.add_input(qi);
-                    args_qk.add_input(key_cache);
-                    args_qk.add_output(sij_buf_ci);
-                    args_qk.add_scalar(n_blocks);
-                    args_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
+                    params_qk.reset();
+                    params_qk.add_input(qi);
+                    params_qk.add_input(key_cache);
+                    params_qk.add_output(sij_buf_ci);
+                    params_qk.add_scalar(n_blocks);
+                    params_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, args_qk);
+                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor &sij_buf = qk_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -242,16 +242,16 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-                    args_sf.reset();
-                    args_sf.add_input(sij_buf);
-                    args_sf.add_output(pij_buf_ci);
-                    args_sf.add_output(scalar_ci);
-                    args_sf.add_output(scalar_ci);
-                    args_sf.add_scalar(scale_value);
-                    args_sf.add_scalar(n_blocks);
-                    args_sf.add_scalar(valid_len_last);
+                    params_sf.reset();
+                    params_sf.add_input(sij_buf);
+                    params_sf.add_output(pij_buf_ci);
+                    params_sf.add_output(scalar_ci);
+                    params_sf.add_output(scalar_ci);
+                    params_sf.add_scalar(scale_value);
+                    params_sf.add_scalar(n_blocks);
+                    params_sf.add_scalar(valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, args_sf);
+                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     const Tensor &pij_buf = sf_outs.get_ref(0);
                     const Tensor &mi = sf_outs.get_ref(1);
                     const Tensor &li = sf_outs.get_ref(2);
@@ -261,14 +261,14 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
 #endif
 
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
-                    args_pv.reset();
-                    args_pv.add_input(pij_buf);
-                    args_pv.add_input(value_cache);
-                    args_pv.add_output(tile2d_ci);
-                    args_pv.add_scalar(n_blocks);
-                    args_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
+                    params_pv.reset();
+                    params_pv.add_input(pij_buf);
+                    params_pv.add_input(value_cache);
+                    params_pv.add_output(tile2d_ci);
+                    params_pv.add_scalar(n_blocks);
+                    params_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, args_pv);
+                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_new = pv_outs.get_ref(0);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
@@ -279,18 +279,18 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
 
-                    args_up.reset();
-                    args_up.add_input(mi);
-                    args_up.add_input(li);
-                    args_up.add_input(oi_new);
-                    args_up.add_inout(mi_update);
-                    args_up.add_inout(li_update);
-                    args_up.add_inout(oi);
-                    args_up.add_inout(out_view);
-                    args_up.add_scalar(is_first);
-                    args_up.add_scalar(is_last);
+                    params_up.reset();
+                    params_up.add_input(mi);
+                    params_up.add_input(li);
+                    params_up.add_input(oi_new);
+                    params_up.add_inout(mi_update);
+                    params_up.add_inout(li_update);
+                    params_up.add_inout(oi);
+                    params_up.add_inout(out_view);
+                    params_up.add_scalar(is_first);
+                    params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, args_up);
+                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);

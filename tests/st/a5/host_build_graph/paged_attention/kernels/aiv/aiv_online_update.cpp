@@ -163,6 +163,7 @@ static __aicore__ void online_update_impl(
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
         // Phase 2: Scalar arithmetic in RowMajor (kScalarRows, kScalarCols)
+        // pipe_barrier(PIPE_V) required between each dependent vector operation
         // to resolve RAW hazards on shared UB tiles.
         TMAX(miNewND, miND, mijND);    // mi_new = max(mi, mij)
         TSUB(alphaND, miND, miNewND);  // alpha = mi - mi_new

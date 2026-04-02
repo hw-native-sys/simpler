@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 /**
  * PTO Runtime2 - Main Implementation
  *
@@ -17,11 +18,15 @@
  */
 
 #include "pto_runtime2.h"
+
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
-#include "common/unified_log.h"
+
+#include <algorithm>
+
 #include "aicpu/device_time.h"
+#include "common/unified_log.h"
 
 // Weak fallback for HOST .so builds (never called, but satisfies linker).
 // The AICPU build links the strong symbol from platform/.../device_time.cpp.
@@ -52,25 +57,53 @@ void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->o
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[pto2_current_orch_idx].fatal; }
 
-// Wait for TensorMap producers of this tensor to be safe for data access.
-// For reads: wait until producer COMPLETED (done writing).
+// Wait for all producers of this tensor to be safe for data access.
+// Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
+// For reads: wait until each producer COMPLETED (done writing).
 // For writes: also wait until all consumers done reading
 //   (fanout_refcount >= fanout_count - 1, excluding scope reference).
 // Uses cycle-based timeout (checked every 1024 spins).
 // Returns false on timeout (sets orch.fatal).
+MAYBE_UNINITIALIZED_BEGIN
 static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
     PTO2OrchestratorState &orch = rt->orchestrators[pto2_current_orch_idx];
+
+    // Collect producer slot states from both maps, deduplicated by pointer.
+    // +1: one creator slot + up to PTO2_LOOKUP_MAX_RESULTS modifier slots.
+    constexpr int kMaxWait = PTO2_LOOKUP_MAX_RESULTS + 1;
+    PTO2TaskSlotState *slots[kMaxWait];
+    int slot_count = 0;
+
+    // Step A: creator retention — read owner directly from tensor metadata
+    PTO2TaskId owner = tensor.owner_task_id;
+    if (owner.is_valid()) {
+        slots[slot_count++] = &rt->scheduler.ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
+    }
+
+    // Step B: modifier writer lookup (OverlapMap)
     PTO2LookupResult lookup_result;
     orch.tensor_map.lookup(tensor, lookup_result);
-
     for (int r = 0; r < lookup_result.count; r++) {
-        PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
-        PTO2TaskId producer_id = entry.producer_task_id;
-        uint8_t ring_id = producer_id.ring();
-        int32_t local_id = producer_id.local();
-        PTO2TaskSlotState &slot = rt->scheduler.ring_sched_states[ring_id].get_slot_state_by_task_id(local_id);
+        PTO2TaskId pid = lookup_result.entries[r].entry->producer_task_id;
+        PTO2TaskSlotState *s = &rt->scheduler.ring_sched_states[pid.ring()].get_slot_state_by_task_id(pid.local());
+        bool already = false;
+        for (int j = 0; j < slot_count; j++) {
+            if (slots[j] == s) {
+                already = true;
+                break;
+            }
+        }
+        if (!already && slot_count < kMaxWait) {
+            slots[slot_count++] = s;
+        }
+    }
 
-        // Wait for producer to complete (WAW safety)
+    // Wait for each producer
+    for (int p = 0; p < slot_count; p++) {
+        PTO2TaskSlotState &slot = *slots[p];
+        uint8_t ring_id = slot.ring_id;
+        int32_t local_id = static_cast<int32_t>(slot.task->task_id.local());
+
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
         while (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) {
@@ -79,15 +112,13 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
                 orch.fatal = true;
                 unified_log_error(
                     caller, "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
-                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES,  // NOLINT(runtime/int)
+                    ring_id, local_id
                 );
                 return false;
             }
         }
 
-        // For writes: also wait for all consumers to finish reading (WAR safety).
-        // fanout_count includes 1 scope reference that won't release until scope_end,
-        // so wait until fanout_refcount >= fanout_count - 1.
         if (wait_for_consumers) {
             t0 = get_sys_cnt_aicpu();
             spin_count = 0;
@@ -97,7 +128,8 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
                     orch.fatal = true;
                     unified_log_error(
                         caller, "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES,  // NOLINT(runtime/int)
+                        ring_id, local_id
                     );
                     return false;
                 }
@@ -106,6 +138,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     }
     return true;
 }
+MAYBE_UNINITIALIZED_END
 
 uint64_t pto2_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     if (tensor.buffer.addr == 0) {
@@ -177,7 +210,7 @@ PTO2Runtime *pto2_runtime_create_custom(
     PTO2RuntimeMode mode, uint64_t task_window_size, uint64_t heap_size, int32_t dep_pool_capacity
 ) {
     // Allocate runtime context
-    PTO2Runtime *rt = (PTO2Runtime *)calloc(1, sizeof(PTO2Runtime));
+    PTO2Runtime *rt = static_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
     if (!rt) {
         return NULL;
     }
@@ -241,7 +274,7 @@ PTO2Runtime *pto2_runtime_create_from_sm(
     if (orch_count < 1) orch_count = 1;
     if (orch_count > PTO2_MAX_ORCH_THREADS) orch_count = PTO2_MAX_ORCH_THREADS;
 
-    PTO2Runtime *rt = (PTO2Runtime *)calloc(1, sizeof(PTO2Runtime));
+    PTO2Runtime *rt = static_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
     if (!rt) return NULL;
 
     rt->ops = &s_runtime_ops;

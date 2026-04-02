@@ -9,11 +9,15 @@ During task graph construction, orchestration sometimes needs to read InCore ker
 ## 2. API
 
 ```cpp
-// Blocking read: returns raw uint64_t bit pattern at the given indices
-uint64_t get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[]);
+// Blocking read: returns value at the given indices (default: raw uint64_t bits)
+// Specify T for typed read: float val = get_tensor_data<float>(tensor, 1, idx);
+template<typename T = uint64_t>
+T get_tensor_data(const Tensor& tensor, uint32_t ndims, const uint32_t indices[]);
 
-// Blocking write: stores value at the given indices
-void set_tensor_data(Tensor& tensor, uint32_t ndims, const uint32_t indices[], uint64_t value);
+// Blocking write: stores value at the given indices (type deduced from argument)
+// Typed write: set_tensor_data(tensor, 1, idx, 42.0f);
+template<typename T = uint64_t>
+void set_tensor_data(Tensor& tensor, uint32_t ndims, const uint32_t indices[], T value);
 ```
 
 Both call into the runtime through the ops table — orchestration .so needs no runtime symbol linkage.
@@ -81,7 +85,7 @@ const Tensor& scalar_tensor = outs.get_ref(0);
 
 // Orchestration-side blocking read (waits for kernel completion)
 uint32_t idx[1] = {0};
-uint64_t raw = get_tensor_data(scalar_tensor, 1, idx);
+float val = get_tensor_data<float>(scalar_tensor, 1, idx);
 ```
 
 **Advantage**: Fully reuses existing TensorMap (producer tracking, fanin/fanout dependencies) — no new infrastructure needed.

@@ -212,19 +212,29 @@ static inline bool pto2_rt_is_fatal() {
 /**
  * Read a value from a tensor at the given multi-dimensional indices.
  *
+ * Default T = uint64_t preserves old behavior (raw bits).
+ * Specify T to get automatic type conversion:
+ *
+ *   uint64_t raw = get_tensor_data(tensor, 1, idx);       // old usage unchanged
+ *   float val = get_tensor_data<float>(tensor, 1, idx);   // typed read
+ *
  * If the tensor has a producer in TensorMap, spin-waits until the producer
  * task completes before reading. External tensors (make_tensor_external)
  * are read immediately without waiting.
- *
- * Returns the raw bits as uint64_t; caller reinterprets via bit_cast.
  */
-static inline uint64_t get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+template <typename T = uint64_t>
+static inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     PTO2Runtime *rt = pto2_current_runtime();
-    return rt->ops->get_tensor_data(rt, tensor, ndims, indices);
+    return from_u64<T>(rt->ops->get_tensor_data(rt, tensor, ndims, indices));
 }
 
 /**
  * Write a value to a tensor at the given multi-dimensional indices.
+ *
+ * Type is deduced from value argument; uint64_t by default:
+ *
+ *   set_tensor_data(tensor, 1, idx, raw_u64);     // old usage unchanged
+ *   set_tensor_data(tensor, 1, idx, 42.0f);       // typed write (T = float)
  *
  * If the tensor has a producer in TensorMap, spin-waits until the producer
  * and all its consumers complete before writing (WAW + WAR safety).
@@ -245,9 +255,10 @@ static inline uint64_t get_tensor_data(const Tensor &tensor, uint32_t ndims, con
  * For runtime-created outputs, call this only on the Tensor returned by
  * add_output(TensorCreateInfo) after submit returns.
  */
-static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value) {
+template <typename T = uint64_t>
+static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
     PTO2Runtime *rt = pto2_current_runtime();
-    rt->ops->set_tensor_data(rt, tensor, ndims, indices, value);
+    rt->ops->set_tensor_data(rt, tensor, ndims, indices, to_u64(value));
 }
 
 // =============================================================================

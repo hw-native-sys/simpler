@@ -8,21 +8,23 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 #pragma once
 
 #include <stdio.h>
 #include <stdlib.h>
+
 #include <stdexcept>
 #include <string>
 
 /**
- * Get current stack trace information (including file paths and line numbers).
+ * Get the current stack trace, including file paths and line numbers.
  * Implemented in common.cpp.
  */
 std::string get_stacktrace(int skip_frames = 1);
 
 /**
- * Assertion failure exception, containing file, line number, condition, and stack trace information.
+ * Assertion failure exception with condition, file, line, and stack trace.
  */
 class AssertionError : public std::runtime_error {
 public:
@@ -39,14 +41,15 @@ private:
 };
 
 /**
- * Handler function for assertion failures.
+ * Assertion failure handler.
  * Implemented in common.cpp.
  */
 [[noreturn]] void assert_impl(const char *condition, const char *file, int line);
 
 /**
- * debug_assert macro - checks condition in debug mode; throws exception and prints stack trace on failure.
- * No-op in release mode (NDEBUG).
+ * debug_assert macro:
+ * checks the condition in debug builds and throws with a stack trace on failure.
+ * It is a no-op in release builds (NDEBUG).
  */
 #ifdef NDEBUG
 #define debug_assert(cond) ((void)0)
@@ -60,7 +63,8 @@ private:
 #endif
 
 /**
- * always_assert macro - checks condition in both debug and release modes.
+ * always_assert macro:
+ * checks the condition in both debug and release builds.
  */
 #define always_assert(cond)                         \
     do {                                            \
@@ -68,3 +72,22 @@ private:
             assert_impl(#cond, __FILE__, __LINE__); \
         }                                           \
     } while (0)
+
+#define PTO_PRAGMA(x) _Pragma(#x)
+
+#if defined(__clang__)
+#define MAYBE_UNINITIALIZED_BEGIN                          \
+    PTO_PRAGMA(clang diagnostic push)                      \
+    PTO_PRAGMA(clang diagnostic ignored "-Wuninitialized") \
+    PTO_PRAGMA(clang diagnostic ignored "-Wsometimes-uninitialized")
+#define MAYBE_UNINITIALIZED_END PTO_PRAGMA(clang diagnostic pop)
+#elif defined(__GNUC__)
+#define MAYBE_UNINITIALIZED_BEGIN                        \
+    PTO_PRAGMA(GCC diagnostic push)                      \
+    PTO_PRAGMA(GCC diagnostic ignored "-Wuninitialized") \
+    PTO_PRAGMA(GCC diagnostic ignored "-Wmaybe-uninitialized")
+#define MAYBE_UNINITIALIZED_END PTO_PRAGMA(GCC diagnostic pop)
+#else
+#define MAYBE_UNINITIALIZED_BEGIN
+#define MAYBE_UNINITIALIZED_END
+#endif

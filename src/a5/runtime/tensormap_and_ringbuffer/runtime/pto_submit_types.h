@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 /**
  * PTO Submit Types - Shared submit-contract definitions
  *
@@ -15,8 +16,7 @@
  * headers. Keeps orchestration slim (no dependency on pto_runtime2_types.h).
  */
 
-#ifndef PTO_SUBMIT_TYPES_H
-#define PTO_SUBMIT_TYPES_H
+#pragma once
 
 #include <stdint.h>
 
@@ -100,4 +100,20 @@ static inline uint8_t pto2_mixed_kernels_to_active_mask(const MixedKernels &mk) 
     return mask;
 }
 
-#endif  // PTO_SUBMIT_TYPES_H
+/**
+ * SPMD launch parameters carried inside Arg.
+ *
+ * Controls how many logical blocks (SPMD dimension) a single task
+ * is expanded into at dispatch time.  Each block receives a unique
+ * core_idx in [0, core_num) via the per-dispatch LocalContext.
+ */
+class PTO2LaunchSpec {
+public:
+    constexpr PTO2LaunchSpec() = default;
+
+    int16_t core_num() const { return core_num_; }
+    void set_core_num(int16_t n) { core_num_ = n; }
+
+private:
+    int16_t core_num_{1};
+};

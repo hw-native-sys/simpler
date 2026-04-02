@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
@@ -540,7 +541,7 @@ int AicpuExecutor::shutdown_aicore(Runtime *runtime, int thread_idx, const int *
     for (int i = 0; i < thread_cores_num_[thread_idx]; i++) {
         int core_id = cur_thread_cores[i];
         Handshake *hank = &all_handshakes[core_id];
-        LOG_INFO("Thread %d: AICPU hank addr = 0x%lx", thread_idx, (uint64_t)hank);
+        LOG_INFO("Thread %d: AICPU hank addr = 0x%lx", thread_idx, reinterpret_cast<uint64_t>(hank));
 
         uint64_t reg_addr = core_id_to_reg_addr_[core_id];
         if (reg_addr != 0) {
@@ -619,11 +620,35 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 );
 
                 int completed_task_id = pending_task_ids_[core_id];
+                int prev_running_id = running_task_ids_[core_id];
 
-                // Profiling
+                // Profiling: when prev_running_id exists, its AICore record was
+                // written first (at records[count]), so complete it BEFORE the
+                // pending task's record to maintain buffer ordering.
                 if (profiling_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
                     PerfBuffer *perf_buf = reinterpret_cast<PerfBuffer *>(h->perf_records_addr);
+
+                    if (prev_running_id != AICPU_TASK_INVALID) {
+                        Task *prev_task = &runtime.tasks[prev_running_id];
+                        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
+                        for (int i = 0; i < prev_task->fanout_count; i++) {
+                            fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
+                        }
+                        if (perf_aicpu_complete_record(
+                                perf_buf, static_cast<uint32_t>(prev_running_id),
+                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
+                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
+                            ) != 0) {
+                            DEV_ERROR(
+                                "Core %d: perf_aicpu_complete_record failed for implicit task %d", core_id,
+                                prev_running_id
+                            );
+                        }
+                        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                    }
+
+                    finish_ts = get_sys_cnt_aicpu();
                     Task *task = &runtime.tasks[completed_task_id];
                     uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
                     for (int i = 0; i < task->fanout_count; i++) {
@@ -642,7 +667,6 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 cur_thread_completed++;
                 completed_tasks_.fetch_add(1, std::memory_order_release);
 
-                int prev_running_id = running_task_ids_[core_id];
                 pending_task_ids_[core_id] = AICPU_TASK_INVALID;
                 running_task_ids_[core_id] = AICPU_TASK_INVALID;
 
@@ -690,7 +714,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 if (!dispatched && profiling_enabled) {
                     dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
                 }
-            } else if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_ACK_STATE) {  // Case 2: ACK
+            } else if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_ACK_STATE) {
+                // Case 2: Pending task received ACK
                 LOG_INFO(
                     "Thread %d: Core %d ACKed task %d (running_id=%d)", thread_idx, core_id, pending_task_ids_[core_id],
                     running_task_ids_[core_id]
@@ -707,6 +732,28 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // completed (AICore overwrote COND before we could read its FIN).
                 // Count it here to avoid losing completion.
                 if (prev_running_id != AICPU_TASK_INVALID) {
+                    // Profiling: complete the implicit task's AICore record
+                    if (profiling_enabled) {
+                        uint64_t finish_ts = get_sys_cnt_aicpu();
+                        PerfBuffer *perf_buf = reinterpret_cast<PerfBuffer *>(h->perf_records_addr);
+                        Task *prev_task = &runtime.tasks[prev_running_id];
+                        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
+                        for (int i = 0; i < prev_task->fanout_count; i++) {
+                            fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
+                        }
+                        if (perf_aicpu_complete_record(
+                                perf_buf, static_cast<uint32_t>(prev_running_id),
+                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
+                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
+                            ) != 0) {
+                            DEV_ERROR(
+                                "Core %d: perf_aicpu_complete_record failed for implicit task %d", core_id,
+                                prev_running_id
+                            );
+                        }
+                        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                    }
+
                     cur_thread_completed++;
                     completed_tasks_.fetch_add(1, std::memory_order_release);
 
@@ -721,7 +768,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 // Core can accept new task now (pipeline!)
                 // Continue to Case 4 to dispatch next task
-            } else if (reg_task_id == running_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {  // Case 3: FIN
+            } else if (reg_task_id == running_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
+                // Case 3: Running task finished
                 LOG_INFO(
                     "Thread %d: Core %d completed task %d (pending_id=%d)", thread_idx, core_id,
                     running_task_ids_[core_id], pending_task_ids_[core_id]

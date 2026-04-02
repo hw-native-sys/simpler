@@ -57,8 +57,8 @@
 #include <cstdint>
 #include <vector>
 
-#include "core_type.h"
-#include "platform_config.h"
+#include "common/core_type.h"
+#include "common/platform_config.h"
 
 // Maximum number of successor tasks per PerfRecord (matches Task::fanout)
 #ifndef RUNTIME_MAX_FANOUT
@@ -286,7 +286,7 @@ struct AicpuOrchSummary {
     uint64_t end_time;         // Orchestrator end timestamp
     uint64_t sync_cycle;       // sync_tensormap phase
     uint64_t alloc_cycle;      // task_ring_alloc phase
-    uint64_t params_cycle;     // param_copy phase
+    uint64_t args_cycle;       // param_copy phase
     uint64_t lookup_cycle;     // lookup+dep phase
     uint64_t heap_cycle;       // heap_alloc phase
     uint64_t insert_cycle;     // tensormap_insert phase

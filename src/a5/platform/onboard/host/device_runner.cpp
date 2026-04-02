@@ -760,7 +760,13 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
         return allocator->free(dev_ptr);
     };
 
-    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_);
+    auto set_device_cb = [](int device_id, void * /*user_data*/) -> int {
+        return rtSetDevice(device_id);
+    };
+
+    return perf_collector_.initialize(
+        runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, set_device_cb
+    );
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {

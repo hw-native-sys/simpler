@@ -31,9 +31,10 @@
 
 #include <atomic>
 
-#include "pto2_dispatch_payload.h"  // NOLINT(build/include_subdir)
-#include "pto_submit_types.h"       // NOLINT(build/include_subdir)
-#include "pto_types.h"              // NOLINT(build/include_subdir)
+#include "pto2_dispatch_payload.h"
+#include "pto_submit_types.h"
+#include "pto_task_id.h"
+#include "pto_types.h"
 
 // =============================================================================
 // Profiling Configuration
@@ -77,7 +78,8 @@
 #define PTO2_ERROR_HEAP_RING_DEADLOCK 2
 #define PTO2_ERROR_FLOW_CONTROL_DEADLOCK 3
 #define PTO2_ERROR_DEP_POOL_OVERFLOW 4
-#define PTO2_ERROR_INVALID_ARGS 5  // Arg construction error (invalid args)
+#define PTO2_ERROR_INVALID_ARGS 5         // Arg construction error (invalid args)
+#define PTO2_ERROR_DEPENDENCY_OVERFLOW 6  // Too many unique fanin dependencies for one task
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT 100
@@ -127,33 +129,8 @@ constexpr uint64_t PTO2_TENSOR_DATA_TIMEOUT_CYCLES = 15 * 1000 * 1000 * 1000ULL;
 // =============================================================================
 
 /**
- * TaskId: 64-bit encoding used across Runtime2.
- *
- * raw encoding: (ring_id << 32) | local_id
- *
- * ring_id:  which ring layer (0..PTO2_MAX_RING_DEPTH-1)
- * local_id: per-ring monotonic counter
+ * TaskId: defined in pto_task_id.h (included above).
  */
-struct PTO2TaskId {
-    uint64_t raw;
-
-    constexpr PTO2TaskId() :
-        raw(0) {}
-    constexpr explicit PTO2TaskId(uint64_t v) :
-        raw(v) {}
-
-    constexpr uint8_t ring() const { return static_cast<uint8_t>(raw >> 32); }
-    constexpr uint32_t local() const { return static_cast<uint32_t>(raw & 0xFFFFFFFFu); }
-
-    constexpr bool operator==(const PTO2TaskId &other) const { return raw == other.raw; }
-    constexpr bool operator!=(const PTO2TaskId &other) const { return raw != other.raw; }
-};
-
-static_assert(sizeof(PTO2TaskId) == 8, "PTO2TaskId must stay 8 bytes (shared memory ABI)");
-
-static inline PTO2TaskId pto2_make_task_id(uint8_t ring_id, uint32_t local_id) {
-    return PTO2TaskId{(static_cast<uint64_t>(ring_id) << 32) | static_cast<uint64_t>(local_id)};
-}
 
 // =============================================================================
 // Worker Types
@@ -364,59 +341,66 @@ struct PTO2TaskDescriptor {
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
  * Layout: metadata (counts, fanin pointers) packed in the first 3 cache lines,
- * followed by pre-built dispatch args and bulk tensor data. Scalar values are
- * written directly into dispatch_args[] (after tensor pointers), eliminating
- * the separate scalars[] array.
- *
- * The Scheduler writes function_bin_addr and a pointer to dispatch_args[] into
- * PTO2DispatchPayload, then signals AICore via DATA_MAIN_BASE register.
+ * followed by bulk tensor and scalar data. This gives sequential write access
+ * during orchestration and groups scheduler-hot fields (fanin_actual_count +
+ * fanin_slot_states) together for on_task_release.
  */
 struct PTO2TaskPayload {
-    // === Cache line 0 (64B) — metadata ===
+    // === Cache lines 0-2 (192B) — metadata ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
     int32_t _reserved{0};           // Reserved (dep_pool_mark moved to SlotState for local access)
     PTO2TaskSlotState *fanin_slot_states[PTO2_MAX_INPUTS];  // Producer slot states (used by on_task_release)
-    // === Tensors (2048B) — alignas(64) Tensor forces alignment ===
+    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
-    // === Pre-built args for AICore dispatch (1152B = 16 tensor ptrs + 128 scalars) ===
-    uint64_t dispatch_args[PTO2_DISPATCH_MAX_ARGS];
+    // === Cache lines 35-50 (1024B) — scalars ===
+    uint64_t scalars[MAX_SCALAR_ARGS];
+
+    // Layout verification (size checks that don't need offsetof).
+    static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
+    static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 1024, "scalar region must be 1024B (16 cache lines)");
 
     /**
-     * Initialize payload: copy tensors, build dispatch args.
+     * Initialize payload: copy tensors, store scalars.
      *
      * For each param slot, the tensor source is determined by TensorArgType:
-     * - OUTPUT → use materialized_outputs.output_ptr(out_idx++)
-     * - INPUT / INOUT → use refs[i].tensor
+     * - OUTPUT -> use materialized_outputs.output_ptr(out_idx++)
+     * - INPUT / INOUT -> use refs[i].tensor
      *
      * @param args                Task arguments (tensors + scalars)
      * @param materialized_outputs  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const Arg &args, const TaskOutputTensors &materialized_outputs) {
+    void
+    init(const Arg &args, TaskOutputTensors &result, void *base_addr, uint64_t offsets[], uint64_t buffer_sizes[]) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
-        int32_t out_idx = 0;
+        // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {
-            const Tensor *src;
-            if (args.tag(i) == TensorArgType::OUTPUT) {
-                src = materialized_outputs.output_ptr(out_idx++);
+            if (args.tag(i) != TensorArgType::OUTPUT) {
+                tensors[i].copy(*args.tensor(i).ptr);
             } else {
-                src = args.tensor(i).ptr;
+                tensors[i].init_from_create_info(
+                    *args.tensor(i).create_info,
+                    reinterpret_cast<void *>(reinterpret_cast<char *>(base_addr) + offsets[i]), buffer_sizes[i]
+                );
+                result.materialize_output(tensors[i]);
             }
-            tensors[i].copy(*src);
             tensors[i].update_start_offset();
-            dispatch_args[i] = reinterpret_cast<uint64_t>(&tensors[i]);
         }
-        // Bulk-copy scalars into dispatch_args[tensor_count..], rounded up to
-        // cache-line boundary (extra bytes within the same CL cost nothing).
-        memcpy(
-            &dispatch_args[args.tensor_count()], args.scalar_data(),
-            PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64)
-        );
+        // Round up to cache line boundary. Both arrays are 1024B so no overrun.
+        // Eliminates branches; extra bytes within the same CL have zero additional cost.
+        memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
     }
 };
+
+// PTO2TaskPayload layout verification (offsetof requires complete type).
+static_assert(offsetof(PTO2TaskPayload, tensors) == 192, "tensors must start at byte 192 (cache line 3)");
+static_assert(
+    offsetof(PTO2TaskPayload, scalars) == 192 + MAX_TENSOR_ARGS * sizeof(Tensor),
+    "scalars must immediately follow tensors"
+);
 
 /**
  * Per-task slot scheduling state (scheduler-private, NOT in shared memory)
@@ -453,9 +437,15 @@ struct alignas(64) PTO2TaskSlotState {
 
     // Hot-path completion fields (moved from TaskDescriptor to avoid cross-struct access)
     uint8_t active_mask;                     // Bitmask of active subtask slots (set once)
-    std::atomic<uint8_t> subtask_done_mask;  // Each subtask sets its done bit on completion
+    std::atomic<uint8_t> subtask_done_mask;  // Deprecated: superseded by completed_subtasks
     uint8_t ring_id;                         // Ring layer this task belongs to (for per-ring reclamation)
     int32_t dep_pool_mark{0};  // Dep pool top after this task's submission (orchestrator-only, local memory)
+
+    // SPMD multi-block (occupies the 8 tail bytes previously implicit padding)
+    std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
+    int16_t total_required_subtasks{0};          // = block_num * popcount(active_mask)
+    int16_t block_num{1};                        // Total logical blocks (set by orchestrator)
+    int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);
@@ -501,7 +491,7 @@ typedef void (*PTO2InCoreFunc)(void **args, int32_t num_args);
 // This header is also compiled into the Host .so (for struct definitions only),
 // where the hint is never called — the fallback no-op keeps Host builds clean.
 #if __has_include("spin_hint.h")
-#include "spin_hint.h"  // NOLINT(build/include_subdir)
+#include "spin_hint.h"
 #else
 #define SPIN_WAIT_HINT() ((void)0)
 #endif

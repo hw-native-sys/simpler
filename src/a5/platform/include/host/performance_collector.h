@@ -78,6 +78,15 @@ using PerfUnregisterCallback = int (*)(void *dev_ptr, int device_id, void *user_
  */
 using PerfFreeCallback = int (*)(void *dev_ptr, void *user_data);
 
+/**
+ * Device context setup callback (called once on mgmt thread startup)
+ *
+ * @param device_id Device ID to set
+ * @param user_data User-provided context pointer
+ * @return 0 on success, error code on failure
+ */
+using PerfSetDeviceCallback = int (*)(int device_id, void *user_data);
+
 // =============================================================================
 // ProfMemoryManager - Dynamic Buffer Memory Management Thread
 // =============================================================================
@@ -140,10 +149,12 @@ public:
      * @param free_cb Device memory free callback
      * @param user_data User context for callbacks
      * @param device_id Device ID for registration
+     * @param set_device_cb Device context setup callback (nullptr to skip)
      */
     void start(
         void *shared_mem_host, int num_cores, int num_phase_threads, PerfAllocCallback alloc_cb,
-        PerfRegisterCallback register_cb, PerfFreeCallback free_cb, void *user_data, int device_id
+        PerfRegisterCallback register_cb, PerfFreeCallback free_cb, void *user_data, int device_id,
+        PerfSetDeviceCallback set_device_cb = nullptr
     );
 
     /**
@@ -194,6 +205,7 @@ private:
     PerfAllocCallback alloc_cb_{nullptr};
     PerfRegisterCallback register_cb_{nullptr};
     PerfFreeCallback free_cb_{nullptr};
+    PerfSetDeviceCallback set_device_cb_{nullptr};
     void *user_data_{nullptr};
     int device_id_{-1};
 
@@ -269,11 +281,12 @@ public:
      * @param register_cb Memory registration callback (can be nullptr for simulation)
      * @param free_cb Memory free callback
      * @param user_data User-provided context pointer passed to callbacks
+     * @param set_device_cb Device context setup callback (nullptr to skip)
      * @return 0 on success, error code on failure
      */
     int initialize(
         Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfRegisterCallback register_cb,
-        PerfFreeCallback free_cb, void *user_data
+        PerfFreeCallback free_cb, void *user_data, PerfSetDeviceCallback set_device_cb = nullptr
     );
 
     /**
@@ -378,6 +391,7 @@ private:
     PerfAllocCallback alloc_cb_{nullptr};
     PerfRegisterCallback register_cb_{nullptr};
     PerfFreeCallback free_cb_{nullptr};
+    PerfSetDeviceCallback set_device_cb_{nullptr};
     void *user_data_{nullptr};
 
     // Memory manager

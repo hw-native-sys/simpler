@@ -126,11 +126,11 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                 uint32_t out_view_offsets[2] = {cur_offset, 0};
                 Tensor out_view = out.view(tile2d_shapes, out_view_offsets);
 
-                Arg args_inplace;
-                args_inplace.add_output(tile2d_ci);
-                args_inplace.add_output(scalar_ci);
-                args_inplace.add_output(scalar_ci);
-                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, args_inplace);
+                Arg params_inplace;
+                params_inplace.add_output(tile2d_ci);
+                params_inplace.add_output(scalar_ci);
+                params_inplace.add_output(scalar_ci);
+                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace);
                 const Tensor &oi = hub_outs.get_ref(0);
                 const Tensor &li_update = hub_outs.get_ref(1);
                 const Tensor &mi_update = hub_outs.get_ref(2);
@@ -144,48 +144,48 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     Tensor kj = key_cache.view(kv_shapes, kv_offsets);
                     Tensor vj = value_cache.view(kv_shapes, kv_offsets);
 
-                    Arg args_qk;
-                    args_qk.add_input(qi);
-                    args_qk.add_input(kj);
-                    args_qk.add_output(sij_ci);
-                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, args_qk);
+                    Arg params_qk;
+                    params_qk.add_input(qi);
+                    params_qk.add_input(kj);
+                    params_qk.add_output(sij_ci);
+                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor &sij = qk_outs.get_ref(0);
 
                     uint32_t sij_valid_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(valid_len)};
                     uint32_t sij_valid_offsets[2] = {0, 0};
                     Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
-                    Arg args_sf;
-                    args_sf.add_input(sij_valid);
-                    args_sf.add_output(pij_f16_ci);
-                    args_sf.add_output(scalar_ci);
-                    args_sf.add_output(scalar_ci);
-                    args_sf.add_scalar(scale_value);
-                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, args_sf);
+                    Arg params_sf;
+                    params_sf.add_input(sij_valid);
+                    params_sf.add_output(pij_f16_ci);
+                    params_sf.add_output(scalar_ci);
+                    params_sf.add_output(scalar_ci);
+                    params_sf.add_scalar(scale_value);
+                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     const Tensor &pij_f16 = sf_outs.get_ref(0);
                     const Tensor &mi = sf_outs.get_ref(1);
                     const Tensor &li = sf_outs.get_ref(2);
 
-                    Arg args_pv;
-                    args_pv.add_input(pij_f16);
-                    args_pv.add_input(vj);
-                    args_pv.add_output(tile2d_ci);
-                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, args_pv);
+                    Arg params_pv;
+                    params_pv.add_input(pij_f16);
+                    params_pv.add_input(vj);
+                    params_pv.add_output(tile2d_ci);
+                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_tmp = pv_outs.get_ref(0);
 
                     uint64_t is_first = (bn == 0) ? 1 : 0;
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
 
-                    Arg args_up;
-                    args_up.add_input(mi);
-                    args_up.add_input(li);
-                    args_up.add_input(oi_tmp);
-                    args_up.add_inout(mi_update);
-                    args_up.add_inout(li_update);
-                    args_up.add_inout(oi);
-                    args_up.add_inout(out_view);
-                    args_up.add_scalar(is_first);
-                    args_up.add_scalar(is_last);
-                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, args_up);
+                    Arg params_up;
+                    params_up.add_input(mi);
+                    params_up.add_input(li);
+                    params_up.add_input(oi_tmp);
+                    params_up.add_inout(mi_update);
+                    params_up.add_inout(li_update);
+                    params_up.add_inout(oi);
+                    params_up.add_inout(out_view);
+                    params_up.add_scalar(is_first);
+                    params_up.add_scalar(is_last);
+                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
                 }
             }
         }

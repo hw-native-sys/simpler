@@ -21,8 +21,9 @@
  * - Function address mapping (func_id_to_addr_)
  *
  * Task dispatch uses a per-core PTO2DispatchPayload written by the scheduler.
- * The Orchestrator pre-builds dispatch_args[] in each task payload; the
- * scheduler only fills function_bin_addr + args before signaling AICore.
+ * At dispatch time, build_payload() copies tensor pointers and scalars from
+ * the task payload into the per-core args[], populates SPMD context, then
+ * signals AICore via DATA_MAIN_BASE.
  */
 
 #ifndef SRC_A5_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
@@ -36,8 +37,8 @@
 #include "common/core_type.h"
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"
-#include "pto2_dispatch_payload.h"  // NOLINT(build/include_subdir)
-#include "task_args.h"              // NOLINT(build/include_subdir)
+#include "pto2_dispatch_payload.h"
+#include "task_args.h"
 
 // =============================================================================
 // Configuration Macros

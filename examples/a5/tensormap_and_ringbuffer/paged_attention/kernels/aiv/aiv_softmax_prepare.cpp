@@ -26,8 +26,9 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
-#include "tensor.h"
+#include "tensor.h"  // NOLINT(build/include_subdir)
 
+// NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
 
 #ifndef __gm__
@@ -35,7 +36,7 @@ using namespace pto;
 #endif
 
 #ifndef __aicore__
-#define __aicore__ [aicore]
+#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
 #endif
 
 template <int M, int N>
@@ -115,12 +116,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *pij = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *mij = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *lij = reinterpret_cast<__gm__ Tensor *>(args[3]);
-    union {
-        uint64_t u;
-        float f;
-    } scale_conv;
-    scale_conv.u = static_cast<uint64_t>(args[4]);
-    float scale_value = scale_conv.f;
+    float scale_value = from_u64<float>(static_cast<uint64_t>(args[4]));
 
     softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij);
 }

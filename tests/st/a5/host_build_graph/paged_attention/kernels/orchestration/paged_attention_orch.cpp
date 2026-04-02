@@ -173,19 +173,14 @@ int build_paged_attention_graph(Runtime *runtime, const ChipStorageTaskArgs &orc
 
             for (uint32_t bn = 0; bn < bn_this_batch; bn++) {
                 int cur_block_idx = host_block_table[b_idx * max_num_blocks + bn];
-                int valid_len = std::min(
-                    static_cast<int>(block_size), cur_seq - static_cast<int>(bn) * static_cast<int>(block_size)
-                );
+                int valid_len = std::min(static_cast<int>(block_size), cur_seq - static_cast<int>(bn * block_size));
 
                 // Key: (total_blocks, block_size, kv_head_num, head_dim) bf16
-                // Stride to block: cur_block_idx * (block_size * kv_head_num * head_dim)
-                // Then offset to kv_head: kv_head_idx * head_dim (within each token row)
-                // But since we want contiguous (block_size, head_dim), and kv_head_num=1 makes it simple:
                 uint8_t *kj_ptr = reinterpret_cast<uint8_t *>(dev_key_cache) +
                                   (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx) *
                                       head_dim * sizeof(uint16_t);
 
-                // Value: (total_blocks, block_size, kv_head_num, head_dim) bf16 - same layout as key
+                // Value: (total_blocks, block_size, kv_head_num, head_dim) bf16
                 uint8_t *vj_ptr = reinterpret_cast<uint8_t *>(dev_value_cache) +
                                   (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx) *
                                       head_dim * sizeof(uint16_t);

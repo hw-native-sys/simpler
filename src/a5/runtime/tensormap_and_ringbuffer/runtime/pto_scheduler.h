@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 /**
  * PTO Runtime2 - Scheduler Interface
  *
@@ -26,16 +27,14 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#ifndef PTO_SCHEDULER_H
-#define PTO_SCHEDULER_H
+#pragma once
 
 #include <atomic>
 
+#include "common/core_type.h"
+#include "pto_ring_buffer.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
-#include "pto_ring_buffer.h"
-
-#include "common/core_type.h"
 
 #if PTO2_SCHED_PROFILING
 #include "aicpu/device_time.h"
@@ -131,7 +130,7 @@ struct alignas(64) PTO2ReadyQueue {
             pos = enqueue_pos.load(std::memory_order_relaxed);
             slot = &slots[pos & mask];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
-            int64_t diff = seq - (int64_t)pos;
+            int64_t diff = seq - static_cast<int64_t>(pos);
             if (diff == 0) {
                 if (enqueue_pos.compare_exchange_weak(
                         pos, pos + 1, std::memory_order_relaxed, std::memory_order_relaxed
@@ -144,7 +143,7 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         slot->slot_state = slot_state;
-        slot->sequence.store((int64_t)(pos + 1), std::memory_order_release);
+        slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
 
@@ -160,7 +159,7 @@ struct alignas(64) PTO2ReadyQueue {
             for (int i = 0; i < count; i++) {
                 PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
-                int64_t diff = seq - (int64_t)(pos + i);
+                int64_t diff = seq - static_cast<int64_t>(pos + i);
                 if (diff != 0) {
                     ready = false;
                     break;
@@ -179,7 +178,7 @@ struct alignas(64) PTO2ReadyQueue {
         for (int i = 0; i < count; i++) {
             PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
             slot->slot_state = items[i];
-            slot->sequence.store((int64_t)(pos + i + 1), std::memory_order_release);
+            slot->sequence.store(static_cast<int64_t>(pos + i + 1), std::memory_order_release);
         }
     }
 
@@ -194,7 +193,7 @@ struct alignas(64) PTO2ReadyQueue {
             pos = enqueue_pos.load(std::memory_order_relaxed);
             slot = &slots[pos & mask];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
-            int64_t diff = seq - (int64_t)pos;
+            int64_t diff = seq - static_cast<int64_t>(pos);
             atomic_ops += 2;  // enqueue_pos.load + sequence.load
             if (diff == 0) {
                 if (enqueue_pos.compare_exchange_weak(
@@ -218,7 +217,7 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         slot->slot_state = slot_state;
-        slot->sequence.store((int64_t)(pos + 1), std::memory_order_release);
+        slot->sequence.store(static_cast<int64_t>(pos + 1), std::memory_order_release);
         return true;
     }
 #endif
@@ -237,7 +236,7 @@ struct alignas(64) PTO2ReadyQueue {
             pos = dequeue_pos.load(std::memory_order_relaxed);
             slot = &slots[pos & mask];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
-            int64_t diff = seq - (int64_t)(pos + 1);
+            int64_t diff = seq - static_cast<int64_t>(pos + 1);
             if (diff == 0) {
                 if (dequeue_pos.compare_exchange_weak(
                         pos, pos + 1, std::memory_order_relaxed, std::memory_order_relaxed
@@ -249,7 +248,7 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         PTO2TaskSlotState *result = slot->slot_state;
-        slot->sequence.store((int64_t)(pos + mask + 1), std::memory_order_release);
+        slot->sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
         return result;
     }
 
@@ -272,7 +271,7 @@ struct alignas(64) PTO2ReadyQueue {
             pos = dequeue_pos.load(std::memory_order_relaxed);
             slot = &slots[pos & mask];
             int64_t seq = slot->sequence.load(std::memory_order_acquire);
-            int64_t diff = seq - (int64_t)(pos + 1);
+            int64_t diff = seq - static_cast<int64_t>(pos + 1);
             atomic_ops += 2;  // dequeue_pos.load + sequence.load
             if (diff == 0) {
                 if (dequeue_pos.compare_exchange_weak(
@@ -297,7 +296,7 @@ struct alignas(64) PTO2ReadyQueue {
         }
 
         PTO2TaskSlotState *result = slot->slot_state;
-        slot->sequence.store((int64_t)(pos + mask + 1), std::memory_order_release);
+        slot->sequence.store(static_cast<int64_t>(pos + mask + 1), std::memory_order_release);
         return result;
     }
 #endif
@@ -313,7 +312,7 @@ struct alignas(64) PTO2ReadyQueue {
             while (count < max_count) {
                 PTO2ReadyQueueSlot *slot = &slots[(pos + count) & mask];
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
-                int64_t diff = seq - (int64_t)(pos + count + 1);
+                int64_t diff = seq - static_cast<int64_t>(pos + count + 1);
                 if (diff == 0) {
                     count++;
                     continue;
@@ -336,7 +335,7 @@ struct alignas(64) PTO2ReadyQueue {
         for (int i = 0; i < count; i++) {
             PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
             out[i] = slot->slot_state;
-            slot->sequence.store((int64_t)(pos + i + mask + 1), std::memory_order_release);
+            slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
         }
         return count;
     }
@@ -355,7 +354,7 @@ struct alignas(64) PTO2ReadyQueue {
             while (count < max_count) {
                 PTO2ReadyQueueSlot *slot = &slots[(pos + count) & mask];
                 int64_t seq = slot->sequence.load(std::memory_order_acquire);
-                int64_t diff = seq - (int64_t)(pos + count + 1);
+                int64_t diff = seq - static_cast<int64_t>(pos + count + 1);
                 atomic_ops++;  // sequence.load
                 if (diff == 0) {
                     count++;
@@ -388,7 +387,7 @@ struct alignas(64) PTO2ReadyQueue {
         for (int i = 0; i < count; i++) {
             PTO2ReadyQueueSlot *slot = &slots[(pos + i) & mask];
             out[i] = slot->slot_state;
-            slot->sequence.store((int64_t)(pos + i + mask + 1), std::memory_order_release);
+            slot->sequence.store(static_cast<int64_t>(pos + i + mask + 1), std::memory_order_release);
             atomic_ops++;  // sequence.store
         }
         atomic_count += atomic_ops;
@@ -655,18 +654,16 @@ struct PTO2SchedulerState {
     }
 
     /**
-     * Two-stage completion: first stage.
-     * Called when a single subtask (AIC, AIV0, or AIV1) finishes.
-     * Sets the corresponding done bit in subtask_done_mask.
+     * Subtask completion: atomic counter model.
+     * Called when a single subtask (AIC, AIV0, or AIV1) finishes on any block.
+     * Atomically increments completed_subtasks and checks whether all subtasks
+     * across all blocks are done.
      *
-     * @return true if this subtask was the last one, completing the mixed task.
+     * @return true if this was the last subtask, completing the entire task.
      */
-    bool on_subtask_complete(PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot) {
-        uint8_t done_bit = (1u << static_cast<uint8_t>(subslot));
-        uint8_t prev_mask = slot_state.subtask_done_mask.fetch_or(done_bit, std::memory_order_acq_rel);
-        uint8_t new_mask = prev_mask | done_bit;
-
-        return new_mask == slot_state.active_mask;
+    bool on_subtask_complete(PTO2TaskSlotState &slot_state) {
+        int16_t prev = slot_state.completed_subtasks.fetch_add(1, std::memory_order_acq_rel);
+        return (prev + 1) == slot_state.total_required_subtasks;
     }
 
     /**
@@ -782,7 +779,7 @@ struct PTO2SchedulerState {
 #endif
         return fanin_edges;
     }
-};
+};  // NOLINT(readability/braces)
 
 // =============================================================================
 // Scheduler API (cold path, defined in pto_scheduler.cpp)
@@ -832,5 +829,3 @@ struct PTO2SchedProfilingData {
  */
 PTO2SchedProfilingData pto2_scheduler_get_profiling(int thread_idx);
 #endif
-
-#endif  // PTO_SCHEDULER_H

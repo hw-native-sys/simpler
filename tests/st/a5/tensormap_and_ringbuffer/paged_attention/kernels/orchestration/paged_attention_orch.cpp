@@ -153,12 +153,12 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                 prof_view_count += 2;
                 CYCLE_COUNT_LAP(prof_tensor_view);
 
-                Arg args_inplace;
-                args_inplace.add_output(tile2d_ci);
-                args_inplace.add_output(scalar_ci);
-                args_inplace.add_output(scalar_ci);
+                Arg params_inplace;
+                params_inplace.add_output(tile2d_ci);
+                params_inplace.add_output(scalar_ci);
+                params_inplace.add_output(scalar_ci);
                 CYCLE_COUNT_LAP(prof_param_setup);
-                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, args_inplace);
+                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace);
                 const Tensor &oi = hub_outs.get_ref(0);
                 const Tensor &li_update = hub_outs.get_ref(1);
                 const Tensor &mi_update = hub_outs.get_ref(2);
@@ -179,12 +179,12 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     prof_view_count += 2;
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
-                    Arg args_qk;
-                    args_qk.add_input(qi);
-                    args_qk.add_input(kj);
-                    args_qk.add_output(sij_ci);
+                    Arg params_qk;
+                    params_qk.add_input(qi);
+                    params_qk.add_input(kj);
+                    params_qk.add_output(sij_ci);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, args_qk);
+                    TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor &sij = qk_outs.get_ref(0);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -195,26 +195,26 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     prof_view_count += 1;
                     CYCLE_COUNT_LAP(prof_tensor_view);
 
-                    Arg args_sf;
-                    args_sf.add_input(sij_valid);
-                    args_sf.add_output(pij_f16_ci);
-                    args_sf.add_output(scalar_ci);
-                    args_sf.add_output(scalar_ci);
-                    args_sf.add_scalar(scale_value);
+                    Arg params_sf;
+                    params_sf.add_input(sij_valid);
+                    params_sf.add_output(pij_f16_ci);
+                    params_sf.add_output(scalar_ci);
+                    params_sf.add_output(scalar_ci);
+                    params_sf.add_scalar(scale_value);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, args_sf);
+                    TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     const Tensor &pij_f16 = sf_outs.get_ref(0);
                     const Tensor &mi = sf_outs.get_ref(1);
                     const Tensor &li = sf_outs.get_ref(2);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
 
-                    Arg args_pv;
-                    args_pv.add_input(pij_f16);
-                    args_pv.add_input(vj);
-                    args_pv.add_output(tile2d_ci);
+                    Arg params_pv;
+                    params_pv.add_input(pij_f16);
+                    params_pv.add_input(vj);
+                    params_pv.add_output(tile2d_ci);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, args_pv);
+                    TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_tmp = pv_outs.get_ref(0);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
@@ -223,18 +223,18 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
                     CYCLE_COUNT_LAP(prof_param_extract);
 
-                    Arg args_up;
-                    args_up.add_input(mi);
-                    args_up.add_input(li);
-                    args_up.add_input(oi_tmp);
-                    args_up.add_inout(mi_update);
-                    args_up.add_inout(li_update);
-                    args_up.add_inout(oi);
-                    args_up.add_inout(out_view);
-                    args_up.add_scalar(is_first);
-                    args_up.add_scalar(is_last);
+                    Arg params_up;
+                    params_up.add_input(mi);
+                    params_up.add_input(li);
+                    params_up.add_input(oi_tmp);
+                    params_up.add_inout(mi_update);
+                    params_up.add_inout(li_update);
+                    params_up.add_inout(oi);
+                    params_up.add_inout(out_view);
+                    params_up.add_scalar(is_first);
+                    params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, args_up);
+                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
                 }
