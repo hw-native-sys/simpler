@@ -26,7 +26,7 @@
 
 #include <cinttypes>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "pto_orchestration_api.h"
 
 #define FUNC_QK_MATMUL 0
 #define FUNC_SOFTMAX_PREPARE 1
@@ -39,7 +39,7 @@ extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
 aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
-    (void)orch_args;  // NOLINT(readability/casting)
+    (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
@@ -64,12 +64,18 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
 
     LOG_INFO("batch_paged_attention: batch=%" PRIu64 ", num_heads=%" PRIu64, batch, num_heads);
 
-    int *host_block_table = orch_args.tensor(3).data_as<int>();
-    int *host_context_lens = orch_args.tensor(4).data_as<int>();
+    uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
+    Tensor block_table =
+        make_tensor_external(orch_args.tensor(3).data_as<void>(), bt_shapes, 2, DataType::INT32, false);
+
+    uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
+    Tensor context_lens =
+        make_tensor_external(orch_args.tensor(4).data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
     uint64_t max_bn = 0;
     for (uint64_t b = 0; b < batch; b++) {
-        uint64_t cur_seq = host_context_lens[b];
+        uint32_t cl_idx[1] = {static_cast<uint32_t>(b)};
+        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
         uint64_t bn_b = (cur_seq + block_size - 1) / block_size;
         if (bn_b > max_bn) max_bn = bn_b;
     }
@@ -92,9 +98,6 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
     Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
     Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32, true);
-
-    uint64_t bt_addr = reinterpret_cast<uintptr_t>(host_block_table);
-    uint64_t cl_addr = reinterpret_cast<uintptr_t>(host_context_lens);
 
     uint64_t IN_CORE_BATCH = 16;
     uint64_t num_chunks = (batch + IN_CORE_BATCH - 1) / IN_CORE_BATCH;
@@ -129,8 +132,8 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     Arg params_qk;
                     params_qk.add_input(query);
                     params_qk.add_input(key_cache);
+                    params_qk.add_input(block_table);
                     params_qk.add_output(sij_ci);
-                    params_qk.add_scalar(bt_addr);
                     params_qk.add_scalar(chunk_bc);
                     params_qk.add_scalar(bn);
                     params_qk.add_scalar(q_offset);
@@ -142,11 +145,11 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
 
                     Arg params_sf;
                     params_sf.add_input(sij_b);
+                    params_sf.add_input(context_lens);
                     params_sf.add_output(pij_ci);
                     params_sf.add_output(scalar_ci);
                     params_sf.add_output(scalar_ci);
                     params_sf.add_scalar(scale_value);
-                    params_sf.add_scalar(cl_addr);
                     params_sf.add_scalar(chunk_bc);
                     params_sf.add_scalar(bn);
                     params_sf.add_scalar(batch_start);
@@ -158,8 +161,8 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     Arg params_pv;
                     params_pv.add_input(pij_b);
                     params_pv.add_input(value_cache);
+                    params_pv.add_input(block_table);
                     params_pv.add_output(tile2d_ci);
-                    params_pv.add_scalar(bt_addr);
                     params_pv.add_scalar(chunk_bc);
                     params_pv.add_scalar(bn);
                     params_pv.add_scalar(block_num);

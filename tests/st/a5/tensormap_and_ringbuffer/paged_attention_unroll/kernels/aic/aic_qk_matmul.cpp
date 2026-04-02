@@ -27,10 +27,12 @@
 // Template: M=q_tile, K=head_dim, N=block_size
 
 #include <cstdint>
+// NOLINTBEGIN(clang-diagnostic-error,bugprone-reserved-identifier,bugprone-easily-swappable-parameters,modernize-avoid-c-arrays,modernize-use-auto)
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"
 
+// NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
 
 #ifndef __gm__
@@ -44,7 +46,7 @@ using namespace pto;
 template <int M, int K, int N>
 static __aicore__ void qk_matmul_n_impl(
     __gm__ bfloat16_t *qi_base, __gm__ bfloat16_t *key_base, __gm__ float *sij_base, uint64_t n_blocks,
-    __gm__ int32_t *block_table
+    __gm__ int32_t *bt, uint64_t bt_offset
 ) {
     using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, pto::Stride<M * K, M * K, M * K, K, 1>>;
     using GlobalB = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, pto::Stride<K * N, K * N, K * N, 1, K>, Layout::DN>;
@@ -74,7 +76,7 @@ static __aicore__ void qk_matmul_n_impl(
     TLOAD(aMatTile, qiGlobal);
 
     for (uint64_t i = 0; i < n_blocks; i++) {
-        GlobalB kjGlobal(key_base + block_table[i] * N * K);
+        GlobalB kjGlobal(key_base + bt[bt_offset + i] * N * K);
         GlobalOut sijGlobal(sij_base + i * M * N);
 
         // Load only B each iteration (qi already in L1 from hoist)
@@ -106,19 +108,23 @@ static __aicore__ void qk_matmul_n_impl(
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *qi = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *key_cache = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *sij_buf = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    uint64_t n_blocks = static_cast<uint64_t>(args[3]);
-    __gm__ int32_t *block_table = reinterpret_cast<__gm__ int32_t *>(args[4]);
+    __gm__ Tensor *block_table_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *sij_buf = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    uint64_t n_blocks = static_cast<uint64_t>(args[4]);
+    uint64_t bt_offset = static_cast<uint64_t>(args[5]);
 
     __gm__ bfloat16_t *qi_base = reinterpret_cast<__gm__ bfloat16_t *>(qi->buffer.addr) + qi->start_offset;
     __gm__ bfloat16_t *key_base = reinterpret_cast<__gm__ bfloat16_t *>(key_cache->buffer.addr);
     __gm__ float *sij_base = reinterpret_cast<__gm__ float *>(sij_buf->buffer.addr) + sij_buf->start_offset;
+    __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_t->buffer.addr);
 
     uint64_t q_tile_size = static_cast<uint64_t>(qi->shapes[0]);
 
     if (q_tile_size == 16) {
-        qk_matmul_n_impl<16, 128, 128>(qi_base, key_base, sij_base, n_blocks, block_table);
+        qk_matmul_n_impl<16, 128, 128>(qi_base, key_base, sij_base, n_blocks, bt, bt_offset);
     } else {
-        qk_matmul_n_impl<64, 128, 64>(qi_base, key_base, sij_base, n_blocks, block_table);
+        qk_matmul_n_impl<64, 128, 64>(qi_base, key_base, sij_base, n_blocks, bt, bt_offset);
     }
 }
+
+// NOLINTEND(clang-diagnostic-error,bugprone-reserved-identifier,bugprone-easily-swappable-parameters,modernize-avoid-c-arrays,modernize-use-auto)

@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 // Batched PV Matmul Kernel: for each batch b, pij(M, K) @ vj(K, N) -> oi_new(M, N)
 //
 // Processes batch_count batches in a single kernel invocation.
@@ -16,10 +17,12 @@
 // Template: M=q_tile, K=block_size, N=head_dim
 
 #include <cstdint>
+// NOLINTBEGIN(clang-diagnostic-error,bugprone-reserved-identifier,bugprone-easily-swappable-parameters,modernize-use-auto)
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"
 
+// NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
 
 #ifndef __gm__
@@ -27,19 +30,18 @@ using namespace pto;
 #endif
 
 #ifndef __aicore__
-#define __aicore__ [aicore]
+#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
 #endif
 
 template <int M, int K, int N>
 static __aicore__ void pv_matmul_batch_impl(
-    __gm__ Tensor *pij_batch, __gm__ Tensor *value_cache, __gm__ Tensor *oi_new_batch, uint64_t block_table_ptr,
+    __gm__ Tensor *pij_batch, __gm__ Tensor *value_cache, __gm__ Tensor *block_table_t, __gm__ Tensor *oi_new_batch,
     uint64_t batch_count, uint64_t block_idx, uint64_t block_num, uint64_t batch_start
 ) {
     __gm__ half *pij_base = reinterpret_cast<__gm__ half *>(pij_batch->buffer.addr);
     __gm__ half *val_base = reinterpret_cast<__gm__ half *>(value_cache->buffer.addr);
     __gm__ float *oi_base = reinterpret_cast<__gm__ float *>(oi_new_batch->buffer.addr);
-    // Block table values are always non-negative (physical block indices)
-    __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_ptr);
+    __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_t->buffer.addr);
 
     using GlobalA = GlobalTensor<half, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
     using GlobalB = GlobalTensor<half, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, N, 1>>;
@@ -67,7 +69,7 @@ static __aicore__ void pv_matmul_batch_impl(
     for (uint64_t b = 0; b < batch_count; b++) {
         __gm__ half *pij_addr = pij_base + b * M * K;
         int32_t phys_block = bt[(batch_start + b) * block_num + block_idx];
-        __gm__ half *vj_addr = val_base + (uint64_t)phys_block * K * N;
+        __gm__ half *vj_addr = val_base + static_cast<uint64_t>(phys_block) * K * N;
         __gm__ float *oi_addr = oi_base + b * M * N;
 
         GlobalA pijGlobal(pij_addr);
@@ -102,14 +104,15 @@ static __aicore__ void pv_matmul_batch_impl(
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *pij_batch = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *value_cache = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *oi_new_batch = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    uint64_t block_table_ptr = static_cast<uint64_t>(args[3]);
+    __gm__ Tensor *block_table_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *oi_new_batch = reinterpret_cast<__gm__ Tensor *>(args[3]);
     uint64_t batch_count = static_cast<uint64_t>(args[4]);
     uint64_t block_idx = static_cast<uint64_t>(args[5]);
     uint64_t block_num = static_cast<uint64_t>(args[6]);
     uint64_t batch_start = static_cast<uint64_t>(args[7]);
 
     pv_matmul_batch_impl<16, 16, 16>(
-        pij_batch, value_cache, oi_new_batch, block_table_ptr, batch_count, block_idx, block_num, batch_start
+        pij_batch, value_cache, block_table_t, oi_new_batch, batch_count, block_idx, block_num, batch_start
     );
 }
+// NOLINTEND(clang-diagnostic-error,bugprone-reserved-identifier,bugprone-easily-swappable-parameters,modernize-use-auto)

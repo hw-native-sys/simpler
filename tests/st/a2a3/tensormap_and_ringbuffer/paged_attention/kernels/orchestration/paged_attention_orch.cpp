@@ -25,7 +25,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "pto_orchestration_api.h"
 
 #define FUNC_QK_MATMUL 0
 #define FUNC_SOFTMAX_PREPARE 1
@@ -58,7 +58,7 @@ extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
 aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
-    (void)orch_args;  // NOLINT(readability/casting)
+    (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
@@ -66,8 +66,8 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
 
 __attribute__((visibility("default"))) void
 aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
-    (void)orch_thread_num;    // NOLINT(readability/casting)
-    (void)orch_thread_index;  // NOLINT(readability/casting)
+    (void)orch_thread_num;
+    (void)orch_thread_index;
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;
     uint64_t prof_scope = 0;
@@ -121,8 +121,12 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
     CYCLE_COUNT_LAP(prof_ext_tensor);
 
-    int *host_block_table = orch_args.tensor(3).data_as<int>();
-    int *host_context_lens = orch_args.tensor(4).data_as<int>();
+    uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
+    Tensor block_table =
+        make_tensor_external(orch_args.tensor(3).data_as<void>(), bt_shapes, 2, DataType::INT32, false);
+    uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
+    Tensor context_lens =
+        make_tensor_external(orch_args.tensor(4).data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
     // Create infos are loop-invariant — shapes depend only on q_tile/head_dim/block_size
     uint32_t tile2d_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
@@ -139,7 +143,8 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     int total_tasks = 0;
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
-        uint64_t cur_seq = host_context_lens[b_idx];
+        uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
+        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
             PTO2_SCOPE() {
@@ -168,7 +173,8 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     PTO2_SCOPE_GUARD();
 
-                    uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
+                    uint32_t bt_idx[2] = {static_cast<uint32_t>(b_idx), static_cast<uint32_t>(bn)};
+                    uint64_t cur_block_idx = static_cast<uint64_t>(get_tensor_data<int32_t>(block_table, 2, bt_idx));
                     uint64_t valid_len = std::min(block_size, cur_seq - bn * block_size);
                     CYCLE_COUNT_LAP(prof_param_extract);
 

@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 // SplitK PV Matmul Kernel: Accumulated P @ V across n_blocks
 //
 // Processes n_blocks blocks using SplitK accumulation pattern:
@@ -33,10 +34,12 @@
 // vj is stored as (K, N) = (block_size, head_dim) in row-major (ND) layout.
 
 #include <cstdint>
+// NOLINTBEGIN(clang-diagnostic-error,bugprone-reserved-identifier,bugprone-easily-swappable-parameters,modernize-avoid-c-arrays,modernize-use-auto)
 #include <pto/pto-inst.hpp>
 
 #include "tensor.h"
 
+// NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
 
 #ifndef __gm__
@@ -44,13 +47,13 @@ using namespace pto;
 #endif
 
 #ifndef __aicore__
-#define __aicore__ [aicore]
+#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
 #endif
 
 template <int M, int K, int N>
 static __aicore__ void pv_matmul_n_impl(
     __gm__ bfloat16_t *pij_base, __gm__ bfloat16_t *val_base, __gm__ float *oi_base, uint64_t n_blocks,
-    __gm__ int32_t *block_table
+    __gm__ int32_t *bt, uint64_t bt_offset
 ) {
     using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
     using GlobalB = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, N, 1>>;
@@ -97,7 +100,7 @@ static __aicore__ void pv_matmul_n_impl(
     for (uint64_t i = 0; i < n_blocks; i++) {
         int cur = static_cast<int>(i % 2);
         GlobalA pijGlobal(pij_base + i * M * K);
-        GlobalB vjGlobal(val_base + block_table[i] * K * N);
+        GlobalB vjGlobal(val_base + bt[bt_offset + i] * K * N);
 
         // Stage 1: TLOAD (MTE2: GM → L1[cur])
         // Wait for MTE1 to release L1[cur] (reverse dep from previous iteration)
@@ -144,19 +147,22 @@ static __aicore__ void pv_matmul_n_impl(
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *pij_buf = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *value_cache = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *oi_new = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    uint64_t n_blocks = static_cast<uint64_t>(args[3]);
-    __gm__ int32_t *block_table = reinterpret_cast<__gm__ int32_t *>(args[4]);
+    __gm__ Tensor *block_table_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *oi_new = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    uint64_t n_blocks = static_cast<uint64_t>(args[4]);
+    uint64_t bt_offset = static_cast<uint64_t>(args[5]);
 
     __gm__ bfloat16_t *pij_base = reinterpret_cast<__gm__ bfloat16_t *>(pij_buf->buffer.addr) + pij_buf->start_offset;
     __gm__ bfloat16_t *val_base = reinterpret_cast<__gm__ bfloat16_t *>(value_cache->buffer.addr);
     __gm__ float *oi_base = reinterpret_cast<__gm__ float *>(oi_new->buffer.addr) + oi_new->start_offset;
+    __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_t->buffer.addr);
 
     uint64_t q_tile_size = static_cast<uint64_t>(pij_buf->shapes[0]);
 
     if (q_tile_size == 16) {
-        pv_matmul_n_impl<16, 128, 128>(pij_base, val_base, oi_base, n_blocks, block_table);
+        pv_matmul_n_impl<16, 128, 128>(pij_base, val_base, oi_base, n_blocks, bt, bt_offset);
     } else {
-        pv_matmul_n_impl<64, 64, 128>(pij_base, val_base, oi_base, n_blocks, block_table);
+        pv_matmul_n_impl<64, 64, 128>(pij_base, val_base, oi_base, n_blocks, bt, bt_offset);
     }
 }
+// NOLINTEND(clang-diagnostic-error,bugprone-reserved-identifier,bugprone-easily-swappable-parameters,modernize-avoid-c-arrays,modernize-use-auto)

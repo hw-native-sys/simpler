@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 // Batched Softmax Preparation Kernel (AIV)
 //
 // Processes batch_count batches in a single kernel invocation.
@@ -28,6 +29,7 @@
 
 #include "tensor.h"
 
+// NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
 
 #ifndef __gm__
@@ -35,19 +37,19 @@ using namespace pto;
 #endif
 
 #ifndef __aicore__
-#define __aicore__ [aicore]
+#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
 #endif
 
 template <int M, int N>
 static __aicore__ void softmax_prepare_batch_impl(
-    __gm__ Tensor *sij_batch, __gm__ Tensor *pij_batch, __gm__ Tensor *mij_batch, __gm__ Tensor *lij_batch,
-    float scale_value, uint64_t context_lens_ptr, uint64_t batch_count, uint64_t block_idx, uint64_t batch_start
+    __gm__ Tensor *sij_batch, __gm__ Tensor *context_lens_t, __gm__ Tensor *pij_batch, __gm__ Tensor *mij_batch,
+    __gm__ Tensor *lij_batch, float scale_value, uint64_t batch_count, uint64_t block_idx, uint64_t batch_start
 ) {
     __gm__ float *sij_base = reinterpret_cast<__gm__ float *>(sij_batch->buffer.addr);
     __gm__ bfloat16_t *pij_base = reinterpret_cast<__gm__ bfloat16_t *>(pij_batch->buffer.addr);
     __gm__ float *mij_base = reinterpret_cast<__gm__ float *>(mij_batch->buffer.addr);
     __gm__ float *lij_base = reinterpret_cast<__gm__ float *>(lij_batch->buffer.addr);
-    __gm__ int32_t *ctx_lens = reinterpret_cast<__gm__ int32_t *>(context_lens_ptr);
+    __gm__ int32_t *ctx_lens = reinterpret_cast<__gm__ int32_t *>(context_lens_t->buffer.addr);
 
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
@@ -82,8 +84,8 @@ static __aicore__ void softmax_prepare_batch_impl(
         int32_t cur_seq = ctx_lens[batch_start + b];
         uint64_t start = block_idx * N;
         uint64_t valid_len = 0;
-        if (start < (uint64_t)cur_seq) {
-            uint64_t remaining = (uint64_t)cur_seq - start;
+        if (start < static_cast<uint64_t>(cur_seq)) {
+            uint64_t remaining = static_cast<uint64_t>(cur_seq) - start;
             valid_len = (remaining < N) ? remaining : N;
         }
 
@@ -161,16 +163,16 @@ static __aicore__ void softmax_prepare_batch_impl(
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *sij_batch = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *pij_batch = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *mij_batch = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    __gm__ Tensor *lij_batch = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *context_lens_t = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *pij_batch = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *mij_batch = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *lij_batch = reinterpret_cast<__gm__ Tensor *>(args[4]);
     union {
         uint64_t u;
         float f;
     } scale_conv;
-    scale_conv.u = static_cast<uint64_t>(args[4]);
+    scale_conv.u = static_cast<uint64_t>(args[5]);
     float scale_value = scale_conv.f;
-    uint64_t context_lens_ptr = static_cast<uint64_t>(args[5]);
     uint64_t batch_count = static_cast<uint64_t>(args[6]);
     uint64_t block_idx = static_cast<uint64_t>(args[7]);
     uint64_t batch_start = static_cast<uint64_t>(args[8]);
@@ -179,13 +181,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
     if (q_tile_size == 16) {
         softmax_prepare_batch_impl<16, 128>(
-            sij_batch, pij_batch, mij_batch, lij_batch, scale_value, context_lens_ptr, batch_count, block_idx,
-            batch_start
+            sij_batch, context_lens_t, pij_batch, mij_batch, lij_batch, scale_value, batch_count, block_idx, batch_start
         );
     } else {
         softmax_prepare_batch_impl<64, 64>(
-            sij_batch, pij_batch, mij_batch, lij_batch, scale_value, context_lens_ptr, batch_count, block_idx,
-            batch_start
+            sij_batch, context_lens_t, pij_batch, mij_batch, lij_batch, scale_value, batch_count, block_idx, batch_start
         );
     }
 }

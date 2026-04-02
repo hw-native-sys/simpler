@@ -8,6 +8,7 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+
 // Batched QK Matmul Kernel: for each batch b, qi(M, K) @ kj.T(K, N) -> sij(M, N)
 //
 // Processes batch_count batches in a single kernel invocation.
@@ -24,6 +25,7 @@
 
 #include "tensor.h"
 
+// NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
 
 #ifndef __gm__
@@ -31,20 +33,19 @@ using namespace pto;
 #endif
 
 #ifndef __aicore__
-#define __aicore__ [aicore]
+#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
 #endif
 
 template <int M, int K, int N>
 static __aicore__ void qk_matmul_batch_impl(
-    __gm__ Tensor *query, __gm__ Tensor *key_cache, __gm__ Tensor *sij_batch, uint64_t block_table_ptr,
+    __gm__ Tensor *query, __gm__ Tensor *key_cache, __gm__ Tensor *block_table_t, __gm__ Tensor *sij_batch,
     uint64_t batch_count, uint64_t block_idx, uint64_t q_offset, uint64_t block_num, uint64_t num_heads,
     uint64_t batch_start
 ) {
     __gm__ bfloat16_t *query_base = reinterpret_cast<__gm__ bfloat16_t *>(query->buffer.addr);
     __gm__ bfloat16_t *key_base = reinterpret_cast<__gm__ bfloat16_t *>(key_cache->buffer.addr);
     __gm__ float *sij_base = reinterpret_cast<__gm__ float *>(sij_batch->buffer.addr);
-    // Block table values are always non-negative (physical block indices)
-    __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_ptr);
+    __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_t->buffer.addr);
 
     using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
     using GlobalB = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, 1, K>, Layout::DN>;
@@ -72,7 +73,7 @@ static __aicore__ void qk_matmul_batch_impl(
     for (uint64_t b = 0; b < batch_count; b++) {
         __gm__ bfloat16_t *qi_addr = query_base + ((batch_start + b) * num_heads + q_offset) * K;
         int32_t phys_block = bt[(batch_start + b) * block_num + block_idx];
-        __gm__ bfloat16_t *kj_addr = key_base + (uint64_t)phys_block * N * K;
+        __gm__ bfloat16_t *kj_addr = key_base + static_cast<uint64_t>(phys_block) * N * K;
         __gm__ float *sij_addr = sij_base + b * M * N;
 
         GlobalA qiGlobal(qi_addr);
@@ -108,8 +109,8 @@ static __aicore__ void qk_matmul_batch_impl(
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *query = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *key_cache = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *sij_batch = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    uint64_t block_table_ptr = static_cast<uint64_t>(args[3]);
+    __gm__ Tensor *block_table_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *sij_batch = reinterpret_cast<__gm__ Tensor *>(args[3]);
     uint64_t batch_count = static_cast<uint64_t>(args[4]);
     uint64_t block_idx = static_cast<uint64_t>(args[5]);
     uint64_t q_offset = static_cast<uint64_t>(args[6]);
@@ -121,12 +122,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
     if (q_tile_size == 16) {
         qk_matmul_batch_impl<16, 128, 128>(
-            query, key_cache, sij_batch, block_table_ptr, batch_count, block_idx, q_offset, block_num, num_heads,
+            query, key_cache, block_table_t, sij_batch, batch_count, block_idx, q_offset, block_num, num_heads,
             batch_start
         );
     } else {
         qk_matmul_batch_impl<64, 128, 64>(
-            query, key_cache, sij_batch, block_table_ptr, batch_count, block_idx, q_offset, block_num, num_heads,
+            query, key_cache, block_table_t, sij_batch, batch_count, block_idx, q_offset, block_num, num_heads,
             batch_start
         );
     }

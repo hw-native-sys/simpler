@@ -136,15 +136,16 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type, false);
     Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
 
-    int *host_block_table = orch_args.tensor(3).data_as<int>();
-    int *host_context_lens = orch_args.tensor(4).data_as<int>();
+    uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
+    Tensor block_table =
+        make_tensor_external(orch_args.tensor(3).data_as<void>(), bt_shapes, 2, DataType::INT32, false);
+    uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
+    Tensor context_lens =
+        make_tensor_external(orch_args.tensor(4).data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
 #ifdef ENABLE_PROFILING
     CYCLE_COUNT_LAP(prof_ext_tensor);
 #endif
-
-    // Prefetch first block host_context_lens data into cache
-    __builtin_prefetch(&host_context_lens[0], 0, 3);
 
     // Create infos are loop-invariant — shapes depend only on q_tile/head_dim
     uint32_t oi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
@@ -158,15 +159,9 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
 #endif
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
-        uint64_t cur_seq = host_context_lens[b_idx];
+        uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
+        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
-        // Pre-compute block table base pointer for this batch
-        int *bt_base = host_block_table + b_idx * block_num;
-
-        // Prefetch next block host_context_lens data while processing current batch
-        if (b_idx + 1 < batch) {
-            __builtin_prefetch(&host_context_lens[b_idx + 1], 0, 3);
-        }
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
             CYCLE_COUNT_LAP(prof_scope_and_loop);
             PTO2_SCOPE() {
@@ -221,9 +216,10 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     params_qk.reset();
                     params_qk.add_input(qi);
                     params_qk.add_input(key_cache);
+                    params_qk.add_input(block_table);
                     params_qk.add_output(sij_buf_ci);
                     params_qk.add_scalar(n_blocks);
-                    params_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
+                    params_qk.add_scalar(b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor &sij_buf = qk_outs.get_ref(0);
@@ -264,9 +260,10 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     params_pv.reset();
                     params_pv.add_input(pij_buf);
                     params_pv.add_input(value_cache);
+                    params_pv.add_input(block_table);
                     params_pv.add_output(tile2d_ci);
                     params_pv.add_scalar(n_blocks);
-                    params_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
+                    params_pv.add_scalar(b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_new = pv_outs.get_ref(0);
