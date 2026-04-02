@@ -26,32 +26,24 @@
 #include "common/unified_log.h"
 
 // =============================================================================
-// Thread-local orchestrator index for multi-orchestrator dispatch
-// =============================================================================
-
-thread_local int pto2_current_orch_idx = 0;
-
-void pto2_set_orch_thread_idx(int idx) { pto2_current_orch_idx = idx; }
-
-// =============================================================================
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================
 
 static SubmitResult submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
-    return pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels, args);
+    return pto2_submit_mixed_task(&rt->orchestrators[0], mixed_kernels, args);
 }
 
 static void add_dependency_impl(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer) {
-    pto2_add_dependency(&rt->orchestrators[pto2_current_orch_idx], producer, consumer);
+    pto2_add_dependency(&rt->orchestrators[0], producer, consumer);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrators[0]); }
 
-void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrators[0]); }
 
-void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrators[0]); }
 
-static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[pto2_current_orch_idx].fatal; }
+static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[0].fatal; }
 
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,

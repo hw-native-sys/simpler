@@ -34,28 +34,20 @@
 __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { return 0; }
 
 // =============================================================================
-// Thread-local orchestrator index for multi-orchestrator dispatch
-// =============================================================================
-
-thread_local int pto2_current_orch_idx = 0;
-
-void pto2_set_orch_thread_idx(int idx) { pto2_current_orch_idx = idx; }
-
-// =============================================================================
 // Orchestration Ops Table (function-pointer dispatch for orchestration .so)
 // =============================================================================
 
 static TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
-    return pto2_submit_mixed_task(&rt->orchestrators[pto2_current_orch_idx], mixed_kernels, args);
+    return pto2_submit_mixed_task(&rt->orchestrators[0], mixed_kernels, args);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrators[0]); }
 
-void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrators[0]); }
 
-void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrators[pto2_current_orch_idx]); }
+void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrators[0]); }
 
-static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[pto2_current_orch_idx].fatal; }
+static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[0].fatal; }
 
 // Wait for all producers of this tensor to be safe for data access.
 // Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
@@ -66,7 +58,7 @@ static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[pto2_curre
 // Returns false on timeout (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
 static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
-    PTO2OrchestratorState &orch = rt->orchestrators[pto2_current_orch_idx];
+    PTO2OrchestratorState &orch = rt->orchestrators[0];
 
     // Collect producer slot states from both maps, deduplicated by pointer.
     // +1: one creator slot + up to PTO2_LOOKUP_MAX_RESULTS modifier slots.

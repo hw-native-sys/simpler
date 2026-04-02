@@ -1801,8 +1801,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 SPIN_WAIT_HINT();
             }
 
-            pto2_set_orch_thread_idx(orch_idx);
-
 #if PTO2_PROFILING
             // Each orchestrator thread sets its own phase buffer index (thread-local)
             if (runtime->enable_profiling) {

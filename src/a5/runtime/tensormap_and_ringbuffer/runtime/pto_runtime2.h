@@ -168,12 +168,6 @@ void pto2_runtime_destroy(PTO2Runtime *rt);
  */
 void pto2_runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
 
-/**
- * Set the orchestrator index for the current thread.
- * Must be called before any orchestration API calls on a given thread.
- */
-void pto2_set_orch_thread_idx(int idx);
-
 // =============================================================================
 // Orchestration API (called by orchestration function)
 // =============================================================================
