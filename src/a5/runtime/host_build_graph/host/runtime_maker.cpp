@@ -27,12 +27,14 @@
 #include <fcntl.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <string>
 
 #include "callable.h"   // NOLINT(build/include_subdir)
 #include "runtime.h"    // Includes unified_log.h and provides LOG_* macros  // NOLINT(build/include_subdir)
@@ -46,6 +48,49 @@
  * @return 0 on success, negative on error
  */
 typedef int (*OrchestrationFunc)(Runtime *runtime, const ChipStorageTaskArgs &orch_args);
+
+namespace {
+
+bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
+    size_t total_written = 0;
+    while (total_written < size) {
+        ssize_t written = write(fd, data + total_written, size - total_written);
+        if (written <= 0) {
+            return false;
+        }
+        total_written += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+bool create_temp_so_file(const uint8_t *data, size_t size, std::string *out_path) {
+    char path_template[] = "/tmp/orch_so_XXXXXX";
+    int fd = mkstemp(path_template);
+    if (fd < 0) {
+        return false;
+    }
+
+    // dlopen requires the file to be executable; mkstemp creates 0600 (no exec bit)
+    if (fchmod(fd, 0755) != 0) {
+        close(fd);
+        unlink(path_template);
+        return false;
+    }
+
+    bool ok = write_all_bytes(fd, data, size);
+    if (close(fd) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        unlink(path_template);
+        return false;
+    }
+
+    *out_path = path_template;
+    return true;
+}
+
+}  // namespace
 
 #ifdef __cplusplus
 extern "C" {
@@ -102,26 +147,14 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
     }
 
     // Load orchestration SO from binary data via temp file
-    char fd_path[128];
-    snprintf(fd_path, sizeof(fd_path), "/tmp/orch_so_%d.so", getpid());
-
-    int fd = open(fd_path, O_WRONLY | O_CREAT | O_TRUNC, 0700);
-    if (fd < 0) {
+    std::string fd_path;
+    if (!create_temp_so_file(orch_so_binary, orch_so_size, &fd_path)) {
         LOG_ERROR("Failed to create temp SO file");
         return -1;
     }
 
-    ssize_t written = write(fd, orch_so_binary, static_cast<size_t>(orch_so_size));
-    if (written < 0 || static_cast<uint64_t>(written) != orch_so_size) {
-        LOG_ERROR("Failed to write orchestration SO to temp file");
-        close(fd);
-        unlink(fd_path);
-        return -1;
-    }
-    close(fd);
-
-    void *handle = dlopen(fd_path, RTLD_NOW | RTLD_LOCAL);
-    unlink(fd_path);
+    void *handle = dlopen(fd_path.c_str(), RTLD_NOW | RTLD_LOCAL);
+    unlink(fd_path.c_str());
     if (handle == nullptr) {
         LOG_ERROR("dlopen failed: %s", dlerror());
         return -1;
@@ -160,8 +193,9 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
 
     LOG_INFO("Runtime initialized. Ready for execution from Python.");
 
-    // Note: We intentionally leak the dlopen handle to keep the SO loaded
-    // for the lifetime of the process.
+    // Host orchestration is complete once orch_func returns. The task graph now
+    // lives in Runtime, so the orchestration SO can be closed immediately.
+    dlclose(handle);
 
     return 0;
 }

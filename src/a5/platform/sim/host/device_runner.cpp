@@ -26,6 +26,9 @@
 
 #include "device_runner.h"
 
+#include <stdlib.h>
+#include <sys/stat.h>
+
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -40,6 +43,51 @@ typedef void (*aicore_execute_func_t)(
     Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs
 );
 typedef void (*set_platform_regs_func_t)(uint64_t regs);
+
+namespace {
+
+bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
+    size_t total_written = 0;
+    while (total_written < size) {
+        ssize_t written = write(fd, data + total_written, size - total_written);
+        if (written <= 0) {
+            return false;
+        }
+        total_written += static_cast<size_t>(written);
+    }
+    return true;
+}
+
+bool create_temp_so_file(const std::string &path_template, const uint8_t *data, size_t size, std::string *out_path) {
+    std::vector<char> path_buf(path_template.begin(), path_template.end());
+    path_buf.push_back('\0');
+
+    int fd = mkstemp(path_buf.data());
+    if (fd < 0) {
+        return false;
+    }
+
+    // dlopen requires the file to be executable; mkstemp creates 0600 (no exec bit)
+    if (fchmod(fd, 0755) != 0) {
+        close(fd);
+        unlink(path_buf.data());
+        return false;
+    }
+
+    bool ok = write_all_bytes(fd, data, size);
+    if (close(fd) != 0) {
+        ok = false;
+    }
+    if (!ok) {
+        unlink(path_buf.data());
+        return false;
+    }
+
+    *out_path = path_buf.data();
+    return true;
+}
+
+}  // namespace
 
 // =============================================================================
 // DeviceRunner Implementation
@@ -67,16 +115,14 @@ int DeviceRunner::ensure_binaries_loaded(
 
     // Write AICPU binary to temp file and dlopen
     if (!aicpu_so_binary.empty()) {
-        aicpu_so_path_ = "/tmp/aicpu_sim_" + std::to_string(getpid()) + ".so";
-        std::ofstream ofs(aicpu_so_path_, std::ios::binary);
-        if (!ofs) {
-            LOG_ERROR("Failed to create temp file for AICPU SO: %s", aicpu_so_path_.c_str());
+        if (!create_temp_so_file(
+                "/tmp/aicpu_sim_XXXXXX", aicpu_so_binary.data(), aicpu_so_binary.size(), &aicpu_so_path_
+            )) {
+            LOG_ERROR("Failed to create temp file for AICPU SO");
             return -1;
         }
-        ofs.write(reinterpret_cast<const char *>(aicpu_so_binary.data()), aicpu_so_binary.size());
-        ofs.close();
 
-        aicpu_so_handle_ = dlopen(aicpu_so_path_.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        aicpu_so_handle_ = dlopen(aicpu_so_path_.c_str(), RTLD_NOW | RTLD_LOCAL);
         if (aicpu_so_handle_ == nullptr) {
             LOG_ERROR("dlopen failed for AICPU SO: %s", dlerror());
             return -1;
@@ -99,16 +145,14 @@ int DeviceRunner::ensure_binaries_loaded(
 
     // Write AICore binary to temp file and dlopen
     if (!aicore_kernel_binary.empty()) {
-        aicore_so_path_ = "/tmp/aicore_sim_" + std::to_string(getpid()) + ".so";
-        std::ofstream ofs(aicore_so_path_, std::ios::binary);
-        if (!ofs) {
-            LOG_ERROR("Failed to create temp file for AICore SO: %s", aicore_so_path_.c_str());
+        if (!create_temp_so_file(
+                "/tmp/aicore_sim_XXXXXX", aicore_kernel_binary.data(), aicore_kernel_binary.size(), &aicore_so_path_
+            )) {
+            LOG_ERROR("Failed to create temp file for AICore SO");
             return -1;
         }
-        ofs.write(reinterpret_cast<const char *>(aicore_kernel_binary.data()), aicore_kernel_binary.size());
-        ofs.close();
 
-        aicore_so_handle_ = dlopen(aicore_so_path_.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        aicore_so_handle_ = dlopen(aicore_so_path_.c_str(), RTLD_NOW | RTLD_LOCAL);
         if (aicore_so_handle_ == nullptr) {
             LOG_ERROR("dlopen failed for AICore SO: %s", dlerror());
             return -1;
@@ -491,25 +535,22 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
     size_t kernel_size = callable->binary_size();
 
     // 1. Generate temp file path
-    char tmpfile[256];
-    snprintf(tmpfile, sizeof(tmpfile), "/tmp/kernel_%d_%d.so", func_id, getpid());
-
-    // 2. Write extracted kernel binary to temp file
-    std::ofstream ofs(tmpfile, std::ios::binary);
-    if (!ofs) {
-        LOG_ERROR("Failed to create temp file: %s", tmpfile);
+    std::string tmpfile;
+    if (!create_temp_so_file(
+            "/tmp/kernel_" + std::to_string(func_id) + "_XXXXXX", reinterpret_cast<const uint8_t *>(kernel_binary),
+            kernel_size, &tmpfile
+        )) {
+        LOG_ERROR("Failed to create temp file for kernel func_id=%d", func_id);
         return 0;
     }
-    ofs.write(reinterpret_cast<const char *>(kernel_binary), kernel_size);
-    ofs.close();
 
-    LOG_DEBUG("Uploading kernel .so: %s (size=%zu bytes)", tmpfile, kernel_size);
+    LOG_DEBUG("Uploading kernel .so: %s (size=%zu bytes)", tmpfile.c_str(), kernel_size);
 
     // 3. dlopen to load .so (RTLD_NOW ensures all symbols resolved immediately)
-    void *handle = dlopen(tmpfile, RTLD_NOW | RTLD_LOCAL);
+    void *handle = dlopen(tmpfile.c_str(), RTLD_NOW | RTLD_LOCAL);
 
     // 4. Remove temp file immediately (.so is already in memory)
-    std::remove(tmpfile);
+    std::remove(tmpfile.c_str());
 
     if (!handle) {
         LOG_ERROR("dlopen failed: %s", dlerror());
