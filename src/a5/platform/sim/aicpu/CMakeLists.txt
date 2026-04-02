@@ -55,13 +55,21 @@ endif()
 # Create shared library (host-compatible for dlopen)
 add_library(aicpu_kernel SHARED ${AICPU_SOURCES})
 
+# AppleClang does not recognize -Wno-error=class-memaccess.
+set(AICPU_WARNING_FLAGS
+    -Wall
+    -Wextra
+    -Werror
+)
+
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "AppleClang")
+    list(APPEND AICPU_WARNING_FLAGS -Wno-error=class-memaccess)
+endif()
+
 # Compile options (host g++/gcc)
 target_compile_options(aicpu_kernel
     PRIVATE
-        -Wall
-        -Wextra
-        -Werror
-        -Wno-error=class-memaccess
+        ${AICPU_WARNING_FLAGS}
         -fPIC
         -O3
         -g
