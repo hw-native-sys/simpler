@@ -13,8 +13,7 @@
  */
 #include "aicore/aicore.h"
 #include "common/core_type.h"
-
-class Runtime;
+#include "common/kernel_args.h"
 
 #ifdef __DAV_VEC__
 #define KERNEL_ENTRY(x) \
@@ -48,7 +47,7 @@ extern __aicore__ void aicore_execute(__gm__ Runtime *runtime, int block_idx, Co
  *
  * @param runtime Address of Runtime structure in device memory
  */
-extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime *runtime) {
+extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ KernelArgs *k_args) {
     // Calculate block_idx for this core
 #ifdef __DAV_VEC__
     block_idx = get_block_idx() * get_subblockdim() + get_subblockid() + get_block_num();
@@ -58,5 +57,6 @@ extern "C" __global__ __aicore__ void KERNEL_ENTRY(aicore_kernel)(__gm__ Runtime
     core_type = CoreType::AIC;
 #endif
 
-    aicore_execute(runtime, block_idx, core_type);
+    set_ffts_base_addr((uint64_t)k_args->ffts_base_addr);
+    aicore_execute(k_args->runtime_args, block_idx, core_type);
 }

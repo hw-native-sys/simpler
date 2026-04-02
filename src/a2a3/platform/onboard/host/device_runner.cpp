@@ -136,6 +136,48 @@ int KernelArgsHelper::finalize_runtime_args() {
     return 0;
 }
 
+int KernelArgsHelper::init_ffts_base_addr() {
+    uint64_t ffts_base_addr{0};
+    uint32_t ffts_len{0};
+    int rc = rtGetC2cCtrlAddr(&ffts_base_addr, &ffts_len);
+    if (rc != 0) {
+        LOG_ERROR("rtGetC2cCtrlAddr failed: %d", rc);
+        return rc;
+    }
+    args.ffts_base_addr = ffts_base_addr;
+    return 0;
+}
+
+int KernelArgsHelper::init_device_kernel_args(MemoryAllocator &allocator) {
+    allocator_ = &allocator;
+
+    if (device_k_args_ == nullptr) {
+        void *dev_ptr = allocator_->alloc(sizeof(KernelArgs));
+        if (dev_ptr == nullptr) {
+            LOG_ERROR("Alloc for device KernelArgs failed");
+            return -1;
+        }
+        device_k_args_ = reinterpret_cast<KernelArgs *>(dev_ptr);
+    }
+    int rc = rtMemcpy(device_k_args_, sizeof(KernelArgs), &args, sizeof(KernelArgs), RT_MEMCPY_HOST_TO_DEVICE);
+    if (rc != 0) {
+        LOG_ERROR("rtMemcpy for KernelArgs failed: %d", rc);
+        allocator_->free(device_k_args_);
+        device_k_args_ = nullptr;
+        return rc;
+    }
+    return 0;
+}
+
+int KernelArgsHelper::finalize_device_kernel_args() {
+    if (device_k_args_ != nullptr && allocator_ != nullptr) {
+        int rc = allocator_->free(device_k_args_);
+        device_k_args_ = nullptr;
+        return rc;
+    }
+    return 0;
+}
+
 // =============================================================================
 // AicpuSoInfo Implementation
 // =============================================================================
@@ -406,6 +448,7 @@ int DeviceRunner::run(
     });
 
     auto runtime_args_cleanup = RAIIScopeGuard([this]() {
+        kernel_args_.finalize_device_kernel_args();
         kernel_args_.finalize_runtime_args();
     });
 
@@ -435,6 +478,19 @@ int DeviceRunner::run(
         return rc;
     }
 
+    rc = kernel_args_.init_ffts_base_addr();
+    if (rc != 0) {
+        LOG_ERROR("init_ffts_base_addr failed: %d", rc);
+        return rc;
+    }
+
+    // Copy KernelArgs to device memory for AICore
+    rc = kernel_args_.init_device_kernel_args(mem_alloc_);
+    if (rc != 0) {
+        LOG_ERROR("init_device_kernel_args failed: %d", rc);
+        return rc;
+    }
+
     std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerInit===" << '\n';
     // Launch AICPU init kernel
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
@@ -454,8 +510,8 @@ int DeviceRunner::run(
     }
 
     std::cout << "\n=== launch_aicore_kernel===" << '\n';
-    // Launch AICore kernel
-    rc = launch_aicore_kernel(stream_aicore_, kernel_args_.args.runtime_args);
+    // Launch AICore kernel (pass device copy of KernelArgs)
+    rc = launch_aicore_kernel(stream_aicore_, kernel_args_.device_k_args_);
     if (rc != 0) {
         LOG_ERROR("launch_aicore_kernel failed: %d", rc);
         return rc;
@@ -618,7 +674,7 @@ int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, con
     );
 }
 
-int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime *runtime) {
+int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {
     if (aicore_kernel_binary_.empty()) {
         LOG_ERROR("AICore kernel binary is empty");
         return -1;
@@ -641,10 +697,9 @@ int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime *runtime) {
     }
 
     struct Args {
-        Runtime *runtime;
+        KernelArgs *k_args;
     };
-    // Pass device address of Runtime to AICore
-    Args args = {runtime};
+    Args args = {k_args};
     rtArgsEx_t rt_args;
     std::memset(&rt_args, 0, sizeof(rt_args));
     rt_args.args = &args;

@@ -60,15 +60,16 @@ extern "C" {
  * - runtime_args: Written by host, read by AICPU (task runtime, includes
  *   handshake buffers)
  *
- * Note: AICore kernels receive Runtime* directly, not KernelArgs
- *       - AICPU: accesses runtime_args->workers directly
- *       - AICore: receives Runtime* pointer with workers at offset 0
+ * Field Access Patterns:
+ *       - AICPU: receives KernelArgs* via DynTileFwkBackendKernelServer
+ *       - AICore: receives KernelArgs* via KERNEL_ENTRY
  */
 struct KernelArgs {
-    uint64_t unused[5] = {0};          // Alignment padding (required by CANN runtime offset)
-    DeviceArgs *device_args{nullptr};  // Device arguments (AICPU reads, contains SO info)
-    Runtime *runtime_args{nullptr};    // Task runtime in device memory
-    uint64_t regs{0};                  // Per-core register base address array (platform-specific)
+    uint64_t unused[5] = {0};                               // Alignment padding (required by CANN runtime offset)
+    DeviceArgs *device_args{nullptr};                       // Device arguments (AICPU reads, contains SO info)
+    __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
+    uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
+    uint64_t ffts_base_addr{0};                             // FFTS base address for AICore
 };
 
 #ifdef __cplusplus

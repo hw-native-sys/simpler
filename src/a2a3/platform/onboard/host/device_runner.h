@@ -70,6 +70,7 @@ struct DeviceArgs {
 struct KernelArgsHelper {
     KernelArgs args;
     MemoryAllocator *allocator_{nullptr};
+    KernelArgs *device_k_args_{nullptr};  // Device copy of KernelArgs for AICore
 
     /**
      * Initialize device arguments by allocating device memory and copying data
@@ -102,6 +103,30 @@ struct KernelArgsHelper {
      * @return 0 on success, error code on failure
      */
     int finalize_runtime_args();
+
+    /**
+     * Retrieve FFTS base address via rtGetC2cCtrlAddr and store in KernelArgs
+     *
+     * @return 0 on success, error code on failure
+     */
+    int init_ffts_base_addr();
+
+    /**
+     * Copy KernelArgs to device memory for AICore kernel parameter passing
+     *
+     * Must be called after init_runtime_args and init_ffts_base_addr.
+     *
+     * @param allocator  Memory allocator to use
+     * @return 0 on success, error code on failure
+     */
+    int init_device_kernel_args(MemoryAllocator &allocator);
+
+    /**
+     * Free device memory allocated for KernelArgs copy
+     *
+     * @return 0 on success, error code on failure
+     */
+    int finalize_device_kernel_args();
 
     /**
      * Implicit conversion operators for seamless use with runtime APIs
@@ -286,10 +311,10 @@ public:
      * workflows.
      *
      * @param stream  AICore stream
-     * @param runtime   Pointer to device runtime
+     * @param k_args  Pointer to kernel arguments (includes runtime, ffts_base_addr, etc.)
      * @return 0 on success, error code on failure
      */
-    int launch_aicore_kernel(rtStream_t stream, Runtime *runtime);
+    int launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args);
 
     /**
      * Upload a kernel binary to device memory
