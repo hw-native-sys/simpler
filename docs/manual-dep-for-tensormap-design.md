@@ -23,6 +23,44 @@ These decisions are already aligned with the requested direction:
 3. The design must not simplify away multi-write cases.
 4. For an outer-scope tensor written inside a manual scope, readiness is the writer task completion time, not `scope_end`.
 5. Therefore, a task inside a manual scope that writes an outer-scope tensor must still publish that tensor to TensorMap.
+6. For an outer-scope tensor read inside a manual scope, the dependency must still be forced by TensorMap/owner-based boundary seeding.
+
+## Change Control Requirements
+
+The implementation PR must follow these rules:
+
+- Keep the change strictly scoped to manual dependency support in `tensormap_and_ringbuffer`.
+- Do not refactor unrelated runtime behavior while doing this work.
+- Do not change existing normal-scope TensorMap semantics.
+- Do not change scope lifetime semantics.
+- Prefer the smallest invasive write set that cleanly supports the feature.
+- Preserve existing examples/tests unless a targeted update is required to cover the new feature.
+- Any behavior change outside manual-scope execution must be treated as a regression.
+
+## Repository Rule Requirements
+
+The implementation must carefully follow the repository's coding rules and conventions:
+
+- obey `CLAUDE.md` directory ownership and workflow rules
+- obey `.claude/rules/architecture.md`
+- obey `.claude/rules/codestyle.md`
+- keep platform-isolation preprocessor ordering consistent with repo rules
+- avoid comment styles that encode plan phases or temporary implementation notes
+- preserve current behavior unless this spec explicitly requires otherwise
+- avoid adding new tensor metadata unless it is strictly necessary for correctness
+- prefer provenance on task-side state over changing hot-path `Tensor` layout
+
+## Tooling Requirements
+
+The implementation and follow-up PRs must also respect the current repository tooling state:
+
+- PR #424 has already aligned C and C++ sources with `clang-format`.
+- Local development should use `clang-format` `v21.1.0`, matching `.pre-commit-config.yaml`.
+- Developers should configure local save-time auto-formatting with that exact `clang-format` version to avoid unnecessary AI-driven formatting churn.
+- The feature PR should not include unrelated bulk reformatting.
+- `.clang-tidy` is now part of the repository toolchain, but many checks are still intentionally disabled in the config file.
+- This feature PR must satisfy the currently active `clang-tidy` expectations for touched code.
+- Gradually enabling additional `clang-tidy` checks and fixing old violations is a separate ongoing stream of work, not something this feature should broaden into unless directly required for touched code.
 
 ## Non-Goals
 
@@ -85,7 +123,7 @@ For a task submitted inside a manual scope, every tensor argument falls into one
 1. Outer-scope tensor, read only
 2. Outer-scope tensor, written in place
 3. Tensor created inside this manual scope, used again inside this manual scope
-4. Tensor created inside this manual scope, then used through an outer-scope tensor alias/view
+4. Outer-scope tensor accessed through a derived view/reshape/transpose inside the manual scope
 5. External tensor with no owner task
 
 The runtime must classify behavior from ownership and current scope, not only from argument tag.
@@ -94,9 +132,10 @@ The runtime must classify behavior from ownership and current scope, not only fr
 
 ### 1. Outer-scope tensor, read only
 
-- The first internal consumer still needs dependency seeding from existing producer state.
-- This must still use creator retention and TensorMap lookup as appropriate.
+- The first internal consumer must still get its dependency from TensorMap/owner-based boundary seeding.
+- This is not optional and must not be delegated to explicit manual edges inside the scope.
 - Manual scope does not remove the need to wait for the outer producer frontier.
+- In other words, outer-read boundary correctness is still forced by TensorMap-side logic.
 
 ### 2. Outer-scope tensor, written in place
 
@@ -111,13 +150,15 @@ The runtime must classify behavior from ownership and current scope, not only fr
 - No automatic same-scope dependency derivation.
 - Orchestration must call `add_dependency` explicitly for correctness.
 
-### 4. Tensor created inside this manual scope, then used through an outer-scope alias/view
+### 4. Outer-scope tensor accessed through a derived view/reshape/transpose inside the manual scope
 
-This case must be handled by ownership classification, not by raw pointer equality.
+This is the real aliasing case that matters for the design. It must be handled by ownership classification, not by raw pointer equality.
 
-If the tensor instance still belongs to the manual scope, it remains same-scope and should stay explicit.
+An outer-scope tensor may be sliced or reshaped inside the manual scope, but it is still outer-scope.
 
-If orchestration is mutating an outer-scope tensor through a view that inherits the outer owner/scope identity, that is cross-scope and should keep TensorMap behavior.
+If orchestration is reading or mutating an outer-scope tensor through a derived view that inherits the outer owner/scope identity, that is still cross-scope and should keep TensorMap behavior.
+
+A tensor created inside the manual scope should not later become an outer-scope alias. That would violate the existing scope lifetime model rather than define a supported boundary case.
 
 ### 5. External tensor with no owner task
 
@@ -176,8 +217,8 @@ The unique scope id is required because same-scope vs cross-scope classification
 Recommendation:
 
 - assign `scope_id` on every `scope_begin`
-- store current producing `scope_id` on runtime-created tensors
-- views inherit the source tensor's producing `scope_id`
+- store current producing `scope_id` on task-side provenance
+- use `owner_task_id` on `Tensor` to reach producing task provenance
 
 ## Tensor metadata
 
@@ -186,22 +227,27 @@ Current `Tensor` already stores:
 - `owner_task_id`
 - `manual_dep`
 
-For this design, the critical missing concept is producing scope identity. We need enough metadata to answer:
+Recommendation: do not add new tensor metadata in v1.
+
+The critical missing concept is producing scope identity, but that provenance should live on the producer task side if possible, not on `Tensor`.
+
+We need enough information to answer:
 
 - was this tensor produced in the current manual scope?
 - or is it owned by an outer scope and therefore boundary-visible?
 
-Recommendation:
+Preferred approach:
 
-- add `owner_scope_id` to `Tensor`
-- initialize runtime-created outputs with the current scope id
-- inherit `owner_scope_id` through `view`, `reshape`, and `transpose`
+- keep `Tensor` layout unchanged
+- use `tensor.owner_task_id` as the provenance pointer
+- record `owner_scope_id` on producer task-side metadata such as task descriptor or scheduler/orchestrator slot state
+- classify same-scope versus cross-scope through `owner_task_id -> producer provenance -> scope_id`
 
 `manual_dep` should no longer be the primary mechanism for scope semantics. It may remain as a per-tensor override, but the scoped design should be driven by:
 
 - current scope mode
-- tensor owner scope id
 - tensor owner task id
+- producer task scope provenance
 
 ## Submit-time classification
 
@@ -212,7 +258,7 @@ Pseudo-rule for a task submitted inside a manual scope:
 ```cpp
 same_scope_tensor =
     tensor.owner_task_id.is_valid() &&
-    tensor.owner_scope_id == current_manual_scope_id;
+    producer_scope_id(tensor.owner_task_id) == current_manual_scope_id;
 
 if (!in_manual_scope) {
     use existing tensormap behavior;
@@ -234,6 +280,7 @@ Important nuance:
 
 - same-scope tensors should still retain creator lifetime through explicit dependencies, not through automatic creator retention
 - cross-scope tensors should still retain creator lifetime automatically
+- cross-scope outer reads must still execute the existing TensorMap/owner dependency path even when the current scope is manual
 
 ## Explicit edge wiring
 
@@ -292,7 +339,7 @@ This is a user error. The runtime should not try to reconstruct same-scope write
 
 ## Reads Of Outer Tensors Inside Manual Scope
 
-Outer tensors read inside manual scope must still seed internal dependencies from existing producer state.
+Outer tensors read inside manual scope must still seed internal dependencies from existing producer state through TensorMap/owner logic.
 
 Otherwise:
 
@@ -300,6 +347,11 @@ Otherwise:
 - explicit edges inside the scope are insufficient to protect the outer-to-inner boundary
 
 So manual mode disables only same-scope auto-derivation, not boundary seeding.
+
+This is a strict requirement:
+
+- outer read boundary dependency is forced by TensorMap/owner metadata
+- orchestration code inside the manual scope must not be required to recreate that outer dependency manually
 
 ## Nesting Rules
 
@@ -322,11 +374,17 @@ Recommendation:
 - detect this at `scope_begin`
 - fail fast with a clear orchestrator error
 
+Required error text quality:
+
+- the message must explicitly say that `manual scope inside manual scope is not supported`
+- the message must identify the offending operation as nested `PTO_SCOPE(manual_dep=1)`
+- the message must not use vague wording such as only `invalid scope state`
+
 ## Diagnostics
 
 The runtime should detect and report:
 
-1. nested manual scope not supported
+1. nested manual scope not supported, with an explicit error message
 2. `add_dependency` used with invalid task ids
 3. dependency overflow from explicit wiring
 4. obvious cross-scope/manual mismatch where possible
@@ -381,14 +439,20 @@ Only then move to more complex orchestration such as paged attention.
 2. Using `Tensor::manual_dep` as the only signal.
 - Scope semantics are relational and need owner scope identity.
 
-3. Letting cross-scope writes publish only at `scope_end`.
+3. Failing to force outer-scope reads through TensorMap/owner dependency seeding.
+- This allows manual-scope tasks to read before the outer producer frontier is ready.
+
+4. Letting cross-scope writes publish only at `scope_end`.
 - This delays readiness incorrectly.
 
-4. Accidentally preserving creator retention for same-scope tensors in manual mode.
+5. Accidentally preserving creator retention for same-scope tensors in manual mode.
 - This reintroduces hidden dependencies and weakens the mental model.
 
-5. Missing alias/view inheritance of scope ownership.
+6. Missing alias/view inheritance of scope ownership.
 - This causes wrong same-scope vs cross-scope classification.
+
+7. Turning this feature into a broad runtime refactor.
+- This increases regression risk and violates the required change scope.
 
 ## Recommended Implementation Order
 
@@ -398,8 +462,8 @@ Only then move to more complex orchestration such as paged attention.
 4. Implement explicit edge wiring in tensormap runtime.
 5. Refactor submit-time dependency logic to branch on:
    - current scope mode
-   - tensor owner scope id
    - tensor owner task id
+   - producer task scope provenance
 6. Add fail-fast nested-manual-scope check.
 7. Add targeted tests for boundary semantics.
 8. Migrate one example and validate.
