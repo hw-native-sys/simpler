@@ -46,18 +46,16 @@ public:
 private:
     using SetDeviceFn = int (*)(int);
     using GetRuntimeSizeFn = size_t (*)();
-    using InitRuntimeFn = int (*)(void *, const void *, const void *);
-    using LaunchRuntimeFn = int (*)(void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int);
-    using FinalizeRuntimeFn = int (*)(void *);
-    using EnableProfilingFn = int (*)(void *, int);
+    using RunRuntimeFn = int (*)(
+        void *, const void *, const void *, int, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int
+    );
+    using FinalizeDeviceFn = int (*)();
 
     void *lib_handle_ = nullptr;
     SetDeviceFn set_device_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
-    InitRuntimeFn init_runtime_fn_ = nullptr;
-    LaunchRuntimeFn launch_runtime_fn_ = nullptr;
-    FinalizeRuntimeFn finalize_runtime_fn_ = nullptr;
-    EnableProfilingFn enable_profiling_fn_ = nullptr;
+    RunRuntimeFn run_runtime_fn_ = nullptr;
+    FinalizeDeviceFn finalize_device_fn_ = nullptr;
 
     std::vector<uint8_t> runtime_buf_;
     std::vector<uint8_t> aicpu_binary_;

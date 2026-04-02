@@ -55,15 +55,11 @@ void ChipWorker::init(
     }
 
     try {
-        // Resolve C API symbols
         set_device_fn_ = load_symbol<SetDeviceFn>(handle, "set_device");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
-        init_runtime_fn_ = load_symbol<InitRuntimeFn>(handle, "init_runtime");
-        launch_runtime_fn_ = load_symbol<LaunchRuntimeFn>(handle, "launch_runtime");
-        finalize_runtime_fn_ = load_symbol<FinalizeRuntimeFn>(handle, "finalize_runtime");
-        enable_profiling_fn_ = load_symbol<EnableProfilingFn>(handle, "enable_runtime_profiling");
+        run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
+        finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
 
-        // Set device
         int rc = set_device_fn_(device_id);
         if (rc != 0) {
             throw std::runtime_error("set_device failed with code " + std::to_string(rc));
@@ -76,11 +72,9 @@ void ChipWorker::init(
     lib_handle_ = handle;
     device_id_ = device_id;
 
-    // Cache platform binaries
     aicpu_binary_.assign(aicpu_binary, aicpu_binary + aicpu_size);
     aicore_binary_.assign(aicore_binary, aicore_binary + aicore_size);
 
-    // Pre-allocate runtime buffer
     runtime_buf_.resize(get_runtime_size_fn_());
 
     initialized_ = true;
@@ -88,15 +82,16 @@ void ChipWorker::init(
 
 void ChipWorker::reset() {
     if (lib_handle_) {
+        if (finalize_device_fn_) {
+            finalize_device_fn_();
+        }
         dlclose(lib_handle_);
     }
     lib_handle_ = nullptr;
     set_device_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
-    init_runtime_fn_ = nullptr;
-    launch_runtime_fn_ = nullptr;
-    finalize_runtime_fn_ = nullptr;
-    enable_profiling_fn_ = nullptr;
+    run_runtime_fn_ = nullptr;
+    finalize_device_fn_ = nullptr;
     runtime_buf_.clear();
     aicpu_binary_.clear();
     aicore_binary_.clear();
@@ -111,32 +106,12 @@ void ChipWorker::run(const void *callable, const void *args, const CallConfig &c
 
     void *rt = runtime_buf_.data();
 
-    // 1. Placement new + build graph
-    int rc = init_runtime_fn_(rt, callable, args);
-    if (rc != 0) {
-        throw std::runtime_error("init_runtime failed with code " + std::to_string(rc));
-    }
-
-    // 2. Enable profiling AFTER init (placement new would overwrite the flag)
-    if (config.enable_profiling) {
-        rc = enable_profiling_fn_(rt, 1);
-        if (rc != 0) {
-            throw std::runtime_error("enable_runtime_profiling failed with code " + std::to_string(rc));
-        }
-    }
-
-    // 3. Launch
-    rc = launch_runtime_fn_(
-        rt, config.aicpu_thread_num, config.block_dim, device_id_, aicpu_binary_.data(), aicpu_binary_.size(),
-        aicore_binary_.data(), aicore_binary_.size(), config.orch_thread_num
+    int rc = run_runtime_fn_(
+        rt, callable, args, config.block_dim, config.aicpu_thread_num, config.orch_thread_num, device_id_,
+        aicpu_binary_.data(), aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(),
+        config.enable_profiling ? 1 : 0
     );
     if (rc != 0) {
-        throw std::runtime_error("launch_runtime failed with code " + std::to_string(rc));
-    }
-
-    // 4. Finalize — copy results back, cleanup
-    rc = finalize_runtime_fn_(rt);
-    if (rc != 0) {
-        throw std::runtime_error("finalize_runtime failed with code " + std::to_string(rc));
+        throw std::runtime_error("run_runtime failed with code " + std::to_string(rc));
     }
 }

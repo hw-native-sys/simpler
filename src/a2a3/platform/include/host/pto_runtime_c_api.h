@@ -9,19 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * PTO Runtime C API
+ * PTO Runtime C API — Platform Header
  *
- * Pure C interface for Python ctypes bindings. Wraps C++ classes (Runtime,
- * DeviceRunner) as opaque pointers and provides C functions to manipulate them.
+ * Declares all C-linkage functions exported by the host runtime .so:
  *
- * This interface is shared across all platforms (a2a3, a2a3sim, etc.) to ensure
- * compatibility and consistent behavior.
+ * - Public API (resolved by ChipWorker via dlsym):
+ *     get_runtime_size, set_device, run_runtime, finalize_device
+ *     → see src/common/worker/pto_runtime_c_api.h for the canonical spec.
  *
- * Key design:
- * - All functions use C linkage (extern "C")
- * - Opaque pointers hide C++ implementation details
- * - Error codes: 0 = success, negative = error
- * - Memory management: User allocates Runtime with malloc(get_runtime_size())
+ * - Internal API (called by orchestration code via function pointers
+ *   or direct linking within the .so):
+ *     record_tensor_pair
+ *
+ * Memory management: caller allocates a buffer of get_runtime_size() bytes
+ * and passes it to run_runtime(). Error codes: 0 = success, negative = error.
  */
 
 #ifndef SRC_A2A3_PLATFORM_INCLUDE_HOST_PTO_RUNTIME_C_API_H_
@@ -38,177 +39,48 @@
 extern "C" {
 #endif
 
-/* ===========================================================================
- * Compile Strategy API
- *
- * get_incore_compiler() and get_orchestration_compiler() are declared in
- * host/runtime_compile_info.h and linked into this library. They return
- * ToolchainType values indicating which compiler to use.
- * get_platform() is declared in host/platform_compile_info.h.
- * ===========================================================================
- */
-
-/**
- * Opaque pointer types for C interface.
- * These hide the C++ class implementations.
- */
 typedef void *RuntimeHandle;
 
 /* ===========================================================================
- * Runtime API
- * ===========================================================================
- */
+ * Public API (resolved by ChipWorker via dlsym)
+ * =========================================================================== */
 
-/**
- * Get the size of Runtime structure for memory allocation.
- *
- * User should allocate: Runtime* r = (Runtime*)malloc(get_runtime_size());
- *
- * @return Size of Runtime structure in bytes
- */
+/** Return sizeof(Runtime) for caller buffer allocation. */
 size_t get_runtime_size(void);
 
-/**
- * Initialize a runtime with a ChipCallable and orchestration arguments.
- *
- * Uses placement new to construct Runtime in user-allocated memory.
- * The ChipCallable bundles the orchestration binary, function name, and
- * child kernel CoreCallables. This function uploads kernels to device memory,
- * loads the orchestration shared library, and calls the orchestration function
- * to build the task graph.
- *
- * IMPORTANT: set_device() MUST be called before this function.
- *
- * @param runtime   User-allocated memory of size get_runtime_size()
- * @param callable  ChipCallable containing orch binary, func_name, and child kernels
- * @param orch_args Separated tensor/scalar arguments for orchestration
- * @return 0 on success, -1 on failure
- */
-int init_runtime(RuntimeHandle runtime, const ChipCallable *callable, const ChipStorageTaskArgs *orch_args);
-
-/* ===========================================================================
- * Device Memory API (for use by orchestration functions)
- * ===========================================================================
- */
+/** Set the target device. Must be called before the first run_runtime(). */
+int set_device(int device_id);
 
 /**
- * Allocate device memory.
+ * Build the task graph, execute on device, copy results back, and clean up.
  *
- * @param size  Size in bytes to allocate
- * @return Device pointer on success, NULL on failure
+ * Combines the former init_runtime + enable_runtime_profiling +
+ * launch_runtime + finalize_runtime into a single call.
  */
-void *device_malloc(size_t size);
-
-/**
- * Free device memory.
- *
- * @param dev_ptr  Device pointer to free
- */
-void device_free(void *dev_ptr);
-
-/**
- * Copy data from host to device.
- *
- * @param dev_ptr   Device destination pointer
- * @param host_ptr  Host source pointer
- * @param size     Size in bytes to copy
- * @return 0 on success, error code on failure
- */
-int copy_to_device(void *dev_ptr, const void *host_ptr, size_t size);
-
-/**
- * Copy data from device to host.
- *
- * @param host_ptr  Host destination pointer
- * @param dev_ptr   Device source pointer
- * @param size     Size in bytes to copy
- * @return 0 on success, error code on failure
- */
-int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size);
-
-/**
- * Execute a runtime on the device.
- *
- * Initializes DeviceRunner singleton (if first call), registers kernel
- * addresses, copies runtime to device, launches kernels, synchronizes,
- * and copies runtime back from device.
- *
- * @param runtime         Initialized runtime handle
- * @param aicpu_thread_num Number of AICPU scheduler threads
- * @param block_dim        Number of blocks (1 block = 1 AIC + 2 AIV)
- * @param device_id        Device ID (0-15)
- * @param aicpu_binary     AICPU shared object binary data
- * @param aicpu_size       Size of AICPU binary in bytes
- * @param aicore_binary    AICore kernel binary data
- * @param aicore_size      Size of AICore binary in bytes
- * @param orch_thread_num  Number of orchestrator threads (default 1)
- * @return 0 on success, error code on failure
- */
-int launch_runtime(
-    RuntimeHandle runtime, int aicpu_thread_num, int block_dim, int device_id, const uint8_t *aicpu_binary,
-    size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size, int orch_thread_num
+int run_runtime(
+    RuntimeHandle runtime, const void *callable, const void *args, int block_dim, int aicpu_thread_num,
+    int orch_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
+    size_t aicore_size, int enable_profiling
 );
 
 /**
- * Finalize and cleanup a runtime instance.
- *
- * Validates results, frees device tensors, calls Runtime destructor.
- * After this call, user can free(runtime).
- *
- * @param runtime  Runtime handle to finalize
- * @return 0 on success, -1 on failure
+ * Finalize the DeviceRunner, releasing all device resources.
+ * Must be called before dlclose() to avoid static destruction order issues.
  */
-int finalize_runtime(RuntimeHandle runtime);
+int finalize_device(void);
+
+/* ===========================================================================
+ * Internal API (used by orchestration code within the .so)
+ * =========================================================================== */
 
 /**
- * Set device and create streams for memory operations.
- *
- * Must be called before init_runtime() to enable device tensor allocation.
- * Only performs minimal initialization:
- * - rtSetDevice(device_id)
- * - Create AICPU and AICore streams
- *
- * Binary loading happens later in launch_runtime().
- *
- * @param device_id  Device ID (0-15)
- * @return 0 on success, error code on failure
- */
-int set_device(int device_id);
-
-/* Note: register_kernel() has been internalized into init_runtime().
- * Kernel binaries are now passed directly to init_runtime() which handles
- * registration and stores addresses in Runtime's func_id_to_addr_[] array.
- */
-
-/**
- * Record a tensor pair for copy-back during finalize.
- *
- * Used by orchestration to track host-device memory mappings.
- * During finalize_runtime(), tensors with non-null host_ptr will be
- * copied back from device to host, then all device memory is freed.
- *
- * @param runtime   Runtime handle
- * @param host_ptr  Host memory pointer (NULL if no copy-back needed)
- * @param dev_ptr   Device memory pointer
- * @param size      Size of tensor in bytes
+ * Record a host-device tensor pair for copy-back during finalize.
+ * Called by orchestration to track memory mappings.
  */
 void record_tensor_pair(RuntimeHandle runtime, void *host_ptr, void *dev_ptr, size_t size);
 
-/**
- * Enable or disable performance profiling for swimlane visualization.
- *
- * Must be called before init_runtime() to enable profiling.
- * When enabled, the runtime will record task execution timestamps on AICore/AICPU
- * and generate swim_time.json after finalize_runtime().
- *
- * @param runtime  Runtime handle
- * @param enabled  1 to enable profiling, 0 to disable
- * @return 0 on success, -1 on failure
- */
-int enable_runtime_profiling(RuntimeHandle runtime, int enabled);
-
 #ifdef __cplusplus
-} /* extern "C" */
+}
 #endif
 
 #endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_PTO_RUNTIME_C_API_H_
