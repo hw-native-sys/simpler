@@ -10,9 +10,23 @@
 from __future__ import annotations
 
 import os
+import shutil
 from enum import IntEnum
 
 import env_manager
+
+
+def _resolve_compiler(env_var: str, default: str) -> str:
+    """Resolve a compiler from an environment variable to a full path.
+
+    Handles the case where the env var contains flags (e.g. sysconfig-derived
+    'gcc -pthread -B /path') by extracting only the executable name and resolving
+    it via PATH.
+    """
+    raw = os.environ.get(env_var, "")
+    parts = raw.split()
+    exe = parts[0] if parts else default
+    return shutil.which(exe) or exe
 
 
 # Must match compile_strategy.h
@@ -117,7 +131,8 @@ class Gxx15Toolchain(Toolchain):
 
     def __init__(self):
         super().__init__()
-        self.cxx_path = "g++-15"
+        self.cc_path = _resolve_compiler("CC", "gcc-15")
+        self.cxx_path = _resolve_compiler("CXX", "g++-15")
 
     def get_compile_flags(self, core_type: str = "", **kwargs) -> list[str]:
         flags = [
@@ -141,12 +156,9 @@ class Gxx15Toolchain(Toolchain):
         return flags
 
     def get_cmake_args(self) -> list[str]:
-        # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
-        cc = os.environ.get("CC", "gcc")
-        cxx = os.environ.get("CXX", "g++")
         return [
-            f"-DCMAKE_C_COMPILER={cc}",
-            f"-DCMAKE_CXX_COMPILER={cxx}",
+            f"-DCMAKE_C_COMPILER={self.cc_path}",
+            f"-DCMAKE_CXX_COMPILER={self.cxx_path}",
         ]
 
 
@@ -155,18 +167,16 @@ class GxxToolchain(Toolchain):
 
     def __init__(self):
         super().__init__()
-        self.cxx_path = "g++"
+        self.cc_path = _resolve_compiler("CC", "gcc")
+        self.cxx_path = _resolve_compiler("CXX", "g++")
 
     def get_compile_flags(self, **kwargs) -> list[str]:
         return ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
 
     def get_cmake_args(self) -> list[str]:
-        # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
-        cc = os.environ.get("CC", "gcc")
-        cxx = os.environ.get("CXX", "g++")
         args = [
-            f"-DCMAKE_C_COMPILER={cc}",
-            f"-DCMAKE_CXX_COMPILER={cxx}",
+            f"-DCMAKE_C_COMPILER={self.cc_path}",
+            f"-DCMAKE_CXX_COMPILER={self.cxx_path}",
         ]
         if self.ascend_home_path:
             args.append(f"-DASCEND_HOME_PATH={self.ascend_home_path}")
