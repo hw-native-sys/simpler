@@ -15,10 +15,10 @@
 //         mij (M,) fp32 — global row max across all blocks
 //         lij (M,) fp32 — total row sum across all blocks
 //
-// Pass 1: Iterate over n_blocks tiles, apply scale, mask last block,
-//         find global m = max over all blocks of rowmax(S_i * scale)
-//         Uses TRESHAPE for DN↔Row conversion to keep globalMax in UB
-//         (eliminates 63 × 4 GM round-trip operations).
+// Pass 1: Iterate over n_blocks tiles, mask last block,
+//         find global m = scale * max over all blocks of rowmax(S_i)
+//         Defers scale to after the loop (single M-element TMULS vs n_blocks M×N).
+//         Uses double-buffered sij tiles and TRESHAPE for DN↔Row conversion.
 // Pass 2: Iterate again, compute P_i = exp(S_i * scale - m) -> bf16,
 //         accumulate l = sum over all blocks of rowsum(P_i)
 //         Uses double-buffered sij tiles to overlap TLOAD with computation.
@@ -116,24 +116,44 @@ static __aicore__ void softmax_prepare_n_impl(
     GlobalScalarND mijGlobalND(mij_addr);
     GlobalScalarDN lijGlobalDN(lij_addr);
 
-    // ======== Pass 1: Find global row max via TRESHAPE (no GM round-trip) ========
+    // ======== Pass 1: Find global row max (unscaled) with double-buffered sij ========
+    // rowmax(S*scale) = scale * rowmax(S) since scale > 0, so defer scale to after loop.
+    GlobalDataMxN sijGlobal_p1_0(sij_base);
+    TLOAD(sijTile_A, sijGlobal_p1_0);
+
     for (uint64_t i = 0; i < n_blocks; i++) {
-        GlobalDataMxN sijGlobal(sij_base + i * M * N);
-        TLOAD(sijTile_A, sijGlobal);
         set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
         if (i == n_blocks - 1 && valid_len_last < static_cast<uint64_t>(N)) {
             TileSijDyn sijDynTile(static_cast<size_t>(valid_len_last));
-            TASSIGN(sijDynTile, 0x0);
-            TFILLPAD_INPLACE(sijPadTile_A, sijDynTile);
+            if (i % 2 == 0) {
+                TASSIGN(sijDynTile, 0x0);
+                TFILLPAD_INPLACE(sijPadTile_A, sijDynTile);
+            } else {
+                TASSIGN(sijDynTile, static_cast<int>(kDataBytes));
+                TFILLPAD_INPLACE(sijPadTile_B, sijDynTile);
+            }
             pipe_barrier(PIPE_V);
         }
 
-        TMULS(sijTile_A, sijTile_A, scale_value);
+        // Compute unscaled TROWMAX on current buffer
+        if (i % 2 == 0) {
+            TROWMAX(localMaxDN, sijTile_A, tmpTile);
+        } else {
+            TROWMAX(localMaxDN, sijTile_B, tmpTile);
+        }
         pipe_barrier(PIPE_V);
-        TROWMAX(localMaxDN, sijTile_A, tmpTile);
-        pipe_barrier(PIPE_V);
+
+        // Prefetch next sij into alternate buffer (overlaps with V pipe scalar ops)
+        if (i + 1 < n_blocks) {
+            GlobalDataMxN sijGlobal_next(sij_base + (i + 1) * M * N);
+            if (i % 2 == 0) {
+                TLOAD(sijTile_B, sijGlobal_next);
+            } else {
+                TLOAD(sijTile_A, sijGlobal_next);
+            }
+        }
 
         // TRESHAPE: ColMajor(M,1) → RowMajor(1,M) for element-wise TMAX
         TRESHAPE(localMaxRow, localMaxDN);
@@ -144,6 +164,10 @@ static __aicore__ void softmax_prepare_n_impl(
         }
         pipe_barrier(PIPE_V);
     }
+
+    // Apply scale once to the global max vector (M elements, not n_blocks × M × N)
+    TMULS(globalMaxRow, globalMaxRow, scale_value);
+    pipe_barrier(PIPE_V);
 
     // TRESHAPE back: RowMajor(1,M) → ColMajor(M,1) for Pass 2's TROWEXPANDSUB
     TRESHAPE(globalMaxDN, globalMaxRow);

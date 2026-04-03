@@ -20,6 +20,7 @@
 //
 // Optimizations:
 //   - qi TLOAD hoisted before the loop (constant across all iterations)
+//   - Double-buffered L1 B tiles: prefetch next kj during current TMATMUL+TSTORE
 //
 // Supports two tile configurations via runtime dispatch:
 //   Case1: (16, 128) @ (128, 128).T -> (16, 128)
@@ -60,10 +61,14 @@ static __aicore__ void qk_matmul_n_impl(
     using RightTile = TileRight<bfloat16_t, K, N, K, N>;
     using AccTile = TileAcc<float, M, N, M, N>;
 
+    // Double-buffered L1 B tiles for kj prefetching
+    constexpr int kBBytes = K * N * static_cast<int>(sizeof(bfloat16_t));
     TileMatA aMatTile;
-    TileMatB bMatTile;
+    TileMatB bMatTile_A;
+    TileMatB bMatTile_B;
     TASSIGN(aMatTile, 0x0);
-    TASSIGN(bMatTile, 0x20000);
+    TASSIGN(bMatTile_A, 0x20000);
+    TASSIGN(bMatTile_B, 0x20000 + kBBytes);
 
     LeftTile aTile;
     RightTile bTile;
@@ -76,19 +81,34 @@ static __aicore__ void qk_matmul_n_impl(
     GlobalA qiGlobal(qi_base);
     TLOAD(aMatTile, qiGlobal);
 
+    // Pre-load first kj into buffer A
+    GlobalB kjGlobal_0(key_base + bt[bt_offset + 0] * N * K);
+    TLOAD(bMatTile_A, kjGlobal_0);
+
     for (uint64_t i = 0; i < n_blocks; i++) {
-        GlobalB kjGlobal(key_base + bt[bt_offset + i] * N * K);
         GlobalOut sijGlobal(sij_base + i * M * N);
 
-        // Load only B each iteration (qi already in L1 from hoist)
-        TLOAD(bMatTile, kjGlobal);
-
+        // Wait for current kj TLOAD to complete
         set_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
         wait_flag(PIPE_MTE2, PIPE_MTE1, EVENT_ID0);
 
-        // TMOV qi from L1→L0A (re-copy since TMATMUL consumed L0A) and kj from L1→L0B
+        // TMOV qi L1→L0A and kj L1→L0B from current buffer
         TMOV(aTile, aMatTile);
-        TMOV(bTile, bMatTile);
+        if (i % 2 == 0) {
+            TMOV(bTile, bMatTile_A);
+        } else {
+            TMOV(bTile, bMatTile_B);
+        }
+
+        // Prefetch next kj into alternate L1 buffer (overlaps with MTE1→M→FIX)
+        if (i + 1 < n_blocks) {
+            GlobalB kjGlobal_next(key_base + bt[bt_offset + i + 1] * N * K);
+            if (i % 2 == 0) {
+                TLOAD(bMatTile_B, kjGlobal_next);
+            } else {
+                TLOAD(bMatTile_A, kjGlobal_next);
+            }
+        }
 
         set_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
         wait_flag(PIPE_MTE1, PIPE_M, EVENT_ID0);
@@ -101,6 +121,10 @@ static __aicore__ void qk_matmul_n_impl(
         TSTORE(sijGlobal, cTile);
 
         if (i + 1 < n_blocks) {
+            // Drain all pipes before next iteration:
+            //   - FIX/MTE3: ensures TSTORE data path (L0C→UB→GM) fully completes
+            //   - MTE2: prefetch TLOAD likely already done (ran during TMATMUL+TSTORE)
+            // The prefetch TLOAD overlaps with compute, so barrier cost is minimal.
             pipe_barrier(PIPE_ALL);
         }
     }

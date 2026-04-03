@@ -180,16 +180,16 @@ static __aicore__ void online_update_impl(
 
         TMAX(miNewRow, miRow, mijRow);  // mi_new = max(mi, mij)
         pipe_barrier(PIPE_V);
+        // alphaRow and betaRow write to independent UB addresses; both only read miNewRow
         TSUB(alphaRow, miRow, miNewRow);  // alpha_exp = mi - mi_new
-        pipe_barrier(PIPE_V);
-        TEXP(alphaRow, alphaRow);  // alpha = exp(mi - mi_new)
-        pipe_barrier(PIPE_V);
         TSUB(betaRow, mijRow, miNewRow);  // beta_exp = mij - mi_new
         pipe_barrier(PIPE_V);
-        TEXP(betaRow, betaRow);  // beta = exp(mij - mi_new)
+        // TEXP on independent UB addresses
+        TEXP(alphaRow, alphaRow);  // alpha = exp(mi - mi_new)
+        TEXP(betaRow, betaRow);    // beta = exp(mij - mi_new)
         pipe_barrier(PIPE_V);
-        TMUL(tmpRow, alphaRow, liRow);  // alpha * li
-        pipe_barrier(PIPE_V);
+        // tmpRow and liNewRow write to independent UB addresses
+        TMUL(tmpRow, alphaRow, liRow);    // alpha * li
         TMUL(liNewRow, betaRow, lijRow);  // beta * lij
         pipe_barrier(PIPE_V);
         TADD(liNewRow, tmpRow, liNewRow);  // li_new = alpha*li + beta*lij
@@ -200,8 +200,7 @@ static __aicore__ void online_update_impl(
         TRESHAPE(betaDN, betaRow);
 
         // Scale data tiles using row-broadcast multiply
-        TROWEXPANDMUL(oiTile, oiTile, alphaDN);  // oi *= alpha
-        pipe_barrier(PIPE_V);
+        TROWEXPANDMUL(oiTile, oiTile, alphaDN);       // oi *= alpha
         TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);  // oi_new *= beta
         pipe_barrier(PIPE_V);
         TADD(oiTile, oiTile, oiNewTile);  // oi = alpha*oi + beta*oi_new
