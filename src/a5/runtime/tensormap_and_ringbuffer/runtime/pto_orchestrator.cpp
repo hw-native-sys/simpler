@@ -346,6 +346,21 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         active_mask = pto2_mixed_kernels_to_active_mask(normalized);
     }
 
+    // Encode require_sync_start into active_mask bit 3 (only meaningful for tasks with block_num > 1)
+    if (block_num > 1 && args.launch_spec.require_sync_start()) {
+        // Deadlock check: block_num >= total available slots of the required type.
+        // For MIX/AIC: limit is total_cluster_count (one AIC per cluster).
+        // For AIV:     limit is total_aiv_count.
+        PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
+        int32_t limit = (shape == PTO2ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
+        if (limit > 0 && block_num > limit) {
+            LOG_ERROR("FATAL: require_sync_start block_num=%d > limit=%d (deadlock guaranteed)", block_num, limit);
+            orch->fatal = true;
+            return TaskOutputTensors{};
+        }
+        active_mask |= PTO2_SUBTASK_FLAG_SYNC_START;
+    }
+
     // Submission without an open scope is illegal
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
 
@@ -583,7 +598,8 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         cur_slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
         cur_slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
         cur_slot_state.completed_subtasks.store(0, std::memory_order_relaxed);
-        cur_slot_state.total_required_subtasks = static_cast<int16_t>(block_num * __builtin_popcount(active_mask));
+        cur_slot_state.total_required_subtasks =
+            static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
         cur_slot_state.block_num = block_num;
         cur_slot_state.next_block_idx = 0;
 

@@ -70,6 +70,10 @@ struct PTO2OrchestratorState {
     // Note: In simulated mode, orchestrator and scheduler share address space
     // In real mode, they communicate via shared memory only
     PTO2SchedulerState *scheduler;  // For simulated mode only
+
+    // Total core counts set once at executor init; used for submit-time deadlock detection.
+    int32_t total_cluster_count{0};  // AIC cores = MIX clusters
+    int32_t total_aiv_count{0};      // AIV cores (= 2 × clusters on standard hardware)
 #if PTO2_PROFILING
     // Runtime profiling switch copied from Runtime::enable_profiling.
     bool enable_profiling;
