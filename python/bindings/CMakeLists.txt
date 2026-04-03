@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-# nanobind Python bindings for task_interface
+# nanobind Python bindings for task_interface and distributed runtime
 
 set(BINDING_SOURCES
     task_interface.cpp
@@ -15,7 +15,21 @@ set(BINDING_SOURCES
 
 list(TRANSFORM BINDING_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 
-nanobind_add_module(_task_interface ${BINDING_SOURCES})
+set(DIST_SRC ${CMAKE_SOURCE_DIR}/src/common/distributed)
+
+set(DIST_SOURCES
+    ${DIST_SRC}/dist_types.cpp
+    ${DIST_SRC}/dist_tensormap.cpp
+    ${DIST_SRC}/dist_ring.cpp
+    ${DIST_SRC}/dist_scope.cpp
+    ${DIST_SRC}/dist_orchestrator.cpp
+    ${DIST_SRC}/dist_sub_worker.cpp
+    ${DIST_SRC}/dist_chip_process.cpp
+    ${DIST_SRC}/dist_scheduler.cpp
+    ${DIST_SRC}/dist_worker.cpp
+)
+
+nanobind_add_module(_task_interface ${BINDING_SOURCES} ${DIST_SOURCES})
 
 target_sources(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_worker.cpp
@@ -24,9 +38,11 @@ target_sources(_task_interface PRIVATE
 target_include_directories(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/task_interface
     ${CMAKE_SOURCE_DIR}/src/common/worker
+    ${CMAKE_SOURCE_DIR}/src/common/distributed
+    ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
-target_link_libraries(_task_interface PRIVATE ${CMAKE_DL_LIBS})
+target_link_libraries(_task_interface PRIVATE ${CMAKE_DL_LIBS} pthread)
 
 if(SKBUILD_MODE)
     install(TARGETS _task_interface DESTINATION .)

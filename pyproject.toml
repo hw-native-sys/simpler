@@ -58,6 +58,7 @@ reportMissingImports = false
 reportMissingTypeStubs = false
 reportMissingModuleSource = false
 reportCallIssue = false
+reportAttributeAccessIssue = false
 reportAssignmentType = false
 reportOperatorIssue = false
 reportRedeclaration = false

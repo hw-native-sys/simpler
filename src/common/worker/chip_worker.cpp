@@ -167,6 +167,14 @@ void ChipWorker::finalize() {
     finalized_ = true;
 }
 
+void ChipWorker::run(const WorkerPayload &payload) {
+    CallConfig config;
+    config.block_dim = payload.block_dim;
+    config.aicpu_thread_num = payload.aicpu_thread_num;
+    config.enable_profiling = payload.enable_profiling;
+    run(payload.callable, payload.args, config);
+}
+
 void ChipWorker::run(const void *callable, const void *args, const CallConfig &config) {
     if (!device_set_) {
         throw std::runtime_error("ChipWorker device not set; call set_device() first");

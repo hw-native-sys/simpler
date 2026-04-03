@@ -16,13 +16,15 @@
 #include <string>
 #include <vector>
 
+#include "dist_types.h"
+
 struct CallConfig {
     int block_dim = 24;
     int aicpu_thread_num = 3;
     bool enable_profiling = false;
 };
 
-class ChipWorker {
+class ChipWorker : public IWorker {
 public:
     ChipWorker() = default;
     ~ChipWorker();
@@ -49,6 +51,10 @@ public:
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
+    // IWorker: extract callable/args/config from payload and execute synchronously.
+    void run(const WorkerPayload &payload) override;
+
+    // Direct invocation (used by Python wrapper and internal tests).
     void run(const void *callable, const void *args, const CallConfig &config);
 
     int device_id() const { return device_id_; }

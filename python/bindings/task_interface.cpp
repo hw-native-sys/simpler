@@ -33,6 +33,7 @@
 #include "callable.h"
 #include "chip_worker.h"
 #include "data_type.h"
+#include "dist_worker_bind.h"
 #include "task_args.h"
 #include "tensor_arg.h"
 
@@ -595,7 +596,22 @@ NB_MODULE(_task_interface, m) {
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("config")
         )
+        .def(
+            "run_raw",
+            [](ChipWorker &self, uint64_t callable, uint64_t args, int block_dim, int aicpu_thread_num,
+               bool enable_profiling) {
+                CallConfig config;
+                config.block_dim = block_dim;
+                config.aicpu_thread_num = aicpu_thread_num;
+                config.enable_profiling = enable_profiling;
+                self.run(reinterpret_cast<const void *>(callable), reinterpret_cast<const void *>(args), config);
+            },
+            nb::arg("callable"), nb::arg("args"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
+            nb::arg("enable_profiling") = false, "Run with raw pointer arguments (used from forked chip process)."
+        )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
         .def_prop_ro("device_set", &ChipWorker::device_set);
+
+    bind_dist_worker(m);
 }
