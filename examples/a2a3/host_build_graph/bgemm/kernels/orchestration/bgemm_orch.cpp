@@ -31,8 +31,7 @@
 #include <iostream>
 #include <vector>
 
-#include "runtime.h"    // NOLINT(build/include_subdir)
-#include "task_args.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
@@ -44,7 +43,7 @@ constexpr int BATCH = 1;
 
 constexpr size_t TILE_BYTES = TILE * TILE * sizeof(float);
 
-int build_bgemm_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
+int build_bgemm_graph(OrchestrationRuntime *runtime, const ChipStorageTaskArgs &orch_args) {
     // Expected orch_args: [A, B, C] — 3 tensors
     if (orch_args.tensor_count() < 3) {
         std::cerr << "build_bgemm_graph: Expected at least 3 tensors, got " << orch_args.tensor_count() << '\n';
@@ -62,38 +61,38 @@ int build_bgemm_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
     std::cout << "Grid: " << GRID_M << " x " << GRID_K << " x " << GRID_N << '\n';
 
     // Allocate device memory and copy inputs
-    void *dev_A = runtime->host_api.device_malloc(size_A);
+    void *dev_A = device_malloc(runtime, size_A);
     if (!dev_A) return -1;
-    runtime->host_api.copy_to_device(dev_A, host_A, size_A);
+    copy_to_device(runtime, dev_A, host_A, size_A);
 
-    void *dev_B = runtime->host_api.device_malloc(size_B);
+    void *dev_B = device_malloc(runtime, size_B);
     if (!dev_B) {
-        runtime->host_api.device_free(dev_A);
+        device_free(runtime, dev_A);
         return -1;
     }
-    runtime->host_api.copy_to_device(dev_B, host_B, size_B);
+    copy_to_device(runtime, dev_B, host_B, size_B);
 
-    void *dev_C = runtime->host_api.device_malloc(size_C);
+    void *dev_C = device_malloc(runtime, size_C);
     if (!dev_C) {
-        runtime->host_api.device_free(dev_A);
-        runtime->host_api.device_free(dev_B);
+        device_free(runtime, dev_A);
+        device_free(runtime, dev_B);
         return -1;
     }
-    runtime->host_api.copy_to_device(dev_C, host_C, size_C);
-    runtime->record_tensor_pair(host_C, dev_C, size_C);
+    copy_to_device(runtime, dev_C, host_C, size_C);
+    record_tensor_pair(runtime, host_C, dev_C, size_C);
 
     // Allocate intermediate P buffers (one per C tile)
     constexpr int NUM_P_BUFFERS = BATCH * GRID_M * GRID_N;
     std::vector<void *> dev_P(NUM_P_BUFFERS, nullptr);
     for (int i = 0; i < NUM_P_BUFFERS; i++) {
-        dev_P[i] = runtime->host_api.device_malloc(TILE_BYTES);
+        dev_P[i] = device_malloc(runtime, TILE_BYTES);
         if (!dev_P[i]) {
             for (int j = 0; j < i; j++) {
-                runtime->host_api.device_free(dev_P[j]);
+                device_free(runtime, dev_P[j]);
             }
-            runtime->host_api.device_free(dev_A);
-            runtime->host_api.device_free(dev_B);
-            runtime->host_api.device_free(dev_C);
+            device_free(runtime, dev_A);
+            device_free(runtime, dev_B);
+            device_free(runtime, dev_C);
             return -1;
         }
     }
@@ -121,7 +120,7 @@ int build_bgemm_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
                     args_gemm[3] = TILE;
                     args_gemm[4] = TILE;
                     args_gemm[5] = TILE;
-                    int t_gemm = runtime->add_task(args_gemm, 6, 0, CoreType::AIC);
+                    int t_gemm = add_task(runtime, args_gemm, 6, 0, CoreType::AIC);
 
                     // Task 2: C[m,n] = C[m,n] + P (tile_add on Vector core)
                     uint64_t args_add[5];
@@ -130,14 +129,14 @@ int build_bgemm_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
                     args_add[2] = reinterpret_cast<uint64_t>(static_cast<char *>(dev_C) + C_offset);
                     args_add[3] = TILE;
                     args_add[4] = TILE;
-                    int t_add = runtime->add_task(args_add, 5, 1, CoreType::AIV);
+                    int t_add = add_task(runtime, args_add, 5, 1, CoreType::AIV);
 
                     // Dependency: gemm must complete before add
-                    runtime->add_successor(t_gemm, t_add);
+                    add_successor(runtime, t_gemm, t_add);
 
                     // Dependency: previous add must complete before current gemm (K accumulation)
                     if (last_add_task[c_tile_idx] >= 0) {
-                        runtime->add_successor(last_add_task[c_tile_idx], t_gemm);
+                        add_successor(runtime, last_add_task[c_tile_idx], t_gemm);
                     }
                     last_add_task[c_tile_idx] = t_add;
                 }
@@ -145,7 +144,7 @@ int build_bgemm_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
         }
     }
 
-    std::cout << "Created " << runtime->get_task_count() << " tasks\n";
+    std::cout << "Created " << get_task_count(runtime) << " tasks\n";
     return 0;
 }
 

@@ -649,11 +649,8 @@ class CodeRunner:
         """
         Build orch_args from tensors dict (legacy path).
 
-        Convention for orchestration function signature:
-            int BuildGraph(Runtime* runtime, uint64_t* args, int arg_count)
-
-        Where args layout is:
-            [ptr_0, ptr_1, ..., ptr_n, nbytes_0, nbytes_1, ..., nbytes_n, count]
+        The resulting object is passed to orchestration entries with the shape:
+            int BuildGraph(OrchestrationRuntime* runtime, const ChipStorageTaskArgs &orch_args)
 
         Args:
             tensors: Dict of torch tensors (will be modified to ensure contiguous)

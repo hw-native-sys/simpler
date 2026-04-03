@@ -47,7 +47,7 @@ python examples/scripts/run_example.py \
 ### `run_example.py` Parameters
 
 | Argument | Short | Description | Default |
-|----------|-------|-------------|---------|
+| -------- | ----- | ----------- | ------- |
 | `--kernels` | `-k` | Kernels directory path (contains kernel_config.py) | **Required** |
 | `--golden` | `-g` | golden.py script path | **Required** |
 | `--platform` | `-p` | Platform name: `a2a3` or `a2a3sim` | `a2a3` |
@@ -110,6 +110,7 @@ python examples/scripts/run_example.py -k ./kernels -g ./golden.py
 ### Priority
 
 Log level is determined by (highest to lowest priority):
+
 1. CLI arguments (`--log-level`, `--verbose`, `--silent`)
 2. Environment variable (`PTO_LOG_LEVEL`)
 3. Default value (`info` / INFO level)
@@ -126,7 +127,7 @@ Log level is determined by (highest to lowest priority):
 
 The kernels directory must contain a `kernel_config.py` file:
 
-```
+```text
 kernels/
 ├── kernel_config.py          # Required: kernel configuration
 ├── orchestration/
@@ -262,21 +263,30 @@ def generate_inputs(params: dict) -> dict:
 
 ## Orchestration Function Interface
 
-The orchestration function's parameter order must match `TENSOR_ORDER`:
+For `host_build_graph`, orchestration sources should include `orchestration_api.h` and use `ChipStorageTaskArgs`:
 
 ```cpp
 // Assume TENSOR_ORDER = ["a", "b", "f"]
-int BuildExampleGraph(Runtime* runtime, uint64_t* args, int arg_count) {
-    // args layout: [ptr_a, ptr_b, ptr_f, size_a, size_b, size_f, count]
-    void* ptr_a = reinterpret_cast<void*>(args[0]);
-    void* ptr_b = reinterpret_cast<void*>(args[1]);
-    void* ptr_f = reinterpret_cast<void*>(args[2]);
-    uint64_t size_a = args[3];
-    uint64_t size_b = args[4];
-    uint64_t size_f = args[5];
-    uint64_t count = args[6];
+#include "orchestration_api.h"
+
+int BuildExampleGraph(OrchestrationRuntime* runtime, const ChipStorageTaskArgs &orch_args) {
+    void* ptr_a = orch_args.tensor(0).data_as<void>();
+    void* ptr_b = orch_args.tensor(1).data_as<void>();
+    void* ptr_f = orch_args.tensor(2).data_as<void>();
+
+    size_t size_a = orch_args.tensor(0).nbytes();
+    size_t size_b = orch_args.tensor(1).nbytes();
+    size_t size_f = orch_args.tensor(2).nbytes();
+
+    void* dev_a = device_malloc(runtime, size_a);
+    void* dev_b = device_malloc(runtime, size_b);
+    void* dev_f = device_malloc(runtime, size_f);
+    copy_to_device(runtime, dev_a, ptr_a, size_a);
+    copy_to_device(runtime, dev_b, ptr_b, size_b);
+    record_tensor_pair(runtime, ptr_f, dev_f, size_f);
 
     // Build task graph...
+    return 0;
 }
 ```
 
@@ -313,7 +323,7 @@ No special platform-specific environment variables required.
 
 ### Directory Structure
 
-```
+```text
 my_test/
 ├── kernels/
 │   ├── kernel_config.py
@@ -342,7 +352,7 @@ python examples/scripts/run_example.py -k my_test/kernels -g my_test/golden.py -
 
 ### Success Example
 
-```
+```text
 === Building Runtime: host_build_graph (platform: a2a3sim) ===
 ...
 === Compiling and Registering Kernels ===
@@ -367,7 +377,7 @@ TEST PASSED
 
 ### Failure Example
 
-```
+```text
 === Comparing Results ===
 Comparing f: shape=(16384,), dtype=float32
   First 10 actual:   [40. 40. 40. 40. 40. 40. 40. 40. 40. 40.]
@@ -394,10 +404,12 @@ python examples/scripts/run_example.py -k ... -g ... -p ... -v
 ### Q: Why "binary_data cannot be empty" error?
 
 This usually happens when:
+
 - Using wrong platform (a2a3 vs a2a3sim)
 - Kernel compilation failed silently
 
 Solutions:
+
 1. Verify correct `-p` parameter is used
 2. Check if kernel source files exist
 3. Use `-v` to view detailed compilation logs

@@ -15,20 +15,19 @@
  *
  * This orchestration function:
  * 1. Receives ChipStorageTaskArgs with tensor metadata (pointers, shapes, dtypes)
- * 2. Allocates device memory via runtime->host_api
- * 3. Copies input data to device via runtime->host_api
+ * 2. Allocates device memory via orchestration API helpers
+ * 3. Copies input data to device via orchestration API helpers
  * 4. Records output tensor for copy-back during finalize
  * 5. Builds the task graph
  */
 
 #include <iostream>
 
-#include "runtime.h"    // NOLINT(build/include_subdir)
-#include "task_args.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
-int build_example_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
+int build_example_graph(OrchestrationRuntime *runtime, const ChipStorageTaskArgs &orch_args) {
     // Validate argument count
     // Expected orch_args: [a, b, f] — 3 tensors
     if (orch_args.tensor_count() < 3) {
@@ -52,48 +51,48 @@ int build_example_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) 
     // Allocate device memory and copy inputs
     std::cout << "\n=== Allocating Device Memory ===" << '\n';
 
-    void *dev_a = runtime->host_api.device_malloc(size_a);
+    void *dev_a = device_malloc(runtime, size_a);
     if (!dev_a) {
         std::cerr << "Error: Failed to allocate device memory for a\n";
         return -1;
     }
-    runtime->host_api.copy_to_device(dev_a, host_a, size_a);
+    copy_to_device(runtime, dev_a, host_a, size_a);
     std::cout << "Tensor a: " << size_a << " bytes copied to device\n";
 
-    void *dev_b = runtime->host_api.device_malloc(size_b);
+    void *dev_b = device_malloc(runtime, size_b);
     if (!dev_b) {
         std::cerr << "Error: Failed to allocate device memory for b\n";
-        runtime->host_api.device_free(dev_a);
+        device_free(runtime, dev_a);
         return -1;
     }
-    runtime->host_api.copy_to_device(dev_b, host_b, size_b);
+    copy_to_device(runtime, dev_b, host_b, size_b);
     std::cout << "Tensor b: " << size_b << " bytes copied to device\n";
 
-    void *dev_f = runtime->host_api.device_malloc(size_f);
+    void *dev_f = device_malloc(runtime, size_f);
     if (!dev_f) {
         std::cerr << "Error: Failed to allocate device memory for f\n";
-        runtime->host_api.device_free(dev_a);
-        runtime->host_api.device_free(dev_b);
+        device_free(runtime, dev_a);
+        device_free(runtime, dev_b);
         return -1;
     }
     // Record output tensor for copy-back during finalize
-    runtime->record_tensor_pair(host_f, dev_f, size_f);
+    record_tensor_pair(runtime, host_f, dev_f, size_f);
     std::cout << "Tensor f (output): " << size_f << " bytes allocated\n";
 
     // Allocate intermediate tensors (c, d, e)
     size_t BYTES = SIZE * sizeof(float);
-    void *dev_c = runtime->host_api.device_malloc(BYTES);
-    void *dev_d = runtime->host_api.device_malloc(BYTES);
-    void *dev_e = runtime->host_api.device_malloc(BYTES);
+    void *dev_c = device_malloc(runtime, BYTES);
+    void *dev_d = device_malloc(runtime, BYTES);
+    void *dev_e = device_malloc(runtime, BYTES);
 
     if (!dev_c || !dev_d || !dev_e) {
         std::cerr << "Error: Failed to allocate intermediate tensors\n";
-        runtime->host_api.device_free(dev_a);
-        runtime->host_api.device_free(dev_b);
-        runtime->host_api.device_free(dev_f);
-        if (dev_c) runtime->host_api.device_free(dev_c);
-        if (dev_d) runtime->host_api.device_free(dev_d);
-        if (dev_e) runtime->host_api.device_free(dev_e);
+        device_free(runtime, dev_a);
+        device_free(runtime, dev_b);
+        device_free(runtime, dev_f);
+        if (dev_c) device_free(runtime, dev_c);
+        if (dev_d) device_free(runtime, dev_d);
+        if (dev_e) device_free(runtime, dev_e);
         return -1;
     }
 
@@ -111,7 +110,7 @@ int build_example_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) 
     args_t0[1] = reinterpret_cast<uint64_t>(dev_b);  // src1
     args_t0[2] = reinterpret_cast<uint64_t>(dev_c);  // out
     args_t0[3] = SIZE;                               // size
-    int t0 = runtime->add_task(args_t0, 4, 0, CoreType::AIV);
+    int t0 = add_task(runtime, args_t0, 4, 0, CoreType::AIV);
 
     // Task 1: d = c + 1 (func_id=1: kernel_add_scalar, AIV)
     uint64_t args_t1[4];
@@ -120,7 +119,7 @@ int build_example_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) 
     args_t1[1] = scalar_converter.u64;               // scalar=1.0
     args_t1[2] = reinterpret_cast<uint64_t>(dev_d);  // out
     args_t1[3] = SIZE;                               // size
-    int t1 = runtime->add_task(args_t1, 4, 1, CoreType::AIV);
+    int t1 = add_task(runtime, args_t1, 4, 1, CoreType::AIV);
 
     // Task 2: e = c + 2 (func_id=1: kernel_add_scalar, AIV)
     uint64_t args_t2[4];
@@ -129,7 +128,7 @@ int build_example_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) 
     args_t2[1] = scalar_converter.u64;               // scalar=2.0
     args_t2[2] = reinterpret_cast<uint64_t>(dev_e);  // out
     args_t2[3] = SIZE;                               // size
-    int t2 = runtime->add_task(args_t2, 4, 1, CoreType::AIV);
+    int t2 = add_task(runtime, args_t2, 4, 1, CoreType::AIV);
 
     // Task 3: f = d * e (func_id=2: kernel_mul, AIV)
     uint64_t args_t3[4];
@@ -137,13 +136,13 @@ int build_example_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) 
     args_t3[1] = reinterpret_cast<uint64_t>(dev_e);  // src1
     args_t3[2] = reinterpret_cast<uint64_t>(dev_f);  // out
     args_t3[3] = SIZE;                               // size
-    int t3 = runtime->add_task(args_t3, 4, 2, CoreType::AIV);
+    int t3 = add_task(runtime, args_t3, 4, 2, CoreType::AIV);
 
     // Add dependencies
-    runtime->add_successor(t0, t1);  // t0 → t1
-    runtime->add_successor(t0, t2);  // t0 → t2
-    runtime->add_successor(t1, t3);  // t1 → t3
-    runtime->add_successor(t2, t3);  // t2 → t3
+    add_successor(runtime, t0, t1);  // t0 → t1
+    add_successor(runtime, t0, t2);  // t0 → t2
+    add_successor(runtime, t1, t3);  // t1 → t3
+    add_successor(runtime, t2, t3);  // t2 → t3
 
     std::cout << "\nTasks:\n";
     std::cout << "  task" << t0 << ": c = a + b\n";
@@ -152,8 +151,8 @@ int build_example_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) 
     std::cout << "  task" << t3 << ": f = d * e\n";
     std::cout << "Dependencies: t0→t1, t0→t2, t1→t3, t2→t3\n";
 
-    std::cout << "Created runtime with " << runtime->get_task_count() << " tasks\n";
-    runtime->print_runtime();
+    std::cout << "Created runtime with " << get_task_count(runtime) << " tasks\n";
+    print_runtime(runtime);
 
     return 0;
 }

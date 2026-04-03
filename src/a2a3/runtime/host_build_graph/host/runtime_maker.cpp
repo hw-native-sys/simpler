@@ -36,20 +36,54 @@
 #include <cstring>
 #include <string>
 
-#include "callable.h"   // NOLINT(build/include_subdir)
-#include "runtime.h"    // Includes unified_log.h and provides LOG_* macros  // NOLINT(build/include_subdir)
-#include "task_args.h"  // NOLINT(build/include_subdir)
-
-/**
- * Orchestration function signature.
- *
- * @param runtime    Pointer to Runtime to populate with tasks
- * @param orch_args  Separated tensor/scalar arguments
- * @return 0 on success, negative on error
- */
-typedef int (*OrchestrationFunc)(Runtime *runtime, const ChipStorageTaskArgs &orch_args);
+#include "callable.h"           // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "runtime.h"            // Includes unified_log.h and provides LOG_* macros  // NOLINT(build/include_subdir)
+#include "task_args.h"          // NOLINT(build/include_subdir)
 
 namespace {
+
+struct OrchestrationRuntimeImpl {
+    const OrchestrationRuntimeOps *ops;
+    Runtime *runtime;
+};
+
+Runtime *unwrap_runtime(OrchestrationRuntime *runtime) {
+    return reinterpret_cast<OrchestrationRuntimeImpl *>(runtime)->runtime;
+}
+
+int runtime_add_task(OrchestrationRuntime *runtime, uint64_t *args, int num_args, int func_id, CoreType core_type) {
+    return unwrap_runtime(runtime)->add_task(args, num_args, func_id, core_type);
+}
+
+void runtime_add_successor(OrchestrationRuntime *runtime, int from_task, int to_task) {
+    unwrap_runtime(runtime)->add_successor(from_task, to_task);
+}
+
+void runtime_record_tensor_pair(OrchestrationRuntime *runtime, void *host_ptr, void *dev_ptr, size_t size) {
+    unwrap_runtime(runtime)->record_tensor_pair(host_ptr, dev_ptr, size);
+}
+
+int runtime_get_task_count(OrchestrationRuntime *runtime) { return unwrap_runtime(runtime)->get_task_count(); }
+
+void runtime_print_runtime(OrchestrationRuntime *runtime) { unwrap_runtime(runtime)->print_runtime(); }
+
+void *runtime_device_malloc(OrchestrationRuntime *runtime, size_t size) {
+    return unwrap_runtime(runtime)->host_api.device_malloc(size);
+}
+
+void runtime_device_free(OrchestrationRuntime *runtime, void *ptr) {
+    unwrap_runtime(runtime)->host_api.device_free(ptr);
+}
+
+int runtime_copy_to_device(OrchestrationRuntime *runtime, void *dev_ptr, const void *host_ptr, size_t size) {
+    return unwrap_runtime(runtime)->host_api.copy_to_device(dev_ptr, host_ptr, size);
+}
+
+const OrchestrationRuntimeOps k_orchestration_runtime_ops = {
+    runtime_add_task,      runtime_add_successor, runtime_record_tensor_pair, runtime_get_task_count,
+    runtime_print_runtime, runtime_device_malloc, runtime_device_free,        runtime_copy_to_device,
+};
 
 bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
     size_t total_written = 0;
@@ -102,10 +136,10 @@ extern "C" {
  * This function loads the orchestration SO from binary data via a temp file,
  * resolves the orchestration function via dlsym, then calls it to build the
  * task graph. The orchestration function is responsible for:
- * - Allocating device memory via runtime->host_api.device_malloc()
- * - Copying data to device via runtime->host_api.copy_to_device()
+ * - Allocating device memory via device_malloc()
+ * - Copying data to device via copy_to_device()
  * - Building the task graph
- * - Recording tensor pairs via runtime->record_tensor_pair()
+ * - Recording tensor pairs via record_tensor_pair()
  *
  * @param runtime   Pointer to pre-constructed Runtime
  * @param callable  ChipCallable containing orch binary, func_name, and child kernels
@@ -181,9 +215,11 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
         orch_args->tensor_count(), orch_args->scalar_count()
     );
 
+    OrchestrationRuntimeImpl orchestration_runtime = {&k_orchestration_runtime_ops, runtime};
+
     // Call orchestration function to build task graph
     // The orchestration function handles device memory allocation and copy-to-device
-    int rc = orch_func(runtime, *orch_args);
+    int rc = orch_func(reinterpret_cast<OrchestrationRuntime *>(&orchestration_runtime), *orch_args);
     if (rc != 0) {
         LOG_ERROR("Orchestration function failed with code %d", rc);
         runtime->clear_tensor_pairs();

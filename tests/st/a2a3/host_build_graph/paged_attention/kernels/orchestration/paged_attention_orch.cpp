@@ -27,8 +27,7 @@
 #include <cstring>
 #include <iostream>
 
-#include "runtime.h"    // NOLINT(build/include_subdir)
-#include "task_args.h"  // NOLINT(build/include_subdir)
+#include "orchestration_api.h"  // NOLINT(build/include_subdir)
 
 #define FUNC_QK_MATMUL 0
 #define FUNC_SOFTMAX_PREPARE 1
@@ -37,7 +36,7 @@
 
 extern "C" {
 
-int build_paged_attention_graph(Runtime *runtime, const ChipStorageTaskArgs &orch_args) {
+int build_paged_attention_graph(OrchestrationRuntime *runtime, const ChipStorageTaskArgs &orch_args) {
     if (orch_args.tensor_count() < 6) {
         std::cerr << "Expected at least 6 tensors, got " << orch_args.tensor_count() << '\n';
         return -1;
@@ -85,20 +84,20 @@ int build_paged_attention_graph(Runtime *runtime, const ChipStorageTaskArgs &orc
     std::cout << "q_tile_size=" << q_tile_size << ", num_head_tiles=" << num_head_tiles << '\n';
 
     // Allocate device memory for inputs/outputs
-    void *dev_query = runtime->host_api.device_malloc(query_size);
-    void *dev_key_cache = runtime->host_api.device_malloc(key_cache_size);
-    void *dev_value_cache = runtime->host_api.device_malloc(value_cache_size);
-    void *dev_out = runtime->host_api.device_malloc(out_size);
+    void *dev_query = device_malloc(runtime, query_size);
+    void *dev_key_cache = device_malloc(runtime, key_cache_size);
+    void *dev_value_cache = device_malloc(runtime, value_cache_size);
+    void *dev_out = device_malloc(runtime, out_size);
 
     if (!dev_query || !dev_key_cache || !dev_value_cache || !dev_out) {
         std::cerr << "Error: Failed to allocate device memory\n";
         return -1;
     }
 
-    runtime->host_api.copy_to_device(dev_query, host_query, query_size);
-    runtime->host_api.copy_to_device(dev_key_cache, host_key_cache, key_cache_size);
-    runtime->host_api.copy_to_device(dev_value_cache, host_value_cache, value_cache_size);
-    runtime->record_tensor_pair(host_out, dev_out, out_size);
+    copy_to_device(runtime, dev_query, host_query, query_size);
+    copy_to_device(runtime, dev_key_cache, host_key_cache, key_cache_size);
+    copy_to_device(runtime, dev_value_cache, host_value_cache, value_cache_size);
+    record_tensor_pair(runtime, host_out, dev_out, out_size);
 
     // Buffer sizes depend on q_tile_size and block_size
     size_t sij_size = static_cast<size_t>(q_tile_size) * block_size * sizeof(float);
@@ -116,11 +115,11 @@ int build_paged_attention_graph(Runtime *runtime, const ChipStorageTaskArgs &orc
     void **dev_oi_new_arr = new void *[total_buffers];
 
     for (uint32_t i = 0; i < total_buffers; i++) {
-        dev_sij_arr[i] = runtime->host_api.device_malloc(sij_size);
-        dev_pij_arr[i] = runtime->host_api.device_malloc(pij_size);
-        dev_mij_arr[i] = runtime->host_api.device_malloc(mij_size);
-        dev_lij_arr[i] = runtime->host_api.device_malloc(lij_size);
-        dev_oi_new_arr[i] = runtime->host_api.device_malloc(oi_new_size);
+        dev_sij_arr[i] = device_malloc(runtime, sij_size);
+        dev_pij_arr[i] = device_malloc(runtime, pij_size);
+        dev_mij_arr[i] = device_malloc(runtime, mij_size);
+        dev_lij_arr[i] = device_malloc(runtime, lij_size);
+        dev_oi_new_arr[i] = device_malloc(runtime, oi_new_size);
     }
 
     // Per-(batch, head_tile) accumulators
@@ -134,9 +133,9 @@ int build_paged_attention_graph(Runtime *runtime, const ChipStorageTaskArgs &orc
     void **dev_oi_arr = new void *[total_accums];
 
     for (uint32_t i = 0; i < total_accums; i++) {
-        dev_mi_arr[i] = runtime->host_api.device_malloc(mi_size);
-        dev_li_arr[i] = runtime->host_api.device_malloc(li_size);
-        dev_oi_arr[i] = runtime->host_api.device_malloc(oi_size);
+        dev_mi_arr[i] = device_malloc(runtime, mi_size);
+        dev_li_arr[i] = device_malloc(runtime, li_size);
+        dev_oi_arr[i] = device_malloc(runtime, oi_size);
     }
 
     std::cout << "Allocated " << total_buffers << " per-block buffers\n";
@@ -196,7 +195,7 @@ int build_paged_attention_graph(Runtime *runtime, const ChipStorageTaskArgs &orc
                 uint64_t qk_args[6] = {reinterpret_cast<uint64_t>(qi_ptr),  reinterpret_cast<uint64_t>(kj_ptr),
                                        reinterpret_cast<uint64_t>(dev_sij), static_cast<uint64_t>(q_tile_size),
                                        static_cast<uint64_t>(head_dim),     static_cast<uint64_t>(block_size)};
-                int t_qk = runtime->add_task(qk_args, 6, FUNC_QK_MATMUL, CoreType::AIC);
+                int t_qk = add_task(runtime, qk_args, 6, FUNC_QK_MATMUL, CoreType::AIC);
                 total_tasks++;
 
                 // SF: scale, rowmax, exp, rowsum -> pij, mij, lij
@@ -204,18 +203,18 @@ int build_paged_attention_graph(Runtime *runtime, const ChipStorageTaskArgs &orc
                                        reinterpret_cast<uint64_t>(dev_pij), reinterpret_cast<uint64_t>(dev_mij),
                                        reinterpret_cast<uint64_t>(dev_lij), static_cast<uint64_t>(q_tile_size),
                                        static_cast<uint64_t>(block_size),   static_cast<uint64_t>(valid_len)};
-                int t_sf = runtime->add_task(sf_args, 8, FUNC_SOFTMAX_PREPARE, CoreType::AIV);
+                int t_sf = add_task(runtime, sf_args, 8, FUNC_SOFTMAX_PREPARE, CoreType::AIV);
                 total_tasks++;
 
                 // PV: pij(M, K') @ vj(K', N') -> oi_new(M, N')
                 uint64_t pv_args[6] = {reinterpret_cast<uint64_t>(dev_pij),    reinterpret_cast<uint64_t>(vj_ptr),
                                        reinterpret_cast<uint64_t>(dev_oi_new), static_cast<uint64_t>(q_tile_size),
                                        static_cast<uint64_t>(block_size),      static_cast<uint64_t>(head_dim)};
-                int t_pv = runtime->add_task(pv_args, 6, FUNC_PV_MATMUL, CoreType::AIC);
+                int t_pv = add_task(runtime, pv_args, 6, FUNC_PV_MATMUL, CoreType::AIC);
                 total_tasks++;
 
-                runtime->add_successor(t_qk, t_sf);
-                runtime->add_successor(t_sf, t_pv);
+                add_successor(runtime, t_qk, t_sf);
+                add_successor(runtime, t_sf, t_pv);
 
                 // Online Update: serialized across blocks (each depends on previous)
                 int is_first = (bn == 0) ? 1 : 0;
@@ -227,12 +226,12 @@ int build_paged_attention_graph(Runtime *runtime, const ChipStorageTaskArgs &orc
                                         static_cast<uint64_t>(is_first),        static_cast<uint64_t>(is_last),
                                         reinterpret_cast<uint64_t>(out_ptr),    static_cast<uint64_t>(q_tile_size),
                                         static_cast<uint64_t>(head_dim)};
-                int t_up = runtime->add_task(up_args, 11, FUNC_ONLINE_UPDATE, CoreType::AIV);
+                int t_up = add_task(runtime, up_args, 11, FUNC_ONLINE_UPDATE, CoreType::AIV);
                 total_tasks++;
 
-                runtime->add_successor(t_pv, t_up);
+                add_successor(runtime, t_pv, t_up);
                 if (t_up_prev >= 0) {
-                    runtime->add_successor(t_up_prev, t_up);
+                    add_successor(runtime, t_up_prev, t_up);
                 }
                 t_up_prev = t_up;
             }
@@ -249,7 +248,7 @@ int build_paged_attention_graph(Runtime *runtime, const ChipStorageTaskArgs &orc
     delete[] dev_oi_arr;
 
     std::cout << "Created " << total_tasks << " tasks\n";
-    runtime->print_runtime();
+    print_runtime(runtime);
 
     return 0;
 }
