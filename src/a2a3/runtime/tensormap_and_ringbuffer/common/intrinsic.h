@@ -21,7 +21,7 @@
  *        startup based on each core's cluster position; never changes.
  *        Only meaningful for AIV kernels in MIX tasks.
  *
- *   2. Local topology (per-dispatch, changes each dispatch):
+ *   2. Local per-dispatch context (changes each dispatch):
  *      - block_idx : which logical block the current worker is executing
  *      - block_num : total number of blocks in this task (= block_dim)
  *      Written by build_payload() before each dispatch.
@@ -85,8 +85,9 @@ struct GlobalContext {
 
 /**
  * Per-dispatch local context, stored in PTO2DispatchPayload.
- * Written by build_payload() before each dispatch.  Different blocks of the
+ * Written by build_payload() before each dispatch. Different blocks of the
  * same task receive different block_idx values but the same block_num.
+ *
  */
 struct LocalContext {
     int32_t block_idx;  // Logical block index within the task [0, block_num)

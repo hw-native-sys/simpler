@@ -25,6 +25,7 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
+#include "aicpu/cpu_sim_task_cookie.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -565,8 +566,8 @@ struct AicpuExecutor {
             dispatch_payload.args[n++] = payload.scalars[i];
         }
         // Per-dispatch local context (read from slot state)
-        dispatch_payload.local_context.core_idx = slot_state.next_block_idx;
-        dispatch_payload.local_context.core_num = slot_state.block_num;
+        dispatch_payload.local_context.s_block_idx = slot_state.next_block_idx;
+        dispatch_payload.local_context.s_block_num = slot_state.block_num;
         // Store context pointers at fixed suffix positions in args[]
         // (GlobalContext content is already set by init_global_context, but the
         //  pointer must be written each dispatch since args[] is rebuilt entirely)
@@ -616,6 +617,7 @@ struct AicpuExecutor {
             core_exec_state.dispatch_seq += (TASK_ID_MASK - reg_task_id + 1);
             reg_task_id = core_exec_state.dispatch_seq & TASK_ID_MASK;
         }
+        platform_set_cpu_sim_task_cookie(core_id, reg_task_id, static_cast<uint64_t>(slot_state.task->task_id.raw));
         write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
 
         tracker.change_core_state(core_offset);

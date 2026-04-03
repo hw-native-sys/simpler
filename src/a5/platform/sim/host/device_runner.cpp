@@ -35,6 +35,7 @@
 
 #include "aicpu/platform_aicpu_affinity.h"
 #include "callable.h"
+#include "cpu_sim_context.h"
 #include "host/raii_scope_guard.h"
 
 // Function pointer types for dynamically loaded executors
@@ -195,6 +196,7 @@ int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
     const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
 ) {
+    clear_cpu_sim_shared_storage();
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
@@ -503,6 +505,7 @@ int DeviceRunner::finalize() {
 
     // Free all remaining allocations
     mem_alloc_.finalize();
+    clear_cpu_sim_shared_storage();
 
     device_id_ = -1;
     worker_count_ = 0;

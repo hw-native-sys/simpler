@@ -56,11 +56,11 @@ __aicore__ __attribute__((always_inline)) static void execute_task(__gm__ PTO2Di
  * increasing task ID used only for dispatch signaling and ACK/FIN protocol.
  *
  * @param runtime Pointer to Runtime in global memory
- * @param core_idx Block index (core ID)
+ * @param s_block_idx Block index (core ID)
  * @param core_type Core type (AIC or AIV)
  */
-__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int core_idx, CoreType core_type) {
-    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[core_idx]);
+__aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, int s_block_idx, CoreType core_type) {
+    __gm__ Handshake *my_hank = (__gm__ Handshake *)(&runtime->workers[s_block_idx]);
 
     // Phase 1: Wait for AICPU initialization signal
     while (my_hank->aicpu_ready == 0) {
@@ -81,7 +81,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Phase 3: Report core type, signal ready
     my_hank->core_type = core_type;
     OUT_OF_ORDER_STORE_BARRIER();
-    my_hank->aicore_done = core_idx + 1;  // Signal ready (use core_idx + 1 to avoid 0)
+    my_hank->aicore_done = s_block_idx + 1;  // Signal ready (use s_block_idx + 1 to avoid 0)
 
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
 
@@ -121,6 +121,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             uint64_t start_time = get_sys_cnt_aicore();
 
             // Execute the task
+            CPU_SIM_SET_EXECUTION_CONTEXT(
+                payload->local_context.s_block_idx, payload->global_context.sub_block_id,
+                (core_type == CoreType::AIV) ? PLATFORM_AIV_CORES_PER_BLOCKDIM : 1u
+            );
+            CPU_SIM_SET_TASK_COOKIE(platform_get_cpu_sim_task_cookie(static_cast<uint32_t>(s_block_idx), task_id));
             execute_task(payload);
 
             // Performance profiling: record task execution

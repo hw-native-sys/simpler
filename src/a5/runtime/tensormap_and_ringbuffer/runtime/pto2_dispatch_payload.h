@@ -20,10 +20,9 @@
  * GlobalContext (sub_block_id) is initialized once at runtime startup via
  * init_global_context() and never modified afterwards.
  *
- * LocalContext (block_idx, block_num) and args[] are rebuilt by
- * build_payload() before each dispatch.  Both context struct pointers are
- * written into the args[] suffix on every dispatch (since args[] is rebuilt
- * entirely each time).
+ * LocalContext (block_idx, block_num) and args[] are rebuilt by build_payload()
+ * before each dispatch.  Both context struct pointers are written into the
+ * args[] suffix on every dispatch (since args[] is rebuilt entirely each time).
  *
  * AICore caches a pointer to its per-core slot at startup and reads from
  * it on each dispatch.  The struct is cache-line aligned to avoid false

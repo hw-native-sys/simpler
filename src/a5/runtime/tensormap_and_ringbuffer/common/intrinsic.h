@@ -21,9 +21,9 @@
  *        startup based on each core's cluster position; never changes.
  *        Only meaningful for AIV kernels in MIX tasks.
  *
- *   2. Local topology (per-dispatch, changes each dispatch):
- *      - core_idx : which logical block the current worker is executing
- *      - core_num : total number of blocks in this task (= block_dim)
+ *   2. Local per-dispatch context (changes each dispatch):
+ *      - s_block_idx : which logical block the current worker is executing
+ *      - s_block_num : total number of blocks in this task (= block_dim)
  *      Written by build_payload() before each dispatch.
  *
  * Both categories are injected via two pointer slots appended at the tail
@@ -85,15 +85,16 @@ struct GlobalContext {
 
 /**
  * Per-dispatch local context, stored in PTO2DispatchPayload.
- * Written by build_payload() before each dispatch.  Different blocks of the
- * same task receive different core_idx values but the same core_num.
+ * Written by build_payload() before each dispatch. Different blocks of the
+ * same task receive different s_block_idx values but the same s_block_num.
+ *
  */
 struct LocalContext {
-    int32_t core_idx;  // Logical block index within the task [0, core_num)
-    int32_t core_num;  // How many logical blocks this task requires.
-                       // Currently fixed to 1 (block_dim > 1 not yet implemented).
-                       // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
-                       // which controls how many physical cores the runtime launches.
+    int32_t s_block_idx;  // Logical block index within the task [0, s_block_num)
+    int32_t s_block_num;  // How many logical blocks this task requires.
+                          // Currently fixed to 1 (block_dim > 1 not yet implemented).
+                          // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
+                          // which controls how many physical cores the runtime launches.
 };
 
 /**
@@ -123,7 +124,7 @@ static __aicore__ inline int32_t get_sub_block_id(__gm__ int64_t *args) {
 static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
     __gm__ LocalContext *ctx =
         reinterpret_cast<__gm__ LocalContext *>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
-    return ctx->core_idx;
+    return ctx->s_block_idx;
 }
 
 /**
@@ -137,5 +138,5 @@ static __aicore__ inline int32_t get_block_idx(__gm__ int64_t *args) {
 static __aicore__ inline int32_t get_block_num(__gm__ int64_t *args) {
     __gm__ LocalContext *ctx =
         reinterpret_cast<__gm__ LocalContext *>(static_cast<uint64_t>(args[SPMD_LOCAL_CONTEXT_INDEX]));
-    return ctx->core_num;
+    return ctx->s_block_num;
 }
