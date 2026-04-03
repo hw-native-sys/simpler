@@ -39,15 +39,28 @@ enum class PTO2SubtaskSlot : uint8_t {
 /**
  * Subtask mask bits (for active_mask / subtask_done_mask)
  */
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);   // 0x1
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);  // 0x2
-inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV1 = (1u << 2);  // 0x4
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);         // 0x1
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);        // 0x2
+inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV1 = (1u << 2);        // 0x4
+inline constexpr uint8_t PTO2_SUBTASK_FLAG_SYNC_START = (1u << 3);  // 0x8: all blocks must launch atomically
 
 /**
  * Test whether a subtask slot is active in a given mask
  */
 static inline bool pto2_subtask_active(uint8_t mask, PTO2SubtaskSlot slot) {
     return (mask & (1u << static_cast<uint8_t>(slot))) != 0;
+}
+
+/**
+ * Extract only the core bits from active_mask (strips flag bits).
+ */
+static inline uint8_t pto2_core_mask(uint8_t active_mask) { return active_mask & 0x07u; }
+
+/**
+ * Check whether a task requires all blocks to be launched atomically.
+ */
+static inline bool pto2_requires_sync_start(uint8_t active_mask) {
+    return (active_mask & PTO2_SUBTASK_FLAG_SYNC_START) != 0;
 }
 
 /**
@@ -83,9 +96,10 @@ inline constexpr int32_t PTO2_NUM_RESOURCE_SHAPES = 3;
  * Caller must ensure active_mask is valid (at least one bit set).
  */
 static inline PTO2ResourceShape pto2_active_mask_to_shape(uint8_t active_mask) {
-    int bit_count = __builtin_popcount(active_mask);
+    uint8_t core_mask = pto2_core_mask(active_mask);
+    int bit_count = __builtin_popcount(core_mask);
     if (bit_count >= 2) return PTO2ResourceShape::MIX;
-    if (active_mask & PTO2_SUBTASK_MASK_AIC) return PTO2ResourceShape::AIC;
+    if (core_mask & PTO2_SUBTASK_MASK_AIC) return PTO2ResourceShape::AIC;
     return PTO2ResourceShape::AIV;
 }
 
@@ -114,6 +128,10 @@ public:
     int16_t block_num() const { return block_num_; }
     void set_block_num(int16_t n) { block_num_ = n; }
 
+    bool require_sync_start() const { return require_sync_start_; }
+    void set_require_sync_start(bool v) { require_sync_start_ = v; }
+
 private:
     int16_t block_num_{1};
+    bool require_sync_start_{false};
 };
