@@ -8,18 +8,18 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
-
 /**
- * PTO Runtime Public C API
+ * PTO Runtime C API — canonical header
  *
- * Declares the symbols that ChipWorker resolves via dlsym from the host
- * runtime shared library. Each platform (sim / onboard × a2a3 / a5)
- * provides its own implementation.
+ * Declares all C-linkage functions exported by the host runtime .so.
+ * Both the ChipWorker (consumer, resolves public symbols via dlsym) and the
+ * platform implementations (producers, define all symbols) include this file.
  *
- * Internal functions used by orchestration code (device_malloc, device_free,
- * copy_to_device, copy_from_device, upload_kernel_binary_wrapper,
- * remove_kernel_binary_wrapper) are NOT part of this public interface —
- * they are passed via Runtime.host_api function pointers within the .so.
+ * Public API — resolved by ChipWorker via dlsym:
+ *   get_runtime_size, set_device, run_runtime, finalize_device
+ *
+ * Memory management: caller allocates a buffer of get_runtime_size() bytes
+ * and passes it to run_runtime(). Error codes: 0 = success, negative = error.
  */
 
 #ifndef SRC_COMMON_WORKER_PTO_RUNTIME_C_API_H_
@@ -34,40 +34,20 @@ extern "C" {
 
 typedef void *RuntimeHandle;
 
-/**
- * Return the size (in bytes) of the Runtime structure.
- * The caller allocates a buffer of this size and passes it to run_runtime().
- */
+/* ===========================================================================
+ * Public API (resolved by ChipWorker via dlsym)
+ * =========================================================================== */
+
+/** Return sizeof(Runtime) for caller buffer allocation. */
 size_t get_runtime_size(void);
 
-/**
- * Set the target device for subsequent operations.
- * Must be called before the first run_runtime() call.
- *
- * @param device_id  Logical device identifier
- * @return 0 on success, negative on error
- */
+/** Set the target device. Must be called before the first run_runtime(). */
 int set_device(int device_id);
 
 /**
  * Build the task graph, execute on device, copy results back, and clean up.
  *
- * Combines the former init_runtime + enable_runtime_profiling +
- * launch_runtime + finalize_runtime into a single call.
- *
- * @param runtime           Caller-allocated buffer (size from get_runtime_size())
- * @param callable          Opaque ChipCallable pointer (orchestration + kernel binaries)
- * @param args              Opaque ChipStorageTaskArgs pointer (tensor/scalar arguments)
- * @param block_dim         Number of AICore blocks
- * @param aicpu_thread_num  Number of AICPU scheduler threads
- * @param orch_thread_num   Number of orchestrator threads
- * @param device_id         Target device
- * @param aicpu_binary      AICPU executor binary blob
- * @param aicpu_size        Size of AICPU binary
- * @param aicore_binary     AICore executor binary blob
- * @param aicore_size       Size of AICore binary
- * @param enable_profiling  1 to enable profiling, 0 to disable
- * @return 0 on success, negative on error
+ * Combines init_runtime + launch_runtime + finalize_runtime into one call.
  */
 int run_runtime(
     RuntimeHandle runtime, const void *callable, const void *args, int block_dim, int aicpu_thread_num,
@@ -76,13 +56,8 @@ int run_runtime(
 );
 
 /**
- * Finalize the DeviceRunner, releasing all device resources.
- *
- * Must be called before dlclose() to avoid static destruction order segfaults.
- * After this call, the next set_device() + run_runtime() cycle will
- * re-initialize from scratch.
- *
- * @return 0 on success, negative on error
+ * Release all device resources.
+ * Must be called before dlclose() to avoid static destruction order issues.
  */
 int finalize_device(void);
 

@@ -15,7 +15,10 @@
  * src/common/worker/pto_runtime_c_api.h.  Uses thread-based simulation.
  */
 
-#include "host/pto_runtime_c_api.h"
+#include "pto_runtime_c_api.h"
+
+#include "callable.h"
+#include "task_args.h"
 
 #include <new>
 #include <vector>
