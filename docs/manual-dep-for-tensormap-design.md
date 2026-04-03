@@ -4,7 +4,7 @@
 
 Bring the human-created dependency workflow from `aicpu_build_graph` into `tensormap_and_ringbuffer` in a scoped way:
 
-- `PTO_SCOPE(manual_dep=1) { ... }`
+- `PTO2_SCOPE(true) { ... }`
 - Tensors crossing scope boundaries use TensorMap semantics
 - Tensors used entirely inside the manual scope use explicit `add_dependency`
 
@@ -14,6 +14,24 @@ This is not a port of `aicpu_build_graph`'s fully-explicit runtime model. The ta
 - cross-scope dependency tracking: TensorMap
 - scope-local lifetime management: unchanged ring/scope ownership model
 
+## Code-Checked Baseline
+
+This draft is reviewed against the current implementations in:
+
+- `src/a2a3/runtime/aicpu_build_graph/runtime/pto_orchestrator.{h,cpp}`
+- `src/a2a3/runtime/aicpu_build_graph/orchestration/pto_orchestration_api.h`
+- `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.{h,cpp}`
+- `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2.{h,cpp}`
+- `src/a2a3/runtime/tensormap_and_ringbuffer/orchestration/pto_orchestration_api.h`
+- `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/tensor.h`
+
+The important current-code facts are:
+
+- `aicpu_build_graph` already has explicit `add_dependency`, returns `SubmitResult { task_id, outputs }`, and batch-publishes tasks at `scope_end`.
+- `tensormap_and_ringbuffer` currently derives dependencies during submit, returns only `TaskOutputTensors`, and uses `scope_end` only for lifetime release.
+- `tensormap_and_ringbuffer` orchestration is TLS-based today: `PTO2_SCOPE()` and `pto2_rt_submit_*()` do not take an explicit `PTO2Runtime*`.
+- In `tensormap_and_ringbuffer`, `Tensor::manual_dep` is creator-retention-only mode: it skips OverlapMap lookup/insert, but `owner_task_id` retention still applies.
+
 ## Confirmed Decisions
 
 These decisions are already aligned with the requested direction:
@@ -22,8 +40,9 @@ These decisions are already aligned with the requested direction:
 2. Manual scope may not contain another manual scope.
 3. The design must not simplify away multi-write cases.
 4. For an outer-scope tensor written inside a manual scope, readiness is the writer task completion time, not `scope_end`.
-5. Therefore, a task inside a manual scope that writes an outer-scope tensor must still publish that tensor to TensorMap.
-6. For an outer-scope tensor read inside a manual scope, the dependency must still be forced by TensorMap/owner-based boundary seeding.
+5. Therefore, a task inside a manual scope that writes an outer-scope tensor must still publish that tensor to TensorMap by manual `scope_end`.
+6. For an outer-scope tensor read inside a manual scope, the dependency must still be forced by TensorMap/owner-based boundary seeding during manual `scope_end`.
+7. Tasks created inside a manual scope should be batch-published to the scheduler at `scope_end`, matching `aicpu_build_graph` semantics for explicit dependency closure inside the scope.
 
 ## Change Control Requirements
 
@@ -89,13 +108,67 @@ Today the runtime derives dependencies in `pto_orchestrator.cpp` using:
 - modifier lookup through TensorMap overlap search
 - TensorMap insert for `INOUT` and `OUTPUT_EXISTING`
 
-There is already a `Tensor::manual_dep` bit, but in current code it is effectively a per-tensor escape hatch that skips TensorMap lookup/insert. That is not sufficient for scoped hybrid semantics because the scope, not the tensor alone, decides whether a use is same-scope or cross-scope.
+There is already a `Tensor::manual_dep` bit, but in current code it is only a per-tensor creator-retention mode: it skips TensorMap overlap lookup/insert while still keeping `owner_task_id` retention. That is not sufficient for scoped hybrid semantics because the scope, not the tensor alone, decides whether a use is same-scope or cross-scope.
+
+## Discovery vs Execution Separation
+
+This distinction is central to the frozen design.
+
+TensorMap is not the execution-time dependency engine. It is only a producer-discovery mechanism.
+
+The scheduler's fanin/fanout graph is the execution-time dependency engine.
+
+In current `tensormap_and_ringbuffer`, submit does two different things:
+
+1. Discover producers from tensors.
+- creator retention from `owner_task_id` in `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp`
+- overlap lookup from TensorMap in `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp`
+
+2. Convert discovered producers into scheduler edges.
+- accumulate unique producer slot states in local `fanin_states[]`
+- wire producer `fanout_head`, consumer `fanin_count`, and consumer `fanin_refcount`
+
+After that conversion, execution no longer cares how the dependency was found.
+
+The scheduler only sees:
+
+- producer fanout list
+- consumer fanin counters
+
+This is why manual dependency integration should work as follows:
+
+- do not put manual dependencies into TensorMap
+- do not bind manual dependencies to tensors
+- at manual `scope_end`, realize manual dependencies directly as normal producer-consumer scheduler edges
+
+So at manual `scope_end`, for each manual task:
+
+1. Start a local dedup buffer such as `fanin_states[]`.
+2. Add producers from recorded manual edges.
+3. Add producers from outer-tensor creator retention and TensorMap lookup.
+4. Dedup all of them together.
+5. Run the normal wiring path into:
+   - `payload->fanin_slot_states[]`
+   - `fanin_count`
+   - producer `fanout_head`
+
+Then after publish:
+
+- manual deps and TensorMap-derived deps are indistinguishable
+- both are handled by the existing scheduler readiness and completion fanout path
+
+Concise conclusion:
+
+- TensorMap discovers tensor-related dependencies
+- manual deps bypass discovery
+- both become the same scheduler edges before publish
+- execution uses only the scheduler edge machinery, not TensorMap
 
 ## Problem Statement
 
 If we simply copy `aicpu_build_graph` semantics into `tensormap_and_ringbuffer`, we get a wrong boundary model:
 
-- suppressing TensorMap for all tensors inside `PTO_SCOPE(manual_dep=1)` is incorrect
+- suppressing TensorMap for all tensors inside `PTO2_SCOPE(true)` is incorrect
 - delaying publication of an outer tensor until `scope_end` is incorrect
 
 The reason is that cross-scope tensors must become visible at the actual writer frontier. Outside consumers should depend on the task that really produced the latest visible state, not on scope closure.
@@ -109,12 +182,72 @@ So the correct split is:
 
 ## Core rule
 
-`PTO_SCOPE(manual_dep=1)` means:
+`PTO2_SCOPE(true)` means:
 
-- if both producer and consumer are inside this manual scope, the dependency must be established by explicit `add_dependency`
-- if a tensor use crosses the scope boundary, dependency tracking still uses TensorMap/owner metadata
+- if a tensor was created inside this manual scope and is reused inside this manual scope, the dependency must be established by explicit `add_dependency`
+- all outer-scope tensors still use existing TensorMap/owner metadata
+- tasks submitted inside the manual scope remain invisible to the scheduler until `scope_end`
 
 This rule applies per tensor use site, not as a global on/off switch for the whole submit.
+
+## Two Different Publication Semantics
+
+The design must distinguish two different kinds of publication:
+
+1. Scheduler publication
+2. TensorMap boundary publication
+
+### Scheduler publication
+
+For tasks inside `PTO2_SCOPE(true)`:
+
+- submit builds the internal task records and records explicit dependencies
+- those tasks are not yet published as executable scheduler work
+- `scope_end` batch-publishes them to the scheduler
+
+This is required so all same-scope explicit edges are fully wired before any task in the manual scope can start execution.
+
+### TensorMap boundary publication
+
+For cross-scope tensors touched by tasks inside `PTO2_SCOPE(true)`:
+
+- outside tasks submitted after the manual scope ends must still be able to discover the internal writer frontier
+- therefore the producer frontier for an external tensor written inside the manual scope must become visible to later TensorMap lookups at manual `scope_end`
+- however the tensor is still not semantically ready until that producer task actually completes
+
+So:
+
+- scheduler visibility of the task is controlled by manual `scope_end`
+- dependency readiness for later consumers is still enforced by waiting on producer task completion
+
+The document must not conflate these two mechanisms.
+
+More precisely:
+
+- before manual `scope_end`, the task record already exists but TensorMap boundary wiring may still be deferred
+- after manual `scope_end`, the task becomes part of the executable published graph
+- once published, the task may enter `READY` immediately or remain `PENDING` depending on whether its dependencies are already satisfied
+
+## Discussion Guardrails
+
+The following clarifications are recorded to reduce implementation drift and hallucination risk:
+
+1. Deferred publish does not mean deferred task allocation.
+- Manual tasks still allocate task ids, slot state, and payload at submit time.
+- What is deferred is dependency realization and ready-queue publication.
+
+2. Manual dependencies are not tracked by TensorMap.
+- TensorMap is only used for tensor-related producer discovery.
+- Manual dependencies are explicit producer-consumer edges recorded by orchestration.
+- At manual `scope_end`, both kinds of dependencies are converted into the same scheduler fanin/fanout structures.
+
+3. After manual `scope_end`, there is no special execution-time manual mechanism.
+- The runtime should not keep a second dependency engine alive after publish.
+- Once the scope is finalized, all dependencies are handled only by the existing scheduler fanin/fanout path.
+
+4. Deferred boundary wiring does not change tensor readiness semantics.
+- Outer writes become TensorMap-visible at manual `scope_end`.
+- Their semantic readiness is still producer-task completion.
 
 ## Tensor categories
 
@@ -126,7 +259,11 @@ For a task submitted inside a manual scope, every tensor argument falls into one
 4. Outer-scope tensor accessed through a derived view/reshape/transpose inside the manual scope
 5. External tensor with no owner task
 
-The runtime must classify behavior from ownership and current scope, not only from argument tag.
+The runtime only needs one special classification for v1:
+
+- tensor created in the current manual scope
+
+Everything else stays on the existing TensorMap path.
 
 ## Expected behavior by category
 
@@ -139,10 +276,11 @@ The runtime must classify behavior from ownership and current scope, not only fr
 
 ### 2. Outer-scope tensor, written in place
 
-- The internal writer must still publish to TensorMap.
+- The internal writer must still publish its producer frontier for TensorMap boundary tracking.
+- That boundary frontier becomes visible at manual `scope_end`, so later outside submissions can attach to the correct writer task.
 - Readiness of the written tensor is the completion of that writer task.
 - Multiple writes inside the same manual scope are allowed.
-- TensorMap should continue tracking the latest producer frontier exactly as in normal scope.
+- TensorMap should continue tracking the latest producer frontier exactly as in normal scope once the manual scope is finalized.
 
 ### 3. Tensor created inside this manual scope and reused only inside this manual scope
 
@@ -170,21 +308,65 @@ A tensor created inside the manual scope should not later become an outer-scope 
 
 ## Orchestration API
 
-Add explicit edge wiring to `tensormap_and_ringbuffer` orchestration API, mirroring `aicpu_build_graph`:
+Keep the existing `tensormap_and_ringbuffer` orchestration style: TLS-based helpers with no explicit runtime argument in user orchestration code. Do not make the public surface look like `aicpu_build_graph`'s `PTO2_SCOPE(rt)` family just to add manual mode.
+
+Add explicit edge wiring to `tensormap_and_ringbuffer` orchestration API:
 
 ```cpp
 void pto2_rt_add_dependency(PTO2TaskId producer, PTO2TaskId consumer);
 ```
 
-Add scoped manual mode:
+Extend scope syntax to accept an optional manual flag:
 
 ```cpp
-PTO_SCOPE(manual_dep = 1) {
+PTO2_SCOPE(true) {
     ...
 }
 ```
 
-For C++ implementation, this should compile down to a guard with scope metadata, not a dynamic stringly API.
+`PTO2_SCOPE()` remains the normal-scope form. `PTO2_SCOPE(true)` enters manual mode.
+
+Do not change `TaskOutputTensors`.
+
+Add new manual-submit APIs with `_manual` suffix so orchestration code can get task ids without changing existing normal submit call sites. This mirrors the role of `aicpu_build_graph`'s `SubmitResult`, but keeps the existing `tensormap_and_ringbuffer` submit APIs intact:
+
+```cpp
+struct PTO2ManualSubmitResult {
+    PTO2TaskId task_id;
+    TaskOutputTensors outputs;
+};
+
+PTO2ManualSubmitResult pto2_rt_submit_task_manual(const MixedKernels& mixed_kernels, const Arg& args);
+PTO2ManualSubmitResult pto2_rt_submit_aic_task_manual(int32_t kernel_id, const Arg& args);
+PTO2ManualSubmitResult pto2_rt_submit_aiv_task_manual(int32_t kernel_id, const Arg& args);
+```
+
+These APIs are intended for use inside `PTO2_SCOPE(true)` where explicit dependency wiring is required.
+
+This design intentionally splits task APIs, not tensor storage APIs:
+
+- normal scope uses existing `pto2_rt_submit_*` task APIs
+- manual scope uses `pto2_rt_submit_*_manual` task APIs
+- both modes continue using the same `Tensor`, `Arg`, and `TensorArgType` model
+
+So manual mode changes how tasks are recorded and finalized, not how tensors are represented.
+
+## Rejected API Alternatives
+
+The following alternatives were considered and rejected for v1:
+
+1. Add a new user-facing “external tensor” API for manual scope.
+- Rejected because manual mode only needs to identify manual-local tensors.
+- Everything else can be treated as outer/external and handled by the existing TensorMap path.
+- Adding a second tensor annotation API would increase surface area without adding necessary information.
+
+2. Change `TaskOutputTensors` to carry task ids.
+- Rejected to avoid broad churn in existing orchestration code.
+- Manual mode gets separate `_manual` submit APIs instead.
+
+3. Create a second tensor representation for manual mode.
+- Rejected because payload already stores the copied tensor/scalar data needed for deferred finalize.
+- The task API split is enough; tensor storage stays unified.
 
 ## Runtime API
 
@@ -192,15 +374,18 @@ Add runtime ops support:
 
 ```cpp
 void (*add_dependency)(PTO2Runtime* rt, PTO2TaskId producer, PTO2TaskId consumer);
+void (*scope_begin)(PTO2Runtime* rt, bool manual_dep);
 ```
 
-Add manual-scope entry/exit plumbing by extending the existing scope API with a mode flag:
+The orchestration-facing helper can stay TLS-style and hide the runtime pointer, for example by plumbing the flag through the existing `pto2_rt_scope_begin()` / `PTO2ScopeGuard` path.
+
+Add manual-scope entry/exit plumbing by extending the existing runtime entry point with a mode flag:
 
 ```cpp
 void pto2_rt_scope_begin(PTO2Runtime* rt, bool manual_dep);
 ```
 
-Recommendation: extend scope state with a mode flag and keep one scope stack. Avoid separate manual/non-manual stacks and avoid introducing a second scope API family.
+Recommendation: extend scope state with a mode flag and keep one scope stack. Avoid separate manual/non-manual stacks.
 
 ## Internal Design
 
@@ -210,15 +395,12 @@ Each scope frame needs:
 
 - `begin_index` into `scope_tasks`
 - scope mode: normal or manual
-- unique scope id
+- `begin_index` into a manual-edge buffer when the scope is manual
+- `begin_index` into a manual-task-meta buffer when the scope is manual
 
-The unique scope id is required because same-scope vs cross-scope classification must be relative to the current manual scope, not only to nested depth.
+Manual scope needs a local edge registry because `add_dependency` should record edges during orchestration but should not mutate scheduler fanin/fanout state until manual `scope_end`.
 
-Recommendation:
-
-- assign `scope_id` on every `scope_begin`
-- store current producing `scope_id` on task-side provenance
-- use `owner_task_id` on `Tensor` to reach producing task provenance
+Manual scope also needs a compact per-task metadata stream so `scope_end` can replay the deferred dependency logic without copying full `Arg` objects.
 
 ## Tensor metadata
 
@@ -229,79 +411,407 @@ Current `Tensor` already stores:
 
 Recommendation: do not add new tensor metadata in v1.
 
-The critical missing concept is producing scope identity, but that provenance should live on the producer task side if possible, not on `Tensor`.
+The narrowed v1 rule only needs to identify tensors created in the current manual scope. That can be derived from:
 
-We need enough information to answer:
+- `tensor.owner_task_id`
+- the set of task ids created in the current manual scope
 
-- was this tensor produced in the current manual scope?
-- or is it owned by an outer scope and therefore boundary-visible?
-
-Preferred approach:
+So the preferred approach is:
 
 - keep `Tensor` layout unchanged
-- use `tensor.owner_task_id` as the provenance pointer
-- record `owner_scope_id` on producer task-side metadata such as task descriptor or scheduler/orchestrator slot state
-- classify same-scope versus cross-scope through `owner_task_id -> producer provenance -> scope_id`
+- keep `owner_task_id` as the provenance pointer
+- track the current manual scope's owned task membership in scope-local orchestrator state
 
-`manual_dep` should no longer be the primary mechanism for scope semantics. It may remain as a per-tensor override, but the scoped design should be driven by:
+`manual_dep` should not become the primary mechanism for scoped semantics. It may remain as a per-tensor escape hatch for existing behavior, but the manual-scope design should be driven by:
 
 - current scope mode
 - tensor owner task id
-- producer task scope provenance
+- whether that owner belongs to the current manual scope
 
-## Submit-time classification
+## Shared Tensor Path, Split Task APIs
 
-In `pto_orchestrator.cpp`, dependency behavior should be classified per tensor argument.
+The design should keep one shared tensor recording path across normal and manual scope:
 
-Pseudo-rule for a task submitted inside a manual scope:
+- `Arg` remains the user-facing container for tensor refs, tensor create-info, scalars, and `TensorArgType`
+- `PTO2TaskPayload` remains the destination for copied tensors and scalars
+- runtime-created outputs still receive `owner_task_id` during submit
+
+What changes in manual scope is only the task API and the time when dependency logic runs:
+
+- normal submit APIs perform dependency lookup and TensorMap insert immediately
+- manual submit APIs only allocate the task, copy payload data, and record compact finalize metadata
+- manual `scope_end` replays dependency lookup and TensorMap insert from the recorded payload
+
+This keeps normal-mode APIs unchanged while avoiding a second tensor representation for manual mode.
+
+## Classification rule
+
+In manual scope, the runtime only needs one special classification:
 
 ```cpp
-same_scope_tensor =
+manual_local_tensor =
     tensor.owner_task_id.is_valid() &&
-    producer_scope_id(tensor.owner_task_id) == current_manual_scope_id;
+    current_manual_scope_owns(tensor.owner_task_id);
+```
 
+Then:
+
+```cpp
 if (!in_manual_scope) {
     use existing tensormap behavior;
-} else if (same_scope_tensor) {
-    skip TensorMap lookup/insert;
-    rely on explicit add_dependency;
+} else if (manual_local_tensor) {
+    use explicit add_dependency only;
 } else {
-    use cross-scope TensorMap/owner behavior;
+    use existing TensorMap/owner behavior;
 }
 ```
 
-This should be applied separately to:
-
-- creator retention
-- modifier lookup
-- TensorMap insertion for writes
-
 Important nuance:
 
-- same-scope tensors should still retain creator lifetime through explicit dependencies, not through automatic creator retention
-- cross-scope tensors should still retain creator lifetime automatically
-- cross-scope outer reads must still execute the existing TensorMap/owner dependency path even when the current scope is manual
+- tensors created in the current manual scope use explicit same-scope dependencies
+- all outer tensors stay on the existing TensorMap path, even if two tasks inside the manual scope both access them
+- this means outer tensors may still create implicit same-scope edges through TensorMap inside a manual scope
+- this is an accepted v1 decision and should be documented in the PR description as a deliberate tradeoff
+
+This is why a separate user-facing “external tensor” API is not required for v1:
+
+- manual mode only needs to identify manual-local tensors
+- everything else is treated as outer/external and goes through the existing TensorMap path
+- that decision can be derived from `owner_task_id` plus the current manual scope's owned-task membership check
+
+## Scheduler-Safe Hybrid Design
+
+The scheduler changes should be localized and should not disturb existing normal-scope behavior.
+
+### Design principle
+
+Keep two execution paths:
+
+- normal scope path: existing `tensormap_and_ringbuffer` behavior
+- manual scope path: deferred dependency realization and deferred scheduler publication
+
+The normal path should remain unchanged as much as possible.
+
+### What a manual-scope task must count as dependencies
+
+For a task inside `PTO2_SCOPE(true)`, total fanin is:
+
+- explicit manual dependencies added by `add_dependency`
+- external dependencies derived from TensorMap/owner logic for outer-scope reads
+- one extra publish barrier released only at manual `scope_end`
+
+In other words:
+
+```cpp
+fanin_count =
+    manual_dep_edges +
+    external_tensor_deps +
+    1;  // publish barrier
+```
+
+This is the key mechanism that lets the scheduler ignore manual-local TensorMap lookup while still respecting out-of-scope dependencies.
+
+### What submit should do in manual scope
+
+For a task submitted inside manual scope:
+
+1. Allocate slot and payload exactly as today.
+2. Initialize `task_state = PENDING`.
+3. Initialize `fanin_count = 1` and `fanin_refcount = 0` for deferred publication.
+4. Return a stable `task_id` immediately so orchestration can call `add_dependency`.
+5. Do not realize explicit manual edges into scheduler fanin/fanout yet.
+6. Do not realize external TensorMap-derived dependencies yet.
+7. Do not publish outer writes into TensorMap yet.
+8. Do not push the task into ready queues during submit.
+9. Preserve enough scope-local information so manual `scope_end` can realize all dependencies before publish.
+
+Submit-time task records are still required even though execution is deferred:
+
+- manual submit APIs must return stable task ids immediately
+- runtime-created outputs need `owner_task_id` immediately so later scope-local tensors and their derived views can be recognized
+- the scheduler only sees these tasks after manual `scope_end`
+
+Manual mode should also record a compact per-task finalize descriptor rather than a second full copy of `Arg`.
+
+Recommended shape:
+
+```cpp
+struct PTO2ManualTaskMeta {
+    uint64_t packed_tags;   // compact encoding of TensorArgType for this task
+    uint16_t tensor_count;
+    uint16_t edge_begin;    // range in manual_edges[]
+    uint16_t edge_count;
+    uint16_t _pad;
+};
+
+struct PTO2ManualEdge {
+    uint16_t producer_idx;  // index in current manual scope's task slice
+    uint16_t consumer_idx;
+};
+```
+
+Why this is low-overhead:
+
+- tensor values are already copied into `PTO2TaskPayload`
+- scalars are already copied into `PTO2TaskPayload`
+- tags are much smaller than copying `Arg` again
+- the edge list is dense, append-only, and scope-local
+
+The design should prefer a packed tag stream plus a dense edge stream over storing duplicated tensor refs or explicit user-marked external tensors.
+
+That gives a manual pre-publish state:
+
+- task records and task ids already exist
+- explicit edges are only recorded, not yet wired into scheduler fanin/fanout
+- external TensorMap-derived edges are also deferred until `scope_end`
+- the task is still unpublished as executable scheduler work because the publish barrier is not yet released
+
+### What scope_end should do in manual scope
+
+Manual `scope_end` needs one additional finalize-and-publish step before the existing lifetime-release step completes.
+
+Recommended sequence:
+
+1. For every task directly owned by this manual scope:
+   - realize recorded explicit `add_dependency` edges into scheduler fanin/fanout state
+   - inspect each tensor arg
+   - if the tensor is manual-local, skip TensorMap logic
+   - otherwise run the existing TensorMap/owner dependency logic
+   - if the task writes an outer tensor, insert its producer frontier into TensorMap
+2. After all dependency realization is complete for the scope:
+   - release the publish barrier by incrementing `fanin_refcount`
+   - if `fanin_refcount == fanin_count`, transition to `READY` and push to ready queue
+   - otherwise keep the task in published `PENDING` state so later producer completion can resolve it
+3. Release the scope lifetime reference exactly as current `on_scope_end` does
+
+This can be implemented as a manual-scope finalize path in the orchestrator plus a small scheduler helper for the publish-barrier release.
+
+Example helper shape:
+
+```cpp
+void publish_manual_scope_tasks(PTO2TaskSlotState** task_slot_states, int32_t count);
+```
+
+This helper should reuse the existing ready-transition logic as much as possible.
+
+### How external dependency replay works
+
+Manual `scope_end` should replay tasks in original submit order, using:
+
+- `scope_tasks[]` for task order
+- `manual_task_meta[]` for packed tags and edge ranges
+- `PTO2TaskPayload::tensors[]` for actual tensor values
+
+For each task in that order:
+
+1. Realize explicit manual edges whose consumer is this task.
+2. Decode tensor tags from `packed_tags`.
+3. For each tensor arg:
+   - if `owner_task_id` belongs to the current manual scope's owned task set, treat it as manual-local and skip TensorMap logic
+   - otherwise treat it as outer/external
+4. For outer/external tensors:
+   - apply creator-retention logic from `owner_task_id`
+   - apply existing TensorMap overlap lookup for `INPUT` / `INOUT`
+5. After lookup for this task:
+   - apply normal TensorMap insertion for outer writes (`INOUT` / `OUTPUT_EXISTING`)
+
+This replay order matters:
+
+- it preserves current tensormap behavior for multiple writes to outer tensors
+- earlier outer writes from the same manual scope become visible to later tasks in the same manual scope during replay
+- that matches the accepted v1 tradeoff that outer tensors may still induce implicit same-scope TensorMap edges
+
+The replay must not be implemented as:
+
+- all lookups for the whole scope first, then all inserts
+- all explicit manual edges first, then a second undeduped TensorMap pass
+- per-dependency immediate scheduler mutation without first building a deduped producer set for the consumer
+
+Those variants would diverge from current tensormap semantics and are considered incorrect for this design.
+
+### Important case: external dependency already produced before manual publish
+
+For a manual-scope task that reads an outer-scope tensor:
+
+- if the external producer task has already completed when dependency realization happens at manual `scope_end`, that edge should immediately contribute to `fanin_refcount`
+- then manual `scope_end` releases only the publish barrier, and the task may become `READY` immediately
+
+If the external producer has only published its TensorMap frontier but not yet completed:
+
+- the manual-scope consumer is published at manual `scope_end`
+- but it remains in published `PENDING`
+- later producer completion notifies fanout and increments `fanin_refcount`
+- once `fanin_refcount == fanin_count`, the consumer transitions to `READY`
+
+This is the desired hybrid behavior:
+
+- dependency construction happens at manual `scope_end`, before publish
+- dependency satisfaction is still handled by the normal runtime execution path after publish
+
+### Why this is low-risk
+
+- no change to ready queue implementation
+- no change to worker dispatch loop
+- no change to normal TensorMap scope behavior
+- no need for a new scheduler task state
+- reuse the existing `fanin_count` / `fanin_refcount` / `PENDING -> READY` transition model
+
+The main new behavior is deferred dependency realization plus deferred release of the publish barrier for manual-scope tasks.
+
+## Current-Manual-Scope Ownership Without Tensor Changes
+
+To decide whether a tensor is manual-local or outer-visible, the orchestrator only needs to know whether its `owner_task_id` belongs to the current manual scope.
+
+Recommended minimal design:
+
+- keep `Tensor` unchanged
+- use `Tensor.owner_task_id` as the provenance link
+- keep a scope-local registry of task ids created in the current manual scope
+
+A good low-risk implementation is to reuse the existing flat `scope_tasks` buffer plus a parallel manual-edge buffer, rather than widening hot structs unnecessarily.
+
+Classification then becomes:
+
+```cpp
+if (!tensor.owner_task_id.is_valid()) {
+    // external tensor with no producer task
+} else {
+    manual_local = current_manual_scope_owns(tensor.owner_task_id);
+}
+```
+
+## Lifecycle Clarification
+
+This design needs precise task-lifecycle terms:
+
+- `COMPLETED`: task execution has finished; produced tensor data is semantically ready
+- `CONSUMED` / reclaimed: all fanout references and the owning-scope reference have been released, so the task slot may be reused and `last_task_alive` may advance
+- tensor readiness: data-level concept, typically tied to producer task completion
+
+This matters for deferred manual `scope_end` wiring:
+
+- an outer-scope producer task may already be `COMPLETED` before the inner manual scope ends
+- that is fine, and the manual finalize path should treat it as an already-satisfied dependency
+- what must remain true is that the producer task has not yet reached the reclaimed / slot-reusable state before the inner manual `scope_end`
+
+Why this is expected to hold:
+
+- tasks created in the current manual scope are still protected by the current manual scope reference until manual `scope_end`
+- tasks created in an outer still-active scope may complete early, but the outer scope still holds their scope reference until that outer scope ends
+- therefore an inner manual scope can still discover those outer producers through `owner_task_id` or TensorMap when it finalizes
+
+This does not mean the producer task is still runnable or incomplete.
+It may already be `COMPLETED`; the manual finalize path should then treat it as an already-satisfied dependency.
+
+So the safety argument is not "outer producers cannot complete early". The correct statement is:
+
+- outer producers may complete before inner manual `scope_end`
+- they should still remain alive enough to be discoverable until the deferred boundary wiring for that inner manual scope has finished
+
+## External Dependency Publication In Manual Scope
+
+The spec needs two explicit rules here.
+
+### External reads
+
+A task inside manual scope that reads an outer-scope tensor:
+
+- must still collect the external producer through TensorMap/owner logic
+- must include that dependency in its fanin during manual `scope_end`, before manual batch publish
+- must not require the user to restate that outer dependency manually
+
+### External writes
+
+A task inside manual scope that writes an outer-scope tensor:
+
+- must publish its producer frontier to TensorMap during manual `scope_end`
+- must not publish same-scope temporary tensors into TensorMap
+- may still be `PENDING` and unpublished to the scheduler until manual `scope_end`
+
+This is safe because later outside submissions only need to identify the producer task and wire dependency to it. Actual execution readiness is still controlled by task completion and the scheduler's normal completion path.
+
+## Manual Dependencies And External Dependencies On The Same Task
+
+A single task inside manual scope may simultaneously depend on:
+
+- explicit same-scope manual producers
+- external TensorMap-derived producers
+
+This is supported by the same fanin accounting model.
+
+Example:
+
+```cpp
+PTO2_SCOPE(true) {
+    t0 = in-scope producer of tmp
+    t1 = consumer of tmp and outer tensor X
+    add_dependency(t0, t1)
+}
+```
+
+At manual `scope_end`, for `t1`:
+
+- `t0 -> t1` contributes one explicit manual fanin edge
+- outer tensor `X` contributes boundary-derived external fanin edges
+- publish barrier contributes one extra deferred fanin unit
+
+`t1` becomes READY only after:
+
+- explicit in-scope producers complete
+- external producers complete
+- manual `scope_end` releases the publish barrier
+
+That is the intended scheduler behavior.
 
 ## Explicit edge wiring
 
-`pto2_add_dependency` from `aicpu_build_graph` can be reused conceptually, but the implementation must match `tensormap_and_ringbuffer` scheduler semantics:
+`pto2_add_dependency` from `aicpu_build_graph` can be reused conceptually, but manual scope should not wire scheduler fanin/fanout immediately.
 
-- increment consumer `fanin_count`
+Recommended behavior inside manual scope:
+
+- validate that both task ids belong to the current manual scope
+- record the edge in a scope-local manual-edge buffer
+- do not increment `fanin_count` yet
+- do not mutate producer `fanout_head` yet
+
+Then at manual `scope_end`:
+
+- realize each recorded edge into the scheduler's existing fanin/fanout structures
+- increment `fanin_count`
 - record producer in consumer payload for release traversal
-- wire producer fanout list under `fanout_lock`
-- handle early-completed producer case
+- handle the already-completed producer case exactly once, during realization
 
-No scope-end batch publish behavior should be imported. `tensormap_and_ringbuffer` tasks are already submit-visible before scope end, and changing that would be a separate design.
+This avoids racing live external completion against partially built manual dependency state.
+
+Important discussion note:
+
+- the deduped producer set for one consumer must include all sources together:
+  - explicit manual edges
+  - creator retention from `owner_task_id`
+  - TensorMap overlap lookup
+
+The implementation must not count these sources independently and then wire fanout multiple times for the same producer-consumer pair.
 
 ## Scope-end behavior
+
+Manual scope changes scheduler publication semantics for tasks inside that scope:
+
+- tasks in manual scope are batch-published to the scheduler at `scope_end`
+- same-scope explicit edges must be fully wired before that publish happens
 
 Manual scope does not change lifetime release semantics:
 
 - `scope_end` still releases the owning-scope fanout reference
-- `scope_end` is not a publication barrier for cross-scope tensors
-- cross-scope visibility must already reflect task completion frontier
 
-This is the main semantic difference from `aicpu_build_graph`.
+Manual scope also does not change cross-scope readiness semantics:
+
+- external tensor readiness is still producer-task completion, not `scope_end`
+- but external-writer frontier information must be visible to later TensorMap lookups no later than manual `scope_end`
+
+This manual-scope behavior intentionally combines:
+
+- `aicpu_build_graph`-style scope-end batch publish for explicit same-scope dependencies
+- `tensormap_and_ringbuffer`-style TensorMap boundary tracking for cross-scope tensors
 
 ## Multiple Writes To Outer Tensors
 
@@ -310,7 +820,7 @@ This case must be supported in v1.
 Example:
 
 ```cpp
-PTO_SCOPE(manual_dep=1) {
+PTO2_SCOPE(true) {
     t1 writes outer C
     t2 writes outer C
     add_dependency(t1, t2)
@@ -320,15 +830,16 @@ outside task reads C
 
 Correct behavior:
 
-- `t1` publishes `C` to TensorMap
-- `t2` publishes `C` again to TensorMap
+- at manual `scope_end`, `t1` publishes `C` to TensorMap
+- at manual `scope_end`, `t2` publishes `C` again to TensorMap
 - outside reader should see `t2` as the latest producer frontier
 - because `t1 -> t2` is explicit, `t2` completion is a valid readiness frontier for the final visible state
+- outer tensors may still create implicit same-scope TensorMap edges inside the manual scope; this is an accepted v1 tradeoff and should be called out in the PR description
 
 Potential invalid user pattern:
 
 ```cpp
-PTO_SCOPE(manual_dep=1) {
+PTO2_SCOPE(true) {
     t1 writes outer C
     t2 also writes outer C
     // missing add_dependency(t1, t2)
@@ -352,6 +863,7 @@ This is a strict requirement:
 
 - outer read boundary dependency is forced by TensorMap/owner metadata
 - orchestration code inside the manual scope must not be required to recreate that outer dependency manually
+- even though the consumer task itself is only batch-published to the scheduler at manual `scope_end`, its fanin accounting must include the external TensorMap-derived dependency before publication
 
 ## Nesting Rules
 
@@ -363,11 +875,14 @@ Supported:
 Not supported in v1:
 
 - manual scope contains manual scope
+- manual scope contains any nested scope with its own publish boundary
 
 Reason:
 
-- the same-scope vs cross-scope rule is already relative to the current manual frame
-- nested manual scopes add little value and complicate classification and diagnostics
+- current ring selection depends on scope depth
+- the top scope frame is also the publication and lifetime-release boundary
+- allowing a child scope inside `PTO2_SCOPE(true)` would split one manual region across multiple scope/ring boundaries unless extra machinery is added
+- rejecting nested scopes inside manual mode keeps `current_manual_scope_owns(...)` a simple membership check over one manual frame
 
 Recommendation:
 
@@ -376,18 +891,35 @@ Recommendation:
 
 Required error text quality:
 
+- the message must explicitly say that nested scope inside `PTO2_SCOPE(true)` is not supported in v1
 - the message must explicitly say that `manual scope inside manual scope is not supported`
-- the message must identify the offending operation as nested `PTO_SCOPE(manual_dep=1)`
+- the message must identify the offending operation as nested `PTO2_SCOPE(true)`
 - the message must not use vague wording such as only `invalid scope state`
+
+## Blocking Cross-Layer Tensor Access
+
+`get_tensor_data` and `set_tensor_data` are blocking cross-layer access APIs. Their current contract assumes producer state is already published through TensorMap/owner metadata.
+
+That assumption does not hold inside manual scope because tasks remain unpublished until manual `scope_end`.
+
+So v1 should fail fast:
+
+- `get_tensor_data` inside `PTO2_SCOPE(true)` is an error
+- `set_tensor_data` inside `PTO2_SCOPE(true)` is an error
+
+Required error text quality:
+
+- the message must explicitly say that blocking tensor data access is not supported inside `PTO2_SCOPE(true)`
+- the message should tell the user to exit the manual scope first
 
 ## Diagnostics
 
 The runtime should detect and report:
 
-1. nested manual scope not supported, with an explicit error message
+1. nested scope inside manual mode not supported, with an explicit error message
 2. `add_dependency` used with invalid task ids
 3. dependency overflow from explicit wiring
-4. obvious cross-scope/manual mismatch where possible
+4. `get_tensor_data` or `set_tensor_data` called inside manual scope
 
 Nice-to-have diagnostics:
 
@@ -415,11 +947,12 @@ Add focused coverage before broad workload migration.
 4. Manual scope writes outer tensor multiple times
 - latest writer becomes TensorMap frontier
 - correctness depends on explicit same-scope edge wiring
+- accepted implicit TensorMap edges on outer tensors are documented
 
 5. Normal scope containing manual scope
 - outer to inner and inner to outer boundary cases both work
 
-6. Nested manual scope
+6. Nested scope inside manual mode
 - rejected with deterministic error
 
 ### Example-level migration
@@ -437,36 +970,44 @@ Only then move to more complex orchestration such as paged attention.
 - This breaks cross-scope correctness.
 
 2. Using `Tensor::manual_dep` as the only signal.
-- Scope semantics are relational and need owner scope identity.
+- Scoped semantics should be driven by current manual-scope ownership, not by the tensor flag alone.
 
 3. Failing to force outer-scope reads through TensorMap/owner dependency seeding.
 - This allows manual-scope tasks to read before the outer producer frontier is ready.
 
-4. Letting cross-scope writes publish only at `scope_end`.
-- This delays readiness incorrectly.
+4. Confusing scheduler batch publication with tensor readiness semantics.
+- Manual-scope tasks should be scheduler-visible at `scope_end`, but external tensor readiness is still producer completion.
 
-5. Accidentally preserving creator retention for same-scope tensors in manual mode.
-- This reintroduces hidden dependencies and weakens the mental model.
+5. Letting cross-scope writer frontier become visible only after producer completion.
+- This is too late for later outside submissions made after manual `scope_end`.
 
-6. Missing alias/view inheritance of scope ownership.
+6. Realizing manual edges incrementally before `scope_end`.
+- This can race with already-live external producers and partially built fanin state.
+
+7. Missing alias/view inheritance of scope ownership.
 - This causes wrong same-scope vs cross-scope classification.
 
-7. Turning this feature into a broad runtime refactor.
+8. Turning this feature into a broad runtime refactor.
 - This increases regression risk and violates the required change scope.
+
+9. Allowing blocking cross-layer tensor access inside manual scope.
+- `get_tensor_data` and `set_tensor_data` assume published producer state and should fail fast in manual scope.
+
+10. Replacing the existing scheduler edge machinery with a separate manual execution path.
+- This would duplicate fanin/fanout handling, completion notification, and release traversal.
+- The design requires one unified post-publish scheduler mechanism.
 
 ## Recommended Implementation Order
 
 1. Add API surface for `add_dependency` and manual scope mode.
-2. Add scope-frame mode and `scope_id`.
-3. Add tensor ownership metadata needed for classification.
-4. Implement explicit edge wiring in tensormap runtime.
-5. Refactor submit-time dependency logic to branch on:
-   - current scope mode
-   - tensor owner task id
-   - producer task scope provenance
-6. Add fail-fast nested-manual-scope check.
-7. Add targeted tests for boundary semantics.
-8. Migrate one example and validate.
+2. Add manual-submit APIs with `_manual` suffix returning task ids plus outputs.
+3. Add scope-frame mode plus scope-local manual-edge storage.
+4. Implement deferred explicit edge realization at manual `scope_end`.
+5. Implement manual-local tensor classification from `owner_task_id` plus current manual-scope ownership.
+6. Realize outer-tensor TensorMap lookup/insert during manual `scope_end`.
+7. Add fail-fast nested-scope-in-manual check and block `get_tensor_data` / `set_tensor_data` in manual scope.
+8. Add targeted tests for boundary semantics.
+9. Migrate one example and validate.
 
 ## Open Question Resolved
 
@@ -475,7 +1016,7 @@ This design intentionally resolves the central ambiguity:
 - `scope_end` controls lifetime release
 - task completion controls semantic readiness
 
-For outer tensors written inside manual scope, TensorMap publication must stay aligned with task completion frontier, not with scope closure.
+For outer tensors written inside manual scope, TensorMap frontier publication happens at manual `scope_end`, while semantic readiness is still producer-task completion.
 
 ## File Areas Expected To Change
 
@@ -483,17 +1024,18 @@ For outer tensors written inside manual scope, TensorMap publication must stay a
 - `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2.h`
 - `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2.cpp`
 - `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp`
-- `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/tensor.h`
 - `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2_types.h`
+- `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_scheduler.h`
 - docs and examples/tests needed to demonstrate the new scoped behavior
 
 ## Recommendation Summary
 
 Implement manual dependency as a scope-local override inside `tensormap_and_ringbuffer`, not as a runtime-wide replacement of TensorMap:
 
-- same manual scope: explicit `add_dependency`
-- crossing the manual scope boundary: TensorMap
-- write visibility: writer completion
+- tensors created in the current manual scope: explicit `add_dependency`
+- outer tensors: existing TensorMap path
+- TensorMap boundary realization for manual scopes: manual `scope_end`
+- semantic readiness of outer writes: writer completion
 - lifetime release: `scope_end`
 
 That is the smallest design that satisfies the requested model without breaking the core tensormap runtime semantics.
