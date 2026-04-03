@@ -45,13 +45,37 @@ static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
     return pto2_alloc_tensors(&rt->orchestrator, args);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrator); }
+PTO2ManualSubmitResult pto2_rt_submit_task_manual(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
+    return pto2_submit_mixed_task_manual(&rt->orchestrator, mixed_kernels, args);
+}
+
+void pto2_rt_add_dependency(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer) {
+    pto2_add_dependency(&rt->orchestrator, producer, consumer);
+}
+
+void pto2_rt_scope_begin(PTO2Runtime *rt, PTO2ScopeMode mode) {
+    pto2_scope_begin(&rt->orchestrator, mode);
+}
 
 void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
 
 void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrator); }
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
+
+static bool in_manual_scope_runtime(PTO2Runtime *rt) {
+    return rt->orchestrator.manual_scope_active;
+}
+
+static void fail_manual_tensor_access(PTO2Runtime *rt, const char *caller) {
+    PTO2OrchestratorState &orch = rt->orchestrator;
+    orch.sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+    orch.fatal = true;
+    unified_log_error(
+        caller,
+        "blocking tensor data access is not supported inside PTO2_SCOPE(PTO2ScopeMode::MANUAL); exit the manual scope first"
+    );
+}
 
 // Wait for all producers of this tensor to be safe for data access.
 // Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
@@ -137,6 +161,10 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
 MAYBE_UNINITIALIZED_END
 
 uint64_t pto2_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
+    if (in_manual_scope_runtime(rt)) {
+        fail_manual_tensor_access(rt, __FUNCTION__);
+        return 0;
+    }
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "get_tensor_data: buffer not allocated (addr=0). "
@@ -160,6 +188,10 @@ uint64_t pto2_get_tensor_data(PTO2Runtime *rt, const Tensor &tensor, uint32_t nd
 void pto2_set_tensor_data(
     PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
 ) {
+    if (in_manual_scope_runtime(rt)) {
+        fail_manual_tensor_access(rt, __FUNCTION__);
+        return;
+    }
     if (tensor.buffer.addr == 0) {
         unified_log_error(
             __FUNCTION__, "set_tensor_data: buffer not allocated (addr=0). "
@@ -181,6 +213,8 @@ void pto2_set_tensor_data(
 
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
+    .submit_task_manual = pto2_rt_submit_task_manual,
+    .add_dependency = pto2_rt_add_dependency,
     .scope_begin = pto2_rt_scope_begin,
     .scope_end = pto2_rt_scope_end,
     .orchestration_done = pto2_rt_orchestration_done,

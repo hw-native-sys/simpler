@@ -32,7 +32,7 @@ clang-format -i <file>
 
 ## Important Rules
 
-1. **Consult `.claude/rules/` for coding conventions** (architecture, codestyle, terminology) — these are always-loaded guidelines. **Consult `.claude/skills/` for task-specific workflows** (e.g., `git-commit/` when committing, `testing/` when running tests)
+1. **Consult `.agents/rules/` for coding conventions** (architecture, codestyle, terminology) — these are always-loaded guidelines. **Consult `.agents/skills/` for task-specific workflows** (e.g., `git-commit/` when committing, `testing/` when running tests)
 2. **Do not modify directories outside your assigned area** unless the user explicitly requests it
 3. Create new subdirectories under your assigned directory as needed
 4. When in doubt, ask the user before making changes to other areas

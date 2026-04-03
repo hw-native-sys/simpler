@@ -34,6 +34,7 @@
 #include <type_traits>
 
 // Type headers needed by orchestration
+#include "pto_task_id.h"       // PTO2TaskId  // NOLINT(build/include_subdir)
 #include "pto_submit_types.h"  // MixedKernels, INVALID_KERNEL_ID, subtask slots  // NOLINT(build/include_subdir)
 #include "pto_types.h"         // Arg, TaskOutputTensors, TensorArgType  // NOLINT(build/include_subdir)
 #include "task_args.h"         // ChipStorageTaskArgs, ContinuousTensor  // NOLINT(build/include_subdir)
@@ -84,6 +85,16 @@ inline Tensor from_tensor_arg(const ContinuousTensor &t, bool manual_dep = false
 // Ops Table and Opaque Runtime
 // =============================================================================
 
+enum class PTO2ScopeMode : uint8_t {
+    AUTO = 0,
+    MANUAL = 1,
+};
+
+struct PTO2ManualSubmitResult {
+    PTO2TaskId task_id;
+    TaskOutputTensors outputs;
+};
+
 /**
  * Forward declaration — the orchestration sees PTO2Runtime as a partial
  * struct whose first field is the ops pointer.  The full definition
@@ -115,7 +126,9 @@ void pto2_framework_bind_runtime(PTO2Runtime *rt);
  */
 typedef struct PTO2RuntimeOps {
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
-    void (*scope_begin)(PTO2Runtime *rt);
+    PTO2ManualSubmitResult (*submit_task_manual)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    void (*add_dependency)(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer);
+    void (*scope_begin)(PTO2Runtime *rt, PTO2ScopeMode mode);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
     bool (*is_fatal)(PTO2Runtime *rt);
@@ -179,10 +192,14 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
     always_assert(!args.has_error && "alloc_tensors failed to construct output-only Arg");
     return alloc_tensors(args);
 }
-
 static inline TaskOutputTensors pto2_rt_submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
     PTO2Runtime *rt = pto2_current_runtime();
     return rt->ops->submit_task(rt, mixed_kernels, args);
+}
+
+static inline PTO2ManualSubmitResult pto2_rt_submit_task_manual(const MixedKernels &mixed_kernels, const Arg &args) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    return rt->ops->submit_task_manual(rt, mixed_kernels, args);
 }
 
 /**
@@ -205,9 +222,28 @@ static inline TaskOutputTensors pto2_rt_submit_aiv_task(int32_t kernel_id, const
     return rt->ops->submit_task(rt, mk, args);
 }
 
-static inline void pto2_rt_scope_begin() {
+static inline PTO2ManualSubmitResult pto2_rt_submit_aic_task_manual(int32_t kernel_id, const Arg &args) {
     PTO2Runtime *rt = pto2_current_runtime();
-    rt->ops->scope_begin(rt);
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    return rt->ops->submit_task_manual(rt, mk, args);
+}
+
+static inline PTO2ManualSubmitResult pto2_rt_submit_aiv_task_manual(int32_t kernel_id, const Arg &args) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    return rt->ops->submit_task_manual(rt, mk, args);
+}
+
+static inline void pto2_rt_add_dependency(PTO2TaskId producer, PTO2TaskId consumer) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    rt->ops->add_dependency(rt, producer, consumer);
+}
+
+static inline void pto2_rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    rt->ops->scope_begin(rt, mode);
 }
 
 static inline void pto2_rt_scope_end() {
@@ -300,9 +336,9 @@ static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const u
  */
 class PTO2ScopeGuard {
 public:  // NOLINT(whitespace/indent)
-    PTO2ScopeGuard() :
+    explicit PTO2ScopeGuard(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) :
         rt_(pto2_current_runtime()) {
-        rt_->ops->scope_begin(rt_);
+        rt_->ops->scope_begin(rt_, mode);
     }
     ~PTO2ScopeGuard() { rt_->ops->scope_end(rt_); }
 
@@ -313,7 +349,8 @@ private:  // NOLINT(whitespace/indent)
 #define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
 
-#define PTO2_SCOPE_GUARD() [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)
+#define PTO2_SCOPE_GUARD(...) \
+    [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__) { __VA_ARGS__ }
 
 /**
  * Scoped block macro:
@@ -321,7 +358,7 @@ private:  // NOLINT(whitespace/indent)
  *       pto2_rt_submit_task(...);
  *   }
  */
-#define PTO2_SCOPE() if (PTO2_SCOPE_GUARD(); true)
+#define PTO2_SCOPE(...) if (PTO2_SCOPE_GUARD(__VA_ARGS__); true)
 
 // =============================================================================
 // Orchestration Config

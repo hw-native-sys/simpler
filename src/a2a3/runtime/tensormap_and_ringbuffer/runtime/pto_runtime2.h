@@ -67,7 +67,9 @@ typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
-    void (*scope_begin)(PTO2Runtime *rt);
+    PTO2ManualSubmitResult (*submit_task_manual)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    void (*add_dependency)(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer);
+    void (*scope_begin)(PTO2Runtime *rt, PTO2ScopeMode mode);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
     bool (*is_fatal)(PTO2Runtime *rt);
@@ -176,7 +178,7 @@ void pto2_runtime_set_mode(PTO2Runtime *rt, PTO2RuntimeMode mode);
  * bounded by the scope. When scope_end() is called, the scope
  * releases its reference to all enclosed tasks.
  */
-void pto2_rt_scope_begin(PTO2Runtime *rt);
+void pto2_rt_scope_begin(PTO2Runtime *rt, PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
 
 /**
  * End current scope
@@ -185,6 +187,10 @@ void pto2_rt_scope_begin(PTO2Runtime *rt);
  * Tasks whose refcount reaches zero will have their buffers released.
  */
 void pto2_rt_scope_end(PTO2Runtime *rt);
+
+PTO2ManualSubmitResult pto2_rt_submit_task_manual(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+
+void pto2_rt_add_dependency(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer);
 
 /**
  * Mark orchestration as complete
