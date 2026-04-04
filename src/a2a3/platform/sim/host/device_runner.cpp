@@ -167,6 +167,19 @@ int DeviceRunner::ensure_binaries_loaded(
             return -1;
         }
         LOG_INFO("DeviceRunner(sim): Loaded aicore_execute_wrapper from %s", aicore_so_path_.c_str());
+
+        // Pass sim context function pointers to the AICore SO so it doesn't
+        // need dlsym(RTLD_DEFAULT) — which fails when the host runtime SO
+        // is loaded with RTLD_LOCAL.
+        auto set_helpers =
+            reinterpret_cast<void (*)(void *, void *, void *)>(dlsym(aicore_so_handle_, "set_sim_context_helpers"));
+        if (set_helpers != nullptr) {
+            set_helpers(
+                reinterpret_cast<void *>(pto_cpu_sim_set_execution_context),
+                reinterpret_cast<void *>(pto_cpu_sim_set_task_cookie),
+                reinterpret_cast<void *>(platform_get_cpu_sim_task_cookie)
+            );
+        }
     }
 
     return 0;

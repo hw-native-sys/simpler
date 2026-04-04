@@ -186,31 +186,34 @@ inline uint32_t get_physical_core_id() { return g_sim_physical_core_id; }
 // =============================================================================
 // CPU Simulation Context Hooks
 // =============================================================================
+//
+// These functions bridge the AICore kernel SO → host runtime SO gap.
+// The host runtime's DeviceRunner calls set_sim_context_helpers() after
+// dlopen to pass function pointers, avoiding dlsym(RTLD_DEFAULT) which
+// fails when the host SO is loaded with RTLD_LOCAL.
 
-// CPU_SIM_SET_EXECUTION_CONTEXT — set block/subblock context for CANN intrinsic emulation.
-// Resolves pto_cpu_sim_set_execution_context (defined in cpu_sim_context.cpp) via dlsym.
+// Function pointer storage — set by set_sim_context_helpers(), used by macros below.
+using SimSetExecCtxFn = void (*)(uint32_t, uint32_t, uint32_t);
+using SimSetTaskCookieFn = void (*)(uint64_t);
+using SimGetTaskCookieFn = uint64_t (*)(uint32_t, uint32_t);
+
+extern SimSetExecCtxFn g_sim_set_exec_ctx_fn;
+extern SimSetTaskCookieFn g_sim_set_task_cookie_fn;
+extern SimGetTaskCookieFn g_sim_get_task_cookie_fn;
+
 inline void cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim) {
-    using Fn = void (*)(uint32_t, uint32_t, uint32_t);
-    static auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "pto_cpu_sim_set_execution_context"));
-    if (fn != nullptr) fn(block_idx, subblock_id, subblock_dim);
+    if (g_sim_set_exec_ctx_fn != nullptr) g_sim_set_exec_ctx_fn(block_idx, subblock_id, subblock_dim);
 }
 #define CPU_SIM_SET_EXECUTION_CONTEXT(block_idx, subblock_id, subblock_dim) \
     cpu_sim_set_execution_context(block_idx, subblock_id, subblock_dim)
 
-// CPU_SIM_SET_TASK_COOKIE — set task cookie for simulation tracing.
-// Resolves pto_cpu_sim_set_task_cookie (defined in cpu_sim_context.cpp) via dlsym.
 inline void cpu_sim_set_task_cookie(uint64_t cookie) {
-    using Fn = void (*)(uint64_t);
-    static auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "pto_cpu_sim_set_task_cookie"));
-    if (fn != nullptr) fn(cookie);
+    if (g_sim_set_task_cookie_fn != nullptr) g_sim_set_task_cookie_fn(cookie);
 }
 #define CPU_SIM_SET_TASK_COOKIE(cookie) cpu_sim_set_task_cookie(cookie)
 
-// platform_get_cpu_sim_task_cookie — resolve per-dispatch logical task identity.
 inline uint64_t platform_get_cpu_sim_task_cookie(uint32_t core_id, uint32_t reg_task_id) {
-    using Fn = uint64_t (*)(uint32_t, uint32_t);
-    static auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "platform_get_cpu_sim_task_cookie"));
-    return (fn != nullptr) ? fn(core_id, reg_task_id) : 0;
+    return (g_sim_get_task_cookie_fn != nullptr) ? g_sim_get_task_cookie_fn(core_id, reg_task_id) : 0;
 }
 
 #endif  // PLATFORM_A2A3SIM_AICORE_INNER_KERNEL_H_

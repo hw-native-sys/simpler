@@ -16,6 +16,7 @@
  */
 
 #include <cstdint>
+#include "inner_kernel.h"  // NOLINT(build/include_subdir)
 #include "aicore/aicore.h"
 #include "common/core_type.h"
 #include "common/platform_config.h"
@@ -26,6 +27,17 @@ thread_local volatile uint8_t *g_sim_reg_base = nullptr;
 
 // Thread-local simulated physical core ID (declared in inner_kernel.h)
 thread_local uint32_t g_sim_physical_core_id = 0;
+
+// Sim context function pointers — set by DeviceRunner after dlopen.
+SimSetExecCtxFn g_sim_set_exec_ctx_fn = nullptr;
+SimSetTaskCookieFn g_sim_set_task_cookie_fn = nullptr;
+SimGetTaskCookieFn g_sim_get_task_cookie_fn = nullptr;
+
+extern "C" void set_sim_context_helpers(void *set_exec_ctx, void *set_task_cookie, void *get_task_cookie) {
+    g_sim_set_exec_ctx_fn = reinterpret_cast<SimSetExecCtxFn>(set_exec_ctx);
+    g_sim_set_task_cookie_fn = reinterpret_cast<SimSetTaskCookieFn>(set_task_cookie);
+    g_sim_get_task_cookie_fn = reinterpret_cast<SimGetTaskCookieFn>(get_task_cookie);
+}
 
 // Declare the original function (defined in aicore_executor.cpp with weak linkage)
 void aicore_execute(__gm__ Runtime *runtime, int block_idx, CoreType core_type);
