@@ -969,6 +969,85 @@ Use a small example first, such as vector-style or BGEMM-style, to validate:
 
 Only then move to more complex orchestration such as paged attention.
 
+## Fresh Hardware Benchmark
+
+Fresh benchmark data was rerun on real hardware on 2026-04-06 with:
+
+- platform: `a2a3`
+- device: `2`
+- rounds: `5`
+- pinned PTO-ISA commit: `6622890`
+- runner: `tools/benchmark_rounds.sh`
+
+The four compared variants are:
+
+- `aicpu_build_graph`
+- `tensormap_and_ringbuffer_unmodified`
+- `tensormap_and_ringbuffer`
+- `tensormap_and_ringbuffer_partial_manual`
+
+`tensormap_and_ringbuffer` is the current/new AUTO-path runtime under evaluation.
+`tensormap_and_ringbuffer_partial_manual` is the same runtime tree, but benchmarked
+through the `_partial_manual` paged-attention scenes.
+
+### Benchmark Script Selectors
+
+The benchmark wrapper enables the variants as follows:
+
+- `./tools/benchmark_rounds.sh -r tensormap_and_ringbuffer`
+  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention`
+  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll`
+- `./tools/benchmark_rounds.sh -r tensormap_and_ringbuffer_unmodified`
+  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer_unmodified/paged_attention`
+  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer_unmodified/paged_attention_unroll`
+- `./tools/benchmark_rounds.sh -r tensormap_and_ringbuffer_partial_manual`
+  - uses the same ST root as `tensormap_and_ringbuffer`
+  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_partial_manual`
+  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll_partial_manual`
+- `./tools/benchmark_rounds.sh -r aicpu_build_graph`
+  - benchmarks `tests/st/a2a3/aicpu_build_graph/paged_attention`
+  - benchmarks `tests/st/a2a3/aicpu_build_graph/paged_attention_unroll`
+
+That means the current/new AUTO runtime is already selected directly by `-r
+tensormap_and_ringbuffer`, while the manual-mode comparison is selected by `-r
+tensormap_and_ringbuffer_partial_manual`.
+
+### Fresh Results
+
+Units below are `elapsed_us (orch_us)`.
+
+| Workload | Case | `aicpu_build_graph` | `tensormap_and_ringbuffer_unmodified` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
+| --- | --- | --- | --- | --- | --- |
+| `paged_attention` | `Case1` | `31129.9 (-)` | `35789.6 (35788.6)` | `36643.8 (36643.0)` | `41611.6 (41605.3)` |
+| `paged_attention` | `Case2` | `16348.7 (-)` | `18884.1 (18883.4)` | `18873.5 (18872.6)` | `21047.6 (20983.7)` |
+| `paged_attention_unroll` | `Case1` | `1431.7 (-)` | `1320.5 (827.5)` | `1317.2 (833.3)` | `1329.8 (946.2)` |
+| `paged_attention_unroll` | `Case2` | `716.7 (-)` | `630.5 (375.9)` | `633.5 (371.4)` | `649.1 (429.3)` |
+
+### Benchmark Takeaways
+
+1. The current/new AUTO-path runtime is close to the unmodified runtime on three of
+   the four fresh cells.
+   - `paged_attention/Case2`: effectively flat
+   - `paged_attention_unroll/Case1`: slightly faster end-to-end, slightly slower in orch
+   - `paged_attention_unroll/Case2`: slightly slower end-to-end, slightly faster in orch
+
+2. The remaining AUTO-path gap is the heavy `paged_attention/Case1` cell.
+   - unmodified: `35789.6 us`
+   - current/new: `36643.8 us`
+   - regression: about `+2.4%`
+
+3. Partial-manual mode is still materially slower on the heavy paged-attention scene.
+   - `paged_attention/Case1`: about `+16.3%` vs unmodified
+   - `paged_attention/Case2`: about `+11.5%` vs unmodified
+
+4. Partial-manual mode also adds visible orch cost on the unroll scene even when
+   elapsed stays close.
+   - `paged_attention_unroll/Case1`: `946.2 us` orch vs `827.5 us` unmodified
+   - `paged_attention_unroll/Case2`: `429.3 us` orch vs `375.9 us` unmodified
+
+5. `aicpu_build_graph` remains fastest on the heavy `paged_attention` scene, but it is
+   slower than the tensormap runtimes on both `paged_attention_unroll` cells.
+
 ## Main Risks
 
 1. Treating manual scope as a global TensorMap disable switch.

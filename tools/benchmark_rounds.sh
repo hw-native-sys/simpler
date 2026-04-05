@@ -49,6 +49,16 @@ TMR_UNMODIFIED_EXAMPLE_ORDER=(
     paged_attention_unroll
 )
 
+# --- tensormap_and_ringbuffer_partial_manual ---
+declare -A TMR_PARTIAL_MANUAL_EXAMPLE_CASES=(
+    [paged_attention_partial_manual]="Case1,Case2"
+    [paged_attention_unroll_partial_manual]="Case1,Case2"
+)
+TMR_PARTIAL_MANUAL_EXAMPLE_ORDER=(
+    paged_attention_partial_manual
+    paged_attention_unroll_partial_manual
+)
+
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
@@ -97,7 +107,10 @@ Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 100)
-  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), tensormap_and_ringbuffer_unmodified, aicpu_build_graph
+  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default),
+                 tensormap_and_ringbuffer_unmodified,
+                 tensormap_and_ringbuffer_partial_manual,
+                 aicpu_build_graph
   -e, --examples Comma-separated example names to run (default: runtime-specific full list)
   -v, --verbose  Save detailed run_example.py output to a timestamped log file
   -h, --help     Show this help
@@ -138,7 +151,7 @@ vlog() {
 # ---------------------------------------------------------------------------
 # Derive arch from platform and set examples directory
 # ---------------------------------------------------------------------------
-EXAMPLES_DIR="$PROJECT_ROOT/tests/st/${PLATFORM}/${RUNTIME}"
+TESTS_RUNTIME_DIR="$RUNTIME"
 
 # Clock frequency (MHz) for converting cycle counts to microseconds
 case "$PLATFORM" in
@@ -157,15 +170,22 @@ case "$RUNTIME" in
         declare -n EXAMPLE_CASES=TMR_UNMODIFIED_EXAMPLE_CASES
         EXAMPLE_ORDER=("${TMR_UNMODIFIED_EXAMPLE_ORDER[@]}")
         ;;
+    tensormap_and_ringbuffer_partial_manual)
+        TESTS_RUNTIME_DIR="tensormap_and_ringbuffer"
+        declare -n EXAMPLE_CASES=TMR_PARTIAL_MANUAL_EXAMPLE_CASES
+        EXAMPLE_ORDER=("${TMR_PARTIAL_MANUAL_EXAMPLE_ORDER[@]}")
+        ;;
     aicpu_build_graph)
         declare -n EXAMPLE_CASES=ABG_EXAMPLE_CASES
         EXAMPLE_ORDER=("${ABG_EXAMPLE_ORDER[@]}")
         ;;
     *)
-        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer, tensormap_and_ringbuffer_unmodified, or aicpu_build_graph."
+        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer, tensormap_and_ringbuffer_unmodified, tensormap_and_ringbuffer_partial_manual, or aicpu_build_graph."
         exit 1
         ;;
 esac
+
+EXAMPLES_DIR="$PROJECT_ROOT/tests/st/${PLATFORM}/${TESTS_RUNTIME_DIR}"
 
 if [[ -n "$EXAMPLE_FILTER" ]]; then
     IFS=',' read -ra REQUESTED_EXAMPLES <<< "$EXAMPLE_FILTER"
