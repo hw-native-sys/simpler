@@ -20,7 +20,7 @@
 #define FUNC_ONLINE_UPDATE 3
 #define FUNC_AIC_HUB 4
 #define FUNC_AIV_HUB 5
-#define N_MANUAL_CHUNK 2
+#define N_MANUAL_CHUNK 4
 
 extern "C" {
 
@@ -105,8 +105,6 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     uint64_t bn_end = std::min(bn + static_cast<uint64_t>(N_MANUAL_CHUNK), bn_this_batch);
 
                     PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
-                        PTO2TaskId prev_update_task = PTO2TaskId::invalid();
-
                         for (uint64_t bn_local = bn; bn_local < bn_end; bn_local++) {
                             uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn_local];
                             uint64_t valid_len = std::min(block_size, cur_seq - bn_local * block_size);
@@ -170,10 +168,6 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                             pto2_rt_add_dependency(sf_outs.task_id, pv_outs.task_id);
                             pto2_rt_add_dependency(sf_outs.task_id, up_outs.task_id);
                             pto2_rt_add_dependency(pv_outs.task_id, up_outs.task_id);
-                            if (prev_update_task.is_valid()) {
-                                pto2_rt_add_dependency(prev_update_task, up_outs.task_id);
-                            }
-                            prev_update_task = up_outs.task_id;
                         }
                     }
                 }
