@@ -77,18 +77,9 @@ struct PTO2OrchestratorState {
     int32_t scope_tasks_size;         // Number of task IDs currently in the buffer
     int32_t scope_tasks_capacity;     // Allocated capacity of scope_tasks
     int32_t *scope_begins;            // scope_begins[i] = start index of scope i in scope_tasks
-    PTO2ScopeMode *scope_modes;        // Mode for each scope frame
-    int32_t *manual_task_meta_begins;  // start index in manual_task_meta for each scope
-    int32_t *manual_edge_begins;       // start index in manual_edges for each scope
     int32_t scope_stack_top;           // Current top of stack (-1 = no scope open)
     uint64_t scope_stack_capacity;     // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
     bool manual_scope_active{false};
-    PTO2ManualTaskMeta *manual_task_meta;
-    int32_t manual_task_meta_size;
-    int32_t manual_task_meta_capacity;
-    PTO2ManualEdge *manual_edges;
-    int32_t manual_edges_size;
-    int32_t manual_edges_capacity;
 
     // === SCHEDULER REFERENCE ===
     // Note: In simulated mode, orchestrator and scheduler share address space
@@ -111,6 +102,16 @@ struct PTO2OrchestratorState {
     // Fatal error flag (single-thread access by orchestrator, no atomic needed)
     // Cross-thread notification uses shared memory orch_error_code (atomic)
     bool fatal;
+
+    // === MANUAL-SCOPE METADATA ===
+    int32_t *manual_task_meta_begins;  // start index in manual_task_meta for each scope
+    int32_t *manual_edge_begins;       // start index in manual_edges for each scope
+    PTO2ManualTaskMeta *manual_task_meta;
+    int32_t manual_task_meta_size;
+    int32_t manual_task_meta_capacity;
+    PTO2ManualEdge *manual_edges;
+    int32_t manual_edges_size;
+    int32_t manual_edges_capacity;
 
     // Hidden alloc tasks complete synchronously inside the orchestrator and
     // therefore bypass the executor's normal worker-completion counter path.
