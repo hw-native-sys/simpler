@@ -23,21 +23,35 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 declare -A TMR_EXAMPLE_CASES=(
     [alternating_matmul_add]=""
     [benchmark_bgemm]=""
+    [paged_attention]="Case1,Case2"
     [paged_attention_unroll]="Case1,Case2"
     [batch_paged_attention]=""
 )
 TMR_EXAMPLE_ORDER=(
     alternating_matmul_add
     benchmark_bgemm
+    paged_attention
     paged_attention_unroll
     batch_paged_attention
 )
 
 # --- aicpu_build_graph ---
 declare -A ABG_EXAMPLE_CASES=(
+    [paged_attention]="Case1,Case2"
     [paged_attention_unroll]="Case1,Case2"
 )
 ABG_EXAMPLE_ORDER=(
+    paged_attention
+    paged_attention_unroll
+)
+
+# --- tensormap_and_ringbuffer_unmodified ---
+declare -A TMR_UNMODIFIED_EXAMPLE_CASES=(
+    [paged_attention]="Case1,Case2"
+    [paged_attention_unroll]="Case1,Case2"
+)
+TMR_UNMODIFIED_EXAMPLE_ORDER=(
+    paged_attention
     paged_attention_unroll
 )
 
@@ -84,7 +98,7 @@ Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 100)
-  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), aicpu_build_graph
+  -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), tensormap_and_ringbuffer_unmodified, aicpu_build_graph
   -v, --verbose  Save detailed run_example.py output to a timestamped log file
   -h, --help     Show this help
 
@@ -139,12 +153,16 @@ case "$RUNTIME" in
         declare -n EXAMPLE_CASES=TMR_EXAMPLE_CASES
         EXAMPLE_ORDER=("${TMR_EXAMPLE_ORDER[@]}")
         ;;
+    tensormap_and_ringbuffer_unmodified)
+        declare -n EXAMPLE_CASES=TMR_UNMODIFIED_EXAMPLE_CASES
+        EXAMPLE_ORDER=("${TMR_UNMODIFIED_EXAMPLE_ORDER[@]}")
+        ;;
     aicpu_build_graph)
         declare -n EXAMPLE_CASES=ABG_EXAMPLE_CASES
         EXAMPLE_ORDER=("${ABG_EXAMPLE_ORDER[@]}")
         ;;
     *)
-        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer or aicpu_build_graph."
+        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer, tensormap_and_ringbuffer_unmodified, or aicpu_build_graph."
         exit 1
         ;;
 esac
