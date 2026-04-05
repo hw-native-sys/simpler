@@ -664,6 +664,33 @@ struct PTO2SchedulerState {
         }
     }
 
+    void publish_manual_scope_tasks_and_end_scope(PTO2TaskSlotState **task_slot_states, int32_t count) {
+#if PTO2_ORCH_PROFILING
+        extern uint64_t g_orch_scope_end_atomic_count;
+#endif
+        if (count > 0) __builtin_prefetch(task_slot_states[0], 1, 0);
+        for (int32_t i = 0; i < count; i++) {
+            if (i + 1 < count) __builtin_prefetch(task_slot_states[i + 1], 1, 0);
+            PTO2TaskSlotState &slot_state = *task_slot_states[i];
+            int32_t new_rc = slot_state.fanin_refcount.fetch_add(1, std::memory_order_acq_rel) + 1;
+#if PTO2_ORCH_PROFILING
+            g_orch_scope_end_atomic_count += 1;  // fanin_refcount.fetch_add
+#endif
+            if (new_rc >= slot_state.fanin_count) {
+                PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state.active_mask);
+#if PTO2_ORCH_PROFILING
+                g_orch_scope_end_atomic_count += 1;  // ready queue push lock/CAS path
+#endif
+                ready_queues[static_cast<int32_t>(shape)].push(&slot_state);
+            }
+#if PTO2_ORCH_PROFILING
+            release_producer(slot_state, g_orch_scope_end_atomic_count);
+#else
+            release_producer(slot_state);
+#endif
+        }
+    }
+
     /**
      * Subtask completion: atomic counter model.
      * Called when a single subtask (AIC, AIV0, or AIV1) finishes on any block.

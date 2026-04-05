@@ -45,6 +45,7 @@ struct PTO2ManualTaskMeta {
     int32_t scope_task_index;
     int32_t incoming_edge_head;
     uint8_t tensor_count;
+    uint16_t manual_local_mask;
     uint8_t tags[MAX_TENSOR_ARGS];
 };
 
