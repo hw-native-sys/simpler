@@ -50,9 +50,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
             break;
         case 4:
             PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
-                Arg args;
-                PTO2ManualSubmitResult submit_result = pto2_rt_submit_aiv_task_manual(FUNC_NOOP, args);
-                pto2_rt_add_dependency(submit_result.task_id, submit_result.task_id);
+                PTO2TaskId invalid = PTO2TaskId::invalid();
+                pto2_rt_add_dependency(invalid, invalid);
             }
             break;
         default:

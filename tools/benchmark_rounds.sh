@@ -21,18 +21,12 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 
 # --- tensormap_and_ringbuffer ---
 declare -A TMR_EXAMPLE_CASES=(
-    [alternating_matmul_add]=""
-    [benchmark_bgemm]=""
     [paged_attention]="Case1,Case2"
     [paged_attention_unroll]="Case1,Case2"
-    [batch_paged_attention]=""
 )
 TMR_EXAMPLE_ORDER=(
-    alternating_matmul_add
-    benchmark_bgemm
     paged_attention
     paged_attention_unroll
-    batch_paged_attention
 )
 
 # --- aicpu_build_graph ---
@@ -63,6 +57,7 @@ ROUNDS=100
 PLATFORM=a2a3
 RUNTIME=tensormap_and_ringbuffer
 VERBOSE=0
+EXAMPLE_FILTER=""
 EXTRA_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -83,6 +78,10 @@ while [[ $# -gt 0 ]]; do
             RUNTIME="$2"
             shift 2
             ;;
+        -e|--examples)
+            EXAMPLE_FILTER="$2"
+            shift 2
+            ;;
         -v|--verbose)
             VERBOSE=1
             shift
@@ -92,13 +91,14 @@ while [[ $# -gt 0 ]]; do
 benchmark_rounds.sh — run all examples and report per-round timing from device logs
 
 Usage:
-  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-v]
+  ./tools/benchmark_rounds.sh [-p <platform>] [-d <device>] [-n <rounds>] [-r <runtime>] [-e <examples>] [-v]
 
 Options:
   -p, --platform Platform to run on (default: a2a3)
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 100)
   -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), tensormap_and_ringbuffer_unmodified, aicpu_build_graph
+  -e, --examples Comma-separated example names to run (default: runtime-specific full list)
   -v, --verbose  Save detailed run_example.py output to a timestamped log file
   -h, --help     Show this help
 
@@ -166,6 +166,20 @@ case "$RUNTIME" in
         exit 1
         ;;
 esac
+
+if [[ -n "$EXAMPLE_FILTER" ]]; then
+    IFS=',' read -ra REQUESTED_EXAMPLES <<< "$EXAMPLE_FILTER"
+    FILTERED_ORDER=()
+    for requested in "${REQUESTED_EXAMPLES[@]}"; do
+        if [[ -n "${EXAMPLE_CASES[$requested]+x}" ]]; then
+            FILTERED_ORDER+=("$requested")
+        else
+            echo "ERROR: example '$requested' is not available for runtime '$RUNTIME'."
+            exit 1
+        fi
+    done
+    EXAMPLE_ORDER=("${FILTERED_ORDER[@]}")
+fi
 
 # ---------------------------------------------------------------------------
 # Resolve device log directory (mirrors run_example.py / device_log_resolver.py)

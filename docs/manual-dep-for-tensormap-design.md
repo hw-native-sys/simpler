@@ -4,7 +4,7 @@
 
 Bring the human-created dependency workflow from `aicpu_build_graph` into `tensormap_and_ringbuffer` in a scoped way:
 
-- `PTO2_SCOPE(true) { ... }`
+- `PTO2_SCOPE(PTO2ScopeMode::MANUAL) { ... }`
 - Tensors crossing scope boundaries use TensorMap semantics
 - Tensors used entirely inside the manual scope use explicit `add_dependency`
 
@@ -50,7 +50,7 @@ The implementation PR must follow these rules:
 
 - Keep the change strictly scoped to manual dependency support in `tensormap_and_ringbuffer`.
 - Do not refactor unrelated runtime behavior while doing this work.
-- Do not change existing normal-scope TensorMap semantics.
+- Do not change existing auto-scope TensorMap semantics.
 - Do not change scope lifetime semantics.
 - Prefer the smallest invasive write set that cleanly supports the feature.
 - Preserve existing examples/tests unless a targeted update is required to cover the new feature.
@@ -168,7 +168,7 @@ Concise conclusion:
 
 If we simply copy `aicpu_build_graph` semantics into `tensormap_and_ringbuffer`, we get a wrong boundary model:
 
-- suppressing TensorMap for all tensors inside `PTO2_SCOPE(true)` is incorrect
+- suppressing TensorMap for all tensors inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` is incorrect
 - delaying publication of an outer tensor until `scope_end` is incorrect
 
 The reason is that cross-scope tensors must become visible at the actual writer frontier. Outside consumers should depend on the task that really produced the latest visible state, not on scope closure.
@@ -182,7 +182,7 @@ So the correct split is:
 
 ## Core rule
 
-`PTO2_SCOPE(true)` means:
+`PTO2_SCOPE(PTO2ScopeMode::MANUAL)` means:
 
 - if a tensor was created inside this manual scope and is reused inside this manual scope, the dependency must be established by explicit `add_dependency`
 - all outer-scope tensors still use existing TensorMap/owner metadata
@@ -199,7 +199,7 @@ The design must distinguish two different kinds of publication:
 
 ### Scheduler publication
 
-For tasks inside `PTO2_SCOPE(true)`:
+For tasks inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`:
 
 - submit builds the internal task records and records explicit dependencies
 - those tasks are not yet published as executable scheduler work
@@ -209,7 +209,7 @@ This is required so all same-scope explicit edges are fully wired before any tas
 
 ### TensorMap boundary publication
 
-For cross-scope tensors touched by tasks inside `PTO2_SCOPE(true)`:
+For cross-scope tensors touched by tasks inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`:
 
 - outside tasks submitted after the manual scope ends must still be able to discover the internal writer frontier
 - therefore the producer frontier for an external tensor written inside the manual scope must become visible to later TensorMap lookups at manual `scope_end`
@@ -280,7 +280,7 @@ Everything else stays on the existing TensorMap path.
 - That boundary frontier becomes visible at manual `scope_end`, so later outside submissions can attach to the correct writer task.
 - Readiness of the written tensor is the completion of that writer task.
 - Multiple writes inside the same manual scope are allowed.
-- TensorMap should continue tracking the latest producer frontier exactly as in normal scope once the manual scope is finalized.
+- TensorMap should continue tracking the latest producer frontier exactly as in auto scope once the manual scope is finalized.
 
 ### 3. Tensor created inside this manual scope and reused only inside this manual scope
 
@@ -316,15 +316,20 @@ Add explicit edge wiring to `tensormap_and_ringbuffer` orchestration API:
 void pto2_rt_add_dependency(PTO2TaskId producer, PTO2TaskId consumer);
 ```
 
-Extend scope syntax to accept an optional manual flag:
+Use an explicit scope mode enum for the scoped API:
 
 ```cpp
-PTO2_SCOPE(true) {
+enum class PTO2ScopeMode : uint8_t {
+    AUTO = 0,
+    MANUAL = 1,
+};
+
+PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
     ...
 }
 ```
 
-`PTO2_SCOPE()` remains the normal-scope form. `PTO2_SCOPE(true)` enters manual mode.
+`PTO2_SCOPE()` remains the auto-scope form by default. `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` enters manual mode explicitly.
 
 Do not change `TaskOutputTensors`.
 
@@ -341,11 +346,11 @@ PTO2ManualSubmitResult pto2_rt_submit_aic_task_manual(int32_t kernel_id, const A
 PTO2ManualSubmitResult pto2_rt_submit_aiv_task_manual(int32_t kernel_id, const Arg& args);
 ```
 
-These APIs are intended for use inside `PTO2_SCOPE(true)` where explicit dependency wiring is required.
+These APIs are intended for use inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` where explicit dependency wiring is required.
 
 This design intentionally splits task APIs, not tensor storage APIs:
 
-- normal scope uses existing `pto2_rt_submit_*` task APIs
+- auto scope uses existing `pto2_rt_submit_*` task APIs
 - manual scope uses `pto2_rt_submit_*_manual` task APIs
 - both modes continue using the same `Tensor`, `Arg`, and `TensorArgType` model
 
@@ -374,15 +379,15 @@ Add runtime ops support:
 
 ```cpp
 void (*add_dependency)(PTO2Runtime* rt, PTO2TaskId producer, PTO2TaskId consumer);
-void (*scope_begin)(PTO2Runtime* rt, bool manual_dep);
+void (*scope_begin)(PTO2Runtime* rt, PTO2ScopeMode mode);
 ```
 
-The orchestration-facing helper can stay TLS-style and hide the runtime pointer, for example by plumbing the flag through the existing `pto2_rt_scope_begin()` / `PTO2ScopeGuard` path.
+The orchestration-facing helper can stay TLS-style and hide the runtime pointer, for example by plumbing the mode through the existing `pto2_rt_scope_begin()` / `PTO2ScopeGuard` path.
 
 Add manual-scope entry/exit plumbing by extending the existing runtime entry point with a mode flag:
 
 ```cpp
-void pto2_rt_scope_begin(PTO2Runtime* rt, bool manual_dep);
+void pto2_rt_scope_begin(PTO2Runtime* rt, PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
 ```
 
 Recommendation: extend scope state with a mode flag and keep one scope stack. Avoid separate manual/non-manual stacks.
@@ -481,20 +486,20 @@ This is why a separate user-facing “external tensor” API is not required for
 
 ## Scheduler-Safe Hybrid Design
 
-The scheduler changes should be localized and should not disturb existing normal-scope behavior.
+The scheduler changes should be localized and should not disturb existing auto-scope behavior.
 
 ### Design principle
 
 Keep two execution paths:
 
-- normal scope path: existing `tensormap_and_ringbuffer` behavior
+- auto scope path: existing `tensormap_and_ringbuffer` behavior
 - manual scope path: deferred dependency realization and deferred scheduler publication
 
-The normal path should remain unchanged as much as possible.
+The auto path should remain unchanged as much as possible.
 
 ### What a manual-scope task must count as dependencies
 
-For a task inside `PTO2_SCOPE(true)`, total fanin is:
+For a task inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`, total fanin is:
 
 - explicit manual dependencies added by `add_dependency`
 - external dependencies derived from TensorMap/owner logic for outer-scope reads
@@ -742,7 +747,7 @@ This is supported by the same fanin accounting model.
 Example:
 
 ```cpp
-PTO2_SCOPE(true) {
+PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
     t0 = in-scope producer of tmp
     t1 = consumer of tmp and outer tensor X
     add_dependency(t0, t1)
@@ -820,7 +825,7 @@ This case must be supported in v1.
 Example:
 
 ```cpp
-PTO2_SCOPE(true) {
+PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
     t1 writes outer C
     t2 writes outer C
     add_dependency(t1, t2)
@@ -839,7 +844,7 @@ Correct behavior:
 Potential invalid user pattern:
 
 ```cpp
-PTO2_SCOPE(true) {
+PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
     t1 writes outer C
     t2 also writes outer C
     // missing add_dependency(t1, t2)
@@ -869,8 +874,8 @@ This is a strict requirement:
 
 Supported:
 
-- normal scope contains manual scope
-- normal scope contains normal scope
+- auto scope contains manual scope
+- auto scope contains auto scope
 
 Not supported in v1:
 
@@ -881,7 +886,7 @@ Reason:
 
 - current ring selection depends on scope depth
 - the top scope frame is also the publication and lifetime-release boundary
-- allowing a child scope inside `PTO2_SCOPE(true)` would split one manual region across multiple scope/ring boundaries unless extra machinery is added
+- allowing a child scope inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` would split one manual region across multiple scope/ring boundaries unless extra machinery is added
 - rejecting nested scopes inside manual mode keeps `current_manual_scope_owns(...)` a simple membership check over one manual frame
 
 Recommendation:
@@ -891,9 +896,9 @@ Recommendation:
 
 Required error text quality:
 
-- the message must explicitly say that nested scope inside `PTO2_SCOPE(true)` is not supported in v1
+- the message must explicitly say that nested scope inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` is not supported in v1
 - the message must explicitly say that `manual scope inside manual scope is not supported`
-- the message must identify the offending operation as nested `PTO2_SCOPE(true)`
+- the message must identify the offending operation as nested `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`
 - the message must not use vague wording such as only `invalid scope state`
 
 ## Blocking Cross-Layer Tensor Access
@@ -904,12 +909,12 @@ That assumption does not hold inside manual scope because tasks remain unpublish
 
 So v1 should fail fast:
 
-- `get_tensor_data` inside `PTO2_SCOPE(true)` is an error
-- `set_tensor_data` inside `PTO2_SCOPE(true)` is an error
+- `get_tensor_data` inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` is an error
+- `set_tensor_data` inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` is an error
 
 Required error text quality:
 
-- the message must explicitly say that blocking tensor data access is not supported inside `PTO2_SCOPE(true)`
+- the message must explicitly say that blocking tensor data access is not supported inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`
 - the message should tell the user to exit the manual scope first
 
 ## Diagnostics

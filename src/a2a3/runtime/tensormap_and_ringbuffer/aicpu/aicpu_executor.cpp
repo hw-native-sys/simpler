@@ -2364,6 +2364,17 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
     }
 
+    if (rt != nullptr) {
+        void* sm = runtime->get_pto2_gm_sm_ptr();
+        if (sm != nullptr) {
+            int32_t orch_err = static_cast<PTO2SharedMemoryHeader*>(sm)->orch_error_code.load(std::memory_order_acquire);
+            if (orch_err != PTO2_ERROR_NONE) {
+                DEV_ERROR("Thread %d: Exiting with orchestrator error code=%d", thread_idx, orch_err);
+                return -1;
+            }
+        }
+    }
+
     return 0;
 }
 
