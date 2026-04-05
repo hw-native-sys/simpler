@@ -77,6 +77,16 @@ static void fail_manual_tensor_access(PTO2Runtime *rt, const char *caller) {
     );
 }
 
+static void fail_manual_tensor_access(PTO2Runtime *rt, const char *caller) {
+    PTO2OrchestratorState &orch = rt->orchestrators[pto2_current_orch_idx];
+    orch.sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+    orch.fatal = true;
+    unified_log_error(
+        caller,
+        "blocking tensor data access is not supported inside PTO2_SCOPE(PTO2ScopeMode::MANUAL); exit the manual scope first"
+    );
+}
+
 // Wait for all producers of this tensor to be safe for data access.
 // Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
 // For reads: wait until each producer COMPLETED (done writing).

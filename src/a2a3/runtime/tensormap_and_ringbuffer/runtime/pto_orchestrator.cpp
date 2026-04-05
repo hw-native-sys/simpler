@@ -485,7 +485,7 @@ static void manual_task_meta_push(PTO2OrchestratorState *orch, const PTO2ManualT
     orch->manual_task_meta[orch->manual_task_meta_size++] = meta;
 }
 
-static void manual_edge_push(PTO2OrchestratorState *orch, const PTO2ManualEdge &edge) {
+static int32_t manual_edge_push(PTO2OrchestratorState *orch, const PTO2ManualEdge &edge) {
     if (orch->manual_edges_size >= orch->manual_edges_capacity) {
         int32_t new_cap = orch->manual_edges_capacity * 2;
         PTO2ManualEdge *new_buf =
@@ -494,7 +494,9 @@ static void manual_edge_push(PTO2OrchestratorState *orch, const PTO2ManualEdge &
         orch->manual_edges = new_buf;
         orch->manual_edges_capacity = new_cap;
     }
+    int32_t edge_idx = orch->manual_edges_size;
     orch->manual_edges[orch->manual_edges_size++] = edge;
+    return edge_idx;
 }
 
 static bool in_manual_scope(const PTO2OrchestratorState *orch) {
@@ -511,6 +513,28 @@ static int32_t find_current_manual_scope_task_index(const PTO2OrchestratorState 
     }
 
     int32_t begin = current_manual_scope_begin(orch);
+    int32_t count = orch->scope_tasks_size - begin;
+    if (count <= 0) {
+        return -1;
+    }
+
+    PTO2TaskSlotState *first_slot_state = orch->scope_tasks[begin];
+    if (first_slot_state != nullptr) {
+        PTO2TaskId first_task_id = first_slot_state->task->task_id;
+        if (first_task_id.ring() == task_id.ring()) {
+            uint32_t window_size = orch->rings[first_task_id.ring()].task_allocator.window_size();
+            uint32_t first_local = first_task_id.local();
+            uint32_t task_local = task_id.local();
+            uint32_t delta = task_local >= first_local ? task_local - first_local : task_local + window_size - first_local;
+            if (delta < static_cast<uint32_t>(count)) {
+                PTO2TaskSlotState *candidate = orch->scope_tasks[begin + static_cast<int32_t>(delta)];
+                if (candidate != nullptr && candidate->task->task_id == task_id) {
+                    return static_cast<int32_t>(delta);
+                }
+            }
+        }
+    }
+
     for (int32_t i = begin; i < orch->scope_tasks_size; i++) {
         PTO2TaskSlotState *slot_state = orch->scope_tasks[i];
         if (slot_state != nullptr && slot_state->task->task_id == task_id) {
@@ -531,7 +555,9 @@ void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode) {
     assert(orch->scope_stack_top < static_cast<int32_t>(orch->scope_stack_capacity - 1) && "Scope stack overflow");
 
     if (in_manual_scope(orch)) {
-        LOG_ERROR("nested scope inside PTO2_SCOPE(PTO2ScopeMode::MANUAL) is not supported in v1");
+        LOG_ERROR(
+            "nested PTO2_SCOPE(PTO2ScopeMode::MANUAL) is not supported in v1; manual scope inside manual scope is not supported"
+        );
         orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
         orch->fatal = true;
         return;
@@ -541,8 +567,10 @@ void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode) {
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
     orch->scope_modes[orch->scope_stack_top] = mode;
     orch->manual_scope_active = (mode == PTO2ScopeMode::MANUAL);
-    orch->manual_task_meta_begins[orch->scope_stack_top] = orch->manual_task_meta_size;
-    orch->manual_edge_begins[orch->scope_stack_top] = orch->manual_edges_size;
+    if (mode == PTO2ScopeMode::MANUAL) {
+        orch->manual_task_meta_begins[orch->scope_stack_top] = orch->manual_task_meta_size;
+        orch->manual_edge_begins[orch->scope_stack_top] = orch->manual_edges_size;
+    }
 }
 
 void pto2_scope_end(PTO2OrchestratorState *orch) {
@@ -559,10 +587,27 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
     int32_t begin = orch->scope_begins[top];
     int32_t count = orch->scope_tasks_size - begin;
     PTO2ScopeMode mode = orch->scope_modes[top];
+
+    if (mode != PTO2ScopeMode::MANUAL) {
+        orch->scope_stack_top--;
+
+        if (orch->scheduler && count > 0) {
+            orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
+        }
+
+        orch->scope_tasks_size = begin;
+
+#if PTO2_ORCH_PROFILING
+        uint64_t _se1 = get_sys_cnt_aicpu();
+        g_orch_scope_end_cycle += (_se1 - _se0);
+#endif
+        return;
+    }
+
     int32_t manual_meta_begin = orch->manual_task_meta_begins[top];
     int32_t manual_edge_begin = orch->manual_edge_begins[top];
 
-    if (mode == PTO2ScopeMode::MANUAL && orch->scheduler && count > 0) {
+    if (orch->scheduler && count > 0) {
         int32_t manual_task_count = orch->manual_task_meta_size - manual_meta_begin;
         if (manual_task_count != count) {
             LOG_ERROR("manual scope requires pto2_rt_submit_*_manual for every submitted task");
@@ -596,12 +641,9 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
             PTO2FaninBuilder fanin_builder;
             fanin_builder.spill_pool = &orch->rings[ring_id].fanin_pool;
 
-            for (int32_t edge_idx = manual_edge_begin; edge_idx < orch->manual_edges_size; edge_idx++) {
+            for (int32_t edge_idx = meta.incoming_edge_head; edge_idx >= 0;
+                 edge_idx = orch->manual_edges[edge_idx].next_consumer_edge) {
                 const PTO2ManualEdge &edge = orch->manual_edges[edge_idx];
-                if (edge.consumer_idx != task_idx) {
-                    continue;
-                }
-
                 PTO2TaskSlotState *prod_state = orch->scope_tasks[begin + edge.producer_idx];
                 if (!pto2_append_fanin_or_fail(
                         orch, task_id, edge.consumer_idx, TensorArgType::INPUT, prod_state, &fanin_builder,
@@ -739,8 +781,10 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
 // =============================================================================
 // Task Submission
 // =============================================================================
+template <bool kManualSubmit>
 static TaskOutputTensors pto2_submit_mixed_task_impl(
-    PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args, bool manual_submit
+    PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args,
+    PTO2TaskId *submitted_task_id = nullptr
 ) {
     CYCLE_COUNT_START();
 
@@ -773,11 +817,13 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
     // Submission without an open scope is illegal.
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
 
-    if (!manual_submit && in_manual_scope(orch)) {
-        LOG_ERROR("PTO2_SCOPE(PTO2ScopeMode::MANUAL) requires pto2_rt_submit_*_manual task APIs");
-        orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
-        orch->fatal = true;
-        return result;
+    if constexpr (!kManualSubmit) {
+        if (in_manual_scope(orch)) {
+            LOG_ERROR("PTO2_SCOPE(PTO2ScopeMode::MANUAL) requires pto2_rt_submit_*_manual task APIs");
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+            orch->fatal = true;
+            return result;
+        }
     }
 
     // Encode require_sync_start into active_mask bit 3 (only meaningful for tasks with block_num > 1)
@@ -809,7 +855,6 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
 
     PTO2FaninBuilder fanin_builder;
     fanin_builder.spill_pool = &orch->rings[ring_id].fanin_pool;
-    bool defer_publish = manual_submit;
 
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id.raw);
 
@@ -833,7 +878,7 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
     // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
-    if (!defer_publish) {
+    if constexpr (!kManualSubmit) {
         for (int i = 0; i < args.tensor_count(); i++) {
             TensorArgType ptype = args.tag(i);
             if (ptype == TensorArgType::OUTPUT) {
@@ -888,11 +933,11 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id.raw);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    {
+    if constexpr (!kManualSubmit) {
         for (int i = 0; i < args.tensor_count(); i++) {
             TensorArgType ptype = args.tag(i);
             if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-                if (!defer_publish && !args.tensor(i).ptr->manual_dep) {
+                if (!args.tensor(i).ptr->manual_dep) {
                     orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
                 }
             }
@@ -953,7 +998,7 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
         cur_slot_state.block_num = block_num;
         cur_slot_state.next_block_idx = 0;
 
-        if (defer_publish) {
+        if constexpr (kManualSubmit) {
             cur_slot_state.fanin_count = 1;
             payload->fanin_actual_count = 0;
             payload->fanin_spill_start = 0;
@@ -1024,7 +1069,6 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
 #endif
     g_orch_submit_idx++;
 #endif
-    orch->last_submitted_task_id = task_id;
     return result;
 }
 
@@ -1115,7 +1159,13 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
 
 TaskOutputTensors
 pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args) {
-    return pto2_submit_mixed_task_impl(orch, mixed_kernels, args, false);
+    if (in_manual_scope(orch)) {
+        LOG_ERROR("PTO2_SCOPE(PTO2ScopeMode::MANUAL) requires pto2_rt_submit_*_manual task APIs");
+        orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+        orch->fatal = true;
+        return {};
+    }
+    return pto2_submit_mixed_task_impl<false>(orch, mixed_kernels, args);
 }
 
 PTO2ManualSubmitResult
@@ -1127,16 +1177,18 @@ pto2_submit_mixed_task_manual(PTO2OrchestratorState *orch, const MixedKernels &m
         orch->fatal = true;
         return result;
     }
-    TaskOutputTensors outputs = pto2_submit_mixed_task_impl(orch, mixed_kernels, args, true);
-    if (orch->fatal || !orch->last_submitted_task_id.is_valid()) {
+    PTO2TaskId task_id = PTO2TaskId::invalid();
+    TaskOutputTensors outputs = pto2_submit_mixed_task_impl<true>(orch, mixed_kernels, args, &task_id);
+    if (orch->fatal || !task_id.is_valid()) {
         return result;
     }
-    result.task_id = orch->last_submitted_task_id;
+    result.task_id = task_id;
     result.outputs = outputs;
 
     PTO2ManualTaskMeta meta{};
     meta.slot_state = orch->scope_tasks[orch->scope_tasks_size - 1];
     meta.scope_task_index = orch->scope_tasks_size - 1 - current_manual_scope_begin(orch);
+    meta.incoming_edge_head = -1;
     meta.tensor_count = static_cast<uint8_t>(args.tensor_count());
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         meta.tags[i] = static_cast<uint8_t>(args.tag(i));
@@ -1156,6 +1208,12 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
         orch->fatal = true;
         return;
     }
+    if (producer_id == consumer_id) {
+        LOG_ERROR("add_dependency does not allow self-dependency");
+        orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+        orch->fatal = true;
+        return;
+    }
     int32_t producer_idx = find_current_manual_scope_task_index(orch, producer_id);
     int32_t consumer_idx = find_current_manual_scope_task_index(orch, consumer_id);
     if (producer_idx < 0 || consumer_idx < 0) {
@@ -1165,7 +1223,17 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
         return;
     }
 
-    manual_edge_push(orch, PTO2ManualEdge{.producer_idx = producer_idx, .consumer_idx = consumer_idx});
+    int32_t meta_begin = orch->manual_task_meta_begins[orch->scope_stack_top];
+    PTO2ManualTaskMeta &consumer_meta = orch->manual_task_meta[meta_begin + consumer_idx];
+    int32_t edge_idx = manual_edge_push(
+        orch,
+        PTO2ManualEdge{
+            .producer_idx = producer_idx,
+            .consumer_idx = consumer_idx,
+            .next_consumer_edge = consumer_meta.incoming_edge_head,
+        }
+    );
+    consumer_meta.incoming_edge_head = edge_idx;
 }
 
 // =============================================================================

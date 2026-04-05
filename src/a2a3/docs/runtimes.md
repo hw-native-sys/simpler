@@ -1,20 +1,20 @@
 # Runtime Variants (a2a3)
 
-Three runtime implementations live under `src/a2a3/runtime/`, each providing a different graph-building strategy. The `RUNTIME_CONFIG.runtime` field in `kernel_config.py` selects which runtime to use.
+Four runtime implementations live under `src/a2a3/runtime/`, each providing a different graph-building strategy. The `RUNTIME_CONFIG.runtime` field in `kernel_config.py` selects which runtime to use.
 
 ## Comparison
 
-| Feature | host_build_graph | aicpu_build_graph | tensormap_and_ringbuffer |
-| ------- | ---------------- | ----------------- | ------------------------ |
-| Graph built on | Host CPU | AICPU (device) | AICPU (device) |
-| Task storage | Fixed `Task[]` array | Fixed `Task[]` array | Ring buffer (`PTO2TaskDescriptor[]`) |
-| Dependencies | Explicit edges | Explicit edges | Auto-derived via TensorMap |
-| Memory management | Host-side | Host + device malloc | Ring buffer heap (GM) |
-| Concurrent build+schedule | No | Optional (`build_mode=1`) | Yes (always) |
-| Profiling support | Basic | Basic | Multi-level hierarchy |
-| Batch/streaming | No | No | Yes (flow control, back-pressure) |
-| Thread model | N scheduler threads | 1 builder + N schedulers | 1 orchestrator + 3 schedulers |
-| Use case | Development, debugging | Reduced host-device transfer | Production workloads |
+| Feature | host_build_graph | aicpu_build_graph | tensormap_and_ringbuffer_unmodified | tensormap_and_ringbuffer |
+| ------- | ---------------- | ----------------- | ----------------------------------- | ------------------------ |
+| Graph built on | Host CPU | AICPU (device) | AICPU (device) | AICPU (device) |
+| Task storage | Fixed `Task[]` array | Fixed `Task[]` array | Ring buffer (`PTO2TaskDescriptor[]`) | Ring buffer (`PTO2TaskDescriptor[]`) |
+| Dependencies | Explicit edges | Explicit edges | Auto-derived via TensorMap | Auto-derived via TensorMap, plus optional manual dependencies |
+| Memory management | Host-side | Host + device malloc | Ring buffer heap (GM) | Ring buffer heap (GM) |
+| Concurrent build+schedule | No | Optional (`build_mode=1`) | Yes (always) | Yes (always) |
+| Profiling support | Basic | Basic | Multi-level hierarchy | Multi-level hierarchy |
+| Batch/streaming | No | No | Yes (flow control, back-pressure) | Yes (flow control, back-pressure) |
+| Thread model | N scheduler threads | 1 builder + N schedulers | 1 orchestrator + 3 schedulers | 1 orchestrator + 3 schedulers |
+| Use case | Development, debugging | Reduced host-device transfer | Baseline PTO2 comparison | Production PTO2 with manual-scope extensions |
 
 ## host_build_graph
 
@@ -46,6 +46,16 @@ The primary production runtime. Uses ring buffers for task slots and output memo
 - Thread model: 3 scheduler threads + 1 orchestrator thread on AICPU
 - Multi-ring: HeapRing, TaskRing, and DepPool split into 4 independent instances for nested scope isolation
 - Supports streaming, flow control, large batch sizes, and multi-level profiling
+
+## tensormap_and_ringbuffer_unmodified
+
+An unmodified clone of the baseline PTO2 runtime, kept side-by-side for apples-to-apples comparison against the extended `tensormap_and_ringbuffer` runtime.
+
+- Same TensorMap and ring-buffer architecture as the original PTO2 implementation
+- No manual-scope dependency extensions
+- Intended for benchmarking and regression isolation, not new feature development
+
+See [tensormap_and_ringbuffer_unmodified/docs/](../runtime/tensormap_and_ringbuffer_unmodified/docs/) for the baseline runtime logic and profiling notes.
 
 See [tensormap_and_ringbuffer/docs/](../runtime/tensormap_and_ringbuffer/docs/):
 

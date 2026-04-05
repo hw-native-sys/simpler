@@ -43,6 +43,7 @@
 struct PTO2ManualTaskMeta {
     PTO2TaskSlotState *slot_state;
     int32_t scope_task_index;
+    int32_t incoming_edge_head;
     uint8_t tensor_count;
     uint8_t tags[MAX_TENSOR_ARGS];
 };
@@ -50,6 +51,7 @@ struct PTO2ManualTaskMeta {
 struct PTO2ManualEdge {
     int32_t producer_idx;
     int32_t consumer_idx;
+    int32_t next_consumer_edge;
 };
 
 /**
@@ -87,7 +89,6 @@ struct PTO2OrchestratorState {
     PTO2ManualEdge *manual_edges;
     int32_t manual_edges_size;
     int32_t manual_edges_capacity;
-    PTO2TaskId last_submitted_task_id{PTO2TaskId::invalid()};
 
     // === SCHEDULER REFERENCE ===
     // Note: In simulated mode, orchestrator and scheduler share address space
