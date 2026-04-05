@@ -752,7 +752,11 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
             }
 
         }
-        orch->scheduler->publish_manual_scope_tasks_and_end_scope(&orch->scope_tasks[begin], count);
+        orch->scheduler->publish_manual_scope_tasks(&orch->scope_tasks[begin], count);
+    }
+
+    if (orch->scheduler && count > 0) {
+        orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
     }
 
     // Rewind the task buffer — these entries are no longer needed
@@ -857,68 +861,69 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
 #endif
 
     // === STEP 2: Sync TensorMap validity and optional cleanup ===
-    int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
+    // Manual submit defers TensorMap lookup/insert and dep-pool wiring to
+    // manual scope_end, so syncing/reclaiming here only duplicates work.
+    if constexpr (!kManualSubmit) {
+        int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
 
-    orch->tensor_map.sync_tensormap(ring_id, sm_last_task_alive);
+        orch->tensor_map.sync_tensormap(ring_id, sm_last_task_alive);
 
-    if (sched) {
-        orch->rings[ring_id].dep_pool.reclaim(*sched, ring_id, sm_last_task_alive);
+        if (sched) {
+            orch->rings[ring_id].dep_pool.reclaim(*sched, ring_id, sm_last_task_alive);
+        }
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
     // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
-    for (int i = 0; i < args.tensor_count(); i++) {
-        TensorArgType ptype = args.tag(i);
-        if (ptype == TensorArgType::OUTPUT) {
-            // Runtime-created OUTPUT tensors are not looked up in the TensorMap since they have no dependencies.
-            continue;
-        }
-
-        const Tensor *tensor = args.tensor(i).ptr;
-        if constexpr (kManualSubmit) {
-            if (task_owned_by_current_manual_scope(orch, tensor->owner_task_id)) {
+    if constexpr (!kManualSubmit) {
+        for (int i = 0; i < args.tensor_count(); i++) {
+            TensorArgType ptype = args.tag(i);
+            if (ptype == TensorArgType::OUTPUT) {
+                // Runtime-created OUTPUT tensors are not looked up in the TensorMap since they have no dependencies.
                 continue;
             }
-        }
 
-        // Step A: creator retention — all existing tensors extend their creator lifetime.
-        PTO2TaskId owner = tensor->owner_task_id;
-        if (owner.is_valid() && sched != nullptr) {
-            PTO2TaskSlotState *prod_state =
-                &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
-            if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "creator retention"
-                )) {
-                return result;
+            const Tensor *tensor = args.tensor(i).ptr;
+
+            // Step A: creator retention — all existing tensors extend their creator lifetime.
+            PTO2TaskId owner = tensor->owner_task_id;
+            if (owner.is_valid() && sched != nullptr) {
+                PTO2TaskSlotState *prod_state =
+                    &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
+                if (!pto2_append_fanin_or_fail(
+                        orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "creator retention"
+                    )) {
+                        return result;
+                    }
             }
-        }
 
-        // Step B: only INPUT/INOUT need modifier dependency lookup.
-        if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
-            continue;
-        }
-        if (tensor->manual_dep) {
-            continue;
-        }
-
-        PTO2LookupResult lookup_result;
-        orch->tensor_map.lookup(*tensor, lookup_result);
-
-        for (int r = 0; r < lookup_result.count; r++) {
-            PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
-            auto overlap_status = lookup_result.entries[r].overlap_status;
-            auto prod_ring = entry.producer_task_id.ring();
-            auto prod_local = entry.producer_task_id.local();
-            PTO2TaskSlotState *prod_state =
-                &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
-            if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "overlap lookup"
-                )) {
-                return result;
+            // Step B: only INPUT/INOUT need modifier dependency lookup.
+            if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
+                continue;
             }
-            if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
-                orch->tensor_map.remove_entry(entry);
+            if (tensor->manual_dep) {
+                continue;
+            }
+
+            PTO2LookupResult lookup_result;
+            orch->tensor_map.lookup(*tensor, lookup_result);
+
+            for (int r = 0; r < lookup_result.count; r++) {
+                PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
+                auto overlap_status = lookup_result.entries[r].overlap_status;
+                auto prod_ring = entry.producer_task_id.ring();
+                auto prod_local = entry.producer_task_id.local();
+                PTO2TaskSlotState *prod_state =
+                    &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
+                if (!pto2_append_fanin_or_fail(
+                        orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "overlap lookup"
+                    )) {
+                    return result;
+                }
+                if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                    orch->tensor_map.remove_entry(entry);
+                }
             }
         }
     }
@@ -926,16 +931,13 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id.raw);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    for (int i = 0; i < args.tensor_count(); i++) {
-        TensorArgType ptype = args.tag(i);
-        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-            if constexpr (kManualSubmit) {
-                if (task_owned_by_current_manual_scope(orch, args.tensor(i).ptr->owner_task_id)) {
-                    continue;
+    if constexpr (!kManualSubmit) {
+        for (int i = 0; i < args.tensor_count(); i++) {
+            TensorArgType ptype = args.tag(i);
+            if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
+                if (!args.tensor(i).ptr->manual_dep) {
+                    orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
                 }
-            }
-            if (!args.tensor(i).ptr->manual_dep) {
-                orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
             }
         }
     }
