@@ -34,6 +34,7 @@ extern "C" {
 
 void pto_cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim);
 void pto_cpu_sim_set_task_cookie(uint64_t task_cookie);
+void platform_set_cpu_sim_task_cookie(uint32_t core_id, uint32_t reg_task_id, uint64_t task_cookie);
 uint64_t platform_get_cpu_sim_task_cookie(uint32_t core_id, uint32_t reg_task_id);
 
 #ifdef __cplusplus

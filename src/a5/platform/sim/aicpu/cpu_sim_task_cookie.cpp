@@ -10,14 +10,19 @@
  */
 
 #include <cstdint>
-#include <dlfcn.h>
 
 #include "aicpu/cpu_sim_task_cookie.h"
 
+using SetTaskCookieFn = void (*)(uint32_t, uint32_t, uint64_t);
+static SetTaskCookieFn g_set_task_cookie_fn = nullptr;
+
+// Called by DeviceRunner after dlopen to inject the host-side function pointer.
+extern "C" void set_aicpu_sim_context_helpers(void *set_task_cookie) {
+    g_set_task_cookie_fn = reinterpret_cast<SetTaskCookieFn>(set_task_cookie);
+}
+
 void platform_set_cpu_sim_task_cookie(uint32_t core_id, uint32_t reg_task_id, uint64_t task_cookie) {
-    using Fn = void (*)(uint32_t, uint32_t, uint64_t);
-    static auto fn = reinterpret_cast<Fn>(dlsym(RTLD_DEFAULT, "platform_set_cpu_sim_task_cookie"));
-    if (fn != nullptr) {
-        fn(core_id, reg_task_id, task_cookie);
+    if (g_set_task_cookie_fn != nullptr) {
+        g_set_task_cookie_fn(core_id, reg_task_id, task_cookie);
     }
 }

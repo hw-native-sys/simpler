@@ -142,6 +142,13 @@ int DeviceRunner::ensure_binaries_loaded(
         }
 
         LOG_INFO("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
+
+        // Pass sim context function pointer to the AICPU SO (same pattern as AICore).
+        auto set_aicpu_helpers =
+            reinterpret_cast<void (*)(void *)>(dlsym(aicpu_so_handle_, "set_aicpu_sim_context_helpers"));
+        if (set_aicpu_helpers != nullptr) {
+            set_aicpu_helpers(reinterpret_cast<void *>(platform_set_cpu_sim_task_cookie));
+        }
     }
 
     // Write AICore binary to temp file and dlopen
