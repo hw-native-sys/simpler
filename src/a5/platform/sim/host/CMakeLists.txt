@@ -73,6 +73,7 @@ target_compile_options(host_runtime
         -fPIC
         -O3
         -g
+        $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>
 )
 
 # Include directories

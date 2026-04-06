@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from enum import IntEnum
 
 import env_manager
@@ -23,6 +24,17 @@ class ToolchainType(IntEnum):
     HOST_GXX_15 = 1  # g++-15 (host, simulation kernels)
     HOST_GXX = 2  # g++ (host, orchestration .so)
     AARCH64_GXX = 3  # aarch64-target-linux-gnu-g++ (cross-compile)
+
+
+def _is_gcc(cxx_path: str) -> bool:
+    """Return True if *cxx_path* is a real GCC (not clang masquerading as g++)."""
+    try:
+        out = subprocess.run(
+            [cxx_path, "--version"], check=False, capture_output=True, text=True, timeout=5
+        ).stdout.lower()
+        return "clang" not in out
+    except (OSError, subprocess.SubprocessError):
+        return False
 
 
 class Toolchain:
@@ -156,9 +168,15 @@ class GxxToolchain(Toolchain):
     def __init__(self):
         super().__init__()
         self.cxx_path = "g++"
+        self._gcc = _is_gcc(self.cxx_path)
 
     def get_compile_flags(self, **kwargs) -> list[str]:
-        return ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
+        flags = ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
+        # -fno-gnu-unique: prevent STB_GNU_UNIQUE binding so dlclose actually
+        # unloads the SO.  GCC-only; clang does not produce STB_GNU_UNIQUE.
+        if self._gcc:
+            flags.append("-fno-gnu-unique")
+        return flags
 
     def get_cmake_args(self) -> list[str]:
         # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
@@ -200,9 +218,14 @@ class Aarch64GxxToolchain(Toolchain):
             raise FileNotFoundError(f"aarch64 C compiler not found: {self.cc_path}")
         if not os.path.isfile(self.cxx_path):
             raise FileNotFoundError(f"aarch64 C++ compiler not found: {self.cxx_path}")
+        self._gcc = _is_gcc(self.cxx_path)
 
     def get_compile_flags(self, **kwargs) -> list[str]:
-        return ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
+        flags = ["-shared", "-fPIC", "-O3", "-g", "-std=c++17"]
+        # -fno-gnu-unique: prevent STB_GNU_UNIQUE binding so dlclose actually unloads the SO.
+        if self._gcc:
+            flags.append("-fno-gnu-unique")
+        return flags
 
     def get_cmake_args(self) -> list[str]:
         return [

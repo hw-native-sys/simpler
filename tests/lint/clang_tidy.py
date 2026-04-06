@@ -18,6 +18,7 @@ If no sim build cache exists, the sim runtimes are built first:
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -31,6 +32,9 @@ _SUPPRESS_ARGS = [
     "--extra-arg=-Wno-unknown-warning-option",
     "--extra-arg=-Wno-unused-command-line-argument",
 ]
+
+# GCC-only flags to strip from compile_commands.json before passing to clang-tidy.
+_GCC_ONLY_FLAGS = {"-fno-gnu-unique"}
 
 
 def _ensure_sim_cache() -> None:
@@ -47,16 +51,34 @@ def _ensure_sim_cache() -> None:
         sys.exit(result.returncode)
 
 
+def _strip_gcc_flags(command: str) -> str:
+    """Remove GCC-only flags that clang/clang-tidy does not understand."""
+    parts = shlex.split(command)
+    filtered_parts = [p for p in parts if p not in _GCC_ONLY_FLAGS]
+    return shlex.join(filtered_parts)
+
+
 def _build_file_index() -> dict[str, list[Path]]:
     """Return a mapping from absolute source path to the db directories that compile it.
 
     Each db directory is a build/cache/<arch>/<variant>/<runtime>/<target>/
     folder that contains a compile_commands.json covering the file.
     Only sim variant databases are used (avoids cross-compiler sysroot issues).
+
+    When the compile database contains GCC-only flags, it is modified
+    in-place to remove them so that clang-tidy can parse the commands.
     """
     index: dict[str, list[Path]] = {}
     for db_file in sorted(_CACHE_DIR.glob("*/sim/*/*/compile_commands.json")):
-        for entry in json.loads(db_file.read_text()):
+        raw = db_file.read_text()
+        entries = json.loads(raw)
+        needs_filter = any(flag in raw for flag in _GCC_ONLY_FLAGS)
+        if needs_filter:
+            for entry in entries:
+                if "command" in entry:
+                    entry["command"] = _strip_gcc_flags(entry["command"])
+            db_file.write_text(json.dumps(entries, indent=2))
+        for entry in entries:
             filepath = entry["file"]
             index.setdefault(filepath, []).append(db_file.parent)
     return index

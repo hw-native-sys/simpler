@@ -1,3 +1,12 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+#
 # Build AICore runtime for a5sim (Simulation)
 #
 # This builds the AICore executor as a host-compatible shared library (.so)
@@ -56,6 +65,7 @@ target_compile_options(aicore_kernel
         -fPIC
         -O3
         -g
+        $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>
 )
 
 # Define __CPU_SIM for CPU simulation backend

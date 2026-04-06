@@ -56,7 +56,7 @@ static_assert(sizeof(DataType) == 1, "DataType must stay 1 byte");
  */
 inline uint64_t get_element_size(DataType dtype) {
     // Order must match the enum definition exactly
-    static std::array<uint64_t, static_cast<int>(DataType::DATA_TYPE_NUM)> data_type_size = {
+    constexpr static std::array<uint64_t, static_cast<int>(DataType::DATA_TYPE_NUM)> data_type_size = {
         4,  // case DataType::FLOAT32
         2,  // DataType::FLOAT16
         4,  // DataType::INT32

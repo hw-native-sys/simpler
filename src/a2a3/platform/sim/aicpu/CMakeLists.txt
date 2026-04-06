@@ -65,6 +65,7 @@ target_compile_options(aicpu_kernel
         -fPIC
         -O3
         -g
+        $<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>
         $<$<COMPILE_LANGUAGE:CXX>:-std=c++17>
         $<$<COMPILE_LANGUAGE:C>:-std=gnu11>
 )
