@@ -139,17 +139,13 @@ inline uint64_t get_sys_cnt_aicore() {
 // =============================================================================
 
 /**
- * Per-thread simulated register base address for page 0 (0x0000-0x0FFF).
- * Set by the kernel wrapper before calling aicore_execute().
- * Points to the first 4KB page of the sparse register block.
+ * Per-thread simulated register base address and physical core ID.
+ * Stored in pthread TLS (not C++ thread_local) to avoid glibc TLSDESC
+ * issues when this SO is loaded with RTLD_LOCAL on aarch64.
+ * Set by aicore_execute_wrapper, read by read_reg/write_reg.
  */
-extern thread_local volatile uint8_t *g_sim_reg_base;
-
-/**
- * Per-thread simulated physical core ID.
- * Set by the kernel wrapper before calling aicore_execute().
- */
-extern thread_local uint32_t g_sim_physical_core_id;
+volatile uint8_t *sim_get_reg_base();
+uint32_t sim_get_physical_core_id();
 
 /**
  * Read an AICore register from simulated register memory
@@ -161,7 +157,7 @@ extern thread_local uint32_t g_sim_physical_core_id;
  */
 inline uint64_t read_reg(RegId reg) {
     uint32_t offset = reg_offset(reg);
-    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(g_sim_reg_base, offset));
+    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(sim_get_reg_base(), offset));
 
     uint64_t val = static_cast<uint64_t>(*ptr);
     OUT_OF_ORDER_LOAD_BARRIER();
@@ -178,7 +174,7 @@ inline uint64_t read_reg(RegId reg) {
  */
 inline void write_reg(RegId reg, uint64_t value) {
     uint32_t offset = reg_offset(reg);
-    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(g_sim_reg_base, offset));
+    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(sim_get_reg_base(), offset));
 
     *ptr = static_cast<uint32_t>(value);
     OUT_OF_ORDER_STORE_BARRIER();
@@ -189,7 +185,7 @@ inline void write_reg(RegId reg, uint64_t value) {
  *
  * @return Physical core ID for the current simulated core
  */
-inline uint32_t get_physical_core_id() { return g_sim_physical_core_id; }
+inline uint32_t get_physical_core_id() { return sim_get_physical_core_id(); }
 
 // =============================================================================
 // CPU Simulation Context Hooks
