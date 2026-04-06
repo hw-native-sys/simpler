@@ -1031,6 +1031,17 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     total_tasks_.store(0, std::memory_order_release);
     finished_count_.store(0, std::memory_order_release);
 
+    // Reset core discovery and assignment state
+    aic_count_ = 0;
+    aiv_count_ = 0;
+    cores_total_num_ = 0;
+    thread_num_ = 0;
+    aic_per_thread_ = 0;
+    aiv_per_thread_ = 0;
+    memset(core_assignments_, 0, sizeof(core_assignments_));
+    memset(thread_cores_num_, 0, sizeof(thread_cores_num_));
+    regs_ = 0;
+
     initialized_.store(false, std::memory_order_release);
     init_done_.store(false, std::memory_order_release);
     init_failed_.store(false, std::memory_order_release);

@@ -2455,9 +2455,19 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     completed_.store(false, std::memory_order_release);
     orch_finished_count_.store(0, std::memory_order_release);
 
-    // Reset core discovery state
+    // Reset core discovery and assignment state
     aic_count_ = 0;
     aiv_count_ = 0;
+    cores_total_num_ = 0;
+    thread_num_ = 0;
+    orch_thread_num_ = 0;
+    sched_thread_num_ = 0;
+    thread_cores_num_ = 0;
+    orch_to_sched_ = false;
+    active_sched_threads_ = 0;
+    memset(core_trackers_, 0, sizeof(core_trackers_));
+    memset(core_assignments_, 0, sizeof(core_assignments_));
+    memset(core_count_per_thread_, 0, sizeof(core_count_per_thread_));
 
     regs_ = 0;
     orch_func_ = nullptr;
