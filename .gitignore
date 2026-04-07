@@ -20,6 +20,7 @@ venv/
 .claude/settings.json
 .claude/settings.local.json
 .claude/worktrees
+.claude/plans
 
 # Git cloned dependencies (not tracked in repo)
 examples/scripts/_deps/

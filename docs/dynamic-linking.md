@@ -1,0 +1,292 @@
+# Dynamic Linking and Thread-Local Storage
+
+This document describes how shared libraries are loaded, symbols are resolved,
+and per-thread state is managed across simulation and onboard platforms.
+
+## SO Loading Hierarchy
+
+### Simulation
+
+```text
+Python process (ChipWorker)
+  |
+  dlopen(host_runtime.so, RTLD_GLOBAL)        ← host SO
+    |
+    +-- DeviceRunner::ensure_binaries_loaded()
+    |     |
+    |     +-- dlopen(aicpu_sim_XXXXXX, RTLD_NOW | RTLD_LOCAL)    ← AICPU SO (temp file)
+    |     |     |
+    |     |     +-- dlopen(libdevice_orch_<PID>.so, RTLD_LAZY | RTLD_LOCAL)  ← orch SO (temp file)
+    |     |
+    |     +-- dlopen(aicore_sim_XXXXXX, RTLD_NOW | RTLD_LOCAL)   ← AICore SO (temp file)
+    |
+    +-- DeviceRunner::upload_kernel_binary()
+          |
+          +-- dlopen(kernel_<func_id>_XXXXXX, RTLD_NOW | RTLD_LOCAL)  ← kernel SOs (temp file, per func_id)
+```
+
+### Onboard
+
+```text
+Python process (ChipWorker)
+  |
+  dlopen(host_runtime.so, RTLD_GLOBAL)        ← host SO
+    |
+    +-- DeviceRunner (singleton)
+    |     |
+    |     +-- rtMemcpy(aicpu_binary → device HBM)    ← NOT dlopen, binary blob upload
+    |     +-- rtRegisterAllKernel(aicore_binary)      ← CANN kernel registration
+    |     +-- rtAicpuKernelLaunchExWithArgs(...)       ← device-side execution
+    |
+    +-- dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL)  ← CANN HAL (profiling only)
+```
+
+Key difference: onboard does **not** dlopen AICPU/AICore as host-side SOs.
+They are binary blobs uploaded to device memory and executed by CANN runtime.
+
+## RTLD Flags and Rationale
+
+### Host Runtime SO: `RTLD_NOW | RTLD_GLOBAL`
+
+`RTLD_GLOBAL` is **required**. PTO ISA's TPUSH/TPOP instructions (AIC-AIV
+data transfer for mix-type kernels) use `dlsym(RTLD_DEFAULT, ...)` internally
+to locate shared storage hooks defined in the host SO:
+
+```cpp
+// PTO ISA: pto/common/cpu_stub.hpp
+inline GetSharedStorageHookFn ResolveSharedStorageHook() {
+    static auto hook = reinterpret_cast<...>(
+        dlsym(RTLD_DEFAULT, "pto_cpu_sim_get_shared_storage"));
+    return hook;
+}
+```
+
+With `RTLD_LOCAL`, this symbol is not in the global scope. The hook returns
+`nullptr`, and TPUSH/TPOP fall back to a `static` local variable per SO.
+Since AIC and AIV kernel threads run in different contexts, they get separate
+storage instances and deadlock — the producer (TPUSH) writes to one storage,
+the consumer (TPOP) waits on another.
+
+**Cross-runtime isolation** (running different runtime SOs sequentially) relies
+on `-fno-gnu-unique` to ensure `dlclose` actually unloads the SO. The next
+`dlopen` with `RTLD_GLOBAL` then replaces the global symbol scope with the
+new runtime's symbols.
+
+### Inner SOs: `RTLD_LOCAL`
+
+All SOs loaded by DeviceRunner (AICPU, AICore, kernel, orchestration) use
+`RTLD_LOCAL` to prevent symbol pollution between them. Functions that inner
+SOs need from the host SO are passed via explicit function pointer injection
+(see "Function Pointer Injection" below).
+
+### Orchestration SO: `RTLD_LAZY | RTLD_LOCAL`
+
+Loaded by the AICPU executor at runtime from a temp file. Uses `RTLD_LAZY`
+because not all symbols may be referenced. Communicates with the runtime
+through a function pointer table (`PTO2RuntimeOps`), not direct symbol
+linkage.
+
+**File path collision**: all runtimes write the orch SO to
+`/var/tmp/libdevice_orch_<PID>.so`. Safe in serial execution (each task
+dlcloses before the next writes), but would conflict in parallel in-process
+execution.
+
+### CANN HAL: `RTLD_NOW | RTLD_LOCAL`
+
+`libascend_hal.so` is loaded only for performance profiling (SVM memory
+mapping via `halHostRegister`/`halHostUnregister`). The handle is cached
+in a file-scope `g_hal_handle` and never explicitly dlclosed.
+
+## All dlsym(RTLD_DEFAULT) Calls
+
+| Symbol | File | Used by | How it works |
+| ------ | ---- | ------- | ------------ |
+| `pto_cpu_sim_set_execution_context` | PTO ISA `cpu_stub.hpp` | Kernel `set_execution_context()` | Sim: injected via `set_sim_context_helpers` (bypasses dlsym) |
+| `pto_cpu_sim_get_execution_context` | PTO ISA `cpu_stub.hpp` | Kernel `get_block_idx()` etc. | Sim: same injection mechanism |
+| `pto_cpu_sim_get_shared_storage` | PTO ISA `cpu_stub.hpp` | TPUSH/TPOP shared state | Requires `RTLD_GLOBAL` on host SO |
+| `pto_cpu_sim_get_task_cookie` | PTO ISA `cpu_stub.hpp` | Kernel `get_task_cookie()` | Requires `RTLD_GLOBAL` on host SO |
+| `halMemAlloc` / `halMemFree` | Onboard `device_malloc.cpp` | AICPU device memory | Resolved once, cached in statics |
+| `halGetDeviceInfoByBuff` | Onboard `host_regs.cpp` | Core validity query | a2a3 only |
+| `halMemCtl` | Onboard `host_regs.cpp` | Register address mapping | a2a3 only |
+| `halResMap` | Onboard `host_regs.cpp` | Per-core register mapping | a5 only |
+
+The first two are called from AICore SO code (via `inner_kernel.h` macros).
+They were converted from `dlsym(RTLD_DEFAULT)` to function pointer injection
+through `set_sim_context_helpers()`, so they work under both `RTLD_GLOBAL`
+and `RTLD_LOCAL`.
+
+The next two (`get_shared_storage`, `get_task_cookie`) are called from PTO ISA
+template code instantiated **inside kernel SOs** — not the AICore SO. Function
+pointer injection into the AICore SO cannot reach them. They require the host
+SO to be loaded with `RTLD_GLOBAL`.
+
+The HAL symbols are onboard-only. CANN's scheduler process pre-loads
+`libascend_hal.so` into the global scope before launching AICPU kernels.
+
+## Function Pointer Injection
+
+To avoid `dlsym(RTLD_DEFAULT)` in inner SOs loaded with `RTLD_LOCAL`,
+DeviceRunner passes function pointers after dlopen:
+
+**AICore SO** (`set_sim_context_helpers`):
+
+```text
+DeviceRunner → dlsym(aicore_handle, "set_sim_context_helpers")
+             → set_helpers(pto_cpu_sim_set_execution_context,
+                           pto_cpu_sim_set_task_cookie,
+                           platform_get_cpu_sim_task_cookie)
+```
+
+**AICPU SO** (`set_aicpu_sim_context_helpers`):
+
+```text
+DeviceRunner → dlsym(aicpu_handle, "set_aicpu_sim_context_helpers")
+             → set_helpers(platform_set_cpu_sim_task_cookie)
+```
+
+These injected function pointers are stored as globals in the respective SOs
+and called instead of `dlsym(RTLD_DEFAULT)`.
+
+## Thread-Local Storage
+
+### Design Principle
+
+**No C++ `thread_local` in any SO that gets dlclosed and re-dlopen'd.**
+C++ `thread_local` uses ELF TLSDESC on aarch64, which has known issues
+with dlclose/re-dlopen cycles in older glibc versions. The sim platform
+uses `pthread_key_t` (POSIX TLS) for per-thread state in framework SOs.
+
+### All TLS Variables
+
+| Variable | Storage | SO | Purpose |
+| -------- | ------- | -- | ------- |
+| `g_reg_base_key` | `pthread_key_t` | AICore SO | Per-core simulated register base address |
+| `g_core_id_key` | `pthread_key_t` | AICore SO | Per-core physical core ID |
+| `g_cpu_sim_context_key` | `pthread_key_t` | Host SO | Per-thread execution context (block_idx, subblock_id, etc.) |
+| `s_orch_thread_idx` | `__thread int` | AICPU SO | Profiling thread index (profiling off by default) |
+| `execution_context` | `thread_local` | Kernel SO (PTO ISA) | Per-thread execution context (fallback, cached values only) |
+| `NPUMemoryModel::instance` | `thread_local` | Kernel SO (PTO ISA) | Per-core memory model simulation |
+
+### Known Risks
+
+1. **`s_orch_thread_idx`** uses `__thread` (ELF TLS) in the AICPU SO. Could
+   cause issues on aarch64 glibc <2.39 if the AICPU SO is dlclosed and
+   re-dlopen'd while profiling is enabled. Currently safe because profiling
+   is off by default and the variable is only accessed during profiling.
+
+2. **PTO ISA `thread_local`** variables (`execution_context`,
+   `NPUMemoryModel::instance`) are in kernel SOs. Kernel SOs are short-lived
+   (loaded per task, dlclosed after validation), and each kernel thread is
+   freshly created, so stale TLS is not a concern in practice.
+
+## `-fno-gnu-unique`
+
+GCC emits `STB_GNU_UNIQUE` binding for `static` locals in inline/template
+functions. glibc marks such SOs as `NODELETE`, making `dlclose` a no-op.
+When multiple runtime SOs are loaded sequentially with `RTLD_GLOBAL`, the
+first SO's symbols persist and pollute the second.
+
+Applied to all sim compilation paths:
+
+- 6 CMakeLists (host/aicpu/aicore for a2a3 and a5): `$<$<CXX_COMPILER_ID:GNU>:-fno-gnu-unique>`
+- `toolchain.py` (GxxToolchain, Aarch64GxxToolchain): appended to compile flags
+
+Additionally, `data_type.h::get_element_size()` uses `constexpr static`
+instead of `static` to avoid generating UNIQUE symbols at the source level.
+
+## AicpuExecutor::deinit()
+
+The AICPU SO contains a file-scope static `AicpuExecutor g_aicpu_executor`.
+When the AICPU SO is dlclosed and re-dlopen'd between tasks, the static is
+reconstructed. But when the AICPU SO is **reused** (same runtime, consecutive
+tasks), `deinit()` must reset all fields. Previously missing resets:
+
+- `cores_total_num_`, `thread_num_`, `orch_thread_num_`, `sched_thread_num_`
+- `trackers_` / `core_trackers_`, `core_assignments_`, `core_count_per_thread_`
+- `orch_func_`, `orch_args_cached_`, `orch_so_handle_`, `orch_so_path_`
+
+Applies to all 5 runtime executors: a2a3 (abg, hbg, tmr), a5 (hbg, tmr).
+
+## SO Handle Caching and Reuse
+
+### Simulation
+
+| SO | Caching | Lifecycle |
+| -- | ------- | --------- |
+| Host runtime | `ChipWorker::lib_handle_` | Per-task: dlopen in `init()`, dlclose in `reset()` |
+| AICPU | `DeviceRunner::aicpu_so_handle_` | Per-run: loaded in `ensure_binaries_loaded()`, closed in `unload_executor_binaries()` at end of `run()` |
+| AICore | `DeviceRunner::aicore_so_handle_` | Same as AICPU |
+| Kernel | `DeviceRunner::func_id_to_addr_` (map by func_id) | Per-task: uploaded in `init_runtime_impl()`, removed in `validate_runtime_impl()` |
+| Orchestration | `AicpuExecutor::orch_so_handle_` | Per-run: loaded by orchestrator thread, closed by last thread in `deinit()` |
+
+### Onboard
+
+| Resource | Caching | Lifecycle |
+| -------- | ------- | --------- |
+| Host runtime | `ChipWorker::lib_handle_` | Per-runtime-group: shared across tasks in same group |
+| AICPU binary | `AicpuSoInfo` in DeviceRunner | Per-runtime-group: uploaded to device HBM once, reused |
+| AICore binary | `rtRegisterAllKernel` handle | Per-run: registered each `launch_aicore_kernel()` call |
+| Kernel binaries | `func_id_to_addr_` (device GM addresses) | Per-task: uploaded to device GM, cached by func_id |
+| CANN HAL | `g_hal_handle` (file-scope static) | Process lifetime: loaded once for profiling, never closed |
+
+### Key difference
+
+Onboard caches more aggressively — the DeviceRunner singleton persists
+across tasks and the AICPU binary stays in device memory. Simulation
+re-loads AICPU/AICore SOs every `run()` call because the SO's internal
+static state (`g_aicpu_executor`) must be fresh for each task when
+different tasks have different configurations.
+
+## Execution Lifecycle
+
+### Simulation (in-process, per-task init/reset)
+
+```text
+ChipWorker.init(host_path, aicpu_bytes, aicore_bytes)
+  dlopen(host_runtime.so, RTLD_GLOBAL)
+  dlsym: set_device, get_runtime_size, run_runtime, finalize_device
+  set_device(device_id)
+
+ChipWorker.run(callable, args, config)
+  run_runtime(buf, callable, args, ...)
+    new (buf) Runtime()
+    init_runtime_impl(r, callable, args)     build graph, upload kernels
+    DeviceRunner::run(r, ...)
+      clear_cpu_sim_shared_storage()
+      ensure_binaries_loaded()               dlopen aicpu/aicore SOs
+      launch AICPU + AICore threads
+      join all threads
+      unload_executor_binaries()             dlclose aicpu/aicore SOs
+    validate_runtime_impl(r)                 copy results, remove kernels
+    r->~Runtime()
+
+ChipWorker.reset()
+  finalize_device()
+  dlclose(host_runtime.so)                   -fno-gnu-unique ensures real unload
+```
+
+### Onboard (subprocess per device, ChipWorker reused per runtime group)
+
+```text
+device_worker_main(device_id)
+  for each runtime_group:
+    ChipWorker.init(host_path, aicpu_bytes, aicore_bytes)
+      dlopen(host_runtime.so, RTLD_GLOBAL)
+      set_device(device_id)                  rtSetDevice()
+
+    for each task in group:
+      ChipWorker.run(callable, args, config)
+        run_runtime(buf, callable, args, ...)
+          new (buf) Runtime()
+          init_runtime_impl()                rtMalloc, rtMemcpy to device
+          DeviceRunner::run()
+            ensure_binaries_loaded()         rtMemcpy AICPU SO to HBM (once)
+            rtAicpuKernelLaunchExWithArgs()   launch on device
+            rtStreamSynchronize()            wait for completion
+            launch_aicore_kernel()           rtRegisterAllKernel + rtKernelLaunch
+          validate_runtime_impl()            rtMemcpy results back to host
+
+    ChipWorker.reset()
+      finalize_device()                      rtDeviceReset()
+      dlclose(host_runtime.so)
+```
