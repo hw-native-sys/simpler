@@ -22,20 +22,12 @@
 
 #include <array>
 #include <cstdint>
-
-#if __has_include(<type_traits>)
 #include <type_traits>
-#define PTO_HAS_TYPE_TRAITS 1
-#else
-#define PTO_HAS_TYPE_TRAITS 0
-#endif
 
-#if PTO_HAS_TYPE_TRAITS
 template <typename T>
 inline constexpr bool kIsSupportedScalarArg =
     std::is_arithmetic_v<std::remove_cv_t<std::remove_reference_t<T>>> ||
     std::is_enum_v<std::remove_cv_t<std::remove_reference_t<T>>>;
-#endif
 
 /**
  * Supported data types for tensor elements
@@ -148,9 +140,7 @@ inline const char *get_dtype_name(DataType dtype) {
 template <typename T>
 PTO_DEVICE_FUNC inline uint64_t to_u64(T value) {
     static_assert(sizeof(T) <= sizeof(uint64_t), "to_u64: type must fit in 8 bytes");
-#if PTO_HAS_TYPE_TRAITS
     static_assert(std::is_trivially_copyable_v<T>, "to_u64: type must be trivially copyable");
-#endif
     union {
         uint64_t u;
         T v;
@@ -169,9 +159,7 @@ PTO_DEVICE_FUNC inline uint64_t to_u64(T value) {
 template <typename T>
 PTO_DEVICE_FUNC inline T from_u64(uint64_t bits) {
     static_assert(sizeof(T) <= sizeof(uint64_t), "from_u64: type must fit in 8 bytes");
-#if PTO_HAS_TYPE_TRAITS
     static_assert(std::is_trivially_copyable_v<T>, "from_u64: type must be trivially copyable");
-#endif
     union {
         uint64_t u;
         T v;
