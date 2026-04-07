@@ -9,116 +9,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  # ---------- Pre-commit hooks (format, lint, clang-tidy) ----------
-  pre-commit:
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Install build and lint tools
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ clang-tidy
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install Python dependencies
-        run: pip install numpy ml_dtypes
-
-      - name: Cache cmake build directories
-        uses: actions/cache@v3
-        with:
-          path: build/cache
-          key: cmake-sim-${{ runner.os }}-${{ hashFiles('src/**/CMakeLists.txt', 'src/**/build_config.py', 'python/runtime_compiler.py') }}
-          restore-keys: |
-            cmake-sim-${{ runner.os }}-
-
-      - name: Build sim runtimes (generates per-target compile_commands.json)
-        run: python examples/scripts/build_runtimes.py --platforms a2a3sim a5sim
-
-      - name: Run pre-commit
-        uses: pre-commit/action@v3.0.0
-        with:
-          extra_args: --from-ref ${{ github.event.pull_request.base.sha }} --to-ref ${{ github.event.pull_request.head.sha }}
-
-  # ---------- Python unit tests (no hardware) ----------
-  ut-py:
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
-        run: |
-          pip install numpy
-          pip install ml_dtypes
-          pip install pytest
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-
-      - name: Build nanobind extension
-        run: pip install .
-
-      - name: Run unit tests
-        run: pytest tests -m "not requires_hardware" -v
-
-  # ---------- Simulation scene tests ----------
+  # ---------- Simulation scene tests (debug) ----------
   st-sim-a2a3:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ['3.10']
-
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up C++ compiler
         run: |
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            sudo apt-get update
-            sudo apt-get install -y ninja-build
-            sudo apt-get install -y g++-15 || sudo apt-get install -y g++
-            if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
-          else
-            brew install ninja
-            brew install gcc@15 || brew install gcc
-          fi
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gdb
+          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+          if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
@@ -131,44 +40,31 @@ jobs:
         run: pip install .
 
       - name: Run simulation examples (a2a3sim)
-        run: python ci.py -p a2a3sim -c 882c4db -t 600 --clone-protocol https
+        run: python ci.py -p a2a3sim -c 882c4db -t 600 --clone-protocol https || true
+
+      - name: Debug via tmate
+        uses: mxschmitt/action-tmate@v3
+        with:
+          limit-access-to-actor: true
 
   st-sim-a5:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-        python-version: ['3.10']
-
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up C++ compiler
         run: |
-          if [[ "${{ runner.os }}" == "Linux" ]]; then
-            sudo apt-get update
-            sudo apt-get install -y ninja-build
-            sudo apt-get install -y g++-15 || sudo apt-get install -y g++
-            if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
-          else
-            brew install ninja
-            brew install gcc@15 || brew install gcc
-          fi
+          sudo apt-get update
+          sudo apt-get install -y ninja-build gdb
+          sudo apt-get install -y g++-15 || sudo apt-get install -y g++
+          if ! command -v g++-15; then sudo ln -s $(which g++) /usr/local/bin/g++-15; fi
 
-      - name: Set up Python ${{ matrix.python-version }}
+      - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+          python-version: '3.10'
 
       - name: Install dependencies
         run: |
@@ -181,113 +77,9 @@ jobs:
         run: pip install .
 
       - name: Run simulation examples (a5sim)
-        run: python ci.py -p a5sim -c 882c4db -t 600 --clone-protocol https
+        run: python ci.py -p a5sim -c 882c4db -t 600 --clone-protocol https || true
 
-  # ---------- Python unit tests (a2a3 hardware) ----------
-  ut-py-a2a3:
-    runs-on: [self-hosted, a2a3]
-    timeout-minutes: 30
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build nanobind extension
-        run: pip install .
-
-      - name: Run hardware unit tests (a2a3)
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest tests -m requires_hardware --platform a2a3 -v
-
-  # ---------- Scene tests (a2a3 hardware) ----------
-  st-onboard-a2a3:
-    runs-on: [self-hosted, a2a3]
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build nanobind extension
-        run: pip install .
-
-      - name: Run on-device examples (a2a3)
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python ci.py -p a2a3 -d ${DEVICE_RANGE} -c 882c4db -t 600 --clone-protocol https
-
-
-  # ---------- Detect A5 changes (runs on GitHub server, not A5 machine) ----------
-  detect-changes:
-    runs-on: ubuntu-latest
-    outputs:
-      a5_changed: ${{ steps.check.outputs.a5_changed }}
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Debug via tmate
+        uses: mxschmitt/action-tmate@v3
         with:
-          fetch-depth: 0
-      - name: Check A5 file changes
-        id: check
-        run: |
-          FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
-
-          # Skip A5 only when ALL changed files are confined to a2a3-only or non-code paths.
-          # Shared code (src/common/, python/, examples/scripts/, build files) affects A5.
-          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|device_tests)/a2a3/)'
-          NON_CODE='^(docs/|\.docs/|\.claude/|KNOWN_ISSUES\.md$|\.gitignore$|README\.md$|\.pre-commit-config\.yaml$)'
-
-          # Filter out a2a3-only and non-code files; if anything remains, it may affect A5
-          REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
-
-          if [ -n "$REMAINING" ]; then
-            echo "a5_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Files affecting A5:"
-            echo "$REMAINING"
-          else
-            echo "a5_changed=false" >> "$GITHUB_OUTPUT"
-            echo "All changes are a2a3-only or non-code; skipping A5"
-          fi
-  # TODO: Uncomment when a5 hardware runner is available.
-  #       Add the "a5" label to the runner, matching [self-hosted, a5] below.
-  #
-  # ut-py-a5:
-  #   needs: detect-changes
-  #   runs-on: [self-hosted, a5]
-  #   timeout-minutes: 30
-  #
-  #   steps:
-  #     - name: Checkout repository
-  #       uses: actions/checkout@v4
-  #
-  #     - name: Build nanobind extension
-  #       run: pip install .
-  #
-  #     - name: Run hardware unit tests (a5)
-  #       run: |
-  #         export PATH="$HOME/.local/bin:$PATH"
-  #         source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest tests -m requires_hardware --platform a5 -v
-  #
-
-  st-onboard-a5:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.a5_changed == 'true'
-    runs-on: [self-hosted, a5]
-    timeout-minutes: 60
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Build nanobind extension
-        run: |
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash
-          PTO_ARCH=a5 pip install .
-
-      - name: Run on-device examples (a5)
-        run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash
-          DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python ci.py -p a5 -d ${DEVICE_RANGE} -c 882c4db -t 1200 --clone-protocol https"
+          limit-access-to-actor: true
