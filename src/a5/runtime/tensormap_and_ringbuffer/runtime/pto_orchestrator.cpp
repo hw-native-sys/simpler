@@ -114,34 +114,84 @@ static uint32_t g_orch_submit_idx = 0;
 #define CYCLE_COUNT_LAP_RECORD(acc, phase_id, tid)
 #endif
 
-static bool pto2_append_fanin_or_fail(
-    PTO2OrchestratorState *orch, PTO2TaskId task_id, int32_t tensor_arg_index, TensorArgType ptype,
-    PTO2TaskSlotState *prod_state, PTO2TaskSlotState *fanin_states[], int32_t *fanin_count, const char *reason
-) {
-    for (int32_t j = 0; j < *fanin_count; j++) {
-        if (fanin_states[j] == prod_state) {
-            return true;
-        }
+static void *pto2_aligned_zalloc(size_t size, size_t alignment) {
+    void *ptr = nullptr;
+    if (posix_memalign(&ptr, alignment, size) != 0) {
+        return nullptr;
+    }
+    memset(ptr, 0, size);
+    return ptr;
+}
+
+struct PTO2FaninBuilder {
+    PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
+    int32_t count{0};
+    int32_t spill_start{0};
+    PTO2FaninPool *spill_pool{nullptr};
+
+    template <typename Fn>
+    PTO2FaninForEachReturn<Fn> for_each(Fn &&fn) const {
+        return pto2_for_each_fanin_storage(inline_slots, count, spill_start, spill_pool, static_cast<Fn &&>(fn));
     }
 
-    if (*fanin_count >= PTO2_MAX_INPUTS) {
+    bool contains(PTO2TaskSlotState *prod_state) const {
+        bool found = false;
+        for_each([&](PTO2TaskSlotState *slot_state) {
+            if (slot_state == prod_state) {
+                found = true;
+                return false;
+            }
+            return true;
+        });
+        if (found) {
+            return true;
+        }
+        return false;
+    }
+};
+
+static bool pto2_append_fanin_or_fail(
+    PTO2OrchestratorState *orch, PTO2TaskId task_id, int32_t tensor_arg_index, TensorArgType ptype,
+    PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, PTO2SchedulerState *sched, PTO2RingFlowControl &fc,
+    uint8_t ring_id, const char *reason
+) {
+    if (fanin_builder->contains(prod_state)) {
+        return true;
+    }
+
+    if (fanin_builder->count < PTO2_FANIN_INLINE_CAP) {
+        fanin_builder->inline_slots[fanin_builder->count++] = prod_state;
+        return true;
+    }
+
+    if (sched == nullptr || fanin_builder->spill_pool == nullptr) {
         LOG_ERROR("========================================");
-        LOG_ERROR("FATAL: Dependency Overflow Detected!");
+        LOG_ERROR("FATAL: Fanin Spill Builder Misconfigured!");
         LOG_ERROR("========================================");
-        LOG_ERROR("Task requires more than PTO2_MAX_INPUTS unique fanin dependencies.");
+        LOG_ERROR("Missing scheduler or fanin spill pool while appending dynamic fanin.");
         LOG_ERROR("  task_id.raw:        %" PRIu64, task_id.raw);
         LOG_ERROR("  tensor_arg_index:   %d", tensor_arg_index);
         LOG_ERROR("  tensor_arg_type:    %d", static_cast<int>(ptype));
-        LOG_ERROR("  fanin_count:        %d / %d", *fanin_count, PTO2_MAX_INPUTS);
         LOG_ERROR("  reason:             %s", reason);
-        LOG_ERROR("This is a runtime dependency-tracking limit.");
         LOG_ERROR("========================================");
         orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_DEPENDENCY_OVERFLOW, std::memory_order_release);
         orch->fatal = true;
         return false;
     }
 
-    fanin_states[(*fanin_count)++] = prod_state;
+    PTO2FaninPool &fanin_pool = *fanin_builder->spill_pool;
+    fanin_pool.ensure_space(*sched, fc, ring_id, 1);
+    int32_t spill_idx = fanin_pool.top;
+    PTO2FaninSpillEntry *entry = fanin_pool.alloc();
+    if (entry == nullptr) {
+        orch->fatal = true;
+        return false;
+    }
+    if (fanin_builder->count == PTO2_FANIN_INLINE_CAP) {
+        fanin_builder->spill_start = spill_idx;
+    }
+    entry->slot_state = prod_state;
+    fanin_builder->count++;
     return true;
 }
 
@@ -171,14 +221,29 @@ bool pto2_orchestrator_init(
             &fc.last_task_alive, ring_heap_base, heap_size, &sm_handle->header->orch_error_code
         );
 
+        size_t fanin_pool_bytes =
+            PTO2_ALIGN_UP(static_cast<size_t>(dep_pool_capacity) * sizeof(PTO2FaninSpillEntry), PTO2_ALIGN_SIZE);
+        PTO2FaninSpillEntry *fanin_entries =
+            reinterpret_cast<PTO2FaninSpillEntry *>(pto2_aligned_zalloc(fanin_pool_bytes, PTO2_ALIGN_SIZE));
+        if (!fanin_entries) {
+            for (int j = 0; j < r; j++) {
+                free(orch->rings[j].fanin_pool.base);
+                free(orch->rings[j].dep_pool.base);
+            }
+            return false;
+        }
+        orch->rings[r].fanin_pool.init(fanin_entries, dep_pool_capacity, &sm_handle->header->orch_error_code);
+
         // Allocate and initialize dependency list pool (per-ring)
         PTO2DepListEntry *dep_entries =
             reinterpret_cast<PTO2DepListEntry *>(calloc(dep_pool_capacity, sizeof(PTO2DepListEntry)));
         if (!dep_entries) {
             // Cleanup previously allocated rings
             for (int j = 0; j < r; j++) {
+                free(orch->rings[j].fanin_pool.base);
                 free(orch->rings[j].dep_pool.base);
             }
+            free(orch->rings[r].fanin_pool.base);
             return false;
         }
         orch->rings[r].dep_pool.init(dep_entries, dep_pool_capacity, &sm_handle->header->orch_error_code);
@@ -191,6 +256,7 @@ bool pto2_orchestrator_init(
     }
     if (!orch->tensor_map.init_default(task_window_sizes)) {
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            free(orch->rings[r].fanin_pool.base);
             free(orch->rings[r].dep_pool.base);
         }
         return false;
@@ -206,6 +272,7 @@ bool pto2_orchestrator_init(
         free(orch->scope_tasks);
         free(orch->scope_begins);
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            free(orch->rings[r].fanin_pool.base);
             free(orch->rings[r].dep_pool.base);
         }
         orch->tensor_map.destroy();
@@ -223,6 +290,8 @@ void pto2_orchestrator_destroy(PTO2OrchestratorState *orch) {
     orch->tensor_map.destroy();
 
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        free(orch->rings[r].fanin_pool.base);
+        orch->rings[r].fanin_pool.base = NULL;
         free(orch->rings[r].dep_pool.base);
         orch->rings[r].dep_pool.base = NULL;
     }
@@ -461,9 +530,10 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         scope_tasks_push(orch, nullptr);
     }
 
-    // Temporary storage for fanin (cached slot state pointers, avoids repeated ring/slot lookups)
-    PTO2TaskSlotState *fanin_states[PTO2_MAX_INPUTS];
-    int32_t fanin_count = 0;
+    PTO2FaninBuilder fanin_builder;
+    fanin_builder.count = 0;
+    fanin_builder.spill_start = 0;
+    fanin_builder.spill_pool = &orch->rings[ring_id].fanin_pool;
 
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id.raw);
 
@@ -502,7 +572,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
             PTO2TaskSlotState *prod_state =
                 &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
             if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, fanin_states, &fanin_count, "creator retention"
+                    orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "creator retention"
                 )) {
                 return result;
             }
@@ -526,7 +596,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
             auto prod_local = entry.producer_task_id.local();
             PTO2TaskSlotState *prod_state = &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
             if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, fanin_states, &fanin_count, "overlap lookup"
+                    orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "overlap lookup"
                 )) {
                 return result;
             }
@@ -568,9 +638,9 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     if (sched) {
         auto &rs = sched->ring_sched_states[ring_id];
         __builtin_prefetch(&rs.get_slot_state_by_slot(slot), 1, 0);
-        for (int i = 0; i < fanin_count; i++) {
-            __builtin_prefetch(fanin_states[i], 1, 0);
-        }
+        fanin_builder.for_each([](PTO2TaskSlotState *producer_slot_state) {
+            __builtin_prefetch(producer_slot_state, 1, 0);
+        });
     }
 
     payload->init(args, result, alloc_result.packed_base, offsets, buffer_sizes);
@@ -604,34 +674,35 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         cur_slot_state.next_block_idx = 0;
 
         auto &dep_pool = orch->rings[ring_id].dep_pool;
-        // Ensure dep pool has space: fanin_count entries + 1 pre-alloc
+        int32_t fanin_count = fanin_builder.count;
+        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
+        int32_t spill_count = fanin_count - inline_count;
         dep_pool.ensure_space(*sched, fc, ring_id, fanin_count + 1);
 
         int32_t early_finished = 0;
         cur_slot_state.fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
         payload->fanin_actual_count = fanin_count;
-        for (int i = 0; i < fanin_count; i++) {
-            payload->fanin_slot_states[i] = fanin_states[i];
+        payload->fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
+        payload->fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
+        for (int i = 0; i < inline_count; i++) {
+            payload->fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
         }
-        for (int i = 0; i < fanin_count; i++) {
-            PTO2TaskSlotState &producer_slot_state = *fanin_states[i];
+        pto2_for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot) {
+            PTO2TaskSlotState &producer_slot_state = *producer_slot;
 #if PTO2_ORCH_PROFILING
             pto2_fanout_lock(producer_slot_state, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
 #else
             pto2_fanout_lock(producer_slot_state);
 #endif
-            // Normal path: prepend consumer to producer's fanout list
             producer_slot_state.fanout_count += 1;
             int32_t prod_state = producer_slot_state.task_state.load(std::memory_order_acquire);
             if (prod_state >= PTO2_TASK_COMPLETED) {
-                // Early return optimization: if producer already completed, we can skip adding dependency and directly
-                // decrement fanin_count
                 early_finished++;
             } else {
                 producer_slot_state.fanout_head = dep_pool.prepend(producer_slot_state.fanout_head, &cur_slot_state);
             }
             pto2_fanout_unlock(producer_slot_state);
-        }
+        });
         // Combined release: merge early_finished batch with the +1 init release
         // into a single atomic fetch_add (saves one acq_rel cache-line bounce per task).
         int32_t initial_refcount = early_finished + 1;  // +1 for the init release
@@ -675,7 +746,14 @@ void pto2_orchestrator_done(PTO2OrchestratorState *orch) {
         if (total_tasks > 0) {
             LOG_INFO("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
         }
+        auto &fanin_pool = orch->rings[r].fanin_pool;
         auto &pool = orch->rings[r].dep_pool;
+        if (fanin_pool.top > 1) {
+            LOG_INFO(
+                "=== [FaninPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===", r, fanin_pool.top,
+                fanin_pool.tail, fanin_pool.top - fanin_pool.tail, fanin_pool.high_water, fanin_pool.capacity
+            );
+        }
         if (pool.top > 0) {
             LOG_INFO(
                 "=== [DepPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===", r, pool.top, pool.tail,
@@ -708,6 +786,9 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState *orch) {
             LOG_INFO(
                 "Ring %d heap used:    %" PRIu64 " / %" PRIu64, r, orch->rings[r].task_allocator.heap_top(),
                 orch->rings[r].task_allocator.heap_capacity()
+            );
+            LOG_INFO(
+                "Ring %d fanin pool:   %d / %d", r, orch->rings[r].fanin_pool.used(), orch->rings[r].fanin_pool.capacity
             );
             LOG_INFO(
                 "Ring %d dep pool:     %d / %d", r, orch->rings[r].dep_pool.used(), orch->rings[r].dep_pool.capacity

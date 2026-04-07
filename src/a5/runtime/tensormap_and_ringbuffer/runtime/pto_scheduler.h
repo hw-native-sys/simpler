@@ -754,14 +754,13 @@ struct PTO2SchedulerState {
     int32_t on_task_release(PTO2TaskSlotState &slot_state) {
 #endif
         PTO2TaskPayload *payload = slot_state.payload;
-        int32_t fanin_edges = payload->fanin_actual_count;
-        for (int32_t i = 0; i < fanin_edges; i++) {
+        pto2_for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot_state) {
 #if PTO2_SCHED_PROFILING
-            release_producer(*payload->fanin_slot_states[i], fanin_atomics);
+            release_producer(*producer_slot_state, fanin_atomics);
 #else
-            release_producer(*payload->fanin_slot_states[i]);
+            release_producer(*producer_slot_state);
 #endif
-        }
+        });
 #if PTO2_SCHED_PROFILING
         g_sched_fanin_atomic_count[thread_idx] += fanin_atomics;
         PTO2_SCHED_CYCLE_LAP(g_sched_fanin_cycle[thread_idx]);
@@ -777,7 +776,7 @@ struct PTO2SchedulerState {
 #else
         check_and_handle_consumed(slot_state);
 #endif
-        return fanin_edges;
+        return payload->fanin_actual_count;
     }
 };  // NOLINT(readability/braces)
 

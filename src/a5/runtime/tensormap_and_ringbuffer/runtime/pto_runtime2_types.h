@@ -116,6 +116,9 @@
 #define PTO2_PACKED_OUTPUT_ALIGN 1024  // Each output in packed buffer aligned to 1024B; gap is padding
 #define PTO2_ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))
 
+// Fanin storage
+#define PTO2_FANIN_INLINE_CAP 16
+
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
 #define PTO2_DEP_POOL_CLEANUP_INTERVAL 64   // Cleanup every N retired tasks
@@ -296,13 +299,17 @@ typedef struct {
 // Dependency List Entry
 // =============================================================================
 
+struct PTO2TaskSlotState;  // Forward declaration
+struct PTO2FaninPool;      // Forward declaration
+struct PTO2FaninSpillEntry {
+    PTO2TaskSlotState *slot_state;
+};
+static_assert(sizeof(PTO2FaninSpillEntry) == sizeof(PTO2TaskSlotState *));
+
 /**
  * Dependency list entry (singly-linked list node)
- * Stored in DepListPool ring buffer
- *
- * Used for both fanin_list and fanout_list
+ * Stored in DepListPool ring buffer.
  */
-struct PTO2TaskSlotState;  // Forward declaration
 struct PTO2DepListEntry {
     PTO2TaskSlotState *slot_state;  // Consumer slot state (direct pointer)
     PTO2DepListEntry *next;         // next entry
@@ -340,18 +347,18 @@ struct PTO2TaskDescriptor {
 /**
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
- * Layout: metadata (counts, fanin pointers) packed in the first 3 cache lines,
- * followed by bulk tensor and scalar data. This gives sequential write access
- * during orchestration and groups scheduler-hot fields (fanin_actual_count +
- * fanin_slot_states) together for on_task_release.
+ * Layout: metadata + inline fanin packed in the first 3 cache lines, followed
+ * by bulk tensor and scalar data. Small fanins stay fully inline; larger
+ * fanins spill into a per-ring ring buffer slice.
  */
 struct PTO2TaskPayload {
     // === Cache lines 0-2 (192B) — metadata ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
-    int32_t _reserved{0};           // Reserved (dep_pool_mark moved to SlotState for local access)
-    PTO2TaskSlotState *fanin_slot_states[PTO2_MAX_INPUTS];  // Producer slot states (used by on_task_release)
+    int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
+    PTO2FaninPool *fanin_spill_pool{nullptr};
+    PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
     // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 35-50 (1024B) — scalars ===
@@ -396,6 +403,10 @@ struct PTO2TaskPayload {
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
+static_assert(
+    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24,
+    "inline fanin array must follow spill metadata"
+);
 static_assert(offsetof(PTO2TaskPayload, tensors) == 192, "tensors must start at byte 192 (cache line 3)");
 static_assert(
     offsetof(PTO2TaskPayload, scalars) == 192 + MAX_TENSOR_ARGS * sizeof(Tensor),
