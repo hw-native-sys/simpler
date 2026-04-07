@@ -218,7 +218,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
      */
     template <typename T = uint64_t>
     void add_scalar(T value) {
-        static_assert(kIsSupportedScalarArg<T>, "add_scalar: type must be arithmetic or enum");
+        static_assert(is_supported_scalar_arg_v<T>, "add_scalar: type must be arithmetic or enum");
         if (scalar_count_ >= MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;

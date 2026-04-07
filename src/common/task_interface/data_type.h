@@ -25,9 +25,8 @@
 #include <type_traits>
 
 template <typename T>
-inline constexpr bool kIsSupportedScalarArg =
-    std::is_arithmetic_v<std::remove_cv_t<std::remove_reference_t<T>>> ||
-    std::is_enum_v<std::remove_cv_t<std::remove_reference_t<T>>>;
+inline constexpr bool is_supported_scalar_arg_v = std::is_arithmetic_v<std::remove_cv_t<std::remove_reference_t<T>>> ||
+                                                  std::is_enum_v<std::remove_cv_t<std::remove_reference_t<T>>>;
 
 /**
  * Supported data types for tensor elements
