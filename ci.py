@@ -14,7 +14,7 @@ Replaces ci.sh by running all test tasks (sim + HW) in a single Python process
 per device, reusing ChipWorker across tasks that share the same runtime.
 
 Usage:
-    python tools/ci.py -p a2a3 -d 5-8 --parallel -c 6622890 -t 600
+    python tools/ci.py -p a2a3 -d 5-8 -c 6622890 -t 600
     python tools/ci.py -p a2a3sim -r tensormap_and_ringbuffer -c 6622890 -t 600
 """
 
@@ -35,7 +35,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from queue import Empty, Queue
 from threading import Lock, Thread
-from typing import Any, Protocol, cast
+from typing import Any, Callable, Protocol, cast
 
 # ---------------------------------------------------------------------------
 # Path setup — mirrors run_example.py
@@ -733,6 +733,7 @@ def _run_device_worker_subprocess(
     args: argparse.Namespace,
     tag: str,
     pto_isa_commit: str | None = None,
+    print_log_on_fail: bool = False,
 ) -> list[TaskResult]:
     """Run a task batch in one device-worker subprocess and return its reported results."""
     base_args = _build_device_worker_base_args(args)
@@ -765,10 +766,11 @@ def _run_device_worker_subprocess(
 
     logger.info(f"[{tag}:dev{device_id}] Launching: {' '.join(full_cmd)}")
     try:
-        proc = subprocess.run(full_cmd, check=False, capture_output=True, text=True, timeout=args.timeout)
+        proc = subprocess.run(full_cmd, check=False, capture_output=True, text=True)
         device_results = _read_results_json(result_path)
         if proc.returncode != 0:
-            logger.error(f"[{tag}:dev{device_id}] Failed:\n{proc.stdout}\n{proc.stderr}")
+            if print_log_on_fail:
+                logger.error(f"[{tag}:dev{device_id}] Failed:\n{proc.stdout}\n{proc.stderr}")
         fallback_needed = proc.returncode != 0 and not any(not result.passed for result in device_results)
         if fallback_needed:
             device_results.append(
@@ -783,20 +785,6 @@ def _run_device_worker_subprocess(
                 )
             )
         return device_results
-    except subprocess.TimeoutExpired:
-        error_msg = f"Timed out after {args.timeout}s"
-        logger.error(f"[{tag}:dev{device_id}] {error_msg}")
-        return [
-            TaskResult(
-                name=f"{tag}-device-{device_id}",
-                platform=args.platform,
-                passed=False,
-                device=str(device_id),
-                attempt=0,
-                elapsed_s=args.timeout,
-                error=error_msg,
-            )
-        ]
     finally:
         task_list_path.unlink(missing_ok=True)
         result_path.unlink(missing_ok=True)
@@ -827,17 +815,22 @@ def run_sim_tasks_subprocess(
     pto_isa_commit: str | None = None,
 ) -> list[TaskResult]:
     """Run simulation tasks: one subprocess per task, no retry."""
+    is_pin_retry = pto_isa_commit is not None
     results: list[TaskResult] = []
-    for task in tasks:
+    total = len(tasks)
+    for i, task in enumerate(tasks, 1):
         task_results = _run_device_worker_subprocess(
             [task],
             0,
             args,
             tag="sim",
             pto_isa_commit=pto_isa_commit,
+            print_log_on_fail=is_pin_retry,
         )
         normalized = _normalize_task_result(task, 0, 0, task_results)
         results.append(normalized)
+        status = "PASS" if normalized.passed else "FAIL"
+        logger.info(f"[sim] [{i}/{total}] {status}: {task.name} ({normalized.elapsed_s:.1f}s)")
     return results
 
 
@@ -847,54 +840,92 @@ def run_hw_tasks_subprocess(
     args: argparse.Namespace,
     pto_isa_commit: str | None = None,
 ) -> list[TaskResult]:
-    """Run hardware tasks: one subprocess per task, retry up to MAX_RETRIES in parent."""
-    task_queue: Queue[tuple[TaskSpec, int] | None] = Queue()
+    """Run hardware tasks: one subprocess per task.
+
+    On any failure the device is immediately quarantined (worker exits). Healthy
+    devices keep pulling from the shared queue. Tasks that were never run or failed
+    are collected so the caller can re-run them in a pin-commit pass with all devices
+    refreshed.
+    """
+    task_queue: Queue[tuple[TaskSpec, int]] = Queue()
+    total = len(tasks)
     for task in tasks:
         task_queue.put((task, 0))
 
     results: list[TaskResult] = []
     results_lock = Lock()
+    completed = [0]  # mutable counter for thread-safe increment
+    quarantined: set[int] = set()
+    quarantine_lock = Lock()
     tag = "hw"
+
+    is_pin_retry = pto_isa_commit is not None
 
     def _run_device(dev_id: int):
         while True:
-            item = task_queue.get()
-            if item is None:
-                task_queue.task_done()
+            try:
+                task, attempt = task_queue.get_nowait()
+            except Empty:
                 return
 
-            task, attempt = item
-            try:
-                task_results = _run_device_worker_subprocess(
-                    [task],
-                    dev_id,
-                    args,
-                    tag=tag,
-                    pto_isa_commit=pto_isa_commit,
-                )
-                normalized = _normalize_task_result(task, dev_id, attempt, task_results)
-                with results_lock:
-                    results.append(normalized)
+            is_last_attempt = attempt + 1 >= MAX_RETRIES
+            task_results = _run_device_worker_subprocess(
+                [task],
+                dev_id,
+                args,
+                tag=tag,
+                pto_isa_commit=pto_isa_commit,
+                print_log_on_fail=is_pin_retry and is_last_attempt,
+            )
+            normalized = _normalize_task_result(task, dev_id, attempt, task_results)
+            with results_lock:
+                results.append(normalized)
+                if normalized.passed or is_last_attempt:
+                    completed[0] += 1
+                n = completed[0]
+            status = "PASS" if normalized.passed else "FAIL"
+            attempt_info = f" attempt {attempt + 1}" if attempt > 0 else ""
+            logger.info(
+                f"[{tag}:dev{dev_id}] [{n}/{total}] {status}: {task.name}{attempt_info} ({normalized.elapsed_s:.1f}s)"
+            )
 
-                if normalized.passed:
-                    continue
+            if normalized.passed:
+                continue
 
-                next_attempt = attempt + 1
-                if next_attempt < MAX_RETRIES:
-                    task_queue.put((task, next_attempt))
-                else:
-                    logger.warning(f"[{tag}:dev{dev_id}] Exhausted retries on {task.name}")
-            finally:
-                task_queue.task_done()
+            # Failure: re-enqueue with attempt+1 if under limit, quarantine this device
+            if not is_last_attempt:
+                task_queue.put((task, attempt + 1))
+            logger.warning(f"[{tag}:dev{dev_id}] Quarantined after failure on {task.name}")
+            with quarantine_lock:
+                quarantined.add(dev_id)
+            return
 
     threads = [Thread(target=_run_device, args=(device_id,)) for device_id in devices]
     for t in threads:
         t.start()
-    task_queue.join()
-    for _ in threads:
-        task_queue.put(None)
     for t in threads:
         t.join()
+
+    # Tasks stranded in queue — all devices quarantined before queue emptied
+    while True:
+        try:
+            task, attempt = task_queue.get_nowait()
+        except Empty:
+            break
+        results.append(
+            TaskResult(
+                name=task.name,
+                platform=task.platform,
+                passed=False,
+                device="N/A",
+                attempt=attempt,
+                elapsed_s=0,
+                error="All devices quarantined",
+            )
+        )
+
+    if quarantined:
+        logger.warning(f"[{tag}] Quarantined devices: {sorted(quarantined)}")
 
     return results
 
@@ -1127,7 +1158,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-c", "--pto-isa-commit", default=None)
     parser.add_argument("-t", "--timeout", type=int, default=600)
     parser.add_argument("--clone-protocol", choices=["ssh", "https"], default="ssh")
-    parser.add_argument("--parallel", action="store_true")
     parser.add_argument("--all", dest="run_all_cases", action="store_true", help="Run all cases, not just DEFAULT_CASE")
     parser.add_argument("--device-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--result-json", default=None, help=argparse.SUPPRESS)
@@ -1142,9 +1172,32 @@ def parse_device_range(device_range: str) -> list[int]:
     return [int(device_range)]
 
 
+def _run_with_timeout(
+    phase_name: str,
+    timeout_s: int,
+    runner: Callable[[], list[TaskResult]],
+) -> list[TaskResult]:
+    def _watchdog_handler(signum, frame):
+        print(f"\n{'=' * 40}", flush=True)
+        print(
+            f"[CI] TIMEOUT: {phase_name} exceeded {timeout_s}s ({timeout_s // 60}min) limit, aborting",
+            flush=True,
+        )
+        print(f"{'=' * 40}", flush=True)
+        os._exit(1)
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _watchdog_handler)
+    signal.alarm(timeout_s)
+    try:
+        return runner()
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
 def main() -> int:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", force=True)
-    os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
 
     args = parse_args()
     args.devices = parse_device_range(args.device_range)
@@ -1161,20 +1214,6 @@ def main() -> int:
     if args.device_worker:
         return device_worker_main(args)
 
-    # Watchdog timer
-    watchdog_fired = False
-
-    def _watchdog_handler(signum, frame):
-        nonlocal watchdog_fired
-        watchdog_fired = True
-        print(f"\n{'=' * 40}", flush=True)
-        print(f"[CI] TIMEOUT: exceeded {args.timeout}s ({args.timeout // 60}min) limit, aborting", flush=True)
-        print(f"{'=' * 40}", flush=True)
-        os._exit(1)
-
-    signal.signal(signal.SIGALRM, _watchdog_handler)
-    signal.alarm(args.timeout)
-
     # Step 1: Discover tasks
     tasks = discover_tasks(args.platform, runtime_filter=args.runtime)
     if not tasks:
@@ -1183,11 +1222,15 @@ def main() -> int:
     logger.info(f"Discovered {len(tasks)} tasks")
 
     # Step 2: Compile and run — each task in its own subprocess.
-    # sim: no retry; hw: retry up to MAX_RETRIES in parent.
+    # hw: failed device is quarantined; healthy devices keep running remaining tasks.
     if is_sim:
-        all_results = run_sim_tasks_subprocess(tasks, args)
+        all_results = _run_with_timeout("initial pass", args.timeout, lambda: run_sim_tasks_subprocess(tasks, args))
     else:
-        all_results = run_hw_tasks_subprocess(tasks, args.devices, args)
+        all_results = _run_with_timeout(
+            "initial pass",
+            args.timeout,
+            lambda: run_hw_tasks_subprocess(tasks, args.devices, args),
+        )
 
     # Step 3: Pin retry — re-run failed tasks with pinned PTO-ISA commit.
     final: dict[str, TaskResult] = {}
@@ -1200,13 +1243,25 @@ def main() -> int:
         failed_tasks = [t for t in tasks if t.name in failed_names]
         logger.info(f"[CI] {len(failed_tasks)} failure(s), retrying with pinned PTO-ISA {args.pto_isa_commit}")
         if is_sim:
-            pin_results = run_sim_tasks_subprocess(failed_tasks, args, pto_isa_commit=args.pto_isa_commit)
+            pin_results = _run_with_timeout(
+                "pin retry",
+                args.timeout,
+                lambda: run_sim_tasks_subprocess(failed_tasks, args, pto_isa_commit=args.pto_isa_commit),
+            )
         else:
-            pin_results = run_hw_tasks_subprocess(failed_tasks, args.devices, args, pto_isa_commit=args.pto_isa_commit)
+            pin_results = _run_with_timeout(
+                "pin retry",
+                args.timeout,
+                lambda: run_hw_tasks_subprocess(
+                    failed_tasks,
+                    args.devices,
+                    args,
+                    pto_isa_commit=args.pto_isa_commit,
+                ),
+            )
         all_results.extend(pin_results)
 
     # Step 4: Summary
-    signal.alarm(0)
     return print_summary(all_results)
 
 
