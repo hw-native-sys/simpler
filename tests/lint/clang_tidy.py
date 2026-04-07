@@ -19,6 +19,7 @@ If no sim build cache exists, the sim runtimes are built first:
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +27,14 @@ from pathlib import Path
 _ROOT = Path(__file__).resolve().parents[2]
 _BUILD_RUNTIMES = _ROOT / "examples" / "scripts" / "build_runtimes.py"
 _CACHE_DIR = _ROOT / "build" / "cache"
+
+for _import_dir in (_ROOT / "python", _ROOT / "examples" / "scripts"):
+    _import_dir_str = str(_import_dir)
+    if _import_dir_str not in sys.path:
+        sys.path.insert(0, _import_dir_str)
+
+from platform_info import load_build_config, to_platform  # noqa: E402
+from runtime_compiler import RuntimeCompiler  # noqa: E402
 
 # Suppress compiler flags that are valid for GCC but unknown to clang.
 _SUPPRESS_ARGS = [
@@ -58,6 +67,82 @@ def _strip_gcc_flags(command: str) -> str:
     return shlex.join(filtered_parts)
 
 
+def _resolve_target_dirs(config_dir: Path, build_config: dict, target: str) -> tuple[list[str], list[str]]:
+    """Resolve include and source dirs for a target from build_config."""
+    cfg = build_config[target]
+    include_dirs = [str((config_dir / p).resolve()) for p in cfg["include_dirs"]]
+    source_dirs = [str((config_dir / p).resolve()) for p in cfg["source_dirs"]]
+    return include_dirs, source_dirs
+
+
+def _parse_db_path(db_file: Path) -> tuple[str, str, str, str]:
+    """Return (arch, variant, runtime, target) for a compile database path."""
+    try:
+        arch, variant, runtime_name, target, filename = db_file.relative_to(_CACHE_DIR).parts
+    except ValueError as exc:
+        raise RuntimeError(f"compile database is outside build/cache: {db_file}") from exc
+
+    if filename != "compile_commands.json":
+        raise RuntimeError(f"unexpected compile database file name: {db_file}")
+
+    return arch, variant, runtime_name, target
+
+
+def _reconfigure_compile_database(db_file: Path) -> None:
+    """Delete the broken target build dir and rerun CMake configure for it."""
+    arch, variant, runtime_name, target = _parse_db_path(db_file)
+    platform = to_platform(arch, variant)
+    config_path = _ROOT / "src" / arch / "runtime" / runtime_name / "build_config.py"
+    if not config_path.is_file():
+        raise RuntimeError(f"build config not found for compile database recovery: {config_path}")
+
+    build_config = load_build_config(config_path)
+    if target not in build_config:
+        raise RuntimeError(f"target '{target}' not found in build config: {config_path}")
+
+    include_dirs, source_dirs = _resolve_target_dirs(config_path.parent, build_config, target)
+    compiler = RuntimeCompiler.get_instance(platform=platform)
+    build_target = getattr(compiler, f"{target}_target", None)
+    if build_target is None:
+        raise RuntimeError(f"runtime compiler has no target configuration for '{target}'")
+
+    target_build_dir = db_file.parent
+    print(f"WARNING: reconfiguring broken compile database: {db_file}", file=sys.stderr)
+    if target_build_dir.exists():
+        shutil.rmtree(target_build_dir)
+    target_build_dir.mkdir(parents=True, exist_ok=True)
+
+    cmake_cmd = [
+        "cmake",
+        build_target.get_root_dir(),
+        "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
+    ] + build_target.gen_cmake_args(include_dirs, source_dirs)
+    compiler._run_build_step(cmake_cmd, str(target_build_dir), target.upper(), "CMake configuration")
+
+
+def _parse_compile_database(raw: str, db_file: Path) -> list[dict]:
+    """Parse compile_commands.json content and reject empty or malformed payloads."""
+    if not raw.strip():
+        raise ValueError(f"empty compile database: {db_file}")
+    entries = json.loads(raw)
+    if not isinstance(entries, list):
+        raise ValueError(f"compile database is not a JSON array: {db_file}")
+    return entries
+
+
+def _load_compile_database(db_file: Path) -> tuple[str, list[dict]]:
+    """Load a compile database, rebuilding its target cache dir when it is broken."""
+    raw = db_file.read_text()
+    try:
+        return raw, _parse_compile_database(raw, db_file)
+    except (ValueError, json.JSONDecodeError) as exc:
+        print(f"WARNING: invalid compile database detected: {exc}", file=sys.stderr)
+        _reconfigure_compile_database(db_file)
+
+    rebuilt_raw = db_file.read_text()
+    return rebuilt_raw, _parse_compile_database(rebuilt_raw, db_file)
+
+
 def _build_file_index() -> dict[str, list[Path]]:
     """Return a mapping from absolute source path to the db directories that compile it.
 
@@ -70,8 +155,7 @@ def _build_file_index() -> dict[str, list[Path]]:
     """
     index: dict[str, list[Path]] = {}
     for db_file in sorted(_CACHE_DIR.glob("*/sim/*/*/compile_commands.json")):
-        raw = db_file.read_text()
-        entries = json.loads(raw)
+        raw, entries = _load_compile_database(db_file)
         needs_filter = any(flag in raw for flag in _GCC_ONLY_FLAGS)
         if needs_filter:
             for entry in entries:
