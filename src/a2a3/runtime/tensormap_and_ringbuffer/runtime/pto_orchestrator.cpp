@@ -639,27 +639,65 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
             for (int32_t i = 0; i < cached_inline_count; i++) {
                 fanin_builder.inline_slots[i] = payload->fanin_inline_slot_states[i];
             }
+            int32_t local_edge_count = meta.incoming_edge_count;
+            int32_t fanin_count = cached_external_count + local_edge_count;
 
+            if (fanin_count > PTO2_MAX_INPUTS) {
+                LOG_ERROR("========================================");
+                LOG_ERROR("FATAL: Dependency Overflow Detected!");
+                LOG_ERROR("========================================");
+                LOG_ERROR("Task requires more than PTO2_MAX_INPUTS unique fanin dependencies.");
+                LOG_ERROR("  task_id.raw:        %" PRIu64, task_id.raw);
+                LOG_ERROR("  fanin_count:        %d / %d", fanin_count, PTO2_MAX_INPUTS);
+                LOG_ERROR("  reason:             manual explicit dependency");
+                LOG_ERROR("This is a runtime dependency-tracking limit.");
+                LOG_ERROR("========================================");
+                orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_DEPENDENCY_OVERFLOW, std::memory_order_release);
+                orch->fatal = true;
+                return;
+            }
+
+            // Explicit manual edges are deduped at record time, and current-scope
+            // producers never appear in cached_external_count because manual submit
+            // skips local owner/TensorMap discovery for those tensors.
+            auto append_local_fanin_or_fail = [&](PTO2TaskSlotState *prod_state) {
+                if (fanin_builder.count < PTO2_FANIN_INLINE_CAP) {
+                    fanin_builder.inline_slots[fanin_builder.count++] = prod_state;
+                    return true;
+                }
+
+                PTO2FaninPool &fanin_pool = *fanin_builder.spill_pool;
+                fanin_pool.ensure_space(*orch->scheduler, fc, ring_id, 1);
+                int32_t spill_idx = fanin_pool.top;
+                PTO2FaninSpillEntry *entry = fanin_pool.alloc();
+                if (entry == nullptr) {
+                    orch->fatal = true;
+                    return false;
+                }
+                if (fanin_builder.count == PTO2_FANIN_INLINE_CAP) {
+                    fanin_builder.spill_start = spill_idx;
+                }
+                entry->slot_state = prod_state;
+                fanin_builder.count++;
+                return true;
+            };
             for (int32_t edge_idx = meta.incoming_edge_head; edge_idx >= 0;
                  edge_idx = orch->manual_edges[edge_idx].next_consumer_edge) {
                 const PTO2ManualEdge &edge = orch->manual_edges[edge_idx];
                 PTO2TaskSlotState *prod_state = orch->scope_tasks[begin + edge.producer_idx];
-                if (!pto2_append_fanin_or_fail(
-                        orch, task_id, edge.consumer_idx, TensorArgType::INPUT, prod_state, &fanin_builder,
-                        orch->scheduler, fc, ring_id, "manual explicit dependency"
-                    )) {
+                if (!append_local_fanin_or_fail(prod_state)) {
                     return;
                 }
             }
 
-            int32_t fanin_count = fanin_builder.count;
-            int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-            int32_t spill_count = fanin_count - inline_count;
-            dep_pool.ensure_space(*orch->scheduler, fc, ring_id, fanin_count + 1);
+            int32_t final_fanin_count = fanin_builder.count;
+            int32_t inline_count = std::min(final_fanin_count, PTO2_FANIN_INLINE_CAP);
+            int32_t spill_count = final_fanin_count - inline_count;
+            dep_pool.ensure_space(*orch->scheduler, fc, ring_id, final_fanin_count + 1);
 
             slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
-            slot_state->fanin_count = fanin_count + 1;
-            payload->fanin_actual_count = fanin_count;
+            slot_state->fanin_count = final_fanin_count + 1;
+            payload->fanin_actual_count = final_fanin_count;
             payload->fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
             payload->fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
             for (int32_t i = 0; i < inline_count; i++) {
@@ -669,17 +707,16 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
             int32_t early_finished = 0;
             int32_t producer_index = 0;
             fanin_builder.for_each([&](PTO2TaskSlotState *producer_slot) {
+                if (producer_index >= cached_external_count) {
+                    return false;
+                }
                 PTO2TaskSlotState &producer_slot_state = *producer_slot;
-                bool cached_external = producer_index < cached_external_count;
                 producer_index++;
 #if PTO2_ORCH_PROFILING
                 pto2_fanout_lock(producer_slot_state, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
 #else
                 pto2_fanout_lock(producer_slot_state);
 #endif
-                if (!cached_external) {
-                    producer_slot_state.fanout_count += 1;
-                }
                 int32_t prod_state = producer_slot_state.task_state.load(std::memory_order_acquire);
                 if (prod_state >= PTO2_TASK_COMPLETED) {
                     early_finished++;
@@ -689,6 +726,14 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
                 pto2_fanout_unlock(producer_slot_state);
                 return true;
             });
+            for (int32_t edge_idx = meta.incoming_edge_head; edge_idx >= 0;
+                 edge_idx = orch->manual_edges[edge_idx].next_consumer_edge) {
+                PTO2TaskSlotState &producer_slot_state = *orch->scope_tasks[begin + orch->manual_edges[edge_idx].producer_idx];
+                // Same-scope explicit producers are unpublished until the batch
+                // publish below, so no scheduler thread can race on fanout state.
+                producer_slot_state.fanout_count += 1;
+                producer_slot_state.fanout_head = dep_pool.prepend(producer_slot_state.fanout_head, slot_state);
+            }
             if (early_finished > 0) {
                 slot_state->fanin_refcount.fetch_add(early_finished, std::memory_order_acq_rel);
             }
@@ -1148,6 +1193,7 @@ pto2_submit_mixed_task_manual(PTO2OrchestratorState *orch, const MixedKernels &m
     meta.slot_state = orch->scope_tasks[orch->scope_tasks_size - 1];
     meta.scope_task_index = orch->scope_tasks_size - 1 - current_manual_scope_begin(orch);
     meta.incoming_edge_head = -1;
+    meta.incoming_edge_count = 0;
     meta.tensor_count = static_cast<uint8_t>(args.tensor_count());
     meta.manual_local_mask = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
@@ -1188,6 +1234,12 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
 
     int32_t meta_begin = orch->manual_task_meta_begins[orch->scope_stack_top];
     PTO2ManualTaskMeta &consumer_meta = orch->manual_task_meta[meta_begin + consumer_idx];
+    for (int32_t edge_idx = consumer_meta.incoming_edge_head; edge_idx >= 0;
+         edge_idx = orch->manual_edges[edge_idx].next_consumer_edge) {
+        if (orch->manual_edges[edge_idx].producer_idx == producer_idx) {
+            return;
+        }
+    }
     int32_t edge_idx = manual_edge_push(
         orch,
         PTO2ManualEdge{
@@ -1197,6 +1249,7 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
         }
     );
     consumer_meta.incoming_edge_head = edge_idx;
+    consumer_meta.incoming_edge_count++;
 }
 
 // =============================================================================

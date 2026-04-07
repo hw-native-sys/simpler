@@ -44,6 +44,7 @@ struct PTO2ManualTaskMeta {
     PTO2TaskSlotState *slot_state;
     int32_t scope_task_index;
     int32_t incoming_edge_head;
+    uint16_t incoming_edge_count;
     uint8_t tensor_count;
     uint16_t manual_local_mask;
     uint8_t tags[MAX_TENSOR_ARGS];
