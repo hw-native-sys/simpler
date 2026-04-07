@@ -30,6 +30,13 @@
 #define PTO_HAS_TYPE_TRAITS 0
 #endif
 
+#if PTO_HAS_TYPE_TRAITS
+template <typename T>
+inline constexpr bool kIsSupportedScalarArg =
+    std::is_arithmetic_v<std::remove_cv_t<std::remove_reference_t<T>>> ||
+    std::is_enum_v<std::remove_cv_t<std::remove_reference_t<T>>>;
+#endif
+
 /**
  * Supported data types for tensor elements
  */

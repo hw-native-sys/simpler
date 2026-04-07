@@ -199,12 +199,24 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
         tensor_count_++;
     }
 
-    void add_scalar(uint64_t v) {
+    /**
+     * Add a scalar value. Type is deduced from the argument;
+     * the value is bit-cast to uint64_t for storage.
+     *
+     *   args.add_scalar(uint64_val);      // existing usage unchanged
+     *   args.add_scalar(3.14f);           // float, auto bit-cast
+     *   args.add_scalar(int32_t(42));     // int32, auto bit-cast
+     */
+    template <typename T = uint64_t>
+    void add_scalar(T value) {
+#if PTO_HAS_TYPE_TRAITS
+        static_assert(kIsSupportedScalarArg<T>, "add_scalar: type must be arithmetic or enum");
+#endif
         if (scalar_count_ >= MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
-        scalars_[scalar_count_++] = v;
+        scalars_[scalar_count_++] = to_u64(value);
     }
 
     void add_scalars(const uint64_t *values, int count) {

@@ -60,7 +60,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
         Arg args_t1;
         args_t1.add_input(r0.outputs.get_ref(0));
         args_t1.add_output(TensorCreateInfo(shapes, 1, DataType::FLOAT32));
-        args_t1.add_scalar(to_u64(1.0f));
+        args_t1.add_scalar(1.0f);
         SubmitResult r1 = pto2_rt_submit_aiv_task(rt, 1, args_t1);
         pto2_rt_add_dependency(rt, r0.task_id, r1.task_id);
 
@@ -68,7 +68,7 @@ aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args)
         Arg args_t2;
         args_t2.add_input(r0.outputs.get_ref(0));
         args_t2.add_output(TensorCreateInfo(shapes, 1, DataType::FLOAT32));
-        args_t2.add_scalar(to_u64(2.0f));
+        args_t2.add_scalar(2.0f);
         SubmitResult r2 = pto2_rt_submit_aiv_task(rt, 1, args_t2);
         pto2_rt_add_dependency(rt, r0.task_id, r2.task_id);
 

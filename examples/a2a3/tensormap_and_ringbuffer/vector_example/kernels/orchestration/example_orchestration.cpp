@@ -79,8 +79,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         Arg params_t1;
         params_t1.add_input(c);
         params_t1.add_output(inter_ci);
-        params_t1.add_scalar(to_u64(1.0f));
-        params_t1.add_scalar(static_cast<uint64_t>(3));
+        params_t1.add_scalar(1.0f);
+        params_t1.add_scalar(3u);
         TaskOutputTensors outs_t1 = pto2_rt_submit_aiv_task(1, params_t1);  // kernel_add_scalar
         const Tensor &d = outs_t1.get_ref(0);
 
@@ -88,8 +88,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         Arg params_t2;
         params_t2.add_input(c);
         params_t2.add_output(inter_ci);
-        params_t2.add_scalar(to_u64(2.0f));
-        params_t2.add_scalar(static_cast<uint64_t>(3));
+        params_t2.add_scalar(2.0f);
+        params_t2.add_scalar(3u);
         TaskOutputTensors outs_t2 = pto2_rt_submit_aiv_task(1, params_t2);  // kernel_add_scalar
         const Tensor &e = outs_t2.get_ref(0);
 
@@ -98,7 +98,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         params_t3.add_input(d);
         params_t3.add_input(e);
         params_t3.add_output(inter_ci);
-        params_t3.add_scalar(static_cast<uint64_t>(3));
+        params_t3.add_scalar(3u);
         TaskOutputTensors outs_t3 = pto2_rt_submit_aiv_task(2, params_t3);  // kernel_mul
         const Tensor &g = outs_t3.get_ref(0);
 
