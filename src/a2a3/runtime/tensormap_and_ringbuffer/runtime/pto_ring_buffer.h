@@ -18,7 +18,12 @@
  *    - Single spin-wait loop with unified back-pressure and deadlock detection
  *    - O(1) bump allocation for both task slots and heap buffers
  *
- * 2. DepListPool - Dependency list entry allocation
+ * 2. FaninPool - Fanin spill entry allocation
+ *    - Ring buffer for spilled fanin entries
+ *    - O(1) append allocation
+ *    - Implicit reclamation with task ring
+ *
+ * 3. DepListPool - Dependency list entry allocation
  *    - Ring buffer for linked list entries
  *    - O(1) prepend operation
  *    - Implicit reclamation with task ring
@@ -29,7 +34,9 @@
 #ifndef PTO_RING_BUFFER_H
 #define PTO_RING_BUFFER_H
 
+#include <algorithm>
 #include <inttypes.h>
+#include <type_traits>
 
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
@@ -358,6 +365,166 @@ private:
 };
 
 // =============================================================================
+// Fanin Spill Pool
+// =============================================================================
+
+/**
+ * Fanin spill pool structure
+ *
+ * True ring buffer for allocating spilled fanin entries.
+ * Entries are reclaimed when their consumer tasks become CONSUMED.
+ *
+ * Linear counters (top, tail) grow monotonically; the physical index
+ * is obtained via modulo: base[linear_index % capacity].
+ */
+struct PTO2FaninPool {
+    PTO2FaninSpillEntry *base;       // Pool base address
+    int32_t capacity;                // Total number of entries
+    int32_t top;                     // Linear next-allocation counter (starts from 1)
+    int32_t tail;                    // Linear first-alive counter (entries before this are dead)
+    int32_t high_water;              // Peak concurrent usage (top - tail)
+    int32_t reclaim_task_cursor{0};  // Last task id scanned for reclaim on this pool
+
+    std::atomic<int32_t> *error_code_ptr = nullptr;
+
+    void init(PTO2FaninSpillEntry *in_base, int32_t in_capacity, std::atomic<int32_t> *in_error_code_ptr) {
+        base = in_base;
+        capacity = in_capacity;
+        top = 1;
+        tail = 1;
+        high_water = 0;
+        reclaim_task_cursor = 0;
+        base[0].slot_state = nullptr;
+        error_code_ptr = in_error_code_ptr;
+    }
+
+    void reclaim(PTO2SchedulerState &sched, uint8_t ring_id, int32_t sm_last_task_alive);
+
+    void ensure_space(PTO2SchedulerState &sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
+
+    PTO2FaninSpillEntry *alloc() {
+        int32_t used = top - tail;
+        if (used >= capacity) {
+            LOG_ERROR("========================================");
+            LOG_ERROR("FATAL: Fanin Spill Pool Overflow!");
+            LOG_ERROR("========================================");
+            LOG_ERROR("Fanin spill pool exhausted: %d entries alive (capacity=%d).", used, capacity);
+            LOG_ERROR("  - Pool top:      %d (linear)", top);
+            LOG_ERROR("  - Pool tail:     %d (linear)", tail);
+            LOG_ERROR("  - High water:    %d", high_water);
+            LOG_ERROR("Solution:");
+            LOG_ERROR("  Increase fanin spill pool capacity (current: %d, recommended: %d).", capacity, capacity * 2);
+            LOG_ERROR("  Compile-time: PTO2_DEP_LIST_POOL_SIZE in pto_runtime2_types.h");
+            LOG_ERROR("  Runtime env:  PTO2_RING_DEP_POOL=%d", capacity * 2);
+            LOG_ERROR("========================================");
+            if (error_code_ptr) {
+                error_code_ptr->store(PTO2_ERROR_DEP_POOL_OVERFLOW, std::memory_order_release);
+            }
+            return nullptr;
+        }
+        int32_t idx = top % capacity;
+        top++;
+        used++;
+        if (used > high_water) high_water = used;
+        return &base[idx];
+    }
+
+    void advance_tail(int32_t new_tail) {
+        if (new_tail > tail) {
+            tail = new_tail;
+        }
+    }
+
+    int32_t used() const { return top - tail; }
+
+    int32_t available() const { return capacity - used(); }
+};
+
+template <typename Fn>
+using PTO2FaninCallbackResult = std::invoke_result_t<Fn &, PTO2TaskSlotState *>;
+
+template <typename Fn>
+using PTO2FaninForEachReturn = std::conditional_t<std::is_same_v<PTO2FaninCallbackResult<Fn>, void>, void, bool>;
+
+template <typename InlineSlots, typename Fn>
+inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_storage(
+    InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool *spill_pool, Fn &&fn
+) {
+    using FaninCallbackResult = PTO2FaninCallbackResult<Fn>;
+    static_assert(
+        std::is_same_v<FaninCallbackResult, void> || std::is_same_v<FaninCallbackResult, bool>,
+        "fanin callback must return void or bool"
+    );
+
+    if constexpr (std::is_void_v<FaninCallbackResult>) {
+        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
+        for (int32_t i = 0; i < inline_count; i++) {
+            fn(inline_slot_states[i]);
+        }
+
+        int32_t spill_count = fanin_count - inline_count;
+        if (spill_count <= 0) {
+            return;
+        }
+
+        PTO2FaninPool *pool = spill_pool;
+        int32_t start_idx = spill_start % pool->capacity;
+        int32_t first_count = std::min(spill_count, pool->capacity - start_idx);
+        PTO2FaninSpillEntry *first = pool->base + start_idx;
+        for (int32_t i = 0; i < first_count; i++) {
+            fn(first[i].slot_state);
+        }
+
+        int32_t second_count = spill_count - first_count;
+        for (int32_t i = 0; i < second_count; i++) {
+            fn(pool->base[i].slot_state);
+        }
+        return;
+    } else {
+        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
+        for (int32_t i = 0; i < inline_count; i++) {
+            if (!fn(inline_slot_states[i])) {
+                return false;
+            }
+        }
+
+        int32_t spill_count = fanin_count - inline_count;
+        if (spill_count <= 0) {
+            return true;
+        }
+
+        PTO2FaninPool *pool = spill_pool;
+        int32_t start_idx = spill_start % pool->capacity;
+        int32_t first_count = std::min(spill_count, pool->capacity - start_idx);
+        PTO2FaninSpillEntry *first = pool->base + start_idx;
+        for (int32_t i = 0; i < first_count; i++) {
+            if (!fn(first[i].slot_state)) {
+                return false;
+            }
+        }
+
+        int32_t second_count = spill_count - first_count;
+        for (int32_t i = 0; i < second_count; i++) {
+            if (!fn(pool->base[i].slot_state)) {
+                return false;
+            }
+        }
+        return true;
+    }
+}
+
+template <typename Fn>
+inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn) {
+    return pto2_for_each_fanin_storage(
+        payload.fanin_inline_slot_states,
+        payload.fanin_actual_count,
+        payload.fanin_spill_start,
+        payload.fanin_spill_pool,
+        static_cast<Fn &&>(fn)
+    );
+}
+
+// =============================================================================
 // Dependency List Pool
 // =============================================================================
 
@@ -501,6 +668,7 @@ struct PTO2DepListPool {
  */
 struct PTO2RingSet {
     PTO2TaskAllocator task_allocator;
+    PTO2FaninPool fanin_pool;
     PTO2DepListPool dep_pool;
 };
 

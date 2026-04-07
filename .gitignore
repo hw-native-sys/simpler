@@ -13,6 +13,9 @@ venv/
 .vscode
 *bak
 
+# Local Codex files (not tracked in repo)
+.codex
+
 # claude local settings
 .claude/settings.json
 .claude/settings.local.json
