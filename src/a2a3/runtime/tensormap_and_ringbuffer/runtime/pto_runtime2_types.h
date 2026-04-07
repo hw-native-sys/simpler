@@ -408,8 +408,7 @@ struct PTO2TaskPayload {
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
 static_assert(
-    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24,
-    "inline fanin array must follow spill metadata"
+    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
 );
 static_assert(offsetof(PTO2TaskPayload, tensors) == 192, "tensors must start at byte 192 (cache line 3)");
 static_assert(

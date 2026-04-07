@@ -47,9 +47,7 @@ void PTO2FaninPool::reclaim(PTO2SchedulerState &sched, uint8_t ring_id, int32_t 
     reclaim_task_cursor = scan_end;
 }
 
-void PTO2FaninPool::ensure_space(
-    PTO2SchedulerState &sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed
-) {
+void PTO2FaninPool::ensure_space(PTO2SchedulerState &sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed) {
     if (available() >= needed) return;
 
     int spin_count = 0;
