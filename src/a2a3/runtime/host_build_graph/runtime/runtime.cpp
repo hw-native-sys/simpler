@@ -45,7 +45,6 @@ Runtime::Runtime() {
     initial_ready_count = 0;
     worker_count = 0;
     sche_cpu_num = 1;
-    orch_thread_num = 1;
     enable_profiling = false;
     perf_data_base = 0;
     tensor_pair_count = 0;

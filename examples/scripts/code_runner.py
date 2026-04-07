@@ -532,7 +532,6 @@ class CodeRunner:
         # Runtime configuration - read from kernel_config or use defaults
         runtime_config = getattr(self._kernel_config, "RUNTIME_CONFIG", {})
         self.aicpu_thread_num = runtime_config.get("aicpu_thread_num", 3)
-        self.orch_thread_num = runtime_config.get("orch_thread_num", 1)
         self.block_dim = runtime_config.get("block_dim", 24)
         self.runtime_name = runtime_config.get("runtime", "host_build_graph")
         self.repeat_rounds = repeat_rounds if repeat_rounds is not None else runtime_config.get("rounds", 1)
@@ -887,7 +886,6 @@ class CodeRunner:
                 config = CallConfig()
                 config.block_dim = self.block_dim
                 config.aicpu_thread_num = self.aicpu_thread_num
-                config.orch_thread_num = self.orch_thread_num
                 if self.enable_profiling and round_idx == 0:
                     config.enable_profiling = True
                     logger.info("Profiling enabled")

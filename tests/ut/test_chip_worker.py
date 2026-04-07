@@ -31,18 +31,15 @@ class TestCallConfig:
         config = CallConfig()
         assert config.block_dim == 24
         assert config.aicpu_thread_num == 3
-        assert config.orch_thread_num == 1
         assert config.enable_profiling is False
 
     def test_setters(self):
         config = CallConfig()
         config.block_dim = 32
         config.aicpu_thread_num = 4
-        config.orch_thread_num = 2
         config.enable_profiling = True
         assert config.block_dim == 32
         assert config.aicpu_thread_num == 4
-        assert config.orch_thread_num == 2
         assert config.enable_profiling is True
 
     def test_repr(self):

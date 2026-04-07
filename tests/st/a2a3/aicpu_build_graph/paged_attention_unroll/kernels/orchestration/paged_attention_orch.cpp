@@ -78,11 +78,8 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index
-) {
-    (void)orch_thread_num;    // NOLINT(readability/casting)
-    (void)orch_thread_index;  // NOLINT(readability/casting)
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args) {
 #ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;

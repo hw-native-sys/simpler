@@ -19,7 +19,6 @@
 struct CallConfig {
     int block_dim = 24;
     int aicpu_thread_num = 3;
-    int orch_thread_num = 1;
     bool enable_profiling = false;
 };
 
@@ -47,7 +46,7 @@ private:
     using SetDeviceFn = int (*)(int);
     using GetRuntimeSizeFn = size_t (*)();
     using RunRuntimeFn = int (*)(
-        void *, const void *, const void *, int, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int
+        void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int
     );
     using FinalizeDeviceFn = int (*)();
 

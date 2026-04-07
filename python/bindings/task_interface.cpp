@@ -570,12 +570,10 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
         .def_rw("block_dim", &CallConfig::block_dim)
         .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
-        .def_rw("orch_thread_num", &CallConfig::orch_thread_num)
         .def_rw("enable_profiling", &CallConfig::enable_profiling)
         .def("__repr__", [](const CallConfig &self) -> std::string {
             std::ostringstream os;
             os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
-               << ", orch_thread_num=" << self.orch_thread_num
                << ", enable_profiling=" << (self.enable_profiling ? "True" : "False") << ")";
             return os.str();
         });

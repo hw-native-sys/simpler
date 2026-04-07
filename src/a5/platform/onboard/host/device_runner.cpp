@@ -309,15 +309,7 @@ int DeviceRunner::run(
         return -1;
     }
 
-    // Validate orchestrator configuration
-    int scheduler_thread_num = launch_aicpu_num - runtime.orch_thread_num;
-
-    if (runtime.orch_thread_num > launch_aicpu_num) {
-        LOG_ERROR(
-            "orch_thread_num (%d) cannot exceed aicpu_thread_num (%d)", runtime.orch_thread_num, launch_aicpu_num
-        );
-        return -1;
-    }
+    int scheduler_thread_num = runtime.get_orch_built_on_host() ? launch_aicpu_num : launch_aicpu_num - 1;
 
     // Validate even core distribution for initial scheduler threads
     if (scheduler_thread_num > 0) {

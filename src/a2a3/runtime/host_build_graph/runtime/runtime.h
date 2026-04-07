@@ -199,8 +199,7 @@ public:
     int worker_count;                       // Number of active workers
 
     // Execution parameters for AICPU scheduling
-    int sche_cpu_num;     // Number of AICPU threads for scheduling
-    int orch_thread_num;  // Number of orchestrator threads (unused, for API compatibility)
+    int sche_cpu_num;  // Number of AICPU threads for scheduling
 
     // Profiling support
     bool enable_profiling;    // Enable profiling flag
@@ -232,6 +231,9 @@ public:
      * Constructor - zero-initialize all arrays
      */
     Runtime();
+
+    // Orchestration is always built on the host for this runtime
+    bool get_orch_built_on_host() const { return true; }
 
     // =========================================================================
     // Task Management

@@ -47,8 +47,7 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     };
 }
 
-__attribute__((visibility("default"))) void
-aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
     // Read dimensions from tensor metadata
     // query: shape=[batch, num_heads, head_dim]
     uint64_t batch = orch_args.tensor(0).shapes[0];
@@ -69,15 +68,6 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     uint64_t q_tile = 16;
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
     uint64_t elem_size = get_element_size(data_type);
-
-    // Partition batch across orchestrators
-    uint64_t b_start = batch * orch_thread_index / orch_thread_num;
-    uint64_t b_end = batch * (orch_thread_index + 1) / orch_thread_num;
-
-    LOG_INFO(
-        "orch_idx=%d/%d batch=%" PRIu64 " b_range=[%" PRIu64 ",%" PRIu64 ")", orch_thread_index, orch_thread_num, batch,
-        b_start, b_end
-    );
 
     // Reshape tensors for kernel consumption (2D flattened)
     void *query_ptr = orch_args.tensor(0).data_as<void>();
@@ -118,7 +108,7 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     TensorCreateInfo sij_ci(sij_shapes, 2, DataType::FLOAT32);
     TensorCreateInfo pij_f16_ci(sij_shapes, 2, data_type);
 
-    for (uint64_t b_idx = b_start; b_idx < b_end; b_idx++) {
+    for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
         uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
@@ -197,10 +187,7 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
         }
     }
 
-    LOG_INFO(
-        "orch_idx=%d: tasks submitted for batch=[%" PRIu64 ",%" PRIu64 "), num_heads=%" PRIu64, orch_thread_index,
-        b_start, b_end, num_heads
-    );
+    LOG_INFO("tasks submitted for batch=%" PRIu64 ", num_heads=%" PRIu64, batch, num_heads);
 }
 
 }  // extern "C"

@@ -38,7 +38,7 @@ static PerfBufferState *s_perf_buffer_states[PLATFORM_MAX_CORES] = {};
 static PhaseBufferState *s_phase_buffer_states[PLATFORM_MAX_AICPU_THREADS] = {};
 static PhaseBuffer *s_current_phase_buf[PLATFORM_MAX_AICPU_THREADS] = {};
 
-static __thread int s_orch_thread_idx = -1;
+static int s_orch_thread_idx = -1;
 
 /**
  * Enqueue ready buffer to per-thread queue
@@ -279,7 +279,7 @@ void perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks) {
     wmb();
 }
 
-void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads, int num_orch_threads) {
+void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads) {
     void *perf_base = reinterpret_cast<void *>(runtime->perf_data_base);
     if (perf_base == nullptr) {
         LOG_ERROR("perf_data_base is NULL, cannot initialize phase profiling");
@@ -298,8 +298,8 @@ void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads, in
     memset(&s_phase_header->orch_summary, 0, sizeof(AicpuOrchSummary));
 
     // Cache per-thread record pointers and clear buffers
-    // Include all threads: scheduler + orchestrator (orchestrators may become schedulers)
-    int total_threads = num_sched_threads + num_orch_threads;
+    // Include all threads: scheduler + orchestrator (orchestrator may become scheduler)
+    int total_threads = num_sched_threads + 1;
     if (total_threads > PLATFORM_MAX_AICPU_THREADS) {
         total_threads = PLATFORM_MAX_AICPU_THREADS;
     }
@@ -342,8 +342,8 @@ void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads, in
     wmb();
 
     LOG_INFO(
-        "Phase profiling initialized: %d scheduler + %d orch threads, %d records/thread", num_sched_threads,
-        num_orch_threads, PLATFORM_PHASE_RECORDS_PER_THREAD
+        "Phase profiling initialized: %d scheduler + 1 orch thread, %d records/thread", num_sched_threads,
+        PLATFORM_PHASE_RECORDS_PER_THREAD
     );
 }
 

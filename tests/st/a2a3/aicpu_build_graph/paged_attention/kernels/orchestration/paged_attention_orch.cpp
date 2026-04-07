@@ -48,12 +48,8 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index
-) {
-    (void)orch_thread_num;    // NOLINT(readability/casting)
-    (void)orch_thread_index;  // NOLINT(readability/casting)
-
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args) {
     // Read dimensions from tensor metadata
     // query: shape=[batch, num_heads, head_dim]
     uint64_t batch = orch_args.tensor(0).shapes[0];

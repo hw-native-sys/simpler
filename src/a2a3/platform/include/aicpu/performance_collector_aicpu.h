@@ -102,9 +102,8 @@ void perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks);
  *
  * @param runtime Runtime instance pointer
  * @param num_sched_threads Number of scheduler threads
- * @param num_orch_threads Number of orchestrator threads (may become schedulers after transition)
  */
-void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads, int num_orch_threads = 1);
+void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads);
 
 /**
  * Record a single scheduler phase

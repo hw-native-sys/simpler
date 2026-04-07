@@ -98,9 +98,9 @@ int set_device(int device_id) {
 }
 
 int run_runtime(
-    RuntimeHandle runtime, const void *callable, const void *args, int block_dim, int aicpu_thread_num,
-    int orch_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_profiling
+    RuntimeHandle runtime, const void *callable, const void *args, int block_dim, int aicpu_thread_num, int device_id,
+    const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size,
+    int enable_profiling
 ) {
     if (runtime == NULL) return -1;
 
@@ -130,7 +130,6 @@ int run_runtime(
         }
 
         // Phase 3: launch
-        r->orch_thread_num = orch_thread_num;
         DeviceRunner &runner = DeviceRunner::get();
         std::vector<uint8_t> aicpu_vec;
         std::vector<uint8_t> aicore_vec;

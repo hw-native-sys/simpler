@@ -36,9 +36,8 @@ Legacy per-task submit (`kernel_id + worker_type`) cannot express atomic co-disp
 
 Design must preserve the current main runtime architecture:
 
-1. Multi-orchestrator runtime wiring (`orchestrators[]`, `orch_count`, thread-local `pto2_current_orch_idx`).
-2. Executor threading split (orchestrator threads vs scheduler threads), and post-orchestrator transition (`transition_requested_` + `reassign_cores_for_all_threads()`).
-3. Shared-memory hot/cold split (`PTO2TaskDescriptor` hot + `PTO2TaskPayload` cold).
+1. Executor threading split (orchestrator thread vs scheduler threads), and post-orchestrator transition (`transition_requested_` + `reassign_cores_for_all_threads()`).
+2. Shared-memory hot/cold split (`PTO2TaskDescriptor` hot + `PTO2TaskPayload` cold).
 
 ## 5. Terminology
 
@@ -197,7 +196,7 @@ Recommended validation coverage:
 2. Atomic dispatch for multi-slot shapes.
 3. Dependency gating and completion aggregation (`done_mask == active_mask`).
 4. Lane-occupancy co-residency behavior for compatible shapes.
-5. Multi-orchestrator and core-transition ownership stability.
+5. Core-transition ownership stability.
 6. Invalid submit handling (`always_assert` path).
 7. Regression coverage for existing examples/tests.
 
@@ -223,4 +222,3 @@ Final validation:
 3. Per-cluster concurrent capacity is lane-occupancy-driven, not a fixed constant.
 4. Submit-contract types live in one shared header-only surface.
 5. Resource-aware dispatch heuristics are allowed without a strict starvation-free guarantee.
-

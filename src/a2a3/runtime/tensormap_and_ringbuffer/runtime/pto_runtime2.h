@@ -43,9 +43,6 @@
 #include "pto_scheduler.h"
 #include "pto_orchestrator.h"
 
-// Maximum number of orchestrator threads supported
-constexpr int PTO2_MAX_ORCH_THREADS = 4;
-
 // =============================================================================
 // Runtime Context
 // =============================================================================
@@ -102,8 +99,7 @@ struct PTO2Runtime {
 
     // Components
     PTO2SharedMemoryHandle *sm_handle;
-    PTO2OrchestratorState orchestrators[PTO2_MAX_ORCH_THREADS];
-    int orch_count;  // Number of active orchestrator states
+    PTO2OrchestratorState orchestrator;
     PTO2SchedulerState scheduler;
 
     // GM Heap for output buffers
@@ -154,7 +150,7 @@ PTO2Runtime *pto2_runtime_create_custom(
  * @return Runtime context, or NULL on failure
  */
 PTO2Runtime *pto2_runtime_create_from_sm(
-    PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size, int orch_count = 1,
+    PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
     int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
 );
 

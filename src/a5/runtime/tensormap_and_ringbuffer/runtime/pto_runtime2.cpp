@@ -38,16 +38,16 @@ __attribute__((weak, visibility("hidden"))) uint64_t get_sys_cnt_aicpu() { retur
 // =============================================================================
 
 static TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args) {
-    return pto2_submit_mixed_task(&rt->orchestrators[0], mixed_kernels, args);
+    return pto2_submit_mixed_task(&rt->orchestrator, mixed_kernels, args);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrators[0]); }
+void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrator); }
 
-void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrators[0]); }
+void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
 
-void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrators[0]); }
+void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrator); }
 
-static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[0].fatal; }
+static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
 
 // Wait for all producers of this tensor to be safe for data access.
 // Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
@@ -58,7 +58,7 @@ static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrators[0].fatal; 
 // Returns false on timeout (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
 static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
-    PTO2OrchestratorState &orch = rt->orchestrators[0];
+    PTO2OrchestratorState &orch = rt->orchestrator;
 
     // Collect producer slot states from both maps, deduplicated by pointer.
     // +1: one creator slot + up to PTO2_LOOKUP_MAX_RESULTS modifier slots.
@@ -209,7 +209,6 @@ PTO2Runtime *pto2_runtime_create_custom(
 
     rt->ops = &s_runtime_ops;
     rt->mode = mode;
-    rt->orch_count = 1;
     rt->sm_handle = pto2_sm_create(task_window_size, heap_size);
     if (!rt->sm_handle) {
         free(rt);
@@ -235,8 +234,8 @@ PTO2Runtime *pto2_runtime_create_custom(
 #endif
     rt->gm_heap_owned = true;
 
-    // Initialize first orchestrator
-    if (!pto2_orchestrator_init(&rt->orchestrators[0], rt->sm_handle, rt->gm_heap, heap_size, dep_pool_capacity)) {
+    // Initialize orchestrator
+    if (!pto2_orchestrator_init(&rt->orchestrator, rt->sm_handle, rt->gm_heap, heap_size, dep_pool_capacity)) {
         free(rt->gm_heap);
         pto2_sm_destroy(rt->sm_handle);
         free(rt);
@@ -245,7 +244,7 @@ PTO2Runtime *pto2_runtime_create_custom(
 
     // Initialize scheduler (heap_size = per-ring heap size)
     if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle)) {
-        pto2_orchestrator_destroy(&rt->orchestrators[0]);
+        pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt->gm_heap);
         pto2_sm_destroy(rt->sm_handle);
         free(rt);
@@ -253,18 +252,16 @@ PTO2Runtime *pto2_runtime_create_custom(
     }
 
     // Connect orchestrator to scheduler (for simulated mode)
-    pto2_orchestrator_set_scheduler(&rt->orchestrators[0], &rt->scheduler);
+    pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
 
     return rt;
 }
 
 PTO2Runtime *pto2_runtime_create_from_sm(
-    PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size, int orch_count,
+    PTO2RuntimeMode mode, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
     int32_t dep_pool_capacity
 ) {
     if (!sm_handle) return NULL;
-    if (orch_count < 1) orch_count = 1;
-    if (orch_count > PTO2_MAX_ORCH_THREADS) orch_count = PTO2_MAX_ORCH_THREADS;
 
     PTO2Runtime *rt = static_cast<PTO2Runtime *>(calloc(1, sizeof(PTO2Runtime)));
     if (!rt) return NULL;
@@ -275,32 +272,20 @@ PTO2Runtime *pto2_runtime_create_from_sm(
     rt->gm_heap = gm_heap;
     rt->gm_heap_size = heap_size > 0 ? heap_size * PTO2_MAX_RING_DEPTH : 0;
     rt->gm_heap_owned = false;
-    rt->orch_count = orch_count;
 
-    // Initialize all orchestrator states
-    for (int i = 0; i < orch_count; i++) {
-        if (!pto2_orchestrator_init(&rt->orchestrators[i], rt->sm_handle, rt->gm_heap, heap_size, dep_pool_capacity)) {
-            for (int j = 0; j < i; j++) {
-                pto2_orchestrator_destroy(&rt->orchestrators[j]);
-            }
-            free(rt);
-            return NULL;
-        }
-    }
-
-    // Initialize scheduler (heap_size = per-ring heap size)
-    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle)) {
-        for (int i = 0; i < orch_count; i++) {
-            pto2_orchestrator_destroy(&rt->orchestrators[i]);
-        }
+    if (!pto2_orchestrator_init(&rt->orchestrator, rt->sm_handle, rt->gm_heap, heap_size, dep_pool_capacity)) {
         free(rt);
         return NULL;
     }
 
-    // Connect all orchestrators to scheduler
-    for (int i = 0; i < orch_count; i++) {
-        pto2_orchestrator_set_scheduler(&rt->orchestrators[i], &rt->scheduler);
+    // Initialize scheduler (heap_size = per-ring heap size)
+    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle)) {
+        pto2_orchestrator_destroy(&rt->orchestrator);
+        free(rt);
+        return NULL;
     }
+
+    pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
 
     return rt;
 }
@@ -309,9 +294,7 @@ void pto2_runtime_destroy(PTO2Runtime *rt) {
     if (!rt) return;
 
     pto2_scheduler_destroy(&rt->scheduler);
-    for (int i = 0; i < rt->orch_count; i++) {
-        pto2_orchestrator_destroy(&rt->orchestrators[i]);
-    }
+    pto2_orchestrator_destroy(&rt->orchestrator);
 
     if (rt->gm_heap_owned && rt->gm_heap) {
         free(rt->gm_heap);

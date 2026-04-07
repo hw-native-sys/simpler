@@ -38,11 +38,7 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     };
 }
 
-__attribute__((visibility("default"))) void
-aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
-    (void)orch_thread_num;  // NOLINT(readability/casting)
-    if (orch_thread_index != 0) return;
-
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
     Tensor ext_output = from_tensor_arg(orch_args.tensor(0));
 
     MixedKernels mk;

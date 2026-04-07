@@ -47,12 +47,26 @@ int set_device(int device_id);
 /**
  * Build the task graph, execute on device, copy results back, and clean up.
  *
- * Combines init_runtime + launch_runtime + finalize_runtime into one call.
+ * Combines the former init_runtime + enable_runtime_profiling +
+ * launch_runtime + finalize_runtime into a single call.
+ *
+ * @param runtime           Caller-allocated buffer (size from get_runtime_size())
+ * @param callable          Opaque ChipCallable pointer (orchestration + kernel binaries)
+ * @param args              Opaque ChipStorageTaskArgs pointer (tensor/scalar arguments)
+ * @param block_dim         Number of AICore blocks
+ * @param aicpu_thread_num  Number of AICPU scheduler threads
+ * @param device_id         Target device
+ * @param aicpu_binary      AICPU executor binary blob
+ * @param aicpu_size        Size of AICPU binary
+ * @param aicore_binary     AICore executor binary blob
+ * @param aicore_size       Size of AICore binary
+ * @param enable_profiling  1 to enable profiling, 0 to disable
+ * @return 0 on success, negative on error
  */
 int run_runtime(
-    RuntimeHandle runtime, const void *callable, const void *args, int block_dim, int aicpu_thread_num,
-    int orch_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_profiling
+    RuntimeHandle runtime, const void *callable, const void *args, int block_dim, int aicpu_thread_num, int device_id,
+    const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size,
+    int enable_profiling
 );
 
 /**

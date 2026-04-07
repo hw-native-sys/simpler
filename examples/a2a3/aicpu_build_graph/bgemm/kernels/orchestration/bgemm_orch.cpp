@@ -62,12 +62,8 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(
-    PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index
-) {
-    (void)orch_thread_num;    // NOLINT(readability/casting)
-    (void)orch_thread_index;  // NOLINT(readability/casting)
-
+__attribute__((visibility("default"))) void
+aicpu_orchestration_entry(PTO2Runtime *rt, const ChipStorageTaskArgs &orch_args) {
     Tensor ext_A = from_tensor_arg(orch_args.tensor(0));
     Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
     Tensor ext_C = from_tensor_arg(orch_args.tensor(2));

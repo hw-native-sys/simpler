@@ -459,7 +459,6 @@ def run_single_task(
         config = CallConfig()
         config.block_dim = runtime_config.get("block_dim", 24)
         config.aicpu_thread_num = runtime_config.get("aicpu_thread_num", 3)
-        config.orch_thread_num = runtime_config.get("orch_thread_num", 1)
 
         with _temporary_env(run_env):
             worker.run(task.chip_callable, orch_args, config)

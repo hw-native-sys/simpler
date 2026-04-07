@@ -107,9 +107,8 @@ void ChipWorker::run(const void *callable, const void *args, const CallConfig &c
     void *rt = runtime_buf_.data();
 
     int rc = run_runtime_fn_(
-        rt, callable, args, config.block_dim, config.aicpu_thread_num, config.orch_thread_num, device_id_,
-        aicpu_binary_.data(), aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(),
-        config.enable_profiling ? 1 : 0
+        rt, callable, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
+        aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_profiling ? 1 : 0
     );
     if (rc != 0) {
         throw std::runtime_error("run_runtime failed with code " + std::to_string(rc));

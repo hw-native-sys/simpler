@@ -47,8 +47,7 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     };
 }
 
-__attribute__((visibility("default"))) void
-aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
     // Tensor args
     Tensor ext_A = from_tensor_arg(orch_args.tensor(0));
     Tensor ext_B = from_tensor_arg(orch_args.tensor(1));
@@ -64,7 +63,6 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     int matmul_batch = static_cast<int>(orch_args.scalar(3));
     int add_batch = static_cast<int>(orch_args.scalar(4));
 
-    LOG_ALWAYS("[alternating_orch] thread num: %d, idx: %d", orch_thread_num, orch_thread_index);
     LOG_INFO(
         "[alternating_orch] Batch: %d, M: %d, N: %d, matmul_batch: %d, add_batch: %d", batch, M, N, matmul_batch,
         add_batch
@@ -81,7 +79,7 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     int max_groups = num_matmul_groups > num_add_groups ? num_matmul_groups : num_add_groups;
 
     // Interleaved submit: matmul and add groups alternate
-    for (int group_idx = orch_thread_index; group_idx < max_groups; group_idx += orch_thread_num) {
+    for (int group_idx = 0; group_idx < max_groups; group_idx++) {
         if (group_idx < num_matmul_groups) {
             int start_task_idx = group_idx * matmul_batch;
             uint64_t offset = static_cast<uint64_t>(start_task_idx) * MATMUL_ELEMS;

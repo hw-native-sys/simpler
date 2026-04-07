@@ -62,8 +62,7 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     };
 }
 
-__attribute__((visibility("default"))) void
-aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
+__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
     // Read dimensions from tensor metadata
     uint64_t batch = orch_args.tensor(0).shapes[0];
     uint64_t num_heads = orch_args.tensor(0).shapes[1];
@@ -120,7 +119,7 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
         uint64_t q_offset = q_idx * q_tile;
 
-        for (uint64_t chunk_idx = orch_thread_index; chunk_idx < num_chunks; chunk_idx += orch_thread_num) {
+        for (uint64_t chunk_idx = 0; chunk_idx < num_chunks; chunk_idx++) {
             uint64_t chunk_bc = batch - chunk_idx * IN_CORE_BATCH;
             if (chunk_bc > IN_CORE_BATCH) chunk_bc = IN_CORE_BATCH;
             uint64_t batch_start = chunk_idx * IN_CORE_BATCH;
