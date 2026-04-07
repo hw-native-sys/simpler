@@ -722,8 +722,6 @@ def _build_device_worker_base_args(args: argparse.Namespace) -> list[str]:
         base_args += ["-r", args.runtime]
     if args.build_runtime:
         base_args.append("--build-runtime")
-    if args.pto_isa_commit:
-        base_args += ["-c", args.pto_isa_commit]
     if args.run_all_cases:
         base_args.append("--all")
     return base_args
@@ -734,11 +732,12 @@ def _run_device_worker_subprocess(
     device_id: int,
     args: argparse.Namespace,
     tag: str,
-    max_attempts: int = MAX_RETRIES,
+    pto_isa_commit: str | None = None,
 ) -> list[TaskResult]:
     """Run a task batch in one device-worker subprocess and return its reported results."""
     base_args = _build_device_worker_base_args(args)
-    base_args += ["--max-attempts", str(max_attempts)]
+    if pto_isa_commit:
+        base_args += ["-c", pto_isa_commit]
 
     with tempfile.NamedTemporaryFile(
         prefix=f"ci_{tag}_tasks_dev{device_id}_",
@@ -822,12 +821,33 @@ def _normalize_task_result(
     )
 
 
+def run_sim_tasks_subprocess(
+    tasks: list[TaskSpec],
+    args: argparse.Namespace,
+    pto_isa_commit: str | None = None,
+) -> list[TaskResult]:
+    """Run simulation tasks: one subprocess per task, no retry."""
+    results: list[TaskResult] = []
+    for task in tasks:
+        task_results = _run_device_worker_subprocess(
+            [task],
+            0,
+            args,
+            tag="sim",
+            pto_isa_commit=pto_isa_commit,
+        )
+        normalized = _normalize_task_result(task, 0, 0, task_results)
+        results.append(normalized)
+    return results
+
+
 def run_hw_tasks_subprocess(
     tasks: list[TaskSpec],
     devices: list[int],
     args: argparse.Namespace,
+    pto_isa_commit: str | None = None,
 ) -> list[TaskResult]:
-    """Run hardware tasks via a shared parent queue, mirroring ci.sh parallel scheduling."""
+    """Run hardware tasks: one subprocess per task, retry up to MAX_RETRIES in parent."""
     task_queue: Queue[tuple[TaskSpec, int] | None] = Queue()
     for task in tasks:
         task_queue.put((task, 0))
@@ -850,7 +870,7 @@ def run_hw_tasks_subprocess(
                     dev_id,
                     args,
                     tag=tag,
-                    max_attempts=1,
+                    pto_isa_commit=pto_isa_commit,
                 )
                 normalized = _normalize_task_result(task, dev_id, attempt, task_results)
                 with results_lock:
@@ -974,88 +994,101 @@ def device_worker_main(args: argparse.Namespace) -> int:
         logger.info("No tasks found")
         return 0
 
+    all_results = _run_tasks_on_device(tasks, device_id, platform, pto_isa_root, args)
+    _write_results_json(all_results, args.result_json)
+    return print_summary(all_results)
+
+
+def _run_tasks_on_device(
+    tasks: list[TaskSpec],
+    device_id: int,
+    platform: str,
+    pto_isa_root: str,
+    args: argparse.Namespace,
+) -> list[TaskResult]:
+    """Compile and run all tasks on a single device. Returns all TaskResults."""
     logger.info(f"Compiling {len(tasks)} tasks...")
-    compiled = compile_all_tasks(
-        tasks, pto_isa_root, build_runtime=args.build_runtime, run_all_cases=args.run_all_cases
-    )
+    try:
+        compiled = compile_all_tasks(
+            tasks, pto_isa_root, build_runtime=args.build_runtime, run_all_cases=args.run_all_cases
+        )
+    except RuntimeError:
+        return [
+            TaskResult(
+                name=t.name,
+                platform=platform,
+                passed=False,
+                device=str(device_id),
+                attempt=0,
+                elapsed_s=0,
+                error="compile failed",
+            )
+            for t in tasks
+        ]
 
     groups = group_by_runtime(compiled)
     all_results: list[TaskResult] = []
 
     for rt_name, group_tasks in groups.items():
-        remaining = list(group_tasks)
+        rt_bins = cast(RuntimeBinariesLike, group_tasks[0].runtime_bins)
+        worker = ChipWorker()
+        try:
+            worker.init(
+                device_id,
+                str(rt_bins.host_path),
+                rt_bins.aicpu_path.read_bytes(),
+                rt_bins.aicore_path.read_bytes(),
+            )
+        except Exception as e:
+            logger.error(f"[dev{device_id}] Failed to init ChipWorker for {rt_name}: {e}")
+            all_results.extend(
+                TaskResult(
+                    name=ct.spec.name,
+                    platform=platform,
+                    passed=False,
+                    device=str(device_id),
+                    attempt=0,
+                    elapsed_s=0,
+                    error=str(e),
+                )
+                for ct in group_tasks
+            )
+            continue
 
-        for attempt in range(args.max_attempts):
-            if not remaining:
-                break
-
-            rt_bins = cast(RuntimeBinariesLike, remaining[0].runtime_bins)
-            worker = ChipWorker()
+        for ct in group_tasks:
+            start = time.monotonic()
             try:
-                worker.init(
-                    device_id,
-                    str(rt_bins.host_path),
-                    rt_bins.aicpu_path.read_bytes(),
-                    rt_bins.aicore_path.read_bytes(),
+                run_single_task(ct, worker, device_id)
+                elapsed = time.monotonic() - start
+                logger.info(f"[dev{device_id}] PASS: {ct.spec.name} ({elapsed:.1f}s)")
+                all_results.append(
+                    TaskResult(
+                        name=ct.spec.name,
+                        platform=platform,
+                        passed=True,
+                        device=str(device_id),
+                        attempt=0,
+                        elapsed_s=elapsed,
+                    )
                 )
             except Exception as e:
-                logger.error(f"[dev{device_id}] Failed to init ChipWorker for {rt_name}: {e}")
-                all_results.extend(
+                elapsed = time.monotonic() - start
+                logger.error(f"[dev{device_id}] FAIL: {ct.spec.name} ({elapsed:.1f}s): {e}")
+                all_results.append(
                     TaskResult(
                         name=ct.spec.name,
                         platform=platform,
                         passed=False,
                         device=str(device_id),
-                        attempt=attempt,
-                        elapsed_s=0,
+                        attempt=0,
+                        elapsed_s=elapsed,
                         error=str(e),
                     )
-                    for ct in remaining
                 )
-                remaining = []
-                break
 
-            failed_tasks = []
-            for ct in remaining:
-                start = time.monotonic()
-                try:
-                    run_single_task(ct, worker, device_id)
-                    elapsed = time.monotonic() - start
-                    logger.info(f"[dev{device_id}] PASS: {ct.spec.name} ({elapsed:.1f}s)")
-                    all_results.append(
-                        TaskResult(
-                            name=ct.spec.name,
-                            platform=platform,
-                            passed=True,
-                            device=str(device_id),
-                            attempt=attempt,
-                            elapsed_s=elapsed,
-                        )
-                    )
-                except Exception as e:
-                    elapsed = time.monotonic() - start
-                    logger.error(f"[dev{device_id}] FAIL: {ct.spec.name} ({elapsed:.1f}s): {e}")
-                    all_results.append(
-                        TaskResult(
-                            name=ct.spec.name,
-                            platform=platform,
-                            passed=False,
-                            device=str(device_id),
-                            attempt=attempt,
-                            elapsed_s=elapsed,
-                            error=str(e),
-                        )
-                    )
-                    failed_tasks.append(ct)
+        worker.reset()
 
-            worker.reset()
-            remaining = failed_tasks
-
-            if remaining and attempt + 1 >= MAX_RETRIES:
-                logger.warning(f"[dev{device_id}] Quarantined after exhausting retries")
-
-    _write_results_json(all_results, args.result_json)
-    return print_summary(all_results)
+    return all_results
 
 
 # ---------------------------------------------------------------------------
@@ -1097,7 +1130,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--parallel", action="store_true")
     parser.add_argument("--all", dest="run_all_cases", action="store_true", help="Run all cases, not just DEFAULT_CASE")
     parser.add_argument("--device-worker", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--max-attempts", type=int, default=MAX_RETRIES, help=argparse.SUPPRESS)
     parser.add_argument("--result-json", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--task-list-json", default=None, help=argparse.SUPPRESS)
     return parser.parse_args()
@@ -1150,35 +1182,30 @@ def main() -> int:
         return 0
     logger.info(f"Discovered {len(tasks)} tasks")
 
-    # Step 2 & 3: Compile and run via subprocess-per-runtime-group
-    # Each subprocess loads exactly one host .so, avoiding RTLD_GLOBAL symbol conflicts.
+    # Step 2: Compile and run — each task in its own subprocess.
+    # sim: no retry; hw: retry up to MAX_RETRIES in parent.
     if is_sim:
-        all_results = run_hw_tasks_subprocess(tasks, [0], args)
+        all_results = run_sim_tasks_subprocess(tasks, args)
     else:
         all_results = run_hw_tasks_subprocess(tasks, args.devices, args)
 
-    # Step 5: PTO-ISA pinned retry for failures
-    # Deduplicate results by task name (last result wins, same as print_summary)
-    # then only retry tasks that did NOT exhaust all retries — tasks that failed
-    # on every attempt are deterministic and won't benefit from a PTO-ISA pin.
-    final_by_name: dict[str, TaskResult] = {}
+    # Step 3: Pin retry — re-run failed tasks with pinned PTO-ISA commit.
+    final: dict[str, TaskResult] = {}
     for r in all_results:
-        final_by_name[r.name] = r
-    max_attempt = args.max_attempts - 1
-    failures = [r for r in final_by_name.values() if not r.passed and r.attempt < max_attempt]
+        final[r.name] = r
+    failures = [r for r in final.values() if not r.passed]
+
     if failures and args.pto_isa_commit:
         failed_names = {r.name for r in failures}
-        logger.info(f"[CI] {len(failures)} failure(s), retrying with pinned PTO-ISA {args.pto_isa_commit}")
-        reset_pto_isa(args.pto_isa_commit, args.clone_protocol)
-        retry_tasks = [task for task in tasks if task.name in failed_names]
+        failed_tasks = [t for t in tasks if t.name in failed_names]
+        logger.info(f"[CI] {len(failed_tasks)} failure(s), retrying with pinned PTO-ISA {args.pto_isa_commit}")
         if is_sim:
-            retry_results = run_hw_tasks_subprocess(retry_tasks, [0], args)
+            pin_results = run_sim_tasks_subprocess(failed_tasks, args, pto_isa_commit=args.pto_isa_commit)
         else:
-            retry_results = run_hw_tasks_subprocess(retry_tasks, args.devices, args)
+            pin_results = run_hw_tasks_subprocess(failed_tasks, args.devices, args, pto_isa_commit=args.pto_isa_commit)
+        all_results.extend(pin_results)
 
-        all_results.extend(retry_results)
-
-    # Step 6: Summary
+    # Step 4: Summary
     signal.alarm(0)
     return print_summary(all_results)
 
