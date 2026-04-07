@@ -583,14 +583,17 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
         .def(
             "init",
-            [](ChipWorker &self, int device_id, const std::string &host_lib_path, nb::bytes aicpu, nb::bytes aicore) {
+            [](ChipWorker &self, const std::string &host_lib_path, nb::bytes aicpu, nb::bytes aicore) {
                 self.init(
-                    device_id, host_lib_path, reinterpret_cast<const uint8_t *>(aicpu.c_str()), aicpu.size(),
+                    host_lib_path, reinterpret_cast<const uint8_t *>(aicpu.c_str()), aicpu.size(),
                     reinterpret_cast<const uint8_t *>(aicore.c_str()), aicore.size()
                 );
             },
-            nb::arg("device_id"), nb::arg("host_lib_path"), nb::arg("aicpu_binary"), nb::arg("aicore_binary")
+            nb::arg("host_lib_path"), nb::arg("aicpu_binary"), nb::arg("aicore_binary")
         )
+        .def("set_device", &ChipWorker::set_device, nb::arg("device_id"))
+        .def("reset_device", &ChipWorker::reset_device)
+        .def("finalize", &ChipWorker::finalize)
         .def(
             "run",
             [](ChipWorker &self, const PyChipCallable &callable, ChipStorageTaskArgs &args, const CallConfig &config) {
@@ -598,7 +601,7 @@ NB_MODULE(_task_interface, m) {
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("config")
         )
-        .def("reset", &ChipWorker::reset)
         .def_prop_ro("device_id", &ChipWorker::device_id)
-        .def_prop_ro("initialized", &ChipWorker::initialized);
+        .def_prop_ro("initialized", &ChipWorker::initialized)
+        .def_prop_ro("device_set", &ChipWorker::device_set);
 }

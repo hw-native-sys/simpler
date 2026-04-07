@@ -58,9 +58,10 @@ class TestChipWorkerStateMachine:
     def test_initial_state(self):
         worker = _ChipWorker()
         assert worker.initialized is False
+        assert worker.device_set is False
         assert worker.device_id == -1
 
-    def test_run_before_init_raises(self):
+    def test_run_before_set_device_raises(self):
         from _task_interface import ChipCallable, ChipStorageTaskArgs  # noqa: PLC0415
 
         worker = _ChipWorker()
@@ -70,20 +71,37 @@ class TestChipWorkerStateMachine:
         # Build a minimal ChipCallable for the test
         callable_obj = ChipCallable.build(signature=[], func_name="test", binary=b"\x00", children=[])
 
-        with pytest.raises(RuntimeError, match="not initialized"):
+        with pytest.raises(RuntimeError, match="device not set"):
             worker.run(callable_obj, args, config)
 
-    def test_reset_idempotent(self):
+    def test_set_device_before_init_raises(self):
         worker = _ChipWorker()
-        # reset() on an uninitialized worker should not raise
-        worker.reset()
-        worker.reset()
+        with pytest.raises(RuntimeError, match="not initialized"):
+            worker.set_device(0)
+
+    def test_reset_device_idempotent(self):
+        worker = _ChipWorker()
+        # reset_device() on an uninitialized worker should not raise
+        worker.reset_device()
+        worker.reset_device()
+        assert worker.device_set is False
+
+    def test_finalize_idempotent(self):
+        worker = _ChipWorker()
+        worker.finalize()
+        worker.finalize()
         assert worker.initialized is False
+
+    def test_init_after_finalize_raises(self):
+        worker = _ChipWorker()
+        worker.finalize()
+        with pytest.raises(RuntimeError, match="finalized"):
+            worker.init("/nonexistent/libfoo.so", b"", b"")
 
     def test_init_with_nonexistent_lib_raises(self):
         worker = _ChipWorker()
         with pytest.raises(RuntimeError, match="dlopen"):
-            worker.init(0, "/nonexistent/libfoo.so", b"", b"")
+            worker.init("/nonexistent/libfoo.so", b"", b"")
 
 
 # ============================================================================
@@ -100,4 +118,5 @@ class TestChipWorkerPython:
 
         worker = ChipWorker()
         assert worker.initialized is False
+        assert worker.device_set is False
         assert isinstance(PyCallConfig(), CallConfig)

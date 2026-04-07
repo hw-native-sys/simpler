@@ -129,28 +129,55 @@ def scalar_to_uint64(value) -> int:
 class ChipWorker:
     """Unified execution interface wrapping the host runtime C API.
 
+    The runtime library is bound once via init() and cannot be changed.
+    Devices can be set and reset independently.
+
     Usage::
 
         worker = ChipWorker()
-        worker.init(device_id=0, host_path="build/lib/.../host.so",
+        worker.init(host_path="build/lib/.../host.so",
                     aicpu_binary=aicpu_bytes, aicore_binary=aicore_bytes)
+        worker.set_device(device_id=0)
         worker.run(chip_callable, orch_args, block_dim=24)
-        worker.reset()
+        worker.reset_device()
+        worker.finalize()
     """
 
     def __init__(self):
         self._impl = _ChipWorker()
 
-    def init(self, device_id, host_path, aicpu_binary, aicore_binary):
-        """Load host runtime library, cache platform binaries, and set device.
+    def init(self, host_path, aicpu_binary, aicore_binary):
+        """Load host runtime library and cache platform binaries.
+
+        Can only be called once — the runtime cannot be changed.
 
         Args:
-            device_id: NPU device ID.
             host_path: Path to the host runtime shared library (.so).
             aicpu_binary: AICPU binary content (bytes).
             aicore_binary: AICore binary content (bytes).
         """
-        self._impl.init(device_id, str(host_path), aicpu_binary, aicore_binary)
+        self._impl.init(str(host_path), aicpu_binary, aicore_binary)
+
+    def set_device(self, device_id):
+        """Set the target NPU device.
+
+        Requires init() first. Can be called after reset_device() to switch devices.
+
+        Args:
+            device_id: NPU device ID.
+        """
+        self._impl.set_device(device_id)
+
+    def reset_device(self):
+        """Release device resources. The runtime binding remains intact."""
+        self._impl.reset_device()
+
+    def finalize(self):
+        """Tear down everything: device resources and runtime library.
+
+        Terminal operation — the object cannot be reused after this.
+        """
+        self._impl.finalize()
 
     def run(self, callable, args, config=None, **kwargs):
         """Execute a callable synchronously.
@@ -167,10 +194,6 @@ class ChipWorker:
             setattr(config, k, v)
         self._impl.run(callable, args, config)
 
-    def reset(self):
-        """Release runtime resources. The worker can be re-initialized after reset."""
-        self._impl.reset()
-
     @property
     def device_id(self):
         return self._impl.device_id
@@ -178,3 +201,7 @@ class ChipWorker:
     @property
     def initialized(self):
         return self._impl.initialized
+
+    @property
+    def device_set(self):
+        return self._impl.device_set

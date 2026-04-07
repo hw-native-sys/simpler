@@ -518,11 +518,11 @@ def device_worker(
         worker = ChipWorker()
         try:
             worker.init(
-                device_id,
                 str(rt_bins.host_path),
                 rt_bins.aicpu_path.read_bytes(),
                 rt_bins.aicore_path.read_bytes(),
             )
+            worker.set_device(device_id)
         except Exception as e:
             logger.error(f"[dev{device_id}] Failed to init ChipWorker for {runtime_name}: {e}")
             for ct in compiled_tasks:
@@ -579,7 +579,8 @@ def device_worker(
                     )
                 failed_tasks.append(ct)
 
-        worker.reset()
+        worker.reset_device()
+        worker.finalize()
 
         # Re-enqueue failed tasks for retry (individually, not as a group)
         if failed_tasks and attempt + 1 < MAX_RETRIES:
@@ -1016,11 +1017,11 @@ def _run_tasks_on_device(
         worker = ChipWorker()
         try:
             worker.init(
-                device_id,
                 str(rt_bins.host_path),
                 rt_bins.aicpu_path.read_bytes(),
                 rt_bins.aicore_path.read_bytes(),
             )
+            worker.set_device(device_id)
         except Exception as e:
             logger.error(f"[dev{device_id}] Failed to init ChipWorker for {rt_name}: {e}")
             all_results.extend(
@@ -1068,7 +1069,8 @@ def _run_tasks_on_device(
                     )
                 )
 
-        worker.reset()
+        worker.reset_device()
+        worker.finalize()
 
     return all_results
 

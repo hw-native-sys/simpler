@@ -30,17 +30,30 @@ public:
     ChipWorker(const ChipWorker &) = delete;
     ChipWorker &operator=(const ChipWorker &) = delete;
 
+    /// Bind the runtime library and cache platform binaries.
+    /// Can only be called once per lifetime — the runtime cannot be changed.
     void init(
-        int device_id, const std::string &host_lib_path, const uint8_t *aicpu_binary, size_t aicpu_size,
-        const uint8_t *aicore_binary, size_t aicore_size
+        const std::string &host_lib_path, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
+        size_t aicore_size
     );
 
-    void reset();
+    /// Set the target NPU device. Requires init() first.
+    /// Can be called after reset_device() to switch to a different device.
+    void set_device(int device_id);
+
+    /// Release device resources only. The runtime binding remains intact.
+    /// After this, set_device() can be called again with a new device ID.
+    void reset_device();
+
+    /// Tear down everything: device resources and runtime library.
+    /// Terminal — the object cannot be reused after this.
+    void finalize();
 
     void run(const void *callable, const void *args, const CallConfig &config);
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
+    bool device_set() const { return device_set_; }
 
 private:
     using SetDeviceFn = int (*)(int);
@@ -61,6 +74,8 @@ private:
     std::vector<uint8_t> aicore_binary_;
     int device_id_ = -1;
     bool initialized_ = false;
+    bool device_set_ = false;
+    bool finalized_ = false;
 };
 
 #endif  // SRC_COMMON_WORKER_CHIP_WORKER_H_

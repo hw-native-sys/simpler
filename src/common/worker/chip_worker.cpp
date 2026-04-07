@@ -35,14 +35,17 @@ T load_symbol(void *handle, const char *name) {
 
 }  // namespace
 
-ChipWorker::~ChipWorker() { reset(); }
+ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
-    int device_id, const std::string &host_lib_path, const uint8_t *aicpu_binary, size_t aicpu_size,
-    const uint8_t *aicore_binary, size_t aicore_size
+    const std::string &host_lib_path, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
+    size_t aicore_size
 ) {
+    if (finalized_) {
+        throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
+    }
     if (initialized_) {
-        throw std::runtime_error("ChipWorker already initialized; call reset() first");
+        throw std::runtime_error("ChipWorker already initialized; runtime cannot be changed");
     }
 
     // RTLD_GLOBAL is required: PTO ISA's TPUSH/TPOP (AIC-AIV sync) use
@@ -64,18 +67,12 @@ void ChipWorker::init(
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
-
-        int rc = set_device_fn_(device_id);
-        if (rc != 0) {
-            throw std::runtime_error("set_device failed with code " + std::to_string(rc));
-        }
     } catch (...) {
         dlclose(handle);
         throw;
     }
 
     lib_handle_ = handle;
-    device_id_ = device_id;
 
     aicpu_binary_.assign(aicpu_binary, aicpu_binary + aicpu_size);
     aicore_binary_.assign(aicore_binary, aicore_binary + aicore_size);
@@ -85,11 +82,33 @@ void ChipWorker::init(
     initialized_ = true;
 }
 
-void ChipWorker::reset() {
+void ChipWorker::set_device(int device_id) {
+    if (!initialized_) {
+        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    }
+    if (device_set_) {
+        throw std::runtime_error("Device already set; call reset_device() before switching devices");
+    }
+
+    int rc = set_device_fn_(device_id);
+    if (rc != 0) {
+        throw std::runtime_error("set_device failed with code " + std::to_string(rc));
+    }
+    device_id_ = device_id;
+    device_set_ = true;
+}
+
+void ChipWorker::reset_device() {
+    if (device_set_ && finalize_device_fn_) {
+        finalize_device_fn_();
+    }
+    device_id_ = -1;
+    device_set_ = false;
+}
+
+void ChipWorker::finalize() {
+    reset_device();
     if (lib_handle_) {
-        if (finalize_device_fn_) {
-            finalize_device_fn_();
-        }
         dlclose(lib_handle_);
     }
     lib_handle_ = nullptr;
@@ -100,13 +119,13 @@ void ChipWorker::reset() {
     runtime_buf_.clear();
     aicpu_binary_.clear();
     aicore_binary_.clear();
-    device_id_ = -1;
     initialized_ = false;
+    finalized_ = true;
 }
 
 void ChipWorker::run(const void *callable, const void *args, const CallConfig &config) {
-    if (!initialized_) {
-        throw std::runtime_error("ChipWorker not initialized; call init() first");
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
     }
 
     void *rt = runtime_buf_.data();

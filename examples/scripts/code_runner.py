@@ -826,11 +826,11 @@ class CodeRunner:
         logger.info(f"=== Creating ChipWorker (host: {binaries.host_path}, device: {self.device_id}) ===")
         worker = ChipWorker()
         worker.init(
-            self.device_id,
             str(binaries.host_path),
             binaries.aicpu_path.read_bytes(),
             binaries.aicore_path.read_bytes(),
         )
+        worker.set_device(self.device_id)
 
         # Step 3: Run each parameter set
         total_cases = len(self.params_list)
@@ -898,7 +898,8 @@ class CodeRunner:
 
             logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
 
-        worker.reset()
+        worker.reset_device()
+        worker.finalize()
         logger.info("=" * 60)
         logger.info(f"=== All {total_cases} cases passed ===")
         logger.info("=" * 60)
