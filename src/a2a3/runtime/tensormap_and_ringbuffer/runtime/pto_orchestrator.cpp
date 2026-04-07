@@ -515,27 +515,29 @@ static int32_t find_current_manual_scope_task_index(const PTO2OrchestratorState 
     }
 
     PTO2TaskSlotState *first_slot_state = orch->scope_tasks[begin];
-    if (first_slot_state != nullptr) {
-        PTO2TaskId first_task_id = first_slot_state->task->task_id;
-        if (first_task_id.ring() == task_id.ring()) {
-            uint32_t window_size = orch->rings[first_task_id.ring()].task_allocator.window_size();
-            uint32_t first_local = first_task_id.local();
-            uint32_t task_local = task_id.local();
-            uint32_t delta = task_local >= first_local ? task_local - first_local : task_local + window_size - first_local;
-            if (delta < static_cast<uint32_t>(count)) {
-                PTO2TaskSlotState *candidate = orch->scope_tasks[begin + static_cast<int32_t>(delta)];
-                if (candidate != nullptr && candidate->task->task_id == task_id) {
-                    return static_cast<int32_t>(delta);
-                }
-            }
-        }
+    if (first_slot_state == nullptr) {
+        return -1;
     }
 
-    for (int32_t i = begin; i < orch->scope_tasks_size; i++) {
-        PTO2TaskSlotState *slot_state = orch->scope_tasks[i];
-        if (slot_state != nullptr && slot_state->task->task_id == task_id) {
-            return i - begin;
-        }
+    PTO2TaskId first_task_id = first_slot_state->task->task_id;
+    if (first_task_id.ring() != task_id.ring()) {
+        return -1;
+    }
+
+    uint32_t first_local = first_task_id.local();
+    uint32_t task_local = task_id.local();
+    if (task_local < first_local) {
+        return -1;
+    }
+
+    uint32_t delta = task_local - first_local;
+    if (delta >= static_cast<uint32_t>(count)) {
+        return -1;
+    }
+
+    PTO2TaskSlotState *candidate = orch->scope_tasks[begin + static_cast<int32_t>(delta)];
+    if (candidate != nullptr && candidate->task->task_id == task_id) {
+        return static_cast<int32_t>(delta);
     }
     return -1;
 }
