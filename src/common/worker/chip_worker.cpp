@@ -45,7 +45,12 @@ void ChipWorker::init(
         throw std::runtime_error("ChipWorker already initialized; call reset() first");
     }
 
-    // Load the host runtime shared library
+    // RTLD_GLOBAL is required: PTO ISA's TPUSH/TPOP (AIC-AIV sync) use
+    // dlsym(RTLD_DEFAULT, "pto_cpu_sim_get_shared_storage") to find the
+    // host SO's shared storage hook.  Cross-runtime isolation relies on
+    // -fno-gnu-unique (#453) allowing dlclose to actually unload the
+    // previous runtime's SO before loading the next one.
+    dlerror();
     void *handle = dlopen(host_lib_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
     if (!handle) {
         std::string err = "dlopen failed: ";

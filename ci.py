@@ -600,77 +600,64 @@ def device_worker(
 # ---------------------------------------------------------------------------
 
 
-def run_sim_tasks(compiled: list[CompiledTask], parallel: bool = False) -> list[TaskResult]:
-    """Run simulation tasks with ChipWorker reuse per runtime group."""
-    groups = group_by_runtime(compiled)
-    results: list[TaskResult] = []
-    lock = Lock()
+def _run_sim_task_with_worker(ct: CompiledTask, worker: ChipWorker) -> TaskResult:
+    """Run a single sim task using *worker*, returning one result."""
+    rt_bins = cast(RuntimeBinariesLike, ct.runtime_bins)
 
-    def _run_group(runtime_name: str, group_tasks: list[CompiledTask]):
-        worker = ChipWorker()
-        rt_bins = cast(RuntimeBinariesLike, group_tasks[0].runtime_bins)
-        try:
-            worker.init(0, str(rt_bins.host_path), rt_bins.aicpu_path.read_bytes(), rt_bins.aicore_path.read_bytes())
-        except Exception as e:
-            logger.error(f"[sim] Failed to init ChipWorker for {runtime_name}: {e}")
-            with lock:
-                results.extend(
-                    TaskResult(
-                        name=ct.spec.name,
-                        platform=ct.spec.platform,
-                        passed=False,
-                        device="sim",
-                        attempt=0,
-                        elapsed_s=0,
-                        error=str(e),
-                    )
-                    for ct in group_tasks
-                )
-            return
-
-        try:
-            for ct in group_tasks:
-                start = time.monotonic()
-                try:
-                    run_single_task(ct, worker, 0)
-                    elapsed = time.monotonic() - start
-                    logger.info(f"[sim] PASS: {ct.spec.name} ({elapsed:.1f}s)")
-                    r = TaskResult(
-                        name=ct.spec.name,
-                        platform=ct.spec.platform,
-                        passed=True,
-                        device="sim",
-                        attempt=0,
-                        elapsed_s=elapsed,
-                    )
-                except Exception as e:
-                    elapsed = time.monotonic() - start
-                    logger.error(f"[sim] FAIL: {ct.spec.name} ({elapsed:.1f}s): {e}")
-                    r = TaskResult(
-                        name=ct.spec.name,
-                        platform=ct.spec.platform,
-                        passed=False,
-                        device="sim",
-                        attempt=0,
-                        elapsed_s=elapsed,
-                        error=str(e),
-                    )
-                with lock:
-                    results.append(r)
-        finally:
+    start = time.monotonic()
+    try:
+        worker.init(0, str(rt_bins.host_path), rt_bins.aicpu_path.read_bytes(), rt_bins.aicore_path.read_bytes())
+        run_single_task(ct, worker, 0)
+        elapsed = time.monotonic() - start
+        logger.info(f"[sim] PASS: {ct.spec.name} ({elapsed:.1f}s)")
+        return TaskResult(
+            name=ct.spec.name,
+            platform=ct.spec.platform,
+            passed=True,
+            device="sim",
+            attempt=0,
+            elapsed_s=elapsed,
+        )
+    except Exception as e:
+        elapsed = time.monotonic() - start
+        logger.error(f"[sim] FAIL: {ct.spec.name} ({elapsed:.1f}s): {e}")
+        return TaskResult(
+            name=ct.spec.name,
+            platform=ct.spec.platform,
+            passed=False,
+            device="sim",
+            attempt=0,
+            elapsed_s=elapsed,
+            error=str(e),
+        )
+    finally:
+        if worker.initialized:
             worker.reset()
 
-    if parallel:
-        threads = [Thread(target=_run_group, args=(rt_name, tasks)) for rt_name, tasks in groups.items()]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
-    else:
-        for rt_name, tasks in groups.items():
-            _run_group(rt_name, tasks)
 
+def run_sim_tasks(compiled: list[CompiledTask]) -> list[TaskResult]:
+    """Run simulation tasks in-process with per-task init/reset isolation."""
+    results: list[TaskResult] = []
+    worker = ChipWorker()
+    for ct in compiled:
+        results.append(_run_sim_task_with_worker(ct, worker))
     return results
+
+
+def compile_and_run_sim_tasks(
+    tasks: list[TaskSpec],
+    args: argparse.Namespace,
+    pto_isa_root: str,
+) -> list[TaskResult]:
+    """Compile simulation tasks in-process and run them with ChipWorker.reset()."""
+    logger.info(f"Compiling {len(tasks)} sim task(s)...")
+    compiled = compile_all_tasks(
+        tasks,
+        pto_isa_root,
+        build_runtime=args.build_runtime,
+        run_all_cases=args.run_all_cases,
+    )
+    return run_sim_tasks(compiled)
 
 
 def run_hw_tasks(
@@ -806,31 +793,6 @@ def _normalize_task_result(
         elapsed_s=source.elapsed_s,
         error=source.error,
     )
-
-
-def run_sim_tasks_subprocess(
-    tasks: list[TaskSpec],
-    args: argparse.Namespace,
-    pto_isa_commit: str | None = None,
-) -> list[TaskResult]:
-    """Run simulation tasks: one subprocess per task, no retry."""
-    is_pin_retry = pto_isa_commit is not None
-    results: list[TaskResult] = []
-    total = len(tasks)
-    for i, task in enumerate(tasks, 1):
-        task_results = _run_device_worker_subprocess(
-            [task],
-            0,
-            args,
-            tag="sim",
-            pto_isa_commit=pto_isa_commit,
-            print_log_on_fail=is_pin_retry,
-        )
-        normalized = _normalize_task_result(task, 0, 0, task_results)
-        results.append(normalized)
-        status = "PASS" if normalized.passed else "FAIL"
-        logger.info(f"[sim] [{i}/{total}] {status}: {task.name} ({normalized.elapsed_s:.1f}s)")
-    return results
 
 
 def run_hw_tasks_subprocess(
@@ -1220,10 +1182,14 @@ def main() -> int:
         return 0
     logger.info(f"Discovered {len(tasks)} tasks")
 
-    # Step 2: Compile and run — each task in its own subprocess.
-    # hw: failed device is quarantined; healthy devices keep running remaining tasks.
+    # Step 2: Compile and run.
+    # Sim: in-process with RTLD_LOCAL isolation.
+    # HW: subprocess per device, failed device is quarantined.
     if is_sim:
-        all_results = _run_with_timeout("initial pass", args.timeout, lambda: run_sim_tasks_subprocess(tasks, args))
+        pto_isa_root = ensure_pto_isa(args.pto_isa_commit, args.clone_protocol)
+        all_results = _run_with_timeout(
+            "initial pass", args.timeout, lambda: compile_and_run_sim_tasks(tasks, args, pto_isa_root)
+        )
     else:
         all_results = _run_with_timeout(
             "initial pass",
@@ -1242,10 +1208,9 @@ def main() -> int:
         failed_tasks = [t for t in tasks if t.name in failed_names]
         logger.info(f"[CI] {len(failed_tasks)} failure(s), retrying with pinned PTO-ISA {args.pto_isa_commit}")
         if is_sim:
+            retry_pto_isa_root = reset_pto_isa(args.pto_isa_commit, args.clone_protocol)
             pin_results = _run_with_timeout(
-                "pin retry",
-                args.timeout,
-                lambda: run_sim_tasks_subprocess(failed_tasks, args, pto_isa_commit=args.pto_isa_commit),
+                "pin retry", args.timeout, lambda: compile_and_run_sim_tasks(failed_tasks, args, retry_pto_isa_root)
             )
         else:
             pin_results = _run_with_timeout(
