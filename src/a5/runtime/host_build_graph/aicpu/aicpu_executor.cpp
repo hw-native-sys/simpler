@@ -97,8 +97,7 @@ struct AicpuExecutor {
     std::atomic<int> finished_count_{0};
 
     // ===== Performance profiling state =====
-    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];   // Per-core AICPU dispatch timestamp
-    uint32_t core_dispatch_counts_[RUNTIME_MAX_WORKER];  // Per-core total dispatched task counter
+    uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
 
     // ===== Methods =====
     int init(Runtime *runtime);
@@ -121,7 +120,7 @@ struct AicpuExecutor {
 
     inline bool try_dispatch_task(
         int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head,
-        int &ready_count, bool profiling_enabled, Runtime &runtime
+        int &ready_count
     );
 };
 
@@ -169,8 +168,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
 
 // Try to dispatch a task from thread-local queue to a core
 inline bool AicpuExecutor::try_dispatch_task(
-    int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head, int &ready_count,
-    bool profiling_enabled, Runtime &runtime
+    int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head, int &ready_count
 ) {
     if (ready_count <= 0) {
         return false;
@@ -180,15 +178,6 @@ inline bool AicpuExecutor::try_dispatch_task(
     int task_id = local_queue[head];
     head = (head + 1) % MAX_CORES_PER_THREAD;
     ready_count--;
-
-    // Profiling: buffer switch check
-    if (profiling_enabled) {
-        core_dispatch_counts_[core_id]++;
-        if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE - 1) {
-            perf_aicpu_switch_buffer(&runtime, core_id, thread_idx);
-            core_dispatch_counts_[core_id] = 0;
-        }
-    }
 
     const char *core_type_str = (core_type == CoreType::AIC) ? "AIC" : "AIV";
     LOG_INFO(
@@ -260,7 +249,6 @@ int AicpuExecutor::init(Runtime *runtime) {
 
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
-        core_dispatch_counts_[i] = 0;
     }
     if (runtime->enable_profiling) {
         perf_aicpu_init_profiling(runtime);
@@ -672,12 +660,12 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                     dispatched = try_dispatch_task(
                         core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                        cur_aic_ready_count, profiling_enabled, runtime
+                        cur_aic_ready_count
                     );
                 } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
                     dispatched = try_dispatch_task(
                         core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                        cur_aiv_ready_count, profiling_enabled, runtime
+                        cur_aiv_ready_count
                     );
                 }
 
@@ -801,12 +789,12 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                         dispatched = try_dispatch_task(
                             core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                            cur_aic_ready_count, profiling_enabled, runtime
+                            cur_aic_ready_count
                         );
                     } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
                         dispatched = try_dispatch_task(
                             core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                            cur_aiv_ready_count, profiling_enabled, runtime
+                            cur_aiv_ready_count
                         );
                     }
                 }
@@ -830,14 +818,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                     if (try_dispatch_task(
                             core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                            cur_aic_ready_count, profiling_enabled, runtime
+                            cur_aic_ready_count
                         )) {
                         made_progress = true;
                     }
                 } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
                     if (try_dispatch_task(
                             core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                            cur_aiv_ready_count, profiling_enabled, runtime
+                            cur_aiv_ready_count
                         )) {
                         made_progress = true;
                     }
@@ -979,11 +967,6 @@ int AicpuExecutor::run(Runtime *runtime) {
         return rc;
     }
 
-    // Flush performance buffers for cores managed by this thread
-    if (runtime->enable_profiling) {
-        perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
-    }
-
     LOG_INFO("Thread %d: Completed", thread_idx);
 
     int prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
@@ -1014,7 +997,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
 
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
-        core_dispatch_counts_[i] = 0;
         pending_task_ids_[i] = AICPU_TASK_INVALID;
         running_task_ids_[i] = AICPU_TASK_INVALID;
         core_first_dispatch_[i] = true;

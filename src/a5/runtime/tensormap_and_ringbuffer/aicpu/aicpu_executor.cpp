@@ -103,7 +103,6 @@ struct alignas(64) CoreExecState {
     uint8_t pad_[3];                          // offset 25: alignment padding
 #if PTO2_PROFILING
     // --- Profiling fields (dispatch path, compile-time gated) ---
-    uint32_t dispatch_count;      // offset 28: dispatched task count (buffer mgmt)
     uint64_t dispatch_timestamp;  // offset 32: AICPU dispatch timestamp
 #endif
     // --- Cold fields (init/diagnostics only, never in hot path) ---
@@ -595,8 +594,7 @@ struct AicpuExecutor {
     }
 
     void dispatch_subtask_to_core(
-        Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
-        PTO2SubtaskSlot subslot
+        int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot
 #if PTO2_PROFILING
         ,
         bool profiling_enabled
@@ -604,9 +602,6 @@ struct AicpuExecutor {
     ) {
         CoreTracker &tracker = core_trackers_[thread_idx];
         auto core_id = tracker.get_core_id_by_offset(core_offset);
-#if !PTO2_PROFILING
-        (void)runtime;  // NOLINT(readability/casting)
-#endif
         CoreExecState &core_exec_state = core_exec_states_[core_id];
         PTO2DispatchPayload &payload = s_pto2_payload_per_core[core_id];
         build_payload(payload, slot_state, subslot);
@@ -615,11 +610,6 @@ struct AicpuExecutor {
 #if PTO2_PROFILING
         if (profiling_enabled) {
             core_exec_state.dispatch_timestamp = get_sys_cnt_aicpu();
-            if (core_exec_state.dispatch_count >= PLATFORM_PROF_BUFFER_SIZE) {
-                perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
-                core_exec_state.dispatch_count = 0;
-            }
-            core_exec_state.dispatch_count++;
         }
 #endif
         // Per-core monotonic counter for register protocol uniqueness (32-bit).
@@ -646,7 +636,7 @@ struct AicpuExecutor {
     // Dispatch one SPMD block of a MIX task to the cluster at cluster_offset.
     // Reads slot_state.next_block_idx as block_idx; caller increments it afterwards.
     void dispatch_mix_block_to_cluster(
-        Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state
+        int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state
 #if PTO2_PROFILING
         ,
         bool profiling_enabled
@@ -656,7 +646,7 @@ struct AicpuExecutor {
         uint8_t core_mask = pto2_core_mask(slot_state.active_mask);
         if (core_mask & PTO2_SUBTASK_MASK_AIC) {
             dispatch_subtask_to_core(
-                runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC
+                thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -665,7 +655,7 @@ struct AicpuExecutor {
         }
         if (core_mask & PTO2_SUBTASK_MASK_AIV0) {
             dispatch_subtask_to_core(
-                runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0
+                thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -674,7 +664,7 @@ struct AicpuExecutor {
         }
         if (core_mask & PTO2_SUBTASK_MASK_AIV1) {
             dispatch_subtask_to_core(
-                runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1
+                thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -713,8 +703,7 @@ struct AicpuExecutor {
     // based on shape.  For AIV, picks whichever AIV core in the cluster is currently idle.
     // Caller is responsible for incrementing slot_state.next_block_idx after this returns.
     void dispatch_block_to_cluster(
-        Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state,
-        PTO2ResourceShape shape
+        int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, PTO2ResourceShape shape
 #if PTO2_PROFILING
         ,
         bool profiling_enabled, uint32_t &phase_dispatch_count
@@ -723,7 +712,7 @@ struct AicpuExecutor {
         CoreTracker &tracker = core_trackers_[thread_idx];
         if (shape == PTO2ResourceShape::MIX) {
             dispatch_mix_block_to_cluster(
-                runtime, thread_idx, cluster_offset, slot_state
+                thread_idx, cluster_offset, slot_state
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -731,7 +720,7 @@ struct AicpuExecutor {
             );
         } else if (shape == PTO2ResourceShape::AIC) {
             dispatch_subtask_to_core(
-                runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC
+                thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -742,7 +731,7 @@ struct AicpuExecutor {
                                    tracker.get_aiv0_core_offset(cluster_offset) :
                                    tracker.get_aiv1_core_offset(cluster_offset);
             dispatch_subtask_to_core(
-                runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0
+                thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -771,7 +760,7 @@ struct AicpuExecutor {
     // Called only when global resources >= block_num, so one pass always suffices.
     // All other threads are spinning — the drain worker has exclusive tracker access.
     void drain_worker_dispatch(
-        Runtime *runtime, int32_t block_num
+        int32_t block_num
 #if PTO2_PROFILING
         ,
         bool profiling_enabled, uint32_t &phase_dispatch_count
@@ -788,7 +777,7 @@ struct AicpuExecutor {
             auto valid = core_trackers_[t].get_valid_cluster_offset_states(shape);
             while (valid.has_value() && slot_state->next_block_idx < block_num) {
                 dispatch_block_to_cluster(
-                    runtime, t, valid.pop_first(), *slot_state, shape
+                    t, valid.pop_first(), *slot_state, shape
 #if PTO2_PROFILING
                     ,
                     profiling_enabled, phase_dispatch_count
@@ -822,7 +811,7 @@ struct AicpuExecutor {
     //      Non-elected threads spin-wait until sync_start_pending == 0.
     //      During dispatch the elected thread has exclusive tracker access.
     void handle_drain_mode(
-        Runtime *runtime, int32_t thread_idx
+        int32_t thread_idx
 #if PTO2_PROFILING
         ,
         bool profiling_enabled, uint32_t &phase_dispatch_count
@@ -871,7 +860,7 @@ struct AicpuExecutor {
 
         // Phase 3: Dispatch — all other threads are spinning, exclusive tracker access.
         drain_worker_dispatch(
-            runtime, block_num
+            block_num
 #if PTO2_PROFILING
             ,
             profiling_enabled, phase_dispatch_count
@@ -1464,7 +1453,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         // pause normal dispatch and let the drain protocol run.
         if (drain_state_.sync_start_pending.load(std::memory_order_acquire) != 0) {
             handle_drain_mode(
-                runtime, thread_idx
+                thread_idx
 #if PTO2_PROFILING
                 ,
                 profiling_enabled, phase_dispatch_count
@@ -1534,8 +1523,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             uint8_t mask = pto2_core_mask(slot_state->active_mask);
                             if (mask & PTO2_SUBTASK_MASK_AIC) {
                                 dispatch_subtask_to_core(
-                                    runtime, thread_idx, tracker.get_aic_core_offset(current_valid_cluster_offset),
-                                    *slot_state, PTO2SubtaskSlot::AIC
+                                    thread_idx, tracker.get_aic_core_offset(current_valid_cluster_offset), *slot_state,
+                                    PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
                                     ,
                                     profiling_enabled
@@ -1544,8 +1533,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             }
                             if (mask & PTO2_SUBTASK_MASK_AIV0) {
                                 dispatch_subtask_to_core(
-                                    runtime, thread_idx, tracker.get_aiv0_core_offset(current_valid_cluster_offset),
-                                    *slot_state, PTO2SubtaskSlot::AIV0
+                                    thread_idx, tracker.get_aiv0_core_offset(current_valid_cluster_offset), *slot_state,
+                                    PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
                                     ,
                                     profiling_enabled
@@ -1554,8 +1543,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             }
                             if (mask & PTO2_SUBTASK_MASK_AIV1) {
                                 dispatch_subtask_to_core(
-                                    runtime, thread_idx, tracker.get_aiv1_core_offset(current_valid_cluster_offset),
-                                    *slot_state, PTO2SubtaskSlot::AIV1
+                                    thread_idx, tracker.get_aiv1_core_offset(current_valid_cluster_offset), *slot_state,
+                                    PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
                                     ,
                                     profiling_enabled
@@ -1565,8 +1554,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             slot_state->next_block_idx++;
                         } else if (shape == PTO2ResourceShape::AIC) {
                             dispatch_subtask_to_core(
-                                runtime, thread_idx, tracker.get_aic_core_offset(current_valid_cluster_offset),
-                                *slot_state, PTO2SubtaskSlot::AIC
+                                thread_idx, tracker.get_aic_core_offset(current_valid_cluster_offset), *slot_state,
+                                PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
                                 ,
                                 profiling_enabled
@@ -1578,7 +1567,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                                                    tracker.get_aiv0_core_offset(current_valid_cluster_offset) :
                                                    tracker.get_aiv1_core_offset(current_valid_cluster_offset);
                             dispatch_subtask_to_core(
-                                runtime, thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV0
+                                thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
                                 ,
                                 profiling_enabled
@@ -1950,14 +1939,6 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     );
 #endif
 
-#if PTO2_PROFILING
-    // Flush performance buffers for cores managed by this thread
-    if (profiling_enabled) {
-        perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
-        perf_aicpu_flush_phase_buffers(thread_idx);
-    }
-#endif
-
     return cur_thread_completed;
 }
 
@@ -2265,8 +2246,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 perf_aicpu_write_core_assignments(
                     core_assignments_, core_count_per_thread_, sched_thread_num_, cores_total_num_
                 );
-                // Flush orchestrator's phase record buffer
-                perf_aicpu_flush_phase_buffers(thread_idx);
             }
 #endif
 

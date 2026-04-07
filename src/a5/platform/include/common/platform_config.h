@@ -88,55 +88,24 @@ constexpr int PLATFORM_MAX_CORES_PER_THREAD = PLATFORM_MAX_AIC_PER_THREAD + PLAT
 constexpr int PLATFORM_MAX_CORES = PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BLOCKDIM;  // 108
 
 /**
- * Performance buffer capacity per buffer
- * Number of PerfRecord entries per dynamically allocated PerfBuffer
+ * Performance buffer capacity per core
+ * Maximum number of PerfRecord entries per PerfBuffer.
+ * Each core gets one PerfBuffer; when full, AICPU silently stops recording.
  */
-constexpr int PLATFORM_PROF_BUFFER_SIZE = 1000;
+constexpr int PLATFORM_PROF_BUFFER_SIZE = 10000;
 
 /**
- * Number of buffer slots per core/thread for dynamic profiling
- * Host dynamically allocates buffers and writes addresses into these slots.
- * Device reads slot addresses when switching buffers.
- * Using slots: provides full pipeline depth for buffer recycling.
- * No runtime rtMalloc — all buffers are pre-allocated and recycled in a closed loop.
+ * Performance buffer capacity per AICPU thread
+ * Maximum number of AicpuPhaseRecord entries per PhaseBuffer.
+ * Each thread gets one PhaseBuffer; when full, records are silently dropped.
  */
-constexpr int PLATFORM_PROF_SLOT_COUNT = 4;
-
-/**
- * PerfBuffer pre-allocation count per AICore.
- * 1 goes into the free_queue at init, the rest into the recycled pool.
- */
-constexpr int PLATFORM_PROF_BUFFERS_PER_CORE = 8;
-
-/**
- * PhaseBuffer pre-allocation count per AICPU thread.
- * 1 goes into the free_queue at init, the rest into the recycled pool.
- */
-constexpr int PLATFORM_PROF_BUFFERS_PER_THREAD = 16;
-
-/**
- * Ready queue capacity for performance data collection
- * Queue holds ReadyQueueEntry structs for buffers ready to be read by Host.
- * Sized to match pre-allocation total across all cores and threads.
- */
-constexpr int PLATFORM_PROF_READYQUEUE_SIZE =
-    PLATFORM_MAX_CORES * PLATFORM_PROF_BUFFERS_PER_CORE + PLATFORM_MAX_AICPU_THREADS * PLATFORM_PROF_BUFFERS_PER_THREAD;
+constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 500000;
 
 /**
  * System counter frequency (get_sys_cnt)
  * Used to convert timestamps to microseconds.
  */
 constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 1000000000;  // 1000 MHz
-
-/**
- * Timeout duration for performance data collection (seconds)
- */
-constexpr int PLATFORM_PROF_TIMEOUT_SECONDS = 30;
-
-/**
- * Number of empty polling iterations before checking timeout
- */
-constexpr int PLATFORM_PROF_EMPTY_POLLS_CHECK_NUM = 1000;
 
 inline double cycles_to_us(uint64_t cycles) {
     return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;

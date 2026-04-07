@@ -233,17 +233,6 @@ public:
     void print_handshake_results();
 
     /**
-     * Poll and collect performance data from device
-     *
-     * Polls the ready queue and collects performance records from full buffers.
-     * This is a synchronous polling function that should be called after
-     * launching kernels but before stream synchronization.
-     *
-     * @param expected_tasks Expected total number of tasks (used for exit condition)
-     */
-    void poll_and_collect_performance_data(int expected_tasks);
-
-    /**
      * Export performance data to merged_swimlane.json
      *
      * Converts collected performance records to Chrome Trace Event Format
@@ -397,14 +386,14 @@ private:
     );
 
     /**
-     * Initialize performance profiling shared memory
+     * Initialize performance profiling device buffers
      *
-     * Allocates device memory, maps to host for shared access, and initializes
-     * performance data structures (header and double buffers).
+     * Allocates PerfSetupHeader and per-core/per-thread buffers on device,
+     * publishes pointers via runtime.perf_data_base.
      *
      * @param runtime Runtime instance to configure
      * @param num_aicore Number of AICore instances
-     * @param device_id Device ID for host registration
+     * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
     int init_performance_profiling(Runtime &runtime, int num_aicore, int device_id);

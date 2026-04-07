@@ -17,55 +17,15 @@
 
 #include "device_runner.h"
 
-#include <dlfcn.h>
-
 #include <cassert>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
 
-// Include HAL constants from CANN (header only, library loaded dynamically)
-#include "ascend_hal.h"
 #include "callable.h"
 #include "host/host_regs.h"  // Register address retrieval
 #include "host/raii_scope_guard.h"
-
-// =============================================================================
-// Lazy-loaded HAL (ascend_hal) for profiling host-register only
-// =============================================================================
-
-namespace {
-void *g_hal_handle = nullptr;
-
-using HalHostRegisterFn = int (*)(void *dev_ptr, size_t size, unsigned int flags, int device_id, void **host_ptr);
-using HalHostUnregisterFn = int (*)(void *host_ptr, int device_id);
-
-int load_hal_if_needed() {
-    if (g_hal_handle != nullptr) {
-        return 0;
-    }
-    g_hal_handle = dlopen("libascend_hal.so", RTLD_NOW | RTLD_LOCAL);
-    if (g_hal_handle == nullptr) {
-        return -1;
-    }
-    return 0;
-}
-
-HalHostRegisterFn get_halHostRegister() {
-    if (g_hal_handle == nullptr) {
-        return nullptr;
-    }
-    return reinterpret_cast<HalHostRegisterFn>(dlsym(g_hal_handle, "halHostRegister"));
-}
-
-HalHostUnregisterFn get_halHostUnregister() {
-    if (g_hal_handle == nullptr) {
-        return nullptr;
-    }
-    return reinterpret_cast<HalHostUnregisterFn>(dlsym(g_hal_handle, "halHostUnregister"));
-}
-
-}  // namespace
 
 // =============================================================================
 // KernelArgsHelper Implementation
@@ -408,16 +368,7 @@ int DeviceRunner::run(
             LOG_ERROR("init_performance_profiling failed: %d", rc);
             return rc;
         }
-        // Start memory management thread
-        perf_collector_.start_memory_manager();
     }
-
-    auto perf_cleanup = RAIIScopeGuard([this]() {
-        bool was_initialized = perf_collector_.is_initialized();
-        if (was_initialized) {
-            perf_collector_.stop_memory_manager();
-        }
-    });
 
     std::cout << "\n=== Initialize runtime args ===" << '\n';
     // Initialize runtime args
@@ -454,19 +405,6 @@ int DeviceRunner::run(
     }
 
     {
-        // Poll and collect performance data in a separate collector thread
-        std::thread collector_thread;
-        if (runtime.enable_profiling) {
-            collector_thread = std::thread([this, &runtime]() {
-                poll_and_collect_performance_data(runtime.get_task_count());
-            });
-        }
-        auto thread_guard = RAIIScopeGuard([&]() {
-            if (runtime.enable_profiling && collector_thread.joinable()) {
-                collector_thread.join();
-            }
-        });
-
         std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
         // Synchronize streams
         rc = rtStreamSynchronize(stream_aicpu_);
@@ -481,19 +419,12 @@ int DeviceRunner::run(
             LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
             return rc;
         }
-
-        // Signal collector that device execution is complete
-        if (runtime.enable_profiling) {
-            perf_collector_.signal_execution_complete();
-        }
     }
 
-    // Stop memory management, drain remaining buffers, collect phase data, export
+    // After streams are synchronized, pull profiling data back in one batch
+    // (memcpy-based: two-step count-first copy per buffer).
     if (runtime.enable_profiling) {
-        perf_collector_.stop_memory_manager();
-        perf_collector_.drain_remaining_buffers();
-        perf_collector_.scan_remaining_perf_buffers();
-        perf_collector_.collect_phase_data();
+        perf_collector_.collect_all();
         export_swimlane_json();
     }
 
@@ -556,23 +487,9 @@ int DeviceRunner::finalize() {
         stream_aicore_ = nullptr;
     }
 
-    // Cleanup performance profiling
+    // Cleanup performance profiling (frees PerfSetupHeader + all per-core/per-thread buffers)
     if (perf_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id, void *user_data) -> int {
-            (void)user_data;
-            HalHostUnregisterFn fn = get_halHostUnregister();
-            if (fn != nullptr) {
-                return fn(dev_ptr, device_id);
-            }
-            return 0;
-        };
-
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
-        };
-
-        perf_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+        perf_collector_.finalize();
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
@@ -726,25 +643,10 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
 }
 
 int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, int device_id) {
-    // Define allocation callback (a5: use MemoryAllocator)
+    // Device memory allocation via MemoryAllocator
     auto alloc_cb = [](size_t size, void *user_data) -> void * {
         auto *allocator = static_cast<MemoryAllocator *>(user_data);
         return allocator->alloc(size);
-    };
-
-    // Define registration callback (a5: use halHostRegister for shared memory)
-    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void *user_data, void **host_ptr) -> int {
-        (void)user_data;  // Not needed for registration
-        if (load_hal_if_needed() != 0) {
-            LOG_ERROR("Failed to load ascend_hal for profiling: %s", dlerror());
-            return -1;
-        }
-        HalHostRegisterFn fn = get_halHostRegister();
-        if (fn == nullptr) {
-            LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
-            return -1;
-        }
-        return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
     auto free_cb = [](void *dev_ptr, void *user_data) -> int {
@@ -752,17 +654,18 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
         return allocator->free(dev_ptr);
     };
 
-    auto set_device_cb = [](int device_id, void * /*user_data*/) -> int {
-        return rtSetDevice(device_id);
+    // Host→device and device→host copies via rtMemcpy
+    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size, void * /*user_data*/) -> int {
+        return rtMemcpy(dev_dst, size, host_src, size, RT_MEMCPY_HOST_TO_DEVICE);
+    };
+
+    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size, void * /*user_data*/) -> int {
+        return rtMemcpy(host_dst, size, dev_src, size, RT_MEMCPY_DEVICE_TO_HOST);
     };
 
     return perf_collector_.initialize(
-        runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, set_device_cb
+        runtime, num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb, &mem_alloc_
     );
-}
-
-void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
-    perf_collector_.poll_and_collect(expected_tasks);
 }
 
 int DeviceRunner::export_swimlane_json(const std::string &output_path) {
