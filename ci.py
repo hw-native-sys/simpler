@@ -14,8 +14,9 @@ Replaces ci.sh by running all test tasks (sim + HW) in a single Python process
 per device, reusing ChipWorker across tasks that share the same runtime.
 
 Usage:
-    python tools/ci.py -p a2a3 -d 5-8 -c 6622890 -t 600
-    python tools/ci.py -p a2a3sim -r tensormap_and_ringbuffer -c 6622890 -t 600
+    python ci.py                                                    # all sim platforms
+    python ci.py -p a2a3sim -r tensormap_and_ringbuffer -c 6622890  # single platform
+    python ci.py -p a2a3 -d 5-8 -c 6622890 -t 600                  # hardware with devices
 """
 
 from __future__ import annotations
@@ -1100,7 +1101,7 @@ def _discover_valid_platforms() -> list[str]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Batch CI test runner with ChipWorker reuse")
-    parser.add_argument("-p", "--platform", required=True)
+    parser.add_argument("-p", "--platform", default=None)
     parser.add_argument("-d", "--device", dest="device_range", default="0")
     parser.add_argument("-r", "--runtime", default=None)
     parser.add_argument(
@@ -1149,44 +1150,34 @@ def _run_with_timeout(
         signal.signal(signal.SIGALRM, previous_handler)
 
 
-def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", force=True)
+def _run_single_platform(platform: str, args: argparse.Namespace) -> list[TaskResult]:
+    """Run all tasks for a single platform. Returns list of TaskResults."""
+    is_sim = platform.endswith("sim")
 
-    args = parse_args()
-    args.devices = parse_device_range(args.device_range)
-
-    valid_platforms = _discover_valid_platforms()
-    if valid_platforms and args.platform not in valid_platforms:
-        print(f"Unknown platform: {args.platform}")
-        print(f"Valid platforms: {' '.join(valid_platforms)}")
-        return 1
-
-    is_sim = args.platform.endswith("sim")
-
-    # Device-worker sub-command
-    if args.device_worker:
-        return device_worker_main(args)
-
-    # Step 1: Discover tasks
-    tasks = discover_tasks(args.platform, runtime_filter=args.runtime)
+    tasks = discover_tasks(platform, runtime_filter=args.runtime)
     if not tasks:
-        logger.info("No tasks found")
-        return 0
-    logger.info(f"Discovered {len(tasks)} tasks")
+        logger.info(f"[{platform}] No tasks found")
+        return []
+    logger.info(f"[{platform}] Discovered {len(tasks)} tasks")
 
-    # Step 2: Compile and run.
+    # Compile and run.
     # Both sim and hw use subprocess isolation (different runtimes cannot share a process).
     # Within each subprocess, tasks with the same runtime share a ChipWorker.
+    # Override platform in args for subprocess spawning.
+    sub_args = argparse.Namespace(**vars(args))
+    sub_args.platform = platform
     if is_sim:
-        all_results = _run_with_timeout("initial pass", args.timeout, lambda: run_sim_tasks_subprocess(tasks, args))
+        all_results = _run_with_timeout(
+            f"{platform} initial pass", args.timeout, lambda: run_sim_tasks_subprocess(tasks, sub_args)
+        )
     else:
         all_results = _run_with_timeout(
-            "initial pass",
+            f"{platform} initial pass",
             args.timeout,
-            lambda: run_hw_tasks_subprocess(tasks, args.devices, args),
+            lambda: run_hw_tasks_subprocess(tasks, args.devices, sub_args),
         )
 
-    # Step 3: Pin retry — re-run failed tasks with pinned PTO-ISA commit.
+    # Pin retry — re-run failed tasks with pinned PTO-ISA commit.
     final: dict[str, TaskResult] = {}
     for r in all_results:
         final[r.name] = r
@@ -1195,27 +1186,67 @@ def main() -> int:
     if failures and args.pto_isa_commit:
         failed_names = {r.name for r in failures}
         failed_tasks = [t for t in tasks if t.name in failed_names]
-        logger.info(f"[CI] {len(failed_tasks)} failure(s), retrying with pinned PTO-ISA {args.pto_isa_commit}")
+        logger.info(f"[{platform}] {len(failed_tasks)} failure(s), retrying with pinned PTO-ISA {args.pto_isa_commit}")
         if is_sim:
             pin_results = _run_with_timeout(
-                "pin retry",
+                f"{platform} pin retry",
                 args.timeout,
-                lambda: run_sim_tasks_subprocess(failed_tasks, args, pto_isa_commit=args.pto_isa_commit),
+                lambda: run_sim_tasks_subprocess(failed_tasks, sub_args, pto_isa_commit=args.pto_isa_commit),
             )
         else:
             pin_results = _run_with_timeout(
-                "pin retry",
+                f"{platform} pin retry",
                 args.timeout,
                 lambda: run_hw_tasks_subprocess(
                     failed_tasks,
                     args.devices,
-                    args,
+                    sub_args,
                     pto_isa_commit=args.pto_isa_commit,
                 ),
             )
         all_results.extend(pin_results)
 
-    # Step 4: Summary
+    return all_results
+
+
+def main() -> int:
+    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", force=True)
+
+    args = parse_args()
+    args.devices = parse_device_range(args.device_range)
+
+    valid_platforms = _discover_valid_platforms()
+
+    # Device-worker sub-command (always needs explicit -p)
+    if args.device_worker:
+        if not args.platform:
+            print("--device-worker requires -p/--platform")
+            return 1
+        return device_worker_main(args)
+
+    # Determine which platforms to run
+    if args.platform:
+        if args.platform not in valid_platforms:
+            print(f"Unknown platform: {args.platform}")
+            print(f"Valid platforms: {' '.join(valid_platforms)}")
+            return 1
+        platforms = [args.platform]
+    else:
+        # No -p: run all sim platforms
+        platforms = [p for p in valid_platforms if p.endswith("sim")]
+        if not platforms:
+            print("No sim platforms found")
+            return 1
+        logger.info(f"No platform specified, running all sim platforms: {', '.join(platforms)}")
+
+    all_results: list[TaskResult] = []
+    for platform in platforms:
+        all_results.extend(_run_single_platform(platform, args))
+
+    if not all_results:
+        logger.info("No tasks found")
+        return 0
+
     return print_summary(all_results)
 
 

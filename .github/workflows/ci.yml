@@ -283,7 +283,7 @@ jobs:
       - name: Build nanobind extension
         run: |
           source ${ASCEND_HOME_PATH}/bin/setenv.bash
-          PTO_ARCH=a5 pip install .
+          pip install .
 
       - name: Run on-device examples (a5)
         run: |

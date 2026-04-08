@@ -80,6 +80,11 @@ Runtime binaries (host `.so`, aicpu `.so`, aicore `.o`) are pre-built during `pi
 
 Persistent cmake build directories under `build/cache/` enable incremental compilation — only changed files are recompiled.
 
+**Architecture note:** a2a3 and a5 differ only at runtime (device selection, block dimensions, etc.). The compiled binaries are architecture-independent — the same toolchain and flags produce artifacts that work on both chips. Therefore `pip install .` should build **all** architectures (both a2a3 and a5, both onboard and sim) whenever the corresponding toolchain is available. Toolchain detection (`build_runtimes.py`):
+
+- **sim** (a2a3sim, a5sim): requires `gcc` + `g++` in `PATH`
+- **onboard** (a2a3, a5): requires `ccec` in `PATH` + cross-compiler under `ASCEND_HOME_PATH`
+
 ### User code (per-example)
 
 1. `python/kernel_compiler.py` — compiles user-written kernel `.cpp` files (one per `func_id`)
@@ -123,7 +128,7 @@ Run with: `python examples/scripts/run_example.py -k <kernels_dir> -g <golden.py
 pip install -e .
 ```
 
-This builds the nanobind `_task_interface` extension **and** pre-builds all runtime binaries for available toolchains into `build/lib/`. On x86_64, this means sim platforms only; on aarch64 hardware, onboard variants are also built.
+This builds the nanobind `_task_interface` extension **and** pre-builds all runtime binaries for available toolchains into `build/lib/`. Sim platforms (a2a3sim, a5sim) are built when `gcc`/`g++` are available; onboard platforms (a2a3, a5) are built when `ccec` and the cross-compiler under `ASCEND_HOME_PATH` are available. Since a2a3 and a5 share the same compilation — differing only at runtime — both architectures are always built together when their toolchain is present.
 
 ### When to rebuild
 

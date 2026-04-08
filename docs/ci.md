@@ -8,14 +8,14 @@ Design principles:
 
 1. **Separate jobs per test category** — st, ut-py, and ut-cpp run as independent jobs for parallelism and clear dashboard visibility.
 2. **Runner matches hardware tier** — no-hardware tests run on `ubuntu-latest`; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
-3. **sim vs onboard for st** — scene tests split into sim jobs (github-hosted, `ci.sh -p a2a3sim`) and onboard jobs (self-hosted, `ci.sh -p a2a3`).
+3. **sim vs onboard for st** — scene tests split into sim jobs (github-hosted, `ci.py -p a2a3sim`) and onboard jobs (self-hosted, `ci.py -p a2a3`).
 
 ## Full Job Matrix
 
 The complete test-type × hardware-tier matrix. Empty cells have no tests yet; only non-empty jobs exist in `ci.yml`.
 
-| | github-hosted | a2a3 runner | a5 runner |
-|---|---|---|---|
+| Category | github-hosted | a2a3 runner | a5 runner |
+| -------- | ------------- | ----------- | --------- |
 | **ut-py** | `ut-py` | `ut-py-a2a3` | `ut-py-a5` |
 | **ut-cpp** | *(empty)* | *(empty)* | *(empty)* |
 | **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3` | `st-onboard-a5` |
@@ -24,7 +24,7 @@ The complete test-type × hardware-tier matrix. Empty cells have no tests yet; o
 
 Currently active jobs (a5 jobs commented out — no runner yet):
 
-```
+```text
 PullRequest
   ├── ut-py                (ubuntu-latest)
   ├── st-sim-a2a3          (ubuntu + macOS)
@@ -36,14 +36,14 @@ PullRequest
 ```
 
 | Job | Runner | What it runs |
-|-----|--------|-------------|
+| --- | ------ | ------------ |
 | `ut-py` | `ubuntu-latest` | `pytest tests -m "not requires_hardware" -v` |
-| `st-sim-a2a3` | `ubuntu-latest`, `macos-latest` | `ci.sh -p a2a3sim` |
-| `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `ci.sh -p a5sim` |
+| `st-sim-a2a3` | `ubuntu-latest`, `macos-latest` | `ci.py -p a2a3sim` |
+| `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `ci.py -p a5sim` |
 | `ut-py-a2a3` | a2a3 self-hosted | `pytest tests -m requires_hardware --platform a2a3 -v` |
-| `st-onboard-a2a3` | a2a3 self-hosted | `ci.sh -p a2a3 -d ... --parallel` |
+| `st-onboard-a2a3` | a2a3 self-hosted | `ci.py -p a2a3 -d ...` |
 | `ut-py-a5` | a5 self-hosted | `pytest tests -m requires_hardware --platform a5 -v` |
-| `st-onboard-a5` | a5 self-hosted | `ci.sh -p a5 -d ... --parallel` |
+| `st-onboard-a5` | a5 self-hosted | `ci.py -p a5 -d ...` |
 
 ### Scheduling constraints
 
@@ -56,7 +56,7 @@ PullRequest
 Three hardware tiers, applied to all test categories. See [testing.md](testing.md#hardware-classification) for the full table including per-category mechanisms (pytest markers, ctest labels, folder structure).
 
 | Tier | CI Runner | Job examples |
-|------|-----------|-------------|
+| ---- | --------- | ------------ |
 | No hardware | `ubuntu-latest` | `ut-py`, `st-sim-*` |
 | Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-py-a2a3`, `st-onboard-a2a3` |
 | Platform-specific (a5) | `[self-hosted, a5]` | `ut-py-a5`, `st-onboard-a5` |
@@ -68,24 +68,24 @@ Three hardware tiers, applied to all test categories. See [testing.md](testing.m
 Python unit tests. Run via pytest with marker filtering.
 
 | File | Content | Hardware? |
-|------|---------|-----------|
+| ---- | ------- | --------- |
 | `test_task_interface.py` | nanobind extension API tests | No |
 | `test_runtime_builder.py` (mocked classes) | RuntimeBuilder discovery, error handling, build logic | No |
 | `test_runtime_builder.py::TestRuntimeBuilderIntegration` | Real compilation across platform × runtime | Yes (`@pytest.mark.requires_hardware`) |
 
 ### `examples/` — Small examples (sim + onboard)
 
-Small, fast examples that run on both simulation and real hardware. Organized as `examples/{arch}/{runtime}/{name}/`. Discovered and executed by `ci.sh`.
+Small, fast examples that run on both simulation and real hardware. Organized as `examples/{arch}/{runtime}/{name}/`. Discovered and executed by `ci.py`.
 
 ### `tests/st/` — Scene tests (onboard only)
 
-Large-scale, feature-rich hardware tests. Too slow or using instructions unsupported by the simulator. Organized as `tests/st/{arch}/{runtime}/{name}/`. Discovered and executed by `ci.sh` only when the platform is not sim.
+Large-scale, feature-rich hardware tests. Too slow or using instructions unsupported by the simulator. Organized as `tests/st/{arch}/{runtime}/{name}/`. Discovered and executed by `ci.py` only when the platform is not sim.
 
 ### Shared structure
 
 Both `examples/` and `tests/st/` cases follow the same layout:
 
-```
+```text
 {name}/
   golden.py                      # generate_inputs() + compute_golden()
   kernels/
@@ -143,38 +143,39 @@ python tools/test_catalog.py cases --platform a2a3sim --source example
 python tools/test_catalog.py cases --platform a2a3 --source st --format json
 ```
 
-## `ci.sh` — Scene Test Runner
+## `ci.py` — Scene Test Runner
 
-`ci.sh` handles scene test execution (examples + st). It does **not** run pytest tests — those are invoked directly by the CI workflow.
+`ci.py` handles scene test execution (examples + st). It does **not** run pytest tests — those are invoked directly by the CI workflow.
 
 ### Key features
 
-- **Parallel execution**: `--parallel` runs sim tasks concurrently; hardware tasks use a shared device queue with `flock`-based locking.
-- **Device queue**: Hardware tasks are distributed across devices specified by `-d`. Workers pop tasks from a shared queue atomically.
-- **Retry**: Failed tasks are retried up to 3 times. Hardware workers quarantine a device after exhausting retries.
-- **PTO-ISA pinning**: `-c <commit>` pins the PTO-ISA dependency. On first failure, ci.sh cleans the cached clone and retries with the pinned commit.
+- **ChipWorker reuse**: Tasks sharing the same runtime reuse a single ChipWorker within their subprocess, avoiding repeated device init/teardown.
+- **Subprocess isolation**: Different runtimes run in separate subprocesses (the host `.so` cannot be unloaded within a single process).
+- **Device queue**: Hardware tasks are distributed across devices specified by `-d`. Workers pop tasks from a shared queue via threads.
+- **Retry**: Failed tasks are retried up to 3 times. Hardware workers quarantine a device after a failure.
+- **PTO-ISA pinning**: `-c <commit>` pins the PTO-ISA dependency. On first failure, re-runs failed tasks with the pinned commit.
 - **Watchdog**: `-t <seconds>` sets a timeout. The entire run is aborted if it exceeds the limit.
 - **Summary table**: After all tasks complete, a formatted results table is printed with pass/fail status, timing, device, and attempt count.
 
 ### Usage
 
 ```bash
-# Simulation (github-hosted)
-./ci.sh -p a2a3sim -t 600
+# All sim platforms (no -p: auto-discovers a2a3sim, a5sim, etc.)
+python ci.py -t 600
+
+# Single sim platform
+python ci.py -p a2a3sim -c 6622890 -t 600
 
 # Hardware with device range
-./ci.sh -p a2a3 -d 4-7 --parallel -t 600
+python ci.py -p a2a3 -d 4-7 -c 6622890 -t 600
 
 # Filter by runtime
-./ci.sh -p a2a3sim -r tensormap_and_ringbuffer
-
-# Pin PTO-ISA commit
-./ci.sh -p a2a3sim -c 6622890
+python ci.py -p a2a3sim -r tensormap_and_ringbuffer
 ```
 
 ### Task discovery
 
-`ci.sh` scans two directories:
+`ci.py` scans two directories:
 
 1. `examples/` — included for both sim and onboard platforms.
 2. `tests/st/` — included only for onboard platforms (non-sim).
@@ -183,14 +184,13 @@ For each directory, it walks subdirectories looking for `kernels/kernel_config.p
 
 ### Execution flow
 
-```
-1. Parse arguments (-p, -d, --parallel, -r, -c, -t)
-2. Discover platforms and runtimes from src/
-3. Discover tasks from examples/ and tests/st/
-4. Run sim tasks (parallel or sequential)
-   └── On failure + -c flag: pin PTO-ISA, retry
-5. Run hardware tasks (device queue with workers)
-   └── On failure + -c flag: pin PTO-ISA, retry
-6. Print summary table
-7. Exit 0 if all passed, 1 otherwise
+```text
+1. Parse arguments (-p, -d, -r, -c, -t)
+2. If no -p: auto-discover all sim platforms and run each
+3. For each platform:
+   a. Discover tasks from examples/ and tests/st/
+   b. Run tasks (subprocess per runtime group for sim, device queue for hw)
+      └── On failure + -c flag: pin PTO-ISA, retry failed tasks
+4. Print combined summary table
+5. Exit 0 if all passed, 1 otherwise
 ```

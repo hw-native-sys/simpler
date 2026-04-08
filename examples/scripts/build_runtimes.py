@@ -43,15 +43,18 @@ def detect_buildable_platforms() -> list:
     """Detect which platforms can be built with available toolchains.
 
     Returns:
-        List of platform strings, e.g. ["a2a3sim", "a5sim"] on x86_64.
+        List of platform strings, e.g. ["a2a3sim", "a5sim"] when only gcc is available,
+        or all four when the onboard cross-compiler is also present.
     """
     platforms = []
 
-    # Sim platforms always buildable (only need gcc/g++)
+    # Sim platforms: only need gcc/g++
     if shutil.which("gcc") and shutil.which("g++"):
         platforms.extend(["a2a3sim", "a5sim"])
 
-    # Onboard platforms need ccec + aarch64 cross-compiler from ASCEND_HOME_PATH
+    # Onboard platforms: need ccec + cross-compiler from ASCEND_HOME_PATH.
+    # a2a3 and a5 use the same toolchain and produce identical artifacts;
+    # the difference is runtime-only, so always build both.
     has_ccec = shutil.which("ccec") is not None
 
     ascend_home = os.environ.get("ASCEND_HOME_PATH", "")
@@ -59,26 +62,9 @@ def detect_buildable_platforms() -> list:
     has_cross = os.path.isfile(cross_gxx)
 
     if has_cross and has_ccec:
-        local_arch = _detect_local_chip_arch()
-        if local_arch:
-            platforms.append(local_arch)
+        platforms.extend(["a2a3", "a5"])
 
     return platforms
-
-
-def _detect_local_chip_arch() -> str:
-    """Detect chip architecture on aarch64 hardware.
-
-    Returns "a2a3" or "a5" based on environment or device files.
-    Falls back to "a2a3" if detection is ambiguous.
-    """
-    # Explicit override
-    env_arch = os.environ.get("PTO_ARCH")
-    if env_arch in ("a2a3", "a5"):
-        return env_arch
-
-    # Default to a2a3 on aarch64 hardware
-    return "a2a3"
 
 
 def build_all(
