@@ -40,22 +40,6 @@
 // Orchestrator State
 // =============================================================================
 
-struct PTO2ManualTaskMeta {
-    PTO2TaskSlotState *slot_state;
-    int32_t scope_task_index;
-    int32_t incoming_edge_head;
-    uint16_t incoming_edge_count;
-    uint8_t tensor_count;
-    uint64_t manual_local_mask;
-    uint8_t tags[MAX_TENSOR_ARGS];
-};
-
-struct PTO2ManualEdge {
-    int32_t producer_idx;
-    int32_t consumer_idx;
-    int32_t next_consumer_edge;
-};
-
 /**
  * Orchestrator state structure (private to Orchestrator)
  *
@@ -105,15 +89,8 @@ struct PTO2OrchestratorState {
     // Cross-thread notification uses shared memory orch_error_code (atomic)
     bool fatal;
 
-    // === MANUAL-SCOPE METADATA ===
-    int32_t *manual_task_meta_begins;  // start index in manual_task_meta for each scope
-    int32_t *manual_edge_begins;       // start index in manual_edges for each scope
-    PTO2ManualTaskMeta *manual_task_meta;
-    int32_t manual_task_meta_size;
-    int32_t manual_task_meta_capacity;
-    PTO2ManualEdge *manual_edges;
-    int32_t manual_edges_size;
-    int32_t manual_edges_capacity;
+    // === MANUAL-SCOPE STATE ===
+    int32_t manual_dep_pool_reserve[PTO2_MAX_RING_DEPTH];
 
     // Hidden alloc tasks complete synchronously inside the orchestrator and
     // therefore bypass the executor's normal worker-completion counter path.
