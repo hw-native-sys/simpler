@@ -248,6 +248,19 @@ This split was chosen because it preserves the normal scheduler after publish:
 - only boundary discovery stays on the TensorMap path
 - only same-scope replay is deferred to manual `scope_end`
 
+### Why these decisions were made
+
+Each part of the split exists to avoid a specific incorrect or too-expensive alternative:
+
+- keep cross-scope producer discovery on TensorMap
+  - otherwise outer reads and writes would lose the current producer frontier and later submissions could see stale state
+- keep same-scope manual-local edges explicit
+  - otherwise manual mode would still pay repeated TensorMap lookup/insert for the tensors it is trying to optimize
+- defer scheduler publication to manual `scope_end`
+  - otherwise tasks with partially wired explicit edges could become runnable too early
+- keep only one post-publish scheduler mechanism
+  - otherwise the runtime would need a second dependency engine and a second completion path, which is high-risk and unnecessary
+
 ## Problem Statement
 
 If we simply copy `aicpu_build_graph` semantics into `tensormap_and_ringbuffer`, we get a wrong boundary model:
