@@ -62,10 +62,10 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
         static_cast<uint32_t>(total_blocks_count * block_size), static_cast<uint32_t>(head_dim)
     };
     uint32_t out_shapes[2] = {static_cast<uint32_t>(batch * num_heads), static_cast<uint32_t>(head_dim)};
-    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type);
-    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type);
-    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type);
-    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
+    Tensor query = make_tensor_external(query_ptr, query_shapes, 2, data_type, true);
+    Tensor key_cache = make_tensor_external(kc_ptr, key_cache_shapes, 2, data_type, true);
+    Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type, true);
+    Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32, true);
 
     int *host_block_table = orch_args.tensor(3).data_as<int>();
     int *host_context_lens = orch_args.tensor(4).data_as<int>();
@@ -87,8 +87,8 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
 
                 uint32_t qi_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
                 uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
-                Tensor qi = query.view(tile2d_shapes, qi_offsets);
-                Tensor out_view = out.view(tile2d_shapes, out_view_offsets);
+                Tensor qi = query.view(tile2d_shapes, qi_offsets, true);
+                Tensor out_view = out.view(tile2d_shapes, out_view_offsets, true);
 
                 PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
                     Arg params_inplace;
@@ -109,8 +109,8 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                             static_cast<uint32_t>(block_size), static_cast<uint32_t>(head_dim)
                         };
                         uint32_t kv_offsets[2] = {static_cast<uint32_t>(cur_block_idx * block_size), 0};
-                        Tensor kj = key_cache.view(kv_shapes, kv_offsets);
-                        Tensor vj = value_cache.view(kv_shapes, kv_offsets);
+                        Tensor kj = key_cache.view(kv_shapes, kv_offsets, true);
+                        Tensor vj = value_cache.view(kv_shapes, kv_offsets, true);
 
                         Arg params_qk;
                         params_qk.add_input(qi);
