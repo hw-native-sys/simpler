@@ -20,8 +20,6 @@
 #define FUNC_ONLINE_UPDATE 3
 #define FUNC_AIC_HUB 4
 #define FUNC_AIV_HUB 5
-#define N_MANUAL_CHUNK 4
-
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
@@ -92,83 +90,82 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                 Tensor qi = query.view(tile2d_shapes, qi_offsets);
                 Tensor out_view = out.view(tile2d_shapes, out_view_offsets);
 
-                Arg params_inplace;
-                params_inplace.add_output(tile2d_ci);
-                params_inplace.add_output(scalar_ci);
-                params_inplace.add_output(scalar_ci);
-                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_inplace);
-                const Tensor &oi = hub_outs.get_ref(0);
-                const Tensor &li_update = hub_outs.get_ref(1);
-                const Tensor &mi_update = hub_outs.get_ref(2);
+                PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
+                    Arg params_inplace;
+                    params_inplace.add_output(tile2d_ci);
+                    params_inplace.add_output(scalar_ci);
+                    params_inplace.add_output(scalar_ci);
+                    PTO2ManualSubmitResult hub_outs = pto2_rt_submit_aiv_task_manual(FUNC_AIV_HUB, params_inplace);
+                    const Tensor &oi = hub_outs.outputs.get_ref(0);
+                    const Tensor &li_update = hub_outs.outputs.get_ref(1);
+                    const Tensor &mi_update = hub_outs.outputs.get_ref(2);
+                    PTO2TaskId prev_update_task = hub_outs.task_id;
 
-                for (uint64_t bn = 0; bn < bn_this_batch; bn += N_MANUAL_CHUNK) {
-                    uint64_t bn_end = std::min(bn + static_cast<uint64_t>(N_MANUAL_CHUNK), bn_this_batch);
+                    for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
+                        uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
+                        uint64_t valid_len = std::min(block_size, cur_seq - bn * block_size);
 
-                    PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
-                        for (uint64_t bn_local = bn; bn_local < bn_end; bn_local++) {
-                            uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn_local];
-                            uint64_t valid_len = std::min(block_size, cur_seq - bn_local * block_size);
+                        uint32_t kv_shapes[2] = {
+                            static_cast<uint32_t>(block_size), static_cast<uint32_t>(head_dim)
+                        };
+                        uint32_t kv_offsets[2] = {static_cast<uint32_t>(cur_block_idx * block_size), 0};
+                        Tensor kj = key_cache.view(kv_shapes, kv_offsets);
+                        Tensor vj = value_cache.view(kv_shapes, kv_offsets);
 
-                            uint32_t kv_shapes[2] = {
-                                static_cast<uint32_t>(block_size), static_cast<uint32_t>(head_dim)
-                            };
-                            uint32_t kv_offsets[2] = {static_cast<uint32_t>(cur_block_idx * block_size), 0};
-                            Tensor kj = key_cache.view(kv_shapes, kv_offsets);
-                            Tensor vj = value_cache.view(kv_shapes, kv_offsets);
+                        Arg params_qk;
+                        params_qk.add_input(qi);
+                        params_qk.add_input(kj);
+                        params_qk.add_output(sij_ci);
+                        PTO2ManualSubmitResult qk_outs = pto2_rt_submit_aic_task_manual(FUNC_QK_MATMUL, params_qk);
+                        const Tensor &sij = qk_outs.outputs.get_ref(0);
 
-                            Arg params_qk;
-                            params_qk.add_input(qi);
-                            params_qk.add_input(kj);
-                            params_qk.add_output(sij_ci);
-                            PTO2ManualSubmitResult qk_outs = pto2_rt_submit_aic_task_manual(FUNC_QK_MATMUL, params_qk);
-                            const Tensor &sij = qk_outs.outputs.get_ref(0);
+                        uint32_t sij_valid_shapes[2] = {
+                            static_cast<uint32_t>(q_tile), static_cast<uint32_t>(valid_len)
+                        };
+                        uint32_t sij_valid_offsets[2] = {0, 0};
+                        Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
 
-                            uint32_t sij_valid_shapes[2] = {
-                                static_cast<uint32_t>(q_tile), static_cast<uint32_t>(valid_len)
-                            };
-                            uint32_t sij_valid_offsets[2] = {0, 0};
-                            Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
+                        Arg params_sf;
+                        params_sf.add_input(sij_valid);
+                        params_sf.add_output(pij_f16_ci);
+                        params_sf.add_output(scalar_ci);
+                        params_sf.add_output(scalar_ci);
+                        params_sf.add_scalar(scale_value);
+                        PTO2ManualSubmitResult sf_outs =
+                            pto2_rt_submit_aiv_task_manual(FUNC_SOFTMAX_PREPARE, params_sf);
+                        const Tensor &pij_f16 = sf_outs.outputs.get_ref(0);
+                        const Tensor &mi = sf_outs.outputs.get_ref(1);
+                        const Tensor &li = sf_outs.outputs.get_ref(2);
 
-                            Arg params_sf;
-                            params_sf.add_input(sij_valid);
-                            params_sf.add_output(pij_f16_ci);
-                            params_sf.add_output(scalar_ci);
-                            params_sf.add_output(scalar_ci);
-                            params_sf.add_scalar(scale_value);
-                            PTO2ManualSubmitResult sf_outs =
-                                pto2_rt_submit_aiv_task_manual(FUNC_SOFTMAX_PREPARE, params_sf);
-                            const Tensor &pij_f16 = sf_outs.outputs.get_ref(0);
-                            const Tensor &mi = sf_outs.outputs.get_ref(1);
-                            const Tensor &li = sf_outs.outputs.get_ref(2);
+                        Arg params_pv;
+                        params_pv.add_input(pij_f16);
+                        params_pv.add_input(vj);
+                        params_pv.add_output(tile2d_ci);
+                        PTO2ManualSubmitResult pv_outs = pto2_rt_submit_aic_task_manual(FUNC_PV_MATMUL, params_pv);
+                        const Tensor &oi_tmp = pv_outs.outputs.get_ref(0);
 
-                            Arg params_pv;
-                            params_pv.add_input(pij_f16);
-                            params_pv.add_input(vj);
-                            params_pv.add_output(tile2d_ci);
-                            PTO2ManualSubmitResult pv_outs = pto2_rt_submit_aic_task_manual(FUNC_PV_MATMUL, params_pv);
-                            const Tensor &oi_tmp = pv_outs.outputs.get_ref(0);
+                        uint64_t is_first = (bn == 0) ? 1 : 0;
+                        uint64_t is_last = (bn == bn_this_batch - 1) ? 1 : 0;
 
-                            uint64_t is_first = (bn_local == 0) ? 1 : 0;
-                            uint64_t is_last = (bn_local == bn_this_batch - 1) ? 1 : 0;
+                        Arg params_up;
+                        params_up.add_input(mi);
+                        params_up.add_input(li);
+                        params_up.add_input(oi_tmp);
+                        params_up.add_inout(mi_update);
+                        params_up.add_inout(li_update);
+                        params_up.add_inout(oi);
+                        params_up.add_inout(out_view);
+                        params_up.add_scalar(is_first);
+                        params_up.add_scalar(is_last);
+                        PTO2ManualSubmitResult up_outs =
+                            pto2_rt_submit_aiv_task_manual(FUNC_ONLINE_UPDATE, params_up);
 
-                            Arg params_up;
-                            params_up.add_input(mi);
-                            params_up.add_input(li);
-                            params_up.add_input(oi_tmp);
-                            params_up.add_inout(mi_update);
-                            params_up.add_inout(li_update);
-                            params_up.add_inout(oi);
-                            params_up.add_inout(out_view);
-                            params_up.add_scalar(is_first);
-                            params_up.add_scalar(is_last);
-                            PTO2ManualSubmitResult up_outs =
-                                pto2_rt_submit_aiv_task_manual(FUNC_ONLINE_UPDATE, params_up);
-
-                            pto2_rt_add_dependency(qk_outs.task_id, sf_outs.task_id);
-                            pto2_rt_add_dependency(sf_outs.task_id, pv_outs.task_id);
-                            pto2_rt_add_dependency(sf_outs.task_id, up_outs.task_id);
-                            pto2_rt_add_dependency(pv_outs.task_id, up_outs.task_id);
-                        }
+                        pto2_rt_add_dependency(qk_outs.task_id, sf_outs.task_id);
+                        pto2_rt_add_dependency(sf_outs.task_id, pv_outs.task_id);
+                        pto2_rt_add_dependency(sf_outs.task_id, up_outs.task_id);
+                        pto2_rt_add_dependency(pv_outs.task_id, up_outs.task_id);
+                        pto2_rt_add_dependency(prev_update_task, up_outs.task_id);
+                        prev_update_task = up_outs.task_id;
                     }
                 }
             }
