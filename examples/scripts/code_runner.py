@@ -827,8 +827,8 @@ class CodeRunner:
         worker = ChipWorker()
         worker.init(
             str(binaries.host_path),
-            binaries.aicpu_path.read_bytes(),
-            binaries.aicore_path.read_bytes(),
+            str(binaries.aicpu_path),
+            str(binaries.aicore_path),
             sim_context_lib_path=str(binaries.sim_context_path) if binaries.sim_context_path else "",
         )
         worker.set_device(self.device_id)

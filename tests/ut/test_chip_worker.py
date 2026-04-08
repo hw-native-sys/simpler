@@ -96,12 +96,12 @@ class TestChipWorkerStateMachine:
         worker = _ChipWorker()
         worker.finalize()
         with pytest.raises(RuntimeError, match="finalized"):
-            worker.init("/nonexistent/libfoo.so", b"", b"")
+            worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null")
 
     def test_init_with_nonexistent_lib_raises(self):
         worker = _ChipWorker()
         with pytest.raises(RuntimeError, match="dlopen"):
-            worker.init("/nonexistent/libfoo.so", b"", b"")
+            worker.init("/nonexistent/libfoo.so", "/dev/null", "/dev/null")
 
 
 # ============================================================================

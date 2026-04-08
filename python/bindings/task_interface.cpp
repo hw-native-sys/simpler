@@ -582,15 +582,7 @@ NB_MODULE(_task_interface, m) {
     nb::class_<ChipWorker>(m, "_ChipWorker")
         .def(nb::init<>())
         .def(
-            "init",
-            [](ChipWorker &self, const std::string &host_lib_path, nb::bytes aicpu, nb::bytes aicore,
-               const std::string &sim_context_lib_path) {
-                self.init(
-                    host_lib_path, reinterpret_cast<const uint8_t *>(aicpu.c_str()), aicpu.size(),
-                    reinterpret_cast<const uint8_t *>(aicore.c_str()), aicore.size(), sim_context_lib_path
-                );
-            },
-            nb::arg("host_lib_path"), nb::arg("aicpu_binary"), nb::arg("aicore_binary"),
+            "init", &ChipWorker::init, nb::arg("host_lib_path"), nb::arg("aicpu_path"), nb::arg("aicore_path"),
             nb::arg("sim_context_lib_path") = ""
         )
         .def("set_device", &ChipWorker::set_device, nb::arg("device_id"))

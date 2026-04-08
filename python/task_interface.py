@@ -136,7 +136,8 @@ class ChipWorker:
 
         worker = ChipWorker()
         worker.init(host_path="build/lib/.../host.so",
-                    aicpu_binary=aicpu_bytes, aicore_binary=aicore_bytes)
+                    aicpu_path="build/lib/.../aicpu.so",
+                    aicore_path="build/lib/.../aicore.o")
         worker.set_device(device_id=0)
         worker.run(chip_callable, orch_args, block_dim=24)
         worker.reset_device()
@@ -146,18 +147,18 @@ class ChipWorker:
     def __init__(self):
         self._impl = _ChipWorker()
 
-    def init(self, host_path, aicpu_binary, aicore_binary, sim_context_lib_path=""):
+    def init(self, host_path, aicpu_path, aicore_path, sim_context_lib_path=""):
         """Load host runtime library and cache platform binaries.
 
         Can only be called once — the runtime cannot be changed.
 
         Args:
             host_path: Path to the host runtime shared library (.so).
-            aicpu_binary: AICPU binary content (bytes).
-            aicore_binary: AICore binary content (bytes).
+            aicpu_path: Path to the AICPU binary (.so).
+            aicore_path: Path to the AICore binary (.o).
             sim_context_lib_path: Path to libcpu_sim_context.so (sim only).
         """
-        self._impl.init(str(host_path), aicpu_binary, aicore_binary, str(sim_context_lib_path))
+        self._impl.init(str(host_path), str(aicpu_path), str(aicore_path), str(sim_context_lib_path))
 
     def set_device(self, device_id):
         """Set the target NPU device.

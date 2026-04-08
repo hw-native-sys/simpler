@@ -150,8 +150,8 @@ binaries = builder.get_binaries("tensormap_and_ringbuffer")
 # Create worker and initialize with platform binaries
 worker = ChipWorker()
 worker.init(host_path=str(binaries.host_path),
-            aicpu_binary=binaries.aicpu_path.read_bytes(),
-            aicore_binary=binaries.aicore_path.read_bytes())
+            aicpu_path=str(binaries.aicpu_path),
+            aicore_path=str(binaries.aicore_path))
 worker.set_device(device_id=0)
 
 # Execute callable on device

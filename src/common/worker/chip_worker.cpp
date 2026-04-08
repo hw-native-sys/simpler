@@ -13,9 +13,11 @@
 
 #include <dlfcn.h>
 
+#include <fstream>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace {
 
@@ -53,13 +55,30 @@ void ensure_sim_context_loaded(const std::string &path) {
     });
 }
 
+std::vector<uint8_t> read_binary_file(const std::string &path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f) {
+        throw std::runtime_error("Failed to open binary file: " + path);
+    }
+    auto size = f.tellg();
+    if (size < 0) {
+        throw std::runtime_error("Failed to determine size of binary file: " + path);
+    }
+    std::vector<uint8_t> buf(static_cast<size_t>(size));
+    f.seekg(0);
+    if (size > 0 && !f.read(reinterpret_cast<char *>(buf.data()), size)) {
+        throw std::runtime_error("Failed to read binary file: " + path);
+    }
+    return buf;
+}
+
 }  // namespace
 
 ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
-    const std::string &host_lib_path, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, const std::string &sim_context_lib_path
+    const std::string &host_lib_path, const std::string &aicpu_path, const std::string &aicore_path,
+    const std::string &sim_context_lib_path
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -98,8 +117,9 @@ void ChipWorker::init(
 
     lib_handle_ = handle;
 
-    aicpu_binary_.assign(aicpu_binary, aicpu_binary + aicpu_size);
-    aicore_binary_.assign(aicore_binary, aicore_binary + aicore_size);
+    // Read platform binaries from files
+    aicpu_binary_ = read_binary_file(aicpu_path);
+    aicore_binary_ = read_binary_file(aicore_path);
 
     runtime_buf_.resize(get_runtime_size_fn_());
 
