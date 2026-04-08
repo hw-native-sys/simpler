@@ -146,13 +146,6 @@ int DeviceRunner::ensure_binaries_loaded(
         }
 
         LOG_INFO("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
-
-        // Pass sim context function pointer to the AICPU SO (same pattern as AICore).
-        auto set_aicpu_helpers =
-            reinterpret_cast<void (*)(void *)>(dlsym(aicpu_so_handle_, "set_aicpu_sim_context_helpers"));
-        if (set_aicpu_helpers != nullptr) {
-            set_aicpu_helpers(reinterpret_cast<void *>(platform_set_cpu_sim_task_cookie));
-        }
     }
 
     // Write AICore binary to temp file and dlopen
@@ -179,16 +172,14 @@ int DeviceRunner::ensure_binaries_loaded(
         }
         LOG_INFO("DeviceRunner(sim): Loaded aicore_execute_wrapper from %s", aicore_so_path_.c_str());
 
-        // Pass sim context function pointers to the AICore SO so it doesn't
-        // need dlsym(RTLD_DEFAULT) — which fails when the host runtime SO
-        // is loaded with RTLD_LOCAL.
-        auto set_helpers =
-            reinterpret_cast<void (*)(void *, void *, void *)>(dlsym(aicore_so_handle_, "set_sim_context_helpers"));
-        if (set_helpers != nullptr) {
-            set_helpers(
-                reinterpret_cast<void *>(pto_cpu_sim_set_execution_context),
-                reinterpret_cast<void *>(pto_cpu_sim_set_task_cookie),
-                reinterpret_cast<void *>(platform_get_cpu_sim_task_cookie)
+        // Pass core identity setter function pointers to the AICore SO so it can
+        // set per-thread subblock_id and cluster_id for pto-isa's TPUSH/TPOP hooks.
+        auto set_identity_helpers =
+            reinterpret_cast<void (*)(void *, void *)>(dlsym(aicore_so_handle_, "set_sim_core_identity_helpers"));
+        if (set_identity_helpers != nullptr) {
+            set_identity_helpers(
+                reinterpret_cast<void *>(sim_context_set_subblock_id),
+                reinterpret_cast<void *>(sim_context_set_cluster_id)
             );
         }
     }
@@ -546,6 +537,16 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
         LOG_ERROR("dlsym failed for 'kernel_entry': %s", dlerror());
         dlclose(handle);
         return 0;
+    }
+
+    // 6. Inject pto-isa simulation hooks into the kernel SO.
+    //    Each kernel SO has its own copy of the inline static function pointers
+    //    in cpu_stub.hpp, so every SO must be registered after dlopen.
+    auto register_hooks = reinterpret_cast<void (*)(void *, void *)>(dlsym(handle, "pto_sim_register_hooks"));
+    if (register_hooks != nullptr) {
+        register_hooks(
+            reinterpret_cast<void *>(pto_sim_get_subblock_id), reinterpret_cast<void *>(pto_sim_get_pipe_shared_state)
+        );
     }
 
     // 6. Create host-memory copy of CoreCallable with resolved_addr_ = func_ptr

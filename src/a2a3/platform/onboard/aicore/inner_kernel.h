@@ -89,19 +89,6 @@ __aicore__ inline void write_reg(RegId reg, uint64_t value) {
  */
 __aicore__ inline uint32_t get_physical_core_id() { return static_cast<uint32_t>(get_coreid()) & AICORE_COREID_MASK; }
 
-// CPU_SIM_SET_EXECUTION_CONTEXT - no-op on real hardware (context provided by CANN runtime)
-#define CPU_SIM_SET_EXECUTION_CONTEXT(block_idx, subblock_id, subblock_dim) ((void)0)
-
-// CPU_SIM_SET_TASK_COOKIE - no-op on real hardware
-#define CPU_SIM_SET_TASK_COOKIE(cookie) ((void)0)
-
-// platform_get_cpu_sim_task_cookie - no-op on real hardware
-__aicore__ inline uint64_t platform_get_cpu_sim_task_cookie(uint32_t core_id, uint32_t reg_task_id) {
-    (void)core_id;
-    (void)reg_task_id;
-    return 0;
-}
-
 // =============================================================================
 // System Counter
 // =============================================================================

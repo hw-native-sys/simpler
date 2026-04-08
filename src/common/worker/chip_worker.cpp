@@ -37,8 +37,8 @@ T load_symbol(void *handle, const char *name) {
 }
 
 // Process-wide singleton: libcpu_sim_context.so is loaded once with
-// RTLD_GLOBAL so that PTO ISA kernel SOs can find pto_cpu_sim_* symbols
-// via dlsym(RTLD_DEFAULT, ...).  Never dlclosed.
+// RTLD_GLOBAL so that host_runtime.so can resolve sim_context_set_* and
+// pto_sim_get_* symbols at runtime.  Never dlclosed.
 std::once_flag g_sim_context_once;
 void *g_sim_context_handle = nullptr;
 
@@ -88,7 +88,8 @@ void ChipWorker::init(
     }
 
     // Load the sim context SO with RTLD_GLOBAL (once per process) so that
-    // PTO ISA TPUSH/TPOP can resolve pto_cpu_sim_* via dlsym(RTLD_DEFAULT).
+    // PTO ISA TPUSH/TPOP can resolve pto_sim_get_subblock_id and
+    // pto_sim_get_pipe_shared_state via dlsym(RTLD_DEFAULT).
     if (!sim_context_lib_path.empty()) {
         ensure_sim_context_loaded(sim_context_lib_path);
     }
@@ -96,6 +97,9 @@ void ChipWorker::init(
     // Host runtime SO is loaded with RTLD_LOCAL so that different runtimes'
     // identically-named symbols (init_runtime_impl, run_runtime, etc.) do
     // not collide when switching runtimes within the same process.
+    // Cross-runtime isolation relies on -fno-gnu-unique (#453) allowing
+    // dlclose to actually unload the previous runtime's SO before loading
+    // the next one.
     dlerror();
     void *handle = dlopen(host_lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {

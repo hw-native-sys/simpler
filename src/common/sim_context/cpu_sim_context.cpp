@@ -11,20 +11,25 @@
 
 /**
  * @file cpu_sim_context.cpp
- * @brief Per-device CPU simulation context
+ * @brief Per-device CPU simulation context for TPUSH/TPOP
  *
- * Provides per-thread execution context (block_idx, subblock_id, subblock_dim)
- * and per-device shared storage / task cookie maps.
+ * Provides per-thread core identity (subblock_id, cluster_id, dispatch_id)
+ * and per-device pipe shared state maps.
  *
  * Each simulated device has an independent DeviceSimContext so that multiple
  * ChipWorkers (each simulating a different device) can run concurrently.
  *
  * The current device is bound to each thread via a pthread key set in
- * pto_cpu_sim_bind_device(). All pto_cpu_sim_* functions route through
- * this binding to find the correct DeviceSimContext.
+ * pto_cpu_sim_bind_device(). Hooks called by pto-isa route through this
+ * binding to find the correct DeviceSimContext.
  *
- * Functions are exported with extern "C" linkage so that AICore kernel SOs
- * can resolve them via dlsym(RTLD_DEFAULT, ...) at runtime.
+ * Exported hooks (resolved by pto-isa via dlsym(RTLD_DEFAULT)):
+ *   - pto_sim_get_subblock_id: returns current thread's AIV lane (0 or 1)
+ *   - pto_sim_get_pipe_shared_state: returns per-device per-cluster
+ *     per-dispatch pipe shared memory keyed by a uint32 pipe configuration
+ *
+ * Per-thread TLS values (subblock_id, cluster_id, dispatch_id) are set by
+ * the sim aicore platform code via the sim_context_set_* setter functions.
  */
 
 #include "cpu_sim_context.h"
@@ -32,24 +37,35 @@
 #include <atomic>
 #include <cstdint>
 #include <cstdlib>
-#include <map>
 #include <mutex>
 #include <pthread.h>
-#include <string>
 #include <unordered_map>
 
 namespace {
 
 // ---------------------------------------------------------------------------
-// Per-device context
+// Per-device pipe shared state
 // ---------------------------------------------------------------------------
 
-struct DeviceSimContext {
-    std::mutex shared_storage_mutex;
-    std::map<std::string, void *> shared_storage;
+// Key identifying a pipe shared state entry: per-cluster, per-pipe configuration.
+// pipe_key encodes FlagID, DirType, SlotNum, LocalSlotNum, SlotSize from pto-isa.
+// Fixed number of entries (one per cluster per pipe type) — no growth over time.
+struct PipeStateKey {
+    uint32_t cluster_id;
+    uint64_t pipe_key;
 
-    std::mutex task_cookie_mutex;
-    std::map<uint64_t, uint64_t> task_cookies;
+    bool operator==(const PipeStateKey &o) const { return cluster_id == o.cluster_id && pipe_key == o.pipe_key; }
+};
+
+struct PipeStateKeyHash {
+    size_t operator()(const PipeStateKey &k) const {
+        return static_cast<size_t>(k.cluster_id) * 0x9e3779b97f4a7c15ULL ^ static_cast<size_t>(k.pipe_key);
+    }
+};
+
+struct DeviceSimContext {
+    std::mutex pipe_state_mutex;
+    std::unordered_map<PipeStateKey, void *, PipeStateKeyHash> pipe_states;
 };
 
 std::mutex g_registry_mutex;
@@ -100,53 +116,30 @@ DeviceSimContext *get_current_device_context() {
 }
 
 // ---------------------------------------------------------------------------
-// Per-thread execution context (block_idx, subblock_id, etc.)
+// Per-thread core identity TLS (subblock_id, cluster_id, dispatch_id)
 // ---------------------------------------------------------------------------
 
-struct CpuSimExecutionContext {
-    uint32_t block_idx = 0;
-    uint32_t subblock_id = 0;
-    uint32_t subblock_dim = 1;
-    uint64_t task_cookie = 0;
-};
+std::mutex g_identity_key_mutex;
+pthread_key_t g_subblock_id_key{};
+pthread_key_t g_cluster_id_key{};
+std::atomic<bool> g_identity_keys_initialized{false};
 
-void free_cpu_sim_execution_context(void *ptr) { std::free(ptr); }
-
-std::mutex g_exec_ctx_key_mutex;
-pthread_key_t g_exec_ctx_key{};
-std::atomic<bool> g_exec_ctx_key_initialized{false};
-
-CpuSimExecutionContext *get_cpu_sim_execution_context() {
-    if (!g_exec_ctx_key_initialized.load(std::memory_order_acquire)) {
-        std::lock_guard<std::mutex> lock(g_exec_ctx_key_mutex);
-        if (!g_exec_ctx_key_initialized.load(std::memory_order_relaxed)) {
-            if (pthread_key_create(&g_exec_ctx_key, free_cpu_sim_execution_context) != 0) {
-                return nullptr;
-            }
-            g_exec_ctx_key_initialized.store(true, std::memory_order_release);
-        }
+void ensure_identity_keys() {
+    if (g_identity_keys_initialized.load(std::memory_order_acquire)) {
+        return;
     }
-
-    auto *ctx = static_cast<CpuSimExecutionContext *>(pthread_getspecific(g_exec_ctx_key));
-    if (ctx != nullptr) {
-        return ctx;
+    std::lock_guard<std::mutex> lock(g_identity_key_mutex);
+    if (g_identity_keys_initialized.load(std::memory_order_relaxed)) {
+        return;
     }
-
-    ctx = static_cast<CpuSimExecutionContext *>(std::calloc(1, sizeof(CpuSimExecutionContext)));
-    if (ctx == nullptr) {
-        return nullptr;
+    if (pthread_key_create(&g_subblock_id_key, nullptr) != 0) {
+        return;
     }
-    ctx->subblock_dim = 1;
-
-    if (pthread_setspecific(g_exec_ctx_key, ctx) != 0) {
-        std::free(ctx);
-        return nullptr;
+    if (pthread_key_create(&g_cluster_id_key, nullptr) != 0) {
+        pthread_key_delete(g_subblock_id_key);
+        return;
     }
-    return ctx;
-}
-
-uint64_t make_task_cookie_key(uint32_t core_id, uint32_t reg_task_id) {
-    return (static_cast<uint64_t>(core_id) << 32) | static_cast<uint64_t>(reg_task_id);
+    g_identity_keys_initialized.store(true, std::memory_order_release);
 }
 
 }  // namespace
@@ -189,8 +182,8 @@ extern "C" void pto_cpu_sim_release_device(int device_id) {
     }
 
     {
-        std::lock_guard<std::mutex> lock(ctx->shared_storage_mutex);
-        for (auto &[key, storage] : ctx->shared_storage) {
+        std::lock_guard<std::mutex> lock(ctx->pipe_state_mutex);
+        for (auto &[key, storage] : ctx->pipe_states) {
             (void)key;
             std::free(storage);
         }
@@ -203,93 +196,41 @@ void clear_cpu_sim_shared_storage() {
     if (ctx == nullptr) {
         return;
     }
-
-    {
-        std::lock_guard<std::mutex> lock(ctx->task_cookie_mutex);
-        ctx->task_cookies.clear();
+    std::lock_guard<std::mutex> lock(ctx->pipe_state_mutex);
+    for (auto &[key, storage] : ctx->pipe_states) {
+        (void)key;
+        std::free(storage);
     }
-
-    {
-        std::lock_guard<std::mutex> lock(ctx->shared_storage_mutex);
-        for (auto &[key, storage] : ctx->shared_storage) {
-            (void)key;
-            std::free(storage);
-        }
-        ctx->shared_storage.clear();
-    }
+    ctx->pipe_states.clear();
 }
 
 // ---------------------------------------------------------------------------
-// Per-thread execution context
+// Per-thread core identity setters (called by sim aicore platform code)
 // ---------------------------------------------------------------------------
 
-extern "C" void pto_cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim) {
-    auto *ctx = get_cpu_sim_execution_context();
-    if (ctx == nullptr) {
-        return;
-    }
-    ctx->block_idx = block_idx;
-    ctx->subblock_id = subblock_id;
-    ctx->subblock_dim = (subblock_dim == 0) ? 1u : subblock_dim;
+void sim_context_set_subblock_id(uint32_t subblock_id) {
+    ensure_identity_keys();
+    pthread_setspecific(g_subblock_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(subblock_id)));
 }
 
-extern "C" void pto_cpu_sim_set_task_cookie(uint64_t task_cookie) {
-    auto *ctx = get_cpu_sim_execution_context();
-    if (ctx == nullptr) {
-        return;
-    }
-    ctx->task_cookie = task_cookie;
-}
-
-extern "C" void pto_cpu_sim_get_execution_context(uint32_t *block_idx, uint32_t *subblock_id, uint32_t *subblock_dim) {
-    auto *ctx = get_cpu_sim_execution_context();
-    uint32_t b = 0, s = 0, d = 1;
-    if (ctx != nullptr) {
-        b = ctx->block_idx;
-        s = ctx->subblock_id;
-        d = ctx->subblock_dim;
-    }
-    if (block_idx != nullptr) *block_idx = b;
-    if (subblock_id != nullptr) *subblock_id = s;
-    if (subblock_dim != nullptr) *subblock_dim = d;
-}
-
-extern "C" uint64_t pto_cpu_sim_get_task_cookie() {
-    auto *ctx = get_cpu_sim_execution_context();
-    return (ctx != nullptr) ? ctx->task_cookie : 0;
+void sim_context_set_cluster_id(uint32_t cluster_id) {
+    ensure_identity_keys();
+    pthread_setspecific(g_cluster_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(cluster_id)));
 }
 
 // ---------------------------------------------------------------------------
-// Per-device shared storage and task cookies
+// Hooks resolved by pto-isa via function pointer injection
 // ---------------------------------------------------------------------------
 
-extern "C" void platform_set_cpu_sim_task_cookie(uint32_t core_id, uint32_t reg_task_id, uint64_t task_cookie) {
-    DeviceSimContext *dev = get_current_device_context();
-    if (dev == nullptr) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(dev->task_cookie_mutex);
-    dev->task_cookies[make_task_cookie_key(core_id, reg_task_id)] = task_cookie;
-}
-
-extern "C" uint64_t platform_get_cpu_sim_task_cookie(uint32_t core_id, uint32_t reg_task_id) {
-    DeviceSimContext *dev = get_current_device_context();
-    if (dev == nullptr) {
+extern "C" uint32_t pto_sim_get_subblock_id() {
+    if (!g_identity_keys_initialized.load(std::memory_order_acquire)) {
         return 0;
     }
-    std::lock_guard<std::mutex> lock(dev->task_cookie_mutex);
-    uint64_t key = make_task_cookie_key(core_id, reg_task_id);
-    auto it = dev->task_cookies.find(key);
-    if (it == dev->task_cookies.end()) {
-        return 0;
-    }
-    uint64_t val = it->second;
-    dev->task_cookies.erase(it);
-    return val;
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_subblock_id_key)));
 }
 
-extern "C" void *pto_cpu_sim_get_shared_storage(const char *key, size_t size) {
-    if (key == nullptr || size == 0) {
+extern "C" void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size) {
+    if (size == 0) {
         return nullptr;
     }
 
@@ -298,13 +239,20 @@ extern "C" void *pto_cpu_sim_get_shared_storage(const char *key, size_t size) {
         return nullptr;
     }
 
-    std::lock_guard<std::mutex> lock(dev->shared_storage_mutex);
-    auto it = dev->shared_storage.find(key);
-    if (it != dev->shared_storage.end()) {
+    uint32_t cluster_id = 0;
+    if (g_identity_keys_initialized.load(std::memory_order_acquire)) {
+        cluster_id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_cluster_id_key)));
+    }
+
+    PipeStateKey key{cluster_id, pipe_key};
+
+    std::lock_guard<std::mutex> lock(dev->pipe_state_mutex);
+    auto it = dev->pipe_states.find(key);
+    if (it != dev->pipe_states.end()) {
         return it->second;
     }
 
     void *storage = std::calloc(1, size);
-    dev->shared_storage.emplace(key, storage);
+    dev->pipe_states.emplace(key, storage);
     return storage;
 }

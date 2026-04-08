@@ -121,11 +121,6 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             uint64_t start_time = get_sys_cnt_aicore();
 
             // Execute the task
-            CPU_SIM_SET_EXECUTION_CONTEXT(
-                payload->local_context.s_block_idx, payload->global_context.sub_block_id,
-                (core_type == CoreType::AIV) ? PLATFORM_AIV_CORES_PER_BLOCKDIM : 1u
-            );
-            CPU_SIM_SET_TASK_COOKIE(platform_get_cpu_sim_task_cookie(static_cast<uint32_t>(s_block_idx), task_id));
             execute_task(payload);
 
             // Performance profiling: record task execution

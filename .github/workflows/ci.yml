@@ -135,7 +135,7 @@ jobs:
         run: pip install .
 
       - name: Run simulation examples (a2a3sim)
-        run: python ci.py -p a2a3sim -c 8830244b -t 600 --clone-protocol https
+        run: python ci.py -p a2a3sim -c d96c8784 -t 600 --clone-protocol https
 
   st-sim-a5:
     runs-on: ${{ matrix.os }}
@@ -186,7 +186,7 @@ jobs:
         run: pip install .
 
       - name: Run simulation examples (a5sim)
-        run: python ci.py -p a5sim -c 8830244b -t 600 --clone-protocol https
+        run: python ci.py -p a5sim -c d96c8784 -t 600 --clone-protocol https
 
   # ---------- Python unit tests (a2a3 hardware) ----------
   ut-py-a2a3:
@@ -220,7 +220,7 @@ jobs:
       - name: Run on-device examples (a2a3)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python ci.py -p a2a3 -d ${DEVICE_RANGE} -c 8830244b -t 600 --clone-protocol https
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python ci.py -p a2a3 -d ${DEVICE_RANGE} -c d96c8784 -t 600 --clone-protocol https
 
 
   # ---------- Detect A5 changes (runs on GitHub server, not A5 machine) ----------
@@ -295,4 +295,4 @@ jobs:
           export PATH="$HOME/.local/bin:$PATH"
           source ${ASCEND_HOME_PATH}/bin/setenv.bash
           DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
-          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python ci.py -p a5 -d ${DEVICE_RANGE} -c 8830244b -t 1200 --clone-protocol https"
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python ci.py -p a5 -d ${DEVICE_RANGE} -c d96c8784 -t 1200 --clone-protocol https"

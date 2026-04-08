@@ -1,165 +1,190 @@
-# TPUSH/TPOP Support in a2a3 Simulation
+# TPUSH/TPOP Simulation Support
 
-This document summarizes the CPU_SIM context plumbing used by TPUSH/TPOP in
-`a2a3sim`, including the host-side follow-up that replaced `thread_local`
-storage with a pthread-backed per-thread context.
+## Overview
 
-## Problem
+TPUSH/TPOP enables direct data transfer between AIC (Cube) and AIV (Vector)
+cores within the same cluster via an on-chip VEC_FIFO, bypassing global memory.
 
-`TPUSH/TPOP` depends on CPU_SIM being able to identify:
+In simulation, the hardware VEC_FIFO is replaced by a software ring buffer
+(`SharedState`) managed per cluster per pipe configuration. The simulation
+platform provides the necessary context so that pto-isa's CPU simulation
+backend can locate the correct ring buffer without any runtime involvement.
 
-- the current execution context
-- the logical task that owns the pipe state
-- the shared storage used by the producer and consumer
+## Architecture
 
-The original sim path did not provide a stable task identity. Using reused
-payload addresses as the key was not reliable, so mixed AIC/AIV workloads could
-not rendezvous correctly in simulation.
+### Hardware Model
 
-## Solution
+Each cluster has a fixed set of physical VEC_FIFO channels. AIC writes
+(TPUSH), AIV reads (TPOP). The channels persist across task dispatches —
+they are not created or destroyed per task.
 
-The simulation solution has three parts:
+### Simulation Model
 
-1. Add a host-side CPU_SIM context module in `src/a2a3/platform/sim/host/cpu_sim_context.cpp`
-2. Publish a stable per-dispatch `task_cookie` through platform hooks keyed by `(core_id, reg_task_id)`
-3. Inject execution context and `task_cookie` into CPU_SIM before AICore kernel execution
+The simulation mirrors this with per-cluster, per-pipe-configuration
+`SharedState` instances:
 
-`task_cookie` is taken from `slot_state.task->task_id.raw`.
+```text
+cluster 0 ──┬── pipe_key A → SharedState (mutex + ring buffer + slot storage)
+             └── pipe_key B → SharedState (if kernel uses multiple pipe types)
+cluster 1 ──┬── pipe_key A → SharedState
+             └── pipe_key B → SharedState
+...
+```
 
-The host-side CPU_SIM context still has per-thread semantics, but it no longer
-uses C++ `thread_local`. The current implementation stores
-`CpuSimExecutionContext` behind a `pthread_key_t`, so host runtime reloads do
-not depend on ELF TLS descriptors.
+Each `SharedState` contains:
 
-## Implementation
+- A mutex and condition variable for producer/consumer synchronization
+- `next_producer_slot` / `next_consumer_slot` ring indices
+- `occupied` counter (number of filled slots)
+- `local_slot_storage[SlotNum]` — the actual data buffers
+- `remaining_consumers[SlotNum]` — per-slot consumer reference count (for split mode)
 
-The runtime flow is:
+### Key Properties
 
-1. AICPU builds the dispatch payload
-2. AICore sim reads the payload before kernel execution
-3. AICore sim calls `CPU_SIM_SET_EXECUTION_CONTEXT(...)` and `CPU_SIM_SET_TASK_COOKIE(...)`
-4. The values are exposed through host-side hooks for `pto-isa` CPU_SIM to read
+**Fixed channel count.** The number of `SharedState` entries is determined at
+compile time by the kernel's `TPipe<...>` template instantiations, not by the
+number of tasks. A typical kernel has 1 pipe type; a complex kernel may have
+2–3 (e.g., C2V + V2C).
 
-On the host side, `pto_cpu_sim_set_*` and `pto_cpu_sim_get_*` resolve the
-calling thread's `CpuSimExecutionContext` through `pthread_getspecific()`.
+**Persistent across tasks.** Like hardware VEC_FIFO, the `SharedState` is not
+reset between task dispatches. Tasks on the same cluster share the same ring
+buffer, enabling cross-task pipelining.
 
-`CPU_SIM_SET_EXECUTION_CONTEXT(...)` sets exactly three values:
+**Bounded by SlotNum.** The ring buffer has `SlotNum` slots (a compile-time
+constant, e.g., 2 for bgemm). When all slots are occupied, the producer
+(TPUSH) blocks until a consumer (TPOP + TFREE) frees a slot.
 
-- logical block index
-- AIV lane id inside the cluster
-- subblock dimension
+### Pipe Key
 
-`task_cookie` is not part of `CPU_SIM_SET_EXECUTION_CONTEXT(...)`. It is set
-separately by `CPU_SIM_SET_TASK_COOKIE(...)`.
+Each `TPipe<FlagID, DirType, SlotSize, SlotNum, LocalSlotNum>` instance
+produces a unique 64-bit `pipe_key`:
 
-## Runtime Changes
+```text
+pipe_key = FlagID:8 | DirType:8 | SlotNum:8 | LocalSlotNum:8 | SlotSize:32
+```
 
-- AICPU writes the logical block index/count into `LocalContext`
-- AICPU publishes `task_cookie` through `platform_set_cpu_sim_task_cookie(core_id, reg_task_id, ...)`
-- AICPU initializes per-core `GlobalContext.sub_block_id` once during executor init
-- AICore sim reads the payload, resolves `task_cookie` through `platform_get_cpu_sim_task_cookie(core_id, reg_task_id)`,
-  and then calls the CPU_SIM hooks before running the kernel
-- Sim `DeviceRunner` clears CPU_SIM shared state at run start and finalize to avoid cross-run leakage
-- The host CPU_SIM module resets its pthread-backed execution-context key at the same run boundaries
-- Onboard builds keep the same interface as no-ops, so hardware behavior does not change
+Combined with `cluster_id`, this uniquely identifies a `SharedState` within a
+device. The `SharedState` size (`sizeof(SharedStateStorage)`) depends on
+`SlotSize` and `SlotNum`, so different `pipe_key` values always map to
+different allocations.
 
-More specifically:
+## Cross-Task Pipelining
 
-- logical block index
-  - prepared in `build_payload()`
-  - source is `slot_state.next_block_idx`
-  - stored in `LocalContext`
-  - field name is `block_idx`
-- logical block count
-  - prepared in `build_payload()`
-  - source is `slot_state.block_num`
-  - stored in `LocalContext`
-  - exposed to kernels by `get_block_num(args)`
-- `sub_block_id`
-  - prepared once in `init()` of `AicpuExecutor`
-  - stored in `PTO2DispatchPayload::global_context.sub_block_id`
-  - `aiv0 = 0`, `aiv1 = 1`
-- `subblock_dim`
-  - not stored in the payload
-  - computed in `aicore_executor.cpp` when dispatching to CPU_SIM
-  - value is `PLATFORM_AIV_CORES_PER_BLOCKDIM` for AIV and `1` for AIC
-- `task_cookie`
-  - prepared in `dispatch_subtask_to_core()`
-  - source is `slot_state.task->task_id.raw`
-  - published through platform hooks keyed by `(core_id, reg_task_id)`
-  - passed separately through `CPU_SIM_SET_TASK_COOKIE(...)`
+The simulation correctly supports AIC running ahead of AIV across task
+boundaries:
 
-## Host Context Storage
+```text
+task N:   AIC TPUSH → slot 0, occupied=1
+task N+1: AIC TPUSH → slot 1, occupied=2
+task N+2: AIC TPUSH → allocate() blocks (occupied >= SlotNum)
 
-The host CPU_SIM module keeps the following fields together in one
-`CpuSimExecutionContext` object:
+          AIV TPOP task N  → reads slot 0
+          AIV TFREE task N → occupied=1, AIC unblocked
+          AIV TPOP task N+1 → reads slot 1
+          ...
+```
 
-- `block_idx`
-- `subblock_id`
-- `subblock_dim`
-- `task_cookie`
+This matches hardware behavior: the VEC_FIFO is a persistent physical channel,
+and back-pressure naturally throttles the producer when the FIFO is full.
 
-The storage model is:
+### Split Mode (TILE_UP_DOWN)
 
-1. Lazily create one `pthread_key_t` for the host runtime process
-2. Allocate one `CpuSimExecutionContext` per worker thread on first use
-3. Read and write that context only through `pto_cpu_sim_set_*` and `pto_cpu_sim_get_*`
-4. Reset the key during `DeviceRunner::run()` start and `DeviceRunner::finalize()`
+For C2V split mode, AIC pushes one full tile, and both AIV0 and AIV1 consume
+their respective halves from the same slot:
 
-This keeps the original per-thread behavior required by mixed AIC/AIV
-execution, but avoids relying on C++ `thread_local` in a `.so` that is loaded
-and unloaded across runs.
+1. AIC `record()` sets `remaining_consumers[slot] = 2`
+2. AIV0 `wait()` + `free()` → remaining: 2→1
+3. AIV1 `wait()` + `free()` → remaining: 1→0, slot released
 
-## File Structure
+The slot is not freed until **both** AIVs have consumed it. This matches the
+hardware behavior where both AIV sub-cores read from the same VEC_FIFO entry.
 
-The implementation is split by responsibility:
+## Platform Integration
 
-- Host CPU_SIM context
-  - `src/a2a3/platform/sim/host/cpu_sim_context.cpp`
-  - exports `pto_cpu_sim_set_*`, `pto_cpu_sim_get_*`, and shared-storage hooks
-  - stores per-thread context with `pthread_key_t`
-- Runtime dispatch metadata
-  - `src/a2a3/runtime/tensormap_and_ringbuffer/common/intrinsic.h`
-- AICPU payload construction
-  - `src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp`
-- AICore sim context injection
-  - `src/a2a3/runtime/tensormap_and_ringbuffer/aicore/aicore_executor.cpp`
-- Platform hook glue
-  - `src/a2a3/platform/include/aicpu/cpu_sim_task_cookie.h`
-  - `src/a2a3/platform/sim/aicore/inner_kernel.h`
-  - `src/a2a3/platform/onboard/aicore/inner_kernel.h`
-- Run-boundary cleanup
-  - `src/a2a3/platform/sim/host/device_runner.cpp`
+### Context Plumbing
+
+The simulation platform sets up per-thread identity without any runtime
+involvement:
+
+1. **`aicore_execute_wrapper`** (in `kernel.cpp`): computes `cluster_id` and
+   `subblock_id` from `physical_core_id` and `core_type`, sets them in
+   per-thread TLS via function pointer injection from `cpu_sim_context.cpp`.
+
+2. **`DeviceRunner::upload_kernel_binary`**: after dlopen'ing each kernel SO,
+   injects `pto_sim_get_subblock_id` and `pto_sim_get_pipe_shared_state`
+   function pointers via `pto_sim_register_hooks`.
+
+3. **pto-isa `TPush.hpp`**: calls the injected hooks to locate the correct
+   `SharedState` for the current cluster and pipe configuration.
+
+### Core Layout
+
+```text
+physical_core_id [0..block_dim-1]           = AIC of cluster i
+physical_core_id [block_dim..3*block_dim-1] = AIV pairs
+                                              (AIV0_c0, AIV1_c0, AIV0_c1, AIV1_c1, ...)
+```
+
+- `cluster_id`: AIC → `physical_core_id`; AIV → `(physical_core_id - block_dim) / 2`
+- `subblock_id`: AIC → 0; AIV → `(physical_core_id - block_dim) % 2`
+
+### Lifecycle
+
+- `DeviceRunner::run()` start: `clear_cpu_sim_shared_storage()` frees all
+  `SharedState` entries for the current device.
+- `DeviceRunner::finalize()`: same cleanup.
+- `pto_cpu_sim_release_device()`: destroys the entire device context including
+  all pipe states.
+
+During a run, `SharedState` entries are lazily allocated on first access and
+persist until the run ends. The total count is bounded by
+`block_dim × pipe_type_count`, which is small (typically < 100).
+
+## Runtime Isolation
+
+Runtime code (`aicore_executor.cpp`, `aicpu_executor.cpp`) has **zero
+simulation awareness**. All sim context setup is handled by the platform layer:
+
+- No `CPU_SIM_SET_*` macros in runtime code
+- No `platform_set_cpu_sim_task_cookie` calls
+- No sim-specific includes in runtime headers
+- Onboard platform has no empty stubs for sim functions
+
+## Current Constraints
+
+The simulation correctly handles:
+
+- Multiple tasks sharing the same VEC_FIFO (cross-task pipelining)
+- Back-pressure when the FIFO is full
+- Split-mode consumption by two AIV sub-cores
+- Multiple pipe types within a single kernel
+
+**Current execution model constraint:** the runtime dispatches a complete
+AIC+AIV task group to a cluster and waits for all cores to finish (write FIN)
+before reusing that core for a new task. A kernel using TPUSH/TPOP must run
+to completion — **preemption of a partially-executed C↔V kernel is not
+supported**. If a kernel is interrupted mid-TPUSH/TPOP and a different
+C↔V kernel is scheduled on the same cluster, the new kernel will see the
+previous kernel's ring buffer state (stale slot data, incorrect producer/
+consumer indices), leading to data corruption or deadlock.
+
+This constraint matches the current hardware execution model where AIC/AIV
+tasks are non-preemptible.
 
 ## Validation
 
-The host-side `cpu_sim_context.cpp` implementation was independently checked
-after the pthread conversion with direct C++ compilation.
+Validated with `examples/a5/tensormap_and_ringbuffer/bgemm/`:
 
-## pto-isa Dependency
+- AIC: TLOAD + TMATMUL + TPUSH (cube-to-vector via VEC_FIFO)
+- AIV: TPOP + TADD + TSTORE (accumulate result from cube)
+- Grid: 4×4×4, Batch: 2, block_dim: 3 (3 clusters, 128 MIX tasks)
 
-The validated `pto-isa` baseline is:
+## File Structure
 
-- `882c4db95570dfeaf04e0ee2c0ab32477ed372fc`
-
-This design assumes CPU_SIM provides:
-
-- execution-context hooks
-- task-cookie hooks
-- shared-storage hooks
-
-So the actual set/get chain is:
-
-`AICPU build_payload/init_global_context` -> `AICore executor` -> `CPU_SIM_SET_EXECUTION_CONTEXT/CPU_SIM_SET_TASK_COOKIE` -> `pto_cpu_sim_set_*` in `cpu_sim_context.cpp`
-
-`pto-isa` CPU_SIM reads the context through these exported hooks.
-
-Newer `pto-isa` versions must be revalidated independently. Runtime-side
-context plumbing can be correct while later CPU_SIM behavior changes still
-break the example.
-
-## Scope Note
-
-This document is about the host-side CPU_SIM context used by TPUSH/TPOP in
-`a2a3sim`. It does not describe every remaining TLS-like variable under
-`src/a2a3/platform/sim/`.
+| Responsibility | File |
+| -------------- | ---- |
+| Per-device pipe shared state + TLS | `src/common/sim_context/cpu_sim_context.cpp` |
+| Per-thread core identity setup | `src/{arch}/platform/sim/aicore/kernel.cpp` |
+| Hook injection into kernel SOs | `src/{arch}/platform/sim/host/device_runner.cpp` |
+| pto-isa hook registration API | `pto-isa/include/pto/common/cpu_stub.hpp` |
+| pto-isa TPUSH/TPOP implementation | `pto-isa/include/pto/cpu/TPush.hpp`, `TPop.hpp` |

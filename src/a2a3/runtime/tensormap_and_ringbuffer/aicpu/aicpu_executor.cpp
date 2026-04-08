@@ -25,7 +25,6 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
-#include "aicpu/cpu_sim_task_cookie.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -637,7 +636,6 @@ struct AicpuExecutor {
             core_exec_state.dispatch_seq += (TASK_ID_MASK - reg_task_id + 1);
             reg_task_id = core_exec_state.dispatch_seq & TASK_ID_MASK;
         }
-        platform_set_cpu_sim_task_cookie(core_id, reg_task_id, static_cast<uint64_t>(slot_state.task->task_id.raw));
         write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
 
         tracker.change_core_state(core_offset);

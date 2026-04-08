@@ -187,32 +187,4 @@ inline void write_reg(RegId reg, uint64_t value) {
  */
 inline uint32_t get_physical_core_id() { return sim_get_physical_core_id(); }
 
-// =============================================================================
-// CPU Simulation Context Hooks
-// =============================================================================
-
-// Function pointer storage — set by set_sim_context_helpers(), used by macros below.
-using SimSetExecCtxFn = void (*)(uint32_t, uint32_t, uint32_t);
-using SimSetTaskCookieFn = void (*)(uint64_t);
-using SimGetTaskCookieFn = uint64_t (*)(uint32_t, uint32_t);
-
-extern SimSetExecCtxFn g_sim_set_exec_ctx_fn;
-extern SimSetTaskCookieFn g_sim_set_task_cookie_fn;
-extern SimGetTaskCookieFn g_sim_get_task_cookie_fn;
-
-inline void cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim) {
-    if (g_sim_set_exec_ctx_fn != nullptr) g_sim_set_exec_ctx_fn(block_idx, subblock_id, subblock_dim);
-}
-#define CPU_SIM_SET_EXECUTION_CONTEXT(block_idx, subblock_id, subblock_dim) \
-    cpu_sim_set_execution_context(block_idx, subblock_id, subblock_dim)
-
-inline void cpu_sim_set_task_cookie(uint64_t cookie) {
-    if (g_sim_set_task_cookie_fn != nullptr) g_sim_set_task_cookie_fn(cookie);
-}
-#define CPU_SIM_SET_TASK_COOKIE(cookie) cpu_sim_set_task_cookie(cookie)
-
-inline uint64_t platform_get_cpu_sim_task_cookie(uint32_t core_id, uint32_t reg_task_id) {
-    return (g_sim_get_task_cookie_fn != nullptr) ? g_sim_get_task_cookie_fn(core_id, reg_task_id) : 0;
-}
-
 #endif  // PLATFORM_A5SIM_AICORE_INNER_KERNEL_H_
