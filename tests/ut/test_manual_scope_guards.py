@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from hardware_test_utils import get_test_device_id
+
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 RUN_EXAMPLE = PROJECT_ROOT / "examples" / "scripts" / "run_example.py"
@@ -38,7 +40,7 @@ PTO_ISA_COMMIT = "6622890"
     ],
 )
 def test_manual_scope_guard_failures(case_name, expected_message):
-    device_id = os.environ.get("PTO_TEST_DEVICE_ID", "0")
+    device_id = get_test_device_id()
     log_dir = Path.home() / "ascend" / "log" / "debug" / f"device-{device_id}"
     if os.getenv("ASCEND_WORK_PATH"):
         work_log_dir = Path(os.environ["ASCEND_WORK_PATH"]).expanduser() / "log" / "debug" / f"device-{device_id}"

@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+from hardware_test_utils import get_test_device_id
+
 
 PROJECT_ROOT = Path(__file__).parent.parent.parent
 RUN_EXAMPLE = PROJECT_ROOT / "examples" / "scripts" / "run_example.py"
@@ -18,7 +20,7 @@ PTO_ISA_COMMIT = "6622890"
 @pytest.mark.requires_hardware
 @pytest.mark.skipif(not os.getenv("ASCEND_HOME_PATH"), reason="ASCEND_HOME_PATH not set; Ascend toolkit required")
 def test_manual_scope_outer_multiwrite_boundary():
-    device_id = os.environ.get("PTO_TEST_DEVICE_ID", "0")
+    device_id = get_test_device_id()
     command = (
         f"source {os.environ['ASCEND_HOME_PATH']}/bin/setenv.bash >/dev/null 2>&1 && "
         f"{sys.executable} {RUN_EXAMPLE} --build --silent "
