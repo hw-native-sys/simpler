@@ -165,6 +165,89 @@ Concise conclusion:
 - both become the same scheduler edges before publish
 - execution uses only the scheduler edge machinery, not TensorMap
 
+## Implemented Manual-Scope Algorithm
+
+The current implementation is a submit/scope-end split:
+
+- manual submit still allocates task ids, task slots, and payloads immediately
+- manual submit still does boundary producer discovery for cross-scope tensors
+- manual submit still updates TensorMap frontier for cross-scope writes
+- manual submit does not publish tasks to the scheduler ready graph
+- manual `scope_end` replays only explicit same-scope edges plus cached external fanins, then batch-publishes tasks
+
+### How tensor arguments are handled
+
+The runtime decision is per tensor argument, not per scope:
+
+| Tensor use in a manual-scope task | How dependency is found | Uses TensorMap? | What must be maintained |
+| --- | --- | --- | --- |
+| tensor created in the current manual scope, then reused in the current manual scope | explicit `add_dependency` only | no | recorded manual edge in scope-local edge buffer |
+| outer/external `INPUT` | creator retention plus overlap lookup | yes, at manual submit unless `manual_dep=true` | cached external producer set in task payload |
+| outer/external `INOUT` | creator retention plus overlap lookup for incoming state | yes, at manual submit unless `manual_dep=true` | cached external producer set plus updated writer frontier |
+| outer/external `OUTPUT_EXISTING` | creator retention only for incoming owner, no overlap lookup | yes for outgoing frontier update unless `manual_dep=true` | updated writer frontier |
+| runtime-created `OUTPUT` inside manual scope | no incoming dependency | no immediate lookup | `owner_task_id` on produced tensor so later users can classify it as manual-local |
+
+`TensorArgType` matters here:
+
+- `INPUT`: read-only; needs incoming producer discovery, no outgoing frontier update
+- `INOUT`: read old value and write new value; needs both incoming producer discovery and outgoing frontier update
+- `OUTPUT_EXISTING`: overwrite an existing outer buffer; does not need overlap lookup for an old modifier chain, but still needs outgoing frontier update
+- `OUTPUT`: fresh runtime allocation; has no incoming dependency and becomes manual-local to later tasks in the same manual scope
+
+### What manual submit iterates
+
+For each submitted task in a manual scope, the runtime iterates tensor args in submit order:
+
+1. Allocate task id, slot state, and payload immediately.
+2. For each tensor arg, classify it as manual-local or outer/external from `owner_task_id` plus current manual-scope ownership.
+3. For manual-local tensors:
+   - skip creator-retention wiring
+   - skip TensorMap lookup/insert
+   - rely on explicit `add_dependency`
+4. For outer/external tensors:
+   - keep creator-retention from `owner_task_id`
+   - run TensorMap overlap lookup for `INPUT` and `INOUT` unless `manual_dep=true`
+   - cache the deduped external producer set in the task payload
+   - update TensorMap frontier for outer writes in original submit order unless `manual_dep=true`
+5. Leave the task unpublished behind one deferred publish barrier.
+
+### What manual scope_end iterates
+
+At manual `scope_end`, the runtime iterates tasks in the current manual scope in original submit order:
+
+1. Read the cached external producer set from each task payload.
+2. Replay explicit same-scope edges recorded by `add_dependency`.
+3. Merge and dedup:
+   - cached external producers
+   - explicit manual producers
+4. Realize the final producer set into the normal scheduler fanin/fanout structures.
+5. Release the deferred publish barrier and batch-publish the manual-scope tasks.
+6. Release the usual scope-held lifetime reference.
+
+This is why manual `scope_end` is still expensive on non-unroll paged attention:
+
+- it walks every manual-scope task
+- it merges cached external fanins with explicit same-scope edges
+- it mutates scheduler fanin/fanout state in one serial finalize step
+
+### What state manual scope maintains
+
+The runtime keeps a small amount of scope-local metadata instead of a second execution engine:
+
+- `scope_tasks[]`: task order for the current scope
+- `manual_task_meta[]`: per-task metadata for manual finalize
+- `manual_edges[]`: explicit same-scope producer-consumer edges
+- `payload->fanin_slot_states[]`: cached external producers discovered at manual submit
+- `fanin_count` plus one deferred publish barrier
+
+This split was chosen because it preserves the normal scheduler after publish:
+
+- no second execution-time dependency engine
+- no change to the ready queue model
+- no change to worker dispatch or completion handling
+- only boundary discovery stays on the TensorMap path
+- only same-scope replay is deferred to manual `scope_end`
+
 ## Problem Statement
 
 If we simply copy `aicpu_build_graph` semantics into `tensormap_and_ringbuffer`, we get a wrong boundary model:
@@ -279,10 +362,10 @@ Everything else stays on the existing TensorMap path.
 ### 2. Outer-scope tensor, written in place
 
 - The internal writer must still publish its producer frontier for TensorMap boundary tracking.
-- That boundary frontier becomes visible at manual `scope_end`, so later outside submissions can attach to the correct writer task.
+- That boundary frontier must become visible at manual submit, in original submit order, so later submissions can attach to the correct writer task immediately.
 - Readiness of the written tensor is the completion of that writer task.
 - Multiple writes inside the same manual scope are allowed.
-- TensorMap should continue tracking the latest producer frontier exactly as in auto scope once the manual scope is finalized.
+- TensorMap should continue tracking the latest producer frontier exactly as in auto scope while the scope is still unpublished to the scheduler.
 
 ### 3. Tensor created inside this manual scope and reused only inside this manual scope
 
@@ -447,7 +530,7 @@ What changes in manual scope is only the task API and the time when dependency l
 
 - normal submit APIs perform dependency lookup and TensorMap insert immediately
 - manual submit APIs only allocate the task, copy payload data, and record compact finalize metadata
-- manual `scope_end` replays dependency lookup and TensorMap insert from the recorded payload
+- manual `scope_end` replays only explicit same-scope edges and combines them with the external producer set already cached at submit
 
 This keeps normal-mode APIs unchanged while avoiding a second tensor representation for manual mode.
 
@@ -631,7 +714,7 @@ For each task in that order during submit:
 This submit order matters:
 
 - it preserves current tensormap behavior for multiple writes to outer tensors
-- earlier outer writes from the same manual scope become visible to later tasks in the same manual scope during replay
+- earlier outer writes from the same manual scope become visible to later tasks in the same manual scope during submit
 - that matches the accepted v1 tradeoff that outer tensors may still induce implicit same-scope TensorMap edges
 - it requires the same TensorMap validity synchronization that normal auto submit uses before lookup/insert
 
@@ -659,7 +742,8 @@ If the external producer has only published its TensorMap frontier but not yet c
 
 This is the desired hybrid behavior:
 
-- dependency construction happens at manual `scope_end`, before publish
+- explicit same-scope dependency replay happens at manual `scope_end`, before publish
+- cross-scope dependency discovery already happened at manual submit
 - dependency satisfaction is still handled by the normal runtime execution path after publish
 
 ### Why this is low-risk
@@ -712,7 +796,7 @@ Why this is expected to hold:
 
 - tasks created in the current manual scope are still protected by the current manual scope reference until manual `scope_end`
 - tasks created in an outer still-active scope may complete early, but the outer scope still holds their scope reference until that outer scope ends
-- therefore an inner manual scope can still discover those outer producers through `owner_task_id` or TensorMap when it finalizes
+- therefore an inner manual scope can still rely on the producer state already discovered and retained during manual submit when it finalizes
 
 This does not mean the producer task is still runnable or incomplete.
 It may already be `COMPLETED`; the manual finalize path should then treat it as an already-satisfied dependency.
@@ -821,7 +905,7 @@ Manual scope does not change lifetime release semantics:
 Manual scope also does not change cross-scope readiness semantics:
 
 - external tensor readiness is still producer-task completion, not `scope_end`
-- but external-writer frontier information must be visible to later TensorMap lookups no later than manual `scope_end`
+- but external-writer frontier information must already be visible to later TensorMap lookups at manual submit
 
 This manual-scope behavior intentionally combines:
 
@@ -845,8 +929,8 @@ outside task reads C
 
 Correct behavior:
 
-- at manual `scope_end`, `t1` publishes `C` to TensorMap
-- at manual `scope_end`, `t2` publishes `C` again to TensorMap
+- at manual submit, `t1` publishes `C` to TensorMap
+- at manual submit, `t2` publishes `C` again to TensorMap
 - outside reader should see `t2` as the latest producer frontier
 - because `t1 -> t2` is explicit, `t2` completion is a valid readiness frontier for the final visible state
 - outer tensors may still create implicit same-scope TensorMap edges inside the manual scope; this is an accepted v1 tradeoff and should be called out in the PR description
@@ -1039,6 +1123,32 @@ Units below are `elapsed_us (orch_us)`.
 | `paged_attention_unroll` | `Case1` | `1412.7 (-)` | `1321.7 (841.6)` | `1323.9 (831.3)` | `1321.3 (884.4)` |
 | `paged_attention_unroll` | `Case2` | `705.5 (-)` | `628.1 (381.6)` | `632.5 (378.9)` | `637.5 (406.4)` |
 
+### Feature-To-Gain Mapping
+
+The most important question is which change actually moved performance.
+
+The rerun below isolates the non-unroll partial-manual example on device `3`. All
+three rows already include the same rewritten orchestration structure
+(`one manual scope per q_idx`, `AIV_HUB` moved inside manual scope, and explicit
+`prev_update_task -> up_outs.task_id` chaining). The only thing changing between rows
+is boundary annotation.
+
+| Optimization step | What changed | `Case1` orch delta | `Case2` orch delta | What it means |
+| --- | --- | --- | --- | --- |
+| Baseline after rewrite | no `manual_dep` boundary hints | baseline `36791.9 us` | baseline `19792.7 us` | structural rewrite alone is the starting point |
+| Add input-side hints | `query`, `key_cache`, `value_cache`, and their views use `manual_dep=true` | `-39.6 us` (`-0.1%`) | `-496.0 us` (`-2.5%`) | minor benefit; input-side TensorMap work is not the main bottleneck |
+| Add output-side hints on top | `out` and `out_view` also use `manual_dep=true` | `-1683.6 us` (`-4.6%`) | `-1628.5 us` (`-8.4%`) | major gain; repeated external-output overlap tracking was expensive |
+| Full boundary hints vs no hints | inputs + output boundary hints together | `-1723.2 us` (`-4.7%`) | `-2124.5 us` (`-10.7%`) | this is the measurable win that was worth keeping |
+
+Two conclusions matter:
+
+1. The kept optimization is not “use `manual_dep` everywhere”.
+   - The measurable gain came mostly from suppressing repeated external-output
+     TensorMap work on `out` / `out_view`, where same-scope write ordering is already
+     carried by explicit manual edges.
+2. Input-side `manual_dep=true` alone is not enough.
+   - It helps a little on `Case2`, but almost nothing on `Case1`.
+
 ### Benchmark Takeaways
 
 1. The non-unroll target is still not met.
@@ -1112,6 +1222,15 @@ That is consistent with the current runtime behavior:
 - marking `out` / `out_view` `manual_dep=true` avoids paying repeated external-output
   overlap tracking on every block update when that ordering is already explicit
 
+Why this was kept even though `manual_dep` is not the core semantics:
+
+- manual scope still uses TensorMap for general cross-scope correctness
+- this example already has explicit same-scope write ordering for `ONLINE_UPDATE`
+- there is no same-scope external consumer that needs `out` / `out_view` to stay on
+  TensorMap before manual `scope_end`
+- so suppressing repeated output overlap tracking is a valid example-level
+  optimization, not a change to the runtime's semantic model
+
 This is still not a general “scope arguments” API. It is an example-local optimization
 that is only safe when the manual scope already carries the same-scope write ordering
 explicitly and there is no same-scope external consumer that depends on TensorMap
@@ -1156,9 +1275,11 @@ publication before manual `scope_end`.
 - This would duplicate fanin/fanout handling, completion notification, and release traversal.
 - The design requires one unified post-publish scheduler mechanism.
 
-13. Using `manual_dep=true` as a fake scope-boundary annotation.
+13. Using `manual_dep=true` as a blanket scope-boundary annotation.
 - This can suppress TensorMap work that is still required for cross-scope correctness.
-- It also creates unstable performance results because the flag is tensor-local, not scope-local.
+- It is only safe as a narrowly-scoped example optimization when the same-scope
+  ordering is already explicit and no early external consumer needs TensorMap
+  publication for that tensor.
 
 ## Dangerous Risks For The Submit/Scope-End Split
 
@@ -1226,7 +1347,8 @@ This design intentionally resolves the central ambiguity:
 - `scope_end` controls lifetime release
 - task completion controls semantic readiness
 
-For outer tensors written inside manual scope, TensorMap frontier publication happens at manual `scope_end`, while semantic readiness is still producer-task completion.
+For outer tensors written inside manual scope, TensorMap frontier publication happens at
+manual submit, while semantic readiness is still producer-task completion.
 
 ## File Areas Expected To Change
 
@@ -1244,7 +1366,7 @@ Implement manual dependency as a scope-local override inside `tensormap_and_ring
 
 - tensors created in the current manual scope: explicit `add_dependency`
 - outer tensors: existing TensorMap path
-- TensorMap boundary realization for manual scopes: manual `scope_end`
+- TensorMap boundary realization for manual scopes: manual submit
 - semantic readiness of outer writes: writer completion
 - lifetime release: `scope_end`
 
