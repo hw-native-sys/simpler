@@ -95,6 +95,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 
     // Pipe and FIFO tile are declared in common scope (both sides reference the type)
     VecFifoTileT vecFifoTile;
+    TASSIGN(vecFifoTile, 0x0);
     PipeT mPipe(nullptr, 0U, 0U);
 
     // =========================================================================
@@ -174,8 +175,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t* args) {
 
         VecTile cTile;
         VecTile outTile;
-        // Place after FIFO buffer: FIFO uses [0x0, FIFO_DEPTH * VEC_M * N * 4)
-        // = [0x0, 2 * 32 * 64 * 4) = [0x0, 0x4000)
+        // cTile/outTile live after the simulated local staging for vecFifoTile.
         TASSIGN(cTile, 0x4000);
         TASSIGN(outTile, 0x6000);
 
