@@ -5,9 +5,8 @@
 In host_build_graph, the orchestration function runs on the host. It allocates device buffers, builds the task graph by calling `add_task(runtime, ...)`, and wires dependencies with `add_successor(runtime, ...)`.
 
 ## Where To Put Orchestration Code
-
-- Each example keeps orchestration sources under `examples/host_build_graph/<example>/kernels/orchestration/`.
-- `examples/host_build_graph/<example>/kernels/kernel_config.py` defines the orchestration entry point. Example: `ORCHESTRATION = {"source": ".../example_orch.cpp", "function_name": "build_example_graph"}`.
+- Each example keeps orchestration sources under `examples/a2a3/host_build_graph/<example>/kernels/orchestration/`.
+- `examples/a2a3/host_build_graph/<example>/kernels/kernel_config.py` defines the orchestration entry point. Example: `ORCHESTRATION = {"source": ".../example_orch.cpp", "function_name": "build_example_graph"}`.
 
 ## Function Signature
 
@@ -37,7 +36,7 @@ A typical host orchestration sequence is:
 4. Create tasks with `add_task(runtime, args, num_args, func_id, core_type)`.
 5. Add dependency edges with `add_successor(runtime, producer, consumer)`.
 
-Example: see `examples/host_build_graph/vector_example/kernels/orchestration/example_orch.cpp`.
+Example: see `examples/a2a3/host_build_graph/vector_example/kernels/orchestration/example_orch.cpp`.
 
 ## Kernel Mapping
 

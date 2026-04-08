@@ -1086,16 +1086,19 @@ Fresh benchmark data was rerun on real hardware on 2026-04-08 with:
 - pinned PTO-ISA commit: `6622890`
 - runner: `tools/benchmark_rounds.sh`
 
-The four compared variants are:
+The branch-local compared variants are:
 
 - `aicpu_build_graph`
-- `tensormap_and_ringbuffer_unmodified`
 - `tensormap_and_ringbuffer`
 - `tensormap_and_ringbuffer_partial_manual`
 
 `tensormap_and_ringbuffer` is the current/new AUTO-path runtime under evaluation.
 `tensormap_and_ringbuffer_partial_manual` is the same runtime tree, but benchmarked
 through the `_partial_manual` paged-attention scenes.
+
+The untouched PTO2 baseline is no longer kept in this branch. If a comparison against
+an unmodified tensormap runtime is needed, create a temporary worktree from the
+baseline commit and run the same benchmark script there.
 
 ### Benchmark Script Selectors
 
@@ -1104,9 +1107,6 @@ The benchmark wrapper enables the variants as follows:
 - `./tools/benchmark_rounds.sh -d 3 -n 10 -r aicpu_build_graph -c 6622890`
   - benchmarks `tests/st/a2a3/aicpu_build_graph/paged_attention`
   - benchmarks `tests/st/a2a3/aicpu_build_graph/paged_attention_unroll`
-- `./tools/benchmark_rounds.sh -d 3 -n 10 -r tensormap_and_ringbuffer_unmodified -c 6622890`
-  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer_unmodified/paged_attention`
-  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer_unmodified/paged_attention_unroll`
 - `./tools/benchmark_rounds.sh -d 3 -n 10 -r tensormap_and_ringbuffer -c 6622890`
   - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention`
   - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll`
@@ -1122,19 +1122,18 @@ The partial-manual scenes still declare `RUNTIME_CONFIG["runtime"] =
 is selected.
 
 Similarly, the current/new AUTO-path runtime is enabled directly by `-r
-tensormap_and_ringbuffer`, while the copied side-by-side baseline is enabled by `-r
-tensormap_and_ringbuffer_unmodified`.
+tensormap_and_ringbuffer`.
 
 ### Fresh Results
 
 Units below are `elapsed_us (orch_us)`.
 
-| Workload | Case | `aicpu_build_graph` | `tensormap_and_ringbuffer_unmodified` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
-| --- | --- | --- | --- | --- | --- |
-| `paged_attention` | `Case1` | `31318.9 (-)` | `35367.3 (35366.7)` | `36996.3 (36995.6)` | `35187.6 (35030.2)` |
-| `paged_attention` | `Case2` | `16844.5 (-)` | `19739.8 (19736.1)` | `19861.8 (19856.8)` | `18685.5 (18274.5)` |
-| `paged_attention_unroll` | `Case1` | `1412.7 (-)` | `1321.7 (841.6)` | `1323.9 (831.3)` | `1321.3 (884.4)` |
-| `paged_attention_unroll` | `Case2` | `705.5 (-)` | `628.1 (381.6)` | `632.5 (378.9)` | `637.5 (406.4)` |
+| Workload | Case | `aicpu_build_graph` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
+| --- | --- | --- | --- | --- |
+| `paged_attention` | `Case1` | `31318.9 (-)` | `36996.3 (36995.6)` | `35187.6 (35030.2)` |
+| `paged_attention` | `Case2` | `16844.5 (-)` | `19861.8 (19856.8)` | `18685.5 (18274.5)` |
+| `paged_attention_unroll` | `Case1` | `1412.7 (-)` | `1323.9 (831.3)` | `1321.3 (884.4)` |
+| `paged_attention_unroll` | `Case2` | `705.5 (-)` | `632.5 (378.9)` | `637.5 (406.4)` |
 
 ### Feature-To-Gain Mapping
 
@@ -1175,22 +1174,13 @@ Two conclusions matter:
    - `paged_attention/Case1`: about `-4.9%` elapsed, about `-5.3%` orch vs current/new
    - `paged_attention/Case2`: about `-5.9%` elapsed, about `-8.0%` orch vs current/new
 
-3. Partial-manual is not yet consistently better than the copied unmodified baseline.
-   - `paged_attention/Case1`: about `-0.5%` elapsed, about `-1.0%` orch vs unmodified
-   - `paged_attention/Case2`: about `+5.2%` elapsed, about `+7.8%` orch vs unmodified
+3. On the unroll scene, both tensormap-family runtimes remain faster than
+   `aicpu_build_graph` end-to-end, but partial-manual stays slightly worse than the
+   AUTO tensormap path in orch time.
+   - `paged_attention_unroll/Case1`: `884.4 us` orch vs `831.3 us` current/new
+   - `paged_attention_unroll/Case2`: `406.4 us` orch vs `378.9 us` current/new
 
-4. The current/new AUTO runtime is still slower than the copied unmodified runtime on
-   the non-unroll scene.
-   - `paged_attention/Case1`: about `+4.6%` elapsed, about `+4.6%` orch
-   - `paged_attention/Case2`: about `+0.6%` elapsed, about `+0.6%` orch
-
-5. On the unroll scene, all three tensormap-family runtimes remain faster than
-   `aicpu_build_graph` end-to-end, but partial-manual stays slightly worse than both
-   AUTO tensormap variants in orch time.
-   - `paged_attention_unroll/Case1`: `884.4 us` orch vs `841.6 us` unmodified and `831.3 us` current/new
-   - `paged_attention_unroll/Case2`: `406.4 us` orch vs `381.6 us` unmodified and `378.9 us` current/new
-
-6. The remaining performance problem is still concentrated in the non-unroll
+4. The remaining performance problem is still concentrated in the non-unroll
    partial-manual path, especially the replay/publish cost paid at manual `scope_end`.
 
 ### Boundary Annotation Note

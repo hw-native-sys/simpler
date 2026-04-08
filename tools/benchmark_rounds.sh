@@ -39,16 +39,6 @@ ABG_EXAMPLE_ORDER=(
     paged_attention_unroll
 )
 
-# --- tensormap_and_ringbuffer_unmodified ---
-declare -A TMR_UNMODIFIED_EXAMPLE_CASES=(
-    [paged_attention]="Case1,Case2"
-    [paged_attention_unroll]="Case1,Case2"
-)
-TMR_UNMODIFIED_EXAMPLE_ORDER=(
-    paged_attention
-    paged_attention_unroll
-)
-
 # --- tensormap_and_ringbuffer_partial_manual ---
 declare -A TMR_PARTIAL_MANUAL_EXAMPLE_CASES=(
     [paged_attention_partial_manual]="Case1,Case2"
@@ -108,7 +98,6 @@ Options:
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 100)
   -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default),
-                 tensormap_and_ringbuffer_unmodified,
                  tensormap_and_ringbuffer_partial_manual,
                  aicpu_build_graph
   -e, --examples Comma-separated example names to run (default: runtime-specific full list)
@@ -166,10 +155,6 @@ case "$RUNTIME" in
         declare -n EXAMPLE_CASES=TMR_EXAMPLE_CASES
         EXAMPLE_ORDER=("${TMR_EXAMPLE_ORDER[@]}")
         ;;
-    tensormap_and_ringbuffer_unmodified)
-        declare -n EXAMPLE_CASES=TMR_UNMODIFIED_EXAMPLE_CASES
-        EXAMPLE_ORDER=("${TMR_UNMODIFIED_EXAMPLE_ORDER[@]}")
-        ;;
     tensormap_and_ringbuffer_partial_manual)
         TESTS_RUNTIME_DIR="tensormap_and_ringbuffer"
         declare -n EXAMPLE_CASES=TMR_PARTIAL_MANUAL_EXAMPLE_CASES
@@ -180,7 +165,7 @@ case "$RUNTIME" in
         EXAMPLE_ORDER=("${ABG_EXAMPLE_ORDER[@]}")
         ;;
     *)
-        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer, tensormap_and_ringbuffer_unmodified, tensormap_and_ringbuffer_partial_manual, or aicpu_build_graph."
+        echo "ERROR: unknown runtime '$RUNTIME'. Use tensormap_and_ringbuffer, tensormap_and_ringbuffer_partial_manual, or aicpu_build_graph."
         exit 1
         ;;
 esac

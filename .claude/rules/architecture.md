@@ -24,6 +24,11 @@ See [docs/architecture.md](../../docs/architecture.md) for the full diagram, API
 
 ## Example / Test Layout
 
+Examples must live under `examples/{arch}/{runtime}/{name}/`. Valid example roots are
+`examples/a2a3/` and `examples/a5/`. Paths such as
+`examples/host_build_graph/<name>/` or `examples/tensormap_and_ringbuffer/<name>/`
+directly under `examples/` are invalid.
+
 ```text
 my_example/
   golden.py              # generate_inputs() + compute_golden()

@@ -106,7 +106,9 @@ When preprocessor guards are used to isolate platform code paths, the `__aarch64
 
 ## Example / Test Layout
 
-Every example and device test follows this structure:
+Examples must live under `examples/{arch}/{runtime}/{name}/`, and device scenes must
+live under `tests/st/{arch}/{runtime}/{name}/`. Every example and device test follows
+this structure:
 
 ```text
 my_example/

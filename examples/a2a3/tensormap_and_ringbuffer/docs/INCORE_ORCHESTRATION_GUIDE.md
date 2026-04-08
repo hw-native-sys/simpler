@@ -5,9 +5,8 @@
 In tensormap_and_ringbuffer, the orchestration function runs on AICPU and builds the graph directly on device. Dependencies are discovered automatically by TensorMap based on tensor overlap, and task memory is allocated from ring buffers.
 
 ## Where To Put Orchestration Code
-
-- Each example keeps orchestration sources under `examples/tensormap_and_ringbuffer/<example>/kernels/orchestration/`.
-- `examples/tensormap_and_ringbuffer/<example>/kernels/kernel_config.py` selects the orchestration source and the runtime `tensormap_and_ringbuffer`.
+- Each example keeps orchestration sources under `examples/a2a3/tensormap_and_ringbuffer/<example>/kernels/orchestration/`.
+- `examples/a2a3/tensormap_and_ringbuffer/<example>/kernels/kernel_config.py` selects the orchestration source and the runtime `tensormap_and_ringbuffer`.
 
 ## Required Exports
 
@@ -78,6 +77,5 @@ Dependencies are inferred by TensorMap from input/inout/output tensors, so you d
 Do not call `pto2_rt_orchestration_done` yourself in device mode. The executor wraps the entry call in an outer scope and signals completion after `aicpu_orchestration_entry` returns.
 
 ## Examples
-
-- `examples/tensormap_and_ringbuffer/vector_example/kernels/orchestration/example_orchestration.cpp` (AIV-only tasks)
-- `examples/tensormap_and_ringbuffer/bgemm/kernels/orchestration/bgemm_orch.cpp` (mixed AIC + AIV tasks)
+- `examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels/orchestration/example_orchestration.cpp` (AIV-only tasks)
+- `examples/a2a3/tensormap_and_ringbuffer/bgemm/kernels/orchestration/bgemm_orch.cpp` (mixed AIC + AIV tasks)

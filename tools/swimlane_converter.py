@@ -1043,7 +1043,7 @@ Examples:
   %(prog)s                                       # Use latest .json in outputs/, output to outputs/
   %(prog)s perf_swimlane_20260210_143526.json   # Output: outputs/merged_swimlane_20260210_143526.json
   %(prog)s perf_swimlane_20260210_143526.json -o custom_output.json
-  %(prog)s perf_swimlane_20260210_143526.json -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
+  %(prog)s perf_swimlane_20260210_143526.json -k examples/a2a3/host_build_graph/paged_attention/kernels/kernel_config.py
   %(prog)s perf_swimlane_20260210_143526.json -d 0
   %(prog)s perf_swimlane_20260210_143526.json -v
         """,

@@ -43,14 +43,6 @@ class TestRuntimeBuilderDiscovery:
         runtimes = builder.list_runtimes()
         assert "aicpu_build_graph" in runtimes
 
-    def test_discovers_unmodified_tensormap_runtime(self, default_test_platform):
-        """RuntimeBuilder discovers the unmodified tensormap runtime clone."""
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        builder = RuntimeBuilder(platform=default_test_platform)
-        runtimes = builder.list_runtimes()
-        assert "tensormap_and_ringbuffer_unmodified" in runtimes
-
     def test_runtime_dir_resolves_to_project_root(self, default_test_platform, test_arch):
         """runtime_dir resolves to src/{arch}/runtime/ under the project root."""
         from runtime_builder import RuntimeBuilder  # noqa: PLC0415

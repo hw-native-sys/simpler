@@ -6,8 +6,8 @@ This example runs the same computation as `host_build_graph_example`, but the ta
 
 ```bash
 python examples/scripts/run_example.py \
-  -k examples/aicpu_build_graph/vector_example/kernels \
-  -g examples/aicpu_build_graph/vector_example/golden.py \
+  -k examples/a2a3/aicpu_build_graph/vector_example/kernels \
+  -g examples/a2a3/aicpu_build_graph/vector_example/golden.py \
   -p a2a3sim
 ```
 

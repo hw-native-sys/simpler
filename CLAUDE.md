@@ -8,7 +8,7 @@ See [docs/developer-guide.md](docs/developer-guide.md) for full directory struct
 | ---- | ----------------- |
 | Platform Developer | `src/{arch}/platform/` |
 | Runtime Developer | `src/{arch}/runtime/` |
-| Codegen Developer | `examples/` |
+| Codegen Developer | `examples/{arch}/` |
 
 ## Common Commands
 
@@ -37,3 +37,4 @@ clang-format -i <file>
 3. Create new subdirectories under your assigned directory as needed
 4. When in doubt, ask the user before making changes to other areas
 5. **Avoid including private information in documentation or code** such as usernames, absolute paths with usernames, or other personally identifiable information. Use relative paths or generic placeholders instead
+6. **Place examples under `examples/{arch}/{runtime}/{name}/`**. Do not create `examples/{runtime}/...` directly under `examples/`.
