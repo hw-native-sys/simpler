@@ -560,6 +560,7 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
     }
 
     if (orch->scheduler && count > 0) {
+        int32_t dep_pool_mark_prefix = 0;
         for (int32_t task_idx = 0; task_idx < count; task_idx++) {
             PTO2TaskSlotState *slot_state = orch->scope_tasks[begin + task_idx];
             PTO2TaskPayload *payload = slot_state->payload;
@@ -577,11 +578,6 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
                 orch->fatal = true;
                 return;
             }
-        }
-
-        int32_t dep_pool_mark_prefix = 0;
-        for (int32_t task_idx = 0; task_idx < count; task_idx++) {
-            PTO2TaskSlotState *slot_state = orch->scope_tasks[begin + task_idx];
             // add_dependency may allocate dep entries for an older consumer after
             // newer tasks were already submitted. Recompute a monotonic dep-pool
             // watermark at publish time so tail reclamation still advances safely.
