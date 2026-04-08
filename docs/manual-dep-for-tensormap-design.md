@@ -981,11 +981,11 @@ Only then move to more complex orchestration such as paged attention.
 
 ## Fresh Hardware Benchmark
 
-Fresh benchmark data was rerun on real hardware on 2026-04-06 with:
+Fresh benchmark data was rerun on real hardware on 2026-04-08 with:
 
 - platform: `a2a3`
 - device: `2`
-- rounds: `5`
+- rounds: `10`
 - pinned PTO-ISA commit: `6622890`
 - runner: `tools/benchmark_rounds.sh`
 
@@ -1004,23 +1004,29 @@ through the `_partial_manual` paged-attention scenes.
 
 The benchmark wrapper enables the variants as follows:
 
-- `./tools/benchmark_rounds.sh -r tensormap_and_ringbuffer`
-  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention`
-  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll`
-- `./tools/benchmark_rounds.sh -r tensormap_and_ringbuffer_unmodified`
+- `./tools/benchmark_rounds.sh -d 2 -n 10 -r aicpu_build_graph -c 6622890`
+  - benchmarks `tests/st/a2a3/aicpu_build_graph/paged_attention`
+  - benchmarks `tests/st/a2a3/aicpu_build_graph/paged_attention_unroll`
+- `./tools/benchmark_rounds.sh -d 2 -n 10 -r tensormap_and_ringbuffer_unmodified -c 6622890`
   - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer_unmodified/paged_attention`
   - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer_unmodified/paged_attention_unroll`
-- `./tools/benchmark_rounds.sh -r tensormap_and_ringbuffer_partial_manual`
+- `./tools/benchmark_rounds.sh -d 2 -n 10 -r tensormap_and_ringbuffer -c 6622890`
+  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention`
+  - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll`
+- `./tools/benchmark_rounds.sh -d 2 -n 10 -r tensormap_and_ringbuffer_partial_manual -c 6622890`
   - uses the same ST root as `tensormap_and_ringbuffer`
   - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_partial_manual`
   - benchmarks `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll_partial_manual`
-- `./tools/benchmark_rounds.sh -r aicpu_build_graph`
-  - benchmarks `tests/st/a2a3/aicpu_build_graph/paged_attention`
-  - benchmarks `tests/st/a2a3/aicpu_build_graph/paged_attention_unroll`
 
-That means the current/new AUTO runtime is already selected directly by `-r
-tensormap_and_ringbuffer`, while the manual-mode comparison is selected by `-r
-tensormap_and_ringbuffer_partial_manual`.
+There is no separate runtime named `partial_manual` in the example `kernel_config.py`.
+The partial-manual scenes still declare `RUNTIME_CONFIG["runtime"] =
+"tensormap_and_ringbuffer"`, and the benchmark wrapper switches to the
+`*_partial_manual` scene directories when `-r tensormap_and_ringbuffer_partial_manual`
+is selected.
+
+Similarly, the current/new AUTO-path runtime is enabled directly by `-r
+tensormap_and_ringbuffer`, while the copied side-by-side baseline is enabled by `-r
+tensormap_and_ringbuffer_unmodified`.
 
 ### Fresh Results
 
@@ -1028,39 +1034,66 @@ Units below are `elapsed_us (orch_us)`.
 
 | Workload | Case | `aicpu_build_graph` | `tensormap_and_ringbuffer_unmodified` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
 | --- | --- | --- | --- | --- | --- |
-| `paged_attention` | `Case1` | `31864.8 (-)` | `36218.5 (36217.7)` | `36643.8 (36643.0)` | `41611.6 (41605.3)` |
-| `paged_attention` | `Case2` | `16295.2 (-)` | `18325.8 (18324.7)` | `18873.5 (18872.6)` | `21047.6 (20983.7)` |
-| `paged_attention_unroll` | `Case1` | `1431.7 (-)` | `1321.8 (815.7)` | `1317.2 (833.3)` | `1329.8 (946.2)` |
-| `paged_attention_unroll` | `Case2` | `716.7 (-)` | `629.6 (388.7)` | `633.5 (371.4)` | `649.1 (429.3)` |
+| `paged_attention` | `Case1` | `31719.8 (-)` | `37161.3 (37160.6)` | `36368.0 (36367.3)` | `34989.4 (34830.0)` |
+| `paged_attention` | `Case2` | `16922.9 (-)` | `18913.1 (18912.4)` | `18951.0 (18950.4)` | `18191.2 (17785.0)` |
+| `paged_attention_unroll` | `Case1` | `1403.7 (-)` | `1318.7 (854.1)` | `1320.9 (830.9)` | `1324.0 (878.9)` |
+| `paged_attention_unroll` | `Case2` | `692.0 (-)` | `623.5 (366.2)` | `637.8 (389.2)` | `639.2 (398.8)` |
 
 ### Benchmark Takeaways
 
-1. The current/new AUTO-path runtime is close to the unmodified runtime on three of
-   the four fresh cells.
-   - `paged_attention_unroll/Case1`: slightly faster end-to-end, slightly slower in orch
-   - `paged_attention_unroll/Case2`: slightly slower end-to-end, slightly faster in orch
+1. The example rewrite improved the non-unroll partial-manual scene enough to move it
+   back into the expected ordering on both paged-attention cases.
+   - `paged_attention/Case1`: `aicpu_build_graph` < `partial_manual` < `tensormap*`
+   - `paged_attention/Case2`: `aicpu_build_graph` < `partial_manual` < `tensormap*`
 
-2. The remaining AUTO-path gap is the heavy `paged_attention/Case1` cell.
-   - unmodified: `36218.5 us`
-   - current/new: `36643.8 us`
-   - regression: about `+1.2%`
+2. The non-unroll target is still not met.
+   - target cell: `paged_attention/Case1`
+   - `aicpu_build_graph`: `31719.8 us`
+   - `partial_manual`: `34989.4 us`
+   - remaining gap: about `+10.3%`
 
-3. `paged_attention/Case2` still shows a measurable AUTO-path regression.
-   - unmodified: `18325.8 us`
-   - current/new: `18873.5 us`
-   - regression: about `+3.0%`
+3. Partial-manual is now clearly better than both tensormap AUTO variants on the
+   non-unroll scene, but not yet equal to `aicpu_build_graph`.
+   - `paged_attention/Case1`: about `-5.8%` vs unmodified, about `-3.8%` vs current/new
+   - `paged_attention/Case2`: about `-3.8%` vs unmodified, about `-4.0%` vs current/new
 
-4. Partial-manual mode is still materially slower on the heavy paged-attention scene.
-   - `paged_attention/Case1`: about `+14.9%` vs unmodified
-   - `paged_attention/Case2`: about `+14.8%` vs unmodified
+4. The current/new AUTO runtime no longer looks meaningfully worse than the copied
+   unmodified baseline on the fresh device-2 rerun.
+   - `paged_attention/Case1`: current/new is about `-2.1%` faster
+   - `paged_attention/Case2`: current/new is effectively tied (`+0.2%`)
+   - `paged_attention_unroll`: current/new stays within about `+2%` end-to-end
 
-5. Partial-manual mode also adds visible orch cost on the unroll scene even when
-   elapsed stays close.
-   - `paged_attention_unroll/Case1`: `946.2 us` orch vs `815.7 us` unmodified
-   - `paged_attention_unroll/Case2`: `429.3 us` orch vs `388.7 us` unmodified
+5. On the unroll scene, all three tensormap-family runtimes stay faster than
+   `aicpu_build_graph` end-to-end, but partial-manual still has the highest orch cost
+   among the tensormap variants.
+   - `paged_attention_unroll/Case1`: `878.9 us` orch vs `830.9 us` current/new
+   - `paged_attention_unroll/Case2`: `398.8 us` orch vs `389.2 us` current/new
 
-6. `aicpu_build_graph` remains fastest on the heavy `paged_attention` scene, but it is
-   slower than the tensormap runtimes on both `paged_attention_unroll` cells.
+6. The remaining performance problem is specifically the heavy non-unroll partial-manual
+   `scope_end` path, not a broad collapse of the AUTO-path runtime.
+
+### Boundary Annotation Note
+
+There is still no explicit “scope arguments” API in
+`src/a2a3/runtime/tensormap_and_ringbuffer/orchestration/pto_orchestration_api.h`.
+
+The closest current mechanism is per-tensor `manual_dep=true` on
+`make_tensor_external(...)` and derived `view(...)` objects. That mechanism is not a
+good substitute for scope-boundary declaration:
+
+- it is tensor-local, not scope-local
+- it suppresses TensorMap lookup/insert for that tensor
+- it can easily hide an output frontier that the boundary semantics still need
+
+For the paged-attention partial-manual example, the stable improvement came from the
+orchestration rewrite itself:
+
+- one manual scope per `q_idx`
+- move `AIV_HUB` creation into the manual scope
+- add an explicit `prev_update_task -> up_outs.task_id` chain
+
+The `manual_dep=true` boundary-hint experiments were not kept in the example because
+they did not produce a robust win across the non-unroll scene.
 
 ## Main Risks
 
@@ -1100,6 +1133,10 @@ Units below are `elapsed_us (orch_us)`.
 12. Replacing the existing scheduler edge machinery with a separate manual execution path.
 - This would duplicate fanin/fanout handling, completion notification, and release traversal.
 - The design requires one unified post-publish scheduler mechanism.
+
+13. Using `manual_dep=true` as a fake scope-boundary annotation.
+- This can suppress TensorMap work that is still required for cross-scope correctness.
+- It also creates unstable performance results because the flag is tensor-local, not scope-local.
 
 ## Dangerous Risks For The Submit/Scope-End Split
 
