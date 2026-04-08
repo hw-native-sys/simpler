@@ -89,15 +89,11 @@ struct PTO2OrchestratorState {
     // Cross-thread notification uses shared memory orch_error_code (atomic)
     bool fatal;
 
-    // === MANUAL-SCOPE STATE ===
-    int32_t manual_dep_pool_reserve[PTO2_MAX_RING_DEPTH];
-
     // Hidden alloc tasks complete synchronously inside the orchestrator and
     // therefore bypass the executor's normal worker-completion counter path.
     // The executor adds this count into its completed_tasks_ progress counter
     // after orchestration finishes so shutdown/profiling totals remain closed.
     int64_t inline_completed_tasks{0};
-
     // === STATISTICS ===
 #if PTO2_PROFILING
     int64_t tasks_submitted;

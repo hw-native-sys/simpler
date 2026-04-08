@@ -407,7 +407,6 @@ bool pto2_orchestrator_init(
     orch->scope_stack_top = -1;
     orch->scope_stack_capacity = max_depth;
     orch->manual_scope_active = false;
-    memset(orch->manual_dep_pool_reserve, 0, sizeof(orch->manual_dep_pool_reserve));
 
     return true;
 }
