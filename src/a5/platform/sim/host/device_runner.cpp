@@ -584,27 +584,27 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
 int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, int device_id) {
     // Simulation: "device" memory is just host memory, so use malloc/free and
     // std::memcpy for the copy callbacks.
-    auto alloc_cb = [](size_t size, void * /*user_data*/) -> void * {
+    auto alloc_cb = [](size_t size) -> void * {
         return malloc(size);
     };
 
-    auto free_cb = [](void *dev_ptr, void * /*user_data*/) -> int {
+    auto free_cb = [](void *dev_ptr) -> int {
         free(dev_ptr);
         return 0;
     };
 
-    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size, void * /*user_data*/) -> int {
+    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
         std::memcpy(dev_dst, host_src, size);
         return 0;
     };
 
-    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size, void * /*user_data*/) -> int {
+    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
         std::memcpy(host_dst, dev_src, size);
         return 0;
     };
 
     return perf_collector_.initialize(
-        runtime, num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb, nullptr
+        runtime, num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
     );
 }
 

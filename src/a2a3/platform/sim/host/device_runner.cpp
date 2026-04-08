@@ -481,13 +481,12 @@ int DeviceRunner::finalize() {
 
     // Cleanup performance profiling
     if (perf_collector_.is_initialized()) {
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            (void)user_data;
+        auto free_cb = [](void *dev_ptr) -> int {
             free(dev_ptr);
             return 0;
         };
 
-        perf_collector_.finalize(nullptr, free_cb, nullptr);
+        perf_collector_.finalize(nullptr, free_cb);
     }
 
     // Kernel binaries should have been removed by validate_runtime_impl()
@@ -615,20 +614,18 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
 
 int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, int device_id) {
     // Define allocation callback (a2a3sim: use malloc)
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        (void)user_data;  // Not needed for malloc
+    auto alloc_cb = [](size_t size) -> void * {
         return malloc(size);
     };
 
     // Define free callback (a2a3sim: use free)
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        (void)user_data;  // Not needed for free
+    auto free_cb = [](void *dev_ptr) -> int {
         free(dev_ptr);
         return 0;
     };
 
     // Simulation: no registration needed (pass nullptr)
-    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, nullptr, free_cb, nullptr, nullptr);
+    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, nullptr, free_cb, nullptr);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {

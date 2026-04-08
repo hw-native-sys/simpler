@@ -47,8 +47,7 @@ ProfMemoryManager::~ProfMemoryManager() {
 
 void ProfMemoryManager::start(
     void *shared_mem_host, int num_cores, int num_phase_threads, PerfAllocCallback alloc_cb,
-    PerfRegisterCallback register_cb, PerfFreeCallback free_cb, void *user_data, int device_id,
-    PerfSetDeviceCallback set_device_cb
+    PerfRegisterCallback register_cb, PerfFreeCallback free_cb, int device_id, PerfSetDeviceCallback set_device_cb
 ) {
     shared_mem_host_ = shared_mem_host;
     num_cores_ = num_cores;
@@ -56,7 +55,6 @@ void ProfMemoryManager::start(
     alloc_cb_ = alloc_cb;
     register_cb_ = register_cb;
     free_cb_ = free_cb;
-    user_data_ = user_data;
     device_id_ = device_id;
     set_device_cb_ = set_device_cb;
 
@@ -123,7 +121,7 @@ void ProfMemoryManager::notify_copy_done(const CopyDoneInfo &info) {
 }
 
 void *ProfMemoryManager::alloc_and_register(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size, user_data_);
+    void *dev_ptr = alloc_cb_(size);
     if (dev_ptr == nullptr) {
         const char *hint = (size == sizeof(PerfBuffer)) ?
                                "increase PLATFORM_PROF_BUFFERS_PER_CORE to reduce profiling data loss" :
@@ -135,7 +133,7 @@ void *ProfMemoryManager::alloc_and_register(size_t size, void **host_ptr_out) {
 
     if (register_cb_ != nullptr) {
         void *host_ptr = nullptr;
-        int rc = register_cb_(dev_ptr, size, device_id_, user_data_, &host_ptr);
+        int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
         if (rc != 0 || host_ptr == nullptr) {
             LOG_ERROR("ProfMemoryManager: register failed: %d", rc);
             free_buffer(dev_ptr);
@@ -155,7 +153,7 @@ void *ProfMemoryManager::alloc_and_register(size_t size, void **host_ptr_out) {
 void ProfMemoryManager::free_buffer(void *dev_ptr) {
     if (dev_ptr != nullptr && free_cb_ != nullptr) {
         dev_to_host_.erase(dev_ptr);
-        free_cb_(dev_ptr, user_data_);
+        free_cb_(dev_ptr);
     }
 }
 
@@ -341,7 +339,7 @@ void ProfMemoryManager::process_ready_entry(
 
 void ProfMemoryManager::mgmt_loop() {
     if (set_device_cb_ != nullptr) {
-        int rc = set_device_cb_(device_id_, user_data_);
+        int rc = set_device_cb_(device_id_);
         if (rc != 0) {
             LOG_ERROR("mgmt_loop: set_device_cb(%d) failed: %d", device_id_, rc);
         }
@@ -517,7 +515,7 @@ PerformanceCollector::~PerformanceCollector() {
 }
 
 void *PerformanceCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
-    void *dev_ptr = alloc_cb_(size, user_data_);
+    void *dev_ptr = alloc_cb_(size);
     if (dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate buffer (%zu bytes)", size);
         *host_ptr_out = nullptr;
@@ -526,7 +524,7 @@ void *PerformanceCollector::alloc_single_buffer(size_t size, void **host_ptr_out
 
     if (register_cb_ != nullptr) {
         void *host_ptr = nullptr;
-        int rc = register_cb_(dev_ptr, size, device_id_, user_data_, &host_ptr);
+        int rc = register_cb_(dev_ptr, size, device_id_, &host_ptr);
         if (rc != 0 || host_ptr == nullptr) {
             LOG_ERROR("Buffer registration failed: %d", rc);
             *host_ptr_out = nullptr;
@@ -544,7 +542,7 @@ void *PerformanceCollector::alloc_single_buffer(size_t size, void **host_ptr_out
 
 int PerformanceCollector::initialize(
     Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfRegisterCallback register_cb,
-    PerfFreeCallback free_cb, void *user_data, PerfSetDeviceCallback set_device_cb
+    PerfFreeCallback free_cb, PerfSetDeviceCallback set_device_cb
 ) {
     if (perf_shared_mem_host_ != nullptr) {
         LOG_ERROR("PerformanceCollector already initialized");
@@ -563,7 +561,6 @@ int PerformanceCollector::initialize(
     alloc_cb_ = alloc_cb;
     register_cb_ = register_cb;
     free_cb_ = free_cb;
-    user_data_ = user_data;
     set_device_cb_ = set_device_cb;
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
@@ -578,7 +575,7 @@ int PerformanceCollector::initialize(
     LOG_DEBUG("  Total shared memory:  %zu bytes (%zu KB)", total_size, total_size / 1024);
 
     // Step 2: Allocate shared memory for slot arrays
-    void *perf_dev_ptr = alloc_cb(total_size, user_data);
+    void *perf_dev_ptr = alloc_cb(total_size);
     if (perf_dev_ptr == nullptr) {
         LOG_ERROR("Failed to allocate shared memory (%zu bytes)", total_size);
         return -1;
@@ -588,7 +585,7 @@ int PerformanceCollector::initialize(
     // Step 3: Register to host mapping (optional)
     void *perf_host_ptr = nullptr;
     if (register_cb != nullptr) {
-        int rc = register_cb(perf_dev_ptr, total_size, device_id, user_data, &perf_host_ptr);
+        int rc = register_cb(perf_dev_ptr, total_size, device_id, &perf_host_ptr);
         if (rc != 0) {
             LOG_ERROR("Memory registration failed: %d", rc);
             return rc;
@@ -712,8 +709,8 @@ void PerformanceCollector::start_memory_manager() {
     }
 
     memory_manager_.start(
-        perf_shared_mem_host_, num_aicore_, PLATFORM_MAX_AICPU_THREADS, alloc_cb_, register_cb_, free_cb_, user_data_,
-        device_id_, set_device_cb_
+        perf_shared_mem_host_, num_aicore_, PLATFORM_MAX_AICPU_THREADS, alloc_cb_, register_cb_, free_cb_, device_id_,
+        set_device_cb_
     );
 }
 
@@ -1454,7 +1451,7 @@ int PerformanceCollector::export_swimlane_json(const std::string &output_path) {
     return 0;
 }
 
-int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFreeCallback free_cb, void *user_data) {
+int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFreeCallback free_cb) {
     if (perf_shared_mem_host_ == nullptr) {
         return 0;
     }
@@ -1473,7 +1470,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFre
 
         // Free current buffer if any
         if (state->current_buf_ptr != 0 && free_cb != nullptr) {
-            free_cb(reinterpret_cast<void *>(state->current_buf_ptr), user_data);
+            free_cb(reinterpret_cast<void *>(state->current_buf_ptr));
         }
 
         // Free all buffers in free_queue (limit iterations to max capacity)
@@ -1484,7 +1481,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFre
         while (head != tail && max_iters-- > 0) {
             uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
             if (buf_ptr != 0 && free_cb != nullptr) {
-                free_cb(reinterpret_cast<void *>(buf_ptr), user_data);
+                free_cb(reinterpret_cast<void *>(buf_ptr));
             }
             head++;
         }
@@ -1499,7 +1496,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFre
 
         // Free current buffer if any
         if (state->current_buf_ptr != 0 && free_cb != nullptr) {
-            free_cb(reinterpret_cast<void *>(state->current_buf_ptr), user_data);
+            free_cb(reinterpret_cast<void *>(state->current_buf_ptr));
         }
 
         // Free all buffers in free_queue (limit iterations to max capacity)
@@ -1510,7 +1507,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFre
         while (head != tail && max_iters-- > 0) {
             uint64_t buf_ptr = state->free_queue.buffer_ptrs[head % PLATFORM_PROF_SLOT_COUNT];
             if (buf_ptr != 0 && free_cb != nullptr) {
-                free_cb(reinterpret_cast<void *>(buf_ptr), user_data);
+                free_cb(reinterpret_cast<void *>(buf_ptr));
             }
             head++;
         }
@@ -1521,7 +1518,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFre
 
     // Unregister host mapping (optional)
     if (unregister_cb != nullptr && was_registered_) {
-        int rc = unregister_cb(perf_shared_mem_dev_, device_id_, user_data);
+        int rc = unregister_cb(perf_shared_mem_dev_, device_id_);
         if (rc != 0) {
             LOG_ERROR("halHostUnregister failed: %d", rc);
             return rc;
@@ -1531,7 +1528,7 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFre
 
     // Free shared memory (slot arrays)
     if (free_cb != nullptr && perf_shared_mem_dev_ != nullptr) {
-        free_cb(perf_shared_mem_dev_, user_data);
+        free_cb(perf_shared_mem_dev_);
         LOG_DEBUG("Shared memory freed");
     }
 
@@ -1546,7 +1543,6 @@ int PerformanceCollector::finalize(PerfUnregisterCallback unregister_cb, PerfFre
     alloc_cb_ = nullptr;
     register_cb_ = nullptr;
     free_cb_ = nullptr;
-    user_data_ = nullptr;
 
     LOG_DEBUG("Performance profiling cleanup complete");
     return 0;

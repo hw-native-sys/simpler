@@ -56,7 +56,7 @@ PerformanceCollector::~PerformanceCollector() {
 
 int PerformanceCollector::initialize(
     Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfFreeCallback free_cb,
-    PerfCopyToDeviceCallback copy_to_dev_cb, PerfCopyFromDeviceCallback copy_from_dev_cb, void *user_data
+    PerfCopyToDeviceCallback copy_to_dev_cb, PerfCopyFromDeviceCallback copy_from_dev_cb
 ) {
     if (setup_header_dev_ != nullptr) {
         LOG_ERROR("PerformanceCollector already initialized");
@@ -81,7 +81,6 @@ int PerformanceCollector::initialize(
     free_cb_ = free_cb;
     copy_to_dev_cb_ = copy_to_dev_cb;
     copy_from_dev_cb_ = copy_from_dev_cb;
-    user_data_ = user_data;
 
     perf_buffer_bytes_ = calc_perf_buffer_size(PLATFORM_PROF_BUFFER_SIZE);
     phase_buffer_bytes_ = calc_phase_buffer_size(PLATFORM_PHASE_RECORDS_PER_THREAD);
@@ -95,7 +94,7 @@ int PerformanceCollector::initialize(
     LOG_DEBUG("  num_phase_threads:    %d", num_phase_threads_);
 
     // Step 1: Allocate PerfSetupHeader on device
-    setup_header_dev_ = alloc_cb_(calc_perf_setup_size(), user_data_);
+    setup_header_dev_ = alloc_cb_(calc_perf_setup_size());
     if (setup_header_dev_ == nullptr) {
         LOG_ERROR("Failed to allocate PerfSetupHeader (%zu bytes)", calc_perf_setup_size());
         return -1;
@@ -104,7 +103,7 @@ int PerformanceCollector::initialize(
     // Step 2: Allocate one PerfBuffer per core on device
     core_buffers_dev_.assign(num_aicore_, nullptr);
     for (int i = 0; i < num_aicore_; i++) {
-        void *buf = alloc_cb_(perf_buffer_bytes_, user_data_);
+        void *buf = alloc_cb_(perf_buffer_bytes_);
         if (buf == nullptr) {
             LOG_ERROR("Failed to allocate PerfBuffer for core %d (%zu bytes)", i, perf_buffer_bytes_);
             finalize();
@@ -116,7 +115,7 @@ int PerformanceCollector::initialize(
     // Step 3: Allocate one PhaseBuffer per AICPU thread on device
     phase_buffers_dev_.assign(num_phase_threads_, nullptr);
     for (int t = 0; t < num_phase_threads_; t++) {
-        void *buf = alloc_cb_(phase_buffer_bytes_, user_data_);
+        void *buf = alloc_cb_(phase_buffer_bytes_);
         if (buf == nullptr) {
             LOG_ERROR("Failed to allocate PhaseBuffer for thread %d (%zu bytes)", t, phase_buffer_bytes_);
             finalize();
@@ -139,7 +138,7 @@ int PerformanceCollector::initialize(
     }
     // phase_header is zero-initialized; AICPU sets magic during init.
 
-    int rc = copy_to_dev_cb_(setup_header_dev_, &host_header, sizeof(host_header), user_data_);
+    int rc = copy_to_dev_cb_(setup_header_dev_, &host_header, sizeof(host_header));
     if (rc != 0) {
         LOG_ERROR("Failed to copy PerfSetupHeader to device: %d", rc);
         finalize();
@@ -169,7 +168,7 @@ int PerformanceCollector::collect_all() {
     // Step 1: Copy back PerfSetupHeader (contains total_tasks and phase_header)
     PerfSetupHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
-    int rc = copy_from_dev_cb_(&host_header, setup_header_dev_, sizeof(host_header), user_data_);
+    int rc = copy_from_dev_cb_(&host_header, setup_header_dev_, sizeof(host_header));
     if (rc != 0) {
         LOG_ERROR("Failed to copy PerfSetupHeader from device: %d", rc);
         return rc;
@@ -195,7 +194,7 @@ int PerformanceCollector::collect_all() {
             void *dev_ptr = core_buffers_dev_[i];
             if (dev_ptr == nullptr) continue;
 
-            rc = copy_from_dev_cb_(header_buf, dev_ptr, sizeof(PerfBuffer), user_data_);
+            rc = copy_from_dev_cb_(header_buf, dev_ptr, sizeof(PerfBuffer));
             if (rc != 0) {
                 LOG_ERROR("Failed to copy PerfBuffer header for core %d: %d", i, rc);
                 continue;
@@ -216,7 +215,7 @@ int PerformanceCollector::collect_all() {
             collected_perf_records_[i].resize(count);
             size_t records_bytes = static_cast<size_t>(count) * sizeof(PerfRecord);
             void *dev_records = static_cast<unsigned char *>(dev_ptr) + sizeof(PerfBuffer);
-            rc = copy_from_dev_cb_(collected_perf_records_[i].data(), dev_records, records_bytes, user_data_);
+            rc = copy_from_dev_cb_(collected_perf_records_[i].data(), dev_records, records_bytes);
             if (rc != 0) {
                 LOG_ERROR("Failed to copy PerfBuffer records for core %d: %d", i, rc);
                 collected_perf_records_[i].clear();
@@ -235,7 +234,7 @@ int PerformanceCollector::collect_all() {
             void *dev_ptr = phase_buffers_dev_[t];
             if (dev_ptr == nullptr) continue;
 
-            rc = copy_from_dev_cb_(header_buf, dev_ptr, sizeof(PhaseBuffer), user_data_);
+            rc = copy_from_dev_cb_(header_buf, dev_ptr, sizeof(PhaseBuffer));
             if (rc != 0) {
                 LOG_ERROR("Failed to copy PhaseBuffer header for thread %d: %d", t, rc);
                 continue;
@@ -256,7 +255,7 @@ int PerformanceCollector::collect_all() {
             collected_phase_records_[t].resize(count);
             size_t records_bytes = static_cast<size_t>(count) * sizeof(AicpuPhaseRecord);
             void *dev_records = static_cast<unsigned char *>(dev_ptr) + sizeof(PhaseBuffer);
-            rc = copy_from_dev_cb_(collected_phase_records_[t].data(), dev_records, records_bytes, user_data_);
+            rc = copy_from_dev_cb_(collected_phase_records_[t].data(), dev_records, records_bytes);
             if (rc != 0) {
                 LOG_ERROR("Failed to copy PhaseBuffer records for thread %d: %d", t, rc);
                 collected_phase_records_[t].clear();
@@ -621,7 +620,7 @@ int PerformanceCollector::finalize() {
     if (free_cb_ != nullptr) {
         for (void *ptr : core_buffers_dev_) {
             if (ptr != nullptr) {
-                free_cb_(ptr, user_data_);
+                free_cb_(ptr);
             }
         }
     }
@@ -631,7 +630,7 @@ int PerformanceCollector::finalize() {
     if (free_cb_ != nullptr) {
         for (void *ptr : phase_buffers_dev_) {
             if (ptr != nullptr) {
-                free_cb_(ptr, user_data_);
+                free_cb_(ptr);
             }
         }
     }
@@ -639,7 +638,7 @@ int PerformanceCollector::finalize() {
 
     // Free PerfSetupHeader
     if (free_cb_ != nullptr && setup_header_dev_ != nullptr) {
-        free_cb_(setup_header_dev_, user_data_);
+        free_cb_(setup_header_dev_);
     }
     setup_header_dev_ = nullptr;
 
@@ -659,7 +658,6 @@ int PerformanceCollector::finalize() {
     free_cb_ = nullptr;
     copy_to_dev_cb_ = nullptr;
     copy_from_dev_cb_ = nullptr;
-    user_data_ = nullptr;
 
     LOG_DEBUG("Performance profiling cleanup complete");
     return 0;
