@@ -20,6 +20,7 @@
 #include "callable.h"
 #include "task_args.h"
 
+#include <pthread.h>
 #include <vector>
 
 #include "common/unified_log.h"
@@ -35,12 +36,22 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
 int validate_runtime_impl(Runtime *runtime);
 
 /* ===========================================================================
+ * Per-thread DeviceRunner binding (set by run_runtime, read by HostApi wrappers)
+ * =========================================================================== */
+
+static pthread_key_t g_runner_key;
+static pthread_once_t g_runner_key_once = PTHREAD_ONCE_INIT;
+static void create_runner_key() { pthread_key_create(&g_runner_key, nullptr); }
+
+static DeviceRunner *current_runner() { return static_cast<DeviceRunner *>(pthread_getspecific(g_runner_key)); }
+
+/* ===========================================================================
  * Internal device-memory functions (used via Runtime.host_api, NOT dlsym'd)
  * =========================================================================== */
 
 static void *device_malloc(size_t size) {
     try {
-        return DeviceRunner::get().allocate_tensor(size);
+        return current_runner()->allocate_tensor(size);
     } catch (...) {
         return NULL;
     }
@@ -49,14 +60,14 @@ static void *device_malloc(size_t size) {
 static void device_free(void *dev_ptr) {
     if (dev_ptr == NULL) return;
     try {
-        DeviceRunner::get().free_tensor(dev_ptr);
+        current_runner()->free_tensor(dev_ptr);
     } catch (...) {}
 }
 
 static int copy_to_device(void *dev_ptr, const void *host_ptr, size_t size) {
     if (dev_ptr == NULL || host_ptr == NULL) return -1;
     try {
-        return DeviceRunner::get().copy_to_device(dev_ptr, host_ptr, size);
+        return current_runner()->copy_to_device(dev_ptr, host_ptr, size);
     } catch (...) {
         return -1;
     }
@@ -65,7 +76,7 @@ static int copy_to_device(void *dev_ptr, const void *host_ptr, size_t size) {
 static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
     if (host_ptr == NULL || dev_ptr == NULL) return -1;
     try {
-        return DeviceRunner::get().copy_from_device(host_ptr, dev_ptr, size);
+        return current_runner()->copy_from_device(host_ptr, dev_ptr, size);
     } catch (...) {
         return -1;
     }
@@ -73,7 +84,7 @@ static int copy_from_device(void *host_ptr, const void *dev_ptr, size_t size) {
 
 static uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t *bin_data, size_t bin_size) {
     try {
-        return DeviceRunner::get().upload_kernel_binary(func_id, bin_data, bin_size);
+        return current_runner()->upload_kernel_binary(func_id, bin_data, bin_size);
     } catch (...) {
         return 0;
     }
@@ -81,7 +92,7 @@ static uint64_t upload_kernel_binary_wrapper(int func_id, const uint8_t *bin_dat
 
 static void remove_kernel_binary_wrapper(int func_id) {
     try {
-        DeviceRunner::get().remove_kernel_binary(func_id);
+        current_runner()->remove_kernel_binary(func_id);
     } catch (...) {}
 }
 
@@ -89,23 +100,38 @@ static void remove_kernel_binary_wrapper(int func_id) {
  * Public C API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
 
+DeviceContextHandle create_device_context(void) {
+    try {
+        return static_cast<DeviceContextHandle>(new DeviceRunner());
+    } catch (...) {
+        return NULL;
+    }
+}
+
+void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<DeviceRunner *>(ctx); }
+
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
-int set_device(int device_id) {
+int set_device(DeviceContextHandle ctx, int device_id) {
+    if (ctx == NULL) return -1;
     try {
-        return DeviceRunner::get().ensure_device_set(device_id);
+        return static_cast<DeviceRunner *>(ctx)->ensure_device_set(device_id);
     } catch (...) {
         return -1;
     }
 }
 
 int run_runtime(
-    RuntimeHandle runtime, const void *callable, const void *args, int block_dim, int aicpu_thread_num, int device_id,
-    const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size,
-    int enable_profiling
+    DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
+    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
+    size_t aicore_size, int enable_profiling
 ) {
-    if (runtime == NULL) return -1;
+    if (ctx == NULL || runtime == NULL) return -1;
     if (aicpu_binary == NULL || aicpu_size == 0 || aicore_binary == NULL || aicore_size == 0) return -1;
+
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, ctx);
+    DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
 
     try {
         // Phase 1: placement new + build graph
@@ -126,6 +152,7 @@ int run_runtime(
             r->set_pto2_gm_sm_ptr(nullptr);
             validate_runtime_impl(r);
             r->~Runtime();
+            pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
 
@@ -135,28 +162,31 @@ int run_runtime(
         }
 
         // Phase 3: launch
-        DeviceRunner &runner = DeviceRunner::get();
         std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
         std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
-        rc = runner.run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
+        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();
+            pthread_setspecific(g_runner_key, nullptr);
             return rc;
         }
 
         // Phase 4: finalize (copy results back)
         rc = validate_runtime_impl(r);
         r->~Runtime();
+        pthread_setspecific(g_runner_key, nullptr);
         return rc;
     } catch (...) {
+        pthread_setspecific(g_runner_key, nullptr);
         return -1;
     }
 }
 
-int finalize_device(void) {
+int finalize_device(DeviceContextHandle ctx) {
+    if (ctx == NULL) return -1;
     try {
-        return DeviceRunner::get().finalize();
+        return static_cast<DeviceRunner *>(ctx)->finalize();
     } catch (...) {
         return -1;
     }

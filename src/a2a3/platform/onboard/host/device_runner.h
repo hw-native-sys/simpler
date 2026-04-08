@@ -18,7 +18,7 @@
  * - DeviceArgs: AICPU device argument structure
  * - KernelArgsHelper: Helper for managing kernel arguments with device memory
  * - AicpuSoInfo: AICPU shared object (.so) file management
- * - DeviceRunner: Singleton for kernel launching and execution
+ * - DeviceRunner: kernel launching and execution
  */
 
 #ifndef RUNTIME_DEVICERUNNER_H
@@ -168,7 +168,7 @@ struct AicpuSoInfo {
 };
 
 /**
- * Device runner singleton for kernel execution
+ * Device runner for kernel execution
  *
  * This class provides a unified interface for launching AICPU and AICore
  * kernels on Ascend devices. It handles:
@@ -181,12 +181,8 @@ struct AicpuSoInfo {
  */
 class DeviceRunner {
 public:
-    /**
-     * Get singleton instance
-     *
-     * @return Reference to the singleton DeviceRunner instance
-     */
-    static DeviceRunner &get();
+    DeviceRunner() = default;
+    ~DeviceRunner();
 
     /**
      * Allocate device tensor memory
@@ -361,9 +357,6 @@ public:
     int ensure_device_set(int device_id);
 
 private:
-    DeviceRunner() = default;
-    ~DeviceRunner();
-
     // Internal state
     int device_id_{-1};
     int block_dim_{0};

@@ -61,7 +61,7 @@ struct MappedKernel {
 };
 
 /**
- * Device runner singleton for simulated kernel execution
+ * Device runner for simulated kernel execution
  *
  * This class provides the SAME interface as the real a2a3 DeviceRunner,
  * but implements execution using host threads instead of actual device
@@ -74,10 +74,8 @@ struct MappedKernel {
  */
 class DeviceRunner {
 public:
-    /**
-     * Get singleton instance
-     */
-    static DeviceRunner &get();
+    DeviceRunner() = default;
+    ~DeviceRunner();
 
     /**
      * Allocate tensor memory (host memory in simulation)
@@ -201,9 +199,6 @@ public:
     void remove_kernel_binary(int func_id);
 
 private:
-    DeviceRunner() = default;
-    ~DeviceRunner();
-
     // Configuration
     int device_id_{-1};
     int block_dim_{0};

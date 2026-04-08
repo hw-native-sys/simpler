@@ -106,6 +106,8 @@ void ChipWorker::init(
     }
 
     try {
+        create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
+        destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
         set_device_fn_ = load_symbol<SetDeviceFn>(handle, "set_device");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
@@ -116,6 +118,13 @@ void ChipWorker::init(
     }
 
     lib_handle_ = handle;
+
+    device_ctx_ = create_device_context_fn_();
+    if (device_ctx_ == nullptr) {
+        dlclose(handle);
+        lib_handle_ = nullptr;
+        throw std::runtime_error("create_device_context returned null");
+    }
 
     // Read platform binaries from files
     aicpu_binary_ = read_binary_file(aicpu_path);
@@ -134,7 +143,7 @@ void ChipWorker::set_device(int device_id) {
         throw std::runtime_error("Device already set; call reset_device() before switching devices");
     }
 
-    int rc = set_device_fn_(device_id);
+    int rc = set_device_fn_(device_ctx_, device_id);
     if (rc != 0) {
         throw std::runtime_error("set_device failed with code " + std::to_string(rc));
     }
@@ -144,7 +153,7 @@ void ChipWorker::set_device(int device_id) {
 
 void ChipWorker::reset_device() {
     if (device_set_ && finalize_device_fn_) {
-        finalize_device_fn_();
+        finalize_device_fn_(device_ctx_);
     }
     device_id_ = -1;
     device_set_ = false;
@@ -152,10 +161,16 @@ void ChipWorker::reset_device() {
 
 void ChipWorker::finalize() {
     reset_device();
+    if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
+        destroy_device_context_fn_(device_ctx_);
+        device_ctx_ = nullptr;
+    }
     if (lib_handle_) {
         dlclose(lib_handle_);
     }
     lib_handle_ = nullptr;
+    create_device_context_fn_ = nullptr;
+    destroy_device_context_fn_ = nullptr;
     set_device_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
     run_runtime_fn_ = nullptr;
@@ -183,7 +198,7 @@ void ChipWorker::run(const void *callable, const void *args, const CallConfig &c
     void *rt = runtime_buf_.data();
 
     int rc = run_runtime_fn_(
-        rt, callable, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
+        device_ctx_, rt, callable, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
         aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_profiling ? 1 : 0
     );
     if (rc != 0) {

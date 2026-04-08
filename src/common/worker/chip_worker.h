@@ -62,18 +62,23 @@ public:
     bool device_set() const { return device_set_; }
 
 private:
-    using SetDeviceFn = int (*)(int);
+    using CreateDeviceContextFn = void *(*)();
+    using DestroyDeviceContextFn = void (*)(void *);
+    using SetDeviceFn = int (*)(void *, int);
     using GetRuntimeSizeFn = size_t (*)();
     using RunRuntimeFn = int (*)(
-        void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int
+        void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int
     );
-    using FinalizeDeviceFn = int (*)();
+    using FinalizeDeviceFn = int (*)(void *);
 
     void *lib_handle_ = nullptr;
+    CreateDeviceContextFn create_device_context_fn_ = nullptr;
+    DestroyDeviceContextFn destroy_device_context_fn_ = nullptr;
     SetDeviceFn set_device_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     RunRuntimeFn run_runtime_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
+    void *device_ctx_ = nullptr;
 
     std::vector<uint8_t> runtime_buf_;
     std::vector<uint8_t> aicpu_binary_;

@@ -16,6 +16,7 @@
  * platform implementations (producers, define all symbols) include this file.
  *
  * Public API — resolved by ChipWorker via dlsym:
+ *   create_device_context, destroy_device_context,
  *   get_runtime_size, set_device, run_runtime, finalize_device
  *
  * Memory management: caller allocates a buffer of get_runtime_size() bytes
@@ -33,23 +34,35 @@ extern "C" {
 #endif
 
 typedef void *RuntimeHandle;
+typedef void *DeviceContextHandle;
 
 /* ===========================================================================
  * Public API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
 
+/**
+ * Create a new device context (heap-allocated DeviceRunner).
+ * Each ChipWorker should own one context for the lifetime of its init→finalize cycle.
+ * @return Opaque handle on success, NULL on failure.
+ */
+DeviceContextHandle create_device_context(void);
+
+/**
+ * Destroy a device context created by create_device_context().
+ * Calls finalize internally, then frees the underlying object.
+ */
+void destroy_device_context(DeviceContextHandle ctx);
+
 /** Return sizeof(Runtime) for caller buffer allocation. */
 size_t get_runtime_size(void);
 
 /** Set the target device. Must be called before the first run_runtime(). */
-int set_device(int device_id);
+int set_device(DeviceContextHandle ctx, int device_id);
 
 /**
  * Build the task graph, execute on device, copy results back, and clean up.
  *
- * Combines the former init_runtime + enable_runtime_profiling +
- * launch_runtime + finalize_runtime into a single call.
- *
+ * @param ctx               Device context from create_device_context()
  * @param runtime           Caller-allocated buffer (size from get_runtime_size())
  * @param callable          Opaque ChipCallable pointer (orchestration + kernel binaries)
  * @param args              Opaque ChipStorageTaskArgs pointer (tensor/scalar arguments)
@@ -64,16 +77,16 @@ int set_device(int device_id);
  * @return 0 on success, negative on error
  */
 int run_runtime(
-    RuntimeHandle runtime, const void *callable, const void *args, int block_dim, int aicpu_thread_num, int device_id,
-    const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary, size_t aicore_size,
-    int enable_profiling
+    DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
+    int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
+    size_t aicore_size, int enable_profiling
 );
 
 /**
- * Release all device resources.
- * Must be called before dlclose() to avoid static destruction order issues.
+ * Release all device resources held by the context.
+ * Must be called before destroy_device_context() / dlclose().
  */
-int finalize_device(void);
+int finalize_device(DeviceContextHandle ctx);
 
 #ifdef __cplusplus
 }

@@ -223,11 +223,6 @@ int AicpuSoInfo::finalize() {
 // DeviceRunner Implementation
 // =============================================================================
 
-DeviceRunner &DeviceRunner::get() {
-    static DeviceRunner runner;
-    return runner;
-}
-
 DeviceRunner::~DeviceRunner() { finalize(); }
 
 int DeviceRunner::ensure_device_initialized(
