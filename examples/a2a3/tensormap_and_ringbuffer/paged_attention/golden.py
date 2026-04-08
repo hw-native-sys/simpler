@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged Attention Golden - tensormap_and_ringbuffer example (small scale, float16)."""
+"""Paged Attention Golden - tensormap_and_ringbuffer example (small scale, bfloat16)."""
 
 from paged_attention_golden import (
     compute_golden,  # noqa: F401
@@ -28,7 +28,7 @@ ALL_CASES = {
         "block_size": 16,
         "context_len": 33,
         "max_model_len": 256,
-        "dtype": "float16",
+        "dtype": "bfloat16",
     },
     "Case2": {
         "batch": 1,
@@ -38,7 +38,7 @@ ALL_CASES = {
         "block_size": 16,
         "context_len": 128,
         "max_model_len": 256,
-        "dtype": "float16",
+        "dtype": "bfloat16",
     },
     "CaseVarSeq2": {
         "batch": 2,
@@ -49,7 +49,7 @@ ALL_CASES = {
         "context_len": 33,
         "context_lens_list": [33, 17],
         "max_model_len": 256,
-        "dtype": "float16",
+        "dtype": "bfloat16",
     },
     "CaseVarSeq4": {
         "batch": 4,
@@ -60,7 +60,7 @@ ALL_CASES = {
         "context_len": 128,
         "context_lens_list": [33, 64, 128, 15],
         "max_model_len": 256,
-        "dtype": "float16",
+        "dtype": "bfloat16",
     },
 }
 

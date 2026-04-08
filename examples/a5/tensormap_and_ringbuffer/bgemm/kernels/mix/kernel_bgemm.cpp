@@ -93,6 +93,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
 
     // Pipe and FIFO tile are declared in common scope (both sides reference the type)
     VecFifoTileT vecFifoTile;
+    TASSIGN(vecFifoTile, 0x0);
     PipeT mPipe(nullptr, 0U, 0U);
 
     // =========================================================================
