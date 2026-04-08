@@ -13,6 +13,7 @@
 
 #include <dlfcn.h>
 
+#include <mutex>
 #include <stdexcept>
 #include <string>
 
@@ -33,13 +34,32 @@ T load_symbol(void *handle, const char *name) {
     return reinterpret_cast<T>(sym);
 }
 
+// Process-wide singleton: libcpu_sim_context.so is loaded once with
+// RTLD_GLOBAL so that PTO ISA kernel SOs can find pto_cpu_sim_* symbols
+// via dlsym(RTLD_DEFAULT, ...).  Never dlclosed.
+std::once_flag g_sim_context_once;
+void *g_sim_context_handle = nullptr;
+
+void ensure_sim_context_loaded(const std::string &path) {
+    std::call_once(g_sim_context_once, [&]() {
+        dlerror();
+        g_sim_context_handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (!g_sim_context_handle) {
+            std::string err = "dlopen sim_context failed: ";
+            const char *msg = dlerror();
+            err += msg ? msg : "unknown error";
+            throw std::runtime_error(err);
+        }
+    });
+}
+
 }  // namespace
 
 ChipWorker::~ChipWorker() { finalize(); }
 
 void ChipWorker::init(
     const std::string &host_lib_path, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size
+    size_t aicore_size, const std::string &sim_context_lib_path
 ) {
     if (finalized_) {
         throw std::runtime_error("ChipWorker already finalized; cannot reinitialize");
@@ -48,13 +68,17 @@ void ChipWorker::init(
         throw std::runtime_error("ChipWorker already initialized; runtime cannot be changed");
     }
 
-    // RTLD_GLOBAL is required: PTO ISA's TPUSH/TPOP (AIC-AIV sync) use
-    // dlsym(RTLD_DEFAULT, "pto_cpu_sim_get_shared_storage") to find the
-    // host SO's shared storage hook.  Cross-runtime isolation relies on
-    // -fno-gnu-unique (#453) allowing dlclose to actually unload the
-    // previous runtime's SO before loading the next one.
+    // Load the sim context SO with RTLD_GLOBAL (once per process) so that
+    // PTO ISA TPUSH/TPOP can resolve pto_cpu_sim_* via dlsym(RTLD_DEFAULT).
+    if (!sim_context_lib_path.empty()) {
+        ensure_sim_context_loaded(sim_context_lib_path);
+    }
+
+    // Host runtime SO is loaded with RTLD_LOCAL so that different runtimes'
+    // identically-named symbols (init_runtime_impl, run_runtime, etc.) do
+    // not collide when switching runtimes within the same process.
     dlerror();
-    void *handle = dlopen(host_lib_path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+    void *handle = dlopen(host_lib_path.c_str(), RTLD_NOW | RTLD_LOCAL);
     if (!handle) {
         std::string err = "dlopen failed: ";
         const char *msg = dlerror();

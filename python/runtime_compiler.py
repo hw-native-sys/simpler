@@ -368,3 +368,47 @@ class RuntimeCompiler:
             )
 
         return binary_path
+
+    def compile_sim_context(
+        self,
+        build_dir: Optional[str] = None,
+        output_dir: Optional[Union[str, Path]] = None,
+    ) -> Union[bytes, Path]:
+        """Compile the standalone libcpu_sim_context.so (sim platforms only).
+
+        This library contains the per-device CPU simulation context functions
+        (pto_cpu_sim_get_shared_storage, etc.) that must be loaded with
+        RTLD_GLOBAL for PTO ISA kernel SOs to find via dlsym(RTLD_DEFAULT).
+        """
+        if not self.platform.endswith("sim"):
+            raise ValueError(f"compile_sim_context is only for sim platforms, got {self.platform}")
+
+        cmake_source_dir = str(self.project_root / "src" / "common" / "sim_context")
+        binary_name = "libcpu_sim_context.so"
+        cmake_args = self.host_target.toolchain.get_cmake_args()
+
+        def _build(actual_build_dir: str) -> Union[bytes, Path]:
+            binary_path = self._run_compilation(
+                cmake_source_dir,
+                cmake_args,
+                binary_name,
+                platform="SIM_CONTEXT",
+                build_dir=actual_build_dir,
+            )
+            if output_dir is not None:
+                od = Path(output_dir)
+                od.mkdir(parents=True, exist_ok=True)
+                dest = od / binary_name
+                shutil.copy2(binary_path, dest)
+                return dest
+            else:
+                with open(binary_path, "rb") as f:
+                    return f.read()
+
+        if build_dir is None:
+            with tempfile.TemporaryDirectory(prefix="sim_context_build_", dir="/tmp") as tmp_dir:
+                return _build(tmp_dir)
+        else:
+            ctx_build_dir = Path(os.path.realpath(build_dir)) / "sim_context"
+            os.makedirs(ctx_build_dir, exist_ok=True)
+            return _build(str(ctx_build_dir))

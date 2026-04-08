@@ -34,7 +34,7 @@ public:
     /// Can only be called once per lifetime — the runtime cannot be changed.
     void init(
         const std::string &host_lib_path, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-        size_t aicore_size
+        size_t aicore_size, const std::string &sim_context_lib_path = ""
     );
 
     /// Set the target NPU device. Requires init() first.

@@ -12,6 +12,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 from platform_info import TARGETS, load_build_config, parse_platform
 from runtime_compiler import RuntimeCompiler
@@ -21,11 +22,12 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class RuntimeBinaries:
-    """Paths to the three compiled runtime binaries."""
+    """Paths to the compiled runtime binaries."""
 
     host_path: Path
     aicpu_path: Path
     aicore_path: Path
+    sim_context_path: Optional[Path] = None
 
 
 class RuntimeBuilder:
@@ -120,10 +122,19 @@ class RuntimeBuilder:
                 + "\nRun 'pip install .' or pass --build to compile them."
             )
 
+        # Validate sim_context SO exists for sim platforms
+        sim_context_path = self._resolve_sim_context_path()
+        if sim_context_path is not None and not sim_context_path.is_file():
+            raise FileNotFoundError(
+                f"Pre-built libcpu_sim_context.so not found at {sim_context_path}.\n"
+                "Run 'pip install .' or pass --build to compile it."
+            )
+
         return RuntimeBinaries(
             host_path=paths["host"],
             aicpu_path=paths["aicpu"],
             aicore_path=paths["aicore"],
+            sim_context_path=sim_context_path,
         )
 
     def get_binaries(self, name: str, build: bool = False) -> RuntimeBinaries:
@@ -180,14 +191,16 @@ class RuntimeBuilder:
 
         logger.info("Compiling AICore, AICPU, Host in parallel...")
 
-        with ThreadPoolExecutor(max_workers=3) as executor:
+        with ThreadPoolExecutor(max_workers=4) as executor:
             fut_host = executor.submit(_compile_target, "host")
             fut_aicpu = executor.submit(_compile_target, "aicpu")
             fut_aicore = executor.submit(_compile_target, "aicore")
+            fut_sim_ctx = executor.submit(self.ensure_sim_context, build=True) if variant == "sim" else None
 
             host_path = fut_host.result()
             aicpu_path = fut_aicpu.result()
             aicore_path = fut_aicore.result()
+            sim_context_path = fut_sim_ctx.result() if fut_sim_ctx else None
 
         self._place_compile_commands(name)
         logger.info("Build complete!")
@@ -195,7 +208,41 @@ class RuntimeBuilder:
             host_path=host_path,
             aicpu_path=aicpu_path,
             aicore_path=aicore_path,
+            sim_context_path=sim_context_path,
         )
+
+    def _resolve_sim_context_path(self) -> Optional[Path]:
+        """Return path to libcpu_sim_context.so for sim platforms, None for onboard."""
+        if self._variant != "sim":
+            return None
+        return self._LIB_DIR / self._arch / self._variant / "libcpu_sim_context.so"
+
+    def ensure_sim_context(self, build: bool = False) -> Optional[Path]:
+        """Build or locate the sim context SO (sim platforms only)."""
+        if self._variant != "sim":
+            return None
+
+        output_dir = self._LIB_DIR / self._arch / self._variant
+        so_path = output_dir / "libcpu_sim_context.so"
+
+        if not build and so_path.is_file():
+            return so_path
+        if not build:
+            raise FileNotFoundError(
+                f"Pre-built libcpu_sim_context.so not found at {so_path}.\n"
+                "Run 'pip install .' or pass --build to compile it."
+            )
+
+        cache_dir = self._CACHE_DIR / self._arch / self._variant
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = cache_dir / ".sim_context.lock"
+        with open(lock_path, "w") as lock_fd:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            result = self._runtime_compiler.compile_sim_context(
+                build_dir=str(cache_dir),
+                output_dir=output_dir,
+            )
+            return Path(result)  # type: ignore[arg-type]
 
     def _place_compile_commands(self, runtime_name: str) -> None:
         """Merge compile_commands.json from build/cache/ targets into source dirs.

@@ -24,8 +24,9 @@
 #include <vector>
 
 #include "common/unified_log.h"
-#include "device_runner.h"  // NOLINT(build/include_subdir)
-#include "runtime.h"        // NOLINT(build/include_subdir)
+#include "cpu_sim_context.h"  // NOLINT(build/include_subdir)
+#include "device_runner.h"    // NOLINT(build/include_subdir)
+#include "runtime.h"          // NOLINT(build/include_subdir)
 
 extern "C" {
 
@@ -93,7 +94,8 @@ static void remove_kernel_binary_wrapper(int func_id) {
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
 int set_device(int device_id) {
-    (void)device_id;
+    pto_cpu_sim_bind_device(device_id);
+    pto_cpu_sim_acquire_device(device_id);
     return 0;
 }
 
@@ -157,7 +159,12 @@ int run_runtime(
 
 int finalize_device(void) {
     try {
-        return DeviceRunner::get().finalize();
+        int rc = DeviceRunner::get().finalize();
+        int dev = pto_cpu_sim_get_bound_device();
+        if (dev >= 0) {
+            pto_cpu_sim_release_device(dev);
+        }
+        return rc;
     } catch (...) {
         return -1;
     }

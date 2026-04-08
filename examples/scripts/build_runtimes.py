@@ -120,6 +120,14 @@ def build_all(
             logger.warning(f"  {platform}: cannot initialize builder: {e}")
             continue
 
+        if variant == "sim":
+            logger.info(f"  Building {platform}/sim_context...")
+            try:
+                builder.ensure_sim_context(build=True)
+            except Exception as e:
+                logger.error(f"  Failed to build {platform}/sim_context: {e}")
+                raise
+
         for runtime_name in runtimes:
             logger.info(f"  Building {platform}/{runtime_name}...")
             try:

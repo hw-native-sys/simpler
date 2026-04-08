@@ -371,6 +371,7 @@ int DeviceRunner::run(
     aicpu_threads.reserve(over_launch);
     for (int i = 0; i < over_launch; i++) {
         aicpu_threads.emplace_back([this, &runtime, launch_aicpu_num, over_launch]() {
+            pto_cpu_sim_bind_device(device_id_);
             if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
                 return;
             }
@@ -385,6 +386,7 @@ int DeviceRunner::run(
         CoreType core_type = runtime.workers[i].core_type;
         uint32_t physical_core_id = static_cast<uint32_t>(i);
         aicore_threads.emplace_back([this, &runtime, i, core_type, physical_core_id]() {
+            pto_cpu_sim_bind_device(device_id_);
             aicore_execute_func_(&runtime, i, core_type, physical_core_id, kernel_args_.regs);
         });
     }
