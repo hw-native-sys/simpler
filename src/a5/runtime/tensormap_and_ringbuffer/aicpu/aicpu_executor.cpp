@@ -583,7 +583,7 @@ struct AicpuExecutor {
         for (int32_t i = 0; i < payload.scalar_count; i++) {
             dispatch_payload.args[n++] = payload.scalars[i];
         }
-        // Per-dispatch local context (read from slot state)
+        // Per-dispatch local context: read block_idx/block_num directly from slot_state.
         dispatch_payload.local_context.s_block_idx = slot_state.next_block_idx;
         dispatch_payload.local_context.s_block_num = slot_state.block_num;
         // Store context pointers at fixed suffix positions in args[]
@@ -963,13 +963,13 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime *runtime) {
  * (Aligned with host_build_graph mechanism)
  */
 bool AicpuExecutor::assign_cores_to_threads() {
-    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % divisor.
+    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
-    int32_t divisor = (sched_thread_num_ > 0) ? sched_thread_num_ : thread_num_;
+    active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : thread_num_;
     int32_t cluster_count = aic_count_;
 
-    // Max clusters any single sched thread can hold: ceil(cluster_count / divisor).
-    int32_t max_clusters_per_thread = (cluster_count + divisor - 1) / divisor;
+    // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
+    int32_t max_clusters_per_thread = (cluster_count + active_sched_threads_ - 1) / active_sched_threads_;
     thread_cores_num_ = max_clusters_per_thread * 3;
 
     if (thread_cores_num_ > CoreTracker::MAX_CORE_PER_THREAD) {
@@ -978,8 +978,8 @@ bool AicpuExecutor::assign_cores_to_threads() {
     }
 
     DEV_INFO(
-        "Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count, divisor,
-        aic_count_, aiv_count_
+        "Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count,
+        active_sched_threads_, aic_count_, aiv_count_
     );
 
     for (int32_t i = 0; i < MAX_CORES_PER_THREAD; i++) {
@@ -989,9 +989,9 @@ bool AicpuExecutor::assign_cores_to_threads() {
     // Count clusters per thread first (round-robin may distribute unevenly)
     int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % divisor]++;
+        clusters_per_thread[ci % active_sched_threads_]++;
     }
-    for (int32_t i = 0; i < divisor; i++) {
+    for (int32_t i = 0; i < thread_num_; i++) {
         core_trackers_[i].init(clusters_per_thread[i]);
         core_count_per_thread_[i] = 0;
     }
@@ -1001,7 +1001,7 @@ bool AicpuExecutor::assign_cores_to_threads() {
     int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
 
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % divisor;
+        int32_t t = ci % active_sched_threads_;
         int32_t &idx = core_idx[t];
 
         int32_t aic_wid = aic_worker_ids_[ci];
@@ -1017,12 +1017,11 @@ bool AicpuExecutor::assign_cores_to_threads() {
         DEV_INFO("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
     }
 
-    for (int32_t t = 0; t < divisor; t++) {
+    for (int32_t t = 0; t < thread_num_; t++) {
         core_count_per_thread_[t] = core_idx[t];
         DEV_INFO("Thread %d: total %d cores (%d clusters)", t, core_idx[t], core_trackers_[t].get_cluster_count());
     }
 
-    active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : thread_num_;
     return true;
 }
 
@@ -1518,71 +1517,19 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                     // For block_num=1 the inner body executes exactly once (no overhead).
                     do {
                         auto current_valid_cluster_offset = valid_cluster_states.pop_first();
-                        if (shape == PTO2ResourceShape::MIX) {
-                            // Full-cluster: all active subtasks share the same block_idx.
-                            uint8_t mask = pto2_core_mask(slot_state->active_mask);
-                            if (mask & PTO2_SUBTASK_MASK_AIC) {
-                                dispatch_subtask_to_core(
-                                    thread_idx, tracker.get_aic_core_offset(current_valid_cluster_offset), *slot_state,
-                                    PTO2SubtaskSlot::AIC
+                        dispatch_block_to_cluster(
+                            thread_idx, current_valid_cluster_offset, *slot_state, shape
 #if PTO2_PROFILING
-                                    ,
-                                    profiling_enabled
+                            ,
+                            profiling_enabled, phase_dispatch_count
 #endif
-                                );
-                            }
-                            if (mask & PTO2_SUBTASK_MASK_AIV0) {
-                                dispatch_subtask_to_core(
-                                    thread_idx, tracker.get_aiv0_core_offset(current_valid_cluster_offset), *slot_state,
-                                    PTO2SubtaskSlot::AIV0
-#if PTO2_PROFILING
-                                    ,
-                                    profiling_enabled
-#endif
-                                );
-                            }
-                            if (mask & PTO2_SUBTASK_MASK_AIV1) {
-                                dispatch_subtask_to_core(
-                                    thread_idx, tracker.get_aiv1_core_offset(current_valid_cluster_offset), *slot_state,
-                                    PTO2SubtaskSlot::AIV1
-#if PTO2_PROFILING
-                                    ,
-                                    profiling_enabled
-#endif
-                                );
-                            }
-                            slot_state->next_block_idx++;
-                        } else if (shape == PTO2ResourceShape::AIC) {
-                            dispatch_subtask_to_core(
-                                thread_idx, tracker.get_aic_core_offset(current_valid_cluster_offset), *slot_state,
-                                PTO2SubtaskSlot::AIC
-#if PTO2_PROFILING
-                                ,
-                                profiling_enabled
-#endif
-                            );
-                            slot_state->next_block_idx++;
-                        } else {  // shape == PTO2ResourceShape::AIV
-                            auto core_offset = tracker.is_aiv0_core_idle(current_valid_cluster_offset) ?
-                                                   tracker.get_aiv0_core_offset(current_valid_cluster_offset) :
-                                                   tracker.get_aiv1_core_offset(current_valid_cluster_offset);
-                            dispatch_subtask_to_core(
-                                thread_idx, core_offset, *slot_state, PTO2SubtaskSlot::AIV0
-#if PTO2_PROFILING
-                                ,
-                                profiling_enabled
-#endif
-                            );
-                            slot_state->next_block_idx++;
-                            // Refresh idle state so the do-while naturally picks up
-                            // the other AIV in the same cluster on the next iteration.
-                            if (slot_state->next_block_idx < slot_state->block_num) {
-                                valid_cluster_states = tracker.get_valid_cluster_offset_states(shape);
-                            }
+                        );
+                        slot_state->next_block_idx++;
+                        // For AIV, refresh cluster states so the do-while can pick up the
+                        // other AIV core in the same cluster on the next iteration.
+                        if (shape == PTO2ResourceShape::AIV && slot_state->next_block_idx < slot_state->block_num) {
+                            valid_cluster_states = tracker.get_valid_cluster_offset_states(shape);
                         }
-#if PTO2_PROFILING
-                        phase_dispatch_count += __builtin_popcount(pto2_core_mask(slot_state->active_mask));
-#endif
                         DEV_DEBUG(
                             "Thread %d: Dispatched %s task %" PRId64 " block %d/%d to cluster_offset %d", thread_idx,
                             shape_name(shape), static_cast<int64_t>(slot_state->task->task_id.raw),
@@ -2112,12 +2059,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 return -1;
             }
 
-            // Core counts for submit-time deadlock detection.
-            rt->orchestrator.total_cluster_count = aic_count_;
-            rt->orchestrator.total_aiv_count = aiv_count_;
 #if PTO2_PROFILING
             rt->orchestrator.enable_profiling = runtime->enable_profiling;
 #endif
+
+            // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
+            rt->orchestrator.total_cluster_count = aic_count_;
+            rt->orchestrator.total_aiv_count = aiv_count_;
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
             runtime->set_pto2_slot_states_ptr(nullptr);
@@ -2249,7 +2197,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 #endif
 
-            // Signal orchestration completion and trigger core transition
+            // Signal completion and trigger core transition
             pto2_rt_orchestration_done(rt);
 
             void *sm = runtime->get_pto2_gm_sm_ptr();

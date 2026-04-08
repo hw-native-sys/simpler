@@ -88,6 +88,9 @@ struct GlobalContext {
  * Written by build_payload() before each dispatch. Different blocks of the
  * same task receive different s_block_idx values but the same s_block_num.
  *
+ * NOTE: Fields are prefixed with s_ to avoid collisions with compiler
+ * built-in symbols block_idx / block_num on the a5 AICore target, which
+ * would cause a compile error if the unprefixed names were used.
  */
 struct LocalContext {
     int32_t s_block_idx;  // Logical block index within the task [0, s_block_num)

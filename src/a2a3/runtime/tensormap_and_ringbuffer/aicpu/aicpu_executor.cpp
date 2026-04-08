@@ -561,6 +561,17 @@ struct AicpuExecutor {
         return count;
     }
 
+    /**
+     * Build per-core dispatch payload: copy tensor pointers and scalars into
+     * the per-core args[] array, then populate SPMD local context at the tail.
+     *
+     * Reads next_block_idx and block_num directly from the task descriptor
+     * to populate LocalContext.  The caller is responsible for incrementing
+     * next_block_idx AFTER dispatch.
+     *
+     * GlobalContext (sub_block_id) is NOT written here — it is initialized once
+     * at runtime startup by init_global_context().
+     */
     void build_payload(PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot) {
         int32_t slot_idx = static_cast<int32_t>(subslot);
         uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
@@ -964,13 +975,13 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime *runtime) {
  * (Aligned with host_build_graph mechanism)
  */
 bool AicpuExecutor::assign_cores_to_threads() {
-    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % divisor.
+    // Cluster-aligned round-robin assignment: cluster ci -> sched thread ci % active_sched_threads_.
     // Each cluster = 1 AIC + 2 adjacent AIV; the triple is always kept together.
-    int32_t divisor = (sched_thread_num_ > 0) ? sched_thread_num_ : thread_num_;
+    active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : thread_num_;
     int32_t cluster_count = aic_count_;
 
-    // Max clusters any single sched thread can hold: ceil(cluster_count / divisor).
-    int32_t max_clusters_per_thread = (cluster_count + divisor - 1) / divisor;
+    // Max clusters any single sched thread can hold: ceil(cluster_count / active_sched_threads_).
+    int32_t max_clusters_per_thread = (cluster_count + active_sched_threads_ - 1) / active_sched_threads_;
     thread_cores_num_ = max_clusters_per_thread * 3;
 
     if (thread_cores_num_ > CoreTracker::MAX_CORE_PER_THREAD) {
@@ -979,8 +990,8 @@ bool AicpuExecutor::assign_cores_to_threads() {
     }
 
     DEV_INFO(
-        "Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count, divisor,
-        aic_count_, aiv_count_
+        "Assigning cores (round-robin): %d clusters across %d sched threads (%d AIC, %d AIV)", cluster_count,
+        active_sched_threads_, aic_count_, aiv_count_
     );
 
     for (int32_t i = 0; i < MAX_CORES_PER_THREAD; i++) {
@@ -990,9 +1001,9 @@ bool AicpuExecutor::assign_cores_to_threads() {
     // Count clusters per thread first (round-robin may distribute unevenly)
     int32_t clusters_per_thread[MAX_AICPU_THREADS] = {};
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        clusters_per_thread[ci % divisor]++;
+        clusters_per_thread[ci % active_sched_threads_]++;
     }
-    for (int32_t i = 0; i < divisor; i++) {
+    for (int32_t i = 0; i < active_sched_threads_; i++) {
         core_trackers_[i].init(clusters_per_thread[i]);
         core_count_per_thread_[i] = 0;
     }
@@ -1002,7 +1013,7 @@ bool AicpuExecutor::assign_cores_to_threads() {
     int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
 
     for (int32_t ci = 0; ci < cluster_count; ci++) {
-        int32_t t = ci % divisor;
+        int32_t t = ci % active_sched_threads_;
         int32_t &idx = core_idx[t];
 
         int32_t aic_wid = aic_worker_ids_[ci];
@@ -1023,7 +1034,6 @@ bool AicpuExecutor::assign_cores_to_threads() {
         DEV_INFO("Thread %d: total %d cores (%d clusters)", t, core_idx[t], core_trackers_[t].get_cluster_count());
     }
 
-    active_sched_threads_ = (sched_thread_num_ > 0) ? sched_thread_num_ : thread_num_;
     return true;
 }
 
