@@ -80,6 +80,7 @@
 #define PTO2_ERROR_DEP_POOL_OVERFLOW 4
 #define PTO2_ERROR_INVALID_ARGS 5         // Arg construction error (invalid args)
 #define PTO2_ERROR_DEPENDENCY_OVERFLOW 6  // Too many unique fanin dependencies for one task
+#define PTO2_ERROR_OUT_OF_MEMORY 7        // Runtime metadata buffer growth failed
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT 100

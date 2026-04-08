@@ -456,37 +456,63 @@ void pto2_orchestrator_set_scheduler(PTO2OrchestratorState *orch, PTO2SchedulerS
 // Scope Management
 // =============================================================================
 
-static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state) {
+static bool scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state) {
+    if (orch->fatal) {
+        return false;
+    }
     if (orch->scope_tasks_size >= orch->scope_tasks_capacity) {
         int32_t new_cap = orch->scope_tasks_capacity * 2;
         PTO2TaskSlotState **new_buf =
             reinterpret_cast<PTO2TaskSlotState **>(realloc(orch->scope_tasks, new_cap * sizeof(PTO2TaskSlotState *)));
-        assert(new_buf && "Failed to grow scope task buffer");
+        if (new_buf == nullptr) {
+            LOG_ERROR("Failed to grow scope task buffer to %d entries", new_cap);
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_OUT_OF_MEMORY, std::memory_order_release);
+            orch->fatal = true;
+            return false;
+        }
         orch->scope_tasks = new_buf;
         orch->scope_tasks_capacity = new_cap;
     }
     orch->scope_tasks[orch->scope_tasks_size++] = task_slot_state;
+    return true;
 }
 
-static void manual_task_meta_push(PTO2OrchestratorState *orch, const PTO2ManualTaskMeta &meta) {
+static bool manual_task_meta_push(PTO2OrchestratorState *orch, const PTO2ManualTaskMeta &meta) {
+    if (orch->fatal) {
+        return false;
+    }
     if (orch->manual_task_meta_size >= orch->manual_task_meta_capacity) {
         int32_t new_cap = orch->manual_task_meta_capacity * 2;
         PTO2ManualTaskMeta *new_buf = reinterpret_cast<PTO2ManualTaskMeta *>(
             realloc(orch->manual_task_meta, new_cap * sizeof(PTO2ManualTaskMeta))
         );
-        assert(new_buf && "Failed to grow manual task meta buffer");
+        if (new_buf == nullptr) {
+            LOG_ERROR("Failed to grow manual task metadata buffer to %d entries", new_cap);
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_OUT_OF_MEMORY, std::memory_order_release);
+            orch->fatal = true;
+            return false;
+        }
         orch->manual_task_meta = new_buf;
         orch->manual_task_meta_capacity = new_cap;
     }
     orch->manual_task_meta[orch->manual_task_meta_size++] = meta;
+    return true;
 }
 
 static int32_t manual_edge_push(PTO2OrchestratorState *orch, const PTO2ManualEdge &edge) {
+    if (orch->fatal) {
+        return -1;
+    }
     if (orch->manual_edges_size >= orch->manual_edges_capacity) {
         int32_t new_cap = orch->manual_edges_capacity * 2;
         PTO2ManualEdge *new_buf =
             reinterpret_cast<PTO2ManualEdge *>(realloc(orch->manual_edges, new_cap * sizeof(PTO2ManualEdge)));
-        assert(new_buf && "Failed to grow manual edge buffer");
+        if (new_buf == nullptr) {
+            LOG_ERROR("Failed to grow manual edge buffer to %d entries", new_cap);
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_OUT_OF_MEMORY, std::memory_order_release);
+            orch->fatal = true;
+            return -1;
+        }
         orch->manual_edges = new_buf;
         orch->manual_edges_capacity = new_cap;
     }
@@ -861,7 +887,7 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
     // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
-    uint16_t manual_local_mask = 0;
+    uint64_t manual_local_mask = 0;
     for (int i = 0; i < args.tensor_count(); i++) {
         TensorArgType ptype = args.tag(i);
         if (ptype == TensorArgType::OUTPUT) {
@@ -871,7 +897,7 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
         const Tensor *tensor = args.tensor(i).ptr;
         if constexpr (kManualSubmit) {
             if (task_owned_by_current_manual_scope(orch, tensor->owner_task_id)) {
-                manual_local_mask |= static_cast<uint16_t>(1u << i);
+                manual_local_mask |= static_cast<uint64_t>(1ULL << i);
                 continue;
             }
         }
@@ -922,7 +948,7 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
         TensorArgType ptype = args.tag(i);
         if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
             if constexpr (kManualSubmit) {
-                if ((manual_local_mask & static_cast<uint16_t>(1u << i)) != 0) {
+                if ((manual_local_mask & static_cast<uint64_t>(1ULL << i)) != 0) {
                     continue;
                 }
             }
@@ -1199,10 +1225,12 @@ pto2_submit_mixed_task_manual(PTO2OrchestratorState *orch, const MixedKernels &m
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         meta.tags[i] = static_cast<uint8_t>(args.tag(i));
         if (task_owned_by_current_manual_scope(orch, meta.slot_state->payload->tensors[i].owner_task_id)) {
-            meta.manual_local_mask |= static_cast<uint16_t>(1u << i);
+            meta.manual_local_mask |= static_cast<uint64_t>(1ULL << i);
         }
     }
-    manual_task_meta_push(orch, meta);
+    if (!manual_task_meta_push(orch, meta)) {
+        return result;
+    }
     return result;
 }
 
@@ -1248,6 +1276,9 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
             .next_consumer_edge = consumer_meta.incoming_edge_head,
         }
     );
+    if (edge_idx < 0) {
+        return;
+    }
     consumer_meta.incoming_edge_head = edge_idx;
     consumer_meta.incoming_edge_count++;
 }

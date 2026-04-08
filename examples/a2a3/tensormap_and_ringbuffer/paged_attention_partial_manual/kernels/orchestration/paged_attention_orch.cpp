@@ -101,8 +101,7 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
 
                 for (uint64_t bn = 0; bn < bn_this_batch; bn++) {
                     uint64_t cur_block_idx = host_block_table[b_idx * block_num + bn];
-                    uint64_t valid_len =
-                        block_size < (cur_seq - bn * block_size) ? block_size : (cur_seq - bn * block_size);
+                    uint64_t valid_len = std::min(block_size, cur_seq - bn * block_size);
                     uint32_t kv_shapes[2] = {static_cast<uint32_t>(block_size), static_cast<uint32_t>(head_dim)};
                     uint32_t kv_offsets[2] = {static_cast<uint32_t>(cur_block_idx * block_size), 0};
                     Tensor kj = key_cache.view(kv_shapes, kv_offsets);
