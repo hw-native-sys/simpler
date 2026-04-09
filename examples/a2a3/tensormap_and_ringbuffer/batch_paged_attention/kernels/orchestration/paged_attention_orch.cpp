@@ -32,9 +32,6 @@
 #define FUNC_SOFTMAX_PREPARE 1
 #define FUNC_PV_MATMUL 2
 #define FUNC_ONLINE_UPDATE 3
-#define FUNC_AIC_HUB 4
-#define FUNC_AIV_HUB 5
-
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
@@ -118,14 +115,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 TensorCreateInfo sij_ci(sij_shapes, 2, DataType::FLOAT32);
                 TensorCreateInfo pij_ci(sij_shapes, 2, data_type);
 
-                Arg params_hub;
-                params_hub.add_output(tile2d_ci);
-                params_hub.add_output(scalar_ci);
-                params_hub.add_output(scalar_ci);
-                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_hub);
-                const Tensor &oi_batch = hub_outs.get_ref(0);
-                const Tensor &li_batch = hub_outs.get_ref(1);
-                const Tensor &mi_batch = hub_outs.get_ref(2);
+                TaskOutputTensors alloc_outs = alloc_tensors(tile2d_ci, scalar_ci, scalar_ci);
+                const Tensor &oi_batch = alloc_outs.get_ref(0);
+                const Tensor &li_batch = alloc_outs.get_ref(1);
+                const Tensor &mi_batch = alloc_outs.get_ref(2);
 
                 for (uint64_t bn = 0; bn < max_bn; bn++) {
                     Arg params_qk;

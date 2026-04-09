@@ -51,13 +51,6 @@ KERNELS = [
         "signature": [D.IN, D.IN, D.OUT],
     },
     {
-        "func_id": 4,
-        "name": "AIC_HUB",
-        "source": str(_PA_KERNELS / "aic" / "aic_hub.cpp"),
-        "core_type": "aic",
-        "signature": [],
-    },
-    {
         "func_id": 1,
         "name": "SF",
         "source": str(_PA_KERNELS / "aiv" / "aiv_softmax_prepare.cpp"),
@@ -70,13 +63,6 @@ KERNELS = [
         "source": str(_PA_KERNELS / "aiv" / "aiv_online_update.cpp"),
         "core_type": "aiv",
         "signature": [D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.INOUT, D.INOUT],
-    },
-    {
-        "func_id": 5,
-        "name": "AIV_HUB",
-        "source": str(_PA_KERNELS / "aiv" / "aiv_hub.cpp"),
-        "core_type": "aiv",
-        "signature": [],
     },
 ]
 

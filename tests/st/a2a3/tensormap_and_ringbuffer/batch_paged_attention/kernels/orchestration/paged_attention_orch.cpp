@@ -49,9 +49,6 @@
 #define FUNC_SOFTMAX_PREPARE 1
 #define FUNC_PV_MATMUL 2
 #define FUNC_ONLINE_UPDATE 3
-#define FUNC_AIC_HUB 4
-#define FUNC_AIV_HUB 5
-
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
@@ -129,15 +126,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 uint32_t scalar_acc_shapes[1] = {static_cast<uint32_t>(chunk_bc * q_tile)};
                 TensorCreateInfo oi_batch_ci(oi_acc_shapes, 2, DataType::FLOAT32);
                 TensorCreateInfo scalar_acc_ci(scalar_acc_shapes, 1, DataType::FLOAT32);
-
-                Arg params_hub;
-                params_hub.add_output(oi_batch_ci);
-                params_hub.add_output(scalar_acc_ci);
-                params_hub.add_output(scalar_acc_ci);
-                TaskOutputTensors hub_outs = pto2_rt_submit_aiv_task(FUNC_AIV_HUB, params_hub);
-                const Tensor &oi_batch = hub_outs.get_ref(0);
-                const Tensor &li_batch = hub_outs.get_ref(1);
-                const Tensor &mi_batch = hub_outs.get_ref(2);
+                TaskOutputTensors alloc_outs = alloc_tensors(oi_batch_ci, scalar_acc_ci, scalar_acc_ci);
+                const Tensor &oi_batch = alloc_outs.get_ref(0);
+                const Tensor &li_batch = alloc_outs.get_ref(1);
+                const Tensor &mi_batch = alloc_outs.get_ref(2);
 
                 // Inner-loop create infos: shapes are loop-invariant, hoist out of bn loop
                 uint32_t sij_shapes[2] = {static_cast<uint32_t>(chunk_bc * q_tile), static_cast<uint32_t>(block_size)};

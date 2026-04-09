@@ -53,13 +53,6 @@ KERNELS = [
         "core_type": "aic",
         "signature": [D.IN, D.IN, D.OUT],
     },
-    {
-        "func_id": 4,
-        "name": "AIC_HUB",
-        "source": str(_KERNELS_ROOT / "aic" / "aic_hub.cpp"),
-        "core_type": "aic",
-        "signature": [],
-    },
     # AIV kernels (vector operations)
     {
         "func_id": 1,
@@ -74,13 +67,6 @@ KERNELS = [
         "source": str(_KERNELS_ROOT / "aiv" / "aiv_online_update.cpp"),
         "core_type": "aiv",
         "signature": [D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.INOUT, D.INOUT],
-    },
-    {
-        "func_id": 5,
-        "name": "AIV_HUB",
-        "source": str(_KERNELS_ROOT / "aiv" / "aiv_hub.cpp"),
-        "core_type": "aiv",
-        "signature": [],
     },
 ]
 

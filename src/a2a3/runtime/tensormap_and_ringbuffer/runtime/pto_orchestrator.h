@@ -88,6 +88,12 @@ struct PTO2OrchestratorState {
     // Cross-thread notification uses shared memory orch_error_code (atomic)
     bool fatal;
 
+    // Hidden alloc tasks complete synchronously inside the orchestrator and
+    // therefore bypass the executor's normal worker-completion counter path.
+    // The executor adds this count into its completed_tasks_ progress counter
+    // after orchestration finishes so shutdown/profiling totals remain closed.
+    int64_t inline_completed_tasks{0};
+
     // === STATISTICS ===
 #if PTO2_PROFILING
     int64_t tasks_submitted;
@@ -176,6 +182,16 @@ void pto2_scope_end(PTO2OrchestratorState *orch);
  */
 TaskOutputTensors
 pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args);
+
+/**
+ * Allocate fresh tensors by creating one hidden runtime-owned output task.
+ *
+ * The returned tensors are already materialized and bound to the same creator
+ * task id for scope lifetime and future creator-retention dependencies.
+ */
+TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args);
+
+Tensor pto2_alloc_tensor(PTO2OrchestratorState *orch, const TensorCreateInfo &create_info);
 
 // =============================================================================
 // Flow Control

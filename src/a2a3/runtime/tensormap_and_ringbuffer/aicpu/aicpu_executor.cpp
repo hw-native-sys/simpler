@@ -2238,6 +2238,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             if (runtime->enable_profiling && pto2_task_count > 0) {
                 perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(pto2_task_count));
             }
+            int32_t inline_completed = static_cast<int32_t>(rt->orchestrator.inline_completed_tasks);
+            if (inline_completed > 0) {
+                completed_tasks_.fetch_add(inline_completed, std::memory_order_relaxed);
+#if PTO2_SCHED_PROFILING
+                rt->scheduler.tasks_completed.fetch_add(inline_completed, std::memory_order_relaxed);
+#endif
+            }
             orchestrator_done_ = true;
             {
                 int32_t orch_err = 0;

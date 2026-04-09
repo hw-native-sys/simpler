@@ -85,6 +85,7 @@ struct PTO2RuntimeOps {
     void (*set_tensor_data)(
         PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
+    TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
 };
 
 /**

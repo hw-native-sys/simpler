@@ -41,6 +41,10 @@ static TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &m
     return pto2_submit_mixed_task(&rt->orchestrator, mixed_kernels, args);
 }
 
+static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
+    return pto2_alloc_tensors(&rt->orchestrator, args);
+}
+
 void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrator); }
 
 void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
@@ -188,6 +192,7 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .log_always = unified_log_always,
     .get_tensor_data = pto2_get_tensor_data,
     .set_tensor_data = pto2_set_tensor_data,
+    .alloc_tensors = alloc_tensors_impl,
 };
 
 // =============================================================================
