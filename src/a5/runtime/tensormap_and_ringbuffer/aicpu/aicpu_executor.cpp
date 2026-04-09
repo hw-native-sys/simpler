@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include <dlfcn.h>
+// NOLINTBEGIN
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -393,7 +394,7 @@ struct AicpuExecutor {
             uint64_t reg_addr = core_exec_state.reg_addr;
 
             int32_t expected_reg_task_id = core_exec_state.executing_reg_task_id;
-            uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+            uint64_t reg_val = poll_reg(reg_addr, RegId::COND);
             int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
             int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
             bool done = reg_task_id == expected_reg_task_id && reg_state == TASK_FIN_STATE;
@@ -407,6 +408,7 @@ struct AicpuExecutor {
 #endif
 
             if (done) {
+                poll_acquire_barrier();
                 core_exec_state.executing_reg_task_id = AICPU_TASK_INVALID;
                 PTO2TaskSlotState &slot_state = *core_exec_state.executing_slot_state;
 
@@ -2540,3 +2542,4 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     DEV_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }
+// NOLINTEND

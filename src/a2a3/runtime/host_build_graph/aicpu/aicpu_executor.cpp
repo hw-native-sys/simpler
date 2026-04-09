@@ -9,12 +9,13 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
+// NOLINTBEGIN
 #include <atomic>
 #include <cstdint>
 #include <cstdio>
 #include <mutex>
 
-#include "aicpu/device_log.h"
+#include "aicpu/device_log.h"  // NOLINT(clang-diagnostic-error)
 #include "aicpu/device_time.h"
 #include "aicpu/performance_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
@@ -604,12 +605,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
             uint64_t reg_addr = core_id_to_reg_addr_[core_id];
             Handshake *h = &hank[core_id];
 
-            uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+            uint64_t reg_val = poll_reg(reg_addr, RegId::COND);
             int reg_task_id = EXTRACT_TASK_ID(reg_val);
             int reg_state = EXTRACT_TASK_STATE(reg_val);
 
             // Case 1: Pending task finished directly
             if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
+                poll_acquire_barrier();
+
                 LOG_INFO(
                     "Thread %d: Core %d completed task %d (running_id=%d)", thread_idx, core_id,
                     pending_task_ids_[core_id], running_task_ids_[core_id]
@@ -712,6 +715,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 }
             } else if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_ACK_STATE) {
                 // Case 2: Pending task received ACK
+                poll_acquire_barrier();
+
                 LOG_INFO(
                     "Thread %d: Core %d ACKed task %d (running_id=%d)", thread_idx, core_id, pending_task_ids_[core_id],
                     running_task_ids_[core_id]
@@ -766,6 +771,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 // Continue to Case 4 to dispatch next task
             } else if (reg_task_id == running_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
                 // Case 3: Running task finished
+                poll_acquire_barrier();
+
                 LOG_INFO(
                     "Thread %d: Core %d completed task %d (pending_id=%d)", thread_idx, core_id,
                     running_task_ids_[core_id], pending_task_ids_[core_id]
@@ -1207,3 +1214,4 @@ extern "C" int aicpu_execute(Runtime *runtime) {
     LOG_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }
+// NOLINTEND

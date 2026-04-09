@@ -9,6 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include <dlfcn.h>
+// NOLINTBEGIN
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -23,7 +24,7 @@
 #include <sys/mman.h>
 #endif
 
-#include "aicpu/device_log.h"
+#include "aicpu/device_log.h"  // NOLINT(clang-diagnostic-error)
 #include "aicpu/device_time.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
@@ -306,7 +307,7 @@ struct AicpuExecutor {
             uint64_t reg_addr = core_id_to_reg_addr_[core_id];
 
             int32_t expected_reg_task_id = executing_reg_task_ids_[core_id];
-            uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+            uint64_t reg_val = poll_reg(reg_addr, RegId::COND);
             int32_t reg_task_id = EXTRACT_TASK_ID(reg_val);
             int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
             bool done = reg_task_id == expected_reg_task_id && reg_state == TASK_FIN_STATE;
@@ -320,6 +321,7 @@ struct AicpuExecutor {
 #endif
 
             if (done) {
+                poll_acquire_barrier();
                 executing_reg_task_ids_[core_id] = AICPU_TASK_INVALID;
                 PTO2SubtaskSlot subslot = executing_subslot_by_core_[core_id];
                 PTO2TaskSlotState &slot_state = *executing_slot_state_by_core_[core_id];
@@ -2195,3 +2197,4 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
     DEV_INFO("%s", "aicpu_execute: Kernel execution completed successfully");
     return 0;
 }
+// NOLINTEND

@@ -64,6 +64,30 @@ uint64_t get_platform_regs();
 uint64_t read_reg(uint64_t reg_base_addr, RegId reg);
 
 /**
+ * Poll a register value without memory barriers (for hot polling loops)
+ *
+ * Unlike read_reg(), this function performs a bare volatile read with no
+ * memory barriers. This is safe for polling loops where the "not-yet-done"
+ * fast path has no Normal-memory data dependency on the register value.
+ *
+ * Callers MUST insert an explicit memory barrier (e.g. poll_acquire_barrier())
+ * after detecting the awaited condition, before accessing Normal memory that
+ * depends on the polled result.
+ *
+ * On real hardware: MMIO is Device memory; volatile alone prevents caching
+ * and compiler reordering. No hardware barrier needed for visibility.
+ *
+ * On simulation: registers are Normal memory; volatile prevents compiler
+ * reordering. Cache coherence ensures cross-thread visibility within
+ * a bounded number of iterations.
+ *
+ * @param reg_base_addr  Base address of the AICore's register block
+ * @param reg            Register identifier (C++ enum class)
+ * @return Register value (zero-extended to uint64_t)
+ */
+uint64_t poll_reg(uint64_t reg_base_addr, RegId reg);
+
+/**
  * Write a value to an AICore's register
  *
  * @param reg_base_addr  Base address of the AICore's register block

@@ -36,20 +36,25 @@ void set_platform_regs(uint64_t regs) { g_platform_regs = regs; }
 
 uint64_t get_platform_regs() { return g_platform_regs; }
 
-uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
+uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {  // NOLINT(bugprone-easily-swappable-parameters)
     volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg));
 
     __sync_synchronize();
 
     // Read the register value
-    uint64_t value = static_cast<uint64_t>(*ptr);
+    uint64_t value = static_cast<uint64_t>(*ptr);  // NOLINT(modernize-use-auto)
 
     __sync_synchronize();
 
     return value;
 }
 
-void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {
+uint64_t poll_reg(uint64_t reg_base_addr, RegId reg) {  // NOLINT(bugprone-easily-swappable-parameters)
+    volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg));
+    return static_cast<uint64_t>(*ptr);
+}
+
+void write_reg(uint64_t reg_base_addr, RegId reg, uint64_t value) {  // NOLINT(bugprone-easily-swappable-parameters)
     volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg));
 
     __sync_synchronize();

@@ -60,4 +60,33 @@
 #define OUT_OF_ORDER_STORE_BARRIER() __asm__ __volatile__("" ::: "memory")
 #endif
 
+// =============================================================================
+// Polling Acquire Barrier
+// =============================================================================
+
+/**
+ * Polling acquire barrier
+ *
+ * Use after poll_reg() detects the awaited condition (e.g., task completion),
+ * before accessing Normal memory whose correctness depends on the polled value.
+ *
+ * ARM64: dmb ish (data memory barrier, inner shareable, full)
+ *   Ensures the Device-memory register read is ordered before all subsequent
+ *   Normal-memory loads and stores in the completion path.
+ *   Chosen over dmb ishld (load-only) for safety margin: negligible cost
+ *   (executed once per completion, not per poll iteration) and protects
+ *   against future stores that may be added to the completion path.
+ *
+ * x86_64: compiler barrier only (TSO provides implicit acquire on all loads)
+ *
+ * Other: full barrier fallback (__sync_synchronize)
+ */
+#if defined(__aarch64__)
+#define poll_acquire_barrier() __asm__ __volatile__("dmb ish" ::: "memory")
+#elif defined(__x86_64__)
+#define poll_acquire_barrier() __asm__ __volatile__("" ::: "memory")
+#else
+#define poll_acquire_barrier() __sync_synchronize()
+#endif
+
 #endif  // SRC_A5_PLATFORM_INCLUDE_COMMON_MEMORY_BARRIER_H_
