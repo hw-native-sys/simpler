@@ -195,7 +195,7 @@ static bool pto2_append_fanin_or_fail(
     return true;
 }
 
-static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
+static bool scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
 
 struct PTO2OutputLayout {
     uint64_t offsets[MAX_TENSOR_ARGS] = {};
@@ -632,6 +632,23 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
         orch->fatal = true;
         return result;
     }
+
+    // === Validate submit inputs ===
+    uint8_t active_mask = pto2_mixed_kernels_to_active_mask(mixed_kernels);
+    always_assert(active_mask != 0 && "MixedKernels must have at least one active slot");
+
+    int16_t block_num = args.launch_spec.block_num();
+    always_assert(block_num >= 1 && "block_num must be >= 1");
+
+    // Normalize single-AIV tasks: if only aiv1 is set (no aic, no aiv0), move
+    // it to the aiv0 slot. This guarantees the dispatch path can always use
+    // PTO2SubtaskSlot::AIV0 for single-AIV shapes without inspecting active_mask.
+    // Mixed tasks (AIC+AIV) keep their original AIV identity so the correct
+    // hardware channel (AIV0→AIC vs AIV1→AIC) is used at dispatch time.
+    MixedKernels normalized = mixed_kernels;
+    bool has_aic = (active_mask & PTO2_SUBTASK_MASK_AIC) != 0;
+    bool has_aiv0 = (active_mask & PTO2_SUBTASK_MASK_AIV0) != 0;
+    bool has_aiv1 = (active_mask & PTO2_SUBTASK_MASK_AIV1) != 0;
     if (!has_aic && has_aiv1 && !has_aiv0) {
         normalized.aiv0_kernel_id = normalized.aiv1_kernel_id;
         normalized.aiv1_kernel_id = INVALID_KERNEL_ID;
@@ -969,6 +986,9 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
 #endif
     g_orch_submit_idx++;
 #endif
+    if (submitted_task_id != nullptr) {
+        *submitted_task_id = task_id;
+    }
     return result;
 }
 

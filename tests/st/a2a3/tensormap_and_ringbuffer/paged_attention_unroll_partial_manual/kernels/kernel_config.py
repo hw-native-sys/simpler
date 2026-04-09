@@ -37,7 +37,7 @@ KERNELS = [
     {
         "func_id": 4,
         "name": "AIC_HUB",
-        "source": str(_PA_KERNELS / "aic" / "aic_hub.cpp"),
+        "source": str(_ROOT / "aic" / "aic_hub.cpp"),
         "core_type": "aic",
         "signature": [],
     },
@@ -58,7 +58,7 @@ KERNELS = [
     {
         "func_id": 5,
         "name": "AIV_HUB",
-        "source": str(_PA_KERNELS / "aiv" / "aiv_hub.cpp"),
+        "source": str(_ROOT / "aiv" / "aiv_hub.cpp"),
         "core_type": "aiv",
         "signature": [],
     },
