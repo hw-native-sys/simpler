@@ -84,7 +84,6 @@ def _make_shared_tensors():
     return a, b, f, args
 
 
-@pytest.mark.st
 @pytest.mark.platforms(["a2a3sim", "a2a3"])
 @pytest.mark.device_count(1)
 def test_l3_chiptask_subtask(st_platform, st_device_ids):

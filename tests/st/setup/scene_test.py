@@ -9,7 +9,7 @@
 """SceneTestCase framework — unified scene test infrastructure.
 
 ``@scene_test`` decorator + ``SceneTestCase`` base class.
-pytest: ``pytest --platform a2a3sim -m st``
+pytest: ``pytest --platform a2a3sim``
 standalone: ``python test_xxx.py -p a2a3sim``
 
 Supports multiple levels:
@@ -88,14 +88,6 @@ def scene_test(level: int, platforms: list[str], runtime: str):
                     k["source"] = str(cls_dir / k["source"])
                 resolved.append(k)
             cls.KERNELS = resolved
-        try:
-            import pytest  # noqa: PLC0415
-
-            cls = pytest.mark.st(cls)
-            if any(not p.endswith("sim") for p in platforms):
-                cls = pytest.mark.requires_hardware(cls)
-        except ImportError:
-            pass
         return cls
 
     return decorator

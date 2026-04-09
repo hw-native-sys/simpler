@@ -60,7 +60,6 @@ def pytest_addoption(parser):
 
 def pytest_configure(config):
     """Register custom markers."""
-    config.addinivalue_line("markers", "st: scene test (chip compilation + execution)")
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
     config.addinivalue_line("markers", "requires_hardware: test needs Ascend toolchain and real device")
     config.addinivalue_line("markers", "device_count(n): number of NPU devices needed")
@@ -78,13 +77,12 @@ def pytest_collection_modifyitems(session, config, items):
             elif platform not in cls._st_platforms:
                 item.add_marker(pytest.mark.skip(reason=f"{cls.__name__} not supported on {platform}"))
             continue
-        # Standalone @pytest.mark.st function: check platforms marker
-        if item.get_closest_marker("st"):
+        # Standalone function with @pytest.mark.platforms([...])
+        platforms_marker = item.get_closest_marker("platforms")
+        if platforms_marker:
             if not platform:
                 item.add_marker(pytest.mark.skip(reason="ST requires --platform"))
-                continue
-            platforms_marker = item.get_closest_marker("platforms")
-            if platforms_marker and platform not in platforms_marker.args[0]:
+            elif platform not in platforms_marker.args[0]:
                 item.add_marker(pytest.mark.skip(reason=f"Not supported on {platform}"))
 
 
