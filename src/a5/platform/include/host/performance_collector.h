@@ -44,41 +44,37 @@
  * Device memory allocation callback.
  *
  * @param size      Memory size in bytes
- * @param user_data User-provided context pointer
  * @return Allocated device memory pointer, or nullptr on failure
  */
-using PerfAllocCallback = void *(*)(size_t size, void *user_data);
+using PerfAllocCallback = void *(*)(size_t size);
 
 /**
  * Device memory free callback.
  *
  * @param dev_ptr   Device memory pointer
- * @param user_data User-provided context pointer
  * @return 0 on success, error code on failure
  */
-using PerfFreeCallback = int (*)(void *dev_ptr, void *user_data);
+using PerfFreeCallback = int (*)(void *dev_ptr);
 
 /**
- * Host → Device copy callback (rtMemcpy HOST_TO_DEVICE / memcpy in sim).
+ * Host -> Device copy callback (rtMemcpy HOST_TO_DEVICE / memcpy in sim).
  *
  * @param dev_dst   Device destination pointer
  * @param host_src  Host source pointer
  * @param size      Number of bytes to copy
- * @param user_data User-provided context pointer
  * @return 0 on success, error code on failure
  */
-using PerfCopyToDeviceCallback = int (*)(void *dev_dst, const void *host_src, size_t size, void *user_data);
+using PerfCopyToDeviceCallback = int (*)(void *dev_dst, const void *host_src, size_t size);
 
 /**
- * Device → Host copy callback (rtMemcpy DEVICE_TO_HOST / memcpy in sim).
+ * Device -> Host copy callback (rtMemcpy DEVICE_TO_HOST / memcpy in sim).
  *
  * @param host_dst  Host destination pointer
  * @param dev_src   Device source pointer
  * @param size      Number of bytes to copy
- * @param user_data User-provided context pointer
  * @return 0 on success, error code on failure
  */
-using PerfCopyFromDeviceCallback = int (*)(void *host_dst, const void *dev_src, size_t size, void *user_data);
+using PerfCopyFromDeviceCallback = int (*)(void *host_dst, const void *dev_src, size_t size);
 
 /**
  * Host-side performance data collector.
@@ -111,13 +107,12 @@ public:
      * @param alloc_cb         Device memory alloc
      * @param free_cb          Device memory free
      * @param copy_to_dev_cb   Host→device copy (used during init to publish header)
-     * @param copy_from_dev_cb Device→host copy (used during collect_all)
-     * @param user_data        Opaque context passed back to callbacks
+     * @param copy_from_dev_cb Device->host copy (used during collect_all)
      * @return 0 on success, error code on failure
      */
     int initialize(
         Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfFreeCallback free_cb,
-        PerfCopyToDeviceCallback copy_to_dev_cb, PerfCopyFromDeviceCallback copy_from_dev_cb, void *user_data
+        PerfCopyToDeviceCallback copy_to_dev_cb, PerfCopyFromDeviceCallback copy_from_dev_cb
     );
 
     /**
@@ -176,7 +171,6 @@ private:
     PerfFreeCallback free_cb_{nullptr};
     PerfCopyToDeviceCallback copy_to_dev_cb_{nullptr};
     PerfCopyFromDeviceCallback copy_from_dev_cb_{nullptr};
-    void *user_data_{nullptr};
 
     // Host-side collected data (indexed by core / thread)
     std::vector<std::vector<PerfRecord>> collected_perf_records_;

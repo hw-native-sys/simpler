@@ -638,28 +638,28 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
 }
 
 int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, int device_id) {
-    // Device memory allocation via MemoryAllocator
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    // Device memory allocation via rtMalloc directly
+    auto alloc_cb = [](size_t size) -> void * {
+        void *ptr = nullptr;
+        int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
+        return (rc == 0) ? ptr : nullptr;
     };
 
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [](void *dev_ptr) -> int {
+        return rtFree(dev_ptr);
     };
 
-    // Host→device and device→host copies via rtMemcpy
-    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size, void * /*user_data*/) -> int {
+    // Host->device and device->host copies via rtMemcpy
+    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
         return rtMemcpy(dev_dst, size, host_src, size, RT_MEMCPY_HOST_TO_DEVICE);
     };
 
-    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size, void * /*user_data*/) -> int {
+    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
         return rtMemcpy(host_dst, size, dev_src, size, RT_MEMCPY_DEVICE_TO_HOST);
     };
 
     return perf_collector_.initialize(
-        runtime, num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb, &mem_alloc_
+        runtime, num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
     );
 }
 

@@ -609,8 +609,7 @@ int DeviceRunner::finalize() {
 
     // Cleanup performance profiling
     if (perf_collector_.is_initialized()) {
-        auto unregister_cb = [](void *dev_ptr, int device_id, void *user_data) -> int {
-            (void)user_data;
+        auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
             HalHostUnregisterFn fn = get_halHostUnregister();
             if (fn != nullptr) {
                 return fn(dev_ptr, device_id);
@@ -618,12 +617,11 @@ int DeviceRunner::finalize() {
             return 0;
         };
 
-        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-            auto *allocator = static_cast<MemoryAllocator *>(user_data);
-            return allocator->free(dev_ptr);
+        auto free_cb = [](void *dev_ptr) -> int {
+            return rtFree(dev_ptr);
         };
 
-        perf_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+        perf_collector_.finalize(unregister_cb, free_cb);
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
@@ -776,15 +774,15 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
 }
 
 int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, int device_id) {
-    // Define allocation callback (a2a3: use MemoryAllocator)
-    auto alloc_cb = [](size_t size, void *user_data) -> void * {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->alloc(size);
+    // Define allocation callback (a2a3: use rtMalloc directly)
+    auto alloc_cb = [](size_t size) -> void * {
+        void *ptr = nullptr;
+        int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
+        return (rc == 0) ? ptr : nullptr;
     };
 
     // Define registration callback (a2a3: use halHostRegister for shared memory)
-    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void *user_data, void **host_ptr) -> int {
-        (void)user_data;  // Not needed for registration
+    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void **host_ptr) -> int {
         if (load_hal_if_needed() != 0) {
             LOG_ERROR("Failed to load ascend_hal for profiling: %s", dlerror());
             return -1;
@@ -797,18 +795,15 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
         return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
     };
 
-    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
-        auto *allocator = static_cast<MemoryAllocator *>(user_data);
-        return allocator->free(dev_ptr);
+    auto free_cb = [](void *dev_ptr) -> int {
+        return rtFree(dev_ptr);
     };
 
-    auto set_device_cb = [](int device_id, void * /*user_data*/) -> int {
+    auto set_device_cb = [](int device_id) -> int {
         return rtSetDevice(device_id);
     };
 
-    return perf_collector_.initialize(
-        runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, set_device_cb
-    );
+    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, set_device_cb);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
