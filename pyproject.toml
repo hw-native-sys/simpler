@@ -63,6 +63,9 @@ reportAssignmentType = false
 reportOperatorIssue = false
 reportRedeclaration = false
 
+[tool.pytest.ini_options]
+testpaths = ["tests", "examples"]
+
 [tool.scikit-build]
 wheel.packages = []
 cmake.build-type = "Release"

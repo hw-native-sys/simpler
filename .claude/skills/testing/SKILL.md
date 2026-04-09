@@ -7,10 +7,10 @@ description: Testing guide and pre-commit testing strategy for PTO Runtime. Use 
 
 ## Test Types
 
-1. **Python unit tests (pyut)** (`tests/ut/`): Standard pytest tests for the Python compilation pipeline and nanobind bindings. Run with `pytest tests -m "not requires_hardware" -v`. Some tests require hardware (`@pytest.mark.requires_hardware`).
-2. **C++ unit tests (cpput)** (`tests/cpp/`): GoogleTest-based tests for pure C++ modules with no Python binding. Run with `cmake -B tests/cpp/build -S tests/cpp && cmake --build tests/cpp/build && ctest --test-dir tests/cpp/build --output-on-failure`.
+1. **Python unit tests (ut-py)** (`tests/ut/`): Standard pytest tests for the Python compilation pipeline and nanobind bindings. Run with `pytest tests/ut`. Tests declaring `@pytest.mark.requires_hardware[("<platform>")]` auto-skip unless `--platform` points to a matching device.
+2. **C++ unit tests (ut-cpp)** (`tests/ut/cpp/`): GoogleTest-based tests for pure C++ modules. Run with `cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build && ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure`. Hardware-required tests carry a `requires_hardware` or `requires_hardware_<platform>` ctest label and are filtered via `-LE`.
 3. **Simulation examples** (`examples/{arch}/*/`): Small end-to-end examples running on both sim and hardware. No hardware required for sim mode, works on Linux and macOS.
-4. **Device scene tests** (`tests/st/{arch}/*/`): Hardware-only scene tests for large-scale and feature-rich scenarios. Running on real Ascend devices via `a2a3`. Requires CANN toolkit.
+4. **Device scene tests** (`tests/st/{arch}/*/`): Scene tests for large-scale and feature-rich scenarios. Each `@scene_test` class declares its `platforms=[...]` list. Running on real Ascend devices requires the CANN toolkit.
 
 ## Running Tests
 
@@ -32,10 +32,17 @@ Before running tests, determine whether runtime binaries need recompilation:
 
 ```bash
 # Python unit tests (no hardware)
-pytest tests -m "not requires_hardware" -v
+pytest tests/ut
+
+# Python unit tests (a2a3 hardware)
+pytest tests/ut --platform a2a3
 
 # C++ unit tests (no hardware)
-cmake -B tests/cpp/build -S tests/cpp && cmake --build tests/cpp/build && ctest --test-dir tests/cpp/build --output-on-failure
+cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build
+ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
+
+# C++ unit tests (a2a3 hardware)
+ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$" --output-on-failure
 
 # All simulation tests (extract -c and -t from ci.yml)
 ./ci.sh -p a2a3sim -c <commit> -t <timeout>
@@ -92,7 +99,8 @@ Run `git diff --name-only` (or `git diff --cached --name-only` for staged change
 | `src/{arch}/platform/*` | Full (all runtimes) | `./ci.sh -p <platform>` |
 | `src/{arch}/runtime/<rt>/*` | Single runtime | `./ci.sh -p <platform> -r <rt>` |
 | `examples/{arch}/<rt>/<ex>/*` | Single example | `python examples/scripts/run_example.py --build -k <ex>/kernels -g <ex>/golden.py -p <platform>` |
-| `tests/ut/*` or `tests/cpp/*` | Unit tests only | `pytest tests -m "not requires_hardware" -v` and/or `ctest` |
+| `tests/ut/*` (Python) | Python UT only | `pytest tests/ut` (add `--platform <platform>` on a device runner) |
+| `tests/ut/cpp/*` | C++ UT only | `cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build && ctest --test-dir tests/ut/cpp/build -LE requires_hardware` |
 | Mixed (spans multiple categories) | Escalate to the **widest** matching scope | — |
 
 > **Note on `--build`**: When changed paths include `src/{arch}/runtime/` or `src/{arch}/platform/`, always use `--build` for single-example `run_example.py` commands. `ci.sh` uses pre-built binaries from `pip install .`, so runtime C++ changes require re-running `pip install -e .` before `ci.sh`.

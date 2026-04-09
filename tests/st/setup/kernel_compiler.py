@@ -1,0 +1,531 @@
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
+import importlib.util
+import logging
+import os
+import subprocess
+import sys
+import tempfile
+from typing import Optional, Union
+
+import env_manager
+
+from .environment import PROJECT_ROOT
+from .toolchain import (
+    Aarch64GxxToolchain,
+    CCECToolchain,
+    Gxx15Toolchain,
+    GxxToolchain,
+    ToolchainType,
+)
+
+logger = logging.getLogger(__name__)
+
+
+class KernelCompiler:
+    """
+    Compiler for PTO kernels and orchestration functions.
+
+    Public entry points:
+    - compile_incore(): Compile a kernel source file for AICore/AIVector
+    - compile_orchestration(): Compile an orchestration function for a given runtime
+
+    Toolchain selection is determined by C++ via get_incore_compiler() and
+    get_orchestration_compiler() (defined in runtime_compile_info.cpp).
+    Falls back to platform-based logic if the library is not yet loaded.
+
+    Available toolchains:
+    - CCEC: ccec compiler for AICore kernels (real hardware)
+    - HOST_GXX_15: g++-15 for simulation kernels (host execution)
+    - HOST_GXX: g++ for orchestration .so (host dlopen)
+    - AARCH64_GXX: aarch64 cross-compiler for device orchestration
+    """
+
+    def __init__(self, platform: str = "a2a3"):
+        """
+        Initialize KernelCompiler.
+
+        Args:
+            platform: Target platform ("a2a3" or "a2a3sim")
+
+        Raises:
+            ValueError: If platform is unknown
+            EnvironmentError: If ASCEND_HOME_PATH is not set for a2a3 platform
+            FileNotFoundError: If required compiler not found
+        """
+        self.platform = platform
+        self.project_root = PROJECT_ROOT
+
+        # Map platform to architecture directory
+        if platform in ("a2a3", "a2a3sim"):
+            self.platform_dir = self.project_root / "src" / "a2a3" / "platform"
+        elif platform in ("a5", "a5sim"):
+            self.platform_dir = self.project_root / "src" / "a5" / "platform"
+        else:
+            raise ValueError(f"Unknown platform: {platform}")
+
+        # Create toolchain objects based on platform
+        if platform in ("a2a3", "a5"):
+            env_manager.ensure("ASCEND_HOME_PATH")
+            self.ccec = CCECToolchain(platform)
+            self.aarch64 = Aarch64GxxToolchain()
+            self.host_gxx = GxxToolchain()
+        else:
+            self.ccec = None
+            self.aarch64 = None
+            self.host_gxx = GxxToolchain()
+
+        self.gxx15 = Gxx15Toolchain()
+
+    def get_platform_include_dirs(self) -> list[str]:
+        """
+        Get platform-specific include directories for orchestration compilation.
+
+        Returns:
+            List of include directory paths (e.g., for device_runner.h, core_type.h)
+        """
+        return [
+            str(self.platform_dir / "include"),  # For common headers like core_type.h
+        ]
+
+    def get_orchestration_include_dirs(self, runtime_name: str) -> list[str]:
+        """
+        Get all include directories needed for orchestration compilation.
+
+        Combines the runtime-specific directory with platform include directories.
+
+        Args:
+            runtime_name: Name of the runtime (e.g., "host_build_graph")
+
+        Returns:
+            List of include directory paths:
+            [runtime_dir, platform_host_dir, platform_include_dir]
+        """
+        # Map platform to runtime architecture
+        if self.platform in ("a2a3", "a2a3sim"):
+            arch = "a2a3"
+        elif self.platform in ("a5", "a5sim"):
+            arch = "a5"  # Phase 2: A5 uses A5 runtime
+        else:
+            arch = "a2a3"
+
+        runtime_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "runtime")
+        common_dir = str(self.project_root / "src" / "common" / "task_interface")
+        return [runtime_dir, common_dir] + self.get_platform_include_dirs()
+
+    def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
+        """
+        Load the optional "orchestration" section from a runtime's build_config.py.
+
+        If the runtime has an "orchestration" key in its BUILD_CONFIG, returns
+        the resolved include dirs and discovered source files.  Otherwise returns
+        empty lists (backward-compatible for runtimes without the section).
+
+        Args:
+            runtime_name: Name of the runtime (e.g., "tensormap_and_ringbuffer")
+
+        Returns:
+            (include_dirs, source_files) — both as absolute paths, or ([], [])
+        """
+        # Map platform to runtime architecture
+        if self.platform in ("a2a3", "a2a3sim"):
+            arch = "a2a3"
+        elif self.platform in ("a5", "a5sim"):
+            arch = "a5"  # Phase 2: A5 uses A5 runtime
+        else:
+            arch = "a2a3"
+
+        config_path = self.project_root / "src" / arch / "runtime" / runtime_name / "build_config.py"
+        if not config_path.is_file():
+            return [], []
+
+        spec = importlib.util.spec_from_file_location("build_config", str(config_path))
+        if spec is None or spec.loader is None:
+            return [], []
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        build_config = getattr(mod, "BUILD_CONFIG", {})
+
+        orch_cfg = build_config.get("orchestration")
+        if orch_cfg is None:
+            return [], []
+
+        config_dir = config_path.parent
+
+        include_dirs = [str((config_dir / p).resolve()) for p in orch_cfg.get("include_dirs", [])]
+
+        source_files = []
+        for src_dir_rel in orch_cfg.get("source_dirs", []):
+            src_dir = (config_dir / src_dir_rel).resolve()
+            if src_dir.is_dir():
+                for f in sorted(src_dir.iterdir()):
+                    if f.suffix in (".cpp", ".c") and f.is_file():
+                        source_files.append(str(f))
+
+        return include_dirs, source_files
+
+    def _run_subprocess(
+        self, cmd: list[str], label: str, error_hint: str = "Compiler not found"
+    ) -> subprocess.CompletedProcess:
+        """Run a subprocess command with standardized logging and error handling."""
+        logger.debug(f"[{label}] Command: {' '.join(cmd)}")
+        try:
+            result = subprocess.run(cmd, check=False, capture_output=True, text=True)
+
+            if result.stdout and logger.isEnabledFor(10):  # DEBUG = 10
+                logger.debug(f"[{label}] stdout:\n{result.stdout}")
+            if result.stderr and logger.isEnabledFor(10):
+                logger.debug(f"[{label}] stderr:\n{result.stderr}")
+
+            if result.returncode != 0:
+                logger.error(f"[{label}] Compilation failed: {result.stderr}")
+                raise RuntimeError(f"{label} compilation failed with exit code {result.returncode}:\n{result.stderr}")
+
+            return result
+
+        except FileNotFoundError:
+            raise RuntimeError(error_hint)
+
+    def _compile_to_bytes(
+        self,
+        cmd: list[str],
+        output_path: str,
+        label: str,
+        error_hint: str = "Compiler not found",
+        delete_output: bool = True,
+    ) -> bytes:
+        """Run compilation command, read output file, clean up, return bytes.
+
+        Args:
+            cmd: Compilation command and arguments
+            output_path: Path to expected output file
+            label: Label for log messages
+            error_hint: Message for FileNotFoundError
+
+        Returns:
+            Binary contents of the compiled output file
+
+        Raises:
+            RuntimeError: If compilation fails or output file not found
+        """
+        self._run_subprocess(cmd, label, error_hint)
+
+        if not os.path.isfile(output_path):
+            raise RuntimeError(f"Compilation succeeded but output file not found: {output_path}")
+
+        with open(output_path, "rb") as f:
+            binary_data = f.read()
+
+        if delete_output:
+            os.remove(output_path)
+        logger.info(f"[{label}] Compilation {output_path} successful: {len(binary_data)} bytes")
+        return binary_data
+
+    def _get_toolchain(self, toolchain_map: dict) -> ToolchainType:
+        """Get toolchain for the current platform.
+
+        Args:
+            toolchain_map: Dict mapping platform name to ToolchainType
+
+        Returns:
+            ToolchainType for the current platform
+
+        Raises:
+            ValueError: If platform is not in the map
+        """
+        if self.platform not in toolchain_map:
+            raise ValueError(f"No toolchain for platform: {self.platform}")
+        return toolchain_map[self.platform]
+
+    @staticmethod
+    def _make_temp_path(prefix: str, suffix: str, build_dir: Optional[str] = None) -> str:
+        """Create a unique temporary file path in /tmp via mkstemp.
+
+        The file is created atomically to avoid races, then immediately
+        closed so the caller can overwrite it with compiler output.
+        """
+        fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=build_dir or "/tmp")
+        os.close(fd)
+        return path
+
+    def compile_incore(
+        self,
+        source_path: str,
+        core_type: str = "aiv",
+        pto_isa_root: Optional[str] = None,
+        extra_include_dirs: Optional[list[str]] = None,
+        build_dir: Optional[str] = None,
+    ) -> bytes:
+        """
+        Compile a kernel source file. Dispatches based on platform:
+        - a2a3: Uses ccec compiler (requires pto_isa_root)
+        - a2a3sim: Uses compile_incore_sim (g++-15)
+
+        Args:
+            source_path: Path to kernel source file (.cpp)
+            core_type: Core type: "aic" (cube) or "aiv" (vector). Default: "aiv"
+            pto_isa_root: Path to PTO-ISA root directory. Required for a2a3.
+            extra_include_dirs: Additional include directories
+
+        Returns:
+            Binary contents of the compiled .o file
+
+        Raises:
+            FileNotFoundError: If source file or PTO-ISA headers not found
+            ValueError: If pto_isa_root is not provided (for a2a3) or core_type is invalid
+            RuntimeError: If compilation fails
+        """
+        incore_toolchain = self._get_toolchain(
+            {
+                "a2a3": ToolchainType.CCEC,
+                "a2a3sim": ToolchainType.HOST_GXX_15,
+                "a5": ToolchainType.CCEC,  # Phase 1: A5 uses same as A2A3
+                "a5sim": ToolchainType.HOST_GXX_15,  # Phase 1: A5sim uses same as A2A3sim
+            },
+        )
+
+        # Dispatch based on toolchain
+        if incore_toolchain == ToolchainType.HOST_GXX_15:
+            return self._compile_incore_sim(
+                source_path,
+                core_type=core_type,
+                pto_isa_root=pto_isa_root,
+                extra_include_dirs=extra_include_dirs,
+                build_dir=build_dir,
+            )
+
+        # TOOLCHAIN_CCEC: continue with ccec compilation
+        assert self.ccec is not None, "ccec toolchain is only available for hardware platforms"
+        source_path = os.path.abspath(source_path)
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Source file not found: {source_path}")
+
+        if pto_isa_root is None:
+            raise ValueError("pto_isa_root is required for incore compilation")
+
+        pto_include = os.path.join(pto_isa_root, "include")
+        pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
+
+        # Generate output path
+        output_path = self._make_temp_path(
+            prefix=f"{os.path.basename(source_path)}.incore_", suffix=".o", build_dir=build_dir
+        )
+
+        # Build command from toolchain
+        cmd = [self.ccec.cxx_path] + self.ccec.get_compile_flags(core_type=core_type)
+        cmd.extend([f"-I{pto_include}", f"-I{pto_pto_include}"])
+
+        if extra_include_dirs:
+            for inc_dir in extra_include_dirs:
+                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+
+        cmd.extend(["-o", output_path, source_path])
+
+        # Execute compilation
+        core_type_name = "AIV" if core_type == "aiv" else "AIC"
+        logger.info(f"[Incore] Compiling ({core_type_name}): {source_path}")
+        logger.debug(f"  Command: {' '.join(cmd)}")
+
+        return self._compile_to_bytes(
+            cmd,
+            output_path,
+            "Incore",
+            error_hint=f"ccec compiler not found at {self.ccec.cxx_path}",
+            delete_output=build_dir is None,
+        )
+
+    def compile_orchestration(
+        self,
+        runtime_name: str,
+        source_path: str,
+        extra_include_dirs: Optional[list[str]] = None,
+        build_dir: Optional[str] = None,
+    ) -> bytes:
+        """Compile an orchestration function for the given runtime.
+
+        Unified entry point that dispatches to the appropriate compilation
+        strategy based on runtime_name.
+
+        Args:
+            runtime_name: Name of the runtime (e.g., "host_build_graph",
+                         "tensormap_and_ringbuffer", "aicpu_build_graph")
+            source_path: Path to orchestration source file (.cpp)
+            extra_include_dirs: Additional include directories (merged with
+                               the runtime/platform include dirs)
+
+        Returns:
+            Binary contents of the compiled orchestration .so file
+
+        Raises:
+            FileNotFoundError: If source file not found
+            RuntimeError: If compilation fails
+            ValueError: If runtime_name is unknown
+        """
+        include_dirs = self.get_orchestration_include_dirs(runtime_name)
+        if extra_include_dirs:
+            include_dirs = include_dirs + list(extra_include_dirs)
+
+        # Load optional orchestration config for extra sources/includes
+        orch_includes, orch_sources = self._get_orchestration_config(runtime_name)
+        if orch_includes:
+            include_dirs = include_dirs + orch_includes
+
+        # Resolve toolchain: HOST_GXX needs no runtime-specific extras
+        toolchain_type = self._get_toolchain(
+            {
+                "a2a3": ToolchainType.AARCH64_GXX,
+                "a2a3sim": ToolchainType.HOST_GXX,
+                "a5": ToolchainType.AARCH64_GXX,
+                "a5sim": ToolchainType.HOST_GXX,
+            },
+        )
+        toolchain: Union[GxxToolchain, Aarch64GxxToolchain]
+        if toolchain_type == ToolchainType.AARCH64_GXX:
+            assert self.aarch64 is not None, "aarch64 toolchain is only available for hardware platforms"
+            toolchain = self.aarch64
+        else:
+            toolchain = self.host_gxx
+
+        # HOST_GXX: simulation build (host execution)
+        # AARCH64_GXX: cross-compilation for supported runtimes
+        #   Note: orchestration uses ops table via pto_orchestration_api.h (no extra runtime sources needed)
+        return self._compile_orchestration_shared_lib(
+            source_path,
+            toolchain,
+            extra_include_dirs=include_dirs,
+            extra_sources=orch_sources or None,
+            build_dir=build_dir,
+        )
+
+    def _compile_orchestration_shared_lib(
+        self,
+        source_path: str,
+        toolchain: Union[GxxToolchain, Aarch64GxxToolchain],
+        extra_include_dirs: Optional[list[str]] = None,
+        extra_sources: Optional[list[str]] = None,
+        build_dir: Optional[str] = None,
+    ) -> bytes:
+        """Compile an orchestration function to a shared library (.so).
+
+        Prefer the unified compile_orchestration() entry point.
+
+        Args:
+            source_path: Path to orchestration source file (.cpp)
+            toolchain: Resolved toolchain object (GxxToolchain or Aarch64GxxToolchain)
+            extra_include_dirs: Additional include directories
+            extra_sources: Additional source files to compile into the SO
+
+        Returns:
+            Binary contents of the compiled .so file
+        """
+        source_path = os.path.abspath(source_path)
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Source file not found: {source_path}")
+
+        # Generate output path
+        output_path = self._make_temp_path(
+            prefix=f"{os.path.basename(source_path)}.orch_", suffix=".so", build_dir=build_dir
+        )
+
+        cmd = [toolchain.cxx_path] + toolchain.get_compile_flags()
+
+        if extra_sources:
+            for src in extra_sources:
+                src = os.path.abspath(src)
+                if os.path.isfile(src):
+                    cmd.append(src)
+                    logger.debug(f"  Including extra source: {os.path.basename(src)}")
+
+        # On macOS, allow undefined symbols to be resolved at dlopen time
+        if sys.platform == "darwin":
+            cmd.append("-undefined")
+            cmd.append("dynamic_lookup")
+
+        # Add include dirs
+        if extra_include_dirs:
+            for inc_dir in extra_include_dirs:
+                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+
+        # Output and input
+        cmd.extend(["-o", output_path, source_path])
+
+        # Log compilation command
+        logger.info(f"[Orchestration] Compiling: {source_path}")
+        logger.debug(f"  Command: {' '.join(cmd)}")
+
+        return self._compile_to_bytes(
+            cmd,
+            output_path,
+            "Orchestration",
+            error_hint=f"{toolchain.cxx_path} not found. Please install it.",
+            delete_output=build_dir is None,
+        )
+
+    def _compile_incore_sim(
+        self,
+        source_path: str,
+        *,
+        core_type: str,
+        pto_isa_root: Optional[str] = None,
+        extra_include_dirs: Optional[list[str]] = None,
+        build_dir: Optional[str] = None,
+    ) -> bytes:
+        """
+        Compile a simulation kernel to .so/.dylib using g++-15.
+
+        Args:
+            source_path: Path to kernel source file (.cpp)
+            core_type: Core type: "aic" (cube) or "aiv" (vector).
+            pto_isa_root: Path to PTO-ISA root directory (for PTO ISA headers)
+            extra_include_dirs: Additional include directories
+
+        Returns:
+            Binary contents of the compiled .so/.dylib file
+
+        Raises:
+            FileNotFoundError: If source file not found
+            RuntimeError: If compilation fails
+        """
+        source_path = os.path.abspath(source_path)
+        if not os.path.isfile(source_path):
+            raise FileNotFoundError(f"Source file not found: {source_path}")
+
+        # Generate output path (use platform-appropriate extension)
+        ext = ".dylib" if sys.platform == "darwin" else ".so"
+        output_path = self._make_temp_path(
+            prefix=f"{os.path.basename(source_path)}.sim_", suffix=ext, build_dir=build_dir
+        )
+
+        # Build command from toolchain
+        cmd = [self.gxx15.cxx_path] + self.gxx15.get_compile_flags(core_type=core_type)
+
+        # Add PTO ISA header paths if provided
+        if pto_isa_root:
+            pto_include = os.path.join(pto_isa_root, "include")
+            pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
+            cmd.extend([f"-I{pto_include}", f"-I{pto_pto_include}"])
+
+        # Add extra include directories if provided
+        if extra_include_dirs:
+            for inc_dir in extra_include_dirs:
+                cmd.append(f"-I{os.path.abspath(inc_dir)}")
+
+        cmd.extend(["-o", output_path, source_path])
+
+        # Log compilation command
+        logger.info(f"[SimKernel] Compiling: {source_path}")
+        logger.debug(f"  Command: {' '.join(cmd)}")
+
+        return self._compile_to_bytes(
+            cmd,
+            output_path,
+            "SimKernel",
+            error_hint=f"{self.gxx15.cxx_path} not found. Please install g++-15.",
+            delete_output=build_dir is None,
+        )

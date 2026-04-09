@@ -310,7 +310,7 @@ class Worker:
             host_lib_path = str(binaries.host_path)
             aicpu_path = str(binaries.aicpu_path)
             aicore_path = str(binaries.aicore_path)
-            sim_ctx_path = str(binaries.sim_context_path) if hasattr(binaries, "sim_context_path") else ""
+            sim_ctx_path = str(binaries.sim_context_path) if getattr(binaries, "sim_context_path", None) else ""
 
             for dev_id in device_ids:
                 shm = SharedMemory(create=True, size=DIST_CHIP_MAILBOX_SIZE)

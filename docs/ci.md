@@ -8,17 +8,18 @@ Design principles:
 
 1. **Separate jobs per test category** — st, ut-py, and ut-cpp run as independent jobs for parallelism and clear dashboard visibility.
 2. **Runner matches hardware tier** — no-hardware tests run on `ubuntu-latest`; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
-3. **sim vs onboard for st** — scene tests split into sim jobs (github-hosted, `ci.py -p a2a3sim`) and onboard jobs (self-hosted, `ci.py -p a2a3`).
+3. **`--platform` is the only filter** — pytest uses `--platform` + the `requires_hardware` marker; ctest uses label `-LE` exclusion. No `-m st`, no `-m "not requires_hardware"`.
+4. **sim = no hardware** — `a2a3sim`/`a5sim` jobs run on github-hosted runners alongside unit tests.
 
 ## Full Job Matrix
 
 The complete test-type × hardware-tier matrix. Empty cells have no tests yet; only non-empty jobs exist in `ci.yml`.
 
-| Category | github-hosted | a2a3 runner | a5 runner |
-| -------- | ------------- | ----------- | --------- |
+| Category | github-hosted (no hardware) | a2a3 runner | a5 runner |
+| -------- | --------------------------- | ----------- | --------- |
 | **ut-py** | `ut-py` | `ut-py-a2a3` | `ut-py-a5` |
-| **ut-cpp** | *(empty)* | *(empty)* | *(empty)* |
-| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3` | `st-onboard-a5` |
+| **ut-cpp** | `ut-cpp` | `ut-cpp-a2a3` | `ut-cpp-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-a2a3` | `st-a5` |
 
 ## GitHub Actions Jobs
 
@@ -27,29 +28,35 @@ Currently active jobs (a5 jobs commented out — no runner yet):
 ```text
 PullRequest
   ├── ut-py                (ubuntu-latest)
+  ├── ut-cpp               (ubuntu-latest)
   ├── st-sim-a2a3          (ubuntu + macOS)
   ├── st-sim-a5            (ubuntu + macOS)
   ├── ut-py-a2a3           (a2a3 self-hosted)
-  ├── st-onboard-a2a3      (a2a3 self-hosted)
+  ├── ut-cpp-a2a3          (a2a3 self-hosted)
+  ├── st-a2a3              (a2a3 self-hosted)
   ├── ut-py-a5             (a5 self-hosted, commented out)
-  └── st-onboard-a5        (a5 self-hosted, commented out)
+  ├── ut-cpp-a5            (a5 self-hosted, commented out)
+  └── st-a5                (a5 self-hosted, commented out)
 ```
 
 | Job | Runner | What it runs |
 | --- | ------ | ------------ |
-| `ut-py` | `ubuntu-latest` | `pytest tests -m "not requires_hardware" -v` |
-| `st-sim-a2a3` | `ubuntu-latest`, `macos-latest` | `ci.py -p a2a3sim` |
-| `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `ci.py -p a5sim` |
-| `ut-py-a2a3` | a2a3 self-hosted | `pytest tests -m requires_hardware --platform a2a3 -v` |
-| `st-onboard-a2a3` | a2a3 self-hosted | `ci.py -p a2a3 -d ...` |
-| `ut-py-a5` | a5 self-hosted | `pytest tests -m requires_hardware --platform a5 -v` |
-| `st-onboard-a5` | a5 self-hosted | `ci.py -p a5 -d ...` |
+| `ut-py` | `ubuntu-latest` | `pytest tests/ut` |
+| `ut-cpp` | `ubuntu-latest` | `ctest --test-dir tests/ut/cpp/build -LE requires_hardware` |
+| `st-sim-a2a3` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a2a3sim` + `ci.py -p a2a3sim` |
+| `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a5sim` + `ci.py -p a5sim` |
+| `ut-py-a2a3` | a2a3 self-hosted | `pytest tests/ut --platform a2a3` |
+| `ut-cpp-a2a3` | a2a3 self-hosted | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$"` |
+| `st-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3` + `ci.py -p a2a3 -d ...` |
+| `ut-py-a5` | a5 self-hosted | `pytest tests/ut --platform a5` |
+| `ut-cpp-a5` | a5 self-hosted | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a5)?$"` |
+| `st-a5` | a5 self-hosted | `pytest examples tests/st --platform a5` + `ci.py -p a5 -d ...` |
 
 ### Scheduling constraints
 
 - Sim scene tests and no-hardware unit tests run on github-hosted runners (no hardware).
-- `a2a3` tests (st + ut-py) only run on the `a2a3` self-hosted machine.
-- `a5` tests (st + ut-py) only run on the `a5` self-hosted machine.
+- `a2a3` tests (st + ut-py + ut-cpp) only run on the `a2a3` self-hosted machine.
+- `a5` tests (st + ut-py + ut-cpp) only run on the `a5` self-hosted machine.
 
 ## Hardware Classification
 
@@ -57,15 +64,15 @@ Three hardware tiers, applied to all test categories. See [testing.md](testing.m
 
 | Tier | CI Runner | Job examples |
 | ---- | --------- | ------------ |
-| No hardware | `ubuntu-latest` | `ut-py`, `st-sim-*` |
-| Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-py-a2a3`, `st-onboard-a2a3` |
-| Platform-specific (a5) | `[self-hosted, a5]` | `ut-py-a5`, `st-onboard-a5` |
+| No hardware | `ubuntu-latest` | `ut-py`, `ut-cpp`, `st-sim-*` |
+| Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-py-a2a3`, `ut-cpp-a2a3`, `st-a2a3` |
+| Platform-specific (a5) | `[self-hosted, a5]` | `ut-py-a5`, `ut-cpp-a5`, `st-a5` |
 
 ## Test Sources
 
-### `tests/ut/` — Python unit tests (pyut)
+### `tests/ut/` — Python unit tests (ut-py)
 
-Python unit tests. Run via pytest with marker filtering.
+Python unit tests. Run via pytest, filtered by `--platform` + `requires_hardware` marker.
 
 | File | Content | Hardware? |
 | ---- | ------- | --------- |
@@ -73,13 +80,23 @@ Python unit tests. Run via pytest with marker filtering.
 | `test_runtime_builder.py` (mocked classes) | RuntimeBuilder discovery, error handling, build logic | No |
 | `test_runtime_builder.py::TestRuntimeBuilderIntegration` | Real compilation across platform × runtime | Yes (`@pytest.mark.requires_hardware`) |
 
+### `tests/ut/cpp/` — C++ unit tests (ut-cpp)
+
+GoogleTest-based tests for pure C++ modules. Run via ctest, filtered by label `-LE` exclusion.
+
+| Runner | Command |
+| ------ | ------- |
+| No hardware | `ctest --test-dir tests/ut/cpp/build -LE requires_hardware` |
+| a2a3 | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$"` |
+| a5 | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a5)?$"` |
+
 ### `examples/` — Small examples (sim + onboard)
 
-Small, fast examples that run on both simulation and real hardware. Organized as `examples/{arch}/{runtime}/{name}/`. Discovered and executed by `ci.py`.
+Small, fast examples that run on both simulation and real hardware. Organized as `examples/{arch}/{runtime}/{name}/`. Discovered and executed by `ci.py` (legacy golden.py format) or pytest (`@scene_test` format).
 
-### `tests/st/` — Scene tests (onboard only)
+### `tests/st/` — Scene tests (onboard-biased)
 
-Large-scale, feature-rich hardware tests. Too slow or using instructions unsupported by the simulator. Organized as `tests/st/{arch}/{runtime}/{name}/`. Discovered and executed by `ci.py` only when the platform is not sim.
+Large-scale, feature-rich hardware tests. Too slow or using instructions unsupported by the simulator. Organized as `tests/st/{arch}/{runtime}/{name}/`. Platform compatibility is declared per test via `@scene_test(platforms=[...])`.
 
 ### Shared structure
 
@@ -95,29 +112,66 @@ Both `examples/` and `tests/st/` cases follow the same layout:
     aiv/*.cpp                    # optional
 ```
 
-A case is discoverable when both `golden.py` and `kernels/kernel_config.py` exist.
+A legacy case is discoverable by `ci.py` when both `golden.py` and `kernels/kernel_config.py` exist. `@scene_test` cases are discovered by pytest via `test_*.py` files.
 
-## Marker Scheme
+## Selection Scheme
 
-A single pytest marker controls hardware/non-hardware splitting:
+A single `--platform` flag controls hardware/non-hardware splitting across all three categories.
+
+### ut-py (pytest marker)
 
 ```python
-@pytest.mark.requires_hardware
+@pytest.mark.requires_hardware                  # any hardware
 class TestRuntimeBuilderIntegration:
+    ...
+
+@pytest.mark.requires_hardware("a2a3")          # a2a3 specifically
+class TestA2A3Feature:
     ...
 ```
 
 Selection:
 
 ```bash
-# Non-hardware tests (github-hosted)
-pytest tests -m "not requires_hardware" -v
+# No hardware (no-hw tests run, requires_hardware tests skip)
+pytest tests/ut
 
-# Hardware integration tests (device runner)
-pytest tests -m requires_hardware --platform a2a3 -v
+# Hardware (no-hw tests skip, hw + platform-specific tests run)
+pytest tests/ut --platform a2a3
 ```
 
-Tests without the marker are assumed to need no hardware.
+### ut-cpp (ctest label)
+
+```cmake
+# any hardware
+set_tests_properties(test_runtime_integration PROPERTIES LABELS "requires_hardware")
+# a2a3-specific
+set_tests_properties(test_a2a3_feature PROPERTIES LABELS "requires_hardware_a2a3")
+```
+
+Selection uses `-LE` (label exclude) on no-hw runner and `-L` (label include) on device runners:
+
+```bash
+ctest -LE requires_hardware                 # no-hardware runner: only unlabeled
+ctest -L "^requires_hardware(_a2a3)?$"      # a2a3 runner: hw + a2a3-specific
+ctest -L "^requires_hardware(_a5)?$"        # a5 runner: hw + a5-specific
+```
+
+### st (`@scene_test`)
+
+```python
+@scene_test(level=2, platforms=["a2a3sim", "a2a3"], runtime="tensormap_and_ringbuffer")
+class TestVectorExample(SceneTestCase):
+    ...
+```
+
+| `--platform` | Behavior |
+| ------------ | -------- |
+| `a2a3sim` | Run if `"a2a3sim"` in `platforms` |
+| `a2a3` | Run if `"a2a3"` in `platforms` |
+| *(none)* | Auto-parametrize over all `*sim` entries in `platforms` |
+
+No `--platform` means "run all sims" — tests with no sim in their `platforms` list are skipped. No additional markers are used.
 
 ## Discovery Layer (`tools/test_catalog.py`)
 
@@ -143,9 +197,9 @@ python tools/test_catalog.py cases --platform a2a3sim --source example
 python tools/test_catalog.py cases --platform a2a3 --source st --format json
 ```
 
-## `ci.py` — Scene Test Runner
+## `ci.py` — Scene Test Runner (Legacy)
 
-`ci.py` handles scene test execution (examples + st). It does **not** run pytest tests — those are invoked directly by the CI workflow.
+`ci.py` handles scene test execution for golden.py-based tests (examples + st). New tests should use `@scene_test` and run via pytest. `ci.py` is retained for backward compatibility during the migration.
 
 ### Key features
 

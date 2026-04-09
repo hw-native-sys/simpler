@@ -16,9 +16,6 @@ import pytest
 
 PROJECT_ROOT = Path(__file__).parent.parent
 
-# ST files do module-level kernel compilation requiring g++/compiler toolchain.
-# Exclude from default pytest collection; run ST via: python tests/st/<test>.py
-collect_ignore_glob = ["st/*"]
 
 # Make tools/ importable so we can use the shared discovery module
 _tools_dir = str(PROJECT_ROOT / "tools")
@@ -30,21 +27,6 @@ from test_catalog import (  # noqa: E402
     discover_platforms,
     discover_runtimes_for_arch,
 )
-
-
-def pytest_configure(config):
-    """Register custom markers."""
-    config.addinivalue_line("markers", "requires_hardware: test needs Ascend toolchain and real device")
-
-
-def pytest_addoption(parser):
-    """Add custom command-line options for pytest."""
-    parser.addoption(
-        "--platform",
-        action="store",
-        default=None,
-        help="Platform to test (e.g., a2a3sim, a5sim). If not specified, tests all platforms.",
-    )
 
 
 @pytest.fixture

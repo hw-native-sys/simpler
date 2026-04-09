@@ -6,15 +6,21 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Conftest for scene tests (tests/st/).
+"""Scene test setup — compilation toolchain, test framework, and platform discovery."""
 
-Adds tests/st/ and python/ to sys.path so setup package and task_interface are importable.
-"""
+from .elf_parser import extract_text_section
+from .kernel_compiler import KernelCompiler
+from .platform_info import parse_platform
+from .pto_isa import ensure_pto_isa_root
+from .runtime_builder import RuntimeBuilder
+from .scene_test import SceneTestCase, scene_test
 
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).parent.parent.parent
-for _d in [str(Path(__file__).parent), str(_ROOT / "python")]:
-    if _d not in sys.path:
-        sys.path.insert(0, _d)
+__all__ = [
+    "KernelCompiler",
+    "RuntimeBuilder",
+    "SceneTestCase",
+    "ensure_pto_isa_root",
+    "extract_text_section",
+    "parse_platform",
+    "scene_test",
+]
