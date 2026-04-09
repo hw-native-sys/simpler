@@ -365,6 +365,13 @@ public:
      */
     int ensure_device_set(int device_id);
 
+    /**
+     * Reset per-thread CANN device context and clear cached streams.
+     * Called after each run_runtime() completes so the next run on a
+     * fresh thread can recreate streams in its own context.
+     */
+    void reset_device_context();
+
 private:
     // Internal state
     int device_id_{-1};

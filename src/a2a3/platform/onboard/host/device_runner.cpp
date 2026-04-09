@@ -230,7 +230,6 @@ std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     return std::thread([dev_id, fn = std::move(fn)]() {
         rtSetDevice(dev_id);
         fn();
-        rtDeviceReset(dev_id);
     });
 }
 
@@ -248,19 +247,19 @@ int DeviceRunner::ensure_device_initialized(
 }
 
 int DeviceRunner::ensure_device_set(int device_id) {
-    // Check if already initialized
-    if (stream_aicpu_ != nullptr) {
-        return 0;
-    }
-
-    device_id_ = device_id;
-
-    // Set device
+    // Always set device for the calling thread (CANN device context is per-thread)
     int rc = rtSetDevice(device_id);
     if (rc != 0) {
         LOG_ERROR("rtSetDevice(%d) failed: %d", device_id, rc);
         return rc;
     }
+
+    // Create streams only on first call
+    if (stream_aicpu_ != nullptr) {
+        return 0;
+    }
+
+    device_id_ = device_id;
 
     // Create streams
     rc = rtStreamCreate(&stream_aicpu_, 0);
@@ -279,6 +278,19 @@ int DeviceRunner::ensure_device_set(int device_id) {
 
     LOG_INFO("DeviceRunner: device=%d set, streams created", device_id);
     return 0;
+}
+
+void DeviceRunner::reset_device_context() {
+    // Destroy streams (they belong to the current thread's CANN context)
+    if (stream_aicpu_ != nullptr) {
+        rtStreamDestroy(stream_aicpu_);
+        stream_aicpu_ = nullptr;
+    }
+    if (stream_aicore_ != nullptr) {
+        rtStreamDestroy(stream_aicore_);
+        stream_aicore_ = nullptr;
+    }
+    rtDeviceReset(device_id_);
 }
 
 int DeviceRunner::ensure_binaries_loaded(
