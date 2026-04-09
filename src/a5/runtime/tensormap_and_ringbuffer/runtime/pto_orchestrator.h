@@ -191,8 +191,6 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
  */
 TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args);
 
-Tensor pto2_alloc_tensor(PTO2OrchestratorState *orch, const TensorCreateInfo &create_info);
-
 // =============================================================================
 // Flow Control
 // =============================================================================

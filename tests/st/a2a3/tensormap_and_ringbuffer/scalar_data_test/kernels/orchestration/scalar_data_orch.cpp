@@ -100,7 +100,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     uint32_t scalar_shapes[1] = {1};
     TensorCreateInfo scalar_ci(scalar_shapes, 1, DataType::FLOAT32);
     scalar_ci.set_initial_value(77.0f);
-    Tensor scalar_tensor = alloc_tensor(scalar_ci);
+    TaskOutputTensors scalar_alloc_outs = alloc_tensors(scalar_ci);
+    const Tensor &scalar_tensor = scalar_alloc_outs.get_ref(0);
 
     // =========================================================
     // Step 5: get_tensor_data(scalar_tensor, {0}) → check[2]
@@ -163,7 +164,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     //   Orchestration writes d[0]=10.0 via set_tensor_data, then
     //   kernel_add reads d as input: e[0] = d[0] + a[0] = 12.0
     // =========================================================
-    Tensor d = alloc_tensor(inter_ci);
+    TaskOutputTensors d_alloc_outs = alloc_tensors(inter_ci);
+    const Tensor &d = d_alloc_outs.get_ref(0);
 
     idx[0] = 0;
     set_tensor_data(d, 1, idx, 10.0f);

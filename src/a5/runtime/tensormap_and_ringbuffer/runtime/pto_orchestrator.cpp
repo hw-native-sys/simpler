@@ -204,7 +204,6 @@ struct PTO2OutputLayout {
 };
 
 struct PTO2PreparedTask {
-    uint8_t ring_id = 0;
     PTO2SchedulerState *sched = nullptr;
     PTO2TaskId task_id = PTO2TaskId::invalid();
     PTO2TaskAllocResult alloc_result = {-1, 0, nullptr, nullptr};
@@ -278,10 +277,10 @@ static void pto2_prefetch_payload(PTO2TaskPayload *payload, int32_t tensor_count
 static bool pto2_prepare_task(
     PTO2OrchestratorState *orch, const Arg &args, int32_t total_output_size, uint8_t active_mask, PTO2PreparedTask *out
 ) {
-    out->ring_id = orch->current_ring_id();
-    auto &allocator = orch->rings[out->ring_id].task_allocator;
+    uint8_t ring_id = orch->current_ring_id();
+    auto &allocator = orch->rings[ring_id].task_allocator;
 
-    if (!pto2_check_scope_can_accept_task(orch, allocator, out->ring_id)) {
+    if (!pto2_check_scope_can_accept_task(orch, allocator, ring_id)) {
         return false;
     }
 
@@ -292,14 +291,14 @@ static bool pto2_prepare_task(
         return false;
     }
 
-    out->task_id = PTO2TaskId::make(out->ring_id, static_cast<uint32_t>(out->alloc_result.task_id));
+    out->task_id = PTO2TaskId::make(ring_id, static_cast<uint32_t>(out->alloc_result.task_id));
     out->task = &allocator.task_by_slot(out->alloc_result.slot);
-    out->payload = &orch->sm_handle->task_payloads[out->ring_id][out->alloc_result.slot];
+    out->payload = &orch->sm_handle->task_payloads[ring_id][out->alloc_result.slot];
 
     pto2_prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
 
     if (out->sched) {
-        auto &rs = out->sched->ring_sched_states[out->ring_id];
+        auto &rs = out->sched->ring_sched_states[ring_id];
         out->slot_state = &rs.get_slot_state_by_slot(out->alloc_result.slot);
         PTO2TaskSlotState &slot_state = *out->slot_state;
         slot_state.fanin_count = 0;
@@ -312,7 +311,7 @@ static bool pto2_prepare_task(
         slot_state.task = out->task;
         slot_state.active_mask = active_mask;
         slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
-        slot_state.ring_id = out->ring_id;
+        slot_state.ring_id = ring_id;
         scope_tasks_push(orch, &slot_state);
     } else {
         scope_tasks_push(orch, nullptr);
@@ -869,9 +868,12 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
 
     PTO2OutputLayout layout = pto2_calculate_output_layout(args);
     PTO2PreparedTask prepared;
-    always_assert(pto2_prepare_task(orch, args, layout.total_output_size, 0, &prepared) && "alloc_tensor failed");
+    if (!pto2_prepare_task(orch, args, layout.total_output_size, 0, &prepared)) {
+        return TaskOutputTensors{};
+    }
 
-    PTO2RingFlowControl &fc = orch->sm_handle->header->rings[prepared.ring_id].fc;
+    uint8_t ring_id = prepared.task_id.ring();
+    PTO2RingFlowControl &fc = orch->sm_handle->header->rings[ring_id].fc;
     PTO2TaskDescriptor &task = *prepared.task;
     PTO2TaskPayload *payload = prepared.payload;
 
@@ -885,9 +887,9 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
 #endif
 
     int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
-    orch->tensor_map.sync_tensormap(prepared.ring_id, sm_last_task_alive);
+    orch->tensor_map.sync_tensormap(ring_id, sm_last_task_alive);
     if (prepared.sched != nullptr) {
-        orch->rings[prepared.ring_id].dep_pool.reclaim(*prepared.sched, prepared.ring_id, sm_last_task_alive);
+        orch->rings[ring_id].dep_pool.reclaim(*prepared.sched, ring_id, sm_last_task_alive);
     }
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, prepared.task_id.raw);
 
@@ -910,12 +912,15 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, prepared.task_id.raw);
 
     if (prepared.slot_state != nullptr) {
-        prepared.slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
-        prepared.slot_state->completed_subtasks.store(0, std::memory_order_relaxed);
-        prepared.slot_state->total_required_subtasks = 0;
-        prepared.slot_state->block_num = 0;
-        prepared.slot_state->next_block_idx = 0;
-        prepared.sched->on_mixed_task_complete(*prepared.slot_state);
+        // Hidden alloc tasks complete inline in the orchestrator before any
+        // consumer can exist, so they have no fanout to notify and no worker
+        // subtasks to retire. Running the full on_mixed_task_complete path
+        // would only pay unnecessary fanout_lock / traversal overhead here.
+        // The generic slot initialization done in pto2_prepare_task() is still
+        // required so scope_end can release the producer-side reference and
+        // drive the slot to CONSUMED, but worker dispatch fields are never
+        // observed for hidden alloc tasks.
+        prepared.slot_state->task_state.store(PTO2_TASK_COMPLETED, std::memory_order_release);
     }
     orch->inline_completed_tasks++;
 
@@ -930,14 +935,6 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
 #endif
 
     return outputs;
-}
-
-Tensor pto2_alloc_tensor(PTO2OrchestratorState *orch, const TensorCreateInfo &create_info) {
-    Arg args;
-    args.add_output(create_info);
-    always_assert(!args.has_error && "alloc_tensor failed to construct output-only Arg");
-    TaskOutputTensors outputs = pto2_alloc_tensors(orch, args);
-    return outputs.get_ref(0);
 }
 
 // =============================================================================

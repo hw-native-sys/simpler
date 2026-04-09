@@ -180,29 +180,6 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
     return alloc_tensors(args);
 }
 
-static inline Tensor alloc_tensor(const TensorCreateInfo &create_info) {
-    Arg args;
-    args.add_output(create_info);
-    always_assert(!args.has_error && "alloc_tensor failed to construct output-only Arg");
-    TaskOutputTensors outputs = alloc_tensors(args);
-    return outputs.get_ref(0);
-}
-
-static inline Tensor
-alloc_tensor(const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false) {
-    TensorCreateInfo ci(shapes, ndims, dtype, manual_dep);
-    return alloc_tensor(ci);
-}
-
-template <typename T>
-static inline Tensor alloc_tensor_fill(
-    const uint32_t shapes[], uint32_t ndims, T init_value, DataType dtype = DataType::FLOAT32, bool manual_dep = false
-) {
-    TensorCreateInfo ci(shapes, ndims, dtype, manual_dep);
-    ci.set_initial_value(init_value);
-    return alloc_tensor(ci);
-}
-
 static inline TaskOutputTensors pto2_rt_submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
     PTO2Runtime *rt = pto2_current_runtime();
     return rt->ops->submit_task(rt, mixed_kernels, args);
