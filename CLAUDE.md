@@ -5,7 +5,7 @@ See [docs/developer-guide.md](docs/developer-guide.md) for full directory struct
 ## Directory Ownership
 
 | Role | Working directory |
-|------|-------------------|
+| ---- | ----------------- |
 | Platform Developer | `src/{arch}/platform/` |
 | Runtime Developer | `src/{arch}/runtime/` |
 | Codegen Developer | `examples/` |
@@ -14,7 +14,18 @@ See [docs/developer-guide.md](docs/developer-guide.md) for full directory struct
 
 See [docs/testing.md](docs/testing.md) for the full testing guide (st, pyut, cpput) and [docs/ci.md](docs/ci.md) for CI pipeline details.
 
+### Python environment
+
+This repo requires `pip install .` to run. **Always use a project-local venv created with `--system-site-packages`** — never install into the user/global site. Applies equally to git worktrees (create `.venv` inside the worktree). See [.claude/rules/venv-isolation.md](.claude/rules/venv-isolation.md).
+
+```bash
+python3 -m venv --system-site-packages .venv
+source .venv/bin/activate
+pip install .
+```
+
 ### Format C++ code
+
 ```bash
 clang-format -i <file>
 ```
