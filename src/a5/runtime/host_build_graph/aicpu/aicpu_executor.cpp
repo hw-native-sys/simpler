@@ -120,7 +120,7 @@ struct AicpuExecutor {
 
     inline bool try_dispatch_task(
         int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head,
-        int &ready_count
+        int &ready_count, bool profiling_enabled
     );
 };
 
@@ -145,7 +145,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
                     cur_aic_tail = (cur_aic_tail + 1) % MAX_CORES_PER_THREAD;
                     cur_aic_ready_count++;
                 } else {
-                    std::lock_guard<std::mutex> lock(ready_queue_aic_mutex_);
+                    std::scoped_lock lock(ready_queue_aic_mutex_);
                     ready_queue_aic_[ready_queue_aic_tail_] = dep_id;
                     ready_queue_aic_tail_ = (ready_queue_aic_tail_ + 1) % RUNTIME_MAX_TASKS;
                     ready_count_aic_.fetch_add(1, std::memory_order_release);
@@ -156,7 +156,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
                     cur_aiv_tail = (cur_aiv_tail + 1) % MAX_CORES_PER_THREAD;
                     cur_aiv_ready_count++;
                 } else {
-                    std::lock_guard<std::mutex> lock(ready_queue_aiv_mutex_);
+                    std::scoped_lock lock(ready_queue_aiv_mutex_);
                     ready_queue_aiv_[ready_queue_aiv_tail_] = dep_id;
                     ready_queue_aiv_tail_ = (ready_queue_aiv_tail_ + 1) % RUNTIME_MAX_TASKS;
                     ready_count_aiv_.fetch_add(1, std::memory_order_release);
@@ -168,7 +168,8 @@ inline void AicpuExecutor::resolve_task_dependencies(
 
 // Try to dispatch a task from thread-local queue to a core
 inline bool AicpuExecutor::try_dispatch_task(
-    int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head, int &ready_count
+    int core_id, uint64_t reg_addr, CoreType core_type, int thread_idx, int *local_queue, int &head, int &ready_count,
+    bool profiling_enabled
 ) {
     if (ready_count <= 0) {
         return false;
@@ -187,6 +188,11 @@ inline bool AicpuExecutor::try_dispatch_task(
 
     // Set state before writing register to avoid race with AICore ACK
     pending_task_ids_[core_id] = task_id;
+
+    // Record the real AICPU dispatch point for this core.
+    if (profiling_enabled) {
+        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+    }
 
     write_reg(reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(task_id));
 
@@ -660,12 +666,12 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                     dispatched = try_dispatch_task(
                         core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                        cur_aic_ready_count
+                        cur_aic_ready_count, profiling_enabled
                     );
                 } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
                     dispatched = try_dispatch_task(
                         core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                        cur_aiv_ready_count
+                        cur_aiv_ready_count, profiling_enabled
                     );
                 }
 
@@ -789,12 +795,12 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                         dispatched = try_dispatch_task(
                             core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                            cur_aic_ready_count
+                            cur_aic_ready_count, profiling_enabled
                         );
                     } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
                         dispatched = try_dispatch_task(
                             core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                            cur_aiv_ready_count
+                            cur_aiv_ready_count, profiling_enabled
                         );
                     }
                 }
@@ -818,14 +824,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                     if (try_dispatch_task(
                             core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                            cur_aic_ready_count
+                            cur_aic_ready_count, profiling_enabled
                         )) {
                         made_progress = true;
                     }
                 } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
                     if (try_dispatch_task(
                             core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                            cur_aiv_ready_count
+                            cur_aiv_ready_count, profiling_enabled
                         )) {
                         made_progress = true;
                     }
@@ -836,7 +842,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
         // Refill local queues from shared queues
         if (cur_aic_ready_count == 0) {
             if (ready_count_aic_.load(std::memory_order_acquire) > 0) {
-                std::lock_guard<std::mutex> lock(ready_queue_aic_mutex_);
+                std::scoped_lock lock(ready_queue_aic_mutex_);
                 int available = ready_count_aic_.load(std::memory_order_relaxed);
                 int to_grab = (available < aic_per_thread_) ? available : aic_per_thread_;
 
@@ -857,7 +863,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
         if (cur_aiv_ready_count == 0) {
             if (ready_count_aiv_.load(std::memory_order_acquire) > 0) {
-                std::lock_guard<std::mutex> lock(ready_queue_aiv_mutex_);
+                std::scoped_lock lock(ready_queue_aiv_mutex_);
                 int available = ready_count_aiv_.load(std::memory_order_relaxed);
                 int to_grab = (available < aiv_per_thread_) ? available : aiv_per_thread_;
 

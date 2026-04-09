@@ -45,20 +45,20 @@ except ImportError:
 
 
 def _func_id_to_letter(func_id):
-    """Map a non-negative integer func_id to a base-26 letter label.
+    """Map a non-negative integer func_id to a numeric+letter label.
 
-    0 → 'a', 1 → 'b', …, 25 → 'z', 26 → 'aa', 27 → 'ab', …
+    0 → '0_a', 1 → '1_b', …, 25 → '25_z', 26 → '26_aa', 27 → '27_ab', …
     """
     try:
         n = int(func_id)
     except (TypeError, ValueError):
         return str(func_id)
     letters = []
-    n += 1  # shift so that 0 maps to 'a' (1-based bijective base-26)
-    while n > 0:
-        n, rem = divmod(n - 1, 26)
+    m = n + 1  # shift so that 0 maps to 'a' (1-based bijective base-26)
+    while m > 0:
+        m, rem = divmod(m - 1, 26)
         letters.append(chr(ord("a") + rem))
-    return "".join(reversed(letters))
+    return str(n) + "_" + "".join(reversed(letters))
 
 
 def normalize_pto2_task_id_int(v):
@@ -445,7 +445,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     events.append({"args": {"sort_index": 4}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 1})
 
     # Check if any task has AICPU timestamps
-    has_aicpu_data = any(task.get("dispatch_time_us", 0) > 0 and task.get("finish_time_us", 0) > 0 for task in tasks)
+    has_aicpu_data = any(task.get("dispatch_time_us", 0) >= 0 and task.get("finish_time_us", 0) > 0 for task in tasks)
 
     if has_aicpu_data:
         events.append(
@@ -534,7 +534,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         for task in tasks:
             dispatch_us = task.get("dispatch_time_us", 0)
             finish_us = task.get("finish_time_us", 0)
-            if dispatch_us <= 0 or finish_us <= 0:
+            # 0us is a valid timestamp (base-time aligned); only reject negative/invalid values.
+            if dispatch_us < 0 or finish_us <= 0:
                 continue
 
             tid = core_to_tid[task["core_id"]]
@@ -803,7 +804,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     if has_aicpu_data:
         for task in tasks:
             src_finish_us = task.get("finish_time_us", 0)
-            if src_finish_us <= 0:
+            # 0us is valid for the first task; keep it for dependency visualization.
+            if src_finish_us < 0:
                 continue
 
             src_tid = core_to_tid[task["core_id"]]
@@ -814,7 +816,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
 
                 succ_task = task_map[succ_task_id]
                 dst_dispatch_us = succ_task.get("dispatch_time_us", 0)
-                if dst_dispatch_us <= 0:
+                if dst_dispatch_us < 0:
                     continue
 
                 dst_tid = core_to_tid[succ_task["core_id"]]
@@ -868,7 +870,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             core_thread_votes = defaultdict(lambda: defaultdict(int))
             for task in tasks:
                 dispatch_us = task.get("dispatch_time_us", 0)
-                if dispatch_us <= 0:
+                if dispatch_us < 0:
                     continue
                 core_id = task["core_id"]
                 for thread_idx, dispatch_records in dispatch_phases_by_thread.items():
@@ -884,7 +886,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
 
         for task in tasks:
             dispatch_us = task.get("dispatch_time_us", 0)
-            if dispatch_us <= 0:
+            if dispatch_us < 0:
                 continue
 
             matched_thread = core_to_sched_thread.get(task["core_id"])
@@ -972,7 +974,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     continue
 
                 dispatch_us = task.get("dispatch_time_us", 0)
-                if dispatch_us <= 0:
+                if dispatch_us < 0:
                     continue
 
                 matched_thread = core_to_sched_thread.get(task["core_id"])

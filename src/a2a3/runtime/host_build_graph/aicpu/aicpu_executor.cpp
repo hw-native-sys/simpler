@@ -146,7 +146,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
                     cur_aic_tail = (cur_aic_tail + 1) % MAX_CORES_PER_THREAD;
                     cur_aic_ready_count++;
                 } else {
-                    std::lock_guard<std::mutex> lock(ready_queue_aic_mutex_);
+                    std::scoped_lock lock(ready_queue_aic_mutex_);
                     ready_queue_aic_[ready_queue_aic_tail_] = dep_id;
                     ready_queue_aic_tail_ = (ready_queue_aic_tail_ + 1) % RUNTIME_MAX_TASKS;
                     ready_count_aic_.fetch_add(1, std::memory_order_release);
@@ -157,7 +157,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
                     cur_aiv_tail = (cur_aiv_tail + 1) % MAX_CORES_PER_THREAD;
                     cur_aiv_ready_count++;
                 } else {
-                    std::lock_guard<std::mutex> lock(ready_queue_aiv_mutex_);
+                    std::scoped_lock lock(ready_queue_aiv_mutex_);
                     ready_queue_aiv_[ready_queue_aiv_tail_] = dep_id;
                     ready_queue_aiv_tail_ = (ready_queue_aiv_tail_ + 1) % RUNTIME_MAX_TASKS;
                     ready_count_aiv_.fetch_add(1, std::memory_order_release);
@@ -181,13 +181,14 @@ inline bool AicpuExecutor::try_dispatch_task(
     head = (head + 1) % MAX_CORES_PER_THREAD;
     ready_count--;
 
-    // Profiling: buffer switch check
+    // Profiling: buffer switch check. Then record the real AICPU dispatch point for this core.
     if (profiling_enabled) {
         core_dispatch_counts_[core_id]++;
         if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE - 1) {
             perf_aicpu_switch_buffer(&runtime, core_id, thread_idx);
             core_dispatch_counts_[core_id] = 0;
         }
+        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
     }
 
     const char *core_type_str = (core_type == CoreType::AIC) ? "AIC" : "AIV";
@@ -848,7 +849,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
         // Refill local queues from shared queues
         if (cur_aic_ready_count == 0) {
             if (ready_count_aic_.load(std::memory_order_acquire) > 0) {
-                std::lock_guard<std::mutex> lock(ready_queue_aic_mutex_);
+                std::scoped_lock lock(ready_queue_aic_mutex_);
                 int available = ready_count_aic_.load(std::memory_order_relaxed);
                 int to_grab = (available < aic_per_thread_) ? available : aic_per_thread_;
 
@@ -869,7 +870,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
         if (cur_aiv_ready_count == 0) {
             if (ready_count_aiv_.load(std::memory_order_acquire) > 0) {
-                std::lock_guard<std::mutex> lock(ready_queue_aiv_mutex_);
+                std::scoped_lock lock(ready_queue_aiv_mutex_);
                 int available = ready_count_aiv_.load(std::memory_order_relaxed);
                 int to_grab = (available < aiv_per_thread_) ? available : aiv_per_thread_;
 
