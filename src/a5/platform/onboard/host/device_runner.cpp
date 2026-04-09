@@ -143,6 +143,15 @@ int AicpuSoInfo::finalize() {
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
+std::thread DeviceRunner::create_thread(std::function<void()> fn) {
+    int dev_id = device_id_;
+    return std::thread([dev_id, fn = std::move(fn)]() {
+        rtSetDevice(dev_id);
+        fn();
+        rtDeviceReset(dev_id);
+    });
+}
+
 int DeviceRunner::ensure_device_initialized(
     int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
 ) {

@@ -96,6 +96,15 @@ bool create_temp_so_file(const std::string &path_template, const uint8_t *data, 
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
+std::thread DeviceRunner::create_thread(std::function<void()> fn) {
+    int dev_id = device_id_;
+    return std::thread([dev_id, fn = std::move(fn)]() {
+        pto_cpu_sim_bind_device(dev_id);
+        fn();
+        pto_cpu_sim_bind_device(-1);
+    });
+}
+
 int DeviceRunner::ensure_device_initialized(
     int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
 ) {
@@ -306,7 +315,9 @@ int DeviceRunner::run(
             return rc;
         }
         // Start memory management thread
-        perf_collector_.start_memory_manager();
+        perf_collector_.start_memory_manager([this](std::function<void()> fn) {
+            return create_thread(std::move(fn));
+        });
     }
 
     auto perf_cleanup = RAIIScopeGuard([this]() {
@@ -365,13 +376,12 @@ int DeviceRunner::run(
     std::vector<std::thread> aicpu_threads;
     aicpu_threads.reserve(over_launch);
     for (int i = 0; i < over_launch; i++) {
-        aicpu_threads.emplace_back([this, &runtime, launch_aicpu_num, over_launch]() {
-            pto_cpu_sim_bind_device(device_id_);
+        aicpu_threads.push_back(create_thread([this, &runtime, launch_aicpu_num, over_launch]() {
             if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
                 return;
             }
             aicpu_execute_func_(&runtime);
-        });
+        }));
     }
 
     // Launch AICore threads
@@ -380,16 +390,15 @@ int DeviceRunner::run(
     for (int i = 0; i < num_aicore; i++) {
         CoreType core_type = runtime.workers[i].core_type;
         uint32_t physical_core_id = static_cast<uint32_t>(i);
-        aicore_threads.emplace_back([this, &runtime, i, core_type, physical_core_id]() {
-            pto_cpu_sim_bind_device(device_id_);
+        aicore_threads.push_back(create_thread([this, &runtime, i, core_type, physical_core_id]() {
             aicore_execute_func_(&runtime, i, core_type, physical_core_id, kernel_args_.regs);
-        });
+        }));
     }
 
     // Poll and collect performance data during execution (if enabled)
     std::thread collector_thread;
     if (runtime.enable_profiling) {
-        collector_thread = std::thread([this, &runtime]() {
+        collector_thread = create_thread([this, &runtime]() {
             poll_and_collect_performance_data(runtime.get_task_count());
         });
     }
@@ -625,7 +634,7 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
     };
 
     // Simulation: no registration needed (pass nullptr)
-    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, nullptr, free_cb, nullptr);
+    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, nullptr, free_cb);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {

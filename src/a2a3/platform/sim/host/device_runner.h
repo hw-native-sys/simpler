@@ -32,6 +32,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <string>
@@ -76,6 +77,13 @@ class DeviceRunner {
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
+
+    /**
+     * Create a thread bound to this device.
+     * The thread calls pto_cpu_sim_bind_device(device_id) on entry
+     * and unbinds on exit.
+     */
+    std::thread create_thread(std::function<void()> fn);
 
     /**
      * Allocate tensor memory (host memory in simulation)

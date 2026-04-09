@@ -27,6 +27,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <string>
@@ -75,12 +76,15 @@ using PerfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
 using PerfFreeCallback = int (*)(void *dev_ptr);
 
 /**
- * Device context setup callback (called once on mgmt thread startup)
+ * Thread factory callback for creating threads with device binding
  *
- * @param device_id Device ID to set
- * @return 0 on success, error code on failure
+ * Creates a std::thread that runs the given function with proper device
+ * context setup/teardown (e.g., rtSetDevice/rtDeviceReset on onboard).
+ *
+ * @param fn Function to execute in the new thread
+ * @return The newly created thread
  */
-using PerfSetDeviceCallback = int (*)(int device_id);
+using ThreadFactory = std::function<std::thread(std::function<void()>)>;
 
 // =============================================================================
 // ProfMemoryManager - Dynamic Buffer Memory Management Thread
@@ -143,12 +147,12 @@ public:
      * @param register_cb Host-device mapping callback (nullptr for simulation)
      * @param free_cb Device memory free callback
      * @param device_id Device ID for registration
-     * @param set_device_cb Device context setup callback (nullptr to skip)
+     * @param thread_factory Thread factory for creating device-bound threads (empty to use std::thread)
      */
     void start(
         void *shared_mem_host, int num_cores, int num_phase_threads, PerfAllocCallback alloc_cb,
         PerfRegisterCallback register_cb, PerfFreeCallback free_cb, int device_id,
-        PerfSetDeviceCallback set_device_cb = nullptr
+        const ThreadFactory &thread_factory = {}
     );
 
     /**
@@ -199,7 +203,6 @@ private:
     PerfAllocCallback alloc_cb_{nullptr};
     PerfRegisterCallback register_cb_{nullptr};
     PerfFreeCallback free_cb_{nullptr};
-    PerfSetDeviceCallback set_device_cb_{nullptr};
     int device_id_{-1};
 
     // Management thread → main thread (ready buffers)
@@ -273,20 +276,21 @@ public:
      * @param alloc_cb Memory allocation callback
      * @param register_cb Memory registration callback (can be nullptr for simulation)
      * @param free_cb Memory free callback
-     * @param set_device_cb Device context setup callback (nullptr to skip)
      * @return 0 on success, error code on failure
      */
     int initialize(
         Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfRegisterCallback register_cb,
-        PerfFreeCallback free_cb, PerfSetDeviceCallback set_device_cb = nullptr
+        PerfFreeCallback free_cb
     );
 
     /**
      * Start the memory management thread
      *
      * Must be called after initialize() and before device execution starts.
+     *
+     * @param thread_factory Thread factory for creating device-bound threads (empty to use std::thread)
      */
-    void start_memory_manager();
+    void start_memory_manager(const ThreadFactory &thread_factory = {});
 
     /**
      * Poll and collect performance data from the memory manager's queue
@@ -382,7 +386,6 @@ private:
     PerfAllocCallback alloc_cb_{nullptr};
     PerfRegisterCallback register_cb_{nullptr};
     PerfFreeCallback free_cb_{nullptr};
-    PerfSetDeviceCallback set_device_cb_{nullptr};
 
     // Memory manager
     ProfMemoryManager memory_manager_;

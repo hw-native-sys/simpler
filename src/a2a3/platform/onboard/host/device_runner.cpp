@@ -225,6 +225,15 @@ int AicpuSoInfo::finalize() {
 
 DeviceRunner::~DeviceRunner() { finalize(); }
 
+std::thread DeviceRunner::create_thread(std::function<void()> fn) {
+    int dev_id = device_id_;
+    return std::thread([dev_id, fn = std::move(fn)]() {
+        rtSetDevice(dev_id);
+        fn();
+        rtDeviceReset(dev_id);
+    });
+}
+
 int DeviceRunner::ensure_device_initialized(
     int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
 ) {
@@ -447,7 +456,9 @@ int DeviceRunner::run(
             return rc;
         }
         // Start memory management thread
-        perf_collector_.start_memory_manager();
+        perf_collector_.start_memory_manager([this](std::function<void()> fn) {
+            return create_thread(std::move(fn));
+        });
     }
 
     auto perf_cleanup = RAIIScopeGuard([this]() {
@@ -508,7 +519,7 @@ int DeviceRunner::run(
         // Poll and collect performance data in a separate collector thread
         std::thread collector_thread;
         if (runtime.enable_profiling) {
-            collector_thread = std::thread([this, &runtime]() {
+            collector_thread = create_thread([this, &runtime]() {
                 poll_and_collect_performance_data(runtime.get_task_count());
             });
         }
@@ -799,11 +810,7 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
         return rtFree(dev_ptr);
     };
 
-    auto set_device_cb = [](int device_id) -> int {
-        return rtSetDevice(device_id);
-    };
-
-    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, set_device_cb);
+    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {

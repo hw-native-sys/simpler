@@ -28,9 +28,11 @@
 
 #include <cstdint>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <map>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "common/kernel_args.h"
@@ -158,6 +160,13 @@ class DeviceRunner {
 public:
     DeviceRunner() = default;
     ~DeviceRunner();
+
+    /**
+     * Create a thread bound to this device.
+     * The thread calls rtSetDevice(device_id) on entry
+     * and rtDeviceReset(device_id) on exit.
+     */
+    std::thread create_thread(std::function<void()> fn);
 
     /**
      * Allocate device tensor memory

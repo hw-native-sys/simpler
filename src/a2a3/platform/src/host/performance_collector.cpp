@@ -47,7 +47,7 @@ ProfMemoryManager::~ProfMemoryManager() {
 
 void ProfMemoryManager::start(
     void *shared_mem_host, int num_cores, int num_phase_threads, PerfAllocCallback alloc_cb,
-    PerfRegisterCallback register_cb, PerfFreeCallback free_cb, int device_id, PerfSetDeviceCallback set_device_cb
+    PerfRegisterCallback register_cb, PerfFreeCallback free_cb, int device_id, const ThreadFactory &thread_factory
 ) {
     shared_mem_host_ = shared_mem_host;
     num_cores_ = num_cores;
@@ -56,10 +56,15 @@ void ProfMemoryManager::start(
     register_cb_ = register_cb;
     free_cb_ = free_cb;
     device_id_ = device_id;
-    set_device_cb_ = set_device_cb;
 
     running_.store(true);
-    mgmt_thread_ = std::thread(&ProfMemoryManager::mgmt_loop, this);
+    if (thread_factory) {
+        mgmt_thread_ = thread_factory([this]() {
+            mgmt_loop();
+        });
+    } else {
+        mgmt_thread_ = std::thread(&ProfMemoryManager::mgmt_loop, this);
+    }
 
     LOG_INFO("ProfMemoryManager started: %d cores, %d phase threads", num_cores, num_phase_threads);
 }
@@ -338,13 +343,6 @@ void ProfMemoryManager::process_ready_entry(
 }
 
 void ProfMemoryManager::mgmt_loop() {
-    if (set_device_cb_ != nullptr) {
-        int rc = set_device_cb_(device_id_);
-        if (rc != 0) {
-            LOG_ERROR("mgmt_loop: set_device_cb(%d) failed: %d", device_id_, rc);
-        }
-    }
-
     PerfDataHeader *header = get_perf_header(shared_mem_host_);
 
     while (running_.load()) {
@@ -542,7 +540,7 @@ void *PerformanceCollector::alloc_single_buffer(size_t size, void **host_ptr_out
 
 int PerformanceCollector::initialize(
     Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfRegisterCallback register_cb,
-    PerfFreeCallback free_cb, PerfSetDeviceCallback set_device_cb
+    PerfFreeCallback free_cb
 ) {
     if (perf_shared_mem_host_ != nullptr) {
         LOG_ERROR("PerformanceCollector already initialized");
@@ -561,7 +559,6 @@ int PerformanceCollector::initialize(
     alloc_cb_ = alloc_cb;
     register_cb_ = register_cb;
     free_cb_ = free_cb;
-    set_device_cb_ = set_device_cb;
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
     int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
@@ -703,14 +700,14 @@ int PerformanceCollector::initialize(
     return 0;
 }
 
-void PerformanceCollector::start_memory_manager() {
+void PerformanceCollector::start_memory_manager(const ThreadFactory &thread_factory) {
     if (perf_shared_mem_host_ == nullptr) {
         return;
     }
 
     memory_manager_.start(
         perf_shared_mem_host_, num_aicore_, PLATFORM_MAX_AICPU_THREADS, alloc_cb_, register_cb_, free_cb_, device_id_,
-        set_device_cb_
+        thread_factory
     );
 }
 
