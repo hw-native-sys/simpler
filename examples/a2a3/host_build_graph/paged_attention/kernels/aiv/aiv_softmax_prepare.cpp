@@ -38,23 +38,23 @@ static __aicore__ void softmax_prepare_impl(
     constexpr int M = 16, N = 16;
 
     __gm__ float *sij = reinterpret_cast<__gm__ float *>(sij_raw);
-    __gm__ half *pij = reinterpret_cast<__gm__ half *>(pij_raw);
+    __gm__ bfloat16_t *pij = reinterpret_cast<__gm__ bfloat16_t *>(pij_raw);
     __gm__ float *mij = reinterpret_cast<__gm__ float *>(mij_raw);
     __gm__ float *lij = reinterpret_cast<__gm__ float *>(lij_raw);
 
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
     using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
-    using GlobalDataMxN_f16 = GlobalTensor<half, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
+    using GlobalDataMxN_bf16 = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
     using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, Stride<1, 1, 1, 1, 1>, Layout::DN>;
 
     GlobalDataMxN sijGlobal(sij);
-    GlobalDataMxN_f16 pijGlobal(pij);
+    GlobalDataMxN_bf16 pijGlobal(pij);
     GlobalScalarDN mijGlobal(mij);
     GlobalScalarDN lijGlobal(lij);
 
     using TileVecMxN = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N>;
-    using TileVecMxN_f16 = Tile<TileType::Vec, half, M, N, BLayout::RowMajor, M, N>;
+    using TileVecMxN_bf16 = Tile<TileType::Vec, bfloat16_t, M, N, BLayout::RowMajor, M, N>;
     using TileScalarDN = Tile<TileType::Vec, float, kAlignedRows, 1, BLayout::ColMajor, M, 1>;
 
     TileVecMxN sijTile;
@@ -62,14 +62,14 @@ static __aicore__ void softmax_prepare_impl(
     TileVecMxN tmpTile;
     TileScalarDN maxTile;
     TileScalarDN sumTile;
-    TileVecMxN_f16 pijF16Tile;
+    TileVecMxN_bf16 pijBf16Tile;
 
     TASSIGN(sijTile, 0x0);
     TASSIGN(pijTile, M * N * sizeof(float));
     TASSIGN(tmpTile, 2 * M * N * sizeof(float));
     TASSIGN(maxTile, 3 * M * N * sizeof(float));
     TASSIGN(sumTile, 3 * M * N * sizeof(float) + kAlignedRows * sizeof(float));
-    TASSIGN(pijF16Tile, 3 * M * N * sizeof(float) + 2 * kAlignedRows * sizeof(float));
+    TASSIGN(pijBf16Tile, 3 * M * N * sizeof(float) + 2 * kAlignedRows * sizeof(float));
 
     TLOAD(sijTile, sijGlobal);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
@@ -79,16 +79,16 @@ static __aicore__ void softmax_prepare_impl(
     TROWMAX(maxTile, sijTile, tmpTile);
     TROWEXPANDSUB(pijTile, sijTile, maxTile);
     TEXP(pijTile, pijTile);
-    // Truncate pij to fp16 first, then compute lij from truncated values (matches golden)
-    TCVT(pijF16Tile, pijTile, RoundMode::CAST_ROUND);
-    TCVT(pijTile, pijF16Tile, RoundMode::CAST_ROUND);
+    // Truncate pij to bf16 first, then compute lij from truncated values (matches golden)
+    TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
+    TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
     TROWSUM(sumTile, pijTile, tmpTile);
 
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(mijGlobal, maxTile);
     TSTORE(lijGlobal, sumTile);
-    TSTORE(pijGlobal, pijF16Tile);
+    TSTORE(pijGlobal, pijBf16Tile);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {

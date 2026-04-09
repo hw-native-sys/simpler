@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged Attention Golden - host_build_graph example (small scale, float16).
+"""Paged Attention Golden - host_build_graph example (small scale, bfloat16).
 
 Args layout: [query, key_cache, value_cache, block_table, context_lens, out, scale]
   - Tensors retain original multi-dimensional shapes (ContinuousTensor metadata carries shape/dtype)
@@ -33,7 +33,7 @@ ALL_CASES = {
         "block_size": 16,
         "context_len": 16,
         "max_model_len": 256,
-        "dtype": "float16",
+        "dtype": "bfloat16",
     },
     "Case2": {
         "batch": 1,
@@ -43,7 +43,7 @@ ALL_CASES = {
         "block_size": 16,
         "context_len": 64,
         "max_model_len": 256,
-        "dtype": "float16",
+        "dtype": "bfloat16",
     },
 }
 

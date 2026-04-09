@@ -57,14 +57,14 @@ static __aicore__ void online_update_impl(
     // --- GlobalTensor types ---
 
     // Data (M, N) RowMajor
-    using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<1, 1, 1, N, 1>>;
+    using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
 
     // Scalar ND: M contiguous floats as (kScalarRows, kScalarCols) RowMajor
     using GlobalScalarND =
-        GlobalTensor<float, Shape<1, 1, 1, kScalarRows, kScalarCols>, pto::Stride<1, 1, 1, kScalarCols, 1>>;
+        GlobalTensor<float, Shape<1, 1, 1, kScalarRows, kScalarCols>, Stride<1, 1, 1, kScalarCols, 1>>;
 
     // Scalar DN: same M contiguous floats as (kAlignedRows, 1) ColMajor
-    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, pto::Stride<1, 1, 1, 1, 1>, Layout::DN>;
+    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, Stride<1, 1, 1, 1, 1>, Layout::DN>;
 
     // --- GlobalTensor instances ---
 

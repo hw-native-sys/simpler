@@ -12,9 +12,9 @@
  * Paged Attention Orchestration - Small Scale (16x16)
  *
  * Supports small-scale paged attention with:
- *   Query: (batch, q_head_num, head_dim) fp16
- *   Key:   (total_blocks, block_size, kv_head_num, head_dim) fp16 (NOT transposed)
- *   Value: (total_blocks, block_size, kv_head_num, head_dim) fp16
+ *   Query: (batch, q_head_num, head_dim) bf16
+ *   Key:   (total_blocks, block_size, kv_head_num, head_dim) bf16 (NOT transposed)
+ *   Value: (total_blocks, block_size, kv_head_num, head_dim) bf16
  *   Output: (batch, q_head_num, head_dim) float32
  *
  * Head tiling: q_tile_size = min(num_heads, 128)
@@ -148,7 +148,7 @@ int build_paged_attention_graph(OrchestrationRuntime *runtime, const ChipStorage
         for (uint32_t ht = 0; ht < num_head_tiles; ht++) {
             uint32_t cur_offset = ht * q_tile_size;
 
-            // Query: (batch, q_head_num, head_dim) fp16
+            // Query: (batch, q_head_num, head_dim) bf16
             // qi points to heads [cur_offset .. cur_offset+q_tile_size) for batch b_idx
             uint8_t *qi_ptr = reinterpret_cast<uint8_t *>(dev_query) +
                               static_cast<int64_t>(b_idx * num_heads + cur_offset) * head_dim * sizeof(uint16_t);
@@ -171,12 +171,12 @@ int build_paged_attention_graph(OrchestrationRuntime *runtime, const ChipStorage
             for (uint32_t bn = 0; bn < bn_this_batch; bn++) {
                 int cur_block_idx = host_block_table[b_idx * max_num_blocks + bn];
 
-                // Key: (total_blocks, block_size, kv_head_num, head_dim) fp16
+                // Key: (total_blocks, block_size, kv_head_num, head_dim) bf16
                 uint8_t *kj_ptr = reinterpret_cast<uint8_t *>(dev_key_cache) +
                                   (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx) *
                                       head_dim * sizeof(uint16_t);
 
-                // Value: (total_blocks, block_size, kv_head_num, head_dim) fp16
+                // Value: (total_blocks, block_size, kv_head_num, head_dim) bf16
                 uint8_t *vj_ptr = reinterpret_cast<uint8_t *>(dev_value_cache) +
                                   (static_cast<int64_t>(cur_block_idx) * block_size * kv_head_num + kv_head_idx) *
                                       head_dim * sizeof(uint16_t);
