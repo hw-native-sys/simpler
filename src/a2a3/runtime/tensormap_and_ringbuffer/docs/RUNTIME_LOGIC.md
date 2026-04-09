@@ -335,8 +335,8 @@ When `pto2_submit_task` processes parameters:
 | `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
 | `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
 | `subtask_done_mask` | Atomic bitmask; each subtask sets its done bit on completion |
-| `fanin_count` | Number of producer dependencies |
-| `fanout_lock` | Per-task spinlock for concurrent fanout modification |
+| `fanin_count` | Number of producer dependencies (set by scheduler during wiring) |
+| `fanout_lock` | Per-task spinlock for concurrent fanout modification (used by scheduler wiring + completion) |
 | `fanout_head` | Head of fanout consumer list (pointer, protected by `fanout_lock`) |
 | `fanout_count` | 1 (scope ref) + number of consumers |
 | `packed_buffer_base` | Start of packed buffer in GM Heap |
@@ -380,42 +380,49 @@ The orchestrator runs on AICPU Thread 3 and builds the task graph by calling the
 
 Key members:
 
-- `rings[PTO2_MAX_RING_DEPTH]`: per-ring `PTO2RingSet` (HeapRing + TaskRing + DepPool). See [MULTI_RING.md §4.2](MULTI_RING.md).
+- `rings[PTO2_MAX_RING_DEPTH]`: per-ring `PTO2RingSet` (HeapRing + TaskRing + FaninPool). See [MULTI_RING.md §4.2](MULTI_RING.md).
 - `tensor_map`, `tensor_pool`: dependency tracking
 - `scope_tasks[]`, `scope_begins[]`, `scope_stack_top`: scope nesting stack (flat buffer partitioned by level)
-- `scheduler`: pointer to scheduler state (for simulated mode or `init_task_on_submit`)
+- `scheduler`: pointer to scheduler state (for wiring queue and ready queue access)
 - `gm_heap_base`, `gm_heap_size`: GM heap for output buffers
 
-### 7.2 Task Submission Flow (`pto2_submit_task`)
+### 7.2 Task Submission Flow (`pto2_submit_mixed_task`)
 
 | Step | Operation |
 | ---- | --------- |
 | 0 | `pto2_orchestrator_sync_tensormap` — prune stale TensorMap entries |
 | 1 | `pto2_task_ring_alloc` — allocate task slot (may block on flow control) |
-| 2 | Initialize task descriptor, copy parameters |
-| 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers |
-| 4 | **Dependency**: `pto2_add_consumer_to_producer` for each producer found |
-| 5 | **Heap alloc**: `pto2_alloc_packed_buffer` for OUTPUT args (addr=0) |
-| 6 | **Insert**: register OUTPUT/INOUT args in TensorMap |
-| 7 | **Fanin**: finalize `fanin_count`; if `init_task_on_submit`, call scheduler's `init_task` |
-| 8 | **Publish**: `STORE_RELEASE(current_task_index)` makes task visible to scanners |
+| 2 | Initialize task descriptor + slot state, copy parameters |
+| 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
+| 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
+| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >16); increment each producer's `fanout_count` (no lock needed — single writer) |
+| 6 | **Push to wiring queue**: scheduler thread 0 asynchronously wires fanout edges (lock + dep_pool + early_finished check + ready push) |
 
-### 7.3 Lock Protocol for Concurrent Dependency Setup
+> **Note**: Fanout wiring (Steps 4–7 in earlier versions) has been moved from the
+> orchestrator submit hot path to the scheduler's `wiring_queue`. This reduces the
+> orchestrator's shared L2 cache / memory bus pressure, as the orchestrator no longer
+> acquires `fanout_lock` or allocates from `dep_pool` during submission.
 
-The orchestrator and scheduler run concurrently. When adding a consumer to a producer's fanout list:
+### 7.3 Deferred Fanout Wiring (Scheduler Wiring Queue)
 
-1. **Orchestrator acquires** the producer's `fanout_lock` via `pto2_fanout_lock(task)` (CAS spin-lock)
-2. **Normal path**: prepend consumer to the producer's fanout list, increment `fanout_count`
-3. **Release** `fanout_lock`
+The orchestrator pushes each submitted task to `scheduler->wiring_queue`. Scheduler thread 0 drains this queue and, for each task:
+
+1. Sets `fanin_count = N + 1` (+1 redundance to prevent premature readiness)
+2. For each producer in `payload->fanin_slot_states[]`:
+   - **Acquires** the producer's `fanout_lock`
+   - Checks `task_state >= COMPLETED` (early-finished optimization)
+   - If not completed: prepends consumer to producer's `fanout_head` via `dep_pool.prepend`
+   - **Releases** `fanout_lock`
+3. Atomically releases the +1 redundance + early_finished count via `fanin_refcount.fetch_add`
+4. If all deps satisfied: pushes task to ready queue
 
 The scheduler's completion handler mirrors this:
 
-1. Mark `task_state[slot] = COMPLETED`
-2. **Acquire** `fanout_lock`, read `fanout_head`, **release** lock
-3. Traverse fanout list, incrementing each consumer's `fanin_refcount`
-4. Mark `task_state[slot] = CONSUMED` when `fanout_refcount` reaches `fanout_count`
+1. **Acquire** `fanout_lock`, mark `task_state = COMPLETED`, read `fanout_head`, **release** lock
+2. Traverse fanout list, incrementing each consumer's `fanin_refcount`
+3. Mark `task_state = CONSUMED` when `fanout_refcount` reaches `fanout_count`
 
-This lock protocol guarantees every consumer is accounted for exactly once.
+This protocol guarantees every consumer is accounted for exactly once.
 
 ### 7.4 Scope Mechanism (`PTO2_SCOPE`)
 

@@ -163,9 +163,9 @@ This project-defined flattened numbering is kept unchanged.
 ### 10.2 Runtime Behavior per Submit
 
 1. Validate submit arguments.
-2. Allocate mixed-task ID and initialize descriptor/payload once.
-3. Build fanin/fanout at mixed-task granularity.
-4. Enqueue by shape when ready.
+2. Allocate mixed-task ID and initialize descriptor/payload/slot_state once.
+3. Lookup producers via TensorMap; collect fanin metadata and increment producers' `fanout_count`.
+4. Push task to scheduler's wiring queue (scheduler thread 0 asynchronously wires fanout edges and determines readiness).
 5. Dispatch all active lanes atomically when resources allow.
 6. Aggregate completion and release downstream once.
 

@@ -1484,11 +1484,13 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     uint64_t sched_scan_cycle = 0;
     uint64_t sched_complete_cycle = 0;
     uint64_t sched_dispatch_cycle = 0;
+    uint64_t sched_wiring_cycle = 0;
     uint64_t sched_idle_cycle = 0;
     uint64_t sched_loop_count = 0;
     uint32_t phase_complete_count = 0;
     uint32_t phase_dispatch_count = 0;
 #if PTO2_SCHED_PROFILING
+    uint32_t phase_wiring_count = 0;
     uint64_t complete_probe_count = 0;
     uint64_t complete_hit_count = 0;
     uint64_t notify_edges_total = 0;
@@ -1674,6 +1676,22 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             continue;
         }
 
+        // Phase 3: Drain wiring queue — wire fanout edges for newly submitted tasks.
+        // Only thread 0 does wiring to keep dep_pool single-threaded.
+        if (thread_idx == 0) {
+            int wired = rt->scheduler.drain_wiring_queue();
+            if (wired > 0) {
+                made_progress = true;
+#if PTO2_SCHED_PROFILING
+                phase_wiring_count += wired;
+#endif
+            }
+        }
+#if PTO2_PROFILING
+        CYCLE_COUNT_LAP(sched_wiring_cycle);
+#endif
+
+        // Phase 4: Dispatch
         const PTO2ResourceShape *dispatch_order = get_dispatch_order(thread_idx);
         bool entered_drain = false;
 
@@ -2020,7 +2038,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     );
 
     // Scheduler summary logging (always print when PTO2_PROFILING=1)
-    uint64_t sched_total = sched_complete_cycle + sched_scan_cycle + sched_dispatch_cycle + sched_idle_cycle;
+    uint64_t sched_total =
+        sched_wiring_cycle + sched_complete_cycle + sched_scan_cycle + sched_dispatch_cycle + sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;  // avoid div-by-zero
 
 #if PTO2_SCHED_PROFILING
@@ -2132,6 +2151,19 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             "Thread %d:   scan           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(sched_scan_cycle),
             sched_scan_cycle * 100.0 / sched_total
         );
+
+        // Level 1: wiring
+#if PTO2_SCHED_PROFILING
+        DEV_ALWAYS(
+            "Thread %d:   wiring         : %.3fus (%.1f%%)  tasks=%d", thread_idx, cycles_to_us(sched_wiring_cycle),
+            sched_wiring_cycle * 100.0 / sched_total, phase_wiring_count
+        );
+#else
+        DEV_ALWAYS(
+            "Thread %d:   wiring         : %.3fus (%.1f%%)", thread_idx, cycles_to_us(sched_wiring_cycle),
+            sched_wiring_cycle * 100.0 / sched_total
+        );
+#endif
 
         // Level 1: idle
         DEV_ALWAYS(
@@ -2376,7 +2408,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
             uint64_t total =
-                p.sync_cycle + p.alloc_cycle + p.params_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
+                p.sync_cycle + p.alloc_cycle + p.args_cycle + p.lookup_cycle + p.insert_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero
             DEV_ALWAYS(
                 "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", thread_idx,
@@ -2402,8 +2434,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             );
             DEV_ALWAYS(
                 "Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", thread_idx,
-                cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total,
-                static_cast<uint64_t>(p.params_atomic_count)
+                cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
             );
             DEV_ALWAYS(
                 "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",

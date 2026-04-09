@@ -1782,7 +1782,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Print orchestrator profiling data
 #if PTO2_ORCH_PROFILING
             PTO2OrchProfilingData p = pto2_orchestrator_get_profiling();
-            uint64_t total = p.alloc_cycle + p.params_cycle + p.heap_cycle + p.fanin_cycle;
+            uint64_t total = p.alloc_cycle + p.args_cycle + p.heap_cycle + p.fanin_cycle;
             if (total == 0) total = 1;  // avoid div-by-zero
             DEV_ALWAYS(
                 "Thread %d: === Orchestrator Profiling: %" PRId64 " tasks, total=%.3fus ===", thread_idx,
@@ -1802,8 +1802,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             );
             DEV_ALWAYS(
                 "Thread %d:   param_copy     : %.3fus (%.1f%%)  atomics=%" PRIu64 "", thread_idx,
-                cycles_to_us(p.params_cycle), p.params_cycle * 100.0 / total,
-                static_cast<uint64_t>(p.params_atomic_count)
+                cycles_to_us(p.args_cycle), p.args_cycle * 100.0 / total, static_cast<uint64_t>(p.args_atomic_count)
             );
             DEV_ALWAYS(
                 "Thread %d:   fanin+ready    : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "",
@@ -1824,7 +1823,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 orch_summary.end_time = orch_cycle_end;
                 orch_summary.sync_cycle = 0;
                 orch_summary.alloc_cycle = p.alloc_cycle;
-                orch_summary.params_cycle = p.args_cycle;
+                orch_summary.args_cycle = p.args_cycle;
                 orch_summary.lookup_cycle = 0;
                 orch_summary.heap_cycle = p.heap_cycle;
                 orch_summary.insert_cycle = 0;

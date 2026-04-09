@@ -301,17 +301,24 @@ static bool pto2_prepare_task(
         auto &rs = out->sched->ring_sched_states[ring_id];
         out->slot_state = &rs.get_slot_state_by_slot(out->alloc_result.slot);
         PTO2TaskSlotState &slot_state = *out->slot_state;
-        slot_state.fanin_count = 0;
         slot_state.fanout_head = nullptr;
         slot_state.fanout_lock.store(0, std::memory_order_relaxed);
         slot_state.fanout_count = 1;
-        slot_state.fanout_refcount.store(0, std::memory_order_release);
-        slot_state.fanin_refcount.store(0, std::memory_order_release);
+        slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
+        slot_state.fanin_refcount.store(0, std::memory_order_relaxed);
+        slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+        slot_state.completed_subtasks.store(0, std::memory_order_relaxed);
+        slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
+        int16_t block_num = args.launch_spec.core_num();
+        slot_state.total_required_subtasks =
+            static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
+        slot_state.block_num = block_num;
+        slot_state.next_block_idx = 0;
         slot_state.payload = out->payload;
         slot_state.task = out->task;
         slot_state.active_mask = active_mask;
-        slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
         slot_state.ring_id = ring_id;
+        // fanin_count is set by scheduler during wiring
         scope_tasks_push(orch, &slot_state);
     } else {
         scope_tasks_push(orch, nullptr);
@@ -353,25 +360,10 @@ bool pto2_orchestrator_init(
         if (!fanin_entries) {
             for (int j = 0; j < r; j++) {
                 free(orch->rings[j].fanin_pool.base);
-                free(orch->rings[j].dep_pool.base);
             }
             return false;
         }
         orch->rings[r].fanin_pool.init(fanin_entries, dep_pool_capacity, &sm_handle->header->orch_error_code);
-
-        // Allocate and initialize dependency list pool (per-ring)
-        PTO2DepListEntry *dep_entries =
-            reinterpret_cast<PTO2DepListEntry *>(calloc(dep_pool_capacity, sizeof(PTO2DepListEntry)));
-        if (!dep_entries) {
-            // Cleanup previously allocated rings
-            for (int j = 0; j < r; j++) {
-                free(orch->rings[j].fanin_pool.base);
-                free(orch->rings[j].dep_pool.base);
-            }
-            free(orch->rings[r].fanin_pool.base);
-            return false;
-        }
-        orch->rings[r].dep_pool.init(dep_entries, dep_pool_capacity, &sm_handle->header->orch_error_code);
     }
 
     // Initialize TensorMap with per-ring task window sizes
@@ -382,7 +374,6 @@ bool pto2_orchestrator_init(
     if (!orch->tensor_map.init_default(task_window_sizes)) {
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             free(orch->rings[r].fanin_pool.base);
-            free(orch->rings[r].dep_pool.base);
         }
         return false;
     }
@@ -398,7 +389,6 @@ bool pto2_orchestrator_init(
         free(orch->scope_begins);
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             free(orch->rings[r].fanin_pool.base);
-            free(orch->rings[r].dep_pool.base);
         }
         orch->tensor_map.destroy();
         return false;
@@ -417,8 +407,6 @@ void pto2_orchestrator_destroy(PTO2OrchestratorState *orch) {
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         free(orch->rings[r].fanin_pool.base);
         orch->rings[r].fanin_pool.base = NULL;
-        free(orch->rings[r].dep_pool.base);
-        orch->rings[r].dep_pool.base = NULL;
     }
 
     free(orch->scope_tasks);
@@ -629,18 +617,23 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     if (sched) {
         auto &rs = sched->ring_sched_states[ring_id];
         PTO2TaskSlotState &slot_state = rs.get_slot_state_by_slot(slot);
-        slot_state.fanin_count = 0;
         slot_state.fanout_head = nullptr;
         slot_state.fanout_lock.store(0, std::memory_order_relaxed);
-        // Initial fanout_count = 1 (the owning scope holds one reference)
         slot_state.fanout_count = 1;
-        slot_state.fanout_refcount.store(0, std::memory_order_release);
-        slot_state.fanin_refcount.store(0, std::memory_order_release);
+        slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
+        slot_state.fanin_refcount.store(0, std::memory_order_relaxed);
+        slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+        slot_state.completed_subtasks.store(0, std::memory_order_relaxed);
+        slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
+        slot_state.total_required_subtasks =
+            static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
+        slot_state.block_num = block_num;
+        slot_state.next_block_idx = 0;
         slot_state.payload = payload;
         slot_state.task = &task;
         slot_state.active_mask = active_mask;
-        slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
         slot_state.ring_id = ring_id;
+        // fanin_count is set by scheduler during wiring
         scope_tasks_push(orch, &slot_state);
     } else {
         scope_tasks_push(orch, nullptr);
@@ -664,11 +657,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     // Read current last_task_alive from shared memory for this ring
     int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
 
-    orch->tensor_map.sync_tensormap(ring_id, sm_last_task_alive);
-
-    if (sched) {
-        orch->rings[ring_id].dep_pool.reclaim(*sched, ring_id, sm_last_task_alive);
-    }
+    orch->tensor_map.sync_tensormap(task_id, sm_last_task_alive);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
@@ -749,16 +738,6 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     task.packed_buffer_base = alloc_result.packed_base;
     task.packed_buffer_end = alloc_result.packed_end;
 
-    // Prefetch producer slot_states and cur_slot_state (written at init but likely
-    // evicted by lookup/insert/heap). param_copy below provides hide time.
-    if (sched) {
-        auto &rs = sched->ring_sched_states[ring_id];
-        __builtin_prefetch(&rs.get_slot_state_by_slot(slot), 1, 0);
-        fanin_builder.for_each([](PTO2TaskSlotState *producer_slot_state) {
-            __builtin_prefetch(producer_slot_state, 1, 0);
-        });
-    }
-
     payload->init(args, result, alloc_result.packed_base, offsets, buffer_sizes);
 
     // Write owner_task_id into materialized OUTPUT tensors so creator-only dependency
@@ -774,69 +753,37 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     g_orch_args_atomic_count += 2;  // fanout_lock.store + fanout_count.store
 #endif
 
-    // === STEP 6: Finalize fanin list ===
-    // First build the fanin list
+    // === STEP 6: Record fanin metadata + push to wiring queue ===
+    // Deferred wiring: orchestrator only stores dependency metadata and increments
+    // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
+    // is handled asynchronously by scheduler thread 0 via the wiring queue.
     if (sched) {
         auto &rs = sched->ring_sched_states[ring_id];
         PTO2TaskSlotState &cur_slot_state = rs.get_slot_state_by_slot(slot);
-        // Initialize scheduler state BEFORE adding to producer fanout lists,
-        // so concurrent on_mixed_task_complete can safely access task_state/fanout_refcount.
-        cur_slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
-        cur_slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
-        cur_slot_state.completed_subtasks.store(0, std::memory_order_relaxed);
-        cur_slot_state.total_required_subtasks =
-            static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
-        cur_slot_state.block_num = block_num;
-        cur_slot_state.next_block_idx = 0;
-
-        auto &dep_pool = orch->rings[ring_id].dep_pool;
         int32_t fanin_count = fanin_builder.count;
         int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
         int32_t spill_count = fanin_count - inline_count;
-        dep_pool.ensure_space(*sched, fc, ring_id, fanin_count + 1);
 
-        int32_t early_finished = 0;
-        cur_slot_state.fanin_count = fanin_count + 1;  // +1 redundance for not being ready too early
+        // Store fanin metadata in payload for scheduler to iterate
         payload->fanin_actual_count = fanin_count;
         payload->fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
         payload->fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
         for (int i = 0; i < inline_count; i++) {
             payload->fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
         }
-        pto2_for_each_fanin_slot_state(*payload, [&](PTO2TaskSlotState *producer_slot) {
-            PTO2TaskSlotState &producer_slot_state = *producer_slot;
-#if PTO2_ORCH_PROFILING
-            pto2_fanout_lock(producer_slot_state, g_orch_fanin_atomic_count, g_orch_fanin_wait_cycle);
-#else
-            pto2_fanout_lock(producer_slot_state);
-#endif
-            producer_slot_state.fanout_count += 1;
-            int32_t prod_state = producer_slot_state.task_state.load(std::memory_order_acquire);
-            if (prod_state >= PTO2_TASK_COMPLETED) {
-                early_finished++;
-            } else {
-                producer_slot_state.fanout_head = dep_pool.prepend(producer_slot_state.fanout_head, &cur_slot_state);
-            }
-            pto2_fanout_unlock(producer_slot_state);
+
+        // Increment fanout_count on each producer (no lock — only orch writes this field).
+        // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
+        pto2_for_each_fanin_slot_state(*payload, [](PTO2TaskSlotState *producer) {
+            producer->fanout_count += 1;
         });
-        // Combined release: merge early_finished batch with the +1 init release
-        // into a single atomic fetch_add (saves one acq_rel cache-line bounce per task).
-        int32_t initial_refcount = early_finished + 1;  // +1 for the init release
-        int32_t new_rc =
-            cur_slot_state.fanin_refcount.fetch_add(initial_refcount, std::memory_order_acq_rel) + initial_refcount;
-        if (new_rc >= fanin_count + 1) {
-            PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
-            sched->ready_queues[static_cast<int32_t>(shape)].push(&cur_slot_state);
+
+        // Push to per-ring wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
+        while (!sched->ring_sched_states[ring_id].wiring_queue.push(&cur_slot_state)) {
+            SPIN_WAIT_HINT();
         }
-        // Record dep pool watermark in local slot state (used by tail reclamation)
-        cur_slot_state.dep_pool_mark = orch->rings[ring_id].dep_pool.top;
 #if PTO2_ORCH_PROFILING
-        // Per producer: fetch_add(fanout_count) + load(task_state) + store(unlock) = 3 atomics
-        // Lock atomics (loads + CAS) are counted inside pto2_fanout_lock
-        g_orch_fanin_atomic_count += fanin_count * 3;
-        if (early_finished > 0) {
-            g_orch_fanin_atomic_count += 1;  // fanin_refcount.fetch_add
-        }
+        g_orch_fanin_atomic_count += 0;  // No lock/atomic ops in submit hot path
 #endif
     }
 
@@ -887,10 +834,7 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
 #endif
 
     int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
-    orch->tensor_map.sync_tensormap(ring_id, sm_last_task_alive);
-    if (prepared.sched != nullptr) {
-        orch->rings[ring_id].dep_pool.reclaim(*prepared.sched, ring_id, sm_last_task_alive);
-    }
+    orch->tensor_map.sync_tensormap(prepared.task_id, sm_last_task_alive);
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, prepared.task_id.raw);
 
     task.task_id = prepared.task_id;
@@ -948,17 +892,10 @@ void pto2_orchestrator_done(PTO2OrchestratorState *orch) {
             LOG_INFO("=== [Orchestrator] ring %d: total_tasks=%d ===", r, total_tasks);
         }
         auto &fanin_pool = orch->rings[r].fanin_pool;
-        auto &pool = orch->rings[r].dep_pool;
         if (fanin_pool.top > 1) {
             LOG_INFO(
                 "=== [FaninPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===", r, fanin_pool.top,
                 fanin_pool.tail, fanin_pool.top - fanin_pool.tail, fanin_pool.high_water, fanin_pool.capacity
-            );
-        }
-        if (pool.top > 0) {
-            LOG_INFO(
-                "=== [DepPool %d] top=%d tail=%d used=%d high_water=%d capacity=%d ===", r, pool.top, pool.tail,
-                pool.top - pool.tail, pool.high_water, pool.capacity
             );
         }
     }
@@ -990,9 +927,6 @@ void pto2_orchestrator_print_stats(PTO2OrchestratorState *orch) {
             );
             LOG_INFO(
                 "Ring %d fanin pool:   %d / %d", r, orch->rings[r].fanin_pool.used(), orch->rings[r].fanin_pool.capacity
-            );
-            LOG_INFO(
-                "Ring %d dep pool:     %d / %d", r, orch->rings[r].dep_pool.used(), orch->rings[r].dep_pool.capacity
             );
         }
     }

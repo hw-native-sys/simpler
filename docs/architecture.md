@@ -68,9 +68,10 @@ The PTO Runtime consists of **three separate programs** that communicate through
 **Key Responsibilities:**
 
 - Initialize handshake protocol with AICore cores
-- Identify initially ready tasks (fanin=0)
+- Wire fanout dependency edges from orchestrator's wiring queue (scheduler thread 0)
+- Identify ready tasks (fanin satisfied) and enqueue to ready queues
 - Dispatch ready tasks to idle AICore cores
-- Track task completion and update dependencies
+- Track task completion and notify downstream consumers
 - Continue until all tasks complete
 
 ### 3. AICore Kernel (`src/{arch}/platform/*/aicore/`)

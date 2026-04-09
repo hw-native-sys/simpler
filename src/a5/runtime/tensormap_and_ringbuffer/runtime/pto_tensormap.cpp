@@ -234,11 +234,15 @@ int32_t PTO2TensorMap::valid_count() {
     return count;
 }
 
-void PTO2TensorMap::sync_tensormap(uint8_t ring_id, int32_t sm_last_task_alive) {
+void PTO2TensorMap::sync_tensormap(PTO2TaskId task_id, int32_t sm_last_task_alive) {
+    auto ring_id = task_id.ring();
+    auto local_id = task_id.local();
     sync_validity(ring_id, sm_last_task_alive);
+
     // Only attempt cleanup when last_task_alive has actually advanced;
     // otherwise cleanup_retired would empty-loop and we'd spin forever.
-    if (sm_last_task_alive - last_cleanup[ring_id] >= PTO2_TENSORMAP_CLEANUP_INTERVAL) {
+    auto overlap = get_task_local_id_slot(ring_id, local_id) == get_task_local_id_slot(ring_id, last_cleanup[ring_id]);
+    if (sm_last_task_alive - last_cleanup[ring_id] >= PTO2_TENSORMAP_CLEANUP_INTERVAL || overlap) {
         cleanup_retired(ring_id, last_cleanup[ring_id], sm_last_task_alive);
         last_cleanup[ring_id] = sm_last_task_alive;
     }

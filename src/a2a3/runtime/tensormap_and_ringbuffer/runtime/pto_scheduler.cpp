@@ -148,6 +148,9 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHandle *sm_handle,
         slot_states[i].ring_id = 0;
     }
 
+    wiring_batch_count = 0;
+    wiring_batch_index = 0;
+
     return true;
 }
 
@@ -157,7 +160,7 @@ void PTO2SchedulerState::RingSchedState::destroy() {
     slot_states = nullptr;
 }
 
-bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_handle) {
+bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_handle, int32_t dep_pool_capacity) {
     sched->sm_handle = sm_handle;
 #if PTO2_SCHED_PROFILING
     sched->tasks_completed.store(0, std::memory_order_relaxed);
@@ -188,12 +191,49 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
         }
     }
 
+    // Initialize per-ring wiring queues and dep pools (exclusively managed by scheduler thread 0)
+    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        if (!pto2_ready_queue_init(&sched->ring_sched_states[r].wiring_queue, PTO2_WRIRING_QUEUE_SIZE)) {
+            for (int j = 0; j < r; j++) {
+                pto2_ready_queue_destroy(&sched->ring_sched_states[j].wiring_queue);
+                free(sched->ring_sched_states[j].dep_pool.base);
+            }
+            for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+                pto2_ready_queue_destroy(&sched->ready_queues[i]);
+            }
+            for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
+                sched->ring_sched_states[rr].destroy();
+            }
+            return false;
+        }
+        PTO2DepListEntry *dep_entries =
+            reinterpret_cast<PTO2DepListEntry *>(calloc(dep_pool_capacity, sizeof(PTO2DepListEntry)));
+        if (!dep_entries) {
+            pto2_ready_queue_destroy(&sched->ring_sched_states[r].wiring_queue);
+            for (int j = 0; j < r; j++) {
+                pto2_ready_queue_destroy(&sched->ring_sched_states[j].wiring_queue);
+                free(sched->ring_sched_states[j].dep_pool.base);
+            }
+            for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
+                pto2_ready_queue_destroy(&sched->ready_queues[i]);
+            }
+            for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
+                sched->ring_sched_states[rr].destroy();
+            }
+            return false;
+        }
+        sched->ring_sched_states[r].dep_pool.init(dep_entries, dep_pool_capacity, &sm_handle->header->orch_error_code);
+    }
+
     return true;
 }
 
 void pto2_scheduler_destroy(PTO2SchedulerState *sched) {
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         sched->ring_sched_states[r].destroy();
+        free(sched->ring_sched_states[r].dep_pool.base);
+        sched->ring_sched_states[r].dep_pool.base = nullptr;
+        pto2_ready_queue_destroy(&sched->ring_sched_states[r].wiring_queue);
     }
 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
@@ -211,6 +251,13 @@ void pto2_scheduler_print_stats(PTO2SchedulerState *sched) {
         if (sched->ring_sched_states[r].last_task_alive > 0) {
             LOG_INFO("Ring %d:", r);
             LOG_INFO("  last_task_alive: %d", sched->ring_sched_states[r].last_task_alive);
+            auto &dp = sched->ring_sched_states[r].dep_pool;
+            if (dp.top > 0) {
+                LOG_INFO(
+                    "  dep_pool: top=%d tail=%d used=%d high_water=%d capacity=%d", dp.top, dp.tail, dp.top - dp.tail,
+                    dp.high_water, dp.capacity
+                );
+            }
         }
     }
 #if PTO2_SCHED_PROFILING

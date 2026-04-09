@@ -30,8 +30,8 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
     RTOL = 1e-3
     ATOL = 1e-3
     RUNTIME_ENV = {
-        "PTO2_RING_TASK_WINDOW": "128",
-        "PTO2_RING_HEAP": "262144",
+        "PTO2_RING_TASK_WINDOW": "64",
+        "PTO2_RING_HEAP": "2621440",
         "PTO2_RING_DEP_POOL": "256",
     }
 

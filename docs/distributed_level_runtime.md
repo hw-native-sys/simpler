@@ -41,9 +41,12 @@ User code ──►  DistOrchestrator                   DistScheduler
                │                                   │
                │ submit(callable, args, config)     │
                │   1. alloc ring slot               │
-               │   2. TensorMap: build deps         │
-               │   3. fanin wiring                  │
-               │   4. if ready → push ready_queue ─►│
+               │   2. TensorMap: lookup deps        │
+               │   3. record fanin metadata         │
+               │   4. push wiring_queue ───────────►│
+               │                                    │ Phase 0: drain wiring_queue
+               │                                    │   wire fanout edges (lock + dep_pool)
+               │                                    │   if ready → push ready_queue
                │                                    │ pop ready_queue
                │                                    │ pick idle WorkerThread
                │                                    │ dispatch(payload) ──────► IWorker::run()
@@ -60,12 +63,13 @@ User code ──►  DistOrchestrator                   DistScheduler
 **Orchestrator** (main thread, single-threaded):
 
 - Owns TensorMap, Scope, Ring alloc side — no locks needed
-- Builds the DAG: for each submit, looks up input tensors to find producers, wires fanin/fanout edges
-- Pushes READY tasks to the ready queue
+- Builds the dependency metadata: for each submit, looks up input tensors to find producers, records fanin pointers in payload, increments producers' `fanout_count`
+- Pushes tasks to scheduler's wiring queue for asynchronous fanout edge construction
 
 **Scheduler** (dedicated C++ thread):
 
-- Pops tasks from ready queue, finds idle WorkerThreads, dispatches
+- **Wiring**: drains wiring queue, wires fanout edges (acquires `fanout_lock`, allocates dep_pool entries), determines task readiness
+- Pops ready tasks from ready queue, finds idle WorkerThreads, dispatches
 - Receives completion callbacks from WorkerThreads
 - Releases fanout refs, wakes downstream consumers, retires consumed slots
 

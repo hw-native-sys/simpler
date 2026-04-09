@@ -221,6 +221,10 @@ struct PTO2TensorMap {
 
     PTO2OrchestratorState *orch{nullptr};
 
+    uint32_t get_task_local_id_slot(uint8_t ring_id, uint32_t task_local_id) const {
+        return task_local_id & (task_window_sizes[ring_id] - 1);
+    }
+
     // new_entry only allocates memory, does not assign attributes
     PTO2TensorMapEntry *new_entry() {
         if (free_num > 0) {
@@ -507,7 +511,7 @@ struct PTO2TensorMap {
      * Called periodically to refresh the lazy invalidation threshold.
      * Also triggers cleanup if threshold has advanced significantly.
      */
-    void sync_tensormap(uint8_t ring_id, int32_t sm_last_task_alive);
+    void sync_tensormap(PTO2TaskId task_id, int32_t sm_last_task_alive);
 };
 
 #if PTO2_TENSORMAP_PROFILING

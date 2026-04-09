@@ -666,7 +666,6 @@ struct PTO2DepListPool {
 struct PTO2RingSet {
     PTO2TaskAllocator task_allocator;
     PTO2FaninPool fanin_pool;
-    PTO2DepListPool dep_pool;
 };
 
 #endif  // PTO_RING_BUFFER_H

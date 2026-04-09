@@ -438,6 +438,19 @@ struct PTO2SchedulerState {
         // Try-lock used to advance this ring's last_task_alive pointer.
         std::atomic<int32_t> advance_lock;
 
+        // Dep pool for fanout wiring (exclusively managed by scheduler thread 0)
+        PTO2DepListPool dep_pool;
+
+        // Per-ring wiring queue: orchestrator pushes tasks, scheduler thread 0 pops and wires.
+        PTO2ReadyQueue wiring_queue;
+
+        // Local batch buffer for drain_wiring_queue (scheduler thread 0 only).
+        // Persists across calls so partially-consumed batches resume next call.
+        static constexpr int WIRING_BATCH_SIZE = 32;
+        PTO2TaskSlotState *wiring_batch[WIRING_BATCH_SIZE];
+        int wiring_batch_count = 0;
+        int wiring_batch_index = 0;
+
         bool init(PTO2SharedMemoryHandle *sm_handle, int32_t ring_id);
         void destroy();
 
@@ -476,9 +489,99 @@ struct PTO2SchedulerState {
     // =========================================================================
     // Inline hot-path methods
     // =========================================================================
+
+    /**
+     * Drain wiring queue: pop submitted tasks and wire their fanout edges.
+     * Called by scheduler thread 0 each loop iteration. Sets fanin_count,
+     * acquires fanout_lock per producer, allocates dep_pool entries, and
+     * pushes ready tasks to the appropriate ready queue.
+     *
+     * @return Number of tasks wired this call.
+     */
+    int drain_wiring_queue() {
+        int wired = 0;
+        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+            wired += drain_ring_wiring_queue(r);
+        }
+        return wired;
+    }
+
+    /**
+     * Drain the wiring queue for a single ring. See drain_wiring_queue() for
+     * the peek/pop_batch FIFO protocol. Returns the number of tasks wired.
+     */
+    int drain_ring_wiring_queue(int ring_id) {
+        auto &rss = ring_sched_states[ring_id];
+        int wired = 0;
+
+        // Refill local batch buffer when exhausted.
+        if (rss.wiring_batch_index >= rss.wiring_batch_count) {
+            rss.wiring_batch_count = rss.wiring_queue.pop_batch(rss.wiring_batch, RingSchedState::WIRING_BATCH_SIZE);
+            rss.wiring_batch_index = 0;
+            if (rss.wiring_batch_count == 0) return 0;
+        }
+
+        // Process tasks from local buffer in strict FIFO order.
+        while (rss.wiring_batch_index < rss.wiring_batch_count) {
+            PTO2TaskSlotState *ws = rss.wiring_batch[rss.wiring_batch_index];
+            int32_t wfanin = ws->payload->fanin_actual_count;
+
+            if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
+                rss.dep_pool.reclaim(*this, ring_id, rss.last_task_alive);
+                if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
+                    break;  // not enough dep_pool space — keep remainder for next call
+                }
+            }
+
+            rss.wiring_batch_index++;
+            wire_task(ring_id, ws);
+            wired++;
+        }
+
+        return wired;
+    }
+
+    /**
+     * Wire fanout edges for a single task. Sets fanin_count, acquires each
+     * producer's fanout_lock, allocates dep_pool entries for live producers,
+     * pushes the task to the ready queue once its fanin refcount is satisfied.
+     */
+    void wire_task(int ring_id, PTO2TaskSlotState *ws) {
+        auto &rss = ring_sched_states[ring_id];
+        PTO2TaskPayload *wp = ws->payload;
+        int32_t wfanin = wp->fanin_actual_count;
+        ws->fanin_count = wfanin + 1;
+
+        if (wfanin != 0) {
+            int32_t early_finished = 0;
+            pto2_for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
+                pto2_fanout_lock(*producer);
+                int32_t pstate = producer->task_state.load(std::memory_order_acquire);
+                if (pstate >= PTO2_TASK_COMPLETED) {
+                    early_finished++;
+                } else {
+                    producer->fanout_head = rss.dep_pool.prepend(producer->fanout_head, ws);
+                }
+                pto2_fanout_unlock(*producer);
+            });
+
+            int32_t init_rc = early_finished + 1;
+            int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
+            if (new_rc >= ws->fanin_count) {
+                ready_queues[static_cast<int32_t>(pto2_active_mask_to_shape(ws->active_mask))].push(ws);
+            }
+        } else {
+            ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
+            ready_queues[static_cast<int32_t>(pto2_active_mask_to_shape(ws->active_mask))].push(ws);
+        }
+
+        ws->dep_pool_mark = rss.dep_pool.top;
+    }
+
     PTO2TaskSlotState &get_slot_state(int32_t ring_id, int32_t local_id) {
         return ring_sched_states[ring_id].get_slot_state_by_task_id(local_id);
     }
+
     PTO2TaskSlotState &get_slot_state_by_slot(int32_t ring_id, int32_t slot) {
         return ring_sched_states[ring_id].get_slot_state_by_slot(slot);
     }
@@ -784,7 +887,9 @@ struct PTO2SchedulerState {
 // Scheduler API (cold path, defined in pto_scheduler.cpp)
 // =============================================================================
 
-bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_handle);
+bool pto2_scheduler_init(
+    PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_handle, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
+);
 void pto2_scheduler_destroy(PTO2SchedulerState *sched);
 
 // =============================================================================

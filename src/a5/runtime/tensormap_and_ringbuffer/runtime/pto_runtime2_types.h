@@ -111,6 +111,9 @@
 // Ready queue
 #define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
 
+// Wiring queue
+#define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
+
 // Memory alignment
 #define PTO2_ALIGN_SIZE 64             // Cache line alignment
 #define PTO2_PACKED_OUTPUT_ALIGN 1024  // Each output in packed buffer aligned to 1024B; gap is padding

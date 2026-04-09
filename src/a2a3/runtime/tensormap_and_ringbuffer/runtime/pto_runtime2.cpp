@@ -248,7 +248,7 @@ PTO2Runtime *pto2_runtime_create_custom(
     }
 
     // Initialize scheduler (heap_size = per-ring heap size)
-    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle)) {
+    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle, dep_pool_capacity)) {
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt->gm_heap);
         pto2_sm_destroy(rt->sm_handle);
@@ -284,7 +284,7 @@ PTO2Runtime *pto2_runtime_create_from_sm(
     }
 
     // Initialize scheduler (heap_size = per-ring heap size)
-    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle)) {
+    if (!pto2_scheduler_init(&rt->scheduler, rt->sm_handle, dep_pool_capacity)) {
         pto2_orchestrator_destroy(&rt->orchestrator);
         free(rt);
         return NULL;
