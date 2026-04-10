@@ -15,7 +15,7 @@ for benchmarking multi-round execution.
 
 from pathlib import Path
 
-from task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
+from simpler.task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
 
 _KERNELS_ROOT = Path(__file__).parent
 _PA_KERNELS = _KERNELS_ROOT.parent.parent / "paged_attention" / "kernels"

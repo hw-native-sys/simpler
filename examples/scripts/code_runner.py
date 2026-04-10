@@ -68,7 +68,7 @@ import torch  # type: ignore[import-not-found]
 # =============================================================================
 # Argument construction — uses nanobind bindings from task_interface
 # =============================================================================
-from task_interface import (  # type: ignore[import-not-found]
+from simpler.task_interface import (  # type: ignore[import-not-found]
     CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
@@ -707,9 +707,9 @@ class CodeRunner:
            - Compare with golden
         """
         # Import runtime modules (deferred import to avoid top-level dependency)
-        from elf_parser import extract_text_section  # noqa: PLC0415
-        from kernel_compiler import KernelCompiler  # noqa: PLC0415
         from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler.elf_parser import extract_text_section  # noqa: PLC0415
+        from simpler.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
         # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
         pto_isa_root = _ensure_pto_isa_root(

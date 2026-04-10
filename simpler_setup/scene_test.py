@@ -156,7 +156,12 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
         output_names: list of tensor names that are OUTPUT or INOUT
     """
     ensure_python_path()
-    from task_interface import ArgDirection, ChipStorageTaskArgs, make_tensor_arg, scalar_to_uint64  # noqa: PLC0415
+    from simpler.task_interface import (  # noqa: PLC0415
+        ArgDirection,
+        ChipStorageTaskArgs,
+        make_tensor_arg,
+        scalar_to_uint64,
+    )
 
     chip_args = ChipStorageTaskArgs()
     output_names: list[str] = []
@@ -285,7 +290,7 @@ class SceneTestCase:
         from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
         ensure_python_path()
-        from task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
+        from simpler.task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
 
         pto_isa_root = ensure_pto_isa_root()
         kc = KernelCompiler(platform=platform)
@@ -325,7 +330,7 @@ class SceneTestCase:
     @classmethod
     def _create_worker(cls, platform, device_id=0):
         ensure_python_path()
-        from task_interface import ChipWorker  # noqa: PLC0415
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415
 
         bins = cls._get_binaries(platform)
         w = ChipWorker()
@@ -348,7 +353,7 @@ class SceneTestCase:
 
     def _build_config(self, config_dict):
         ensure_python_path()
-        from task_interface import CallConfig  # noqa: PLC0415
+        from simpler.task_interface import CallConfig  # noqa: PLC0415
 
         config = CallConfig()
         config.block_dim = config_dict.get("block_dim", 1)

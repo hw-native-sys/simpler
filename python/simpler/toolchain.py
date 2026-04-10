@@ -13,7 +13,7 @@ import os
 import subprocess
 from enum import IntEnum
 
-import env_manager
+from . import env_manager
 
 
 # Must match compile_strategy.h

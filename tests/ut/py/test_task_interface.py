@@ -112,7 +112,7 @@ class TestGetDtypeName:
 class TestTaskInterfaceWrapper:
     def test_torch_dtype_to_datatype(self):
         import torch  # pyright: ignore[reportMissingImports]
-        from task_interface import torch_dtype_to_datatype
+        from simpler.task_interface import torch_dtype_to_datatype
 
         assert torch_dtype_to_datatype(torch.float32) == DataType.FLOAT32
         assert torch_dtype_to_datatype(torch.int8) == DataType.INT8
@@ -120,14 +120,14 @@ class TestTaskInterfaceWrapper:
 
     def test_torch_dtype_unsupported(self):
         import torch  # pyright: ignore[reportMissingImports]
-        from task_interface import torch_dtype_to_datatype
+        from simpler.task_interface import torch_dtype_to_datatype
 
         with pytest.raises(KeyError):
             torch_dtype_to_datatype(torch.complex64)
 
     def test_make_tensor_arg(self):
         import torch  # pyright: ignore[reportMissingImports]
-        from task_interface import make_tensor_arg
+        from simpler.task_interface import make_tensor_arg
 
         t = torch.zeros(4, 8, dtype=torch.float32)
         arg = make_tensor_arg(t)
@@ -138,17 +138,17 @@ class TestTaskInterfaceWrapper:
         assert arg.nbytes() == 4 * 8 * 4
 
     def test_scalar_to_uint64_int(self):
-        from task_interface import scalar_to_uint64
+        from simpler.task_interface import scalar_to_uint64
 
         assert scalar_to_uint64(999) == 999
 
     def test_scalar_to_uint64_ctypes(self):
-        from task_interface import scalar_to_uint64
+        from simpler.task_interface import scalar_to_uint64
 
         assert scalar_to_uint64(ctypes.c_int64(42)) == 42
 
     def test_scalar_to_uint64_float_ctypes(self):
-        from task_interface import scalar_to_uint64
+        from simpler.task_interface import scalar_to_uint64
 
         bits = scalar_to_uint64(ctypes.c_float(1.5))
         expected_bits = struct.unpack("I", struct.pack("f", 1.5))[0]

@@ -18,7 +18,7 @@ function is compiled into the AICPU binary rather than loaded as a separate SO.
 
 from pathlib import Path
 
-from task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
+from simpler.task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
 
 _KERNELS_ROOT = Path(__file__).parent
 

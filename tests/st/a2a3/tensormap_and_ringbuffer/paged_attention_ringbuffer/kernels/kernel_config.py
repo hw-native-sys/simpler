@@ -24,7 +24,7 @@ Environment overrides:
 
 from pathlib import Path
 
-from task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
+from simpler.task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
 
 # Point to paged_attention's kernel sources (no duplication)
 _PA_KERNELS = Path(__file__).parent / ".." / ".." / "paged_attention" / "kernels"

@@ -273,7 +273,7 @@ Create a `test_*.py` file using the `@scene_test` decorator:
 
 ```python
 from setup import SceneTestCase, scene_test
-from task_interface import ArgDirection as D
+from simpler.task_interface import ArgDirection as D
 
 @scene_test(level=2, platforms=["a2a3sim", "a2a3"], runtime="tensormap_and_ringbuffer")
 class TestMyKernel(SceneTestCase):

@@ -128,7 +128,7 @@ def st_worker(request, st_platform, device_pool):
         if not ids:
             pytest.fail("no devices available")
 
-        from worker import Worker  # noqa: PLC0415
+        from simpler.worker import Worker  # noqa: PLC0415
 
         w = Worker(level=2, device_id=ids[0], platform=st_platform, runtime=runtime)
         w.init()
@@ -143,7 +143,7 @@ def st_worker(request, st_platform, device_pool):
         if not ids:
             pytest.fail(f"need {max_devices} devices")
 
-        from worker import Worker  # noqa: PLC0415
+        from simpler.worker import Worker  # noqa: PLC0415
 
         w = Worker(level=3, device_ids=ids, num_sub_workers=max_subs, platform=st_platform, runtime=runtime)
         w.init()

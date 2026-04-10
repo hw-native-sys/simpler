@@ -50,7 +50,7 @@ for d in (PYTHON_DIR, SCRIPTS_DIR, GOLDEN_DIR):
     if d.exists() and str(d) not in sys.path:
         sys.path.insert(0, str(d))
 
-from task_interface import (  # noqa: E402  # type: ignore[import-not-found]
+from simpler.task_interface import (  # noqa: E402  # type: ignore[import-not-found]
     CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
@@ -276,9 +276,9 @@ def compile_task(
     run_all_cases: bool = False,
 ) -> CompiledTask:
     """Compile orchestration + kernels for a single task, return CompiledTask."""
-    from elf_parser import extract_text_section  # noqa: PLC0415
-    from kernel_compiler import KernelCompiler  # noqa: PLC0415
     from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+    from simpler.elf_parser import extract_text_section  # noqa: PLC0415
+    from simpler.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
     # Load kernel_config and golden
     kc = _load_module(spec.kernels_dir / "kernel_config.py", f"kc_{id(spec)}")

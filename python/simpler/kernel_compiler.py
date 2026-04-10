@@ -15,8 +15,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Union
 
-import env_manager
-from toolchain import (
+from . import env_manager
+from .toolchain import (
     Aarch64GxxToolchain,
     CCECToolchain,
     Gxx15Toolchain,
@@ -59,7 +59,7 @@ class KernelCompiler:
             FileNotFoundError: If required compiler not found
         """
         self.platform = platform
-        self.project_root = Path(__file__).parent.parent
+        self.project_root = Path(__file__).parent.parent.parent
 
         # Map platform to architecture directory
         if platform in ("a2a3", "a2a3sim"):

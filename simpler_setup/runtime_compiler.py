@@ -15,7 +15,7 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Union
 
-import env_manager
+from simpler import env_manager
 
 from .environment import PROJECT_ROOT
 from .toolchain import Aarch64GxxToolchain, CCECToolchain, GxxToolchain, Toolchain

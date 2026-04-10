@@ -15,8 +15,8 @@ import tempfile
 from pathlib import Path
 from typing import Optional, Union
 
-import env_manager
-from toolchain import Aarch64GxxToolchain, CCECToolchain, GxxToolchain, Toolchain
+from . import env_manager
+from .toolchain import Aarch64GxxToolchain, CCECToolchain, GxxToolchain, Toolchain
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +78,7 @@ class RuntimeCompiler:
 
     def __init__(self, platform: str = "a2a3"):
         self.platform = platform
-        self.project_root = Path(__file__).parent.parent
+        self.project_root = Path(__file__).parent.parent.parent
 
         # Map platform name to architecture path
         if platform == "a2a3":

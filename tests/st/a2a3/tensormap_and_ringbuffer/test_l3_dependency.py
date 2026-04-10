@@ -19,16 +19,16 @@ from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 import torch
-from task_interface import (
+from simpler.task_interface import (
     ArgDirection as D,
 )
-from task_interface import (
+from simpler.task_interface import (
     ChipStorageTaskArgs,
     WorkerPayload,
     WorkerType,
     make_tensor_arg,
 )
-from worker import Task, Worker
+from simpler.worker import Task, Worker
 
 from simpler_setup import SceneTestCase, scene_test
 

@@ -10,7 +10,7 @@
 """Tensormap-and-ringbuffer vector example: f = (a+b+1)*(a+b+2) + (a+b)."""
 
 import torch
-from task_interface import ArgDirection as D
+from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 

@@ -84,7 +84,7 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 The **RuntimeCompiler** class handles compilation of all three components separately:
 
 ```python
-from runtime_compiler import RuntimeCompiler
+from simpler.runtime_compiler import RuntimeCompiler
 
 # For real Ascend hardware (requires CANN toolkit)
 compiler = RuntimeCompiler(platform="a2a3")
@@ -140,7 +140,7 @@ TEST PASSED
 ### Python API Example
 
 ```python
-from task_interface import ChipWorker, CallConfig
+from simpler.task_interface import ChipWorker, CallConfig
 from runtime_builder import RuntimeBuilder
 
 # Build or locate pre-built runtime binaries

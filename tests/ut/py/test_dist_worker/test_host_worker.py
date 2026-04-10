@@ -17,8 +17,8 @@ import time as _time
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
-from task_interface import WorkerPayload, WorkerType
-from worker import Task, Worker
+from simpler.task_interface import WorkerPayload, WorkerType
+from simpler.worker import Task, Worker
 
 # ---------------------------------------------------------------------------
 # Helpers

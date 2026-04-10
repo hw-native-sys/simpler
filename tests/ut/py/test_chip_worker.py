@@ -111,10 +111,10 @@ class TestChipWorkerStateMachine:
 
 class TestChipWorkerPython:
     def test_import(self):
-        from task_interface import (  # noqa: PLC0415
+        from simpler.task_interface import (  # noqa: PLC0415
             CallConfig as PyCallConfig,  # pyright: ignore[reportAttributeAccessIssue]
         )
-        from task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
+        from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
 
         worker = ChipWorker()
         assert worker.initialized is False

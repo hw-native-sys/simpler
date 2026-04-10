@@ -15,7 +15,7 @@ from pathlib import Path
 from typing import Optional
 
 from platform_info import TARGETS, load_build_config, parse_platform
-from runtime_compiler import RuntimeCompiler
+from simpler.runtime_compiler import RuntimeCompiler
 
 logger = logging.getLogger(__name__)
 

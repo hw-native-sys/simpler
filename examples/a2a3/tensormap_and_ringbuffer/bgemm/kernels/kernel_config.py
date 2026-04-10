@@ -14,7 +14,7 @@ Cube core (AIC) for matrix multiplication, Vector core (AIV) for element-wise ad
 
 from pathlib import Path
 
-from task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
+from simpler.task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
 
 _KERNELS_ROOT = Path(__file__).parent
 

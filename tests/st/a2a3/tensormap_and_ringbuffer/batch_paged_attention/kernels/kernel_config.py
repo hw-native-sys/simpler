@@ -23,7 +23,7 @@ AIV Kernels (Vector Operations):
 
 from pathlib import Path
 
-from task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
+from simpler.task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
 
 _KERNELS_ROOT = Path(__file__).parent
 

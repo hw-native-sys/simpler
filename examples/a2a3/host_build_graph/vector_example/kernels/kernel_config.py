@@ -15,7 +15,7 @@ Supports both hardware (a2a3) and simulation (a2a3sim) platforms.
 
 from pathlib import Path
 
-from task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
+from simpler.task_interface import ArgDirection as D  # pyright: ignore[reportAttributeAccessIssue]
 
 _KERNELS_ROOT = Path(__file__).parent
 

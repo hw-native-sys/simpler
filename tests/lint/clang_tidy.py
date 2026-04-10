@@ -34,7 +34,7 @@ for _import_dir in (_ROOT / "python", _ROOT / "examples" / "scripts"):
         sys.path.insert(0, _import_dir_str)
 
 from platform_info import load_build_config, to_platform  # noqa: E402
-from runtime_compiler import RuntimeCompiler  # noqa: E402
+from simpler.runtime_compiler import RuntimeCompiler  # noqa: E402
 
 # Suppress compiler flags that are valid for GCC but unknown to clang.
 _SUPPRESS_ARGS = [

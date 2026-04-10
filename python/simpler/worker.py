@@ -40,11 +40,11 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 # Make sure examples/scripts is importable for runtime_builder
-_SCRIPTS = str(Path(__file__).parent.parent / "examples" / "scripts")
+_SCRIPTS = str(Path(__file__).parent.parent.parent / "examples" / "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
-from task_interface import (  # noqa: E402
+from .task_interface import (  # noqa: E402
     DIST_CHIP_MAILBOX_SIZE,
     DIST_SUB_MAILBOX_SIZE,
     ChipWorker,
@@ -294,7 +294,8 @@ class Worker:
         # 3. Fork ChipWorker processes (only if device_ids provided)
         if device_ids:
             from runtime_builder import RuntimeBuilder  # noqa: PLC0415
-            from task_interface import ChipStorageTaskArgs as _CSA  # noqa: PLC0415
+
+            from .task_interface import ChipStorageTaskArgs as _CSA  # noqa: PLC0415
 
             platform = self._config["platform"]
             runtime = self._config["runtime"]
@@ -361,7 +362,7 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             if isinstance(task_or_payload, WorkerPayload):
-                from task_interface import CallConfig  # noqa: PLC0415
+                from .task_interface import CallConfig  # noqa: PLC0415
 
                 config = CallConfig()
                 config.block_dim = task_or_payload.block_dim
