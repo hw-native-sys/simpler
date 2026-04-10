@@ -118,18 +118,35 @@ destroy_device_context(ctx);
 ### Layer 3: Python API (`python/bindings/task_interface.cpp` via nanobind)
 
 ```python
-from simpler.task_interface import ChipWorker, ChipCallable, ChipStorageTaskArgs, CallConfig
+from simpler.task_interface import ChipWorker, ChipCallable, ChipStorageTaskArgs, ChipCallConfig
 
 worker = ChipWorker()
 worker.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path="")
 worker.set_device(device_id)
 
-config = CallConfig()
+config = ChipCallConfig()
 config.block_dim = 24
 config.aicpu_thread_num = 3
 worker.run(callable, args, config)
 worker.finalize()
 ```
+
+### Python Type Naming Convention
+
+Layer 3 Python types use a **level-prefixed naming convention** that mirrors the
+level model (see [Distributed Level Runtime](distributed_level_runtime.md)):
+
+| Concept | L2 (Chip) type | L3+ (Distributed) type | Unified factory |
+| ------- | -------------- | ---------------------- | --------------- |
+| Worker | `ChipWorker` | `DistWorker` | `Worker(level=N)` |
+| Callable | `ChipCallable` | *(planned)* | — |
+| TaskArgs | `ChipStorageTaskArgs` | *(planned)* | — |
+| Config | `ChipCallConfig` | *(planned)* | — |
+
+The unified `Worker(level=N)` factory already routes to the correct backend.
+When new level-specific types are added (e.g. `DistCallConfig`), each concept
+should follow the same pattern: a `Chip*` concrete type for L2, a `Dist*`
+concrete type for L3+, and optionally a factory function that routes by level.
 
 ## Execution Flow
 
@@ -161,7 +178,7 @@ worker.set_device(device_id)
 ### 3. Execution Phase
 
 ```text
-worker.run(callable, args, CallConfig(block_dim, aicpu_thread_num))
+worker.run(callable, args, ChipCallConfig(block_dim, aicpu_thread_num))
   │
   └─→ run_runtime(ctx, runtime, callable, args, ...)
        │

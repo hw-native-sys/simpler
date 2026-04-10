@@ -362,9 +362,9 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             if isinstance(task_or_payload, WorkerPayload):
-                from .task_interface import CallConfig  # noqa: PLC0415
+                from .task_interface import ChipCallConfig  # noqa: PLC0415
 
-                config = CallConfig()
+                config = ChipCallConfig()
                 config.block_dim = task_or_payload.block_dim
                 config.aicpu_thread_num = task_or_payload.aicpu_thread_num
                 config.enable_profiling = task_or_payload.enable_profiling

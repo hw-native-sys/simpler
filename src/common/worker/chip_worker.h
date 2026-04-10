@@ -18,7 +18,7 @@
 
 #include "dist_types.h"
 
-struct CallConfig {
+struct ChipCallConfig {
     int block_dim = 24;
     int aicpu_thread_num = 3;
     bool enable_profiling = false;
@@ -55,7 +55,7 @@ public:
     void run(const WorkerPayload &payload) override;
 
     // Direct invocation (used by Python wrapper and internal tests).
-    void run(const void *callable, const void *args, const CallConfig &config);
+    void run(const void *callable, const void *args, const ChipCallConfig &config);
 
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }

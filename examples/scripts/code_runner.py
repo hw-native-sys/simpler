@@ -69,8 +69,8 @@ import torch  # type: ignore[import-not-found]
 # Argument construction — uses nanobind bindings from task_interface
 # =============================================================================
 from simpler.task_interface import (  # type: ignore[import-not-found]
-    CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
+    ChipCallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
     ChipWorker,  # pyright: ignore[reportAttributeAccessIssue]
     CoreCallable,  # pyright: ignore[reportAttributeAccessIssue]
@@ -884,7 +884,7 @@ class CodeRunner:
                 for k, v in initial_outputs.items():
                     outputs[k].copy_(v)
 
-                config = CallConfig()
+                config = ChipCallConfig()
                 config.block_dim = self.block_dim
                 config.aicpu_thread_num = self.aicpu_thread_num
                 if self.enable_profiling and round_idx == 0:

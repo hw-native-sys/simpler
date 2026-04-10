@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: E402
-"""Tests for CallConfig and ChipWorker state machine."""
+"""Tests for ChipCallConfig and ChipWorker state machine."""
 
 import sys
 from pathlib import Path
@@ -19,22 +19,22 @@ _python_dir = str(Path(__file__).resolve().parent.parent.parent / "python")
 if _python_dir not in sys.path:
     sys.path.insert(0, _python_dir)
 
-from _task_interface import CallConfig, _ChipWorker  # pyright: ignore[reportMissingImports]
+from _task_interface import ChipCallConfig, _ChipWorker  # pyright: ignore[reportMissingImports]
 
 # ============================================================================
-# CallConfig tests
+# ChipCallConfig tests
 # ============================================================================
 
 
-class TestCallConfig:
+class TestChipCallConfig:
     def test_defaults(self):
-        config = CallConfig()
+        config = ChipCallConfig()
         assert config.block_dim == 24
         assert config.aicpu_thread_num == 3
         assert config.enable_profiling is False
 
     def test_setters(self):
-        config = CallConfig()
+        config = ChipCallConfig()
         config.block_dim = 32
         config.aicpu_thread_num = 4
         config.enable_profiling = True
@@ -43,7 +43,7 @@ class TestCallConfig:
         assert config.enable_profiling is True
 
     def test_repr(self):
-        config = CallConfig()
+        config = ChipCallConfig()
         r = repr(config)
         assert "block_dim=24" in r
         assert "enable_profiling=False" in r
@@ -65,7 +65,7 @@ class TestChipWorkerStateMachine:
         from _task_interface import ChipCallable, ChipStorageTaskArgs  # noqa: PLC0415
 
         worker = _ChipWorker()
-        config = CallConfig()
+        config = ChipCallConfig()
         args = ChipStorageTaskArgs()
 
         # Build a minimal ChipCallable for the test
@@ -112,11 +112,11 @@ class TestChipWorkerStateMachine:
 class TestChipWorkerPython:
     def test_import(self):
         from simpler.task_interface import (  # noqa: PLC0415
-            CallConfig as PyCallConfig,  # pyright: ignore[reportAttributeAccessIssue]
+            ChipCallConfig as PyChipCallConfig,  # pyright: ignore[reportAttributeAccessIssue]
         )
         from simpler.task_interface import ChipWorker  # noqa: PLC0415  # pyright: ignore[reportAttributeAccessIssue]
 
         worker = ChipWorker()
         assert worker.initialized is False
         assert worker.device_set is False
-        assert isinstance(PyCallConfig(), CallConfig)
+        assert isinstance(PyChipCallConfig(), ChipCallConfig)

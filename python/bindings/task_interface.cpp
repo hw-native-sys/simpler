@@ -566,15 +566,15 @@ NB_MODULE(_task_interface, m) {
             return os.str();
         });
 
-    // --- CallConfig ---
-    nb::class_<CallConfig>(m, "CallConfig")
+    // --- ChipCallConfig ---
+    nb::class_<ChipCallConfig>(m, "ChipCallConfig")
         .def(nb::init<>())
-        .def_rw("block_dim", &CallConfig::block_dim)
-        .def_rw("aicpu_thread_num", &CallConfig::aicpu_thread_num)
-        .def_rw("enable_profiling", &CallConfig::enable_profiling)
-        .def("__repr__", [](const CallConfig &self) -> std::string {
+        .def_rw("block_dim", &ChipCallConfig::block_dim)
+        .def_rw("aicpu_thread_num", &ChipCallConfig::aicpu_thread_num)
+        .def_rw("enable_profiling", &ChipCallConfig::enable_profiling)
+        .def("__repr__", [](const ChipCallConfig &self) -> std::string {
             std::ostringstream os;
-            os << "CallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
+            os << "ChipCallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
                << ", enable_profiling=" << (self.enable_profiling ? "True" : "False") << ")";
             return os.str();
         });
@@ -591,7 +591,8 @@ NB_MODULE(_task_interface, m) {
         .def("finalize", &ChipWorker::finalize)
         .def(
             "run",
-            [](ChipWorker &self, const PyChipCallable &callable, ChipStorageTaskArgs &args, const CallConfig &config) {
+            [](ChipWorker &self, const PyChipCallable &callable, ChipStorageTaskArgs &args,
+               const ChipCallConfig &config) {
                 self.run(callable.buffer_.data(), &args, config);
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("config")
@@ -600,7 +601,7 @@ NB_MODULE(_task_interface, m) {
             "run_raw",
             [](ChipWorker &self, uint64_t callable, uint64_t args, int block_dim, int aicpu_thread_num,
                bool enable_profiling) {
-                CallConfig config;
+                ChipCallConfig config;
                 config.block_dim = block_dim;
                 config.aicpu_thread_num = aicpu_thread_num;
                 config.enable_profiling = enable_profiling;

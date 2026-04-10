@@ -353,9 +353,9 @@ class SceneTestCase:
 
     def _build_config(self, config_dict):
         ensure_python_path()
-        from simpler.task_interface import CallConfig  # noqa: PLC0415
+        from simpler.task_interface import ChipCallConfig  # noqa: PLC0415
 
-        config = CallConfig()
+        config = ChipCallConfig()
         config.block_dim = config_dict.get("block_dim", 1)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         return config

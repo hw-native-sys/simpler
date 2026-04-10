@@ -51,8 +51,8 @@ for d in (PYTHON_DIR, SCRIPTS_DIR, GOLDEN_DIR):
         sys.path.insert(0, str(d))
 
 from simpler.task_interface import (  # noqa: E402  # type: ignore[import-not-found]
-    CallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
+    ChipCallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
     ChipWorker,  # pyright: ignore[reportAttributeAccessIssue]
     CoreCallable,  # pyright: ignore[reportAttributeAccessIssue]
@@ -458,7 +458,7 @@ def run_single_task(
         golden_mod.compute_golden(golden_with_inputs, params)
 
         # Run on device
-        config = CallConfig()
+        config = ChipCallConfig()
         config.block_dim = runtime_config.get("block_dim", 24)
         config.aicpu_thread_num = runtime_config.get("aicpu_thread_num", 3)
 

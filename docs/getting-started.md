@@ -140,7 +140,7 @@ TEST PASSED
 ### Python API Example
 
 ```python
-from simpler.task_interface import ChipWorker, CallConfig
+from simpler.task_interface import ChipWorker
 from runtime_builder import RuntimeBuilder
 
 # Build or locate pre-built runtime binaries
@@ -155,9 +155,7 @@ worker.init(host_path=str(binaries.host_path),
 worker.set_device(device_id=0)
 
 # Execute callable on device
-config = CallConfig()
-config.block_dim = 24
-worker.run(chip_callable, orch_args, config)
+worker.run(chip_callable, orch_args, block_dim=24)
 
 # Cleanup
 worker.reset_device()
