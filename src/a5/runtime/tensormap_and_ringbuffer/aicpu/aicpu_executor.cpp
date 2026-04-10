@@ -1919,9 +1919,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             // Try memfd first (Linux only), fall back to file-based
             char so_path[256];
             void *handle = nullptr;
-            int memfd = -1;
 
 #if defined(__linux__)
+            int memfd = -1;
             // Attempt memfd-based loading first
             int memfd_rc = load_orchestration_so_with_memfd(so_data, so_size, thread_idx, &handle, so_path, &memfd);
 
