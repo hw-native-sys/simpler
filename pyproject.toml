@@ -65,7 +65,7 @@ reportRedeclaration = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "examples"]
-pythonpath = ["python"]
+pythonpath = ["python", "golden"]
 
 [tool.scikit-build]
 wheel.packages = ["simpler_setup"]
