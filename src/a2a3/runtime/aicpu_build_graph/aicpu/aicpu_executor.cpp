@@ -29,8 +29,10 @@
 #include "runtime.h"
 #include "spin_hint.h"
 
-// memfd-based SO loading
+// memfd-based SO loading (Linux only)
+#if defined(__linux__)
 #include "memfd_loader.h"
+#endif
 
 // Runtime headers (full struct definition for create/destroy + PTO2_SCOPE)
 #include "pto_runtime2.h"
@@ -1600,11 +1602,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 return -1;
             }
 
-            // Try memfd first, fall back to file-based
+            // Try memfd first (Linux only), fall back to file-based
             char so_path[256];
             void *handle = nullptr;
             int memfd = -1;
 
+#if defined(__linux__)
             // Attempt memfd-based loading first
             int memfd_rc = load_orchestration_so_with_memfd(so_data, so_size, thread_idx, &handle, so_path, &memfd);
 
@@ -1612,10 +1615,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 // memfd loading succeeded, use memfd-loaded handle
                 orch_so_memfd_ = memfd;
             }
+#endif
 
             if (handle == nullptr) {
                 // memfd failed or unavailable - use file-based loading
+#if defined(__linux__)
                 orch_so_memfd_ = -1;
+#endif
 
                 // Try multiple paths that may allow execution on AICPU
                 bool file_created = false;
@@ -1992,6 +1998,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (!runtime->get_orch_built_on_host() && orch_so_handle_ != nullptr) {
             pto2_runtime_destroy(rt);
             // Handle cleanup based on loading method
+#if defined(__linux__)
             if (orch_so_memfd_ >= 0) {
                 // memfd-based: close fd AFTER dlclose
                 cleanup_memfd_so(orch_so_memfd_, orch_so_handle_);
@@ -2000,6 +2007,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 dlclose(orch_so_handle_);
                 unlink(orch_so_path_);
             }
+#else
+            // Non-Linux: only file-based loading
+            dlclose(orch_so_handle_);
+            unlink(orch_so_path_);
+#endif
         }
         DEV_ALWAYS("Thread %d: Last thread, marking executor finished", thread_idx);
     }
