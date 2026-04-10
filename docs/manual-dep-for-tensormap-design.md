@@ -3,18 +3,19 @@
 ## Goal
 
 Add a scoped manual-dependency mode to `tensormap_and_ringbuffer` without
-regressing the default automatic path:
+changing the default API shape:
 
-- `PTO2_SCOPE()` stays in automatic mode
+- `PTO2_SCOPE()` stays `AUTO` by default
 - `PTO2_SCOPE(PTO2ScopeMode::MANUAL)` enables scoped manual dependency wiring
-- same-manual-scope edges use explicit `pto2_rt_add_dependency(...)`
-- cross-scope edges still use `owner_task_id` and TensorMap discovery
+- cross-scope correctness still relies on `owner_task_id` and TensorMap
+- same-manual-scope ordering is expressed explicitly, not rediscovered from
+  tensors
 
-This is a hybrid model, not a port of `aicpu_build_graph`.
+This is a hybrid runtime model. It is not a port of `aicpu_build_graph`.
 
 ## API Surface
 
-The orchestration-facing API is:
+### Scope mode
 
 ```cpp
 enum class PTO2ScopeMode : uint8_t {
@@ -27,65 +28,85 @@ PTO2_SCOPE() {
 }
 
 PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
-    auto qk = pto2_rt_submit_aic_task_manual(...);
-    auto sf = pto2_rt_submit_aiv_task_manual(...);
-    pto2_rt_add_dependency(qk.task_id, sf.task_id);
+    // manual mode
 }
 ```
 
-Current restrictions:
+### Manual submit APIs
+
+Manual submit is valid only inside `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`.
+
+```cpp
+auto qk = pto2_rt_submit_aic_task_manual(FUNC_QK_MATMUL, params_qk);
+auto sf = pto2_rt_submit_aiv_task_manual_with_deps(
+    FUNC_SOFTMAX_PREPARE, params_sf, {qk.task_id}
+);
+auto pv = pto2_rt_submit_aic_task_manual_with_deps(
+    FUNC_PV_MATMUL, params_pv, {sf.task_id}
+);
+auto up = pto2_rt_submit_aiv_task_manual_with_deps(
+    FUNC_ONLINE_UPDATE, params_up, {sf.task_id, pv.task_id}
+);
+```
+
+`pto2_rt_add_dependency(producer, consumer)` is still supported in manual
+scope. The new `*_manual_with_deps(...)` helpers exist to fold explicit edges
+into submit and remove hot orchestration-side `add_dependency(...)` overhead.
+
+### Current restrictions
 
 - manual submit APIs are only valid inside
   `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`
-- `pto2_rt_add_dependency(...)` requires both tasks to belong to the current
+- `pto2_rt_add_dependency(...)` requires both task ids to belong to the current
   manual scope
-- nested scope inside manual scope is rejected in v1
+- nested manual scope is rejected in v1
 - blocking tensor access helpers are rejected inside manual scope
 
 ## Dependency Semantics
 
-### Tensor origin matters first
+### First split: manual-local vs boundary
 
-Each tensor argument is classified at submit time:
+At manual submit time, each tensor argument is classified as:
 
-- `manual-local`: the tensor owner was created inside the current manual scope
-- `boundary`: anything else, including external tensors and tensors produced by
-  tasks outside the current manual scope
+- `manual-local`
+  - the tensor owner was created inside the current manual scope
+- `boundary`
+  - everything else: external tensors, tensors from outer scopes, or tensors
+    produced by already-published tasks
 
-Manual-local tensors skip TensorMap entirely. Boundary tensors stay on the
-normal TensorMap path unless `manual_dep=true`.
+Manual-local tensors skip TensorMap. Boundary tensors keep the normal
+cross-scope correctness path unless `manual_dep=true` suppresses TensorMap
+lookup/insert for that tensor.
 
-### `INPUT`, `OUTPUT`, `INOUT`, and friends
+### `INPUT`, `OUTPUT`, `INOUT`, `OUTPUT_EXISTING`, `NO_DEP`
 
-`TensorArgType` behavior in the runtime:
-
-| Arg kind | Meaning | Incoming dependency work | Outgoing frontier work |
+| Arg kind | Meaning | Incoming work | Outgoing work |
 | --- | --- | --- | --- |
 | `INPUT` | existing tensor, read-only | creator retention, plus TensorMap lookup unless skipped | none |
-| `OUTPUT` | fresh runtime-allocated tensor | none | no TensorMap insert at creation; `owner_task_id` is stamped on the produced tensor |
+| `OUTPUT` | fresh runtime-allocated tensor | none | no TensorMap insert at creation; the produced tensor gets `owner_task_id` |
 | `INOUT` | existing tensor, read + write | creator retention, plus TensorMap lookup unless skipped | TensorMap insert unless skipped |
 | `OUTPUT_EXISTING` | existing tensor, write-only | creator retention only | TensorMap insert unless skipped |
-| `NO_DEP` | existing tensor, creator-retention-only | creator retention only | none |
+| `NO_DEP` | creator-retention-only handle passing | creator retention only | none |
 
 ### Manual-local vs boundary behavior
 
 | Arg kind | Manual-local tensor | Boundary tensor |
 | --- | --- | --- |
-| `INPUT` | no TensorMap lookup, requires explicit manual edge | creator retention; TensorMap lookup unless `manual_dep=true` |
-| `OUTPUT` | fresh local tensor; later same-scope uses rely on explicit manual edges | not applicable |
-| `INOUT` | no TensorMap lookup/insert, requires explicit manual edge | creator retention; TensorMap lookup for incoming state; TensorMap insert for outgoing state unless `manual_dep=true` |
-| `OUTPUT_EXISTING` | no TensorMap insert, requires explicit manual edge if later reused in scope | creator retention; TensorMap insert for outgoing state unless `manual_dep=true` |
-| `NO_DEP` | creator-only object passing, no publish | same |
+| `INPUT` | no TensorMap lookup; ordering must come from explicit manual edges | creator retention; TensorMap lookup unless `manual_dep=true` |
+| `OUTPUT` | fresh local tensor; later same-scope consumers rely on explicit manual edges | not applicable |
+| `INOUT` | no TensorMap lookup/insert; ordering must come from explicit manual edges | creator retention; TensorMap lookup for incoming state; TensorMap insert for outgoing state unless `manual_dep=true` |
+| `OUTPUT_EXISTING` | no TensorMap insert; later same-scope reuse needs explicit manual edges | creator retention; TensorMap insert unless `manual_dep=true` |
+| `NO_DEP` | creator-only handle passing | same |
 
 ### `manual_dep=true`
 
-`Tensor::manual_dep` keeps its existing meaning:
+`Tensor::manual_dep` keeps its original meaning:
 
-- skip TensorMap lookup/insert
-- keep creator-only retention via `owner_task_id`
+- skip TensorMap lookup/insert for that tensor
+- still preserve creator retention via `owner_task_id`
 
-It is a per-tensor optimization hint. It is not the core manual-scope
-mechanism.
+It is a per-tensor optimization hint. It is not the manual-scope feature by
+itself.
 
 ## Runtime Model
 
@@ -95,7 +116,7 @@ mechanism.
 PTO2_SCOPE(MANUAL)
         |
         v
-  submit_*_manual()
+  submit_*_manual[_with_deps]()
         |
         +-- classify tensor args
         |     |- manual-local -> no TensorMap
@@ -103,113 +124,146 @@ PTO2_SCOPE(MANUAL)
         |
         +-- allocate slot / payload / outputs
         |
-        +-- wire boundary producers immediately
-        |     `- keep one extra fanin publish barrier
+        +-- append explicit same-scope producer slot states
+        |     into the consumer payload tail
+        |     (no dep-pool fanout publish yet)
         |
         `-- return { task_id, outputs }
                   |
-                  v
-      pto2_rt_add_dependency()
+                  +-- optional pto2_rt_add_dependency(...)
+                  |      appends more explicit producer slot states to
+                  |      the same cached payload tail range
                   |
-                  `-- wire same-scope producer -> consumer immediately
-
+                  v
 scope_end()
         |
-        +-- validate fanin bounds
+        +-- link only the cached explicit tail range into dep-pool fanout lists
         +-- repair monotonic dep_pool_mark prefix
         +-- release publish barrier and batch-publish tasks
         `-- do normal scope lifetime release
 ```
 
+### Why explicit manual edges are not linked into dep-pool during submit
+
+This was attempted and rejected.
+
+Manual-scope tasks are unpublished until `scope_end()`. If explicit manual
+edges are materialized into dep-pool fanout lists during submit:
+
+- producers are still invisible to the scheduler
+- `last_task_alive` cannot advance far enough for safe dep-pool reclamation
+- manual scopes can deadlock the dep-pool
+
+So the current design intentionally splits the work:
+
+- submit time:
+  - append explicit producer slot states into the consumer payload
+  - increment `fanin_count`
+  - remember where the explicit tail range starts
+- `scope_end()`:
+  - materialize only that cached explicit tail range into dep-pool fanout lists
+  - publish the scope in one batch
+
+That keeps the semantics correct without reviving the large old replay scan.
+
 ### What manual submit iterates
 
-Current implementation is in
+Current implementation lives in
 `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp`.
 
-For a manual submit:
+For manual submit:
 
 1. allocate the task slot, payload, and task id immediately
 2. classify each tensor arg as manual-local or boundary
 3. build `manual_local_mask` for same-scope tensors
 4. decide whether TensorMap sync is needed at all
-   - if every relevant arg is manual-local or `manual_dep=true`, skip sync
-   - otherwise run the normal TensorMap sync
-5. for each non-`OUTPUT` arg that is not manual-local
+   - if all relevant tensors are manual-local or `manual_dep=true`, skip sync
+   - otherwise run normal TensorMap sync
+5. for each non-`OUTPUT` boundary arg
    - always do creator retention from `owner_task_id`
    - for `INPUT` and `INOUT`, do TensorMap lookup unless `manual_dep=true`
 6. for `INOUT` and `OUTPUT_EXISTING` boundary args
    - update TensorMap frontier unless `manual_dep=true`
-7. initialize scheduler state, but keep the task unpublished behind a deferred
+7. initialize scheduler state, but keep the task unpublished behind the manual
    publish barrier
+8. append explicit same-scope producers into the consumer payload tail if the
+   caller used `*_manual_with_deps(...)`
 
 Important consequence:
 
-- cross-scope dependency discovery is still paid at submit time
-- same-scope dependency discovery is no longer replayed from tensors later
+- cross-scope correctness is still paid at submit time
+- same-scope explicit dependencies no longer pay TensorMap lookup
+- explicit same-scope edges also no longer pay hot orchestration-side
+  `add_dependency(...)` calls when the submit helper is used
 
 ### What `pto2_rt_add_dependency(...)` does now
 
-This is the key difference from the older design draft.
+`pto2_rt_add_dependency(...)` is still valid in manual scope, but it no longer
+builds dep-pool fanout links immediately.
 
-`pto2_rt_add_dependency(...)` no longer records an edge for replay at
-`scope_end()`. It validates both task ids belong to the current manual scope,
-dedups against the consumer payload, ensures dep-pool space, and wires the edge
-immediately:
+It now:
 
-- increments producer `fanout_count`
-- prepends the consumer into the producer fanout list
-- appends the producer slot state into `payload->fanin_slot_states[]`
-- increments consumer `fanin_count`
-- updates consumer `dep_pool_mark`
+1. validates producer and consumer belong to the current manual scope
+2. deduplicates against the consumer payload fanins
+3. appends the producer slot state into the consumer payload
+4. extends the cached explicit tail range metadata
+5. increments the consumer `fanin_count`
 
-That removes the old replay-heavy finalize path.
+This preserves the same manual-scope semantics as the helper APIs.
 
 ### What `scope_end()` does now
 
-Manual `scope_end()` is now intentionally small and TensorMap-free.
+Manual `scope_end()` remains TensorMap-free.
 
-It only:
+It now:
 
 1. validates `fanin_actual_count`
-2. repairs a monotonic `dep_pool_mark` prefix
-3. calls `publish_manual_scope_tasks_and_end_scope(...)`
-4. performs the normal scope lifetime release
+2. sums cached explicit tail sizes across the scope
+3. ensures dep-pool space once for the whole manual scope
+4. links only the cached explicit tail ranges into producer fanout lists
+5. repairs a monotonic `dep_pool_mark` prefix
+6. calls `publish_manual_scope_tasks_and_end_scope(...)`
+7. performs normal scope lifetime release
 
-There is no explicit-edge replay at `scope_end()` anymore.
+The important detail is step 4:
+
+- older versions had to rescan every consumer fanin and test whether each
+  producer belonged to the current manual scope
+- current code links only the cached explicit manual tail range
+- that is the optimization in commit `6dc2e1e`
 
 ## Why This Split Is Correct
 
 ### Cross-scope correctness
 
-Cross-scope tensors still need TensorMap because the runtime must preserve:
+Boundary tensors still need TensorMap because the runtime must preserve:
 
 - latest-writer frontier tracking
 - overlap-based modifier discovery
-- boundary ordering across scopes
+- ordering across scopes
 
 If manual scope disabled TensorMap globally, outer reads and writes would
 become incorrect.
 
 ### Same-scope performance
 
-Manual-local tensors are exactly where TensorMap is unnecessary work:
+Manual-local tensors are exactly where TensorMap is unnecessary:
 
-- the producer is already known from the current manual scope
-- the ordering can be expressed directly by `pto2_rt_add_dependency(...)`
-- replaying those edges at `scope_end()` added serial overhead without adding
-  correctness
+- the producer is already known inside the current manual scope
+- the ordering is explicitly available from task ids
+- same-scope fanins do not need overlap discovery
 
 ### Zero-overhead AUTO path
 
-The manual-scope extension must not slow down the normal AUTO runtime.
+The manual-scope feature must not add work to `AUTO`.
 
-Fresh measurements below show the current AUTO runtime stays within roughly
-`±1%` end-to-end of the unmodified baseline on the two paged-attention scenes,
-which is the intended zero-overhead result.
+The committed runtime changes stay on the manual submit/scope-end path. The
+remaining zero-overhead concern is still the non-unroll AUTO paged-attention
+scene, which is a separate runtime/orch optimization problem.
 
 ## Example Requirements
 
-Manual mode only helps when the example exposes a real same-scope
+Manual mode only helps when the orchestration exposes a real same-scope
 producer/consumer chain that TensorMap would otherwise rediscover.
 
 For paged attention, the profitable chain is:
@@ -220,37 +274,43 @@ qk_matmul -> softmax_prepare -> pv_matmul -> online_update
 
 Inside a manual scope:
 
-- intermediate tensors in that chain should stay manual-local
-- explicit edges should connect those tasks directly
-- outer tensors such as the external KV cache and the final output still keep
-  boundary semantics
+- intermediate tensors in that chain stay manual-local
+- explicit task edges express the chain directly
+- boundary tensors such as external KV cache or outer outputs keep
+  cross-scope semantics
 
-If an example keeps using boundary tensors everywhere, manual mode cannot
-remove much runtime work.
+If the example keeps boundary tensors everywhere, partial-manual cannot remove
+much runtime work.
 
 ## Benchmark Enablement
 
-Current branch benchmark entrypoints:
+### Current selectors
 
 ```bash
-./tools/benchmark_rounds.sh -d 4 -n 5 -c d96c8784 -r aicpu_build_graph --build
-./tools/benchmark_rounds.sh -d 4 -n 5 -c d96c8784 -r tensormap_and_ringbuffer --build
-./tools/benchmark_rounds.sh -d 4 -n 5 -c d96c8784 -r tensormap_and_ringbuffer_partial_manual --build
+./tools/benchmark_rounds.sh -d 5 -n 5 -c d96c8784 -r aicpu_build_graph --build
+./tools/benchmark_rounds.sh -d 5 -n 5 -c d96c8784 -r tensormap_and_ringbuffer --build
+./tools/benchmark_rounds.sh -d 5 -n 5 -c d96c8784 -r tensormap_and_ringbuffer_partial_manual --build
 ```
 
-`tensormap_and_ringbuffer_partial_manual` is a selector in
-`tools/benchmark_rounds.sh`. The example `kernel_config.py` files still use
-`RUNTIME_CONFIG["runtime"] = "tensormap_and_ringbuffer"`. The selector only
-switches the scene directories to:
+`tensormap_and_ringbuffer_partial_manual` is a benchmark selector in
+`tools/benchmark_rounds.sh`. It switches the scene directories to:
 
 - `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_partial_manual`
 - `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention_unroll_partial_manual`
 
-The old unmodified runtime is intentionally not kept on this branch. To rerun
-it side-by-side:
+The partial-manual scenes enable the new runtime behavior by:
+
+- entering `PTO2_SCOPE(PTO2ScopeMode::MANUAL)`
+- using `pto2_rt_submit_*_manual_with_deps(...)` for hot explicit chains
+
+### Unmodified runtime
+
+`tensormap_and_ringbuffer_unmodified` exists only in a separate worktree, not
+on this branch.
+
+Example rerun flow:
 
 ```bash
-export PROJECT_ROOT=$(pwd)
 git worktree add tmp/worktree_unmodified a71ba16
 (
   cd tmp/worktree_unmodified
@@ -258,29 +318,10 @@ git worktree add tmp/worktree_unmodified a71ba16
   . .venv/bin/activate
   pip install -e . -q
   export PTO_ISA_ROOT="$PROJECT_ROOT/examples/scripts/_deps/pto-isa"
-  ./tools/benchmark_rounds.sh -d 4 -n 5 -c d96c8784 \
+  ./tools/benchmark_rounds.sh -d 5 -n 5 -c d96c8784 \
     -r tensormap_and_ringbuffer_unmodified --build
 )
 ```
-
-Fresh benchmark logs for the rebased branch are in:
-
-- `tmp/rebased_bench_20260410_fix/aicpu_build_graph.log`
-- `tmp/rebased_bench_20260410_fix/tensormap_and_ringbuffer.log`
-- `tmp/rebased_bench_20260410_fix/tensormap_and_ringbuffer_partial_manual.log`
-- `tmp/rebased_bench_20260410_fix/tensormap_and_ringbuffer_unmodified.log`
-
-Rebase note:
-
-- `paged_attention_unroll_partial_manual` was initially timing out after the
-  merge-forward.
-- The runtime manual-scope machinery was not the root cause.
-- The direct cause was stale example-side AIC submit ABI: the rebased
-  `paged_attention_unroll` AIC kernels now expect `block_table` as a tensor
-  input plus a scalar `bt_offset`, while the partial-manual scene was still
-  passing a raw pointer scalar.
-- Fixing the partial-manual `qk/pv` submit argument layout restored both
-  unroll cases on device.
 
 ## Fresh Hardware Results
 
@@ -288,119 +329,139 @@ Fresh rerun settings:
 
 - date: `2026-04-10`
 - platform: `a2a3`
-- device: `4`
+- device: `5`
 - rounds: `5`
 - PTO-ISA commit: `d96c8784`
 
-Units below are `elapsed_us (orch_us)`. `aicpu_build_graph` does not emit the
-same orch timing lines, so only elapsed time is shown there.
+Units below are elapsed microseconds. These are fresh reruns only.
 
 ### `paged_attention`
 
 | Case | `aicpu_build_graph` | `tensormap_and_ringbuffer_unmodified` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
 | --- | ---: | ---: | ---: | ---: |
-| `Case1` | `29937.7` | `36095.9 (36094.9)` | `39148.7 (39148.3)` | `34186.3 (34025.7)` |
-| `Case2` | `16762.7` | `18639.5 (18635.1)` | `19813.0 (19812.7)` | `18028.7 (17618.4)` |
+| `Case1` | `30943.4` | `36722.9` | `38296.0` | `32008.9` |
+| `Case2` | `16189.9` | `18682.5` | `19904.9` | `16605.3` |
 
 ### `paged_attention_unroll`
 
 | Case | `aicpu_build_graph` | `tensormap_and_ringbuffer_unmodified` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
 | --- | ---: | ---: | ---: | ---: |
-| `Case1` | `1425.3` | `1325.6 (835.3)` | `1173.2 (992.0)` | `1160.4 (968.8)` |
-| `Case2` | `693.0` | `628.7 (380.7)` | `567.9 (435.6)` | `561.9 (416.6)` |
+| `Case1` | `1392.4` | `1325.9` | `1151.3` | `1159.1` |
+| `Case2` | `678.1` | `638.1` | `563.3` | `568.0` |
 
 ## Feature / Optimization -> Gain
 
-### 1. AUTO stays effectively zero-overhead
+### 1. Folding explicit edges into submit removed hot `add_dependency(...)` cost
 
-The current AUTO runtime no longer meets the zero-overhead target on the
-non-unroll scene, but it still wins clearly on the unroll scene:
+Hot non-unroll partial-manual profiling before the helper change showed:
 
-- `paged_attention/Case1`: `39148.7 us` vs `36095.9 us` (`+8.5%`)
-- `paged_attention/Case2`: `19813.0 us` vs `18639.5 us` (`+6.3%`)
-- `paged_attention_unroll/Case1`: `1173.2 us` vs `1325.6 us` (`-11.5%`)
-- `paged_attention_unroll/Case2`: `567.9 us` vs `628.7 us` (`-9.7%`)
+- `add_dependency`: about `4.6-4.8 ms` on `paged_attention/Case1`
+- `submit_manual`: about `26.4 ms`
+- `scope_close`: about `4.8-5.0 ms`
 
-So the AUTO path is still good for the already-amortized unroll workload, but
-not yet zero-overhead for the non-unroll paged-attention target.
+After switching the hot path to `*_manual_with_deps(...)`:
 
-### 2. Partial-manual removes the non-unroll gap
+- `add_dependency`: `0`
+- the same explicit edges are still represented correctly
+- the orchestration hot path no longer pays separate explicit-edge calls
 
-Against the current AUTO runtime, partial-manual improves the non-unroll scene
-substantially:
+This was the big submit-side win.
 
-- `paged_attention/Case1`
-  - elapsed: `39148.7 us -> 34186.3 us` (`-12.7%`)
-  - orch: `39148.3 us -> 34025.7 us` (`-13.1%`)
-- `paged_attention/Case2`
-  - elapsed: `19813.0 us -> 18028.7 us` (`-9.0%`)
-  - orch: `19812.7 us -> 17618.4 us` (`-11.1%`)
+### 2. Caching explicit fanin ranges cut manual `scope_end()` overhead again
 
-Against `aicpu_build_graph`, there is still a visible non-unroll gap:
+Commit `6dc2e1e` changed manual payloads to cache the explicit manual tail
+range and changed manual `scope_end()` to link only that range.
 
-- `Case1`: `34186.3 us` vs `29937.7 us` (`+14.2%`)
-- `Case2`: `18028.7 us` vs `16762.7 us` (`+7.6%`)
+Measured effect on device `5`:
 
-Against the unmodified tensormap baseline, partial-manual is now ahead on the
-non-unroll scene:
+- non-unroll `Case1`
+  - elapsed: about `32.76 ms -> 32.01 ms`
+  - `scope_close`: about `4.8-5.1 ms -> 3.5-3.8 ms`
+- non-unroll `Case2`
+  - elapsed: about `17.33 ms -> 16.61 ms`
+  - `scope_close`: about `2.4-2.7 ms -> 1.9-2.0 ms`
 
-- `Case1`: `36095.9 us -> 34186.3 us` (`-5.3%`)
-- `Case2`: `18639.5 us -> 18028.7 us` (`-3.3%`)
+This confirms the remaining manual scope-end cost was still meaningful, but it
+is no longer the main gap.
 
-### 3. Unroll already amortizes most of the cost
+### 3. Current non-unroll ranking is now close to the intended shape
 
-On `paged_attention_unroll`, both current runtimes are already better than
-`aicpu_build_graph`, and partial-manual only nudges the AUTO path slightly:
+For `paged_attention`:
 
-- `Case1`: `1173.2 us -> 1160.4 us` elapsed (`-1.1%`)
-- `Case2`: `567.9 us -> 561.9 us` elapsed (`-1.1%`)
+- `aicpu_build_graph` is still the fastest
+- `tensormap_and_ringbuffer_partial_manual` is now much closer to it
+- `tensormap_and_ringbuffer_partial_manual` is clearly better than both
+  current AUTO and the unmodified tensormap runtime
 
-That is the expected shape. The unroll orchestration already amortizes most
-dependency overhead, so partial-manual has little room left to improve.
+Concrete non-unroll deltas:
 
-### 4. What specifically helped
+- vs `aicpu_build_graph`
+  - `Case1`: `32008.9 us` vs `30943.4 us` (`+3.4%`)
+  - `Case2`: `16605.3 us` vs `16189.9 us` (`+2.6%`)
+- vs `tensormap_and_ringbuffer_unmodified`
+  - `Case1`: `36722.9 us -> 32008.9 us` (`-12.8%`)
+  - `Case2`: `18682.5 us -> 16605.3 us` (`-11.1%`)
+- vs current AUTO
+  - `Case1`: `38296.0 us -> 32008.9 us` (`-16.4%`)
+  - `Case2`: `19904.9 us -> 16605.3 us` (`-16.6%`)
 
-The important runtime-side wins were:
+### 4. Unroll remains a low-return target for partial-manual
 
-- classify manual-local tensors from `owner_task_id`
-- skip TensorMap work for those manual-local tensors
-- wire explicit same-scope edges immediately in `pto2_rt_add_dependency(...)`
-- keep `scope_end()` down to publish-barrier release plus `dep_pool_mark`
-  fixup
+For `paged_attention_unroll`, AUTO already amortizes most of the dependency
+cost, so partial-manual stays nearly flat:
 
-The important example-side win was using manual scope only where the
-non-unroll paged-attention orchestration still had repeated same-scope
-dependency work to remove.
+- `Case1`: `1151.3 us -> 1159.1 us`
+- `Case2`: `563.3 us -> 568.0 us`
+
+This is expected. The profitable target for partial-manual is the non-unroll
+scene.
+
+### 5. Remaining gap is now mostly submit-time, not `scope_end()`
+
+Latest non-unroll partial-manual profiling after `6dc2e1e`:
+
+- `submit_manual`: about `27.5-28.0 ms`
+- `scope_close`: about `3.5-3.8 ms`
+- `add_dependency`: `0`
+
+So the next worthwhile optimization target is manual submit itself, especially
+the runtime/orch path for boundary tensors inside manual scopes.
 
 ## Current Risks
 
-1. `manual_dep=true` can still be abused.
+1. Submit-time dep-pool linking for explicit manual edges is still unsafe.
+   - Because manual-scope tasks are unpublished until `scope_end()`, doing that
+     work at submit time can deadlock dep-pool reclamation.
+
+2. `manual_dep=true` can still be abused.
    - It suppresses TensorMap lookup/insert for that tensor.
-   - It is only safe when ordering/frontier requirements are already covered by
-     other logic.
+   - It is only safe when ordering/frontier requirements are covered elsewhere.
 
-2. Nested scope inside manual scope is still unsupported.
-   - This is a current implementation restriction, not a theoretical property.
+3. Nested manual scope is still unsupported.
+   - This is an implementation restriction of the current design.
 
-3. `pto2_rt_add_dependency(...)` now spends dep-pool entries on the submit path.
-   - That is intentional, but it means dep-pool pressure moved from the old
-     replay path into explicit-edge wiring.
+4. The remaining non-unroll gap is no longer dominated by `scope_end()`.
+   - More `scope_end()` work is unlikely to close the gap.
+   - The next gains must come from the manual submit path.
 
-4. Manual publish still relies on `dep_pool_mark` prefix repair at `scope_end()`.
-   - This is required because explicit edges can touch older consumers after
-     newer tasks were already submitted.
+5. AUTO non-unroll still needs work if zero-overhead is required there too.
+   - The partial-manual feature should not be used as an excuse to leave AUTO
+     slow on that scene.
 
 ## Recommendation Summary
 
 Keep the design as:
 
-- AUTO mode by default
-- explicit MANUAL mode through `PTO2ScopeMode`
-- TensorMap kept only for cross-scope correctness
-- explicit immediate wiring for same-scope manual edges
-- `scope_end()` reduced to publish-barrier release and normal lifetime work
+- `AUTO` by default
+- explicit `MANUAL` mode through `PTO2ScopeMode`
+- TensorMap retained for cross-scope correctness
+- explicit same-scope edges appended at submit time
+- dep-pool fanout materialization deferred to manual `scope_end()`
+- manual `scope_end()` linking only the cached explicit tail range
 
-That gives the required feature coverage while keeping the AUTO path
-competitive on unroll and materially reducing the non-unroll gap, but the
-fresh rerun still shows more work is needed to make partial-manual match
-`aicpu_build_graph` on non-unroll paged attention.
+This gives the required feature coverage, keeps the methodology sound, and has
+already moved partial-manual non-unroll paged attention close to
+`aicpu_build_graph` without changing the fundamental runtime model.
+
+The next optimization pass should focus on reducing manual submit overhead for
+boundary tensors that still pay runtime/orch bookkeeping inside manual scopes.
