@@ -93,6 +93,15 @@ def _mailbox_addr(shm: SharedMemory) -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(buf))
 
 
+def _args_size(csa_cls) -> int:
+    """Return sizeof(ChipStorageTaskArgs). Uses C++ binding if available, else heap probe."""
+    if hasattr(csa_cls, "sizeof"):
+        return csa_cls.sizeof()
+    objs = [csa_cls() for _ in range(5)]
+    ptrs = [o.__ptr__() for o in objs]
+    return min(abs(ptrs[i + 1] - ptrs[i]) for i in range(len(ptrs) - 1))
+
+
 def _sub_worker_loop(buf, registry: dict) -> None:
     """Runs in forked child process."""
     while True:
@@ -272,14 +281,51 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
 
-        # 1. Allocate mailboxes
+        # 1. Allocate sub-worker mailboxes
         for _ in range(n_sub):
             shm = SharedMemory(create=True, size=DIST_SUB_MAILBOX_SIZE)
             assert shm.buf is not None
             struct.pack_into("i", shm.buf, _OFF_STATE, _IDLE)
             self._shms.append(shm)
 
-        # 2. Fork SubWorker processes (MUST be before any C++ threads)
+        # 2. Prepare chip-worker config (but do NOT fork yet — deferred to _start_level3)
+        if device_ids:
+            from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+            from .task_interface import ChipStorageTaskArgs as _CSA  # noqa: PLC0415
+
+            platform = self._config["platform"]
+            runtime = self._config["runtime"]
+            builder = RuntimeBuilder(platform)
+            binaries = builder.get_binaries(runtime, build=False)
+
+            self._l3_args_size = _args_size(_CSA)
+            self._l3_host_lib_path = str(binaries.host_path)
+            self._l3_aicpu_path = str(binaries.aicpu_path)
+            self._l3_aicore_path = str(binaries.aicore_path)
+            self._l3_sim_ctx_path = (
+                str(binaries.sim_context_path) if getattr(binaries, "sim_context_path", None) else ""
+            )
+
+            # Allocate chip mailboxes (shared memory, no fork yet)
+            for _ in device_ids:
+                shm = SharedMemory(create=True, size=DIST_CHIP_MAILBOX_SIZE)
+                assert shm.buf is not None
+                struct.pack_into("i", shm.buf, _CHIP_OFF_STATE, _IDLE)
+                self._chip_shms.append(shm)
+
+        self._l3_started = False
+
+    def _start_level3(self) -> None:
+        """Fork child processes and start C++ scheduler. Called on first run()."""
+        if self._l3_started:
+            return
+        self._l3_started = True
+
+        device_ids = self._config.get("device_ids", [])
+        n_sub = self._config.get("num_sub_workers", 0)
+
+        # Fork SubWorker processes (MUST be before any C++ threads)
         registry = self._callable_registry
         for i in range(n_sub):
             pid = os.fork()
@@ -291,50 +337,33 @@ class Worker:
             else:
                 self._pids.append(pid)
 
-        # 3. Fork ChipWorker processes (only if device_ids provided)
+        # Fork ChipWorker processes
         if device_ids:
-            from runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-            from .task_interface import ChipStorageTaskArgs as _CSA  # noqa: PLC0415
-
-            platform = self._config["platform"]
-            runtime = self._config["runtime"]
-            builder = RuntimeBuilder(platform)
-            binaries = builder.get_binaries(runtime, build=False)
-
-            # Determine args_size (sizeof ChipStorageTaskArgs)
-            _objs = [_CSA() for _ in range(5)]
-            _ptrs = [o.__ptr__() for o in _objs]
-            args_size = min(abs(_ptrs[i + 1] - _ptrs[i]) for i in range(len(_ptrs) - 1))
-            del _objs, _ptrs
-
-            host_lib_path = str(binaries.host_path)
-            aicpu_path = str(binaries.aicpu_path)
-            aicore_path = str(binaries.aicore_path)
-            sim_ctx_path = str(binaries.sim_context_path) if getattr(binaries, "sim_context_path", None) else ""
-
-            for dev_id in device_ids:
-                shm = SharedMemory(create=True, size=DIST_CHIP_MAILBOX_SIZE)
-                assert shm.buf is not None
-                struct.pack_into("i", shm.buf, _CHIP_OFF_STATE, _IDLE)
-                self._chip_shms.append(shm)
-
+            for idx, dev_id in enumerate(device_ids):
                 pid = os.fork()
                 if pid == 0:
-                    buf = shm.buf
+                    buf = self._chip_shms[idx].buf
                     assert buf is not None
-                    _chip_process_loop(buf, host_lib_path, dev_id, aicpu_path, aicore_path, sim_ctx_path, args_size)
+                    _chip_process_loop(
+                        buf,
+                        self._l3_host_lib_path,
+                        dev_id,
+                        self._l3_aicpu_path,
+                        self._l3_aicore_path,
+                        self._l3_sim_ctx_path,
+                        self._l3_args_size,
+                    )
                     os._exit(0)
                 else:
                     self._chip_pids.append(pid)
 
-        # 4. Create DistWorker and wire chip processes + sub workers
+        # Create DistWorker and wire chip processes + sub workers
         dw = DistWorker(3)
         self._dist_worker = dw
 
         if device_ids:
             for shm in self._chip_shms:
-                cp = DistChipProcess(_mailbox_addr(shm), args_size)
+                cp = DistChipProcess(_mailbox_addr(shm), self._l3_args_size)
                 self._dist_chip_procs.append(cp)
                 dw.add_chip_process(cp)
 
@@ -343,7 +372,7 @@ class Worker:
             self._dist_sub_workers.append(sw)
             dw.add_sub_worker(sw)
 
-        # 6. Start Scheduler + WorkerThreads (C++ threads start here, after fork)
+        # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()
 
     # ------------------------------------------------------------------
@@ -377,6 +406,7 @@ class Worker:
                 # run(callable, args, **kwargs)
                 self._chip_worker.run(task_or_payload, args, **kwargs)
         else:
+            self._start_level3()
             assert self._dist_worker is not None
             task = task_or_payload
             task.orch(self, task.args)

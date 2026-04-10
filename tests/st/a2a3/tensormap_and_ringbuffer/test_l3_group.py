@@ -15,126 +15,108 @@ Verifies: fork+shm process isolation, 2-chip concurrent execution,
 group completion aggregation, downstream dependency waits for group.
 """
 
-import struct
-from multiprocessing.shared_memory import SharedMemory
-
-import pytest
 import torch
-from simpler.task_interface import (
-    ArgDirection as D,
-)
-from simpler.task_interface import (
-    ChipStorageTaskArgs,
-    WorkerPayload,
-    WorkerType,
-    make_tensor_arg,
-)
-from simpler.worker import Task, Worker
+from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import ChipStorageTaskArgs, WorkerPayload, WorkerType, make_tensor_arg
 
-from simpler_setup import SceneTestCase, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 KERNELS_BASE = "../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 
 
-@scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class _VectorKernels(SceneTestCase):
-    """Shared kernel definition — not a test itself, used for _compile()."""
+def verify():
+    """SubCallable — runs after group completes."""
 
-    __test__ = False
+
+def run_dag(w, callables, task_args, config):
+    """L3 orchestration: group of 2 chips → SubTask dependency."""
+    # Build per-chip ChipStorageTaskArgs from shared-memory tensors
+    args0 = ChipStorageTaskArgs()
+    for t in [task_args.a0, task_args.b0, task_args.f0]:
+        args0.add_tensor(make_tensor_arg(t))
+
+    args1 = ChipStorageTaskArgs()
+    for t in [task_args.a1, task_args.b1, task_args.f1]:
+        args1.add_tensor(make_tensor_arg(t))
+
+    callables.keep(args0, args1)  # prevent GC before drain
+
+    chip_p = WorkerPayload()
+    chip_p.worker_type = WorkerType.CHIP
+    chip_p.callable = callables.vector_kernel.buffer_ptr()
+    chip_p.block_dim = config.block_dim
+    chip_p.aicpu_thread_num = config.aicpu_thread_num
+    group_result = w.submit(WorkerType.CHIP, chip_p, args_list=[args0.__ptr__(), args1.__ptr__()], outputs=[4])
+
+    sub_p = WorkerPayload()
+    sub_p.worker_type = WorkerType.SUB
+    sub_p.callable_id = callables.verify
+    w.submit(WorkerType.SUB, sub_p, inputs=[group_result.outputs[0].ptr])
+
+
+@scene_test(level=3, runtime="tensormap_and_ringbuffer")
+class TestL3Group(SceneTestCase):
+    """L3: Group of 2 ChipWorkers as 1 DAG node, SubTask depends on group."""
+
     CALLABLE = {
-        "orchestration": {
-            "source": f"{KERNELS_BASE}/orchestration/example_orchestration.cpp",
-            "function_name": "aicpu_orchestration_entry",
-            "signature": [D.IN, D.IN, D.OUT],
-        },
-        "incores": [
+        "orchestration": run_dag,
+        "callables": [
             {
-                "func_id": 0,
-                "source": f"{KERNELS_BASE}/aiv/kernel_add.cpp",
-                "core_type": "aiv",
-                "signature": [D.IN, D.IN, D.OUT],
+                "name": "vector_kernel",
+                "orchestration": {
+                    "source": f"{KERNELS_BASE}/orchestration/example_orchestration.cpp",
+                    "function_name": "aicpu_orchestration_entry",
+                    "signature": [D.IN, D.IN, D.OUT],
+                },
+                "incores": [
+                    {
+                        "func_id": 0,
+                        "source": f"{KERNELS_BASE}/aiv/kernel_add.cpp",
+                        "core_type": "aiv",
+                        "signature": [D.IN, D.IN, D.OUT],
+                    },
+                    {
+                        "func_id": 1,
+                        "source": f"{KERNELS_BASE}/aiv/kernel_add_scalar.cpp",
+                        "core_type": "aiv",
+                        "signature": [D.IN, D.OUT],
+                    },
+                    {
+                        "func_id": 2,
+                        "source": f"{KERNELS_BASE}/aiv/kernel_mul.cpp",
+                        "core_type": "aiv",
+                        "signature": [D.IN, D.IN, D.OUT],
+                    },
+                ],
             },
-            {
-                "func_id": 1,
-                "source": f"{KERNELS_BASE}/aiv/kernel_add_scalar.cpp",
-                "core_type": "aiv",
-                "signature": [D.IN, D.OUT],
-            },
-            {
-                "func_id": 2,
-                "source": f"{KERNELS_BASE}/aiv/kernel_mul.cpp",
-                "core_type": "aiv",
-                "signature": [D.IN, D.IN, D.OUT],
-            },
+            {"name": "verify", "callable": verify},
         ],
     }
-    RUNTIME_CONFIG = {"aicpu_thread_num": 4, "block_dim": 3}
 
-    def generate_inputs(self, params):
-        return []
+    CASES = [
+        {
+            "name": "default",
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"device_count": 2, "num_sub_workers": 1, "block_dim": 3, "aicpu_thread_num": 4},
+            "params": {},
+        },
+    ]
 
-    def compute_golden(self, tensors, params):
-        pass
+    def generate_args(self, params):
+        SIZE = 128 * 128
+        return TaskArgsBuilder(
+            Tensor("a0", torch.full((SIZE,), 2.0, dtype=torch.float32).share_memory_()),
+            Tensor("b0", torch.full((SIZE,), 3.0, dtype=torch.float32).share_memory_()),
+            Tensor("f0", torch.zeros(SIZE, dtype=torch.float32).share_memory_()),
+            Tensor("a1", torch.full((SIZE,), 2.0, dtype=torch.float32).share_memory_()),
+            Tensor("b1", torch.full((SIZE,), 3.0, dtype=torch.float32).share_memory_()),
+            Tensor("f1", torch.zeros(SIZE, dtype=torch.float32).share_memory_()),
+        )
+
+    def compute_golden(self, args, params):
+        args.f0[:] = (args.a0 + args.b0 + 1) * (args.a0 + args.b0 + 2) + (args.a0 + args.b0)
+        args.f1[:] = (args.a1 + args.b1 + 1) * (args.a1 + args.b1 + 2) + (args.a1 + args.b1)
 
 
-def _make_shared_tensors():
-    SIZE = 128 * 128
-    a = torch.full((SIZE,), 2.0, dtype=torch.float32).share_memory_()
-    b = torch.full((SIZE,), 3.0, dtype=torch.float32).share_memory_()
-    f = torch.zeros(SIZE, dtype=torch.float32).share_memory_()
-    args = ChipStorageTaskArgs()
-    for t in [a, b, f]:
-        args.add_tensor(make_tensor_arg(t))
-    return a, b, f, args
-
-
-@pytest.mark.platforms(["a2a3sim", "a2a3"])
-@pytest.mark.device_count(2)
-def test_l3_group_subtask(st_platform, st_device_ids):
-    """L3: Group of 2 ChipWorkers (fork+shm) as 1 DAG node, SubTask depends on group."""
-    chip_callable = _VectorKernels.compile_chip_callable(st_platform)
-    a0, b0, f0, args0 = _make_shared_tensors()
-    a1, b1, f1, args1 = _make_shared_tensors()
-
-    result_shm = SharedMemory(create=True, size=16)
-    result_buf = result_shm.buf
-    assert result_buf is not None
-    struct.pack_into("dd", result_buf, 0, -999.0, -999.0)
-
-    def sub_fn():
-        import ctypes  # noqa: PLC0415
-
-        p0 = ctypes.cast(f0.data_ptr(), ctypes.POINTER(ctypes.c_float))
-        p1 = ctypes.cast(f1.data_ptr(), ctypes.POINTER(ctypes.c_float))
-        struct.pack_into("dd", result_buf, 0, float(p0[0]), float(p1[0]))
-
-    w = Worker(
-        level=3, device_ids=st_device_ids, num_sub_workers=1, platform=st_platform, runtime="tensormap_and_ringbuffer"
-    )
-    sub_cid = w.register(sub_fn)
-    w.init()
-
-    def my_orch(w, _args):
-        chip_p = WorkerPayload()
-        chip_p.worker_type = WorkerType.CHIP
-        chip_p.callable = chip_callable.buffer_ptr()
-        chip_p.block_dim = 3
-        chip_p.aicpu_thread_num = 4
-        group_result = w.submit(WorkerType.CHIP, chip_p, args_list=[args0.__ptr__(), args1.__ptr__()], outputs=[4])
-        sub_p = WorkerPayload()
-        sub_p.worker_type = WorkerType.SUB
-        sub_p.callable_id = sub_cid
-        w.submit(WorkerType.SUB, sub_p, inputs=[group_result.outputs[0].ptr])
-
-    w.run(Task(orch=my_orch))
-    w.close()
-
-    v0, v1 = struct.unpack_from("dd", result_buf, 0)
-    result_shm.close()
-    result_shm.unlink()
-
-    assert abs(f0[0].item() - 47.0) < 0.01, f"Chip 0 wrong: {f0[0].item()}"
-    assert abs(f1[0].item() - 47.0) < 0.01, f"Chip 1 wrong: {f1[0].item()}"
-    assert v0 != -999.0 and v1 != -999.0, "SubTask never ran"
-    assert abs(v0 - 47.0) < 0.01, f"SubTask saw wrong f0: {v0}"
-    assert abs(v1 - 47.0) < 0.01, f"SubTask saw wrong f1: {v1}"
+if __name__ == "__main__":
+    SceneTestCase.run_module(__name__)

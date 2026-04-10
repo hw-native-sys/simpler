@@ -137,8 +137,8 @@ def st_worker(request, st_platform, device_pool):
         device_pool.release(ids)
 
     elif level == 3:
-        max_devices = max((c.get("device_count", 1) for c in cls.CASES), default=1)
-        max_subs = max((c.get("num_sub_workers", 0) for c in cls.CASES), default=0)
+        max_devices = max((c.get("config", {}).get("device_count", 1) for c in cls.CASES), default=1)
+        max_subs = max((c.get("config", {}).get("num_sub_workers", 0) for c in cls.CASES), default=0)
         ids = device_pool.allocate(max_devices)
         if not ids:
             pytest.fail(f"need {max_devices} devices")
@@ -146,6 +146,15 @@ def st_worker(request, st_platform, device_pool):
         from simpler.worker import Worker  # noqa: PLC0415
 
         w = Worker(level=3, device_ids=ids, num_sub_workers=max_subs, platform=st_platform, runtime=runtime)
+
+        # Register SubCallable entries from cls.CALLABLE
+        sub_ids = {}
+        for entry in cls.CALLABLE.get("callables", []):
+            if "callable" in entry:
+                cid = w.register(entry["callable"])
+                sub_ids[entry["name"]] = cid
+        cls._st_sub_ids = sub_ids
+
         w.init()
         yield w
         w.close()

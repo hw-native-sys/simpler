@@ -13,9 +13,10 @@ from .kernel_compiler import KernelCompiler
 from .platform_info import parse_platform
 from .pto_isa import ensure_pto_isa_root
 from .runtime_builder import RuntimeBuilder
-from .scene_test import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from .scene_test import CallableNamespace, Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 __all__ = [
+    "CallableNamespace",
     "KernelCompiler",
     "RuntimeBuilder",
     "Scalar",

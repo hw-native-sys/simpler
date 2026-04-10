@@ -13,7 +13,9 @@ pytest: ``pytest --platform a2a3sim``
 standalone: ``python test_xxx.py -p a2a3sim``
 
 A scene test class declares three things:
-  CALLABLE: what to compile (orchestration + incores)
+  CALLABLE: what to compile/register
+    L2: orchestration (C++ source) + incores (C++ kernels)
+    L3: orchestration (Python DAG fn) + callables (ChipCallable + SubCallable)
   CASES: how to run (per-case platform, config, params)
   generate_args / compute_golden: data + golden comparison
 """
@@ -144,6 +146,49 @@ class TaskArgsBuilder:
 
 
 # ---------------------------------------------------------------------------
+# CallableNamespace — dot-access container for L3 callables
+# ---------------------------------------------------------------------------
+
+
+class CallableNamespace:
+    """Dot-access container for compiled/registered callables.
+
+    Used by L3 orch functions to access callables by name::
+
+        callables.vector_kernel       # → ChipCallable object
+        callables.vector_kernel_sig   # → signature list
+        callables.verify              # → callable_id (int)
+
+    Also provides ``keep()`` for lifetime management: L3 orch functions
+    that build transient Python objects (e.g. ChipStorageTaskArgs) whose
+    raw pointers are submitted to the C++ scheduler must register them
+    via ``keep()`` so they outlive the scheduler drain::
+
+        def run_dag(w, callables, task_args, config):
+            chip_args, _ = _build_chip_task_args(task_args, callables.vector_kernel_sig)
+            callables.keep(chip_args)  # survive until drain finishes
+            ...
+    """
+
+    def __init__(self, entries: dict):
+        self._entries = dict(entries)
+        self._keepalive: list = []
+
+    def __getattr__(self, name: str):
+        try:
+            return self._entries[name]
+        except KeyError:
+            raise AttributeError(f"CallableNamespace has no entry '{name}'") from None
+
+    def keep(self, *objs):
+        """Register objects to keep alive until this namespace is destroyed."""
+        if not objs:
+            return None
+        self._keepalive.extend(objs)
+        return objs[0] if len(objs) == 1 else objs
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 
@@ -208,19 +253,88 @@ def _temporary_env(env_updates):
 def _resolve_callable_paths(cls, cls_dir):
     """Resolve relative source paths in CALLABLE against cls_dir."""
     callable_spec = cls.CALLABLE
-    if "orchestration" in callable_spec:
-        orch = callable_spec["orchestration"]
-        if "source" in orch and not os.path.isabs(orch["source"]):
-            callable_spec["orchestration"] = dict(orch)
-            callable_spec["orchestration"]["source"] = str(cls_dir / orch["source"])
-    if "incores" in callable_spec:
+    if "callables" in callable_spec:
+        # L3: resolve inside each ChipCallable entry
         resolved = []
-        for k in callable_spec["incores"]:
+        for entry in callable_spec["callables"]:
+            if "orchestration" in entry:
+                entry = dict(entry)
+                _resolve_chip_entry_paths(entry, cls_dir)
+            resolved.append(entry)
+        callable_spec["callables"] = resolved
+    else:
+        # L2: resolve orchestration + incores directly
+        _resolve_chip_entry_paths(callable_spec, cls_dir)
+
+
+def _resolve_chip_entry_paths(entry, cls_dir):
+    """Resolve relative source paths in a chip entry (orchestration + incores)."""
+    if "orchestration" in entry:
+        orch = entry["orchestration"]
+        if isinstance(orch, dict) and "source" in orch and not os.path.isabs(orch["source"]):
+            entry["orchestration"] = dict(orch)
+            entry["orchestration"]["source"] = str(cls_dir / orch["source"])
+    if "incores" in entry:
+        resolved = []
+        for k in entry["incores"]:
             k = dict(k)
             if "source" in k and not os.path.isabs(k["source"]):
                 k["source"] = str(cls_dir / k["source"])
             resolved.append(k)
-        callable_spec["incores"] = resolved
+        entry["incores"] = resolved
+
+
+def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
+    """Compare output tensors against golden values."""
+    import torch  # noqa: PLC0415
+
+    for name in output_names:
+        actual = getattr(test_args, name)
+        expected = getattr(golden_args, name)
+        if not torch.allclose(actual, expected, rtol=rtol, atol=atol):
+            diff = (actual - expected).abs().max().item()
+            raise AssertionError(f"Golden mismatch on '{name}': max_diff={diff}, rtol={rtol}, atol={atol}")
+
+
+def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
+    """Compile a chip entry spec (orchestration + incores) -> ChipCallable. Session-cached."""
+    if cache_key in _compile_cache:
+        return _compile_cache[cache_key]
+
+    from .elf_parser import extract_text_section  # noqa: PLC0415
+    from .kernel_compiler import KernelCompiler  # noqa: PLC0415
+    from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+    ensure_python_path()
+    from simpler.task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
+
+    orch = spec["orchestration"]
+    incores = spec["incores"]
+
+    pto_isa_root = ensure_pto_isa_root()
+    kc = KernelCompiler(platform=platform)
+    is_sim = platform.endswith("sim")
+
+    orch_binary = kc.compile_orchestration(runtime, orch["source"])
+    inc_dirs = kc.get_orchestration_include_dirs(runtime)
+
+    kernel_binaries = []
+    for k in incores:
+        incore = kc.compile_incore(
+            k["source"], core_type=k["core_type"], pto_isa_root=pto_isa_root, extra_include_dirs=inc_dirs
+        )
+        if not is_sim:
+            incore = extract_text_section(incore)
+        kernel_binaries.append((k["func_id"], CoreCallable.build(signature=k.get("signature", []), binary=incore)))
+
+    chip_callable = ChipCallable.build(
+        signature=orch.get("signature", []),
+        func_name=orch["function_name"],
+        binary=orch_binary,
+        children=kernel_binaries,
+    )
+    _compile_cache[cache_key] = chip_callable
+    return chip_callable
 
 
 # ---------------------------------------------------------------------------
@@ -276,46 +390,22 @@ class SceneTestCase:
 
     @classmethod
     def compile_chip_callable(cls, platform):
-        """Compile CALLABLE -> ChipCallable. Session-cached."""
-        callable_spec = cls.CALLABLE
-        orch = callable_spec["orchestration"]
-        incores = callable_spec["incores"]
-
+        """Compile CALLABLE -> ChipCallable (L2). Session-cached."""
         cache_key = (cls.__qualname__, platform, cls._st_runtime)
-        if cache_key in _compile_cache:
-            return _compile_cache[cache_key]
+        return _compile_chip_callable_from_spec(cls.CALLABLE, platform, cls._st_runtime, cache_key)
 
-        from .elf_parser import extract_text_section  # noqa: PLC0415
-        from .kernel_compiler import KernelCompiler  # noqa: PLC0415
-        from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
-
-        ensure_python_path()
-        from simpler.task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
-
-        pto_isa_root = ensure_pto_isa_root()
-        kc = KernelCompiler(platform=platform)
-        is_sim = platform.endswith("sim")
-
-        orch_binary = kc.compile_orchestration(cls._st_runtime, orch["source"])
-        inc_dirs = kc.get_orchestration_include_dirs(cls._st_runtime)
-
-        kernel_binaries = []
-        for k in incores:
-            incore = kc.compile_incore(
-                k["source"], core_type=k["core_type"], pto_isa_root=pto_isa_root, extra_include_dirs=inc_dirs
-            )
-            if not is_sim:
-                incore = extract_text_section(incore)
-            kernel_binaries.append((k["func_id"], CoreCallable.build(signature=k.get("signature", []), binary=incore)))
-
-        chip_callable = ChipCallable.build(
-            signature=orch.get("signature", []),
-            func_name=orch["function_name"],
-            binary=orch_binary,
-            children=kernel_binaries,
-        )
-        _compile_cache[cache_key] = chip_callable
-        return chip_callable
+    @classmethod
+    def _compile_l3_callables(cls, platform):
+        """Compile all ChipCallable entries in CALLABLE['callables'] (L3)."""
+        compiled = {}
+        for entry in cls.CALLABLE["callables"]:
+            if "orchestration" in entry:
+                name = entry["name"]
+                cache_key = (cls.__qualname__, name, platform, cls._st_runtime)
+                chip = _compile_chip_callable_from_spec(entry, platform, cls._st_runtime, cache_key)
+                compiled[name] = chip
+                compiled[f"{name}_sig"] = entry["orchestration"].get("signature", [])
+        return compiled
 
     # ------------------------------------------------------------------
     # Worker creation
@@ -348,8 +438,16 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     def build_callable(self, platform):
-        """Default: compile from CALLABLE. Override for L3+."""
-        return self.compile_chip_callable(platform)
+        """Build callable for the current level.
+
+        L2: returns ChipCallable.
+        L3: returns dict of {name: ChipCallable, name_sig: signature}.
+        """
+        if self._st_level == 2:
+            return self.compile_chip_callable(platform)
+        elif self._st_level == 3:
+            return self._compile_l3_callables(platform)
+        raise ValueError(f"Unsupported level: {self._st_level}")
 
     def _build_config(self, config_dict):
         ensure_python_path()
@@ -377,9 +475,13 @@ class SceneTestCase:
     # Run + validate
     # ------------------------------------------------------------------
 
-    def _run_and_validate(self, worker, callable_obj, case):
-        import torch  # noqa: PLC0415
+    def _run_and_validate(self, worker, callable_obj, case, sub_ids=None):
+        if self._st_level == 2:
+            self._run_and_validate_l2(worker, callable_obj, case)
+        elif self._st_level == 3:
+            self._run_and_validate_l3(worker, callable_obj, sub_ids or {}, case)
 
+    def _run_and_validate_l2(self, worker, callable_obj, case):
         params = case.get("params", {})
         config = self._build_config(case.get("config", {}))
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
@@ -397,14 +499,37 @@ class SceneTestCase:
             worker.run(callable_obj, chip_args, block_dim=config.block_dim, aicpu_thread_num=config.aicpu_thread_num)
 
         # Compare outputs
-        for name in output_names:
-            actual = getattr(test_args, name)
-            expected = getattr(golden_args, name)
-            if not torch.allclose(actual, expected, rtol=self.RTOL, atol=self.ATOL):
-                diff = (actual - expected).abs().max().item()
-                raise AssertionError(
-                    f"Golden mismatch on '{name}': max_diff={diff}, rtol={self.RTOL}, atol={self.ATOL}"
-                )
+        _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+
+    def _run_and_validate_l3(self, worker, compiled_callables, sub_ids, case):
+        ensure_python_path()
+        from simpler.worker import Task  # noqa: PLC0415
+
+        params = case.get("params", {})
+        config = self._build_config(case.get("config", {}))
+
+        # Build args
+        test_args = self.generate_args(params)
+
+        # Clone for golden
+        golden_args = test_args.clone()
+        self.compute_golden(golden_args, params)
+
+        # Build CallableNamespace: compiled ChipCallables + sub callable IDs
+        ns = CallableNamespace({**compiled_callables, **sub_ids})
+
+        # Get orch function (plain function from CALLABLE)
+        orch_fn = self.CALLABLE["orchestration"]
+
+        # Wrap in Task — orch signature: (w, callables, task_args, config)
+        def task_orch(w, _unused):
+            orch_fn(w, ns, test_args, config)
+
+        with _temporary_env(self._resolve_env()):
+            worker.run(Task(orch=task_orch))
+
+        # Compare all tensors against golden
+        _compare_outputs(test_args, golden_args, test_args.tensor_names(), self.RTOL, self.ATOL)
 
     # ------------------------------------------------------------------
     # pytest auto test method
@@ -416,6 +541,7 @@ class SceneTestCase:
         all_cases = request.config.getoption("--all-cases", default=False)
 
         callable_obj = self.build_callable(st_platform)
+        sub_ids = getattr(type(self), "_st_sub_ids", {})
         ran_any = False
         for case in self.CASES:
             if st_platform not in case["platforms"]:
@@ -424,7 +550,7 @@ class SceneTestCase:
                 continue
             if case.get("manual") and not case_filter and not all_cases:
                 continue
-            self._run_and_validate(st_worker, callable_obj, case)
+            self._run_and_validate(st_worker, callable_obj, case, sub_ids=sub_ids)
             ran_any = True
 
         if not ran_any:
@@ -462,11 +588,12 @@ class SceneTestCase:
         ok = True
         for runtime, group in by_runtime.items():
             print(f"\n=== Runtime: {runtime} ===")
-            worker = group[0]._create_worker(args.platform, args.device)
+            worker, per_class_sub_ids = _create_standalone_worker(group, args)
             try:
                 for cls in group:
                     inst = cls()
                     callable_obj = inst.build_callable(args.platform)
+                    sub_ids = per_class_sub_ids.get(cls, {})
                     for case in inst.CASES:
                         if args.platform not in case["platforms"]:
                             continue
@@ -477,11 +604,43 @@ class SceneTestCase:
                         label = f"{cls.__name__}::{case['name']}"
                         print(f"  {label} ... ", end="", flush=True)
                         try:
-                            inst._run_and_validate(worker, callable_obj, case)
+                            inst._run_and_validate(worker, callable_obj, case, sub_ids=sub_ids)
                             print("PASSED")
                         except Exception as e:
                             print(f"FAILED: {e}")
                             ok = False
             finally:
-                worker.finalize()
+                if group[0]._st_level == 2:
+                    worker.finalize()
+                else:
+                    worker.close()
         sys.exit(0 if ok else 1)
+
+
+def _create_standalone_worker(group, args):
+    """Create a Worker for standalone run_module entry point."""
+    first_cls = group[0]
+    level = first_cls._st_level
+    if level == 2:
+        return first_cls._create_worker(args.platform, args.device), {}
+
+    ensure_python_path()
+    from simpler.worker import Worker  # noqa: PLC0415
+
+    max_devices = max((c.get("config", {}).get("device_count", 1) for cls in group for c in cls.CASES), default=1)
+    max_subs = max((c.get("config", {}).get("num_sub_workers", 0) for cls in group for c in cls.CASES), default=0)
+    device_ids = list(range(args.device, args.device + max_devices))
+    worker = Worker(
+        level=3, device_ids=device_ids, num_sub_workers=max_subs, platform=args.platform, runtime=first_cls._st_runtime
+    )
+    # Register sub callables per-class to avoid name collisions
+    per_class_sub_ids: dict[type, dict] = {}
+    for cls in group:
+        cls_sub_ids = {}
+        for entry in cls.CALLABLE.get("callables", []):
+            if "callable" in entry:
+                cid = worker.register(entry["callable"])
+                cls_sub_ids[entry["name"]] = cid
+        per_class_sub_ids[cls] = cls_sub_ids
+    worker.init()
+    return worker, per_class_sub_ids

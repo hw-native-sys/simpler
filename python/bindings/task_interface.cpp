@@ -222,6 +222,14 @@ NB_MODULE(_task_interface, m) {
                 return reinterpret_cast<uint64_t>(&self);
             },
             "Return the memory address of the underlying C++ object."
+        )
+
+        .def_static(
+            "sizeof",
+            []() -> size_t {
+                return sizeof(ChipStorageTaskArgs);
+            },
+            "Return sizeof(ChipStorageTaskArgs) in bytes."
         );
 
     // --- TensorArgType enum ---
