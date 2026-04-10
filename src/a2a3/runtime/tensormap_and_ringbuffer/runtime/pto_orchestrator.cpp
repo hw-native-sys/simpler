@@ -407,6 +407,7 @@ bool pto2_orchestrator_init(
     orch->scope_stack_top = -1;
     orch->scope_stack_capacity = max_depth;
     orch->manual_scope_active = false;
+    orch->manual_scope_needs_dep_pool_repair = false;
 
     return true;
 }
@@ -525,6 +526,7 @@ void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode) {
     ++orch->scope_stack_top;
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
     orch->manual_scope_active = (mode == PTO2ScopeMode::MANUAL);
+    orch->manual_scope_needs_dep_pool_repair = false;
 }
 
 void pto2_scope_end(PTO2OrchestratorState *orch) {
@@ -545,6 +547,7 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
     if (!manual_scope) {
         orch->scope_stack_top--;
         orch->manual_scope_active = false;
+        orch->manual_scope_needs_dep_pool_repair = false;
 
         if (orch->scheduler && count > 0) {
             orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
@@ -594,6 +597,7 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
     orch->scope_tasks_size = begin;
     orch->scope_stack_top--;
     orch->manual_scope_active = false;
+    orch->manual_scope_needs_dep_pool_repair = false;
 
 #if PTO2_ORCH_PROFILING
     uint64_t _se1 = get_sys_cnt_aicpu();

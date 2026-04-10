@@ -66,6 +66,7 @@ struct PTO2OrchestratorState {
     int32_t scope_stack_top;           // Current top of stack (-1 = no scope open)
     uint64_t scope_stack_capacity;     // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
     bool manual_scope_active{false};
+    bool manual_scope_needs_dep_pool_repair{false};
 
     // === SCHEDULER REFERENCE ===
     // Note: In simulated mode, orchestrator and scheduler share address space
