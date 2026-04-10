@@ -193,6 +193,10 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
 TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args);
 PTO2ManualSubmitResult
 pto2_submit_mixed_task_manual(PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args);
+PTO2ManualSubmitResult pto2_submit_mixed_task_manual_with_deps(
+    PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args,
+    const PTO2TaskId explicit_producer_ids[], int32_t explicit_producer_count
+);
 
 void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer, PTO2TaskId consumer);
 

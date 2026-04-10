@@ -150,6 +150,9 @@ struct PTO2FaninBuilder {
     }
 };
 
+static int32_t current_manual_scope_begin(const PTO2OrchestratorState *orch);
+static int32_t find_current_manual_scope_task_index(const PTO2OrchestratorState *orch, PTO2TaskId task_id);
+
 static bool pto2_append_fanin_or_fail(
     PTO2OrchestratorState *orch, PTO2TaskId task_id, int32_t tensor_arg_index, TensorArgType ptype,
     PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, PTO2SchedulerState *sched, PTO2RingFlowControl &fc,
@@ -192,6 +195,95 @@ static bool pto2_append_fanin_or_fail(
     }
     entry->slot_state = prod_state;
     fanin_builder->count++;
+    return true;
+}
+
+static bool pto2_append_manual_explicit_fanins_to_payload_or_fail(
+    PTO2OrchestratorState *orch, PTO2TaskId consumer_id, PTO2TaskPayload *consumer_payload,
+    PTO2TaskSlotState *consumer_slot_state, const PTO2TaskId explicit_producer_ids[], int32_t explicit_producer_count
+) {
+    if (explicit_producer_count <= 0 || explicit_producer_ids == nullptr) {
+        return true;
+    }
+
+    if (consumer_payload->manual_explicit_fanin_count == 0) {
+        consumer_payload->manual_explicit_fanin_begin = consumer_payload->fanin_actual_count;
+    }
+
+    for (int32_t i = 0; i < explicit_producer_count; i++) {
+        PTO2TaskId producer_id = explicit_producer_ids[i];
+        if (!producer_id.is_valid()) {
+            LOG_ERROR("manual submit explicit dependency requires valid producer task ids");
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+            orch->fatal = true;
+            return false;
+        }
+        if (producer_id == consumer_id) {
+            LOG_ERROR("manual submit explicit dependency does not allow self-dependency");
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+            orch->fatal = true;
+            return false;
+        }
+        int32_t producer_idx = find_current_manual_scope_task_index(orch, producer_id);
+        if (producer_idx < 0) {
+            LOG_ERROR("manual submit explicit dependency requires producers from the current manual scope");
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+            orch->fatal = true;
+            return false;
+        }
+        PTO2TaskSlotState *producer_slot_state = orch->scope_tasks[current_manual_scope_begin(orch) + producer_idx];
+        bool duplicate = false;
+        pto2_for_each_fanin_slot_state(*consumer_payload, [&](PTO2TaskSlotState *fanin_slot_state) {
+            if (fanin_slot_state == producer_slot_state) {
+                duplicate = true;
+                return false;
+            }
+            return true;
+        });
+        if (duplicate) {
+            continue;
+        }
+        if (consumer_payload->fanin_actual_count >= PTO2_MAX_INPUTS) {
+            LOG_ERROR("========================================");
+            LOG_ERROR("FATAL: Dependency Overflow Detected!");
+            LOG_ERROR("========================================");
+            LOG_ERROR("Task requires more than PTO2_MAX_INPUTS unique fanin dependencies.");
+            LOG_ERROR("  consumer_id.raw:    %" PRIu64, consumer_id.raw);
+            LOG_ERROR("  fanin_count:        %d / %d", consumer_payload->fanin_actual_count + 1, PTO2_MAX_INPUTS);
+            LOG_ERROR("  reason:             manual submit explicit dependency");
+            LOG_ERROR("========================================");
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_DEPENDENCY_OVERFLOW, std::memory_order_release);
+            orch->fatal = true;
+            return false;
+        }
+        int32_t current_fanin_count = consumer_payload->fanin_actual_count;
+        if (current_fanin_count < PTO2_FANIN_INLINE_CAP) {
+            consumer_payload->fanin_inline_slot_states[current_fanin_count] = producer_slot_state;
+        } else {
+            PTO2FaninPool *spill_pool = (consumer_payload->fanin_spill_pool != nullptr)
+                                            ? consumer_payload->fanin_spill_pool
+                                            : &orch->rings[consumer_slot_state->ring_id].fanin_pool;
+            PTO2FaninPool &fanin_pool = *spill_pool;
+            auto &fc = orch->sm_handle->header->rings[consumer_slot_state->ring_id].fc;
+            fanin_pool.ensure_space(*orch->scheduler, fc, consumer_slot_state->ring_id, 1);
+            int32_t spill_idx = fanin_pool.top;
+            PTO2FaninSpillEntry *entry = fanin_pool.alloc();
+            if (entry == nullptr) {
+                orch->fatal = true;
+                return false;
+            }
+            if (current_fanin_count == PTO2_FANIN_INLINE_CAP) {
+                consumer_payload->fanin_spill_start = spill_idx;
+                consumer_payload->fanin_spill_pool = spill_pool;
+            } else if (consumer_payload->fanin_spill_pool == nullptr) {
+                consumer_payload->fanin_spill_pool = spill_pool;
+            }
+            entry->slot_state = producer_slot_state;
+        }
+        consumer_payload->fanin_actual_count = current_fanin_count + 1;
+        consumer_payload->manual_explicit_fanin_count += 1;
+        consumer_slot_state->fanin_count += 1;
+    }
     return true;
 }
 
@@ -508,6 +600,80 @@ static bool task_owned_by_current_manual_scope(const PTO2OrchestratorState *orch
     return find_current_manual_scope_task_index(orch, task_id) >= 0;
 }
 
+static bool link_manual_scope_explicit_edges(PTO2OrchestratorState *orch, int32_t begin, int32_t count) {
+    if (orch->scheduler == nullptr || count <= 0) {
+        return true;
+    }
+
+    int32_t total_explicit_edges = 0;
+    for (int32_t task_idx = 0; task_idx < count; task_idx++) {
+        PTO2TaskSlotState *consumer_slot_state = orch->scope_tasks[begin + task_idx];
+        PTO2TaskPayload *consumer_payload = consumer_slot_state->payload;
+        if (consumer_payload->fanin_actual_count > PTO2_MAX_INPUTS) {
+            LOG_ERROR("========================================");
+            LOG_ERROR("FATAL: Dependency Overflow Detected!");
+            LOG_ERROR("========================================");
+            LOG_ERROR("Task requires more than PTO2_MAX_INPUTS unique fanin dependencies.");
+            LOG_ERROR("  task_id.raw:        %" PRIu64, consumer_slot_state->task->task_id.raw);
+            LOG_ERROR("  fanin_count:        %d / %d", consumer_payload->fanin_actual_count, PTO2_MAX_INPUTS);
+            LOG_ERROR("  reason:             manual dependency bookkeeping");
+            LOG_ERROR("This is a runtime dependency-tracking limit.");
+            LOG_ERROR("========================================");
+            orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_DEPENDENCY_OVERFLOW, std::memory_order_release);
+            orch->fatal = true;
+            return false;
+        }
+        total_explicit_edges += consumer_payload->manual_explicit_fanin_count;
+    }
+
+    if (total_explicit_edges == 0) {
+        return true;
+    }
+
+    uint8_t ring_id = orch->scope_tasks[begin]->ring_id;
+    auto &dep_pool = orch->rings[ring_id].dep_pool;
+    auto &fc = orch->sm_handle->header->rings[ring_id].fc;
+    dep_pool.ensure_space(*orch->scheduler, fc, ring_id, total_explicit_edges);
+
+    int32_t dep_pool_mark_prefix = 0;
+    for (int32_t task_idx = 0; task_idx < count; task_idx++) {
+        PTO2TaskSlotState *consumer_slot_state = orch->scope_tasks[begin + task_idx];
+        PTO2TaskPayload *consumer_payload = consumer_slot_state->payload;
+
+        bool fanout_ok = pto2_for_each_fanin_slot_state_range(
+            *consumer_payload, consumer_payload->manual_explicit_fanin_begin,
+            consumer_payload->manual_explicit_fanin_count,
+            [&](PTO2TaskSlotState *producer_slot_state) {
+                always_assert(
+                    producer_slot_state->ring_id == consumer_slot_state->ring_id &&
+                    "manual explicit dependencies must stay within one ring"
+                );
+                producer_slot_state->fanout_count += 1;
+                producer_slot_state->fanout_head =
+                    dep_pool.prepend(producer_slot_state->fanout_head, consumer_slot_state);
+                if (producer_slot_state->fanout_head == nullptr) {
+                    orch->fatal = true;
+                    return false;
+                }
+                return true;
+            }
+        );
+        if (!fanout_ok) {
+            return false;
+        }
+
+        if (consumer_slot_state->dep_pool_mark < dep_pool.top) {
+            consumer_slot_state->dep_pool_mark = dep_pool.top;
+        }
+        if (consumer_slot_state->dep_pool_mark < dep_pool_mark_prefix) {
+            consumer_slot_state->dep_pool_mark = dep_pool_mark_prefix;
+        } else {
+            dep_pool_mark_prefix = consumer_slot_state->dep_pool_mark;
+        }
+    }
+    return true;
+}
+
 void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode) {
     if (orch->fatal) {
         return;
@@ -563,32 +729,8 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
     }
 
     if (orch->scheduler && count > 0) {
-        int32_t dep_pool_mark_prefix = 0;
-        for (int32_t task_idx = 0; task_idx < count; task_idx++) {
-            PTO2TaskSlotState *slot_state = orch->scope_tasks[begin + task_idx];
-            PTO2TaskPayload *payload = slot_state->payload;
-            if (payload->fanin_actual_count > PTO2_MAX_INPUTS) {
-                LOG_ERROR("========================================");
-                LOG_ERROR("FATAL: Dependency Overflow Detected!");
-                LOG_ERROR("========================================");
-                LOG_ERROR("Task requires more than PTO2_MAX_INPUTS unique fanin dependencies.");
-                LOG_ERROR("  task_id.raw:        %" PRIu64, slot_state->task->task_id.raw);
-                LOG_ERROR("  fanin_count:        %d / %d", payload->fanin_actual_count, PTO2_MAX_INPUTS);
-                LOG_ERROR("  reason:             manual dependency bookkeeping");
-                LOG_ERROR("This is a runtime dependency-tracking limit.");
-                LOG_ERROR("========================================");
-                orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_DEPENDENCY_OVERFLOW, std::memory_order_release);
-                orch->fatal = true;
-                return;
-            }
-            // add_dependency may allocate dep entries for an older consumer after
-            // newer tasks were already submitted. Recompute a monotonic dep-pool
-            // watermark at publish time so tail reclamation still advances safely.
-            if (slot_state->dep_pool_mark < dep_pool_mark_prefix) {
-                slot_state->dep_pool_mark = dep_pool_mark_prefix;
-            } else {
-                dep_pool_mark_prefix = slot_state->dep_pool_mark;
-            }
+        if (!link_manual_scope_explicit_edges(orch, begin, count)) {
+            return;
         }
         orch->scheduler->publish_manual_scope_tasks_and_end_scope(&orch->scope_tasks[begin], count);
     }
@@ -612,7 +754,8 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
 template <bool kManualSubmit>
 static TaskOutputTensors pto2_submit_mixed_task_impl(
     PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args,
-    PTO2TaskId *submitted_task_id = nullptr
+    PTO2TaskId *submitted_task_id = nullptr, const PTO2TaskId explicit_producer_ids[] = nullptr,
+    int32_t explicit_producer_count = 0
 ) {
     CYCLE_COUNT_START();
 
@@ -663,6 +806,8 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
     always_assert(orch->scope_stack_top >= 0 && "Cannot submit task outside a scope");
 
     if constexpr (!kManualSubmit) {
+        (void)explicit_producer_ids;
+        (void)explicit_producer_count;
         if (in_manual_scope(orch)) {
             LOG_ERROR("PTO2_SCOPE(PTO2ScopeMode::MANUAL) requires pto2_rt_submit_*_manual task APIs");
             orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
@@ -880,6 +1025,8 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
             payload->fanin_actual_count = fanin_count;
             payload->fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
             payload->fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
+            payload->manual_explicit_fanin_begin = fanin_count;
+            payload->manual_explicit_fanin_count = 0;
             for (int i = 0; i < inline_count; i++) {
                 payload->fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
             }
@@ -919,6 +1066,11 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
                 cur_slot_state.fanin_refcount.fetch_add(early_finished, std::memory_order_acq_rel);
             }
             cur_slot_state.dep_pool_mark = dep_pool.top;
+            if (!pto2_append_manual_explicit_fanins_to_payload_or_fail(
+                    orch, task_id, payload, &cur_slot_state, explicit_producer_ids, explicit_producer_count
+                )) {
+                return result;
+            }
 #if PTO2_ORCH_PROFILING
             g_orch_fanin_atomic_count += fanin_count * 3;
             if (early_finished > 0) {
@@ -937,6 +1089,8 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
             payload->fanin_actual_count = fanin_count;
             payload->fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
             payload->fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
+            payload->manual_explicit_fanin_begin = fanin_count;
+            payload->manual_explicit_fanin_count = 0;
             for (int i = 0; i < inline_count; i++) {
                 payload->fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
             }
@@ -1049,6 +1203,8 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
     payload->fanin_actual_count = 0;
     payload->fanin_spill_start = 0;
     payload->fanin_spill_pool = nullptr;
+    payload->manual_explicit_fanin_begin = 0;
+    payload->manual_explicit_fanin_count = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         payload->tensors[i].owner_task_id = prepared.task_id;
     }
@@ -1103,6 +1259,29 @@ pto2_submit_mixed_task_manual(PTO2OrchestratorState *orch, const MixedKernels &m
     }
     PTO2TaskId task_id = PTO2TaskId::invalid();
     TaskOutputTensors outputs = pto2_submit_mixed_task_impl<true>(orch, mixed_kernels, args, &task_id);
+    if (orch->fatal || !task_id.is_valid()) {
+        return result;
+    }
+    result.task_id = task_id;
+    result.outputs = outputs;
+    return result;
+}
+
+PTO2ManualSubmitResult pto2_submit_mixed_task_manual_with_deps(
+    PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args,
+    const PTO2TaskId explicit_producer_ids[], int32_t explicit_producer_count
+) {
+    PTO2ManualSubmitResult result{};
+    if (!in_manual_scope(orch)) {
+        LOG_ERROR("manual submit APIs require PTO2_SCOPE(PTO2ScopeMode::MANUAL)");
+        orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
+        orch->fatal = true;
+        return result;
+    }
+    PTO2TaskId task_id = PTO2TaskId::invalid();
+    TaskOutputTensors outputs = pto2_submit_mixed_task_impl<true>(
+        orch, mixed_kernels, args, &task_id, explicit_producer_ids, explicit_producer_count
+    );
     if (orch->fatal || !task_id.is_valid()) {
         return result;
     }
@@ -1167,25 +1346,18 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
         return;
     }
 
-    auto &dep_pool = orch->rings[producer_slot_state->ring_id].dep_pool;
-    auto &fc = orch->sm_handle->header->rings[producer_slot_state->ring_id].fc;
-    dep_pool.ensure_space(*orch->scheduler, fc, producer_slot_state->ring_id, 1);
-
-    PTO2FaninBuilder fanin_builder;
-    fanin_builder.count = consumer_payload->fanin_actual_count;
-    fanin_builder.spill_start = consumer_payload->fanin_spill_start;
-    fanin_builder.spill_pool =
-        (consumer_payload->fanin_spill_pool != nullptr) ? consumer_payload->fanin_spill_pool
-                                                        : &orch->rings[consumer_slot_state->ring_id].fanin_pool;
-    int32_t cached_inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
-    for (int32_t i = 0; i < cached_inline_count; i++) {
-        fanin_builder.inline_slots[i] = consumer_payload->fanin_inline_slot_states[i];
+    int32_t current_fanin_count = consumer_payload->fanin_actual_count;
+    if (consumer_payload->manual_explicit_fanin_count == 0) {
+        consumer_payload->manual_explicit_fanin_begin = current_fanin_count;
     }
-
-    if (fanin_builder.count < PTO2_FANIN_INLINE_CAP) {
-        fanin_builder.inline_slots[fanin_builder.count++] = producer_slot_state;
+    if (current_fanin_count < PTO2_FANIN_INLINE_CAP) {
+        consumer_payload->fanin_inline_slot_states[current_fanin_count] = producer_slot_state;
     } else {
-        PTO2FaninPool &fanin_pool = *fanin_builder.spill_pool;
+        PTO2FaninPool *spill_pool = (consumer_payload->fanin_spill_pool != nullptr)
+                                        ? consumer_payload->fanin_spill_pool
+                                        : &orch->rings[consumer_slot_state->ring_id].fanin_pool;
+        PTO2FaninPool &fanin_pool = *spill_pool;
+        auto &fc = orch->sm_handle->header->rings[consumer_slot_state->ring_id].fc;
         fanin_pool.ensure_space(*orch->scheduler, fc, consumer_slot_state->ring_id, 1);
         int32_t spill_idx = fanin_pool.top;
         PTO2FaninSpillEntry *entry = fanin_pool.alloc();
@@ -1193,30 +1365,18 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
             orch->fatal = true;
             return;
         }
-        if (fanin_builder.count == PTO2_FANIN_INLINE_CAP) {
-            fanin_builder.spill_start = spill_idx;
+        if (current_fanin_count == PTO2_FANIN_INLINE_CAP) {
+            consumer_payload->fanin_spill_start = spill_idx;
+            consumer_payload->fanin_spill_pool = spill_pool;
+        } else if (consumer_payload->fanin_spill_pool == nullptr) {
+            consumer_payload->fanin_spill_pool = spill_pool;
         }
         entry->slot_state = producer_slot_state;
-        fanin_builder.count++;
     }
 
-    producer_slot_state->fanout_count += 1;
-    producer_slot_state->fanout_head = dep_pool.prepend(producer_slot_state->fanout_head, consumer_slot_state);
-    if (producer_slot_state->fanout_head == nullptr) {
-        orch->fatal = true;
-        return;
-    }
-
-    int32_t inline_count = std::min(fanin_builder.count, PTO2_FANIN_INLINE_CAP);
-    int32_t spill_count = fanin_builder.count - inline_count;
-    consumer_payload->fanin_actual_count = fanin_builder.count;
-    consumer_payload->fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
-    consumer_payload->fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
-    for (int32_t i = 0; i < inline_count; i++) {
-        consumer_payload->fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
-    }
+    consumer_payload->fanin_actual_count = current_fanin_count + 1;
+    consumer_payload->manual_explicit_fanin_count += 1;
     consumer_slot_state->fanin_count += 1;
-    consumer_slot_state->dep_pool_mark = dep_pool.top;
 }
 
 // =============================================================================

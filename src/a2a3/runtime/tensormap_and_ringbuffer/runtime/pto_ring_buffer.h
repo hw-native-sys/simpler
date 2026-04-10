@@ -521,6 +521,41 @@ inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_slot_state(const PTO2TaskP
     );
 }
 
+template <typename Fn>
+inline PTO2FaninForEachReturn<Fn>
+pto2_for_each_fanin_slot_state_range(const PTO2TaskPayload &payload, int32_t begin, int32_t count, Fn &&fn) {
+    if (count <= 0) {
+        return true;
+    }
+    always_assert(begin >= 0 && begin + count <= payload.fanin_actual_count);
+
+    int32_t inline_count = std::min(payload.fanin_actual_count, PTO2_FANIN_INLINE_CAP);
+    int32_t inline_begin = std::min(begin, inline_count);
+    int32_t inline_end = std::min(begin + count, inline_count);
+    for (int32_t i = inline_begin; i < inline_end; i++) {
+        if (!fn(payload.fanin_inline_slot_states[i])) {
+            return false;
+        }
+    }
+
+    int32_t spill_begin = std::max(begin, inline_count);
+    int32_t spill_end = begin + count;
+    if (spill_begin >= spill_end) {
+        return true;
+    }
+
+    PTO2FaninPool *pool = payload.fanin_spill_pool;
+    always_assert(pool != nullptr && "fanin spill pool must exist when iterating spilled fanins");
+    for (int32_t i = spill_begin; i < spill_end; i++) {
+        int32_t spill_offset = i - inline_count;
+        int32_t spill_idx = (payload.fanin_spill_start + spill_offset) % pool->capacity;
+        if (!fn(pool->base[spill_idx].slot_state)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 // =============================================================================
 // Dependency List Pool
 // =============================================================================

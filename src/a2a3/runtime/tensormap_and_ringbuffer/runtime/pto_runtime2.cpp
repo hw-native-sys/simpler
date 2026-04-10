@@ -49,6 +49,15 @@ PTO2ManualSubmitResult pto2_rt_submit_task_manual(PTO2Runtime *rt, const MixedKe
     return pto2_submit_mixed_task_manual(&rt->orchestrator, mixed_kernels, args);
 }
 
+PTO2ManualSubmitResult pto2_rt_submit_task_manual_with_deps(
+    PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args, const PTO2TaskId explicit_producer_ids[],
+    int32_t explicit_producer_count
+) {
+    return pto2_submit_mixed_task_manual_with_deps(
+        &rt->orchestrator, mixed_kernels, args, explicit_producer_ids, explicit_producer_count
+    );
+}
+
 void pto2_rt_add_dependency(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer) {
     pto2_add_dependency(&rt->orchestrator, producer, consumer);
 }
@@ -214,6 +223,7 @@ void pto2_set_tensor_data(
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
     .submit_task_manual = pto2_rt_submit_task_manual,
+    .submit_task_manual_with_deps = pto2_rt_submit_task_manual_with_deps,
     .add_dependency = pto2_rt_add_dependency,
     .scope_begin = pto2_rt_scope_begin,
     .scope_end = pto2_rt_scope_end,

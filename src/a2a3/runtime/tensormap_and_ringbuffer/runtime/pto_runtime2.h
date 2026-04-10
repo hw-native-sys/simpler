@@ -68,6 +68,10 @@ typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 struct PTO2RuntimeOps {
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
     PTO2ManualSubmitResult (*submit_task_manual)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    PTO2ManualSubmitResult (*submit_task_manual_with_deps)(
+        PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args, const PTO2TaskId explicit_producer_ids[],
+        int32_t explicit_producer_count
+    );
     void (*add_dependency)(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer);
     void (*scope_begin)(PTO2Runtime *rt, PTO2ScopeMode mode);
     void (*scope_end)(PTO2Runtime *rt);
@@ -189,6 +193,10 @@ void pto2_rt_scope_begin(PTO2Runtime *rt, PTO2ScopeMode mode = PTO2ScopeMode::AU
 void pto2_rt_scope_end(PTO2Runtime *rt);
 
 PTO2ManualSubmitResult pto2_rt_submit_task_manual(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+PTO2ManualSubmitResult pto2_rt_submit_task_manual_with_deps(
+    PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args, const PTO2TaskId explicit_producer_ids[],
+    int32_t explicit_producer_count
+);
 
 void pto2_rt_add_dependency(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer);
 

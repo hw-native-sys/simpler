@@ -10,6 +10,7 @@
  */
 
 #include <algorithm>
+#include <cinttypes>
 #include <cstdint>
 
 #include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
@@ -20,6 +21,25 @@
 #define FUNC_ONLINE_UPDATE 3
 #define FUNC_AIC_HUB 4
 #define FUNC_AIV_HUB 5
+constexpr uint64_t PLATFORM_PROF_SYS_CNT_FREQ = 50000000;  // 50 MHz
+
+inline double cycles_to_us(uint64_t cycles) {
+    return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
+}
+
+inline uint64_t get_sys_cnt_aicpu() {
+    uint64_t ticks;
+    asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+    return ticks;
+}
+
+#define CYCLE_COUNT_START() uint64_t _t0 = get_sys_cnt_aicpu(), _t1
+#define CYCLE_COUNT_LAP(acc)       \
+    do {                           \
+        _t1 = get_sys_cnt_aicpu(); \
+        acc += (_t1 - _t0);        \
+        _t0 = _t1;                 \
+    } while (0)
 extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
@@ -34,6 +54,14 @@ __attribute__((visibility("default"))) void
 aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_num, int orch_thread_index) {
     (void)orch_thread_num;    // NOLINT(readability/casting)
     (void)orch_thread_index;  // NOLINT(readability/casting)
+    uint64_t prof_submit_manual = 0;
+    uint64_t prof_add_dependency = 0;
+    uint64_t prof_manual_scope_close = 0;
+    uint64_t prof_view = 0;
+    int prof_submit_manual_count = 0;
+    int prof_add_dependency_count = 0;
+    int prof_manual_scope_close_count = 0;
+    CYCLE_COUNT_START();
 
     uint64_t batch = orch_args.tensor(0).shapes[0];
     uint64_t num_heads = orch_args.tensor(0).shapes[1];
@@ -89,6 +117,7 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                 uint32_t out_view_offsets[2] = {static_cast<uint32_t>(cur_offset), 0};
                 Tensor qi = query.view(tile2d_shapes, qi_offsets, true);
                 Tensor out_view = out.view(tile2d_shapes, out_view_offsets, true);
+                CYCLE_COUNT_LAP(prof_view);
 
                 PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
                     Arg params_inplace;
@@ -96,6 +125,8 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                     params_inplace.add_output(scalar_ci);
                     params_inplace.add_output(scalar_ci);
                     PTO2ManualSubmitResult hub_outs = pto2_rt_submit_aiv_task_manual(FUNC_AIV_HUB, params_inplace);
+                    prof_submit_manual_count++;
+                    CYCLE_COUNT_LAP(prof_submit_manual);
                     const Tensor &oi = hub_outs.outputs.get_ref(0);
                     const Tensor &li_update = hub_outs.outputs.get_ref(1);
                     const Tensor &mi_update = hub_outs.outputs.get_ref(2);
@@ -111,12 +142,15 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         uint32_t kv_offsets[2] = {static_cast<uint32_t>(cur_block_idx * block_size), 0};
                         Tensor kj = key_cache.view(kv_shapes, kv_offsets, true);
                         Tensor vj = value_cache.view(kv_shapes, kv_offsets, true);
+                        CYCLE_COUNT_LAP(prof_view);
 
                         Arg params_qk;
                         params_qk.add_input(qi);
                         params_qk.add_input(kj);
                         params_qk.add_output(sij_ci);
                         PTO2ManualSubmitResult qk_outs = pto2_rt_submit_aic_task_manual(FUNC_QK_MATMUL, params_qk);
+                        prof_submit_manual_count++;
+                        CYCLE_COUNT_LAP(prof_submit_manual);
                         const Tensor &sij = qk_outs.outputs.get_ref(0);
 
                         uint32_t sij_valid_shapes[2] = {
@@ -124,6 +158,7 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         };
                         uint32_t sij_valid_offsets[2] = {0, 0};
                         Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
+                        CYCLE_COUNT_LAP(prof_view);
 
                         Arg params_sf;
                         params_sf.add_input(sij_valid);
@@ -131,8 +166,11 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         params_sf.add_output(scalar_ci);
                         params_sf.add_output(scalar_ci);
                         params_sf.add_scalar(scale_value);
-                        PTO2ManualSubmitResult sf_outs =
-                            pto2_rt_submit_aiv_task_manual(FUNC_SOFTMAX_PREPARE, params_sf);
+                        PTO2ManualSubmitResult sf_outs = pto2_rt_submit_aiv_task_manual_with_deps(
+                            FUNC_SOFTMAX_PREPARE, params_sf, {qk_outs.task_id}
+                        );
+                        prof_submit_manual_count++;
+                        CYCLE_COUNT_LAP(prof_submit_manual);
                         const Tensor &pij_f16 = sf_outs.outputs.get_ref(0);
                         const Tensor &mi = sf_outs.outputs.get_ref(1);
                         const Tensor &li = sf_outs.outputs.get_ref(2);
@@ -141,7 +179,10 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         params_pv.add_input(pij_f16);
                         params_pv.add_input(vj);
                         params_pv.add_output(tile2d_ci);
-                        PTO2ManualSubmitResult pv_outs = pto2_rt_submit_aic_task_manual(FUNC_PV_MATMUL, params_pv);
+                        PTO2ManualSubmitResult pv_outs =
+                            pto2_rt_submit_aic_task_manual_with_deps(FUNC_PV_MATMUL, params_pv, {sf_outs.task_id});
+                        prof_submit_manual_count++;
+                        CYCLE_COUNT_LAP(prof_submit_manual);
                         const Tensor &oi_tmp = pv_outs.outputs.get_ref(0);
 
                         uint64_t is_first = (bn == 0) ? 1 : 0;
@@ -157,19 +198,48 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         params_up.add_inout(out_view);
                         params_up.add_scalar(is_first);
                         params_up.add_scalar(is_last);
-                        PTO2ManualSubmitResult up_outs =
-                            pto2_rt_submit_aiv_task_manual(FUNC_ONLINE_UPDATE, params_up);
-
-                        pto2_rt_add_dependency(qk_outs.task_id, sf_outs.task_id);
-                        pto2_rt_add_dependency(sf_outs.task_id, pv_outs.task_id);
-                        pto2_rt_add_dependency(sf_outs.task_id, up_outs.task_id);
-                        pto2_rt_add_dependency(pv_outs.task_id, up_outs.task_id);
-                        pto2_rt_add_dependency(prev_update_task, up_outs.task_id);
+                        PTO2ManualSubmitResult up_outs = pto2_rt_submit_aiv_task_manual_with_deps(
+                            FUNC_ONLINE_UPDATE, params_up, {sf_outs.task_id, pv_outs.task_id, prev_update_task}
+                        );
+                        prof_submit_manual_count++;
+                        CYCLE_COUNT_LAP(prof_submit_manual);
                         prev_update_task = up_outs.task_id;
                     }
                 }
+                prof_manual_scope_close_count++;
+                CYCLE_COUNT_LAP(prof_manual_scope_close);
             }
         }
+    }
+    uint64_t total = prof_submit_manual + prof_add_dependency + prof_manual_scope_close + prof_view;
+    LOG_ALWAYS(
+        "=== PartialManual Orch Profiling: submits=%d add_dep=%d total=%.3fus ===",
+        prof_submit_manual_count,
+        prof_add_dependency_count,
+        cycles_to_us(total)
+    );
+    if (total > 0) {
+        LOG_ALWAYS(
+            "  submit_manual   : %7.3fus (%5.1f%%)",
+            cycles_to_us(prof_submit_manual),
+            prof_submit_manual * 100.0 / total
+        );
+        LOG_ALWAYS(
+            "  add_dependency  : %7.3fus (%5.1f%%)",
+            cycles_to_us(prof_add_dependency),
+            prof_add_dependency * 100.0 / total
+        );
+        LOG_ALWAYS(
+            "  scope_close(x%d): %7.3fus (%5.1f%%)",
+            prof_manual_scope_close_count,
+            cycles_to_us(prof_manual_scope_close),
+            prof_manual_scope_close * 100.0 / total
+        );
+        LOG_ALWAYS(
+            "  tensor_view     : %7.3fus (%5.1f%%)",
+            cycles_to_us(prof_view),
+            prof_view * 100.0 / total
+        );
     }
 }
 

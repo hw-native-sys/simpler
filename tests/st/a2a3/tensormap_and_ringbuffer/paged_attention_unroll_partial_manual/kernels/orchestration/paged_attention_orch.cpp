@@ -146,8 +146,9 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         params_sf.add_scalar(scale_value);
                         params_sf.add_scalar(n_blocks);
                         params_sf.add_scalar(valid_len_last);
-                        PTO2ManualSubmitResult sf_outs =
-                            pto2_rt_submit_aiv_task_manual(FUNC_SOFTMAX_PREPARE, params_sf);
+                        PTO2ManualSubmitResult sf_outs = pto2_rt_submit_aiv_task_manual_with_deps(
+                            FUNC_SOFTMAX_PREPARE, params_sf, {qk_outs.task_id}
+                        );
 
                         params_pv.reset();
                         params_pv.add_input(sf_outs.outputs.get_ref(0));
@@ -156,7 +157,8 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         params_pv.add_output(tile2d_ci);
                         params_pv.add_scalar(n_blocks);
                         params_pv.add_scalar(b_idx * block_num + bn);
-                        PTO2ManualSubmitResult pv_outs = pto2_rt_submit_aic_task_manual(FUNC_PV_MATMUL, params_pv);
+                        PTO2ManualSubmitResult pv_outs =
+                            pto2_rt_submit_aic_task_manual_with_deps(FUNC_PV_MATMUL, params_pv, {sf_outs.task_id});
 
                         uint64_t is_first = (bn == 0) ? 1 : 0;
                         uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
@@ -171,12 +173,9 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         params_up.add_inout(out_view);
                         params_up.add_scalar(is_first);
                         params_up.add_scalar(is_last);
-                        PTO2ManualSubmitResult up_outs = pto2_rt_submit_aiv_task_manual(FUNC_ONLINE_UPDATE, params_up);
-
-                        pto2_rt_add_dependency(qk_outs.task_id, sf_outs.task_id);
-                        pto2_rt_add_dependency(sf_outs.task_id, pv_outs.task_id);
-                        pto2_rt_add_dependency(sf_outs.task_id, up_outs.task_id);
-                        pto2_rt_add_dependency(pv_outs.task_id, up_outs.task_id);
+                        PTO2ManualSubmitResult up_outs = pto2_rt_submit_aiv_task_manual_with_deps(
+                            FUNC_ONLINE_UPDATE, params_up, {sf_outs.task_id, pv_outs.task_id}
+                        );
                     }
                 }
             }

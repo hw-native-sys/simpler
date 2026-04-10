@@ -31,6 +31,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <initializer_list>
 #include <type_traits>
 
 // Type headers needed by orchestration
@@ -127,6 +128,10 @@ void pto2_framework_bind_runtime(PTO2Runtime *rt);
 typedef struct PTO2RuntimeOps {
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
     PTO2ManualSubmitResult (*submit_task_manual)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    PTO2ManualSubmitResult (*submit_task_manual_with_deps)(
+        PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args, const PTO2TaskId explicit_producer_ids[],
+        int32_t explicit_producer_count
+    );
     void (*add_dependency)(PTO2Runtime *rt, PTO2TaskId producer, PTO2TaskId consumer);
     void (*scope_begin)(PTO2Runtime *rt, PTO2ScopeMode mode);
     void (*scope_end)(PTO2Runtime *rt);
@@ -202,6 +207,15 @@ static inline PTO2ManualSubmitResult pto2_rt_submit_task_manual(const MixedKerne
     return rt->ops->submit_task_manual(rt, mixed_kernels, args);
 }
 
+static inline PTO2ManualSubmitResult pto2_rt_submit_task_manual_with_deps(
+    const MixedKernels &mixed_kernels, const Arg &args, std::initializer_list<PTO2TaskId> explicit_producers
+) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    return rt->ops->submit_task_manual_with_deps(
+        rt, mixed_kernels, args, explicit_producers.begin(), static_cast<int32_t>(explicit_producers.size())
+    );
+}
+
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
@@ -229,11 +243,33 @@ static inline PTO2ManualSubmitResult pto2_rt_submit_aic_task_manual(int32_t kern
     return rt->ops->submit_task_manual(rt, mk, args);
 }
 
+static inline PTO2ManualSubmitResult pto2_rt_submit_aic_task_manual_with_deps(
+    int32_t kernel_id, const Arg &args, std::initializer_list<PTO2TaskId> explicit_producers
+) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    return rt->ops->submit_task_manual_with_deps(
+        rt, mk, args, explicit_producers.begin(), static_cast<int32_t>(explicit_producers.size())
+    );
+}
+
 static inline PTO2ManualSubmitResult pto2_rt_submit_aiv_task_manual(int32_t kernel_id, const Arg &args) {
     PTO2Runtime *rt = pto2_current_runtime();
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt->ops->submit_task_manual(rt, mk, args);
+}
+
+static inline PTO2ManualSubmitResult pto2_rt_submit_aiv_task_manual_with_deps(
+    int32_t kernel_id, const Arg &args, std::initializer_list<PTO2TaskId> explicit_producers
+) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    return rt->ops->submit_task_manual_with_deps(
+        rt, mk, args, explicit_producers.begin(), static_cast<int32_t>(explicit_producers.size())
+    );
 }
 
 static inline void pto2_rt_add_dependency(PTO2TaskId producer, PTO2TaskId consumer) {
