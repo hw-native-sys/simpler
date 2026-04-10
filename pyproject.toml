@@ -65,7 +65,8 @@ reportRedeclaration = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "examples"]
+pythonpath = ["python"]
 
 [tool.scikit-build]
-wheel.packages = []
+wheel.packages = ["simpler_setup"]
 cmake.build-type = "Release"

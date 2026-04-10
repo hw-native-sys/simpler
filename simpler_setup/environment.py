@@ -6,21 +6,24 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Scene test setup — compilation toolchain, test framework, and platform discovery."""
+"""Centralized path management for scene test setup."""
 
-from .elf_parser import extract_text_section
-from .kernel_compiler import KernelCompiler
-from .platform_info import parse_platform
-from .pto_isa import ensure_pto_isa_root
-from .runtime_builder import RuntimeBuilder
-from .scene_test import SceneTestCase, scene_test
+import sys
+from pathlib import Path
 
-__all__ = [
-    "KernelCompiler",
-    "RuntimeBuilder",
-    "SceneTestCase",
-    "ensure_pto_isa_root",
-    "extract_text_section",
-    "parse_platform",
-    "scene_test",
-]
+# Single source of truth: project root derived from this file's location
+# tests/st/setup/environment.py → 4 parents up → project root
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Key directories
+PYTHON_DIR = PROJECT_ROOT / "python"
+EXAMPLES_SCRIPTS_DIR = PROJECT_ROOT / "examples" / "scripts"
+BUILD_CACHE_DIR = PROJECT_ROOT / "build" / "cache"
+BUILD_LIB_DIR = PROJECT_ROOT / "build" / "lib"
+
+
+def ensure_python_path() -> None:
+    """Add python/ to sys.path for task_interface imports."""
+    p = str(PYTHON_DIR)
+    if p not in sys.path:
+        sys.path.insert(0, p)

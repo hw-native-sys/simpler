@@ -8,13 +8,5 @@
 # -----------------------------------------------------------------------------------------------------------
 """Conftest for scene tests (tests/st/).
 
-Adds tests/st/ and python/ to sys.path so setup package and task_interface are importable.
+sys.path is handled by pyproject.toml [tool.pytest.ini_options] pythonpath.
 """
-
-import sys
-from pathlib import Path
-
-_ROOT = Path(__file__).parent.parent.parent
-for _d in [str(Path(__file__).parent), str(_ROOT / "python")]:
-    if _d not in sys.path:
-        sys.path.insert(0, _d)

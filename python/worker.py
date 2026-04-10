@@ -264,7 +264,7 @@ class Worker:
             str(binaries.host_path),
             str(binaries.aicpu_path),
             str(binaries.aicore_path),
-            str(binaries.sim_context_path) if hasattr(binaries, "sim_context_path") else "",
+            str(binaries.sim_context_path) if binaries.sim_context_path else "",
         )
         self._chip_worker.set_device(device_id)
 

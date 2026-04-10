@@ -30,7 +30,7 @@ def ensure_pto_isa_root() -> str:
         return env_root
 
     # Default location (relative to project root)
-    project_root = Path(__file__).parent.parent.parent.parent
+    project_root = Path(__file__).parent.parent
     default_path = project_root / "examples" / "scripts" / "_deps" / "pto-isa"
     if default_path.is_dir():
         return str(default_path)

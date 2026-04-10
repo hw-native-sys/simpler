@@ -19,7 +19,6 @@ from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 import torch
-from setup import SceneTestCase, scene_test
 from task_interface import (
     ArgDirection as D,
 )
@@ -31,39 +30,43 @@ from task_interface import (
 )
 from worker import Task, Worker
 
+from simpler_setup import SceneTestCase, scene_test
+
 KERNELS_BASE = "../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 
 
-@scene_test(level=2, platforms=["a2a3sim", "a2a3"], runtime="tensormap_and_ringbuffer")
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class _VectorKernels(SceneTestCase):
     """Shared kernel definition — not a test itself, used for _compile()."""
 
     __test__ = False
-    ORCHESTRATION = {
-        "source": f"{KERNELS_BASE}/orchestration/example_orchestration.cpp",
-        "function_name": "aicpu_orchestration_entry",
-        "signature": [D.IN, D.IN, D.OUT],
+    CALLABLE = {
+        "orchestration": {
+            "source": f"{KERNELS_BASE}/orchestration/example_orchestration.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.IN, D.IN, D.OUT],
+        },
+        "incores": [
+            {
+                "func_id": 0,
+                "source": f"{KERNELS_BASE}/aiv/kernel_add.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+            {
+                "func_id": 1,
+                "source": f"{KERNELS_BASE}/aiv/kernel_add_scalar.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.OUT],
+            },
+            {
+                "func_id": 2,
+                "source": f"{KERNELS_BASE}/aiv/kernel_mul.cpp",
+                "core_type": "aiv",
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+        ],
     }
-    KERNELS = [
-        {
-            "func_id": 0,
-            "source": f"{KERNELS_BASE}/aiv/kernel_add.cpp",
-            "core_type": "aiv",
-            "signature": [D.IN, D.IN, D.OUT],
-        },
-        {
-            "func_id": 1,
-            "source": f"{KERNELS_BASE}/aiv/kernel_add_scalar.cpp",
-            "core_type": "aiv",
-            "signature": [D.IN, D.OUT],
-        },
-        {
-            "func_id": 2,
-            "source": f"{KERNELS_BASE}/aiv/kernel_mul.cpp",
-            "core_type": "aiv",
-            "signature": [D.IN, D.IN, D.OUT],
-        },
-    ]
     RUNTIME_CONFIG = {"aicpu_thread_num": 4, "block_dim": 3}
 
     def generate_inputs(self, params):
@@ -88,7 +91,7 @@ def _make_shared_tensors():
 @pytest.mark.device_count(1)
 def test_l3_chiptask_subtask(st_platform, st_device_ids):
     """L3: ChipTask produces output, SubTask depends on it via TensorMap."""
-    chip_callable = _VectorKernels._compile(st_platform)
+    chip_callable = _VectorKernels.compile_chip_callable(st_platform)
     a, b, f, orch_args = _make_shared_tensors()
     SIZE = f.numel()
 

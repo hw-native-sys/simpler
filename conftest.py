@@ -24,8 +24,8 @@ def _parse_device_range(s: str) -> list[int]:
 class DevicePool:
     """Simple device allocator for pytest fixtures.
 
-    On sim platforms, device IDs are virtual — allocate always succeeds by
-    reusing the first available ID.  On real hardware, IDs are exclusive.
+    On sim platforms, device IDs are virtual — allocate always succeeds.
+    On real hardware, IDs are exclusive.
     """
 
     def __init__(self, device_ids: list[int], *, is_sim: bool = False):
@@ -53,9 +53,11 @@ _device_pool: DevicePool | None = None
 
 
 def pytest_addoption(parser):
-    """Register --platform and --device options."""
+    """Register CLI options."""
     parser.addoption("--platform", action="store", default=None, help="Target platform (e.g., a2a3sim, a2a3)")
     parser.addoption("--device", action="store", default="0", help="Device ID or range (e.g., 0, 4-7)")
+    parser.addoption("--case", action="store", default=None, help="Run specific case name only")
+    parser.addoption("--all-cases", action="store_true", default=False, help="Include manual cases")
 
 
 def pytest_configure(config):
@@ -69,19 +71,19 @@ def pytest_collection_modifyitems(session, config, items):
     """Skip ST tests based on --platform filter."""
     platform = config.getoption("--platform")
     for item in items:
-        # SceneTestCase subclass: check _st_platforms
+        # SceneTestCase subclass: skip if no case matches current platform
         cls = getattr(item, "cls", None)
-        if cls and hasattr(cls, "_st_platforms"):
+        if cls and hasattr(cls, "CASES") and isinstance(cls.CASES, list):
             if not platform:
-                item.add_marker(pytest.mark.skip(reason="ST requires --platform"))
-            elif platform not in cls._st_platforms:
-                item.add_marker(pytest.mark.skip(reason=f"{cls.__name__} not supported on {platform}"))
+                item.add_marker(pytest.mark.skip(reason="--platform required"))
+            elif not any(platform in c.get("platforms", []) for c in cls.CASES):
+                item.add_marker(pytest.mark.skip(reason=f"No cases for {platform}"))
             continue
         # Standalone function with @pytest.mark.platforms([...])
         platforms_marker = item.get_closest_marker("platforms")
         if platforms_marker:
             if not platform:
-                item.add_marker(pytest.mark.skip(reason="ST requires --platform"))
+                item.add_marker(pytest.mark.skip(reason="--platform required"))
             elif platform not in platforms_marker.args[0]:
                 item.add_marker(pytest.mark.skip(reason=f"Not supported on {platform}"))
 
@@ -108,27 +110,55 @@ def st_platform(request):
 
 
 @pytest.fixture()
-def st_chip_worker(request, st_platform, device_pool):
-    """Per-test ChipWorker with device allocated from pool."""
+def st_worker(request, st_platform, device_pool):
+    """Per-test Worker with devices allocated from pool.
+
+    Reads _st_level and CASES from the test class to determine
+    how many devices and sub-workers to allocate.
+    """
     cls = request.node.cls
-    if cls is None or not hasattr(cls, "_st_runtime"):
-        pytest.skip("st_chip_worker requires SceneTestCase")
-    ids = device_pool.allocate(1)
-    if not ids:
-        pytest.fail("no devices available in pool")
-    worker = cls._create_worker(st_platform, ids[0])
-    yield worker
-    worker.finalize()
-    device_pool.release(ids)
+    if cls is None or not hasattr(cls, "_st_level"):
+        pytest.skip("st_worker requires SceneTestCase")
+
+    level = cls._st_level
+    runtime = cls._st_runtime
+
+    if level == 2:
+        ids = device_pool.allocate(1)
+        if not ids:
+            pytest.fail("no devices available")
+
+        from worker import Worker  # noqa: PLC0415
+
+        w = Worker(level=2, device_id=ids[0], platform=st_platform, runtime=runtime)
+        w.init()
+        yield w
+        w.close()
+        device_pool.release(ids)
+
+    elif level == 3:
+        max_devices = max((c.get("device_count", 1) for c in cls.CASES), default=1)
+        max_subs = max((c.get("num_sub_workers", 0) for c in cls.CASES), default=0)
+        ids = device_pool.allocate(max_devices)
+        if not ids:
+            pytest.fail(f"need {max_devices} devices")
+
+        from worker import Worker  # noqa: PLC0415
+
+        w = Worker(level=3, device_ids=ids, num_sub_workers=max_subs, platform=st_platform, runtime=runtime)
+        w.init()
+        yield w
+        w.close()
+        device_pool.release(ids)
 
 
 @pytest.fixture()
 def st_device_ids(request, device_pool):
-    """Allocate device IDs for L3 tests. Use @pytest.mark.device_count(n) to request multiple."""
+    """Allocate device IDs. Use @pytest.mark.device_count(n) to request multiple."""
     marker = request.node.get_closest_marker("device_count")
     n = marker.args[0] if marker else 1
     ids = device_pool.allocate(n)
     if not ids:
-        pytest.fail(f"need {n} devices, only {len(device_pool._available)} available in pool")
+        pytest.fail(f"need {n} devices")
     yield ids
     device_pool.release(ids)
