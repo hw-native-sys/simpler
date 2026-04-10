@@ -70,8 +70,12 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     Tensor value_cache = make_tensor_external(vc_ptr, value_cache_shapes, 2, data_type, false);
     Tensor out = make_tensor_external(out_ptr, out_shapes, 2, DataType::FLOAT32);
 
-    int *host_block_table = orch_args.tensor(3).data_as<int>();
-    int *host_context_lens = orch_args.tensor(4).data_as<int>();
+    uint32_t bt_shapes[2] = {static_cast<uint32_t>(batch), static_cast<uint32_t>(block_num)};
+    Tensor block_table =
+        make_tensor_external(orch_args.tensor(3).data_as<void>(), bt_shapes, 2, DataType::INT32, false);
+    uint32_t cl_shapes[1] = {static_cast<uint32_t>(batch)};
+    Tensor context_lens =
+        make_tensor_external(orch_args.tensor(4).data_as<void>(), cl_shapes, 1, DataType::INT32, false);
 
     uint32_t oi_shapes[2] = {static_cast<uint32_t>(q_tile), static_cast<uint32_t>(head_dim)};
     uint32_t li_shapes[1] = {static_cast<uint32_t>(q_tile)};
@@ -80,9 +84,9 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
     TensorCreateInfo scalar_ci(li_shapes, 1, DataType::FLOAT32);
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
-        uint64_t cur_seq = host_context_lens[b_idx];
+        uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
+        uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
-        int *bt_base = host_block_table + b_idx * block_num;
 
         for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
             PTO2_SCOPE() {
@@ -123,9 +127,10 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         params_qk.reset();
                         params_qk.add_input(qi);
                         params_qk.add_input(key_cache);
+                        params_qk.add_input(block_table);
                         params_qk.add_output(sij_buf_ci);
                         params_qk.add_scalar(n_blocks);
-                        params_qk.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
+                        params_qk.add_scalar(b_idx * block_num + bn);
                         PTO2ManualSubmitResult qk_outs = pto2_rt_submit_aic_task_manual(FUNC_QK_MATMUL, params_qk);
 
                         uint32_t pij_buf_shapes[2] = {
@@ -147,9 +152,10 @@ aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args, int orch_thread_
                         params_pv.reset();
                         params_pv.add_input(sf_outs.outputs.get_ref(0));
                         params_pv.add_input(value_cache);
+                        params_pv.add_input(block_table);
                         params_pv.add_output(tile2d_ci);
                         params_pv.add_scalar(n_blocks);
-                        params_pv.add_scalar(reinterpret_cast<uint64_t>(bt_base + bn));
+                        params_pv.add_scalar(b_idx * block_num + bn);
                         PTO2ManualSubmitResult pv_outs = pto2_rt_submit_aic_task_manual(FUNC_PV_MATMUL, params_pv);
 
                         uint64_t is_first = (bn == 0) ? 1 : 0;

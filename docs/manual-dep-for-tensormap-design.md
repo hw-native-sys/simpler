@@ -233,9 +233,9 @@ remove much runtime work.
 Current branch benchmark entrypoints:
 
 ```bash
-./tools/benchmark_rounds.sh -d 6 -n 5 -c 6622890 -r aicpu_build_graph --build
-./tools/benchmark_rounds.sh -d 6 -n 5 -c 6622890 -r tensormap_and_ringbuffer --build
-./tools/benchmark_rounds.sh -d 6 -n 5 -c 6622890 -r tensormap_and_ringbuffer_partial_manual --build
+./tools/benchmark_rounds.sh -d 4 -n 5 -c d96c8784 -r aicpu_build_graph --build
+./tools/benchmark_rounds.sh -d 4 -n 5 -c d96c8784 -r tensormap_and_ringbuffer --build
+./tools/benchmark_rounds.sh -d 4 -n 5 -c d96c8784 -r tensormap_and_ringbuffer_partial_manual --build
 ```
 
 `tensormap_and_ringbuffer_partial_manual` is a selector in
@@ -250,30 +250,47 @@ The old unmodified runtime is intentionally not kept on this branch. To rerun
 it side-by-side:
 
 ```bash
+export PROJECT_ROOT=$(pwd)
 git worktree add tmp/worktree_unmodified a71ba16
 (
   cd tmp/worktree_unmodified
-  ./tools/benchmark_rounds.sh -d 6 -n 5 -c 6622890 \
+  python3 -m venv .venv --system-site-packages
+  . .venv/bin/activate
+  pip install -e . -q
+  export PTO_ISA_ROOT="$PROJECT_ROOT/examples/scripts/_deps/pto-isa"
+  ./tools/benchmark_rounds.sh -d 4 -n 5 -c d96c8784 \
     -r tensormap_and_ringbuffer_unmodified --build
 )
 ```
 
-For this document, a serial `run_example.py` pass was used instead of the
-wrapper so every run used one uncontended process on one device.
+Fresh benchmark logs for the rebased branch are in:
 
-Fresh result CSV:
+- `tmp/rebased_bench_20260410_fix/aicpu_build_graph.log`
+- `tmp/rebased_bench_20260410_fix/tensormap_and_ringbuffer.log`
+- `tmp/rebased_bench_20260410_fix/tensormap_and_ringbuffer_partial_manual.log`
+- `tmp/rebased_bench_20260410_fix/tensormap_and_ringbuffer_unmodified.log`
 
-- `tmp/bench_matrix_20260409_0006_direct/results.csv`
+Rebase note:
+
+- `paged_attention_unroll_partial_manual` was initially timing out after the
+  merge-forward.
+- The runtime manual-scope machinery was not the root cause.
+- The direct cause was stale example-side AIC submit ABI: the rebased
+  `paged_attention_unroll` AIC kernels now expect `block_table` as a tensor
+  input plus a scalar `bt_offset`, while the partial-manual scene was still
+  passing a raw pointer scalar.
+- Fixing the partial-manual `qk/pv` submit argument layout restored both
+  unroll cases on device.
 
 ## Fresh Hardware Results
 
 Fresh rerun settings:
 
-- date: `2026-04-09`
+- date: `2026-04-10`
 - platform: `a2a3`
-- device: `6`
+- device: `4`
 - rounds: `5`
-- PTO-ISA commit: `6622890`
+- PTO-ISA commit: `d96c8784`
 
 Units below are `elapsed_us (orch_us)`. `aicpu_build_graph` does not emit the
 same orch timing lines, so only elapsed time is shown there.
@@ -282,28 +299,30 @@ same orch timing lines, so only elapsed time is shown there.
 
 | Case | `aicpu_build_graph` | `tensormap_and_ringbuffer_unmodified` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
 | --- | ---: | ---: | ---: | ---: |
-| `Case1` | `31037.8` | `36992.8 (36991.9)` | `36791.2 (36790.5)` | `31563.9 (31407.2)` |
-| `Case2` | `16719.2` | `18753.6 (18752.8)` | `18615.9 (18615.1)` | `16757.6 (16343.9)` |
+| `Case1` | `29937.7` | `36095.9 (36094.9)` | `39148.7 (39148.3)` | `34186.3 (34025.7)` |
+| `Case2` | `16762.7` | `18639.5 (18635.1)` | `19813.0 (19812.7)` | `18028.7 (17618.4)` |
 
 ### `paged_attention_unroll`
 
 | Case | `aicpu_build_graph` | `tensormap_and_ringbuffer_unmodified` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
 | --- | ---: | ---: | ---: | ---: |
-| `Case1` | `1421.2` | `1320.0 (853.6)` | `1322.5 (820.0)` | `1327.0 (835.5)` |
-| `Case2` | `707.8` | `632.5 (383.5)` | `635.9 (391.8)` | `633.7 (365.5)` |
+| `Case1` | `1425.3` | `1325.6 (835.3)` | `1173.2 (992.0)` | `1160.4 (968.8)` |
+| `Case2` | `693.0` | `628.7 (380.7)` | `567.9 (435.6)` | `561.9 (416.6)` |
 
 ## Feature / Optimization -> Gain
 
 ### 1. AUTO stays effectively zero-overhead
 
-The current AUTO runtime is flat versus the unmodified baseline:
+The current AUTO runtime no longer meets the zero-overhead target on the
+non-unroll scene, but it still wins clearly on the unroll scene:
 
-- `paged_attention/Case1`: `36791.2 us` vs `36992.8 us` (`-0.5%`)
-- `paged_attention/Case2`: `18615.9 us` vs `18753.6 us` (`-0.7%`)
-- `paged_attention_unroll/Case1`: `1322.5 us` vs `1320.0 us` (`+0.2%`)
-- `paged_attention_unroll/Case2`: `635.9 us` vs `632.5 us` (`+0.5%`)
+- `paged_attention/Case1`: `39148.7 us` vs `36095.9 us` (`+8.5%`)
+- `paged_attention/Case2`: `19813.0 us` vs `18639.5 us` (`+6.3%`)
+- `paged_attention_unroll/Case1`: `1173.2 us` vs `1325.6 us` (`-11.5%`)
+- `paged_attention_unroll/Case2`: `567.9 us` vs `628.7 us` (`-9.7%`)
 
-This is the zero-overhead result we needed on the normal tensormap path.
+So the AUTO path is still good for the already-amortized unroll workload, but
+not yet zero-overhead for the non-unroll paged-attention target.
 
 ### 2. Partial-manual removes the non-unroll gap
 
@@ -311,31 +330,33 @@ Against the current AUTO runtime, partial-manual improves the non-unroll scene
 substantially:
 
 - `paged_attention/Case1`
-  - elapsed: `36791.2 us -> 31563.9 us` (`-14.2%`)
-  - orch: `36790.5 us -> 31407.2 us` (`-14.6%`)
+  - elapsed: `39148.7 us -> 34186.3 us` (`-12.7%`)
+  - orch: `39148.3 us -> 34025.7 us` (`-13.1%`)
 - `paged_attention/Case2`
-  - elapsed: `18615.9 us -> 16757.6 us` (`-10.0%`)
-  - orch: `18615.1 us -> 16343.9 us` (`-12.2%`)
+  - elapsed: `19813.0 us -> 18028.7 us` (`-9.0%`)
+  - orch: `19812.7 us -> 17618.4 us` (`-11.1%`)
 
-Against `aicpu_build_graph`, the remaining end-to-end gap on non-unroll is now
-small:
+Against `aicpu_build_graph`, there is still a visible non-unroll gap:
 
-- `Case1`: `31563.9 us` vs `31037.8 us` (`+1.7%`)
-- `Case2`: `16757.6 us` vs `16719.2 us` (`+0.2%`)
+- `Case1`: `34186.3 us` vs `29937.7 us` (`+14.2%`)
+- `Case2`: `18028.7 us` vs `16762.7 us` (`+7.6%`)
 
-This is the target workload. Partial-manual is now effectively in the same
-performance band as `aicpu_build_graph` there.
+Against the unmodified tensormap baseline, partial-manual is now ahead on the
+non-unroll scene:
+
+- `Case1`: `36095.9 us -> 34186.3 us` (`-5.3%`)
+- `Case2`: `18639.5 us -> 18028.7 us` (`-3.3%`)
 
 ### 3. Unroll already amortizes most of the cost
 
-On `paged_attention_unroll`, the AUTO tensormap path was already strong, so
-partial-manual brings little extra value:
+On `paged_attention_unroll`, both current runtimes are already better than
+`aicpu_build_graph`, and partial-manual only nudges the AUTO path slightly:
 
-- `Case1`: `1322.5 us -> 1327.0 us` elapsed (`+0.3%`)
-- `Case2`: `635.9 us -> 633.7 us` elapsed (`-0.3%`)
+- `Case1`: `1173.2 us -> 1160.4 us` elapsed (`-1.1%`)
+- `Case2`: `567.9 us -> 561.9 us` elapsed (`-1.1%`)
 
-That is expected. The unroll example already amortizes dependency-construction
-overhead, so partial-manual mainly matters for the non-unroll shape.
+That is the expected shape. The unroll orchestration already amortizes most
+dependency overhead, so partial-manual has little room left to improve.
 
 ### 4. What specifically helped
 
@@ -380,5 +401,6 @@ Keep the design as:
 - `scope_end()` reduced to publish-barrier release and normal lifetime work
 
 That gives the required feature coverage while keeping the AUTO path
-effectively zero-overhead and bringing non-unroll partial-manual paged
-attention to within `~0-2%` of `aicpu_build_graph`.
+competitive on unroll and materially reducing the non-unroll gap, but the
+fresh rerun still shows more work is needed to make partial-manual match
+`aicpu_build_graph` on non-unroll paged attention.
