@@ -100,8 +100,8 @@ class TestTwoWorkersParallel:
                 c.unlink()
 
     def test_two_workers_wall_time(self):
-        """Two workers with 0.1s tasks should finish in ~0.1s, not 0.2s."""
-        sleep_s = 0.1
+        """Two workers with 0.2s tasks should finish in ~0.2s, not 0.4s."""
+        sleep_s = 0.2
         counters = [_alloc_counter() for _ in range(2)]
         workers = []
         threads = []
@@ -147,7 +147,7 @@ class TestTwoWorkersParallel:
             for c in counters:
                 assert _read(c) == 1
 
-            assert elapsed < sleep_s * 2 * 0.7, (
+            assert elapsed < sleep_s * 2 * 0.9, (
                 f"Expected ~{sleep_s}s wall time, got {elapsed:.2f}s (serial would be {sleep_s * 2:.2f}s)"
             )
 

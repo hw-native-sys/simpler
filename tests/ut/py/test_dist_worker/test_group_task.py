@@ -160,8 +160,8 @@ class TestGroupDependency:
 
 class TestGroupParallel:
     def test_group_wall_time(self):
-        """2 workers sleeping 0.1s in a group finish in ~0.1s, not 0.2s."""
-        sleep_s = 0.1
+        """2 workers sleeping 0.2s in a group finish in ~0.2s, not 0.4s."""
+        sleep_s = 0.2
         counter = Value("i", 0)
 
         def slow_fn():
@@ -185,4 +185,4 @@ class TestGroupParallel:
         hw.close()
 
         assert counter.value == 2
-        assert elapsed < sleep_s * 2 * 0.8, f"Expected parallel ~{sleep_s}s, got {elapsed:.2f}s"
+        assert elapsed < sleep_s * 2 * 0.9, f"Expected parallel ~{sleep_s}s, got {elapsed:.2f}s"

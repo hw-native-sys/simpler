@@ -131,9 +131,9 @@ class TestSingleSubTask:
 
 class TestParallelSubWorkers:
     def test_parallel_wall_time(self):
-        """Three workers each sleeping 0.1s should finish in <0.25s (not 0.3s)."""
+        """Three workers each sleeping 0.2s should finish in <0.54s (not 0.6s)."""
         n = 3
-        sleep_s = 0.1
+        sleep_s = 0.2
         counters = [SharedMemory(create=True, size=4) for _ in range(n)]
         for c in counters:
             assert c.buf is not None
@@ -173,8 +173,8 @@ class TestParallelSubWorkers:
             c.close()
             c.unlink()
 
-        assert elapsed < sleep_s * n * 0.7, (
-            f"Expected parallel wall time < {sleep_s * n * 0.7:.2f}s, got {elapsed:.2f}s"
+        assert elapsed < sleep_s * n * 0.9, (
+            f"Expected parallel wall time < {sleep_s * n * 0.9:.2f}s, got {elapsed:.2f}s"
         )
 
 

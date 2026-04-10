@@ -53,16 +53,20 @@ jobs:
 
   # ---------- Python unit tests (no hardware) ----------
   ut-py:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10']
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.10
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: '3.10'
+          python-version: ${{ matrix.python-version }}
 
       - name: Cache pip packages
         uses: actions/cache@v3
@@ -84,6 +88,38 @@ jobs:
 
       - name: Run unit tests
         run: pytest tests -m "not requires_hardware" -v
+
+  # ---------- C++ unit tests (no hardware) ----------
+  ut-cpp:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install GoogleTest (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake libgtest-dev
+          cd /usr/src/googletest
+          sudo cmake -B build -DCMAKE_CXX_FLAGS="-D_GLIBCXX_USE_CXX11_ABI=0"
+          sudo cmake --build build
+          sudo cmake --install build
+
+      - name: Install GoogleTest (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install googletest
+
+      - name: Build and run C++ unit tests
+        run: |
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp
+          cmake --build tests/ut/cpp/build
+          ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure
 
   # ---------- Simulation scene tests ----------
   st-sim-a2a3:

@@ -19,10 +19,18 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 # ---------------------------------------------------------------------------
-# GoogleTest (pre-installed at /usr/local)
+# GoogleTest
 # ---------------------------------------------------------------------------
-find_library(GTEST_LIB      gtest      PATHS /usr/local/lib64 REQUIRED)
-find_library(GTEST_MAIN_LIB gtest_main PATHS /usr/local/lib64 REQUIRED)
+if(APPLE)
+    set(GTEST_SEARCH_PATHS /opt/homebrew/lib /usr/local/lib)
+    set(GTEST_INCLUDE_DIRS /opt/homebrew/include /usr/local/include)
+else()
+    set(GTEST_SEARCH_PATHS /usr/local/lib64 /usr/local/lib)
+    set(GTEST_INCLUDE_DIRS /usr/local/include)
+endif()
+
+find_library(GTEST_LIB      gtest      PATHS ${GTEST_SEARCH_PATHS} REQUIRED)
+find_library(GTEST_MAIN_LIB gtest_main PATHS ${GTEST_SEARCH_PATHS} REQUIRED)
 
 # ---------------------------------------------------------------------------
 # Distributed runtime sources under test
@@ -47,7 +55,7 @@ set(DIST_SOURCES
 function(add_dist_test name src)
     add_executable(${name} ${src} ${DIST_SOURCES})
     target_include_directories(${name} PRIVATE
-        /usr/local/include
+        ${GTEST_INCLUDE_DIRS}
         ${DIST_SRC_DIR}
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
