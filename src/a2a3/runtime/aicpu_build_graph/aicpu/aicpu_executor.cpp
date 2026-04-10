@@ -1606,9 +1606,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             int memfd = -1;
 
             // Attempt memfd-based loading first
-            int memfd_rc = load_orchestration_so_with_memfd(
-                so_data, so_size, thread_idx, &handle, so_path, &memfd
-            );
+            int memfd_rc = load_orchestration_so_with_memfd(so_data, so_size, thread_idx, &handle, so_path, &memfd);
 
             if (memfd_rc == 0 && handle != nullptr) {
                 // memfd loading succeeded, use memfd-loaded handle
