@@ -14,7 +14,7 @@ KERNELS_DIR = (
     PROJECT_ROOT / "tests" / "st" / "a2a3" / "tensormap_and_ringbuffer" / "manual_scope_outer_multiwrite" / "kernels"
 )
 GOLDEN = PROJECT_ROOT / "tests" / "st" / "a2a3" / "tensormap_and_ringbuffer" / "manual_scope_outer_multiwrite" / "golden.py"
-PTO_ISA_COMMIT = "6622890"
+PTO_ISA_COMMIT = "d96c8784"
 
 
 @pytest.mark.requires_hardware

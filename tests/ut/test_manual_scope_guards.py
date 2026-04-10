@@ -13,7 +13,7 @@ PROJECT_ROOT = Path(__file__).parent.parent.parent
 RUN_EXAMPLE = PROJECT_ROOT / "examples" / "scripts" / "run_example.py"
 KERNELS_DIR = PROJECT_ROOT / "tests" / "st" / "a2a3" / "tensormap_and_ringbuffer" / "manual_scope_guard_negative" / "kernels"
 GOLDEN = PROJECT_ROOT / "tests" / "st" / "a2a3" / "tensormap_and_ringbuffer" / "manual_scope_guard_negative" / "golden.py"
-PTO_ISA_COMMIT = "6622890"
+PTO_ISA_COMMIT = "d96c8784"
 
 
 @pytest.mark.requires_hardware
