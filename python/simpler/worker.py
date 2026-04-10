@@ -23,7 +23,7 @@ Usage::
     w.init()
 
     def my_orch(w, args):
-        r = w.submit(WorkerType.CHIP, chip_payload, inputs=[...], outputs=[64])
+        r = w.submit(WorkerType.NEXT_LEVEL, chip_payload, inputs=[...], outputs=[64])
         w.submit(WorkerType.SUB, sub_payload(cid), inputs=[r.outputs[0].ptr])
 
     w.run(Task(orch=my_orch, args=my_args))
@@ -235,6 +235,8 @@ class Worker:
 
     def register(self, fn: Callable) -> int:
         """Register a callable for SubWorker use. Must be called before init()."""
+        if self.level < 3:
+            raise RuntimeError("Worker.register() is only available at level 3+")
         if self._initialized:
             raise RuntimeError("Worker.register() must be called before init()")
         cid = len(self._callable_registry)
@@ -365,7 +367,7 @@ class Worker:
             for shm in self._chip_shms:
                 cp = DistChipProcess(_mailbox_addr(shm), self._l3_args_size)
                 self._dist_chip_procs.append(cp)
-                dw.add_chip_process(cp)
+                dw.add_next_level_worker(cp)
 
         for shm in self._shms:
             sw = DistSubWorker(_mailbox_addr(shm))
@@ -391,19 +393,8 @@ class Worker:
         if self.level == 2:
             assert self._chip_worker is not None
             if isinstance(task_or_payload, WorkerPayload):
-                from .task_interface import ChipCallConfig  # noqa: PLC0415
-
-                config = ChipCallConfig()
-                config.block_dim = task_or_payload.block_dim
-                config.aicpu_thread_num = task_or_payload.aicpu_thread_num
-                config.enable_profiling = task_or_payload.enable_profiling
-                self._chip_worker.run(
-                    task_or_payload.callable,  # type: ignore[arg-type]
-                    task_or_payload.args,
-                    config,
-                )
+                self._run_l2_from_payload(task_or_payload)
             else:
-                # run(callable, args, **kwargs)
                 self._chip_worker.run(task_or_payload, args, **kwargs)
         else:
             self._start_level3()
@@ -411,6 +402,21 @@ class Worker:
             task = task_or_payload
             task.orch(self, task.args)
             self._dist_worker.drain()
+
+    def _run_l2_from_payload(self, payload: WorkerPayload) -> None:
+        """Unpack a WorkerPayload and forward to ChipWorker (L2 only)."""
+        from .task_interface import ChipCallConfig  # noqa: PLC0415
+
+        assert self._chip_worker is not None
+        config = ChipCallConfig()
+        config.block_dim = payload.block_dim
+        config.aicpu_thread_num = payload.aicpu_thread_num
+        config.enable_profiling = payload.enable_profiling
+        self._chip_worker.run(
+            payload.callable,  # type: ignore[arg-type]
+            payload.args,
+            config,
+        )
 
     # ------------------------------------------------------------------
     # Orchestration API (called from inside orch functions at L3+)

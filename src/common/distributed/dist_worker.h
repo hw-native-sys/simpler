@@ -20,7 +20,7 @@
  * Usage (L3 host worker, instantiated from Python via nanobind):
  *
  *   DistWorker dw(level=3);
- *   dw.add_worker(WorkerType::CHIP, chip_worker_ptr);
+ *   dw.add_worker(WorkerType::NEXT_LEVEL, chip_worker_ptr);
  *   dw.add_worker(WorkerType::SUB,  sub_worker_ptr);
  *   dw.init();
  *
@@ -32,7 +32,7 @@
  *   dw.execute();   // blocks until all submitted tasks complete
  *
  *   // When used as an IWorker by a higher-level DistWorker (L4+):
- *   parent.add_worker(WorkerType::DIST, &dw);
+ *   parent.add_worker(WorkerType::NEXT_LEVEL, &dw);
  *   // parent scheduler calls dw.dispatch() / dw.poll()
  */
 
@@ -107,7 +107,7 @@ private:
     DistOrchestrator orchestrator_;
     DistScheduler scheduler_;
 
-    std::vector<IWorker *> chip_workers_;
+    std::vector<IWorker *> next_level_workers_;
     std::vector<IWorker *> sub_workers_;
 
     // --- Drain support ---

@@ -80,7 +80,7 @@ void DistScheduler::start(const Config &cfg) {
             threads.push_back(std::move(wt));
         }
     };
-    make_threads(cfg_.chip_workers, chip_threads_);
+    make_threads(cfg_.next_level_workers, next_level_threads_);
     make_threads(cfg_.sub_workers, sub_threads_);
 
     stop_requested_.store(false, std::memory_order_relaxed);
@@ -95,11 +95,11 @@ void DistScheduler::stop() {
 
     if (sched_thread_.joinable()) sched_thread_.join();
 
-    for (auto &wt : chip_threads_)
+    for (auto &wt : next_level_threads_)
         wt->stop();
     for (auto &wt : sub_threads_)
         wt->stop();
-    chip_threads_.clear();
+    next_level_threads_.clear();
     sub_threads_.clear();
 
     running_.store(false, std::memory_order_release);
@@ -157,7 +157,7 @@ void DistScheduler::run() {
         // Exit when stop requested and all workers idle
         if (stop_requested_.load(std::memory_order_acquire)) {
             bool any_busy = false;
-            for (auto &wt : chip_threads_)
+            for (auto &wt : next_level_threads_)
                 if (!wt->idle()) {
                     any_busy = true;
                     break;
@@ -268,7 +268,7 @@ void DistScheduler::dispatch_ready() {
 }
 
 WorkerThread *DistScheduler::pick_idle(WorkerType type) {
-    auto &threads = (type == WorkerType::CHIP) ? chip_threads_ : sub_threads_;
+    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     for (auto &wt : threads) {
         if (wt->idle()) return wt.get();
     }
@@ -276,7 +276,7 @@ WorkerThread *DistScheduler::pick_idle(WorkerType type) {
 }
 
 std::vector<WorkerThread *> DistScheduler::pick_n_idle(WorkerType type, int n) {
-    auto &threads = (type == WorkerType::CHIP) ? chip_threads_ : sub_threads_;
+    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
     std::vector<WorkerThread *> result;
     result.reserve(n);
     for (auto &wt : threads) {

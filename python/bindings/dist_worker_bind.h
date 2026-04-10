@@ -36,10 +36,7 @@ namespace nb = nanobind;
 
 inline void bind_dist_worker(nb::module_ &m) {
     // --- WorkerType ---
-    nb::enum_<WorkerType>(m, "WorkerType")
-        .value("CHIP", WorkerType::CHIP)
-        .value("SUB", WorkerType::SUB)
-        .value("DIST", WorkerType::DIST);
+    nb::enum_<WorkerType>(m, "WorkerType").value("NEXT_LEVEL", WorkerType::NEXT_LEVEL).value("SUB", WorkerType::SUB);
 
     // --- TaskState ---
     nb::enum_<TaskState>(m, "TaskState")
@@ -167,27 +164,27 @@ inline void bind_dist_worker(nb::module_ &m) {
         )
 
         .def(
-            "add_chip_worker",
+            "add_next_level_worker",
             [](DistWorker &self, DistWorker &w) {
-                self.add_worker(WorkerType::CHIP, &w);
+                self.add_worker(WorkerType::NEXT_LEVEL, &w);
             },
-            nb::arg("worker"), "Add a lower-level DistWorker as a CHIP sub-worker (for L4+)."
+            nb::arg("worker"), "Add a lower-level DistWorker as a NEXT_LEVEL sub-worker."
         )
 
         .def(
-            "add_chip_worker_native",
+            "add_next_level_worker",
             [](DistWorker &self, ChipWorker &w) {
-                self.add_worker(WorkerType::CHIP, &w);
+                self.add_worker(WorkerType::NEXT_LEVEL, &w);
             },
-            nb::arg("worker"), "Add a ChipWorker (_ChipWorker) as a CHIP sub-worker (for L3)."
+            nb::arg("worker"), "Add a ChipWorker as a NEXT_LEVEL sub-worker."
         )
 
         .def(
-            "add_chip_process",
+            "add_next_level_worker",
             [](DistWorker &self, DistChipProcess &w) {
-                self.add_worker(WorkerType::CHIP, &w);
+                self.add_worker(WorkerType::NEXT_LEVEL, &w);
             },
-            nb::arg("worker"), "Add a forked ChipProcess as a CHIP sub-worker (process-isolated)."
+            nb::arg("worker"), "Add a forked process as a NEXT_LEVEL sub-worker."
         )
 
         .def(

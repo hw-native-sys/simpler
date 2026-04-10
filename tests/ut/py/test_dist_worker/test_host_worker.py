@@ -193,7 +193,7 @@ class TestOutputAllocation:
             # no workers — submit with empty workers list isn't useful here;
             # instead verify that submit() allocates output buffers correctly
             # by using a SUB worker that immediately signals done
-            p.worker_type = WorkerType.CHIP  # no CHIP workers — task stays RUNNING
+            p.worker_type = WorkerType.NEXT_LEVEL  # no NEXT_LEVEL workers — task stays RUNNING
             # For output allocation test, just verify DistSubmitResult has outputs
             # We re-init with sub workers for a real execution test
             pass

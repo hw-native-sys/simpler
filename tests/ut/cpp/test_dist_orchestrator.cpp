@@ -39,11 +39,12 @@ struct OrchestratorFixture : public ::testing::Test {
 
     void TearDown() override { ring.shutdown(); }
 
-    // Submit a CHIP task with the given input/output specs.
-    DistSubmitResult submit_chip(const std::vector<DistInputSpec> &inputs, const std::vector<DistOutputSpec> &outputs) {
+    // Submit a NEXT_LEVEL task with the given input/output specs.
+    DistSubmitResult
+    submit_next_level(const std::vector<DistInputSpec> &inputs, const std::vector<DistOutputSpec> &outputs) {
         WorkerPayload p;
-        p.worker_type = WorkerType::CHIP;
-        return orch.submit(WorkerType::CHIP, p, inputs, outputs);
+        p.worker_type = WorkerType::NEXT_LEVEL;
+        return orch.submit(WorkerType::NEXT_LEVEL, p, inputs, outputs);
     }
 };
 
@@ -52,7 +53,7 @@ struct OrchestratorFixture : public ::testing::Test {
 // ---------------------------------------------------------------------------
 
 TEST_F(OrchestratorFixture, IndependentTaskIsImmediatelyReady) {
-    auto res = submit_chip({}, {{64}});
+    auto res = submit_next_level({}, {{64}});
     EXPECT_NE(res.task_slot, DIST_INVALID_SLOT);
     ASSERT_EQ(res.outputs.size(), 1u);
     EXPECT_NE(res.outputs[0].ptr, nullptr);
@@ -65,14 +66,14 @@ TEST_F(OrchestratorFixture, IndependentTaskIsImmediatelyReady) {
 
 TEST_F(OrchestratorFixture, DependentTaskIsPending) {
     // Task A produces a buffer
-    auto a = submit_chip({}, {{128}});
+    auto a = submit_next_level({}, {{128}});
     DistTaskSlot a_slot;
     rq.try_pop(a_slot);  // drain ready queue
 
     uint64_t a_out = reinterpret_cast<uint64_t>(a.outputs[0].ptr);
 
     // Task B depends on A's output
-    auto b = submit_chip({{a_out}}, {{64}});
+    auto b = submit_next_level({{a_out}}, {{64}});
     EXPECT_EQ(slots[b.task_slot].state.load(), TaskState::PENDING);
     EXPECT_EQ(slots[b.task_slot].fanin_count, 1);
 
@@ -81,7 +82,7 @@ TEST_F(OrchestratorFixture, DependentTaskIsPending) {
 }
 
 TEST_F(OrchestratorFixture, TensorMapTracksProducer) {
-    auto a = submit_chip({}, {{256}});
+    auto a = submit_next_level({}, {{256}});
     DistTaskSlot drain_slot;
     rq.try_pop(drain_slot);
 
@@ -90,7 +91,7 @@ TEST_F(OrchestratorFixture, TensorMapTracksProducer) {
 }
 
 TEST_F(OrchestratorFixture, OnConsumedCleansUpTensorMap) {
-    auto a = submit_chip({}, {{64}});
+    auto a = submit_next_level({}, {{64}});
     DistTaskSlot slot;
     rq.try_pop(slot);
 
@@ -107,7 +108,7 @@ TEST_F(OrchestratorFixture, OnConsumedCleansUpTensorMap) {
 
 TEST_F(OrchestratorFixture, ScopeRegistersAndReleasesRef) {
     orch.scope_begin();
-    auto a = submit_chip({}, {{64}});
+    auto a = submit_next_level({}, {{64}});
     DistTaskSlot slot;
     rq.try_pop(slot);
 
@@ -126,7 +127,7 @@ TEST_F(OrchestratorFixture, ScopeRegistersAndReleasesRef) {
 }
 
 TEST_F(OrchestratorFixture, MultipleOutputsAllocated) {
-    auto res = submit_chip({}, {{32}, {64}, {128}});
+    auto res = submit_next_level({}, {{32}, {64}, {128}});
     ASSERT_EQ(res.outputs.size(), 3u);
     EXPECT_EQ(res.outputs[0].size, 32u);
     EXPECT_EQ(res.outputs[1].size, 64u);

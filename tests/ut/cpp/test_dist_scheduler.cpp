@@ -93,7 +93,7 @@ struct SchedulerFixture : public ::testing::Test {
     DistScope scope;
     DistReadyQueue rq;
     DistOrchestrator orch;
-    MockWorker chip_worker;
+    MockWorker mock_worker;
     DistScheduler sched;
 
     std::vector<DistTaskSlot> consumed_slots;
@@ -108,7 +108,7 @@ struct SchedulerFixture : public ::testing::Test {
         cfg.slots = slots.get();
         cfg.num_slots = N;
         cfg.ready_queue = &rq;
-        cfg.chip_workers = {&chip_worker};
+        cfg.next_level_workers = {&mock_worker};
         cfg.on_consumed_cb = [this](DistTaskSlot s) {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
@@ -122,10 +122,11 @@ struct SchedulerFixture : public ::testing::Test {
         ring.shutdown();
     }
 
-    DistSubmitResult submit_chip(const std::vector<DistInputSpec> &inputs, const std::vector<DistOutputSpec> &outputs) {
+    DistSubmitResult
+    submit_next_level(const std::vector<DistInputSpec> &inputs, const std::vector<DistOutputSpec> &outputs) {
         WorkerPayload p;
-        p.worker_type = WorkerType::CHIP;
-        return orch.submit(WorkerType::CHIP, p, inputs, outputs);
+        p.worker_type = WorkerType::NEXT_LEVEL;
+        return orch.submit(WorkerType::NEXT_LEVEL, p, inputs, outputs);
     }
 
     void wait_consumed(DistTaskSlot slot, int timeout_ms = 500) {
@@ -147,40 +148,40 @@ struct SchedulerFixture : public ::testing::Test {
 // ---------------------------------------------------------------------------
 
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
-    auto res = submit_chip({}, {{64}});
+    auto res = submit_next_level({}, {{64}});
     DistTaskSlot slot = res.task_slot;
 
     // WorkerThread calls MockWorker.run() — wait for it to start
-    chip_worker.wait_running();
-    ASSERT_GE(chip_worker.dispatched_count(), 1);
-    EXPECT_EQ(chip_worker.dispatched[0].slot, slot);
+    mock_worker.wait_running();
+    ASSERT_GE(mock_worker.dispatched_count(), 1);
+    EXPECT_EQ(mock_worker.dispatched[0].slot, slot);
 
     // Signal completion → WorkerThread pushes to completion_queue → Scheduler consumes
-    chip_worker.complete();
+    mock_worker.complete();
     wait_consumed(slot);
 }
 
 TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
-    auto a = submit_chip({}, {{128}});
+    auto a = submit_next_level({}, {{128}});
     uint64_t a_key = reinterpret_cast<uint64_t>(a.outputs[0].ptr);
 
-    auto b = submit_chip({{a_key}}, {{64}});
+    auto b = submit_next_level({{a_key}}, {{64}});
     EXPECT_EQ(slots[b.task_slot].state.load(), TaskState::PENDING);
 
     // Complete A → B should become ready
-    chip_worker.wait_running();
-    EXPECT_EQ(chip_worker.dispatched[0].slot, a.task_slot);
-    chip_worker.complete();  // A done
+    mock_worker.wait_running();
+    EXPECT_EQ(mock_worker.dispatched[0].slot, a.task_slot);
+    mock_worker.complete();  // A done
 
     // Wait for B to be dispatched
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
-    while (chip_worker.dispatched_count() < 2 && std::chrono::steady_clock::now() < deadline) {
+    while (mock_worker.dispatched_count() < 2 && std::chrono::steady_clock::now() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    ASSERT_GE(chip_worker.dispatched_count(), 2);
-    EXPECT_EQ(chip_worker.dispatched[1].slot, b.task_slot);
+    ASSERT_GE(mock_worker.dispatched_count(), 2);
+    EXPECT_EQ(mock_worker.dispatched[1].slot, b.task_slot);
 
-    chip_worker.complete();  // B done
+    mock_worker.complete();  // B done
     wait_consumed(b.task_slot);
 }
 
@@ -213,7 +214,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
         cfg.slots = slots.get();
         cfg.num_slots = N;
         cfg.ready_queue = &rq;
-        cfg.chip_workers = {&worker_a, &worker_b};
+        cfg.next_level_workers = {&worker_a, &worker_b};
         cfg.on_consumed_cb = [this](DistTaskSlot s) {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
@@ -247,10 +248,10 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
     int dummy_args_1 = 1;
 
     WorkerPayload p;
-    p.worker_type = WorkerType::CHIP;
+    p.worker_type = WorkerType::NEXT_LEVEL;
     std::vector<const void *> args_list = {&dummy_args_0, &dummy_args_1};
 
-    auto res = orch.submit_group(WorkerType::CHIP, p, args_list, {}, {{64}});
+    auto res = orch.submit_group(WorkerType::NEXT_LEVEL, p, args_list, {}, {{64}});
     DistTaskSlot slot = res.task_slot;
 
     // Both workers should receive dispatches
@@ -274,9 +275,9 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
 TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
     int d0 = 0, d1 = 1;
     WorkerPayload p;
-    p.worker_type = WorkerType::CHIP;
+    p.worker_type = WorkerType::NEXT_LEVEL;
 
-    auto res = orch.submit_group(WorkerType::CHIP, p, {&d0, &d1}, {}, {});
+    auto res = orch.submit_group(WorkerType::NEXT_LEVEL, p, {&d0, &d1}, {}, {});
     DistTaskSlot slot = res.task_slot;
 
     worker_a.wait_running();
@@ -297,15 +298,15 @@ TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
     // Task B depends on A's output — B stays PENDING until group A finishes.
     int d0 = 0, d1 = 1;
     WorkerPayload pa;
-    pa.worker_type = WorkerType::CHIP;
+    pa.worker_type = WorkerType::NEXT_LEVEL;
 
-    auto a = orch.submit_group(WorkerType::CHIP, pa, {&d0, &d1}, {}, {{128}});
+    auto a = orch.submit_group(WorkerType::NEXT_LEVEL, pa, {&d0, &d1}, {}, {{128}});
     uint64_t a_out = reinterpret_cast<uint64_t>(a.outputs[0].ptr);
 
     // Submit B depending on A's output
     WorkerPayload pb;
-    pb.worker_type = WorkerType::CHIP;
-    auto b = orch.submit(WorkerType::CHIP, pb, {{a_out}}, {});
+    pb.worker_type = WorkerType::NEXT_LEVEL;
+    auto b = orch.submit(WorkerType::NEXT_LEVEL, pb, {{a_out}}, {});
     EXPECT_EQ(slots[b.task_slot].state.load(), TaskState::PENDING);
 
     // Complete group A

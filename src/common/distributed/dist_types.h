@@ -51,9 +51,8 @@ using DistTaskSlot = int32_t;
 // =============================================================================
 
 enum class WorkerType : int32_t {
-    CHIP = 0,  // ChipWorker: L2 hardware device
-    SUB = 1,   // SubWorker:  fork/shm Python function
-    DIST = 2,  // DistWorker: lower-level node (L4+)
+    NEXT_LEVEL = 0,  // Next-level Worker (L3→ChipWorker, L4→DistWorker(L3), …)
+    SUB = 1,         // SubWorker: fork/shm Python function
 };
 
 // =============================================================================
@@ -75,7 +74,7 @@ enum class TaskState : int32_t {
 
 struct WorkerPayload {
     DistTaskSlot task_slot = DIST_INVALID_SLOT;
-    WorkerType worker_type = WorkerType::CHIP;
+    WorkerType worker_type = WorkerType::NEXT_LEVEL;
 
     // --- ChipWorker fields (set in PR 2-2) ---
     const void *callable = nullptr;  // ChipCallable buffer ptr

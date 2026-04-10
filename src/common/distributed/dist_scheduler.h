@@ -89,8 +89,8 @@ public:
         DistTaskSlotState *slots;
         int32_t num_slots;
         DistReadyQueue *ready_queue;
-        std::vector<IWorker *> chip_workers;  // WorkerType::CHIP
-        std::vector<IWorker *> sub_workers;   // WorkerType::SUB
+        std::vector<IWorker *> next_level_workers;  // WorkerType::NEXT_LEVEL
+        std::vector<IWorker *> sub_workers;         // WorkerType::SUB
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).
         std::function<void(DistTaskSlot)> on_consumed_cb;
     };
@@ -104,7 +104,7 @@ private:
     Config cfg_;
 
     // Per-worker threads
-    std::vector<std::unique_ptr<WorkerThread>> chip_threads_;
+    std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
     std::vector<std::unique_ptr<WorkerThread>> sub_threads_;
 
     // Shared completion queue (WorkerThread → Scheduler)

@@ -24,7 +24,7 @@ DistWorker::~DistWorker() {
 
 void DistWorker::add_worker(WorkerType type, IWorker *worker) {
     if (initialized_) throw std::runtime_error("DistWorker: add_worker after init");
-    if (type == WorkerType::CHIP || type == WorkerType::DIST) chip_workers_.push_back(worker);
+    if (type == WorkerType::NEXT_LEVEL) next_level_workers_.push_back(worker);
     else sub_workers_.push_back(worker);
 }
 
@@ -38,7 +38,7 @@ void DistWorker::init() {
     cfg.slots = slots_.get();
     cfg.num_slots = DIST_TASK_WINDOW_SIZE;
     cfg.ready_queue = &ready_queue_;
-    cfg.chip_workers = chip_workers_;
+    cfg.next_level_workers = next_level_workers_;
     cfg.sub_workers = sub_workers_;
     cfg.on_consumed_cb = [this](DistTaskSlot slot) {
         on_consumed(slot);

@@ -34,12 +34,12 @@ def run_dag(w, callables, task_args, config):
     callables.keep(chip_args)  # prevent GC before drain
 
     chip_p = WorkerPayload()
-    chip_p.worker_type = WorkerType.CHIP
+    chip_p.worker_type = WorkerType.NEXT_LEVEL
     chip_p.callable = callables.vector_kernel.buffer_ptr()
     chip_p.args = chip_args.__ptr__()
     chip_p.block_dim = config.block_dim
     chip_p.aicpu_thread_num = config.aicpu_thread_num
-    chip_result = w.submit(WorkerType.CHIP, chip_p, inputs=[], outputs=[task_args.f.numel() * 4])
+    chip_result = w.submit(WorkerType.NEXT_LEVEL, chip_p, inputs=[], outputs=[task_args.f.numel() * 4])
 
     sub_p = WorkerPayload()
     sub_p.worker_type = WorkerType.SUB

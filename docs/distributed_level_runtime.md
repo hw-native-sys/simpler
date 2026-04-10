@@ -228,7 +228,7 @@ def my_orch(w, args):
         payload.callable = chip_callable.buffer_ptr()
         payload.args = task_args.__ptr__()
         payload.block_dim = 24
-        r = w.submit(WorkerType.CHIP, payload, outputs=[64])
+        r = w.submit(WorkerType.NEXT_LEVEL, payload, outputs=[64])
 
         # SubWorker task: runs Python callable, depends on chip output
         sub_p = WorkerPayload()
@@ -254,7 +254,7 @@ def my_orch(w, args):
         args_list.append(a.__ptr__())
 
     # 1 DAG node, 4 chips execute in parallel
-    w.submit(WorkerType.CHIP, payload, args_list=args_list, outputs=[out_size])
+    w.submit(WorkerType.NEXT_LEVEL, payload, args_list=args_list, outputs=[out_size])
 ```
 
 ### Why It's Uniform
