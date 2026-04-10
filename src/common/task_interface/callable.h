@@ -9,21 +9,24 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Callable - Binary artifact with typed argument signature
+ * Callable - Binary artifact with typed argument signature (host→device serialization format)
  *
- * Template: Callable<Child, MaxSig, MaxChildren>
- *   - Static leaf:    Callable<void, MaxSig, 0>    — FAM storage, no children
- *   - Static parent:  Callable<Child, MaxSig, MaxChildren> — FAM storage + children
- *   - Dynamic leaf:   Callable<void, 0, 0>         — vector-backed, no children
- *   - Dynamic parent: Callable<Child, 0, 0>        — vector-backed + children
+ * Two concrete types, both using fixed-size arrays + flexible array member (FAM) storage:
  *
- * Static leaf includes resolved_addr_ — a platform-resolved dispatch address
+ *   CoreCallable = Callable<void, MaxSig, 0>              — leaf kernel binary
+ *   ChipCallable = Callable<CoreCallable, MaxSig, MaxChildren> — orchestration + child kernels
+ *
+ * CoreCallable includes resolved_addr_ — a platform-resolved dispatch address
  * (binary code addr on onboard, func_ptr on sim) used by AICPU dispatch.
  * Binary data is placed at CALLABLE_ALIGN boundary within storage_ for
  * device-optimal alignment; binary_data() accounts for this automatically.
  *
- * Static variants use placement-new via make_callable() factory functions.
+ * Both types use placement-new via make_callable() factory functions.
  * The returned vector<uint8_t> owns the memory; reinterpret_cast to access.
+ *
+ * Higher-level callables (L3 HostCallable) are Python-only objects that
+ * reference ChipCallable(s) by pointer. They use callable_id in WorkerPayload
+ * and never cross the host-device boundary. See distributed_level_runtime.md.
  *
  * Type aliases:
  *   CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>       — leaf kernel binary
@@ -35,7 +38,6 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 #include "arg_direction.h"
@@ -44,7 +46,7 @@
 // Forward declaration
 // ============================================================================
 
-template <typename Child, int MaxSig = 0, int MaxChildren = 0>
+template <typename Child, int MaxSig, int MaxChildren>
 struct Callable;
 
 // ============================================================================
@@ -136,59 +138,6 @@ private:
         const ArgDirection *sig, int32_t sig_count, const char *func_name, const void *binary, uint32_t binary_size,
         const int32_t *child_func_ids, const std::vector<uint8_t> *child_buffers, int32_t child_count
     );
-};
-
-// ============================================================================
-// Dynamic leaf: Callable<void, 0, 0> — vector-backed, no children
-// ============================================================================
-
-template <>
-struct Callable<void, 0, 0> {
-    std::vector<ArgDirection> signature_;
-    std::vector<uint8_t> binary_;
-
-    ArgDirection sig(int32_t i) const {
-        if (i < 0 || static_cast<size_t>(i) >= signature_.size())
-            throw std::out_of_range("Callable: sig index out of range");
-        return signature_[static_cast<size_t>(i)];
-    }
-    int32_t sig_count() const { return static_cast<int32_t>(signature_.size()); }
-    const void *binary_data() const { return binary_.data(); }
-    uint32_t binary_size() const { return static_cast<uint32_t>(binary_.size()); }
-};
-
-// ============================================================================
-// Dynamic parent: Callable<Child, 0, 0> — vector-backed + children
-// ============================================================================
-
-template <typename Child>
-struct Callable<Child, 0, 0> {
-    std::string func_name_;
-    std::vector<ArgDirection> signature_;
-    std::vector<uint8_t> binary_;
-    std::vector<int32_t> child_func_ids_;
-    std::vector<Child> children_;
-
-    ArgDirection sig(int32_t i) const {
-        if (i < 0 || static_cast<size_t>(i) >= signature_.size())
-            throw std::out_of_range("Callable: sig index out of range");
-        return signature_[static_cast<size_t>(i)];
-    }
-    int32_t sig_count() const { return static_cast<int32_t>(signature_.size()); }
-    const void *binary_data() const { return binary_.data(); }
-    uint32_t binary_size() const { return static_cast<uint32_t>(binary_.size()); }
-
-    const Child &child(int32_t i) const {
-        if (i < 0 || static_cast<size_t>(i) >= children_.size())
-            throw std::out_of_range("Callable: child index out of range");
-        return children_[static_cast<size_t>(i)];
-    }
-    int32_t child_func_id(int32_t i) const {
-        if (i < 0 || static_cast<size_t>(i) >= child_func_ids_.size())
-            throw std::out_of_range("Callable: child_func_id index out of range");
-        return child_func_ids_[static_cast<size_t>(i)];
-    }
-    int32_t child_count() const { return static_cast<int32_t>(children_.size()); }
 };
 
 // ============================================================================

@@ -270,6 +270,53 @@ The internal C++ interface is `IWorker::run(payload)` — one method, implemente
 
 The `IWorker` interface enables recursive composition: an L4 `DistWorker` would contain L3 `DistWorker` instances as workers, dispatching to them via `run()`. This is the intended design for L4+, not yet implemented.
 
+## 6. Callable Hierarchy
+
+Callable types form a hierarchy that mirrors the level model. Each level has its own callable type with different storage and transport characteristics:
+
+```text
+CoreCallable   ── C++ struct, binary kernel code, resolved by platform loader
+     │              Lives on device. Used by AICPU dispatch (resolved_addr_).
+     │
+ChipCallable   ── C++ struct, orchestration binary + nested CoreCallable children
+     │              Serialized binary layout — host builds it, copies to AICPU.
+     │              Template: Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 32>
+     │
+HostCallable   ── Python object, never leaves host process
+                   Contains: ChipCallable(s) + Python orch fn + Python sub fns
+                   C++ side stores only callable_id (int) in WorkerPayload.
+```
+
+### CoreCallable and ChipCallable (C++ binary layout)
+
+These two types use a C++ `Callable<>` template with fixed-size arrays and flexible array member (FAM) storage. They are **serialization formats** — the host builds them into a `vector<uint8_t>` buffer via `make_callable()`, then the buffer is copied to device memory or passed by pointer.
+
+```cpp
+// src/common/task_interface/callable.h
+using CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>;       // leaf: kernel binary
+using ChipCallable = Callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 32>; // parent: orch + children
+```
+
+**CoreCallable** carries one kernel binary and a `resolved_addr_` field. The platform loader (`device_runner.cpp`) resolves the binary to a device address and writes `resolved_addr_`. AICPU dispatch reads `resolved_addr()` to jump to the kernel entry point.
+
+**ChipCallable** carries the orchestration binary, a `func_name` for AICPU entry, and up to 32 child CoreCallables indexed by `func_id`. The Python binding (`ChipCallable.build()`) constructs the serialized buffer; the C runtime treats it as an opaque `const void*` pointer in `WorkerPayload.callable`.
+
+### HostCallable (Python-only, L3+)
+
+HostCallable is a **Python-side composition** — it never crosses the host↔device boundary and has no C++ struct representation. It combines:
+
+- **ChipCallable(s)**: pre-compiled binary callables for ChipWorker tasks
+- **Python orch function**: the DAG orchestration logic (calls `w.submit()`)
+- **Python sub functions**: host-side callables for SubWorker tasks
+
+At L3, the Python orch function runs in the main thread and submits tasks to the C++ scheduling engine. ChipWorker tasks carry `WorkerPayload.callable` (ChipCallable buffer pointer). SubWorker tasks carry `WorkerPayload.callable_id` (int index into a Python registry). The C++ Scheduler does not inspect either — it dispatches the payload to the appropriate WorkerThread.
+
+At L4+, a HostCallable submitted to a higher-level engine would also use `callable_id` in WorkerPayload. The C++ Scheduler treats it as opaque — the receiving DistWorker looks up the ID in its Python registry to retrieve the full HostCallable object.
+
+### Design Rationale
+
+Only CoreCallable and ChipCallable require C++ binary layout because they cross the host↔device boundary (DMA copy to AICPU). HostCallable stays in host memory and is better represented as a Python object — it contains Python functions which cannot be serialized into a C struct.
+
 ## Architecture Diagram
 
 ```text
