@@ -4,16 +4,16 @@
 
 The PTO Runtime consists of **three separate programs** that communicate through well-defined APIs:
 
-```
+```text
 ┌─────────────────────────────────────────────────────────────┐
 │                    Python Application                        │
-│              (examples/scripts/run_example.py)                   │
+│              (examples/scripts/run_example.py)               │
 └─────────────────────────┬───────────────────────────────────┘
                           │
          ┌────────────────┼────────────────┐
          │                │                │
-    Python Bindings   (ctypes)      Device I/O
-    bindings.py
+    nanobind          ChipWorker       RuntimeBuilder
+    (task_interface)  (dlopen host.so)  (compile binaries)
          │                │                │
          ▼                ▼                ▼
 ┌──────────────────┐  ┌──────────────────┐
@@ -41,13 +41,16 @@ The PTO Runtime consists of **three separate programs** that communicate through
 ## Components
 
 ### 1. Host Runtime (`src/{arch}/platform/*/host/`)
+
 **C++ library** - Device orchestration and management
-- `DeviceRunner`: Singleton managing device operations
+
+- `DeviceRunner`: Handle-based device context manager (one per `ChipWorker`)
 - `MemoryAllocator`: Device tensor memory management
-- `pto_runtime_c_api.h`: Pure C API for Python bindings
+- `pto_runtime_c_api.h`: Pure C API for `ChipWorker` bindings (`src/common/worker/pto_runtime_c_api.h`)
 - Compiled to shared library (.so) at runtime
 
 **Key Responsibilities:**
+
 - Allocate/free device memory
 - Host <-> Device data transfer
 - AICPU kernel launching and configuration
@@ -55,12 +58,15 @@ The PTO Runtime consists of **three separate programs** that communicate through
 - Runtime execution workflow coordination
 
 ### 2. AICPU Kernel (`src/{arch}/platform/*/aicpu/`)
+
 **Device program** - Task scheduler running on AICPU processor
+
 - `kernel.cpp`: Kernel entry points and handshake protocol
 - Runtime-specific executor in `src/{arch}/runtime/*/aicpu/`
 - Compiled to device binary at build time
 
 **Key Responsibilities:**
+
 - Initialize handshake protocol with AICore cores
 - Identify initially ready tasks (fanin=0)
 - Dispatch ready tasks to idle AICore cores
@@ -68,12 +74,15 @@ The PTO Runtime consists of **three separate programs** that communicate through
 - Continue until all tasks complete
 
 ### 3. AICore Kernel (`src/{arch}/platform/*/aicore/`)
+
 **Device program** - Computation kernels executing on AICore processors
+
 - `kernel.cpp`: Task execution kernels (add, mul, etc.)
 - Runtime-specific executor in `src/{arch}/runtime/*/aicore/`
 - Compiled to object file (.o) at build time
 
 **Key Responsibilities:**
+
 - Wait for task assignment via handshake buffer
 - Read task arguments and kernel address
 - Execute kernel using PTO ISA
@@ -83,88 +92,83 @@ The PTO Runtime consists of **three separate programs** that communicate through
 ## API Layers
 
 ### Layer 1: C++ API (`src/{arch}/platform/*/host/device_runner.h`)
+
 ```cpp
-DeviceRunner& runner = DeviceRunner::Get();
-runner.Init(device_id, num_cores, aicpu_bin, aicore_bin, pto_isa_root);
-runner.AllocateTensor(bytes);
-runner.CopyToDevice(device_ptr, host_ptr, bytes);
-runner.Run(runtime);
-runner.Finalize();
+DeviceRunner runner;
+void *ptr = runner.allocate_tensor(bytes);
+runner.copy_to_device(dev_ptr, host_ptr, bytes);
+runner.run(runtime, block_dim, device_id, aicpu_binary, aicore_binary, launch_aicpu_num);
+runner.finalize();
 ```
 
-### Layer 2: C API (`src/{arch}/platform/include/host/pto_runtime_c_api.h`)
+### Layer 2: C API (`src/common/worker/pto_runtime_c_api.h`)
+
 ```c
-int DeviceRunner_Init(device_id, num_cores, aicpu_binary, aicpu_size,
-                      aicore_binary, aicore_size, pto_isa_root);
-int DeviceRunner_Run(runtime_handle, launch_aicpu_num);
-int InitRuntime(runtime_handle);
-int FinalizeRuntime(runtime_handle);
-int DeviceRunner_Finalize();
+DeviceContextHandle ctx = create_device_context();
+set_device(ctx, device_id);
+size_t size = get_runtime_size();
+run_runtime(ctx, runtime, callable, args, block_dim,
+            aicpu_thread_num, device_id,
+            aicpu_binary, aicpu_size, aicore_binary, aicore_size,
+            enable_profiling);
+finalize_device(ctx);
+destroy_device_context(ctx);
 ```
 
-### Layer 3: Python API (`python/bindings.py`)
+### Layer 3: Python API (`python/bindings/task_interface.cpp` via nanobind)
+
 ```python
-Runtime = bind_host_binary(host_binary)
-runtime = Runtime()
-runtime.initialize()
-launch_runtime(runtime, aicpu_thread_num=1, block_dim=1,
-               device_id=device_id, aicpu_binary=aicpu_bytes,
-               aicore_binary=aicore_bytes)
-runtime.finalize()
+from simpler.task_interface import ChipWorker, ChipCallable, ChipStorageTaskArgs, CallConfig
+
+worker = ChipWorker()
+worker.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path="")
+worker.set_device(device_id)
+
+config = CallConfig()
+config.block_dim = 24
+config.aicpu_thread_num = 3
+worker.run(callable, args, config)
+worker.finalize()
 ```
 
 ## Execution Flow
 
 ### 1. Python Setup Phase
-```
+
+```text
 Python run_example.py
   │
-  ├─→ RuntimeCompiler.compile("host", ...) → host_binary (.so)
-  ├─→ RuntimeCompiler.compile("aicpu", ...) → aicpu_binary (.so)
-  ├─→ RuntimeCompiler.compile("aicore", ...) → aicore_binary (.o)
+  ├─→ RuntimeBuilder(platform).get_binaries(runtime_name) → host.so, aicpu.so, aicore.o
+  ├─→ KernelCompiler(platform).compile_incore(source, core_type) → kernel .o/.so
+  ├─→ KernelCompiler(platform).compile_orchestration(runtime, source) → orch .so
   │
-  └─→ bind_host_binary(host_binary)
-       └─→ RuntimeLibraryLoader(host_binary)
-            └─→ CDLL(host_binary) ← Loads .so into memory
+  └─→ ChipWorker()
+       └─→ init(host_path, aicpu_path, aicore_path)
+            └─→ dlopen(host.so) → resolve C API symbols via dlsym
 ```
 
 ### 2. Initialization Phase
-```
-runner.init(device_id, num_cores, aicpu_binary, aicore_binary, pto_isa_root)
+
+```text
+worker.set_device(device_id)
   │
-  ├─→ DeviceRunner_Init (C API)
-  │    ├─→ Initialize CANN device
-  │    ├─→ Allocate device streams
-  │    ├─→ Load AICPU binary to device
-  │    ├─→ Register AICore kernel binary
-  │    └─→ Create handshake buffers (one per core)
-  │
-  └─→ DeviceRunner singleton ready
+  └─→ create_device_context() → DeviceContextHandle
+       └─→ set_device(ctx, device_id)
+            ├─→ Initialize device (CANN on hardware, no-op on sim)
+            └─→ Allocate device streams
 ```
 
-### 3. Runtime Building Phase
-```
-runtime.initialize()
-  │
-  └─→ InitRuntime (C API)
-       └─→ InitRuntimeImpl (C++)
-            ├─→ Compile kernels at runtime (CompileAndLoadKernel)
-            │    ├─→ KernelCompiler calls ccec
-            │    ├─→ Load .o to device GM memory
-            │    └─→ Update kernel function address table
-            │
-            ├─→ Allocate device tensors via MemoryAllocator
-            ├─→ Copy input data to device
-            ├─→ Build task runtime with dependencies
-            └─→ Return Runtime pointer
-```
+### 3. Execution Phase
 
-### 4. Execution Phase
-```
-launch_runtime(runtime, aicpu_thread_num=1, block_dim=1, device_id=device_id,
-               aicpu_binary=aicpu_bytes, aicore_binary=aicore_bytes)
+```text
+worker.run(callable, args, CallConfig(block_dim, aicpu_thread_num))
   │
-  └─→ launch_runtime (C API)
+  └─→ run_runtime(ctx, runtime, callable, args, ...)
+       │
+       ├─→ Upload kernel binaries (upload_kernel_binary per func_id)
+       ├─→ Allocate device tensors via MemoryAllocator
+       ├─→ Copy input data to device
+       ├─→ Build task graph with dependencies
        │
        ├─→ Copy Runtime to device memory
        │
@@ -183,20 +187,20 @@ launch_runtime(runtime, aicpu_thread_num=1, block_dim=1, device_id=device_id,
        │         ├─→ Execute kernel
        │         └─→ Signal completion, repeat
        │
-       └─→ rtStreamSynchronize (wait for completion)
+       ├─→ rtStreamSynchronize (wait for completion)
+       │
+       ├─→ Copy results from device to host
+       └─→ Clean up device tensors and runtime
 ```
 
-### 5. Validation Phase
-```
-runtime.finalize()
+### 4. Finalization Phase
+
+```text
+worker.finalize()
   │
-  └─→ FinalizeRuntime (C API)
-       └─→ FinalizeRuntimeImpl (C++)
-            ├─→ Copy results from device to host
-            ├─→ Verify correctness (compare with expected values)
-            ├─→ Free all device tensors
-            ├─→ Delete runtime
-            └─→ Return success/failure
+  └─→ finalize_device(ctx)
+       ├─→ Release device resources
+       └─→ destroy_device_context(ctx)
 ```
 
 ## Handshake Protocol
@@ -214,6 +218,7 @@ struct Handshake {
 ```
 
 **Flow:**
+
 1. AICPU finds a ready task
 2. AICPU writes task pointer to handshake buffer and sets `aicpu_ready`
 3. AICore polls buffer, sees task, reads from device memory

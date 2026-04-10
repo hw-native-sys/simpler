@@ -26,11 +26,18 @@ pto-runtime/
 │           └── tensormap_and_ringbuffer/  # Advanced production runtime
 │
 ├── python/                            # Language bindings
-│   ├── bindings.py                    # ctypes wrapper (C -> Python)
-│   ├── runtime_compiler.py            # Multi-platform runtime compiler
-│   ├── kernel_compiler.py             # Kernel compiler
-│   ├── elf_parser.py                  # ELF binary parser
-│   └── toolchain.py                   # Toolchain configuration
+│   ├── bindings/                      # nanobind extension module (_task_interface)
+│   │   ├── CMakeLists.txt
+│   │   ├── task_interface.cpp
+│   │   └── dist_worker_bind.h
+│   └── simpler/                       # Python package
+│       ├── worker.py                  # Unified Worker (L2 single-chip, L3 distributed)
+│       ├── task_interface.py          # Python re-exports of nanobind types + helpers
+│       ├── runtime_compiler.py        # Multi-platform runtime compiler
+│       ├── kernel_compiler.py         # Kernel compiler
+│       ├── elf_parser.py              # ELF binary parser
+│       ├── env_manager.py             # Environment variable management
+│       └── toolchain.py              # Toolchain configuration
 │
 ├── examples/                          # Working examples
 │   ├── scripts/                       # Build and test framework
@@ -45,9 +52,10 @@ pto-runtime/
 │       └── tensormap_and_ringbuffer/
 │
 ├── tests/                             # Test suite
-│   ├── ut/                           # Python unit tests
-│   ├── st/                           # Device scene tests (hardware-only)
-│   └── cpp/                          # C++ unit tests (GoogleTest)
+│   ├── ut/                           # Unit tests
+│   │   ├── py/                       # Python unit tests (pytest)
+│   │   └── cpp/                      # C++ unit tests (GoogleTest)
+│   └── st/                           # Device scene tests (hardware-only)
 │
 └── docs/                              # Documentation
 ```
@@ -88,7 +96,7 @@ Persistent cmake build directories under `build/cache/` enable incremental compi
 ### User code (per-example)
 
 1. `python/kernel_compiler.py` — compiles user-written kernel `.cpp` files (one per `func_id`)
-2. `python/bindings.py` — provides ctypes wrappers for calling the host `.so` from Python
+2. `python/bindings/` — nanobind extension providing ChipWorker, task types, and distributed types to Python
 
 ## Cross-Platform Preprocessor Convention
 
@@ -169,18 +177,20 @@ build/
 
 ## Dynamic Kernel Compilation
 
-Compile and load kernels at runtime without rebuilding:
+Kernels are compiled externally by `KernelCompiler` and uploaded to the device at runtime:
 
-```cpp
-// In host code
-runner.CompileAndLoadKernel(func_id, "path/to/kernel.cpp", core_type);
+```python
+from simpler.kernel_compiler import KernelCompiler
+
+compiler = KernelCompiler(platform="a2a3sim")
+kernel_binary = compiler.compile_incore("path/to/kernel.cpp", core_type="aiv")
 ```
 
-This compiles the kernel source using `ccec`, loads the binary to device memory, and registers it for task dispatch.
+The compiled binary is then uploaded via `DeviceRunner::upload_kernel_binary(func_id, bin_data, bin_size)`, which loads it into device memory and returns the function address for task dispatch.
 
 ## Features
 
 - **Three programs compile independently** with clear API boundaries
-- **Full Python API** with ctypes and NumPy integration
+- **Full Python API** via nanobind with torch integration
 - **Modular design** enables parallel component development
 - **Runtime linking** via binary loading

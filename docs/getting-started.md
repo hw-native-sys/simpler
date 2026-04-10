@@ -155,7 +155,9 @@ worker.init(host_path=str(binaries.host_path),
 worker.set_device(device_id=0)
 
 # Execute callable on device
-worker.run(chip_callable, orch_args, CallConfig(block_dim=24))
+config = CallConfig()
+config.block_dim = 24
+worker.run(chip_callable, orch_args, config)
 
 # Cleanup
 worker.reset_device()
@@ -176,14 +178,20 @@ In `src/{arch}/runtime/host_build_graph/runtime/runtime.h`:
 
 ### Runtime Configuration
 
+Runtime behavior is configured via `kernel_config.py` in each example:
+
 ```python
-runner.init(
-    device_id=0,              # Device ID (0-15)
-    num_cores=3,              # Number of cores for handshake
-    aicpu_binary=...,         # AICPU .so binary
-    aicore_binary=...,        # AICore .o binary
-    pto_isa_root="/path/to/pto-isa"  # PTO-ISA headers location
-)
+RUNTIME_CONFIG = {
+    "runtime": "host_build_graph",    # Runtime to use
+    "aicpu_thread_num": 3,            # Number of AICPU scheduler threads
+    "block_dim": 3,                   # Number of AICore blocks (1 block = 1 AIC + 2 AIV)
+}
+```
+
+Device selection is done via CLI flag:
+
+```bash
+python examples/scripts/run_example.py -k <kernels> -g <golden.py> -p a2a3 --device 0
 ```
 
 ## Notes

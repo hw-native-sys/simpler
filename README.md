@@ -21,16 +21,18 @@ PTO ISA headers are automatically cloned on first run. See [Getting Started](doc
 ## Platforms
 
 | Platform | Description | Requirements |
-|----------|-------------|--------------|
-| `a2a3` | Real Ascend hardware | CANN toolkit (ccec, aarch64 cross-compiler) |
-| `a2a3sim` | Thread-based host simulation | gcc/g++ only (no Ascend SDK needed) |
+| -------- | ----------- | ------------ |
+| `a2a3` | Real Ascend A2/A3 hardware | CANN toolkit (ccec, aarch64 cross-compiler) |
+| `a2a3sim` | Thread-based A2/A3 simulation | gcc/g++ only (no Ascend SDK needed) |
+| `a5` | Real Ascend A5 hardware | CANN toolkit (ccec, aarch64 cross-compiler) |
+| `a5sim` | Thread-based A5 simulation | gcc/g++ only (no Ascend SDK needed) |
 
 ## Runtime Variants
 
 Three runtimes under `src/{arch}/runtime/`, each with a different graph-building strategy:
 
 | Runtime | Graph built on | Use case |
-|---------|---------------|----------|
+| ------- | -------------- | -------- |
 | `host_build_graph` | Host CPU | Development, debugging |
 | `aicpu_build_graph` | AICPU (device) | Reduced host-device transfer |
 | `tensormap_and_ringbuffer` | AICPU (device) | Production workloads |
@@ -50,7 +52,7 @@ See runtime docs per arch: [a2a3](src/a2a3/docs/runtimes.md), [a5](src/a5/docs/r
 pytest tests -m "not requires_hardware" -v
 
 # C++ unit tests
-cmake -B tests/cpp/build -S tests/cpp && cmake --build tests/cpp/build && ctest --test-dir tests/cpp/build --output-on-failure
+cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build && ctest --test-dir tests/ut/cpp/build --output-on-failure
 ```
 
 See [Testing Guide](docs/testing.md) for details.
@@ -65,7 +67,7 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 ## Documentation
 
 | Document | Description |
-|----------|-------------|
+| -------- | ----------- |
 | [Architecture](docs/architecture.md) | Three-program model, API layers, execution flow, handshake protocol |
 | [Getting Started](docs/getting-started.md) | Setup, prerequisites, build process, configuration |
 | [Developer Guide](docs/developer-guide.md) | Directory structure, role ownership, conventions |

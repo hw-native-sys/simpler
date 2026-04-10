@@ -32,7 +32,7 @@ Python process (ChipWorker)
   |
   dlopen(host_runtime.so, RTLD_GLOBAL)        ← host SO
     |
-    +-- DeviceRunner (singleton)
+    +-- DeviceRunner (handle-based, one per ChipWorker)
     |     |
     |     +-- rtMemcpy(aicpu_binary → device HBM)    ← NOT dlopen, binary blob upload
     |     +-- rtRegisterAllKernel(aicore_binary)      ← CANN kernel registration
@@ -162,7 +162,9 @@ uses `pthread_key_t` (POSIX TLS) for per-thread state in framework SOs.
 | -------- | ------- | -- | ------- |
 | `g_reg_base_key` | `pthread_key_t` | AICore SO | Per-core simulated register base address |
 | `g_core_id_key` | `pthread_key_t` | AICore SO | Per-core physical core ID |
-| `g_cpu_sim_context_key` | `pthread_key_t` | Host SO | Per-thread execution context (block_idx, subblock_id, etc.) |
+| `g_device_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread device binding (device_id) |
+| `g_subblock_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread subblock identity (for TPUSH/TPOP) |
+| `g_cluster_id_key` | `pthread_key_t` | Sim Context SO (`libcpu_sim_context.so`) | Per-thread cluster identity (for TPUSH/TPOP) |
 | `s_orch_thread_idx` | `__thread int` | AICPU SO | Profiling thread index (profiling off by default) |
 | `execution_context` | `thread_local` | Kernel SO (PTO ISA) | Per-thread execution context (fallback, cached values only) |
 | `NPUMemoryModel::instance` | `thread_local` | Kernel SO (PTO ISA) | Per-core memory model simulation |
@@ -201,7 +203,7 @@ When the AICPU SO is dlclosed and re-dlopen'd between tasks, the static is
 reconstructed. But when the AICPU SO is **reused** (same runtime, consecutive
 tasks), `deinit()` must reset all fields. Previously missing resets:
 
-- `cores_total_num_`, `thread_num_`, `orch_thread_num_`, `sched_thread_num_`
+- `cores_total_num_`, `thread_num_`, `sched_thread_num_`
 - `trackers_` / `core_trackers_`, `core_assignments_`, `core_count_per_thread_`
 - `orch_func_`, `orch_args_cached_`, `orch_so_handle_`, `orch_so_path_`
 
@@ -213,7 +215,7 @@ Applies to all 5 runtime executors: a2a3 (abg, hbg, tmr), a5 (hbg, tmr).
 
 | SO | Caching | Lifecycle |
 | -- | ------- | --------- |
-| Host runtime | `ChipWorker::lib_handle_` | Per-task: dlopen in `init()`, dlclose in `reset()` |
+| Host runtime | `ChipWorker::lib_handle_` | Per-init: dlopen in `init()`, dlclose in `finalize()` |
 | AICPU | `DeviceRunner::aicpu_so_handle_` | Per-run: loaded in `ensure_binaries_loaded()`, closed in `unload_executor_binaries()` at end of `run()` |
 | AICore | `DeviceRunner::aicore_so_handle_` | Same as AICPU |
 | Kernel | `DeviceRunner::func_id_to_addr_` (map by func_id) | Per-task: uploaded in `init_runtime_impl()`, removed in `validate_runtime_impl()` |
@@ -231,8 +233,8 @@ Applies to all 5 runtime executors: a2a3 (abg, hbg, tmr), a5 (hbg, tmr).
 
 ### Key difference
 
-Onboard caches more aggressively — the DeviceRunner singleton persists
-across tasks and the AICPU binary stays in device memory. Simulation
+Onboard caches more aggressively — the DeviceRunner persists
+across tasks within a runtime group, and the AICPU binary stays in device memory. Simulation
 re-loads AICPU/AICore SOs every `run()` call because the SO's internal
 static state (`g_aicpu_executor`) must be fresh for each task when
 different tasks have different configurations.
@@ -242,13 +244,17 @@ different tasks have different configurations.
 ### Simulation (in-process, per-task init/reset)
 
 ```text
-ChipWorker.init(host_path, aicpu_bytes, aicore_bytes)
+ChipWorker.init(host_path, aicpu_path, aicore_path)
   dlopen(host_runtime.so, RTLD_GLOBAL)
-  dlsym: set_device, get_runtime_size, run_runtime, finalize_device
-  set_device(device_id)
+  dlsym: create_device_context, destroy_device_context, set_device,
+         get_runtime_size, run_runtime, finalize_device
+
+ChipWorker.set_device(device_id)
+  create_device_context() → DeviceContextHandle
+  set_device(ctx, device_id)
 
 ChipWorker.run(callable, args, config)
-  run_runtime(buf, callable, args, ...)
+  run_runtime(ctx, buf, callable, args, ...)
     new (buf) Runtime()
     init_runtime_impl(r, callable, args)     build graph, upload kernels
     DeviceRunner::run(r, ...)
@@ -260,8 +266,12 @@ ChipWorker.run(callable, args, config)
     validate_runtime_impl(r)                 copy results, remove kernels
     r->~Runtime()
 
-ChipWorker.reset()
-  finalize_device()
+ChipWorker.reset_device()
+  finalize_device(ctx)
+  destroy_device_context(ctx)
+
+ChipWorker.finalize()
+  reset_device() (if needed)
   dlclose(host_runtime.so)                   -fno-gnu-unique ensures real unload
 ```
 
@@ -270,13 +280,15 @@ ChipWorker.reset()
 ```text
 device_worker_main(device_id)
   for each runtime_group:
-    ChipWorker.init(host_path, aicpu_bytes, aicore_bytes)
+    ChipWorker.init(host_path, aicpu_path, aicore_path)
       dlopen(host_runtime.so, RTLD_GLOBAL)
-      set_device(device_id)                  rtSetDevice()
+    ChipWorker.set_device(device_id)
+      create_device_context()
+      set_device(ctx, device_id)               rtSetDevice()
 
     for each task in group:
       ChipWorker.run(callable, args, config)
-        run_runtime(buf, callable, args, ...)
+        run_runtime(ctx, buf, callable, args, ...)
           new (buf) Runtime()
           init_runtime_impl()                rtMalloc, rtMemcpy to device
           DeviceRunner::run()
@@ -286,7 +298,10 @@ device_worker_main(device_id)
             launch_aicore_kernel()           rtRegisterAllKernel + rtKernelLaunch
           validate_runtime_impl()            rtMemcpy results back to host
 
-    ChipWorker.reset()
-      finalize_device()                      rtDeviceReset()
+    ChipWorker.reset_device()
+      finalize_device(ctx)                     rtDeviceReset()
+      destroy_device_context(ctx)
+
+    ChipWorker.finalize()
       dlclose(host_runtime.so)
 ```

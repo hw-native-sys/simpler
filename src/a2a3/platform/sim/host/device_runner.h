@@ -12,10 +12,12 @@
  * Device Runner - Thread-Based Simulation
  *
  * This module simulates the Ascend AICPU/AICore execution model using threads.
- * It provides the SAME interface as the real a2a3 DeviceRunner, ensuring
- * API compatibility with Python bindings and examples.
+ * It provides a compatible interface with the onboard DeviceRunner for the
+ * core operations (allocate, copy, run, finalize, upload/remove kernel).
+ * The onboard version exposes additional low-level methods (launch_aicpu_kernel,
+ * launch_aicore_kernel, ensure_device_set) for custom workflows.
  *
- * Key differences from real a2a3:
+ * Key differences from onboard:
  * - Uses host memory instead of device memory
  * - Uses std::thread instead of CANN kernel launches
  * - Kernel .text binaries are loaded into executable memory (mmap)
@@ -64,7 +66,7 @@ struct MappedKernel {
 /**
  * Device runner for simulated kernel execution
  *
- * This class provides the SAME interface as the real a2a3 DeviceRunner,
+ * This class provides a compatible interface with the onboard DeviceRunner,
  * but implements execution using host threads instead of actual device
  * kernel launches.
  *

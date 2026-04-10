@@ -273,7 +273,7 @@ int validate_runtime_impl(Runtime *runtime) {
         }
     }
 
-    // Note: PrintHandshakeResults is now called in DeviceRunner's destructor
+    // Note: print_handshake_results() is called in DeviceRunner::run()
 
     // Cleanup device tensors
     LOG_INFO("=== Cleaning Up ===");

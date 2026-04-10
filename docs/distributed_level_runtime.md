@@ -133,7 +133,7 @@ For group tasks, RUNNING → COMPLETED requires ALL N workers to finish (`sub_co
 ```text
 Python layer                              C++ layer
 ──────────────                            ──────────────
-Worker / HostWorker                       DistWorker
+Worker                                    DistWorker
   - fork() SubWorker processes              - DistOrchestrator (DAG, TensorMap)
   - register callables (before fork)        - DistScheduler (thread, dispatch)
   - manage SharedMemory lifecycle           - DistRing (slot allocation)
@@ -275,7 +275,7 @@ The `IWorker` interface enables recursive composition: an L4 `DistWorker` would 
 ```text
 Python Application
   │
-  └─► Worker / HostWorker                    ← Python wrapper (lifecycle, fork management)
+  └─► Worker                              ← Python wrapper (lifecycle, fork management)
        │
        └── DistWorker(level=3)               ← C++ scheduling engine
             │
@@ -305,6 +305,5 @@ Python Application
 | `src/common/distributed/dist_scope.h/.cpp` | Scope depth tracking and ref management |
 | `src/common/distributed/dist_sub_worker.h/.cpp` | fork/shm IWorker with mailbox protocol |
 | `src/common/worker/chip_worker.h/.cpp` | L2 device execution, thread_local DeviceRunner |
-| `python/host_worker/host_worker.py` | L3 Python wrapper, fork management, scope context manager |
-| `python/worker.py` | Unified Worker factory (L2 + L3) |
+| `python/worker.py` | Unified Worker (L2 + L3): Python wrapper, fork management, scope context manager |
 | `python/bindings/dist_worker_bind.h` | nanobind bindings for distributed types |

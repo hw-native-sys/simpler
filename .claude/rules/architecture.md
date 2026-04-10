@@ -18,7 +18,7 @@ See [docs/architecture.md](../../docs/architecture.md) for the full diagram, API
 | Pre-build all runtimes | `examples/scripts/build_runtimes.py` (invoked by `pip install .`) |
 | Platform/runtime discovery | `examples/scripts/platform_info.py` |
 | Kernel compilation | `python/kernel_compiler.py` (one `.cpp` per `func_id`) |
-| Python bindings | `python/bindings.py` (ctypes wrappers for host `.so`) |
+| Python bindings | `python/bindings/` (nanobind extension for ChipWorker, task types) |
 | Pre-built binary lookup | `build/lib/{arch}/{variant}/{runtime}/` |
 | Persistent cmake cache | `build/cache/{arch}/{variant}/{runtime}/` |
 
