@@ -14,13 +14,13 @@
  * @brief Memory file descriptor based SO loading for AICPU environment
  */
 
+#ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_AICPU_MEMFD_LOADER_H_
+#define SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_AICPU_MEMFD_LOADER_H_
+
 // Enable GNU extensions for memfd_create and MFD_CLOEXEC
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE
 #endif
-
-#ifndef MEMFD_LOADER_H
-#define MEMFD_LOADER_H
 
 #ifdef __cplusplus
 extern "C" {
@@ -39,13 +39,8 @@ extern "C" {
  * Load orchestration SO using memfd
  */
 static inline int load_orchestration_so_with_memfd(
-    const void *so_data,
-    size_t so_size,
-    int orch_thread_num,
-    void **out_handle,
-    char *out_so_path,
-    int *out_memfd
-) {
+    const void *so_data, size_t so_size, int orch_thread_num,
+    void **out_handle, char *out_so_path, int *out_memfd) {
     *out_handle = nullptr;
     *out_memfd = -1;
     out_so_path[0] = '\0';
@@ -58,6 +53,7 @@ static inline int load_orchestration_so_with_memfd(
     int fd = memfd_create("libdevice_orch", MFD_CLOEXEC);
 
     if (fd < 0) {
+        DEV_INFO("memfd_create failed: errno=%d", errno);
         return -1;
     }
 
@@ -65,10 +61,12 @@ static inline int load_orchestration_so_with_memfd(
     ssize_t written = write(fd, so_data, so_size);
 
     if (written < 0) {
+        DEV_INFO("memfd write failed: errno=%d", errno);
         close(fd);
         return -1;
     }
     if (written != static_cast<ssize_t>(so_size)) {
+        DEV_INFO("memfd partial write: %zd/%zu", written, so_size);
         close(fd);
         return -1;
     }
@@ -83,15 +81,17 @@ static inline int load_orchestration_so_with_memfd(
     // Create a symlink to /proc/self/fd/N with a "normal" path
     // This bypasses the AICPU dynamic linker's issue with /proc/self/fd/N paths
     char link_path[256];
-    snprintf(link_path, sizeof(link_path), "/tmp/libdevice_orch_%d_%d.so", getpid(), orch_thread_num);
+    snprintf(link_path, sizeof(link_path),
+             "/tmp/libdevice_orch_%d_%d.so", getpid(), orch_thread_num);
 
     int symlink_rc = symlink(proc_fd_path, link_path);
     if (symlink_rc != 0) {
+        DEV_INFO("symlink failed: errno=%d", errno);
         close(fd);
         return -1;
     }
 
-    snprintf(out_so_path, 256, "%s", link_path);
+    snprintf(out_so_path, sizeof(out_so_path), "%s", link_path);
 
     // Try dlopen from the symlink
     dlerror();
@@ -101,6 +101,9 @@ static inline int load_orchestration_so_with_memfd(
     unlink(link_path);
 
     if (handle == nullptr) {
+        const char *dl_err = dlerror();
+        DEV_INFO("dlopen from memfd symlink failed: %s",
+                 dl_err ? dl_err : "unknown");
         close(fd);
         return -1;
     }
@@ -126,4 +129,4 @@ static inline void cleanup_memfd_so(int memfd, void *handle) {
 }
 #endif
 
-#endif  // MEMFD_LOADER_H
+#endif  // SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_AICPU_MEMFD_LOADER_H_
