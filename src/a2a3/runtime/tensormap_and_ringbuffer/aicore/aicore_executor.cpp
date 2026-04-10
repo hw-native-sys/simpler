@@ -112,8 +112,11 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
         {
             uint32_t task_id = reg_val;  // Decode: register holds task_id directly
 
+            // Select dual-buffer slot: same bit as AICPU used when writing payload
+            __gm__ PTO2DispatchPayload *exec_payload = payload + (task_id & 1u);
+
             // Invalidate payload buffer (AICPU updates its content each dispatch)
-            dcci(payload, ENTIRE_DATA_CACHE);
+            dcci(exec_payload, ENTIRE_DATA_CACHE);
 
             write_reg(RegId::COND, MAKE_ACK_VALUE(task_id));
 
@@ -121,7 +124,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             uint64_t start_time = get_sys_cnt_aicore();
 
             // Execute the task
-            execute_task(payload);
+            execute_task(exec_payload);
 
             // Performance profiling: record task execution
             if (profiling_enabled) {
