@@ -91,7 +91,7 @@ static inline int load_orchestration_so_with_memfd(
         return -1;
     }
 
-    snprintf(out_so_path, sizeof(out_so_path), "%s", link_path);
+    snprintf(out_so_path, 256, "%s", link_path);
 
     // Try dlopen from the symlink
     dlerror();
