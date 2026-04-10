@@ -39,8 +39,8 @@ extern "C" {
  * Load orchestration SO using memfd
  */
 static inline int load_orchestration_so_with_memfd(
-    const void *so_data, size_t so_size, int orch_thread_num,
-    void **out_handle, char *out_so_path, int *out_memfd) {
+    const void *so_data, size_t so_size, int orch_thread_num, void **out_handle, char *out_so_path, int *out_memfd
+) {
     *out_handle = nullptr;
     *out_memfd = -1;
     out_so_path[0] = '\0';
@@ -81,8 +81,7 @@ static inline int load_orchestration_so_with_memfd(
     // Create a symlink to /proc/self/fd/N with a "normal" path
     // This bypasses the AICPU dynamic linker's issue with /proc/self/fd/N paths
     char link_path[256];
-    snprintf(link_path, sizeof(link_path),
-             "/tmp/libdevice_orch_%d_%d.so", getpid(), orch_thread_num);
+    snprintf(link_path, sizeof(link_path), "/tmp/libdevice_orch_%d_%d.so", getpid(), orch_thread_num);
 
     int symlink_rc = symlink(proc_fd_path, link_path);
     if (symlink_rc != 0) {
@@ -102,8 +101,7 @@ static inline int load_orchestration_so_with_memfd(
 
     if (handle == nullptr) {
         const char *dl_err = dlerror();
-        DEV_INFO("dlopen from memfd symlink failed: %s",
-                 dl_err ? dl_err : "unknown");
+        DEV_INFO("dlopen from memfd symlink failed: %s", dl_err ? dl_err : "unknown");
         close(fd);
         return -1;
     }
