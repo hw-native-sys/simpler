@@ -73,6 +73,10 @@ typedef void (*DeviceOrchestrationBindRuntimeFunc)(PTO2Runtime *rt);
 // Config function exported by orchestration .so
 typedef PTO2OrchestrationConfig (*DeviceOrchestrationConfigFunc)(const ChipStorageTaskArgs &orch_args);
 
+// From orchestration/common.cpp linked into this DSO — updates g_pto2_current_runtime here (distinct from
+// pto2_framework_bind_runtime in the dlopen'd libdevice_orch_*.so).
+extern "C" void pto2_framework_bind_runtime(PTO2Runtime *rt);
+
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int32_t MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 
@@ -2091,6 +2095,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if PTO2_PROFILING
             orch_cycle_start = get_sys_cnt_aicpu();
 #endif
+            pto2_framework_bind_runtime(rt);
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(rt);
             }
@@ -2330,8 +2335,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         finished_.store(true, std::memory_order_release);
         // Destroy PTO2 runtime and close orchestration SO (moved from orchestrator path)
         if (!runtime->get_orch_built_on_host() && orch_so_handle_ != nullptr) {
-            // Clear the borrowed pointer in the orchestration SO before destroying
-            // rt, so g_pto2_current_runtime never points to freed memory.
+            // Clear g_pto2_current_runtime in this DSO and in the orchestration SO before destroying rt.
+            pto2_framework_bind_runtime(nullptr);
             if (orch_bind_runtime_ != nullptr) {
                 orch_bind_runtime_(nullptr);
             }
