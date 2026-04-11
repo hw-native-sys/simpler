@@ -58,7 +58,7 @@ struct Segment {
  *
  * Layout (64B) is aligned with Tensor cacheline 1 so that
  * init_from_create_info() can copy the entire cacheline with a single memcpy,
- * then overwrite buffer/owner metadata and refresh start_offset later.
+ * then overwrite buffer/owner metadata while keeping start_offset at zero.
  *
  * Arg::add_output() stores a pointer to this object, so the original
  * must remain valid (not a temporary) until after the submit call.
@@ -101,7 +101,7 @@ public:  // NOLINT(whitespace/indent)
     // --- Bytes [0, 32): TensorCreateInfo-only fields ---
     // These occupy the same positions as Tensor::buffer, Tensor::owner_task_id,
     // and Tensor::start_offset. The runtime overwrites owner metadata after the
-    // memcpy and refreshes start_offset during payload materialization.
+    // memcpy and keeps start_offset at zero for fresh contiguous outputs.
     uint64_t initial_value;
     bool has_initial_value;
     uint8_t __pad1__[7];
@@ -210,6 +210,7 @@ struct alignas(64) Tensor {
             }
         }
         owner_task_id = PTO2TaskId::invalid();
+        update_start_offset();
     }
 
     void init(const Tensor &other) {
@@ -264,6 +265,7 @@ struct alignas(64) Tensor {
         }
         is_all_offset_zero = all_zero;
         owner_task_id = other.owner_task_id;
+        update_start_offset();
     }
 
     /// Compute 1D flat element offset from multi-dimensional indices.
@@ -288,6 +290,7 @@ struct alignas(64) Tensor {
         memcpy(this, &ci, 64);
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size};
         owner_task_id = PTO2TaskId::invalid();  // caller (orchestrator) overwrites with actual task_id
+        start_offset = 0;
         if (ci.has_initial_value) {
             fill_initial_value(ci.initial_value);
         }
