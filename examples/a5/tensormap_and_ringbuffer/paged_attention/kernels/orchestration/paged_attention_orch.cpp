@@ -15,9 +15,9 @@
  * Each block processes a single 16x16 matmul operation.
  *
  * Memory Layout:
- *   Query: (batch, 16, 16) - one 16x16 tile per batch fp16
- *   Key:   (total_blocks, 16, 16) - stored as K^T for direct matmul fp16
- *   Value: (total_blocks, 16, 16) - direct format fp16
+ *   Query: (batch, 16, 16) - one 16x16 tile per batch bf16
+ *   Key:   (total_blocks, 16, 16) - stored as K^T for direct matmul bf16
+ *   Value: (total_blocks, 16, 16) - direct format bf16
  *
  * This file compiles as a standalone .so with zero runtime link dependencies.
  * All runtime calls go through the PTO2RuntimeOps function-pointer table.
@@ -28,7 +28,7 @@
 
 #include <cinttypes>
 
-#include "pto_orchestration_api.h"  // NOLINT(build/include_subdir)
+#include "pto_orchestration_api.h"
 
 #define FUNC_QK_MATMUL 0
 #define FUNC_SOFTMAX_PREPARE 1
@@ -38,7 +38,7 @@ extern "C" {
 
 __attribute__((visibility("default"))) PTO2OrchestrationConfig
 aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
-    (void)orch_args;  // NOLINT(readability/casting)
+    (void)orch_args;
     return PTO2OrchestrationConfig{
         .expected_arg_count = 7,
     };
@@ -103,7 +103,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     TensorCreateInfo tile2d_ci(tile2d_shapes, 2, DataType::FLOAT32);
     TensorCreateInfo scalar_ci(scalar_shapes, 1, DataType::FLOAT32);
     TensorCreateInfo sij_ci(sij_shapes, 2, DataType::FLOAT32);
-    TensorCreateInfo pij_f16_ci(sij_shapes, 2, data_type);
+    TensorCreateInfo pij_bf16_ci(sij_shapes, 2, data_type);
 
     for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
@@ -145,17 +145,17 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     Tensor sij_valid = sij.view(sij_valid_shapes, sij_valid_offsets);
                     Arg params_sf;
                     params_sf.add_input(sij_valid);
-                    params_sf.add_output(pij_f16_ci);
+                    params_sf.add_output(pij_bf16_ci);
                     params_sf.add_output(scalar_ci);
                     params_sf.add_output(scalar_ci);
                     params_sf.add_scalar(scale_value);
                     TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
-                    const Tensor &pij_f16 = sf_outs.get_ref(0);
+                    const Tensor &pij_bf16 = sf_outs.get_ref(0);
                     const Tensor &mi = sf_outs.get_ref(1);
                     const Tensor &li = sf_outs.get_ref(2);
 
                     Arg params_pv;
-                    params_pv.add_input(pij_f16);
+                    params_pv.add_input(pij_bf16);
                     params_pv.add_input(vj);
                     params_pv.add_output(tile2d_ci);
                     TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
