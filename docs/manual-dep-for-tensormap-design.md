@@ -327,27 +327,32 @@ git worktree add tmp/worktree_unmodified a71ba16
 
 Fresh rerun settings:
 
-- date: `2026-04-10`
+- date: `2026-04-11`
 - platform: `a2a3`
 - device: `5`
-- rounds: `5`
+- rounds: `7`
 - PTO-ISA commit: `d96c8784`
 
-Units below are elapsed microseconds. These are fresh reruns only.
+Units below are elapsed microseconds. These are fresh reruns only. The
+comparison uses median round time because outliers were observed in the latest
+run (`aicpu_build_graph/Case1` and `tensormap_and_ringbuffer/Case2` each had
+one large outlier).
 
 ### `paged_attention`
 
-| Case | `aicpu_build_graph` | `tensormap_and_ringbuffer_unmodified` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
-| --- | ---: | ---: | ---: | ---: |
-| `Case1` | `30943.4` | `36722.9` | `38296.0` | `32008.9` |
-| `Case2` | `16189.9` | `18682.5` | `19904.9` | `16605.3` |
+| Case | `aicpu_build_graph` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
+| --- | ---: | ---: | ---: |
+| `Case1` | `30026.2` | `37047.9` | `28303.4` |
+| `Case2` | `15945.8` | `18757.3` | `15640.3` |
 
-### `paged_attention_unroll`
+Notes:
 
-| Case | `aicpu_build_graph` | `tensormap_and_ringbuffer_unmodified` | `tensormap_and_ringbuffer` | `tensormap_and_ringbuffer_partial_manual` |
-| --- | ---: | ---: | ---: | ---: |
-| `Case1` | `1392.4` | `1325.9` | `1151.3` | `1159.1` |
-| `Case2` | `678.1` | `638.1` | `563.3` | `568.0` |
+- the table above is from the newest reruns after commits `a65894a` and
+  `6d33941`
+- `tensormap_and_ringbuffer_unmodified` was not rerun in this update, so it is
+  intentionally omitted rather than mixed with old results
+- `paged_attention_unroll` was also not rerun in this update, so it is omitted
+  for the same reason
 
 ## Feature / Optimization -> Gain
 
@@ -384,48 +389,84 @@ Measured effect on device `5`:
 This confirms the remaining manual scope-end cost was still meaningful, but it
 is no longer the main gap.
 
-### 3. Current non-unroll ranking is now close to the intended shape
+### 3. Skipping no-op manual TensorMap bookkeeping gave a small win
 
-For `paged_attention`:
+Commit `a65894a` replaced broad manual-arg rescans with exact work masks for:
 
-- `aicpu_build_graph` is still the fastest
-- `tensormap_and_ringbuffer_partial_manual` is now much closer to it
-- `tensormap_and_ringbuffer_partial_manual` is clearly better than both
-  current AUTO and the unmodified tensormap runtime
+- creator-retention work
+- TensorMap lookup work
+- TensorMap insert work
 
-Concrete non-unroll deltas:
+Measured effect on partial-manual device-log medians:
+
+- `Case1`: `31808.4 us -> 31412.1 us` (`-1.2%`)
+- `Case2`: `31058.6 us -> 31019.8 us` (`-0.1%`)
+
+This was worth keeping, but it was not the main gap-closer.
+
+### 4. Caching `Tensor::start_offset` at creation was the major recent win
+
+Commit `6d33941` changed TMR tensors so that:
+
+- external tensors cache `start_offset = 0` at construction
+- view tensors cache the flattened offset when the view is created
+- fresh runtime-created outputs stay at zero
+- payload materialization no longer recomputes `start_offset` for every tensor
+
+A focused C++ unit test was added to lock this down:
+
+- `tests/ut/cpp/test_a2a3_tmr_tensor_offsets.cpp`
+
+Measured effect on partial-manual device-log medians before the final rerun:
+
+- `Case1`: `31808.4 us -> 29144.0 us` (`-8.4%`)
+- `Case2`: `31058.6 us -> 29514.6 us` (`-5.0%`)
+
+The final rerun shows a larger end-to-end gain because it avoided the earlier
+bad `Case2` measurement window:
+
+- `Case1`: `30026.2 us` (`aicpu_build_graph`) vs `28303.4 us`
+  (`partial_manual`)
+- `Case2`: `15945.8 us` (`aicpu_build_graph`) vs `15640.3 us`
+  (`partial_manual`)
+
+### 5. Current non-unroll ranking now matches the intended shape
+
+For `paged_attention` after the newest reruns:
 
 - vs `aicpu_build_graph`
-  - `Case1`: `32008.9 us` vs `30943.4 us` (`+3.4%`)
-  - `Case2`: `16605.3 us` vs `16189.9 us` (`+2.6%`)
-- vs `tensormap_and_ringbuffer_unmodified`
-  - `Case1`: `36722.9 us -> 32008.9 us` (`-12.8%`)
-  - `Case2`: `18682.5 us -> 16605.3 us` (`-11.1%`)
+  - `Case1`: `30026.2 us -> 28303.4 us` (`-5.7%`)
+  - `Case2`: `15945.8 us -> 15640.3 us` (`-1.9%`)
 - vs current AUTO
-  - `Case1`: `38296.0 us -> 32008.9 us` (`-16.4%`)
-  - `Case2`: `19904.9 us -> 16605.3 us` (`-16.6%`)
+  - `Case1`: `37047.9 us -> 28303.4 us` (`-23.6%`)
+  - `Case2`: `18757.3 us -> 15640.3 us` (`-16.6%`)
 
-### 4. Unroll remains a low-return target for partial-manual
+This is the intended non-unroll shape:
 
-For `paged_attention_unroll`, AUTO already amortizes most of the dependency
-cost, so partial-manual stays nearly flat:
+- `partial_manual` keeps the feature coverage of scoped manual dependencies
+- it avoids the heavy TensorMap path for same-manual-scope dependencies
+- it now matches or slightly beats `aicpu_build_graph` on the two measured
+  non-unroll cases
 
-- `Case1`: `1151.3 us -> 1159.1 us`
-- `Case2`: `563.3 us -> 568.0 us`
+### 6. Remaining work is still submit-path robustness
 
-This is expected. The profitable target for partial-manual is the non-unroll
-scene.
+Latest non-unroll partial-manual profiling after `6d33941`:
 
-### 5. Remaining gap is now mostly submit-time, not `scope_end()`
-
-Latest non-unroll partial-manual profiling after `6dc2e1e`:
-
-- `submit_manual`: about `27.5-28.0 ms`
-- `scope_close`: about `3.5-3.8 ms`
+- `Case1`
+  - `submit_manual`: about `24.0 ms`
+  - `scope_close`: about `3.8 ms`
+  - `scope_close(x256)`
+- `Case2`
+  - `submit_manual`: about `13.0 ms`
+  - `scope_close`: about `2.0 ms`
+  - `scope_close(x64)`
 - `add_dependency`: `0`
 
-So the next worthwhile optimization target is manual submit itself, especially
-the runtime/orch path for boundary tensors inside manual scopes.
+The earlier suspicious `Case2` run showed a `scope_close(x256)` shape, which
+does not match `Case2`. The rerun shows the expected `scope_close(x64)` shape
+and removes the apparent large ABG gap. Future benchmark updates should keep
+the device log and round summary paired together to avoid this kind of
+wrong-log or contaminated-window interpretation.
 
 ## Current Risks
 
