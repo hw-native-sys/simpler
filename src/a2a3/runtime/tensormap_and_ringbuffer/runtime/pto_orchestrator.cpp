@@ -845,8 +845,9 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
 
     PTO2FaninBuilder fanin_builder;
     fanin_builder.spill_pool = &orch->rings[ring_id].fanin_pool;
-    uint64_t manual_local_mask = 0;
-    uint64_t manual_boundary_passthrough_mask = 0;
+    uint64_t manual_owner_retention_mask = 0;
+    uint64_t manual_lookup_mask = 0;
+    uint64_t manual_insert_mask = 0;
     bool needs_tensormap_sync = true;
     if constexpr (kManualSubmit) {
         needs_tensormap_sync = false;
@@ -859,18 +860,26 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
             const Tensor *tensor = args.tensor(i).ptr;
             PTO2TaskId owner = tensor->owner_task_id;
             if (tensor->manual_dep && !owner.is_valid()) {
-                manual_boundary_passthrough_mask |= static_cast<uint64_t>(1ULL << i);
                 continue;
             }
 
             if (task_owned_by_current_manual_scope(orch, owner)) {
-                manual_local_mask |= static_cast<uint64_t>(1ULL << i);
                 continue;
+            }
+
+            if (owner.is_valid() && sched != nullptr) {
+                manual_owner_retention_mask |= static_cast<uint64_t>(1ULL << i);
             }
 
             bool needs_lookup = (ptype == TensorArgType::INPUT || ptype == TensorArgType::INOUT) && !tensor->manual_dep;
             bool needs_insert =
                 (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) && !tensor->manual_dep;
+            if (needs_lookup) {
+                manual_lookup_mask |= static_cast<uint64_t>(1ULL << i);
+            }
+            if (needs_insert) {
+                manual_insert_mask |= static_cast<uint64_t>(1ULL << i);
+            }
             if (needs_lookup || needs_insert) {
                 needs_tensormap_sync = true;
             }
@@ -902,55 +911,94 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
     // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
-    for (int i = 0; i < args.tensor_count(); i++) {
-        TensorArgType ptype = args.tag(i);
-        if (ptype == TensorArgType::OUTPUT) {
-            continue;
-        }
-
-        const Tensor *tensor = args.tensor(i).ptr;
-        if constexpr (kManualSubmit) {
-            uint64_t arg_mask = static_cast<uint64_t>(1ULL << i);
-            if ((manual_local_mask & arg_mask) != 0 || (manual_boundary_passthrough_mask & arg_mask) != 0) {
+    if constexpr (!kManualSubmit) {
+        for (int i = 0; i < args.tensor_count(); i++) {
+            TensorArgType ptype = args.tag(i);
+            if (ptype == TensorArgType::OUTPUT) {
                 continue;
             }
-        }
 
-        PTO2TaskId owner = tensor->owner_task_id;
-        if (owner.is_valid() && sched != nullptr) {
-            PTO2TaskSlotState *prod_state =
-                &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
-            if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "creator retention"
-                )) {
-                return result;
+            const Tensor *tensor = args.tensor(i).ptr;
+            PTO2TaskId owner = tensor->owner_task_id;
+            if (owner.is_valid() && sched != nullptr) {
+                PTO2TaskSlotState *prod_state =
+                    &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
+                if (!pto2_append_fanin_or_fail(
+                        orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "creator retention"
+                    )) {
+                    return result;
+                }
+            }
+
+            if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
+                continue;
+            }
+            if (tensor->manual_dep) {
+                continue;
+            }
+
+            PTO2LookupResult lookup_result;
+            orch->tensor_map.lookup(*tensor, lookup_result);
+
+            for (int r = 0; r < lookup_result.count; r++) {
+                PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
+                auto overlap_status = lookup_result.entries[r].overlap_status;
+                auto prod_ring = entry.producer_task_id.ring();
+                auto prod_local = entry.producer_task_id.local();
+                PTO2TaskSlotState *prod_state =
+                    &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
+                if (!pto2_append_fanin_or_fail(
+                        orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "overlap lookup"
+                    )) {
+                    return result;
+                }
+                if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                    orch->tensor_map.remove_entry(entry);
+                }
             }
         }
+    } else {
+        uint64_t manual_step3_mask = manual_owner_retention_mask | manual_lookup_mask;
+        while (manual_step3_mask != 0) {
+            int i = __builtin_ctzll(manual_step3_mask);
+            uint64_t arg_mask = static_cast<uint64_t>(1ULL << i);
+            manual_step3_mask &= (manual_step3_mask - 1);
 
-        if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
-            continue;
-        }
-        if (tensor->manual_dep) {
-            continue;
-        }
-
-        PTO2LookupResult lookup_result;
-        orch->tensor_map.lookup(*tensor, lookup_result);
-
-        for (int r = 0; r < lookup_result.count; r++) {
-            PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
-            auto overlap_status = lookup_result.entries[r].overlap_status;
-            auto prod_ring = entry.producer_task_id.ring();
-            auto prod_local = entry.producer_task_id.local();
-            PTO2TaskSlotState *prod_state =
-                &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
-            if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "overlap lookup"
-                )) {
-                return result;
+            TensorArgType ptype = args.tag(i);
+            const Tensor *tensor = args.tensor(i).ptr;
+            if ((manual_owner_retention_mask & arg_mask) != 0) {
+                PTO2TaskId owner = tensor->owner_task_id;
+                PTO2TaskSlotState *prod_state =
+                    &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
+                if (!pto2_append_fanin_or_fail(
+                        orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "creator retention"
+                    )) {
+                    return result;
+                }
             }
-            if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
-                orch->tensor_map.remove_entry(entry);
+
+            if ((manual_lookup_mask & arg_mask) == 0) {
+                continue;
+            }
+
+            PTO2LookupResult lookup_result;
+            orch->tensor_map.lookup(*tensor, lookup_result);
+
+            for (int r = 0; r < lookup_result.count; r++) {
+                PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
+                auto overlap_status = lookup_result.entries[r].overlap_status;
+                auto prod_ring = entry.producer_task_id.ring();
+                auto prod_local = entry.producer_task_id.local();
+                PTO2TaskSlotState *prod_state =
+                    &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
+                if (!pto2_append_fanin_or_fail(
+                        orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "overlap lookup"
+                    )) {
+                    return result;
+                }
+                if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
+                    orch->tensor_map.remove_entry(entry);
+                }
             }
         }
     }
@@ -958,18 +1006,19 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
     CYCLE_COUNT_LAP_RECORD(g_orch_lookup_cycle, AicpuPhaseId::ORCH_LOOKUP, task_id.raw);
 
     // === STEP 4: Register outputs/inouts in TensorMap (must be separate from lookup) ===
-    for (int i = 0; i < args.tensor_count(); i++) {
-        TensorArgType ptype = args.tag(i);
-        if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-            if constexpr (kManualSubmit) {
-                uint64_t arg_mask = static_cast<uint64_t>(1ULL << i);
-                if ((manual_local_mask & arg_mask) != 0 || (manual_boundary_passthrough_mask & arg_mask) != 0) {
-                    continue;
-                }
-            }
-            if (!args.tensor(i).ptr->manual_dep) {
+    if constexpr (!kManualSubmit) {
+        for (int i = 0; i < args.tensor_count(); i++) {
+            TensorArgType ptype = args.tag(i);
+            if ((ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) &&
+                !args.tensor(i).ptr->manual_dep) {
                 orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
             }
+        }
+    } else {
+        while (manual_insert_mask != 0) {
+            int i = __builtin_ctzll(manual_insert_mask);
+            manual_insert_mask &= (manual_insert_mask - 1);
+            orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
         }
     }
 
