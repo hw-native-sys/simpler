@@ -846,6 +846,7 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
     PTO2FaninBuilder fanin_builder;
     fanin_builder.spill_pool = &orch->rings[ring_id].fanin_pool;
     uint64_t manual_local_mask = 0;
+    uint64_t manual_boundary_passthrough_mask = 0;
     bool needs_tensormap_sync = true;
     if constexpr (kManualSubmit) {
         needs_tensormap_sync = false;
@@ -856,7 +857,13 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
             }
 
             const Tensor *tensor = args.tensor(i).ptr;
-            if (task_owned_by_current_manual_scope(orch, tensor->owner_task_id)) {
+            PTO2TaskId owner = tensor->owner_task_id;
+            if (tensor->manual_dep && !owner.is_valid()) {
+                manual_boundary_passthrough_mask |= static_cast<uint64_t>(1ULL << i);
+                continue;
+            }
+
+            if (task_owned_by_current_manual_scope(orch, owner)) {
                 manual_local_mask |= static_cast<uint64_t>(1ULL << i);
                 continue;
             }
@@ -903,7 +910,8 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
 
         const Tensor *tensor = args.tensor(i).ptr;
         if constexpr (kManualSubmit) {
-            if ((manual_local_mask & static_cast<uint64_t>(1ULL << i)) != 0) {
+            uint64_t arg_mask = static_cast<uint64_t>(1ULL << i);
+            if ((manual_local_mask & arg_mask) != 0 || (manual_boundary_passthrough_mask & arg_mask) != 0) {
                 continue;
             }
         }
@@ -954,7 +962,8 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
         TensorArgType ptype = args.tag(i);
         if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
             if constexpr (kManualSubmit) {
-                if ((manual_local_mask & static_cast<uint64_t>(1ULL << i)) != 0) {
+                uint64_t arg_mask = static_cast<uint64_t>(1ULL << i);
+                if ((manual_local_mask & arg_mask) != 0 || (manual_boundary_passthrough_mask & arg_mask) != 0) {
                     continue;
                 }
             }
