@@ -307,6 +307,7 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
     for (int i = 0; i < cores_total_num_; i++) {
         all_handshakes[i].aicpu_ready = 1;
     }
+    OUT_OF_ORDER_STORE_BARRIER();
 
     // Get platform physical cores count for validation
     uint32_t max_physical_cores_count = platform_get_physical_cores_count();
@@ -339,7 +340,10 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
 
         // Initialize AICore registers after discovery (first round)
         platform_init_aicore_regs(reg_addr);
+        OUT_OF_ORDER_STORE_BARRIER();
         hank->aicpu_regs_ready = 1;
+
+        OUT_OF_ORDER_STORE_BARRIER();
 
         while (hank->aicore_done == 0) {}
 
