@@ -192,10 +192,7 @@ inline bool AicpuExecutor::try_dispatch_task(
     }
 
     const char *core_type_str = (core_type == CoreType::AIC) ? "AIC" : "AIV";
-    LOG_INFO(
-        "Thread %d: Dispatching %s task %d to core %d (running_id=%d)", thread_idx, core_type_str, task_id, core_id,
-        running_task_ids_[core_id]
-    );
+    LOG_INFO("Thread %d: Dispatching %s task %d to core %d", thread_idx, core_type_str, task_id, core_id);
 
     // Set state before writing register to avoid race with AICore ACK
     pending_task_ids_[core_id] = task_id;
@@ -248,7 +245,6 @@ int AicpuExecutor::init(Runtime *runtime) {
 
     for (int i = 0; i < cores_total_num_; i++) {
         pending_task_ids_[i] = AICPU_TASK_INVALID;
-        running_task_ids_[i] = AICPU_TASK_INVALID;
         core_first_dispatch_[i] = true;
     }
 
@@ -609,147 +605,31 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
             uint64_t reg_addr = core_id_to_reg_addr_[core_id];
             Handshake *h = &hank[core_id];
 
-            uint64_t reg_val = read_reg(reg_addr, RegId::COND);
-            int reg_task_id = EXTRACT_TASK_ID(reg_val);
-            int reg_state = EXTRACT_TASK_STATE(reg_val);
+            // --- Completion check: wait for the dispatched task's FIN ---
+            if (pending_task_ids_[core_id] != AICPU_TASK_INVALID) {
+                uint64_t reg_val = read_reg(reg_addr, RegId::COND);
+                int reg_task_id = EXTRACT_TASK_ID(reg_val);
+                int reg_state = EXTRACT_TASK_STATE(reg_val);
 
-            // Case 1: Pending task finished directly
-            if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
-                LOG_INFO(
-                    "Thread %d: Core %d completed task %d (running_id=%d)", thread_idx, core_id,
-                    pending_task_ids_[core_id], running_task_ids_[core_id]
-                );
+                if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
+                    int completed_task_id = pending_task_ids_[core_id];
+                    LOG_INFO("Thread %d: Core %d completed task %d", thread_idx, core_id, completed_task_id);
 
-                int completed_task_id = pending_task_ids_[core_id];
-                int prev_running_id = running_task_ids_[core_id];
-
-                // Profiling: when prev_running_id exists, its AICore record was
-                // written first (at records[count]), so complete it BEFORE the
-                // pending task's record to maintain buffer ordering.
-                if (profiling_enabled) {
-                    uint64_t finish_ts = get_sys_cnt_aicpu();
-                    PerfBuffer *perf_buf = reinterpret_cast<PerfBuffer *>(h->perf_records_addr);
-
-                    if (prev_running_id != AICPU_TASK_INVALID) {
-                        Task *prev_task = &runtime.tasks[prev_running_id];
-                        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                        for (int i = 0; i < prev_task->fanout_count; i++) {
-                            fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
-                        }
-                        if (perf_aicpu_complete_record(
-                                perf_buf, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
-                            ) != 0) {
-                            DEV_ERROR(
-                                "Core %d: perf_aicpu_complete_record failed for implicit task %d", core_id,
-                                prev_running_id
-                            );
-                        }
-                        dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-                    }
-
-                    finish_ts = get_sys_cnt_aicpu();
-                    Task *task = &runtime.tasks[completed_task_id];
-                    uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                    for (int i = 0; i < task->fanout_count; i++) {
-                        fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
-                    }
-                    if (perf_aicpu_complete_record(
-                            perf_buf, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
-                        ) != 0) {
-                        DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task %d", core_id, completed_task_id);
-                    }
-                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-                }
-
-                cur_thread_completed++;
-                completed_tasks_.fetch_add(1, std::memory_order_release);
-
-                pending_task_ids_[core_id] = AICPU_TASK_INVALID;
-                running_task_ids_[core_id] = AICPU_TASK_INVALID;
-
-                // Try dispatch BEFORE resolve_dependencies
-                // This allows the core to start next task immediately
-                bool dispatched = false;
-                if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
-                    dispatched = try_dispatch_task(
-                        core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                        cur_aic_ready_count, profiling_enabled, runtime
-                    );
-                } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
-                    dispatched = try_dispatch_task(
-                        core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                        cur_aiv_ready_count, profiling_enabled, runtime
-                    );
-                }
-
-                // Resolve old running task dependencies (if exists)
-                // When pending task FINs directly, the running task was implicitly
-                // completed (AICore overwrote COND before we could read its FIN).
-                // Count it here to avoid losing completion.
-                if (prev_running_id != AICPU_TASK_INVALID) {
-                    cur_thread_completed++;
-                    completed_tasks_.fetch_add(1, std::memory_order_release);
-
-                    Task *prev_running_task = runtime.get_task(prev_running_id);
-                    resolve_task_dependencies(
-                        prev_running_task, runtime, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
-                        cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
-                    );
-
-                    LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
-                }
-
-                Task *task = runtime.get_task(completed_task_id);
-                resolve_task_dependencies(
-                    task, runtime, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count, cur_ready_queue_aiv,
-                    cur_aiv_tail, cur_aiv_ready_count
-                );
-
-                made_progress = true;
-
-                // Update timestamp if didn't dispatch (try_dispatch_task updates it if dispatched)
-                if (!dispatched && profiling_enabled) {
-                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-                }
-            } else if (reg_task_id == pending_task_ids_[core_id] && reg_state == TASK_ACK_STATE) {
-                // Case 2: Pending task received ACK
-                LOG_INFO(
-                    "Thread %d: Core %d ACKed task %d (running_id=%d)", thread_idx, core_id, pending_task_ids_[core_id],
-                    running_task_ids_[core_id]
-                );
-
-                int prev_running_id = running_task_ids_[core_id];
-
-                // Move pending to running
-                running_task_ids_[core_id] = pending_task_ids_[core_id];
-                pending_task_ids_[core_id] = AICPU_TASK_INVALID;
-                made_progress = true;
-
-                // When pending task ACKs, the old running task was implicitly
-                // completed (AICore overwrote COND before we could read its FIN).
-                // Count it here to avoid losing completion.
-                if (prev_running_id != AICPU_TASK_INVALID) {
-                    // Profiling: complete the implicit task's AICore record
                     if (profiling_enabled) {
                         uint64_t finish_ts = get_sys_cnt_aicpu();
                         PerfBuffer *perf_buf = reinterpret_cast<PerfBuffer *>(h->perf_records_addr);
-                        Task *prev_task = &runtime.tasks[prev_running_id];
+                        Task *task = &runtime.tasks[completed_task_id];
                         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                        for (int i = 0; i < prev_task->fanout_count; i++) {
-                            fanout_arr[i] = static_cast<uint64_t>(prev_task->fanout[i]);
+                        for (int fi = 0; fi < task->fanout_count; fi++) {
+                            fanout_arr[fi] = static_cast<uint64_t>(task->fanout[fi]);
                         }
                         if (perf_aicpu_complete_record(
-                                perf_buf, static_cast<uint32_t>(prev_running_id),
-                                static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
+                                perf_buf, static_cast<uint32_t>(completed_task_id),
+                                static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
+                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
                             ) != 0) {
                             DEV_ERROR(
-                                "Core %d: perf_aicpu_complete_record failed for implicit task %d", core_id,
-                                prev_running_id
+                                "Core %d: perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
                             );
                         }
                         dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
@@ -757,80 +637,19 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                     cur_thread_completed++;
                     completed_tasks_.fetch_add(1, std::memory_order_release);
+                    pending_task_ids_[core_id] = AICPU_TASK_INVALID;
 
-                    Task *prev_running_task = runtime.get_task(prev_running_id);
+                    Task *task = runtime.get_task(completed_task_id);
                     resolve_task_dependencies(
-                        prev_running_task, runtime, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
-                        cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
+                        task, runtime, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count, cur_ready_queue_aiv,
+                        cur_aiv_tail, cur_aiv_ready_count
                     );
 
-                    LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
-                }
-
-                // Core can accept new task now (pipeline!)
-                // Continue to Case 4 to dispatch next task
-            } else if (reg_task_id == running_task_ids_[core_id] && reg_state == TASK_FIN_STATE) {
-                // Case 3: Running task finished
-                LOG_INFO(
-                    "Thread %d: Core %d completed task %d (pending_id=%d)", thread_idx, core_id,
-                    running_task_ids_[core_id], pending_task_ids_[core_id]
-                );
-
-                int completed_task_id = running_task_ids_[core_id];
-
-                if (profiling_enabled) {
-                    uint64_t finish_ts = get_sys_cnt_aicpu();
-                    PerfBuffer *perf_buf = reinterpret_cast<PerfBuffer *>(h->perf_records_addr);
-                    Task *task = &runtime.tasks[completed_task_id];
-                    uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-                    for (int i = 0; i < task->fanout_count; i++) {
-                        fanout_arr[i] = static_cast<uint64_t>(task->fanout[i]);
-                    }
-                    if (perf_aicpu_complete_record(
-                            perf_buf, static_cast<uint32_t>(completed_task_id),
-                            static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
-                        ) != 0) {
-                        DEV_ERROR("Core %d: perf_aicpu_complete_record failed for task %d", core_id, completed_task_id);
-                    }
-                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
-                }
-
-                cur_thread_completed++;
-                completed_tasks_.fetch_add(1, std::memory_order_release);
-
-                running_task_ids_[core_id] = AICPU_TASK_INVALID;
-
-                bool dispatched = false;
-                if (pending_task_ids_[core_id] == AICPU_TASK_INVALID) {
-                    if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
-                        dispatched = try_dispatch_task(
-                            core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
-                            cur_aic_ready_count, profiling_enabled, runtime
-                        );
-                    } else if (h->core_type == CoreType::AIV && cur_aiv_ready_count > 0) {
-                        dispatched = try_dispatch_task(
-                            core_id, reg_addr, CoreType::AIV, thread_idx, cur_ready_queue_aiv, cur_aiv_head,
-                            cur_aiv_ready_count, profiling_enabled, runtime
-                        );
-                    }
-                }
-
-                Task *task = runtime.get_task(completed_task_id);
-                resolve_task_dependencies(
-                    task, runtime, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count, cur_ready_queue_aiv,
-                    cur_aiv_tail, cur_aiv_ready_count
-                );
-
-                made_progress = true;
-
-                // Update timestamp if didn't dispatch (try_dispatch_task updates it if dispatched)
-                if (!dispatched && profiling_enabled) {
-                    dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
+                    made_progress = true;
                 }
             }
 
-            // Case 4: Dispatch new task if pending slot is available
+            // --- Dispatch: send next ready task if core is free ---
             if (pending_task_ids_[core_id] == AICPU_TASK_INVALID) {
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                     if (try_dispatch_task(
@@ -899,18 +718,16 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
             for (int i = 0; i < core_num; i++) {
                 int core_id = cur_thread_cores[i];
-                if (pending_task_ids_[core_id] != AICPU_TASK_INVALID ||
-                    running_task_ids_[core_id] != AICPU_TASK_INVALID) {
+                if (pending_task_ids_[core_id] != AICPU_TASK_INVALID) {
                     all_cores_idle = false;
 
                     if (verification_warning_count == 0) {
                         uint64_t reg_addr = core_id_to_reg_addr_[core_id];
                         uint64_t reg_val = read_reg(reg_addr, RegId::COND);
                         LOG_WARN(
-                            "Thread %d: Counter reached %d/%d but core %d still has work (COND=0x%lx, pending_id=%d, "
-                            "running_id=%d)",
+                            "Thread %d: Counter reached %d/%d but core %d still has work (COND=0x%lx, pending_id=%d)",
                             thread_idx, completed_tasks_.load(std::memory_order_acquire), task_count, core_id, reg_val,
-                            pending_task_ids_[core_id], running_task_ids_[core_id]
+                            pending_task_ids_[core_id]
                         );
                     }
                     break;
@@ -1021,7 +838,6 @@ void AicpuExecutor::deinit(Runtime *runtime) {
         dispatch_timestamps_[i] = 0;
         core_dispatch_counts_[i] = 0;
         pending_task_ids_[i] = AICPU_TASK_INVALID;
-        running_task_ids_[i] = AICPU_TASK_INVALID;
         core_first_dispatch_[i] = true;
     }
 
@@ -1100,29 +916,17 @@ void AicpuExecutor::diagnose_stuck_state(
         int reg_state = EXTRACT_TASK_STATE(reg_val);
 
         int pending_id = pending_task_ids_[core_id];
-        int running_id = running_task_ids_[core_id];
 
-        if (pending_id != AICPU_TASK_INVALID || running_id != AICPU_TASK_INVALID) {
+        if (pending_id != AICPU_TASK_INVALID) {
             busy_cores++;
 
-            if (pending_id != AICPU_TASK_INVALID) {
-                Task *task = runtime.get_task(pending_id);
-                LOG_ERROR(
-                    "  Core %d [%s, PENDING]: COND=0x%lx (reg_task_id=%d, reg_state=%d), pending_id=%d, func_id=%d, "
-                    "fanin=%d, fanout=%d",
-                    core_id, core_type_str, reg_val, reg_task_id, reg_state, task->task_id, task->func_id,
-                    task->fanin.load(std::memory_order_acquire), task->fanout_count
-                );
-            }
-            if (running_id != AICPU_TASK_INVALID) {
-                Task *task = runtime.get_task(running_id);
-                LOG_ERROR(
-                    "  Core %d [%s, RUNNING]: COND=0x%lx (reg_task_id=%d, reg_state=%d), running_id=%d, func_id=%d, "
-                    "fanin=%d, fanout=%d",
-                    core_id, core_type_str, reg_val, reg_task_id, reg_state, task->task_id, task->func_id,
-                    task->fanin.load(std::memory_order_acquire), task->fanout_count
-                );
-            }
+            Task *task = runtime.get_task(pending_id);
+            LOG_ERROR(
+                "  Core %d [%s, PENDING]: COND=0x%lx (reg_task_id=%d, reg_state=%d), pending_id=%d, func_id=%d, "
+                "fanin=%d, fanout=%d",
+                core_id, core_type_str, reg_val, reg_task_id, reg_state, task->task_id, task->func_id,
+                task->fanin.load(std::memory_order_acquire), task->fanout_count
+            );
         } else {
             idle_cores++;
         }
