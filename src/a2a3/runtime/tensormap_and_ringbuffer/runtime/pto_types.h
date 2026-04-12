@@ -33,6 +33,7 @@
 #endif
 
 #include "pto_submit_types.h"  // NOLINT(build/include_subdir) -- PTO2LaunchSpec
+#include "pto_cq_types.h"      // NOLINT(build/include_subdir)
 #include "task_args.h"         // NOLINT(build/include_subdir) -- TaskArgs base class
 #include "tensor.h"            // NOLINT(build/include_subdir)
 #include "tensor_arg.h"        // NOLINT(build/include_subdir) -- canonical TensorArgType definition
@@ -43,6 +44,54 @@
 #define PTO2_MAX_OUTPUTS 16  // Maximum outputs per task
 #define PTO2_MAX_INPUTS 16   // Maximum inputs per task
 #define PTO2_MAX_INOUTS 8    // Maximum in-out args per task
+#define PTO2_MAX_COMPLETIONS_PER_TASK PTO2_CQ_MAX_ENTRIES
+
+typedef enum {
+    PTO2_ASYNC_ENGINE_SDMA = 0,
+    PTO2_ASYNC_ENGINE_ROCE = 1,
+    PTO2_ASYNC_ENGINE_URMA = 2,
+    PTO2_ASYNC_ENGINE_CCU = 3,
+    PTO2_NUM_ASYNC_ENGINES = 4
+} PTO2AsyncEngine;
+
+/**
+ * Runtime-level async capabilities exposed to orchestration.
+ *
+ * These are semantic capabilities, not hard-coded hardware backends.
+ * A platform may implement the same capability with different engines.
+ */
+enum class PTO2AsyncCapability : uint32_t {
+    REMOTE_COPY = 0,
+};
+
+/**
+ * Host-side initialization result for an async capability context.
+ */
+enum class PTO2AsyncContextInitStatus : int32_t {
+    ERROR = -1,
+    SKIPPED = 0,
+    READY = 1,
+};
+
+inline constexpr PTO2AsyncEngine pto2_async_capability_default_engine(PTO2AsyncCapability capability) {
+    switch (capability) {
+        case PTO2AsyncCapability::REMOTE_COPY:
+            return PTO2_ASYNC_ENGINE_SDMA;
+    }
+    return PTO2_ASYNC_ENGINE_SDMA;
+}
+
+inline constexpr const char *pto2_async_capability_name(PTO2AsyncCapability capability) {
+    switch (capability) {
+        case PTO2AsyncCapability::REMOTE_COPY:
+            return "REMOTE_COPY";
+    }
+    return "UNKNOWN";
+}
+
+enum class PTO2CompletionType : int32_t {
+    COUNTER = 0,
+};
 
 // =============================================================================
 // Task Output Tensors (return value from submit)
@@ -130,11 +179,24 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
     bool has_error{false};
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
+    bool complete_in_future{false};
+    uint64_t cq_addr{0};
+
+    template <typename T>
+    static uint64_t pack_scalar(T value) {
+        static_assert(sizeof(T) <= sizeof(uint64_t), "pack_scalar: type must fit in 8 bytes");
+        static_assert(std::is_trivially_copyable_v<T>, "pack_scalar: type must be trivially copyable");
+        uint64_t packed = 0;
+        memcpy(&packed, &value, sizeof(T));
+        return packed;
+    }
 
     void reset() {
         clear();
         has_error = false;
         error_msg = nullptr;
+        complete_in_future = false;
+        cq_addr = 0;
     }
 
     void set_error(const char *msg) {
@@ -223,7 +285,7 @@ struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, Ten
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
-        scalars_[scalar_count_++] = to_u64(value);
+        scalars_[scalar_count_++] = pack_scalar(value);
     }
 
     void add_scalars(const uint64_t *values, int count) {

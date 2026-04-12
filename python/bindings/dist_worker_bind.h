@@ -26,6 +26,7 @@
 #include <stdexcept>
 
 #include "dist_chip_process.h"
+#include "dist_chip_bootstrap_channel.h"
 #include "dist_orchestrator.h"
 #include "dist_sub_worker.h"
 #include "dist_types.h"
@@ -49,6 +50,19 @@ inline void bind_dist_worker(nb::module_ &m) {
         .value("RUNNING", TaskState::RUNNING)
         .value("COMPLETED", TaskState::COMPLETED)
         .value("CONSUMED", TaskState::CONSUMED);
+
+    nb::class_<DistTensorKey>(m, "DistTensorKey")
+        .def(nb::init<>())
+        .def(
+            "__init__",
+            [](DistTensorKey *self, uint64_t base_ptr, int32_t worker_index) {
+                new (self) DistTensorKey{worker_index, base_ptr};
+            },
+            nb::arg("base_ptr"),
+            nb::arg("worker_index") = -1
+        )
+        .def_rw("worker_index", &DistTensorKey::worker_index)
+        .def_rw("base_ptr", &DistTensorKey::base_ptr);
 
     // --- WorkerPayload ---
     nb::class_<WorkerPayload>(m, "WorkerPayload")
@@ -85,12 +99,35 @@ inline void bind_dist_worker(nb::module_ &m) {
         .def(nb::init<>())
         .def(
             "__init__",
-            [](DistInputSpec *self, uint64_t base_ptr) {
-                new (self) DistInputSpec{base_ptr};
+            [](DistInputSpec *self, uint64_t base_ptr, int32_t worker_index) {
+                new (self) DistInputSpec{DistTensorKey{worker_index, base_ptr}};
             },
-            nb::arg("base_ptr")
+            nb::arg("base_ptr"),
+            nb::arg("worker_index") = -1
         )
-        .def_rw("base_ptr", &DistInputSpec::base_ptr);
+        .def_rw("key", &DistInputSpec::key)
+        .def_prop_rw(
+            "base_ptr",
+            [](const DistInputSpec &self) {
+                return self.key.base_ptr;
+            },
+            [](DistInputSpec &self, uint64_t base_ptr) {
+                self.key.base_ptr = base_ptr;
+            }
+        )
+        .def_prop_rw(
+            "worker_index",
+            [](const DistInputSpec &self) {
+                return self.key.worker_index;
+            },
+            [](DistInputSpec &self, int32_t worker_index) {
+                self.key.worker_index = worker_index;
+            }
+        );
+
+    nb::enum_<DistOutputOwnership>(m, "DistOutputOwnership")
+        .value("ALLOCATED", DistOutputOwnership::ALLOCATED)
+        .value("EXTERNAL", DistOutputOwnership::EXTERNAL);
 
     // --- DistOutputSpec ---
     nb::class_<DistOutputSpec>(m, "DistOutputSpec")
@@ -98,11 +135,54 @@ inline void bind_dist_worker(nb::module_ &m) {
         .def(
             "__init__",
             [](DistOutputSpec *self, size_t size) {
-                new (self) DistOutputSpec{size};
+                new (self) DistOutputSpec{DistOutputOwnership::ALLOCATED, size, DistTensorKey{}, nullptr};
             },
             nb::arg("size")
         )
-        .def_rw("size", &DistOutputSpec::size);
+        .def_static(
+            "external",
+            [](uint64_t ptr, size_t size, int32_t worker_index) {
+                DistOutputSpec spec;
+                spec.ownership = DistOutputOwnership::EXTERNAL;
+                spec.size = size;
+                spec.key = DistTensorKey{worker_index, ptr};
+                spec.external_ptr = reinterpret_cast<void *>(ptr);
+                return spec;
+            },
+            nb::arg("ptr"),
+            nb::arg("size"),
+            nb::arg("worker_index") = -1
+        )
+        .def_rw("ownership", &DistOutputSpec::ownership)
+        .def_rw("size", &DistOutputSpec::size)
+        .def_rw("key", &DistOutputSpec::key)
+        .def_prop_rw(
+            "base_ptr",
+            [](const DistOutputSpec &self) {
+                return self.key.base_ptr;
+            },
+            [](DistOutputSpec &self, uint64_t base_ptr) {
+                self.key.base_ptr = base_ptr;
+            }
+        )
+        .def_prop_rw(
+            "worker_index",
+            [](const DistOutputSpec &self) {
+                return self.key.worker_index;
+            },
+            [](DistOutputSpec &self, int32_t worker_index) {
+                self.key.worker_index = worker_index;
+            }
+        )
+        .def_prop_rw(
+            "ptr",
+            [](const DistOutputSpec &self) {
+                return reinterpret_cast<uint64_t>(self.external_ptr);
+            },
+            [](DistOutputSpec &self, uint64_t ptr) {
+                self.external_ptr = reinterpret_cast<void *>(ptr);
+            }
+        );
 
     // --- DistSubmitOutput ---
     nb::class_<DistSubmitOutput>(m, "DistSubmitOutput")
@@ -143,6 +223,36 @@ inline void bind_dist_worker(nb::module_ &m) {
 
     // Python can use this constant to allocate mailboxes of the right size.
     m.attr("DIST_SUB_MAILBOX_SIZE") = static_cast<int>(DIST_SUB_MAILBOX_SIZE);
+
+    nb::enum_<ChipBootstrapMailboxState>(m, "ChipBootstrapMailboxState")
+        .value("IDLE", ChipBootstrapMailboxState::IDLE)
+        .value("SUCCESS", ChipBootstrapMailboxState::SUCCESS)
+        .value("ERROR", ChipBootstrapMailboxState::ERROR);
+
+    nb::class_<DistChipBootstrapChannel>(m, "DistChipBootstrapChannel")
+        .def(
+            "__init__",
+            [](DistChipBootstrapChannel *self, uint64_t mailbox_ptr, size_t max_buffer_count) {
+                new (self) DistChipBootstrapChannel(reinterpret_cast<void *>(mailbox_ptr), max_buffer_count);
+            },
+            nb::arg("mailbox_ptr"), nb::arg("max_buffer_count"),
+            "Wrap a chip-bootstrap mailbox pointer. max_buffer_count must match the bootstrap buffer list length."
+        )
+        .def("reset", &DistChipBootstrapChannel::reset)
+        .def(
+            "write_success", &DistChipBootstrapChannel::write_success, nb::arg("device_ctx"), nb::arg("local_window_base"),
+            nb::arg("actual_window_size"), nb::arg("buffer_ptrs")
+        )
+        .def("write_error", &DistChipBootstrapChannel::write_error, nb::arg("error_code"), nb::arg("message"))
+        .def_prop_ro("state", &DistChipBootstrapChannel::state)
+        .def_prop_ro("error_code", &DistChipBootstrapChannel::error_code)
+        .def_prop_ro("device_ctx", &DistChipBootstrapChannel::device_ctx)
+        .def_prop_ro("local_window_base", &DistChipBootstrapChannel::local_window_base)
+        .def_prop_ro("actual_window_size", &DistChipBootstrapChannel::actual_window_size)
+        .def_prop_ro("buffer_ptrs", &DistChipBootstrapChannel::buffer_ptrs)
+        .def_prop_ro("error_message", &DistChipBootstrapChannel::error_message);
+
+    m.attr("DIST_CHIP_BOOTSTRAP_MAILBOX_SIZE") = static_cast<int>(DIST_CHIP_BOOTSTRAP_MAILBOX_SIZE);
 
     // --- DistChipProcess ---
     // Fork + host_runtime.so init are managed from Python (Worker.__init__).

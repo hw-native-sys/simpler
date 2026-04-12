@@ -83,6 +83,9 @@
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT 100
+#define PTO2_ERROR_ASYNC_COMPLETION_INVALID 101
+#define PTO2_ERROR_ASYNC_WAIT_OVERFLOW 102
+#define PTO2_ERROR_ASYNC_REGISTRATION_FAILED 103
 
 // =============================================================================
 // Configuration Constants
@@ -367,6 +370,10 @@ struct PTO2TaskPayload {
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 35-50 (1024B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
+    // Async/deferred-completion metadata. Kept after tensors/scalars so the
+    // existing hot-path tensor/scalar layout stays unchanged.
+    bool complete_in_future{false};
+    uint64_t cq_addr{0};
 
     // Layout verification (size checks that don't need offsetof).
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
@@ -386,6 +393,8 @@ struct PTO2TaskPayload {
     init(const Arg &args, TaskOutputTensors &result, void *base_addr, uint64_t offsets[], uint64_t buffer_sizes[]) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
+        complete_in_future = args.complete_in_future;
+        cq_addr = args.cq_addr;
 
         // int32_t out_idx = 0;
         for (int32_t i = 0; i < args.tensor_count(); i++) {

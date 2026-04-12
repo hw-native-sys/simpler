@@ -23,11 +23,21 @@
 
 constexpr int CONTINUOUS_TENSOR_MAX_DIMS = 5;
 
+enum class TensorStorageType : uint8_t {
+    HOST = 0,    // data points to host memory; runtime performs H2D before execution
+    DEVICE = 1,  // data already points to device/window memory valid in the target chip context
+};
+
 struct ContinuousTensor {
     uint64_t data;                                // Host/device memory address
     uint32_t shapes[CONTINUOUS_TENSOR_MAX_DIMS];  // Shape per dim (element count)
     uint32_t ndims;                               // Number of dimensions (1..5)
     DataType dtype;                               // DataType : uint8_t
+    // Storage kind tells the host runtime whether this tensor needs the usual
+    // device_malloc + copy_to_device path, or whether the pointer can be reused
+    // directly as an external device/window buffer.
+    TensorStorageType storage{TensorStorageType::HOST};
+    uint8_t reserved[6]{};
 
     [[nodiscard]] uint64_t nbytes() const {
         uint64_t total = 1;
@@ -35,6 +45,8 @@ struct ContinuousTensor {
             total *= shapes[i];
         return total * get_element_size(dtype);
     }
+
+    [[nodiscard]] bool is_device_resident() const { return storage == TensorStorageType::DEVICE; }
 
     template <typename T>
     T *data_as() const {

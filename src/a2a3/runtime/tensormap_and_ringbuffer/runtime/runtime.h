@@ -29,6 +29,8 @@
 #ifndef SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
 #define SRC_A2A3_RUNTIME_TENSORMAP_AND_RINGBUFFER_RUNTIME_RUNTIME_H_
 
+#define PTO2_RUNTIME_HAS_ASYNC_HOST_API 1
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>   // for fprintf, printf
@@ -38,6 +40,7 @@
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
+#include "pto_types.h"
 #include "task_args.h"
 
 // =============================================================================
@@ -125,6 +128,8 @@ struct HostApi {
     int (*copy_from_device)(void *host_ptr, const void *dev_ptr, size_t size);
     uint64_t (*upload_kernel_binary)(int func_id, const uint8_t *bin_data, size_t bin_size);
     void (*remove_kernel_binary)(int func_id);
+    PTO2AsyncContextInitStatus (*init_async_context)(PTO2AsyncCapability capability, uint64_t *addr);
+    void (*destroy_async_context)(PTO2AsyncCapability capability, uint64_t addr);
 };
 
 /**
@@ -193,6 +198,7 @@ private:  // NOLINT(whitespace/indent)
     void *pto2_gm_sm_ptr_;                   // GM pointer to PTO2 shared memory (device)
     void *pto2_gm_heap_ptr_;                 // GM heap for orchestrator output buffers (device)
     void *pto2_slot_states_ptr_;             // Pointer to PTO2TaskSlotState array (scheduler-private, for profiling)
+    uint64_t async_context_addrs_[PTO2_NUM_ASYNC_ENGINES];
     ChipStorageTaskArgs orch_args_storage_;  // Copy of args for device
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)
@@ -246,6 +252,8 @@ public:  // NOLINT(whitespace/indent)
     void set_pto2_gm_sm_ptr(void *p);
     void set_pto2_gm_heap(void *p);
     void set_pto2_slot_states_ptr(void *p);
+    void set_async_context_addr(PTO2AsyncEngine engine, uint64_t addr);
+    uint64_t get_async_context_addr(PTO2AsyncEngine engine) const;
     void set_orch_args(const ChipStorageTaskArgs &args);
 
     // Device orchestration SO binary (for dlopen on AICPU thread 3)

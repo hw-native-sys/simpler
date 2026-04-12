@@ -49,11 +49,19 @@
 // ---------------------------------------------------------------------------
 
 struct DistInputSpec {
-    uint64_t base_ptr;  // tensor base address for TensorMap lookup
+    DistTensorKey key;
+};
+
+enum class DistOutputOwnership : int32_t {
+    ALLOCATED = 0,
+    EXTERNAL = 1,
 };
 
 struct DistOutputSpec {
-    size_t size;  // bytes to allocate for this output
+    DistOutputOwnership ownership{DistOutputOwnership::ALLOCATED};
+    size_t size{0};
+    DistTensorKey key{};
+    void *external_ptr{nullptr};
 };
 
 struct DistSubmitOutput {

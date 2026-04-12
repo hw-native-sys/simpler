@@ -11,16 +11,16 @@
 
 #include "dist_tensormap.h"
 
-DistTaskSlot DistTensorMap::lookup(uint64_t base_ptr) const {
-    auto it = map_.find(base_ptr);
+DistTaskSlot DistTensorMap::lookup(const DistTensorKey &key) const {
+    auto it = map_.find(key);
     if (it == map_.end()) return DIST_INVALID_SLOT;
     return it->second;
 }
 
-void DistTensorMap::insert(uint64_t base_ptr, DistTaskSlot producer) { map_[base_ptr] = producer; }
+void DistTensorMap::insert(const DistTensorKey &key, DistTaskSlot producer) { map_[key] = producer; }
 
-void DistTensorMap::erase_task_outputs(const std::vector<uint64_t> &keys) {
-    for (uint64_t key : keys)
+void DistTensorMap::erase_task_outputs(const std::vector<DistTensorKey> &keys) {
+    for (const DistTensorKey &key : keys)
         map_.erase(key);
 }
 

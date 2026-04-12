@@ -47,6 +47,7 @@ Runtime::Runtime() {
     pto2_gm_sm_ptr_ = nullptr;
     pto2_gm_heap_ptr_ = nullptr;
     pto2_slot_states_ptr_ = nullptr;
+    memset(async_context_addrs_, 0, sizeof(async_context_addrs_));
     orch_args_storage_.clear();
 
     // Initialize device orchestration SO binary
@@ -95,6 +96,17 @@ void Runtime::set_orch_built_on_host(bool v) { orch_built_on_host_ = v; }
 void Runtime::set_pto2_gm_sm_ptr(void *p) { pto2_gm_sm_ptr_ = p; }
 void Runtime::set_pto2_gm_heap(void *p) { pto2_gm_heap_ptr_ = p; }
 void Runtime::set_pto2_slot_states_ptr(void *p) { pto2_slot_states_ptr_ = p; }
+void Runtime::set_async_context_addr(PTO2AsyncEngine engine, uint64_t addr) {
+    if (engine < PTO2_NUM_ASYNC_ENGINES) {
+        async_context_addrs_[engine] = addr;
+    }
+}
+uint64_t Runtime::get_async_context_addr(PTO2AsyncEngine engine) const {
+    if (engine < PTO2_NUM_ASYNC_ENGINES) {
+        return async_context_addrs_[engine];
+    }
+    return 0;
+}
 void Runtime::set_orch_args(const ChipStorageTaskArgs &args) { orch_args_storage_ = args; }
 
 // Device orchestration SO binary (for dlopen on AICPU thread 3)

@@ -67,6 +67,8 @@ typedef struct PTO2Runtime PTO2Runtime;  // forward declare for ops signatures
 
 struct PTO2RuntimeOps {
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    uint64_t (*get_async_context)(PTO2Runtime *rt, PTO2AsyncEngine engine);
+    uint64_t (*alloc_cq)(PTO2Runtime *rt);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
@@ -110,6 +112,14 @@ struct PTO2Runtime {
 
     // Mode
     PTO2RuntimeMode mode;
+
+    // Per-engine async context addresses (0 = not available).
+    uint64_t async_context_addrs[PTO2_NUM_ASYNC_ENGINES]{};
+
+    // Per-task completion queues for deferred completion.
+    PTO2CompletionQueue *cq_pool{nullptr};
+    int32_t cq_pool_size{0};
+    int32_t cq_pool_next{0};
 
     // Statistics
     int64_t total_cycles;

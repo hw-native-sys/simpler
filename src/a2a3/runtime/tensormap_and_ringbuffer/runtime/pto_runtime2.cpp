@@ -18,6 +18,7 @@
  */
 
 #include "pto_runtime2.h"
+#include "pto_async_wait.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,21 @@ static TaskOutputTensors submit_task_impl(PTO2Runtime *rt, const MixedKernels &m
 
 static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
     return pto2_alloc_tensors(&rt->orchestrator, args);
+}
+
+static uint64_t get_async_context_impl(PTO2Runtime *rt, PTO2AsyncEngine engine) {
+    if (engine >= PTO2_NUM_ASYNC_ENGINES) return 0;
+    return rt->async_context_addrs[engine];
+}
+
+static uint64_t alloc_cq_impl(PTO2Runtime *rt) {
+    if (!rt->cq_pool || rt->cq_pool_next >= rt->cq_pool_size) {
+        return 0;
+    }
+    int32_t idx = rt->cq_pool_next++;
+    PTO2CompletionQueue *cq = &rt->cq_pool[idx];
+    memset(cq, 0, sizeof(PTO2CompletionQueue));
+    return reinterpret_cast<uint64_t>(cq);
 }
 
 void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrator); }
@@ -181,6 +197,8 @@ void pto2_set_tensor_data(
 
 static const PTO2RuntimeOps s_runtime_ops = {
     .submit_task = submit_task_impl,
+    .get_async_context = get_async_context_impl,
+    .alloc_cq = alloc_cq_impl,
     .scope_begin = pto2_rt_scope_begin,
     .scope_end = pto2_rt_scope_end,
     .orchestration_done = pto2_rt_orchestration_done,
@@ -259,6 +277,10 @@ PTO2Runtime *pto2_runtime_create_custom(
     // Connect orchestrator to scheduler (for simulated mode)
     pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
 
+    rt->cq_pool_size = PTO2_MAX_ASYNC_WAITS;
+    rt->cq_pool = static_cast<PTO2CompletionQueue *>(calloc(rt->cq_pool_size, sizeof(PTO2CompletionQueue)));
+    rt->cq_pool_next = 0;
+
     return rt;
 }
 
@@ -292,6 +314,10 @@ PTO2Runtime *pto2_runtime_create_from_sm(
 
     pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
 
+    rt->cq_pool_size = PTO2_MAX_ASYNC_WAITS;
+    rt->cq_pool = static_cast<PTO2CompletionQueue *>(calloc(rt->cq_pool_size, sizeof(PTO2CompletionQueue)));
+    rt->cq_pool_next = 0;
+
     return rt;
 }
 
@@ -309,6 +335,7 @@ void pto2_runtime_destroy(PTO2Runtime *rt) {
         pto2_sm_destroy(rt->sm_handle);
     }
 
+    free(rt->cq_pool);
     free(rt);
 }
 

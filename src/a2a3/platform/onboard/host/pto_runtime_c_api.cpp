@@ -20,12 +20,20 @@
 #include "callable.h"
 #include "task_args.h"
 
+#include <cstdlib>
 #include <pthread.h>
 #include <vector>
 
 #include "common/unified_log.h"
 #include "device_runner.h"  // NOLINT(build/include_subdir)
 #include "runtime.h"        // NOLINT(build/include_subdir)
+
+#if __has_include("pto/npu/comm/async/sdma/sdma_workspace_manager.hpp") && __has_include("acl/acl.h")
+#include "pto/npu/comm/async/sdma/sdma_workspace_manager.hpp"
+#define PTO2_PLATFORM_HAS_SDMA_WORKSPACE_MANAGER 1
+#else
+#define PTO2_PLATFORM_HAS_SDMA_WORKSPACE_MANAGER 0
+#endif
 
 extern "C" {
 
@@ -96,6 +104,61 @@ static void remove_kernel_binary_wrapper(int func_id) {
     } catch (...) {}
 }
 
+static bool env_flag_enabled(const char *primary_name, const char *legacy_name) {
+    const char *value = std::getenv(primary_name);
+    if (value == nullptr && legacy_name != nullptr) {
+        value = std::getenv(legacy_name);
+    }
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+#ifdef PTO2_RUNTIME_HAS_ASYNC_HOST_API
+#if PTO2_PLATFORM_HAS_SDMA_WORKSPACE_MANAGER
+static pto::comm::sdma::SdmaWorkspaceManager &sdma_workspace_manager() {
+    static pto::comm::sdma::SdmaWorkspaceManager manager;
+    return manager;
+}
+#endif
+
+static PTO2AsyncContextInitStatus init_async_context(PTO2AsyncCapability capability, uint64_t *addr) {
+    if (addr == nullptr) {
+        return PTO2AsyncContextInitStatus::ERROR;
+    }
+    *addr = 0;
+
+    switch (capability) {
+        case PTO2AsyncCapability::REMOTE_COPY:
+#if PTO2_PLATFORM_HAS_SDMA_WORKSPACE_MANAGER
+            if (!env_flag_enabled("PTO2_ENABLE_REMOTE_COPY_ASYNC", "PTO2_ENABLE_SDMA")) {
+                return PTO2AsyncContextInitStatus::SKIPPED;
+            }
+            if (!sdma_workspace_manager().Init()) {
+                return PTO2AsyncContextInitStatus::ERROR;
+            }
+            *addr = reinterpret_cast<uint64_t>(sdma_workspace_manager().GetWorkspaceAddr());
+            return *addr != 0 ? PTO2AsyncContextInitStatus::READY : PTO2AsyncContextInitStatus::ERROR;
+#else
+            return PTO2AsyncContextInitStatus::SKIPPED;
+#endif
+    }
+
+    return PTO2AsyncContextInitStatus::SKIPPED;
+}
+
+static void destroy_async_context(PTO2AsyncCapability capability, uint64_t addr) {
+    (void)addr;
+    switch (capability) {
+        case PTO2AsyncCapability::REMOTE_COPY:
+#if PTO2_PLATFORM_HAS_SDMA_WORKSPACE_MANAGER
+            sdma_workspace_manager().Finalize();
+            break;
+#else
+            break;
+#endif
+    }
+}
+#endif
+
 /* ===========================================================================
  * Public C API (resolved by ChipWorker via dlsym)
  * =========================================================================== */
@@ -116,6 +179,40 @@ int set_device(DeviceContextHandle ctx, int device_id) {
     if (ctx == NULL) return -1;
     try {
         return static_cast<DeviceRunner *>(ctx)->ensure_device_set(device_id);
+    } catch (...) {
+        return -1;
+    }
+}
+
+void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
+    if (ctx == NULL) return NULL;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->allocate_tensor(size);
+    } catch (...) {
+        return NULL;
+    }
+}
+
+void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr) {
+    if (ctx == NULL || dev_ptr == NULL) return;
+    try {
+        static_cast<DeviceRunner *>(ctx)->free_tensor(dev_ptr);
+    } catch (...) {}
+}
+
+int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size) {
+    if (ctx == NULL || dev_ptr == NULL || host_ptr == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->copy_to_device(dev_ptr, host_ptr, size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size) {
+    if (ctx == NULL || host_ptr == NULL || dev_ptr == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->copy_from_device(host_ptr, dev_ptr, size);
     } catch (...) {
         return -1;
     }
@@ -142,6 +239,10 @@ int run_runtime(
         r->host_api.copy_from_device = copy_from_device;
         r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
         r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
+#ifdef PTO2_RUNTIME_HAS_ASYNC_HOST_API
+        r->host_api.init_async_context = init_async_context;
+        r->host_api.destroy_async_context = destroy_async_context;
+#endif
 
         LOG_DEBUG("About to call init_runtime_impl, r=%p", (void *)r);
         int rc = init_runtime_impl(

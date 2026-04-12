@@ -124,6 +124,15 @@ static_assert(
     "PTO2SharedMemoryHeader must be aligned to cache line (PTO2_ALIGN_SIZE)"
 );
 
+static inline void pto2_record_scheduler_error(
+    PTO2SharedMemoryHeader* header, int32_t thread_idx, int32_t error_code) {
+    if (header == nullptr) return;
+    header->sched_error_bitmap.fetch_or(1u << thread_idx, std::memory_order_acq_rel);
+    header->sched_error_code.store(error_code, std::memory_order_release);
+    header->sched_error_thread.store(thread_idx, std::memory_order_release);
+    header->orch_error_code.store(error_code, std::memory_order_release);
+}
+
 // =============================================================================
 // Shared Memory Handle
 // =============================================================================

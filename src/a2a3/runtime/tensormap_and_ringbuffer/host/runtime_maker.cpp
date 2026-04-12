@@ -69,6 +69,48 @@ static uint64_t parse_env_uint64(const char *name, uint64_t min_val, bool requir
     return static_cast<uint64_t>(val);
 }
 
+static void init_optional_async_context(Runtime *runtime, PTO2AsyncCapability capability) {
+    if (runtime == nullptr || runtime->host_api.init_async_context == nullptr) {
+        return;
+    }
+
+    uint64_t addr = 0;
+    PTO2AsyncContextInitStatus status = runtime->host_api.init_async_context(capability, &addr);
+    PTO2AsyncEngine engine = pto2_async_capability_default_engine(capability);
+
+    if (status == PTO2AsyncContextInitStatus::READY) {
+        runtime->set_async_context_addr(engine, addr);
+        LOG_INFO(
+            "%s async context initialized via platform backend: addr=0x%lx",
+            pto2_async_capability_name(capability), static_cast<unsigned long>(addr)
+        );
+        return;
+    }
+
+    runtime->set_async_context_addr(engine, 0);
+    if (status == PTO2AsyncContextInitStatus::ERROR) {
+        LOG_WARN(
+            "%s async context initialization failed, continuing without async backend support",
+            pto2_async_capability_name(capability)
+        );
+    }
+}
+
+static void destroy_optional_async_context(Runtime *runtime, PTO2AsyncCapability capability) {
+    if (runtime == nullptr || runtime->host_api.destroy_async_context == nullptr) {
+        return;
+    }
+
+    PTO2AsyncEngine engine = pto2_async_capability_default_engine(capability);
+    uint64_t addr = runtime->get_async_context_addr(engine);
+    if (addr == 0) {
+        return;
+    }
+
+    runtime->host_api.destroy_async_context(capability, addr);
+    runtime->set_async_context_addr(engine, 0);
+}
+
 /**
  * Initialize a pre-allocated runtime for device orchestration.
  *
@@ -135,6 +177,14 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
     int64_t t_args_start = _now_ms();
     for (int i = 0; i < tensor_count; i++) {
         ContinuousTensor t = orch_args->tensor(i);
+        if (t.is_device_resident()) {
+            // External/bootstrap-provided device buffers are already valid in the
+            // target chip context, so runtime_maker must preserve the pointer
+            // instead of allocating/copying a second device buffer.
+            LOG_INFO("  Tensor %d: reusing device-resident pointer %p (%zu bytes)", i, t.data_as<void>(), t.nbytes());
+            device_args.add_tensor(t);
+            continue;
+        }
 
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.data));
         size_t size = static_cast<size_t>(t.nbytes());
@@ -255,6 +305,8 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
     runtime->set_pto2_gm_sm_ptr(sm_ptr);
     runtime->record_tensor_pair(nullptr, sm_ptr, static_cast<size_t>(sm_size));
 
+    init_optional_async_context(runtime, PTO2AsyncCapability::REMOTE_COPY);
+
     // Set up device orchestration state
     runtime->set_orch_built_on_host(false);
     runtime->set_orch_args(device_args);
@@ -356,6 +408,7 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
 
     // Cleanup device tensors
     LOG_INFO("=== Cleaning Up ===");
+    destroy_optional_async_context(runtime, PTO2AsyncCapability::REMOTE_COPY);
     for (int i = 0; i < tensor_pair_count; i++) {
         if (tensor_pairs[i].dev_ptr != nullptr) {
             runtime->host_api.device_free(tensor_pairs[i].dev_ptr);

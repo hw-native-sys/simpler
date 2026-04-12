@@ -23,6 +23,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include "acl/acl.h"
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
@@ -638,9 +639,18 @@ int DeviceRunner::finalize() {
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 
+    int saved_device_id = device_id_;
     device_id_ = -1;
     worker_count_ = 0;
     aicore_kernel_binary_.clear();
+
+    // Reset device and finalize ACL AFTER all device memory is freed.
+    // This was previously done in comm_destroy, but that ran before the
+    // static DeviceRunner destructor, causing rtFree failures (107000).
+    if (saved_device_id >= 0) {
+        aclrtResetDevice(saved_device_id);
+        aclFinalize();
+    }
 
     LOG_INFO("DeviceRunner finalized");
     return 0;

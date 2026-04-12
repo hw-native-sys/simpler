@@ -74,6 +74,11 @@ NB_MODULE(_task_interface, m) {
 
     // --- Constants ---
     m.attr("CONTINUOUS_TENSOR_MAX_DIMS") = CONTINUOUS_TENSOR_MAX_DIMS;
+    m.attr("CHIP_STORAGE_TASK_ARGS_SIZE") = static_cast<int>(sizeof(ChipStorageTaskArgs));
+
+    nb::enum_<TensorStorageType>(m, "TensorStorageType")
+        .value("HOST", TensorStorageType::HOST)
+        .value("DEVICE", TensorStorageType::DEVICE);
 
     // --- ContinuousTensor ---
     nb::class_<ContinuousTensor>(m, "ContinuousTensor")
@@ -81,7 +86,7 @@ NB_MODULE(_task_interface, m) {
 
         .def_static(
             "make",
-            [](uint64_t data, nb::tuple shapes, DataType dtype) -> ContinuousTensor {
+            [](uint64_t data, nb::tuple shapes, DataType dtype, bool device_resident) -> ContinuousTensor {
                 size_t n = nb::len(shapes);
                 if (n > CONTINUOUS_TENSOR_MAX_DIMS)
                     throw std::invalid_argument("shapes length exceeds CONTINUOUS_TENSOR_MAX_DIMS");
@@ -89,11 +94,12 @@ NB_MODULE(_task_interface, m) {
                 arg.data = data;
                 arg.dtype = dtype;
                 arg.ndims = static_cast<uint32_t>(n);
+                arg.storage = device_resident ? TensorStorageType::DEVICE : TensorStorageType::HOST;
                 for (size_t i = 0; i < n; ++i)
                     arg.shapes[i] = nb::cast<uint32_t>(shapes[i]);
                 return arg;
             },
-            nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"),
+            nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("device_resident") = false,
             "Create a ContinuousTensor from a data pointer, shape tuple, and dtype."
         )
 
@@ -150,6 +156,16 @@ NB_MODULE(_task_interface, m) {
             }
         )
 
+        .def_prop_rw(
+            "device_resident",
+            [](const ContinuousTensor &self) -> bool {
+                return self.is_device_resident();
+            },
+            [](ContinuousTensor &self, bool device_resident) {
+                self.storage = device_resident ? TensorStorageType::DEVICE : TensorStorageType::HOST;
+            }
+        )
+
         .def(
             "nbytes",
             [](const ContinuousTensor &self) -> uint64_t {
@@ -165,7 +181,8 @@ NB_MODULE(_task_interface, m) {
                 if (i) os << ", ";
                 os << self.shapes[i];
             }
-            os << "), dtype=" << get_dtype_name(self.dtype) << ")";
+            os << "), dtype=" << get_dtype_name(self.dtype)
+               << ", device_resident=" << (self.is_device_resident() ? "True" : "False") << ")";
             return os.str();
         });
 
@@ -611,7 +628,17 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
-        .def_prop_ro("device_set", &ChipWorker::device_set);
+        .def_prop_ro("device_set", &ChipWorker::device_set)
+        .def("device_malloc", &ChipWorker::device_malloc, nb::arg("size"))
+        .def("device_free", &ChipWorker::device_free, nb::arg("dev_ptr"))
+        .def("copy_to_device", &ChipWorker::copy_to_device, nb::arg("dev_ptr"), nb::arg("host_ptr"), nb::arg("size"))
+        .def("copy_from_device", &ChipWorker::copy_from_device, nb::arg("host_ptr"), nb::arg("dev_ptr"), nb::arg("size"))
+        .def("comm_init", &ChipWorker::comm_init, nb::arg("rank"), nb::arg("nranks"), nb::arg("device_id"), nb::arg("rootinfo_path"))
+        .def("comm_alloc_windows", &ChipWorker::comm_alloc_windows, nb::arg("comm_handle"), nb::arg("win_size"))
+        .def("comm_get_local_window_base", &ChipWorker::comm_get_local_window_base, nb::arg("comm_handle"))
+        .def("comm_get_window_size", &ChipWorker::comm_get_window_size, nb::arg("comm_handle"))
+        .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"))
+        .def("comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"));
 
     bind_dist_worker(m);
 }

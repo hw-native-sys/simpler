@@ -46,6 +46,19 @@ static constexpr int32_t DIST_INVALID_SLOT = -1;
 
 using DistTaskSlot = int32_t;
 
+struct DistTensorKey {
+    // base_ptr alone is not a stable distributed identity: different workers may
+    // legally expose the same virtual address. Include worker_index so TensorMap
+    // can distinguish external buffers coming from different chip/sub-worker
+    // address spaces.
+    int32_t worker_index{-1};
+    uint64_t base_ptr{0};
+
+    bool operator==(const DistTensorKey &other) const {
+        return worker_index == other.worker_index && base_ptr == other.base_ptr;
+    }
+};
+
 // =============================================================================
 // WorkerType
 // =============================================================================
@@ -110,9 +123,10 @@ struct DistTaskSlotState {
     // --- Output buffers (malloced by orch, freed when CONSUMED) ---
     std::vector<void *> output_bufs;  // one entry per output
     std::vector<size_t> output_sizes;
+    std::vector<int32_t> output_ownerships;  // DistOutputOwnership per output_bufs[i]; controls reset()-time free
 
     // --- TensorMap keys registered by this task (for cleanup on CONSUMED) ---
-    std::vector<uint64_t> output_keys;
+    std::vector<DistTensorKey> output_keys;
 
     // --- Producer tasks this task depends on (for deferred release) ---
     // When this task reaches COMPLETED, the Scheduler releases one fanout ref

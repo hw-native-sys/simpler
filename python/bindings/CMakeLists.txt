@@ -18,6 +18,7 @@ list(TRANSFORM BINDING_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 set(DIST_SRC ${CMAKE_SOURCE_DIR}/src/common/distributed)
 
 set(DIST_SOURCES
+    ${DIST_SRC}/dist_chip_bootstrap_channel.cpp
     ${DIST_SRC}/dist_types.cpp
     ${DIST_SRC}/dist_tensormap.cpp
     ${DIST_SRC}/dist_ring.cpp

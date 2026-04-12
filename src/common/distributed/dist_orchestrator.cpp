@@ -63,13 +63,23 @@ DistSubmitResult DistOrchestrator::submit_group(
 
     s.output_bufs.reserve(output_specs.size());
     s.output_sizes.reserve(output_specs.size());
+    s.output_ownerships.reserve(output_specs.size());
     s.output_keys.reserve(output_specs.size());
 
     for (const DistOutputSpec &spec : output_specs) {
-        void *buf = spec.size > 0 ? ::operator new(spec.size) : nullptr;
+        void *buf = nullptr;
+        DistTensorKey key = spec.key;
+        if (spec.ownership == DistOutputOwnership::ALLOCATED) {
+            buf = spec.size > 0 ? ::operator new(spec.size) : nullptr;
+            key = DistTensorKey{-1, reinterpret_cast<uint64_t>(buf)};
+        } else {
+            buf = spec.external_ptr;
+        }
         s.output_bufs.push_back(buf);
         s.output_sizes.push_back(spec.size);
+        s.output_ownerships.push_back(static_cast<int32_t>(spec.ownership));
         result.outputs.push_back({buf, spec.size});
+        s.output_keys.push_back(key);
     }
 
     // --- Step 3: TensorMap lookup — collect producer slots ---
@@ -77,7 +87,7 @@ DistSubmitResult DistOrchestrator::submit_group(
     std::vector<DistTaskSlot> producers;
     producers.reserve(inputs.size());
     for (const DistInputSpec &inp : inputs) {
-        DistTaskSlot prod = tensormap_->lookup(inp.base_ptr);
+        DistTaskSlot prod = tensormap_->lookup(inp.key);
         if (prod != DIST_INVALID_SLOT) {
             bool found = false;
             for (DistTaskSlot p : producers) {
@@ -92,10 +102,8 @@ DistSubmitResult DistOrchestrator::submit_group(
 
     // --- Step 4: TensorMap insert — register outputs ---
     for (size_t i = 0; i < output_specs.size(); ++i) {
-        if (s.output_bufs[i]) {
-            uint64_t key = reinterpret_cast<uint64_t>(s.output_bufs[i]);
-            tensormap_->insert(key, slot);
-            s.output_keys.push_back(key);
+        if (s.output_keys[i].base_ptr != 0) {
+            tensormap_->insert(s.output_keys[i], slot);
         }
     }
 

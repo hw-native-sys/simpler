@@ -121,6 +121,40 @@ int set_device(DeviceContextHandle ctx, int device_id) {
     return 0;
 }
 
+void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
+    if (ctx == NULL) return NULL;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->allocate_tensor(size);
+    } catch (...) {
+        return NULL;
+    }
+}
+
+void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr) {
+    if (ctx == NULL || dev_ptr == NULL) return;
+    try {
+        static_cast<DeviceRunner *>(ctx)->free_tensor(dev_ptr);
+    } catch (...) {}
+}
+
+int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size) {
+    if (ctx == NULL || dev_ptr == NULL || host_ptr == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->copy_to_device(dev_ptr, host_ptr, size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size) {
+    if (ctx == NULL || host_ptr == NULL || dev_ptr == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->copy_from_device(host_ptr, dev_ptr, size);
+    } catch (...) {
+        return -1;
+    }
+}
+
 int run_runtime(
     DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
     int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,

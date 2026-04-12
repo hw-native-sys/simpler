@@ -34,6 +34,7 @@
 #include "pto_runtime2.h"
 #include "pto_runtime2_types.h"
 #include "pto_shared_memory.h"
+#include "pto_async_wait.h"
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
@@ -85,6 +86,7 @@ constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
 constexpr int32_t STALL_DUMP_CORE_MAX = 8;
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
+constexpr int32_t MAX_DEFERRED_RELEASES = 256;
 
 static PTO2Runtime *rt{nullptr};
 
@@ -370,8 +372,9 @@ struct AicpuExecutor {
     template <CoreType CT>
     void check_running_cores_for_completion(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
-        bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
-        PTO2LocalReadyBuffer *local_bufs
+        bool &made_progress, bool &fatal_error, int32_t &fatal_error_code,
+        PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
+        PTO2LocalReadyBuffer *local_bufs, PTO2AsyncWaitList &async_wait_list
 #if PTO2_PROFILING
         ,
         bool profiling_enabled, uint32_t &phase_complete_count
@@ -415,6 +418,16 @@ struct AicpuExecutor {
                 // Completion: increment atomic counter, trigger task-level completion on last subtask
                 bool mixed_complete = rt->scheduler.on_subtask_complete(slot_state);
                 if (mixed_complete) {
+                    int32_t registration_error = PTO2_ERROR_NONE;
+                    if (async_wait_list.register_deferred(slot_state, thread_idx,
+                                                         registration_error)) {
+                        // Deferred completion is now tracked by async_wait_list.
+                    } else {
+                        if (registration_error != PTO2_ERROR_NONE) {
+                            fatal_error = true;
+                            fatal_error_code = registration_error;
+                            return;
+                        }
 #if PTO2_SCHED_PROFILING
                     PTO2CompletionStats cstats =
                         rt->scheduler.on_mixed_task_complete(slot_state, thread_idx, local_bufs);
@@ -428,7 +441,7 @@ struct AicpuExecutor {
                     phase_complete_count++;
 #endif
 #endif
-                    if (deferred_release_count < 256) {
+                    if (deferred_release_count < MAX_DEFERRED_RELEASES) {
                         deferred_release_slot_states[deferred_release_count++] = &slot_state;
                     } else {
                         DEV_ALWAYS("Thread %d: release", thread_idx);
@@ -448,6 +461,7 @@ struct AicpuExecutor {
 #endif
                         }
                         deferred_release_slot_states[deferred_release_count++] = &slot_state;
+                    }
                     }
                 }
                 tracker.change_core_state(bit_pos);
@@ -491,7 +505,7 @@ struct AicpuExecutor {
                     CT == CoreType::AIC ? "AIC" : "AIV", core_id, expected_reg_task_id, mixed_complete ? 1 : 0
                 );
                 cur_thread_completed++;
-                if (mixed_complete) {
+                if (mixed_complete && slot_state.payload != nullptr && !slot_state.payload->complete_in_future) {
                     completed_this_turn++;
                 }
                 made_progress = true;
@@ -1318,6 +1332,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     PTO2TaskSlotState *deferred_release_slot_states[256];
     int32_t deferred_release_count = 0;
 
+    PTO2AsyncWaitList async_wait_list;
+
     bool cores_released = false;
 
 #if PTO2_PROFILING
@@ -1332,7 +1348,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         uint64_t _t0_phase = _t0;
 #endif
         int32_t task_count = 0;
-        if (!tracker.has_any_running_cores()) {
+        if (!tracker.has_any_running_cores() && async_wait_list.count == 0) {
             bool orch_done = orchestrator_done_;
             if (orch_done) {
                 // Check for orchestrator fatal error — exit immediately
@@ -1386,16 +1402,51 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         // Sched time = finish_ts - dispatch_ts; recording finish_ts here at loop start reduces
         // tail overhead (time from AICore done to AICPU recording finish).
 
+        // Invariant: previous iteration fully consumed local_bufs
+        always_assert(local_bufs[0].count == 0 && local_bufs[1].count == 0);
+
+        // Phase 0: Poll async completion conditions (deferred-completion tasks)
+        int32_t async_completed_this_turn = 0;
+        if (async_wait_list.count > 0) {
+            PTO2AsyncPollResult poll_result = async_wait_list.poll_and_complete<false>(
+                &rt->scheduler, local_bufs,
+                deferred_release_slot_states, deferred_release_count, MAX_DEFERRED_RELEASES
+#if PTO2_SCHED_PROFILING
+                , thread_idx
+#endif
+            );
+            if (poll_result.error_code != PTO2_ERROR_NONE) {
+                int32_t failed_task = -1;
+                if (poll_result.failed_slot_state != nullptr
+                    && poll_result.failed_slot_state->task != nullptr) {
+                    failed_task = static_cast<int32_t>(
+                        poll_result.failed_slot_state->task->task_id.local());
+                }
+                DEV_ERROR("Thread %d: async poll failed for task %d with error code %d",
+                          thread_idx, failed_task, poll_result.error_code);
+                pto2_record_scheduler_error(header, thread_idx, poll_result.error_code);
+                emergency_shutdown(runtime);
+                completed_.store(true, std::memory_order_release);
+                return -1;
+            }
+            async_completed_this_turn = poll_result.completed;
+            if (async_completed_this_turn > 0) {
+                made_progress = true;
+            }
+        }
+
         // Phase 1: Check running cores for completion, process and move to idle
-        int32_t completed_this_turn = 0;
+        int32_t completed_this_turn = async_completed_this_turn;
+        bool fatal_error = false;
+        int32_t fatal_error_code = PTO2_ERROR_NONE;
 
         // Check AIC running cores
         bool try_completed = false;
         if (tracker.has_running_cores<CoreType::AIC>()) {
             try_completed = true;
             check_running_cores_for_completion<CoreType::AIC>(
-                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count, local_bufs
+                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress, fatal_error,
+                fatal_error_code, deferred_release_slot_states, deferred_release_count, local_bufs, async_wait_list
 #if PTO2_PROFILING
                 ,
                 profiling_enabled, phase_complete_count
@@ -1406,14 +1457,22 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                 fanin_edges_total, fanin_max_degree, sched_complete_perf_cycle
 #endif
             );
+            if (fatal_error) {
+                DEV_ERROR("Thread %d: async registration failed with error code %d",
+                          thread_idx, fatal_error_code);
+                pto2_record_scheduler_error(header, thread_idx, fatal_error_code);
+                emergency_shutdown(runtime);
+                completed_.store(true, std::memory_order_release);
+                return -1;
+            }
         }
 
         // Check AIV running cores
         if (tracker.has_running_cores<CoreType::AIV>()) {
             try_completed = true;
             check_running_cores_for_completion<CoreType::AIV>(
-                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count, local_bufs
+                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress, fatal_error,
+                fatal_error_code, deferred_release_slot_states, deferred_release_count, local_bufs, async_wait_list
 #if PTO2_PROFILING
                 ,
                 profiling_enabled, phase_complete_count
@@ -1424,6 +1483,14 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                 fanin_edges_total, fanin_max_degree, sched_complete_perf_cycle
 #endif
             );
+            if (fatal_error) {
+                DEV_ERROR("Thread %d: async registration failed with error code %d",
+                          thread_idx, fatal_error_code);
+                pto2_record_scheduler_error(header, thread_idx, fatal_error_code);
+                emergency_shutdown(runtime);
+                completed_.store(true, std::memory_order_release);
+                return -1;
+            }
         }
         if (completed_this_turn > 0) {
 #if PTO2_SCHED_PROFILING
@@ -1645,6 +1712,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                     "PTO2 stall: no progress for %d iterations, completed=%d total=%d (last progress at %d)",
                     idle_iterations, c, task_count, last_progress_count
                 );
+                async_wait_list.dump(thread_idx, STALL_DUMP_WAIT_MAX);
                 // Scan all task slots to find truly stuck tasks using scheduler state
                 PTO2SchedulerState *sched = &rt->scheduler;
                 PTO2SharedMemoryHeader *sm_header_diag = static_cast<PTO2SharedMemoryHeader *>(sm_base);
@@ -2091,6 +2159,11 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
             runtime->set_pto2_slot_states_ptr(nullptr);
+
+            // Pass host-side async engine contexts to device PTO2Runtime.
+            for (int e = 0; e < PTO2_NUM_ASYNC_ENGINES; e++) {
+                rt->async_context_addrs[e] = runtime->get_async_context_addr(static_cast<PTO2AsyncEngine>(e));
+            }
 
             orch_func_ = orch_func;
             orch_bind_runtime_ = bind_runtime_func;

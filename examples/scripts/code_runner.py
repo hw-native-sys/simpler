@@ -57,9 +57,12 @@ import fcntl
 import importlib.util
 import logging
 import os
+import shutil
+import struct
 import sys
 import time
 from contextlib import contextmanager
+from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
 from typing import Any, Optional
 
@@ -405,7 +408,9 @@ def _ensure_pto_isa_root_locked(
             logger.warning(f"pto-isa cloned but missing include directory: {include_dir}")
         return None
 
-    return str(clone_path.resolve())
+    resolved_root = str(clone_path.resolve())
+    os.environ["PTO_ISA_ROOT"] = resolved_root
+    return resolved_root
 
 
 def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> dict[str, str]:
@@ -471,6 +476,20 @@ class CodeRunner:
         platform: Platform name ("a2a3" for hardware, "a2a3sim" for simulation, default: "a2a3")
     """
 
+    DTYPE_FORMAT = {
+        "float32": ("f", 4),
+        "float64": ("d", 8),
+        "int32": ("i", 4),
+        "int64": ("q", 8),
+        "uint32": ("I", 4),
+        "uint64": ("Q", 8),
+        "float16": ("e", 2),
+        "int16": ("h", 2),
+        "uint16": ("H", 2),
+        "int8": ("b", 1),
+        "uint8": ("B", 1),
+    }
+
     def __init__(  # noqa: PLR0913
         self,
         kernels_dir: str,
@@ -485,6 +504,8 @@ class CodeRunner:
         repeat_rounds: Optional[int] = None,
         clone_protocol: str = "ssh",
         skip_golden: bool = False,
+        nranks: Optional[int] = None,
+        device_ids: Optional[list[int]] = None,
     ):
         # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
         _setup_logging_if_needed()
@@ -535,6 +556,33 @@ class CodeRunner:
         self.block_dim = runtime_config.get("block_dim", 24)
         self.runtime_name = runtime_config.get("runtime", "host_build_graph")
         self.repeat_rounds = repeat_rounds if repeat_rounds is not None else runtime_config.get("rounds", 1)
+
+        self._is_distributed = hasattr(self._kernel_config, "DISTRIBUTED_CONFIG")
+        if self._is_distributed:
+            dist_cfg = getattr(self._kernel_config, "DISTRIBUTED_CONFIG", {})
+            self.nranks = nranks if nranks is not None else dist_cfg.get("nranks", 8)
+            self.root = dist_cfg.get("root", 0)
+            if self.nranks <= 0:
+                raise ValueError(f"Distributed nranks must be positive, got {self.nranks}")
+            if self.root < 0 or self.root >= self.nranks:
+                raise ValueError(f"Distributed root must be in [0, {self.nranks}), got {self.root}")
+            if device_ids is None:
+                self.device_ids = list(range(self.nranks))
+            else:
+                if len(device_ids) != self.nranks:
+                    raise ValueError(f"Expected {self.nranks} device ids, got {len(device_ids)}: {device_ids}")
+                self.device_ids = list(device_ids)
+            self.orch_func = self.orchestration["function_name"]
+            self._dist_run_dir = (
+                self.project_root / "build" / "distributed" / "runs" / f"run_{os.getpid()}_{time.time_ns()}"
+            )
+            self.build_dir = self._dist_run_dir / "cache"
+            self.artifact_dir = self._dist_run_dir / "artifacts"
+            self._dist_example_input_shms: list[SharedMemory] = []
+            self._dist_example_output_shms: list[SharedMemory] = []
+            self._dist_example_output_artifacts: list[dict[str, Path]] = []
+            self._dist_example_inputs_by_rank = []
+            self._dist_example_outputs_by_rank = []
 
     def _load_kernel_config(self):
         """Load kernel_config.py from kernels directory."""
@@ -706,6 +754,11 @@ class CodeRunner:
            - Run via ChipWorker
            - Compare with golden
         """
+        if self._is_distributed:
+            if not self.run_all():
+                raise RuntimeError("Distributed run failed")
+            return
+
         # Import runtime modules (deferred import to avoid top-level dependency)
         from elf_parser import extract_text_section  # noqa: PLC0415
         from kernel_compiler import KernelCompiler  # noqa: PLC0415
@@ -751,9 +804,10 @@ class CodeRunner:
 
         runtime_base_dir = os.path.join(self.project_root, "src", arch, "runtime", self.runtime_name)
 
-        # Read include_dirs from build_config.py for kernel compilation
+        # Start from the standard runtime + common + platform include roots used
+        # by orchestration compilation, then add runtime-specific aicore extras.
         build_config_path = os.path.join(runtime_base_dir, "build_config.py")
-        runtime_include_dirs = []
+        runtime_include_dirs = kernel_compiler.get_orchestration_include_dirs(self.runtime_name)
         if os.path.isfile(build_config_path):
             import importlib.util  # noqa: PLC0415
 
@@ -763,10 +817,9 @@ class CodeRunner:
             spec.loader.exec_module(bc_module)
             aicore_cfg = bc_module.BUILD_CONFIG.get("aicore", {})
             for p in aicore_cfg.get("include_dirs", []):
-                runtime_include_dirs.append(os.path.join(runtime_base_dir, p))
-        else:
-            runtime_include_dirs.append(os.path.join(runtime_base_dir, "runtime"))
-        runtime_include_dirs.append(os.path.join(self.project_root, "src", "common", "task_interface"))
+                inc_dir = os.path.join(runtime_base_dir, p)
+                if inc_dir not in runtime_include_dirs:
+                    runtime_include_dirs.append(inc_dir)
 
         def _build_runtime():
             return builder.get_binaries(self.runtime_name, build=self.build_runtime)
@@ -905,6 +958,23 @@ class CodeRunner:
         logger.info(f"=== All {total_cases} cases passed ===")
         logger.info("=" * 60)
 
+    def run_all(self, skip_compile: bool = False, skip_verify: bool = False) -> bool:
+        if self._is_distributed:
+            try:
+                if not skip_compile:
+                    self._compile_dist_example_artifacts()
+                self._prepare_dist_example_data()
+                success = self._run_distributed()
+                if success and not skip_verify:
+                    success = self._verify_distributed()
+                return success
+            finally:
+                self._cleanup_dist_example_staging()
+
+        del skip_compile, skip_verify
+        self.run()
+        return True
+
     def _compare_with_golden(
         self,
         outputs: dict[str, torch.Tensor],
@@ -944,6 +1014,400 @@ class CodeRunner:
             matched = torch.isclose(actual, expected, rtol=self.rtol, atol=self.atol).sum().item()
             logger.info(f"  {name}: PASS ({matched}/{actual.numel()} elements matched)")
 
+    def _dist_example_buffer_config(self, name: str):
+        dist = getattr(self._kernel_config, "DISTRIBUTED_CONFIG", {})
+        for buf_cfg in dist.get("buffers", []):
+            if buf_cfg["name"] == name:
+                return buf_cfg
+        raise ValueError(f"Buffer '{name}' not found in DISTRIBUTED_CONFIG['buffers']")
+
+    def _chip_buffer_dtype_to_task_dtype(self, dtype: str):
+        from task_interface import DataType  # noqa: PLC0415
+
+        mapping = {
+            "float32": DataType.FLOAT32,
+            "float16": DataType.FLOAT16,
+            "int32": DataType.INT32,
+            "int16": DataType.INT16,
+            "int8": DataType.INT8,
+            "uint8": DataType.UINT8,
+            "int64": DataType.INT64,
+        }
+        if dtype not in mapping:
+            raise ValueError(f"Unsupported distributed buffer dtype: {dtype}")
+        return mapping[dtype]
+
+    def _chip_runtime_artifact_paths(self):
+        return {
+            "host": self.artifact_dir / "libhost_runtime.so",
+            "aicpu": self.artifact_dir / "libaicpu_kernel.so",
+            "aicore": self.artifact_dir / "aicore_kernel.o",
+        }
+
+    def _chip_orch_artifact_name(self):
+        return Path(self.orchestration["source"]).stem + ".so"
+
+    def _chip_kernel_artifact_name(self, kernel_cfg):
+        return Path(kernel_cfg["source"]).stem + ".bin"
+
+    def _build_chip_callable(self):
+        from task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
+
+        orch_binary = (self.artifact_dir / self._chip_orch_artifact_name()).read_bytes()
+        children = []
+        for kernel_cfg in self.kernels:
+            binary = (self.artifact_dir / self._chip_kernel_artifact_name(kernel_cfg)).read_bytes()
+            children.append((kernel_cfg["func_id"], CoreCallable.build(kernel_cfg.get("signature", []), binary)))
+        return ChipCallable.build(
+            self.orchestration.get("signature", []),
+            self.orch_func,
+            orch_binary,
+            children,
+        )
+
+    def _buffer_nbytes(self, buf_cfg: dict) -> int:
+        fmt = self.DTYPE_FORMAT.get(buf_cfg["dtype"])
+        if fmt is None:
+            raise ValueError(f"Unsupported dtype '{buf_cfg['dtype']}' for buffer '{buf_cfg['name']}'")
+        return int(buf_cfg["count"]) * fmt[1]
+
+    def _cleanup_dist_example_staging(self) -> None:
+        for shm in self._dist_example_input_shms:
+            try:
+                shm.close()
+            finally:
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+        for shm in self._dist_example_output_shms:
+            try:
+                shm.close()
+            finally:
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+        self._dist_example_input_shms.clear()
+        self._dist_example_output_shms.clear()
+        self._dist_example_output_artifacts.clear()
+        self._dist_example_inputs_by_rank.clear()
+        self._dist_example_outputs_by_rank.clear()
+
+    def _prepare_dist_example_data(self) -> None:
+        from worker import HostBufferStaging  # noqa: PLC0415
+
+        self._cleanup_dist_example_staging()
+        golden = self._golden_module
+        if not hasattr(golden, "generate_distributed_inputs"):
+            raise AttributeError(
+                "Distributed examples must define generate_distributed_inputs(rank, nranks, root, comm_ctx=None)"
+            )
+
+        self._dist_example_inputs_by_rank: list[dict[str, HostBufferStaging]] = []
+        self._dist_example_outputs_by_rank: list[dict[str, HostBufferStaging]] = []
+
+        dist_cfg = getattr(self._kernel_config, "DISTRIBUTED_CONFIG", {})
+        input_names = set(dist_cfg.get("inputs", []))
+        output_names = set(dist_cfg.get("outputs", []))
+
+        for rank in range(self.nranks):
+            rank_dir = self.artifact_dir / f"rank_{rank}"
+            rank_dir.mkdir(parents=True, exist_ok=True)
+
+            inputs = golden.generate_distributed_inputs(rank, self.nranks, self.root)
+            input_map: dict[str, HostBufferStaging] = {}
+            output_map: dict[str, HostBufferStaging] = {}
+
+            for name, data in inputs:
+                buf_cfg = self._dist_example_buffer_config(name)
+                fmt = self.DTYPE_FORMAT.get(buf_cfg["dtype"])
+                if fmt is None:
+                    raise ValueError(f"Unsupported dtype '{buf_cfg['dtype']}' for buffer '{name}'")
+                if isinstance(data, (list, tuple)):
+                    raw = struct.pack(f"<{len(data)}{fmt[0]}", *data)
+                else:
+                    raw = bytes(data)
+                if len(raw) != self._buffer_nbytes(buf_cfg):
+                    raise ValueError(f"Distributed input '{name}' size mismatch: got {len(raw)}, expected {self._buffer_nbytes(buf_cfg)}")
+                if name in input_names:
+                    shm = SharedMemory(create=True, size=len(raw))
+                    assert shm.buf is not None
+                    shm.buf[:len(raw)] = raw
+                    self._dist_example_input_shms.append(shm)
+                    input_map[name] = HostBufferStaging(name=name, shm_name=shm.name, size=len(raw))
+                (rank_dir / f"{name}.bin").write_bytes(raw)
+
+            for name in output_names:
+                buf_cfg = self._dist_example_buffer_config(name)
+                size = self._buffer_nbytes(buf_cfg)
+                shm = SharedMemory(create=True, size=size)
+                assert shm.buf is not None
+                if size:
+                    shm.buf[:size] = b"\0" * size
+                self._dist_example_output_shms.append(shm)
+                output_map[name] = HostBufferStaging(name=name, shm_name=shm.name, size=size)
+
+            self._dist_example_inputs_by_rank.append(input_map)
+            self._dist_example_outputs_by_rank.append(output_map)
+            self._dist_example_output_artifacts.append(
+                {name: rank_dir / f"{name}.bin" for name in output_names}
+            )
+
+        logger.info(f"Prepared distributed data for {self.nranks} ranks in {self.artifact_dir}")
+
+    def _build_chip_bootstrap_config(self, rank: int):
+        from worker import ChipBootstrapConfig, ChipBufferSpec, ChipCommBootstrapConfig  # noqa: PLC0415
+
+        dist = getattr(self._kernel_config, "DISTRIBUTED_CONFIG", {})
+        buffers = []
+        total_window = int(dist.get("win_sync_prefix", 0))
+        for buf in dist.get("buffers", []):
+            spec = ChipBufferSpec(
+                name=buf["name"],
+                dtype=buf["dtype"],
+                count=int(buf["count"]),
+                placement=buf["placement"],
+                nbytes=self._buffer_nbytes(buf),
+                load_from_host=buf["name"] in dist.get("inputs", []),
+                store_to_host=buf["name"] in dist.get("outputs", []),
+            )
+            buffers.append(spec)
+            if spec.placement == "window":
+                total_window += spec.nbytes
+        return ChipBootstrapConfig(
+            comm=ChipCommBootstrapConfig(
+                rank=rank,
+                nranks=self.nranks,
+                rootinfo_path=str(self.artifact_dir / "rootinfo.bin"),
+                win_sync_prefix=int(dist.get("win_sync_prefix", 0)),
+                window_size=total_window,
+            ),
+            buffers=buffers,
+            host_inputs=list(self._dist_example_inputs_by_rank[rank].values()),
+            host_outputs=list(self._dist_example_outputs_by_rank[rank].values()),
+        )
+
+    def _make_chip_task_args(self, chip_context):
+        from task_interface import ChipStorageTaskArgs, scalar_to_uint64  # noqa: PLC0415
+
+        dist = getattr(self._kernel_config, "DISTRIBUTED_CONFIG", {})
+        buf_cfg_by_name = {buf["name"]: buf for buf in dist.get("buffers", [])}
+        args = ChipStorageTaskArgs()
+        for tok in dist.get("args", []):
+            if tok == "nranks":
+                args.add_scalar(scalar_to_uint64(self.nranks))
+            elif tok == "root":
+                args.add_scalar(scalar_to_uint64(self.root))
+            elif tok == "rank":
+                args.add_scalar(scalar_to_uint64(chip_context.rank))
+            elif tok == "deviceCtx":
+                args.add_scalar(scalar_to_uint64(chip_context.device_ctx))
+            else:
+                buf_cfg = buf_cfg_by_name.get(tok)
+                if buf_cfg is None:
+                    raise ValueError(f"Unknown distributed arg token: {tok}")
+                tensor_arg = chip_context.buffer_tensors.get(tok)
+                if tensor_arg is None:
+                    from task_interface import make_device_tensor_arg  # noqa: PLC0415
+
+                    tensor_arg = make_device_tensor_arg(
+                        chip_context.buffer_ptrs[tok],
+                        (int(buf_cfg["count"]),),
+                        self._chip_buffer_dtype_to_task_dtype(buf_cfg["dtype"]),
+                    )
+                args.add_tensor(tensor_arg)
+        return args
+
+    def _compile_dist_example_artifacts(self):
+        from elf_parser import extract_text_section  # noqa: PLC0415
+        from kernel_compiler import KernelCompiler  # noqa: PLC0415
+        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+
+        if self.build_dir.exists():
+            shutil.rmtree(self.build_dir)
+        if self.artifact_dir.exists():
+            shutil.rmtree(self.artifact_dir)
+        self.artifact_dir.mkdir(parents=True, exist_ok=True)
+        self.build_dir.mkdir(parents=True, exist_ok=True)
+        logger.info(f"Using distributed run directory: {self._dist_run_dir}")
+
+        pto_isa_root = _ensure_pto_isa_root(verbose=True, commit=self.pto_isa_commit, clone_protocol=self.clone_protocol)
+        if pto_isa_root is None:
+            raise EnvironmentError("PTO_ISA_ROOT could not be resolved.")
+
+        builder = RuntimeBuilder(platform=self.platform)
+        kernel_compiler = KernelCompiler(self.platform)
+
+        logger.info("=== Phase 1: Building runtime ===")
+        runtime_bins = builder.get_binaries(self.runtime_name, build=self.build_runtime)
+
+        logger.info("=== Phase 2: Compiling orchestration ===")
+        orch_binary = kernel_compiler.compile_orchestration(
+            self.runtime_name,
+            str(Path(self.orchestration["source"]).resolve()),
+            extra_include_dirs=kernel_compiler.get_orchestration_include_dirs(self.runtime_name),
+            build_dir=str(self.build_dir),
+        )
+
+        logger.info("=== Phase 3: Compiling kernels ===")
+        extra_includes = kernel_compiler.get_orchestration_include_dirs(self.runtime_name)
+        for d in getattr(self._kernel_config, "DISTRIBUTED_CONFIG", {}).get("comm_include_dirs", []):
+            p = Path(pto_isa_root) / d if not os.path.isabs(d) else Path(d)
+            extra_includes.append(str(p))
+        kernel_bins = {}
+        for k in self.kernels:
+            src = k["source"] if os.path.isabs(k["source"]) else str(self.kernels_dir / k["source"])
+            incore_o = kernel_compiler.compile_incore(
+                src,
+                core_type=k.get("core_type", "aiv"),
+                pto_isa_root=pto_isa_root,
+                extra_include_dirs=extra_includes,
+                build_dir=str(self.build_dir),
+            )
+            kernel_bins[k["func_id"]] = (k, incore_o if self.platform.endswith("sim") else extract_text_section(incore_o))
+
+        def save(name, data):
+            path = self.artifact_dir / name
+            path.write_bytes(data)
+            logger.info(f"  {name}: {len(data)} bytes")
+
+        save("libhost_runtime.so", runtime_bins.host_path.read_bytes())
+        save("libaicpu_kernel.so", runtime_bins.aicpu_path.read_bytes())
+        save("aicore_kernel.o", runtime_bins.aicore_path.read_bytes())
+        save(self._chip_orch_artifact_name(), orch_binary)
+        for _, (kcfg, data) in kernel_bins.items():
+            save(self._chip_kernel_artifact_name(kcfg), data)
+        self._chip_callable = self._build_chip_callable()
+        logger.info(f"All artifacts saved to {self.artifact_dir}")
+
+    def _dump_dist_example_outputs(self) -> None:
+        for rank, outputs in enumerate(self._dist_example_outputs_by_rank):
+            for name, staging in outputs.items():
+                shm = SharedMemory(name=staging.shm_name)
+                try:
+                    assert shm.buf is not None
+                    self._dist_example_output_artifacts[rank][name].write_bytes(bytes(shm.buf[:staging.size]))
+                finally:
+                    shm.close()
+
+    def _run_distributed(self):
+        from task_interface import WorkerPayload, WorkerType  # noqa: PLC0415
+        from worker import Task, Worker  # noqa: PLC0415
+
+        if not self._dist_example_inputs_by_rank or not self._dist_example_outputs_by_rank:
+            raise RuntimeError("Distributed data is not prepared. Call run_all() or _prepare_dist_example_data() first.")
+
+        rootinfo_file = self.artifact_dir / "rootinfo.bin"
+        for f in self.artifact_dir.glob("barrier_*.ready"):
+            f.unlink()
+        if rootinfo_file.exists():
+            rootinfo_file.unlink()
+
+        if not hasattr(self, "_chip_callable"):
+            self._chip_callable = self._build_chip_callable()
+
+        runtime_paths = self._chip_runtime_artifact_paths()
+        chip_bootstrap_configs = [self._build_chip_bootstrap_config(rank) for rank, _ in enumerate(self.device_ids)]
+        run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
+        success = True
+        worker = None
+        try:
+            with _temporary_env(run_env):
+                worker = Worker(
+                    level=3,
+                    device_ids=self.device_ids,
+                    num_sub_workers=0,
+                    platform=self.platform,
+                    runtime=self.runtime_name,
+                    host_path=str(runtime_paths["host"]),
+                    aicpu_path=str(runtime_paths["aicpu"]),
+                    aicore_path=str(runtime_paths["aicore"]),
+                    chip_bootstrap_configs=chip_bootstrap_configs,
+                )
+                worker.init()
+                rank_args = [self._make_chip_task_args(ctx) for ctx in worker.chip_contexts]
+
+                payload = WorkerPayload()
+                payload.worker_type = WorkerType.CHIP
+                payload.callable = self._chip_callable.buffer_ptr()
+                payload.block_dim = int(getattr(self._kernel_config, "RUNTIME_CONFIG", {}).get("block_dim", 1))
+                payload.aicpu_thread_num = int(getattr(self._kernel_config, "RUNTIME_CONFIG", {}).get("aicpu_thread_num", 1))
+
+                def orch_fn(w, args_list):
+                    w.submit(
+                        WorkerType.CHIP,
+                        payload,
+                        args_list=[arg.__ptr__() for arg in args_list],
+                        outputs=[],
+                    )
+
+                worker.run(Task(orch=orch_fn, args=rank_args))
+                self._dump_dist_example_outputs()
+        except Exception:
+            logger.exception("Distributed worker execution failed")
+            success = False
+        finally:
+            if worker is not None:
+                worker.close()
+            for f in self.artifact_dir.glob("barrier_*.ready"):
+                f.unlink()
+
+        print()
+        print(f"=== ALL {self.nranks} RANKS COMPLETED ===" if success else f"=== DISTRIBUTED RUN FAILED ({self.nranks} ranks) ===")
+        return success
+
+    def _verify_distributed(self):
+        dist = getattr(self._kernel_config, "DISTRIBUTED_CONFIG", {})
+        output_names = dist.get("outputs", [])
+        buf_map = {b["name"]: b for b in dist.get("buffers", [])}
+
+        seed_dir = self.artifact_dir / f"rank_{self.root}"
+        seed_outputs = {}
+        for name in output_names:
+            path = seed_dir / f"{name}.bin"
+            if not path.exists():
+                logger.error(f"Output file not found: {path}")
+                return False
+            raw = path.read_bytes()
+            dtype = buf_map.get(name, {}).get("dtype", "float32")
+            fmt_char, elem_sz = self.DTYPE_FORMAT.get(dtype, ("f", 4))
+            count = len(raw) // elem_sz
+            seed_outputs[name] = list(struct.unpack(f"<{count}{fmt_char}", raw))
+
+        expected_outputs = {n: v.copy() for n, v in seed_outputs.items()}
+        self._golden_module.compute_golden(expected_outputs, {"nranks": self.nranks, "root": self.root})
+
+        rtol = getattr(self._golden_module, "RTOL", 1e-5)
+        atol = getattr(self._golden_module, "ATOL", 1e-5)
+        all_ok = True
+        for rank in range(self.nranks):
+            rank_dir = self.artifact_dir / f"rank_{rank}"
+            for name in output_names:
+                path = rank_dir / f"{name}.bin"
+                if not path.exists():
+                    logger.error(f"Output file not found: {path}")
+                    all_ok = False
+                    continue
+                raw = path.read_bytes()
+                dtype = buf_map.get(name, {}).get("dtype", "float32")
+                fmt_char, elem_sz = self.DTYPE_FORMAT.get(dtype, ("f", 4))
+                count = len(raw) // elem_sz
+                actual = list(struct.unpack(f"<{count}{fmt_char}", raw))
+                expected = expected_outputs[name]
+                mismatches = 0
+                for i, (a, e) in enumerate(zip(actual, expected)):
+                    if abs(a - e) > atol + rtol * abs(e):
+                        if mismatches < 3:
+                            logger.error(f"  rank {rank} {name}[{i}]: got {a}, expected {e}")
+                        mismatches += 1
+                if mismatches:
+                    logger.error(f"VERIFY FAILED: rank {rank} {name} — {mismatches}/{len(actual)} mismatches")
+                    all_ok = False
+                else:
+                    logger.info(f"VERIFY PASSED: rank {rank} {name} — {len(actual)} elements correct")
+        print("\n=== VERIFICATION PASSED ===\n" if all_ok else "\n=== VERIFICATION FAILED ===\n")
+        return all_ok
 
 def create_code_runner(  # noqa: PLR0913
     kernels_dir,
@@ -958,8 +1422,25 @@ def create_code_runner(  # noqa: PLR0913
     repeat_rounds=None,
     clone_protocol="ssh",
     skip_golden=False,
+    nranks=None,
+    device_ids=None,
 ):
-    """Factory: creates a CodeRunner based on kernel_config."""
+    """Factory: creates the example runner for the given kernel_config."""
+    effective_device_ids = None if device_ids is None else list(device_ids)
+    effective_nranks = nranks
+    kernels_dir_path = Path(kernels_dir).resolve()
+    kernel_config = _load_module_from_path(kernels_dir_path / "kernel_config.py", f"kernel_config_factory_{os.getpid()}")
+    if hasattr(kernel_config, "DISTRIBUTED_CONFIG"):
+        dist_cfg = getattr(kernel_config, "DISTRIBUTED_CONFIG", {})
+        if effective_device_ids is not None:
+            effective_nranks = len(effective_device_ids)
+        else:
+            effective_nranks = nranks if nranks is not None else dist_cfg.get("nranks", 8)
+            base_device = 0 if device_id is None else device_id
+            effective_device_ids = [base_device + i for i in range(effective_nranks)]
+        if nranks is not None and nranks != effective_nranks:
+            raise ValueError(f"--nranks={nranks} conflicts with device list ({effective_nranks} devices)")
+
     return CodeRunner(
         kernels_dir=kernels_dir,
         golden_path=golden_path,
@@ -973,4 +1454,6 @@ def create_code_runner(  # noqa: PLR0913
         repeat_rounds=repeat_rounds,
         clone_protocol=clone_protocol,
         skip_golden=skip_golden,
+        nranks=effective_nranks,
+        device_ids=effective_device_ids,
     )

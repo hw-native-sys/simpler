@@ -135,6 +135,14 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
     int64_t t_args_start = _now_ms();
     for (int i = 0; i < tensor_count; i++) {
         ContinuousTensor t = orch_args->tensor(i);
+        if (t.is_device_resident()) {
+            // External/bootstrap-provided device buffers are already valid in the
+            // target chip context, so runtime_maker must preserve the pointer
+            // instead of allocating/copying a second device buffer.
+            LOG_INFO("  Tensor %d: reusing device-resident pointer %p (%zu bytes)", i, t.data_as<void>(), t.nbytes());
+            device_args.add_tensor(t);
+            continue;
+        }
 
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.data));
         size_t size = static_cast<size_t>(t.nbytes());

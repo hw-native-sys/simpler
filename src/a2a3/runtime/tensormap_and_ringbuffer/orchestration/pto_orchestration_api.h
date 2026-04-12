@@ -70,6 +70,18 @@ inline Tensor make_tensor_external(
     };
 }
 
+/**
+ * Create a TensorCreateInfo for runtime-allocated output memory.
+ */
+inline TensorCreateInfo make_tensor(
+    const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false,
+    int32_t version = 0
+) {
+    TensorCreateInfo info(shapes, ndims, dtype, manual_dep);
+    info.version = version;
+    return info;
+}
+
 // Convert ContinuousTensor to Tensor
 static_assert(
     CONTINUOUS_TENSOR_MAX_DIMS == RUNTIME_MAX_TENSOR_DIMS, "ContinuousTensor and runtime max dims must match"
@@ -115,6 +127,8 @@ void pto2_framework_bind_runtime(PTO2Runtime *rt);
  */
 typedef struct PTO2RuntimeOps {
     TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    uint64_t (*get_async_context)(PTO2Runtime *rt, PTO2AsyncEngine engine);
+    uint64_t (*alloc_cq)(PTO2Runtime *rt);
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
@@ -203,6 +217,118 @@ static inline TaskOutputTensors pto2_rt_submit_aiv_task(int32_t kernel_id, const
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, args);
+}
+
+static inline uint64_t pto2_rt_get_async_context(PTO2AsyncEngine engine) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    return rt->ops->get_async_context(rt, engine);
+}
+
+static inline uint64_t pto2_rt_get_async_context(PTO2Runtime *rt, PTO2AsyncEngine engine) {
+    return rt->ops->get_async_context(rt, engine);
+}
+
+static inline uint64_t pto2_rt_get_async_context(PTO2AsyncCapability capability) {
+    return pto2_rt_get_async_context(pto2_async_capability_default_engine(capability));
+}
+
+static inline uint64_t pto2_rt_get_async_context(PTO2Runtime *rt, PTO2AsyncCapability capability) {
+    return pto2_rt_get_async_context(rt, pto2_async_capability_default_engine(capability));
+}
+
+static inline uint64_t pto2_rt_get_remote_copy_context() {
+    return pto2_rt_get_async_context(PTO2AsyncCapability::REMOTE_COPY);
+}
+
+static inline uint64_t pto2_rt_get_remote_copy_context(PTO2Runtime *rt) {
+    return pto2_rt_get_async_context(rt, PTO2AsyncCapability::REMOTE_COPY);
+}
+
+// Compatibility alias for existing A2/A3 orchestration code.  New code should
+// use pto2_rt_get_remote_copy_context() so the orchestration layer does not
+// depend on a specific transport backend name such as SDMA.
+static inline uint64_t pto2_rt_get_sdma_context() { return pto2_rt_get_remote_copy_context(); }
+
+static inline uint64_t pto2_rt_get_sdma_context(PTO2Runtime *rt) {
+    return pto2_rt_get_remote_copy_context(rt);
+}
+
+static inline uint64_t pto2_rt_alloc_cq() {
+    PTO2Runtime *rt = pto2_current_runtime();
+    return rt->ops->alloc_cq(rt);
+}
+
+static inline uint64_t pto2_rt_alloc_cq(PTO2Runtime *rt) { return rt->ops->alloc_cq(rt); }
+
+static inline TaskOutputTensors pto2_rt_submit_aiv_task_deferred(int32_t kernel_id, Arg &args, uint64_t cq_addr) {
+    args.complete_in_future = true;
+    args.cq_addr = cq_addr;
+    args.add_scalar(cq_addr);
+    return pto2_rt_submit_aiv_task(kernel_id, args);
+}
+
+static inline TaskOutputTensors
+pto2_rt_submit_aiv_task_deferred(PTO2Runtime *rt, int32_t kernel_id, Arg &args, uint64_t cq_addr) {
+    args.complete_in_future = true;
+    args.cq_addr = cq_addr;
+    args.add_scalar(cq_addr);
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    return rt->ops->submit_task(rt, mk, args);
+}
+
+static inline TaskOutputTensors pto2_rt_submit_aic_task_deferred(int32_t kernel_id, Arg &args, uint64_t cq_addr) {
+    args.complete_in_future = true;
+    args.cq_addr = cq_addr;
+    args.add_scalar(cq_addr);
+    PTO2Runtime *rt = pto2_current_runtime();
+    MixedKernels mk;
+    mk.aic_kernel_id = kernel_id;
+    return rt->ops->submit_task(rt, mk, args);
+}
+
+static inline TaskOutputTensors pto2_rt_submit_task_deferred(
+    const MixedKernels &mixed_kernels, Arg &args, uint64_t cq_addr
+) {
+    args.complete_in_future = true;
+    args.cq_addr = cq_addr;
+    args.add_scalar(cq_addr);
+    return pto2_rt_submit_task(mixed_kernels, args);
+}
+
+/**
+ * Submit a notification-wait deferred task and return a dependency token.
+ *
+ * Encapsulates the boilerplate for creating a NotifyWait task:
+ *   1. Allocate a CQ
+ *   2. Create a 1-element dummy output tensor (dependency token)
+ *   3. Submit a deferred AIV task with (counter_addr, expected_value, cq_addr)
+ *
+ * The returned token tensor should be added as an input to any downstream
+ * task that depends on the notification completing.
+ *
+ * @param kernel_id      func_id of the NotifyWait kernel
+ * @param counter_addr   GM address of the notification counter (int32*)
+ * @param expected_value  threshold: task completes when *counter >= expected
+ * @return dependency token tensor (add as input to downstream tasks)
+ */
+static inline Tensor pto2_rt_submit_notification_wait_task(
+    int32_t kernel_id,
+    uint64_t counter_addr,
+    uint32_t expected_value) {
+    uint64_t cq_addr = pto2_rt_alloc_cq();
+    always_assert(cq_addr != 0 && "pto2_rt_submit_notification_wait_task: failed to allocate CQ");
+
+    uint32_t dummy_shape[1] = { 1 };
+    TensorCreateInfo token_info = make_tensor(dummy_shape, 1, DataType::INT32);
+
+    Arg params;
+    params.add_output(token_info);
+    params.add_scalar(counter_addr);
+    params.add_scalar(static_cast<uint64_t>(expected_value));
+    TaskOutputTensors outputs = pto2_rt_submit_aiv_task_deferred(kernel_id, params, cq_addr);
+
+    return outputs.get_ref(0);
 }
 
 static inline void pto2_rt_scope_begin() {

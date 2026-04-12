@@ -11,6 +11,8 @@
 
 #include "dist_types.h"
 
+#include "dist_orchestrator.h"
+
 // =============================================================================
 // DistTaskSlotState
 // =============================================================================
@@ -25,10 +27,14 @@ void DistTaskSlotState::reset() {
         fanout_total = 0;
     }
     fanout_released.store(0, std::memory_order_relaxed);
-    for (void *p : output_bufs)
-        ::operator delete(p);
+    for (size_t i = 0; i < output_bufs.size(); ++i) {
+        if (output_ownerships[i] == static_cast<int32_t>(DistOutputOwnership::ALLOCATED)) {
+            ::operator delete(output_bufs[i]);
+        }
+    }
     output_bufs.clear();
     output_sizes.clear();
+    output_ownerships.clear();
     output_keys.clear();
     fanin_producers.clear();
     payload = WorkerPayload{};
