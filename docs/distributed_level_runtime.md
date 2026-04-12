@@ -339,6 +339,12 @@ Python Application
                  └── forked child process    ← mailbox state machine
 ```
 
+## Runtime Isolation (Onboard Hardware)
+
+A single device can only run **one runtime** per CANN process context. CANN's AICPU framework (`libaicpu_extend_kernels.so`) caches the user AICPU .so on first load and skips reloading on subsequent launches. If a different runtime's AICPU .so is launched on the same device, the cached (stale) function pointers are used, causing hangs.
+
+This means: **do not reuse a device across different runtimes within a single process.** Either use separate processes (one per runtime), or partition devices so each runtime gets exclusive devices. See [testing.md](testing.md#runtime-isolation-constraint-onboard) for details and the pytest device allocation algorithm.
+
 ## Files
 
 | File | Purpose |

@@ -16,6 +16,9 @@ name = "simpler"
 version = "0.1.0"
 requires-python = ">=3.9"
 
+[project.optional-dependencies]
+test = ["pytest>=6.0"]
+
 [tool.ruff]
 line-length = 120
 target-version = "py39"
@@ -66,6 +69,7 @@ reportRedeclaration = false
 [tool.pytest.ini_options]
 testpaths = ["tests", "examples"]
 pythonpath = ["python", "golden"]
+addopts = "--import-mode=importlib"
 
 [tool.scikit-build]
 wheel.packages = ["simpler_setup"]

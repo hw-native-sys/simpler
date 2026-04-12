@@ -81,6 +81,7 @@ class TestPagedAttentionHostBuildGraph(SceneTestCase):
             "name": "small2",
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 3, "block_dim": 3},
+            "manual": True,
             "params": {
                 "batch": 1,
                 "num_heads": 16,

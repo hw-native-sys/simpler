@@ -1,4 +1,12 @@
 #!/usr/bin/env bash
+# Copyright (c) PyPTO Contributors.
+# This program is free software, you can redistribute it and/or modify it under the terms and conditions of
+# CANN Open Software License Agreement Version 2.0 (the "License").
+# Please refer to the License for details. You may not use this file except in compliance with the License.
+# THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
+# See LICENSE in the root of the software repository for the full text of the License.
+# -----------------------------------------------------------------------------------------------------------
 # Benchmark wrapper: run examples on hardware,
 # then parse device-log timing lines to report per-round latency.
 #
@@ -122,9 +130,14 @@ vlog() {
 }
 
 # ---------------------------------------------------------------------------
-# Derive arch from platform and set examples directory
+# Derive arch from platform and set examples directories
 # ---------------------------------------------------------------------------
-EXAMPLES_DIR="$PROJECT_ROOT/tests/st/${PLATFORM}/${RUNTIME}"
+# Search both examples/ (migrated tests) and tests/st/ (legacy tests)
+ARCH="${PLATFORM%%sim}"  # strip "sim" suffix if present
+EXAMPLES_DIRS=(
+    "$PROJECT_ROOT/examples/${ARCH}/${RUNTIME}"
+    "$PROJECT_ROOT/tests/st/${ARCH}/${RUNTIME}"
+)
 
 # Clock frequency (MHz) for converting cycle counts to microseconds
 case "$PLATFORM" in
@@ -458,12 +471,19 @@ SUMMARY_ORCH=()
 
 echo ""
 echo "Runtime: $RUNTIME"
-echo "Tests dir: $EXAMPLES_DIR"
 
 for example in "${EXAMPLE_ORDER[@]}"; do
     case_list="${EXAMPLE_CASES[$example]:-}"
 
-    EXAMPLE_DIR="$EXAMPLES_DIR/$example"
+    # Search for example in both directories
+    EXAMPLE_DIR=""
+    for dir in "${EXAMPLES_DIRS[@]}"; do
+        if [[ -f "$dir/$example/golden.py" && -d "$dir/$example/kernels" ]]; then
+            EXAMPLE_DIR="$dir/$example"
+            break
+        fi
+    done
+
     KERNELS_DIR="$EXAMPLE_DIR/kernels"
     GOLDEN="$EXAMPLE_DIR/golden.py"
 
@@ -472,8 +492,8 @@ for example in "${EXAMPLE_ORDER[@]}"; do
     echo "  $example"
     echo "================================================================"
 
-    if [[ ! -f "$GOLDEN" || ! -d "$KERNELS_DIR" ]]; then
-        echo "  SKIP: missing kernels/ or golden.py"
+    if [[ -z "$EXAMPLE_DIR" ]]; then
+        echo "  SKIP: not found in any search directory"
         ((FAIL++)) || true
         continue
     fi

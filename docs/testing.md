@@ -331,6 +331,71 @@ The test will be automatically picked up by `ci.py`. New tests should prefer the
 
 See [ci.md](ci.md) for the full CI pipeline documentation, including the job matrix, runner constraints, marker scheme, and `ci.sh` internals.
 
+## Runtime Isolation Constraint (Onboard)
+
+**One device can only run one runtime per process.** Switching runtimes on the same device within a single process causes AICPU kernel hangs.
+
+### Root Cause
+
+CANN's AICPU dispatch uses a framework SO (`libaicpu_extend_kernels.so`) with a global singleton `BackendServerHandleManager` that:
+
+1. **`SaveSoFile`**: Writes the user AICPU .so to disk on first call, then sets `firstCreatSo_ = true` to skip all subsequent writes.
+2. **`SetTileFwkKernelMap`**: `dlopen`s the .so and caches function pointers on first call, then sets `firstLoadSo_ = true` to skip all subsequent loads.
+
+When a second runtime launches on the same device (same CANN process context), the Init kernel call hits the cached flags — the new AICPU .so is never written or loaded. The Exec kernel then calls function pointers from the first runtime's .so, which operates on incompatible data structures and hangs.
+
+### Impact
+
+| Scenario | Result |
+| -------- | ------ |
+| Same runtime, same device, sequential | Works (same .so, cached pointers valid) |
+| Different runtime, same device, sequential | **Hangs** (stale .so, wrong function pointers) |
+| Different runtime, different device | Works (separate CANN context per device) |
+| Different runtime, different process, same device | Works (`rtDeviceReset` between processes clears context) |
+
+### Mitigation in pytest
+
+The `conftest.py` device allocator groups tests by runtime and assigns each runtime group to exclusive devices. See "Device Allocation Algorithm" below.
+
+## Device Allocation Algorithm (Onboard pytest)
+
+When running `pytest --platform a2a3 --device 8-11`, the fixture must allocate devices to tests such that:
+
+1. **Runtime isolation**: A device used by runtime A must not be reused by runtime B in the same process.
+2. **L3 multi-device**: L3 tests may need 2+ contiguous devices.
+3. **Efficiency**: Devices freed by one test of the same runtime can be reused by the next.
+
+### Algorithm
+
+```text
+Phase 1: Group tests by runtime
+  tensormap_and_ringbuffer: [TestVectorExample, TestScalarData, TestL3Dependency, ...]
+  aicpu_build_graph:        [TestPagedAttentionAicpuBuildGraph]
+  host_build_graph:         [TestPagedAttentionHostBuildGraph]
+
+Phase 2: Partition devices across runtime groups
+  Available: [8, 9, 10, 11]
+  tensormap_and_ringbuffer (6 tests, needs max 2 for L3 group): devices [8, 9]
+  aicpu_build_graph (1 test, needs 1):                          devices [10]
+  host_build_graph (1 test, needs 1):                           devices [11]
+
+Phase 3: Within each group, allocate from group's device pool
+  TestVectorExample:       dev 8 → run → release → dev 8 available again
+  TestScalarData:          dev 8 → run → release → OK (same runtime)
+  TestL3Dependency:        dev 8 → run → release
+  TestL3Group:             dev [8, 9] → run → release
+  TestPagedAttentionAicpuBuildGraph: dev 10 → run → release
+  TestPagedAttentionHostBuildGraph:  dev 11 → run → release
+```
+
+### Implementation
+
+The `DevicePool` in `conftest.py` is extended with runtime-aware partitioning. The `st_worker` fixture checks the test class's `_st_runtime` and allocates from the corresponding partition.
+
+### Sim platforms
+
+On sim (`a2a3sim`, `a5sim`), device IDs are virtual — no hardware state, no isolation constraint. All tests share a single virtual pool with auto-incrementing IDs.
+
 ## Per-Case Device Filtering
 
 The `@scene_test(platforms=[...])` decorator provides per-case platform filtering. A single test class declares which platforms it supports:

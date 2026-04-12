@@ -6,9 +6,18 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Root conftest — CLI options, markers, ST platform filtering, and ST fixtures."""
+"""Root conftest — CLI options, markers, ST platform filtering, runtime isolation, and ST fixtures.
+
+Runtime isolation: CANN's AICPU framework caches the user .so per device context.
+Switching runtimes on the same device within one process causes hangs. When multiple
+runtimes are collected and --runtime is not specified, pytest_runtestloop spawns a
+subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
+"""
 
 from __future__ import annotations
+
+import subprocess
+import sys
 
 import pytest
 
@@ -22,22 +31,16 @@ def _parse_device_range(s: str) -> list[int]:
 
 
 class DevicePool:
-    """Simple device allocator for pytest fixtures.
+    """Device allocator for pytest fixtures.
 
-    On sim platforms, device IDs are virtual — allocate always succeeds.
-    On real hardware, IDs are exclusive.
+    Manages a fixed set of device IDs. Tests allocate IDs before use
+    and release them after. Works identically for sim and onboard.
     """
 
-    def __init__(self, device_ids: list[int], *, is_sim: bool = False):
+    def __init__(self, device_ids: list[int]):
         self._available = list(device_ids)
-        self._is_sim = is_sim
-        self._sim_next = 0
 
     def allocate(self, n: int = 1) -> list[int]:
-        if self._is_sim:
-            ids = list(range(self._sim_next, self._sim_next + n))
-            self._sim_next += n
-            return ids
         if n > len(self._available):
             return []
         allocated = self._available[:n]
@@ -45,8 +48,7 @@ class DevicePool:
         return allocated
 
     def release(self, ids: list[int]) -> None:
-        if not self._is_sim:
-            self._available.extend(ids)
+        self._available.extend(ids)
 
 
 _device_pool: DevicePool | None = None
@@ -58,6 +60,7 @@ def pytest_addoption(parser):
     parser.addoption("--device", action="store", default="0", help="Device ID or range (e.g., 0, 4-7)")
     parser.addoption("--case", action="store", default=None, help="Run specific case name only")
     parser.addoption("--all-cases", action="store_true", default=False, help="Include manual cases")
+    parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
 
 
 def pytest_configure(config):
@@ -68,18 +71,31 @@ def pytest_configure(config):
 
 
 def pytest_collection_modifyitems(session, config, items):
-    """Skip ST tests based on --platform filter."""
+    """Skip ST tests based on --platform and --runtime filters, and order L3 before L2."""
     platform = config.getoption("--platform")
+    runtime_filter = config.getoption("--runtime")
+
+    # Sort: L3 tests first (they fork child processes that inherit main process CANN state,
+    # so they must run before L2 tests pollute the CANN context).
+    def sort_key(item):
+        cls = getattr(item, "cls", None)
+        level = getattr(cls, "_st_level", 0) if cls else 0
+        return (0 if level >= 3 else 1, item.nodeid)
+
+    items.sort(key=sort_key)
+
     for item in items:
-        # SceneTestCase subclass: skip if no case matches current platform
         cls = getattr(item, "cls", None)
         if cls and hasattr(cls, "CASES") and isinstance(cls.CASES, list):
             if not platform:
                 item.add_marker(pytest.mark.skip(reason="--platform required"))
             elif not any(platform in c.get("platforms", []) for c in cls.CASES):
                 item.add_marker(pytest.mark.skip(reason=f"No cases for {platform}"))
+            elif runtime_filter and getattr(cls, "_st_runtime", None) != runtime_filter:
+                item.add_marker(
+                    pytest.mark.skip(reason=f"Runtime {getattr(cls, '_st_runtime', '?')} != {runtime_filter}")
+                )
             continue
-        # Standalone function with @pytest.mark.platforms([...])
         platforms_marker = item.get_closest_marker("platforms")
         if platforms_marker:
             if not platform:
@@ -88,15 +104,77 @@ def pytest_collection_modifyitems(session, config, items):
                 item.add_marker(pytest.mark.skip(reason=f"Not supported on {platform}"))
 
 
+# ---------------------------------------------------------------------------
+# Runtime isolation: spawn subprocess per runtime
+# ---------------------------------------------------------------------------
+
+
+def _collect_st_runtimes(items):
+    """Return sorted list of unique runtimes from collected SceneTestCase items."""
+    runtimes = set()
+    for item in items:
+        cls = getattr(item, "cls", None)
+        rt = getattr(cls, "_st_runtime", None) if cls else None
+        if rt:
+            runtimes.add(rt)
+    return sorted(runtimes)
+
+
+def pytest_runtestloop(session):
+    """Override test execution to isolate runtimes in subprocesses.
+
+    If --runtime is specified (or only one runtime collected), run normally.
+    Otherwise, spawn one subprocess per runtime and aggregate results.
+    """
+    runtime_filter = session.config.getoption("--runtime")
+    if runtime_filter:
+        return  # single runtime — let pytest run normally
+
+    runtimes = _collect_st_runtimes(session.items)
+    if len(runtimes) <= 1:
+        return  # zero or one runtime — no isolation needed
+
+    # Multiple runtimes: spawn subprocess per runtime
+    # Re-invoke pytest with the same args + --runtime <rt> for each runtime
+    base_args = [sys.executable, "-m", "pytest"]
+    for arg in session.config.invocation_params.args:
+        base_args.append(str(arg))
+
+    failed = False
+    for rt in runtimes:
+        # Build subprocess command: inject --runtime <rt>
+        cmd = base_args + ["--runtime", rt]
+        header = f"  Runtime: {rt}"
+        print(f"\n{'=' * 60}\n{header}\n{'=' * 60}\n", flush=True)
+
+        result = subprocess.run(cmd, check=False, cwd=session.config.invocation_params.dir)
+        if result.returncode != 0:
+            failed = True
+            print(f"\n*** Runtime {rt}: FAILED ***\n", flush=True)
+        else:
+            print(f"\n--- Runtime {rt}: PASSED ---\n", flush=True)
+
+    if failed:
+        session.testsfailed = 1
+    else:
+        session.testscollected = sum(1 for _ in session.items)
+        session.testsfailed = 0
+
+    return True  # returning True prevents default runtestloop
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
 @pytest.fixture(scope="session")
 def device_pool(request):
     """Session-scoped device pool parsed from --device."""
     global _device_pool  # noqa: PLW0603
     if _device_pool is None:
         raw = request.config.getoption("--device")
-        platform = request.config.getoption("--platform")
-        is_sim = platform is None or platform.endswith("sim")
-        _device_pool = DevicePool(_parse_device_range(raw), is_sim=is_sim)
+        _device_pool = DevicePool(_parse_device_range(raw))
     return _device_pool
 
 

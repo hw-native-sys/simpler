@@ -174,7 +174,7 @@ jobs:
         run: python ci.py -p a2a3sim -c d96c8784 -t 600 --clone-protocol https
 
       - name: Run pytest scene tests (a2a3sim)
-        run: pytest examples tests/st --platform a2a3sim -v
+        run: pytest examples tests/st --platform a2a3sim --device 0-15 -v
 
   st-sim-a5:
     runs-on: ${{ matrix.os }}
@@ -228,7 +228,7 @@ jobs:
         run: python ci.py -p a5sim -c d96c8784 -t 600 --clone-protocol https
 
       - name: Run pytest scene tests (a5sim)
-        run: pytest examples tests/st --platform a5sim -v
+        run: pytest examples tests/st --platform a5sim --device 0-15 -v
 
   # ---------- Python unit tests (a2a3 hardware) ----------
   ut-py-a2a3:
