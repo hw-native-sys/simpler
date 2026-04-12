@@ -63,15 +63,15 @@ Block n: QK -> SF -> PV --+
 ```bash
 # Run on hardware (specify device ID)
 python examples/scripts/run_example.py \
-  -k tests/st/a5/host_build_graph/paged_attention/kernels \
-  -g tests/st/a5/host_build_graph/paged_attention/golden.py \
-  -p a5 -d 0
+  -k tests/st/host_build_graph/paged_attention/kernels \
+  -g tests/st/host_build_graph/paged_attention/golden.py \
+  -p a2a3 -d 0
 
 # Run multi-block test case
 PA_CASE=Case2 python examples/scripts/run_example.py \
-  -k tests/st/a5/host_build_graph/paged_attention/kernels \
-  -g tests/st/a5/host_build_graph/paged_attention/golden.py \
-  -p a5 -d 0
+  -k tests/st/host_build_graph/paged_attention/kernels \
+  -g tests/st/host_build_graph/paged_attention/golden.py \
+  -p a2a3 -d 0
 ```
 
 ## Directory Structure

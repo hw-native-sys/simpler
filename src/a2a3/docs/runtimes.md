@@ -8,13 +8,13 @@ Three runtime implementations live under `src/a2a3/runtime/`, each providing a d
 | ------- | ---------------- | ----------------- | ------------------------ |
 | Graph built on | Host CPU | AICPU (device) | AICPU (device) |
 | Task storage | Fixed `Task[]` array | Fixed `Task[]` array | Ring buffer (`PTO2TaskDescriptor[]`) |
-| Dependencies | Explicit edges | Explicit edges | Auto-derived via TensorMap, plus optional manual dependencies |
+| Dependencies | Explicit edges | Explicit edges | Auto-derived via TensorMap |
 | Memory management | Host-side | Host + device malloc | Ring buffer heap (GM) |
 | Concurrent build+schedule | No | Optional (`build_mode=1`) | Yes (always) |
 | Profiling support | Basic | Basic | Multi-level hierarchy |
 | Batch/streaming | No | No | Yes (flow control, back-pressure) |
 | Thread model | N scheduler threads | 1 builder + N schedulers | 1 orchestrator + 3 schedulers |
-| Use case | Development, debugging | Reduced host-device transfer | Production PTO2 with manual-scope extensions |
+| Use case | Development, debugging | Reduced host-device transfer | Production workloads |
 
 ## host_build_graph
 

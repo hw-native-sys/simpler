@@ -8,7 +8,7 @@ See [docs/developer-guide.md](docs/developer-guide.md) for full directory struct
 | ---- | ----------------- |
 | Platform Developer | `src/{arch}/platform/` |
 | Runtime Developer | `src/{arch}/runtime/` |
-| Codegen Developer | `examples/{arch}/` |
+| Codegen Developer | `examples/` |
 
 ## Common Commands
 
@@ -32,9 +32,8 @@ clang-format -i <file>
 
 ## Important Rules
 
-1. **Consult `.agents/rules/` for coding conventions** (architecture, codestyle, terminology) — these are always-loaded guidelines. **Consult `.agents/skills/` for task-specific workflows** (e.g., `git-commit/` when committing, `testing/` when running tests)
+1. **Consult `.claude/rules/` for coding conventions** (architecture, codestyle, terminology) — these are always-loaded guidelines. **Consult `.claude/skills/` for task-specific workflows** (e.g., `git-commit/` when committing, `testing/` when running tests)
 2. **Do not modify directories outside your assigned area** unless the user explicitly requests it
 3. Create new subdirectories under your assigned directory as needed
 4. When in doubt, ask the user before making changes to other areas
 5. **Avoid including private information in documentation or code** such as usernames, absolute paths with usernames, or other personally identifiable information. Use relative paths or generic placeholders instead
-6. **Place examples under `examples/{arch}/{runtime}/{name}/`**. Do not create `examples/{runtime}/...` directly under `examples/`.

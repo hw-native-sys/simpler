@@ -21,12 +21,18 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 
 # --- tensormap_and_ringbuffer ---
 declare -A TMR_EXAMPLE_CASES=(
+    [alternating_matmul_add]=""
+    [benchmark_bgemm]=""
     [paged_attention]="Case1,Case2"
     [paged_attention_unroll]="Case1,Case2"
+    [batch_paged_attention]=""
 )
 TMR_EXAMPLE_ORDER=(
+    alternating_matmul_add
+    benchmark_bgemm
     paged_attention
     paged_attention_unroll
+    batch_paged_attention
 )
 
 # --- aicpu_build_graph ---

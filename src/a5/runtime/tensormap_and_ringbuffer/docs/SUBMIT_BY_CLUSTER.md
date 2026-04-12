@@ -204,9 +204,9 @@ Milestone command (device):
 
 ```bash
 python examples/scripts/run_example.py \
-  -k tests/st/a5/tensormap_and_ringbuffer/batch_paged_attention/kernels \
-  -g tests/st/a5/tensormap_and_ringbuffer/batch_paged_attention/golden.py \
-  -p a5 -d 9
+  -k tests/st/tensormap_and_ringbuffer/batch_paged_attention/kernels \
+  -g tests/st/tensormap_and_ringbuffer/batch_paged_attention/golden.py \
+  -p a2a3 -d 9
 ```
 
 Final validation:

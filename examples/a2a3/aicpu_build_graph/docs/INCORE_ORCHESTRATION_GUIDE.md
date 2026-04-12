@@ -4,8 +4,8 @@
 In aicpu_build_graph, the orchestration function runs on AICPU. It reads device pointers from `runtime->orch_args`, allocates intermediate buffers with `device_malloc`, builds the task dependency graph through the `AicpuBuildApi` function-pointer table, and publishes tasks for scheduling.
 
 ## Where To Put Orchestration Code
-- Each example keeps orchestration sources under `examples/a2a3/aicpu_build_graph/<example>/kernels/orchestration/`.
-- `examples/a2a3/aicpu_build_graph/<example>/kernels/kernel_config.py` defines the orchestration entry point. Example: `ORCHESTRATION = {"source": ".../orchestration.cpp", "function_name": "orchestration"}`.
+- Each example keeps orchestration sources under `examples/aicpu_build_graph/<example>/kernels/orchestration/`.
+- `examples/aicpu_build_graph/<example>/kernels/kernel_config.py` defines the orchestration entry point. Example: `ORCHESTRATION = {"source": ".../orchestration.cpp", "function_name": "orchestration"}`.
 
 ## Function Signature
 Your orchestration entry must be `extern "C"` and match:
@@ -60,5 +60,5 @@ Where `api` is `runtime->aicpu_build_api`.
 - `"0"`: Sequential -- schedulers wait until the builder finishes all tasks.
 
 ## Examples
-- `examples/a2a3/aicpu_build_graph/vector_example/kernels/orchestration/orchestration.cpp`
-- `examples/a2a3/aicpu_build_graph/bgemm/kernels/orchestration/bgemm_orch.cpp`
+- `examples/aicpu_build_graph/vector_example/kernels/orchestration/orchestration.cpp`
+- `examples/aicpu_build_graph/bgemm/kernels/orchestration/bgemm_orch.cpp`

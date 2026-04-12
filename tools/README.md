@@ -34,7 +34,7 @@ python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -
 
 # 从 kernel_config.py 加载函数名映射
 python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json \
-    -k examples/a2a3/host_build_graph/paged_attention/kernels/kernel_config.py
+    -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
 # 使用指定 device id 自动选择 device log（device-<id>）
 python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -d 0
@@ -102,8 +102,8 @@ log root 解析顺序：
 ```bash
 # 运行测试并启用性能分析 - 测试通过后自动生成 merged_swimlane.json
 python examples/scripts/run_example.py \
-    -k examples/a2a3/host_build_graph/vector_example/kernels \
-    -g examples/a2a3/host_build_graph/vector_example/golden.py \
+    -k examples/host_build_graph/vector_example/kernels \
+    -g examples/host_build_graph/vector_example/golden.py \
     --enable-profiling
 ```
 
@@ -190,7 +190,7 @@ python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json -o d
 
 # 从 kernel_config.py 加载函数名映射
 python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json \
-    -k examples/a2a3/host_build_graph/paged_attention/kernels/kernel_config.py
+    -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
 # 使用紧凑样式（仅显示任务ID和函数名）
 python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json --style compact
@@ -270,7 +270,7 @@ flowchart TD
 
 ### 功能概述
 
-`benchmark_rounds.sh` 遍历脚本顶部为对应 runtime 配置的测试用例（位于 `tests/st/{arch}/{runtime}/` 下），依次调用 `run_example.py` 运行每个 example，然后从生成的 device log 中提取 `orch_start` / `orch_end` / `sched_end` 时间戳计算每轮 elapsed 时间。
+`benchmark_rounds.sh` 遍历 `EXAMPLES` 数组中配置的测试用例（位于 `tests/st/tensormap_and_ringbuffer/` 下），依次调用 `run_example.py` 运行每个 example，然后从生成的 device log 中提取 `orch_start` / `orch_end` / `sched_end` 时间戳计算每轮 elapsed 时间。
 
 当前预配置的 examples：
 - `alternating_matmul_add`
