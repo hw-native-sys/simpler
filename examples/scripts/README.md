@@ -236,6 +236,51 @@ def compute_golden(tensors: dict, params: dict) -> None:
         output[i] = float(nranks * i + 100 * nranks * (nranks - 1) // 2)
 ```
 
+### 4.1 Optional Multi-Task Distributed Host Orchestration
+
+For examples that want to express multiple L3 tasks connected by TensorMap
+dependencies, `kernel_config.py` may point at a separate host-orchestration
+Python file:
+
+```python
+DISTRIBUTED_HOST_ORCH = {
+    "source": str(KERNELS_DIR / "orchestration" / "host_orch.py"),
+    "function_name": "distributed_orch",
+}
+```
+
+Then `host_orch.py` defines the task registry and submit order:
+
+```python
+from pathlib import Path
+
+_ORCH_ROOT = Path(__file__).parent
+
+DISTRIBUTED_TASKS = [
+    {
+        "name": "task_a",
+        "source": str(_ORCH_ROOT / "task_a.cpp"),
+        "function_name": "aicpu_orchestration_entry",
+        "args": ["input", "tmp"],
+    },
+    {
+        "name": "task_b",
+        "source": str(_ORCH_ROOT / "task_b.cpp"),
+        "function_name": "aicpu_orchestration_entry",
+        "args": ["tmp", "output", "deviceCtx"],
+    },
+]
+
+def distributed_orch(ctx):
+    ctx.submit_task("task_a", outputs=["tmp"])
+    ctx.submit_task("task_b", inputs=["tmp"], outputs=["output"])
+```
+
+`ctx.submit_task(...)` submits one CHIP group task across all ranks. The
+runner expands named buffers into distributed input/output specs with
+`worker_index=rank`, so the second task can depend on the first purely through
+L3 TensorMap lookup/insert.
+
 ### 5. Standard `golden.py` Format
 
 ```python
@@ -484,6 +529,7 @@ TEST FAILED: Output 'f' does not match golden
 - **Single-Card Example**: [examples/a2a3/host_build_graph/vector_example/](../a2a3/host_build_graph/vector_example/)
 - **Async Completion Demo** (2-card, deferred RDMA read): [examples/a2a3/tensormap_and_ringbuffer/async_completion_demo/](../a2a3/tensormap_and_ringbuffer/async_completion_demo/)
 - **Async Notify Demo** (2-card, TNOTIFY launch gating): [examples/a2a3/tensormap_and_ringbuffer/async_notify_demo/](../a2a3/tensormap_and_ringbuffer/async_notify_demo/)
+- **FFN TP Parallel** (multi-task L3 `FFN -> AllReduce`): [examples/a2a3/tensormap_and_ringbuffer/ffn_tp_parallel/](../a2a3/tensormap_and_ringbuffer/ffn_tp_parallel/)
 
 ## FAQ
 

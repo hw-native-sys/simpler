@@ -458,6 +458,33 @@ def _temporary_env(env_updates: dict[str, str]):
                 os.environ[k] = prev
 
 
+class DistributedOrchContext:
+    """Host-side helper passed to distributed_orch(ctx) in multi-task examples."""
+
+    def __init__(self, runner, worker, task_payloads, task_rank_args):
+        self._runner = runner
+        self._worker = worker
+        self._task_payloads = task_payloads
+        self._task_rank_args = task_rank_args
+        self.nranks = runner.nranks
+        self.chip_contexts = list(worker.chip_contexts)
+
+    def submit_task(self, task_name: str, inputs: Optional[list[str]] = None, outputs: Optional[list[str]] = None):
+        payload = self._task_payloads.get(task_name)
+        if payload is None:
+            raise KeyError(f"Unknown distributed task: {task_name}")
+        rank_args = self._task_rank_args.get(task_name)
+        if rank_args is None:
+            raise KeyError(f"Missing rank args for distributed task: {task_name}")
+        return self._worker.submit(
+            payload.worker_type,
+            payload,
+            inputs=self._runner._task_input_specs(inputs or []),
+            outputs=self._runner._task_output_specs(outputs or []),
+            args_list=[arg.__ptr__() for arg in rank_args],
+        )
+
+
 class CodeRunner:
     """
     Simplified test runner that loads kernel config and golden script.
@@ -529,7 +556,14 @@ class CodeRunner:
 
         # Extract kernel configuration
         self.kernels = self._kernel_config.KERNELS
-        self.orchestration = self._kernel_config.ORCHESTRATION
+        self.orchestration = getattr(self._kernel_config, "ORCHESTRATION", None)
+        self._distributed_host_orch_module = self._load_distributed_host_orch_module()
+        self._distributed_tasks = getattr(
+            self._distributed_host_orch_module,
+            "DISTRIBUTED_TASKS",
+            getattr(self._kernel_config, "DISTRIBUTED_TASKS", None),
+        )
+        self._distributed_orch = self._load_distributed_orch_callable()
 
         # Extract golden configuration — determine which cases to run
         all_cases = getattr(self._golden_module, "ALL_CASES", {"Default": {}})
@@ -572,7 +606,6 @@ class CodeRunner:
                 if len(device_ids) != self.nranks:
                     raise ValueError(f"Expected {self.nranks} device ids, got {len(device_ids)}: {device_ids}")
                 self.device_ids = list(device_ids)
-            self.orch_func = self.orchestration["function_name"]
             self._dist_run_dir = (
                 self.project_root / "build" / "distributed" / "runs" / f"run_{os.getpid()}_{time.time_ns()}"
             )
@@ -583,6 +616,10 @@ class CodeRunner:
             self._dist_example_output_artifacts: list[dict[str, Path]] = []
             self._dist_example_inputs_by_rank = []
             self._dist_example_outputs_by_rank = []
+            self._worker_chip_contexts = []
+            self._validate_distributed_task_config()
+        elif self.orchestration is None:
+            raise AttributeError("kernel_config.py must define ORCHESTRATION for non-distributed examples")
 
     def _load_kernel_config(self):
         """Load kernel_config.py from kernels directory."""
@@ -590,6 +627,33 @@ class CodeRunner:
         if not config_path.exists():
             raise FileNotFoundError(f"kernel_config.py not found in {self.kernels_dir}\nExpected: {config_path}")
         return _load_module_from_path(config_path, f"kernel_config_{id(self)}")
+
+    def _load_distributed_host_orch_module(self):
+        cfg = getattr(self._kernel_config, "DISTRIBUTED_HOST_ORCH", None)
+        if cfg is None:
+            return None
+        if not isinstance(cfg, dict):
+            raise TypeError("DISTRIBUTED_HOST_ORCH must be a dict when provided")
+        source = cfg.get("source")
+        if not isinstance(source, str) or not source:
+            raise KeyError("DISTRIBUTED_HOST_ORCH must define non-empty 'source'")
+        source_path = Path(source)
+        if not source_path.is_absolute():
+            source_path = (self.kernels_dir / source_path).resolve()
+        if not source_path.exists():
+            raise FileNotFoundError(f"Distributed host orchestration file not found: {source_path}")
+        return _load_module_from_path(source_path, f"distributed_host_orch_{id(self)}")
+
+    def _load_distributed_orch_callable(self):
+        cfg = getattr(self._kernel_config, "DISTRIBUTED_HOST_ORCH", None)
+        func_name = "distributed_orch"
+        if cfg is not None:
+            if not isinstance(cfg, dict):
+                raise TypeError("DISTRIBUTED_HOST_ORCH must be a dict when provided")
+            func_name = str(cfg.get("function_name", func_name))
+        if self._distributed_host_orch_module is not None:
+            return getattr(self._distributed_host_orch_module, func_name, None)
+        return getattr(self._kernel_config, "distributed_orch", None)
 
     def _load_golden_module(self):
         """Load golden.py script."""
@@ -599,14 +663,39 @@ class CodeRunner:
         module = _load_module_from_path(self.golden_path, f"golden_{id(self)}")
 
         # Validate required functions
-        if not hasattr(module, "generate_inputs"):
-            raise AttributeError(f"golden.py must define generate_inputs(params) function\nFile: {self.golden_path}")
         if not hasattr(module, "compute_golden"):
             raise AttributeError(
                 f"golden.py must define compute_golden(tensors, params) function\nFile: {self.golden_path}"
             )
+        if not hasattr(module, "generate_inputs") and not hasattr(module, "generate_distributed_inputs"):
+            raise AttributeError(
+                f"golden.py must define generate_inputs(params) or generate_distributed_inputs(rank, nranks, root, comm_ctx=None)\nFile: {self.golden_path}"
+            )
 
         return module
+
+    def _validate_distributed_task_config(self) -> None:
+        if self._distributed_tasks is None:
+            if self.orchestration is None:
+                raise AttributeError("Distributed examples must define ORCHESTRATION or DISTRIBUTED_TASKS")
+            return
+        if not isinstance(self._distributed_tasks, list) or not self._distributed_tasks:
+            raise TypeError("DISTRIBUTED_TASKS must be a non-empty list")
+        seen = set()
+        for task in self._distributed_tasks:
+            if not isinstance(task, dict):
+                raise TypeError("Each DISTRIBUTED_TASKS item must be a dict")
+            for key in ("name", "source", "function_name", "args"):
+                if key not in task:
+                    raise KeyError(f"DISTRIBUTED_TASKS item is missing '{key}'")
+            name = str(task["name"])
+            if name in seen:
+                raise ValueError(f"Duplicate distributed task name: {name}")
+            seen.add(name)
+            if not isinstance(task["args"], list):
+                raise TypeError(f"DISTRIBUTED_TASKS[{name}].args must be a list")
+        if self._distributed_orch is not None and not callable(self._distributed_orch):
+            raise TypeError("distributed_orch must be callable when provided")
 
     def _identify_outputs(self, tensors: dict[str, torch.Tensor]) -> tuple[dict, dict]:
         """
@@ -1037,6 +1126,17 @@ class CodeRunner:
             raise ValueError(f"Unsupported distributed buffer dtype: {dtype}")
         return mapping[dtype]
 
+    def _dist_task_configs(self) -> list[dict[str, Any]]:
+        if self._distributed_tasks is None:
+            return []
+        return list(self._distributed_tasks)
+
+    def _dist_task_config(self, task_name: str) -> dict[str, Any]:
+        for task in self._dist_task_configs():
+            if task["name"] == task_name:
+                return task
+        raise KeyError(f"Unknown distributed task: {task_name}")
+
     def _chip_runtime_artifact_paths(self):
         return {
             "host": self.artifact_dir / "libhost_runtime.so",
@@ -1044,23 +1144,28 @@ class CodeRunner:
             "aicore": self.artifact_dir / "aicore_kernel.o",
         }
 
-    def _chip_orch_artifact_name(self):
+    def _chip_orch_artifact_name(self, task_name: Optional[str] = None):
+        if task_name is not None:
+            return f"{task_name}.so"
+        assert self.orchestration is not None
         return Path(self.orchestration["source"]).stem + ".so"
 
     def _chip_kernel_artifact_name(self, kernel_cfg):
         return Path(kernel_cfg["source"]).stem + ".bin"
 
-    def _build_chip_callable(self):
+    def _build_chip_callable(self, task_name: Optional[str] = None):
         from task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
 
-        orch_binary = (self.artifact_dir / self._chip_orch_artifact_name()).read_bytes()
+        orch_cfg = self._dist_task_config(task_name) if task_name is not None else self.orchestration
+        assert orch_cfg is not None
+        orch_binary = (self.artifact_dir / self._chip_orch_artifact_name(task_name)).read_bytes()
         children = []
         for kernel_cfg in self.kernels:
             binary = (self.artifact_dir / self._chip_kernel_artifact_name(kernel_cfg)).read_bytes()
             children.append((kernel_cfg["func_id"], CoreCallable.build(kernel_cfg.get("signature", []), binary)))
         return ChipCallable.build(
-            self.orchestration.get("signature", []),
-            self.orch_func,
+            orch_cfg.get("signature", []),
+            orch_cfg["function_name"],
             orch_binary,
             children,
         )
@@ -1188,13 +1293,13 @@ class CodeRunner:
             host_outputs=list(self._dist_example_outputs_by_rank[rank].values()),
         )
 
-    def _make_chip_task_args(self, chip_context):
+    def _make_chip_task_args(self, chip_context, arg_tokens: Optional[list[str]] = None):
         from task_interface import ChipStorageTaskArgs, scalar_to_uint64  # noqa: PLC0415
 
         dist = getattr(self._kernel_config, "DISTRIBUTED_CONFIG", {})
         buf_cfg_by_name = {buf["name"]: buf for buf in dist.get("buffers", [])}
         args = ChipStorageTaskArgs()
-        for tok in dist.get("args", []):
+        for tok in arg_tokens or dist.get("args", []):
             if tok == "nranks":
                 args.add_scalar(scalar_to_uint64(self.nranks))
             elif tok == "root":
@@ -1218,6 +1323,50 @@ class CodeRunner:
                     )
                 args.add_tensor(tensor_arg)
         return args
+
+    def _task_input_specs(self, buffer_names: list[str]) -> list[tuple[int, int]]:
+        specs = []
+        for rank, chip_context in enumerate(self._worker_chip_contexts):
+            for name in buffer_names:
+                specs.append((rank, int(chip_context.buffer_ptrs[name])))
+        return specs
+
+    def _task_output_specs(self, buffer_names: list[str]) -> list[dict[str, int]]:
+        specs: list[dict[str, int]] = []
+        for rank, chip_context in enumerate(self._worker_chip_contexts):
+            for name in buffer_names:
+                buf_cfg = self._dist_example_buffer_config(name)
+                specs.append(
+                    {
+                        "ptr": int(chip_context.buffer_ptrs[name]),
+                        "size": self._buffer_nbytes(buf_cfg),
+                        "worker_index": rank,
+                    }
+                )
+        return specs
+
+    def _build_dist_task_payloads(self):
+        from task_interface import WorkerPayload, WorkerType  # noqa: PLC0415
+
+        runtime_cfg = getattr(self._kernel_config, "RUNTIME_CONFIG", {})
+        payloads = {}
+        for task in self._dist_task_configs():
+            payload = WorkerPayload()
+            payload.worker_type = WorkerType.CHIP
+            payload.callable = self._chip_callables[task["name"]].buffer_ptr()
+            payload.block_dim = int(runtime_cfg.get("block_dim", 1))
+            payload.aicpu_thread_num = int(runtime_cfg.get("aicpu_thread_num", 1))
+            payloads[task["name"]] = payload
+        return payloads
+
+    def _build_dist_task_rank_args(self):
+        task_rank_args = {}
+        for task in self._dist_task_configs():
+            task_rank_args[task["name"]] = [
+                self._make_chip_task_args(chip_context, list(task["args"]))
+                for chip_context in self._worker_chip_contexts
+            ]
+        return task_rank_args
 
     def _compile_dist_example_artifacts(self):
         from elf_parser import extract_text_section  # noqa: PLC0415
@@ -1243,12 +1392,23 @@ class CodeRunner:
         runtime_bins = builder.get_binaries(self.runtime_name, build=self.build_runtime)
 
         logger.info("=== Phase 2: Compiling orchestration ===")
-        orch_binary = kernel_compiler.compile_orchestration(
-            self.runtime_name,
-            str(Path(self.orchestration["source"]).resolve()),
-            extra_include_dirs=kernel_compiler.get_orchestration_include_dirs(self.runtime_name),
-            build_dir=str(self.build_dir),
-        )
+        orchestration_binaries = {}
+        if self._dist_task_configs():
+            for task in self._dist_task_configs():
+                orchestration_binaries[task["name"]] = kernel_compiler.compile_orchestration(
+                    self.runtime_name,
+                    str(Path(task["source"]).resolve()),
+                    extra_include_dirs=kernel_compiler.get_orchestration_include_dirs(self.runtime_name),
+                    build_dir=str(self.build_dir),
+                )
+        else:
+            assert self.orchestration is not None
+            orchestration_binaries["__single__"] = kernel_compiler.compile_orchestration(
+                self.runtime_name,
+                str(Path(self.orchestration["source"]).resolve()),
+                extra_include_dirs=kernel_compiler.get_orchestration_include_dirs(self.runtime_name),
+                build_dir=str(self.build_dir),
+            )
 
         logger.info("=== Phase 3: Compiling kernels ===")
         extra_includes = kernel_compiler.get_orchestration_include_dirs(self.runtime_name)
@@ -1275,10 +1435,20 @@ class CodeRunner:
         save("libhost_runtime.so", runtime_bins.host_path.read_bytes())
         save("libaicpu_kernel.so", runtime_bins.aicpu_path.read_bytes())
         save("aicore_kernel.o", runtime_bins.aicore_path.read_bytes())
-        save(self._chip_orch_artifact_name(), orch_binary)
+        if self._dist_task_configs():
+            for task_name, orch_binary in orchestration_binaries.items():
+                save(self._chip_orch_artifact_name(task_name), orch_binary)
+        else:
+            save(self._chip_orch_artifact_name(), orchestration_binaries["__single__"])
         for _, (kcfg, data) in kernel_bins.items():
             save(self._chip_kernel_artifact_name(kcfg), data)
-        self._chip_callable = self._build_chip_callable()
+        if self._dist_task_configs():
+            self._chip_callables = {
+                task["name"]: self._build_chip_callable(task["name"])
+                for task in self._dist_task_configs()
+            }
+        else:
+            self._chip_callable = self._build_chip_callable()
         logger.info(f"All artifacts saved to {self.artifact_dir}")
 
     def _dump_dist_example_outputs(self) -> None:
@@ -1292,7 +1462,6 @@ class CodeRunner:
                     shm.close()
 
     def _run_distributed(self):
-        from task_interface import WorkerPayload, WorkerType  # noqa: PLC0415
         from worker import Task, Worker  # noqa: PLC0415
 
         if not self._dist_example_inputs_by_rank or not self._dist_example_outputs_by_rank:
@@ -1304,7 +1473,13 @@ class CodeRunner:
         if rootinfo_file.exists():
             rootinfo_file.unlink()
 
-        if not hasattr(self, "_chip_callable"):
+        if self._dist_task_configs():
+            if not hasattr(self, "_chip_callables"):
+                self._chip_callables = {
+                    task["name"]: self._build_chip_callable(task["name"])
+                    for task in self._dist_task_configs()
+                }
+        elif not hasattr(self, "_chip_callable"):
             self._chip_callable = self._build_chip_callable()
 
         runtime_paths = self._chip_runtime_artifact_paths()
@@ -1326,23 +1501,45 @@ class CodeRunner:
                     chip_bootstrap_configs=chip_bootstrap_configs,
                 )
                 worker.init()
-                rank_args = [self._make_chip_task_args(ctx) for ctx in worker.chip_contexts]
-
-                payload = WorkerPayload()
-                payload.worker_type = WorkerType.CHIP
-                payload.callable = self._chip_callable.buffer_ptr()
-                payload.block_dim = int(getattr(self._kernel_config, "RUNTIME_CONFIG", {}).get("block_dim", 1))
-                payload.aicpu_thread_num = int(getattr(self._kernel_config, "RUNTIME_CONFIG", {}).get("aicpu_thread_num", 1))
-
-                def orch_fn(w, args_list):
-                    w.submit(
-                        WorkerType.CHIP,
-                        payload,
-                        args_list=[arg.__ptr__() for arg in args_list],
-                        outputs=[],
+                self._worker_chip_contexts = list(worker.chip_contexts)
+                if self._dist_task_configs():
+                    if self._distributed_orch is None:
+                        raise AttributeError(
+                            "Distributed multi-task examples must define distributed_orch(ctx) in kernel_config.py"
+                        )
+                    orch_ctx = DistributedOrchContext(
+                        self,
+                        worker,
+                        self._build_dist_task_payloads(),
+                        self._build_dist_task_rank_args(),
                     )
 
-                worker.run(Task(orch=orch_fn, args=rank_args))
+                    def orch_fn(_worker, ctx):
+                        self._distributed_orch(ctx)
+
+                    worker.run(Task(orch=orch_fn, args=orch_ctx))
+                else:
+                    from task_interface import WorkerPayload, WorkerType  # noqa: PLC0415
+
+                    rank_args = [self._make_chip_task_args(ctx) for ctx in worker.chip_contexts]
+
+                    payload = WorkerPayload()
+                    payload.worker_type = WorkerType.CHIP
+                    payload.callable = self._chip_callable.buffer_ptr()
+                    payload.block_dim = int(getattr(self._kernel_config, "RUNTIME_CONFIG", {}).get("block_dim", 1))
+                    payload.aicpu_thread_num = int(
+                        getattr(self._kernel_config, "RUNTIME_CONFIG", {}).get("aicpu_thread_num", 1)
+                    )
+
+                    def orch_fn(w, args_list):
+                        w.submit(
+                            WorkerType.CHIP,
+                            payload,
+                            args_list=[arg.__ptr__() for arg in args_list],
+                            outputs=[],
+                        )
+
+                    worker.run(Task(orch=orch_fn, args=rank_args))
                 self._dump_dist_example_outputs()
         except Exception:
             logger.exception("Distributed worker execution failed")
@@ -1350,6 +1547,7 @@ class CodeRunner:
         finally:
             if worker is not None:
                 worker.close()
+            self._worker_chip_contexts = []
             for f in self.artifact_dir.glob("barrier_*.ready"):
                 f.unlink()
 
