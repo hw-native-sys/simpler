@@ -68,6 +68,44 @@ function(add_dist_test name src)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+function(add_a2a3_pto2_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+function(add_a5_pto2_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/orchestration
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/runtime
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/runtime/tensormap_and_ringbuffer/common
+        ${CMAKE_SOURCE_DIR}/../../../src/a5/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
 enable_testing()
 
 add_dist_test(test_dist_tensormap  test_dist_tensormap.cpp)
@@ -75,3 +113,5 @@ add_dist_test(test_dist_ring       test_dist_ring.cpp)
 add_dist_test(test_dist_scope      test_dist_scope.cpp)
 add_dist_test(test_dist_orchestrator test_dist_orchestrator.cpp)
 add_dist_test(test_dist_scheduler  test_dist_scheduler.cpp)
+add_a2a3_pto2_test(test_a2a3_pto2_fatal test_a2a3_pto2_fatal.cpp)
+add_a5_pto2_test(test_a5_pto2_fatal test_a5_pto2_fatal.cpp)

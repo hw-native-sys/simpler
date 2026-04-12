@@ -19,6 +19,7 @@
 
 #include "pto_runtime2.h"
 
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -52,6 +53,19 @@ void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
 void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrator); }
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
+
+void pto2_rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    if (fmt == nullptr || fmt[0] == '\0') {
+        pto2_orch_report_fatal(&rt->orchestrator, error_code, func, nullptr);
+    } else {
+        char message[1024];
+        vsnprintf(message, sizeof(message), fmt, args);
+        pto2_orch_report_fatal(&rt->orchestrator, error_code, func, "%s", message);
+    }
+    va_end(args);
+}
 
 // Wait for all producers of this tensor to be safe for data access.
 // Checks owner metadata (lifecycle anchor) and OverlapMap (modifier writers).
@@ -105,9 +119,9 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
         while (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                orch.fatal = true;
-                unified_log_error(
-                    caller, "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
+                pto2_orch_report_fatal(
+                    &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                    "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
                     (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES,  // NOLINT(runtime/int)
                     ring_id, local_id
                 );
@@ -121,9 +135,9 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
             while (slot.fanout_refcount.load(std::memory_order_acquire) < slot.fanout_count - 1) {
                 SPIN_WAIT_HINT();
                 if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                    orch.fatal = true;
-                    unified_log_error(
-                        caller, "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
+                    pto2_orch_report_fatal(
+                        &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
                         (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES,  // NOLINT(runtime/int)
                         ring_id, local_id
                     );
@@ -185,6 +199,7 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .scope_end = pto2_rt_scope_end,
     .orchestration_done = pto2_rt_orchestration_done,
     .is_fatal = is_fatal_impl,
+    .report_fatal = pto2_rt_report_fatal,
     .log_error = unified_log_error,
     .log_warn = unified_log_warn,
     .log_info = unified_log_info,

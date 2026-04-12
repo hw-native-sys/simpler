@@ -141,6 +141,12 @@ void pto2_orchestrator_destroy(PTO2OrchestratorState *orch);
 void pto2_orchestrator_set_scheduler(PTO2OrchestratorState *orch, PTO2SchedulerState *scheduler);
 
 // =============================================================================
+// Fatal Reporting
+// =============================================================================
+
+void pto2_orch_report_fatal(PTO2OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, ...);
+
+// =============================================================================
 // Scope Management
 // =============================================================================
 

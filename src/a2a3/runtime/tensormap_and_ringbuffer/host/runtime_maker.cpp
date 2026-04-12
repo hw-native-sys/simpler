@@ -35,6 +35,7 @@
 #include <cstdlib>
 #include <cstring>
 
+#include "../common/pto_runtime_status.h"
 #include "../runtime/pto_shared_memory.h"
 #include "../runtime/runtime.h"
 #include "callable.h"
@@ -67,6 +68,27 @@ static uint64_t parse_env_uint64(const char *name, uint64_t min_val, bool requir
         return 0;
     }
     return static_cast<uint64_t>(val);
+}
+
+static int32_t pto2_read_runtime_status(Runtime *runtime, PTO2SharedMemoryHeader *host_header) {
+    if (runtime == nullptr || host_header == nullptr) {
+        return 0;
+    }
+
+    void *pto2_sm = runtime->get_pto2_gm_sm_ptr();
+    if (pto2_sm == nullptr) {
+        return 0;
+    }
+
+    int hdr_rc = runtime->host_api.copy_from_device(host_header, pto2_sm, sizeof(PTO2SharedMemoryHeader));
+    if (hdr_rc != 0) {
+        LOG_WARN("Failed to copy PTO2 header from device");
+        return 0;
+    }
+
+    int32_t orch_error_code = host_header->orch_error_code.load(std::memory_order_relaxed);
+    int32_t sched_error_code = host_header->sched_error_code.load(std::memory_order_relaxed);
+    return pto2_runtime_status_from_error_codes(orch_error_code, sched_error_code);
 }
 
 /**
@@ -299,58 +321,67 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     LOG_INFO("Tensor pairs to process: %d", tensor_pair_count);
 
     // PTO2 (device orchestration): graph output may be in packed buffer
-    void *pto2_sm = runtime->get_pto2_gm_sm_ptr();
     uint64_t graph_out_ptr = 0;
     uint64_t graph_out_size = 0;
+    bool skip_tensor_copy_back = false;
+    int32_t runtime_status = 0;
+    PTO2SharedMemoryHeader host_header;
+    memset(&host_header, 0, sizeof(host_header));
 
-    if (pto2_sm != nullptr) {
-        // Copy header from device to host to read graph_output_ptr/size
-        PTO2SharedMemoryHeader host_header;
-        int hdr_rc = runtime->host_api.copy_from_device(&host_header, pto2_sm, sizeof(PTO2SharedMemoryHeader));
-        if (hdr_rc == 0) {
-            graph_out_ptr = host_header.graph_output_ptr;
-            graph_out_size = host_header.graph_output_size;
-            if (graph_out_ptr != 0) {
-                LOG_INFO("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
-            }
-        } else {
-            LOG_WARN("Failed to copy PTO2 header from device");
+    runtime_status = pto2_read_runtime_status(runtime, &host_header);
+    if (runtime_status != 0) {
+        int32_t orch_error_code = host_header.orch_error_code.load(std::memory_order_relaxed);
+        int32_t sched_error_code = host_header.sched_error_code.load(std::memory_order_relaxed);
+        LOG_ERROR(
+            "PTO2 runtime failed: orch_error_code=%d sched_error_code=%d runtime_status=%d", orch_error_code,
+            sched_error_code, runtime_status
+        );
+        skip_tensor_copy_back = true;
+    } else {
+        graph_out_ptr = host_header.graph_output_ptr;
+        graph_out_size = host_header.graph_output_size;
+        if (graph_out_ptr != 0) {
+            LOG_INFO("Graph output buffer: ptr=0x%" PRIx64 ", size=%" PRIu64, graph_out_ptr, graph_out_size);
         }
     }
 
-    bool first_output_tensor = true;
-    for (int i = 0; i < tensor_pair_count; i++) {
-        const TensorPair &pair = tensor_pairs[i];
+    if (skip_tensor_copy_back) {
+        LOG_WARN("Skipping tensor copy-back because PTO2 runtime reported fatal status");
+    } else {
+        bool first_output_tensor = true;
+        for (int i = 0; i < tensor_pair_count; i++) {
+            const TensorPair &pair = tensor_pairs[i];
 
-        // Skip if device pointer is null
-        if (pair.dev_ptr == nullptr) {
-            LOG_WARN("Tensor %d has null device pointer, skipping", i);
-            continue;
-        }
+            // Skip if device pointer is null
+            if (pair.dev_ptr == nullptr) {
+                LOG_WARN("Tensor %d has null device pointer, skipping", i);
+                continue;
+            }
 
-        // If host pointer is null, this is a device-only allocation (no copy-back)
-        if (pair.host_ptr == nullptr) {
-            LOG_INFO("Tensor %d: device-only allocation (no copy-back)", i);
-            continue;
-        }
+            // If host pointer is null, this is a device-only allocation (no copy-back)
+            if (pair.host_ptr == nullptr) {
+                LOG_INFO("Tensor %d: device-only allocation (no copy-back)", i);
+                continue;
+            }
 
-        void *src_ptr = pair.dev_ptr;
-        size_t copy_size = pair.size;
+            void *src_ptr = pair.dev_ptr;
+            size_t copy_size = pair.size;
 
-        // Use graph_output_ptr for the first output tensor if available
-        if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
-            src_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(graph_out_ptr));
-            copy_size = static_cast<size_t>(graph_out_size);
-            LOG_INFO("Using packed output buffer for tensor %d", i);
-            first_output_tensor = false;
-        }
+            // Use graph_output_ptr for the first output tensor if available
+            if (first_output_tensor && graph_out_ptr != 0 && graph_out_size > 0) {
+                src_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(graph_out_ptr));
+                copy_size = static_cast<size_t>(graph_out_size);
+                LOG_INFO("Using packed output buffer for tensor %d", i);
+                first_output_tensor = false;
+            }
 
-        int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, src_ptr, copy_size);
-        if (copy_rc != 0) {
-            LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
-            rc = copy_rc;
-        } else {
-            LOG_INFO("Tensor %d: %zu bytes copied to host", i, pair.size);
+            int copy_rc = runtime->host_api.copy_from_device(pair.host_ptr, src_ptr, copy_size);
+            if (copy_rc != 0) {
+                LOG_ERROR("Failed to copy tensor %d from device: %d", i, copy_rc);
+                rc = copy_rc;
+            } else {
+                LOG_INFO("Tensor %d: %zu bytes copied to host", i, pair.size);
+            }
         }
     }
 
@@ -379,6 +410,10 @@ extern "C" int validate_runtime_impl(Runtime *runtime) {
     runtime->clear_tensor_pairs();
 
     LOG_INFO("=== Finalize Complete ===");
+
+    if (rc == 0 && runtime_status != 0) {
+        rc = runtime_status;
+    }
 
     return rc;
 }

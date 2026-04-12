@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 
+#include <atomic>
 #include <cstdio>
 #include <string>
 #include <vector>
@@ -366,12 +367,17 @@ int DeviceRunner::run(
     LOG_INFO("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
     std::vector<std::thread> aicpu_threads;
     aicpu_threads.reserve(over_launch);
+    std::atomic<int> aicpu_rc{0};
     for (int i = 0; i < over_launch; i++) {
-        aicpu_threads.push_back(create_thread([this, &runtime, launch_aicpu_num, over_launch]() {
+        aicpu_threads.push_back(create_thread([this, &runtime, launch_aicpu_num, over_launch, &aicpu_rc]() {
             if (!platform_aicpu_affinity_gate(launch_aicpu_num, over_launch)) {
                 return;
             }
-            aicpu_execute_func_(&runtime);
+            int rc = aicpu_execute_func_(&runtime);
+            if (rc != 0) {
+                int expected = 0;
+                aicpu_rc.compare_exchange_strong(expected, rc, std::memory_order_acq_rel);
+            }
         }));
     }
 
@@ -414,6 +420,12 @@ int DeviceRunner::run(
     }
 
     LOG_INFO("All threads completed");
+
+    int runtime_rc = aicpu_rc.load(std::memory_order_acquire);
+    if (runtime_rc != 0) {
+        LOG_ERROR("AICPU execution failed with rc=%d", runtime_rc);
+        return runtime_rc;
+    }
 
     // Stop memory management, drain remaining buffers, collect phase data, export
     if (runtime.enable_profiling) {

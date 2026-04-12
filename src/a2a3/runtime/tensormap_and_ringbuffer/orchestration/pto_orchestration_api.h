@@ -34,10 +34,11 @@
 #include <type_traits>
 
 // Type headers needed by orchestration
-#include "pto_submit_types.h"  // MixedKernels, INVALID_KERNEL_ID, subtask slots  // NOLINT(build/include_subdir)
-#include "pto_types.h"         // Arg, TaskOutputTensors, TensorArgType  // NOLINT(build/include_subdir)
-#include "task_args.h"         // ChipStorageTaskArgs, ContinuousTensor  // NOLINT(build/include_subdir)
-#include "tensor.h"            // Tensor, TensorCreateInfo  // NOLINT(build/include_subdir)
+#include "pto_runtime2_types.h"  // PTO2_ERROR_*  // NOLINT(build/include_subdir)
+#include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots  // NOLINT(build/include_subdir)
+#include "pto_types.h"           // Arg, TaskOutputTensors, TensorArgType  // NOLINT(build/include_subdir)
+#include "task_args.h"           // ChipStorageTaskArgs, ContinuousTensor  // NOLINT(build/include_subdir)
+#include "tensor.h"              // Tensor, TensorCreateInfo  // NOLINT(build/include_subdir)
 
 // =============================================================================
 // Tensor Factory Helpers
@@ -119,6 +120,7 @@ typedef struct PTO2RuntimeOps {
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
     bool (*is_fatal)(PTO2Runtime *rt);
+    void (*report_fatal)(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
 
     // Logging (populated by runtime, called by orchestration)
     void (*log_error)(const char *func, const char *fmt, ...);
@@ -155,15 +157,28 @@ static inline PTO2Runtime *pto2_current_runtime() { return pto2_framework_curren
 
 static inline TaskOutputTensors alloc_tensors(const Arg &args) {
     PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return TaskOutputTensors{};
+    }
     return rt->ops->alloc_tensors(rt, args);
 }
 
 static inline TaskOutputTensors alloc_tensors(const TensorCreateInfo create_infos[], uint32_t count) {
+    PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return TaskOutputTensors{};
+    }
     Arg args;
     for (uint32_t i = 0; i < count; i++) {
         args.add_output(create_infos[i]);
     }
-    always_assert(!args.has_error && "alloc_tensors failed to construct output-only Arg");
+    if (args.has_error) {
+        rt->ops->report_fatal(
+            rt, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
+            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
+        );
+        return TaskOutputTensors{};
+    }
     return alloc_tensors(args);
 }
 
@@ -174,14 +189,27 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
         (std::is_same_v<std::decay_t<CIs>, TensorCreateInfo> && ...),
         "alloc_tensors only accepts TensorCreateInfo arguments"
     );
+    PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return TaskOutputTensors{};
+    }
     Arg args;
     (args.add_output(cis), ...);
-    always_assert(!args.has_error && "alloc_tensors failed to construct output-only Arg");
+    if (args.has_error) {
+        rt->ops->report_fatal(
+            rt, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
+            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
+        );
+        return TaskOutputTensors{};
+    }
     return alloc_tensors(args);
 }
 
 static inline TaskOutputTensors pto2_rt_submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
     PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return TaskOutputTensors{};
+    }
     return rt->ops->submit_task(rt, mixed_kernels, args);
 }
 
@@ -190,6 +218,9 @@ static inline TaskOutputTensors pto2_rt_submit_task(const MixedKernels &mixed_ke
  */
 static inline TaskOutputTensors pto2_rt_submit_aic_task(int32_t kernel_id, const Arg &args) {
     PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return TaskOutputTensors{};
+    }
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, args);
@@ -200,6 +231,9 @@ static inline TaskOutputTensors pto2_rt_submit_aic_task(int32_t kernel_id, const
  */
 static inline TaskOutputTensors pto2_rt_submit_aiv_task(int32_t kernel_id, const Arg &args) {
     PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return TaskOutputTensors{};
+    }
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
     return rt->ops->submit_task(rt, mk, args);
@@ -207,11 +241,17 @@ static inline TaskOutputTensors pto2_rt_submit_aiv_task(int32_t kernel_id, const
 
 static inline void pto2_rt_scope_begin() {
     PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return;
+    }
     rt->ops->scope_begin(rt);
 }
 
 static inline void pto2_rt_scope_end() {
     PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return;
+    }
     rt->ops->scope_end(rt);
 }
 
@@ -224,6 +264,12 @@ static inline bool pto2_rt_is_fatal() {
     PTO2Runtime *rt = pto2_current_runtime();
     return rt->ops->is_fatal(rt);
 }
+
+#define pto2_rt_report_fatal(code, fmt, ...)                                               \
+    do {                                                                                   \
+        PTO2Runtime *_pto2_rt = pto2_current_runtime();                                    \
+        _pto2_rt->ops->report_fatal(_pto2_rt, (code), __FUNCTION__, (fmt), ##__VA_ARGS__); \
+    } while (0)
 
 // =============================================================================
 // Logging Macros for Orchestration (call through ops table)
@@ -255,6 +301,9 @@ static inline bool pto2_rt_is_fatal() {
 template <typename T = uint64_t>
 static inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[]) {
     PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return from_u64<T>(0);
+    }
     return from_u64<T>(rt->ops->get_tensor_data(rt, tensor, ndims, indices));
 }
 
@@ -288,6 +337,9 @@ static inline T get_tensor_data(const Tensor &tensor, uint32_t ndims, const uint
 template <typename T = uint64_t>
 static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const uint32_t indices[], T value) {
     PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return;
+    }
     rt->ops->set_tensor_data(rt, tensor, ndims, indices, to_u64(value));
 }
 
@@ -302,9 +354,15 @@ class PTO2ScopeGuard {
 public:  // NOLINT(whitespace/indent)
     PTO2ScopeGuard() :
         rt_(pto2_current_runtime()) {
-        rt_->ops->scope_begin(rt_);
+        if (!rt_->ops->is_fatal(rt_)) {
+            rt_->ops->scope_begin(rt_);
+        }
     }
-    ~PTO2ScopeGuard() { rt_->ops->scope_end(rt_); }
+    ~PTO2ScopeGuard() {
+        if (!rt_->ops->is_fatal(rt_)) {
+            rt_->ops->scope_end(rt_);
+        }
+    }
 
 private:  // NOLINT(whitespace/indent)
     PTO2Runtime *rt_;

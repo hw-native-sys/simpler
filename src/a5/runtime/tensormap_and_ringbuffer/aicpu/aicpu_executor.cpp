@@ -89,6 +89,22 @@ constexpr int32_t STALL_DUMP_CORE_MAX = 8;
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
 
+static int32_t read_pto2_runtime_status(Runtime *runtime) {
+    if (runtime == nullptr) {
+        return 0;
+    }
+
+    void *sm = runtime->get_pto2_gm_sm_ptr();
+    if (sm == nullptr) {
+        return 0;
+    }
+
+    auto *header = static_cast<PTO2SharedMemoryHeader *>(sm);
+    int32_t orch_error_code = header->orch_error_code.load(std::memory_order_acquire);
+    int32_t sched_error_code = header->sched_error_code.load(std::memory_order_acquire);
+    return pto2_runtime_status_from_error_codes(orch_error_code, sched_error_code);
+}
+
 static PTO2Runtime *rt{nullptr};
 
 // Per-core dispatch payload storage: dual-buffer to allow pipelining.
@@ -2847,10 +2863,17 @@ extern "C" int32_t aicpu_execute(Runtime *runtime) {
         return rc;
     }
 
+    int32_t runtime_rc = read_pto2_runtime_status(runtime);
+
     // Last thread cleans up
     if (g_aicpu_executor.finished_.load(std::memory_order_acquire)) {
         DEV_INFO("aicpu_execute: Last thread finished, cleaning up");
         g_aicpu_executor.deinit(runtime);
+    }
+
+    if (runtime_rc != 0) {
+        DEV_ERROR("aicpu_execute: PTO2 runtime failed with rc=%d", runtime_rc);
+        return runtime_rc;
     }
 
     DEV_INFO("%s", "aicpu_execute: Kernel execution completed successfully");

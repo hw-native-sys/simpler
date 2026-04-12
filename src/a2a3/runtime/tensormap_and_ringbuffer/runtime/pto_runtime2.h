@@ -71,6 +71,7 @@ struct PTO2RuntimeOps {
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
     bool (*is_fatal)(PTO2Runtime *rt);
+    void (*report_fatal)(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
 
     // Logging (populated by runtime, called by orchestration)
     void (*log_error)(const char *func, const char *fmt, ...);
@@ -192,6 +193,11 @@ void pto2_rt_scope_end(PTO2Runtime *rt);
  * Signals that no more tasks will be submitted.
  */
 void pto2_rt_orchestration_done(PTO2Runtime *rt);
+
+/**
+ * Enter fatal state explicitly from orchestration.
+ */
+void pto2_rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func, const char *fmt, ...);
 
 /**
  * Cross-layer data access: read a tensor value by waiting for its producer.

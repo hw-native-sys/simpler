@@ -22,6 +22,7 @@
 #include <assert.h>
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -123,6 +124,51 @@ static void *pto2_aligned_zalloc(size_t size, size_t alignment) {
     return ptr;
 }
 
+static int32_t pto2_orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
+    always_assert(orch != nullptr);
+    orch->fatal = true;
+    if (error_code == PTO2_ERROR_NONE || orch->sm_handle == nullptr || orch->sm_handle->header == nullptr) {
+        return PTO2_ERROR_NONE;
+    }
+
+    int32_t expected = PTO2_ERROR_NONE;
+    std::atomic<int32_t> &orch_error_code = orch->sm_handle->header->orch_error_code;
+    if (orch_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel)) {
+        return error_code;
+    }
+    return expected;
+}
+
+static void pto2_orch_report_fatal_v(
+    PTO2OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, va_list args
+) {
+    int32_t latched_code = pto2_orch_mark_fatal(orch, error_code);
+
+    if (fmt == nullptr || fmt[0] == '\0') {
+        if (latched_code != PTO2_ERROR_NONE && latched_code != error_code) {
+            unified_log_error(func, "FATAL(code=%d, latched=%d)", error_code, latched_code);
+        } else {
+            unified_log_error(func, "FATAL(code=%d)", error_code);
+        }
+        return;
+    }
+
+    char message[1024];
+    vsnprintf(message, sizeof(message), fmt, args);
+    if (latched_code != PTO2_ERROR_NONE && latched_code != error_code) {
+        unified_log_error(func, "FATAL(code=%d, latched=%d): %s", error_code, latched_code, message);
+        return;
+    }
+    unified_log_error(func, "FATAL(code=%d): %s", error_code, message);
+}
+
+void pto2_orch_report_fatal(PTO2OrchestratorState *orch, int32_t error_code, const char *func, const char *fmt, ...) {
+    va_list args;
+    va_start(args, fmt);
+    pto2_orch_report_fatal_v(orch, error_code, func, fmt, args);
+    va_end(args);
+}
+
 struct PTO2FaninBuilder {
     PTO2TaskSlotState *inline_slots[PTO2_FANIN_INLINE_CAP];
     int32_t count{0};
@@ -174,8 +220,7 @@ static bool pto2_append_fanin_or_fail(
         LOG_ERROR("  tensor_arg_type:    %d", static_cast<int>(ptype));
         LOG_ERROR("  reason:             %s", reason);
         LOG_ERROR("========================================");
-        orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_DEPENDENCY_OVERFLOW, std::memory_order_release);
-        orch->fatal = true;
+        pto2_orch_mark_fatal(orch, PTO2_ERROR_DEPENDENCY_OVERFLOW);
         return false;
     }
 
@@ -184,7 +229,7 @@ static bool pto2_append_fanin_or_fail(
     int32_t spill_idx = fanin_pool.top;
     PTO2FaninSpillEntry *entry = fanin_pool.alloc();
     if (entry == nullptr) {
-        orch->fatal = true;
+        pto2_orch_mark_fatal(orch, PTO2_ERROR_DEP_POOL_OVERFLOW);
         return false;
     }
     if (fanin_builder->count == PTO2_FANIN_INLINE_CAP) {
@@ -256,8 +301,7 @@ pto2_check_scope_can_accept_task(PTO2OrchestratorState *orch, PTO2TaskAllocator 
     LOG_ERROR("     Runtime env:  PTO2_RING_TASK_WINDOW=<power-of-2>");
     LOG_ERROR("  3. Split work across multiple scopes");
     LOG_ERROR("========================================");
-    orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_SCOPE_DEADLOCK, std::memory_order_release);
-    orch->fatal = true;
+    pto2_orch_mark_fatal(orch, PTO2_ERROR_SCOPE_DEADLOCK);
     return false;
 }
 
@@ -287,7 +331,7 @@ static bool pto2_prepare_task(
     out->sched = orch->scheduler;
     out->alloc_result = allocator.alloc(total_output_size);
     if (out->alloc_result.failed()) {
-        orch->fatal = true;
+        pto2_orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
         return false;
     }
 
@@ -481,7 +525,8 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
 
     TaskOutputTensors result;
 
-    // Fast path after fatal error — all subsequent submits are no-ops
+    // Orchestration API should short-circuit after fatal, but keep this entry
+    // robust as a no-op in case a caller reaches it directly.
     if (orch->fatal) {
         return result;
     }
@@ -495,8 +540,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         LOG_ERROR("  tensor_count: %d, scalar_count: %d", args.tensor_count(), args.scalar_count());
         LOG_ERROR("This is a bug in the orchestration code.");
         LOG_ERROR("========================================");
-        orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
-        orch->fatal = true;
+        pto2_orch_mark_fatal(orch, PTO2_ERROR_INVALID_ARGS);
         return result;
     }
 
@@ -530,9 +574,11 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         PTO2ResourceShape shape = pto2_active_mask_to_shape(active_mask);
         int32_t limit = (shape == PTO2ResourceShape::AIV) ? orch->total_aiv_count : orch->total_cluster_count;
         if (limit > 0 && block_num > limit) {
-            LOG_ERROR("FATAL: require_sync_start block_num=%d > limit=%d (deadlock guaranteed)", block_num, limit);
-            orch->fatal = true;
-            return TaskOutputTensors{};
+            pto2_orch_report_fatal(
+                orch, PTO2_ERROR_REQUIRE_SYNC_START_INVALID, __FUNCTION__,
+                "require_sync_start block_num=%d > limit=%d (deadlock guaranteed)", block_num, limit
+            );
+            return result;
         }
         active_mask |= PTO2_SUBTASK_FLAG_SYNC_START;
     }
@@ -710,18 +756,42 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
 }
 
 TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args) {
-    always_assert(!orch->fatal && "alloc_tensor cannot be called after the runtime becomes fatal");
-    always_assert(args.tensor_count() > 0 && "alloc_tensors requires at least one TensorCreateInfo");
-    always_assert(args.scalar_count() == 0 && "alloc_tensors only accepts output TensorCreateInfo args");
-    for (int32_t i = 0; i < args.tensor_count(); i++) {
-        always_assert(
-            args.tag(i) == TensorArgType::OUTPUT && "alloc_tensors only accepts output TensorCreateInfo args"
+    // Orchestration API should short-circuit after fatal, but keep this entry
+    // robust as a no-op in case a caller reaches it directly.
+    if (orch->fatal) {
+        return TaskOutputTensors{};
+    }
+
+    if (args.tensor_count() <= 0) {
+        pto2_orch_report_fatal(
+            orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors requires at least one TensorCreateInfo"
         );
+        return TaskOutputTensors{};
+    }
+    if (args.scalar_count() != 0) {
+        pto2_orch_report_fatal(
+            orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors only accepts output TensorCreateInfo args"
+        );
+        return TaskOutputTensors{};
+    }
+    for (int32_t i = 0; i < args.tensor_count(); i++) {
+        if (args.tag(i) != TensorArgType::OUTPUT) {
+            pto2_orch_report_fatal(
+                orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors only accepts output TensorCreateInfo args"
+            );
+            return TaskOutputTensors{};
+        }
     }
 
     CYCLE_COUNT_START();
 
-    always_assert(!args.has_error && "alloc_tensors failed to construct output-only Arg");
+    if (args.has_error) {
+        pto2_orch_report_fatal(
+            orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
+            args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
+        );
+        return TaskOutputTensors{};
+    }
 
     PTO2OutputLayout layout = pto2_calculate_output_layout(args);
     PTO2PreparedTask prepared;

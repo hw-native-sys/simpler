@@ -31,6 +31,7 @@
 
 #include <atomic>
 
+#include "pto_runtime_status.h"
 #include "pto2_dispatch_payload.h"
 #include "pto_submit_types.h"
 #include "pto_task_id.h"
@@ -67,22 +68,6 @@
 #if PTO2_TENSORMAP_PROFILING && !PTO2_ORCH_PROFILING
 #error "PTO2_TENSORMAP_PROFILING requires PTO2_ORCH_PROFILING=1"
 #endif
-
-// =============================================================================
-// AICPU Error Codes (written to shared memory for Host-side diagnosis)
-// =============================================================================
-
-// Orchestrator errors (1-99): detected in orchestrator thread
-#define PTO2_ERROR_NONE 0
-#define PTO2_ERROR_SCOPE_DEADLOCK 1
-#define PTO2_ERROR_HEAP_RING_DEADLOCK 2
-#define PTO2_ERROR_FLOW_CONTROL_DEADLOCK 3
-#define PTO2_ERROR_DEP_POOL_OVERFLOW 4
-#define PTO2_ERROR_INVALID_ARGS 5         // Arg construction error (invalid args)
-#define PTO2_ERROR_DEPENDENCY_OVERFLOW 6  // Too many unique fanin dependencies for one task
-
-// Scheduler errors (100+): detected in scheduler threads
-#define PTO2_ERROR_SCHEDULER_TIMEOUT 100
 
 // =============================================================================
 // Configuration Constants
