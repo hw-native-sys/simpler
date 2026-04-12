@@ -10,11 +10,13 @@
  */
 
 /**
- * DistScheduler — Scheduler thread + per-worker WorkerThread model.
+ * DistScheduler — DAG scheduling engine.
  *
- * Each registered IWorker gets a WorkerThread wrapper with its own thread
- * and task queue.  The Scheduler thread routes tasks from ready_queue to
- * idle WorkerThreads and waits on a shared completion CV instead of polling.
+ * The Scheduler thread routes tasks through the DAG lifecycle:
+ *   ready_queue → dispatch (via WorkerManager) → completion → fanout release → new ready
+ *
+ * Worker pool management (WorkerThread creation, idle selection, dispatch) is
+ * delegated to DistWorkerManager. The Scheduler only drives the DAG state machine.
  *
  * Flow:
  *   Orch: submit() → ready_queue.push(slot) + cv.notify()
@@ -22,11 +24,11 @@
  *   Scheduler thread:
  *     wait on cv (ready_queue OR completion_queue non-empty)
  *     drain completion_queue → on_task_complete → fanout release → ready_queue
- *     drain ready_queue → pick idle WorkerThread → worker_thread.dispatch(slot)
+ *     drain ready_queue → manager.pick_n_idle → dispatch
  *
- *   WorkerThread (one per IWorker):
- *     loop: task_queue.pop() (blocking) → worker.run(payload) →
- *           completion_queue.push(slot) + cv.notify()
+ *   WorkerThread (managed by DistWorkerManager):
+ *     loop: task_queue.pop() → worker.run(payload) →
+ *           completion callback → Scheduler.worker_done(slot)
  */
 
 #pragma once
@@ -34,53 +36,16 @@
 #include <atomic>
 #include <condition_variable>
 #include <functional>
-#include <memory>
 #include <mutex>
 #include <queue>
 #include <thread>
-#include <vector>
 
 #include "dist_types.h"
 
-// =============================================================================
-// WorkerThread — gives one IWorker its own execution thread
-// =============================================================================
-
-class WorkerThread {
-public:
-    WorkerThread() = default;
-    ~WorkerThread() { stop(); }
-    WorkerThread(const WorkerThread &) = delete;
-    WorkerThread &operator=(const WorkerThread &) = delete;
-
-    // Start the worker thread.
-    // on_complete(slot) is called (in the WorkerThread) after each run().
-    void start(IWorker *worker, const std::function<void(DistTaskSlot)> &on_complete);
-
-    // Enqueue a task for the worker.  Non-blocking.
-    void dispatch(const WorkerPayload &payload);
-
-    // True if the worker has no active task.
-    bool idle() const { return idle_.load(std::memory_order_acquire); }
-
-    void stop();
-
-private:
-    IWorker *worker_{nullptr};
-    std::function<void(DistTaskSlot)> on_complete_;
-
-    std::thread thread_;
-    std::queue<WorkerPayload> queue_;
-    std::mutex mu_;
-    std::condition_variable cv_;
-    bool shutdown_{false};
-    std::atomic<bool> idle_{true};
-
-    void loop();
-};
+class DistWorkerManager;  // forward decl
 
 // =============================================================================
-// DistScheduler
+// DistScheduler — DAG engine (no worker pool ownership)
 // =============================================================================
 
 class DistScheduler {
@@ -89,8 +54,7 @@ public:
         DistTaskSlotState *slots;
         int32_t num_slots;
         DistReadyQueue *ready_queue;
-        std::vector<IWorker *> next_level_workers;  // WorkerType::NEXT_LEVEL
-        std::vector<IWorker *> sub_workers;         // WorkerType::SUB
+        DistWorkerManager *manager;  // not owned — Scheduler calls manager for dispatch
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).
         std::function<void(DistTaskSlot)> on_consumed_cb;
     };
@@ -100,12 +64,11 @@ public:
 
     bool running() const { return running_.load(std::memory_order_acquire); }
 
+    // Called by WorkerManager (from WorkerThread) after run() completes.
+    void worker_done(DistTaskSlot slot);
+
 private:
     Config cfg_;
-
-    // Per-worker threads
-    std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
-    std::vector<std::unique_ptr<WorkerThread>> sub_threads_;
 
     // Shared completion queue (WorkerThread → Scheduler)
     std::queue<DistTaskSlot> completion_queue_;
@@ -120,9 +83,4 @@ private:
     void on_task_complete(DistTaskSlot slot);
     void try_consume(DistTaskSlot slot);
     void dispatch_ready();
-    WorkerThread *pick_idle(WorkerType type);
-    std::vector<WorkerThread *> pick_n_idle(WorkerType type, int n);
-
-    // Called by WorkerThread after run() completes
-    void worker_done(DistTaskSlot slot);
 };

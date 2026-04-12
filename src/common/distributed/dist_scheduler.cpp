@@ -13,75 +13,20 @@
 
 #include <stdexcept>
 
+#include "dist_worker_manager.h"
+
 // =============================================================================
-// WorkerThread
+// DistScheduler
 // =============================================================================
-
-void WorkerThread::start(IWorker *worker, const std::function<void(DistTaskSlot)> &on_complete) {
-    worker_ = worker;
-    on_complete_ = on_complete;
-    shutdown_ = false;
-    idle_.store(true, std::memory_order_relaxed);
-    thread_ = std::thread(&WorkerThread::loop, this);
-}
-
-void WorkerThread::dispatch(const WorkerPayload &payload) {
-    idle_.store(false, std::memory_order_release);
-    std::lock_guard<std::mutex> lk(mu_);
-    queue_.push(payload);
-    cv_.notify_one();
-}
-
-void WorkerThread::stop() {
-    {
-        std::lock_guard<std::mutex> lk(mu_);
-        shutdown_ = true;
-    }
-    cv_.notify_all();
-    if (thread_.joinable()) thread_.join();
-}
-
-void WorkerThread::loop() {
-    while (true) {
-        WorkerPayload payload;
-        {
-            std::unique_lock<std::mutex> lk(mu_);
-            cv_.wait(lk, [this] {
-                return !queue_.empty() || shutdown_;
-            });
-            if (queue_.empty()) break;  // shutdown
-            payload = queue_.front();
-            queue_.pop();
-        }
-
-        worker_->run(payload);  // blocking in this thread
-        idle_.store(true, std::memory_order_release);
-        on_complete_(payload.task_slot);  // notify Scheduler
-    }
-}
 
 // =============================================================================
 // DistScheduler
 // =============================================================================
 
 void DistScheduler::start(const Config &cfg) {
-    if (cfg.slots == nullptr || cfg.ready_queue == nullptr)
+    if (cfg.slots == nullptr || cfg.ready_queue == nullptr || cfg.manager == nullptr)
         throw std::invalid_argument("DistScheduler::start: null config fields");
     cfg_ = cfg;
-
-    // Create a WorkerThread per IWorker
-    auto make_threads = [&](const std::vector<IWorker *> &workers,
-                            std::vector<std::unique_ptr<WorkerThread>> &threads) {
-        for (IWorker *w : workers) {
-            auto wt = std::make_unique<WorkerThread>();
-            wt->start(w, [this](DistTaskSlot slot) {
-                worker_done(slot);
-            });
-            threads.push_back(std::move(wt));
-        }
-    };
-    make_threads(cfg_.next_level_workers, next_level_threads_);
-    make_threads(cfg_.sub_workers, sub_threads_);
 
     stop_requested_.store(false, std::memory_order_relaxed);
     running_.store(true, std::memory_order_release);
@@ -95,18 +40,11 @@ void DistScheduler::stop() {
 
     if (sched_thread_.joinable()) sched_thread_.join();
 
-    for (auto &wt : next_level_threads_)
-        wt->stop();
-    for (auto &wt : sub_threads_)
-        wt->stop();
-    next_level_threads_.clear();
-    sub_threads_.clear();
-
     running_.store(false, std::memory_order_release);
 }
 
 // =============================================================================
-// WorkerThread completion callback (called from WorkerThread)
+// WorkerThread completion callback (called from WorkerThread via Manager)
 // =============================================================================
 
 void DistScheduler::worker_done(DistTaskSlot slot) {
@@ -156,19 +94,7 @@ void DistScheduler::run() {
 
         // Exit when stop requested and all workers idle
         if (stop_requested_.load(std::memory_order_acquire)) {
-            bool any_busy = false;
-            for (auto &wt : next_level_threads_)
-                if (!wt->idle()) {
-                    any_busy = true;
-                    break;
-                }
-            if (!any_busy)
-                for (auto &wt : sub_threads_)
-                    if (!wt->idle()) {
-                        any_busy = true;
-                        break;
-                    }
-            if (!any_busy) {
+            if (!cfg_.manager->any_busy()) {
                 // Final drain
                 while (true) {
                     DistTaskSlot slot;
@@ -216,7 +142,6 @@ void DistScheduler::on_task_complete(DistTaskSlot slot) {
     try_consume(slot);
 
     // Deferred release: release one fanout ref on each producer this task consumed.
-    // Mirrors L2 "deferred release: walk fanin → release producer".
     std::vector<DistTaskSlot> producers;
     {
         std::lock_guard<std::mutex> lk(s.fanout_mu);
@@ -243,7 +168,7 @@ void DistScheduler::try_consume(DistTaskSlot slot) {
 }
 
 // =============================================================================
-// Dispatch
+// Dispatch — delegates to WorkerManager
 // =============================================================================
 
 void DistScheduler::dispatch_ready() {
@@ -252,7 +177,7 @@ void DistScheduler::dispatch_ready() {
         DistTaskSlotState &s = cfg_.slots[slot];
         int N = s.group_size();  // 1 for normal tasks
 
-        auto workers = pick_n_idle(s.payload.worker_type, N);
+        auto workers = cfg_.manager->pick_n_idle(s.payload.worker_type, N);
         if (static_cast<int>(workers.size()) < N) {
             cfg_.ready_queue->push(slot);
             break;
@@ -265,25 +190,4 @@ void DistScheduler::dispatch_ready() {
             workers[i]->dispatch(p);
         }
     }
-}
-
-WorkerThread *DistScheduler::pick_idle(WorkerType type) {
-    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
-    for (auto &wt : threads) {
-        if (wt->idle()) return wt.get();
-    }
-    return nullptr;
-}
-
-std::vector<WorkerThread *> DistScheduler::pick_n_idle(WorkerType type, int n) {
-    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
-    std::vector<WorkerThread *> result;
-    result.reserve(n);
-    for (auto &wt : threads) {
-        if (wt->idle()) {
-            result.push_back(wt.get());
-            if (static_cast<int>(result.size()) >= n) break;
-        }
-    }
-    return result;
 }

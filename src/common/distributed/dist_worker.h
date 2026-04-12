@@ -48,6 +48,7 @@
 #include "dist_scope.h"
 #include "dist_tensormap.h"
 #include "dist_types.h"
+#include "dist_worker_manager.h"
 
 class DistWorker : public IWorker {
 public:
@@ -106,9 +107,7 @@ private:
     DistReadyQueue ready_queue_;
     DistOrchestrator orchestrator_;
     DistScheduler scheduler_;
-
-    std::vector<IWorker *> next_level_workers_;
-    std::vector<IWorker *> sub_workers_;
+    DistWorkerManager manager_;
 
     // --- Drain support ---
     std::mutex drain_mu_;

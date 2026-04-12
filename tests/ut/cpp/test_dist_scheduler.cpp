@@ -23,6 +23,7 @@
 #include "dist_scope.h"
 #include "dist_tensormap.h"
 #include "dist_types.h"
+#include "dist_worker_manager.h"
 
 // ---------------------------------------------------------------------------
 // MockWorker: run() blocks until complete() is called by the test thread.
@@ -94,6 +95,7 @@ struct SchedulerFixture : public ::testing::Test {
     DistReadyQueue rq;
     DistOrchestrator orch;
     MockWorker mock_worker;
+    DistWorkerManager manager;
     DistScheduler sched;
 
     std::vector<DistTaskSlot> consumed_slots;
@@ -104,11 +106,16 @@ struct SchedulerFixture : public ::testing::Test {
         ring.init(N);
         orch.init(&tm, &ring, &scope, &rq, slots.get(), N);
 
+        manager.add_next_level(&mock_worker);
+        manager.start([this](DistTaskSlot slot) {
+            sched.worker_done(slot);
+        });
+
         DistScheduler::Config cfg;
         cfg.slots = slots.get();
         cfg.num_slots = N;
         cfg.ready_queue = &rq;
-        cfg.next_level_workers = {&mock_worker};
+        cfg.manager = &manager;
         cfg.on_consumed_cb = [this](DistTaskSlot s) {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
@@ -119,6 +126,7 @@ struct SchedulerFixture : public ::testing::Test {
 
     void TearDown() override {
         sched.stop();
+        manager.stop();
         ring.shutdown();
     }
 
@@ -200,6 +208,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
     DistOrchestrator orch;
     MockWorker worker_a;
     MockWorker worker_b;
+    DistWorkerManager manager;
     DistScheduler sched;
 
     std::vector<DistTaskSlot> consumed_slots;
@@ -210,11 +219,17 @@ struct GroupSchedulerFixture : public ::testing::Test {
         ring.init(N);
         orch.init(&tm, &ring, &scope, &rq, slots.get(), N);
 
+        manager.add_next_level(&worker_a);
+        manager.add_next_level(&worker_b);
+        manager.start([this](DistTaskSlot slot) {
+            sched.worker_done(slot);
+        });
+
         DistScheduler::Config cfg;
         cfg.slots = slots.get();
         cfg.num_slots = N;
         cfg.ready_queue = &rq;
-        cfg.next_level_workers = {&worker_a, &worker_b};
+        cfg.manager = &manager;
         cfg.on_consumed_cb = [this](DistTaskSlot s) {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
@@ -225,6 +240,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
 
     void TearDown() override {
         sched.stop();
+        manager.stop();
         ring.shutdown();
     }
 

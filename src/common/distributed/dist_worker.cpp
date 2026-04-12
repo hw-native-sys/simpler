@@ -24,8 +24,8 @@ DistWorker::~DistWorker() {
 
 void DistWorker::add_worker(WorkerType type, IWorker *worker) {
     if (initialized_) throw std::runtime_error("DistWorker: add_worker after init");
-    if (type == WorkerType::NEXT_LEVEL) next_level_workers_.push_back(worker);
-    else sub_workers_.push_back(worker);
+    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level(worker);
+    else manager_.add_sub(worker);
 }
 
 void DistWorker::init() {
@@ -34,12 +34,17 @@ void DistWorker::init() {
     ring_.init(DIST_TASK_WINDOW_SIZE);
     orchestrator_.init(&tensormap_, &ring_, &scope_, &ready_queue_, slots_.get(), DIST_TASK_WINDOW_SIZE);
 
+    // Start WorkerManager first — creates WorkerThreads.
+    // The on_complete callback routes through the Scheduler's worker_done().
+    manager_.start([this](DistTaskSlot slot) {
+        scheduler_.worker_done(slot);
+    });
+
     DistScheduler::Config cfg;
     cfg.slots = slots_.get();
     cfg.num_slots = DIST_TASK_WINDOW_SIZE;
     cfg.ready_queue = &ready_queue_;
-    cfg.next_level_workers = next_level_workers_;
-    cfg.sub_workers = sub_workers_;
+    cfg.manager = &manager_;
     cfg.on_consumed_cb = [this](DistTaskSlot slot) {
         on_consumed(slot);
     };
@@ -51,6 +56,7 @@ void DistWorker::init() {
 void DistWorker::close() {
     if (!initialized_) return;
     scheduler_.stop();
+    manager_.stop();
     ring_.shutdown();
     initialized_ = false;
 }
