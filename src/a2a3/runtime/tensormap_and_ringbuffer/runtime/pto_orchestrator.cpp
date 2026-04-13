@@ -124,6 +124,21 @@ static void *pto2_aligned_zalloc(size_t size, size_t alignment) {
     return ptr;
 }
 
+static bool pto2_current_scope_contains_task_id(const PTO2OrchestratorState *orch, PTO2TaskId task_id) {
+    if (orch->scope_stack_top < 0) {
+        return false;
+    }
+
+    int32_t begin = orch->scope_begins[orch->scope_stack_top];
+    for (int32_t i = begin; i < orch->scope_tasks_size; i++) {
+        PTO2TaskSlotState *slot_state = orch->scope_tasks[i];
+        if (slot_state != nullptr && slot_state->task != nullptr && slot_state->task->task_id == task_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static int32_t pto2_orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
     always_assert(orch != nullptr);
     orch->fatal = true;
@@ -479,14 +494,22 @@ static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *tas
     orch->scope_tasks[orch->scope_tasks_size++] = task_slot_state;
 }
 
-void pto2_scope_begin(PTO2OrchestratorState *orch) {
+void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode) {
     if (orch->fatal) {
         return;
     }
     assert(orch->scope_stack_top < static_cast<int32_t>(orch->scope_stack_capacity - 1) && "Scope stack overflow");
+    if (mode == PTO2ScopeMode::MANUAL && orch->in_manual_scope()) {
+        pto2_orch_report_fatal(orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "nested manual scope is not supported");
+        return;
+    }
 
     ++orch->scope_stack_top;
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
+    orch->scope_modes[orch->scope_stack_top] = mode;
+    if (mode == PTO2ScopeMode::MANUAL) {
+        orch->current_manual_scope_depth = orch->scope_stack_top;
+    }
 }
 
 void pto2_scope_end(PTO2OrchestratorState *orch) {
@@ -499,8 +522,12 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
     uint64_t _se0 = get_sys_cnt_aicpu();
 #endif
 
+    PTO2ScopeMode mode = orch->scope_modes[orch->scope_stack_top];
     int32_t begin = orch->scope_begins[orch->scope_stack_top--];
     int32_t count = orch->scope_tasks_size - begin;
+    if (mode == PTO2ScopeMode::MANUAL) {
+        orch->current_manual_scope_depth = -1;
+    }
 
     if (orch->scheduler && count > 0) {
         orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
@@ -519,11 +546,11 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
 // =============================================================================
 // Task Submission
 // =============================================================================
-TaskOutputTensors
+TaskSubmitResult
 pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_kernels, const Arg &args) {
     CYCLE_COUNT_START();
 
-    TaskOutputTensors result;
+    TaskSubmitResult result;
 
     // Orchestration API should short-circuit after fatal, but keep this entry
     // robust as a no-op in case a caller reaches it directly.
@@ -542,6 +569,30 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         LOG_ERROR("========================================");
         pto2_orch_mark_fatal(orch, PTO2_ERROR_INVALID_ARGS);
         return result;
+    }
+    if (args.explicit_dep_count() > 0) {
+        if (!orch->in_manual_scope()) {
+            pto2_orch_report_fatal(
+                orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "Arg.add_dep(...) is only valid inside manual scope"
+            );
+            return result;
+        }
+        for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
+            PTO2TaskId dep_task_id = args.explicit_dep(i);
+            if (!dep_task_id.is_valid()) {
+                pto2_orch_report_fatal(
+                    orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "manual dependency task_id is invalid"
+                );
+                return result;
+            }
+            if (!pto2_current_scope_contains_task_id(orch, dep_task_id)) {
+                pto2_orch_report_fatal(
+                    orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__,
+                    "manual dependency must target a task created in the current manual scope"
+                );
+                return result;
+            }
+        }
     }
 
     // === Validate submit inputs ===
@@ -755,31 +806,37 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     return result;
 }
 
-TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args) {
+TaskSubmitResult pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args) {
     // Orchestration API should short-circuit after fatal, but keep this entry
     // robust as a no-op in case a caller reaches it directly.
     if (orch->fatal) {
-        return TaskOutputTensors{};
+        return TaskSubmitResult{};
     }
 
     if (args.tensor_count() <= 0) {
         pto2_orch_report_fatal(
             orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors requires at least one TensorCreateInfo"
         );
-        return TaskOutputTensors{};
+        return TaskSubmitResult{};
+    }
+    if (args.explicit_dep_count() != 0) {
+        pto2_orch_report_fatal(
+            orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors does not accept explicit dependencies"
+        );
+        return TaskSubmitResult{};
     }
     if (args.scalar_count() != 0) {
         pto2_orch_report_fatal(
             orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors only accepts output TensorCreateInfo args"
         );
-        return TaskOutputTensors{};
+        return TaskSubmitResult{};
     }
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) != TensorArgType::OUTPUT) {
             pto2_orch_report_fatal(
                 orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "alloc_tensors only accepts output TensorCreateInfo args"
             );
-            return TaskOutputTensors{};
+            return TaskSubmitResult{};
         }
     }
 
@@ -790,13 +847,13 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
             orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__, "%s",
             args.error_msg ? args.error_msg : "alloc_tensors failed to construct output-only Arg"
         );
-        return TaskOutputTensors{};
+        return TaskSubmitResult{};
     }
 
     PTO2OutputLayout layout = pto2_calculate_output_layout(args);
     PTO2PreparedTask prepared;
     if (!pto2_prepare_task(orch, args, layout.total_output_size, 0, &prepared)) {
-        return TaskOutputTensors{};
+        return TaskSubmitResult{};
     }
 
     uint8_t ring_id = prepared.task_id.ring();
@@ -824,7 +881,7 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    TaskOutputTensors outputs;
+    TaskSubmitResult outputs;
     payload->init(args, outputs, prepared.alloc_result.packed_base, layout.offsets, layout.buffer_sizes);
     payload->fanin_actual_count = 0;
     payload->fanin_spill_start = 0;
