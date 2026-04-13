@@ -98,7 +98,7 @@ struct PerfRecord {
 static_assert(sizeof(PerfRecord) % 64 == 0, "PerfRecord must be 64-byte aligned for optimal cache performance");
 
 // =============================================================================
-// PerfBuffer - Fixed-Size Record Buffer
+// PerfBuffer - Fixed-Size Record Buffer with WIP Staging Slots
 // =============================================================================
 
 /**
@@ -106,10 +106,14 @@ static_assert(sizeof(PerfRecord) % 64 == 0, "PerfRecord must be 64-byte aligned 
  *
  * Capacity: PLATFORM_PROF_BUFFER_SIZE (defined in platform_config.h)
  * Allocated dynamically by Host, pushed into per-core free_queue.
+ *
+ * WIP protocol: AICore writes timing to wip[reg_task_id & 1], AICPU copies
+ * it into records[count] at completion. Dual-slot parity ensures no overlap.
  */
 struct PerfBuffer {
-    PerfRecord records[PLATFORM_PROF_BUFFER_SIZE];  // Record array
-    volatile uint32_t count;                        // Current record count
+    PerfRecord wip[2];                              // AICore WIP staging slots (index = reg_task_id & 1)
+    PerfRecord records[PLATFORM_PROF_BUFFER_SIZE];  // Committed records (AICPU writes)
+    volatile uint32_t count;                        // Current committed record count
 } __attribute__((aligned(64)));
 
 // =============================================================================

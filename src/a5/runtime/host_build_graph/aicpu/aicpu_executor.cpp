@@ -616,8 +616,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 int completed_task_id = pending_task_ids_[core_id];
                 int prev_running_id = running_task_ids_[core_id];
 
-                // Profiling: when prev_running_id exists, its AICore record was
-                // written first (at records[count]), so complete it BEFORE the
+                // Profiling: when prev_running_id exists, its AICore timing was
+                // written to wip[id & 1] first, so complete it BEFORE the
                 // pending task's record to maintain buffer ordering.
                 if (profiling_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
