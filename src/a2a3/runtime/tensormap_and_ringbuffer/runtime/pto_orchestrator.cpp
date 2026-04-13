@@ -139,6 +139,11 @@ static bool pto2_current_scope_contains_task_id(const PTO2OrchestratorState *orc
     return false;
 }
 
+static bool pto2_is_current_manual_scope_local(const PTO2OrchestratorState *orch, const Tensor &tensor) {
+    return orch->in_manual_scope() && tensor.owner_task_id.is_valid() &&
+           tensor.producer_manual_scope_depth == orch->current_manual_scope_depth;
+}
+
 static int32_t pto2_orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
     always_assert(orch != nullptr);
     orch->fatal = true;
@@ -252,6 +257,24 @@ static bool pto2_append_fanin_or_fail(
     }
     entry->slot_state = prod_state;
     fanin_builder->count++;
+    return true;
+}
+
+static bool pto2_append_explicit_manual_deps(
+    PTO2OrchestratorState *orch, PTO2TaskId consumer_task_id, const Arg &args, PTO2FaninBuilder *fanin_builder,
+    PTO2SchedulerState *sched, PTO2RingFlowControl &fc, uint8_t consumer_ring_id
+) {
+    for (uint32_t i = 0; i < args.explicit_dep_count(); i++) {
+        PTO2TaskId dep_task_id = args.explicit_dep(i);
+        PTO2TaskSlotState *prod_state =
+            &sched->ring_sched_states[dep_task_id.ring()].get_slot_state_by_task_id(dep_task_id.local());
+        if (!pto2_append_fanin_or_fail(
+                orch, consumer_task_id, -1, TensorArgType::INPUT, prod_state, fanin_builder, sched, fc,
+                consumer_ring_id, "manual explicit dep"
+            )) {
+            return false;
+        }
+    }
     return true;
 }
 
@@ -651,6 +674,11 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     fanin_builder.spill_start = 0;
     fanin_builder.spill_pool = &orch->rings[ring_id].fanin_pool;
 
+    if (args.explicit_dep_count() > 0 &&
+        !pto2_append_explicit_manual_deps(orch, task_id, args, &fanin_builder, sched, fc, ring_id)) {
+        return result;
+    }
+
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, task_id.raw);
 
 #if PTO2_PROFILING
@@ -694,7 +722,8 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
             continue;
         }
-        if (tensor->manual_dep) {
+        bool manual_local = pto2_is_current_manual_scope_local(orch, *tensor);
+        if (tensor->manual_dep || (manual_local && args.explicit_dep_count() > 0)) {
             continue;
         }
 
@@ -725,7 +754,8 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         for (int i = 0; i < args.tensor_count(); i++) {
             TensorArgType ptype = args.tag(i);
             if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-                if (!args.tensor(i).ptr->manual_dep) {
+                bool manual_local = pto2_is_current_manual_scope_local(orch, *args.tensor(i).ptr);
+                if (!args.tensor(i).ptr->manual_dep && !(manual_local && args.explicit_dep_count() > 0)) {
                     orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
                 }
             }
@@ -752,6 +782,9 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     for (int i = 0; i < args.tensor_count(); i++) {
         if (args.tag(i) == TensorArgType::OUTPUT) {
             payload->tensors[i].owner_task_id = prepared.task_id;
+            payload->tensors[i].set_producer_scope_metadata(
+                static_cast<int16_t>(orch->scope_stack_top), static_cast<int16_t>(orch->current_manual_scope_depth)
+            );
         }
     }
 
@@ -888,6 +921,9 @@ TaskSubmitResult pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args
     payload->fanin_spill_pool = nullptr;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         payload->tensors[i].owner_task_id = prepared.task_id;
+        payload->tensors[i].set_producer_scope_metadata(
+            static_cast<int16_t>(orch->scope_stack_top), static_cast<int16_t>(orch->current_manual_scope_depth)
+        );
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, prepared.task_id.raw);
