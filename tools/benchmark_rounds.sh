@@ -33,12 +33,24 @@ declare -A TMR_EXAMPLE_CASES=(
     [benchmark_bgemm]=""
     [paged_attention_unroll]="Case1,Case2"
     [batch_paged_attention]=""
+    [dispatch-independent]=""
+    [dispatch-serial]=""
+    [graph-chain_n]=""
+    [graph-fanin_n]=""
+    [graph-fanout_n]=""
+    [graph-diamond]=""
 )
 TMR_EXAMPLE_ORDER=(
     alternating_matmul_add
     benchmark_bgemm
     paged_attention_unroll
     batch_paged_attention
+    dispatch-independent
+    dispatch-serial
+    graph-chain_n
+    graph-fanin_n
+    graph-fanout_n
+    graph-diamond
 )
 
 # --- aicpu_build_graph ---
