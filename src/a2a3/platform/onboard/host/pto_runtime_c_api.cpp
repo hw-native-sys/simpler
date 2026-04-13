@@ -25,7 +25,8 @@
 
 #include "common/unified_log.h"
 #include "device_runner.h"  // NOLINT(build/include_subdir)
-#include "runtime.h"        // NOLINT(build/include_subdir)
+#include "host/raii_scope_guard.h"
+#include "runtime.h"  // NOLINT(build/include_subdir)
 
 extern "C" {
 
@@ -128,66 +129,58 @@ int run_runtime(
 
     DeviceRunner *runner = static_cast<DeviceRunner *>(ctx);
 
-    int rc = -1;
-    runner
-        ->create_thread([&]() {
-            pthread_once(&g_runner_key_once, create_runner_key);
-            pthread_setspecific(g_runner_key, ctx);
+    pthread_once(&g_runner_key_once, create_runner_key);
+    pthread_setspecific(g_runner_key, ctx);
+    auto tsd_guard = RAIIScopeGuard([]() {
+        pthread_setspecific(g_runner_key, nullptr);
+    });
 
-            try {
-                // Ensure device + streams are initialized on this thread
-                rc = runner->ensure_device_set(device_id);
-                if (rc != 0) return;
+    try {
+        int rc = runner->ensure_device_set(device_id);
+        if (rc != 0) return rc;
+        auto device_guard = RAIIScopeGuard([runner]() {
+            runner->reset_device_context();
+        });
 
-                // Phase 1: placement new + build graph
-                Runtime *r = new (runtime) Runtime();
-                r->host_api.device_malloc = device_malloc;
-                r->host_api.device_free = device_free;
-                r->host_api.copy_to_device = copy_to_device;
-                r->host_api.copy_from_device = copy_from_device;
-                r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
-                r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
+        Runtime *r = new (runtime) Runtime();
+        r->host_api.device_malloc = device_malloc;
+        r->host_api.device_free = device_free;
+        r->host_api.copy_to_device = copy_to_device;
+        r->host_api.copy_from_device = copy_from_device;
+        r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
+        r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
 
-                LOG_DEBUG("About to call init_runtime_impl, r=%p", (void *)r);
-                rc = init_runtime_impl(
-                    r, reinterpret_cast<const ChipCallable *>(callable),
-                    reinterpret_cast<const ChipStorageTaskArgs *>(args)
-                );
-                LOG_DEBUG("init_runtime_impl returned: %d", rc);
-                if (rc != 0) {
-                    r->set_pto2_gm_sm_ptr(nullptr);
-                    validate_runtime_impl(r);
-                    r->~Runtime();
-                    return;
-                }
+        LOG_DEBUG("About to call init_runtime_impl, r=%p", (void *)r);
+        rc = init_runtime_impl(
+            r, reinterpret_cast<const ChipCallable *>(callable), reinterpret_cast<const ChipStorageTaskArgs *>(args)
+        );
+        LOG_DEBUG("init_runtime_impl returned: %d", rc);
+        if (rc != 0) {
+            r->set_pto2_gm_sm_ptr(nullptr);
+            validate_runtime_impl(r);
+            r->~Runtime();
+            return rc;
+        }
 
-                // Phase 2: profiling
-                if (enable_profiling) {
-                    r->enable_profiling = true;
-                }
+        if (enable_profiling) {
+            r->enable_profiling = true;
+        }
 
-                // Phase 3: launch
-                std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
-                std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
-                rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
-                if (rc != 0) {
-                    validate_runtime_impl(r);
-                    r->~Runtime();
-                    return;
-                }
+        std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
+        std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
+        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
+        if (rc != 0) {
+            validate_runtime_impl(r);
+            r->~Runtime();
+            return rc;
+        }
 
-                // Phase 4: finalize (copy results back)
-                rc = validate_runtime_impl(r);
-                r->~Runtime();
-                runner->reset_device_context();
-            } catch (...) {
-                runner->reset_device_context();
-                rc = -1;
-            }
-        })
-        .join();
-
-    return rc;
+        rc = validate_runtime_impl(r);
+        r->~Runtime();
+        return rc;
+    } catch (...) {
+        return -1;
+    }
 }
 
 int finalize_device(DeviceContextHandle ctx) {
