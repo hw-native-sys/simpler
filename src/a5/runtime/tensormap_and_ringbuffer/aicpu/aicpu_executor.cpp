@@ -9,7 +9,6 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 #include <dlfcn.h>
-#include <fcntl.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -25,6 +24,7 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
+#include "aicpu/orch_so_file.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 #include "spin_hint.h"
@@ -2226,8 +2226,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             const int32_t num_candidates = sizeof(candidate_dirs) / sizeof(candidate_dirs[0]);
 
             for (int32_t i = 0; i < num_candidates && !file_created; i++) {
-                snprintf(so_path, sizeof(so_path), "%s/libdevice_orch_%d.so", candidate_dirs[i], getpid());
-                int32_t fd = open(so_path, O_WRONLY | O_CREAT | O_TRUNC, 0755);
+                int32_t fd = create_orch_so_file(candidate_dirs[i], so_path, sizeof(so_path));
                 if (fd < 0) {
                     DEV_INFO(
                         "Thread %d: Cannot create SO at %s (errno=%d), trying next path", thread_idx, so_path, errno
@@ -2642,8 +2641,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 orch_bind_runtime_(nullptr);
             }
             pto2_runtime_destroy(rt);
-            dlclose(orch_so_handle_);
-            unlink(orch_so_path_);
         }
     }
 
@@ -2697,6 +2694,12 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     orch_func_ = nullptr;
     orch_bind_runtime_ = nullptr;
     orch_args_cached_ = nullptr;
+    if (orch_so_handle_ != nullptr) {
+        dlclose(orch_so_handle_);
+    }
+    if (orch_so_path_[0] != '\0') {
+        unlink(orch_so_path_);
+    }
     orch_so_handle_ = nullptr;
     orch_so_path_[0] = '\0';
 
