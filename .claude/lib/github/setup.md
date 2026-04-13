@@ -17,7 +17,7 @@ Detects repository role, remotes, and current state. Sets standard variables use
 ### Canonical Repo
 
 ```bash
-UPSTREAM_OWNER="ChaoWao"
+UPSTREAM_OWNER="hw-native-sys"
 UPSTREAM_NAME="simpler"
 UPSTREAM_REPO="$UPSTREAM_OWNER/$UPSTREAM_NAME"
 DEFAULT_BRANCH="main"
@@ -90,7 +90,7 @@ fi
 | `ROLE` | `"owner"` | `"fork"` |
 | `BASE_REF` | `upstream/main` | `upstream/main` |
 | `PUSH_REMOTE` | `origin` | `origin` |
-| `PR_REPO_OWNER` | `ChaoWao` | `ChaoWao` |
+| `PR_REPO_OWNER` | `hw-native-sys` | `hw-native-sys` |
 | `PR_REPO_NAME` | `simpler` | `simpler` |
 | `PR_HEAD_PREFIX` | `""` | `"myuser:"` |
 | `DEFAULT_BRANCH` | `main` | `main` |

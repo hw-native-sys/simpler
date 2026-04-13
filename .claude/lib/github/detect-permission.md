@@ -1,6 +1,6 @@
 # Detect Permission
 
-Used by `address-pr-comments` when working on someone else's PR. Determines push access and overrides `PUSH_REMOTE` if needed.
+Used by `fix-pr` when working on someone else's PR. Determines push access and overrides `PUSH_REMOTE` if needed.
 
 ## Fetch PR Metadata
 
@@ -62,4 +62,4 @@ esac
 
 ## Cleanup After Push
 
-Do NOT remove the fork remote — it is reused by upstream tracking for auto-detection in `/github-pr` and `/address-pr-comments`.
+Do NOT remove the fork remote — it is reused by upstream tracking for auto-detection in `/github-pr` and `/fix-pr`.

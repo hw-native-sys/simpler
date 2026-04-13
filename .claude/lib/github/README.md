@@ -8,10 +8,10 @@ Reusable procedures for GitHub PR workflows.
 | --------- | ----------- | ------- |
 | [setup](setup.md) | Authenticate and detect repository context | All |
 | [lookup-pr](lookup-pr.md) | Find PR by number, branch, or list all | All |
-| [detect-permission](detect-permission.md) | Check push access to PR | address-pr-comments |
-| [commit-and-push](commit-and-push.md) | Squash commits, rebase, and push | github-pr, address-pr-comments |
-| [fetch-comments](fetch-comments.md) | Get unresolved PR review comments | address-pr-comments |
-| [reply-and-resolve](reply-and-resolve.md) | Reply to and resolve review threads | address-pr-comments |
+| [detect-permission](detect-permission.md) | Check push access to PR | fix-pr |
+| [commit-and-push](commit-and-push.md) | Squash commits, rebase, and push | github-pr, fix-pr |
+| [fetch-comments](fetch-comments.md) | Get unresolved PR review comments | fix-pr |
+| [reply-and-resolve](reply-and-resolve.md) | Reply to and resolve review threads | fix-pr |
 | [branch-naming](branch-naming.md) | Generate branch name from commit | github-pr |
 | [common-issues](common-issues.md) | Troubleshooting reference | All |
 
@@ -21,9 +21,9 @@ After running `detect-context`, these variables are available:
 
 | Variable | Description | Example (owner) | Example (fork) |
 | -------- | ----------- | --------------- | -------------- |
-| `REPO_OWNER` | Origin repo owner | `ChaoWao` | `contributor` |
+| `REPO_OWNER` | Origin repo owner | `hw-native-sys` | `contributor` |
 | `REPO_NAME` | Origin repo name | `simpler` | `simpler` |
-| `PR_REPO_OWNER` | PR target owner | `ChaoWao` | `ChaoWao` |
+| `PR_REPO_OWNER` | PR target owner | `hw-native-sys` | `hw-native-sys` |
 | `PR_REPO_NAME` | PR target name | `simpler` | `simpler` |
 | `DEFAULT_BRANCH` | Base branch name | `main` | `main` |
 | `BASE_REF` | Full base ref | `origin/main` | `upstream/main` |

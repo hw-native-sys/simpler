@@ -49,7 +49,7 @@ Do NOT use `-f`/`-F` flags to pass GraphQL `$variables`. Bash mangles `$` signs 
 
 ```bash
 # BAD — $owner/$repo/$number clash with bash
-gh api graphql -f owner="ChaoWao" -f repo="simpler" -F number=276 \
+gh api graphql -f owner="hw-native-sys" -f repo="simpler" -F number=276 \
   -f query='query($owner: String!, $repo: String!, $number: Int!) { ... }'
 
 # GOOD — inline values, no variables

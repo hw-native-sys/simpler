@@ -33,7 +33,7 @@ query {
 }'
 ```
 
-Replace `OWNER`, `REPO`, `NUMBER` with actual values (e.g., `"ChaoWao"`, `"simpler"`, `276`).
+Replace `OWNER`, `REPO`, `NUMBER` with actual values (e.g., `"hw-native-sys"`, `"simpler"`, `276`).
 
 Use `--jq` to filter unresolved threads:
 
@@ -43,9 +43,11 @@ gh api graphql -f query='...' \
 ```
 
 **Limits:**
+
 - `reviewThreads(first: 100)`: Fetches up to 100 threads.
 - `comments(first: 50)`: Fetches up to 50 comments per thread.
 
 Output: JSON array of unresolved threads. Each thread has:
+
 - `id` — GraphQL node ID (for resolving via mutation)
 - `comments.nodes[].databaseId` — REST API ID (for replying)

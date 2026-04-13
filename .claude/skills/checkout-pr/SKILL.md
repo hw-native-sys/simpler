@@ -62,11 +62,10 @@ Run [checkout-fork-branch](../../lib/github/checkout-fork-branch.md) with `PUSH_
 
 Print summary:
 
-```
-Checked out PR #$PR_NUMBER ($PR_AUTHOR)
+```text
   Remote: $FORK_REMOTE -> git@github.com:$HEAD_REPO_OWNER/$HEAD_REPO_NAME.git
   Branch: $LOCAL_BRANCH -> $FORK_REMOTE/$HEAD_BRANCH
   Push:   PUSH_REMOTE=$FORK_REMOTE  BRANCH_NAME=$LOCAL_BRANCH:$HEAD_BRANCH
 ```
 
-Remind user that `/github-pr` and `/address-pr-comments` will pick up the correct push target automatically (via upstream tracking).
+Remind user that `/github-pr` and `/fix-pr` will pick up the correct push target automatically (via upstream tracking).
