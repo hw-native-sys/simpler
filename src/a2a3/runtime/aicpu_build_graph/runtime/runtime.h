@@ -34,8 +34,8 @@
 #include "common/core_type.h"
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"
-#include "pto2_dispatch_payload.h"  // NOLINT(build/include_subdir)
-#include "task_args.h"              // NOLINT(build/include_subdir)
+#include "pto2_dispatch_payload.h"
+#include "task_args.h"
 
 // =============================================================================
 // Configuration Macros
@@ -148,7 +148,7 @@ struct Task {
  * execution control and device orchestration state.
  */
 class Runtime {
-public:  // NOLINT(whitespace/indent)
+public:
     // Handshake buffers for AICPU-AICore communication
     Handshake workers[RUNTIME_MAX_WORKER];  // Worker (AICore) handshake buffers
     int worker_count;                       // Number of active workers
@@ -176,7 +176,7 @@ public:  // NOLINT(whitespace/indent)
     bool orch_to_sched;
     uint64_t perf_data_base;  // Performance data shared memory base address (device-side)
 
-private:  // NOLINT(whitespace/indent)
+private:
     // Tensor pairs for host-device memory tracking
     TensorPair tensor_pairs[RUNTIME_MAX_TENSOR_PAIRS];
     int tensor_pair_count;
@@ -197,7 +197,7 @@ private:  // NOLINT(whitespace/indent)
     uint8_t device_orch_so_storage_[RUNTIME_MAX_ORCH_SO_SIZE];
     size_t device_orch_so_size_;
 
-public:  // NOLINT(whitespace/indent)
+public:
     /**
      * Constructor - zero-initialize all arrays
      */

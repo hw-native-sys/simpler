@@ -21,8 +21,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "common/core_type.h"  // NOLINT(build/include_subdir)
-#include "task_args.h"         // NOLINT(build/include_subdir)
+#include "common/core_type.h"
+#include "task_args.h"
 
 typedef struct OrchestrationRuntime OrchestrationRuntime;
 

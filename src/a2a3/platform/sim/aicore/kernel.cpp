@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <pthread.h>
 
-#include "inner_kernel.h"  // NOLINT(build/include_subdir)
+#include "inner_kernel.h"
 #include "aicore/aicore.h"
 #include "common/core_type.h"
 #include "common/platform_config.h"

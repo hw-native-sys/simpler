@@ -13,7 +13,7 @@
 #include "aicore/performance_collector_aicore.h"
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"  // Platform configuration (C/C++ compatible)
-#include "runtime.h"                 // NOLINT(build/include_subdir)
+#include "runtime.h"
 
 typedef void (*KernelFunc)(__gm__ int64_t *);
 

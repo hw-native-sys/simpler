@@ -18,9 +18,9 @@
 #include <string>
 #include <utility>
 
-#include "common.h"       // NOLINT(build/include_subdir)
-#include "data_type.h"    // NOLINT(build/include_subdir)
-#include "pto_task_id.h"  // NOLINT(build/include_subdir)
+#include "common.h"
+#include "data_type.h"
+#include "pto_task_id.h"
 
 constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
 
@@ -64,7 +64,7 @@ struct Segment {
  * must remain valid (not a temporary) until after the submit call.
  */
 class alignas(64) TensorCreateInfo {
-public:  // NOLINT(whitespace/indent)
+public:
     TensorCreateInfo(
         const uint32_t shapes[], uint32_t ndims, DataType dtype = DataType::FLOAT32, bool manual_dep = false
     ) :
@@ -97,7 +97,7 @@ public:  // NOLINT(whitespace/indent)
         return total * get_element_size(dtype);
     }
 
-public:  // NOLINT(whitespace/indent)
+public:
     // --- Bytes [0, 32): TensorCreateInfo-only fields ---
     // These occupy the same positions as Tensor::buffer, Tensor::owner_task_id,
     // and Tensor::start_offset. The runtime overwrites owner metadata after the

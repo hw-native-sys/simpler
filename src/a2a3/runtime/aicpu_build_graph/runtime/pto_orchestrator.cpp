@@ -21,7 +21,7 @@
  * - scope_end: batch-publishes all tasks (releases +1 fanin redundance)
  */
 
-#include "pto_orchestrator.h"  // NOLINT(build/include_subdir)
+#include "pto_orchestrator.h"
 
 #include <assert.h>
 #include <inttypes.h>
@@ -30,10 +30,10 @@
 #include <string.h>
 
 #include "common/unified_log.h"
-#include "pto_runtime2_types.h"  // NOLINT(build/include_subdir)
-#include "pto_shared_memory.h"   // NOLINT(build/include_subdir)
-#include "pto_types.h"           // NOLINT(build/include_subdir)
-#include "tensor.h"              // NOLINT(build/include_subdir)
+#include "pto_runtime2_types.h"
+#include "pto_shared_memory.h"
+#include "pto_types.h"
+#include "tensor.h"
 
 // =============================================================================
 // Orchestrator Profiling (compile-time toggle)

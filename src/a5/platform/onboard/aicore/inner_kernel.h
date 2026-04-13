@@ -17,8 +17,6 @@
  * running on real Ascend hardware with CANN compiler support.
  */
 
-// NOLINT(build/header_guard) -- PLATFORM_* include guards are the project convention here
-
 #ifndef PLATFORM_A5_AICORE_INNER_KERNEL_H_
 #define PLATFORM_A5_AICORE_INNER_KERNEL_H_
 
@@ -28,7 +26,7 @@
 
 // AICore function attribute for CANN compiler
 #ifndef __aicore__
-#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
+#define __aicore__ [aicore]
 #endif
 
 // dcci (Data Cache Clean and Invalidate) is provided by CANN headers

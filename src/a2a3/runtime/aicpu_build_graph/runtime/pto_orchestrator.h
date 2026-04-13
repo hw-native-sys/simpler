@@ -28,12 +28,12 @@
 #ifndef SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_ORCHESTRATOR_H_
 #define SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_ORCHESTRATOR_H_
 
-#include "pto_ring_buffer.h"     // NOLINT(build/include_subdir)
-#include "pto_runtime2_types.h"  // NOLINT(build/include_subdir)
-#include "pto_scheduler.h"       // NOLINT(build/include_subdir)
-#include "pto_shared_memory.h"   // NOLINT(build/include_subdir)
-#include "pto_submit_types.h"    // NOLINT(build/include_subdir)
-#include "pto_types.h"           // NOLINT(build/include_subdir)
+#include "pto_ring_buffer.h"
+#include "pto_runtime2_types.h"
+#include "pto_scheduler.h"
+#include "pto_shared_memory.h"
+#include "pto_submit_types.h"
+#include "pto_types.h"
 
 // =============================================================================
 // Orchestrator State

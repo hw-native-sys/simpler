@@ -13,8 +13,8 @@
 #include "aicore/performance_collector_aicore.h"
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"  // Register-based communication
-#include "pto2_dispatch_payload.h"   // NOLINT(build/include_subdir)
-#include "runtime.h"                 // NOLINT(build/include_subdir)
+#include "pto2_dispatch_payload.h"
+#include "runtime.h"
 
 /**
  * Unified function pointer type for kernel dispatch

@@ -34,11 +34,11 @@
 #include <type_traits>
 
 // Type headers needed by orchestration
-#include "pto_runtime2_types.h"  // PTO2_ERROR_*  // NOLINT(build/include_subdir)
-#include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots  // NOLINT(build/include_subdir)
-#include "pto_types.h"           // Arg, TaskOutputTensors, TensorArgType  // NOLINT(build/include_subdir)
-#include "task_args.h"           // ChipStorageTaskArgs, ContinuousTensor  // NOLINT(build/include_subdir)
-#include "tensor.h"              // Tensor, TensorCreateInfo  // NOLINT(build/include_subdir)
+#include "pto_runtime2_types.h"  // PTO2_ERROR_*
+#include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
+#include "pto_types.h"           // Arg, TaskOutputTensors, TensorArgType
+#include "task_args.h"           // ChipStorageTaskArgs, ContinuousTensor
+#include "tensor.h"              // Tensor, TensorCreateInfo
 
 // =============================================================================
 // Tensor Factory Helpers
@@ -351,7 +351,7 @@ static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const u
  * RAII Scope Guard (calls through ops table)
  */
 class PTO2ScopeGuard {
-public:  // NOLINT(whitespace/indent)
+public:
     PTO2ScopeGuard() :
         rt_(pto2_current_runtime()) {
         if (!rt_->ops->is_fatal(rt_)) {
@@ -364,7 +364,7 @@ public:  // NOLINT(whitespace/indent)
         }
     }
 
-private:  // NOLINT(whitespace/indent)
+private:
     PTO2Runtime *rt_;
 };
 

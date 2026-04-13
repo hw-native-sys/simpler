@@ -353,7 +353,7 @@ struct AicpuExecutor {
                             int32_t fe =
                                 rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
-                            (void)fe;  // NOLINT(readability/casting)
+                            (void)fe;
 #if PTO2_SCHED_PROFILING
                             fanin_edges_total += fe;
                             if (fe > fanin_max_degree) fanin_max_degree = fe;
@@ -471,7 +471,7 @@ struct AicpuExecutor {
         uint64_t &pop_hit, uint64_t &pop_miss, uint64_t &sched_dispatch_pop_cycle
 #endif
     ) {
-        (void)thread_idx;  // NOLINT(readability/casting)
+        (void)thread_idx;
 #if PTO2_SCHED_PROFILING
         extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
         uint64_t t_pop_start = get_sys_cnt_aicpu();
@@ -865,7 +865,7 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
 int32_t AicpuExecutor::shutdown_aicore(
     Runtime *runtime, int32_t thread_idx, const int32_t *cur_thread_cores, int32_t core_num
 ) {
-    (void)runtime;  // NOLINT(readability/casting)
+    (void)runtime;
     if (core_num == 0) return 0;
 
     DEV_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
@@ -1289,7 +1289,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #else
             int32_t fe = rt->scheduler.on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
-                (void)fe;  // NOLINT(readability/casting)
+                (void)fe;
 #if PTO2_SCHED_PROFILING
                 fanin_edges_total += fe;
                 if (fe > fanin_max_degree) fanin_max_degree = fe;
@@ -1344,7 +1344,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             if (cnt_ready <= STALL_DUMP_READY_MAX) {
                                 DEV_ALWAYS(
                                     "  STUCK-READY  ring=%d task_id=%" PRId64
-                                    " kernel_id=%d refcount=%d fanin=%d state=%d",  // NOLINT(whitespace/line_length)
+                                    " kernel_id=%d refcount=%d fanin=%d state=%d",
                                     r, static_cast<int64_t>(slot_state.task->task_id.raw), kid, rc, fi,
                                     static_cast<int32_t>(st)
                                 );
@@ -1354,7 +1354,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             if (cnt_waiting <= STALL_DUMP_WAIT_MAX) {
                                 DEV_ALWAYS(
                                     "  STUCK-WAIT   ring=%d task_id=%" PRId64
-                                    " kernel_id=%d refcount=%d fanin=%d state=%d",  // NOLINT(whitespace/line_length)
+                                    " kernel_id=%d refcount=%d fanin=%d state=%d",
                                     r, static_cast<int64_t>(slot_state.task->task_id.raw), kid, rc, fi,
                                     static_cast<int32_t>(st)
                                 );
@@ -1461,7 +1461,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             cur_thread_completed > 0 ? static_cast<double>(fanin_edges_total) / cur_thread_completed : 0.0;
         DEV_ALWAYS(
             "Thread %d:   complete       : %.3fus (%.1f%%)  [fanout: edges=%" PRIu64
-            ", max_degree=%d, avg=%.1f]  [fanin: "  // NOLINT(whitespace/line_length)
+            ", max_degree=%d, avg=%.1f]  [fanin: "
             "edges=%" PRIu64 ", max_degree=%d, avg=%.1f]",
             thread_idx, cycles_to_us(sched_complete_cycle), sched_complete_cycle * 100.0 / sched_total,
             static_cast<uint64_t>(notify_edges_total), notify_max_degree, notify_avg,
@@ -1509,8 +1509,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         uint64_t pop_total = pop_hit + pop_miss;
         double pop_hit_rate = pop_total > 0 ? pop_hit * 100.0 / pop_total : 0.0;
         DEV_ALWAYS(
-            "Thread %d:   dispatch       : %.3fus (%.1f%%)  [pop: hit=%" PRIu64 ", miss=%" PRIu64
-            ", hit_rate=%.1f%%]",  // NOLINT(whitespace/line_length)
+            "Thread %d:   dispatch       : %.3fus (%.1f%%)  [pop: hit=%" PRIu64 ", miss=%" PRIu64 ", hit_rate=%.1f%%]",
             thread_idx, cycles_to_us(sched_dispatch_cycle), sched_dispatch_cycle * 100.0 / sched_total,
             static_cast<uint64_t>(pop_hit), static_cast<uint64_t>(pop_miss), pop_hit_rate
         );
@@ -1519,7 +1518,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         double local_hit_rate = total_dispatched > 0 ? local_dispatch_count * 100.0 / total_dispatched : 0.0;
         DEV_ALWAYS(
             "Thread %d:     local_disp   : local=%" PRIu64 ", global=%" PRIu64 ", overflow=%" PRIu64
-            ", local_rate=%.1f%%",  // NOLINT(whitespace/line_length)
+            ", local_rate=%.1f%%",
             thread_idx, static_cast<uint64_t>(local_dispatch_count), static_cast<uint64_t>(global_dispatch_count),
             static_cast<uint64_t>(local_overflow_count), local_hit_rate
         );
@@ -2075,7 +2074,7 @@ void AicpuExecutor::emergency_shutdown(Runtime *runtime) {
 void AicpuExecutor::diagnose_stuck_state(
     Runtime *runtime, int32_t thread_idx, const int32_t *cur_thread_cores, int32_t core_num, Handshake *hank
 ) {
-    (void)runtime;  // NOLINT(readability/casting)
+    (void)runtime;
     PTO2SchedulerState *sched = &rt->scheduler;
     DEV_ALWAYS("========== DIAGNOSTIC REPORT: Thread %d ==========", thread_idx);
 

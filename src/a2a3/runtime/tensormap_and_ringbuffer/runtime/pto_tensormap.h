@@ -42,9 +42,9 @@
 
 #pragma once
 
-#include "common.h"              // NOLINT(build/include_subdir)
-#include "pto_runtime2_types.h"  // NOLINT(build/include_subdir)
-#include "tensor.h"              // NOLINT(build/include_subdir)
+#include "common.h"
+#include "pto_runtime2_types.h"
+#include "tensor.h"
 
 struct PTO2OrchestratorState;  // forward declare
 

@@ -34,9 +34,9 @@
 #include <arm_neon.h>
 #endif
 
-#include "task_args.h"   // NOLINT(build/include_subdir) -- TaskArgs base class
-#include "tensor.h"      // NOLINT(build/include_subdir)
-#include "tensor_arg.h"  // NOLINT(build/include_subdir) -- canonical TensorArgType definition
+#include "task_args.h"
+#include "tensor.h"
+#include "tensor_arg.h"
 
 // Task arguments
 #define MAX_TENSOR_ARGS 16   // Maximum tensor parameters per task
@@ -65,7 +65,7 @@ struct PTO2TaskId;
  * binding get_ref() on an rvalue is compile-time rejected to prevent dangling.
  */
 class TaskOutputTensors {
-public:  // NOLINT(whitespace/indent)
+public:
     TaskOutputTensors() :
         output_count_(0) {}
 
@@ -94,7 +94,7 @@ public:  // NOLINT(whitespace/indent)
         return reinterpret_cast<const Tensor *>(_storage + index * sizeof(Tensor));
     }
 
-private:  // NOLINT(whitespace/indent)
+private:
     uint32_t output_count_;
     alignas(Tensor) unsigned char _storage[PTO2_MAX_OUTPUTS * sizeof(Tensor)];
 };

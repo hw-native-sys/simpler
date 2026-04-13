@@ -31,8 +31,8 @@
 
 #include <atomic>
 
-#include "pto_submit_types.h"  // NOLINT(build/include_subdir)
-#include "pto_types.h"         // NOLINT(build/include_subdir)
+#include "pto_submit_types.h"
+#include "pto_types.h"
 
 // =============================================================================
 // Profiling Configuration
@@ -360,7 +360,7 @@ typedef void (*PTO2InCoreFunc)(void **args, int32_t num_args);
 // This header is also compiled into the Host .so (for struct definitions only),
 // where the hint is never called — the fallback no-op keeps Host builds clean.
 #if __has_include("spin_hint.h")
-#include "spin_hint.h"  // NOLINT(build/include_subdir)
+#include "spin_hint.h"
 #else
 #define SPIN_WAIT_HINT() ((void)0)
 #endif

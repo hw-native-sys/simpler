@@ -32,11 +32,11 @@
 #include <stdint.h>
 
 // Type headers needed by orchestration
-#include "pto_runtime2_types.h"  // PTO2TaskId  // NOLINT(build/include_subdir)
-#include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots  // NOLINT(build/include_subdir)
-#include "pto_types.h"           // Arg, PTOTensorEntry, TensorArgType  // NOLINT(build/include_subdir)
-#include "task_args.h"           // ChipStorageTaskArgs, ContinuousTensor  // NOLINT(build/include_subdir)
-#include "tensor.h"              // Tensor, TensorCreateInfo, make_tensor_external  // NOLINT(build/include_subdir)
+#include "pto_runtime2_types.h"  // PTO2TaskId
+#include "pto_submit_types.h"    // MixedKernels, INVALID_KERNEL_ID, subtask slots
+#include "pto_types.h"           // Arg, PTOTensorEntry, TensorArgType
+#include "task_args.h"           // ChipStorageTaskArgs, ContinuousTensor
+#include "tensor.h"              // Tensor, TensorCreateInfo, make_tensor_external
 
 // Convert ContinuousTensor to Tensor (needs make_tensor_external from tensor.h)
 static_assert(
@@ -149,14 +149,14 @@ static inline bool pto2_rt_is_fatal(PTO2Runtime *rt) { return rt->ops->is_fatal(
  * RAII Scope Guard (calls through ops table)
  */
 class PTO2ScopeGuard {
-public:  // NOLINT(whitespace/indent)
+public:
     explicit PTO2ScopeGuard(PTO2Runtime *rt) :
         rt_(rt) {
         rt_->ops->scope_begin(rt_);
     }
     ~PTO2ScopeGuard() { rt_->ops->scope_end(rt_); }
 
-private:  // NOLINT(whitespace/indent)
+private:
     PTO2Runtime *rt_;
 };
 

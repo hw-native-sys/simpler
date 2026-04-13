@@ -226,7 +226,7 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
                 static_cast<uint64_t>(
                     runtime->pto2_dep_pool_size ? runtime->pto2_dep_pool_size : PTO2_DEP_LIST_POOL_SIZE
                 )
-            );  // NOLINT(whitespace/line_length)
+            );
         }
     }
 

@@ -19,8 +19,8 @@
 #include <string>
 #include <utility>
 
-#include "common.h"     // NOLINT(build/include_subdir)
-#include "data_type.h"  // NOLINT(build/include_subdir)
+#include "common.h"
+#include "data_type.h"
 
 constexpr int RUNTIME_MAX_TENSOR_DIMS = 5;
 

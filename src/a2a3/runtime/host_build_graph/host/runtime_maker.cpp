@@ -36,10 +36,10 @@
 #include <cstring>
 #include <string>
 
-#include "callable.h"           // NOLINT(build/include_subdir)
-#include "orchestration_api.h"  // NOLINT(build/include_subdir)
-#include "runtime.h"            // Includes unified_log.h and provides LOG_* macros  // NOLINT(build/include_subdir)
-#include "task_args.h"          // NOLINT(build/include_subdir)
+#include "callable.h"
+#include "orchestration_api.h"
+#include "runtime.h"  // Includes unified_log.h and provides LOG_* macros
+#include "task_args.h"
 
 namespace {
 

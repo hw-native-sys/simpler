@@ -15,11 +15,11 @@
  * Task graph construction is handled by PTO2Runtime.
  */
 
-#include "runtime.h"  // NOLINT(build/include_subdir)
+#include "runtime.h"
 
 #include "common/unified_log.h"
-#include "pto_runtime2_types.h"  // NOLINT(build/include_subdir)
-#include "pto_shared_memory.h"   // NOLINT(build/include_subdir)
+#include "pto_runtime2_types.h"
+#include "pto_shared_memory.h"
 
 // =============================================================================
 // Constructor
