@@ -779,7 +779,7 @@ struct AicpuExecutor {
         }
         // Per-dispatch local context: read block_idx/block_num directly from slot_state.
         dispatch_payload.local_context.s_block_idx = slot_state.next_block_idx;
-        dispatch_payload.local_context.s_block_num = slot_state.block_num;
+        dispatch_payload.local_context.s_block_num = slot_state.logical_block_num;
         // Store context pointers at fixed suffix positions in args[]
         // (GlobalContext content is already set by init_global_context, but the
         //  pointer must be written each dispatch since args[] is rebuilt entirely)
@@ -1751,8 +1751,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                     if (pto2_requires_sync_start(slot_state->active_mask)) {
                         int32_t available = (shape == PTO2ResourceShape::AIV) ? tracker.count_idle_aiv_cores() :
                                                                                 valid_cluster_states.count();
-                        if (available < slot_state->block_num) {
-                            if (!enter_drain_mode(slot_state, slot_state->block_num)) {
+                        if (available < slot_state->logical_block_num) {
+                            if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
                                 // CAS lost: drain already active for another task; re-push and wait.
                                 rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
                             }
@@ -1780,18 +1780,20 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                         slot_state->next_block_idx++;
                         // For AIV, refresh cluster states so the do-while can pick up the
                         // other AIV core in the same cluster on the next iteration.
-                        if (shape == PTO2ResourceShape::AIV && slot_state->next_block_idx < slot_state->block_num) {
+                        if (shape == PTO2ResourceShape::AIV &&
+                            slot_state->next_block_idx < slot_state->logical_block_num) {
                             valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
                         }
                         DEV_DEBUG(
                             "Thread %d: Dispatched %s task %" PRId64 " block %d/%d to cluster_offset %d", thread_idx,
                             shape_name(shape), static_cast<int64_t>(slot_state->task->task_id.raw),
-                            slot_state->next_block_idx - 1, slot_state->block_num, current_valid_cluster_offset
+                            slot_state->next_block_idx - 1, slot_state->logical_block_num, current_valid_cluster_offset
                         );
-                    } while (slot_state->next_block_idx < slot_state->block_num && valid_cluster_states.has_value());
+                    } while (slot_state->next_block_idx < slot_state->logical_block_num &&
+                             valid_cluster_states.has_value());
 
                     // Re-enqueue only if blocks remain after exhausting local clusters
-                    if (slot_state->next_block_idx < slot_state->block_num) {
+                    if (slot_state->next_block_idx < slot_state->logical_block_num) {
                         rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
                     }
                     made_progress = true;
@@ -1846,7 +1848,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #endif
                         );
                         slot_state->next_block_idx++;
-                        if (slot_state->next_block_idx < slot_state->block_num) {
+                        if (slot_state->next_block_idx < slot_state->logical_block_num) {
                             rt->scheduler.ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].push(slot_state);
                         }
                         made_progress = true;

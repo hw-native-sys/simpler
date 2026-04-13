@@ -356,7 +356,7 @@ static bool pto2_prepare_task(
         int16_t block_num = args.launch_spec.core_num();
         slot_state.total_required_subtasks =
             static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
-        slot_state.block_num = block_num;
+        slot_state.logical_block_num = block_num;
         slot_state.next_block_idx = 0;
         slot_state.payload = out->payload;
         slot_state.task = out->task;
@@ -672,7 +672,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
         slot_state.total_required_subtasks =
             static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
-        slot_state.block_num = block_num;
+        slot_state.logical_block_num = block_num;
         slot_state.next_block_idx = 0;
         slot_state.payload = payload;
         slot_state.task = &task;

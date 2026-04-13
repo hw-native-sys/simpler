@@ -441,8 +441,8 @@ struct alignas(64) PTO2TaskSlotState {
 
     // SPMD multi-block (occupies the 8 tail bytes previously implicit padding)
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
-    int16_t total_required_subtasks{0};          // = block_num * popcount(active_mask)
-    int16_t block_num{1};                        // Total logical blocks (set by orchestrator)
+    int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
+    int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
     int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
 };
 
