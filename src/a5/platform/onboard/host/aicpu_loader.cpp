@@ -43,6 +43,14 @@ struct AicpuOpConfig {
 };
 
 // Generate AICPU op info JSON file
+//
+// Note: This function manually constructs JSON without using a library.
+// The kernel names and configuration values are controlled strings that do not
+// contain special characters (quotes, backslashes, control characters). This
+// matches the approach used in pypto's GenerateAicpuOpJson for similar AICPU
+// op descriptors. If new kernels are added that may contain special characters,
+// consider adding a JSON library dependency (e.g., nlohmann/json) or implementing
+// proper string escaping.
 static bool GenerateAicpuOpJson(const std::string &json_path, const std::vector<AicpuOpConfig> &op_configs) {
     std::ofstream json_file(json_path);
     if (!json_file.is_open()) {
@@ -97,7 +105,17 @@ int AicpuLoader::init_with_binary(
     close(json_fd);
     json_file_path_ = json_path_buffer.data();
 
-    // Map opType (used for rtsFuncGetByName) to functionName (actual symbol in .so)
+    // Map opType (external kernel name used by rtsFuncGetByName) to functionName
+    // (actual C++ symbol name in the .so file).
+    //
+    // This mapping is specific to the Ascend tile framework kernels:
+    // - DynTileFwkKernelServerInit -> DynTileFwkBackendKernelServerInit
+    // - DynTileFwkKernelServer -> DynTileFwkBackendKernelServer
+    //
+    // The opType names are used by the CANN runtime to look up kernels, while the
+    // functionName names are the actual symbols exported by the shared library.
+    // This mapping is defined here as it's specific to the tile framework's
+    // naming convention and is unlikely to change.
     std::unordered_map<std::string, std::string> name_mapping = {
         {"DynTileFwkKernelServerInit", "DynTileFwkBackendKernelServerInit"},
         {"DynTileFwkKernelServer", "DynTileFwkBackendKernelServer"}

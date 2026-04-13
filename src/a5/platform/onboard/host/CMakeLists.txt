@@ -108,7 +108,8 @@ target_link_libraries(host_runtime
 
 target_link_directories(host_runtime
     PRIVATE
-        ${ASCEND_HOME_PATH}/aarch64-linux/lib64
+        ${ASCEND_HOME_PATH}/lib64
+        ${ASCEND_HOME_PATH}/runtime/lib64
 )
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")

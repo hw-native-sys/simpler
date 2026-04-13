@@ -253,7 +253,7 @@ public:
      */
     int
     run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num);
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
 
     /**
      * Print handshake results from device
