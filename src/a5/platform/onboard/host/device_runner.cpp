@@ -233,10 +233,7 @@ int DeviceRunner::ensure_binaries_loaded(
 
 #ifdef BUILD_WITH_NEW_CANN
     // New interface: Initialize AICPU loader with binary data
-    const std::vector<std::string> kernel_names = {
-        "DynTileFwkKernelServerInit",
-        "DynTileFwkKernelServer"
-    };
+    const std::vector<std::string> kernel_names = {"DynTileFwkKernelServerInit", "DynTileFwkKernelServer"};
     int rc = aicpu_loader_.init_with_binary(aicpu_so_binary, kernel_names);
     if (rc != 0) {
         LOG_ERROR("AicpuLoader init_with_binary failed: %d", rc);

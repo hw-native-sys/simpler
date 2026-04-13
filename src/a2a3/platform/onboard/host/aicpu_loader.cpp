@@ -3,7 +3,7 @@
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OR ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
@@ -43,7 +43,7 @@ struct AicpuOpConfig {
 };
 
 // Generate AICPU op info JSON file
-static bool GenerateAicpuOpJson(const std::string& json_path, const std::vector<AicpuOpConfig>& op_configs) {
+static bool GenerateAicpuOpJson(const std::string &json_path, const std::vector<AicpuOpConfig> &op_configs) {
     std::ofstream json_file(json_path);
     if (!json_file.is_open()) {
         LOG_ERROR("Failed to open JSON file for writing: %s", json_path.c_str());
@@ -52,7 +52,7 @@ static bool GenerateAicpuOpJson(const std::string& json_path, const std::vector<
 
     json_file << "{\n";
     for (size_t i = 0; i < op_configs.size(); ++i) {
-        const auto& config = op_configs[i];
+        const auto &config = op_configs[i];
         json_file << "  \"" << config.opType << "\": {\n";
         json_file << "    \"opInfo\": {\n";
         json_file << "      \"functionName\": \"" << config.functionName << "\",\n";
@@ -75,14 +75,16 @@ static bool GenerateAicpuOpJson(const std::string& json_path, const std::vector<
 
 #endif
 
-int AicpuLoader::init_with_binary(const std::vector<uint8_t>& aicpu_binary, const std::vector<std::string>& kernel_names) {
+int AicpuLoader::init_with_binary(
+    const std::vector<uint8_t> &aicpu_binary, const std::vector<std::string> &kernel_names
+) {
 #ifdef BUILD_WITH_NEW_CANN
     // New interface: Load binary using JSON descriptor (pypto approach)
     LOG_INFO("AicpuLoader: Using new rtsBinaryLoadFromFile + rtsLaunchCpuKernel interface");
     LOG_INFO("AicpuLoader: Binary size=%zu bytes", aicpu_binary.size());
 
     // Step 1: Generate op info JSON at runtime (using only filename, not full path)
-    const char* tmp_dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp";
+    const char *tmp_dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp";
     std::string json_path_template = std::string(tmp_dir) + "/simpler_aicpu_op_info_XXXXXX.json";
     std::vector<char> json_path_buffer(json_path_template.begin(), json_path_template.end());
     json_path_buffer.push_back('\0');
@@ -104,7 +106,7 @@ int AicpuLoader::init_with_binary(const std::vector<uint8_t>& aicpu_binary, cons
     // Create op configs for JSON generation
     // kernelSo uses only filename - runtime will find it via library search path
     std::vector<AicpuOpConfig> op_configs;
-    for (const auto& name : kernel_names) {
+    for (const auto &name : kernel_names) {
         AicpuOpConfig config;
         config.opType = name;
         config.functionName = name_mapping[name];
@@ -136,7 +138,7 @@ int AicpuLoader::init_with_binary(const std::vector<uint8_t>& aicpu_binary, cons
     LOG_INFO("AicpuLoader: Loaded binary from JSON, handle=%p", binary_handle_);
 
     // Step 3: Resolve function handles: rtsFuncGetByName
-    for (const auto& name : kernel_names) {
+    for (const auto &name : kernel_names) {
         rtFuncHandle func_handle = nullptr;
         rc = rtsFuncGetByName(binary_handle_, name.c_str(), &func_handle);
         if (rc != RT_ERROR_NONE) {
@@ -158,7 +160,7 @@ int AicpuLoader::init_with_binary(const std::vector<uint8_t>& aicpu_binary, cons
 #endif
 }
 
-int AicpuLoader::init(const std::string& so_path, const std::vector<std::string>& kernel_names) {
+int AicpuLoader::init(const std::string &so_path, const std::vector<std::string> &kernel_names) {
 #ifdef BUILD_WITH_NEW_CANN
     // New interface: Use init_with_binary() instead
     // This init() is kept for backward compatibility but does nothing
@@ -175,7 +177,7 @@ int AicpuLoader::init(const std::string& so_path, const std::vector<std::string>
 #endif
 }
 
-int AicpuLoader::launch(rtStream_t stream, KernelArgs* k_args, const char* kernel_name, int aicpu_num) {
+int AicpuLoader::launch(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num) {
 #ifdef BUILD_WITH_NEW_CANN
     // New interface: rtsLaunchCpuKernel
     auto it = func_handles_.find(kernel_name);

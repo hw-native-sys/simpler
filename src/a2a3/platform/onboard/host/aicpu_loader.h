@@ -55,7 +55,7 @@ public:
      * @param kernel_names List of kernel function names to resolve
      * @return 0 on success, error code on failure
      */
-    int init_with_binary(const std::vector<uint8_t>& aicpu_binary, const std::vector<std::string>& kernel_names);
+    int init_with_binary(const std::vector<uint8_t> &aicpu_binary, const std::vector<std::string> &kernel_names);
 
     /**
      * @brief Initialize the AICPU loader (legacy interface compatibility)
@@ -67,7 +67,7 @@ public:
      * @param kernel_names List of kernel function names to resolve
      * @return 0 on success, error code on failure
      */
-    int init(const std::string& so_path, const std::vector<std::string>& kernel_names);
+    int init(const std::string &so_path, const std::vector<std::string> &kernel_names);
 
     /**
      * @brief Launch an AICPU kernel
@@ -80,7 +80,7 @@ public:
      * @param aicpu_num Number of AICPU instances to launch
      * @return 0 on success, error code on failure
      */
-    int launch(rtStream_t stream, KernelArgs* k_args, const char* kernel_name, int aicpu_num);
+    int launch(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num);
 
     /**
      * @brief Cleanup resources
@@ -91,17 +91,17 @@ public:
     void finalize();
 
     // Disable copy and move
-    AicpuLoader(const AicpuLoader&) = delete;
-    AicpuLoader& operator=(const AicpuLoader&) = delete;
-    AicpuLoader(AicpuLoader&&) = delete;
-    AicpuLoader& operator=(AicpuLoader&&) = delete;
+    AicpuLoader(const AicpuLoader &) = delete;
+    AicpuLoader &operator=(const AicpuLoader &) = delete;
+    AicpuLoader(AicpuLoader &&) = delete;
+    AicpuLoader &operator=(AicpuLoader &&) = delete;
 
 private:
 #ifdef BUILD_WITH_NEW_CANN
     // New interface members
-    void* binary_handle_ = nullptr;  // Binary handle from rtsBinaryLoadFromFile
-    std::unordered_map<std::string, void*> func_handles_;  // Function handles (kernel_name -> func_handle)
-    std::string json_file_path_;  // Path to temporary JSON descriptor file
+    void *binary_handle_ = nullptr;                         // Binary handle from rtsBinaryLoadFromFile
+    std::unordered_map<std::string, void *> func_handles_;  // Function handles (kernel_name -> func_handle)
+    std::string json_file_path_;                            // Path to temporary JSON descriptor file
 #else
     // Legacy interface - no state needed
 #endif
