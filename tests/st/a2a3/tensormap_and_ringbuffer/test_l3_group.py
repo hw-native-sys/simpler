@@ -17,7 +17,7 @@ group completion aggregation, downstream dependency waits for group.
 
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import ChipStorageTaskArgs, WorkerPayload, WorkerType, make_tensor_arg
+from simpler.task_interface import ChipStorageTaskArgs, make_tensor_arg
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
@@ -28,7 +28,7 @@ def verify():
     """SubCallable — runs after group completes."""
 
 
-def run_dag(w, callables, task_args, config):
+def run_dag(orch, callables, task_args, config):
     """L3 orchestration: group of 2 chips → SubTask dependency."""
     # Build per-chip ChipStorageTaskArgs from shared-memory tensors
     args0 = ChipStorageTaskArgs()
@@ -41,17 +41,13 @@ def run_dag(w, callables, task_args, config):
 
     callables.keep(args0, args1)  # prevent GC before drain
 
-    chip_p = WorkerPayload()
-    chip_p.worker_type = WorkerType.NEXT_LEVEL
-    chip_p.callable = callables.vector_kernel.buffer_ptr()
-    chip_p.block_dim = config.block_dim
-    chip_p.aicpu_thread_num = config.aicpu_thread_num
-    group_result = w.submit(WorkerType.NEXT_LEVEL, chip_p, args_list=[args0.__ptr__(), args1.__ptr__()], outputs=[4])
-
-    sub_p = WorkerPayload()
-    sub_p.worker_type = WorkerType.SUB
-    sub_p.callable_id = callables.verify
-    w.submit(WorkerType.SUB, sub_p, inputs=[group_result.outputs[0].ptr])
+    group_result = orch.submit_next_level_group(
+        callables.vector_kernel,
+        args_list=[args0.__ptr__(), args1.__ptr__()],
+        config=config,
+        outputs=[4],
+    )
+    orch.submit_sub(callables.verify, inputs=[group_result.outputs[0].ptr])
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")

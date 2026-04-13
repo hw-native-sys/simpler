@@ -22,9 +22,9 @@ Usage::
     cid = w.register(lambda: postprocess())
     w.init()
 
-    def my_orch(w, args):
-        r = w.submit(WorkerType.NEXT_LEVEL, chip_payload, inputs=[...], outputs=[64])
-        w.submit(WorkerType.SUB, sub_payload(cid), inputs=[r.outputs[0].ptr])
+    def my_orch(orch, args):
+        r = orch.submit_next_level(chip_callable, chip_args_ptr, config, outputs=[64])
+        orch.submit_sub(cid, inputs=[r.outputs[0].ptr])
 
     w.run(Task(orch=my_orch, args=my_args))
     w.close()
@@ -44,17 +44,15 @@ _SCRIPTS = str(Path(__file__).parent.parent.parent / "examples" / "scripts")
 if _SCRIPTS not in sys.path:
     sys.path.insert(0, _SCRIPTS)
 
+from .orchestrator import Orchestrator  # noqa: E402
 from .task_interface import (  # noqa: E402
     DIST_CHIP_MAILBOX_SIZE,
     DIST_SUB_MAILBOX_SIZE,
     ChipWorker,
     DistChipProcess,
-    DistInputSpec,
-    DistOutputSpec,
     DistSubWorker,
     DistWorker,
     WorkerPayload,
-    WorkerType,
     _ChipWorker,
 )
 
@@ -68,7 +66,8 @@ class Task:
     """Execution unit for Worker.run() at any level.
 
     For L2: set callable/args directly on a WorkerPayload and pass to run().
-    For L3+: provide an orch function that calls worker.submit().
+    For L3+: provide an orch function ``fn(orchestrator, args)`` that builds
+    the DAG via ``orchestrator.submit_*``.
     """
 
     orch: Callable
@@ -189,20 +188,6 @@ def _chip_process_loop(
 # ---------------------------------------------------------------------------
 
 
-class _ScopeGuard:
-    """RAII scope guard for DistWorker.scope_begin/scope_end."""
-
-    def __init__(self, dw: DistWorker) -> None:
-        self._dw = dw
-
-    def __enter__(self):
-        self._dw.scope_begin()
-        return self
-
-    def __exit__(self, *_):
-        self._dw.scope_end()
-
-
 class Worker:
     """Unified worker for all hierarchy levels.
 
@@ -222,6 +207,7 @@ class Worker:
 
         # Level-3 internals
         self._dist_worker: Optional[DistWorker] = None
+        self._orch: Optional[Orchestrator] = None
         self._dist_chip_procs: list[DistChipProcess] = []
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
@@ -377,6 +363,8 @@ class Worker:
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()
 
+        self._orch = Orchestrator(dw)
+
     # ------------------------------------------------------------------
     # run — uniform entry point
     # ------------------------------------------------------------------
@@ -398,10 +386,16 @@ class Worker:
                 self._chip_worker.run(task_or_payload, args, **kwargs)
         else:
             self._start_level3()
-            assert self._dist_worker is not None
+            assert self._orch is not None
             task = task_or_payload
-            task.orch(self, task.args)
-            self._dist_worker.drain()
+            self._orch._scope_begin()
+            try:
+                task.orch(self._orch, task.args)
+            finally:
+                # Always release scope refs and drain so ring slots aren't
+                # stranded when the orch fn raises mid-DAG.
+                self._orch._scope_end()
+                self._orch._drain()
 
     def _run_l2_from_payload(self, payload: WorkerPayload) -> None:
         """Unpack a WorkerPayload and forward to ChipWorker (L2 only)."""
@@ -419,31 +413,6 @@ class Worker:
         )
 
     # ------------------------------------------------------------------
-    # Orchestration API (called from inside orch functions at L3+)
-    # ------------------------------------------------------------------
-
-    def submit(
-        self,
-        worker_type: WorkerType,
-        payload: WorkerPayload,
-        inputs: Optional[list[int]] = None,
-        outputs: Optional[list[int]] = None,
-        args_list: Optional[list[int]] = None,
-    ):
-        """Submit a task. If args_list has >1 entries, submits a group task."""
-        assert self._dist_worker is not None
-        in_specs = [DistInputSpec(p) for p in (inputs or [])]
-        out_specs = [DistOutputSpec(s) for s in (outputs or [])]
-        if args_list and len(args_list) > 1:
-            return self._dist_worker.submit_group(worker_type, payload, args_list, in_specs, out_specs)
-        return self._dist_worker.submit(worker_type, payload, in_specs, out_specs)
-
-    def scope(self):
-        """Context manager for scope lifetime. Usage: ``with w.scope(): ...``"""
-        assert self._dist_worker is not None
-        return _ScopeGuard(self._dist_worker)
-
-    # ------------------------------------------------------------------
     # close
     # ------------------------------------------------------------------
 
@@ -458,6 +427,7 @@ class Worker:
             if self._dist_worker:
                 self._dist_worker.close()
                 self._dist_worker = None
+                self._orch = None
 
             # Shutdown SubWorker processes
             for sw in self._dist_sub_workers:

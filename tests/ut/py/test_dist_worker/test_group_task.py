@@ -26,7 +26,6 @@ import struct
 from multiprocessing import Value
 from multiprocessing.shared_memory import SharedMemory
 
-from simpler.task_interface import WorkerPayload, WorkerType
 from simpler.worker import Task, Worker
 
 # ---------------------------------------------------------------------------
@@ -65,19 +64,16 @@ class TestGroupBasic:
         cid = hw.register(inc)
         hw.init()
 
-        def orch(hw, _args):
-            p = WorkerPayload()
-            p.worker_type = WorkerType.SUB
-            p.callable_id = cid
-            hw.submit(WorkerType.SUB, p, args_list=[0, 0])
+        def orch(o, _args):
+            o.submit_sub_group(cid, args_list=[0, 0])
 
         hw.run(Task(orch=orch))
         hw.close()
 
         assert counter.value == 2, f"Expected 2, got {counter.value}"
 
-    def test_single_args_is_normal_task(self):
-        """submit with 1 args behaves like normal submit."""
+    def test_single_args_group_runs_once(self):
+        """submit_sub_group with 1 arg still runs exactly once."""
         counter = Value("i", 0)
 
         hw = Worker(level=3, num_sub_workers=1)
@@ -89,11 +85,8 @@ class TestGroupBasic:
         cid = hw.register(inc)
         hw.init()
 
-        def orch(hw, _args):
-            p = WorkerPayload()
-            p.worker_type = WorkerType.SUB
-            p.callable_id = cid
-            hw.submit(WorkerType.SUB, p, args_list=[0])
+        def orch(o, _args):
+            o.submit_sub_group(cid, args_list=[0])
 
         hw.run(Task(orch=orch))
         hw.close()
@@ -123,17 +116,10 @@ class TestGroupDependency:
             dep_cid = hw.register(lambda: struct.pack_into("i", db, 0, 1))
             hw.init()
 
-            def orch(hw, _args):
-                p = WorkerPayload()
-                p.worker_type = WorkerType.SUB
-                p.callable_id = group_cid
-                group_result = hw.submit(WorkerType.SUB, p, args_list=[0, 0], outputs=[64])
+            def orch(o, _args):
+                group_result = o.submit_sub_group(group_cid, args_list=[0, 0], outputs=[64])
                 out_ptr = group_result.outputs[0].ptr
-
-                dp = WorkerPayload()
-                dp.worker_type = WorkerType.SUB
-                dp.callable_id = dep_cid
-                hw.submit(WorkerType.SUB, dp, inputs=[out_ptr])
+                o.submit_sub(dep_cid, inputs=[out_ptr])
 
             hw.run(Task(orch=orch))
             hw.close()

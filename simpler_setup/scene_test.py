@@ -573,9 +573,9 @@ class SceneTestCase:
 
             config = self._build_config(config_dict, enable_profiling=(enable_profiling and round_idx == 0))
 
-            # Wrap in Task — orch signature: (w, callables, task_args, config)
-            def task_orch(w, _unused, _ns=ns, _test_args=test_args, _config=config):
-                orch_fn(w, _ns, _test_args, _config)
+            # Wrap in Task — user orch signature: (orch, callables, task_args, config)
+            def task_orch(orch, _unused, _ns=ns, _test_args=test_args, _config=config):
+                orch_fn(orch, _ns, _test_args, _config)
 
             with _temporary_env(self._resolve_env()):
                 worker.run(Task(orch=task_orch))

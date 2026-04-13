@@ -16,7 +16,6 @@ SubWorker reads result produced by ChipWorker.
 
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import WorkerPayload, WorkerType
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 from simpler_setup.scene_test import _build_chip_task_args
@@ -28,23 +27,18 @@ def verify():
     """SubCallable — dependency target, runs after ChipTask completes."""
 
 
-def run_dag(w, callables, task_args, config):
+def run_dag(orch, callables, task_args, config):
     """L3 orchestration: ChipTask → SubTask dependency."""
     chip_args, _ = _build_chip_task_args(task_args, callables.vector_kernel_sig)
     callables.keep(chip_args)  # prevent GC before drain
 
-    chip_p = WorkerPayload()
-    chip_p.worker_type = WorkerType.NEXT_LEVEL
-    chip_p.callable = callables.vector_kernel.buffer_ptr()
-    chip_p.args = chip_args.__ptr__()
-    chip_p.block_dim = config.block_dim
-    chip_p.aicpu_thread_num = config.aicpu_thread_num
-    chip_result = w.submit(WorkerType.NEXT_LEVEL, chip_p, inputs=[], outputs=[task_args.f.numel() * 4])
-
-    sub_p = WorkerPayload()
-    sub_p.worker_type = WorkerType.SUB
-    sub_p.callable_id = callables.verify
-    w.submit(WorkerType.SUB, sub_p, inputs=[chip_result.outputs[0].ptr])
+    chip_result = orch.submit_next_level(
+        callables.vector_kernel,
+        chip_args.__ptr__(),
+        config,
+        outputs=[task_args.f.numel() * 4],
+    )
+    orch.submit_sub(callables.verify, inputs=[chip_result.outputs[0].ptr])
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")

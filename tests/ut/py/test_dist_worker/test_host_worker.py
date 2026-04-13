@@ -17,7 +17,6 @@ import time as _time
 from multiprocessing.shared_memory import SharedMemory
 
 import pytest
-from simpler.task_interface import WorkerPayload, WorkerType
 from simpler.worker import Task, Worker
 
 # ---------------------------------------------------------------------------
@@ -86,11 +85,8 @@ class TestSingleSubTask:
             cid = hw.register(lambda: _increment_counter(counter_buf))
             hw.init()
 
-            def orch(hw, _args):
-                p = WorkerPayload()
-                p.worker_type = WorkerType.SUB
-                p.callable_id = cid
-                hw.submit(WorkerType.SUB, p)
+            def orch(o, _args):
+                o.submit_sub(cid)
 
             hw.run(Task(orch=orch))
             hw.close()
@@ -108,12 +104,9 @@ class TestSingleSubTask:
             cid = hw.register(lambda: _increment_counter(counter_buf))
             hw.init()
 
-            def orch(hw, _args):
+            def orch(o, _args):
                 for _ in range(3):
-                    p = WorkerPayload()
-                    p.worker_type = WorkerType.SUB
-                    p.callable_id = cid
-                    hw.submit(WorkerType.SUB, p)
+                    o.submit_sub(cid)
 
             hw.run(Task(orch=orch))
             hw.close()
@@ -155,12 +148,9 @@ class TestParallelSubWorkers:
             cids.append(hw.register(make_fn(buf)))
         hw.init()
 
-        def orch(hw, _args):
+        def orch(o, _args):
             for i in range(n):
-                p = WorkerPayload()
-                p.worker_type = WorkerType.SUB
-                p.callable_id = cids[i]
-                hw.submit(WorkerType.SUB, p)
+                o.submit_sub(cids[i])
 
         start = _time.monotonic()
         hw.run(Task(orch=orch))
@@ -187,17 +177,6 @@ class TestOutputAllocation:
     def test_output_buffer_allocated(self):
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
-
-        def orch(hw, _args):
-            p = WorkerPayload()
-            # no workers — submit with empty workers list isn't useful here;
-            # instead verify that submit() allocates output buffers correctly
-            # by using a SUB worker that immediately signals done
-            p.worker_type = WorkerType.NEXT_LEVEL  # no NEXT_LEVEL workers — task stays RUNNING
-            # For output allocation test, just verify DistSubmitResult has outputs
-            # We re-init with sub workers for a real execution test
-            pass
-
         hw.close()
 
         # Re-test with actual SUB worker + output allocation
@@ -210,11 +189,8 @@ class TestOutputAllocation:
 
             captured = []
 
-            def orch2(hw, _args):
-                p = WorkerPayload()
-                p.worker_type = WorkerType.SUB
-                p.callable_id = cid
-                result = hw.submit(WorkerType.SUB, p, outputs=[64, 128])
+            def orch2(o, _args):
+                result = o.submit_sub(cid, outputs=[64, 128])
                 captured.append(result)
 
             hw2.run(Task(orch=orch2))
@@ -236,12 +212,12 @@ class TestOutputAllocation:
 
 
 # ---------------------------------------------------------------------------
-# Test: scope management
+# Test: scope management (owned by Worker.run; user doesn't see scope_begin/end)
 # ---------------------------------------------------------------------------
 
 
 class TestScope:
-    def test_scope_begin_end(self):
+    def test_scope_managed_by_run(self):
         counter_shm, counter_buf = _make_shared_counter()
 
         try:
@@ -249,12 +225,8 @@ class TestScope:
             cid = hw.register(lambda: _increment_counter(counter_buf))
             hw.init()
 
-            def orch(hw, _args):
-                with hw.scope():
-                    p = WorkerPayload()
-                    p.worker_type = WorkerType.SUB
-                    p.callable_id = cid
-                    hw.submit(WorkerType.SUB, p)
+            def orch(o, _args):
+                o.submit_sub(cid)
 
             hw.run(Task(orch=orch))
             hw.close()

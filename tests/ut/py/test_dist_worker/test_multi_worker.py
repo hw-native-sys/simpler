@@ -20,7 +20,6 @@ import threading
 import time
 from multiprocessing.shared_memory import SharedMemory
 
-from simpler.task_interface import WorkerPayload, WorkerType
 from simpler.worker import Task, Worker
 
 # ---------------------------------------------------------------------------
@@ -76,11 +75,8 @@ class TestTwoWorkersParallel:
             for hw, cid in workers:
 
                 def make_orch(c):
-                    def orch(hw, _args):
-                        p = WorkerPayload()
-                        p.worker_type = WorkerType.SUB
-                        p.callable_id = c
-                        hw.submit(WorkerType.SUB, p)
+                    def orch(o, _args):
+                        o.submit_sub(c)
 
                     return orch
 
@@ -126,11 +122,8 @@ class TestTwoWorkersParallel:
             start = time.monotonic()
 
             def run(hw, cid):
-                def orch(hw, _args):
-                    p = WorkerPayload()
-                    p.worker_type = WorkerType.SUB
-                    p.callable_id = cid
-                    hw.submit(WorkerType.SUB, p)
+                def orch(o, _args):
+                    o.submit_sub(cid)
 
                 hw.run(Task(orch=orch))
 
@@ -178,12 +171,9 @@ class TestManyTasksNoLeak:
             cid = hw.register(lambda: _inc(buf))
             hw.init()
 
-            def orch(hw, _args):
+            def orch(o, _args):
                 for _ in range(n_tasks):
-                    p = WorkerPayload()
-                    p.worker_type = WorkerType.SUB
-                    p.callable_id = cid
-                    hw.submit(WorkerType.SUB, p)
+                    o.submit_sub(cid)
 
             hw.run(Task(orch=orch))
             hw.close()
@@ -207,12 +197,9 @@ class TestManyTasksNoLeak:
                 cids.append(hw.register(lambda b=buf: _inc(b)))
             hw.init()
 
-            def orch(hw, _args):
+            def orch(o, _args):
                 for i in range(n_tasks):
-                    p = WorkerPayload()
-                    p.worker_type = WorkerType.SUB
-                    p.callable_id = cids[i]
-                    hw.submit(WorkerType.SUB, p)
+                    o.submit_sub(cids[i])
 
             hw.run(Task(orch=orch))
             hw.close()
