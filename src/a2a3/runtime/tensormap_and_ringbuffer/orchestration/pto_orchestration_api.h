@@ -207,6 +207,9 @@ static inline PTO2ManualSubmitResult pto2_rt_submit_task_manual(const MixedKerne
     return rt->ops->submit_task_manual(rt, mixed_kernels, args);
 }
 
+// Manual submit keeps a separate public entry point so call sites are explicit
+// and mode/API mismatch can fail immediately, but the runtime still shares the
+// same core submission implementation with AUTO.
 static inline PTO2ManualSubmitResult pto2_rt_submit_task_manual_with_deps(
     const MixedKernels &mixed_kernels, const Arg &args, std::initializer_list<PTO2TaskId> explicit_producers
 ) {

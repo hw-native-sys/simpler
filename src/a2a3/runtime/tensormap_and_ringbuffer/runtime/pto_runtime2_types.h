@@ -377,8 +377,13 @@ struct PTO2TaskPayload {
     int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
     PTO2FaninPool *fanin_spill_pool{nullptr};
-    int32_t manual_explicit_fanin_begin{0};  // First explicit manual edge appended after implicit fanins
-    int32_t manual_explicit_fanin_count{0};  // Number of explicit manual edges appended to the tail
+    // Explicit same-scope edges declared during manual submit are appended after
+    // all ordinary fanins, but they are linked into producer fanout lists only
+    // at manual scope_end() because manual-scope tasks are unpublished until
+    // then. These fields therefore describe a deferred tail range, not a
+    // separate dependency semantic.
+    int32_t deferred_explicit_fanin_begin{0};
+    int32_t deferred_explicit_fanin_count{0};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
     // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];

@@ -17,6 +17,7 @@ ALL_CASES = {
     "ManualGetTensorData": {"mode": 2},
     "ManualSetTensorData": {"mode": 3},
     "ManualSelfDependency": {"mode": 4},
+    "NestedAutoInsideManual": {"mode": 5},
 }
 
 DEFAULT_CASE = "NestedManualScope"

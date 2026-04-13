@@ -23,7 +23,11 @@ PTO_ISA_COMMIT = "d96c8784"
     [
         (
             "NestedManualScope",
-            "manual scope inside manual scope is not supported",
+            "nested scope inside PTO2_SCOPE(PTO2ScopeMode::MANUAL) is not supported in v1",
+        ),
+        (
+            "NestedAutoInsideManual",
+            "nested scope inside PTO2_SCOPE(PTO2ScopeMode::MANUAL) is not supported in v1",
         ),
         (
             "ManualGetTensorData",

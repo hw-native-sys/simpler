@@ -198,7 +198,7 @@ static bool pto2_append_fanin_or_fail(
     return true;
 }
 
-static bool pto2_append_manual_explicit_fanins_to_payload_or_fail(
+static bool pto2_append_deferred_explicit_fanins_to_payload_or_fail(
     PTO2OrchestratorState *orch, PTO2TaskId consumer_id, PTO2TaskPayload *consumer_payload,
     PTO2TaskSlotState *consumer_slot_state, const PTO2TaskId explicit_producer_ids[], int32_t explicit_producer_count
 ) {
@@ -206,8 +206,8 @@ static bool pto2_append_manual_explicit_fanins_to_payload_or_fail(
         return true;
     }
 
-    if (consumer_payload->manual_explicit_fanin_count == 0) {
-        consumer_payload->manual_explicit_fanin_begin = consumer_payload->fanin_actual_count;
+    if (consumer_payload->deferred_explicit_fanin_count == 0) {
+        consumer_payload->deferred_explicit_fanin_begin = consumer_payload->fanin_actual_count;
     }
 
     for (int32_t i = 0; i < explicit_producer_count; i++) {
@@ -281,7 +281,7 @@ static bool pto2_append_manual_explicit_fanins_to_payload_or_fail(
             entry->slot_state = producer_slot_state;
         }
         consumer_payload->fanin_actual_count = current_fanin_count + 1;
-        consumer_payload->manual_explicit_fanin_count += 1;
+        consumer_payload->deferred_explicit_fanin_count += 1;
         consumer_slot_state->fanin_count += 1;
     }
     return true;
@@ -499,7 +499,6 @@ bool pto2_orchestrator_init(
     orch->scope_stack_top = -1;
     orch->scope_stack_capacity = max_depth;
     orch->manual_scope_active = false;
-    orch->manual_scope_needs_dep_pool_repair = false;
 
     return true;
 }
@@ -600,7 +599,7 @@ static bool task_owned_by_current_manual_scope(const PTO2OrchestratorState *orch
     return find_current_manual_scope_task_index(orch, task_id) >= 0;
 }
 
-static bool link_manual_scope_explicit_edges(PTO2OrchestratorState *orch, int32_t begin, int32_t count) {
+static bool link_manual_scope_deferred_explicit_edges(PTO2OrchestratorState *orch, int32_t begin, int32_t count) {
     if (orch->scheduler == nullptr || count <= 0) {
         return true;
     }
@@ -623,7 +622,7 @@ static bool link_manual_scope_explicit_edges(PTO2OrchestratorState *orch, int32_
             orch->fatal = true;
             return false;
         }
-        total_explicit_edges += consumer_payload->manual_explicit_fanin_count;
+        total_explicit_edges += consumer_payload->deferred_explicit_fanin_count;
     }
 
     if (total_explicit_edges == 0) {
@@ -641,12 +640,12 @@ static bool link_manual_scope_explicit_edges(PTO2OrchestratorState *orch, int32_
         PTO2TaskPayload *consumer_payload = consumer_slot_state->payload;
 
         bool fanout_ok = pto2_for_each_fanin_slot_state_range(
-            *consumer_payload, consumer_payload->manual_explicit_fanin_begin,
-            consumer_payload->manual_explicit_fanin_count,
+            *consumer_payload, consumer_payload->deferred_explicit_fanin_begin,
+            consumer_payload->deferred_explicit_fanin_count,
             [&](PTO2TaskSlotState *producer_slot_state) {
                 always_assert(
                     producer_slot_state->ring_id == consumer_slot_state->ring_id &&
-                    "manual explicit dependencies must stay within one ring"
+                    "deferred explicit dependencies must stay within one ring"
                 );
                 producer_slot_state->fanout_count += 1;
                 producer_slot_state->fanout_head =
@@ -682,7 +681,7 @@ void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode) {
 
     if (in_manual_scope(orch)) {
         LOG_ERROR(
-            "nested PTO2_SCOPE(PTO2ScopeMode::MANUAL) is not supported in v1; manual scope inside manual scope is not supported"
+            "nested scope inside PTO2_SCOPE(PTO2ScopeMode::MANUAL) is not supported in v1; both MANUAL->MANUAL and MANUAL->AUTO nesting are rejected"
         );
         orch->sm_handle->header->orch_error_code.store(PTO2_ERROR_INVALID_ARGS, std::memory_order_release);
         orch->fatal = true;
@@ -692,7 +691,6 @@ void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode) {
     ++orch->scope_stack_top;
     orch->scope_begins[orch->scope_stack_top] = orch->scope_tasks_size;
     orch->manual_scope_active = (mode == PTO2ScopeMode::MANUAL);
-    orch->manual_scope_needs_dep_pool_repair = false;
 }
 
 void pto2_scope_end(PTO2OrchestratorState *orch) {
@@ -713,7 +711,6 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
     if (!manual_scope) {
         orch->scope_stack_top--;
         orch->manual_scope_active = false;
-        orch->manual_scope_needs_dep_pool_repair = false;
 
         if (orch->scheduler && count > 0) {
             orch->scheduler->on_scope_end(&orch->scope_tasks[begin], count);
@@ -729,7 +726,7 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
     }
 
     if (orch->scheduler && count > 0) {
-        if (!link_manual_scope_explicit_edges(orch, begin, count)) {
+        if (!link_manual_scope_deferred_explicit_edges(orch, begin, count)) {
             return;
         }
         orch->scheduler->publish_manual_scope_tasks_and_end_scope(&orch->scope_tasks[begin], count);
@@ -739,7 +736,6 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
     orch->scope_tasks_size = begin;
     orch->scope_stack_top--;
     orch->manual_scope_active = false;
-    orch->manual_scope_needs_dep_pool_repair = false;
 
 #if PTO2_ORCH_PROFILING
     uint64_t _se1 = get_sys_cnt_aicpu();
@@ -1083,8 +1079,8 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
             payload->fanin_actual_count = fanin_count;
             payload->fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
             payload->fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
-            payload->manual_explicit_fanin_begin = fanin_count;
-            payload->manual_explicit_fanin_count = 0;
+            payload->deferred_explicit_fanin_begin = fanin_count;
+            payload->deferred_explicit_fanin_count = 0;
             for (int i = 0; i < inline_count; i++) {
                 payload->fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
             }
@@ -1124,7 +1120,7 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
                 cur_slot_state.fanin_refcount.fetch_add(early_finished, std::memory_order_acq_rel);
             }
             cur_slot_state.dep_pool_mark = dep_pool.top;
-            if (!pto2_append_manual_explicit_fanins_to_payload_or_fail(
+            if (!pto2_append_deferred_explicit_fanins_to_payload_or_fail(
                     orch, task_id, payload, &cur_slot_state, explicit_producer_ids, explicit_producer_count
                 )) {
                 return result;
@@ -1147,8 +1143,8 @@ static TaskOutputTensors pto2_submit_mixed_task_impl(
             payload->fanin_actual_count = fanin_count;
             payload->fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
             payload->fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
-            payload->manual_explicit_fanin_begin = fanin_count;
-            payload->manual_explicit_fanin_count = 0;
+            payload->deferred_explicit_fanin_begin = fanin_count;
+            payload->deferred_explicit_fanin_count = 0;
             for (int i = 0; i < inline_count; i++) {
                 payload->fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
             }
@@ -1261,8 +1257,8 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
     payload->fanin_actual_count = 0;
     payload->fanin_spill_start = 0;
     payload->fanin_spill_pool = nullptr;
-    payload->manual_explicit_fanin_begin = 0;
-    payload->manual_explicit_fanin_count = 0;
+    payload->deferred_explicit_fanin_begin = 0;
+    payload->deferred_explicit_fanin_count = 0;
     for (int32_t i = 0; i < args.tensor_count(); i++) {
         payload->tensors[i].owner_task_id = prepared.task_id;
     }
@@ -1405,8 +1401,8 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
     }
 
     int32_t current_fanin_count = consumer_payload->fanin_actual_count;
-    if (consumer_payload->manual_explicit_fanin_count == 0) {
-        consumer_payload->manual_explicit_fanin_begin = current_fanin_count;
+    if (consumer_payload->deferred_explicit_fanin_count == 0) {
+        consumer_payload->deferred_explicit_fanin_begin = current_fanin_count;
     }
     if (current_fanin_count < PTO2_FANIN_INLINE_CAP) {
         consumer_payload->fanin_inline_slot_states[current_fanin_count] = producer_slot_state;
@@ -1433,7 +1429,7 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
     }
 
     consumer_payload->fanin_actual_count = current_fanin_count + 1;
-    consumer_payload->manual_explicit_fanin_count += 1;
+    consumer_payload->deferred_explicit_fanin_count += 1;
     consumer_slot_state->fanin_count += 1;
 }
 

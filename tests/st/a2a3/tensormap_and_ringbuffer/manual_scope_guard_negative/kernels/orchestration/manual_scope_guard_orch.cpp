@@ -54,6 +54,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(
                 pto2_rt_add_dependency(invalid, invalid);
             }
             break;
+        case 5:
+            PTO2_SCOPE(PTO2ScopeMode::MANUAL) { PTO2_SCOPE() {} }
+            break;
         default:
             PTO2_SCOPE() {}
             break;

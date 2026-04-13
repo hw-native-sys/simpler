@@ -65,8 +65,10 @@ struct PTO2OrchestratorState {
     int32_t *scope_begins;            // scope_begins[i] = start index of scope i in scope_tasks
     int32_t scope_stack_top;           // Current top of stack (-1 = no scope open)
     uint64_t scope_stack_capacity;     // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
+    // v1 uses a flat manual-scope bit. Nested scope composition inside a manual
+    // scope is rejected, so scope_end() always clears this flag rather than
+    // restoring stacked mode metadata.
     bool manual_scope_active{false};
-    bool manual_scope_needs_dep_pool_repair{false};
 
     // === SCHEDULER REFERENCE ===
     // Note: In simulated mode, orchestrator and scheduler share address space
