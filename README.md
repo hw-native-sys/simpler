@@ -68,16 +68,22 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 
 | Document | Description |
 | -------- | ----------- |
-| [Architecture](docs/architecture.md) | Three-program model, API layers, execution flow, handshake protocol |
+| [Chip-Level Architecture](docs/chip-level-arch.md) | L2 single-chip: three-program model (host/AICPU/AICore), API layers, handshake protocol |
+| [Distributed Level Runtime](docs/distributed_level_runtime.md) | L0–L6 level model, component composition (Orchestrator / Scheduler / Worker) |
+| [Task Flow](docs/task-flow.md) | End-to-end data flow: Callable / TaskArgs / CallConfig handles, IWorker interface |
+| [Orchestrator](docs/orchestrator.md) | DAG submission internals: submit flow, TensorMap, Scope, Ring, task state machine |
+| [Scheduler](docs/scheduler.md) | DAG dispatch internals: wiring/ready/completion queues, dispatch loop |
+| [Worker Manager](docs/worker-manager.md) | Worker pool, WorkerThread, THREAD/PROCESS modes, fork + mailbox mechanics |
 | [Getting Started](docs/getting-started.md) | Setup, prerequisites, build process, configuration |
 | [Developer Guide](docs/developer-guide.md) | Directory structure, role ownership, conventions |
 | [Testing Guide](docs/testing.md) | CI pipeline, test types, writing new tests |
-| **Per-arch (a2a3):** | |
-| [Runtimes](src/a2a3/docs/runtimes.md) | Runtime comparison and links to per-runtime docs |
-| [Platform](src/a2a3/docs/platform.md) | onboard vs sim, hardware requirements |
-| **Per-arch (a5):** | |
-| [Runtimes](src/a5/docs/runtimes.md) | Runtime comparison and links to per-runtime docs |
-| [Platform](src/a5/docs/platform.md) | onboard vs sim, hardware requirements |
+
+### Per-arch docs
+
+| Document | a2a3 arch | a5 arch |
+| -------- | --------- | ------- |
+| Runtimes | [a2a3/docs/runtimes.md](src/a2a3/docs/runtimes.md) | [a5/docs/runtimes.md](src/a5/docs/runtimes.md) |
+| Platform | [a2a3/docs/platform.md](src/a2a3/docs/platform.md) | [a5/docs/platform.md](src/a5/docs/platform.md) |
 
 ## License
 

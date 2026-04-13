@@ -1,6 +1,6 @@
 # Architecture Quick Reference
 
-See [docs/architecture.md](../../docs/architecture.md) for the full diagram, API layers, execution flow, and handshake protocol.
+See [docs/chip-level-arch.md](../../docs/chip-level-arch.md) for the full diagram, API layers, execution flow, and handshake protocol. See [docs/distributed_level_runtime.md](../../docs/distributed_level_runtime.md) for the L0–L6 level model and component composition, and [docs/task-flow.md](../../docs/task-flow.md) for end-to-end data flow through the hierarchical runtime.
 
 ## Key Concepts
 

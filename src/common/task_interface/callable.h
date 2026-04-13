@@ -25,8 +25,9 @@
  * The returned vector<uint8_t> owns the memory; reinterpret_cast to access.
  *
  * Higher-level callables (L3 HostCallable) are Python-only objects that
- * reference ChipCallable(s) by pointer. They use callable_id in WorkerPayload
- * and never cross the host-device boundary. See distributed_level_runtime.md.
+ * reference ChipCallable(s) by pointer. At L3+ submit, callables are passed as
+ * an opaque uint64 Callable handle (see docs/task-flow.md); they never cross
+ * the host-device boundary.
  *
  * Type aliases:
  *   CoreCallable = Callable<void, CORE_MAX_TENSOR_ARGS, 0>       — leaf kernel binary
