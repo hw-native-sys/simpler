@@ -3,7 +3,7 @@
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OR ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
@@ -16,7 +16,10 @@
 
 #include <cstring>
 #include <iostream>
+#include <fstream>
 #include <unordered_map>
+#include <vector>
+#include <unistd.h>
 
 #include "common/unified_log.h"
 #include "common/kernel_args.h"
@@ -25,70 +28,130 @@
 // New CANN RTS header for rtsLaunchCpuKernel interface (CANN 7.0+)
 #include "runtime/runtime/rts/rts_kernel.h"
 #include "runtime/runtime/kernel.h"
+
+// Forward declarations for JSON structures
+struct AicpuOpConfig {
+    std::string functionName;
+    std::string kernelSo;
+    std::string opKernelLib;
+    std::string computeCost = "100";
+    std::string engine = "DNN_VM_AICPU";
+    std::string flagAsync = "False";
+    std::string flagPartial = "False";
+    std::string userDefined = "False";
+    std::string opType;
+};
+
+// Generate AICPU op info JSON file
+static bool GenerateAicpuOpJson(const std::string& json_path, const std::vector<AicpuOpConfig>& op_configs) {
+    std::ofstream json_file(json_path);
+    if (!json_file.is_open()) {
+        LOG_ERROR("Failed to open JSON file for writing: %s", json_path.c_str());
+        return false;
+    }
+
+    json_file << "{\n";
+    for (size_t i = 0; i < op_configs.size(); ++i) {
+        const auto& config = op_configs[i];
+        json_file << "  \"" << config.opType << "\": {\n";
+        json_file << "    \"opInfo\": {\n";
+        json_file << "      \"functionName\": \"" << config.functionName << "\",\n";
+        json_file << "      \"kernelSo\": \"" << config.kernelSo << "\",\n";
+        json_file << "      \"opKernelLib\": \"" << config.opKernelLib << "\",\n";
+        json_file << "      \"computeCost\": \"" << config.computeCost << "\",\n";
+        json_file << "      \"engine\": \"" << config.engine << "\",\n";
+        json_file << "      \"flagAsync\": \"" << config.flagAsync << "\",\n";
+        json_file << "      \"flagPartial\": \"" << config.flagPartial << "\",\n";
+        json_file << "      \"userDefined\": \"" << config.userDefined << "\"\n";
+        json_file << "    }\n";
+        json_file << "  }" << (i < op_configs.size() - 1 ? "," : "") << "\n";
+    }
+    json_file << "}\n";
+    json_file.close();
+
+    LOG_INFO("Generated AICPU op info JSON: %s", json_path.c_str());
+    return true;
+}
+
 #endif
 
-int AicpuLoader::init_with_binary(const std::vector<uint8_t>& aicpu_so_binary, const std::vector<std::string>& kernel_names) {
+int AicpuLoader::init_with_binary(const std::vector<uint8_t>& aicpu_binary, const std::vector<std::string>& kernel_names) {
 #ifdef BUILD_WITH_NEW_CANN
-    // New interface: Load binary from memory and resolve function handles
-    LOG_INFO("AicpuLoader: Using new rtsBinaryLoadFromData + rtsLaunchCpuKernel interface");
+    // New interface: Load binary using JSON descriptor (pypto approach)
+    LOG_INFO("AicpuLoader: Using new rtsBinaryLoadFromFile + rtsLaunchCpuKernel interface");
+    LOG_INFO("AicpuLoader: Binary size=%zu bytes", aicpu_binary.size());
 
-    if (aicpu_so_binary.empty()) {
-        LOG_ERROR("AicpuLoader: AICPU binary is empty");
+    // Step 1: Generate op info JSON at runtime (using only filename, not full path)
+    const char* tmp_dir = std::getenv("TMPDIR") ? std::getenv("TMPDIR") : "/tmp";
+    std::string json_path_template = std::string(tmp_dir) + "/simpler_aicpu_op_info_XXXXXX.json";
+    std::vector<char> json_path_buffer(json_path_template.begin(), json_path_template.end());
+    json_path_buffer.push_back('\0');
+
+    int json_fd = mkstemps(json_path_buffer.data(), 5);
+    if (json_fd == -1) {
+        LOG_ERROR("Failed to create temporary JSON file");
         return -1;
     }
+    close(json_fd);
+    json_file_path_ = json_path_buffer.data();
 
-    // 1. Load binary from memory: rtsBinaryLoadFromData
-    // Try with CPU kernel mode configuration
-    rtLoadBinaryOption_t option = {};
-    option.optionId = RT_LOAD_BINARY_OPT_CPU_KERNEL_MODE;
-    option.value.cpuKernelMode = 1;  // Load CPU so & json
-
-    rtLoadBinaryConfig_t load_config = {};
-    load_config.options = &option;
-    load_config.numOpt = 1;
-
-    rtError_t rc = rtsBinaryLoadFromData(
-        aicpu_so_binary.data(),
-        aicpu_so_binary.size(),
-        &load_config,
-        &binary_handle_
-    );
-    if (rc != RT_ERROR_NONE) {
-        LOG_ERROR("rtsBinaryLoadFromData failed: %d (binary size=%zu)", rc, aicpu_so_binary.size());
-        return rc;
-    }
-    LOG_INFO("AicpuLoader: Loaded binary from memory, handle=%p, size=%zu", binary_handle_, aicpu_so_binary.size());
-
-    // Map kernel names to backend versions (actual symbol names in the .so)
+    // Map opType (used for rtsFuncGetByName) to functionName (actual symbol in .so)
     std::unordered_map<std::string, std::string> name_mapping = {
         {"DynTileFwkKernelServerInit", "DynTileFwkBackendKernelServerInit"},
         {"DynTileFwkKernelServer", "DynTileFwkBackendKernelServer"}
     };
 
-    // 2. Resolve function handles: rtsFuncGetByName
+    // Create op configs for JSON generation
+    // kernelSo uses only filename - runtime will find it via library search path
+    std::vector<AicpuOpConfig> op_configs;
     for (const auto& name : kernel_names) {
-        // Map to the actual symbol name
-        std::string actual_name = name;
-        auto it = name_mapping.find(name);
-        if (it != name_mapping.end()) {
-            actual_name = it->second;
-        }
+        AicpuOpConfig config;
+        config.opType = name;
+        config.functionName = name_mapping[name];
+        config.kernelSo = "libaicpu_kernel.so";  // Filename only, runtime searches library path
+        config.opKernelLib = "KFCKernel";
+        op_configs.push_back(config);
+    }
 
+    // Generate JSON file
+    if (!GenerateAicpuOpJson(json_file_path_, op_configs)) {
+        return -1;
+    }
+
+    // Step 2: Load binary handle from JSON: rtsBinaryLoadFromFile
+    // cpuKernelMode=0: JSON only mode, runtime finds .so via library search path
+    rtLoadBinaryOption_t option = {};
+    option.optionId = RT_LOAD_BINARY_OPT_CPU_KERNEL_MODE;
+    option.value.cpuKernelMode = 0;
+
+    rtLoadBinaryConfig_t load_config = {};
+    load_config.options = &option;
+    load_config.numOpt = 1;
+
+    rtError_t rc = rtsBinaryLoadFromFile(json_file_path_.c_str(), &load_config, &binary_handle_);
+    if (rc != RT_ERROR_NONE) {
+        LOG_ERROR("rtsBinaryLoadFromFile failed for %s: %d", json_file_path_.c_str(), rc);
+        return rc;
+    }
+    LOG_INFO("AicpuLoader: Loaded binary from JSON, handle=%p", binary_handle_);
+
+    // Step 3: Resolve function handles: rtsFuncGetByName
+    for (const auto& name : kernel_names) {
         rtFuncHandle func_handle = nullptr;
-        rc = rtsFuncGetByName(binary_handle_, actual_name.c_str(), &func_handle);
+        rc = rtsFuncGetByName(binary_handle_, name.c_str(), &func_handle);
         if (rc != RT_ERROR_NONE) {
-            LOG_ERROR("rtsFuncGetByName failed for %s (mapped from %s): %d", actual_name.c_str(), name.c_str(), rc);
+            LOG_ERROR("rtsFuncGetByName failed for %s: %d", name.c_str(), rc);
             return rc;
         }
-        func_handles_[name] = func_handle;  // Store with original name for lookup
-        LOG_INFO("AicpuLoader: Resolved function handle for %s -> %s: %p", name.c_str(), actual_name.c_str(), func_handle);
+        func_handles_[name] = func_handle;
+        LOG_INFO("AicpuLoader: Resolved function handle for %s: %p", name.c_str(), func_handle);
     }
 
     return 0;
 
 #else
     // Legacy interface: No pre-loading needed
-    (void)aicpu_so_binary;
+    (void)so_path;
     (void)kernel_names;
     LOG_INFO("AicpuLoader: Using legacy rtAicpuKernelLaunchExWithArgs interface");
     return 0;
@@ -97,12 +160,12 @@ int AicpuLoader::init_with_binary(const std::vector<uint8_t>& aicpu_so_binary, c
 
 int AicpuLoader::init(const std::string& so_path, const std::vector<std::string>& kernel_names) {
 #ifdef BUILD_WITH_NEW_CANN
-    // New interface: Store kernel names for later resolution
-    // Binary will be loaded via init_with_binary()
-    LOG_INFO("AicpuLoader: Using new rtsLaunchCpuKernel interface (binary not loaded yet)");
+    // New interface: Use init_with_binary() instead
+    // This init() is kept for backward compatibility but does nothing
     (void)so_path;
     (void)kernel_names;
-    return 0;  // Binary will be loaded separately via init_with_binary()
+    LOG_INFO("AicpuLoader: Use init_with_binary() for new interface");
+    return 0;
 #else
     // Legacy interface: No pre-loading needed
     (void)so_path;
@@ -195,6 +258,14 @@ void AicpuLoader::finalize() {
         binary_handle_ = nullptr;
     }
     func_handles_.clear();
+
+    // Delete temporary JSON file if it was created
+    if (!json_file_path_.empty()) {
+        std::remove(json_file_path_.c_str());
+        LOG_INFO("AicpuLoader: Deleted temporary JSON file: %s", json_file_path_.c_str());
+        json_file_path_.clear();
+    }
+
     LOG_INFO("AicpuLoader: Finalized new interface");
 #else
     // Legacy interface: No-op

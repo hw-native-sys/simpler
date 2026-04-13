@@ -3,7 +3,7 @@
  * This program is free software, you can redistribute it and/or modify it under the terms and conditions of
  * CANN Open Software License Agreement Version 2.0 (the "License").
  * Please refer to the License for details. You may not use this file except in compliance with the License.
- * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OF ANY KIND, EITHER EXPRESS OR IMPLIED,
+ * THIS SOFTWARE IS PROVIDED ON AN "AS IS" BASIS, WITHOUT WARRANTIES OR ANY KIND, EITHER EXPRESS OR IMPLIED,
  * INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
@@ -46,24 +46,25 @@ public:
     /**
      * @brief Initialize the AICPU loader with binary data
      *
-     * For the new interface (BUILD_WITH_NEW_CANN=ON), this loads the AICPU binary from memory
-     * and resolves function handles using rtsBinaryLoadFromData and rtsFuncGetByName.
+     * For the new interface (BUILD_WITH_NEW_CANN=ON), this generates a JSON descriptor
+     * and loads the binary using rtsBinaryLoadFromFile. The .so file is referenced by
+     * filename only (libaicpu_kernel.so) and must be findable via library search path.
      * For the legacy interface (BUILD_WITH_NEW_CANN=OFF), this is a no-op.
      *
-     * @param aicpu_so_binary Binary data of the AICPU shared object
-     * @param kernel_names List of kernel function names to resolve (used for mapping)
+     * @param aicpu_binary Binary data of the AICPU shared library (not used, kept for API compatibility)
+     * @param kernel_names List of kernel function names to resolve
      * @return 0 on success, error code on failure
      */
-    int init_with_binary(const std::vector<uint8_t>& aicpu_so_binary, const std::vector<std::string>& kernel_names);
+    int init_with_binary(const std::vector<uint8_t>& aicpu_binary, const std::vector<std::string>& kernel_names);
 
     /**
      * @brief Initialize the AICPU loader (legacy interface compatibility)
      *
-     * For the new interface (BUILD_WITH_NEW_CANN=ON), this stores kernel names for later use.
+     * For the new interface (BUILD_WITH_NEW_CANN=ON), this does nothing.
      * For the legacy interface (BUILD_WITH_NEW_CANN=OFF), this is a no-op.
      *
-     * @param so_path Path to the AICPU shared library (not used in new interface)
-     * @param kernel_names List of kernel function names to resolve
+     * @param so_path Path to the AICPU shared library (not used)
+     * @param kernel_names List of kernel function names (not used)
      * @return 0 on success, error code on failure
      */
     int init(const std::string& so_path, const std::vector<std::string>& kernel_names);
@@ -98,8 +99,9 @@ public:
 private:
 #ifdef BUILD_WITH_NEW_CANN
     // New interface members
-    void* binary_handle_ = nullptr;  // Binary handle from rtsBinaryLoadFromData
-    std::unordered_map<std::string, void*> func_handles_;  // Function handles
+    void* binary_handle_ = nullptr;  // Binary handle from rtsBinaryLoadFromFile
+    std::unordered_map<std::string, void*> func_handles_;  // Function handles (kernel_name -> func_handle)
+    std::string json_file_path_;  // Path to temporary JSON descriptor file
 #else
     // Legacy interface - no state needed
 #endif
