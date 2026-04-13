@@ -74,3 +74,7 @@ RUNTIME_CONFIG = {
     "aicpu_thread_num": 4,
     "block_dim": 24,
 }
+
+RUNTIME_ENV = {
+    "PTO2_RING_HEAP": "1073741824",
+}

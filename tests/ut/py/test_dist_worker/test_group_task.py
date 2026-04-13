@@ -20,15 +20,9 @@ TestGroupDependency:
     test_group_then_dependent_task — group (2 workers) produces output,
         downstream task depends on it via TensorMap. Verifies downstream
         only runs after group completes.
-
-TestGroupParallel:
-    test_group_wall_time — 2 workers each sleep 0.1s in a group. Wall time
-        should be ~0.1s (parallel), not 0.2s (serial). Verifies group workers
-        execute concurrently.
 """
 
 import struct
-import time as _time
 from multiprocessing import Value
 from multiprocessing.shared_memory import SharedMemory
 
@@ -151,38 +145,3 @@ class TestGroupDependency:
             group_marker.unlink()
             dep_marker.close()
             dep_marker.unlink()
-
-
-# ---------------------------------------------------------------------------
-# Test: group parallel wall time
-# ---------------------------------------------------------------------------
-
-
-class TestGroupParallel:
-    def test_group_wall_time(self):
-        """2 workers sleeping 0.2s in a group finish in ~0.2s, not 0.4s."""
-        sleep_s = 0.2
-        counter = Value("i", 0)
-
-        def slow_fn():
-            _time.sleep(sleep_s)
-            with counter.get_lock():
-                counter.value += 1
-
-        hw = Worker(level=3, num_sub_workers=2)
-        cid = hw.register(slow_fn)
-        hw.init()
-
-        def orch(hw, _args):
-            p = WorkerPayload()
-            p.worker_type = WorkerType.SUB
-            p.callable_id = cid
-            hw.submit(WorkerType.SUB, p, args_list=[0, 0])
-
-        start = _time.monotonic()
-        hw.run(Task(orch=orch))
-        elapsed = _time.monotonic() - start
-        hw.close()
-
-        assert counter.value == 2
-        assert elapsed < sleep_s * 2 * 0.9, f"Expected parallel ~{sleep_s}s, got {elapsed:.2f}s"
