@@ -297,8 +297,8 @@ struct alignas(64) Tensor {
         always_assert(reinterpret_cast<char *>(buffer.addr) != nullptr);
         uint64_t elem_size = get_element_size(dtype);
         char *dst = reinterpret_cast<char *>(buffer.addr);
-        constexpr uint64_t BLK = 64;
-        uint64_t blk = (buffer.size < BLK) ? buffer.size : BLK;
+        constexpr uint64_t blk_size = 64;
+        uint64_t blk = (buffer.size < blk_size) ? buffer.size : blk_size;
         for (uint64_t b = 0; b < blk; b += elem_size) {
             memcpy(dst + b, &initial_value, elem_size);
         }
