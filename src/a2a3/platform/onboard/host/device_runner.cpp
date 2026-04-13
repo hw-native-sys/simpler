@@ -313,8 +313,24 @@ int DeviceRunner::ensure_binaries_loaded(
 
     aicore_kernel_binary_ = aicore_kernel_binary;
 
+#ifdef BUILD_WITH_NEW_CANN
+    // New interface: Initialize AICPU loader with binary data
+    const std::vector<std::string> kernel_names = {
+        "DynTileFwkKernelServerInit",
+        "DynTileFwkKernelServer"
+    };
+    int rc = aicpu_loader_.init_with_binary(aicpu_so_binary, kernel_names);
+    if (rc != 0) {
+        LOG_ERROR("AicpuLoader init_with_binary failed: %d", rc);
+        return rc;
+    }
+    LOG_INFO("DeviceRunner: AICPU loader initialized with %zu bytes of binary data", aicpu_so_binary.size());
+#else
+    int rc = 0;
+#endif
+
     // Load AICPU SO
-    int rc = so_info_.init(aicpu_so_binary, mem_alloc_);
+    rc = so_info_.init(aicpu_so_binary, mem_alloc_);
     if (rc != 0) {
         LOG_ERROR("AicpuSoInfo::init failed: %d", rc);
         return rc;
@@ -607,6 +623,9 @@ int DeviceRunner::finalize() {
     // Cleanup AICPU SO
     so_info_.finalize();
 
+    // Cleanup AICPU loader
+    aicpu_loader_.finalize();
+
     // Kernel binaries should have been removed by validate_runtime_impl()
     if (!func_id_to_addr_.empty()) {
         LOG_ERROR("finalize() called with %zu kernel binaries still cached (memory leak)", func_id_to_addr_.size());
@@ -659,27 +678,7 @@ int DeviceRunner::finalize() {
 }
 
 int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num) {
-    struct Args {
-        KernelArgs k_args;
-        char kernel_name[32];
-        const char so_name[32] = {"libaicpu_extend_kernels.so"};
-        const char op_name[32] = {""};
-    } args;
-
-    args.k_args = *k_args;
-    std::strncpy(args.kernel_name, kernel_name, sizeof(args.kernel_name) - 1);
-    args.kernel_name[sizeof(args.kernel_name) - 1] = '\0';
-
-    rtAicpuArgsEx_t rt_args;
-    std::memset(&rt_args, 0, sizeof(rt_args));
-    rt_args.args = &args;
-    rt_args.argsSize = sizeof(args);
-    rt_args.kernelNameAddrOffset = offsetof(struct Args, kernel_name);
-    rt_args.soNameAddrOffset = offsetof(struct Args, so_name);
-
-    return rtAicpuKernelLaunchExWithArgs(
-        rtKernelType_t::KERNEL_TYPE_AICPU_KFC, "AST_DYN_AICPU", aicpu_num, &rt_args, nullptr, stream, 0
-    );
+    return aicpu_loader_.launch(stream, k_args, kernel_name, aicpu_num);
 }
 
 int DeviceRunner::launch_aicore_kernel(rtStream_t stream, KernelArgs *k_args) {

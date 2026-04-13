@@ -35,6 +35,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/pto_runtime_c_api.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/platform_compile_info.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/host_regs.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/aicpu_loader.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/host_log.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_log_host.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/performance_collector.cpp"
@@ -84,11 +85,16 @@ target_include_directories(host_runtime
         ${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include/driver
 )
 
-target_link_directories(host_runtime
-    PRIVATE
-        ${ASCEND_HOME_PATH}/lib64
-        ${ASCEND_HOME_PATH}/runtime/lib64
-)
+# Conditional compilation for new CANN interface
+option(BUILD_WITH_NEW_CANN "Use new rtsLaunchCpuKernel interface (CANN 7.0+)" ON)
+if(BUILD_WITH_NEW_CANN)
+    target_compile_definitions(host_runtime PRIVATE BUILD_WITH_NEW_CANN)
+    # Add additional include path for new RTS headers (CANN 7.0+)
+    target_include_directories(host_runtime PRIVATE
+        ${ASCEND_HOME_PATH}/pkg_inc/runtime/runtime
+    )
+    message(STATUS "Building with new CANN rtsLaunchCpuKernel interface")
+endif()
 
 # Link against CANN runtime libraries
 # ascend_hal is dynamically loaded at runtime via dlopen in device_runner
@@ -98,6 +104,11 @@ target_link_libraries(host_runtime
         runtime
         ascendcl
         dl
+)
+
+target_link_directories(host_runtime
+    PRIVATE
+        ${ASCEND_HOME_PATH}/aarch64-linux/lib64
 )
 
 set_target_properties(host_runtime PROPERTIES OUTPUT_NAME "host_runtime")

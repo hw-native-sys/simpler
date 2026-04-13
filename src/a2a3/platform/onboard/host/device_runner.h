@@ -43,6 +43,7 @@
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
 #include "host/performance_collector.h"
+#include "aicpu_loader.h"
 #include "runtime.h"
 
 /**
@@ -252,7 +253,7 @@ public:
      */
     int
     run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num);
 
     /**
      * Print handshake results from device
@@ -379,6 +380,9 @@ private:
     int cores_per_blockdim_{PLATFORM_CORES_PER_BLOCKDIM};
     int worker_count_{0};  // Stored for print_handshake_results in destructor
     std::vector<uint8_t> aicore_kernel_binary_;
+
+    // AICPU loader abstraction (supports both legacy and new CANN interfaces)
+    AicpuLoader aicpu_loader_;
 
     // Memory management
     MemoryAllocator mem_alloc_;

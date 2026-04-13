@@ -28,6 +28,8 @@ examples/scripts/_deps/
 # Profiling files
 outputs
 tmp
+profiling_logs_*
+*.log
 
 # Mid-work documentation
 .docs
