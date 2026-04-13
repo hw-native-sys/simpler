@@ -6,24 +6,21 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Centralized path management for scene test setup."""
+"""Centralized path management.
 
-import sys
+PROJECT_ROOT auto-resolves between two layouts:
+  - wheel install: simpler_setup/_assets/{src,build/lib} populated by CMakeLists install()
+  - source tree / editable: repo root with src/ and build/lib/ in original positions
+"""
+
 from pathlib import Path
 
-# Single source of truth: project root derived from this file's location
-# tests/st/setup/environment.py → 4 parents up → project root
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# Key directories
-PYTHON_DIR = PROJECT_ROOT / "python"
-EXAMPLES_SCRIPTS_DIR = PROJECT_ROOT / "examples" / "scripts"
-BUILD_CACHE_DIR = PROJECT_ROOT / "build" / "cache"
-BUILD_LIB_DIR = PROJECT_ROOT / "build" / "lib"
+def _resolve_project_root() -> Path:
+    assets = Path(__file__).resolve().parent / "_assets"
+    if (assets / "src").is_dir():
+        return assets
+    return Path(__file__).resolve().parent.parent
 
 
-def ensure_python_path() -> None:
-    """Add python/ to sys.path for task_interface imports."""
-    p = str(PYTHON_DIR)
-    if p not in sys.path:
-        sys.path.insert(0, p)
+PROJECT_ROOT = _resolve_project_root()

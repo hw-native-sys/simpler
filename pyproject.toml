@@ -72,5 +72,14 @@ pythonpath = ["python", "golden"]
 addopts = "--import-mode=importlib"
 
 [tool.scikit-build]
-wheel.packages = ["simpler_setup"]
+wheel.packages = ["simpler_setup", "python/simpler"]
+wheel.exclude = [
+    "simpler/elf_parser.py",
+    "simpler/kernel_compiler.py",
+    "simpler/runtime_compiler.py",
+    "simpler/toolchain.py",
+]
 cmake.build-type = "Release"
+build-dir = "build/{wheel_tag}"
+editable.rebuild = true
+editable.verbose = true

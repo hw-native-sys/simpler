@@ -36,3 +36,11 @@ add_custom_target(build_runtimes ALL
         --cache-dir ${CMAKE_SOURCE_DIR}/build/cache
     COMMENT "Building runtime binaries (incremental)..."
 )
+
+if(SKBUILD_MODE)
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/src/
+            DESTINATION simpler_setup/_assets/src)
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/build/lib/
+            DESTINATION simpler_setup/_assets/build/lib
+            OPTIONAL)
+endif()

@@ -43,9 +43,6 @@ from pathlib import Path
 # Get script and project directories
 script_dir = Path(__file__).parent.resolve()
 project_root = script_dir.parent.parent
-python_dir = project_root / "python"
-if python_dir.exists():
-    sys.path.insert(0, str(python_dir))
 golden_dir = project_root / "golden"
 if golden_dir.exists():
     sys.path.insert(0, str(golden_dir))

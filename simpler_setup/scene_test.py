@@ -27,8 +27,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from .environment import ensure_python_path
-
 _compile_cache: dict[tuple[str, str, str], object] = {}
 
 
@@ -200,7 +198,6 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
         chip_args: ChipStorageTaskArgs (for worker.run)
         output_names: list of tensor names that are OUTPUT or INOUT
     """
-    ensure_python_path()
     from simpler.task_interface import (  # noqa: PLC0415
         ArgDirection,
         ChipStorageTaskArgs,
@@ -301,12 +298,11 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
     if cache_key in _compile_cache:
         return _compile_cache[cache_key]
 
+    from simpler.task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
+
     from .elf_parser import extract_text_section  # noqa: PLC0415
     from .kernel_compiler import KernelCompiler  # noqa: PLC0415
     from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
-
-    ensure_python_path()
-    from simpler.task_interface import ChipCallable, CoreCallable  # noqa: PLC0415
 
     orch = spec["orchestration"]
     incores = spec["incores"]
@@ -419,7 +415,6 @@ class SceneTestCase:
 
     @classmethod
     def _create_worker(cls, platform, device_id=0, build=False):
-        ensure_python_path()
         from simpler.task_interface import ChipWorker  # noqa: PLC0415
 
         bins = cls._get_binaries(platform, build=build)
@@ -450,7 +445,6 @@ class SceneTestCase:
         raise ValueError(f"Unsupported level: {self._st_level}")
 
     def _build_config(self, config_dict, enable_profiling=False):
-        ensure_python_path()
         from simpler.task_interface import ChipCallConfig  # noqa: PLC0415
 
         config = ChipCallConfig()
@@ -537,7 +531,6 @@ class SceneTestCase:
     def _run_and_validate_l3(
         self, worker, compiled_callables, sub_ids, case, rounds=1, skip_golden=False, enable_profiling=False
     ):
-        ensure_python_path()
         from simpler.worker import Task  # noqa: PLC0415
 
         params = case.get("params", {})
@@ -706,7 +699,6 @@ def _create_standalone_worker(group, args):
     if level == 2:
         return first_cls._create_worker(args.platform, args.device, build=build), {}
 
-    ensure_python_path()
     from simpler.worker import Worker  # noqa: PLC0415
 
     max_devices = max((c.get("config", {}).get("device_count", 1) for cls in group for c in cls.CASES), default=1)

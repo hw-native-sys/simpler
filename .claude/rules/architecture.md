@@ -8,18 +8,29 @@ See [docs/chip-level-arch.md](../../docs/chip-level-arch.md) for the full diagra
 - **Three runtimes** under `src/{arch}/runtime/`: `host_build_graph`, `aicpu_build_graph`, `tensormap_and_ringbuffer`
 - **Two platform backends** under `src/{arch}/platform/`: `onboard/` (hardware), `sim/` (simulation)
 
+## Python Package Layout
+
+| Package | Source | What's in wheel | Use for |
+| ------- | ------ | --------------- | ------- |
+| `simpler` | `python/simpler/` | `task_interface`, `worker`, `env_manager` only | Stable user API at runtime |
+| `simpler_setup` | `simpler_setup/` | All files + `_assets/{src,build/lib}` | Test framework, compilers, path resolution |
+| `_task_interface` | `python/bindings/` | nanobind `.so` at wheel root | Internal nanobind module |
+
+The 4 files `kernel_compiler.py`, `runtime_compiler.py`, `toolchain.py`, `elf_parser.py` exist in **both** `python/simpler/` and `simpler_setup/` during transition. The `simpler_setup/` copies are authoritative; the `python/simpler/` copies are excluded from wheel via `pyproject.toml::wheel.exclude`. New code must `import` from `simpler_setup.*`, not `simpler.*`, for these four.
+
 ## Build System Lookup
 
 | What | Where |
 | ---- | ----- |
 | Runtime selection | `kernel_config.py` → `RUNTIME_CONFIG.runtime` |
 | Per-runtime build config | `src/{arch}/runtime/{runtime}/build_config.py` |
-| Runtime build orchestration | `examples/scripts/runtime_builder.py` → `runtime_compiler.py` → cmake |
+| Runtime build orchestration | `simpler_setup/runtime_builder.py` → `simpler_setup/runtime_compiler.py` → cmake |
 | Pre-build all runtimes | `examples/scripts/build_runtimes.py` (invoked by `pip install .`) |
-| Platform/runtime discovery | `examples/scripts/platform_info.py` |
-| Kernel compilation | `python/kernel_compiler.py` (one `.cpp` per `func_id`) |
+| Platform/runtime discovery | `simpler_setup/platform_info.py` |
+| Kernel compilation | `simpler_setup/kernel_compiler.py` (one `.cpp` per `func_id`) |
 | Python bindings | `python/bindings/` (nanobind extension for ChipWorker, task types) |
-| Pre-built binary lookup | `build/lib/{arch}/{variant}/{runtime}/` |
+| Path resolution (wheel vs source tree) | `simpler_setup/environment.py::PROJECT_ROOT` |
+| Pre-built binary lookup | `build/lib/{arch}/{variant}/{runtime}/` (source tree) or `simpler_setup/_assets/build/lib/...` (wheel) |
 | Persistent cmake cache | `build/cache/{arch}/{variant}/{runtime}/` |
 
 ## Example / Test Layout

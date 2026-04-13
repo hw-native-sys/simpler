@@ -27,8 +27,14 @@ Multiple AI agents may work on this repo concurrently (parallel sessions, worktr
 3. **Install the project**:
 
    ```bash
-   pip install .
+   # Production / CI install
+   pip install --no-build-isolation .
+
+   # Editable install for development (auto-rebuilds C++ on import)
+   pip install --no-build-isolation -e .
    ```
+
+   `--no-build-isolation` is required because scikit-build-core consumes the venv's already-installed `scikit-build-core`, `nanobind`, and `cmake` directly. Without the flag, pip spins up a temporary isolated build env that doesn't see them, slowing the install and risking version drift.
 
 4. **Run tests / examples** inside the activated venv.
 
@@ -42,7 +48,7 @@ When working in a git worktree (`.claude/worktrees/` or any other worktree path)
 # First time in a directory (or worktree)
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
-pip install .
+pip install --no-build-isolation .            # or: -e . for editable
 
 # Subsequent runs — just activate
 source .venv/bin/activate
@@ -53,3 +59,4 @@ source .venv/bin/activate
 - Run `pip install .` without an activated local venv
 - Share a single venv across multiple worktrees
 - Use `--user` installs as a substitute for venv isolation
+- Drop `--no-build-isolation` — scikit-build-core needs the venv's `nanobind`/`cmake` directly
