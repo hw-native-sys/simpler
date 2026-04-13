@@ -19,7 +19,7 @@
 #include <cstdint>
 #include <type_traits>
 
-#include "data_type.h"  // NOLINT(build/include_subdir)
+#include "data_type.h"
 
 constexpr int CONTINUOUS_TENSOR_MAX_DIMS = 5;
 
@@ -50,10 +50,10 @@ static_assert(
 /**
  * TensorArgType - Distinguishes inputs, outputs, and in-place updates
  */
-enum class TensorArgType : int32_t {  // NOLINT(performance-enum-size)
-    INPUT = 0,                        // Read-only input buffer
-    OUTPUT = 1,                       // Write-only output buffer (runtime allocates)
-    INOUT = 2,                        // Read-then-write: modifier for downstream
-    OUTPUT_EXISTING = 3,              // Write-only existing tensor: skips OverlapMap lookup, depends on creator
-    NO_DEP = 4,                       // No-dependency existing tensor: skips OverlapMap lookup, no publish
+enum class TensorArgType : int32_t {
+    INPUT = 0,            // Read-only input buffer
+    OUTPUT = 1,           // Write-only output buffer (runtime allocates)
+    INOUT = 2,            // Read-then-write: modifier for downstream
+    OUTPUT_EXISTING = 3,  // Write-only existing tensor: skips OverlapMap lookup, depends on creator
+    NO_DEP = 4,           // No-dependency existing tensor: skips OverlapMap lookup, no publish
 };

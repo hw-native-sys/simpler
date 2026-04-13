@@ -17,8 +17,6 @@
  * running in host-based simulation environment.
  */
 
-// NOLINT(build/header_guard) -- PLATFORM_* include guards are the project convention here
-
 #ifndef PLATFORM_A2A3SIM_AICORE_INNER_KERNEL_H_
 #define PLATFORM_A2A3SIM_AICORE_INNER_KERNEL_H_
 

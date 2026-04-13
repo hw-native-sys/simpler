@@ -24,9 +24,9 @@
 #include <vector>
 
 #include "common/unified_log.h"
-#include "device_runner.h"  // NOLINT(build/include_subdir)
+#include "device_runner.h"
 #include "host/raii_scope_guard.h"
-#include "runtime.h"  // NOLINT(build/include_subdir)
+#include "runtime.h"
 
 extern "C" {
 

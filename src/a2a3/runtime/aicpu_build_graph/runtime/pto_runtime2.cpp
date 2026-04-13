@@ -17,7 +17,7 @@
  * Based on: docs/RUNTIME_LOGIC.md
  */
 
-#include "pto_runtime2.h"  // NOLINT(build/include_subdir)
+#include "pto_runtime2.h"
 
 #include <stdio.h>
 #include <stdlib.h>

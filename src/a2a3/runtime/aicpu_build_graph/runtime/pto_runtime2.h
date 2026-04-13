@@ -36,12 +36,12 @@
 #ifndef SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_H_
 #define SRC_A2A3_RUNTIME_AICPU_BUILD_GRAPH_RUNTIME_PTO_RUNTIME2_H_
 
-#include "pto_orchestrator.h"    // NOLINT(build/include_subdir)
-#include "pto_ring_buffer.h"     // NOLINT(build/include_subdir)
-#include "pto_runtime2_types.h"  // NOLINT(build/include_subdir)
-#include "pto_scheduler.h"       // NOLINT(build/include_subdir)
-#include "pto_shared_memory.h"   // NOLINT(build/include_subdir)
-#include "pto_submit_types.h"    // NOLINT(build/include_subdir)
+#include "pto_orchestrator.h"
+#include "pto_ring_buffer.h"
+#include "pto_runtime2_types.h"
+#include "pto_scheduler.h"
+#include "pto_shared_memory.h"
+#include "pto_submit_types.h"
 
 // =============================================================================
 // Runtime Context
@@ -232,14 +232,14 @@ void pto2_rt_orchestration_done(PTO2Runtime *rt);
  * - Less error-prone: impossible to forget scope cleanup
  */
 class PTO2ScopeGuard {
-public:  // NOLINT(whitespace/indent)
+public:
     explicit PTO2ScopeGuard(PTO2Runtime *rt) :
         rt_(rt) {
         pto2_rt_scope_begin(rt_);
     }
     ~PTO2ScopeGuard() { pto2_rt_scope_end(rt_); }
 
-private:  // NOLINT(whitespace/indent)
+private:
     PTO2Runtime *rt_;
 };
 

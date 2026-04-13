@@ -122,8 +122,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
                 pto2_orch_report_fatal(
                     &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                     "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
-                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES,  // NOLINT(runtime/int)
-                    ring_id, local_id
+                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
                 );
                 return false;
             }
@@ -138,8 +137,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
                     pto2_orch_report_fatal(
                         &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                         "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES,  // NOLINT(runtime/int)
-                        ring_id, local_id
+                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
                     );
                     return false;
                 }

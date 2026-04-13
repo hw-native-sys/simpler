@@ -25,9 +25,9 @@
 #include <vector>
 
 #include "common/unified_log.h"
-#include "cpu_sim_context.h"  // NOLINT(build/include_subdir)
-#include "device_runner.h"    // NOLINT(build/include_subdir)
-#include "runtime.h"          // NOLINT(build/include_subdir)
+#include "cpu_sim_context.h"
+#include "device_runner.h"
+#include "runtime.h"
 
 extern "C" {
 

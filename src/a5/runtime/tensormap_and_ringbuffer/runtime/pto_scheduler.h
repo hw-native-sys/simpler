@@ -880,7 +880,7 @@ struct PTO2SchedulerState {
 #endif
         return payload->fanin_actual_count;
     }
-};  // NOLINT(readability/braces)
+};
 
 // =============================================================================
 // Scheduler API (cold path, defined in pto_scheduler.cpp)

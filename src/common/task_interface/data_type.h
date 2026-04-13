@@ -111,7 +111,7 @@ inline const char *get_dtype_name(DataType dtype) {
 // Platform headers (inner_kernel.h) normally define this, but data_type.h
 // may be included before them.
 #ifndef __aicore__
-#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
+#define __aicore__ [aicore]
 #endif
 #define PTO_DEVICE_FUNC __aicore__
 #else
