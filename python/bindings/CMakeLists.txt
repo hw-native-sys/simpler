@@ -43,6 +43,10 @@ target_include_directories(_task_interface PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 
+target_compile_definitions(_task_interface PRIVATE
+    SIMPLER_SOURCE_DIR="${CMAKE_SOURCE_DIR}"
+)
+
 target_link_libraries(_task_interface PRIVATE ${CMAKE_DL_LIBS} pthread)
 
 if(SKBUILD_MODE)

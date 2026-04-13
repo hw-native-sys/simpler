@@ -16,7 +16,28 @@ Usage:
     from task_interface import DataType, ContinuousTensor, ChipStorageTaskArgs, make_tensor_arg
 """
 
-from _task_interface import (  # pyright: ignore[reportMissingImports]
+import pathlib as _pathlib
+
+import _task_interface  # pyright: ignore[reportMissingImports]
+
+# Detect stale .so loaded from a different source tree (cross-repo pollution).
+# Only runs when this file lives in a source tree (not in site-packages).
+# Compares repo directory names (not full paths) to tolerate CI runners that
+# check out the same repo under different workspace prefixes.
+_this_dir = _pathlib.Path(__file__).resolve()
+_candidate_root = _this_dir.parents[2]  # python/simpler/task_interface.py → repo root
+if (_candidate_root / "pyproject.toml").is_file():
+    _loaded_root = getattr(_task_interface, "_source_dir", "")
+    if _loaded_root and _pathlib.Path(_loaded_root).name != _candidate_root.name:
+        raise ImportError(
+            f"Stale _task_interface binary detected.\n"
+            f"  Loaded .so was built from: {_loaded_root}\n"
+            f"  Current source tree:       {_candidate_root}\n"
+            f"  Fix: activate your project venv and run 'pip install .'"
+        )
+del _pathlib, _this_dir, _candidate_root
+
+from _task_interface import (  # pyright: ignore[reportMissingImports]  # noqa: E402
     CONTINUOUS_TENSOR_MAX_DIMS,
     DIST_CHIP_MAILBOX_SIZE,
     DIST_SUB_MAILBOX_SIZE,

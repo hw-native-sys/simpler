@@ -623,4 +623,10 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro("device_set", &ChipWorker::device_set);
 
     bind_dist_worker(m);
+
+#ifdef SIMPLER_SOURCE_DIR
+    m.attr("_source_dir") = SIMPLER_SOURCE_DIR;
+#else
+    m.attr("_source_dir") = "";
+#endif
 }
