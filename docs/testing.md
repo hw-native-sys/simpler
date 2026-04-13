@@ -40,14 +40,19 @@ python ci.py -p a2a3 -d 4-7
 # Single scene test (standalone)
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py -p a2a3sim
 
-# Single example (pre-built runtime binaries)
-python examples/scripts/run_example.py \
-    -k examples/a2a3/host_build_graph/vector_example/kernels \
-    -g examples/a2a3/host_build_graph/vector_example/golden.py \
-    -p a2a3sim
+# Standalone with build-from-source
+python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py -p a2a3sim --build
 
-# Single example (recompile runtime from source)
-python examples/scripts/run_example.py --build \
+# Benchmark mode (100 rounds, skip golden comparison)
+python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
+    -p a2a3 -d 0 -n 100 --skip-golden
+
+# Profiling (first round only)
+python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
+    -p a2a3 --enable-profiling
+
+# Single example via run_example.py (deprecated — prefer test_*.py standalone)
+python examples/scripts/run_example.py \
     -k examples/a2a3/host_build_graph/vector_example/kernels \
     -g examples/a2a3/host_build_graph/vector_example/golden.py \
     -p a2a3sim
@@ -69,6 +74,42 @@ Three test categories:
 
 If a module is exposed via nanobind (used by both C++ and Python), test in **ut-py** (`tests/ut/`).
 If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/ut/cpp/`).
+
+## Scene Test CLI Options
+
+Scene tests support advanced CLI options for benchmarking, profiling, and runtime control. These work identically in both pytest and standalone mode.
+
+### pytest
+
+```bash
+pytest --platform a2a3sim                                        # default: 1 round + golden
+pytest --platform a2a3 --rounds 100 --skip-golden                # benchmark mode
+pytest --platform a2a3 --enable-profiling                        # profiling (first round)
+pytest --platform a2a3sim --build                                # compile runtime from source
+pytest --platform a2a3sim --log-level debug                        # verbose C++ logging
+```
+
+### Standalone (test_*.py)
+
+```bash
+python test_xxx.py -p a2a3sim                                    # default: 1 round + golden
+python test_xxx.py -p a2a3 -d 0 -n 100 --skip-golden            # benchmark mode
+python test_xxx.py -p a2a3 --enable-profiling                    # profiling (first round)
+python test_xxx.py -p a2a3sim --build                            # compile runtime from source
+python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
+```
+
+### Option Reference
+
+| Option | Short | Default | Description |
+| ------ | ----- | ------- | ----------- |
+| `--rounds N` | `-n` | 1 | Run each case N times |
+| `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
+| `--enable-profiling` | | false | Enable profiling on first round only |
+| `--build` | | false | Compile runtime from source (not pre-built) |
+| `--log-level LEVEL` | | (none) | Set `PTO_LOG_LEVEL` env var (`error`/`warn`/`info`/`debug`) |
+
+Profiling is enabled only on the first round to avoid overhead on subsequent iterations. Output tensors are reset to their initial values between rounds.
 
 ## Hardware Classification
 

@@ -16,6 +16,7 @@ subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -61,13 +62,25 @@ def pytest_addoption(parser):
     parser.addoption("--case", action="store", default=None, help="Run specific case name only")
     parser.addoption("--all-cases", action="store_true", default=False, help="Include manual cases")
     parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
+    parser.addoption("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
+    parser.addoption(
+        "--skip-golden", action="store_true", default=False, help="Skip golden comparison (benchmark mode)"
+    )
+    parser.addoption(
+        "--enable-profiling", action="store_true", default=False, help="Enable profiling (first round only)"
+    )
+    parser.addoption("--build", action="store_true", default=False, help="Compile runtime from source")
 
 
 def pytest_configure(config):
-    """Register custom markers."""
+    """Register custom markers and apply global config."""
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
     config.addinivalue_line("markers", "requires_hardware: test needs Ascend toolchain and real device")
     config.addinivalue_line("markers", "device_count(n): number of NPU devices needed")
+
+    log_level = config.getoption("--log-level", default=None)
+    if log_level:
+        os.environ["PTO_LOG_LEVEL"] = log_level
 
 
 def pytest_collection_modifyitems(session, config, items):
@@ -200,6 +213,7 @@ def st_worker(request, st_platform, device_pool):
 
     level = cls._st_level
     runtime = cls._st_runtime
+    build = request.config.getoption("--build", default=False)
 
     if level == 2:
         ids = device_pool.allocate(1)
@@ -208,7 +222,7 @@ def st_worker(request, st_platform, device_pool):
 
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=ids[0], platform=st_platform, runtime=runtime)
+        w = Worker(level=2, device_id=ids[0], platform=st_platform, runtime=runtime, build=build)
         w.init()
         yield w
         w.close()
@@ -223,7 +237,14 @@ def st_worker(request, st_platform, device_pool):
 
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=3, device_ids=ids, num_sub_workers=max_subs, platform=st_platform, runtime=runtime)
+        w = Worker(
+            level=3,
+            device_ids=ids,
+            num_sub_workers=max_subs,
+            platform=st_platform,
+            runtime=runtime,
+            build=build,
+        )
 
         # Register SubCallable entries from cls.CALLABLE
         sub_ids = {}

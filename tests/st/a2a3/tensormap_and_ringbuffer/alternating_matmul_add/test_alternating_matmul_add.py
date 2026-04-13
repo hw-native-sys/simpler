@@ -57,6 +57,20 @@ class TestAlternatingMatmulAdd(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"batch": 1, "M": 1, "N": 1, "matmul_batch": 1, "add_batch": 1},
         },
+        {
+            "name": "Case1",
+            "platforms": ["a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {"batch": 500, "M": 4, "N": 4, "matmul_batch": 4, "add_batch": 4},
+            "manual": True,
+        },
+        {
+            "name": "Case2",
+            "platforms": ["a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {"batch": 512, "M": 2, "N": 5, "matmul_batch": 4, "add_batch": 5},
+            "manual": True,
+        },
     ]
 
     def generate_args(self, params):

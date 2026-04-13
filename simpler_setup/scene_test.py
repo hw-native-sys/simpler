@@ -412,17 +412,17 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     @classmethod
-    def _get_binaries(cls, platform):
+    def _get_binaries(cls, platform, build=False):
         from .runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-        return RuntimeBuilder(platform=platform).get_binaries(cls._st_runtime, build=False)
+        return RuntimeBuilder(platform=platform).get_binaries(cls._st_runtime, build=build)
 
     @classmethod
-    def _create_worker(cls, platform, device_id=0):
+    def _create_worker(cls, platform, device_id=0, build=False):
         ensure_python_path()
         from simpler.task_interface import ChipWorker  # noqa: PLC0415
 
-        bins = cls._get_binaries(platform)
+        bins = cls._get_binaries(platform, build=build)
         w = ChipWorker()
         w.init(
             str(bins.host_path),
@@ -449,13 +449,14 @@ class SceneTestCase:
             return self._compile_l3_callables(platform)
         raise ValueError(f"Unsupported level: {self._st_level}")
 
-    def _build_config(self, config_dict):
+    def _build_config(self, config_dict, enable_profiling=False):
         ensure_python_path()
         from simpler.task_interface import ChipCallConfig  # noqa: PLC0415
 
         config = ChipCallConfig()
         config.block_dim = config_dict.get("block_dim", 1)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
+        config.enable_profiling = enable_profiling
         return config
 
     def _resolve_env(self):
@@ -475,45 +476,88 @@ class SceneTestCase:
     # Run + validate
     # ------------------------------------------------------------------
 
-    def _run_and_validate(self, worker, callable_obj, case, sub_ids=None):
+    def _run_and_validate(
+        self, worker, callable_obj, case, sub_ids=None, rounds=1, skip_golden=False, enable_profiling=False
+    ):
         if self._st_level == 2:
-            self._run_and_validate_l2(worker, callable_obj, case)
+            self._run_and_validate_l2(
+                worker,
+                callable_obj,
+                case,
+                rounds=rounds,
+                skip_golden=skip_golden,
+                enable_profiling=enable_profiling,
+            )
         elif self._st_level == 3:
-            self._run_and_validate_l3(worker, callable_obj, sub_ids or {}, case)
+            self._run_and_validate_l3(
+                worker,
+                callable_obj,
+                sub_ids or {},
+                case,
+                rounds=rounds,
+                skip_golden=skip_golden,
+                enable_profiling=enable_profiling,
+            )
 
-    def _run_and_validate_l2(self, worker, callable_obj, case):
+    def _run_and_validate_l2(self, worker, callable_obj, case, rounds=1, skip_golden=False, enable_profiling=False):
         params = case.get("params", {})
-        config = self._build_config(case.get("config", {}))
+        config_dict = case.get("config", {})
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
 
         # Build args
         test_args = self.generate_args(params)
         chip_args, output_names = _build_chip_task_args(test_args, orch_sig)
 
-        # Clone for golden
-        golden_args = test_args.clone()
-        self.compute_golden(golden_args, params)
+        # Compute golden (unless skip_golden)
+        golden_args = None
+        if not skip_golden:
+            golden_args = test_args.clone()
+            self.compute_golden(golden_args, params)
 
-        # Execute
-        with _temporary_env(self._resolve_env()):
-            worker.run(callable_obj, chip_args, block_dim=config.block_dim, aicpu_thread_num=config.aicpu_thread_num)
+        # Save initial output tensor values for reset between rounds
+        initial_outputs = {}
+        if rounds > 1:
+            for name in output_names:
+                initial_outputs[name] = getattr(test_args, name).clone()
 
-        # Compare outputs
-        _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+        # Execute rounds
+        for round_idx in range(rounds):
+            if round_idx > 0:
+                for name, initial in initial_outputs.items():
+                    getattr(test_args, name).copy_(initial)
 
-    def _run_and_validate_l3(self, worker, compiled_callables, sub_ids, case):
+            config = self._build_config(config_dict, enable_profiling=(enable_profiling and round_idx == 0))
+
+            with _temporary_env(self._resolve_env()):
+                worker.run(callable_obj, chip_args, config=config)
+
+            if not skip_golden:
+                _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
+
+    def _run_and_validate_l3(
+        self, worker, compiled_callables, sub_ids, case, rounds=1, skip_golden=False, enable_profiling=False
+    ):
         ensure_python_path()
         from simpler.worker import Task  # noqa: PLC0415
 
         params = case.get("params", {})
-        config = self._build_config(case.get("config", {}))
+        config_dict = case.get("config", {})
 
         # Build args
         test_args = self.generate_args(params)
 
-        # Clone for golden
-        golden_args = test_args.clone()
-        self.compute_golden(golden_args, params)
+        # Compute golden (unless skip_golden)
+        golden_args = None
+        if not skip_golden:
+            golden_args = test_args.clone()
+            self.compute_golden(golden_args, params)
+
+        # Save initial tensor values for reset between rounds
+        all_tensor_names = test_args.tensor_names()
+        initial_tensors = {}
+        if rounds > 1:
+            for name in all_tensor_names:
+                initial_tensors[name] = getattr(test_args, name).clone()
 
         # Build CallableNamespace: compiled ChipCallables + sub callable IDs
         ns = CallableNamespace({**compiled_callables, **sub_ids})
@@ -521,15 +565,23 @@ class SceneTestCase:
         # Get orch function (plain function from CALLABLE)
         orch_fn = self.CALLABLE["orchestration"]
 
-        # Wrap in Task — orch signature: (w, callables, task_args, config)
-        def task_orch(w, _unused):
-            orch_fn(w, ns, test_args, config)
+        # Execute rounds
+        for round_idx in range(rounds):
+            if round_idx > 0:
+                for name, initial in initial_tensors.items():
+                    getattr(test_args, name).copy_(initial)
 
-        with _temporary_env(self._resolve_env()):
-            worker.run(Task(orch=task_orch))
+            config = self._build_config(config_dict, enable_profiling=(enable_profiling and round_idx == 0))
 
-        # Compare all tensors against golden
-        _compare_outputs(test_args, golden_args, test_args.tensor_names(), self.RTOL, self.ATOL)
+            # Wrap in Task — orch signature: (w, callables, task_args, config)
+            def task_orch(w, _unused, _ns=ns, _test_args=test_args, _config=config):
+                orch_fn(w, _ns, _test_args, _config)
+
+            with _temporary_env(self._resolve_env()):
+                worker.run(Task(orch=task_orch))
+
+            if not skip_golden:
+                _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
 
     # ------------------------------------------------------------------
     # pytest auto test method
@@ -539,6 +591,9 @@ class SceneTestCase:
         """Auto test method — runs matching cases for the current platform."""
         case_filter = request.config.getoption("--case", default=None)
         all_cases = request.config.getoption("--all-cases", default=False)
+        rounds = request.config.getoption("--rounds", default=1)
+        skip_golden = request.config.getoption("--skip-golden", default=False)
+        enable_profiling = request.config.getoption("--enable-profiling", default=False)
 
         callable_obj = self.build_callable(st_platform)
         sub_ids = getattr(type(self), "_st_sub_ids", {})
@@ -550,7 +605,15 @@ class SceneTestCase:
                 continue
             if case.get("manual") and not case_filter and not all_cases:
                 continue
-            self._run_and_validate(st_worker, callable_obj, case, sub_ids=sub_ids)
+            self._run_and_validate(
+                st_worker,
+                callable_obj,
+                case,
+                sub_ids=sub_ids,
+                rounds=rounds,
+                skip_golden=skip_golden,
+                enable_profiling=enable_profiling,
+            )
             ran_any = True
 
         if not ran_any:
@@ -572,7 +635,17 @@ class SceneTestCase:
         parser.add_argument("-d", "--device", type=int, default=0)
         parser.add_argument("--case", help="Run specific case name")
         parser.add_argument("--all-cases", action="store_true", help="Include manual cases")
+        parser.add_argument("-n", "--rounds", type=int, default=1, help="Run each case N times (default: 1)")
+        parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
+        parser.add_argument("--enable-profiling", action="store_true", help="Enable profiling (first round only)")
+        parser.add_argument("--build", action="store_true", help="Compile runtime from source")
+        parser.add_argument(
+            "--log-level", choices=["error", "warn", "info", "debug"], help="Set PTO_LOG_LEVEL environment variable"
+        )
         args = parser.parse_args()
+
+        if args.log_level:
+            os.environ["PTO_LOG_LEVEL"] = args.log_level
 
         module = sys.modules[module_name]
         test_classes = [
@@ -604,7 +677,15 @@ class SceneTestCase:
                         label = f"{cls.__name__}::{case['name']}"
                         print(f"  {label} ... ", end="", flush=True)
                         try:
-                            inst._run_and_validate(worker, callable_obj, case, sub_ids=sub_ids)
+                            inst._run_and_validate(
+                                worker,
+                                callable_obj,
+                                case,
+                                sub_ids=sub_ids,
+                                rounds=args.rounds,
+                                skip_golden=args.skip_golden,
+                                enable_profiling=args.enable_profiling,
+                            )
                             print("PASSED")
                         except Exception as e:
                             print(f"FAILED: {e}")
@@ -621,8 +702,9 @@ def _create_standalone_worker(group, args):
     """Create a Worker for standalone run_module entry point."""
     first_cls = group[0]
     level = first_cls._st_level
+    build = getattr(args, "build", False)
     if level == 2:
-        return first_cls._create_worker(args.platform, args.device), {}
+        return first_cls._create_worker(args.platform, args.device, build=build), {}
 
     ensure_python_path()
     from simpler.worker import Worker  # noqa: PLC0415
@@ -631,7 +713,12 @@ def _create_standalone_worker(group, args):
     max_subs = max((c.get("config", {}).get("num_sub_workers", 0) for cls in group for c in cls.CASES), default=0)
     device_ids = list(range(args.device, args.device + max_devices))
     worker = Worker(
-        level=3, device_ids=device_ids, num_sub_workers=max_subs, platform=args.platform, runtime=first_cls._st_runtime
+        level=3,
+        device_ids=device_ids,
+        num_sub_workers=max_subs,
+        platform=args.platform,
+        runtime=first_cls._st_runtime,
+        build=build,
     )
     # Register sub callables per-class to avoid name collisions
     per_class_sub_ids: dict[type, dict] = {}

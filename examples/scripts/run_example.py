@@ -82,6 +82,15 @@ def _wait_for_new_device_log(log_dir, pre_run_logs, timeout=15, interval=0.5):
 
 
 def main():  # noqa: PLR0912
+    import warnings  # noqa: PLC0415
+
+    warnings.warn(
+        "run_example.py is deprecated. Use 'python test_*.py' with the same CLI options instead. "
+        "See docs/testing.md for details.",
+        DeprecationWarning,
+        stacklevel=1,
+    )
+
     parser = argparse.ArgumentParser(
         description="Run PTO runtime test with kernel config and golden script",
         formatter_class=argparse.RawDescriptionHelpFormatter,

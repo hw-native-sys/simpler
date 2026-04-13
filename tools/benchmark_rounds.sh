@@ -29,7 +29,7 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 
 # --- tensormap_and_ringbuffer ---
 declare -A TMR_EXAMPLE_CASES=(
-    [alternating_matmul_add]=""
+    [alternating_matmul_add]="Case1"
     [benchmark_bgemm]=""
     [paged_attention_unroll]="Case1,Case2"
     [batch_paged_attention]=""
@@ -135,8 +135,8 @@ vlog() {
 # Search both examples/ (migrated tests) and tests/st/ (legacy tests)
 ARCH="${PLATFORM%%sim}"  # strip "sim" suffix if present
 EXAMPLES_DIRS=(
-    "$PROJECT_ROOT/examples/${ARCH}/${RUNTIME}"
     "$PROJECT_ROOT/tests/st/${ARCH}/${RUNTIME}"
+    "$PROJECT_ROOT/examples/${ARCH}/${RUNTIME}"
 )
 
 # Clock frequency (MHz) for converting cycle counts to microseconds
@@ -370,12 +370,13 @@ wait_for_new_log() {
 }
 
 # ---------------------------------------------------------------------------
-# run_bench <example> <kernels_dir> <golden> [case_name]
+# run_bench <example> <example_dir> [case_name]
 #   Run one benchmark invocation and parse timing from the resulting log.
+#   Prefers test_*.py (new SceneTestCase entry), falls back to run_example.py (legacy).
 #   Sets global PASS / FAIL counters.
 # ---------------------------------------------------------------------------
 run_bench() {
-    local example="$1" kernels_dir="$2" golden="$3" case_name="${4:-}"
+    local example="$1" example_dir="$2" case_name="${3:-}"
 
     if [[ -n "$case_name" ]]; then
         echo "  ---- $case_name ----"
@@ -387,13 +388,27 @@ run_bench() {
     trap 'rm -f -- "$pre_log_file"' RETURN
     ls -1 "$DEVICE_LOG_DIR"/*.log 2>/dev/null | sort > "$pre_log_file" || true
 
-    # Build run command
-    local run_cmd=(
-        python3 "$RUN_EXAMPLE"
-        -k "$kernels_dir" -g "$golden"
-        -p "$PLATFORM" -d "$DEVICE_ID"
-        -n "$ROUNDS" --skip-golden
-    )
+    # Build run command: prefer test_*.py, fall back to run_example.py
+    local test_file
+    test_file=$(find "$example_dir" -maxdepth 1 -name 'test_*.py' -print -quit 2>/dev/null || true)
+
+    local run_cmd
+    if [[ -n "$test_file" ]]; then
+        run_cmd=(
+            python3 "$test_file"
+            -p "$PLATFORM" -d "$DEVICE_ID"
+            -n "$ROUNDS" --skip-golden
+        )
+    else
+        local kernels_dir="$example_dir/kernels"
+        local golden="$example_dir/golden.py"
+        run_cmd=(
+            python3 "$RUN_EXAMPLE"
+            -k "$kernels_dir" -g "$golden"
+            -p "$PLATFORM" -d "$DEVICE_ID"
+            -n "$ROUNDS" --skip-golden
+        )
+    fi
     if [[ -n "$case_name" ]]; then
         run_cmd+=(--case "$case_name")
     fi
@@ -410,7 +425,7 @@ run_bench() {
         "${run_cmd[@]}" > /dev/null 2>&1 || rc=$?
     fi
     if [[ $rc -ne 0 ]]; then
-        echo "  FAILED: run_example.py returned non-zero"
+        echo "  FAILED: benchmark run returned non-zero"
         vlog "FAILED: exit code $rc"
         ((FAIL++)) || true
         return
@@ -475,17 +490,25 @@ echo "Runtime: $RUNTIME"
 for example in "${EXAMPLE_ORDER[@]}"; do
     case_list="${EXAMPLE_CASES[$example]:-}"
 
-    # Search for example in both directories
+    # Search for example: prefer test_*.py (new style), fall back to golden.py (legacy).
+    # tests/st/ is searched before examples/ since benchmarks use production-scale cases.
     EXAMPLE_DIR=""
     for dir in "${EXAMPLES_DIRS[@]}"; do
-        if [[ -f "$dir/$example/golden.py" && -d "$dir/$example/kernels" ]]; then
-            EXAMPLE_DIR="$dir/$example"
+        candidate="$dir/$example"
+        if [[ -d "$candidate" ]] && ls "$candidate"/test_*.py 1>/dev/null 2>&1; then
+            EXAMPLE_DIR="$candidate"
             break
         fi
     done
-
-    KERNELS_DIR="$EXAMPLE_DIR/kernels"
-    GOLDEN="$EXAMPLE_DIR/golden.py"
+    if [[ -z "$EXAMPLE_DIR" ]]; then
+        for dir in "${EXAMPLES_DIRS[@]}"; do
+            candidate="$dir/$example"
+            if [[ -f "$candidate/golden.py" && -d "$candidate/kernels" ]]; then
+                EXAMPLE_DIR="$candidate"
+                break
+            fi
+        done
+    fi
 
     echo ""
     echo "================================================================"
@@ -499,11 +522,11 @@ for example in "${EXAMPLE_ORDER[@]}"; do
     fi
 
     if [[ -z "${case_list:-}" ]]; then
-        run_bench "$example" "$KERNELS_DIR" "$GOLDEN"
+        run_bench "$example" "$EXAMPLE_DIR"
     else
         IFS=',' read -ra cases <<< "$case_list"
         for c in "${cases[@]}"; do
-            run_bench "$example" "$KERNELS_DIR" "$GOLDEN" "$c"
+            run_bench "$example" "$EXAMPLE_DIR" "$c"
         done
     fi
 done
