@@ -11,10 +11,9 @@ SPMD Paged Attention Kernel and Orchestration Configuration
 
 Uses SPMD (block_num) parallelism across batch*q_loop positions.
 Each block handles one (batch_idx, q_tile_idx) using get_block_idx().
-q_tile adapts to num_heads: q_tile = min(num_heads, MAX_Q_TILE).
 
 Softmax and online-update run as MIX tasks (AIC idle + AIV0 + AIV1), with the
-two AIVs splitting the q_tile query rows via get_sub_block_id().
+two AIVs splitting the 16 query rows 8/8 via get_sub_block_id().
 
 AIC Kernels (Matrix Multiplication):
   - aic_qk_matmul: Q @ K^T (SPMD across batch*q_loop)
@@ -22,8 +21,8 @@ AIC Kernels (Matrix Multiplication):
   - aic_hub: no-op, occupies the AIC slot of softmax/update MIX tasks
 
 AIV Kernels (Vector Operations):
-  - aiv_softmax_prepare: scale, rowmax, exp, rowsum on sub-tile (q_tile/2 rows)
-  - aiv_online_update: online softmax accumulation + normalization on sub-tile
+  - aiv_softmax_prepare: scale, rowmax, exp, rowsum on 8-row sub-tile
+  - aiv_online_update: online softmax accumulation + normalization on 8-row sub-tile
   - aiv_hub: no-op, used to allocate persistent accumulators
 """
 

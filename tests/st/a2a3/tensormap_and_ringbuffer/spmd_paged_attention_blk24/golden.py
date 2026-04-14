@@ -6,10 +6,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""SPMD Paged Attention Golden - tensormap_and_ringbuffer example (small scale, bfloat16).
+"""SPMD Paged Attention Golden - fixed block_num=24 variant (bfloat16).
 
-Uses SPMD parallelism: each block handles one (batch, q_tile) position.
-Kernels use get_block_idx() to determine their work slice.
+Uses SPMD parallelism with a fixed hardware block_num of 24.
+Each hardware block strides over batch*q_loop logical work items.
 """
 
 from paged_attention_golden import (
@@ -20,8 +20,8 @@ from paged_attention_golden import generate_inputs as _generate_inputs
 
 __outputs__ = ["out"]
 
-RTOL = 1e-2
-ATOL = 1e-2
+RTOL = 1e-3
+ATOL = 1e-3
 
 ALL_CASES = {
     "Case1": {
@@ -30,7 +30,7 @@ ALL_CASES = {
         "kv_head_num": 1,
         "head_dim": 128,
         "block_size": 128,
-        "context_len": 256,
+        "context_len": 8192,
         "max_model_len": 32768,
         "dtype": "bfloat16",
     },

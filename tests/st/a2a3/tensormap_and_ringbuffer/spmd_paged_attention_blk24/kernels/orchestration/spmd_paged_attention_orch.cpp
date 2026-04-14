@@ -11,9 +11,10 @@
 /**
  * SPMD Paged Attention Orchestration (dual-vector subvector partitioning)
  *
- * Uses SPMD parallelism: block_num = batch * q_loop, where each logical
- * block handles one (batch_idx, q_tile_idx) position. Kernels use
- * get_block_idx() to compute their data offsets.
+ * Uses SPMD parallelism with a fixed hardware block_num = 24.
+ * total_logical_blocks = batch * q_loop logical work items are distributed
+ * across the 24 hardware blocks via stride loops inside each kernel:
+ *   for (block_idx = hw_idx; block_idx < total_blocks; block_idx += 24)
  *
  * q_tile adapts to num_heads: q_tile = min(num_heads, MAX_Q_TILE).
  * When num_heads <= MAX_Q_TILE, q_loop = 1 and each block processes all heads.
@@ -83,12 +84,13 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // Q_TILE adapts to num_heads: use num_heads directly when it fits, cap at MAX_Q_TILE
     uint64_t q_tile = (num_heads <= MAX_Q_TILE) ? num_heads : MAX_Q_TILE;
     uint64_t q_loop = (num_heads + q_tile - 1) / q_tile;
-    int16_t spmd_block_num = static_cast<int16_t>(batch * q_loop);
+    int64_t total_logical_blocks = static_cast<int64_t>(batch * q_loop);
+    static constexpr int16_t spmd_block_num = 24;
 
     LOG_INFO(
-        "SPMD PA: batch=%" PRIu64 " heads=%" PRIu64 " hd=%" PRIu64 " bs=%" PRIu64 " q_tile=%" PRIu64
-        " q_loop=%" PRIu64 " blocks=%d",
-        batch, num_heads, head_dim, block_size, q_tile, q_loop, spmd_block_num
+        "SPMD PA: batch=%" PRIu64 " heads=%" PRIu64 " hd=%" PRIu64 " bs=%" PRIu64 " q_tile=%" PRIu64 " q_loop=%" PRIu64
+        " hw_blocks=%d logical_blocks=%" PRId64,
+        batch, num_heads, head_dim, block_size, q_tile, q_loop, spmd_block_num, total_logical_blocks
     );
 
     // Wrap host-provided tensors
@@ -125,18 +127,20 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     }
     uint64_t max_bn = (max_ctx + block_size - 1) / block_size;
 
-    // Scratch tensor create infos (sized for all SPMD blocks)
-    uint32_t n_rows = static_cast<uint32_t>(spmd_block_num) * static_cast<uint32_t>(q_tile);
+    // Scratch tensor create infos (sized for all logical blocks)
+    uint32_t n_rows = static_cast<uint32_t>(total_logical_blocks) * static_cast<uint32_t>(q_tile);
     uint32_t sij_shapes[2] = {n_rows, static_cast<uint32_t>(block_size)};
     uint32_t pij_shapes[2] = {n_rows, static_cast<uint32_t>(block_size)};
     uint32_t oi_new_shapes[2] = {n_rows, static_cast<uint32_t>(head_dim)};
 
-    // Scalar buffers (mij, lij, mi_acc, li_acc) use aligned rows per AIV lane
-    // based on the actual sub-tile height (q_tile / 2).
+    // Scalar buffers (mij, lij, mi_acc, li_acc) are padded to MIN_TM=16 rows per
+    // AIV lane, even when the actual sub-tile is smaller (e.g., 8 rows for q_tile=16).
+    // This ensures TROW* instructions always operate on 16-row tiles on hardware.
     uint64_t sub_qt = q_tile / 2;
-    uint64_t aligned_rows_sub = ((sub_qt * sizeof(float) + 31) / 32) * (32 / sizeof(float));
+    uint64_t pad_sub_qt = (sub_qt < 16) ? 16 : sub_qt;
+    uint64_t aligned_rows_sub = ((pad_sub_qt * sizeof(float) + 31) / 32) * (32 / sizeof(float));
     uint64_t aligned_rows_full = 2 * aligned_rows_sub;
-    uint32_t scalar_n = static_cast<uint32_t>(spmd_block_num) * static_cast<uint32_t>(aligned_rows_full);
+    uint32_t scalar_n = static_cast<uint32_t>(total_logical_blocks) * static_cast<uint32_t>(aligned_rows_full);
     uint32_t scalar_shapes[1] = {scalar_n};
 
     TensorCreateInfo sij_ci(sij_shapes, 2, DataType::FLOAT32);
@@ -182,6 +186,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 qk_args.add_scalar(static_cast<int64_t>(max_num_blocks_per_req));
                 qk_args.add_scalar(static_cast<int64_t>(q_loop));
                 qk_args.add_scalar(static_cast<int64_t>(q_tile));
+                qk_args.add_scalar(total_logical_blocks);
                 qk_args.launch_spec.set_block_num(spmd_block_num);
                 TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, qk_args);
                 const Tensor &sij = qk_outs.get_ref(0);
@@ -198,6 +203,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 sf_args.add_scalar(static_cast<int64_t>(block_size));
                 sf_args.add_scalar(static_cast<int64_t>(q_loop));
                 sf_args.add_scalar(static_cast<int64_t>(q_tile));
+                sf_args.add_scalar(total_logical_blocks);
                 sf_args.launch_spec.set_block_num(spmd_block_num);
                 MixedKernels sf_mk;
                 sf_mk.aic_kernel_id = FUNC_AIC_HUB;
@@ -222,6 +228,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 pv_args.add_scalar(static_cast<int64_t>(max_num_blocks_per_req));
                 pv_args.add_scalar(static_cast<int64_t>(q_loop));
                 pv_args.add_scalar(static_cast<int64_t>(q_tile));
+                pv_args.add_scalar(total_logical_blocks);
                 pv_args.launch_spec.set_block_num(spmd_block_num);
                 TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, pv_args);
                 const Tensor &oi_new = pv_outs.get_ref(0);
@@ -241,6 +248,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 up_args.add_scalar(static_cast<int64_t>(head_dim));
                 up_args.add_scalar(static_cast<int64_t>(q_loop));
                 up_args.add_scalar(static_cast<int64_t>(q_tile));
+                up_args.add_scalar(total_logical_blocks);
                 up_args.launch_spec.set_block_num(spmd_block_num);
                 MixedKernels up_mk;
                 up_mk.aic_kernel_id = FUNC_AIC_HUB;
@@ -251,7 +259,10 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
         }
     }
 
-    LOG_INFO("SPMD PA: %" PRIu64 " KV iters x 4 tasks, blocks=%d", max_bn, static_cast<int>(spmd_block_num));
+    LOG_INFO(
+        "SPMD PA: %" PRIu64 " KV iters x 4 tasks, hw_blocks=%d logical=%" PRId64, max_bn,
+        static_cast<int>(spmd_block_num), total_logical_blocks
+    );
 }
 
 }  // extern "C"

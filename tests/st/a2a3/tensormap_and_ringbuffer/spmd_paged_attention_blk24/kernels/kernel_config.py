@@ -7,10 +7,11 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 """
-SPMD Paged Attention Kernel and Orchestration Configuration
+SPMD Paged Attention Kernel and Orchestration Configuration (fixed block_num=24)
 
-Uses SPMD (block_num) parallelism across batch*q_loop positions.
-Each block handles one (batch_idx, q_tile_idx) using get_block_idx().
+Uses SPMD parallelism with a fixed hardware block_num of 24.
+total_logical_blocks = batch * q_loop work items are distributed across
+the 24 hardware blocks via stride loops inside each kernel.
 q_tile adapts to num_heads: q_tile = min(num_heads, MAX_Q_TILE).
 
 Softmax and online-update run as MIX tasks (AIC idle + AIV0 + AIV1), with the

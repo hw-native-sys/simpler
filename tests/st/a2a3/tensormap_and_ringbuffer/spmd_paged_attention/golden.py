@@ -20,8 +20,8 @@ from paged_attention_golden import generate_inputs as _generate_inputs
 
 __outputs__ = ["out"]
 
-RTOL = 1e-2
-ATOL = 1e-2
+RTOL = 1e-3
+ATOL = 1e-3
 
 ALL_CASES = {
     "Case1": {
@@ -30,7 +30,7 @@ ALL_CASES = {
         "kv_head_num": 1,
         "head_dim": 128,
         "block_size": 128,
-        "context_len": 256,
+        "context_len": 8192,
         "max_model_len": 32768,
         "dtype": "bfloat16",
     },

@@ -12,26 +12,32 @@
 // dual-vector subvector split.
 //
 // SPMD block_idx encodes (batch_idx, q_tile_idx).
-// The two AIV lanes in a cluster split the Q_TILE=16 rows 8/8 via
-// get_sub_block_id(): AIV0 handles rows [0, 8), AIV1 handles rows [8, 16).
+// The two AIV lanes in a cluster split the q_tile rows via
+// get_sub_block_id(): AIV0 handles the first half, AIV1 handles the second.
+// q_tile is passed as a runtime scalar and dispatched to the matching template.
 //
-// Computes (per sub-slice of SUB_M=8 rows):
+// Dual-vector subvector split: each AIV lane processes SUB_M = q_tile/2 rows.
+// TROW* instructions (TROWMAX, TROWEXPANDSUB, TROWSUM) operate directly on
+// SUB_M-row tiles. Scalar outputs (mij/lij) are stored at aligned width per lane.
+//
+// Computes (per sub-slice of sub_m rows):
 //   sij_masked = pad(sij, valid_len, -inf)
 //   sij_scale = sij_masked * scale
-//   mij = row_max(sij_scale)        -> (SUB_M, 1)
-//   pij = exp(sij_scale - mij)      -> (SUB_M, N)
-//   lij = row_sum(pij)              -> (SUB_M, 1)
+//   mij = row_max(sij_scale)        -> (sub_m, 1)
+//   pij = exp(sij_scale - mij)      -> (sub_m, N)
+//   lij = row_sum(pij)              -> (sub_m, 1)
 //
 // Args:
-//   args[0] = sij          Tensor* (spmd_blocks*Q_TILE, block_size) float32 [input]
+//   args[0] = sij          Tensor* (spmd_blocks*q_tile, block_size) float32 [input]
 //   args[1] = context_lens Tensor* (batch,) int32
-//   args[2] = pij          Tensor* (spmd_blocks*Q_TILE, block_size) bf16 [output]
-//   args[3] = mij          Tensor* (spmd_blocks*Q_TILE,) float32 [output]
-//   args[4] = lij          Tensor* (spmd_blocks*Q_TILE,) float32 [output]
+//   args[2] = pij          Tensor* (spmd_blocks*q_tile, block_size) bf16 [output]
+//   args[3] = mij          Tensor* (padded scalar buf) float32 [output]
+//   args[4] = lij          Tensor* (padded scalar buf) float32 [output]
 //   args[5] = scale_value  scalar (as float bits in uint64)
 //   args[6] = bn           scalar: current KV block index
 //   args[7] = block_size   scalar
 //   args[8] = q_loop       scalar
+//   args[9] = q_tile       scalar
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
@@ -50,10 +56,12 @@ using namespace pto;
 
 #include "intrinsic.h"
 
-static constexpr int M = 16;      // Full Q tile rows (shared between both AIVs)
-static constexpr int SUB_M = 8;   // Rows per AIV lane (M / 2)
-static constexpr int N = 16;      // block_size
+static constexpr int N_128 = 128;    // block_size (Case1)
+static constexpr int N_64 = 64;      // block_size (Case2)
 
+// TM = actual number of valid rows this AIV lane owns.
+// All TROW* instructions operate on TM-row tiles directly.
+// Scalar outputs (mij/lij) are stored at aligned width.
 template <int TM, int TN>
 static __aicore__ void softmax_prepare_spmd(
     __gm__ float *sij_addr, float scale_value, uint64_t valid_len, __gm__ bfloat16_t *pij_addr,
@@ -61,6 +69,7 @@ static __aicore__ void softmax_prepare_spmd(
 ) {
     constexpr int kAlignedRows = ((TM * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
+    // GM accessors
     using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, TM, TN>, Stride<1, 1, 1, TN, 1>>;
     using GlobalDataMxN_bf16 = GlobalTensor<bfloat16_t, Shape<1, 1, 1, TM, TN>, Stride<1, 1, 1, TN, 1>>;
     using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, Stride<1, 1, 1, 1, 1>, Layout::DN>;
@@ -70,6 +79,7 @@ static __aicore__ void softmax_prepare_spmd(
     GlobalScalarDN mijGlobal(mij_addr);
     GlobalScalarDN lijGlobal(lij_addr);
 
+    // Compute tiles use TM rows directly
     using TileSijDyn = Tile<TileType::Vec, float, TM, TN, BLayout::RowMajor, TM, -1>;
     using TileSijPad =
         Tile<TileType::Vec, float, TM, TN, BLayout::RowMajor, TM, TN, SLayout::NoneBox, 512, PadValue::Min>;
@@ -100,6 +110,7 @@ static __aicore__ void softmax_prepare_spmd(
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
+    // Pad invalid columns [valid_len, N) with -inf
     TFILLPAD_INPLACE(sijPadTile, sijDynTile);
     pipe_barrier(PIPE_V);
 
@@ -124,19 +135,15 @@ static __aicore__ void softmax_prepare_spmd(
     wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *sij_t = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *context_lens_t = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *pij_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    __gm__ Tensor *mij_t = reinterpret_cast<__gm__ Tensor *>(args[3]);
-    __gm__ Tensor *lij_t = reinterpret_cast<__gm__ Tensor *>(args[4]);
-    float scale_value = from_u64<float>(static_cast<uint64_t>(args[5]));
-    int64_t bn = static_cast<int64_t>(args[6]);
-    int64_t block_size = static_cast<int64_t>(args[7]);
-    int64_t q_loop = static_cast<int64_t>(args[8]);
+template <int Q_TILE, int BLOCK_SIZE>
+static __aicore__ void softmax_prepare_entry(
+    __gm__ Tensor *sij_t, __gm__ Tensor *context_lens_t, __gm__ Tensor *pij_t, __gm__ Tensor *mij_t,
+    __gm__ Tensor *lij_t, float scale_value, int64_t bn, int64_t block_size, int64_t q_loop, __gm__ int64_t *args
+) {
+    constexpr int SUB_M = Q_TILE / 2;
 
     int32_t block_idx = get_block_idx(args);
-    int32_t sub_block_id = get_sub_block_id(args);  // 0 = AIV0 (rows 0..7), 1 = AIV1 (rows 8..15)
+    int32_t sub_block_id = get_sub_block_id(args);
     int64_t batch_idx = block_idx / q_loop;
 
     // Compute valid_len for this block: how many columns of sij are valid
@@ -153,19 +160,18 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         valid_len = static_cast<uint64_t>(remaining);
     }
 
-    // Row offset for this AIV lane within the block_idx's Q_TILE slice
+    // Row offset for this AIV lane within the block_idx's q_tile slice
     int64_t row_offset = sub_block_id * SUB_M;
 
     // Pointers into this block's SUB_M-row sub-slice of the flat tensors
-    int64_t data_row_offset = block_idx * M + row_offset;
+    int64_t data_row_offset = block_idx * Q_TILE + row_offset;
     __gm__ float *sij_addr =
         reinterpret_cast<__gm__ float *>(sij_t->buffer.addr) + sij_t->start_offset + data_row_offset * block_size;
     __gm__ bfloat16_t *pij_addr =
         reinterpret_cast<__gm__ bfloat16_t *>(pij_t->buffer.addr) + pij_t->start_offset + data_row_offset * block_size;
 
-    // Scalar layout: full M=16 rows pack to kAlignedRowsFull=16 floats per block_idx;
-    // each AIV lane owns kAlignedRowsSub=8 contiguous floats inside that slab.
-    constexpr int kAlignedRowsFull = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
+    // Scalar layout uses aligned rows per sub-tile (based on SUB_M)
+    constexpr int kAlignedRowsFull = 2 * (((SUB_M * sizeof(float) + 31) / 32) * (32 / sizeof(float)));
     constexpr int kAlignedRowsSub = ((SUB_M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
     int64_t scalar_offset = block_idx * kAlignedRowsFull + sub_block_id * kAlignedRowsSub;
     __gm__ float *mij_addr =
@@ -174,10 +180,6 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         reinterpret_cast<__gm__ float *>(lij_t->buffer.addr) + lij_t->start_offset + scalar_offset;
 
     if (valid_len == 0) {
-        // No valid KV data — emit neutral values so online_update is a no-op:
-        // mij = -1e30 (very negative so beta = exp(mij - mi_new) ≈ 0)
-        // lij = 0 (no contribution to normalizer)
-        // pij = 0 (no attention weight)
         for (int i = 0; i < kAlignedRowsSub; i++) {
             mij_addr[i] = -1e30f;
             lij_addr[i] = 0.0f;
@@ -188,5 +190,24 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
         return;
     }
 
-    softmax_prepare_spmd<SUB_M, N>(sij_addr, scale_value, valid_len, pij_addr, mij_addr, lij_addr);
+    softmax_prepare_spmd<SUB_M, BLOCK_SIZE>(sij_addr, scale_value, valid_len, pij_addr, mij_addr, lij_addr);
+}
+
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    __gm__ Tensor *sij_t = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *context_lens_t = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *pij_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *mij_t = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *lij_t = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    float scale_value = from_u64<float>(static_cast<uint64_t>(args[5]));
+    int64_t bn = static_cast<int64_t>(args[6]);
+    int64_t block_size = static_cast<int64_t>(args[7]);
+    int64_t q_loop = static_cast<int64_t>(args[8]);
+    int64_t q_tile = static_cast<int64_t>(args[9]);
+
+    if (q_tile == 16) {
+        softmax_prepare_entry<16, 128>(sij_t, context_lens_t, pij_t, mij_t, lij_t, scale_value, bn, block_size, q_loop, args);
+    } else {
+        softmax_prepare_entry<64, 64>(sij_t, context_lens_t, pij_t, mij_t, lij_t, scale_value, bn, block_size, q_loop, args);
+    }
 }

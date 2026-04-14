@@ -12,36 +12,30 @@
 // subvector split.
 //
 // SPMD block_idx encodes (batch_idx, q_tile_idx).
-// The two AIV lanes in a cluster split the q_tile rows via
-// get_sub_block_id(): AIV0 updates the first half, AIV1 the second half.
-// q_tile is passed as a runtime scalar and dispatched to the matching template.
+// The two AIV lanes in a cluster split the Q_TILE=16 rows 8/8 via
+// get_sub_block_id(): AIV0 updates rows [0, 8), AIV1 updates rows [8, 16).
 // The online softmax update is row-independent, so the two lanes never touch
 // the same row of mi/li/oi accumulators or the output buffer.
 //
-// Dual-vector subvector split: each AIV lane processes SUB_QT = q_tile/2 rows.
-// TROWEXPANDMUL/DIV instructions operate directly on SUB_QT-row tiles.
-// Scalar tiles (mi, li, alpha, beta) are stored at aligned width per lane.
-//
-// Scalar layout strategy:
+// Scalar layout strategy (same as MPMD version):
 //   M scalar floats stored contiguously in GM can be loaded as either:
 //   - ND (kScalarRows, kScalarCols) RowMajor for element-wise ops
 //   - DN (kAlignedRows, 1) ColMajor for row-broadcast ops (TROWEXPANDMUL/DIV)
 //   Conversion between layouts uses GM round-trip: ND TSTORE -> DN TLOAD.
 //
 // Args:
-//   args[0] = mij      Tensor* (padded scalar buf) float32
-//   args[1] = lij      Tensor* (padded scalar buf) float32
-//   args[2] = oi_new   Tensor* (spmd_blocks*q_tile, head_dim) float32
-//   args[3] = mi_acc   Tensor* (padded scalar buf) float32 [inout]
-//   args[4] = li_acc   Tensor* (padded scalar buf) float32 [inout]
-//   args[5] = oi_acc   Tensor* (spmd_blocks*q_tile, head_dim) float32 [inout]
+//   args[0] = mij      Tensor* (spmd_blocks*Q_TILE,) float32
+//   args[1] = lij      Tensor* (spmd_blocks*Q_TILE,) float32
+//   args[2] = oi_new   Tensor* (spmd_blocks*Q_TILE, head_dim) float32
+//   args[3] = mi_acc   Tensor* (spmd_blocks*Q_TILE,) float32 [inout]
+//   args[4] = li_acc   Tensor* (spmd_blocks*Q_TILE,) float32 [inout]
+//   args[5] = oi_acc   Tensor* (spmd_blocks*Q_TILE, head_dim) float32 [inout]
 //   args[6] = out      Tensor* (batch*num_heads, head_dim) float32 [inout]
 //   args[7] = is_first scalar
 //   args[8] = is_last  scalar
 //   args[9] = num_heads scalar
 //   args[10] = head_dim scalar
 //   args[11] = q_loop  scalar
-//   args[12] = q_tile  scalar
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
@@ -60,10 +54,9 @@ using namespace pto;
 
 #include "intrinsic.h"
 
-static constexpr int HD = 128;       // Head dimension
+static constexpr int QT = 16;     // Full Q tile rows (shared between both AIVs)
+static constexpr int SUB_QT = 8;  // Rows per AIV lane (QT / 2)
 
-// TM = actual number of valid rows this AIV lane owns.
-// All TROW* instructions operate on TM-row tiles directly.
 template <int TM, int TN>
 static __aicore__ void online_update_spmd(
     __gm__ float *mij_ptr, __gm__ float *lij_ptr, __gm__ float *oi_new_ptr, __gm__ float *mi_ptr,
@@ -73,7 +66,6 @@ static __aicore__ void online_update_spmd(
     constexpr int kScalarRows = TM / kScalarCols;
     constexpr int kAlignedRows = ((TM * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
-    // GM accessors
     using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, TM, TN>, Stride<1, 1, 1, TN, 1>>;
     using GlobalScalarND =
         GlobalTensor<float, Shape<1, 1, 1, kScalarRows, kScalarCols>, Stride<1, 1, 1, kScalarCols, 1>>;
@@ -92,7 +84,6 @@ static __aicore__ void online_update_spmd(
     GlobalScalarDN lijGlobalDN(lij_ptr);
     GlobalScalarDN liGlobalDN(li_ptr);
 
-    // Compute tiles use TM rows directly
     using TileDataMxN = Tile<TileType::Vec, float, TM, TN, BLayout::RowMajor, TM, TN>;
     using TileScalarND =
         Tile<TileType::Vec, float, kScalarRows, kScalarCols, BLayout::RowMajor, kScalarRows, kScalarCols>;
@@ -210,26 +201,38 @@ static __aicore__ void online_update_spmd(
     wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
-template <int QT>
-static __aicore__ void online_update_entry(
-    __gm__ Tensor *mij_t, __gm__ Tensor *lij_t, __gm__ Tensor *oi_new_t, __gm__ Tensor *mi_acc_t,
-    __gm__ Tensor *li_acc_t, __gm__ Tensor *oi_acc_t, __gm__ Tensor *out_t, uint64_t is_first, uint64_t is_last,
-    int64_t num_heads, int64_t head_dim, int64_t q_loop, __gm__ int64_t *args
-) {
-    constexpr int SUB_QT = QT / 2;
+extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
+    // Safety check: if called with null tensor args (misrouted hub invocation), return.
+    if (args[0] == 0 || args[1] == 0 || args[2] == 0) {
+        return;
+    }
+
+    __gm__ Tensor *mij_t = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *lij_t = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *oi_new_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *mi_acc_t = reinterpret_cast<__gm__ Tensor *>(args[3]);
+    __gm__ Tensor *li_acc_t = reinterpret_cast<__gm__ Tensor *>(args[4]);
+    __gm__ Tensor *oi_acc_t = reinterpret_cast<__gm__ Tensor *>(args[5]);
+    __gm__ Tensor *out_t = reinterpret_cast<__gm__ Tensor *>(args[6]);
+    uint64_t is_first = static_cast<uint64_t>(args[7]);
+    uint64_t is_last = static_cast<uint64_t>(args[8]);
+    int64_t num_heads = static_cast<int64_t>(args[9]);
+    int64_t head_dim = static_cast<int64_t>(args[10]);
+    int64_t q_loop = static_cast<int64_t>(args[11]);
 
     int32_t block_idx = get_block_idx(args);
-    int32_t sub_block_id = get_sub_block_id(args);
+    int32_t sub_block_id = get_sub_block_id(args);  // 0 = AIV0 (rows 0..7), 1 = AIV1 (rows 8..15)
     int64_t batch_idx = block_idx / q_loop;
     int64_t q_tile_idx = block_idx % q_loop;
 
-    // Scalar layout uses aligned rows per sub-tile (based on SUB_QT)
-    constexpr int kAlignedRowsFull = 2 * (((SUB_QT * sizeof(float) + 31) / 32) * (32 / sizeof(float)));
+    // Scalar layout: full QT=16 rows pack to kAlignedRowsFull=16 floats per block_idx;
+    // each AIV lane owns kAlignedRowsSub=8 contiguous floats inside that slab.
+    constexpr int kAlignedRowsFull = ((QT * sizeof(float) + 31) / 32) * (32 / sizeof(float));
     constexpr int kAlignedRowsSub = ((SUB_QT * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
     int64_t row_offset = sub_block_id * SUB_QT;
 
-    // Accumulator offsets (each AIV lane owns its own sub-slice within the block_idx slab)
+    // Accumulator offsets (each AIV lane owns its own 8-row sub-slice within the block_idx slab)
     int64_t scalar_offset = block_idx * kAlignedRowsFull + sub_block_id * kAlignedRowsSub;
     int64_t data_offset = (block_idx * QT + row_offset) * head_dim;
 
@@ -250,32 +253,5 @@ static __aicore__ void online_update_entry(
     int64_t out_offset = (batch_idx * num_heads + q_tile_idx * QT + row_offset) * head_dim;
     __gm__ float *dst_ptr = reinterpret_cast<__gm__ float *>(out_t->buffer.addr) + out_t->start_offset + out_offset;
 
-    online_update_spmd<SUB_QT, HD>(mij_ptr, lij_ptr, oi_new_ptr, mi_ptr, li_ptr, oi_ptr, dst_ptr, is_first, is_last);
-}
-
-extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
-    // Safety check: if called with null tensor args (misrouted hub invocation), return.
-    if (args[0] == 0 || args[1] == 0 || args[2] == 0) {
-        return;
-    }
-
-    __gm__ Tensor *mij_t = reinterpret_cast<__gm__ Tensor *>(args[0]);
-    __gm__ Tensor *lij_t = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ Tensor *oi_new_t = reinterpret_cast<__gm__ Tensor *>(args[2]);
-    __gm__ Tensor *mi_acc_t = reinterpret_cast<__gm__ Tensor *>(args[3]);
-    __gm__ Tensor *li_acc_t = reinterpret_cast<__gm__ Tensor *>(args[4]);
-    __gm__ Tensor *oi_acc_t = reinterpret_cast<__gm__ Tensor *>(args[5]);
-    __gm__ Tensor *out_t = reinterpret_cast<__gm__ Tensor *>(args[6]);
-    uint64_t is_first = static_cast<uint64_t>(args[7]);
-    uint64_t is_last = static_cast<uint64_t>(args[8]);
-    int64_t num_heads = static_cast<int64_t>(args[9]);
-    int64_t head_dim = static_cast<int64_t>(args[10]);
-    int64_t q_loop = static_cast<int64_t>(args[11]);
-    int64_t q_tile = static_cast<int64_t>(args[12]);
-
-    if (q_tile == 16) {
-        online_update_entry<16>(mij_t, lij_t, oi_new_t, mi_acc_t, li_acc_t, oi_acc_t, out_t, is_first, is_last, num_heads, head_dim, q_loop, args);
-    } else {
-        online_update_entry<64>(mij_t, lij_t, oi_new_t, mi_acc_t, li_acc_t, oi_acc_t, out_t, is_first, is_last, num_heads, head_dim, q_loop, args);
-    }
+    online_update_spmd<SUB_QT, 128>(mij_ptr, lij_ptr, oi_new_ptr, mi_ptr, li_ptr, oi_ptr, dst_ptr, is_first, is_last);
 }

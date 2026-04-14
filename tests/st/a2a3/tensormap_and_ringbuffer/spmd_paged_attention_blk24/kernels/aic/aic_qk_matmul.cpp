@@ -10,8 +10,10 @@
  */
 // SPMD QK Matmul: qi(q_tile, K) @ kj.T(K, N) -> sij(q_tile, N)
 //
-// SPMD block_idx encodes (batch_idx, q_tile_idx).
-// Each block computes one q_tile x K @ K x N matmul using paged KV.
+// Hardware block_num is fixed at 24. Each hardware block strides over
+// total_blocks logical work items:
+//   for (idx = hw_block_idx; idx < total_blocks; idx += block_num)
+// Each logical block_idx encodes (batch_idx, q_tile_idx).
 // q_tile is passed as a runtime scalar and dispatched to the matching template.
 //
 // Args:
@@ -19,7 +21,7 @@
 //   args[1] = key_cache   Tensor* (kv_total_rows, head_dim) bf16
 //   args[2] = block_table Tensor* (batch, max_blocks_per_req) int32
 //   args[3] = context_lens Tensor* (batch,) int32
-//   args[4] = sij         Tensor* (spmd_blocks*q_tile, block_size) float32 [output]
+//   args[4] = sij         Tensor* (total_blocks*q_tile, block_size) float32 [output]
 //   args[5] = bn          scalar: current KV block index
 //   args[6] = num_heads   scalar
 //   args[7] = head_dim    scalar
@@ -27,6 +29,7 @@
 //   args[9] = max_num_blocks_per_req scalar
 //   args[10] = q_loop     scalar
 //   args[11] = q_tile     scalar
+//   args[12] = total_blocks scalar
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
@@ -50,8 +53,7 @@ static constexpr int N_128 = 128;
 static constexpr int N_64 = 64;
 
 template <int TM, int TK, int TN>
-static __aicore__ void
-qk_matmul_spmd(__gm__ bfloat16_t *qi_addr, __gm__ bfloat16_t *kj_addr, __gm__ float *sij_addr) {
+static __aicore__ void qk_matmul_spmd(__gm__ bfloat16_t *qi_addr, __gm__ bfloat16_t *kj_addr, __gm__ float *sij_addr) {
     using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, TM, TK>, Stride<TM * TK, TM * TK, TM * TK, TK, 1>>;
     using GlobalB =
         GlobalTensor<bfloat16_t, Shape<1, 1, 1, TK, TN>, Stride<TK * TN, TK * TN, TK * TN, 1, TK>, Layout::DN>;
@@ -117,49 +119,53 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     int64_t max_blocks_per_req = static_cast<int64_t>(args[9]);
     int64_t q_loop = static_cast<int64_t>(args[10]);
     int64_t q_tile = static_cast<int64_t>(args[11]);
+    int64_t total_blocks = static_cast<int64_t>(args[12]);
 
-    int32_t block_idx = get_block_idx(args);
+    int32_t hw_block_idx = get_block_idx(args);
+    int32_t block_num = get_block_num(args);
 
-    // Decode (batch_idx, q_tile_idx) from block_idx
-    int64_t batch_idx = block_idx / q_loop;
-    int64_t q_tile_idx = block_idx % q_loop;
+    for (int32_t block_idx = hw_block_idx; block_idx < total_blocks; block_idx += block_num) {
+        // Decode (batch_idx, q_tile_idx) from block_idx
+        int64_t batch_idx = block_idx / q_loop;
+        int64_t q_tile_idx = block_idx % q_loop;
 
-    // Check if this batch has data at this KV block
-    __gm__ int32_t *ctx_ptr =
-        reinterpret_cast<__gm__ int32_t *>(context_lens_t->buffer.addr) + context_lens_t->start_offset;
-    int64_t cur_seq = static_cast<int64_t>(ctx_ptr[batch_idx]);
-    int64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
+        // Check if this batch has data at this KV block
+        __gm__ int32_t *ctx_ptr =
+            reinterpret_cast<__gm__ int32_t *>(context_lens_t->buffer.addr) + context_lens_t->start_offset;
+        int64_t cur_seq = static_cast<int64_t>(ctx_ptr[batch_idx]);
+        int64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
 
-    // Output pointer for this block's sij slice
-    __gm__ float *sij_addr =
-        reinterpret_cast<__gm__ float *>(sij_t->buffer.addr) + sij_t->start_offset + block_idx * q_tile * block_size;
+        // Output pointer for this block's sij slice
+        __gm__ float *sij_addr = reinterpret_cast<__gm__ float *>(sij_t->buffer.addr) + sij_t->start_offset +
+                                 block_idx * q_tile * block_size;
 
-    if (bn >= bn_this_batch) {
-        // No valid KV data for this batch at this bn — zero out sij
-        for (int i = 0; i < static_cast<int>(q_tile * block_size); i++) {
-            sij_addr[i] = 0.0f;
+        if (bn >= bn_this_batch) {
+            // No valid KV data for this batch at this bn — zero out sij
+            for (int i = 0; i < static_cast<int>(q_tile * block_size); i++) {
+                sij_addr[i] = 0.0f;
+            }
+            continue;
         }
-        return;
-    }
 
-    // Look up physical block index from block_table
-    __gm__ int32_t *bt_ptr =
-        reinterpret_cast<__gm__ int32_t *>(block_table_t->buffer.addr) + block_table_t->start_offset;
-    int64_t phys_block = static_cast<int64_t>(bt_ptr[batch_idx * max_blocks_per_req + bn]);
+        // Look up physical block index from block_table
+        __gm__ int32_t *bt_ptr =
+            reinterpret_cast<__gm__ int32_t *>(block_table_t->buffer.addr) + block_table_t->start_offset;
+        int64_t phys_block = static_cast<int64_t>(bt_ptr[batch_idx * max_blocks_per_req + bn]);
 
-    // Query offset: (batch_idx * num_heads + q_tile_idx * q_tile, 0)
-    int64_t q_offset = (batch_idx * num_heads + q_tile_idx * q_tile) * head_dim;
-    __gm__ bfloat16_t *qi_addr =
-        reinterpret_cast<__gm__ bfloat16_t *>(query_t->buffer.addr) + query_t->start_offset + q_offset;
+        // Query offset: (batch_idx * num_heads + q_tile_idx * q_tile, 0)
+        int64_t q_offset = (batch_idx * num_heads + q_tile_idx * q_tile) * head_dim;
+        __gm__ bfloat16_t *qi_addr =
+            reinterpret_cast<__gm__ bfloat16_t *>(query_t->buffer.addr) + query_t->start_offset + q_offset;
 
-    // Key offset: (phys_block * block_size, 0)
-    int64_t k_offset = phys_block * block_size * head_dim;
-    __gm__ bfloat16_t *kj_addr =
-        reinterpret_cast<__gm__ bfloat16_t *>(key_cache_t->buffer.addr) + key_cache_t->start_offset + k_offset;
+        // Key offset: (phys_block * block_size, 0)
+        int64_t k_offset = phys_block * block_size * head_dim;
+        __gm__ bfloat16_t *kj_addr =
+            reinterpret_cast<__gm__ bfloat16_t *>(key_cache_t->buffer.addr) + key_cache_t->start_offset + k_offset;
 
-    if (q_tile == 16) {
-        qk_matmul_spmd<16, K_128, N_128>(qi_addr, kj_addr, sij_addr);
-    } else {
-        qk_matmul_spmd<64, K_128, N_64>(qi_addr, kj_addr, sij_addr);
+        if (q_tile == 16) {
+            qk_matmul_spmd<16, K_128, N_128>(qi_addr, kj_addr, sij_addr);
+        } else {
+            qk_matmul_spmd<64, K_128, N_64>(qi_addr, kj_addr, sij_addr);
+        }
     }
 }
