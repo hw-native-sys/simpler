@@ -53,7 +53,6 @@ Golden.py interface:
 """
 
 import ctypes
-import fcntl
 import importlib.util
 import logging
 import os
@@ -78,25 +77,21 @@ from simpler.task_interface import (  # type: ignore[import-not-found]
     scalar_to_uint64,
 )
 
+from .environment import PROJECT_ROOT
+from .log_config import DEFAULT_LOG_LEVEL, configure_logging
+from .pto_isa import ensure_pto_isa_root
+
 logger = logging.getLogger(__name__)
 
 
-def _setup_logging_if_needed() -> None:
+def _maybe_configure_logging(log_level: Optional[str]) -> None:
+    """Apply log_level if given; fall back to DEFAULT_LOG_LEVEL only when the
+    caller hasn't configured logging themselves (e.g. notebook / ad-hoc script).
     """
-    Setup logging if not already configured (for direct CodeRunner usage).
-    Uses PTO_LOG_LEVEL environment variable or defaults to 'info'.
-    """
-    # Only setup if logging hasn't been configured yet
-    if not logging.getLogger().hasHandlers():
-        level_str = os.environ.get("PTO_LOG_LEVEL", "info")
-        level_map = {
-            "error": logging.ERROR,
-            "warn": logging.WARNING,
-            "info": logging.INFO,
-            "debug": logging.DEBUG,
-        }
-        log_level = level_map.get(level_str.lower(), logging.INFO)
-        logging.basicConfig(level=log_level, format="[%(levelname)s] %(message)s", force=True)
+    if log_level is not None:
+        configure_logging(log_level)
+    elif not logging.getLogger().hasHandlers():
+        configure_logging(DEFAULT_LOG_LEVEL)
 
 
 def _to_torch(tensor) -> torch.Tensor:
@@ -126,286 +121,6 @@ def _load_module_from_path(module_path: Path, module_name: str):
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
-
-
-def _get_project_root() -> Path:
-    """Get the project root directory (one level above simpler_setup/)."""
-    return Path(__file__).parent.parent
-
-
-def _get_pto_isa_clone_path() -> Path:
-    """Get the expected path to pto-isa clone."""
-    return _get_project_root() / "examples" / "scripts" / "_deps" / "pto-isa"
-
-
-def _is_pto_isa_cloned() -> bool:
-    """
-    Check if pto-isa is cloned.
-
-    A clone is considered valid if:
-    1. The directory exists
-    2. It contains the include directory (essential content)
-    """
-    clone_path = _get_pto_isa_clone_path()
-    if not clone_path.exists():
-        return False
-
-    # Check for essential content
-    include_dir = clone_path / "include"
-    return include_dir.exists() and include_dir.is_dir()
-
-
-def _is_git_available() -> bool:
-    """Check if git command is available."""
-    try:
-        import subprocess  # noqa: PLC0415
-
-        result = subprocess.run(["git", "--version"], check=False, capture_output=True, text=True, timeout=5)
-        return result.returncode == 0
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-
-
-_PTO_ISA_HTTPS = "https://github.com/PTO-ISA/pto-isa.git"
-_PTO_ISA_SSH = "git@github.com:PTO-ISA/pto-isa.git"
-
-
-def _pto_isa_repo_url(clone_protocol: str = "ssh") -> str:
-    """Return the pto-isa clone URL for the given protocol."""
-    if clone_protocol == "https":
-        return _PTO_ISA_HTTPS
-    return _PTO_ISA_SSH
-
-
-def _clone_pto_isa(verbose: bool = False, commit: Optional[str] = None, clone_protocol: str = "ssh") -> bool:
-    """
-    Clone pto-isa repository, optionally at a specific commit.
-
-    Args:
-        verbose: Print detailed progress information
-        commit: If provided, checkout this commit after cloning
-
-    Returns:
-        True if successful, False otherwise
-    """
-    import subprocess  # noqa: PLC0415
-
-    if not _is_git_available():
-        if verbose:
-            logger.warning("git command not available, cannot clone pto-isa")
-        return False
-
-    clone_path = _get_pto_isa_clone_path()
-
-    # Create parent deps directory if it doesn't exist
-    deps_dir = clone_path.parent
-    try:
-        deps_dir.mkdir(parents=True, exist_ok=True)
-    except Exception as e:
-        if verbose:
-            logger.warning(f"Failed to create deps directory: {e}")
-        return False
-
-    try:
-        if verbose:
-            logger.info(f"Cloning pto-isa to {clone_path}...")
-            logger.info("This may take a few moments on first run...")
-
-        repo_url = _pto_isa_repo_url(clone_protocol)
-        result = subprocess.run(
-            ["git", "clone", repo_url, str(clone_path)],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=300,  # 5 minutes timeout
-        )
-
-        if result.returncode != 0:
-            if verbose:
-                logger.warning(f"Failed to clone pto-isa:\n{result.stderr}")
-            return False
-
-        # Checkout specific commit if requested
-        if commit:
-            result = subprocess.run(
-                ["git", "checkout", commit],
-                check=False,
-                capture_output=True,
-                text=True,
-                cwd=str(clone_path),
-                timeout=30,
-            )
-            if result.returncode != 0:
-                if verbose:
-                    logger.warning(f"Failed to checkout pto-isa commit {commit}:\n{result.stderr}")
-                return False
-
-        if verbose:
-            suffix = f" at commit {commit}" if commit else ""
-            logger.info(f"pto-isa cloned successfully{suffix}: {clone_path}")
-
-        return True
-
-    except subprocess.TimeoutExpired:
-        if verbose:
-            logger.warning("Clone operation timed out")
-        return False
-    except Exception as e:
-        if verbose:
-            logger.warning(f"Failed to clone pto-isa: {e}")
-        return False
-
-
-def _checkout_pto_isa_commit(clone_path: Path, commit: str, verbose: bool = False) -> None:
-    """Checkout the specified commit if the existing clone is at a different revision."""
-    import subprocess  # noqa: PLC0415
-
-    try:
-        result = subprocess.run(
-            ["git", "rev-parse", "--short", "HEAD"],
-            check=False,
-            capture_output=True,
-            text=True,
-            cwd=str(clone_path),
-            timeout=5,
-        )
-        current = result.stdout.strip() if result.returncode == 0 else ""
-        if current and not commit.startswith(current) and not current.startswith(commit):
-            if verbose:
-                logger.info(f"pto-isa at {current}, checking out {commit}...")
-            subprocess.run(
-                ["git", "fetch", "origin"],
-                capture_output=True,
-                text=True,
-                cwd=str(clone_path),
-                timeout=120,
-                check=True,
-            )
-            subprocess.run(
-                ["git", "checkout", commit],
-                capture_output=True,
-                text=True,
-                cwd=str(clone_path),
-                timeout=30,
-                check=True,
-            )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"Failed to checkout pto-isa commit {commit}: {e.stderr if hasattr(e, 'stderr') else e}")
-    except Exception as e:
-        logger.warning(f"Unexpected error checking out pto-isa commit {commit}: {e}")
-
-
-def _update_pto_isa_to_latest(clone_path: Path, verbose: bool = False) -> None:
-    """Fetch and reset existing clone to the remote default branch."""
-    import subprocess  # noqa: PLC0415
-
-    try:
-        if verbose:
-            logger.info("Updating pto-isa to latest...")
-        subprocess.run(
-            ["git", "fetch", "origin"],
-            capture_output=True,
-            text=True,
-            cwd=str(clone_path),
-            timeout=120,
-            check=True,
-        )
-        # Use origin/HEAD which tracks the remote's default branch
-        subprocess.run(
-            ["git", "reset", "--hard", "origin/HEAD"],
-            capture_output=True,
-            text=True,
-            cwd=str(clone_path),
-            timeout=30,
-            check=True,
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-        logger.warning(f"Failed to update pto-isa to latest: {e.stderr if hasattr(e, 'stderr') else e}")
-    except Exception as e:
-        logger.warning(f"Unexpected error updating pto-isa: {e}")
-
-
-def _ensure_pto_isa_root(
-    verbose: bool = False, commit: Optional[str] = None, clone_protocol: str = "ssh"
-) -> Optional[str]:
-    """
-    Ensure PTO_ISA_ROOT is available, either from environment or cloned repo.
-
-    This function:
-    1. Checks if PTO_ISA_ROOT is already set
-    2. If not, tries to clone pto-isa repository
-    3. Returns the resolved path
-
-    Uses a file lock to prevent parallel processes from racing on the clone.
-
-    Args:
-        verbose: Print detailed progress information
-        commit: If provided, checkout this specific commit
-
-    Returns:
-        PTO_ISA_ROOT path if successful, None otherwise
-    """
-    # Check if already set in environment
-    existing_root = os.environ.get("PTO_ISA_ROOT")
-    if existing_root:
-        if verbose:
-            logger.info(f"Using existing PTO_ISA_ROOT: {existing_root}")
-        return existing_root
-
-    # Try to use cloned repository
-    clone_path = _get_pto_isa_clone_path()
-
-    # Use a file lock so only one process clones at a time
-    lock_path = clone_path.parent / ".pto-isa.lock"
-    lock_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(lock_path, "w") as lock_fd:
-        fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        return _ensure_pto_isa_root_locked(clone_path, verbose=verbose, commit=commit, clone_protocol=clone_protocol)
-
-
-def _ensure_pto_isa_root_locked(
-    clone_path: Path,
-    verbose: bool = False,
-    commit: Optional[str] = None,
-    clone_protocol: str = "ssh",
-) -> Optional[str]:
-    """Inner logic for _ensure_pto_isa_root, called while holding the file lock."""
-
-    # Clone if needed
-    if not _is_pto_isa_cloned():
-        if verbose:
-            logger.info("PTO_ISA_ROOT not set, cloning pto-isa repository...")
-        if not _clone_pto_isa(verbose=verbose, commit=commit, clone_protocol=clone_protocol):
-            # Another parallel process may have completed the clone
-            if not _is_pto_isa_cloned():
-                if verbose:
-                    logger.warning("Failed to automatically clone pto-isa.")
-                    logger.warning("You can manually clone it with:")
-                    logger.warning(f"  mkdir -p {clone_path.parent}")
-                    logger.warning(f"  git clone {_pto_isa_repo_url(clone_protocol)} {clone_path}")
-                    logger.warning("Or set PTO_ISA_ROOT to an existing pto-isa installation:")
-                    logger.warning("  export PTO_ISA_ROOT=/path/to/pto-isa")
-                return None
-            if verbose:
-                logger.info("pto-isa already cloned by another process")
-            # Recovered from race — apply commit/update below
-            if commit:
-                _checkout_pto_isa_commit(clone_path, commit, verbose=verbose)
-            else:
-                _update_pto_isa_to_latest(clone_path, verbose=verbose)
-    elif commit:
-        _checkout_pto_isa_commit(clone_path, commit, verbose=verbose)
-    else:
-        _update_pto_isa_to_latest(clone_path, verbose=verbose)
-
-    # Verify clone has expected content
-    include_dir = clone_path / "include"
-    if not include_dir.exists():
-        if verbose:
-            logger.warning(f"pto-isa cloned but missing include directory: {include_dir}")
-        return None
-
-    return str(clone_path.resolve())
 
 
 def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> dict[str, str]:
@@ -485,16 +200,20 @@ class CodeRunner:
         repeat_rounds: Optional[int] = None,
         clone_protocol: str = "ssh",
         skip_golden: bool = False,
+        log_level: Optional[str] = None,
     ):
-        # Setup logging if not already configured (e.g., when used directly, not via run_example.py)
-        _setup_logging_if_needed()
+        # If caller passed log_level, apply it. Otherwise only set up a sane
+        # default when no logging has been configured yet (notebook / ad-hoc
+        # script path). CLI callers (run_example.py) already configured, so
+        # this becomes a no-op.
+        _maybe_configure_logging(log_level)
 
         self.kernels_dir = Path(kernels_dir).resolve()
         self.golden_path = Path(golden_path).resolve()
         self.platform = platform
         self.enable_profiling = enable_profiling
         self.skip_golden = skip_golden
-        self.project_root = _get_project_root()
+        self.project_root = PROJECT_ROOT
 
         # Resolve device ID
         self.device_id = device_id if device_id is not None else 0
@@ -711,16 +430,14 @@ class CodeRunner:
         from .kernel_compiler import KernelCompiler  # noqa: PLC0415
         from .runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-        # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
-        pto_isa_root = _ensure_pto_isa_root(
-            verbose=True, commit=self.pto_isa_commit, clone_protocol=self.clone_protocol
+        # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers).
+        # update_if_exists=True mirrors ci.py: when no commit is pinned, fetch origin/HEAD.
+        pto_isa_root = ensure_pto_isa_root(
+            commit=self.pto_isa_commit,
+            clone_protocol=self.clone_protocol,
+            update_if_exists=True,
+            verbose=True,
         )
-        if pto_isa_root is None:
-            raise OSError(
-                "PTO_ISA_ROOT could not be resolved.\n"
-                "Please set it to the PTO-ISA root directory, e.g.:\n"
-                "  export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa"
-            )
 
         # Step 1: Build runtime, orchestration, and kernels in parallel
         # (they are independent — all only need kernel_compiler which is ready)
@@ -958,6 +675,7 @@ def create_code_runner(  # noqa: PLR0913
     repeat_rounds=None,
     clone_protocol="ssh",
     skip_golden=False,
+    log_level=None,
 ):
     """Factory: creates a CodeRunner based on kernel_config."""
     return CodeRunner(
@@ -973,4 +691,5 @@ def create_code_runner(  # noqa: PLR0913
         repeat_rounds=repeat_rounds,
         clone_protocol=clone_protocol,
         skip_golden=skip_golden,
+        log_level=log_level,
     )

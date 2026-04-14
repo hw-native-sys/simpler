@@ -60,9 +60,7 @@ from queue import Empty, Queue
 from threading import Lock, Thread
 from typing import Any, Callable, Protocol, cast
 
-PROJECT_ROOT = Path(__file__).resolve().parent
-
-from simpler.task_interface import (  # noqa: E402  # type: ignore[import-not-found]
+from simpler.task_interface import (  # type: ignore[import-not-found]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
     ChipCallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
@@ -71,6 +69,10 @@ from simpler.task_interface import (  # noqa: E402  # type: ignore[import-not-fo
     make_tensor_arg,
     scalar_to_uint64,
 )
+
+from simpler_setup.log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 logger = logging.getLogger("ci")
 
@@ -264,16 +266,17 @@ def discover_tasks(platform: str, runtime_filter: str | None = None) -> list[Tas
 
 
 def ensure_pto_isa(commit: str | None, clone_protocol: str) -> str:
-    from simpler_setup.code_runner import _ensure_pto_isa_root  # noqa: PLC0415
+    from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-    root = _ensure_pto_isa_root(verbose=True, commit=commit, clone_protocol=clone_protocol)
-    if root is None:
-        raise OSError(
-            "PTO_ISA_ROOT could not be resolved.\n"
-            "Set it manually or let auto-clone run:\n"
-            "  export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa"
-        )
-    return root
+    # update_if_exists=True: when no commit is pinned, fetch latest origin/HEAD
+    # so CI runs reproducibly track main rather than whatever local checkout
+    # happens to be on disk.
+    return ensure_pto_isa_root(
+        commit=commit,
+        clone_protocol=clone_protocol,
+        update_if_exists=True,
+        verbose=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -952,11 +955,11 @@ def print_summary(results: list[TaskResult]) -> int:
 
 def reset_pto_isa(commit: str, clone_protocol: str) -> str:
     """Checkout PTO-ISA at the pinned commit (or re-clone if needed)."""
-    from simpler_setup.code_runner import _checkout_pto_isa_commit, _get_pto_isa_clone_path  # noqa: PLC0415
+    from simpler_setup.pto_isa import checkout_pto_isa_commit, get_pto_isa_clone_path  # noqa: PLC0415
 
-    clone_path = _get_pto_isa_clone_path()
+    clone_path = get_pto_isa_clone_path()
     if clone_path.exists():
-        _checkout_pto_isa_commit(clone_path, commit, verbose=True)
+        checkout_pto_isa_commit(clone_path, commit, verbose=True)
         return str(clone_path.resolve())
     return ensure_pto_isa(commit, clone_protocol)
 
@@ -1177,6 +1180,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-t", "--timeout", type=int, default=600)
     parser.add_argument("--clone-protocol", choices=["ssh", "https"], default="ssh")
     parser.add_argument("--all", dest="run_all_cases", action="store_true", help="Run all cases, not just DEFAULT_CASE")
+    parser.add_argument(
+        "--log-level", choices=LOG_LEVEL_CHOICES, default=DEFAULT_LOG_LEVEL, help="Root logger level (default: info)"
+    )
     parser.add_argument("--device-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--result-json", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--task-list-json", default=None, help=argparse.SUPPRESS)
@@ -1276,9 +1282,8 @@ def _run_single_platform(platform: str, args: argparse.Namespace) -> list[TaskRe
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", force=True)
-
     args = parse_args()
+    configure_logging(args.log_level)
     args.devices = parse_device_range(args.device_range)
 
     valid_platforms = _discover_valid_platforms()

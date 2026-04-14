@@ -27,6 +27,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
+
 _compile_cache: dict[tuple[str, str, str], object] = {}
 
 
@@ -633,12 +635,13 @@ class SceneTestCase:
         parser.add_argument("--enable-profiling", action="store_true", help="Enable profiling (first round only)")
         parser.add_argument("--build", action="store_true", help="Compile runtime from source")
         parser.add_argument(
-            "--log-level", choices=["error", "warn", "info", "debug"], help="Set PTO_LOG_LEVEL environment variable"
+            "--log-level",
+            choices=LOG_LEVEL_CHOICES,
+            default=DEFAULT_LOG_LEVEL,
+            help=f"Root logger level (default: {DEFAULT_LOG_LEVEL})",
         )
         args = parser.parse_args()
-
-        if args.log_level:
-            os.environ["PTO_LOG_LEVEL"] = args.log_level
+        configure_logging(args.log_level)
 
         module = sys.modules[module_name]
         test_classes = [

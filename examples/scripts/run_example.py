@@ -40,6 +40,9 @@ import sys
 import time
 from pathlib import Path
 
+from simpler_setup.code_runner import create_code_runner
+from simpler_setup.log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
+
 project_root = Path(__file__).parent.parent.parent
 
 logger = logging.getLogger(__name__)
@@ -128,22 +131,10 @@ Golden.py interface:
     )
 
     parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
-        help="Enable verbose output (equivalent to --log-level debug)",
-    )
-
-    parser.add_argument(
-        "--silent",
-        action="store_true",
-        help="Silent mode - only show errors (equivalent to --log-level error)",
-    )
-
-    parser.add_argument(
         "--log-level",
-        choices=["error", "warn", "info", "debug"],
-        help="Set log level explicitly (overrides --verbose and --silent)",
+        choices=LOG_LEVEL_CHOICES,
+        default=DEFAULT_LOG_LEVEL,
+        help=f"Root logger level (default: {DEFAULT_LOG_LEVEL})",
     )
 
     parser.add_argument(
@@ -206,31 +197,7 @@ Golden.py interface:
     if args.all and args.case:
         parser.error("--all and --case are mutually exclusive")
 
-    # Determine log level from arguments
-    log_level_str = None
-    if args.log_level:
-        log_level_str = args.log_level
-    elif args.verbose:
-        log_level_str = "debug"
-    elif args.silent:
-        log_level_str = "error"
-    else:
-        log_level_str = "info"
-
-    # Setup logging before any other operations
-    level_map = {
-        "error": logging.ERROR,
-        "warn": logging.WARNING,
-        "info": logging.INFO,
-        "debug": logging.DEBUG,
-    }
-    log_level = level_map.get(log_level_str.lower(), logging.INFO)
-
-    # Configure Python logging
-    logging.basicConfig(level=log_level, format="[%(levelname)s] %(message)s", force=True)
-
-    # Set environment variable for C++ side
-    os.environ["PTO_LOG_LEVEL"] = log_level_str
+    configure_logging(args.log_level)
 
     # Validate paths
     kernels_path = Path(args.kernels)
@@ -249,10 +216,7 @@ Golden.py interface:
         logger.error(f"kernel_config.py not found in {kernels_path}")
         return 1
 
-    # Import and run
     try:
-        from simpler_setup.code_runner import create_code_runner  # noqa: PLC0415
-
         runner = create_code_runner(
             kernels_dir=str(args.kernels),
             golden_path=str(args.golden),
@@ -310,7 +274,7 @@ Golden.py interface:
                     else:
                         cmd += ["-d", str(args.device)]
 
-                    if log_level_str == "debug":
+                    if logger.isEnabledFor(logging.DEBUG):
                         cmd.append("-v")
 
                     result = subprocess.run(cmd, check=True, capture_output=True, text=True)
@@ -318,8 +282,7 @@ Golden.py interface:
                     logger.info("Swimlane JSON generation completed")
                 except subprocess.CalledProcessError as e:
                     logger.warning(f"Failed to generate swimlane JSON: {e}")
-                    if log_level_str == "debug":
-                        logger.debug(f"stderr: {e.stderr}")
+                    logger.debug(f"stderr: {e.stderr}")
             else:
                 logger.warning(f"Swimlane converter script not found: {swimlane_script}")
 
@@ -332,7 +295,7 @@ Golden.py interface:
 
     except Exception as e:
         logger.error(f"TEST FAILED: {e}")
-        if log_level_str == "debug":
+        if logger.isEnabledFor(logging.DEBUG):
             import traceback  # noqa: PLC0415
 
             traceback.print_exc()
