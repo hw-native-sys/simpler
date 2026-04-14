@@ -283,24 +283,57 @@ Verified on `manual_scope_v0`:
 
 This status does not mean the branch is performance-ready.
 
-## Benchmark Results
+## Benchmark Status
 
-### Method
+### Authoritative Current vs Baselines
+
+This is the current branch-status table. Only same-method, same-device,
+same-round-count reruns go here.
+
+### Method For The Authoritative Table
 
 - Platform: `a2a3` real device
-- Device: `5`
+- Device: `10`
 - Workload: supported production `paged_attention` cases only
   - `Case1`: `batch=256, num_heads=16, head_dim=128, block_size=128`
   - `Case2`: `batch=64, num_heads=64, head_dim=128, block_size=64`
-- Rounds: `30`
-- Reported value: trimmed average, dropping `10` low and `10` high rounds
-- Baseline TMR: merge-base `617add6`
-- Current TMR: `manual_scope_v0` HEAD
-- ABG: current branch `examples/a2a3/aicpu_build_graph/paged_attention`
-- All runs used the same local `PTO_ISA_ROOT` checkout so the runtime delta is
-  measured against the same kernel dependency tree
+- Rounds: `10`
+- Aggregation: simple average from `tmp/measure_case.py`
+- Current TMR measured commit: `371349f`
+- Baseline TMR measured commit: merge-base `617add6`
+- ABG measured source: current branch `examples/a2a3/aicpu_build_graph/paged_attention`
+- All three runs used the same local `PTO_ISA_ROOT` checkout so the runtime
+  delta is measured against the same kernel dependency tree
 
-### Results At `a682ccc` (Pre-hotpath Tuning)
+| Case | Runtime | Commit / Source | Elapsed Avg (us) | Orch Avg (us) | Elapsed Delta vs Base TMR | Elapsed Delta vs ABG |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| Case1 | TMR merge-base | `617add6` | 32579.9 | 32442.7 | baseline | +162.8 (+0.5%) |
+| Case1 | TMR optimized current | `371349f` | 32288.2 | 32275.2 | -291.7 (-0.9%) | -128.9 (-0.4%) |
+| Case1 | ABG current | current branch | 32417.1 | 32127.0 (`orch_func_cost`) | -162.8 (-0.5%) | baseline |
+| Case2 | TMR merge-base | `617add6` | 18749.7 | 18305.1 | baseline | +1920.6 (+11.4%) |
+| Case2 | TMR optimized current | `371349f` | 16548.1 | 16482.1 | -2201.6 (-11.7%) | -281.0 (-1.7%) |
+| Case2 | ABG current | current branch | 16829.1 | 16246.0 (`orch_func_cost`) | -1920.6 (-10.2%) | baseline |
+
+Notes:
+
+- `371349f` is the first measured state where current TMR beats both merge-base
+  TMR and ABG on elapsed time for the two supported non-unroll paged-attention
+  cases.
+- `Case1` is still nearly tied. The elapsed win is real in this batch, but it
+  is small enough that more tuning is still needed before calling it robust.
+- ABG's `orch` column comes from `orch_func_cost`, so it is informative but not
+  identical to the TMR orchestration-span metric.
+
+### Historical Pre-tuning Snapshot
+
+These numbers explain where tuning started. They are not the current
+branch-status table.
+
+- Platform: `a2a3` real device
+- Device: `5`
+- Rounds: `30`
+- Aggregation: trimmed average, dropping `10` low and `10` high rounds
+- Current TMR measured commit: `a682ccc`
 
 | Case | Runtime | Elapsed Trimmed Avg (us) | Orch Trimmed Avg (us) | Delta vs Base | Delta vs ABG |
 | --- | --- | ---: | ---: | ---: | ---: |
@@ -311,24 +344,21 @@ This status does not mean the branch is performance-ready.
 | Case2 | TMR current | 33248.6 | 33248.1 | +17672.0 (+113.5%) | +15662.6 (+89.1%) |
 | Case2 | ABG current | 17586.0 | 17018.7 (`orch_func_cost`) | +2009.4 (+12.9%) vs base TMR | baseline |
 
-### Reading The Table
+### Reading The Tables
 
-- Current TMR is slower than merge-base on both supported paged-attention
+- The current tuning direction has recovered the branch from clearly slower
+  than both baselines to slightly faster on elapsed time for the two supported
   cases.
-- Current TMR is also slower than ABG on both supported paged-attention cases.
-- For current TMR, orchestration time is effectively the whole elapsed time on
-  both cases. The regression is therefore in the orchestration path, not in the
-  worker execution path.
-- The current v0 implementation is therefore functionally correct for the
-  supported scope, but not performance-ready.
+- The remaining gap is not "manual scope is broken". It is now about making the
+  small `Case1` win more stable and reducing the still-visible orchestration
+  cost.
+- The heavy regression was in orchestration, and the recovery also came from
+  orchestration-path changes rather than worker-side math changes.
 
 ## Optimization Effects
 
-The table above is the starting point before runtime hotpath tuning.
-
 The entries below record the follow-up optimizations that were applied after
-`a682ccc`. These are not all from the same benchmark batch. They are iterative
-spot measurements collected during tuning, mainly with:
+`a682ccc`. These are iterative tuning measurements, mainly with:
 
 - platform: `a2a3`
 - device: `10`
@@ -343,6 +373,7 @@ These numbers are still useful for attribution, but they are noisier than the
 
 | Optimization | Files / Functions Touched | Why It Helps | Measured Effect |
 | --- | --- | --- | --- |
+| Cached allocator-state fast path before shared reload | `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_ring_buffer.h` `PTO2TaskAllocator::alloc()` `has_task_slot_capacity()` `try_alloc_with_last_alive()` | The allocator used to pay an acquire-load of `last_task_alive` and a heap-tail refresh before every submit, even when the cached window and heap state were already sufficient. The new path first tries the monotonic cached state, then falls back to the shared refresh only when the cached view says "not enough room". | Measured commit `371349f`, compared against the previous best-known spot snapshot at `eeaa456`: `Case1 34105.5 -> 32288.2us`, `Case2 18503.3 -> 16548.1us`. The same-batch current-vs-baseline table above shows this was enough to move current TMR slightly ahead of both baselines on elapsed time. |
 | O(1) explicit-dep membership check | `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `pto2_get_current_scope_task_slot()` `pto2_submit_mixed_task()` `pto2_scope_begin()` `pto2_prepare_task()`; `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.h`; `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_ring_buffer.h` | Removed the per-dependency linear scan over current-scope tasks. Manual paged-attention emits many `add_dep(...)` edges inside the inner loop, so the old validation shape was wrong for this workload. | First spot run after replacing the scan: `Case1 49628.2 -> 36016.3us`, `Case2 33248.6 -> 17906.5us`. |
 | Exact per-scope epoch validation | `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `pto2_get_current_scope_task_slot()` `pto2_scope_begin()` `pto2_prepare_task()`; `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.h`; `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_ring_buffer.h`; `tests/ut/cpp/test_a2a3_pto2_manual_scope_runtime.cpp` | The first O(1) version used only `scope_depth`, which was fast but could accept a task from an older closed scope reopened at the same depth. The epoch fix keeps the O(1) path while restoring exact scope isolation. | Correctness fix. No meaningful speed target by itself; it preserves the O(1) win and closes the stale-scope hole. |
 | Skip redundant creator-retention when owner is already explicit | `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `pto2_submit_mixed_task()` `pto2_append_explicit_manual_deps()` | For manual-local tensors, if the producer task is already present in `Arg.add_dep(...)`, the submit path does not need to look up the producer slot again just to add the same fanin and let `fanin_builder` deduplicate it. | Spot run during tuning: `Case1 36016.3 -> 33170.4us`; `Case2` was roughly flat/noisy (`17906.5 -> 18304.6us`). |
@@ -357,21 +388,11 @@ These numbers are still useful for attribution, but they are noisier than the
 | Change `out_view` in paged-attention update from `INOUT` to `NO_DEP` | `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention/kernels/orchestration/paged_attention_orch.cpp`; `examples/a2a3/tensormap_and_ringbuffer/paged_attention/kernels/orchestration/paged_attention_orch.cpp` | Reverted. Real-device golden failed badly, so `NO_DEP` was too strong for this tensor. |
 | Change `out_view` in paged-attention update from `INOUT` to `OUTPUT_EXISTING` | `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention/kernels/orchestration/paged_attention_orch.cpp`; `examples/a2a3/tensormap_and_ringbuffer/paged_attention/kernels/orchestration/paged_attention_orch.cpp` | Reverted. Real-device golden also failed, so the current runtime still needs `INOUT` semantics there. |
 
-### Current Tuning Snapshot
+### Current Hotspots
 
-After the kept optimizations above, the current branch is materially better than
-the original `a682ccc` runtime hotpath, but it still is not yet at the target
-of clearly beating both merge-base TMR and ABG on the supported paged-attention
-cases.
-
-Current spot measurement after the latest kept runtime changes:
-
-| Case | Current TMR Spot Avg (us) | Current Orch Spot Avg (us) | Improvement vs `a682ccc` |
-| --- | ---: | ---: | ---: |
-| Case1 | 34105.5 | 34051.1 | `-15522.7us` elapsed |
-| Case2 | 18503.3 | 18246.1 | `-14745.3us` elapsed |
-
-The remaining large buckets from the latest phase breakdown are:
+After `371349f`, the branch has crossed the elapsed-time target in the current
+spot batch, but the `Case1` margin is still thin. The remaining large buckets
+from the latest phase breakdown before the allocator fast path were:
 
 - `task+heap_alloc`
 - `lookup+dep`
@@ -379,6 +400,36 @@ The remaining large buckets from the latest phase breakdown are:
 
 `param_copy` was reduced substantially by eager `start_offset` caching and is
 no longer the largest problem.
+
+The next optimization pass should keep focusing on:
+
+1. More submit-path cost reduction in allocator / fanin materialization.
+2. Scheduler wiring fast paths for small `fanin` counts.
+3. Avoiding work that only protects AUTO-style lookup paths when the manual
+   scope already supplied explicit ordering.
+
+## Mandatory Update Checklist
+
+After every optimization try, update this document before moving on:
+
+1. Add one entry under either `Kept Optimizations` or `Reverted / Rejected`.
+2. Record the attempt name and outcome: kept, reverted, or rejected.
+3. Record the measured commit and the exact compared-against commit.
+4. Record the touched files and functions only, not a vague subsystem label.
+5. Record the hypothesis: which cost bucket or branch the change was meant to
+   reduce.
+6. Record the exact workload, platform, device, runner, round count, and
+   aggregation method.
+7. Record whether the same `PTO_ISA_ROOT` and runtime environment were used.
+8. Record before/after elapsed numbers per measured case.
+9. Record before/after orch numbers per measured case when available.
+10. Record the correctness checks that were run, or what failed.
+11. If the branch best-known state changed, refresh the `Authoritative Current
+    vs Baselines` table immediately.
+12. If a number is only a noisy spot result, keep it in the optimization log
+    and do not promote it into the authoritative table.
+13. If the measurement method changes, update the method section in the same
+    edit so later readers do not compare mismatched numbers.
 
 ## Risks
 
