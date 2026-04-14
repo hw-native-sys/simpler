@@ -328,6 +328,7 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
         func_name=orch["function_name"],
         binary=orch_binary,
         children=kernel_binaries,
+        config_name=orch.get("config_name", ""),
     )
     _compile_cache[cache_key] = chip_callable
     return chip_callable

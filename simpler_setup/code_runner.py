@@ -819,6 +819,7 @@ class CodeRunner:
             func_name=self.orchestration["function_name"],
             binary=orch_so_binary,
             children=kernel_binaries,
+            config_name=self.orchestration.get("config_name", ""),
         )
 
         # Step 2: Create ChipWorker

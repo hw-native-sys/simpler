@@ -354,6 +354,7 @@ def compile_task(
         func_name=orchestration["function_name"],
         binary=orch_binary,
         children=kernel_binaries,
+        config_name=orchestration.get("config_name", ""),
     )
 
     all_cases = getattr(golden, "ALL_CASES", {"Default": {}})

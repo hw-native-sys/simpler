@@ -88,6 +88,8 @@ constexpr int32_t STALL_DUMP_WAIT_MAX = 4;
 constexpr int32_t STALL_DUMP_CORE_MAX = 8;
 constexpr int32_t PROGRESS_VERBOSE_THRESHOLD = 10;  // log every completion for the first N tasks
 constexpr int32_t PROGRESS_LOG_INTERVAL = 250;      // log every N completions after threshold
+constexpr const char *DEFAULT_ORCH_ENTRY_SYMBOL = "aicpu_orchestration_entry";
+constexpr const char *DEFAULT_ORCH_CONFIG_SYMBOL = "aicpu_orchestration_config";
 
 static int32_t read_pto2_runtime_status(Runtime *runtime) {
     if (runtime == nullptr) {
@@ -2287,25 +2289,42 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
             DEV_INFO("Thread %d: dlopen succeeded, handle=%p", thread_idx, handle);
 
-            dlerror();
-            auto config_func =
-                reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, "aicpu_orchestration_config"));
+            const char *entry_symbol = runtime->get_device_orch_func_name();
+            if (entry_symbol == nullptr || entry_symbol[0] == '\0') {
+                entry_symbol = DEFAULT_ORCH_ENTRY_SYMBOL;
+            }
+            const char *config_symbol = runtime->get_device_orch_config_name();
+            if (config_symbol == nullptr || config_symbol[0] == '\0') {
+                config_symbol = DEFAULT_ORCH_CONFIG_SYMBOL;
+            }
 
             dlerror();
-            DeviceOrchestrationFunc orch_func =
-                reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, "aicpu_orchestration_entry"));
-            const char *dlsym_error = dlerror();
-            if (dlsym_error != nullptr) {
-                DEV_ERROR("Thread %d: dlsym failed: %s", thread_idx, dlsym_error);
+            DeviceOrchestrationFunc orch_func = reinterpret_cast<DeviceOrchestrationFunc>(dlsym(handle, entry_symbol));
+            const char *entry_dlsym_error = dlerror();
+            if (entry_dlsym_error != nullptr) {
+                DEV_ERROR(
+                    "Thread %d: dlsym failed for entry symbol '%s': %s", thread_idx, entry_symbol, entry_dlsym_error
+                );
                 dlclose(handle);
                 unlink(so_path);
                 return -1;
             }
             if (orch_func == nullptr) {
-                DEV_ERROR("Thread %d: dlsym returned NULL for aicpu_orchestration_entry", thread_idx);
+                DEV_ERROR("Thread %d: dlsym returned NULL for entry symbol '%s'", thread_idx, entry_symbol);
                 dlclose(handle);
                 unlink(so_path);
                 return -1;
+            }
+
+            dlerror();
+            auto config_func = reinterpret_cast<DeviceOrchestrationConfigFunc>(dlsym(handle, config_symbol));
+            const char *config_dlsym_error = dlerror();
+            if (config_dlsym_error != nullptr || config_func == nullptr) {
+                DEV_ERROR(
+                    "Thread %d: dlsym failed for config symbol '%s': %s", thread_idx, config_symbol,
+                    config_dlsym_error ? config_dlsym_error : "NULL function pointer"
+                );
+                config_func = nullptr;
             }
 
             dlerror();
@@ -2313,7 +2332,9 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 reinterpret_cast<DeviceOrchestrationBindRuntimeFunc>(dlsym(handle, "pto2_framework_bind_runtime"));
             const char *bind_runtime_error = dlerror();
             if (bind_runtime_error != nullptr) {
-                DEV_INFO("Thread %d: Optional TLS runtime binder not found: %s", thread_idx, bind_runtime_error);
+                DEV_ERROR(
+                    "Thread %d: dlsym failed for pto2_framework_bind_runtime: %s", thread_idx, bind_runtime_error
+                );
                 bind_runtime_func = nullptr;
             }
 
