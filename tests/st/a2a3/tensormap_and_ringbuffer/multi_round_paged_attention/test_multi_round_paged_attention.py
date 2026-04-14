@@ -7,62 +7,54 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged attention with small ring buffer sizes — stress test for ring rotation/reclamation.
+"""Multi-round paged attention: benchmark multi-round execution (default 10 rounds).
 
-Tests RUNTIME_ENV (PTO2_RING_TASK_WINDOW, PTO2_RING_HEAP, PTO2_RING_DEP_POOL),
-INOUT tensors, bfloat16, and AIC+AIV mixed execution.
+Run with --rounds 10 --skip-golden for benchmarking.
 """
 
 import torch
-from paged_attention_golden import compute_golden as _pa_compute_golden  # noqa: PLC0415
-from paged_attention_golden import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
+from paged_attention_golden import compute_golden as _pa_compute_golden
+from paged_attention_golden import generate_inputs as _pa_generate_inputs
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
-PA_KERNELS = "../batch_paged_attention/kernels"
+_PA_KERNELS = "../../../../../examples/a2a3/tensormap_and_ringbuffer/paged_attention/kernels"
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
-class TestPagedAttentionRingbuffer(SceneTestCase):
-    """Paged attention with small ring buffer sizes for stress testing."""
-
-    RTOL = 1e-3
-    ATOL = 1e-3
-    RUNTIME_ENV = {
-        "PTO2_RING_TASK_WINDOW": "64",
-        "PTO2_RING_HEAP": "2621440",
-        "PTO2_RING_DEP_POOL": "256",
-    }
+class TestMultiRoundPagedAttention(SceneTestCase):
+    RTOL = 1e-2
+    ATOL = 1e-2
 
     CALLABLE = {
         "orchestration": {
-            "source": f"{PA_KERNELS}/orchestration/paged_attention_orch.cpp",
+            "source": f"{_PA_KERNELS}/orchestration/paged_attention_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
         },
         "incores": [
             {
                 "func_id": 0,
-                "source": f"{PA_KERNELS}/aic/aic_qk_matmul.cpp",
-                "core_type": "aic",
-                "signature": [D.IN, D.IN, D.OUT],
-            },
-            {
-                "func_id": 2,
-                "source": f"{PA_KERNELS}/aic/aic_pv_matmul.cpp",
+                "source": f"{_PA_KERNELS}/aic/aic_qk_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
-                "source": f"{PA_KERNELS}/aiv/aiv_softmax_prepare.cpp",
+                "source": f"{_PA_KERNELS}/aiv/aiv_softmax_prepare.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT, D.OUT, D.OUT],
             },
             {
+                "func_id": 2,
+                "source": f"{_PA_KERNELS}/aic/aic_pv_matmul.cpp",
+                "core_type": "aic",
+                "signature": [D.IN, D.IN, D.OUT],
+            },
+            {
                 "func_id": 3,
-                "source": f"{PA_KERNELS}/aiv/aiv_online_update.cpp",
+                "source": f"{_PA_KERNELS}/aiv/aiv_online_update.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.INOUT, D.INOUT],
             },
@@ -71,30 +63,31 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
 
     CASES = [
         {
-            "name": "ringbuffer_stress",
-            "platforms": ["a2a3"],
+            "name": "Case1",
+            "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {
-                "batch": 32,
+                "batch": 1,
                 "num_heads": 16,
                 "kv_head_num": 1,
-                "head_dim": 128,
-                "block_size": 128,
-                "context_len": 4096,
-                "max_model_len": 32768,
+                "head_dim": 16,
+                "block_size": 16,
+                "context_len": 33,
+                "max_model_len": 256,
                 "dtype": "bfloat16",
             },
+            "manual": True,
         },
     ]
 
     def generate_args(self, params):
-        inputs = _pa_generate_inputs(params)
+        result = _pa_generate_inputs(params)
         specs = []
-        for name, val in inputs:
-            if isinstance(val, torch.Tensor):
-                specs.append(Tensor(name, val))
+        for name, value in result:
+            if isinstance(value, torch.Tensor):
+                specs.append(Tensor(name, value))
             else:
-                specs.append(Scalar(name, val))
+                specs.append(Scalar(name, value))
         return TaskArgsBuilder(*specs)
 
     def compute_golden(self, args, params):

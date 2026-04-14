@@ -116,8 +116,9 @@ class KernelCompiler:
             arch = "a2a3"
 
         runtime_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "runtime")
+        runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
-        return [runtime_dir, common_dir] + self.get_platform_include_dirs()
+        return [runtime_dir, runtime_common_dir, common_dir] + self.get_platform_include_dirs()
 
     def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
         """

@@ -14,11 +14,16 @@
 // For each batch b, updates accumulators mi/li/oi with new block's mij/lij/oi_new.
 // On is_last, normalizes and writes to the output tensor at the correct batch offset.
 //
-// Scalar layout strategy (unchanged from unbatched version):
+// Supports three tile configurations via runtime dispatch:
+//   Small: (16,  16) -- q_tile=16, head_dim=16
+//   Case1: (16, 128) -- q_tile=16, head_dim=128
+//   Case2: (64, 128) -- q_tile=64, head_dim=128
+//
+// Scalar layout strategy:
 //   M scalar floats stored contiguously in GM can be loaded as either:
 //   - ND (kScalarRows, kScalarCols) RowMajor for element-wise ops
 //   - DN (kAlignedRows, 1) ColMajor for row-broadcast ops
-//   Conversion between layouts uses GM round-trip: ND TSTORE -> DN TLOAD.
+//   Conversion between layouts uses TRESHAPE (UB-internal, zero GM access).
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
@@ -56,7 +61,6 @@ static __aicore__ void online_update_batch_impl(
     using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<1, 1, 1, N, 1>>;
     using GlobalScalarND =
         GlobalTensor<float, Shape<1, 1, 1, kScalarRows, kScalarCols>, Stride<1, 1, 1, kScalarCols, 1>>;
-    using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, Stride<1, 1, 1, 1, 1>, Layout::DN>;
 
     using TileDataMxN = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N>;
     using TileScalarND =
@@ -65,7 +69,6 @@ static __aicore__ void online_update_batch_impl(
 
     constexpr int kDataBytes = M * N * sizeof(float);
     constexpr int kScalarNDBytes = kScalarRows * kScalarCols * sizeof(float);
-    constexpr int kScalarDNBytes = kAlignedRows * sizeof(float);
 
     TileDataMxN oiNewTile;
     TileDataMxN oiTile;
@@ -85,9 +88,6 @@ static __aicore__ void online_update_batch_impl(
     TASSIGN(alphaND, 2 * kDataBytes + 5 * kScalarNDBytes);
     TASSIGN(betaND, 2 * kDataBytes + 6 * kScalarNDBytes);
     TASSIGN(tmpND, 2 * kDataBytes + 7 * kScalarNDBytes);
-    TASSIGN(alphaDN, 2 * kDataBytes + 8 * kScalarNDBytes);
-    TASSIGN(betaDN, 2 * kDataBytes + 8 * kScalarNDBytes + kScalarDNBytes);
-    TASSIGN(liDN, 2 * kDataBytes + 8 * kScalarNDBytes + 2 * kScalarDNBytes);
 
     for (uint64_t b = 0; b < batch_count; b++) {
         __gm__ float *mij_ptr = mij_base + b * M;
@@ -107,10 +107,6 @@ static __aicore__ void online_update_batch_impl(
         GlobalScalarND miGlobalND(mi_ptr);
         GlobalScalarND liGlobalND(li_ptr);
 
-        GlobalScalarDN mijGlobalDN(mij_ptr);
-        GlobalScalarDN lijGlobalDN(lij_ptr);
-        GlobalScalarDN liGlobalDN(li_ptr);
-
         if (is_first) {
             TLOAD(oiNewTile, oiNewGlobal);
             TLOAD(mijND, mijGlobalND);
@@ -125,11 +121,9 @@ static __aicore__ void online_update_batch_impl(
             TSTORE(oiGlobal, oiNewTile);
 
             if (is_last) {
-                set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-                wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-                TLOAD(liDN, liGlobalDN);
-                set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-                wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
+                TRESHAPE(liDN, lijND);
+                set_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
+                wait_flag(PIPE_MTE3, PIPE_V, EVENT_ID1);
                 TROWEXPANDDIV(oiNewTile, oiNewTile, liDN);
                 set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
                 wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
@@ -161,22 +155,16 @@ static __aicore__ void online_update_batch_impl(
             pipe_barrier(PIPE_V);
             TADD(liND, liND, tmpND);
 
+            TRESHAPE(alphaDN, alphaND);
+            TRESHAPE(betaDN, betaND);
+            if (is_last) {
+                TRESHAPE(liDN, liND);
+            }
+
             set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
             TSTORE(miGlobalND, miNewND);
             TSTORE(liGlobalND, liND);
-            TSTORE(mijGlobalND, alphaND);
-            TSTORE(lijGlobalND, betaND);
-
-            set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-            TLOAD(alphaDN, mijGlobalDN);
-            TLOAD(betaDN, lijGlobalDN);
-            if (is_last) {
-                TLOAD(liDN, liGlobalDN);
-            }
-            set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-            wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
 
             TROWEXPANDMUL(oiTile, oiTile, alphaDN);
             TROWEXPANDMUL(oiNewTile, oiNewTile, betaDN);
@@ -200,6 +188,9 @@ static __aicore__ void online_update_batch_impl(
             pipe_barrier(PIPE_ALL);
         }
     }
+
+    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
@@ -217,8 +208,23 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     uint64_t num_heads = static_cast<uint64_t>(args[11]);
     uint64_t batch_start = static_cast<uint64_t>(args[12]);
 
-    online_update_batch_impl<16, 16>(
-        mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count, q_offset,
-        num_heads, batch_start
-    );
+    uint64_t q_tile_size = static_cast<uint64_t>(mij_batch->shapes[0] / batch_count);
+    uint64_t head_dim = static_cast<uint64_t>(oi_new_batch->shapes[1]);
+
+    if (q_tile_size == 16 && head_dim == 16) {
+        online_update_batch_impl<16, 16>(
+            mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count,
+            q_offset, num_heads, batch_start
+        );
+    } else if (q_tile_size == 16) {
+        online_update_batch_impl<16, 128>(
+            mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count,
+            q_offset, num_heads, batch_start
+        );
+    } else {
+        online_update_batch_impl<64, 128>(
+            mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count,
+            q_offset, num_heads, batch_start
+        );
+    }
 }
