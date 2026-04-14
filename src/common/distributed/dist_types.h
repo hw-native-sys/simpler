@@ -15,7 +15,8 @@
  * Every level in the hierarchy (L3 HostWorker, L4, L5, …) runs the same
  * scheduling engine.  This header defines:
  *   - WorkerType / TaskState enumerations
- *   - WorkerPayload: the data dispatched to an IWorker
+ *   - WorkerPayload: internal dispatch carrier (Orchestrator → WorkerThread →
+ *                    IWorker::run); not part of the user-facing surface
  *   - DistTaskSlotState: per-task scheduling bookkeeping
  *   - DistReadyQueue: Orch→Scheduler notification channel
  *   - IWorker: abstract interface implemented by ChipWorker, SubWorker,
@@ -31,6 +32,9 @@
 #include <mutex>
 #include <queue>
 #include <vector>
+
+#include "../task_interface/chip_call_config.h"
+#include "../task_interface/task_args.h"
 
 // =============================================================================
 // Constants
@@ -69,23 +73,27 @@ enum class TaskState : int32_t {
 };
 
 // =============================================================================
-// WorkerPayload — dispatched from Scheduler to IWorker
+// WorkerPayload — internal dispatch carrier (Scheduler → WorkerThread → IWorker)
 // =============================================================================
+//
+// Not part of the user-facing surface. Constructed by the Scheduler at
+// dispatch time from the slot's stored TaskArgs + callable + config, then
+// handed to IWorker::run. ChipWorker / DistChipProcess / DistSubWorker each
+// read the fields they need.
 
 struct WorkerPayload {
     DistTaskSlot task_slot = DIST_INVALID_SLOT;
     WorkerType worker_type = WorkerType::NEXT_LEVEL;
 
-    // --- ChipWorker fields (set in PR 2-2) ---
+    // --- ChipWorker / DistChipProcess fields ---
     const void *callable = nullptr;  // ChipCallable buffer ptr
-    const void *args = nullptr;      // ChipStorageTaskArgs*
+    const void *args = nullptr;      // ChipStorageTaskArgs* (in slot storage)
     int32_t block_dim = 1;
     int32_t aicpu_thread_num = 3;
     bool enable_profiling = false;
 
     // --- SubWorker fields ---
     int32_t callable_id = -1;
-    // 'args' pointer above is reused as shm args addr for SubWorker
 };
 
 // =============================================================================
@@ -106,10 +114,6 @@ struct DistTaskSlotState {
     int32_t fanout_total{0};                  // 1 (scope ref) + fanout_consumers.size()
     std::atomic<int32_t> fanout_released{0};  // incremented as each ref is released
 
-    // --- Output buffers (malloced by orch, freed when CONSUMED) ---
-    std::vector<void *> output_bufs;  // one entry per output
-    std::vector<size_t> output_sizes;
-
     // --- TensorMap keys registered by this task (for cleanup on CONSUMED) ---
     std::vector<uint64_t> output_keys;
 
@@ -118,17 +122,28 @@ struct DistTaskSlotState {
     // on each producer — mirroring L2's "deferred release: walk fanin" step.
     std::vector<DistTaskSlot> fanin_producers;
 
-    // --- Dispatch payload (stored for scheduler dispatch) ---
-    WorkerPayload payload;
+    // --- Task data (stored on parent heap, lives until slot CONSUMED) ---
+    WorkerType worker_type{WorkerType::NEXT_LEVEL};
+    uint64_t callable_ptr{0};  // NEXT_LEVEL: ChipCallable buffer ptr
+    int32_t callable_id{-1};   // SUB: registered callable id
+    ChipCallConfig config{};   // NEXT_LEVEL config (block_dim, aicpu_thread_num, enable_profiling)
 
-    // --- Group task (N workers on 1 DAG node) ---
-    // args_list stores per-worker args pointers.  size()==1 for normal tasks.
-    // Scheduler dispatches worker[i] with args_list[i].
-    std::vector<const void *> args_list;
+    // Per-worker chip-storage args (size()==1 for normal tasks, ==N for groups).
+    // Pre-built at submit time (assembled from each TaskArgs via view_to_chip_storage)
+    // so scheduler dispatch can pass &chip_storage_list[i] in the WorkerPayload.
+    std::vector<ChipStorageTaskArgs> chip_storage_list;
+
+    // Runtime-owned intermediate buffers (DistOrchestrator::alloc). Each entry
+    // is a MAP_SHARED|MAP_ANONYMOUS mmap that must be munmap'd when this slot
+    // reaches CONSUMED. Empty for non-alloc slots.
+    std::vector<void *> alloc_bufs;
+    std::vector<size_t> alloc_sizes;
+
+    // --- Group bookkeeping ---
     std::atomic<int32_t> sub_complete_count{0};
 
-    bool is_group() const { return args_list.size() > 1; }
-    int32_t group_size() const { return static_cast<int32_t>(args_list.size()); }
+    bool is_group() const { return chip_storage_list.size() > 1; }
+    int32_t group_size() const { return static_cast<int32_t>(chip_storage_list.size()); }
 
     DistTaskSlotState() = default;
     DistTaskSlotState(const DistTaskSlotState &) = delete;

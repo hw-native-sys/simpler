@@ -10,7 +10,8 @@
  */
 
 /**
- * Nanobind bindings for the distributed runtime (DistWorker and helpers).
+ * Nanobind bindings for the distributed runtime (DistWorker, DistOrchestrator,
+ * mailbox helpers).
  *
  * Compiled into the same _task_interface extension module as task_interface.cpp.
  * Call bind_dist_worker(m) from the NB_MODULE definition in task_interface.cpp.
@@ -25,12 +26,12 @@
 
 #include <stdexcept>
 
+#include "chip_worker.h"
 #include "dist_chip_process.h"
 #include "dist_orchestrator.h"
 #include "dist_sub_worker.h"
 #include "dist_types.h"
 #include "dist_worker.h"
-#include "chip_worker.h"
 
 namespace nb = nanobind;
 
@@ -47,83 +48,10 @@ inline void bind_dist_worker(nb::module_ &m) {
         .value("COMPLETED", TaskState::COMPLETED)
         .value("CONSUMED", TaskState::CONSUMED);
 
-    // --- WorkerPayload ---
-    nb::class_<WorkerPayload>(m, "WorkerPayload")
-        .def(nb::init<>())
-        .def_rw("task_slot", &WorkerPayload::task_slot)
-        .def_rw("worker_type", &WorkerPayload::worker_type)
-        .def_prop_rw(
-            "callable",
-            [](const WorkerPayload &p) {
-                return reinterpret_cast<uint64_t>(p.callable);
-            },
-            [](WorkerPayload &p, uint64_t v) {
-                p.callable = reinterpret_cast<const void *>(v);
-            },
-            "Callable buffer pointer as uint64_t address."
-        )
-        .def_prop_rw(
-            "args",
-            [](const WorkerPayload &p) {
-                return reinterpret_cast<uint64_t>(p.args);
-            },
-            [](WorkerPayload &p, uint64_t v) {
-                p.args = reinterpret_cast<const void *>(v);
-            },
-            "Args pointer as uint64_t address."
-        )
-        .def_rw("block_dim", &WorkerPayload::block_dim)
-        .def_rw("aicpu_thread_num", &WorkerPayload::aicpu_thread_num)
-        .def_rw("enable_profiling", &WorkerPayload::enable_profiling)
-        .def_rw("callable_id", &WorkerPayload::callable_id);
-
-    // --- DistInputSpec ---
-    nb::class_<DistInputSpec>(m, "DistInputSpec")
-        .def(nb::init<>())
-        .def(
-            "__init__",
-            [](DistInputSpec *self, uint64_t base_ptr) {
-                new (self) DistInputSpec{base_ptr};
-            },
-            nb::arg("base_ptr")
-        )
-        .def_rw("base_ptr", &DistInputSpec::base_ptr);
-
-    // --- DistOutputSpec ---
-    nb::class_<DistOutputSpec>(m, "DistOutputSpec")
-        .def(nb::init<>())
-        .def(
-            "__init__",
-            [](DistOutputSpec *self, size_t size) {
-                new (self) DistOutputSpec{size};
-            },
-            nb::arg("size")
-        )
-        .def_rw("size", &DistOutputSpec::size);
-
-    // --- DistSubmitOutput ---
-    nb::class_<DistSubmitOutput>(m, "DistSubmitOutput")
-        .def_prop_ro(
-            "ptr",
-            [](const DistSubmitOutput &o) {
-                return reinterpret_cast<uint64_t>(o.ptr);
-            }
-        )
-        .def_prop_ro("size", [](const DistSubmitOutput &o) {
-            return o.size;
-        });
-
     // --- DistSubmitResult ---
-    nb::class_<DistSubmitResult>(m, "DistSubmitResult")
-        .def_prop_ro(
-            "task_slot",
-            [](const DistSubmitResult &r) {
-                return r.task_slot;
-            }
-        )
-        .def_prop_ro("outputs", [](const DistSubmitResult &r) {
-            return r.outputs;
-        });
+    nb::class_<DistSubmitResult>(m, "DistSubmitResult").def_prop_ro("task_slot", [](const DistSubmitResult &r) {
+        return r.task_slot;
+    });
 
     // --- DistSubWorker ---
     // The fork + Python callable loop are managed from Python (HostWorker.__init__).
@@ -156,6 +84,65 @@ inline void bind_dist_worker(nb::module_ &m) {
         .def("shutdown", &DistChipProcess::shutdown);
 
     m.attr("DIST_CHIP_MAILBOX_SIZE") = static_cast<int>(DIST_CHIP_MAILBOX_SIZE);
+
+    // --- DistOrchestrator (DAG builder, exposed via DistWorker.get_orchestrator()) ---
+    //
+    // Returned as a reference borrowed from the parent DistWorker. Lifetime is
+    // tied to the DistWorker; using the handle after dw.close() / dw destruction
+    // is undefined behaviour. The Python facade in simpler/orchestrator.py keeps
+    // a strong reference to the parent DistWorker for the lifetime of the
+    // Orchestrator.
+    nb::class_<DistOrchestrator>(m, "DistOrchestrator")
+        .def(
+            "submit_next_level",
+            [](DistOrchestrator &self, uint64_t callable, const TaskArgs &args, const ChipCallConfig &config) {
+                return self.submit_next_level(callable, args, config);
+            },
+            nb::arg("callable"), nb::arg("args"), nb::arg("config"),
+            "Submit a NEXT_LEVEL (chip) task. Tags inside `args` drive dependency inference."
+        )
+        .def(
+            "submit_next_level_group",
+            [](DistOrchestrator &self, uint64_t callable, const std::vector<TaskArgs> &args_list,
+               const ChipCallConfig &config) {
+                return self.submit_next_level_group(callable, args_list, config);
+            },
+            nb::arg("callable"), nb::arg("args_list"), nb::arg("config"),
+            "Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node."
+        )
+        .def(
+            "submit_sub",
+            [](DistOrchestrator &self, int32_t callable_id, const TaskArgs &args) {
+                return self.submit_sub(callable_id, args);
+            },
+            nb::arg("callable_id"), nb::arg("args"),
+            "Submit a SUB task by registered callable id. Tags drive dependency inference."
+        )
+        .def(
+            "submit_sub_group",
+            [](DistOrchestrator &self, int32_t callable_id, const std::vector<TaskArgs> &args_list) {
+                return self.submit_sub_group(callable_id, args_list);
+            },
+            nb::arg("callable_id"), nb::arg("args_list"),
+            "Submit a group of SUB tasks: N args -> N workers, 1 DAG node."
+        )
+        .def(
+            "alloc",
+            [](DistOrchestrator &self, const std::vector<uint32_t> &shape, DataType dtype) {
+                return self.alloc(shape, dtype);
+            },
+            nb::arg("shape"), nb::arg("dtype"),
+            "Allocate an intermediate ContinuousTensor from the orchestrator's MAP_SHARED "
+            "pool (visible to forked child workers). Lifetime: until the next Worker.run() call."
+        )
+        // Internal lifecycle hooks invoked by Worker::run (Python facade) only.
+        // Not part of the user-facing orch-fn API.
+        .def("_scope_begin", &DistOrchestrator::scope_begin)
+        .def("_scope_end", &DistOrchestrator::scope_end)
+        .def(
+            "_drain", &DistOrchestrator::drain, nb::call_guard<nb::gil_scoped_release>(),
+            "Block until all submitted tasks are CONSUMED (releases GIL)."
+        );
 
     // --- DistWorker ---
     nb::class_<DistWorker>(m, "DistWorker")
@@ -199,39 +186,7 @@ inline void bind_dist_worker(nb::module_ &m) {
         .def("close", &DistWorker::close, "Stop the Scheduler thread.")
 
         .def(
-            "drain", &DistWorker::drain, nb::call_guard<nb::gil_scoped_release>(),
-            "Block until all submitted tasks are consumed (releases GIL)."
-        )
-
-        .def("scope_begin", &DistWorker::scope_begin)
-        .def("scope_end", &DistWorker::scope_end)
-
-        .def(
-            "submit",
-            [](DistWorker &self, WorkerType worker_type, const WorkerPayload &base_payload,
-               const std::vector<DistInputSpec> &inputs, const std::vector<DistOutputSpec> &outputs) {
-                return self.submit(worker_type, base_payload, inputs, outputs);
-            },
-            nb::arg("worker_type"), nb::arg("payload"), nb::arg("inputs") = std::vector<DistInputSpec>{},
-            nb::arg("outputs") = std::vector<DistOutputSpec>{}
-        )
-
-        .def(
-            "submit_group",
-            [](DistWorker &self, WorkerType worker_type, const WorkerPayload &base_payload,
-               const std::vector<uint64_t> &args_addrs, const std::vector<DistInputSpec> &inputs,
-               const std::vector<DistOutputSpec> &outputs) {
-                std::vector<const void *> args_list;
-                args_list.reserve(args_addrs.size());
-                for (uint64_t addr : args_addrs)
-                    args_list.push_back(reinterpret_cast<const void *>(addr));
-                return self.submit_group(worker_type, base_payload, args_list, inputs, outputs);
-            },
-            nb::arg("worker_type"), nb::arg("payload"), nb::arg("args_list"),
-            nb::arg("inputs") = std::vector<DistInputSpec>{}, nb::arg("outputs") = std::vector<DistOutputSpec>{},
-            "Submit a group task: N args -> N workers, 1 DAG node."
-        )
-
-        .def_prop_ro("level", &DistWorker::level)
-        .def_prop_ro("idle", &DistWorker::idle);
+            "get_orchestrator", &DistWorker::get_orchestrator, nb::rv_policy::reference_internal,
+            "Return the Orchestrator handle (lifetime tied to this DistWorker)."
+        );
 }

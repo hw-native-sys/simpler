@@ -177,7 +177,7 @@ void DistScheduler::dispatch_ready() {
         DistTaskSlotState &s = cfg_.slots[slot];
         int N = s.group_size();  // 1 for normal tasks
 
-        auto workers = cfg_.manager->pick_n_idle(s.payload.worker_type, N);
+        auto workers = cfg_.manager->pick_n_idle(s.worker_type, N);
         if (static_cast<int>(workers.size()) < N) {
             cfg_.ready_queue->push(slot);
             break;
@@ -185,8 +185,15 @@ void DistScheduler::dispatch_ready() {
 
         s.state.store(TaskState::RUNNING, std::memory_order_release);
         for (int i = 0; i < N; i++) {
-            WorkerPayload p = s.payload;
-            p.args = s.args_list[i];
+            WorkerPayload p;
+            p.task_slot = slot;
+            p.worker_type = s.worker_type;
+            p.callable = reinterpret_cast<const void *>(s.callable_ptr);
+            p.args = &s.chip_storage_list[i];
+            p.block_dim = s.config.block_dim;
+            p.aicpu_thread_num = s.config.aicpu_thread_num;
+            p.enable_profiling = s.config.enable_profiling;
+            p.callable_id = s.callable_id;
             workers[i]->dispatch(p);
         }
     }

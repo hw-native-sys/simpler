@@ -11,9 +11,9 @@
 /**
  * Nanobind Python extension for task_interface headers.
  *
- * Wraps DataType, ContinuousTensor, ChipStorageTaskArgs, DynamicTaskArgs,
- * TaggedTaskArgs, TensorArgType, ArgDirection, CoreCallable, ChipCallable,
- * and helper functions from
+ * Wraps DataType, ContinuousTensor, ChipStorageTaskArgs, TaskArgs (unified
+ * vector-backed builder with per-tensor TensorArgType tags), TensorArgType,
+ * ArgDirection, CoreCallable, ChipCallable, and helper functions from
  * data_type.h / tensor_arg.h / task_args.h / arg_direction.h / callable.h.
  */
 
@@ -236,79 +236,32 @@ NB_MODULE(_task_interface, m) {
     nb::enum_<TensorArgType>(m, "TensorArgType")
         .value("INPUT", TensorArgType::INPUT)
         .value("OUTPUT", TensorArgType::OUTPUT)
-        .value("INOUT", TensorArgType::INOUT);
+        .value("INOUT", TensorArgType::INOUT)
+        .value("OUTPUT_EXISTING", TensorArgType::OUTPUT_EXISTING)
+        .value("NO_DEP", TensorArgType::NO_DEP);
 
-    // --- DynamicTaskArgs (vector-backed, no capacity limit) ---
-    nb::class_<DynamicTaskArgs>(m, "DynamicTaskArgs")
-        .def(nb::init<>())
-
-        .def(
-            "add_tensor", &DynamicTaskArgs::add_tensor, nb::arg("t"),
-            "Add a ContinuousTensor. Must be called before any add_scalar()."
-        )
-
-        .def(
-            "add_scalar", &DynamicTaskArgs::add_scalar, nb::arg("s"),
-            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
-        )
-
-        .def(
-            "tensor",
-            [](const DynamicTaskArgs &self, int32_t i) -> const ContinuousTensor & {
-                if (i < 0 || i >= self.tensor_count())
-                    throw std::out_of_range("DynamicTaskArgs tensor index out of range");
-                return self.tensor(i);
-            },
-            nb::arg("i"), nb::rv_policy::reference_internal, "Return the ContinuousTensor at index i."
-        )
-
-        .def(
-            "scalar",
-            [](const DynamicTaskArgs &self, int32_t i) -> uint64_t {
-                if (i < 0 || i >= self.scalar_count())
-                    throw std::out_of_range("DynamicTaskArgs scalar index out of range");
-                return self.scalar(i);
-            },
-            nb::arg("i"), "Return the scalar at index i."
-        )
-
-        .def("tensor_count", &DynamicTaskArgs::tensor_count)
-        .def("scalar_count", &DynamicTaskArgs::scalar_count)
-
-        .def("clear", &DynamicTaskArgs::clear)
-
-        .def(
-            "__len__",
-            [](const DynamicTaskArgs &self) {
-                return self.tensor_count() + self.scalar_count();
-            },
-            "Return total number of arguments (tensors + scalars)."
-        );
-
-    // --- TaggedTaskArgs (fixed-size with per-tensor TensorArgType tags) ---
-    nb::class_<TaggedTaskArgs>(m, "TaggedTaskArgs")
+    // --- TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags) ---
+    nb::class_<TaskArgs>(m, "TaskArgs")
         .def(nb::init<>())
 
         .def(
             "add_tensor",
-            [](TaggedTaskArgs &self, const ContinuousTensor &t, TensorArgType tag) {
-                self.add_tensor(t);
-                self.tag(self.tensor_count() - 1) = tag;
+            [](TaskArgs &self, const ContinuousTensor &t, TensorArgType tag) {
+                self.add_tensor(t, tag);
             },
             nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT,
             "Add a ContinuousTensor with an optional TensorArgType tag (default INPUT)."
         )
 
         .def(
-            "add_scalar", &TaggedTaskArgs::add_scalar, nb::arg("s"),
+            "add_scalar", &TaskArgs::add_scalar, nb::arg("s"),
             "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
         )
 
         .def(
             "tensor",
-            [](const TaggedTaskArgs &self, int32_t i) -> const ContinuousTensor & {
-                if (i < 0 || i >= self.tensor_count())
-                    throw std::out_of_range("TaggedTaskArgs tensor index out of range");
+            [](const TaskArgs &self, int32_t i) -> const ContinuousTensor & {
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs tensor index out of range");
                 return self.tensor(i);
             },
             nb::arg("i"), nb::rv_policy::reference_internal, "Return the ContinuousTensor at index i."
@@ -316,9 +269,8 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "scalar",
-            [](const TaggedTaskArgs &self, int32_t i) -> uint64_t {
-                if (i < 0 || i >= self.scalar_count())
-                    throw std::out_of_range("TaggedTaskArgs scalar index out of range");
+            [](const TaskArgs &self, int32_t i) -> uint64_t {
+                if (i < 0 || i >= self.scalar_count()) throw std::out_of_range("TaskArgs scalar index out of range");
                 return self.scalar(i);
             },
             nb::arg("i"), "Return the scalar at index i."
@@ -326,8 +278,8 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "tag",
-            [](const TaggedTaskArgs &self, int32_t i) -> TensorArgType {
-                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaggedTaskArgs tag index out of range");
+            [](const TaskArgs &self, int32_t i) -> TensorArgType {
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs tag index out of range");
                 return self.tag(i);
             },
             nb::arg("i"), "Return the TensorArgType tag for the tensor at index i."
@@ -335,22 +287,21 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "set_tag",
-            [](TaggedTaskArgs &self, int32_t i, TensorArgType tag) {
-                if (i < 0 || i >= self.tensor_count())
-                    throw std::out_of_range("TaggedTaskArgs set_tag index out of range");
+            [](TaskArgs &self, int32_t i, TensorArgType tag) {
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs set_tag index out of range");
                 self.tag(i) = tag;
             },
             nb::arg("i"), nb::arg("tag"), "Set the TensorArgType tag for the tensor at index i."
         )
 
-        .def("tensor_count", &TaggedTaskArgs::tensor_count)
-        .def("scalar_count", &TaggedTaskArgs::scalar_count)
+        .def("tensor_count", &TaskArgs::tensor_count)
+        .def("scalar_count", &TaskArgs::scalar_count)
 
-        .def("clear", &TaggedTaskArgs::clear)
+        .def("clear", &TaskArgs::clear)
 
         .def(
             "__len__",
-            [](const TaggedTaskArgs &self) {
+            [](const TaskArgs &self) {
                 return self.tensor_count() + self.scalar_count();
             },
             "Return total number of arguments (tensors + scalars)."

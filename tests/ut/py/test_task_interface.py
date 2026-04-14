@@ -29,8 +29,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     ContinuousTensor,
     CoreCallable,
     DataType,
-    DynamicTaskArgs,
-    TaggedTaskArgs,
+    TaskArgs,
     TensorArgType,
     arg_direction_name,
     get_dtype_name,
@@ -314,50 +313,80 @@ class TestTensorArgType:
 
 
 # ============================================================================
-# DynamicTaskArgs
+# TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags)
 # ============================================================================
 
 
-class TestDynamicTaskArgs:
+class TestTaskArgs:
     def test_empty(self):
-        args = DynamicTaskArgs()
+        args = TaskArgs()
         assert len(args) == 0
         assert args.tensor_count() == 0
         assert args.scalar_count() == 0
 
-    def test_add_tensor(self):
-        args = DynamicTaskArgs()
+    def test_add_tensor_default_tag(self):
+        args = TaskArgs()
         t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
         args.add_tensor(t)
         assert args.tensor_count() == 1
-        assert args.scalar_count() == 0
-        assert len(args) == 1
+        assert args.tag(0) == TensorArgType.INPUT
+
+    def test_add_tensor_with_tag(self):
+        args = TaskArgs()
+        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
+        args.add_tensor(t, TensorArgType.OUTPUT)
+        assert args.tag(0) == TensorArgType.OUTPUT
+
+    def test_multiple_tensors_with_tags(self):
+        args = TaskArgs()
+        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
+        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
+        args.add_tensor(ContinuousTensor.make(0x3, (4,), DataType.INT8), TensorArgType.INOUT)
+        args.add_tensor(ContinuousTensor.make(0x4, (5,), DataType.FLOAT32), TensorArgType.OUTPUT_EXISTING)
+        args.add_tensor(ContinuousTensor.make(0x5, (6,), DataType.INT32), TensorArgType.NO_DEP)
+        assert args.tensor_count() == 5
+        assert args.tag(0) == TensorArgType.INPUT
+        assert args.tag(1) == TensorArgType.OUTPUT
+        assert args.tag(2) == TensorArgType.INOUT
+        assert args.tag(3) == TensorArgType.OUTPUT_EXISTING
+        assert args.tag(4) == TensorArgType.NO_DEP
+
+    def test_set_tag(self):
+        args = TaskArgs()
+        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
+        assert args.tag(0) == TensorArgType.INPUT
+        args.set_tag(0, TensorArgType.INOUT)
+        assert args.tag(0) == TensorArgType.INOUT
 
     def test_add_scalar(self):
-        args = DynamicTaskArgs()
+        args = TaskArgs()
         args.add_scalar(42)
         assert args.scalar_count() == 1
         assert args.tensor_count() == 0
         assert len(args) == 1
 
-    def test_mixed(self):
-        args = DynamicTaskArgs()
-        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
-        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16))
+    def test_mixed_with_tags(self):
+        args = TaskArgs()
+        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
+        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
         args.add_scalar(99)
         args.add_scalar(100)
         assert args.tensor_count() == 2
         assert args.scalar_count() == 2
         assert len(args) == 4
+        assert args.tensor(0).data == 0x1
+        assert args.tensor(1).data == 0x2
+        assert args.scalar(0) == 99
+        assert args.scalar(1) == 100
 
     def test_tensor_before_scalar_enforced(self):
-        args = DynamicTaskArgs()
+        args = TaskArgs()
         args.add_scalar(42)
         with pytest.raises(RuntimeError):
             args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
 
     def test_tensor_access(self):
-        args = DynamicTaskArgs()
+        args = TaskArgs()
         args.add_tensor(ContinuousTensor.make(0xA, (4,), DataType.FLOAT32))
         args.add_tensor(ContinuousTensor.make(0xB, (8,), DataType.INT32))
         assert args.tensor(0).data == 0xA
@@ -366,106 +395,34 @@ class TestDynamicTaskArgs:
         assert args.tensor(1).shapes == (8,)
 
     def test_scalar_access(self):
-        args = DynamicTaskArgs()
+        args = TaskArgs()
         args.add_scalar(111)
         args.add_scalar(222)
         assert args.scalar(0) == 111
         assert args.scalar(1) == 222
 
     def test_tensor_out_of_range(self):
-        args = DynamicTaskArgs()
+        args = TaskArgs()
         with pytest.raises((IndexError, RuntimeError)):
             args.tensor(0)
 
     def test_scalar_out_of_range(self):
-        args = DynamicTaskArgs()
+        args = TaskArgs()
         with pytest.raises((IndexError, RuntimeError)):
             args.scalar(0)
 
-    def test_clear(self):
-        args = DynamicTaskArgs()
-        args.add_tensor(ContinuousTensor.make(0, (1,), DataType.INT8))
-        args.add_scalar(42)
-        args.clear()
-        assert len(args) == 0
-        assert args.tensor_count() == 0
-        assert args.scalar_count() == 0
+    def test_tag_out_of_range(self):
+        args = TaskArgs()
+        with pytest.raises((IndexError, RuntimeError)):
+            args.tag(0)
 
-    def test_no_capacity_limit(self):
-        """Dynamic variant should handle more than 16 tensors / 128 scalars."""
-        args = DynamicTaskArgs()
-        for i in range(20):
-            args.add_tensor(ContinuousTensor.make(i, (1,), DataType.INT8))
-        assert args.tensor_count() == 20
-
-    def test_many_scalars(self):
-        args = DynamicTaskArgs()
-        for i in range(200):
-            args.add_scalar(i)
-        assert args.scalar_count() == 200
-
-
-# ============================================================================
-# TaggedTaskArgs
-# ============================================================================
-
-
-class TestTaggedTaskArgs:
-    def test_empty(self):
-        args = TaggedTaskArgs()
-        assert len(args) == 0
-        assert args.tensor_count() == 0
-        assert args.scalar_count() == 0
-
-    def test_add_tensor_default_tag(self):
-        args = TaggedTaskArgs()
-        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
-        args.add_tensor(t)
-        assert args.tensor_count() == 1
-        assert args.tag(0) == TensorArgType.INPUT
-
-    def test_add_tensor_with_tag(self):
-        args = TaggedTaskArgs()
-        t = ContinuousTensor.make(0xBEEF, (4, 8), DataType.FLOAT32)
-        args.add_tensor(t, TensorArgType.OUTPUT)
-        assert args.tag(0) == TensorArgType.OUTPUT
-
-    def test_multiple_tensors_with_tags(self):
-        args = TaggedTaskArgs()
-        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
-        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
-        args.add_tensor(ContinuousTensor.make(0x3, (4,), DataType.INT8), TensorArgType.INOUT)
-        assert args.tensor_count() == 3
-        assert args.tag(0) == TensorArgType.INPUT
-        assert args.tag(1) == TensorArgType.OUTPUT
-        assert args.tag(2) == TensorArgType.INOUT
-
-    def test_set_tag(self):
-        args = TaggedTaskArgs()
-        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
-        assert args.tag(0) == TensorArgType.INPUT
-        args.set_tag(0, TensorArgType.INOUT)
-        assert args.tag(0) == TensorArgType.INOUT
-
-    def test_tensor_before_scalar_enforced(self):
-        args = TaggedTaskArgs()
-        args.add_scalar(42)
-        with pytest.raises(RuntimeError):
-            args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32))
-
-    def test_mixed_with_tags(self):
-        args = TaggedTaskArgs()
-        args.add_tensor(ContinuousTensor.make(0x1, (2,), DataType.INT32), TensorArgType.INPUT)
-        args.add_tensor(ContinuousTensor.make(0x2, (3,), DataType.FLOAT16), TensorArgType.OUTPUT)
-        args.add_scalar(99)
-        assert args.tensor_count() == 2
-        assert args.scalar_count() == 1
-        assert args.tensor(0).data == 0x1
-        assert args.tensor(1).data == 0x2
-        assert args.scalar(0) == 99
+    def test_set_tag_out_of_range(self):
+        args = TaskArgs()
+        with pytest.raises((IndexError, RuntimeError)):
+            args.set_tag(0, TensorArgType.INPUT)
 
     def test_clear(self):
-        args = TaggedTaskArgs()
+        args = TaskArgs()
         args.add_tensor(ContinuousTensor.make(0, (1,), DataType.INT8), TensorArgType.OUTPUT)
         args.add_scalar(42)
         args.clear()
@@ -473,15 +430,18 @@ class TestTaggedTaskArgs:
         assert args.tensor_count() == 0
         assert args.scalar_count() == 0
 
-    def test_tag_out_of_range(self):
-        args = TaggedTaskArgs()
-        with pytest.raises((IndexError, RuntimeError)):
-            args.tag(0)
+    def test_no_capacity_limit_tensors(self):
+        """TaskArgs is vector-backed — no per-class capacity limit on tensors."""
+        args = TaskArgs()
+        for i in range(20):
+            args.add_tensor(ContinuousTensor.make(i, (1,), DataType.INT8))
+        assert args.tensor_count() == 20
 
-    def test_set_tag_out_of_range(self):
-        args = TaggedTaskArgs()
-        with pytest.raises((IndexError, RuntimeError)):
-            args.set_tag(0, TensorArgType.INPUT)
+    def test_no_capacity_limit_scalars(self):
+        args = TaskArgs()
+        for i in range(200):
+            args.add_scalar(i)
+        assert args.scalar_count() == 200
 
 
 # ============================================================================

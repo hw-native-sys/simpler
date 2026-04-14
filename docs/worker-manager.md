@@ -1,5 +1,11 @@
 # Worker Manager — Pool, Threading, and Dispatch Modes
 
+> **Status**: describes the **target** design. Current code still has
+> separate `DistChipProcess` / `DistSubWorker` classes (target: merged
+> into `WorkerThread` in PR-D) and passes `const WorkerPayload&` to
+> `IWorker::run` (target: replaced in PR-C). See
+> [roadmap.md](roadmap.md) for the full landed-vs-planned breakdown.
+
 `WorkerManager` and `WorkerThread` together implement the **execution layer**
 of a `Worker` engine. `WorkerManager` owns two pools of `WorkerThread`s (one
 for next-level workers, one for sub workers); each `WorkerThread` owns an

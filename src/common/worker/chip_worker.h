@@ -16,13 +16,8 @@
 #include <string>
 #include <vector>
 
+#include "../task_interface/chip_call_config.h"
 #include "dist_types.h"
-
-struct ChipCallConfig {
-    int block_dim = 24;
-    int aicpu_thread_num = 3;
-    bool enable_profiling = false;
-};
 
 class ChipWorker : public IWorker {
 public:

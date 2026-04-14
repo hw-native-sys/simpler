@@ -1,5 +1,11 @@
 # Scheduler — DAG Dispatch Internals
 
+> **Status**: target design. Current code dispatches via
+> `IWorker::run(const WorkerPayload&)` rather than `run(callable, view,
+> config)`; per-worker-type ready queue split (Strict-4) is not yet
+> implemented. See [roadmap.md](roadmap.md) for the full
+> landed-vs-planned breakdown.
+
 The Scheduler is the **DAG executor**. A dedicated C++ thread that consumes
 submitted slots, wires fanout edges, dispatches ready tasks to worker threads,
 and handles completion callbacks. It is the bridge between the Orchestrator

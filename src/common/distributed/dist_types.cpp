@@ -25,14 +25,19 @@ void DistTaskSlotState::reset() {
         fanout_total = 0;
     }
     fanout_released.store(0, std::memory_order_relaxed);
-    for (void *p : output_bufs)
-        ::operator delete(p);
-    output_bufs.clear();
-    output_sizes.clear();
     output_keys.clear();
     fanin_producers.clear();
-    payload = WorkerPayload{};
-    args_list.clear();
+    worker_type = WorkerType::NEXT_LEVEL;
+    callable_ptr = 0;
+    callable_id = -1;
+    config = ChipCallConfig{};
+    chip_storage_list.clear();
+    // alloc_bufs / alloc_sizes are owned mmaps freed in on_consumed.
+    // reset() runs at submit time on a freshly-released slot — these vectors
+    // should already be empty here. Guard with assertions in debug builds if
+    // we want to catch leaks.
+    alloc_bufs.clear();
+    alloc_sizes.clear();
     sub_complete_count.store(0, std::memory_order_relaxed);
 }
 

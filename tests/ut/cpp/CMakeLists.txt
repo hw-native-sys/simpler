@@ -58,6 +58,7 @@ function(add_dist_test name src)
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
         ${DIST_SRC_DIR}
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE

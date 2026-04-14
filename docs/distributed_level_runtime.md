@@ -1,5 +1,11 @@
 # Distributed Level Runtime — Level Model and Component Composition
 
+> **Status**: level model + high-level component split are accurate for
+> current code. Low-level details (e.g. `IWorker::run` signature,
+> `WorkerThread` unified mode) describe the target; see the
+> per-component docs for current vs target, or
+> [roadmap.md](roadmap.md) for the full landed-vs-planned breakdown.
+
 This document covers:
 
 - The **L0–L6 level model** (what each level represents)

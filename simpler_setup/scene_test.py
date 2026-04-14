@@ -192,10 +192,13 @@ class CallableNamespace:
 
 
 def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
-    """Build ChipStorageTaskArgs from TaskArgsBuilder + identify outputs via signature.
+    """Build `ChipStorageTaskArgs` (POD) from `TaskArgsBuilder`.
+
+    Used by the L2 path (`ChipWorker.run(callable, chip_args, config)`): the
+    chip worker expects the runtime.so ABI-shaped POD directly (no tags).
 
     Returns:
-        chip_args: ChipStorageTaskArgs (for worker.run)
+        chip_args: ChipStorageTaskArgs (POD)
         output_names: list of tensor names that are OUTPUT or INOUT
     """
     from simpler.task_interface import (  # noqa: PLC0415
@@ -211,7 +214,6 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     tensor_idx = 0
     for spec in test_args.specs:
         if isinstance(spec, Tensor):
-            chip_args.add_tensor(make_tensor_arg(spec.value))
             if tensor_idx >= len(orch_signature):
                 raise ValueError(
                     f"Tensor '{spec.name}' at index {tensor_idx} has no matching entry in "
@@ -219,6 +221,56 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
                     f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
                 )
             direction = orch_signature[tensor_idx]
+            chip_args.add_tensor(make_tensor_arg(spec.value))
+            if direction in (ArgDirection.OUT, ArgDirection.INOUT):
+                output_names.append(spec.name)
+            tensor_idx += 1
+        elif isinstance(spec, Scalar):
+            chip_args.add_scalar(scalar_to_uint64(spec.value))
+
+    return chip_args, output_names
+
+
+def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list):
+    """Build a tagged `TaskArgs` (vector-backed, with `TensorArgType` tags) from
+    `TaskArgsBuilder`.
+
+    Used by the L3 path (`orch.submit_next_level(callable, args, config)`):
+    the orchestrator reads the tags to drive dependency inference.
+
+    Returns:
+        chip_args: TaskArgs (tagged)
+        output_names: list of tensor names that are OUTPUT or INOUT
+    """
+    from simpler.task_interface import (  # noqa: PLC0415
+        ArgDirection,
+        TaskArgs,
+        TensorArgType,
+        make_tensor_arg,
+        scalar_to_uint64,
+    )
+
+    _DIR_TO_TAG = {
+        ArgDirection.IN: TensorArgType.INPUT,
+        ArgDirection.OUT: TensorArgType.OUTPUT_EXISTING,
+        ArgDirection.INOUT: TensorArgType.INOUT,
+    }
+
+    chip_args = TaskArgs()
+    output_names: list[str] = []
+
+    tensor_idx = 0
+    for spec in test_args.specs:
+        if isinstance(spec, Tensor):
+            if tensor_idx >= len(orch_signature):
+                raise ValueError(
+                    f"Tensor '{spec.name}' at index {tensor_idx} has no matching entry in "
+                    f"orchestration signature (length {len(orch_signature)}). "
+                    f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
+                )
+            direction = orch_signature[tensor_idx]
+            tag = _DIR_TO_TAG.get(direction, TensorArgType.INPUT)
+            chip_args.add_tensor(make_tensor_arg(spec.value), tag)
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1

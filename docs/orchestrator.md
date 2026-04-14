@@ -1,5 +1,10 @@
 # Orchestrator — DAG Submission Internals
 
+> **Status**: describes the **target** design. Current code matches the
+> user-facing submit API and `alloc` surface; inline "Status:" notes flag
+> the few remaining divergences. See [roadmap.md](roadmap.md) for the
+> full landed-vs-planned breakdown.
+
 The Orchestrator is the **DAG builder**. It runs single-threaded on the user's
 thread (inside `Worker::run` between `scope_begin` and `drain`) and owns the
 three data structures that turn a sequence of `submit_*` calls into a scheduled
@@ -18,26 +23,40 @@ The user's orch fn receives an `Orchestrator*` as its first argument:
 ```cpp
 class Orchestrator {
 public:
-    SubmitResult submit_next_level(Callable cb, TaskArgs args, const CallConfig &config);
-    SubmitResult submit_next_level_group(Callable cb,
-                                          std::vector<TaskArgs> args_list,
-                                          const CallConfig &config);
-    SubmitResult submit_sub(Callable cb, TaskArgs args, const CallConfig &config);
+    // --- User-facing submit API (tags inside TaskArgs drive deps) ---
+    SubmitResult submit_next_level(uint64_t callable,
+                                    const TaskArgs &args,
+                                    const ChipCallConfig &config);
+    SubmitResult submit_next_level_group(uint64_t callable,
+                                          const std::vector<TaskArgs> &args_list,
+                                          const ChipCallConfig &config);
+    SubmitResult submit_sub(int32_t callable_id, const TaskArgs &args);
+    SubmitResult submit_sub_group(int32_t callable_id,
+                                   const std::vector<TaskArgs> &args_list);
 
-private:
-    friend class Worker;
+    // --- Intermediate-buffer allocation (runtime-owned lifetime) ---
+    ContinuousTensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
+
+    // --- Internal lifecycle (invoked by Worker::run only, bound as _scope_begin
+    //     / _scope_end / _drain in the Python facade) ---
     void scope_begin();
     void scope_end();
     void drain();
-    // ... components: Ring, TensorMap, Scope, slot pool
+
+private:
+    // ... components: Ring, TensorMap, Scope, slot pool, active_tasks_ counter
 };
 
-struct SubmitResult { TaskSlot slot_id; };
+struct SubmitResult { TaskSlot task_slot; };  // field is `task_slot` in current code
 ```
 
-`scope_begin` / `scope_end` / `drain` are not user-visible — they are invoked
-by `Worker::run` around the orch fn. See
-[task-flow.md](task-flow.md) §5 for the Worker::run wrapper.
+**Status**: `submit_sub` takes only `(callable_id, args)` — no `config`, SUB
+has no per-call config. Target design (plan §"Why L2 has no submit") allows
+callable IDs that may later unify with ChipCallable pointers; see PR-E.
+
+`scope_begin` / `scope_end` / `drain` are invoked from Python `Worker.run` via
+`_scope_begin` / `_scope_end` / `_drain` bindings. They are not part of the
+user-facing orch-fn API.
 
 ---
 
@@ -388,6 +407,92 @@ State transitions are driven by atomic CAS operations:
 
 - Orch: FREE → PENDING/READY at submit time
 - Scheduler: READY → RUNNING → COMPLETED → CONSUMED during dispatch/completion
+
+### Fanout-release threshold
+
+Both paths that can trigger COMPLETED → CONSUMED (the scheduler's
+`try_consume` and the scope-end `release_ref`) use the same threshold:
+
+```cpp
+if (fanout_released >= fanout_total + 1 && state == COMPLETED) on_consumed(slot);
+```
+
+The `+1` accounts for the slot's own self-release contribution, which normal
+tasks emit from `on_task_complete` (`try_consume(slot)` self-call). Alloc
+slots (§8b) bypass the scheduler and pre-bump `fanout_released` to `1` at
+`alloc()` time to stand in for the self-release. Both paths use `on_consumed`,
+which uses a CAS on `state` from `COMPLETED` to `CONSUMED` to remain idempotent
+when both fire concurrently at threshold.
+
+---
+
+## 8b. `alloc(shape, dtype)` — runtime-owned intermediate buffers
+
+Mirrors L2's "task slot owns its output buffer" model: `alloc` creates a
+synthetic task slot in `COMPLETED` state that owns an mmap'd buffer. The
+buffer is freed when the slot reaches `CONSUMED` — i.e. after all downstream
+consumers have completed and the scope ref has been released.
+
+```cpp
+ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
+    // 1. mmap(MAP_SHARED|MAP_ANONYMOUS) a page-aligned region — visible to
+    //    forked child workers at the same virtual address.
+    void *buf = mmap(...);
+    // 2. Claim a task slot.
+    TaskSlot sid = ring_.alloc();
+    TaskSlotState &s = slots_[sid];
+    // 3. Record buffer for on_consumed munmap.
+    s.alloc_bufs.push_back(buf);
+    s.alloc_sizes.push_back(mmap_bytes);
+    // 4. Register as this slot's output so downstream `INPUT`-tagged tensors
+    //    with the same data ptr look up this slot as producer.
+    tensormap_.insert(reinterpret_cast<uint64_t>(buf), sid);
+    s.output_keys.push_back(reinterpret_cast<uint64_t>(buf));
+    // 5. No fanin — alloc has no work to wait on.
+    s.fanin_count = 0;
+    // 6. Initial fanout = scope_ref. Consumers that wire on this slot in
+    //    infer_deps bump fanout_total; this slot's CONSUMED transition waits
+    //    for all of them + scope_end.
+    s.fanout_total = (scope_.depth() > 0) ? 1 : 0;
+    if (s.fanout_total > 0) scope_.register_task(sid);
+    // 7. Sim self-consume so the fanout-release threshold math aligns with
+    //    normal slots (see §8 Fanout-release threshold).
+    s.fanout_released = 1;
+    // 8. Straight to COMPLETED — no dispatch needed.
+    s.state = TaskState::COMPLETED;
+    active_tasks_++;
+    return ContinuousTensor{buf, shape, dtype};
+}
+```
+
+On `on_consumed`, in addition to the usual `tensormap.erase_task_outputs` and
+`ring.release(sid)`, the slot's `alloc_bufs` are `munmap`'d.
+
+### Consumer interaction
+
+`infer_deps` treats `COMPLETED` producers specially: it still wires the
+fanout edge (so the producer waits for the consumer before being consumed and
+freeing its buffer) but does not bump `live_fanins` (the consumer is
+immediately ready because the producer is already done).
+
+```cpp
+if (ps_state == TaskState::CONSUMED) continue;  // already gone
+ps.fanout_consumers.push_back(slot);
+ps.fanout_total++;
+s.fanin_producers.push_back(prod);
+if (ps_state != TaskState::COMPLETED) live_fanins++;   // wait only if not yet done
+```
+
+### Status — placeholder vs target (PR-H)
+
+The current implementation uses **per-alloc `mmap`** (one syscall per
+`alloc()` invocation). This is a placeholder. The target design (PR-H,
+"HeapRing") pre-allocates a single MAP_SHARED region at `Worker::init()`
+before any fork, bump-allocates from it, and reclaims via FIFO
+`last_alive` tracking — mirroring L2's `PTO2TaskAllocator`. Under the
+target design, `OUTPUT`-tagged tensors will be auto-allocated by the
+Orchestrator (no explicit `alloc` call), and `OUTPUT_EXISTING` will
+preserve the current "user-provided buffer" path.
 
 ---
 

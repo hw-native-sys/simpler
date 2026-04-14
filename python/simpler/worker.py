@@ -46,7 +46,6 @@ from .task_interface import (
     DistChipProcess,
     DistSubWorker,
     DistWorker,
-    WorkerPayload,
     _ChipWorker,
 )
 
@@ -357,31 +356,28 @@ class Worker:
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()
 
-        self._orch = Orchestrator(dw)
+        self._orch = Orchestrator(dw.get_orchestrator())
 
     # ------------------------------------------------------------------
     # run — uniform entry point
     # ------------------------------------------------------------------
 
-    def run(self, task_or_payload, args=None, **kwargs) -> None:
+    def run(self, task_or_callable, args=None, **kwargs) -> None:
         """Execute one task synchronously.
 
         L2: run(chip_callable, chip_args, block_dim=N)
-            or run(WorkerPayload(...))
         L3: run(Task(orch=fn, args=...))
         """
         assert self._initialized, "Worker not initialized; call init() first"
 
         if self.level == 2:
             assert self._chip_worker is not None
-            if isinstance(task_or_payload, WorkerPayload):
-                self._run_l2_from_payload(task_or_payload)
-            else:
-                self._chip_worker.run(task_or_payload, args, **kwargs)
+            self._chip_worker.run(task_or_callable, args, **kwargs)
         else:
             self._start_level3()
             assert self._orch is not None
-            task = task_or_payload
+            assert self._dist_worker is not None
+            task = task_or_callable
             self._orch._scope_begin()
             try:
                 task.orch(self._orch, task.args)
@@ -390,21 +386,6 @@ class Worker:
                 # stranded when the orch fn raises mid-DAG.
                 self._orch._scope_end()
                 self._orch._drain()
-
-    def _run_l2_from_payload(self, payload: WorkerPayload) -> None:
-        """Unpack a WorkerPayload and forward to ChipWorker (L2 only)."""
-        from .task_interface import ChipCallConfig  # noqa: PLC0415
-
-        assert self._chip_worker is not None
-        config = ChipCallConfig()
-        config.block_dim = payload.block_dim
-        config.aicpu_thread_num = payload.aicpu_thread_num
-        config.enable_profiling = payload.enable_profiling
-        self._chip_worker.run(
-            payload.callable,  # type: ignore[arg-type]
-            payload.args,
-            config,
-        )
 
     # ------------------------------------------------------------------
     # close

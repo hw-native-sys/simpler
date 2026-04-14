@@ -46,7 +46,7 @@ void DistWorker::init() {
     cfg.ready_queue = &ready_queue_;
     cfg.manager = &manager_;
     cfg.on_consumed_cb = [this](DistTaskSlot slot) {
-        on_consumed(slot);
+        orchestrator_.on_consumed(slot);
     };
 
     scheduler_.start(cfg);
@@ -62,54 +62,10 @@ void DistWorker::close() {
 }
 
 // =============================================================================
-// Orchestrator-facing API
-// =============================================================================
-
-DistSubmitResult DistWorker::submit(
-    WorkerType worker_type, const WorkerPayload &base_payload, const std::vector<DistInputSpec> &inputs,
-    const std::vector<DistOutputSpec> &outputs
-) {
-    active_tasks_.fetch_add(1, std::memory_order_relaxed);
-    return orchestrator_.submit(worker_type, base_payload, inputs, outputs);
-}
-
-DistSubmitResult DistWorker::submit_group(
-    WorkerType worker_type, const WorkerPayload &base_payload, const std::vector<const void *> &args_list,
-    const std::vector<DistInputSpec> &inputs, const std::vector<DistOutputSpec> &outputs
-) {
-    active_tasks_.fetch_add(1, std::memory_order_relaxed);
-    return orchestrator_.submit_group(worker_type, base_payload, args_list, inputs, outputs);
-}
-
-void DistWorker::scope_begin() { orchestrator_.scope_begin(); }
-void DistWorker::scope_end() { orchestrator_.scope_end(); }
-
-void DistWorker::drain() {
-    std::unique_lock<std::mutex> lk(drain_mu_);
-    drain_cv_.wait(lk, [this] {
-        return active_tasks_.load(std::memory_order_acquire) == 0;
-    });
-}
-
-// =============================================================================
-// on_consumed callback (called from Scheduler thread)
-// =============================================================================
-
-void DistWorker::on_consumed(DistTaskSlot slot) {
-    orchestrator_.on_consumed(slot);
-
-    int32_t remaining = active_tasks_.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (remaining == 0) {
-        std::lock_guard<std::mutex> lk(drain_mu_);
-        drain_cv_.notify_all();
-    }
-}
-
-// =============================================================================
 // IWorker::run() — DistWorker as sub-worker of a higher level (placeholder)
 // =============================================================================
 
 void DistWorker::run(const WorkerPayload & /*payload*/) {
     // Full L4+ support: payload would carry a HostTask* to execute.
-    // For now this is a placeholder; drain() returns immediately when idle.
+    // Placeholder for plan step F.
 }

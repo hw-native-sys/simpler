@@ -1,5 +1,11 @@
 # Task Flow — Callable / TaskArgs / CallConfig Pass-Through
 
+> **Status**: describes the **target** design. The unified `TaskArgs` +
+> tag-driven submit + Orchestrator-owned drain are landed; the
+> `IWorker::run(callable, view, config)` signature and length-prefixed
+> mailbox blob are not yet (target landing: PR-C). See
+> [roadmap.md](roadmap.md) for the full landed-vs-planned breakdown.
+
 This document specifies **what data flows through the hierarchical runtime and
 what shapes it takes at each stage**. It covers:
 

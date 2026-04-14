@@ -11,11 +11,15 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+
+#include "chip_call_config.h"
 #include "dist_orchestrator.h"
 #include "dist_ring.h"
 #include "dist_scope.h"
 #include "dist_tensormap.h"
 #include "dist_types.h"
+#include "task_args.h"
 
 // ---------------------------------------------------------------------------
 // Fixture: wires the Orchestrator components together (no Scheduler thread)
@@ -30,6 +34,7 @@ struct OrchestratorFixture : public ::testing::Test {
     DistScope scope;
     DistReadyQueue rq;
     DistOrchestrator orch;
+    ChipCallConfig cfg;
 
     void SetUp() override {
         slots = std::make_unique<DistTaskSlotState[]>(N);
@@ -39,12 +44,16 @@ struct OrchestratorFixture : public ::testing::Test {
 
     void TearDown() override { ring.shutdown(); }
 
-    // Submit a NEXT_LEVEL task with the given input/output specs.
-    DistSubmitResult
-    submit_next_level(const std::vector<DistInputSpec> &inputs, const std::vector<DistOutputSpec> &outputs) {
-        WorkerPayload p;
-        p.worker_type = WorkerType::NEXT_LEVEL;
-        return orch.submit(WorkerType::NEXT_LEVEL, p, inputs, outputs);
+    // Helper: build a TaskArgs whose only tensor has the given (data, tag).
+    static TaskArgs single_tensor_args(uint64_t data_ptr, TensorArgType tag) {
+        TaskArgs a;
+        ContinuousTensor t{};
+        t.data = data_ptr;
+        t.ndims = 1;
+        t.shapes[0] = 1;
+        t.dtype = DataType::UINT8;
+        a.add_tensor(t, tag);
+        return a;
     }
 };
 
@@ -53,10 +62,9 @@ struct OrchestratorFixture : public ::testing::Test {
 // ---------------------------------------------------------------------------
 
 TEST_F(OrchestratorFixture, IndependentTaskIsImmediatelyReady) {
-    auto res = submit_next_level({}, {{64}});
+    auto a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level(/*callable=*/0xDEAD, a, cfg);
     EXPECT_NE(res.task_slot, DIST_INVALID_SLOT);
-    ASSERT_EQ(res.outputs.size(), 1u);
-    EXPECT_NE(res.outputs[0].ptr, nullptr);
 
     DistTaskSlot slot;
     EXPECT_TRUE(rq.try_pop(slot));
@@ -65,15 +73,15 @@ TEST_F(OrchestratorFixture, IndependentTaskIsImmediatelyReady) {
 }
 
 TEST_F(OrchestratorFixture, DependentTaskIsPending) {
-    // Task A produces a buffer
-    auto a = submit_next_level({}, {{128}});
+    // Task A produces an OUTPUT at key 0xBEEF
+    auto args_a = single_tensor_args(0xBEEF, TensorArgType::OUTPUT);
+    auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
     DistTaskSlot a_slot;
-    rq.try_pop(a_slot);  // drain ready queue
+    rq.try_pop(a_slot);
 
-    uint64_t a_out = reinterpret_cast<uint64_t>(a.outputs[0].ptr);
-
-    // Task B depends on A's output
-    auto b = submit_next_level({{a_out}}, {{64}});
+    // Task B reads INPUT at the same key — depends on A
+    auto args_b = single_tensor_args(0xBEEF, TensorArgType::INPUT);
+    auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
     EXPECT_EQ(slots[b.task_slot].state.load(), TaskState::PENDING);
     EXPECT_EQ(slots[b.task_slot].fanin_count, 1);
 
@@ -82,56 +90,78 @@ TEST_F(OrchestratorFixture, DependentTaskIsPending) {
 }
 
 TEST_F(OrchestratorFixture, TensorMapTracksProducer) {
-    auto a = submit_next_level({}, {{256}});
+    auto args_a = single_tensor_args(0x1234, TensorArgType::OUTPUT);
+    auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
     DistTaskSlot drain_slot;
     rq.try_pop(drain_slot);
 
-    uint64_t key = reinterpret_cast<uint64_t>(a.outputs[0].ptr);
-    EXPECT_EQ(tm.lookup(key), a.task_slot);
+    EXPECT_EQ(tm.lookup(0x1234), a.task_slot);
 }
 
 TEST_F(OrchestratorFixture, OnConsumedCleansUpTensorMap) {
-    auto a = submit_next_level({}, {{64}});
+    auto args_a = single_tensor_args(0x42, TensorArgType::OUTPUT);
+    auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
     DistTaskSlot slot;
     rq.try_pop(slot);
 
-    uint64_t key = reinterpret_cast<uint64_t>(a.outputs[0].ptr);
-    EXPECT_EQ(tm.lookup(key), slot);
+    EXPECT_EQ(tm.lookup(0x42), slot);
 
-    // Simulate task completion + consumed
     slots[slot].state.store(TaskState::COMPLETED, std::memory_order_relaxed);
     orch.on_consumed(slot);
 
-    EXPECT_EQ(tm.lookup(key), DIST_INVALID_SLOT);
+    EXPECT_EQ(tm.lookup(0x42), DIST_INVALID_SLOT);
     EXPECT_EQ(slots[slot].state.load(), TaskState::CONSUMED);
 }
 
 TEST_F(OrchestratorFixture, ScopeRegistersAndReleasesRef) {
     orch.scope_begin();
-    auto a = submit_next_level({}, {{64}});
+    auto args_a = single_tensor_args(0x77, TensorArgType::OUTPUT);
+    auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
     DistTaskSlot slot;
     rq.try_pop(slot);
 
-    // Inside scope: fanout_total should be 1 (scope ref)
     {
         std::lock_guard<std::mutex> lk(slots[slot].fanout_mu);
         EXPECT_EQ(slots[slot].fanout_total, 1);
     }
 
-    // scope_end releases the scope ref; if task is completed it becomes consumed
+    // Simulate the completion path that would run if this test drove the
+    // full scheduler: state -> COMPLETED + the self try_consume that
+    // on_task_complete would normally fire (bumps fanout_released by 1).
+    // Without this simulated self-release, the `>= total + 1` threshold in
+    // release_ref / try_consume cannot be met from scope_end alone.
     slots[slot].state.store(TaskState::COMPLETED, std::memory_order_relaxed);
+    slots[slot].fanout_released.fetch_add(1, std::memory_order_relaxed);
     orch.scope_end();
 
-    // After scope_end the consumed callback should have fired
     EXPECT_EQ(slots[slot].state.load(), TaskState::CONSUMED);
 }
 
-TEST_F(OrchestratorFixture, MultipleOutputsAllocated) {
-    auto res = submit_next_level({}, {{32}, {64}, {128}});
-    ASSERT_EQ(res.outputs.size(), 3u);
-    EXPECT_EQ(res.outputs[0].size, 32u);
-    EXPECT_EQ(res.outputs[1].size, 64u);
-    EXPECT_EQ(res.outputs[2].size, 128u);
-    for (const auto &o : res.outputs)
-        EXPECT_NE(o.ptr, nullptr);
+TEST_F(OrchestratorFixture, NoDepTagSkipsDependencyTracking) {
+    // OUTPUT-tagged input registers a producer
+    auto args_a = single_tensor_args(0xAAAA, TensorArgType::OUTPUT);
+    auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
+    DistTaskSlot drain_slot;
+    rq.try_pop(drain_slot);
+
+    // Second task references same key but tagged NO_DEP — should be independent
+    auto args_b = single_tensor_args(0xAAAA, TensorArgType::NO_DEP);
+    auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
+    EXPECT_EQ(slots[b.task_slot].state.load(), TaskState::READY);
+    EXPECT_EQ(slots[b.task_slot].fanin_count, 0);
+}
+
+TEST_F(OrchestratorFixture, GroupTaskHasAllChipStorageEntries) {
+    TaskArgs a0 = single_tensor_args(0xA0, TensorArgType::OUTPUT);
+    TaskArgs a1 = single_tensor_args(0xA1, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
+
+    EXPECT_NE(res.task_slot, DIST_INVALID_SLOT);
+    EXPECT_TRUE(slots[res.task_slot].is_group());
+    EXPECT_EQ(slots[res.task_slot].group_size(), 2);
+    EXPECT_EQ(slots[res.task_slot].chip_storage_list.size(), 2u);
+
+    // Both keys registered as producers for the group slot.
+    EXPECT_EQ(tm.lookup(0xA0), res.task_slot);
+    EXPECT_EQ(tm.lookup(0xA1), res.task_slot);
 }
