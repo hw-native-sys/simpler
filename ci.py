@@ -60,17 +60,7 @@ from queue import Empty, Queue
 from threading import Lock, Thread
 from typing import Any, Callable, Protocol, cast
 
-# ---------------------------------------------------------------------------
-# Path setup — mirrors run_example.py
-# ---------------------------------------------------------------------------
 PROJECT_ROOT = Path(__file__).resolve().parent
-SCRIPTS_DIR = PROJECT_ROOT / "examples" / "scripts"
-PYTHON_DIR = PROJECT_ROOT / "python"
-GOLDEN_DIR = PROJECT_ROOT / "golden"
-
-for d in (PYTHON_DIR, SCRIPTS_DIR, GOLDEN_DIR):
-    if d.exists() and str(d) not in sys.path:
-        sys.path.insert(0, str(d))
 
 from simpler.task_interface import (  # noqa: E402  # type: ignore[import-not-found]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
@@ -202,7 +192,7 @@ def _read_task_list_json(task_list_path: str | None) -> set[str] | None:
 
 
 def _discover_runtimes_for_platform(platform: str) -> list[str]:
-    from platform_info import discover_runtimes, parse_platform  # noqa: PLC0415
+    from simpler_setup.platform_info import discover_runtimes, parse_platform  # noqa: PLC0415
 
     arch, _ = parse_platform(platform)
     return discover_runtimes(arch)
@@ -210,7 +200,7 @@ def _discover_runtimes_for_platform(platform: str) -> list[str]:
 
 def discover_tasks(platform: str, runtime_filter: str | None = None) -> list[TaskSpec]:
     """Scan examples/ and tests/st/ for test directories matching the given platform."""
-    from platform_info import parse_platform  # noqa: PLC0415
+    from simpler_setup.platform_info import parse_platform  # noqa: PLC0415
 
     arch, variant = parse_platform(platform)
     is_sim = variant == "sim"
@@ -274,7 +264,7 @@ def discover_tasks(platform: str, runtime_filter: str | None = None) -> list[Tas
 
 
 def ensure_pto_isa(commit: str | None, clone_protocol: str) -> str:
-    from code_runner import _ensure_pto_isa_root  # noqa: PLC0415
+    from simpler_setup.code_runner import _ensure_pto_isa_root  # noqa: PLC0415
 
     root = _ensure_pto_isa_root(verbose=True, commit=commit, clone_protocol=clone_protocol)
     if root is None:
@@ -298,10 +288,9 @@ def compile_task(
     run_all_cases: bool = False,
 ) -> CompiledTask:
     """Compile orchestration + kernels for a single task, return CompiledTask."""
-    from runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
     from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
     from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
+    from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
     # Load kernel_config and golden
     kc = _load_module(spec.kernels_dir / "kernel_config.py", f"kc_{id(spec)}")
@@ -314,7 +303,7 @@ def compile_task(
     compiler = KernelCompiler(platform=spec.platform)
 
     # Resolve runtime include dirs
-    from platform_info import parse_platform  # noqa: PLC0415
+    from simpler_setup.platform_info import parse_platform  # noqa: PLC0415
 
     arch, _ = parse_platform(spec.platform)
     runtime_base = PROJECT_ROOT / "src" / arch / "runtime" / spec.runtime_name
@@ -434,7 +423,8 @@ def run_single_task(
 
     import numpy as np  # noqa: PLC0415
     import torch  # noqa: PLC0415
-    from code_runner import _kernel_config_runtime_env, _temporary_env  # noqa: PLC0415
+
+    from simpler_setup.code_runner import _kernel_config_runtime_env, _temporary_env  # noqa: PLC0415
 
     golden_mod = cast(GoldenModuleLike, task.golden_module)
     kc = task.kernel_config
@@ -962,7 +952,7 @@ def print_summary(results: list[TaskResult]) -> int:
 
 def reset_pto_isa(commit: str, clone_protocol: str) -> str:
     """Checkout PTO-ISA at the pinned commit (or re-clone if needed)."""
-    from code_runner import _checkout_pto_isa_commit, _get_pto_isa_clone_path  # noqa: PLC0415
+    from simpler_setup.code_runner import _checkout_pto_isa_commit, _get_pto_isa_clone_path  # noqa: PLC0415
 
     clone_path = _get_pto_isa_clone_path()
     if clone_path.exists():

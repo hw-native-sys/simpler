@@ -52,9 +52,9 @@ skip-magic-trailing-comma = false
 line-ending = "lf"
 
 [tool.pyright]
-include = ["python", "tests", "examples/scripts"]
+include = ["python", "simpler_setup", "tests", "examples/scripts"]
 exclude = ["**/__pycache__", "build", "dist", "tests/st"]
-extraPaths = ["python", "examples/scripts"]
+extraPaths = ["python"]
 typeCheckingMode = "basic"
 pythonVersion = "3.9"
 reportMissingImports = false
@@ -68,18 +68,11 @@ reportRedeclaration = false
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "examples"]
-pythonpath = ["python", "golden"]
 addopts = "--import-mode=importlib"
 
 [tool.scikit-build]
 wheel.packages = ["simpler_setup", "python/simpler"]
-wheel.exclude = [
-    "simpler/elf_parser.py",
-    "simpler/kernel_compiler.py",
-    "simpler/runtime_compiler.py",
-    "simpler/toolchain.py",
-]
 cmake.build-type = "Release"
 build-dir = "build/{wheel_tag}"
-editable.rebuild = true
+editable.rebuild = false
 editable.verbose = true

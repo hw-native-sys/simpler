@@ -40,13 +40,7 @@ import sys
 import time
 from pathlib import Path
 
-# Get script and project directories
-script_dir = Path(__file__).parent.resolve()
-project_root = script_dir.parent.parent
-golden_dir = project_root / "golden"
-if golden_dir.exists():
-    sys.path.insert(0, str(golden_dir))
-sys.path.insert(0, str(script_dir))
+project_root = Path(__file__).parent.parent.parent
 
 logger = logging.getLogger(__name__)
 
@@ -257,7 +251,7 @@ Golden.py interface:
 
     # Import and run
     try:
-        from code_runner import create_code_runner  # noqa: PLC0415
+        from simpler_setup.code_runner import create_code_runner  # noqa: PLC0415
 
         runner = create_code_runner(
             kernels_dir=str(args.kernels),

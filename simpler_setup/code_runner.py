@@ -19,7 +19,7 @@ Usage:
     python examples/scripts/run_example.py --kernels ./my_test/kernels --golden ./my_test/golden.py
 
     # In Python
-    from code_runner import CodeRunner
+    from simpler_setup.code_runner import CodeRunner
     runner = CodeRunner("./kernels", "./golden.py")
     runner.run()
 
@@ -129,8 +129,8 @@ def _load_module_from_path(module_path: Path, module_name: str):
 
 
 def _get_project_root() -> Path:
-    """Get the project root directory."""
-    return Path(__file__).parent.parent.parent  # examples/scripts/ -> examples/ -> simpler/
+    """Get the project root directory (one level above simpler_setup/)."""
+    return Path(__file__).parent.parent
 
 
 def _get_pto_isa_clone_path() -> Path:
@@ -707,10 +707,9 @@ class CodeRunner:
            - Compare with golden
         """
         # Import runtime modules (deferred import to avoid top-level dependency)
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
-
-        from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
-        from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
+        from .elf_parser import extract_text_section  # noqa: PLC0415
+        from .kernel_compiler import KernelCompiler  # noqa: PLC0415
+        from .runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
         pto_isa_root = _ensure_pto_isa_root(

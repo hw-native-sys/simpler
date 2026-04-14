@@ -10,11 +10,11 @@
 """Paged attention unroll: production-scale with unrolled orchestration."""
 
 import torch
-from paged_attention_golden import compute_golden as _pa_compute_golden
-from paged_attention_golden import generate_inputs as _pa_generate_inputs
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden
+from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")

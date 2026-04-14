@@ -39,7 +39,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: build/cache
-          key: cmake-sim-${{ runner.os }}-${{ hashFiles('src/**/CMakeLists.txt', 'src/**/build_config.py', 'python/runtime_compiler.py') }}
+          key: cmake-sim-${{ runner.os }}-${{ hashFiles('src/**/CMakeLists.txt', 'src/**/build_config.py', 'simpler_setup/runtime_compiler.py') }}
           restore-keys: |
             cmake-sim-${{ runner.os }}-
 
@@ -50,6 +50,54 @@ jobs:
         uses: pre-commit/action@v3.0.0
         with:
           extra_args: --from-ref ${{ github.event.pull_request.base.sha }} --to-ref ${{ github.event.pull_request.head.sha }}
+
+  # ---------- Packaging matrix: 5 install paths × 4 entry points, on macOS + Ubuntu ----------
+  # Smoke-checks that every supported install path exposes the four user entry points.
+  # Each mode is wiped to a fully clean state (no caches) so a previous mode's
+  # build artifacts cannot mask a regression in the next mode. Slow but reliable.
+  # See docs/python-packaging.md and tools/verify_packaging.sh.
+  packaging-matrix:
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python-version: ['3.10']
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up C++ compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++
+
+      - name: Set up C++ compiler (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install ninja cmake
+          brew install gcc@15 || brew install gcc
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install build + runtime deps in venv
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install scikit-build-core nanobind cmake
+          pip install numpy ml_dtypes pytest
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Run packaging matrix (5 modes × 4 entry points, fully isolated)
+        run: |
+          . .venv/bin/activate
+          bash tools/verify_packaging.sh
 
   # ---------- Python unit tests (no hardware) ----------
   ut-py:
@@ -244,13 +292,13 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          pip install .
+          pip install '.[test]'
 
       - name: Run hardware unit tests (a2a3)
         run: |
           source .venv/bin/activate
           export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest tests -m requires_hardware --platform a2a3 -v
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python -m pytest tests -m requires_hardware --platform a2a3 -v
 
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
@@ -266,7 +314,7 @@ jobs:
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          pip install .
+          pip install '.[test]'
 
       - name: Run on-device examples (a2a3)
         run: |
@@ -278,7 +326,7 @@ jobs:
         run: |
           source .venv/bin/activate
           export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v
 
 
   # ---------- Detect A5 changes (runs on GitHub server, not A5 machine) ----------
@@ -346,7 +394,7 @@ jobs:
       - name: Build nanobind extension
         run: |
           source ${ASCEND_HOME_PATH}/bin/setenv.bash
-          pip install .
+          pip install '.[test]'
 
       - name: Run on-device examples (a5)
         run: |
@@ -358,4 +406,4 @@ jobs:
       - name: Run pytest scene tests (a5)
         run: |
           export PATH="$HOME/.local/bin:$PATH"
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v

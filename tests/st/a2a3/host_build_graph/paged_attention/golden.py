@@ -13,11 +13,11 @@ Args layout: [query, key_cache, value_cache, block_table, context_lens, out, sca
   - scale is a scalar float parameter
 """
 
-from paged_attention_golden import (
+from simpler_setup.goldens.paged_attention import (
     compute_golden,  # noqa: F401
     run_golden_test,
 )
-from paged_attention_golden import generate_inputs as _generate_inputs
+from simpler_setup.goldens.paged_attention import generate_inputs as _generate_inputs
 
 __outputs__ = ["out"]
 

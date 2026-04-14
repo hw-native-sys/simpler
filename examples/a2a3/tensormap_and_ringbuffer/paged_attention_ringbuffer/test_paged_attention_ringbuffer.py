@@ -14,11 +14,11 @@ INOUT tensors, bfloat16, and AIC+AIV mixed execution.
 """
 
 import torch
-from paged_attention_golden import compute_golden as _pa_compute_golden  # noqa: PLC0415
-from paged_attention_golden import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden  # noqa: PLC0415
+from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
 
 PA_KERNELS = "../batch_paged_attention/kernels"
 

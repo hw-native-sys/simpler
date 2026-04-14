@@ -36,16 +36,10 @@ import struct
 import sys
 from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
-from pathlib import Path
 from typing import Any, Callable, Optional
 
-# Make sure examples/scripts is importable for runtime_builder
-_SCRIPTS = str(Path(__file__).parent.parent.parent / "examples" / "scripts")
-if _SCRIPTS not in sys.path:
-    sys.path.insert(0, _SCRIPTS)
-
-from .orchestrator import Orchestrator  # noqa: E402
-from .task_interface import (  # noqa: E402
+from .orchestrator import Orchestrator
+from .task_interface import (
     DIST_CHIP_MAILBOX_SIZE,
     DIST_SUB_MAILBOX_SIZE,
     ChipWorker,
@@ -247,7 +241,7 @@ class Worker:
         self._initialized = True
 
     def _init_level2(self) -> None:
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         platform = self._config["platform"]
         runtime = self._config["runtime"]
@@ -278,7 +272,7 @@ class Worker:
 
         # 2. Prepare chip-worker config (but do NOT fork yet — deferred to _start_level3)
         if device_ids:
-            from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+            from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
             from .task_interface import ChipStorageTaskArgs as _CSA  # noqa: PLC0415
 

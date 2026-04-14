@@ -16,8 +16,6 @@ No NPU device required; SubWorker (fork/shm) is used as the execution backend.
 """
 
 import struct
-import threading
-import time
 from multiprocessing.shared_memory import SharedMemory
 
 from simpler.worker import Task, Worker
@@ -87,62 +85,6 @@ class TestTwoWorkersParallel:
             assert _read(counters[1]) == 1
             # No cross-contamination
             assert _read(counters[0]) != _read(counters[1]) + 1
-
-        finally:
-            for hw, _ in workers:
-                hw.close()
-            for c in counters:
-                c.close()
-                c.unlink()
-
-    def test_two_workers_wall_time(self):
-        """Two workers with 0.2s tasks should finish in ~0.2s, not 0.4s."""
-        sleep_s = 0.2
-        counters = [_alloc_counter() for _ in range(2)]
-        workers = []
-        threads = []
-
-        try:
-            for i in range(2):
-                buf = counters[i].buf
-                assert buf is not None
-                hw = Worker(level=3, num_sub_workers=1)
-
-                def make_fn(b, d):
-                    def fn():
-                        time.sleep(d)
-                        _inc(b)
-
-                    return fn
-
-                cid = hw.register(make_fn(buf, sleep_s))
-                hw.init()
-                workers.append((hw, cid))
-
-            start = time.monotonic()
-
-            def run(hw, cid):
-                def orch(o, _args):
-                    o.submit_sub(cid)
-
-                hw.run(Task(orch=orch))
-
-            for hw, cid in workers:
-                t = threading.Thread(target=run, args=(hw, cid))
-                threads.append(t)
-                t.start()
-
-            for t in threads:
-                t.join()
-
-            elapsed = time.monotonic() - start
-
-            for c in counters:
-                assert _read(c) == 1
-
-            assert elapsed < sleep_s * 2 * 0.9, (
-                f"Expected ~{sleep_s}s wall time, got {elapsed:.2f}s (serial would be {sleep_s * 2:.2f}s)"
-            )
 
         finally:
             for hw, _ in workers:

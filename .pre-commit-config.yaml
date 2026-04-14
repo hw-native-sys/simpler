@@ -43,10 +43,20 @@ repos:
 
     - repo: local
       hooks:
+        # `language: system` (not `python`) is intentional: clang_tidy.py imports
+        # simpler_setup, which is the project itself. With `language: python`,
+        # pre-commit creates an isolated venv that doesn't see the project install
+        # and the hook fails with ModuleNotFoundError. `system` reuses whatever
+        # python is on PATH — in CI that's setup-python's interpreter (where
+        # `pip install .` ran in an earlier step); locally it's the activated
+        # `.venv` (where `pip install -e .` ran). Pre-installing the project in an
+        # isolated hook venv would technically work but triggers a full C++ build
+        # (cmake + ninja + nanobind + build_runtimes for all sim variants) and
+        # forces every Python-only contributor to install a C++ toolchain.
         - id: clang-tidy
           name: clang-tidy
           entry: python tests/lint/clang_tidy.py
-          language: python
+          language: system
           types_or: [c++, c]
           exclude: |
             (?x)^(

@@ -28,13 +28,7 @@ _ROOT = Path(__file__).resolve().parents[2]
 _BUILD_RUNTIMES = _ROOT / "examples" / "scripts" / "build_runtimes.py"
 _CACHE_DIR = _ROOT / "build" / "cache"
 
-for _import_dir in (_ROOT / "python", _ROOT / "examples" / "scripts"):
-    _import_dir_str = str(_import_dir)
-    if _import_dir_str not in sys.path:
-        sys.path.insert(0, _import_dir_str)
-
-from platform_info import load_build_config, to_platform  # noqa: E402
-
+from simpler_setup.platform_info import load_build_config, to_platform  # noqa: E402
 from simpler_setup.runtime_compiler import RuntimeCompiler  # noqa: E402
 
 # Suppress compiler flags that are valid for GCC but unknown to clang.
