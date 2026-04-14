@@ -394,7 +394,6 @@ struct PTO2TaskPayload {
                 );
                 result.materialize_output(tensors[i]);
             }
-            tensors[i].update_start_offset();
         }
         // Round up to cache line boundary. Both arrays are 1024B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
@@ -449,6 +448,7 @@ struct alignas(64) PTO2TaskSlotState {
     uint8_t active_mask;                     // Bitmask of active subtask slots (set once)
     std::atomic<uint8_t> subtask_done_mask;  // Deprecated: superseded by completed_subtasks
     uint8_t ring_id;                         // Ring layer this task belongs to (for per-ring reclamation)
+    int8_t scope_depth{-1};                  // Submission scope depth for O(1) explicit-dep validation
     int32_t dep_pool_mark{0};  // Dep pool top after this task's submission (orchestrator-only, local memory)
 
     // SPMD multi-block (occupies the 8 tail bytes previously implicit padding)

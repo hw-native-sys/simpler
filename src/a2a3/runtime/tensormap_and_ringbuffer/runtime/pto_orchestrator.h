@@ -65,6 +65,8 @@ struct PTO2OrchestratorState {
     int32_t *scope_begins;            // scope_begins[i] = start index of scope i in scope_tasks
     int32_t scope_stack_top;          // Current top of stack (-1 = no scope open)
     uint64_t scope_stack_capacity;    // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
+    uint64_t next_scope_epoch{0};
+    uint64_t scope_epochs[PTO2_MAX_SCOPE_DEPTH]{};
     PTO2ScopeMode scope_modes[PTO2_MAX_SCOPE_DEPTH]{};
     int32_t current_manual_scope_depth{-1};
 

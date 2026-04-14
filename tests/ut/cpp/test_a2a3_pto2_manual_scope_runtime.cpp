@@ -92,4 +92,100 @@ TEST_F(ManualScopeRuntimeTest, RuntimeOutputsRecordManualScopeMetadata) {
     EXPECT_EQ(out.producer_manual_scope_depth, 0);
 }
 
+TEST_F(ManualScopeRuntimeTest, TaskSlotRecordsSubmissionScopeDepth) {
+    pto2_scope_begin(&rt_->orchestrator, PTO2ScopeMode::MANUAL);
+
+    TensorCreateInfo outer_ci = make_create_info();
+    Arg outer_args;
+    outer_args.add_output(outer_ci);
+    TaskSubmitResult outer = pto2_alloc_tensors(&rt_->orchestrator, outer_args);
+    ASSERT_TRUE(outer.task_id().is_valid());
+
+    pto2_scope_begin(&rt_->orchestrator, PTO2ScopeMode::AUTO);
+
+    TensorCreateInfo inner_ci = make_create_info();
+    Arg inner_args;
+    inner_args.add_output(inner_ci);
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+
+    TaskSubmitResult inner = pto2_submit_mixed_task(&rt_->orchestrator, kernels, inner_args);
+    ASSERT_FALSE(rt_->orchestrator.fatal);
+    ASSERT_TRUE(inner.task_id().is_valid());
+
+    PTO2TaskSlotState &outer_slot =
+        rt_->scheduler.ring_sched_states[outer.task_id().ring()].get_slot_state_by_task_id(outer.task_id().local());
+    PTO2TaskSlotState &inner_slot =
+        rt_->scheduler.ring_sched_states[inner.task_id().ring()].get_slot_state_by_task_id(inner.task_id().local());
+
+    EXPECT_EQ(outer_slot.scope_depth, 0);
+    EXPECT_EQ(inner_slot.scope_depth, 1);
+}
+
+TEST_F(ManualScopeRuntimeTest, ExplicitDepRejectsTaskFromOuterScope) {
+    pto2_scope_begin(&rt_->orchestrator, PTO2ScopeMode::MANUAL);
+
+    TensorCreateInfo outer_ci = make_create_info();
+    Arg outer_args;
+    outer_args.add_output(outer_ci);
+    TaskSubmitResult outer = pto2_alloc_tensors(&rt_->orchestrator, outer_args);
+    ASSERT_TRUE(outer.task_id().is_valid());
+
+    pto2_scope_begin(&rt_->orchestrator, PTO2ScopeMode::AUTO);
+
+    TensorCreateInfo inner_ci = make_create_info();
+    Arg inner_args;
+    inner_args.add_output(inner_ci);
+    inner_args.add_dep(outer.task_id());
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+
+    TaskSubmitResult inner = pto2_submit_mixed_task(&rt_->orchestrator, kernels, inner_args);
+    EXPECT_TRUE(rt_->orchestrator.fatal);
+    EXPECT_TRUE(inner.empty());
+}
+
+TEST_F(ManualScopeRuntimeTest, ExplicitDepRejectsTaskFromClosedScopeAtSameDepth) {
+    pto2_scope_begin(&rt_->orchestrator, PTO2ScopeMode::MANUAL);
+
+    TensorCreateInfo first_ci = make_create_info();
+    Arg first_args;
+    first_args.add_output(first_ci);
+    TaskSubmitResult first = pto2_alloc_tensors(&rt_->orchestrator, first_args);
+    ASSERT_TRUE(first.task_id().is_valid());
+
+    pto2_scope_end(&rt_->orchestrator);
+    ASSERT_FALSE(rt_->orchestrator.fatal);
+
+    pto2_scope_begin(&rt_->orchestrator, PTO2ScopeMode::MANUAL);
+
+    TensorCreateInfo second_ci = make_create_info();
+    Arg second_args;
+    second_args.add_output(second_ci);
+    second_args.add_dep(first.task_id());
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+
+    TaskSubmitResult second = pto2_submit_mixed_task(&rt_->orchestrator, kernels, second_args);
+    EXPECT_TRUE(rt_->orchestrator.fatal);
+    EXPECT_TRUE(second.empty());
+}
+
+TEST_F(ManualScopeRuntimeTest, ViewCachesStartOffsetEagerly) {
+    pto2_scope_begin(&rt_->orchestrator, PTO2ScopeMode::MANUAL);
+
+    uint32_t shapes[2] = {8, 8};
+    TensorCreateInfo create_info(shapes, 2, DataType::FLOAT32);
+    Arg args;
+    args.add_output(create_info);
+    TaskSubmitResult outputs = pto2_alloc_tensors(&rt_->orchestrator, args);
+    ASSERT_EQ(outputs.size(), 1u);
+
+    uint32_t view_shapes[2] = {2, 3};
+    uint32_t view_offsets[2] = {2, 3};
+    Tensor view = outputs.get_ref(0).view(view_shapes, view_offsets);
+
+    EXPECT_EQ(view.start_offset, 19u);
+}
+
 }  // namespace
