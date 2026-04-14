@@ -51,6 +51,10 @@ python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
     -p a2a3 --enable-profiling
 
+# Tensor dump
+python tests/st/a2a3/tensormap_and_ringbuffer/alternating_matmul_add/test_alternating_matmul_add.py \
+    -p a2a3 -d 11 --dump-tensor
+
 # Single example via run_example.py (deprecated — prefer test_*.py standalone)
 python examples/scripts/run_example.py \
     -k examples/a2a3/host_build_graph/vector_example/kernels \
@@ -95,6 +99,7 @@ pytest --platform a2a3sim --log-level debug                        # verbose C++
 python test_xxx.py -p a2a3sim                                    # default: 1 round + golden
 python test_xxx.py -p a2a3 -d 0 -n 100 --skip-golden            # benchmark mode
 python test_xxx.py -p a2a3 --enable-profiling                    # profiling (first round)
+python test_xxx.py -p a2a3 --dump-tensor                         # dump per-task tensor I/O
 python test_xxx.py -p a2a3sim --build                            # compile runtime from source
 python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
 ```
@@ -106,6 +111,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--rounds N` | `-n` | 1 | Run each case N times |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
 | `--enable-profiling` | | false | Enable profiling on first round only |
+| `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
 | `--build` | | false | Compile runtime from source (not pre-built) |
 | `--log-level LEVEL` | | (none) | Set `PTO_LOG_LEVEL` env var (`error`/`warn`/`info`/`debug`) |
 

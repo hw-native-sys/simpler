@@ -143,6 +143,52 @@ inline double cycles_to_us(uint64_t cycles) {
 }
 
 // =============================================================================
+// Tensor Dump Configuration
+// =============================================================================
+
+/**
+ * Number of TensorDumpRecord entries per DumpMetaBuffer.
+ * Each record is 128 bytes, so one buffer = RECORDS * 128 bytes.
+ */
+constexpr int PLATFORM_DUMP_RECORDS_PER_BUFFER = 256;
+
+/**
+ * Pre-allocated DumpMetaBuffer count per AICPU scheduling thread.
+ * Pushed into the per-thread SPSC free_queue at init.
+ */
+constexpr int PLATFORM_DUMP_BUFFERS_PER_THREAD = 8;
+
+/**
+ * SPSC free_queue slot count for dump metadata buffers.
+ */
+constexpr int PLATFORM_DUMP_SLOT_COUNT = 4;
+
+/**
+ * Expected average tensor size in bytes.
+ * Used together with BUFFERS_PER_THREAD and RECORDS_PER_BUFFER to compute
+ * per-thread arena size:
+ *   arena = BUFFERS_PER_THREAD * RECORDS_PER_BUFFER * AVG_TENSOR_BYTES
+ * Default: 4 * 256 * 65536 = 64 MB per thread.
+ */
+constexpr uint64_t PLATFORM_DUMP_AVG_TENSOR_BYTES = 65536;
+
+/**
+ * Maximum tensor dimensions (matches RUNTIME_MAX_TENSOR_DIMS).
+ */
+constexpr int PLATFORM_DUMP_MAX_DIMS = 5;
+
+/**
+ * Ready queue capacity for dump data.
+ * Sized to hold all dump buffers across all threads.
+ */
+constexpr int PLATFORM_DUMP_READYQUEUE_SIZE = PLATFORM_MAX_AICPU_THREADS * PLATFORM_DUMP_BUFFERS_PER_THREAD * 2;
+
+/**
+ * Idle timeout duration for tensor dump collection (seconds)
+ */
+constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
+
+// =============================================================================
 // Register Communication Configuration
 // =============================================================================
 

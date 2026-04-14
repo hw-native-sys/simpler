@@ -541,10 +541,12 @@ NB_MODULE(_task_interface, m) {
         .def_rw("block_dim", &ChipCallConfig::block_dim)
         .def_rw("aicpu_thread_num", &ChipCallConfig::aicpu_thread_num)
         .def_rw("enable_profiling", &ChipCallConfig::enable_profiling)
+        .def_rw("enable_dump_tensor", &ChipCallConfig::enable_dump_tensor)
         .def("__repr__", [](const ChipCallConfig &self) -> std::string {
             std::ostringstream os;
             os << "ChipCallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
-               << ", enable_profiling=" << (self.enable_profiling ? "True" : "False") << ")";
+               << ", enable_profiling=" << (self.enable_profiling ? "True" : "False")
+               << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False") << ")";
             return os.str();
         });
 

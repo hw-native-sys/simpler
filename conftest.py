@@ -69,6 +69,7 @@ def pytest_addoption(parser):
     parser.addoption(
         "--enable-profiling", action="store_true", default=False, help="Enable profiling (first round only)"
     )
+    parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
     parser.addoption("--build", action="store_true", default=False, help="Compile runtime from source")
 
 

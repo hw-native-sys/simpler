@@ -35,6 +35,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
 
 #include "callable.h"
 #include "orchestration_api.h"
@@ -46,14 +47,82 @@ namespace {
 struct OrchestrationRuntimeImpl {
     const OrchestrationRuntimeOps *ops;
     Runtime *runtime;
+    struct TensorInfoBuilder *tensor_info_builder;
+    struct TensorAllocationBuilder *tensor_allocation_builder;
+};
+
+struct TensorInfoBuilder {
+    std::vector<std::vector<TensorInfo>> tensor_info_by_task;
+
+    int set_tensor_info_to_task(int task_id, const TensorInfo *tensor_info, int tensor_count) {
+        if (task_id < 0 || tensor_count < 0 || tensor_count > RUNTIME_MAX_ARGS) {
+            return -1;
+        }
+        if (static_cast<size_t>(task_id) >= tensor_info_by_task.size()) {
+            tensor_info_by_task.resize(static_cast<size_t>(task_id) + 1);
+        }
+        std::vector<TensorInfo> &task_info = tensor_info_by_task[static_cast<size_t>(task_id)];
+        task_info.assign(tensor_info, tensor_info + tensor_count);
+        return 0;
+    }
+};
+
+struct TensorAllocationBuilder {
+    std::vector<TensorAllocationInfo> allocations;
+
+    void record_allocation(void *ptr, size_t size) {
+        if (ptr == nullptr || size == 0) {
+            return;
+        }
+        allocations.push_back({reinterpret_cast<uint64_t>(ptr), static_cast<uint64_t>(size)});
+    }
+
+    void erase_allocation(void *ptr) {
+        if (ptr == nullptr) {
+            return;
+        }
+        uint64_t base_addr = reinterpret_cast<uint64_t>(ptr);
+        for (auto it = allocations.begin(); it != allocations.end(); ++it) {
+            if (it->base_addr == base_addr) {
+                allocations.erase(it);
+                return;
+            }
+        }
+    }
 };
 
 Runtime *unwrap_runtime(OrchestrationRuntime *runtime) {
     return reinterpret_cast<OrchestrationRuntimeImpl *>(runtime)->runtime;
 }
 
+TensorInfoBuilder *unwrap_tensor_info_builder(OrchestrationRuntime *runtime) {
+    return reinterpret_cast<OrchestrationRuntimeImpl *>(runtime)->tensor_info_builder;
+}
+
+TensorAllocationBuilder *unwrap_tensor_allocation_builder(OrchestrationRuntime *runtime) {
+    return reinterpret_cast<OrchestrationRuntimeImpl *>(runtime)->tensor_allocation_builder;
+}
+
 int runtime_add_task(OrchestrationRuntime *runtime, uint64_t *args, int num_args, int func_id, CoreType core_type) {
     return unwrap_runtime(runtime)->add_task(args, num_args, func_id, core_type);
+}
+
+int runtime_set_tensor_info_to_task(
+    OrchestrationRuntime *runtime, int task_id, const TensorInfo *tensor_info, int tensor_count
+) {
+    Runtime *host_runtime = unwrap_runtime(runtime);
+    if (task_id < 0 || task_id >= host_runtime->get_task_count()) {
+        LOG_ERROR("Invalid task_id %d for task tensor info", task_id);
+        return -1;
+    }
+    if (tensor_count == 0) {
+        return 0;
+    }
+    if (tensor_info == nullptr) {
+        LOG_ERROR("Task %d tensor info pointer is null", task_id);
+        return -1;
+    }
+    return unwrap_tensor_info_builder(runtime)->set_tensor_info_to_task(task_id, tensor_info, tensor_count);
 }
 
 void runtime_add_successor(OrchestrationRuntime *runtime, int from_task, int to_task) {
@@ -69,10 +138,13 @@ int runtime_get_task_count(OrchestrationRuntime *runtime) { return unwrap_runtim
 void runtime_print_runtime(OrchestrationRuntime *runtime) { unwrap_runtime(runtime)->print_runtime(); }
 
 void *runtime_device_malloc(OrchestrationRuntime *runtime, size_t size) {
-    return unwrap_runtime(runtime)->host_api.device_malloc(size);
+    void *ptr = unwrap_runtime(runtime)->host_api.device_malloc(size);
+    unwrap_tensor_allocation_builder(runtime)->record_allocation(ptr, size);
+    return ptr;
 }
 
 void runtime_device_free(OrchestrationRuntime *runtime, void *ptr) {
+    unwrap_tensor_allocation_builder(runtime)->erase_allocation(ptr);
     unwrap_runtime(runtime)->host_api.device_free(ptr);
 }
 
@@ -81,8 +153,9 @@ int runtime_copy_to_device(OrchestrationRuntime *runtime, void *dev_ptr, const v
 }
 
 const OrchestrationRuntimeOps k_orchestration_runtime_ops = {
-    runtime_add_task,      runtime_add_successor, runtime_record_tensor_pair, runtime_get_task_count,
-    runtime_print_runtime, runtime_device_malloc, runtime_device_free,        runtime_copy_to_device,
+    runtime_add_task,       runtime_set_tensor_info_to_task, runtime_add_successor, runtime_record_tensor_pair,
+    runtime_get_task_count, runtime_print_runtime,           runtime_device_malloc, runtime_device_free,
+    runtime_copy_to_device,
 };
 
 bool write_all_bytes(int fd, const uint8_t *data, size_t size) {
@@ -122,6 +195,78 @@ bool create_temp_so_file(const uint8_t *data, size_t size, std::string *out_path
 
     *out_path = path_template;
     return true;
+}
+
+int upload_tensor_info_storage(Runtime *runtime, const TensorInfoBuilder &builder) {
+    runtime->clear_tensor_info_storage();
+    for (int task_id = 0; task_id < RUNTIME_MAX_TASKS; task_id++) {
+        runtime->set_tensor_info_range(task_id, 0, 0);
+    }
+
+    int task_count = runtime->get_task_count();
+    std::vector<TensorInfo> compact_tensor_info;
+    for (int task_id = 0; task_id < task_count; task_id++) {
+        const std::vector<TensorInfo> *task_info = nullptr;
+        if (static_cast<size_t>(task_id) < builder.tensor_info_by_task.size()) {
+            task_info = &builder.tensor_info_by_task[static_cast<size_t>(task_id)];
+        }
+        uint32_t offset = static_cast<uint32_t>(compact_tensor_info.size());
+        uint16_t count = 0;
+        if (task_info != nullptr) {
+            count = static_cast<uint16_t>(task_info->size());
+            compact_tensor_info.insert(compact_tensor_info.end(), task_info->begin(), task_info->end());
+        }
+        runtime->set_tensor_info_range(task_id, offset, count);
+    }
+
+    if (compact_tensor_info.empty()) {
+        return 0;
+    }
+
+    size_t tensor_info_bytes = compact_tensor_info.size() * sizeof(TensorInfo);
+    void *dev_tensor_info_storage = runtime->host_api.device_malloc(tensor_info_bytes);
+    if (dev_tensor_info_storage == nullptr) {
+        LOG_ERROR("Failed to allocate tensor info storage (%zu bytes)", tensor_info_bytes);
+        return -1;
+    }
+
+    int rc = runtime->host_api.copy_to_device(dev_tensor_info_storage, compact_tensor_info.data(), tensor_info_bytes);
+    if (rc != 0) {
+        LOG_ERROR("Failed to copy tensor info storage to device: %d", rc);
+        runtime->host_api.device_free(dev_tensor_info_storage);
+        return rc;
+    }
+
+    runtime->set_tensor_info_storage(dev_tensor_info_storage, tensor_info_bytes);
+    LOG_INFO("Uploaded %zu tensor info entries (%zu bytes)", compact_tensor_info.size(), tensor_info_bytes);
+    return 0;
+}
+
+int upload_tensor_allocation_storage(Runtime *runtime, const TensorAllocationBuilder &builder) {
+    runtime->clear_tensor_allocation_storage();
+    if (builder.allocations.empty()) {
+        return 0;
+    }
+
+    size_t allocation_bytes = builder.allocations.size() * sizeof(TensorAllocationInfo);
+    void *dev_allocation_storage = runtime->host_api.device_malloc(allocation_bytes);
+    if (dev_allocation_storage == nullptr) {
+        LOG_ERROR("Failed to allocate tensor allocation storage (%zu bytes)", allocation_bytes);
+        return -1;
+    }
+
+    int rc = runtime->host_api.copy_to_device(dev_allocation_storage, builder.allocations.data(), allocation_bytes);
+    if (rc != 0) {
+        LOG_ERROR("Failed to copy tensor allocation storage to device: %d", rc);
+        runtime->host_api.device_free(dev_allocation_storage);
+        return rc;
+    }
+
+    runtime->set_tensor_allocation_storage(
+        dev_allocation_storage, static_cast<uint32_t>(builder.allocations.size()), allocation_bytes
+    );
+    LOG_INFO("Uploaded %zu tensor allocation ranges (%zu bytes)", builder.allocations.size(), allocation_bytes);
+    return 0;
 }
 
 }  // namespace
@@ -215,13 +360,37 @@ int init_runtime_impl(Runtime *runtime, const ChipCallable *callable, const Chip
         orch_args->tensor_count(), orch_args->scalar_count()
     );
 
-    OrchestrationRuntimeImpl orchestration_runtime = {&k_orchestration_runtime_ops, runtime};
+    TensorInfoBuilder tensor_info_builder;
+    TensorAllocationBuilder tensor_allocation_builder;
+    OrchestrationRuntimeImpl orchestration_runtime = {
+        &k_orchestration_runtime_ops, runtime, &tensor_info_builder, &tensor_allocation_builder
+    };
 
     // Call orchestration function to build task graph
     // The orchestration function handles device memory allocation and copy-to-device
     int rc = orch_func(reinterpret_cast<OrchestrationRuntime *>(&orchestration_runtime), *orch_args);
     if (rc != 0) {
         LOG_ERROR("Orchestration function failed with code %d", rc);
+        runtime->clear_tensor_pairs();
+        dlclose(handle);
+        return rc;
+    }
+
+    rc = upload_tensor_allocation_storage(runtime, tensor_allocation_builder);
+    if (rc != 0) {
+        LOG_ERROR("Failed to upload tensor allocations: %d", rc);
+        runtime->clear_tensor_pairs();
+        dlclose(handle);
+        return rc;
+    }
+
+    rc = upload_tensor_info_storage(runtime, tensor_info_builder);
+    if (rc != 0) {
+        LOG_ERROR("Failed to upload tensor info storage: %d", rc);
+        if (runtime->get_tensor_allocation_storage() != nullptr) {
+            runtime->host_api.device_free(runtime->get_tensor_allocation_storage());
+            runtime->clear_tensor_allocation_storage();
+        }
         runtime->clear_tensor_pairs();
         dlclose(handle);
         return rc;
@@ -293,6 +462,15 @@ int validate_runtime_impl(Runtime *runtime) {
         LOG_INFO("Freed %d kernel binaries", kernel_count);
     }
     runtime->clear_registered_kernels();
+
+    if (runtime->get_tensor_info_storage() != nullptr) {
+        runtime->host_api.device_free(runtime->get_tensor_info_storage());
+        runtime->clear_tensor_info_storage();
+    }
+    if (runtime->get_tensor_allocation_storage() != nullptr) {
+        runtime->host_api.device_free(runtime->get_tensor_allocation_storage());
+        runtime->clear_tensor_allocation_storage();
+    }
 
     // Clear tensor pairs
     runtime->clear_tensor_pairs();

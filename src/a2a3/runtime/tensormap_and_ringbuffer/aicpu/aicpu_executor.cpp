@@ -36,6 +36,7 @@
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/perf_profiling.h"
 #include "common/unified_log.h"
@@ -492,6 +493,19 @@ struct AicpuExecutor {
 #endif
         bool mixed_complete = rt->scheduler.on_subtask_complete(slot_state);
         if (mixed_complete) {
+#if PTO2_DUMP_TENSOR
+            if (get_enable_dump_tensor()) {
+                dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
+                    thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
+                    [](uint8_t active_mask, uint8_t raw_subtask_id) {
+                        return pto2_subtask_active(active_mask, static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                    },
+                    [this](int32_t func_id) {
+                        return get_function_bin_addr(func_id);
+                    }
+                );
+            }
+#endif
 #if PTO2_SCHED_PROFILING
             PTO2CompletionStats cstats = rt->scheduler.on_mixed_task_complete(slot_state, thread_idx, local_bufs);
             notify_edges_total += cstats.fanout_edges;
@@ -949,6 +963,19 @@ struct AicpuExecutor {
 #endif
     ) {
         CoreTracker &tracker = core_trackers_[thread_idx];
+#if PTO2_DUMP_TENSOR
+        if (get_enable_dump_tensor()) {
+            dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
+                thread_idx, slot_state, TensorDumpStage::BEFORE_DISPATCH,
+                [](uint8_t active_mask, uint8_t raw_subtask_id) {
+                    return pto2_subtask_active(active_mask, static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                },
+                [this](int32_t func_id) {
+                    return get_function_bin_addr(func_id);
+                }
+            );
+        }
+#endif
         if (shape == PTO2ResourceShape::MIX) {
             dispatch_mix_block_to_cluster(
                 runtime, thread_idx, cluster_offset, slot_state
@@ -1510,6 +1537,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             // Initialize phase profiling for scheduler threads + orchestrator threads
             perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
             perf_aicpu_set_orch_thread_idx(sched_thread_num_);
+        }
+#endif
+#if PTO2_DUMP_TENSOR
+        if (get_enable_dump_tensor()) {
+            dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
         }
 #endif
 
@@ -2241,6 +2273,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     if (profiling_enabled) {
         perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
         perf_aicpu_flush_phase_buffers(thread_idx);
+    }
+#endif
+#if PTO2_DUMP_TENSOR
+    if (get_enable_dump_tensor()) {
+        dump_tensor_flush(thread_idx);
     }
 #endif
 

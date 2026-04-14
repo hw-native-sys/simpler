@@ -23,11 +23,15 @@
 
 #include "common/core_type.h"
 #include "task_args.h"
+#include "tensor_info.h"
 
 typedef struct OrchestrationRuntime OrchestrationRuntime;
 
 typedef struct OrchestrationRuntimeOps {
     int (*add_task)(OrchestrationRuntime *runtime, uint64_t *args, int num_args, int func_id, CoreType core_type);
+    int (*set_tensor_info_to_task)(
+        OrchestrationRuntime *runtime, int task_id, const TensorInfo *tensor_info, int tensor_count
+    );
     void (*add_successor)(OrchestrationRuntime *runtime, int from_task, int to_task);
     void (*record_tensor_pair)(OrchestrationRuntime *runtime, void *host_ptr, void *dev_ptr, size_t size);
     int (*get_task_count)(OrchestrationRuntime *runtime);
@@ -45,6 +49,25 @@ struct OrchestrationRuntime {
 static inline int
 add_task(OrchestrationRuntime *runtime, uint64_t *args, int num_args, int func_id, CoreType core_type) {
     return runtime->ops->add_task(runtime, args, num_args, func_id, core_type);
+}
+
+static inline int
+set_tensor_info_to_task(OrchestrationRuntime *runtime, int task_id, const TensorInfo *tensor_info, int tensor_count) {
+    return runtime->ops->set_tensor_info_to_task(runtime, task_id, tensor_info, tensor_count);
+}
+
+static inline int add_task_with_tensor_info(
+    OrchestrationRuntime *runtime, uint64_t *args, int num_args, int func_id, CoreType core_type,
+    const TensorInfo *tensor_info, int tensor_count
+) {
+    int task_id = add_task(runtime, args, num_args, func_id, core_type);
+    if (task_id < 0) {
+        return task_id;
+    }
+    if (set_tensor_info_to_task(runtime, task_id, tensor_info, tensor_count) != 0) {
+        return -1;
+    }
+    return task_id;
 }
 
 static inline void add_successor(OrchestrationRuntime *runtime, int from_task, int to_task) {

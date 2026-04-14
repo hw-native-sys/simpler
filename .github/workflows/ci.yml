@@ -401,4 +401,6 @@ jobs:
 
       - name: Run pytest scene tests (a5)
         run: |
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash
+          DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
+          task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v"

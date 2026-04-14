@@ -62,7 +62,8 @@ private:
     using SetDeviceFn = int (*)(void *, int);
     using GetRuntimeSizeFn = size_t (*)();
     using RunRuntimeFn = int (*)(
-        void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int
+        void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t,
+        int, int
     );
     using FinalizeDeviceFn = int (*)(void *);
 

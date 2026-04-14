@@ -193,6 +193,7 @@ class CodeRunner:
         device_id: Optional[int] = None,
         platform: str = "a2a3",
         enable_profiling: bool = False,
+        enable_dump_tensor: bool = False,
         run_all_cases: bool = False,
         case_name: Optional[str] = None,
         pto_isa_commit: Optional[str] = None,
@@ -212,6 +213,7 @@ class CodeRunner:
         self.golden_path = Path(golden_path).resolve()
         self.platform = platform
         self.enable_profiling = enable_profiling
+        self.enable_dump_tensor = enable_dump_tensor
         self.skip_golden = skip_golden
         self.project_root = PROJECT_ROOT
 
@@ -608,6 +610,9 @@ class CodeRunner:
                 if self.enable_profiling and round_idx == 0:
                     config.enable_profiling = True
                     logger.info("Profiling enabled")
+                if self.enable_dump_tensor:
+                    config.enable_dump_tensor = True
+                    logger.info("Dump tensor enabled")
 
                 with _temporary_env(run_env):
                     worker.run(chip_callable, orch_args, config)
@@ -682,6 +687,7 @@ def create_code_runner(  # noqa: PLR0913
     device_id=None,
     platform="a2a3",
     enable_profiling=False,
+    enable_dump_tensor=False,
     run_all_cases=False,
     case_name=None,
     pto_isa_commit=None,
@@ -698,6 +704,7 @@ def create_code_runner(  # noqa: PLR0913
         device_id=device_id,
         platform=platform,
         enable_profiling=enable_profiling,
+        enable_dump_tensor=enable_dump_tensor,
         run_all_cases=run_all_cases,
         case_name=case_name,
         pto_isa_commit=pto_isa_commit,

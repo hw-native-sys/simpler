@@ -499,13 +499,14 @@ class SceneTestCase:
             return self._compile_l3_callables(platform)
         raise ValueError(f"Unsupported level: {self._st_level}")
 
-    def _build_config(self, config_dict, enable_profiling=False):
+    def _build_config(self, config_dict, enable_profiling=False, enable_dump_tensor=False):
         from simpler.task_interface import ChipCallConfig  # noqa: PLC0415
 
         config = ChipCallConfig()
         config.block_dim = config_dict.get("block_dim", 1)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         config.enable_profiling = enable_profiling
+        config.enable_dump_tensor = enable_dump_tensor
         return config
 
     def _resolve_env(self):
@@ -526,7 +527,15 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     def _run_and_validate(
-        self, worker, callable_obj, case, sub_ids=None, rounds=1, skip_golden=False, enable_profiling=False
+        self,
+        worker,
+        callable_obj,
+        case,
+        sub_ids=None,
+        rounds=1,
+        skip_golden=False,
+        enable_profiling=False,
+        enable_dump_tensor=False,
     ):
         if self._st_level == 2:
             self._run_and_validate_l2(
@@ -536,6 +545,7 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_profiling=enable_profiling,
+                enable_dump_tensor=enable_dump_tensor,
             )
         elif self._st_level == 3:
             self._run_and_validate_l3(
@@ -546,9 +556,12 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_profiling=enable_profiling,
+                enable_dump_tensor=enable_dump_tensor,
             )
 
-    def _run_and_validate_l2(self, worker, callable_obj, case, rounds=1, skip_golden=False, enable_profiling=False):
+    def _run_and_validate_l2(
+        self, worker, callable_obj, case, rounds=1, skip_golden=False, enable_profiling=False, enable_dump_tensor=False
+    ):
         params = case.get("params", {})
         config_dict = case.get("config", {})
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
@@ -575,7 +588,11 @@ class SceneTestCase:
                 for name, initial in initial_outputs.items():
                     getattr(test_args, name).copy_(initial)
 
-            config = self._build_config(config_dict, enable_profiling=(enable_profiling and round_idx == 0))
+            config = self._build_config(
+                config_dict,
+                enable_profiling=(enable_profiling and round_idx == 0),
+                enable_dump_tensor=enable_dump_tensor,
+            )
 
             with _temporary_env(self._resolve_env()):
                 worker.run(callable_obj, chip_args, config=config)
@@ -584,7 +601,15 @@ class SceneTestCase:
                 _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def _run_and_validate_l3(
-        self, worker, compiled_callables, sub_ids, case, rounds=1, skip_golden=False, enable_profiling=False
+        self,
+        worker,
+        compiled_callables,
+        sub_ids,
+        case,
+        rounds=1,
+        skip_golden=False,
+        enable_profiling=False,
+        enable_dump_tensor=False,
     ):
         from simpler.worker import Task  # noqa: PLC0415
 
@@ -619,7 +644,11 @@ class SceneTestCase:
                 for name, initial in initial_tensors.items():
                     getattr(test_args, name).copy_(initial)
 
-            config = self._build_config(config_dict, enable_profiling=(enable_profiling and round_idx == 0))
+            config = self._build_config(
+                config_dict,
+                enable_profiling=(enable_profiling and round_idx == 0),
+                enable_dump_tensor=enable_dump_tensor,
+            )
 
             # Wrap in Task — user orch signature: (orch, callables, task_args, config)
             def task_orch(orch, _unused, _ns=ns, _test_args=test_args, _config=config):
@@ -642,6 +671,7 @@ class SceneTestCase:
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_profiling = request.config.getoption("--enable-profiling", default=False)
+        enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
 
         callable_obj = self.build_callable(st_platform)
         sub_ids = getattr(type(self), "_st_sub_ids", {})
@@ -661,6 +691,7 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_profiling=enable_profiling,
+                enable_dump_tensor=enable_dump_tensor,
             )
             ran_any = True
 
@@ -686,6 +717,7 @@ class SceneTestCase:
         parser.add_argument("-n", "--rounds", type=int, default=1, help="Run each case N times (default: 1)")
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
         parser.add_argument("--enable-profiling", action="store_true", help="Enable profiling (first round only)")
+        parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
         parser.add_argument("--build", action="store_true", help="Compile runtime from source")
         parser.add_argument(
             "--log-level",
@@ -734,6 +766,7 @@ class SceneTestCase:
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
                                 enable_profiling=args.enable_profiling,
+                                enable_dump_tensor=args.dump_tensor,
                             )
                             print("PASSED")
                         except Exception as e:

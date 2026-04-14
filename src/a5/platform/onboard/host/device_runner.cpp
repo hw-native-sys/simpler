@@ -271,9 +271,8 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
 
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
+    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor
 ) {
-    // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
@@ -386,6 +385,15 @@ int DeviceRunner::run(
         }
     }
 
+    // Initialize tensor dump if enabled
+    if (enable_dump_tensor) {
+        rc = init_tensor_dump(runtime, num_aicore, device_id);
+        if (rc != 0) {
+            LOG_ERROR("init_tensor_dump failed: %d", rc);
+            return rc;
+        }
+    }
+
     std::cout << "\n=== Initialize runtime args ===" << '\n';
     // Initialize runtime args
     rc = kernel_args_.init_runtime_args(runtime, mem_alloc_);
@@ -442,6 +450,12 @@ int DeviceRunner::run(
     if (runtime.enable_profiling) {
         perf_collector_.collect_all();
         export_swimlane_json();
+    }
+
+    // Collect and export tensor dump data
+    if (enable_dump_tensor) {
+        dump_collector_.collect_all();
+        dump_collector_.export_dump_files();
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -506,6 +520,11 @@ int DeviceRunner::finalize() {
     // Cleanup performance profiling (frees PerfSetupHeader + all per-core/per-thread buffers)
     if (perf_collector_.is_initialized()) {
         perf_collector_.finalize();
+    }
+
+    // Cleanup tensor dump
+    if (dump_collector_.is_initialized()) {
+        dump_collector_.finalize();
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
@@ -686,4 +705,36 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
 
 int DeviceRunner::export_swimlane_json(const std::string &output_path) {
     return perf_collector_.export_swimlane_json(output_path);
+}
+
+int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {
+    (void)num_aicore;
+    int num_dump_threads = runtime.sche_cpu_num;
+
+    auto alloc_cb = [](size_t size) -> void * {
+        void *ptr = nullptr;
+        int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
+        return (rc == 0) ? ptr : nullptr;
+    };
+
+    auto free_cb = [](void *dev_ptr) -> int {
+        return rtFree(dev_ptr);
+    };
+
+    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
+        return rtMemcpy(dev_dst, size, host_src, size, RT_MEMCPY_HOST_TO_DEVICE);
+    };
+
+    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
+        return rtMemcpy(host_dst, size, dev_src, size, RT_MEMCPY_DEVICE_TO_HOST);
+    };
+
+    int rc =
+        dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb);
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.args.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_setup_device_ptr());
+    return 0;
 }

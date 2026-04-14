@@ -39,6 +39,7 @@
 #include "common/core_type.h"
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"
+#include "tensor_info.h"
 
 // Logging macros using unified logging interface
 #include "common/unified_log.h"
@@ -226,6 +227,17 @@ private:
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
 
+    // Tensor info metadata for tensor dump
+    void *tensor_info_storage_;
+    uint64_t tensor_info_storage_bytes_;
+    uint32_t tensor_info_offsets_[RUNTIME_MAX_TASKS];
+    uint16_t tensor_info_counts_[RUNTIME_MAX_TASKS];
+
+    // Device allocation ranges used to recover tensor buffer addresses from task.args[]
+    void *tensor_allocation_storage_;
+    uint64_t tensor_allocation_storage_bytes_;
+    uint32_t tensor_allocation_count_;
+
 public:
     /**
      * Constructor - zero-initialize all arrays
@@ -335,6 +347,78 @@ public:
      * Clear all recorded tensor pairs.
      */
     void clear_tensor_pairs();
+
+    // =========================================================================
+    // Tensor Info Metadata
+    // =========================================================================
+
+    void set_tensor_info_storage(void *ptr, uint64_t bytes) {
+        tensor_info_storage_ = ptr;
+        tensor_info_storage_bytes_ = bytes;
+    }
+
+    void clear_tensor_info_storage() {
+        tensor_info_storage_ = nullptr;
+        tensor_info_storage_bytes_ = 0;
+    }
+
+    void set_tensor_info_range(int task_id, uint32_t offset, uint16_t count) {
+        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS) return;
+        tensor_info_offsets_[task_id] = offset;
+        tensor_info_counts_[task_id] = count;
+    }
+
+    const TensorInfo *get_tensor_info(int task_id, int *count) const {
+        if (count != nullptr) {
+            *count = 0;
+        }
+        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS || tensor_info_storage_ == nullptr) {
+            return nullptr;
+        }
+        uint16_t tensor_info_count = tensor_info_counts_[task_id];
+        if (tensor_info_count == 0) {
+            return nullptr;
+        }
+        if (count != nullptr) {
+            *count = static_cast<int>(tensor_info_count);
+        }
+        const TensorInfo *base = reinterpret_cast<const TensorInfo *>(tensor_info_storage_);
+        return base + tensor_info_offsets_[task_id];
+    }
+
+    void *get_tensor_info_storage() const { return tensor_info_storage_; }
+
+    uint64_t get_tensor_info_storage_bytes() const { return tensor_info_storage_bytes_; }
+
+    void set_tensor_allocation_storage(void *ptr, uint32_t count, uint64_t bytes) {
+        tensor_allocation_storage_ = ptr;
+        tensor_allocation_count_ = count;
+        tensor_allocation_storage_bytes_ = bytes;
+    }
+
+    void clear_tensor_allocation_storage() {
+        tensor_allocation_storage_ = nullptr;
+        tensor_allocation_count_ = 0;
+        tensor_allocation_storage_bytes_ = 0;
+    }
+
+    bool is_tensor_buffer_addr(uint64_t addr) const {
+        if (tensor_allocation_storage_ == nullptr || tensor_allocation_count_ == 0) {
+            return false;
+        }
+        const TensorAllocationInfo *allocations =
+            reinterpret_cast<const TensorAllocationInfo *>(tensor_allocation_storage_);
+        for (uint32_t i = 0; i < tensor_allocation_count_; i++) {
+            if (allocations[i].contains(addr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void *get_tensor_allocation_storage() const { return tensor_allocation_storage_; }
+
+    uint64_t get_tensor_allocation_storage_bytes() const { return tensor_allocation_storage_bytes_; }
 
     // =========================================================================
     // Device Orchestration (stub for API compatibility)

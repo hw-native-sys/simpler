@@ -43,6 +43,7 @@
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
 #include "host/performance_collector.h"
+#include "host/tensor_dump_collector.h"
 #include "runtime.h"
 
 /**
@@ -227,7 +228,7 @@ public:
      */
     int
     run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1, bool enable_dump_tensor = false);
 
     /**
      * Print handshake results from device
@@ -359,6 +360,9 @@ private:
     // Performance profiling
     PerformanceCollector perf_collector_;
 
+    // Tensor dump (independent from profiling)
+    TensorDumpCollector dump_collector_;
+
     /**
      * Ensure device is initialized (lazy initialization)
      *
@@ -404,6 +408,16 @@ private:
      * @return 0 on success, error code on failure
      */
     int init_performance_profiling(Runtime &runtime, int num_aicore, int device_id);
+
+    /**
+     * Initialize tensor dump device buffers.
+     *
+     * @param runtime Runtime instance to configure
+     * @param num_aicore Number of AICore instances (unused)
+     * @param device_id Device ID for allocations
+     * @return 0 on success, error code on failure
+     */
+    int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

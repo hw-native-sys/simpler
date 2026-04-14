@@ -353,7 +353,7 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
 
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
+    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor
 ) {
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
@@ -473,6 +473,16 @@ int DeviceRunner::run(
         });
     }
 
+    if (enable_dump_tensor) {
+        // Initialize tensor dump (independent from profiling)
+        rc = init_tensor_dump(runtime, num_aicore, device_id);
+        if (rc != 0) {
+            LOG_ERROR("init_tensor_dump failed: %d", rc);
+            return rc;
+        }
+        dump_collector_.start_memory_manager();
+    }
+
     auto perf_cleanup = RAIIScopeGuard([this]() {
         bool was_initialized = perf_collector_.is_initialized();
         if (was_initialized) {
@@ -540,6 +550,26 @@ int DeviceRunner::run(
                 collector_thread.join();
             }
         });
+        auto collector_signal_guard = RAIIScopeGuard([this, &runtime]() {
+            if (runtime.enable_profiling) {
+                perf_collector_.signal_execution_complete();
+            }
+        });
+
+        if (enable_dump_tensor) {
+            // Poll and collect dump data in a separate collector thread
+            std::thread dump_collector_thread([this]() {
+                dump_collector_.poll_and_collect();
+            });
+            auto dump_thread_guard = RAIIScopeGuard([&]() {
+                if (dump_collector_thread.joinable()) {
+                    dump_collector_thread.join();
+                }
+            });
+            auto dump_signal_guard = RAIIScopeGuard([this]() {
+                dump_collector_.signal_execution_complete();
+            });
+        }
 
         std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
         // Synchronize streams
@@ -555,11 +585,6 @@ int DeviceRunner::run(
             LOG_ERROR("rtStreamSynchronize (AICore) failed: %d", rc);
             return rc;
         }
-
-        // Signal collector that device execution is complete
-        if (runtime.enable_profiling) {
-            perf_collector_.signal_execution_complete();
-        }
     }
 
     // Stop memory management, drain remaining buffers, collect phase data, export
@@ -569,6 +594,13 @@ int DeviceRunner::run(
         perf_collector_.scan_remaining_perf_buffers();
         perf_collector_.collect_phase_data();
         export_swimlane_json();
+    }
+
+    if (enable_dump_tensor) {
+        dump_collector_.stop_memory_manager();
+        dump_collector_.drain_remaining_buffers();
+        dump_collector_.scan_remaining_dump_buffers();
+        dump_collector_.export_dump_files();
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -645,6 +677,24 @@ int DeviceRunner::finalize() {
         };
 
         perf_collector_.finalize(unregister_cb, free_cb);
+    }
+
+    if (dump_collector_.is_initialized()) {
+        auto unregister_cb = [](void *dev_ptr, int device_id, void *user_data) -> int {
+            (void)user_data;
+            HalHostUnregisterFn fn = get_halHostUnregister();
+            if (fn != nullptr) {
+                return fn(dev_ptr, device_id);
+            }
+            return 0;
+        };
+
+        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+            auto *allocator = static_cast<MemoryAllocator *>(user_data);
+            return allocator->free(dev_ptr);
+        };
+
+        dump_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
@@ -831,4 +881,46 @@ void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
 
 int DeviceRunner::export_swimlane_json(const std::string &output_path) {
     return perf_collector_.export_swimlane_json(output_path);
+}
+
+int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {
+    int num_dump_threads = runtime.sche_cpu_num;
+
+    auto alloc_cb = [](size_t size, void *user_data) -> void * {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->alloc(size);
+    };
+
+    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void *user_data, void **host_ptr) -> int {
+        (void)user_data;
+        if (load_hal_if_needed() != 0) {
+            LOG_ERROR("Failed to load ascend_hal for tensor dump: %s", dlerror());
+            return -1;
+        }
+        HalHostRegisterFn fn = get_halHostRegister();
+        if (fn == nullptr) {
+            LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
+            return -1;
+        }
+        return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
+    };
+
+    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
+    auto set_device_cb = [](int device_id, void * /*user_data*/) -> int {
+        return rtSetDevice(device_id);
+    };
+
+    int rc = dump_collector_.initialize(
+        num_dump_threads, device_id, alloc_cb, register_cb, free_cb, &mem_alloc_, set_device_cb
+    );
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.args.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_shm_device_ptr());
+    return 0;
 }

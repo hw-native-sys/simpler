@@ -124,7 +124,7 @@ int set_device(DeviceContextHandle ctx, int device_id) {
 int run_runtime(
     DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
     int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_profiling
+    size_t aicore_size, int enable_profiling, int enable_dump_tensor
 ) {
     if (ctx == NULL || runtime == NULL) return -1;
 
@@ -167,7 +167,7 @@ int run_runtime(
         if (aicore_binary != NULL && aicore_size > 0) {
             aicore_vec.assign(aicore_binary, aicore_binary + aicore_size);
         }
-        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
+        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num, enable_dump_tensor != 0);
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();

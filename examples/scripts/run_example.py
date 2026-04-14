@@ -144,6 +144,12 @@ Golden.py interface:
     )
 
     parser.add_argument(
+        "--dump-tensor",
+        action="store_true",
+        help="Dump per-task tensor I/O at runtime (controlled by enable_dump_tensor flag)",
+    )
+
+    parser.add_argument(
         "--all",
         action="store_true",
         help="Run all test cases defined in ALL_CASES (default: run only DEFAULT_CASE)",
@@ -223,6 +229,7 @@ Golden.py interface:
             device_id=args.device,
             platform=args.platform,
             enable_profiling=args.enable_profiling,
+            enable_dump_tensor=args.dump_tensor,
             run_all_cases=args.all,
             case_name=args.case,
             pto_isa_commit=args.pto_isa_commit,

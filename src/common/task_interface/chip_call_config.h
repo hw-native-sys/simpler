@@ -22,4 +22,5 @@ struct ChipCallConfig {
     int block_dim = 24;
     int aicpu_thread_num = 3;
     bool enable_profiling = false;
+    bool enable_dump_tensor = false;
 };

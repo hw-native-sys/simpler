@@ -39,6 +39,10 @@ Runtime::Runtime() {
     pto2_dep_pool_size = 0;
     orch_to_sched = false;
 
+    // Initialize profiling state
+    enable_profiling = false;
+    perf_data_base = 0;
+
     // Initialize tensor pairs
     tensor_pair_count = 0;
 

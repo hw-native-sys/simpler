@@ -74,12 +74,13 @@ int set_device(DeviceContextHandle ctx, int device_id);
  * @param aicore_binary     AICore executor binary blob
  * @param aicore_size       Size of AICore binary
  * @param enable_profiling  1 to enable profiling, 0 to disable
+ * @param enable_dump_tensor 1 to enable tensor dump, 0 to disable
  * @return 0 on success, negative on error
  */
 int run_runtime(
     DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
     int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_profiling
+    size_t aicore_size, int enable_profiling, int enable_dump_tensor
 );
 
 /**

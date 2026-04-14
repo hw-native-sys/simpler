@@ -69,6 +69,7 @@ struct KernelArgs {
     DeviceArgs *device_args{nullptr};  // Device arguments (AICPU reads, contains SO info)
     Runtime *runtime_args{nullptr};    // Task runtime in device memory
     uint64_t regs{0};                  // Per-core register base address array (platform-specific)
+    uint64_t dump_data_base{0};        // Dump shared memory base address, zero when unused
 };
 
 #ifdef __cplusplus
