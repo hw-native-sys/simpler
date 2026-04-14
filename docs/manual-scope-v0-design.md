@@ -259,6 +259,69 @@ submit API family.
 - compare against AUTO and `aicpu_build_graph`
 - verify correctness against golden outputs
 
+## Validation Status
+
+The supported v0 scope is currently functionally correct for the cases we
+intend to support now.
+
+Verified on `manual_scope_v0`:
+
+- C++ UT passed:
+  - `test_a2a3_pto2_manual_scope_api`
+  - `test_a2a3_pto2_manual_scope_runtime`
+  - `test_a2a3_pto2_fatal`
+- Simulation ST passed:
+  - `tests/st/a2a3/tensormap_and_ringbuffer/test_manual_scope_validation.py`
+- Real-device golden checks passed:
+  - `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention` `Case1`
+  - `tests/st/a2a3/tensormap_and_ringbuffer/paged_attention` `Case2`
+  - `examples/a2a3/tensormap_and_ringbuffer/paged_attention` `Case1`
+  - `examples/a2a3/tensormap_and_ringbuffer/paged_attention` `CaseVarSeq2`
+- Unsupported shapes now fail fast with runtime invalid-args instead of
+  silently reaching a bad golden comparison:
+  - `tests/st/a2a3/tensormap_and_ringbuffer/test_paged_attention_validation.py`
+
+This status does not mean the branch is performance-ready.
+
+## Benchmark Results
+
+### Method
+
+- Platform: `a2a3` real device
+- Device: `5`
+- Workload: supported production `paged_attention` cases only
+  - `Case1`: `batch=256, num_heads=16, head_dim=128, block_size=128`
+  - `Case2`: `batch=64, num_heads=64, head_dim=128, block_size=64`
+- Rounds: `30`
+- Reported value: trimmed average, dropping `10` low and `10` high rounds
+- Baseline TMR: merge-base `617add6`
+- Current TMR: `manual_scope_v0` HEAD
+- ABG: current branch `examples/a2a3/aicpu_build_graph/paged_attention`
+- All runs used the same local `PTO_ISA_ROOT` checkout so the runtime delta is
+  measured against the same kernel dependency tree
+
+### Results
+
+| Case | Runtime | Elapsed Trimmed Avg (us) | Orch Trimmed Avg (us) | Delta vs Base | Delta vs ABG |
+| --- | --- | ---: | ---: | ---: | ---: |
+| Case1 | TMR merge-base | 30206.8 | 30161.7 | baseline | -2823.2 |
+| Case1 | TMR current | 49628.2 | 49627.9 | +19421.4 (+64.3%) | +16598.2 (+50.3%) |
+| Case1 | ABG current | 33030.0 | 32723.6 (`orch_func_cost`) | +2823.2 (+9.3%) vs base TMR | baseline |
+| Case2 | TMR merge-base | 15576.6 | 15339.3 | baseline | -2009.4 |
+| Case2 | TMR current | 33248.6 | 33248.1 | +17672.0 (+113.5%) | +15662.6 (+89.1%) |
+| Case2 | ABG current | 17586.0 | 17018.7 (`orch_func_cost`) | +2009.4 (+12.9%) vs base TMR | baseline |
+
+### Reading The Table
+
+- Current TMR is slower than merge-base on both supported paged-attention
+  cases.
+- Current TMR is also slower than ABG on both supported paged-attention cases.
+- For current TMR, orchestration time is effectively the whole elapsed time on
+  both cases. The regression is therefore in the orchestration path, not in the
+  worker execution path.
+- The current v0 implementation is therefore functionally correct for the
+  supported scope, but not performance-ready.
+
 ## Risks
 
 1. If explicit deps are missing, current-manual-scope-local tensors may be
@@ -283,3 +346,7 @@ Implement v0 as the minimal, explicit, submit-time-only manual scope:
 
 This keeps the PR small, aligns with maintainer feedback, and preserves the
 useful part of manual scope for the current examples.
+
+The implementation direction still looks right, but the current measured state
+shows we need more runtime/orchestration optimization before this branch is
+ready to present as a performance improvement.
