@@ -708,8 +708,9 @@ class CodeRunner:
         """
         # Import runtime modules (deferred import to avoid top-level dependency)
         from runtime_builder import RuntimeBuilder  # noqa: PLC0415
-        from simpler.elf_parser import extract_text_section  # noqa: PLC0415
-        from simpler.kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+        from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
+        from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
         # Auto-setup PTO_ISA_ROOT if needed (for all platforms, since kernels may use PTO ISA headers)
         pto_isa_root = _ensure_pto_isa_root(

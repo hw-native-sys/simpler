@@ -299,8 +299,9 @@ def compile_task(
 ) -> CompiledTask:
     """Compile orchestration + kernels for a single task, return CompiledTask."""
     from runtime_builder import RuntimeBuilder  # noqa: PLC0415
-    from simpler.elf_parser import extract_text_section  # noqa: PLC0415
-    from simpler.kernel_compiler import KernelCompiler  # noqa: PLC0415
+
+    from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
+    from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
 
     # Load kernel_config and golden
     kc = _load_module(spec.kernels_dir / "kernel_config.py", f"kc_{id(spec)}")

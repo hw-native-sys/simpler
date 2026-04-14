@@ -291,7 +291,7 @@ class TestRuntimeBuilderIntegration:
     @pytest.fixture(autouse=True)
     def _reset_compiler_singleton(self):
         """Reset RuntimeCompiler singleton-per-platform cache so each test gets fresh instances."""
-        from simpler.runtime_compiler import RuntimeCompiler  # noqa: PLC0415
+        from simpler_setup.runtime_compiler import RuntimeCompiler  # noqa: PLC0415
 
         yield
         RuntimeCompiler._instances.clear()

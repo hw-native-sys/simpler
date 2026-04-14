@@ -97,7 +97,7 @@ Three ways to get the project running, depending on your role. All three assume 
 | **Edit `.py` → effect** | reinstall required | immediate | immediate |
 | **Edit nanobind `.cpp` → rebuild** | reinstall required | auto on next import (`editable.rebuild`) | manual `cmake --build build/` |
 | **Edit runtime `src/` → rebuild** | reinstall or manual | manual (`--build` flag or explicit script) | manual |
-| **`from simpler.kernel_compiler import`** | fails (excluded from wheel) | works (transitional source on disk) | works |
+| **`from simpler.kernel_compiler import`** | fails (excluded from wheel) | works (transitional copy — use `simpler_setup` instead) | works (transitional copy — use `simpler_setup` instead) |
 | **`--build` path writable** | no (site-packages read-only) | yes | yes |
 
 ### 1. `pip install .` — user / CI install
