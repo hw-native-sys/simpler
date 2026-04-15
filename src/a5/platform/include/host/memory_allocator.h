@@ -99,7 +99,6 @@ public:
 
 private:
     std::set<void *> ptr_set_;
-    bool finalized_{false};
 };
 
 #endif  // PLATFORM_MEMORY_ALLOCATOR_H_

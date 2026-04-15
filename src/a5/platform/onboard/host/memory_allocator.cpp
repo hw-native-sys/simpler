@@ -61,11 +61,6 @@ int MemoryAllocator::free(void *ptr) {
 }
 
 int MemoryAllocator::finalize() {
-    // Idempotent - safe to call multiple times
-    if (finalized_) {
-        return 0;
-    }
-
     int last_error = 0;
 
     // Free all remaining tracked pointers
@@ -77,9 +72,8 @@ int MemoryAllocator::finalize() {
         }
     }
 
-    // Clear the set
+    // Clear the set (empty set makes subsequent finalize() calls a no-op)
     ptr_set_.clear();
-    finalized_ = true;
 
     return last_error;
 }

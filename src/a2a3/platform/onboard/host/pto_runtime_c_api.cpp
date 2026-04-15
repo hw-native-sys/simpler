@@ -136,10 +136,10 @@ int run_runtime(
     });
 
     try {
-        int rc = runner->ensure_device_set(device_id);
+        int rc = runner->prepare_run_context(device_id);
         if (rc != 0) return rc;
-        auto device_guard = RAIIScopeGuard([runner]() {
-            runner->reset_device_context();
+        auto run_context_guard = RAIIScopeGuard([runner]() {
+            runner->release_run_context();
         });
 
         Runtime *r = new (runtime) Runtime();

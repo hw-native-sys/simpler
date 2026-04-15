@@ -54,19 +54,13 @@ int MemoryAllocator::free(void *ptr) {
 }
 
 int MemoryAllocator::finalize() {
-    // Idempotent - safe to call multiple times
-    if (finalized_) {
-        return 0;
-    }
-
     // Free all remaining tracked pointers
     for (void *ptr : ptr_set_) {
         std::free(ptr);
     }
 
-    // Clear the set
+    // Clear the set (empty set makes subsequent finalize() calls a no-op)
     ptr_set_.clear();
-    finalized_ = true;
 
     return 0;
 }
