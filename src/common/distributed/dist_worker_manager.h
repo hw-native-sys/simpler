@@ -15,6 +15,11 @@
  * Owns WorkerThread instances (one per registered IWorker).
  * Provides idle-worker selection and dispatch to the Scheduler.
  * The Scheduler drives the DAG; the Manager drives the workers.
+ *
+ * Each WorkerThread carries a `WorkerDispatch` queue (slot id + group
+ * sub-index); on dispatch the thread reads `callable` / `task_args` /
+ * `config` from the ring's slot pool and builds a `TaskArgsView` on
+ * demand. The old `WorkerPayload` dispatch carrier is gone (PR-C).
  */
 
 #pragma once
@@ -30,6 +35,21 @@
 
 #include "dist_types.h"
 
+class DistRing;  // forward decl — owns the slot state pool
+
+// =============================================================================
+// WorkerDispatch — per-dispatch handle handed to a WorkerThread.
+// =============================================================================
+//
+// `task_slot` is the slot id; `group_index` is 0 for single tasks and
+// 0..group_size-1 for group members. The thread resolves callable / args /
+// config by reading `ring->slot_state(task_slot)`.
+
+struct WorkerDispatch {
+    DistTaskSlot task_slot{DIST_INVALID_SLOT};
+    int32_t group_index{0};
+};
+
 // =============================================================================
 // WorkerThread — gives one IWorker its own execution thread
 // =============================================================================
@@ -41,12 +61,14 @@ public:
     WorkerThread(const WorkerThread &) = delete;
     WorkerThread &operator=(const WorkerThread &) = delete;
 
-    // Start the worker thread.
+    // Start the worker thread. `ring` is a borrowed pointer to the engine's
+    // slot-state pool — the thread reads callable/args/config from
+    // `ring->slot_state(task_slot)` on each dispatch.
     // on_complete(slot) is called (in the WorkerThread) after each run().
-    void start(IWorker *worker, const std::function<void(DistTaskSlot)> &on_complete);
+    void start(IWorker *worker, DistRing *ring, const std::function<void(DistTaskSlot)> &on_complete);
 
-    // Enqueue a task for the worker.  Non-blocking.
-    void dispatch(const WorkerPayload &payload);
+    // Enqueue a dispatch for the worker. Non-blocking.
+    void dispatch(WorkerDispatch d);
 
     // True if the worker has no active task.
     bool idle() const { return idle_.load(std::memory_order_acquire); }
@@ -55,10 +77,11 @@ public:
 
 private:
     IWorker *worker_{nullptr};
+    DistRing *ring_{nullptr};
     std::function<void(DistTaskSlot)> on_complete_;
 
     std::thread thread_;
-    std::queue<WorkerPayload> queue_;
+    std::queue<WorkerDispatch> queue_;
     std::mutex mu_;
     std::condition_variable cv_;
     bool shutdown_{false};
@@ -78,9 +101,10 @@ public:
     void add_next_level(IWorker *worker);
     void add_sub(IWorker *worker);
 
-    /// Start all WorkerThreads. on_complete is called (from the WorkerThread)
-    /// after each task finishes — the Scheduler hooks into this.
-    void start(const OnCompleteFn &on_complete);
+    /// Start all WorkerThreads. `ring` is the engine's slot-state pool;
+    /// WorkerThreads read slot state from it at dispatch time.
+    /// on_complete is called (from the WorkerThread) after each task finishes.
+    void start(DistRing *ring, const OnCompleteFn &on_complete);
 
     /// Stop and join all WorkerThreads.
     void stop();

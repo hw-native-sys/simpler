@@ -150,7 +150,7 @@ TEST_F(OrchestratorFixture, NoDepTagSkipsDependencyTracking) {
     EXPECT_EQ(S(b.task_slot).fanin_count, 0);
 }
 
-TEST_F(OrchestratorFixture, GroupTaskHasAllChipStorageEntries) {
+TEST_F(OrchestratorFixture, GroupTaskStoresArgsListPerMember) {
     TaskArgs a0 = single_tensor_args(0xA0, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xA1, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
@@ -158,16 +158,30 @@ TEST_F(OrchestratorFixture, GroupTaskHasAllChipStorageEntries) {
     EXPECT_NE(res.task_slot, DIST_INVALID_SLOT);
     EXPECT_TRUE(S(res.task_slot).is_group());
     EXPECT_EQ(S(res.task_slot).group_size(), 2);
-    EXPECT_EQ(S(res.task_slot).chip_storage_list.size(), 2u);
+    EXPECT_EQ(S(res.task_slot).task_args_list.size(), 2u);
+
+    // args_view(i) yields each member's distinct tensor list.
+    EXPECT_EQ(S(res.task_slot).args_view(0).tensors[0].data, 0xA0u);
+    EXPECT_EQ(S(res.task_slot).args_view(1).tensors[0].data, 0xA1u);
 
     // Both keys registered as producers for the group slot.
     EXPECT_EQ(tm.lookup(0xA0), res.task_slot);
     EXPECT_EQ(tm.lookup(0xA1), res.task_slot);
 }
 
+TEST_F(OrchestratorFixture, SingleTaskStoresTaskArgsDirectly) {
+    TaskArgs a0 = single_tensor_args(0xC0, TensorArgType::OUTPUT);
+    auto res = orch.submit_next_level(0xDEAD, a0, cfg);
+    ASSERT_NE(res.task_slot, DIST_INVALID_SLOT);
+    EXPECT_FALSE(S(res.task_slot).is_group());
+    EXPECT_EQ(S(res.task_slot).group_size(), 1);
+    EXPECT_EQ(S(res.task_slot).task_args.tensor_count(), 1);
+    EXPECT_EQ(S(res.task_slot).args_view(0).tensors[0].data, 0xC0u);
+}
+
 TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
     // An OUTPUT tensor submitted with `data == 0` is auto-allocated from
-    // the HeapRing: the slot's chip_storage tensor ends up with a non-zero
+    // the HeapRing: the slot's task_args tensor ends up with a non-zero
     // data pointer that falls inside the allocator's mmap'd region, and
     // the TensorMap routes that pointer to the slot.
     TaskArgs args;
@@ -181,8 +195,7 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
     auto res = orch.submit_next_level(0xDEAD, args, cfg);
     ASSERT_NE(res.task_slot, DIST_INVALID_SLOT);
 
-    const auto &chip = S(res.task_slot).chip_storage_list.front();
-    uint64_t data = chip.tensor(0).data;
+    uint64_t data = S(res.task_slot).task_args.tensor(0).data;
     ASSERT_NE(data, 0u);
     uintptr_t base = reinterpret_cast<uintptr_t>(allocator.heap_base());
     EXPECT_GE(data, base);

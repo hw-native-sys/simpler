@@ -340,11 +340,19 @@ The mailbox layout, fork ordering, and child loop are in
 
 | Region | Lives in | Used by | Lifetime |
 | ------ | -------- | ------- | -------- |
-| `slots_[N]` (TaskSlotState array) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | ring-managed |
-| `slots_[i].task_args` (vector-backed) | parent heap | same | until slot released |
+| `DistRing` slot-state pool (`std::deque<unique_ptr<TaskSlotState>>`) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | monotonic task-id; reset at `Worker.run` drain |
+| `slot.task_args` (single) or `task_args_list[N]` (group, vector-backed) | parent heap | same | until slot reaches CONSUMED |
 | per-WT mailbox (PROCESS only) | shm MAP_SHARED | parent WorkerThread writes, child reads | lifetime of WorkerThread |
-| tensor data bytes | torch shm (`share_memory_()` or equiv) | kernel reads/writes | user-managed |
+| HeapRing (user OUTPUT auto-alloc + `orch.alloc`) | shm MAP_SHARED | output to user code; inherited by forked children | FIFO reclaimed via `last_alive` |
+| tensor data bytes (user-provided) | torch shm (`share_memory_()` or equiv) | kernel reads/writes | user-managed |
 | `Callable` target (ChipCallable / OrchFn / Python fn) | parent heap | child via fork COW | pre-fork registered |
+
+Slot state lives inside `DistRing` as `std::deque<std::unique_ptr<…>>` so
+`push_back` never invalidates pointers to live slots (see PR-I in
+[roadmap.md](roadmap.md)). `ring.slot_state(id)` hands out a stable
+pointer for every live slot; `drain()` calls `ring.reset_to_empty()` to
+drop all slot state at the end of each `Worker.run`, bounding per-run
+memory.
 
 **Child never reads the slot.** Child only sees:
 

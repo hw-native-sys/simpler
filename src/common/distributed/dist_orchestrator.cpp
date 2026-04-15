@@ -152,19 +152,28 @@ DistSubmitResult DistOrchestrator::submit_impl(
     s.reset();
 
     s.worker_type = worker_type;
-    s.callable_ptr = callable_ptr;
+    s.callable = callable_ptr;
     s.callable_id = callable_id;
     s.config = config;
 
-    // --- Step 2: Per-worker chip storage (one ChipStorageTaskArgs per group member) ---
-    s.chip_storage_list.reserve(args_list.size());
-    for (const TaskArgs &a : args_list) {
-        s.chip_storage_list.push_back(view_to_chip_storage(make_view(a)));
-    }
-
-    // --- Step 3 + 4: Walk tags → tensormap.lookup (deps) + tensormap.insert (outputs) ---
+    // --- Step 2: Walk tags → tensormap.lookup (deps) + tensormap.insert
+    // (outputs). Must happen before we move args_list into the slot because
+    // infer_deps reads tensor data pointers and tags from it.
     std::vector<DistTaskSlot> producers;
     infer_deps(slot, args_list, producers, s.output_keys);
+
+    // --- Step 3: Store TaskArgs directly (no chip-storage pre-build) ---
+    // Dispatch builds a TaskArgsView on demand via `slot.args_view(i)`
+    // (THREAD mode) or write_blob → read_blob (PROCESS mode). The L2 ABI
+    // ChipStorageTaskArgs conversion now runs inside ChipWorker::run
+    // rather than at submit time.
+    if (args_list.size() == 1) {
+        s.is_group_ = false;
+        s.task_args = std::move(args_list.front());
+    } else {
+        s.is_group_ = true;
+        s.task_args_list = std::move(args_list);
+    }
 
     // --- Step 5: Finalize fanin — lock each producer's fanout_mu, attach ---
     //

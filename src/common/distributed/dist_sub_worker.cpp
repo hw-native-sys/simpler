@@ -60,8 +60,10 @@ void DistSubWorker::write_state(SubMailboxState s) {
 // IWorker::run() — blocks in the WorkerThread's own thread
 // =============================================================================
 
-void DistSubWorker::run(const WorkerPayload &payload) {
-    *callable_id_ptr() = payload.callable_id;
+void DistSubWorker::run(uint64_t callable, TaskArgsView /*args*/, const ChipCallConfig & /*config*/) {
+    // `callable` encodes the registered callable id as uint64. Write the
+    // low 32 bits — matches the Python-side mailbox layout.
+    *callable_id_ptr() = static_cast<int32_t>(callable);
     write_state(SubMailboxState::TASK_READY);
 
     // Self-poll until child signals TASK_DONE.

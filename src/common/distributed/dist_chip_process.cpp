@@ -13,12 +13,12 @@
 
 #include <stdexcept>
 
-DistChipProcess::DistChipProcess(void *mailbox_ptr, size_t args_size) :
+DistChipProcess::DistChipProcess(void *mailbox_ptr, size_t args_capacity) :
     mailbox_(mailbox_ptr),
-    args_size_(args_size) {
+    args_capacity_(args_capacity) {
     if (!mailbox_ptr) throw std::invalid_argument("DistChipProcess: null mailbox_ptr");
-    if (args_size > DIST_CHIP_ARGS_CAPACITY) {
-        throw std::invalid_argument("DistChipProcess: args_size exceeds mailbox capacity");
+    if (args_capacity > DIST_CHIP_ARGS_CAPACITY) {
+        throw std::invalid_argument("DistChipProcess: args_capacity exceeds mailbox capacity");
     }
 }
 
@@ -49,28 +49,46 @@ void DistChipProcess::write_state(ChipMailboxState s) {
 #endif
 }
 
-void DistChipProcess::run(const WorkerPayload &payload) {
-    // Write callable pointer
-    uint64_t callable_val = reinterpret_cast<uint64_t>(payload.callable);
-    std::memcpy(base() + OFF_CALLABLE, &callable_val, sizeof(uint64_t));
+void DistChipProcess::run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) {
+    // Write callable pointer (child dereferences this via fork-COW).
+    std::memcpy(base() + OFF_CALLABLE, &callable, sizeof(uint64_t));
 
-    // Write config fields
-    int32_t block_dim = payload.block_dim;
-    int32_t aicpu_tn = payload.aicpu_thread_num;
-    int32_t profiling = payload.enable_profiling ? 1 : 0;
+    // Write config fields.
+    int32_t block_dim = config.block_dim;
+    int32_t aicpu_tn = config.aicpu_thread_num;
+    int32_t profiling = config.enable_profiling ? 1 : 0;
     std::memcpy(base() + OFF_BLOCK_DIM, &block_dim, sizeof(int32_t));
     std::memcpy(base() + OFF_AICPU_THREAD_NUM, &aicpu_tn, sizeof(int32_t));
     std::memcpy(base() + OFF_ENABLE_PROFILING, &profiling, sizeof(int32_t));
 
-    // Copy args into mailbox (child reads from mailbox address)
-    if (payload.args != nullptr && args_size_ > 0) {
-        std::memcpy(base() + OFF_ARGS, payload.args, args_size_);
+    // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars]. The
+    // child reads it with read_blob() and assembles a ChipStorageTaskArgs
+    // POD on its own heap before invoking pto2_run_runtime.
+    size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(args.tensor_count) * sizeof(ContinuousTensor) +
+                        static_cast<size_t>(args.scalar_count) * sizeof(uint64_t);
+    if (blob_bytes > args_capacity_) {
+        throw std::runtime_error("DistChipProcess::run: args blob exceeds mailbox capacity");
+    }
+    uint8_t *d = reinterpret_cast<uint8_t *>(base() + OFF_ARGS);
+    std::memcpy(d + 0, &args.tensor_count, sizeof(int32_t));
+    std::memcpy(d + 4, &args.scalar_count, sizeof(int32_t));
+    if (args.tensor_count > 0) {
+        std::memcpy(
+            d + TASK_ARGS_BLOB_HEADER_SIZE, args.tensors,
+            static_cast<size_t>(args.tensor_count) * sizeof(ContinuousTensor)
+        );
+    }
+    if (args.scalar_count > 0) {
+        std::memcpy(
+            d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(args.tensor_count) * sizeof(ContinuousTensor),
+            args.scalars, static_cast<size_t>(args.scalar_count) * sizeof(uint64_t)
+        );
     }
 
-    // Signal child process
+    // Signal child process.
     write_state(ChipMailboxState::TASK_READY);
 
-    // Spin-poll until child signals TASK_DONE
+    // Spin-poll until child signals TASK_DONE.
     while (read_state() != ChipMailboxState::TASK_DONE) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }

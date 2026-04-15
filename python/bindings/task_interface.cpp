@@ -579,7 +579,24 @@ NB_MODULE(_task_interface, m) {
                 self.run(reinterpret_cast<const void *>(callable), reinterpret_cast<const void *>(args), config);
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
-            nb::arg("enable_profiling") = false, "Run with raw pointer arguments (used from forked chip process)."
+            nb::arg("enable_profiling") = false, "Run with a raw ChipStorageTaskArgs POD pointer."
+        )
+        .def(
+            "run_from_blob",
+            [](ChipWorker &self, uint64_t callable, uint64_t blob_ptr, int block_dim, int aicpu_thread_num,
+               bool enable_profiling) {
+                ChipCallConfig config;
+                config.block_dim = block_dim;
+                config.aicpu_thread_num = aicpu_thread_num;
+                config.enable_profiling = enable_profiling;
+                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr));
+                self.run(callable, view, config);
+            },
+            nb::arg("callable"), nb::arg("blob_ptr"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
+            nb::arg("enable_profiling") = false,
+            "Decode a length-prefixed TaskArgs blob ([T][S][tensors][scalars]) at "
+            "blob_ptr and dispatch to the runtime. Used from forked chip processes "
+            "reading the WorkerThread mailbox."
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)

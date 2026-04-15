@@ -58,7 +58,7 @@ from .task_interface import (
 class Task:
     """Execution unit for Worker.run() at any level.
 
-    For L2: set callable/args directly on a WorkerPayload and pass to run().
+    For L2: call ``Worker.run(chip_callable, chip_args, config)`` directly.
     For L3+: provide an orch function ``fn(orchestrator, args)`` that builds
     the DAG via ``orchestrator.submit_*``.
     """
@@ -83,15 +83,6 @@ def _mailbox_addr(shm: SharedMemory) -> int:
     buf = shm.buf
     assert buf is not None
     return ctypes.addressof(ctypes.c_char.from_buffer(buf))
-
-
-def _args_size(csa_cls) -> int:
-    """Return sizeof(ChipStorageTaskArgs). Uses C++ binding if available, else heap probe."""
-    if hasattr(csa_cls, "sizeof"):
-        return csa_cls.sizeof()
-    objs = [csa_cls() for _ in range(5)]
-    ptrs = [o.__ptr__() for o in objs]
-    return min(abs(ptrs[i + 1] - ptrs[i]) for i in range(len(ptrs) - 1))
 
 
 def _sub_worker_loop(buf, registry: dict) -> None:
@@ -132,9 +123,17 @@ def _chip_process_loop(
     aicpu_path: str,
     aicore_path: str,
     sim_context_lib_path: str = "",
-    args_size: int = 1712,
 ) -> None:
-    """Runs in forked child process. Loads host_runtime.so in own address space."""
+    """Runs in forked child process. Loads host_runtime.so in own address space.
+
+    The parent writes a length-prefixed TaskArgs blob ([T][S][tensors][scalars])
+    into the mailbox at OFF_ARGS. The child reads the blob directly from the
+    mailbox via ChipWorker.run_from_blob — safe because the parent is blocked
+    on TASK_DONE for the duration of the call, so the mailbox bytes are
+    stable, and run_from_blob's view_to_chip_storage already memcpys the
+    tensor / scalar data into the ChipStorageTaskArgs POD it hands to
+    pto2_run_runtime. No per-task heap buffer needed.
+    """
     import traceback as _tb  # noqa: PLC0415
 
     try:
@@ -147,6 +146,8 @@ def _chip_process_loop(
         return
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+    # The blob pointer is a constant offset into the mailbox — compute once.
+    args_ptr = mailbox_addr + _CHIP_OFF_ARGS
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
 
@@ -157,16 +158,10 @@ def _chip_process_loop(
             block_dim = struct.unpack_from("i", buf, _CHIP_OFF_BLOCK_DIM)[0]
             aicpu_tn = struct.unpack_from("i", buf, _CHIP_OFF_AICPU_THREAD_NUM)[0]
             profiling = struct.unpack_from("i", buf, _CHIP_OFF_ENABLE_PROFILING)[0]
-            args_ptr = mailbox_addr + _CHIP_OFF_ARGS
-
-            # Copy args from shm to heap — run_runtime requires heap-backed args
-            args_buf = ctypes.create_string_buffer(args_size)
-            ctypes.memmove(args_buf, args_ptr, args_size)
-            heap_args_ptr = ctypes.addressof(args_buf)
 
             error = 0
             try:
-                cw.run_raw(callable_ptr, heap_args_ptr, block_dim, aicpu_tn, bool(profiling))
+                cw.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
             except Exception:  # noqa: BLE001
                 error = 1
             struct.pack_into("i", buf, _CHIP_OFF_ERROR, error)
@@ -274,14 +269,14 @@ class Worker:
         if device_ids:
             from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-            from .task_interface import ChipStorageTaskArgs as _CSA  # noqa: PLC0415
-
             platform = self._config["platform"]
             runtime = self._config["runtime"]
             builder = RuntimeBuilder(platform)
             binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
 
-            self._l3_args_size = _args_size(_CSA)
+            # args_capacity: how many bytes the parent can write at mailbox
+            # OFF_ARGS. Matches DIST_CHIP_ARGS_CAPACITY on the C++ side.
+            self._l3_args_capacity = DIST_CHIP_MAILBOX_SIZE - _CHIP_OFF_ARGS
             self._l3_host_lib_path = str(binaries.host_path)
             self._l3_aicpu_path = str(binaries.aicpu_path)
             self._l3_aicore_path = str(binaries.aicore_path)
@@ -342,7 +337,6 @@ class Worker:
                         self._l3_aicpu_path,
                         self._l3_aicore_path,
                         self._l3_sim_ctx_path,
-                        self._l3_args_size,
                     )
                     os._exit(0)
                 else:
@@ -356,7 +350,7 @@ class Worker:
 
         if device_ids:
             for shm in self._chip_shms:
-                cp = DistChipProcess(_mailbox_addr(shm), self._l3_args_size)
+                cp = DistChipProcess(_mailbox_addr(shm), self._l3_args_capacity)
                 self._dist_chip_procs.append(cp)
                 dw.add_next_level_worker(cp)
 

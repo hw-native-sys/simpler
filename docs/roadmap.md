@@ -67,13 +67,22 @@ get if I pip install `main` today", this page.
 
 ### Dispatch internals
 
-- `Scheduler` dispatches via a single ready queue into `WorkerManager`
-  pools (next-level + sub). Slot stores `chip_storage_list` (one
-  `ChipStorageTaskArgs` per group worker) that dispatch passes through
-  a `WorkerPayload` handed to `IWorker::run`.
+- `IWorker::run(uint64_t callable, TaskArgsView args, ChipCallConfig cfg)`
+  is the dispatch surface — no `WorkerPayload` carrier. Each
+  `WorkerThread` reads `callable` / `task_args` / `config` from
+  `ring->slot_state(task_slot)` at dispatch time and builds a
+  `TaskArgsView` on demand (`slot.args_view(i)` for THREAD;
+  `write_blob` / `read_blob` for PROCESS). `ChipWorker::run` assembles
+  the L2 ABI `ChipStorageTaskArgs` POD from the view right before
+  `pto2_run_runtime` — the slot itself stores only the tagged
+  `TaskArgs` (single) or `task_args_list` (group).
+- `Scheduler` dispatches slot ids via a single ready queue into
+  `WorkerManager` pools (next-level + sub); for group slots it pushes
+  a `WorkerDispatch { slot, group_index }` per member onto N idle
+  threads.
 - `DistChipProcess` / `DistSubWorker` are separate classes today;
   unified `WorkerThread` with `THREAD | PROCESS` modes is not yet
-  implemented.
+  implemented (lands in PR-D).
 - `DistRing` owns the task-id counter, the heap slab, **and** the
   per-slot state (`std::deque<std::unique_ptr<DistTaskSlotState>>`).
   Slot ids are monotonic within a run (no fixed window, no modulo
@@ -89,15 +98,14 @@ get if I pip install `main` today", this page.
 
 ## In flight / not yet landed
 
-### PR-C: drop `WorkerPayload`, new `IWorker::run` signature
+### PR-Scope: user-facing nested scope + Strict-1 per-scope rings
 
-- `IWorker::run(callable, TaskArgsView, config)` — no `WorkerPayload`
-  wrapper; mailbox encodes a length-prefixed blob of `callable +
-  config + args` at dispatch.
-- Slot drops `chip_storage_list` and stores the `TaskArgs` itself.
-  Child assembles `ChipStorageTaskArgs` from the view at the L2 ABI
-  edge only.
-- Strict-1 (per-scope rings, 4 depth) lands here.
+- Expose `Orchestrator.scope_begin` / `scope_end` to the user's orch fn
+  (allow nesting up to `DIST_MAX_SCOPE_DEPTH = 64`).
+- Refactor `DistRing` into `DIST_MAX_RING_DEPTH = 4` independent
+  HeapRing instances; `alloc_for_scope(depth)` picks one. Per-ring
+  `last_alive` so deeply nested scopes never contend on a single
+  reclamation pointer.
 
 ### PR-D: WorkerThread unification + per-shape ready queues
 
@@ -137,7 +145,10 @@ get if I pip install `main` today", this page.
   call paths (`release_ref` and `try_consume`).
 - **scene_test has two helper functions** —
   `_build_chip_task_args` returns `ChipStorageTaskArgs` (POD, for the
-  current L2 path: `ChipWorker.run(callable, POD, config)`) and
-  `_build_l3_task_args` returns a tagged `TaskArgs` (for
-  `orch.submit_next_level`). PR-C will collapse these into one helper
-  when `ChipWorker::run` takes a `TaskArgsView`.
+  L2 `ChipWorker.run(callable, POD, config)` overload still used by
+  inline callers) and `_build_l3_task_args` returns a tagged
+  `TaskArgs` (for `orch.submit_next_level`). The
+  `ChipWorker::run(uint64_t, TaskArgsView, ChipCallConfig)` IWorker
+  entry now accepts a view, so these helpers can collapse into one —
+  the POD overload is retained as an internal convenience for the
+  Python-bound `_ChipWorker.run_raw` path.

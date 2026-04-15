@@ -28,10 +28,12 @@ void DistTaskSlotState::reset() {
     output_keys.clear();
     fanin_producers.clear();
     worker_type = WorkerType::NEXT_LEVEL;
-    callable_ptr = 0;
+    callable = 0;
     callable_id = -1;
     config = ChipCallConfig{};
-    chip_storage_list.clear();
+    task_args.clear();
+    task_args_list.clear();
+    is_group_ = false;
     sub_complete_count.store(0, std::memory_order_relaxed);
 }
 

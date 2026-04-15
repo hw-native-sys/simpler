@@ -11,22 +11,27 @@
 
 #include "dist_worker_manager.h"
 
+#include <stdexcept>
+
+#include "dist_ring.h"
+
 // =============================================================================
 // WorkerThread
 // =============================================================================
 
-void WorkerThread::start(IWorker *worker, const std::function<void(DistTaskSlot)> &on_complete) {
+void WorkerThread::start(IWorker *worker, DistRing *ring, const std::function<void(DistTaskSlot)> &on_complete) {
     worker_ = worker;
+    ring_ = ring;
     on_complete_ = on_complete;
     shutdown_ = false;
     idle_.store(true, std::memory_order_relaxed);
     thread_ = std::thread(&WorkerThread::loop, this);
 }
 
-void WorkerThread::dispatch(const WorkerPayload &payload) {
+void WorkerThread::dispatch(WorkerDispatch d) {
     idle_.store(false, std::memory_order_release);
     std::lock_guard<std::mutex> lk(mu_);
-    queue_.push(payload);
+    queue_.push(d);
     cv_.notify_one();
 }
 
@@ -41,20 +46,28 @@ void WorkerThread::stop() {
 
 void WorkerThread::loop() {
     while (true) {
-        WorkerPayload payload;
+        WorkerDispatch d;
         {
             std::unique_lock<std::mutex> lk(mu_);
             cv_.wait(lk, [this] {
                 return !queue_.empty() || shutdown_;
             });
             if (queue_.empty()) break;  // shutdown
-            payload = queue_.front();
+            d = queue_.front();
             queue_.pop();
         }
 
-        worker_->run(payload);  // blocking in this thread
+        // Resolve callable / args / config from the slot. For NEXT_LEVEL
+        // tasks `callable` is the ChipCallable buffer pointer; for SUB
+        // tasks it encodes the registry id in the low 32 bits. The view
+        // is a zero-copy handle over the slot's vector-backed TaskArgs.
+        DistTaskSlotState &s = *ring_->slot_state(d.task_slot);
+        uint64_t callable = (s.worker_type == WorkerType::SUB) ? static_cast<uint64_t>(s.callable_id) : s.callable;
+        TaskArgsView view = s.args_view(d.group_index);
+
+        worker_->run(callable, view, s.config);  // blocking in this thread
         idle_.store(true, std::memory_order_release);
-        on_complete_(payload.task_slot);  // notify Scheduler
+        on_complete_(d.task_slot);  // notify Scheduler
     }
 }
 
@@ -66,12 +79,13 @@ void DistWorkerManager::add_next_level(IWorker *worker) { next_level_workers_.pu
 
 void DistWorkerManager::add_sub(IWorker *worker) { sub_workers_.push_back(worker); }
 
-void DistWorkerManager::start(const OnCompleteFn &on_complete) {
+void DistWorkerManager::start(DistRing *ring, const OnCompleteFn &on_complete) {
+    if (ring == nullptr) throw std::invalid_argument("DistWorkerManager::start: null ring");
     auto make_threads = [&](const std::vector<IWorker *> &workers,
                             std::vector<std::unique_ptr<WorkerThread>> &threads) {
         for (IWorker *w : workers) {
             auto wt = std::make_unique<WorkerThread>();
-            wt->start(w, on_complete);
+            wt->start(w, ring, on_complete);
             threads.push_back(std::move(wt));
         }
     };

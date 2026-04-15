@@ -11,8 +11,10 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <iterator>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -33,9 +35,9 @@
 
 struct MockWorker : public IWorker {
     struct Record {
-        DistTaskSlot slot;
-        WorkerType type;
-        const void *args;
+        uint64_t callable;
+        uint64_t tensor_key;              // tensors[0].data (unique per submit in tests)
+        const ContinuousTensor *tensors;  // backing pointer (distinct per group member)
     };
 
     std::vector<Record> dispatched;
@@ -46,10 +48,11 @@ struct MockWorker : public IWorker {
     std::atomic<bool> should_complete{false};
     std::atomic<bool> is_running{false};
 
-    void run(const WorkerPayload &p) override {
+    void run(uint64_t callable, TaskArgsView args, const ChipCallConfig & /*cfg*/) override {
         {
             std::lock_guard<std::mutex> lk(dispatched_mu);
-            dispatched.push_back({p.task_slot, p.worker_type, p.args});
+            uint64_t key = (args.tensor_count > 0) ? args.tensors[0].data : 0;
+            dispatched.push_back({callable, key, args.tensors});
         }
         is_running.store(true, std::memory_order_release);
 
@@ -120,7 +123,7 @@ struct SchedulerFixture : public ::testing::Test {
         orch.init(&tm, &allocator, &scope, &rq);
 
         manager.add_next_level(&mock_worker);
-        manager.start([this](DistTaskSlot slot) {
+        manager.start(&allocator, [this](DistTaskSlot slot) {
             sched.worker_done(slot);
         });
 
@@ -167,7 +170,8 @@ TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
 
     mock_worker.wait_running();
     ASSERT_GE(mock_worker.dispatched_count(), 1);
-    EXPECT_EQ(mock_worker.dispatched[0].slot, slot);
+    EXPECT_EQ(mock_worker.dispatched[0].tensor_key, 0xCAFEu);
+    EXPECT_EQ(mock_worker.dispatched[0].callable, 0xDEADu);
 
     mock_worker.complete();
     wait_consumed(slot);
@@ -175,14 +179,14 @@ TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
 
 TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
     auto args_a = single_tensor_args(0xBEEF, TensorArgType::OUTPUT);
-    auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
+    auto a = orch.submit_next_level(0xAA, args_a, cfg);
 
     auto args_b = single_tensor_args(0xBEEF, TensorArgType::INPUT);
-    auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
+    auto b = orch.submit_next_level(0xBB, args_b, cfg);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
 
     mock_worker.wait_running();
-    EXPECT_EQ(mock_worker.dispatched[0].slot, a.task_slot);
+    EXPECT_EQ(mock_worker.dispatched[0].callable, 0xAAu);
     mock_worker.complete();  // A done
 
     auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
@@ -190,10 +194,11 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     ASSERT_GE(mock_worker.dispatched_count(), 2);
-    EXPECT_EQ(mock_worker.dispatched[1].slot, b.task_slot);
+    EXPECT_EQ(mock_worker.dispatched[1].callable, 0xBBu);
 
     mock_worker.complete();  // B done
     wait_consumed(b.task_slot);
+    (void)a;
 }
 
 // ===========================================================================
@@ -223,7 +228,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
 
         manager.add_next_level(&worker_a);
         manager.add_next_level(&worker_b);
-        manager.start([this](DistTaskSlot slot) {
+        manager.start(&allocator, [this](DistTaskSlot slot) {
             sched.worker_done(slot);
         });
 
@@ -271,13 +276,14 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
 
     EXPECT_EQ(worker_a.dispatched_count(), 1);
     EXPECT_EQ(worker_b.dispatched_count(), 1);
-    EXPECT_EQ(worker_a.dispatched[0].slot, slot);
-    EXPECT_EQ(worker_b.dispatched[0].slot, slot);
 
-    // Each worker got a different chip-storage pointer (slot.chip_storage_list[i])
-    EXPECT_NE(worker_a.dispatched[0].args, nullptr);
-    EXPECT_NE(worker_b.dispatched[0].args, nullptr);
-    EXPECT_NE(worker_a.dispatched[0].args, worker_b.dispatched[0].args);
+    // Each worker got a different TaskArgs from the slot's task_args_list.
+    uint64_t keys[2] = {worker_a.dispatched[0].tensor_key, worker_b.dispatched[0].tensor_key};
+    std::sort(std::begin(keys), std::end(keys));
+    EXPECT_EQ(keys[0], 0xA0u);
+    EXPECT_EQ(keys[1], 0xA1u);
+    EXPECT_NE(worker_a.dispatched[0].tensors, worker_b.dispatched[0].tensors);
+    (void)slot;
 
     worker_a.complete();
     worker_b.complete();

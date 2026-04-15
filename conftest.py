@@ -147,9 +147,9 @@ def pytest_configure(config):
 
     commit = config.getoption("--pto-isa-commit")
     if commit:
-        from simpler_setup.code_runner import _ensure_pto_isa_root  # noqa: PLC0415
+        from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-        root = _ensure_pto_isa_root(
+        root = ensure_pto_isa_root(
             verbose=True,
             commit=commit,
             clone_protocol=config.getoption("--clone-protocol"),

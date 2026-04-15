@@ -81,7 +81,7 @@ public:
 
     // IWorker — used when this DistWorker is itself a sub-worker of L4+.
     // Placeholder for recursive composition; filled in by plan step F.
-    void run(const WorkerPayload &payload) override;
+    void run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) override;
 
 private:
     int32_t level_;

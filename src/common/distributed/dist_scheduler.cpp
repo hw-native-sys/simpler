@@ -14,6 +14,7 @@
 #include <stdexcept>
 
 #include "dist_ring.h"
+#include "dist_types.h"
 #include "dist_worker_manager.h"
 
 // =============================================================================
@@ -186,16 +187,10 @@ void DistScheduler::dispatch_ready() {
 
         s.state.store(TaskState::RUNNING, std::memory_order_release);
         for (int i = 0; i < N; i++) {
-            WorkerPayload p;
-            p.task_slot = slot;
-            p.worker_type = s.worker_type;
-            p.callable = reinterpret_cast<const void *>(s.callable_ptr);
-            p.args = &s.chip_storage_list[i];
-            p.block_dim = s.config.block_dim;
-            p.aicpu_thread_num = s.config.aicpu_thread_num;
-            p.enable_profiling = s.config.enable_profiling;
-            p.callable_id = s.callable_id;
-            workers[i]->dispatch(p);
+            WorkerDispatch d;
+            d.task_slot = slot;
+            d.group_index = i;
+            workers[i]->dispatch(d);
         }
     }
 }

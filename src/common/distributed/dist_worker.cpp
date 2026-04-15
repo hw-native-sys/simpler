@@ -132,7 +132,7 @@ void DistWorker::init() {
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
-    manager_.start([this](DistTaskSlot slot) {
+    manager_.start(&allocator_, [this](DistTaskSlot slot) {
         scheduler_.worker_done(slot);
     });
 
@@ -160,7 +160,8 @@ void DistWorker::close() {
 // IWorker::run() — DistWorker as sub-worker of a higher level (placeholder)
 // =============================================================================
 
-void DistWorker::run(const WorkerPayload & /*payload*/) {
-    // Full L4+ support: payload would carry a HostTask* to execute.
-    // Placeholder for plan step F.
+void DistWorker::run(uint64_t /*callable*/, TaskArgsView /*args*/, const ChipCallConfig & /*config*/) {
+    // Full L4+ support: `callable` decodes to an orch-fn handle; Worker::run
+    // opens a fresh scope, invokes the orch fn on its own Orchestrator,
+    // drains, and closes the scope. Placeholder for plan step F.
 }

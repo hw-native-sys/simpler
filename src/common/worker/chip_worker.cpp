@@ -187,12 +187,13 @@ void ChipWorker::finalize() {
     finalized_ = true;
 }
 
-void ChipWorker::run(const WorkerPayload &payload) {
-    ChipCallConfig config;
-    config.block_dim = payload.block_dim;
-    config.aicpu_thread_num = payload.aicpu_thread_num;
-    config.enable_profiling = payload.enable_profiling;
-    run(payload.callable, payload.args, config);
+void ChipWorker::run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) {
+    // L2 ABI edge: assemble the fixed-size ChipStorageTaskArgs POD from the
+    // view and hand it to the runtime. This conversion used to happen at
+    // submit time (stored on the slot); it now runs lazily in the worker so
+    // the slot can carry a single TaskArgs irrespective of the destination.
+    ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
+    run(reinterpret_cast<const void *>(callable), &chip_storage, config);
 }
 
 void ChipWorker::run(const void *callable, const void *args, const ChipCallConfig &config) {

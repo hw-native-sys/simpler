@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "../task_interface/chip_call_config.h"
+#include "../task_interface/task_args.h"
 #include "dist_types.h"
 
 class ChipWorker : public IWorker {
@@ -46,10 +47,13 @@ public:
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // IWorker: extract callable/args/config from payload and execute synchronously.
-    void run(const WorkerPayload &payload) override;
+    // IWorker: build a ChipStorageTaskArgs POD from `args` and execute the
+    // runtime synchronously. `callable` is a ChipCallable buffer pointer
+    // cast to uint64.
+    void run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) override;
 
-    // Direct invocation (used by Python wrapper and internal tests).
+    // Direct invocation (used by Python wrapper and internal tests) — bypasses
+    // the TaskArgsView path and takes a ready-made ChipStorageTaskArgs POD.
     void run(const void *callable, const void *args, const ChipCallConfig &config);
 
     int device_id() const { return device_id_; }

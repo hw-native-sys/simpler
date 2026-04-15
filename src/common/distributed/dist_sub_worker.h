@@ -54,9 +54,12 @@ public:
     // (allocated from Python before fork).
     explicit DistSubWorker(void *mailbox_ptr);
 
-    // IWorker: write mailbox → spin-poll TASK_DONE → reset IDLE.
+    // IWorker: write mailbox → spin-poll TASK_DONE → reset IDLE. `callable`
+    // carries the registered callable id (uint64; low 32 bits = int32 cid).
+    // `args` is currently ignored — the child's py registry receives no
+    // args yet; PR-E threads the TaskArgsView into the Python call.
     // Blocks in the caller's thread (WorkerThread), not the Scheduler thread.
-    void run(const WorkerPayload &payload) override;
+    void run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) override;
 
     // Signal the child process to exit (SHUTDOWN state).
     void shutdown();
