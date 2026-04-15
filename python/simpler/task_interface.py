@@ -65,6 +65,11 @@ __all__ = [
     "torch_dtype_to_datatype",
     "make_tensor_arg",
     "scalar_to_uint64",
+    "get_active_worker",
+    "host_malloc",
+    "host_free",
+    "host_register_mapped",
+    "host_unregister_mapped",
     # Distributed runtime
     "WorkerType",
     "TaskState",
@@ -83,6 +88,7 @@ __all__ = [
 
 # Lazy-loaded torch dtype → DataType map (avoids importing torch at module load)
 _TORCH_DTYPE_MAP = None
+_ACTIVE_WORKER = None
 
 
 def _ensure_torch_map():
@@ -170,7 +176,9 @@ class ChipWorker:
     """
 
     def __init__(self):
+        global _ACTIVE_WORKER
         self._impl = _ChipWorker()
+        _ACTIVE_WORKER = self
 
     def init(self, host_path, aicpu_path, aicore_path, sim_context_lib_path=""):
         """Load host runtime library and cache platform binaries.
@@ -199,12 +207,35 @@ class ChipWorker:
         """Release device resources. The runtime binding remains intact."""
         self._impl.reset_device()
 
+    def host_malloc(self, size):
+        """Allocate pinned host memory through the bound host runtime."""
+        return self._impl.host_malloc(int(size))
+
+    def host_free(self, host_ptr):
+        """Free pinned host memory previously allocated by host_malloc()."""
+        self._impl.host_free(int(host_ptr))
+
+    def host_register_mapped(self, host_ptr, size, device_id=None):
+        """Register host memory and return the device-visible mapped pointer."""
+        if device_id is None:
+            device_id = self.device_id
+        return self._impl.host_register_mapped(int(host_ptr), int(size), int(device_id))
+
+    def host_unregister_mapped(self, host_ptr, device_id=None):
+        """Unregister host memory previously registered via host_register_mapped()."""
+        if device_id is None:
+            device_id = self.device_id
+        self._impl.host_unregister_mapped(int(host_ptr), int(device_id))
+
     def finalize(self):
         """Tear down everything: device resources and runtime library.
 
         Terminal operation — the object cannot be reused after this.
         """
+        global _ACTIVE_WORKER
         self._impl.finalize()
+        if _ACTIVE_WORKER is self:
+            _ACTIVE_WORKER = None
 
     def run(self, callable, args, config=None, **kwargs):
         """Execute a callable synchronously.
@@ -232,3 +263,34 @@ class ChipWorker:
     @property
     def device_set(self):
         return self._impl.device_set
+
+
+def get_active_worker():
+    """Return the most recently created ChipWorker in this process."""
+    if _ACTIVE_WORKER is None:
+        raise RuntimeError("No active ChipWorker is available")
+    if not _ACTIVE_WORKER.initialized:
+        raise RuntimeError("The active ChipWorker is not initialized")
+    if not _ACTIVE_WORKER.device_set:
+        raise RuntimeError("The active ChipWorker does not have a device set")
+    return _ACTIVE_WORKER
+
+
+def host_malloc(size):
+    """Allocate pinned host memory using the active ChipWorker."""
+    return get_active_worker().host_malloc(size)
+
+
+def host_free(host_ptr):
+    """Free pinned host memory using the active ChipWorker."""
+    get_active_worker().host_free(host_ptr)
+
+
+def host_register_mapped(host_ptr, size, device_id=None):
+    """Register pinned host memory and return a device-visible mapped pointer."""
+    return get_active_worker().host_register_mapped(host_ptr, size, device_id=device_id)
+
+
+def host_unregister_mapped(host_ptr, device_id=None):
+    """Unregister pinned host memory from the active ChipWorker."""
+    get_active_worker().host_unregister_mapped(host_ptr, device_id=device_id)

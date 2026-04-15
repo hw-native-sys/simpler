@@ -20,6 +20,8 @@
 #include "callable.h"
 #include "task_args.h"
 
+#include <dlfcn.h>
+#include <initializer_list>
 #include <pthread.h>
 #include <vector>
 
@@ -27,6 +29,58 @@
 #include "device_runner.h"
 #include "host/raii_scope_guard.h"
 #include "runtime.h"
+
+namespace {
+
+using RtMallocHostFn = int (*)(void **, uint64_t, uint32_t);
+using RtFreeHostFn = int (*)(void *);
+using RtHostRegisterFn = int (*)(void *, uint64_t, uint32_t, void **);
+using RtHostUnregisterFn = int (*)(void *);
+using AclMallocHostFn = int (*)(void **, size_t);
+using AclFreeHostFn = int (*)(void *);
+using AclHostRegisterFn = int (*)(void *, uint64_t, uint32_t, void **);
+using AclHostUnregisterFn = int (*)(void *);
+
+template <typename Fn>
+Fn resolve_symbol(const char **resolved_name, std::initializer_list<const char *> names) {
+    for (const char *name : names) {
+        dlerror();
+        void *sym = dlsym(RTLD_DEFAULT, name);
+        const char *err = dlerror();
+        if (err == nullptr && sym != nullptr) {
+            if (resolved_name != nullptr) {
+                *resolved_name = name;
+            }
+            return reinterpret_cast<Fn>(sym);
+        }
+    }
+    if (resolved_name != nullptr) {
+        *resolved_name = nullptr;
+    }
+    return nullptr;
+}
+
+static constexpr uint32_t kHostRegisterMappedFlag =
+#if defined(RT_HOST_REGISTER_MAPPED)
+    RT_HOST_REGISTER_MAPPED;
+#elif defined(ACL_HOST_REGISTER_MAPPED)
+    ACL_HOST_REGISTER_MAPPED;
+#else
+    0U;
+#endif
+
+int ensure_host_api_device_ready(DeviceContextHandle ctx, int device_id) {
+    if (ctx == nullptr) {
+        return -1;
+    }
+    try {
+        return static_cast<DeviceRunner *>(ctx)->ensure_device_set(device_id);
+    } catch (...) {
+        return -1;
+    }
+}
+
+}  // namespace
 
 extern "C" {
 
@@ -114,9 +168,156 @@ void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<Device
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
 int set_device(DeviceContextHandle ctx, int device_id) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->ensure_device_set(device_id);
+    } catch (...) {
+        return -1;
+    }
+}
+
+void *host_malloc(DeviceContextHandle ctx, size_t size) {
     (void)ctx;
-    (void)device_id;
-    return 0;
+    if (size == 0) {
+        LOG_ERROR("host_malloc: size must be > 0");
+        return NULL;
+    }
+
+    void *host_ptr = nullptr;
+    const char *symbol_name = nullptr;
+
+    if (RtMallocHostFn fn = resolve_symbol<RtMallocHostFn>(&symbol_name, {"rtMallocHost"})) {
+        int rc = fn(&host_ptr, static_cast<uint64_t>(size), 0U);
+        if (rc != 0 || host_ptr == nullptr) {
+            LOG_ERROR("host_malloc via %s failed: rc=%d size=%zu", symbol_name, rc, size);
+            return NULL;
+        }
+        LOG_INFO("host_malloc: %zu bytes at %p via %s", size, host_ptr, symbol_name);
+        return host_ptr;
+    }
+
+    if (AclMallocHostFn fn = resolve_symbol<AclMallocHostFn>(&symbol_name, {"aclrtMallocHost"})) {
+        int rc = fn(&host_ptr, size);
+        if (rc != 0 || host_ptr == nullptr) {
+            LOG_ERROR("host_malloc via %s failed: rc=%d size=%zu", symbol_name, rc, size);
+            return NULL;
+        }
+        LOG_INFO("host_malloc: %zu bytes at %p via %s", size, host_ptr, symbol_name);
+        return host_ptr;
+    }
+
+    LOG_ERROR("host_malloc: missing symbols rtMallocHost / aclrtMallocHost");
+    return NULL;
+}
+
+void host_free(DeviceContextHandle ctx, void *host_ptr) {
+    (void)ctx;
+    if (host_ptr == NULL) return;
+
+    const char *symbol_name = nullptr;
+    if (RtFreeHostFn fn = resolve_symbol<RtFreeHostFn>(&symbol_name, {"rtFreeHost"})) {
+        int rc = fn(host_ptr);
+        if (rc != 0) {
+            LOG_ERROR("host_free via %s failed: rc=%d ptr=%p", symbol_name, rc, host_ptr);
+            return;
+        }
+        LOG_INFO("host_free: ptr=%p via %s", host_ptr, symbol_name);
+        return;
+    }
+
+    if (AclFreeHostFn fn = resolve_symbol<AclFreeHostFn>(&symbol_name, {"aclrtFreeHost"})) {
+        int rc = fn(host_ptr);
+        if (rc != 0) {
+            LOG_ERROR("host_free via %s failed: rc=%d ptr=%p", symbol_name, rc, host_ptr);
+            return;
+        }
+        LOG_INFO("host_free: ptr=%p via %s", host_ptr, symbol_name);
+        return;
+    }
+
+    LOG_ERROR("host_free: missing symbols rtFreeHost / aclrtFreeHost");
+}
+
+int host_register_mapped(DeviceContextHandle ctx, void *host_ptr, size_t size, int device_id, void **dev_ptr) {
+    if (host_ptr == NULL || dev_ptr == NULL) return -1;
+    *dev_ptr = nullptr;
+
+    int rc = ensure_host_api_device_ready(ctx, device_id);
+    if (rc != 0) {
+        LOG_ERROR("host_register_mapped: ensure_device_set(%d) failed: rc=%d", device_id, rc);
+        return rc;
+    }
+
+    const char *symbol_name = nullptr;
+    if (RtHostRegisterFn fn = resolve_symbol<RtHostRegisterFn>(&symbol_name, {"rtsHostRegister", "rtHostRegister"})) {
+        rc = fn(host_ptr, static_cast<uint64_t>(size), kHostRegisterMappedFlag, dev_ptr);
+        if (rc != 0 || *dev_ptr == nullptr) {
+            LOG_ERROR(
+                "host_register_mapped via %s failed: rc=%d host=%p size=%zu flag=%u", symbol_name, rc, host_ptr, size,
+                kHostRegisterMappedFlag
+            );
+            return (rc != 0) ? rc : -1;
+        }
+        LOG_INFO(
+            "host_register_mapped: host=%p dev=%p size=%zu via %s flag=%u", host_ptr, *dev_ptr, size, symbol_name,
+            kHostRegisterMappedFlag
+        );
+        return 0;
+    }
+
+    if (AclHostRegisterFn fn = resolve_symbol<AclHostRegisterFn>(&symbol_name, {"aclrtHostRegister"})) {
+        rc = fn(host_ptr, static_cast<uint64_t>(size), kHostRegisterMappedFlag, dev_ptr);
+        if (rc != 0 || *dev_ptr == nullptr) {
+            LOG_ERROR(
+                "host_register_mapped via %s failed: rc=%d host=%p size=%zu flag=%u", symbol_name, rc, host_ptr, size,
+                kHostRegisterMappedFlag
+            );
+            return (rc != 0) ? rc : -1;
+        }
+        LOG_INFO(
+            "host_register_mapped: host=%p dev=%p size=%zu via %s flag=%u", host_ptr, *dev_ptr, size, symbol_name,
+            kHostRegisterMappedFlag
+        );
+        return 0;
+    }
+
+    LOG_ERROR("host_register_mapped: missing symbols rtsHostRegister / rtHostRegister / aclrtHostRegister");
+    return -1;
+}
+
+int host_unregister_mapped(DeviceContextHandle ctx, void *host_ptr, int device_id) {
+    if (host_ptr == NULL) return -1;
+
+    int rc = ensure_host_api_device_ready(ctx, device_id);
+    if (rc != 0) {
+        LOG_ERROR("host_unregister_mapped: ensure_device_set(%d) failed: rc=%d", device_id, rc);
+        return rc;
+    }
+
+    const char *symbol_name = nullptr;
+    if (RtHostUnregisterFn fn =
+            resolve_symbol<RtHostUnregisterFn>(&symbol_name, {"rtsHostUnregister", "rtHostUnregister"})) {
+        rc = fn(host_ptr);
+        if (rc != 0) {
+            LOG_ERROR("host_unregister_mapped via %s failed: rc=%d host=%p", symbol_name, rc, host_ptr);
+            return rc;
+        }
+        LOG_INFO("host_unregister_mapped: host=%p via %s", host_ptr, symbol_name);
+        return 0;
+    }
+
+    if (AclHostUnregisterFn fn = resolve_symbol<AclHostUnregisterFn>(&symbol_name, {"aclrtHostUnregister"})) {
+        rc = fn(host_ptr);
+        if (rc != 0) {
+            LOG_ERROR("host_unregister_mapped via %s failed: rc=%d host=%p", symbol_name, rc, host_ptr);
+            return rc;
+        }
+        LOG_INFO("host_unregister_mapped: host=%p via %s", host_ptr, symbol_name);
+        return 0;
+    }
+
+    LOG_ERROR("host_unregister_mapped: missing symbols rtsHostUnregister / rtHostUnregister / aclrtHostUnregister");
+    return -1;
 }
 
 int run_runtime(

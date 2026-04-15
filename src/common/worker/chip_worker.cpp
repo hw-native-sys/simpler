@@ -37,6 +37,14 @@ T load_symbol(void *handle, const char *name) {
     return reinterpret_cast<T>(sym);
 }
 
+template <typename T>
+T try_load_symbol(void *handle, const char *name) {
+    dlerror();  // clear any existing error
+    void *sym = dlsym(handle, name);
+    (void)dlerror();
+    return reinterpret_cast<T>(sym);
+}
+
 // Process-wide singleton: libcpu_sim_context.so is loaded once with
 // RTLD_GLOBAL so that host_runtime.so can resolve sim_context_set_* and
 // pto_sim_get_* symbols at runtime.  Never dlclosed.
@@ -117,6 +125,10 @@ void ChipWorker::init(
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+        host_malloc_fn_ = try_load_symbol<HostMallocFn>(handle, "host_malloc");
+        host_free_fn_ = try_load_symbol<HostFreeFn>(handle, "host_free");
+        host_register_mapped_fn_ = try_load_symbol<HostRegisterMappedFn>(handle, "host_register_mapped");
+        host_unregister_mapped_fn_ = try_load_symbol<HostUnregisterMappedFn>(handle, "host_unregister_mapped");
     } catch (...) {
         dlclose(handle);
         throw;
@@ -164,6 +176,60 @@ void ChipWorker::reset_device() {
     device_set_ = false;
 }
 
+uint64_t ChipWorker::host_malloc(size_t size) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    if (host_malloc_fn_ == nullptr) {
+        throw std::runtime_error("host_malloc symbol is not available in the bound runtime");
+    }
+    void *ptr = host_malloc_fn_(device_ctx_, size);
+    if (ptr == nullptr) {
+        throw std::runtime_error("host_malloc returned null");
+    }
+    return reinterpret_cast<uint64_t>(ptr);
+}
+
+void ChipWorker::host_free(uint64_t host_ptr) {
+    if (host_ptr == 0) {
+        return;
+    }
+    if (host_free_fn_ == nullptr) {
+        throw std::runtime_error("host_free symbol is not available in the bound runtime");
+    }
+    host_free_fn_(device_ctx_, reinterpret_cast<void *>(host_ptr));
+}
+
+uint64_t ChipWorker::host_register_mapped(uint64_t host_ptr, size_t size, int device_id) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    if (host_register_mapped_fn_ == nullptr) {
+        throw std::runtime_error("host_register_mapped symbol is not available in the bound runtime");
+    }
+    int effective_device_id = (device_id >= 0) ? device_id : device_id_;
+    void *dev_ptr = nullptr;
+    int rc = host_register_mapped_fn_(device_ctx_, reinterpret_cast<void *>(host_ptr), size, effective_device_id, &dev_ptr);
+    if (rc != 0 || dev_ptr == nullptr) {
+        throw std::runtime_error("host_register_mapped failed with code " + std::to_string(rc));
+    }
+    return reinterpret_cast<uint64_t>(dev_ptr);
+}
+
+void ChipWorker::host_unregister_mapped(uint64_t host_ptr, int device_id) {
+    if (host_ptr == 0) {
+        return;
+    }
+    if (host_unregister_mapped_fn_ == nullptr) {
+        throw std::runtime_error("host_unregister_mapped symbol is not available in the bound runtime");
+    }
+    int effective_device_id = (device_id >= 0) ? device_id : device_id_;
+    int rc = host_unregister_mapped_fn_(device_ctx_, reinterpret_cast<void *>(host_ptr), effective_device_id);
+    if (rc != 0) {
+        throw std::runtime_error("host_unregister_mapped failed with code " + std::to_string(rc));
+    }
+}
+
 void ChipWorker::finalize() {
     reset_device();
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
@@ -180,6 +246,10 @@ void ChipWorker::finalize() {
     get_runtime_size_fn_ = nullptr;
     run_runtime_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
+    host_malloc_fn_ = nullptr;
+    host_free_fn_ = nullptr;
+    host_register_mapped_fn_ = nullptr;
+    host_unregister_mapped_fn_ = nullptr;
     runtime_buf_.clear();
     aicpu_binary_.clear();
     aicore_binary_.clear();

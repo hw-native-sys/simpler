@@ -114,9 +114,45 @@ void destroy_device_context(DeviceContextHandle ctx) { delete static_cast<Device
 size_t get_runtime_size(void) { return sizeof(Runtime); }
 
 int set_device(DeviceContextHandle ctx, int device_id) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->ensure_device_set(device_id);
+    } catch (...) {
+        return -1;
+    }
+}
+
+void *host_malloc(DeviceContextHandle ctx, size_t size) {
     (void)ctx;
+    (void)size;
+    LOG_ERROR("host_malloc is not supported on a5 onboard runtime");
+    return NULL;
+}
+
+void host_free(DeviceContextHandle ctx, void *host_ptr) {
+    (void)ctx;
+    (void)host_ptr;
+    LOG_ERROR("host_free is not supported on a5 onboard runtime");
+}
+
+int host_register_mapped(DeviceContextHandle ctx, void *host_ptr, size_t size, int device_id, void **dev_ptr) {
+    (void)ctx;
+    (void)host_ptr;
+    (void)size;
     (void)device_id;
-    return 0;
+    if (dev_ptr != NULL) {
+        *dev_ptr = NULL;
+    }
+    LOG_ERROR("host_register_mapped is not supported on a5 onboard runtime");
+    return -1;
+}
+
+int host_unregister_mapped(DeviceContextHandle ctx, void *host_ptr, int device_id) {
+    (void)ctx;
+    (void)host_ptr;
+    (void)device_id;
+    LOG_ERROR("host_unregister_mapped is not supported on a5 onboard runtime");
+    return -1;
 }
 
 int run_runtime(
