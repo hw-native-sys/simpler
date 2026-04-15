@@ -17,10 +17,16 @@ subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 
 import pytest
+
+# Exit code used when the session watchdog fires. Matches the GNU `timeout`
+# convention so shell wrappers (e.g. CI) can distinguish timeout from other
+# failures.
+TIMEOUT_EXIT_CODE = 124
 
 
 def _parse_device_range(s: str) -> list[int]:
@@ -82,6 +88,46 @@ def pytest_addoption(parser):
     )
     parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
     parser.addoption("--build", action="store_true", default=False, help="Compile runtime from source")
+    parser.addoption(
+        "--pto-isa-commit",
+        action="store",
+        default=None,
+        help="Pin pto-isa clone to this commit before running tests",
+    )
+    parser.addoption(
+        "--clone-protocol",
+        action="store",
+        default="ssh",
+        choices=["ssh", "https"],
+        help="Protocol for cloning pto-isa when --pto-isa-commit is set",
+    )
+    # Distinct from pytest-timeout's per-test --timeout (which `.[test]` pulls
+    # in on the a2a3 hardware runner); this is session-level.
+    parser.addoption(
+        "--pto-session-timeout",
+        action="store",
+        type=int,
+        default=0,
+        help=(f"Abort whole pytest session after N seconds (0 = disabled; exit code {TIMEOUT_EXIT_CODE} on timeout)"),
+    )
+
+
+def _install_session_timeout(timeout_s: int) -> None:
+    def _handler(signum, frame):
+        print(
+            f"\n{'=' * 40}\n"
+            f"[pytest] TIMEOUT: session exceeded {timeout_s}s "
+            f"({timeout_s // 60}min) limit, aborting\n"
+            f"{'=' * 40}",
+            flush=True,
+        )
+        os._exit(TIMEOUT_EXIT_CODE)
+
+    # signal.alarm / SIGALRM are Unix-only; skip silently on platforms without
+    # them so --pto-session-timeout is a no-op rather than a crash (e.g. Windows).
+    if hasattr(signal, "alarm") and hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(timeout_s)
 
 
 def pytest_configure(config):
@@ -98,6 +144,22 @@ def pytest_configure(config):
     log_level = config.getoption("--log-level", default=None)
     if log_level:
         os.environ["PTO_LOG_LEVEL"] = log_level
+
+    commit = config.getoption("--pto-isa-commit")
+    if commit:
+        from simpler_setup.code_runner import _ensure_pto_isa_root  # noqa: PLC0415
+
+        root = _ensure_pto_isa_root(
+            verbose=True,
+            commit=commit,
+            clone_protocol=config.getoption("--clone-protocol"),
+        )
+        if root:
+            os.environ["PTO_ISA_ROOT"] = root
+
+    timeout = config.getoption("--pto-session-timeout")
+    if timeout and timeout > 0:
+        _install_session_timeout(timeout)
 
 
 def pytest_collection_modifyitems(session, config, items):
@@ -186,6 +248,9 @@ def pytest_runtestloop(session):
         print(f"\n{'=' * 60}\n{header}\n{'=' * 60}\n", flush=True)
 
         result = subprocess.run(cmd, check=False, cwd=session.config.invocation_params.dir)
+        if result.returncode == TIMEOUT_EXIT_CODE:
+            print(f"\n*** Runtime {rt}: TIMED OUT ***\n", flush=True)
+            os._exit(TIMEOUT_EXIT_CODE)
         if result.returncode != 0:
             failed = True
             print(f"\n*** Runtime {rt}: FAILED ***\n", flush=True)
