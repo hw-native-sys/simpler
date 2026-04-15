@@ -458,6 +458,88 @@ So unroll is not "worse" in the meaningful sense. Its absolute latency is
 larger because the workload is massively larger, while its orchestration cost
 per submitted task is much lower.
 
+## Fresh TensorMap Profiling
+
+This section is the required profiling checkpoint for the current branch.
+Any optimization that touches the manual-scope runtime hot path or the manual
+paged-attention orchestration should refresh both this section and the benchmark
+table above with new real-device data.
+
+### Method
+
+- local profiling-only rebuild with:
+  - `PTO2_ORCH_PROFILING=1`
+  - `PTO2_TENSORMAP_PROFILING=1`
+- platform: `a2a3`
+- device: `9`
+- PTO-ISA commit: `d96c8784`
+- rounds: `30`
+- mode: `--skip-golden`
+- AUTO runner:
+  - `python examples/a2a3/tensormap_and_ringbuffer/paged_attention/test_paged_attention.py -p a2a3 -d 9 -n 30 --case <Case> --skip-golden`
+- manual runner:
+  - `python examples/scripts/run_example.py -k examples/a2a3/tensormap_and_ringbuffer/paged_attention_manual_scope/kernels -g examples/a2a3/tensormap_and_ringbuffer/paged_attention_manual_scope/golden.py -p a2a3 -d 9 -c d96c8784 -n 30 --case <Case> --skip-golden`
+- parsing:
+  - per-round device-log `=== Orchestrator Profiling ===` blocks
+  - per-round device-log `=== TensorMap Lookup Stats ===` blocks
+  - trimmed average for time fields, mean for lookup / insert counts
+
+### Results
+
+| Case | Mode | Tasks | `lookup+dep` Trim (us) | `tensormap_ins` Trim (us) | TensorMap Lookups Avg | TensorMap Inserts Avg | Profiled Submit Trim (us) | Full Orch Trim (us) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `Case1` | AUTO | 13 | 4.132 | 1.842 | 40.0 | 12.0 | 16.422 | 194.508 |
+| `Case1` | MANUAL | 13 | 1.944 | 1.414 | 16.0 | 3.0 | 14.458 | 259.318 |
+| `Case2` | AUTO | 33 | 6.320 | 2.638 | 105.0 | 32.0 | 24.368 | 210.274 |
+| `Case2` | MANUAL | 33 | 2.598 | 1.728 | 41.0 | 8.0 | 21.560 | 285.182 |
+
+### What The Numbers Prove
+
+- The manual-local TensorMap bypass is working.
+  - `Case1`: lookups dropped from `40.0` to `16.0` (`-60.0%`), inserts
+    dropped from `12.0` to `3.0` (`-75.0%`), and `lookup+dep` time dropped
+    from `4.132us` to `1.944us` (`-53.0%`).
+  - `Case2`: lookups dropped from `105.0` to `41.0` (`-61.0%`), inserts
+    dropped from `32.0` to `8.0` (`-75.0%`), and `lookup+dep` time dropped
+    from `6.320us` to `2.598us` (`-58.9%`).
+- The manual path still shows non-zero TensorMap traffic because boundary
+  tensors still use TensorMap in v0. That is expected.
+- The remaining non-unroll regression is no longer explained by TensorMap.
+  - The profiled submit buckets are lower in manual mode
+    (`-12.0%` in `Case1`, `-11.5%` in `Case2`).
+  - But full orchestration time is still much higher
+    (`+33.3%` in `Case1`, `+35.6%` in `Case2`).
+
+### Why Full Orch Is Still Worse
+
+The gap has moved out of the TensorMap buckets.
+
+The current profiling points to two more likely hot regions:
+
+1. Orchestration-side explicit-dep construction.
+   The manual paged-attention orchestration adds many `Arg.add_dep(...)`
+   calls and threads task ids explicitly through the loop body.
+2. Runtime explicit-dep validation and dedupe before the first profiled phase.
+   `pto2_submit_mixed_task()` validates every explicit dep against the current
+   scope and deduplicates it before the first `alloc/sync/lookup/insert` lap is
+   recorded.
+
+So the next optimization target is no longer "remove more TensorMap work".
+It is "make explicit-dep construction and validation cheaper".
+
+### Code Pointers For The Current Design
+
+- Current-manual-scope-local classification:
+  - [pto_orchestrator.cpp](/data/uvxiao/pto-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp#L143)
+- Manual-local tensors bypass TensorMap lookup / insert here:
+  - [pto_orchestrator.cpp](/data/uvxiao/pto-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp#L742)
+- Explicit deps are validated and deduplicated here:
+  - [pto_orchestrator.cpp](/data/uvxiao/pto-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp#L627)
+- `Arg.add_dep(...)` storage is a simple append here:
+  - [pto_types.h](/data/uvxiao/pto-runtime/src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_types.h#L228)
+- The manual paged-attention example that exercises this path is here:
+  - [paged_attention_orch.cpp](/data/uvxiao/pto-runtime/examples/a2a3/tensormap_and_ringbuffer/paged_attention_manual_scope/kernels/orchestration/paged_attention_orch.cpp#L131)
+
 ## Current Implementation Gap
 
 The runtime and manual paged-attention examples now match the core v0 alignment
@@ -474,6 +556,8 @@ The remaining work is performance-focused:
 
 - reduce non-unroll manual orchestration cost without reintroducing TensorMap
   fallback for manual-local tensors
+- focus the next optimization round on explicit-dep construction / validation,
+  not on TensorMap lookup / insert removal
 - keep the unroll gains while tightening the small-workload path
 
 ## Historical Optimization Notes
