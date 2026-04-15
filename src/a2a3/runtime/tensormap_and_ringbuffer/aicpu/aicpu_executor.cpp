@@ -1097,6 +1097,13 @@ struct AicpuExecutor {
                     }
                 }
 
+                // Guard: a preceding task in this batch may have drained all cores;
+                // re-enqueue the rest of the batch instead of popping an empty mask.
+                if (!cores.has_value()) {
+                    rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
+                    break;
+                }
+
                 dispatched_any = true;
                 try_pushed = true;
 #if PTO2_SCHED_PROFILING
