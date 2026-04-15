@@ -97,7 +97,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     int q_tile_size = static_cast<int>(args[3]);
     // args[4] = block_size, args[5] = head_dim
 
-    if (q_tile_size == 16) {
+    int block_size = static_cast<int>(args[4]);
+    int head_dim = static_cast<int>(args[5]);
+
+    if (q_tile_size == 16 && block_size == 16) {
+        pv_matmul_impl<16, 16, 16>(pij, vj, oi_new);
+    } else if (q_tile_size == 16) {
         pv_matmul_impl<16, 128, 128>(pij, vj, oi_new);
     } else {
         pv_matmul_impl<64, 64, 128>(pij, vj, oi_new);

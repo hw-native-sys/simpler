@@ -1225,6 +1225,11 @@ def _run_single_platform(platform: str, args: argparse.Namespace) -> list[TaskRe
     """Run all tasks for a single platform. Returns list of TaskResults."""
     is_sim = platform.endswith("sim")
 
+    # Ensure PTO-ISA is available before task discovery so that downstream
+    # pytest scene tests (which share the same clone path) can find it even
+    # when ci.py itself has no tasks to run.
+    ensure_pto_isa(args.pto_isa_commit, args.clone_protocol)
+
     tasks = discover_tasks(platform, runtime_filter=args.runtime)
     if not tasks:
         logger.info(f"[{platform}] No tasks found")
