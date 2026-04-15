@@ -17,11 +17,33 @@
 
 #include "device_runner.h"
 
+#ifdef BUILD_WITH_NEW_CANN
+#include "load_aicpu_op.h"
+#endif
+
 #include <cassert>
 #include <cstring>
+#include <dlfcn.h>
 #include <iostream>
 #include <string>
 #include <vector>
+
+#ifdef BUILD_WITH_NEW_CANN
+
+static std::string resolve_dispatcher_so_path() {
+    Dl_info info;
+    if (dladdr(reinterpret_cast<void*>(resolve_dispatcher_so_path), &info) == 0 || info.dli_fname == nullptr) {
+        return "";
+    }
+    std::string so_dir = info.dli_fname;
+    size_t pos = so_dir.rfind('/');
+    if (pos == std::string::npos) {
+        return "libaicpu_dispatcher.so";
+    }
+    so_dir = so_dir.substr(0, pos + 1);
+    return so_dir + "libaicpu_dispatcher.so";
+}
+#endif
 
 #include "callable.h"
 #include "host/host_regs.h"  // Register address retrieval
@@ -232,14 +254,14 @@ int DeviceRunner::ensure_binaries_loaded(
     aicore_kernel_binary_ = aicore_kernel_binary;
 
 #ifdef BUILD_WITH_NEW_CANN
-    // New interface: Initialize AICPU loader with binary data
-    const std::vector<std::string> kernel_names = {"DynTileFwkKernelServerInit", "DynTileFwkKernelServer"};
-    int rc = aicpu_loader_.init_with_binary(aicpu_so_binary, kernel_names);
+    // New interface: Initialize LoadAicpuOp (loads dispatcher SO)
+    std::string dispatcher_so_path = resolve_dispatcher_so_path();
+    int rc = load_aicpu_op_.Init(dispatcher_so_path);
     if (rc != 0) {
-        LOG_ERROR("AicpuLoader init_with_binary failed: %d", rc);
+        LOG_ERROR("LoadAicpuOp::Init failed: %d", rc);
         return rc;
     }
-    LOG_INFO("DeviceRunner: AICPU loader initialized with binary data");
+    LOG_INFO("DeviceRunner: LoadAicpuOp initialized");
 #else
     int rc = 0;
 #endif
@@ -407,6 +429,28 @@ int DeviceRunner::run(
         return rc;
     }
 
+#ifdef BUILD_WITH_NEW_CANN
+    // Three-phase launch pattern with dispatcher:
+    // 1. Load (Null) - Pass inner SO binary to dispatcher
+    // 2. Init - Initialize inner SO
+    // 3. Run - Execute actual kernel
+    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerNull (Load) ===" << '\n';
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerNull", 1);
+    if (rc != 0) {
+        LOG_ERROR("launch_aicpu_kernel (load/null) failed: %d", rc);
+        return rc;
+    }
+
+    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerInit (Init) ===" << '\n';
+    // Launch AICPU init kernel
+    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
+    if (rc != 0) {
+        LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
+        return rc;
+    }
+
+    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer (Run) ===" << '\n';
+#else
     std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerInit===" << '\n';
     // Launch AICPU init kernel
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
@@ -416,6 +460,7 @@ int DeviceRunner::run(
     }
 
     std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer===" << '\n';
+#endif
     // Launch AICPU main kernel (over-launch for affinity gate)
     rc = launch_aicpu_kernel(
         stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
@@ -493,8 +538,12 @@ int DeviceRunner::finalize() {
     // Cleanup AICPU SO
     so_info_.finalize();
 
+#ifdef BUILD_WITH_NEW_CANN
+    // LoadAicpuOp cleanup happens automatically in destructor
+#else
     // Cleanup AICPU loader
     aicpu_loader_.finalize();
+#endif
 
     // Kernel binaries should have been removed by validate_runtime_impl()
     if (!func_id_to_addr_.empty()) {
@@ -536,7 +585,23 @@ int DeviceRunner::finalize() {
 }
 
 int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num) {
+#ifdef BUILD_WITH_NEW_CANN
+    // Map kernel name to LoadAicpuOp function name
+    std::string func_name;
+    if (std::strcmp(kernel_name, "DynTileFwkKernelServerInit") == 0) {
+        func_name = host::KernelNames::InitName;
+    } else if (std::strcmp(kernel_name, "DynTileFwkKernelServer") == 0) {
+        func_name = host::KernelNames::RunName;
+    } else if (std::strcmp(kernel_name, "DynTileFwkKernelServerNull") == 0) {
+        func_name = host::KernelNames::NullName;
+    } else {
+        LOG_ERROR("Unknown kernel name: %s", kernel_name);
+        return -1;
+    }
+    return load_aicpu_op_.LaunchBuiltInOp(stream, k_args, aicpu_num, func_name, kernel_name);
+#else
     return aicpu_loader_.launch(stream, k_args, kernel_name, aicpu_num);
+#endif
 }
 
 int DeviceRunner::launch_aicore_kernel(rtStream_t stream, Runtime *runtime) {

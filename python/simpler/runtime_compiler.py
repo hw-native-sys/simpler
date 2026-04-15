@@ -233,6 +233,12 @@ class RuntimeCompiler:
                 od.mkdir(parents=True, exist_ok=True)
                 dest = od / binary_name
                 shutil.copy2(binary_path, dest)
+                dispatcher_so = Path(actual_build_dir) / "libaicpu_dispatcher.so"
+                if dispatcher_so.is_file():
+                    dest_dispatcher = od / "libaicpu_dispatcher.so"
+                    shutil.copy2(dispatcher_so, dest_dispatcher)
+                    # Strip debug info to match CANN built-in SO format
+                    subprocess.run(["strip", "-s", str(dest_dispatcher)], check=True)
                 return dest
             else:
                 with open(binary_path, "rb") as f:

@@ -43,7 +43,11 @@
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
 #include "host/performance_collector.h"
+#ifdef BUILD_WITH_NEW_CANN
+#include "load_aicpu_op.h"
+#else
 #include "aicpu_loader.h"
+#endif
 #include "runtime.h"
 
 /**
@@ -344,7 +348,11 @@ private:
     std::vector<uint8_t> aicore_kernel_binary_;
 
     // AICPU loader abstraction (supports both legacy and new CANN interfaces)
+#ifdef BUILD_WITH_NEW_CANN
+    host::LoadAicpuOp load_aicpu_op_;
+#else
     AicpuLoader aicpu_loader_;
+#endif
 
     // Memory management
     MemoryAllocator mem_alloc_;

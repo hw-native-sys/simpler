@@ -41,3 +41,7 @@ compile_commands.json
 # Built nanobind extensions
 python/_task_interface*.so
 python/_task_interface*.dylib
+
+# Log files
+*.log
+profiling_logs_*/

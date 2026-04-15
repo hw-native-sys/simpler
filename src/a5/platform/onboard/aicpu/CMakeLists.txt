@@ -10,6 +10,7 @@ project(aicpu_kernel LANGUAGES C CXX)
 set(CMAKE_CUSTOM_INCLUDE_DIRS "")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../include")
 list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/task_interface")
+list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher")
 if(DEFINED CUSTOM_INCLUDE_DIRS)
     foreach(INC_DIR ${CUSTOM_INCLUDE_DIRS})
         list(APPEND CMAKE_CUSTOM_INCLUDE_DIRS "${INC_DIR}")
@@ -74,4 +75,39 @@ target_link_directories(aicpu_kernel
 
 # Output name
 set_target_properties(aicpu_kernel PROPERTIES OUTPUT_NAME aicpu_kernel)
+
+# Build dispatcher SO (two-layer architecture)
+set(AICPU_DISPATCHER_SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/aicpu_dispatcher/aicpu_dispatcher.cpp"
+)
+add_library(aicpu_dispatcher SHARED ${AICPU_DISPATCHER_SOURCES})
+
+# Compiler options for dispatcher (same as AICPU kernel)
+target_compile_options(aicpu_dispatcher
+    PRIVATE
+        -Wall
+        -Wextra
+        -rdynamic
+        -O3
+        -fPIC
+        -g
+        $<$<COMPILE_LANGUAGE:CXX>:-std=gnu++17>
+)
+
+# Include directories for dispatcher
+target_include_directories(aicpu_dispatcher
+    PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}
+        ${CMAKE_CUSTOM_INCLUDE_DIRS}
+        ${ASCEND_HOME_PATH}/include
+)
+
+# Link against dl for dlopen/dlsym
+target_link_libraries(aicpu_dispatcher PRIVATE dl)
+
+# Match CANN built-in SO properties: SYMBOLIC flag, build-id, stripped
+set_target_properties(aicpu_dispatcher PROPERTIES
+    LINK_FLAGS "-Wl,-Bsymbolic,--build-id"
+    OUTPUT_NAME "aicpu_dispatcher"
+)
 
