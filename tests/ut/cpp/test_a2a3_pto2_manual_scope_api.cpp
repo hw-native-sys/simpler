@@ -116,6 +116,8 @@ TEST(A2A3ManualScopeApi, SubmitAndAllocExposeTaskIds) {
     Tensor alloc_tensor = make_tensor_external(reinterpret_cast<void *>(0x20), shape, 1);
     submit_tensor.owner_task_id = PTO2TaskId::make(0, 17);
     alloc_tensor.owner_task_id = PTO2TaskId::make(0, 23);
+    runtime.submit_result.set_task_id(PTO2TaskId::make(0, 17));
+    runtime.alloc_result.set_task_id(PTO2TaskId::make(0, 23));
     runtime.submit_result.materialize_output(submit_tensor);
     runtime.alloc_result.materialize_output(alloc_tensor);
     RuntimeBindingGuard bind(reinterpret_cast<PTO2Runtime *>(&runtime));

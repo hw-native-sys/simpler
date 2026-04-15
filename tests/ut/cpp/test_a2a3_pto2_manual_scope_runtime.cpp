@@ -171,4 +171,61 @@ TEST_F(ManualScopeRuntimeTest, ExplicitDepRejectsTaskFromClosedScopeAtSameDepth)
     EXPECT_TRUE(second.empty());
 }
 
+TEST(ManualScopeRuntimeStandaloneTest, ZeroOutputTaskStillExposesTaskId) {
+    EXPECT_EXIT(
+        {
+            PTO2Runtime *rt = pto2_runtime_create(PTO2_MODE_GRAPH_ONLY);
+            if (rt == nullptr) {
+                exit(2);
+            }
+
+            pto2_scope_begin(&rt->orchestrator, PTO2ScopeMode::MANUAL);
+
+            static const uint32_t kShape[1] = {1};
+            TensorCreateInfo output_ci(kShape, 1, DataType::FLOAT32);
+            Arg alloc_args;
+            alloc_args.add_output(output_ci);
+            TaskSubmitResult alloc = pto2_alloc_tensors(&rt->orchestrator, alloc_args);
+            if (!alloc.task_id().is_valid()) {
+                pto2_runtime_destroy(rt);
+                exit(3);
+            }
+
+            Arg update_args;
+            update_args.add_inout(alloc.get_ref(0));
+            update_args.add_dep(alloc.task_id());
+            MixedKernels kernels{};
+            kernels.aiv0_kernel_id = 0;
+
+            TaskSubmitResult update = pto2_submit_mixed_task(&rt->orchestrator, kernels, update_args);
+            int exit_code = update.task_id().is_valid() ? 0 : 1;
+            pto2_runtime_destroy(rt);
+            exit(exit_code);
+        },
+        ::testing::ExitedWithCode(0), ""
+    );
+}
+
+TEST_F(ManualScopeRuntimeTest, ManualLocalInoutDoesNotPublishTensorMapEntry) {
+    pto2_scope_begin(&rt_->orchestrator, PTO2ScopeMode::MANUAL);
+
+    TensorCreateInfo state_ci = make_create_info();
+    Arg alloc_args;
+    alloc_args.add_output(state_ci);
+    TaskSubmitResult alloc = pto2_alloc_tensors(&rt_->orchestrator, alloc_args);
+    ASSERT_FALSE(rt_->orchestrator.fatal);
+    ASSERT_TRUE(alloc.task_id().is_valid());
+    ASSERT_EQ(rt_->orchestrator.tensor_map.valid_count(), 0);
+
+    Arg update_args;
+    update_args.add_inout(alloc.get_ref(0));
+    update_args.add_dep(alloc.task_id());
+    MixedKernels kernels{};
+    kernels.aiv0_kernel_id = 0;
+
+    (void)pto2_submit_mixed_task(&rt_->orchestrator, kernels, update_args);
+    ASSERT_FALSE(rt_->orchestrator.fatal);
+    EXPECT_EQ(rt_->orchestrator.tensor_map.valid_count(), 0);
+}
+
 }  // namespace

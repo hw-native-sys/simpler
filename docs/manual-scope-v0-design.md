@@ -12,8 +12,8 @@ Add a lighter manual-scope mode to `a2a3/tensormap_and_ringbuffer` that:
 - does not introduce a separate manual submit API family
 - does not support delayed dependency wiring
 - publishes tasks at submit time, like AUTO mode
-- allows explicit same-scope task ordering without relying entirely on
-  TensorMap rediscovery
+- allows explicit same-scope task ordering without using TensorMap for
+  current-manual-scope-local tensors
 
 This is intentionally smaller than the previous manual-scope branch.
 
@@ -26,8 +26,8 @@ The v0 branch must follow these rules:
 3. Do not support delayed wiring and delayed linking.
 4. Publish at submit time, same as AUTO mode.
 5. Treat tensor allocation as a task for manual dependency building.
-6. Determine whether TensorMap lookup is required from tensor scope metadata
-   first, not from ring id.
+6. Determine whether TensorMap lookup or insert is required from tensor scope
+   metadata first, not from ring id.
 
 ## Non-goals
 
@@ -35,6 +35,7 @@ The v0 branch must follow these rules:
 - no post-submit `add_dependency(...)`
 - no delayed explicit-edge replay or scope-end linking
 - no batch publish barrier at manual `scope_end()`
+- no implicit TensorMap fallback for current-manual-scope-local tensors
 - no attempt to redesign AUTO mode
 
 ## User-Facing API
@@ -63,6 +64,14 @@ auto out = pto2_rt_submit_task(mixed_kernels, args);
 
 No `*_manual(...)` or `*_manual_with_deps(...)` APIs in v0.
 
+Each submit result should carry:
+
+- a standalone `task_id`
+- zero or more materialized output tensors
+
+The returned task id must not depend on whether the task created any new
+`OUTPUT` tensors.
+
 ### Explicit dependencies
 
 `Arg` grows explicit dependency support:
@@ -86,8 +95,8 @@ Rules:
 
 ```cpp
 auto alloc = alloc_tensors(create_info0, create_info1);
-// alloc.task_id
-// alloc.outputs
+// alloc.task_id()
+// alloc.get_ref(...)
 ```
 
 This allows later manual tasks to depend on the allocation task explicitly.
@@ -102,7 +111,7 @@ Manual mode in v0 is:
 
 - AUTO-style submit and publish
 - plus explicit deps from `Arg`
-- plus reduced TensorMap work for current-manual-scope-local tensors
+- plus full TensorMap bypass for current-manual-scope-local tensors
 
 There is no hidden manual subgraph and no delayed publish.
 
@@ -115,11 +124,11 @@ Inside manual scope, submit should do this:
 3. Validate that explicit deps belong to the current manual scope.
 4. Turn explicit deps into ordinary fanins immediately.
 5. Classify tensor args as current-manual-scope-local or boundary.
-6. Skip TensorMap lookup for manual-local producer-flow tensors only when the
-   explicit task ids already cover the producing tasks.
-7. Keep TensorMap lookup/insert for modifier tensors (`INOUT`,
-   `OUTPUT_EXISTING`) because v0 does not expose a returned task id for
-   zero-output updater tasks.
+6. Do not perform TensorMap lookup or TensorMap insert for any manual-local
+   tensor, regardless of whether it is `INPUT`, `INOUT`, or
+   `OUTPUT_EXISTING`.
+7. Treat explicit task ids as the only dependency source for manual-local
+   tensors.
 8. Keep normal creator-retention and TensorMap behavior for boundary tensors.
 9. Publish the task immediately, same as AUTO mode.
 
@@ -148,7 +157,7 @@ distinguishing outer-manual-scope tensors.
 
 External tensors use invalid producer scope metadata.
 
-## Tensor Lookup Rule
+## Tensor Dependency Rule
 
 When a tensor is used inside manual scope:
 
@@ -161,11 +170,11 @@ Treat a tensor as manual-local only when:
 
 Behavior:
 
-- for producer-flow inputs, explicit task ids are the primary ordering source
-- if the producing task is already covered by `Arg.add_dep(...)`, lookup can
-  skip the manual-local creator / modifier rediscovery
-- modifier tensors (`INOUT`, `OUTPUT_EXISTING`) still publish through
-  TensorMap so later updates can chain correctly
+- explicit task ids are the only ordering source
+- do not perform TensorMap lookup
+- do not perform TensorMap insert
+- do not rely on TensorMap to rediscover either creators or modifiers
+- producer / updater coverage must already be present in `Arg.add_dep(...)`
 
 ### Boundary tensor
 
@@ -191,6 +200,10 @@ This is intentionally conservative.
 - keep creator retention through task ownership metadata
 
 It is orthogonal to manual scope.
+
+Inside manual scope, `manual_dep=true` is mainly useful for boundary tensors.
+Manual-local tensors already bypass TensorMap by scope rule, so they do not
+need `manual_dep=true` to get that behavior.
 
 ## Representation Change From Previous Design
 
@@ -240,22 +253,12 @@ submit API family.
 
 ## Important Limitation
 
-V0 cannot express every same-scope chain only with `Arg.add_dep(...)`.
+V0 still rejects nested manual scopes and still requires explicit deps to be
+known at submit time.
 
-Reason:
-
-- `alloc_tensors(...)` returns a task id because it returns materialized outputs
-- normal producer tasks also expose task ids through their returned outputs
-- a zero-output updater does not expose a returned task-id handle in
-  `TaskOutputTensors`
-
-Practical consequence:
-
-- explicit deps are enough for `qk -> softmax -> pv -> update`
-- they are not enough to express `update(i) -> update(i+1)` when the updater
-  only modifies existing tensors
-- v0 therefore keeps TensorMap publication / lookup for modifier tensors even
-  inside manual scope
+With a standalone task id in `TaskOutputTensors`, a zero-output updater can
+still be named by later `Arg.add_dep(...)` calls. That keeps manual-local
+dependency expression explicit without relying on TensorMap fallback.
 
 ## Validation Plan
 
@@ -265,8 +268,7 @@ Practical consequence:
 - reject invalid task ids in manual scope
 - reject explicit deps that are not from the current manual scope
 - reject nested manual scopes
-- verify manual-local tensors skip TensorMap lookup when explicit deps are
-  present
+- verify manual-local tensors skip both TensorMap lookup and TensorMap insert
 - verify boundary tensors still use TensorMap
 
 ### Allocation behavior
@@ -286,7 +288,10 @@ Practical consequence:
 ## Validation Status
 
 This document reflects the cleaned `manual_scope_v0` branch state validated on
-2026-04-15.
+2026-04-15. The validation below is the status of the current implementation,
+including the latest unit-level alignment for direct submit-result task ids and
+manual-local TensorMap bypass. Real-device reruns should still be refreshed
+after any further runtime tuning.
 
 ### Automated checks
 
@@ -428,13 +433,20 @@ So unroll is not "worse" in the meaningful sense. Its absolute latency is
 larger because the workload is massively larger, while its orchestration cost
 per submitted task is much lower.
 
-## Why Modifier Tensors Still Use TensorMap
+## Current Implementation Gap
 
-The main correctness-sensitive runtime choice in v0 is still:
+The unit-tested runtime now matches the two core v0 alignment rules:
 
-| Change | Files / Functions Touched | Why It Matters | Observed Effect |
-| --- | --- | --- | --- |
-| Keep TensorMap for manual-scope modifier tensors | `src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp` `pto2_submit_mixed_task()` | V0 has no returned task-id handle for zero-output updater tasks. Explicit deps can describe `qk -> softmax -> pv -> update`, but they still cannot express `update(i) -> update(i+1)` when the updater only mutates existing tensors. TensorMap publication / lookup on `INOUT` / `OUTPUT_EXISTING` keeps those repeated updates ordered correctly. | Current branch passes all eight fresh hardware golden checks. The remaining unroll gap is small but still concentrated in orchestration, which is consistent with modifier tensors continuing to pay TensorMap cost. |
+- `TaskOutputTensors` carries `task_id` directly, including for zero-output
+  updater tasks
+- manual-local tensors bypass TensorMap lookup and TensorMap insert in the
+  submit path
+
+The remaining validation work is end-to-end:
+
+- rerun real-device golden checks after the alignment change
+- rerun fresh benchmarks to measure how much orchestration time the stricter
+  bypass removes on the manual-scope examples
 
 ## Historical Optimization Notes
 
@@ -469,10 +481,8 @@ reverted there, or later dropped from this PR scope.
 
 1. Manual scope still relies on orchestration authors to supply producer-flow
    explicit deps correctly.
-2. V0 cannot fully replace TensorMap for modifier chains when the updater task
-   does not return an output-backed task id.
-3. Wrong scope metadata would still cause incorrect locality classification.
-4. The current non-unroll benchmark gap is large enough that performance should
+2. Wrong scope metadata would still cause incorrect locality classification.
+3. The current non-unroll benchmark gap is large enough that performance should
    not be described as improved relative to AUTO.
 
 ## Recommendation
@@ -485,10 +495,13 @@ Keep v0 narrow and explicit:
 - no delayed linking
 - immediate publish
 - alloc returns `task_id`
+- submit results carry `task_id` directly, independent of outputs
 - scope-depth metadata decides locality
-- modifier tensors keep TensorMap chaining until the API can expose zero-output
-  updater task ids in a lighter way
+- manual-local tensors bypass TensorMap entirely
 
-This is the smallest v0 design that is functionally correct on the current
-hardware batch. The next optimization work should focus first on the
-non-unroll orchestration regression without widening the API again.
+This is the smallest v0 target design that keeps the API narrow. The current
+branch is functionally correct on the current hardware batch, but it is not yet
+fully aligned with the stricter "manual-local tensors bypass TensorMap
+entirely" rule above. The next implementation work should close that gap first,
+then focus on the non-unroll orchestration regression without widening the API
+again.

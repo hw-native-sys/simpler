@@ -749,22 +749,23 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         const Tensor *tensor = args.tensor(i).ptr;
         bool manual_local = pto2_is_current_manual_scope_local(orch, *tensor);
 
-        // Step A: creator retention — all existing tensors extend their creator lifetime.
+        // Step A: boundary tensors keep creator retention; manual-local tensors
+        // rely only on explicit deps in v0.
         PTO2TaskId owner = tensor->owner_task_id;
-        if (owner.is_valid() && sched != nullptr) {
-            if (!(manual_local && explicit_dep_count > 0 &&
-                  pto2_explicit_dep_ids_contains(explicit_dep_ids, explicit_dep_count, owner))) {
-                PTO2TaskSlotState *prod_state =
-                    &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
-                if (!pto2_append_fanin_or_fail(
-                        orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "creator retention"
-                    )) {
-                    return result;
-                }
+        if (!manual_local && owner.is_valid() && sched != nullptr) {
+            PTO2TaskSlotState *prod_state =
+                &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
+            if (!pto2_append_fanin_or_fail(
+                    orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "creator retention"
+                )) {
+                return result;
             }
         }
 
-        // Step B: only INPUT/INOUT need modifier dependency lookup.
+        // Step B: boundary INPUT/INOUT tensors still use TensorMap for modifier chaining.
+        if (manual_local) {
+            continue;
+        }
         if (ptype != TensorArgType::INPUT && ptype != TensorArgType::INOUT) {
             continue;
         }
@@ -799,11 +800,8 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         for (int i = 0; i < args.tensor_count(); i++) {
             TensorArgType ptype = args.tag(i);
             if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
-                // Manual scope still needs TensorMap publication for modifier tensors.
-                // V0 can express producer->consumer edges via returned task IDs, but a
-                // zero-output updater has no returned task-id handle, so later INOUT /
-                // OUTPUT_EXISTING uses still rely on TensorMap chaining.
-                if (!args.tensor(i).ptr->manual_dep) {
+                const Tensor *tensor = args.tensor(i).ptr;
+                if (!pto2_is_current_manual_scope_local(orch, *tensor) && !tensor->manual_dep) {
                     orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
                 }
             }
@@ -824,6 +822,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
     payload->init(args, result, prepared.alloc_result.packed_base, layout.offsets, layout.buffer_sizes);
+    result.set_task_id(prepared.task_id);
 
     // Write owner_task_id into materialized OUTPUT tensors so creator-only dependency
     // tracking remains available even when manual_dep skips OverlapMap publication.
@@ -964,6 +963,7 @@ TaskSubmitResult pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &args
 
     TaskSubmitResult outputs;
     payload->init(args, outputs, prepared.alloc_result.packed_base, layout.offsets, layout.buffer_sizes);
+    outputs.set_task_id(prepared.task_id);
     payload->fanin_actual_count = 0;
     payload->fanin_spill_start = 0;
     payload->fanin_spill_pool = nullptr;
