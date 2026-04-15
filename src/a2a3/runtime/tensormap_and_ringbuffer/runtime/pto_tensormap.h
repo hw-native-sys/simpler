@@ -216,6 +216,11 @@ struct PTO2TensorMap {
     // Per-ring validity threshold (for lazy invalidation)
     int32_t last_task_alives[PTO2_MAX_RING_DEPTH];  // Cached from shared memory per ring
 
+    // Per-ring iteration isolation for parallel for.
+    // -1 = normal mode (no filtering); >= 0 = parallel for mode, entries with
+    // local_id < iter_start on the same ring are filtered out during lookup.
+    int32_t iter_start_local_ids[PTO2_MAX_RING_DEPTH];
+
     // Per-ring cleanup progress (for periodic cleanup_retired)
     int32_t last_cleanup[PTO2_MAX_RING_DEPTH]{};
 
@@ -326,6 +331,17 @@ struct PTO2TensorMap {
             if (!entry_valid(*cur_entry)) {
                 cur_entry = next_entry;
                 continue;
+            }
+
+            // Parallel for iteration isolation: skip entries from prior iterations
+            // on the same ring. Outer-ring entries have iter_start_local_ids == -1
+            // and pass through unconditionally.
+            {
+                int32_t iter_start = iter_start_local_ids[cur_entry->producer_task_id.ring()];
+                if (iter_start >= 0 && static_cast<int32_t>(cur_entry->producer_task_id.local()) < iter_start) {
+                    cur_entry = next_entry;
+                    continue;
+                }
             }
 
             // Entry is valid - check if regions OVERLAP (not just exact match)
