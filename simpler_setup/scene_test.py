@@ -700,7 +700,7 @@ class SceneTestCase:
             return self._compile_l3_callables(platform)
         raise ValueError(f"Unsupported level: {self._st_level}")
 
-    def _build_config(self, config_dict, enable_profiling=False, enable_dump_tensor=False):
+    def _build_config(self, config_dict, enable_profiling=0, enable_dump_tensor=False):
         from simpler.task_interface import ChipCallConfig  # noqa: PLC0415
 
         config = ChipCallConfig()
@@ -791,7 +791,7 @@ class SceneTestCase:
 
             config = self._build_config(
                 config_dict,
-                enable_profiling=(enable_profiling and round_idx == 0),
+                enable_profiling=(enable_profiling if round_idx == 0 else 0),
                 enable_dump_tensor=enable_dump_tensor,
             )
 
@@ -847,7 +847,7 @@ class SceneTestCase:
 
             config = self._build_config(
                 config_dict,
-                enable_profiling=(enable_profiling and round_idx == 0),
+                enable_profiling=(enable_profiling if round_idx == 0 else 0),
                 enable_dump_tensor=enable_dump_tensor,
             )
 
@@ -948,7 +948,15 @@ class SceneTestCase:
         )
         parser.add_argument("-n", "--rounds", type=int, default=1, help="Run each case N times (default: 1)")
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
-        parser.add_argument("--enable-profiling", action="store_true", help="Enable profiling (first round only)")
+        parser.add_argument(
+            "--enable-profiling",
+            type=int,
+            nargs="?",
+            const=3,
+            default=0,
+            metavar="LEVEL",
+            help="Swimlane profiling mode: 1=AICore only, 2=task+fanout, 3=full (default when flag given: 3)",
+        )
         parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
         parser.add_argument("--build", action="store_true", help="Compile runtime from source")
         parser.add_argument(

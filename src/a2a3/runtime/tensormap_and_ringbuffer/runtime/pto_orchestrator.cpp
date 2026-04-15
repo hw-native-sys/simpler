@@ -95,8 +95,8 @@ __attribute__((weak, visibility("hidden"))) void
 perf_aicpu_record_orch_phase(AicpuPhaseId, uint64_t, uint64_t, uint32_t, uint64_t) {}
 // submit_idx needed for swimlane task_id tagging (no cycle accumulation at this level)
 static uint32_t g_orch_submit_idx = 0;
-#define CYCLE_COUNT_START()                     \
-    bool _prof_active = orch->enable_profiling; \
+#define CYCLE_COUNT_START()                      \
+    bool _prof_active = (orch->perf_level >= 3); \
     uint64_t _t0 = _prof_active ? get_sys_cnt_aicpu() : 0, _t1 = 0
 #define CYCLE_COUNT_LAP(acc) \
     do {                     \

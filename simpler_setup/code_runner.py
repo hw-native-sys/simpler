@@ -123,6 +123,12 @@ def _load_module_from_path(module_path: Path, module_name: str):
     return module
 
 
+def _normalize_perf_level(v) -> int:
+    if isinstance(v, bool):
+        return 3 if v else 0
+    return int(v)
+
+
 def _kernel_config_runtime_env(kernel_config_module, kernels_dir: Path) -> dict[str, str]:
     """
     Optional per-example environment variables for runtime compilation.
@@ -192,7 +198,7 @@ class CodeRunner:
         golden_path: str,
         device_id: Optional[int] = None,
         platform: str = "a2a3",
-        enable_profiling: bool = False,
+        enable_profiling: int = 0,
         enable_dump_tensor: bool = False,
         run_all_cases: bool = False,
         case_name: Optional[str] = None,
@@ -212,7 +218,7 @@ class CodeRunner:
         self.kernels_dir = Path(kernels_dir).resolve()
         self.golden_path = Path(golden_path).resolve()
         self.platform = platform
-        self.enable_profiling = enable_profiling
+        self._perf_level = _normalize_perf_level(enable_profiling)
         self.enable_dump_tensor = enable_dump_tensor
         self.skip_golden = skip_golden
         self.project_root = PROJECT_ROOT
@@ -607,9 +613,9 @@ class CodeRunner:
                 config = ChipCallConfig()
                 config.block_dim = self.block_dim
                 config.aicpu_thread_num = self.aicpu_thread_num
-                if self.enable_profiling and round_idx == 0:
-                    config.enable_profiling = True
-                    logger.info("Profiling enabled")
+                if self._perf_level > 0 and round_idx == 0:
+                    config.enable_profiling = self._perf_level
+                    logger.info(f"Swimlane profiling enabled (mode={self._perf_level})")
                 if self.enable_dump_tensor:
                     config.enable_dump_tensor = True
                     logger.info("Dump tensor enabled")

@@ -168,6 +168,7 @@ public:
 
     // Profiling support
     bool enable_profiling;  // Enable profiling flag
+    int perf_level = 0;     // Derived from enable_profiling: 0=off, 2=task+fanout
 
     // Orchestrator-to-scheduler transition control
     // When true, orchestrator threads convert to scheduler threads after orchestration completes.

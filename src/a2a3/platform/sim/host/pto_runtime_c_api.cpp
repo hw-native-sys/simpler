@@ -28,6 +28,7 @@
 #include "cpu_sim_context.h"
 #include "device_runner.h"
 #include "runtime.h"
+#include "host/runtime_profiling_mode.h"
 
 extern "C" {
 
@@ -154,9 +155,7 @@ int run_runtime(
         }
 
         // Phase 2: profiling
-        if (enable_profiling) {
-            r->enable_profiling = true;
-        }
+        set_runtime_profiling_mode(r, enable_profiling);
 
         // Phase 3: launch
         std::vector<uint8_t> aicpu_vec;

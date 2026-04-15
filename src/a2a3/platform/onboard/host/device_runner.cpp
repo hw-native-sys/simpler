@@ -461,7 +461,7 @@ int DeviceRunner::run(
     });
 
     // Initialize performance profiling if enabled
-    if (runtime.enable_profiling) {
+    if (runtime.perf_level > 0) {
         rc = init_performance_profiling(runtime, num_aicore, device_id);
         if (rc != 0) {
             LOG_ERROR("init_performance_profiling failed: %d", rc);
@@ -540,18 +540,18 @@ int DeviceRunner::run(
     {
         // Poll and collect performance data in a separate collector thread
         std::thread collector_thread;
-        if (runtime.enable_profiling) {
+        if (runtime.perf_level > 0) {
             collector_thread = create_thread([this, &runtime]() {
                 poll_and_collect_performance_data(runtime.get_task_count());
             });
         }
         auto thread_guard = RAIIScopeGuard([&]() {
-            if (runtime.enable_profiling && collector_thread.joinable()) {
+            if (runtime.perf_level > 0 && collector_thread.joinable()) {
                 collector_thread.join();
             }
         });
         auto collector_signal_guard = RAIIScopeGuard([this, &runtime]() {
-            if (runtime.enable_profiling) {
+            if (runtime.perf_level > 0) {
                 perf_collector_.signal_execution_complete();
             }
         });
@@ -588,7 +588,7 @@ int DeviceRunner::run(
     }
 
     // Stop memory management, drain remaining buffers, collect phase data, export
-    if (runtime.enable_profiling) {
+    if (runtime.perf_level > 0) {
         perf_collector_.stop_memory_manager();
         perf_collector_.drain_remaining_buffers();
         perf_collector_.scan_remaining_perf_buffers();
@@ -872,6 +872,7 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
         return rtFree(dev_ptr);
     };
 
+    perf_collector_.set_perf_level(runtime.perf_level);
     return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb);
 }
 

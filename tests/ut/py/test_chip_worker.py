@@ -31,7 +31,7 @@ class TestChipCallConfig:
         config = ChipCallConfig()
         assert config.block_dim == 24
         assert config.aicpu_thread_num == 3
-        assert config.enable_profiling is False
+        assert config.enable_profiling == 0
 
     def test_setters(self):
         config = ChipCallConfig()
@@ -40,13 +40,13 @@ class TestChipCallConfig:
         config.enable_profiling = True
         assert config.block_dim == 32
         assert config.aicpu_thread_num == 4
-        assert config.enable_profiling is True
+        assert config.enable_profiling > 0
 
     def test_repr(self):
         config = ChipCallConfig()
         r = repr(config)
         assert "block_dim=24" in r
-        assert "enable_profiling=False" in r
+        assert "enable_profiling=0" in r
 
 
 # ============================================================================

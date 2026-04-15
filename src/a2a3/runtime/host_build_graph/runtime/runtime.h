@@ -203,7 +203,8 @@ public:
     int sche_cpu_num;  // Number of AICPU threads for scheduling
 
     // Profiling support
-    bool enable_profiling;    // Enable profiling flag
+    bool enable_profiling;    // Legacy flag for host_build_graph runtime paths
+    int perf_level;           // 0=off, >0=profiling on (extended mode encoding)
     uint64_t perf_data_base;  // Performance data shared memory base address (device-side)
 
     // Task storage

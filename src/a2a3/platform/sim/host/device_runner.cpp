@@ -314,7 +314,7 @@ int DeviceRunner::run(
     last_runtime_ = &runtime;
 
     // Initialize performance profiling if enabled
-    if (runtime.enable_profiling) {
+    if (runtime.perf_level > 0) {
         rc = init_performance_profiling(runtime, num_aicore, device_id);
         if (rc != 0) {
             LOG_ERROR("init_performance_profiling failed: %d", rc);
@@ -420,7 +420,7 @@ int DeviceRunner::run(
 
     // Poll and collect performance data during execution (if enabled)
     std::thread collector_thread;
-    if (runtime.enable_profiling) {
+    if (runtime.perf_level > 0) {
         collector_thread = create_thread([this, &runtime]() {
             poll_and_collect_performance_data(runtime.get_task_count());
         });
@@ -442,13 +442,13 @@ int DeviceRunner::run(
         }
 
         // Signal collector that device execution is complete
-        if (runtime.enable_profiling) {
+        if (runtime.perf_level > 0) {
             perf_collector_.signal_execution_complete();
         }
         dump_collector_.signal_execution_complete();
 
         // Wait for collector thread if it was launched
-        if (runtime.enable_profiling && collector_thread.joinable()) {
+        if (runtime.perf_level > 0 && collector_thread.joinable()) {
             collector_thread.join();
         }
         if (dump_collector_thread.joinable()) {
@@ -465,12 +465,12 @@ int DeviceRunner::run(
         }
 
         // Signal collector that device execution is complete
-        if (runtime.enable_profiling) {
+        if (runtime.perf_level > 0) {
             perf_collector_.signal_execution_complete();
         }
 
         // Wait for collector thread if it was launched
-        if (runtime.enable_profiling && collector_thread.joinable()) {
+        if (runtime.perf_level > 0 && collector_thread.joinable()) {
             collector_thread.join();
         }
     }
@@ -484,7 +484,7 @@ int DeviceRunner::run(
     }
 
     // Stop memory management, drain remaining buffers, collect phase data, export
-    if (runtime.enable_profiling) {
+    if (runtime.perf_level > 0) {
         perf_collector_.stop_memory_manager();
         perf_collector_.drain_remaining_buffers();
         perf_collector_.scan_remaining_perf_buffers();
@@ -710,6 +710,7 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
 // =============================================================================
 
 int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, int device_id) {
+    perf_collector_.set_perf_level(runtime.perf_level);
     // Define allocation callback (a2a3sim: use malloc)
     auto alloc_cb = [](size_t size) -> void * {
         return malloc(size);

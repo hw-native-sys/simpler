@@ -540,12 +540,24 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
         .def_rw("block_dim", &ChipCallConfig::block_dim)
         .def_rw("aicpu_thread_num", &ChipCallConfig::aicpu_thread_num)
-        .def_rw("enable_profiling", &ChipCallConfig::enable_profiling)
+        .def_prop_rw(
+            "enable_profiling",
+            [](const ChipCallConfig &self) {
+                return self.perf_level;
+            },
+            [](ChipCallConfig &self, nb::object v) {
+                if (nb::isinstance<nb::bool_>(v)) {
+                    self.perf_level = nb::cast<bool>(v) ? 3 : 0;
+                } else {
+                    self.perf_level = nb::cast<int>(v);
+                }
+            }
+        )
         .def_rw("enable_dump_tensor", &ChipCallConfig::enable_dump_tensor)
         .def("__repr__", [](const ChipCallConfig &self) -> std::string {
             std::ostringstream os;
             os << "ChipCallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
-               << ", enable_profiling=" << (self.enable_profiling ? "True" : "False")
+               << ", enable_profiling=" << self.perf_level
                << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False") << ")";
             return os.str();
         });
@@ -571,29 +583,29 @@ NB_MODULE(_task_interface, m) {
         .def(
             "run_raw",
             [](ChipWorker &self, uint64_t callable, uint64_t args, int block_dim, int aicpu_thread_num,
-               bool enable_profiling) {
+               int perf_level) {
                 ChipCallConfig config;
                 config.block_dim = block_dim;
                 config.aicpu_thread_num = aicpu_thread_num;
-                config.enable_profiling = enable_profiling;
+                config.perf_level = perf_level;
                 self.run(reinterpret_cast<const void *>(callable), reinterpret_cast<const void *>(args), config);
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
-            nb::arg("enable_profiling") = false, "Run with a raw ChipStorageTaskArgs POD pointer."
+            nb::arg("perf_level") = 0, "Run with a raw ChipStorageTaskArgs POD pointer."
         )
         .def(
             "run_from_blob",
             [](ChipWorker &self, uint64_t callable, uint64_t blob_ptr, int block_dim, int aicpu_thread_num,
-               bool enable_profiling) {
+               int perf_level) {
                 ChipCallConfig config;
                 config.block_dim = block_dim;
                 config.aicpu_thread_num = aicpu_thread_num;
-                config.enable_profiling = enable_profiling;
+                config.perf_level = perf_level;
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr));
                 self.run(callable, view, config);
             },
             nb::arg("callable"), nb::arg("blob_ptr"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
-            nb::arg("enable_profiling") = false,
+            nb::arg("perf_level") = 0,
             "Decode a length-prefixed TaskArgs blob ([T][S][tensors][scalars]) at "
             "blob_ptr and dispatch to the runtime. Used from forked chip processes "
             "reading the WorkerThread mailbox."

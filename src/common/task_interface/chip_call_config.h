@@ -11,7 +11,7 @@
 
 /**
  * ChipCallConfig — per-NEXT_LEVEL-task config (block_dim, aicpu_thread_num,
- * enable_profiling). Lives here (rather than chip_worker.h) so distributed
+ * enable_profiling/perf_level). Lives here (rather than chip_worker.h) so distributed
  * task slot state can store it directly without pulling in the full
  * ChipWorker header (which depends on dist_types.h).
  */
@@ -21,6 +21,6 @@
 struct ChipCallConfig {
     int block_dim = 24;
     int aicpu_thread_num = 3;
-    bool enable_profiling = false;
+    int perf_level = 0;  // 0=off, 1=AICore-only, 2=task+fanout, 3=full
     bool enable_dump_tensor = false;
 };

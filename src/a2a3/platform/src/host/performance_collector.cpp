@@ -77,7 +77,7 @@ void ProfMemoryManager::stop() {
 
     // Drain remaining done_queue and free buffers
     {
-        std::lock_guard<std::mutex> lock(done_mutex_);
+        std::scoped_lock lock(done_mutex_);
         while (!done_queue_.empty()) {
             CopyDoneInfo info = done_queue_.front();
             done_queue_.pop();
@@ -99,7 +99,7 @@ void ProfMemoryManager::stop() {
 }
 
 bool ProfMemoryManager::try_pop_ready(ReadyBufferInfo &info) {
-    std::lock_guard<std::mutex> lock(ready_mutex_);
+    std::scoped_lock lock(ready_mutex_);
     if (ready_queue_.empty()) {
         return false;
     }
@@ -121,7 +121,7 @@ bool ProfMemoryManager::wait_pop_ready(ReadyBufferInfo &info, std::chrono::milli
 }
 
 void ProfMemoryManager::notify_copy_done(const CopyDoneInfo &info) {
-    std::lock_guard<std::mutex> lock(done_mutex_);
+    std::scoped_lock lock(done_mutex_);
     done_queue_.push(info);
 }
 
@@ -210,7 +210,7 @@ void ProfMemoryManager::process_ready_entry(
                 host_ptr = resolve_host_ptr(new_dev_ptr);
             }
             if (new_dev_ptr == nullptr) {
-                std::lock_guard<std::mutex> lock(done_mutex_);
+                std::scoped_lock lock(done_mutex_);
                 while (!done_queue_.empty()) {
                     CopyDoneInfo dinfo = done_queue_.front();
                     done_queue_.pop();
@@ -258,7 +258,7 @@ void ProfMemoryManager::process_ready_entry(
         info.buffer_seq = seq;
 
         {
-            std::lock_guard<std::mutex> lock(ready_mutex_);
+            std::scoped_lock lock(ready_mutex_);
             ready_queue_.push(info);
         }
         ready_cv_.notify_one();
@@ -289,7 +289,7 @@ void ProfMemoryManager::process_ready_entry(
                 host_ptr = resolve_host_ptr(new_dev_ptr);
             }
             if (new_dev_ptr == nullptr) {
-                std::lock_guard<std::mutex> lock(done_mutex_);
+                std::scoped_lock lock(done_mutex_);
                 while (!done_queue_.empty()) {
                     CopyDoneInfo dinfo = done_queue_.front();
                     done_queue_.pop();
@@ -335,7 +335,7 @@ void ProfMemoryManager::process_ready_entry(
         info.buffer_seq = seq;
 
         {
-            std::lock_guard<std::mutex> lock(ready_mutex_);
+            std::scoped_lock lock(ready_mutex_);
             ready_queue_.push(info);
         }
         ready_cv_.notify_one();
@@ -348,7 +348,7 @@ void ProfMemoryManager::mgmt_loop() {
     while (running_.load()) {
         // 1. Recycle done queue: move completed buffers to recycled pools for reuse
         {
-            std::lock_guard<std::mutex> lock(done_mutex_);
+            std::scoped_lock lock(done_mutex_);
             while (!done_queue_.empty()) {
                 CopyDoneInfo info = done_queue_.front();
                 done_queue_.pop();
@@ -561,8 +561,9 @@ int PerformanceCollector::initialize(
     free_cb_ = free_cb;
 
     // Step 1: Calculate shared memory size (slot arrays only, no actual buffers)
-    int num_phase_threads = PLATFORM_MAX_AICPU_THREADS;
-    size_t total_size = calc_perf_data_size_with_phases(num_aicore, num_phase_threads);
+    int num_phase_threads = (perf_level_ >= 3) ? PLATFORM_MAX_AICPU_THREADS : 0;
+    size_t total_size = (num_phase_threads > 0) ? calc_perf_data_size_with_phases(num_aicore, num_phase_threads) :
+                                                  calc_perf_data_size(num_aicore);
 
     LOG_DEBUG("Shared memory allocation plan:");
     LOG_DEBUG("  Number of cores:      %d", num_aicore);
@@ -651,41 +652,43 @@ int PerformanceCollector::initialize(
         num_aicore * (PLATFORM_PROF_BUFFERS_PER_CORE - 1)
     );
 
-    // Step 6: Initialize PhaseBufferStates — 1 buffer per thread in free_queue, rest to recycled pool
-    for (int t = 0; t < num_phase_threads; t++) {
-        PhaseBufferState *state = get_phase_buffer_state(perf_host_ptr, num_aicore, t);
-        memset(state, 0, sizeof(PhaseBufferState));
+    // Step 6: Initialize PhaseBufferStates (only when phase recording enabled)
+    if (num_phase_threads > 0) {
+        for (int t = 0; t < num_phase_threads; t++) {
+            PhaseBufferState *state = get_phase_buffer_state(perf_host_ptr, num_aicore, t);
+            memset(state, 0, sizeof(PhaseBufferState));
 
-        state->free_queue.head = 0;
-        state->free_queue.tail = 0;
-        state->current_buf_ptr = 0;
-        state->current_buf_seq = 0;
+            state->free_queue.head = 0;
+            state->free_queue.tail = 0;
+            state->current_buf_ptr = 0;
+            state->current_buf_seq = 0;
 
-        for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
-            void *host_buf_ptr = nullptr;
-            void *dev_buf_ptr = alloc_single_buffer(sizeof(PhaseBuffer), &host_buf_ptr);
-            if (dev_buf_ptr == nullptr) {
-                LOG_ERROR("Failed to allocate PhaseBuffer for thread %d, buffer %d", t, s);
-                return -1;
+            for (int s = 0; s < PLATFORM_PROF_BUFFERS_PER_THREAD; s++) {
+                void *host_buf_ptr = nullptr;
+                void *dev_buf_ptr = alloc_single_buffer(sizeof(PhaseBuffer), &host_buf_ptr);
+                if (dev_buf_ptr == nullptr) {
+                    LOG_ERROR("Failed to allocate PhaseBuffer for thread %d, buffer %d", t, s);
+                    return -1;
+                }
+                PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(host_buf_ptr);
+                memset(buf, 0, sizeof(PhaseBuffer));
+                buf->count = 0;
+
+                if (s == 0) {
+                    state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(dev_buf_ptr);
+                } else {
+                    memory_manager_.recycled_phase_buffers_.push_back(dev_buf_ptr);
+                }
             }
-            PhaseBuffer *buf = reinterpret_cast<PhaseBuffer *>(host_buf_ptr);
-            memset(buf, 0, sizeof(PhaseBuffer));
-            buf->count = 0;
-
-            if (s == 0) {
-                state->free_queue.buffer_ptrs[0] = reinterpret_cast<uint64_t>(dev_buf_ptr);
-            } else {
-                memory_manager_.recycled_phase_buffers_.push_back(dev_buf_ptr);
-            }
+            wmb();
+            state->free_queue.tail = 1;
+            wmb();
         }
-        wmb();
-        state->free_queue.tail = 1;
-        wmb();
+        LOG_DEBUG(
+            "Initialized %d PhaseBufferStates: 1 buffer/thread, %d in recycled pool", num_phase_threads,
+            num_phase_threads * (PLATFORM_PROF_BUFFERS_PER_THREAD - 1)
+        );
     }
-    LOG_DEBUG(
-        "Initialized %d PhaseBufferStates: 1 buffer/thread, %d in recycled pool", num_phase_threads,
-        num_phase_threads * (PLATFORM_PROF_BUFFERS_PER_THREAD - 1)
-    );
 
     wmb();
 
@@ -706,8 +709,8 @@ void PerformanceCollector::start_memory_manager(const ThreadFactory &thread_fact
     }
 
     memory_manager_.start(
-        perf_shared_mem_host_, num_aicore_, PLATFORM_MAX_AICPU_THREADS, alloc_cb_, register_cb_, free_cb_, device_id_,
-        thread_factory
+        perf_shared_mem_host_, num_aicore_, (perf_level_ >= 3) ? PLATFORM_MAX_AICPU_THREADS : 0, alloc_cb_,
+        register_cb_, free_cb_, device_id_, thread_factory
     );
 }
 
@@ -1245,7 +1248,17 @@ int PerformanceCollector::export_swimlane_json(const std::string &output_path) {
     }
 
     // Step 7: Write JSON data
-    int version = has_phase_data_ ? 2 : 1;
+    int version;
+    if (perf_level_ <= 1) {
+        version = 0;
+    } else if (has_phase_data_) {
+        version = 2;
+    } else {
+        if (perf_level_ >= 3) {
+            LOG_WARN("perf_level=%d but no phase data collected; writing version=1", perf_level_);
+        }
+        version = 1;
+    }
     outfile << "{\n";
     outfile << "  \"version\": " << version << ",\n";
     outfile << "  \"tasks\": [\n";
@@ -1258,8 +1271,6 @@ int PerformanceCollector::export_swimlane_json(const std::string &output_path) {
         double start_us = cycles_to_us(record.start_time - base_time_cycles);
         double end_us = cycles_to_us(record.end_time - base_time_cycles);
         double duration_us = end_us - start_us;
-        double dispatch_us = (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time - base_time_cycles) : 0.0;
-        double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time - base_time_cycles) : 0.0;
 
         const char *core_type_str = (record.core_type == CoreType::AIC) ? "aic" : "aiv";
 
@@ -1271,20 +1282,27 @@ int PerformanceCollector::export_swimlane_json(const std::string &output_path) {
         outfile << "      \"ring_id\": " << static_cast<int>(record.task_id >> 32) << ",\n";
         outfile << "      \"start_time_us\": " << std::fixed << std::setprecision(3) << start_us << ",\n";
         outfile << "      \"end_time_us\": " << std::fixed << std::setprecision(3) << end_us << ",\n";
-        outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
-        outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
-        outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
-        outfile << "      \"fanout\": [";
-        int safe_fanout_count =
-            (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT) ? record.fanout_count : 0;
-        for (int j = 0; j < safe_fanout_count; ++j) {
-            outfile << record.fanout[j];
-            if (j < safe_fanout_count - 1) {
-                outfile << ", ";
+        if (perf_level_ >= 2) {
+            double dispatch_us =
+                (record.dispatch_time > 0) ? cycles_to_us(record.dispatch_time - base_time_cycles) : 0.0;
+            double finish_us = (record.finish_time > 0) ? cycles_to_us(record.finish_time - base_time_cycles) : 0.0;
+            outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << ",\n";
+            outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
+            outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
+            outfile << "      \"fanout\": [";
+            int safe_fanout_count =
+                (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT) ? record.fanout_count : 0;
+            for (int j = 0; j < safe_fanout_count; ++j) {
+                outfile << record.fanout[j];
+                if (j < safe_fanout_count - 1) {
+                    outfile << ", ";
+                }
             }
+            outfile << "],\n";
+            outfile << "      \"fanout_count\": " << record.fanout_count << "\n";
+        } else {
+            outfile << "      \"duration_us\": " << std::fixed << std::setprecision(3) << duration_us << "\n";
         }
-        outfile << "],\n";
-        outfile << "      \"fanout_count\": " << record.fanout_count << "\n";
         outfile << "    }";
         if (i < tagged_records.size() - 1) {
             outfile << ",";

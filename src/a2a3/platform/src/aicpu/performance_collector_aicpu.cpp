@@ -230,7 +230,7 @@ void perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx) {
 }
 
 void perf_aicpu_flush_buffers(Runtime *runtime, int thread_idx, const int *cur_thread_cores, int core_num) {
-    if (!runtime->enable_profiling) {
+    if (runtime->perf_level <= 0) {
         return;
     }
 

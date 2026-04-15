@@ -333,6 +333,12 @@ public:
     bool is_initialized() const { return perf_shared_mem_host_ != nullptr; }
 
     /**
+     * Set profiling level before initialize().
+     * 0=off, 1=AICore-only, 2=task+fanout, 3=full (with phase buffers)
+     */
+    void set_perf_level(int level) { perf_level_ = level; }
+
+    /**
      * Drain remaining buffers from the memory manager's ready queue
      *
      * After poll_and_collect() exits (all PERF records collected) and
@@ -386,6 +392,9 @@ private:
     PerfAllocCallback alloc_cb_{nullptr};
     PerfRegisterCallback register_cb_{nullptr};
     PerfFreeCallback free_cb_{nullptr};
+
+    // Profiling level: 0=off, 1=AICore-only, 2=task+fanout, 3=full (with phase)
+    int perf_level_{0};
 
     // Memory manager
     ProfMemoryManager memory_manager_;

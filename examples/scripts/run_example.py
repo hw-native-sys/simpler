@@ -139,8 +139,12 @@ Golden.py interface:
 
     parser.add_argument(
         "--enable-profiling",
-        action="store_true",
-        help="Enable profiling and generate swimlane.json",
+        type=int,
+        nargs="?",
+        const=3,
+        default=0,
+        metavar="LEVEL",
+        help="Swimlane profiling mode: 1=AICore only, 2=task+fanout, 3=full (default when flag given: 3)",
     )
 
     parser.add_argument(

@@ -171,7 +171,7 @@ public:
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
     // Profiling support
-    bool enable_profiling;  // Enable profiling flag
+    int perf_level = 0;  // 0=off, 1=AICore-only, 2=task+fanout, 3=full
 
     // Orchestrator-to-scheduler transition control
     // When true, orchestrator threads convert to scheduler threads after orchestration completes.

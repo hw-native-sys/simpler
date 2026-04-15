@@ -84,7 +84,12 @@ def pytest_addoption(parser):
         "--skip-golden", action="store_true", default=False, help="Skip golden comparison (benchmark mode)"
     )
     parser.addoption(
-        "--enable-profiling", action="store_true", default=False, help="Enable profiling (first round only)"
+        "--enable-profiling",
+        type=int,
+        nargs="?",
+        const=3,
+        default=0,
+        help="Swimlane profiling mode: 1=AICore only, 2=task+fanout, 3=full (default when flag given: 3)",
     )
     parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
     parser.addoption("--build", action="store_true", default=False, help="Compile runtime from source")
