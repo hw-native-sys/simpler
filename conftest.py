@@ -77,6 +77,11 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
     config.addinivalue_line("markers", "requires_hardware: test needs Ascend toolchain and real device")
     config.addinivalue_line("markers", "device_count(n): number of NPU devices needed")
+    config.addinivalue_line(
+        "markers",
+        "runtime(name): runtime this standalone test targets; used by runtime-isolation subprocess "
+        "filtering so non-@scene_test tests only run under their matching runtime",
+    )
 
     log_level = config.getoption("--log-level", default=None)
     if log_level:
@@ -115,6 +120,14 @@ def pytest_collection_modifyitems(session, config, items):
                 item.add_marker(pytest.mark.skip(reason="--platform required"))
             elif platform not in platforms_marker.args[0]:
                 item.add_marker(pytest.mark.skip(reason=f"Not supported on {platform}"))
+
+        # runtime-isolation filter for non-@scene_test tests: if the item declares
+        # `@pytest.mark.runtime("X")` and a --runtime filter is active, skip when
+        # they don't match. Prevents test_explicit_fatal_reports and friends from
+        # running under every runtime's subprocess.
+        runtime_marker = item.get_closest_marker("runtime")
+        if runtime_marker and runtime_marker.args and runtime_filter and runtime_marker.args[0] != runtime_filter:
+            item.add_marker(pytest.mark.skip(reason=f"Runtime {runtime_marker.args[0]} != {runtime_filter}"))
 
 
 # ---------------------------------------------------------------------------

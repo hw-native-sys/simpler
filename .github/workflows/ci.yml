@@ -39,7 +39,7 @@ jobs:
         uses: actions/cache@v3
         with:
           path: build/cache
-          key: cmake-sim-${{ runner.os }}-${{ hashFiles('src/**/CMakeLists.txt', 'src/**/build_config.py', 'simpler_setup/runtime_compiler.py') }}
+          key: cmake-sim-${{ runner.os }}-${{ hashFiles('src/**/CMakeLists.txt', 'src/**/build_config.py', 'simpler_setup/runtime_compiler.py', 'simpler_setup/kernel_compiler.py', 'simpler_setup/toolchain.py') }}
           restore-keys: |
             cmake-sim-${{ runner.os }}-
 
@@ -297,7 +297,6 @@ jobs:
       - name: Run hardware unit tests (a2a3)
         run: |
           source .venv/bin/activate
-          export PATH="$HOME/.local/bin:$PATH"
           source ${ASCEND_HOME_PATH}/bin/setenv.bash && python -m pytest tests -m requires_hardware --platform a2a3 -v
 
   # ---------- Scene tests (a2a3 hardware) ----------
@@ -319,13 +318,11 @@ jobs:
       - name: Run on-device examples (a2a3)
         run: |
           source .venv/bin/activate
-          export PATH="$HOME/.local/bin:$PATH"
           source ${ASCEND_HOME_PATH}/bin/setenv.bash && python ci.py -p a2a3 -d ${DEVICE_RANGE} -c d96c8784 -t 600 --clone-protocol https
 
       - name: Run pytest scene tests (a2a3)
         run: |
           source .venv/bin/activate
-          export PATH="$HOME/.local/bin:$PATH"
           source ${ASCEND_HOME_PATH}/bin/setenv.bash && python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v
 
 
@@ -398,12 +395,10 @@ jobs:
 
       - name: Run on-device examples (a5)
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
           source ${ASCEND_HOME_PATH}/bin/setenv.bash
           DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python ci.py -p a5 -d ${DEVICE_RANGE} -c d96c8784 -t 1200 --clone-protocol https"
 
       - name: Run pytest scene tests (a5)
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
           source ${ASCEND_HOME_PATH}/bin/setenv.bash && python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v

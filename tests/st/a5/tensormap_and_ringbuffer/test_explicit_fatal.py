@@ -30,6 +30,7 @@ class _ExplicitFatal(SceneTestCase):
 
 @pytest.mark.platforms(["a5sim"])
 @pytest.mark.device_count(1)
+@pytest.mark.runtime("tensormap_and_ringbuffer")
 def test_explicit_fatal_reports(st_platform, st_device_ids, monkeypatch):
     monkeypatch.setenv("PTO_LOG_LEVEL", "error")
 
