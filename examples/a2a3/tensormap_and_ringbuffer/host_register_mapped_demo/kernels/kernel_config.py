@@ -26,7 +26,7 @@ KERNELS = [
         "func_id": 0,
         "source": str(_KERNELS_ROOT / "aiv" / "kernel_load_add_one.cpp"),
         "core_type": "aiv",
-        "signature": [D.IN, D.OUT],
+        "signature": [D.INOUT, D.OUT],
     },
 ]
 

@@ -14,6 +14,9 @@
  * Args layout in ChipStorageTaskArgs:
  *   tensor(0): mapped_out (host tensor copied back by runtime)
  *   scalar(0): mapped_dev_ptr (device-visible address returned by host_register_mapped)
+ *
+ * The mapped host buffer is wrapped as an external tensor and submitted as
+ * INOUT so the kernel updates host-visible memory in place.
  */
 
 #include <stdint.h>
@@ -35,17 +38,17 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     Tensor mapped_out = from_tensor_arg(out_arg);
 
     uint64_t mapped_input_u64 = orch_args.scalar(0);
-    Tensor mapped_input = make_tensor_external(
+    Tensor mapped_host_buffer = make_tensor_external(
         reinterpret_cast<void *>(static_cast<uintptr_t>(mapped_input_u64)), out_arg.shapes, out_arg.ndims, out_arg.dtype
     );
 
     LOG_INFO(
-        "host_register_mapped_demo: mapped_input=0x%lx mapped_out=0x%lx elements=%u", mapped_input_u64, out_arg.data,
+        "host_register_mapped_demo: mapped_host_buffer=0x%lx mapped_out=0x%lx elements=%u", mapped_input_u64, out_arg.data,
         out_arg.shapes[0]
     );
 
     Arg params;
-    params.add_input(mapped_input);
+    params.add_inout(mapped_host_buffer);
     params.add_output(mapped_out);
     pto2_rt_submit_aiv_task(0, params);
 }

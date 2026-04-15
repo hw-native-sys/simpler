@@ -9,10 +9,13 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * Demo kernel: out[i] = mapped_input[i] + 1.0f
+ * Demo kernel:
+ *   mapped_host_buffer[i] = mapped_host_buffer[i] + 1.0f
+ *   out[i] = mapped_host_buffer[i] + 1.0f
  *
  * The input pointer comes from host_register_mapped(), so a successful result
- * shows that the kernel was able to read the mapped host buffer directly.
+ * shows that the kernel was able to read and write the mapped host buffer
+ * directly while also producing a regular copy-back output.
  */
 
 #include <cstdint>
@@ -31,9 +34,9 @@ using namespace pto;  // NOLINT(build/namespaces)
 #endif
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ Tensor *src_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *mapped_host_tensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
     __gm__ Tensor *out_tensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
-    __gm__ float *src = reinterpret_cast<__gm__ float *>(src_tensor->buffer.addr) + src_tensor->start_offset;
+    __gm__ float *mapped_host = reinterpret_cast<__gm__ float *>(mapped_host_tensor->buffer.addr) + mapped_host_tensor->start_offset;
     __gm__ float *out = reinterpret_cast<__gm__ float *>(out_tensor->buffer.addr) + out_tensor->start_offset;
 
     constexpr float kAddValue = 1.0f;
@@ -52,15 +55,16 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     TASSIGN(src_tile, 0x0);
     TASSIGN(dst_tile, 0x10000);
 
-    GlobalData src_global(src);
+    GlobalData mapped_host_global(mapped_host);
     GlobalData dst_global(out);
 
-    TLOAD(src_tile, src_global);
+    TLOAD(src_tile, mapped_host_global);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     TADDS(dst_tile, src_tile, kAddValue);
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(mapped_host_global, dst_tile);
     TSTORE(dst_global, dst_tile);
 
     set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
