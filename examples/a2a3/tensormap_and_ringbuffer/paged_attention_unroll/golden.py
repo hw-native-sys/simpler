@@ -1,6 +1,6 @@
 """Paged Attention Unroll Golden - tensormap_and_ringbuffer test (production scale, bfloat16)."""
 
-from paged_attention_golden import (
+from simpler_setup.goldens.paged_attention import (
     generate_inputs as _generate_inputs,
     compute_golden,
     run_golden_test,

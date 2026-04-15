@@ -31,29 +31,21 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 declare -A TMR_EXAMPLE_CASES=(
     [alternating_matmul_add]="Case1"
     [benchmark_bgemm]=""
-    [paged_attention]="Case1,Case2"
-    [paged_attention_manual_scope]="Case1,Case2"
     [paged_attention_unroll]="Case1,Case2"
-    [paged_attention_unroll_manual_scope]="Case1,Case2"
     [batch_paged_attention]=""
 )
 TMR_EXAMPLE_ORDER=(
     alternating_matmul_add
     benchmark_bgemm
-    paged_attention
-    paged_attention_manual_scope
     paged_attention_unroll
-    paged_attention_unroll_manual_scope
     batch_paged_attention
 )
 
 # --- aicpu_build_graph ---
 declare -A ABG_EXAMPLE_CASES=(
-    [paged_attention]="case1,case2"
     [paged_attention_unroll]="Case1,Case2"
 )
 ABG_EXAMPLE_ORDER=(
-    paged_attention
     paged_attention_unroll
 )
 
@@ -191,7 +183,7 @@ parse_timing() {
     local log_file="$1"
 
     local timing
-    timing=$(grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end|orch_func_cost)' "$log_file" || true)
+    timing=$(grep -E 'Thread [0-9]+: (sched_start|orch_start|orch_end|sched_end|orch_stage_end)' "$log_file" || true)
 
     if [[ -z "$timing" ]]; then
         echo "  (no benchmark timing data — was PTO2_PROFILING enabled?)"
@@ -223,7 +215,7 @@ parse_timing() {
         min_start = 0; max_end = 0
         min_sched_start = 0; max_sched_end = 0
         min_orch_start = 0; max_orch_end = 0
-        has_sched = 0; has_orch_end = 0; has_orch_cost = 0
+        has_sched = 0; has_orch_end = 0
     }
     /sched_start=/ {
         match($0, /Thread ([0-9]+):/, tm)
@@ -245,10 +237,6 @@ parse_timing() {
         val = m[1] + 0
         if (min_orch_start == 0 || val < min_orch_start) min_orch_start = val
         if (min_start == 0 || val < min_start) min_start = val
-        if (match($0, /orch_func_cost=([0-9.]+)us/, m2)) {
-            orch_results[round] = m2[1] + 0
-            has_orch_cost = 1
-        }
     }
     /sched_end[^=]*=/ {
         match($0, /sched_end[^=]*=([0-9]+)/, m)
@@ -273,7 +261,7 @@ parse_timing() {
         if (count == 0) { print "  (no rounds parsed)"; exit 1 }
 
         show_sched = has_sched
-        show_orch = has_orch_end || has_orch_cost
+        show_orch = has_orch_end
 
         # Header
         hdr = sprintf("  %-8s  %12s", "Round", "Elapsed (us)")

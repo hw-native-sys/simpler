@@ -32,7 +32,7 @@ _KERNELS_ROOT = Path(__file__).parent
 # Orchestration config
 ORCHESTRATION = {
     "source": str(_KERNELS_ROOT / "orchestration" / "paged_attention_orch.cpp"),
-    "function_name": "build_paged_attention_graph",
+    "function_name": "aicpu_orchestration_entry",
     "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
 }
 
