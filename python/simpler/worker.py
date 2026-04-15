@@ -161,7 +161,7 @@ def _chip_process_loop(
 
             error = 0
             try:
-                cw.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
+                cw.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, profiling)
             except Exception:  # noqa: BLE001
                 error = 1
             struct.pack_into("i", buf, _CHIP_OFF_ERROR, error)

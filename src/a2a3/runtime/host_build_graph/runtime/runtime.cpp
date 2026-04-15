@@ -46,6 +46,7 @@ Runtime::Runtime() {
     worker_count = 0;
     sche_cpu_num = 1;
     enable_profiling = false;
+    perf_level = 0;
     perf_data_base = 0;
     tensor_pair_count = 0;
     tensor_info_storage_ = nullptr;

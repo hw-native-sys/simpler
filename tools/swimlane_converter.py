@@ -120,8 +120,8 @@ def read_perf_data(filepath):
             raise ValueError(f"Missing required field: {field}")
 
     # Validate version
-    if data["version"] not in [1, 2]:
-        raise ValueError(f"Unsupported version: {data['version']} (expected 1 or 2)")
+    if data["version"] not in [0, 1, 2]:
+        raise ValueError(f"Unsupported version: {data['version']} (expected 0/1/2)")
 
     return data
 
@@ -482,7 +482,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         dur = task["duration_us"]
 
         # Build fanout hint string (packed ids → rXtY / tY for readability)
-        fanout_str = "[" + ", ".join(format_task_display(x) for x in task["fanout"]) + "]"
+        fanout_list = task.get("fanout", [])
+        fanout_str = "[" + ", ".join(format_task_display(x) for x in fanout_list) + "]"
 
         # Get function name if available
         func_id = task["func_id"]
@@ -632,7 +633,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         src_tid = core_to_tid[task["core_id"]]
         src_ts_end = task["end_time_us"]
 
-        for succ_task_id in task["fanout"]:
+        for succ_task_id in task.get("fanout", []):
             if succ_task_id not in task_map:
                 if verbose:
                     print(
@@ -864,7 +865,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             src_tid = task_to_aicpu_tid.get(task["task_id"], core_to_tid[task["core_id"]])
             src_aicpu_eid = task_to_aicpu_event_id.get(task["task_id"])
 
-            for succ_task_id in task["fanout"]:
+            for succ_task_id in task.get("fanout", []):
                 if succ_task_id not in task_map:
                     continue
 

@@ -646,7 +646,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
     int verification_warning_count = 0;
     const int MAX_VERIFICATION_WARNINGS = 10;
-    bool profiling_enabled = runtime.enable_profiling;
+    bool profiling_enabled = runtime.perf_level > 0;
 
     // Extract array pointers as local variables for better readability and performance
     int *cur_ready_queue_aic = cur_ready_queue_aic_[thread_idx];
