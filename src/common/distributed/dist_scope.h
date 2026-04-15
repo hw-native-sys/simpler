@@ -46,6 +46,19 @@ public:
     // Current nesting depth (0 = no open scope).
     int32_t depth() const { return static_cast<int32_t>(stack_.size()); }
 
+    // L2-style 0-based scope index: the innermost open scope, or 0 when
+    // none is open. Used by DistRing::alloc to choose a heap ring:
+    //   ring_idx = min(current_depth(), DIST_MAX_RING_DEPTH - 1)
+    // Matches `PTO2OrchestratorState::current_ring_id` semantics: the
+    // first scope opened (depth()==1) maps to ring 0, the next nested
+    // scope maps to ring 1, and so on. Returns 0 when no scope is open
+    // so tasks submitted outside `Worker::run` still have a deterministic
+    // ring assignment.
+    int32_t current_depth() const {
+        int32_t d = depth();
+        return d > 0 ? d - 1 : 0;
+    }
+
 private:
     struct ScopeFrame {
         std::vector<DistTaskSlot> tasks;

@@ -20,7 +20,8 @@
 namespace {
 
 // Most tests only need a small heap to exercise wrap/back-pressure quickly.
-constexpr uint64_t kSmallHeap = 8ULL * DIST_HEAP_ALIGN;  // 8 KiB
+// This is the PER-RING size now that DistRing owns DIST_MAX_RING_DEPTH rings.
+constexpr uint64_t kSmallHeap = 8ULL * DIST_HEAP_ALIGN;  // 8 KiB per ring
 constexpr uint32_t kQuickTimeoutMs = 500;
 
 }  // namespace
@@ -113,7 +114,7 @@ TEST(DistRing, HeapWrapsAroundWhenTailLeadsTop) {
     auto wrapped = a.alloc(DIST_HEAP_ALIGN);
     ASSERT_NE(wrapped.heap_ptr, nullptr);
     // Wrapped allocation lives at the base of the region.
-    EXPECT_EQ(wrapped.heap_ptr, a.heap_base());
+    EXPECT_EQ(wrapped.heap_ptr, a.heap_base(0));
 
     a.release(r2.slot);
     a.release(r3.slot);
@@ -207,4 +208,177 @@ TEST(DistRing, ShutdownUnblocksAlloc) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     a.shutdown();
     t.join();
+}
+
+// ---------------------------------------------------------------------------
+// Per-scope ring tests (Strict-1)
+// ---------------------------------------------------------------------------
+
+TEST(DistRing, ScopeDepthMapsToRingIdx) {
+    EXPECT_EQ(dist_ring_idx_for_scope(0), 0);
+    EXPECT_EQ(dist_ring_idx_for_scope(1), 1);
+    EXPECT_EQ(dist_ring_idx_for_scope(2), 2);
+    EXPECT_EQ(dist_ring_idx_for_scope(3), 3);
+    // Scopes deeper than MAX_RING_DEPTH share the innermost ring.
+    EXPECT_EQ(dist_ring_idx_for_scope(4), DIST_MAX_RING_DEPTH - 1);
+    EXPECT_EQ(dist_ring_idx_for_scope(64), DIST_MAX_RING_DEPTH - 1);
+    // Negative scope depths clamp to 0 (defensive).
+    EXPECT_EQ(dist_ring_idx_for_scope(-1), 0);
+}
+
+TEST(DistRing, PerRingHeapsAreDistinctMmaps) {
+    // Total VA = 4 × 4 KiB; verify each ring has its own mapping.
+    DistRing a;
+    a.init(kSmallHeap, kQuickTimeoutMs);
+
+    std::vector<uintptr_t> bases;
+    for (int r = 0; r < DIST_MAX_RING_DEPTH; ++r) {
+        void *b = a.heap_base(r);
+        ASSERT_NE(b, nullptr);
+        EXPECT_EQ(a.heap_size(r), kSmallHeap);
+        bases.push_back(reinterpret_cast<uintptr_t>(b));
+    }
+    for (int i = 0; i < DIST_MAX_RING_DEPTH; ++i) {
+        for (int j = i + 1; j < DIST_MAX_RING_DEPTH; ++j) {
+            EXPECT_NE(bases[i], bases[j])
+                << "rings " << i << " and " << j << " share a mapping — expected 4 separate mmaps";
+        }
+    }
+}
+
+TEST(DistRing, AllocRoutesToRingChosenByScopeDepth) {
+    DistRing a;
+    a.init(kSmallHeap, kQuickTimeoutMs);
+
+    auto r0 = a.alloc(100, /*scope_depth=*/0);
+    auto r1 = a.alloc(100, /*scope_depth=*/1);
+    auto r2 = a.alloc(100, /*scope_depth=*/2);
+    auto r3 = a.alloc(100, /*scope_depth=*/3);
+    auto rd = a.alloc(100, /*scope_depth=*/7);  // clamps to ring 3
+
+    EXPECT_EQ(r0.ring_idx, 0);
+    EXPECT_EQ(r1.ring_idx, 1);
+    EXPECT_EQ(r2.ring_idx, 2);
+    EXPECT_EQ(r3.ring_idx, 3);
+    EXPECT_EQ(rd.ring_idx, 3);
+
+    // The allocation lives in the ring's own mmap region.
+    for (const auto *res : {&r0, &r1, &r2, &r3}) {
+        uintptr_t base = reinterpret_cast<uintptr_t>(a.heap_base(res->ring_idx));
+        uintptr_t ptr = reinterpret_cast<uintptr_t>(res->heap_ptr);
+        EXPECT_GE(ptr, base);
+        EXPECT_LT(ptr, base + a.heap_size(res->ring_idx));
+    }
+
+    // Slot state remembers the ring assignment.
+    EXPECT_EQ(a.slot_state(r0.slot)->ring_idx, 0);
+    EXPECT_EQ(a.slot_state(r3.slot)->ring_idx, 3);
+
+    a.release(r0.slot);
+    a.release(r1.slot);
+    a.release(r2.slot);
+    a.release(r3.slot);
+    a.release(rd.slot);
+}
+
+TEST(DistRing, RingsReclaimIndependently) {
+    // Fill ring 1 but keep ring 0 empty. A subsequent alloc on ring 0
+    // must not be blocked by ring 1's fullness.
+    DistRing a;
+    a.init(2 * DIST_HEAP_ALIGN, /*timeout_ms=*/100);
+
+    auto r1a = a.alloc(DIST_HEAP_ALIGN, /*scope_depth=*/1);
+    auto r1b = a.alloc(DIST_HEAP_ALIGN, /*scope_depth=*/1);  // ring 1 full
+    EXPECT_EQ(r1a.ring_idx, 1);
+    EXPECT_EQ(r1b.ring_idx, 1);
+
+    // Ring 0 is untouched — this must succeed instantly, not time out.
+    auto r0 = a.alloc(DIST_HEAP_ALIGN, /*scope_depth=*/0);
+    EXPECT_EQ(r0.ring_idx, 0);
+    ASSERT_NE(r0.heap_ptr, nullptr);
+
+    // Ring 3 is also untouched.
+    auto r3 = a.alloc(DIST_HEAP_ALIGN, /*scope_depth=*/3);
+    EXPECT_EQ(r3.ring_idx, 3);
+
+    // Now verify ring 1 still times out (no release on ring 1 yet).
+    EXPECT_THROW(a.alloc(DIST_HEAP_ALIGN, /*scope_depth=*/1), std::runtime_error);
+
+    a.release(r1a.slot);
+    a.release(r1b.slot);
+    a.release(r0.slot);
+    a.release(r3.slot);
+}
+
+TEST(DistRing, InnerRingReclaimsWhileOuterHolds) {
+    // Simulate nested scope: outer task on ring 0 holds an allocation while
+    // inner tasks on ring 1 churn through their heap. Ring 1's heap_top /
+    // heap_tail advance as tasks cycle; ring 0's cursors stay put because
+    // the outer task is still alive.
+    DistRing a;
+    a.init(4 * DIST_HEAP_ALIGN, /*timeout_ms=*/500);
+
+    auto outer = a.alloc(DIST_HEAP_ALIGN, /*scope_depth=*/0);
+    EXPECT_EQ(a.heap_top(0), DIST_HEAP_ALIGN);
+    EXPECT_EQ(a.heap_tail(0), 0u);
+
+    // Churn on the inner ring — allocate, release, allocate, release, ...
+    for (int i = 0; i < 8; ++i) {
+        auto inner = a.alloc(DIST_HEAP_ALIGN, /*scope_depth=*/1);
+        a.release(inner.slot);
+    }
+
+    // Outer ring unchanged (one live slab at offset 0).
+    EXPECT_EQ(a.heap_top(0), DIST_HEAP_ALIGN);
+    EXPECT_EQ(a.heap_tail(0), 0u);
+    // Inner ring reclaimed each slab — tail caught up to top.
+    EXPECT_EQ(a.heap_tail(1), a.heap_top(1));
+
+    a.release(outer.slot);
+}
+
+TEST(DistRing, ResetRewindsAllRings) {
+    DistRing a;
+    a.init(kSmallHeap, kQuickTimeoutMs);
+
+    auto r0 = a.alloc(100, /*scope_depth=*/0);
+    auto r1 = a.alloc(100, /*scope_depth=*/1);
+    auto r2 = a.alloc(100, /*scope_depth=*/3);
+
+    a.release(r0.slot);
+    a.release(r1.slot);
+    a.release(r2.slot);
+
+    a.reset_to_empty();
+
+    EXPECT_EQ(a.next_task_id(), 0);
+    for (int r = 0; r < DIST_MAX_RING_DEPTH; ++r) {
+        EXPECT_EQ(a.heap_top(r), 0u) << "ring " << r << " heap_top not rewound";
+        EXPECT_EQ(a.heap_tail(r), 0u) << "ring " << r << " heap_tail not rewound";
+    }
+}
+
+TEST(DistRing, NewSlotStatesCarryRingMetadata) {
+    DistRing a;
+    a.init(kSmallHeap, kQuickTimeoutMs);
+
+    auto r = a.alloc(100, /*scope_depth=*/2);
+    auto *s = a.slot_state(r.slot);
+    ASSERT_NE(s, nullptr);
+    EXPECT_EQ(s->ring_idx, 2);
+    EXPECT_EQ(s->ring_slot_idx, 0);  // first allocation on ring 2
+
+    auto r2 = a.alloc(100, /*scope_depth=*/2);
+    auto *s2 = a.slot_state(r2.slot);
+    EXPECT_EQ(s2->ring_idx, 2);
+    EXPECT_EQ(s2->ring_slot_idx, 1);  // second allocation on the same ring
+
+    auto r3 = a.alloc(100, /*scope_depth=*/0);
+    auto *s3 = a.slot_state(r3.slot);
+    EXPECT_EQ(s3->ring_idx, 0);
+    EXPECT_EQ(s3->ring_slot_idx, 0);  // ring 0's own in-ring index resets to 0
+
+    a.release(r.slot);
+    a.release(r2.slot);
+    a.release(r3.slot);
 }

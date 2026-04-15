@@ -192,6 +192,83 @@ class TestScope:
             counter_shm.close()
             counter_shm.unlink()
 
+    def test_user_nested_scope_runs_to_completion(self):
+        """User opens a nested scope with ``with orch.scope():``; all tasks run."""
+        counter_shm, counter_buf = _make_shared_counter()
+        try:
+            # Use one sub worker so the increments serialize — _increment_counter
+            # is a non-atomic RMW and races across parallel SubWorker processes.
+            hw = Worker(level=3, num_sub_workers=1)
+            cid = hw.register(lambda: _increment_counter(counter_buf))
+            hw.init()
+
+            def orch(o, _args):
+                with o.scope():
+                    o.submit_sub(cid)
+                    o.submit_sub(cid)
+                o.submit_sub(cid)  # back on outer-scope ring
+
+            hw.run(Task(orch=orch))
+            hw.close()
+
+            assert _read_counter(counter_buf) == 3
+        finally:
+            counter_shm.close()
+            counter_shm.unlink()
+
+    def test_user_nested_scope_binding_is_exposed(self):
+        """The scope context manager and raw scope_begin / scope_end are bound."""
+        from simpler.task_interface import DistOrchestrator  # noqa: PLC0415
+
+        # Binding carries the new accessors.
+        assert hasattr(DistOrchestrator, "scope_begin")
+        assert hasattr(DistOrchestrator, "scope_end")
+
+        hw = Worker(level=3, num_sub_workers=1)
+        hw.register(lambda: None)
+        hw.init()
+
+        def orch(o, _args):
+            # Raw calls — match L2's pto2_scope_begin / pto2_scope_end.
+            o.scope_begin()
+            o.scope_end()
+            # Context-manager form.
+            with o.scope():
+                pass
+            # Mixed with submits.
+            with o.scope():
+                inner = o.alloc((32,), DataType.FLOAT32)
+                assert inner.data != 0
+
+        hw.run(Task(orch=orch))
+        hw.close()
+
+    def test_user_nested_scope_three_deep(self):
+        """Three levels of nested scopes drain cleanly (no leaked refs)."""
+        counter_shm, counter_buf = _make_shared_counter()
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+            cid = hw.register(lambda: _increment_counter(counter_buf))
+            hw.init()
+
+            def orch(o, _args):
+                o.submit_sub(cid)  # outer scope (ring 0)
+                with o.scope():
+                    o.submit_sub(cid)  # ring 1
+                    with o.scope():
+                        o.submit_sub(cid)  # ring 2
+                        with o.scope():
+                            o.submit_sub(cid)  # ring 3
+                            with o.scope():
+                                o.submit_sub(cid)  # clamps to ring 3
+
+            hw.run(Task(orch=orch))
+            hw.close()
+            assert _read_counter(counter_buf) == 5
+        finally:
+            counter_shm.close()
+            counter_shm.unlink()
+
 
 # ---------------------------------------------------------------------------
 # Test: orch.alloc — runtime-managed intermediate buffer lifecycle

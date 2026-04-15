@@ -34,6 +34,10 @@ void DistTaskSlotState::reset() {
     task_args.clear();
     task_args_list.clear();
     is_group_ = false;
+    // ring_idx / ring_slot_idx are deliberately NOT cleared here: DistRing
+    // stamps them at alloc() before the Orchestrator ever calls reset(),
+    // and DistRing::release() needs to read them for the FIFO advance. The
+    // fields are rewritten on every alloc, so stale values never escape.
     sub_complete_count.store(0, std::memory_order_relaxed);
 }
 

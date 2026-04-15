@@ -54,7 +54,12 @@ ContinuousTensor DistOrchestrator::alloc(const std::vector<uint32_t> &shape, Dat
     // allocator as a slot-only claim — matches reserve_outputs_and_slot.
     // Skip tensormap registration when the returned heap_ptr is nullptr,
     // since 0 is the sentinel for "no tensor" in infer_deps.
-    DistAllocResult ar = allocator_->alloc(aligned);
+    //
+    // Inherit the caller's scope depth so alloc buffers land in the same
+    // ring as any tasks submitted inside that scope — an alloc inside a
+    // nested `with orch.scope():` uses the nested ring and reclaims
+    // independently of the outer ring (Strict-1).
+    DistAllocResult ar = allocator_->alloc(aligned, scope_->current_depth());
     if (ar.slot == DIST_INVALID_SLOT) {
         throw std::runtime_error("DistOrchestrator::alloc: allocator shutdown");
     }
@@ -244,7 +249,7 @@ DistAllocResult DistOrchestrator::reserve_outputs_and_slot(std::vector<TaskArgs>
         }
     }
 
-    DistAllocResult ar = allocator_->alloc(total_bytes);
+    DistAllocResult ar = allocator_->alloc(total_bytes, scope_->current_depth());
     if (ar.slot == DIST_INVALID_SLOT) return ar;
 
     // Hand slabs out in the same order we counted them.

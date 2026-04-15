@@ -136,8 +136,19 @@ inline void bind_dist_worker(nb::module_ &m) {
             "Allocate an intermediate ContinuousTensor from the orchestrator's MAP_SHARED "
             "pool (visible to forked child workers). Lifetime: until the next Worker.run() call."
         )
-        // Internal lifecycle hooks invoked by Worker::run (Python facade) only.
-        // Not part of the user-facing orch-fn API.
+        // User-facing nested scope (Strict-1). Tasks submitted between
+        // `scope_begin` and `scope_end` bind to a heap ring chosen by the
+        // current nesting depth (`min(depth, DIST_MAX_RING_DEPTH - 1)`),
+        // reclaiming independently of outer-scope tasks. Non-blocking:
+        // `scope_end` releases scope refs and returns; use `_drain()` for
+        // a synchronous wait.
+        .def(
+            "scope_begin", &DistOrchestrator::scope_begin,
+            "Open a nested scope. Max nesting depth = DIST_MAX_SCOPE_DEPTH (64)."
+        )
+        .def("scope_end", &DistOrchestrator::scope_end, "Close the innermost scope. Non-blocking.")
+        // Aliases used by the Python `Worker.run` facade to open/close the
+        // outermost scope without looking like a user-facing API.
         .def("_scope_begin", &DistOrchestrator::scope_begin)
         .def("_scope_end", &DistOrchestrator::scope_end)
         .def(
@@ -201,4 +212,6 @@ inline void bind_dist_worker(nb::module_ &m) {
         );
 
     m.attr("DIST_DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DIST_DEFAULT_HEAP_RING_SIZE);
+    m.attr("DIST_MAX_RING_DEPTH") = static_cast<int32_t>(DIST_MAX_RING_DEPTH);
+    m.attr("DIST_MAX_SCOPE_DEPTH") = static_cast<int32_t>(DIST_MAX_SCOPE_DEPTH);
 }

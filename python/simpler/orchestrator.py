@@ -29,7 +29,8 @@ Scope/drain lifecycle is managed by ``Worker.run()``; users never call those
 directly.
 """
 
-from collections.abc import Sequence
+import contextlib
+from collections.abc import Iterator, Sequence
 from typing import Any, Optional
 
 from .task_interface import (
@@ -88,6 +89,44 @@ class Orchestrator:
     def submit_sub_group(self, callable_id: int, args_list: list):
         """Submit a group of SUB tasks (N TaskArgs → N workers, 1 DAG node)."""
         return self._o.submit_sub_group(int(callable_id), args_list)
+
+    # ------------------------------------------------------------------
+    # Nested scope (Strict-1 per-scope rings)
+    # ------------------------------------------------------------------
+    #
+    # Tasks and allocations inside a nested ``with orch.scope():`` bind to a
+    # deeper heap ring (``min(depth, DIST_MAX_RING_DEPTH-1)``) so their
+    # memory reclaims independently of the outer scope. ``scope_end`` is
+    # non-blocking — it releases scope refs and returns; call
+    # ``Worker.run``/``drain`` for a synchronous wait.
+    #
+    # Usage::
+    #
+    #     def my_orch(orch, args):
+    #         with orch.scope():
+    #             orch.submit_next_level(a, ...)
+    #             orch.submit_next_level(b, ...)
+    #         orch.submit_next_level(c, ...)   # back on outer-scope ring
+
+    def scope_begin(self) -> None:
+        self._o.scope_begin()
+
+    def scope_end(self) -> None:
+        self._o.scope_end()
+
+    @contextlib.contextmanager
+    def scope(self) -> Iterator["Orchestrator"]:
+        """Open a nested scope for the ``with`` block.
+
+        Tasks submitted inside the block use a deeper heap ring so they
+        reclaim independently of the outer scope (see Strict-1 in
+        ``.claude/plans/HIERARCHICAL_RUNTIME_REFACTOR.md``).
+        """
+        self._o.scope_begin()
+        try:
+            yield self
+        finally:
+            self._o.scope_end()
 
     def alloc(self, shape: Sequence[int], dtype: DataType) -> ContinuousTensor:
         """Allocate a runtime-managed intermediate buffer.

@@ -45,7 +45,15 @@
 // Constants
 // =============================================================================
 
+// User-visible scope-nesting cap. Matches L2 PTO2_MAX_SCOPE_DEPTH.
 static constexpr int32_t DIST_MAX_SCOPE_DEPTH = 64;
+
+// Number of independent HeapRing layers inside DistRing. Scope depth maps
+// to ring index via `min(depth, DIST_MAX_RING_DEPTH - 1)` (L2-style);
+// scopes deeper than DIST_MAX_RING_DEPTH share the innermost ring.
+// Matches L2's PTO2_MAX_RING_DEPTH (Strict-1).
+static constexpr int32_t DIST_MAX_RING_DEPTH = 4;
+
 static constexpr int32_t DIST_INVALID_SLOT = -1;
 
 // =============================================================================
@@ -125,6 +133,14 @@ struct DistTaskSlotState {
     // Runtime-owned OUTPUT slabs live in the Worker's HeapRing and are
     // reclaimed implicitly by DistRing::release(slot) — no per-slot
     // munmap is needed. See docs/orchestrator.md §8b.
+
+    // --- HeapRing layer membership (Strict-1 per-scope rings) ---
+    // Set by DistRing::alloc from the caller's scope depth. ring_idx picks
+    // which of the DIST_MAX_RING_DEPTH heaps holds this slot's slab;
+    // ring_slot_idx is the slot's position within that ring's FIFO order
+    // and indexes the ring's per-slot released/heap_end vectors.
+    int32_t ring_idx{0};
+    int32_t ring_slot_idx{0};
 
     // --- Group bookkeeping ---
     std::atomic<int32_t> sub_complete_count{0};

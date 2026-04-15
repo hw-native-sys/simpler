@@ -197,9 +197,9 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
 
     uint64_t data = S(res.task_slot).task_args.tensor(0).data;
     ASSERT_NE(data, 0u);
-    uintptr_t base = reinterpret_cast<uintptr_t>(allocator.heap_base());
+    uintptr_t base = reinterpret_cast<uintptr_t>(allocator.heap_base(0));
     EXPECT_GE(data, base);
-    EXPECT_LT(data, base + allocator.heap_size());
+    EXPECT_LT(data, base + allocator.heap_size(0));
     EXPECT_EQ(data % DIST_HEAP_ALIGN, 0u);
 
     EXPECT_EQ(tm.lookup(data), res.task_slot);

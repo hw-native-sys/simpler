@@ -343,7 +343,7 @@ The mailbox layout, fork ordering, and child loop are in
 | `DistRing` slot-state pool (`std::deque<unique_ptr<TaskSlotState>>`) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | monotonic task-id; reset at `Worker.run` drain |
 | `slot.task_args` (single) or `task_args_list[N]` (group, vector-backed) | parent heap | same | until slot reaches CONSUMED |
 | per-WT mailbox (PROCESS only) | shm MAP_SHARED | parent WorkerThread writes, child reads | lifetime of WorkerThread |
-| HeapRing (user OUTPUT auto-alloc + `orch.alloc`) | shm MAP_SHARED | output to user code; inherited by forked children | FIFO reclaimed via `last_alive` |
+| **HeapRing[0..3]** (user OUTPUT auto-alloc + `orch.alloc`) | **4 separate shm MAP_SHARED mmaps**, one per scope-layer ring | output to user code; inherited by forked children | per-ring FIFO via `rings_[r].last_alive`; scope depth picks the ring |
 | tensor data bytes (user-provided) | torch shm (`share_memory_()` or equiv) | kernel reads/writes | user-managed |
 | `Callable` target (ChipCallable / OrchFn / Python fn) | parent heap | child via fork COW | pre-fork registered |
 
@@ -353,6 +353,18 @@ Slot state lives inside `DistRing` as `std::deque<std::unique_ptr<…>>` so
 pointer for every live slot; `drain()` calls `ring.reset_to_empty()` to
 drop all slot state at the end of each `Worker.run`, bounding per-run
 memory.
+
+The HeapRing is **partitioned into `DIST_MAX_RING_DEPTH = 4` independent
+rings** (Strict-1; matches L2's `PTO2_MAX_RING_DEPTH`). Each ring is its
+own `mmap(MAP_SHARED | MAP_ANONYMOUS)` taken before fork, so children
+inherit all four at the same virtual addresses. The `heap_ring_size`
+knob on `Worker(...)` is the **per-ring** size (default 1 GiB → 4 GiB
+total VA reservation); physical pages remain lazy under
+`MAP_ANONYMOUS`. A task's ring is chosen by scope depth,
+`min(scope_depth, DIST_MAX_RING_DEPTH - 1)`, so inner-scope tasks
+reclaim independently of outer-scope tasks. See
+[orchestrator.md §5](orchestrator.md) for the allocator internals and
+[orchestrator.md §6](orchestrator.md) for the scope → ring mapping.
 
 **Child never reads the slot.** Child only sees:
 

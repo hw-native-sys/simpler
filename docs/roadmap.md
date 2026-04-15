@@ -41,12 +41,11 @@ get if I pip install `main` today", this page.
   `Orchestrator._scope_begin` / `_scope_end` / `_drain` are invoked by
   the Python `Worker.run` facade only.
 - **`orch.alloc(shape, dtype)`** — runtime-owned intermediate buffer
-  carved out of the Worker's HeapRing (a single
-  `mmap(MAP_SHARED | MAP_ANONYMOUS)` region taken in the `DistWorker`
-  ctor, before fork, inherited by child workers at the same virtual
-  address). Lifetime follows a synthetic task slot; the slab is
-  reclaimed implicitly by the allocator once all downstream consumers
-  have completed and `last_alive` sweeps over it (see
+  carved out of the Worker's HeapRing (per-scope ring chosen by the
+  caller's scope depth; see "Per-scope HeapRing" below). Lifetime
+  follows a synthetic task slot; the slab is reclaimed implicitly by
+  the allocator once all downstream consumers have completed and the
+  ring's `last_alive` sweeps over it (see
   [orchestrator.md](orchestrator.md) §8b).
 - **`OUTPUT` auto-allocation** — `OUTPUT`-tagged tensors submitted with
   `data == 0` are auto-allocated from the same HeapRing as part of the
@@ -59,11 +58,24 @@ get if I pip install `main` today", this page.
   (see [orchestrator.md](orchestrator.md) §8b "Tag semantics for
   write-after-write"). `OUTPUT_EXISTING` is never auto-allocated.
 - **`heap_ring_size` knob** — `Worker(level=3, heap_ring_size=...)`
-  selects the HeapRing size (default 1 GiB). The underlying
-  `DistWorker(level, heap_ring_size)` ctor also installs fork hygiene
-  (setenv of `OMP/BLIS/OPENBLAS/MKL_NUM_THREADS=1`, plus
+  selects the **per-ring** HeapRing size (default 1 GiB; total VA
+  reservation is `heap_ring_size * DIST_MAX_RING_DEPTH`). The
+  underlying `DistWorker(level, heap_ring_size)` ctor also installs
+  fork hygiene (setenv of `OMP/BLIS/OPENBLAS/MKL_NUM_THREADS=1`, plus
   `KMP_DUPLICATE_LIB_OK=TRUE` on macOS, and a `pthread_atfork` landing
   pad).
+- **Per-scope HeapRing (Strict-1) + user-facing nested scope** —
+  `DistRing` owns `DIST_MAX_RING_DEPTH = 4` independent HeapRing
+  instances, each its own `mmap(MAP_SHARED | MAP_ANONYMOUS)` taken
+  before fork. Ring selection is driven by scope depth
+  (`min(scope_depth, DIST_MAX_RING_DEPTH - 1)`); every ring has its own
+  `mu` / `cv` / `last_alive`, so inner-scope tasks reclaim independently
+  of outer-scope tasks. `Orchestrator::scope_begin` / `scope_end` are
+  now user-facing (bound on the nanobind `DistOrchestrator`); the
+  Python facade adds a `with orch.scope():` context manager. Outermost
+  scope is still opened by `Worker::run`. Max user nesting is
+  `DIST_MAX_SCOPE_DEPTH = 64`; scopes deeper than the ring depth share
+  the innermost ring.
 
 ### Dispatch internals
 
@@ -97,15 +109,6 @@ get if I pip install `main` today", this page.
 ---
 
 ## In flight / not yet landed
-
-### PR-Scope: user-facing nested scope + Strict-1 per-scope rings
-
-- Expose `Orchestrator.scope_begin` / `scope_end` to the user's orch fn
-  (allow nesting up to `DIST_MAX_SCOPE_DEPTH = 64`).
-- Refactor `DistRing` into `DIST_MAX_RING_DEPTH = 4` independent
-  HeapRing instances; `alloc_for_scope(depth)` picks one. Per-ring
-  `last_alive` so deeply nested scopes never contend on a single
-  reclamation pointer.
 
 ### PR-D: WorkerThread unification + per-shape ready queues
 

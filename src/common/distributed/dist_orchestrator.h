@@ -91,7 +91,18 @@ public:
     // Submit a group of SUB tasks: N args -> N workers, 1 DAG node.
     DistSubmitResult submit_sub_group(int32_t callable_id, const std::vector<TaskArgs> &args_list);
 
-    // Internal — invoked by Worker::run only.
+    // Open a nested scope. Every task submitted between this call and the
+    // matching `scope_end()` picks a heap ring based on the current scope
+    // depth (`min(depth, DIST_MAX_RING_DEPTH - 1)`) so its slab reclaims
+    // independently of the outer scope's slabs (Strict-1). `Worker::run`
+    // opens the outermost scope automatically; user orch fns may nest up
+    // to `DIST_MAX_SCOPE_DEPTH` additional scopes.
+    //
+    // Non-blocking: `scope_end` walks the scope's tasks and releases one
+    // ref per task, returning immediately. Actual CONSUMED transitions
+    // happen asynchronously as each task's consumer count reaches
+    // threshold (mirrors L2's `pto2_scope_end`). Callers that need a
+    // synchronous wait must call `drain()` separately.
     void scope_begin();
     void scope_end();
 
