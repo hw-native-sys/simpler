@@ -64,10 +64,7 @@ struct DistSubmitResult {
 
 class DistOrchestrator {
 public:
-    void init(
-        DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_queue,
-        DistTaskSlotState *slots, int32_t num_slots
-    );
+    void init(DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_queue);
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
     // visible to forked child workers). Returns a ContinuousTensor whose
@@ -115,15 +112,16 @@ private:
     DistRing *allocator_ = nullptr;
     DistScope *scope_ = nullptr;
     DistReadyQueue *ready_queue_ = nullptr;
-    DistTaskSlotState *slots_ = nullptr;
-    int32_t num_slots_ = 0;
 
     // --- Drain support (owned here, not on Worker) ---
     std::atomic<int32_t> active_tasks_{0};
     std::mutex drain_mu_;
     std::condition_variable drain_cv_;
 
-    DistTaskSlotState &slot_state(DistTaskSlot s) { return slots_[s]; }
+    // Slot state lives in the DistRing; the pointer stays stable for the
+    // slot's lifetime. Throws if the id is out of range — callers that
+    // hold a recently-allocated slot id should always get a valid pointer.
+    DistTaskSlotState &slot_state(DistTaskSlot s);
 
     // Shared submit machinery. Takes `args_list` by value so the Orchestrator
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.

@@ -14,7 +14,6 @@
 #include <sys/mman.h>
 
 #include <chrono>
-#include <cstring>
 #include <stdexcept>
 
 DistRing::~DistRing() {
@@ -25,16 +24,11 @@ DistRing::~DistRing() {
     }
 }
 
-void DistRing::init(int32_t window_size, uint64_t heap_bytes, uint32_t timeout_ms) {
-    if (window_size <= 0 || (window_size & (window_size - 1)) != 0) {
-        throw std::invalid_argument("DistRing window_size must be a positive power of 2");
-    }
+void DistRing::init(uint64_t heap_bytes, uint32_t timeout_ms) {
     if (heap_mapped_) {
         throw std::logic_error("DistRing::init called twice");
     }
 
-    window_size_ = window_size;
-    window_mask_ = window_size - 1;
     timeout_ms_ = timeout_ms == 0 ? DIST_ALLOC_TIMEOUT_MS : timeout_ms;
 
     next_task_id_ = 0;
@@ -43,8 +37,9 @@ void DistRing::init(int32_t window_size, uint64_t heap_bytes, uint32_t timeout_m
     heap_tail_ = 0;
     shutdown_ = false;
 
-    released_.assign(static_cast<size_t>(window_size_), 0);
-    slot_heap_end_.assign(static_cast<size_t>(window_size_), 0);
+    released_.clear();
+    slot_heap_end_.clear();
+    slot_states_.clear();
 
     if (heap_bytes > 0) {
         heap_size_ = heap_bytes;
@@ -62,7 +57,7 @@ void DistRing::init(int32_t window_size, uint64_t heap_bytes, uint32_t timeout_m
 }
 
 // ---------------------------------------------------------------------------
-// alloc — atomic {slot, heap_ptr} under a single mutex
+// alloc — slot + heap under a single mutex
 // ---------------------------------------------------------------------------
 
 DistAllocResult DistRing::alloc(uint64_t bytes) {
@@ -83,38 +78,31 @@ DistAllocResult DistRing::alloc(uint64_t bytes) {
     while (true) {
         if (shutdown_) return DistAllocResult{DIST_INVALID_SLOT, nullptr, 0};
 
-        if (has_window_space_locked()) {
-            if (aligned == 0) {
-                heap_ptr = nullptr;
-                heap_end = heap_top_;
-                break;
-            }
-            if (try_bump_heap_locked(aligned, heap_ptr, heap_end)) {
-                break;
-            }
+        if (aligned == 0) {
+            heap_ptr = nullptr;
+            heap_end = heap_top_;
+            break;
+        }
+        if (try_bump_heap_locked(aligned, heap_ptr, heap_end)) {
+            break;
         }
 
-        // Wait for a release to advance last_alive_ (and heap_tail_) or for
-        // shutdown. Treat the timeout as a deadlock signal so Python callers
-        // can enlarge the heap instead of stalling forever.
+        // Heap full. Wait for a release to advance last_alive_ / heap_tail_,
+        // or for shutdown. Timing out surfaces as a Python exception so the
+        // user can enlarge `heap_ring_size` instead of deadlocking.
         if (cv_.wait_until(lk, deadline) == std::cv_status::timeout) {
             if (shutdown_) return DistAllocResult{DIST_INVALID_SLOT, nullptr, 0};
-            int32_t active = next_task_id_ - last_alive_;
             throw std::runtime_error(
-                aligned > heap_size_ / 2 ?
-                    "DistRing: heap exhausted (timed out waiting). Increase heap_ring_size on Worker." :
-                    (active >= window_size_ ? "DistRing: task window full (timed out waiting). "
-                                              "Either the DAG is too wide or the scheduler has stalled." :
-                                              "DistRing: timed out waiting for reclamation.")
+                "DistRing: heap exhausted (timed out waiting). Increase heap_ring_size on Worker."
             );
         }
     }
 
     int32_t task_id = next_task_id_++;
-    DistTaskSlot slot = task_id & window_mask_;
-    released_[static_cast<size_t>(slot)] = 0;
-    slot_heap_end_[static_cast<size_t>(slot)] = heap_end;
-    return DistAllocResult{slot, heap_ptr, heap_end};
+    released_.push_back(0);
+    slot_heap_end_.push_back(heap_end);
+    slot_states_.emplace_back(std::make_unique<DistTaskSlotState>());
+    return DistAllocResult{task_id, heap_ptr, heap_end};
 }
 
 // ---------------------------------------------------------------------------
@@ -124,11 +112,43 @@ DistAllocResult DistRing::alloc(uint64_t bytes) {
 void DistRing::release(DistTaskSlot slot) {
     {
         std::lock_guard<std::mutex> lk(mu_);
-        if (slot < 0 || slot >= window_size_) return;
+        if (slot < 0 || slot >= next_task_id_) return;
+        if (released_[static_cast<size_t>(slot)] != 0) return;  // idempotent
         released_[static_cast<size_t>(slot)] = 1;
         advance_last_alive_locked();
     }
     cv_.notify_all();
+}
+
+// ---------------------------------------------------------------------------
+// slot_state accessor — pointer-stable until reset_to_empty()
+// ---------------------------------------------------------------------------
+
+DistTaskSlotState *DistRing::slot_state(DistTaskSlot slot) {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (slot < 0 || slot >= static_cast<int32_t>(slot_states_.size())) return nullptr;
+    return slot_states_[static_cast<size_t>(slot)].get();
+}
+
+// ---------------------------------------------------------------------------
+// reset_to_empty — drop all per-task state, return counters to zero
+// ---------------------------------------------------------------------------
+
+void DistRing::reset_to_empty() {
+    std::lock_guard<std::mutex> lk(mu_);
+    if (last_alive_ != next_task_id_) {
+        throw std::logic_error(
+            "DistRing::reset_to_empty: tasks still live "
+            "(last_alive_ != next_task_id_). Did drain() complete?"
+        );
+    }
+    next_task_id_ = 0;
+    last_alive_ = 0;
+    heap_top_ = 0;
+    heap_tail_ = 0;
+    released_.clear();
+    slot_heap_end_.clear();
+    slot_states_.clear();
 }
 
 // ---------------------------------------------------------------------------
@@ -138,6 +158,11 @@ void DistRing::release(DistTaskSlot slot) {
 int32_t DistRing::active_count() const {
     std::lock_guard<std::mutex> lk(mu_);
     return next_task_id_ - last_alive_;
+}
+
+int32_t DistRing::next_task_id() const {
+    std::lock_guard<std::mutex> lk(mu_);
+    return next_task_id_;
 }
 
 void DistRing::shutdown() {
@@ -151,8 +176,6 @@ void DistRing::shutdown() {
 // ---------------------------------------------------------------------------
 // Internal helpers (all called under mu_)
 // ---------------------------------------------------------------------------
-
-bool DistRing::has_window_space_locked() const { return (next_task_id_ - last_alive_) < window_size_; }
 
 bool DistRing::try_bump_heap_locked(uint64_t aligned, void *&out_ptr, uint64_t &out_end) {
     uint64_t top = heap_top_;
@@ -192,15 +215,12 @@ bool DistRing::try_bump_heap_locked(uint64_t aligned, void *&out_ptr, uint64_t &
 
 void DistRing::advance_last_alive_locked() {
     // Advance last_alive_ while the next-oldest task is already released.
-    // Reset the released bit as we cross it so the slot can be reused without
-    // leaking a stale "consumed" flag into the next generation.
-    while (last_alive_ < next_task_id_) {
-        DistTaskSlot la_slot = last_alive_ & window_mask_;
-        if (released_[static_cast<size_t>(la_slot)] == 0) break;
-
-        uint64_t end = slot_heap_end_[static_cast<size_t>(la_slot)];
-        released_[static_cast<size_t>(la_slot)] = 0;
+    // Slot state and heap_end entries stay in their vectors — memory is
+    // only reclaimed by reset_to_empty() at drain time — so we don't have
+    // to worry about invalidating pointers that other threads may still
+    // hold to in-flight slots.
+    while (last_alive_ < next_task_id_ && released_[static_cast<size_t>(last_alive_)] == 1) {
+        heap_tail_ = slot_heap_end_[static_cast<size_t>(last_alive_)];
         last_alive_++;
-        heap_tail_ = end;
     }
 }

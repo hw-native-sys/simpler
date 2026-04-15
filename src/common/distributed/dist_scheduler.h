@@ -43,6 +43,7 @@
 #include "dist_types.h"
 
 class DistWorkerManager;  // forward decl
+class DistRing;           // forward decl
 
 // =============================================================================
 // DistScheduler — DAG engine (no worker pool ownership)
@@ -51,8 +52,7 @@ class DistWorkerManager;  // forward decl
 class DistScheduler {
 public:
     struct Config {
-        DistTaskSlotState *slots;
-        int32_t num_slots;
+        DistRing *ring;  // owns slot state storage; Scheduler reads via ring->slot_state(id)
         DistReadyQueue *ready_queue;
         DistWorkerManager *manager;  // not owned — Scheduler calls manager for dispatch
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).

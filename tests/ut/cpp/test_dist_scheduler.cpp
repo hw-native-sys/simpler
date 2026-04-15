@@ -100,9 +100,6 @@ static TaskArgs single_tensor_args(uint64_t data_ptr, TensorArgType tag) {
 // ---------------------------------------------------------------------------
 
 struct SchedulerFixture : public ::testing::Test {
-    static constexpr int32_t N = DIST_TASK_WINDOW_SIZE;
-
-    std::unique_ptr<DistTaskSlotState[]> slots;
     DistTensorMap tm;
     DistRing allocator;
     DistScope scope;
@@ -116,10 +113,11 @@ struct SchedulerFixture : public ::testing::Test {
     std::vector<DistTaskSlot> consumed_slots;
     std::mutex consumed_mu;
 
+    DistTaskSlotState &S(DistTaskSlot id) { return *allocator.slot_state(id); }
+
     void SetUp() override {
-        slots = std::make_unique<DistTaskSlotState[]>(N);
-        allocator.init(N, /*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq, slots.get(), N);
+        allocator.init(/*heap_bytes=*/1ULL << 20);
+        orch.init(&tm, &allocator, &scope, &rq);
 
         manager.add_next_level(&mock_worker);
         manager.start([this](DistTaskSlot slot) {
@@ -127,8 +125,7 @@ struct SchedulerFixture : public ::testing::Test {
         });
 
         DistScheduler::Config c;
-        c.slots = slots.get();
-        c.num_slots = N;
+        c.ring = &allocator;
         c.ready_queue = &rq;
         c.manager = &manager;
         c.on_consumed_cb = [this](DistTaskSlot s) {
@@ -182,7 +179,7 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
 
     auto args_b = single_tensor_args(0xBEEF, TensorArgType::INPUT);
     auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
-    EXPECT_EQ(slots[b.task_slot].state.load(), TaskState::PENDING);
+    EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
 
     mock_worker.wait_running();
     EXPECT_EQ(mock_worker.dispatched[0].slot, a.task_slot);
@@ -204,9 +201,6 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
 // ===========================================================================
 
 struct GroupSchedulerFixture : public ::testing::Test {
-    static constexpr int32_t N = DIST_TASK_WINDOW_SIZE;
-
-    std::unique_ptr<DistTaskSlotState[]> slots;
     DistTensorMap tm;
     DistRing allocator;
     DistScope scope;
@@ -221,10 +215,11 @@ struct GroupSchedulerFixture : public ::testing::Test {
     std::vector<DistTaskSlot> consumed_slots;
     std::mutex consumed_mu;
 
+    DistTaskSlotState &S(DistTaskSlot id) { return *allocator.slot_state(id); }
+
     void SetUp() override {
-        slots = std::make_unique<DistTaskSlotState[]>(N);
-        allocator.init(N, /*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq, slots.get(), N);
+        allocator.init(/*heap_bytes=*/1ULL << 20);
+        orch.init(&tm, &allocator, &scope, &rq);
 
         manager.add_next_level(&worker_a);
         manager.add_next_level(&worker_b);
@@ -233,8 +228,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
         });
 
         DistScheduler::Config c;
-        c.slots = slots.get();
-        c.num_slots = N;
+        c.ring = &allocator;
         c.ready_queue = &rq;
         c.manager = &manager;
         c.on_consumed_cb = [this](DistTaskSlot s) {
@@ -301,7 +295,7 @@ TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
 
     worker_a.complete();
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    EXPECT_EQ(slots[slot].state.load(), TaskState::RUNNING);
+    EXPECT_EQ(S(slot).state.load(), TaskState::RUNNING);
 
     worker_b.complete();
     wait_consumed(slot);
@@ -316,7 +310,7 @@ TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
 
     auto args_b = single_tensor_args(0xCAFE, TensorArgType::INPUT);
     auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
-    EXPECT_EQ(slots[b.task_slot].state.load(), TaskState::PENDING);
+    EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
 
     worker_a.wait_running();
     worker_b.wait_running();

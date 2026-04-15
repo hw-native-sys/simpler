@@ -10,31 +10,48 @@
  */
 
 /**
- * DistRing — unified task-slot + heap-buffer allocator (Strict-2).
+ * DistRing — unified slot + heap allocator for L3+ distributed workers.
  *
- * Single allocator guarding both resources under one mutex, mirroring L2's
- * `PTO2TaskAllocator`. The orchestrator calls `alloc(bytes)` to claim a slot
- * plus a contiguous heap slab in one atomic step; there is no partial-failure
- * rollback. `release(slot)` advances a FIFO `last_alive` pointer, which
- * implicitly reclaims heap space belonging to the trailing range of slots.
+ * A single structure owns three correlated, per-task resources:
  *
- * Heap memory is a single `mmap(MAP_SHARED | MAP_ANONYMOUS)` region taken
- * at construction time, before any fork, so forked child workers see the
- * same bytes at the same virtual address.
+ *   1. A monotonic task id (`next_task_id_`), allocated by the Orchestrator.
+ *      Unlike L2's `PTO2TaskAllocator` the id is NOT masked into a fixed-size
+ *      window — slot state lives in parent-process heap (never crossed into
+ *      child workers), so a ring index buys us nothing at L3 (see the plan's
+ *      L2 Consistency Audit, allowed exception #6).
+ *   2. A shared-memory heap slab (bump-allocated under one mutex, FIFO
+ *      reclaimed via `last_alive_`). This part still mirrors L2 (Strict-2):
+ *      the heap must be `mmap(MAP_SHARED)` and forked into child workers,
+ *      which forces a pre-sized region.
+ *   3. The per-task scheduling state (`DistTaskSlotState`). Stored in a
+ *      `std::deque<std::unique_ptr<...>>` so push_back never invalidates
+ *      pointers, and destruction happens only at `reset_to_empty()` /
+ *      process teardown, giving callers stable references to a slot until
+ *      it is consumed.
  *
- * Output-buffer alignment is 1024 B (matches L2's `PTO2_PACKED_OUTPUT_ALIGN`).
+ * Back-pressure: only the heap can be full. `alloc(bytes)` spin-waits on a
+ * cv; if no progress is made for `timeout_ms` it throws `std::runtime_error`
+ * so Python callers see an exception rather than a silent deadlock.
  *
- * Back-pressure: `alloc()` spin-waits with cv when either the slot window or
- * the heap is exhausted. If no progress is made for `timeout_ms` the call
- * throws `std::runtime_error` so Python users can catch it and grow the heap
- * instead of deadlocking.
+ * Lifecycle:
+ *
+ *   Worker.run() → orch submits N tasks → each submit calls
+ *   `ring.alloc()` (task id allocated, slot state constructed) → scheduler
+ *   dispatches → workers run → on_consumed calls `ring.release(id)` which
+ *   marks the slot consumed and advances `last_alive_` FIFO-wise → drain
+ *   waits until `active_count() == 0` → `ring.reset_to_empty()` resets
+ *   counters and drops all slot states so the next run starts fresh.
+ *
+ *   Memory footprint per Worker.run() is bounded by the peak alive task
+ *   count; no state accumulates across runs.
  */
 
 #pragma once
 
-#include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
+#include <memory>
 #include <mutex>
 #include <vector>
 
@@ -71,45 +88,59 @@ public:
     // hands out slots, but any `alloc(bytes>0)` throws. `timeout_ms == 0`
     // selects the default. Must be called before any fork if the heap is
     // to be inherited by children.
-    void init(
-        int32_t window_size = DIST_TASK_WINDOW_SIZE, uint64_t heap_bytes = DIST_DEFAULT_HEAP_RING_SIZE,
-        uint32_t timeout_ms = DIST_ALLOC_TIMEOUT_MS
-    );
+    void init(uint64_t heap_bytes = DIST_DEFAULT_HEAP_RING_SIZE, uint32_t timeout_ms = DIST_ALLOC_TIMEOUT_MS);
 
-    // Allocate a slot (and, if `bytes > 0`, a heap slab). Blocks with
-    // back-pressure; throws `std::runtime_error` on timeout. Returns the
-    // sentinel `{DIST_INVALID_SLOT, nullptr, 0}` on `shutdown()`.
+    // Allocate a slot (and, if `bytes > 0`, a heap slab). Blocks on the
+    // heap cv; throws `std::runtime_error` on timeout. Returns the sentinel
+    // `{DIST_INVALID_SLOT, nullptr, 0}` on `shutdown()`.
     //
     // `bytes` is rounded up to `DIST_HEAP_ALIGN`. Passing `0` skips the heap
     // bump entirely (slot-only allocation).
     DistAllocResult alloc(uint64_t bytes = 0);
 
     // Release a slot. Marks the slot consumed; advances `last_alive_` (and
-    // `heap_tail_`) as far as the FIFO ordering allows.
+    // `heap_tail_`) as far as the FIFO ordering allows. Safe to call from
+    // any thread; safe under concurrent `alloc()`.
     void release(DistTaskSlot slot);
 
-    int32_t window_size() const { return window_size_; }
+    // Pointer to the slot's state. Stable for the slot's lifetime (i.e.
+    // until `reset_to_empty()` drops it). Returns nullptr for invalid ids.
+    //
+    // Thread safety: the pointer refers to heap-allocated storage held by a
+    // `std::deque<std::unique_ptr<...>>`. `std::deque::push_back` never
+    // invalidates pointers to existing elements, so once a slot id has been
+    // handed out by `alloc()`, `slot_state(id)` stays valid across concurrent
+    // allocs. The caller is responsible for not using the pointer across a
+    // matching `reset_to_empty()` call.
+    DistTaskSlotState *slot_state(DistTaskSlot slot);
+
+    // Clear all per-task state and return to `next_task_id_ = last_alive_ = 0`.
+    // Requires that no slots are currently live (`active_count() == 0`) —
+    // typically called by `DistOrchestrator::drain()` right after the active
+    // count hits zero.
+    void reset_to_empty();
+
     int32_t active_count() const;
+    int32_t next_task_id() const;
     void *heap_base() const { return heap_base_; }
     uint64_t heap_size() const { return heap_size_; }
 
     void shutdown();
 
 private:
-    int32_t window_size_{DIST_TASK_WINDOW_SIZE};
-    int32_t window_mask_{DIST_TASK_WINDOW_SIZE - 1};
     uint32_t timeout_ms_{DIST_ALLOC_TIMEOUT_MS};
 
-    // Orch-owned counter (single-writer from alloc(), so no atomic needed —
-    // it's still read under mu_).
+    // Monotonic within a run. Reset to 0 by `reset_to_empty()`.
     int32_t next_task_id_{0};
 
     // FIFO consumption frontier. `[last_alive_, next_task_id_)` are live.
     int32_t last_alive_{0};
 
-    // Per-slot bookkeeping (sized to window_size_ after init).
+    // Per-slot bookkeeping, indexed directly by task id (0..next_task_id_).
+    // All three grow together under `mu_`; no erase while the run is live.
     std::vector<uint8_t> released_;        // 0 = live, 1 = consumed
     std::vector<uint64_t> slot_heap_end_;  // byte-offset high-water of each slot's allocation
+    std::deque<std::unique_ptr<DistTaskSlotState>> slot_states_;
 
     // Heap region.
     void *heap_base_{nullptr};
@@ -123,7 +154,6 @@ private:
     bool heap_mapped_{false};
 
     // Helpers — all called under mu_.
-    bool has_window_space_locked() const;
     bool try_bump_heap_locked(uint64_t aligned_bytes, void *&out_ptr, uint64_t &out_end);
     void advance_last_alive_locked();
 };

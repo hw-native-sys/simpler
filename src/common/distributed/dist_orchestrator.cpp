@@ -16,16 +16,19 @@
 #include <stdexcept>
 
 void DistOrchestrator::init(
-    DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_queue,
-    DistTaskSlotState *slots, int32_t num_slots
+    DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_queue
 ) {
     tensormap_ = tensormap;
     allocator_ = allocator;
     scope_ = scope;
     ready_queue_ = ready_queue;
-    slots_ = slots;
-    num_slots_ = num_slots;
     active_tasks_.store(0, std::memory_order_relaxed);
+}
+
+DistTaskSlotState &DistOrchestrator::slot_state(DistTaskSlot s) {
+    DistTaskSlotState *p = allocator_->slot_state(s);
+    if (!p) throw std::runtime_error("DistOrchestrator::slot_state: invalid slot id");
+    return *p;
 }
 
 // ---------------------------------------------------------------------------
@@ -383,8 +386,14 @@ bool DistOrchestrator::on_consumed(DistTaskSlot slot) {
 }
 
 void DistOrchestrator::drain() {
-    std::unique_lock<std::mutex> lk(drain_mu_);
-    drain_cv_.wait(lk, [this] {
-        return active_tasks_.load(std::memory_order_acquire) == 0;
-    });
+    {
+        std::unique_lock<std::mutex> lk(drain_mu_);
+        drain_cv_.wait(lk, [this] {
+            return active_tasks_.load(std::memory_order_acquire) == 0;
+        });
+    }
+    // Every slot is CONSUMED (active_tasks_ == 0 ⇒ allocator last_alive_ ==
+    // next_task_id_). Drop all per-slot state so the next Worker.run()
+    // starts from task_id = 0 with no accumulated memory.
+    allocator_->reset_to_empty();
 }

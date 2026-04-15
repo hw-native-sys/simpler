@@ -105,8 +105,6 @@ void fork_hygiene_once() {
 
 DistWorker::DistWorker(int32_t level, uint64_t heap_ring_size) :
     level_(level) {
-    slots_ = std::make_unique<DistTaskSlotState[]>(DIST_TASK_WINDOW_SIZE);
-
     // Fork hygiene runs before the HeapRing mmap so the env-var defaults
     // apply to any thread-pool library that observes them at library init.
     fork_hygiene_once();
@@ -114,7 +112,7 @@ DistWorker::DistWorker(int32_t level, uint64_t heap_ring_size) :
     // mmap the HeapRing region here, in the ctor, so Python callers can
     // construct the DistWorker before fork()-ing children. The children
     // inherit the MAP_SHARED region at the same virtual address.
-    allocator_.init(DIST_TASK_WINDOW_SIZE, heap_ring_size, DIST_ALLOC_TIMEOUT_MS);
+    allocator_.init(heap_ring_size, DIST_ALLOC_TIMEOUT_MS);
 }
 
 DistWorker::~DistWorker() {
@@ -130,7 +128,7 @@ void DistWorker::add_worker(WorkerType type, IWorker *worker) {
 void DistWorker::init() {
     if (initialized_) throw std::runtime_error("DistWorker: already initialized");
 
-    orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_queue_, slots_.get(), DIST_TASK_WINDOW_SIZE);
+    orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_queue_);
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
@@ -139,8 +137,7 @@ void DistWorker::init() {
     });
 
     DistScheduler::Config cfg;
-    cfg.slots = slots_.get();
-    cfg.num_slots = DIST_TASK_WINDOW_SIZE;
+    cfg.ring = &allocator_;
     cfg.ready_queue = &ready_queue_;
     cfg.manager = &manager_;
     cfg.on_consumed_cb = [this](DistTaskSlot slot) {

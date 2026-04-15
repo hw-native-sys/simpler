@@ -13,6 +13,7 @@
 
 #include <stdexcept>
 
+#include "dist_ring.h"
 #include "dist_worker_manager.h"
 
 // =============================================================================
@@ -24,7 +25,7 @@
 // =============================================================================
 
 void DistScheduler::start(const Config &cfg) {
-    if (cfg.slots == nullptr || cfg.ready_queue == nullptr || cfg.manager == nullptr)
+    if (cfg.ring == nullptr || cfg.ready_queue == nullptr || cfg.manager == nullptr)
         throw std::invalid_argument("DistScheduler::start: null config fields");
     cfg_ = cfg;
 
@@ -48,7 +49,7 @@ void DistScheduler::stop() {
 // =============================================================================
 
 void DistScheduler::worker_done(DistTaskSlot slot) {
-    DistTaskSlotState &s = cfg_.slots[slot];
+    DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
 
     // Group aggregation: only push to completion queue when ALL workers done
     if (s.is_group()) {
@@ -118,7 +119,7 @@ void DistScheduler::run() {
 // =============================================================================
 
 void DistScheduler::on_task_complete(DistTaskSlot slot) {
-    DistTaskSlotState &s = cfg_.slots[slot];
+    DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
     s.state.store(TaskState::COMPLETED, std::memory_order_release);
 
     // Release fanin on downstream consumers
@@ -128,7 +129,7 @@ void DistScheduler::on_task_complete(DistTaskSlot slot) {
         consumers = s.fanout_consumers;
     }
     for (DistTaskSlot consumer : consumers) {
-        DistTaskSlotState &cs = cfg_.slots[consumer];
+        DistTaskSlotState &cs = *cfg_.ring->slot_state(consumer);
         int32_t released = cs.fanin_released.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (released >= cs.fanin_count) {
             TaskState expected = TaskState::PENDING;
@@ -153,7 +154,7 @@ void DistScheduler::on_task_complete(DistTaskSlot slot) {
 }
 
 void DistScheduler::try_consume(DistTaskSlot slot) {
-    DistTaskSlotState &s = cfg_.slots[slot];
+    DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
     int32_t released = s.fanout_released.fetch_add(1, std::memory_order_acq_rel) + 1;
     int32_t total;
     {
@@ -174,7 +175,7 @@ void DistScheduler::try_consume(DistTaskSlot slot) {
 void DistScheduler::dispatch_ready() {
     DistTaskSlot slot;
     while (cfg_.ready_queue->try_pop(slot)) {
-        DistTaskSlotState &s = cfg_.slots[slot];
+        DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
         int N = s.group_size();  // 1 for normal tasks
 
         auto workers = cfg_.manager->pick_n_idle(s.worker_type, N);

@@ -88,7 +88,9 @@ private:
     bool initialized_{false};
 
     // --- Scheduling engine components ---
-    std::unique_ptr<DistTaskSlotState[]> slots_;
+    // Per-task slot state lives inside `allocator_` (DistRing) — Orchestrator
+    // and Scheduler access it via `allocator_.slot_state(id)`. No separate
+    // fixed-size slots array at L3 (see plan Allowed Exception #6).
     DistTensorMap tensormap_;
     DistRing allocator_;
     DistScope scope_;

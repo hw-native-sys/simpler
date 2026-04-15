@@ -119,7 +119,7 @@ SubmitResult Orchestrator::submit_next_level(Callable cb,
 
 ### Step details
 
-**Step 1 — `ring_.alloc()`**: See [§5 Ring](#5-ring-unified-slot--heap-allocator). Blocks the Orch thread
+**Step 1 — `ring_.alloc()`**: See [§5 Ring](#5-ring-slot--heap-allocator). Blocks the Orch thread
 if all slots are in-flight; this is the system's back-pressure mechanism.
 
 **Step 2 — store task data**: `TaskArgs` is moved (not copied). `config` is a
@@ -246,13 +246,27 @@ SubmitResult Orchestrator::submit_sub(Callable cb, TaskArgs args, const CallConf
 
 ---
 
-## 5. Ring (unified slot + heap allocator)
+## 5. Ring (slot + heap allocator)
 
-`DistRing` is a single allocator that hands out both a task slot and an
-aligned heap slab in one atomic call — matching L2's `PTO2TaskAllocator`
-(Strict-2). The slot window and the heap region share one mutex, one
-`last_alive` pointer, and one back-pressure signal; there is no "got a slot
-but no heap" rollback path.
+`DistRing` owns three correlated per-task resources:
+
+1. A **monotonic task id** — allocated by the Orchestrator, incremented
+   on every `alloc()`. There is no fixed window and no modulo wrap at
+   L3: slot state lives in parent-process heap (never crossed into
+   child workers), so the ring index L2 uses to address shmem
+   descriptors buys us nothing here (see plan Allowed Exception #6).
+   A monotonic `int32_t` gives ~2 billion ids per `reset_to_empty()`
+   interval, reset back to 0 at the end of every `Worker.run()`.
+2. A **shared-memory heap slab** — bump-allocated under the same mutex,
+   FIFO-reclaimed via `last_alive_`. This still mirrors L2 (Strict-2):
+   the heap must be `mmap(MAP_SHARED)` and forked into child workers,
+   so it has to be pre-sized. `heap_ring_size` on the Worker ctor
+   controls the total bytes (default 1 GiB).
+3. The **per-task slot state** (`DistTaskSlotState`) — stored in a
+   `std::deque<std::unique_ptr<...>>`. `std::deque::push_back` never
+   invalidates pointers to existing elements, so the pointer returned
+   by `slot_state(id)` stays valid until `reset_to_empty()` drops the
+   whole deque.
 
 ```cpp
 struct DistAllocResult {
@@ -263,24 +277,24 @@ struct DistAllocResult {
 
 class DistRing {
 public:
-    void  init(int32_t window_size,
-               uint64_t heap_bytes,      // default 1 GiB, Worker-configurable
-               uint32_t timeout_ms);     // default 10 s
+    void  init(uint64_t heap_bytes,       // default 1 GiB, Worker-configurable
+               uint32_t timeout_ms);      // default 10 s
 
-    DistAllocResult alloc(uint64_t bytes = 0);   // blocks, throws on timeout
-    void            release(TaskSlot sid);       // FIFO-advances last_alive
-    void            shutdown();
+    DistAllocResult      alloc(uint64_t bytes = 0);  // blocks on heap full, throws on timeout
+    void                 release(TaskSlot sid);      // FIFO-advances last_alive
+    DistTaskSlotState   *slot_state(TaskSlot sid);   // pointer-stable until reset_to_empty
+    void                 reset_to_empty();           // drop per-task state at drain boundary
+    void                 shutdown();
 
     void    *heap_base()  const;
     uint64_t heap_size()  const;
 };
 ```
 
-**Back-pressure rationale**: if the Orch thread submits tasks faster than the
-Scheduler + Workers can drain, either the slot window or the heap fills up
-first. `alloc()` spin-waits on the shared cv; if `timeout_ms` elapses with no
-progress, it throws `std::runtime_error`. That surfaces as a Python exception
-so users can enlarge `heap_ring_size` on the `Worker` instead of deadlocking.
+**Back-pressure rationale**: only the heap can be full at L3. `alloc()`
+spin-waits on a cv; if `timeout_ms` elapses with no progress, it throws
+`std::runtime_error`. That surfaces as a Python exception so users can
+enlarge `heap_ring_size` on the `Worker` instead of deadlocking.
 
 **Alignment**: every heap allocation is rounded up to `DIST_HEAP_ALIGN = 1024 B`
 (matches L2's `PTO2_PACKED_OUTPUT_ALIGN`, Strict-3).
@@ -294,28 +308,26 @@ inherit the same virtual address range.
 as the next-oldest slot is also released, walking the `heap_tail_` forward
 accordingly. Heap space is reclaimed implicitly; no per-slot `munmap` runs.
 
+**End-of-run reset**: `DistOrchestrator::drain()` waits for `active_tasks_`
+to hit 0, then calls `ring.reset_to_empty()` which clears the deque of
+slot states, zeroes the heap cursors, and resets `next_task_id_` to 0.
+Memory per `Worker.run()` is bounded by that run's peak alive task count;
+nothing accumulates across runs.
+
 **Ownership by role**:
 
 | Field | Writer | Reader |
 | ----- | ------ | ------ |
 | `next_task_id_`, `heap_top_` | Orch (`alloc`, under `mu_`) | Allocator only |
 | `last_alive_`, `heap_tail_`, `released_[]` | `release` (scheduler or Orch thread) | Allocator only |
-| `slot_heap_end_[]` | Orch at alloc | `release` during FIFO advance |
+| `slot_heap_end_[]`, `slot_states_[]` | Orch at alloc | `release` / `slot_state()` readers |
 
 All shared state is guarded by a single mutex. The Orch thread is the only
 writer of `next_task_id_` / `heap_top_`, so the mutex serves primarily to
 coordinate with `release` and to protect the back-pressure condition
-variable.
-
-**Slot window is transitional.** The fixed-size
-`DIST_TASK_WINDOW_SIZE = 128` slot pool is legacy from matching L2's
-shmem-backed `PTO2TaskAllocator`. L3+ has no reason to bound slot count:
-slot state lives in the parent process's heap, is only read by Orch and
-Scheduler (never crossed into child workers), and the real back-pressure
-at L3 is the heap. A follow-up PR (PR-I in the plan) replaces the slot
-ring with a dynamic `std::deque<std::unique_ptr<TaskSlotState>>`; slot
-ids become monotonic task ids and only the heap throws on overflow.
-`DistRing` keeps its heap role and `last_alive_` reclamation clock.
+variable. `slot_state()` takes the mutex briefly to read the deque cell, but
+the returned pointer is safe to dereference without the mutex because
+`std::deque::push_back` doesn't invalidate existing elements.
 
 ---
 

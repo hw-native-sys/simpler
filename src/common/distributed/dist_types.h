@@ -40,7 +40,6 @@
 // Constants
 // =============================================================================
 
-static constexpr int32_t DIST_TASK_WINDOW_SIZE = 128;  // slots per engine instance
 static constexpr int32_t DIST_MAX_SCOPE_DEPTH = 64;
 static constexpr int32_t DIST_INVALID_SLOT = -1;
 

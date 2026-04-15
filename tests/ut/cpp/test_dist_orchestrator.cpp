@@ -26,9 +26,6 @@
 // ---------------------------------------------------------------------------
 
 struct OrchestratorFixture : public ::testing::Test {
-    static constexpr int32_t N = DIST_TASK_WINDOW_SIZE;
-
-    std::unique_ptr<DistTaskSlotState[]> slots;
     DistTensorMap tm;
     DistRing allocator;
     DistScope scope;
@@ -37,12 +34,14 @@ struct OrchestratorFixture : public ::testing::Test {
     ChipCallConfig cfg;
 
     void SetUp() override {
-        slots = std::make_unique<DistTaskSlotState[]>(N);
-        allocator.init(N, /*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq, slots.get(), N);
+        allocator.init(/*heap_bytes=*/1ULL << 20);
+        orch.init(&tm, &allocator, &scope, &rq);
     }
 
     void TearDown() override { allocator.shutdown(); }
+
+    // Per-slot accessor — slot state lives inside the DistRing now.
+    DistTaskSlotState &S(DistTaskSlot id) { return *allocator.slot_state(id); }
 
     // Helper: build a TaskArgs whose only tensor has the given (data, tag).
     static TaskArgs single_tensor_args(uint64_t data_ptr, TensorArgType tag) {
@@ -69,7 +68,7 @@ TEST_F(OrchestratorFixture, IndependentTaskIsImmediatelyReady) {
     DistTaskSlot slot;
     EXPECT_TRUE(rq.try_pop(slot));
     EXPECT_EQ(slot, res.task_slot);
-    EXPECT_EQ(slots[slot].state.load(), TaskState::READY);
+    EXPECT_EQ(S(slot).state.load(), TaskState::READY);
 }
 
 TEST_F(OrchestratorFixture, DependentTaskIsPending) {
@@ -82,8 +81,8 @@ TEST_F(OrchestratorFixture, DependentTaskIsPending) {
     // Task B reads INPUT at the same key — depends on A
     auto args_b = single_tensor_args(0xBEEF, TensorArgType::INPUT);
     auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
-    EXPECT_EQ(slots[b.task_slot].state.load(), TaskState::PENDING);
-    EXPECT_EQ(slots[b.task_slot].fanin_count, 1);
+    EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
+    EXPECT_EQ(S(b.task_slot).fanin_count, 1);
 
     DistTaskSlot extra;
     EXPECT_FALSE(rq.try_pop(extra));  // B should NOT be in ready queue
@@ -106,11 +105,11 @@ TEST_F(OrchestratorFixture, OnConsumedCleansUpTensorMap) {
 
     EXPECT_EQ(tm.lookup(0x42), slot);
 
-    slots[slot].state.store(TaskState::COMPLETED, std::memory_order_relaxed);
+    S(slot).state.store(TaskState::COMPLETED, std::memory_order_relaxed);
     orch.on_consumed(slot);
 
     EXPECT_EQ(tm.lookup(0x42), DIST_INVALID_SLOT);
-    EXPECT_EQ(slots[slot].state.load(), TaskState::CONSUMED);
+    EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
 }
 
 TEST_F(OrchestratorFixture, ScopeRegistersAndReleasesRef) {
@@ -121,8 +120,8 @@ TEST_F(OrchestratorFixture, ScopeRegistersAndReleasesRef) {
     rq.try_pop(slot);
 
     {
-        std::lock_guard<std::mutex> lk(slots[slot].fanout_mu);
-        EXPECT_EQ(slots[slot].fanout_total, 1);
+        std::lock_guard<std::mutex> lk(S(slot).fanout_mu);
+        EXPECT_EQ(S(slot).fanout_total, 1);
     }
 
     // Simulate the completion path that would run if this test drove the
@@ -130,11 +129,11 @@ TEST_F(OrchestratorFixture, ScopeRegistersAndReleasesRef) {
     // on_task_complete would normally fire (bumps fanout_released by 1).
     // Without this simulated self-release, the `>= total + 1` threshold in
     // release_ref / try_consume cannot be met from scope_end alone.
-    slots[slot].state.store(TaskState::COMPLETED, std::memory_order_relaxed);
-    slots[slot].fanout_released.fetch_add(1, std::memory_order_relaxed);
+    S(slot).state.store(TaskState::COMPLETED, std::memory_order_relaxed);
+    S(slot).fanout_released.fetch_add(1, std::memory_order_relaxed);
     orch.scope_end();
 
-    EXPECT_EQ(slots[slot].state.load(), TaskState::CONSUMED);
+    EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
 }
 
 TEST_F(OrchestratorFixture, NoDepTagSkipsDependencyTracking) {
@@ -147,8 +146,8 @@ TEST_F(OrchestratorFixture, NoDepTagSkipsDependencyTracking) {
     // Second task references same key but tagged NO_DEP — should be independent
     auto args_b = single_tensor_args(0xAAAA, TensorArgType::NO_DEP);
     auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
-    EXPECT_EQ(slots[b.task_slot].state.load(), TaskState::READY);
-    EXPECT_EQ(slots[b.task_slot].fanin_count, 0);
+    EXPECT_EQ(S(b.task_slot).state.load(), TaskState::READY);
+    EXPECT_EQ(S(b.task_slot).fanin_count, 0);
 }
 
 TEST_F(OrchestratorFixture, GroupTaskHasAllChipStorageEntries) {
@@ -157,9 +156,9 @@ TEST_F(OrchestratorFixture, GroupTaskHasAllChipStorageEntries) {
     auto res = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
 
     EXPECT_NE(res.task_slot, DIST_INVALID_SLOT);
-    EXPECT_TRUE(slots[res.task_slot].is_group());
-    EXPECT_EQ(slots[res.task_slot].group_size(), 2);
-    EXPECT_EQ(slots[res.task_slot].chip_storage_list.size(), 2u);
+    EXPECT_TRUE(S(res.task_slot).is_group());
+    EXPECT_EQ(S(res.task_slot).group_size(), 2);
+    EXPECT_EQ(S(res.task_slot).chip_storage_list.size(), 2u);
 
     // Both keys registered as producers for the group slot.
     EXPECT_EQ(tm.lookup(0xA0), res.task_slot);
@@ -182,7 +181,7 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
     auto res = orch.submit_next_level(0xDEAD, args, cfg);
     ASSERT_NE(res.task_slot, DIST_INVALID_SLOT);
 
-    const auto &chip = slots[res.task_slot].chip_storage_list.front();
+    const auto &chip = S(res.task_slot).chip_storage_list.front();
     uint64_t data = chip.tensor(0).data;
     ASSERT_NE(data, 0u);
     uintptr_t base = reinterpret_cast<uintptr_t>(allocator.heap_base());
@@ -205,7 +204,7 @@ TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {
     rq.try_pop(drain);
     // Mark the creator COMPLETED so the new submit mimics the alloc-slot
     // path (COMPLETED producer with non-zero fanout).
-    slots[creator.task_slot].state.store(TaskState::COMPLETED, std::memory_order_relaxed);
+    S(creator.task_slot).state.store(TaskState::COMPLETED, std::memory_order_relaxed);
 
     auto writer_args = single_tensor_args(0xFEED, TensorArgType::INOUT);
     auto writer = orch.submit_next_level(0xDEAD, writer_args, cfg);
@@ -216,15 +215,15 @@ TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {
     EXPECT_EQ(tm.lookup(0xFEED), writer.task_slot);
     // Writer has the creator recorded as a fanin producer (via INOUT
     // lookup) but no *live* fanin since the creator is already COMPLETED.
-    EXPECT_EQ(slots[writer.task_slot].fanin_count, 0);
-    ASSERT_EQ(slots[writer.task_slot].fanin_producers.size(), 1u);
-    EXPECT_EQ(slots[writer.task_slot].fanin_producers[0], creator.task_slot);
+    EXPECT_EQ(S(writer.task_slot).fanin_count, 0);
+    ASSERT_EQ(S(writer.task_slot).fanin_producers.size(), 1u);
+    EXPECT_EQ(S(writer.task_slot).fanin_producers[0], creator.task_slot);
     // Creator's fanout_total bumped so it waits for writer before CONSUMED.
     {
-        std::lock_guard<std::mutex> lk(slots[creator.task_slot].fanout_mu);
-        EXPECT_EQ(slots[creator.task_slot].fanout_total, 1);
-        ASSERT_EQ(slots[creator.task_slot].fanout_consumers.size(), 1u);
-        EXPECT_EQ(slots[creator.task_slot].fanout_consumers[0], writer.task_slot);
+        std::lock_guard<std::mutex> lk(S(creator.task_slot).fanout_mu);
+        EXPECT_EQ(S(creator.task_slot).fanout_total, 1);
+        ASSERT_EQ(S(creator.task_slot).fanout_consumers.size(), 1u);
+        EXPECT_EQ(S(creator.task_slot).fanout_consumers[0], writer.task_slot);
     }
 }
 
@@ -242,17 +241,17 @@ TEST_F(OrchestratorFixture, OutputAndOutputExistingAreInsertOnly) {
         auto prior = orch.submit_next_level(0xDEAD, prior_args, cfg);
         DistTaskSlot drain;
         rq.try_pop(drain);
-        slots[prior.task_slot].state.store(TaskState::COMPLETED, std::memory_order_relaxed);
+        S(prior.task_slot).state.store(TaskState::COMPLETED, std::memory_order_relaxed);
 
         auto writer_args = single_tensor_args(c.key, c.tag);
         auto writer = orch.submit_next_level(0xDEAD, writer_args, cfg);
 
         EXPECT_EQ(tm.lookup(c.key), writer.task_slot);
-        EXPECT_EQ(slots[writer.task_slot].fanin_count, 0);
-        EXPECT_TRUE(slots[writer.task_slot].fanin_producers.empty()) << "tag=" << static_cast<int>(c.tag);
+        EXPECT_EQ(S(writer.task_slot).fanin_count, 0);
+        EXPECT_TRUE(S(writer.task_slot).fanin_producers.empty()) << "tag=" << static_cast<int>(c.tag);
         {
-            std::lock_guard<std::mutex> lk(slots[prior.task_slot].fanout_mu);
-            EXPECT_EQ(slots[prior.task_slot].fanout_total, 0) << "tag=" << static_cast<int>(c.tag);
+            std::lock_guard<std::mutex> lk(S(prior.task_slot).fanout_mu);
+            EXPECT_EQ(S(prior.task_slot).fanout_total, 0) << "tag=" << static_cast<int>(c.tag);
         }
     }
 }

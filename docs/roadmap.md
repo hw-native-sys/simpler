@@ -74,11 +74,16 @@ get if I pip install `main` today", this page.
 - `DistChipProcess` / `DistSubWorker` are separate classes today;
   unified `WorkerThread` with `THREAD | PROCESS` modes is not yet
   implemented.
-- Slot-ring and heap-ring share one `DistRing` (merged, matches
-  L2-consistency audit Strict-2). One mutex guards both; FIFO
-  reclamation via `last_alive` advances both resources at once. There
-  is no partial-failure rollback path between slot and heap
-  acquisition.
+- `DistRing` owns the task-id counter, the heap slab, **and** the
+  per-slot state (`std::deque<std::unique_ptr<DistTaskSlotState>>`).
+  Slot ids are monotonic within a run (no fixed window, no modulo
+  wrap); `std::deque::push_back` keeps existing pointers valid across
+  concurrent allocs, so `ring.slot_state(id)` hands out a stable
+  pointer for every live slot. Heap bytes are the only back-pressure
+  source: `alloc()` throws `std::runtime_error` on timeout if the heap
+  is full. At end of `Worker.run()`, `drain()` calls
+  `ring.reset_to_empty()` to drop all slot state and zero counters,
+  so per-run memory stays bounded (see plan Allowed Exception #6).
 
 ---
 
