@@ -19,11 +19,11 @@
 #include "tensor_arg.h"
 
 // =============================================================================
-// Dump Tensor Configuration
+// Profiling Configuration
 // =============================================================================
 
-#ifndef PTO2_DUMP_TENSOR
-#define PTO2_DUMP_TENSOR 1
+#ifndef PTO2_PROFILING
+#define PTO2_PROFILING 1
 #endif
 
 struct TensorInfo {

@@ -76,7 +76,11 @@ arena_data (per-thread, circular byte buffer)
 These structs are binary-identical between a2a3 and a5 (enforced by
 `static_assert`). `dump_data_base` flows through `KernelArgs`, not
 `Runtime` — AICPU reads it from `k_args->dump_data_base` in
-`kernel.cpp` and passes it to `set_platform_dump_base()`.
+`kernel.cpp` and passes it to `set_platform_dump_base()`. Dump
+enablement itself is propagated separately via the per-worker
+handshake field `enable_profiling_flag` (`bit0 =
+PROFILING_FLAG_DUMP_TENSOR`), so device-side code must not infer
+"dump enabled" from `dump_data_base != 0`.
 
 ### 2.2 a2a3 — shared-memory + background thread (primary design)
 
@@ -116,8 +120,8 @@ kernels are still executing**.
 │ export_dump_files()      │
 │   → outputs/tensor_dump_ │
 │     YYYYMMDD_HHMMSS/     │
-│       manifest.json      │
-│       tensors.bin        │
+│       <same-name>.json   │
+│       <same-name>.bin    │
 └──────────────────────────┘
 ```
 
@@ -184,8 +188,8 @@ available on a5 hardware.
 │ export_dump_files()      │
 │   → outputs/tensor_dump_ │
 │     YYYYMMDD_HHMMSS/     │
-│       manifest.json      │
-│       tensors.bin        │
+│       <same-name>.json   │
+│       <same-name>.bin    │
 └──────────────────────────┘
 ```
 
@@ -194,7 +198,7 @@ available on a5 hardware.
 ```text
 init_tensor_dump()
   dump_collector_.initialize(...)
-  kernel_args_.dump_data_base = dump_collector_.get_dump_setup_device_ptr()
+  kernel_args_.args.dump_data_base = dump_collector_.get_dump_setup_device_ptr()
 launch AICPU / AICore              ← no background thread
 rtStreamSynchronize                ← wait for kernel completion
 collect_all()                      ← batch memcpy all buffers back
@@ -234,6 +238,12 @@ each non-scalar slot to a `TensorDumpInfo` (dtype + shape + offsets +
 device address), and calls `dump_tensor_record` for slots that match
 the current stage (inputs `BEFORE`, outputs `AFTER`, inouts both).
 
+When dump tensor is enabled, AICore executors also read
+`enable_profiling_flag` and issue `pipe_barrier(PIPE_ALL)` after task
+execution but before the FIN handshake. This closes the ordering gap
+where `AFTER_COMPLETION` snapshots could observe output buffers before
+all device-side writes were globally visible.
+
 ### 2.5 Common: tensor metadata registration
 
 AICPU only has device addresses and sizes — it does **not** know the
@@ -266,11 +276,27 @@ execution is never affected.
 
 ### 3.1 Enable at runtime
 
-The feature is gated end-to-end by a single boolean
-(`ChipCallConfig::enable_dump_tensor`) that threads from the Python
-harness through `ChipWorker::run` into `pto_runtime_c_api` and finally
-into `DeviceRunner::run`. When `false`, zero bytes are allocated and
-no dump code paths execute.
+The user-facing switch is still
+`ChipCallConfig::enable_dump_tensor`, but the runtime no longer relies
+on `dump_data_base` as the enable signal.
+
+Current propagation chain:
+
+1. Python / test harness sets `ChipCallConfig::enable_dump_tensor`.
+2. Host `DeviceRunner` allocates dump storage and publishes its base
+   address via `kernel_args.dump_data_base`.
+3. Host also sets `PROFILING_FLAG_DUMP_TENSOR` in each worker
+   handshake's `enable_profiling_flag`.
+4. The onboard AICPU kernel calls:
+   - `set_platform_dump_base(k_args->dump_data_base)` to publish the
+     backing storage location
+   - `set_enable_dump_tensor(GET_PROFILING_FLAG(...))` to publish the
+     actual enable state
+5. AICore executors read the same handshake bit to decide whether to
+   insert the extra completion barrier before FIN.
+
+When `enable_dump_tensor = false`, the host does not allocate dump
+storage and neither AICPU nor AICore enters dump-specific paths.
 
 **From a scene test** (`SceneTestCase.run_module` / pytest):
 
@@ -280,7 +306,7 @@ python tests/st/a5/host_build_graph/dump_tensor_example/test_dump_tensor_example
     -p a5sim --dump-tensor
 
 # pytest
-pytest tests/st/a5/host_build_graph/dump_tensor_example -p a5sim --dump-tensor
+pytest tests/st/a5/host_build_graph/dump_tensor_example --platform a5sim --dump-tensor
 ```
 
 **From `run_example.py`** (any example):
@@ -297,15 +323,33 @@ python examples/scripts/run_example.py \
 ```text
 outputs/
 └── tensor_dump_<YYYYMMDD_HHMMSS>/
-    ├── manifest.json      # Array of TensorDumpRecord metadata
-    └── tensors.bin        # Raw packed payload, indexed by bin_offset
+    ├── tensor_dump_<YYYYMMDD_HHMMSS>.json
+    └── tensor_dump_<YYYYMMDD_HHMMSS>.bin
 ```
 
-`manifest.json`:
+The JSON file is the manifest; `bin_file` points at the sibling binary
+payload file.
+
+`tensor_dump_<YYYYMMDD_HHMMSS>.json`:
 
 ```json
 {
-  "bin_file": "tensors.bin",
+  "timestamp": "20260415_103522",
+  "run_dir": "tensor_dump_20260415_103522",
+  "bin_format": {
+    "type": "logical_contiguous",
+    "byte_order": "little_endian"
+  },
+  "total_tensors": 1,
+  "before_dispatch": 1,
+  "after_completion": 0,
+  "input_tensors": 1,
+  "output_tensors": 0,
+  "inout_tensors": 0,
+  "truncated_tensors": 0,
+  "dropped_records": 0,
+  "dropped_overwrite": 0,
+  "bin_file": "tensor_dump_20260415_103522.bin",
   "tensors": [
     {
       "task_id": "0x0000000200000a00",
@@ -315,7 +359,6 @@ outputs/
       "func_id": 0,
       "arg_index": 0,
       "dtype": "float32",
-      "ndims": 1,
       "shape": [16384],
       "raw_shape": [16384],
       "offsets": [0],
@@ -332,7 +375,8 @@ outputs/
 ### 3.3 Inspect with `tools/dump_viewer.py`
 
 The viewer auto-picks the latest `outputs/tensor_dump_*` directory
-when invoked without arguments:
+when invoked without arguments. It loads the `*.json` manifest found in
+that directory and uses its `bin_file` field to locate the payload:
 
 ```bash
 # List every dumped tensor in the latest run
@@ -541,55 +585,21 @@ handoff queue).
 
 ---
 
-## 6. Known issues
+## 6. Completion ordering
 
-### 6.1 After-completion dumps capture stale output-tensor data (mixed_example)
+Older implementations could capture stale `AFTER_COMPLETION` output
+data: AICPU observed FIN and dumped the tensor before all device-side
+writes were guaranteed visible in GM.
 
-**Status:** open — requires pto-isa clarification.
+The current implementation fixes this in the runtime, not in each
+individual kernel. When dump tensor is enabled,
+`aicore_executor.cpp` issues `pipe_barrier(PIPE_ALL)` immediately after
+task execution and before writing the FIN handshake value. That makes
+the `AFTER_COMPLETION` snapshot happen only after dump-relevant output
+writes have drained.
 
-**Symptom:** in `mixed_example` (a2a3 / tensormap_and_ringbuffer),
-some `after_completion` output-tensor dumps show stale or zero
-prefixes followed by correct suffixes. The kernel execution result
-itself is correct; only the dumped snapshot is wrong.
-
-**Root cause:** the TSTORE instruction enqueues an asynchronous MTE3
-copy from vector pipe to Global Memory. The current post-TSTORE
-synchronisation in affected kernels uses:
-
-```cpp
-set_flag(PIPE_V, PIPE_MTE3);
-wait_flag(PIPE_V, PIPE_MTE3);
-```
-
-This pair does **not** guarantee that the MTE3 outgoing queue has
-fully drained to GM before AICore signals FIN to AICPU. When AICPU
-receives FIN and immediately reads the output buffer for the
-`after_completion` dump, it can observe partially-written data.
-
-**Evidence:** replacing the `set_flag/wait_flag` pair with
-`pipe_barrier(PIPE_ALL)` makes every `after_completion` dump match
-its recomputed golden values.
-
-**Affected scope:** any kernel that uses TSTORE and relies on
-`set_flag(PIPE_V, PIPE_MTE3)` + `wait_flag(PIPE_V, PIPE_MTE3)` as
-the final barrier before FIN. The dump itself is not at fault — the
-issue is in the ordering semantics between the MTE3 queue and the
-AICore → AICPU FIN handshake.
-
-**Workaround:** use `pipe_barrier(PIPE_ALL)` instead of the
-`set_flag/wait_flag` pair in kernels whose outputs need correct
-`after_completion` dumps.
-
-**Open question for pto-isa:**
-
-- Does `set_flag/wait_flag(PIPE_V, PIPE_MTE3)` guarantee that MTE3
-  writes are visible in GM, or only that the MTE3 **pipe** is idle?
-- What is the correct barrier to ensure GM visibility before FIN?
-
-**References:**
-
-- Kernels: `examples/a2a3/tensormap_and_ringbuffer/mixed_example/kernels/aic/` and `aiv/`
-- Runtime: `src/a2a3/runtime/tensormap_and_ringbuffer/aicpu/aicpu_executor.cpp`
+This barrier is gated on `PROFILING_FLAG_DUMP_TENSOR`, so non-dump runs
+keep the original cheaper completion path.
 
 ---
 

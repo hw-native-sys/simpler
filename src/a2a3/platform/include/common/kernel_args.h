@@ -72,7 +72,7 @@ struct KernelArgs {
     __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
     uint64_t ffts_base_addr{0};                             // FFTS base address for AICore
-    uint64_t dump_data_base{0};                             // Dump shared memory base address, zero when unused
+    uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
 };
 
 #ifdef __cplusplus

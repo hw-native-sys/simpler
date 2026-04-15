@@ -406,7 +406,7 @@ struct AicpuExecutor {
                 );
                 cur_thread_completed++;
                 if (mixed_complete) {
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
                     if (get_enable_dump_tensor()) {
                         dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                             thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
@@ -515,7 +515,7 @@ struct AicpuExecutor {
         ,
         bool profiling_enabled
 #endif
-#if PTO2_PROFILING || PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
         ,
         int32_t thread_idx
 #endif
@@ -944,7 +944,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             perf_aicpu_set_orch_thread_idx(sched_thread_num_);
         }
 #endif
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
         if (get_enable_dump_tensor()) {
             dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
         }
@@ -1163,7 +1163,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                     uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
                     ResourceCount rc = shape_resource_count(shape);
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
                     if (get_enable_dump_tensor()) {
                         dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                             thread_idx, *slot_state, TensorDumpStage::BEFORE_DISPATCH,
@@ -1183,7 +1183,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             ,
                             profiling_enabled
 #endif
-#if PTO2_PROFILING || PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
                             ,
                             thread_idx
 #endif
@@ -1197,7 +1197,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             ,
                             profiling_enabled
 #endif
-#if PTO2_PROFILING || PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
                             ,
                             thread_idx
 #endif
@@ -1210,7 +1210,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             ,
                             profiling_enabled
 #endif
-#if PTO2_PROFILING || PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
                             ,
                             thread_idx
 #endif
@@ -1272,7 +1272,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #endif
                 Cluster &c = tracker.clusters[ci];
                 ResourceCount rc = shape_resource_count(shape);
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
                 if (get_enable_dump_tensor()) {
                     dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                         thread_idx, *slot_state, TensorDumpStage::BEFORE_DISPATCH,
@@ -1292,7 +1292,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                         ,
                         profiling_enabled
 #endif
-#if PTO2_PROFILING || PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
                         ,
                         thread_idx
 #endif
@@ -1306,7 +1306,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                         ,
                         profiling_enabled
 #endif
-#if PTO2_PROFILING || PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
                         ,
                         thread_idx
 #endif
@@ -1319,7 +1319,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                         ,
                         profiling_enabled
 #endif
-#if PTO2_PROFILING || PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
                         ,
                         thread_idx
 #endif
@@ -1650,7 +1650,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         perf_aicpu_flush_phase_buffers(thread_idx);
     }
 #endif
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
     if (get_enable_dump_tensor()) {
         dump_tensor_flush(thread_idx);
     }

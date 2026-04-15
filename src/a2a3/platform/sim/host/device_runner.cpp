@@ -286,6 +286,10 @@ int DeviceRunner::run(
 
     // Calculate number of AIC cores
     int num_aic = block_dim;
+    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
+    if (enable_dump_tensor) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -295,6 +299,7 @@ int DeviceRunner::run(
         runtime.workers[i].task_status = 0;
         // First 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
+        runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
     }
 
     // Set function_bin_addr for each task: func_id_to_addr_[] stores CoreCallable

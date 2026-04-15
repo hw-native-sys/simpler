@@ -129,7 +129,7 @@ struct AicpuExecutor {
 
 static AicpuExecutor g_aicpu_executor;
 
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
 static int
 collect_task_tensor_buffer_addrs(const Runtime &runtime, const Task &task, uint64_t *buffer_addrs, int max_count) {
     int found = 0;
@@ -158,7 +158,7 @@ inline void AicpuExecutor::resolve_task_dependencies(
         return;
     }
 
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
     if (get_enable_dump_tensor()) {
         uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
         if (callable_addr != 0) {
@@ -242,7 +242,7 @@ inline bool AicpuExecutor::try_dispatch_task(
         running_task_ids_[core_id]
     );
 
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
     if (get_enable_dump_tensor()) {
         Task *task = runtime.get_task(task_id);
         if (task != nullptr) {
@@ -333,7 +333,7 @@ int AicpuExecutor::init(Runtime *runtime) {
     if (runtime->enable_profiling) {
         perf_aicpu_init_profiling(runtime);
     }
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
     if (get_enable_dump_tensor()) {
         dump_tensor_init(thread_num_);
     }
@@ -1060,7 +1060,7 @@ int AicpuExecutor::run(Runtime *runtime) {
     if (runtime->enable_profiling) {
         perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
-#if PTO2_DUMP_TENSOR
+#if PTO2_PROFILING
     if (get_enable_dump_tensor()) {
         dump_tensor_flush(thread_idx);
     }

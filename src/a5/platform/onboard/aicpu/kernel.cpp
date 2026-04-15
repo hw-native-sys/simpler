@@ -80,9 +80,11 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
     }
 
     // Store platform regs before calling aicpu_execute
+    // Dump enable is an execution control flag propagated via handshake.
+    // The dump base address is only the backing storage location.
     set_platform_regs(k_args->regs);
     set_platform_dump_base(k_args->dump_data_base);
-    set_enable_dump_tensor(k_args->dump_data_base != 0);
+    set_enable_dump_tensor(GET_PROFILING_FLAG(runtime->workers[0].enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
 
     // Affinity gate: drop excess threads before entering runtime
     if (!platform_aicpu_affinity_gate(runtime->sche_cpu_num, PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH)) {

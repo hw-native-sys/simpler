@@ -142,6 +142,13 @@ inline double cycles_to_us(uint64_t cycles) {
     return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
 }
 
+// Profiling-related runtime flags shared through AICPU-AICore handshake.
+#define PROFILING_FLAG_NONE 0u
+#define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
+#define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
+#define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
+#define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
+
 // =============================================================================
 // Tensor Dump Configuration
 // =============================================================================
