@@ -59,8 +59,19 @@ def pytest_addoption(parser):
     """Register CLI options."""
     parser.addoption("--platform", action="store", default=None, help="Target platform (e.g., a2a3sim, a2a3)")
     parser.addoption("--device", action="store", default="0", help="Device ID or range (e.g., 0, 4-7)")
-    parser.addoption("--case", action="store", default=None, help="Run specific case name only")
-    parser.addoption("--all-cases", action="store_true", default=False, help="Include manual cases")
+    parser.addoption(
+        "--case",
+        action="append",
+        default=None,
+        help="Case selector; repeatable. Forms: 'Foo' (any class), 'ClassA::Foo', 'ClassA::' (whole class).",
+    )
+    parser.addoption(
+        "--manual",
+        action="store",
+        choices=["exclude", "include", "only"],
+        default="exclude",
+        help="Manual case handling: exclude (default), include, only",
+    )
     parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
     parser.addoption("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
     parser.addoption(
@@ -232,11 +243,12 @@ def st_worker(request, st_platform, device_pool):
     if level == 2:
         ids = device_pool.allocate(1)
         if not ids:
-            pytest.fail("no devices available")
+            pytest.fail(f"no devices available in --device pool (requested 1, pool has {len(device_pool._available)})")
 
         from simpler.worker import Worker  # noqa: PLC0415
 
         w = Worker(level=2, device_id=ids[0], platform=st_platform, runtime=runtime, build=build)
+        w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
         w.init()
         yield w
         w.close()
@@ -247,7 +259,9 @@ def st_worker(request, st_platform, device_pool):
         max_subs = max((c.get("config", {}).get("num_sub_workers", 0) for c in cls.CASES), default=0)
         ids = device_pool.allocate(max_devices)
         if not ids:
-            pytest.fail(f"need {max_devices} devices")
+            pytest.fail(
+                f"need {max_devices} devices but --device pool has {len(device_pool._available)}; widen --device range"
+            )
 
         from simpler.worker import Worker  # noqa: PLC0415
 
@@ -259,6 +273,7 @@ def st_worker(request, st_platform, device_pool):
             runtime=runtime,
             build=build,
         )
+        w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
 
         # Register SubCallable entries from cls.CALLABLE
         sub_ids = {}

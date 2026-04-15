@@ -447,7 +447,20 @@ def compute_golden(self, args, params):
 | Batch (pytest) | `python examples/scripts/ci.py` | `pytest examples tests/st --platform a2a3sim` |
 | Multi-round | Not supported | `python test_*.py -p a2a3sim -n 3` |
 | Benchmark | Manual | `python test_*.py -p a2a3 -d 0 -n 100 --skip-golden --case CaseName` |
-| Profiling | `--enable-profiling` flag on run_example.py | `python test_*.py -p a2a3 -d 0 --enable-profiling` |
+| Profiling | `--enable-profiling` flag on run_example.py | `python test_*.py -p a2a3 -d 0 --enable-profiling` (auto-runs `tools/swimlane_converter.py` per case at end) |
+
+##### `--case` selector and `--manual`
+
+`--case` is repeatable and accepts compound forms (useful when a test file declares multiple `SceneTestCase` classes):
+
+| Form | Meaning |
+| ---- | ------- |
+| `--case Foo` | case named `Foo` in any class |
+| `--case ClassA::Foo` | `Foo` in `ClassA` only |
+| `--case ClassA::` | all cases in `ClassA` |
+| `--case A::x --case B::y` | multiple selectors (repeatable) |
+
+`--manual exclude` (default) skips `manual: True` cases; `--manual include` runs them alongside normal cases; `--manual only` runs only manual cases. These compose orthogonally with `--case`: explicit selectors still respect the manual filter — to run a manual case by name, pass `--manual include`.
 
 #### After Migration
 
