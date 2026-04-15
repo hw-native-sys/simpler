@@ -251,6 +251,25 @@ PTO2_SCOPE(PTO2ScopeMode::MANUAL) {
 This keeps the orchestration shape readable while avoiding a separate manual
 submit API family.
 
+For repeated zero-output updater chains, orchestration must still carry the
+chain explicitly:
+
+```cpp
+PTO2TaskId prev_update = PTO2TaskId::invalid();
+
+for (...) {
+    Arg up = make_update_args(...);
+    if (prev_update.is_valid()) {
+        up.add_dep(prev_update);
+    }
+    TaskOutputTensors update_out = pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, up);
+    prev_update = update_out.task_id();
+}
+```
+
+This is the intended v0 use of the direct submit-result task id after removing
+manual-local TensorMap fallback.
+
 ## Important Limitation
 
 V0 still rejects nested manual scopes and still requires explicit deps to be
@@ -290,8 +309,8 @@ dependency expression explicit without relying on TensorMap fallback.
 This document reflects the cleaned `manual_scope_v0` branch state validated on
 2026-04-15. The validation below is the status of the current implementation,
 including the latest unit-level alignment for direct submit-result task ids and
-manual-local TensorMap bypass. Real-device reruns should still be refreshed
-after any further runtime tuning.
+manual-local TensorMap bypass, plus the example-side explicit updater chaining
+needed once zero-output updater tasks stop relying on TensorMap fallback.
 
 ### Automated checks
 
@@ -332,11 +351,17 @@ Fresh hardware reruns passed for all four kept paged-attention paths:
 
 ### Method
 
-This benchmark block is the authoritative batch for the current cleaned branch.
-Older measurements were removed because they were collected before the cleanup
-pass or on different branch states.
+This benchmark block is the authoritative batch for the current aligned branch
+state.
 
-- commit under test: `32fecc5`
+It includes:
+
+- direct `TaskOutputTensors::task_id()` storage on submit results
+- manual-local TensorMap lookup / insert bypass in the runtime
+- explicit `update(i) -> update(i+1)` chaining in the two manual paged-attention
+  examples
+
+- base commit before the example-side chaining fix: `3d36370`
 - platform: `a2a3`
 - device: `9`
 - PTO-ISA commit: `d96c8784`
@@ -359,19 +384,19 @@ Important reading rule:
 
 | Example | Case | Auto Elapsed Trim (us) | Auto Orch Trim (us) | Manual Elapsed Trim (us) | Manual Orch Trim (us) | Elapsed Delta | Orch Delta |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| `paged_attention` | `Case1` | 79.9 | 64.6 | 124.7 | 109.4 | +44.8 us (+56.1%) | +44.8 us (+69.3%) |
-| `paged_attention` | `Case2` | 93.0 | 72.6 | 146.2 | 126.1 | +53.2 us (+57.2%) | +53.5 us (+73.7%) |
-| `paged_attention_unroll` | `Case1` | 1134.5 | 777.4 | 1136.9 | 785.3 | +2.4 us (+0.2%) | +7.9 us (+1.0%) |
-| `paged_attention_unroll` | `Case2` | 524.8 | 319.8 | 525.2 | 329.0 | +0.4 us (+0.1%) | +9.2 us (+2.9%) |
+| `paged_attention` | `Case1` | 77.5 | 62.4 | 124.0 | 108.6 | +46.5 us (+60.0%) | +46.2 us (+74.0%) |
+| `paged_attention` | `Case2` | 96.2 | 74.1 | 146.7 | 124.6 | +50.5 us (+52.5%) | +50.5 us (+68.2%) |
+| `paged_attention_unroll` | `Case1` | 1138.4 | 800.7 | 1131.3 | 694.9 | -7.1 us (-0.6%) | -105.8 us (-13.2%) |
+| `paged_attention_unroll` | `Case2` | 519.7 | 319.1 | 511.3 | 282.6 | -8.4 us (-1.6%) | -36.5 us (-11.4%) |
 
 ### Reading The Batch
 
-- Non-unroll manual scope is materially slower than AUTO in this fresh batch.
-  The regression is almost entirely orchestration time.
-- Unroll manual scope stays close to AUTO in total elapsed time, but it still
-  pays a measurable orchestration penalty.
-- The current v0 branch is functionally correct on hardware, but it does not
-  meet the earlier non-unroll performance target.
+- Non-unroll manual scope is still materially slower than AUTO in this fresh
+  batch. The regression is almost entirely orchestration time.
+- Unroll manual scope is now slightly faster than AUTO in total elapsed time
+  and materially lower in orchestration time on both kept cases.
+- The current v0 branch is functionally correct on hardware, but the
+  non-unroll manual path still does not meet the earlier performance target.
 
 ## Why Raw Non-unroll Looks Faster Than Unroll
 
@@ -435,18 +460,21 @@ per submitted task is much lower.
 
 ## Current Implementation Gap
 
-The unit-tested runtime now matches the two core v0 alignment rules:
+The runtime and manual paged-attention examples now match the core v0 alignment
+rules:
 
 - `TaskOutputTensors` carries `task_id` directly, including for zero-output
   updater tasks
 - manual-local tensors bypass TensorMap lookup and TensorMap insert in the
   submit path
+- manual examples explicitly chain repeated zero-output updater tasks with
+  `add_dep(prev_update_task)`
 
-The remaining validation work is end-to-end:
+The remaining work is performance-focused:
 
-- rerun real-device golden checks after the alignment change
-- rerun fresh benchmarks to measure how much orchestration time the stricter
-  bypass removes on the manual-scope examples
+- reduce non-unroll manual orchestration cost without reintroducing TensorMap
+  fallback for manual-local tensors
+- keep the unroll gains while tightening the small-workload path
 
 ## Historical Optimization Notes
 

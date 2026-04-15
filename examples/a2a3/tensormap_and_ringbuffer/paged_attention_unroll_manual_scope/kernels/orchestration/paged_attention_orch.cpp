@@ -177,6 +177,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                 const Tensor &li_update = alloc_outs.get_ref(1);
                 const Tensor &mi_update = alloc_outs.get_ref(2);
                 PTO2TaskId alloc_task = alloc_outs.task_id();
+                PTO2TaskId prev_update_task = PTO2TaskId::invalid();
 #ifdef ENABLE_PROFILING
                 prof_submit_count++;
                 CYCLE_COUNT_LAP(prof_submit_task);
@@ -280,10 +281,14 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     params_up.add_dep(alloc_task);
                     params_up.add_dep(sf_outs.task_id());
                     params_up.add_dep(pv_outs.task_id());
+                    if (prev_update_task.is_valid()) {
+                        params_up.add_dep(prev_update_task);
+                    }
                     params_up.add_scalar(is_first);
                     params_up.add_scalar(is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
-                    pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                    TaskOutputTensors update_outs = pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
+                    prev_update_task = update_outs.task_id();
 #ifdef ENABLE_PROFILING
                     prof_submit_count++;
                     CYCLE_COUNT_LAP(prof_submit_task);
