@@ -128,7 +128,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     // args[6] = block_size
     int valid_len = static_cast<int>(args[7]);
 
-    if (q_tile_size == 16) {
+    int block_size = static_cast<int>(args[6]);
+
+    if (q_tile_size == 16 && block_size == 16) {
+        softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij, valid_len);
+    } else if (q_tile_size == 16) {
         softmax_prepare_impl<16, 128>(sij, scale_value, pij, mij, lij, valid_len);
     } else {
         softmax_prepare_impl<64, 64>(sij, scale_value, pij, mij, lij, valid_len);
