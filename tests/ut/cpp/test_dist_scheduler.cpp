@@ -104,7 +104,7 @@ struct SchedulerFixture : public ::testing::Test {
 
     std::unique_ptr<DistTaskSlotState[]> slots;
     DistTensorMap tm;
-    DistRing ring;
+    DistRing allocator;
     DistScope scope;
     DistReadyQueue rq;
     DistOrchestrator orch;
@@ -118,8 +118,8 @@ struct SchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         slots = std::make_unique<DistTaskSlotState[]>(N);
-        ring.init(N);
-        orch.init(&tm, &ring, &scope, &rq, slots.get(), N);
+        allocator.init(N, /*heap_bytes=*/1ULL << 20);
+        orch.init(&tm, &allocator, &scope, &rq, slots.get(), N);
 
         manager.add_next_level(&mock_worker);
         manager.start([this](DistTaskSlot slot) {
@@ -142,7 +142,7 @@ struct SchedulerFixture : public ::testing::Test {
     void TearDown() override {
         sched.stop();
         manager.stop();
-        ring.shutdown();
+        allocator.shutdown();
     }
 
     void wait_consumed(DistTaskSlot slot, int timeout_ms = 500) {
@@ -208,7 +208,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
 
     std::unique_ptr<DistTaskSlotState[]> slots;
     DistTensorMap tm;
-    DistRing ring;
+    DistRing allocator;
     DistScope scope;
     DistReadyQueue rq;
     DistOrchestrator orch;
@@ -223,8 +223,8 @@ struct GroupSchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         slots = std::make_unique<DistTaskSlotState[]>(N);
-        ring.init(N);
-        orch.init(&tm, &ring, &scope, &rq, slots.get(), N);
+        allocator.init(N, /*heap_bytes=*/1ULL << 20);
+        orch.init(&tm, &allocator, &scope, &rq, slots.get(), N);
 
         manager.add_next_level(&worker_a);
         manager.add_next_level(&worker_b);
@@ -248,7 +248,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
     void TearDown() override {
         sched.stop();
         manager.stop();
-        ring.shutdown();
+        allocator.shutdown();
     }
 
     void wait_consumed(DistTaskSlot slot, int timeout_ms = 1000) {

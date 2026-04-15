@@ -119,7 +119,7 @@ SubmitResult Orchestrator::submit_next_level(Callable cb,
 
 ### Step details
 
-**Step 1 — `ring_.alloc()`**: See [§5 Ring](#5-ring). Blocks the Orch thread
+**Step 1 — `ring_.alloc()`**: See [§5 Ring](#5-ring-unified-slot--heap-allocator). Blocks the Orch thread
 if all slots are in-flight; this is the system's back-pressure mechanism.
 
 **Step 2 — store task data**: `TaskArgs` is moved (not copied). `config` is a
@@ -246,44 +246,76 @@ SubmitResult Orchestrator::submit_sub(Callable cb, TaskArgs args, const CallConf
 
 ---
 
-## 5. Ring
+## 5. Ring (unified slot + heap allocator)
 
-The `Ring` is a fixed-size slot pool with back-pressure.
+`DistRing` is a single allocator that hands out both a task slot and an
+aligned heap slab in one atomic call — matching L2's `PTO2TaskAllocator`
+(Strict-2). The slot window and the heap region share one mutex, one
+`last_alive` pointer, and one back-pressure signal; there is no "got a slot
+but no heap" rollback path.
 
 ```cpp
-class Ring {
+struct DistAllocResult {
+    TaskSlot slot;
+    void    *heap_ptr;          // nullptr when alloc(0)
+    uint64_t heap_end_offset;   // recorded per-slot for FIFO reclamation
+};
+
+class DistRing {
 public:
-    explicit Ring(int32_t window_size);   // typical: 128
+    void  init(int32_t window_size,
+               uint64_t heap_bytes,      // default 1 GiB, Worker-configurable
+               uint32_t timeout_ms);     // default 10 s
 
-    TaskSlot alloc();                      // blocks if full
-    void     release(TaskSlot sid);        // called by Scheduler on CONSUMED
+    DistAllocResult alloc(uint64_t bytes = 0);   // blocks, throws on timeout
+    void            release(TaskSlot sid);       // FIFO-advances last_alive
+    void            shutdown();
 
-private:
-    TaskSlotState *slots_;
-    int32_t size_;
-    std::atomic<uint32_t> head_;           // orch-only, next to alloc
-    std::atomic<uint32_t> tail_;           // scheduler-only, next to release
-    std::mutex mu_;
-    std::condition_variable cv_;
+    void    *heap_base()  const;
+    uint64_t heap_size()  const;
 };
 ```
 
 **Back-pressure rationale**: if the Orch thread submits tasks faster than the
-Scheduler + Workers can drain them, slots pile up. A fixed window forces the
-Orch thread to pause, preventing unbounded memory growth and keeping DAG
-depth reasonable.
+Scheduler + Workers can drain, either the slot window or the heap fills up
+first. `alloc()` spin-waits on the shared cv; if `timeout_ms` elapses with no
+progress, it throws `std::runtime_error`. That surfaces as a Python exception
+so users can enlarge `heap_ring_size` on the `Worker` instead of deadlocking.
+
+**Alignment**: every heap allocation is rounded up to `DIST_HEAP_ALIGN = 1024 B`
+(matches L2's `PTO2_PACKED_OUTPUT_ALIGN`, Strict-3).
+
+**Heap mapping**: the heap region is a single `mmap(MAP_SHARED | MAP_ANONYMOUS)`
+taken in the `DistWorker` ctor — *before* any fork — so forked child workers
+inherit the same virtual address range.
+
+**FIFO reclamation**: each `alloc()` records the slot's `heap_end_offset`.
+`release(slot)` flags that slot consumed and advances `last_alive_` as long
+as the next-oldest slot is also released, walking the `heap_tail_` forward
+accordingly. Heap space is reclaimed implicitly; no per-slot `munmap` runs.
 
 **Ownership by role**:
 
 | Field | Writer | Reader |
 | ----- | ------ | ------ |
-| `head_` | Orch (`alloc`) | Orch only |
-| `tail_` | Scheduler (`release`) | Scheduler only |
-| `slots_[i]` | Orch at submit, Scheduler on completion | both per-phase |
+| `next_task_id_`, `heap_top_` | Orch (`alloc`, under `mu_`) | Allocator only |
+| `last_alive_`, `heap_tail_`, `released_[]` | `release` (scheduler or Orch thread) | Allocator only |
+| `slot_heap_end_[]` | Orch at alloc | `release` during FIFO advance |
 
-Orch and Scheduler coordinate via per-slot atomics (`state`, `fanin_released`)
-and per-slot mutexes (`fanout_mu`), not via ring-level atomics beyond the
-head/tail positions.
+All shared state is guarded by a single mutex. The Orch thread is the only
+writer of `next_task_id_` / `heap_top_`, so the mutex serves primarily to
+coordinate with `release` and to protect the back-pressure condition
+variable.
+
+**Slot window is transitional.** The fixed-size
+`DIST_TASK_WINDOW_SIZE = 128` slot pool is legacy from matching L2's
+shmem-backed `PTO2TaskAllocator`. L3+ has no reason to bound slot count:
+slot state lives in the parent process's heap, is only read by Orch and
+Scheduler (never crossed into child workers), and the real back-pressure
+at L3 is the heap. A follow-up PR (PR-I in the plan) replaces the slot
+ring with a dynamic `std::deque<std::unique_ptr<TaskSlotState>>`; slot
+ids become monotonic task ids and only the heap throws on overflow.
+`DistRing` keeps its heap role and `last_alive_` reclamation clock.
 
 ---
 
@@ -428,45 +460,45 @@ when both fire concurrently at threshold.
 
 ## 8b. `alloc(shape, dtype)` — runtime-owned intermediate buffers
 
-Mirrors L2's "task slot owns its output buffer" model: `alloc` creates a
-synthetic task slot in `COMPLETED` state that owns an mmap'd buffer. The
-buffer is freed when the slot reaches `CONSUMED` — i.e. after all downstream
-consumers have completed and the scope ref has been released.
+`alloc` creates a synthetic task slot in `COMPLETED` state that owns a
+1024-byte-aligned slab of the Worker's HeapRing. The slab is reclaimed
+implicitly once the slot reaches `CONSUMED` and `last_alive` sweeps over it
+— no per-slot `munmap` runs.
 
 ```cpp
 ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
-    // 1. mmap(MAP_SHARED|MAP_ANONYMOUS) a page-aligned region — visible to
-    //    forked child workers at the same virtual address.
-    void *buf = mmap(...);
-    // 2. Claim a task slot.
-    TaskSlot sid = ring_.alloc();
-    TaskSlotState &s = slots_[sid];
-    // 3. Record buffer for on_consumed munmap.
-    s.alloc_bufs.push_back(buf);
-    s.alloc_sizes.push_back(mmap_bytes);
-    // 4. Register as this slot's output so downstream `INPUT`-tagged tensors
-    //    with the same data ptr look up this slot as producer.
-    tensormap_.insert(reinterpret_cast<uint64_t>(buf), sid);
-    s.output_keys.push_back(reinterpret_cast<uint64_t>(buf));
-    // 5. No fanin — alloc has no work to wait on.
+    // 1. Atomic {slot, heap_ptr} from the merged DistRing. Blocks on
+    //    back-pressure; throws on timeout.
+    uint64_t aligned = align_up(nbytes(shape, dtype), DIST_HEAP_ALIGN);
+    DistAllocResult ar = allocator_.alloc(aligned);
+    TaskSlotState &s   = slots_[ar.slot];
+    s.reset();
+    // 2. Register as this slot's output so downstream tensors with the same
+    //    data pointer look up this slot as producer.
+    uint64_t key = reinterpret_cast<uint64_t>(ar.heap_ptr);
+    tensormap_.insert(key, ar.slot);
+    s.output_keys.push_back(key);
+    // 3. No fanin — alloc has no work to wait on.
     s.fanin_count = 0;
-    // 6. Initial fanout = scope_ref. Consumers that wire on this slot in
+    // 4. Initial fanout = scope_ref. Consumers that wire on this slot in
     //    infer_deps bump fanout_total; this slot's CONSUMED transition waits
     //    for all of them + scope_end.
     s.fanout_total = (scope_.depth() > 0) ? 1 : 0;
-    if (s.fanout_total > 0) scope_.register_task(sid);
-    // 7. Sim self-consume so the fanout-release threshold math aligns with
+    if (s.fanout_total > 0) scope_.register_task(ar.slot);
+    // 5. Sim self-consume so the fanout-release threshold math aligns with
     //    normal slots (see §8 Fanout-release threshold).
     s.fanout_released = 1;
-    // 8. Straight to COMPLETED — no dispatch needed.
+    // 6. Straight to COMPLETED — no dispatch needed.
     s.state = TaskState::COMPLETED;
     active_tasks_++;
-    return ContinuousTensor{buf, shape, dtype};
+    return ContinuousTensor{key, shape, dtype};
 }
 ```
 
-On `on_consumed`, in addition to the usual `tensormap.erase_task_outputs` and
-`ring.release(sid)`, the slot's `alloc_bufs` are `munmap`'d.
+`on_consumed` runs the usual `tensormap.erase_task_outputs` and then calls
+`allocator_.release(sid)`. FIFO reclamation inside the allocator returns the
+slab to the heap's free region as `last_alive` advances; callers see no
+per-slab free syscall.
 
 ### Consumer interaction
 
@@ -483,16 +515,78 @@ s.fanin_producers.push_back(prod);
 if (ps_state != TaskState::COMPLETED) live_fanins++;   // wait only if not yet done
 ```
 
-### Status — placeholder vs target (PR-H)
+### Tag semantics for write-after-write
 
-The current implementation uses **per-alloc `mmap`** (one syscall per
-`alloc()` invocation). This is a placeholder. The target design (PR-H,
-"HeapRing") pre-allocates a single MAP_SHARED region at `Worker::init()`
-before any fork, bump-allocates from it, and reclaims via FIFO
-`last_alive` tracking — mirroring L2's `PTO2TaskAllocator`. Under the
-target design, `OUTPUT`-tagged tensors will be auto-allocated by the
-Orchestrator (no explicit `alloc` call), and `OUTPUT_EXISTING` will
-preserve the current "user-provided buffer" path.
+`infer_deps` mirrors L2 (`pto_orchestrator.cpp` Step B): only `INPUT`
+and `INOUT` do a tensormap lookup. `OUTPUT` and `OUTPUT_EXISTING`
+are pure inserts — the latter is the way users signal "skip the
+lookup even though I'm writing a pre-existing buffer".
+
+| Tag | TensorMap lookup | TensorMap insert | Dep wired on prior owner |
+| --- | ---------------- | ---------------- | ------------------------ |
+| `INPUT` | ✓ | — | RaW |
+| `INOUT` | ✓ | ✓ | RaW + WaW |
+| `OUTPUT` | — | ✓ | **none** — pure overwrite |
+| `OUTPUT_EXISTING` | — | ✓ | **none** — pure overwrite, skips lookup |
+| `NO_DEP` | — | — | — |
+
+A task that writes into a buffer handed out by `orch.alloc()` and
+needs the alloc-slot to stay live while it writes must tag the
+tensor `INOUT`. `INOUT` is the only tag that pulls the creator in
+as a fanin producer, pinning the alloc-slot against reclamation.
+Tagging the same buffer `OUTPUT` / `OUTPUT_EXISTING` is a pure
+overwrite and leaves no lifetime link: if the caller needs the
+buffer to outlive the creator they must maintain that lifetime
+themselves.
+
+### `OUTPUT` auto-allocation
+
+If an `OUTPUT`-tagged tensor arrives at `submit_*` with `data == 0`, the
+Orchestrator reserves a slab from the HeapRing as part of the same
+`DistRing::alloc` call that claims the slot. All OUTPUT slabs for a
+single submit share one `alloc(total_bytes)` call — the returned base
+pointer is carved into per-tensor slabs, each 1024-byte aligned.
+OUTPUT tensors whose `data` is already set are left alone (legacy
+"user-provided buffer" path, and the entry point for
+`orch.alloc()`-then-submit). `OUTPUT_EXISTING` is never auto-allocated.
+
+### `heap_ring_size` and back-pressure
+
+The HeapRing size is a `DistWorker` ctor parameter, surfaced on the Python
+`Worker` as `heap_ring_size=` (default 1 GiB). The heap is `mmap`'d in the
+C++ ctor — before Python forks the ChipProcess / SubWorker children — so
+children inherit the same `MAP_SHARED | MAP_ANONYMOUS` region at the same
+virtual address.
+
+When the heap or the slot window is full, `allocator.alloc()` spin-waits on
+the shared cv. If the `timeout_ms` elapses with no progress, it throws
+`std::runtime_error` (typical wrappers: `"HeapRing exhausted, increase
+heap_ring_size on Worker"` or `"task window full"`). That bubbles out of
+`Worker.run` as a Python exception so users can recover or grow the ring
+instead of stalling forever. Default timeout: 10 s.
+
+## 8c. Fork hygiene
+
+`DistWorker`'s ctor runs a one-shot `fork_hygiene_once()` step before it
+`mmap`s the heap. Two pieces:
+
+1. **Thread-pool env defaults** — `setenv` with `overwrite=0`:
+   - `OMP_NUM_THREADS=1`
+   - `OPENBLAS_NUM_THREADS=1`
+   - `MKL_NUM_THREADS=1`
+   - `BLIS_NUM_THREADS=1`
+   - `KMP_DUPLICATE_LIB_OK=TRUE` (macOS only, tolerates duplicate libomp
+     loads across Python / PyTorch / NumPy)
+
+   These keep transitively-linked thread pools from spinning up worker
+   threads we would then inherit across `fork()`. User-supplied values win.
+
+2. **`pthread_atfork`** handler registered once per process. The handler is
+   currently a landing pad; the Allocator's mutex is the only Worker-owned
+   lock that matters today, and it is not held across any fork point. The
+   handler documents the acquisition order we'll use as more locks are added
+   in subsequent PRs (callable registry → worker manager → worker thread →
+   scheduler → allocator → tensormap, coarse-to-fine).
 
 ---
 

@@ -227,7 +227,7 @@ class TestOrchAlloc:
         assert shape0 == 64
 
     def test_alloc_dep_wires_via_tensormap(self):
-        """OUTPUT producer -> alloc'd ptr -> INPUT consumer wires the dep."""
+        """INOUT producer -> alloc'd ptr -> INPUT consumer wires the dep."""
         marker_shm, marker_buf = _make_shared_counter()
 
         try:
@@ -239,11 +239,14 @@ class TestOrchAlloc:
             def orch(o, _args):
                 inter = o.alloc((128,), DataType.FLOAT32)
 
-                # Producer tags inter as OUTPUT — alloc slot is the initial
-                # producer (synthetic), then tensormap.insert reassigns it
-                # to the producer slot.
+                # Producer writes into the alloc'd slab and must depend on
+                # the alloc-slot (the creator) so the slab is not reclaimed
+                # while the producer is still writing. That lifetime link
+                # goes through INOUT — matching L2, only INPUT and INOUT
+                # do TensorMap.lookup. Plain OUTPUT / OUTPUT_EXISTING are
+                # pure inserts and would leave no dep on the alloc slot.
                 p_args = TaskArgs()
-                p_args.add_tensor(inter, TensorArgType.OUTPUT)
+                p_args.add_tensor(inter, TensorArgType.INOUT)
                 o.submit_sub(producer_cid, p_args)
 
                 # Consumer tags inter as INPUT — tensormap.lookup finds the

@@ -17,10 +17,12 @@
  *   - submit_next_level_group(callable, vector<TaskArgs>, ChipCallConfig)
  *   - submit_sub(callable_id, TaskArgs)
  *   - submit_sub_group(callable_id, vector<TaskArgs>)
+ *   - alloc(shape, dtype) — runtime-owned intermediate buffer
  *
  * Each TaskArgs carries per-tensor TensorArgType tags. The Orchestrator
- * walks those tags to drive dependency inference (INPUT/INOUT → tensormap
- * lookup; OUTPUT/INOUT/OUTPUT_EXISTING → tensormap insert; NO_DEP → skip).
+ * walks those tags to drive dependency inference and — for OUTPUT tags with
+ * a null data pointer — automatically assigns a slab from the HeapRing
+ * (see docs/orchestrator.md §8b).
  *
  * Internal:
  *   - scope_begin / scope_end / drain — invoked only by Worker::run
@@ -49,7 +51,7 @@
 // ---------------------------------------------------------------------------
 //
 // Downstream consumers reference outputs by their own tensor pointers (the
-// tensors live in shm/heap allocated by the user), and tensormap.lookup
+// tensors live in the HeapRing allocated by the Worker), and tensormap.lookup
 // finds the producer slot from the data pointer. No outputs[] field needed.
 
 struct DistSubmitResult {
@@ -63,25 +65,23 @@ struct DistSubmitResult {
 class DistOrchestrator {
 public:
     void init(
-        DistTensorMap *tensormap, DistRing *ring, DistScope *scope, DistReadyQueue *ready_queue,
+        DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_queue,
         DistTaskSlotState *slots, int32_t num_slots
     );
 
-    // Allocate an intermediate buffer (mmap MAP_SHARED|MAP_ANONYMOUS so child
-    // workers see it after fork). Returns a ContinuousTensor with .data
-    // pointing at the buffer.
+    // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
+    // visible to forked child workers). Returns a ContinuousTensor whose
+    // `.data` points into the ring.
     //
-    // Lifetime: aligned with the slot lifecycle. alloc creates a synthetic
-    // task slot in COMPLETED state that owns the buffer. Downstream tasks
-    // that tag the buffer as INPUT/INOUT/OUTPUT_EXISTING wire a fanout edge
-    // on this slot via TensorMap; the buffer is munmap'd in on_consumed
-    // once all consumers have released their fanout refs and scope_end has
-    // released the scope ref.
+    // Lifetime: aligned with a synthetic task slot. The buffer is reclaimed
+    // (FIFO, via last_alive) once every downstream consumer tagging the
+    // pointer has reached CONSUMED and scope_end has released the scope ref.
     ContinuousTensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
 
     // Submit a NEXT_LEVEL task. `callable` is the chip callable buffer pointer
     // (uint64_t handle from Python — typically ChipCallable.buffer_ptr()).
-    // Tags inside `args` drive dependency inference.
+    // Tags inside `args` drive dependency inference; OUTPUT tensors with null
+    // data are auto-allocated from the HeapRing.
     DistSubmitResult submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config);
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node.
@@ -103,7 +103,8 @@ public:
     void drain();
 
     // Called by Scheduler (via DistWorker) when a task becomes CONSUMED:
-    // erases TensorMap entries, frees alloc'd buffers, releases the ring slot.
+    // erases TensorMap entries, releases the allocator slot (and implicitly
+    // the slot's heap slab via last_alive).
     // Returns true iff this call performed the COMPLETED -> CONSUMED transition.
     // Idempotent: concurrent callers (release_ref vs try_consume) race on a
     // CAS — only the winner returns true and runs cleanup; losers return false.
@@ -111,7 +112,7 @@ public:
 
 private:
     DistTensorMap *tensormap_ = nullptr;
-    DistRing *ring_ = nullptr;
+    DistRing *allocator_ = nullptr;
     DistScope *scope_ = nullptr;
     DistReadyQueue *ready_queue_ = nullptr;
     DistTaskSlotState *slots_ = nullptr;
@@ -124,13 +125,22 @@ private:
 
     DistTaskSlotState &slot_state(DistTaskSlot s) { return slots_[s]; }
 
-    // Shared submit machinery — installs slot, walks tags for deps, dispatches
-    // ready transitions. `callable_ptr` and `callable_id` are mutually
-    // exclusive depending on `worker_type`.
+    // Shared submit machinery. Takes `args_list` by value so the Orchestrator
+    // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     DistSubmitResult submit_impl(
         WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const ChipCallConfig &config,
-        const std::vector<TaskArgs> &args_list
+        std::vector<TaskArgs> args_list
     );
+
+    // Size, in aligned bytes, an OUTPUT tensor should occupy in the HeapRing.
+    static uint64_t output_alloc_bytes(const ContinuousTensor &t);
+
+    // Rewrite any OUTPUT tensors with a null data pointer to point into a
+    // freshly-allocated HeapRing slab. Returns the total aligned byte span
+    // consumed, and populates `slot` / `heap_ptr` / `heap_end_offset` via the
+    // output params (reused for book-keeping on the slot state). Throws on
+    // back-pressure timeout.
+    DistAllocResult reserve_outputs_and_slot(std::vector<TaskArgs> &args_list);
 
     // Walk the tags of each TaskArgs in `args_list`, accumulating producer
     // slots (for INPUT/INOUT tags) and registering outputs in the tensormap

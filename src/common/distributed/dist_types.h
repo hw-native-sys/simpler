@@ -133,11 +133,9 @@ struct DistTaskSlotState {
     // so scheduler dispatch can pass &chip_storage_list[i] in the WorkerPayload.
     std::vector<ChipStorageTaskArgs> chip_storage_list;
 
-    // Runtime-owned intermediate buffers (DistOrchestrator::alloc). Each entry
-    // is a MAP_SHARED|MAP_ANONYMOUS mmap that must be munmap'd when this slot
-    // reaches CONSUMED. Empty for non-alloc slots.
-    std::vector<void *> alloc_bufs;
-    std::vector<size_t> alloc_sizes;
+    // Runtime-owned OUTPUT slabs live in the Worker's HeapRing and are
+    // reclaimed implicitly by DistRing::release(slot) — no per-slot
+    // munmap is needed. See docs/orchestrator.md §8b.
 
     // --- Group bookkeeping ---
     std::atomic<int32_t> sub_complete_count{0};

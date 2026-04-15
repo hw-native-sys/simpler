@@ -14,7 +14,7 @@
  *
  * DistWorker is the implementation of one level in the hierarchy (L3, L4, …).
  * From the level above it looks like an IWorker; internally it contains the
- * full scheduling engine (TensorMap, Ring, Scope, Orchestrator, Scheduler)
+ * full scheduling engine (TensorMap, Allocator, Scope, Orchestrator, Scheduler)
  * and a set of sub-IWorkers it dispatches to.
  *
  * Public surface:
@@ -27,6 +27,11 @@
  *
  * Worker holds no submit / scope / drain / active-task bookkeeping — those
  * concepts belong to Orchestrator.
+ *
+ * Construction is separated from `init()` so Python callers can mmap the
+ * HeapRing in the parent process *before* forking children (children see the
+ * MAP_SHARED region at the same virtual address). Start the scheduler and
+ * WorkerThreads with `init()` only after forks have happened.
  */
 
 #pragma once
@@ -34,8 +39,8 @@
 #include <cstdint>
 #include <memory>
 
-#include "dist_orchestrator.h"
 #include "dist_ring.h"
+#include "dist_orchestrator.h"
 #include "dist_scheduler.h"
 #include "dist_scope.h"
 #include "dist_tensormap.h"
@@ -44,7 +49,16 @@
 
 class DistWorker : public IWorker {
 public:
-    explicit DistWorker(int32_t level);
+    // Construct a Worker for hierarchy `level`. `heap_ring_size` is the
+    // MAP_SHARED|MAP_ANONYMOUS region handed out by the Orchestrator for
+    // auto-allocated OUTPUT tensors and `orch.alloc()` buffers.
+    //
+    // The heap is mmap'd here (before any fork) so forked child workers
+    // inherit the same mapping. Thread-hostile hygiene (setenv of
+    // OMP/MKL/BLIS/OPENBLAS thread-count knobs and the pthread_atfork
+    // installation) also runs in the ctor, still in the parent, before
+    // child forks.
+    explicit DistWorker(int32_t level, uint64_t heap_ring_size = DIST_DEFAULT_HEAP_RING_SIZE);
     ~DistWorker() override;
 
     DistWorker(const DistWorker &) = delete;
@@ -53,7 +67,9 @@ public:
     // Register sub-workers before calling init().
     void add_worker(WorkerType type, IWorker *worker);
 
-    // Initialise the engine and start the Scheduler thread.
+    // Start the scheduler thread. Must be called AFTER the parent has forked
+    // any child workers — init() spins up threads in the parent that would
+    // otherwise be accidentally inherited across fork.
     void init();
 
     // Shut down the Scheduler thread and release resources.
@@ -74,7 +90,7 @@ private:
     // --- Scheduling engine components ---
     std::unique_ptr<DistTaskSlotState[]> slots_;
     DistTensorMap tensormap_;
-    DistRing ring_;
+    DistRing allocator_;
     DistScope scope_;
     DistReadyQueue ready_queue_;
     DistOrchestrator orchestrator_;

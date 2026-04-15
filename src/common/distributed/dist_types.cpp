@@ -32,12 +32,6 @@ void DistTaskSlotState::reset() {
     callable_id = -1;
     config = ChipCallConfig{};
     chip_storage_list.clear();
-    // alloc_bufs / alloc_sizes are owned mmaps freed in on_consumed.
-    // reset() runs at submit time on a freshly-released slot — these vectors
-    // should already be empty here. Guard with assertions in debug builds if
-    // we want to catch leaks.
-    alloc_bufs.clear();
-    alloc_sizes.clear();
     sub_complete_count.store(0, std::memory_order_relaxed);
 }
 

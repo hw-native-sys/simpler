@@ -41,10 +41,29 @@ get if I pip install `main` today", this page.
   `Orchestrator._scope_begin` / `_scope_end` / `_drain` are invoked by
   the Python `Worker.run` facade only.
 - **`orch.alloc(shape, dtype)`** — runtime-owned intermediate buffer
-  backed by `mmap(MAP_SHARED | MAP_ANONYMOUS)`. Lifetime follows a
-  synthetic task slot so the buffer is freed once all downstream
-  consumers have completed (see
+  carved out of the Worker's HeapRing (a single
+  `mmap(MAP_SHARED | MAP_ANONYMOUS)` region taken in the `DistWorker`
+  ctor, before fork, inherited by child workers at the same virtual
+  address). Lifetime follows a synthetic task slot; the slab is
+  reclaimed implicitly by the allocator once all downstream consumers
+  have completed and `last_alive` sweeps over it (see
   [orchestrator.md](orchestrator.md) §8b).
+- **`OUTPUT` auto-allocation** — `OUTPUT`-tagged tensors submitted with
+  `data == 0` are auto-allocated from the same HeapRing as part of the
+  allocator call that claims the slot (1024-byte aligned). `OUTPUT`
+  tensors with a pre-set `data` pointer are passed through untouched —
+  pure overwrite with no WaW dep on the prior owner. Matching L2
+  semantics, only `INPUT` and `INOUT` do a tensormap lookup in
+  `infer_deps`; user code that writes into an `orch.alloc()` buffer
+  must tag it `INOUT` so the alloc-slot stays live as a WaW producer
+  (see [orchestrator.md](orchestrator.md) §8b "Tag semantics for
+  write-after-write"). `OUTPUT_EXISTING` is never auto-allocated.
+- **`heap_ring_size` knob** — `Worker(level=3, heap_ring_size=...)`
+  selects the HeapRing size (default 1 GiB). The underlying
+  `DistWorker(level, heap_ring_size)` ctor also installs fork hygiene
+  (setenv of `OMP/BLIS/OPENBLAS/MKL_NUM_THREADS=1`, plus
+  `KMP_DUPLICATE_LIB_OK=TRUE` on macOS, and a `pthread_atfork` landing
+  pad).
 
 ### Dispatch internals
 
@@ -55,23 +74,15 @@ get if I pip install `main` today", this page.
 - `DistChipProcess` / `DistSubWorker` are separate classes today;
   unified `WorkerThread` with `THREAD | PROCESS` modes is not yet
   implemented.
+- Slot-ring and heap-ring share one `DistRing` (merged, matches
+  L2-consistency audit Strict-2). One mutex guards both; FIFO
+  reclamation via `last_alive` advances both resources at once. There
+  is no partial-failure rollback path between slot and heap
+  acquisition.
 
 ---
 
 ## In flight / not yet landed
-
-### PR-H: HeapRing + `OUTPUT` auto-alloc
-
-- Replace the current per-call `mmap` in `orch.alloc` with a single
-  pre-allocated `MAP_SHARED` region at `Worker.init()` (default 1 GB),
-  bump-allocated with FIFO reclamation (mirrors L2's
-  `PTO2TaskAllocator`).
-- `OUTPUT` tag will auto-allocate from the ring;
-  `OUTPUT_EXISTING` keeps the "user-provided buffer" path.
-- Merge slot ring + heap ring into one allocator
-  (matches L2-consistency audit Strict-2).
-- Fork-safety hygiene at `Worker.init()` (`setenv
-  OMP_NUM_THREADS=1` / `pthread_atfork` on runtime-owned locks).
 
 ### PR-C: drop `WorkerPayload`, new `IWorker::run` signature
 

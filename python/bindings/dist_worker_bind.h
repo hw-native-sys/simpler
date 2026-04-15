@@ -27,6 +27,7 @@
 #include <stdexcept>
 
 #include "chip_worker.h"
+#include "dist_ring.h"
 #include "dist_chip_process.h"
 #include "dist_orchestrator.h"
 #include "dist_sub_worker.h"
@@ -145,9 +146,18 @@ inline void bind_dist_worker(nb::module_ &m) {
         );
 
     // --- DistWorker ---
+    //
+    // `heap_ring_size` is the MAP_SHARED|MAP_ANONYMOUS region the Orchestrator
+    // hands out for auto-allocated OUTPUT slabs and `orch.alloc()` buffers.
+    // The mapping is taken in the ctor, before the Python caller forks any
+    // child workers, so children see the same bytes at the same virtual
+    // address.
     nb::class_<DistWorker>(m, "DistWorker")
         .def(
-            nb::init<int32_t>(), nb::arg("level"), "Create a DistWorker for the given hierarchy level (3=L3, 4=L4, …)."
+            nb::init<int32_t, uint64_t>(), nb::arg("level"), nb::arg("heap_ring_size") = DIST_DEFAULT_HEAP_RING_SIZE,
+            "Create a DistWorker for the given hierarchy level (3=L3, 4=L4, …). "
+            "`heap_ring_size` selects the MAP_SHARED heap mmap'd in the ctor "
+            "(default 1 GiB)."
         )
 
         .def(
@@ -189,4 +199,6 @@ inline void bind_dist_worker(nb::module_ &m) {
             "get_orchestrator", &DistWorker::get_orchestrator, nb::rv_policy::reference_internal,
             "Return the Orchestrator handle (lifetime tied to this DistWorker)."
         );
+
+    m.attr("DIST_DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DIST_DEFAULT_HEAP_RING_SIZE);
 }

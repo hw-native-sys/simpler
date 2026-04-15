@@ -261,6 +261,7 @@ class Worker:
     def _init_level3(self) -> None:
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
+        heap_ring_size = self._config.get("heap_ring_size", None)
 
         # 1. Allocate sub-worker mailboxes
         for _ in range(n_sub):
@@ -294,6 +295,15 @@ class Worker:
                 assert shm.buf is not None
                 struct.pack_into("i", shm.buf, _CHIP_OFF_STATE, _IDLE)
                 self._chip_shms.append(shm)
+
+        # 3. Construct the DistWorker *before* fork so the HeapRing mmap
+        #    (taken in the C++ ctor) is inherited by every child process at
+        #    the same virtual address. No C++ thread is spawned here; the
+        #    scheduler + WorkerThreads start in init(), after forks.
+        if heap_ring_size is None:
+            self._dist_worker = DistWorker(3)
+        else:
+            self._dist_worker = DistWorker(3, int(heap_ring_size))
 
         self._l3_started = False
 
@@ -338,9 +348,11 @@ class Worker:
                 else:
                     self._chip_pids.append(pid)
 
-        # Create DistWorker and wire chip processes + sub workers
-        dw = DistWorker(3)
-        self._dist_worker = dw
+        # DistWorker was constructed in _init_level3 (pre-fork) so children
+        # inherit the HeapRing MAP_SHARED mmap. Wire chip processes + sub
+        # workers now that their mailboxes exist.
+        dw = self._dist_worker
+        assert dw is not None
 
         if device_ids:
             for shm in self._chip_shms:

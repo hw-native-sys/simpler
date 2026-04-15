@@ -11,18 +11,16 @@
 
 #include "dist_orchestrator.h"
 
-#include <sys/mman.h>
-
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 
 void DistOrchestrator::init(
-    DistTensorMap *tensormap, DistRing *ring, DistScope *scope, DistReadyQueue *ready_queue, DistTaskSlotState *slots,
-    int32_t num_slots
+    DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_queue,
+    DistTaskSlotState *slots, int32_t num_slots
 ) {
     tensormap_ = tensormap;
-    ring_ = ring;
+    allocator_ = allocator;
     scope_ = scope;
     ready_queue_ = ready_queue;
     slots_ = slots;
@@ -30,42 +28,42 @@ void DistOrchestrator::init(
     active_tasks_.store(0, std::memory_order_relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// alloc(shape, dtype) — user-facing intermediate buffer from the HeapRing
+// ---------------------------------------------------------------------------
+
+uint64_t DistOrchestrator::output_alloc_bytes(const ContinuousTensor &t) {
+    return dist_align_up(t.nbytes(), DIST_HEAP_ALIGN);
+}
+
 ContinuousTensor DistOrchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
     if (shape.size() > CONTINUOUS_TENSOR_MAX_DIMS) {
         throw std::invalid_argument("DistOrchestrator::alloc: shape exceeds CONTINUOUS_TENSOR_MAX_DIMS");
     }
 
-    // --- Compute size and mmap a MAP_SHARED|MAP_ANONYMOUS region ---
-    // Page-align so munmap on this exact size is valid.
-    size_t numel = 1;
+    uint64_t numel = 1;
     for (uint32_t d : shape)
-        numel *= static_cast<size_t>(d);
-    size_t bytes = numel * get_element_size(dtype);
-    static constexpr size_t PAGE = 4096;
-    size_t mmap_bytes = (bytes + PAGE - 1) & ~(PAGE - 1);
-    if (mmap_bytes == 0) mmap_bytes = PAGE;
+        numel *= static_cast<uint64_t>(d);
+    uint64_t bytes = numel * get_element_size(dtype);
+    uint64_t aligned = dist_align_up(bytes, DIST_HEAP_ALIGN);
 
-    void *buf = mmap(nullptr, mmap_bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-    if (buf == MAP_FAILED) {
-        throw std::runtime_error("DistOrchestrator::alloc: mmap failed");
+    // 0-byte request (e.g. shape with a zero dim) flows straight through the
+    // allocator as a slot-only claim — matches reserve_outputs_and_slot.
+    // Skip tensormap registration when the returned heap_ptr is nullptr,
+    // since 0 is the sentinel for "no tensor" in infer_deps.
+    DistAllocResult ar = allocator_->alloc(aligned);
+    if (ar.slot == DIST_INVALID_SLOT) {
+        throw std::runtime_error("DistOrchestrator::alloc: allocator shutdown");
     }
 
-    // --- Synthetic task slot to own the buffer's lifecycle ---
-    DistTaskSlot slot = ring_->alloc();
-    if (slot == DIST_INVALID_SLOT) {
-        munmap(buf, mmap_bytes);
-        throw std::runtime_error("DistOrchestrator::alloc: ring shutdown");
-    }
-    DistTaskSlotState &s = slot_state(slot);
+    DistTaskSlotState &s = slot_state(ar.slot);
     s.reset();
-    s.alloc_bufs.push_back(buf);
-    s.alloc_sizes.push_back(mmap_bytes);
 
-    // Register the buffer as this slot's output in the TensorMap so any
-    // downstream task tagging it as INPUT/INOUT lookups this slot as producer.
-    uint64_t key = reinterpret_cast<uint64_t>(buf);
-    tensormap_->insert(key, slot);
-    s.output_keys.push_back(key);
+    uint64_t key = reinterpret_cast<uint64_t>(ar.heap_ptr);
+    if (key != 0) {
+        tensormap_->insert(key, ar.slot);
+        s.output_keys.push_back(key);
+    }
 
     // No fanin — alloc has no work to wait on.
     s.fanin_count = 0;
@@ -83,12 +81,8 @@ ContinuousTensor DistOrchestrator::alloc(const std::vector<uint32_t> &shape, Dat
     // bump, the fanout-release threshold (`>= total + 1`) would be one
     // short and the slot would never reach CONSUMED.
     s.fanout_released.store(1, std::memory_order_relaxed);
-    if (scope_ref > 0) scope_->register_task(slot);
+    if (scope_ref > 0) scope_->register_task(ar.slot);
 
-    // Mark COMPLETED — alloc has no work, so it's "done" immediately.
-    // Downstream consumers in infer_deps see this state and skip live_fanin
-    // wiring (consumer is immediately ready) but still wire fanout (so this
-    // slot waits for them before being consumed and freeing its buffer).
     s.state.store(TaskState::COMPLETED, std::memory_order_release);
 
     active_tasks_.fetch_add(1, std::memory_order_relaxed);
@@ -131,7 +125,7 @@ DistSubmitResult DistOrchestrator::submit_sub_group(int32_t callable_id, const s
 
 DistSubmitResult DistOrchestrator::submit_impl(
     WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const ChipCallConfig &config,
-    const std::vector<TaskArgs> &args_list
+    std::vector<TaskArgs> args_list
 ) {
     if (args_list.empty()) throw std::invalid_argument("DistOrchestrator: args_list must not be empty");
 
@@ -140,9 +134,16 @@ DistSubmitResult DistOrchestrator::submit_impl(
     // group_size N.
     active_tasks_.fetch_add(1, std::memory_order_relaxed);
 
-    // --- Step 1: Alloc slot (blocks if ring full) ---
-    DistTaskSlot slot = ring_->alloc();
-    if (slot == DIST_INVALID_SLOT) throw std::runtime_error("DistOrchestrator: ring shutdown");
+    // --- Step 1: Atomically claim slot + auto-alloc any OUTPUT tensors that
+    // arrived with a null data pointer. Both resources come from the same
+    // merged allocator (Strict-2) so there is no partial-failure rollback
+    // path.
+    DistAllocResult ar = reserve_outputs_and_slot(args_list);
+    if (ar.slot == DIST_INVALID_SLOT) {
+        active_tasks_.fetch_sub(1, std::memory_order_relaxed);
+        throw std::runtime_error("DistOrchestrator: allocator shutdown");
+    }
+    DistTaskSlot slot = ar.slot;
 
     DistTaskSlotState &s = slot_state(slot);
     s.reset();
@@ -211,6 +212,46 @@ DistSubmitResult DistOrchestrator::submit_impl(
 }
 
 // =============================================================================
+// reserve_outputs_and_slot — atomic slot + heap carve-up for this submit
+// =============================================================================
+//
+// Walks every OUTPUT-tagged tensor that arrived with `data == 0` and reserves
+// aligned slabs out of a single contiguous HeapRing allocation. OUTPUT tensors
+// with a user-supplied data pointer are left untouched (that's the
+// OUTPUT_EXISTING-equivalent back-compat path for callers that pre-fill
+// OUTPUT.data themselves). The single allocator call owns both the slot and
+// the heap range, so there is no partial-failure rollback.
+
+DistAllocResult DistOrchestrator::reserve_outputs_and_slot(std::vector<TaskArgs> &args_list) {
+    uint64_t total_bytes = 0;
+    for (const TaskArgs &a : args_list) {
+        for (int32_t i = 0; i < a.tensor_count(); ++i) {
+            if (a.tag(i) != TensorArgType::OUTPUT) continue;
+            if (a.tensor(i).data != 0) continue;  // user supplied a pointer — leave alone
+            total_bytes += output_alloc_bytes(a.tensor(i));
+        }
+    }
+
+    DistAllocResult ar = allocator_->alloc(total_bytes);
+    if (ar.slot == DIST_INVALID_SLOT) return ar;
+
+    // Hand slabs out in the same order we counted them.
+    uint64_t off = 0;
+    char *base = static_cast<char *>(ar.heap_ptr);
+    for (TaskArgs &a : args_list) {
+        for (int32_t i = 0; i < a.tensor_count(); ++i) {
+            if (a.tag(i) != TensorArgType::OUTPUT) continue;
+            ContinuousTensor &t = a.tensor(i);
+            if (t.data != 0) continue;
+            uint64_t slab = output_alloc_bytes(t);
+            t.data = reinterpret_cast<uint64_t>(base + off);
+            off += slab;
+        }
+    }
+    return ar;
+}
+
+// =============================================================================
 // infer_deps — tag-driven dependency inference
 // =============================================================================
 
@@ -219,14 +260,28 @@ void DistOrchestrator::infer_deps(
     std::vector<uint64_t> &output_keys
 ) {
     auto add_unique_producer = [&](DistTaskSlot p) {
+        // Group submits walk many TaskArgs under one slot: if two entries in
+        // the same group tag the same buffer (e.g. both OUTPUT 0xCAFE), the
+        // second-pass lookup would return the slot that the first pass just
+        // inserted — a self-loop. Skip it.
+        if (p == slot) return;
         for (DistTaskSlot existing : producers) {
             if (existing == p) return;
         }
         producers.push_back(p);
     };
 
-    // Inputs (and INOUT) → lookup producer; outputs (and INOUT, OUTPUT_EXISTING)
-    // → insert as producer of `slot`. NO_DEP tags are skipped.
+    // Tag-driven dependency inference — mirrors L2
+    // (src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp
+    //  steps B and 4):
+    //   INPUT            → lookup only (RaW)
+    //   INOUT            → lookup + insert (RaW + WaW)
+    //   OUTPUT_EXISTING  → insert only (user-provided buffer; any WaW dep on
+    //                      the creator must be expressed via INOUT instead)
+    //   OUTPUT           → insert only (pure overwrite; if auto-alloc is
+    //                      needed, the data ptr is assigned in
+    //                      reserve_outputs_and_slot before this step)
+    //   NO_DEP           → skip
     for (const TaskArgs &a : args_list) {
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
             uint64_t key = a.tensor(i).data;
@@ -287,9 +342,8 @@ void DistOrchestrator::release_ref(DistTaskSlot slot) {
     // 1 (self try_consume from on_task_complete, or the alloc-time sim) +
     // N (per consumer's deferred try_consume) + 1 (this scope_end release)
     // = N + 2 = total + 1 where total = scope_ref + N.
-    // Using `>= total + 1` keeps scope_end from prematurely consuming when
-    // a consumer is still running — important once on_consumed actually
-    // frees runtime-owned buffers (orch.alloc).
+    // Using `>= total + 1` keeps scope_end from prematurely consuming while
+    // a consumer (or a HeapRing peer) is still live.
     if (released >= total + 1 && s.state.load(std::memory_order_acquire) == TaskState::COMPLETED) {
         on_consumed(slot);
     }
@@ -311,14 +365,9 @@ bool DistOrchestrator::on_consumed(DistTaskSlot slot) {
 
     tensormap_->erase_task_outputs(s.output_keys);
 
-    // Free any runtime-owned intermediate buffers (orch.alloc).
-    for (size_t i = 0; i < s.alloc_bufs.size(); ++i) {
-        munmap(s.alloc_bufs[i], s.alloc_sizes[i]);
-    }
-    s.alloc_bufs.clear();
-    s.alloc_sizes.clear();
-
-    ring_->release(slot);
+    // HeapRing-owned OUTPUT slabs are reclaimed implicitly when the allocator
+    // advances last_alive past this slot — no per-slot munmap needed.
+    allocator_->release(slot);
 
     // Decrement active-task counter so drain() observes completion. Gated
     // on the CAS win so both consume paths — release_ref (Orch thread,

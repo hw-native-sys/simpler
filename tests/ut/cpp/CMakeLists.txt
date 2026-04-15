@@ -110,7 +110,7 @@ endfunction()
 enable_testing()
 
 add_dist_test(test_dist_tensormap  test_dist_tensormap.cpp)
-add_dist_test(test_dist_ring       test_dist_ring.cpp)
+add_dist_test(test_dist_ring  test_dist_ring.cpp)
 add_dist_test(test_dist_scope      test_dist_scope.cpp)
 add_dist_test(test_dist_orchestrator test_dist_orchestrator.cpp)
 add_dist_test(test_dist_scheduler  test_dist_scheduler.cpp)
