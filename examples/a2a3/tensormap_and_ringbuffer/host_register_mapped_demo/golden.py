@@ -23,12 +23,19 @@ __outputs__ = ["mapped_out"]
 
 RTOL = 1e-5
 ATOL = 1e-5
+LOG_PREVIEW_COUNT = 16
 
 ROWS = 128
 COLS = 128
 SIZE = ROWS * COLS
 
 _MAPPED_STATE = {}
+
+
+def _log_preview(label: str, values) -> None:
+    flat = np.asarray(values).reshape(-1)
+    preview = flat[:LOG_PREVIEW_COUNT].tolist()
+    logger.info("%s first_%d=%s total=%d", label, min(LOG_PREVIEW_COUNT, flat.size), preview, flat.size)
 
 
 def _cleanup_mapped_state() -> None:
@@ -66,6 +73,7 @@ def generate_inputs(params: dict) -> list:
     host_np = np.ctypeslib.as_array(host_buf)
     host_np[:] = np.arange(SIZE, dtype=np.float32)
     host_tensor = torch.from_numpy(host_np)
+    _log_preview("host_register_mapped_demo: host_init_data", host_np)
 
     try:
         mapped_dev_ptr = host_register_mapped(host_ptr, host_tensor.numel() * host_tensor.element_size())
@@ -106,6 +114,11 @@ def compute_golden(tensors: dict, params: dict) -> None:
 
 
 def post_run_collect(outputs: dict, params: dict) -> None:
-    del outputs
     del params
+    host_np = _MAPPED_STATE.get("host_np")
+    if host_np is not None:
+        _log_preview("host_register_mapped_demo: host_data_after_run", host_np)
+    mapped_out = outputs.get("mapped_out")
+    if mapped_out is not None:
+        _log_preview("host_register_mapped_demo: device_copy_back_data", mapped_out.detach().cpu().numpy())
     _cleanup_mapped_state()
