@@ -14,12 +14,11 @@
 // Processes batch_count batches in a single kernel invocation.
 // Per-batch addresses are computed from global tensor bases + block_table lookup.
 //
-// Supports three tile configurations via runtime dispatch:
-//   Small: (16,  16) @ ( 16,  16) -> (16,  16)  [fp16]
-//   Case1: (16, 128) @ (128, 128) -> (16, 128)  [bf16]
-//   Case2: (64,  64) @ ( 64, 128) -> (64, 128)  [bf16]
+// Supports two tile configurations via runtime dispatch:
+//   Case1: (16, 128) @ (128, 128) -> (16, 128)
+//   Case2: (64,  64) @ ( 64, 128) -> (64, 128)
 //
-// Template: T=data_type, M=q_tile, K=block_size, N=head_dim
+// Template: M=q_tile, K=block_size, N=head_dim
 
 #include <cstdint>
 #include <pto/pto-inst.hpp>
@@ -37,25 +36,25 @@ using namespace pto;
 #define __aicore__ [aicore]  // NOLINT(whitespace/braces)
 #endif
 
-template <typename T, int M, int K, int N>
+template <int M, int K, int N>
 static __aicore__ void pv_matmul_batch_impl(
     __gm__ Tensor *pij_batch, __gm__ Tensor *value_cache, __gm__ Tensor *block_table_t, __gm__ Tensor *oi_new_batch,
     uint64_t batch_count, uint64_t block_idx, uint64_t block_num, uint64_t batch_start
 ) {
-    __gm__ T *pij_base = reinterpret_cast<__gm__ T *>(pij_batch->buffer.addr);
-    __gm__ T *val_base = reinterpret_cast<__gm__ T *>(value_cache->buffer.addr);
+    __gm__ bfloat16_t *pij_base = reinterpret_cast<__gm__ bfloat16_t *>(pij_batch->buffer.addr);
+    __gm__ bfloat16_t *val_base = reinterpret_cast<__gm__ bfloat16_t *>(value_cache->buffer.addr);
     __gm__ float *oi_base = reinterpret_cast<__gm__ float *>(oi_new_batch->buffer.addr);
     __gm__ int32_t *bt = reinterpret_cast<__gm__ int32_t *>(block_table_t->buffer.addr);
 
-    using GlobalA = GlobalTensor<T, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
-    using GlobalB = GlobalTensor<T, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, N, 1>>;
+    using GlobalA = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, K>, Stride<M * K, M * K, M * K, K, 1>>;
+    using GlobalB = GlobalTensor<bfloat16_t, Shape<1, 1, 1, K, N>, Stride<K * N, K * N, K * N, N, 1>>;
     using GlobalOut = GlobalTensor<float, Shape<1, 1, 1, M, N>, Stride<M * N, M * N, M * N, N, 1>>;
 
-    using TileMatA = Tile<TileType::Mat, T, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
-    using TileMatB = Tile<TileType::Mat, T, K, N, BLayout::ColMajor, K, N, SLayout::RowMajor, 512>;
+    using TileMatA = Tile<TileType::Mat, bfloat16_t, M, K, BLayout::ColMajor, M, K, SLayout::RowMajor, 512>;
+    using TileMatB = Tile<TileType::Mat, bfloat16_t, K, N, BLayout::ColMajor, K, N, SLayout::RowMajor, 512>;
 
-    using LeftTile = TileLeft<T, M, K, M, K>;
-    using RightTile = TileRight<T, K, N, K, N>;
+    using LeftTile = TileLeft<bfloat16_t, M, K, M, K>;
+    using RightTile = TileRight<bfloat16_t, K, N, K, N>;
     using AccTile = TileAcc<float, M, N, M, N>;
 
     TileMatA aMatTile;
@@ -71,9 +70,9 @@ static __aicore__ void pv_matmul_batch_impl(
     TASSIGN(cTile, 0x0);
 
     for (uint64_t b = 0; b < batch_count; b++) {
-        __gm__ T *pij_addr = pij_base + b * M * K;
+        __gm__ bfloat16_t *pij_addr = pij_base + b * M * K;
         int32_t phys_block = bt[(batch_start + b) * block_num + block_idx];
-        __gm__ T *vj_addr = val_base + static_cast<uint64_t>(phys_block) * K * N;
+        __gm__ bfloat16_t *vj_addr = val_base + static_cast<uint64_t>(phys_block) * K * N;
         __gm__ float *oi_addr = oi_base + b * M * N;
 
         GlobalA pijGlobal(pij_addr);
@@ -121,16 +120,16 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     uint64_t q_tile_size = static_cast<uint64_t>(pij_batch->shapes[0] / batch_count);
     uint64_t block_size = static_cast<uint64_t>(pij_batch->shapes[1]);
 
-    if (q_tile_size == 16 && block_size == 16) {
-        pv_matmul_batch_impl<half, 16, 16, 16>(
+    if (q_tile_size == 16 && block_size <= 16) {
+        pv_matmul_batch_impl<16, 16, 16>(
             pij_batch, value_cache, block_table_t, oi_new_batch, batch_count, block_idx, block_num, batch_start
         );
     } else if (q_tile_size == 16) {
-        pv_matmul_batch_impl<bfloat16_t, 16, 128, 128>(
+        pv_matmul_batch_impl<16, 128, 128>(
             pij_batch, value_cache, block_table_t, oi_new_batch, batch_count, block_idx, block_num, batch_start
         );
     } else {
-        pv_matmul_batch_impl<bfloat16_t, 64, 64, 128>(
+        pv_matmul_batch_impl<64, 64, 128>(
             pij_batch, value_cache, block_table_t, oi_new_batch, batch_count, block_idx, block_num, batch_start
         );
     }

@@ -20,7 +20,7 @@ from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_
 from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden  # noqa: PLC0415
 from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
 
-PA_KERNELS = "../batch_paged_attention/kernels"
+PA_KERNELS = "../../../../tests/st/a2a3/tensormap_and_ringbuffer/batch_paged_attention/kernels"
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")

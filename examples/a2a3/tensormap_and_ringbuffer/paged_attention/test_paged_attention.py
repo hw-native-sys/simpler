@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged attention: small-scale (sim-compatible, bfloat16) tests."""
+"""Paged attention: online softmax with AIC/AIV subgraph splitting (bfloat16)."""
 
 import torch
 from simpler.task_interface import ArgDirection as D
@@ -19,8 +19,8 @@ from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generat
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestPagedAttention(SceneTestCase):
-    RTOL = 1e-2
-    ATOL = 1e-2
+    RTOL = 1e-3
+    ATOL = 1e-3
 
     CALLABLE = {
         "orchestration": {
@@ -59,8 +59,55 @@ class TestPagedAttention(SceneTestCase):
     CASES = [
         {
             "name": "Case1",
-            "platforms": ["a2a3sim", "a2a3"],
+            "platforms": ["a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {
+                "batch": 256,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 128,
+                "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
+            "name": "Case2",
+            "platforms": ["a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "manual": True,
+            "params": {
+                "batch": 64,
+                "num_heads": 64,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 64,
+                "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
+            "name": "Case3",
+            "platforms": ["a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "manual": True,
+            "params": {
+                "batch": 64,
+                "num_heads": 64,
+                "kv_head_num": 1,
+                "head_dim": 256,
+                "block_size": 64,
+                "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
+            "name": "CaseSmall1",
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 9},
             "params": {
                 "batch": 1,
                 "num_heads": 16,
@@ -73,9 +120,10 @@ class TestPagedAttention(SceneTestCase):
             },
         },
         {
-            "name": "Case2",
+            "name": "CaseSmall2",
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "manual": True,
             "params": {
                 "batch": 1,
                 "num_heads": 16,
@@ -91,6 +139,7 @@ class TestPagedAttention(SceneTestCase):
             "name": "CaseVarSeq2",
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "manual": True,
             "params": {
                 "batch": 2,
                 "num_heads": 16,
@@ -107,6 +156,7 @@ class TestPagedAttention(SceneTestCase):
             "name": "CaseVarSeq4",
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "manual": True,
             "params": {
                 "batch": 4,
                 "num_heads": 16,

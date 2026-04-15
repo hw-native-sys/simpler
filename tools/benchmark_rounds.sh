@@ -30,9 +30,9 @@ RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 # --- tensormap_and_ringbuffer ---
 declare -A TMR_EXAMPLE_CASES=(
     [alternating_matmul_add]="Case1"
-    [benchmark_bgemm]=""
+    [benchmark_bgemm]="Case0"
     [paged_attention_unroll]="Case1,Case2"
-    [batch_paged_attention]=""
+    [batch_paged_attention]="Case1"
 )
 TMR_EXAMPLE_ORDER=(
     alternating_matmul_add

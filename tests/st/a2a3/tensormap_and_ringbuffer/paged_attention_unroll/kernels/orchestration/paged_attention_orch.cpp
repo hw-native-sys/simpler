@@ -105,7 +105,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     // scale from scalar arg
     uint64_t scale_value = orch_args.scalar(0);
     uint64_t q_head_num = num_heads;
-    uint64_t q_tile = std::min(num_heads, 128UL);
+    uint64_t q_tile = std::min(num_heads, static_cast<uint64_t>(128));
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
     CYCLE_COUNT_LAP(prof_param_extract);
 

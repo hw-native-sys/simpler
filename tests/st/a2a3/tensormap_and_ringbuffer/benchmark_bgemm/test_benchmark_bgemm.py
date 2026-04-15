@@ -51,24 +51,28 @@ class TestBenchmarkBgemm(SceneTestCase):
         },
         {
             "name": "Case1",
+            "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"matmul_add_task_num": 64, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
         },
         {
             "name": "Case2",
+            "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"matmul_add_task_num": 256, "incore_data_size": 128, "incore_loop": 4, "grid_k": 2},
         },
         {
             "name": "Case3",
+            "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"matmul_add_task_num": 64, "incore_data_size": 128, "incore_loop": 16, "grid_k": 2},
         },
         {
             "name": "Case4",
+            "manual": True,
             "platforms": ["a2a3sim", "a2a3"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"matmul_add_task_num": 64, "incore_data_size": 128, "incore_loop": 4, "grid_k": 4},
