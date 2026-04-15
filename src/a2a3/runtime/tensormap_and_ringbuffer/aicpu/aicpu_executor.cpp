@@ -280,14 +280,6 @@ public:
         return ((core_states_ >> (cluster_offset + 2)) & BitStates(1ULL)).has_value();
     }
 
-    // Count total idle AIV cores (AIV0 + AIV1) across all clusters.
-    // Unlike get_valid_cluster_offset_states(AIV).count() which counts clusters with
-    // at least one idle AIV, this counts individual idle cores — a cluster with both
-    // AIV0 and AIV1 idle contributes 2, not 1.
-    int32_t count_idle_aiv_cores() const {
-        return ((core_states_ >> 1) & aic_mask_).count() + ((core_states_ >> 2) & aic_mask_).count();
-    }
-
     // --- State mutation ---
 
     // Toggle bit at the given bit offset (running <-> idle)
@@ -304,19 +296,53 @@ public:
 
     // --- Two-phase dispatch queries ---
 
-    // Idle dispatch: clusters where core is idle AND pending slot is free (both slots empty).
-    BitStates get_idle_cluster_offset_states(PTO2ResourceShape shape) const {
-        BitStates idle = get_valid_cluster_offset_states(shape);
-        // Mask out clusters whose AIC bit has pending_occupied set
-        return idle & ~(pending_occupied_ & aic_mask_);
+    // Idle dispatch: returns bit offsets of idle cores for the given shape.
+    // For AIC: 1 bit per cluster (core offset == cluster offset).
+    // For AIV: 1 bit per AIV core (2 bits per cluster at aiv_mask_ positions).
+    // Only AIC needs pending_occupied filtering: by invariant, idle cores (core_states_ bit=1)
+    // always have pending_occupied=0, so AIV/MIX need no extra filtering.
+    // Skipping the AIC-centric filter also fixes a latent bug where a running+pending AIC core
+    // would incorrectly block AIV idle dispatch on the same cluster.
+    BitStates get_idle_core_offset_states(PTO2ResourceShape shape) const {
+        if (shape == PTO2ResourceShape::AIC) {
+            return get_valid_cluster_offset_states(shape) & ~(pending_occupied_ & aic_mask_);
+        }
+        if (shape == PTO2ResourceShape::AIV) {
+            return core_states_ & aiv_mask_;
+        }
+        return get_valid_cluster_offset_states(shape);  // MIX: cluster-level
     }
 
-    // Pending dispatch: clusters where core is running AND pending slot is free.
-    // For AIC: core running (bit=0) but pending_occupied not set.
-    BitStates get_pending_only_cluster_offset_states(PTO2ResourceShape shape) const {
-        if (shape != PTO2ResourceShape::AIC) return BitStates(0ULL);  // Only AIC supports pending dispatch
-        BitStates running_aic = (~core_states_) & aic_mask_;
-        return running_aic & ~(pending_occupied_ & aic_mask_);
+    // Pending dispatch: returns bit offsets of cores eligible for pending-slot dispatch.
+    // AIC: 1 bit per cluster (aic_mask_ positions). AIV: 1 bit per AIV core (aiv_mask_ positions).
+    // MIX: 1 bit per cluster where ALL 3 cores have free pending slots AND at least one is running.
+    //       Idle cores participate via to_pending=false in dispatch_mix_block_to_cluster.
+    BitStates get_pending_core_offset_states(PTO2ResourceShape shape) const {
+        if (shape == PTO2ResourceShape::MIX) {
+            // Any core without a pending payload can accept a dispatch (idle or running).
+            BitStates available = ~pending_occupied_;
+            BitStates mix_available =
+                (available & aic_mask_) & ((available >> 1) & aic_mask_) & ((available >> 2) & aic_mask_);
+            // Exclude fully-idle clusters (handled by IDLE phase) to prevent double-dispatch.
+            BitStates running = ~core_states_;
+            BitStates cluster_has_running =
+                (running & aic_mask_) | ((running >> 1) & aic_mask_) | ((running >> 2) & aic_mask_);
+            return mix_available & cluster_has_running;
+        }
+        if (shape == PTO2ResourceShape::AIC) {
+            return (~core_states_) & aic_mask_ & ~(pending_occupied_ & aic_mask_);
+        }
+        // AIV
+        return (~core_states_) & aiv_mask_ & ~pending_occupied_;
+    }
+
+    // --- Two-phase dispatch unified query ---
+
+    enum class DispatchPhase : uint8_t { IDLE, PENDING };
+
+    BitStates get_dispatchable_cores(PTO2ResourceShape shape, DispatchPhase phase) const {
+        return (phase == DispatchPhase::IDLE) ? get_idle_core_offset_states(shape) :
+                                                get_pending_core_offset_states(shape);
     }
 
     // --- Bit offset <-> worker_id mapping ---
@@ -885,7 +911,7 @@ struct AicpuExecutor {
     // Dispatch one SPMD block of a MIX task to the cluster at cluster_offset.
     // Reads slot_state.next_block_idx as block_idx; caller increments it afterwards.
     void dispatch_mix_block_to_cluster(
-        Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state
+        Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state, bool to_pending
 #if PTO2_PROFILING
         ,
         bool profiling_enabled
@@ -893,10 +919,14 @@ struct AicpuExecutor {
     ) {
         CoreTracker &tracker = core_trackers_[thread_idx];
         uint8_t core_mask = pto2_core_mask(slot_state.active_mask);
+        // Per-core to_pending: in pending phase, idle cores dispatch to running slot
+        // (to_pending=false triggers change_core_state), running cores to pending slot.
+        // In idle phase (to_pending=false), all per-core flags stay false — no behavior change.
         if (core_mask & PTO2_SUBTASK_MASK_AIC) {
+            bool aic_to_pending = to_pending && !tracker.is_aic_core_idle(cluster_offset);
             dispatch_subtask_to_core(
                 runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC,
-                false
+                aic_to_pending
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -904,9 +934,10 @@ struct AicpuExecutor {
             );
         }
         if (core_mask & PTO2_SUBTASK_MASK_AIV0) {
+            bool aiv0_to_pending = to_pending && !tracker.is_aiv0_core_idle(cluster_offset);
             dispatch_subtask_to_core(
                 runtime, thread_idx, tracker.get_aiv0_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV0,
-                false
+                aiv0_to_pending
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -914,9 +945,10 @@ struct AicpuExecutor {
             );
         }
         if (core_mask & PTO2_SUBTASK_MASK_AIV1) {
+            bool aiv1_to_pending = to_pending && !tracker.is_aiv1_core_idle(cluster_offset);
             dispatch_subtask_to_core(
                 runtime, thread_idx, tracker.get_aiv1_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIV1,
-                false
+                aiv1_to_pending
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -951,18 +983,18 @@ struct AicpuExecutor {
         return true;
     }
 
-    // Dispatch one SPMD block to the cluster at cluster_offset, routing to the correct core(s)
-    // based on shape.  For AIV, picks whichever AIV core in the cluster is currently idle.
+    // Dispatch one SPMD block to the given core_offset, routing to the correct core(s)
+    // based on shape.  For MIX, core_offset is a cluster offset; for AIC/AIV, it is a
+    // per-core bit offset (already resolved by the caller in both idle and pending phases).
     // Caller is responsible for incrementing slot_state.next_block_idx after this returns.
-    void dispatch_block_to_cluster(
-        Runtime *runtime, int32_t thread_idx, int32_t cluster_offset, PTO2TaskSlotState &slot_state,
-        PTO2ResourceShape shape
+    void dispatch_block(
+        Runtime *runtime, int32_t thread_idx, int32_t core_offset, PTO2TaskSlotState &slot_state,
+        PTO2ResourceShape shape, bool to_pending
 #if PTO2_PROFILING
         ,
         bool profiling_enabled, uint32_t &phase_dispatch_count
 #endif
     ) {
-        CoreTracker &tracker = core_trackers_[thread_idx];
 #if PTO2_DUMP_TENSOR
         if (get_enable_dump_tensor()) {
             dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
@@ -978,7 +1010,7 @@ struct AicpuExecutor {
 #endif
         if (shape == PTO2ResourceShape::MIX) {
             dispatch_mix_block_to_cluster(
-                runtime, thread_idx, cluster_offset, slot_state
+                runtime, thread_idx, core_offset, slot_state, to_pending
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -986,19 +1018,15 @@ struct AicpuExecutor {
             );
         } else if (shape == PTO2ResourceShape::AIC) {
             dispatch_subtask_to_core(
-                runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), slot_state, PTO2SubtaskSlot::AIC,
-                false
+                runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIC, to_pending
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
 #endif
             );
-        } else {  // AIV
-            auto core_offset = tracker.is_aiv0_core_idle(cluster_offset) ?
-                                   tracker.get_aiv0_core_offset(cluster_offset) :
-                                   tracker.get_aiv1_core_offset(cluster_offset);
+        } else {  // AIV — core_offset already resolved by caller in both phases
             dispatch_subtask_to_core(
-                runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, false
+                runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending
 #if PTO2_PROFILING
                 ,
                 profiling_enabled
@@ -1010,15 +1038,114 @@ struct AicpuExecutor {
 #endif
     }
 
+    // Dispatch tasks of a given shape during the specified phase (IDLE or PENDING).
+    // IDLE: dispatches to idle cores, supports sync_start/drain, multi-block do-while.
+    // PENDING: dispatches to pending slots of running cores, skips sync_start tasks.
+    void dispatch_shape(
+        Runtime *runtime, int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
+        PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress,
+        bool &try_pushed
+#if PTO2_SCHED_PROFILING
+        ,
+        uint64_t &pop_hit, uint64_t &pop_miss, uint64_t &local_dispatch_count, uint64_t &sched_dispatch_pop_cycle,
+        uint64_t &sched_dispatch_setup_cycle
+#endif
+#if PTO2_PROFILING
+        ,
+        bool profiling_enabled, uint32_t &phase_dispatch_count
+#endif
+    ) {
+        if (entered_drain) return;
+
+        bool is_pending = (phase == CoreTracker::DispatchPhase::PENDING);
+        auto cores = tracker.get_dispatchable_cores(shape, phase);
+        if (!cores.has_value()) return;
+
+        while (cores.has_value() && !entered_drain) {
+            int want = cores.count();
+            PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS * 3];
+            int got = pop_ready_tasks_batch(
+                shape, thread_idx, local_buf, batch, want
+#if PTO2_SCHED_PROFILING
+                ,
+                pop_hit, pop_miss, local_dispatch_count, sched_dispatch_pop_cycle
+#endif
+            );
+            if (got == 0) break;
+
+            bool dispatched_any = false;
+            for (int bi = 0; bi < got; bi++) {
+                PTO2TaskSlotState *slot_state = batch[bi];
+
+                // sync_start tasks cannot use pending slots — requeue and skip.
+                if (pto2_requires_sync_start(slot_state->active_mask)) {
+                    if (is_pending) {
+                        rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        continue;
+                    }
+                    // Idle phase: check whether enough local resources exist for atomic dispatch.
+                    int32_t available = cores.count();
+                    if (available < slot_state->logical_block_num) {
+                        if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
+                            rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                        }
+                        for (int rem = bi + 1; rem < got; rem++) {
+                            rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(batch[rem]);
+                        }
+                        entered_drain = true;
+                        break;
+                    }
+                }
+
+                dispatched_any = true;
+                try_pushed = true;
+#if PTO2_SCHED_PROFILING
+                uint64_t t_setup_start = get_sys_cnt_aicpu();
+#endif
+                // Dispatch as many blocks as possible for this task.
+                do {
+                    auto core_offset = cores.pop_first();
+                    dispatch_block(
+                        runtime, thread_idx, core_offset, *slot_state, shape, is_pending
+#if PTO2_PROFILING
+                        ,
+                        profiling_enabled, phase_dispatch_count
+#endif
+                    );
+                    slot_state->next_block_idx++;
+                    DEV_DEBUG(
+                        "Thread %d: Dispatched %s %s task %" PRId64 " block %d/%d to core_offset %d", thread_idx,
+                        is_pending ? "pending" : "idle", shape_name(shape),
+                        static_cast<int64_t>(slot_state->task->task_id.raw), slot_state->next_block_idx - 1,
+                        slot_state->logical_block_num, core_offset
+                    );
+                } while (slot_state->next_block_idx < slot_state->logical_block_num && cores.has_value());
+
+                if (slot_state->next_block_idx < slot_state->logical_block_num) {
+                    rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
+                }
+                made_progress = true;
+#if PTO2_SCHED_PROFILING
+                sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+#endif
+            }
+
+            // If no task was actually dispatched (e.g. all were sync_start requeued in pending
+            // phase), stop to avoid spinning on the same tasks forever.
+            if (!dispatched_any) break;
+
+            // Lazy refresh: if cores exhausted mid-batch, re-query for newly available cores.
+            if (!cores.has_value()) {
+                cores = tracker.get_dispatchable_cores(shape, phase);
+            }
+        }
+    }
+
     // Count total available resources across all scheduler threads for a given shape.
     int32_t count_global_available(PTO2ResourceShape shape) {
         int32_t total = 0;
         for (int32_t t = 0; t < active_sched_threads_; t++) {
-            if (shape == PTO2ResourceShape::AIV) {
-                total += core_trackers_[t].count_idle_aiv_cores();
-            } else {
-                total += core_trackers_[t].get_valid_cluster_offset_states(shape).count();
-            }
+            total += core_trackers_[t].get_idle_core_offset_states(shape).count();
         }
         return total;
     }
@@ -1041,10 +1168,10 @@ struct AicpuExecutor {
         PTO2ResourceShape shape = pto2_active_mask_to_shape(slot_state->active_mask);
 
         for (int32_t t = 0; t < active_sched_threads_ && slot_state->next_block_idx < block_num; t++) {
-            auto valid = core_trackers_[t].get_valid_cluster_offset_states(shape);
+            auto valid = core_trackers_[t].get_idle_core_offset_states(shape);
             while (valid.has_value() && slot_state->next_block_idx < block_num) {
-                dispatch_block_to_cluster(
-                    runtime, t, valid.pop_first(), *slot_state, shape
+                dispatch_block(
+                    runtime, t, valid.pop_first(), *slot_state, shape, false
 #if PTO2_PROFILING
                     ,
                     profiling_enabled, phase_dispatch_count
@@ -1052,7 +1179,7 @@ struct AicpuExecutor {
                 );
                 slot_state->next_block_idx++;
                 if (slot_state->next_block_idx < block_num)
-                    valid = core_trackers_[t].get_valid_cluster_offset_states(shape);
+                    valid = core_trackers_[t].get_idle_core_offset_states(shape);
             }
         }
 
@@ -1775,157 +1902,22 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         const PTO2ResourceShape *dispatch_order = get_dispatch_order(thread_idx);
         bool entered_drain = false;
 
-        // === Idle dispatch: assign tasks to cores with both slots free ===
+        // === Two-phase dispatch: idle then pending ===
         for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES && !entered_drain; si++) {
             PTO2ResourceShape shape = dispatch_order[si];
-            auto valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
-            if (!valid_cluster_states.has_value()) {
-                continue;
-            }
-            auto &local_buf = local_bufs[static_cast<int32_t>(shape)];
-
-            while (valid_cluster_states.has_value() && !entered_drain) {
-                int want = valid_cluster_states.count();
-                PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS];
-                int got = pop_ready_tasks_batch(
-                    shape, thread_idx, local_buf, batch, want
+            for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
+                dispatch_shape(
+                    runtime, thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
+                    made_progress, try_pushed
 #if PTO2_SCHED_PROFILING
                     ,
-                    pop_hit, pop_miss, local_dispatch_count, sched_dispatch_pop_cycle
+                    pop_hit, pop_miss, local_dispatch_count, sched_dispatch_pop_cycle, sched_dispatch_setup_cycle
+#endif
+#if PTO2_PROFILING
+                    ,
+                    profiling_enabled, phase_dispatch_count
 #endif
                 );
-                if (got == 0) break;
-
-                for (int bi = 0; bi < got; bi++) {
-                    PTO2TaskSlotState *slot_state = batch[bi];
-                    try_pushed = true;
-#if PTO2_SCHED_PROFILING
-                    uint64_t t_setup_start = get_sys_cnt_aicpu();
-#endif
-                    // sync_start: all blocks must dispatch atomically.
-                    // Fast path  — enough local slots: fall through to normal dispatch loop below.
-                    // Slow path  — not enough: enter drain mode, then re-push all remaining
-                    //              tasks in the batch so nothing is lost.
-                    // For AIV, one cluster can serve 2 blocks (AIV0 + AIV1), so compare against
-                    // idle AIV core count rather than cluster count.
-                    if (pto2_requires_sync_start(slot_state->active_mask)) {
-                        int32_t available = (shape == PTO2ResourceShape::AIV) ? tracker.count_idle_aiv_cores() :
-                                                                                valid_cluster_states.count();
-                        if (available < slot_state->logical_block_num) {
-                            if (!enter_drain_mode(slot_state, slot_state->logical_block_num)) {
-                                // CAS lost: drain already active for another task; re-push and wait.
-                                rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
-                            }
-                            // Re-push all unprocessed tasks remaining in this batch.
-                            for (int rem = bi + 1; rem < got; rem++) {
-                                rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(batch[rem]);
-                            }
-                            entered_drain = true;
-                            break;
-                        }
-                        // Fast path: enough local resources, fall through to normal dispatch.
-                    }
-
-                    // Dispatch as many blocks as possible for this task using available clusters.
-                    // Guard: a preceding task in this batch may have drained all clusters;
-                    // re-enqueue the rest of the batch instead of popping an empty mask.
-                    if (!valid_cluster_states.has_value()) {
-                        rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
-                        break;
-                    }
-                    // For block_num=1 the inner body executes exactly once (no overhead).
-                    do {
-                        auto current_valid_cluster_offset = valid_cluster_states.pop_first();
-                        dispatch_block_to_cluster(
-                            runtime, thread_idx, current_valid_cluster_offset, *slot_state, shape
-#if PTO2_PROFILING
-                            ,
-                            profiling_enabled, phase_dispatch_count
-#endif
-                        );
-                        slot_state->next_block_idx++;
-                        // For AIV, refresh cluster states so the do-while can pick up the
-                        // other AIV core in the same cluster on the next iteration.
-                        if (shape == PTO2ResourceShape::AIV &&
-                            slot_state->next_block_idx < slot_state->logical_block_num) {
-                            valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
-                        }
-                        DEV_DEBUG(
-                            "Thread %d: Dispatched %s task %" PRId64 " block %d/%d to cluster_offset %d", thread_idx,
-                            shape_name(shape), static_cast<int64_t>(slot_state->task->task_id.raw),
-                            slot_state->next_block_idx - 1, slot_state->logical_block_num, current_valid_cluster_offset
-                        );
-                    } while (slot_state->next_block_idx < slot_state->logical_block_num &&
-                             valid_cluster_states.has_value());
-
-                    // Re-enqueue only if blocks remain after exhausting local clusters
-                    if (slot_state->next_block_idx < slot_state->logical_block_num) {
-                        rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push(slot_state);
-                    }
-                    made_progress = true;
-#if PTO2_SCHED_PROFILING
-                    sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
-#endif
-                }
-
-                // lazy update valid_cluster_states
-                if (!valid_cluster_states.has_value()) {
-                    valid_cluster_states = tracker.get_idle_cluster_offset_states(shape);
-                }
-            }
-        }
-
-        // === Pending dispatch: assign AIC tasks to pending slots (core running, pending free) ===
-        // Only AIC tasks support pending dispatch; sync_start tasks are excluded.
-        if (!entered_drain) {
-            auto pending_clusters = tracker.get_pending_only_cluster_offset_states(PTO2ResourceShape::AIC);
-            if (pending_clusters.has_value()) {
-                auto &local_buf = local_bufs[static_cast<int32_t>(PTO2ResourceShape::AIC)];
-                while (pending_clusters.has_value()) {
-                    int want = pending_clusters.count();
-                    PTO2TaskSlotState *batch[CoreTracker::MAX_CLUSTERS];
-                    int got = pop_ready_tasks_batch(
-                        PTO2ResourceShape::AIC, thread_idx, local_buf, batch, want
-#if PTO2_SCHED_PROFILING
-                        ,
-                        pop_hit, pop_miss, local_dispatch_count, sched_dispatch_pop_cycle
-#endif
-                    );
-                    if (got == 0) break;
-
-                    for (int bi = 0; bi < got; bi++) {
-                        PTO2TaskSlotState *slot_state = batch[bi];
-                        // Skip sync_start tasks for pending dispatch (need all-idle for atomic dispatch)
-                        if (pto2_requires_sync_start(slot_state->active_mask)) {
-                            rt->scheduler.ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].push(slot_state);
-                            continue;
-                        }
-                        try_pushed = true;
-#if PTO2_SCHED_PROFILING
-                        uint64_t t_setup_start = get_sys_cnt_aicpu();
-#endif
-                        auto cluster_offset = pending_clusters.pop_first();
-                        dispatch_subtask_to_core(
-                            runtime, thread_idx, tracker.get_aic_core_offset(cluster_offset), *slot_state,
-                            PTO2SubtaskSlot::AIC, true
-#if PTO2_PROFILING
-                            ,
-                            profiling_enabled
-#endif
-                        );
-                        slot_state->next_block_idx++;
-                        if (slot_state->next_block_idx < slot_state->logical_block_num) {
-                            rt->scheduler.ready_queues[static_cast<int32_t>(PTO2ResourceShape::AIC)].push(slot_state);
-                        }
-                        made_progress = true;
-#if PTO2_SCHED_PROFILING
-                        sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
-#endif
-                    }
-                    if (!pending_clusters.has_value()) {
-                        pending_clusters = tracker.get_pending_only_cluster_offset_states(PTO2ResourceShape::AIC);
-                    }
-                }
             }
         }
 
