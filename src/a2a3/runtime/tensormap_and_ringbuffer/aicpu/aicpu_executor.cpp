@@ -1827,6 +1827,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                     }
 
                     // Dispatch as many blocks as possible for this task using available clusters.
+                    // Guard: a preceding task in this batch may have drained all clusters;
+                    // re-enqueue the rest of the batch instead of popping an empty mask.
+                    if (!valid_cluster_states.has_value()) {
+                        rt->scheduler.ready_queues[static_cast<int32_t>(shape)].push_batch(&batch[bi], got - bi);
+                        break;
+                    }
                     // For block_num=1 the inner body executes exactly once (no overhead).
                     do {
                         auto current_valid_cluster_offset = valid_cluster_states.pop_first();
