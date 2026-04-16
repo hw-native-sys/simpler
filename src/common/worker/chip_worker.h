@@ -43,18 +43,6 @@ public:
     /// After this, set_device() can be called again with a new device ID.
     void reset_device();
 
-    /// Allocate pinned host memory through the bound host runtime.
-    uint64_t host_malloc(size_t size);
-
-    /// Free pinned host memory allocated by host_malloc().
-    void host_free(uint64_t host_ptr);
-
-    /// Register pinned host memory and return the mapped device-visible address.
-    uint64_t host_register_mapped(uint64_t host_ptr, size_t size, int device_id = -1);
-
-    /// Unregister a mapped host buffer.
-    void host_unregister_mapped(uint64_t host_ptr, int device_id = -1);
-
     /// Allocate host memory and register it as a device-visible mapped buffer.
     void mallocHostDeviceShareMem(uint64_t size, uint64_t *host_ptr, uint64_t *dev_ptr, int device_id = -1);
 
@@ -88,10 +76,6 @@ private:
         int, int
     );
     using FinalizeDeviceFn = int (*)(void *);
-    using HostMallocFn = void *(*)(void *, size_t);
-    using HostFreeFn = void (*)(void *, void *);
-    using HostRegisterMappedFn = int (*)(void *, void *, size_t, int, void **);
-    using HostUnregisterMappedFn = int (*)(void *, void *, int);
     using MallocHostDeviceShareMemFn = int (*)(uint32_t, uint64_t, void **, void **);
     using FreeHostDeviceShareMemFn = int (*)(uint32_t, void *);
 
@@ -102,10 +86,6 @@ private:
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     RunRuntimeFn run_runtime_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
-    HostMallocFn host_malloc_fn_ = nullptr;
-    HostFreeFn host_free_fn_ = nullptr;
-    HostRegisterMappedFn host_register_mapped_fn_ = nullptr;
-    HostUnregisterMappedFn host_unregister_mapped_fn_ = nullptr;
     MallocHostDeviceShareMemFn malloc_host_device_share_mem_fn_ = nullptr;
     FreeHostDeviceShareMemFn free_host_device_share_mem_fn_ = nullptr;
     void *device_ctx_ = nullptr;

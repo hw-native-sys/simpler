@@ -58,14 +58,8 @@ __all__ = [
     "make_tensor_arg",
     "scalar_to_uint64",
     "get_active_worker",
-    "host_malloc",
-    "host_free",
-    "host_register_mapped",
-    "host_unregister_mapped",
     "malloc_host_device_share_mem",
     "free_host_device_share_mem",
-    "mallocHostDeviceShareMem",
-    "freeHostDeviceShareMem",
     # Distributed runtime
     "WorkerType",
     "TaskState",
@@ -197,26 +191,6 @@ class ChipWorker:
         """Release device resources. The runtime binding remains intact."""
         self._impl.reset_device()
 
-    def host_malloc(self, size):
-        """Allocate pinned host memory through the bound host runtime."""
-        return self._impl.host_malloc(int(size))
-
-    def host_free(self, host_ptr):
-        """Free pinned host memory previously allocated by host_malloc()."""
-        self._impl.host_free(int(host_ptr))
-
-    def host_register_mapped(self, host_ptr, size, device_id=None):
-        """Register host memory and return the device-visible mapped pointer."""
-        if device_id is None:
-            device_id = self.device_id
-        return self._impl.host_register_mapped(int(host_ptr), int(size), int(device_id))
-
-    def host_unregister_mapped(self, host_ptr, device_id=None):
-        """Unregister host memory previously registered via host_register_mapped()."""
-        if device_id is None:
-            device_id = self.device_id
-        self._impl.host_unregister_mapped(int(host_ptr), int(device_id))
-
     def malloc_host_device_share_mem(self, size, device_id=None):
         """Allocate host memory and register it as a device-visible mapped buffer."""
         if device_id is None:
@@ -279,26 +253,6 @@ def get_active_worker():
     return _ACTIVE_WORKER
 
 
-def host_malloc(size):
-    """Allocate pinned host memory using the active ChipWorker."""
-    return get_active_worker().host_malloc(size)
-
-
-def host_free(host_ptr):
-    """Free pinned host memory using the active ChipWorker."""
-    get_active_worker().host_free(host_ptr)
-
-
-def host_register_mapped(host_ptr, size, device_id=None):
-    """Register pinned host memory and return a device-visible mapped pointer."""
-    return get_active_worker().host_register_mapped(host_ptr, size, device_id=device_id)
-
-
-def host_unregister_mapped(host_ptr, device_id=None):
-    """Unregister pinned host memory from the active ChipWorker."""
-    get_active_worker().host_unregister_mapped(host_ptr, device_id=device_id)
-
-
 def malloc_host_device_share_mem(size, device_id=None):
     """Allocate host memory and register it as a device-visible mapped buffer."""
     return get_active_worker().malloc_host_device_share_mem(size, device_id=device_id)
@@ -307,13 +261,3 @@ def malloc_host_device_share_mem(size, device_id=None):
 def free_host_device_share_mem(host_ptr, device_id=None):
     """Unregister and free a mapped host buffer."""
     get_active_worker().free_host_device_share_mem(host_ptr, device_id=device_id)
-
-
-def mallocHostDeviceShareMem(device_id, size):
-    """Compatibility helper matching the minimal C-style API naming."""
-    return malloc_host_device_share_mem(size, device_id=device_id)
-
-
-def freeHostDeviceShareMem(device_id, host_ptr):
-    """Compatibility helper matching the minimal C-style API naming."""
-    free_host_device_share_mem(host_ptr, device_id=device_id)

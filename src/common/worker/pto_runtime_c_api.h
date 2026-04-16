@@ -18,7 +18,7 @@
  * Public API — resolved by ChipWorker via dlsym:
  *   create_device_context, destroy_device_context,
  *   get_runtime_size, set_device, run_runtime, finalize_device,
- *   host_malloc, host_free, host_register_mapped, host_unregister_mapped
+ *   mallocHostDeviceShareMem, freeHostDeviceShareMem
  *
  * Memory management: caller allocates a buffer of get_runtime_size() bytes
  * and passes it to run_runtime(). Error codes: 0 = success, negative = error.
@@ -59,45 +59,6 @@ size_t get_runtime_size(void);
 
 /** Set the target device. Must be called before the first run_runtime(). */
 int set_device(DeviceContextHandle ctx, int device_id);
-
-/**
- * Allocate pinned host memory suitable for host-register flows.
- *
- * @param ctx   Device context from create_device_context()
- * @param size  Size in bytes
- * @return Host pointer on success, NULL on failure
- */
-void *host_malloc(DeviceContextHandle ctx, size_t size);
-
-/**
- * Free host memory allocated by host_malloc().
- *
- * @param ctx       Device context from create_device_context()
- * @param host_ptr  Pointer returned by host_malloc()
- */
-void host_free(DeviceContextHandle ctx, void *host_ptr);
-
-/**
- * Register host memory as a device-visible mapped address.
- *
- * @param ctx        Device context from create_device_context()
- * @param host_ptr   Host pointer to register
- * @param size       Size in bytes
- * @param device_id  Target device ID
- * @param dev_ptr    Output mapped device-visible address
- * @return 0 on success, negative on error
- */
-int host_register_mapped(DeviceContextHandle ctx, void *host_ptr, size_t size, int device_id, void **dev_ptr);
-
-/**
- * Unregister host memory previously registered by host_register_mapped().
- *
- * @param ctx        Device context from create_device_context()
- * @param host_ptr   Host pointer to unregister
- * @param device_id  Target device ID
- * @return 0 on success, negative on error
- */
-int host_unregister_mapped(DeviceContextHandle ctx, void *host_ptr, int device_id);
 
 /**
  * Allocate host memory and register it as a device-visible mapped address.

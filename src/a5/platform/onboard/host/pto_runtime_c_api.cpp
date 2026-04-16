@@ -207,39 +207,6 @@ int set_device(DeviceContextHandle ctx, int device_id) {
     }
 }
 
-void *host_malloc(DeviceContextHandle ctx, size_t size) {
-    (void)ctx;
-    (void)size;
-    LOG_ERROR("host_malloc is not supported on a5 onboard runtime");
-    return NULL;
-}
-
-void host_free(DeviceContextHandle ctx, void *host_ptr) {
-    (void)ctx;
-    (void)host_ptr;
-    LOG_ERROR("host_free is not supported on a5 onboard runtime");
-}
-
-int host_register_mapped(DeviceContextHandle ctx, void *host_ptr, size_t size, int device_id, void **dev_ptr) {
-    (void)ctx;
-    (void)host_ptr;
-    (void)size;
-    (void)device_id;
-    if (dev_ptr != NULL) {
-        *dev_ptr = NULL;
-    }
-    LOG_ERROR("host_register_mapped is not supported on a5 onboard runtime");
-    return -1;
-}
-
-int host_unregister_mapped(DeviceContextHandle ctx, void *host_ptr, int device_id) {
-    (void)ctx;
-    (void)host_ptr;
-    (void)device_id;
-    LOG_ERROR("host_unregister_mapped is not supported on a5 onboard runtime");
-    return -1;
-}
-
 int mallocHostDeviceShareMem(uint32_t deviceId, uint64_t size, void **hostPtr, void **devPtr) {
     if (hostPtr == NULL || devPtr == NULL || size == 0) {
         return -1;

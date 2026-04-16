@@ -560,13 +560,6 @@ NB_MODULE(_task_interface, m) {
         .def("set_device", &ChipWorker::set_device, nb::arg("device_id"))
         .def("reset_device", &ChipWorker::reset_device)
         .def("finalize", &ChipWorker::finalize)
-        .def("host_malloc", &ChipWorker::host_malloc, nb::arg("size"))
-        .def("host_free", &ChipWorker::host_free, nb::arg("host_ptr"))
-        .def(
-            "host_register_mapped", &ChipWorker::host_register_mapped, nb::arg("host_ptr"), nb::arg("size"),
-            nb::arg("device_id") = -1
-        )
-        .def("host_unregister_mapped", &ChipWorker::host_unregister_mapped, nb::arg("host_ptr"), nb::arg("device_id") = -1)
         .def(
             "malloc_host_device_share_mem",
             [](ChipWorker &self, uint64_t size, int device_id) -> nb::tuple {
