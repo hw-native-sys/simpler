@@ -43,8 +43,6 @@ set(DIST_SOURCES
     ${DIST_SRC_DIR}/dist_ring.cpp
     ${DIST_SRC_DIR}/dist_scope.cpp
     ${DIST_SRC_DIR}/dist_orchestrator.cpp
-    ${DIST_SRC_DIR}/dist_sub_worker.cpp
-    ${DIST_SRC_DIR}/dist_chip_process.cpp
     ${DIST_SRC_DIR}/dist_worker_manager.cpp
     ${DIST_SRC_DIR}/dist_scheduler.cpp
     ${DIST_SRC_DIR}/dist_worker.cpp

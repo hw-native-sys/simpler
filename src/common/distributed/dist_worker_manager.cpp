@@ -16,13 +16,48 @@
 #include "dist_ring.h"
 
 // =============================================================================
-// WorkerThread
+// WorkerThread — mailbox helpers (PROCESS mode)
 // =============================================================================
 
-void WorkerThread::start(IWorker *worker, DistRing *ring, const std::function<void(DistTaskSlot)> &on_complete) {
+MailboxState WorkerThread::read_mailbox_state() const {
+    volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(mbox() + MAILBOX_OFF_STATE);
+    int32_t v;
+#if defined(__aarch64__)
+    __asm__ volatile("ldar %w0, [%1]" : "=r"(v) : "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    v = *ptr;
+    __asm__ volatile("" ::: "memory");
+#else
+    __atomic_load(ptr, &v, __ATOMIC_ACQUIRE);
+#endif
+    return static_cast<MailboxState>(v);
+}
+
+void WorkerThread::write_mailbox_state(MailboxState s) {
+    volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(mbox() + MAILBOX_OFF_STATE);
+    int32_t v = static_cast<int32_t>(s);
+#if defined(__aarch64__)
+    __asm__ volatile("stlr %w0, [%1]" : : "r"(v), "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    __asm__ volatile("" ::: "memory");
+    *ptr = v;
+#else
+    __atomic_store(ptr, &v, __ATOMIC_RELEASE);
+#endif
+}
+
+// =============================================================================
+// WorkerThread — lifecycle
+// =============================================================================
+
+void WorkerThread::start(
+    Mode mode, IWorker *worker, DistRing *ring, const std::function<void(DistTaskSlot)> &on_complete, void *mailbox
+) {
+    mode_ = mode;
     worker_ = worker;
     ring_ = ring;
     on_complete_ = on_complete;
+    mailbox_ = mailbox;
     shutdown_ = false;
     idle_.store(true, std::memory_order_relaxed);
     thread_ = std::thread(&WorkerThread::loop, this);
@@ -44,6 +79,16 @@ void WorkerThread::stop() {
     if (thread_.joinable()) thread_.join();
 }
 
+void WorkerThread::shutdown_child() {
+    if (mode_ == Mode::PROCESS && mailbox_) {
+        write_mailbox_state(MailboxState::SHUTDOWN);
+    }
+}
+
+// =============================================================================
+// WorkerThread — main loop + per-mode dispatch
+// =============================================================================
+
 void WorkerThread::loop() {
     while (true) {
         WorkerDispatch d;
@@ -52,45 +97,112 @@ void WorkerThread::loop() {
             cv_.wait(lk, [this] {
                 return !queue_.empty() || shutdown_;
             });
-            if (queue_.empty()) break;  // shutdown
+            if (queue_.empty()) break;
             d = queue_.front();
             queue_.pop();
         }
 
-        // Resolve callable / args / config from the slot. For NEXT_LEVEL
-        // tasks `callable` is the ChipCallable buffer pointer; for SUB
-        // tasks it encodes the registry id in the low 32 bits. The view
-        // is a zero-copy handle over the slot's vector-backed TaskArgs.
         DistTaskSlotState &s = *ring_->slot_state(d.task_slot);
-        uint64_t callable = (s.worker_type == WorkerType::SUB) ? static_cast<uint64_t>(s.callable_id) : s.callable;
-        TaskArgsView view = s.args_view(d.group_index);
 
-        worker_->run(callable, view, s.config);  // blocking in this thread
+        if (mode_ == Mode::THREAD) {
+            dispatch_thread(s, d.group_index);
+        } else {
+            dispatch_process(s, d.group_index);
+        }
+
         idle_.store(true, std::memory_order_release);
-        on_complete_(d.task_slot);  // notify Scheduler
+        on_complete_(d.task_slot);
     }
+}
+
+void WorkerThread::dispatch_thread(DistTaskSlotState &s, int32_t group_index) {
+    uint64_t callable = (s.worker_type == WorkerType::SUB) ? static_cast<uint64_t>(s.callable_id) : s.callable;
+    TaskArgsView view = s.args_view(group_index);
+    worker_->run(callable, view, s.config);
+}
+
+void WorkerThread::dispatch_process(DistTaskSlotState &s, int32_t group_index) {
+    uint64_t callable = (s.worker_type == WorkerType::SUB) ? static_cast<uint64_t>(s.callable_id) : s.callable;
+    TaskArgsView view = s.args_view(group_index);
+
+    // Write callable.
+    std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &callable, sizeof(uint64_t));
+
+    // Write config fields individually to avoid struct-layout portability issues.
+    int32_t block_dim = s.config.block_dim;
+    int32_t aicpu_tn = s.config.aicpu_thread_num;
+    int32_t profiling = s.config.enable_profiling ? 1 : 0;
+    int32_t dump_tensor = s.config.enable_dump_tensor ? 1 : 0;
+    std::memcpy(mbox() + MAILBOX_OFF_BLOCK_DIM, &block_dim, sizeof(int32_t));
+    std::memcpy(mbox() + MAILBOX_OFF_AICPU_THREAD_NUM, &aicpu_tn, sizeof(int32_t));
+    std::memcpy(mbox() + MAILBOX_OFF_ENABLE_PROFILING, &profiling, sizeof(int32_t));
+    std::memcpy(mbox() + MAILBOX_OFF_ENABLE_DUMP_TENSOR, &dump_tensor, sizeof(int32_t));
+
+    // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars].
+    size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor) +
+                        static_cast<size_t>(view.scalar_count) * sizeof(uint64_t);
+    if (blob_bytes > DIST_MAILBOX_ARGS_CAPACITY) {
+        throw std::runtime_error("WorkerThread::dispatch_process: args blob exceeds mailbox capacity");
+    }
+    uint8_t *d = reinterpret_cast<uint8_t *>(mbox() + MAILBOX_OFF_ARGS);
+    std::memcpy(d + 0, &view.tensor_count, sizeof(int32_t));
+    std::memcpy(d + 4, &view.scalar_count, sizeof(int32_t));
+    if (view.tensor_count > 0) {
+        std::memcpy(
+            d + TASK_ARGS_BLOB_HEADER_SIZE, view.tensors,
+            static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor)
+        );
+    }
+    if (view.scalar_count > 0) {
+        std::memcpy(
+            d + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor),
+            view.scalars, static_cast<size_t>(view.scalar_count) * sizeof(uint64_t)
+        );
+    }
+
+    // Signal child process.
+    write_mailbox_state(MailboxState::TASK_READY);
+
+    // Spin-poll until child signals TASK_DONE.
+    while (read_mailbox_state() != MailboxState::TASK_DONE) {
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+
+    write_mailbox_state(MailboxState::IDLE);
 }
 
 // =============================================================================
 // DistWorkerManager
 // =============================================================================
 
-void DistWorkerManager::add_next_level(IWorker *worker) { next_level_workers_.push_back(worker); }
+void DistWorkerManager::add_next_level(IWorker *worker) {
+    next_level_entries_.push_back({worker, WorkerThread::Mode::THREAD, nullptr});
+}
 
-void DistWorkerManager::add_sub(IWorker *worker) { sub_workers_.push_back(worker); }
+void DistWorkerManager::add_sub(IWorker *worker) {
+    sub_entries_.push_back({worker, WorkerThread::Mode::THREAD, nullptr});
+}
+
+void DistWorkerManager::add_next_level_process(void *mailbox) {
+    next_level_entries_.push_back({nullptr, WorkerThread::Mode::PROCESS, mailbox});
+}
+
+void DistWorkerManager::add_sub_process(void *mailbox) {
+    sub_entries_.push_back({nullptr, WorkerThread::Mode::PROCESS, mailbox});
+}
 
 void DistWorkerManager::start(DistRing *ring, const OnCompleteFn &on_complete) {
     if (ring == nullptr) throw std::invalid_argument("DistWorkerManager::start: null ring");
-    auto make_threads = [&](const std::vector<IWorker *> &workers,
+    auto make_threads = [&](const std::vector<WorkerEntry> &entries,
                             std::vector<std::unique_ptr<WorkerThread>> &threads) {
-        for (IWorker *w : workers) {
+        for (const WorkerEntry &e : entries) {
             auto wt = std::make_unique<WorkerThread>();
-            wt->start(w, ring, on_complete);
+            wt->start(e.mode, e.worker, ring, on_complete, e.mailbox);
             threads.push_back(std::move(wt));
         }
     };
-    make_threads(next_level_workers_, next_level_threads_);
-    make_threads(sub_workers_, sub_threads_);
+    make_threads(next_level_entries_, next_level_threads_);
+    make_threads(sub_entries_, sub_threads_);
 }
 
 void DistWorkerManager::stop() {
@@ -100,6 +212,13 @@ void DistWorkerManager::stop() {
         wt->stop();
     next_level_threads_.clear();
     sub_threads_.clear();
+}
+
+void DistWorkerManager::shutdown_children() {
+    for (auto &wt : next_level_threads_)
+        wt->shutdown_child();
+    for (auto &wt : sub_threads_)
+        wt->shutdown_child();
 }
 
 WorkerThread *DistWorkerManager::pick_idle(WorkerType type) const {

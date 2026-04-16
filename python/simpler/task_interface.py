@@ -18,8 +18,7 @@ Usage:
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CONTINUOUS_TENSOR_MAX_DIMS,
-    DIST_CHIP_MAILBOX_SIZE,
-    DIST_SUB_MAILBOX_SIZE,
+    DIST_MAILBOX_SIZE,
     ArgDirection,
     ChipCallable,
     ChipCallConfig,
@@ -27,10 +26,8 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     ContinuousTensor,
     CoreCallable,
     DataType,
-    DistChipProcess,
     DistOrchestrator,
     DistSubmitResult,
-    DistSubWorker,
     DistWorker,
     TaskArgs,
     TaskState,
@@ -65,11 +62,8 @@ __all__ = [
     "TaskState",
     "DistOrchestrator",
     "DistSubmitResult",
-    "DistSubWorker",
-    "DistChipProcess",
     "DistWorker",
-    "DIST_SUB_MAILBOX_SIZE",
-    "DIST_CHIP_MAILBOX_SIZE",
+    "DIST_MAILBOX_SIZE",
 ]
 
 

@@ -40,11 +40,8 @@ from typing import Any, Callable, Optional
 
 from .orchestrator import Orchestrator
 from .task_interface import (
-    DIST_CHIP_MAILBOX_SIZE,
-    DIST_SUB_MAILBOX_SIZE,
+    DIST_MAILBOX_SIZE,
     ChipWorker,
-    DistChipProcess,
-    DistSubWorker,
     DistWorker,
     _ChipWorker,
 )
@@ -68,11 +65,22 @@ class Task:
 
 
 # ---------------------------------------------------------------------------
-# Mailbox helpers (shared with host_worker)
+# Unified mailbox layout (must match dist_worker_manager.h MAILBOX_OFF_*)
 # ---------------------------------------------------------------------------
+#
+# One layout for both NEXT_LEVEL (chip) and SUB workers. SUB children
+# read `callable` as a uint64 encoding the callable_id and ignore the
+# config + args_blob region.
 
 _OFF_STATE = 0
-_OFF_CALLABLE_ID = 4
+_OFF_ERROR = 4
+_OFF_CALLABLE = 8
+_OFF_BLOCK_DIM = 16
+_OFF_AICPU_THREAD_NUM = 20
+_OFF_ENABLE_PROFILING = 24
+_OFF_ENABLE_DUMP_TENSOR = 28
+_OFF_ARGS = 64
+
 _IDLE = 0
 _TASK_READY = 1
 _TASK_DONE = 2
@@ -86,12 +94,12 @@ def _mailbox_addr(shm: SharedMemory) -> int:
 
 
 def _sub_worker_loop(buf, registry: dict) -> None:
-    """Runs in forked child process."""
+    """Runs in forked child process. Reads unified mailbox layout."""
     while True:
         state = struct.unpack_from("i", buf, _OFF_STATE)[0]
         if state == _TASK_READY:
-            cid = struct.unpack_from("i", buf, _OFF_CALLABLE_ID)[0]
-            fn = registry.get(cid)
+            cid = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+            fn = registry.get(int(cid))
             error = 0
             if fn is None:
                 error = 1
@@ -100,20 +108,10 @@ def _sub_worker_loop(buf, registry: dict) -> None:
                     fn()
                 except Exception:  # noqa: BLE001
                     error = 2
-            struct.pack_into("i", buf, 24, error)
+            struct.pack_into("i", buf, _OFF_ERROR, error)
             struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
         elif state == _SHUTDOWN:
             break
-
-
-# Chip process mailbox offsets (must match dist_chip_process.h)
-_CHIP_OFF_STATE = 0
-_CHIP_OFF_ERROR = 4
-_CHIP_OFF_CALLABLE = 8
-_CHIP_OFF_BLOCK_DIM = 16
-_CHIP_OFF_AICPU_THREAD_NUM = 20
-_CHIP_OFF_ENABLE_PROFILING = 24
-_CHIP_OFF_ARGS = 64
 
 
 def _chip_process_loop(
@@ -126,13 +124,8 @@ def _chip_process_loop(
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
-    The parent writes a length-prefixed TaskArgs blob ([T][S][tensors][scalars])
-    into the mailbox at OFF_ARGS. The child reads the blob directly from the
-    mailbox via ChipWorker.run_from_blob — safe because the parent is blocked
-    on TASK_DONE for the duration of the call, so the mailbox bytes are
-    stable, and run_from_blob's view_to_chip_storage already memcpys the
-    tensor / scalar data into the ChipStorageTaskArgs POD it hands to
-    pto2_run_runtime. No per-task heap buffer needed.
+    Reads the unified mailbox layout (same offsets as _sub_worker_loop, but
+    this loop also consumes config fields + args_blob).
     """
     import traceback as _tb  # noqa: PLC0415
 
@@ -142,30 +135,29 @@ def _chip_process_loop(
         cw.set_device(device_id)
     except Exception:
         _tb.print_exc()
-        struct.pack_into("i", buf, _CHIP_OFF_ERROR, 99)
+        struct.pack_into("i", buf, _OFF_ERROR, 99)
         return
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
-    # The blob pointer is a constant offset into the mailbox — compute once.
-    args_ptr = mailbox_addr + _CHIP_OFF_ARGS
+    args_ptr = mailbox_addr + _OFF_ARGS
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
 
     while True:
-        state = struct.unpack_from("i", buf, _CHIP_OFF_STATE)[0]
+        state = struct.unpack_from("i", buf, _OFF_STATE)[0]
         if state == _TASK_READY:
-            callable_ptr = struct.unpack_from("Q", buf, _CHIP_OFF_CALLABLE)[0]
-            block_dim = struct.unpack_from("i", buf, _CHIP_OFF_BLOCK_DIM)[0]
-            aicpu_tn = struct.unpack_from("i", buf, _CHIP_OFF_AICPU_THREAD_NUM)[0]
-            profiling = struct.unpack_from("i", buf, _CHIP_OFF_ENABLE_PROFILING)[0]
+            callable_ptr = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+            block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
+            aicpu_tn = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
+            profiling = struct.unpack_from("i", buf, _OFF_ENABLE_PROFILING)[0]
 
             error = 0
             try:
                 cw.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
             except Exception:  # noqa: BLE001
                 error = 1
-            struct.pack_into("i", buf, _CHIP_OFF_ERROR, error)
-            struct.pack_into("i", buf, _CHIP_OFF_STATE, _TASK_DONE)
+            struct.pack_into("i", buf, _OFF_ERROR, error)
+            struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
         elif state == _SHUTDOWN:
             cw.finalize()
             break
@@ -196,12 +188,10 @@ class Worker:
         # Level-3 internals
         self._dist_worker: Optional[DistWorker] = None
         self._orch: Optional[Orchestrator] = None
-        self._dist_chip_procs: list[DistChipProcess] = []
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
-        self._dist_sub_workers: list[DistSubWorker] = []
-        self._shms: list[SharedMemory] = []
-        self._pids: list[int] = []
+        self._sub_shms: list[SharedMemory] = []
+        self._sub_pids: list[int] = []
 
     # ------------------------------------------------------------------
     # Callable registration (before init)
@@ -258,12 +248,12 @@ class Worker:
         n_sub = self._config.get("num_sub_workers", 0)
         heap_ring_size = self._config.get("heap_ring_size", None)
 
-        # 1. Allocate sub-worker mailboxes
+        # 1. Allocate sub-worker mailboxes (unified layout, DIST_MAILBOX_SIZE each).
         for _ in range(n_sub):
-            shm = SharedMemory(create=True, size=DIST_SUB_MAILBOX_SIZE)
+            shm = SharedMemory(create=True, size=DIST_MAILBOX_SIZE)
             assert shm.buf is not None
             struct.pack_into("i", shm.buf, _OFF_STATE, _IDLE)
-            self._shms.append(shm)
+            self._sub_shms.append(shm)
 
         # 2. Prepare chip-worker config (but do NOT fork yet — deferred to _start_level3)
         if device_ids:
@@ -274,9 +264,6 @@ class Worker:
             builder = RuntimeBuilder(platform)
             binaries = builder.get_binaries(runtime, build=self._config.get("build", False))
 
-            # args_capacity: how many bytes the parent can write at mailbox
-            # OFF_ARGS. Matches DIST_CHIP_ARGS_CAPACITY on the C++ side.
-            self._l3_args_capacity = DIST_CHIP_MAILBOX_SIZE - _CHIP_OFF_ARGS
             self._l3_host_lib_path = str(binaries.host_path)
             self._l3_aicpu_path = str(binaries.aicpu_path)
             self._l3_aicore_path = str(binaries.aicore_path)
@@ -284,11 +271,11 @@ class Worker:
                 str(binaries.sim_context_path) if getattr(binaries, "sim_context_path", None) else ""
             )
 
-            # Allocate chip mailboxes (shared memory, no fork yet)
+            # Allocate chip mailboxes (unified layout, DIST_MAILBOX_SIZE each).
             for _ in device_ids:
-                shm = SharedMemory(create=True, size=DIST_CHIP_MAILBOX_SIZE)
+                shm = SharedMemory(create=True, size=DIST_MAILBOX_SIZE)
                 assert shm.buf is not None
-                struct.pack_into("i", shm.buf, _CHIP_OFF_STATE, _IDLE)
+                struct.pack_into("i", shm.buf, _OFF_STATE, _IDLE)
                 self._chip_shms.append(shm)
 
         # 3. Construct the DistWorker *before* fork so the HeapRing mmap
@@ -316,12 +303,12 @@ class Worker:
         for i in range(n_sub):
             pid = os.fork()
             if pid == 0:
-                buf = self._shms[i].buf
+                buf = self._sub_shms[i].buf
                 assert buf is not None
                 _sub_worker_loop(buf, registry)
                 os._exit(0)
             else:
-                self._pids.append(pid)
+                self._sub_pids.append(pid)
 
         # Fork ChipWorker processes
         if device_ids:
@@ -343,21 +330,17 @@ class Worker:
                     self._chip_pids.append(pid)
 
         # DistWorker was constructed in _init_level3 (pre-fork) so children
-        # inherit the HeapRing MAP_SHARED mmap. Wire chip processes + sub
-        # workers now that their mailboxes exist.
+        # inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode workers
+        # via the unified mailbox — no DistChipProcess/DistSubWorker wrappers.
         dw = self._dist_worker
         assert dw is not None
 
         if device_ids:
             for shm in self._chip_shms:
-                cp = DistChipProcess(_mailbox_addr(shm), self._l3_args_capacity)
-                self._dist_chip_procs.append(cp)
-                dw.add_next_level_worker(cp)
+                dw.add_next_level_process(_mailbox_addr(shm))
 
-        for shm in self._shms:
-            sw = DistSubWorker(_mailbox_addr(shm))
-            self._dist_sub_workers.append(sw)
-            dw.add_sub_worker(sw)
+        for shm in self._sub_shms:
+            dw.add_sub_process(_mailbox_addr(shm))
 
         # Start Scheduler + WorkerThreads (C++ threads start here, after fork)
         dw.init()
@@ -410,34 +393,33 @@ class Worker:
                 self._dist_worker = None
                 self._orch = None
 
-            # Shutdown SubWorker processes
-            for sw in self._dist_sub_workers:
-                sw.shutdown()
-            for shm in self._shms:
+            # Shutdown SubWorker processes: write SHUTDOWN to each mailbox,
+            # then waitpid + free shm.
+            for shm in self._sub_shms:
                 buf = shm.buf
                 assert buf is not None
                 struct.pack_into("i", buf, _OFF_STATE, _SHUTDOWN)
-            for pid in self._pids:
+            for pid in self._sub_pids:
                 os.waitpid(pid, 0)
-            for shm in self._shms:
+            for shm in self._sub_shms:
                 shm.close()
                 shm.unlink()
 
-            # Shutdown ChipWorker processes
-            for cp in self._dist_chip_procs:
-                cp.shutdown()
+            # Shutdown ChipWorker processes: same pattern.
+            for shm in self._chip_shms:
+                buf = shm.buf
+                assert buf is not None
+                struct.pack_into("i", buf, _OFF_STATE, _SHUTDOWN)
             for pid in self._chip_pids:
                 os.waitpid(pid, 0)
             for shm in self._chip_shms:
                 shm.close()
                 shm.unlink()
 
-            self._shms.clear()
-            self._pids.clear()
+            self._sub_shms.clear()
+            self._sub_pids.clear()
             self._chip_shms.clear()
             self._chip_pids.clear()
-            self._dist_sub_workers.clear()
-            self._dist_chip_procs.clear()
 
         self._initialized = False
 

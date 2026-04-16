@@ -125,6 +125,12 @@ void DistWorker::add_worker(WorkerType type, IWorker *worker) {
     else manager_.add_sub(worker);
 }
 
+void DistWorker::add_process_worker(WorkerType type, void *mailbox) {
+    if (initialized_) throw std::runtime_error("DistWorker: add_process_worker after init");
+    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level_process(mailbox);
+    else manager_.add_sub_process(mailbox);
+}
+
 void DistWorker::init() {
     if (initialized_) throw std::runtime_error("DistWorker: already initialized");
 

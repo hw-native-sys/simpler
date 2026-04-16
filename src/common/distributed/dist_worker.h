@@ -65,7 +65,13 @@ public:
     DistWorker &operator=(const DistWorker &) = delete;
 
     // Register sub-workers before calling init().
+    // THREAD mode — parent calls worker->run() directly.
     void add_worker(WorkerType type, IWorker *worker);
+
+    // PROCESS mode — parent writes the unified mailbox; a pre-forked child
+    // process reads it and runs the real IWorker in its own address space.
+    // `mailbox` must point to a DIST_MAILBOX_SIZE-byte MAP_SHARED region.
+    void add_process_worker(WorkerType type, void *mailbox);
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
     // any child workers — init() spins up threads in the parent that would
