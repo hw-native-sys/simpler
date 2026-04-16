@@ -115,6 +115,23 @@ def load_kernel_config(config_path):
     return func_id_to_name
 
 
+def load_func_names_json(json_path):
+    """Load name mapping from a SceneTest JSON file.
+
+    Each mapping carries ``callable_id_to_name`` and a ``level`` tag.
+    Used directly — no cross-level merging.
+
+    Returns:
+        tuple: (callable_id_to_name dict, orchestrator_name str or None)
+    """
+    path = Path(json_path)
+    if not path.exists():
+        raise ValueError(f"Func names JSON not found: {path}")
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("callable_id_to_name", {}), data.get("orchestrator_name")
+
+
 def generate_mermaid_flowchart(tasks, func_id_to_name=None, style="detailed", direction="LR", verbose=False):
     """Generate Mermaid flowchart from task data.
 
@@ -235,6 +252,10 @@ View the Mermaid diagram:
         help="Path to kernel_config.py for func_id -> name mapping",
     )
     parser.add_argument(
+        "--func-names",
+        help="Path to func_id_names_*.json (SceneTest format) for func_id to function name mapping",
+    )
+    parser.add_argument(
         "--style",
         choices=["detailed", "compact"],
         default="detailed",
@@ -306,7 +327,16 @@ def main():
             print()
 
         func_names = {}
-        if args.kernel_config:
+        if args.func_names:
+            if args.verbose:
+                print(f"Loading func names from: {args.func_names}")
+            func_names, _ = load_func_names_json(args.func_names)
+            if args.verbose:
+                print(f"  Loaded {len(func_names)} func_id name mappings")
+                for func_id, name in sorted(func_names.items(), key=lambda x: int(x[0])):
+                    print(f"    func_id={func_id}: {name}")
+                print()
+        elif args.kernel_config:
             if args.verbose:
                 print(f"Loading kernel config: {args.kernel_config}")
             func_names = load_kernel_config(args.kernel_config)

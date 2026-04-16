@@ -186,6 +186,24 @@ def load_kernel_config(config_path):
     return func_id_to_name
 
 
+def load_func_names_json(json_path):
+    """Load name mapping from a SceneTest JSON file.
+
+    Each level's mapping carries ``callable_id_to_name`` for its
+    next-level-down callables and a ``level`` tag.  The tool uses
+    ``callable_id_to_name`` directly — no cross-level merging.
+
+    Returns:
+        tuple: (callable_id_to_name dict, orchestrator_name str or None)
+    """
+    path = Path(json_path)
+    if not path.exists():
+        raise ValueError(f"Func names JSON not found: {path}")
+    with open(path) as f:
+        data = json.load(f)
+    return data.get("callable_id_to_name", {}), data.get("orchestrator_name")
+
+
 def parse_sched_cpu_from_device_log(log_path, task_count):
     """Parse device log for PTO2 scheduler stats and return scheduler CPU time per task (us).
 
@@ -392,6 +410,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     orchestrator_data=None,
     orchestrator_phases=None,
     core_to_thread=None,
+    orchestrator_name=None,
 ):
     """Generate Chrome Trace Event Format JSON from task data.
 
@@ -744,8 +763,9 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
     # AICPU Orchestrator event (version 2)
     if orchestrator_phases or orchestrator_data:
         # Process metadata
+        orch_process_label = f"AICPU {orchestrator_name}" if orchestrator_name else "AICPU Orchestrator"
         events.append(
-            {"args": {"name": "AICPU Orchestrator"}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 4}
+            {"args": {"name": orch_process_label}, "cat": "__metadata", "name": "process_name", "ph": "M", "pid": 4}
         )
         events.append(
             {"args": {"sort_index": 1}, "cat": "__metadata", "name": "process_sort_index", "ph": "M", "pid": 4}
@@ -765,7 +785,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         if not orch_threads and orchestrator_data:
             events.append(
                 {
-                    "args": {"name": "Orchestrator"},
+                    "args": {"name": orchestrator_name or "Orchestrator"},
                     "cat": "__metadata",
                     "name": "thread_name",
                     "ph": "M",
@@ -1121,6 +1141,10 @@ Examples:
         "--kernel-config",
         help="Path to kernel_config.py file for func_id to function name mapping",
     )
+    parser.add_argument(
+        "--func-names",
+        help="Path to func_id_names_*.json (SceneTest format) for func_id to function name mapping",
+    )
     parser.add_argument("--device-log", help="Device log file/path/glob override used for scheduler analysis")
     parser.add_argument("-d", "--device-id", help="Device id for auto-selection from device-<id>")
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose output")
@@ -1210,6 +1234,39 @@ def _report_device_log(resolved_device_log, log_strategy):
         print(f"Selection: {log_strategy}")
 
 
+def _load_func_names(args):
+    """Load func_id→name mapping from --func-names JSON or -k kernel_config.py.
+
+    Returns:
+        tuple: (func_id_to_name dict, orchestrator_name str or None)
+    """
+    if args.func_names:
+        if args.verbose:
+            print(f"Loading func names from: {args.func_names}")
+        func_names, orchestrator_name = load_func_names_json(args.func_names)
+        if args.verbose:
+            print(f"  Loaded {len(func_names)} function name mappings:")
+            for func_id, name in sorted(func_names.items(), key=lambda x: int(x[0])):
+                print(f"    func_id={func_id}: {name}")
+            if orchestrator_name:
+                print(f"  Orchestrator: {orchestrator_name}")
+            print()
+        return func_names, orchestrator_name
+
+    if args.kernel_config:
+        if args.verbose:
+            print(f"Loading kernel config from: {args.kernel_config}")
+        func_names = load_kernel_config(args.kernel_config)
+        if args.verbose:
+            print(f"  Loaded {len(func_names)} function name mappings from kernel_config.py:")
+            for func_id, name in sorted(func_names.items(), key=lambda x: int(x[0])):
+                print(f"    func_id={func_id}: {name}")
+            print()
+        return func_names, None
+
+    return {}, None
+
+
 def main():
     args = _build_parser().parse_args()
 
@@ -1223,16 +1280,7 @@ def main():
         data = read_perf_data(input_path)
         _print_verbose_data_info(data, args.verbose)
 
-        func_names = {}
-        if args.kernel_config:
-            if args.verbose:
-                print(f"Loading kernel config from: {args.kernel_config}")
-            func_names = load_kernel_config(args.kernel_config)
-            if args.verbose:
-                print(f"  Loaded {len(func_names)} function name mappings from kernel_config.py:")
-                for func_id, name in sorted(func_names.items(), key=lambda x: int(x[0])):
-                    print(f"    func_id={func_id}: {name}")
-                print()
+        func_names, orchestrator_name = _load_func_names(args)
 
         output_path = _resolve_output_path(args, input_path)
 
@@ -1247,6 +1295,7 @@ def main():
             str(output_path),
             func_names,
             args.verbose,
+            orchestrator_name=orchestrator_name,
             scheduler_phases=data.get("aicpu_scheduler_phases"),
             orchestrator_data=data.get("aicpu_orchestrator"),
             orchestrator_phases=data.get("aicpu_orchestrator_phases"),

@@ -340,6 +340,63 @@ def _resolve_chip_entry_paths(entry, cls_dir):
         entry["incores"] = resolved
 
 
+def _extract_name_map(callable_spec: dict) -> dict:
+    """Extract name mapping from a CALLABLE spec.
+
+    Each level exports only its own ``callable_id_to_name`` — the mapping
+    from next-level-down IDs to human-readable names.  No cross-level
+    nesting: the perf data declares its level, the mapping declares its
+    level, and the tool matches them.
+
+    * **L2** — ``callable_id`` = incore ``func_id``::
+
+        {"level": 2, "orchestrator_name": "PagedAttn",
+         "callable_id_to_name": {"0": "QK", "1": "SF"}}
+
+    * **L3** — ``callable_id`` = index in ``callables`` list::
+
+        {"level": 3, "orchestrator_name": "run_dag",
+         "callable_id_to_name": {"0": "vec_kernel", "1": "verify"}}
+    """
+    if "callables" not in callable_spec:
+        # L2: orchestration + incores
+        callable_id_to_name: dict[str, str] = {}
+        orch = callable_spec.get("orchestration", {})
+        orchestrator_name = orch.get("name") if isinstance(orch, dict) else None
+        for k in callable_spec.get("incores", []):
+            if "name" in k and "func_id" in k:
+                callable_id_to_name[str(k["func_id"])] = k["name"]
+        result: dict = {"level": 2, "orchestrator_name": orchestrator_name}
+        if callable_id_to_name:
+            result["callable_id_to_name"] = callable_id_to_name
+        return result
+
+    # L3: Python orch function + callables list
+    orch = callable_spec.get("orchestration")
+    orchestrator_name = getattr(orch, "__name__", None) if callable(orch) else None
+
+    callable_id_to_name = {}
+    for idx, entry in enumerate(callable_spec["callables"]):
+        callable_id_to_name[str(idx)] = entry.get("name", f"callable_{idx}")
+
+    result = {"level": 3, "orchestrator_name": orchestrator_name}
+    if callable_id_to_name:
+        result["callable_id_to_name"] = callable_id_to_name
+    return result
+
+
+def _dump_name_map(mapping: dict, output_path: Path) -> Path | None:
+    """Write name mapping to JSON if it contains any names. Returns path or None."""
+    import json as _json  # noqa: PLC0415
+
+    if not mapping.get("callable_id_to_name") and not mapping.get("orchestrator_name"):
+        return None
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w") as f:
+        _json.dump(mapping, f, indent=2)
+    return output_path
+
+
 def _parse_case_selector(value: str) -> tuple[str | None, str | None]:
     """Parse one ``--case`` value into ``(class_name, case_name)``.
 
@@ -466,6 +523,7 @@ def _run_swimlane_converter(
     input_path: Path | None = None,
     device_id=None,
     device_log: Path | None = None,
+    func_names_path: Path | None = None,
 ) -> None:
     """Invoke ``tools/swimlane_converter.py``.
 
@@ -484,6 +542,8 @@ def _run_swimlane_converter(
     cmd = [sys.executable, str(script)]
     if input_path is not None:
         cmd.append(str(input_path))
+    if func_names_path is not None:
+        cmd += ["--func-names", str(func_names_path)]
     if device_log is not None:
         cmd += ["--device-log", str(device_log)]
     elif device_id is not None:
@@ -510,12 +570,17 @@ def _convert_case_swimlane(
     device_id,
     before_perf: set[Path],
     before_device: set[Path] | None,
+    callable_spec: dict | None = None,
 ) -> None:
     """Post-case: rename the new perf file to include ``case_label`` (guarding against
     the runtime's second-precision filename collisions), then invoke the converter.
 
     The ``perf_swimlane_`` prefix is preserved so the converter's stem-based output
     naming still strips it and produces ``merged_swimlane_<ts>_<case_label>.json``.
+
+    When ``callable_spec`` is provided and contains ``"name"`` entries on incores,
+    a ``func_id_names_<label>.json`` sidecar is written and passed to the converter
+    so that swimlane visualizations display human-readable kernel names.
     """
     import logging  # noqa: PLC0415
 
@@ -531,12 +596,21 @@ def _convert_case_swimlane(
         logger.warning(f"[{case_label}] target {renamed.name} already exists; overwriting")
         renamed.unlink()
     perf_file.rename(renamed)
+
+    # Dump callable name mapping if the CALLABLE spec provides names
+    func_names_path = None
+    if callable_spec:
+        mapping = _extract_name_map(callable_spec)
+        func_names_path = _dump_name_map(mapping, renamed.parent / f"name_map_{safe_label}.json")
+
     device_log = None
     if before_device is not None:
         device_log = _wait_new_device_log(device_id, before_device)
         if device_log is None:
             logger.warning(f"[{case_label}] no new device log found; scheduler deep-dive may use stale log")
-    _run_swimlane_converter(input_path=renamed, device_id=device_id, device_log=device_log)
+    _run_swimlane_converter(
+        input_path=renamed, device_id=device_id, device_log=device_log, func_names_path=func_names_path
+    )
 
 
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
@@ -919,7 +993,13 @@ class SceneTestCase:
                 )
             finally:
                 if enable_profiling:
-                    _convert_case_swimlane(f"{cls_name}_{case['name']}", primary_device_id, before_perf, before_device)
+                    _convert_case_swimlane(
+                        f"{cls_name}_{case['name']}",
+                        primary_device_id,
+                        before_perf,
+                        before_device,
+                        callable_spec=self.CALLABLE,
+                    )
             ran_any = True
 
         if not ran_any:
@@ -1037,6 +1117,7 @@ class SceneTestCase:
                                     args.device,
                                     before_perf,
                                     before_device,
+                                    callable_spec=cls.CALLABLE,
                                 )
             finally:
                 if group[0]._st_level == 2:
