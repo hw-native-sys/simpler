@@ -87,6 +87,9 @@ static __aicore__ void pv_matmul_impl(__gm__ uint8_t *pij_raw, __gm__ uint8_t *v
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
 
     TSTORE(oiGlobal, cTile);
+
+    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
