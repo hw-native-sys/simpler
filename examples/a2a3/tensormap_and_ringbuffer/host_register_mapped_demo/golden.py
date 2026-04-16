@@ -15,7 +15,7 @@ import logging
 import numpy as np
 import torch
 
-from simpler.task_interface import host_free, host_malloc, host_register_mapped, host_unregister_mapped
+from simpler.task_interface import free_host_device_share_mem, malloc_host_device_share_mem
 
 logger = logging.getLogger(__name__)
 
@@ -45,15 +45,9 @@ def _cleanup_mapped_state() -> None:
         return
 
     try:
-        if _MAPPED_STATE.get("registered", False):
-            host_unregister_mapped(host_ptr)
+        free_host_device_share_mem(host_ptr)
     except Exception as exc:  # noqa: BLE001
-        logger.warning("host_unregister_mapped cleanup failed: %s", exc)
-
-    try:
-        host_free(host_ptr)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("host_free cleanup failed: %s", exc)
+        logger.warning("free_host_device_share_mem cleanup failed: %s", exc)
 
     _MAPPED_STATE.clear()
 
@@ -65,21 +59,13 @@ def generate_inputs(params: dict) -> list:
     del params
     _cleanup_mapped_state()
 
-    host_ptr = host_malloc(SIZE * ctypes.sizeof(ctypes.c_float))
-    if host_ptr == 0:
-        raise RuntimeError("host_malloc returned null")
-
+    alloc_size = SIZE * ctypes.sizeof(ctypes.c_float)
+    host_ptr, mapped_dev_ptr = malloc_host_device_share_mem(alloc_size)
     host_buf = (ctypes.c_float * SIZE).from_address(host_ptr)
     host_np = np.ctypeslib.as_array(host_buf)
     host_np[:] = np.arange(SIZE, dtype=np.float32)
     host_tensor = torch.from_numpy(host_np)
     _log_preview("host_register_mapped_demo: host_init_data", host_np)
-
-    try:
-        mapped_dev_ptr = host_register_mapped(host_ptr, host_tensor.numel() * host_tensor.element_size())
-    except Exception:
-        host_free(host_ptr)
-        raise
 
     mapped_out = torch.zeros_like(host_tensor)
 
@@ -87,7 +73,6 @@ def generate_inputs(params: dict) -> list:
         {
             "host_ptr": host_ptr,
             "mapped_dev_ptr": mapped_dev_ptr,
-            "registered": True,
             "host_buf": host_buf,
             "host_np": host_np,
             "host_tensor": host_tensor,

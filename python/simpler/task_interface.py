@@ -70,6 +70,10 @@ __all__ = [
     "host_free",
     "host_register_mapped",
     "host_unregister_mapped",
+    "malloc_host_device_share_mem",
+    "free_host_device_share_mem",
+    "mallocHostDeviceShareMem",
+    "freeHostDeviceShareMem",
     # Distributed runtime
     "WorkerType",
     "TaskState",
@@ -227,6 +231,19 @@ class ChipWorker:
             device_id = self.device_id
         self._impl.host_unregister_mapped(int(host_ptr), int(device_id))
 
+    def malloc_host_device_share_mem(self, size, device_id=None):
+        """Allocate host memory and register it as a device-visible mapped buffer."""
+        if device_id is None:
+            device_id = self.device_id
+        host_ptr, dev_ptr = self._impl.malloc_host_device_share_mem(int(size), int(device_id))
+        return int(host_ptr), int(dev_ptr)
+
+    def free_host_device_share_mem(self, host_ptr, device_id=None):
+        """Unregister and free a mapped host buffer."""
+        if device_id is None:
+            device_id = self.device_id
+        self._impl.free_host_device_share_mem(int(host_ptr), int(device_id))
+
     def finalize(self):
         """Tear down everything: device resources and runtime library.
 
@@ -294,3 +311,23 @@ def host_register_mapped(host_ptr, size, device_id=None):
 def host_unregister_mapped(host_ptr, device_id=None):
     """Unregister pinned host memory from the active ChipWorker."""
     get_active_worker().host_unregister_mapped(host_ptr, device_id=device_id)
+
+
+def malloc_host_device_share_mem(size, device_id=None):
+    """Allocate host memory and register it as a device-visible mapped buffer."""
+    return get_active_worker().malloc_host_device_share_mem(size, device_id=device_id)
+
+
+def free_host_device_share_mem(host_ptr, device_id=None):
+    """Unregister and free a mapped host buffer."""
+    get_active_worker().free_host_device_share_mem(host_ptr, device_id=device_id)
+
+
+def mallocHostDeviceShareMem(device_id, size):
+    """Compatibility helper matching the minimal C-style API naming."""
+    return malloc_host_device_share_mem(size, device_id=device_id)
+
+
+def freeHostDeviceShareMem(device_id, host_ptr):
+    """Compatibility helper matching the minimal C-style API naming."""
+    free_host_device_share_mem(host_ptr, device_id=device_id)

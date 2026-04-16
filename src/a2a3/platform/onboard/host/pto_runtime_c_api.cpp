@@ -20,6 +20,7 @@
 #include "callable.h"
 #include "task_args.h"
 
+#include <inttypes.h>
 #include <dlfcn.h>
 #include <initializer_list>
 #include <pthread.h>
@@ -40,6 +41,8 @@ using AclMallocHostFn = int (*)(void **, size_t);
 using AclFreeHostFn = int (*)(void *);
 using AclHostRegisterFn = int (*)(void *, uint64_t, uint32_t, void **);
 using AclHostUnregisterFn = int (*)(void *);
+using GetDeviceFn = int (*)(int32_t *);
+using DirectSetDeviceFn = int (*)(int32_t);
 
 template <typename Fn>
 Fn resolve_symbol(const char **resolved_name, std::initializer_list<const char *> names) {
@@ -78,6 +81,45 @@ int ensure_host_api_device_ready(DeviceContextHandle ctx, int device_id) {
     } catch (...) {
         return -1;
     }
+}
+
+int ensure_current_device_for_share_mem(uint32_t device_id) {
+    const char *symbol_name = nullptr;
+    if (GetDeviceFn get_device_fn = resolve_symbol<GetDeviceFn>(&symbol_name, {"aclrtGetDevice", "rtGetDevice"})) {
+        int32_t current_device = -1;
+        int rc = get_device_fn(&current_device);
+        if (rc != 0) {
+            LOG_INFO(
+                "ensure_current_device_for_share_mem: %s failed rc=%d, trying to set device to %u",
+                symbol_name, rc, device_id
+            );
+            if (DirectSetDeviceFn set_device_fn =
+                    resolve_symbol<DirectSetDeviceFn>(&symbol_name, {"rtSetDevice", "aclrtSetDevice"})) {
+                rc = set_device_fn(static_cast<int32_t>(device_id));
+                if (rc != 0) {
+                    LOG_ERROR(
+                        "ensure_current_device_for_share_mem: %s(%u) failed: rc=%d", symbol_name, device_id, rc
+                    );
+                    return rc;
+                }
+                return 0;
+            }
+            LOG_ERROR("ensure_current_device_for_share_mem: missing symbols rtSetDevice / aclrtSetDevice");
+            return rc;
+        }
+
+        if (current_device != static_cast<int32_t>(device_id)) {
+            LOG_ERROR(
+                "ensure_current_device_for_share_mem: current device %d does not match requested device %u",
+                static_cast<int>(current_device), device_id
+            );
+            return -1;
+        }
+        return 0;
+    }
+
+    LOG_ERROR("ensure_current_device_for_share_mem: missing symbols aclrtGetDevice / rtGetDevice");
+    return -1;
 }
 
 }  // namespace
@@ -318,6 +360,136 @@ int host_unregister_mapped(DeviceContextHandle ctx, void *host_ptr, int device_i
 
     LOG_ERROR("host_unregister_mapped: missing symbols rtsHostUnregister / rtHostUnregister / aclrtHostUnregister");
     return -1;
+}
+
+int mallocHostDeviceShareMem(uint32_t deviceId, uint64_t size, void **hostPtr, void **devPtr) {
+    if (hostPtr == NULL || devPtr == NULL || size == 0) {
+        return -1;
+    }
+
+    *hostPtr = nullptr;
+    *devPtr = nullptr;
+
+    int rc = ensure_current_device_for_share_mem(deviceId);
+    if (rc != 0) {
+        return rc;
+    }
+
+    void *allocated_host_ptr = nullptr;
+    const char *symbol_name = nullptr;
+    if (RtMallocHostFn malloc_fn = resolve_symbol<RtMallocHostFn>(&symbol_name, {"rtMallocHost"})) {
+        rc = malloc_fn(&allocated_host_ptr, size, 0U);
+        if (rc != 0 || allocated_host_ptr == nullptr) {
+            LOG_ERROR("mallocHostDeviceShareMem via %s failed on rtMallocHost: rc=%d size=%" PRIu64, symbol_name, rc, size);
+            return (rc != 0) ? rc : -1;
+        }
+    } else if (AclMallocHostFn malloc_fn = resolve_symbol<AclMallocHostFn>(&symbol_name, {"aclrtMallocHost"})) {
+        rc = malloc_fn(&allocated_host_ptr, static_cast<size_t>(size));
+        if (rc != 0 || allocated_host_ptr == nullptr) {
+            LOG_ERROR("mallocHostDeviceShareMem via %s failed on aclrtMallocHost: rc=%d size=%" PRIu64, symbol_name, rc, size);
+            return (rc != 0) ? rc : -1;
+        }
+    } else {
+        LOG_ERROR("mallocHostDeviceShareMem: missing symbols rtMallocHost / aclrtMallocHost");
+        return -1;
+    }
+
+    if (RtHostRegisterFn register_fn =
+            resolve_symbol<RtHostRegisterFn>(&symbol_name, {"rtsHostRegister", "rtHostRegister"})) {
+        rc = register_fn(allocated_host_ptr, size, kHostRegisterMappedFlag, devPtr);
+        if (rc != 0 || *devPtr == nullptr) {
+            LOG_ERROR(
+                "mallocHostDeviceShareMem via %s failed on host register: rc=%d host=%p size=%" PRIu64 " flag=%u",
+                symbol_name, rc, allocated_host_ptr, size, kHostRegisterMappedFlag
+            );
+            if (RtFreeHostFn free_fn = resolve_symbol<RtFreeHostFn>(nullptr, {"rtFreeHost"})) {
+                free_fn(allocated_host_ptr);
+            } else if (AclFreeHostFn free_fn = resolve_symbol<AclFreeHostFn>(nullptr, {"aclrtFreeHost"})) {
+                free_fn(allocated_host_ptr);
+            }
+            return (rc != 0) ? rc : -1;
+        }
+    } else if (AclHostRegisterFn register_fn =
+                   resolve_symbol<AclHostRegisterFn>(&symbol_name, {"aclrtHostRegister"})) {
+        rc = register_fn(allocated_host_ptr, size, kHostRegisterMappedFlag, devPtr);
+        if (rc != 0 || *devPtr == nullptr) {
+            LOG_ERROR(
+                "mallocHostDeviceShareMem via %s failed on host register: rc=%d host=%p size=%" PRIu64 " flag=%u",
+                symbol_name, rc, allocated_host_ptr, size, kHostRegisterMappedFlag
+            );
+            if (RtFreeHostFn free_fn = resolve_symbol<RtFreeHostFn>(nullptr, {"rtFreeHost"})) {
+                free_fn(allocated_host_ptr);
+            } else if (AclFreeHostFn free_fn = resolve_symbol<AclFreeHostFn>(nullptr, {"aclrtFreeHost"})) {
+                free_fn(allocated_host_ptr);
+            }
+            return (rc != 0) ? rc : -1;
+        }
+    } else {
+        LOG_ERROR("mallocHostDeviceShareMem: missing symbols rtsHostRegister / rtHostRegister / aclrtHostRegister");
+        if (RtFreeHostFn free_fn = resolve_symbol<RtFreeHostFn>(nullptr, {"rtFreeHost"})) {
+            free_fn(allocated_host_ptr);
+        } else if (AclFreeHostFn free_fn = resolve_symbol<AclFreeHostFn>(nullptr, {"aclrtFreeHost"})) {
+            free_fn(allocated_host_ptr);
+        }
+        return -1;
+    }
+
+    *hostPtr = allocated_host_ptr;
+    LOG_INFO(
+        "mallocHostDeviceShareMem: device=%u host=%p dev=%p size=%" PRIu64, deviceId, *hostPtr, *devPtr, size
+    );
+    return 0;
+}
+
+int freeHostDeviceShareMem(uint32_t deviceId, void *hostPtr) {
+    if (hostPtr == NULL) {
+        return 0;
+    }
+
+    int rc = ensure_current_device_for_share_mem(deviceId);
+    if (rc != 0) {
+        return rc;
+    }
+
+    const char *symbol_name = nullptr;
+    if (RtHostUnregisterFn unregister_fn =
+            resolve_symbol<RtHostUnregisterFn>(&symbol_name, {"rtsHostUnregister", "rtHostUnregister"})) {
+        rc = unregister_fn(hostPtr);
+        if (rc != 0) {
+            LOG_ERROR("freeHostDeviceShareMem via %s failed on unregister: rc=%d host=%p", symbol_name, rc, hostPtr);
+            return rc;
+        }
+    } else if (AclHostUnregisterFn unregister_fn =
+                   resolve_symbol<AclHostUnregisterFn>(&symbol_name, {"aclrtHostUnregister"})) {
+        rc = unregister_fn(hostPtr);
+        if (rc != 0) {
+            LOG_ERROR("freeHostDeviceShareMem via %s failed on unregister: rc=%d host=%p", symbol_name, rc, hostPtr);
+            return rc;
+        }
+    } else {
+        LOG_ERROR("freeHostDeviceShareMem: missing symbols rtsHostUnregister / rtHostUnregister / aclrtHostUnregister");
+        return -1;
+    }
+
+    if (RtFreeHostFn free_fn = resolve_symbol<RtFreeHostFn>(&symbol_name, {"rtFreeHost"})) {
+        rc = free_fn(hostPtr);
+        if (rc != 0) {
+            LOG_ERROR("freeHostDeviceShareMem via %s failed on free: rc=%d host=%p", symbol_name, rc, hostPtr);
+            return rc;
+        }
+    } else if (AclFreeHostFn free_fn = resolve_symbol<AclFreeHostFn>(&symbol_name, {"aclrtFreeHost"})) {
+        rc = free_fn(hostPtr);
+        if (rc != 0) {
+            LOG_ERROR("freeHostDeviceShareMem via %s failed on free: rc=%d host=%p", symbol_name, rc, hostPtr);
+            return rc;
+        }
+    } else {
+        LOG_ERROR("freeHostDeviceShareMem: missing symbols rtFreeHost / aclrtFreeHost");
+        return -1;
+    }
+
+    LOG_INFO("freeHostDeviceShareMem: device=%u host=%p", deviceId, hostPtr);
+    return 0;
 }
 
 int run_runtime(

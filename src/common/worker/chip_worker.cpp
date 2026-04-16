@@ -129,6 +129,9 @@ void ChipWorker::init(
         host_free_fn_ = try_load_symbol<HostFreeFn>(handle, "host_free");
         host_register_mapped_fn_ = try_load_symbol<HostRegisterMappedFn>(handle, "host_register_mapped");
         host_unregister_mapped_fn_ = try_load_symbol<HostUnregisterMappedFn>(handle, "host_unregister_mapped");
+        malloc_host_device_share_mem_fn_ =
+            try_load_symbol<MallocHostDeviceShareMemFn>(handle, "mallocHostDeviceShareMem");
+        free_host_device_share_mem_fn_ = try_load_symbol<FreeHostDeviceShareMemFn>(handle, "freeHostDeviceShareMem");
     } catch (...) {
         dlclose(handle);
         throw;
@@ -230,6 +233,49 @@ void ChipWorker::host_unregister_mapped(uint64_t host_ptr, int device_id) {
     }
 }
 
+void ChipWorker::mallocHostDeviceShareMem(uint64_t size, uint64_t *host_ptr, uint64_t *dev_ptr, int device_id) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    if (host_ptr == nullptr || dev_ptr == nullptr) {
+        throw std::runtime_error("mallocHostDeviceShareMem requires non-null output pointers");
+    }
+    if (malloc_host_device_share_mem_fn_ == nullptr) {
+        throw std::runtime_error("mallocHostDeviceShareMem symbol is not available in the bound runtime");
+    }
+
+    *host_ptr = 0;
+    *dev_ptr = 0;
+    int effective_device_id = (device_id >= 0) ? device_id : device_id_;
+    void *host_ptr_raw = nullptr;
+    void *dev_ptr_raw = nullptr;
+    int rc = malloc_host_device_share_mem_fn_(static_cast<uint32_t>(effective_device_id), size, &host_ptr_raw, &dev_ptr_raw);
+    if (rc != 0 || host_ptr_raw == nullptr || dev_ptr_raw == nullptr) {
+        throw std::runtime_error("mallocHostDeviceShareMem failed with code " + std::to_string(rc));
+    }
+
+    *host_ptr = reinterpret_cast<uint64_t>(host_ptr_raw);
+    *dev_ptr = reinterpret_cast<uint64_t>(dev_ptr_raw);
+}
+
+void ChipWorker::freeHostDeviceShareMem(uint64_t host_ptr, int device_id) {
+    if (host_ptr == 0) {
+        return;
+    }
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    if (free_host_device_share_mem_fn_ == nullptr) {
+        throw std::runtime_error("freeHostDeviceShareMem symbol is not available in the bound runtime");
+    }
+
+    int effective_device_id = (device_id >= 0) ? device_id : device_id_;
+    int rc = free_host_device_share_mem_fn_(static_cast<uint32_t>(effective_device_id), reinterpret_cast<void *>(host_ptr));
+    if (rc != 0) {
+        throw std::runtime_error("freeHostDeviceShareMem failed with code " + std::to_string(rc));
+    }
+}
+
 void ChipWorker::finalize() {
     reset_device();
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
@@ -250,6 +296,8 @@ void ChipWorker::finalize() {
     host_free_fn_ = nullptr;
     host_register_mapped_fn_ = nullptr;
     host_unregister_mapped_fn_ = nullptr;
+    malloc_host_device_share_mem_fn_ = nullptr;
+    free_host_device_share_mem_fn_ = nullptr;
     runtime_buf_.clear();
     aicpu_binary_.clear();
     aicore_binary_.clear();

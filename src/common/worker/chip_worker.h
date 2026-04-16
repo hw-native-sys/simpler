@@ -59,6 +59,12 @@ public:
     /// Unregister a mapped host buffer.
     void host_unregister_mapped(uint64_t host_ptr, int device_id = -1);
 
+    /// Allocate host memory and register it as a device-visible mapped buffer.
+    void mallocHostDeviceShareMem(uint64_t size, uint64_t *host_ptr, uint64_t *dev_ptr, int device_id = -1);
+
+    /// Unregister and free a mapped host buffer.
+    void freeHostDeviceShareMem(uint64_t host_ptr, int device_id = -1);
+
     /// Tear down everything: device resources and runtime library.
     /// Terminal — the object cannot be reused after this.
     void finalize();
@@ -86,6 +92,8 @@ private:
     using HostFreeFn = void (*)(void *, void *);
     using HostRegisterMappedFn = int (*)(void *, void *, size_t, int, void **);
     using HostUnregisterMappedFn = int (*)(void *, void *, int);
+    using MallocHostDeviceShareMemFn = int (*)(uint32_t, uint64_t, void **, void **);
+    using FreeHostDeviceShareMemFn = int (*)(uint32_t, void *);
 
     void *lib_handle_ = nullptr;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
@@ -98,6 +106,8 @@ private:
     HostFreeFn host_free_fn_ = nullptr;
     HostRegisterMappedFn host_register_mapped_fn_ = nullptr;
     HostUnregisterMappedFn host_unregister_mapped_fn_ = nullptr;
+    MallocHostDeviceShareMemFn malloc_host_device_share_mem_fn_ = nullptr;
+    FreeHostDeviceShareMemFn free_host_device_share_mem_fn_ = nullptr;
     void *device_ctx_ = nullptr;
 
     std::vector<uint8_t> runtime_buf_;
