@@ -204,12 +204,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 #endif
 
                     params_qk.reset();
-                    params_qk.add_input(qi);
-                    params_qk.add_input(key_cache);
-                    params_qk.add_input(block_table);
+                    params_qk.add_input(qi, key_cache, block_table);
                     params_qk.add_output(sij_buf_ci);
-                    params_qk.add_scalar(n_blocks);
-                    params_qk.add_scalar(b_idx * block_num + bn);
+                    params_qk.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors qk_outs = pto2_rt_submit_aic_task(FUNC_QK_MATMUL, params_qk);
                     const Tensor &sij_buf = qk_outs.get_ref(0);
@@ -230,12 +227,8 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
                     params_sf.reset();
                     params_sf.add_input(sij_buf);
-                    params_sf.add_output(pij_buf_ci);
-                    params_sf.add_output(scalar_ci);
-                    params_sf.add_output(scalar_ci);
-                    params_sf.add_scalar(scale_value);
-                    params_sf.add_scalar(n_blocks);
-                    params_sf.add_scalar(valid_len_last);
+                    params_sf.add_output(pij_buf_ci, scalar_ci, scalar_ci);
+                    params_sf.add_scalar(scale_value, n_blocks, valid_len_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors sf_outs = pto2_rt_submit_aiv_task(FUNC_SOFTMAX_PREPARE, params_sf);
                     const Tensor &pij_buf = sf_outs.get_ref(0);
@@ -248,12 +241,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
                     // === Task 3: SplitK PV matmul (accumulated P @ V) ===
                     params_pv.reset();
-                    params_pv.add_input(pij_buf);
-                    params_pv.add_input(value_cache);
-                    params_pv.add_input(block_table);
+                    params_pv.add_input(pij_buf, value_cache, block_table);
                     params_pv.add_output(tile2d_ci);
-                    params_pv.add_scalar(n_blocks);
-                    params_pv.add_scalar(b_idx * block_num + bn);
+                    params_pv.add_scalar(n_blocks, b_idx * block_num + bn);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     TaskOutputTensors pv_outs = pto2_rt_submit_aic_task(FUNC_PV_MATMUL, params_pv);
                     const Tensor &oi_new = pv_outs.get_ref(0);
@@ -267,15 +257,9 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
                     uint64_t is_last = (bn + n_blocks >= bn_this_batch) ? 1 : 0;
 
                     params_up.reset();
-                    params_up.add_input(mi);
-                    params_up.add_input(li);
-                    params_up.add_input(oi_new);
-                    params_up.add_inout(mi_update);
-                    params_up.add_inout(li_update);
-                    params_up.add_inout(oi);
-                    params_up.add_inout(out_view);
-                    params_up.add_scalar(is_first);
-                    params_up.add_scalar(is_last);
+                    params_up.add_input(mi, li, oi_new);
+                    params_up.add_inout(mi_update, li_update, oi, out_view);
+                    params_up.add_scalar(is_first, is_last);
                     CYCLE_COUNT_LAP(prof_param_setup);
                     pto2_rt_submit_aiv_task(FUNC_ONLINE_UPDATE, params_up);
 #ifdef ENABLE_PROFILING

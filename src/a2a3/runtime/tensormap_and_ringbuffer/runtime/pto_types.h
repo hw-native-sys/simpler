@@ -144,86 +144,62 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         }
     }
 
-    bool check_add_tensor_valid() {
-        if (scalar_count_ != 0) {
-            set_error(
-                "add_input/add_output/add_inout called after add_scalar: "
-                "all tensors must be added before any scalars"
-            );
-            return false;
-        }
-        if (tensor_count_ >= MAX_TENSOR_ARGS) {
-            set_error("Too many tensor args (exceeds MAX_TENSOR_ARGS=16)");
-            return false;
-        }
-        return true;
-    }
-
-    void add_input(const Tensor &t) {
-        if (!check_add_tensor_valid()) {
+    template <typename... Args>
+    void add_input(Args &&...args) {
+        if (!check_add_tensor_valid<false>(args...)) {
             return;
         }
-        tensors_[tensor_count_].ptr = &t;
-        tags_[tensor_count_] = TensorArgType::INPUT;
-        tensor_count_++;
+        ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::INPUT, tensor_count_++), ...);
     }
 
-    /// Standard future-output path: runtime allocates buffer from heap,
-    /// materializes Tensor into TaskOutputTensors.
-    /// The TensorCreateInfo must outlive the submit call (pointer is stored).
-    void add_output(const TensorCreateInfo &ci) {
-        if (!check_add_tensor_valid()) {
+    /// Batch add outputs — all Tensor or all TensorCreateInfo:
+    ///   add_output(ci1, ci2)         — runtime allocates buffers (OUTPUT)
+    ///   add_output(t1, t2)           — write-only existing tensors (OUTPUT_EXISTING)
+    template <typename... Args>
+    void add_output(Args &&...args) {
+        if (!check_add_tensor_valid<true>(args...)) return;
+        if constexpr ((std::is_same_v<std::decay_t<Args>, TensorCreateInfo> && ...)) {
+            ((tensors_[tensor_count_].create_info = &args, tags_[tensor_count_] = TensorArgType::OUTPUT,
+              tensor_count_++),
+             ...);
+        } else {
+            ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING,
+              tensor_count_++),
+             ...);
+        }
+    }
+
+    template <typename... Args>
+    void add_inout(Args &&...args) {
+        if (!check_add_tensor_valid<false>(args...)) {
             return;
         }
-        tensors_[tensor_count_].create_info = &ci;
-        tags_[tensor_count_] = TensorArgType::OUTPUT;
-        tensor_count_++;
-    }
-
-    /// Prevent passing temporaries — the pointer would dangle before submit.
-    void add_output(TensorCreateInfo &&) = delete;
-
-    void add_inout(const Tensor &t) {
-        if (!check_add_tensor_valid()) {
-            return;
-        }
-        tensors_[tensor_count_].ptr = &t;
-        tags_[tensor_count_] = TensorArgType::INOUT;
-        tensor_count_++;
-    }
-
-    /// Write-only existing tensor: skips OverlapMap lookup, depends on creator.
-    void add_output(const Tensor &t) {
-        if (!check_add_tensor_valid()) return;
-        tensors_[tensor_count_].ptr = &t;
-        tags_[tensor_count_] = TensorArgType::OUTPUT_EXISTING;
-        tensor_count_++;
+        ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::INOUT, tensor_count_++), ...);
     }
 
     /// No-dependency existing tensor: skips OverlapMap lookup, depends on creator only.
-    void add_no_dep(const Tensor &t) {
-        if (!check_add_tensor_valid()) return;
-        tensors_[tensor_count_].ptr = &t;
-        tags_[tensor_count_] = TensorArgType::NO_DEP;
-        tensor_count_++;
+    template <typename... Args>
+    void add_no_dep(Args &&...args) {
+        if (!check_add_tensor_valid<false>(args...)) return;
+        ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
     }
 
     /**
-     * Add a scalar value. Type is deduced from the argument;
-     * the value is bit-cast to uint64_t for storage.
+     * Add scalar values. Types are deduced per argument; each value is
+     * bit-cast to uint64_t for storage. Mixed types are allowed:
      *
-     *   args.add_scalar(uint64_val);      // existing usage unchanged
-     *   args.add_scalar(3.14f);           // float, auto bit-cast
-     *   args.add_scalar(int32_t(42));     // int32, auto bit-cast
+     *   args.add_scalar(uint64_val);                  // single
+     *   args.add_scalar(3.14f, int32_t(42), 7u);     // mixed batch
      */
-    template <typename T = uint64_t>
-    void add_scalar(T value) {
-        static_assert(is_supported_scalar_arg_v<T>, "add_scalar: type must be arithmetic or enum");
-        if (scalar_count_ >= MAX_SCALAR_ARGS) {
+    template <typename... Args>
+    void add_scalar(Args... args) {
+        static_assert(sizeof...(Args) >= 1, "add_scalar: at least one argument required");
+        static_assert((is_supported_scalar_arg_v<Args> && ...), "add_scalar: all types must be arithmetic or enum");
+        if (scalar_count_ + sizeof...(Args) > MAX_SCALAR_ARGS) {
             set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
             return;
         }
-        scalars_[scalar_count_++] = to_u64(value);
+        ((scalars_[scalar_count_++] = to_u64(args)), ...);
     }
 
     void add_scalars(const uint64_t *values, int count) {
@@ -282,6 +258,37 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));
         scalar_count_ += count;
+    }
+
+private:
+    template <bool is_output, typename... Args>
+    bool check_add_tensor_valid(Args &&...) {
+        static_assert(sizeof...(Args) >= 1, "at least one argument required");
+        static_assert(
+            (std::is_lvalue_reference_v<Args> && ...),
+            "temporaries are not allowed — stored pointers would dangle after the call"
+        );
+        if constexpr (is_output) {
+            static_assert(
+                (std::is_same_v<std::decay_t<Args>, Tensor> && ...) ||
+                    (std::is_same_v<std::decay_t<Args>, TensorCreateInfo> && ...),
+                "add_output: all arguments must be the same type (all Tensor or all TensorCreateInfo)"
+            );
+        } else {
+            static_assert((std::is_same_v<std::decay_t<Args>, Tensor> && ...), "all arguments must be Tensor");
+        }
+        if (scalar_count_ != 0) {
+            set_error(
+                "add_input/add_output/add_inout called after add_scalar: "
+                "all tensors must be added before any scalars"
+            );
+            return false;
+        }
+        if (tensor_count_ + sizeof...(Args) > MAX_TENSOR_ARGS) {
+            set_error("Too many tensor args (exceeds MAX_TENSOR_ARGS=16)");
+            return false;
+        }
+        return true;
     }
 };
 
