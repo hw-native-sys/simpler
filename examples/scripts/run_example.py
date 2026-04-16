@@ -171,7 +171,6 @@ Golden.py interface:
     )
 
     parser.add_argument(
-        "-n",
         "--rounds",
         type=int,
         default=None,
@@ -204,6 +203,10 @@ Golden.py interface:
         parser.error("--all and --case are mutually exclusive")
 
     configure_logging(args.log_level)
+
+    if args.rounds is not None and args.rounds > 1 and args.enable_profiling:
+        logger.warning("Profiling disabled: --rounds > 1")
+        args.enable_profiling = False
 
     # Validate paths
     kernels_path = Path(args.kernels)

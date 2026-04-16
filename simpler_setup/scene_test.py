@@ -23,6 +23,7 @@ A scene test class declares three things:
 from __future__ import annotations
 
 import inspect
+import logging
 import os
 import sys
 from contextlib import contextmanager
@@ -30,6 +31,8 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
+
+logger = logging.getLogger(__name__)
 
 _compile_cache: dict[tuple[str, str, str], object] = {}
 
@@ -874,6 +877,9 @@ class SceneTestCase:
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_profiling = request.config.getoption("--enable-profiling", default=False)
         enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
+        if rounds > 1 and enable_profiling:
+            logger.warning("Profiling disabled: --rounds > 1")
+            enable_profiling = False
 
         cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
@@ -946,7 +952,7 @@ class SceneTestCase:
             default="exclude",
             help="Manual case handling: exclude (default), include, only",
         )
-        parser.add_argument("-n", "--rounds", type=int, default=1, help="Run each case N times (default: 1)")
+        parser.add_argument("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
         parser.add_argument("--enable-profiling", action="store_true", help="Enable profiling (first round only)")
         parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
@@ -959,6 +965,10 @@ class SceneTestCase:
         )
         args = parser.parse_args()
         configure_logging(args.log_level)
+
+        if args.rounds > 1 and args.enable_profiling:
+            logger.warning("Profiling disabled: --rounds > 1")
+            args.enable_profiling = False
 
         module = sys.modules[module_name]
         test_classes = [
