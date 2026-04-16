@@ -18,7 +18,7 @@ No NPU device required; SubWorker (fork/shm) is used as the execution backend.
 import struct
 from multiprocessing.shared_memory import SharedMemory
 
-from simpler.worker import Task, Worker
+from simpler.worker import Worker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -65,7 +65,7 @@ class TestTwoWorkersParallel:
                 buf = counters[i].buf
                 assert buf is not None
                 hw = Worker(level=3, num_sub_workers=1)
-                cid = hw.register(lambda b=buf: _inc(b))
+                cid = hw.register(lambda args, b=buf: _inc(b))
                 hw.init()
                 workers.append((hw, cid))
 
@@ -73,12 +73,12 @@ class TestTwoWorkersParallel:
             for hw, cid in workers:
 
                 def make_orch(c):
-                    def orch(o, _args):
+                    def orch(o, args, cfg):
                         o.submit_sub(c)
 
                     return orch
 
-                hw.run(Task(orch=make_orch(cid)))
+                hw.run(make_orch(cid))
 
             # Each counter must be incremented exactly once
             assert _read(counters[0]) == 1
@@ -110,14 +110,14 @@ class TestManyTasksNoLeak:
             hw = Worker(level=3, num_sub_workers=1)
             buf = counter.buf
             assert buf is not None
-            cid = hw.register(lambda: _inc(buf))
+            cid = hw.register(lambda args: _inc(buf))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 for _ in range(n_tasks):
                     o.submit_sub(cid)
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
 
             assert _read(counter) == n_tasks
@@ -136,14 +136,14 @@ class TestManyTasksNoLeak:
             cids = []
             for i in range(n_tasks):
                 buf = counters[i].buf
-                cids.append(hw.register(lambda b=buf: _inc(b)))
+                cids.append(hw.register(lambda args, b=buf: _inc(b)))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 for i in range(n_tasks):
                     o.submit_sub(cids[i])
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
 
             # Every task's dedicated counter must be exactly 1

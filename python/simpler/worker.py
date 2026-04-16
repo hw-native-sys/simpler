@@ -13,20 +13,20 @@ Usage::
     # L2: one NPU chip
     w = Worker(level=2, device_id=8, platform="a2a3", runtime="tensormap_and_ringbuffer")
     w.init()
-    w.run(chip_callable, chip_args, block_dim=24)
+    w.run(chip_callable, chip_args, config)
     w.close()
 
     # L3: multiple chips + SubWorkers, auto-discovery in init()
     w = Worker(level=3, device_ids=[8, 9], num_sub_workers=2,
                platform="a2a3", runtime="tensormap_and_ringbuffer")
-    cid = w.register(lambda: postprocess())
+    cid = w.register(lambda args: postprocess())
     w.init()
 
-    def my_orch(orch, args):
-        r = orch.submit_next_level(chip_callable, chip_args_ptr, config, outputs=[64])
-        orch.submit_sub(cid, inputs=[r.outputs[0].ptr])
+    def my_orch(orch, args, cfg):
+        r = orch.submit_next_level(chip_callable, chip_args_ptr, cfg)
+        orch.submit_sub(cid, sub_args)
 
-    w.run(Task(orch=my_orch, args=my_args))
+    w.run(my_orch, my_args, my_config)
     w.close()
 """
 
@@ -34,43 +34,28 @@ import ctypes
 import os
 import struct
 import sys
-from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Callable, Optional
 
 from .orchestrator import Orchestrator
 from .task_interface import (
     DIST_MAILBOX_SIZE,
+    ChipCallConfig,
     ChipWorker,
+    ContinuousTensor,
+    DataType,
     DistWorker,
+    TaskArgs,
     _ChipWorker,
 )
-
-# ---------------------------------------------------------------------------
-# Task
-# ---------------------------------------------------------------------------
-
-
-@dataclass
-class Task:
-    """Execution unit for Worker.run() at any level.
-
-    For L2: call ``Worker.run(chip_callable, chip_args, config)`` directly.
-    For L3+: provide an orch function ``fn(orchestrator, args)`` that builds
-    the DAG via ``orchestrator.submit_*``.
-    """
-
-    orch: Callable
-    args: Any = field(default=None)
-
 
 # ---------------------------------------------------------------------------
 # Unified mailbox layout (must match dist_worker_manager.h MAILBOX_OFF_*)
 # ---------------------------------------------------------------------------
 #
 # One layout for both NEXT_LEVEL (chip) and SUB workers. SUB children
-# read `callable` as a uint64 encoding the callable_id and ignore the
-# config + args_blob region.
+# read `callable` as a uint64 encoding the callable_id and decode the
+# args_blob region to pass TaskArgs to the registered callable.
 
 _OFF_STATE = 0
 _OFF_ERROR = 4
@@ -93,6 +78,35 @@ def _mailbox_addr(shm: SharedMemory) -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(buf))
 
 
+def _read_args_from_mailbox(buf) -> TaskArgs:
+    """Decode the TaskArgs blob written by C++ write_blob from the mailbox.
+
+    Blob layout at _OFF_ARGS:
+      int32 tensor_count (T), int32 scalar_count (S),
+      ContinuousTensor[T] (40 B each), uint64_t[S] (8 B each).
+    """
+    base = _OFF_ARGS
+    t_count = struct.unpack_from("i", buf, base)[0]
+    s_count = struct.unpack_from("i", buf, base + 4)[0]
+
+    args = TaskArgs()
+    ct_off = base + 8
+    for i in range(t_count):
+        off = ct_off + i * 40
+        data = struct.unpack_from("Q", buf, off)[0]
+        shapes = struct.unpack_from("5I", buf, off + 8)
+        ndims = struct.unpack_from("I", buf, off + 28)[0]
+        dtype_val = struct.unpack_from("B", buf, off + 32)[0]
+        ct = ContinuousTensor.make(data, tuple(shapes[:ndims]), DataType(dtype_val))
+        args.add_tensor(ct)
+
+    sc_off = ct_off + t_count * 40
+    for i in range(s_count):
+        args.add_scalar(struct.unpack_from("Q", buf, sc_off + i * 8)[0])
+
+    return args
+
+
 def _sub_worker_loop(buf, registry: dict) -> None:
     """Runs in forked child process. Reads unified mailbox layout."""
     while True:
@@ -105,7 +119,8 @@ def _sub_worker_loop(buf, registry: dict) -> None:
                 error = 1
             else:
                 try:
-                    fn()
+                    args = _read_args_from_mailbox(buf)
+                    fn(args)
                 except Exception:  # noqa: BLE001
                     error = 2
             struct.pack_into("i", buf, _OFF_ERROR, error)
@@ -351,25 +366,26 @@ class Worker:
     # run — uniform entry point
     # ------------------------------------------------------------------
 
-    def run(self, task_or_callable, args=None, **kwargs) -> None:
-        """Execute one task synchronously.
+    def run(self, callable, args=None, config=None) -> None:
+        """Execute one task (L2) or one DAG (L3+) synchronously.
 
-        L2: run(chip_callable, chip_args, block_dim=N)
-        L3: run(Task(orch=fn, args=...))
+        callable: ChipCallable (L2) or Python orch fn (L3+)
+        args:     TaskArgs (optional)
+        config:   ChipCallConfig (optional, default-constructed if None)
         """
         assert self._initialized, "Worker not initialized; call init() first"
+        cfg = config if config is not None else ChipCallConfig()
 
         if self.level == 2:
             assert self._chip_worker is not None
-            self._chip_worker.run(task_or_callable, args, **kwargs)
+            self._chip_worker.run(callable, args, cfg)
         else:
             self._start_level3()
             assert self._orch is not None
             assert self._dist_worker is not None
-            task = task_or_callable
             self._orch._scope_begin()
             try:
-                task.orch(self._orch, task.args)
+                callable(self._orch, args, cfg)
             finally:
                 # Always release scope refs and drain so ring slots aren't
                 # stranded when the orch fn raises mid-DAG.

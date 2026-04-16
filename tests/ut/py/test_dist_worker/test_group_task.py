@@ -33,7 +33,7 @@ from simpler.task_interface import (
     TaskArgs,
     TensorArgType,
 )
-from simpler.worker import Task, Worker
+from simpler.worker import Worker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -75,17 +75,17 @@ class TestGroupBasic:
 
         hw = Worker(level=3, num_sub_workers=2)
 
-        def inc():
+        def inc(args):
             with counter.get_lock():
                 counter.value += 1
 
         cid = hw.register(inc)
         hw.init()
 
-        def orch(o, _args):
+        def orch(o, args, cfg):
             o.submit_sub_group(cid, [TaskArgs(), TaskArgs()])
 
-        hw.run(Task(orch=orch))
+        hw.run(orch)
         hw.close()
 
         assert counter.value == 2, f"Expected 2, got {counter.value}"
@@ -96,17 +96,17 @@ class TestGroupBasic:
 
         hw = Worker(level=3, num_sub_workers=1)
 
-        def inc():
+        def inc(args):
             with counter.get_lock():
                 counter.value += 1
 
         cid = hw.register(inc)
         hw.init()
 
-        def orch(o, _args):
+        def orch(o, args, cfg):
             o.submit_sub_group(cid, [TaskArgs()])
 
-        hw.run(Task(orch=orch))
+        hw.run(orch)
         hw.close()
 
         assert counter.value == 1
@@ -136,11 +136,11 @@ class TestGroupDependency:
             assert gb is not None and db is not None
 
             hw = Worker(level=3, num_sub_workers=3)
-            group_cid = hw.register(lambda: struct.pack_into("i", gb, 0, 1))
-            dep_cid = hw.register(lambda: struct.pack_into("i", db, 0, 1))
+            group_cid = hw.register(lambda args: struct.pack_into("i", gb, 0, 1))
+            dep_cid = hw.register(lambda args: struct.pack_into("i", db, 0, 1))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 # Group: both members tag the synthetic ptr as OUTPUT — the
                 # second insert overwrites the first with the same slot id.
                 o.submit_sub_group(
@@ -154,7 +154,7 @@ class TestGroupDependency:
                 # a fanin on the group slot.
                 o.submit_sub(dep_cid, _sync_args(_SYNC_PTR, TensorArgType.INPUT))
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
 
             assert _read(group_marker) == 1, "Group task didn't run"

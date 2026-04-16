@@ -77,6 +77,21 @@ get if I pip install `main` today", this page.
   `DIST_MAX_SCOPE_DEPTH = 64`; scopes deeper than the ring depth share
   the innermost ring.
 
+### Uniform `Worker.run(callable, args, config)`
+
+- **`Task` dataclass deleted** — `Worker.run` now takes
+  `(callable, args=None, config=None)` directly. For L3+, `callable` is
+  the orch function; for L2, it is a `ChipCallable`. `config` defaults
+  to `ChipCallConfig()` if omitted.
+- **Orch fn signature is 3-param**: `def orch(o, args, cfg)` — receives
+  the `Orchestrator`, `TaskArgs`, and `ChipCallConfig` passed to
+  `Worker.run`.
+- **Sub callable signature is `fn(args)`** — registered callables now
+  receive the `TaskArgs` decoded from the mailbox blob. The Python child
+  loop (`_sub_worker_loop`) reads the blob at `_OFF_ARGS` and constructs
+  a `TaskArgs` via `_read_args_from_mailbox`. Callable registry stays
+  Python-only (`dict[int, Callable]`).
+
 ### Dispatch internals
 
 - `IWorker::run(uint64_t callable, TaskArgsView args, ChipCallConfig cfg)`
@@ -118,14 +133,6 @@ get if I pip install `main` today", this page.
 - Fold `DistChipProcess` / `DistSubWorker` into `WorkerThread` with
   `Mode = THREAD | PROCESS` (no separate fork-proxy classes). Strict-4
   per-worker-type ready queues already landed in PR-D-1.
-
-### PR-E: uniform `Worker.run` + callable registry unification
-
-- Python `Worker.run` drops the `if level==2` branch.
-- Callable registry moves fully into C++
-  (`unordered_map<uint64_t, nb::object>` owned by `Worker`) so
-  `ChipCallable` and Python `sub` callables share one lookup path.
-  This unblocks L4+ recursion.
 
 ### PR-F: C++ `Worker::run(Task)` for L4+ recursion
 

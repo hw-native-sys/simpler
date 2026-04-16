@@ -24,7 +24,7 @@ from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 KERNELS_BASE = "../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 
 
-def verify():
+def verify(args):
     """SubCallable — runs after group completes."""
 
 

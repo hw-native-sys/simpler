@@ -156,15 +156,20 @@ void WorkerThread::dispatch_thread(WorkerDispatch d) {
   `IWorker` casts back appropriately.
 - `IWorker::run` dispatches polymorphically based on the actual worker type.
 
+Note: SUB workers in PROCESS mode bypass `IWorker` entirely — the Python
+child loop (``_sub_worker_loop``) reads the args blob from the mailbox,
+decodes it into a ``TaskArgs``, and calls the registered callable as
+``fn(args)``. The C++ dispatch path writes the same mailbox format for
+both worker types.
+
 **When is THREAD mode safe?**
 
 - The IWorker implementation must be thread-safe relative to other concurrent
   calls and other system state
 - `ChipWorker` (dlsym'd runtime.so) is safe when the runtime `.so` and its
   device driver support concurrent use
-- `SubWorker` in THREAD mode is constrained by Python's GIL (all SubWorkers
-  in the pool effectively serialize), but this is often fine for light
-  Python callables
+- SUB workers run in Python child processes (PROCESS mode) where the
+  callable receives ``TaskArgs`` as its sole argument
 
 ---
 

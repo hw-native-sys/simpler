@@ -815,8 +815,6 @@ class SceneTestCase:
         enable_profiling=False,
         enable_dump_tensor=False,
     ):
-        from simpler.worker import Task  # noqa: PLC0415
-
         params = case.get("params", {})
         config_dict = case.get("config", {})
 
@@ -854,12 +852,13 @@ class SceneTestCase:
                 enable_dump_tensor=enable_dump_tensor,
             )
 
-            # Wrap in Task — user orch signature: (orch, callables, task_args, config)
-            def task_orch(orch, _unused, _ns=ns, _test_args=test_args, _config=config):
+            # Orch fn signature: (orch, args, cfg) — inner fn forwards to
+            # the user's scene orch which takes (orch, callables, task_args, config).
+            def task_orch(orch, _args, _cfg, _ns=ns, _test_args=test_args, _config=config):
                 orch_fn(orch, _ns, _test_args, _config)
 
             with _temporary_env(self._resolve_env()):
-                worker.run(Task(orch=task_orch))
+                worker.run(task_orch)
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)

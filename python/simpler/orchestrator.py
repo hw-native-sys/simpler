@@ -12,18 +12,18 @@ A thin Python facade over the C++ ``DistOrchestrator``. The Worker creates one
 Orchestrator handle at init, retrieves the C++ object via ``DistWorker.get_orchestrator()``,
 and passes the handle to the user's orch function::
 
-    def my_orch(orch, args):
+    def my_orch(orch, args, cfg):
         # build the args object yourself; tags drive dependency inference
         a = TaskArgs()
         a.add_tensor(make_tensor_arg(input_tensor),  TensorArgType.INPUT)
         a.add_tensor(make_tensor_arg(output_tensor), TensorArgType.OUTPUT)
-        orch.submit_next_level(chip_callable, a, config)
+        orch.submit_next_level(chip_callable, a, cfg)
 
         sub_args = TaskArgs()
         sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
         orch.submit_sub(cid, sub_args)
 
-    w.run(Task(orch=my_orch, args=my_args))
+    w.run(my_orch, my_args, my_config)
 
 Scope/drain lifecycle is managed by ``Worker.run()``; users never call those
 directly.

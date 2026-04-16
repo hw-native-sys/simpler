@@ -24,7 +24,7 @@ from simpler_setup.scene_test import _build_l3_task_args
 KERNELS_BASE = "../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 
 
-def verify():
+def verify(args):
     """SubCallable — dependency target, runs after ChipTask completes."""
 
 

@@ -108,12 +108,17 @@ See [scheduler.md](scheduler.md) for the dispatch loop and coordination.
 The **execution layer**. `WorkerManager` holds two pools of `WorkerThread`s
 (next-level pool and sub pool). Each `WorkerThread`:
 
-- owns one `IWorker` (`ChipWorker`, `SubWorker`, or nested `Worker`)
+- owns one `IWorker` (`ChipWorker` or nested `Worker`) for next-level workers
 - has its own `std::thread`
 - runs in one of two modes:
   - `THREAD`: calls `worker->run(callable, view, config)` directly in-process
   - `PROCESS`: forks a child at init; each dispatch writes task data to a shm
     mailbox, the child decodes and runs
+
+SUB workers are Python-only: the forked child process runs a Python loop
+(``_sub_worker_loop``) that reads the args blob from the mailbox, decodes it
+into a ``TaskArgs``, and calls the registered callable as ``fn(args)``.
+There is no C++ ``SubWorker`` class.
 
 See [worker-manager.md](worker-manager.md) for thread/process mechanics, fork
 ordering, and mailbox layout. See [task-flow.md](task-flow.md) for what flows
@@ -177,7 +182,7 @@ w4 = Worker(level=4, child_mode=WorkerManager.Mode.THREAD)
 w4.add_worker(NEXT_LEVEL, w3)         # w3 is an IWorker
 w4.init()
 
-w4.run(Task(orch=my_l4_orch, task_args=..., config=...))
+w4.run(my_l4_orch, my_args, my_config)
 ```
 
 When L4's `WorkerThread` dispatches to L3, L3's `Worker::run` opens its own

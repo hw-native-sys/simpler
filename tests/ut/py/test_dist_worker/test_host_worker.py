@@ -17,7 +17,7 @@ from multiprocessing.shared_memory import SharedMemory
 
 import pytest
 from simpler.task_interface import DataType, TaskArgs, TensorArgType
-from simpler.worker import Task, Worker
+from simpler.worker import Worker
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,14 +60,14 @@ class TestLifecycle:
 
     def test_context_manager(self):
         with Worker(level=3, num_sub_workers=1) as hw:
-            hw.register(lambda: None)
+            hw.register(lambda args: None)
         # close() called by __exit__, no exception
 
     def test_register_after_init_raises(self):
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
         with pytest.raises(RuntimeError, match="before init"):
-            hw.register(lambda: None)
+            hw.register(lambda args: None)
         hw.close()
 
 
@@ -82,13 +82,13 @@ class TestSingleSubTask:
 
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.register(lambda: _increment_counter(counter_buf))
+            cid = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 o.submit_sub(cid)
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
 
             assert _read_counter(counter_buf) == 1
@@ -101,14 +101,14 @@ class TestSingleSubTask:
 
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.register(lambda: _increment_counter(counter_buf))
+            cid = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 for _ in range(3):
                     o.submit_sub(cid)
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
 
             assert _read_counter(counter_buf) == 3
@@ -143,16 +143,16 @@ class TestSubmitResult:
         counter_shm, counter_buf = _make_shared_counter()
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.register(lambda: _increment_counter(counter_buf))
+            cid = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
             captured = []
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 result = o.submit_sub(cid)
                 captured.append(result)
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
 
             assert len(captured) == 1
@@ -178,13 +178,13 @@ class TestScope:
 
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.register(lambda: _increment_counter(counter_buf))
+            cid = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 o.submit_sub(cid)
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
 
             assert _read_counter(counter_buf) == 1
@@ -199,16 +199,16 @@ class TestScope:
             # Use one sub worker so the increments serialize — _increment_counter
             # is a non-atomic RMW and races across parallel SubWorker processes.
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.register(lambda: _increment_counter(counter_buf))
+            cid = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 with o.scope():
                     o.submit_sub(cid)
                     o.submit_sub(cid)
                 o.submit_sub(cid)  # back on outer-scope ring
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
 
             assert _read_counter(counter_buf) == 3
@@ -225,10 +225,10 @@ class TestScope:
         assert hasattr(DistOrchestrator, "scope_end")
 
         hw = Worker(level=3, num_sub_workers=1)
-        hw.register(lambda: None)
+        hw.register(lambda args: None)
         hw.init()
 
-        def orch(o, _args):
+        def orch(o, args, cfg):
             # Raw calls — match L2's pto2_scope_begin / pto2_scope_end.
             o.scope_begin()
             o.scope_end()
@@ -240,7 +240,7 @@ class TestScope:
                 inner = o.alloc((32,), DataType.FLOAT32)
                 assert inner.data != 0
 
-        hw.run(Task(orch=orch))
+        hw.run(orch)
         hw.close()
 
     def test_user_nested_scope_three_deep(self):
@@ -248,10 +248,10 @@ class TestScope:
         counter_shm, counter_buf = _make_shared_counter()
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.register(lambda: _increment_counter(counter_buf))
+            cid = hw.register(lambda args: _increment_counter(counter_buf))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 o.submit_sub(cid)  # outer scope (ring 0)
                 with o.scope():
                     o.submit_sub(cid)  # ring 1
@@ -262,7 +262,7 @@ class TestScope:
                             with o.scope():
                                 o.submit_sub(cid)  # clamps to ring 3
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
             assert _read_counter(counter_buf) == 5
         finally:
@@ -281,10 +281,10 @@ class TestOrchAlloc:
         captured = []
 
         hw = Worker(level=3, num_sub_workers=1)
-        cid = hw.register(lambda: None)  # sub callable doesn't actually read
+        cid = hw.register(lambda args: None)  # sub callable doesn't actually read
         hw.init()
 
-        def orch(o, _args):
+        def orch(o, args, cfg):
             inter = o.alloc((64,), DataType.FLOAT32)
             captured.append((inter.data, inter.ndims, inter.shapes[0]))
 
@@ -294,7 +294,7 @@ class TestOrchAlloc:
             sub_args.add_tensor(inter, TensorArgType.INPUT)
             o.submit_sub(cid, sub_args)
 
-        hw.run(Task(orch=orch))
+        hw.run(orch)
         hw.close()
 
         assert len(captured) == 1
@@ -309,11 +309,11 @@ class TestOrchAlloc:
 
         try:
             hw = Worker(level=3, num_sub_workers=2)
-            producer_cid = hw.register(lambda: _increment_counter(marker_buf))
-            consumer_cid = hw.register(lambda: _increment_counter(marker_buf))
+            producer_cid = hw.register(lambda args: _increment_counter(marker_buf))
+            consumer_cid = hw.register(lambda args: _increment_counter(marker_buf))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 inter = o.alloc((128,), DataType.FLOAT32)
 
                 # Producer writes into the alloc'd slab and must depend on
@@ -332,7 +332,7 @@ class TestOrchAlloc:
                 c_args.add_tensor(inter, TensorArgType.INPUT)
                 o.submit_sub(consumer_cid, c_args)
 
-            hw.run(Task(orch=orch))
+            hw.run(orch)
             hw.close()
 
             # Both ran (we don't assert order strictly — relies on dep enforcement
@@ -348,13 +348,13 @@ class TestOrchAlloc:
         hw = Worker(level=3, num_sub_workers=0)
         hw.init()
 
-        def orch(o, _args):
+        def orch(o, args, cfg):
             o.alloc((16,), DataType.UINT8)
             o.alloc((32,), DataType.FLOAT32)
             # No submits using these — synthetic slots' fanout_total = 1 (scope only)
             # scope_end's release_ref alone hits the threshold (sim self + scope = 2 = total + 1).
 
-        hw.run(Task(orch=orch))
+        hw.run(orch)
         hw.close()
         # If munmap leaks or the slot doesn't reach CONSUMED, drain hangs above.
 
@@ -364,20 +364,112 @@ class TestOrchAlloc:
 
         try:
             hw = Worker(level=3, num_sub_workers=1)
-            cid = hw.register(lambda: _increment_counter(marker_buf))
+            cid = hw.register(lambda args: _increment_counter(marker_buf))
             hw.init()
 
-            def orch(o, _args):
+            def orch(o, args, cfg):
                 inter = o.alloc((64,), DataType.FLOAT32)
                 args = TaskArgs()
                 args.add_tensor(inter, TensorArgType.INPUT)
                 o.submit_sub(cid, args)
 
             for _ in range(8):
-                hw.run(Task(orch=orch))
+                hw.run(orch)
 
             hw.close()
             assert _read_counter(marker_buf) == 8
         finally:
             marker_shm.close()
             marker_shm.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Test: sub callable receives args blob correctly
+# ---------------------------------------------------------------------------
+
+
+class TestSubCallableArgs:
+    def test_sub_callable_receives_tensor_metadata(self):
+        """Sub callable receives TaskArgs with correct tensor count and shape."""
+        from simpler.task_interface import ContinuousTensor  # noqa: PLC0415
+
+        result_shm, result_buf = _make_shared_counter()
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+
+            def check_args(args):
+                # Verify args decoded correctly: 1 tensor, shape (4,), FLOAT32
+                if args.tensor_count() == 1 and args.scalar_count() == 0:
+                    t = args.tensor(0)
+                    if t.ndims == 1 and t.shapes[0] == 4:
+                        _increment_counter(result_buf)
+
+            cid = hw.register(check_args)
+            hw.init()
+
+            # Use a synthetic non-zero pointer — sub callable only checks metadata,
+            # doesn't dereference the pointer.
+            ct = ContinuousTensor.make(0xCAFE0000, (4,), DataType.FLOAT32)
+
+            def orch(o, args, cfg):
+                sub_args = TaskArgs()
+                sub_args.add_tensor(ct, TensorArgType.INPUT)
+                o.submit_sub(cid, sub_args)
+
+            hw.run(orch)
+            hw.close()
+
+            assert _read_counter(result_buf) == 1, "Sub callable did not receive correct args"
+        finally:
+            result_shm.close()
+            result_shm.unlink()
+
+    def test_sub_callable_receives_scalar(self):
+        """Sub callable receives TaskArgs with a scalar value."""
+        result_shm, result_buf = _make_shared_counter()
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+
+            def check_scalar(args):
+                if args.scalar_count() == 1 and args.scalar(0) == 42:
+                    _increment_counter(result_buf)
+
+            cid = hw.register(check_scalar)
+            hw.init()
+
+            def orch(o, args, cfg):
+                sub_args = TaskArgs()
+                sub_args.add_scalar(42)
+                o.submit_sub(cid, sub_args)
+
+            hw.run(orch)
+            hw.close()
+
+            assert _read_counter(result_buf) == 1, "Sub callable did not receive correct scalar"
+        finally:
+            result_shm.close()
+            result_shm.unlink()
+
+    def test_sub_callable_empty_args(self):
+        """Sub callable receives empty TaskArgs when no args submitted."""
+        result_shm, result_buf = _make_shared_counter()
+        try:
+            hw = Worker(level=3, num_sub_workers=1)
+
+            def check_empty(args):
+                if args.tensor_count() == 0 and args.scalar_count() == 0:
+                    _increment_counter(result_buf)
+
+            cid = hw.register(check_empty)
+            hw.init()
+
+            def orch(o, args, cfg):
+                o.submit_sub(cid)
+
+            hw.run(orch)
+            hw.close()
+
+            assert _read_counter(result_buf) == 1, "Sub callable did not receive empty args"
+        finally:
+            result_shm.close()
+            result_shm.unlink()
