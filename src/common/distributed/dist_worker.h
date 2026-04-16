@@ -94,7 +94,11 @@ private:
     DistTensorMap tensormap_;
     DistRing allocator_;
     DistScope scope_;
-    DistReadyQueue ready_queue_;
+    // Strict-4: one ready queue per WorkerType. Submit routes by
+    // s.worker_type; the Scheduler drains each queue independently so
+    // saturation of one pool cannot head-of-line-block the other.
+    DistReadyQueue ready_next_level_queue_;
+    DistReadyQueue ready_sub_queue_;
     DistOrchestrator orchestrator_;
     DistScheduler scheduler_;
     DistWorkerManager manager_;

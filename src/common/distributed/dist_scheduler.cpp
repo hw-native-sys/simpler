@@ -26,7 +26,8 @@
 // =============================================================================
 
 void DistScheduler::start(const Config &cfg) {
-    if (cfg.ring == nullptr || cfg.ready_queue == nullptr || cfg.manager == nullptr)
+    if (cfg.ring == nullptr || cfg.ready_next_level_queue == nullptr || cfg.ready_sub_queue == nullptr ||
+        cfg.manager == nullptr)
         throw std::invalid_argument("DistScheduler::start: null config fields");
     cfg_ = cfg;
 
@@ -38,7 +39,9 @@ void DistScheduler::start(const Config &cfg) {
 void DistScheduler::stop() {
     stop_requested_.store(true, std::memory_order_release);
     completion_cv_.notify_all();
-    cfg_.ready_queue->shutdown();
+    // Shut down both per-type ready queues so any wait_pop waiters unblock.
+    cfg_.ready_next_level_queue->shutdown();
+    cfg_.ready_sub_queue->shutdown();
 
     if (sched_thread_.joinable()) sched_thread_.join();
 
@@ -135,7 +138,11 @@ void DistScheduler::on_task_complete(DistTaskSlot slot) {
         if (released >= cs.fanin_count) {
             TaskState expected = TaskState::PENDING;
             if (cs.state.compare_exchange_strong(expected, TaskState::READY, std::memory_order_acq_rel)) {
-                cfg_.ready_queue->push(consumer);
+                // Strict-4: route the freshly-ready consumer to the queue
+                // matching its own worker type.
+                auto *q =
+                    (cs.worker_type == WorkerType::NEXT_LEVEL) ? cfg_.ready_next_level_queue : cfg_.ready_sub_queue;
+                q->push(consumer);
                 completion_cv_.notify_one();
             }
         }
@@ -174,23 +181,31 @@ void DistScheduler::try_consume(DistTaskSlot slot) {
 // =============================================================================
 
 void DistScheduler::dispatch_ready() {
-    DistTaskSlot slot;
-    while (cfg_.ready_queue->try_pop(slot)) {
-        DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
-        int N = s.group_size();  // 1 for normal tasks
+    // Strict-4: drain each per-type queue with its OWN head-of-line break.
+    // A saturated pool of one type only stalls its own queue; the other
+    // type continues to dispatch from its pool of idle workers.
+    auto drain_one = [this](DistReadyQueue *q) {
+        DistTaskSlot slot;
+        while (q->try_pop(slot)) {
+            DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
+            int N = s.group_size();  // 1 for normal tasks
 
-        auto workers = cfg_.manager->pick_n_idle(s.worker_type, N);
-        if (static_cast<int>(workers.size()) < N) {
-            cfg_.ready_queue->push(slot);
-            break;
-        }
+            auto workers = cfg_.manager->pick_n_idle(s.worker_type, N);
+            if (static_cast<int>(workers.size()) < N) {
+                q->push(slot);
+                break;
+            }
 
-        s.state.store(TaskState::RUNNING, std::memory_order_release);
-        for (int i = 0; i < N; i++) {
-            WorkerDispatch d;
-            d.task_slot = slot;
-            d.group_index = i;
-            workers[i]->dispatch(d);
+            s.state.store(TaskState::RUNNING, std::memory_order_release);
+            for (int i = 0; i < N; i++) {
+                WorkerDispatch d;
+                d.task_slot = slot;
+                d.group_index = i;
+                workers[i]->dispatch(d);
+            }
         }
-    }
+    };
+
+    drain_one(cfg_.ready_next_level_queue);
+    drain_one(cfg_.ready_sub_queue);
 }

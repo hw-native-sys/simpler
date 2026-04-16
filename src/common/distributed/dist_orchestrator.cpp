@@ -16,12 +16,14 @@
 #include <stdexcept>
 
 void DistOrchestrator::init(
-    DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_queue
+    DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_next_level_queue,
+    DistReadyQueue *ready_sub_queue
 ) {
     tensormap_ = tensormap;
     allocator_ = allocator;
     scope_ = scope;
-    ready_queue_ = ready_queue;
+    ready_next_level_queue_ = ready_next_level_queue;
+    ready_sub_queue_ = ready_sub_queue;
     active_tasks_.store(0, std::memory_order_relaxed);
 }
 
@@ -218,9 +220,11 @@ DistSubmitResult DistOrchestrator::submit_impl(
     if (scope_ref > 0) scope_->register_task(slot);
 
     // --- Step 6: If no live fanins → READY ---
+    // Strict-4: push to the queue dedicated to this task's worker type so a
+    // saturated sub pool cannot stall next-level dispatch (and vice versa).
     if (live_fanins == 0) {
         s.state.store(TaskState::READY, std::memory_order_release);
-        ready_queue_->push(slot);
+        ready_queue_for(worker_type)->push(slot);
     } else {
         s.state.store(TaskState::PENDING, std::memory_order_release);
     }

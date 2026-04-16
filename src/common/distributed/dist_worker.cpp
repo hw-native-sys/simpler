@@ -128,7 +128,7 @@ void DistWorker::add_worker(WorkerType type, IWorker *worker) {
 void DistWorker::init() {
     if (initialized_) throw std::runtime_error("DistWorker: already initialized");
 
-    orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_queue_);
+    orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_);
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
@@ -138,7 +138,8 @@ void DistWorker::init() {
 
     DistScheduler::Config cfg;
     cfg.ring = &allocator_;
-    cfg.ready_queue = &ready_queue_;
+    cfg.ready_next_level_queue = &ready_next_level_queue_;
+    cfg.ready_sub_queue = &ready_sub_queue_;
     cfg.manager = &manager_;
     cfg.on_consumed_cb = [this](DistTaskSlot slot) {
         orchestrator_.on_consumed(slot);

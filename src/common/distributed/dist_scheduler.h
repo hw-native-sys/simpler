@@ -53,7 +53,11 @@ class DistScheduler {
 public:
     struct Config {
         DistRing *ring;  // owns slot state storage; Scheduler reads via ring->slot_state(id)
-        DistReadyQueue *ready_queue;
+        // Strict-4 per-worker-type ready queues. `dispatch_ready` walks each
+        // queue independently so a saturated pool of one worker type cannot
+        // head-of-line-block dispatch for the other.
+        DistReadyQueue *ready_next_level_queue;
+        DistReadyQueue *ready_sub_queue;
         DistWorkerManager *manager;  // not owned — Scheduler calls manager for dispatch
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).
         std::function<void(DistTaskSlot)> on_consumed_cb;

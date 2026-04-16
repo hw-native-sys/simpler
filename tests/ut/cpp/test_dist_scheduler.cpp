@@ -106,7 +106,9 @@ struct SchedulerFixture : public ::testing::Test {
     DistTensorMap tm;
     DistRing allocator;
     DistScope scope;
-    DistReadyQueue rq;
+    // Strict-4: per-type ready queues.
+    DistReadyQueue rq_next_level;
+    DistReadyQueue rq_sub;
     DistOrchestrator orch;
     MockWorker mock_worker;
     DistWorkerManager manager;
@@ -120,7 +122,7 @@ struct SchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
 
         manager.add_next_level(&mock_worker);
         manager.start(&allocator, [this](DistTaskSlot slot) {
@@ -129,7 +131,8 @@ struct SchedulerFixture : public ::testing::Test {
 
         DistScheduler::Config c;
         c.ring = &allocator;
-        c.ready_queue = &rq;
+        c.ready_next_level_queue = &rq_next_level;
+        c.ready_sub_queue = &rq_sub;
         c.manager = &manager;
         c.on_consumed_cb = [this](DistTaskSlot s) {
             orch.on_consumed(s);
@@ -209,7 +212,9 @@ struct GroupSchedulerFixture : public ::testing::Test {
     DistTensorMap tm;
     DistRing allocator;
     DistScope scope;
-    DistReadyQueue rq;
+    // Strict-4: per-type ready queues.
+    DistReadyQueue rq_next_level;
+    DistReadyQueue rq_sub;
     DistOrchestrator orch;
     MockWorker worker_a;
     MockWorker worker_b;
@@ -224,7 +229,7 @@ struct GroupSchedulerFixture : public ::testing::Test {
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
 
         manager.add_next_level(&worker_a);
         manager.add_next_level(&worker_b);
@@ -234,7 +239,8 @@ struct GroupSchedulerFixture : public ::testing::Test {
 
         DistScheduler::Config c;
         c.ring = &allocator;
-        c.ready_queue = &rq;
+        c.ready_next_level_queue = &rq_next_level;
+        c.ready_sub_queue = &rq_sub;
         c.manager = &manager;
         c.on_consumed_cb = [this](DistTaskSlot s) {
             orch.on_consumed(s);
@@ -305,6 +311,107 @@ TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
 
     worker_b.complete();
     wait_consumed(slot);
+}
+
+// ===========================================================================
+// Strict-4: per-worker-type ready queues (no head-of-line blocking across
+// types). Covered here with one NEXT_LEVEL worker + one SUB worker: with a
+// saturated NEXT_LEVEL pool, a SUB task submitted afterwards must still
+// dispatch immediately instead of waiting behind the stuck next-level task.
+// ===========================================================================
+
+struct MixedTypeSchedulerFixture : public ::testing::Test {
+    DistTensorMap tm;
+    DistRing allocator;
+    DistScope scope;
+    DistReadyQueue rq_next_level;
+    DistReadyQueue rq_sub;
+    DistOrchestrator orch;
+    MockWorker next_level_worker;
+    MockWorker sub_worker;
+    DistWorkerManager manager;
+    DistScheduler sched;
+    ChipCallConfig cfg;
+
+    std::vector<DistTaskSlot> consumed_slots;
+    std::mutex consumed_mu;
+
+    DistTaskSlotState &S(DistTaskSlot id) { return *allocator.slot_state(id); }
+
+    void SetUp() override {
+        allocator.init(/*heap_bytes=*/1ULL << 20);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
+
+        manager.add_next_level(&next_level_worker);
+        manager.add_sub(&sub_worker);
+        manager.start(&allocator, [this](DistTaskSlot slot) {
+            sched.worker_done(slot);
+        });
+
+        DistScheduler::Config c;
+        c.ring = &allocator;
+        c.ready_next_level_queue = &rq_next_level;
+        c.ready_sub_queue = &rq_sub;
+        c.manager = &manager;
+        c.on_consumed_cb = [this](DistTaskSlot s) {
+            orch.on_consumed(s);
+            std::lock_guard<std::mutex> lk(consumed_mu);
+            consumed_slots.push_back(s);
+        };
+        sched.start(c);
+    }
+
+    void TearDown() override {
+        sched.stop();
+        manager.stop();
+        allocator.shutdown();
+    }
+
+    bool is_consumed(DistTaskSlot slot) {
+        std::lock_guard<std::mutex> lk(consumed_mu);
+        for (DistTaskSlot s : consumed_slots)
+            if (s == slot) return true;
+        return false;
+    }
+
+    void wait_consumed(DistTaskSlot slot, int timeout_ms = 500) {
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (is_consumed(slot)) return;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        FAIL() << "Timed out waiting for slot " << slot << " to be consumed";
+    }
+};
+
+TEST_F(MixedTypeSchedulerFixture, SubTaskDispatchesWhileNextLevelPoolSaturated) {
+    // Submit a next-level task; the only chip worker begins running it and
+    // stays blocked until we call complete() on it.
+    auto chip_args = single_tensor_args(0xAAA, TensorArgType::OUTPUT);
+    auto chip = orch.submit_next_level(0xCDCD, chip_args, cfg);
+    next_level_worker.wait_running();
+    ASSERT_TRUE(next_level_worker.is_running.load());
+
+    // Now submit a sub task while the chip pool is saturated. With a single
+    // shared ready queue this would block behind any next-level task sitting
+    // at the queue head waiting for a free chip worker. With per-type
+    // queues (Strict-4) it must dispatch immediately to the idle sub
+    // worker.
+    auto sub_args = single_tensor_args(0xBBB, TensorArgType::OUTPUT);
+    auto sub = orch.submit_sub(/*callable_id=*/7, sub_args);
+
+    sub_worker.wait_running();
+    EXPECT_TRUE(sub_worker.is_running.load());
+    EXPECT_TRUE(next_level_worker.is_running.load()) << "chip worker must still be busy";
+
+    // Complete the sub task first; it reaches CONSUMED while the chip task
+    // is still running — demonstrating independent per-type dispatch.
+    sub_worker.complete();
+    wait_consumed(sub.task_slot);
+    EXPECT_FALSE(is_consumed(chip.task_slot));
+
+    next_level_worker.complete();
+    wait_consumed(chip.task_slot);
 }
 
 TEST_F(GroupSchedulerFixture, GroupDependencyChain) {

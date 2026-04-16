@@ -29,13 +29,21 @@ struct OrchestratorFixture : public ::testing::Test {
     DistTensorMap tm;
     DistRing allocator;
     DistScope scope;
-    DistReadyQueue rq;
+    // Strict-4: per-type ready queues.
+    DistReadyQueue rq_next_level;
+    DistReadyQueue rq_sub;
     DistOrchestrator orch;
     ChipCallConfig cfg;
 
+    // Tests in this file only submit NEXT_LEVEL tasks, so `rq` is a
+    // convenience alias for the next-level queue. Kept public so existing
+    // `rq.try_pop(...)` / `EXPECT_TRUE(rq.try_pop(...))` lines continue to
+    // work without rewriting every assertion.
+    DistReadyQueue &rq = rq_next_level;
+
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
-        orch.init(&tm, &allocator, &scope, &rq);
+        orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
     }
 
     void TearDown() override { allocator.shutdown(); }

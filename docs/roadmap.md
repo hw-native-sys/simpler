@@ -88,8 +88,11 @@ get if I pip install `main` today", this page.
   the L2 ABI `ChipStorageTaskArgs` POD from the view right before
   `pto2_run_runtime` — the slot itself stores only the tagged
   `TaskArgs` (single) or `task_args_list` (group).
-- `Scheduler` dispatches slot ids via a single ready queue into
-  `WorkerManager` pools (next-level + sub); for group slots it pushes
+- `Scheduler` dispatches slot ids via **per-worker-type ready queues**
+  (Strict-4; one `DistReadyQueue` for `NEXT_LEVEL`, one for `SUB`) into
+  `WorkerManager` pools (next-level + sub). `dispatch_ready` drains each
+  queue with its own head-of-line break, so a saturated pool of one
+  type cannot stall dispatch for the other. For group slots it pushes
   a `WorkerDispatch { slot, group_index }` per member onto N idle
   threads.
 - `DistChipProcess` / `DistSubWorker` are separate classes today;
@@ -110,11 +113,11 @@ get if I pip install `main` today", this page.
 
 ## In flight / not yet landed
 
-### PR-D: WorkerThread unification + per-shape ready queues
+### PR-D-2: WorkerThread unification (PROCESS mode)
 
 - Fold `DistChipProcess` / `DistSubWorker` into `WorkerThread` with
-  `Mode = THREAD | PROCESS`.
-- Strict-4: 3 ready queues (AIC / AIV / MIX) instead of a single queue.
+  `Mode = THREAD | PROCESS` (no separate fork-proxy classes). Strict-4
+  per-worker-type ready queues already landed in PR-D-1.
 
 ### PR-E: uniform `Worker.run` + callable registry unification
 

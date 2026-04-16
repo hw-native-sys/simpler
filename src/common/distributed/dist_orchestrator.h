@@ -64,7 +64,14 @@ struct DistSubmitResult {
 
 class DistOrchestrator {
 public:
-    void init(DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_queue);
+    // Strict-4: the engine keeps one DistReadyQueue per WorkerType so a
+    // saturated sub pool cannot head-of-line-block chip dispatch (and vice
+    // versa). Submit routes to the queue matching the task's worker_type;
+    // the Scheduler's dispatch_ready walks each queue independently.
+    void init(
+        DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_next_level_queue,
+        DistReadyQueue *ready_sub_queue
+    );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
     // visible to forked child workers). Returns a ContinuousTensor whose
@@ -122,7 +129,18 @@ private:
     DistTensorMap *tensormap_ = nullptr;
     DistRing *allocator_ = nullptr;
     DistScope *scope_ = nullptr;
-    DistReadyQueue *ready_queue_ = nullptr;
+    // Strict-4 per-worker-type ready queues. Each queue handles tasks of
+    // exactly one WorkerType so the Scheduler can dispatch from an idle pool
+    // without being blocked by another pool's saturation.
+    DistReadyQueue *ready_next_level_queue_ = nullptr;
+    DistReadyQueue *ready_sub_queue_ = nullptr;
+
+    // Returns the ready queue that owns tasks of the given worker type.
+    // The method itself does not mutate the Orchestrator (hence `const`);
+    // the returned pointer is non-const because callers push into the queue.
+    DistReadyQueue *ready_queue_for(WorkerType t) const {
+        return t == WorkerType::NEXT_LEVEL ? ready_next_level_queue_ : ready_sub_queue_;
+    }
 
     // --- Drain support (owned here, not on Worker) ---
     std::atomic<int32_t> active_tasks_{0};
