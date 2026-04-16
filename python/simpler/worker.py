@@ -28,6 +28,22 @@ Usage::
 
     w.run(my_orch, my_args, my_config)
     w.close()
+
+    # L4: recursive composition — L3 Workers as children
+    l3 = Worker(level=3, device_ids=[8, 9], num_sub_workers=1,
+                platform="a2a3", runtime="tensormap_and_ringbuffer")
+    w4 = Worker(level=4, num_sub_workers=1)
+    l3_cid = w4.register(my_l3_orch)
+    verify_cid = w4.register(lambda: verify())
+    w4.add_worker(l3)
+    w4.init()
+
+    def my_l4_orch(orch, args, config):
+        orch.submit_next_level(l3_cid, chip_args, config)
+        orch.submit_sub(verify_cid)
+
+    w4.run(Task(orch=my_l4_orch))
+    w4.close()
 """
 
 import ctypes
@@ -178,6 +194,50 @@ def _chip_process_loop(
             break
 
 
+def _read_config_from_mailbox(buf: memoryview) -> "ChipCallConfig":
+    """Reconstruct a ChipCallConfig from the unified mailbox layout."""
+    cfg = ChipCallConfig()
+    cfg.block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
+    cfg.aicpu_thread_num = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
+    cfg.enable_profiling = bool(struct.unpack_from("i", buf, _OFF_ENABLE_PROFILING)[0])
+    cfg.enable_dump_tensor = bool(struct.unpack_from("i", buf, _OFF_ENABLE_DUMP_TENSOR)[0])
+    return cfg
+
+
+def _child_worker_loop(
+    buf: memoryview,
+    registry: dict,
+    inner_worker: "Worker",
+) -> None:
+    """Runs in forked child process. Any-level Worker as child of its parent.
+
+    Polls the unified mailbox for (cid, config, args_blob). Looks up the
+    orch function in the COW-inherited registry, then delegates to
+    ``inner_worker.run(orch_fn, args, cfg)`` which opens its own scope,
+    runs the orch function, and drains.
+    """
+    while True:
+        state = struct.unpack_from("i", buf, _OFF_STATE)[0]
+        if state == _TASK_READY:
+            cid = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+            orch_fn = registry.get(int(cid))
+            error = 0
+            if orch_fn is None:
+                error = 1
+            else:
+                try:
+                    args = _read_args_from_mailbox(buf)
+                    cfg = _read_config_from_mailbox(buf)
+                    inner_worker.run(orch_fn, args, cfg)
+                except Exception:  # noqa: BLE001
+                    error = 2
+            struct.pack_into("i", buf, _OFF_ERROR, error)
+            struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
+        elif state == _SHUTDOWN:
+            inner_worker.close()
+            break
+
+
 # ---------------------------------------------------------------------------
 # Worker factory
 # ---------------------------------------------------------------------------
@@ -187,8 +247,11 @@ class Worker:
     """Unified worker for all hierarchy levels.
 
     level=2: wraps ChipWorker (one NPU device).
-    level=3: wraps DistWorker(3) with ChipWorker×N + SubWorker×M,
+    level=3: wraps DistWorker with ChipWorker×N + SubWorker×M,
              auto-created in init() from device_ids and num_sub_workers.
+    level=4+: wraps DistWorker with Worker(level-1)×N as NEXT_LEVEL
+              children + SubWorker×M. Children are added via add_worker()
+              before init().
     """
 
     def __init__(self, level: int, **config) -> None:
@@ -200,7 +263,7 @@ class Worker:
         # Level-2 internals
         self._chip_worker: Optional[ChipWorker] = None
 
-        # Level-3 internals
+        # Level-3+ internals
         self._dist_worker: Optional[DistWorker] = None
         self._orch: Optional[Orchestrator] = None
         self._chip_shms: list[SharedMemory] = []
@@ -208,12 +271,17 @@ class Worker:
         self._sub_shms: list[SharedMemory] = []
         self._sub_pids: list[int] = []
 
+        # L4+ next-level Worker children (added via add_worker before init)
+        self._next_level_workers: list[Worker] = []
+        self._next_level_shms: list[SharedMemory] = []
+        self._next_level_pids: list[int] = []
+
     # ------------------------------------------------------------------
     # Callable registration (before init)
     # ------------------------------------------------------------------
 
     def register(self, fn: Callable) -> int:
-        """Register a callable for SubWorker use. Must be called before init()."""
+        """Register a callable (sub or orch fn). Must be called before init()."""
         if self.level < 3:
             raise RuntimeError("Worker.register() is only available at level 3+")
         if self._initialized:
@@ -221,6 +289,21 @@ class Worker:
         cid = len(self._callable_registry)
         self._callable_registry[cid] = fn
         return cid
+
+    def add_worker(self, worker: "Worker") -> None:
+        """Add a lower-level Worker as a NEXT_LEVEL child. Must be called before init().
+
+        The child Worker must NOT be init'd — init happens inside the forked
+        child process (so the child's own children are forked in the right
+        process tree).
+        """
+        if self.level < 4:
+            raise RuntimeError("Worker.add_worker() requires level >= 4")
+        if self._initialized:
+            raise RuntimeError("Worker.add_worker() must be called before init()")
+        if worker._initialized:
+            raise RuntimeError("Child worker must not be initialized before add_worker()")
+        self._next_level_workers.append(worker)
 
     # ------------------------------------------------------------------
     # init — auto-discovery
@@ -232,10 +315,10 @@ class Worker:
 
         if self.level == 2:
             self._init_level2()
-        elif self.level == 3:
-            self._init_level3()
+        elif self.level >= 3:
+            self._init_distributed()
         else:
-            raise ValueError(f"Worker: level {self.level} not yet supported")
+            raise ValueError(f"Worker: level {self.level} not supported")
 
         self._initialized = True
 
@@ -258,7 +341,7 @@ class Worker:
         )
         self._chip_worker.set_device(device_id)
 
-    def _init_level3(self) -> None:
+    def _init_distributed(self) -> None:
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
         heap_ring_size = self._config.get("heap_ring_size", None)
@@ -270,7 +353,7 @@ class Worker:
             struct.pack_into("i", shm.buf, _OFF_STATE, _IDLE)
             self._sub_shms.append(shm)
 
-        # 2. Prepare chip-worker config (but do NOT fork yet — deferred to _start_level3)
+        # 2. Prepare chip-worker config (L3 only — L4+ has Worker children instead)
         if device_ids:
             from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
@@ -293,22 +376,29 @@ class Worker:
                 struct.pack_into("i", shm.buf, _OFF_STATE, _IDLE)
                 self._chip_shms.append(shm)
 
-        # 3. Construct the DistWorker *before* fork so the HeapRing mmap
+        # 3. Allocate next-level Worker child mailboxes (L4+ only).
+        for _ in self._next_level_workers:
+            shm = SharedMemory(create=True, size=DIST_MAILBOX_SIZE)
+            assert shm.buf is not None
+            struct.pack_into("i", shm.buf, _OFF_STATE, _IDLE)
+            self._next_level_shms.append(shm)
+
+        # 4. Construct the DistWorker *before* fork so the HeapRing mmap
         #    (taken in the C++ ctor) is inherited by every child process at
         #    the same virtual address. No C++ thread is spawned here; the
         #    scheduler + WorkerThreads start in init(), after forks.
         if heap_ring_size is None:
-            self._dist_worker = DistWorker(3)
+            self._dist_worker = DistWorker(self.level)
         else:
-            self._dist_worker = DistWorker(3, int(heap_ring_size))
+            self._dist_worker = DistWorker(self.level, int(heap_ring_size))
 
-        self._l3_started = False
+        self._distributed_started = False
 
-    def _start_level3(self) -> None:
+    def _start_distributed(self) -> None:
         """Fork child processes and start C++ scheduler. Called on first run()."""
-        if self._l3_started:
+        if self._distributed_started:
             return
-        self._l3_started = True
+        self._distributed_started = True
 
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
@@ -325,7 +415,7 @@ class Worker:
             else:
                 self._sub_pids.append(pid)
 
-        # Fork ChipWorker processes
+        # Fork ChipWorker processes (L3 with device_ids)
         if device_ids:
             for idx, dev_id in enumerate(device_ids):
                 pid = os.fork()
@@ -344,15 +434,37 @@ class Worker:
                 else:
                     self._chip_pids.append(pid)
 
-        # DistWorker was constructed in _init_level3 (pre-fork) so children
-        # inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode workers
-        # via the unified mailbox — no DistChipProcess/DistSubWorker wrappers.
+        # Fork next-level Worker children (L4+ with Worker children).
+        # Each child process: init the inner Worker (which mmaps its own
+        # HeapRing and allocates its own child mailboxes), then enter
+        # _child_worker_loop. The inner Worker's own children are forked
+        # lazily on first run() inside _child_worker_loop, so the process
+        # tree nests correctly: L4 → L3 child → L3's chip/sub children.
+        for idx, inner_worker in enumerate(self._next_level_workers):
+            pid = os.fork()
+            if pid == 0:
+                buf = self._next_level_shms[idx].buf
+                assert buf is not None
+                inner_worker.init()
+                _child_worker_loop(buf, registry, inner_worker)
+                os._exit(0)
+            else:
+                self._next_level_pids.append(pid)
+
+        # DistWorker was constructed in _init_distributed (pre-fork) so
+        # children inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode
+        # workers via the unified mailbox.
         dw = self._dist_worker
         assert dw is not None
 
+        # Register chip workers as NEXT_LEVEL (L3)
         if device_ids:
             for shm in self._chip_shms:
                 dw.add_next_level_process(_mailbox_addr(shm))
+
+        # Register Worker children as NEXT_LEVEL (L4+)
+        for shm in self._next_level_shms:
+            dw.add_next_level_process(_mailbox_addr(shm))
 
         for shm in self._sub_shms:
             dw.add_sub_process(_mailbox_addr(shm))
@@ -380,7 +492,7 @@ class Worker:
             assert self._chip_worker is not None
             self._chip_worker.run(callable, args, cfg)
         else:
-            self._start_level3()
+            self._start_distributed()
             assert self._orch is not None
             assert self._dist_worker is not None
             self._orch._scope_begin()
@@ -391,6 +503,17 @@ class Worker:
                 # stranded when the orch fn raises mid-DAG.
                 self._orch._scope_end()
                 self._orch._drain()
+
+    def _run_as_child(self, cid: int, args, config) -> None:
+        """Called from C++ DistWorker::run when this Worker is a THREAD-mode child.
+
+        Looks up the orch function from the callable registry and delegates
+        to ``self.run(orch_fn, args, config)``.
+        """
+        orch_fn = self._callable_registry.get(cid)
+        if orch_fn is None:
+            raise KeyError(f"callable id {cid} not found in registry")
+        self.run(orch_fn, args, config)
 
     # ------------------------------------------------------------------
     # close
@@ -432,10 +555,25 @@ class Worker:
                 shm.close()
                 shm.unlink()
 
+            # Shutdown next-level Worker children (L4+): SHUTDOWN triggers
+            # _child_worker_loop to call inner_worker.close() before exiting.
+            for shm in self._next_level_shms:
+                buf = shm.buf
+                assert buf is not None
+                struct.pack_into("i", buf, _OFF_STATE, _SHUTDOWN)
+            for pid in self._next_level_pids:
+                os.waitpid(pid, 0)
+            for shm in self._next_level_shms:
+                shm.close()
+                shm.unlink()
+
             self._sub_shms.clear()
             self._sub_pids.clear()
             self._chip_shms.clear()
             self._chip_pids.clear()
+            self._next_level_shms.clear()
+            self._next_level_pids.clear()
+            self._next_level_workers.clear()
 
         self._initialized = False
 

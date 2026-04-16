@@ -408,47 +408,90 @@ release), see [scheduler.md](scheduler.md) §6.
 
 ## 9. Recursive composition (L4+)
 
-`Worker` implements `IWorker`, so a higher-level `Worker` can use it as a
-next-level child:
+`Worker` implements `IWorker`, so a higher-level `Worker` can register a
+lower-level `Worker` as a NEXT_LEVEL child. The dispatch is structurally
+identical to how L3 dispatches to `ChipWorker` — via a shared-memory
+mailbox and a forked child process loop.
+
+### Setup
 
 ```python
-w3 = Worker(level=3, child_mode=WorkerManager.Mode.PROCESS)
-w3.add_worker(NEXT_LEVEL, chip_worker_0)
-w3.add_worker(NEXT_LEVEL, chip_worker_1)
-w3.add_worker(SUB, sub_worker_0)
+# L3 child: sub-only (no chips for this example)
+l3 = Worker(level=3, num_sub_workers=1)
+l3_sub_cid = l3.register(lambda: verify_result())
 
-w4 = Worker(level=4, child_mode=WorkerManager.Mode.THREAD)
-w4.add_worker(NEXT_LEVEL, w3)                 # L3 Worker is IWorker
+def my_l3_orch(orch, args, config):
+    orch.submit_sub(l3_sub_cid)
+
+# L4 parent
+w4 = Worker(level=4, num_sub_workers=0)
+l3_cid = w4.register(my_l3_orch)   # register L3 orch fn in Python dict
+w4.add_worker(l3)                   # add un-init'd L3 Worker as child
+w4.init()
+
+def my_l4_orch(orch, args):
+    orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+
+w4.run(Task(orch=my_l4_orch))
+w4.close()
 ```
 
-At L4 the `Callable` passed to `submit_next_level` is an **L3 orch fn**, not a
-`ChipCallable`:
+At L4 the `Callable` passed to `submit_next_level` is a **registry id**
+(cid) that maps to a Python orch function — not a `ChipCallable`.
 
-```python
-def my_l3_orch(orch3, args, cfg):
-    orch3.submit_next_level(chip_callable_handle, args, cfg)
+### Fork sequence
 
-def my_l4_orch(orch4, args, cfg):
-    orch4.submit_next_level(my_l3_orch_handle, args, cfg)
+L4's `init()` allocates the L4 DistWorker's HeapRing (before fork).
+On first `run()`, the deferred `_start_distributed()`:
 
-w4.run(my_l4_orch, my_args, my_config)
+1. Forks one child process per L3 Worker child
+2. **Inside the child**: `inner_worker.init()` creates the L3 DistWorker
+   (mmaps L3's own HeapRing), allocates L3's sub/chip mailboxes. L3's
+   own children are forked lazily on L3's first `run()`.
+3. Child enters `_child_worker_loop(mailbox, registry, inner_worker)`
+4. **Parent**: registers each mailbox with L4's DistWorker via
+   `add_next_level_process(mailbox_addr)`
+
+```text
+L4 parent process
+  ├─ DistWorker(4) + HeapRing (MAP_SHARED, inherited by L3 child)
+  └─ fork ──────────────────► L3 child process
+                                 ├─ inner_worker.init()
+                                 │    └─ DistWorker(3) + L3's own HeapRing
+                                 └─ _child_worker_loop(mbox, registry, inner_worker)
+                                      └─ on first dispatch:
+                                           inner_worker.run(orch_fn, args, cfg)
+                                             └─ _start_distributed() forks L3's sub children
 ```
 
-L4's WorkerThread dispatches to `w3` via `IWorker::run`. `Worker::run`
-interprets the `Callable` as an `OrchFn`:
+### Dispatch walkthrough (PROCESS mode)
 
-```cpp
-void Worker::run(Callable cb, TaskArgsView args, const CallConfig &cfg) override {
-    orchestrator_.scope_begin();
-    reinterpret_cast<OrchFn>(cb)(&orchestrator_, args, cfg);
-    orchestrator_.drain();
-    orchestrator_.scope_end();
-}
-```
+| Step | Where | What happens |
+| ---- | ----- | ------------ |
+| 1 | L4 parent Python | `w4.run(my_l4_orch)` → `scope_begin` → `my_l4_orch(orch4, ...)` |
+| 2 | L4 `Orchestrator.submit_next_level` | `l3_cid` stored as slot's `callable`; slot pushed to L4's ready queue |
+| 3 | L4 Scheduler | pop slot; pick idle WorkerThread → the L3 child's mailbox |
+| 4 | L4 WorkerThread (PROCESS) | encode `(l3_cid, config, args_blob)` into mailbox; write `TASK_READY`; spin-poll |
+| 5 | L3 child `_child_worker_loop` | wake on `TASK_READY`; read cid → `registry[cid]` → `my_l3_orch` |
+| 6 | L3 child | `inner_worker.run(my_l3_orch, args, cfg)` → `scope_begin` → `my_l3_orch(orch3, ...)` |
+| 7 | L3 `Orchestrator.submit_sub` | `l3_sub_cid` dispatched to L3's own sub worker child |
+| 8 | L3 sub child | `registry[l3_sub_cid]()` → `verify_result()` executes |
+| 9 | L3 drain | all L3 tasks complete; `scope_end` + `drain` return |
+| 10 | L3 child | `inner_worker.run()` returns; `_child_worker_loop` writes `TASK_DONE` |
+| 11 | L4 WorkerThread | sees `TASK_DONE`; calls `on_complete_(slot)` |
+| 12 | L4 drain | L4 scope_end + drain; `w4.run()` returns |
 
 Each level's orch fn receives **its own** `Orchestrator` — the recursion is
-symmetric. `Worker` code does not branch on `level_`; the level is only a
-label (for diagnostics).
+symmetric. `Worker` code does not branch on `level`; the level is only a
+diagnostic label.
+
+### THREAD mode (alternative)
+
+For in-process dispatch (no fork), L4 can register an L3 `DistWorker` as a
+THREAD-mode child. `DistWorker::run()` invokes a Python callback
+(`_run_as_child`) that looks up the orch function in the callable registry
+and calls `Worker.run(orch_fn, args, config)`. The GIL is acquired by the
+binding layer before entering Python.
 
 ---
 

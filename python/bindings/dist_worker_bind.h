@@ -164,6 +164,32 @@ inline void bind_dist_worker(nb::module_ &m) {
         .def("init", &DistWorker::init, "Start the Scheduler thread.")
         .def("close", &DistWorker::close, "Stop the Scheduler thread.")
 
+        // THREAD-mode callback for L4+ recursion (approach b: Python callback).
+        // The lambda captures the Python callable and wraps it with GIL
+        // acquisition + TaskArgsView→TaskArgs reconstruction so the Python
+        // side receives normal objects.
+        .def(
+            "set_run_callback",
+            [](DistWorker &self, nb::object cb) {
+                self.set_run_callback(
+                    [cb_stored = nb::object(cb)](uint64_t callable, TaskArgsView view, const ChipCallConfig &config) {
+                        nb::gil_scoped_acquire gil;
+                        TaskArgs args;
+                        for (int32_t i = 0; i < view.tensor_count; i++) {
+                            args.add_tensor(view.tensors[i]);
+                        }
+                        for (int32_t i = 0; i < view.scalar_count; i++) {
+                            args.add_scalar(view.scalars[i]);
+                        }
+                        cb_stored(callable, &args, &config);
+                    }
+                );
+            },
+            nb::arg("callback"),
+            "Set the Python callback for THREAD-mode L4+ dispatch. The callback "
+            "receives (callable_id, TaskArgs, ChipCallConfig) with the GIL held."
+        )
+
         .def(
             "get_orchestrator", &DistWorker::get_orchestrator, nb::rv_policy::reference_internal,
             "Return the Orchestrator handle (lifetime tied to this DistWorker)."

@@ -348,6 +348,31 @@ not by the IWorker type — so the same IWorker implementation works in both
 modes. This is why `ChipWorker`, `SubWorker`, and `Worker` all share one
 interface: the dispatch layer is orthogonal to the worker semantics.
 
+### 5.1 Nested fork ordering (L4+ Worker children)
+
+When an L4 Worker has L3 Worker children (PROCESS mode), the fork sequence
+nests:
+
+```text
+L4 parent process
+  ├─ _init_distributed(): DistWorker(4) + HeapRing mmap (before fork)
+  └─ _start_distributed() (on first run):
+       ├─ fork L3 child  ────────►  L3 child process:
+       │                              inner_worker.init()  ← DistWorker(3) + L3 HeapRing
+       │                              _child_worker_loop()
+       │                                └─ on first dispatch: inner_worker.run()
+       │                                     └─ _start_distributed() forks L3's sub/chip children
+       └─ register mailbox with L4's DistWorker
+```
+
+Each inner Worker inits **inside its forked child process** so its own
+children are forked from the correct parent. The L4 parent never sees L3's
+sub/chip grandchildren — they're L3's responsibility.
+
+**Key invariant**: `DistWorker(N)` and its HeapRing are created before any
+fork at level N. Children inherit the `MAP_SHARED` mmap at the same virtual
+address. C++ scheduler threads start only after all forks at that level.
+
 ---
 
 ## 6. Why this layering

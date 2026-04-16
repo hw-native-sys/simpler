@@ -164,11 +164,11 @@ void DistWorker::close() {
 }
 
 // =============================================================================
-// IWorker::run() — DistWorker as sub-worker of a higher level (placeholder)
+// IWorker::run() — DistWorker as sub-worker of a higher level (THREAD mode)
 // =============================================================================
 
-void DistWorker::run(uint64_t /*callable*/, TaskArgsView /*args*/, const ChipCallConfig & /*config*/) {
-    // Full L4+ support: `callable` decodes to an orch-fn handle; Worker::run
-    // opens a fresh scope, invokes the orch fn on its own Orchestrator,
-    // drains, and closes the scope. Placeholder for plan step F.
+void DistWorker::run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) {
+    if (run_callback_) {
+        run_callback_(callable, args, config);
+    }
 }

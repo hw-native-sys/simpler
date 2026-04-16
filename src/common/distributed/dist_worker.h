@@ -86,10 +86,17 @@ public:
     DistOrchestrator &get_orchestrator() { return orchestrator_; }
 
     // IWorker — used when this DistWorker is itself a sub-worker of L4+.
-    // Placeholder for recursive composition; filled in by plan step F.
+    // In THREAD mode, the parent's WorkerThread calls run() directly;
+    // run() invokes run_callback_ which acquires the GIL and delegates
+    // to the Python Worker._run_as_child method (approach (b): Python
+    // callback — simpler than full C++ registry lookup).
     void run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) override;
 
+    using RunCallback = std::function<void(uint64_t, TaskArgsView, const ChipCallConfig &)>;
+    void set_run_callback(RunCallback cb) { run_callback_ = std::move(cb); }
+
 private:
+    RunCallback run_callback_;
     int32_t level_;
     bool initialized_{false};
 

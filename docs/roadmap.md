@@ -22,8 +22,8 @@ get if I pip install `main` today", this page.
   in `src/common/distributed/`.
 - **Level model** — L0–L6 as described in
   [distributed_level_runtime.md](distributed_level_runtime.md) §1. L2
-  (single-chip) and L3 (composite over ChipWorker + SubWorker) are
-  implemented; L4+ recursion is not (see below).
+  (single-chip), L3 (composite over ChipWorker + SubWorker), and L4+
+  (recursive composition with Worker children) are implemented.
 
 ### User-facing API
 
@@ -134,16 +134,29 @@ get if I pip install `main` today", this page.
   `Mode = THREAD | PROCESS` (no separate fork-proxy classes). Strict-4
   per-worker-type ready queues already landed in PR-D-1.
 
-### PR-F: C++ `Worker::run(Task)` for L4+ recursion
+### PR-F: L4+ recursion via `_child_worker_loop` + `DistWorker::run` — **Landed**
 
-- C++ `Task { OrchFn orch; TaskArgs task_args; CallConfig config; }`
-  so a higher-level `Worker` can register a lower-level `Worker` as a
-  next-level child and dispatch via `IWorker::run`.
+- `Worker(level=4)` registers `Worker(level=3)` children via
+  `add_worker(child)`. Parent forks → child inits inner Worker → enters
+  `_child_worker_loop(mailbox, registry, inner_worker)`.
+- `_child_worker_loop`: reads `(cid, config, args_blob)` from mailbox,
+  looks up orch fn in COW-inherited Python registry, calls
+  `inner_worker.run(orch_fn, args, cfg)`.
+- `DistWorker::run()` for THREAD mode: Python callback via
+  `set_run_callback` (GIL acquired in binding layer).
+- `read_args_from_blob(blob_ptr)`: nanobind binding to reconstruct
+  `TaskArgs` from a mailbox blob.
+- Generalised `DistWorker(level)` — no hardcoded `DistWorker(3)`.
+- `Worker._init_distributed` / `_start_distributed` replace the old
+  `_init_level3` / `_start_level3` (handles all levels >= 3).
 
-### PR-G: drop the `Dist` prefix
+### PR-G: drop the `Dist` prefix + rename `ChipCallConfig`
 
 - Final rename sweep: `DistOrchestrator` → `Orchestrator`, files
   `dist_*.{h,cpp}` → `*.{h,cpp}`.
+- `ChipCallConfig` → `CallConfig`: now used at every level (L3→L4→…)
+  via `IWorker::run`, `DistOrchestrator::submit_next_level`, slot state,
+  and mailbox encoding — the `Chip` prefix is misleading.
 
 ---
 
