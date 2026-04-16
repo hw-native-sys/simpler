@@ -127,10 +127,12 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ uint8_t *mij = reinterpret_cast<__gm__ uint8_t *>(args[3]);
     __gm__ uint8_t *lij = reinterpret_cast<__gm__ uint8_t *>(args[4]);
     int q_tile_size = static_cast<int>(args[5]);
-    // args[6] = block_size
+    int block_size = static_cast<int>(args[6]);
     int valid_len = static_cast<int>(args[7]);
 
-    if (q_tile_size == 16) {
+    if (q_tile_size == 16 && block_size <= 16) {
+        softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij, valid_len);
+    } else if (q_tile_size == 16) {
         softmax_prepare_impl<16, 128>(sij, scale_value, pij, mij, lij, valid_len);
     } else {
         softmax_prepare_impl<64, 64>(sij, scale_value, pij, mij, lij, valid_len);

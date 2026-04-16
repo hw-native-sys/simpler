@@ -229,9 +229,11 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     int is_last = static_cast<int>(args[7]);
     __gm__ uint8_t *dst = reinterpret_cast<__gm__ uint8_t *>(args[8]);
     int q_tile_size = static_cast<int>(args[9]);
-    // args[10] = head_dim (128)
+    int head_dim = static_cast<int>(args[10]);
 
-    if (q_tile_size == 16) {
+    if (q_tile_size == 16 && head_dim <= 16) {
+        online_update_impl<16, 16>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
+    } else if (q_tile_size == 16) {
         online_update_impl<16, 128>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
     } else {
         online_update_impl<64, 128>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);

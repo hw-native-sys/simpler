@@ -7,10 +7,10 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Paged attention — tensormap_and_ringbuffer example (small scale, float16).
+"""Paged attention — tensormap_and_ringbuffer test (production scale, bfloat16).
 
 AIC+AIV mixed execution with online softmax paged attention.
-Small-scale cases including variable sequence lengths.
+Production-scale cases for A5 hardware validation.
 """
 
 import torch
@@ -25,13 +25,13 @@ from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generat
 class TestPagedAttention(SceneTestCase):
     """Paged attention with tensormap_and_ringbuffer runtime on A5."""
 
-    RTOL = 1e-2
-    ATOL = 1e-2
+    RTOL = 1e-3
+    ATOL = 1e-3
 
     CALLABLE = {
         "orchestration": {
             "source": "kernels/orchestration/paged_attention_orch.cpp",
-            "function_name": "aicpu_orchestration_entry",
+            "function_name": "build_paged_attention_graph",
             "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
         },
         "incores": [
@@ -65,6 +65,53 @@ class TestPagedAttention(SceneTestCase):
     CASES = [
         {
             "name": "Case1",
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "params": {
+                "batch": 256,
+                "num_heads": 16,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 128,
+                "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
+            "name": "Case2",
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "manual": True,
+            "params": {
+                "batch": 64,
+                "num_heads": 64,
+                "kv_head_num": 1,
+                "head_dim": 128,
+                "block_size": 64,
+                "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
+            "name": "Case3",
+            "platforms": ["a5"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 24},
+            "manual": True,
+            "params": {
+                "batch": 64,
+                "num_heads": 64,
+                "kv_head_num": 1,
+                "head_dim": 256,
+                "block_size": 64,
+                "context_len": 8192,
+                "max_model_len": 32768,
+                "dtype": "bfloat16",
+            },
+        },
+        {
+            "name": "SmallCase1",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {
@@ -75,11 +122,11 @@ class TestPagedAttention(SceneTestCase):
                 "block_size": 16,
                 "context_len": 33,
                 "max_model_len": 256,
-                "dtype": "float16",
+                "dtype": "bfloat16",
             },
         },
         {
-            "name": "Case2",
+            "name": "SmallCase2",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "manual": True,
@@ -91,11 +138,11 @@ class TestPagedAttention(SceneTestCase):
                 "block_size": 16,
                 "context_len": 128,
                 "max_model_len": 256,
-                "dtype": "float16",
+                "dtype": "bfloat16",
             },
         },
         {
-            "name": "CaseVarSeq2",
+            "name": "SmallCaseVarSeq2",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "manual": True,
@@ -108,11 +155,11 @@ class TestPagedAttention(SceneTestCase):
                 "context_len": 33,
                 "context_lens_list": [33, 17],
                 "max_model_len": 256,
-                "dtype": "float16",
+                "dtype": "bfloat16",
             },
         },
         {
-            "name": "CaseVarSeq4",
+            "name": "SmallCaseVarSeq4",
             "platforms": ["a5sim", "a5"],
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "manual": True,
@@ -125,7 +172,7 @@ class TestPagedAttention(SceneTestCase):
                 "context_len": 128,
                 "context_lens_list": [33, 64, 128, 15],
                 "max_model_len": 256,
-                "dtype": "float16",
+                "dtype": "bfloat16",
             },
         },
     ]

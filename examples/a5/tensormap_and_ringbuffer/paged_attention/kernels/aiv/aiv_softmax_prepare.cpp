@@ -10,14 +10,16 @@
  */
 // Softmax Preparation Kernel (AIV) with partial block masking
 //
-// Fixed tile size: sij is (16, 16)
+// Operates on (M, N) tile where M=q_tile_size, N=block_size:
+//   Case1: sij is (16, 128)
+//   Case2: sij is (64, 64)
 //
 // For partial blocks (valid_len < N), positions [valid_len, N) in sij are
-// filled with -inf before softmax, ensuring exp(-inf)=0 so that invalid
-// key positions contribute zero attention weight.
+// filled with -inf via TFILLPAD_INPLACE before softmax, ensuring exp(-inf)=0
+// so that invalid key positions contribute zero attention weight.
 //
 // Computes:
-//   sij_masked = pad(sij, valid_len, -inf)
+//   sij_masked = TFILLPAD(sij, valid_len, pad=-inf)
 //   sij_scale = sij_masked * scale
 //   mij = row_max(sij_scale)        -> (M, 1)
 //   pij = exp(sij_scale - mij)      -> (M, N)
@@ -26,9 +28,8 @@
 #include <cstdint>
 #include <pto/pto-inst.hpp>
 
-#include "tensor.h"  // NOLINT(build/include_subdir)
+#include "tensor.h"
 
-// NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
 
 #ifndef __gm__
@@ -36,7 +37,7 @@ using namespace pto;
 #endif
 
 #ifndef __aicore__
-#define __aicore__ [aicore]  // NOLINT(whitespace/braces)
+#define __aicore__ [aicore]
 #endif
 
 template <int M, int N>
@@ -45,18 +46,18 @@ static __aicore__ void softmax_prepare_impl(
 ) {
     uint64_t valid_len = static_cast<uint64_t>(sij->shapes[1]);
     __gm__ float *sij_addr = reinterpret_cast<__gm__ float *>(sij->buffer.addr);
-    __gm__ half *pij_addr = reinterpret_cast<__gm__ half *>(pij->buffer.addr);
+    __gm__ bfloat16_t *pij_addr = reinterpret_cast<__gm__ bfloat16_t *>(pij->buffer.addr);
     __gm__ float *mij_addr = reinterpret_cast<__gm__ float *>(mij->buffer.addr);
     __gm__ float *lij_addr = reinterpret_cast<__gm__ float *>(lij->buffer.addr);
 
     constexpr int kAlignedRows = ((M * sizeof(float) + 31) / 32) * (32 / sizeof(float));
 
     using GlobalDataMxN = GlobalTensor<float, Shape<1, 1, 1, M, N>, pto::Stride<1, 1, 1, N, 1>>;
-    using GlobalDataMxN_f16 = GlobalTensor<half, Shape<1, 1, 1, M, N>, pto::Stride<1, 1, 1, N, 1>>;
+    using GlobalDataMxN_bf16 = GlobalTensor<bfloat16_t, Shape<1, 1, 1, M, N>, pto::Stride<1, 1, 1, N, 1>>;
     using GlobalScalarDN = GlobalTensor<float, Shape<1, 1, 1, kAlignedRows, 1>, pto::Stride<1, 1, 1, 1, 1>, Layout::DN>;
 
     GlobalDataMxN sijGlobal(sij_addr + sij->start_offset);
-    GlobalDataMxN_f16 pijGlobal(pij_addr + pij->start_offset);
+    GlobalDataMxN_bf16 pijGlobal(pij_addr + pij->start_offset);
     GlobalScalarDN mijGlobal(mij_addr + mij->start_offset);
     GlobalScalarDN lijGlobal(lij_addr + lij->start_offset);
 
@@ -66,7 +67,7 @@ static __aicore__ void softmax_prepare_impl(
     using TileSijPad = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N, SLayout::NoneBox, 512, PadValue::Min>;
 
     using TileVecMxN = Tile<TileType::Vec, float, M, N, BLayout::RowMajor, M, N>;
-    using TileVecMxN_f16 = Tile<TileType::Vec, half, M, N, BLayout::RowMajor, M, N>;
+    using TileVecMxN_bf16 = Tile<TileType::Vec, bfloat16_t, M, N, BLayout::RowMajor, M, N>;
     using TileScalarDN = Tile<TileType::Vec, float, kAlignedRows, 1, BLayout::ColMajor, M, 1>;
 
     TileVecMxN sijTile;
@@ -76,8 +77,9 @@ static __aicore__ void softmax_prepare_impl(
     TileVecMxN tmpTile;
     TileScalarDN maxTile;
     TileScalarDN sumTile;
-    TileVecMxN_f16 pijF16Tile;
+    TileVecMxN_bf16 pijBf16Tile;
 
+    // All sij tiles share UB address 0x0 (in-place masking)
     TASSIGN(sijTile, 0x0);
     TASSIGN(sijDynTile, 0x0);
     TASSIGN(sijPadTile, 0x0);
@@ -85,28 +87,38 @@ static __aicore__ void softmax_prepare_impl(
     TASSIGN(tmpTile, 2 * M * N * sizeof(float));
     TASSIGN(maxTile, 3 * M * N * sizeof(float));
     TASSIGN(sumTile, 3 * M * N * sizeof(float) + kAlignedRows * sizeof(float));
-    TASSIGN(pijF16Tile, 3 * M * N * sizeof(float) + 2 * kAlignedRows * sizeof(float));
+    TASSIGN(pijBf16Tile, 3 * M * N * sizeof(float) + 2 * kAlignedRows * sizeof(float));
 
     // Load full sij (M, N) tile from GM - all N columns including garbage for partial blocks
+    // printf("sij addr incore %x\n", sij->buffer.addr);
     TLOAD(sijTile, sijGlobal);
     set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
     wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
 
-    // manually fill invalid columns with -inf as a workaround.
+    // Mask columns [valid_len, N) with -inf. sijDynTile provides the valid boundary,
+    // sijPadTile provides PadValue::Min as the fill value. No-op when valid_len == N.
     TFILLPAD_INPLACE(sijPadTile, sijDynTile);
 
     TMULS(sijTile, sijTile, scale_value);
     TROWMAX(maxTile, sijTile, tmpTile);
     TROWEXPANDSUB(pijTile, sijTile, maxTile);
     TEXP(pijTile, pijTile);
-    // Truncate pij to fp16 first, then compute lij from truncated values (matches golden)
-    TCVT(pijF16Tile, pijTile, RoundMode::CAST_ROUND);
-    TCVT(pijTile, pijF16Tile, RoundMode::CAST_ROUND);
-    TROWSUM(sumTile, pijTile, tmpTile);
+    // Truncate pij to bf16 first
+    TCVT(pijBf16Tile, pijTile, RoundMode::CAST_ROUND);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);  // pij bf16 ready, can store early
 
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    // Continue computing: bf16 → f32 and rowsum while pij store proceeds in parallel
+    TCVT(pijTile, pijBf16Tile, RoundMode::CAST_ROUND);
+    TROWSUM(sumTile, pijTile, tmpTile);
+    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);  // sum ready
+
+    // Store pij (overlaps with TCVT + TROWSUM above)
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
+    TSTORE(pijGlobal, pijBf16Tile);
+
+    // Store max and sum
     TSTORE(mijGlobal, maxTile);
+    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID1);
     TSTORE(lijGlobal, sumTile);
     TSTORE(pijGlobal, pijF16Tile);
 
@@ -119,7 +131,19 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     __gm__ Tensor *pij = reinterpret_cast<__gm__ Tensor *>(args[1]);
     __gm__ Tensor *mij = reinterpret_cast<__gm__ Tensor *>(args[2]);
     __gm__ Tensor *lij = reinterpret_cast<__gm__ Tensor *>(args[3]);
-    float scale_value = from_u64<float>(static_cast<uint64_t>(args[4]));
+    union {
+        uint64_t u;
+        float f;
+    } scale_conv;
+    scale_conv.u = static_cast<uint64_t>(args[4]);
+    float scale_value = scale_conv.f;
+    uint64_t q_tile_size = static_cast<uint64_t>(sij->shapes[0]);
 
-    softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij);
+    if (q_tile_size == 16 && pij->shapes[1] <= 16) {
+        softmax_prepare_impl<16, 16>(sij, scale_value, pij, mij, lij);
+    } else if (q_tile_size == 16) {
+        softmax_prepare_impl<16, 128>(sij, scale_value, pij, mij, lij);
+    } else {
+        softmax_prepare_impl<64, 64>(sij, scale_value, pij, mij, lij);
+    }
 }

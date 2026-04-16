@@ -1,4 +1,4 @@
-# Paged Attention (Device Test)
+# Paged Attention (A5 host_build_graph)
 
 This example demonstrates Paged Attention implementation using CCE (Cube Core Engine) code generation, with AIC matmul kernels and AIV vector kernels using PTO Tile API.
 
@@ -13,16 +13,18 @@ Paged Attention is an efficient attention mechanism that processes KV cache in f
 ### Supported Platforms
 
 | Platform | Description |
-|----------|-------------|
-| a2a3 | Ascend hardware (requires device ID) |
+| -------- | ----------- |
+| a5sim | Simulator |
+| a5 | Ascend hardware |
 
-> This test uses bfloat16 data types and production-scale shapes that are not supported by the a2a3sim simulator. It only runs on real hardware.
+This directory contains the `host_build_graph` variant of the A5 paged attention scene test.
+The `tensormap_and_ringbuffer` variant lives separately under `examples/a5/tensormap_and_ringbuffer/paged_attention/`.
 
 ### Algorithm
 
 For each query token, the attention is computed incrementally across KV cache blocks:
 
-```
+```text
 For each block j:
     sij = Qi @ Kj^T                    # QK MatMul (AIC)
     mij, lij, pij = softmax_prepare(sij)  # Softmax (AIV)
@@ -33,7 +35,7 @@ For each block j:
 ### Kernel Design (AIC/AIV Split)
 
 | Kernel | Core Type | Operation | Key Instructions |
-|--------|-----------|-----------|------------------|
+| ------ | --------- | --------- | ---------------- |
 | aic_qk_matmul | AIC (Cube) | Q @ K^T | TLOAD/TMOV/TMATMUL/TSTORE |
 | aiv_softmax_prepare | AIV (Vector) | scale, rowmax, exp, rowsum | TMULS/TROWMAX/TROWEXPANDSUB/TEXP/TROWSUM |
 | aic_pv_matmul | AIC (Cube) | P @ V | TLOAD/TMOV/TMATMUL/TSTORE |
@@ -41,7 +43,7 @@ For each block j:
 
 ### Memory Hierarchy (AIC Matmul)
 
-```
+```text
 GM -> L1 (Mat tiles) -> L0A/L0B -> L0C (Accumulator) -> GM
 ```
 
@@ -49,7 +51,7 @@ GM -> L1 (Mat tiles) -> L0A/L0B -> L0C (Accumulator) -> GM
 
 For each batch, the task dependency pattern is:
 
-```
+```text
 Block 0: QK -> SF -> PV --+
 Block 1: QK -> SF -> PV --+--> UP[0] -> UP[1] -> ... -> UP[n]
 Block n: QK -> SF -> PV --+
@@ -61,45 +63,40 @@ Block n: QK -> SF -> PV --+
 ## Quick Start
 
 ```bash
-# Run on hardware (specify device ID)
-python examples/scripts/run_example.py \
-  -k tests/st/host_build_graph/paged_attention/kernels \
-  -g tests/st/host_build_graph/paged_attention/golden.py \
-  -p a2a3 -d 0
+# Run the default case on sim
+python tests/st/a5/host_build_graph/paged_attention/test_paged_attention.py -p a5sim
 
-# Run multi-block test case
-PA_CASE=Case2 python examples/scripts/run_example.py \
-  -k tests/st/host_build_graph/paged_attention/kernels \
-  -g tests/st/host_build_graph/paged_attention/golden.py \
-  -p a2a3 -d 0
+# Run a specific hardware case
+python tests/st/a5/host_build_graph/paged_attention/test_paged_attention.py -p a5 -d 0 -k Case2
 ```
 
 ## Directory Structure
 
-```
+```text
 paged_attention/
 ├── README.md                    # This file
-├── golden.py                    # Input generation and expected output
+├── test_paged_attention.py      # Scene test entry
 └── kernels/
-    ├── kernel_config.py         # Kernel registration config
-    ├── aic/                      # AIC kernels (CCE codegen style)
-    │   ├── aic_qk_matmul.cpp     # Q @ K^T matmul
-    │   └── aic_pv_matmul.cpp     # P @ V matmul
-    ├── aiv/                      # AIV kernels (PTO Tile API)
-    │   ├── aiv_softmax_prepare.cpp  # Softmax preparation
-    │   └── aiv_online_update.cpp    # Online Softmax update + normalize
+    ├── aic/
+    │   ├── aic_qk_matmul.cpp
+    │   └── aic_pv_matmul.cpp
+    ├── aiv/
+    │   ├── aiv_softmax_prepare.cpp
+    │   └── aiv_online_update.cpp
     └── orchestration/
-        └── paged_attention_orch.cpp # Task graph builder
+        └── paged_attention_orch.cpp
 ```
 
 ## Test Cases
 
-| Case | batch | num_heads | kv_head_num | head_dim | block_size | context_len | Description |
-|------|-------|-----------|-------------|----------|------------|-------------|-------------|
-| Case1 | 1 | 16 | 1 | 128 | 128 | 256 | Small scale (default) |
-| Case2 | 8 | 64 | 1 | 128 | 64 | 8192 | Production scale |
+| Case | batch | num_heads | kv_head_num | head_dim | block_size | context_len | Platforms |
+| ---- | ----- | --------- | ----------- | -------- | ---------- | ----------- | --------- |
+| Case1 | 256 | 16 | 1 | 128 | 128 | 8100 | a5 |
+| Case2 | 64 | 64 | 1 | 128 | 64 | 8150 | a5 |
+| SmallCase1 | 1 | 16 | 1 | 16 | 16 | 16 | a5sim, a5 |
+| SmallCase2 | 1 | 16 | 1 | 16 | 16 | 64 | a5sim, a5 |
 
-All test cases use **bfloat16** Q/K/V inputs with GQA (kv_head_num=1).
+All cases use **bfloat16** Q/K/V inputs with GQA (`kv_head_num=1`).
 
 ## Key Technical Details
 
@@ -161,16 +158,16 @@ TROWEXPANDMUL(oiTile, oiTile, alphaTileDN);
 
 ## Expected Output
 
-```
+```text
 === Compiling and Registering Kernels ===
 Compiling kernel: .../aic_qk_matmul.cpp (func_id=0)
 Compiling kernel: .../aiv_softmax_prepare.cpp (func_id=1)
 Compiling kernel: .../aic_pv_matmul.cpp (func_id=2)
 Compiling kernel: .../aiv_online_update.cpp (func_id=3)
 ...
-=== build_paged_attention_graph (16x16 framework version) ===
+=== build_paged_attention_graph ===
 batch=1, num_heads=16, kv_head_num=1, head_dim=16
-block_size=16, block_num=1
+block_size=16, max_num_blocks=16
 ...
 Created 4 tasks
 ...
@@ -185,7 +182,7 @@ TEST PASSED
 
 ## Reference
 
-This implementation uses the Online Softmax algorithm for paged attention, with identical kernel structure to the PyPTO reference implementation.
+This implementation uses the Online Softmax algorithm for paged attention, with an AIC/AIV split tailored for the `host_build_graph` runtime on A5.
 
 ## See Also
 
