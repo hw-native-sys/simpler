@@ -35,7 +35,7 @@ class TestSpmdMultiblockAiv(SceneTestCase):
             "signature": [D.INOUT],
         },
         "incores": [
-            {"func_id": 0, "source": "kernels/aiv/kernel_spmd_write.cpp", "core_type": "aiv"},
+            {"func_id": 0, "name": "SPMD_WRITE_AIV", "source": "kernels/aiv/kernel_spmd_write.cpp", "core_type": "aiv"},
         ],
     }
 

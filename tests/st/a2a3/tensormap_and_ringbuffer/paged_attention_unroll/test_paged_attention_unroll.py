@@ -31,24 +31,28 @@ class TestPagedAttentionUnroll(SceneTestCase):
         "incores": [
             {
                 "func_id": 0,
+                "name": "QK",
                 "source": "kernels/aic/aic_qk_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
+                "name": "PV",
                 "source": "kernels/aiv/aiv_softmax_prepare.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.OUT, D.OUT, D.OUT],
             },
             {
                 "func_id": 2,
+                "name": "SF",
                 "source": "kernels/aic/aic_pv_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 3,
+                "name": "UP",
                 "source": "kernels/aiv/aiv_online_update.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.IN, D.INOUT, D.INOUT, D.INOUT, D.INOUT],

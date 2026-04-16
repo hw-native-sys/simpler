@@ -57,30 +57,35 @@ class TestMixedExample(SceneTestCase):
         "incores": [
             {
                 "func_id": 0,
+                "name": "MATMUL",
                 "source": "kernels/aic/kernel_matmul.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
+                "name": "ADD",
                 "source": "kernels/aiv/kernel_add.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 2,
+                "name": "MUL",
                 "source": "kernels/aiv/kernel_mul.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 3,
+                "name": "ADD_STANDALONE",
                 "source": "kernels/aiv/kernel_add_standalone.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 4,
+                "name": "MUL_STANDALONE",
                 "source": "kernels/aiv/kernel_mul_standalone.cpp",
                 "core_type": "aiv",
                 "signature": [D.IN, D.IN, D.OUT],

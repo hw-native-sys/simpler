@@ -29,12 +29,14 @@ class TestBenchmarkBgemm(SceneTestCase):
         "incores": [
             {
                 "func_id": 0,
+                "name": "GEMM",
                 "source": "kernels/aic/kernel_gemm_tile.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
+                "name": "ADD",
                 "source": "kernels/aiv/kernel_tile_add.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.IN],

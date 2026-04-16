@@ -37,12 +37,14 @@ class TestBgemm(SceneTestCase):
         "incores": [
             {
                 "func_id": 0,
+                "name": "GEMM",
                 "source": "kernels/mix/kernel_bgemm.cpp",
                 "core_type": "aic",
                 "signature": [D.IN, D.IN, D.OUT],
             },
             {
                 "func_id": 1,
+                "name": "ADD",
                 "source": "kernels/mix/kernel_bgemm.cpp",
                 "core_type": "aiv",
                 "signature": [D.INOUT, D.IN],

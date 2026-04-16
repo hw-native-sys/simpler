@@ -75,10 +75,30 @@ class TestSpmdSyncStartStress(SceneTestCase):
             "signature": [D.INOUT],
         },
         "incores": [
-            {"func_id": 0, "source": "../spmd_multiblock_mix/kernels/aic/kernel_spmd_mix.cpp", "core_type": "aic"},
-            {"func_id": 1, "source": "../spmd_multiblock_mix/kernels/aiv/kernel_spmd_mix.cpp", "core_type": "aiv"},
-            {"func_id": 2, "source": "../spmd_multiblock_mix/kernels/aiv/kernel_spmd_mix.cpp", "core_type": "aiv"},
-            {"func_id": 3, "source": "../spmd_multiblock_aiv/kernels/aiv/kernel_spmd_write.cpp", "core_type": "aiv"},
+            {
+                "func_id": 0,
+                "name": "SPMD_MIX_AIC",
+                "source": "../spmd_multiblock_mix/kernels/aic/kernel_spmd_mix.cpp",
+                "core_type": "aic",
+            },
+            {
+                "func_id": 1,
+                "name": "SPMD_MIX_AIV0",
+                "source": "../spmd_multiblock_mix/kernels/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+            },
+            {
+                "func_id": 2,
+                "name": "SPMD_MIX_AIV1",
+                "source": "../spmd_multiblock_mix/kernels/aiv/kernel_spmd_mix.cpp",
+                "core_type": "aiv",
+            },
+            {
+                "func_id": 3,
+                "name": "SPMD_WRITE_AIV",
+                "source": "../spmd_multiblock_aiv/kernels/aiv/kernel_spmd_write.cpp",
+                "core_type": "aiv",
+            },
         ],
     }
 
