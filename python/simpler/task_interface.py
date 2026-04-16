@@ -37,6 +37,7 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     arg_direction_name,
     get_dtype_name,
     get_element_size,
+    read_args_from_blob,
 )
 
 __all__ = [
@@ -64,6 +65,7 @@ __all__ = [
     "DistSubmitResult",
     "DistWorker",
     "DIST_MAILBOX_SIZE",
+    "read_args_from_blob",
 ]
 
 

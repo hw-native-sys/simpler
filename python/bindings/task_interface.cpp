@@ -602,5 +602,24 @@ NB_MODULE(_task_interface, m) {
         .def_prop_ro("initialized", &ChipWorker::initialized)
         .def_prop_ro("device_set", &ChipWorker::device_set);
 
+    // --- Standalone blob helpers ---
+    m.def(
+        "read_args_from_blob",
+        [](uint64_t blob_ptr) {
+            TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr));
+            TaskArgs args;
+            for (int32_t i = 0; i < view.tensor_count; i++) {
+                args.add_tensor(view.tensors[i]);
+            }
+            for (int32_t i = 0; i < view.scalar_count; i++) {
+                args.add_scalar(view.scalars[i]);
+            }
+            return args;
+        },
+        nb::arg("blob_ptr"),
+        "Reconstruct a TaskArgs from a length-prefixed blob at blob_ptr. "
+        "Tags are not preserved (blob wire format strips them)."
+    );
+
     bind_dist_worker(m);
 }

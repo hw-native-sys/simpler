@@ -53,9 +53,9 @@ L0  CORE  / AIV, AIC   ── individual compute core (hardware-managed)
 | Level | Workers it contains | Status |
 | ----- | ------------------- | ------ |
 | L3 (Host) | `ChipWorker` ×N + `SubWorker` ×M | Implemented |
-| L4 (Pod) | `Worker(level=3)` ×N | Planned |
-| L5 (SuperNode) | `Worker(level=4)` ×N | Planned |
-| L6 (Cluster) | `Worker(level=5)` ×N | Planned |
+| L4 (Pod) | `Worker(level=3)` ×N + `SubWorker` ×M | Implemented |
+| L5 (SuperNode) | `Worker(level=4)` ×N | Same code as L4 (untested) |
+| L6 (Cluster) | `Worker(level=5)` ×N | Same code as L4 (untested) |
 
 `Worker` is a single C++ class that handles every level from L3 upward — the
 `level` parameter is a diagnostic label; behavior does not branch on it. The
@@ -170,29 +170,47 @@ Communication channels:
 ## 4. Recursive Composition
 
 A `Worker` is itself an `IWorker`, so a higher-level `Worker` can register it
-as a next-level child:
+as a NEXT_LEVEL child. The Python `Worker.add_worker(child)` stores an
+un-init'd child Worker; on first `run()`, the parent forks a child process
+that inits the inner Worker and enters a mailbox-polling loop
+(`_child_worker_loop`).
 
 ```python
-w3 = Worker(level=3, child_mode=WorkerManager.Mode.PROCESS)
-w3.add_worker(NEXT_LEVEL, chip_worker_0)
-w3.add_worker(SUB,        sub_worker_0)
-w3.init()
+# L3 child: sub-only (or with chips via device_ids)
+l3 = Worker(level=3, num_sub_workers=1)
+l3_sub_cid = l3.register(lambda: verify_result())
 
-w4 = Worker(level=4, child_mode=WorkerManager.Mode.THREAD)
-w4.add_worker(NEXT_LEVEL, w3)         # w3 is an IWorker
+def my_l3_orch(orch, args, config):
+    orch.submit_sub(l3_sub_cid)
+
+# L4 parent
+w4 = Worker(level=4, num_sub_workers=0)
+l3_cid = w4.register(my_l3_orch)
+w4.add_worker(l3)
 w4.init()
 
-w4.run(my_l4_orch, my_args, my_config)
+def my_l4_orch(orch, args, config):
+    orch.submit_next_level(l3_cid, TaskArgs(), ChipCallConfig())
+
+w4.run(my_l4_orch)
+w4.close()
 ```
 
-When L4's `WorkerThread` dispatches to L3, L3's `Worker::run` opens its own
-scope, executes the L4-supplied orch function with L3's own `Orchestrator`,
-and drains. Each level's orch fn receives its own Orchestrator — recursion is
-symmetric.
+When L4's `WorkerThread` writes `(cid, config, args_blob)` to the L3 child's
+mailbox, the child loop reads `cid`, looks up the orch function in the
+COW-inherited callable registry, and calls `inner_worker.run(orch_fn, args,
+cfg)`. The inner Worker opens its own scope, executes the orch function with
+its own `Orchestrator`, and drains. Each level's orch fn receives its own
+Orchestrator — recursion is symmetric.
 
-**Mode per level is independent**: L3 might use PROCESS (sim isolation), L4
-THREAD (L3 workers are thread-safe composites). Each `Worker` chooses its
-children's mode at construction.
+**Nested fork ordering**: L3's own children (sub/chip) are forked **inside**
+the L4 child process, on L3's first `run()`. This keeps the process tree
+clean: L4 parent → L3 child → L3's sub/chip grandchildren.
+
+**Mode per level is independent**: L3 can use PROCESS (chip children), while
+L4 also uses PROCESS (L3 Worker children). Each `Worker` picks its children's
+mode independently. Nested forks are safe because L3 init happens inside the
+already-forked L3 child process.
 
 See [task-flow.md](task-flow.md) §9 for the full recursive data-flow
 walk-through.
