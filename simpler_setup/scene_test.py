@@ -20,12 +20,19 @@ A scene test class declares three things:
   generate_args / compute_golden: data + golden comparison
 """
 
+from __future__ import annotations
+
 import inspect
+import logging
 import os
 import sys
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple
+
+from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
+
+logger = logging.getLogger(__name__)
 
 _compile_cache: dict[tuple[str, str, str], object] = {}
 
@@ -109,7 +116,7 @@ class TaskArgsBuilder:
         except KeyError:
             raise AttributeError(f"TaskArgsBuilder has no argument '{name}'") from None
 
-    def clone(self) -> "TaskArgsBuilder":
+    def clone(self) -> TaskArgsBuilder:
         """Deep clone: all tensors are cloned, scalars copied."""
         import torch  # noqa: PLC0415
 
@@ -192,10 +199,13 @@ class CallableNamespace:
 
 
 def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
-    """Build ChipStorageTaskArgs from TaskArgsBuilder + identify outputs via signature.
+    """Build `ChipStorageTaskArgs` (POD) from `TaskArgsBuilder`.
+
+    Used by the L2 path (`ChipWorker.run(callable, chip_args, config)`): the
+    chip worker expects the runtime.so ABI-shaped POD directly (no tags).
 
     Returns:
-        chip_args: ChipStorageTaskArgs (for worker.run)
+        chip_args: ChipStorageTaskArgs (POD)
         output_names: list of tensor names that are OUTPUT or INOUT
     """
     from simpler.task_interface import (  # noqa: PLC0415
@@ -211,7 +221,6 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     tensor_idx = 0
     for spec in test_args.specs:
         if isinstance(spec, Tensor):
-            chip_args.add_tensor(make_tensor_arg(spec.value))
             if tensor_idx >= len(orch_signature):
                 raise ValueError(
                     f"Tensor '{spec.name}' at index {tensor_idx} has no matching entry in "
@@ -219,6 +228,56 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
                     f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
                 )
             direction = orch_signature[tensor_idx]
+            chip_args.add_tensor(make_tensor_arg(spec.value))
+            if direction in (ArgDirection.OUT, ArgDirection.INOUT):
+                output_names.append(spec.name)
+            tensor_idx += 1
+        elif isinstance(spec, Scalar):
+            chip_args.add_scalar(scalar_to_uint64(spec.value))
+
+    return chip_args, output_names
+
+
+def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list):
+    """Build a tagged `TaskArgs` (vector-backed, with `TensorArgType` tags) from
+    `TaskArgsBuilder`.
+
+    Used by the L3 path (`orch.submit_next_level(callable, args, config)`):
+    the orchestrator reads the tags to drive dependency inference.
+
+    Returns:
+        chip_args: TaskArgs (tagged)
+        output_names: list of tensor names that are OUTPUT or INOUT
+    """
+    from simpler.task_interface import (  # noqa: PLC0415
+        ArgDirection,
+        TaskArgs,
+        TensorArgType,
+        make_tensor_arg,
+        scalar_to_uint64,
+    )
+
+    _DIR_TO_TAG = {
+        ArgDirection.IN: TensorArgType.INPUT,
+        ArgDirection.OUT: TensorArgType.OUTPUT_EXISTING,
+        ArgDirection.INOUT: TensorArgType.INOUT,
+    }
+
+    chip_args = TaskArgs()
+    output_names: list[str] = []
+
+    tensor_idx = 0
+    for spec in test_args.specs:
+        if isinstance(spec, Tensor):
+            if tensor_idx >= len(orch_signature):
+                raise ValueError(
+                    f"Tensor '{spec.name}' at index {tensor_idx} has no matching entry in "
+                    f"orchestration signature (length {len(orch_signature)}). "
+                    f"Update CALLABLE['orchestration']['signature'] to match generate_args()."
+                )
+            direction = orch_signature[tensor_idx]
+            tag = _DIR_TO_TAG.get(direction, TensorArgType.INPUT)
+            chip_args.add_tensor(make_tensor_arg(spec.value), tag)
             if direction in (ArgDirection.OUT, ArgDirection.INOUT):
                 output_names.append(spec.name)
             tensor_idx += 1
@@ -281,6 +340,205 @@ def _resolve_chip_entry_paths(entry, cls_dir):
         entry["incores"] = resolved
 
 
+def _parse_case_selector(value: str) -> tuple[str | None, str | None]:
+    """Parse one ``--case`` value into ``(class_name, case_name)``.
+
+    ``Foo`` -> ``(None, "Foo")`` (any class)
+    ``ClassA::Foo`` -> ``("ClassA", "Foo")``
+    ``ClassA::`` -> ``("ClassA", None)`` (all cases in ClassA)
+    ``::Foo`` -> ``(None, "Foo")``
+    """
+    if "::" in value:
+        cls_part, case_part = value.split("::", 1)
+        return (cls_part or None, case_part or None)
+    return (None, value)
+
+
+def _match_selectors(cls_name: str, case_name: str, selectors: list[tuple]) -> bool:
+    """True if ``(cls_name, case_name)`` matches any selector (empty list means no selector filter)."""
+    if not selectors:
+        return True
+    for sel_cls, sel_case in selectors:
+        if (sel_cls is None or sel_cls == cls_name) and (sel_case is None or sel_case == case_name):
+            return True
+    return False
+
+
+def _select_cases(test_classes, platform: str, selectors: list[tuple], manual_mode: str):
+    """Resolve (class, case) pairs to run. Validates selectors strictly.
+
+    Filters: platform match -> selector match -> manual_mode (exclude/include/only).
+    Raises ``ValueError`` on unknown selector class/case or empty selection.
+    """
+    class_index = {c.__name__: c for c in test_classes}
+    for sel_cls, _ in selectors:
+        if sel_cls is not None and sel_cls not in class_index:
+            available = ", ".join(sorted(class_index)) or "(none)"
+            raise ValueError(f"--case: unknown class '{sel_cls}'. Available: {available}")
+    for sel_cls, sel_case in selectors:
+        if sel_case is None:
+            continue
+        scoped = [class_index[sel_cls]] if sel_cls else test_classes
+        if not any(case["name"] == sel_case for c in scoped for case in c.CASES):
+            scope = sel_cls or "any class"
+            raise ValueError(f"--case: case '{sel_case}' not found in {scope}")
+
+    selected: list[tuple] = []
+    for cls in test_classes:
+        for case in cls.CASES:
+            if platform not in case["platforms"]:
+                continue
+            if not _match_selectors(cls.__name__, case["name"], selectors):
+                continue
+            is_manual = bool(case.get("manual"))
+            if manual_mode == "exclude" and is_manual:
+                continue
+            if manual_mode == "only" and not is_manual:
+                continue
+            selected.append((cls, case))
+
+    if not selected:
+        if selectors:
+            sel_str = ", ".join(f"{c or '*'}::{n or '*'}" for c, n in selectors)
+            hint = " (matches are manual; pass --manual include or only)" if manual_mode == "exclude" else ""
+            raise ValueError(f"--case: no cases matched [{sel_str}] for platform={platform}{hint}")
+        raise ValueError(f"No cases matched platform={platform} (manual={manual_mode})")
+    return selected
+
+
+def _project_root() -> Path:
+    return Path(__file__).resolve().parent.parent
+
+
+def _outputs_dir() -> Path:
+    return _project_root() / "outputs"
+
+
+def _snapshot_perf_files() -> set[Path]:
+    d = _outputs_dir()
+    return set(d.glob("perf_swimlane_*.json")) if d.exists() else set()
+
+
+def _wait_new_perf_file(before: set[Path], timeout: float = 2.0) -> Path | None:
+    """Wait briefly for a new ``perf_swimlane_*.json`` to appear in outputs/."""
+    import time  # noqa: PLC0415
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        new = _snapshot_perf_files() - before
+        if new:
+            return max(new, key=lambda p: p.stat().st_mtime)
+        time.sleep(0.1)
+    return None
+
+
+def _get_device_log_dir(device_id) -> Path:
+    """Return CANN device log directory (matches device_log_resolver)."""
+    ascend_work_path = os.environ.get("ASCEND_WORK_PATH")
+    if ascend_work_path:
+        root = Path(ascend_work_path).expanduser() / "log" / "debug"
+        if root.exists():
+            return root / f"device-{device_id}"
+    return Path.home() / "ascend" / "log" / "debug" / f"device-{device_id}"
+
+
+def _snapshot_device_logs(device_id) -> set[Path]:
+    log_dir = _get_device_log_dir(device_id)
+    return set(log_dir.glob("*.log")) if log_dir.exists() else set()
+
+
+def _wait_new_device_log(device_id, before: set[Path], timeout: float = 15.0) -> Path | None:
+    """Wait for a new CANN device log; returns the newest new file or None."""
+    import time  # noqa: PLC0415
+
+    log_dir = _get_device_log_dir(device_id)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if log_dir.exists():
+            new = set(log_dir.glob("*.log")) - before
+            if new:
+                return max(new, key=lambda p: p.stat().st_mtime)
+        time.sleep(0.5)
+    return None
+
+
+def _run_swimlane_converter(
+    input_path: Path | None = None,
+    device_id=None,
+    device_log: Path | None = None,
+) -> None:
+    """Invoke ``tools/swimlane_converter.py``.
+
+    When ``input_path`` is given, the converter derives its output filename from
+    the input's timestamp (see ``tools/swimlane_converter.py::_resolve_output_path``).
+    Without it, the converter auto-selects the latest ``perf_swimlane_*.json``.
+    """
+    import logging  # noqa: PLC0415
+    import subprocess  # noqa: PLC0415
+
+    logger = logging.getLogger(__name__)
+    script = _project_root() / "tools" / "swimlane_converter.py"
+    if not script.exists():
+        logger.warning(f"Swimlane converter script not found: {script}")
+        return
+    cmd = [sys.executable, str(script)]
+    if input_path is not None:
+        cmd.append(str(input_path))
+    if device_log is not None:
+        cmd += ["--device-log", str(device_log)]
+    elif device_id is not None:
+        cmd += ["-d", str(device_id)]
+    try:
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        if result.stdout:
+            logger.info(result.stdout)
+        logger.info("Swimlane JSON generation completed")
+    except subprocess.CalledProcessError as e:
+        logger.warning(f"Failed to generate swimlane JSON: {e}")
+        if e.stdout:
+            logger.debug(f"stdout: {e.stdout}")
+        if e.stderr:
+            logger.debug(f"stderr: {e.stderr}")
+
+
+def _sanitize_for_filename(s: str) -> str:
+    return "".join(c if c.isalnum() or c in "._-" else "_" for c in s)
+
+
+def _convert_case_swimlane(
+    case_label: str,
+    device_id,
+    before_perf: set[Path],
+    before_device: set[Path] | None,
+) -> None:
+    """Post-case: rename the new perf file to include ``case_label`` (guarding against
+    the runtime's second-precision filename collisions), then invoke the converter.
+
+    The ``perf_swimlane_`` prefix is preserved so the converter's stem-based output
+    naming still strips it and produces ``merged_swimlane_<ts>_<case_label>.json``.
+    """
+    import logging  # noqa: PLC0415
+
+    logger = logging.getLogger(__name__)
+    perf_file = _wait_new_perf_file(before_perf)
+    if perf_file is None:
+        logger.warning(f"[{case_label}] No new perf_swimlane_*.json produced; skipping conversion")
+        return
+    safe_label = _sanitize_for_filename(case_label)
+    suffix = perf_file.stem[len("perf_swimlane_") :] if perf_file.stem.startswith("perf_swimlane_") else perf_file.stem
+    renamed = perf_file.with_name(f"perf_swimlane_{suffix}_{safe_label}.json")
+    if renamed.exists():
+        logger.warning(f"[{case_label}] target {renamed.name} already exists; overwriting")
+        renamed.unlink()
+    perf_file.rename(renamed)
+    device_log = None
+    if before_device is not None:
+        device_log = _wait_new_device_log(device_id, before_device)
+        if device_log is None:
+            logger.warning(f"[{case_label}] no new device log found; scheduler deep-dive may use stale log")
+    _run_swimlane_converter(input_path=renamed, device_id=device_id, device_log=device_log)
+
+
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
     """Compare output tensors against golden values."""
     import torch  # noqa: PLC0415
@@ -328,6 +586,7 @@ def _compile_chip_callable_from_spec(spec, platform, runtime, cache_key):
         func_name=orch["function_name"],
         binary=orch_binary,
         children=kernel_binaries,
+        config_name=orch.get("config_name", ""),
     )
     _compile_cache[cache_key] = chip_callable
     return chip_callable
@@ -444,13 +703,14 @@ class SceneTestCase:
             return self._compile_l3_callables(platform)
         raise ValueError(f"Unsupported level: {self._st_level}")
 
-    def _build_config(self, config_dict, enable_profiling=False):
+    def _build_config(self, config_dict, enable_profiling=False, enable_dump_tensor=False):
         from simpler.task_interface import ChipCallConfig  # noqa: PLC0415
 
         config = ChipCallConfig()
         config.block_dim = config_dict.get("block_dim", 1)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
         config.enable_profiling = enable_profiling
+        config.enable_dump_tensor = enable_dump_tensor
         return config
 
     def _resolve_env(self):
@@ -471,7 +731,15 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     def _run_and_validate(
-        self, worker, callable_obj, case, sub_ids=None, rounds=1, skip_golden=False, enable_profiling=False
+        self,
+        worker,
+        callable_obj,
+        case,
+        sub_ids=None,
+        rounds=1,
+        skip_golden=False,
+        enable_profiling=False,
+        enable_dump_tensor=False,
     ):
         if self._st_level == 2:
             self._run_and_validate_l2(
@@ -481,6 +749,7 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_profiling=enable_profiling,
+                enable_dump_tensor=enable_dump_tensor,
             )
         elif self._st_level == 3:
             self._run_and_validate_l3(
@@ -491,9 +760,12 @@ class SceneTestCase:
                 rounds=rounds,
                 skip_golden=skip_golden,
                 enable_profiling=enable_profiling,
+                enable_dump_tensor=enable_dump_tensor,
             )
 
-    def _run_and_validate_l2(self, worker, callable_obj, case, rounds=1, skip_golden=False, enable_profiling=False):
+    def _run_and_validate_l2(
+        self, worker, callable_obj, case, rounds=1, skip_golden=False, enable_profiling=False, enable_dump_tensor=False
+    ):
         params = case.get("params", {})
         config_dict = case.get("config", {})
         orch_sig = self.CALLABLE.get("orchestration", {}).get("signature", [])
@@ -520,7 +792,11 @@ class SceneTestCase:
                 for name, initial in initial_outputs.items():
                     getattr(test_args, name).copy_(initial)
 
-            config = self._build_config(config_dict, enable_profiling=(enable_profiling and round_idx == 0))
+            config = self._build_config(
+                config_dict,
+                enable_profiling=(enable_profiling and round_idx == 0),
+                enable_dump_tensor=enable_dump_tensor,
+            )
 
             with _temporary_env(self._resolve_env()):
                 worker.run(callable_obj, chip_args, config=config)
@@ -529,10 +805,16 @@ class SceneTestCase:
                 _compare_outputs(test_args, golden_args, output_names, self.RTOL, self.ATOL)
 
     def _run_and_validate_l3(
-        self, worker, compiled_callables, sub_ids, case, rounds=1, skip_golden=False, enable_profiling=False
+        self,
+        worker,
+        compiled_callables,
+        sub_ids,
+        case,
+        rounds=1,
+        skip_golden=False,
+        enable_profiling=False,
+        enable_dump_tensor=False,
     ):
-        from simpler.worker import Task  # noqa: PLC0415
-
         params = case.get("params", {})
         config_dict = case.get("config", {})
 
@@ -564,14 +846,19 @@ class SceneTestCase:
                 for name, initial in initial_tensors.items():
                     getattr(test_args, name).copy_(initial)
 
-            config = self._build_config(config_dict, enable_profiling=(enable_profiling and round_idx == 0))
+            config = self._build_config(
+                config_dict,
+                enable_profiling=(enable_profiling and round_idx == 0),
+                enable_dump_tensor=enable_dump_tensor,
+            )
 
-            # Wrap in Task — user orch signature: (orch, callables, task_args, config)
-            def task_orch(orch, _unused, _ns=ns, _test_args=test_args, _config=config):
+            # Orch fn signature: (orch, args, cfg) — inner fn forwards to
+            # the user's scene orch which takes (orch, callables, task_args, config).
+            def task_orch(orch, _args, _cfg, _ns=ns, _test_args=test_args, _config=config):
                 orch_fn(orch, _ns, _test_args, _config)
 
             with _temporary_env(self._resolve_env()):
-                worker.run(Task(orch=task_orch))
+                worker.run(task_orch)
 
             if not skip_golden:
                 _compare_outputs(test_args, golden_args, all_tensor_names, self.RTOL, self.ATOL)
@@ -582,37 +869,63 @@ class SceneTestCase:
 
     def test_run(self, st_platform, st_worker, request):
         """Auto test method — runs matching cases for the current platform."""
-        case_filter = request.config.getoption("--case", default=None)
-        all_cases = request.config.getoption("--all-cases", default=False)
+        raw_selectors = request.config.getoption("--case", default=None) or []
+        selectors = [_parse_case_selector(v) for v in raw_selectors]
+        manual_mode = request.config.getoption("--manual", default="exclude")
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
         enable_profiling = request.config.getoption("--enable-profiling", default=False)
+        enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
+        if rounds > 1 and enable_profiling:
+            logger.warning("Profiling disabled: --rounds > 1")
+            enable_profiling = False
 
+        cls_name = type(self).__name__
         callable_obj = self.build_callable(st_platform)
         sub_ids = getattr(type(self), "_st_sub_ids", {})
+
+        # Primary device id: prefer the one actually allocated by st_worker
+        # (each test class can hold a different slot from DevicePool); fall back
+        # to the first id in --device if the fixture didn't stash it.
+        primary_device_id = getattr(st_worker, "_st_device_id", None)
+        if primary_device_id is None:
+            raw_device = request.config.getoption("--device", default="0")
+            primary_device_id = raw_device.split("-", 1)[0] if "-" in raw_device else raw_device
+        is_hardware = not st_platform.endswith("sim")
+
         ran_any = False
         for case in self.CASES:
             if st_platform not in case["platforms"]:
                 continue
-            if case_filter and case["name"] != case_filter:
+            if not _match_selectors(cls_name, case["name"], selectors):
                 continue
-            if case.get("manual") and not case_filter and not all_cases:
+            is_manual = bool(case.get("manual"))
+            if manual_mode == "exclude" and is_manual:
                 continue
-            self._run_and_validate(
-                st_worker,
-                callable_obj,
-                case,
-                sub_ids=sub_ids,
-                rounds=rounds,
-                skip_golden=skip_golden,
-                enable_profiling=enable_profiling,
-            )
+            if manual_mode == "only" and not is_manual:
+                continue
+            before_perf = _snapshot_perf_files() if enable_profiling else set()
+            before_device = _snapshot_device_logs(primary_device_id) if enable_profiling and is_hardware else None
+            try:
+                self._run_and_validate(
+                    st_worker,
+                    callable_obj,
+                    case,
+                    sub_ids=sub_ids,
+                    rounds=rounds,
+                    skip_golden=skip_golden,
+                    enable_profiling=enable_profiling,
+                    enable_dump_tensor=enable_dump_tensor,
+                )
+            finally:
+                if enable_profiling:
+                    _convert_case_swimlane(f"{cls_name}_{case['name']}", primary_device_id, before_perf, before_device)
             ran_any = True
 
         if not ran_any:
             import pytest  # noqa: PLC0415
 
-            pytest.skip(f"No cases matched platform={st_platform}")
+            pytest.skip(f"No cases matched {cls_name} (platform={st_platform}, manual={manual_mode})")
 
     # ------------------------------------------------------------------
     # Standalone entry point
@@ -626,19 +939,35 @@ class SceneTestCase:
         parser = argparse.ArgumentParser()
         parser.add_argument("-p", "--platform", required=True)
         parser.add_argument("-d", "--device", type=int, default=0)
-        parser.add_argument("--case", help="Run specific case name")
-        parser.add_argument("--all-cases", action="store_true", help="Include manual cases")
-        parser.add_argument("-n", "--rounds", type=int, default=1, help="Run each case N times (default: 1)")
+        parser.add_argument(
+            "--case",
+            action="append",
+            default=None,
+            help="Case selector; repeatable. Forms: 'Foo' (any class), 'ClassA::Foo', 'ClassA::'",
+        )
+        parser.add_argument(
+            "--manual",
+            choices=["exclude", "include", "only"],
+            default="exclude",
+            help="Manual case handling: exclude (default), include, only",
+        )
+        parser.add_argument("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
         parser.add_argument("--enable-profiling", action="store_true", help="Enable profiling (first round only)")
+        parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
         parser.add_argument("--build", action="store_true", help="Compile runtime from source")
         parser.add_argument(
-            "--log-level", choices=["error", "warn", "info", "debug"], help="Set PTO_LOG_LEVEL environment variable"
+            "--log-level",
+            choices=LOG_LEVEL_CHOICES,
+            default=DEFAULT_LOG_LEVEL,
+            help=f"Root logger level (default: {DEFAULT_LOG_LEVEL})",
         )
         args = parser.parse_args()
+        configure_logging(args.log_level)
 
-        if args.log_level:
-            os.environ["PTO_LOG_LEVEL"] = args.log_level
+        if args.rounds > 1 and args.enable_profiling:
+            logger.warning("Profiling disabled: --rounds > 1")
+            args.enable_profiling = False
 
         module = sys.modules[module_name]
         test_classes = [
@@ -647,9 +976,28 @@ class SceneTestCase:
             if isinstance(v, type) and issubclass(v, SceneTestCase) and v is not SceneTestCase and hasattr(v, "CASES")
         ]
 
+        selectors = [_parse_case_selector(v) for v in (args.case or [])]
+        try:
+            selected = _select_cases(test_classes, args.platform, selectors, args.manual)
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            sys.exit(2)
+
+        selected_by_cls: dict[type, list[dict]] = {}
+        for cls, case in selected:
+            selected_by_cls.setdefault(cls, []).append(case)
+
         by_runtime: dict[str, list[type]] = {}
-        for cls in test_classes:
+        for cls in selected_by_cls:
             by_runtime.setdefault(cls._st_runtime, []).append(cls)
+
+        is_hardware = not args.platform.endswith("sim")
+        if args.enable_profiling and is_hardware and "-d" not in sys.argv and "--device" not in sys.argv:
+            print(
+                f"WARNING: --enable-profiling on hardware platform '{args.platform}' without explicit "
+                "-d/--device; defaulting to device 0 may point scheduler deep-dive at the wrong log.",
+                file=sys.stderr,
+            )
 
         ok = True
         for runtime, group in by_runtime.items():
@@ -660,15 +1008,13 @@ class SceneTestCase:
                     inst = cls()
                     callable_obj = inst.build_callable(args.platform)
                     sub_ids = per_class_sub_ids.get(cls, {})
-                    for case in inst.CASES:
-                        if args.platform not in case["platforms"]:
-                            continue
-                        if args.case and case["name"] != args.case:
-                            continue
-                        if case.get("manual") and not args.case and not args.all_cases:
-                            continue
+                    for case in selected_by_cls[cls]:
                         label = f"{cls.__name__}::{case['name']}"
                         print(f"  {label} ... ", end="", flush=True)
+                        before_perf = _snapshot_perf_files() if args.enable_profiling else set()
+                        before_device = (
+                            _snapshot_device_logs(args.device) if args.enable_profiling and is_hardware else None
+                        )
                         try:
                             inst._run_and_validate(
                                 worker,
@@ -678,16 +1024,26 @@ class SceneTestCase:
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
                                 enable_profiling=args.enable_profiling,
+                                enable_dump_tensor=args.dump_tensor,
                             )
                             print("PASSED")
                         except Exception as e:
                             print(f"FAILED: {e}")
                             ok = False
+                        finally:
+                            if args.enable_profiling:
+                                _convert_case_swimlane(
+                                    f"{cls.__name__}_{case['name']}",
+                                    args.device,
+                                    before_perf,
+                                    before_device,
+                                )
             finally:
                 if group[0]._st_level == 2:
                     worker.finalize()
                 else:
                     worker.close()
+
         sys.exit(0 if ok else 1)
 
 

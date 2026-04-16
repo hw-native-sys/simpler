@@ -71,7 +71,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     uint64_t scale_value = orch_args.scalar(0);
 
-    uint64_t q_tile = std::min(num_heads, 128UL);
+    uint64_t q_tile = std::min(num_heads, static_cast<uint64_t>(128));
     uint64_t q_loop = (num_heads + q_tile - 1) / q_tile;
     uint64_t elem_size = get_element_size(data_type);
 

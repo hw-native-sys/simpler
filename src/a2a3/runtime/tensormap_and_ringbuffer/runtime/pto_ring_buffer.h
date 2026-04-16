@@ -280,16 +280,30 @@ private:
                 result = static_cast<char *>(heap_base_) + top;
                 heap_top_ = top + alloc_size;
             } else if (tail > alloc_size) {
+                LOG_DEBUG(
+                    "try_bump_heap wrap-around alloc: top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64, top, tail,
+                    alloc_size
+                );
                 result = heap_base_;
                 heap_top_ = alloc_size;
             } else {
+                LOG_DEBUG(
+                    "try_bump_heap failed (top>=tail): top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64
+                    ", heap_size=%" PRIu64,
+                    top, tail, alloc_size, heap_size_
+                );
                 return nullptr;
             }
         } else {
-            if (tail - top >= alloc_size) {
+            if (tail - top > alloc_size) {
                 result = static_cast<char *>(heap_base_) + top;
                 heap_top_ = top + alloc_size;
             } else {
+                LOG_DEBUG(
+                    "try_bump_heap failed (top<tail): top=%" PRIu64 ", tail=%" PRIu64 ", alloc=%" PRIu64
+                    ", free_gap=%" PRIu64,
+                    top, tail, alloc_size, tail - top
+                );
                 return nullptr;
             }
         }

@@ -17,10 +17,16 @@ subprocess per runtime so each gets a clean CANN context. See docs/testing.md.
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 
 import pytest
+
+# Exit code used when the session watchdog fires. Matches the GNU `timeout`
+# convention so shell wrappers (e.g. CI) can distinguish timeout from other
+# failures.
+TIMEOUT_EXIT_CODE = 124
 
 
 def _parse_device_range(s: str) -> list[int]:
@@ -59,8 +65,19 @@ def pytest_addoption(parser):
     """Register CLI options."""
     parser.addoption("--platform", action="store", default=None, help="Target platform (e.g., a2a3sim, a2a3)")
     parser.addoption("--device", action="store", default="0", help="Device ID or range (e.g., 0, 4-7)")
-    parser.addoption("--case", action="store", default=None, help="Run specific case name only")
-    parser.addoption("--all-cases", action="store_true", default=False, help="Include manual cases")
+    parser.addoption(
+        "--case",
+        action="append",
+        default=None,
+        help="Case selector; repeatable. Forms: 'Foo' (any class), 'ClassA::Foo', 'ClassA::' (whole class).",
+    )
+    parser.addoption(
+        "--manual",
+        action="store",
+        choices=["exclude", "include", "only"],
+        default="exclude",
+        help="Manual case handling: exclude (default), include, only",
+    )
     parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
     parser.addoption("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
     parser.addoption(
@@ -69,7 +86,48 @@ def pytest_addoption(parser):
     parser.addoption(
         "--enable-profiling", action="store_true", default=False, help="Enable profiling (first round only)"
     )
+    parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
     parser.addoption("--build", action="store_true", default=False, help="Compile runtime from source")
+    parser.addoption(
+        "--pto-isa-commit",
+        action="store",
+        default=None,
+        help="Pin pto-isa clone to this commit before running tests",
+    )
+    parser.addoption(
+        "--clone-protocol",
+        action="store",
+        default="ssh",
+        choices=["ssh", "https"],
+        help="Protocol for cloning pto-isa when --pto-isa-commit is set",
+    )
+    # Distinct from pytest-timeout's per-test --timeout (which `.[test]` pulls
+    # in on the a2a3 hardware runner); this is session-level.
+    parser.addoption(
+        "--pto-session-timeout",
+        action="store",
+        type=int,
+        default=0,
+        help=(f"Abort whole pytest session after N seconds (0 = disabled; exit code {TIMEOUT_EXIT_CODE} on timeout)"),
+    )
+
+
+def _install_session_timeout(timeout_s: int) -> None:
+    def _handler(signum, frame):
+        print(
+            f"\n{'=' * 40}\n"
+            f"[pytest] TIMEOUT: session exceeded {timeout_s}s "
+            f"({timeout_s // 60}min) limit, aborting\n"
+            f"{'=' * 40}",
+            flush=True,
+        )
+        os._exit(TIMEOUT_EXIT_CODE)
+
+    # signal.alarm / SIGALRM are Unix-only; skip silently on platforms without
+    # them so --pto-session-timeout is a no-op rather than a crash (e.g. Windows).
+    if hasattr(signal, "alarm") and hasattr(signal, "SIGALRM"):
+        signal.signal(signal.SIGALRM, _handler)
+        signal.alarm(timeout_s)
 
 
 def pytest_configure(config):
@@ -77,10 +135,31 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "platforms(list): supported platforms for standalone ST functions")
     config.addinivalue_line("markers", "requires_hardware: test needs Ascend toolchain and real device")
     config.addinivalue_line("markers", "device_count(n): number of NPU devices needed")
+    config.addinivalue_line(
+        "markers",
+        "runtime(name): runtime this standalone test targets; used by runtime-isolation subprocess "
+        "filtering so non-@scene_test tests only run under their matching runtime",
+    )
 
     log_level = config.getoption("--log-level", default=None)
     if log_level:
         os.environ["PTO_LOG_LEVEL"] = log_level
+
+    commit = config.getoption("--pto-isa-commit")
+    if commit:
+        from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+        root = ensure_pto_isa_root(
+            verbose=True,
+            commit=commit,
+            clone_protocol=config.getoption("--clone-protocol"),
+        )
+        if root:
+            os.environ["PTO_ISA_ROOT"] = root
+
+    timeout = config.getoption("--pto-session-timeout")
+    if timeout and timeout > 0:
+        _install_session_timeout(timeout)
 
 
 def pytest_collection_modifyitems(session, config, items):
@@ -115,6 +194,14 @@ def pytest_collection_modifyitems(session, config, items):
                 item.add_marker(pytest.mark.skip(reason="--platform required"))
             elif platform not in platforms_marker.args[0]:
                 item.add_marker(pytest.mark.skip(reason=f"Not supported on {platform}"))
+
+        # runtime-isolation filter for non-@scene_test tests: if the item declares
+        # `@pytest.mark.runtime("X")` and a --runtime filter is active, skip when
+        # they don't match. Prevents test_explicit_fatal_reports and friends from
+        # running under every runtime's subprocess.
+        runtime_marker = item.get_closest_marker("runtime")
+        if runtime_marker and runtime_marker.args and runtime_filter and runtime_marker.args[0] != runtime_filter:
+            item.add_marker(pytest.mark.skip(reason=f"Runtime {runtime_marker.args[0]} != {runtime_filter}"))
 
 
 # ---------------------------------------------------------------------------
@@ -161,6 +248,9 @@ def pytest_runtestloop(session):
         print(f"\n{'=' * 60}\n{header}\n{'=' * 60}\n", flush=True)
 
         result = subprocess.run(cmd, check=False, cwd=session.config.invocation_params.dir)
+        if result.returncode == TIMEOUT_EXIT_CODE:
+            print(f"\n*** Runtime {rt}: TIMED OUT ***\n", flush=True)
+            os._exit(TIMEOUT_EXIT_CODE)
         if result.returncode != 0:
             failed = True
             print(f"\n*** Runtime {rt}: FAILED ***\n", flush=True)
@@ -218,11 +308,12 @@ def st_worker(request, st_platform, device_pool):
     if level == 2:
         ids = device_pool.allocate(1)
         if not ids:
-            pytest.fail("no devices available")
+            pytest.fail(f"no devices available in --device pool (requested 1, pool has {len(device_pool._available)})")
 
         from simpler.worker import Worker  # noqa: PLC0415
 
         w = Worker(level=2, device_id=ids[0], platform=st_platform, runtime=runtime, build=build)
+        w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
         w.init()
         yield w
         w.close()
@@ -233,7 +324,9 @@ def st_worker(request, st_platform, device_pool):
         max_subs = max((c.get("config", {}).get("num_sub_workers", 0) for c in cls.CASES), default=0)
         ids = device_pool.allocate(max_devices)
         if not ids:
-            pytest.fail(f"need {max_devices} devices")
+            pytest.fail(
+                f"need {max_devices} devices but --device pool has {len(device_pool._available)}; widen --device range"
+            )
 
         from simpler.worker import Worker  # noqa: PLC0415
 
@@ -245,6 +338,7 @@ def st_worker(request, st_platform, device_pool):
             runtime=runtime,
             build=build,
         )
+        w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
 
         # Register SubCallable entries from cls.CALLABLE
         sub_ids = {}

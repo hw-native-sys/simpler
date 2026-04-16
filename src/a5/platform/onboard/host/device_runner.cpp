@@ -148,15 +148,14 @@ std::thread DeviceRunner::create_thread(std::function<void()> fn) {
     return std::thread([dev_id, fn = std::move(fn)]() {
         rtSetDevice(dev_id);
         fn();
-        rtDeviceReset(dev_id);
     });
 }
 
 int DeviceRunner::ensure_device_initialized(
     int device_id, const std::vector<uint8_t> &aicpu_so_binary, const std::vector<uint8_t> &aicore_kernel_binary
 ) {
-    // First ensure device is set and streams are created
-    int rc = ensure_device_set(device_id);
+    // First attach the current thread and create fresh run-scoped streams
+    int rc = prepare_run_context(device_id);
     if (rc != 0) {
         return rc;
     }
@@ -165,20 +164,41 @@ int DeviceRunner::ensure_device_initialized(
     return ensure_binaries_loaded(aicpu_so_binary, aicore_kernel_binary);
 }
 
-int DeviceRunner::ensure_device_set(int device_id) {
-    // Always set device for the calling thread (CANN device context is per-thread)
+int DeviceRunner::attach_current_thread(int device_id) {
+    if (device_id < 0) {
+        LOG_ERROR("Invalid device_id: %d", device_id);
+        return -1;
+    }
+    if (device_id_ != -1 && device_id_ != device_id) {
+        LOG_ERROR(
+            "DeviceRunner already initialized on device %d; reset/finalize before switching to device %d", device_id_,
+            device_id
+        );
+        return -1;
+    }
+
+    // CANN device context is per-thread, so every caller must attach explicitly.
     int rc = rtSetDevice(device_id);
     if (rc != 0) {
         LOG_ERROR("rtSetDevice(%d) failed: %d", device_id, rc);
         return rc;
     }
 
-    // Check if streams already initialized
-    if (stream_aicpu_ != nullptr) {
+    device_id_ = device_id;
+    return 0;
+}
+
+int DeviceRunner::prepare_run_context(int device_id) {
+    int rc = attach_current_thread(device_id);
+    if (rc != 0) {
+        return rc;
+    }
+
+    if (stream_aicpu_ != nullptr && stream_aicore_ != nullptr) {
         return 0;
     }
 
-    device_id_ = device_id;
+    release_run_context();
 
     // Create streams
     rc = rtStreamCreate(&stream_aicpu_, 0);
@@ -199,7 +219,7 @@ int DeviceRunner::ensure_device_set(int device_id) {
     return 0;
 }
 
-void DeviceRunner::reset_device_context() {
+void DeviceRunner::release_run_context() {
     if (stream_aicpu_ != nullptr) {
         rtStreamDestroy(stream_aicpu_);
         stream_aicpu_ = nullptr;
@@ -208,7 +228,6 @@ void DeviceRunner::reset_device_context() {
         rtStreamDestroy(stream_aicore_);
         stream_aicore_ = nullptr;
     }
-    rtDeviceReset(device_id_);
 }
 
 int DeviceRunner::ensure_binaries_loaded(
@@ -271,9 +290,8 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
 
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
+    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor
 ) {
-    // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
@@ -339,6 +357,10 @@ int DeviceRunner::run(
 
     // Calculate number of AIC cores (1/3 of total)
     int num_aic = block_dim;  // Round up for 1/3
+    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
+    if (enable_dump_tensor) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -348,6 +370,7 @@ int DeviceRunner::run(
         runtime.workers[i].task_status = 0;
         // Set core type: first 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
+        runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
         runtime.workers[i].perf_records_addr = static_cast<uint64_t>(0);
         runtime.workers[i].perf_buffer_status = 0;
     }
@@ -382,6 +405,15 @@ int DeviceRunner::run(
         rc = init_performance_profiling(runtime, num_aicore, device_id);
         if (rc != 0) {
             LOG_ERROR("init_performance_profiling failed: %d", rc);
+            return rc;
+        }
+    }
+
+    // Initialize tensor dump if enabled
+    if (enable_dump_tensor) {
+        rc = init_tensor_dump(runtime, num_aicore, device_id);
+        if (rc != 0) {
+            LOG_ERROR("init_tensor_dump failed: %d", rc);
             return rc;
         }
     }
@@ -444,6 +476,12 @@ int DeviceRunner::run(
         export_swimlane_json();
     }
 
+    // Collect and export tensor dump data
+    if (enable_dump_tensor) {
+        dump_collector_.collect_all();
+        dump_collector_.export_dump_files();
+    }
+
     // Print handshake results (reads from device memory, must be before free)
     print_handshake_results();
 
@@ -470,9 +508,17 @@ void DeviceRunner::print_handshake_results() {
 }
 
 int DeviceRunner::finalize() {
-    if (stream_aicpu_ == nullptr) {
+    if (device_id_ == -1) {
         return 0;
     }
+
+    int rc = attach_current_thread(device_id_);
+    if (rc != 0) {
+        LOG_ERROR("Failed to attach finalize thread to device %d: %d", device_id_, rc);
+        return rc;
+    }
+
+    release_run_context();
 
     // Cleanup kernel args (deviceArgs)
     kernel_args_.finalize_device_args();
@@ -493,25 +539,27 @@ int DeviceRunner::finalize() {
     func_id_to_addr_.clear();
     binaries_loaded_ = false;
 
-    // Destroy streams
-    if (stream_aicpu_ != nullptr) {
-        rtStreamDestroy(stream_aicpu_);
-        stream_aicpu_ = nullptr;
-    }
-    if (stream_aicore_ != nullptr) {
-        rtStreamDestroy(stream_aicore_);
-        stream_aicore_ = nullptr;
-    }
-
     // Cleanup performance profiling (frees PerfSetupHeader + all per-core/per-thread buffers)
     if (perf_collector_.is_initialized()) {
         perf_collector_.finalize();
     }
 
+    // Cleanup tensor dump
+    if (dump_collector_.is_initialized()) {
+        dump_collector_.finalize();
+    }
+
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 
+    rc = rtDeviceReset(device_id_);
+    if (rc != 0) {
+        LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, rc);
+        return rc;
+    }
+
     device_id_ = -1;
+    block_dim_ = 0;
     worker_count_ = 0;
     aicore_kernel_binary_.clear();
 
@@ -599,7 +647,7 @@ uint64_t DeviceRunner::upload_kernel_binary(int func_id, const uint8_t *bin_data
 
     // Device must be set first (set_device() must be called before upload_kernel_binary())
     if (stream_aicpu_ == nullptr) {
-        LOG_ERROR("Device not set. Call set_device() before upload_kernel_binary()");
+        LOG_ERROR("Run context not prepared before upload_kernel_binary()");
         return 0;
     }
 
@@ -686,4 +734,36 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
 
 int DeviceRunner::export_swimlane_json(const std::string &output_path) {
     return perf_collector_.export_swimlane_json(output_path);
+}
+
+int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {
+    (void)num_aicore;
+    int num_dump_threads = runtime.sche_cpu_num;
+
+    auto alloc_cb = [](size_t size) -> void * {
+        void *ptr = nullptr;
+        int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
+        return (rc == 0) ? ptr : nullptr;
+    };
+
+    auto free_cb = [](void *dev_ptr) -> int {
+        return rtFree(dev_ptr);
+    };
+
+    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
+        return rtMemcpy(dev_dst, size, host_src, size, RT_MEMCPY_HOST_TO_DEVICE);
+    };
+
+    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
+        return rtMemcpy(host_dst, size, dev_src, size, RT_MEMCPY_DEVICE_TO_HOST);
+    };
+
+    int rc =
+        dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb);
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.args.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_setup_device_ptr());
+    return 0;
 }

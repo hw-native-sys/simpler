@@ -16,13 +16,9 @@
 #include <string>
 #include <vector>
 
+#include "../task_interface/chip_call_config.h"
+#include "../task_interface/task_args.h"
 #include "dist_types.h"
-
-struct ChipCallConfig {
-    int block_dim = 24;
-    int aicpu_thread_num = 3;
-    bool enable_profiling = false;
-};
 
 class ChipWorker : public IWorker {
 public:
@@ -69,10 +65,13 @@ public:
     /// Terminal — the object cannot be reused after this.
     void finalize();
 
-    // IWorker: extract callable/args/config from payload and execute synchronously.
-    void run(const WorkerPayload &payload) override;
+    // IWorker: build a ChipStorageTaskArgs POD from `args` and execute the
+    // runtime synchronously. `callable` is a ChipCallable buffer pointer
+    // cast to uint64.
+    void run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) override;
 
-    // Direct invocation (used by Python wrapper and internal tests).
+    // Direct invocation (used by Python wrapper and internal tests) — bypasses
+    // the TaskArgsView path and takes a ready-made ChipStorageTaskArgs POD.
     void run(const void *callable, const void *args, const ChipCallConfig &config);
 
     int device_id() const { return device_id_; }
@@ -85,7 +84,8 @@ private:
     using SetDeviceFn = int (*)(void *, int);
     using GetRuntimeSizeFn = size_t (*)();
     using RunRuntimeFn = int (*)(
-        void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t, int
+        void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t,
+        int, int
     );
     using FinalizeDeviceFn = int (*)(void *);
     using HostMallocFn = void *(*)(void *, size_t);

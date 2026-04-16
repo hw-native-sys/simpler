@@ -43,6 +43,7 @@
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
 #include "host/performance_collector.h"
+#include "host/tensor_dump_collector.h"
 #include "runtime.h"
 
 /**
@@ -163,8 +164,7 @@ public:
 
     /**
      * Create a thread bound to this device.
-     * The thread calls rtSetDevice(device_id) on entry
-     * and rtDeviceReset(device_id) on exit.
+     * The thread calls rtSetDevice(device_id) on entry.
      */
     std::thread create_thread(std::function<void()> fn);
 
@@ -227,7 +227,7 @@ public:
      */
     int
     run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1, bool enable_dump_tensor = false);
 
     /**
      * Print handshake results from device
@@ -288,7 +288,7 @@ public:
     /**
      * Upload a kernel binary to device memory
      *
-     * IMPORTANT: ensure_device_set() must be called before this function.
+     * IMPORTANT: prepare_run_context() must be called before this function.
      * Kernels are immediately copied to device memory.
      *
      * Receives pre-extracted .text section binary data,
@@ -317,22 +317,35 @@ public:
     void remove_kernel_binary(int func_id);
 
     /**
-     * Ensure device is set and streams are created (minimal initialization)
+     * Attach the current host thread to the target device.
      *
-     * This is called by set_device() C API to enable memory allocation
-     * before init_runtime(). Only performs:
-     * - rtSetDevice(device_id)
-     * - Create AICPU and AICore streams
+     * This is required before host-side runtime initialization may allocate or
+     * free device memory on the current thread. No streams are created here.
      *
      * @param device_id  Device ID (0-15)
      * @return 0 on success, error code on failure
      */
-    int ensure_device_set(int device_id);
+    int attach_current_thread(int device_id);
 
     /**
-     * Reset per-thread CANN device context and clear cached streams.
+     * Ensure the current thread has fresh run-scoped streams.
+     *
+     * This attaches the current thread to the target device and lazily creates
+     * the AICPU/AICore streams used by a single run.
+     *
+     * @param device_id  Device ID (0-15)
+     * @return 0 on success, error code on failure
      */
-    void reset_device_context();
+    int prepare_run_context(int device_id);
+
+    /**
+     * Release run-scoped resources owned by the current thread.
+     *
+     * This destroys AICPU/AICore streams but intentionally preserves device
+     * allocations, uploaded binaries, and other session state so they can be
+     * finalized later before rtDeviceReset().
+     */
+    void release_run_context();
 
 private:
     // Internal state
@@ -359,11 +372,14 @@ private:
     // Performance profiling
     PerformanceCollector perf_collector_;
 
+    // Tensor dump (independent from profiling)
+    TensorDumpCollector dump_collector_;
+
     /**
      * Ensure device is initialized (lazy initialization)
      *
      * Checks if device is already initialized. If not, performs:
-     * - rtSetDevice(device_id)
+     * - Attach the current thread to the device
      * - Create AICPU and AICore streams
      * - Load AICPU SO to device memory
      * - Initialize device args
@@ -380,7 +396,7 @@ private:
     /**
      * Load AICPU SO and initialize device args
      *
-     * Called by run() after ensure_device_set(). Performs:
+     * Called by run() after prepare_run_context(). Performs:
      * - Load AICPU SO to device memory
      * - Initialize device args
      *
@@ -404,6 +420,16 @@ private:
      * @return 0 on success, error code on failure
      */
     int init_performance_profiling(Runtime &runtime, int num_aicore, int device_id);
+
+    /**
+     * Initialize tensor dump device buffers.
+     *
+     * @param runtime Runtime instance to configure
+     * @param num_aicore Number of AICore instances (unused)
+     * @param device_id Device ID for allocations
+     * @return 0 on success, error code on failure
+     */
+    int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

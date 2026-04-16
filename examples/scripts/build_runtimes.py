@@ -27,14 +27,15 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Ensure examples/scripts/ and python/ are on sys.path for imports
-_script_dir = Path(__file__).resolve().parent
-_project_root = _script_dir.parent.parent
-sys.path.insert(0, str(_script_dir))
+# Pre-install bootstrap: this script is invoked by CMake during `pip install .`
+# before simpler_setup/simpler are on sys.path. Point at the source tree so
+# `from simpler_setup...` and `from simpler...` resolve.
+_project_root = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_project_root / "python"))
 
-from platform_info import PROJECT_ROOT, discover_runtimes, parse_platform  # noqa: E402
-from runtime_builder import RuntimeBuilder  # noqa: E402
+from simpler_setup.platform_info import PROJECT_ROOT, discover_runtimes, parse_platform  # noqa: E402
+from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: E402
 
 logger = logging.getLogger(__name__)
 

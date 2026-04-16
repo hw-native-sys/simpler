@@ -17,37 +17,39 @@ group completion aggregation, downstream dependency waits for group.
 
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import ChipStorageTaskArgs, make_tensor_arg
+from simpler.task_interface import TaskArgs, TensorArgType, make_tensor_arg
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
 
 KERNELS_BASE = "../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 
 
-def verify():
+def verify(args):
     """SubCallable — runs after group completes."""
+
+
+def _chip_args(in_a, in_b, out_f) -> TaskArgs:
+    """Build per-chip TaskArgs with INPUT/INPUT/OUTPUT_EXISTING tags."""
+    a = TaskArgs()
+    a.add_tensor(make_tensor_arg(in_a), TensorArgType.INPUT)
+    a.add_tensor(make_tensor_arg(in_b), TensorArgType.INPUT)
+    a.add_tensor(make_tensor_arg(out_f), TensorArgType.OUTPUT_EXISTING)
+    return a
 
 
 def run_dag(orch, callables, task_args, config):
     """L3 orchestration: group of 2 chips → SubTask dependency."""
-    # Build per-chip ChipStorageTaskArgs from shared-memory tensors
-    args0 = ChipStorageTaskArgs()
-    for t in [task_args.a0, task_args.b0, task_args.f0]:
-        args0.add_tensor(make_tensor_arg(t))
-
-    args1 = ChipStorageTaskArgs()
-    for t in [task_args.a1, task_args.b1, task_args.f1]:
-        args1.add_tensor(make_tensor_arg(t))
-
+    args0 = _chip_args(task_args.a0, task_args.b0, task_args.f0)
+    args1 = _chip_args(task_args.a1, task_args.b1, task_args.f1)
     callables.keep(args0, args1)  # prevent GC before drain
 
-    group_result = orch.submit_next_level_group(
-        callables.vector_kernel,
-        args_list=[args0.__ptr__(), args1.__ptr__()],
-        config=config,
-        outputs=[4],
-    )
-    orch.submit_sub(callables.verify, inputs=[group_result.outputs[0].ptr])
+    orch.submit_next_level_group(callables.vector_kernel, [args0, args1], config)
+
+    # SubTask depends on both group outputs (f0, f1) — tag both as INPUT.
+    sub_args = TaskArgs()
+    sub_args.add_tensor(make_tensor_arg(task_args.f0), TensorArgType.INPUT)
+    sub_args.add_tensor(make_tensor_arg(task_args.f1), TensorArgType.INPUT)
+    orch.submit_sub(callables.verify, sub_args)
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")

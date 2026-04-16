@@ -73,7 +73,7 @@ aicpu_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     };
 }
 
-__attribute__((visibility("default"))) void aicpu_orchestration_entry(const ChipStorageTaskArgs &orch_args) {
+__attribute__((visibility("default"))) void build_paged_attention_graph(const ChipStorageTaskArgs &orch_args) {
 #ifdef ENABLE_PROFILING
     uint64_t prof_param_extract = 0;
     uint64_t prof_ext_tensor = 0;

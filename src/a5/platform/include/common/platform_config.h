@@ -111,6 +111,62 @@ inline double cycles_to_us(uint64_t cycles) {
     return (static_cast<double>(cycles) / PLATFORM_PROF_SYS_CNT_FREQ) * 1000000.0;
 }
 
+// Profiling-related runtime flags shared through AICPU-AICore handshake.
+#define PROFILING_FLAG_NONE 0u
+#define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
+#define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
+#define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
+#define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
+
+// =============================================================================
+// Tensor Dump Configuration
+// =============================================================================
+
+/**
+ * Number of TensorDumpRecord entries per DumpBuffer.
+ * Each record is 128 bytes, so one buffer = RECORDS * 128 bytes.
+ */
+constexpr int PLATFORM_DUMP_RECORDS_PER_BUFFER = 256;
+
+/**
+ * Pre-allocated DumpBuffer count per AICPU scheduling thread.
+ * Retained for configuration parity with A2A3; in the memcpy design
+ * this controls arena sizing only (no SPSC free queues).
+ */
+constexpr int PLATFORM_DUMP_BUFFERS_PER_THREAD = 8;
+
+/**
+ * SPSC free_queue slot count for dump metadata buffers.
+ * Retained for configuration parity with A2A3.
+ */
+constexpr int PLATFORM_DUMP_SLOT_COUNT = 4;
+
+/**
+ * Expected average tensor size in bytes.
+ * Used together with BUFFERS_PER_THREAD and RECORDS_PER_BUFFER to compute
+ * per-thread arena size:
+ *   arena = BUFFERS_PER_THREAD * RECORDS_PER_BUFFER * AVG_TENSOR_BYTES
+ * Default: 4 * 256 * 65536 = 64 MB per thread.
+ */
+constexpr uint64_t PLATFORM_DUMP_AVG_TENSOR_BYTES = 65536;
+
+/**
+ * Maximum tensor dimensions (matches RUNTIME_MAX_TENSOR_DIMS).
+ */
+constexpr int PLATFORM_DUMP_MAX_DIMS = 5;
+
+/**
+ * Ready queue capacity for dump data.
+ * Retained for configuration parity with A2A3.
+ */
+constexpr int PLATFORM_DUMP_READYQUEUE_SIZE = PLATFORM_MAX_AICPU_THREADS * PLATFORM_DUMP_BUFFERS_PER_THREAD * 2;
+
+/**
+ * Idle timeout duration for tensor dump collection (seconds)
+ * Retained for configuration parity with A2A3.
+ */
+constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
+
 // =============================================================================
 // Register Communication Configuration
 // =============================================================================

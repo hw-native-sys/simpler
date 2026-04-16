@@ -1,5 +1,13 @@
 # Scheduler — DAG Dispatch Internals
 
+> **Status**: target design. `IWorker::run(uint64_t callable, TaskArgsView,
+> ChipCallConfig)` is the live dispatch signature; per-worker-type ready
+> queue split (Strict-4) is landed — each `WorkerType` has its own
+> `DistReadyQueue` and `dispatch_ready` walks them independently, so a
+> saturated pool of one type cannot head-of-line-block dispatch for the
+> other. See [roadmap.md](roadmap.md) for the full landed-vs-planned
+> breakdown.
+
 The Scheduler is the **DAG executor**. A dedicated C++ thread that consumes
 submitted slots, wires fanout edges, dispatches ready tasks to worker threads,
 and handles completion callbacks. It is the bridge between the Orchestrator
@@ -32,16 +40,21 @@ consults scheduling metadata (`fanin_count`, `fanout_consumers`, `state`).
 
 ---
 
-## 2. The three queues
+## 2. The queues
 
 ```cpp
 class Scheduler {
     // Producer: Orchestrator.submit_*. Consumer: Scheduler's own loop, Phase 0.
     LockFreeQueue<WiringEntry> wiring_queue_;       // {slot, producers}
 
-    // Producer: Scheduler Phase 0 (newly-ready) + Phase 2 (fanout-released).
-    // Consumer: Scheduler's own loop, Phase 1.
-    LockFreeQueue<TaskSlot> ready_queue_;
+    // Strict-4 — per-worker-type ready queues.
+    // Producers: Orchestrator.submit_* (routes by slot.worker_type) +
+    //            Scheduler Phase 0 / Phase 2 (fanout-released; routes by
+    //            consumer worker_type).
+    // Consumer: Scheduler's own loop, Phase 1 (one drain loop per queue,
+    //           each with its own head-of-line break).
+    DistReadyQueue *ready_next_level_queue_;
+    DistReadyQueue *ready_sub_queue_;
 
     // Producer: WorkerThread (on worker->run() return).
     // Consumer: Scheduler's own loop, Phase 2.
@@ -67,7 +80,27 @@ struct WiringEntry {
 ### Ready queue
 
 Slots whose `fanin_count == fanin_released` are ready to dispatch. The queue
-holds just the slot id; dispatch reads task data from `slots_[sid]`.
+holds just the slot id; dispatch reads task data from the
+`ring.slot_state(sid)` pool.
+
+**Strict-4 — per-worker-type split.** In practice the ready queue is two
+`DistReadyQueue` instances, one per `WorkerType`:
+
+```cpp
+DistReadyQueue ready_next_level_queue_;   // WorkerType::NEXT_LEVEL tasks
+DistReadyQueue ready_sub_queue_;          // WorkerType::SUB tasks
+```
+
+Matching L2's per-shape ready buffer (`PTO2_LocalReadyBuffer` fan-out to
+AIC / AIV / MIX queues), with the L3+ exception that we use `std::queue`
+(Allowed Exception 3: dynamic data structures on host) and only two
+worker types (Allowed Exception 2: `NEXT_LEVEL` + `SUB` at L3+, not
+AIC / AIV / MIX). `Orchestrator::submit_*` routes each slot to the queue
+matching `slot.worker_type`; `Scheduler::on_task_complete` routes a
+newly-ready consumer the same way, based on the *consumer's* worker
+type. `Scheduler::dispatch_ready` drains each queue with its own
+head-of-line break so a saturated pool of one type cannot stall dispatch
+for the other.
 
 ### Completion queue
 
@@ -88,11 +121,8 @@ void Scheduler::run() {
             wire_fanout(w);   // see §4
         }
 
-        // Phase 1: dispatch
-        TaskSlot sid;
-        while (ready_queue_.try_pop(sid)) {
-            dispatch_ready(sid);   // see §5
-        }
+        // Phase 1: dispatch (drains BOTH per-type queues; see §5)
+        dispatch_ready();
 
         // Phase 2: completion
         while (completion_queue_.try_pop(sid)) {
@@ -139,7 +169,12 @@ void Scheduler::wire_fanout(const WiringEntry &w) {
     // Update consumer's fanin to the actual live count (producers already
     // finished don't count).
     c.fanin_count = actual_live;
-    if (actual_live == 0) ready_queue_.push(csid);
+    if (actual_live == 0) {
+        // Strict-4: wiring promotes directly to the per-type queue.
+        auto *q = (c.worker_type == WorkerType::NEXT_LEVEL) ? ready_next_level_queue_
+                                                            : ready_sub_queue_;
+        q->push(csid);
+    }
 }
 ```
 
@@ -155,35 +190,44 @@ The `lock_guard(p.fanout_mu)` + `p.state.load()` check ensures we either:
 
 ## 5. Phase 1 — dispatch
 
-```cpp
-void Scheduler::dispatch_ready(TaskSlot sid) {
-    TaskSlotState &s = slots_[sid];
-    s.state.store(TaskState::READY);
+`dispatch_ready` drains each per-type ready queue with its own
+head-of-line break so one saturated pool cannot stall the other:
 
-    if (s.group_size == 0) {
-        // Single-worker task
-        WorkerThread *wt = manager_->pick_idle(s.worker_type);
-        wt->dispatch(sid);
-    } else {
-        // Group task — reserve N idle workers
-        auto wts = manager_->pick_n_idle(s.worker_type, s.group_size);
-        s.state.store(TaskState::RUNNING);
-        for (size_t i = 0; i < wts.size(); i++) {
-            wts[i]->dispatch(sid, /*group_index=*/static_cast<int32_t>(i));
+```cpp
+void Scheduler::dispatch_ready() {
+    auto drain_one = [&](DistReadyQueue *q) {
+        DistTaskSlot slot;
+        while (q->try_pop(slot)) {
+            TaskSlotState &s = slots_[slot];
+            int N = s.group_size();  // 1 for single-task slots
+
+            auto workers = manager_->pick_n_idle(s.worker_type, N);
+            if (static_cast<int>(workers.size()) < N) {
+                q->push(slot);   // put back; try again after a completion
+                break;
+            }
+            s.state.store(TaskState::RUNNING);
+            for (int i = 0; i < N; i++) {
+                workers[i]->dispatch({slot, i});
+            }
         }
-    }
+    };
+    drain_one(ready_next_level_queue_);
+    drain_one(ready_sub_queue_);
 }
 ```
 
-Dispatch hands off the slot id to a `WorkerThread`. The WorkerThread reads
-`slots_[sid].{callable, task_args, config}` on its own thread and executes —
-see [worker-manager.md](worker-manager.md) §3 for THREAD mode and §4 for
-PROCESS mode.
+Dispatch hands off a `WorkerDispatch {slot, group_index}` to a
+`WorkerThread`. The WorkerThread reads
+`ring.slot_state(slot).{callable, task_args, config}` on its own thread
+and executes — see [worker-manager.md](worker-manager.md) §3 for THREAD
+mode and §4 for PROCESS mode.
 
-**Pick-idle back-pressure**: if no idle worker exists in the pool,
-`pick_idle` blocks. The Scheduler thread is then stalled, which is fine —
-ready tasks pile up in the queue until a worker frees up. The ring's
-back-pressure at the Orch side already caps the number of in-flight tasks.
+**Pick-idle back-pressure**: when `pick_n_idle` returns fewer workers
+than the task needs, the slot is pushed back onto *its* queue and that
+queue's drain halts; the other-type queue's drain continues. The ring's
+back-pressure at the Orch side already caps the total number of
+in-flight tasks across both types.
 
 ---
 
@@ -212,7 +256,12 @@ void Scheduler::on_task_complete(TaskSlot sid) {
     for (TaskSlot csid : consumers) {
         TaskSlotState &c = slots_[csid];
         if (++c.fanin_released == c.fanin_count) {
-            ready_queue_.push(csid);       // consumer now ready
+            // Strict-4: push to the queue matching the *consumer's*
+            // worker type. A consumer of a NEXT_LEVEL producer can itself
+            // be SUB, so we pick based on `c.worker_type`, not `s`.
+            auto *q = (c.worker_type == WorkerType::NEXT_LEVEL) ? ready_next_level_queue_
+                                                                : ready_sub_queue_;
+            q->push(csid);
         }
     }
 

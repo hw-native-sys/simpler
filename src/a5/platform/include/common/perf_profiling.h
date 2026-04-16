@@ -76,21 +76,26 @@ struct PerfRecord {
 static_assert(sizeof(PerfRecord) % 64 == 0, "PerfRecord must be 64-byte aligned for optimal cache performance");
 
 // =============================================================================
-// PerfBuffer - Record Buffer with Count-First Layout
+// PerfBuffer - Record Buffer with Count-First Layout and WIP Staging Slots
 // =============================================================================
 
 /**
  * Performance record buffer (count-first + flexible array)
  *
- * Layout: 64B header (count + padding) followed by records[].
- * Actual allocation: 64 + capacity * sizeof(PerfRecord).
+ * Layout: 64B header (count + padding), then wip[2] staging slots,
+ * then records[].
+ * Actual allocation: sizeof(PerfBuffer) + capacity * sizeof(PerfRecord).
  *
- * Count-first enables two-step collection: Host copies 64B to read count,
- * then copies only count * sizeof(PerfRecord) of actual data.
+ * Count-first enables two-step collection: Host copies sizeof(PerfBuffer) to
+ * read count, then copies only count * sizeof(PerfRecord) of actual data.
+ *
+ * WIP protocol: AICore writes timing to wip[reg_task_id & 1], AICPU copies
+ * it into records[count] at completion. Dual-slot parity ensures no overlap.
  */
 struct PerfBuffer {
-    volatile uint32_t count;  // Current record count (at offset 0 for cache-line read)
+    volatile uint32_t count;  // Current committed record count (at offset 0 for cache-line read)
     uint32_t pad[15];         // Pad to 64B cache line boundary
+    PerfRecord wip[2];        // AICore WIP staging slots (index = reg_task_id & 1)
     PerfRecord records[];     // Flexible array member (not counted in sizeof)
 } __attribute__((aligned(64)));
 

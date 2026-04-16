@@ -1,5 +1,11 @@
 # Task Flow — Callable / TaskArgs / CallConfig Pass-Through
 
+> **Status**: describes the **target** design. The unified `TaskArgs` +
+> tag-driven submit + Orchestrator-owned drain are landed; the
+> `IWorker::run(callable, view, config)` signature and length-prefixed
+> mailbox blob are not yet (target landing: PR-C). See
+> [roadmap.md](roadmap.md) for the full landed-vs-planned breakdown.
+
 This document specifies **what data flows through the hierarchical runtime and
 what shapes it takes at each stage**. It covers:
 
@@ -238,12 +244,19 @@ void ChipWorker::run(Callable cb, TaskArgsView view, const CallConfig &config) o
 
 ### `SubWorker` (Python callable leaf)
 
-```cpp
-void SubWorker::run(Callable cb, TaskArgsView view, const CallConfig &config) override {
-    uint64_t cid = cb;                     // no cast
-    py_registry_[cid](view);               // invoke Python callable with view
-}
+SubWorker execution is handled entirely in Python. The forked child process
+runs ``_sub_worker_loop`` which reads the args blob from the shared-memory
+mailbox, decodes it into a ``TaskArgs`` object, and passes it to the
+registered callable:
+
+```python
+fn(args)    # args: TaskArgs decoded from the mailbox blob
 ```
+
+The callable receives the same `TaskArgs` that was submitted via
+`orch.submit_sub(cid, args)`, with tags stripped (tags are consumed by the
+Orchestrator at submit time). There is no C++ `SubWorker` class — the
+Python child loop and callable registry are the entire implementation.
 
 Child inherits the Python registry through fork COW; the registry lookup works
 with no IPC.
@@ -327,6 +340,12 @@ slot.config     ─┼─► memcpy into shm mailbox ─► child reads view ─
 slot.task_args  ─┘    (write_blob)                (read_blob)
 ```
 
+For SUB workers in PROCESS mode, the child is a Python process running
+``_sub_worker_loop``. The mailbox carries the same blob format, but the
+Python child decodes it via ``_read_args_from_mailbox`` into a ``TaskArgs``
+object and calls ``fn(args)`` directly — the dispatch path bypasses
+``IWorker`` entirely.
+
 The mailbox layout, fork ordering, and child loop are in
 [worker-manager.md](worker-manager.md) §4.
 
@@ -334,11 +353,31 @@ The mailbox layout, fork ordering, and child loop are in
 
 | Region | Lives in | Used by | Lifetime |
 | ------ | -------- | ------- | -------- |
-| `slots_[N]` (TaskSlotState array) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | ring-managed |
-| `slots_[i].task_args` (vector-backed) | parent heap | same | until slot released |
+| `DistRing` slot-state pool (`std::deque<unique_ptr<TaskSlotState>>`) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | monotonic task-id; reset at `Worker.run` drain |
+| `slot.task_args` (single) or `task_args_list[N]` (group, vector-backed) | parent heap | same | until slot reaches CONSUMED |
 | per-WT mailbox (PROCESS only) | shm MAP_SHARED | parent WorkerThread writes, child reads | lifetime of WorkerThread |
-| tensor data bytes | torch shm (`share_memory_()` or equiv) | kernel reads/writes | user-managed |
+| **HeapRing[0..3]** (user OUTPUT auto-alloc + `orch.alloc`) | **4 separate shm MAP_SHARED mmaps**, one per scope-layer ring | output to user code; inherited by forked children | per-ring FIFO via `rings_[r].last_alive`; scope depth picks the ring |
+| tensor data bytes (user-provided) | torch shm (`share_memory_()` or equiv) | kernel reads/writes | user-managed |
 | `Callable` target (ChipCallable / OrchFn / Python fn) | parent heap | child via fork COW | pre-fork registered |
+
+Slot state lives inside `DistRing` as `std::deque<std::unique_ptr<…>>` so
+`push_back` never invalidates pointers to live slots (see PR-I in
+[roadmap.md](roadmap.md)). `ring.slot_state(id)` hands out a stable
+pointer for every live slot; `drain()` calls `ring.reset_to_empty()` to
+drop all slot state at the end of each `Worker.run`, bounding per-run
+memory.
+
+The HeapRing is **partitioned into `DIST_MAX_RING_DEPTH = 4` independent
+rings** (Strict-1; matches L2's `PTO2_MAX_RING_DEPTH`). Each ring is its
+own `mmap(MAP_SHARED | MAP_ANONYMOUS)` taken before fork, so children
+inherit all four at the same virtual addresses. The `heap_ring_size`
+knob on `Worker(...)` is the **per-ring** size (default 1 GiB → 4 GiB
+total VA reservation); physical pages remain lazy under
+`MAP_ANONYMOUS`. A task's ring is chosen by scope depth,
+`min(scope_depth, DIST_MAX_RING_DEPTH - 1)`, so inner-scope tasks
+reclaim independently of outer-scope tasks. See
+[orchestrator.md §5](orchestrator.md) for the allocator internals and
+[orchestrator.md §6](orchestrator.md) for the scope → ring mapping.
 
 **Child never reads the slot.** Child only sees:
 
@@ -392,7 +431,7 @@ def my_l3_orch(orch3, args, cfg):
 def my_l4_orch(orch4, args, cfg):
     orch4.submit_next_level(my_l3_orch_handle, args, cfg)
 
-w4.run(Task(orch=my_l4_orch, task_args=..., config=...))
+w4.run(my_l4_orch, my_args, my_config)
 ```
 
 L4's WorkerThread dispatches to `w3` via `IWorker::run`. `Worker::run`
@@ -437,14 +476,14 @@ w3 = Worker(level=3, child_mode=PROCESS)
 w3.add_worker(NEXT_LEVEL, chip_worker_0)
 w3.init()    # fork chip_0 here
 
-w3.run(Task(orch=my_orch, task_args=args, config=CallConfig(block_dim=3)))
+w3.run(my_orch, args, CallConfig(block_dim=3))
 ```
 
 Step-by-step (PROCESS mode, one chip worker):
 
 | Step | Where | What happens |
 | ---- | ----- | ------------ |
-| 1 | parent Python | user builds `args: TaskArgs`, calls `w3.run(Task)` |
+| 1 | parent Python | user builds `args: TaskArgs`, calls `w3.run(my_orch, args, config)` |
 | 2 | `Worker::run` | `scope_begin` → call `my_orch(&orch_, args.view(), cfg)` |
 | 3 | `Orchestrator::submit_next_level` | `slot = ring.alloc()`; move `chip_args` into `slot.task_args`; walk tags → `tensormap.lookup(a.data)`, `tensormap.lookup(b.data)`, `tensormap.insert(c.data, slot)`; push ready |
 | 4 | Scheduler thread | pop `slot`; `wt = manager.pick_idle(NEXT_LEVEL)` (WT_chip_0); `wt->dispatch(slot)` |
@@ -455,7 +494,7 @@ Step-by-step (PROCESS mode, one chip worker):
 | 9 | chip_0 child | `run` returns; write `TASK_DONE` |
 | 10 | WT_chip_0 parent | see `TASK_DONE`; call `on_complete_(slot)` |
 | 11 | Scheduler | mark slot COMPLETED; fanout release (none in this DAG); scope_end will release scope ref |
-| 12 | `Worker::run` returns | user's `w3.run(Task)` returns; `c` contains result in shm, visible to user |
+| 12 | `Worker::run` returns | user's `w3.run(...)` returns; `c` contains result in shm, visible to user |
 
 ---
 

@@ -16,29 +16,30 @@ SubWorker reads result produced by ChipWorker.
 
 import torch
 from simpler.task_interface import ArgDirection as D
+from simpler.task_interface import TaskArgs, TensorArgType, make_tensor_arg
 
 from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
-from simpler_setup.scene_test import _build_chip_task_args
+from simpler_setup.scene_test import _build_l3_task_args
 
 KERNELS_BASE = "../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 
 
-def verify():
+def verify(args):
     """SubCallable — dependency target, runs after ChipTask completes."""
 
 
 def run_dag(orch, callables, task_args, config):
     """L3 orchestration: ChipTask → SubTask dependency."""
-    chip_args, _ = _build_chip_task_args(task_args, callables.vector_kernel_sig)
+    # ChipTask: tags inside chip_args drive deps (INPUT → lookup; OUTPUT_EXISTING → insert).
+    chip_args, _ = _build_l3_task_args(task_args, callables.vector_kernel_sig)
     callables.keep(chip_args)  # prevent GC before drain
 
-    chip_result = orch.submit_next_level(
-        callables.vector_kernel,
-        chip_args.__ptr__(),
-        config,
-        outputs=[task_args.f.numel() * 4],
-    )
-    orch.submit_sub(callables.verify, inputs=[chip_result.outputs[0].ptr])
+    orch.submit_next_level(callables.vector_kernel, chip_args, config)
+
+    # SubTask: tag the chip output as INPUT — Orchestrator wires the dep via TensorMap.
+    sub_args = TaskArgs()
+    sub_args.add_tensor(make_tensor_arg(task_args.f), TensorArgType.INPUT)
+    orch.submit_sub(callables.verify, sub_args)
 
 
 @scene_test(level=3, runtime="tensormap_and_ringbuffer")

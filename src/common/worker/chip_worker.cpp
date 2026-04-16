@@ -305,12 +305,13 @@ void ChipWorker::finalize() {
     finalized_ = true;
 }
 
-void ChipWorker::run(const WorkerPayload &payload) {
-    ChipCallConfig config;
-    config.block_dim = payload.block_dim;
-    config.aicpu_thread_num = payload.aicpu_thread_num;
-    config.enable_profiling = payload.enable_profiling;
-    run(payload.callable, payload.args, config);
+void ChipWorker::run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) {
+    // L2 ABI edge: assemble the fixed-size ChipStorageTaskArgs POD from the
+    // view and hand it to the runtime. This conversion used to happen at
+    // submit time (stored on the slot); it now runs lazily in the worker so
+    // the slot can carry a single TaskArgs irrespective of the destination.
+    ChipStorageTaskArgs chip_storage = view_to_chip_storage(args);
+    run(reinterpret_cast<const void *>(callable), &chip_storage, config);
 }
 
 void ChipWorker::run(const void *callable, const void *args, const ChipCallConfig &config) {
@@ -322,7 +323,8 @@ void ChipWorker::run(const void *callable, const void *args, const ChipCallConfi
 
     int rc = run_runtime_fn_(
         device_ctx_, rt, callable, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
-        aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_profiling ? 1 : 0
+        aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_profiling ? 1 : 0,
+        config.enable_dump_tensor ? 1 : 0
     );
     if (rc != 0) {
         throw std::runtime_error("run_runtime failed with code " + std::to_string(rc));

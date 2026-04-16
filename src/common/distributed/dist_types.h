@@ -15,11 +15,17 @@
  * Every level in the hierarchy (L3 HostWorker, L4, L5, …) runs the same
  * scheduling engine.  This header defines:
  *   - WorkerType / TaskState enumerations
- *   - WorkerPayload: the data dispatched to an IWorker
- *   - DistTaskSlotState: per-task scheduling bookkeeping
+ *   - DistTaskSlotState: per-task scheduling bookkeeping (stores TaskArgs
+ *                        directly — no separate dispatch carrier struct)
  *   - DistReadyQueue: Orch→Scheduler notification channel
  *   - IWorker: abstract interface implemented by ChipWorker, SubWorker,
  *              and DistWorker itself (recursive composition)
+ *
+ * IWorker::run takes (callable, TaskArgsView, ChipCallConfig) directly.
+ * THREAD-mode dispatch builds the view via `slot.args_view(i)` from the
+ * slot's stored TaskArgs; PROCESS-mode dispatch encodes the TaskArgs into
+ * the per-WorkerThread shm mailbox via write_blob() and the child rebuilds
+ * the view with read_blob().
  */
 
 #pragma once
@@ -32,12 +38,22 @@
 #include <queue>
 #include <vector>
 
+#include "../task_interface/chip_call_config.h"
+#include "../task_interface/task_args.h"
+
 // =============================================================================
 // Constants
 // =============================================================================
 
-static constexpr int32_t DIST_TASK_WINDOW_SIZE = 128;  // slots per engine instance
+// User-visible scope-nesting cap. Matches L2 PTO2_MAX_SCOPE_DEPTH.
 static constexpr int32_t DIST_MAX_SCOPE_DEPTH = 64;
+
+// Number of independent HeapRing layers inside DistRing. Scope depth maps
+// to ring index via `min(depth, DIST_MAX_RING_DEPTH - 1)` (L2-style);
+// scopes deeper than DIST_MAX_RING_DEPTH share the innermost ring.
+// Matches L2's PTO2_MAX_RING_DEPTH (Strict-1).
+static constexpr int32_t DIST_MAX_RING_DEPTH = 4;
+
 static constexpr int32_t DIST_INVALID_SLOT = -1;
 
 // =============================================================================
@@ -69,28 +85,13 @@ enum class TaskState : int32_t {
 };
 
 // =============================================================================
-// WorkerPayload — dispatched from Scheduler to IWorker
-// =============================================================================
-
-struct WorkerPayload {
-    DistTaskSlot task_slot = DIST_INVALID_SLOT;
-    WorkerType worker_type = WorkerType::NEXT_LEVEL;
-
-    // --- ChipWorker fields (set in PR 2-2) ---
-    const void *callable = nullptr;  // ChipCallable buffer ptr
-    const void *args = nullptr;      // ChipStorageTaskArgs*
-    int32_t block_dim = 1;
-    int32_t aicpu_thread_num = 3;
-    bool enable_profiling = false;
-
-    // --- SubWorker fields ---
-    int32_t callable_id = -1;
-    // 'args' pointer above is reused as shm args addr for SubWorker
-};
-
-// =============================================================================
 // DistTaskSlotState — per-task scheduling bookkeeping
 // =============================================================================
+//
+// Stores the submitted TaskArgs directly. Dispatch builds a TaskArgsView on
+// demand via `args_view(i)` (THREAD mode) or write_blob → read_blob
+// (PROCESS mode). There is no separate dispatch carrier struct; the old
+// WorkerPayload was removed in PR-C.
 
 struct DistTaskSlotState {
     std::atomic<TaskState> state{TaskState::FREE};
@@ -106,10 +107,6 @@ struct DistTaskSlotState {
     int32_t fanout_total{0};                  // 1 (scope ref) + fanout_consumers.size()
     std::atomic<int32_t> fanout_released{0};  // incremented as each ref is released
 
-    // --- Output buffers (malloced by orch, freed when CONSUMED) ---
-    std::vector<void *> output_bufs;  // one entry per output
-    std::vector<size_t> output_sizes;
-
     // --- TensorMap keys registered by this task (for cleanup on CONSUMED) ---
     std::vector<uint64_t> output_keys;
 
@@ -118,17 +115,44 @@ struct DistTaskSlotState {
     // on each producer — mirroring L2's "deferred release: walk fanin" step.
     std::vector<DistTaskSlot> fanin_producers;
 
-    // --- Dispatch payload (stored for scheduler dispatch) ---
-    WorkerPayload payload;
+    // --- Task data (stored on parent heap, lives until slot CONSUMED) ---
+    WorkerType worker_type{WorkerType::NEXT_LEVEL};
+    uint64_t callable{0};     // NEXT_LEVEL: ChipCallable buffer ptr; SUB: unused
+    int32_t callable_id{-1};  // SUB: registered callable id
+    ChipCallConfig config{};  // NEXT_LEVEL config (block_dim, aicpu_thread_num, enable_profiling)
 
-    // --- Group task (N workers on 1 DAG node) ---
-    // args_list stores per-worker args pointers.  size()==1 for normal tasks.
-    // Scheduler dispatches worker[i] with args_list[i].
-    std::vector<const void *> args_list;
+    // Unified task-args storage: `task_args` is the single-task builder;
+    // when `is_group_` is true, `task_args_list` carries one TaskArgs per
+    // worker (N-SPMD group, L3-flavoured — each member has its own distinct
+    // tensors/scalars, unlike L2's SPMD single-payload). `task_args` stays
+    // empty for groups.
+    TaskArgs task_args;
+    std::vector<TaskArgs> task_args_list;
+    bool is_group_{false};
+
+    // Runtime-owned OUTPUT slabs live in the Worker's HeapRing and are
+    // reclaimed implicitly by DistRing::release(slot) — no per-slot
+    // munmap is needed. See docs/orchestrator.md §8b.
+
+    // --- HeapRing layer membership (Strict-1 per-scope rings) ---
+    // Set by DistRing::alloc from the caller's scope depth. ring_idx picks
+    // which of the DIST_MAX_RING_DEPTH heaps holds this slot's slab;
+    // ring_slot_idx is the slot's position within that ring's FIFO order
+    // and indexes the ring's per-slot released/heap_end vectors.
+    int32_t ring_idx{0};
+    int32_t ring_slot_idx{0};
+
+    // --- Group bookkeeping ---
     std::atomic<int32_t> sub_complete_count{0};
 
-    bool is_group() const { return args_list.size() > 1; }
-    int32_t group_size() const { return static_cast<int32_t>(args_list.size()); }
+    bool is_group() const { return is_group_; }
+    int32_t group_size() const { return is_group_ ? static_cast<int32_t>(task_args_list.size()) : 1; }
+
+    // Zero-copy view over the i-th worker's args (THREAD-mode dispatch).
+    // `i` must be 0 for non-group slots; 0..group_size()-1 for groups.
+    TaskArgsView args_view(int32_t i) const {
+        return is_group_ ? make_view(task_args_list[static_cast<size_t>(i)]) : make_view(task_args);
+    }
 
     DistTaskSlotState() = default;
     DistTaskSlotState(const DistTaskSlotState &) = delete;
@@ -169,7 +193,19 @@ class IWorker {
 public:
     virtual ~IWorker() = default;
 
-    // Execute one task synchronously.  Called in the worker's own thread.
-    // Blocks until the task is complete (mirroring ChipWorker::run()).
-    virtual void run(const WorkerPayload &payload) = 0;
+    // Execute one task synchronously. Called in the worker's own thread,
+    // blocking until the task is complete.
+    //
+    // Each implementation interprets `callable` per its semantics:
+    //   - ChipWorker: uint64 holding a ChipCallable buffer ptr; builds a
+    //     ChipStorageTaskArgs POD from `args` and calls pto2_run_runtime.
+    //   - DistChipProcess / DistSubWorker: dispatch proxies — forward
+    //     callable / config / args through the shm mailbox to the forked
+    //     child, which invokes the actual IWorker in its own address space.
+    //   - DistWorker (L4+): `callable` decodes to an orch-fn handle;
+    //     placeholder until PR-F.
+    //
+    // slot_id is not a parameter — completion routing is owned by
+    // WorkerThread / Scheduler at a higher layer.
+    virtual void run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) = 0;
 };

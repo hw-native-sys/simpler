@@ -60,19 +60,7 @@ from queue import Empty, Queue
 from threading import Lock, Thread
 from typing import Any, Callable, Protocol, cast
 
-# ---------------------------------------------------------------------------
-# Path setup — mirrors run_example.py
-# ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent
-SCRIPTS_DIR = PROJECT_ROOT / "examples" / "scripts"
-PYTHON_DIR = PROJECT_ROOT / "python"
-GOLDEN_DIR = PROJECT_ROOT / "golden"
-
-for d in (PYTHON_DIR, SCRIPTS_DIR, GOLDEN_DIR):
-    if d.exists() and str(d) not in sys.path:
-        sys.path.insert(0, str(d))
-
-from simpler.task_interface import (  # noqa: E402  # type: ignore[import-not-found]
+from simpler.task_interface import (  # type: ignore[import-not-found]
     ChipCallable,  # pyright: ignore[reportAttributeAccessIssue]
     ChipCallConfig,  # pyright: ignore[reportAttributeAccessIssue]
     ChipStorageTaskArgs,  # pyright: ignore[reportAttributeAccessIssue]
@@ -81,6 +69,10 @@ from simpler.task_interface import (  # noqa: E402  # type: ignore[import-not-fo
     make_tensor_arg,
     scalar_to_uint64,
 )
+
+from simpler_setup.log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
+
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 logger = logging.getLogger("ci")
 
@@ -202,7 +194,7 @@ def _read_task_list_json(task_list_path: str | None) -> set[str] | None:
 
 
 def _discover_runtimes_for_platform(platform: str) -> list[str]:
-    from platform_info import discover_runtimes, parse_platform  # noqa: PLC0415
+    from simpler_setup.platform_info import discover_runtimes, parse_platform  # noqa: PLC0415
 
     arch, _ = parse_platform(platform)
     return discover_runtimes(arch)
@@ -210,7 +202,7 @@ def _discover_runtimes_for_platform(platform: str) -> list[str]:
 
 def discover_tasks(platform: str, runtime_filter: str | None = None) -> list[TaskSpec]:
     """Scan examples/ and tests/st/ for test directories matching the given platform."""
-    from platform_info import parse_platform  # noqa: PLC0415
+    from simpler_setup.platform_info import parse_platform  # noqa: PLC0415
 
     arch, variant = parse_platform(platform)
     is_sim = variant == "sim"
@@ -274,16 +266,17 @@ def discover_tasks(platform: str, runtime_filter: str | None = None) -> list[Tas
 
 
 def ensure_pto_isa(commit: str | None, clone_protocol: str) -> str:
-    from code_runner import _ensure_pto_isa_root  # noqa: PLC0415
+    from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
-    root = _ensure_pto_isa_root(verbose=True, commit=commit, clone_protocol=clone_protocol)
-    if root is None:
-        raise OSError(
-            "PTO_ISA_ROOT could not be resolved.\n"
-            "Set it manually or let auto-clone run:\n"
-            "  export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa"
-        )
-    return root
+    # update_if_exists=True: when no commit is pinned, fetch latest origin/HEAD
+    # so CI runs reproducibly track main rather than whatever local checkout
+    # happens to be on disk.
+    return ensure_pto_isa_root(
+        commit=commit,
+        clone_protocol=clone_protocol,
+        update_if_exists=True,
+        verbose=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -298,9 +291,9 @@ def compile_task(
     run_all_cases: bool = False,
 ) -> CompiledTask:
     """Compile orchestration + kernels for a single task, return CompiledTask."""
-    from runtime_builder import RuntimeBuilder  # noqa: PLC0415
-    from simpler.elf_parser import extract_text_section  # noqa: PLC0415
-    from simpler.kernel_compiler import KernelCompiler  # noqa: PLC0415
+    from simpler_setup.elf_parser import extract_text_section  # noqa: PLC0415
+    from simpler_setup.kernel_compiler import KernelCompiler  # noqa: PLC0415
+    from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
     # Load kernel_config and golden
     kc = _load_module(spec.kernels_dir / "kernel_config.py", f"kc_{id(spec)}")
@@ -313,7 +306,7 @@ def compile_task(
     compiler = KernelCompiler(platform=spec.platform)
 
     # Resolve runtime include dirs
-    from platform_info import parse_platform  # noqa: PLC0415
+    from simpler_setup.platform_info import parse_platform  # noqa: PLC0415
 
     arch, _ = parse_platform(spec.platform)
     runtime_base = PROJECT_ROOT / "src" / arch / "runtime" / spec.runtime_name
@@ -364,6 +357,7 @@ def compile_task(
         func_name=orchestration["function_name"],
         binary=orch_binary,
         children=kernel_binaries,
+        config_name=orchestration.get("config_name", ""),
     )
 
     all_cases = getattr(golden, "ALL_CASES", {"Default": {}})
@@ -431,9 +425,9 @@ def run_single_task(
     """Run all cases in a compiled task on a given worker. Returns True if all pass."""
     import ctypes  # noqa: PLC0415
 
-    import numpy as np  # noqa: PLC0415
     import torch  # noqa: PLC0415
-    from code_runner import _kernel_config_runtime_env, _temporary_env  # noqa: PLC0415
+
+    from simpler_setup.code_runner import _kernel_config_runtime_env, _temporary_env  # noqa: PLC0415
 
     golden_mod = cast(GoldenModuleLike, task.golden_module)
     kc = task.kernel_config
@@ -454,12 +448,8 @@ def run_single_task(
 
             for item in result:
                 name, value = item
-                if isinstance(value, (torch.Tensor, np.ndarray)):
-                    tensor = (
-                        torch.as_tensor(value).cpu().contiguous()
-                        if not isinstance(value, torch.Tensor)
-                        else value.cpu().contiguous()
-                    )
+                if isinstance(value, torch.Tensor):
+                    tensor = value.cpu().contiguous()
                     args[name] = tensor
                     orch_args.add_tensor(make_tensor_arg(tensor))
                     if name in output_set:
@@ -961,11 +951,11 @@ def print_summary(results: list[TaskResult]) -> int:
 
 def reset_pto_isa(commit: str, clone_protocol: str) -> str:
     """Checkout PTO-ISA at the pinned commit (or re-clone if needed)."""
-    from code_runner import _checkout_pto_isa_commit, _get_pto_isa_clone_path  # noqa: PLC0415
+    from simpler_setup.pto_isa import checkout_pto_isa_commit, get_pto_isa_clone_path  # noqa: PLC0415
 
-    clone_path = _get_pto_isa_clone_path()
+    clone_path = get_pto_isa_clone_path()
     if clone_path.exists():
-        _checkout_pto_isa_commit(clone_path, commit, verbose=True)
+        checkout_pto_isa_commit(clone_path, commit, verbose=True)
         return str(clone_path.resolve())
     return ensure_pto_isa(commit, clone_protocol)
 
@@ -1186,6 +1176,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("-t", "--timeout", type=int, default=600)
     parser.add_argument("--clone-protocol", choices=["ssh", "https"], default="ssh")
     parser.add_argument("--all", dest="run_all_cases", action="store_true", help="Run all cases, not just DEFAULT_CASE")
+    parser.add_argument(
+        "--log-level", choices=LOG_LEVEL_CHOICES, default=DEFAULT_LOG_LEVEL, help="Root logger level (default: info)"
+    )
     parser.add_argument("--device-worker", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--result-json", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--task-list-json", default=None, help=argparse.SUPPRESS)
@@ -1226,6 +1219,11 @@ def _run_with_timeout(
 def _run_single_platform(platform: str, args: argparse.Namespace) -> list[TaskResult]:
     """Run all tasks for a single platform. Returns list of TaskResults."""
     is_sim = platform.endswith("sim")
+
+    # Ensure PTO-ISA is available before task discovery so that downstream
+    # pytest scene tests (which share the same clone path) can find it even
+    # when ci.py itself has no tasks to run.
+    ensure_pto_isa(args.pto_isa_commit, args.clone_protocol)
 
     tasks = discover_tasks(platform, runtime_filter=args.runtime)
     if not tasks:
@@ -1285,9 +1283,8 @@ def _run_single_platform(platform: str, args: argparse.Namespace) -> list[TaskRe
 
 
 def main() -> int:
-    logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s", force=True)
-
     args = parse_args()
+    configure_logging(args.log_level)
     args.devices = parse_device_range(args.device_range)
 
     valid_platforms = _discover_valid_platforms()

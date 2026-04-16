@@ -11,11 +11,108 @@
 
 #include "dist_worker.h"
 
+#include <pthread.h>
+
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
 
-DistWorker::DistWorker(int32_t level) :
+// ---------------------------------------------------------------------------
+// Fork hygiene
+// ---------------------------------------------------------------------------
+//
+// Thread-pool libraries linked transitively into the Python process (OpenMP,
+// OpenBLAS, MKL, BLIS, KMP) spin up worker threads the first time they are
+// touched, and those threads do not survive `fork()` cleanly. Pin every
+// library we know about to a single thread before Worker.init() spawns its
+// own pool, and let KMP tolerate duplicate libomp loads on macOS where
+// multiple shared libraries link against their own copy.
+//
+// pthread_atfork installs handlers once per process that take the locks we
+// own in a fixed order on the parent side and release them in reverse on
+// both parent and child. The order is coarse-to-fine so nested locking in
+// normal paths cannot deadlock the atfork handler. The set of locks is
+// intentionally narrow: only those we own. Foreign locks (malloc, GIL) are
+// out of scope and handled by the other libraries' own atfork plumbing.
+//
+// The handler list is process-global (pthread_atfork cannot be unregistered)
+// and idempotent — installing it more than once is harmless because the
+// actual state it touches is per-Worker. For PR-H we keep the handler empty
+// until we have a second Worker-owned lock worth guarding (Allocator::mu_
+// is the only one so far, and its lifetime is tied to a DistWorker that
+// always fork-then-init). Registering an empty handler is still valuable as
+// a diagnostic hook for fork misuse and as a landing pad for locks added
+// in PR-C / PR-D (per-scope rings, per-worker-type queues, callable registry).
+
+namespace {
+
+std::once_flag g_fork_hygiene_once;
+
+void apply_env_defaults_once() {
+    // setenv with overwrite=0 leaves user-supplied values intact.
+    setenv("OMP_NUM_THREADS", "1", 0);
+    setenv("OPENBLAS_NUM_THREADS", "1", 0);
+    setenv("MKL_NUM_THREADS", "1", 0);
+    setenv("BLIS_NUM_THREADS", "1", 0);
+#if defined(__APPLE__)
+    setenv("KMP_DUPLICATE_LIB_OK", "TRUE", 0);
+#endif
+}
+
+void atfork_prepare() {
+    // Reserved for locks we own. Acquisition order (coarse-to-fine):
+    //   1. callable_registry.mu_   (owned by Python Worker today; future
+    //      PR-E will move this to C++)
+    //   2. worker_manager.pool_mu_ (PR-D)
+    //   3. worker_thread.queue_mu_ (PR-D, per thread)
+    //   4. scheduler.completion_mu_
+    //   5. allocator.mu_
+    //   6. tensormap.mu_
+    // Locks are taken in this order and released in reverse on prepare/parent
+    // handlers so the handlers never themselves deadlock. Today none of our
+    // locks are held across potential fork points, so the handler is empty;
+    // keep the landing pad so subsequent PRs can add locks without revisiting
+    // the atfork bookkeeping.
+}
+
+void atfork_parent() {}
+
+void atfork_child() {}
+
+void install_atfork_once() {
+    // Registered once per process; the handlers close over file-scope statics
+    // so multiple DistWorker instances share a single registration.
+    static std::once_flag s_atfork;
+    std::call_once(s_atfork, []() {
+        pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
+    });
+}
+
+void fork_hygiene_once() {
+    std::call_once(g_fork_hygiene_once, []() {
+        apply_env_defaults_once();
+        install_atfork_once();
+    });
+}
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// DistWorker
+// ---------------------------------------------------------------------------
+
+DistWorker::DistWorker(int32_t level, uint64_t heap_ring_size) :
     level_(level) {
-    slots_ = std::make_unique<DistTaskSlotState[]>(DIST_TASK_WINDOW_SIZE);
+    // Fork hygiene runs before the HeapRing mmap so the env-var defaults
+    // apply to any thread-pool library that observes them at library init.
+    fork_hygiene_once();
+
+    // mmap the HeapRing region here, in the ctor, so Python callers can
+    // construct the DistWorker before fork()-ing children. The children
+    // inherit the MAP_SHARED region at the same virtual address.
+    allocator_.init(heap_ring_size, DIST_ALLOC_TIMEOUT_MS);
 }
 
 DistWorker::~DistWorker() {
@@ -28,25 +125,30 @@ void DistWorker::add_worker(WorkerType type, IWorker *worker) {
     else manager_.add_sub(worker);
 }
 
+void DistWorker::add_process_worker(WorkerType type, void *mailbox) {
+    if (initialized_) throw std::runtime_error("DistWorker: add_process_worker after init");
+    if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level_process(mailbox);
+    else manager_.add_sub_process(mailbox);
+}
+
 void DistWorker::init() {
     if (initialized_) throw std::runtime_error("DistWorker: already initialized");
 
-    ring_.init(DIST_TASK_WINDOW_SIZE);
-    orchestrator_.init(&tensormap_, &ring_, &scope_, &ready_queue_, slots_.get(), DIST_TASK_WINDOW_SIZE);
+    orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_);
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
-    manager_.start([this](DistTaskSlot slot) {
+    manager_.start(&allocator_, [this](DistTaskSlot slot) {
         scheduler_.worker_done(slot);
     });
 
     DistScheduler::Config cfg;
-    cfg.slots = slots_.get();
-    cfg.num_slots = DIST_TASK_WINDOW_SIZE;
-    cfg.ready_queue = &ready_queue_;
+    cfg.ring = &allocator_;
+    cfg.ready_next_level_queue = &ready_next_level_queue_;
+    cfg.ready_sub_queue = &ready_sub_queue_;
     cfg.manager = &manager_;
     cfg.on_consumed_cb = [this](DistTaskSlot slot) {
-        on_consumed(slot);
+        orchestrator_.on_consumed(slot);
     };
 
     scheduler_.start(cfg);
@@ -57,59 +159,16 @@ void DistWorker::close() {
     if (!initialized_) return;
     scheduler_.stop();
     manager_.stop();
-    ring_.shutdown();
+    allocator_.shutdown();
     initialized_ = false;
-}
-
-// =============================================================================
-// Orchestrator-facing API
-// =============================================================================
-
-DistSubmitResult DistWorker::submit(
-    WorkerType worker_type, const WorkerPayload &base_payload, const std::vector<DistInputSpec> &inputs,
-    const std::vector<DistOutputSpec> &outputs
-) {
-    active_tasks_.fetch_add(1, std::memory_order_relaxed);
-    return orchestrator_.submit(worker_type, base_payload, inputs, outputs);
-}
-
-DistSubmitResult DistWorker::submit_group(
-    WorkerType worker_type, const WorkerPayload &base_payload, const std::vector<const void *> &args_list,
-    const std::vector<DistInputSpec> &inputs, const std::vector<DistOutputSpec> &outputs
-) {
-    active_tasks_.fetch_add(1, std::memory_order_relaxed);
-    return orchestrator_.submit_group(worker_type, base_payload, args_list, inputs, outputs);
-}
-
-void DistWorker::scope_begin() { orchestrator_.scope_begin(); }
-void DistWorker::scope_end() { orchestrator_.scope_end(); }
-
-void DistWorker::drain() {
-    std::unique_lock<std::mutex> lk(drain_mu_);
-    drain_cv_.wait(lk, [this] {
-        return active_tasks_.load(std::memory_order_acquire) == 0;
-    });
-}
-
-// =============================================================================
-// on_consumed callback (called from Scheduler thread)
-// =============================================================================
-
-void DistWorker::on_consumed(DistTaskSlot slot) {
-    orchestrator_.on_consumed(slot);
-
-    int32_t remaining = active_tasks_.fetch_sub(1, std::memory_order_acq_rel) - 1;
-    if (remaining == 0) {
-        std::lock_guard<std::mutex> lk(drain_mu_);
-        drain_cv_.notify_all();
-    }
 }
 
 // =============================================================================
 // IWorker::run() — DistWorker as sub-worker of a higher level (placeholder)
 // =============================================================================
 
-void DistWorker::run(const WorkerPayload & /*payload*/) {
-    // Full L4+ support: payload would carry a HostTask* to execute.
-    // For now this is a placeholder; drain() returns immediately when idle.
+void DistWorker::run(uint64_t /*callable*/, TaskArgsView /*args*/, const ChipCallConfig & /*config*/) {
+    // Full L4+ support: `callable` decodes to an orch-fn handle; Worker::run
+    // opens a fresh scope, invokes the orch fn on its own Orchestrator,
+    // drains, and closes the scope. Placeholder for plan step F.
 }

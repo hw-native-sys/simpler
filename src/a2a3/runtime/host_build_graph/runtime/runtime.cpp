@@ -48,6 +48,11 @@ Runtime::Runtime() {
     enable_profiling = false;
     perf_data_base = 0;
     tensor_pair_count = 0;
+    tensor_info_storage_ = nullptr;
+    tensor_info_storage_bytes_ = 0;
+    tensor_allocation_storage_ = nullptr;
+    tensor_allocation_storage_bytes_ = 0;
+    tensor_allocation_count_ = 0;
 
     // Initialize kernel binary tracking
     registered_kernel_count_ = 0;
@@ -56,6 +61,8 @@ Runtime::Runtime() {
     for (int i = 0; i < RUNTIME_MAX_FUNC_ID; i++) {
         func_id_to_addr_[i] = 0;
     }
+    memset(tensor_info_offsets_, 0, sizeof(tensor_info_offsets_));
+    memset(tensor_info_counts_, 0, sizeof(tensor_info_counts_));
 }
 
 // =============================================================================

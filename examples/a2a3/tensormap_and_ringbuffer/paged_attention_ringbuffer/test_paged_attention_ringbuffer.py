@@ -14,13 +14,13 @@ INOUT tensors, bfloat16, and AIC+AIV mixed execution.
 """
 
 import torch
-from paged_attention_golden import compute_golden as _pa_compute_golden  # noqa: PLC0415
-from paged_attention_golden import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
 from simpler.task_interface import ArgDirection as D
 
 from simpler_setup import Scalar, SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup.goldens.paged_attention import compute_golden as _pa_compute_golden  # noqa: PLC0415
+from simpler_setup.goldens.paged_attention import generate_inputs as _pa_generate_inputs  # noqa: PLC0415
 
-PA_KERNELS = "../../../../tests/st/a2a3/tensormap_and_ringbuffer/paged_attention/kernels"
+PA_KERNELS = "../../../../tests/st/a2a3/tensormap_and_ringbuffer/batch_paged_attention/kernels"
 
 
 @scene_test(level=2, runtime="tensormap_and_ringbuffer")
@@ -38,7 +38,7 @@ class TestPagedAttentionRingbuffer(SceneTestCase):
     CALLABLE = {
         "orchestration": {
             "source": f"{PA_KERNELS}/orchestration/paged_attention_orch.cpp",
-            "function_name": "build_paged_attention_graph",
+            "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
         },
         "incores": [

@@ -17,13 +17,16 @@
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/tensor_dump_aicpu.h"
 #include "aicpu/platform_regs.h"
+#include "callable.h"
 #include "common/memory_barrier.h"
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "runtime.h"
 #include "spin_hint.h"
+#include "tensor_info.h"
 
 constexpr int MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
 constexpr int MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
@@ -99,6 +102,9 @@ struct AicpuExecutor {
     // ===== Performance profiling state =====
     uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
 
+    // ===== Dump tensor state =====
+    Runtime *runtime_{nullptr};  // Cached for dump_tensor access in try_dispatch_task
+
     // ===== Methods =====
     int init(Runtime *runtime);
     int handshake_all_cores(Runtime *runtime);
@@ -114,8 +120,8 @@ struct AicpuExecutor {
 
     // Helper functions (inline to avoid linker issues, not always_inline to preserve barriers)
     inline void resolve_task_dependencies(
-        Task *task, Runtime &runtime, int *cur_ready_queue_aic, int &cur_aic_tail, int &cur_aic_ready_count,
-        int *cur_ready_queue_aiv, int &cur_aiv_tail, int &cur_aiv_ready_count
+        Task *task, Runtime &runtime, int thread_idx, int *cur_ready_queue_aic, int &cur_aic_tail,
+        int &cur_aic_ready_count, int *cur_ready_queue_aiv, int &cur_aiv_tail, int &cur_aiv_ready_count
     );
 
     inline bool try_dispatch_task(
@@ -126,13 +132,56 @@ struct AicpuExecutor {
 
 static AicpuExecutor g_aicpu_executor;
 
+#if PTO2_PROFILING
+static int
+collect_task_tensor_buffer_addrs(const Runtime &runtime, const Task &task, uint64_t *buffer_addrs, int max_count) {
+    int found = 0;
+    for (int arg_idx = 0; arg_idx < task.num_args; arg_idx++) {
+        uint64_t arg = task.args[arg_idx];
+        if (!runtime.is_tensor_buffer_addr(arg)) {
+            continue;
+        }
+        if (found < max_count) {
+            buffer_addrs[found] = arg;
+        }
+        found++;
+    }
+    return found;
+}
+#endif
+
 // ===== Helper Function Implementations =====
 
 // Resolve dependencies: decrement fanin and enqueue newly ready tasks
 inline void AicpuExecutor::resolve_task_dependencies(
-    Task *task, Runtime &runtime, int *cur_ready_queue_aic, int &cur_aic_tail, int &cur_aic_ready_count,
+    Task *task, Runtime &runtime, int thread_idx, int *cur_ready_queue_aic, int &cur_aic_tail, int &cur_aic_ready_count,
     int *cur_ready_queue_aiv, int &cur_aiv_tail, int &cur_aiv_ready_count
 ) {
+    if (task == nullptr) {
+        return;
+    }
+
+#if PTO2_PROFILING
+    if (get_enable_dump_tensor()) {
+        uint64_t callable_addr = runtime.get_function_bin_addr(task->func_id);
+        if (callable_addr != 0) {
+            const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
+            int tensor_info_count = 0;
+            const TensorInfo *tensor_info = runtime.get_tensor_info(task->task_id, &tensor_info_count);
+            uint64_t tensor_buffer_addrs[RUNTIME_MAX_ARGS] = {};
+            int tensor_buffer_count =
+                collect_task_tensor_buffer_addrs(runtime, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
+            dump_tensors_for_task(
+                thread_idx, static_cast<uint64_t>(task->task_id), 0, task->num_args, task->func_id, *callable,
+                tensor_info, tensor_info_count, tensor_buffer_addrs, tensor_buffer_count,
+                TensorDumpStage::AFTER_COMPLETION
+            );
+        }
+    }
+#else
+    (void)thread_idx;
+#endif
+
     for (int j = 0; j < task->fanout_count; j++) {
         int dep_id = task->fanout[j];
         Task *dep = runtime.get_task(dep_id);
@@ -186,6 +235,28 @@ inline bool AicpuExecutor::try_dispatch_task(
         running_task_ids_[core_id]
     );
 
+#if PTO2_PROFILING
+    if (get_enable_dump_tensor()) {
+        Task *task = runtime_->get_task(task_id);
+        if (task != nullptr) {
+            uint64_t callable_addr = runtime_->get_function_bin_addr(task->func_id);
+            if (callable_addr != 0) {
+                const CoreCallable *callable = reinterpret_cast<const CoreCallable *>(callable_addr);
+                int tensor_info_count = 0;
+                const TensorInfo *tensor_info = runtime_->get_tensor_info(task_id, &tensor_info_count);
+                uint64_t tensor_buffer_addrs[RUNTIME_MAX_ARGS] = {};
+                int tensor_buffer_count =
+                    collect_task_tensor_buffer_addrs(*runtime_, *task, tensor_buffer_addrs, RUNTIME_MAX_ARGS);
+                dump_tensors_for_task(
+                    thread_idx, static_cast<uint64_t>(task_id), 0, task->num_args, task->func_id, *callable,
+                    tensor_info, tensor_info_count, tensor_buffer_addrs, tensor_buffer_count,
+                    TensorDumpStage::BEFORE_DISPATCH
+                );
+            }
+        }
+    }
+#endif
+
     // Set state before writing register to avoid race with AICore ACK
     pending_task_ids_[core_id] = task_id;
 
@@ -217,6 +288,7 @@ int AicpuExecutor::init(Runtime *runtime) {
 
     // Read execution parameters from runtime
     thread_num_ = runtime->sche_cpu_num;
+    runtime_ = runtime;
 
     // Simplified defensive check
     if (thread_num_ < 1 || thread_num_ > MAX_AICPU_THREADS) {
@@ -259,6 +331,11 @@ int AicpuExecutor::init(Runtime *runtime) {
     if (runtime->enable_profiling) {
         perf_aicpu_init_profiling(runtime);
     }
+#if PTO2_PROFILING
+    if (get_enable_dump_tensor()) {
+        dump_tensor_init(thread_num_);
+    }
+#endif
 
     init_done_.store(true, std::memory_order_release);
     LOG_INFO("AicpuExecutor: Init complete");
@@ -616,8 +693,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                 int completed_task_id = pending_task_ids_[core_id];
                 int prev_running_id = running_task_ids_[core_id];
 
-                // Profiling: when prev_running_id exists, its AICore record was
-                // written first (at records[count]), so complete it BEFORE the
+                // Profiling: when prev_running_id exists, its AICore timing was
+                // written to wip[id & 1] first, so complete it BEFORE the
                 // pending task's record to maintain buffer ordering.
                 if (profiling_enabled) {
                     uint64_t finish_ts = get_sys_cnt_aicpu();
@@ -689,7 +766,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                     Task *prev_running_task = runtime.get_task(prev_running_id);
                     resolve_task_dependencies(
-                        prev_running_task, runtime, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
+                        prev_running_task, runtime, thread_idx, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
                         cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                     );
 
@@ -698,8 +775,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 Task *task = runtime.get_task(completed_task_id);
                 resolve_task_dependencies(
-                    task, runtime, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count, cur_ready_queue_aiv,
-                    cur_aiv_tail, cur_aiv_ready_count
+                    task, runtime, thread_idx, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
+                    cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                 );
 
                 made_progress = true;
@@ -753,7 +830,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                     Task *prev_running_task = runtime.get_task(prev_running_id);
                     resolve_task_dependencies(
-                        prev_running_task, runtime, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
+                        prev_running_task, runtime, thread_idx, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
                         cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                     );
 
@@ -811,8 +888,8 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
                 Task *task = runtime.get_task(completed_task_id);
                 resolve_task_dependencies(
-                    task, runtime, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count, cur_ready_queue_aiv,
-                    cur_aiv_tail, cur_aiv_ready_count
+                    task, runtime, thread_idx, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
+                    cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                 );
 
                 made_progress = true;
@@ -977,6 +1054,12 @@ int AicpuExecutor::run(Runtime *runtime) {
         return rc;
     }
 
+#if PTO2_PROFILING
+    if (get_enable_dump_tensor()) {
+        dump_tensor_flush(thread_idx);
+    }
+#endif
+
     LOG_INFO("Thread %d: Completed", thread_idx);
 
     int prev_finished = finished_count_.fetch_add(1, std::memory_order_acq_rel);
@@ -995,6 +1078,17 @@ void AicpuExecutor::deinit(Runtime *runtime) {
     //    Next round's Host DMA (rtMemcpy) writes fresh Runtime to HBM but
     //    bypasses this cache. Invalidating now ensures next round reads from HBM.
     cache_invalidate_range(runtime, sizeof(Runtime));
+    if (runtime->get_tensor_info_storage() != nullptr && runtime->get_tensor_info_storage_bytes() > 0) {
+        cache_invalidate_range(
+            runtime->get_tensor_info_storage(), static_cast<size_t>(runtime->get_tensor_info_storage_bytes())
+        );
+    }
+    if (runtime->get_tensor_allocation_storage() != nullptr && runtime->get_tensor_allocation_storage_bytes() > 0) {
+        cache_invalidate_range(
+            runtime->get_tensor_allocation_storage(),
+            static_cast<size_t>(runtime->get_tensor_allocation_storage_bytes())
+        );
+    }
 
     // === Existing reset logic ===
     ready_count_aic_.store(0, std::memory_order_release);

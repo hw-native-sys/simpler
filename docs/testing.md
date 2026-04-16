@@ -51,6 +51,10 @@ python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
     -p a2a3 --enable-profiling
 
+# Tensor dump
+python tests/st/a2a3/tensormap_and_ringbuffer/alternating_matmul_add/test_alternating_matmul_add.py \
+    -p a2a3 -d 11 --dump-tensor
+
 # Single example via run_example.py (deprecated — prefer test_*.py standalone)
 python examples/scripts/run_example.py \
     -k examples/a2a3/host_build_graph/vector_example/kernels \
@@ -95,6 +99,7 @@ pytest --platform a2a3sim --log-level debug                        # verbose C++
 python test_xxx.py -p a2a3sim                                    # default: 1 round + golden
 python test_xxx.py -p a2a3 -d 0 -n 100 --skip-golden            # benchmark mode
 python test_xxx.py -p a2a3 --enable-profiling                    # profiling (first round)
+python test_xxx.py -p a2a3 --dump-tensor                         # dump per-task tensor I/O
 python test_xxx.py -p a2a3sim --build                            # compile runtime from source
 python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
 ```
@@ -106,6 +111,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--rounds N` | `-n` | 1 | Run each case N times |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
 | `--enable-profiling` | | false | Enable profiling on first round only |
+| `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
 | `--build` | | false | Compile runtime from source (not pre-built) |
 | `--log-level LEVEL` | | (none) | Set `PTO_LOG_LEVEL` env var (`error`/`warn`/`info`/`debug`) |
 
@@ -313,25 +319,42 @@ add_test(NAME test_my_component COMMAND test_my_component)
 Create a `test_*.py` file using the `@scene_test` decorator:
 
 ```python
-from setup import SceneTestCase, scene_test
+import torch
 from simpler.task_interface import ArgDirection as D
 
-@scene_test(level=2, platforms=["a2a3sim", "a2a3"], runtime="tensormap_and_ringbuffer")
+from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+
+
+@scene_test(level=2, runtime="tensormap_and_ringbuffer")
 class TestMyKernel(SceneTestCase):
-    ORCHESTRATION = {
-        "source": "kernels/orchestration/my_orch.cpp",
-        "function_name": "aicpu_orchestration_entry",
-        "signature": [D.IN, D.OUT],
+    CALLABLE = {
+        "orchestration": {
+            "source": "kernels/orchestration/my_orch.cpp",
+            "function_name": "aicpu_orchestration_entry",
+            "signature": [D.IN, D.OUT],
+        },
+        "incores": [
+            {"func_id": 0, "source": "kernels/aiv/my_kernel.cpp", "core_type": "aiv"},
+        ],
     }
-    KERNELS = [{"func_id": 0, "source": "kernels/aiv/my_kernel.cpp", "core_type": "aiv"}]
-    RUNTIME_CONFIG = {"aicpu_thread_num": 4, "block_dim": 3}
-    __outputs__ = ["y"]
 
-    def generate_inputs(self, params):
-        return [("x", torch.ones(1024)), ("y", torch.zeros(1024))]
+    CASES = [
+        {
+            "name": "default",
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 3},
+            "params": {},
+        },
+    ]
 
-    def compute_golden(self, tensors, params):
-        tensors["y"][:] = tensors["x"] + 1
+    def generate_args(self, params):
+        return TaskArgsBuilder(
+            Tensor("x", torch.ones(1024, dtype=torch.float32)),
+            Tensor("y", torch.zeros(1024, dtype=torch.float32)),
+        )
+
+    def compute_golden(self, args, params):
+        args.y[:] = args.x + 1
 
 if __name__ == "__main__":
     SceneTestCase.run_module(__name__)
@@ -353,9 +376,9 @@ pytest examples tests/st --platform a2a3
 Key fields:
 
 - `level`: 2 = single ChipWorker, 3 = distributed Worker (future)
-- `platforms`: which platforms this test supports (sim names end in "sim")
+- `CASES[].platforms`: which platforms each case supports (sim names end in "sim")
 - `runtime`: which runtime to use
-- `ORCHESTRATION.source` / `KERNELS[].source`: paths relative to the test file
+- `CALLABLE.orchestration.source` / `CALLABLE.incores[].source`: paths relative to the test file
 
 ### New Scene Test (Legacy)
 
@@ -367,6 +390,83 @@ Create a directory under `tests/st/{arch}/{runtime}/my_test/` with:
 - `kernels/kernel_config.py` — Kernel and runtime configuration
 
 The test will be automatically picked up by `ci.py`. New tests should prefer the `@scene_test` format above.
+
+### Migrating Legacy Tests to @scene_test
+
+#### Field Mapping
+
+| Legacy file | Legacy field | SceneTestCase equivalent |
+| ----------- | ------------ | ------------------------ |
+| `kernel_config.py` | `ORCHESTRATION` | `CALLABLE["orchestration"]` (source becomes relative path) |
+| `kernel_config.py` | `KERNELS` | `CALLABLE["incores"]` |
+| `kernel_config.py` | `RUNTIME_CONFIG` | `CASES[*]["config"]` (`aicpu_thread_num`, `block_dim`) |
+| `golden.py` | `generate_inputs()` | `generate_args(self, params)` returning `TaskArgsBuilder(...)` |
+| `golden.py` | `compute_golden()` | `compute_golden(self, args, params)` using `args.name[:]` |
+| `golden.py` | `__outputs__` | `D.OUT` / `D.INOUT` in `CALLABLE["orchestration"]["signature"]` |
+| `golden.py` | `ALL_CASES` | `CASES` list with per-case `platforms`, `config`, `params` |
+| `golden.py` | `RTOL` / `ATOL` | Class attributes `RTOL` / `ATOL` |
+
+#### Key Conversions
+
+**generate_inputs → generate_args:**
+
+```python
+# Legacy (golden.py)
+def generate_inputs(params):
+    a = torch.full((SIZE,), 2.0, dtype=torch.float32)
+    return [("a", a), ("b", b), ("f", f)]
+
+# New (test_*.py)
+def generate_args(self, params):
+    a = torch.full((SIZE,), 2.0, dtype=torch.float32)
+    return TaskArgsBuilder(Tensor("a", a), Tensor("b", b), Tensor("f", f))
+```
+
+**compute_golden:**
+
+```python
+# Legacy
+def compute_golden(tensors, params):
+    tensors["f"][:] = torch.as_tensor(tensors["a"]) + 1
+
+# New
+def compute_golden(self, args, params):
+    args.f[:] = args.a + 1
+```
+
+**Source paths:** Legacy uses absolute paths (`str(_KERNELS_ROOT / "aiv" / "kernel.cpp")`). SceneTestCase uses paths relative to the test file (`"kernels/aiv/kernel.cpp"`).
+
+**Import:** `from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test` (not `from setup`). For scalar arguments add `Scalar` and `import ctypes`. Tensors must appear before Scalars in `TaskArgsBuilder`.
+
+#### Running: Before and After
+
+| Action | Legacy | SceneTestCase |
+| ------ | ------ | ------------- |
+| Single run (sim) | `python examples/scripts/run_example.py -k kernels/ -g golden.py -p a2a3sim` | `python test_*.py -p a2a3sim` |
+| Single run (hardware) | `python examples/scripts/run_example.py -k kernels/ -g golden.py -p a2a3 -d 0` | `python test_*.py -p a2a3 -d 0` |
+| Batch (pytest) | `python examples/scripts/ci.py` | `pytest examples tests/st --platform a2a3sim` |
+| Multi-round | Not supported | `python test_*.py -p a2a3sim -n 3` |
+| Benchmark | Manual | `python test_*.py -p a2a3 -d 0 -n 100 --skip-golden --case CaseName` |
+| Profiling | `--enable-profiling` flag on run_example.py | `python test_*.py -p a2a3 -d 0 --enable-profiling` (auto-runs `tools/swimlane_converter.py` per case at end) |
+
+##### `--case` selector and `--manual`
+
+`--case` is repeatable and accepts compound forms (useful when a test file declares multiple `SceneTestCase` classes):
+
+| Form | Meaning |
+| ---- | ------- |
+| `--case Foo` | case named `Foo` in any class |
+| `--case ClassA::Foo` | `Foo` in `ClassA` only |
+| `--case ClassA::` | all cases in `ClassA` |
+| `--case A::x --case B::y` | multiple selectors (repeatable) |
+
+`--manual exclude` (default) skips `manual: True` cases; `--manual include` runs them alongside normal cases; `--manual only` runs only manual cases. These compose orthogonally with `--case`: explicit selectors still respect the manual filter — to run a manual case by name, pass `--manual include`.
+
+#### After Migration
+
+Delete `golden.py` and `kernels/kernel_config.py`. Keep `kernels/` C++ sources — `CALLABLE` references them. Once legacy files are removed, the test is no longer discovered by `ci.py` and runs exclusively via pytest or standalone.
+
+If the same example exists in both `examples/` and `tests/st/`, merge into one `test_*.py`: small cases get `platforms: ["a2a3sim", "a2a3"]`, large benchmark cases get `platforms: ["a2a3"], "manual": True`.
 
 ## CI Pipeline
 

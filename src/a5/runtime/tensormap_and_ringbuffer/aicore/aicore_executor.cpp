@@ -89,6 +89,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
     bool profiling_enabled = runtime->enable_profiling;
+    bool dump_tensor_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
@@ -125,6 +126,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             // Execute the task
             execute_task(exec_payload);
+
+            if (dump_tensor_enabled) {
+                pipe_barrier(PIPE_ALL);
+            }
 
             // Performance profiling: record task execution
             if (profiling_enabled) {

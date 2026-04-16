@@ -25,14 +25,19 @@ void DistTaskSlotState::reset() {
         fanout_total = 0;
     }
     fanout_released.store(0, std::memory_order_relaxed);
-    for (void *p : output_bufs)
-        ::operator delete(p);
-    output_bufs.clear();
-    output_sizes.clear();
     output_keys.clear();
     fanin_producers.clear();
-    payload = WorkerPayload{};
-    args_list.clear();
+    worker_type = WorkerType::NEXT_LEVEL;
+    callable = 0;
+    callable_id = -1;
+    config = ChipCallConfig{};
+    task_args.clear();
+    task_args_list.clear();
+    is_group_ = false;
+    // ring_idx / ring_slot_idx are deliberately NOT cleared here: DistRing
+    // stamps them at alloc() before the Orchestrator ever calls reset(),
+    // and DistRing::release() needs to read them for the FIFO advance. The
+    // fields are rewritten on every alloc, so stale values never escape.
     sub_complete_count.store(0, std::memory_order_relaxed);
 }
 

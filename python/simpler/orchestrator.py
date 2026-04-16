@@ -8,27 +8,39 @@
 # -----------------------------------------------------------------------------------------------------------
 """Orchestrator — DAG builder exposed to the user's orch function during Worker.run().
 
-An Orchestrator instance is Worker's private member. Users receive it as the
-first argument of their orch function::
+A thin Python facade over the C++ ``DistOrchestrator``. The Worker creates one
+Orchestrator handle at init, retrieves the C++ object via ``DistWorker.get_orchestrator()``,
+and passes the handle to the user's orch function::
 
-    def my_orch(orch, args):
-        r = orch.submit_next_level(chip_callable, chip_args_ptr, config, outputs=[64])
-        orch.submit_sub(cid, inputs=[r.outputs[0].ptr])
+    def my_orch(orch, args, cfg):
+        # build the args object yourself; tags drive dependency inference
+        a = TaskArgs()
+        a.add_tensor(make_tensor_arg(input_tensor),  TensorArgType.INPUT)
+        a.add_tensor(make_tensor_arg(output_tensor), TensorArgType.OUTPUT)
+        orch.submit_next_level(chip_callable, a, cfg)
 
-    w.run(Task(orch=my_orch, args=my_args))
+        sub_args = TaskArgs()
+        sub_args.add_tensor(make_tensor_arg(output_tensor), TensorArgType.INPUT)
+        orch.submit_sub(cid, sub_args)
+
+    w.run(my_orch, my_args, my_config)
 
 Scope/drain lifecycle is managed by ``Worker.run()``; users never call those
 directly.
 """
 
+import contextlib
+from collections.abc import Iterator, Sequence
 from typing import Any, Optional
 
 from .task_interface import (
-    DistInputSpec,
-    DistOutputSpec,
-    DistWorker,
-    WorkerPayload,
-    WorkerType,
+    ChipCallConfig,
+    ContinuousTensor,
+    DataType,
+    TaskArgs,
+)
+from .task_interface import (
+    DistOrchestrator as _CDistOrchestrator,
 )
 
 
@@ -40,110 +52,106 @@ def _resolve_callable_ptr(callable_: Any) -> int:
 
 
 class Orchestrator:
-    """DAG builder. Valid only inside the orch function passed to Worker.run()."""
+    """DAG builder. Valid only inside the orch function passed to Worker.run().
 
-    def __init__(self, dist_worker: DistWorker) -> None:
-        self._dw = dist_worker
+    Wraps a borrowed reference to the C++ DistOrchestrator owned by the parent
+    DistWorker. The Python ``Worker`` keeps a strong reference to the parent
+    DistWorker for the entire orch-fn execution, so the borrowed reference
+    stays valid.
+    """
+
+    def __init__(self, c_orchestrator: _CDistOrchestrator) -> None:
+        self._o = c_orchestrator
 
     # ------------------------------------------------------------------
     # User-facing submit API
     # ------------------------------------------------------------------
 
-    def submit_next_level(
-        self,
-        callable_: Any,
-        args: int = 0,
-        config: Optional[Any] = None,
-        *,
-        inputs: Optional[list[int]] = None,
-        outputs: Optional[list[int]] = None,
-    ):
-        """Submit a next-level (chip) task.
+    def submit_next_level(self, callable_: Any, args: TaskArgs, config: Optional[ChipCallConfig] = None):
+        """Submit a NEXT_LEVEL (chip) task. Tags inside ``args`` drive deps."""
+        cfg = config if config is not None else ChipCallConfig()
+        return self._o.submit_next_level(_resolve_callable_ptr(callable_), args, cfg)
 
-        Args:
-            callable_: ChipCallable or raw callable pointer (int).
-            args: Pointer to ChipStorageTaskArgs (int).
-            config: ChipCallConfig-like (reads block_dim, aicpu_thread_num,
-                enable_profiling). If None, defaults apply.
-            inputs: List of input pointers for dependency inference.
-            outputs: List of output byte sizes to allocate.
+    def submit_next_level_group(self, callable_: Any, args_list: list, config: Optional[ChipCallConfig] = None):
+        """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N workers, 1 DAG node)."""
+        cfg = config if config is not None else ChipCallConfig()
+        return self._o.submit_next_level_group(_resolve_callable_ptr(callable_), args_list, cfg)
+
+    def submit_sub(self, callable_id: int, args: Optional[TaskArgs] = None):
+        """Submit a SUB task by registered callable id.
+
+        ``args`` may be omitted for a tag-less task (no dependencies, no outputs).
         """
-        p = self._build_next_level_payload(callable_, args, config)
-        in_specs = [DistInputSpec(x) for x in (inputs or [])]
-        out_specs = [DistOutputSpec(s) for s in (outputs or [])]
-        return self._dw.submit(WorkerType.NEXT_LEVEL, p, in_specs, out_specs)
+        if args is None:
+            args = TaskArgs()
+        return self._o.submit_sub(int(callable_id), args)
 
-    def submit_next_level_group(
-        self,
-        callable_: Any,
-        args_list: list[int],
-        config: Optional[Any] = None,
-        *,
-        inputs: Optional[list[int]] = None,
-        outputs: Optional[list[int]] = None,
-    ):
-        """Submit a group of next-level tasks (N args → N workers, 1 DAG node)."""
-        p = self._build_next_level_payload(callable_, 0, config)
-        in_specs = [DistInputSpec(x) for x in (inputs or [])]
-        out_specs = [DistOutputSpec(s) for s in (outputs or [])]
-        return self._dw.submit_group(WorkerType.NEXT_LEVEL, p, args_list, in_specs, out_specs)
+    def submit_sub_group(self, callable_id: int, args_list: list):
+        """Submit a group of SUB tasks (N TaskArgs → N workers, 1 DAG node)."""
+        return self._o.submit_sub_group(int(callable_id), args_list)
 
-    def submit_sub(
-        self,
-        callable_id: int,
-        *,
-        inputs: Optional[list[int]] = None,
-        outputs: Optional[list[int]] = None,
-    ):
-        """Submit a SUB task by registered callable id."""
-        p = WorkerPayload()
-        p.worker_type = WorkerType.SUB
-        p.callable_id = callable_id
-        in_specs = [DistInputSpec(x) for x in (inputs or [])]
-        out_specs = [DistOutputSpec(s) for s in (outputs or [])]
-        return self._dw.submit(WorkerType.SUB, p, in_specs, out_specs)
+    # ------------------------------------------------------------------
+    # Nested scope (Strict-1 per-scope rings)
+    # ------------------------------------------------------------------
+    #
+    # Tasks and allocations inside a nested ``with orch.scope():`` bind to a
+    # deeper heap ring (``min(depth, DIST_MAX_RING_DEPTH-1)``) so their
+    # memory reclaims independently of the outer scope. ``scope_end`` is
+    # non-blocking — it releases scope refs and returns; call
+    # ``Worker.run``/``drain`` for a synchronous wait.
+    #
+    # Usage::
+    #
+    #     def my_orch(orch, args):
+    #         with orch.scope():
+    #             orch.submit_next_level(a, ...)
+    #             orch.submit_next_level(b, ...)
+    #         orch.submit_next_level(c, ...)   # back on outer-scope ring
 
-    def submit_sub_group(
-        self,
-        callable_id: int,
-        args_list: list[int],
-        *,
-        inputs: Optional[list[int]] = None,
-        outputs: Optional[list[int]] = None,
-    ):
-        """Submit a group of SUB tasks (N args → N workers, 1 DAG node)."""
-        p = WorkerPayload()
-        p.worker_type = WorkerType.SUB
-        p.callable_id = callable_id
-        in_specs = [DistInputSpec(x) for x in (inputs or [])]
-        out_specs = [DistOutputSpec(s) for s in (outputs or [])]
-        return self._dw.submit_group(WorkerType.SUB, p, args_list, in_specs, out_specs)
+    def scope_begin(self) -> None:
+        self._o.scope_begin()
+
+    def scope_end(self) -> None:
+        self._o.scope_end()
+
+    @contextlib.contextmanager
+    def scope(self) -> Iterator["Orchestrator"]:
+        """Open a nested scope for the ``with`` block.
+
+        Tasks submitted inside the block use a deeper heap ring so they
+        reclaim independently of the outer scope (see Strict-1 in
+        ``.claude/plans/HIERARCHICAL_RUNTIME_REFACTOR.md``).
+        """
+        self._o.scope_begin()
+        try:
+            yield self
+        finally:
+            self._o.scope_end()
+
+    def alloc(self, shape: Sequence[int], dtype: DataType) -> ContinuousTensor:
+        """Allocate a runtime-managed intermediate buffer.
+
+        Returns a ``ContinuousTensor`` whose backing memory comes from a
+        per-allocation MAP_SHARED mmap (visible to forked child workers).
+        Lifetime is bound to a synthetic task slot that the Orchestrator
+        treats as the buffer's producer; the buffer is freed when all
+        downstream consumers have completed and the run's scope ends.
+
+        Use this for chip-A → chip-B intermediate buffers instead of
+        pre-allocating with ``torch.share_memory_()`` — the runtime owns
+        the lifecycle.
+        """
+        return self._o.alloc(list(shape), dtype)
 
     # ------------------------------------------------------------------
     # Internal (called by Worker.run)
     # ------------------------------------------------------------------
 
     def _scope_begin(self) -> None:
-        self._dw.scope_begin()
+        self._o._scope_begin()
 
     def _scope_end(self) -> None:
-        self._dw.scope_end()
+        self._o._scope_end()
 
     def _drain(self) -> None:
-        self._dw.drain()
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _build_next_level_payload(callable_: Any, args: int, config: Optional[Any]) -> WorkerPayload:
-        p = WorkerPayload()
-        p.worker_type = WorkerType.NEXT_LEVEL
-        p.callable = _resolve_callable_ptr(callable_)
-        p.args = int(args)
-        if config is not None:
-            p.block_dim = int(config.block_dim)
-            p.aicpu_thread_num = int(config.aicpu_thread_num)
-            p.enable_profiling = bool(getattr(config, "enable_profiling", False))
-        return p
+        self._o._drain()

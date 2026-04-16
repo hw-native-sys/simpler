@@ -43,8 +43,6 @@ set(DIST_SOURCES
     ${DIST_SRC_DIR}/dist_ring.cpp
     ${DIST_SRC_DIR}/dist_scope.cpp
     ${DIST_SRC_DIR}/dist_orchestrator.cpp
-    ${DIST_SRC_DIR}/dist_sub_worker.cpp
-    ${DIST_SRC_DIR}/dist_chip_process.cpp
     ${DIST_SRC_DIR}/dist_worker_manager.cpp
     ${DIST_SRC_DIR}/dist_scheduler.cpp
     ${DIST_SRC_DIR}/dist_worker.cpp
@@ -58,6 +56,7 @@ function(add_dist_test name src)
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
         ${DIST_SRC_DIR}
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
@@ -109,7 +108,7 @@ endfunction()
 enable_testing()
 
 add_dist_test(test_dist_tensormap  test_dist_tensormap.cpp)
-add_dist_test(test_dist_ring       test_dist_ring.cpp)
+add_dist_test(test_dist_ring  test_dist_ring.cpp)
 add_dist_test(test_dist_scope      test_dist_scope.cpp)
 add_dist_test(test_dist_orchestrator test_dist_orchestrator.cpp)
 add_dist_test(test_dist_scheduler  test_dist_scheduler.cpp)

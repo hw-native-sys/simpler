@@ -39,6 +39,7 @@
 #include "common/core_type.h"
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"
+#include "tensor_info.h"
 
 // Logging macros using unified logging interface
 #include "common/unified_log.h"
@@ -100,6 +101,10 @@
  * The structure is cache-line aligned (64 bytes) to prevent false sharing
  * between cores and optimize cache coherency operations.
  *
+ * enable_profiling_flag bit definitions:
+ * - bit0: tensor dump enabled
+ * - remaining bits: reserved for future runtime controls
+ *
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
  * - aicore_done: Written by AICore, read by AICPU
@@ -110,19 +115,21 @@
  * - perf_records_addr: Written by AICPU, read by AICore (performance records address)
  * - perf_buffer_status: Written by both (AICPU=1 on buffer full, AICore=0 on buffer empty)
  * - physical_core_id: Written by AICPU, read by AICore (physical core ID)
+ * - enable_profiling_flag: Written by host/AICPU init, read by AICore (bitmask)
  */
 struct Handshake {
-    volatile uint32_t aicpu_ready;         // AICPU ready signal: 0=not ready, 1=ready
-    volatile uint32_t aicore_done;         // AICore ready signal: 0=not ready, core_id+1=ready
-    volatile uint64_t task;                // Task pointer: 0=no task, non-zero=Task* address
-    volatile int32_t task_status;          // Task execution status: 0=idle, 1=busy
-    volatile int32_t control;              // Control signal: 0=execute, 1=quit
-    volatile CoreType core_type;           // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t perf_records_addr;   // Performance records address
-    volatile uint32_t perf_buffer_status;  // 0 = not full, 1 = full
-    volatile uint32_t physical_core_id;    // Physical core ID
-    volatile uint32_t aicpu_regs_ready;    // AICPU register init done: 0=pending, 1=done
-    volatile uint32_t aicore_regs_ready;   // AICore ID reported: 0=pending, 1=done
+    volatile uint32_t aicpu_ready;            // AICPU ready signal: 0=not ready, 1=ready
+    volatile uint32_t aicore_done;            // AICore ready signal: 0=not ready, core_id+1=ready
+    volatile uint64_t task;                   // Task pointer: 0=no task, non-zero=Task* address
+    volatile int32_t task_status;             // Task execution status: 0=idle, 1=busy
+    volatile int32_t control;                 // Control signal: 0=execute, 1=quit
+    volatile CoreType core_type;              // Core type: CoreType::AIC or CoreType::AIV
+    volatile uint64_t perf_records_addr;      // Performance records address
+    volatile uint32_t perf_buffer_status;     // 0 = not full, 1 = full
+    volatile uint32_t physical_core_id;       // Physical core ID
+    volatile uint32_t aicpu_regs_ready;       // AICPU register init done: 0=pending, 1=done
+    volatile uint32_t aicore_regs_ready;      // AICore ID reported: 0=pending, 1=done
+    volatile uint32_t enable_profiling_flag;  // Generic profiling-related flags; bit0=dump tensor
 } __attribute__((aligned(64)));
 
 /**
@@ -225,6 +232,17 @@ private:
     // Kernel binary tracking for cleanup
     int registered_kernel_func_ids_[RUNTIME_MAX_FUNC_ID];
     int registered_kernel_count_;
+
+    // Tensor info metadata for tensor dump
+    void *tensor_info_storage_;
+    uint64_t tensor_info_storage_bytes_;
+    uint32_t tensor_info_offsets_[RUNTIME_MAX_TASKS];
+    uint16_t tensor_info_counts_[RUNTIME_MAX_TASKS];
+
+    // Device allocation ranges used to recover tensor buffer addresses from task.args[]
+    void *tensor_allocation_storage_;
+    uint64_t tensor_allocation_storage_bytes_;
+    uint32_t tensor_allocation_count_;
 
 public:
     /**
@@ -335,6 +353,78 @@ public:
      * Clear all recorded tensor pairs.
      */
     void clear_tensor_pairs();
+
+    // =========================================================================
+    // Tensor Info Metadata
+    // =========================================================================
+
+    void set_tensor_info_storage(void *ptr, uint64_t bytes) {
+        tensor_info_storage_ = ptr;
+        tensor_info_storage_bytes_ = bytes;
+    }
+
+    void clear_tensor_info_storage() {
+        tensor_info_storage_ = nullptr;
+        tensor_info_storage_bytes_ = 0;
+    }
+
+    void set_tensor_info_range(int task_id, uint32_t offset, uint16_t count) {
+        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS) return;
+        tensor_info_offsets_[task_id] = offset;
+        tensor_info_counts_[task_id] = count;
+    }
+
+    const TensorInfo *get_tensor_info(int task_id, int *count) const {
+        if (count != nullptr) {
+            *count = 0;
+        }
+        if (task_id < 0 || task_id >= RUNTIME_MAX_TASKS || tensor_info_storage_ == nullptr) {
+            return nullptr;
+        }
+        uint16_t tensor_info_count = tensor_info_counts_[task_id];
+        if (tensor_info_count == 0) {
+            return nullptr;
+        }
+        if (count != nullptr) {
+            *count = static_cast<int>(tensor_info_count);
+        }
+        const TensorInfo *base = reinterpret_cast<const TensorInfo *>(tensor_info_storage_);
+        return base + tensor_info_offsets_[task_id];
+    }
+
+    void *get_tensor_info_storage() const { return tensor_info_storage_; }
+
+    uint64_t get_tensor_info_storage_bytes() const { return tensor_info_storage_bytes_; }
+
+    void set_tensor_allocation_storage(void *ptr, uint32_t count, uint64_t bytes) {
+        tensor_allocation_storage_ = ptr;
+        tensor_allocation_count_ = count;
+        tensor_allocation_storage_bytes_ = bytes;
+    }
+
+    void clear_tensor_allocation_storage() {
+        tensor_allocation_storage_ = nullptr;
+        tensor_allocation_count_ = 0;
+        tensor_allocation_storage_bytes_ = 0;
+    }
+
+    bool is_tensor_buffer_addr(uint64_t addr) const {
+        if (tensor_allocation_storage_ == nullptr || tensor_allocation_count_ == 0) {
+            return false;
+        }
+        const TensorAllocationInfo *allocations =
+            reinterpret_cast<const TensorAllocationInfo *>(tensor_allocation_storage_);
+        for (uint32_t i = 0; i < tensor_allocation_count_; i++) {
+            if (allocations[i].contains(addr)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void *get_tensor_allocation_storage() const { return tensor_allocation_storage_; }
+
+    uint64_t get_tensor_allocation_storage_bytes() const { return tensor_allocation_storage_bytes_; }
 
     // =========================================================================
     // Device Orchestration (stub for API compatibility)

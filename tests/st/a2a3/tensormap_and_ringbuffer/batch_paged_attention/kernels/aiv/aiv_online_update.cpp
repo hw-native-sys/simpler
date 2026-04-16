@@ -208,8 +208,14 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     uint64_t batch_start = static_cast<uint64_t>(args[12]);
 
     uint64_t q_tile_size = static_cast<uint64_t>(mij_batch->shapes[0] / batch_count);
+    uint64_t head_dim = static_cast<uint64_t>(oi_new_batch->shapes[1]);
 
-    if (q_tile_size == 16) {
+    if (q_tile_size == 16 && head_dim <= 16) {
+        online_update_batch_impl<16, 16>(
+            mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count,
+            q_offset, num_heads, batch_start
+        );
+    } else if (q_tile_size == 16) {
         online_update_batch_impl<16, 128>(
             mij_batch, lij_batch, oi_new_batch, mi_batch, li_batch, oi_batch, out, is_first, is_last, batch_count,
             q_offset, num_heads, batch_start

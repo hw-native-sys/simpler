@@ -10,7 +10,7 @@
 """Public Python API for task_interface nanobind bindings.
 
 Re-exports the canonical C++ types (DataType, ContinuousTensor, ChipStorageTaskArgs,
-DynamicTaskArgs, TaggedTaskArgs, TensorArgType) and adds torch-aware convenience helpers.
+TaskArgs, TensorArgType) and adds torch-aware convenience helpers.
 
 Usage:
     from task_interface import DataType, ContinuousTensor, ChipStorageTaskArgs, make_tensor_arg
@@ -18,8 +18,7 @@ Usage:
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CONTINUOUS_TENSOR_MAX_DIMS,
-    DIST_CHIP_MAILBOX_SIZE,
-    DIST_SUB_MAILBOX_SIZE,
+    DIST_MAILBOX_SIZE,
     ArgDirection,
     ChipCallable,
     ChipCallConfig,
@@ -27,18 +26,12 @@ from _task_interface import (  # pyright: ignore[reportMissingImports]
     ContinuousTensor,
     CoreCallable,
     DataType,
-    DistChipProcess,
-    DistInputSpec,
-    DistOutputSpec,
-    DistSubmitOutput,
+    DistOrchestrator,
     DistSubmitResult,
-    DistSubWorker,
     DistWorker,
-    DynamicTaskArgs,
-    TaggedTaskArgs,
+    TaskArgs,
     TaskState,
     TensorArgType,
-    WorkerPayload,
     WorkerType,
     _ChipWorker,
     arg_direction_name,
@@ -54,8 +47,7 @@ __all__ = [
     "ContinuousTensor",
     "ChipStorageTaskArgs",
     "TensorArgType",
-    "DynamicTaskArgs",
-    "TaggedTaskArgs",
+    "TaskArgs",
     "ArgDirection",
     "CoreCallable",
     "ChipCallable",
@@ -77,16 +69,10 @@ __all__ = [
     # Distributed runtime
     "WorkerType",
     "TaskState",
-    "WorkerPayload",
-    "DistInputSpec",
-    "DistOutputSpec",
-    "DistSubmitOutput",
+    "DistOrchestrator",
     "DistSubmitResult",
-    "DistSubWorker",
-    "DistChipProcess",
     "DistWorker",
-    "DIST_SUB_MAILBOX_SIZE",
-    "DIST_CHIP_MAILBOX_SIZE",
+    "DIST_MAILBOX_SIZE",
 ]
 
 

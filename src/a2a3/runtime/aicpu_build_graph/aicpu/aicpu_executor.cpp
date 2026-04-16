@@ -36,6 +36,7 @@
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/perf_profiling.h"
 #include "common/unified_log.h"
@@ -405,6 +406,19 @@ struct AicpuExecutor {
                 );
                 cur_thread_completed++;
                 if (mixed_complete) {
+#if PTO2_PROFILING
+                    if (get_enable_dump_tensor()) {
+                        dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
+                            thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
+                            [](uint8_t active_mask, uint8_t raw_subtask_id) {
+                                return pto2_subtask_active(active_mask, static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                            },
+                            [this](int32_t func_id) {
+                                return get_function_bin_addr(func_id);
+                            }
+                        );
+                    }
+#endif
                     completed_this_turn++;
                 }
                 made_progress = true;
@@ -499,9 +513,16 @@ struct AicpuExecutor {
         PTO2SubtaskSlot subslot
 #if PTO2_PROFILING
         ,
-        bool profiling_enabled, int32_t thread_idx
+        bool profiling_enabled
+#endif
+#if PTO2_PROFILING
+        ,
+        int32_t thread_idx
 #endif
     ) {
+#if !PTO2_PROFILING
+        (void)runtime;  // NOLINT(readability/casting)
+#endif
         PTO2DispatchPayload &payload = s_pto2_payload_per_core[core_id];
         PTO2TaskDescriptor &task = *slot_state.task;
         int32_t slot_idx = static_cast<int32_t>(subslot);
@@ -518,6 +539,7 @@ struct AicpuExecutor {
             core_dispatch_counts_[core_id]++;
         }
 #endif
+
         // Per-core monotonic counter for register protocol uniqueness.
         // PTO2 task_id encodes (ring_id << 32 | local_id); truncation to uint32 loses ring_id,
         // so tasks from different rings with the same local_id would write identical DATA_MAIN_BASE
@@ -922,6 +944,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             perf_aicpu_set_orch_thread_idx(sched_thread_num_);
         }
 #endif
+#if PTO2_PROFILING
+        if (get_enable_dump_tensor()) {
+            dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
+        }
+#endif
 
         DEV_INFO("Thread %d: one-time init done", thread_idx);
         pto2_init_complete_.store(true, std::memory_order_release);
@@ -1136,13 +1163,29 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                     uint64_t t_setup_start = get_sys_cnt_aicpu();
 #endif
                     ResourceCount rc = shape_resource_count(shape);
-
+#if PTO2_PROFILING
+                    if (get_enable_dump_tensor()) {
+                        dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
+                            thread_idx, *slot_state, TensorDumpStage::BEFORE_DISPATCH,
+                            [](uint8_t active_mask, uint8_t raw_subtask_id) {
+                                return pto2_subtask_active(active_mask, static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                            },
+                            [this](int32_t func_id) {
+                                return get_function_bin_addr(func_id);
+                            }
+                        );
+                    }
+#endif
                     if (rc.aic) {
                         dispatch_subtask_to_core(
                             runtime, tracker, c.aic_core_id, CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
                             ,
-                            profiling_enabled, thread_idx
+                            profiling_enabled
+#endif
+#if PTO2_PROFILING
+                            ,
+                            thread_idx
 #endif
                         );
                     }
@@ -1152,7 +1195,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             runtime, tracker, aiv0, CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
                             ,
-                            profiling_enabled, thread_idx
+                            profiling_enabled
+#endif
+#if PTO2_PROFILING
+                            ,
+                            thread_idx
 #endif
                         );
                     }
@@ -1161,7 +1208,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             runtime, tracker, c.aiv_core_ids[1], CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
                             ,
-                            profiling_enabled, thread_idx
+                            profiling_enabled
+#endif
+#if PTO2_PROFILING
+                            ,
+                            thread_idx
 #endif
                         );
                     }
@@ -1221,13 +1272,29 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #endif
                 Cluster &c = tracker.clusters[ci];
                 ResourceCount rc = shape_resource_count(shape);
-
+#if PTO2_PROFILING
+                if (get_enable_dump_tensor()) {
+                    dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
+                        thread_idx, *slot_state, TensorDumpStage::BEFORE_DISPATCH,
+                        [](uint8_t active_mask, uint8_t raw_subtask_id) {
+                            return pto2_subtask_active(active_mask, static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                        },
+                        [this](int32_t func_id) {
+                            return get_function_bin_addr(func_id);
+                        }
+                    );
+                }
+#endif
                 if (rc.aic) {
                     dispatch_subtask_to_core(
                         runtime, tracker, c.aic_core_id, CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
                         ,
-                        profiling_enabled, thread_idx
+                        profiling_enabled
+#endif
+#if PTO2_PROFILING
+                        ,
+                        thread_idx
 #endif
                     );
                 }
@@ -1237,7 +1304,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                         runtime, tracker, aiv_id, CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
                         ,
-                        profiling_enabled, thread_idx
+                        profiling_enabled
+#endif
+#if PTO2_PROFILING
+                        ,
+                        thread_idx
 #endif
                     );
                 }
@@ -1246,7 +1317,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                         runtime, tracker, c.aiv_core_ids[1], CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
                         ,
-                        profiling_enabled, thread_idx
+                        profiling_enabled
+#endif
+#if PTO2_PROFILING
+                        ,
+                        thread_idx
 #endif
                     );
                 }
@@ -1573,6 +1648,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     if (profiling_enabled) {
         perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
         perf_aicpu_flush_phase_buffers(thread_idx);
+    }
+#endif
+#if PTO2_PROFILING
+    if (get_enable_dump_tensor()) {
+        dump_tensor_flush(thread_idx);
     }
 #endif
 

@@ -134,6 +134,8 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
 
     const uint8_t *orch_so_binary = static_cast<const uint8_t *>(callable->binary_data());
     size_t orch_so_size = callable->binary_size();
+    runtime->set_device_orch_func_name(callable->func_name());
+    runtime->set_device_orch_config_name(callable->config_name());
 
     if (orch_so_binary == nullptr || orch_so_size == 0) {
         LOG_ERROR("Orchestration SO binary is required for device orchestration");

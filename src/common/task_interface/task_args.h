@@ -9,9 +9,9 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * TaskArgs - Tensor + scalar argument storage
+ * TaskArgsTpl - Tensor + scalar argument storage (template)
  *
- * Template: TaskArgs<T, S, MaxT, MaxS, TensorTag=void>
+ * Template: TaskArgsTpl<T, S, MaxT, MaxS, TensorTag=void>
  *   - Static:  MaxT>0, MaxS>0 — fixed-size arrays
  *   - Dynamic: MaxT==0, MaxS==0 — std::vector backed
  *
@@ -22,14 +22,22 @@
  *   - void (default): no per-tensor tag — pure transport/storage
  *   - real type: adds tags_ storage + tag(i) accessor
  *
- * Type aliases:
- *   ChipStorageTaskArgs = TaskArgs<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 128>
+ * Concrete user-facing types (typedefs at the bottom):
+ *   - TaskArgs            — vector-backed + TensorArgType tags (the unified
+ *                           builder used by Orchestrator.submit_*)
+ *   - ChipStorageTaskArgs — fixed POD matching the runtime.so ABI byte-for-byte
+ *
+ * Wire / dispatch helpers:
+ *   - TaskArgsView        — zero-copy view into a {tensors, scalars} pair (no tags)
+ *   - write_blob/read_blob — length-prefixed serialization for PROCESS-mode
+ *                            mailbox transport (tags stripped on the wire)
  */
 
 #pragma once
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -68,11 +76,11 @@ template <>
 struct TensorTagMixin<void, 0> {};
 
 // ============================================================================
-// TaskArgs — primary template (static / fixed-size)
+// TaskArgsTpl — primary template (static / fixed-size)
 // ============================================================================
 
 template <typename T, typename S, size_t MaxT, size_t MaxS, typename TensorTag = void>
-struct TaskArgs : TensorTagMixin<TensorTag, MaxT> {
+struct TaskArgsTpl : TensorTagMixin<TensorTag, MaxT> {
     T tensors_[MaxT];
     S scalars_[MaxS];
     int32_t tensor_count_{0};
@@ -110,11 +118,11 @@ struct TaskArgs : TensorTagMixin<TensorTag, MaxT> {
 };
 
 // ============================================================================
-// TaskArgs — partial specialization (dynamic / vector-backed, MaxT==0, MaxS==0)
+// TaskArgsTpl — partial specialization (dynamic / vector-backed, MaxT==0, MaxS==0)
 // ============================================================================
 
 template <typename T, typename S, typename TensorTag>
-struct TaskArgs<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
+struct TaskArgsTpl<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
     std::vector<T> tensors_;
     std::vector<S> scalars_;
 
@@ -124,6 +132,14 @@ struct TaskArgs<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
         if constexpr (!std::is_void_v<TensorTag>) {
             this->tags_.push_back(TensorTag{});
         }
+    }
+
+    // Tagged overload: only enabled when TensorTag != void.
+    template <typename Tag = TensorTag, typename = std::enable_if_t<!std::is_void_v<Tag>>>
+    void add_tensor(const T &t, Tag tag) {
+        if (!scalars_.empty()) throw std::logic_error("TaskArgs: cannot add tensor after scalar");
+        tensors_.push_back(t);
+        this->tags_.push_back(tag);
     }
 
     void add_scalar(S s) { scalars_.push_back(s); }
@@ -153,11 +169,109 @@ struct TaskArgs<T, S, 0, 0, TensorTag> : TensorTagMixin<TensorTag, 0> {
 // Type aliases
 // ============================================================================
 
-// Transport/storage: host → device, no per-tensor tags
-using ChipStorageTaskArgs = TaskArgs<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 128>;
+// Unified user-facing builder: vector-backed with TensorArgType tags.
+// Used by Orchestrator.submit_*; tags drive dependency inference at submit
+// time and are stripped before the args cross the dispatch boundary.
+using TaskArgs = TaskArgsTpl<ContinuousTensor, uint64_t, 0, 0, TensorArgType>;
 
-// Dynamic variant (no capacity limit)
-using DynamicTaskArgs = TaskArgs<ContinuousTensor, uint64_t, 0, 0>;
+// L2 runtime ABI: fixed POD matching runtime.so byte-for-byte.
+// Assembled from a TaskArgsView on the child side just before pto2_run_runtime.
+using ChipStorageTaskArgs = TaskArgsTpl<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 128>;
 
-// Tagged variant with TensorArgType (for submit-time INPUT/OUTPUT/INOUT)
-using TaggedTaskArgs = TaskArgs<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 128, TensorArgType>;
+// ============================================================================
+// TaskArgsView — zero-copy view used by IWorker::run and the wire format
+// ============================================================================
+//
+// View-only: refers to externally owned tensor + scalar arrays. No tags
+// (tags are consumed by Orchestrator at submit time and never travel further).
+
+struct TaskArgsView {
+    int32_t tensor_count;
+    int32_t scalar_count;
+    const ContinuousTensor *tensors;
+    const uint64_t *scalars;
+};
+
+// Build a view directly over a TaskArgs's vectors (THREAD-mode dispatch).
+inline TaskArgsView make_view(const TaskArgs &a) {
+    return TaskArgsView{a.tensor_count(), a.scalar_count(), a.tensor_data(), a.scalar_data()};
+}
+
+// ============================================================================
+// Wire format — length-prefixed blob for PROCESS-mode mailbox transport
+// ============================================================================
+//
+// Byte layout (tags stripped):
+//   offset 0:                 int32 tensor_count = T
+//   offset 4:                 int32 scalar_count = S
+//   offset 8:                 ContinuousTensor tensors[T]   (40 B each)
+//   offset 8 + 40T:           uint64_t scalars[S]           (8 B each)
+// total bytes used:           8 + 40T + 8S
+
+inline constexpr size_t TASK_ARGS_BLOB_HEADER_SIZE = 8;
+
+inline size_t task_args_blob_size(const TaskArgs &a) {
+    return TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(a.tensor_count()) * sizeof(ContinuousTensor) +
+           static_cast<size_t>(a.scalar_count()) * sizeof(uint64_t);
+}
+
+// Serialize a TaskArgs into `dst`. Caller must ensure `dst` has room for
+// task_args_blob_size(a) bytes. Tags are not written.
+inline void write_blob(uint8_t *dst, const TaskArgs &a) {
+    int32_t T = a.tensor_count();
+    int32_t S = a.scalar_count();
+    std::memcpy(dst + 0, &T, sizeof(T));
+    std::memcpy(dst + 4, &S, sizeof(S));
+    if (T > 0) {
+        std::memcpy(
+            dst + TASK_ARGS_BLOB_HEADER_SIZE, a.tensor_data(), static_cast<size_t>(T) * sizeof(ContinuousTensor)
+        );
+    }
+    if (S > 0) {
+        std::memcpy(
+            dst + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(ContinuousTensor), a.scalar_data(),
+            static_cast<size_t>(S) * sizeof(uint64_t)
+        );
+    }
+}
+
+// Zero-copy view into a blob written by write_blob. The returned view is only
+// valid as long as `src` stays alive in mapped/shm memory.
+inline TaskArgsView read_blob(const uint8_t *src) {
+    int32_t T;
+    int32_t S;
+    std::memcpy(&T, src + 0, sizeof(T));
+    std::memcpy(&S, src + 4, sizeof(S));
+    return TaskArgsView{
+        T,
+        S,
+        reinterpret_cast<const ContinuousTensor *>(src + TASK_ARGS_BLOB_HEADER_SIZE),
+        reinterpret_cast<const uint64_t *>(
+            src + TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(T) * sizeof(ContinuousTensor)
+        ),
+    };
+}
+
+// ============================================================================
+// L2 ABI helper: build ChipStorageTaskArgs POD from a view (memcpy'd).
+// Runs on the child side immediately before crossing into runtime.so.
+// ============================================================================
+
+inline ChipStorageTaskArgs view_to_chip_storage(TaskArgsView view) {
+    ChipStorageTaskArgs out;
+    if (static_cast<size_t>(view.tensor_count) > CHIP_MAX_TENSOR_ARGS) {
+        throw std::out_of_range("view_to_chip_storage: tensor_count exceeds CHIP_MAX_TENSOR_ARGS");
+    }
+    if (view.scalar_count > 128) {
+        throw std::out_of_range("view_to_chip_storage: scalar_count exceeds 128");
+    }
+    out.tensor_count_ = view.tensor_count;
+    out.scalar_count_ = view.scalar_count;
+    if (view.tensor_count > 0) {
+        std::memcpy(out.tensors_, view.tensors, static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor));
+    }
+    if (view.scalar_count > 0) {
+        std::memcpy(out.scalars_, view.scalars, static_cast<size_t>(view.scalar_count) * sizeof(uint64_t));
+    }
+    return out;
+}

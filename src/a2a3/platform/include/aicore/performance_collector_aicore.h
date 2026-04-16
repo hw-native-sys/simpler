@@ -34,8 +34,8 @@
 /**
  * Record task execution performance data
  *
- * Writes performance metrics to the provided buffer. Buffer management
- * and status tracking are handled by AICPU.
+ * Writes timing metrics to the WIP staging slot (wip[task_id & 1]).
+ * Buffer management and final commit are handled by AICPU.
  *
  * AICore writes PerfRecord.task_id as the register dispatch token (low 32 bits, zero-extended).
  * For multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph), AICPU overwrites
@@ -48,18 +48,14 @@
  */
 __aicore__ __attribute__((always_inline)) static inline void
 perf_aicore_record_task(__gm__ PerfBuffer *perf_buf, uint32_t task_id, uint64_t start_time, uint64_t end_time) {
-    // Read current buffer count (AICPU owns the count, AICore reads only)
-    dcci(&perf_buf->count, SINGLE_CACHE_LINE);
-    uint32_t idx = perf_buf->count;
+    // Write to WIP staging slot — parity alternates with dual-slot dispatch
+    __gm__ PerfRecord *record = &perf_buf->wip[task_id & 1u];
 
-    __gm__ PerfRecord *record = &perf_buf->records[idx];
-
-    // Write record data (func_id, core_type, and count filled by AICPU at completion)
     record->start_time = start_time;
     record->end_time = end_time;
     record->task_id = static_cast<uint64_t>(task_id);
 
-    // Flush cache to make data visible
+    // Flush cache to make data visible to AICPU
     dcci(record, SINGLE_CACHE_LINE, CACHELINE_OUT);
     dsb((mem_dsb_t)0);
 }

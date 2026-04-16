@@ -1,5 +1,12 @@
 # Worker Manager — Pool, Threading, and Dispatch Modes
 
+> **Status**: describes the **target** design. Current code still has
+> separate `DistChipProcess` / `DistSubWorker` classes (target: merged
+> into `WorkerThread` in PR-D). `IWorker::run(uint64_t callable,
+> TaskArgsView args, const ChipCallConfig &config)` is the live
+> signature; no `WorkerPayload` dispatch carrier exists. See
+> [roadmap.md](roadmap.md) for the full landed-vs-planned breakdown.
+
 `WorkerManager` and `WorkerThread` together implement the **execution layer**
 of a `Worker` engine. `WorkerManager` owns two pools of `WorkerThread`s (one
 for next-level workers, one for sub workers); each `WorkerThread` owns an
@@ -71,26 +78,31 @@ use different modes independently (e.g., L4 THREAD containing L3 PROCESS).
 One WorkerThread per IWorker instance.
 
 ```cpp
+struct WorkerDispatch {
+    TaskSlot task_slot;
+    int32_t  group_index = 0;    // 0 for non-group; 0..N-1 for group members
+};
+
 class WorkerThread {
 public:
     enum class Mode { THREAD, PROCESS };
 
     WorkerThread(Mode mode,
                  IWorker *worker,
-                 TaskSlotState *parent_slots,
+                 DistRing *ring,
                  size_t mailbox_size = 0);
 
     void start(OnCompleteFn on_done);
     void stop();
-    void dispatch(TaskSlot slot_id);
+    void dispatch(WorkerDispatch d);       // slot id + group sub-index
     bool is_idle() const;
 
 private:
     Mode mode_;
     IWorker *worker_;
-    TaskSlotState *parent_slots_;          // reference to parent's slot pool
+    DistRing *ring_;                       // reads slot state via ring->slot_state(id)
     std::thread parent_thread_;
-    LockFreeQueue<TaskSlot> queue_;
+    LockFreeQueue<WorkerDispatch> queue_;
 
     // PROCESS mode only
     void *mailbox_ = nullptr;              // shm
@@ -98,8 +110,8 @@ private:
     size_t mailbox_size_ = 0;
 
     void loop();
-    void dispatch_thread(TaskSlot slot_id);
-    void dispatch_process(TaskSlot slot_id);
+    void dispatch_thread(WorkerDispatch d);
+    void dispatch_process(WorkerDispatch d);
     [[noreturn]] void child_loop();
     void fork_child();
 };
@@ -109,6 +121,15 @@ The WorkerThread's `std::thread` always exists regardless of mode — it pumps
 the internal queue and either runs the worker in-process or drives the shm
 handshake to a forked child.
 
+`WorkerDispatch` carries only `{slot_id, group_index}`; the thread reads
+`slot.callable` / `slot.task_args` / `slot.config` on each dispatch via
+`ring->slot_state(slot_id)`. For a group slot with `group_size() == N`,
+the Scheduler pushes N `WorkerDispatch` entries (one per member) onto N
+idle threads; each thread's `group_index` selects which
+`task_args_list[i]` view to hand to the worker. There is no
+`WorkerPayload` — the per-dispatch carrier is just the slot id plus the
+group sub-index.
+
 ---
 
 ## 3. THREAD mode
@@ -116,16 +137,30 @@ handshake to a forked child.
 The simple case: same process, no shm, no serialization.
 
 ```cpp
-void WorkerThread::dispatch_thread(TaskSlot slot_id) {
-    TaskSlotState &s = parent_slots_[slot_id];
-    worker_->run(s.callable, s.task_args.view(), s.config);
-    on_complete_(slot_id);
+void WorkerThread::dispatch_thread(WorkerDispatch d) {
+    TaskSlotState &s = *ring_->slot_state(d.task_slot);
+    uint64_t callable = (s.worker_type == WorkerType::SUB)
+        ? static_cast<uint64_t>(s.callable_id)      // registry id for sub path
+        : s.callable;                                // ChipCallable buffer ptr
+    TaskArgsView view = s.args_view(d.group_index); // 0 for single tasks
+    worker_->run(callable, view, s.config);
+    on_complete_(d.task_slot);
 }
 ```
 
-- `TaskArgs::view()` returns a zero-copy `TaskArgsView` pointing into the
-  slot's `std::vector` backing (parent heap)
-- `IWorker::run` dispatches polymorphically based on the actual worker type
+- `slot.args_view(i)` returns a zero-copy `TaskArgsView` over
+  `task_args` (single) or `task_args_list[i]` (group member). The backing
+  `std::vector` lives on the parent heap until the slot reaches CONSUMED.
+- `callable` unifies the two registry shapes: `uint64 = ChipCallable*`
+  for next-level, `uint64 = callable_id` for sub. The receiving
+  `IWorker` casts back appropriately.
+- `IWorker::run` dispatches polymorphically based on the actual worker type.
+
+Note: SUB workers in PROCESS mode bypass `IWorker` entirely — the Python
+child loop (``_sub_worker_loop``) reads the args blob from the mailbox,
+decodes it into a ``TaskArgs``, and calls the registered callable as
+``fn(args)``. The C++ dispatch path writes the same mailbox format for
+both worker types.
 
 **When is THREAD mode safe?**
 
@@ -133,9 +168,8 @@ void WorkerThread::dispatch_thread(TaskSlot slot_id) {
   calls and other system state
 - `ChipWorker` (dlsym'd runtime.so) is safe when the runtime `.so` and its
   device driver support concurrent use
-- `SubWorker` in THREAD mode is constrained by Python's GIL (all SubWorkers
-  in the pool effectively serialize), but this is often fine for light
-  Python callables
+- SUB workers run in Python child processes (PROCESS mode) where the
+  callable receives ``TaskArgs`` as its sole argument
 
 ---
 
@@ -189,14 +223,21 @@ child inherits locks held by threads that don't exist post-fork.
 ### 4.3 Parent-side dispatch
 
 ```cpp
-void WorkerThread::dispatch_process(TaskSlot slot_id) {
-    TaskSlotState &s = parent_slots_[slot_id];
-    uint8_t *d = (uint8_t*)mailbox_ + HEADER_SIZE;
+void WorkerThread::dispatch_process(WorkerDispatch d) {
+    TaskSlotState &s = *ring_->slot_state(d.task_slot);
+    uint8_t *m = (uint8_t*)mailbox_ + HEADER_SIZE;
 
-    // Write task data
-    *reinterpret_cast<Callable*>(d)               = s.callable;
-    *reinterpret_cast<CallConfig*>(d + 8)         = s.config;
-    write_blob(d + 8 + sizeof(CallConfig), s.task_args);
+    // Write task data: callable (8 B) + config (~16 B) + length-prefixed
+    // TaskArgs blob. The blob is derived from the slot's stored TaskArgs
+    // via write_blob() — tags are stripped, only [T][S][tensors][scalars]
+    // crosses the fork boundary.
+    uint64_t callable = (s.worker_type == WorkerType::SUB)
+        ? static_cast<uint64_t>(s.callable_id)
+        : s.callable;
+    *reinterpret_cast<uint64_t*>(m)            = callable;
+    *reinterpret_cast<CallConfig*>(m + 8)      = s.config;
+    const TaskArgs &args = s.is_group() ? s.task_args_list[d.group_index] : s.task_args;
+    write_blob(m + 8 + sizeof(CallConfig), args);
 
     // Signal child
     write_state(mailbox_, MailboxState::TASK_READY);
@@ -207,7 +248,7 @@ void WorkerThread::dispatch_process(TaskSlot slot_id) {
 
     int err = read_error(mailbox_);
     write_state(mailbox_, MailboxState::IDLE);
-    on_complete_(slot_id, err);
+    on_complete_(d.task_slot, err);
 }
 ```
 

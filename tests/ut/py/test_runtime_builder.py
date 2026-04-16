@@ -8,18 +8,11 @@
 # -----------------------------------------------------------------------------------------------------------
 """Tests for RuntimeBuilder class."""
 
-import sys
 import textwrap
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-
-# Add python/ and examples/scripts/ to path so we can import runtime_builder
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-sys.path.insert(0, str(PROJECT_ROOT / "python"))
-sys.path.insert(0, str(PROJECT_ROOT / "examples" / "scripts"))
-
 
 # --- Discovery tests (no compilation needed) ---
 
@@ -29,7 +22,7 @@ class TestRuntimeBuilderDiscovery:
 
     def test_discovers_real_runtimes(self, default_test_platform):
         """RuntimeBuilder discovers host_build_graph from the real project tree."""
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         builder = RuntimeBuilder(platform=default_test_platform)
         runtimes = builder.list_runtimes()
@@ -37,7 +30,7 @@ class TestRuntimeBuilderDiscovery:
 
     def test_discovers_aicpu_build_graph(self, default_test_platform):
         """RuntimeBuilder discovers aicpu_build_graph from the real project tree."""
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         builder = RuntimeBuilder(platform=default_test_platform)
         runtimes = builder.list_runtimes()
@@ -45,21 +38,21 @@ class TestRuntimeBuilderDiscovery:
 
     def test_runtime_dir_resolves_to_project_root(self, default_test_platform, test_arch):
         """runtime_dir resolves to src/{arch}/runtime/ under the project root."""
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         builder = RuntimeBuilder(platform=default_test_platform)
         assert builder.runtime_dir == builder.runtime_root / "src" / test_arch / "runtime"
         assert builder.runtime_dir.is_dir()
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_discovers_configs_in_runtime_dir(
         self, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch
     ):
         """RuntimeBuilder discovers implementations in the runtime directory."""
-        import runtime_builder as rb_module  # noqa: PLC0415
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "examples" / "scripts" / "rb.py"))
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
 
         # Set up fake runtime tree with architecture-specific structure
         rt_dir = tmp_path / "src" / test_arch / "runtime" / "my_runtime"
@@ -69,15 +62,15 @@ class TestRuntimeBuilderDiscovery:
         builder = RuntimeBuilder(platform=default_test_platform)
         assert builder.list_runtimes() == ["my_runtime"]
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_ignores_dirs_without_build_config(
         self, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch
     ):
         """Directories without build_config.py are not listed."""
-        import runtime_builder as rb_module  # noqa: PLC0415
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "examples" / "scripts" / "rb.py"))
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
 
         rt_dir = tmp_path / "src" / test_arch / "runtime"
         (rt_dir / "has_config").mkdir(parents=True)
@@ -89,37 +82,37 @@ class TestRuntimeBuilderDiscovery:
         builder = RuntimeBuilder(platform=default_test_platform)
         assert builder.list_runtimes() == ["has_config"]
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_empty_runtime_dir(self, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch):
         """Empty src/{arch}/runtime/ directory yields no runtimes."""
-        import runtime_builder as rb_module  # noqa: PLC0415
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "examples" / "scripts" / "rb.py"))
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
 
         (tmp_path / "src" / test_arch / "runtime").mkdir(parents=True)
 
         builder = RuntimeBuilder(platform=default_test_platform)
         assert builder.list_runtimes() == []
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_missing_runtime_dir(self, MockCompiler, tmp_path, monkeypatch, default_test_platform):
         """Non-existent src/{arch}/runtime/ directory yields no runtimes."""
-        import runtime_builder as rb_module  # noqa: PLC0415
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "examples" / "scripts" / "rb.py"))
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
 
         builder = RuntimeBuilder(platform=default_test_platform)
         assert builder.list_runtimes() == []
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_multiple_runtimes_sorted(self, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch):
         """Multiple implementations are returned in sorted order."""
-        import runtime_builder as rb_module  # noqa: PLC0415
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "examples" / "scripts" / "rb.py"))
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
 
         rt_dir = tmp_path / "src" / test_arch / "runtime"
         for name in ["zeta", "alpha", "beta"]:
@@ -139,7 +132,7 @@ class TestRuntimeBuilderErrors:
 
     def test_unknown_runtime_raises(self, default_test_platform):
         """get_binaries() raises ValueError for a non-existent runtime name."""
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         builder = RuntimeBuilder(platform=default_test_platform)
         with pytest.raises(ValueError, match="is not available for platform"):
@@ -147,19 +140,19 @@ class TestRuntimeBuilderErrors:
 
     def test_unknown_runtime_lists_available(self, default_test_platform):
         """ValueError message includes available runtime names."""
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         builder = RuntimeBuilder(platform=default_test_platform)
         with pytest.raises(ValueError, match="host_build_graph"):
             builder.get_binaries("nonexistent_runtime", build=True)
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_empty_registry_shows_none(self, MockCompiler, tmp_path, monkeypatch, default_test_platform, test_arch):
         """ValueError message shows '(none)' when no runtimes exist."""
-        import runtime_builder as rb_module  # noqa: PLC0415
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "examples" / "scripts" / "rb.py"))
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
 
         (tmp_path / "src" / test_arch / "runtime").mkdir(parents=True)
         builder = RuntimeBuilder(platform=default_test_platform)
@@ -175,9 +168,9 @@ class TestRuntimeBuilderGetBinaries:
 
     @pytest.fixture(autouse=True)
     def _patch_runtime_root(self, monkeypatch, tmp_path):
-        import runtime_builder as rb_module  # noqa: PLC0415
+        import simpler_setup.runtime_builder as rb_module  # noqa: PLC0415
 
-        monkeypatch.setattr(rb_module, "__file__", str(tmp_path / "examples" / "scripts" / "rb.py"))
+        monkeypatch.setattr(rb_module, "PROJECT_ROOT", tmp_path)
 
     def _make_runtime(self, tmp_path, test_arch):
         """Create a fake runtime with a valid build_config.py."""
@@ -204,10 +197,10 @@ class TestRuntimeBuilderGetBinaries:
         (rt_dir / "build_config.py").write_text(config_content)
         return rt_dir
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_returns_runtime_binaries(self, MockCompiler, tmp_path, default_test_platform, test_arch):
         """get_binaries(build=True) returns RuntimeBinaries with three paths."""
-        from runtime_builder import RuntimeBinaries, RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBinaries, RuntimeBuilder  # noqa: PLC0415
 
         self._make_runtime(tmp_path, test_arch)
 
@@ -223,10 +216,10 @@ class TestRuntimeBuilderGetBinaries:
         assert result.aicpu_path.name == "libaicpu.so"
         assert result.aicore_path.name == "libaicore.so"
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_calls_compiler_three_times(self, MockCompiler, tmp_path, default_test_platform, test_arch):
         """get_binaries(build=True) invokes compiler.compile() exactly 3 times."""
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         self._make_runtime(tmp_path, test_arch)
 
@@ -240,10 +233,10 @@ class TestRuntimeBuilderGetBinaries:
         targets = sorted(call.args[0] for call in mock_instance.compile.call_args_list)
         assert targets == ["aicore", "aicpu", "host"]
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_resolves_paths_relative_to_config(self, MockCompiler, tmp_path, default_test_platform, test_arch):
         """Include/source dirs are resolved relative to the build_config.py directory."""
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         rt_dir = self._make_runtime(tmp_path, test_arch)
 
@@ -260,10 +253,10 @@ class TestRuntimeBuilderGetBinaries:
                 assert Path(d).is_absolute()
                 assert str(rt_dir.resolve()) in d
 
-    @patch("runtime_builder.RuntimeCompiler")
+    @patch("simpler_setup.runtime_builder.RuntimeCompiler")
     def test_propagates_compiler_error(self, MockCompiler, tmp_path, default_test_platform, test_arch):
         """If RuntimeCompiler.compile() raises, get_binaries() propagates the exception."""
-        from runtime_builder import RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: PLC0415
 
         self._make_runtime(tmp_path, test_arch)
 
@@ -291,14 +284,14 @@ class TestRuntimeBuilderIntegration:
     @pytest.fixture(autouse=True)
     def _reset_compiler_singleton(self):
         """Reset RuntimeCompiler singleton-per-platform cache so each test gets fresh instances."""
-        from simpler.runtime_compiler import RuntimeCompiler  # noqa: PLC0415
+        from simpler_setup.runtime_compiler import RuntimeCompiler  # noqa: PLC0415
 
         yield
         RuntimeCompiler._instances.clear()
 
     def test_get_binaries_returns_valid_paths(self, platform, runtime_name):
         """get_binaries(build=True) produces RuntimeBinaries with existing files."""
-        from runtime_builder import RuntimeBinaries, RuntimeBuilder  # noqa: PLC0415
+        from simpler_setup.runtime_builder import RuntimeBinaries, RuntimeBuilder  # noqa: PLC0415
 
         builder = RuntimeBuilder(platform=platform)
         result = builder.get_binaries(runtime_name, build=True)

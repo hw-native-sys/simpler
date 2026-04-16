@@ -11,9 +11,9 @@
 /**
  * Nanobind Python extension for task_interface headers.
  *
- * Wraps DataType, ContinuousTensor, ChipStorageTaskArgs, DynamicTaskArgs,
- * TaggedTaskArgs, TensorArgType, ArgDirection, CoreCallable, ChipCallable,
- * and helper functions from
+ * Wraps DataType, ContinuousTensor, ChipStorageTaskArgs, TaskArgs (unified
+ * vector-backed builder with per-tensor TensorArgType tags), TensorArgType,
+ * ArgDirection, CoreCallable, ChipCallable, and helper functions from
  * data_type.h / tensor_arg.h / task_args.h / arg_direction.h / callable.h.
  */
 
@@ -236,79 +236,32 @@ NB_MODULE(_task_interface, m) {
     nb::enum_<TensorArgType>(m, "TensorArgType")
         .value("INPUT", TensorArgType::INPUT)
         .value("OUTPUT", TensorArgType::OUTPUT)
-        .value("INOUT", TensorArgType::INOUT);
+        .value("INOUT", TensorArgType::INOUT)
+        .value("OUTPUT_EXISTING", TensorArgType::OUTPUT_EXISTING)
+        .value("NO_DEP", TensorArgType::NO_DEP);
 
-    // --- DynamicTaskArgs (vector-backed, no capacity limit) ---
-    nb::class_<DynamicTaskArgs>(m, "DynamicTaskArgs")
-        .def(nb::init<>())
-
-        .def(
-            "add_tensor", &DynamicTaskArgs::add_tensor, nb::arg("t"),
-            "Add a ContinuousTensor. Must be called before any add_scalar()."
-        )
-
-        .def(
-            "add_scalar", &DynamicTaskArgs::add_scalar, nb::arg("s"),
-            "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
-        )
-
-        .def(
-            "tensor",
-            [](const DynamicTaskArgs &self, int32_t i) -> const ContinuousTensor & {
-                if (i < 0 || i >= self.tensor_count())
-                    throw std::out_of_range("DynamicTaskArgs tensor index out of range");
-                return self.tensor(i);
-            },
-            nb::arg("i"), nb::rv_policy::reference_internal, "Return the ContinuousTensor at index i."
-        )
-
-        .def(
-            "scalar",
-            [](const DynamicTaskArgs &self, int32_t i) -> uint64_t {
-                if (i < 0 || i >= self.scalar_count())
-                    throw std::out_of_range("DynamicTaskArgs scalar index out of range");
-                return self.scalar(i);
-            },
-            nb::arg("i"), "Return the scalar at index i."
-        )
-
-        .def("tensor_count", &DynamicTaskArgs::tensor_count)
-        .def("scalar_count", &DynamicTaskArgs::scalar_count)
-
-        .def("clear", &DynamicTaskArgs::clear)
-
-        .def(
-            "__len__",
-            [](const DynamicTaskArgs &self) {
-                return self.tensor_count() + self.scalar_count();
-            },
-            "Return total number of arguments (tensors + scalars)."
-        );
-
-    // --- TaggedTaskArgs (fixed-size with per-tensor TensorArgType tags) ---
-    nb::class_<TaggedTaskArgs>(m, "TaggedTaskArgs")
+    // --- TaskArgs (unified vector-backed builder with per-tensor TensorArgType tags) ---
+    nb::class_<TaskArgs>(m, "TaskArgs")
         .def(nb::init<>())
 
         .def(
             "add_tensor",
-            [](TaggedTaskArgs &self, const ContinuousTensor &t, TensorArgType tag) {
-                self.add_tensor(t);
-                self.tag(self.tensor_count() - 1) = tag;
+            [](TaskArgs &self, const ContinuousTensor &t, TensorArgType tag) {
+                self.add_tensor(t, tag);
             },
             nb::arg("t"), nb::arg("tag") = TensorArgType::INPUT,
             "Add a ContinuousTensor with an optional TensorArgType tag (default INPUT)."
         )
 
         .def(
-            "add_scalar", &TaggedTaskArgs::add_scalar, nb::arg("s"),
+            "add_scalar", &TaskArgs::add_scalar, nb::arg("s"),
             "Add a uint64_t scalar. After this, add_tensor() is no longer allowed."
         )
 
         .def(
             "tensor",
-            [](const TaggedTaskArgs &self, int32_t i) -> const ContinuousTensor & {
-                if (i < 0 || i >= self.tensor_count())
-                    throw std::out_of_range("TaggedTaskArgs tensor index out of range");
+            [](const TaskArgs &self, int32_t i) -> const ContinuousTensor & {
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs tensor index out of range");
                 return self.tensor(i);
             },
             nb::arg("i"), nb::rv_policy::reference_internal, "Return the ContinuousTensor at index i."
@@ -316,9 +269,8 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "scalar",
-            [](const TaggedTaskArgs &self, int32_t i) -> uint64_t {
-                if (i < 0 || i >= self.scalar_count())
-                    throw std::out_of_range("TaggedTaskArgs scalar index out of range");
+            [](const TaskArgs &self, int32_t i) -> uint64_t {
+                if (i < 0 || i >= self.scalar_count()) throw std::out_of_range("TaskArgs scalar index out of range");
                 return self.scalar(i);
             },
             nb::arg("i"), "Return the scalar at index i."
@@ -326,8 +278,8 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "tag",
-            [](const TaggedTaskArgs &self, int32_t i) -> TensorArgType {
-                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaggedTaskArgs tag index out of range");
+            [](const TaskArgs &self, int32_t i) -> TensorArgType {
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs tag index out of range");
                 return self.tag(i);
             },
             nb::arg("i"), "Return the TensorArgType tag for the tensor at index i."
@@ -335,22 +287,21 @@ NB_MODULE(_task_interface, m) {
 
         .def(
             "set_tag",
-            [](TaggedTaskArgs &self, int32_t i, TensorArgType tag) {
-                if (i < 0 || i >= self.tensor_count())
-                    throw std::out_of_range("TaggedTaskArgs set_tag index out of range");
+            [](TaskArgs &self, int32_t i, TensorArgType tag) {
+                if (i < 0 || i >= self.tensor_count()) throw std::out_of_range("TaskArgs set_tag index out of range");
                 self.tag(i) = tag;
             },
             nb::arg("i"), nb::arg("tag"), "Set the TensorArgType tag for the tensor at index i."
         )
 
-        .def("tensor_count", &TaggedTaskArgs::tensor_count)
-        .def("scalar_count", &TaggedTaskArgs::scalar_count)
+        .def("tensor_count", &TaskArgs::tensor_count)
+        .def("scalar_count", &TaskArgs::scalar_count)
 
-        .def("clear", &TaggedTaskArgs::clear)
+        .def("clear", &TaskArgs::clear)
 
         .def(
             "__len__",
-            [](const TaggedTaskArgs &self) {
+            [](const TaskArgs &self) {
                 return self.tensor_count() + self.scalar_count();
             },
             "Return total number of arguments (tensors + scalars)."
@@ -448,7 +399,7 @@ NB_MODULE(_task_interface, m) {
         .def_static(
             "build",
             [](std::vector<ArgDirection> signature, std::string func_name, nb::bytes binary,
-               std::vector<std::tuple<int32_t, PyCoreCallable>> children) -> PyChipCallable {
+               std::vector<std::tuple<int32_t, PyCoreCallable>> children, std::string config_name) -> PyChipCallable {
                 auto bin_ptr = reinterpret_cast<const void *>(binary.c_str());
                 auto bin_size = static_cast<uint32_t>(binary.size());
                 auto child_count = static_cast<int32_t>(children.size());
@@ -462,11 +413,12 @@ NB_MODULE(_task_interface, m) {
 
                 auto buf = make_callable<CoreCallable, CHIP_MAX_TENSOR_ARGS, 32>(
                     signature.data(), static_cast<int32_t>(signature.size()), func_name.c_str(), bin_ptr, bin_size,
-                    func_ids.data(), child_bufs.data(), child_count
+                    func_ids.data(), child_bufs.data(), child_count, config_name.c_str()
                 );
                 return PyChipCallable{std::move(buf)};
             },
             nb::arg("signature"), nb::arg("func_name"), nb::arg("binary"), nb::arg("children"),
+            nb::arg("config_name") = "",
             "Build a ChipCallable from signature, func_name, binary, and list of (func_id, CoreCallable) children."
         )
 
@@ -501,6 +453,15 @@ NB_MODULE(_task_interface, m) {
                 return std::string(c.func_name(), c.func_name_len());
             },
             "The orchestration function name."
+        )
+
+        .def_prop_ro(
+            "config_name",
+            [](const PyChipCallable &self) -> std::string {
+                const auto &c = self.get();
+                return std::string(c.config_name(), c.config_name_len());
+            },
+            "The optional orchestration config function name."
         )
 
         .def_prop_ro(
@@ -568,9 +529,9 @@ NB_MODULE(_task_interface, m) {
         .def("__repr__", [](const PyChipCallable &self) -> std::string {
             const auto &c = self.get();
             std::ostringstream os;
-            os << "ChipCallable(func_name=\"" << std::string(c.func_name(), c.func_name_len())
-               << "\", sig_count=" << c.sig_count() << ", binary_size=" << c.binary_size()
-               << ", child_count=" << c.child_count() << ")";
+            os << "ChipCallable(func_name=\"" << std::string(c.func_name(), c.func_name_len()) << "\", config_name=\""
+               << std::string(c.config_name(), c.config_name_len()) << "\", sig_count=" << c.sig_count()
+               << ", binary_size=" << c.binary_size() << ", child_count=" << c.child_count() << ")";
             return os.str();
         });
 
@@ -580,10 +541,12 @@ NB_MODULE(_task_interface, m) {
         .def_rw("block_dim", &ChipCallConfig::block_dim)
         .def_rw("aicpu_thread_num", &ChipCallConfig::aicpu_thread_num)
         .def_rw("enable_profiling", &ChipCallConfig::enable_profiling)
+        .def_rw("enable_dump_tensor", &ChipCallConfig::enable_dump_tensor)
         .def("__repr__", [](const ChipCallConfig &self) -> std::string {
             std::ostringstream os;
             os << "ChipCallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
-               << ", enable_profiling=" << (self.enable_profiling ? "True" : "False") << ")";
+               << ", enable_profiling=" << (self.enable_profiling ? "True" : "False")
+               << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False") << ")";
             return os.str();
         });
 
@@ -640,7 +603,24 @@ NB_MODULE(_task_interface, m) {
                 self.run(reinterpret_cast<const void *>(callable), reinterpret_cast<const void *>(args), config);
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
-            nb::arg("enable_profiling") = false, "Run with raw pointer arguments (used from forked chip process)."
+            nb::arg("enable_profiling") = false, "Run with a raw ChipStorageTaskArgs POD pointer."
+        )
+        .def(
+            "run_from_blob",
+            [](ChipWorker &self, uint64_t callable, uint64_t blob_ptr, int block_dim, int aicpu_thread_num,
+               bool enable_profiling) {
+                ChipCallConfig config;
+                config.block_dim = block_dim;
+                config.aicpu_thread_num = aicpu_thread_num;
+                config.enable_profiling = enable_profiling;
+                TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr));
+                self.run(callable, view, config);
+            },
+            nb::arg("callable"), nb::arg("blob_ptr"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
+            nb::arg("enable_profiling") = false,
+            "Decode a length-prefixed TaskArgs blob ([T][S][tensors][scalars]) at "
+            "blob_ptr and dispatch to the runtime. Used from forked chip processes "
+            "reading the WorkerThread mailbox."
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)

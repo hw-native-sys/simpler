@@ -428,10 +428,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         unique_cores.add(task["core_id"])
 
     core_to_tid = {}
-    tid_counter = 1000
     for core_id in sorted(unique_cores):
-        core_to_tid[core_id] = tid_counter
-        tid_counter += 1
+        core_to_tid[core_id] = 10000 + core_id * 10
 
     if verbose:
         print(f"  Unique cores: {len(unique_cores)}")
@@ -471,22 +469,11 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             {"args": {"name": thread_name}, "cat": "__metadata", "name": "thread_name", "ph": "M", "pid": 1, "tid": tid}
         )
 
-        # Also add thread name for AICPU View if data exists
-        if has_aicpu_data:
-            events.append(
-                {
-                    "args": {"name": thread_name},
-                    "cat": "__metadata",
-                    "name": "thread_name",
-                    "ph": "M",
-                    "pid": 2,
-                    "tid": tid,
-                }
-            )
-
     # Duration events (Complete events "X")
     # Build task_id -> event_id mapping for flow events
     task_to_event_id = {}
+    task_to_aicpu_event_id: dict[int, int] = {}
+    task_to_aicpu_tid: dict[int, int] = {}
     event_id = 0
 
     for task in tasks:
@@ -530,7 +517,72 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
         event_id += 1
 
     # AICPU View duration events (dispatch_time to finish_time)
+    # Assign overlapping tasks on the same core to different tids so Perfetto
+    # renders each bar on its own row (Perfetto requires strict nesting on a tid).
     if has_aicpu_data:
+        # Build per-core sorted task lists and assign sub-lanes.
+        # Each core gets a base tid from core_to_tid; overlapping tasks get base+1.
+        _core_aicpu_tasks: dict[int, list] = defaultdict(list)
+        for task in tasks:
+            d = task.get("dispatch_time_us", 0)
+            f = task.get("finish_time_us", 0)
+            if d < 0 or f <= 0:
+                continue
+            _core_aicpu_tasks[task["core_id"]].append(task)
+        for ct_list in _core_aicpu_tasks.values():
+            ct_list.sort(key=lambda t: t["dispatch_time_us"])
+
+        aicpu_tid_set: set[int] = set()
+        for core_id, ct_list in _core_aicpu_tasks.items():
+            base_tid = core_to_tid[core_id]
+            # Greedy lane assignment: track finish time per sub-lane
+            lane_finish = [0.0]  # lane 0 = base_tid
+            for task in ct_list:
+                d = task["dispatch_time_us"]
+                assigned = -1
+                for lane_idx, lf in enumerate(lane_finish):
+                    if lf <= d:
+                        assigned = lane_idx
+                        break
+                if assigned < 0:
+                    assigned = len(lane_finish)
+                    lane_finish.append(0.0)
+                lane_finish[assigned] = task["finish_time_us"]
+                tid = base_tid if assigned == 0 else base_tid + assigned
+                task_to_aicpu_tid[task["task_id"]] = tid
+                aicpu_tid_set.add(tid)
+
+        # Thread name metadata for AICPU View (one entry per unique tid used)
+        for core_id, base_tid in core_to_tid.items():
+            ct_list = _core_aicpu_tasks.get(core_id)
+            core_type_str = ct_list[0]["core_type"].upper() if ct_list else "unknown"
+            base_name = f"{core_type_str}_{core_id}"
+            # Base lane always gets metadata (even if no tasks, for consistency)
+            if base_tid in aicpu_tid_set or not aicpu_tid_set:
+                events.append(
+                    {
+                        "args": {"name": base_name},
+                        "cat": "__metadata",
+                        "name": "thread_name",
+                        "ph": "M",
+                        "pid": 2,
+                        "tid": base_tid,
+                    }
+                )
+            # Overflow lane (at most one: dual-slot dispatch means max 2 concurrent tasks per core)
+            overflow_tid = base_tid + 1
+            if overflow_tid in aicpu_tid_set:
+                events.append(
+                    {
+                        "args": {"name": base_name},
+                        "cat": "__metadata",
+                        "name": "thread_name",
+                        "ph": "M",
+                        "pid": 2,
+                        "tid": overflow_tid,
+                    }
+                )
+
         for task in tasks:
             dispatch_us = task.get("dispatch_time_us", 0)
             finish_us = task.get("finish_time_us", 0)
@@ -538,7 +590,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             if dispatch_us < 0 or finish_us <= 0:
                 continue
 
-            tid = core_to_tid[task["core_id"]]
+            tid = task_to_aicpu_tid.get(task["task_id"], core_to_tid[task["core_id"]])
             aicpu_dur = finish_us - dispatch_us
 
             # Get function name if available
@@ -569,6 +621,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                     "dur": aicpu_dur,
                 }
             )
+            task_to_aicpu_event_id[task["task_id"]] = event_id
             event_id += 1
 
     # Flow events (Flow events "s" and "f" for dependencies)
@@ -808,7 +861,8 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             if src_finish_us < 0:
                 continue
 
-            src_tid = core_to_tid[task["core_id"]]
+            src_tid = task_to_aicpu_tid.get(task["task_id"], core_to_tid[task["core_id"]])
+            src_aicpu_eid = task_to_aicpu_event_id.get(task["task_id"])
 
             for succ_task_id in task["fanout"]:
                 if succ_task_id not in task_map:
@@ -819,31 +873,36 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 if dst_dispatch_us < 0:
                     continue
 
-                dst_tid = core_to_tid[succ_task["core_id"]]
+                dst_tid = task_to_aicpu_tid.get(succ_task_id, core_to_tid[succ_task["core_id"]])
+                dst_aicpu_eid = task_to_aicpu_event_id.get(succ_task_id)
 
-                events.append(
-                    {
-                        "cat": "flow",
-                        "id": flow_id,
-                        "name": "dependency",
-                        "ph": "s",
-                        "pid": 2,
-                        "tid": src_tid,
-                        "ts": src_finish_us - 0.01,
-                    }
-                )
-                events.append(
-                    {
-                        "cat": "flow",
-                        "id": flow_id,
-                        "name": "dependency",
-                        "ph": "f",
-                        "pid": 2,
-                        "tid": dst_tid,
-                        "ts": dst_dispatch_us,
-                        "bp": "e",
-                    }
-                )
+                flow_s = {
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "dependency",
+                    "ph": "s",
+                    "pid": 2,
+                    "tid": src_tid,
+                    "ts": src_finish_us - 0.01,
+                }
+                if src_aicpu_eid is not None:
+                    flow_s["bind_id"] = src_aicpu_eid
+                events.append(flow_s)
+
+                flow_f = {
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "dependency",
+                    "ph": "f",
+                    "pid": 2,
+                    "tid": dst_tid,
+                    "ts": dst_dispatch_us,
+                    "bp": "e",
+                }
+                if dst_aicpu_eid is not None:
+                    flow_f["bind_id"] = dst_aicpu_eid
+                events.append(flow_f)
+
                 flow_id += 1
 
     # Scheduler DISPATCH → task execution arrows
@@ -894,6 +953,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
             if matched_thread is not None:
                 sched_tid = 3000 + matched_thread
                 core_tid = core_to_tid[task["core_id"]]
+                aicpu_tid = task_to_aicpu_tid.get(task["task_id"], core_tid)
 
                 # Flow: scheduler DISPATCH → AICore View task start
                 events.append(
@@ -922,6 +982,7 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                 flow_id += 1
 
                 # Flow: scheduler DISPATCH → AICPU View task start
+                aicpu_eid = task_to_aicpu_event_id.get(task["task_id"])
                 events.append(
                     {
                         "cat": "flow",
@@ -933,18 +994,19 @@ def generate_chrome_trace_json(  # noqa: PLR0912, PLR0915
                         "ts": dispatch_us,
                     }
                 )
-                events.append(
-                    {
-                        "cat": "flow",
-                        "id": flow_id,
-                        "name": "dispatch",
-                        "ph": "f",
-                        "pid": 2,
-                        "tid": core_tid,
-                        "ts": dispatch_us,
-                        "bp": "e",
-                    }
-                )
+                flow_f = {
+                    "cat": "flow",
+                    "id": flow_id,
+                    "name": "dispatch",
+                    "ph": "f",
+                    "pid": 2,
+                    "tid": aicpu_tid,
+                    "ts": dispatch_us,
+                    "bp": "e",
+                }
+                if aicpu_eid is not None:
+                    flow_f["bind_id"] = aicpu_eid
+                events.append(flow_f)
                 flow_id += 1
 
     # Orchestrator → scheduler dispatch:

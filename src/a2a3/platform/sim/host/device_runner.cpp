@@ -45,6 +45,8 @@ typedef void (*aicore_execute_func_t)(
     Runtime *runtime, int block_idx, CoreType core_type, uint32_t physical_core_id, uint64_t regs
 );
 typedef void (*set_platform_regs_func_t)(uint64_t regs);
+typedef void (*set_platform_dump_base_func_t)(uint64_t dump_data_base);
+typedef void (*set_enable_dump_tensor_func_t)(bool enable);
 
 namespace {
 
@@ -145,6 +147,18 @@ int DeviceRunner::ensure_binaries_loaded(
             LOG_ERROR("dlsym failed for set_platform_regs: %s", dlerror());
             return -1;
         }
+        set_platform_dump_base_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_dump_base"));
+        if (set_platform_dump_base_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_dump_base: %s", dlerror());
+            return -1;
+        }
+        set_enable_dump_tensor_func_ =
+            reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_enable_dump_tensor"));
+        if (set_enable_dump_tensor_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_enable_dump_tensor: %s", dlerror());
+            return -1;
+        }
 
         LOG_INFO("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
     }
@@ -210,7 +224,7 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
 
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
+    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor
 ) {
     clear_cpu_sim_shared_storage();
     // Validate launch_aicpu_num
@@ -272,6 +286,10 @@ int DeviceRunner::run(
 
     // Calculate number of AIC cores
     int num_aic = block_dim;
+    uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
+    if (enable_dump_tensor) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -281,6 +299,7 @@ int DeviceRunner::run(
         runtime.workers[i].task_status = 0;
         // First 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
+        runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
     }
 
     // Set function_bin_addr for each task: func_id_to_addr_[] stores CoreCallable
@@ -310,6 +329,16 @@ int DeviceRunner::run(
         perf_collector_.start_memory_manager([this](std::function<void()> fn) {
             return create_thread(std::move(fn));
         });
+    }
+
+    if (enable_dump_tensor) {
+        // Initialize tensor dump (independent from profiling)
+        rc = init_tensor_dump(runtime, num_aicore, device_id);
+        if (rc != 0) {
+            LOG_ERROR("init_tensor_dump failed: %d", rc);
+            return rc;
+        }
+        dump_collector_.start_memory_manager();
     }
 
     auto perf_cleanup = RAIIScopeGuard([this]() {
@@ -361,6 +390,8 @@ int DeviceRunner::run(
 
     // Set platform regs in the AICPU .so before launching threads
     set_platform_regs_func_(kernel_args_.regs);
+    set_platform_dump_base_func_(kernel_args_.dump_data_base);
+    set_enable_dump_tensor_func_(enable_dump_tensor);
 
     // Launch AICPU threads (over-launch for affinity gate)
     constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
@@ -400,23 +431,53 @@ int DeviceRunner::run(
         });
     }
 
-    // Wait for all threads to complete
-    LOG_INFO("Waiting for threads to complete");
-    for (auto &t : aicpu_threads) {
-        t.join();
-    }
-    for (auto &t : aicore_threads) {
-        t.join();
-    }
+    if (enable_dump_tensor) {
+        // Poll and collect dump data in a separate collector thread
+        std::thread dump_collector_thread([this]() {
+            dump_collector_.poll_and_collect();
+        });
 
-    // Signal collector that device execution is complete
-    if (runtime.enable_profiling) {
-        perf_collector_.signal_execution_complete();
-    }
+        // Wait for all threads to complete
+        LOG_INFO("Waiting for threads to complete");
+        for (auto &t : aicpu_threads) {
+            t.join();
+        }
+        for (auto &t : aicore_threads) {
+            t.join();
+        }
 
-    // Wait for collector thread if it was launched
-    if (runtime.enable_profiling && collector_thread.joinable()) {
-        collector_thread.join();
+        // Signal collector that device execution is complete
+        if (runtime.enable_profiling) {
+            perf_collector_.signal_execution_complete();
+        }
+        dump_collector_.signal_execution_complete();
+
+        // Wait for collector thread if it was launched
+        if (runtime.enable_profiling && collector_thread.joinable()) {
+            collector_thread.join();
+        }
+        if (dump_collector_thread.joinable()) {
+            dump_collector_thread.join();
+        }
+    } else {
+        // Wait for all threads to complete
+        LOG_INFO("Waiting for threads to complete");
+        for (auto &t : aicpu_threads) {
+            t.join();
+        }
+        for (auto &t : aicore_threads) {
+            t.join();
+        }
+
+        // Signal collector that device execution is complete
+        if (runtime.enable_profiling) {
+            perf_collector_.signal_execution_complete();
+        }
+
+        // Wait for collector thread if it was launched
+        if (runtime.enable_profiling && collector_thread.joinable()) {
+            collector_thread.join();
+        }
     }
 
     LOG_INFO("All threads completed");
@@ -434,6 +495,13 @@ int DeviceRunner::run(
         perf_collector_.scan_remaining_perf_buffers();
         perf_collector_.collect_phase_data();
         export_swimlane_json();
+    }
+
+    if (enable_dump_tensor) {
+        dump_collector_.stop_memory_manager();
+        dump_collector_.drain_remaining_buffers();
+        dump_collector_.scan_remaining_dump_buffers();
+        dump_collector_.export_dump_files();
     }
 
     // Print handshake results at end of run
@@ -468,6 +536,8 @@ void DeviceRunner::unload_executor_binaries() {
         aicpu_so_handle_ = nullptr;
         aicpu_execute_func_ = nullptr;
         set_platform_regs_func_ = nullptr;
+        set_platform_dump_base_func_ = nullptr;
+        set_enable_dump_tensor_func_ = nullptr;
     }
     if (!aicpu_so_path_.empty()) {
         std::remove(aicpu_so_path_.c_str());
@@ -499,6 +569,16 @@ int DeviceRunner::finalize() {
         };
 
         perf_collector_.finalize(nullptr, free_cb);
+    }
+
+    if (dump_collector_.is_initialized()) {
+        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+            (void)user_data;
+            free(dev_ptr);
+            return 0;
+        };
+
+        dump_collector_.finalize(nullptr, free_cb, nullptr);
     }
 
     // Kernel binaries should have been removed by validate_runtime_impl()
@@ -656,4 +736,27 @@ void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
 
 int DeviceRunner::export_swimlane_json(const std::string &output_path) {
     return perf_collector_.export_swimlane_json(output_path);
+}
+
+int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {
+    (void)num_aicore;
+    int num_dump_threads = runtime.sche_cpu_num;
+
+    auto alloc_cb = [](size_t size, void * /*user_data*/) -> void * {
+        return malloc(size);
+    };
+
+    auto free_cb = [](void *dev_ptr, void * /*user_data*/) -> int {
+        free(dev_ptr);
+        return 0;
+    };
+
+    // Simulation: no registration needed (dev == host)
+    int rc = dump_collector_.initialize(num_dump_threads, device_id, alloc_cb, nullptr, free_cb, nullptr, nullptr);
+    if (rc != 0) {
+        return rc;
+    }
+
+    kernel_args_.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_shm_device_ptr());
+    return 0;
 }

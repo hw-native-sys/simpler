@@ -23,6 +23,7 @@
 #include <cinttypes>
 #include <cstring>
 
+#include "aicpu/platform_regs.h"
 #include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
@@ -133,9 +134,19 @@ int perf_aicpu_complete_record(
     uint32_t count = perf_buf->count;
     if (count >= PLATFORM_PROF_BUFFER_SIZE) return -1;
 
-    PerfRecord *record = &perf_buf->records[count];
-    if (static_cast<uint32_t>(record->task_id) != expected_reg_task_id) return -1;
+    // Read from WIP staging slot (AICore writes here, parity = reg_task_id & 1)
+    PerfRecord *wip = &perf_buf->wip[expected_reg_task_id & 1u];
+    // One PoC cache line: matches AICore perf_aicore_record_task() dcci(..., SINGLE_CACHE_LINE, ...)
+    // and aicpu/cache_ops.cpp step size; wip timing fields live in the first line.
+    cache_invalidate_range(wip, 64);
+    if (static_cast<uint32_t>(wip->task_id) != expected_reg_task_id) return -1;
 
+    // Copy AICore timing to committed record slot
+    PerfRecord *record = &perf_buf->records[count];
+    record->start_time = wip->start_time;
+    record->end_time = wip->end_time;
+
+    // Fill AICPU-owned fields
     record->task_id = task_id;
     record->func_id = func_id;
     record->core_type = core_type;

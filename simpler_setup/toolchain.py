@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from enum import IntEnum
 
@@ -35,6 +36,42 @@ def _is_gcc(cxx_path: str) -> bool:
         return "clang" not in out
     except (OSError, subprocess.SubprocessError):
         return False
+
+
+def _parse_compiler_env(var_name: str, default: str) -> tuple[str, list[str]]:
+    """Split a CC/CXX env var into (compiler_path, extra_flags).
+
+    Conda activate scripts set CC/CXX to a multi-token string such as
+    ``gcc -pthread -B <env>/compiler_compat``. CMake rejects that as
+    ``CMAKE_C_COMPILER`` because it expects a single executable path, so we
+    separate the leading token from the injected flags.
+    """
+    raw = os.environ.get(var_name, "")
+    tokens = shlex.split(raw) if raw else []
+    if not tokens:
+        return default, []
+    return tokens[0], tokens[1:]
+
+
+def _host_compiler_cmake_args(default_cc: str, default_cxx: str) -> list[str]:
+    """CMake ``-D`` args for a host GCC/G++ toolchain.
+
+    Reads CC/CXX from the environment and splits off any conda-injected flags
+    (e.g. ``-pthread -B <env>/compiler_compat``) into CMAKE_{C,CXX}_FLAGS. The
+    flags are re-joined with ``shlex.join`` so tokens containing spaces survive
+    CMake's shell-style re-parse of the flag string.
+    """
+    cc, cc_flags = _parse_compiler_env("CC", default_cc)
+    cxx, cxx_flags = _parse_compiler_env("CXX", default_cxx)
+    args = [
+        f"-DCMAKE_C_COMPILER={cc}",
+        f"-DCMAKE_CXX_COMPILER={cxx}",
+    ]
+    if cc_flags:
+        args.append(f"-DCMAKE_C_FLAGS={shlex.join(cc_flags)}")
+    if cxx_flags:
+        args.append(f"-DCMAKE_CXX_FLAGS={shlex.join(cxx_flags)}")
+    return args
 
 
 class Toolchain:
@@ -153,13 +190,8 @@ class Gxx15Toolchain(Toolchain):
         return flags
 
     def get_cmake_args(self) -> list[str]:
-        # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
-        cc = os.environ.get("CC", "gcc")
-        cxx = os.environ.get("CXX", "g++")
-        return [
-            f"-DCMAKE_C_COMPILER={cc}",
-            f"-DCMAKE_CXX_COMPILER={cxx}",
-        ]
+        # Default to gcc-15/g++-15 to match self.cxx_path used for direct compilation.
+        return _host_compiler_cmake_args("gcc-15", self.cxx_path)
 
 
 class GxxToolchain(Toolchain):
@@ -179,13 +211,7 @@ class GxxToolchain(Toolchain):
         return flags
 
     def get_cmake_args(self) -> list[str]:
-        # Respect CC/CXX environment variables (e.g., CXX=g++-15 on macOS CI)
-        cc = os.environ.get("CC", "gcc")
-        cxx = os.environ.get("CXX", "g++")
-        args = [
-            f"-DCMAKE_C_COMPILER={cc}",
-            f"-DCMAKE_CXX_COMPILER={cxx}",
-        ]
+        args = _host_compiler_cmake_args("gcc", self.cxx_path)
         if self.ascend_home_path:
             args.append(f"-DASCEND_HOME_PATH={self.ascend_home_path}")
         return args

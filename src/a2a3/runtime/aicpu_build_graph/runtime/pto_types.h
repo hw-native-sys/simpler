@@ -119,7 +119,7 @@ union TensorRef {
 /**
  * Aggregated argument container for pto_submit_task
  *
- * Inherits storage from TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType>.
+ * Inherits storage from TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType>.
  * Each tensor slot stores a TensorRef union (Tensor* or TensorCreateInfo)
  * discriminated by the corresponding tag().
  * Tensors are dispatched first in kernel args, followed by scalars.
@@ -138,7 +138,7 @@ union TensorRef {
  *   SubmitResult r = pto2_rt_submit_aic_task(rt, kernel_id, args);
  *   const Tensor& y = r.outputs.get_ref(0);
  */
-struct Arg : TaskArgs<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> {
+struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> {
     bool has_error{false};
     const char *error_msg{nullptr};
 

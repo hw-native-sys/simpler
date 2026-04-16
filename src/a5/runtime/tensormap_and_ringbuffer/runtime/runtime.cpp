@@ -39,6 +39,10 @@ Runtime::Runtime() {
     pto2_dep_pool_size = 0;
     orch_to_sched = false;
 
+    // Initialize profiling state
+    enable_profiling = false;
+    perf_data_base = 0;
+
     // Initialize tensor pairs
     tensor_pair_count = 0;
 
@@ -51,6 +55,8 @@ Runtime::Runtime() {
 
     // Initialize device orchestration SO binary
     device_orch_so_size_ = 0;
+    device_orch_func_name_[0] = '\0';
+    device_orch_config_name_[0] = '\0';
 
     // Initialize kernel binary tracking
     registered_kernel_count_ = 0;
@@ -118,6 +124,28 @@ const void *Runtime::get_device_orch_so_data() const {
 }
 
 size_t Runtime::get_device_orch_so_size() const { return device_orch_so_size_; }
+
+void Runtime::set_device_orch_func_name(const char *name) {
+    if (name == nullptr) {
+        device_orch_func_name_[0] = '\0';
+        return;
+    }
+    std::strncpy(device_orch_func_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
+    device_orch_func_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
+}
+
+const char *Runtime::get_device_orch_func_name() const { return device_orch_func_name_; }
+
+void Runtime::set_device_orch_config_name(const char *name) {
+    if (name == nullptr) {
+        device_orch_config_name_[0] = '\0';
+        return;
+    }
+    std::strncpy(device_orch_config_name_, name, RUNTIME_MAX_ORCH_SYMBOL_NAME - 1);
+    device_orch_config_name_[RUNTIME_MAX_ORCH_SYMBOL_NAME - 1] = '\0';
+}
+
+const char *Runtime::get_device_orch_config_name() const { return device_orch_config_name_; }
 
 uint64_t Runtime::get_function_bin_addr(int func_id) const {
     if (func_id < 0 || func_id >= RUNTIME_MAX_FUNC_ID) return 0;

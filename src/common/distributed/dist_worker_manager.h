@@ -12,15 +12,31 @@
 /**
  * DistWorkerManager — worker pool lifecycle and dispatch.
  *
- * Owns WorkerThread instances (one per registered IWorker).
+ * Owns WorkerThread instances (one per registered worker).
  * Provides idle-worker selection and dispatch to the Scheduler.
  * The Scheduler drives the DAG; the Manager drives the workers.
+ *
+ * Each WorkerThread operates in one of two modes:
+ *
+ *   THREAD  — calls `worker_->run(callable, view, config)` directly in
+ *             the parent process.
+ *   PROCESS — encodes `(callable, config, args_blob)` into a pre-forked
+ *             child's shared-memory mailbox, signals TASK_READY, and
+ *             spin-polls TASK_DONE. The child process loop (Python) reads
+ *             the mailbox and calls the appropriate IWorker / Python
+ *             callable in its own address space.
+ *
+ * PROCESS mode absorbs the logic that used to live in the standalone
+ * `DistChipProcess` and `DistSubWorker` classes (deleted in PR-D-2).
  */
 
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdint>
+#include <cstring>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -30,41 +46,114 @@
 
 #include "dist_types.h"
 
+class DistRing;  // forward decl — owns the slot state pool
+
 // =============================================================================
-// WorkerThread — gives one IWorker its own execution thread
+// Unified mailbox layout (PROCESS mode)
+// =============================================================================
+//
+// One layout for both NEXT_LEVEL (chip) and SUB workers. SUB children
+// read `callable` as a uint64 encoding the callable_id and ignore
+// config + args_blob. Matches the former DistChipProcess layout at the
+// byte level so the chip child loop in Python needs no offset changes.
+
+enum class MailboxState : int32_t {
+    IDLE = 0,
+    TASK_READY = 1,
+    TASK_DONE = 2,
+    SHUTDOWN = 3,
+};
+
+static constexpr size_t DIST_MAILBOX_SIZE = 4096;
+
+static constexpr ptrdiff_t MAILBOX_OFF_STATE = 0;
+static constexpr ptrdiff_t MAILBOX_OFF_ERROR = 4;
+static constexpr ptrdiff_t MAILBOX_OFF_CALLABLE = 8;
+static constexpr ptrdiff_t MAILBOX_OFF_BLOCK_DIM = 16;
+static constexpr ptrdiff_t MAILBOX_OFF_AICPU_THREAD_NUM = 20;
+static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_PROFILING = 24;
+static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_DUMP_TENSOR = 28;
+static constexpr ptrdiff_t MAILBOX_OFF_ARGS = 64;
+static constexpr size_t DIST_MAILBOX_ARGS_CAPACITY = DIST_MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_ARGS);
+
+// =============================================================================
+// WorkerDispatch — per-dispatch handle handed to a WorkerThread.
+// =============================================================================
+//
+// `task_slot` is the slot id; `group_index` is 0 for single tasks and
+// 0..group_size-1 for group members. The thread resolves callable / args /
+// config by reading `ring->slot_state(task_slot)`.
+
+struct WorkerDispatch {
+    DistTaskSlot task_slot{DIST_INVALID_SLOT};
+    int32_t group_index{0};
+};
+
+// =============================================================================
+// WorkerThread — one worker, one std::thread, two execution modes.
 // =============================================================================
 
 class WorkerThread {
 public:
+    enum class Mode { THREAD, PROCESS };
+
     WorkerThread() = default;
     ~WorkerThread() { stop(); }
     WorkerThread(const WorkerThread &) = delete;
     WorkerThread &operator=(const WorkerThread &) = delete;
 
     // Start the worker thread.
+    //
+    // THREAD mode: `worker` is called directly via `worker->run(...)`.
+    //   `mailbox` must be nullptr.
+    //
+    // PROCESS mode: `worker` is nullptr (the real IWorker lives in the
+    //   forked child). `mailbox` points to a DIST_MAILBOX_SIZE-byte
+    //   MAP_SHARED region managed by the Python facade.
+    //
+    // `ring` is a borrowed pointer to the engine's slot-state pool —
+    // the thread reads callable/args/config from
+    // `ring->slot_state(task_slot)` on each dispatch.
     // on_complete(slot) is called (in the WorkerThread) after each run().
-    void start(IWorker *worker, const std::function<void(DistTaskSlot)> &on_complete);
+    void start(
+        Mode mode, IWorker *worker, DistRing *ring, const std::function<void(DistTaskSlot)> &on_complete,
+        void *mailbox = nullptr
+    );
 
-    // Enqueue a task for the worker.  Non-blocking.
-    void dispatch(const WorkerPayload &payload);
+    // Enqueue a dispatch for the worker. Non-blocking.
+    void dispatch(WorkerDispatch d);
 
     // True if the worker has no active task.
     bool idle() const { return idle_.load(std::memory_order_acquire); }
 
     void stop();
 
+    // PROCESS mode only: write SHUTDOWN to the mailbox so the child
+    // process exits its loop. No-op in THREAD mode. Does NOT waitpid —
+    // the Python facade owns the child PID.
+    void shutdown_child();
+
 private:
+    Mode mode_{Mode::THREAD};
     IWorker *worker_{nullptr};
+    DistRing *ring_{nullptr};
+    void *mailbox_{nullptr};
     std::function<void(DistTaskSlot)> on_complete_;
 
     std::thread thread_;
-    std::queue<WorkerPayload> queue_;
+    std::queue<WorkerDispatch> queue_;
     std::mutex mu_;
     std::condition_variable cv_;
     bool shutdown_{false};
     std::atomic<bool> idle_{true};
 
     void loop();
+    void dispatch_thread(DistTaskSlotState &s, int32_t group_index);
+    void dispatch_process(DistTaskSlotState &s, int32_t group_index);
+
+    char *mbox() const { return static_cast<char *>(mailbox_); }
+    MailboxState read_mailbox_state() const;
+    void write_mailbox_state(MailboxState s);
 };
 
 // =============================================================================
@@ -75,28 +164,34 @@ class DistWorkerManager {
 public:
     using OnCompleteFn = std::function<void(DistTaskSlot)>;
 
+    // THREAD mode: worker is called directly.
     void add_next_level(IWorker *worker);
     void add_sub(IWorker *worker);
 
-    /// Start all WorkerThreads. on_complete is called (from the WorkerThread)
-    /// after each task finishes — the Scheduler hooks into this.
-    void start(const OnCompleteFn &on_complete);
+    // PROCESS mode: mailbox is a DIST_MAILBOX_SIZE-byte MAP_SHARED region.
+    // Worker is nullptr (child has its own).
+    void add_next_level_process(void *mailbox);
+    void add_sub_process(void *mailbox);
 
-    /// Stop and join all WorkerThreads.
+    void start(DistRing *ring, const OnCompleteFn &on_complete);
     void stop();
 
-    /// Pick one idle WorkerThread of the given type. Returns nullptr if none idle.
     WorkerThread *pick_idle(WorkerType type) const;
-
-    /// Pick up to n idle WorkerThreads of the given type.
     std::vector<WorkerThread *> pick_n_idle(WorkerType type, int n) const;
-
-    /// True if any WorkerThread (of any type) is currently busy.
     bool any_busy() const;
 
+    // Write SHUTDOWN to every PROCESS-mode mailbox.
+    void shutdown_children();
+
 private:
-    std::vector<IWorker *> next_level_workers_;
-    std::vector<IWorker *> sub_workers_;
+    struct WorkerEntry {
+        IWorker *worker;  // nullptr for PROCESS mode
+        WorkerThread::Mode mode;
+        void *mailbox;  // nullptr for THREAD mode
+    };
+
+    std::vector<WorkerEntry> next_level_entries_;
+    std::vector<WorkerEntry> sub_entries_;
 
     std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
     std::vector<std::unique_ptr<WorkerThread>> sub_threads_;

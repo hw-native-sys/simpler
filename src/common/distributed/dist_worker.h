@@ -13,37 +13,34 @@
  * DistWorker — top-level distributed worker node.
  *
  * DistWorker is the implementation of one level in the hierarchy (L3, L4, …).
- * From the level above it looks like an IWorker; internally it contains the full
- * scheduling engine (TensorMap, Ring, Scope, Orchestrator, Scheduler) and a set
- * of sub-IWorkers it dispatches to.
+ * From the level above it looks like an IWorker; internally it contains the
+ * full scheduling engine (TensorMap, Allocator, Scope, Orchestrator, Scheduler)
+ * and a set of sub-IWorkers it dispatches to.
  *
- * Usage (L3 host worker, instantiated from Python via nanobind):
+ * Public surface:
+ *   - add_worker(type, IWorker*)  — register sub-workers (before init)
+ *   - init() / close()             — lifecycle
+ *   - get_orchestrator()           — accessor used by Worker::run / Python facade
+ *                                    (scope_begin / drain / scope_end live on the
+ *                                     Orchestrator, not here)
+ *   - run(payload)                 — IWorker entry (placeholder for L4+ recursion)
  *
- *   DistWorker dw(level=3);
- *   dw.add_worker(WorkerType::NEXT_LEVEL, chip_worker_ptr);
- *   dw.add_worker(WorkerType::SUB,  sub_worker_ptr);
- *   dw.init();
+ * Worker holds no submit / scope / drain / active-task bookkeeping — those
+ * concepts belong to Orchestrator.
  *
- *   // Orchestrator side (main thread):
- *   auto result = dw.submit(CHIP, payload, inputs, outputs);
- *   dw.scope_begin();
- *   dw.submit(...);
- *   dw.scope_end();
- *   dw.execute();   // blocks until all submitted tasks complete
- *
- *   // When used as an IWorker by a higher-level DistWorker (L4+):
- *   parent.add_worker(WorkerType::NEXT_LEVEL, &dw);
- *   // parent scheduler calls dw.dispatch() / dw.poll()
+ * Construction is separated from `init()` so Python callers can mmap the
+ * HeapRing in the parent process *before* forking children (children see the
+ * MAP_SHARED region at the same virtual address). Start the scheduler and
+ * WorkerThreads with `init()` only after forks have happened.
  */
 
 #pragma once
 
 #include <cstdint>
 #include <memory>
-#include <vector>
 
-#include "dist_orchestrator.h"
 #include "dist_ring.h"
+#include "dist_orchestrator.h"
 #include "dist_scheduler.h"
 #include "dist_scope.h"
 #include "dist_tensormap.h"
@@ -52,67 +49,63 @@
 
 class DistWorker : public IWorker {
 public:
-    explicit DistWorker(int32_t level);
+    // Construct a Worker for hierarchy `level`. `heap_ring_size` is the
+    // MAP_SHARED|MAP_ANONYMOUS region handed out by the Orchestrator for
+    // auto-allocated OUTPUT tensors and `orch.alloc()` buffers.
+    //
+    // The heap is mmap'd here (before any fork) so forked child workers
+    // inherit the same mapping. Thread-hostile hygiene (setenv of
+    // OMP/MKL/BLIS/OPENBLAS thread-count knobs and the pthread_atfork
+    // installation) also runs in the ctor, still in the parent, before
+    // child forks.
+    explicit DistWorker(int32_t level, uint64_t heap_ring_size = DIST_DEFAULT_HEAP_RING_SIZE);
     ~DistWorker() override;
 
     DistWorker(const DistWorker &) = delete;
     DistWorker &operator=(const DistWorker &) = delete;
 
     // Register sub-workers before calling init().
+    // THREAD mode — parent calls worker->run() directly.
     void add_worker(WorkerType type, IWorker *worker);
 
-    // Initialise the engine and start the Scheduler thread.
+    // PROCESS mode — parent writes the unified mailbox; a pre-forked child
+    // process reads it and runs the real IWorker in its own address space.
+    // `mailbox` must point to a DIST_MAILBOX_SIZE-byte MAP_SHARED region.
+    void add_process_worker(WorkerType type, void *mailbox);
+
+    // Start the scheduler thread. Must be called AFTER the parent has forked
+    // any child workers — init() spins up threads in the parent that would
+    // otherwise be accidentally inherited across fork.
     void init();
 
     // Shut down the Scheduler thread and release resources.
     void close();
 
-    // Submit a task (Orch thread only).
-    DistSubmitResult submit(
-        WorkerType worker_type, const WorkerPayload &base_payload, const std::vector<DistInputSpec> &inputs,
-        const std::vector<DistOutputSpec> &outputs
-    );
+    // Accessor: the Orchestrator handle used by the user's orch fn. Valid
+    // only between init() and close().
+    DistOrchestrator &get_orchestrator() { return orchestrator_; }
 
-    // Submit a group task: N args → N workers, 1 DAG node.
-    DistSubmitResult submit_group(
-        WorkerType worker_type, const WorkerPayload &base_payload, const std::vector<const void *> &args_list,
-        const std::vector<DistInputSpec> &inputs, const std::vector<DistOutputSpec> &outputs
-    );
-
-    void scope_begin();
-    void scope_end();
-
-    // Block until all submitted tasks have reached CONSUMED.
-    // Called at the end of execute() or from the parent Scheduler.
-    void drain();
-
-    // ------------------------------------------------------------------
     // IWorker — used when this DistWorker is itself a sub-worker of L4+.
-    // run() executes the stored HostTask orch + drains (placeholder for now).
-    // ------------------------------------------------------------------
-    void run(const WorkerPayload &payload) override;
-
-    int32_t level() const { return level_; }
-    bool idle() const { return active_tasks_.load(std::memory_order_acquire) == 0; }
+    // Placeholder for recursive composition; filled in by plan step F.
+    void run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) override;
 
 private:
     int32_t level_;
     bool initialized_{false};
 
     // --- Scheduling engine components ---
-    std::unique_ptr<DistTaskSlotState[]> slots_;
+    // Per-task slot state lives inside `allocator_` (DistRing) — Orchestrator
+    // and Scheduler access it via `allocator_.slot_state(id)`. No separate
+    // fixed-size slots array at L3 (see plan Allowed Exception #6).
     DistTensorMap tensormap_;
-    DistRing ring_;
+    DistRing allocator_;
     DistScope scope_;
-    DistReadyQueue ready_queue_;
+    // Strict-4: one ready queue per WorkerType. Submit routes by
+    // s.worker_type; the Scheduler drains each queue independently so
+    // saturation of one pool cannot head-of-line-block the other.
+    DistReadyQueue ready_next_level_queue_;
+    DistReadyQueue ready_sub_queue_;
     DistOrchestrator orchestrator_;
     DistScheduler scheduler_;
     DistWorkerManager manager_;
-
-    // --- Drain support ---
-    std::mutex drain_mu_;
-    std::condition_variable drain_cv_;
-    std::atomic<int32_t> active_tasks_{0};
-
-    void on_consumed(DistTaskSlot slot);
 };
