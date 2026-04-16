@@ -67,15 +67,31 @@ class Orchestrator:
     # User-facing submit API
     # ------------------------------------------------------------------
 
-    def submit_next_level(self, callable_: Any, args: TaskArgs, config: Optional[ChipCallConfig] = None):
-        """Submit a NEXT_LEVEL (chip) task. Tags inside ``args`` drive deps."""
-        cfg = config if config is not None else ChipCallConfig()
-        return self._o.submit_next_level(_resolve_callable_ptr(callable_), args, cfg)
+    def submit_next_level(
+        self, callable_: Any, args: TaskArgs, config: Optional[ChipCallConfig] = None, *, worker: int = -1
+    ):
+        """Submit a NEXT_LEVEL (chip) task. Tags inside ``args`` drive deps.
 
-    def submit_next_level_group(self, callable_: Any, args_list: list, config: Optional[ChipCallConfig] = None):
-        """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N workers, 1 DAG node)."""
+        ``worker``: logical worker id for affinity (-1 = unconstrained).
+        """
         cfg = config if config is not None else ChipCallConfig()
-        return self._o.submit_next_level_group(_resolve_callable_ptr(callable_), args_list, cfg)
+        return self._o.submit_next_level(_resolve_callable_ptr(callable_), args, cfg, int(worker))
+
+    def submit_next_level_group(
+        self,
+        callable_: Any,
+        args_list: list,
+        config: Optional[ChipCallConfig] = None,
+        *,
+        workers: Optional[list] = None,
+    ):
+        """Submit a group of NEXT_LEVEL tasks (N TaskArgs → N workers, 1 DAG node).
+
+        ``workers``: per-args affinity list (None/empty = all unconstrained).
+        """
+        cfg = config if config is not None else ChipCallConfig()
+        w = [int(x) for x in workers] if workers else []
+        return self._o.submit_next_level_group(_resolve_callable_ptr(callable_), args_list, cfg, w)
 
     def submit_sub(self, callable_id: int, args: Optional[TaskArgs] = None):
         """Submit a SUB task by registered callable id.
@@ -127,6 +143,22 @@ class Orchestrator:
             yield self
         finally:
             self._o.scope_end()
+
+    def malloc(self, worker_id: int, size: int) -> int:
+        """Allocate memory on next-level worker *worker_id*. Returns a pointer."""
+        return int(self._o.malloc(int(worker_id), int(size)))
+
+    def free(self, worker_id: int, ptr: int) -> None:
+        """Free memory on next-level worker *worker_id*."""
+        self._o.free(int(worker_id), int(ptr))
+
+    def copy_to(self, worker_id: int, dst: int, src: int, size: int) -> None:
+        """Copy *size* bytes from host *src* to worker *dst*."""
+        self._o.copy_to(int(worker_id), int(dst), int(src), int(size))
+
+    def copy_from(self, worker_id: int, dst: int, src: int, size: int) -> None:
+        """Copy *size* bytes from worker *src* to host *dst*."""
+        self._o.copy_from(int(worker_id), int(dst), int(src), int(size))
 
     def alloc(self, shape: Sequence[int], dtype: DataType) -> ContinuousTensor:
         """Allocate a runtime-managed intermediate buffer.

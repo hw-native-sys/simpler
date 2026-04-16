@@ -114,6 +114,10 @@ void ChipWorker::init(
         create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
         destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
         set_device_fn_ = load_symbol<SetDeviceFn>(handle, "set_device");
+        device_malloc_ctx_fn_ = load_symbol<DeviceMallocCtxFn>(handle, "device_malloc_ctx");
+        device_free_ctx_fn_ = load_symbol<DeviceFreeCtxFn>(handle, "device_free_ctx");
+        copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
+        copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
@@ -177,6 +181,10 @@ void ChipWorker::finalize() {
     create_device_context_fn_ = nullptr;
     destroy_device_context_fn_ = nullptr;
     set_device_fn_ = nullptr;
+    device_malloc_ctx_fn_ = nullptr;
+    device_free_ctx_fn_ = nullptr;
+    copy_to_device_ctx_fn_ = nullptr;
+    copy_from_device_ctx_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
     run_runtime_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
@@ -210,5 +218,45 @@ void ChipWorker::run(const void *callable, const void *args, const ChipCallConfi
     );
     if (rc != 0) {
         throw std::runtime_error("run_runtime failed with code " + std::to_string(rc));
+    }
+}
+
+uint64_t ChipWorker::malloc(size_t size) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    void *ptr = device_malloc_ctx_fn_(device_ctx_, size);
+    if (ptr == nullptr) {
+        throw std::runtime_error("malloc failed");
+    }
+    return reinterpret_cast<uint64_t>(ptr);
+}
+
+void ChipWorker::free(uint64_t ptr) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    device_free_ctx_fn_(device_ctx_, reinterpret_cast<void *>(ptr));
+}
+
+void ChipWorker::copy_to(uint64_t dst, uint64_t src, size_t size) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    int rc =
+        copy_to_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
+    if (rc != 0) {
+        throw std::runtime_error("copy_to failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    int rc =
+        copy_from_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
+    if (rc != 0) {
+        throw std::runtime_error("copy_from failed with code " + std::to_string(rc));
     }
 }

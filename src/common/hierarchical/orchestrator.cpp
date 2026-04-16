@@ -15,15 +15,43 @@
 #include <cstring>
 #include <stdexcept>
 
+#include "worker_manager.h"
+
 void Orchestrator::init(
-    TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue, ReadyQueue *ready_sub_queue
+    TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
+    ReadyQueue *ready_sub_queue, WorkerManager *manager
 ) {
     tensormap_ = tensormap;
     allocator_ = allocator;
     scope_ = scope;
     ready_next_level_queue_ = ready_next_level_queue;
     ready_sub_queue_ = ready_sub_queue;
+    manager_ = manager;
     active_tasks_.store(0, std::memory_order_relaxed);
+}
+
+uint64_t Orchestrator::malloc(int worker_id, size_t size) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::malloc: invalid worker_id");
+    return wt->control_malloc(size);
+}
+
+void Orchestrator::free(int worker_id, uint64_t ptr) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::free: invalid worker_id");
+    wt->control_free(ptr);
+}
+
+void Orchestrator::copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::copy_to: invalid worker_id");
+    wt->control_copy_to(dst, src, size);
+}
+
+void Orchestrator::copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size) {
+    auto *wt = manager_->get_worker(WorkerType::NEXT_LEVEL, worker_id);
+    if (!wt) throw std::runtime_error("Orchestrator::copy_from: invalid worker_id");
+    wt->control_copy_from(dst, src, size);
 }
 
 TaskSlotState &Orchestrator::slot_state(TaskSlot s) {
@@ -66,8 +94,9 @@ ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataTyp
     TaskSlotState &s = slot_state(ar.slot);
     s.reset();
 
-    uint64_t key = reinterpret_cast<uint64_t>(ar.heap_ptr);
-    if (key != 0) {
+    uint64_t ptr = reinterpret_cast<uint64_t>(ar.heap_ptr);
+    if (ptr != 0) {
+        TensorKey key{ptr, -1};  // alloc is always host memory
         tensormap_->insert(key, ar.slot);
         s.output_keys.push_back(key);
     }
@@ -95,7 +124,7 @@ ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataTyp
     active_tasks_.fetch_add(1, std::memory_order_relaxed);
 
     ContinuousTensor t{};
-    t.data = key;
+    t.data = ptr;
     t.dtype = dtype;
     t.ndims = static_cast<uint32_t>(shape.size());
     for (size_t i = 0; i < shape.size(); ++i)
@@ -107,14 +136,18 @@ ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataTyp
 // User-facing submit_* — thin wrappers around submit_impl
 // =============================================================================
 
-SubmitResult Orchestrator::submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config) {
-    return submit_impl(WorkerType::NEXT_LEVEL, callable, /*callable_id=*/-1, config, {args});
+SubmitResult
+Orchestrator::submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config, int8_t worker) {
+    std::vector<int8_t> affinities;
+    if (worker >= 0) affinities = {worker};
+    return submit_impl(WorkerType::NEXT_LEVEL, callable, /*callable_id=*/-1, config, {args}, std::move(affinities));
 }
 
 SubmitResult Orchestrator::submit_next_level_group(
-    uint64_t callable, const std::vector<TaskArgs> &args_list, const ChipCallConfig &config
+    uint64_t callable, const std::vector<TaskArgs> &args_list, const ChipCallConfig &config,
+    const std::vector<int8_t> &workers
 ) {
-    return submit_impl(WorkerType::NEXT_LEVEL, callable, /*callable_id=*/-1, config, args_list);
+    return submit_impl(WorkerType::NEXT_LEVEL, callable, /*callable_id=*/-1, config, args_list, workers);
 }
 
 SubmitResult Orchestrator::submit_sub(int32_t callable_id, const TaskArgs &args) {
@@ -131,7 +164,7 @@ SubmitResult Orchestrator::submit_sub_group(int32_t callable_id, const std::vect
 
 SubmitResult Orchestrator::submit_impl(
     WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const ChipCallConfig &config,
-    std::vector<TaskArgs> args_list
+    std::vector<TaskArgs> args_list, std::vector<int8_t> affinities
 ) {
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
 
@@ -163,7 +196,7 @@ SubmitResult Orchestrator::submit_impl(
     // (outputs). Must happen before we move args_list into the slot because
     // infer_deps reads tensor data pointers and tags from it.
     std::vector<TaskSlot> producers;
-    infer_deps(slot, args_list, producers, s.output_keys);
+    infer_deps(slot, args_list, affinities, producers, s.output_keys);
 
     // --- Step 3: Store TaskArgs directly (no chip-storage pre-build) ---
     // Dispatch builds a TaskArgsView on demand via `slot.args_view(i)`
@@ -177,6 +210,7 @@ SubmitResult Orchestrator::submit_impl(
         s.is_group_ = true;
         s.task_args_list = std::move(args_list);
     }
+    s.affinities = std::move(affinities);
 
     // --- Step 5: Finalize fanin — lock each producer's fanout_mu, attach ---
     //
@@ -273,8 +307,8 @@ AllocResult Orchestrator::reserve_outputs_and_slot(std::vector<TaskArgs> &args_l
 // =============================================================================
 
 void Orchestrator::infer_deps(
-    TaskSlot slot, const std::vector<TaskArgs> &args_list, std::vector<TaskSlot> &producers,
-    std::vector<uint64_t> &output_keys
+    TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int8_t> &affinities,
+    std::vector<TaskSlot> &producers, std::vector<TensorKey> &output_keys
 ) {
     auto add_unique_producer = [&](TaskSlot p) {
         // Group submits walk many TaskArgs under one slot: if two entries in
@@ -299,10 +333,13 @@ void Orchestrator::infer_deps(
     //                      needed, the data ptr is assigned in
     //                      reserve_outputs_and_slot before this step)
     //   NO_DEP           → skip
-    for (const TaskArgs &a : args_list) {
+    for (size_t g = 0; g < args_list.size(); ++g) {
+        int8_t worker_id = (g < affinities.size()) ? affinities[g] : int8_t(-1);
+        const TaskArgs &a = args_list[g];
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
-            uint64_t key = a.tensor(i).data;
-            if (key == 0) continue;  // null tensor — nothing to track
+            const ContinuousTensor &t = a.tensor(i);
+            if (t.data == 0) continue;  // null tensor — nothing to track
+            TensorKey key{t.data, t.is_child_memory() ? worker_id : int8_t(-1)};
             TensorArgType tag = a.tag(i);
             switch (tag) {
             case TensorArgType::INPUT: {

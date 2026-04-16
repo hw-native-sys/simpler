@@ -81,7 +81,7 @@ NB_MODULE(_task_interface, m) {
 
         .def_static(
             "make",
-            [](uint64_t data, nb::tuple shapes, DataType dtype) -> ContinuousTensor {
+            [](uint64_t data, nb::tuple shapes, DataType dtype, bool child_memory) -> ContinuousTensor {
                 size_t n = nb::len(shapes);
                 if (n > CONTINUOUS_TENSOR_MAX_DIMS)
                     throw std::invalid_argument("shapes length exceeds CONTINUOUS_TENSOR_MAX_DIMS");
@@ -89,12 +89,14 @@ NB_MODULE(_task_interface, m) {
                 arg.data = data;
                 arg.dtype = dtype;
                 arg.ndims = static_cast<uint32_t>(n);
+                arg.child_memory = child_memory ? 1 : 0;
                 for (size_t i = 0; i < n; ++i)
                     arg.shapes[i] = nb::cast<uint32_t>(shapes[i]);
                 return arg;
             },
-            nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"),
-            "Create a ContinuousTensor from a data pointer, shape tuple, and dtype."
+            nb::arg("data"), nb::arg("shapes"), nb::arg("dtype"), nb::arg("child_memory") = false,
+            "Create a ContinuousTensor. Set child_memory=True when data is a device pointer "
+            "allocated by the child process (skips H2D copy in init_runtime_impl)."
         )
 
         .def_prop_rw(
@@ -150,6 +152,16 @@ NB_MODULE(_task_interface, m) {
             }
         )
 
+        .def_prop_rw(
+            "child_memory",
+            [](const ContinuousTensor &self) -> bool {
+                return self.is_child_memory();
+            },
+            [](ContinuousTensor &self, bool v) {
+                self.child_memory = v ? 1 : 0;
+            }
+        )
+
         .def(
             "nbytes",
             [](const ContinuousTensor &self) -> uint64_t {
@@ -165,7 +177,9 @@ NB_MODULE(_task_interface, m) {
                 if (i) os << ", ";
                 os << self.shapes[i];
             }
-            os << "), dtype=" << get_dtype_name(self.dtype) << ")";
+            os << "), dtype=" << get_dtype_name(self.dtype);
+            if (self.is_child_memory()) os << ", child_memory=True";
+            os << ")";
             return os.str();
         });
 
@@ -600,7 +614,11 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
-        .def_prop_ro("device_set", &ChipWorker::device_set);
+        .def_prop_ro("device_set", &ChipWorker::device_set)
+        .def("malloc", &ChipWorker::malloc, nb::arg("size"))
+        .def("free", &ChipWorker::free, nb::arg("ptr"))
+        .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
+        .def("copy_from", &ChipWorker::copy_from, nb::arg("dst"), nb::arg("src"), nb::arg("size"));
 
     // --- Standalone blob helpers ---
     m.def(

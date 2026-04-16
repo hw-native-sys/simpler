@@ -209,6 +209,22 @@ class ChipWorker:
             setattr(config, k, v)
         self._impl.run(callable, args, config)
 
+    def malloc(self, size):
+        """Allocate memory. Returns a pointer (uint64)."""
+        return int(self._impl.malloc(int(size)))
+
+    def free(self, ptr):
+        """Free memory allocated by ``malloc()``."""
+        self._impl.free(int(ptr))
+
+    def copy_to(self, dst, src, size):
+        """Copy *size* bytes from host *src* to worker *dst*."""
+        self._impl.copy_to(int(dst), int(src), int(size))
+
+    def copy_from(self, dst, src, size):
+        """Copy *size* bytes from worker *src* to host *dst*."""
+        self._impl.copy_from(int(dst), int(src), int(size))
+
     @property
     def device_id(self):
         return self._impl.device_id

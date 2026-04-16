@@ -28,6 +28,7 @@ struct ContinuousTensor {
     uint32_t shapes[CONTINUOUS_TENSOR_MAX_DIMS];  // Shape per dim (element count)
     uint32_t ndims;                               // Number of dimensions (1..5)
     DataType dtype;                               // DataType : uint8_t
+    uint8_t child_memory;                         // 0 = host (default), 1 = child-managed device memory
 
     [[nodiscard]] uint64_t nbytes() const {
         uint64_t total = 1;
@@ -40,11 +41,13 @@ struct ContinuousTensor {
     T *data_as() const {
         return reinterpret_cast<T *>(static_cast<uintptr_t>(data));
     }
+
+    [[nodiscard]] bool is_child_memory() const { return child_memory != 0; }
 };
 
 static_assert(std::is_trivially_copyable_v<ContinuousTensor>, "ContinuousTensor must be trivially copyable for DMA");
 static_assert(
-    sizeof(ContinuousTensor) == 40, "ContinuousTensor size must be exactly 40B (33B fields + 7B tail padding)"
+    sizeof(ContinuousTensor) == 40, "ContinuousTensor size must be exactly 40B (34B fields + 6B tail padding)"
 );
 
 /**

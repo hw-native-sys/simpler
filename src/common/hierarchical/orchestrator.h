@@ -46,6 +46,8 @@
 #include "tensormap.h"
 #include "types.h"
 
+class WorkerManager;
+
 // ---------------------------------------------------------------------------
 // SubmitResult — just the slot id
 // ---------------------------------------------------------------------------
@@ -70,7 +72,7 @@ public:
     // the Scheduler's dispatch_ready walks each queue independently.
     void init(
         TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
-        ReadyQueue *ready_sub_queue
+        ReadyQueue *ready_sub_queue, WorkerManager *manager = nullptr
     );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
@@ -82,15 +84,28 @@ public:
     // pointer has reached CONSUMED and scope_end has released the scope ref.
     ContinuousTensor alloc(const std::vector<uint32_t> &shape, DataType dtype);
 
+    // Memory management on a specific next-level worker. Thread-safe:
+    // can be called from the orch thread while the target worker is
+    // running a task (MemoryAllocator is mutex-protected).
+    uint64_t malloc(int worker_id, size_t size);
+    void free(int worker_id, uint64_t ptr);
+    void copy_to(int worker_id, uint64_t dst, uint64_t src, size_t size);
+    void copy_from(int worker_id, uint64_t dst, uint64_t src, size_t size);
+
     // Submit a NEXT_LEVEL task. `callable` is the chip callable buffer pointer
     // (uint64_t handle from Python — typically ChipCallable.buffer_ptr()).
     // Tags inside `args` drive dependency inference; OUTPUT tensors with null
     // data are auto-allocated from the HeapRing.
-    SubmitResult submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config);
+    // `worker`: logical worker id for affinity (-1 = unconstrained).
+    SubmitResult
+    submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config, int8_t worker = -1);
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node.
-    SubmitResult
-    submit_next_level_group(uint64_t callable, const std::vector<TaskArgs> &args_list, const ChipCallConfig &config);
+    // `workers`: per-args affinity (empty = all unconstrained).
+    SubmitResult submit_next_level_group(
+        uint64_t callable, const std::vector<TaskArgs> &args_list, const ChipCallConfig &config,
+        const std::vector<int8_t> &workers = {}
+    );
 
     // Submit a SUB task by registered callable id.
     SubmitResult submit_sub(int32_t callable_id, const TaskArgs &args);
@@ -129,6 +144,7 @@ private:
     TensorMap *tensormap_ = nullptr;
     Ring *allocator_ = nullptr;
     Scope *scope_ = nullptr;
+    WorkerManager *manager_ = nullptr;
     // Strict-4 per-worker-type ready queues. Each queue handles tasks of
     // exactly one WorkerType so the Scheduler can dispatch from an idle pool
     // without being blocked by another pool's saturation.
@@ -156,7 +172,7 @@ private:
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
     SubmitResult submit_impl(
         WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const ChipCallConfig &config,
-        std::vector<TaskArgs> args_list
+        std::vector<TaskArgs> args_list, std::vector<int8_t> affinities = {}
     );
 
     // Size, in aligned bytes, an OUTPUT tensor should occupy in the HeapRing.
@@ -172,9 +188,10 @@ private:
     // Walk the tags of each TaskArgs in `args_list`, accumulating producer
     // slots (for INPUT/INOUT tags) and registering outputs in the tensormap
     // (for OUTPUT/INOUT/OUTPUT_EXISTING tags). NO_DEP tags are skipped.
+    // `affinities` maps args_list[i] → worker id for TensorKey construction.
     void infer_deps(
-        TaskSlot slot, const std::vector<TaskArgs> &args_list, std::vector<TaskSlot> &producers,
-        std::vector<uint64_t> &output_keys
+        TaskSlot slot, const std::vector<TaskArgs> &args_list, const std::vector<int8_t> &affinities,
+        std::vector<TaskSlot> &producers, std::vector<TensorKey> &output_keys
     );
 
     // Release one fanout reference on 'slot'.

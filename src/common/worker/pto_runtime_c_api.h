@@ -17,7 +17,8 @@
  *
  * Public API — resolved by ChipWorker via dlsym:
  *   create_device_context, destroy_device_context,
- *   get_runtime_size, set_device, run_runtime, finalize_device
+ *   get_runtime_size, set_device, run_runtime, finalize_device,
+ *   device_malloc_ctx, device_free_ctx, copy_to_device_ctx, copy_from_device_ctx
  *
  * Memory management: caller allocates a buffer of get_runtime_size() bytes
  * and passes it to run_runtime(). Error codes: 0 = success, negative = error.
@@ -58,6 +59,18 @@ size_t get_runtime_size(void);
 
 /** Set the target device. Must be called before the first run_runtime(). */
 int set_device(DeviceContextHandle ctx, int device_id);
+
+/** Allocate device memory in the given device context. */
+void *device_malloc_ctx(DeviceContextHandle ctx, size_t size);
+
+/** Free device memory previously allocated in the given device context. */
+void device_free_ctx(DeviceContextHandle ctx, void *dev_ptr);
+
+/** Copy host memory to a device pointer within the given device context. */
+int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size);
+
+/** Copy device memory to a host pointer within the given device context. */
+int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size);
 
 /**
  * Build the task graph, execute on device, copy results back, and clean up.

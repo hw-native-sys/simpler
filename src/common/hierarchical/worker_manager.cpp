@@ -11,8 +11,10 @@
 
 #include "worker_manager.h"
 
+#include <cstring>
 #include <stdexcept>
 
+#include "../worker/chip_worker.h"
 #include "ring.h"
 
 // =============================================================================
@@ -238,6 +240,101 @@ std::vector<WorkerThread *> WorkerManager::pick_n_idle(WorkerType type, int n) c
         }
     }
     return result;
+}
+
+WorkerThread *WorkerManager::get_worker(WorkerType type, int logical_id) const {
+    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
+    if (logical_id < 0 || static_cast<size_t>(logical_id) >= threads.size()) return nullptr;
+    return threads[static_cast<size_t>(logical_id)].get();
+}
+
+WorkerThread *WorkerManager::pick_idle_excluding(WorkerType type, const std::vector<WorkerThread *> &exclude) const {
+    auto &threads = (type == WorkerType::NEXT_LEVEL) ? next_level_threads_ : sub_threads_;
+    for (auto &wt : threads) {
+        if (!wt->idle()) continue;
+        bool excluded = false;
+        for (auto *ex : exclude) {
+            if (ex == wt.get()) {
+                excluded = true;
+                break;
+            }
+        }
+        if (!excluded) return wt.get();
+    }
+    return nullptr;
+}
+
+// =============================================================================
+// WorkerThread — memory control (orch thread, concurrent with worker thread)
+// =============================================================================
+
+static void write_control_args(char *mbox, uint64_t sub_cmd, uint64_t a0 = 0, uint64_t a1 = 0, uint64_t a2 = 0) {
+    std::memcpy(mbox + MAILBOX_OFF_CALLABLE, &sub_cmd, sizeof(uint64_t));
+    std::memcpy(mbox + CTRL_OFF_ARG0, &a0, sizeof(uint64_t));
+    std::memcpy(mbox + CTRL_OFF_ARG1, &a1, sizeof(uint64_t));
+    std::memcpy(mbox + CTRL_OFF_ARG2, &a2, sizeof(uint64_t));
+}
+
+static uint64_t read_control_result(const char *mbox) {
+    uint64_t r;
+    std::memcpy(&r, mbox + CTRL_OFF_RESULT, sizeof(uint64_t));
+    return r;
+}
+
+uint64_t WorkerThread::control_malloc(size_t size) {
+    if (mode_ == Mode::THREAD) {
+        auto *cw = dynamic_cast<ChipWorker *>(worker_);
+        if (!cw) throw std::runtime_error("control_malloc: worker is not a ChipWorker");
+        return cw->malloc(size);
+    }
+    write_control_args(mbox(), CTRL_MALLOC, static_cast<uint64_t>(size));
+    write_mailbox_state(MailboxState::CONTROL_REQUEST);
+    while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
+    int32_t err;
+    std::memcpy(&err, mbox() + MAILBOX_OFF_ERROR, sizeof(int32_t));
+    if (err != 0) throw std::runtime_error("control_malloc failed on child");
+    uint64_t result = read_control_result(mbox());
+    write_mailbox_state(MailboxState::IDLE);
+    return result;
+}
+
+void WorkerThread::control_free(uint64_t ptr) {
+    if (mode_ == Mode::THREAD) {
+        auto *cw = dynamic_cast<ChipWorker *>(worker_);
+        if (!cw) throw std::runtime_error("control_free: worker is not a ChipWorker");
+        cw->free(ptr);
+        return;
+    }
+    write_control_args(mbox(), CTRL_FREE, ptr);
+    write_mailbox_state(MailboxState::CONTROL_REQUEST);
+    while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
+    write_mailbox_state(MailboxState::IDLE);
+}
+
+void WorkerThread::control_copy_to(uint64_t dst, uint64_t src, size_t size) {
+    if (mode_ == Mode::THREAD) {
+        auto *cw = dynamic_cast<ChipWorker *>(worker_);
+        if (!cw) throw std::runtime_error("control_copy_to: worker is not a ChipWorker");
+        cw->copy_to(dst, src, size);
+        return;
+    }
+    write_control_args(mbox(), CTRL_COPY_TO, dst, src, static_cast<uint64_t>(size));
+    write_mailbox_state(MailboxState::CONTROL_REQUEST);
+    while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
+    write_mailbox_state(MailboxState::IDLE);
+}
+
+void WorkerThread::control_copy_from(uint64_t dst, uint64_t src, size_t size) {
+    if (mode_ == Mode::THREAD) {
+        auto *cw = dynamic_cast<ChipWorker *>(worker_);
+        if (!cw) throw std::runtime_error("control_copy_from: worker is not a ChipWorker");
+        cw->copy_from(dst, src, size);
+        return;
+    }
+    write_control_args(mbox(), CTRL_COPY_FROM, dst, src, static_cast<uint64_t>(size));
+    write_mailbox_state(MailboxState::CONTROL_REQUEST);
+    while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
+    write_mailbox_state(MailboxState::IDLE);
 }
 
 bool WorkerManager::any_busy() const {

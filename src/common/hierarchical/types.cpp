@@ -34,6 +34,7 @@ void TaskSlotState::reset() {
     task_args.clear();
     task_args_list.clear();
     is_group_ = false;
+    affinities.clear();
     // ring_idx / ring_slot_idx are deliberately NOT cleared here: Ring
     // stamps them at alloc() before the Orchestrator ever calls reset(),
     // and Ring::release() needs to read them for the FIFO advance. The

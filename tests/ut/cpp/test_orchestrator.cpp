@@ -102,7 +102,7 @@ TEST_F(OrchestratorFixture, TensorMapTracksProducer) {
     TaskSlot drain_slot;
     rq.try_pop(drain_slot);
 
-    EXPECT_EQ(tm.lookup(0x1234), a.task_slot);
+    EXPECT_EQ(tm.lookup(TensorKey{0x1234, -1}), a.task_slot);
 }
 
 TEST_F(OrchestratorFixture, OnConsumedCleansUpTensorMap) {
@@ -111,12 +111,12 @@ TEST_F(OrchestratorFixture, OnConsumedCleansUpTensorMap) {
     TaskSlot slot;
     rq.try_pop(slot);
 
-    EXPECT_EQ(tm.lookup(0x42), slot);
+    EXPECT_EQ(tm.lookup(TensorKey{0x42, -1}), slot);
 
     S(slot).state.store(TaskState::COMPLETED, std::memory_order_relaxed);
     orch.on_consumed(slot);
 
-    EXPECT_EQ(tm.lookup(0x42), INVALID_SLOT);
+    EXPECT_EQ(tm.lookup(TensorKey{0x42, -1}), INVALID_SLOT);
     EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
 }
 
@@ -173,8 +173,8 @@ TEST_F(OrchestratorFixture, GroupTaskStoresArgsListPerMember) {
     EXPECT_EQ(S(res.task_slot).args_view(1).tensors[0].data, 0xA1u);
 
     // Both keys registered as producers for the group slot.
-    EXPECT_EQ(tm.lookup(0xA0), res.task_slot);
-    EXPECT_EQ(tm.lookup(0xA1), res.task_slot);
+    EXPECT_EQ(tm.lookup(TensorKey{0xA0, -1}), res.task_slot);
+    EXPECT_EQ(tm.lookup(TensorKey{0xA1, -1}), res.task_slot);
 }
 
 TEST_F(OrchestratorFixture, SingleTaskStoresTaskArgsDirectly) {
@@ -210,7 +210,7 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
     EXPECT_LT(data, base + allocator.heap_size(0));
     EXPECT_EQ(data % HEAP_ALIGN, 0u);
 
-    EXPECT_EQ(tm.lookup(data), res.task_slot);
+    EXPECT_EQ(tm.lookup(TensorKey{data, -1}), res.task_slot);
 }
 
 TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {
@@ -233,7 +233,7 @@ TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {
     rq.try_pop(writer_slot);
 
     // TensorMap now points at the new writer.
-    EXPECT_EQ(tm.lookup(0xFEED), writer.task_slot);
+    EXPECT_EQ(tm.lookup(TensorKey{0xFEED, -1}), writer.task_slot);
     // Writer has the creator recorded as a fanin producer (via INOUT
     // lookup) but no *live* fanin since the creator is already COMPLETED.
     EXPECT_EQ(S(writer.task_slot).fanin_count, 0);
@@ -267,7 +267,7 @@ TEST_F(OrchestratorFixture, OutputAndOutputExistingAreInsertOnly) {
         auto writer_args = single_tensor_args(c.key, c.tag);
         auto writer = orch.submit_next_level(0xDEAD, writer_args, cfg);
 
-        EXPECT_EQ(tm.lookup(c.key), writer.task_slot);
+        EXPECT_EQ(tm.lookup(TensorKey{c.key, -1}), writer.task_slot);
         EXPECT_EQ(S(writer.task_slot).fanin_count, 0);
         EXPECT_TRUE(S(writer.task_slot).fanin_producers.empty()) << "tag=" << static_cast<int>(c.tag);
         {

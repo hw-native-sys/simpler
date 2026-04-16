@@ -30,6 +30,7 @@
 #define PLATFORM_MEMORY_ALLOCATOR_H_
 
 #include <cstddef>
+#include <mutex>
 #include <set>
 
 /**
@@ -95,9 +96,13 @@ public:
      *
      * @return Number of currently tracked pointers
      */
-    size_t get_allocation_count() const { return ptr_set_.size(); }
+    size_t get_allocation_count() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return ptr_set_.size();
+    }
 
 private:
+    mutable std::mutex mu_;
     std::set<void *> ptr_set_;
 };
 

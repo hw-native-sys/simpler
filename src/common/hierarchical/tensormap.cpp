@@ -11,16 +11,16 @@
 
 #include "tensormap.h"
 
-TaskSlot TensorMap::lookup(uint64_t base_ptr) const {
-    auto it = map_.find(base_ptr);
+TaskSlot TensorMap::lookup(TensorKey key) const {
+    auto it = map_.find(key);
     if (it == map_.end()) return INVALID_SLOT;
     return it->second;
 }
 
-void TensorMap::insert(uint64_t base_ptr, TaskSlot producer) { map_[base_ptr] = producer; }
+void TensorMap::insert(TensorKey key, TaskSlot producer) { map_[key] = producer; }
 
-void TensorMap::erase_task_outputs(const std::vector<uint64_t> &keys) {
-    for (uint64_t key : keys)
+void TensorMap::erase_task_outputs(const std::vector<TensorKey> &keys) {
+    for (const auto &key : keys)
         map_.erase(key);
 }
 

@@ -62,19 +62,37 @@ enum class MailboxState : int32_t {
     TASK_READY = 1,
     TASK_DONE = 2,
     SHUTDOWN = 3,
+    CONTROL_REQUEST = 4,
+    CONTROL_DONE = 5,
 };
 
 static constexpr size_t MAILBOX_SIZE = 4096;
 
 static constexpr ptrdiff_t MAILBOX_OFF_STATE = 0;
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR = 4;
-static constexpr ptrdiff_t MAILBOX_OFF_CALLABLE = 8;
+static constexpr ptrdiff_t MAILBOX_OFF_CALLABLE = 8;  // also: control sub-command (uint64)
 static constexpr ptrdiff_t MAILBOX_OFF_BLOCK_DIM = 16;
 static constexpr ptrdiff_t MAILBOX_OFF_AICPU_THREAD_NUM = 20;
 static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_PROFILING = 24;
 static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_DUMP_TENSOR = 28;
 static constexpr ptrdiff_t MAILBOX_OFF_ARGS = 64;
 static constexpr size_t MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_ARGS);
+
+// Control sub-commands (written at MAILBOX_OFF_CALLABLE when state == CONTROL_*)
+static constexpr uint64_t CTRL_MALLOC = 0;
+static constexpr uint64_t CTRL_FREE = 1;
+static constexpr uint64_t CTRL_COPY_TO = 2;
+static constexpr uint64_t CTRL_COPY_FROM = 3;
+
+// Control args reuse the task mailbox region (mutually exclusive with task dispatch):
+//   offset 16: uint64 arg0 (size for malloc; ptr for free; dst for copy)
+//   offset 24: uint64 arg1 (src for copy)
+//   offset 32: uint64 arg2 (nbytes for copy)
+//   offset 40: uint64 result (returned ptr from malloc)
+static constexpr ptrdiff_t CTRL_OFF_ARG0 = 16;
+static constexpr ptrdiff_t CTRL_OFF_ARG1 = 24;
+static constexpr ptrdiff_t CTRL_OFF_ARG2 = 32;
+static constexpr ptrdiff_t CTRL_OFF_RESULT = 40;
 
 // =============================================================================
 // WorkerDispatch — per-dispatch handle handed to a WorkerThread.
@@ -133,6 +151,15 @@ public:
     // the Python facade owns the child PID.
     void shutdown_child();
 
+    // Memory control — callable from the orch thread while the worker
+    // thread may be running a task (MemoryAllocator is mutex-protected).
+    // THREAD mode: direct call on the ChipWorker.
+    // PROCESS mode: control command via mailbox (blocks until child responds).
+    uint64_t control_malloc(size_t size);
+    void control_free(uint64_t ptr);
+    void control_copy_to(uint64_t dst, uint64_t src, size_t size);
+    void control_copy_from(uint64_t dst, uint64_t src, size_t size);
+
 private:
     Mode mode_{Mode::THREAD};
     IWorker *worker_{nullptr};
@@ -178,6 +205,13 @@ public:
 
     WorkerThread *pick_idle(WorkerType type) const;
     std::vector<WorkerThread *> pick_n_idle(WorkerType type, int n) const;
+
+    // Direct index into the worker pool by logical id (0-based).
+    WorkerThread *get_worker(WorkerType type, int logical_id) const;
+
+    // Pick one idle worker NOT in `exclude`. Returns nullptr if none available.
+    WorkerThread *pick_idle_excluding(WorkerType type, const std::vector<WorkerThread *> &exclude) const;
+
     bool any_busy() const;
 
     // Write SHUTDOWN to every PROCESS-mode mailbox.

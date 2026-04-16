@@ -621,3 +621,49 @@ class TestChipCallable:
         assert "ChipCallable" in r
         assert "sig_count=2" in r
         assert "child_count=1" in r
+
+
+# ============================================================================
+# ContinuousTensor.child_memory
+# ============================================================================
+
+
+class TestChildMemory:
+    def test_default_is_false(self):
+        t = ContinuousTensor()
+        assert t.child_memory is False
+
+    def test_make_default_is_false(self):
+        t = ContinuousTensor.make(0x1000, (4,), DataType.FLOAT32)
+        assert t.child_memory is False
+
+    def test_make_child_memory_true(self):
+        t = ContinuousTensor.make(0xDEAD, (8,), DataType.FLOAT16, child_memory=True)
+        assert t.child_memory is True
+        assert t.data == 0xDEAD
+        assert t.shapes == (8,)
+        assert t.dtype == DataType.FLOAT16
+
+    def test_set_child_memory(self):
+        t = ContinuousTensor.make(0x1000, (4,), DataType.FLOAT32)
+        assert t.child_memory is False
+        t.child_memory = True
+        assert t.child_memory is True
+
+    def test_repr_shows_child_memory_when_set(self):
+        t = ContinuousTensor.make(0x1000, (4,), DataType.FLOAT32, child_memory=True)
+        r = repr(t)
+        assert "child_memory=True" in r
+
+    def test_repr_hides_child_memory_when_default(self):
+        t = ContinuousTensor.make(0x1000, (4,), DataType.FLOAT32)
+        r = repr(t)
+        assert "child_memory" not in r
+
+    def test_chip_storage_preserves_child_memory(self):
+        args = ChipStorageTaskArgs()
+        t = ContinuousTensor.make(0x2000, (16,), DataType.INT32, child_memory=True)
+        args.add_tensor(t)
+        out = args.tensor(0)
+        assert out.child_memory is True
+        assert out.data == 0x2000

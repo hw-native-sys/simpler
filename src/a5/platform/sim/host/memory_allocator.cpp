@@ -28,7 +28,7 @@ void *MemoryAllocator::alloc(size_t size) {
         return nullptr;
     }
 
-    // Track the pointer
+    std::lock_guard<std::mutex> lk(mu_);
     ptr_set_.insert(ptr);
     return ptr;
 }
@@ -38,29 +38,22 @@ int MemoryAllocator::free(void *ptr) {
         return 0;
     }
 
-    // Check if we're tracking this pointer
+    std::lock_guard<std::mutex> lk(mu_);
     auto it = ptr_set_.find(ptr);
     if (it == ptr_set_.end()) {
-        // Not tracked by us, don't free
         return 0;
     }
 
-    // Free the memory
     std::free(ptr);
-
-    // Remove from tracking set
     ptr_set_.erase(it);
     return 0;
 }
 
 int MemoryAllocator::finalize() {
-    // Free all remaining tracked pointers
+    std::lock_guard<std::mutex> lk(mu_);
     for (void *ptr : ptr_set_) {
         std::free(ptr);
     }
-
-    // Clear the set (empty set makes subsequent finalize() calls a no-op)
     ptr_set_.clear();
-
     return 0;
 }

@@ -42,6 +42,25 @@
 #include "../task_interface/task_args.h"
 
 // =============================================================================
+// TensorKey — compound key for TensorMap dependency tracking
+// =============================================================================
+
+struct TensorKey {
+    uint64_t ptr;
+    int8_t worker;  // -1 = host (globally unique), 0..N-1 = next-level worker logical id
+
+    bool operator==(const TensorKey &o) const { return ptr == o.ptr && worker == o.worker; }
+};
+
+struct TensorKeyHash {
+    size_t operator()(const TensorKey &k) const {
+        size_t h = std::hash<uint64_t>{}(k.ptr);
+        h ^= std::hash<int>{}(k.worker) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+// =============================================================================
 // Constants
 // =============================================================================
 
@@ -108,7 +127,17 @@ struct TaskSlotState {
     std::atomic<int32_t> fanout_released{0};  // incremented as each ref is released
 
     // --- TensorMap keys registered by this task (for cleanup on CONSUMED) ---
-    std::vector<uint64_t> output_keys;
+    std::vector<TensorKey> output_keys;
+
+    // --- Worker affinity (set by submit_next_level with worker= parameter) ---
+    // Empty = unconstrained (any idle worker). Otherwise affinities[i] gives
+    // the logical worker id for args[i] (-1 = unconstrained for that slot).
+    std::vector<int8_t> affinities;
+
+    int8_t get_affinity(int i) const {
+        if (affinities.empty()) return -1;
+        return affinities[static_cast<size_t>(i)];
+    }
 
     // --- Producer tasks this task depends on (for deferred release) ---
     // When this task reaches COMPLETED, the Scheduler releases one fanout ref

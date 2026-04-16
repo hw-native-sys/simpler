@@ -37,6 +37,8 @@ find_library(GTEST_MAIN_LIB gtest_main PATHS ${GTEST_SEARCH_PATHS} REQUIRED)
 # ---------------------------------------------------------------------------
 set(HIERARCHICAL_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/hierarchical)
 
+set(WORKER_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/worker)
+
 set(HIERARCHICAL_SOURCES
     ${HIERARCHICAL_SRC_DIR}/types.cpp
     ${HIERARCHICAL_SRC_DIR}/tensormap.cpp
@@ -46,6 +48,7 @@ set(HIERARCHICAL_SOURCES
     ${HIERARCHICAL_SRC_DIR}/worker_manager.cpp
     ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
     ${HIERARCHICAL_SRC_DIR}/worker.cpp
+    ${WORKER_SRC_DIR}/chip_worker.cpp
 )
 
 # ---------------------------------------------------------------------------
@@ -57,6 +60,7 @@ function(add_hierarchical_test name src)
         ${GTEST_INCLUDE_DIRS}
         ${HIERARCHICAL_SRC_DIR}
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${WORKER_SRC_DIR}
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
     target_link_libraries(${name} PRIVATE
@@ -112,5 +116,21 @@ add_hierarchical_test(test_ring  test_ring.cpp)
 add_hierarchical_test(test_scope      test_scope.cpp)
 add_hierarchical_test(test_orchestrator test_orchestrator.cpp)
 add_hierarchical_test(test_scheduler  test_scheduler.cpp)
+function(add_task_interface_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+    )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+add_task_interface_test(test_child_memory test_child_memory.cpp)
 add_a2a3_pto2_test(test_a2a3_pto2_fatal test_a2a3_pto2_fatal.cpp)
 add_a5_pto2_test(test_a5_pto2_fatal test_a5_pto2_fatal.cpp)

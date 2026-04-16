@@ -190,8 +190,38 @@ void Scheduler::dispatch_ready() {
             TaskSlotState &s = *cfg_.ring->slot_state(slot);
             int N = s.group_size();  // 1 for normal tasks
 
-            auto workers = cfg_.manager->pick_n_idle(s.worker_type, N);
-            if (static_cast<int>(workers.size()) < N) {
+            // Affinity-aware dispatch: pin args[i] to worker affinities[i]
+            // when set, fill remaining slots from the idle pool.
+            std::vector<WorkerThread *> workers(static_cast<size_t>(N), nullptr);
+            bool ok = true;
+
+            // Pass 1: satisfy affinity constraints
+            for (int i = 0; i < N; i++) {
+                int8_t aff = s.get_affinity(i);
+                if (aff >= 0) {
+                    auto *wt = cfg_.manager->get_worker(s.worker_type, aff);
+                    if (!wt || !wt->idle()) {
+                        ok = false;
+                        break;
+                    }
+                    workers[static_cast<size_t>(i)] = wt;
+                }
+            }
+
+            // Pass 2: fill unconstrained slots from idle pool
+            if (ok) {
+                for (int i = 0; i < N; i++) {
+                    if (workers[static_cast<size_t>(i)] != nullptr) continue;
+                    auto *wt = cfg_.manager->pick_idle_excluding(s.worker_type, workers);
+                    if (!wt) {
+                        ok = false;
+                        break;
+                    }
+                    workers[static_cast<size_t>(i)] = wt;
+                }
+            }
+
+            if (!ok) {
                 q->push(slot);
                 break;
             }
@@ -201,7 +231,7 @@ void Scheduler::dispatch_ready() {
                 WorkerDispatch d;
                 d.task_slot = slot;
                 d.group_index = i;
-                workers[i]->dispatch(d);
+                workers[static_cast<size_t>(i)]->dispatch(d);
             }
         }
     };

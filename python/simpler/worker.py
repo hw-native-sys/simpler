@@ -86,6 +86,25 @@ _IDLE = 0
 _TASK_READY = 1
 _TASK_DONE = 2
 _SHUTDOWN = 3
+_CONTROL_REQUEST = 4
+_CONTROL_DONE = 5
+
+# Control sub-commands (written at _OFF_CALLABLE as uint64)
+_CTRL_MALLOC = 0
+_CTRL_FREE = 1
+_CTRL_COPY_TO = 2
+_CTRL_COPY_FROM = 3
+
+# Control args layout (reuses task mailbox fields when state == _CONTROL_*):
+#   offset  8 (_OFF_CALLABLE):  uint64  sub-command
+#   offset 16:                  uint64  arg0 (size for malloc; dev_ptr for free/copy)
+#   offset 24:                  uint64  arg1 (host_ptr for copy)
+#   offset 32:                  uint64  arg2 (nbytes for copy)
+#   offset 40:                  uint64  result (returned ptr from malloc)
+_CTRL_OFF_ARG0 = 16
+_CTRL_OFF_ARG1 = 24
+_CTRL_OFF_ARG2 = 32
+_CTRL_OFF_RESULT = 40
 
 
 def _mailbox_addr(shm: SharedMemory) -> int:
@@ -189,6 +208,31 @@ def _chip_process_loop(
                 error = 1
             struct.pack_into("i", buf, _OFF_ERROR, error)
             struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
+        elif state == _CONTROL_REQUEST:
+            sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+            error = 0
+            try:
+                if sub_cmd == _CTRL_MALLOC:
+                    size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    ptr = cw.malloc(size)
+                    struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
+                elif sub_cmd == _CTRL_FREE:
+                    ptr = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    cw.free(ptr)
+                elif sub_cmd == _CTRL_COPY_TO:
+                    dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                    n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                    cw.copy_to(dst, src, n)
+                elif sub_cmd == _CTRL_COPY_FROM:
+                    dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                    src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                    n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                    cw.copy_from(dst, src, n)
+            except Exception:  # noqa: BLE001
+                error = 1
+            struct.pack_into("i", buf, _OFF_ERROR, error)
+            struct.pack_into("i", buf, _OFF_STATE, _CONTROL_DONE)
         elif state == _SHUTDOWN:
             cw.finalize()
             break
@@ -473,6 +517,62 @@ class Worker:
         dw.init()
 
         self._orch = Orchestrator(dw.get_orchestrator())
+
+    # ------------------------------------------------------------------
+    # memory management
+    # ------------------------------------------------------------------
+
+    def _chip_control(self, worker_id: int, sub_cmd: int, arg0: int = 0, arg1: int = 0, arg2: int = 0) -> int:
+        """Send a control command to chip child *worker_id* via mailbox IPC."""
+        if worker_id < 0 or worker_id >= len(self._chip_shms):
+            raise IndexError(f"worker_id {worker_id} out of range (have {len(self._chip_shms)} chips)")
+        shm = self._chip_shms[worker_id]
+        buf = shm.buf
+        assert buf is not None
+        struct.pack_into("Q", buf, _OFF_CALLABLE, sub_cmd)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG0, arg0)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG1, arg1)
+        struct.pack_into("Q", buf, _CTRL_OFF_ARG2, arg2)
+        struct.pack_into("i", buf, _OFF_STATE, _CONTROL_REQUEST)
+        while struct.unpack_from("i", buf, _OFF_STATE)[0] != _CONTROL_DONE:
+            pass
+        error = struct.unpack_from("i", buf, _OFF_ERROR)[0]
+        if error != 0:
+            raise RuntimeError(f"chip control command {sub_cmd} failed on worker {worker_id}")
+        result = struct.unpack_from("Q", buf, _CTRL_OFF_RESULT)[0]
+        struct.pack_into("i", buf, _OFF_STATE, _IDLE)
+        return result
+
+    def malloc(self, size: int, worker_id: int = 0) -> int:
+        """Allocate memory on next-level worker *worker_id*. Returns a pointer."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            return self._chip_worker.malloc(size)
+        return self._chip_control(worker_id, _CTRL_MALLOC, arg0=size)
+
+    def free(self, ptr: int, worker_id: int = 0) -> None:
+        """Free memory allocated by ``malloc()``."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.free(ptr)
+            return
+        self._chip_control(worker_id, _CTRL_FREE, arg0=ptr)
+
+    def copy_to(self, dst: int, src: int, size: int, worker_id: int = 0) -> None:
+        """Copy *size* bytes from host *src* to worker *dst*."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.copy_to(dst, src, size)
+            return
+        self._chip_control(worker_id, _CTRL_COPY_TO, arg0=dst, arg1=src, arg2=size)
+
+    def copy_from(self, dst: int, src: int, size: int, worker_id: int = 0) -> None:
+        """Copy *size* bytes from worker *src* to host *dst*."""
+        if self.level == 2:
+            assert self._chip_worker is not None
+            self._chip_worker.copy_from(dst, src, size)
+            return
+        self._chip_control(worker_id, _CTRL_COPY_FROM, arg0=dst, arg1=src, arg2=size)
 
     # ------------------------------------------------------------------
     # run — uniform entry point

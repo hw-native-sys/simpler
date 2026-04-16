@@ -134,7 +134,7 @@ void Worker::add_process_worker(WorkerType type, void *mailbox) {
 void Worker::init() {
     if (initialized_) throw std::runtime_error("Worker: already initialized");
 
-    orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_);
+    orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_, &manager_);
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().

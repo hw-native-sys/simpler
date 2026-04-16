@@ -56,6 +56,11 @@ public:
     // the TaskArgsView path and takes a ready-made ChipStorageTaskArgs POD.
     void run(const void *callable, const void *args, const ChipCallConfig &config);
 
+    uint64_t malloc(size_t size);
+    void free(uint64_t ptr);
+    void copy_to(uint64_t dst, uint64_t src, size_t size);
+    void copy_from(uint64_t dst, uint64_t src, size_t size);
+
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
     bool device_set() const { return device_set_; }
@@ -64,6 +69,10 @@ private:
     using CreateDeviceContextFn = void *(*)();
     using DestroyDeviceContextFn = void (*)(void *);
     using SetDeviceFn = int (*)(void *, int);
+    using DeviceMallocCtxFn = void *(*)(void *, size_t);
+    using DeviceFreeCtxFn = void (*)(void *, void *);
+    using CopyToDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
+    using CopyFromDeviceCtxFn = int (*)(void *, void *, const void *, size_t);
     using GetRuntimeSizeFn = size_t (*)();
     using RunRuntimeFn = int (*)(
         void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t,
@@ -75,6 +84,10 @@ private:
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
     DestroyDeviceContextFn destroy_device_context_fn_ = nullptr;
     SetDeviceFn set_device_fn_ = nullptr;
+    DeviceMallocCtxFn device_malloc_ctx_fn_ = nullptr;
+    DeviceFreeCtxFn device_free_ctx_fn_ = nullptr;
+    CopyToDeviceCtxFn copy_to_device_ctx_fn_ = nullptr;
+    CopyFromDeviceCtxFn copy_from_device_ctx_fn_ = nullptr;
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     RunRuntimeFn run_runtime_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;

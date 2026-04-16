@@ -160,6 +160,12 @@ extern "C" int init_runtime_impl(Runtime *runtime, const ChipCallable *callable,
     for (int i = 0; i < tensor_count; i++) {
         ContinuousTensor t = orch_args->tensor(i);
 
+        if (t.is_child_memory()) {
+            LOG_INFO("  Tensor %d: child memory, pass-through (0x%" PRIx64 ")", i, t.data);
+            device_args.add_tensor(t);
+            continue;
+        }
+
         void *host_ptr = reinterpret_cast<void *>(static_cast<uintptr_t>(t.data));
         size_t size = static_cast<size_t>(t.nbytes());
 

@@ -64,20 +64,21 @@ inline void bind_worker(nb::module_ &m) {
     nb::class_<Orchestrator>(m, "_Orchestrator")
         .def(
             "submit_next_level",
-            [](Orchestrator &self, uint64_t callable, const TaskArgs &args, const ChipCallConfig &config) {
-                return self.submit_next_level(callable, args, config);
+            [](Orchestrator &self, uint64_t callable, const TaskArgs &args, const ChipCallConfig &config,
+               int8_t worker) {
+                return self.submit_next_level(callable, args, config, worker);
             },
-            nb::arg("callable"), nb::arg("args"), nb::arg("config"),
-            "Submit a NEXT_LEVEL (chip) task. Tags inside `args` drive dependency inference."
+            nb::arg("callable"), nb::arg("args"), nb::arg("config"), nb::arg("worker") = int8_t(-1),
+            "Submit a NEXT_LEVEL (chip) task. worker= pins to a specific next-level worker (-1 = any)."
         )
         .def(
             "submit_next_level_group",
             [](Orchestrator &self, uint64_t callable, const std::vector<TaskArgs> &args_list,
-               const ChipCallConfig &config) {
-                return self.submit_next_level_group(callable, args_list, config);
+               const ChipCallConfig &config, const std::vector<int8_t> &workers) {
+                return self.submit_next_level_group(callable, args_list, config, workers);
             },
-            nb::arg("callable"), nb::arg("args_list"), nb::arg("config"),
-            "Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node."
+            nb::arg("callable"), nb::arg("args_list"), nb::arg("config"), nb::arg("workers") = std::vector<int8_t>{},
+            "Submit a group of NEXT_LEVEL tasks. workers= per-args affinity (empty = any)."
         )
         .def(
             "submit_sub",
@@ -94,6 +95,34 @@ inline void bind_worker(nb::module_ &m) {
             },
             nb::arg("callable_id"), nb::arg("args_list"),
             "Submit a group of SUB tasks: N args -> N workers, 1 DAG node."
+        )
+        .def(
+            "malloc",
+            [](Orchestrator &self, int worker_id, size_t size) {
+                return self.malloc(worker_id, size);
+            },
+            nb::arg("worker_id"), nb::arg("size"), "Allocate memory on next-level worker."
+        )
+        .def(
+            "free",
+            [](Orchestrator &self, int worker_id, uint64_t ptr) {
+                self.free(worker_id, ptr);
+            },
+            nb::arg("worker_id"), nb::arg("ptr"), "Free memory on next-level worker."
+        )
+        .def(
+            "copy_to",
+            [](Orchestrator &self, int worker_id, uint64_t dst, uint64_t src, size_t size) {
+                self.copy_to(worker_id, dst, src, size);
+            },
+            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("size"), "Copy host src to worker dst."
+        )
+        .def(
+            "copy_from",
+            [](Orchestrator &self, int worker_id, uint64_t dst, uint64_t src, size_t size) {
+                self.copy_from(worker_id, dst, src, size);
+            },
+            nb::arg("worker_id"), nb::arg("dst"), nb::arg("src"), nb::arg("size"), "Copy worker src to host dst."
         )
         .def(
             "alloc",

@@ -31,7 +31,7 @@ void *MemoryAllocator::alloc(size_t size) {
         return nullptr;
     }
 
-    // Track the pointer
+    std::lock_guard<std::mutex> lk(mu_);
     ptr_set_.insert(ptr);
     return ptr;
 }
@@ -41,29 +41,25 @@ int MemoryAllocator::free(void *ptr) {
         return 0;
     }
 
-    // Check if we're tracking this pointer
+    std::lock_guard<std::mutex> lk(mu_);
     auto it = ptr_set_.find(ptr);
     if (it == ptr_set_.end()) {
-        // Not tracked by us, don't free
         return 0;
     }
 
-    // Free the memory
     int rc = rtFree(ptr);
     if (rc != 0) {
         LOG_ERROR("rtFree failed: %d", rc);
         return rc;
     }
 
-    // Remove from tracking set
     ptr_set_.erase(it);
     return 0;
 }
 
 int MemoryAllocator::finalize() {
+    std::lock_guard<std::mutex> lk(mu_);
     int last_error = 0;
-
-    // Free all remaining tracked pointers
     for (void *ptr : ptr_set_) {
         int rc = rtFree(ptr);
         if (rc != 0) {
@@ -71,9 +67,6 @@ int MemoryAllocator::finalize() {
             last_error = rc;
         }
     }
-
-    // Clear the set (empty set makes subsequent finalize() calls a no-op)
     ptr_set_.clear();
-
     return last_error;
 }
