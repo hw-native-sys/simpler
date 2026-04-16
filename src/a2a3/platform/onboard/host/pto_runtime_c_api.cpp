@@ -77,7 +77,7 @@ int ensure_host_api_device_ready(DeviceContextHandle ctx, int device_id) {
         return -1;
     }
     try {
-        return static_cast<DeviceRunner *>(ctx)->ensure_device_set(device_id);
+        return static_cast<DeviceRunner *>(ctx)->attach_current_thread(device_id);
     } catch (...) {
         return -1;
     }
@@ -212,7 +212,7 @@ size_t get_runtime_size(void) { return sizeof(Runtime); }
 int set_device(DeviceContextHandle ctx, int device_id) {
     if (ctx == NULL) return -1;
     try {
-        return static_cast<DeviceRunner *>(ctx)->ensure_device_set(device_id);
+        return static_cast<DeviceRunner *>(ctx)->attach_current_thread(device_id);
     } catch (...) {
         return -1;
     }
@@ -286,7 +286,7 @@ int host_register_mapped(DeviceContextHandle ctx, void *host_ptr, size_t size, i
 
     int rc = ensure_host_api_device_ready(ctx, device_id);
     if (rc != 0) {
-        LOG_ERROR("host_register_mapped: ensure_device_set(%d) failed: rc=%d", device_id, rc);
+        LOG_ERROR("host_register_mapped: attach_current_thread(%d) failed: rc=%d", device_id, rc);
         return rc;
     }
 
@@ -332,7 +332,7 @@ int host_unregister_mapped(DeviceContextHandle ctx, void *host_ptr, int device_i
 
     int rc = ensure_host_api_device_ready(ctx, device_id);
     if (rc != 0) {
-        LOG_ERROR("host_unregister_mapped: ensure_device_set(%d) failed: rc=%d", device_id, rc);
+        LOG_ERROR("host_unregister_mapped: attach_current_thread(%d) failed: rc=%d", device_id, rc);
         return rc;
     }
 

@@ -201,7 +201,7 @@ size_t get_runtime_size(void) { return sizeof(Runtime); }
 int set_device(DeviceContextHandle ctx, int device_id) {
     if (ctx == NULL) return -1;
     try {
-        return static_cast<DeviceRunner *>(ctx)->ensure_device_set(device_id);
+        return static_cast<DeviceRunner *>(ctx)->attach_current_thread(device_id);
     } catch (...) {
         return -1;
     }
