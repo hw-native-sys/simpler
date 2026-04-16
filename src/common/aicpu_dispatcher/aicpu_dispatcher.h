@@ -16,9 +16,12 @@
  * - Inner layer (runtime-specific SO) can be different for each runtime
  *
  * Architecture:
- * 1. DynTileFwkKernelServerNull - Load phase: receives inner SO binary, saves to AICPU filesystem
+ * 1. DynTileFwkKernelServerNull - Null phase: receives inner SO binary, saves to AICPU filesystem
  * 2. DynTileFwkKernelServerInit - Init phase: delegates to inner SO's initialization
  * 3. DynTileFwkKernelServer - Run phase: delegates to inner SO's execution
+ *
+ * IMPORTANT: In cpuKernelMode=1, Null phase is SKIPPED - scheduler handles SO loading automatically.
+ * Init phase handles SO loading internally via memfd_create.
  *
  * This allows different runtimes (tensormap, ringbuffer, etc.) to load their own
  * AICPU kernel implementations at runtime without recompiling the dispatcher.
@@ -92,6 +95,13 @@ public:
      * @return Return value from the function, or error code
      */
     int ExecuteFunc(void* args, const uint64_t funcKey);
+
+    /**
+     * @brief Get the inner SO file path
+     *
+     * @return Path to the saved inner SO file
+     */
+    const std::string& GetInnerSoName() const { return innerSoName_; }
 
 private:
     /**

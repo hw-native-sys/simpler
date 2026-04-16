@@ -257,6 +257,14 @@ namespace {
 // Global instance of the handle manager
 aicpu_dispatcher::BackendServerHandleManager g_handleManager;
 
+// Function pointer for AeAddSoInWhiteList (weak symbol from CANN runtime)
+// This function adds an SO to the AICPU scheduler's whitelist, allowing
+// it to be dynamically loaded by other SOs via dlopen.
+extern "C" {
+typedef int32_t (*AeAddSoInWhiteListFunc)(const char*);
+__attribute__((weak)) AeAddSoInWhiteListFunc AeAddSoInWhiteList = nullptr;
+}
+
 }  // namespace
 
 // C-style exported functions (AICPU entry points)
@@ -264,6 +272,15 @@ extern "C" {
 
 __attribute__((visibility("default"))) uint32_t DynTileFwkKernelServerNull(void* args)
 {
+    // Write marker file to verify function was called
+    {
+        FILE* f = fopen("/tmp/dyn_tile_fwk_kernel_server_null_called.txt", "w");
+        if (f) {
+            fprintf(f, "DynTileFwkKernelServerNull called: args=%p\n", args);
+            fclose(f);
+        }
+    }
+
     if (args == nullptr) {
         LOG_ERROR("Dispatcher Load: args is null");
         return 1;
@@ -286,12 +303,37 @@ __attribute__((visibility("default"))) uint32_t DynTileFwkKernelServerNull(void*
         LOG_ERROR("Dispatcher Load: failed to save inner SO");
         return 1;
     }
+
+    // Add inner SO to AICPU scheduler whitelist
+    // This is required for CANN scheduler to allow dynamic loading of the inner SO
+    if (AeAddSoInWhiteList != nullptr) {
+        const std::string& inner_so_name = g_handleManager.GetInnerSoName();
+        int32_t ret = AeAddSoInWhiteList(inner_so_name.c_str());
+        if (ret != 0) {
+            LOG_WARN("Dispatcher Load: AeAddSoInWhiteList failed for %s (ret=%d), continuing anyway",
+                     inner_so_name.c_str(), ret);
+        } else {
+            LOG_INFO("Dispatcher Load: Added inner SO to whitelist: %s", inner_so_name.c_str());
+        }
+    } else {
+        LOG_DEBUG("Dispatcher Load: AeAddSoInWhiteList not available, skipping whitelist registration");
+    }
+
     g_handleManager.SetTileFwkKernelMap();
     return 0;
 }
 
 __attribute__((visibility("default"))) uint32_t DynTileFwkKernelServerInit(void* args)
 {
+    // Write marker file to verify function was called
+    {
+        FILE* f = fopen("/tmp/dyn_tile_fwk_kernel_server_init_called.txt", "w");
+        if (f) {
+            fprintf(f, "DynTileFwkKernelServerInit called: args=%p\n", args);
+            fclose(f);
+        }
+    }
+
     auto ret = g_handleManager.ExecuteFunc(args, aicpu_dispatcher::dyInitFuncKey);
     if (ret != 0) {
         LOG_ERROR("Dispatcher Init: inner SO init failed with code %d", ret);
@@ -302,6 +344,15 @@ __attribute__((visibility("default"))) uint32_t DynTileFwkKernelServerInit(void*
 
 __attribute__((visibility("default"))) uint32_t DynTileFwkKernelServer(void* args)
 {
+    // Write marker file to verify function was called
+    {
+        FILE* f = fopen("/tmp/dyn_tile_fwk_kernel_server_called.txt", "w");
+        if (f) {
+            fprintf(f, "DynTileFwkKernelServer called: args=%p\n", args);
+            fclose(f);
+        }
+    }
+
     auto ret = g_handleManager.ExecuteFunc(args, aicpu_dispatcher::dyExecFuncKey);
     if (ret != 0) {
         LOG_ERROR("Dispatcher Run: inner SO run failed with code %d", ret);

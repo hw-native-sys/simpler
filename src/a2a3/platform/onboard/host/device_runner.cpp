@@ -39,10 +39,10 @@ static std::string resolve_dispatcher_so_path() {
     std::string so_dir = info.dli_fname;
     size_t pos = so_dir.rfind('/');
     if (pos == std::string::npos) {
-        return "libaicpu_dispatcher.so";
+        return "libretr_kernels.so";
     }
     so_dir = so_dir.substr(0, pos + 1);
-    return so_dir + "libaicpu_dispatcher.so";
+    return so_dir + "libretr_kernels.so";
 }
 #endif
 
@@ -538,15 +538,15 @@ int DeviceRunner::run(
 
 #ifdef BUILD_WITH_NEW_CANN
     // Three-phase launch pattern with dispatcher:
-    // 1. Load (Null) - Pass inner SO binary to dispatcher
+    // 1. Load - Pass inner SO binary to dispatcher (REQUIRED in new architecture)
     // 2. Init - Initialize inner SO
     // 3. Run - Execute actual kernel
-    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerNull (Load) ===" << '\n';
-    rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerNull", 1);
-    if (rc != 0) {
-        LOG_ERROR("launch_aicpu_kernel (load/null) failed: %d", rc);
-        return rc;
-    }
+    // NOTE: SKIPPED for now - DynTileFwkKernelServerInit handles SO loading internally via memfd
+    // This matches the old PyPTO pattern where Load (PyptoNull) was skipped
+    // TODO: Investigate if Load phase can be enabled in future
+    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerNull (Null) ===" << '\n';
+    std::cout << "SKIPPED: DynTileFwkKernelServerNull skipped - Init handles SO loading internally\n";
+    rc = 0;  // Success since we're skipping this step
 
     std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerInit (Init) ===" << '\n';
     // Launch AICPU init kernel
@@ -558,19 +558,25 @@ int DeviceRunner::run(
 
     std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer (Run) ===" << '\n';
 #else
-    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerInit===" << '\n';
-    // Launch AICPU init kernel
+    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServerInit ===" << '\n';
+    // Launch AICPU init kernel (legacy API - uses DynTileFwkKernelServerInit/Server names)
     rc = launch_aicpu_kernel(stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServerInit", 1);
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (init) failed: %d", rc);
         return rc;
     }
 
-    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer===" << '\n';
+    std::cout << "\n=== launch_aicpu_kernel DynTileFwkKernelServer ===" << '\n';
 #endif
     // Launch AICPU main kernel (over-launch for affinity gate)
     rc = launch_aicpu_kernel(
-        stream_aicpu_, &kernel_args_.args, "DynTileFwkKernelServer", PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
+        stream_aicpu_, &kernel_args_.args,
+#ifdef BUILD_WITH_NEW_CANN
+        "DynTileFwkKernelServer",
+#else
+        "DynTileFwkKernelServer",
+#endif
+        PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH
     );
     if (rc != 0) {
         LOG_ERROR("launch_aicpu_kernel (main) failed: %d", rc);

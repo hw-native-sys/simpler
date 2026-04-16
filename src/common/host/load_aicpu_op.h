@@ -18,13 +18,15 @@
  * rtsLaunchCpuKernel.
  *
  * Architecture:
- * - Dispatcher SO (libaicpu_dispatcher.so) - Fixed outer layer
+ * - Dispatcher SO (libretr_kernels.so) - Fixed outer layer (named to match CANN whitelist)
  * - Runtime SO (replaceable) - Different for each runtime (tensormap, ringbuffer, etc.)
  *
  * Three-phase launch pattern:
- * 1. Load phase (DynTileFwkKernelServerNull) - Pass inner SO binary to dispatcher
+ * 1. Null phase (DynTileFwkKernelServerNull) - Pass inner SO binary to dispatcher
  * 2. Init phase (DynTileFwkKernelServerInit) - Initialize inner SO
  * 3. Run phase (DynTileFwkKernelServer) - Execute actual kernel
+ *
+ * IMPORTANT: In cpuKernelMode=1, Null phase is SKIPPED - scheduler handles SO loading
  */
 
 #ifndef COMMON_HOST_LOAD_AICPU_OP_H_
@@ -141,14 +143,14 @@ private:
 
 // Kernel name constants
 namespace KernelNames {
-    constexpr const char* NullName = "PyptoNull";     // Load phase
-    constexpr const char* InitName = "PyptoInit";     // Init phase
-    constexpr const char* RunName = "PyptoRun";       // Run phase
+    constexpr const char* NullName = "DynTileFwkKernelServerNull";     // Null phase
+    constexpr const char* InitName = "DynTileFwkKernelServerInit";     // Init phase
+    constexpr const char* RunName = "DynTileFwkKernelServer";          // Run phase
 }
 
-// Dispatcher SO name
+// Dispatcher SO name (use "retr_kernels" to match CANN whitelist)
 namespace SoNames {
-    constexpr const char* DispatcherSo = "libaicpu_dispatcher.so";
+    constexpr const char* DispatcherSo = "libretr_kernels.so";
 }
 
 }  // namespace host

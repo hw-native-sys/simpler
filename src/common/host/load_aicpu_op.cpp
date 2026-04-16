@@ -99,7 +99,7 @@ bool LoadAicpuOp::GenerateAicpuOpJson(const std::string& json_path, const std::s
 int LoadAicpuOp::Init(const std::string& dispatcher_so_path)
 {
     // Generate JSON in the same directory as the SO, with the same basename
-    // e.g. /path/libaicpu_dispatcher.so -> /path/libaicpu_dispatcher.json
+    // e.g. /path/libretr_kernels.so -> /path/libretr_kernels.json
     // cpuKernelMode=1 derives the SO path by replacing .json with .so
     std::string so_dir;
     size_t last_slash = dispatcher_so_path.rfind('/');
@@ -168,6 +168,8 @@ int LoadAicpuOp::AicpuKernelLaunch(
 ) {
     (void)kernel_name;
 
+    LOG_INFO("LoadAicpuOp::AicpuKernelLaunch: func_handle=%p, aicpu_num=%d", func_handle, aicpu_num);
+
     rtCpuKernelArgs_t cpu_args = {};
     cpu_args.baseArgs.args = k_args;
     cpu_args.baseArgs.argsSize = sizeof(KernelArgs);
@@ -176,7 +178,10 @@ int LoadAicpuOp::AicpuKernelLaunch(
     auto launchKernelAttr = std::make_unique<rtLaunchKernelAttr_t>();
     kernelLaunchCfg.attrs = launchKernelAttr.get();
 
+    LOG_INFO("LoadAicpuOp::AicpuKernelLaunch: calling rtsLaunchCpuKernel...");
     rtError_t rc = rtsLaunchCpuKernel(func_handle, static_cast<uint32_t>(aicpu_num), stream, &kernelLaunchCfg, &cpu_args);
+    LOG_INFO("LoadAicpuOp::AicpuKernelLaunch: rtsLaunchCpuKernel returned %d", rc);
+
     if (rc != RT_ERROR_NONE) {
         LOG_ERROR("rtsLaunchCpuKernel failed: %d", rc);
         return rc;
@@ -188,6 +193,8 @@ int LoadAicpuOp::AicpuKernelLaunch(
 int LoadAicpuOp::LaunchBuiltInOp(
     rtStream_t stream, KernelArgs* k_args, int aicpu_num, const std::string& func_name, const std::string& kernel_name
 ) {
+    LOG_INFO("LoadAicpuOp::LaunchBuiltInOp: func_name=%s, kernel_name=%s, aicpu_num=%d", func_name.c_str(), kernel_name.c_str(), aicpu_num);
+
     auto it = func_handles_.find(func_name);
     if (it == func_handles_.end()) {
         LOG_ERROR("Function not found: %s", func_name.c_str());
@@ -195,7 +202,12 @@ int LoadAicpuOp::LaunchBuiltInOp(
     }
 
     rtFuncHandle func_handle = it->second;
-    return AicpuKernelLaunch(func_handle, stream, k_args, aicpu_num, kernel_name);
+    LOG_INFO("LoadAicpuOp::LaunchBuiltInOp: calling AicpuKernelLaunch with func_handle=%p", func_handle);
+
+    int rc = AicpuKernelLaunch(func_handle, stream, k_args, aicpu_num, kernel_name);
+    LOG_INFO("LoadAicpuOp::LaunchBuiltInOp: AicpuKernelLaunch returned %d", rc);
+
+    return rc;
 }
 
 }  // namespace host

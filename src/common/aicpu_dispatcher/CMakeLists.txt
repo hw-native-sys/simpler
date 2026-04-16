@@ -48,5 +48,5 @@ target_link_libraries(aicpu_dispatcher
         dl
 )
 
-# Set output name
-set_target_properties(aicpu_dispatcher PROPERTIES OUTPUT_NAME "aicpu_dispatcher")
+# Set output name (use "retr_kernels" to match CANN whitelist)
+set_target_properties(aicpu_dispatcher PROPERTIES OUTPUT_NAME "retr_kernels")

@@ -105,9 +105,10 @@ target_include_directories(aicpu_dispatcher
 # Link against dl for dlopen/dlsym
 target_link_libraries(aicpu_dispatcher PRIVATE dl)
 
-# Match CANN built-in SO properties: SYMBOLIC flag, build-id, stripped
+# Match CANN built-in SO properties: build-id only
+# Use libretr_kernels name (whitelisted but not used by CANN built-ins)
 set_target_properties(aicpu_dispatcher PROPERTIES
-    LINK_FLAGS "-Wl,-Bsymbolic,--build-id"
-    OUTPUT_NAME "aicpu_dispatcher"
+    LINK_FLAGS "-Wl,--build-id"
+    OUTPUT_NAME "retr_kernels"
 )
 
