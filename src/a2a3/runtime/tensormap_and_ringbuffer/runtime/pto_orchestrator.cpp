@@ -618,6 +618,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, task_id.raw);
 
     // === STEP 3: Lookup inputs + materialize runtime-created outputs ===
+    uint32_t cached_hashes[MAX_TENSOR_ARGS] = {};
     for (int i = 0; i < args.tensor_count(); i++) {
         TensorArgType ptype = args.tag(i);
         if (ptype == TensorArgType::OUTPUT) {
@@ -648,7 +649,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         }
 
         PTO2LookupResult lookup_result;
-        orch->tensor_map.lookup(*tensor, lookup_result);
+        orch->tensor_map.lookup(*tensor, lookup_result, cached_hashes[i]);
 
         for (int r = 0; r < lookup_result.count; r++) {
             PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
@@ -675,7 +676,12 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
             TensorArgType ptype = args.tag(i);
             if (ptype == TensorArgType::INOUT || ptype == TensorArgType::OUTPUT_EXISTING) {
                 if (!args.tensor(i).ptr->manual_dep) {
-                    orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
+                    if (ptype == TensorArgType::INOUT) {
+                        // Reuse hash cached during lookup (STEP 3)
+                        orch->tensor_map.insert(*args.tensor(i).ptr, task_id, cached_hashes[i]);
+                    } else {
+                        orch->tensor_map.insert(*args.tensor(i).ptr, task_id);
+                    }
                 }
             }
         }

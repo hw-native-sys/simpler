@@ -305,7 +305,17 @@ struct PTO2TensorMap {
      * @param result  Output: stack-allocated result buffer
      */
     void lookup(const Tensor &tensor, PTO2LookupResult &result) {
+        uint32_t unused;
+        lookup(tensor, result, unused);
+    }
+
+    /**
+     * Lookup with hash output — returns the computed bucket index for reuse
+     * in a subsequent insert() call on the same tensor address.
+     */
+    void lookup(const Tensor &tensor, PTO2LookupResult &result, uint32_t &out_hash) {
         uint32_t bucket_index = hash(tensor.buffer.addr);
+        out_hash = bucket_index;
         PTO2TensorMapEntry *cur_entry = buckets[bucket_index];
 
         result.count = 0;
@@ -316,6 +326,9 @@ struct PTO2TensorMap {
 
         while (cur_entry != nullptr) {
             PTO2TensorMapEntry *next_entry = cur_entry->next_in_bucket;
+            if (next_entry != nullptr) {
+                __builtin_prefetch(next_entry, 0, 1);  // Prefetch next entry's cache line 1 (read, moderate locality)
+            }
 
 #if PTO2_TENSORMAP_PROFILING
             chain_len++;
@@ -366,6 +379,16 @@ struct PTO2TensorMap {
         PTO2TensorMapEntry *entry = new_entry();
         entry->copy_from_tensor(tensor);
         link_entry(entry, tensor.buffer.addr, producer_task_id);
+    }
+
+    /**
+     * Insert with precomputed hash — avoids recomputing hash(addr) when
+     * the caller already has it from a prior lookup() on the same address.
+     */
+    void insert(const Tensor &tensor, PTO2TaskId producer_task_id, uint32_t precomputed_hash) {
+        PTO2TensorMapEntry *entry = new_entry();
+        entry->copy_from_tensor(tensor);
+        link_entry(entry, producer_task_id, precomputed_hash);
     }
 
     /**
@@ -421,10 +444,16 @@ struct PTO2TensorMap {
      * Link an initialized entry into bucket and task chains.
      */
     void link_entry(PTO2TensorMapEntry *entry, uint64_t addr, PTO2TaskId producer_task_id) {
+        link_entry(entry, producer_task_id, hash(addr));
+    }
+
+    /**
+     * Link an initialized entry into bucket and task chains (with precomputed hash).
+     */
+    void link_entry(PTO2TensorMapEntry *entry, PTO2TaskId producer_task_id, uint32_t bucket_index) {
 #if PTO2_TENSORMAP_PROFILING
         g_insert_count++;
 #endif
-        uint32_t bucket_index = hash(addr);
         auto ring_id = producer_task_id.ring();
         auto local_id = producer_task_id.local();
         int32_t task_slot = local_id & (task_window_sizes[ring_id] - 1);
