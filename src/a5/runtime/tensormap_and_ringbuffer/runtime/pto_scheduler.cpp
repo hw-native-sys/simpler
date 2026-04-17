@@ -223,6 +223,7 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
     }
     sched->wiring_batch_count = 0;
     sched->wiring_batch_index = 0;
+    sched->wiring_backoff_counter = 0;
 
     return true;
 }

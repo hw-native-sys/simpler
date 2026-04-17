@@ -578,6 +578,12 @@ struct PTO2SchedulerState {
     // wiring backoff to ensure pending tasks are wired promptly.
     alignas(64) std::atomic<bool> orch_needs_drain{false};
 
+    // Backoff counter: when queue size < WIRING_BATCH_SIZE, increment instead
+    // of popping. After WIRING_BACKOFF_LIMIT consecutive deferrals, force a pop
+    // to prevent deadlock (allocator may be waiting for wiring to advance ring).
+    static constexpr int WIRING_BACKOFF_LIMIT = 32;
+    int wiring_backoff_counter;
+
     // Statistics
 #if PTO2_SCHED_PROFILING
     std::atomic<int64_t> tasks_completed;
@@ -601,13 +607,16 @@ struct PTO2SchedulerState {
 
         // Refill local batch buffer when exhausted.
         if (wiring_batch_index >= wiring_batch_count) {
-            // Backoff: skip pop when fewer than WIRING_BACKOFF_THRESHOLD tasks
-            // are queued, reducing contention with the orchestrator's push path.
-            // Bypassed when force_drain is set (orchestrator done — must flush tail)
-            // or when orch_needs_drain is set (orchestrator is spin-waiting on tensor data).
-            if (!force_drain && !orch_needs_drain.load(std::memory_order_acquire) &&
-                wiring_queue.size() < WIRING_BATCH_SIZE)
-                return 0;
+            // Backoff: defer pop when queue holds fewer than a full batch,
+            // unless force_drain, orch_needs_drain, or backoff limit reached.
+            if (!force_drain && wiring_queue.size() < WIRING_BATCH_SIZE) {
+                if (!orch_needs_drain.load(std::memory_order_acquire) &&
+                    wiring_backoff_counter < WIRING_BACKOFF_LIMIT) {
+                    wiring_backoff_counter++;
+                    return 0;
+                }
+            }
+            wiring_backoff_counter = 0;
             wiring_batch_count = wiring_queue.pop_batch(wiring_batch, WIRING_BATCH_SIZE);
             wiring_batch_index = 0;
             if (wiring_batch_count == 0) return 0;
