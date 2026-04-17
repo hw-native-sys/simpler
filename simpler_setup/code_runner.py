@@ -542,80 +542,102 @@ class CodeRunner:
         )
         worker.set_device(self.device_id)
 
-        # Step 3: Run each parameter set
-        total_cases = len(self.params_list)
-        for case_idx, params in enumerate(self.params_list):
-            logger.info("=" * 60)
-            logger.info(f"=== Case {case_idx + 1}/{total_cases}: {params} ===")
-            logger.info("=" * 60)
+        try:
+            # Step 3: Run each parameter set
+            total_cases = len(self.params_list)
+            for case_idx, params in enumerate(self.params_list):
+                logger.info("=" * 60)
+                logger.info(f"=== Case {case_idx + 1}/{total_cases}: {params} ===")
+                logger.info("=" * 60)
 
-            # Generate tensors using golden.py
-            logger.info("=== Generating Inputs ===")
-            result = self._golden_module.generate_inputs(params)
+                outputs = {}
+                try:
+                    # Generate tensors using golden.py
+                    logger.info("=== Generating Inputs ===")
+                    result = self._golden_module.generate_inputs(params)
 
-            if isinstance(result, list):
-                # New-style: generate_inputs returns flat argument list
-                orch_args, args, inputs, outputs = self._build_func_args_from_list(result)
-                tensors = args  # args contains all named items; compute_golden receives all
-            else:
-                # Legacy: generate_inputs returns dict of tensors
-                tensors = {k: _to_torch(v) for k, v in result.items()}
-                orch_args = self._build_func_args(tensors)
-                inputs, outputs = self._identify_outputs(tensors)
+                    if isinstance(result, list):
+                        # New-style: generate_inputs returns flat argument list
+                        orch_args, args, inputs, outputs = self._build_func_args_from_list(result)
+                        tensors = args  # args contains all named items; compute_golden receives all
+                    else:
+                        # Legacy: generate_inputs returns dict of tensors
+                        tensors = {k: _to_torch(v) for k, v in result.items()}
+                        orch_args = self._build_func_args(tensors)
+                        inputs, outputs = self._identify_outputs(tensors)
 
-            logger.info(f"Inputs: {list(inputs.keys())}")
-            logger.info(f"Outputs: {list(outputs.keys())}")
+                    logger.info(f"Inputs: {list(inputs.keys())}")
+                    logger.info(f"Outputs: {list(outputs.keys())}")
 
-            # Determine actual tensor order for debugging
-            logger.debug(f"Tensor order: {list(tensors.keys())}")
-            logger.debug(f"orch_args count: {len(orch_args)}")
+                    # Determine actual tensor order for debugging
+                    logger.debug(f"Tensor order: {list(tensors.keys())}")
+                    logger.debug(f"orch_args count: {len(orch_args)}")
 
-            # Build environment for runtime initialization
-            run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
-            if run_env:
-                logger.debug(f"Runtime init env overrides: {run_env}")
+                    # Build environment for runtime initialization
+                    run_env = _kernel_config_runtime_env(self._kernel_config, self.kernels_dir)
+                    if run_env:
+                        logger.debug(f"Runtime init env overrides: {run_env}")
 
-            # Golden
-            if not self.skip_golden:
-                golden = {k: v.clone() for k, v in outputs.items()}
-                golden_with_inputs = {**inputs, **golden}
-                _t_golden_start = time.perf_counter()
-                self._golden_module.compute_golden(golden_with_inputs, params)
-                _t_golden_end = time.perf_counter()
-                logger.info(f">>> compute_golden() took {_t_golden_end - _t_golden_start:.3f}s")
+                    # Golden
+                    if not self.skip_golden:
+                        golden = {k: v.clone() for k, v in outputs.items()}
+                        golden_with_inputs = {**inputs, **golden}
+                        _t_golden_start = time.perf_counter()
+                        self._golden_module.compute_golden(golden_with_inputs, params)
+                        _t_golden_end = time.perf_counter()
+                        logger.info(f">>> compute_golden() took {_t_golden_end - _t_golden_start:.3f}s")
 
-            initial_outputs = {k: v.clone() for k, v in outputs.items()}
+                    initial_outputs = {k: v.clone() for k, v in outputs.items()}
 
-            for round_idx in range(self.repeat_rounds):
-                if self.repeat_rounds > 1:
-                    logger.info(f"--- Round {round_idx + 1}/{self.repeat_rounds} ---")
+                    for round_idx in range(self.repeat_rounds):
+                        if self.repeat_rounds > 1:
+                            logger.info(f"--- Round {round_idx + 1}/{self.repeat_rounds} ---")
 
-                for k, v in initial_outputs.items():
-                    outputs[k].copy_(v)
+                        for k, v in initial_outputs.items():
+                            outputs[k].copy_(v)
 
-                config = ChipCallConfig()
-                config.block_dim = self.block_dim
-                config.aicpu_thread_num = self.aicpu_thread_num
-                if self.enable_profiling and round_idx == 0:
-                    config.enable_profiling = True
-                    logger.info("Profiling enabled")
-                if self.enable_dump_tensor:
-                    config.enable_dump_tensor = True
-                    logger.info("Dump tensor enabled")
+                        config = ChipCallConfig()
+                        config.block_dim = self.block_dim
+                        config.aicpu_thread_num = self.aicpu_thread_num
+                        if self.enable_profiling and round_idx == 0:
+                            config.enable_profiling = True
+                            logger.info("Profiling enabled")
+                        if self.enable_dump_tensor:
+                            config.enable_dump_tensor = True
+                            logger.info("Dump tensor enabled")
 
-                with _temporary_env(run_env):
-                    worker.run(chip_callable, orch_args, config)
+                        with _temporary_env(run_env):
+                            worker.run(chip_callable, orch_args, config)
 
-                if not self.skip_golden:
-                    self._compare_with_golden(outputs, golden)
+                        if not self.skip_golden:
+                            self._compare_with_golden(outputs, golden)
 
-            logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
+                    logger.info(f"=== Case {case_idx + 1}/{total_cases} Passed ===")
+                finally:
+                    self._run_post_run_collect(outputs, params)
+        finally:
+            worker.reset_device()
+            worker.finalize()
 
-        worker.reset_device()
-        worker.finalize()
         logger.info("=" * 60)
         logger.info(f"=== All {total_cases} cases passed ===")
         logger.info("=" * 60)
+
+    def _run_post_run_collect(
+        self,
+        outputs: dict[str, torch.Tensor],
+        params: dict[str, Any],
+    ) -> None:
+        """
+        Optional post-run hook.
+
+        If golden.py defines post_run_collect(outputs, params), call it after
+        the case completes so custom cleanup hooks can release external state.
+        """
+        collect_fn = getattr(self._golden_module, "post_run_collect", None)
+        if not callable(collect_fn):
+            return
+        collect_fn(outputs, params)
 
     def _compare_with_golden(
         self,

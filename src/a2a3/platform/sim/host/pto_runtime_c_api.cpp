@@ -121,6 +121,26 @@ int set_device(DeviceContextHandle ctx, int device_id) {
     return 0;
 }
 
+int mallocHostDeviceShareMem(uint32_t deviceId, uint64_t size, void **hostPtr, void **devPtr) {
+    (void)deviceId;
+    (void)size;
+    if (hostPtr != nullptr) {
+        *hostPtr = nullptr;
+    }
+    if (devPtr != nullptr) {
+        *devPtr = nullptr;
+    }
+    LOG_ERROR("mallocHostDeviceShareMem is not supported on a2a3sim");
+    return -1;
+}
+
+int freeHostDeviceShareMem(uint32_t deviceId, void *hostPtr) {
+    (void)deviceId;
+    (void)hostPtr;
+    LOG_ERROR("freeHostDeviceShareMem is not supported on a2a3sim");
+    return -1;
+}
+
 int run_runtime(
     DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
     int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,

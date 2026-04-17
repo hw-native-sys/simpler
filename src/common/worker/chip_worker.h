@@ -43,6 +43,12 @@ public:
     /// After this, set_device() can be called again with a new device ID.
     void reset_device();
 
+    /// Allocate host memory and register it as a device-visible mapped buffer.
+    void mallocHostDeviceShareMem(uint64_t size, uint64_t *host_ptr, uint64_t *dev_ptr, int device_id = -1);
+
+    /// Unregister and free a mapped host buffer.
+    void freeHostDeviceShareMem(uint64_t host_ptr, int device_id = -1);
+
     /// Tear down everything: device resources and runtime library.
     /// Terminal — the object cannot be reused after this.
     void finalize();
@@ -70,6 +76,8 @@ private:
         int, int
     );
     using FinalizeDeviceFn = int (*)(void *);
+    using MallocHostDeviceShareMemFn = int (*)(uint32_t, uint64_t, void **, void **);
+    using FreeHostDeviceShareMemFn = int (*)(uint32_t, void *);
 
     void *lib_handle_ = nullptr;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
@@ -78,6 +86,8 @@ private:
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     RunRuntimeFn run_runtime_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
+    MallocHostDeviceShareMemFn malloc_host_device_share_mem_fn_ = nullptr;
+    FreeHostDeviceShareMemFn free_host_device_share_mem_fn_ = nullptr;
     void *device_ctx_ = nullptr;
 
     std::vector<uint8_t> runtime_buf_;

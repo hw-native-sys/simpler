@@ -58,6 +58,9 @@ __all__ = [
     "torch_dtype_to_datatype",
     "make_tensor_arg",
     "scalar_to_uint64",
+    "get_active_worker",
+    "malloc_host_device_share_mem",
+    "free_host_device_share_mem",
     # Distributed runtime
     "WorkerType",
     "TaskState",
@@ -71,6 +74,7 @@ __all__ = [
 
 # Lazy-loaded torch dtype → DataType map (avoids importing torch at module load)
 _TORCH_DTYPE_MAP = None
+_ACTIVE_WORKER = None
 
 
 def _ensure_torch_map():
@@ -158,7 +162,9 @@ class ChipWorker:
     """
 
     def __init__(self):
+        global _ACTIVE_WORKER
         self._impl = _ChipWorker()
+        _ACTIVE_WORKER = self
 
     def init(self, host_path, aicpu_path, aicore_path, sim_context_lib_path=""):
         """Load host runtime library and cache platform binaries.
@@ -187,12 +193,28 @@ class ChipWorker:
         """Release device resources. The runtime binding remains intact."""
         self._impl.reset_device()
 
+    def malloc_host_device_share_mem(self, size, device_id=None):
+        """Allocate host memory and register it as a device-visible mapped buffer."""
+        if device_id is None:
+            device_id = self.device_id
+        host_ptr, dev_ptr = self._impl.malloc_host_device_share_mem(int(size), int(device_id))
+        return int(host_ptr), int(dev_ptr)
+
+    def free_host_device_share_mem(self, host_ptr, device_id=None):
+        """Unregister and free a mapped host buffer."""
+        if device_id is None:
+            device_id = self.device_id
+        self._impl.free_host_device_share_mem(int(host_ptr), int(device_id))
+
     def finalize(self):
         """Tear down everything: device resources and runtime library.
 
         Terminal operation — the object cannot be reused after this.
         """
+        global _ACTIVE_WORKER
         self._impl.finalize()
+        if _ACTIVE_WORKER is self:
+            _ACTIVE_WORKER = None
 
     def run(self, callable, args, config=None, **kwargs):
         """Execute a callable synchronously.
@@ -220,3 +242,24 @@ class ChipWorker:
     @property
     def device_set(self):
         return self._impl.device_set
+
+
+def get_active_worker():
+    """Return the most recently created ChipWorker in this process."""
+    if _ACTIVE_WORKER is None:
+        raise RuntimeError("No active ChipWorker is available")
+    if not _ACTIVE_WORKER.initialized:
+        raise RuntimeError("The active ChipWorker is not initialized")
+    if not _ACTIVE_WORKER.device_set:
+        raise RuntimeError("The active ChipWorker does not have a device set")
+    return _ACTIVE_WORKER
+
+
+def malloc_host_device_share_mem(size, device_id=None):
+    """Allocate host memory and register it as a device-visible mapped buffer."""
+    return get_active_worker().malloc_host_device_share_mem(size, device_id=device_id)
+
+
+def free_host_device_share_mem(host_ptr, device_id=None):
+    """Unregister and free a mapped host buffer."""
+    get_active_worker().free_host_device_share_mem(host_ptr, device_id=device_id)

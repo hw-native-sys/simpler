@@ -37,6 +37,14 @@ T load_symbol(void *handle, const char *name) {
     return reinterpret_cast<T>(sym);
 }
 
+template <typename T>
+T try_load_symbol(void *handle, const char *name) {
+    dlerror();  // clear any existing error
+    void *sym = dlsym(handle, name);
+    (void)dlerror();
+    return reinterpret_cast<T>(sym);
+}
+
 // Process-wide singleton: libcpu_sim_context.so is loaded once with
 // RTLD_GLOBAL so that host_runtime.so can resolve sim_context_set_* and
 // pto_sim_get_* symbols at runtime.  Never dlclosed.
@@ -117,6 +125,9 @@ void ChipWorker::init(
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+        malloc_host_device_share_mem_fn_ =
+            try_load_symbol<MallocHostDeviceShareMemFn>(handle, "mallocHostDeviceShareMem");
+        free_host_device_share_mem_fn_ = try_load_symbol<FreeHostDeviceShareMemFn>(handle, "freeHostDeviceShareMem");
     } catch (...) {
         dlclose(handle);
         throw;
@@ -164,6 +175,49 @@ void ChipWorker::reset_device() {
     device_set_ = false;
 }
 
+void ChipWorker::mallocHostDeviceShareMem(uint64_t size, uint64_t *host_ptr, uint64_t *dev_ptr, int device_id) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    if (host_ptr == nullptr || dev_ptr == nullptr) {
+        throw std::runtime_error("mallocHostDeviceShareMem requires non-null output pointers");
+    }
+    if (malloc_host_device_share_mem_fn_ == nullptr) {
+        throw std::runtime_error("mallocHostDeviceShareMem symbol is not available in the bound runtime");
+    }
+
+    *host_ptr = 0;
+    *dev_ptr = 0;
+    int effective_device_id = (device_id >= 0) ? device_id : device_id_;
+    void *host_ptr_raw = nullptr;
+    void *dev_ptr_raw = nullptr;
+    int rc = malloc_host_device_share_mem_fn_(static_cast<uint32_t>(effective_device_id), size, &host_ptr_raw, &dev_ptr_raw);
+    if (rc != 0 || host_ptr_raw == nullptr || dev_ptr_raw == nullptr) {
+        throw std::runtime_error("mallocHostDeviceShareMem failed with code " + std::to_string(rc));
+    }
+
+    *host_ptr = reinterpret_cast<uint64_t>(host_ptr_raw);
+    *dev_ptr = reinterpret_cast<uint64_t>(dev_ptr_raw);
+}
+
+void ChipWorker::freeHostDeviceShareMem(uint64_t host_ptr, int device_id) {
+    if (host_ptr == 0) {
+        return;
+    }
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    if (free_host_device_share_mem_fn_ == nullptr) {
+        throw std::runtime_error("freeHostDeviceShareMem symbol is not available in the bound runtime");
+    }
+
+    int effective_device_id = (device_id >= 0) ? device_id : device_id_;
+    int rc = free_host_device_share_mem_fn_(static_cast<uint32_t>(effective_device_id), reinterpret_cast<void *>(host_ptr));
+    if (rc != 0) {
+        throw std::runtime_error("freeHostDeviceShareMem failed with code " + std::to_string(rc));
+    }
+}
+
 void ChipWorker::finalize() {
     reset_device();
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
@@ -180,6 +234,8 @@ void ChipWorker::finalize() {
     get_runtime_size_fn_ = nullptr;
     run_runtime_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
+    malloc_host_device_share_mem_fn_ = nullptr;
+    free_host_device_share_mem_fn_ = nullptr;
     runtime_buf_.clear();
     aicpu_binary_.clear();
     aicore_binary_.clear();

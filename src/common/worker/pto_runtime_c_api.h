@@ -17,7 +17,8 @@
  *
  * Public API — resolved by ChipWorker via dlsym:
  *   create_device_context, destroy_device_context,
- *   get_runtime_size, set_device, run_runtime, finalize_device
+ *   get_runtime_size, set_device, run_runtime, finalize_device,
+ *   mallocHostDeviceShareMem, freeHostDeviceShareMem
  *
  * Memory management: caller allocates a buffer of get_runtime_size() bytes
  * and passes it to run_runtime(). Error codes: 0 = success, negative = error.
@@ -58,6 +59,26 @@ size_t get_runtime_size(void);
 
 /** Set the target device. Must be called before the first run_runtime(). */
 int set_device(DeviceContextHandle ctx, int device_id);
+
+/**
+ * Allocate host memory and register it as a device-visible mapped address.
+ *
+ * @param deviceId  Target device ID
+ * @param size      Size in bytes
+ * @param hostPtr   Output host pointer
+ * @param devPtr    Output mapped device-visible address
+ * @return 0 on success, negative on error
+ */
+int mallocHostDeviceShareMem(uint32_t deviceId, uint64_t size, void **hostPtr, void **devPtr);
+
+/**
+ * Unregister and free host memory previously created by mallocHostDeviceShareMem().
+ *
+ * @param deviceId  Target device ID
+ * @param hostPtr   Host pointer previously returned by mallocHostDeviceShareMem()
+ * @return 0 on success, negative on error
+ */
+int freeHostDeviceShareMem(uint32_t deviceId, void *hostPtr);
 
 /**
  * Build the task graph, execute on device, copy results back, and clean up.

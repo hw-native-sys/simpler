@@ -561,6 +561,23 @@ NB_MODULE(_task_interface, m) {
         .def("reset_device", &ChipWorker::reset_device)
         .def("finalize", &ChipWorker::finalize)
         .def(
+            "malloc_host_device_share_mem",
+            [](ChipWorker &self, uint64_t size, int device_id) -> nb::tuple {
+                uint64_t host_ptr = 0;
+                uint64_t dev_ptr = 0;
+                self.mallocHostDeviceShareMem(size, &host_ptr, &dev_ptr, device_id);
+                nb::list lst;
+                lst.append(host_ptr);
+                lst.append(dev_ptr);
+                return nb::tuple(lst);
+            },
+            nb::arg("size"), nb::arg("device_id") = -1
+        )
+        .def(
+            "free_host_device_share_mem", &ChipWorker::freeHostDeviceShareMem, nb::arg("host_ptr"),
+            nb::arg("device_id") = -1
+        )
+        .def(
             "run",
             [](ChipWorker &self, const PyChipCallable &callable, ChipStorageTaskArgs &args,
                const ChipCallConfig &config) {
