@@ -13,10 +13,14 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <sstream>
 #include <string>
+#include <system_error>
 #include <thread>
 #include <vector>
+#include <unistd.h>
 
 #include "acl/acl.h"
 #include "hccl/hccl_comm.h"
@@ -251,6 +255,7 @@ struct CommHandle_ {
     int rank;
     int nranks;
     std::string rootinfo_path;
+    uint64_t run_token = 0;
 
     rtStream_t stream = nullptr;
     HcclComm hccl_comm = nullptr;
@@ -264,24 +269,102 @@ struct CommHandle_ {
 // Helpers
 // ============================================================================
 
-static bool wait_for_file(const std::string& path, int timeout_sec = 120) {
+namespace {
+
+static constexpr uint64_t ROOTINFO_MAGIC = 0x50544f5f4843434cULL;  // "PTO_HCCL"
+
+struct RootInfoFileHeader {
+    uint64_t magic = ROOTINFO_MAGIC;
+    uint64_t run_token = 0;
+    uint32_t payload_size = HCCL_ROOT_INFO_BYTES;
+    uint32_t reserved = 0;
+};
+
+static std::string handshake_dir(const std::string &rootinfo_path) {
+    auto last_slash = rootinfo_path.rfind('/');
+    if (last_slash == std::string::npos) return ".";
+    return rootinfo_path.substr(0, last_slash);
+}
+
+static std::string handshake_prefix(const std::string &rootinfo_path) {
+    auto last_slash = rootinfo_path.rfind('/');
+    return last_slash == std::string::npos ? rootinfo_path : rootinfo_path.substr(last_slash + 1);
+}
+
+static std::string run_token_hex(uint64_t run_token) {
+    std::ostringstream oss;
+    oss << std::hex << run_token;
+    return oss.str();
+}
+
+static uint64_t make_run_token(int rank) {
+    auto now = std::chrono::time_point_cast<std::chrono::nanoseconds>(std::chrono::system_clock::now())
+                   .time_since_epoch()
+                   .count();
+    uint64_t token = static_cast<uint64_t>(now);
+    token ^= static_cast<uint64_t>(getpid()) << 16;
+    token ^= static_cast<uint64_t>(rank & 0xFFFF);
+    return token;
+}
+
+static std::string
+barrier_marker_path(const std::string &rootinfo_path, uint64_t run_token, const std::string &tag, int rank) {
+    return handshake_dir(rootinfo_path) + "/barrier_" + handshake_prefix(rootinfo_path) + "_" + tag + "_" +
+           run_token_hex(run_token) + "_" + std::to_string(rank) + ".ready";
+}
+
+static void cleanup_handshake_files(const std::string &rootinfo_path) {
+    std::error_code ec;
+    std::filesystem::remove(rootinfo_path, ec);
+
+    const std::string prefix = "barrier_" + handshake_prefix(rootinfo_path) + "_";
+    const std::string dir = handshake_dir(rootinfo_path);
+    for (const auto &entry : std::filesystem::directory_iterator(dir, ec)) {
+        if (ec) break;
+        if (!entry.is_regular_file(ec)) continue;
+        const std::string name = entry.path().filename().string();
+        if (name.rfind(prefix, 0) != 0) continue;
+        if (name.size() < 6 || name.substr(name.size() - 6) != ".ready") continue;
+        std::filesystem::remove(entry.path(), ec);
+        ec.clear();
+    }
+}
+
+static bool wait_for_rootinfo(
+    const std::string &path, HcclRootInfo *root_info, uint64_t *run_token, int timeout_sec = 120) {
     for (int i = 0; i < timeout_sec * 10; ++i) {
         std::ifstream f(path, std::ios::binary);
         if (f.good()) {
-            auto sz = f.seekg(0, std::ios::end).tellg();
-            if (sz >= static_cast<std::streamoff>(HCCL_ROOT_INFO_BYTES)) return true;
+            RootInfoFileHeader header{};
+            f.read(reinterpret_cast<char *>(&header), sizeof(header));
+            if (!f.good()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            if (header.magic != ROOTINFO_MAGIC || header.payload_size != HCCL_ROOT_INFO_BYTES) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            f.read(root_info->internal, HCCL_ROOT_INFO_BYTES);
+            if (!f.good()) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                continue;
+            }
+            *run_token = header.run_token;
+            return true;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
     return false;
 }
 
-static void file_barrier(const std::string& dir, int rank, int nranks, const std::string& tag) {
-    std::string my_marker = dir + "/barrier_" + tag + "_" + std::to_string(rank) + ".ready";
+static void file_barrier(
+    const std::string &rootinfo_path, int rank, int nranks, const std::string &tag, uint64_t run_token) {
+    std::string my_marker = barrier_marker_path(rootinfo_path, run_token, tag, rank);
     { std::ofstream(my_marker) << "1"; }
 
     for (int r = 0; r < nranks; ++r) {
-        std::string marker = dir + "/barrier_" + tag + "_" + std::to_string(r) + ".ready";
+        std::string marker = barrier_marker_path(rootinfo_path, run_token, tag, r);
         while (true) {
             std::ifstream f(marker);
             if (f.good()) break;
@@ -289,6 +372,8 @@ static void file_barrier(const std::string& dir, int rank, int nranks, const std
         }
     }
 }
+
+}  // namespace
 
 // ============================================================================
 // API implementation
@@ -335,31 +420,35 @@ extern "C" CommHandle comm_init(int rank, int nranks, int device_id, const char*
     // RootInfo exchange
     HcclRootInfo rootInfo{};
     if (rank == 0) {
+        cleanup_handshake_files(h->rootinfo_path);
+        h->run_token = make_run_token(rank);
         HcclResult hret = hccl_get_root_info(&rootInfo);
         if (hret != HCCL_SUCCESS) {
             fprintf(stderr, "[comm rank 0] HcclGetRootInfo failed: %d\n", (int)hret);
             delete h;
             return nullptr;
         }
-        std::ofstream fout(rootinfo_path, std::ios::binary);
+        RootInfoFileHeader header{};
+        header.run_token = h->run_token;
+        std::string tmp_path = h->rootinfo_path + ".tmp." + std::to_string(getpid());
+        std::ofstream fout(tmp_path, std::ios::binary | std::ios::trunc);
+        fout.write(reinterpret_cast<const char*>(&header), sizeof(header));
         fout.write(rootInfo.internal, HCCL_ROOT_INFO_BYTES);
         fout.close();
+        if (!fout.good() || std::rename(tmp_path.c_str(), h->rootinfo_path.c_str()) != 0) {
+            std::remove(tmp_path.c_str());
+            delete h;
+            return nullptr;
+        }
     } else {
-        if (!wait_for_file(rootinfo_path)) {
+        if (!wait_for_rootinfo(h->rootinfo_path, &rootInfo, &h->run_token)) {
             fprintf(stderr, "[comm rank %d] Timeout waiting for rootinfo\n", rank);
             delete h;
             return nullptr;
         }
-        std::ifstream fin(rootinfo_path, std::ios::binary);
-        fin.read(rootInfo.internal, HCCL_ROOT_INFO_BYTES);
     }
 
-    std::string barrier_dir = h->rootinfo_path;
-    auto last_slash = barrier_dir.rfind('/');
-    if (last_slash != std::string::npos) {
-        barrier_dir = barrier_dir.substr(0, last_slash);
-    }
-    file_barrier(barrier_dir, h->rank, h->nranks, "rootinfo_ready");
+    file_barrier(h->rootinfo_path, h->rank, h->nranks, "rootinfo_ready", h->run_token);
 
     // Create stream for HCCL operations
     rtStreamCreate(&h->stream, RT_STREAM_PRIORITY_DEFAULT);
@@ -393,12 +482,7 @@ extern "C" int comm_alloc_windows(CommHandle h, size_t /*win_size*/, uint64_t* d
     if (hret != HCCL_SUCCESS) return -1;
 
     // File barrier so all ranks have completed HcclCommInitRootInfo
-    std::string barrier_dir = h->rootinfo_path;
-    auto last_slash = barrier_dir.rfind('/');
-    if (last_slash != std::string::npos) {
-        barrier_dir = barrier_dir.substr(0, last_slash);
-    }
-    file_barrier(barrier_dir, h->rank, h->nranks, "hccl_init");
+    file_barrier(h->rootinfo_path, h->rank, h->nranks, "hccl_init", h->run_token);
 
     // Tiling configuration for HcclAllocComResourceByTiling
     Mc2CommConfigV2 tiling{};
@@ -509,6 +593,8 @@ extern "C" int comm_barrier(CommHandle h) {
 extern "C" int comm_destroy(CommHandle h) {
     if (!h) return -1;
 
+    file_barrier(h->rootinfo_path, h->rank, h->nranks, "destroy", h->run_token);
+
     if (h->owns_device_ctx && h->device_ctx) {
         aclrtFree(h->device_ctx);
     }
@@ -519,6 +605,10 @@ extern "C" int comm_destroy(CommHandle h) {
     // Device lifecycle is owned by DeviceRunner (static singleton) whose
     // destructor frees all tracked device memory before resetting the device.
     // Resetting early would invalidate pointers still held by MemoryAllocator.
+
+    if (h->rank == 0) {
+        cleanup_handshake_files(h->rootinfo_path);
+    }
 
     delete h;
     return 0;
