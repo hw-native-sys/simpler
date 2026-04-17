@@ -573,6 +573,11 @@ struct PTO2SchedulerState {
     // Global wiring queue — refill path only (every BATCH_SIZE tasks), separate cache line.
     alignas(64) PTO2SpscQueue wiring_queue;
 
+    // Orchestrator urgency flag: set by orchestrator before spin-waiting on
+    // tensor data, cleared after wait completes. When true, scheduler bypasses
+    // wiring backoff to ensure pending tasks are wired promptly.
+    alignas(64) std::atomic<bool> orch_needs_drain{false};
+
     // Statistics
 #if PTO2_SCHED_PROFILING
     std::atomic<int64_t> tasks_completed;
@@ -598,8 +603,11 @@ struct PTO2SchedulerState {
         if (wiring_batch_index >= wiring_batch_count) {
             // Backoff: skip pop when fewer than WIRING_BACKOFF_THRESHOLD tasks
             // are queued, reducing contention with the orchestrator's push path.
-            // Bypassed when force_drain is set (orchestrator done — must flush tail).
-            if (!force_drain && wiring_queue.size() < WIRING_BATCH_SIZE) return 0;
+            // Bypassed when force_drain is set (orchestrator done — must flush tail)
+            // or when orch_needs_drain is set (orchestrator is spin-waiting on tensor data).
+            if (!force_drain && !orch_needs_drain.load(std::memory_order_acquire) &&
+                wiring_queue.size() < WIRING_BATCH_SIZE)
+                return 0;
             wiring_batch_count = wiring_queue.pop_batch(wiring_batch, WIRING_BATCH_SIZE);
             wiring_batch_index = 0;
             if (wiring_batch_count == 0) return 0;
