@@ -267,7 +267,7 @@ jobs:
           pip install '.[test]'
 
       - name: Run simulation examples (a5sim)
-        run: python ci.py -p a5sim -c d96c8784 -t 600 --clone-protocol https
+        run: python ci.py -p a5sim -c 3cf259e8 -t 600 --clone-protocol https
 
       - name: Run pytest scene tests (a5sim)
         run: |
@@ -277,7 +277,7 @@ jobs:
           if [ $rc -eq 124 ]; then
             echo "pytest timed out; retrying with pinned PTO-ISA commit"
             pytest examples tests/st --platform a5sim --device 0-15 -v \
-              --pto-session-timeout 600 --pto-isa-commit d96c8784 --clone-protocol https
+              --pto-session-timeout 600 --pto-isa-commit 3cf259e8 --clone-protocol https
             rc=$?
           fi
           exit $rc

@@ -79,6 +79,12 @@ class TestBenchmarkBgemm(SceneTestCase):
             "config": {"aicpu_thread_num": 4, "block_dim": 24},
             "params": {"matmul_add_task_num": 64, "incore_data_size": 128, "incore_loop": 4, "grid_k": 4},
         },
+        {
+            "name": "Bgemm64",
+            "platforms": ["a2a3sim", "a2a3"],
+            "config": {"aicpu_thread_num": 4, "block_dim": 3},
+            "params": {"matmul_add_task_num": 32, "incore_data_size": 64, "incore_loop": 1, "grid_k": 4},
+        },
     ]
 
     def generate_args(self, params):

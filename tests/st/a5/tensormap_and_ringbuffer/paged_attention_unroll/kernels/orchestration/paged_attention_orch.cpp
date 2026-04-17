@@ -43,7 +43,15 @@ inline double cycles_to_us(uint64_t cycles) {
 
 inline uint64_t get_sys_cnt_aicpu() {
     uint64_t ticks;
+#if defined(__aarch64__)
     asm volatile("mrs %0, cntvct_el0" : "=r"(ticks));
+#elif defined(__x86_64__)
+    unsigned int lo, hi;
+    asm volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    ticks = (static_cast<uint64_t>(hi) << 32) | lo;
+#else
+    ticks = 0;
+#endif
     return ticks;
 }
 
@@ -105,7 +113,7 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
     // scale from scalar arg
     uint64_t scale_value = orch_args.scalar(0);
     uint64_t q_head_num = num_heads;
-    uint64_t q_tile = std::min(num_heads, 128UL);
+    uint64_t q_tile = std::min(num_heads, static_cast<uint64_t>(128));
     uint64_t q_loop = (q_head_num + q_tile - 1) / q_tile;
     CYCLE_COUNT_LAP(prof_param_extract);
 
