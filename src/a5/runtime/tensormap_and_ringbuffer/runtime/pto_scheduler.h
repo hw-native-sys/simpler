@@ -451,10 +451,11 @@ struct PTO2SpscQueue {
     }
 
     // Push one item (producer only). Returns false if queue is full.
-    // Full condition: next_h - tail > mask_ (i.e. > capacity-1), meaning all
-    // capacity slots are occupied. This uses strict '>' so all capacity slots
-    // are usable (no wasted sentinel slot). uint64_t wrapping is safe since
-    // head and tail are monotonically increasing and subtraction wraps correctly.
+    // Full condition: next_h - tail > mask_ (i.e. > capacity-1), so the
+    // effective usable capacity is capacity-1 (one slot is wasted as a
+    // sentinel to distinguish full from empty). uint64_t wrapping is safe
+    // since head and tail are monotonically increasing and subtraction
+    // wraps correctly.
     bool push(PTO2TaskSlotState *item) {
         uint64_t h = head_.load(std::memory_order_relaxed);
         uint64_t next_h = h + 1;

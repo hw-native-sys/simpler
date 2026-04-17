@@ -405,7 +405,7 @@ Key members:
 
 ### 7.3 Deferred Fanout Wiring (Scheduler Wiring Queue)
 
-The orchestrator pushes each submitted task to the global `scheduler->wiring_queue` (a wait-free SPSC queue). Scheduler thread 0 drains this queue in batches (with backoff until batch-size items are queued), and for each task:
+The orchestrator pushes each submitted task to the global `scheduler->wiring_queue` (a wait-free SPSC queue). Scheduler thread 0 drains this queue in batches, deferring if the queue holds fewer than a full batch of items to reduce contention (unless a final flush is needed at end of execution). For each task:
 
 1. Sets `fanin_count = N + 1` (+1 redundance to prevent premature readiness)
 2. For each producer in `payload->fanin_slot_states[]`:
