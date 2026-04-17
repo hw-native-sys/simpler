@@ -168,9 +168,11 @@ struct alignas(64) Tensor {
     uint32_t shapes[RUNTIME_MAX_TENSOR_DIMS];  // Current view shape per dimension
 
     // === Cache line 2 (64B) — warm path ===
-    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];  // Underlying buffer shape per dimension
-    uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];     // Multi-dimensional offset per dimension
-    uint8_t _pad_cl2[24];                          // Tail padding (bytes 104–127)
+    uint32_t raw_shapes[RUNTIME_MAX_TENSOR_DIMS];   // Underlying buffer shape per dimension
+    uint32_t offsets[RUNTIME_MAX_TENSOR_DIMS];      // Multi-dimensional offset per dimension
+    int16_t producer_scope_depth{-1};               // Scope depth of the producing task (-1 = external)
+    int16_t producer_manual_scope_depth{-1};        // Manual-scope depth of the producing task (-1 = external/auto)
+    uint8_t _pad_cl2[20];                           // Tail padding (bytes 108–127)
 
     // --- Copy / move / destroy are public (valid tensors can be freely copied) ---
     Tensor(const Tensor &) = default;
@@ -210,6 +212,8 @@ struct alignas(64) Tensor {
             }
         }
         owner_task_id = PTO2TaskId::invalid();
+        producer_scope_depth = -1;
+        producer_manual_scope_depth = -1;
     }
 
     void init(const Tensor &other) {
@@ -224,6 +228,8 @@ struct alignas(64) Tensor {
                 offsets[i] = other.offsets[i];
             }
         }
+        producer_scope_depth = other.producer_scope_depth;
+        producer_manual_scope_depth = other.producer_manual_scope_depth;
     }
 
     void init_with_view(
@@ -264,6 +270,8 @@ struct alignas(64) Tensor {
         }
         is_all_offset_zero = all_zero;
         owner_task_id = other.owner_task_id;
+        producer_scope_depth = other.producer_scope_depth;
+        producer_manual_scope_depth = other.producer_manual_scope_depth;
     }
 
     /// Compute 1D flat element offset from multi-dimensional indices.
@@ -288,9 +296,16 @@ struct alignas(64) Tensor {
         memcpy(this, &ci, 64);
         buffer = {reinterpret_cast<uint64_t>(addr), buffer_size};
         owner_task_id = PTO2TaskId::invalid();  // caller (orchestrator) overwrites with actual task_id
+        producer_scope_depth = -1;
+        producer_manual_scope_depth = -1;
         if (ci.has_initial_value) {
             fill_initial_value(ci.initial_value);
         }
+    }
+
+    void set_producer_scope_metadata(int16_t scope_depth, int16_t manual_scope_depth) {
+        producer_scope_depth = scope_depth;
+        producer_manual_scope_depth = manual_scope_depth;
     }
 
     void fill_initial_value(uint64_t initial_value) {

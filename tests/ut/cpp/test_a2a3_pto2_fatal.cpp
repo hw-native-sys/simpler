@@ -28,6 +28,7 @@ extern "C" void pto2_framework_bind_runtime(PTO2Runtime *rt) { g_bound_runtime =
 
 struct FakeRuntime {
     const PTO2RuntimeOps *ops;
+    PTO2ScopeMode pending_scope_mode = PTO2ScopeMode::AUTO;
     bool fatal = false;
     int submit_calls = 0;
     int alloc_calls = 0;

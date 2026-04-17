@@ -86,6 +86,36 @@ function(add_a2a3_pto2_test name src)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
+function(add_a2a3_pto2_runtime_test name src)
+    set(A2A3_PTO2_RUNTIME_SOURCES
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_shared_memory.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_tensormap.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_ring_buffer.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_scheduler.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_orchestrator.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime/pto_runtime2.cpp
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration/common.cpp
+    )
+    add_executable(${name} ${src} ${A2A3_PTO2_RUNTIME_SOURCES})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+        ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+        ${CMAKE_SOURCE_DIR}/../../../src/common
+    )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+        dl
+    )
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
 function(add_a5_pto2_test name src)
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE
@@ -113,4 +143,6 @@ add_dist_test(test_dist_scope      test_dist_scope.cpp)
 add_dist_test(test_dist_orchestrator test_dist_orchestrator.cpp)
 add_dist_test(test_dist_scheduler  test_dist_scheduler.cpp)
 add_a2a3_pto2_test(test_a2a3_pto2_fatal test_a2a3_pto2_fatal.cpp)
+add_a2a3_pto2_test(test_a2a3_pto2_manual_scope_api test_a2a3_pto2_manual_scope_api.cpp)
+add_a2a3_pto2_runtime_test(test_a2a3_pto2_manual_scope_runtime test_a2a3_pto2_manual_scope_runtime.cpp)
 add_a5_pto2_test(test_a5_pto2_fatal test_a5_pto2_fatal.cpp)

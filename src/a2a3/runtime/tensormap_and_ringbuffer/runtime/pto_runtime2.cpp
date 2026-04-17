@@ -46,7 +46,11 @@ static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
     return pto2_alloc_tensors(&rt->orchestrator, args);
 }
 
-void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrator); }
+void pto2_rt_scope_begin(PTO2Runtime *rt) {
+    PTO2ScopeMode mode = rt->pending_scope_mode;
+    rt->pending_scope_mode = PTO2ScopeMode::AUTO;
+    pto2_scope_begin(&rt->orchestrator, mode);
+}
 
 void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
 

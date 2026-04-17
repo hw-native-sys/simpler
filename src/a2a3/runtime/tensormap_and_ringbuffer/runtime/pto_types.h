@@ -48,6 +48,11 @@
 // Task Output Tensors (return value from submit)
 // =============================================================================
 
+enum class PTO2ScopeMode : uint8_t {
+    AUTO = 0,
+    MANUAL = 1,
+};
+
 /**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
  *
@@ -63,6 +68,7 @@
 class TaskOutputTensors {
 public:
     TaskOutputTensors() :
+        task_id_(PTO2TaskId::invalid()),
         output_count_(0) {}
 
     bool empty() const { return output_count_ == 0; }
@@ -81,10 +87,17 @@ public:
         tensors_[output_count_++] = &tensor;
     }
 
+    PTO2TaskId task_id() const { return task_id_; }
+
+    void set_task_id(PTO2TaskId task_id) { task_id_ = task_id; }
+
 private:
+    PTO2TaskId task_id_;
     uint32_t output_count_;
     const Tensor *tensors_[PTO2_MAX_OUTPUTS];
 };
+
+using TaskSubmitResult = TaskOutputTensors;
 
 // =============================================================================
 // Argument Types (for pto_submit_task API)
@@ -127,14 +140,18 @@ union TensorRef {
  *   const Tensor& y = outs.get_ref(0);
  */
 struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, TensorArgType> {
+    static constexpr uint32_t kMaxExplicitDeps = 16;
     bool has_error{false};
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
+    PTO2TaskId explicit_deps_[kMaxExplicitDeps]{};
+    uint32_t explicit_dep_count_{0};
 
     void reset() {
         clear();
         has_error = false;
         error_msg = nullptr;
+        explicit_dep_count_ = 0;
     }
 
     void set_error(const char *msg) {
@@ -182,6 +199,21 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     void add_no_dep(Args &&...args) {
         if (!check_add_tensor_valid<false>(args...)) return;
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
+    }
+
+    void add_dep(PTO2TaskId task_id) {
+        if (explicit_dep_count_ >= kMaxExplicitDeps) {
+            set_error("Too many explicit deps (exceeds Arg::kMaxExplicitDeps=16)");
+            return;
+        }
+        explicit_deps_[explicit_dep_count_++] = task_id;
+    }
+
+    uint32_t explicit_dep_count() const { return explicit_dep_count_; }
+
+    PTO2TaskId explicit_dep(uint32_t index) const {
+        always_assert(index < explicit_dep_count_);
+        return explicit_deps_[index];
     }
 
     /**

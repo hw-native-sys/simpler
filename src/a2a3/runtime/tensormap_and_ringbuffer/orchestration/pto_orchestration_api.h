@@ -147,6 +147,7 @@ typedef struct PTO2RuntimeOps {
  */
 struct PTO2Runtime {
     const PTO2RuntimeOps *ops;
+    PTO2ScopeMode pending_scope_mode;
 };
 
 // =============================================================================
@@ -239,11 +240,12 @@ static inline TaskOutputTensors pto2_rt_submit_aiv_task(int32_t kernel_id, const
     return rt->ops->submit_task(rt, mk, args);
 }
 
-static inline void pto2_rt_scope_begin() {
+static inline void pto2_rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
     PTO2Runtime *rt = pto2_current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
     }
+    rt->pending_scope_mode = mode;
     rt->ops->scope_begin(rt);
 }
 
@@ -352,9 +354,10 @@ static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const u
  */
 class PTO2ScopeGuard {
 public:
-    PTO2ScopeGuard() :
+    explicit PTO2ScopeGuard(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) :
         rt_(pto2_current_runtime()) {
         if (!rt_->ops->is_fatal(rt_)) {
+            rt_->pending_scope_mode = mode;
             rt_->ops->scope_begin(rt_);
         }
     }
@@ -379,7 +382,7 @@ private:
  *       pto2_rt_submit_task(...);
  *   }
  */
-#define PTO2_SCOPE() if (PTO2_SCOPE_GUARD(); true)
+#define PTO2_SCOPE(...) if (PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__){__VA_ARGS__}; true)
 
 // =============================================================================
 // Orchestration Config
