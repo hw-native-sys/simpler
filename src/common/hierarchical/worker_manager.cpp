@@ -161,11 +161,25 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     }
 
     // Signal child process.
+    int32_t error_code = 0;
+    std::memcpy(mbox() + MAILBOX_OFF_ERROR, &error_code, sizeof(int32_t));
     write_mailbox_state(MailboxState::TASK_READY);
 
     // Spin-poll until child signals TASK_DONE.
     while (read_mailbox_state() != MailboxState::TASK_DONE) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+
+    // TASK_DONE only means the child finished consuming the mailbox entry.
+    // The child reports task-level failures separately through OFF_ERROR, so
+    // propagate them here instead of silently treating the dispatch as
+    // successful.
+    std::memcpy(&error_code, mbox() + MAILBOX_OFF_ERROR, sizeof(int32_t));
+    if (error_code != 0) {
+        write_mailbox_state(MailboxState::IDLE);
+        throw std::runtime_error(
+            "WorkerThread::dispatch_process: child task failed with error code " + std::to_string(error_code)
+        );
     }
 
     write_mailbox_state(MailboxState::IDLE);

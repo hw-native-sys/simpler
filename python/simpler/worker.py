@@ -50,20 +50,166 @@ import ctypes
 import os
 import struct
 import sys
+import time
+from dataclasses import dataclass, field
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Callable, Optional
 
 from .orchestrator import Orchestrator
 from .task_interface import (
+    DIST_CHIP_BOOTSTRAP_MAILBOX_SIZE,
     MAILBOX_SIZE,
+    ChipBootstrapMailboxState,
     ChipCallConfig,
     ChipWorker,
     ContinuousTensor,
     DataType,
+    DistChipBootstrapChannel,
     TaskArgs,
-    _ChipWorker,
+    _mailbox_load_i32,
+    _mailbox_store_i32,
     _Worker,
 )
+
+
+@dataclass
+class Task:
+    """Execution unit for Worker.run() at any level."""
+
+    orch: Callable
+    args: Any = field(default=None)
+
+
+@dataclass
+class ChipBufferSpec:
+    """Per-chip buffer contract used by the optional L3 chip bootstrap path."""
+
+    name: str
+    dtype: str
+    count: int
+    placement: str
+    nbytes: int
+    load_from_host: bool = False
+    store_to_host: bool = False
+
+    def make_tensor_arg(self, ptr: int) -> Any:
+        return ContinuousTensor.make(ptr, (self.count,), _buffer_dtype_to_task_dtype(self.dtype))
+
+
+@dataclass
+class HostBufferStaging:
+    """Named shared-memory staging region prepared by the parent process."""
+
+    name: str
+    shm_name: str
+    size: int
+
+
+@dataclass
+class ChipCommBootstrapConfig:
+    """Optional communicator bootstrap for a chip child."""
+
+    rank: int
+    nranks: int
+    rootinfo_path: str
+    window_size: int
+    win_sync_prefix: int = 0
+
+
+@dataclass
+class ChipBootstrapConfig:
+    """Worker-side chip child bootstrap input."""
+
+    comm: Optional[ChipCommBootstrapConfig] = None
+    buffers: list[ChipBufferSpec] = field(default_factory=list)
+    host_inputs: list[HostBufferStaging] = field(default_factory=list)
+    host_outputs: list[HostBufferStaging] = field(default_factory=list)
+
+    def input_staging(self, name: str) -> HostBufferStaging:
+        for staging in self.host_inputs:
+            if staging.name == name:
+                return staging
+        raise KeyError(f"Missing staged host input for chip buffer '{name}'")
+
+    def output_staging(self, name: str) -> HostBufferStaging:
+        for staging in self.host_outputs:
+            if staging.name == name:
+                return staging
+        raise KeyError(f"Missing staged host output for chip buffer '{name}'")
+
+
+@dataclass
+class ChipBootstrapReply:
+    """Child -> parent bootstrap reply carried over the bootstrap mailbox."""
+
+    device_ctx: int
+    local_window_base: int
+    actual_window_size: int
+    buffer_ptrs: list[int]
+
+
+@dataclass
+class ChipBootstrapState:
+    """Child-local chip bootstrap state kept alive for the chip process lifetime."""
+
+    bootstrap_config: ChipBootstrapConfig
+    comm_handle: Optional[int]
+    bootstrap_reply: ChipBootstrapReply
+
+    @property
+    def buffers(self) -> list[ChipBufferSpec]:
+        return self.bootstrap_config.buffers
+
+    @property
+    def buffer_ptrs(self) -> dict[str, int]:
+        return {
+            buf.name: int(ptr)
+            for buf, ptr in zip(self.bootstrap_config.buffers, self.bootstrap_reply.buffer_ptrs, strict=True)
+        }
+
+    def output_staging(self, name: str) -> HostBufferStaging:
+        return self.bootstrap_config.output_staging(name)
+
+
+@dataclass
+class ChipContext:
+    """Parent-visible chip bootstrap result used to build task args."""
+
+    bootstrap_config: ChipBootstrapConfig
+    device_id: int
+    bootstrap_reply: ChipBootstrapReply
+    buffer_tensors: dict[str, Any]
+
+    @property
+    def rank(self) -> int:
+        if self.bootstrap_config.comm is None:
+            raise AttributeError("ChipContext.rank is only available when comm bootstrap is configured")
+        return self.bootstrap_config.comm.rank
+
+    @property
+    def nranks(self) -> int:
+        if self.bootstrap_config.comm is None:
+            raise AttributeError("ChipContext.nranks is only available when comm bootstrap is configured")
+        return self.bootstrap_config.comm.nranks
+
+    @property
+    def device_ctx(self) -> int:
+        return self.bootstrap_reply.device_ctx
+
+    @property
+    def local_window_base(self) -> int:
+        return self.bootstrap_reply.local_window_base
+
+    @property
+    def actual_window_size(self) -> int:
+        return self.bootstrap_reply.actual_window_size
+
+    @property
+    def buffer_ptrs(self) -> dict[str, int]:
+        return {
+            buf.name: int(ptr)
+            for buf, ptr in zip(self.bootstrap_config.buffers, self.bootstrap_reply.buffer_ptrs, strict=True)
+        }
 
 # ---------------------------------------------------------------------------
 # Unified mailbox layout (must match worker_manager.h MAILBOX_OFF_*)
@@ -92,6 +238,10 @@ def _mailbox_addr(shm: SharedMemory) -> int:
     buf = shm.buf
     assert buf is not None
     return ctypes.addressof(ctypes.c_char.from_buffer(buf))
+
+
+def _buffer_field_addr(buf: memoryview, offset: int) -> int:
+    return ctypes.addressof(ctypes.c_char.from_buffer(buf)) + offset
 
 
 def _read_args_from_mailbox(buf) -> TaskArgs:
@@ -125,8 +275,9 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
 
 def _sub_worker_loop(buf, registry: dict) -> None:
     """Runs in forked child process. Reads unified mailbox layout."""
+    state_addr = _buffer_field_addr(buf, _OFF_STATE)
     while True:
-        state = struct.unpack_from("i", buf, _OFF_STATE)[0]
+        state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
             cid = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
             fn = registry.get(int(cid))
@@ -140,9 +291,89 @@ def _sub_worker_loop(buf, registry: dict) -> None:
                 except Exception:  # noqa: BLE001
                     error = 2
             struct.pack_into("i", buf, _OFF_ERROR, error)
-            struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
+            _mailbox_store_i32(state_addr, _TASK_DONE)
         elif state == _SHUTDOWN:
             break
+
+
+def _write_shared_memory_bytes(shm_name: str, data: bytes, expected_size: int) -> None:
+    if len(data) != expected_size:
+        raise ValueError(f"shared-memory staging size mismatch: got {len(data)}, expected {expected_size}")
+    shm = SharedMemory(name=shm_name)
+    try:
+        assert shm.buf is not None
+        if expected_size:
+            shm.buf[:expected_size] = data
+    finally:
+        shm.close()
+
+
+_DIST_DTYPE_MAP = {
+    "float32": DataType.FLOAT32,
+    "float16": DataType.FLOAT16,
+    "bfloat16": DataType.BFLOAT16,
+    "int64": DataType.INT64,
+    "int32": DataType.INT32,
+    "int16": DataType.INT16,
+    "int8": DataType.INT8,
+    "uint8": DataType.UINT8,
+}
+
+
+def _buffer_dtype_to_task_dtype(dtype: str) -> DataType:
+    key = str(dtype).lower()
+    if key not in _DIST_DTYPE_MAP:
+        raise ValueError(f"Unsupported chip buffer dtype: {dtype}")
+    return _DIST_DTYPE_MAP[key]
+
+
+def _enrich_chip_context(
+    chip_bootstrap_config: ChipBootstrapConfig, device_id: int, reply: ChipBootstrapReply
+) -> ChipContext:
+    return ChipContext(
+        bootstrap_config=chip_bootstrap_config,
+        device_id=device_id,
+        bootstrap_reply=reply,
+        buffer_tensors={
+            buf_cfg.name: buf_cfg.make_tensor_arg(ptr)
+            for buf_cfg, ptr in zip(chip_bootstrap_config.buffers, reply.buffer_ptrs, strict=True)
+        },
+    )
+
+
+def _run_chip_bootstrap(cw: ChipWorker, device_id: int, chip_bootstrap_config: ChipBootstrapConfig) -> ChipBootstrapState:
+    bootstrap = cw.bootstrap_context(device_id, chip_bootstrap_config)
+    return ChipBootstrapState(
+        bootstrap_config=chip_bootstrap_config,
+        comm_handle=bootstrap.comm_handle,
+        bootstrap_reply=ChipBootstrapReply(
+            device_ctx=bootstrap.device_ctx,
+            local_window_base=bootstrap.local_window_base,
+            actual_window_size=bootstrap.actual_window_size,
+            buffer_ptrs=list(bootstrap.buffer_ptrs),
+        ),
+    )
+
+
+def _flush_chip_bootstrap_outputs(cw: ChipWorker, chip_context: ChipBootstrapState) -> None:
+    if chip_context.comm_handle is not None:
+        cw.comm_barrier(chip_context.comm_handle)
+    for buf_cfg in chip_context.buffers:
+        if not buf_cfg.store_to_host:
+            continue
+        ptr = chip_context.buffer_ptrs[buf_cfg.name]
+        staged = chip_context.output_staging(buf_cfg.name)
+        _write_shared_memory_bytes(staged.shm_name, cw.copy_device_to_bytes(ptr, buf_cfg.nbytes), staged.size)
+
+
+def _shutdown_chip_child(cw: ChipWorker, chip_context: Optional[ChipBootstrapState]) -> None:
+    if chip_context is not None:
+        cw.shutdown_bootstrap_context(
+            chip_context.bootstrap_config,
+            comm_handle=chip_context.comm_handle or 0,
+            buffer_ptrs=[chip_context.buffer_ptrs[buf.name] for buf in chip_context.buffers],
+        )
+    cw.finalize()
 
 
 def _chip_process_loop(
@@ -152,6 +383,9 @@ def _chip_process_loop(
     aicpu_path: str,
     aicore_path: str,
     sim_context_lib_path: str = "",
+    bootstrap_mailbox_ptr: Optional[int] = None,
+    bootstrap_buffer_count: int = 0,
+    chip_bootstrap_config: Optional[ChipBootstrapConfig] = None,
 ) -> None:
     """Runs in forked child process. Loads host_runtime.so in own address space.
 
@@ -160,22 +394,47 @@ def _chip_process_loop(
     """
     import traceback as _tb  # noqa: PLC0415
 
+    cw: Optional[ChipWorker] = None
+    chip_context: Optional[ChipBootstrapState] = None
+    bootstrap_channel = (
+        DistChipBootstrapChannel(bootstrap_mailbox_ptr, bootstrap_buffer_count)
+        if bootstrap_mailbox_ptr is not None
+        else None
+    )
     try:
-        cw = _ChipWorker()
+        cw = ChipWorker()
         cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path)
-        cw.set_device(device_id)
+        if chip_bootstrap_config is None:
+            cw.set_device(device_id)
+            if bootstrap_channel is not None:
+                bootstrap_channel.write_success(0, 0, 0, [])
+        else:
+            chip_context = _run_chip_bootstrap(cw, device_id, chip_bootstrap_config)
+            if bootstrap_channel is not None:
+                bootstrap_channel.write_success(
+                    chip_context.bootstrap_reply.device_ctx,
+                    chip_context.bootstrap_reply.local_window_base,
+                    chip_context.bootstrap_reply.actual_window_size,
+                    chip_context.bootstrap_reply.buffer_ptrs,
+                )
     except Exception:
+        if bootstrap_channel is not None:
+            try:
+                bootstrap_channel.write_error(1, _tb.format_exc())
+            except Exception:  # noqa: BLE001
+                pass
         _tb.print_exc()
         struct.pack_into("i", buf, _OFF_ERROR, 99)
         return
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+    state_addr = mailbox_addr + _OFF_STATE
     args_ptr = mailbox_addr + _OFF_ARGS
     sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id}] ready\n")
     sys.stderr.flush()
 
     while True:
-        state = struct.unpack_from("i", buf, _OFF_STATE)[0]
+        state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
             callable_ptr = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
             block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
@@ -185,12 +444,14 @@ def _chip_process_loop(
             error = 0
             try:
                 cw.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
+                if chip_context is not None:
+                    _flush_chip_bootstrap_outputs(cw, chip_context)
             except Exception:  # noqa: BLE001
                 error = 1
             struct.pack_into("i", buf, _OFF_ERROR, error)
-            struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
+            _mailbox_store_i32(state_addr, _TASK_DONE)
         elif state == _SHUTDOWN:
-            cw.finalize()
+            _shutdown_chip_child(cw, chip_context)
             break
 
 
@@ -216,8 +477,9 @@ def _child_worker_loop(
     ``inner_worker.run(orch_fn, args, cfg)`` which opens its own scope,
     runs the orch function, and drains.
     """
+    state_addr = _buffer_field_addr(buf, _OFF_STATE)
     while True:
-        state = struct.unpack_from("i", buf, _OFF_STATE)[0]
+        state = _mailbox_load_i32(state_addr)
         if state == _TASK_READY:
             cid = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
             orch_fn = registry.get(int(cid))
@@ -232,7 +494,7 @@ def _child_worker_loop(
                 except Exception:  # noqa: BLE001
                     error = 2
             struct.pack_into("i", buf, _OFF_ERROR, error)
-            struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
+            _mailbox_store_i32(state_addr, _TASK_DONE)
         elif state == _SHUTDOWN:
             inner_worker.close()
             break
@@ -266,6 +528,9 @@ class Worker:
         # Level-3+ internals
         self._worker: Optional[_Worker] = None
         self._orch: Optional[Orchestrator] = None
+        self._chip_contexts: list[ChipContext] = []
+        self._chip_bootstrap_configs: Optional[list[ChipBootstrapConfig]] = None
+        self._chip_bootstrap_shms: list[SharedMemory] = []
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
         self._sub_shms: list[SharedMemory] = []
@@ -275,6 +540,18 @@ class Worker:
         self._next_level_workers: list[Worker] = []
         self._next_level_shms: list[SharedMemory] = []
         self._next_level_pids: list[int] = []
+
+    def _resolve_chip_bootstrap_configs(self, device_ids: list[int]) -> Optional[list[ChipBootstrapConfig]]:
+        configs = self._config.get("chip_bootstrap_configs")
+        if configs is None:
+            return None
+        if not isinstance(configs, list):
+            raise TypeError("chip_bootstrap_configs must be a list of ChipBootstrapConfig")
+        if any(not isinstance(cfg, ChipBootstrapConfig) for cfg in configs):
+            raise TypeError("chip_bootstrap_configs items must be ChipBootstrapConfig")
+        if len(configs) != len(device_ids):
+            raise ValueError("chip bootstrap config length must match device_ids")
+        return configs
 
     # ------------------------------------------------------------------
     # Callable registration (before init)
@@ -345,6 +622,7 @@ class Worker:
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
         heap_ring_size = self._config.get("heap_ring_size", None)
+        self._chip_bootstrap_configs = self._resolve_chip_bootstrap_configs(device_ids)
 
         # 1. Allocate sub-worker mailboxes (unified layout, MAILBOX_SIZE each).
         for _ in range(n_sub):
@@ -416,8 +694,25 @@ class Worker:
                 self._sub_pids.append(pid)
 
         # Fork ChipWorker processes (L3 with device_ids)
+        pending_bootstrap_channels: list[tuple[DistChipBootstrapChannel, int, int]] = []
         if device_ids:
             for idx, dev_id in enumerate(device_ids):
+                chip_bootstrap_config = None
+                bootstrap_channel = None
+                bootstrap_mailbox_ptr = None
+                bootstrap_buffer_count = 0
+                if self._chip_bootstrap_configs is not None:
+                    chip_bootstrap_config = self._chip_bootstrap_configs[idx]
+                    bootstrap_shm = SharedMemory(create=True, size=DIST_CHIP_BOOTSTRAP_MAILBOX_SIZE)
+                    assert bootstrap_shm.buf is not None
+                    self._chip_bootstrap_shms.append(bootstrap_shm)
+                    bootstrap_channel = DistChipBootstrapChannel(
+                        _mailbox_addr(bootstrap_shm), len(chip_bootstrap_config.buffers)
+                    )
+                    bootstrap_channel.reset()
+                    bootstrap_mailbox_ptr = _mailbox_addr(bootstrap_shm)
+                    bootstrap_buffer_count = len(chip_bootstrap_config.buffers)
+
                 pid = os.fork()
                 if pid == 0:
                     buf = self._chip_shms[idx].buf
@@ -429,10 +724,33 @@ class Worker:
                         self._l3_aicpu_path,
                         self._l3_aicore_path,
                         self._l3_sim_ctx_path,
+                        bootstrap_mailbox_ptr,
+                        bootstrap_buffer_count,
+                        chip_bootstrap_config,
                     )
                     os._exit(0)
                 else:
                     self._chip_pids.append(pid)
+                    if bootstrap_channel is not None:
+                        pending_bootstrap_channels.append((bootstrap_channel, idx, dev_id))
+
+        for bootstrap_channel, chip_index, dev_id in pending_bootstrap_channels:
+            deadline = time.monotonic() + 30.0
+            while bootstrap_channel.state == ChipBootstrapMailboxState.IDLE and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if bootstrap_channel.state == ChipBootstrapMailboxState.ERROR:
+                raise RuntimeError(f"chip bootstrap failed on device {dev_id}: {bootstrap_channel.error_message}")
+            if bootstrap_channel.state != ChipBootstrapMailboxState.SUCCESS:
+                raise RuntimeError(f"chip bootstrap timed out on device {dev_id}")
+
+            reply = ChipBootstrapReply(
+                device_ctx=int(bootstrap_channel.device_ctx),
+                local_window_base=int(bootstrap_channel.local_window_base),
+                actual_window_size=int(bootstrap_channel.actual_window_size),
+                buffer_ptrs=[int(ptr) for ptr in bootstrap_channel.buffer_ptrs],
+            )
+            assert self._chip_bootstrap_configs is not None
+            self._chip_contexts.append(_enrich_chip_context(self._chip_bootstrap_configs[chip_index], dev_id, reply))
 
         # Fork next-level Worker children (L4+ with Worker children).
         # Each child process: init the inner Worker (which mmaps its own
@@ -495,9 +813,15 @@ class Worker:
             self._start_hierarchical()
             assert self._orch is not None
             assert self._worker is not None
+            is_task = isinstance(callable, Task)
+            orch_fn = callable.orch if is_task else callable
+            orch_args = callable.args if is_task else args
             self._orch._scope_begin()
             try:
-                callable(self._orch, args, cfg)
+                if is_task:
+                    orch_fn(self, orch_args)
+                else:
+                    orch_fn(self._orch, orch_args, cfg)
             finally:
                 # Always release scope refs and drain so ring slots aren't
                 # stranded when the orch fn raises mid-DAG.
@@ -554,6 +878,9 @@ class Worker:
             for shm in self._chip_shms:
                 shm.close()
                 shm.unlink()
+            for shm in self._chip_bootstrap_shms:
+                shm.close()
+                shm.unlink()
 
             # Shutdown next-level Worker children (L4+): SHUTDOWN triggers
             # _child_worker_loop to call inner_worker.close() before exiting.
@@ -571,11 +898,17 @@ class Worker:
             self._sub_pids.clear()
             self._chip_shms.clear()
             self._chip_pids.clear()
+            self._chip_bootstrap_shms.clear()
+            self._chip_contexts.clear()
             self._next_level_shms.clear()
             self._next_level_pids.clear()
             self._next_level_workers.clear()
 
         self._initialized = False
+
+    @property
+    def chip_contexts(self) -> list[ChipContext]:
+        return list(self._chip_contexts)
 
     def __enter__(self) -> "Worker":
         return self
