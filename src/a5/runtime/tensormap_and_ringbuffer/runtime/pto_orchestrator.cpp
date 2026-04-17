@@ -517,6 +517,49 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
 }
 
 // =============================================================================
+// Parallel For Iteration Isolation
+// =============================================================================
+
+void pto2_parallel_for_begin(PTO2OrchestratorState *orch) {
+    if (orch->fatal) {
+        return;
+    }
+    // Currently a marker; the real work is done per-iteration in
+    // parallel_scope_begin.  Reserved for future diagnostics/assertions.
+}
+
+void pto2_parallel_scope_begin(PTO2OrchestratorState *orch) {
+    if (orch->fatal) {
+        return;
+    }
+    uint8_t outer_ring = orch->current_ring_id();
+    pto2_scope_begin(orch);
+    uint8_t inner_ring = orch->current_ring_id();
+    if (inner_ring != outer_ring) {
+        // Normal case: a new ring was allocated; set the iteration filter.
+        int32_t next_id = orch->rings[inner_ring].task_allocator.next_local_id();
+        orch->tensor_map.iter_start_local_ids[inner_ring] = next_id;
+    }
+    // else: depth overflow (clamped) — silently degrade to a plain scope.
+}
+
+void pto2_parallel_scope_end(PTO2OrchestratorState *orch) {
+    // iter_start_local_ids is NOT cleared here; the next iteration's
+    // parallel_scope_begin will overwrite it.  parallel_for_end clears it.
+    pto2_scope_end(orch);
+}
+
+void pto2_parallel_for_end(PTO2OrchestratorState *orch) {
+    if (orch->fatal) {
+        return;
+    }
+    uint8_t ring_id = orch->current_ring_id();
+    // Clear the filter; subsequent lookups see all entries on this ring.
+    // In the depth-overflow case the value is already -1 (idempotent).
+    orch->tensor_map.iter_start_local_ids[ring_id] = -1;
+}
+
+// =============================================================================
 // Task Submission
 // =============================================================================
 TaskOutputTensors

@@ -136,6 +136,12 @@ typedef struct PTO2RuntimeOps {
         PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
+
+    // Parallel for iteration isolation
+    void (*parallel_for_begin)(PTO2Runtime *rt);
+    void (*parallel_scope_begin)(PTO2Runtime *rt);
+    void (*parallel_scope_end)(PTO2Runtime *rt);
+    void (*parallel_for_end)(PTO2Runtime *rt);
 } PTO2RuntimeOps;
 
 /**
@@ -253,6 +259,38 @@ static inline void pto2_rt_scope_end() {
         return;
     }
     rt->ops->scope_end(rt);
+}
+
+static inline void pto2_rt_parallel_for_begin() {
+    PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return;
+    }
+    rt->ops->parallel_for_begin(rt);
+}
+
+static inline void pto2_rt_parallel_scope_begin() {
+    PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return;
+    }
+    rt->ops->parallel_scope_begin(rt);
+}
+
+static inline void pto2_rt_parallel_scope_end() {
+    PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return;
+    }
+    rt->ops->parallel_scope_end(rt);
+}
+
+static inline void pto2_rt_parallel_for_end() {
+    PTO2Runtime *rt = pto2_current_runtime();
+    if (rt->ops->is_fatal(rt)) {
+        return;
+    }
+    rt->ops->parallel_for_end(rt);
 }
 
 static inline void pto2_rt_orchestration_done() {
@@ -380,6 +418,68 @@ private:
  *   }
  */
 #define PTO2_SCOPE() if (PTO2_SCOPE_GUARD(); true)
+
+/**
+ * RAII guard for parallel for region (calls parallel_for_begin/end)
+ */
+class PTO2ParallelForGuard {
+public:  // NOLINT(whitespace/indent)
+    PTO2ParallelForGuard() :
+        rt_(pto2_current_runtime()) {
+        if (!rt_->ops->is_fatal(rt_)) {
+            rt_->ops->parallel_for_begin(rt_);
+        }
+    }
+    ~PTO2ParallelForGuard() {
+        if (!rt_->ops->is_fatal(rt_)) {
+            rt_->ops->parallel_for_end(rt_);
+        }
+    }
+
+private:  // NOLINT(whitespace/indent)
+    PTO2Runtime *rt_;
+};
+
+/**
+ * RAII guard for parallel scope (one iteration; calls parallel_scope_begin/end)
+ */
+class PTO2ParallelScopeGuard {
+public:  // NOLINT(whitespace/indent)
+    PTO2ParallelScopeGuard() :
+        rt_(pto2_current_runtime()) {
+        if (!rt_->ops->is_fatal(rt_)) {
+            rt_->ops->parallel_scope_begin(rt_);
+        }
+    }
+    ~PTO2ParallelScopeGuard() {
+        if (!rt_->ops->is_fatal(rt_)) {
+            rt_->ops->parallel_scope_end(rt_);
+        }
+    }
+
+private:  // NOLINT(whitespace/indent)
+    PTO2Runtime *rt_;
+};
+
+#define PTO2_PARALLEL_FOR_GUARD() [[maybe_unused]] PTO2ParallelForGuard _PTO2_CONCATENATE(pf_guard_, __COUNTER__)
+#define PTO2_PARALLEL_SCOPE_GUARD() [[maybe_unused]] PTO2ParallelScopeGuard _PTO2_CONCATENATE(ps_guard_, __COUNTER__)
+
+/**
+ * Parallel for loop with automatic iteration isolation:
+ *   PTO2_PARALLEL_FOR(i, N) {
+ *       submit_iter_tasks(i);
+ *   }
+ */
+#define PTO2_PARALLEL_FOR(var, count)           \
+    if (PTO2_PARALLEL_FOR_GUARD(); true)        \
+        for (int var = 0; var < (count); ++var) \
+            if (PTO2_PARALLEL_SCOPE_GUARD(); true)
+
+/**
+ * Single parallel scope (for manual loop control):
+ *   PTO2_PARALLEL_SCOPE() { submit_iter_tasks(); }
+ */
+#define PTO2_PARALLEL_SCOPE() if (PTO2_PARALLEL_SCOPE_GUARD(); true)
 
 // =============================================================================
 // Orchestration Config

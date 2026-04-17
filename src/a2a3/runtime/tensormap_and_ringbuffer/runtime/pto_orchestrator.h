@@ -169,6 +169,34 @@ void pto2_scope_begin(PTO2OrchestratorState *orch);
 void pto2_scope_end(PTO2OrchestratorState *orch);
 
 // =============================================================================
+// Parallel For Iteration Isolation
+// =============================================================================
+
+/**
+ * Begin a parallel for region.
+ * Currently a no-op marker; reserved for future diagnostics/assertions.
+ */
+void pto2_parallel_for_begin(PTO2OrchestratorState *orch);
+
+/**
+ * Begin a parallel scope (one iteration of a parallel for).
+ * Combines scope_begin + setting the iteration filter boundary.
+ */
+void pto2_parallel_scope_begin(PTO2OrchestratorState *orch);
+
+/**
+ * End a parallel scope (one iteration of a parallel for).
+ * Calls scope_end; does NOT clear the filter (next iteration overwrites it).
+ */
+void pto2_parallel_scope_end(PTO2OrchestratorState *orch);
+
+/**
+ * End a parallel for region.
+ * Clears the iteration filter so subsequent lookups see all entries.
+ */
+void pto2_parallel_for_end(PTO2OrchestratorState *orch);
+
+// =============================================================================
 // Task Submission
 // =============================================================================
 
