@@ -561,8 +561,8 @@ struct PTO2DepListPool {
     std::atomic<int32_t> *error_code_ptr = nullptr;
 
     /**
-     * Initialize dependency list pool
      *
+     * Initialize dependency list pool
      * @param base      Pool base address from shared memory
      * @param capacity  Total number of entries
      */

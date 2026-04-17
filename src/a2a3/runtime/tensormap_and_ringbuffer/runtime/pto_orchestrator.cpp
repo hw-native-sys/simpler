@@ -734,8 +734,8 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
             producer->fanout_count += 1;
         });
 
-        // Push to per-ring wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-        while (!sched->ring_sched_states[ring_id].wiring_queue.push(&cur_slot_state)) {
+        // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
+        while (!sched->wiring_queue.push(&cur_slot_state)) {
             SPIN_WAIT_HINT();
         }
 #if PTO2_ORCH_PROFILING
