@@ -199,7 +199,7 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
             for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
                 pto2_ready_queue_destroy(&sched->ready_queues[i]);
             }
-            pto2_ready_queue_destroy(&sched->wiring_queue);
+            sched->wiring_queue.destroy();
             for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
                 sched->ring_sched_states[rr].destroy();
             }
@@ -208,8 +208,8 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
         sched->ring_sched_states[r].dep_pool.init(dep_entries, dep_pool_capacity, &sm_handle->header->orch_error_code);
     }
 
-    // Initialize global wiring queue (orchestrator pushes, scheduler thread 0 drains)
-    if (!pto2_ready_queue_init(&sched->wiring_queue, PTO2_WRIRING_QUEUE_SIZE)) {
+    // Initialize global wiring queue (SPSC: orchestrator pushes, scheduler thread 0 drains)
+    if (!sched->wiring_queue.init(PTO2_WRIRING_QUEUE_SIZE)) {
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             free(sched->ring_sched_states[r].dep_pool.base);
         }
@@ -234,7 +234,7 @@ void pto2_scheduler_destroy(PTO2SchedulerState *sched) {
         sched->ring_sched_states[r].dep_pool.base = nullptr;
     }
 
-    pto2_ready_queue_destroy(&sched->wiring_queue);
+    sched->wiring_queue.destroy();
 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         pto2_ready_queue_destroy(&sched->ready_queues[i]);

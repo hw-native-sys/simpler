@@ -404,6 +404,92 @@ bool pto2_ready_queue_init(PTO2ReadyQueue *queue, uint64_t capacity);
 void pto2_ready_queue_destroy(PTO2ReadyQueue *queue);
 
 // =============================================================================
+// SPSC Queue (Single-Producer Single-Consumer, wait-free)
+// =============================================================================
+//
+// Bounded ring buffer optimized for the wiring queue use case:
+//   - Producer: orchestrator thread (push)
+//   - Consumer: scheduler thread 0 (pop_batch)
+//
+// Design based on Rigtorp's cached-index technique: each side caches
+// the other's index locally, avoiding cross-core cache line bouncing
+// on the hot path. Only when the local cache says "full" or "empty"
+// does the thread issue an acquire load on the remote index.
+//
+// Memory layout: 4 cache-line-aligned fields ensure zero false sharing.
+
+struct PTO2SpscQueue {
+    // --- Producer cache lines (orchestrator thread) ---
+    alignas(64) std::atomic<uint64_t> head_{0};
+    alignas(64) uint64_t tail_cached_{0};
+
+    // --- Consumer cache lines (scheduler thread 0) ---
+    alignas(64) std::atomic<uint64_t> tail_{0};
+    alignas(64) uint64_t head_cached_{0};
+
+    // --- Shared (immutable after init) ---
+    PTO2TaskSlotState **buffer_{nullptr};
+    uint64_t mask_{0};
+
+    bool init(uint64_t capacity) {
+        buffer_ = static_cast<PTO2TaskSlotState **>(calloc(capacity, sizeof(PTO2TaskSlotState *)));
+        if (!buffer_) return false;
+        mask_ = capacity - 1;
+        head_.store(0, std::memory_order_relaxed);
+        tail_.store(0, std::memory_order_relaxed);
+        tail_cached_ = 0;
+        head_cached_ = 0;
+        return true;
+    }
+
+    void destroy() {
+        if (buffer_) {
+            free(buffer_);
+            buffer_ = nullptr;
+        }
+    }
+
+    // Push one item (producer only). Returns false if queue is full.
+    bool push(PTO2TaskSlotState *item) {
+        uint64_t h = head_.load(std::memory_order_relaxed);
+        uint64_t next_h = h + 1;
+        if (next_h - tail_cached_ > mask_) {
+            tail_cached_ = tail_.load(std::memory_order_acquire);
+            if (next_h - tail_cached_ > mask_) {
+                return false;
+            }
+        }
+        buffer_[h & mask_] = item;
+        head_.store(next_h, std::memory_order_release);
+        return true;
+    }
+
+    // Pop up to max_count items (consumer only). Returns actual count.
+    int pop_batch(PTO2TaskSlotState **out, int max_count) {
+        uint64_t t = tail_.load(std::memory_order_relaxed);
+        uint64_t avail = head_cached_ - t;
+        if (avail == 0) {
+            head_cached_ = head_.load(std::memory_order_acquire);
+            avail = head_cached_ - t;
+            if (avail == 0) return 0;
+        }
+        int count = (avail < static_cast<uint64_t>(max_count)) ? static_cast<int>(avail) : max_count;
+        for (int i = 0; i < count; i++) {
+            out[i] = buffer_[(t + i) & mask_];
+        }
+        tail_.store(t + count, std::memory_order_release);
+        return count;
+    }
+
+    // Approximate size (used for backoff decisions, not exact).
+    uint64_t size() const {
+        uint64_t h = head_.load(std::memory_order_acquire);
+        uint64_t t = tail_.load(std::memory_order_acquire);
+        return h - t;
+    }
+};
+
+// =============================================================================
 // Scheduler State
 // =============================================================================
 
@@ -475,11 +561,11 @@ struct PTO2SchedulerState {
     // count(4B) + index(4B) + batch[15](120B) = 128B = exactly 2 cache lines.
     int wiring_batch_count = 0;
     int wiring_batch_index = 0;
-    static constexpr int WIRING_BATCH_SIZE = 15;
+    static constexpr int WIRING_BATCH_SIZE = 31;
     PTO2TaskSlotState *wiring_batch[WIRING_BATCH_SIZE];
 
     // Global wiring queue — refill path only (every BATCH_SIZE tasks), separate cache line.
-    alignas(64) PTO2ReadyQueue wiring_queue;
+    alignas(64) PTO2SpscQueue wiring_queue;
 
     // Statistics
 #if PTO2_SCHED_PROFILING
