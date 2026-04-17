@@ -18,6 +18,7 @@ list(TRANSFORM BINDING_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 set(HIERARCHICAL_SRC ${CMAKE_SOURCE_DIR}/src/common/hierarchical)
 
 set(HIERARCHICAL_SOURCES
+    ${HIERARCHICAL_SRC}/dist_chip_bootstrap_channel.cpp
     ${HIERARCHICAL_SRC}/types.cpp
     ${HIERARCHICAL_SRC}/tensormap.cpp
     ${HIERARCHICAL_SRC}/ring.cpp

@@ -183,6 +183,8 @@ class CodeRunner:
         kernels_dir: str,
         golden_path: str,
         device_id: Optional[int] = None,
+        device_ids: Optional[list[int]] = None,
+        nranks: Optional[int] = None,
         platform: str = "a2a3",
         enable_profiling: bool = False,
         enable_dump_tensor: bool = False,
@@ -209,8 +211,25 @@ class CodeRunner:
         self.skip_golden = skip_golden
         self.project_root = PROJECT_ROOT
 
-        # Resolve device ID
-        self.device_id = device_id if device_id is not None else 0
+        if device_ids is not None:
+            self.device_ids = [int(dev) for dev in device_ids]
+            if not self.device_ids:
+                raise ValueError("device_ids must not be empty when provided")
+            self._is_distributed = True
+            self.nranks = int(nranks) if nranks is not None else len(self.device_ids)
+            if self.nranks <= 0:
+                raise ValueError("nranks must be positive")
+            if self.nranks != len(self.device_ids):
+                raise ValueError("nranks must match len(device_ids)")
+            self.device_id = self.device_ids[0]
+        else:
+            self._is_distributed = False
+            self.device_id = device_id if device_id is not None else 0
+            self.device_ids = [self.device_id]
+            self.nranks = int(nranks) if nranks is not None else 1
+            if self.nranks != 1:
+                raise ValueError("nranks requires device_ids for distributed mode")
+
         self.pto_isa_commit = pto_isa_commit
         self.clone_protocol = clone_protocol
         self.build_runtime = build_runtime
@@ -674,6 +693,8 @@ def create_code_runner(  # noqa: PLR0913
     kernels_dir,
     golden_path,
     device_id=None,
+    device_ids=None,
+    nranks=None,
     platform="a2a3",
     enable_profiling=False,
     enable_dump_tensor=False,
@@ -691,6 +712,8 @@ def create_code_runner(  # noqa: PLR0913
         kernels_dir=kernels_dir,
         golden_path=golden_path,
         device_id=device_id,
+        device_ids=device_ids,
+        nranks=nranks,
         platform=platform,
         enable_profiling=enable_profiling,
         enable_dump_tensor=enable_dump_tensor,

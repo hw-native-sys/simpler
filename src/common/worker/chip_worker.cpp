@@ -37,6 +37,17 @@ T load_symbol(void *handle, const char *name) {
     return reinterpret_cast<T>(sym);
 }
 
+template <typename T>
+T load_optional_symbol(void *handle, const char *name) {
+    // Like load_symbol(), but tolerates runtimes that do not export
+    // optional extension hooks (for example comm_* support).
+    dlerror();
+    void *sym = dlsym(handle, name);
+    const char *err = dlerror();
+    if (err) return nullptr;
+    return reinterpret_cast<T>(sym);
+}
+
 // Process-wide singleton: libcpu_sim_context.so is loaded once with
 // RTLD_GLOBAL so that host_runtime.so can resolve sim_context_set_* and
 // pto_sim_get_* symbols at runtime.  Never dlclosed.
@@ -114,9 +125,17 @@ void ChipWorker::init(
         create_device_context_fn_ = load_symbol<CreateDeviceContextFn>(handle, "create_device_context");
         destroy_device_context_fn_ = load_symbol<DestroyDeviceContextFn>(handle, "destroy_device_context");
         set_device_fn_ = load_symbol<SetDeviceFn>(handle, "set_device");
+        copy_to_device_ctx_fn_ = load_symbol<CopyToDeviceCtxFn>(handle, "copy_to_device_ctx");
+        copy_from_device_ctx_fn_ = load_symbol<CopyFromDeviceCtxFn>(handle, "copy_from_device_ctx");
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+        comm_init_fn_ = load_optional_symbol<CommInitFn>(handle, "comm_init");
+        comm_alloc_windows_fn_ = load_optional_symbol<CommAllocWindowsFn>(handle, "comm_alloc_windows");
+        comm_get_local_window_base_fn_ = load_optional_symbol<CommGetLocalWindowBaseFn>(handle, "comm_get_local_window_base");
+        comm_get_window_size_fn_ = load_optional_symbol<CommGetWindowSizeFn>(handle, "comm_get_window_size");
+        comm_barrier_fn_ = load_optional_symbol<CommBarrierFn>(handle, "comm_barrier");
+        comm_destroy_fn_ = load_optional_symbol<CommDestroyFn>(handle, "comm_destroy");
     } catch (...) {
         dlclose(handle);
         throw;
@@ -177,9 +196,17 @@ void ChipWorker::finalize() {
     create_device_context_fn_ = nullptr;
     destroy_device_context_fn_ = nullptr;
     set_device_fn_ = nullptr;
+    copy_to_device_ctx_fn_ = nullptr;
+    copy_from_device_ctx_fn_ = nullptr;
     get_runtime_size_fn_ = nullptr;
     run_runtime_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
+    comm_init_fn_ = nullptr;
+    comm_alloc_windows_fn_ = nullptr;
+    comm_get_local_window_base_fn_ = nullptr;
+    comm_get_window_size_fn_ = nullptr;
+    comm_barrier_fn_ = nullptr;
+    comm_destroy_fn_ = nullptr;
     runtime_buf_.clear();
     aicpu_binary_.clear();
     aicore_binary_.clear();
@@ -210,5 +237,92 @@ void ChipWorker::run(const void *callable, const void *args, const ChipCallConfi
     );
     if (rc != 0) {
         throw std::runtime_error("run_runtime failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::copy_to_device(uint64_t dev_ptr, uint64_t host_ptr, size_t size) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    int rc = copy_to_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dev_ptr), reinterpret_cast<const void *>(host_ptr), size);
+    if (rc != 0) {
+        throw std::runtime_error("copy_to_device_ctx failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::copy_from_device(uint64_t host_ptr, uint64_t dev_ptr, size_t size) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    int rc = copy_from_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(host_ptr), reinterpret_cast<const void *>(dev_ptr), size);
+    if (rc != 0) {
+        throw std::runtime_error("copy_from_device_ctx failed with code " + std::to_string(rc));
+    }
+}
+
+uint64_t ChipWorker::comm_init(int rank, int nranks, int device_id, const std::string &rootinfo_path) {
+    if (comm_init_fn_ == nullptr) {
+        throw std::runtime_error("comm_init is not available in this runtime");
+    }
+    void *handle = comm_init_fn_(rank, nranks, device_id, rootinfo_path.c_str());
+    if (handle == nullptr) {
+        throw std::runtime_error("comm_init failed");
+    }
+    return reinterpret_cast<uint64_t>(handle);
+}
+
+uint64_t ChipWorker::comm_alloc_windows(uint64_t comm_handle, size_t win_size) {
+    if (comm_alloc_windows_fn_ == nullptr) {
+        throw std::runtime_error("comm_alloc_windows is not available in this runtime");
+    }
+    uint64_t device_ctx = 0;
+    int rc = comm_alloc_windows_fn_(reinterpret_cast<void *>(comm_handle), win_size, &device_ctx);
+    if (rc != 0) {
+        throw std::runtime_error("comm_alloc_windows failed with code " + std::to_string(rc));
+    }
+    return device_ctx;
+}
+
+uint64_t ChipWorker::comm_get_local_window_base(uint64_t comm_handle) {
+    if (comm_get_local_window_base_fn_ == nullptr) {
+        throw std::runtime_error("comm_get_local_window_base is not available in this runtime");
+    }
+    uint64_t base = 0;
+    int rc = comm_get_local_window_base_fn_(reinterpret_cast<void *>(comm_handle), &base);
+    if (rc != 0) {
+        throw std::runtime_error("comm_get_local_window_base failed with code " + std::to_string(rc));
+    }
+    return base;
+}
+
+size_t ChipWorker::comm_get_window_size(uint64_t comm_handle) {
+    if (comm_get_window_size_fn_ == nullptr) {
+        throw std::runtime_error("comm_get_window_size is not available in this runtime");
+    }
+    size_t win_size = 0;
+    int rc = comm_get_window_size_fn_(reinterpret_cast<void *>(comm_handle), &win_size);
+    if (rc != 0) {
+        throw std::runtime_error("comm_get_window_size failed with code " + std::to_string(rc));
+    }
+    return win_size;
+}
+
+void ChipWorker::comm_barrier(uint64_t comm_handle) {
+    if (comm_barrier_fn_ == nullptr) {
+        throw std::runtime_error("comm_barrier is not available in this runtime");
+    }
+    int rc = comm_barrier_fn_(reinterpret_cast<void *>(comm_handle));
+    if (rc != 0) {
+        throw std::runtime_error("comm_barrier failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::comm_destroy(uint64_t comm_handle) {
+    if (comm_destroy_fn_ == nullptr) {
+        throw std::runtime_error("comm_destroy is not available in this runtime");
+    }
+    int rc = comm_destroy_fn_(reinterpret_cast<void *>(comm_handle));
+    if (rc != 0) {
+        throw std::runtime_error("comm_destroy failed with code " + std::to_string(rc));
     }
 }

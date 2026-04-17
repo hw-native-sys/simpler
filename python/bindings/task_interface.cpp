@@ -600,7 +600,18 @@ NB_MODULE(_task_interface, m) {
         )
         .def_prop_ro("device_id", &ChipWorker::device_id)
         .def_prop_ro("initialized", &ChipWorker::initialized)
-        .def_prop_ro("device_set", &ChipWorker::device_set);
+        .def_prop_ro("device_set", &ChipWorker::device_set)
+        .def("_copy_to_device", &ChipWorker::copy_to_device, nb::arg("dev_ptr"), nb::arg("host_ptr"), nb::arg("size"))
+        .def(
+            "_copy_from_device", &ChipWorker::copy_from_device, nb::arg("host_ptr"), nb::arg("dev_ptr"),
+            nb::arg("size")
+        )
+        .def("comm_init", &ChipWorker::comm_init, nb::arg("rank"), nb::arg("nranks"), nb::arg("device_id"), nb::arg("rootinfo_path"))
+        .def("comm_alloc_windows", &ChipWorker::comm_alloc_windows, nb::arg("comm_handle"), nb::arg("win_size"))
+        .def("comm_get_local_window_base", &ChipWorker::comm_get_local_window_base, nb::arg("comm_handle"))
+        .def("comm_get_window_size", &ChipWorker::comm_get_window_size, nb::arg("comm_handle"))
+        .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"))
+        .def("comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"));
 
     // --- Standalone blob helpers ---
     m.def(

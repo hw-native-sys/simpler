@@ -121,6 +121,24 @@ int set_device(DeviceContextHandle ctx, int device_id) {
     return 0;
 }
 
+int copy_to_device_ctx(DeviceContextHandle ctx, void *dev_ptr, const void *host_ptr, size_t size) {
+    if (ctx == NULL || dev_ptr == NULL || host_ptr == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->copy_to_device(dev_ptr, host_ptr, size);
+    } catch (...) {
+        return -1;
+    }
+}
+
+int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *dev_ptr, size_t size) {
+    if (ctx == NULL || host_ptr == NULL || dev_ptr == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->copy_from_device(host_ptr, dev_ptr, size);
+    } catch (...) {
+        return -1;
+    }
+}
+
 int run_runtime(
     DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
     int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
@@ -141,7 +159,6 @@ int run_runtime(
         r->host_api.copy_from_device = copy_from_device;
         r->host_api.upload_kernel_binary = upload_kernel_binary_wrapper;
         r->host_api.remove_kernel_binary = remove_kernel_binary_wrapper;
-
         int rc = init_runtime_impl(
             r, reinterpret_cast<const ChipCallable *>(callable), reinterpret_cast<const ChipStorageTaskArgs *>(args)
         );

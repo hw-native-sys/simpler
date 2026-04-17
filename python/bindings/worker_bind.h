@@ -32,6 +32,7 @@
 
 #include "chip_worker.h"
 #include "ring.h"
+#include "dist_chip_bootstrap_channel.h"
 #include "orchestrator.h"
 #include "types.h"
 #include "worker.h"
@@ -39,11 +40,48 @@
 
 namespace nb = nanobind;
 
+inline int32_t load_i32_acquire(const volatile int32_t *ptr) {
+    int32_t value;
+#if defined(__aarch64__)
+    __asm__ volatile("ldar %w0, [%1]" : "=r"(value) : "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    value = *ptr;
+    __asm__ volatile("" ::: "memory");
+#else
+    __atomic_load(ptr, &value, __ATOMIC_ACQUIRE);
+#endif
+    return value;
+}
+
+inline void store_i32_release(volatile int32_t *ptr, int32_t value) {
+#if defined(__aarch64__)
+    __asm__ volatile("stlr %w0, [%1]" : : "r"(value), "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    __asm__ volatile("" ::: "memory");
+    *ptr = value;
+#else
+    __atomic_store(ptr, &value, __ATOMIC_RELEASE);
+#endif
+}
+
 inline void bind_worker(nb::module_ &m) {
-    // --- WorkerType ---
+    m.def(
+        "_mailbox_load_i32",
+        [](uint64_t addr) -> int32_t {
+            return load_i32_acquire(reinterpret_cast<const volatile int32_t *>(addr));
+        },
+        nb::arg("addr"), "Internal: acquire-load an int32 mailbox field."
+    );
+    m.def(
+        "_mailbox_store_i32",
+        [](uint64_t addr, int32_t value) {
+            store_i32_release(reinterpret_cast<volatile int32_t *>(addr), value);
+        },
+        nb::arg("addr"), nb::arg("value"), "Internal: release-store an int32 mailbox field."
+    );
+
     nb::enum_<WorkerType>(m, "WorkerType").value("NEXT_LEVEL", WorkerType::NEXT_LEVEL).value("SUB", WorkerType::SUB);
 
-    // --- TaskState ---
     nb::enum_<TaskState>(m, "TaskState")
         .value("FREE", TaskState::FREE)
         .value("PENDING", TaskState::PENDING)
@@ -52,15 +90,42 @@ inline void bind_worker(nb::module_ &m) {
         .value("COMPLETED", TaskState::COMPLETED)
         .value("CONSUMED", TaskState::CONSUMED);
 
-    // --- SubmitResult ---
     nb::class_<SubmitResult>(m, "SubmitResult").def_prop_ro("task_slot", [](const SubmitResult &r) {
         return r.task_slot;
     });
 
-    // --- Orchestrator (DAG builder, exposed via Worker.get_orchestrator()) ---
-    // Bound as `_Orchestrator` because the Python user-facing `Orchestrator`
-    // wrapper (simpler.orchestrator.Orchestrator) holds a borrowed reference
-    // to this C++ type.
+    m.attr("DIST_MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
+    m.attr("DIST_SUB_MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
+    m.attr("DIST_CHIP_MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
+    m.attr("DIST_CHIP_BOOTSTRAP_MAILBOX_SIZE") = static_cast<int>(DIST_CHIP_BOOTSTRAP_MAILBOX_SIZE);
+
+    nb::enum_<ChipBootstrapMailboxState>(m, "ChipBootstrapMailboxState")
+        .value("IDLE", ChipBootstrapMailboxState::IDLE)
+        .value("SUCCESS", ChipBootstrapMailboxState::SUCCESS)
+        .value("ERROR", ChipBootstrapMailboxState::ERROR);
+
+    nb::class_<DistChipBootstrapChannel>(m, "DistChipBootstrapChannel")
+        .def(
+            "__init__",
+            [](DistChipBootstrapChannel *self, uint64_t mailbox_ptr, size_t max_buffer_count) {
+                new (self) DistChipBootstrapChannel(reinterpret_cast<void *>(mailbox_ptr), max_buffer_count);
+            },
+            nb::arg("mailbox_ptr"), nb::arg("max_buffer_count")
+        )
+        .def("reset", &DistChipBootstrapChannel::reset)
+        .def(
+            "write_success", &DistChipBootstrapChannel::write_success, nb::arg("device_ctx"),
+            nb::arg("local_window_base"), nb::arg("actual_window_size"), nb::arg("buffer_ptrs")
+        )
+        .def("write_error", &DistChipBootstrapChannel::write_error, nb::arg("error_code"), nb::arg("message"))
+        .def_prop_ro("state", &DistChipBootstrapChannel::state)
+        .def_prop_ro("error_code", &DistChipBootstrapChannel::error_code)
+        .def_prop_ro("device_ctx", &DistChipBootstrapChannel::device_ctx)
+        .def_prop_ro("local_window_base", &DistChipBootstrapChannel::local_window_base)
+        .def_prop_ro("actual_window_size", &DistChipBootstrapChannel::actual_window_size)
+        .def_prop_ro("buffer_ptrs", &DistChipBootstrapChannel::buffer_ptrs)
+        .def_prop_ro("error_message", &DistChipBootstrapChannel::error_message);
+
     nb::class_<Orchestrator>(m, "_Orchestrator")
         .def(
             "submit_next_level",
