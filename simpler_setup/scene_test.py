@@ -1051,7 +1051,7 @@ class SceneTestCase:
     # ------------------------------------------------------------------
 
     @staticmethod
-    def run_module(module_name):  # noqa: PLR0912 -- CLI parsing + dispatch; branches map to user-facing flags
+    def run_module(module_name):  # noqa: PLR0912, PLR0915 -- CLI parsing + dispatch; branches map to user-facing flags
         """Standalone entry: ``if __name__ == "__main__": SceneTestCase.run_module(__name__)``.
 
         Supports -d as either a single id or a range ("0-7"). When more than
@@ -1115,6 +1115,18 @@ class SceneTestCase:
             ),
         )
         parser.add_argument(
+            "-c",
+            "--pto-isa-commit",
+            default=None,
+            help="Checkout PTO-ISA at this git commit before running.",
+        )
+        parser.add_argument(
+            "--clone-protocol",
+            choices=["ssh", "https"],
+            default="ssh",
+            help="Git protocol for auto-cloning PTO-ISA (used with --pto-isa-commit). Default: ssh.",
+        )
+        parser.add_argument(
             "--log-level",
             choices=LOG_LEVEL_CHOICES,
             default=DEFAULT_LOG_LEVEL,
@@ -1122,6 +1134,15 @@ class SceneTestCase:
         )
         args = parser.parse_args()
         configure_logging(args.log_level)
+
+        if args.pto_isa_commit:
+            import os  # noqa: PLC0415
+
+            from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+
+            os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(
+                commit=args.pto_isa_commit, clone_protocol=args.clone_protocol
+            )
 
         if args.rounds > 1 and args.enable_profiling:
             logger.warning("Profiling disabled: --rounds > 1")

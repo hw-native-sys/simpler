@@ -396,8 +396,8 @@ run_bench() {
     if [[ -n "$test_file" ]]; then
         run_cmd=(
             python3 "$test_file"
-            -p "$PLATFORM" -d "$DEVICE_ID"
-            -n "$ROUNDS" --skip-golden
+            --platform "$PLATFORM" --device "$DEVICE_ID"
+            --rounds "$ROUNDS" --skip-golden
         )
     else
         local kernels_dir="$example_dir/kernels"
@@ -411,6 +411,7 @@ run_bench() {
     fi
     if [[ -n "$case_name" ]]; then
         run_cmd+=(--case "$case_name")
+        [[ -n "$test_file" ]] && run_cmd+=(--manual include)
     fi
     run_cmd+=("${EXTRA_ARGS[@]}")
 

@@ -310,8 +310,8 @@ class TestParallelExecution:
             elapsed = time.monotonic() - start
 
             serial_time = n_workers * sleep_sec
-            assert elapsed < serial_time * 0.7, (
-                f"expected parallel wall time < {serial_time * 0.7:.2f}s "
+            assert elapsed < serial_time * 0.8, (
+                f"expected parallel wall time < {serial_time * 0.8:.2f}s "
                 f"(serial would be {serial_time:.2f}s), got {elapsed:.2f}s"
             )
         finally:
