@@ -2050,7 +2050,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         // Phase 3: Drain wiring queue — wire fanout edges for newly submitted tasks.
         // Only thread 0 does wiring to keep dep_pool single-threaded.
         if (thread_idx == 0) {
-            int wired = rt->scheduler.drain_wiring_queue();
+            int wired = rt->scheduler.drain_wiring_queue(orchestrator_done_);
             if (wired > 0) {
                 made_progress = true;
 #if PTO2_SCHED_PROFILING

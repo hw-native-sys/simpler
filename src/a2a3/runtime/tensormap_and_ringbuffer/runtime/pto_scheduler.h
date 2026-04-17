@@ -498,10 +498,10 @@ struct PTO2SchedulerState {
      *
      * @return Number of tasks wired this call.
      */
-    int drain_wiring_queue() {
+    int drain_wiring_queue(bool force_drain = false) {
         int wired = 0;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            wired += drain_ring_wiring_queue(r);
+            wired += drain_ring_wiring_queue(r, force_drain);
         }
         return wired;
     }
@@ -510,12 +510,18 @@ struct PTO2SchedulerState {
      * Drain the wiring queue for a single ring. See drain_wiring_queue() for
      * the peek/pop_batch FIFO protocol. Returns the number of tasks wired.
      */
-    int drain_ring_wiring_queue(int ring_id) {
+    static constexpr int WIRING_BACKOFF_THRESHOLD = 16;
+
+    int drain_ring_wiring_queue(int ring_id, bool force_drain = false) {
         auto &rss = ring_sched_states[ring_id];
         int wired = 0;
 
         // Refill local batch buffer when exhausted.
         if (rss.wiring_batch_index >= rss.wiring_batch_count) {
+            // Backoff: skip pop when fewer than WIRING_BACKOFF_THRESHOLD tasks
+            // are queued, reducing contention with the orchestrator's push path.
+            // Bypassed when force_drain is set (orchestrator done — must flush tail).
+            if (!force_drain && rss.wiring_queue.size() < WIRING_BACKOFF_THRESHOLD) return 0;
             rss.wiring_batch_count = rss.wiring_queue.pop_batch(rss.wiring_batch, RingSchedState::WIRING_BATCH_SIZE);
             rss.wiring_batch_index = 0;
             if (rss.wiring_batch_count == 0) return 0;
