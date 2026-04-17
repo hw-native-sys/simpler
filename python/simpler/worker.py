@@ -341,10 +341,8 @@ def _enrich_chip_context(
     )
 
 
-def _run_chip_bootstrap(
-    worker: ChipWorker, device_id: int, chip_bootstrap_config: ChipBootstrapConfig
-) -> ChipBootstrapState:
-    bootstrap = worker.bootstrap_context(device_id, chip_bootstrap_config)
+def _run_chip_bootstrap(cw: ChipWorker, device_id: int, chip_bootstrap_config: ChipBootstrapConfig) -> ChipBootstrapState:
+    bootstrap = cw.bootstrap_context(device_id, chip_bootstrap_config)
     return ChipBootstrapState(
         bootstrap_config=chip_bootstrap_config,
         comm_handle=bootstrap.comm_handle,
@@ -357,25 +355,25 @@ def _run_chip_bootstrap(
     )
 
 
-def _flush_chip_bootstrap_outputs(worker: ChipWorker, chip_context: ChipBootstrapState) -> None:
+def _flush_chip_bootstrap_outputs(cw: ChipWorker, chip_context: ChipBootstrapState) -> None:
     if chip_context.comm_handle is not None:
-        worker.comm_barrier(chip_context.comm_handle)
+        cw.comm_barrier(chip_context.comm_handle)
     for buf_cfg in chip_context.buffers:
         if not buf_cfg.store_to_host:
             continue
         ptr = chip_context.buffer_ptrs[buf_cfg.name]
         staged = chip_context.output_staging(buf_cfg.name)
-        _write_shared_memory_bytes(staged.shm_name, worker.copy_device_to_bytes(ptr, buf_cfg.nbytes), staged.size)
+        _write_shared_memory_bytes(staged.shm_name, cw.copy_device_to_bytes(ptr, buf_cfg.nbytes), staged.size)
 
 
-def _shutdown_chip_child(worker: ChipWorker, chip_context: Optional[ChipBootstrapState]) -> None:
+def _shutdown_chip_child(cw: ChipWorker, chip_context: Optional[ChipBootstrapState]) -> None:
     if chip_context is not None:
-        worker.shutdown_bootstrap_context(
+        cw.shutdown_bootstrap_context(
             chip_context.bootstrap_config,
             comm_handle=chip_context.comm_handle or 0,
             buffer_ptrs=[chip_context.buffer_ptrs[buf.name] for buf in chip_context.buffers],
         )
-    worker.finalize()
+    cw.finalize()
 
 
 def _chip_process_loop(
@@ -396,7 +394,7 @@ def _chip_process_loop(
     """
     import traceback as _tb  # noqa: PLC0415
 
-    worker: Optional[ChipWorker] = None
+    cw: Optional[ChipWorker] = None
     chip_context: Optional[ChipBootstrapState] = None
     bootstrap_channel = (
         DistChipBootstrapChannel(bootstrap_mailbox_ptr, bootstrap_buffer_count)
@@ -404,14 +402,14 @@ def _chip_process_loop(
         else None
     )
     try:
-        worker = ChipWorker()
-        worker.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path)
+        cw = ChipWorker()
+        cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path)
         if chip_bootstrap_config is None:
-            worker.set_device(device_id)
+            cw.set_device(device_id)
             if bootstrap_channel is not None:
                 bootstrap_channel.write_success(0, 0, 0, [])
         else:
-            chip_context = _run_chip_bootstrap(worker, device_id, chip_bootstrap_config)
+            chip_context = _run_chip_bootstrap(cw, device_id, chip_bootstrap_config)
             if bootstrap_channel is not None:
                 bootstrap_channel.write_success(
                     chip_context.bootstrap_reply.device_ctx,
@@ -445,15 +443,15 @@ def _chip_process_loop(
 
             error = 0
             try:
-                worker.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
+                cw.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
                 if chip_context is not None:
-                    _flush_chip_bootstrap_outputs(worker, chip_context)
+                    _flush_chip_bootstrap_outputs(cw, chip_context)
             except Exception:  # noqa: BLE001
                 error = 1
             struct.pack_into("i", buf, _OFF_ERROR, error)
             _mailbox_store_i32(state_addr, _TASK_DONE)
         elif state == _SHUTDOWN:
-            _shutdown_chip_child(worker, chip_context)
+            _shutdown_chip_child(cw, chip_context)
             break
 
 
@@ -829,34 +827,6 @@ class Worker:
                 # stranded when the orch fn raises mid-DAG.
                 self._orch._scope_end()
                 self._orch._drain()
-
-    def submit_next_level(self, callable_, args, config=None):
-        assert self._orch is not None
-        return self._orch.submit_next_level(callable_, args, config)
-
-    def submit_next_level_group(self, callable_, args_list, config=None):
-        assert self._orch is not None
-        return self._orch.submit_next_level_group(callable_, args_list, config)
-
-    def submit_sub(self, callable_id, args=None):
-        assert self._orch is not None
-        return self._orch.submit_sub(callable_id, args)
-
-    def submit_sub_group(self, callable_id, args_list):
-        assert self._orch is not None
-        return self._orch.submit_sub_group(callable_id, args_list)
-
-    def alloc(self, shape, dtype):
-        assert self._orch is not None
-        return self._orch.alloc(shape, dtype)
-
-    def scope_begin(self):
-        assert self._orch is not None
-        return self._orch.scope_begin()
-
-    def scope_end(self):
-        assert self._orch is not None
-        return self._orch.scope_end()
 
     def _run_as_child(self, cid: int, args, config) -> None:
         """Called from C++ _Worker::run when this Worker is a THREAD-mode child.

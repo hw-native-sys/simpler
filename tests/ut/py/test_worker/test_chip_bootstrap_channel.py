@@ -39,7 +39,6 @@ from simpler.worker import (  # noqa: E402
     ChipCommBootstrapConfig,
     ChipContext,
     HostBufferStaging,
-    Task,
     Worker,
 )
 from simpler_setup.runtime_builder import RuntimeBuilder  # noqa: E402
@@ -139,8 +138,8 @@ def _level3_bootstrap_entry(
 
         observed: dict[str, object] = {}
 
-        def orch_fn(l3_worker, _args):
-            contexts = sorted(l3_worker.chip_contexts, key=lambda ctx: ctx.rank)
+        def orch_fn(o, _args, _cfg):
+            contexts = sorted(worker.chip_contexts, key=lambda ctx: ctx.rank)
             observed["contexts"] = [
                 {
                     "rank": ctx.rank,
@@ -160,7 +159,7 @@ def _level3_bootstrap_entry(
                 task_args.add_tensor(make_tensor_arg(host_outputs_f[rank]), TensorArgType.OUTPUT_EXISTING)
                 args_list.append(task_args)
 
-            l3_worker.submit_next_level_group(vector_kernel, args_list, config)
+            o.submit_next_level_group(vector_kernel, args_list, config)
 
         worker = Worker(
             level=3,
@@ -174,7 +173,7 @@ def _level3_bootstrap_entry(
 
         try:
             worker.init()
-            worker.run(Task(orch=orch_fn))
+            worker.run(orch_fn)
 
             expected_rank0 = (host_inputs_a[0] + host_inputs_b[0] + 1) * (host_inputs_a[0] + host_inputs_b[0] + 2) + (
                 host_inputs_a[0] + host_inputs_b[0]

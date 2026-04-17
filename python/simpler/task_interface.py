@@ -240,10 +240,6 @@ class ChipWorker:
             setattr(config, k, v)
         self._impl.run(callable, args, config)
 
-    def run_raw(self, callable, args, *, block_dim=1, aicpu_thread_num=3, enable_profiling=False):
-        """Run a callable using raw pointer arguments."""
-        self._impl.run_raw(int(callable), int(args), int(block_dim), int(aicpu_thread_num), bool(enable_profiling))
-
     def run_from_blob(self, callable, blob_ptr, block_dim=1, aicpu_thread_num=3, enable_profiling=False):
         """Run a callable from a length-prefixed TaskArgs blob."""
         self._impl.run_from_blob(

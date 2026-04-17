@@ -65,6 +65,7 @@ inline void store_i32_release(volatile int32_t *ptr, int32_t value) {
 }
 
 inline void bind_worker(nb::module_ &m) {
+        // --- WorkerType ---
     m.def(
         "_mailbox_load_i32",
         [](uint64_t addr) -> int32_t {
@@ -82,6 +83,7 @@ inline void bind_worker(nb::module_ &m) {
 
     nb::enum_<WorkerType>(m, "WorkerType").value("NEXT_LEVEL", WorkerType::NEXT_LEVEL).value("SUB", WorkerType::SUB);
 
+    // --- TaskState ---
     nb::enum_<TaskState>(m, "TaskState")
         .value("FREE", TaskState::FREE)
         .value("PENDING", TaskState::PENDING)
@@ -89,11 +91,16 @@ inline void bind_worker(nb::module_ &m) {
         .value("RUNNING", TaskState::RUNNING)
         .value("COMPLETED", TaskState::COMPLETED)
         .value("CONSUMED", TaskState::CONSUMED);
-
+        
+    // --- SubmitResult ---
     nb::class_<SubmitResult>(m, "SubmitResult").def_prop_ro("task_slot", [](const SubmitResult &r) {
         return r.task_slot;
     });
-
+    
+    // --- Orchestrator (DAG builder, exposed via Worker.get_orchestrator()) ---
+    // Bound as `_Orchestrator` because the Python user-facing `Orchestrator`
+    // wrapper (simpler.orchestrator.Orchestrator) holds a borrowed reference
+    // to this C++ type.
     m.attr("DIST_MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
     m.attr("DIST_SUB_MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
     m.attr("DIST_CHIP_MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
