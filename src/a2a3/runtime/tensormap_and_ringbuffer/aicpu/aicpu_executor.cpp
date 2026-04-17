@@ -864,7 +864,7 @@ struct AicpuExecutor {
         PTO2TaskSlotState &slot_state, int32_t expected_reg_task_id, PTO2SubtaskSlot subslot, int32_t thread_idx,
         int32_t core_id, Handshake *hank, int32_t &completed_this_turn,
         PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
-        PTO2LocalReadyBuffer *local_bufs, CoreType ct
+        PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
         ,
         uint64_t dispatch_ts
@@ -872,6 +872,8 @@ struct AicpuExecutor {
     ) {
 #if PTO2_PROFILING
         auto &perf = sched_perf_[thread_idx];
+#else
+        (void)hank;
 #endif
         bool mixed_complete = rt->scheduler.on_subtask_complete(slot_state);
         if (mixed_complete) {
@@ -940,7 +942,8 @@ struct AicpuExecutor {
             int32_t perf_slot_idx = static_cast<int32_t>(subslot);
             if (perf_aicpu_complete_record(
                     pbuf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
-                    slot_state.task->kernel_id[perf_slot_idx], ct, dispatch_ts, finish_ts, fanout_arr, fanout_n
+                    slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts,
+                    fanout_arr, fanout_n
                 ) != 0) {
                 DEV_ERROR(
                     "Core %d: perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
@@ -972,7 +975,6 @@ struct AicpuExecutor {
         core.running_reg_task_id = AICPU_TASK_INVALID;
     }
 
-    template <CoreType CT>
     void check_running_cores_for_completion(
         int32_t thread_idx, Handshake *hank, int32_t &completed_this_turn, int32_t &cur_thread_completed,
         bool &made_progress, PTO2TaskSlotState *deferred_release_slot_states[], int32_t &deferred_release_count,
@@ -982,7 +984,7 @@ struct AicpuExecutor {
         auto &perf = sched_perf_[thread_idx];
 #endif
         CoreTracker &tracker = core_trackers_[thread_idx];
-        auto running_core_states = tracker.get_running_cores<CT>();
+        auto running_core_states = tracker.get_all_running_cores();
         while (running_core_states.has_value()) {
             int32_t bit_pos = running_core_states.pop_first();
             int32_t core_id = tracker.get_core_id_by_offset(bit_pos);
@@ -1015,7 +1017,7 @@ struct AicpuExecutor {
             if (t.pending_done) {
                 complete_slot_task(
                     *core.pending_slot_state, core.pending_reg_task_id, core.pending_subslot, thread_idx, core_id, hank,
-                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs, CT
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                     ,
                     core.pending_dispatch_timestamp
@@ -1026,7 +1028,7 @@ struct AicpuExecutor {
             if (t.running_done) {
                 complete_slot_task(
                     *core.running_slot_state, core.running_reg_task_id, core.running_subslot, thread_idx, core_id, hank,
-                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs, CT
+                    completed_this_turn, deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                     ,
                     core.running_dispatch_timestamp
@@ -1995,20 +1997,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         // Phase 1: Check running cores for completion, process and move to idle
         int32_t completed_this_turn = 0;
 
-        // Check AIC running cores
-        bool try_completed = false;
-        if (tracker.has_running_cores<CoreType::AIC>()) {
-            try_completed = true;
-            check_running_cores_for_completion<CoreType::AIC>(
-                thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
-                deferred_release_slot_states, deferred_release_count, local_bufs
-            );
-        }
-
-        // Check AIV running cores
-        if (tracker.has_running_cores<CoreType::AIV>()) {
-            try_completed = true;
-            check_running_cores_for_completion<CoreType::AIV>(
+        bool try_completed = tracker.has_any_running_cores();
+        if (try_completed) {
+            check_running_cores_for_completion(
                 thread_idx, hank, completed_this_turn, cur_thread_completed, made_progress,
                 deferred_release_slot_states, deferred_release_count, local_bufs
             );
