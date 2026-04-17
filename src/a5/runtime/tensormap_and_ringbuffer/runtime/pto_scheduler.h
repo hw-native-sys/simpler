@@ -404,6 +404,97 @@ bool pto2_ready_queue_init(PTO2ReadyQueue *queue, uint64_t capacity);
 void pto2_ready_queue_destroy(PTO2ReadyQueue *queue);
 
 // =============================================================================
+// SPSC Queue (Single-Producer Single-Consumer, wait-free)
+// =============================================================================
+//
+// Bounded ring buffer optimized for the wiring queue use case:
+//   - Producer: orchestrator thread (push)
+//   - Consumer: scheduler thread 0 (pop_batch)
+//
+// Design based on Rigtorp's cached-index technique: each side caches
+// the other's index locally, avoiding cross-core cache line bouncing
+// on the hot path. Only when the local cache says "full" or "empty"
+// does the thread issue an acquire load on the remote index.
+//
+// Memory layout: 4 cache-line-aligned fields ensure zero false sharing.
+
+struct PTO2SpscQueue {
+    // --- Producer cache lines (orchestrator thread) ---
+    alignas(64) std::atomic<uint64_t> head_{0};
+    alignas(64) uint64_t tail_cached_{0};
+
+    // --- Consumer cache lines (scheduler thread 0) ---
+    alignas(64) std::atomic<uint64_t> tail_{0};
+    alignas(64) uint64_t head_cached_{0};
+
+    // --- Shared (immutable after init) ---
+    PTO2TaskSlotState **buffer_{nullptr};
+    uint64_t mask_{0};
+
+    bool init(uint64_t capacity) {
+        if (capacity == 0 || (capacity & (capacity - 1)) != 0) return false;
+        buffer_ = static_cast<PTO2TaskSlotState **>(calloc(capacity, sizeof(PTO2TaskSlotState *)));
+        if (!buffer_) return false;
+        mask_ = capacity - 1;
+        head_.store(0, std::memory_order_relaxed);
+        tail_.store(0, std::memory_order_relaxed);
+        tail_cached_ = 0;
+        head_cached_ = 0;
+        return true;
+    }
+
+    void destroy() {
+        if (buffer_) {
+            free(buffer_);
+            buffer_ = nullptr;
+        }
+    }
+
+    // Push one item (producer only). Returns false if queue is full.
+    // Full condition: next_h - tail > mask_ (i.e. > capacity-1), meaning all
+    // capacity slots are occupied. This uses strict '>' so all capacity slots
+    // are usable (no wasted sentinel slot). uint64_t wrapping is safe since
+    // head and tail are monotonically increasing and subtraction wraps correctly.
+    bool push(PTO2TaskSlotState *item) {
+        uint64_t h = head_.load(std::memory_order_relaxed);
+        uint64_t next_h = h + 1;
+        if (next_h - tail_cached_ > mask_) {
+            tail_cached_ = tail_.load(std::memory_order_acquire);
+            if (next_h - tail_cached_ > mask_) {
+                return false;
+            }
+        }
+        buffer_[h & mask_] = item;
+        head_.store(next_h, std::memory_order_release);
+        return true;
+    }
+
+    // Pop up to max_count items (consumer only). Returns actual count.
+    int pop_batch(PTO2TaskSlotState **out, int max_count) {
+        uint64_t t = tail_.load(std::memory_order_relaxed);
+        uint64_t avail = head_cached_ - t;
+        if (avail == 0) {
+            head_cached_ = head_.load(std::memory_order_acquire);
+            avail = head_cached_ - t;
+            if (avail == 0) return 0;
+        }
+        int count = (avail < static_cast<uint64_t>(max_count)) ? static_cast<int>(avail) : max_count;
+        for (int i = 0; i < count; i++) {
+            out[i] = buffer_[(t + i) & mask_];
+        }
+        tail_.store(t + count, std::memory_order_release);
+        return count;
+    }
+
+    // Approximate size (used for backoff decisions, not exact).
+    uint64_t size() const {
+        uint64_t h = head_.load(std::memory_order_acquire);
+        uint64_t t = tail_.load(std::memory_order_acquire);
+        return h - t;
+    }
+};
+
+// =============================================================================
 // Scheduler State
 // =============================================================================
 
@@ -430,26 +521,16 @@ struct PTO2SchedulerState {
 
     // Per-ring state
     struct RingSchedState {
+        // --- Completion/dispatch hot path (all scheduler threads) ---
         PTO2TaskDescriptor *task_descriptors;
         PTO2TaskSlotState *slot_states;
         int32_t last_task_alive;
         int32_t task_window_mask;
         uint64_t task_window_size;
-        // Try-lock used to advance this ring's last_task_alive pointer.
-        std::atomic<int32_t> advance_lock;
+        std::atomic<int32_t> advance_lock;  // multi-thread CAS
 
-        // Dep pool for fanout wiring (exclusively managed by scheduler thread 0)
-        PTO2DepListPool dep_pool;
-
-        // Per-ring wiring queue: orchestrator pushes tasks, scheduler thread 0 pops and wires.
-        PTO2ReadyQueue wiring_queue;
-
-        // Local batch buffer for drain_wiring_queue (scheduler thread 0 only).
-        // Persists across calls so partially-consumed batches resume next call.
-        static constexpr int WIRING_BATCH_SIZE = 16;
-        PTO2TaskSlotState *wiring_batch[WIRING_BATCH_SIZE];
-        int wiring_batch_count = 0;
-        int wiring_batch_index = 0;
+        // --- Wiring hot path (thread 0 only, isolated from completion traffic) ---
+        alignas(64) PTO2DepListPool dep_pool;
 
         bool init(PTO2SharedMemoryHandle *sm_handle, int32_t ring_id);
         void destroy();
@@ -457,7 +538,6 @@ struct PTO2SchedulerState {
         PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) {
             return slot_states[local_id & task_window_mask];
         }
-
         PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
 
         void sync_to_sm(PTO2SharedMemoryRingHeader &ring) {
@@ -482,6 +562,16 @@ struct PTO2SchedulerState {
     // Ready queues remain global (scheduling is ring-agnostic)
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
+    // Global wiring batch buffer — thread 0 only, tight layout for cache locality.
+    // count(4B) + index(4B) + batch[31](248B) = 256B = exactly 4 cache lines.
+    int wiring_batch_count = 0;
+    int wiring_batch_index = 0;
+    static constexpr uint64_t WIRING_BATCH_SIZE = 31;
+    PTO2TaskSlotState *wiring_batch[WIRING_BATCH_SIZE];
+
+    // Global wiring queue — refill path only (every BATCH_SIZE tasks), separate cache line.
+    alignas(64) PTO2SpscQueue wiring_queue;
+
     // Statistics
 #if PTO2_SCHED_PROFILING
     std::atomic<int64_t> tasks_completed;
@@ -499,32 +589,26 @@ struct PTO2SchedulerState {
      *
      * @return Number of tasks wired this call.
      */
-    int drain_wiring_queue() {
-        int wired = 0;
-        for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            wired += drain_ring_wiring_queue(r);
-        }
-        return wired;
-    }
 
-    /**
-     * Drain the wiring queue for a single ring. See drain_wiring_queue() for
-     * the peek/pop_batch FIFO protocol. Returns the number of tasks wired.
-     */
-    int drain_ring_wiring_queue(int ring_id) {
-        auto &rss = ring_sched_states[ring_id];
+    int drain_wiring_queue(bool force_drain = false) {
         int wired = 0;
 
         // Refill local batch buffer when exhausted.
-        if (rss.wiring_batch_index >= rss.wiring_batch_count) {
-            rss.wiring_batch_count = rss.wiring_queue.pop_batch(rss.wiring_batch, RingSchedState::WIRING_BATCH_SIZE);
-            rss.wiring_batch_index = 0;
-            if (rss.wiring_batch_count == 0) return 0;
+        if (wiring_batch_index >= wiring_batch_count) {
+            // Backoff: skip pop when fewer than WIRING_BACKOFF_THRESHOLD tasks
+            // are queued, reducing contention with the orchestrator's push path.
+            // Bypassed when force_drain is set (orchestrator done — must flush tail).
+            if (!force_drain && wiring_queue.size() < WIRING_BATCH_SIZE) return 0;
+            wiring_batch_count = wiring_queue.pop_batch(wiring_batch, WIRING_BATCH_SIZE);
+            wiring_batch_index = 0;
+            if (wiring_batch_count == 0) return 0;
         }
 
         // Process tasks from local buffer in strict FIFO order.
-        while (rss.wiring_batch_index < rss.wiring_batch_count) {
-            PTO2TaskSlotState *ws = rss.wiring_batch[rss.wiring_batch_index];
+        while (wiring_batch_index < wiring_batch_count) {
+            PTO2TaskSlotState *ws = wiring_batch[wiring_batch_index];
+            int ring_id = ws->ring_id;
+            auto &rss = ring_sched_states[ring_id];
             int32_t wfanin = ws->payload->fanin_actual_count;
 
             if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
@@ -534,10 +618,11 @@ struct PTO2SchedulerState {
                 }
             }
 
-            rss.wiring_batch_index++;
-            wire_task(ring_id, ws);
+            wiring_batch_index++;
+            wire_task(rss, ws, wfanin);
             wired++;
         }
+
         return wired;
     }
 
@@ -546,10 +631,8 @@ struct PTO2SchedulerState {
      * producer's fanout_lock, allocates dep_pool entries for live producers,
      * pushes the task to the ready queue once its fanin refcount is satisfied.
      */
-    void wire_task(int ring_id, PTO2TaskSlotState *ws) {
-        auto &rss = ring_sched_states[ring_id];
+    void wire_task(RingSchedState &rss, PTO2TaskSlotState *ws, int32_t wfanin) {
         PTO2TaskPayload *wp = ws->payload;
-        int32_t wfanin = wp->fanin_actual_count;
         ws->fanin_count = wfanin + 1;
 
         if (wfanin != 0) {
@@ -581,6 +664,7 @@ struct PTO2SchedulerState {
     PTO2TaskSlotState &get_slot_state(int32_t ring_id, int32_t local_id) {
         return ring_sched_states[ring_id].get_slot_state_by_task_id(local_id);
     }
+
     PTO2TaskSlotState &get_slot_state_by_slot(int32_t ring_id, int32_t slot) {
         return ring_sched_states[ring_id].get_slot_state_by_slot(slot);
     }

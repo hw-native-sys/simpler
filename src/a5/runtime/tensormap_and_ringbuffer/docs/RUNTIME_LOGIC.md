@@ -396,16 +396,16 @@ Key members:
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
 | 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >16); increment each producer's `fanout_count` (no lock needed — single writer) |
-| 6 | **Push to wiring queue**: scheduler thread 0 asynchronously wires fanout edges (lock + dep_pool + early_finished check + ready push) |
+| 6 | **Push to wiring queue**: push to global `PTO2SpscQueue`; scheduler thread 0 asynchronously wires fanout edges (lock + dep_pool + early_finished check + ready push) |
 
 > **Note**: Fanout wiring (Steps 4–7 in earlier versions) has been moved from the
-> orchestrator submit hot path to the scheduler's `wiring_queue`. This reduces the
+> orchestrator submit hot path to the scheduler's global `wiring_queue` (SPSC). This reduces the
 > orchestrator's shared L2 cache / memory bus pressure, as the orchestrator no longer
 > acquires `fanout_lock` or allocates from `dep_pool` during submission.
 
 ### 7.3 Deferred Fanout Wiring (Scheduler Wiring Queue)
 
-The orchestrator pushes each submitted task to `scheduler->wiring_queue`. Scheduler thread 0 drains this queue and, for each task:
+The orchestrator pushes each submitted task to the global `scheduler->wiring_queue` (a wait-free SPSC queue). Scheduler thread 0 drains this queue in batches (with backoff until batch-size items are queued), and for each task:
 
 1. Sets `fanin_count = N + 1` (+1 redundance to prevent premature readiness)
 2. For each producer in `payload->fanin_slot_states[]`:
