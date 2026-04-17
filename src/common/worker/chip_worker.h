@@ -18,7 +18,7 @@
 
 #include "../task_interface/chip_call_config.h"
 #include "../task_interface/task_args.h"
-#include "dist_types.h"
+#include "types.h"
 
 class ChipWorker : public IWorker {
 public:

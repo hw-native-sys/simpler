@@ -1,11 +1,5 @@
 # Task Flow — Callable / TaskArgs / CallConfig Pass-Through
 
-> **Status**: describes the **target** design. The unified `TaskArgs` +
-> tag-driven submit + Orchestrator-owned drain are landed; the
-> `IWorker::run(callable, view, config)` signature and length-prefixed
-> mailbox blob are not yet (target landing: PR-C). See
-> [roadmap.md](roadmap.md) for the full landed-vs-planned breakdown.
-
 This document specifies **what data flows through the hierarchical runtime and
 what shapes it takes at each stage**. It covers:
 
@@ -22,7 +16,7 @@ scheduled), see:
 - [scheduler.md](scheduler.md) — dispatch loop, queues, completion handling
 - [worker-manager.md](worker-manager.md) — WorkerThread, THREAD/PROCESS
   modes, mailbox mechanics
-- [distributed_level_runtime.md](distributed_level_runtime.md) — level model
+- [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — level model
   and how components compose
 
 ---
@@ -353,28 +347,27 @@ The mailbox layout, fork ordering, and child loop are in
 
 | Region | Lives in | Used by | Lifetime |
 | ------ | -------- | ------- | -------- |
-| `DistRing` slot-state pool (`std::deque<unique_ptr<TaskSlotState>>`) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | monotonic task-id; reset at `Worker.run` drain |
+| `Ring` slot-state pool (`std::deque<unique_ptr<TaskSlotState>>`) | parent heap | Orchestrator, Scheduler, WorkerThread parent side | monotonic task-id; reset at `Worker.run` drain |
 | `slot.task_args` (single) or `task_args_list[N]` (group, vector-backed) | parent heap | same | until slot reaches CONSUMED |
 | per-WT mailbox (PROCESS only) | shm MAP_SHARED | parent WorkerThread writes, child reads | lifetime of WorkerThread |
 | **HeapRing[0..3]** (user OUTPUT auto-alloc + `orch.alloc`) | **4 separate shm MAP_SHARED mmaps**, one per scope-layer ring | output to user code; inherited by forked children | per-ring FIFO via `rings_[r].last_alive`; scope depth picks the ring |
 | tensor data bytes (user-provided) | torch shm (`share_memory_()` or equiv) | kernel reads/writes | user-managed |
 | `Callable` target (ChipCallable / OrchFn / Python fn) | parent heap | child via fork COW | pre-fork registered |
 
-Slot state lives inside `DistRing` as `std::deque<std::unique_ptr<…>>` so
-`push_back` never invalidates pointers to live slots (see PR-I in
-[roadmap.md](roadmap.md)). `ring.slot_state(id)` hands out a stable
-pointer for every live slot; `drain()` calls `ring.reset_to_empty()` to
-drop all slot state at the end of each `Worker.run`, bounding per-run
-memory.
+Slot state lives inside `Ring` as `std::deque<std::unique_ptr<…>>` so
+`push_back` never invalidates pointers to live slots.
+`ring.slot_state(id)` hands out a stable pointer for every live slot;
+`drain()` calls `ring.reset_to_empty()` to drop all slot state at the
+end of each `Worker.run`, bounding per-run memory.
 
-The HeapRing is **partitioned into `DIST_MAX_RING_DEPTH = 4` independent
+The HeapRing is **partitioned into `MAX_RING_DEPTH = 4` independent
 rings** (Strict-1; matches L2's `PTO2_MAX_RING_DEPTH`). Each ring is its
 own `mmap(MAP_SHARED | MAP_ANONYMOUS)` taken before fork, so children
 inherit all four at the same virtual addresses. The `heap_ring_size`
 knob on `Worker(...)` is the **per-ring** size (default 1 GiB → 4 GiB
 total VA reservation); physical pages remain lazy under
 `MAP_ANONYMOUS`. A task's ring is chosen by scope depth,
-`min(scope_depth, DIST_MAX_RING_DEPTH - 1)`, so inner-scope tasks
+`min(scope_depth, MAX_RING_DEPTH - 1)`, so inner-scope tasks
 reclaim independently of outer-scope tasks. See
 [orchestrator.md §5](orchestrator.md) for the allocator internals and
 [orchestrator.md §6](orchestrator.md) for the scope → ring mapping.
@@ -441,27 +434,27 @@ At L4 the `Callable` passed to `submit_next_level` is a **registry id**
 
 ### Fork sequence
 
-L4's `init()` allocates the L4 DistWorker's HeapRing (before fork).
-On first `run()`, the deferred `_start_distributed()`:
+L4's `init()` allocates the L4 Worker's HeapRing (before fork).
+On first `run()`, the deferred `_start_hierarchical()`:
 
 1. Forks one child process per L3 Worker child
-2. **Inside the child**: `inner_worker.init()` creates the L3 DistWorker
+2. **Inside the child**: `inner_worker.init()` creates the L3 Worker
    (mmaps L3's own HeapRing), allocates L3's sub/chip mailboxes. L3's
    own children are forked lazily on L3's first `run()`.
 3. Child enters `_child_worker_loop(mailbox, registry, inner_worker)`
-4. **Parent**: registers each mailbox with L4's DistWorker via
+4. **Parent**: registers each mailbox with L4's Worker via
    `add_next_level_process(mailbox_addr)`
 
 ```text
 L4 parent process
-  ├─ DistWorker(4) + HeapRing (MAP_SHARED, inherited by L3 child)
+  ├─ Worker(4) + HeapRing (MAP_SHARED, inherited by L3 child)
   └─ fork ──────────────────► L3 child process
                                  ├─ inner_worker.init()
-                                 │    └─ DistWorker(3) + L3's own HeapRing
+                                 │    └─ Worker(3) + L3's own HeapRing
                                  └─ _child_worker_loop(mbox, registry, inner_worker)
                                       └─ on first dispatch:
                                            inner_worker.run(orch_fn, args, cfg)
-                                             └─ _start_distributed() forks L3's sub children
+                                             └─ _start_hierarchical() forks L3's sub children
 ```
 
 ### Dispatch walkthrough (PROCESS mode)
@@ -487,8 +480,8 @@ diagnostic label.
 
 ### THREAD mode (alternative)
 
-For in-process dispatch (no fork), L4 can register an L3 `DistWorker` as a
-THREAD-mode child. `DistWorker::run()` invokes a Python callback
+For in-process dispatch (no fork), L4 can register an L3 `Worker` as a
+THREAD-mode child. `Worker::run()` invokes a Python callback
 (`_run_as_child`) that looks up the orch function in the callable registry
 and calls `Worker.run(orch_fn, args, config)`. The GIL is acquired by the
 binding layer before entering Python.
@@ -574,7 +567,7 @@ consumers) that is parent-private. Putting them in shm would force cross-
 process atomics and shm-safe containers. The only data that needs to cross
 the fork boundary is per-task: callable, config, args — and that fits in a
 ~2 KB mailbox with a one-time memcpy per dispatch (matches the pattern
-already used by `DistChipProcess` today).
+already used by `ChipProcess` today).
 
 ### Why TaskArgs in slot (not encoded blob in slot)
 
@@ -595,7 +588,7 @@ vector's heap backing or inline in the mailbox blob — view doesn't care.
 
 ## Related
 
-- [distributed_level_runtime.md](distributed_level_runtime.md) — L0–L6 level
+- [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — L0–L6 level
   model, three-component composition
 - [orchestrator.md](orchestrator.md) — how `submit_*` actually builds the DAG
 - [scheduler.md](scheduler.md) — how dispatched slots get worker threads

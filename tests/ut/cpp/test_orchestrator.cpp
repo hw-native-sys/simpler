@@ -14,11 +14,11 @@
 #include <atomic>
 
 #include "chip_call_config.h"
-#include "dist_ring.h"
-#include "dist_orchestrator.h"
-#include "dist_scope.h"
-#include "dist_tensormap.h"
-#include "dist_types.h"
+#include "ring.h"
+#include "orchestrator.h"
+#include "scope.h"
+#include "tensormap.h"
+#include "types.h"
 #include "task_args.h"
 
 // ---------------------------------------------------------------------------
@@ -26,20 +26,20 @@
 // ---------------------------------------------------------------------------
 
 struct OrchestratorFixture : public ::testing::Test {
-    DistTensorMap tm;
-    DistRing allocator;
-    DistScope scope;
+    TensorMap tm;
+    Ring allocator;
+    Scope scope;
     // Strict-4: per-type ready queues.
-    DistReadyQueue rq_next_level;
-    DistReadyQueue rq_sub;
-    DistOrchestrator orch;
+    ReadyQueue rq_next_level;
+    ReadyQueue rq_sub;
+    Orchestrator orch;
     ChipCallConfig cfg;
 
     // Tests in this file only submit NEXT_LEVEL tasks, so `rq` is a
     // convenience alias for the next-level queue. Kept public so existing
     // `rq.try_pop(...)` / `EXPECT_TRUE(rq.try_pop(...))` lines continue to
     // work without rewriting every assertion.
-    DistReadyQueue &rq = rq_next_level;
+    ReadyQueue &rq = rq_next_level;
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
@@ -48,8 +48,8 @@ struct OrchestratorFixture : public ::testing::Test {
 
     void TearDown() override { allocator.shutdown(); }
 
-    // Per-slot accessor — slot state lives inside the DistRing now.
-    DistTaskSlotState &S(DistTaskSlot id) { return *allocator.slot_state(id); }
+    // Per-slot accessor — slot state lives inside the Ring now.
+    TaskSlotState &S(TaskSlot id) { return *allocator.slot_state(id); }
 
     // Helper: build a TaskArgs whose only tensor has the given (data, tag).
     static TaskArgs single_tensor_args(uint64_t data_ptr, TensorArgType tag) {
@@ -71,9 +71,9 @@ struct OrchestratorFixture : public ::testing::Test {
 TEST_F(OrchestratorFixture, IndependentTaskIsImmediatelyReady) {
     auto a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level(/*callable=*/0xDEAD, a, cfg);
-    EXPECT_NE(res.task_slot, DIST_INVALID_SLOT);
+    EXPECT_NE(res.task_slot, INVALID_SLOT);
 
-    DistTaskSlot slot;
+    TaskSlot slot;
     EXPECT_TRUE(rq.try_pop(slot));
     EXPECT_EQ(slot, res.task_slot);
     EXPECT_EQ(S(slot).state.load(), TaskState::READY);
@@ -83,7 +83,7 @@ TEST_F(OrchestratorFixture, DependentTaskIsPending) {
     // Task A produces an OUTPUT at key 0xBEEF
     auto args_a = single_tensor_args(0xBEEF, TensorArgType::OUTPUT);
     auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
-    DistTaskSlot a_slot;
+    TaskSlot a_slot;
     rq.try_pop(a_slot);
 
     // Task B reads INPUT at the same key — depends on A
@@ -92,14 +92,14 @@ TEST_F(OrchestratorFixture, DependentTaskIsPending) {
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
     EXPECT_EQ(S(b.task_slot).fanin_count, 1);
 
-    DistTaskSlot extra;
+    TaskSlot extra;
     EXPECT_FALSE(rq.try_pop(extra));  // B should NOT be in ready queue
 }
 
 TEST_F(OrchestratorFixture, TensorMapTracksProducer) {
     auto args_a = single_tensor_args(0x1234, TensorArgType::OUTPUT);
     auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
-    DistTaskSlot drain_slot;
+    TaskSlot drain_slot;
     rq.try_pop(drain_slot);
 
     EXPECT_EQ(tm.lookup(0x1234), a.task_slot);
@@ -108,7 +108,7 @@ TEST_F(OrchestratorFixture, TensorMapTracksProducer) {
 TEST_F(OrchestratorFixture, OnConsumedCleansUpTensorMap) {
     auto args_a = single_tensor_args(0x42, TensorArgType::OUTPUT);
     auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
-    DistTaskSlot slot;
+    TaskSlot slot;
     rq.try_pop(slot);
 
     EXPECT_EQ(tm.lookup(0x42), slot);
@@ -116,7 +116,7 @@ TEST_F(OrchestratorFixture, OnConsumedCleansUpTensorMap) {
     S(slot).state.store(TaskState::COMPLETED, std::memory_order_relaxed);
     orch.on_consumed(slot);
 
-    EXPECT_EQ(tm.lookup(0x42), DIST_INVALID_SLOT);
+    EXPECT_EQ(tm.lookup(0x42), INVALID_SLOT);
     EXPECT_EQ(S(slot).state.load(), TaskState::CONSUMED);
 }
 
@@ -124,7 +124,7 @@ TEST_F(OrchestratorFixture, ScopeRegistersAndReleasesRef) {
     orch.scope_begin();
     auto args_a = single_tensor_args(0x77, TensorArgType::OUTPUT);
     auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
-    DistTaskSlot slot;
+    TaskSlot slot;
     rq.try_pop(slot);
 
     {
@@ -148,7 +148,7 @@ TEST_F(OrchestratorFixture, NoDepTagSkipsDependencyTracking) {
     // OUTPUT-tagged input registers a producer
     auto args_a = single_tensor_args(0xAAAA, TensorArgType::OUTPUT);
     auto a = orch.submit_next_level(0xDEAD, args_a, cfg);
-    DistTaskSlot drain_slot;
+    TaskSlot drain_slot;
     rq.try_pop(drain_slot);
 
     // Second task references same key but tagged NO_DEP — should be independent
@@ -163,7 +163,7 @@ TEST_F(OrchestratorFixture, GroupTaskStoresArgsListPerMember) {
     TaskArgs a1 = single_tensor_args(0xA1, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
 
-    EXPECT_NE(res.task_slot, DIST_INVALID_SLOT);
+    EXPECT_NE(res.task_slot, INVALID_SLOT);
     EXPECT_TRUE(S(res.task_slot).is_group());
     EXPECT_EQ(S(res.task_slot).group_size(), 2);
     EXPECT_EQ(S(res.task_slot).task_args_list.size(), 2u);
@@ -180,7 +180,7 @@ TEST_F(OrchestratorFixture, GroupTaskStoresArgsListPerMember) {
 TEST_F(OrchestratorFixture, SingleTaskStoresTaskArgsDirectly) {
     TaskArgs a0 = single_tensor_args(0xC0, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level(0xDEAD, a0, cfg);
-    ASSERT_NE(res.task_slot, DIST_INVALID_SLOT);
+    ASSERT_NE(res.task_slot, INVALID_SLOT);
     EXPECT_FALSE(S(res.task_slot).is_group());
     EXPECT_EQ(S(res.task_slot).group_size(), 1);
     EXPECT_EQ(S(res.task_slot).task_args.tensor_count(), 1);
@@ -201,14 +201,14 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
     args.add_tensor(t, TensorArgType::OUTPUT);
 
     auto res = orch.submit_next_level(0xDEAD, args, cfg);
-    ASSERT_NE(res.task_slot, DIST_INVALID_SLOT);
+    ASSERT_NE(res.task_slot, INVALID_SLOT);
 
     uint64_t data = S(res.task_slot).task_args.tensor(0).data;
     ASSERT_NE(data, 0u);
     uintptr_t base = reinterpret_cast<uintptr_t>(allocator.heap_base(0));
     EXPECT_GE(data, base);
     EXPECT_LT(data, base + allocator.heap_size(0));
-    EXPECT_EQ(data % DIST_HEAP_ALIGN, 0u);
+    EXPECT_EQ(data % HEAP_ALIGN, 0u);
 
     EXPECT_EQ(tm.lookup(data), res.task_slot);
 }
@@ -221,7 +221,7 @@ TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {
     // must tag the buffer INOUT.
     auto creator_args = single_tensor_args(0xFEED, TensorArgType::OUTPUT);
     auto creator = orch.submit_next_level(0xDEAD, creator_args, cfg);
-    DistTaskSlot drain;
+    TaskSlot drain;
     rq.try_pop(drain);
     // Mark the creator COMPLETED so the new submit mimics the alloc-slot
     // path (COMPLETED producer with non-zero fanout).
@@ -229,7 +229,7 @@ TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {
 
     auto writer_args = single_tensor_args(0xFEED, TensorArgType::INOUT);
     auto writer = orch.submit_next_level(0xDEAD, writer_args, cfg);
-    DistTaskSlot writer_slot;
+    TaskSlot writer_slot;
     rq.try_pop(writer_slot);
 
     // TensorMap now points at the new writer.
@@ -260,7 +260,7 @@ TEST_F(OrchestratorFixture, OutputAndOutputExistingAreInsertOnly) {
     for (Case c : {Case{0xABCD, TensorArgType::OUTPUT}, Case{0xBEEF, TensorArgType::OUTPUT_EXISTING}}) {
         auto prior_args = single_tensor_args(c.key, TensorArgType::OUTPUT);
         auto prior = orch.submit_next_level(0xDEAD, prior_args, cfg);
-        DistTaskSlot drain;
+        TaskSlot drain;
         rq.try_pop(drain);
         S(prior.task_slot).state.store(TaskState::COMPLETED, std::memory_order_relaxed);
 

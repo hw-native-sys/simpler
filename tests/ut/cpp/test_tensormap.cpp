@@ -11,52 +11,52 @@
 
 #include <gtest/gtest.h>
 
-#include "dist_tensormap.h"
+#include "tensormap.h"
 
-TEST(DistTensorMap, LookupEmptyReturnsInvalid) {
-    DistTensorMap tm;
-    EXPECT_EQ(tm.lookup(0xDEADBEEF), DIST_INVALID_SLOT);
+TEST(TensorMap, LookupEmptyReturnsInvalid) {
+    TensorMap tm;
+    EXPECT_EQ(tm.lookup(0xDEADBEEF), INVALID_SLOT);
 }
 
-TEST(DistTensorMap, InsertAndLookup) {
-    DistTensorMap tm;
+TEST(TensorMap, InsertAndLookup) {
+    TensorMap tm;
     tm.insert(0x1000, 5);
     EXPECT_EQ(tm.lookup(0x1000), 5);
-    EXPECT_EQ(tm.lookup(0x2000), DIST_INVALID_SLOT);
+    EXPECT_EQ(tm.lookup(0x2000), INVALID_SLOT);
     EXPECT_EQ(tm.size(), 1);
 }
 
-TEST(DistTensorMap, OverwriteExistingEntry) {
-    DistTensorMap tm;
+TEST(TensorMap, OverwriteExistingEntry) {
+    TensorMap tm;
     tm.insert(0x1000, 3);
     tm.insert(0x1000, 7);  // new producer reuses same buffer
     EXPECT_EQ(tm.lookup(0x1000), 7);
     EXPECT_EQ(tm.size(), 1);
 }
 
-TEST(DistTensorMap, EraseTaskOutputs) {
-    DistTensorMap tm;
+TEST(TensorMap, EraseTaskOutputs) {
+    TensorMap tm;
     tm.insert(0x1000, 0);
     tm.insert(0x2000, 0);
     tm.insert(0x3000, 1);
 
     tm.erase_task_outputs({0x1000, 0x2000});
 
-    EXPECT_EQ(tm.lookup(0x1000), DIST_INVALID_SLOT);
-    EXPECT_EQ(tm.lookup(0x2000), DIST_INVALID_SLOT);
+    EXPECT_EQ(tm.lookup(0x1000), INVALID_SLOT);
+    EXPECT_EQ(tm.lookup(0x2000), INVALID_SLOT);
     EXPECT_EQ(tm.lookup(0x3000), 1);
     EXPECT_EQ(tm.size(), 1);
 }
 
-TEST(DistTensorMap, EraseWithEmptyKeyList) {
-    DistTensorMap tm;
+TEST(TensorMap, EraseWithEmptyKeyList) {
+    TensorMap tm;
     tm.insert(0x1000, 2);
     tm.erase_task_outputs({});
     EXPECT_EQ(tm.lookup(0x1000), 2);
 }
 
-TEST(DistTensorMap, MultipleEntries) {
-    DistTensorMap tm;
+TEST(TensorMap, MultipleEntries) {
+    TensorMap tm;
     for (int i = 0; i < 100; ++i)
         tm.insert(static_cast<uint64_t>(i) * 0x1000, i % 16);
     EXPECT_EQ(tm.size(), 100);

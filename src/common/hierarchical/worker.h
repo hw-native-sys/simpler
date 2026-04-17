@@ -10,9 +10,9 @@
  */
 
 /**
- * DistWorker — top-level distributed worker node.
+ * Worker — top-level distributed worker node.
  *
- * DistWorker is the implementation of one level in the hierarchy (L3, L4, …).
+ * Worker is the implementation of one level in the hierarchy (L3, L4, …).
  * From the level above it looks like an IWorker; internally it contains the
  * full scheduling engine (TensorMap, Allocator, Scope, Orchestrator, Scheduler)
  * and a set of sub-IWorkers it dispatches to.
@@ -39,15 +39,15 @@
 #include <cstdint>
 #include <memory>
 
-#include "dist_ring.h"
-#include "dist_orchestrator.h"
-#include "dist_scheduler.h"
-#include "dist_scope.h"
-#include "dist_tensormap.h"
-#include "dist_types.h"
-#include "dist_worker_manager.h"
+#include "ring.h"
+#include "orchestrator.h"
+#include "scheduler.h"
+#include "scope.h"
+#include "tensormap.h"
+#include "types.h"
+#include "worker_manager.h"
 
-class DistWorker : public IWorker {
+class Worker : public IWorker {
 public:
     // Construct a Worker for hierarchy `level`. `heap_ring_size` is the
     // MAP_SHARED|MAP_ANONYMOUS region handed out by the Orchestrator for
@@ -58,11 +58,11 @@ public:
     // OMP/MKL/BLIS/OPENBLAS thread-count knobs and the pthread_atfork
     // installation) also runs in the ctor, still in the parent, before
     // child forks.
-    explicit DistWorker(int32_t level, uint64_t heap_ring_size = DIST_DEFAULT_HEAP_RING_SIZE);
-    ~DistWorker() override;
+    explicit Worker(int32_t level, uint64_t heap_ring_size = DEFAULT_HEAP_RING_SIZE);
+    ~Worker() override;
 
-    DistWorker(const DistWorker &) = delete;
-    DistWorker &operator=(const DistWorker &) = delete;
+    Worker(const Worker &) = delete;
+    Worker &operator=(const Worker &) = delete;
 
     // Register sub-workers before calling init().
     // THREAD mode — parent calls worker->run() directly.
@@ -70,7 +70,7 @@ public:
 
     // PROCESS mode — parent writes the unified mailbox; a pre-forked child
     // process reads it and runs the real IWorker in its own address space.
-    // `mailbox` must point to a DIST_MAILBOX_SIZE-byte MAP_SHARED region.
+    // `mailbox` must point to a MAILBOX_SIZE-byte MAP_SHARED region.
     void add_process_worker(WorkerType type, void *mailbox);
 
     // Start the scheduler thread. Must be called AFTER the parent has forked
@@ -83,9 +83,9 @@ public:
 
     // Accessor: the Orchestrator handle used by the user's orch fn. Valid
     // only between init() and close().
-    DistOrchestrator &get_orchestrator() { return orchestrator_; }
+    Orchestrator &get_orchestrator() { return orchestrator_; }
 
-    // IWorker — used when this DistWorker is itself a sub-worker of L4+.
+    // IWorker — used when this Worker is itself a sub-worker of L4+.
     // In THREAD mode, the parent's WorkerThread calls run() directly;
     // run() invokes run_callback_ which acquires the GIL and delegates
     // to the Python Worker._run_as_child method (approach (b): Python
@@ -101,18 +101,18 @@ private:
     bool initialized_{false};
 
     // --- Scheduling engine components ---
-    // Per-task slot state lives inside `allocator_` (DistRing) — Orchestrator
+    // Per-task slot state lives inside `allocator_` (Ring) — Orchestrator
     // and Scheduler access it via `allocator_.slot_state(id)`. No separate
     // fixed-size slots array at L3 (see plan Allowed Exception #6).
-    DistTensorMap tensormap_;
-    DistRing allocator_;
-    DistScope scope_;
+    TensorMap tensormap_;
+    Ring allocator_;
+    Scope scope_;
     // Strict-4: one ready queue per WorkerType. Submit routes by
     // s.worker_type; the Scheduler drains each queue independently so
     // saturation of one pool cannot head-of-line-block the other.
-    DistReadyQueue ready_next_level_queue_;
-    DistReadyQueue ready_sub_queue_;
-    DistOrchestrator orchestrator_;
-    DistScheduler scheduler_;
-    DistWorkerManager manager_;
+    ReadyQueue ready_next_level_queue_;
+    ReadyQueue ready_sub_queue_;
+    Orchestrator orchestrator_;
+    Scheduler scheduler_;
+    WorkerManager manager_;
 };

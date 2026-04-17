@@ -9,7 +9,7 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "dist_worker.h"
+#include "worker.h"
 
 #include <pthread.h>
 
@@ -41,7 +41,7 @@
 // and idempotent — installing it more than once is harmless because the
 // actual state it touches is per-Worker. For PR-H we keep the handler empty
 // until we have a second Worker-owned lock worth guarding (Allocator::mu_
-// is the only one so far, and its lifetime is tied to a DistWorker that
+// is the only one so far, and its lifetime is tied to a Worker that
 // always fork-then-init). Registering an empty handler is still valuable as
 // a diagnostic hook for fork misuse and as a landing pad for locks added
 // in PR-C / PR-D (per-scope rings, per-worker-type queues, callable registry).
@@ -83,7 +83,7 @@ void atfork_child() {}
 
 void install_atfork_once() {
     // Registered once per process; the handlers close over file-scope statics
-    // so multiple DistWorker instances share a single registration.
+    // so multiple Worker instances share a single registration.
     static std::once_flag s_atfork;
     std::call_once(s_atfork, []() {
         pthread_atfork(atfork_prepare, atfork_parent, atfork_child);
@@ -100,54 +100,54 @@ void fork_hygiene_once() {
 }  // namespace
 
 // ---------------------------------------------------------------------------
-// DistWorker
+// Worker
 // ---------------------------------------------------------------------------
 
-DistWorker::DistWorker(int32_t level, uint64_t heap_ring_size) :
+Worker::Worker(int32_t level, uint64_t heap_ring_size) :
     level_(level) {
     // Fork hygiene runs before the HeapRing mmap so the env-var defaults
     // apply to any thread-pool library that observes them at library init.
     fork_hygiene_once();
 
     // mmap the HeapRing region here, in the ctor, so Python callers can
-    // construct the DistWorker before fork()-ing children. The children
+    // construct the Worker before fork()-ing children. The children
     // inherit the MAP_SHARED region at the same virtual address.
-    allocator_.init(heap_ring_size, DIST_ALLOC_TIMEOUT_MS);
+    allocator_.init(heap_ring_size, ALLOC_TIMEOUT_MS);
 }
 
-DistWorker::~DistWorker() {
+Worker::~Worker() {
     if (initialized_) close();
 }
 
-void DistWorker::add_worker(WorkerType type, IWorker *worker) {
-    if (initialized_) throw std::runtime_error("DistWorker: add_worker after init");
+void Worker::add_worker(WorkerType type, IWorker *worker) {
+    if (initialized_) throw std::runtime_error("Worker: add_worker after init");
     if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level(worker);
     else manager_.add_sub(worker);
 }
 
-void DistWorker::add_process_worker(WorkerType type, void *mailbox) {
-    if (initialized_) throw std::runtime_error("DistWorker: add_process_worker after init");
+void Worker::add_process_worker(WorkerType type, void *mailbox) {
+    if (initialized_) throw std::runtime_error("Worker: add_process_worker after init");
     if (type == WorkerType::NEXT_LEVEL) manager_.add_next_level_process(mailbox);
     else manager_.add_sub_process(mailbox);
 }
 
-void DistWorker::init() {
-    if (initialized_) throw std::runtime_error("DistWorker: already initialized");
+void Worker::init() {
+    if (initialized_) throw std::runtime_error("Worker: already initialized");
 
     orchestrator_.init(&tensormap_, &allocator_, &scope_, &ready_next_level_queue_, &ready_sub_queue_);
 
     // Start WorkerManager first — creates WorkerThreads.
     // The on_complete callback routes through the Scheduler's worker_done().
-    manager_.start(&allocator_, [this](DistTaskSlot slot) {
+    manager_.start(&allocator_, [this](TaskSlot slot) {
         scheduler_.worker_done(slot);
     });
 
-    DistScheduler::Config cfg;
+    Scheduler::Config cfg;
     cfg.ring = &allocator_;
     cfg.ready_next_level_queue = &ready_next_level_queue_;
     cfg.ready_sub_queue = &ready_sub_queue_;
     cfg.manager = &manager_;
-    cfg.on_consumed_cb = [this](DistTaskSlot slot) {
+    cfg.on_consumed_cb = [this](TaskSlot slot) {
         orchestrator_.on_consumed(slot);
     };
 
@@ -155,7 +155,7 @@ void DistWorker::init() {
     initialized_ = true;
 }
 
-void DistWorker::close() {
+void Worker::close() {
     if (!initialized_) return;
     scheduler_.stop();
     manager_.stop();
@@ -164,10 +164,10 @@ void DistWorker::close() {
 }
 
 // =============================================================================
-// IWorker::run() — DistWorker as sub-worker of a higher level (THREAD mode)
+// IWorker::run() — Worker as sub-worker of a higher level (THREAD mode)
 // =============================================================================
 
-void DistWorker::run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) {
+void Worker::run(uint64_t callable, TaskArgsView args, const ChipCallConfig &config) {
     if (run_callback_) {
         run_callback_(callable, args, config);
     }

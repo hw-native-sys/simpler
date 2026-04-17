@@ -9,7 +9,7 @@
 """Multi-worker parallel tests — validates thread isolation introduced in PR 2-3.
 
 DeviceRunner is now thread_local so each ChipWorker thread gets its own instance.
-These tests verify that multiple concurrent DistWorker / Worker instances
+These tests verify that multiple concurrent _Worker / Worker instances
 execute correctly and in parallel without interference.
 
 No NPU device required; SubWorker (fork/shm) is used as the execution backend.

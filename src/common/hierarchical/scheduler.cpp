@@ -9,34 +9,34 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "dist_scheduler.h"
+#include "scheduler.h"
 
 #include <stdexcept>
 
-#include "dist_ring.h"
-#include "dist_types.h"
-#include "dist_worker_manager.h"
+#include "ring.h"
+#include "types.h"
+#include "worker_manager.h"
 
 // =============================================================================
-// DistScheduler
+// Scheduler
 // =============================================================================
 
 // =============================================================================
-// DistScheduler
+// Scheduler
 // =============================================================================
 
-void DistScheduler::start(const Config &cfg) {
+void Scheduler::start(const Config &cfg) {
     if (cfg.ring == nullptr || cfg.ready_next_level_queue == nullptr || cfg.ready_sub_queue == nullptr ||
         cfg.manager == nullptr)
-        throw std::invalid_argument("DistScheduler::start: null config fields");
+        throw std::invalid_argument("Scheduler::start: null config fields");
     cfg_ = cfg;
 
     stop_requested_.store(false, std::memory_order_relaxed);
     running_.store(true, std::memory_order_release);
-    sched_thread_ = std::thread(&DistScheduler::run, this);
+    sched_thread_ = std::thread(&Scheduler::run, this);
 }
 
-void DistScheduler::stop() {
+void Scheduler::stop() {
     stop_requested_.store(true, std::memory_order_release);
     completion_cv_.notify_all();
     // Shut down both per-type ready queues so any wait_pop waiters unblock.
@@ -52,8 +52,8 @@ void DistScheduler::stop() {
 // WorkerThread completion callback (called from WorkerThread via Manager)
 // =============================================================================
 
-void DistScheduler::worker_done(DistTaskSlot slot) {
-    DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
+void Scheduler::worker_done(TaskSlot slot) {
+    TaskSlotState &s = *cfg_.ring->slot_state(slot);
 
     // Group aggregation: only push to completion queue when ALL workers done
     if (s.is_group()) {
@@ -72,7 +72,7 @@ void DistScheduler::worker_done(DistTaskSlot slot) {
 // Scheduler loop
 // =============================================================================
 
-void DistScheduler::run() {
+void Scheduler::run() {
     while (true) {
         // Wait until there's something to process
         {
@@ -84,7 +84,7 @@ void DistScheduler::run() {
 
         // Phase 1: drain completions
         while (true) {
-            DistTaskSlot slot;
+            TaskSlot slot;
             {
                 std::lock_guard<std::mutex> lk(completion_mu_);
                 if (completion_queue_.empty()) break;
@@ -102,7 +102,7 @@ void DistScheduler::run() {
             if (!cfg_.manager->any_busy()) {
                 // Final drain
                 while (true) {
-                    DistTaskSlot slot;
+                    TaskSlot slot;
                     {
                         std::lock_guard<std::mutex> lk(completion_mu_);
                         if (completion_queue_.empty()) break;
@@ -122,18 +122,18 @@ void DistScheduler::run() {
 // on_task_complete / try_consume
 // =============================================================================
 
-void DistScheduler::on_task_complete(DistTaskSlot slot) {
-    DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
+void Scheduler::on_task_complete(TaskSlot slot) {
+    TaskSlotState &s = *cfg_.ring->slot_state(slot);
     s.state.store(TaskState::COMPLETED, std::memory_order_release);
 
     // Release fanin on downstream consumers
-    std::vector<DistTaskSlot> consumers;
+    std::vector<TaskSlot> consumers;
     {
         std::lock_guard<std::mutex> lk(s.fanout_mu);
         consumers = s.fanout_consumers;
     }
-    for (DistTaskSlot consumer : consumers) {
-        DistTaskSlotState &cs = *cfg_.ring->slot_state(consumer);
+    for (TaskSlot consumer : consumers) {
+        TaskSlotState &cs = *cfg_.ring->slot_state(consumer);
         int32_t released = cs.fanin_released.fetch_add(1, std::memory_order_acq_rel) + 1;
         if (released >= cs.fanin_count) {
             TaskState expected = TaskState::PENDING;
@@ -151,18 +151,18 @@ void DistScheduler::on_task_complete(DistTaskSlot slot) {
     try_consume(slot);
 
     // Deferred release: release one fanout ref on each producer this task consumed.
-    std::vector<DistTaskSlot> producers;
+    std::vector<TaskSlot> producers;
     {
         std::lock_guard<std::mutex> lk(s.fanout_mu);
         producers = s.fanin_producers;
     }
-    for (DistTaskSlot prod : producers) {
+    for (TaskSlot prod : producers) {
         try_consume(prod);
     }
 }
 
-void DistScheduler::try_consume(DistTaskSlot slot) {
-    DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
+void Scheduler::try_consume(TaskSlot slot) {
+    TaskSlotState &s = *cfg_.ring->slot_state(slot);
     int32_t released = s.fanout_released.fetch_add(1, std::memory_order_acq_rel) + 1;
     int32_t total;
     {
@@ -180,14 +180,14 @@ void DistScheduler::try_consume(DistTaskSlot slot) {
 // Dispatch — delegates to WorkerManager
 // =============================================================================
 
-void DistScheduler::dispatch_ready() {
+void Scheduler::dispatch_ready() {
     // Strict-4: drain each per-type queue with its OWN head-of-line break.
     // A saturated pool of one type only stalls its own queue; the other
     // type continues to dispatch from its pool of idle workers.
-    auto drain_one = [this](DistReadyQueue *q) {
-        DistTaskSlot slot;
+    auto drain_one = [this](ReadyQueue *q) {
+        TaskSlot slot;
         while (q->try_pop(slot)) {
-            DistTaskSlotState &s = *cfg_.ring->slot_state(slot);
+            TaskSlotState &s = *cfg_.ring->slot_state(slot);
             int N = s.group_size();  // 1 for normal tasks
 
             auto workers = cfg_.manager->pick_n_idle(s.worker_type, N);

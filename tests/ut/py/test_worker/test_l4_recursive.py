@@ -335,15 +335,15 @@ class TestL3OwnOrchestrator:
 
 
 # ---------------------------------------------------------------------------
-# Test: generalised DistWorker(level) — no hardcoded 3
+# Test: generalised _Worker(level) — no hardcoded 3
 # ---------------------------------------------------------------------------
 
 
-class TestGeneralisedDistWorker:
-    def test_dist_worker_level_param(self):
-        """DistWorker accepts level != 3 without error."""
-        from simpler.task_interface import DistWorker  # noqa: PLC0415
+class TestGeneralised_Worker:
+    def test_worker_level_param(self):
+        """_Worker accepts level != 3 without error."""
+        from simpler.task_interface import _Worker  # noqa: PLC0415
 
         for level in (3, 4, 5):
-            dw = DistWorker(level)
+            dw = _Worker(level)
             dw.close()

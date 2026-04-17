@@ -9,13 +9,13 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "dist_types.h"
+#include "types.h"
 
 // =============================================================================
-// DistTaskSlotState
+// TaskSlotState
 // =============================================================================
 
-void DistTaskSlotState::reset() {
+void TaskSlotState::reset() {
     state.store(TaskState::FREE, std::memory_order_relaxed);
     fanin_count = 0;
     fanin_released.store(0, std::memory_order_relaxed);
@@ -34,18 +34,18 @@ void DistTaskSlotState::reset() {
     task_args.clear();
     task_args_list.clear();
     is_group_ = false;
-    // ring_idx / ring_slot_idx are deliberately NOT cleared here: DistRing
+    // ring_idx / ring_slot_idx are deliberately NOT cleared here: Ring
     // stamps them at alloc() before the Orchestrator ever calls reset(),
-    // and DistRing::release() needs to read them for the FIFO advance. The
+    // and Ring::release() needs to read them for the FIFO advance. The
     // fields are rewritten on every alloc, so stale values never escape.
     sub_complete_count.store(0, std::memory_order_relaxed);
 }
 
 // =============================================================================
-// DistReadyQueue
+// ReadyQueue
 // =============================================================================
 
-void DistReadyQueue::push(DistTaskSlot slot) {
+void ReadyQueue::push(TaskSlot slot) {
     {
         std::lock_guard<std::mutex> lk(mu_);
         q_.push(slot);
@@ -53,7 +53,7 @@ void DistReadyQueue::push(DistTaskSlot slot) {
     cv_.notify_one();
 }
 
-bool DistReadyQueue::try_pop(DistTaskSlot &out) {
+bool ReadyQueue::try_pop(TaskSlot &out) {
     std::lock_guard<std::mutex> lk(mu_);
     if (q_.empty()) return false;
     out = q_.front();
@@ -61,7 +61,7 @@ bool DistReadyQueue::try_pop(DistTaskSlot &out) {
     return true;
 }
 
-bool DistReadyQueue::wait_pop(DistTaskSlot &out) {
+bool ReadyQueue::wait_pop(TaskSlot &out) {
     std::unique_lock<std::mutex> lk(mu_);
     cv_.wait(lk, [this] {
         return !q_.empty() || shutdown_;
@@ -72,7 +72,7 @@ bool DistReadyQueue::wait_pop(DistTaskSlot &out) {
     return true;
 }
 
-void DistReadyQueue::shutdown() {
+void ReadyQueue::shutdown() {
     {
         std::lock_guard<std::mutex> lk(mu_);
         shutdown_ = true;

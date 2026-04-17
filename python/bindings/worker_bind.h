@@ -10,12 +10,12 @@
  */
 
 /**
- * Nanobind bindings for the distributed runtime (DistWorker, DistOrchestrator).
+ * Nanobind bindings for the distributed runtime (Worker, Orchestrator).
  *
  * Compiled into the same _task_interface extension module as task_interface.cpp.
- * Call bind_dist_worker(m) from the NB_MODULE definition in task_interface.cpp.
+ * Call bind_worker(m) from the NB_MODULE definition in task_interface.cpp.
  *
- * PR-D-2: `DistChipProcess` and `DistSubWorker` bindings are removed; their
+ * PR-D-2: `ChipProcess` and `SubWorker` bindings are removed; their
  * PROCESS-mode dispatch logic now lives inside `WorkerThread`. Python callers
  * register PROCESS-mode workers via `add_next_level_process(mailbox_ptr)` /
  * `add_sub_process(mailbox_ptr)` instead of wrapping an IWorker subclass.
@@ -31,15 +31,15 @@
 #include <stdexcept>
 
 #include "chip_worker.h"
-#include "dist_ring.h"
-#include "dist_orchestrator.h"
-#include "dist_types.h"
-#include "dist_worker.h"
-#include "dist_worker_manager.h"
+#include "ring.h"
+#include "orchestrator.h"
+#include "types.h"
+#include "worker.h"
+#include "worker_manager.h"
 
 namespace nb = nanobind;
 
-inline void bind_dist_worker(nb::module_ &m) {
+inline void bind_worker(nb::module_ &m) {
     // --- WorkerType ---
     nb::enum_<WorkerType>(m, "WorkerType").value("NEXT_LEVEL", WorkerType::NEXT_LEVEL).value("SUB", WorkerType::SUB);
 
@@ -52,16 +52,19 @@ inline void bind_dist_worker(nb::module_ &m) {
         .value("COMPLETED", TaskState::COMPLETED)
         .value("CONSUMED", TaskState::CONSUMED);
 
-    // --- DistSubmitResult ---
-    nb::class_<DistSubmitResult>(m, "DistSubmitResult").def_prop_ro("task_slot", [](const DistSubmitResult &r) {
+    // --- SubmitResult ---
+    nb::class_<SubmitResult>(m, "SubmitResult").def_prop_ro("task_slot", [](const SubmitResult &r) {
         return r.task_slot;
     });
 
-    // --- DistOrchestrator (DAG builder, exposed via DistWorker.get_orchestrator()) ---
-    nb::class_<DistOrchestrator>(m, "DistOrchestrator")
+    // --- Orchestrator (DAG builder, exposed via Worker.get_orchestrator()) ---
+    // Bound as `_Orchestrator` because the Python user-facing `Orchestrator`
+    // wrapper (simpler.orchestrator.Orchestrator) holds a borrowed reference
+    // to this C++ type.
+    nb::class_<Orchestrator>(m, "_Orchestrator")
         .def(
             "submit_next_level",
-            [](DistOrchestrator &self, uint64_t callable, const TaskArgs &args, const ChipCallConfig &config) {
+            [](Orchestrator &self, uint64_t callable, const TaskArgs &args, const ChipCallConfig &config) {
                 return self.submit_next_level(callable, args, config);
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("config"),
@@ -69,7 +72,7 @@ inline void bind_dist_worker(nb::module_ &m) {
         )
         .def(
             "submit_next_level_group",
-            [](DistOrchestrator &self, uint64_t callable, const std::vector<TaskArgs> &args_list,
+            [](Orchestrator &self, uint64_t callable, const std::vector<TaskArgs> &args_list,
                const ChipCallConfig &config) {
                 return self.submit_next_level_group(callable, args_list, config);
             },
@@ -78,7 +81,7 @@ inline void bind_dist_worker(nb::module_ &m) {
         )
         .def(
             "submit_sub",
-            [](DistOrchestrator &self, int32_t callable_id, const TaskArgs &args) {
+            [](Orchestrator &self, int32_t callable_id, const TaskArgs &args) {
                 return self.submit_sub(callable_id, args);
             },
             nb::arg("callable_id"), nb::arg("args"),
@@ -86,7 +89,7 @@ inline void bind_dist_worker(nb::module_ &m) {
         )
         .def(
             "submit_sub_group",
-            [](DistOrchestrator &self, int32_t callable_id, const std::vector<TaskArgs> &args_list) {
+            [](Orchestrator &self, int32_t callable_id, const std::vector<TaskArgs> &args_list) {
                 return self.submit_sub_group(callable_id, args_list);
             },
             nb::arg("callable_id"), nb::arg("args_list"),
@@ -94,7 +97,7 @@ inline void bind_dist_worker(nb::module_ &m) {
         )
         .def(
             "alloc",
-            [](DistOrchestrator &self, const std::vector<uint32_t> &shape, DataType dtype) {
+            [](Orchestrator &self, const std::vector<uint32_t> &shape, DataType dtype) {
                 return self.alloc(shape, dtype);
             },
             nb::arg("shape"), nb::arg("dtype"),
@@ -102,22 +105,23 @@ inline void bind_dist_worker(nb::module_ &m) {
             "pool (visible to forked child workers). Lifetime: until the next Worker.run() call."
         )
         .def(
-            "scope_begin", &DistOrchestrator::scope_begin,
-            "Open a nested scope. Max nesting depth = DIST_MAX_SCOPE_DEPTH (64)."
+            "scope_begin", &Orchestrator::scope_begin, "Open a nested scope. Max nesting depth = MAX_SCOPE_DEPTH (64)."
         )
-        .def("scope_end", &DistOrchestrator::scope_end, "Close the innermost scope. Non-blocking.")
-        .def("_scope_begin", &DistOrchestrator::scope_begin)
-        .def("_scope_end", &DistOrchestrator::scope_end)
+        .def("scope_end", &Orchestrator::scope_end, "Close the innermost scope. Non-blocking.")
+        .def("_scope_begin", &Orchestrator::scope_begin)
+        .def("_scope_end", &Orchestrator::scope_end)
         .def(
-            "_drain", &DistOrchestrator::drain, nb::call_guard<nb::gil_scoped_release>(),
+            "_drain", &Orchestrator::drain, nb::call_guard<nb::gil_scoped_release>(),
             "Block until all submitted tasks are CONSUMED (releases GIL)."
         );
 
-    // --- DistWorker ---
-    nb::class_<DistWorker>(m, "DistWorker")
+    // --- Worker ---
+    // Bound as `_Worker` because the Python user-facing `Worker` factory
+    // (simpler.worker.Worker) wraps this C++ class.
+    nb::class_<Worker>(m, "_Worker")
         .def(
-            nb::init<int32_t, uint64_t>(), nb::arg("level"), nb::arg("heap_ring_size") = DIST_DEFAULT_HEAP_RING_SIZE,
-            "Create a DistWorker for the given hierarchy level (3=L3, 4=L4, …). "
+            nb::init<int32_t, uint64_t>(), nb::arg("level"), nb::arg("heap_ring_size") = DEFAULT_HEAP_RING_SIZE,
+            "Create a Worker for the given hierarchy level (3=L3, 4=L4, …). "
             "`heap_ring_size` selects the per-ring MAP_SHARED heap mmap'd in the ctor "
             "(default 1 GiB; total VA = 4 × heap_ring_size)."
         )
@@ -125,14 +129,14 @@ inline void bind_dist_worker(nb::module_ &m) {
         // THREAD-mode registration (parent calls worker->run directly).
         .def(
             "add_next_level_worker",
-            [](DistWorker &self, DistWorker &w) {
+            [](Worker &self, Worker &w) {
                 self.add_worker(WorkerType::NEXT_LEVEL, &w);
             },
-            nb::arg("worker"), "Add a lower-level DistWorker as a NEXT_LEVEL sub-worker (THREAD mode)."
+            nb::arg("worker"), "Add a lower-level Worker as a NEXT_LEVEL sub-worker (THREAD mode)."
         )
         .def(
             "add_next_level_worker",
-            [](DistWorker &self, ChipWorker &w) {
+            [](Worker &self, ChipWorker &w) {
                 self.add_worker(WorkerType::NEXT_LEVEL, &w);
             },
             nb::arg("worker"), "Add a ChipWorker as a NEXT_LEVEL sub-worker (THREAD mode)."
@@ -142,27 +146,27 @@ inline void bind_dist_worker(nb::module_ &m) {
         // the real IWorker in its own address space).
         .def(
             "add_next_level_process",
-            [](DistWorker &self, uint64_t mailbox_ptr) {
+            [](Worker &self, uint64_t mailbox_ptr) {
                 self.add_process_worker(WorkerType::NEXT_LEVEL, reinterpret_cast<void *>(mailbox_ptr));
             },
             nb::arg("mailbox_ptr"),
             "Add a PROCESS-mode NEXT_LEVEL worker. `mailbox_ptr` is the address of a "
-            "DIST_MAILBOX_SIZE-byte MAP_SHARED region. The child process loop is "
+            "MAILBOX_SIZE-byte MAP_SHARED region. The child process loop is "
             "Python-managed (fork + _chip_process_loop)."
         )
         .def(
             "add_sub_process",
-            [](DistWorker &self, uint64_t mailbox_ptr) {
+            [](Worker &self, uint64_t mailbox_ptr) {
                 self.add_process_worker(WorkerType::SUB, reinterpret_cast<void *>(mailbox_ptr));
             },
             nb::arg("mailbox_ptr"),
             "Add a PROCESS-mode SUB worker. `mailbox_ptr` is the address of a "
-            "DIST_MAILBOX_SIZE-byte MAP_SHARED region. The child process loop is "
+            "MAILBOX_SIZE-byte MAP_SHARED region. The child process loop is "
             "Python-managed (fork + _sub_worker_loop)."
         )
 
-        .def("init", &DistWorker::init, "Start the Scheduler thread.")
-        .def("close", &DistWorker::close, "Stop the Scheduler thread.")
+        .def("init", &Worker::init, "Start the Scheduler thread.")
+        .def("close", &Worker::close, "Stop the Scheduler thread.")
 
         // THREAD-mode callback for L4+ recursion (approach b: Python callback).
         // The lambda captures the Python callable and wraps it with GIL
@@ -170,7 +174,7 @@ inline void bind_dist_worker(nb::module_ &m) {
         // side receives normal objects.
         .def(
             "set_run_callback",
-            [](DistWorker &self, nb::object cb) {
+            [](Worker &self, nb::object cb) {
                 self.set_run_callback(
                     [cb_stored = nb::object(cb)](uint64_t callable, TaskArgsView view, const ChipCallConfig &config) {
                         nb::gil_scoped_acquire gil;
@@ -191,12 +195,12 @@ inline void bind_dist_worker(nb::module_ &m) {
         )
 
         .def(
-            "get_orchestrator", &DistWorker::get_orchestrator, nb::rv_policy::reference_internal,
-            "Return the Orchestrator handle (lifetime tied to this DistWorker)."
+            "get_orchestrator", &Worker::get_orchestrator, nb::rv_policy::reference_internal,
+            "Return the Orchestrator handle (lifetime tied to this Worker)."
         );
 
-    m.attr("DIST_DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DIST_DEFAULT_HEAP_RING_SIZE);
-    m.attr("DIST_MAILBOX_SIZE") = static_cast<int>(DIST_MAILBOX_SIZE);
-    m.attr("DIST_MAX_RING_DEPTH") = static_cast<int32_t>(DIST_MAX_RING_DEPTH);
-    m.attr("DIST_MAX_SCOPE_DEPTH") = static_cast<int32_t>(DIST_MAX_SCOPE_DEPTH);
+    m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);
+    m.attr("MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
+    m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
+    m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);
 }

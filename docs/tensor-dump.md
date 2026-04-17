@@ -609,5 +609,5 @@ keep the original cheaper completion path.
   program boundaries this feature spans.
 - [task-flow.md](task-flow.md) — where AICPU dispatch and completion
   sit in the per-task state machine.
-- [distributed_level_runtime.md](distributed_level_runtime.md) — how
+- [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — how
   L2 (this feature) relates to L3+ composition.

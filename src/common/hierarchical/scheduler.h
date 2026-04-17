@@ -10,13 +10,13 @@
  */
 
 /**
- * DistScheduler — DAG scheduling engine.
+ * Scheduler — DAG scheduling engine.
  *
  * The Scheduler thread routes tasks through the DAG lifecycle:
  *   ready_queue → dispatch (via WorkerManager) → completion → fanout release → new ready
  *
  * Worker pool management (WorkerThread creation, idle selection, dispatch) is
- * delegated to DistWorkerManager. The Scheduler only drives the DAG state machine.
+ * delegated to WorkerManager. The Scheduler only drives the DAG state machine.
  *
  * Flow:
  *   Orch: submit() → ready_queue.push(slot) + cv.notify()
@@ -26,7 +26,7 @@
  *     drain completion_queue → on_task_complete → fanout release → ready_queue
  *     drain ready_queue → manager.pick_n_idle → dispatch
  *
- *   WorkerThread (managed by DistWorkerManager):
+ *   WorkerThread (managed by WorkerManager):
  *     loop: task_queue.pop() → worker.run(payload) →
  *           completion callback → Scheduler.worker_done(slot)
  */
@@ -40,27 +40,27 @@
 #include <queue>
 #include <thread>
 
-#include "dist_types.h"
+#include "types.h"
 
-class DistWorkerManager;  // forward decl
-class DistRing;           // forward decl
+class WorkerManager;  // forward decl
+class Ring;           // forward decl
 
 // =============================================================================
-// DistScheduler — DAG engine (no worker pool ownership)
+// Scheduler — DAG engine (no worker pool ownership)
 // =============================================================================
 
-class DistScheduler {
+class Scheduler {
 public:
     struct Config {
-        DistRing *ring;  // owns slot state storage; Scheduler reads via ring->slot_state(id)
+        Ring *ring;  // owns slot state storage; Scheduler reads via ring->slot_state(id)
         // Strict-4 per-worker-type ready queues. `dispatch_ready` walks each
         // queue independently so a saturated pool of one worker type cannot
         // head-of-line-block dispatch for the other.
-        DistReadyQueue *ready_next_level_queue;
-        DistReadyQueue *ready_sub_queue;
-        DistWorkerManager *manager;  // not owned — Scheduler calls manager for dispatch
+        ReadyQueue *ready_next_level_queue;
+        ReadyQueue *ready_sub_queue;
+        WorkerManager *manager;  // not owned — Scheduler calls manager for dispatch
         // Called when a task reaches CONSUMED (TensorMap cleanup + ring release).
-        std::function<void(DistTaskSlot)> on_consumed_cb;
+        std::function<void(TaskSlot)> on_consumed_cb;
     };
 
     void start(const Config &cfg);
@@ -69,13 +69,13 @@ public:
     bool running() const { return running_.load(std::memory_order_acquire); }
 
     // Called by WorkerManager (from WorkerThread) after run() completes.
-    void worker_done(DistTaskSlot slot);
+    void worker_done(TaskSlot slot);
 
 private:
     Config cfg_;
 
     // Shared completion queue (WorkerThread → Scheduler)
-    std::queue<DistTaskSlot> completion_queue_;
+    std::queue<TaskSlot> completion_queue_;
     std::mutex completion_mu_;
     std::condition_variable completion_cv_;
 
@@ -84,7 +84,7 @@ private:
     std::atomic<bool> running_{false};
 
     void run();
-    void on_task_complete(DistTaskSlot slot);
-    void try_consume(DistTaskSlot slot);
+    void on_task_complete(TaskSlot slot);
+    void try_consume(TaskSlot slot);
     void dispatch_ready();
 };

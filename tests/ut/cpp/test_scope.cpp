@@ -11,27 +11,27 @@
 
 #include <gtest/gtest.h>
 
-#include "dist_scope.h"
+#include "scope.h"
 
-TEST(DistScope, InitialDepthIsZero) {
-    DistScope sc;
+TEST(Scope, InitialDepthIsZero) {
+    Scope sc;
     EXPECT_EQ(sc.depth(), 0);
 }
 
-TEST(DistScope, ScopeEndWithoutBeginThrows) {
-    DistScope sc;
-    EXPECT_THROW(sc.scope_end([](DistTaskSlot) {}), std::runtime_error);
+TEST(Scope, ScopeEndWithoutBeginThrows) {
+    Scope sc;
+    EXPECT_THROW(sc.scope_end([](TaskSlot) {}), std::runtime_error);
 }
 
-TEST(DistScope, SingleScope_ReleasesRegisteredTasks) {
-    DistScope sc;
+TEST(Scope, SingleScope_ReleasesRegisteredTasks) {
+    Scope sc;
     sc.scope_begin();
     EXPECT_EQ(sc.depth(), 1);
     sc.register_task(10);
     sc.register_task(20);
 
-    std::vector<DistTaskSlot> released;
-    sc.scope_end([&](DistTaskSlot s) {
+    std::vector<TaskSlot> released;
+    sc.scope_end([&](TaskSlot s) {
         released.push_back(s);
     });
 
@@ -41,30 +41,30 @@ TEST(DistScope, SingleScope_ReleasesRegisteredTasks) {
     EXPECT_EQ(released[1], 20);
 }
 
-TEST(DistScope, RegisterOutsideScopeIsNoop) {
-    DistScope sc;
+TEST(Scope, RegisterOutsideScopeIsNoop) {
+    Scope sc;
     sc.register_task(5);  // no open scope — should not throw
     EXPECT_EQ(sc.depth(), 0);
 }
 
-TEST(DistScope, NestedScopes) {
-    DistScope sc;
+TEST(Scope, NestedScopes) {
+    Scope sc;
     sc.scope_begin();
     sc.register_task(1);
     sc.scope_begin();
     sc.register_task(2);
     EXPECT_EQ(sc.depth(), 2);
 
-    std::vector<DistTaskSlot> inner_released;
-    sc.scope_end([&](DistTaskSlot s) {
+    std::vector<TaskSlot> inner_released;
+    sc.scope_end([&](TaskSlot s) {
         inner_released.push_back(s);
     });
     EXPECT_EQ(sc.depth(), 1);
     ASSERT_EQ(inner_released.size(), 1u);
     EXPECT_EQ(inner_released[0], 2);
 
-    std::vector<DistTaskSlot> outer_released;
-    sc.scope_end([&](DistTaskSlot s) {
+    std::vector<TaskSlot> outer_released;
+    sc.scope_end([&](TaskSlot s) {
         outer_released.push_back(s);
     });
     EXPECT_EQ(sc.depth(), 0);
@@ -72,11 +72,11 @@ TEST(DistScope, NestedScopes) {
     EXPECT_EQ(outer_released[0], 1);
 }
 
-TEST(DistScope, EmptyScopeReleasesNothing) {
-    DistScope sc;
+TEST(Scope, EmptyScopeReleasesNothing) {
+    Scope sc;
     sc.scope_begin();
     int calls = 0;
-    sc.scope_end([&](DistTaskSlot) {
+    sc.scope_end([&](TaskSlot) {
         ++calls;
     });
     EXPECT_EQ(calls, 0);

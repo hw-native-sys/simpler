@@ -10,7 +10,7 @@
  */
 
 /**
- * DistOrchestrator — DAG builder.
+ * Orchestrator — DAG builder.
  *
  * Public API (called by the user's orch fn during Worker::run):
  *   - submit_next_level(callable, TaskArgs, ChipCallConfig)
@@ -41,10 +41,10 @@
 #include "../task_interface/data_type.h"
 #include "../task_interface/task_args.h"
 #include "../task_interface/tensor_arg.h"
-#include "dist_ring.h"
-#include "dist_scope.h"
-#include "dist_tensormap.h"
-#include "dist_types.h"
+#include "ring.h"
+#include "scope.h"
+#include "tensormap.h"
+#include "types.h"
 
 // ---------------------------------------------------------------------------
 // SubmitResult — just the slot id
@@ -54,23 +54,23 @@
 // tensors live in the HeapRing allocated by the Worker), and tensormap.lookup
 // finds the producer slot from the data pointer. No outputs[] field needed.
 
-struct DistSubmitResult {
-    DistTaskSlot task_slot{DIST_INVALID_SLOT};
+struct SubmitResult {
+    TaskSlot task_slot{INVALID_SLOT};
 };
 
 // ---------------------------------------------------------------------------
-// DistOrchestrator
+// Orchestrator
 // ---------------------------------------------------------------------------
 
-class DistOrchestrator {
+class Orchestrator {
 public:
-    // Strict-4: the engine keeps one DistReadyQueue per WorkerType so a
+    // Strict-4: the engine keeps one ReadyQueue per WorkerType so a
     // saturated sub pool cannot head-of-line-block chip dispatch (and vice
     // versa). Submit routes to the queue matching the task's worker_type;
     // the Scheduler's dispatch_ready walks each queue independently.
     void init(
-        DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_next_level_queue,
-        DistReadyQueue *ready_sub_queue
+        TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue,
+        ReadyQueue *ready_sub_queue
     );
 
     // Allocate an intermediate buffer from the Worker's HeapRing (MAP_SHARED,
@@ -86,24 +86,24 @@ public:
     // (uint64_t handle from Python — typically ChipCallable.buffer_ptr()).
     // Tags inside `args` drive dependency inference; OUTPUT tensors with null
     // data are auto-allocated from the HeapRing.
-    DistSubmitResult submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config);
+    SubmitResult submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config);
 
     // Submit a group of NEXT_LEVEL tasks: N args -> N workers, 1 DAG node.
-    DistSubmitResult
+    SubmitResult
     submit_next_level_group(uint64_t callable, const std::vector<TaskArgs> &args_list, const ChipCallConfig &config);
 
     // Submit a SUB task by registered callable id.
-    DistSubmitResult submit_sub(int32_t callable_id, const TaskArgs &args);
+    SubmitResult submit_sub(int32_t callable_id, const TaskArgs &args);
 
     // Submit a group of SUB tasks: N args -> N workers, 1 DAG node.
-    DistSubmitResult submit_sub_group(int32_t callable_id, const std::vector<TaskArgs> &args_list);
+    SubmitResult submit_sub_group(int32_t callable_id, const std::vector<TaskArgs> &args_list);
 
     // Open a nested scope. Every task submitted between this call and the
     // matching `scope_end()` picks a heap ring based on the current scope
-    // depth (`min(depth, DIST_MAX_RING_DEPTH - 1)`) so its slab reclaims
+    // depth (`min(depth, MAX_RING_DEPTH - 1)`) so its slab reclaims
     // independently of the outer scope's slabs (Strict-1). `Worker::run`
     // opens the outermost scope automatically; user orch fns may nest up
-    // to `DIST_MAX_SCOPE_DEPTH` additional scopes.
+    // to `MAX_SCOPE_DEPTH` additional scopes.
     //
     // Non-blocking: `scope_end` walks the scope's tasks and releases one
     // ref per task, returning immediately. Actual CONSUMED transitions
@@ -117,28 +117,28 @@ public:
     // Worker::run after scope_end; not part of the user-facing orch-fn API.
     void drain();
 
-    // Called by Scheduler (via DistWorker) when a task becomes CONSUMED:
+    // Called by Scheduler (via Worker) when a task becomes CONSUMED:
     // erases TensorMap entries, releases the allocator slot (and implicitly
     // the slot's heap slab via last_alive).
     // Returns true iff this call performed the COMPLETED -> CONSUMED transition.
     // Idempotent: concurrent callers (release_ref vs try_consume) race on a
     // CAS — only the winner returns true and runs cleanup; losers return false.
-    bool on_consumed(DistTaskSlot slot);
+    bool on_consumed(TaskSlot slot);
 
 private:
-    DistTensorMap *tensormap_ = nullptr;
-    DistRing *allocator_ = nullptr;
-    DistScope *scope_ = nullptr;
+    TensorMap *tensormap_ = nullptr;
+    Ring *allocator_ = nullptr;
+    Scope *scope_ = nullptr;
     // Strict-4 per-worker-type ready queues. Each queue handles tasks of
     // exactly one WorkerType so the Scheduler can dispatch from an idle pool
     // without being blocked by another pool's saturation.
-    DistReadyQueue *ready_next_level_queue_ = nullptr;
-    DistReadyQueue *ready_sub_queue_ = nullptr;
+    ReadyQueue *ready_next_level_queue_ = nullptr;
+    ReadyQueue *ready_sub_queue_ = nullptr;
 
     // Returns the ready queue that owns tasks of the given worker type.
     // The method itself does not mutate the Orchestrator (hence `const`);
     // the returned pointer is non-const because callers push into the queue.
-    DistReadyQueue *ready_queue_for(WorkerType t) const {
+    ReadyQueue *ready_queue_for(WorkerType t) const {
         return t == WorkerType::NEXT_LEVEL ? ready_next_level_queue_ : ready_sub_queue_;
     }
 
@@ -147,14 +147,14 @@ private:
     std::mutex drain_mu_;
     std::condition_variable drain_cv_;
 
-    // Slot state lives in the DistRing; the pointer stays stable for the
+    // Slot state lives in the Ring; the pointer stays stable for the
     // slot's lifetime. Throws if the id is out of range — callers that
     // hold a recently-allocated slot id should always get a valid pointer.
-    DistTaskSlotState &slot_state(DistTaskSlot s);
+    TaskSlotState &slot_state(TaskSlot s);
 
     // Shared submit machinery. Takes `args_list` by value so the Orchestrator
     // can patch `tensor.data` on OUTPUT tensors flagged for auto-allocation.
-    DistSubmitResult submit_impl(
+    SubmitResult submit_impl(
         WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const ChipCallConfig &config,
         std::vector<TaskArgs> args_list
     );
@@ -167,17 +167,17 @@ private:
     // consumed, and populates `slot` / `heap_ptr` / `heap_end_offset` via the
     // output params (reused for book-keeping on the slot state). Throws on
     // back-pressure timeout.
-    DistAllocResult reserve_outputs_and_slot(std::vector<TaskArgs> &args_list);
+    AllocResult reserve_outputs_and_slot(std::vector<TaskArgs> &args_list);
 
     // Walk the tags of each TaskArgs in `args_list`, accumulating producer
     // slots (for INPUT/INOUT tags) and registering outputs in the tensormap
     // (for OUTPUT/INOUT/OUTPUT_EXISTING tags). NO_DEP tags are skipped.
     void infer_deps(
-        DistTaskSlot slot, const std::vector<TaskArgs> &args_list, std::vector<DistTaskSlot> &producers,
+        TaskSlot slot, const std::vector<TaskArgs> &args_list, std::vector<TaskSlot> &producers,
         std::vector<uint64_t> &output_keys
     );
 
     // Release one fanout reference on 'slot'.
     // If all references are released → transition to CONSUMED.
-    void release_ref(DistTaskSlot slot);
+    void release_ref(TaskSlot slot);
 };

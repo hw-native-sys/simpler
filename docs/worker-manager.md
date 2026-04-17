@@ -1,12 +1,5 @@
 # Worker Manager — Pool, Threading, and Dispatch Modes
 
-> **Status**: describes the **target** design. Current code still has
-> separate `DistChipProcess` / `DistSubWorker` classes (target: merged
-> into `WorkerThread` in PR-D). `IWorker::run(uint64_t callable,
-> TaskArgsView args, const ChipCallConfig &config)` is the live
-> signature; no `WorkerPayload` dispatch carrier exists. See
-> [roadmap.md](roadmap.md) for the full landed-vs-planned breakdown.
-
 `WorkerManager` and `WorkerThread` together implement the **execution layer**
 of a `Worker` engine. `WorkerManager` owns two pools of `WorkerThread`s (one
 for next-level workers, one for sub workers); each `WorkerThread` owns an
@@ -14,7 +7,7 @@ for next-level workers, one for sub workers); each `WorkerThread` owns an
 PROCESS mode.
 
 For the high-level role of this layer among the three engine components, see
-[distributed_level_runtime.md](distributed_level_runtime.md). For what the
+[hierarchical_level_runtime.md](hierarchical_level_runtime.md). For what the
 `IWorker` implementations actually do with task data, see
 [task-flow.md](task-flow.md). For where dispatched tasks come from, see
 [scheduler.md](scheduler.md).
@@ -89,7 +82,7 @@ public:
 
     WorkerThread(Mode mode,
                  IWorker *worker,
-                 DistRing *ring,
+                 Ring *ring,
                  size_t mailbox_size = 0);
 
     void start(OnCompleteFn on_done);
@@ -100,7 +93,7 @@ public:
 private:
     Mode mode_;
     IWorker *worker_;
-    DistRing *ring_;                       // reads slot state via ring->slot_state(id)
+    Ring *ring_;                       // reads slot state via ring->slot_state(id)
     std::thread parent_thread_;
     LockFreeQueue<WorkerDispatch> queue_;
 
@@ -355,21 +348,21 @@ nests:
 
 ```text
 L4 parent process
-  ├─ _init_distributed(): DistWorker(4) + HeapRing mmap (before fork)
-  └─ _start_distributed() (on first run):
+  ├─ _init_hierarchical(): Worker(4) + HeapRing mmap (before fork)
+  └─ _start_hierarchical() (on first run):
        ├─ fork L3 child  ────────►  L3 child process:
-       │                              inner_worker.init()  ← DistWorker(3) + L3 HeapRing
+       │                              inner_worker.init()  ← Worker(3) + L3 HeapRing
        │                              _child_worker_loop()
        │                                └─ on first dispatch: inner_worker.run()
-       │                                     └─ _start_distributed() forks L3's sub/chip children
-       └─ register mailbox with L4's DistWorker
+       │                                     └─ _start_hierarchical() forks L3's sub/chip children
+       └─ register mailbox with L4's Worker
 ```
 
 Each inner Worker inits **inside its forked child process** so its own
 children are forked from the correct parent. The L4 parent never sees L3's
 sub/chip grandchildren — they're L3's responsibility.
 
-**Key invariant**: `DistWorker(N)` and its HeapRing are created before any
+**Key invariant**: `Worker(N)` and its HeapRing are created before any
 fork at level N. Children inherit the `MAP_SHARED` mmap at the same virtual
 address. C++ scheduler threads start only after all forks at that level.
 
@@ -407,7 +400,7 @@ Alternative: N workers share one dispatch queue. Rejected because:
 
 ## 7. Related
 
-- [distributed_level_runtime.md](distributed_level_runtime.md) — where this
+- [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — where this
   layer fits in the three-component engine
 - [task-flow.md](task-flow.md) — what `IWorker::run` receives
 - [scheduler.md](scheduler.md) — the producer of `WorkerThread::dispatch`

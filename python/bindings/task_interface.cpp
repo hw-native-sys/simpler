@@ -33,7 +33,7 @@
 #include "callable.h"
 #include "chip_worker.h"
 #include "data_type.h"
-#include "dist_worker_bind.h"
+#include "worker_bind.h"
 #include "task_args.h"
 #include "tensor_arg.h"
 
@@ -621,5 +621,5 @@ NB_MODULE(_task_interface, m) {
         "Tags are not preserved (blob wire format strips them)."
     );
 
-    bind_dist_worker(m);
+    bind_worker(m);
 }

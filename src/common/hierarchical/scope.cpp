@@ -9,22 +9,22 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "dist_scope.h"
+#include "scope.h"
 
-void DistScope::scope_begin() {
-    if (depth() >= DIST_MAX_SCOPE_DEPTH) throw std::runtime_error("DistScope: maximum nesting depth exceeded");
+void Scope::scope_begin() {
+    if (depth() >= MAX_SCOPE_DEPTH) throw std::runtime_error("Scope: maximum nesting depth exceeded");
     stack_.push_back(ScopeFrame{});
 }
 
-void DistScope::scope_end(const std::function<void(DistTaskSlot)> &release_fn) {
-    if (stack_.empty()) throw std::runtime_error("DistScope: scope_end without scope_begin");
+void Scope::scope_end(const std::function<void(TaskSlot)> &release_fn) {
+    if (stack_.empty()) throw std::runtime_error("Scope: scope_end without scope_begin");
     ScopeFrame &frame = stack_.back();
-    for (DistTaskSlot slot : frame.tasks)
+    for (TaskSlot slot : frame.tasks)
         release_fn(slot);
     stack_.pop_back();
 }
 
-void DistScope::register_task(DistTaskSlot slot) {
+void Scope::register_task(TaskSlot slot) {
     if (stack_.empty()) return;  // no open scope — task has no scope ref
     stack_.back().tasks.push_back(slot);
 }

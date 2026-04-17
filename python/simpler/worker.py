@@ -55,18 +55,18 @@ from typing import Any, Callable, Optional
 
 from .orchestrator import Orchestrator
 from .task_interface import (
-    DIST_MAILBOX_SIZE,
+    MAILBOX_SIZE,
     ChipCallConfig,
     ChipWorker,
     ContinuousTensor,
     DataType,
-    DistWorker,
     TaskArgs,
     _ChipWorker,
+    _Worker,
 )
 
 # ---------------------------------------------------------------------------
-# Unified mailbox layout (must match dist_worker_manager.h MAILBOX_OFF_*)
+# Unified mailbox layout (must match worker_manager.h MAILBOX_OFF_*)
 # ---------------------------------------------------------------------------
 #
 # One layout for both NEXT_LEVEL (chip) and SUB workers. SUB children
@@ -246,12 +246,12 @@ def _child_worker_loop(
 class Worker:
     """Unified worker for all hierarchy levels.
 
-    level=2: wraps ChipWorker (one NPU device).
-    level=3: wraps DistWorker with ChipWorker×N + SubWorker×M,
+    level=2: wraps the C++ ChipWorker (one NPU device).
+    level=3: wraps the C++ Worker composite with ChipWorker×N + SubWorker×M,
              auto-created in init() from device_ids and num_sub_workers.
-    level=4+: wraps DistWorker with Worker(level-1)×N as NEXT_LEVEL
-              children + SubWorker×M. Children are added via add_worker()
-              before init().
+    level=4+: wraps the C++ Worker composite with Worker(level-1)×N as
+              NEXT_LEVEL children + SubWorker×M. Children are added via
+              add_worker() before init().
     """
 
     def __init__(self, level: int, **config) -> None:
@@ -264,7 +264,7 @@ class Worker:
         self._chip_worker: Optional[ChipWorker] = None
 
         # Level-3+ internals
-        self._dist_worker: Optional[DistWorker] = None
+        self._worker: Optional[_Worker] = None
         self._orch: Optional[Orchestrator] = None
         self._chip_shms: list[SharedMemory] = []
         self._chip_pids: list[int] = []
@@ -316,7 +316,7 @@ class Worker:
         if self.level == 2:
             self._init_level2()
         elif self.level >= 3:
-            self._init_distributed()
+            self._init_hierarchical()
         else:
             raise ValueError(f"Worker: level {self.level} not supported")
 
@@ -341,14 +341,14 @@ class Worker:
         )
         self._chip_worker.set_device(device_id)
 
-    def _init_distributed(self) -> None:
+    def _init_hierarchical(self) -> None:
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
         heap_ring_size = self._config.get("heap_ring_size", None)
 
-        # 1. Allocate sub-worker mailboxes (unified layout, DIST_MAILBOX_SIZE each).
+        # 1. Allocate sub-worker mailboxes (unified layout, MAILBOX_SIZE each).
         for _ in range(n_sub):
-            shm = SharedMemory(create=True, size=DIST_MAILBOX_SIZE)
+            shm = SharedMemory(create=True, size=MAILBOX_SIZE)
             assert shm.buf is not None
             struct.pack_into("i", shm.buf, _OFF_STATE, _IDLE)
             self._sub_shms.append(shm)
@@ -369,36 +369,36 @@ class Worker:
                 str(binaries.sim_context_path) if getattr(binaries, "sim_context_path", None) else ""
             )
 
-            # Allocate chip mailboxes (unified layout, DIST_MAILBOX_SIZE each).
+            # Allocate chip mailboxes (unified layout, MAILBOX_SIZE each).
             for _ in device_ids:
-                shm = SharedMemory(create=True, size=DIST_MAILBOX_SIZE)
+                shm = SharedMemory(create=True, size=MAILBOX_SIZE)
                 assert shm.buf is not None
                 struct.pack_into("i", shm.buf, _OFF_STATE, _IDLE)
                 self._chip_shms.append(shm)
 
         # 3. Allocate next-level Worker child mailboxes (L4+ only).
         for _ in self._next_level_workers:
-            shm = SharedMemory(create=True, size=DIST_MAILBOX_SIZE)
+            shm = SharedMemory(create=True, size=MAILBOX_SIZE)
             assert shm.buf is not None
             struct.pack_into("i", shm.buf, _OFF_STATE, _IDLE)
             self._next_level_shms.append(shm)
 
-        # 4. Construct the DistWorker *before* fork so the HeapRing mmap
+        # 4. Construct the _Worker *before* fork so the HeapRing mmap
         #    (taken in the C++ ctor) is inherited by every child process at
         #    the same virtual address. No C++ thread is spawned here; the
         #    scheduler + WorkerThreads start in init(), after forks.
         if heap_ring_size is None:
-            self._dist_worker = DistWorker(self.level)
+            self._worker = _Worker(self.level)
         else:
-            self._dist_worker = DistWorker(self.level, int(heap_ring_size))
+            self._worker = _Worker(self.level, int(heap_ring_size))
 
-        self._distributed_started = False
+        self._hierarchical_started = False
 
-    def _start_distributed(self) -> None:
+    def _start_hierarchical(self) -> None:
         """Fork child processes and start C++ scheduler. Called on first run()."""
-        if self._distributed_started:
+        if self._hierarchical_started:
             return
-        self._distributed_started = True
+        self._hierarchical_started = True
 
         device_ids = self._config.get("device_ids", [])
         n_sub = self._config.get("num_sub_workers", 0)
@@ -451,10 +451,10 @@ class Worker:
             else:
                 self._next_level_pids.append(pid)
 
-        # DistWorker was constructed in _init_distributed (pre-fork) so
+        # _Worker was constructed in _init_hierarchical (pre-fork) so
         # children inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode
         # workers via the unified mailbox.
-        dw = self._dist_worker
+        dw = self._worker
         assert dw is not None
 
         # Register chip workers as NEXT_LEVEL (L3)
@@ -492,9 +492,9 @@ class Worker:
             assert self._chip_worker is not None
             self._chip_worker.run(callable, args, cfg)
         else:
-            self._start_distributed()
+            self._start_hierarchical()
             assert self._orch is not None
-            assert self._dist_worker is not None
+            assert self._worker is not None
             self._orch._scope_begin()
             try:
                 callable(self._orch, args, cfg)
@@ -505,7 +505,7 @@ class Worker:
                 self._orch._drain()
 
     def _run_as_child(self, cid: int, args, config) -> None:
-        """Called from C++ DistWorker::run when this Worker is a THREAD-mode child.
+        """Called from C++ _Worker::run when this Worker is a THREAD-mode child.
 
         Looks up the orch function from the callable registry and delegates
         to ``self.run(orch_fn, args, config)``.
@@ -527,9 +527,9 @@ class Worker:
             if self._chip_worker:
                 self._chip_worker.finalize()
         else:
-            if self._dist_worker:
-                self._dist_worker.close()
-                self._dist_worker = None
+            if self._worker:
+                self._worker.close()
+                self._worker = None
                 self._orch = None
 
             # Shutdown SubWorker processes: write SHUTDOWN to each mailbox,

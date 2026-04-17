@@ -10,7 +10,7 @@
  */
 
 /**
- * DistTensorMap — base_ptr → producer task slot mapping.
+ * TensorMap — base_ptr → producer task slot mapping.
  *
  * At the distributed host level, every tensor is identified by its base pointer.
  * When a task produces an output, it registers the output's base_ptr here.
@@ -31,17 +31,17 @@
 #include <unordered_map>
 #include <vector>
 
-#include "dist_types.h"
+#include "types.h"
 
-class DistTensorMap {
+class TensorMap {
 public:
     // Look up the producer for tensor base_ptr.
-    // Returns DIST_INVALID_SLOT when not found.
-    DistTaskSlot lookup(uint64_t base_ptr) const;
+    // Returns INVALID_SLOT when not found.
+    TaskSlot lookup(uint64_t base_ptr) const;
 
     // Register base_ptr → producer mapping.
     // Overwrites any existing entry (re-use of the same buffer by a new producer).
-    void insert(uint64_t base_ptr, DistTaskSlot producer);
+    void insert(uint64_t base_ptr, TaskSlot producer);
 
     // Remove all entries whose key appears in 'keys'.
     // Called when a producer task transitions to CONSUMED.
@@ -51,5 +51,5 @@ public:
     int32_t size() const;
 
 private:
-    std::unordered_map<uint64_t, DistTaskSlot> map_;
+    std::unordered_map<uint64_t, TaskSlot> map_;
 };

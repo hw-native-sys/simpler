@@ -20,13 +20,13 @@
 #include <vector>
 
 #include "chip_call_config.h"
-#include "dist_orchestrator.h"
-#include "dist_ring.h"
-#include "dist_scheduler.h"
-#include "dist_scope.h"
-#include "dist_tensormap.h"
-#include "dist_types.h"
-#include "dist_worker_manager.h"
+#include "orchestrator.h"
+#include "ring.h"
+#include "scheduler.h"
+#include "scope.h"
+#include "tensormap.h"
+#include "types.h"
+#include "worker_manager.h"
 #include "task_args.h"
 
 // ---------------------------------------------------------------------------
@@ -103,38 +103,38 @@ static TaskArgs single_tensor_args(uint64_t data_ptr, TensorArgType tag) {
 // ---------------------------------------------------------------------------
 
 struct SchedulerFixture : public ::testing::Test {
-    DistTensorMap tm;
-    DistRing allocator;
-    DistScope scope;
+    TensorMap tm;
+    Ring allocator;
+    Scope scope;
     // Strict-4: per-type ready queues.
-    DistReadyQueue rq_next_level;
-    DistReadyQueue rq_sub;
-    DistOrchestrator orch;
+    ReadyQueue rq_next_level;
+    ReadyQueue rq_sub;
+    Orchestrator orch;
     MockWorker mock_worker;
-    DistWorkerManager manager;
-    DistScheduler sched;
+    WorkerManager manager;
+    Scheduler sched;
     ChipCallConfig cfg;
 
-    std::vector<DistTaskSlot> consumed_slots;
+    std::vector<TaskSlot> consumed_slots;
     std::mutex consumed_mu;
 
-    DistTaskSlotState &S(DistTaskSlot id) { return *allocator.slot_state(id); }
+    TaskSlotState &S(TaskSlot id) { return *allocator.slot_state(id); }
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
         orch.init(&tm, &allocator, &scope, &rq_next_level, &rq_sub);
 
         manager.add_next_level(&mock_worker);
-        manager.start(&allocator, [this](DistTaskSlot slot) {
+        manager.start(&allocator, [this](TaskSlot slot) {
             sched.worker_done(slot);
         });
 
-        DistScheduler::Config c;
+        Scheduler::Config c;
         c.ring = &allocator;
         c.ready_next_level_queue = &rq_next_level;
         c.ready_sub_queue = &rq_sub;
         c.manager = &manager;
-        c.on_consumed_cb = [this](DistTaskSlot s) {
+        c.on_consumed_cb = [this](TaskSlot s) {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
             consumed_slots.push_back(s);
@@ -148,12 +148,12 @@ struct SchedulerFixture : public ::testing::Test {
         allocator.shutdown();
     }
 
-    void wait_consumed(DistTaskSlot slot, int timeout_ms = 500) {
+    void wait_consumed(TaskSlot slot, int timeout_ms = 500) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         while (std::chrono::steady_clock::now() < deadline) {
             {
                 std::lock_guard<std::mutex> lk(consumed_mu);
-                for (DistTaskSlot s : consumed_slots)
+                for (TaskSlot s : consumed_slots)
                     if (s == slot) return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -169,7 +169,7 @@ struct SchedulerFixture : public ::testing::Test {
 TEST_F(SchedulerFixture, IndependentTaskDispatchedAndConsumed) {
     auto args_a = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level(0xDEAD, args_a, cfg);
-    DistTaskSlot slot = res.task_slot;
+    TaskSlot slot = res.task_slot;
 
     mock_worker.wait_running();
     ASSERT_GE(mock_worker.dispatched_count(), 1);
@@ -209,23 +209,23 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
 // ===========================================================================
 
 struct GroupSchedulerFixture : public ::testing::Test {
-    DistTensorMap tm;
-    DistRing allocator;
-    DistScope scope;
+    TensorMap tm;
+    Ring allocator;
+    Scope scope;
     // Strict-4: per-type ready queues.
-    DistReadyQueue rq_next_level;
-    DistReadyQueue rq_sub;
-    DistOrchestrator orch;
+    ReadyQueue rq_next_level;
+    ReadyQueue rq_sub;
+    Orchestrator orch;
     MockWorker worker_a;
     MockWorker worker_b;
-    DistWorkerManager manager;
-    DistScheduler sched;
+    WorkerManager manager;
+    Scheduler sched;
     ChipCallConfig cfg;
 
-    std::vector<DistTaskSlot> consumed_slots;
+    std::vector<TaskSlot> consumed_slots;
     std::mutex consumed_mu;
 
-    DistTaskSlotState &S(DistTaskSlot id) { return *allocator.slot_state(id); }
+    TaskSlotState &S(TaskSlot id) { return *allocator.slot_state(id); }
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
@@ -233,16 +233,16 @@ struct GroupSchedulerFixture : public ::testing::Test {
 
         manager.add_next_level(&worker_a);
         manager.add_next_level(&worker_b);
-        manager.start(&allocator, [this](DistTaskSlot slot) {
+        manager.start(&allocator, [this](TaskSlot slot) {
             sched.worker_done(slot);
         });
 
-        DistScheduler::Config c;
+        Scheduler::Config c;
         c.ring = &allocator;
         c.ready_next_level_queue = &rq_next_level;
         c.ready_sub_queue = &rq_sub;
         c.manager = &manager;
-        c.on_consumed_cb = [this](DistTaskSlot s) {
+        c.on_consumed_cb = [this](TaskSlot s) {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
             consumed_slots.push_back(s);
@@ -256,12 +256,12 @@ struct GroupSchedulerFixture : public ::testing::Test {
         allocator.shutdown();
     }
 
-    void wait_consumed(DistTaskSlot slot, int timeout_ms = 1000) {
+    void wait_consumed(TaskSlot slot, int timeout_ms = 1000) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         while (std::chrono::steady_clock::now() < deadline) {
             {
                 std::lock_guard<std::mutex> lk(consumed_mu);
-                for (DistTaskSlot s : consumed_slots)
+                for (TaskSlot s : consumed_slots)
                     if (s == slot) return;
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -275,7 +275,7 @@ TEST_F(GroupSchedulerFixture, GroupDispatchesToNWorkers) {
     TaskArgs a1 = single_tensor_args(0xA1, TensorArgType::OUTPUT);
 
     auto res = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
-    DistTaskSlot slot = res.task_slot;
+    TaskSlot slot = res.task_slot;
 
     worker_a.wait_running();
     worker_b.wait_running();
@@ -300,7 +300,7 @@ TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
     TaskArgs a0 = single_tensor_args(0xB0, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xB1, TensorArgType::OUTPUT);
     auto res = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
-    DistTaskSlot slot = res.task_slot;
+    TaskSlot slot = res.task_slot;
 
     worker_a.wait_running();
     worker_b.wait_running();
@@ -321,22 +321,22 @@ TEST_F(GroupSchedulerFixture, GroupCompletesOnlyWhenAllDone) {
 // ===========================================================================
 
 struct MixedTypeSchedulerFixture : public ::testing::Test {
-    DistTensorMap tm;
-    DistRing allocator;
-    DistScope scope;
-    DistReadyQueue rq_next_level;
-    DistReadyQueue rq_sub;
-    DistOrchestrator orch;
+    TensorMap tm;
+    Ring allocator;
+    Scope scope;
+    ReadyQueue rq_next_level;
+    ReadyQueue rq_sub;
+    Orchestrator orch;
     MockWorker next_level_worker;
     MockWorker sub_worker;
-    DistWorkerManager manager;
-    DistScheduler sched;
+    WorkerManager manager;
+    Scheduler sched;
     ChipCallConfig cfg;
 
-    std::vector<DistTaskSlot> consumed_slots;
+    std::vector<TaskSlot> consumed_slots;
     std::mutex consumed_mu;
 
-    DistTaskSlotState &S(DistTaskSlot id) { return *allocator.slot_state(id); }
+    TaskSlotState &S(TaskSlot id) { return *allocator.slot_state(id); }
 
     void SetUp() override {
         allocator.init(/*heap_bytes=*/1ULL << 20);
@@ -344,16 +344,16 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
 
         manager.add_next_level(&next_level_worker);
         manager.add_sub(&sub_worker);
-        manager.start(&allocator, [this](DistTaskSlot slot) {
+        manager.start(&allocator, [this](TaskSlot slot) {
             sched.worker_done(slot);
         });
 
-        DistScheduler::Config c;
+        Scheduler::Config c;
         c.ring = &allocator;
         c.ready_next_level_queue = &rq_next_level;
         c.ready_sub_queue = &rq_sub;
         c.manager = &manager;
-        c.on_consumed_cb = [this](DistTaskSlot s) {
+        c.on_consumed_cb = [this](TaskSlot s) {
             orch.on_consumed(s);
             std::lock_guard<std::mutex> lk(consumed_mu);
             consumed_slots.push_back(s);
@@ -367,14 +367,14 @@ struct MixedTypeSchedulerFixture : public ::testing::Test {
         allocator.shutdown();
     }
 
-    bool is_consumed(DistTaskSlot slot) {
+    bool is_consumed(TaskSlot slot) {
         std::lock_guard<std::mutex> lk(consumed_mu);
-        for (DistTaskSlot s : consumed_slots)
+        for (TaskSlot s : consumed_slots)
             if (s == slot) return true;
         return false;
     }
 
-    void wait_consumed(DistTaskSlot slot, int timeout_ms = 500) {
+    void wait_consumed(TaskSlot slot, int timeout_ms = 500) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
         while (std::chrono::steady_clock::now() < deadline) {
             if (is_consumed(slot)) return;

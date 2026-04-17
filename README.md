@@ -69,12 +69,11 @@ export ASCEND_HOME_PATH=/usr/local/Ascend/ascend-toolkit/latest
 | Document | Description |
 | -------- | ----------- |
 | [Chip-Level Architecture](docs/chip-level-arch.md) | L2 single-chip: three-program model (host/AICPU/AICore), API layers, handshake protocol |
-| [Distributed Level Runtime](docs/distributed_level_runtime.md) | L0–L6 level model, component composition (Orchestrator / Scheduler / Worker) |
+| [Hierarchical Level Runtime](docs/hierarchical_level_runtime.md) | L0–L6 level model, component composition (Orchestrator / Scheduler / Worker) |
 | [Task Flow](docs/task-flow.md) | End-to-end data flow: Callable / TaskArgs / CallConfig handles, IWorker interface |
 | [Orchestrator](docs/orchestrator.md) | DAG submission internals: submit flow, TensorMap, Scope, Ring, task state machine |
 | [Scheduler](docs/scheduler.md) | DAG dispatch internals: wiring/ready/completion queues, dispatch loop |
 | [Worker Manager](docs/worker-manager.md) | Worker pool, WorkerThread, THREAD/PROCESS modes, fork + mailbox mechanics |
-| [Roadmap](docs/roadmap.md) | Hierarchical-runtime refactor — what has landed and what is still in flight |
 | [Getting Started](docs/getting-started.md) | Setup, prerequisites, build process, configuration |
 | [Developer Guide](docs/developer-guide.md) | Directory structure, role ownership, conventions |
 | [Testing Guide](docs/testing.md) | CI pipeline, test types, writing new tests |

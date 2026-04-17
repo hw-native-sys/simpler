@@ -1,17 +1,12 @@
 # Orchestrator — DAG Submission Internals
 
-> **Status**: describes the **target** design. Current code matches the
-> user-facing submit API and `alloc` surface; inline "Status:" notes flag
-> the few remaining divergences. See [roadmap.md](roadmap.md) for the
-> full landed-vs-planned breakdown.
-
 The Orchestrator is the **DAG builder**. It runs single-threaded on the user's
 thread (inside `Worker::run` between `scope_begin` and `drain`) and owns the
 three data structures that turn a sequence of `submit_*` calls into a scheduled
 DAG: `Ring`, `TensorMap`, and `Scope`.
 
 For the high-level role of the Orchestrator among the three engine components,
-see [distributed_level_runtime.md](distributed_level_runtime.md). For what
+see [hierarchical_level_runtime.md](hierarchical_level_runtime.md). For what
 flows through `submit`, see [task-flow.md](task-flow.md).
 
 ---
@@ -248,7 +243,7 @@ SubmitResult Orchestrator::submit_sub(Callable cb, TaskArgs args, const CallConf
 
 ## 5. Ring (slot + per-scope heap allocator)
 
-`DistRing` owns three correlated per-task resources:
+`Ring` owns three correlated per-task resources:
 
 1. A **monotonic task id** — allocated on every `alloc()`, shared across
    all rings. There is no fixed window and no modulo wrap at L3: slot
@@ -257,14 +252,14 @@ SubmitResult Orchestrator::submit_sub(Callable cb, TaskArgs args, const CallConf
    here (see plan Allowed Exception #6). A monotonic `int32_t` gives ~2
    billion ids per `reset_to_empty()` interval, reset to 0 at the end of
    every `Worker.run()`.
-2. **`DIST_MAX_RING_DEPTH = 4` independent shared-memory heap slabs**
+2. **`MAX_RING_DEPTH = 4` independent shared-memory heap slabs**
    (Strict-1; matches L2's `PTO2_MAX_RING_DEPTH`). Each slab has its own
    `mmap(MAP_SHARED | MAP_ANONYMOUS)` region, bump cursor, FIFO
    reclamation pointer, and mutex / cv. A task's ring is chosen by
    **scope depth**:
 
    ```cpp
-   ring_idx = std::min(scope_depth, DIST_MAX_RING_DEPTH - 1);
+   ring_idx = std::min(scope_depth, MAX_RING_DEPTH - 1);
    ```
 
    so nested-scope tasks never share a FIFO head with outer-scope
@@ -273,7 +268,7 @@ SubmitResult Orchestrator::submit_sub(Callable cb, TaskArgs args, const CallConf
    the same virtual address range. `heap_ring_size` on the Worker ctor
    is the **per-ring** size (default 1 GiB → 4 GiB total VA reservation;
    physical pages stay lazy).
-3. The **per-task slot state** (`DistTaskSlotState`) — stored in a single
+3. The **per-task slot state** (`TaskSlotState`) — stored in a single
    `std::deque<std::unique_ptr<...>>` shared across rings. Each slot
    records its `ring_idx` and `ring_slot_idx` (position within that
    ring's FIFO order). `std::deque::push_back` never invalidates pointers
@@ -281,26 +276,26 @@ SubmitResult Orchestrator::submit_sub(Callable cb, TaskArgs args, const CallConf
    stays valid until `reset_to_empty()` drops the whole deque.
 
 ```cpp
-struct DistAllocResult {
+struct AllocResult {
     TaskSlot slot;
     void    *heap_ptr;          // nullptr when alloc(0)
     uint64_t heap_end_offset;   // byte offset within the selected ring
-    int32_t  ring_idx;          // which of the DIST_MAX_RING_DEPTH rings was used
+    int32_t  ring_idx;          // which of the MAX_RING_DEPTH rings was used
 };
 
-class DistRing {
+class Ring {
 public:
-    // Initialise DIST_MAX_RING_DEPTH heap rings, each of heap_bytes.
-    // Total VA = DIST_MAX_RING_DEPTH * heap_bytes.
+    // Initialise MAX_RING_DEPTH heap rings, each of heap_bytes.
+    // Total VA = MAX_RING_DEPTH * heap_bytes.
     void init(uint64_t heap_bytes,       // per-ring, default 1 GiB
               uint32_t timeout_ms);      // default 10 s
 
-    // Pick ring = min(scope_depth, DIST_MAX_RING_DEPTH - 1); reserve a
+    // Pick ring = min(scope_depth, MAX_RING_DEPTH - 1); reserve a
     // slab from that ring (blocks on its cv) and stamp the slot state
     // with ring_idx / ring_slot_idx.
-    DistAllocResult alloc(uint64_t bytes = 0, int32_t scope_depth = 0);
+    AllocResult alloc(uint64_t bytes = 0, int32_t scope_depth = 0);
     void            release(TaskSlot sid);      // FIFO-advances THAT slot's ring
-    DistTaskSlotState *slot_state(TaskSlot sid);
+    TaskSlotState *slot_state(TaskSlot sid);
     void            reset_to_empty();           // rewinds every ring
     void            shutdown();
 
@@ -319,7 +314,7 @@ progress, it throws `std::runtime_error`. That surfaces as a Python
 exception so users can enlarge `heap_ring_size` on the `Worker` instead
 of deadlocking.
 
-**Alignment**: every heap allocation is rounded up to `DIST_HEAP_ALIGN = 1024 B`
+**Alignment**: every heap allocation is rounded up to `HEAP_ALIGN = 1024 B`
 (matches L2's `PTO2_PACKED_OUTPUT_ALIGN`, Strict-3).
 
 **FIFO reclamation per ring**: each `alloc()` appends the slot's
@@ -330,7 +325,7 @@ next-oldest in-ring slot is released, walking the ring's `heap_tail`
 forward. Rings never touch each other — inner-scope tasks reclaim
 without waiting for an outer-scope task to finish.
 
-**End-of-run reset**: `DistOrchestrator::drain()` waits for
+**End-of-run reset**: `Orchestrator::drain()` waits for
 `active_tasks_` to hit 0, then calls `ring.reset_to_empty()` which
 drops the whole slot-state deque *and* rewinds every ring's cursors /
 `released[]` / `slot_heap_end[]` back to 0. Memory per `Worker.run()`
@@ -376,7 +371,7 @@ COMPLETED but never transition further. Scope adds a deferred reference
 that releases at `scope_end`:
 
 ```cpp
-class DistScope {
+class Scope {
 public:
     void    scope_begin();
     void    scope_end(const std::function<void(TaskSlot)> &release_ref);
@@ -389,7 +384,7 @@ private:
 ```
 
 `Worker::run` always opens one outer scope; user orch fns may nest up to
-`DIST_MAX_SCOPE_DEPTH = 64` additional scopes on top. Ring selection uses
+`MAX_SCOPE_DEPTH = 64` additional scopes on top. Ring selection uses
 the 0-based `current_depth()`:
 
 | Where you are | `depth()` | `current_depth()` | Ring |
@@ -405,7 +400,7 @@ Flow:
 1. `scope_begin` pushes an empty frame onto `stack_`.
 2. Each `submit_*` calls `scope.register_task(sid)`; the Orchestrator
    has already set `slot.fanout_total = scope_ref` (1 when `depth() > 0`)
-   and stamped `slot.ring_idx = dist_ring_idx_for_scope(current_depth())`
+   and stamped `slot.ring_idx = ring_idx_for_scope(current_depth())`
    before the call.
 3. `scope_end` pops the frame; for each `sid`, invokes the release
    callback (`Orchestrator::release_ref`) which bumps `fanout_released`
@@ -543,10 +538,10 @@ implicitly once the slot reaches `CONSUMED` and `last_alive` sweeps over it
 
 ```cpp
 ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
-    // 1. Atomic {slot, heap_ptr} from the merged DistRing. Blocks on
+    // 1. Atomic {slot, heap_ptr} from the merged Ring. Blocks on
     //    back-pressure; throws on timeout.
-    uint64_t aligned = align_up(nbytes(shape, dtype), DIST_HEAP_ALIGN);
-    DistAllocResult ar = allocator_.alloc(aligned);
+    uint64_t aligned = align_up(nbytes(shape, dtype), HEAP_ALIGN);
+    AllocResult ar = allocator_.alloc(aligned);
     TaskSlotState &s   = slots_[ar.slot];
     s.reset();
     // 2. Register as this slot's output so downstream tensors with the same
@@ -619,7 +614,7 @@ themselves.
 
 If an `OUTPUT`-tagged tensor arrives at `submit_*` with `data == 0`, the
 Orchestrator reserves a slab from the HeapRing as part of the same
-`DistRing::alloc` call that claims the slot. All OUTPUT slabs for a
+`Ring::alloc` call that claims the slot. All OUTPUT slabs for a
 single submit share one `alloc(total_bytes)` call — the returned base
 pointer is carved into per-tensor slabs, each 1024-byte aligned.
 OUTPUT tensors whose `data` is already set are left alone (legacy
@@ -628,7 +623,7 @@ OUTPUT tensors whose `data` is already set are left alone (legacy
 
 ### `heap_ring_size` and back-pressure
 
-The HeapRing size is a `DistWorker` ctor parameter, surfaced on the Python
+The HeapRing size is a `Worker` ctor parameter, surfaced on the Python
 `Worker` as `heap_ring_size=` (default 1 GiB). The heap is `mmap`'d in the
 C++ ctor — before Python forks the ChipProcess / SubWorker children — so
 children inherit the same `MAP_SHARED | MAP_ANONYMOUS` region at the same
@@ -643,7 +638,7 @@ instead of stalling forever. Default timeout: 10 s.
 
 ## 8c. Fork hygiene
 
-`DistWorker`'s ctor runs a one-shot `fork_hygiene_once()` step before it
+`Worker`'s ctor runs a one-shot `fork_hygiene_once()` step before it
 `mmap`s the heap. Two pieces:
 
 1. **Thread-pool env defaults** — `setenv` with `overwrite=0`:
@@ -687,7 +682,7 @@ instead of stalling forever. Default timeout: 10 s.
 
 ## 10. Related
 
-- [distributed_level_runtime.md](distributed_level_runtime.md) — how
+- [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — how
   Orchestrator fits alongside Scheduler and Worker
 - [scheduler.md](scheduler.md) — what happens to slots after they're pushed
   onto the wiring queue

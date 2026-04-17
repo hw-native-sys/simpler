@@ -7,12 +7,12 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 
-# C++ unit tests for src/common/distributed using GoogleTest.
+# C++ unit tests for src/common/hierarchical using GoogleTest.
 # Run with: cmake --build . --target run_ut_cpp
 # Or directly: ctest --test-dir build/ut_cpp
 
 cmake_minimum_required(VERSION 3.15)
-project(dist_ut CXX)
+project(hierarchical_ut CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -35,27 +35,27 @@ find_library(GTEST_MAIN_LIB gtest_main PATHS ${GTEST_SEARCH_PATHS} REQUIRED)
 # ---------------------------------------------------------------------------
 # Distributed runtime sources under test
 # ---------------------------------------------------------------------------
-set(DIST_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/distributed)
+set(HIERARCHICAL_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/hierarchical)
 
-set(DIST_SOURCES
-    ${DIST_SRC_DIR}/dist_types.cpp
-    ${DIST_SRC_DIR}/dist_tensormap.cpp
-    ${DIST_SRC_DIR}/dist_ring.cpp
-    ${DIST_SRC_DIR}/dist_scope.cpp
-    ${DIST_SRC_DIR}/dist_orchestrator.cpp
-    ${DIST_SRC_DIR}/dist_worker_manager.cpp
-    ${DIST_SRC_DIR}/dist_scheduler.cpp
-    ${DIST_SRC_DIR}/dist_worker.cpp
+set(HIERARCHICAL_SOURCES
+    ${HIERARCHICAL_SRC_DIR}/types.cpp
+    ${HIERARCHICAL_SRC_DIR}/tensormap.cpp
+    ${HIERARCHICAL_SRC_DIR}/ring.cpp
+    ${HIERARCHICAL_SRC_DIR}/scope.cpp
+    ${HIERARCHICAL_SRC_DIR}/orchestrator.cpp
+    ${HIERARCHICAL_SRC_DIR}/worker_manager.cpp
+    ${HIERARCHICAL_SRC_DIR}/scheduler.cpp
+    ${HIERARCHICAL_SRC_DIR}/worker.cpp
 )
 
 # ---------------------------------------------------------------------------
 # Helper: add one test executable
 # ---------------------------------------------------------------------------
-function(add_dist_test name src)
-    add_executable(${name} ${src} ${DIST_SOURCES})
+function(add_hierarchical_test name src)
+    add_executable(${name} ${src} ${HIERARCHICAL_SOURCES})
     target_include_directories(${name} PRIVATE
         ${GTEST_INCLUDE_DIRS}
-        ${DIST_SRC_DIR}
+        ${HIERARCHICAL_SRC_DIR}
         ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
     )
     target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
@@ -107,10 +107,10 @@ endfunction()
 
 enable_testing()
 
-add_dist_test(test_dist_tensormap  test_dist_tensormap.cpp)
-add_dist_test(test_dist_ring  test_dist_ring.cpp)
-add_dist_test(test_dist_scope      test_dist_scope.cpp)
-add_dist_test(test_dist_orchestrator test_dist_orchestrator.cpp)
-add_dist_test(test_dist_scheduler  test_dist_scheduler.cpp)
+add_hierarchical_test(test_tensormap  test_tensormap.cpp)
+add_hierarchical_test(test_ring  test_ring.cpp)
+add_hierarchical_test(test_scope      test_scope.cpp)
+add_hierarchical_test(test_orchestrator test_orchestrator.cpp)
+add_hierarchical_test(test_scheduler  test_scheduler.cpp)
 add_a2a3_pto2_test(test_a2a3_pto2_fatal test_a2a3_pto2_fatal.cpp)
 add_a5_pto2_test(test_a5_pto2_fatal test_a5_pto2_fatal.cpp)

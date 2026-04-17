@@ -15,20 +15,20 @@ set(BINDING_SOURCES
 
 list(TRANSFORM BINDING_SOURCES PREPEND "${CMAKE_CURRENT_SOURCE_DIR}/")
 
-set(DIST_SRC ${CMAKE_SOURCE_DIR}/src/common/distributed)
+set(HIERARCHICAL_SRC ${CMAKE_SOURCE_DIR}/src/common/hierarchical)
 
-set(DIST_SOURCES
-    ${DIST_SRC}/dist_types.cpp
-    ${DIST_SRC}/dist_tensormap.cpp
-    ${DIST_SRC}/dist_ring.cpp
-    ${DIST_SRC}/dist_scope.cpp
-    ${DIST_SRC}/dist_orchestrator.cpp
-    ${DIST_SRC}/dist_worker_manager.cpp
-    ${DIST_SRC}/dist_scheduler.cpp
-    ${DIST_SRC}/dist_worker.cpp
+set(HIERARCHICAL_SOURCES
+    ${HIERARCHICAL_SRC}/types.cpp
+    ${HIERARCHICAL_SRC}/tensormap.cpp
+    ${HIERARCHICAL_SRC}/ring.cpp
+    ${HIERARCHICAL_SRC}/scope.cpp
+    ${HIERARCHICAL_SRC}/orchestrator.cpp
+    ${HIERARCHICAL_SRC}/worker_manager.cpp
+    ${HIERARCHICAL_SRC}/scheduler.cpp
+    ${HIERARCHICAL_SRC}/worker.cpp
 )
 
-nanobind_add_module(_task_interface ${BINDING_SOURCES} ${DIST_SOURCES})
+nanobind_add_module(_task_interface ${BINDING_SOURCES} ${HIERARCHICAL_SOURCES})
 
 target_sources(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/worker/chip_worker.cpp
@@ -37,7 +37,7 @@ target_sources(_task_interface PRIVATE
 target_include_directories(_task_interface PRIVATE
     ${CMAKE_SOURCE_DIR}/src/common/task_interface
     ${CMAKE_SOURCE_DIR}/src/common/worker
-    ${CMAKE_SOURCE_DIR}/src/common/distributed
+    ${CMAKE_SOURCE_DIR}/src/common/hierarchical
     ${CMAKE_CURRENT_SOURCE_DIR}
 )
 

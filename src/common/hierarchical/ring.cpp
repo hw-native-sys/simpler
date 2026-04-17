@@ -9,14 +9,14 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "dist_ring.h"
+#include "ring.h"
 
 #include <sys/mman.h>
 
 #include <chrono>
 #include <stdexcept>
 
-DistRing::~DistRing() {
+Ring::~Ring() {
     for (HeapRing &r : rings_) {
         if (r.mapped && r.base) {
             munmap(r.base, r.size);
@@ -26,14 +26,14 @@ DistRing::~DistRing() {
     }
 }
 
-void DistRing::init(uint64_t heap_bytes, uint32_t timeout_ms) {
+void Ring::init(uint64_t heap_bytes, uint32_t timeout_ms) {
     for (const HeapRing &r : rings_) {
         if (r.mapped) {
-            throw std::logic_error("DistRing::init called twice");
+            throw std::logic_error("Ring::init called twice");
         }
     }
 
-    timeout_ms_ = timeout_ms == 0 ? DIST_ALLOC_TIMEOUT_MS : timeout_ms;
+    timeout_ms_ = timeout_ms == 0 ? ALLOC_TIMEOUT_MS : timeout_ms;
 
     {
         std::lock_guard<std::mutex> lk(slots_mu_);
@@ -61,7 +61,7 @@ void DistRing::init(uint64_t heap_bytes, uint32_t timeout_ms) {
                         rr.mapped = false;
                     }
                 }
-                throw std::runtime_error("DistRing: per-ring heap mmap failed");
+                throw std::runtime_error("Ring: per-ring heap mmap failed");
             }
             r.base = base;
             r.size = heap_bytes;
@@ -77,16 +77,16 @@ void DistRing::init(uint64_t heap_bytes, uint32_t timeout_ms) {
 // alloc — picks a ring by scope depth, reserves slot + heap slab
 // ---------------------------------------------------------------------------
 
-DistAllocResult DistRing::alloc(uint64_t bytes, int32_t scope_depth) {
-    int32_t ring_idx = dist_ring_idx_for_scope(scope_depth);
+AllocResult Ring::alloc(uint64_t bytes, int32_t scope_depth) {
+    int32_t ring_idx = ring_idx_for_scope(scope_depth);
     HeapRing &ring = rings_[static_cast<size_t>(ring_idx)];
 
     if (bytes > 0 && ring.size == 0) {
-        throw std::runtime_error("DistRing: heap disabled (heap_bytes=0) but alloc(bytes>0) requested");
+        throw std::runtime_error("Ring: heap disabled (heap_bytes=0) but alloc(bytes>0) requested");
     }
-    uint64_t aligned = bytes > 0 ? dist_align_up(bytes, DIST_HEAP_ALIGN) : 0;
+    uint64_t aligned = bytes > 0 ? align_up(bytes, HEAP_ALIGN) : 0;
     if (aligned > ring.size) {
-        throw std::runtime_error("DistRing: requested allocation exceeds per-ring heap size");
+        throw std::runtime_error("Ring: requested allocation exceeds per-ring heap size");
     }
 
     // --- Phase 1: wait for heap space + reserve in-ring bookkeeping ---
@@ -103,7 +103,7 @@ DistAllocResult DistRing::alloc(uint64_t bytes, int32_t scope_depth) {
 
         while (true) {
             if (shutdown_.load(std::memory_order_acquire)) {
-                return DistAllocResult{DIST_INVALID_SLOT, nullptr, 0, ring_idx};
+                return AllocResult{INVALID_SLOT, nullptr, 0, ring_idx};
             }
             if (aligned == 0) {
                 heap_ptr = nullptr;
@@ -117,10 +117,10 @@ DistAllocResult DistRing::alloc(uint64_t bytes, int32_t scope_depth) {
             // rings stay usable) or a shutdown.
             if (ring.cv.wait_until(rlk, deadline) == std::cv_status::timeout) {
                 if (shutdown_.load(std::memory_order_acquire)) {
-                    return DistAllocResult{DIST_INVALID_SLOT, nullptr, 0, ring_idx};
+                    return AllocResult{INVALID_SLOT, nullptr, 0, ring_idx};
                 }
                 throw std::runtime_error(
-                    "DistRing: per-ring heap exhausted (timed out waiting). "
+                    "Ring: per-ring heap exhausted (timed out waiting). "
                     "Increase heap_ring_size on Worker."
                 );
             }
@@ -141,25 +141,25 @@ DistAllocResult DistRing::alloc(uint64_t bytes, int32_t scope_depth) {
     {
         std::lock_guard<std::mutex> slk(slots_mu_);
         task_id = next_task_id_++;
-        slot_states_.emplace_back(std::make_unique<DistTaskSlotState>());
+        slot_states_.emplace_back(std::make_unique<TaskSlotState>());
         auto *s = slot_states_.back().get();
         s->ring_idx = ring_idx;
         s->ring_slot_idx = ring_slot_idx;
     }
-    return DistAllocResult{task_id, heap_ptr, heap_end, ring_idx};
+    return AllocResult{task_id, heap_ptr, heap_end, ring_idx};
 }
 
 // ---------------------------------------------------------------------------
 // release — mark consumed in the slot's own ring and FIFO-advance that ring
 // ---------------------------------------------------------------------------
 
-void DistRing::release(DistTaskSlot slot) {
+void Ring::release(TaskSlot slot) {
     int32_t ring_idx = 0;
     int32_t ring_slot_idx = 0;
     {
         std::lock_guard<std::mutex> slk(slots_mu_);
         if (slot < 0 || slot >= static_cast<int32_t>(slot_states_.size())) return;
-        DistTaskSlotState *s = slot_states_[static_cast<size_t>(slot)].get();
+        TaskSlotState *s = slot_states_[static_cast<size_t>(slot)].get();
         if (!s) return;
         ring_idx = s->ring_idx;
         ring_slot_idx = s->ring_slot_idx;
@@ -180,7 +180,7 @@ void DistRing::release(DistTaskSlot slot) {
 // slot_state accessor — pointer-stable until reset_to_empty()
 // ---------------------------------------------------------------------------
 
-DistTaskSlotState *DistRing::slot_state(DistTaskSlot slot) {
+TaskSlotState *Ring::slot_state(TaskSlot slot) {
     std::lock_guard<std::mutex> slk(slots_mu_);
     if (slot < 0 || slot >= static_cast<int32_t>(slot_states_.size())) return nullptr;
     return slot_states_[static_cast<size_t>(slot)].get();
@@ -190,7 +190,7 @@ DistTaskSlotState *DistRing::slot_state(DistTaskSlot slot) {
 // reset_to_empty — rewind every ring and drop all slot state
 // ---------------------------------------------------------------------------
 
-void DistRing::reset_to_empty() {
+void Ring::reset_to_empty() {
     std::lock_guard<std::mutex> slk(slots_mu_);
 
     // Validate: every ring must be fully drained. Checking each ring under
@@ -200,7 +200,7 @@ void DistRing::reset_to_empty() {
         std::lock_guard<std::mutex> rlk(r.mu);
         if (r.last_alive != static_cast<int32_t>(r.released.size())) {
             throw std::logic_error(
-                "DistRing::reset_to_empty: tasks still live on at least one ring. "
+                "Ring::reset_to_empty: tasks still live on at least one ring. "
                 "Did drain() complete?"
             );
         }
@@ -226,7 +226,7 @@ void DistRing::reset_to_empty() {
 // Queries & shutdown
 // ---------------------------------------------------------------------------
 
-int32_t DistRing::active_count() const {
+int32_t Ring::active_count() const {
     // total_allocated - total_released. Reads the two halves under separate
     // critical sections to avoid nesting locks (reset_to_empty holds
     // slots_mu_ while iterating each ring's mu, so a reader that nested
@@ -246,35 +246,35 @@ int32_t DistRing::active_count() const {
     return total_tasks - total_released;
 }
 
-int32_t DistRing::next_task_id() const {
+int32_t Ring::next_task_id() const {
     std::lock_guard<std::mutex> slk(slots_mu_);
     return next_task_id_;
 }
 
-const DistRing::HeapRing &DistRing::ring_at(int32_t ring_idx) const {
-    if (ring_idx < 0 || ring_idx >= DIST_MAX_RING_DEPTH) {
-        throw std::out_of_range("DistRing: ring_idx out of range");
+const Ring::HeapRing &Ring::ring_at(int32_t ring_idx) const {
+    if (ring_idx < 0 || ring_idx >= MAX_RING_DEPTH) {
+        throw std::out_of_range("Ring: ring_idx out of range");
     }
     return rings_[static_cast<size_t>(ring_idx)];
 }
 
-void *DistRing::heap_base(int32_t ring_idx) const { return ring_at(ring_idx).base; }
+void *Ring::heap_base(int32_t ring_idx) const { return ring_at(ring_idx).base; }
 
-uint64_t DistRing::heap_size(int32_t ring_idx) const { return ring_at(ring_idx).size; }
+uint64_t Ring::heap_size(int32_t ring_idx) const { return ring_at(ring_idx).size; }
 
-uint64_t DistRing::heap_top(int32_t ring_idx) const {
+uint64_t Ring::heap_top(int32_t ring_idx) const {
     const HeapRing &r = ring_at(ring_idx);
     std::lock_guard<std::mutex> rlk(r.mu);
     return r.top;
 }
 
-uint64_t DistRing::heap_tail(int32_t ring_idx) const {
+uint64_t Ring::heap_tail(int32_t ring_idx) const {
     const HeapRing &r = ring_at(ring_idx);
     std::lock_guard<std::mutex> rlk(r.mu);
     return r.tail;
 }
 
-void DistRing::shutdown() {
+void Ring::shutdown() {
     shutdown_.store(true, std::memory_order_release);
     for (HeapRing &r : rings_) {
         r.cv.notify_all();
@@ -285,7 +285,7 @@ void DistRing::shutdown() {
 // Internal helpers — all called under the respective ring's mu
 // ---------------------------------------------------------------------------
 
-bool DistRing::try_bump_ring_heap_locked(HeapRing &r, uint64_t aligned, void *&out_ptr, uint64_t &out_end) {
+bool Ring::try_bump_ring_heap_locked(HeapRing &r, uint64_t aligned, void *&out_ptr, uint64_t &out_end) {
     uint64_t top = r.top;
     uint64_t tail = r.tail;
 
@@ -321,7 +321,7 @@ bool DistRing::try_bump_ring_heap_locked(HeapRing &r, uint64_t aligned, void *&o
     return false;
 }
 
-void DistRing::advance_last_alive_locked(HeapRing &r) {
+void Ring::advance_last_alive_locked(HeapRing &r) {
     // Walk forward as long as the next-oldest in-ring slot is released.
     // Slot-state entries and heap_end entries stay in their vectors — memory
     // is reclaimed only by reset_to_empty() at drain time — so we never

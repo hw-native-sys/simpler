@@ -29,7 +29,7 @@ pto-runtime/
 │   ├── bindings/                      # nanobind extension module (_task_interface)
 │   │   ├── CMakeLists.txt
 │   │   ├── task_interface.cpp
-│   │   └── dist_worker_bind.h
+│   │   └── worker_bind.h
 │   └── simpler/                       # Stable user-facing API (packaged in wheel)
 │       ├── worker.py                  # Unified Worker (L2 single-chip, L3 distributed)
 │       ├── task_interface.py          # Python re-exports of nanobind types + helpers

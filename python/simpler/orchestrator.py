@@ -8,8 +8,8 @@
 # -----------------------------------------------------------------------------------------------------------
 """Orchestrator — DAG builder exposed to the user's orch function during Worker.run().
 
-A thin Python facade over the C++ ``DistOrchestrator``. The Worker creates one
-Orchestrator handle at init, retrieves the C++ object via ``DistWorker.get_orchestrator()``,
+A thin Python facade over the C++ ``Orchestrator``. The Worker creates one
+Orchestrator handle at init, retrieves the C++ object via ``Worker.get_orchestrator()``,
 and passes the handle to the user's orch function::
 
     def my_orch(orch, args, cfg):
@@ -40,7 +40,7 @@ from .task_interface import (
     TaskArgs,
 )
 from .task_interface import (
-    DistOrchestrator as _CDistOrchestrator,
+    _Orchestrator as _COrchestrator,
 )
 
 
@@ -54,13 +54,13 @@ def _resolve_callable_ptr(callable_: Any) -> int:
 class Orchestrator:
     """DAG builder. Valid only inside the orch function passed to Worker.run().
 
-    Wraps a borrowed reference to the C++ DistOrchestrator owned by the parent
-    DistWorker. The Python ``Worker`` keeps a strong reference to the parent
-    DistWorker for the entire orch-fn execution, so the borrowed reference
+    Wraps a borrowed reference to the C++ Orchestrator owned by the parent
+    Worker. The Python ``Worker`` keeps a strong reference to the parent
+    C++ Worker for the entire orch-fn execution, so the borrowed reference
     stays valid.
     """
 
-    def __init__(self, c_orchestrator: _CDistOrchestrator) -> None:
+    def __init__(self, c_orchestrator: _COrchestrator) -> None:
         self._o = c_orchestrator
 
     # ------------------------------------------------------------------
@@ -95,7 +95,7 @@ class Orchestrator:
     # ------------------------------------------------------------------
     #
     # Tasks and allocations inside a nested ``with orch.scope():`` bind to a
-    # deeper heap ring (``min(depth, DIST_MAX_RING_DEPTH-1)``) so their
+    # deeper heap ring (``min(depth, MAX_RING_DEPTH-1)``) so their
     # memory reclaims independently of the outer scope. ``scope_end`` is
     # non-blocking — it releases scope refs and returns; call
     # ``Worker.run``/``drain`` for a synchronous wait.

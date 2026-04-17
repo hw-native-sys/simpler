@@ -9,15 +9,14 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 
-#include "dist_orchestrator.h"
+#include "orchestrator.h"
 
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
 
-void DistOrchestrator::init(
-    DistTensorMap *tensormap, DistRing *allocator, DistScope *scope, DistReadyQueue *ready_next_level_queue,
-    DistReadyQueue *ready_sub_queue
+void Orchestrator::init(
+    TensorMap *tensormap, Ring *allocator, Scope *scope, ReadyQueue *ready_next_level_queue, ReadyQueue *ready_sub_queue
 ) {
     tensormap_ = tensormap;
     allocator_ = allocator;
@@ -27,9 +26,9 @@ void DistOrchestrator::init(
     active_tasks_.store(0, std::memory_order_relaxed);
 }
 
-DistTaskSlotState &DistOrchestrator::slot_state(DistTaskSlot s) {
-    DistTaskSlotState *p = allocator_->slot_state(s);
-    if (!p) throw std::runtime_error("DistOrchestrator::slot_state: invalid slot id");
+TaskSlotState &Orchestrator::slot_state(TaskSlot s) {
+    TaskSlotState *p = allocator_->slot_state(s);
+    if (!p) throw std::runtime_error("Orchestrator::slot_state: invalid slot id");
     return *p;
 }
 
@@ -37,20 +36,18 @@ DistTaskSlotState &DistOrchestrator::slot_state(DistTaskSlot s) {
 // alloc(shape, dtype) — user-facing intermediate buffer from the HeapRing
 // ---------------------------------------------------------------------------
 
-uint64_t DistOrchestrator::output_alloc_bytes(const ContinuousTensor &t) {
-    return dist_align_up(t.nbytes(), DIST_HEAP_ALIGN);
-}
+uint64_t Orchestrator::output_alloc_bytes(const ContinuousTensor &t) { return align_up(t.nbytes(), HEAP_ALIGN); }
 
-ContinuousTensor DistOrchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
+ContinuousTensor Orchestrator::alloc(const std::vector<uint32_t> &shape, DataType dtype) {
     if (shape.size() > CONTINUOUS_TENSOR_MAX_DIMS) {
-        throw std::invalid_argument("DistOrchestrator::alloc: shape exceeds CONTINUOUS_TENSOR_MAX_DIMS");
+        throw std::invalid_argument("Orchestrator::alloc: shape exceeds CONTINUOUS_TENSOR_MAX_DIMS");
     }
 
     uint64_t numel = 1;
     for (uint32_t d : shape)
         numel *= static_cast<uint64_t>(d);
     uint64_t bytes = numel * get_element_size(dtype);
-    uint64_t aligned = dist_align_up(bytes, DIST_HEAP_ALIGN);
+    uint64_t aligned = align_up(bytes, HEAP_ALIGN);
 
     // 0-byte request (e.g. shape with a zero dim) flows straight through the
     // allocator as a slot-only claim — matches reserve_outputs_and_slot.
@@ -61,12 +58,12 @@ ContinuousTensor DistOrchestrator::alloc(const std::vector<uint32_t> &shape, Dat
     // ring as any tasks submitted inside that scope — an alloc inside a
     // nested `with orch.scope():` uses the nested ring and reclaims
     // independently of the outer ring (Strict-1).
-    DistAllocResult ar = allocator_->alloc(aligned, scope_->current_depth());
-    if (ar.slot == DIST_INVALID_SLOT) {
-        throw std::runtime_error("DistOrchestrator::alloc: allocator shutdown");
+    AllocResult ar = allocator_->alloc(aligned, scope_->current_depth());
+    if (ar.slot == INVALID_SLOT) {
+        throw std::runtime_error("Orchestrator::alloc: allocator shutdown");
     }
 
-    DistTaskSlotState &s = slot_state(ar.slot);
+    TaskSlotState &s = slot_state(ar.slot);
     s.reset();
 
     uint64_t key = reinterpret_cast<uint64_t>(ar.heap_ptr);
@@ -110,22 +107,21 @@ ContinuousTensor DistOrchestrator::alloc(const std::vector<uint32_t> &shape, Dat
 // User-facing submit_* — thin wrappers around submit_impl
 // =============================================================================
 
-DistSubmitResult
-DistOrchestrator::submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config) {
+SubmitResult Orchestrator::submit_next_level(uint64_t callable, const TaskArgs &args, const ChipCallConfig &config) {
     return submit_impl(WorkerType::NEXT_LEVEL, callable, /*callable_id=*/-1, config, {args});
 }
 
-DistSubmitResult DistOrchestrator::submit_next_level_group(
+SubmitResult Orchestrator::submit_next_level_group(
     uint64_t callable, const std::vector<TaskArgs> &args_list, const ChipCallConfig &config
 ) {
     return submit_impl(WorkerType::NEXT_LEVEL, callable, /*callable_id=*/-1, config, args_list);
 }
 
-DistSubmitResult DistOrchestrator::submit_sub(int32_t callable_id, const TaskArgs &args) {
+SubmitResult Orchestrator::submit_sub(int32_t callable_id, const TaskArgs &args) {
     return submit_impl(WorkerType::SUB, /*callable_ptr=*/0, callable_id, ChipCallConfig{}, {args});
 }
 
-DistSubmitResult DistOrchestrator::submit_sub_group(int32_t callable_id, const std::vector<TaskArgs> &args_list) {
+SubmitResult Orchestrator::submit_sub_group(int32_t callable_id, const std::vector<TaskArgs> &args_list) {
     return submit_impl(WorkerType::SUB, /*callable_ptr=*/0, callable_id, ChipCallConfig{}, args_list);
 }
 
@@ -133,11 +129,11 @@ DistSubmitResult DistOrchestrator::submit_sub_group(int32_t callable_id, const s
 // submit_impl — shared 7-step submit machinery
 // =============================================================================
 
-DistSubmitResult DistOrchestrator::submit_impl(
+SubmitResult Orchestrator::submit_impl(
     WorkerType worker_type, uint64_t callable_ptr, int32_t callable_id, const ChipCallConfig &config,
     std::vector<TaskArgs> args_list
 ) {
-    if (args_list.empty()) throw std::invalid_argument("DistOrchestrator: args_list must not be empty");
+    if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
 
     // Track this submission for drain() before any allocations so the count
     // is incremented exactly once per submitted DAG node, regardless of the
@@ -148,14 +144,14 @@ DistSubmitResult DistOrchestrator::submit_impl(
     // arrived with a null data pointer. Both resources come from the same
     // merged allocator (Strict-2) so there is no partial-failure rollback
     // path.
-    DistAllocResult ar = reserve_outputs_and_slot(args_list);
-    if (ar.slot == DIST_INVALID_SLOT) {
+    AllocResult ar = reserve_outputs_and_slot(args_list);
+    if (ar.slot == INVALID_SLOT) {
         active_tasks_.fetch_sub(1, std::memory_order_relaxed);
-        throw std::runtime_error("DistOrchestrator: allocator shutdown");
+        throw std::runtime_error("Orchestrator: allocator shutdown");
     }
-    DistTaskSlot slot = ar.slot;
+    TaskSlot slot = ar.slot;
 
-    DistTaskSlotState &s = slot_state(slot);
+    TaskSlotState &s = slot_state(slot);
     s.reset();
 
     s.worker_type = worker_type;
@@ -166,7 +162,7 @@ DistSubmitResult DistOrchestrator::submit_impl(
     // --- Step 2: Walk tags → tensormap.lookup (deps) + tensormap.insert
     // (outputs). Must happen before we move args_list into the slot because
     // infer_deps reads tensor data pointers and tags from it.
-    std::vector<DistTaskSlot> producers;
+    std::vector<TaskSlot> producers;
     infer_deps(slot, args_list, producers, s.output_keys);
 
     // --- Step 3: Store TaskArgs directly (no chip-storage pre-build) ---
@@ -191,8 +187,8 @@ DistSubmitResult DistOrchestrator::submit_impl(
     // producer is already done. CONSUMED producers are gone (resources freed),
     // so we skip them entirely.
     int32_t live_fanins = 0;
-    for (DistTaskSlot prod : producers) {
-        DistTaskSlotState &ps = slot_state(prod);
+    for (TaskSlot prod : producers) {
+        TaskSlotState &ps = slot_state(prod);
         std::lock_guard<std::mutex> lk(ps.fanout_mu);
 
         TaskState ps_state = ps.state.load(std::memory_order_acquire);
@@ -229,7 +225,7 @@ DistSubmitResult DistOrchestrator::submit_impl(
         s.state.store(TaskState::PENDING, std::memory_order_release);
     }
 
-    return DistSubmitResult{slot};
+    return SubmitResult{slot};
 }
 
 // =============================================================================
@@ -243,7 +239,7 @@ DistSubmitResult DistOrchestrator::submit_impl(
 // OUTPUT.data themselves). The single allocator call owns both the slot and
 // the heap range, so there is no partial-failure rollback.
 
-DistAllocResult DistOrchestrator::reserve_outputs_and_slot(std::vector<TaskArgs> &args_list) {
+AllocResult Orchestrator::reserve_outputs_and_slot(std::vector<TaskArgs> &args_list) {
     uint64_t total_bytes = 0;
     for (const TaskArgs &a : args_list) {
         for (int32_t i = 0; i < a.tensor_count(); ++i) {
@@ -253,8 +249,8 @@ DistAllocResult DistOrchestrator::reserve_outputs_and_slot(std::vector<TaskArgs>
         }
     }
 
-    DistAllocResult ar = allocator_->alloc(total_bytes, scope_->current_depth());
-    if (ar.slot == DIST_INVALID_SLOT) return ar;
+    AllocResult ar = allocator_->alloc(total_bytes, scope_->current_depth());
+    if (ar.slot == INVALID_SLOT) return ar;
 
     // Hand slabs out in the same order we counted them.
     uint64_t off = 0;
@@ -276,17 +272,17 @@ DistAllocResult DistOrchestrator::reserve_outputs_and_slot(std::vector<TaskArgs>
 // infer_deps — tag-driven dependency inference
 // =============================================================================
 
-void DistOrchestrator::infer_deps(
-    DistTaskSlot slot, const std::vector<TaskArgs> &args_list, std::vector<DistTaskSlot> &producers,
+void Orchestrator::infer_deps(
+    TaskSlot slot, const std::vector<TaskArgs> &args_list, std::vector<TaskSlot> &producers,
     std::vector<uint64_t> &output_keys
 ) {
-    auto add_unique_producer = [&](DistTaskSlot p) {
+    auto add_unique_producer = [&](TaskSlot p) {
         // Group submits walk many TaskArgs under one slot: if two entries in
         // the same group tag the same buffer (e.g. both OUTPUT 0xCAFE), the
         // second-pass lookup would return the slot that the first pass just
         // inserted — a self-loop. Skip it.
         if (p == slot) return;
-        for (DistTaskSlot existing : producers) {
+        for (TaskSlot existing : producers) {
             if (existing == p) return;
         }
         producers.push_back(p);
@@ -310,13 +306,13 @@ void DistOrchestrator::infer_deps(
             TensorArgType tag = a.tag(i);
             switch (tag) {
             case TensorArgType::INPUT: {
-                DistTaskSlot prod = tensormap_->lookup(key);
-                if (prod != DIST_INVALID_SLOT) add_unique_producer(prod);
+                TaskSlot prod = tensormap_->lookup(key);
+                if (prod != INVALID_SLOT) add_unique_producer(prod);
                 break;
             }
             case TensorArgType::INOUT: {
-                DistTaskSlot prod = tensormap_->lookup(key);
-                if (prod != DIST_INVALID_SLOT) add_unique_producer(prod);
+                TaskSlot prod = tensormap_->lookup(key);
+                if (prod != INVALID_SLOT) add_unique_producer(prod);
                 tensormap_->insert(key, slot);
                 output_keys.push_back(key);
                 break;
@@ -339,10 +335,10 @@ void DistOrchestrator::infer_deps(
 // Scope
 // =============================================================================
 
-void DistOrchestrator::scope_begin() { scope_->scope_begin(); }
+void Orchestrator::scope_begin() { scope_->scope_begin(); }
 
-void DistOrchestrator::scope_end() {
-    scope_->scope_end([this](DistTaskSlot slot) {
+void Orchestrator::scope_end() {
+    scope_->scope_end([this](TaskSlot slot) {
         release_ref(slot);
     });
 }
@@ -351,15 +347,15 @@ void DistOrchestrator::scope_end() {
 // Reference release helpers
 // =============================================================================
 
-void DistOrchestrator::release_ref(DistTaskSlot slot) {
-    DistTaskSlotState &s = slot_state(slot);
+void Orchestrator::release_ref(TaskSlot slot) {
+    TaskSlotState &s = slot_state(slot);
     int32_t released = s.fanout_released.fetch_add(1, std::memory_order_acq_rel) + 1;
     int32_t total;
     {
         std::lock_guard<std::mutex> lk(s.fanout_mu);
         total = s.fanout_total;
     }
-    // Threshold matches DistScheduler::try_consume: total contributors are
+    // Threshold matches Scheduler::try_consume: total contributors are
     // 1 (self try_consume from on_task_complete, or the alloc-time sim) +
     // N (per consumer's deferred try_consume) + 1 (this scope_end release)
     // = N + 2 = total + 1 where total = scope_ref + N.
@@ -370,8 +366,8 @@ void DistOrchestrator::release_ref(DistTaskSlot slot) {
     }
 }
 
-bool DistOrchestrator::on_consumed(DistTaskSlot slot) {
-    DistTaskSlotState &s = slot_state(slot);
+bool Orchestrator::on_consumed(TaskSlot slot) {
+    TaskSlotState &s = slot_state(slot);
 
     // Idempotent: the threshold can be hit by either release_ref (scope_end,
     // Orch thread) or try_consume (consumer's deferred release, scheduler
@@ -403,7 +399,7 @@ bool DistOrchestrator::on_consumed(DistTaskSlot slot) {
     return true;
 }
 
-void DistOrchestrator::drain() {
+void Orchestrator::drain() {
     {
         std::unique_lock<std::mutex> lk(drain_mu_);
         drain_cv_.wait(lk, [this] {

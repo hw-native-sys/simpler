@@ -6,7 +6,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""Unit tests for Worker (Python L3 wrapper over DistWorker).
+"""Unit tests for Worker (Python L3 wrapper over _Worker).
 
 Tests use SubWorker (fork/shm) as the only worker type — no NPU device required.
 Each test verifies a distinct aspect of the L3 scheduling pipeline.
@@ -218,11 +218,11 @@ class TestScope:
 
     def test_user_nested_scope_binding_is_exposed(self):
         """The scope context manager and raw scope_begin / scope_end are bound."""
-        from simpler.task_interface import DistOrchestrator  # noqa: PLC0415
+        from simpler.task_interface import _Orchestrator  # noqa: PLC0415
 
         # Binding carries the new accessors.
-        assert hasattr(DistOrchestrator, "scope_begin")
-        assert hasattr(DistOrchestrator, "scope_end")
+        assert hasattr(_Orchestrator, "scope_begin")
+        assert hasattr(_Orchestrator, "scope_end")
 
         hw = Worker(level=3, num_sub_workers=1)
         hw.register(lambda args: None)

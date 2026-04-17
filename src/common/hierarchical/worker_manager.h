@@ -10,7 +10,7 @@
  */
 
 /**
- * DistWorkerManager — worker pool lifecycle and dispatch.
+ * WorkerManager — worker pool lifecycle and dispatch.
  *
  * Owns WorkerThread instances (one per registered worker).
  * Provides idle-worker selection and dispatch to the Scheduler.
@@ -27,7 +27,7 @@
  *             callable in its own address space.
  *
  * PROCESS mode absorbs the logic that used to live in the standalone
- * `DistChipProcess` and `DistSubWorker` classes (deleted in PR-D-2).
+ * `ChipProcess` and `SubWorker` classes (deleted in PR-D-2).
  */
 
 #pragma once
@@ -44,9 +44,9 @@
 #include <thread>
 #include <vector>
 
-#include "dist_types.h"
+#include "types.h"
 
-class DistRing;  // forward decl — owns the slot state pool
+class Ring;  // forward decl — owns the slot state pool
 
 // =============================================================================
 // Unified mailbox layout (PROCESS mode)
@@ -54,7 +54,7 @@ class DistRing;  // forward decl — owns the slot state pool
 //
 // One layout for both NEXT_LEVEL (chip) and SUB workers. SUB children
 // read `callable` as a uint64 encoding the callable_id and ignore
-// config + args_blob. Matches the former DistChipProcess layout at the
+// config + args_blob. Matches the former ChipProcess layout at the
 // byte level so the chip child loop in Python needs no offset changes.
 
 enum class MailboxState : int32_t {
@@ -64,7 +64,7 @@ enum class MailboxState : int32_t {
     SHUTDOWN = 3,
 };
 
-static constexpr size_t DIST_MAILBOX_SIZE = 4096;
+static constexpr size_t MAILBOX_SIZE = 4096;
 
 static constexpr ptrdiff_t MAILBOX_OFF_STATE = 0;
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR = 4;
@@ -74,7 +74,7 @@ static constexpr ptrdiff_t MAILBOX_OFF_AICPU_THREAD_NUM = 20;
 static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_PROFILING = 24;
 static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_DUMP_TENSOR = 28;
 static constexpr ptrdiff_t MAILBOX_OFF_ARGS = 64;
-static constexpr size_t DIST_MAILBOX_ARGS_CAPACITY = DIST_MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_ARGS);
+static constexpr size_t MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_ARGS);
 
 // =============================================================================
 // WorkerDispatch — per-dispatch handle handed to a WorkerThread.
@@ -85,7 +85,7 @@ static constexpr size_t DIST_MAILBOX_ARGS_CAPACITY = DIST_MAILBOX_SIZE - static_
 // config by reading `ring->slot_state(task_slot)`.
 
 struct WorkerDispatch {
-    DistTaskSlot task_slot{DIST_INVALID_SLOT};
+    TaskSlot task_slot{INVALID_SLOT};
     int32_t group_index{0};
 };
 
@@ -108,7 +108,7 @@ public:
     //   `mailbox` must be nullptr.
     //
     // PROCESS mode: `worker` is nullptr (the real IWorker lives in the
-    //   forked child). `mailbox` points to a DIST_MAILBOX_SIZE-byte
+    //   forked child). `mailbox` points to a MAILBOX_SIZE-byte
     //   MAP_SHARED region managed by the Python facade.
     //
     // `ring` is a borrowed pointer to the engine's slot-state pool —
@@ -116,7 +116,7 @@ public:
     // `ring->slot_state(task_slot)` on each dispatch.
     // on_complete(slot) is called (in the WorkerThread) after each run().
     void start(
-        Mode mode, IWorker *worker, DistRing *ring, const std::function<void(DistTaskSlot)> &on_complete,
+        Mode mode, IWorker *worker, Ring *ring, const std::function<void(TaskSlot)> &on_complete,
         void *mailbox = nullptr
     );
 
@@ -136,9 +136,9 @@ public:
 private:
     Mode mode_{Mode::THREAD};
     IWorker *worker_{nullptr};
-    DistRing *ring_{nullptr};
+    Ring *ring_{nullptr};
     void *mailbox_{nullptr};
-    std::function<void(DistTaskSlot)> on_complete_;
+    std::function<void(TaskSlot)> on_complete_;
 
     std::thread thread_;
     std::queue<WorkerDispatch> queue_;
@@ -148,8 +148,8 @@ private:
     std::atomic<bool> idle_{true};
 
     void loop();
-    void dispatch_thread(DistTaskSlotState &s, int32_t group_index);
-    void dispatch_process(DistTaskSlotState &s, int32_t group_index);
+    void dispatch_thread(TaskSlotState &s, int32_t group_index);
+    void dispatch_process(TaskSlotState &s, int32_t group_index);
 
     char *mbox() const { return static_cast<char *>(mailbox_); }
     MailboxState read_mailbox_state() const;
@@ -157,23 +157,23 @@ private:
 };
 
 // =============================================================================
-// DistWorkerManager — worker pool lifecycle and dispatch
+// WorkerManager — worker pool lifecycle and dispatch
 // =============================================================================
 
-class DistWorkerManager {
+class WorkerManager {
 public:
-    using OnCompleteFn = std::function<void(DistTaskSlot)>;
+    using OnCompleteFn = std::function<void(TaskSlot)>;
 
     // THREAD mode: worker is called directly.
     void add_next_level(IWorker *worker);
     void add_sub(IWorker *worker);
 
-    // PROCESS mode: mailbox is a DIST_MAILBOX_SIZE-byte MAP_SHARED region.
+    // PROCESS mode: mailbox is a MAILBOX_SIZE-byte MAP_SHARED region.
     // Worker is nullptr (child has its own).
     void add_next_level_process(void *mailbox);
     void add_sub_process(void *mailbox);
 
-    void start(DistRing *ring, const OnCompleteFn &on_complete);
+    void start(Ring *ring, const OnCompleteFn &on_complete);
     void stop();
 
     WorkerThread *pick_idle(WorkerType type) const;

@@ -10,7 +10,7 @@
  */
 
 /**
- * DistScope — scope-depth tracking and scope-owned reference management.
+ * Scope — scope-depth tracking and scope-owned reference management.
  *
  * A scope is a bracket around a group of submitted tasks.  Each task inside
  * a scope carries one extra "scope reference" (counted in fanout_total).  When
@@ -28,27 +28,27 @@
 #include <stdexcept>
 #include <vector>
 
-#include "dist_types.h"
+#include "types.h"
 
-class DistScope {
+class Scope {
 public:
     // Open a new scope level.
     void scope_begin();
 
     // Close innermost scope.
     // Calls release_fn(slot) for every task registered in this scope.
-    void scope_end(const std::function<void(DistTaskSlot)> &release_fn);
+    void scope_end(const std::function<void(TaskSlot)> &release_fn);
 
     // Register a task as belonging to the current innermost scope.
     // Must be called after scope_begin() and before scope_end().
-    void register_task(DistTaskSlot slot);
+    void register_task(TaskSlot slot);
 
     // Current nesting depth (0 = no open scope).
     int32_t depth() const { return static_cast<int32_t>(stack_.size()); }
 
     // L2-style 0-based scope index: the innermost open scope, or 0 when
-    // none is open. Used by DistRing::alloc to choose a heap ring:
-    //   ring_idx = min(current_depth(), DIST_MAX_RING_DEPTH - 1)
+    // none is open. Used by Ring::alloc to choose a heap ring:
+    //   ring_idx = min(current_depth(), MAX_RING_DEPTH - 1)
     // Matches `PTO2OrchestratorState::current_ring_id` semantics: the
     // first scope opened (depth()==1) maps to ring 0, the next nested
     // scope maps to ring 1, and so on. Returns 0 when no scope is open
@@ -61,7 +61,7 @@ public:
 
 private:
     struct ScopeFrame {
-        std::vector<DistTaskSlot> tasks;
+        std::vector<TaskSlot> tasks;
     };
     std::vector<ScopeFrame> stack_;
 };

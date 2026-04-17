@@ -15,11 +15,11 @@
  * Every level in the hierarchy (L3 HostWorker, L4, L5, …) runs the same
  * scheduling engine.  This header defines:
  *   - WorkerType / TaskState enumerations
- *   - DistTaskSlotState: per-task scheduling bookkeeping (stores TaskArgs
+ *   - TaskSlotState: per-task scheduling bookkeeping (stores TaskArgs
  *                        directly — no separate dispatch carrier struct)
- *   - DistReadyQueue: Orch→Scheduler notification channel
+ *   - ReadyQueue: Orch→Scheduler notification channel
  *   - IWorker: abstract interface implemented by ChipWorker, SubWorker,
- *              and DistWorker itself (recursive composition)
+ *              and Worker itself (recursive composition)
  *
  * IWorker::run takes (callable, TaskArgsView, ChipCallConfig) directly.
  * THREAD-mode dispatch builds the view via `slot.args_view(i)` from the
@@ -46,28 +46,28 @@
 // =============================================================================
 
 // User-visible scope-nesting cap. Matches L2 PTO2_MAX_SCOPE_DEPTH.
-static constexpr int32_t DIST_MAX_SCOPE_DEPTH = 64;
+static constexpr int32_t MAX_SCOPE_DEPTH = 64;
 
-// Number of independent HeapRing layers inside DistRing. Scope depth maps
-// to ring index via `min(depth, DIST_MAX_RING_DEPTH - 1)` (L2-style);
-// scopes deeper than DIST_MAX_RING_DEPTH share the innermost ring.
+// Number of independent HeapRing layers inside Ring. Scope depth maps
+// to ring index via `min(depth, MAX_RING_DEPTH - 1)` (L2-style);
+// scopes deeper than MAX_RING_DEPTH share the innermost ring.
 // Matches L2's PTO2_MAX_RING_DEPTH (Strict-1).
-static constexpr int32_t DIST_MAX_RING_DEPTH = 4;
+static constexpr int32_t MAX_RING_DEPTH = 4;
 
-static constexpr int32_t DIST_INVALID_SLOT = -1;
+static constexpr int32_t INVALID_SLOT = -1;
 
 // =============================================================================
 // Task slot index type
 // =============================================================================
 
-using DistTaskSlot = int32_t;
+using TaskSlot = int32_t;
 
 // =============================================================================
 // WorkerType
 // =============================================================================
 
 enum class WorkerType : int32_t {
-    NEXT_LEVEL = 0,  // Next-level Worker (L3→ChipWorker, L4→DistWorker(L3), …)
+    NEXT_LEVEL = 0,  // Next-level Worker (L3→ChipWorker, L4→Worker(L3), …)
     SUB = 1,         // SubWorker: fork/shm Python function
 };
 
@@ -85,7 +85,7 @@ enum class TaskState : int32_t {
 };
 
 // =============================================================================
-// DistTaskSlotState — per-task scheduling bookkeeping
+// TaskSlotState — per-task scheduling bookkeeping
 // =============================================================================
 //
 // Stores the submitted TaskArgs directly. Dispatch builds a TaskArgsView on
@@ -93,7 +93,7 @@ enum class TaskState : int32_t {
 // (PROCESS mode). There is no separate dispatch carrier struct; the old
 // WorkerPayload was removed in PR-C.
 
-struct DistTaskSlotState {
+struct TaskSlotState {
     std::atomic<TaskState> state{TaskState::FREE};
 
     // --- Fanin (orch writes once; scheduler reads atomically) ---
@@ -103,7 +103,7 @@ struct DistTaskSlotState {
     // --- Fanout (protected by fanout_mu) ---
     // orch adds consumers; scheduler traverses on completion
     std::mutex fanout_mu;
-    std::vector<DistTaskSlot> fanout_consumers;
+    std::vector<TaskSlot> fanout_consumers;
     int32_t fanout_total{0};                  // 1 (scope ref) + fanout_consumers.size()
     std::atomic<int32_t> fanout_released{0};  // incremented as each ref is released
 
@@ -113,7 +113,7 @@ struct DistTaskSlotState {
     // --- Producer tasks this task depends on (for deferred release) ---
     // When this task reaches COMPLETED, the Scheduler releases one fanout ref
     // on each producer — mirroring L2's "deferred release: walk fanin" step.
-    std::vector<DistTaskSlot> fanin_producers;
+    std::vector<TaskSlot> fanin_producers;
 
     // --- Task data (stored on parent heap, lives until slot CONSUMED) ---
     WorkerType worker_type{WorkerType::NEXT_LEVEL};
@@ -131,12 +131,12 @@ struct DistTaskSlotState {
     bool is_group_{false};
 
     // Runtime-owned OUTPUT slabs live in the Worker's HeapRing and are
-    // reclaimed implicitly by DistRing::release(slot) — no per-slot
+    // reclaimed implicitly by Ring::release(slot) — no per-slot
     // munmap is needed. See docs/orchestrator.md §8b.
 
     // --- HeapRing layer membership (Strict-1 per-scope rings) ---
-    // Set by DistRing::alloc from the caller's scope depth. ring_idx picks
-    // which of the DIST_MAX_RING_DEPTH heaps holds this slot's slab;
+    // Set by Ring::alloc from the caller's scope depth. ring_idx picks
+    // which of the MAX_RING_DEPTH heaps holds this slot's slab;
     // ring_slot_idx is the slot's position within that ring's FIFO order
     // and indexes the ring's per-slot released/heap_end vectors.
     int32_t ring_idx{0};
@@ -154,32 +154,32 @@ struct DistTaskSlotState {
         return is_group_ ? make_view(task_args_list[static_cast<size_t>(i)]) : make_view(task_args);
     }
 
-    DistTaskSlotState() = default;
-    DistTaskSlotState(const DistTaskSlotState &) = delete;
-    DistTaskSlotState &operator=(const DistTaskSlotState &) = delete;
+    TaskSlotState() = default;
+    TaskSlotState(const TaskSlotState &) = delete;
+    TaskSlotState &operator=(const TaskSlotState &) = delete;
 
     void reset();
 };
 
 // =============================================================================
-// DistReadyQueue — Orch pushes, Scheduler pops
+// ReadyQueue — Orch pushes, Scheduler pops
 // =============================================================================
 
-class DistReadyQueue {
+class ReadyQueue {
 public:
-    void push(DistTaskSlot slot);
+    void push(TaskSlot slot);
 
     // Non-blocking: returns false immediately if empty.
-    bool try_pop(DistTaskSlot &out);
+    bool try_pop(TaskSlot &out);
 
     // Blocking: waits until a slot is available or shutdown() is called.
     // Returns false only when shutdown and queue is empty.
-    bool wait_pop(DistTaskSlot &out);
+    bool wait_pop(TaskSlot &out);
 
     void shutdown();
 
 private:
-    std::queue<DistTaskSlot> q_;
+    std::queue<TaskSlot> q_;
     std::mutex mu_;
     std::condition_variable cv_;
     bool shutdown_{false};
@@ -199,10 +199,10 @@ public:
     // Each implementation interprets `callable` per its semantics:
     //   - ChipWorker: uint64 holding a ChipCallable buffer ptr; builds a
     //     ChipStorageTaskArgs POD from `args` and calls pto2_run_runtime.
-    //   - DistChipProcess / DistSubWorker: dispatch proxies — forward
+    //   - ChipProcess / SubWorker: dispatch proxies — forward
     //     callable / config / args through the shm mailbox to the forked
     //     child, which invokes the actual IWorker in its own address space.
-    //   - DistWorker (L4+): `callable` decodes to an orch-fn handle;
+    //   - Worker (L4+): `callable` decodes to an orch-fn handle;
     //     placeholder until PR-F.
     //
     // slot_id is not a parameter — completion routing is owned by

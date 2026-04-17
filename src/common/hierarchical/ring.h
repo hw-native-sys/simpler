@@ -10,7 +10,7 @@
  */
 
 /**
- * DistRing — unified slot + heap allocator for L3+ distributed workers.
+ * Ring — unified slot + heap allocator for L3+ distributed workers.
  *
  * A single structure owns three correlated per-task resources:
  *
@@ -19,15 +19,15 @@
  *      window — slot state lives in parent-process heap (never crossed into
  *      child workers), so a ring index buys us nothing at L3 (see the plan's
  *      L2 Consistency Audit, allowed exception #6).
- *   2. `DIST_MAX_RING_DEPTH` independent shared-memory heap slabs (Strict-1,
+ *   2. `MAX_RING_DEPTH` independent shared-memory heap slabs (Strict-1,
  *      matches L2's `PTO2_MAX_RING_DEPTH = 4`). Each slab has its own
  *      `mmap(MAP_SHARED)` region, bump cursor, FIFO reclamation pointer,
  *      mutex and cv. Slot → ring mapping is driven by scope depth:
- *         ring_idx = min(scope_depth, DIST_MAX_RING_DEPTH - 1)
+ *         ring_idx = min(scope_depth, MAX_RING_DEPTH - 1)
  *      so tasks inside nested scopes reclaim independently of the outer
  *      scope's long-lived allocations. A mapping taken before any fork is
  *      inherited by every child process at the same virtual address.
- *   3. The per-task scheduling state (`DistTaskSlotState`). Stored in a
+ *   3. The per-task scheduling state (`TaskSlotState`). Stored in a
  *      `std::deque<std::unique_ptr<...>>` so push_back never invalidates
  *      pointers, and destruction happens only at `reset_to_empty()` /
  *      process teardown. Slot state records its `ring_idx` and
@@ -60,52 +60,52 @@
 #include <mutex>
 #include <vector>
 
-#include "dist_types.h"
+#include "types.h"
 
 // User-facing output alignment (Strict-3; matches L2 PTO2_PACKED_OUTPUT_ALIGN).
-static constexpr uint64_t DIST_HEAP_ALIGN = 1024;
+static constexpr uint64_t HEAP_ALIGN = 1024;
 
 // Default PER-RING heap size. Total VA reservation is this value times
-// DIST_MAX_RING_DEPTH (default 4 GiB across 4 rings of 1 GiB each).
-static constexpr uint64_t DIST_DEFAULT_HEAP_RING_SIZE = 1ULL << 30;
+// MAX_RING_DEPTH (default 4 GiB across 4 rings of 1 GiB each).
+static constexpr uint64_t DEFAULT_HEAP_RING_SIZE = 1ULL << 30;
 
 // Default back-pressure timeout (ms). Surfaces as std::runtime_error when the
 // target ring makes no progress for this long — acts as a deadlock detector.
-static constexpr uint32_t DIST_ALLOC_TIMEOUT_MS = 10000;
+static constexpr uint32_t ALLOC_TIMEOUT_MS = 10000;
 
 // Align an unsigned value up to the next multiple of `align` (must be power of 2).
-inline uint64_t dist_align_up(uint64_t v, uint64_t align) { return (v + align - 1) & ~(align - 1); }
+inline uint64_t align_up(uint64_t v, uint64_t align) { return (v + align - 1) & ~(align - 1); }
 
 // Scope-depth → ring-index mapping. `scope_depth` is L2-style 0-based (the
 // outermost open scope is 0); deeper scopes share the innermost ring.
-inline int32_t dist_ring_idx_for_scope(int32_t scope_depth) {
+inline int32_t ring_idx_for_scope(int32_t scope_depth) {
     if (scope_depth < 0) scope_depth = 0;
-    return scope_depth < DIST_MAX_RING_DEPTH ? scope_depth : DIST_MAX_RING_DEPTH - 1;
+    return scope_depth < MAX_RING_DEPTH ? scope_depth : MAX_RING_DEPTH - 1;
 }
 
-struct DistAllocResult {
-    DistTaskSlot slot{DIST_INVALID_SLOT};
+struct AllocResult {
+    TaskSlot slot{INVALID_SLOT};
     void *heap_ptr{nullptr};
     uint64_t heap_end_offset{0};  // byte offset within the selected ring's heap
     int32_t ring_idx{0};
 };
 
-class DistRing {
+class Ring {
 public:
-    DistRing() = default;
-    ~DistRing();
+    Ring() = default;
+    ~Ring();
 
-    DistRing(const DistRing &) = delete;
-    DistRing &operator=(const DistRing &) = delete;
+    Ring(const Ring &) = delete;
+    Ring &operator=(const Ring &) = delete;
 
-    // Initialise `DIST_MAX_RING_DEPTH` heap rings, each of `heap_bytes`
+    // Initialise `MAX_RING_DEPTH` heap rings, each of `heap_bytes`
     // (MAP_SHARED | MAP_ANONYMOUS). Total VA reservation is
-    //   DIST_MAX_RING_DEPTH * heap_bytes.
+    //   MAX_RING_DEPTH * heap_bytes.
     // `heap_bytes == 0` disables all heaps — `alloc(0, …)` still hands out
     // slots but any `alloc(bytes>0, …)` throws. `timeout_ms == 0` selects the
     // default. Must be called before any fork if the heaps are to be
     // inherited by children.
-    void init(uint64_t heap_bytes = DIST_DEFAULT_HEAP_RING_SIZE, uint32_t timeout_ms = DIST_ALLOC_TIMEOUT_MS);
+    void init(uint64_t heap_bytes = DEFAULT_HEAP_RING_SIZE, uint32_t timeout_ms = ALLOC_TIMEOUT_MS);
 
     // Allocate a slot and, if `bytes > 0`, a heap slab from the ring chosen
     // by `scope_depth` (L2-style 0-based: 0 is the outermost scope). The
@@ -113,24 +113,24 @@ public:
     // before this call returns.
     //
     // Blocks on the selected ring's cv; throws `std::runtime_error` on
-    // timeout. Returns the sentinel `{DIST_INVALID_SLOT, nullptr, 0, 0}` on
-    // `shutdown()`. `bytes` is rounded up to `DIST_HEAP_ALIGN`. Passing `0`
+    // timeout. Returns the sentinel `{INVALID_SLOT, nullptr, 0, 0}` on
+    // `shutdown()`. `bytes` is rounded up to `HEAP_ALIGN`. Passing `0`
     // skips the heap bump entirely (slot-only allocation).
-    DistAllocResult alloc(uint64_t bytes = 0, int32_t scope_depth = 0);
+    AllocResult alloc(uint64_t bytes = 0, int32_t scope_depth = 0);
 
     // Release a slot. Reads the slot's `ring_idx` / `ring_slot_idx` to find
     // its ring, marks the slot consumed, and advances that ring's
     // `last_alive_` (and `heap_tail`) as far as FIFO order allows. Other
     // rings are untouched. Safe from any thread.
-    void release(DistTaskSlot slot);
+    void release(TaskSlot slot);
 
     // Pointer to the slot's state. Stable for the slot's lifetime (i.e.
     // until `reset_to_empty()` drops it). Returns nullptr for invalid ids.
-    DistTaskSlotState *slot_state(DistTaskSlot slot);
+    TaskSlotState *slot_state(TaskSlot slot);
 
     // Rewind every ring's cursors + released/slot_heap_end vectors and drop
     // all slot states. Requires that no slots are currently live
-    // (`active_count() == 0`) — typically called by `DistOrchestrator::drain`
+    // (`active_count() == 0`) — typically called by `Orchestrator::drain`
     // right after the active count hits zero.
     void reset_to_empty();
 
@@ -146,7 +146,7 @@ public:
     void shutdown();
 
 private:
-    // One scope-layer heap ring. `DIST_MAX_RING_DEPTH` instances live side by
+    // One scope-layer heap ring. `MAX_RING_DEPTH` instances live side by
     // side; the slot deque and `next_task_id_` remain global (parent-heap
     // bookkeeping — see docs/orchestrator.md §5).
     struct HeapRing {
@@ -171,14 +171,14 @@ private:
         HeapRing &operator=(const HeapRing &) = delete;
     };
 
-    uint32_t timeout_ms_{DIST_ALLOC_TIMEOUT_MS};
+    uint32_t timeout_ms_{ALLOC_TIMEOUT_MS};
 
     // Monotonic across all rings within a run. Reset to 0 by `reset_to_empty`.
     int32_t next_task_id_{0};
 
     // Parent-heap slot-state pool. push_back never invalidates pointers to
     // existing elements, so slot_state(id) remains stable for every live id.
-    std::deque<std::unique_ptr<DistTaskSlotState>> slot_states_;
+    std::deque<std::unique_ptr<TaskSlotState>> slot_states_;
 
     // Guards `next_task_id_` and `slot_states_`. Taken briefly during
     // `alloc()` (between picking the task id and pushing the state) and by
@@ -188,7 +188,7 @@ private:
     mutable std::mutex slots_mu_;
 
     // The 4 scope-layer heap rings (Strict-1).
-    std::array<HeapRing, DIST_MAX_RING_DEPTH> rings_;
+    std::array<HeapRing, MAX_RING_DEPTH> rings_;
 
     // Process-wide shutdown flag (atomic so every ring's waiter sees it
     // without holding that ring's mu_).

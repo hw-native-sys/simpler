@@ -1,20 +1,12 @@
 # Scheduler — DAG Dispatch Internals
 
-> **Status**: target design. `IWorker::run(uint64_t callable, TaskArgsView,
-> ChipCallConfig)` is the live dispatch signature; per-worker-type ready
-> queue split (Strict-4) is landed — each `WorkerType` has its own
-> `DistReadyQueue` and `dispatch_ready` walks them independently, so a
-> saturated pool of one type cannot head-of-line-block dispatch for the
-> other. See [roadmap.md](roadmap.md) for the full landed-vs-planned
-> breakdown.
-
 The Scheduler is the **DAG executor**. A dedicated C++ thread that consumes
 submitted slots, wires fanout edges, dispatches ready tasks to worker threads,
 and handles completion callbacks. It is the bridge between the Orchestrator
 (producer of DAG nodes) and the WorkerManager (consumer of ready nodes).
 
 For the high-level role of the Scheduler among the three engine components,
-see [distributed_level_runtime.md](distributed_level_runtime.md). For the DAG
+see [hierarchical_level_runtime.md](hierarchical_level_runtime.md). For the DAG
 construction side (what feeds the Scheduler), see
 [orchestrator.md](orchestrator.md). For dispatch mechanics (how
 `WorkerThread::dispatch` actually runs a task), see
@@ -53,8 +45,8 @@ class Scheduler {
     //            consumer worker_type).
     // Consumer: Scheduler's own loop, Phase 1 (one drain loop per queue,
     //           each with its own head-of-line break).
-    DistReadyQueue *ready_next_level_queue_;
-    DistReadyQueue *ready_sub_queue_;
+    ReadyQueue *ready_next_level_queue_;
+    ReadyQueue *ready_sub_queue_;
 
     // Producer: WorkerThread (on worker->run() return).
     // Consumer: Scheduler's own loop, Phase 2.
@@ -84,11 +76,11 @@ holds just the slot id; dispatch reads task data from the
 `ring.slot_state(sid)` pool.
 
 **Strict-4 — per-worker-type split.** In practice the ready queue is two
-`DistReadyQueue` instances, one per `WorkerType`:
+`ReadyQueue` instances, one per `WorkerType`:
 
 ```cpp
-DistReadyQueue ready_next_level_queue_;   // WorkerType::NEXT_LEVEL tasks
-DistReadyQueue ready_sub_queue_;          // WorkerType::SUB tasks
+ReadyQueue ready_next_level_queue_;   // WorkerType::NEXT_LEVEL tasks
+ReadyQueue ready_sub_queue_;          // WorkerType::SUB tasks
 ```
 
 Matching L2's per-shape ready buffer (`PTO2_LocalReadyBuffer` fan-out to
@@ -195,8 +187,8 @@ head-of-line break so one saturated pool cannot stall the other:
 
 ```cpp
 void Scheduler::dispatch_ready() {
-    auto drain_one = [&](DistReadyQueue *q) {
-        DistTaskSlot slot;
+    auto drain_one = [&](ReadyQueue *q) {
+        TaskSlot slot;
         while (q->try_pop(slot)) {
             TaskSlotState &s = slots_[slot];
             int N = s.group_size();  // 1 for single-task slots
@@ -361,7 +353,7 @@ by completion-handling cost.
 
 ## 10. Related
 
-- [distributed_level_runtime.md](distributed_level_runtime.md) — high-level
+- [hierarchical_level_runtime.md](hierarchical_level_runtime.md) — high-level
   three-component picture
 - [orchestrator.md](orchestrator.md) — the producer feeding the wiring queue
 - [worker-manager.md](worker-manager.md) — where dispatched slots go

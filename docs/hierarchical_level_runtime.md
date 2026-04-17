@@ -1,10 +1,4 @@
-# Distributed Level Runtime — Level Model and Component Composition
-
-> **Status**: level model + high-level component split are accurate for
-> current code. Low-level details (e.g. `IWorker::run` signature,
-> `WorkerThread` unified mode) describe the target; see the
-> per-component docs for current vs target, or
-> [roadmap.md](roadmap.md) for the full landed-vs-planned breakdown.
+# Hierarchical Level Runtime — Level Model and Component Composition
 
 This document covers:
 
@@ -287,18 +281,15 @@ device allocation algorithm.
 
 | Path | Role |
 | ---- | ---- |
-| `src/common/distributed/orchestrator.{h,cpp}` | `Orchestrator`: submit, TensorMap, Scope |
-| `src/common/distributed/scheduler.{h,cpp}` | `Scheduler`: dispatch loop + queues |
-| `src/common/distributed/worker_manager.{h,cpp}` | `WorkerManager`: WorkerThread pool |
-| `src/common/distributed/worker_thread.{h,cpp}` | `WorkerThread`: THREAD/PROCESS dispatch |
-| `src/common/distributed/worker.{h,cpp}` | `Worker` (L3+): composes the above |
-| `src/common/distributed/ring.{h,cpp}` | slot allocator |
-| `src/common/distributed/tensormap.{h,cpp}` | base_ptr → producer slot |
-| `src/common/distributed/scope.{h,cpp}` | scope lifetime management |
+| `src/common/hierarchical/orchestrator.{h,cpp}` | `Orchestrator`: submit, TensorMap, Scope |
+| `src/common/hierarchical/scheduler.{h,cpp}` | `Scheduler`: dispatch loop + queues |
+| `src/common/hierarchical/worker_manager.{h,cpp}` | `WorkerManager`: WorkerThread pool |
+| `src/common/hierarchical/worker_thread.{h,cpp}` | `WorkerThread`: THREAD/PROCESS dispatch |
+| `src/common/hierarchical/worker.{h,cpp}` | `Worker` (L3+): composes the above |
+| `src/common/hierarchical/ring.{h,cpp}` | slot allocator |
+| `src/common/hierarchical/tensormap.{h,cpp}` | base_ptr → producer slot |
+| `src/common/hierarchical/scope.{h,cpp}` | scope lifetime management |
 | `src/common/worker/chip_worker.{h,cpp}` | L2 `ChipWorker` (IWorker leaf) |
 | `src/common/worker/sub_worker.{h,cpp}` | `SubWorker` (IWorker leaf for Python callables) |
 | `python/bindings/` | nanobind exposure of C++ engine to Python |
 | `python/simpler/worker.py` | Python `Worker` factory + lifecycle wrapper |
-
-> Current source still uses `Dist*` names in several places; rename is tracked
-> as a separate cleanup.
