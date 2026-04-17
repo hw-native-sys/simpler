@@ -432,6 +432,7 @@ struct PTO2SpscQueue {
     uint64_t mask_{0};
 
     bool init(uint64_t capacity) {
+        if (capacity == 0 || (capacity & (capacity - 1)) != 0) return false;
         buffer_ = static_cast<PTO2TaskSlotState **>(calloc(capacity, sizeof(PTO2TaskSlotState *)));
         if (!buffer_) return false;
         mask_ = capacity - 1;
@@ -450,6 +451,10 @@ struct PTO2SpscQueue {
     }
 
     // Push one item (producer only). Returns false if queue is full.
+    // Full condition: next_h - tail > mask_ (i.e. > capacity-1), meaning all
+    // capacity slots are occupied. This uses strict '>' so all capacity slots
+    // are usable (no wasted sentinel slot). uint64_t wrapping is safe since
+    // head and tail are monotonically increasing and subtraction wraps correctly.
     bool push(PTO2TaskSlotState *item) {
         uint64_t h = head_.load(std::memory_order_relaxed);
         uint64_t next_h = h + 1;
@@ -558,10 +563,10 @@ struct PTO2SchedulerState {
     PTO2ReadyQueue ready_queues[PTO2_NUM_RESOURCE_SHAPES];
 
     // Global wiring batch buffer — thread 0 only, tight layout for cache locality.
-    // count(4B) + index(4B) + batch[15](120B) = 128B = exactly 2 cache lines.
+    // count(4B) + index(4B) + batch[31](248B) = 256B = exactly 4 cache lines.
     int wiring_batch_count = 0;
     int wiring_batch_index = 0;
-    static constexpr int WIRING_BATCH_SIZE = 31;
+    static constexpr uint64_t WIRING_BATCH_SIZE = 31;
     PTO2TaskSlotState *wiring_batch[WIRING_BATCH_SIZE];
 
     // Global wiring queue — refill path only (every BATCH_SIZE tasks), separate cache line.

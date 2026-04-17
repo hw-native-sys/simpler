@@ -114,11 +114,11 @@ struct RingSchedState {
     int32_t task_window_size;
     int32_t task_window_mask;
     std::atomic<int32_t> advance_lock;
-    PTO2DepListPool dep_pool;  // fanout wiring dep pool (exclusively managed by scheduler thread 0)
+    alignas(64) PTO2DepListPool dep_pool;  // fanout wiring dep pool (thread 0 only, cache-isolated)
 };
 
 RingSchedState ring_sched_states[PTO2_MAX_RING_DEPTH];
-PTO2ReadyQueue wiring_queue;  // deferred fanout wiring from orchestrator
+PTO2SpscQueue wiring_queue;  // global SPSC queue: orchestrator pushes, scheduler thread 0 drains
 ```
 
 ### 4.6 PTO2TensorMap (modified)
