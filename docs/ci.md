@@ -52,6 +52,52 @@ PullRequest
 | `ut-cpp-a5` | a5 self-hosted | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a5)?$"` |
 | `st-a5` | a5 self-hosted | `pytest examples tests/st --platform a5` + `ci.py -p a5 -d ...` |
 
+### Parallel ST runs on hardware
+
+For self-hosted jobs with multiple NPUs, pass a `--device` range (and
+optionally pytest's `-x` for fail-fast) to get the full orchestrator
+benefit — device bin-packing for L3, xdist fanout for L2, and a shared
+`ChipWorker` per `(runtime, device)`:
+
+```bash
+# Recommended CI invocation
+pytest examples tests/st --platform a2a3 --device 4-7 -x
+
+# Same for a5
+pytest examples tests/st --platform a5 --device 0-7 -x
+```
+
+`-x` (`--exitfirst`) is appropriate for CI, where aborting on first
+failure saves runner minutes. Local development usually wants the opposite
+(let every failure surface) — just drop the flag. The short form is the
+same in both pytest and standalone on purpose; see
+[testing.md §CLI Design Principles](testing.md#cli-design-principles).
+
+`pytest-xdist` is pulled in via the `test` extra. See
+[testing.md §Parallel Test Execution](testing.md#parallel-test-execution-and-resource-reuse)
+for the full hierarchy, fail-fast semantics, and the
+profiling-vs-parallelism trade-off.
+
+### Sim jobs on CPU-constrained runners
+
+Sim jobs (`st-sim-a2a3`, `st-sim-a5`) run on `ubuntu-latest`, which typically
+has 2 vCPUs. `--device 0-15` is still the right choice for the **pool size**
+(some L3 cases need several virtual ids), but the default `--max-parallel auto`
+caps the in-flight subprocess count to `min(nproc, len(--device))` — on a
+2-core runner that becomes `2`, avoiding CPU thrashing:
+
+```bash
+# Sim: --max-parallel auto resolves to 2 on ubuntu-latest
+pytest examples tests/st --platform a2a3sim --device 0-15
+
+# Or pin explicitly if your runner has a different CPU count
+pytest examples tests/st --platform a2a3sim --device 0-15 --max-parallel 2
+```
+
+On hardware jobs the `auto` default is `len(--device)` because each subprocess
+is device-bound (host CPU mostly waits on the NPU), so hardware runners do
+not need `--max-parallel` manually.
+
 ### Scheduling constraints
 
 - Sim scene tests and no-hardware unit tests run on github-hosted runners (no hardware).

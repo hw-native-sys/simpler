@@ -613,6 +613,53 @@ def _convert_case_swimlane(
     )
 
 
+def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI surface
+    worker,
+    cls_inst,
+    cases,
+    *,
+    callable_obj,
+    sub_ids,
+    primary_device_id,
+    is_hardware,
+    rounds,
+    skip_golden,
+    enable_profiling,
+    enable_dump_tensor,
+):
+    """Execute a pre-filtered list of cases for one class (layers 5-6).
+
+    Caller is responsible for platform/selector/manual filtering. Profiling
+    snapshots wrap each case. Validation failures propagate; caller decides
+    fail-fast vs collect semantics.
+    """
+    cls_name = type(cls_inst).__name__
+    callable_spec = getattr(type(cls_inst), "CALLABLE", None)
+    for case in cases:
+        before_perf = _snapshot_perf_files() if enable_profiling else set()
+        before_device = _snapshot_device_logs(primary_device_id) if enable_profiling and is_hardware else None
+        try:
+            cls_inst._run_and_validate(
+                worker,
+                callable_obj,
+                case,
+                sub_ids=sub_ids,
+                rounds=rounds,
+                skip_golden=skip_golden,
+                enable_profiling=enable_profiling,
+                enable_dump_tensor=enable_dump_tensor,
+            )
+        finally:
+            if enable_profiling:
+                _convert_case_swimlane(
+                    f"{cls_name}_{case['name']}",
+                    primary_device_id,
+                    before_perf,
+                    before_device,
+                    callable_spec=callable_spec,
+                )
+
+
 def _compare_outputs(test_args, golden_args, output_names, rtol, atol):
     """Compare output tensors against golden values."""
     import torch  # noqa: PLC0415
@@ -967,7 +1014,7 @@ class SceneTestCase:
             primary_device_id = raw_device.split("-", 1)[0] if "-" in raw_device else raw_device
         is_hardware = not st_platform.endswith("sim")
 
-        ran_any = False
+        matched = []
         for case in self.CASES:
             if st_platform not in case["platforms"]:
                 continue
@@ -978,47 +1025,52 @@ class SceneTestCase:
                 continue
             if manual_mode == "only" and not is_manual:
                 continue
-            before_perf = _snapshot_perf_files() if enable_profiling else set()
-            before_device = _snapshot_device_logs(primary_device_id) if enable_profiling and is_hardware else None
-            try:
-                self._run_and_validate(
-                    st_worker,
-                    callable_obj,
-                    case,
-                    sub_ids=sub_ids,
-                    rounds=rounds,
-                    skip_golden=skip_golden,
-                    enable_profiling=enable_profiling,
-                    enable_dump_tensor=enable_dump_tensor,
-                )
-            finally:
-                if enable_profiling:
-                    _convert_case_swimlane(
-                        f"{cls_name}_{case['name']}",
-                        primary_device_id,
-                        before_perf,
-                        before_device,
-                        callable_spec=self.CALLABLE,
-                    )
-            ran_any = True
+            matched.append(case)
 
-        if not ran_any:
+        if not matched:
             import pytest  # noqa: PLC0415
 
             pytest.skip(f"No cases matched {cls_name} (platform={st_platform}, manual={manual_mode})")
+
+        run_class_cases(
+            st_worker,
+            self,
+            matched,
+            callable_obj=callable_obj,
+            sub_ids=sub_ids,
+            primary_device_id=primary_device_id,
+            is_hardware=is_hardware,
+            rounds=rounds,
+            skip_golden=skip_golden,
+            enable_profiling=enable_profiling,
+            enable_dump_tensor=enable_dump_tensor,
+        )
 
     # ------------------------------------------------------------------
     # Standalone entry point
     # ------------------------------------------------------------------
 
     @staticmethod
-    def run_module(module_name):
-        """Standalone entry: ``if __name__ == "__main__": SceneTestCase.run_module(__name__)``."""
+    def run_module(module_name):  # noqa: PLR0912 -- CLI parsing + dispatch; branches map to user-facing flags
+        """Standalone entry: ``if __name__ == "__main__": SceneTestCase.run_module(__name__)``.
+
+        Supports -d as either a single id or a range ("0-7"). When more than
+        one device is provided (or any L3 case needs more than its single
+        device), the outer invocation becomes an orchestrator that spawns
+        per-case subprocesses via ``parallel_scheduler``; each child re-enters
+        this function in single-group mode via ``--runtime`` + ``--level``.
+        """
         import argparse  # noqa: PLC0415
 
         parser = argparse.ArgumentParser()
         parser.add_argument("-p", "--platform", required=True)
-        parser.add_argument("-d", "--device", type=int, default=0)
+        parser.add_argument(
+            "-d",
+            "--device",
+            type=str,
+            default="0",
+            help="Device id or range ('0', '4-7', '0,2,5')",
+        )
         parser.add_argument(
             "--case",
             action="append",
@@ -1037,6 +1089,32 @@ class SceneTestCase:
         parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
         parser.add_argument("--build", action="store_true", help="Compile runtime from source")
         parser.add_argument(
+            "--runtime",
+            default=None,
+            help="Only run classes with this _st_runtime (child-mode marker when combined with --level)",
+        )
+        parser.add_argument(
+            "--level",
+            type=int,
+            choices=[2, 3],
+            default=None,
+            help="Only run classes with this _st_level (child-mode marker when combined with --runtime)",
+        )
+        parser.add_argument(
+            "-x", "--exitfirst", action="store_true", help="Stop on first failing case (matches pytest -x)"
+        )
+        parser.add_argument(
+            "--max-parallel",
+            default="auto",
+            help=(
+                "Max in-flight subprocesses (make-style); decouples -d pool size from "
+                "parallelism. 'auto' = min(nproc, len(-d)) on sim, len(-d) on hardware. "
+                "Use e.g. '--max-parallel 2' to throttle sim on a CPU-constrained CI "
+                "runner without shrinking -d. No short form — pytest reserves lowercase "
+                "shorts; standalone mirrors that restriction for consistency."
+            ),
+        )
+        parser.add_argument(
             "--log-level",
             choices=LOG_LEVEL_CHOICES,
             default=DEFAULT_LOG_LEVEL,
@@ -1049,12 +1127,59 @@ class SceneTestCase:
             logger.warning("Profiling disabled: --rounds > 1")
             args.enable_profiling = False
 
+        from .parallel_scheduler import default_max_parallel, device_range_to_list  # noqa: PLC0415
+
+        device_ids = device_range_to_list(args.device)
+        if not device_ids:
+            print("ERROR: --device must be a non-empty id or range", file=sys.stderr)
+            sys.exit(2)
+        args.device_ids = device_ids
+        # Keep ``args.device`` as an int for paths that expect a single id
+        # (profiling snapshots, device-id binding inside one worker). In child
+        # mode this is the single allocated id; in parent mode we use the first
+        # slot but the orchestrator doesn't actually run tests here.
+        args.device = device_ids[0]
+
+        # Resolve -j (max parallel) — 'auto' is CPU-aware on sim, device-count on hardware.
+        if args.max_parallel in (None, "", "auto"):
+            args.max_parallel = default_max_parallel(args.platform, device_ids)
+        else:
+            try:
+                args.max_parallel = int(args.max_parallel)
+            except (TypeError, ValueError):
+                print(f"ERROR: -j must be 'auto' or an integer, got {args.max_parallel!r}", file=sys.stderr)
+                sys.exit(2)
+            if args.max_parallel < 1:
+                print(f"ERROR: -j must be >= 1, got {args.max_parallel}", file=sys.stderr)
+                sys.exit(2)
+        if args.enable_profiling and args.max_parallel > 1:
+            print(
+                f"ERROR: --enable-profiling is incompatible with --max-parallel {args.max_parallel}; "
+                "profiling writes process-global files that collide under parallelism. "
+                "Either pass '--max-parallel 1' or drop --enable-profiling.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
         module = sys.modules[module_name]
         test_classes = [
             v
             for v in vars(module).values()
             if isinstance(v, type) and issubclass(v, SceneTestCase) and v is not SceneTestCase and hasattr(v, "CASES")
         ]
+
+        # Apply --runtime/--level filters (child mode sets both; parent may also
+        # use them when the user wants a narrow run).
+        if args.runtime is not None:
+            test_classes = [c for c in test_classes if getattr(c, "_st_runtime", None) == args.runtime]
+        if args.level is not None:
+            test_classes = [c for c in test_classes if getattr(c, "_st_level", None) == args.level]
+        if not test_classes:
+            print(
+                f"No matching classes (runtime={args.runtime}, level={args.level})",
+                file=sys.stderr,
+            )
+            sys.exit(0)
 
         selectors = [_parse_case_selector(v) for v in (args.case or [])]
         try:
@@ -1067,9 +1192,27 @@ class SceneTestCase:
         for cls, case in selected:
             selected_by_cls.setdefault(cls, []).append(case)
 
-        by_runtime: dict[str, list[type]] = {}
+        # Child mode: both --runtime and --level set. Run inline without
+        # spawning further subprocesses; this is the path orchestrator
+        # children take after we re-enter run_module.
+        child_mode = args.runtime is not None and args.level is not None
+
+        if not child_mode:
+            has_multi_dev_case = any(
+                int(case.get("config", {}).get("device_count", 1)) > 1
+                for cases in selected_by_cls.values()
+                for case in cases
+            )
+            has_multiple_groups = len({(cls._st_runtime, cls._st_level) for cls in selected_by_cls}) > 1
+            needs_orchestration = len(device_ids) > 1 or has_multi_dev_case or has_multiple_groups
+            if needs_orchestration:
+                ok = _orchestrate_standalone(module_name, selected_by_cls, args)
+                sys.exit(0 if ok else 1)
+
+        # ----- Inline execution (single group or child mode) -----
+        by_rt_level: dict[tuple[str, int], list[type]] = {}
         for cls in selected_by_cls:
-            by_runtime.setdefault(cls._st_runtime, []).append(cls)
+            by_rt_level.setdefault((cls._st_runtime, cls._st_level), []).append(cls)
 
         is_hardware = not args.platform.endswith("sim")
         if args.enable_profiling and is_hardware and "-d" not in sys.argv and "--device" not in sys.argv:
@@ -1080,9 +1223,9 @@ class SceneTestCase:
             )
 
         ok = True
-        for runtime, group in by_runtime.items():
-            print(f"\n=== Runtime: {runtime} ===")
-            worker, per_class_sub_ids = _create_standalone_worker(group, args)
+        for (runtime, level), group in by_rt_level.items():
+            print(f"\n=== Runtime: {runtime}  Level: {level} ===")
+            worker, per_class_sub_ids = _create_standalone_worker(group, level, args)
             try:
                 for cls in group:
                     inst = cls()
@@ -1091,36 +1234,28 @@ class SceneTestCase:
                     for case in selected_by_cls[cls]:
                         label = f"{cls.__name__}::{case['name']}"
                         print(f"  {label} ... ", end="", flush=True)
-                        before_perf = _snapshot_perf_files() if args.enable_profiling else set()
-                        before_device = (
-                            _snapshot_device_logs(args.device) if args.enable_profiling and is_hardware else None
-                        )
                         try:
-                            inst._run_and_validate(
+                            run_class_cases(
                                 worker,
-                                callable_obj,
-                                case,
+                                inst,
+                                [case],
+                                callable_obj=callable_obj,
                                 sub_ids=sub_ids,
+                                primary_device_id=args.device,
+                                is_hardware=is_hardware,
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
                                 enable_profiling=args.enable_profiling,
                                 enable_dump_tensor=args.dump_tensor,
                             )
                             print("PASSED")
-                        except Exception as e:
+                        except Exception as e:  # noqa: BLE001
                             print(f"FAILED: {e}")
                             ok = False
-                        finally:
-                            if args.enable_profiling:
-                                _convert_case_swimlane(
-                                    f"{cls.__name__}_{case['name']}",
-                                    args.device,
-                                    before_perf,
-                                    before_device,
-                                    callable_spec=cls.CALLABLE,
-                                )
+                            if args.exitfirst:
+                                raise SystemExit(1) from None
             finally:
-                if group[0]._st_level == 2:
+                if level == 2:
                     worker.finalize()
                 else:
                     worker.close()
@@ -1128,10 +1263,197 @@ class SceneTestCase:
         sys.exit(0 if ok else 1)
 
 
-def _create_standalone_worker(group, args):
-    """Create a Worker for standalone run_module entry point."""
+def _orchestrate_standalone(module_name, selected_by_cls, args):  # noqa: PLR0912 -- L3 + L2 phases + chunking + fail-fast
+    """Parent-mode dispatch for run_module.
+
+    L3 phase: one subprocess per (class, case), scheduled by device count.
+    L2 phase: for CS2, serial per-(runtime) subprocess on device_ids[0].
+    (CS4 adds device fanout for L2.)
+
+    Returns True on full success, False if any child failed.
+    """
+    from .parallel_scheduler import Job, format_device_range, run_jobs  # noqa: PLC0415
+
+    module = sys.modules[module_name]
+    # Path to the user's test script — sys.argv[0] is the script they invoked.
+    script = os.path.abspath(getattr(module, "__file__", sys.argv[0]))
+
+    common = ["-p", args.platform, "--manual", args.manual, "--log-level", args.log_level]
+    if args.rounds != 1:
+        common += ["--rounds", str(args.rounds)]
+    if args.skip_golden:
+        common.append("--skip-golden")
+    if args.enable_profiling:
+        common.append("--enable-profiling")
+    if args.dump_tensor:
+        common.append("--dump-tensor")
+    if args.build:
+        common.append("--build")
+
+    # ----- L3 phase: one subprocess per class (not per case).
+    # The child's _create_standalone_worker allocates max(cls.CASES.device_count)
+    # for the whole class, so the scheduler must grant the class-level max,
+    # otherwise a class with a 4-device case can't run any of its 1-device
+    # cases when we dispatch them individually with --device <1>. Cases inside
+    # a class still run serially in the child, reusing the L3 Worker.
+    l3_jobs = []
+    for cls, cases in selected_by_cls.items():
+        if cls._st_level != 3:
+            continue
+        if not cases:
+            continue
+        class_dev_count = max(int(c.get("config", {}).get("device_count", 1)) for c in cases)
+        label = f"L3 {cls.__name__} (rt={cls._st_runtime}, dev={class_dev_count})"
+
+        def _build(ids, _cls=cls.__name__, _rt=cls._st_runtime):
+            return [
+                sys.executable,
+                script,
+                *common,
+                "-d",
+                format_device_range(ids),
+                "--case",
+                f"{_cls}::",
+                "--runtime",
+                _rt,
+                "--level",
+                "3",
+            ]
+
+        l3_jobs.append(Job(label=label, device_count=class_dev_count, build_cmd=_build))
+
+    l3_failed = False
+    if l3_jobs:
+        print(
+            f"\n{'=' * 60}\n  L3 phase: {len(l3_jobs)} case(s), pool={args.device_ids}, "
+            f"max_parallel={args.max_parallel}\n{'=' * 60}\n"
+        )
+
+        def _on_done(res):
+            tag = "PASSED" if res.returncode == 0 else f"FAILED (rc={res.returncode})"
+            print(f"  {res.label}: {tag} on devices {res.device_ids}", flush=True)
+
+        try:
+            results = run_jobs(
+                l3_jobs,
+                args.device_ids,
+                max_parallel=args.max_parallel,
+                fail_fast=args.exitfirst,
+                on_job_done=_on_done,
+            )
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return False
+        l3_failed = any(r.returncode != 0 for r in results)
+        if l3_failed and args.exitfirst:
+            return False
+
+    # ----- L2 phase: runtimes serial (CANN isolation); within a runtime, fan
+    # out classes across device_ids as one subprocess per device. Each child
+    # owns one ChipWorker and runs its chunk of classes back-to-back (layer-4
+    # reuse). Single-device case reduces to one subprocess per runtime.
+    l2_by_runtime: dict[str, list[type]] = {}
+    for cls in selected_by_cls:
+        if cls._st_level == 2:
+            l2_by_runtime.setdefault(cls._st_runtime, []).append(cls)
+
+    l2_failed = False
+    for rt in sorted(l2_by_runtime):
+        classes = l2_by_runtime[rt]
+        # Chunk count = min(-j, number of classes). We intentionally do NOT
+        # include len(device_ids) here: each chunk uses 1 device and at most
+        # max_parallel chunks run concurrently, so a pool bigger than -j just
+        # leaves unused ids. Fewer, larger chunks also amortize ChipWorker
+        # init (layer-4 reuse) over more cases.
+        n = min(args.max_parallel, len(classes))
+        if n == 0:
+            continue
+        # Round-robin distribute classes to N children.
+        chunks: list[list[type]] = [[] for _ in range(n)]
+        for i, cls in enumerate(classes):
+            chunks[i % n].append(cls)
+
+        header = f"  L2 Runtime: {rt}" + (f"  [fanout n={n}]" if n > 1 else "")
+        print(f"\n{'=' * 60}\n{header}\n{'=' * 60}\n")
+
+        l2_jobs = []
+        for i, chunk in enumerate(chunks):
+            if not chunk:
+                continue
+            dev = args.device_ids[i]
+            case_filters: list[str] = []
+            for cls in chunk:
+                # User-supplied selectors still filter; we scope to this chunk's
+                # classes using "ClassName::<case>" or "ClassName::" (whole class).
+                for sel in args.case or []:
+                    if "::" in sel:
+                        sel_cls, sel_case = sel.split("::", 1)
+                        if not sel_cls or sel_cls == cls.__name__:
+                            case_filters.append(f"{cls.__name__}::{sel_case}" if sel_case else f"{cls.__name__}::")
+                    else:
+                        # Bare selector "Foo" = case name in any class — forward as-is,
+                        # but still scope to this chunk's classes.
+                        case_filters.append(f"{cls.__name__}::{sel}")
+                if not args.case:
+                    case_filters.append(f"{cls.__name__}::")
+            label = f"L2 {rt} dev={dev} ({len(chunk)} class(es))"
+
+            def _build(ids, _rt=rt, _dev=dev, _filters=tuple(case_filters)):
+                cmd = [
+                    sys.executable,
+                    script,
+                    *common,
+                    "-d",
+                    str(_dev),
+                    "--runtime",
+                    _rt,
+                    "--level",
+                    "2",
+                ]
+                for f in _filters:
+                    cmd += ["--case", f]
+                return cmd
+
+            # device_count=1 for L2 fanout children (each child uses one slot).
+            l2_jobs.append(Job(label=label, device_count=1, build_cmd=_build))
+
+        # Use the same scheduler: pool=device_ids, fail_fast=exitfirst. This
+        # gives us automatic parallelism + SIGTERM on fail-fast.
+        def _on_l2_done(res):
+            tag = "PASSED" if res.returncode == 0 else f"FAILED (rc={res.returncode})"
+            print(f"  {res.label}: {tag}", flush=True)
+
+        try:
+            results = run_jobs(
+                l2_jobs,
+                args.device_ids,
+                max_parallel=args.max_parallel,
+                fail_fast=args.exitfirst,
+                on_job_done=_on_l2_done,
+            )
+        except ValueError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            l2_failed = True
+            if args.exitfirst:
+                break
+            continue
+
+        if any(r.returncode != 0 for r in results):
+            l2_failed = True
+            if args.exitfirst:
+                break
+
+    return not (l3_failed or l2_failed)
+
+
+def _create_standalone_worker(group, level, args):
+    """Create a Worker for a (runtime, level) group in run_module.
+
+    ``level`` is passed explicitly by the caller; do not read it from
+    ``group[0]._st_level`` because groups are now keyed on (runtime, level)
+    and mixed-level files are allowed.
+    """
     first_cls = group[0]
-    level = first_cls._st_level
     build = getattr(args, "build", False)
     if level == 2:
         return first_cls._create_worker(args.platform, args.device, build=build), {}
@@ -1140,7 +1462,13 @@ def _create_standalone_worker(group, args):
 
     max_devices = max((c.get("config", {}).get("device_count", 1) for cls in group for c in cls.CASES), default=1)
     max_subs = max((c.get("config", {}).get("num_sub_workers", 0) for cls in group for c in cls.CASES), default=0)
-    device_ids = list(range(args.device, args.device + max_devices))
+    # Prefer the allocated list (orchestrator child mode), fall back to
+    # contiguous range starting at args.device (legacy inline path).
+    allocated = getattr(args, "device_ids", None)
+    if allocated and len(allocated) >= max_devices:
+        device_ids = allocated[:max_devices]
+    else:
+        device_ids = list(range(args.device, args.device + max_devices))
     worker = Worker(
         level=3,
         device_ids=device_ids,

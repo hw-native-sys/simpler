@@ -45,7 +45,7 @@ python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example
 
 # Benchmark mode (100 rounds, skip golden comparison)
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
-    -p a2a3 -d 0 -n 100 --skip-golden
+    -p a2a3 -d 0 --rounds 100 --skip-golden
 
 # Profiling (first round only)
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py \
@@ -97,7 +97,7 @@ pytest --platform a2a3sim --log-level debug                        # verbose C++
 
 ```bash
 python test_xxx.py -p a2a3sim                                    # default: 1 round + golden
-python test_xxx.py -p a2a3 -d 0 -n 100 --skip-golden            # benchmark mode
+python test_xxx.py -p a2a3 -d 0 --rounds 100 --skip-golden       # benchmark mode
 python test_xxx.py -p a2a3 --enable-profiling                    # profiling (first round)
 python test_xxx.py -p a2a3 --dump-tensor                         # dump per-task tensor I/O
 python test_xxx.py -p a2a3sim --build                            # compile runtime from source
@@ -108,14 +108,155 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 
 | Option | Short | Default | Description |
 | ------ | ----- | ------- | ----------- |
-| `--rounds N` | `-n` | 1 | Run each case N times |
+| `--rounds N` | | 1 | Run each case N times (reuses the same Worker across rounds) |
+| `--device IDS` | `-d` | `0` | Single id (`0`), range (`0-7`), or list (`0,2,5`). Sets the device-id pool for L3 cases and the available slots for L2 fanout. |
+| `--max-parallel N` | | `auto` | Max in-flight subprocesses (make-style). `auto` = `min(nproc, len(--device))` on sim, `len(--device)` on hardware. Decouples device-id pool size from parallelism; use to throttle sim on a CPU-constrained runner. |
+| `--runtime NAME` | | (all) | Restrict to one runtime (also used internally as the child-mode marker) |
+| `--level {2,3}` | | (all) | Restrict to one SceneTestCase level (also the child-mode marker) |
+| `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
+| `--manual` | | `exclude` | `exclude`/`include`/`only` for manual cases |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
-| `--enable-profiling` | | false | Enable profiling on first round only |
+| `--enable-profiling` | | false | Enable profiling on first round only. Blocked when `--max-parallel > 1`. |
 | `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
 | `--build` | | false | Compile runtime from source (not pre-built) |
+| `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
 | `--log-level LEVEL` | | (none) | Set `PTO_LOG_LEVEL` env var (`error`/`warn`/`info`/`debug`) |
 
 Profiling is enabled only on the first round to avoid overhead on subsequent iterations. Output tensors are reset to their initial values between rounds.
+
+## CLI Design Principles
+
+The same set of flags must work in both pytest and standalone (`python test_*.py`). Two rules govern which short forms we register:
+
+1. **Mirror pytest.** If pytest (or a pytest plugin the project depends on) exposes a flag with a particular short form, standalone must register the same short for the same meaning. Users routinely copy commands between the two entry points; letter-level semantic drift is the fastest way to create confusing bugs.
+2. **Never create a collision with pytest's ecosystem.** If pytest (or one of its plugins) already uses a short letter for a *different* concept, standalone must not reuse that letter for anything else, even if pytest doesn't use that letter for the flag we're adding. The goal is that `-X` in both worlds either does the same thing or is unused.
+
+Worked examples:
+
+| Flag | Long form | Short | Why |
+| ---- | --------- | ----- | --- |
+| `--platform` | both | `-p` | No pytest collision; high-frequency user flag. |
+| `--device` | both | `-d` | Same. |
+| `--exitfirst` | both | `-x` | pytest ships `-x` → standalone mirrors it so the flag behaves identically across entry points. |
+| `--rounds` | both | **(none)** | pytest-xdist already uses `-n` for worker count. Standalone originally had `-n` for `--rounds`, creating a letter-level collision whenever a user switched between pytest (`-n 8` = 8 workers) and standalone (`-n 8` = 8 rounds). Removed in [#574](https://github.com/hw-native-sys/simpler/pull/574); do not reintroduce. |
+| `--max-parallel` | both | **(none)** | `-j` would be the natural make-style short, but pytest reserves all lowercase single letters (`parser.addoption` rejects lowercase shorts). Standalone mirrors this to keep both CLIs identical — no short in either, always spell out `--max-parallel`. |
+| `--runtime` / `--level` | both | **(none)** | Internal child-mode markers; users rarely type them. No short keeps them distinctive. |
+| `--build`, `--skip-golden`, `--enable-profiling`, `--dump-tensor`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
+
+Practical guidance when adding a new CLI option:
+
+- First decide the long name and semantics. Register it on **both** `conftest.py::pytest_addoption` and `simpler_setup/scene_test.py::run_module`.
+- Check pytest's built-in shorts (`pytest --help`) and loaded plugins (`pytest-xdist`, `pytest-timeout`, etc.) for any letter you're considering.
+  - If pytest uses the letter for a matching concept → register the same short in standalone.
+  - If pytest uses the letter for anything else → pick a different short, or drop the short entirely.
+  - If the letter is free and the flag is high-frequency user-facing → a short is OK; otherwise skip it.
+
+## Parallel Test Execution and Resource Reuse
+
+Tests are dispatched through an **orchestrator** that pipelines work along two complementary axes:
+
+1. **Resource reuse** — every `ChipWorker` init costs three `dlopen`s plus a device-context acquire. The orchestrator keeps one worker alive for the lifetime of a test group so every class, case, and round on that device reuses the same worker.
+2. **Parallelism** — when `--device` names more than one id, independent work is spread across subprocesses so N devices do N-way work.
+
+Both pytest and standalone (`python test_*.py`) walk the same 6-layer hierarchy:
+
+```text
+Layer 1  Level axis
+│
+├─ L3 phase (runs first)
+│   One isolated subprocess per case; scheduled by device_count, bin-packed
+│   against the --device pool. CANN isolation is automatic (each case is its
+│   own process). Cross-runtime L3 cases can overlap when their devices don't.
+│
+└─ L2 phase (runs after L3 drains)
+    │
+    ├─ Layer 2  Runtime — serial subprocess per runtime (CANN isolation)
+    │   └─ Layer 3  Device — parallel subprocess per device (xdist for pytest,
+    │               custom fanout for standalone). Capacity bounded by --device size
+    │       └─ Layer 4  Class — one ChipWorker per (runtime, device), reused
+    │                   across every class assigned to that device
+    │           └─ Layer 5  Case — serial within a class
+    │               └─ Layer 6  Rounds — `--rounds N` loop, reuses Worker
+```
+
+### Quick examples
+
+```bash
+# Serial, single device — identical to pre-parallel behavior
+pytest tests/st --platform a2a3sim --device 0
+python test_foo.py -p a2a3sim -d 0
+
+# 8-device box: L3 cases bin-pack; L2 fanned out across 8 xdist workers
+# (hardware default: --max-parallel auto = 8)
+pytest tests/st --platform a2a3 --device 0-7
+python test_foo.py -p a2a3 -d 0-7
+
+# Non-contiguous devices (e.g. devices 0, 2, 5 free)
+pytest tests/st --platform a2a3 --device 0,2,5
+python test_foo.py -p a2a3 -d 0,2,5
+
+# CPU-constrained sim: pool of 16 virtual ids (needed by an L3 case with
+# device_count=8), but only 2 subprocesses running at once to avoid thrashing.
+# --max-parallel auto would pick this automatically on a 2-core CI runner.
+pytest tests/st --platform a2a3sim --device 0-15 --max-parallel 2
+python test_foo.py -p a2a3sim -d 0-15 --max-parallel 2
+
+# Fail-fast for CI: stop at the first failing case
+pytest tests/st --platform a2a3 --device 0-7 -x
+python test_foo.py -p a2a3 -d 0-7 -x
+
+# Narrow run: one level, one runtime, one case
+pytest tests/st --platform a2a3sim --level 2 --runtime tensormap_and_ringbuffer --case TestFoo::default
+python test_foo.py -p a2a3sim --level 2 --runtime tensormap_and_ringbuffer --case TestFoo::default
+```
+
+### Fail-fast (`-x` / `--exitfirst`)
+
+- Default: all cases run; the orchestrator summarizes pass/fail at the end. This is the right mode for local development — you want every failure surfaced at once.
+- With `-x` / `--exitfirst`: first failure cancels the pending queue, sends `SIGTERM` to running children, and **skips the L2 phase if L3 failed**. Intended for CI. The short form mirrors pytest's built-in `-x` so the flag behaves identically across pytest and standalone.
+
+### Device-count constraints
+
+If any L3 case declares `device_count > len(--device pool)` the orchestrator fails the whole batch up front rather than deadlocking the scheduler. Either widen `--device` or reduce the case's `device_count`. When `device_count` exceeds the *currently free* pool (but fits within the total), the case waits for an in-flight job to finish and then claims its slot.
+
+### `--device` vs `--max-parallel` (two separate knobs)
+
+On hardware these two concepts collapse: one device = one subprocess's worth of host CPU, so `--device 0-7` naturally implies 8-way parallelism. On sim they diverge:
+
+| `--device` controls | `--max-parallel` controls |
+| ------------------- | ------------------------- |
+| Size of the virtual device-id pool | Max simultaneous `subprocess.Popen` |
+| Must be ≥ any L3 case's `device_count` | Should be ~nproc on sim (CPU-bound) |
+
+This matters on CPU-constrained CI runners. Example: an L3 case needs `device_count=8` but the runner has 2 CPUs.
+
+- `--device 0-1` — can't run the L3 case; static check fails.
+- `--device 0-15` (no `--max-parallel`) — L3 case fits, but the orchestrator would also spawn 15 concurrent L2 xdist workers and potentially multiple concurrent L3 cases, thrashing the 2 CPUs.
+- `--device 0-15 --max-parallel 2` — L3 case fits in the pool; at most 2 subprocesses run at a time. This is what the `auto` default computes on a 2-core runner.
+
+`--max-parallel` counts top-level subprocesses, like `make -j`. A single L3 case subprocess internally forks N chip-processes for its `device_count`; those forks do **not** count toward `--max-parallel`. One case = one unit regardless of how many devices it uses.
+
+### Mixed L2 + L3 in one file
+
+A single file can declare both L2 and L3 classes; they're grouped by `(runtime, level)` internally. L3 classes run in the L3 phase (subprocess-per-case), L2 classes run in the L2 phase (shared Worker per device).
+
+### Profiling and parallelism are mutually exclusive
+
+`--enable-profiling` writes process-global files (`outputs/perf_swimlane_*.json` and CANN device logs) that collide under parallel runs. The orchestrator errors out up front when `--max-parallel > 1`. Profile on a single device:
+
+```bash
+pytest tests/st --platform a2a3 --device 0 --enable-profiling
+# Or widen the pool but force serial execution:
+pytest tests/st --platform a2a3 --device 0-7 --max-parallel 1 --enable-profiling
+```
+
+### Orchestrator skip conditions (normal pytest runs)
+
+The orchestrator only takes over when there's actual work to parallelize or isolate. It falls through to plain pytest when:
+
+- `--collect-only`
+- Only one runtime is present and no L3 cases are collected (single L2 batch)
+- Both `--runtime` and `--level` are set (child-mode marker — used internally by spawned subprocesses)
 
 ## Hardware Classification
 
@@ -445,8 +586,8 @@ def compute_golden(self, args, params):
 | Single run (sim) | `python examples/scripts/run_example.py -k kernels/ -g golden.py -p a2a3sim` | `python test_*.py -p a2a3sim` |
 | Single run (hardware) | `python examples/scripts/run_example.py -k kernels/ -g golden.py -p a2a3 -d 0` | `python test_*.py -p a2a3 -d 0` |
 | Batch (pytest) | `python examples/scripts/ci.py` | `pytest examples tests/st --platform a2a3sim` |
-| Multi-round | Not supported | `python test_*.py -p a2a3sim -n 3` |
-| Benchmark | Manual | `python test_*.py -p a2a3 -d 0 -n 100 --skip-golden --case CaseName` |
+| Multi-round | Not supported | `python test_*.py -p a2a3sim --rounds 3` |
+| Benchmark | Manual | `python test_*.py -p a2a3 -d 0 --rounds 100 --skip-golden --case CaseName` |
 | Profiling | `--enable-profiling` flag on run_example.py | `python test_*.py -p a2a3 -d 0 --enable-profiling` (auto-runs `tools/swimlane_converter.py` per case at end) |
 
 ##### `--case` selector and `--manual`
@@ -494,48 +635,41 @@ When a second runtime launches on the same device (same CANN process context), t
 | Different runtime, different device | Works (separate CANN context per device) |
 | Different runtime, different process, same device | Works (`rtDeviceReset` between processes clears context) |
 
-### Mitigation in pytest
+### Mitigation
 
-The `conftest.py` device allocator groups tests by runtime and assigns each runtime group to exclusive devices. See "Device Allocation Algorithm" below.
+The orchestrator spawns a separate subprocess per runtime for L2 work and a separate subprocess per case for L3 work. Every subprocess starts from a clean CANN state, so the stale-`.so` hang is structurally impossible.
 
-## Device Allocation Algorithm (Onboard pytest)
+## Device Allocation (Orchestrator + xdist)
 
-When running `pytest --platform a2a3 --device 8-11`, the fixture must allocate devices to tests such that:
+When running `pytest --platform a2a3 --device 8-11`, the orchestrator does this:
 
-1. **Runtime isolation**: A device used by runtime A must not be reused by runtime B in the same process.
-2. **L3 multi-device**: L3 tests may need 2+ contiguous devices.
-3. **Efficiency**: Devices freed by one test of the same runtime can be reused by the next.
+### L3 phase — device bin-packing
 
-### Algorithm
+For every collected L3 case, the scheduler (`simpler_setup/parallel_scheduler.py`) maintains a free-device set starting at `[8, 9, 10, 11]`. It pops the next queued case and, if the free set can cover its `device_count`, grabs that many ids and spawns:
 
 ```text
-Phase 1: Group tests by runtime
-  tensormap_and_ringbuffer: [TestVectorExample, TestScalarData, TestL3Dependency, ...]
-  aicpu_build_graph:        [TestPagedAttentionAicpuBuildGraph]
-  host_build_graph:         [TestPagedAttentionHostBuildGraph]
-
-Phase 2: Partition devices across runtime groups
-  Available: [8, 9, 10, 11]
-  tensormap_and_ringbuffer (6 tests, needs max 2 for L3 group): devices [8, 9]
-  aicpu_build_graph (1 test, needs 1):                          devices [10]
-  host_build_graph (1 test, needs 1):                           devices [11]
-
-Phase 3: Within each group, allocate from group's device pool
-  TestVectorExample:       dev 8 → run → release → dev 8 available again
-  TestScalarData:          dev 8 → run → release → OK (same runtime)
-  TestL3Dependency:        dev 8 → run → release
-  TestL3Group:             dev [8, 9] → run → release
-  TestPagedAttentionAicpuBuildGraph: dev 10 → run → release
-  TestPagedAttentionHostBuildGraph:  dev 11 → run → release
+pytest <nodeid> --runtime <rt> --level 3 --case <Class::case> --device <alloc-range>
 ```
 
-### Implementation
+When a subprocess completes, its devices return to the free set and the queue is re-tried. Cases that need more devices than currently free **wait**; cases that need more than the whole pool **fail the batch up front**.
 
-The `DevicePool` in `conftest.py` is extended with runtime-aware partitioning. The `st_worker` fixture checks the test class's `_st_runtime` and allocates from the corresponding partition.
+### L2 phase — xdist fanout per device
+
+After L3 drains, one subprocess is spawned per runtime:
+
+```text
+pytest --runtime <rt> --level 2 --device 8-11 -n 4 --dist loadfile
+```
+
+`pytest-xdist` starts 4 workers (`gw0`..`gw3`). Each worker's `pytest_configure` slices `--device 8-11` down to a single id (`gw0` → `8`, `gw1` → `9`, ...), and `st_worker` is session-scoped, so the worker initializes exactly one `ChipWorker(device=N)` and reuses it for every L2 class routed to it. `--dist loadfile` keeps all cases from one test file on the same worker, amortizing any file-level setup cost.
+
+### L2 phase — standalone fanout
+
+Standalone (`python test_*.py -d 8-11`) uses the same scheduler module: classes are round-robin assigned to `len(device_ids)` chunks, one subprocess per chunk launched with a single device and explicit `--case ClassName::` selectors.
 
 ### Sim platforms
 
-On sim (`a2a3sim`, `a5sim`), device IDs are virtual — no hardware state, no isolation constraint. All tests share a single virtual pool with auto-incrementing IDs.
+On sim (`a2a3sim`, `a5sim`), device IDs are virtual — no hardware state, no isolation constraint. All tests share a single virtual pool with auto-incrementing IDs. The same orchestrator + xdist path is used; speedup on sim comes from actual CPU parallelism, not hardware parallelism.
 
 ## Per-Case Device Filtering
 

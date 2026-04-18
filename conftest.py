@@ -30,11 +30,15 @@ TIMEOUT_EXIT_CODE = 124
 
 
 def _parse_device_range(s: str) -> list[int]:
-    """Parse '4-7' -> [4,5,6,7] or '0' -> [0]."""
-    if "-" in s:
-        start, end = s.split("-", 1)
-        return list(range(int(start), int(end) + 1))
-    return [int(s)]
+    """Parse a --device spec into a sorted list of ints.
+
+    Delegates to :func:`simpler_setup.parallel_scheduler.device_range_to_list`
+    so both conftest and standalone share the same parser (supports ``0``,
+    ``0-7``, ``0,2,5``, and mixed ``0,2-4,7``).
+    """
+    from simpler_setup.parallel_scheduler import device_range_to_list  # noqa: PLC0415
+
+    return device_range_to_list(s)
 
 
 class DevicePool:
@@ -79,6 +83,27 @@ def pytest_addoption(parser):
         help="Manual case handling: exclude (default), include, only",
     )
     parser.addoption("--runtime", action="store", default=None, help="Only run tests for this runtime")
+    parser.addoption(
+        "--level",
+        action="store",
+        type=int,
+        default=None,
+        choices=[2, 3],
+        help="Only run tests for this SceneTestCase level (2 or 3); default: all levels",
+    )
+    parser.addoption(
+        "--max-parallel",
+        action="store",
+        default="auto",
+        help=(
+            "Max in-flight subprocesses (make-style); decouples the device pool size "
+            "from parallelism. 'auto' = min(nproc, len(--device)) on sim, "
+            "len(--device) on hardware. Use '--max-parallel 2' to throttle sim on a "
+            "CPU-constrained CI runner without shrinking --device. pytest reserves "
+            "lowercase short options for itself, so no '-j' short is registered — "
+            "use the long form in both pytest and standalone."
+        ),
+    )
     parser.addoption("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
     parser.addoption(
         "--skip-golden", action="store_true", default=False, help="Skip golden comparison (benchmark mode)"
@@ -161,11 +186,65 @@ def pytest_configure(config):
     if timeout and timeout > 0:
         _install_session_timeout(timeout)
 
+    # xdist worker: bind this process to a single device id from the --device range.
+    # The orchestrator (or the user) supplies --device 0-7; xdist spawns N workers
+    # labelled gw0..gwN-1. We slice device_ids[worker_index] so each worker owns
+    # exactly one device. L2 Worker is session-scoped inside xdist children, so
+    # all tests on this worker share one ChipWorker init().
+    worker_id = os.environ.get("PYTEST_XDIST_WORKER")
+    if worker_id and worker_id.startswith("gw"):
+        try:
+            idx = int(worker_id[2:])
+        except ValueError:
+            idx = 0
+        device_spec = config.getoption("--device", default="0")
+        ids = _parse_device_range(device_spec)
+        if 0 <= idx < len(ids):
+            config.option.device = str(ids[idx])
+        # else: more xdist workers than devices — fall through with original range;
+        # DevicePool will fail clearly if the test tries to allocate.
+
+    # Parallel + profiling is unsafe (perf files are process-global). Block it
+    # at the parent (non-xdist-worker) level. What matters is concurrent
+    # subprocess count, not device pool size — respect -j.
+    if config.getoption("--enable-profiling", default=False) and not worker_id:
+        device_spec = config.getoption("--device", default="0")
+        ids = _parse_device_range(device_spec)
+        platform = config.getoption("--platform", default="") or ""
+        raw_j = config.getoption("--max-parallel", default="auto")
+        if raw_j in (None, "", "auto"):
+            from simpler_setup.parallel_scheduler import default_max_parallel  # noqa: PLC0415
+
+            j = default_max_parallel(platform, ids)
+        else:
+            try:
+                j = max(1, int(raw_j))
+            except (TypeError, ValueError):
+                j = 1
+        if j > 1:
+            raise pytest.UsageError(
+                f"--enable-profiling is incompatible with --max-parallel {j}; "
+                "profiling writes process-global files that collide under "
+                "parallelism. Either pass '--max-parallel 1' or drop --enable-profiling."
+            )
+
 
 def pytest_collection_modifyitems(session, config, items):
-    """Skip ST tests based on --platform and --runtime filters, and order L3 before L2."""
+    """Skip ST tests based on --platform, --runtime, --level filters; order L3 before L2."""
     platform = config.getoption("--platform")
     runtime_filter = config.getoption("--runtime")
+    level_filter = config.getoption("--level")
+
+    # Orchestrator L3 children set PTO_TARGET_NODEID to the single case they
+    # were dispatched for. Pytest's --case filter runs inside test_run (too
+    # late — other classes' st_worker fixtures already fired at setup). Skip
+    # everything except the target nodeid so the child stays narrow even when
+    # the parent invocation had broad positional args like ``examples tests/st``.
+    target_nodeid = os.environ.get("PTO_TARGET_NODEID")
+    if target_nodeid:
+        for item in items:
+            if item.nodeid != target_nodeid:
+                item.add_marker(pytest.mark.skip(reason=f"orchestrator target is {target_nodeid}"))
 
     # Sort: L3 tests first (they fork child processes that inherit main process CANN state,
     # so they must run before L2 tests pollute the CANN context).
@@ -187,6 +266,8 @@ def pytest_collection_modifyitems(session, config, items):
                 item.add_marker(
                     pytest.mark.skip(reason=f"Runtime {getattr(cls, '_st_runtime', '?')} != {runtime_filter}")
                 )
+            elif level_filter is not None and getattr(cls, "_st_level", None) != level_filter:
+                item.add_marker(pytest.mark.skip(reason=f"Level {getattr(cls, '_st_level', '?')} != {level_filter}"))
             continue
         platforms_marker = item.get_closest_marker("platforms")
         if platforms_marker:
@@ -205,65 +286,240 @@ def pytest_collection_modifyitems(session, config, items):
 
 
 # ---------------------------------------------------------------------------
-# Runtime isolation: spawn subprocess per runtime
+# Orchestrator: L3 phase (device-aware parallel subprocesses) + L2 phase
+# (per-runtime subprocess). Activated only when neither --runtime nor --level
+# is set by the caller. Orchestrator-spawned children set both, so they fall
+# through to pytest's default runtestloop without recursing.
 # ---------------------------------------------------------------------------
 
 
-def _collect_st_runtimes(items):
-    """Return sorted list of unique runtimes from collected SceneTestCase items."""
+def _collect_st_runtimes(items, level=None):
+    """Return sorted list of unique runtimes from items, optionally filtered by level."""
     runtimes = set()
     for item in items:
         cls = getattr(item, "cls", None)
-        rt = getattr(cls, "_st_runtime", None) if cls else None
-        if rt:
+        if not cls:
+            continue
+        rt = getattr(cls, "_st_runtime", None)
+        lvl = getattr(cls, "_st_level", None)
+        if rt and (level is None or lvl == level):
             runtimes.add(rt)
     return sorted(runtimes)
 
 
-def pytest_runtestloop(session):
-    """Override test execution to isolate runtimes in subprocesses.
+def _collect_l3_cases(items, platform):
+    """Collect one job per L3 class (not per case).
 
-    If --runtime is specified (or only one runtime collected), run normally.
-    Otherwise, spawn one subprocess per runtime and aggregate results.
+    Returns a list of tuples ``(nodeid, cls_name, runtime, max_device_count)``
+    where ``max_device_count`` is the maximum ``device_count`` across the
+    class's matching cases. Per-class dispatch matches the ``st_worker``
+    fixture's contract (it allocates ``max(CASES.device_count)`` for the whole
+    class) — dispatching per-case with a smaller device budget would trip the
+    fixture whenever the class also has a case that needs more devices.
+
+    Cases within a class still run in the child process via the existing
+    ``test_run`` case loop, reusing the Worker (layer-4 reuse).
     """
-    runtime_filter = session.config.getoption("--runtime")
-    if runtime_filter:
-        return  # single runtime — let pytest run normally
+    by_nodeid: dict[str, tuple[str, str, int]] = {}
+    for item in items:
+        cls = getattr(item, "cls", None)
+        if not cls or getattr(cls, "_st_level", None) != 3:
+            continue
+        if any(m.name == "skip" for m in item.iter_markers()):
+            continue
+        rt = getattr(cls, "_st_runtime", None)
+        if not rt:
+            continue
+        max_dev = 1
+        saw_case = False
+        for case in getattr(cls, "CASES", []):
+            if platform and platform not in case.get("platforms", []):
+                continue
+            if case.get("manual"):
+                continue  # --manual exclude is the default; children honor the flag
+            saw_case = True
+            max_dev = max(max_dev, int(case.get("config", {}).get("device_count", 1)))
+        if saw_case:
+            by_nodeid[item.nodeid] = (cls.__name__, rt, max_dev)
+    return [(nodeid, cls_name, rt, dev) for nodeid, (cls_name, rt, dev) in by_nodeid.items()]
 
-    runtimes = _collect_st_runtimes(session.items)
-    if len(runtimes) <= 1:
-        return  # zero or one runtime — no isolation needed
 
-    # Multiple runtimes: spawn subprocess per runtime
-    # Re-invoke pytest with the same args + --runtime <rt> for each runtime
-    base_args = [sys.executable, "-m", "pytest"]
+def _base_pytest_argv(session):
+    """Inherit the user's original pytest invocation args."""
+    base = [sys.executable, "-m", "pytest"]
     for arg in session.config.invocation_params.args:
-        base_args.append(str(arg))
+        base.append(str(arg))
+    return base
 
-    failed = False
-    for rt in runtimes:
-        # Build subprocess command: inject --runtime <rt>
-        cmd = base_args + ["--runtime", rt]
-        header = f"  Runtime: {rt}"
-        print(f"\n{'=' * 60}\n{header}\n{'=' * 60}\n", flush=True)
 
-        result = subprocess.run(cmd, check=False, cwd=session.config.invocation_params.dir)
+def _resolve_max_parallel(cfg, platform: str, device_ids: list[int]) -> int:
+    """Parse the -j/--max-parallel CLI value; 'auto' → platform-aware default."""
+    from simpler_setup.parallel_scheduler import default_max_parallel  # noqa: PLC0415
+
+    raw = cfg.getoption("--max-parallel", default="auto")
+    if raw in (None, "", "auto"):
+        return default_max_parallel(platform or "", device_ids)
+    try:
+        val = int(raw)
+    except (TypeError, ValueError) as e:
+        raise pytest.UsageError(f"--max-parallel must be 'auto' or an integer, got {raw!r}") from e
+    if val < 1:
+        raise pytest.UsageError(f"--max-parallel must be >= 1, got {val}")
+    return val
+
+
+def _orchestrate(session):
+    """Run L3 phase (device-parallel) then L2 phase (per-runtime subprocess)."""
+    from simpler_setup import parallel_scheduler as _ps  # noqa: PLC0415
+
+    cfg = session.config
+    device_spec = cfg.getoption("--device", default="0")
+    device_ids = _parse_device_range(device_spec)
+    # pytest registers -x as an alias of --exitfirst; both resolve via this name.
+    fail_fast = bool(cfg.getoption("--exitfirst", default=False))
+    platform = cfg.getoption("--platform")
+    max_parallel = _resolve_max_parallel(cfg, platform or "", device_ids)
+
+    base_args = _base_pytest_argv(session)
+    cwd = session.config.invocation_params.dir
+
+    # ----- Phase 1: L3 classes (device-bin-packed subprocesses, one per class) -----
+    l3_cases = _collect_l3_cases(session.items, platform)
+    l3_failed = False
+    if l3_cases:
+        # Static check happens inside run_jobs; we translate errors into session failure.
+        jobs = []
+        for nodeid, cls_name, rt, dev_count in l3_cases:
+            label = f"L3 {cls_name} (rt={rt}, dev={dev_count})"
+
+            def _build(ids, _nodeid=nodeid, _rt=rt):
+                return base_args + [
+                    _nodeid,
+                    "--runtime",
+                    _rt,
+                    "--level",
+                    "3",
+                    "--device",
+                    _ps.format_device_range(ids),
+                ]
+
+            # PTO_TARGET_NODEID makes the child skip every item except this
+            # nodeid — defends against inherited positional args (``examples``,
+            # ``tests/st``) collecting unrelated classes whose fixtures would
+            # then fire at setup and fail on the narrower child device pool.
+            child_env = {**os.environ, "PTO_TARGET_NODEID": nodeid}
+            jobs.append(_ps.Job(label=label, device_count=dev_count, build_cmd=_build, cwd=str(cwd), env=child_env))
+
+        def _on_done(res):
+            tag = "PASSED" if res.returncode == 0 else f"FAILED (rc={res.returncode})"
+            print(f"\n--- {res.label}: {tag} on devices {res.device_ids} ---\n", flush=True)
+
+        print(
+            f"\n{'=' * 60}\n  L3 phase: {len(jobs)} case(s), "
+            f"pool={device_ids}, max_parallel={max_parallel}\n{'=' * 60}\n",
+            flush=True,
+        )
+        try:
+            results = _ps.run_jobs(
+                jobs,
+                device_ids,
+                max_parallel=max_parallel,
+                fail_fast=fail_fast,
+                on_job_done=_on_done,
+            )
+        except ValueError as e:
+            print(f"\n*** L3 phase ABORTED: {e} ***\n", flush=True)
+            session.testsfailed = 1
+            return True
+        l3_failed = any(r.returncode != 0 for r in results)
+        if any(r.returncode == TIMEOUT_EXIT_CODE for r in results):
+            print("\n*** L3 phase: TIMED OUT ***\n", flush=True)
+            os._exit(TIMEOUT_EXIT_CODE)
+
+        # Fail-fast: stop before L2 phase if any L3 failed.
+        if l3_failed and fail_fast:
+            session.testsfailed = 1
+            return True
+
+    # ----- Phase 2: L2 per-runtime subprocess -----
+    l2_runtimes = _collect_st_runtimes(session.items, level=2)
+    l2_failed = False
+    # When we have more than one device, enable pytest-xdist so the L2 phase
+    # spreads classes across devices. Each xdist worker slices --device 0-7
+    # down to one id in its own pytest_configure (above) and the st_worker
+    # fixture is session-scoped inside the worker — one ChipWorker per (runtime,
+    # device), reused across every class assigned to that worker.
+    xdist_available = False
+    if max_parallel > 1:
+        try:
+            import xdist  # noqa: F401,PLC0415
+
+            xdist_available = True
+        except ImportError:
+            print(
+                "\n[warning] -j > 1 but pytest-xdist not installed; "
+                "falling back to serial L2 phase. pip install pytest-xdist to enable.\n",
+                flush=True,
+            )
+    for rt in l2_runtimes:
+        cmd = base_args + ["--runtime", rt, "--level", "2"]
+        if xdist_available:
+            cmd += ["-n", str(max_parallel), "--dist", "loadfile"]
+        print(
+            f"\n{'=' * 60}\n  L2 Runtime: {rt}"
+            + (f" [-n {max_parallel}]" if xdist_available else "")
+            + f"\n{'=' * 60}\n",
+            flush=True,
+        )
+        result = subprocess.run(cmd, check=False, cwd=cwd)
         if result.returncode == TIMEOUT_EXIT_CODE:
-            print(f"\n*** Runtime {rt}: TIMED OUT ***\n", flush=True)
+            print(f"\n*** L2 runtime {rt}: TIMED OUT ***\n", flush=True)
             os._exit(TIMEOUT_EXIT_CODE)
         if result.returncode != 0:
-            failed = True
-            print(f"\n*** Runtime {rt}: FAILED ***\n", flush=True)
+            l2_failed = True
+            print(f"\n*** L2 runtime {rt}: FAILED ***\n", flush=True)
+            if fail_fast:
+                break
         else:
-            print(f"\n--- Runtime {rt}: PASSED ---\n", flush=True)
+            print(f"\n--- L2 runtime {rt}: PASSED ---\n", flush=True)
 
-    if failed:
-        session.testsfailed = 1
-    else:
+    session.testsfailed = 1 if (l3_failed or l2_failed) else 0
+    if not (l3_failed or l2_failed):
         session.testscollected = sum(1 for _ in session.items)
-        session.testsfailed = 0
-
     return True  # returning True prevents default runtestloop
+
+
+def pytest_runtestloop(session):
+    """Orchestrate L3+L2 phases unless caller is already in child mode.
+
+    Child mode (both --runtime and --level set, or --collect-only) skips the
+    orchestrator and falls through to pytest's default runtestloop.
+    """
+    runtime_filter = session.config.getoption("--runtime")
+    level_filter = session.config.getoption("--level")
+
+    # Child mode: the orchestrator's spawned subprocesses carry both flags.
+    if runtime_filter is not None and level_filter is not None:
+        return
+
+    # User explicitly asked for collect-only / scoped-run — don't orchestrate.
+    if session.config.getoption("--collect-only", default=False):
+        return
+
+    # If there are no items, nothing to orchestrate.
+    if not session.items:
+        return
+
+    # If only L2 items exist in a single runtime, the orchestrator reduces to a
+    # single L2 subprocess — not worth the extra fork overhead vs. letting
+    # pytest run directly. Skip orchestration in that trivial case.
+    level_filter_explicit = level_filter is not None
+    runtimes_all = _collect_st_runtimes(session.items)
+    has_l3 = any(getattr(getattr(i, "cls", None), "_st_level", None) == 3 for i in session.items)
+    if not has_l3 and len(runtimes_all) <= 1 and not level_filter_explicit:
+        return
+
+    return _orchestrate(session)
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +546,33 @@ def st_platform(request):
     return p
 
 
-@pytest.fixture()
-def st_worker(request, st_platform, device_pool):
-    """Per-test Worker with devices allocated from pool.
+@pytest.fixture(scope="session")
+def _l2_worker_pool(request, st_platform):
+    """Session-scoped L2 worker pool keyed by (runtime, device_id).
 
-    Reads _st_level and CASES from the test class to determine
-    how many devices and sub-workers to allocate.
+    Under xdist, each worker process owns one device (slicing done in
+    pytest_configure), so this pool typically ends up with one entry per
+    runtime. Tests on the same worker that share a runtime reuse the same
+    ``ChipWorker`` — amortizing the init cost (three dlopens + device
+    acquire) over every class on that device.
+    """
+    pool: dict[tuple[str, int], object] = {}
+    yield pool
+    # Session teardown: close every Worker we minted.
+    for w in pool.values():
+        try:
+            w.close()
+        except Exception:  # noqa: BLE001
+            pass
+    pool.clear()
+
+
+@pytest.fixture()
+def st_worker(request, st_platform, device_pool, _l2_worker_pool):
+    """Per-test Worker.
+
+    L2: session-scoped, reused across classes with the same (runtime, device).
+    L3: per-test (registers sub-callables at init, can't be reused).
     """
     cls = request.node.cls
     if cls is None or not hasattr(cls, "_st_level"):
@@ -306,18 +583,33 @@ def st_worker(request, st_platform, device_pool):
     build = request.config.getoption("--build", default=False)
 
     if level == 2:
+        # L2 share: reuse any Worker already created for this runtime in the
+        # current process. Under xdist, each worker process is sliced to a
+        # single device so there's at most one matching entry. On first call
+        # we allocate a device from the pool and immediately release it back —
+        # the pool is a process-scoped counter for other fixtures (e.g.
+        # st_device_ids) that also draw from it; retaining the id would drain
+        # the pool and break any non-st_worker test that runs afterward on the
+        # same xdist worker.
+        for (rt, dev_id), existing in _l2_worker_pool.items():
+            if rt == runtime:
+                yield existing
+                return
+
         ids = device_pool.allocate(1)
         if not ids:
             pytest.fail(f"no devices available in --device pool (requested 1, pool has {len(device_pool._available)})")
-
+        dev_id = ids[0]
+        device_pool.release(ids)
+        key = (runtime, dev_id)
         from simpler.worker import Worker  # noqa: PLC0415
 
-        w = Worker(level=2, device_id=ids[0], platform=st_platform, runtime=runtime, build=build)
-        w._st_device_id = ids[0]  # expose primary device to test_run for profiling snapshots
+        w = Worker(level=2, device_id=dev_id, platform=st_platform, runtime=runtime, build=build)
+        w._st_device_id = dev_id
         w.init()
+        _l2_worker_pool[key] = w
         yield w
-        w.close()
-        device_pool.release(ids)
+        # No close here — pool handles teardown at session end.
 
     elif level == 3:
         max_devices = max((c.get("config", {}).get("device_count", 1) for c in cls.CASES), default=1)
