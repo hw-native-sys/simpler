@@ -98,4 +98,9 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     // Flush all dirty cache lines to HBM before kernel exit.
     dcci(my_hank, SINGLE_CACHE_LINE, CACHELINE_OUT);
+
+    // Invalidate our Handshake L1 line on exit so the next case on this core
+    // sees a fresh aicpu_ready=0 on its first load instead of an L1-resident 1
+    // left over from this case (no rtDeviceReset between cases).
+    dcci(my_hank, SINGLE_CACHE_LINE);
 }
