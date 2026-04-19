@@ -134,3 +134,29 @@ endfunction()
 add_task_interface_test(test_child_memory test_child_memory.cpp)
 add_a2a3_pto2_test(test_a2a3_pto2_fatal test_a2a3_pto2_fatal.cpp)
 add_a5_pto2_test(test_a5_pto2_fatal test_a5_pto2_fatal.cpp)
+
+# Hardware-only UT for the HCCL backend of the comm_* C API.
+# Loads libhost_runtime.so at runtime via dlopen (no link-time CANN dep), so
+# this test builds everywhere but only runs on a2a3 hardware runners
+# (selected by ctest -L "^requires_hardware(_a2a3)?$").
+function(add_comm_api_test name src)
+    add_executable(${name} ${src})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+        dl
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES
+        LABELS "requires_hardware_a2a3"
+        RESOURCE_GROUPS "2,npus:1"
+    )
+endfunction()
+
+add_comm_api_test(test_hccl_comm test_hccl_comm.cpp)

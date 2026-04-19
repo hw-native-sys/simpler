@@ -23,6 +23,7 @@
 #include <iostream>
 #include <string>
 #include <vector>
+#include "acl/acl.h"
 
 // Include HAL constants from CANN (header only, library loaded dynamically)
 #include "ascend_hal.h"
@@ -267,6 +268,34 @@ int DeviceRunner::attach_current_thread(int device_id) {
     }
 
     device_id_ = device_id;
+    return 0;
+}
+
+int DeviceRunner::ensure_acl_ready(int device_id) {
+    if (device_id < 0) {
+        LOG_ERROR("ensure_acl_ready: invalid device_id %d", device_id);
+        return -1;
+    }
+
+    // aclInit is process-wide; CANN returns 100002 if it has already been
+    // initialized (possibly by another owner), which we treat as success.
+    constexpr int kAclRepeatInit = 100002;
+    aclError aRet = aclInit(nullptr);
+    if (aRet != ACL_SUCCESS && static_cast<int>(aRet) != kAclRepeatInit) {
+        LOG_ERROR("aclInit failed: %d", static_cast<int>(aRet));
+        return static_cast<int>(aRet);
+    }
+
+    // ACL device binding is per-thread; every caller must still hit it.
+    aRet = aclrtSetDevice(device_id);
+    if (aRet != ACL_SUCCESS) {
+        LOG_ERROR("aclrtSetDevice(%d) failed: %d", device_id, static_cast<int>(aRet));
+        return static_cast<int>(aRet);
+    }
+
+    // Record that we are responsible for aclFinalize at teardown.
+    acl_ready_ = true;
+    if (device_id_ < 0) device_id_ = device_id;
     return 0;
 }
 
@@ -723,10 +752,21 @@ int DeviceRunner::finalize() {
     // Free all remaining allocations (including handshake buffer and binGmAddr)
     mem_alloc_.finalize();
 
-    rc = rtDeviceReset(device_id_);
-    if (rc != 0) {
-        LOG_ERROR("rtDeviceReset(%d) failed during finalize: %d", device_id_, rc);
-        return rc;
+    // Reset device and finalize ACL AFTER all device memory is freed.
+    // Gated on acl_ready_ so rt-only runtimes that never called
+    // ensure_acl_ready() do not try to aclFinalize an un-init'd ACL state.
+    if (acl_ready_ && device_id_ >= 0) {
+        int reset_rc = aclrtResetDevice(device_id_);
+        if (reset_rc != 0) {
+            LOG_ERROR("aclrtResetDevice(%d) failed during finalize: %d", device_id_, reset_rc);
+            rc = reset_rc;
+        }
+        int finalize_rc = aclFinalize();
+        if (finalize_rc != 0) {
+            LOG_ERROR("aclFinalize failed during finalize: %d", finalize_rc);
+            if (rc == 0) rc = finalize_rc;
+        }
+        acl_ready_ = false;
     }
 
     device_id_ = -1;
@@ -735,7 +775,7 @@ int DeviceRunner::finalize() {
     aicore_kernel_binary_.clear();
 
     LOG_INFO("DeviceRunner finalized");
-    return 0;
+    return rc;
 }
 
 int DeviceRunner::launch_aicpu_kernel(rtStream_t stream, KernelArgs *k_args, const char *kernel_name, int aicpu_num) {

@@ -6,10 +6,11 @@ The CI pipeline maps test categories (st, ut-py, ut-cpp) × hardware tiers to Gi
 
 Design principles:
 
-1. **Separate jobs per test category** — st, ut-py, and ut-cpp run as independent jobs for parallelism and clear dashboard visibility.
+1. **Merge by runner, not by language** — Python and C++ unit tests share setup cost and run as steps within a single job per runner tier (`ut`, `ut-a2a3`, `ut-a5`).
 2. **Runner matches hardware tier** — no-hardware tests run on `ubuntu-latest`; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
 3. **`--platform` is the only filter** — pytest uses `--platform` + the `requires_hardware` marker; ctest uses label `-LE` exclusion. No `-m st`, no `-m "not requires_hardware"`.
 4. **sim = no hardware** — `a2a3sim`/`a5sim` jobs run on github-hosted runners alongside unit tests.
+5. **Skip irrelevant platforms** — `detect-changes` gates hardware jobs so pure a5 PRs skip a2a3 runners and vice versa.
 
 ## Full Job Matrix
 
@@ -17,40 +18,34 @@ The complete test-type × hardware-tier matrix. Empty cells have no tests yet; o
 
 | Category | github-hosted (no hardware) | a2a3 runner | a5 runner |
 | -------- | --------------------------- | ----------- | --------- |
-| **ut-py** | `ut-py` | `ut-py-a2a3` | `ut-py-a5` |
-| **ut-cpp** | `ut-cpp` | `ut-cpp-a2a3` | `ut-cpp-a5` |
-| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-a2a3` | `st-a5` |
+| **ut** (py + cpp) | `ut` | `ut-a2a3` | `ut-a5` |
+| **st** | `st-sim-a2a3`, `st-sim-a5` | `st-onboard-a2a3` | `st-onboard-a5` |
 
 ## GitHub Actions Jobs
 
-Currently active jobs (a5 jobs commented out — no runner yet):
-
 ```text
 PullRequest
-  ├── ut-py                (ubuntu-latest)
-  ├── ut-cpp               (ubuntu-latest)
-  ├── st-sim-a2a3          (ubuntu + macOS)
-  ├── st-sim-a5            (ubuntu + macOS)
-  ├── ut-py-a2a3           (a2a3 self-hosted)
-  ├── ut-cpp-a2a3          (a2a3 self-hosted)
-  ├── st-a2a3              (a2a3 self-hosted)
-  ├── ut-py-a5             (a5 self-hosted, commented out)
-  ├── ut-cpp-a5            (a5 self-hosted, commented out)
-  └── st-a5                (a5 self-hosted, commented out)
+  ├── pre-commit             (ubuntu-latest)
+  ├── packaging-matrix       (ubuntu + macOS)
+  ├── ut                     (ubuntu + macOS)        — Python + C++ UT, no hardware
+  ├── st-sim-a2a3            (ubuntu + macOS)
+  ├── st-sim-a5              (ubuntu + macOS)
+  ├── detect-changes         (ubuntu-latest)         — gates a2a3 + a5 hw jobs
+  ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware
+  ├── st-onboard-a2a3        (a2a3 self-hosted)
+  ├── ut-a5                  (a5 self-hosted)        — Python + C++ UT, a5 hardware
+  └── st-onboard-a5          (a5 self-hosted)
 ```
 
 | Job | Runner | What it runs |
 | --- | ------ | ------------ |
-| `ut-py` | `ubuntu-latest` | `pytest tests/ut` |
-| `ut-cpp` | `ubuntu-latest` | `ctest --test-dir tests/ut/cpp/build -LE requires_hardware` |
+| `ut` | `ubuntu-latest`, `macos-latest` | `pytest tests/ut` + `ctest -LE requires_hardware` |
 | `st-sim-a2a3` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a2a3sim` |
 | `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a5sim` |
-| `ut-py-a2a3` | a2a3 self-hosted | `pytest tests/ut --platform a2a3` |
-| `ut-cpp-a2a3` | a2a3 self-hosted | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$"` |
-| `st-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --device ...` |
-| `ut-py-a5` | a5 self-hosted | `pytest tests/ut --platform a5` |
-| `ut-cpp-a5` | a5 self-hosted | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a5)?$"` |
-| `st-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --device ...` |
+| `ut-a2a3` | a2a3 self-hosted | `pytest tests/ut --platform a2a3` + `ctest -L "^requires_hardware(_a2a3)?$" --resource-spec-file ...` |
+| `st-onboard-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --device ...` |
+| `ut-a5` | a5 self-hosted | `pytest tests/ut --platform a5` + `ctest -L "^requires_hardware(_a5)?$"` |
+| `st-onboard-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --device ...` |
 
 ### Parallel ST runs on hardware
 
@@ -101,8 +96,9 @@ not need `--max-parallel` manually.
 ### Scheduling constraints
 
 - Sim scene tests and no-hardware unit tests run on github-hosted runners (no hardware).
-- `a2a3` tests (st + ut-py + ut-cpp) only run on the `a2a3` self-hosted machine.
-- `a5` tests (st + ut-py + ut-cpp) only run on the `a5` self-hosted machine.
+- `detect-changes` gates all hardware jobs: pure a5 PRs skip a2a3 runners and vice versa.
+- a2a3 tests (st + ut) only run on the `a2a3` self-hosted machine when a2a3-relevant files change.
+- a5 tests (st + ut) only run on the `a5` self-hosted machine when a5-relevant files change.
 
 ## Hardware Classification
 
@@ -110,9 +106,9 @@ Three hardware tiers, applied to all test categories. See [testing.md](testing.m
 
 | Tier | CI Runner | Job examples |
 | ---- | --------- | ------------ |
-| No hardware | `ubuntu-latest` | `ut-py`, `ut-cpp`, `st-sim-*` |
-| Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-py-a2a3`, `ut-cpp-a2a3`, `st-a2a3` |
-| Platform-specific (a5) | `[self-hosted, a5]` | `ut-py-a5`, `ut-cpp-a5`, `st-a5` |
+| No hardware | `ubuntu-latest` | `ut`, `st-sim-*` |
+| Platform-specific (a2a3) | `[self-hosted, a2a3]` | `ut-a2a3`, `st-onboard-a2a3` |
+| Platform-specific (a5) | `[self-hosted, a5]` | `ut-a5`, `st-onboard-a5` |
 
 ## Test Sources
 

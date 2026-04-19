@@ -446,6 +446,42 @@ add_test(NAME test_my_component COMMAND test_my_component)
 # set_tests_properties(test_my_component PROPERTIES LABELS "requires_hardware_a2a3")
 ```
 
+#### C++ hardware tests needing NPU devices
+
+Tests that need specific NPU devices use CTest's [resource allocation](https://cmake.org/cmake/help/latest/prop_test/RESOURCE_GROUPS.html). Declare `RESOURCE_GROUPS` alongside the hardware label:
+
+```cmake
+set_tests_properties(test_hccl_comm PROPERTIES
+    LABELS "requires_hardware_a2a3"
+    RESOURCE_GROUPS "2,npus:1"    # 2 groups × 1 NPU slot each = 2 distinct devices
+)
+```
+
+The CI generates a resource spec file from `${DEVICE_RANGE}` and passes it to ctest:
+
+```bash
+# Generate resource spec (CI does this automatically)
+python3 -c "
+import json
+npus = [{'id': str(i), 'slots': 1} for i in range(8)]
+json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
+          open('resources.json', 'w'))
+"
+
+# Run with resource allocation — CTest assigns devices, no oversubscription
+ctest --test-dir tests/ut/cpp/build \
+    -L "^requires_hardware(_a2a3)?$" \
+    --resource-spec-file resources.json \
+    -j$(nproc) --output-on-failure
+```
+
+CTest passes allocated device ids via environment variables:
+
+- `CTEST_RESOURCE_GROUP_COUNT` — number of groups
+- `CTEST_RESOURCE_GROUP_<n>_NPUS` — `"id:<device_id>,slots:1"` per group
+
+Tests read these to determine which devices to use. See `test_hccl_comm.cpp::read_ctest_devices()` for the parsing pattern.
+
 ### New Scene Test
 
 Create a `test_*.py` file using the `@scene_test` decorator:
