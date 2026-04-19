@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cinttypes>
+#include <cstdlib>
 #include <ctime>
 #include <fstream>
 #include <iomanip>
@@ -77,7 +78,7 @@ void ProfMemoryManager::stop() {
 
     // Drain remaining done_queue and free buffers
     {
-        std::lock_guard<std::mutex> lock(done_mutex_);
+        std::scoped_lock<std::mutex> lock(done_mutex_);
         while (!done_queue_.empty()) {
             CopyDoneInfo info = done_queue_.front();
             done_queue_.pop();
@@ -99,7 +100,7 @@ void ProfMemoryManager::stop() {
 }
 
 bool ProfMemoryManager::try_pop_ready(ReadyBufferInfo &info) {
-    std::lock_guard<std::mutex> lock(ready_mutex_);
+    std::scoped_lock<std::mutex> lock(ready_mutex_);
     if (ready_queue_.empty()) {
         return false;
     }
@@ -121,7 +122,7 @@ bool ProfMemoryManager::wait_pop_ready(ReadyBufferInfo &info, std::chrono::milli
 }
 
 void ProfMemoryManager::notify_copy_done(const CopyDoneInfo &info) {
-    std::lock_guard<std::mutex> lock(done_mutex_);
+    std::scoped_lock<std::mutex> lock(done_mutex_);
     done_queue_.push(info);
 }
 
@@ -210,7 +211,7 @@ void ProfMemoryManager::process_ready_entry(
                 host_ptr = resolve_host_ptr(new_dev_ptr);
             }
             if (new_dev_ptr == nullptr) {
-                std::lock_guard<std::mutex> lock(done_mutex_);
+                std::scoped_lock<std::mutex> lock(done_mutex_);
                 while (!done_queue_.empty()) {
                     CopyDoneInfo dinfo = done_queue_.front();
                     done_queue_.pop();
@@ -258,7 +259,7 @@ void ProfMemoryManager::process_ready_entry(
         info.buffer_seq = seq;
 
         {
-            std::lock_guard<std::mutex> lock(ready_mutex_);
+            std::scoped_lock<std::mutex> lock(ready_mutex_);
             ready_queue_.push(info);
         }
         ready_cv_.notify_one();
@@ -289,7 +290,7 @@ void ProfMemoryManager::process_ready_entry(
                 host_ptr = resolve_host_ptr(new_dev_ptr);
             }
             if (new_dev_ptr == nullptr) {
-                std::lock_guard<std::mutex> lock(done_mutex_);
+                std::scoped_lock<std::mutex> lock(done_mutex_);
                 while (!done_queue_.empty()) {
                     CopyDoneInfo dinfo = done_queue_.front();
                     done_queue_.pop();
@@ -335,7 +336,7 @@ void ProfMemoryManager::process_ready_entry(
         info.buffer_seq = seq;
 
         {
-            std::lock_guard<std::mutex> lock(ready_mutex_);
+            std::scoped_lock<std::mutex> lock(ready_mutex_);
             ready_queue_.push(info);
         }
         ready_cv_.notify_one();
@@ -348,7 +349,7 @@ void ProfMemoryManager::mgmt_loop() {
     while (running_.load()) {
         // 1. Recycle done queue: move completed buffers to recycled pools for reuse
         {
-            std::lock_guard<std::mutex> lock(done_mutex_);
+            std::scoped_lock<std::mutex> lock(done_mutex_);
             while (!done_queue_.empty()) {
                 CopyDoneInfo info = done_queue_.front();
                 done_queue_.pop();
@@ -1159,7 +1160,15 @@ void PerformanceCollector::collect_phase_data() {
     );
 }
 
-int PerformanceCollector::export_swimlane_json(const std::string &output_path) {
+int PerformanceCollector::export_swimlane_json(const std::string &output_path_arg) {
+    // Step 0: Resolve effective output directory. SIMPLER_PERF_OUTPUT_DIR (when set)
+    // overrides the caller-supplied path so the parallel test orchestrator can
+    // give each subprocess its own directory — avoids filename collisions when
+    // two concurrent runs produce a perf_swimlane_*.json with the same
+    // second-precision timestamp. Empty env var is treated as unset.
+    const char *env_dir = std::getenv("SIMPLER_PERF_OUTPUT_DIR");
+    const std::string output_path = (env_dir != nullptr && env_dir[0] != '\0') ? std::string(env_dir) : output_path_arg;
+
     // Step 1: Validate collected data
     bool has_any_records = false;
     for (const auto &core_records : collected_perf_records_) {

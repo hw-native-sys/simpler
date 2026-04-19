@@ -468,6 +468,17 @@ def _project_root() -> Path:
 
 
 def _outputs_dir() -> Path:
+    """Return the directory where perf_swimlane_*.json lands.
+
+    Honors ``SIMPLER_PERF_OUTPUT_DIR`` so the parallel test dispatcher can give each
+    subprocess its own isolated output directory. Absolute paths pass through;
+    relative paths are interpreted against the project root. Empty/unset env
+    var falls back to ``<project>/outputs`` (the historical default).
+    """
+    env = os.environ.get("SIMPLER_PERF_OUTPUT_DIR")
+    if env:
+        p = Path(env)
+        return p if p.is_absolute() else _project_root() / p
     return _project_root() / "outputs"
 
 
@@ -936,6 +947,18 @@ class SceneTestCase:
         enable_profiling=False,
         enable_dump_tensor=False,
     ):
+        # Defensive belt-and-braces: the pytest dispatcher and run_module both
+        # block --enable-profiling for L3 at the CLI boundary. Catch any code
+        # path that reaches here with the flag on anyway (direct API use,
+        # future refactors) so we fail loud rather than produce garbage perf
+        # files. Lift once the runtime embeds device_id in the perf filename.
+        if enable_profiling:
+            raise NotImplementedError(
+                "L3 profiling is not supported yet (multi-chip-process perf "
+                "filename collision). Gate at the CLI level in "
+                "conftest.pytest_collection_modifyitems / scene_test.run_module."
+            )
+
         params = case.get("params", {})
         config_dict = case.get("config", {})
 
@@ -1056,7 +1079,7 @@ class SceneTestCase:
 
         Supports -d as either a single id or a range ("0-7"). When more than
         one device is provided (or any L3 case needs more than its single
-        device), the outer invocation becomes an orchestrator that spawns
+        device), the outer invocation becomes a test dispatcher that spawns
         per-case subprocesses via ``parallel_scheduler``; each child re-enters
         this function in single-group mode via ``--runtime`` + ``--level``.
         """
@@ -1158,7 +1181,7 @@ class SceneTestCase:
         # Keep ``args.device`` as an int for paths that expect a single id
         # (profiling snapshots, device-id binding inside one worker). In child
         # mode this is the single allocated id; in parent mode we use the first
-        # slot but the orchestrator doesn't actually run tests here.
+        # slot but the dispatcher doesn't actually run tests here.
         args.device = device_ids[0]
 
         # Resolve -j (max parallel) — 'auto' is CPU-aware on sim, device-count on hardware.
@@ -1173,14 +1196,10 @@ class SceneTestCase:
             if args.max_parallel < 1:
                 print(f"ERROR: -j must be >= 1, got {args.max_parallel}", file=sys.stderr)
                 sys.exit(2)
-        if args.enable_profiling and args.max_parallel > 1:
-            print(
-                f"ERROR: --enable-profiling is incompatible with --max-parallel {args.max_parallel}; "
-                "profiling writes process-global files that collide under parallelism. "
-                "Either pass '--max-parallel 1' or drop --enable-profiling.",
-                file=sys.stderr,
-            )
-            sys.exit(2)
+        # Note: profiling + parallelism used to be blocked here because perf
+        # files shared a process-global directory. The test dispatcher now scopes
+        # each subprocess to its own SIMPLER_PERF_OUTPUT_DIR so the combination
+        # is safe.
 
         module = sys.modules[module_name]
         test_classes = [
@@ -1213,8 +1232,22 @@ class SceneTestCase:
         for cls, case in selected:
             selected_by_cls.setdefault(cls, []).append(case)
 
+        # L3 profiling not supported yet (multi-chip-process filename collision).
+        # Mirror the pytest-side guard so standalone users get the same early-fail.
+        if args.enable_profiling:
+            l3_classes = sorted(cls.__name__ for cls in selected_by_cls if cls._st_level == 3)
+            if l3_classes:
+                print(
+                    f"ERROR: --enable-profiling is not supported for L3 tests yet — "
+                    f"multi-chip-process filename collision unresolved. "
+                    f"L3 classes selected: {', '.join(l3_classes)}. "
+                    f"Either drop --enable-profiling or scope to L2 with --level 2.",
+                    file=sys.stderr,
+                )
+                sys.exit(2)
+
         # Child mode: both --runtime and --level set. Run inline without
-        # spawning further subprocesses; this is the path orchestrator
+        # spawning further subprocesses; this is the path dispatcher
         # children take after we re-enter run_module.
         child_mode = args.runtime is not None and args.level is not None
 
@@ -1227,7 +1260,7 @@ class SceneTestCase:
             has_multiple_groups = len({(cls._st_runtime, cls._st_level) for cls in selected_by_cls}) > 1
             needs_orchestration = len(device_ids) > 1 or has_multi_dev_case or has_multiple_groups
             if needs_orchestration:
-                ok = _orchestrate_standalone(module_name, selected_by_cls, args)
+                ok = _dispatch_test_phases_standalone(module_name, selected_by_cls, args)
                 sys.exit(0 if ok else 1)
 
         # ----- Inline execution (single group or child mode) -----
@@ -1246,7 +1279,7 @@ class SceneTestCase:
         ok = True
         for (runtime, level), group in by_rt_level.items():
             print(f"\n=== Runtime: {runtime}  Level: {level} ===")
-            worker, per_class_sub_ids = _create_standalone_worker(group, level, args)
+            worker, per_class_sub_ids = _create_standalone_worker(group, level, args, selected_by_cls)
             try:
                 for cls in group:
                     inst = cls()
@@ -1284,12 +1317,12 @@ class SceneTestCase:
         sys.exit(0 if ok else 1)
 
 
-def _orchestrate_standalone(module_name, selected_by_cls, args):  # noqa: PLR0912 -- L3 + L2 phases + chunking + fail-fast
-    """Parent-mode dispatch for run_module.
+def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noqa: PLR0912 -- L3 + L2 phases + chunking + fail-fast
+    """Parent-mode test dispatcher for run_module.
 
-    L3 phase: one subprocess per (class, case), scheduled by device count.
-    L2 phase: for CS2, serial per-(runtime) subprocess on device_ids[0].
-    (CS4 adds device fanout for L2.)
+    L3 phase: one subprocess per class, scheduled by device count.
+    L2 phase: per-runtime fanout — up to max_parallel concurrent subprocesses,
+    each owning one device and running its round-robin chunk of classes.
 
     Returns True on full success, False if any child failed.
     """
@@ -1341,7 +1374,15 @@ def _orchestrate_standalone(module_name, selected_by_cls, args):  # noqa: PLR091
                 "3",
             ]
 
-        l3_jobs.append(Job(label=label, device_count=class_dev_count, build_cmd=_build))
+        # Each L3 class gets its own perf output subdir so two concurrent L3
+        # cases can't collide on a per_swimlane_<second-precision-ts>.json.
+        # Anchor to _project_root() so the C++ runtime (resolved against its
+        # own CWD) and Python post-processing agree on the location.
+        child_env = {
+            **os.environ,
+            "SIMPLER_PERF_OUTPUT_DIR": str(_project_root() / "outputs" / f"perf_l3_{cls.__name__}"),
+        }
+        l3_jobs.append(Job(label=label, device_count=class_dev_count, build_cmd=_build, env=child_env))
 
     l3_failed = False
     if l3_jobs:
@@ -1436,7 +1477,15 @@ def _orchestrate_standalone(module_name, selected_by_cls, args):  # noqa: PLR091
                 return cmd
 
             # device_count=1 for L2 fanout children (each child uses one slot).
-            l2_jobs.append(Job(label=label, device_count=1, build_cmd=_build))
+            # Scope perf output to this fanout child's own subdir so concurrent
+            # L2 children don't collide on the second-precision perf filename.
+            # Absolute path anchored to _project_root() so the C++ runtime and
+            # Python post-processing agree on the filesystem location.
+            child_env = {
+                **os.environ,
+                "SIMPLER_PERF_OUTPUT_DIR": str(_project_root() / "outputs" / f"perf_l2_{rt}_dev{dev}"),
+            }
+            l2_jobs.append(Job(label=label, device_count=1, build_cmd=_build, env=child_env))
 
         # Use the same scheduler: pool=device_ids, fail_fast=exitfirst. This
         # gives us automatic parallelism + SIGTERM on fail-fast.
@@ -1464,15 +1513,28 @@ def _orchestrate_standalone(module_name, selected_by_cls, args):  # noqa: PLR091
             if args.exitfirst:
                 break
 
+    # Flatten per-subprocess outputs/perf_*/ subdirs back to outputs/.
+    # Anchor to _project_root() so flushing works when the user runs a
+    # standalone test from a subdirectory.
+    from .parallel_scheduler import flatten_perf_subdirs  # noqa: PLC0415
+
+    flatten_perf_subdirs(_project_root() / "outputs")
+
     return not (l3_failed or l2_failed)
 
 
-def _create_standalone_worker(group, level, args):
+def _create_standalone_worker(group, level, args, selected_by_cls):
     """Create a Worker for a (runtime, level) group in run_module.
 
     ``level`` is passed explicitly by the caller; do not read it from
     ``group[0]._st_level`` because groups are now keyed on (runtime, level)
     and mixed-level files are allowed.
+
+    ``selected_by_cls`` is the dict of the cases that will actually run (after
+    ``--case`` / ``--manual`` / platform filtering). L3 ``max_devices`` /
+    ``max_sub_workers`` must be computed from these, not from ``cls.CASES``:
+    otherwise a manual case with a larger ``device_count`` inflates the
+    allocation even when it isn't scheduled.
     """
     first_cls = group[0]
     build = getattr(args, "build", False)
@@ -1481,9 +1543,15 @@ def _create_standalone_worker(group, level, args):
 
     from simpler.worker import Worker  # noqa: PLC0415
 
-    max_devices = max((c.get("config", {}).get("device_count", 1) for cls in group for c in cls.CASES), default=1)
-    max_subs = max((c.get("config", {}).get("num_sub_workers", 0) for cls in group for c in cls.CASES), default=0)
-    # Prefer the allocated list (orchestrator child mode), fall back to
+    max_devices = max(
+        (c.get("config", {}).get("device_count", 1) for cls in group for c in selected_by_cls.get(cls, [])),
+        default=1,
+    )
+    max_subs = max(
+        (c.get("config", {}).get("num_sub_workers", 0) for cls in group for c in selected_by_cls.get(cls, [])),
+        default=0,
+    )
+    # Prefer the allocated list (dispatcher child mode), fall back to
     # contiguous range starting at args.device (legacy inline path).
     allocated = getattr(args, "device_ids", None)
     if allocated and len(allocated) >= max_devices:

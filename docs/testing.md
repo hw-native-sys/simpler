@@ -105,7 +105,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--case SEL` | | (all) | Case selector, repeatable: `Foo`, `ClassA::Foo`, `ClassA::` |
 | `--manual` | | `exclude` | `exclude`/`include`/`only` for manual cases |
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
-| `--enable-profiling` | | false | Enable profiling on first round only. Blocked when `--max-parallel > 1`. |
+| `--enable-profiling` | | false | Enable profiling on first round only. Works under parallelism — each subprocess writes to its own `outputs/perf_*/` subdir, flattened back to `outputs/` on completion. |
 | `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
 | `--build` | | false | Compile runtime from source (not pre-built) |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
@@ -142,9 +142,9 @@ Practical guidance when adding a new CLI option:
 
 ## Parallel Test Execution and Resource Reuse
 
-Tests are dispatched through an **orchestrator** that pipelines work along two complementary axes:
+Tests are dispatched through a **test dispatcher** (`conftest.py::_dispatch_test_phases` and `scene_test.py::_dispatch_test_phases_standalone`) that pipelines work along two complementary axes:
 
-1. **Resource reuse** — every `ChipWorker` init costs three `dlopen`s plus a device-context acquire. The orchestrator keeps one worker alive for the lifetime of a test group so every class, case, and round on that device reuses the same worker.
+1. **Resource reuse** — every `ChipWorker` init costs three `dlopen`s plus a device-context acquire. The dispatcher keeps one worker alive for the lifetime of a test group so every class, case, and round on that device reuses the same worker.
 2. **Parallelism** — when `--device` names more than one id, independent work is spread across subprocesses so N devices do N-way work.
 
 Both pytest and standalone (`python test_*.py`) walk the same 6-layer hierarchy:
@@ -201,12 +201,12 @@ python test_foo.py -p a2a3sim --level 2 --runtime tensormap_and_ringbuffer --cas
 
 ### Fail-fast (`-x` / `--exitfirst`)
 
-- Default: all cases run; the orchestrator summarizes pass/fail at the end. This is the right mode for local development — you want every failure surfaced at once.
+- Default: all cases run; the dispatcher summarizes pass/fail at the end. This is the right mode for local development — you want every failure surfaced at once.
 - With `-x` / `--exitfirst`: first failure cancels the pending queue, sends `SIGTERM` to running children, and **skips the L2 phase if L3 failed**. Intended for CI. The short form mirrors pytest's built-in `-x` so the flag behaves identically across pytest and standalone.
 
 ### Device-count constraints
 
-If any L3 case declares `device_count > len(--device pool)` the orchestrator fails the whole batch up front rather than deadlocking the scheduler. Either widen `--device` or reduce the case's `device_count`. When `device_count` exceeds the *currently free* pool (but fits within the total), the case waits for an in-flight job to finish and then claims its slot.
+If any L3 case declares `device_count > len(--device pool)` the dispatcher fails the whole batch up front rather than deadlocking the scheduler. Either widen `--device` or reduce the case's `device_count`. When `device_count` exceeds the *currently free* pool (but fits within the total), the case waits for an in-flight job to finish and then claims its slot.
 
 ### `--device` vs `--max-parallel` (two separate knobs)
 
@@ -220,7 +220,7 @@ On hardware these two concepts collapse: one device = one subprocess's worth of 
 This matters on CPU-constrained CI runners. Example: an L3 case needs `device_count=8` but the runner has 2 CPUs.
 
 - `--device 0-1` — can't run the L3 case; static check fails.
-- `--device 0-15` (no `--max-parallel`) — L3 case fits, but the orchestrator would also spawn 15 concurrent L2 xdist workers and potentially multiple concurrent L3 cases, thrashing the 2 CPUs.
+- `--device 0-15` (no `--max-parallel`) — L3 case fits, but the dispatcher would also spawn 15 concurrent L2 xdist workers and potentially multiple concurrent L3 cases, thrashing the 2 CPUs.
 - `--device 0-15 --max-parallel 2` — L3 case fits in the pool; at most 2 subprocesses run at a time. This is what the `auto` default computes on a 2-core runner.
 
 `--max-parallel` counts top-level subprocesses, like `make -j`. A single L3 case subprocess internally forks N chip-processes for its `device_count`; those forks do **not** count toward `--max-parallel`. One case = one unit regardless of how many devices it uses.
@@ -229,19 +229,24 @@ This matters on CPU-constrained CI runners. Example: an L3 case needs `device_co
 
 A single file can declare both L2 and L3 classes; they're grouped by `(runtime, level)` internally. L3 classes run in the L3 phase (subprocess-per-case), L2 classes run in the L2 phase (shared Worker per device).
 
-### Profiling and parallelism are mutually exclusive
+### Profiling under parallelism
 
-`--enable-profiling` writes process-global files (`outputs/perf_swimlane_*.json` and CANN device logs) that collide under parallel runs. The orchestrator errors out up front when `--max-parallel > 1`. Profile on a single device:
+`--enable-profiling` writes `outputs/perf_swimlane_*.json`; the runtime's filename has second-precision timestamps, so two subprocesses producing perf files in the same second would collide on one path. The dispatcher sidesteps this by giving each subprocess its own directory via the `SIMPLER_PERF_OUTPUT_DIR` env var:
 
-```bash
-pytest tests/st --platform a2a3 --device 0 --enable-profiling
-# Or widen the pool but force serial execution:
-pytest tests/st --platform a2a3 --device 0-7 --max-parallel 1 --enable-profiling
-```
+| Subprocess | Scoped directory |
+| ---------- | ---------------- |
+| xdist worker `gwK` (L2 phase) | `outputs/perf_gwK/` |
+| L3 case (pytest path) | `outputs/perf_l3_<nodeid-sanitized>/` |
+| Standalone L3 class | `outputs/perf_l3_<ClassName>/` |
+| Standalone L2 fanout child | `outputs/perf_l2_<runtime>_dev<N>/` |
 
-### Orchestrator skip conditions (normal pytest runs)
+After all phases drain, `flatten_perf_subdirs()` moves the contents of every `outputs/perf_*/` subdir back to `outputs/` so downstream tools (`swimlane_converter.py`, CI artifact upload) still find everything in one place. Name collisions on the destination keep the first writer and suffix the loser with the subdir tag (e.g. `perf_swimlane_…__gw1.json`) so nothing is silently overwritten.
 
-The orchestrator only takes over when there's actual work to parallelize or isolate. It falls through to plain pytest when:
+The C++ runtime honors `SIMPLER_PERF_OUTPUT_DIR` at `PerformanceCollector::export_swimlane_json` — empty/unset falls through to the caller-supplied path (historical `outputs/` default), so standalone invocations that don't set the env var behave exactly as before.
+
+### Dispatcher skip conditions (normal pytest runs)
+
+The dispatcher only takes over when there's actual work to parallelize or isolate. It falls through to plain pytest when:
 
 - `--collect-only`
 - Only one runtime is present and no L3 cases are collected (single L2 batch)
@@ -557,11 +562,11 @@ When a second runtime launches on the same device (same CANN process context), t
 
 ### Mitigation
 
-The orchestrator spawns a separate subprocess per runtime for L2 work and a separate subprocess per case for L3 work. Every subprocess starts from a clean CANN state, so the stale-`.so` hang is structurally impossible.
+The dispatcher spawns a separate subprocess per runtime for L2 work and a separate subprocess per class for L3 work. Every subprocess starts from a clean CANN state, so the stale-`.so` hang is structurally impossible.
 
 ## Device Allocation (Orchestrator + xdist)
 
-When running `pytest --platform a2a3 --device 8-11`, the orchestrator does this:
+When running `pytest --platform a2a3 --device 8-11`, the dispatcher does this:
 
 ### L3 phase — device bin-packing
 
@@ -589,7 +594,7 @@ Standalone (`python test_*.py -d 8-11`) uses the same scheduler module: classes 
 
 ### Sim platforms
 
-On sim (`a2a3sim`, `a5sim`), device IDs are virtual — no hardware state, no isolation constraint. All tests share a single virtual pool with auto-incrementing IDs. The same orchestrator + xdist path is used; speedup on sim comes from actual CPU parallelism, not hardware parallelism.
+On sim (`a2a3sim`, `a5sim`), device IDs are virtual — no hardware state, no isolation constraint. All tests share a single virtual pool with auto-incrementing IDs. The same dispatcher + xdist path is used; speedup on sim comes from actual CPU parallelism, not hardware parallelism.
 
 ## Per-Case Device Filtering
 

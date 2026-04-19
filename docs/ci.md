@@ -55,7 +55,7 @@ PullRequest
 ### Parallel ST runs on hardware
 
 For self-hosted jobs with multiple NPUs, pass a `--device` range (and
-optionally pytest's `-x` for fail-fast) to get the full orchestrator
+optionally pytest's `-x` for fail-fast) to get the full dispatcher
 benefit — device bin-packing for L3, xdist fanout for L2, and a shared
 `ChipWorker` per `(runtime, device)`:
 

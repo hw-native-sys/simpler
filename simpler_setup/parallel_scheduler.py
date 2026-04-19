@@ -10,7 +10,7 @@
 
 Given a list of jobs, each declaring how many devices it needs, this module
 runs them as isolated subprocesses in parallel up to the device pool's
-capacity. Used by the pytest orchestrator (conftest.py) and the standalone
+capacity. Used by the pytest test dispatcher (conftest.py) and the standalone
 runner (scene_test.run_module) to parallelize Level-3 test cases.
 
 Concurrency bound: the caller's ``device_ids`` list size. No separate
@@ -308,3 +308,49 @@ def device_range_to_list(spec: str) -> list[int]:
 def format_device_range(ids: list[int]) -> str:
     """Inverse of device_range_to_list — public wrapper around _device_range_str."""
     return _device_range_str(ids)
+
+
+def flatten_perf_subdirs(outputs_dir: str | os.PathLike = "outputs") -> int:
+    """Move files from ``outputs/perf_*`` subdirs back up to ``outputs/``.
+
+    The test dispatcher scopes each subprocess's ``SIMPLER_PERF_OUTPUT_DIR`` to a
+    distinct ``outputs/perf_<tag>/`` subdir so concurrent perf file writes
+    can't collide on second-precision filenames. After all phases drain,
+    call this to flatten the subdirs back to the historical ``outputs/``
+    layout so downstream tools (swimlane_converter.py stand-alone, artifact
+    uploaders) still find everything in one place.
+
+    - Files are moved (not copied); empty subdirs are removed.
+    - Filename collisions on the destination keep the first writer and prefix
+      the loser with the subdir tag, so nothing is silently overwritten.
+
+    Returns the number of files moved.
+    """
+    import shutil  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    root = Path(outputs_dir)
+    if not root.exists():
+        return 0
+    moved = 0
+    for sub in sorted(root.glob("perf_*")):
+        if not sub.is_dir():
+            continue
+        tag = sub.name[len("perf_") :] if sub.name.startswith("perf_") else sub.name
+        for f in list(sub.iterdir()):
+            if not f.is_file():
+                continue
+            dest = root / f.name
+            if dest.exists():
+                dest = root / f"{dest.stem}__{tag}{dest.suffix}"
+            try:
+                shutil.move(str(f), str(dest))
+                moved += 1
+            except OSError:
+                pass
+        # Remove the subdir if now empty; tolerate non-empty (e.g. nested dirs).
+        try:
+            sub.rmdir()
+        except OSError:
+            pass
+    return moved

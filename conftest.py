@@ -208,7 +208,7 @@ def pytest_configure(config):
         _install_session_timeout(timeout)
 
     # xdist worker: bind this process to a single device id from the --device range.
-    # The orchestrator (or the user) supplies --device 0-7; xdist spawns N workers
+    # The dispatcher (or the user) supplies --device 0-7; xdist spawns N workers
     # labelled gw0..gwN-1. We slice device_ids[worker_index] so each worker owns
     # exactly one device. L2 Worker is session-scoped inside xdist children, so
     # all tests on this worker share one ChipWorker init().
@@ -222,32 +222,23 @@ def pytest_configure(config):
         ids = _parse_device_range(device_spec)
         if 0 <= idx < len(ids):
             config.option.device = str(ids[idx])
+        # Each xdist worker gets its own perf output dir so parallel profiling
+        # runs don't fight over the same perf_swimlane_*.json filename (the
+        # runtime's timestamp is second-precision). Anchor to config.rootpath
+        # so the C++ runtime (which resolves the path against its own CWD) and
+        # Python post-processing always point at the same filesystem location
+        # regardless of where pytest was invoked. Only set if the parent
+        # hasn't already scoped us into a subprocess dir.
+        if "SIMPLER_PERF_OUTPUT_DIR" not in os.environ:
+            os.environ["SIMPLER_PERF_OUTPUT_DIR"] = str(config.rootpath / "outputs" / f"perf_{worker_id}")
         # else: more xdist workers than devices — fall through with original range;
         # DevicePool will fail clearly if the test tries to allocate.
 
-    # Parallel + profiling is unsafe (perf files are process-global). Block it
-    # at the parent (non-xdist-worker) level. What matters is concurrent
-    # subprocess count, not device pool size — respect -j.
-    if config.getoption("--enable-profiling", default=False) and not worker_id:
-        device_spec = config.getoption("--device", default="0")
-        ids = _parse_device_range(device_spec)
-        platform = config.getoption("--platform", default="") or ""
-        raw_j = config.getoption("--max-parallel", default="auto")
-        if raw_j in (None, "", "auto"):
-            from simpler_setup.parallel_scheduler import default_max_parallel  # noqa: PLC0415
-
-            j = default_max_parallel(platform, ids)
-        else:
-            try:
-                j = max(1, int(raw_j))
-            except (TypeError, ValueError):
-                j = 1
-        if j > 1:
-            raise pytest.UsageError(
-                f"--enable-profiling is incompatible with --max-parallel {j}; "
-                "profiling writes process-global files that collide under "
-                "parallelism. Either pass '--max-parallel 1' or drop --enable-profiling."
-            )
+    # Note: profiling + parallelism used to be blocked here because perf files
+    # shared a process-global directory. The test dispatcher now scopes each
+    # subprocess to its own SIMPLER_PERF_OUTPUT_DIR (see _dispatch_test_phases and
+    # the xdist slicing above) and flatten_perf_subdirs reassembles outputs/
+    # at the end, so the combination is now safe.
 
 
 def pytest_collection_modifyitems(session, config, items):
@@ -265,7 +256,7 @@ def pytest_collection_modifyitems(session, config, items):
     if target_nodeid:
         for item in items:
             if item.nodeid != target_nodeid:
-                item.add_marker(pytest.mark.skip(reason=f"orchestrator target is {target_nodeid}"))
+                item.add_marker(pytest.mark.skip(reason=f"dispatcher target is {target_nodeid}"))
 
     # Sort: L3 tests first (they fork child processes that inherit main process CANN state,
     # so they must run before L2 tests pollute the CANN context).
@@ -305,11 +296,32 @@ def pytest_collection_modifyitems(session, config, items):
         if runtime_marker and runtime_marker.args and runtime_filter and runtime_marker.args[0] != runtime_filter:
             item.add_marker(pytest.mark.skip(reason=f"Runtime {runtime_marker.args[0]} != {runtime_filter}"))
 
+    # L3 profiling is not supported yet: a single L3 case forks N chip-processes
+    # that all write perf_swimlane_<ts>.json to the same directory with
+    # second-precision timestamps, so they trample each other. Block the
+    # combination up front; waiting for a proper device-id-in-filename fix.
+    if config.getoption("--enable-profiling", default=False):
+        l3_items = [
+            i
+            for i in items
+            if getattr(getattr(i, "cls", None), "_st_level", None) == 3
+            and not any(m.name == "skip" for m in i.iter_markers())
+        ]
+        if l3_items:
+            sample = ", ".join(sorted({i.nodeid for i in l3_items})[:3])
+            more = "" if len(l3_items) <= 3 else f" (+{len(l3_items) - 3} more)"
+            raise pytest.UsageError(
+                f"--enable-profiling is not supported for L3 tests yet — "
+                f"multi-chip-process filename collision unresolved. "
+                f"L3 items in this session: {sample}{more}. "
+                f"Either drop --enable-profiling or scope to L2 with --level 2."
+            )
+
 
 # ---------------------------------------------------------------------------
-# Orchestrator: L3 phase (device-aware parallel subprocesses) + L2 phase
+# Test dispatcher: L3 phase (device-aware parallel subprocesses) + L2 phase
 # (per-runtime subprocess). Activated only when neither --runtime nor --level
-# is set by the caller. Orchestrator-spawned children set both, so they fall
+# is set by the caller. Dispatcher-spawned children set both, so they fall
 # through to pytest's default runtestloop without recursing.
 # ---------------------------------------------------------------------------
 
@@ -389,7 +401,7 @@ def _resolve_max_parallel(cfg, platform: str, device_ids: list[int]) -> int:
     return val
 
 
-def _orchestrate(session):
+def _dispatch_test_phases(session):
     """Run L3 phase (device-parallel) then L2 phase (per-runtime subprocess)."""
     from simpler_setup import parallel_scheduler as _ps  # noqa: PLC0415
 
@@ -428,7 +440,18 @@ def _orchestrate(session):
             # nodeid — defends against inherited positional args (``examples``,
             # ``tests/st``) collecting unrelated classes whose fixtures would
             # then fire at setup and fail on the narrower child device pool.
-            child_env = {**os.environ, "PTO_TARGET_NODEID": nodeid}
+            # SIMPLER_PERF_OUTPUT_DIR scopes this L3 case's perf files to its own
+            # subdir so concurrent L3 cases can't collide on filename (the
+            # runtime's timestamp is second-precision). Anchor to cfg.rootpath
+            # so the C++ runtime and Python post-processing agree regardless
+            # of the child's CWD. Use a nodeid-derived sanitized label so the
+            # dir name stays readable for post-mortem.
+            safe_nodeid = nodeid.replace("/", "_").replace(":", "_").replace(".", "_")
+            child_env = {
+                **os.environ,
+                "PTO_TARGET_NODEID": nodeid,
+                "SIMPLER_PERF_OUTPUT_DIR": str(cfg.rootpath / "outputs" / f"perf_l3_{safe_nodeid}"),
+            }
             jobs.append(_ps.Job(label=label, device_count=dev_count, build_cmd=_build, cwd=str(cwd), env=child_env))
 
         def _on_done(res):
@@ -504,6 +527,13 @@ def _orchestrate(session):
         else:
             print(f"\n--- L2 runtime {rt}: PASSED ---\n", flush=True)
 
+    # Flatten per-subprocess outputs/perf_*/ subdirs back to outputs/ so
+    # downstream tools (swimlane_converter.py, CI artifact upload) find
+    # everything in the historical location. Anchor to config.rootpath (not
+    # invocation_params.dir) so a user running pytest from a subdirectory
+    # still flushes files into the project's top-level outputs/.
+    _ps.flatten_perf_subdirs(cfg.rootpath / "outputs")
+
     session.testsfailed = 1 if (l3_failed or l2_failed) else 0
     if not (l3_failed or l2_failed):
         session.testscollected = sum(1 for _ in session.items)
@@ -511,15 +541,15 @@ def _orchestrate(session):
 
 
 def pytest_runtestloop(session):
-    """Orchestrate L3+L2 phases unless caller is already in child mode.
+    """Dispatch L3+L2 phases unless caller is already in child mode.
 
     Child mode (both --runtime and --level set, or --collect-only) skips the
-    orchestrator and falls through to pytest's default runtestloop.
+    dispatcher and falls through to pytest's default runtestloop.
     """
     runtime_filter = session.config.getoption("--runtime")
     level_filter = session.config.getoption("--level")
 
-    # Child mode: the orchestrator's spawned subprocesses carry both flags.
+    # Child mode: the dispatcher's spawned subprocesses carry both flags.
     if runtime_filter is not None and level_filter is not None:
         return
 
@@ -531,16 +561,16 @@ def pytest_runtestloop(session):
     if not session.items:
         return
 
-    # If only L2 items exist in a single runtime, the orchestrator reduces to a
+    # If only L2 items exist in a single runtime, the dispatcher reduces to a
     # single L2 subprocess — not worth the extra fork overhead vs. letting
-    # pytest run directly. Skip orchestration in that trivial case.
+    # pytest run directly. Skip dispatching in that trivial case.
     level_filter_explicit = level_filter is not None
     runtimes_all = _collect_st_runtimes(session.items)
     has_l3 = any(getattr(getattr(i, "cls", None), "_st_level", None) == 3 for i in session.items)
     if not has_l3 and len(runtimes_all) <= 1 and not level_filter_explicit:
         return
 
-    return _orchestrate(session)
+    return _dispatch_test_phases(session)
 
 
 # ---------------------------------------------------------------------------
