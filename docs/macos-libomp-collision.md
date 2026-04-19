@@ -2,11 +2,11 @@
 
 ## TL;DR
 
-On macOS, `ci.py` would crash with `OMP: Error #15 ... libomp.dylib already initialized` (SIGABRT, every task fails before any runtime code runs) because two different `libomp.dylib` copies get loaded into the same Python process — one via `numpy → openblas`, one via `torch`. We work around this at the top of `ci.py` by setting `KMP_DUPLICATE_LIB_OK=TRUE` before any import that can pull in numpy or torch. This doc exists so the next person who touches sim CI does not re-investigate the same rabbit hole.
+On macOS, sim CI crashes with `OMP: Error #15 ... libomp.dylib already initialized` (SIGABRT, every task fails before any runtime code runs) because two different `libomp.dylib` copies get loaded into the same Python process — one via `numpy → openblas`, one via `torch`. We work around this at the top of the root `conftest.py` by setting `KMP_DUPLICATE_LIB_OK=TRUE` before pytest collects any golden. This doc exists so the next person who touches sim CI does not re-investigate the same rabbit hole.
 
 ## Symptom
 
-Running `python ci.py -p a2a3sim` (or `a5sim`) on macOS produces, for **every** task:
+Running `pytest examples tests/st --platform a2a3sim` (or `a5sim`) on macOS produces, for **every** task:
 
 ```text
 OMP: Error #15: Initializing libomp.dylib, but found libomp.dylib already initialized.
@@ -18,7 +18,7 @@ Exit code of the spawned worker is `134` (SIGABRT). The failure happens during g
 
 ## Root Cause
 
-Two distinct `libomp.dylib` copies get mapped into the single Python process used by `ci.py`:
+Two distinct `libomp.dylib` copies get mapped into the Python process that pytest (or its xdist worker) uses to collect and execute scene tests:
 
 1. **Homebrew's libomp** — `/opt/homebrew/opt/libomp/lib/libomp.dylib`, pulled in by the chain:
    `numpy → openblas (/opt/homebrew/opt/openblas/lib/libopenblas.0.dylib) → libomp`
@@ -45,11 +45,9 @@ OMP: Error #15: Initializing libomp.dylib, but found libomp.dylib already initia
 
 Any golden importing `torch` after another golden has already imported `numpy` (or vice versa) is enough — and `import torch` transitively imports numpy, so even "all goldens use torch" does not avoid it.
 
-## Why It Surfaced Now
+## Why It Surfaces
 
-Before commit `a90b0a2` ("run sim CI in single subprocess with parallel workers"), `run_sim_tasks_subprocess` launched one fresh Python subprocess **per runtime group**. Each subprocess had a clean interpreter and only loaded its own goldens, so numpy and torch rarely coexisted in the same process, and the conflict almost never manifested.
-
-After `a90b0a2`, all tasks run in one persistent process via `_run_device_worker_subprocess` plus parallel worker threads. Per-golden `import numpy` / `import torch` calls accumulate and the second libomp eventually tries to initialize.
+Sim CI collects every scene test into a single pytest process (or, post xdist introduction, a handful of long-lived xdist workers). Each scene test's golden issues `import numpy` and/or `import torch` at collection or execution time, and those imports accumulate inside the same interpreter. Once both a numpy-triggered libomp and a torch-triggered libomp end up resident, Intel's OMP runtime aborts the process.
 
 ## Why Linux Does Not Hit This
 
@@ -57,7 +55,7 @@ On Linux, homebrew is not typical; `numpy` and `torch` are usually both pip-inst
 
 ## Mitigation
 
-At the very top of `ci.py` — before any `import` that might transitively load numpy or torch — we set:
+Near the top of the repo-root `conftest.py` — after the small stdlib imports, but **before** `import pytest` and before pytest begins collecting test files (which transitively `import numpy` / `import torch` through goldens) — we set:
 
 ```python
 if sys.platform == "darwin":
@@ -96,7 +94,7 @@ Neither risk applies to our workload: the goldens use numpy/torch only for rando
    otool -D .venv/lib/python3.14/site-packages/torch/lib/libomp.dylib
    ```
 
-4. Confirm the `ci.py` preamble still sets `KMP_DUPLICATE_LIB_OK` *before* any import that could pull numpy/torch — someone refactoring imports may accidentally put `import numpy` above the `os.environ.setdefault` line.
+4. Confirm the root `conftest.py` still sets `KMP_DUPLICATE_LIB_OK` *before* `import pytest` and before any test file gets collected — someone refactoring imports may accidentally put a numpy/torch-pulling import above the `os.environ.setdefault` line. Standalone `python test_*.py` entry points bypass conftest, so they rely on the same env var being set by the user or the parent shell on macOS.
 
 ## References
 

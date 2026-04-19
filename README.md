@@ -9,11 +9,11 @@ Modular runtime for building and executing task dependency graphs on Ascend devi
 git clone <repo-url>
 cd simpler
 
+# Install (venv recommended — see `.claude/rules/venv-isolation.md`)
+pip install --no-build-isolation -e '.[test]'
+
 # Run the vector example (simulation, no hardware required)
-python examples/scripts/run_example.py \
-  -k examples/a2a3/host_build_graph/vector_example/kernels \
-  -g examples/a2a3/host_build_graph/vector_example/golden.py \
-  -p a2a3sim
+python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3sim
 ```
 
 PTO ISA headers are automatically cloned on first run. See [Getting Started](docs/getting-started.md) for manual setup and troubleshooting.
@@ -42,14 +42,14 @@ See runtime docs per arch: [a2a3](src/a2a3/docs/runtimes.md), [a5](src/a5/docs/r
 ## Testing
 
 ```bash
-# Simulation tests (no hardware)
-./ci.sh -p a2a3sim
+# Simulation scene tests (no hardware)
+pytest examples tests/st --platform a2a3sim
 
-# Hardware tests (requires Ascend device)
-./ci.sh -p a2a3 -d 4-7 --parallel
+# Hardware scene tests (requires Ascend device)
+pytest examples tests/st --platform a2a3 --device 4-7
 
 # Python unit tests
-pytest tests -m "not requires_hardware" -v
+pytest tests/ut -m "not requires_hardware" -v
 
 # C++ unit tests
 cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build && ctest --test-dir tests/ut/cpp/build --output-on-failure
@@ -94,5 +94,5 @@ This project is licensed under the **CANN Open Software License Agreement Versio
 - [src/a2a3/platform/](src/a2a3/platform/) - Platform implementations
 - [src/a2a3/runtime/](src/a2a3/runtime/) - Runtime implementations
 - [examples/a2a3/](examples/a2a3/) - Examples organized by runtime
-- [examples/scripts/](examples/scripts/) - Test framework
-- [python/](python/) - Python bindings and compiler
+- [simpler_setup/](simpler_setup/) - SceneTestCase framework, runtime builder, kernel compiler
+- [python/](python/) - Python bindings and user-facing runtime API

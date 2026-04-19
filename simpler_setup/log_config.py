@@ -8,10 +8,10 @@
 # -----------------------------------------------------------------------------------------------------------
 """Shared CLI log-level helper.
 
-Used by ci.py, examples/scripts/run_example.py, and SceneTestCase.run_module
-(python test_*.py) so every entry point wires `--log-level` the same way and
-defaults to INFO. Also propagates via `PTO_LOG_LEVEL` env var so subprocesses
-spawned by ci.py's runtime-isolation inherit the level.
+Used by SceneTestCase.run_module (`python test_*.py`) so the standalone entry
+point wires `--log-level` the same way as the rest of the codebase and defaults
+to INFO. Also propagates via `PTO_LOG_LEVEL` env var so subprocesses spawned
+by the parallel scheduler inherit the level.
 
 pytest is intentionally not touched — it has its own `--log-cli-level` and
 pyproject `log_cli_level` knobs.

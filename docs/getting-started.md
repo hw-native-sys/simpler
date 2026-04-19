@@ -23,30 +23,26 @@ The test framework automatically handles PTO_ISA_ROOT setup:
 Just run your example - pto-isa will be cloned automatically on first run:
 
 ```bash
-python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_example/kernels \
-                                       -g examples/a2a3/host_build_graph/vector_example/golden.py \
-                                       -p a2a3sim
+python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3sim
 ```
 
 By default, the auto-clone uses SSH (`git@github.com:...`). In CI or environments without SSH keys, use `--clone-protocol https`:
 
 ```bash
-python examples/scripts/run_example.py -k examples/a2a3/host_build_graph/vector_example/kernels \
-                                       -g examples/a2a3/host_build_graph/vector_example/golden.py \
-                                       -p a2a3sim --clone-protocol https
+pytest examples --platform a2a3sim --clone-protocol https
 ```
 
 **Manual Setup** (if auto-setup fails or you prefer manual control):
 
 ```bash
-mkdir -p examples/scripts/_deps
-git clone --branch main git@github.com:PTO-ISA/pto-isa.git examples/scripts/_deps/pto-isa
+mkdir -p build
+git clone --branch main git@github.com:PTO-ISA/pto-isa.git build/pto-isa
 
 # Or use HTTPS
-git clone --branch main https://github.com/PTO-ISA/pto-isa.git examples/scripts/_deps/pto-isa
+git clone --branch main https://github.com/PTO-ISA/pto-isa.git build/pto-isa
 
 # Set environment variable (optional - auto-detected if in standard location)
-export PTO_ISA_ROOT=$(pwd)/examples/scripts/_deps/pto-isa
+export PTO_ISA_ROOT=$(pwd)/build/pto-isa
 ```
 
 **Using a Different Location:**
@@ -130,16 +126,13 @@ host_binary = compiler.compile("host", include_dirs, source_dirs)        # → .
 
 ```bash
 # Simulation platform (no hardware required)
-python examples/scripts/run_example.py \
-  -k examples/a2a3/host_build_graph/vector_example/kernels \
-  -g examples/a2a3/host_build_graph/vector_example/golden.py \
-  -p a2a3sim
+python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3sim
 
 # Hardware platform (requires Ascend device)
-python examples/scripts/run_example.py \
-  -k examples/a2a3/host_build_graph/vector_example/kernels \
-  -g examples/a2a3/host_build_graph/vector_example/golden.py \
-  -p a2a3
+python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3 -d 0
+
+# Or as a pytest batch:
+pytest examples/a2a3/host_build_graph/vector_example --platform a2a3sim
 ```
 
 Expected output:
@@ -208,7 +201,7 @@ RUNTIME_CONFIG = {
 Device selection is done via CLI flag:
 
 ```bash
-python examples/scripts/run_example.py -k <kernels> -g <golden.py> -p a2a3 --device 0
+python examples/a2a3/host_build_graph/vector_example/test_vector_example.py -p a2a3 --device 0
 ```
 
 ## Notes

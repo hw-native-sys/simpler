@@ -22,7 +22,8 @@ The 4 files `kernel_compiler.py`, `runtime_compiler.py`, `toolchain.py`, `elf_pa
 
 | What | Where |
 | ---- | ----- |
-| Runtime selection | `kernel_config.py` → `RUNTIME_CONFIG.runtime` |
+| Runtime selection | `@scene_test(runtime="...")` on the SceneTestCase class |
+| Per-case knobs (aicpu_thread_num, block_dim) | `CASES[*]["config"]` on the SceneTestCase class |
 | Per-runtime build config | `src/{arch}/runtime/{runtime}/build_config.py` |
 | Runtime build orchestration | `simpler_setup/runtime_builder.py` → `simpler_setup/runtime_compiler.py` → cmake |
 | Pre-build all runtimes | `examples/scripts/build_runtimes.py` (invoked by `pip install .`) |
@@ -37,14 +38,13 @@ The 4 files `kernel_compiler.py`, `runtime_compiler.py`, `toolchain.py`, `elf_pa
 
 ```text
 my_example/
-  golden.py              # generate_inputs() + compute_golden()
+  test_my_example.py     # @scene_test class (CALLABLE + CASES + generate_args + compute_golden)
   kernels/
-    kernel_config.py     # KERNELS list + ORCHESTRATION dict + RUNTIME_CONFIG
     aic/                 # AICore kernel sources (optional)
     aiv/                 # AIV kernel sources (optional)
     orchestration/       # Orchestration C++ source
 ```
 
-Run with: `python examples/scripts/run_example.py -k <kernels_dir> -g <golden.py> -p <platform>`
+Run via pytest: `pytest examples tests/st --platform <platform>`, or standalone: `python <example_or_test>/test_*.py -p <platform>`.
 
 Add `--build` to recompile runtime from source (incremental). Without it, pre-built binaries from `build/lib/` are used. See [docs/developer-guide.md](../../docs/developer-guide.md#build-workflow) for the full rebuild decision table.

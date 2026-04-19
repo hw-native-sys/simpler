@@ -12,7 +12,7 @@ PTO2 (Parallel Task Orchestration v2) is a runtime system for executing task gra
 ```text
 ┌───────────────────────────────────────────────────────────────────────┐
 │                            Host (CPU)                                 │
-│  golden.py → code_runner.py → compile kernels → init Runtime          │
+│  test_*.py (SceneTestCase) → compile kernels → init Runtime           │
 │  → upload binaries → launch AICPU/AICore → collect results            │
 └───────────────────────────┬───────────────────────────────────────────┘
                             │ device memory / GM

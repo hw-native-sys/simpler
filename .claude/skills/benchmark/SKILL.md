@@ -92,10 +92,10 @@ Pick devices with **HBM-Usage = 0**. Find the longest consecutive sub-range (at 
 Extract pinned commit from `.github/workflows/ci.yml`:
 
 ```bash
-PTO_ISA_COMMIT=$(grep -oP '(?<=-c )\w+' .github/workflows/ci.yml | head -1)
+PTO_ISA_COMMIT=$(grep -oP '(?<=--pto-isa-commit )\w+' .github/workflows/ci.yml | head -1)
 ```
 
-Append `-c $PTO_ISA_COMMIT` to benchmark args so `run_example.py` picks it up.
+Append `-c $PTO_ISA_COMMIT` to benchmark args so the underlying `python test_*.py` invocation picks it up.
 
 ## Step 4: Prepare — Compute Absolute Paths
 
@@ -137,7 +137,7 @@ The worktree is a fresh checkout at merge-base — it has **no pre-built runtime
 1. **Runtime `.so` binaries** (`build/lib/`) — loaded via ctypes by `bindings.py`
 2. **Nanobind `_task_interface` extension** — compiled C++ Python bindings
 
-Pure Python files (`bindings.py`, `code_runner.py`) are resolved via `sys.path` relative to `run_example.py`'s `__file__`, so they correctly come from the worktree. But `_task_interface.*.so` is installed into site-packages by `pip install -e .` and is **shared system-wide**. Without isolation, the worktree would use the main workspace's nanobind extension — which may have incompatible API changes.
+Pure Python files under `simpler_setup/` (e.g. `scene_test.py`, `kernel_compiler.py`) are resolved via `sys.path` from the worktree when an editable install is active there, so they correctly come from the worktree. But `_task_interface.*.so` is installed into site-packages by `pip install -e .` and is **shared system-wide**. Without isolation, the worktree would use the main workspace's nanobind extension — which may have incompatible API changes.
 
 **Solution: always create a venv in the worktree** (~26s overhead). This builds both the nanobind extension AND runtime binaries, fully isolating the baseline.
 

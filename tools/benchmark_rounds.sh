@@ -19,7 +19,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-RUN_EXAMPLE="$PROJECT_ROOT/examples/scripts/run_example.py"
 
 # ---------------------------------------------------------------------------
 # Examples to benchmark and their case lists, per runtime.
@@ -93,10 +92,11 @@ Options:
   -d, --device   Device ID (default: 0)
   -n, --rounds   Override number of rounds for each example (default: 100)
   -r, --runtime  Runtime to benchmark: tensormap_and_ringbuffer (default), aicpu_build_graph
-  -v, --verbose  Save detailed run_example.py output to a timestamped log file
+  -v, --verbose  Save detailed test_*.py output to a timestamped log file
   -h, --help     Show this help
 
-All other options are passed through to run_example.py (e.g. --case).
+All other options are passed through to the underlying `python test_*.py`
+invocation (e.g. --case).
 
 Edit the EXAMPLE_CASES map at the top of this script to control which
 examples and cases to benchmark.
@@ -163,7 +163,7 @@ case "$RUNTIME" in
 esac
 
 # ---------------------------------------------------------------------------
-# Resolve device log directory (mirrors run_example.py / device_log_resolver.py)
+# Resolve device log directory (mirrors simpler_setup/device_log_resolver.py)
 # ---------------------------------------------------------------------------
 if [[ -n "${ASCEND_WORK_PATH:-}" ]]; then
     LOG_ROOT="$ASCEND_WORK_PATH/log/debug"
@@ -371,8 +371,8 @@ wait_for_new_log() {
 
 # ---------------------------------------------------------------------------
 # run_bench <example> <example_dir> [case_name]
-#   Run one benchmark invocation and parse timing from the resulting log.
-#   Prefers test_*.py (new SceneTestCase entry), falls back to run_example.py (legacy).
+#   Run one benchmark invocation (via `python test_*.py`) and parse timing
+#   from the resulting log. Skips the example if it has no test_*.py.
 #   Sets global PASS / FAIL counters.
 # ---------------------------------------------------------------------------
 run_bench() {
@@ -388,7 +388,7 @@ run_bench() {
     trap 'rm -f -- "$pre_log_file"' RETURN
     ls -1 "$DEVICE_LOG_DIR"/*.log 2>/dev/null | sort > "$pre_log_file" || true
 
-    # Build run command: prefer test_*.py, fall back to run_example.py
+    # Build run command using test_*.py
     local test_file
     test_file=$(find "$example_dir" -maxdepth 1 -name 'test_*.py' -print -quit 2>/dev/null || true)
 
@@ -400,14 +400,8 @@ run_bench() {
             --rounds "$ROUNDS" --skip-golden
         )
     else
-        local kernels_dir="$example_dir/kernels"
-        local golden="$example_dir/golden.py"
-        run_cmd=(
-            python3 "$RUN_EXAMPLE"
-            -k "$kernels_dir" -g "$golden"
-            -p "$PLATFORM" -d "$DEVICE_ID"
-            -n "$ROUNDS" --skip-golden
-        )
+        echo "  SKIPPED: no test_*.py found in $example_dir"
+        return
     fi
     if [[ -n "$case_name" ]]; then
         run_cmd+=(--case "$case_name")

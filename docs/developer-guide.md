@@ -52,12 +52,8 @@ pto-runtime/
 │   └── _assets/                       # (wheel only) src/ + build/lib/ shipped with wheel
 │
 ├── examples/                          # Working examples
-│   ├── scripts/                       # Build and test framework
-│   │   ├── run_example.py             # Run a single example
-│   │   ├── code_runner.py             # Example execution engine
-│   │   ├── runtime_builder.py         # [legacy shim — prefer simpler_setup.runtime_builder]
-│   │   ├── build_runtimes.py          # Pre-build all runtime variants
-│   │   └── platform_info.py           # [legacy shim — prefer simpler_setup.platform_info]
+│   ├── scripts/
+│   │   └── build_runtimes.py          # Pre-build all runtime variants (invoked by pip install)
 │   └── {arch}/                        # Architecture-specific examples
 │       ├── host_build_graph/
 │       ├── aicpu_build_graph/
@@ -153,15 +149,15 @@ Every example and device test follows this structure:
 
 ```text
 my_example/
-  golden.py              # generate_inputs() + compute_golden()
+  test_my_example.py     # @scene_test class (CALLABLE + CASES + generate_args + compute_golden)
   kernels/
-    kernel_config.py     # KERNELS list + ORCHESTRATION dict + RUNTIME_CONFIG
     aic/                 # AICore kernel sources (optional)
     aiv/                 # AIV kernel sources (optional)
     orchestration/       # Orchestration C++ source
 ```
 
-Run with: `python examples/scripts/run_example.py -k <kernels_dir> -g <golden.py> -p <platform>`
+Run via pytest (`pytest examples tests/st --platform <platform>`) or standalone
+(`python test_my_example.py -p <platform>`).
 
 ## Build Workflow
 
@@ -189,23 +185,24 @@ If startup latency becomes painful, run `unset SKBUILD_EDITABLE_REBUILD` before 
 | What changed | Action |
 | ------------ | ------ |
 | First time / clean checkout | `pip install --no-build-isolation -e .` |
-| Runtime C++ source (`src/{arch}/runtime/`, `src/{arch}/platform/`) | Pass `--build` to `run_example.py` (incremental, ~1-2s); editable rebuild does **not** cover this (runtime cmake is decoupled from the top-level cmake target) |
+| Runtime C++ source (`src/{arch}/runtime/`, `src/{arch}/platform/`) | Pass `--build` to a standalone `python test_*.py` invocation (incremental, ~1-2s); editable rebuild does **not** cover this (runtime cmake is decoupled from the top-level cmake target). For pytest batch runs, pass `--build` at the pytest CLI. |
 | Nanobind bindings (`python/bindings/`) | Auto-rebuilt on next import (`editable.rebuild = true`) |
 | Python-only code (`python/*.py`, `simpler_setup/*.py`, `examples/scripts/*.py`) | No rebuild needed (editable install) |
 | Examples / kernels (`examples/{arch}/`, `tests/st/`) | No rebuild needed, just re-run |
 
 ### The `--build` flag
 
-By default, `run_example.py` loads pre-built runtime binaries from `build/lib/`. When runtime C++ source has changed, pass `--build` to recompile incrementally:
+By default, scene tests load pre-built runtime binaries from `build/lib/`. When runtime C++ source has changed, pass `--build` to recompile incrementally:
 
 ```bash
-python examples/scripts/run_example.py --build \
-    -k examples/a2a3/host_build_graph/vector_example/kernels \
-    -g examples/a2a3/host_build_graph/vector_example/golden.py \
-    -p a2a3sim
+# Standalone: single test file
+python examples/a2a3/host_build_graph/vector_example/test_vector_example.py --build -p a2a3sim
+
+# Pytest: applies to every test in the session
+pytest examples tests/st --platform a2a3sim --build
 ```
 
-This uses the persistent cmake cache in `build/cache/`, recompiling only what changed. In CI, `pip install .` pre-builds all runtimes before `ci.sh` runs, so examples use pre-built binaries.
+This uses the persistent cmake cache in `build/cache/`, recompiling only what changed. In CI, `pip install .` pre-builds all runtimes before pytest runs, so examples use pre-built binaries.
 
 ### Disk layout
 

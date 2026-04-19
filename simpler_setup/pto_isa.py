@@ -9,8 +9,8 @@
 """PTO-ISA dependency management: resolve or auto-clone the repo.
 
 Single source of truth for locating / cloning / pinning the PTO-ISA repo.
-Callers: scene_test (via ensure_pto_isa_root), ci.py (commit pin), code_runner
-(wraps with CLI-friendly signature).
+Callers: root conftest (session-level pre-clone), SceneTestCase (lazy resolve
+at compile time), `SceneTestCase.run_module` (pin via `-c`).
 
 Resolution order for ensure_pto_isa_root():
   1. PTO_ISA_ROOT environment variable (if set and points to a directory)
@@ -165,9 +165,11 @@ def ensure_pto_isa_root(
         commit: if provided, check out this revision after clone/in existing clone.
         clone_protocol: "ssh" (default) or "https".
         update_if_exists: when `commit` is None and a clone already exists,
-            fetch origin and reset to origin/HEAD. Used by ci.py to guarantee
-            reproducibility against latest main; scene_test leaves it False so
-            repeated pytest runs don't issue network requests.
+            fetch origin and reset to origin/HEAD. Conftest passes True to
+            guarantee the local clone isn't stale (in particular, to ensure
+            any later `-c <commit>` request resolves to a real commit rather
+            than a missing object in an old clone). Lazy callers pass False
+            to avoid redundant network traffic since conftest already ran.
         verbose: log progress via `logger.info` / `logger.warning`.
 
     Raises:

@@ -14,7 +14,7 @@ The PTO Runtime consists of **three separate programs** that communicate through
 ```text
 ┌─────────────────────────────────────────────────────────────┐
 │                    Python Application                        │
-│              (examples/scripts/run_example.py)               │
+│   (pytest @scene_test classes, or `python test_*.py`)        │
 └─────────────────────────┬───────────────────────────────────┘
                           │
          ┌────────────────┼────────────────┐
@@ -161,7 +161,7 @@ concrete type for L3+, and optionally a factory function that routes by level.
 ### 1. Python Setup Phase
 
 ```text
-Python run_example.py
+Python test_*.py (SceneTestCase)
   │
   ├─→ RuntimeBuilder(platform).get_binaries(runtime_name) → host.so, aicpu.so, aicore.o
   ├─→ KernelCompiler(platform).compile_incore(source, core_type) → kernel .o/.so

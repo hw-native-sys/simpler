@@ -25,7 +25,8 @@ if [[ -z "${VIRTUAL_ENV:-}" ]]; then
 fi
 
 # macOS libomp collision (homebrew numpy + pip torch) — silence here so the
-# smoke check never aborts on it; ci.py also sets this internally.
+# smoke check never aborts on it; conftest.py sets the same env for pytest
+# entry points. See docs/macos-libomp-collision.md.
 export KMP_DUPLICATE_LIB_OK=TRUE
 
 # ---------------------------------------------------------------------------
@@ -53,7 +54,6 @@ from simpler_setup.runtime_compiler import RuntimeCompiler
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.elf_parser import extract_text_section
 from simpler_setup.platform_info import parse_platform, discover_runtimes
-from simpler_setup.code_runner import CodeRunner, create_code_runner
 from simpler_setup.scene_test import SceneTestCase, scene_test
 from simpler_setup.goldens.paged_attention import generate_inputs, compute_golden
 print('simpler:', simpler.__file__)
@@ -62,12 +62,6 @@ print('simpler_setup:', simpler_setup.__file__)
     echo "::endgroup::"
     echo "::group::[${mode}] standalone test_*.py --help"
     python tests/st/a2a3/aicpu_build_graph/paged_attention/test_paged_attention.py --help >/dev/null
-    echo "::endgroup::"
-    echo "::group::[${mode}] ci.py --help"
-    python ci.py --help >/dev/null
-    echo "::endgroup::"
-    echo "::group::[${mode}] run_example.py --help"
-    python examples/scripts/run_example.py --help >/dev/null
     echo "::endgroup::"
     echo "smoke[${mode}] OK"
 }

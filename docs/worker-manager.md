@@ -58,7 +58,7 @@ private:
 | ---------- | ---------------- |
 | Onboard real hardware | `THREAD` — driver is thread-safe per device, no fork overhead |
 | Simulation (sim runtime) | `PROCESS` — sim backend has shared state that needs isolation |
-| `ci.py` parallel tests | `PROCESS` — test independence; per-test dlopen state |
+| Parallel scene-test orchestrator (`simpler_setup/parallel_scheduler.py`) | `PROCESS` — test independence; per-test dlopen state |
 | L4+ when L3 children are thread-safe composites | `THREAD` |
 
 Mode is a per-`Worker` decision. Different levels in a nested hierarchy can

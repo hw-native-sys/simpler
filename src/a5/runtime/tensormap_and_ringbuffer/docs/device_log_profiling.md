@@ -2,7 +2,7 @@
 
 ## How to Find Device Logs
 
-AICPU logs (via `DEV_ALWAYS`) are written by CANN's **dlog** subsystem and do **not** appear in the `run_example.py` terminal output. They are written to CANN's device log directory:
+AICPU logs (via `DEV_ALWAYS`) are written by CANN's **dlog** subsystem and do **not** appear in the `python test_*.py` / pytest terminal output. They are written to CANN's device log directory:
 
 ```text
 $HOME/ascend/log/debug/device-<device_id>/device-<pid>_<timestamp>.log

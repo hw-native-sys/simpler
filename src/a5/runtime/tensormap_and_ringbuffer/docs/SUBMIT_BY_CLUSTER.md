@@ -203,16 +203,14 @@ Recommended validation coverage:
 Milestone command (device):
 
 ```bash
-python examples/scripts/run_example.py \
-  -k tests/st/tensormap_and_ringbuffer/batch_paged_attention/kernels \
-  -g tests/st/tensormap_and_ringbuffer/batch_paged_attention/golden.py \
+python tests/st/a2a3/tensormap_and_ringbuffer/batch_paged_attention/test_batch_paged_attention.py \
   -p a2a3 -d 9
 ```
 
 Final validation:
 
 ```bash
-./ci.sh
+pytest examples tests/st --platform a2a3
 ```
 
 ## 14. Resolved Decisions

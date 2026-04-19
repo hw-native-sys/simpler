@@ -21,7 +21,13 @@ import signal
 import subprocess
 import sys
 
-import pytest
+# macOS libomp collision workaround — must run before any import that may
+# transitively load numpy or torch (i.e. before pytest collects scene test
+# goldens). See docs/macos-libomp-collision.md.
+if sys.platform == "darwin":
+    os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import pytest  # noqa: E402
 
 # Exit code used when the session watchdog fires. Matches the GNU `timeout`
 # convention so shell wrappers (e.g. CI) can distinguish timeout from other
@@ -171,16 +177,31 @@ def pytest_configure(config):
         os.environ["PTO_LOG_LEVEL"] = log_level
 
     commit = config.getoption("--pto-isa-commit")
-    if commit:
-        from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
+    clone_protocol = config.getoption("--clone-protocol")
+    # Pre-clone / refresh PTO-ISA up front so that (a) the requested
+    # --clone-protocol is honored before SceneTestCase's lazy default-ssh
+    # resolve, and (b) the local clone is fetched to origin/HEAD so a
+    # --pto-isa-commit request doesn't miss a recently-published commit.
+    # Short-circuits when $PTO_ISA_ROOT already points to a user-managed clone.
+    #
+    # Pre-clone is an optimization, not a requirement: jobs that don't actually
+    # need PTO-ISA (e.g. pytest tests/ut on a runner without SSH keys) must not
+    # be aborted when the eager clone fails. If an actual scene test later needs
+    # PTO-ISA, scene_test.py's lazy path will re-raise the original error.
+    from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: PLC0415
 
+    try:
         root = ensure_pto_isa_root(
             verbose=True,
             commit=commit,
-            clone_protocol=config.getoption("--clone-protocol"),
+            clone_protocol=clone_protocol,
+            update_if_exists=True,
         )
-        if root:
-            os.environ["PTO_ISA_ROOT"] = root
+    except OSError as e:
+        print(f"[pytest] PTO-ISA pre-clone skipped: {e}", file=sys.stderr)
+        root = None
+    if root:
+        os.environ["PTO_ISA_ROOT"] = root
 
     timeout = config.getoption("--pto-session-timeout")
     if timeout and timeout > 0:

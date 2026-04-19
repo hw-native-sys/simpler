@@ -5,10 +5,10 @@ This example runs the same computation as `host_build_graph_example`, but the ta
 ## Run (simulation)
 
 ```bash
-python examples/scripts/run_example.py \
-  -k examples/aicpu_build_graph/vector_example/kernels \
-  -g examples/aicpu_build_graph/vector_example/golden.py \
-  -p a2a3sim
+python tests/st/a2a3/aicpu_build_graph/vector_example/test_vector_example.py -p a2a3sim
+
+# Or via pytest
+pytest tests/st/a2a3/aicpu_build_graph/vector_example --platform a2a3sim
 ```
 
 ## Key difference vs host_build_graph/vector_example

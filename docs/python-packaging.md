@@ -25,7 +25,7 @@ simpler_setup/            ← test framework + build/runtime assembly (simpler_s
   runtime_compiler.py     full runtime (host/aicpu/aicore) compilation
   runtime_builder.py      RuntimeBuilder: discovers + builds runtime binaries
   scene_test.py           SceneTestCase framework + @scene_test decorator
-  code_runner.py          CodeRunner engine for run_example.py + ci.py
+  parallel_scheduler.py   device bin-packing + xdist orchestration for scene tests
   goldens/                shared golden reference compute
     __init__.py
     paged_attention.py    attention reference (used by multiple paged_attention tests)
@@ -72,23 +72,21 @@ Anything that needs to find `src/`, `build/lib/`, or `build/cache/` MUST go thro
 1. **No bare imports of internal modules.** Everything goes through `simpler.X` or `simpler_setup.X`. The following are forbidden anywhere in the repo:
    - `from runtime_builder import ...`
    - `from platform_info import ...`
-   - `from code_runner import ...`
+   - `from scene_test import ...`
    - `from paged_attention_golden import ...`
 2. **No `sys.path.insert` to make bare imports work.** The single allowed exception is `examples/scripts/build_runtimes.py`, which is invoked by CMake **before** the package is installed and therefore must bootstrap the source tree onto `sys.path`. That bootstrap is documented inline in the file.
-3. **Build/runtime assembly lives in `simpler_setup`, not `simpler`.** If a new module is shared by the test framework, `code_runner`, or `ci.py`, it goes under `simpler_setup/`. If it's part of the user-facing runtime API, it goes under `python/simpler/`.
+3. **Build/runtime assembly lives in `simpler_setup`, not `simpler`.** If a new module is shared by the test framework (e.g. new scene-test helpers, new parallel-scheduler knobs), it goes under `simpler_setup/`. If it's part of the user-facing runtime API, it goes under `python/simpler/`.
 4. **Goldens** (shared reference compute used by multiple test sites) live in `simpler_setup/goldens/`. New goldens are added as `simpler_setup/goldens/<name>.py`. Per-test ad-hoc goldens stay next to their `kernel_config.py` and aren't packaged.
 5. **`pyproject.toml` `wheel.packages`** must list every directory that needs to ship in the wheel. Currently: `["simpler_setup", "python/simpler"]`. Subpackages (e.g., `simpler_setup/goldens/`) ship automatically as long as they have an `__init__.py`.
 
 ## CLI entry points
 
-Four supported user-facing entry points:
+Two supported user-facing entry points:
 
 | Command | Purpose | Module location |
 | ------- | ------- | --------------- |
 | `pytest` | Unit + scene tests | imports `simpler` and `simpler_setup` from installed package |
 | `python <test_*>.py` | Standalone scene test (uses `SceneTestCase.run_module`) | reads `simpler_setup` from installed package |
-| `python ci.py` | Batch CI runner | imports `simpler` + `simpler_setup` from installed package |
-| `python examples/scripts/run_example.py` | Single-example runner | imports `simpler_setup.code_runner` from installed package |
 
 Plus one build-time entry point invoked by CMake during `pip install`:
 
@@ -122,7 +120,7 @@ pip install scikit-build-core nanobind cmake pytest torch  # one-time
 cmake -S . -B build/cmake_only -Dnanobind_DIR=$(python -c 'import nanobind; print(nanobind.cmake_dir())')
 cmake --build build/cmake_only
 export PYTHONPATH=$(pwd):$(pwd)/python
-# Now all four entry points work
+# Now both entry points work
 ```
 
 The cmake build places `_task_interface.cpython-XYZ.so` directly into `python/` (controlled by `python/bindings/CMakeLists.txt::LIBRARY_OUTPUT_DIRECTORY` when not in `SKBUILD_MODE`). The `add_custom_target(build_runtimes)` in the top-level `CMakeLists.txt` populates `build/lib/...` with runtime binaries. With `PYTHONPATH=repo:repo/python`, `simpler` and `simpler_setup` resolve from the source tree, the nanobind extension resolves from `python/`, and `simpler_setup.environment.PROJECT_ROOT` resolves to the repo root (so `build/lib/` is found).
@@ -133,8 +131,6 @@ The cmake build places `_task_interface.cpython-XYZ.so` directly into `python/` 
 | ----------- | --------------- | ------------------------------------ | ------------------ | --------------------------------------- | ------------------ |
 | `pytest` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `python <test>.py` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `python ci.py` | ✅ | ✅ | ✅ | ✅ | ✅ |
-| `python examples/scripts/run_example.py` | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 On macOS with `--system-site-packages`, set `KMP_DUPLICATE_LIB_OK=TRUE` if the system numpy is present and its libomp collides with torch's (see `docs/macos-libomp-collision.md`).
 
@@ -150,7 +146,7 @@ Any change that touches:
 - `examples/scripts/build_runtimes.py` (the pre-install bootstrap)
 - `python/bindings/CMakeLists.txt` (nanobind module placement)
 
-…must keep the **5 install modes × 4 entry points = 20 combinations** green. CI enforces this on macOS + Ubuntu via the `packaging-matrix` job in `.github/workflows/ci.yml`, which calls a single shared script:
+…must keep the **5 install modes × 2 entry points = 10 combinations** green. CI enforces this on macOS + Ubuntu via the `packaging-matrix` job in `.github/workflows/ci.yml`, which calls a single shared script:
 
 ```bash
 # Locally — same script CI runs.

@@ -43,14 +43,14 @@ PullRequest
 | --- | ------ | ------------ |
 | `ut-py` | `ubuntu-latest` | `pytest tests/ut` |
 | `ut-cpp` | `ubuntu-latest` | `ctest --test-dir tests/ut/cpp/build -LE requires_hardware` |
-| `st-sim-a2a3` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a2a3sim` + `ci.py -p a2a3sim` |
-| `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a5sim` + `ci.py -p a5sim` |
+| `st-sim-a2a3` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a2a3sim` |
+| `st-sim-a5` | `ubuntu-latest`, `macos-latest` | `pytest examples tests/st --platform a5sim` |
 | `ut-py-a2a3` | a2a3 self-hosted | `pytest tests/ut --platform a2a3` |
 | `ut-cpp-a2a3` | a2a3 self-hosted | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$"` |
-| `st-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3` + `ci.py -p a2a3 -d ...` |
+| `st-a2a3` | a2a3 self-hosted | `pytest examples tests/st --platform a2a3 --device ...` |
 | `ut-py-a5` | a5 self-hosted | `pytest tests/ut --platform a5` |
 | `ut-cpp-a5` | a5 self-hosted | `ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a5)?$"` |
-| `st-a5` | a5 self-hosted | `pytest examples tests/st --platform a5` + `ci.py -p a5 -d ...` |
+| `st-a5` | a5 self-hosted | `pytest examples tests/st --platform a5 --device ...` |
 
 ### Parallel ST runs on hardware
 
@@ -138,7 +138,7 @@ GoogleTest-based tests for pure C++ modules. Run via ctest, filtered by label `-
 
 ### `examples/` — Small examples (sim + onboard)
 
-Small, fast examples that run on both simulation and real hardware. Organized as `examples/{arch}/{runtime}/{name}/`. Discovered and executed by `ci.py` (legacy golden.py format) or pytest (`@scene_test` format).
+Small, fast examples that run on both simulation and real hardware. Organized as `examples/{arch}/{runtime}/{name}/`. Discovered and executed by pytest via each example's `test_*.py` (`@scene_test` format).
 
 ### `tests/st/` — Scene tests (onboard-biased)
 
@@ -150,15 +150,14 @@ Both `examples/` and `tests/st/` cases follow the same layout:
 
 ```text
 {name}/
-  golden.py                      # generate_inputs() + compute_golden()
+  test_{name}.py                 # @scene_test class (generate_args, compute_golden)
   kernels/
-    kernel_config.py             # KERNELS, ORCHESTRATION, RUNTIME_CONFIG
     orchestration/*.cpp
     aic/*.cpp                    # optional
     aiv/*.cpp                    # optional
 ```
 
-A legacy case is discoverable by `ci.py` when both `golden.py` and `kernels/kernel_config.py` exist. `@scene_test` cases are discovered by pytest via `test_*.py` files.
+Cases are discovered by pytest via `test_*.py` files. Each test module ends with `if __name__ == "__main__": SceneTestCase.run_module(__name__)` so it can also run standalone as `python test_*.py -p <platform>`.
 
 ## Selection Scheme
 
@@ -243,58 +242,6 @@ python tools/test_catalog.py cases --platform a2a3sim --source example
 python tools/test_catalog.py cases --platform a2a3 --source st --format json
 ```
 
-## `ci.py` — Scene Test Runner (Legacy)
+## Platform notes
 
-`ci.py` handles scene test execution for golden.py-based tests (examples + st). New tests should use `@scene_test` and run via pytest. `ci.py` is retained for backward compatibility during the migration.
-
-### Key features
-
-- **ChipWorker reuse**: Tasks sharing the same runtime reuse a single ChipWorker within their subprocess, avoiding repeated device init/teardown.
-- **Subprocess isolation**: Different runtimes run in separate subprocesses (the host `.so` cannot be unloaded within a single process).
-- **Device queue**: Hardware tasks are distributed across devices specified by `-d`. Workers pop tasks from a shared queue via threads.
-- **Retry**: Failed tasks are retried up to 3 times. Hardware workers quarantine a device after a failure.
-- **PTO-ISA pinning**: `-c <commit>` pins the PTO-ISA dependency. On first failure, re-runs failed tasks with the pinned commit.
-- **Watchdog**: `-t <seconds>` sets a timeout. The entire run is aborted if it exceeds the limit.
-- **Summary table**: After all tasks complete, a formatted results table is printed with pass/fail status, timing, device, and attempt count.
-
-### Usage
-
-```bash
-# All sim platforms (no -p: auto-discovers a2a3sim, a5sim, etc.)
-python ci.py -t 600
-
-# Single sim platform
-python ci.py -p a2a3sim -c 6622890 -t 600
-
-# Hardware with device range
-python ci.py -p a2a3 -d 4-7 -c 6622890 -t 600
-
-# Filter by runtime
-python ci.py -p a2a3sim -r tensormap_and_ringbuffer
-```
-
-### Platform notes
-
-- **macOS libomp collision**: on macOS, `ci.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` at the top of the file to work around a duplicate-libomp abort triggered by homebrew numpy and pip torch coexisting in one process. Do not reorder the imports or remove this workaround without reading [macos-libomp-collision.md](macos-libomp-collision.md) first.
-
-### Task discovery
-
-`ci.py` scans two directories:
-
-1. `examples/` — included for both sim and onboard platforms.
-2. `tests/st/` — included only for onboard platforms (non-sim).
-
-For each directory, it walks subdirectories looking for `kernels/kernel_config.py` + `golden.py`. The arch and runtime are extracted from the path: `{root}/{arch}/{runtime}/{case_name}/`.
-
-### Execution flow
-
-```text
-1. Parse arguments (-p, -d, -r, -c, -t)
-2. If no -p: auto-discover all sim platforms and run each
-3. For each platform:
-   a. Discover tasks from examples/ and tests/st/
-   b. Run tasks (subprocess per runtime group for sim, device queue for hw)
-      └── On failure + -c flag: pin PTO-ISA, retry failed tasks
-4. Print combined summary table
-5. Exit 0 if all passed, 1 otherwise
-```
+- **macOS libomp collision**: on macOS, the root `conftest.py` sets `KMP_DUPLICATE_LIB_OK=TRUE` before `import pytest` to work around a duplicate-libomp abort triggered by homebrew numpy and pip torch coexisting in one Python process (see [macos-libomp-collision.md](macos-libomp-collision.md)). Standalone `python test_*.py` bypasses conftest — rely on the env var being exported by the shell or `tools/verify_packaging.sh`.

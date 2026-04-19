@@ -22,7 +22,7 @@ Both symbols are loaded by AICPU via `dlopen` in `src/runtime/tensormap_and_ring
 
 ## Argument Layout
 
-Arguments are constructed by `examples/scripts/code_runner.py` and passed through host init into `Runtime::orch_args` as device pointers or scalars. For the default `TENSOR_ORDER` flow, the layout is:
+Arguments are constructed by `SceneTestCase` (via `TaskArgsBuilder`, see `simpler_setup/scene_test.py`) and passed through host init into `Runtime::orch_args` as device pointers or scalars. For the default `TENSOR_ORDER` flow, the layout is:
 
 ```text
 [ptr_0, ptr_1, ..., ptr_n, nbytes_0, nbytes_1, ..., nbytes_n, element_count]

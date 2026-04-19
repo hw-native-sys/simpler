@@ -309,13 +309,10 @@ python tests/st/a5/host_build_graph/dump_tensor_example/test_dump_tensor_example
 pytest tests/st/a5/host_build_graph/dump_tensor_example --platform a5sim --dump-tensor
 ```
 
-**From `run_example.py`** (any example):
+**From any scene test via pytest**:
 
 ```bash
-python examples/scripts/run_example.py \
-    -k examples/a5/host_build_graph/vector_example/kernels \
-    -g examples/a5/host_build_graph/vector_example/golden.py \
-    -p a5sim --dump-tensor
+pytest examples/a5/host_build_graph/vector_example --platform a5sim --dump-tensor
 ```
 
 ### 3.2 Output layout

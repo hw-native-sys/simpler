@@ -32,10 +32,7 @@ ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a2a3)?$" --output-on
 pytest examples tests/st                          # all sim platforms (auto-parametrized)
 pytest examples tests/st --platform a2a3sim       # specific sim
 pytest examples tests/st --platform a2a3          # hardware
-
-# Scene tests (legacy ci.py, golden.py directory scanning)
-python ci.py -p a2a3sim
-python ci.py -p a2a3 -d 4-7
+pytest examples tests/st --platform a2a3 --device 4-7  # hardware with device pool
 
 # Single scene test (standalone)
 python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example.py -p a2a3sim
@@ -54,12 +51,6 @@ python examples/a2a3/tensormap_and_ringbuffer/vector_example/test_vector_example
 # Tensor dump
 python tests/st/a2a3/tensormap_and_ringbuffer/alternating_matmul_add/test_alternating_matmul_add.py \
     -p a2a3 -d 11 --dump-tensor
-
-# Single example via run_example.py (deprecated — prefer test_*.py standalone)
-python examples/scripts/run_example.py \
-    -k examples/a2a3/host_build_graph/vector_example/kernels \
-    -g examples/a2a3/host_build_graph/vector_example/golden.py \
-    -p a2a3sim
 ```
 
 ## Test Organization
@@ -68,11 +59,9 @@ Three test categories:
 
 | Category | Abbrev | Location | Runner | Description |
 | -------- | ------ | -------- | ------ | ----------- |
-| System tests | st | `examples/`, `tests/st/` | pytest + `ci.py` (legacy) | Full end-to-end cases (compile + run + validate) |
+| System tests | st | `examples/`, `tests/st/` | pytest (`@scene_test`) or standalone `python test_*.py` | Full end-to-end cases (compile + run + validate) |
 | Python unit tests | ut-py | `tests/ut/` | pytest | Unit tests for nanobind-exposed and Python modules |
 | C++ unit tests | ut-cpp | `tests/ut/cpp/` | ctest (GoogleTest) | Unit tests for pure C++ modules |
-
-**ST migration**: Scene tests are migrating from `ci.py` (golden.py directory scanning) to pytest (`@scene_test` class decorator). New tests should use `@scene_test`. Existing golden.py-based tests continue to work via `ci.py` during the transition.
 
 ### Choosing ut-py vs ut-cpp
 
@@ -369,16 +358,18 @@ tests/
     setup/             # Compilation toolchain (KernelCompiler, RuntimeBuilder, etc.)
     conftest.py        # ST-specific sys.path setup
     test_worker_api.py # L3 distributed worker tests
-    a2a3/              # Legacy golden.py-based tests (ci.py)
-    a5/                # Legacy golden.py-based tests (ci.py)
+    a2a3/              # @scene_test classes organized by {arch}/{runtime}/{name}/
+    a5/
 
 examples/              # Small examples (sim + onboard)
   a2a3/
     tensormap_and_ringbuffer/
       vector_example/
-        test_vector_example.py   # @scene_test — new style
-        golden.py                # legacy (ci.py)
-        kernels/kernel_config.py # legacy (ci.py)
+        test_vector_example.py   # @scene_test class + __main__ entry
+        kernels/
+          orchestration/*.cpp
+          aic/*.cpp               # optional
+          aiv/*.cpp               # optional
   a5/...
 
 conftest.py            # Root: --platform/--device options, ST fixtures
@@ -521,76 +512,7 @@ Key fields:
 - `runtime`: which runtime to use
 - `CALLABLE.orchestration.source` / `CALLABLE.incores[].source`: paths relative to the test file
 
-### New Scene Test (Legacy)
-
-The golden.py + kernel_config.py directory format is still supported via `ci.py`:
-
-Create a directory under `tests/st/{arch}/{runtime}/my_test/` with:
-
-- `golden.py` — Input generation and golden output computation
-- `kernels/kernel_config.py` — Kernel and runtime configuration
-
-The test will be automatically picked up by `ci.py`. New tests should prefer the `@scene_test` format above.
-
-### Migrating Legacy Tests to @scene_test
-
-#### Field Mapping
-
-| Legacy file | Legacy field | SceneTestCase equivalent |
-| ----------- | ------------ | ------------------------ |
-| `kernel_config.py` | `ORCHESTRATION` | `CALLABLE["orchestration"]` (source becomes relative path) |
-| `kernel_config.py` | `KERNELS` | `CALLABLE["incores"]` |
-| `kernel_config.py` | `RUNTIME_CONFIG` | `CASES[*]["config"]` (`aicpu_thread_num`, `block_dim`) |
-| `golden.py` | `generate_inputs()` | `generate_args(self, params)` returning `TaskArgsBuilder(...)` |
-| `golden.py` | `compute_golden()` | `compute_golden(self, args, params)` using `args.name[:]` |
-| `golden.py` | `__outputs__` | `D.OUT` / `D.INOUT` in `CALLABLE["orchestration"]["signature"]` |
-| `golden.py` | `ALL_CASES` | `CASES` list with per-case `platforms`, `config`, `params` |
-| `golden.py` | `RTOL` / `ATOL` | Class attributes `RTOL` / `ATOL` |
-
-#### Key Conversions
-
-**generate_inputs → generate_args:**
-
-```python
-# Legacy (golden.py)
-def generate_inputs(params):
-    a = torch.full((SIZE,), 2.0, dtype=torch.float32)
-    return [("a", a), ("b", b), ("f", f)]
-
-# New (test_*.py)
-def generate_args(self, params):
-    a = torch.full((SIZE,), 2.0, dtype=torch.float32)
-    return TaskArgsBuilder(Tensor("a", a), Tensor("b", b), Tensor("f", f))
-```
-
-**compute_golden:**
-
-```python
-# Legacy
-def compute_golden(tensors, params):
-    tensors["f"][:] = torch.as_tensor(tensors["a"]) + 1
-
-# New
-def compute_golden(self, args, params):
-    args.f[:] = args.a + 1
-```
-
-**Source paths:** Legacy uses absolute paths (`str(_KERNELS_ROOT / "aiv" / "kernel.cpp")`). SceneTestCase uses paths relative to the test file (`"kernels/aiv/kernel.cpp"`).
-
-**Import:** `from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test` (not `from setup`). For scalar arguments add `Scalar` and `import ctypes`. Tensors must appear before Scalars in `TaskArgsBuilder`.
-
-#### Running: Before and After
-
-| Action | Legacy | SceneTestCase |
-| ------ | ------ | ------------- |
-| Single run (sim) | `python examples/scripts/run_example.py -k kernels/ -g golden.py -p a2a3sim` | `python test_*.py -p a2a3sim` |
-| Single run (hardware) | `python examples/scripts/run_example.py -k kernels/ -g golden.py -p a2a3 -d 0` | `python test_*.py -p a2a3 -d 0` |
-| Batch (pytest) | `python examples/scripts/ci.py` | `pytest examples tests/st --platform a2a3sim` |
-| Multi-round | Not supported | `python test_*.py -p a2a3sim --rounds 3` |
-| Benchmark | Manual | `python test_*.py -p a2a3 -d 0 --rounds 100 --skip-golden --case CaseName` |
-| Profiling | `--enable-profiling` flag on run_example.py | `python test_*.py -p a2a3 -d 0 --enable-profiling` (auto-runs `tools/swimlane_converter.py` per case at end) |
-
-##### `--case` selector and `--manual`
+### Case Selection and Manual Cases
 
 `--case` is repeatable and accepts compound forms (useful when a test file declares multiple `SceneTestCase` classes):
 
@@ -603,15 +525,13 @@ def compute_golden(self, args, params):
 
 `--manual exclude` (default) skips `manual: True` cases; `--manual include` runs them alongside normal cases; `--manual only` runs only manual cases. These compose orthogonally with `--case`: explicit selectors still respect the manual filter — to run a manual case by name, pass `--manual include`.
 
-#### After Migration
+### Sharing an Example Between examples/ and tests/st/
 
-Delete `golden.py` and `kernels/kernel_config.py`. Keep `kernels/` C++ sources — `CALLABLE` references them. Once legacy files are removed, the test is no longer discovered by `ci.py` and runs exclusively via pytest or standalone.
-
-If the same example exists in both `examples/` and `tests/st/`, merge into one `test_*.py`: small cases get `platforms: ["a2a3sim", "a2a3"]`, large benchmark cases get `platforms: ["a2a3"], "manual": True`.
+If similar coverage exists in both `examples/` and `tests/st/`, collapse it into a single `test_*.py`: small cases get `platforms: ["a2a3sim", "a2a3"]`; large benchmark cases get `platforms: ["a2a3"], "manual": True`.
 
 ## CI Pipeline
 
-See [ci.md](ci.md) for the full CI pipeline documentation, including the job matrix, runner constraints, marker scheme, and `ci.sh` internals.
+See [ci.md](ci.md) for the full CI pipeline documentation, including the job matrix, runner constraints, and marker scheme.
 
 ## Runtime Isolation Constraint (Onboard)
 
