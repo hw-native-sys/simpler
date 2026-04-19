@@ -98,10 +98,10 @@ jobs:
           . .venv/bin/activate
           bash tools/verify_packaging.sh
 
-  # ---------- Python unit tests (no hardware) ----------
-  ut-py:
+  # ---------- Unit tests (no hardware, Python + C++) ----------
+  ut:
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
+    timeout-minutes: 15
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest]
@@ -114,33 +114,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Cache pip packages
-        uses: actions/cache@v3
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
-      - name: Install dependencies
-        run: |
-          pip install torch --index-url https://download.pytorch.org/whl/cpu
-          pip install '.[test]'
-
-      - name: Run unit tests
-        run: pytest tests -m "not requires_hardware" -v
-
-  # ---------- C++ unit tests (no hardware) ----------
-  ut-cpp:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 10
-    strategy:
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
 
       - name: Install GoogleTest (Linux)
         if: runner.os == 'Linux'
@@ -156,6 +129,22 @@ jobs:
         if: runner.os == 'macOS'
         run: |
           brew install googletest
+
+      - name: Cache pip packages
+        uses: actions/cache@v3
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/*.py') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install dependencies
+        run: |
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install '.[test]'
+
+      - name: Run Python unit tests
+        run: pytest tests -m "not requires_hardware" -v
 
       - name: Build and run C++ unit tests
         run: |
@@ -276,8 +265,10 @@ jobs:
           fi
           exit $rc
 
-  # ---------- Python unit tests (a2a3 hardware) ----------
-  ut-py-a2a3:
+  # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
+  ut-a2a3:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
 
@@ -285,20 +276,46 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build nanobind extension
+      - name: Set up environment
         run: |
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
           pip install --upgrade pip
           pip install '.[test]'
 
-      - name: Run hardware unit tests (a2a3)
+      - name: Run Python hardware unit tests
         run: |
+          set +e
           source .venv/bin/activate
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash && python -m pytest tests -m requires_hardware --platform a2a3 -v
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash
+          set -e
+          python -m pytest tests -m requires_hardware --platform a2a3 -v
+
+      - name: Build and run C++ hardware unit tests
+        run: |
+          set +e
+          source .venv/bin/activate
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash
+          set -e
+          python -c "from simpler_setup.runtime_builder import RuntimeBuilder; RuntimeBuilder('a2a3').get_binaries('tensormap_and_ringbuffer', build=True)"
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
+          cmake --build tests/ut/cpp/build
+          python3 -c "
+          import json, os
+          s, e = os.environ['DEVICE_RANGE'].split('-')
+          npus = [{'id': str(i), 'slots': 1} for i in range(int(s), int(e)+1)]
+          json.dump({'version': {'major': 1, 'minor': 0}, 'local': [{'npus': npus}]},
+                    open('tests/ut/cpp/build/resources.json', 'w'))
+          "
+          ctest --test-dir tests/ut/cpp/build \
+              -L "^requires_hardware(_a2a3)?$" \
+              --resource-spec-file $PWD/tests/ut/cpp/build/resources.json \
+              -j$(nproc) --output-on-failure
 
   # ---------- Scene tests (a2a3 hardware) ----------
   st-onboard-a2a3:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 60
 
@@ -306,7 +323,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build nanobind extension
+      - name: Set up environment
         run: |
           python3 -m venv --system-site-packages .venv
           source .venv/bin/activate
@@ -329,57 +346,83 @@ jobs:
           exit $rc
 
 
-  # ---------- Detect A5 changes (runs on GitHub server, not A5 machine) ----------
+  # ---------- Detect platform-specific changes (runs on GitHub server) ----------
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
+      a2a3_changed: ${{ steps.check.outputs.a2a3_changed }}
       a5_changed: ${{ steps.check.outputs.a5_changed }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Check A5 file changes
+      - name: Check file changes
         id: check
         run: |
           FILES=$(git diff --name-only ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }})
 
-          # Skip A5 only when ALL changed files are confined to a2a3-only or non-code paths.
-          # Shared code (src/common/, python/, examples/scripts/, build files) affects A5.
-          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|device_tests)/a2a3/)'
           NON_CODE='^(docs/|\.docs/|\.claude/|KNOWN_ISSUES\.md$|\.gitignore$|README\.md$|\.pre-commit-config\.yaml$)'
 
-          # Filter out a2a3-only and non-code files; if anything remains, it may affect A5
-          REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
+          # a2a3: skip only when ALL changed files are a5-only or non-code
+          A5_ONLY='^(src/a5/|examples/a5/|tests/(st|device_tests)/a5/)'
+          A2A3_REMAINING=$(echo "$FILES" | grep -vE "$A5_ONLY" | grep -vE "$NON_CODE" || true)
 
-          if [ -n "$REMAINING" ]; then
+          if [ -n "$A2A3_REMAINING" ]; then
+            echo "a2a3_changed=true" >> "$GITHUB_OUTPUT"
+            echo "Files affecting a2a3:"
+            echo "$A2A3_REMAINING"
+          else
+            echo "a2a3_changed=false" >> "$GITHUB_OUTPUT"
+            echo "All changes are a5-only or non-code; skipping a2a3"
+          fi
+
+          # a5: skip only when ALL changed files are a2a3-only or non-code
+          A2A3_ONLY='^(src/a2a3/|examples/a2a3/|tests/(st|device_tests)/a2a3/)'
+          A5_REMAINING=$(echo "$FILES" | grep -vE "$A2A3_ONLY" | grep -vE "$NON_CODE" || true)
+
+          if [ -n "$A5_REMAINING" ]; then
             echo "a5_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Files affecting A5:"
-            echo "$REMAINING"
+            echo "Files affecting a5:"
+            echo "$A5_REMAINING"
           else
             echo "a5_changed=false" >> "$GITHUB_OUTPUT"
-            echo "All changes are a2a3-only or non-code; skipping A5"
+            echo "All changes are a2a3-only or non-code; skipping a5"
           fi
-  # TODO: Uncomment when a5 hardware runner is available.
-  #       Add the "a5" label to the runner, matching [self-hosted, a5] below.
-  #
-  # ut-py-a5:
-  #   needs: detect-changes
-  #   runs-on: [self-hosted, a5]
-  #   timeout-minutes: 30
-  #
-  #   steps:
-  #     - name: Checkout repository
-  #       uses: actions/checkout@v4
-  #
-  #     - name: Build nanobind extension
-  #       run: pip install .
-  #
-  #     - name: Run hardware unit tests (a5)
-  #       run: |
-  #         export PATH="$HOME/.local/bin:$PATH"
-  #         source ${ASCEND_HOME_PATH}/bin/setenv.bash && pytest tests -m requires_hardware --platform a5 -v
-  #
+
+  # ---------- Unit tests (a5 hardware, Python + C++) ----------
+  ut-a5:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.a5_changed == 'true'
+    runs-on: [self-hosted, a5]
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up environment
+        run: |
+          set +e
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash
+          set -e
+          pip install '.[test]'
+
+      - name: Run Python hardware unit tests (a5)
+        run: |
+          set +e
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash
+          set -e
+          python -m pytest tests -m requires_hardware --platform a5 -v
+
+      - name: Build and run C++ hardware unit tests (a5)
+        run: |
+          set +e
+          source ${ASCEND_HOME_PATH}/bin/setenv.bash
+          set -e
+          cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
+          cmake --build tests/ut/cpp/build
+          ctest --test-dir tests/ut/cpp/build -L "^requires_hardware(_a5)?$" --output-on-failure
 
   st-onboard-a5:
     needs: detect-changes
@@ -391,14 +434,19 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Build nanobind extension
+      - name: Set up environment
         run: |
+          set +e
           source ${ASCEND_HOME_PATH}/bin/setenv.bash
+          set -e
+          pip install --upgrade pip
           pip install '.[test]'
 
       - name: Run pytest scene tests (a5)
         run: |
+          set +e
           source ${ASCEND_HOME_PATH}/bin/setenv.bash
+          set -e
           DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol https"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "set +e; $PYTEST --pto-session-timeout 1200; rc=\$?; if [ \$rc -eq 124 ]; then echo 'pytest timed out; retrying with pinned PTO-ISA commit'; $PYTEST --pto-session-timeout 1200 --pto-isa-commit d96c8784 --clone-protocol https; rc=\$?; fi; exit \$rc"
