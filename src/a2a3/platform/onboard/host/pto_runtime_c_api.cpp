@@ -119,6 +119,15 @@ int set_device(DeviceContextHandle ctx, int device_id) {
     return 0;
 }
 
+int ensure_acl_ready_ctx(DeviceContextHandle ctx, int device_id) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->ensure_acl_ready(device_id);
+    } catch (...) {
+        return -1;
+    }
+}
+
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
     if (ctx == NULL) return NULL;
     try {

@@ -364,6 +364,22 @@ public:
     int attach_current_thread(int device_id);
 
     /**
+     * Make the ACL context ready on the current thread.
+     *
+     * Calls aclInit() once per process (subsequent calls are idempotent and
+     * tolerate the ACL_ERROR_REPEAT_INITIALIZE sentinel) and aclrtSetDevice()
+     * on the current thread. This is the entry point for consumers that need
+     * to call acl* / Hccl* APIs (for example the comm_hccl backend) but
+     * intentionally do not want those modules to own ACL lifecycle themselves.
+     *
+     * Symmetric with finalize(): aclrtResetDevice + aclFinalize run there.
+     *
+     * @param device_id  Device ID to bind on the current thread.
+     * @return 0 on success, error code on failure.
+     */
+    int ensure_acl_ready(int device_id);
+
+    /**
      * Ensure the current thread has fresh run-scoped streams.
      *
      * This attaches the current thread to the target device and lazily creates
@@ -404,6 +420,11 @@ private:
     // Kernel binary management
     bool binaries_loaded_{false};              // true after AICPU SO loaded
     std::map<int, uint64_t> func_id_to_addr_;  // func_id -> function_bin_addr (device GM)
+
+    // ACL lifecycle (process-wide). aclInit must run exactly once; ensure_acl_ready
+    // gates it behind this flag. finalize() drives aclFinalize only if we observed
+    // acl_ready_, so runtimes that never ask for ACL (e.g. pure rt-layer) stay unaffected.
+    bool acl_ready_{false};
 
     // Performance profiling
     PerformanceCollector perf_collector_;
