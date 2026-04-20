@@ -6,19 +6,9 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-# ruff: noqa: E402
 """Tests for ChipCallConfig and ChipWorker state machine."""
 
-import sys
-from pathlib import Path
-
 import pytest
-
-# Ensure python/ is on the import path so _task_interface and task_interface resolve
-_python_dir = str(Path(__file__).resolve().parent.parent.parent / "python")
-if _python_dir not in sys.path:
-    sys.path.insert(0, _python_dir)
-
 from _task_interface import ChipCallConfig, _ChipWorker  # pyright: ignore[reportMissingImports]
 
 # ============================================================================

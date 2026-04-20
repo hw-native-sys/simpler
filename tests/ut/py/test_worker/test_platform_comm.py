@@ -40,19 +40,10 @@ from __future__ import annotations
 import ctypes
 import multiprocessing as mp
 import os
-import sys
 import traceback
 import warnings
-from pathlib import Path
 
 import pytest
-
-_ROOT = Path(__file__).resolve().parents[4]
-for _p in (_ROOT, _ROOT / "python"):
-    _s = str(_p)
-    if _s not in sys.path:
-        sys.path.insert(0, _s)
-
 
 # ---------------------------------------------------------------------------
 # CommContext layout — must stay byte-compatible with
