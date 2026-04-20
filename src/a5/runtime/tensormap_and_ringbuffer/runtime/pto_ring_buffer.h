@@ -656,14 +656,6 @@ struct PTO2DepListPool {
         return new_entry;
     }
 
-    /**
-     * Get entry by offset
-     */
-    PTO2DepListEntry *pto2_dep_pool_get(int32_t offset) {
-        if (offset <= 0) return NULL;
-        return &base[offset];
-    }
-
     int32_t used() const { return top - tail; }
 
     int32_t available() const { return capacity - used(); }
