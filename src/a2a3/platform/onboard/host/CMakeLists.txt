@@ -77,6 +77,10 @@ target_include_directories(host_runtime
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        # Shared platform_comm headers (comm.h / comm_context.h) live in
+        # src/common so a2a3 (HCCL) and a5/a2a3 sim (POSIX-shm) can use the
+        # same contract.
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
     PRIVATE
         ${ASCEND_HOME_PATH}/include

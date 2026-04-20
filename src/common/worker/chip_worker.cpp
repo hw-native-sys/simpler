@@ -121,6 +121,20 @@ void ChipWorker::init(
         get_runtime_size_fn_ = load_symbol<GetRuntimeSizeFn>(handle, "get_runtime_size");
         run_runtime_fn_ = load_symbol<RunRuntimeFn>(handle, "run_runtime");
         finalize_device_fn_ = load_symbol<FinalizeDeviceFn>(handle, "finalize_device");
+        // ACL lifecycle + comm_* are part of the uniform host_runtime.so ABI.
+        // Every platform runtime exports all of them — runtimes that do not
+        // have a real backend (today: a5) ship not-supported stubs rather
+        // than omitting the symbols.  This keeps ChipWorker.init platform-
+        // agnostic: no per-symbol probing, no half-loaded extension groups.
+        ensure_acl_ready_fn_ = load_symbol<EnsureAclReadyFn>(handle, "ensure_acl_ready_ctx");
+        create_comm_stream_fn_ = load_symbol<CreateCommStreamFn>(handle, "create_comm_stream_ctx");
+        destroy_comm_stream_fn_ = load_symbol<DestroyCommStreamFn>(handle, "destroy_comm_stream_ctx");
+        comm_init_fn_ = load_symbol<CommInitFn>(handle, "comm_init");
+        comm_alloc_windows_fn_ = load_symbol<CommAllocWindowsFn>(handle, "comm_alloc_windows");
+        comm_get_local_window_base_fn_ = load_symbol<CommGetLocalWindowBaseFn>(handle, "comm_get_local_window_base");
+        comm_get_window_size_fn_ = load_symbol<CommGetWindowSizeFn>(handle, "comm_get_window_size");
+        comm_barrier_fn_ = load_symbol<CommBarrierFn>(handle, "comm_barrier");
+        comm_destroy_fn_ = load_symbol<CommDestroyFn>(handle, "comm_destroy");
     } catch (...) {
         dlclose(handle);
         throw;
@@ -169,6 +183,14 @@ void ChipWorker::reset_device() {
 }
 
 void ChipWorker::finalize() {
+    // Defensive: if the user never called comm_destroy, reclaim the stream
+    // before we tear down the device context (otherwise the stream-backing
+    // ACL state outlives its owning context).
+    if (comm_stream_ != nullptr && device_ctx_ != nullptr && destroy_comm_stream_fn_ != nullptr) {
+        destroy_comm_stream_fn_(device_ctx_, comm_stream_);
+    }
+    comm_stream_ = nullptr;
+
     reset_device();
     if (device_ctx_ != nullptr && destroy_device_context_fn_ != nullptr) {
         destroy_device_context_fn_(device_ctx_);
@@ -188,6 +210,15 @@ void ChipWorker::finalize() {
     get_runtime_size_fn_ = nullptr;
     run_runtime_fn_ = nullptr;
     finalize_device_fn_ = nullptr;
+    ensure_acl_ready_fn_ = nullptr;
+    create_comm_stream_fn_ = nullptr;
+    destroy_comm_stream_fn_ = nullptr;
+    comm_init_fn_ = nullptr;
+    comm_alloc_windows_fn_ = nullptr;
+    comm_get_local_window_base_fn_ = nullptr;
+    comm_get_window_size_fn_ = nullptr;
+    comm_barrier_fn_ = nullptr;
+    comm_destroy_fn_ = nullptr;
     runtime_buf_.clear();
     aicpu_binary_.clear();
     aicore_binary_.clear();
@@ -258,5 +289,96 @@ void ChipWorker::copy_from(uint64_t dst, uint64_t src, size_t size) {
         copy_from_device_ctx_fn_(device_ctx_, reinterpret_cast<void *>(dst), reinterpret_cast<const void *>(src), size);
     if (rc != 0) {
         throw std::runtime_error("copy_from failed with code " + std::to_string(rc));
+    }
+}
+
+uint64_t ChipWorker::comm_init(int rank, int nranks, const std::string &rootinfo_path) {
+    if (!device_set_) {
+        throw std::runtime_error("ChipWorker device not set; call set_device() first");
+    }
+    if (comm_stream_ != nullptr) {
+        throw std::runtime_error("comm_init: a comm session is already active on this ChipWorker");
+    }
+
+    // Bring ACL up on the calling thread before stream creation.  Onboard
+    // runs aclInit (idempotent) + per-thread aclrtSetDevice; sim's stub is
+    // a no-op; platforms with no distributed backend (a5 today) also no-op.
+    int rc = ensure_acl_ready_fn_(device_ctx_, device_id_);
+    if (rc != 0) {
+        throw std::runtime_error("ensure_acl_ready failed with code " + std::to_string(rc));
+    }
+
+    // Create an aclrtStream owned by this ChipWorker.  Sim / a5 stubs
+    // return NULL; their raw comm_init ignores the stream arg.  A NULL
+    // from a runtime that has a real comm backend is a genuine failure —
+    // we can't distinguish "stub returned NULL on purpose" from "onboard
+    // create failed" here, so we defer the check to comm_init's own
+    // return value below (a stub returns NULL from comm_init anyway).
+    void *stream = create_comm_stream_fn_(device_ctx_);
+
+    void *handle = comm_init_fn_(rank, nranks, stream, rootinfo_path.c_str());
+    if (handle == nullptr) {
+        // Roll back the stream we just created — otherwise the ChipWorker
+        // leaks it and the next comm_init attempt trips the
+        // "session already active" guard above.
+        if (stream != nullptr) {
+            destroy_comm_stream_fn_(device_ctx_, stream);
+        }
+        throw std::runtime_error("comm_init failed");
+    }
+
+    comm_stream_ = stream;
+    return reinterpret_cast<uint64_t>(handle);
+}
+
+uint64_t ChipWorker::comm_alloc_windows(uint64_t comm_handle, size_t win_size) {
+    uint64_t device_ctx = 0;
+    int rc = comm_alloc_windows_fn_(reinterpret_cast<void *>(comm_handle), win_size, &device_ctx);
+    if (rc != 0) {
+        throw std::runtime_error("comm_alloc_windows failed with code " + std::to_string(rc));
+    }
+    return device_ctx;
+}
+
+uint64_t ChipWorker::comm_get_local_window_base(uint64_t comm_handle) {
+    uint64_t base = 0;
+    int rc = comm_get_local_window_base_fn_(reinterpret_cast<void *>(comm_handle), &base);
+    if (rc != 0) {
+        throw std::runtime_error("comm_get_local_window_base failed with code " + std::to_string(rc));
+    }
+    return base;
+}
+
+size_t ChipWorker::comm_get_window_size(uint64_t comm_handle) {
+    size_t win_size = 0;
+    int rc = comm_get_window_size_fn_(reinterpret_cast<void *>(comm_handle), &win_size);
+    if (rc != 0) {
+        throw std::runtime_error("comm_get_window_size failed with code " + std::to_string(rc));
+    }
+    return win_size;
+}
+
+void ChipWorker::comm_barrier(uint64_t comm_handle) {
+    int rc = comm_barrier_fn_(reinterpret_cast<void *>(comm_handle));
+    if (rc != 0) {
+        throw std::runtime_error("comm_barrier failed with code " + std::to_string(rc));
+    }
+}
+
+void ChipWorker::comm_destroy(uint64_t comm_handle) {
+    int rc = comm_destroy_fn_(reinterpret_cast<void *>(comm_handle));
+
+    // Destroy our comm-owned stream regardless of the handle-destroy result —
+    // leaking the stream is the worse outcome (it keeps the device attached
+    // and blocks the next session).  We still surface the underlying rc
+    // below so callers see the original failure.
+    if (comm_stream_ != nullptr) {
+        int srv = destroy_comm_stream_fn_(device_ctx_, comm_stream_);
+        if (srv != 0 && rc == 0) rc = srv;
+    }
+    comm_stream_ = nullptr;
+
+    if (rc != 0) {
+        throw std::runtime_error("comm_destroy failed with code " + std::to_string(rc));
     }
 }

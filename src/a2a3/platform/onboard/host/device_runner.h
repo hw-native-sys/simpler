@@ -380,6 +380,26 @@ public:
     int ensure_acl_ready(int device_id);
 
     /**
+     * Create a caller-owned aclrtStream for comm_* usage.
+     *
+     * Intended to back the ChipWorker Python wrapper's internal stream
+     * ownership for distributed comm — callers pair it with
+     * destroy_comm_stream() at teardown.  The ACL context must already be
+     * ready on the calling thread (ensure_acl_ready()).
+     *
+     * @return aclrtStream pointer on success, NULL on failure.
+     */
+    void *create_comm_stream();
+
+    /**
+     * Destroy a stream previously returned by create_comm_stream().
+     * Tolerates a nullptr stream (returns 0).
+     *
+     * @return 0 on success, error code on failure.
+     */
+    int destroy_comm_stream(void *stream);
+
+    /**
      * Ensure the current thread has fresh run-scoped streams.
      *
      * This attaches the current thread to the target device and lazily creates

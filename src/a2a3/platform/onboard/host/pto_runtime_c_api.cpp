@@ -128,6 +128,30 @@ int ensure_acl_ready_ctx(DeviceContextHandle ctx, int device_id) {
     }
 }
 
+/*
+ * Stream creation/destruction exposed so the ChipWorker Python wrapper can
+ * drive comm_init end-to-end without leaking aclrtStream lifetime (or ACL
+ * libs) into Python.  Both entries go through the DeviceRunner so the ACL
+ * ready-flag and device bookkeeping stay consistent with the normal run path.
+ */
+void *create_comm_stream_ctx(DeviceContextHandle ctx) {
+    if (ctx == NULL) return NULL;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->create_comm_stream();
+    } catch (...) {
+        return NULL;
+    }
+}
+
+int destroy_comm_stream_ctx(DeviceContextHandle ctx, void *stream) {
+    if (ctx == NULL) return -1;
+    try {
+        return static_cast<DeviceRunner *>(ctx)->destroy_comm_stream(stream);
+    } catch (...) {
+        return -1;
+    }
+}
+
 void *device_malloc_ctx(DeviceContextHandle ctx, size_t size) {
     if (ctx == NULL) return NULL;
     try {

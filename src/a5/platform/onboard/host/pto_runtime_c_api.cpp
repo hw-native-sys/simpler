@@ -227,6 +227,71 @@ int finalize_device(DeviceContextHandle ctx) {
 }
 
 /* ===========================================================================
+ * ACL + comm_* placeholders (distributed runtime not yet implemented on a5)
+ *
+ * These exist only to satisfy ChipWorker's unconditional dlsym of the extension
+ * surface — the contract is "every host_runtime.so exports the full set; a
+ * runtime without a real implementation returns a not-supported result at
+ * call time" rather than having ChipWorker probe each symbol individually.
+ * When a5 grows real HCCL / sim distributed support these stubs get replaced
+ * wholesale; no ChipWorker changes are needed.
+ * =========================================================================== */
+
+int ensure_acl_ready_ctx(DeviceContextHandle ctx, int device_id) {
+    (void)ctx;
+    (void)device_id;
+    return 0;
+}
+
+void *create_comm_stream_ctx(DeviceContextHandle ctx) {
+    (void)ctx;
+    return NULL;
+}
+
+int destroy_comm_stream_ctx(DeviceContextHandle ctx, void *stream) {
+    (void)ctx;
+    (void)stream;
+    return 0;
+}
+
+void *comm_init(int rank, int nranks, void *stream, const char *rootinfo_path) {
+    (void)rank;
+    (void)nranks;
+    (void)stream;
+    (void)rootinfo_path;
+    return NULL;  // distributed runtime not yet supported on a5
+}
+
+int comm_alloc_windows(void *handle, size_t win_size, uint64_t *device_ctx_out) {
+    (void)handle;
+    (void)win_size;
+    (void)device_ctx_out;
+    return -1;
+}
+
+int comm_get_local_window_base(void *handle, uint64_t *base_out) {
+    (void)handle;
+    (void)base_out;
+    return -1;
+}
+
+int comm_get_window_size(void *handle, size_t *size_out) {
+    (void)handle;
+    (void)size_out;
+    return -1;
+}
+
+int comm_barrier(void *handle) {
+    (void)handle;
+    return -1;
+}
+
+int comm_destroy(void *handle) {
+    (void)handle;
+    return -1;
+}
+
+/* ===========================================================================
  * Internal helpers called from runtime_maker.cpp via Runtime.host_api
  * =========================================================================== */
 

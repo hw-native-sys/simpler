@@ -618,7 +618,30 @@ NB_MODULE(_task_interface, m) {
         .def("malloc", &ChipWorker::malloc, nb::arg("size"))
         .def("free", &ChipWorker::free, nb::arg("ptr"))
         .def("copy_to", &ChipWorker::copy_to, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
-        .def("copy_from", &ChipWorker::copy_from, nb::arg("dst"), nb::arg("src"), nb::arg("size"));
+        .def("copy_from", &ChipWorker::copy_from, nb::arg("dst"), nb::arg("src"), nb::arg("size"))
+        .def(
+            "comm_init", &ChipWorker::comm_init, nb::arg("rank"), nb::arg("nranks"), nb::arg("rootinfo_path"),
+            "Initialize a communicator for this rank.  ChipWorker owns ACL + stream "
+            "lifetime internally (onboard drives ensure_acl_ready + aclrtCreateStream; "
+            "sim ignores both).  Pair with comm_destroy for cleanup."
+        )
+        .def(
+            "comm_alloc_windows", &ChipWorker::comm_alloc_windows, nb::arg("comm_handle"), nb::arg("win_size"),
+            "Allocate per-rank windows and return the device CommContext pointer."
+        )
+        .def(
+            "comm_get_local_window_base", &ChipWorker::comm_get_local_window_base, nb::arg("comm_handle"),
+            "Return this rank's local window base address."
+        )
+        .def(
+            "comm_get_window_size", &ChipWorker::comm_get_window_size, nb::arg("comm_handle"),
+            "Return the actual per-rank window size (may differ from the hint)."
+        )
+        .def("comm_barrier", &ChipWorker::comm_barrier, nb::arg("comm_handle"), "Synchronize all ranks.")
+        .def(
+            "comm_destroy", &ChipWorker::comm_destroy, nb::arg("comm_handle"),
+            "Destroy the communicator and release its resources."
+        );
 
     // --- Standalone blob helpers ---
     m.def(

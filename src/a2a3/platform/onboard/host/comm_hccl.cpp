@@ -16,8 +16,8 @@
  * when extracting per-rank RDMA window addresses.
  */
 
-#include "host/comm.h"
-#include "common/comm_context.h"
+#include "platform_comm/comm.h"
+#include "platform_comm/comm_context.h"
 
 #include <chrono>
 #include <cstdio>

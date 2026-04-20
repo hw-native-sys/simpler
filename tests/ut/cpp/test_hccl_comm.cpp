@@ -65,8 +65,8 @@
 #include <gtest/gtest.h>
 
 #include "acl/acl.h"
-#include "common/comm_context.h"
-#include "host/comm.h"
+#include "platform_comm/comm.h"
+#include "platform_comm/comm_context.h"
 
 namespace {
 

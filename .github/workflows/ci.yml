@@ -289,7 +289,7 @@ jobs:
           source .venv/bin/activate
           source ${ASCEND_HOME_PATH}/bin/setenv.bash
           set -e
-          python -m pytest tests -m requires_hardware --platform a2a3 -v
+          python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v
 
       - name: Build and run C++ hardware unit tests
         run: |

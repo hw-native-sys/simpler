@@ -45,6 +45,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/performance_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/tensor_dump_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../aicpu/platform_aicpu_affinity.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/comm_sim.cpp"
 )
 
 if(DEFINED CUSTOM_SOURCE_DIRS)
@@ -81,6 +82,9 @@ target_include_directories(host_runtime
     PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}
         ${CMAKE_CURRENT_SOURCE_DIR}/../../include
+        # Shared platform_comm headers so comm_sim.cpp (in src/common) resolves
+        # its #include "platform_comm/comm.h" / "platform_comm/comm_context.h".
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common
         ${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/sim_context
         ${CMAKE_CUSTOM_INCLUDE_DIRS}
 )
@@ -91,6 +95,11 @@ target_link_libraries(host_runtime
         pthread
         dl
 )
+
+# POSIX shm_open / shm_unlink live in libSystem on macOS but require -lrt on Linux.
+if(UNIX AND NOT APPLE)
+    target_link_libraries(host_runtime PRIVATE rt)
+endif()
 
 # Allow undefined symbols from libcpu_sim_context.so (loaded with RTLD_GLOBAL at runtime).
 # On macOS, the linker requires -undefined dynamic_lookup; on Linux/gcc this is the default.

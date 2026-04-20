@@ -215,6 +215,9 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
         target_include_directories(${name} PRIVATE
             ${GTEST_INCLUDE_DIRS}
             ${PROJECT_ROOT}/src/a2a3/platform/include
+            # Shared platform_comm headers (comm.h / comm_context.h) moved
+            # under src/common so both a2a3 HCCL and a5/a2a3 sim can use them.
+            ${PROJECT_ROOT}/src/common
             ${ASCEND_HOME_PATH}/include
         )
         target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)

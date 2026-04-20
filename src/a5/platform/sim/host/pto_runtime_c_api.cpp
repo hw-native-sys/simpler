@@ -235,6 +235,30 @@ int finalize_device(DeviceContextHandle ctx) {
 }
 
 /* ===========================================================================
+ * ACL lifecycle stubs.  Sim has no ACL / aclrtStream concept, so these no-op
+ * to satisfy the uniform host_runtime.so ABI that ChipWorker dlsym's.  The
+ * real comm_* entry points come from src/common/platform_comm/comm_sim.cpp,
+ * which is compiled into this runtime via CMakeLists.
+ * =========================================================================== */
+
+int ensure_acl_ready_ctx(DeviceContextHandle ctx, int device_id) {
+    (void)ctx;
+    (void)device_id;
+    return 0;
+}
+
+void *create_comm_stream_ctx(DeviceContextHandle ctx) {
+    (void)ctx;
+    return NULL;
+}
+
+int destroy_comm_stream_ctx(DeviceContextHandle ctx, void *stream) {
+    (void)ctx;
+    (void)stream;
+    return 0;
+}
+
+/* ===========================================================================
  * Internal helpers called from runtime_maker.cpp via Runtime.host_api
  * =========================================================================== */
 

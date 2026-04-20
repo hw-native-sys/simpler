@@ -61,6 +61,29 @@ public:
     void copy_to(uint64_t dst, uint64_t src, size_t size);
     void copy_from(uint64_t dst, uint64_t src, size_t size);
 
+    /// Distributed communication primitives (optional — only available when
+    /// the bound runtime exports comm_*).  Wraps the backend-neutral C API
+    /// defined in src/<arch>/platform/include/host/comm.h.
+    ///
+    /// Unlike the raw C API (which takes a caller-owned aclrtStream),
+    /// ChipWorker's comm_init owns ACL + stream lifetime internally:
+    ///   - On onboard, comm_init drives ensure_acl_ready_ctx + creates an
+    ///     aclrtStream via the DeviceRunner, stashes the stream, and pairs
+    ///     it with comm_destroy which destroys it.  This keeps ACL out of
+    ///     the Python layer (matching the doc's L2-boundary contract:
+    ///     device-side lifecycle stays in C++, not leaking up as
+    ///     ensure_acl_ready / aclrtCreateStream surface area).
+    ///   - On sim, ACL / stream are no-ops; the stashed stream is null.
+    ///
+    /// One active comm session per ChipWorker is supported.  Users needing
+    /// multiple concurrent comms should instantiate multiple ChipWorkers.
+    uint64_t comm_init(int rank, int nranks, const std::string &rootinfo_path);
+    uint64_t comm_alloc_windows(uint64_t comm_handle, size_t win_size);
+    uint64_t comm_get_local_window_base(uint64_t comm_handle);
+    size_t comm_get_window_size(uint64_t comm_handle);
+    void comm_barrier(uint64_t comm_handle);
+    void comm_destroy(uint64_t comm_handle);
+
     int device_id() const { return device_id_; }
     bool initialized() const { return initialized_; }
     bool device_set() const { return device_set_; }
@@ -79,6 +102,15 @@ private:
         int, int
     );
     using FinalizeDeviceFn = int (*)(void *);
+    using EnsureAclReadyFn = int (*)(void *, int);
+    using CreateCommStreamFn = void *(*)(void *);
+    using DestroyCommStreamFn = int (*)(void *, void *);
+    using CommInitFn = void *(*)(int, int, void *, const char *);
+    using CommAllocWindowsFn = int (*)(void *, size_t, uint64_t *);
+    using CommGetLocalWindowBaseFn = int (*)(void *, uint64_t *);
+    using CommGetWindowSizeFn = int (*)(void *, size_t *);
+    using CommBarrierFn = int (*)(void *);
+    using CommDestroyFn = int (*)(void *);
 
     void *lib_handle_ = nullptr;
     CreateDeviceContextFn create_device_context_fn_ = nullptr;
@@ -91,7 +123,21 @@ private:
     GetRuntimeSizeFn get_runtime_size_fn_ = nullptr;
     RunRuntimeFn run_runtime_fn_ = nullptr;
     FinalizeDeviceFn finalize_device_fn_ = nullptr;
+    EnsureAclReadyFn ensure_acl_ready_fn_ = nullptr;
+    CreateCommStreamFn create_comm_stream_fn_ = nullptr;
+    DestroyCommStreamFn destroy_comm_stream_fn_ = nullptr;
+    CommInitFn comm_init_fn_ = nullptr;
+    CommAllocWindowsFn comm_alloc_windows_fn_ = nullptr;
+    CommGetLocalWindowBaseFn comm_get_local_window_base_fn_ = nullptr;
+    CommGetWindowSizeFn comm_get_window_size_fn_ = nullptr;
+    CommBarrierFn comm_barrier_fn_ = nullptr;
+    CommDestroyFn comm_destroy_fn_ = nullptr;
     void *device_ctx_ = nullptr;
+    // aclrtStream owned by the currently-active comm session (created inside
+    // comm_init on onboard via DeviceRunner::create_comm_stream, paired with
+    // destroy_comm_stream in comm_destroy).  Null when no comm is active or
+    // when running on a backend without ACL (sim).
+    void *comm_stream_ = nullptr;
 
     std::vector<uint8_t> runtime_buf_;
     std::vector<uint8_t> aicpu_binary_;

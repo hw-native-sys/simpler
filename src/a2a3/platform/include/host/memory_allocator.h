@@ -97,7 +97,7 @@ public:
      * @return Number of currently tracked pointers
      */
     size_t get_allocation_count() const {
-        std::lock_guard<std::mutex> lk(mu_);
+        std::scoped_lock lk(mu_);
         return ptr_set_.size();
     }
 

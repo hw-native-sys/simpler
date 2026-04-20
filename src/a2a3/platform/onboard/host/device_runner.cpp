@@ -299,6 +299,38 @@ int DeviceRunner::ensure_acl_ready(int device_id) {
     return 0;
 }
 
+void *DeviceRunner::create_comm_stream() {
+    aclrtStream stream = nullptr;
+    aclError aRet = aclrtCreateStream(&stream);
+    if (aRet != ACL_SUCCESS) {
+        LOG_ERROR("aclrtCreateStream failed: %d", static_cast<int>(aRet));
+        return nullptr;
+    }
+    return stream;
+}
+
+int DeviceRunner::destroy_comm_stream(void *stream) {
+    if (stream == nullptr) return 0;
+
+    // Best-effort teardown.  HcclBarrier submits async work on the stream;
+    // if the caller never blocked for completion (or hit the L1a 507018
+    // barrier regression), aclrtDestroyStream will refuse with 507901
+    // ("stream still has pending tasks").  We try to drain first, then
+    // destroy anyway, and log failures without propagating them — leaking
+    // a stream at teardown is strictly better than failing the teardown
+    // itself, which would block device finalization.  This matches the
+    // cleanup behavior of the L1a C++ hardware UT.
+    aclError sync_rc = aclrtSynchronizeStream(static_cast<aclrtStream>(stream));
+    if (sync_rc != ACL_SUCCESS) {
+        LOG_ERROR("aclrtSynchronizeStream during stream teardown failed: %d", static_cast<int>(sync_rc));
+    }
+    aclError destroy_rc = aclrtDestroyStream(static_cast<aclrtStream>(stream));
+    if (destroy_rc != ACL_SUCCESS) {
+        LOG_ERROR("aclrtDestroyStream failed (leaking stream): %d", static_cast<int>(destroy_rc));
+    }
+    return 0;
+}
+
 int DeviceRunner::prepare_run_context(int device_id) {
     int rc = attach_current_thread(device_id);
     if (rc != 0) {

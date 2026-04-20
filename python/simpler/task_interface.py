@@ -225,6 +225,44 @@ class ChipWorker:
         """Copy *size* bytes from worker *src* to host *dst*."""
         self._impl.copy_from(int(dst), int(src), int(size))
 
+    def comm_init(self, rank: int, nranks: int, rootinfo_path: str) -> int:
+        """Initialize a distributed communicator for this rank.
+
+        ChipWorker owns ACL bring-up and the aclrtStream internally, so
+        callers never touch ``aclInit`` / ``aclrtSetDevice`` / stream
+        lifetimes.  On sim, ACL / stream are not used.  Pair with
+        ``comm_destroy`` for teardown.
+
+        Args:
+            rank: This process's rank (0-based).
+            nranks: Total number of ranks.
+            rootinfo_path: Filesystem path used for rank handshake.
+
+        Returns:
+            Opaque communicator handle (uint64) for the other ``comm_*`` calls.
+        """
+        return int(self._impl.comm_init(int(rank), int(nranks), str(rootinfo_path)))
+
+    def comm_alloc_windows(self, comm_handle: int, win_size: int) -> int:
+        """Allocate per-rank windows. Returns a device CommContext pointer (uint64)."""
+        return int(self._impl.comm_alloc_windows(int(comm_handle), int(win_size)))
+
+    def comm_get_local_window_base(self, comm_handle: int) -> int:
+        """Return this rank's local window base address (uint64)."""
+        return int(self._impl.comm_get_local_window_base(int(comm_handle)))
+
+    def comm_get_window_size(self, comm_handle: int) -> int:
+        """Return the actual per-rank window size in bytes."""
+        return int(self._impl.comm_get_window_size(int(comm_handle)))
+
+    def comm_barrier(self, comm_handle: int) -> None:
+        """Synchronize all ranks."""
+        self._impl.comm_barrier(int(comm_handle))
+
+    def comm_destroy(self, comm_handle: int) -> None:
+        """Destroy the communicator and release its resources."""
+        self._impl.comm_destroy(int(comm_handle))
+
     @property
     def device_id(self):
         return self._impl.device_id
