@@ -49,11 +49,10 @@ pto-runtime/
 │   ├── platform_info.py               # Platform/runtime discovery
 │   ├── environment.py                 # PROJECT_ROOT resolver (wheel vs source tree)
 │   ├── pto_isa.py                     # PTO_ISA_ROOT discovery
+│   ├── build_runtimes.py              # Pre-build all runtime variants (invoked by pip install)
 │   └── _assets/                       # (wheel only) src/ + build/lib/ shipped with wheel
 │
 ├── examples/                          # Working examples
-│   ├── scripts/
-│   │   └── build_runtimes.py          # Pre-build all runtime variants (invoked by pip install)
 │   └── {arch}/                        # Architecture-specific examples
 │       ├── host_build_graph/
 │       ├── aicpu_build_graph/
@@ -90,7 +89,7 @@ The build has two layers: **runtime binaries** (platform-dependent, user-code-in
 
 Runtime binaries (host `.so`, aicpu `.so`, aicore `.o`) are pre-built during `pip install .` and cached in `build/lib/{arch}/{variant}/{runtime}/`. After wheel install they are shipped under `simpler_setup/_assets/build/lib/...`; `simpler_setup/environment.py::PROJECT_ROOT` resolves the right location automatically (see [Path resolution](#path-resolution)). The pipeline:
 
-1. `examples/scripts/build_runtimes.py` — detects available toolchains, iterates all (platform, runtime) combinations
+1. `simpler_setup/build_runtimes.py` — detects available toolchains, iterates all (platform, runtime) combinations
 2. `simpler_setup/runtime_builder.py` — orchestrates per-runtime build (lookup pre-built or compile)
 3. `simpler_setup/runtime_compiler.py` — invokes cmake for each target (host, aicpu, aicore)
 
@@ -187,7 +186,7 @@ If startup latency becomes painful, run `unset SKBUILD_EDITABLE_REBUILD` before 
 | First time / clean checkout | `pip install --no-build-isolation -e .` |
 | Runtime C++ source (`src/{arch}/runtime/`, `src/{arch}/platform/`) | Pass `--build` to a standalone `python test_*.py` invocation (incremental, ~1-2s); editable rebuild does **not** cover this (runtime cmake is decoupled from the top-level cmake target). For pytest batch runs, pass `--build` at the pytest CLI. |
 | Nanobind bindings (`python/bindings/`) | Auto-rebuilt on next import (`editable.rebuild = true`) |
-| Python-only code (`python/*.py`, `simpler_setup/*.py`, `examples/scripts/*.py`) | No rebuild needed (editable install) |
+| Python-only code (`python/*.py`, `simpler_setup/*.py`) | No rebuild needed (editable install) |
 | Examples / kernels (`examples/{arch}/`, `tests/st/`) | No rebuild needed, just re-run |
 
 ### The `--build` flag

@@ -8,15 +8,15 @@
 # -----------------------------------------------------------------------------------------------------------
 """Pytest configuration for Python unit tests (tests/ut/py/).
 
-Adds project directories to sys.path so that task_interface, host_worker,
-and examples/scripts modules are importable without installing the package.
+Adds project directories to sys.path so that simpler_setup, task_interface,
+and host_worker modules are importable without installing the package.
 """
 
 import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).parent.parent.parent.parent
-for _d in [_ROOT / "python", _ROOT / "examples" / "scripts"]:
+_ROOT = Path(__file__).resolve().parent.parent.parent.parent
+for _d in [_ROOT, _ROOT / "python"]:
     _s = str(_d)
     if _s not in sys.path:
         sys.path.insert(0, _s)

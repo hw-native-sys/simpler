@@ -44,7 +44,7 @@ jobs:
             cmake-sim-${{ runner.os }}-
 
       - name: Build sim runtimes (generates per-target compile_commands.json)
-        run: python examples/scripts/build_runtimes.py --platforms a2a3sim a5sim
+        run: python simpler_setup/build_runtimes.py --platforms a2a3sim a5sim
 
       - name: Run pre-commit
         uses: pre-commit/action@v3.0.0
@@ -154,6 +154,8 @@ jobs:
 
   # ---------- Simulation scene tests ----------
   st-sim-a2a3:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -210,6 +212,8 @@ jobs:
           exit $rc
 
   st-sim-a5:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -267,8 +271,6 @@ jobs:
 
   # ---------- Unit tests (a2a3 hardware, Python + C++) ----------
   ut-a2a3:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.a2a3_changed == 'true'
     runs-on: [self-hosted, a2a3]
     timeout-minutes: 30
 
@@ -392,8 +394,6 @@ jobs:
 
   # ---------- Unit tests (a5 hardware, Python + C++) ----------
   ut-a5:
-    needs: detect-changes
-    if: needs.detect-changes.outputs.a5_changed == 'true'
     runs-on: [self-hosted, a5]
     timeout-minutes: 30
 

@@ -13,7 +13,7 @@ compile_commands.json that contains the file is used as-is (no merging).
 This ensures each file is analysed with the exact flags of its compilation unit.
 
 If no sim build cache exists, the sim runtimes are built first:
-    python examples/scripts/build_runtimes.py
+    python simpler_setup/build_runtimes.py
 """
 
 import json
@@ -25,7 +25,7 @@ import sys
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parents[2]
-_BUILD_RUNTIMES = _ROOT / "examples" / "scripts" / "build_runtimes.py"
+_BUILD_RUNTIMES = _ROOT / "simpler_setup" / "build_runtimes.py"
 _CACHE_DIR = _ROOT / "build" / "cache"
 
 from simpler_setup.platform_info import load_build_config, to_platform  # noqa: E402

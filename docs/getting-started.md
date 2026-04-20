@@ -16,7 +16,7 @@ The pto-isa repository provides header files needed for kernel compilation on th
 The test framework automatically handles PTO_ISA_ROOT setup:
 
 1. Checks if `PTO_ISA_ROOT` is already set
-2. If not, clones pto-isa to `examples/scripts/_deps/pto-isa` on first run
+2. If not, clones pto-isa to `build/pto-isa` on first run
 3. Passes the resolved path to the kernel compiler
 
 **Automatic Setup (Recommended):**

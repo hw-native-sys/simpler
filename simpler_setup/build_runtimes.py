@@ -14,9 +14,9 @@ persistent build directories (build/cache/) for incremental compilation.
 Final binaries are placed in build/lib/{arch}/{variant}/{runtime}/.
 
 Usage:
-    python examples/scripts/build_runtimes.py                     # auto-detect platforms
-    python examples/scripts/build_runtimes.py --platforms a2a3sim  # build specific platform
-    python examples/scripts/build_runtimes.py --list               # list buildable platforms
+    python simpler_setup/build_runtimes.py                     # auto-detect platforms
+    python simpler_setup/build_runtimes.py --platforms a2a3sim  # build specific platform
+    python simpler_setup/build_runtimes.py --list               # list buildable platforms
 """
 
 import argparse
@@ -29,8 +29,9 @@ from typing import Optional
 
 # Pre-install bootstrap: this script is invoked by CMake during `pip install .`
 # before simpler_setup/simpler are on sys.path. Point at the source tree so
-# `from simpler_setup...` and `from simpler...` resolve.
-_project_root = Path(__file__).resolve().parent.parent.parent
+# `from simpler_setup...` (which eagerly imports `simpler` via its __init__.py)
+# resolves.
+_project_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_project_root))
 sys.path.insert(0, str(_project_root / "python"))
 

@@ -22,9 +22,6 @@ venv/
 .claude/worktrees
 .claude/plans
 
-# Git cloned dependencies (not tracked in repo)
-examples/scripts/_deps/
-
 # Profiling files
 outputs
 tmp

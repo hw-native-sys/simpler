@@ -31,7 +31,7 @@ add_subdirectory(python/bindings)
 # Pre-build runtime binaries (persistent build dirs for incremental compilation)
 add_custom_target(build_runtimes ALL
     COMMAND ${Python_EXECUTABLE}
-        ${CMAKE_SOURCE_DIR}/examples/scripts/build_runtimes.py
+        ${CMAKE_SOURCE_DIR}/simpler_setup/build_runtimes.py
         --lib-dir ${CMAKE_SOURCE_DIR}/build/lib
         --cache-dir ${CMAKE_SOURCE_DIR}/build/cache
     COMMENT "Building runtime binaries (incremental)..."

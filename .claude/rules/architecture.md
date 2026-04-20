@@ -26,7 +26,7 @@ The 4 files `kernel_compiler.py`, `runtime_compiler.py`, `toolchain.py`, `elf_pa
 | Per-case knobs (aicpu_thread_num, block_dim) | `CASES[*]["config"]` on the SceneTestCase class |
 | Per-runtime build config | `src/{arch}/runtime/{runtime}/build_config.py` |
 | Runtime build orchestration | `simpler_setup/runtime_builder.py` → `simpler_setup/runtime_compiler.py` → cmake |
-| Pre-build all runtimes | `examples/scripts/build_runtimes.py` (invoked by `pip install .`) |
+| Pre-build all runtimes | `simpler_setup/build_runtimes.py` (invoked by `pip install .`) |
 | Platform/runtime discovery | `simpler_setup/platform_info.py` |
 | Kernel compilation | `simpler_setup/kernel_compiler.py` (one `.cpp` per `func_id`) |
 | Python bindings | `python/bindings/` (nanobind extension for ChipWorker, task types) |

@@ -74,7 +74,7 @@ Anything that needs to find `src/`, `build/lib/`, or `build/cache/` MUST go thro
    - `from platform_info import ...`
    - `from scene_test import ...`
    - `from paged_attention_golden import ...`
-2. **No `sys.path.insert` to make bare imports work.** The single allowed exception is `examples/scripts/build_runtimes.py`, which is invoked by CMake **before** the package is installed and therefore must bootstrap the source tree onto `sys.path`. That bootstrap is documented inline in the file.
+2. **No `sys.path.insert` to make bare imports work.** The single allowed exception is `simpler_setup/build_runtimes.py`, which is invoked by CMake **before** the package is installed and therefore must bootstrap the source tree onto `sys.path`. That bootstrap is documented inline in the file.
 3. **Build/runtime assembly lives in `simpler_setup`, not `simpler`.** If a new module is shared by the test framework (e.g. new scene-test helpers, new parallel-scheduler knobs), it goes under `simpler_setup/`. If it's part of the user-facing runtime API, it goes under `python/simpler/`.
 4. **Goldens** (shared reference compute used by multiple test sites) live in `simpler_setup/goldens/`. New goldens are added as `simpler_setup/goldens/<name>.py`. Per-test ad-hoc goldens stay next to their `kernel_config.py` and aren't packaged.
 5. **`pyproject.toml` `wheel.packages`** must list every directory that needs to ship in the wheel. Currently: `["simpler_setup", "python/simpler"]`. Subpackages (e.g., `simpler_setup/goldens/`) ship automatically as long as they have an `__init__.py`.
@@ -92,7 +92,7 @@ Plus one build-time entry point invoked by CMake during `pip install`:
 
 | Command | Purpose |
 | ------- | ------- |
-| `python examples/scripts/build_runtimes.py` | Pre-build all runtime variants. Must work before the package is installed → uses an explicit `sys.path.insert` to point at the source tree. |
+| `python simpler_setup/build_runtimes.py` | Pre-build all runtime variants. Must work before the package is installed → uses an explicit `sys.path.insert` to point at the source tree. |
 
 ## Install modes
 
@@ -143,7 +143,7 @@ Any change that touches:
 - `pyproject.toml` `[tool.scikit-build]` section
 - `pyproject.toml` `[tool.pytest.ini_options]` section
 - `CMakeLists.txt` install rules
-- `examples/scripts/build_runtimes.py` (the pre-install bootstrap)
+- `simpler_setup/build_runtimes.py` (the pre-install bootstrap)
 - `python/bindings/CMakeLists.txt` (nanobind module placement)
 
 …must keep the **5 install modes × 2 entry points = 10 combinations** green. CI enforces this on macOS + Ubuntu via the `packaging-matrix` job in `.github/workflows/ci.yml`, which calls a single shared script:

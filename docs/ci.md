@@ -10,7 +10,7 @@ Design principles:
 2. **Runner matches hardware tier** — no-hardware tests run on `ubuntu-latest`; platform-specific tests run on self-hosted runners with the matching label (`a2a3`, `a5`).
 3. **`--platform` is the only filter** — pytest uses `--platform` + the `requires_hardware` marker; ctest uses label `-LE` exclusion. No `-m st`, no `-m "not requires_hardware"`.
 4. **sim = no hardware** — `a2a3sim`/`a5sim` jobs run on github-hosted runners alongside unit tests.
-5. **Skip irrelevant platforms** — `detect-changes` gates hardware jobs so pure a5 PRs skip a2a3 runners and vice versa.
+5. **Skip irrelevant platforms for scene tests** — `detect-changes` gates `st-sim-*` and `st-onboard-*` so pure-a5 PRs skip a2a3 scene-test runs and vice versa. **UT jobs (`ut`, `ut-a2a3`, `ut-a5`) are unconditional** — unit tests cover shared contracts and the cost of a falsely-skipped regression outweighs the savings.
 
 ## Full Job Matrix
 
@@ -27,14 +27,14 @@ The complete test-type × hardware-tier matrix. Empty cells have no tests yet; o
 PullRequest
   ├── pre-commit             (ubuntu-latest)
   ├── packaging-matrix       (ubuntu + macOS)
-  ├── ut                     (ubuntu + macOS)        — Python + C++ UT, no hardware
-  ├── st-sim-a2a3            (ubuntu + macOS)
-  ├── st-sim-a5              (ubuntu + macOS)
-  ├── detect-changes         (ubuntu-latest)         — gates a2a3 + a5 hw jobs
-  ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware
-  ├── st-onboard-a2a3        (a2a3 self-hosted)
-  ├── ut-a5                  (a5 self-hosted)        — Python + C++ UT, a5 hardware
-  └── st-onboard-a5          (a5 self-hosted)
+  ├── ut                     (ubuntu + macOS)        — Python + C++ UT, no hardware [always]
+  ├── detect-changes         (ubuntu-latest)         — outputs a{2a3,5}_changed flags
+  ├── st-sim-a2a3            (ubuntu + macOS)        — gated by a2a3_changed
+  ├── st-sim-a5              (ubuntu + macOS)        — gated by a5_changed
+  ├── ut-a2a3                (a2a3 self-hosted)      — Python + C++ UT, a2a3 hardware [always]
+  ├── st-onboard-a2a3        (a2a3 self-hosted)      — gated by a2a3_changed
+  ├── ut-a5                  (a5 self-hosted)        — Python + C++ UT, a5 hardware [always]
+  └── st-onboard-a5          (a5 self-hosted)        — gated by a5_changed
 ```
 
 | Job | Runner | What it runs |
@@ -96,9 +96,9 @@ not need `--max-parallel` manually.
 ### Scheduling constraints
 
 - Sim scene tests and no-hardware unit tests run on github-hosted runners (no hardware).
-- `detect-changes` gates all hardware jobs: pure a5 PRs skip a2a3 runners and vice versa.
-- a2a3 tests (st + ut) only run on the `a2a3` self-hosted machine when a2a3-relevant files change.
-- a5 tests (st + ut) only run on the `a5` self-hosted machine when a5-relevant files change.
+- `detect-changes` computes two flags (`a2a3_changed`, `a5_changed`) from the PR diff. Each flag is `false` only when *every* changed file is in the opposite platform's tree (`src/{arch}/`, `examples/{arch}/`, `tests/{st,device_tests}/{arch}/`) or in the `NON_CODE` list (`docs/`, `.docs/`, `.claude/`, `KNOWN_ISSUES.md`, `.gitignore`, `README.md`, `.pre-commit-config.yaml`). Anything else — shared C++ (`src/common/`), Python (`python/`, `simpler_setup/`), build files (`CMakeLists.txt`, `pyproject.toml`), test infra (`tests/ut/`, `tests/lint/`), tooling (`tools/`) — flips both flags to `true`.
+- **Gated jobs (scene tests only):** `st-sim-{a2a3,a5}`, `st-onboard-{a2a3,a5}` run iff their platform's flag is `true`.
+- **Unconditional jobs (all UT):** `ut`, `ut-a2a3`, `ut-a5` always run. The gating regex intentionally does **not** include `tests/ut/` — unit tests exercise shared contracts (nanobind bindings, RuntimeBuilder, ring buffers, etc.) and the risk of silently skipping a regression outweighs the CI minutes saved. A consequence: self-hosted runners (`a2a3`, `a5`) are always busy for at least the UT job, even on doc-only PRs that skip all scene tests.
 
 ## Hardware Classification
 

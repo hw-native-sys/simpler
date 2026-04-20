@@ -52,7 +52,7 @@ skip-magic-trailing-comma = false
 line-ending = "lf"
 
 [tool.pyright]
-include = ["python", "simpler_setup", "tests", "examples/scripts"]
+include = ["python", "simpler_setup", "tests"]
 exclude = ["**/__pycache__", "build", "dist", "tests/st"]
 extraPaths = ["python"]
 typeCheckingMode = "basic"
