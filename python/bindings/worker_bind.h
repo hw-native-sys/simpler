@@ -28,6 +28,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <cstdint>
 #include <stdexcept>
 
 #include "chip_bootstrap_channel.h"
@@ -39,6 +40,40 @@
 #include "worker_manager.h"
 
 namespace nb = nanobind;
+
+// ---------------------------------------------------------------------------
+// Mailbox acquire/release helpers (exposed to Python as _mailbox_load_i32 /
+// _mailbox_store_i32). Mirror WorkerThread::read_mailbox_state /
+// write_mailbox_state in worker_manager.cpp so the Python side of the mailbox
+// handshake uses the same memory order as the C++ side. Without these, a
+// plain struct.pack_into("i", ...) on the Python child followed by the parent
+// C++ acquire-load on aarch64 can observe the state flip before the
+// preceding error-field writes are visible.
+inline int32_t mailbox_load_i32(uint64_t addr) {
+    volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(addr);
+    int32_t v;
+#if defined(__aarch64__)
+    __asm__ volatile("ldar %w0, [%1]" : "=r"(v) : "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    v = *ptr;
+    __asm__ volatile("" ::: "memory");
+#else
+    __atomic_load(ptr, &v, __ATOMIC_ACQUIRE);
+#endif
+    return v;
+}
+
+inline void mailbox_store_i32(uint64_t addr, int32_t v) {
+    volatile int32_t *ptr = reinterpret_cast<volatile int32_t *>(addr);
+#if defined(__aarch64__)
+    __asm__ volatile("stlr %w0, [%1]" : : "r"(v), "r"(ptr) : "memory");
+#elif defined(__x86_64__)
+    __asm__ volatile("" ::: "memory");
+    *ptr = v;
+#else
+    __atomic_store(ptr, &v, __ATOMIC_RELEASE);
+#endif
+}
 
 inline void bind_worker(nb::module_ &m) {
     // --- WorkerType ---
@@ -279,4 +314,22 @@ inline void bind_worker(nb::module_ &m) {
         .def_prop_ro("actual_window_size", &ChipBootstrapChannel::actual_window_size)
         .def_prop_ro("buffer_ptrs", &ChipBootstrapChannel::buffer_ptrs)
         .def_prop_ro("error_message", &ChipBootstrapChannel::error_message);
+
+    // Private mailbox acquire/release helpers — only for simpler.worker. The
+    // underscore prefix keeps them out of the public surface; they do not
+    // appear in task_interface.__all__.
+    m.def(
+        "_mailbox_load_i32",
+        [](uint64_t addr) -> int32_t {
+            return mailbox_load_i32(addr);
+        },
+        nb::arg("addr"), "Acquire-load a 32-bit mailbox word at `addr`."
+    );
+    m.def(
+        "_mailbox_store_i32",
+        [](uint64_t addr, int32_t value) {
+            mailbox_store_i32(addr, value);
+        },
+        nb::arg("addr"), nb::arg("value"), "Release-store a 32-bit mailbox word at `addr`."
+    );
 }
