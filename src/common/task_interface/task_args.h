@@ -176,7 +176,7 @@ using TaskArgs = TaskArgsTpl<ContinuousTensor, uint64_t, 0, 0, TensorArgType>;
 
 // L2 runtime ABI: fixed POD matching runtime.so byte-for-byte.
 // Assembled from a TaskArgsView on the child side just before pto2_run_runtime.
-using ChipStorageTaskArgs = TaskArgsTpl<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, 128>;
+using ChipStorageTaskArgs = TaskArgsTpl<ContinuousTensor, uint64_t, CHIP_MAX_TENSOR_ARGS, CHIP_MAX_SCALAR_ARGS>;
 
 // ============================================================================
 // TaskArgsView — zero-copy view used by IWorker::run and the wire format
@@ -262,8 +262,8 @@ inline ChipStorageTaskArgs view_to_chip_storage(TaskArgsView view) {
     if (static_cast<size_t>(view.tensor_count) > CHIP_MAX_TENSOR_ARGS) {
         throw std::out_of_range("view_to_chip_storage: tensor_count exceeds CHIP_MAX_TENSOR_ARGS");
     }
-    if (view.scalar_count > 128) {
-        throw std::out_of_range("view_to_chip_storage: scalar_count exceeds 128");
+    if (static_cast<size_t>(view.scalar_count) > CHIP_MAX_SCALAR_ARGS) {
+        throw std::out_of_range("view_to_chip_storage: scalar_count exceeds CHIP_MAX_SCALAR_ARGS");
     }
     out.tensor_count_ = view.tensor_count;
     out.scalar_count_ = view.scalar_count;

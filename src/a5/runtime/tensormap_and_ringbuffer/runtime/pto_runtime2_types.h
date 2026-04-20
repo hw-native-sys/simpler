@@ -349,12 +349,12 @@ struct PTO2TaskPayload {
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
     // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
-    // === Cache lines 35-50 (1024B) — scalars ===
+    // === Cache lines 35-38 (256B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
 
     // Layout verification (size checks that don't need offsetof).
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
-    static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 1024, "scalar region must be 1024B (16 cache lines)");
+    static_assert(MAX_SCALAR_ARGS * sizeof(uint64_t) == 256, "scalar region must be 256B (4 cache lines)");
 
     /**
      * Initialize payload: copy tensors, store scalars.

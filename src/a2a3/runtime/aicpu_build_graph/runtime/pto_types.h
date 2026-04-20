@@ -40,7 +40,7 @@
 
 // Task arguments
 #define MAX_TENSOR_ARGS 16   // Maximum tensor parameters per task
-#define MAX_SCALAR_ARGS 128  // Maximum scalar parameters per task
+#define MAX_SCALAR_ARGS 32   // Maximum scalar parameters per task
 #define PTO2_MAX_OUTPUTS 16  // Maximum outputs per task
 #define PTO2_MAX_INPUTS 16   // Maximum inputs per task
 #define PTO2_MAX_INOUTS 8    // Maximum in-out args per task
@@ -211,7 +211,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     void add_scalar(T value) {
         static_assert(is_supported_scalar_arg_v<T>, "add_scalar: type must be arithmetic or enum");
         if (scalar_count_ >= MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
             return;
         }
         scalars_[scalar_count_++] = to_u64(value);
@@ -219,7 +219,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     void add_scalars(const uint64_t *values, int count) {
         if (scalar_count_ + count > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
             return;
         }
         memcpy(&scalars_[scalar_count_], values, count * sizeof(uint64_t));
@@ -234,7 +234,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
      */
     void add_scalars_i32(const int32_t *values, int count) {
         if (scalar_count_ + count > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
             return;
         }
         uint64_t *dst = &scalars_[scalar_count_];
@@ -268,7 +268,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
             return;
         }
         if (scalar_count_ + count > MAX_SCALAR_ARGS) {
-            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=128)");
+            set_error("Too many scalar args (exceeds MAX_SCALAR_ARGS=32)");
             return;
         }
         memcpy(&scalars_[scalar_count_], &src.scalars_[src_offset], count * sizeof(uint64_t));

@@ -39,7 +39,7 @@
 #include "intrinsic.h"
 #include "pto_types.h"
 
-/** Max dispatch arguments: 128 scalars + up to 16 tensor pointers + ext params */
+/** Max dispatch arguments: 32 scalars + up to 16 tensor pointers + ext params */
 #ifndef PTO2_DISPATCH_MAX_ARGS
 #define PTO2_DISPATCH_MAX_ARGS (MAX_TENSOR_ARGS + MAX_SCALAR_ARGS + PTO2_EXT_PARAMS_COUNT)
 #endif
