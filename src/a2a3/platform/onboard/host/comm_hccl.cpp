@@ -659,15 +659,14 @@ extern "C" int comm_get_window_size(CommHandle h, size_t *size_out) {
 
 extern "C" int comm_barrier(CommHandle h) {
     if (!h) return -1;
+    // HcclBarrier is synchronous — it blocks until all ranks arrive.
+    // Do NOT call aclrtSynchronizeStream after it: HcclBarrier internally
+    // switches the thread's ACL context, which invalidates the caller-owned
+    // stream for context-checked ACL calls (error 507018).
     HcclResult hret = hccl_barrier(h->hccl_comm, h->stream);
     if (hret != HCCL_SUCCESS) {
         fprintf(stderr, "[comm rank %d] HcclBarrier failed: %d\n", h->rank, static_cast<int>(hret));
         return static_cast<int>(hret);
-    }
-    aclError aRet = aclrtSynchronizeStream(h->stream);
-    if (aRet != ACL_SUCCESS) {
-        fprintf(stderr, "[comm rank %d] aclrtSynchronizeStream failed: %d\n", h->rank, static_cast<int>(aRet));
-        return static_cast<int>(aRet);
     }
     return 0;
 }
