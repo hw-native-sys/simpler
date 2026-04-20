@@ -47,13 +47,19 @@ uint32_t sim_get_physical_core_id() {
 // These point into cpu_sim_context.cpp (host_runtime SO) and set per-thread
 // subblock_id and cluster_id for pto-isa's TPUSH/TPOP hooks.
 using SimSetUint32Fn = void (*)(uint32_t);
+using SimSetExecutionContextFn = void (*)(uint32_t, uint32_t, uint32_t);
 
 static SimSetUint32Fn g_set_subblock_id_fn = nullptr;
 static SimSetUint32Fn g_set_cluster_id_fn = nullptr;
+static SimSetExecutionContextFn g_set_execution_context_fn = nullptr;
 
 extern "C" void set_sim_core_identity_helpers(void *set_subblock_id, void *set_cluster_id) {
     g_set_subblock_id_fn = reinterpret_cast<SimSetUint32Fn>(set_subblock_id);
     g_set_cluster_id_fn = reinterpret_cast<SimSetUint32Fn>(set_cluster_id);
+}
+
+extern "C" void set_sim_execution_context_helper(void *set_execution_context) {
+    g_set_execution_context_fn = reinterpret_cast<SimSetExecutionContextFn>(set_execution_context);
 }
 
 // Declare the original function (defined in aicore_executor.cpp with weak linkage)
@@ -85,13 +91,16 @@ extern "C" void aicore_execute_wrapper(
     uint32_t block_dim = static_cast<uint32_t>(runtime->worker_count) / PLATFORM_CORES_PER_BLOCKDIM;
     uint32_t cluster_id;
     uint32_t subblock_id;
+    uint32_t subblock_dim;
     if (core_type == CoreType::AIC) {
         cluster_id = physical_core_id;
         subblock_id = 0;
+        subblock_dim = 1;
     } else {
         uint32_t aiv_idx = physical_core_id - block_dim;
         cluster_id = aiv_idx / 2;
         subblock_id = aiv_idx % 2;
+        subblock_dim = PLATFORM_CORES_PER_BLOCKDIM - 1;
     }
 
     if (g_set_subblock_id_fn != nullptr) {
@@ -99,6 +108,9 @@ extern "C" void aicore_execute_wrapper(
     }
     if (g_set_cluster_id_fn != nullptr) {
         g_set_cluster_id_fn(cluster_id);
+    }
+    if (g_set_execution_context_fn != nullptr) {
+        g_set_execution_context_fn(static_cast<uint32_t>(block_idx), subblock_id, subblock_dim);
     }
 
     aicore_execute(runtime, block_idx, core_type);

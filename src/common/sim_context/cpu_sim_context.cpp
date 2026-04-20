@@ -120,7 +120,9 @@ DeviceSimContext *get_current_device_context() {
 // ---------------------------------------------------------------------------
 
 std::mutex g_identity_key_mutex;
+pthread_key_t g_block_idx_key{};
 pthread_key_t g_subblock_id_key{};
+pthread_key_t g_subblock_dim_key{};
 pthread_key_t g_cluster_id_key{};
 std::atomic<bool> g_identity_keys_initialized{false};
 
@@ -132,11 +134,22 @@ void ensure_identity_keys() {
     if (g_identity_keys_initialized.load(std::memory_order_relaxed)) {
         return;
     }
+    if (pthread_key_create(&g_block_idx_key, nullptr) != 0) {
+        return;
+    }
     if (pthread_key_create(&g_subblock_id_key, nullptr) != 0) {
+        pthread_key_delete(g_block_idx_key);
+        return;
+    }
+    if (pthread_key_create(&g_subblock_dim_key, nullptr) != 0) {
+        pthread_key_delete(g_block_idx_key);
+        pthread_key_delete(g_subblock_id_key);
         return;
     }
     if (pthread_key_create(&g_cluster_id_key, nullptr) != 0) {
+        pthread_key_delete(g_block_idx_key);
         pthread_key_delete(g_subblock_id_key);
+        pthread_key_delete(g_subblock_dim_key);
         return;
     }
     g_identity_keys_initialized.store(true, std::memory_order_release);
@@ -213,6 +226,15 @@ void sim_context_set_subblock_id(uint32_t subblock_id) {
     pthread_setspecific(g_subblock_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(subblock_id)));
 }
 
+void sim_context_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim) {
+    ensure_identity_keys();
+    pthread_setspecific(g_block_idx_key, reinterpret_cast<void *>(static_cast<uintptr_t>(block_idx)));
+    pthread_setspecific(g_subblock_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(subblock_id)));
+    pthread_setspecific(
+        g_subblock_dim_key, reinterpret_cast<void *>(static_cast<uintptr_t>((subblock_dim == 0) ? 1 : subblock_dim))
+    );
+}
+
 void sim_context_set_cluster_id(uint32_t cluster_id) {
     ensure_identity_keys();
     pthread_setspecific(g_cluster_id_key, reinterpret_cast<void *>(static_cast<uintptr_t>(cluster_id)));
@@ -227,6 +249,31 @@ extern "C" uint32_t pto_sim_get_subblock_id() {
         return 0;
     }
     return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_subblock_id_key)));
+}
+
+extern "C" void pto_cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim) {
+    sim_context_set_execution_context(block_idx, subblock_id, subblock_dim);
+}
+
+extern "C" void pto_cpu_sim_get_execution_context(
+    uint32_t *block_idx, uint32_t *subblock_id, uint32_t *subblock_dim
+) {
+    if (block_idx == nullptr || subblock_id == nullptr || subblock_dim == nullptr) {
+        return;
+    }
+
+    if (!g_identity_keys_initialized.load(std::memory_order_acquire)) {
+        *block_idx = 0;
+        *subblock_id = 0;
+        *subblock_dim = 1;
+        return;
+    }
+
+    *block_idx = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_block_idx_key)));
+    *subblock_id = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_subblock_id_key)));
+    const uint32_t stored_subblock_dim =
+        static_cast<uint32_t>(reinterpret_cast<uintptr_t>(pthread_getspecific(g_subblock_dim_key)));
+    *subblock_dim = (stored_subblock_dim == 0) ? 1 : stored_subblock_dim;
 }
 
 extern "C" void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size) {

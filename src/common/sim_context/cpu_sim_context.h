@@ -54,6 +54,12 @@ uint32_t pto_sim_get_subblock_id(void);
  */
 void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size);
 
+/** Set the current thread's execution context for PTO ISA cpu_stub.hpp. */
+void pto_cpu_sim_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim);
+
+/** Read the current thread's execution context for PTO ISA cpu_stub.hpp. */
+void pto_cpu_sim_get_execution_context(uint32_t *block_idx, uint32_t *subblock_id, uint32_t *subblock_dim);
+
 #ifdef __cplusplus
 }
 #endif
@@ -65,6 +71,9 @@ void *pto_sim_get_pipe_shared_state(uint64_t pipe_key, size_t size);
  * Called by aicore_execute_wrapper (via function pointer injection).
  */
 void sim_context_set_subblock_id(uint32_t subblock_id);
+
+/** Set the current thread's simulated execution context. */
+void sim_context_set_execution_context(uint32_t block_idx, uint32_t subblock_id, uint32_t subblock_dim);
 
 /**
  * Set the current thread's simulated cluster_id.

@@ -196,6 +196,12 @@ int DeviceRunner::ensure_binaries_loaded(
                 reinterpret_cast<void *>(sim_context_set_cluster_id)
             );
         }
+        auto set_execution_context_helper = reinterpret_cast<void (*)(void *)>(
+            dlsym(aicore_so_handle_, "set_sim_execution_context_helper")
+        );
+        if (set_execution_context_helper != nullptr) {
+            set_execution_context_helper(reinterpret_cast<void *>(pto_cpu_sim_set_execution_context));
+        }
     }
 
     return 0;
