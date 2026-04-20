@@ -38,6 +38,7 @@
 
 #include <cerrno>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -55,6 +56,16 @@ constexpr int SIM_COMM_TIMEOUT_SECONDS = 120;
 constexpr int FTRUNCATE_POLL_INTERVAL_US = 1000;
 constexpr int BARRIER_POLL_INTERVAL_US = 50;
 constexpr int DESTROY_POLL_INTERVAL_US = 1000;
+
+// macOS's PSHMNAMLEN is 31 (name length excluding the null terminator).  Linux
+// accepts up to NAME_MAX (255), but we pick the tighter value so the same
+// backend runs on both.  The name layout below is fully constant-width so we
+// can static_assert on it at compile time.
+constexpr size_t SHM_NAME_MAX_LEN = 31;
+constexpr size_t SHM_NAME_PREFIX_LEN = 9;  // "/simpler_"
+constexpr size_t SHM_NAME_HEX_FIELD = 8;   // %08x: exactly 8 hex chars
+constexpr size_t SHM_NAME_LEN = SHM_NAME_PREFIX_LEN + SHM_NAME_HEX_FIELD + 1 /*underscore*/ + SHM_NAME_HEX_FIELD;
+static_assert(SHM_NAME_LEN <= SHM_NAME_MAX_LEN, "shm name exceeds macOS PSHMNAMLEN");
 
 struct SharedHeader {
     volatile int nranks;
@@ -80,10 +91,28 @@ struct SharedHeader {
 // parent PID and therefore a fresh name.  Cross-node / cross-parent launches
 // on sim are out of scope; callers relying on those topologies must use the
 // HCCL backend.
+//
+// Name layout is fixed-width `"/simpler_%08x_%08x"` = 26 bytes (plus NUL), well
+// under macOS's PSHMNAMLEN=31.  The width is constant-propagated into
+// SHM_NAME_LEN above so a future format-string change gets caught by the
+// static_assert at compile time rather than by an EFILENAMEMAXEXCEEDED at
+// runtime on macOS.  PID is truncated to its low 32 bits (pid_t is int32_t on
+// every target we support) and the 64-bit rootinfo-path hash is xor-folded to
+// 32 bits; both are still collision-resistant for the canonical
+// "one driver spawns N ranks" launch pattern.
 std::string make_shm_name(const char *rootinfo_path) {
     size_t h = std::hash<std::string>{}(rootinfo_path ? rootinfo_path : "default");
-    char buf[96];
-    std::snprintf(buf, sizeof(buf), "/simpler_comm_%d_%zx", static_cast<int>(getppid()), h);
+    uint32_t h32 = static_cast<uint32_t>(h ^ (h >> 32));
+    char buf[SHM_NAME_LEN + 1];
+    int written = std::snprintf(buf, sizeof(buf), "/simpler_%08x_%08x", static_cast<uint32_t>(getppid()), h32);
+    // Defensive runtime check: snprintf returns -1 only on I/O / encoding
+    // errors, and the static_assert above already pins the upper bound of a
+    // successful write, so this is really an "impossible path" guard for the
+    // libc-misbehaving edge case.
+    if (written < 0 || static_cast<size_t>(written) != SHM_NAME_LEN) {
+        std::fprintf(stderr, "[comm_sim] snprintf produced unexpected length %d for shm name\n", written);
+        return {};
+    }
     return {buf};
 }
 
