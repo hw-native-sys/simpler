@@ -32,12 +32,14 @@ declare -A TMR_EXAMPLE_CASES=(
     [benchmark_bgemm]="Case0"
     [paged_attention_unroll]="Case1,Case2"
     [batch_paged_attention]="Case1"
+    [spmd_paged_attention_tpush]="Case1,Case2"
 )
 TMR_EXAMPLE_ORDER=(
     alternating_matmul_add
     benchmark_bgemm
     paged_attention_unroll
     batch_paged_attention
+    spmd_paged_attention_tpush
 )
 
 # --- aicpu_build_graph ---
