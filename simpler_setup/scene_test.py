@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from .log_config import DEFAULT_LOG_LEVEL, LOG_LEVEL_CHOICES, configure_logging
+from .pto_isa import ensure_pto_isa_root
 
 logger = logging.getLogger(__name__)
 
@@ -1158,14 +1159,12 @@ class SceneTestCase:
         args = parser.parse_args()
         configure_logging(args.log_level)
 
-        if args.pto_isa_commit:
-            import os  # noqa: PLC0415
-
-            from .pto_isa import ensure_pto_isa_root  # noqa: PLC0415
-
-            os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(
-                commit=args.pto_isa_commit, clone_protocol=args.clone_protocol
-            )
+        os.environ["PTO_ISA_ROOT"] = ensure_pto_isa_root(
+            commit=args.pto_isa_commit,
+            clone_protocol=args.clone_protocol,
+            update_if_exists=True,
+            verbose=True,
+        )
 
         if args.rounds > 1 and args.enable_profiling:
             logger.warning("Profiling disabled: --rounds > 1")

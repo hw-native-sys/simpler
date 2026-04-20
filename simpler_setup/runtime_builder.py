@@ -9,6 +9,8 @@
 import fcntl
 import json
 import logging
+import shutil
+import subprocess
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +21,50 @@ from .platform_info import TARGETS, load_build_config, parse_platform
 from .runtime_compiler import RuntimeCompiler
 
 logger = logging.getLogger(__name__)
+
+_GIT_COMMIT_FILE = ".git_commit"
+
+
+def _get_git_head(repo_root: Path) -> str:
+    """Return the current git HEAD commit hash, or empty string if unavailable."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+        return result.stdout.strip() if result.returncode == 0 else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _invalidate_cache_if_stale(target_cache_dir: Path, current_commit: str) -> None:
+    """Clear target_cache_dir if it was built from a different git commit.
+
+    git does not update file mtimes on checkout, so cmake's incremental build
+    cannot detect that source files changed. Comparing the HEAD commit stored
+    at last build time against the current HEAD is a reliable signal that
+    sources may have changed and a clean rebuild is needed.
+    """
+    if not current_commit:
+        return
+    commit_file = target_cache_dir / _GIT_COMMIT_FILE
+    if commit_file.is_file():
+        cached_commit = commit_file.read_text().strip()
+        if cached_commit == current_commit:
+            return
+        logger.info(
+            "git HEAD changed (%s → %s), clearing cmake cache: %s",
+            cached_commit[:12],
+            current_commit[:12],
+            target_cache_dir,
+        )
+        shutil.rmtree(target_cache_dir)
+    target_cache_dir.mkdir(parents=True, exist_ok=True)
+    commit_file.write_text(current_commit + "\n")
 
 
 @dataclass
@@ -170,6 +216,8 @@ class RuntimeBuilder:
 
         compiler = self._runtime_compiler
 
+        current_commit = _get_git_head(PROJECT_ROOT)
+
         def _compile_target(target: str) -> Path:
             include_dirs, source_dirs = self._resolve_target_dirs(config_dir, build_config, target)
             # compile() adds a {target}/ subdirectory inside build_dir
@@ -182,6 +230,7 @@ class RuntimeBuilder:
             lock_path = cache_dir / f".{target}.lock"
             with open(lock_path, "w") as lock_fd:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                _invalidate_cache_if_stale(cache_dir / target, current_commit)
                 return compiler.compile(  # type: ignore[return-value]
                     target,
                     include_dirs,
