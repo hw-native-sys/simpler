@@ -13,9 +13,24 @@
 
 #include <cstring>
 #include <stdexcept>
+#include <string>
 
 #include "../worker/chip_worker.h"
 #include "ring.h"
+
+namespace {
+
+// Read the child-written error message from the mailbox, guaranteeing
+// NUL-termination even if the child wrote exactly MAILBOX_ERROR_MSG_SIZE
+// bytes without a terminator.
+std::string read_error_msg(const char *mbox) {
+    char buf[MAILBOX_ERROR_MSG_SIZE + 1] = {};
+    std::memcpy(buf, mbox + MAILBOX_OFF_ERROR_MSG, MAILBOX_ERROR_MSG_SIZE);
+    buf[MAILBOX_ERROR_MSG_SIZE] = '\0';
+    return std::string(buf);
+}
+
+}  // namespace
 
 // =============================================================================
 // WorkerThread — mailbox helpers (PROCESS mode)
@@ -53,11 +68,13 @@ void WorkerThread::write_mailbox_state(MailboxState s) {
 // =============================================================================
 
 void WorkerThread::start(
-    Mode mode, IWorker *worker, Ring *ring, const std::function<void(TaskSlot)> &on_complete, void *mailbox
+    Mode mode, IWorker *worker, Ring *ring, WorkerManager *manager, const std::function<void(TaskSlot)> &on_complete,
+    void *mailbox
 ) {
     mode_ = mode;
     worker_ = worker;
     ring_ = ring;
+    manager_ = manager;
     on_complete_ = on_complete;
     mailbox_ = mailbox;
     shutdown_ = false;
@@ -106,10 +123,22 @@ void WorkerThread::loop() {
 
         TaskSlotState &s = *ring_->slot_state(d.task_slot);
 
-        if (mode_ == Mode::THREAD) {
-            dispatch_thread(s, d.group_index);
-        } else {
-            dispatch_process(s, d.group_index);
+        // Dispatch may throw from THREAD mode (worker_->run raised) or
+        // PROCESS mode (dispatch_process saw non-zero ERROR from the
+        // child). An uncaught exception escaping loop() would terminate
+        // the std::thread via std::terminate — instead, capture it and
+        // let the orch thread observe it at the next submit_*/drain.
+        // on_complete_ still fires so the scheduler releases consumers
+        // and active_tasks_ eventually reaches zero; otherwise drain()
+        // would hang.
+        try {
+            if (mode_ == Mode::THREAD) {
+                dispatch_thread(s, d.group_index);
+            } else {
+                dispatch_process(s, d.group_index);
+            }
+        } catch (...) {
+            if (manager_) manager_->report_error(std::current_exception());
         }
 
         idle_.store(true, std::memory_order_release);
@@ -126,6 +155,12 @@ void WorkerThread::dispatch_thread(TaskSlotState &s, int32_t group_index) {
 void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     uint64_t callable = (s.worker_type == WorkerType::SUB) ? static_cast<uint64_t>(s.callable_id) : s.callable;
     TaskArgsView view = s.args_view(group_index);
+
+    // Clear the child-writable error fields so stale bytes from a prior
+    // dispatch cannot masquerade as a fresh failure.
+    int32_t zero_err = 0;
+    std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
+    std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
 
     // Write callable.
     std::memcpy(mbox() + MAILBOX_OFF_CALLABLE, &callable, sizeof(uint64_t));
@@ -170,6 +205,20 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
     }
 
+    // Inspect the child's error report before releasing the mailbox back
+    // to IDLE. Non-zero error_code means the child-side Python loop
+    // caught an exception and filled OFF_ERROR_MSG with
+    // `f"{type(e).__name__}: {e}"` (truncated to MAILBOX_ERROR_MSG_SIZE).
+    int32_t error_code = 0;
+    std::memcpy(&error_code, mbox() + MAILBOX_OFF_ERROR, sizeof(int32_t));
+    if (error_code != 0) {
+        std::string msg = read_error_msg(mbox());
+        write_mailbox_state(MailboxState::IDLE);
+        throw std::runtime_error(
+            "WorkerThread::dispatch_process: child failed (code=" + std::to_string(error_code) + "): " + msg
+        );
+    }
+
     write_mailbox_state(MailboxState::IDLE);
 }
 
@@ -197,12 +246,31 @@ void WorkerManager::start(Ring *ring, const OnCompleteFn &on_complete) {
                             std::vector<std::unique_ptr<WorkerThread>> &threads) {
         for (const WorkerEntry &e : entries) {
             auto wt = std::make_unique<WorkerThread>();
-            wt->start(e.mode, e.worker, ring, on_complete, e.mailbox);
+            wt->start(e.mode, e.worker, ring, this, on_complete, e.mailbox);
             threads.push_back(std::move(wt));
         }
     };
     make_threads(next_level_entries_, next_level_threads_);
     make_threads(sub_entries_, sub_threads_);
+}
+
+void WorkerManager::report_error(std::exception_ptr e) {
+    if (!e) return;
+    std::lock_guard<std::mutex> lk(err_mu_);
+    if (first_error_) return;  // first-error-wins
+    first_error_ = std::move(e);
+    has_error_.store(true, std::memory_order_release);
+}
+
+std::exception_ptr WorkerManager::take_error() {
+    std::lock_guard<std::mutex> lk(err_mu_);
+    return first_error_;
+}
+
+void WorkerManager::clear_error() {
+    std::lock_guard<std::mutex> lk(err_mu_);
+    first_error_ = nullptr;
+    has_error_.store(false, std::memory_order_release);
 }
 
 void WorkerManager::stop() {
@@ -287,12 +355,19 @@ uint64_t WorkerThread::control_malloc(size_t size) {
         if (!cw) throw std::runtime_error("control_malloc: worker is not a ChipWorker");
         return cw->malloc(size);
     }
+    int32_t zero_err = 0;
+    std::memcpy(mbox() + MAILBOX_OFF_ERROR, &zero_err, sizeof(int32_t));
+    std::memset(mbox() + MAILBOX_OFF_ERROR_MSG, 0, MAILBOX_ERROR_MSG_SIZE);
     write_control_args(mbox(), CTRL_MALLOC, static_cast<uint64_t>(size));
     write_mailbox_state(MailboxState::CONTROL_REQUEST);
     while (read_mailbox_state() != MailboxState::CONTROL_DONE) {}
     int32_t err;
     std::memcpy(&err, mbox() + MAILBOX_OFF_ERROR, sizeof(int32_t));
-    if (err != 0) throw std::runtime_error("control_malloc failed on child");
+    if (err != 0) {
+        std::string msg = read_error_msg(mbox());
+        write_mailbox_state(MailboxState::IDLE);
+        throw std::runtime_error("control_malloc failed on child: " + msg);
+    }
     uint64_t result = read_control_result(mbox());
     write_mailbox_state(MailboxState::IDLE);
     return result;

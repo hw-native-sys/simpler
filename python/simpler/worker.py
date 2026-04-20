@@ -55,6 +55,8 @@ from typing import Any, Callable, Optional
 
 from .orchestrator import Orchestrator
 from .task_interface import (
+    MAILBOX_ERROR_MSG_SIZE,
+    MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     ChipCallConfig,
     ChipWorker,
@@ -81,6 +83,8 @@ _OFF_AICPU_THREAD_NUM = 20
 _OFF_ENABLE_PROFILING = 24
 _OFF_ENABLE_DUMP_TENSOR = 28
 _OFF_ARGS = 64
+# MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
+# nanobind module so the two sides cannot drift.
 
 _IDLE = 0
 _TASK_READY = 1
@@ -113,6 +117,37 @@ def _mailbox_addr(shm: SharedMemory) -> int:
     return ctypes.addressof(ctypes.c_char.from_buffer(buf))
 
 
+def _write_error(buf, code: int, msg: str = "") -> None:
+    """Write an (error code, message) tuple into the mailbox error region.
+
+    The message is UTF-8-encoded and truncated to ``MAILBOX_ERROR_MSG_SIZE - 1``
+    bytes so a NUL terminator always fits — the C++ reader assumes
+    NUL-terminated content. On success (code=0) callers may pass an empty
+    message; the region is zero-padded.
+    """
+    struct.pack_into("i", buf, _OFF_ERROR, code)
+    encoded = msg.encode("utf-8", "replace")
+    n = min(len(encoded), MAILBOX_ERROR_MSG_SIZE - 1)
+    start = MAILBOX_OFF_ERROR_MSG
+    buf[start : start + n] = encoded[:n]
+    # Zero-pad the remaining bytes so stale content from a previous dispatch
+    # never leaks into the current error report.
+    buf[start + n : start + MAILBOX_ERROR_MSG_SIZE] = b"\x00" * (MAILBOX_ERROR_MSG_SIZE - n)
+
+
+def _read_error_msg(buf) -> str:
+    """Read the mailbox error message, trimming at the first NUL."""
+    raw = bytes(buf[MAILBOX_OFF_ERROR_MSG : MAILBOX_OFF_ERROR_MSG + MAILBOX_ERROR_MSG_SIZE])
+    nul = raw.find(b"\x00")
+    if nul >= 0:
+        raw = raw[:nul]
+    return raw.decode("utf-8", "replace")
+
+
+def _format_exc(prefix: str, exc: BaseException) -> str:
+    return f"{prefix}: {type(exc).__name__}: {exc}"
+
+
 def _read_args_from_mailbox(buf) -> TaskArgs:
     """Decode the TaskArgs blob written by C++ write_blob from the mailbox.
 
@@ -143,22 +178,31 @@ def _read_args_from_mailbox(buf) -> TaskArgs:
 
 
 def _sub_worker_loop(buf, registry: dict) -> None:
-    """Runs in forked child process. Reads unified mailbox layout."""
+    """Runs in forked child process. Reads unified mailbox layout.
+
+    On success writes ``error=0`` and an empty message. On failure writes
+    ``error=1`` and ``f"sub_worker: <ExcType>: <msg>"`` into the mailbox
+    error-message region; the parent's ``WorkerThread::dispatch_process``
+    rethrows it as ``std::runtime_error``.
+    """
     while True:
         state = struct.unpack_from("i", buf, _OFF_STATE)[0]
         if state == _TASK_READY:
             cid = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
             fn = registry.get(int(cid))
-            error = 0
+            code = 0
+            msg = ""
             if fn is None:
-                error = 1
+                code = 1
+                msg = f"sub_worker: callable id {int(cid)} not registered"
             else:
                 try:
                     args = _read_args_from_mailbox(buf)
                     fn(args)
-                except Exception:  # noqa: BLE001
-                    error = 2
-            struct.pack_into("i", buf, _OFF_ERROR, error)
+                except Exception as e:  # noqa: BLE001
+                    code = 1
+                    msg = _format_exc("sub_worker", e)
+            _write_error(buf, code, msg)
             struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
         elif state == _SHUTDOWN:
             break
@@ -183,9 +227,13 @@ def _chip_process_loop(
         cw = _ChipWorker()
         cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path)
         cw.set_device(device_id)
-    except Exception:
+    except Exception as e:
         _tb.print_exc()
-        struct.pack_into("i", buf, _OFF_ERROR, 99)
+        # Write the message so any parent reader that *does* inspect this
+        # path sees the real cause. State handshake for this init-time
+        # failure is broken — see KNOWN_ISSUES.md — and that is not part
+        # of the L4 scope.
+        _write_error(buf, 1, _format_exc(f"chip_process dev={device_id} init", e))
         return
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
@@ -201,16 +249,19 @@ def _chip_process_loop(
             aicpu_tn = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
             profiling = struct.unpack_from("i", buf, _OFF_ENABLE_PROFILING)[0]
 
-            error = 0
+            code = 0
+            msg = ""
             try:
                 cw.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
-            except Exception:  # noqa: BLE001
-                error = 1
-            struct.pack_into("i", buf, _OFF_ERROR, error)
+            except Exception as e:  # noqa: BLE001
+                code = 1
+                msg = _format_exc(f"chip_process dev={device_id}", e)
+            _write_error(buf, code, msg)
             struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
         elif state == _CONTROL_REQUEST:
             sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
-            error = 0
+            code = 0
+            msg = ""
             try:
                 if sub_cmd == _CTRL_MALLOC:
                     size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
@@ -229,9 +280,10 @@ def _chip_process_loop(
                     src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
                     n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
                     cw.copy_from(dst, src, n)
-            except Exception:  # noqa: BLE001
-                error = 1
-            struct.pack_into("i", buf, _OFF_ERROR, error)
+            except Exception as e:  # noqa: BLE001
+                code = 1
+                msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
+            _write_error(buf, code, msg)
             struct.pack_into("i", buf, _OFF_STATE, _CONTROL_DONE)
         elif state == _SHUTDOWN:
             cw.finalize()
@@ -265,17 +317,20 @@ def _child_worker_loop(
         if state == _TASK_READY:
             cid = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
             orch_fn = registry.get(int(cid))
-            error = 0
+            code = 0
+            msg = ""
             if orch_fn is None:
-                error = 1
+                code = 1
+                msg = f"child_worker: callable id {int(cid)} not registered"
             else:
                 try:
                     args = _read_args_from_mailbox(buf)
                     cfg = _read_config_from_mailbox(buf)
                     inner_worker.run(orch_fn, args, cfg)
-                except Exception:  # noqa: BLE001
-                    error = 2
-            struct.pack_into("i", buf, _OFF_ERROR, error)
+                except Exception as e:  # noqa: BLE001
+                    code = 1
+                    msg = _format_exc(f"child_worker level={inner_worker.level}", e)
+            _write_error(buf, code, msg)
             struct.pack_into("i", buf, _OFF_STATE, _TASK_DONE)
         elif state == _SHUTDOWN:
             inner_worker.close()
@@ -529,6 +584,7 @@ class Worker:
         shm = self._chip_shms[worker_id]
         buf = shm.buf
         assert buf is not None
+        _write_error(buf, 0, "")
         struct.pack_into("Q", buf, _OFF_CALLABLE, sub_cmd)
         struct.pack_into("Q", buf, _CTRL_OFF_ARG0, arg0)
         struct.pack_into("Q", buf, _CTRL_OFF_ARG1, arg1)
@@ -538,7 +594,9 @@ class Worker:
             pass
         error = struct.unpack_from("i", buf, _OFF_ERROR)[0]
         if error != 0:
-            raise RuntimeError(f"chip control command {sub_cmd} failed on worker {worker_id}")
+            err_msg = _read_error_msg(buf)
+            struct.pack_into("i", buf, _OFF_STATE, _IDLE)
+            raise RuntimeError(f"chip control command {sub_cmd} failed on worker {worker_id}: {err_msg}")
         result = struct.unpack_from("Q", buf, _CTRL_OFF_RESULT)[0]
         struct.pack_into("i", buf, _OFF_STATE, _IDLE)
         return result
@@ -595,12 +653,22 @@ class Worker:
             self._start_hierarchical()
             assert self._orch is not None
             assert self._worker is not None
+            # Drop any error stashed by a previous run() so this call starts
+            # clean. drain() rethrows on the way out; every successful run()
+            # leaves the error slot empty, but an unrelated caller may have
+            # poked it.
+            self._orch._clear_error()
             self._orch._scope_begin()
             try:
                 callable(self._orch, args, cfg)
             finally:
                 # Always release scope refs and drain so ring slots aren't
-                # stranded when the orch fn raises mid-DAG.
+                # stranded when the orch fn raises mid-DAG. drain() also
+                # rethrows the first dispatch failure for this run — that
+                # is how child-task exceptions surface to the caller of
+                # Worker.run(). scope_end deliberately does NOT throw: if
+                # it did, released refs would be incomplete and drain
+                # would hang on in-flight tasks.
                 self._orch._scope_end()
                 self._orch._drain()
 

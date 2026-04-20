@@ -130,7 +130,14 @@ public:
 
     // Block until every submitted task has reached CONSUMED. Invoked by
     // Worker::run after scope_end; not part of the user-facing orch-fn API.
+    // Rethrows the first exception reported by any WorkerThread during
+    // dispatch (fail-fast): the wait itself is unaffected — every in-flight
+    // task is allowed to finish so ring slots aren't leaked.
     void drain();
+
+    // Clear any stored dispatch error so the next Worker::run() starts
+    // from a clean slate. Called by Worker::run before scope_begin.
+    void clear_error();
 
     // Called by Scheduler (via Worker) when a task becomes CONSUMED:
     // erases TensorMap entries, releases the allocator slot (and implicitly

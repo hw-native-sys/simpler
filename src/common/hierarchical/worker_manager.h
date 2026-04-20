@@ -37,6 +37,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -47,6 +48,7 @@
 #include "types.h"
 
 class Ring;  // forward decl — owns the slot state pool
+class WorkerManager;
 
 // =============================================================================
 // Unified mailbox layout (PROCESS mode)
@@ -68,6 +70,12 @@ enum class MailboxState : int32_t {
 
 static constexpr size_t MAILBOX_SIZE = 4096;
 
+// Error message region lives at the mailbox tail so OFF_ARGS and all earlier
+// offsets stay byte-compatible with the pre-L4 layout. 256 B of headroom is
+// enough for `<ExceptionType>: <short message>` produced by the child-side
+// Python loops; anything longer is truncated + NUL-terminated.
+static constexpr size_t MAILBOX_ERROR_MSG_SIZE = 256;
+
 static constexpr ptrdiff_t MAILBOX_OFF_STATE = 0;
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR = 4;
 static constexpr ptrdiff_t MAILBOX_OFF_CALLABLE = 8;  // also: control sub-command (uint64)
@@ -76,7 +84,10 @@ static constexpr ptrdiff_t MAILBOX_OFF_AICPU_THREAD_NUM = 20;
 static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_PROFILING = 24;
 static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_DUMP_TENSOR = 28;
 static constexpr ptrdiff_t MAILBOX_OFF_ARGS = 64;
-static constexpr size_t MAILBOX_ARGS_CAPACITY = MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_ARGS);
+static constexpr ptrdiff_t MAILBOX_OFF_ERROR_MSG =
+    static_cast<ptrdiff_t>(MAILBOX_SIZE) - static_cast<ptrdiff_t>(MAILBOX_ERROR_MSG_SIZE);
+static constexpr size_t MAILBOX_ARGS_CAPACITY =
+    MAILBOX_SIZE - static_cast<size_t>(MAILBOX_OFF_ARGS) - MAILBOX_ERROR_MSG_SIZE;
 
 // Control sub-commands (written at MAILBOX_OFF_CALLABLE when state == CONTROL_*)
 static constexpr uint64_t CTRL_MALLOC = 0;
@@ -133,9 +144,11 @@ public:
     // the thread reads callable/args/config from
     // `ring->slot_state(task_slot)` on each dispatch.
     // on_complete(slot) is called (in the WorkerThread) after each run().
+    // `manager` is a borrowed pointer used to report dispatch failures
+    // (exception_ptr routed out of the worker thread to the orch thread).
     void start(
-        Mode mode, IWorker *worker, Ring *ring, const std::function<void(TaskSlot)> &on_complete,
-        void *mailbox = nullptr
+        Mode mode, IWorker *worker, Ring *ring, WorkerManager *manager,
+        const std::function<void(TaskSlot)> &on_complete, void *mailbox = nullptr
     );
 
     // Enqueue a dispatch for the worker. Non-blocking.
@@ -164,6 +177,7 @@ private:
     Mode mode_{Mode::THREAD};
     IWorker *worker_{nullptr};
     Ring *ring_{nullptr};
+    WorkerManager *manager_{nullptr};
     void *mailbox_{nullptr};
     std::function<void(TaskSlot)> on_complete_;
 
@@ -217,6 +231,14 @@ public:
     // Write SHUTDOWN to every PROCESS-mode mailbox.
     void shutdown_children();
 
+    // Error propagation: first dispatch failure from any WorkerThread wins.
+    // The orch thread inspects via `has_error()` / `take_error()` and
+    // clears between Worker.run() invocations via `clear_error()`.
+    void report_error(std::exception_ptr e);
+    bool has_error() const { return has_error_.load(std::memory_order_acquire); }
+    std::exception_ptr take_error();
+    void clear_error();
+
 private:
     struct WorkerEntry {
         IWorker *worker;  // nullptr for PROCESS mode
@@ -229,4 +251,11 @@ private:
 
     std::vector<std::unique_ptr<WorkerThread>> next_level_threads_;
     std::vector<std::unique_ptr<WorkerThread>> sub_threads_;
+
+    // First-error-wins exception slot. Written under err_mu_ by
+    // WorkerThread::loop() catch handlers; read by the orch thread at
+    // submit_*/drain boundaries.
+    std::atomic<bool> has_error_{false};
+    mutable std::mutex err_mu_;
+    std::exception_ptr first_error_;
 };

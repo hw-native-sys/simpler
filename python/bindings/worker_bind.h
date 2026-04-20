@@ -141,7 +141,11 @@ inline void bind_worker(nb::module_ &m) {
         .def("_scope_end", &Orchestrator::scope_end)
         .def(
             "_drain", &Orchestrator::drain, nb::call_guard<nb::gil_scoped_release>(),
-            "Block until all submitted tasks are CONSUMED (releases GIL)."
+            "Block until all submitted tasks are CONSUMED (releases GIL). "
+            "Rethrows the first dispatch failure seen in this run, if any."
+        )
+        .def(
+            "_clear_error", &Orchestrator::clear_error, "Clear any stored dispatch error so the next run can proceed."
         );
 
     // --- Worker ---
@@ -230,6 +234,8 @@ inline void bind_worker(nb::module_ &m) {
 
     m.attr("DEFAULT_HEAP_RING_SIZE") = static_cast<uint64_t>(DEFAULT_HEAP_RING_SIZE);
     m.attr("MAILBOX_SIZE") = static_cast<int>(MAILBOX_SIZE);
+    m.attr("MAILBOX_OFF_ERROR_MSG") = static_cast<int>(MAILBOX_OFF_ERROR_MSG);
+    m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
     m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
     m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);
 }

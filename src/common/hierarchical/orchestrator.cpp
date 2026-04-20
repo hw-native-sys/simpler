@@ -168,6 +168,15 @@ SubmitResult Orchestrator::submit_impl(
 ) {
     if (args_list.empty()) throw std::invalid_argument("Orchestrator: args_list must not be empty");
 
+    // Fail-fast: if a previously-dispatched task has already failed, abort
+    // this submit before any bookkeeping so the orch fn unwinds promptly
+    // and no further work is queued. Tasks already in flight run to
+    // completion; drain() picks up any remaining bookkeeping and rethrows
+    // at the finally: _drain() site in Worker.run.
+    if (manager_ && manager_->has_error()) {
+        std::rethrow_exception(manager_->take_error());
+    }
+
     // Track this submission for drain() before any allocations so the count
     // is incremented exactly once per submitted DAG node, regardless of the
     // group_size N.
@@ -447,4 +456,15 @@ void Orchestrator::drain() {
     // next_task_id_). Drop all per-slot state so the next Worker.run()
     // starts from task_id = 0 with no accumulated memory.
     allocator_->reset_to_empty();
+
+    // Rethrow the first dispatch failure seen during this run. Deferred to
+    // after allocator reset so the next Worker.run() can proceed cleanly
+    // once clear_error() is called.
+    if (manager_ && manager_->has_error()) {
+        std::rethrow_exception(manager_->take_error());
+    }
+}
+
+void Orchestrator::clear_error() {
+    if (manager_) manager_->clear_error();
 }

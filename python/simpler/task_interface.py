@@ -18,6 +18,8 @@ Usage:
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
     CONTINUOUS_TENSOR_MAX_DIMS,
+    MAILBOX_ERROR_MSG_SIZE,
+    MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
     ArgDirection,
     ChipCallable,
@@ -65,6 +67,8 @@ __all__ = [
     "SubmitResult",
     "_Worker",
     "MAILBOX_SIZE",
+    "MAILBOX_OFF_ERROR_MSG",
+    "MAILBOX_ERROR_MSG_SIZE",
     "read_args_from_blob",
 ]
 

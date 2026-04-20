@@ -187,3 +187,6 @@ class Orchestrator:
 
     def _drain(self) -> None:
         self._o._drain()
+
+    def _clear_error(self) -> None:
+        self._o._clear_error()
