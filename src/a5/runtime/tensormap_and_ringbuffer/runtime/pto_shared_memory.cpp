@@ -221,8 +221,6 @@ void pto2_sm_print_layout(PTO2SharedMemoryHandle *handle) {
             "  descriptors_off:  %" PRIu64 " (0x%" PRIx64 ")", h->rings[r].task_descriptors_offset,
             h->rings[r].task_descriptors_offset
         );
-        LOG_INFO("  heap_top:         %" PRIu64, h->rings[r].fc.heap_top.load(std::memory_order_acquire));
-        LOG_INFO("  heap_tail:        %" PRIu64, h->rings[r].fc.heap_tail.load(std::memory_order_acquire));
         LOG_INFO("  current_task_idx: %d", h->rings[r].fc.current_task_index.load(std::memory_order_acquire));
         LOG_INFO("  last_task_alive:  %d", h->rings[r].fc.last_task_alive.load(std::memory_order_acquire));
     }
@@ -265,12 +263,8 @@ bool PTO2RingFlowControl::validate(PTO2SharedMemoryHandle *handle, int32_t ring_
     // Check flow control pointer sanity
     int32_t current = current_task_index.load(std::memory_order_acquire);
     int32_t last_alive = last_task_alive.load(std::memory_order_acquire);
-    uint64_t top = heap_top.load(std::memory_order_acquire);
-    uint64_t tail = heap_tail.load(std::memory_order_acquire);
     if (current < 0) return false;
     if (last_alive < 0) return false;
-    if (top > h->rings[ring_id].heap_size) return false;
-    if (tail > h->rings[ring_id].heap_size) return false;
 
     return true;
 }

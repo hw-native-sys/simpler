@@ -132,20 +132,18 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHandle *sm_handle,
         return false;
     }
 
-    // Zero-initialize all per-task slot state fields.
+    // Initialize all per-task slot state fields.
+    // bind() sets payload, task, ring_id — immutable after init, bound once
+    // to their fixed shared-memory addresses.
+    // reset_for_reuse() sets dynamic fields to reclaim defaults (fanout_count=1,
+    // rest zero) so the first submit needs no reset.
+    PTO2TaskPayload *payloads = sm_handle->task_payloads[ring_id];
     for (uint64_t i = 0; i < task_window_size; i++) {
-        slot_states[i].fanout_lock.store(0, std::memory_order_relaxed);
-        slot_states[i].fanout_count = 0;
-        slot_states[i].fanout_head = nullptr;
-        slot_states[i].task_state.store(static_cast<PTO2TaskState>(0), std::memory_order_relaxed);
-        slot_states[i].fanin_refcount.store(0, std::memory_order_relaxed);
+        slot_states[i].bind(&payloads[i], &task_descriptors[i], static_cast<uint8_t>(ring_id));
+        slot_states[i].reset_for_reuse();
         slot_states[i].fanin_count = 0;
-        slot_states[i].fanout_refcount.store(0, std::memory_order_relaxed);
-        slot_states[i].payload = nullptr;
-        slot_states[i].task = nullptr;
         slot_states[i].active_mask = 0;
         slot_states[i].subtask_done_mask.store(0, std::memory_order_relaxed);
-        slot_states[i].ring_id = 0;
     }
 
     return true;
@@ -199,7 +197,7 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
             for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
                 pto2_ready_queue_destroy(&sched->ready_queues[i]);
             }
-            sched->wiring_queue.destroy();
+            sched->wiring.queue.destroy();
             for (int rr = 0; rr < PTO2_MAX_RING_DEPTH; rr++) {
                 sched->ring_sched_states[rr].destroy();
             }
@@ -209,7 +207,7 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
     }
 
     // Initialize global wiring queue (SPSC: orchestrator pushes, scheduler thread 0 drains)
-    if (!sched->wiring_queue.init(PTO2_WRIRING_QUEUE_SIZE)) {
+    if (!sched->wiring.queue.init(PTO2_WRIRING_QUEUE_SIZE)) {
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
             free(sched->ring_sched_states[r].dep_pool.base);
         }
@@ -221,9 +219,9 @@ bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_h
         }
         return false;
     }
-    sched->wiring_batch_count = 0;
-    sched->wiring_batch_index = 0;
-    sched->wiring_backoff_counter = 0;
+    sched->wiring.batch_count = 0;
+    sched->wiring.batch_index = 0;
+    sched->wiring.backoff_counter = 0;
 
     return true;
 }
@@ -235,7 +233,7 @@ void pto2_scheduler_destroy(PTO2SchedulerState *sched) {
         sched->ring_sched_states[r].dep_pool.base = nullptr;
     }
 
-    sched->wiring_queue.destroy();
+    sched->wiring.queue.destroy();
 
     for (int i = 0; i < PTO2_NUM_RESOURCE_SHAPES; i++) {
         pto2_ready_queue_destroy(&sched->ready_queues[i]);

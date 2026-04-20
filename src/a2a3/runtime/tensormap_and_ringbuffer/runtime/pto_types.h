@@ -63,6 +63,7 @@
 class TaskOutputTensors {
 public:
     TaskOutputTensors() :
+        task_id_(PTO2TaskId::invalid()),
         output_count_(0) {}
 
     bool empty() const { return output_count_ == 0; }
@@ -81,7 +82,12 @@ public:
         tensors_[output_count_++] = &tensor;
     }
 
+    void set_task_id(PTO2TaskId id) { task_id_ = id; }
+
+    PTO2TaskId task_id() const { return task_id_; }
+
 private:
+    PTO2TaskId task_id_;
     uint32_t output_count_;
     const Tensor *tensors_[PTO2_MAX_OUTPUTS];
 };

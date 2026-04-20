@@ -177,6 +177,24 @@ typedef enum {
 #define PTO2_MAX_LAYOUT_DEPTH 8
 
 /**
+ * Result of a unified task allocation.
+ */
+struct PTO2TaskAllocResult {
+    int32_t task_id;    // Absolute task ID (not wrapped)
+    int32_t slot;       // task_id & (window_size - 1)
+    void *packed_base;  // Heap allocation result (nullptr if failure)
+    void *packed_end;   // packed_base + aligned output_size
+
+    bool failed() const { return task_id < 0; }
+};
+
+struct PTO2OutputLayout {
+    uint64_t offsets[MAX_TENSOR_ARGS] = {};
+    uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
+    int32_t total_output_size = 0;
+};
+
+/**
  * Layout operation type for HBB
  */
 typedef enum {
@@ -366,8 +384,7 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param materialized_outputs  Materialized output tensors (from TensorCreateInfo path)
      */
-    void
-    init(const Arg &args, TaskOutputTensors &result, void *base_addr, uint64_t offsets[], uint64_t buffer_sizes[]) {
+    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
@@ -378,8 +395,10 @@ struct PTO2TaskPayload {
             } else {
                 tensors[i].init_from_create_info(
                     *args.tensor(i).create_info,
-                    reinterpret_cast<void *>(reinterpret_cast<char *>(base_addr) + offsets[i]), buffer_sizes[i]
+                    reinterpret_cast<void *>(reinterpret_cast<char *>(alloc_result.packed_base) + layout.offsets[i]),
+                    layout.buffer_sizes[i]
                 );
+                tensors[i].owner_task_id = result.task_id();
                 result.materialize_output(tensors[i]);
             }
             tensors[i].update_start_offset();
@@ -424,26 +443,57 @@ struct alignas(64) PTO2TaskSlotState {
 
     // Fanin (accessed together in release_fanin_and_check_ready)
     std::atomic<int32_t> fanin_refcount;  // Dynamic: counts completed producers
-    int32_t fanin_count;                  // Number of producer dependencies (set once)
+    int32_t fanin_count;                  // Number of producer dependencies (set once by wiring)
 
     // Fanout refcount (accessed with fanout_count in check_and_handle_consumed)
     std::atomic<int32_t> fanout_refcount;  // Dynamic: counts released references
 
+    // --- Immutable after RingSchedState::init() (same value on every slot reuse) ---
     PTO2TaskPayload *payload;
-
     PTO2TaskDescriptor *task;
 
-    // Hot-path completion fields (moved from TaskDescriptor to avoid cross-struct access)
+    // --- Set per-submit (depend on task inputs) ---
     uint8_t active_mask;                     // Bitmask of active subtask slots (set once)
     std::atomic<uint8_t> subtask_done_mask;  // Deprecated: superseded by completed_subtasks
-    uint8_t ring_id;                         // Ring layer this task belongs to (for per-ring reclamation)
-    int32_t dep_pool_mark{0};  // Dep pool top after this task's submission (orchestrator-only, local memory)
+    uint8_t ring_id;                         // Ring layer (immutable after init)
+    int32_t dep_pool_mark{0};                // Dep pool top after wiring (thread-0-only)
 
-    // SPMD multi-block (occupies the 8 tail bytes previously implicit padding)
     std::atomic<int16_t> completed_subtasks{0};  // Each core completion increments by 1
     int16_t total_required_subtasks{0};          // = logical_block_num * popcount(active_mask)
     int16_t logical_block_num{1};                // Total logical blocks (set by orchestrator)
     int16_t next_block_idx{0};                   // Next block to dispatch (scheduler state)
+
+    /**
+     * One-time binding of slot-invariant fields.
+     * Called during RingSchedState::init() — these values are determined by
+     * the slot's position in the ring and never change across reuses.
+     */
+    void bind(PTO2TaskPayload *p, PTO2TaskDescriptor *t, uint8_t rid) {
+        payload = p;
+        task = t;
+        ring_id = rid;
+    }
+
+    /**
+     * Reset dynamic scheduling fields for slot reuse.
+     * Called by advance_ring_pointers() after a slot transitions to CONSUMED
+     * and last_task_alive advances past it, but before sync_to_sm() publishes
+     * the new last_task_alive to the orchestrator.
+     *
+     * Skips payload, task, ring_id (immutable, bound once at init).
+     * Skips task_state: left as CONSUMED so that wait_for_tensor_ready()
+     * callers holding stale owner_task_id still observe a completed state.
+     * task_state is set to PENDING by the orchestrator when it reuses the slot.
+     */
+    void reset_for_reuse() {
+        fanout_lock.store(0, std::memory_order_relaxed);
+        fanout_count = 1;
+        fanout_head = nullptr;
+        fanin_refcount.store(0, std::memory_order_relaxed);
+        fanout_refcount.store(0, std::memory_order_relaxed);
+        completed_subtasks.store(0, std::memory_order_relaxed);
+        next_block_idx = 0;
+    }
 };
 
 static_assert(sizeof(PTO2TaskSlotState) == 64);

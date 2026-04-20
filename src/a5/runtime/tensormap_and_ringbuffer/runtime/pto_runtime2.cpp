@@ -111,7 +111,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     // Signal scheduler: orchestrator is about to block, bypass wiring backoff
     bool signaled = slot_count > 0 && orch.scheduler;
     if (signaled) {
-        orch.scheduler->orch_needs_drain.store(true, std::memory_order_release);
+        orch.scheduler->wiring.orch_needs_drain.store(true, std::memory_order_release);
     }
 
     // Wait for each producer
@@ -126,7 +126,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
                 if (signaled) {
-                    orch.scheduler->orch_needs_drain.store(false, std::memory_order_release);
+                    orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
                 }
                 pto2_orch_report_fatal(
                     &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
@@ -144,7 +144,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
                 SPIN_WAIT_HINT();
                 if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
                     if (signaled) {
-                        orch.scheduler->orch_needs_drain.store(false, std::memory_order_release);
+                        orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
                     }
                     pto2_orch_report_fatal(
                         &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
@@ -159,7 +159,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
 
     // Clear urgency flag: orchestrator no longer blocking
     if (signaled) {
-        orch.scheduler->orch_needs_drain.store(false, std::memory_order_release);
+        orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
     }
 
     return true;

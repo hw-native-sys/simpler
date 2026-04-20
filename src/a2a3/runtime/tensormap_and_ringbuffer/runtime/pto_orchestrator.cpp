@@ -242,14 +242,7 @@ static bool pto2_append_fanin_or_fail(
 
 static void scope_tasks_push(PTO2OrchestratorState *orch, PTO2TaskSlotState *task_slot_state);
 
-struct PTO2OutputLayout {
-    uint64_t offsets[MAX_TENSOR_ARGS] = {};
-    uint64_t buffer_sizes[MAX_TENSOR_ARGS] = {};
-    int32_t total_output_size = 0;
-};
-
 struct PTO2PreparedTask {
-    PTO2SchedulerState *sched = nullptr;
     PTO2TaskId task_id = PTO2TaskId::invalid();
     PTO2TaskAllocResult alloc_result = {-1, 0, nullptr, nullptr};
     PTO2TaskDescriptor *task = nullptr;
@@ -328,45 +321,36 @@ static bool pto2_prepare_task(
         return false;
     }
 
-    out->sched = orch->scheduler;
+    auto sched = orch->scheduler;
     out->alloc_result = allocator.alloc(total_output_size);
     if (out->alloc_result.failed()) {
         pto2_orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
         return false;
     }
 
+    auto &rs = sched->ring_sched_states[ring_id];
     out->task_id = PTO2TaskId::make(ring_id, static_cast<uint32_t>(out->alloc_result.task_id));
-    out->task = &allocator.task_by_slot(out->alloc_result.slot);
+    out->slot_state = &rs.get_slot_state_by_slot(out->alloc_result.slot);
+    out->task = &orch->sm_handle->task_descriptors[ring_id][out->alloc_result.slot];
     out->payload = &orch->sm_handle->task_payloads[ring_id][out->alloc_result.slot];
 
     pto2_prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
 
-    if (out->sched) {
-        auto &rs = out->sched->ring_sched_states[ring_id];
-        out->slot_state = &rs.get_slot_state_by_slot(out->alloc_result.slot);
-        PTO2TaskSlotState &slot_state = *out->slot_state;
-        slot_state.fanout_head = nullptr;
-        slot_state.fanout_lock.store(0, std::memory_order_relaxed);
-        slot_state.fanout_count = 1;
-        slot_state.fanout_refcount.store(0, std::memory_order_relaxed);
-        slot_state.fanin_refcount.store(0, std::memory_order_relaxed);
-        slot_state.task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
-        slot_state.completed_subtasks.store(0, std::memory_order_relaxed);
-        slot_state.subtask_done_mask.store(0, std::memory_order_relaxed);
-        int16_t block_num = args.launch_spec.block_num();
-        slot_state.total_required_subtasks =
-            static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
-        slot_state.logical_block_num = block_num;
-        slot_state.next_block_idx = 0;
-        slot_state.payload = out->payload;
-        slot_state.task = out->task;
-        slot_state.active_mask = active_mask;
-        slot_state.ring_id = ring_id;
-        // fanin_count is set by scheduler during wiring
-        scope_tasks_push(orch, &slot_state);
-    } else {
-        scope_tasks_push(orch, nullptr);
-    }
+    // Fields already reset by advance_ring_pointers (eager reset after CONSUMED):
+    //   fanout_lock=0, fanout_count=1, fanout_head=nullptr,
+    //   fanin_refcount=0, fanout_refcount=0, completed_subtasks=0, next_block_idx=0
+    // Fields immutable after RingSchedState::init():
+    //   payload, task, ring_id
+    // task_state left as CONSUMED by eager reset (safe for stale wait_for_tensor
+    // observers); set to PENDING here when orchestrator actually reuses the slot.
+    out->slot_state->task_state.store(PTO2_TASK_PENDING, std::memory_order_relaxed);
+    int16_t block_num = args.launch_spec.block_num();
+    out->slot_state->total_required_subtasks =
+        static_cast<int16_t>(block_num * __builtin_popcount(pto2_core_mask(active_mask)));
+    out->slot_state->logical_block_num = block_num;
+    out->slot_state->active_mask = active_mask;
+    // fanin_count is set by scheduler during wiring
+    scope_tasks_push(orch, out->slot_state);
 
     return true;
 }
@@ -544,6 +528,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         return result;
     }
 
+    always_assert(orch->scheduler != nullptr);
     // === Validate submit inputs ===
     uint8_t active_mask = pto2_mixed_kernels_to_active_mask(mixed_kernels);
     always_assert(active_mask != 0 && "MixedKernels must have at least one active slot");
@@ -588,12 +573,13 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         return result;
     }
     uint8_t ring_id = prepared.task_id.ring();
-    PTO2SchedulerState *sched = prepared.sched;
+    PTO2SchedulerState *sched = orch->scheduler;
     PTO2RingFlowControl &fc = orch->sm_handle->header->rings[ring_id].fc;
     PTO2TaskId task_id = prepared.task_id;
+    PTO2TaskSlotState &cur_slot_state = *prepared.slot_state;
     PTO2TaskDescriptor &task = *prepared.task;
-    PTO2TaskPayload *payload = prepared.payload;
-    int32_t slot = prepared.alloc_result.slot;
+    PTO2TaskPayload &payload = *prepared.payload;
+    result.set_task_id(task_id);
 
     PTO2FaninBuilder fanin_builder;
     fanin_builder.count = 0;
@@ -629,7 +615,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
 
         // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
-        if (owner.is_valid() && sched != nullptr) {
+        if (owner.is_valid()) {
             PTO2TaskSlotState *prod_state =
                 &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
             if (!pto2_append_fanin_or_fail(
@@ -694,15 +680,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     task.packed_buffer_base = prepared.alloc_result.packed_base;
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
-    payload->init(args, result, prepared.alloc_result.packed_base, layout.offsets, layout.buffer_sizes);
-
-    // Write owner_task_id into materialized OUTPUT tensors so creator-only dependency
-    // tracking remains available even when manual_dep skips OverlapMap publication.
-    for (int i = 0; i < args.tensor_count(); i++) {
-        if (args.tag(i) == TensorArgType::OUTPUT) {
-            payload->tensors[i].owner_task_id = prepared.task_id;
-        }
-    }
+    payload.init(args, result, prepared.alloc_result, layout);
 
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, task_id.raw);
 #if PTO2_ORCH_PROFILING
@@ -713,34 +691,27 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     // Deferred wiring: orchestrator only stores dependency metadata and increments
     // fanout_count. The actual fanout_head wiring (lock + dep_pool + early_finished)
     // is handled asynchronously by scheduler thread 0 via the wiring queue.
-    if (sched) {
-        auto &rs = sched->ring_sched_states[ring_id];
-        PTO2TaskSlotState &cur_slot_state = rs.get_slot_state_by_slot(slot);
-        int32_t fanin_count = fanin_builder.count;
-        int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
-        int32_t spill_count = fanin_count - inline_count;
+    int32_t fanin_count = fanin_builder.count;
+    int32_t inline_count = std::min(fanin_count, PTO2_FANIN_INLINE_CAP);
+    int32_t spill_count = fanin_count - inline_count;
 
-        // Store fanin metadata in payload for scheduler to iterate
-        payload->fanin_actual_count = fanin_count;
-        payload->fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
-        payload->fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
-        for (int i = 0; i < inline_count; i++) {
-            payload->fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
-        }
+    // Store fanin metadata in payload for scheduler to iterate
+    payload.fanin_actual_count = fanin_count;
+    payload.fanin_spill_start = (spill_count > 0) ? fanin_builder.spill_start : 0;
+    payload.fanin_spill_pool = (spill_count > 0) ? fanin_builder.spill_pool : nullptr;
+    for (int i = 0; i < inline_count; i++) {
+        payload.fanin_inline_slot_states[i] = fanin_builder.inline_slots[i];
+    }
 
-        // Increment fanout_count on each producer (no lock — only orch writes this field).
-        // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
-        pto2_for_each_fanin_slot_state(*payload, [](PTO2TaskSlotState *producer) {
-            producer->fanout_count += 1;
-        });
+    // Increment fanout_count on each producer (no lock — only orch writes this field).
+    // Prevents premature CONSUMED: scope_end's release_producer checks fanout_refcount == fanout_count.
+    pto2_for_each_fanin_slot_state(payload, [](PTO2TaskSlotState *producer) {
+        producer->fanout_count += 1;
+    });
 
-        // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
-        while (!sched->wiring_queue.push(&cur_slot_state)) {
-            SPIN_WAIT_HINT();
-        }
-#if PTO2_ORCH_PROFILING
-        g_orch_fanin_atomic_count += 0;  // No lock/atomic ops in submit hot path
-#endif
+    // Push to global wiring queue — scheduler sets fanin_count, wires fanout, checks readiness
+    while (!sched->wiring.queue.push(&cur_slot_state)) {
+        SPIN_WAIT_HINT();
     }
 
     CYCLE_COUNT_LAP_RECORD(g_orch_fanin_cycle, AicpuPhaseId::ORCH_FANIN, task_id.raw);
@@ -799,10 +770,8 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
         return TaskOutputTensors{};
     }
 
-    uint8_t ring_id = prepared.task_id.ring();
-    PTO2RingFlowControl &fc = orch->sm_handle->header->rings[ring_id].fc;
     PTO2TaskDescriptor &task = *prepared.task;
-    PTO2TaskPayload *payload = prepared.payload;
+    PTO2TaskPayload &payload = *prepared.payload;
 
     CYCLE_COUNT_LAP_RECORD(g_orch_alloc_cycle, AicpuPhaseId::ORCH_ALLOC, prepared.task_id.raw);
 
@@ -813,10 +782,6 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
     }
 #endif
 
-    int32_t sm_last_task_alive = fc.last_task_alive.load(std::memory_order_acquire);
-    orch->tensor_map.sync_tensormap(prepared.task_id, sm_last_task_alive);
-    CYCLE_COUNT_LAP_RECORD(g_orch_sync_cycle, AicpuPhaseId::ORCH_SYNC, prepared.task_id.raw);
-
     task.task_id = prepared.task_id;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIC)] = INVALID_KERNEL_ID;
     task.kernel_id[static_cast<int>(PTO2SubtaskSlot::AIV0)] = INVALID_KERNEL_ID;
@@ -825,13 +790,11 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
     task.packed_buffer_end = prepared.alloc_result.packed_end;
 
     TaskOutputTensors outputs;
-    payload->init(args, outputs, prepared.alloc_result.packed_base, layout.offsets, layout.buffer_sizes);
-    payload->fanin_actual_count = 0;
-    payload->fanin_spill_start = 0;
-    payload->fanin_spill_pool = nullptr;
-    for (int32_t i = 0; i < args.tensor_count(); i++) {
-        payload->tensors[i].owner_task_id = prepared.task_id;
-    }
+    outputs.set_task_id(prepared.task_id);
+    payload.init(args, outputs, prepared.alloc_result, layout);
+    payload.fanin_actual_count = 0;
+    payload.fanin_spill_start = 0;
+    payload.fanin_spill_pool = nullptr;
 
     CYCLE_COUNT_LAP_RECORD(g_orch_args_cycle, AicpuPhaseId::ORCH_PARAMS, prepared.task_id.raw);
 

@@ -62,18 +62,6 @@ struct PTO2SchedulerState;  // Forward declaration for dep_pool reclaim
 // =============================================================================
 
 /**
- * Result of a unified task allocation.
- */
-struct PTO2TaskAllocResult {
-    int32_t task_id;    // Absolute task ID (not wrapped), -1 on failure
-    int32_t slot;       // task_id & (window_size - 1)
-    void *packed_base;  // Heap allocation result (nullptr if output_size == 0)
-    void *packed_end;   // packed_base + aligned output_size
-
-    bool failed() const { return task_id < 0; }
-};
-
-/**
  * Unified task slot + heap buffer allocator.
  *
  * Since task and heap are always allocated together and the orchestrator is

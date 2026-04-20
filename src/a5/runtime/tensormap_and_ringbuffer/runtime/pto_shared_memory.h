@@ -53,26 +53,22 @@ struct PTO2SharedMemoryHandle;
  * Per-ring flow control state in shared memory.
  * Written/read by Orchestrator and Scheduler for synchronization.
  */
-struct PTO2RingFlowControl {
-    // Written by Orchestrator, Read by Scheduler
-    std::atomic<uint64_t> heap_top;           // Heap ring allocation pointer
+struct alignas(64) PTO2RingFlowControl {
+    // === Cache Line 0: Written by Orchestrator, Read by Scheduler ===
     std::atomic<int32_t> current_task_index;  // Task ring head (next to allocate)
-    int32_t _pad0;                            // Alignment padding
 
-    // Written by Scheduler, Read by Orchestrator (for back-pressure)
-    std::atomic<uint64_t> heap_tail;       // Heap ring free pointer
-    std::atomic<int32_t> last_task_alive;  // Task ring tail (oldest active task)
-    int32_t _pad1;                         // Alignment padding
+    // === Cache Line 1: Written by Scheduler, Read by Orchestrator (for back-pressure) ===
+    alignas(64) std::atomic<int32_t> last_task_alive;  // Task ring tail (oldest active task)
 
     void init() {
-        heap_top.store(0, std::memory_order_relaxed);
         current_task_index.store(0, std::memory_order_relaxed);
-        heap_tail.store(0, std::memory_order_relaxed);
         last_task_alive.store(0, std::memory_order_relaxed);
     }
 
     bool validate(PTO2SharedMemoryHandle *handle, int32_t ring_id) const;
 };
+
+static_assert(sizeof(PTO2RingFlowControl) == 128, "PTO2RingFlowControl must be exactly 2 cache lines (128B)");
 
 /**
  * Per-ring shared memory header section.
