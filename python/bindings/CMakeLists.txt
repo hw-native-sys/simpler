@@ -26,6 +26,7 @@ set(HIERARCHICAL_SOURCES
     ${HIERARCHICAL_SRC}/worker_manager.cpp
     ${HIERARCHICAL_SRC}/scheduler.cpp
     ${HIERARCHICAL_SRC}/worker.cpp
+    ${HIERARCHICAL_SRC}/chip_bootstrap_channel.cpp
 )
 
 nanobind_add_module(_task_interface ${BINDING_SOURCES} ${HIERARCHICAL_SOURCES})

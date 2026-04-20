@@ -30,6 +30,7 @@
 
 #include <stdexcept>
 
+#include "chip_bootstrap_channel.h"
 #include "chip_worker.h"
 #include "ring.h"
 #include "orchestrator.h"
@@ -238,4 +239,44 @@ inline void bind_worker(nb::module_ &m) {
     m.attr("MAILBOX_ERROR_MSG_SIZE") = static_cast<int>(MAILBOX_ERROR_MSG_SIZE);
     m.attr("MAX_RING_DEPTH") = static_cast<int32_t>(MAX_RING_DEPTH);
     m.attr("MAX_SCOPE_DEPTH") = static_cast<int32_t>(MAX_SCOPE_DEPTH);
+
+    // --- ChipBootstrapChannel ---
+    m.attr("CHIP_BOOTSTRAP_MAILBOX_SIZE") = static_cast<int>(CHIP_BOOTSTRAP_MAILBOX_SIZE);
+
+    nb::enum_<ChipBootstrapMailboxState>(m, "ChipBootstrapMailboxState")
+        .value("IDLE", ChipBootstrapMailboxState::IDLE)
+        .value("SUCCESS", ChipBootstrapMailboxState::SUCCESS)
+        .value("ERROR", ChipBootstrapMailboxState::ERROR);
+
+    nb::class_<ChipBootstrapChannel>(m, "ChipBootstrapChannel")
+        .def(
+            "__init__",
+            [](ChipBootstrapChannel *self, uint64_t mailbox_ptr, size_t max_buffer_count) {
+                new (self) ChipBootstrapChannel(reinterpret_cast<void *>(mailbox_ptr), max_buffer_count);
+            },
+            nb::arg("mailbox_ptr"), nb::arg("max_buffer_count")
+        )
+        .def("reset", &ChipBootstrapChannel::reset)
+        .def(
+            "write_success",
+            [](ChipBootstrapChannel &self, uint64_t device_ctx, uint64_t local_window_base, uint64_t actual_window_size,
+               const std::vector<uint64_t> &buffer_ptrs) {
+                self.write_success(device_ctx, local_window_base, actual_window_size, buffer_ptrs);
+            },
+            nb::arg("device_ctx"), nb::arg("local_window_base"), nb::arg("actual_window_size"), nb::arg("buffer_ptrs")
+        )
+        .def(
+            "write_error",
+            [](ChipBootstrapChannel &self, int32_t error_code, const std::string &message) {
+                self.write_error(error_code, message);
+            },
+            nb::arg("error_code"), nb::arg("message")
+        )
+        .def_prop_ro("state", &ChipBootstrapChannel::state)
+        .def_prop_ro("error_code", &ChipBootstrapChannel::error_code)
+        .def_prop_ro("device_ctx", &ChipBootstrapChannel::device_ctx)
+        .def_prop_ro("local_window_base", &ChipBootstrapChannel::local_window_base)
+        .def_prop_ro("actual_window_size", &ChipBootstrapChannel::actual_window_size)
+        .def_prop_ro("buffer_ptrs", &ChipBootstrapChannel::buffer_ptrs)
+        .def_prop_ro("error_message", &ChipBootstrapChannel::error_message);
 }
