@@ -41,6 +41,8 @@ enum class DataType : uint8_t {
     BFLOAT16,  // 2 bytes
     INT64,     // 8 bytes
     UINT64,    // 8 bytes
+    UINT16,    // 2 bytes
+    UINT32,    // 4 bytes
     DATA_TYPE_NUM,
 };
 
@@ -64,6 +66,8 @@ inline uint64_t get_element_size(DataType dtype) {
         2,  // DataType::BFLOAT16
         8,  // DataType::INT64
         8,  // DataType::UINT64
+        2,  // DataType::UINT16
+        4,  // DataType::UINT32
     };
     return data_type_size[static_cast<int>(dtype)];
 }
@@ -94,6 +98,10 @@ inline const char *get_dtype_name(DataType dtype) {
         return "INT64";
     case DataType::UINT64:
         return "UINT64";
+    case DataType::UINT16:
+        return "UINT16";
+    case DataType::UINT32:
+        return "UINT32";
     default:
         return "UNKNOWN";
     }

@@ -110,6 +110,11 @@ def _ensure_torch_map():
         torch.bfloat16: DataType.BFLOAT16,
         torch.int64: DataType.INT64,
     }
+    # torch.uint16/uint32/uint64 were added in PyTorch 2.3; guard for older versions.
+    if hasattr(torch, "uint16"):
+        _TORCH_DTYPE_MAP[torch.uint16] = DataType.UINT16
+    if hasattr(torch, "uint32"):
+        _TORCH_DTYPE_MAP[torch.uint32] = DataType.UINT32
 
 
 def torch_dtype_to_datatype(dt) -> DataType:

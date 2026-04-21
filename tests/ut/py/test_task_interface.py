@@ -44,6 +44,8 @@ class TestDataType:
         assert DataType.BFLOAT16 is not None
         assert DataType.INT64 is not None
         assert DataType.UINT64 is not None
+        assert DataType.UINT16 is not None
+        assert DataType.UINT32 is not None
 
     def test_enum_int_values(self):
         assert DataType.FLOAT32.value == 0
@@ -55,6 +57,8 @@ class TestDataType:
         assert DataType.BFLOAT16.value == 6
         assert DataType.INT64.value == 7
         assert DataType.UINT64.value == 8
+        assert DataType.UINT16.value == 9
+        assert DataType.UINT32.value == 10
 
 
 class TestGetElementSize:
@@ -70,6 +74,8 @@ class TestGetElementSize:
             (DataType.BFLOAT16, 2),
             (DataType.INT64, 8),
             (DataType.UINT64, 8),
+            (DataType.UINT16, 2),
+            (DataType.UINT32, 4),
         ],
     )
     def test_element_sizes(self, dtype, expected):
@@ -89,6 +95,8 @@ class TestGetDtypeName:
             (DataType.BFLOAT16, "BFLOAT16"),
             (DataType.INT64, "INT64"),
             (DataType.UINT64, "UINT64"),
+            (DataType.UINT16, "UINT16"),
+            (DataType.UINT32, "UINT32"),
         ],
     )
     def test_dtype_names(self, dtype, expected):

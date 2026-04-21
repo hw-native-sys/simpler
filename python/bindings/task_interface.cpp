@@ -56,7 +56,9 @@ NB_MODULE(_task_interface, m) {
         .value("UINT8", DataType::UINT8)
         .value("BFLOAT16", DataType::BFLOAT16)
         .value("INT64", DataType::INT64)
-        .value("UINT64", DataType::UINT64);
+        .value("UINT64", DataType::UINT64)
+        .value("UINT16", DataType::UINT16)
+        .value("UINT32", DataType::UINT32);
 
     // --- Free functions ---
     m.def(
