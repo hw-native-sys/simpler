@@ -42,6 +42,8 @@
 // NOLINTNEXTLINE(build/namespaces)
 using namespace pto;
 
+#include "pipe_sync.h"
+
 #ifndef __gm__
 #define __gm__
 #endif
@@ -140,8 +142,7 @@ static __aicore__ void pv_matmul_n_impl(
     wait_flag(PIPE_M, PIPE_FIX, EVENT_ID0);
     TSTORE(oiGlobal, cTile);
 
-    set_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
-    wait_flag(PIPE_FIX, PIPE_S, EVENT_ID7);
+    pipe_sync();
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {

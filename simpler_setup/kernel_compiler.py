@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 from typing import Optional, Union
 
 from simpler import env_manager
@@ -119,6 +120,19 @@ class KernelCompiler:
         runtime_common_dir = str(self.project_root / "src" / arch / "runtime" / runtime_name / "common")
         common_dir = str(self.project_root / "src" / "common" / "task_interface")
         return [runtime_dir, runtime_common_dir, common_dir] + self.get_platform_include_dirs()
+
+    def get_incore_include_dirs(self) -> list[str]:
+        """
+        Include directories always on the incore (AICore/AIVector) kernel path.
+
+        These hold convenience headers used by user kernels (tests, examples)
+        — e.g. the pipe_sync helper at simpler_setup/incore/pipe_sync.h. They
+        are not framework code and are colocated with the build tooling that
+        exposes them. Both compile_incore and _compile_incore_sim prepend
+        these regardless of what extra_include_dirs the caller passes, so
+        kernels can include them without the call site knowing the dependency.
+        """
+        return [str(Path(__file__).resolve().parent / "incore")]
 
     def _get_orchestration_config(self, runtime_name: str) -> tuple[list[str], list[str]]:
         """
@@ -322,6 +336,9 @@ class KernelCompiler:
         cmd = [self.ccec.cxx_path] + self.ccec.get_compile_flags(core_type=core_type)
         cmd.extend([f"-I{pto_include}", f"-I{pto_pto_include}"])
 
+        for inc_dir in self.get_incore_include_dirs():
+            cmd.append(f"-I{os.path.abspath(inc_dir)}")
+
         if extra_include_dirs:
             for inc_dir in extra_include_dirs:
                 cmd.append(f"-I{os.path.abspath(inc_dir)}")
@@ -511,6 +528,9 @@ class KernelCompiler:
             pto_include = os.path.join(pto_isa_root, "include")
             pto_pto_include = os.path.join(pto_isa_root, "include", "pto")
             cmd.extend([f"-I{pto_include}", f"-I{pto_pto_include}"])
+
+        for inc_dir in self.get_incore_include_dirs():
+            cmd.append(f"-I{os.path.abspath(inc_dir)}")
 
         # Add extra include directories if provided
         if extra_include_dirs:

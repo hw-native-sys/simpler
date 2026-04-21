@@ -31,6 +31,8 @@
 
 using namespace pto;
 
+#include "pipe_sync.h"
+
 #ifndef __gm__
 #define __gm__
 #endif
@@ -65,11 +67,7 @@ static __aicore__ void tile_add_impl(__gm__ float *c_ptr, __gm__ float *p_ptr) {
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(outGlobal, outTile);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-
-    set_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
-    wait_flag(PIPE_MTE3, PIPE_S, EVENT_ID7);
+    pipe_sync();
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {

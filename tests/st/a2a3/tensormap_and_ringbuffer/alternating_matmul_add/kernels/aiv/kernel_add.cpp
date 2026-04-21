@@ -27,6 +27,8 @@
 
 using namespace pto;
 
+#include "pipe_sync.h"
+
 #ifndef __gm__
 #define __gm__
 #endif
@@ -66,8 +68,7 @@ static __aicore__ void add_impl(__gm__ float *src0, __gm__ float *src1, __gm__ f
     set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
     TSTORE(dstGlobal, dstTile);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    pipe_sync();
 }
 
 extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {

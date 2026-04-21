@@ -45,6 +45,7 @@ smoke() {
     local mode="$1"
     echo "::group::[${mode}] import surface"
     python -c "
+import os
 import simpler, simpler_setup
 from simpler.worker import Worker
 from simpler.task_interface import ChipWorker
@@ -58,6 +59,14 @@ from simpler_setup.scene_test import SceneTestCase, scene_test
 from simpler_setup.goldens.paged_attention import generate_inputs, compute_golden
 print('simpler:', simpler.__file__)
 print('simpler_setup:', simpler_setup.__file__)
+# Verify shipped kernel-side helpers are reachable on the incore include path.
+# A wheel that misses these data files would fall through to a cryptic kernel
+# compilation error; this catches it at smoke time.
+inc_dirs = KernelCompiler('a2a3sim').get_incore_include_dirs()
+for d in inc_dirs:
+    h = os.path.join(d, 'pipe_sync.h')
+    assert os.path.isfile(h), 'incore helper not shipped: ' + h
+print('incore helpers OK:', inc_dirs)
 "
     echo "::endgroup::"
     echo "::group::[${mode}] standalone test_*.py --help"
