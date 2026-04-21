@@ -165,14 +165,6 @@ public:
     }
 
     // =========================================================================
-    // Task descriptor accessors
-    // =========================================================================
-
-    PTO2TaskDescriptor &task(int32_t task_id) const { return descriptors_[task_id & window_mask_]; }
-
-    PTO2TaskDescriptor &task_by_slot(int32_t slot) const { return descriptors_[slot]; }
-
-    // =========================================================================
     // State queries
     // =========================================================================
 

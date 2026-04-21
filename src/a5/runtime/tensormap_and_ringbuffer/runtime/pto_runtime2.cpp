@@ -76,7 +76,9 @@ void pto2_rt_report_fatal(PTO2Runtime *rt, int32_t error_code, const char *func,
 // Returns false on timeout (sets orch.fatal).
 MAYBE_UNINITIALIZED_BEGIN
 static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wait_for_consumers, const char *caller) {
+    PTO2TaskId owner = tensor.owner_task_id;
     PTO2OrchestratorState &orch = rt->orchestrator;
+    auto &ring = orch.sm_header->rings[owner.ring()];
 
     // Collect producer slot states from both maps, deduplicated by pointer.
     // +1: one creator slot + up to PTO2_LOOKUP_MAX_RESULTS modifier slots.
@@ -85,9 +87,8 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     int slot_count = 0;
 
     // Step A: creator retention — read owner directly from tensor metadata
-    PTO2TaskId owner = tensor.owner_task_id;
     if (owner.is_valid()) {
-        slots[slot_count++] = &rt->scheduler.ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
+        slots[slot_count++] = &ring.get_slot_state_by_task_id(owner.local());
     }
 
     // Step B: modifier writer lookup (OverlapMap)
@@ -95,7 +96,7 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     orch.tensor_map.lookup(tensor, lookup_result);
     for (int r = 0; r < lookup_result.count; r++) {
         PTO2TaskId pid = lookup_result.entries[r].entry->producer_task_id;
-        PTO2TaskSlotState *s = &rt->scheduler.ring_sched_states[pid.ring()].get_slot_state_by_task_id(pid.local());
+        PTO2TaskSlotState *s = &ring.get_slot_state_by_task_id(pid.local());
         bool already = false;
         for (int j = 0; j < slot_count; j++) {
             if (slots[j] == s) {

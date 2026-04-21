@@ -558,7 +558,7 @@ struct AicpuExecutor {
     }
 
     __attribute__((noinline, cold)) void log_stall_diagnostics(
-        int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count, void *sm_base
+        int32_t thread_idx, int32_t task_count, int32_t idle_iterations, int32_t last_progress_count
     ) {
         int32_t c = completed_tasks_.load(std::memory_order_relaxed);
         DEV_ALWAYS(
@@ -567,12 +567,12 @@ struct AicpuExecutor {
         );
         CoreTracker &tracker = core_trackers_[thread_idx];
         PTO2SchedulerState *sched = &rt->scheduler;
-        PTO2SharedMemoryHeader *sm_header_diag = static_cast<PTO2SharedMemoryHeader *>(sm_base);
         int32_t cnt_ready = 0, cnt_waiting = 0, cnt_inflight = 0;
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-            int32_t ring_task_count = sm_header_diag->rings[r].fc.current_task_index.load(std::memory_order_relaxed);
+            PTO2SharedMemoryRingHeader &ring = *sched->ring_sched_states[r].ring;
+            int32_t ring_task_count = ring.fc.current_task_index.load(std::memory_order_relaxed);
             for (int32_t si = 0; si < ring_task_count; si++) {
-                PTO2TaskSlotState &slot_state = sched->get_slot_state(r, si);
+                PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(si);
                 PTO2TaskState st = slot_state.task_state.load(std::memory_order_relaxed);
                 int32_t rc = slot_state.fanin_refcount.load(std::memory_order_relaxed);
                 int32_t fi = slot_state.fanin_count;
@@ -1892,14 +1892,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     CoreTracker &tracker = core_trackers_[thread_idx];
     DEV_INFO("Thread %d: resolve_and_dispatch_pto2 entry", thread_idx);
 
-    void *sm_base = runtime->get_pto2_gm_sm_ptr();
-    if (!sm_base) {
-        DEV_ERROR("PTO2 dispatch: sm_base is null");
+    PTO2SharedMemoryHeader *header = rt->scheduler.sm_header;
+    if (!header) {
+        DEV_ERROR("PTO2 dispatch: header is null");
         return -1;
     }
-    DEV_INFO("Thread %d: sm_base=%p", thread_idx, sm_base);
-
-    PTO2SharedMemoryHeader *header = static_cast<PTO2SharedMemoryHeader *>(sm_base);
     DEV_INFO(
         "Thread %d: header=%p, task_desc_offset[0]=%lu, window_size=%lu", thread_idx, static_cast<void *>(header),
         static_cast<uint64_t>(header->rings[0].task_descriptors_offset),
@@ -2140,7 +2137,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             }
 
             if (thread_idx == 0 && task_count > 0 && idle_iterations % STALL_LOG_INTERVAL == 0) {
-                log_stall_diagnostics(thread_idx, task_count, idle_iterations, last_progress_count, sm_base);
+                log_stall_diagnostics(thread_idx, task_count, idle_iterations, last_progress_count);
             }
             if (idle_iterations > MAX_IDLE_ITERATIONS) {
                 return handle_timeout_exit(
