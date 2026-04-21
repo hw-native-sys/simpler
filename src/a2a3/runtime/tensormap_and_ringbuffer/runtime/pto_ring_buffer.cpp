@@ -32,16 +32,15 @@ void PTO2FaninPool::reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_ta
 
     int32_t scan_end = sm_last_task_alive;
     for (int32_t task_id = reclaim_task_cursor; task_id < scan_end; ++task_id) {
-        PTO2TaskSlotState &slot_state = ring.get_slot_state_by_task_id(task_id);
-        PTO2TaskPayload *payload = slot_state.payload;
-        if (payload == nullptr || payload->fanin_spill_pool != this) {
+        PTO2TaskPayload &payload = ring.get_payload_by_task_id(task_id);
+        if (payload.fanin_spill_pool != this) {
             continue;
         }
 
-        int32_t inline_count = std::min(payload->fanin_actual_count, PTO2_FANIN_INLINE_CAP);
-        int32_t spill_edge_count = payload->fanin_actual_count - inline_count;
+        int32_t inline_count = std::min(payload.fanin_actual_count, PTO2_FANIN_INLINE_CAP);
+        int32_t spill_edge_count = payload.fanin_actual_count - inline_count;
         if (spill_edge_count > 0) {
-            advance_tail(payload->fanin_spill_start + spill_edge_count);
+            advance_tail(payload.fanin_spill_start + spill_edge_count);
         }
     }
     reclaim_task_cursor = scan_end;

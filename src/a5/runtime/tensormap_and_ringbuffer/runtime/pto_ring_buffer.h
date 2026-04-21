@@ -440,7 +440,7 @@ using PTO2FaninForEachReturn = std::conditional_t<std::is_same_v<PTO2FaninCallba
 
 template <typename InlineSlots, typename Fn>
 inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_storage(
-    InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool *spill_pool, Fn &&fn
+    InlineSlots &&inline_slot_states, int32_t fanin_count, int32_t spill_start, PTO2FaninPool &spill_pool, Fn &&fn
 ) {
     using FaninCallbackResult = PTO2FaninCallbackResult<Fn>;
     static_assert(
@@ -459,17 +459,16 @@ inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_storage(
             return;
         }
 
-        PTO2FaninPool *pool = spill_pool;
-        int32_t start_idx = spill_start % pool->capacity;
-        int32_t first_count = std::min(spill_count, pool->capacity - start_idx);
-        PTO2FaninSpillEntry *first = pool->base + start_idx;
+        int32_t start_idx = spill_start % spill_pool.capacity;
+        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
+        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
         for (int32_t i = 0; i < first_count; i++) {
             fn(first[i].slot_state);
         }
 
         int32_t second_count = spill_count - first_count;
         for (int32_t i = 0; i < second_count; i++) {
-            fn(pool->base[i].slot_state);
+            fn(spill_pool.base[i].slot_state);
         }
         return;
     } else {
@@ -485,10 +484,9 @@ inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_storage(
             return true;
         }
 
-        PTO2FaninPool *pool = spill_pool;
-        int32_t start_idx = spill_start % pool->capacity;
-        int32_t first_count = std::min(spill_count, pool->capacity - start_idx);
-        PTO2FaninSpillEntry *first = pool->base + start_idx;
+        int32_t start_idx = spill_start % spill_pool.capacity;
+        int32_t first_count = std::min(spill_count, spill_pool.capacity - start_idx);
+        PTO2FaninSpillEntry *first = spill_pool.base + start_idx;
         for (int32_t i = 0; i < first_count; i++) {
             if (!fn(first[i].slot_state)) {
                 return false;
@@ -497,7 +495,7 @@ inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_storage(
 
         int32_t second_count = spill_count - first_count;
         for (int32_t i = 0; i < second_count; i++) {
-            if (!fn(pool->base[i].slot_state)) {
+            if (!fn(spill_pool.base[i].slot_state)) {
                 return false;
             }
         }
@@ -509,7 +507,7 @@ template <typename Fn>
 inline PTO2FaninForEachReturn<Fn> pto2_for_each_fanin_slot_state(const PTO2TaskPayload &payload, Fn &&fn) {
     return pto2_for_each_fanin_storage(
         payload.fanin_inline_slot_states, payload.fanin_actual_count, payload.fanin_spill_start,
-        payload.fanin_spill_pool, static_cast<Fn &&>(fn)
+        *payload.fanin_spill_pool, static_cast<Fn &&>(fn)
     );
 }
 

@@ -92,6 +92,14 @@ struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2TaskPayload *task_payloads;
     PTO2TaskSlotState *slot_states;
 
+    PTO2TaskDescriptor &get_task_by_slot(int32_t slot) { return task_descriptors[slot]; }
+
+    PTO2TaskDescriptor &get_task_by_task_id(int32_t local_id) { return task_descriptors[local_id & task_window_mask]; }
+
+    PTO2TaskPayload &get_payload_by_slot(int32_t slot) { return task_payloads[slot]; }
+
+    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id) { return task_payloads[local_id & task_window_mask]; }
+
     PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot) { return slot_states[slot]; }
 
     PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) { return slot_states[local_id & task_window_mask]; }
@@ -131,7 +139,7 @@ struct alignas(PTO2_ALIGN_SIZE) PTO2SharedMemoryHeader {
 };
 
 static_assert(
-    sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0 || sizeof(PTO2SharedMemoryHeader) < 4096,
+    (sizeof(PTO2SharedMemoryHeader) % PTO2_ALIGN_SIZE == 0) && (sizeof(PTO2SharedMemoryHeader) < 4096),
     "PTO2SharedMemoryHeader should be reasonably sized"
 );
 
