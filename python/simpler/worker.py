@@ -48,12 +48,18 @@ Usage::
 
 import ctypes
 import os
+import signal
 import struct
 import sys
+import time
+import traceback
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any, Callable, Optional
 
 from _task_interface import (  # pyright: ignore[reportMissingImports]
+    CHIP_BOOTSTRAP_MAILBOX_SIZE,
+    ChipBootstrapChannel,
+    ChipBootstrapMailboxState,
     _mailbox_load_i32,
     _mailbox_store_i32,
 )
@@ -63,7 +69,9 @@ from .task_interface import (
     MAILBOX_ERROR_MSG_SIZE,
     MAILBOX_OFF_ERROR_MSG,
     MAILBOX_SIZE,
+    ChipBootstrapConfig,
     ChipCallConfig,
+    ChipContext,
     ChipWorker,
     ContinuousTensor,
     DataType,
@@ -71,6 +79,12 @@ from .task_interface import (
     _ChipWorker,
     _Worker,
 )
+
+# Upper bound on how long the parent waits for every chip's bootstrap mailbox
+# to leave IDLE.  Well above a realistic HCCL init (seconds) but short enough
+# that a hung child fails the suite instead of the CI job timing out.
+_BOOTSTRAP_WAIT_TIMEOUT_S = 120.0
+_BOOTSTRAP_POLL_INTERVAL_S = 0.001
 
 # ---------------------------------------------------------------------------
 # Unified mailbox layout (must match worker_manager.h MAILBOX_OFF_*)
@@ -307,6 +321,115 @@ def _chip_process_loop(
             break
 
 
+def _chip_process_loop_with_bootstrap(
+    buf: memoryview,
+    host_lib_path: str,
+    device_id: int,
+    aicpu_path: str,
+    aicore_path: str,
+    sim_context_lib_path: str,
+    bootstrap_cfg: ChipBootstrapConfig,
+    bootstrap_mailbox_addr: int,
+    max_buffer_count: int,
+) -> None:
+    """Chip child variant that runs ``bootstrap_context`` before the main loop.
+
+    The child constructs its own ``ChipBootstrapChannel`` wrapping the
+    pre-fork shared-memory region, calls ``bootstrap_context`` (which
+    publishes SUCCESS/ERROR on the channel), and on success enters the same
+    task / control polling loop as ``_chip_process_loop``.  On any failure
+    before the main loop starts, the channel has already been written by the
+    callee and the function returns — the ``os._exit(0)`` in the fork
+    branch reaps the process without an extra non-zero exit code that would
+    confuse the parent's ``waitpid`` teardown.
+    """
+    channel = ChipBootstrapChannel(bootstrap_mailbox_addr, max_buffer_count)
+
+    cw = ChipWorker()
+    try:
+        cw.init(host_lib_path, aicpu_path, aicore_path, sim_context_lib_path)
+    except Exception as e:  # noqa: BLE001
+        traceback.print_exc()
+        channel.write_error(1, f"{type(e).__name__}: chip_worker.init: {e}")
+        return
+
+    try:
+        cw.bootstrap_context(device_id, bootstrap_cfg, channel=channel)
+    except Exception:  # noqa: BLE001
+        # bootstrap_context already wrote the error payload.  Release the
+        # comm handle (if any) best-effort and return; finalize() is safe to
+        # skip — the process is about to exit and the OS reclaims FDs.
+        traceback.print_exc()
+        try:
+            cw.shutdown_bootstrap()
+        except Exception:  # noqa: BLE001
+            pass
+        return
+
+    mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+    state_addr = mailbox_addr + _OFF_STATE
+    args_ptr = mailbox_addr + _OFF_ARGS
+    sys.stderr.write(f"[chip_process pid={os.getpid()} dev={device_id} bootstrap] ready\n")
+    sys.stderr.flush()
+
+    try:
+        while True:
+            state = _mailbox_load_i32(state_addr)
+            if state == _TASK_READY:
+                callable_ptr = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+                block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
+                aicpu_tn = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
+                profiling = struct.unpack_from("i", buf, _OFF_ENABLE_PROFILING)[0]
+
+                code = 0
+                msg = ""
+                try:
+                    cw._impl.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
+                except Exception as e:  # noqa: BLE001
+                    code = 1
+                    msg = _format_exc(f"chip_process dev={device_id}", e)
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _TASK_DONE)
+            elif state == _CONTROL_REQUEST:
+                sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
+                code = 0
+                msg = ""
+                try:
+                    if sub_cmd == _CTRL_MALLOC:
+                        size = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        ptr = cw._impl.malloc(size)
+                        struct.pack_into("Q", buf, _CTRL_OFF_RESULT, ptr)
+                    elif sub_cmd == _CTRL_FREE:
+                        ptr = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        cw._impl.free(ptr)
+                    elif sub_cmd == _CTRL_COPY_TO:
+                        dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                        n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                        cw._impl.copy_to(dst, src, n)
+                    elif sub_cmd == _CTRL_COPY_FROM:
+                        dst = struct.unpack_from("Q", buf, _CTRL_OFF_ARG0)[0]
+                        src = struct.unpack_from("Q", buf, _CTRL_OFF_ARG1)[0]
+                        n = struct.unpack_from("Q", buf, _CTRL_OFF_ARG2)[0]
+                        cw._impl.copy_from(dst, src, n)
+                except Exception as e:  # noqa: BLE001
+                    code = 1
+                    msg = _format_exc(f"chip_process dev={device_id} ctrl={int(sub_cmd)}", e)
+                _write_error(buf, code, msg)
+                _mailbox_store_i32(state_addr, _CONTROL_DONE)
+            elif state == _SHUTDOWN:
+                break
+    finally:
+        # Teardown contract: release the comm handle before finalize so HCCL
+        # state is torn down in LIFO order; the channel shm the parent may
+        # still reference is not touched here — only the parent unlinks it
+        # once waitpid returns.
+        try:
+            cw.shutdown_bootstrap()
+        finally:
+            cw.finalize()
+
+
 def _read_config_from_mailbox(buf: memoryview) -> "ChipCallConfig":
     """Reconstruct a ChipCallConfig from the unified mailbox layout."""
     cfg = ChipCallConfig()
@@ -371,7 +494,12 @@ class Worker:
               add_worker() before init().
     """
 
-    def __init__(self, level: int, **config) -> None:
+    def __init__(
+        self,
+        level: int,
+        chip_bootstrap_configs: Optional[list[ChipBootstrapConfig]] = None,
+        **config,
+    ) -> None:
         self.level = level
         self._config = config
         self._callable_registry: dict[int, Callable] = {}
@@ -392,6 +520,23 @@ class Worker:
         self._next_level_workers: list[Worker] = []
         self._next_level_shms: list[SharedMemory] = []
         self._next_level_pids: list[int] = []
+
+        # Per-chip bootstrap: one `ChipBootstrapConfig` per device_id plus a
+        # matching shared-memory mailbox the child publishes its
+        # `ChipBootstrapResult` into.  The `ChipContext` list is populated by
+        # `_start_hierarchical` once every chip reports SUCCESS.
+        if chip_bootstrap_configs is not None:
+            if level < 3:
+                raise ValueError(f"chip_bootstrap_configs requires level >= 3 (got level={level})")
+            device_ids = config.get("device_ids", [])
+            if len(chip_bootstrap_configs) != len(device_ids):
+                raise ValueError(
+                    f"chip_bootstrap_configs length ({len(chip_bootstrap_configs)}) "
+                    f"must equal device_ids length ({len(device_ids)})"
+                )
+        self._chip_bootstrap_configs: Optional[list[ChipBootstrapConfig]] = chip_bootstrap_configs
+        self._bootstrap_shms: list[SharedMemory] = []
+        self._chip_contexts: list[ChipContext] = []
 
     # ------------------------------------------------------------------
     # Callable registration (before init)
@@ -434,6 +579,14 @@ class Worker:
             self._init_level2()
         elif self.level >= 3:
             self._init_hierarchical()
+            # When the caller passes chip_bootstrap_configs, bring up every
+            # chip child *during* init — the parent must be able to consume
+            # `worker.chip_contexts` before the first `run()`.  Any bootstrap
+            # failure is surfaced as a RuntimeError; the helper does its own
+            # best-effort teardown of partially-forked children and shms so
+            # the caller does not need to call close().
+            if self._chip_bootstrap_configs is not None:
+                self._start_hierarchical()
         else:
             raise ValueError(f"Worker: level {self.level} not supported")
 
@@ -500,6 +653,16 @@ class Worker:
             _mailbox_store_i32(_buffer_field_addr(shm.buf, _OFF_STATE), _IDLE)
             self._next_level_shms.append(shm)
 
+        # 3b. Allocate per-chip bootstrap mailboxes (one per device_id).  Must
+        # live in shared memory so the forked child's `ChipBootstrapChannel`
+        # and the parent's read-side view see the same region.  SharedMemory
+        # zero-fills on create, which is IDLE (=0) for ChipBootstrapMailboxState,
+        # so no explicit state reset is required.
+        if self._chip_bootstrap_configs is not None:
+            for _ in self._chip_bootstrap_configs:
+                shm = SharedMemory(create=True, size=CHIP_BOOTSTRAP_MAILBOX_SIZE)
+                self._bootstrap_shms.append(shm)
+
         # 4. Construct the _Worker *before* fork so the HeapRing mmap
         #    (taken in the C++ ctor) is inherited by every child process at
         #    the same virtual address. No C++ thread is spawned here; the
@@ -511,7 +674,7 @@ class Worker:
 
         self._hierarchical_started = False
 
-    def _start_hierarchical(self) -> None:
+    def _start_hierarchical(self) -> None:  # noqa: PLR0912 -- three parallel fork loops (sub/chip/next) + bootstrap wait + scheduler register/init; branches track the fork order documented in the body
         """Fork child processes and start C++ scheduler. Called on first run()."""
         if self._hierarchical_started:
             return
@@ -532,21 +695,44 @@ class Worker:
             else:
                 self._sub_pids.append(pid)
 
-        # Fork ChipWorker processes (L3 with device_ids)
+        # Fork ChipWorker processes (L3 with device_ids).  When
+        # chip_bootstrap_configs is provided the child runs a variant loop
+        # that publishes `bootstrap_context` on a dedicated mailbox *before*
+        # entering the normal task/control loop.
+        bootstrap_configs = self._chip_bootstrap_configs
+        use_bootstrap = bootstrap_configs is not None
         if device_ids:
             for idx, dev_id in enumerate(device_ids):
                 pid = os.fork()
                 if pid == 0:
                     buf = self._chip_shms[idx].buf
                     assert buf is not None
-                    _chip_process_loop(
-                        buf,
-                        self._l3_host_lib_path,
-                        dev_id,
-                        self._l3_aicpu_path,
-                        self._l3_aicore_path,
-                        self._l3_sim_ctx_path,
-                    )
+                    if bootstrap_configs is not None:
+                        bootstrap_cfg = bootstrap_configs[idx]
+                        max_buffer_count = len(bootstrap_cfg.buffers)
+                        bootstrap_buf = self._bootstrap_shms[idx].buf
+                        assert bootstrap_buf is not None
+                        bootstrap_addr = ctypes.addressof(ctypes.c_char.from_buffer(bootstrap_buf))
+                        _chip_process_loop_with_bootstrap(
+                            buf,
+                            self._l3_host_lib_path,
+                            dev_id,
+                            self._l3_aicpu_path,
+                            self._l3_aicore_path,
+                            self._l3_sim_ctx_path,
+                            bootstrap_cfg,
+                            bootstrap_addr,
+                            max_buffer_count,
+                        )
+                    else:
+                        _chip_process_loop(
+                            buf,
+                            self._l3_host_lib_path,
+                            dev_id,
+                            self._l3_aicpu_path,
+                            self._l3_aicore_path,
+                            self._l3_sim_ctx_path,
+                        )
                     os._exit(0)
                 else:
                     self._chip_pids.append(pid)
@@ -567,6 +753,19 @@ class Worker:
                 os._exit(0)
             else:
                 self._next_level_pids.append(pid)
+
+        # When chip_bootstrap_configs was provided, block here until every
+        # chip child publishes its result on its bootstrap mailbox.  We wait
+        # *before* registering the chip mailboxes with the scheduler so a
+        # failed bring-up never reaches `dw.init()`; the abort path below
+        # SIGKILLs every forked child and unlinks every shm so init() can
+        # raise cleanly without leaking state.
+        if use_bootstrap:
+            try:
+                self._wait_for_bootstrap()
+            except BaseException:
+                self._abort_hierarchical()
+                raise
 
         # _Worker was constructed in _init_hierarchical (pre-fork) so
         # children inherit the HeapRing MAP_SHARED mmap. Register PROCESS-mode
@@ -590,6 +789,135 @@ class Worker:
         dw.init()
 
         self._orch = Orchestrator(dw.get_orchestrator())
+
+    # ------------------------------------------------------------------
+    # Bootstrap plumbing
+    # ------------------------------------------------------------------
+
+    def _wait_for_bootstrap(self) -> None:
+        """Block until every chip child has left IDLE on its bootstrap mailbox.
+
+        Fails fast on the first ERROR — returning from this function only
+        when *all* chips reached SUCCESS.  Times out after
+        `_BOOTSTRAP_WAIT_TIMEOUT_S` to surface a hung child as a TimeoutError
+        rather than blocking the CI job.  On success, populates
+        `self._chip_contexts` with one `ChipContext` per chip.
+        """
+        assert self._chip_bootstrap_configs is not None
+        device_ids = self._config.get("device_ids", [])
+        assert len(self._bootstrap_shms) == len(device_ids) == len(self._chip_bootstrap_configs)
+
+        channels: list[ChipBootstrapChannel] = []
+        for shm, cfg in zip(self._bootstrap_shms, self._chip_bootstrap_configs):
+            addr = _mailbox_addr(shm)
+            channels.append(ChipBootstrapChannel(addr, max(len(cfg.buffers), 0)))
+
+        pending = set(range(len(channels)))
+        contexts: list[Optional[ChipContext]] = [None] * len(channels)
+        deadline = time.monotonic() + _BOOTSTRAP_WAIT_TIMEOUT_S
+
+        while pending:
+            if time.monotonic() > deadline:
+                raise TimeoutError(
+                    f"bootstrap wait timed out after {_BOOTSTRAP_WAIT_TIMEOUT_S:.0f}s; "
+                    f"pending chip indices: {sorted(pending)}"
+                )
+            for idx in list(pending):
+                state = channels[idx].state
+                if state == ChipBootstrapMailboxState.IDLE:
+                    continue
+                if state == ChipBootstrapMailboxState.ERROR:
+                    raise RuntimeError(f"chip {idx} bootstrap failed: {channels[idx].error_message}")
+                # SUCCESS — assemble the ChipContext from the published fields.
+                cfg = self._chip_bootstrap_configs[idx]
+                comm = cfg.comm
+                rank = comm.rank if comm is not None else 0
+                nranks = comm.nranks if comm is not None else 1
+                ptrs = channels[idx].buffer_ptrs
+                # zip() silently truncates on mismatch, which would hide a
+                # child/parent buffer-count disagreement behind a short
+                # ChipContext — verify explicitly so the caller sees the real
+                # fault instead of a surprising missing key at orch time.
+                if len(ptrs) != len(cfg.buffers):
+                    raise RuntimeError(
+                        f"chip {idx} bootstrap success but buffer count mismatch: "
+                        f"expected {len(cfg.buffers)}, got {len(ptrs)}"
+                    )
+                buffer_ptrs = {spec.name: ptr for spec, ptr in zip(cfg.buffers, ptrs)}
+                contexts[idx] = ChipContext(
+                    device_id=device_ids[idx],
+                    rank=rank,
+                    nranks=nranks,
+                    device_ctx=channels[idx].device_ctx,
+                    local_window_base=channels[idx].local_window_base,
+                    actual_window_size=channels[idx].actual_window_size,
+                    buffer_ptrs=buffer_ptrs,
+                )
+                pending.discard(idx)
+            if pending:
+                time.sleep(_BOOTSTRAP_POLL_INTERVAL_S)
+
+        self._chip_contexts = [c for c in contexts if c is not None]
+
+    def _abort_hierarchical(self) -> None:
+        """Tear down all forked children + shms after a bootstrap failure.
+
+        Best-effort: SIGKILL every child we spawned, reap them, then close
+        and unlink every mailbox.  Called only from the init() failure path,
+        so `dw.init()` has not run and the C++ scheduler is not holding any
+        mailbox references.
+        """
+        pids = list(self._chip_pids) + list(self._sub_pids) + list(self._next_level_pids)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except OSError:
+                pass
+        for pid in pids:
+            try:
+                os.waitpid(pid, 0)
+            except ChildProcessError:
+                pass
+
+        for shm in self._sub_shms + self._chip_shms + self._next_level_shms + self._bootstrap_shms:
+            try:
+                shm.close()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Release the pre-fork _Worker so a retry / close() won't double-free
+        # the HeapRing mmap the C++ ctor grabbed.
+        self._worker = None
+        self._orch = None
+
+        self._chip_pids.clear()
+        self._sub_pids.clear()
+        self._next_level_pids.clear()
+        self._sub_shms.clear()
+        self._chip_shms.clear()
+        self._next_level_shms.clear()
+        self._bootstrap_shms.clear()
+        self._chip_contexts.clear()
+
+    @property
+    def chip_contexts(self) -> list[ChipContext]:
+        """Per-chip bootstrap results, populated during `init()`.
+
+        Raises ``RuntimeError`` when accessed before `init()` so an orch
+        function that consumes this property in the wrong order fails
+        loudly rather than seeing a misleading empty list.
+        """
+        if not self._initialized:
+            raise RuntimeError("Worker.chip_contexts available only after init()")
+        return list(self._chip_contexts)
 
     # ------------------------------------------------------------------
     # memory management
@@ -706,7 +1034,7 @@ class Worker:
     # close
     # ------------------------------------------------------------------
 
-    def close(self) -> None:
+    def close(self) -> None:  # noqa: PLR0912 -- parallel teardown for _worker + sub/chip/next/bootstrap shms with ordering constraints documented inline
         if not self._initialized:
             return
 
@@ -754,6 +1082,21 @@ class Worker:
                 shm.close()
                 shm.unlink()
 
+            # Unlink the bootstrap mailboxes last — chip children touch their
+            # `ChipBootstrapChannel` from inside `shutdown_bootstrap()` +
+            # `finalize()`, which runs after they leave the main loop on
+            # SHUTDOWN.  Waiting until every chip pid has been reaped above
+            # guarantees no child is still reading from these shms.
+            for shm in self._bootstrap_shms:
+                try:
+                    shm.close()
+                except Exception:  # noqa: BLE001
+                    pass
+                try:
+                    shm.unlink()
+                except FileNotFoundError:
+                    pass
+
             self._sub_shms.clear()
             self._sub_pids.clear()
             self._chip_shms.clear()
@@ -761,6 +1104,8 @@ class Worker:
             self._next_level_shms.clear()
             self._next_level_pids.clear()
             self._next_level_workers.clear()
+            self._bootstrap_shms.clear()
+            self._chip_contexts.clear()
 
         self._initialized = False
 

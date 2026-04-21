@@ -79,7 +79,7 @@ __all__ = [
     "MAILBOX_OFF_ERROR_MSG",
     "MAILBOX_ERROR_MSG_SIZE",
     "read_args_from_blob",
-    # Chip bootstrap (L5)
+    # Chip bootstrap
     "CHIP_BOOTSTRAP_MAILBOX_SIZE",
     "ChipBootstrapChannel",
     "ChipBootstrapMailboxState",
@@ -88,6 +88,8 @@ __all__ = [
     "HostBufferStaging",
     "ChipBootstrapConfig",
     "ChipBootstrapResult",
+    # Worker-level chip bootstrap orchestration
+    "ChipContext",
 ]
 
 
@@ -122,9 +124,9 @@ class ChipCommBootstrapConfig:
 
     A ``ChipBootstrapConfig`` with ``comm=None`` skips the communicator step
     entirely; in that mode ``cfg.buffers`` must be empty because
-    ``placement="window"`` is the only supported placement in L5 and the
-    window only exists once a communicator has been brought up.  Comm-less
-    configs are used by validation / error-path tests that need to trip
+    ``placement="window"`` is the only supported placement and the window
+    only exists once a communicator has been brought up.  Comm-less configs
+    are used by validation / error-path tests that need to trip
     ``bootstrap_context`` before it reaches any communicator call.
     """
 
@@ -144,8 +146,8 @@ class ChipBufferSpec:
 
     Buffers are placed sequentially inside the window in declaration order —
     ``ChipBootstrapResult.buffer_ptrs`` is 1:1 aligned with the ``buffers``
-    list so downstream code (L6's ``ChipContext``) can build a ``name → ptr``
-    dict by zipping the two.
+    list so downstream code (the Worker's ``ChipContext``) can build a
+    ``name → ptr`` dict by zipping the two.
     """
 
     name: str
@@ -203,6 +205,27 @@ class ChipBootstrapResult:
     local_window_base: int
     actual_window_size: int
     buffer_ptrs: list[int]
+
+
+@dataclass
+class ChipContext:
+    """Per-chip view of a successful bootstrap, exposed to L3+ orch functions.
+
+    Built by the parent `Worker` in `_start_hierarchical` from the
+    `ChipBootstrapConfig` it forwarded to the chip child and the
+    `ChipBootstrapResult` the child published via its `ChipBootstrapChannel`.
+    `buffer_ptrs` is the `name → device pointer` map obtained by zipping the
+    config's `ChipBufferSpec.name` with the result's `buffer_ptrs`, so orch
+    code can address a named window slice without tracking list indices.
+    """
+
+    device_id: int
+    rank: int
+    nranks: int
+    device_ctx: int
+    local_window_base: int
+    actual_window_size: int
+    buffer_ptrs: dict[str, int]
 
 
 class ChipWorker:
@@ -338,16 +361,17 @@ class ChipWorker:
         """One-shot per-chip bootstrap: set device, build communicator, slice window,
         stage inputs from host shared memory, and (optionally) publish the result.
 
-        Runs inside a forked chip child.  If ``channel`` is provided (the L6
-        integration path), the result is written as SUCCESS or — on any
-        exception — as ERROR (code=1, ``"<ExceptionType>: <message>"``) before
-        the exception is re-raised.  Standalone callers can pass
-        ``channel=None`` and consume the return value directly.
+        Runs inside a forked chip child.  If ``channel`` is provided (the
+        Worker-orchestrated integration path), the result is written as
+        SUCCESS or — on any exception — as ERROR (code=1,
+        ``"<ExceptionType>: <message>"``) before the exception is re-raised.
+        Standalone callers can pass ``channel=None`` and consume the return
+        value directly.
 
         The HCCL comm handle produced by ``comm_init`` is stashed on
         ``self._comm_handle`` so ``shutdown_bootstrap()`` can release it later;
         ``finalize()`` is intentionally *not* wired to this handle — teardown
-        ordering is the caller's (L6's) responsibility.
+        ordering is the caller's responsibility.
         """
         try:
             self.set_device(device_id)
@@ -422,9 +446,10 @@ class ChipWorker:
 
         Idempotent — safe to call multiple times, and safe to call if
         ``bootstrap_context`` was never invoked.  ``finalize()`` does *not*
-        chain into this method, so L6 must call ``shutdown_bootstrap()``
-        before ``finalize()`` (or after, if the comm handle was already
-        destroyed — the zero-handle guard makes a second call a no-op).
+        chain into this method, so callers (e.g. the Worker's chip child
+        loop) must call ``shutdown_bootstrap()`` before ``finalize()`` (or
+        after, if the comm handle was already destroyed — the zero-handle
+        guard makes a second call a no-op).
         """
         handle = getattr(self, "_comm_handle", 0)
         if handle != 0:
