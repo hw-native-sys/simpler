@@ -648,7 +648,7 @@ struct PTO2SchedulerState {
             int32_t wfanin = ws->payload->fanin_actual_count;
 
             if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                rss.dep_pool.reclaim(*this, ring_id, rss.last_task_alive);
+                rss.dep_pool.reclaim(*sm_handle, ring_id, rss.last_task_alive);
                 if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
                     break;  // not enough dep_pool space — keep remainder for next call
                 }

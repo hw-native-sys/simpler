@@ -18,9 +18,7 @@
 
 #include "pto_scheduler.h"
 #include <inttypes.h>
-#include <new>
 #include <stdlib.h>
-#include <utility>
 #include "common/unified_log.h"
 
 // =============================================================================
@@ -123,14 +121,10 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHandle *sm_handle,
     task_window_size = sm_handle->header->rings[ring_id].task_window_size;
     task_window_mask = static_cast<int32_t>(task_window_size - 1);
     last_task_alive = 0;
-    slot_states = nullptr;
     advance_lock.store(0, std::memory_order_relaxed);
 
-    // Allocate per-task slot state array (dynamically sized based on runtime window_size)
-    slot_states = new (std::nothrow) PTO2TaskSlotState[task_window_size];
-    if (!slot_states) {
-        return false;
-    }
+    // Point into shared memory (allocated by pto2_sm_create)
+    slot_states = sm_handle->slot_states[ring_id];
 
     // Initialize all per-task slot state fields.
     // bind() sets payload, task, ring_id — immutable after init, bound once
@@ -149,11 +143,7 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHandle *sm_handle,
     return true;
 }
 
-void PTO2SchedulerState::RingSchedState::destroy() {
-    if (!slot_states) return;
-    delete[] slot_states;
-    slot_states = nullptr;
-}
+void PTO2SchedulerState::RingSchedState::destroy() { slot_states = nullptr; }
 
 bool pto2_scheduler_init(PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_handle, int32_t dep_pool_capacity) {
     sched->sm_handle = sm_handle;

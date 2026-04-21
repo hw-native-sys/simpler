@@ -19,9 +19,11 @@
  *   +---------------------------+
  *   | Ring 0: TaskDescriptor[]  |
  *   | Ring 0: TaskPayload[]     |
+ *   | Ring 0: TaskSlotState[]   |
  *   +---------------------------+
  *   | Ring 1: TaskDescriptor[]  |
  *   | Ring 1: TaskPayload[]     |
+ *   | Ring 1: TaskSlotState[]   |
  *   +---------------------------+
  *   | ...                       |
  *   +---------------------------+
@@ -136,9 +138,20 @@ struct PTO2SharedMemoryHandle {
     PTO2SharedMemoryHeader *header;
     PTO2TaskDescriptor *task_descriptors[PTO2_MAX_RING_DEPTH];
     PTO2TaskPayload *task_payloads[PTO2_MAX_RING_DEPTH];
+    PTO2TaskSlotState *slot_states[PTO2_MAX_RING_DEPTH];
+
+    // Cached per-ring layout (avoids indirection through header)
+    uint64_t task_window_sizes[PTO2_MAX_RING_DEPTH];
+    int32_t task_window_masks[PTO2_MAX_RING_DEPTH];
 
     // Ownership flag
     bool is_owner;  // True if this handle allocated the memory
+
+    PTO2TaskSlotState &get_slot_state_by_slot(int32_t ring_id, int32_t slot) { return slot_states[ring_id][slot]; }
+
+    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t ring_id, int32_t local_id) {
+        return slot_states[ring_id][local_id & task_window_masks[ring_id]];
+    }
 };
 
 // =============================================================================

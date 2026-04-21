@@ -42,8 +42,6 @@
 #include "pto_shared_memory.h"
 #include "common/unified_log.h"
 
-struct PTO2SchedulerState;  // Forward declaration for dep_pool reclaim
-
 // Set to 1 to enable periodic BLOCKED/Unblocked messages during spin-wait.
 #ifndef PTO2_SPIN_VERBOSE_LOGGING
 #define PTO2_SPIN_VERBOSE_LOGGING 1
@@ -400,9 +398,9 @@ struct PTO2FaninPool {
         error_code_ptr = in_error_code_ptr;
     }
 
-    void reclaim(PTO2SchedulerState &sched, uint8_t ring_id, int32_t sm_last_task_alive);
+    void reclaim(PTO2SharedMemoryHandle &sm_handle, uint8_t ring_id, int32_t sm_last_task_alive);
 
-    void ensure_space(PTO2SchedulerState &sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
+    void ensure_space(PTO2SharedMemoryHandle &sm_handle, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
 
     PTO2FaninSpillEntry *alloc() {
         int32_t used = top - tail;
@@ -573,17 +571,17 @@ struct PTO2DepListPool {
      * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
      * Safe to call multiple times — only advances tail forward.
      *
-     * @param sched              Scheduler state (for reading slot dep_pool_mark)
+     * @param sm_handle           Shared memory handle (for reading slot dep_pool_mark)
      * @param ring_id            Ring layer index
      * @param sm_last_task_alive Current last_task_alive from shared memory
      */
-    void reclaim(PTO2SchedulerState &sched, uint8_t ring_id, int32_t sm_last_task_alive);
+    void reclaim(PTO2SharedMemoryHandle &sm_handle, uint8_t ring_id, int32_t sm_last_task_alive);
 
     /**
      * Ensure dep pool for a specific ring has at least `needed` entries available.
      * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
      */
-    void ensure_space(PTO2SchedulerState &sched, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
+    void ensure_space(PTO2SharedMemoryHandle &sm_handle, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)

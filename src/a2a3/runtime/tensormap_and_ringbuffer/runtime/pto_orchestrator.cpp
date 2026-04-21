@@ -198,8 +198,8 @@ struct PTO2FaninBuilder {
 
 static bool pto2_append_fanin_or_fail(
     PTO2OrchestratorState *orch, PTO2TaskId task_id, int32_t tensor_arg_index, TensorArgType ptype,
-    PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, PTO2SchedulerState *sched, PTO2RingFlowControl &fc,
-    uint8_t ring_id, const char *reason
+    PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, PTO2RingFlowControl &fc, uint8_t ring_id,
+    const char *reason
 ) {
     if (fanin_builder->contains(prod_state)) {
         return true;
@@ -210,11 +210,11 @@ static bool pto2_append_fanin_or_fail(
         return true;
     }
 
-    if (sched == nullptr || fanin_builder->spill_pool == nullptr) {
+    if (fanin_builder->spill_pool == nullptr) {
         LOG_ERROR("========================================");
         LOG_ERROR("FATAL: Fanin Spill Builder Misconfigured!");
         LOG_ERROR("========================================");
-        LOG_ERROR("Missing scheduler or fanin spill pool while appending dynamic fanin.");
+        LOG_ERROR("Missing fanin spill pool while appending dynamic fanin.");
         LOG_ERROR("  task_id.raw:        %" PRIu64, task_id.raw);
         LOG_ERROR("  tensor_arg_index:   %d", tensor_arg_index);
         LOG_ERROR("  tensor_arg_type:    %d", static_cast<int>(ptype));
@@ -225,7 +225,7 @@ static bool pto2_append_fanin_or_fail(
     }
 
     PTO2FaninPool &fanin_pool = *fanin_builder->spill_pool;
-    fanin_pool.ensure_space(*sched, fc, ring_id, 1);
+    fanin_pool.ensure_space(*orch->sm_handle, fc, ring_id, 1);
     int32_t spill_idx = fanin_pool.top;
     PTO2FaninSpillEntry *entry = fanin_pool.alloc();
     if (entry == nullptr) {
@@ -321,16 +321,14 @@ static bool pto2_prepare_task(
         return false;
     }
 
-    auto sched = orch->scheduler;
     out->alloc_result = allocator.alloc(total_output_size);
     if (out->alloc_result.failed()) {
         pto2_orch_mark_fatal(orch, PTO2_ERROR_HEAP_RING_DEADLOCK);
         return false;
     }
 
-    auto &rs = sched->ring_sched_states[ring_id];
     out->task_id = PTO2TaskId::make(ring_id, static_cast<uint32_t>(out->alloc_result.task_id));
-    out->slot_state = &rs.get_slot_state_by_slot(out->alloc_result.slot);
+    out->slot_state = &orch->sm_handle->get_slot_state_by_slot(ring_id, out->alloc_result.slot);
     out->task = &orch->sm_handle->task_descriptors[ring_id][out->alloc_result.slot];
     out->payload = &orch->sm_handle->task_payloads[ring_id][out->alloc_result.slot];
 
@@ -616,10 +614,9 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
         if (owner.is_valid()) {
-            PTO2TaskSlotState *prod_state =
-                &sched->ring_sched_states[owner.ring()].get_slot_state_by_task_id(owner.local());
+            PTO2TaskSlotState *prod_state = &orch->sm_handle->get_slot_state_by_task_id(owner.ring(), owner.local());
             if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "creator retention"
+                    orch, task_id, i, ptype, prod_state, &fanin_builder, fc, ring_id, "creator retention"
                 )) {
                 return result;
             }
@@ -641,9 +638,9 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
             auto overlap_status = lookup_result.entries[r].overlap_status;
             auto prod_ring = entry.producer_task_id.ring();
             auto prod_local = entry.producer_task_id.local();
-            PTO2TaskSlotState *prod_state = &sched->ring_sched_states[prod_ring].get_slot_state_by_task_id(prod_local);
+            PTO2TaskSlotState *prod_state = &orch->sm_handle->get_slot_state_by_task_id(prod_ring, prod_local);
             if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, &fanin_builder, sched, fc, ring_id, "overlap lookup"
+                    orch, task_id, i, ptype, prod_state, &fanin_builder, fc, ring_id, "overlap lookup"
                 )) {
                 return result;
             }

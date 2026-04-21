@@ -45,6 +45,7 @@ uint64_t pto2_sm_calculate_size_per_ring(const uint64_t task_window_sizes[PTO2_M
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
         size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        size += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     }
 
     return size;
@@ -64,11 +65,17 @@ pto2_sm_setup_pointers_per_ring(PTO2SharedMemoryHandle *handle, const uint64_t t
 
     // Per-ring task descriptors and payloads
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
+        handle->task_window_sizes[r] = task_window_sizes[r];
+        handle->task_window_masks[r] = static_cast<int32_t>(task_window_sizes[r] - 1);
+
         handle->task_descriptors[r] = (PTO2TaskDescriptor *)ptr;
         ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
 
         handle->task_payloads[r] = (PTO2TaskPayload *)ptr;
         ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+
+        handle->slot_states[r] = (PTO2TaskSlotState *)ptr;
+        ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     }
 }
 
@@ -187,6 +194,7 @@ void pto2_sm_init_header_per_ring(
         header->rings[r].task_descriptors_offset = offset;
         offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
         offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
+        offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     }
 
     header->total_size = handle->sm_size;
