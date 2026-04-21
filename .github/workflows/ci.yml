@@ -290,18 +290,12 @@ jobs:
 
       - name: Run Python hardware unit tests
         run: |
-          set +e
           source .venv/bin/activate
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash
-          set -e
           python -m pytest tests -m requires_hardware --platform a2a3 --device ${DEVICE_RANGE} -v
 
       - name: Build and run C++ hardware unit tests
         run: |
-          set +e
           source .venv/bin/activate
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash
-          set -e
           python -c "from simpler_setup.runtime_builder import RuntimeBuilder; RuntimeBuilder('a2a3').get_binaries('tensormap_and_ringbuffer', build=True)"
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
           cmake --build tests/ut/cpp/build
@@ -339,7 +333,6 @@ jobs:
         run: |
           set +e
           source .venv/bin/activate
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash
           python -m pytest examples tests/st --platform a2a3 --device ${DEVICE_RANGE} -v --pto-session-timeout 600 --clone-protocol https
           rc=$?
           if [ $rc -eq 124 ]; then
@@ -413,19 +406,13 @@ jobs:
 
       - name: Run Python hardware unit tests (a5)
         run: |
-          set +e
           source .venv/bin/activate
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash
-          set -e
           DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "python -m pytest tests -m requires_hardware --platform a5 --device ${DEVICE_RANGE} -v"
 
       - name: Build and run C++ hardware unit tests (a5)
         run: |
-          set +e
           source .venv/bin/activate
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash
-          set -e
           cmake -B tests/ut/cpp/build -S tests/ut/cpp -DSIMPLER_ENABLE_HARDWARE_TESTS=ON
           cmake --build tests/ut/cpp/build
           python3 -c "
@@ -457,10 +444,7 @@ jobs:
 
       - name: Run pytest scene tests (a5)
         run: |
-          set +e
           source .venv/bin/activate
-          source ${ASCEND_HOME_PATH}/bin/setenv.bash
-          set -e
           DEVICE_LIST=$(python -c "s,e='${DEVICE_RANGE}'.split('-'); print(','.join(str(i) for i in range(int(s),int(e)+1)))")
           PYTEST="python -m pytest examples tests/st --platform a5 --device ${DEVICE_RANGE} -v --clone-protocol https"
           task-submit --timeout 1800 --max-time 1800 --device "$DEVICE_LIST" --run "set +e; $PYTEST --pto-session-timeout 1200; rc=\$?; if [ \$rc -eq 124 ]; then echo 'pytest timed out; retrying with pinned PTO-ISA commit'; $PYTEST --pto-session-timeout 1200 --pto-isa-commit ${{ env.PTO_ISA_COMMIT }} --clone-protocol https; rc=\$?; fi; exit \$rc"
