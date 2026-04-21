@@ -321,7 +321,7 @@ def _chip_process_loop(
             break
 
 
-def _chip_process_loop_with_bootstrap(
+def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
     buf: memoryview,
     host_lib_path: str,
     device_id: int,
@@ -354,7 +354,7 @@ def _chip_process_loop_with_bootstrap(
         return
 
     try:
-        cw.bootstrap_context(device_id, bootstrap_cfg, channel=channel)
+        result = cw.bootstrap_context(device_id, bootstrap_cfg, channel=channel)
     except Exception:  # noqa: BLE001
         # bootstrap_context already wrote the error payload.  Release the
         # comm handle (if any) best-effort and return; finalize() is safe to
@@ -365,6 +365,15 @@ def _chip_process_loop_with_bootstrap(
         except Exception:  # noqa: BLE001
             pass
         return
+
+    # Build store_to_host mapping: (device_ptr, HostBufferStaging) for each
+    # buffer with store_to_host=True.  Processed after every task completion
+    # so the parent can read results from SharedMemory without a cross-fork
+    # host-pointer copy_from (which is broken across processes).
+    _store_to_host: list[tuple[int, object]] = []
+    for spec, ptr in zip(bootstrap_cfg.buffers, result.buffer_ptrs):
+        if spec.store_to_host:
+            _store_to_host.append((ptr, bootstrap_cfg.output_staging(spec.name)))
 
     mailbox_addr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
     state_addr = mailbox_addr + _OFF_STATE
@@ -390,6 +399,17 @@ def _chip_process_loop_with_bootstrap(
                     msg = _format_exc(f"chip_process dev={device_id}", e)
                 _write_error(buf, code, msg)
                 _mailbox_store_i32(state_addr, _TASK_DONE)
+
+                # Post-task: flush store_to_host buffers to SharedMemory.
+                for dev_ptr, staging in _store_to_host:
+                    shm = SharedMemory(name=staging.shm_name)
+                    try:
+                        shm_buf = shm.buf
+                        assert shm_buf is not None
+                        host_ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
+                        cw._impl.copy_from(host_ptr, dev_ptr, staging.size)
+                    finally:
+                        shm.close()
             elif state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
                 code = 0

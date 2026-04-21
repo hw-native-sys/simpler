@@ -341,40 +341,55 @@ def _collect_st_runtimes(items, level=None):
 
 
 def _collect_l3_cases(items, platform):
-    """Collect one job per L3 class (not per case).
+    """Collect one job per L3 class or multi-device standalone function.
 
-    Returns a list of tuples ``(nodeid, cls_name, runtime, max_device_count)``
-    where ``max_device_count`` is the maximum ``device_count`` across the
-    class's matching cases. Per-class dispatch matches the ``st_worker``
-    fixture's contract (it allocates ``max(CASES.device_count)`` for the whole
-    class) — dispatching per-case with a smaller device budget would trip the
-    fixture whenever the class also has a case that needs more devices.
+    Returns a list of tuples ``(nodeid, label, runtime, max_device_count)``.
 
-    Cases within a class still run in the child process via the existing
-    ``test_run`` case loop, reusing the Worker (layer-4 reuse).
+    For class-based tests (``SceneTestCase`` with ``_st_level == 3``),
+    ``max_device_count`` is the maximum ``device_count`` across the class's
+    matching cases. Per-class dispatch matches the ``st_worker`` fixture's
+    contract (it allocates ``max(CASES.device_count)`` for the whole class).
+
+    For standalone functions, ``device_count`` comes from the
+    ``@pytest.mark.device_count(n)`` marker. Standalone functions must also
+    carry a ``@pytest.mark.runtime("...")`` marker so the dispatcher knows
+    which runtime to pass to the child subprocess.
     """
     by_nodeid: dict[str, tuple[str, str, int]] = {}
     for item in items:
-        cls = getattr(item, "cls", None)
-        if not cls or getattr(cls, "_st_level", None) != 3:
-            continue
         if any(m.name == "skip" for m in item.iter_markers()):
             continue
-        rt = getattr(cls, "_st_runtime", None)
-        if not rt:
-            continue
-        max_dev = 1
-        saw_case = False
-        for case in getattr(cls, "CASES", []):
-            if platform and platform not in case.get("platforms", []):
+        cls = getattr(item, "cls", None)
+        if cls is not None and getattr(cls, "_st_level", None) == 3:
+            rt = getattr(cls, "_st_runtime", None)
+            if not rt:
                 continue
-            if case.get("manual"):
-                continue  # --manual exclude is the default; children honor the flag
-            saw_case = True
-            max_dev = max(max_dev, int(case.get("config", {}).get("device_count", 1)))
-        if saw_case:
-            by_nodeid[item.nodeid] = (cls.__name__, rt, max_dev)
-    return [(nodeid, cls_name, rt, dev) for nodeid, (cls_name, rt, dev) in by_nodeid.items()]
+            max_dev = 1
+            saw_case = False
+            for case in getattr(cls, "CASES", []):
+                if platform and platform not in case.get("platforms", []):
+                    continue
+                if case.get("manual"):
+                    continue
+                saw_case = True
+                max_dev = max(max_dev, int(case.get("config", {}).get("device_count", 1)))
+            if saw_case:
+                by_nodeid[item.nodeid] = (cls.__name__, rt, max_dev)
+        elif cls is None:
+            # Standalone function: collect if it requests devices via marker.
+            dev_marker = item.get_closest_marker("device_count")
+            if dev_marker is None:
+                continue
+            rt_marker = item.get_closest_marker("runtime")
+            if rt_marker is None or not rt_marker.args:
+                continue
+            platforms_marker = item.get_closest_marker("platforms")
+            if platforms_marker and platform and platform not in platforms_marker.args[0]:
+                continue
+            dev_count = int(dev_marker.args[0]) if dev_marker.args else 1
+            label = item.name  # function name
+            by_nodeid[item.nodeid] = (label, rt_marker.args[0], dev_count)
+    return [(nodeid, label, rt, dev) for nodeid, (label, rt, dev) in by_nodeid.items()]
 
 
 def _base_pytest_argv(session):
