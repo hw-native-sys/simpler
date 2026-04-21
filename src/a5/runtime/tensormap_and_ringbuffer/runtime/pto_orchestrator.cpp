@@ -127,12 +127,12 @@ static void *pto2_aligned_zalloc(size_t size, size_t alignment) {
 static int32_t pto2_orch_mark_fatal(PTO2OrchestratorState *orch, int32_t error_code) {
     always_assert(orch != nullptr);
     orch->fatal = true;
-    if (error_code == PTO2_ERROR_NONE || orch->sm_handle == nullptr || orch->sm_handle->header == nullptr) {
+    if (error_code == PTO2_ERROR_NONE || orch->sm_header == nullptr) {
         return PTO2_ERROR_NONE;
     }
 
     int32_t expected = PTO2_ERROR_NONE;
-    std::atomic<int32_t> &orch_error_code = orch->sm_handle->header->orch_error_code;
+    std::atomic<int32_t> &orch_error_code = orch->sm_header->orch_error_code;
     if (orch_error_code.compare_exchange_strong(expected, error_code, std::memory_order_acq_rel)) {
         return error_code;
     }
@@ -198,8 +198,7 @@ struct PTO2FaninBuilder {
 
 static bool pto2_append_fanin_or_fail(
     PTO2OrchestratorState *orch, PTO2TaskId task_id, int32_t tensor_arg_index, TensorArgType ptype,
-    PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, PTO2RingFlowControl &fc, uint8_t ring_id,
-    const char *reason
+    PTO2TaskSlotState *prod_state, PTO2FaninBuilder *fanin_builder, uint8_t ring_id, const char *reason
 ) {
     if (fanin_builder->contains(prod_state)) {
         return true;
@@ -225,7 +224,7 @@ static bool pto2_append_fanin_or_fail(
     }
 
     PTO2FaninPool &fanin_pool = *fanin_builder->spill_pool;
-    fanin_pool.ensure_space(*orch->sm_handle, fc, ring_id, 1);
+    fanin_pool.ensure_space(orch->sm_header->rings[ring_id], 1);
     int32_t spill_idx = fanin_pool.top;
     PTO2FaninSpillEntry *entry = fanin_pool.alloc();
     if (entry == nullptr) {
@@ -328,9 +327,9 @@ static bool pto2_prepare_task(
     }
 
     out->task_id = PTO2TaskId::make(ring_id, static_cast<uint32_t>(out->alloc_result.task_id));
-    out->slot_state = &orch->sm_handle->get_slot_state_by_slot(ring_id, out->alloc_result.slot);
-    out->task = &orch->sm_handle->task_descriptors[ring_id][out->alloc_result.slot];
-    out->payload = &orch->sm_handle->task_payloads[ring_id][out->alloc_result.slot];
+    out->slot_state = &orch->sm_header->rings[ring_id].get_slot_state_by_slot(out->alloc_result.slot);
+    out->task = &orch->sm_header->rings[ring_id].task_descriptors[out->alloc_result.slot];
+    out->payload = &orch->sm_header->rings[ring_id].task_payloads[out->alloc_result.slot];
 
     pto2_prefetch_payload(out->payload, args.tensor_count(), args.scalar_count());
 
@@ -358,12 +357,12 @@ static bool pto2_prepare_task(
 // =============================================================================
 
 bool pto2_orchestrator_init(
-    PTO2OrchestratorState *orch, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
+    PTO2OrchestratorState *orch, PTO2SharedMemoryHeader *sm_header, void *gm_heap, uint64_t heap_size,
     int32_t dep_pool_capacity
 ) {
     *orch = PTO2OrchestratorState{};
 
-    orch->sm_handle = sm_handle;
+    orch->sm_header = sm_header;
     orch->gm_heap_base = gm_heap;
     orch->gm_heap_size = heap_size * PTO2_MAX_RING_DEPTH;
     orch->fatal = false;
@@ -371,12 +370,12 @@ bool pto2_orchestrator_init(
     // Initialize per-ring resources
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         void *ring_heap_base = reinterpret_cast<char *>(gm_heap) + r * heap_size;
-        auto &fc = sm_handle->header->rings[r].fc;
+        auto &ring = sm_header->rings[r];
 
         // Initialize unified task allocator
         orch->rings[r].task_allocator.init(
-            sm_handle->task_descriptors[r], sm_handle->header->rings[r].task_window_size, &fc.current_task_index,
-            &fc.last_task_alive, ring_heap_base, heap_size, &sm_handle->header->orch_error_code
+            ring.task_descriptors, ring.task_window_size, &ring.fc.current_task_index, &ring.fc.last_task_alive,
+            ring_heap_base, heap_size, &sm_header->orch_error_code
         );
 
         size_t fanin_pool_bytes =
@@ -389,13 +388,13 @@ bool pto2_orchestrator_init(
             }
             return false;
         }
-        orch->rings[r].fanin_pool.init(fanin_entries, dep_pool_capacity, &sm_handle->header->orch_error_code);
+        orch->rings[r].fanin_pool.init(fanin_entries, dep_pool_capacity, &sm_header->orch_error_code);
     }
 
     // Initialize TensorMap with per-ring task window sizes
     int32_t task_window_sizes[PTO2_MAX_RING_DEPTH];
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        task_window_sizes[r] = sm_handle->header->rings[r].task_window_size;
+        task_window_sizes[r] = sm_header->rings[r].task_window_size;
     }
     if (!orch->tensor_map.init_default(task_window_sizes)) {
         for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
@@ -573,7 +572,7 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
     }
     uint8_t ring_id = prepared.task_id.ring();
     PTO2SchedulerState *sched = orch->scheduler;
-    PTO2RingFlowControl &fc = orch->sm_handle->header->rings[ring_id].fc;
+    PTO2RingFlowControl &fc = orch->sm_header->rings[ring_id].fc;
     PTO2TaskId task_id = prepared.task_id;
     PTO2TaskSlotState &cur_slot_state = *prepared.slot_state;
     PTO2TaskDescriptor &task = *prepared.task;
@@ -615,9 +614,10 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
         // Step A: creator retention — all existing tensors extend their creator lifetime.
         PTO2TaskId owner = tensor->owner_task_id;
         if (owner.is_valid()) {
-            PTO2TaskSlotState *prod_state = &orch->sm_handle->get_slot_state_by_task_id(owner.ring(), owner.local());
+            PTO2TaskSlotState *prod_state =
+                &orch->sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local());
             if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, &fanin_builder, fc, ring_id, "creator retention"
+                    orch, task_id, i, ptype, prod_state, &fanin_builder, ring_id, "creator retention"
                 )) {
                 return result;
             }
@@ -639,9 +639,9 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
             auto overlap_status = lookup_result.entries[r].overlap_status;
             auto prod_ring = entry.producer_task_id.ring();
             auto prod_local = entry.producer_task_id.local();
-            PTO2TaskSlotState *prod_state = &orch->sm_handle->get_slot_state_by_task_id(prod_ring, prod_local);
+            PTO2TaskSlotState *prod_state = &orch->sm_header->rings[prod_ring].get_slot_state_by_task_id(prod_local);
             if (!pto2_append_fanin_or_fail(
-                    orch, task_id, i, ptype, prod_state, &fanin_builder, fc, ring_id, "overlap lookup"
+                    orch, task_id, i, ptype, prod_state, &fanin_builder, ring_id, "overlap lookup"
                 )) {
                 return result;
             }
@@ -843,7 +843,7 @@ void pto2_orchestrator_done(PTO2OrchestratorState *orch) {
             );
         }
     }
-    orch->sm_handle->header->orchestrator_done.store(1, std::memory_order_release);
+    orch->sm_header->orchestrator_done.store(1, std::memory_order_release);
 #if !PTO2_ORCH_PROFILING && PTO2_PROFILING
     g_orch_submit_idx = 0;
 #endif

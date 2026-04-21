@@ -520,7 +520,7 @@ struct PTO2CompletionStats {
  */
 struct PTO2SchedulerState {
     // Shared memory access
-    PTO2SharedMemoryHandle *sm_handle;
+    PTO2SharedMemoryHeader *sm_header;
 
     // Per-ring state
     struct alignas(64) RingSchedState {
@@ -537,7 +537,7 @@ struct PTO2SchedulerState {
         // --- Cache Line 2+: Thread 0 only (wiring dep_pool) ---
         alignas(64) PTO2DepListPool dep_pool;
 
-        bool init(PTO2SharedMemoryHandle *sm_handle, int32_t ring_id);
+        bool init(PTO2SharedMemoryHeader *sm_header, int32_t ring_id);
         void destroy();
 
         PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id) {
@@ -651,7 +651,7 @@ struct PTO2SchedulerState {
             int32_t wfanin = ws->payload->fanin_actual_count;
 
             if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
-                rss.dep_pool.reclaim(*sm_handle, ring_id, rss.last_task_alive);
+                rss.dep_pool.reclaim(sm_header->rings[ring_id], rss.last_task_alive);
                 if (wfanin > 0 && rss.dep_pool.available() < wfanin) {
                     break;  // not enough dep_pool space — keep remainder for next call
                 }
@@ -728,7 +728,7 @@ struct PTO2SchedulerState {
         if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
                 expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
             )) {
-            ring_sched_states[ring_id].advance_ring_pointers(sm_handle->header->rings[ring_id]);
+            ring_sched_states[ring_id].advance_ring_pointers(sm_header->rings[ring_id]);
             ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
         }
     }
@@ -762,7 +762,7 @@ struct PTO2SchedulerState {
         if (ring_sched_states[ring_id].advance_lock.compare_exchange_strong(
                 expected_lock, 1, std::memory_order_acquire, std::memory_order_relaxed
             )) {
-            ring_sched_states[ring_id].advance_ring_pointers(sm_handle->header->rings[ring_id]);
+            ring_sched_states[ring_id].advance_ring_pointers(sm_header->rings[ring_id]);
             ring_sched_states[ring_id].advance_lock.store(0, std::memory_order_release);
             atomic_count += 2;  // try-lock CAS + unlock store
         } else {
@@ -1010,7 +1010,7 @@ struct PTO2SchedulerState {
 // =============================================================================
 
 bool pto2_scheduler_init(
-    PTO2SchedulerState *sched, PTO2SharedMemoryHandle *sm_handle, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
+    PTO2SchedulerState *sched, PTO2SharedMemoryHeader *sm_header, int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
 );
 void pto2_scheduler_destroy(PTO2SchedulerState *sched);
 

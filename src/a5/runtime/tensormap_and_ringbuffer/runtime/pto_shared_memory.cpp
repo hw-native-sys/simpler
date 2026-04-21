@@ -63,18 +63,16 @@ pto2_sm_setup_pointers_per_ring(PTO2SharedMemoryHandle *handle, const uint64_t t
     handle->header = (PTO2SharedMemoryHeader *)ptr;
     ptr += PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
 
-    // Per-ring task descriptors and payloads
+    // Per-ring task descriptors, payloads, and slot states
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        handle->task_window_sizes[r] = task_window_sizes[r];
-        handle->task_window_masks[r] = static_cast<int32_t>(task_window_sizes[r] - 1);
-
-        handle->task_descriptors[r] = (PTO2TaskDescriptor *)ptr;
+        auto &ring = handle->header->rings[r];
+        ring.task_descriptors = (PTO2TaskDescriptor *)ptr;
         ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
 
-        handle->task_payloads[r] = (PTO2TaskPayload *)ptr;
+        ring.task_payloads = (PTO2TaskPayload *)ptr;
         ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskPayload), PTO2_ALIGN_SIZE);
 
-        handle->slot_states[r] = (PTO2TaskSlotState *)ptr;
+        ring.slot_states = (PTO2TaskSlotState *)ptr;
         ptr += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskSlotState), PTO2_ALIGN_SIZE);
     }
 }
@@ -190,6 +188,7 @@ void pto2_sm_init_header_per_ring(
     uint64_t offset = PTO2_ALIGN_UP(sizeof(PTO2SharedMemoryHeader), PTO2_ALIGN_SIZE);
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         header->rings[r].task_window_size = task_window_sizes[r];
+        header->rings[r].task_window_mask = static_cast<int32_t>(task_window_sizes[r] - 1);
         header->rings[r].heap_size = heap_sizes[r];
         header->rings[r].task_descriptors_offset = offset;
         offset += PTO2_ALIGN_UP(task_window_sizes[r] * sizeof(PTO2TaskDescriptor), PTO2_ALIGN_SIZE);
@@ -266,7 +265,7 @@ bool PTO2RingFlowControl::validate(PTO2SharedMemoryHandle *handle, int32_t ring_
     if (h->rings[ring_id].task_descriptors_offset >= h->total_size) return false;
 
     // Check pointer alignment
-    if ((uintptr_t)handle->task_descriptors[ring_id] % PTO2_ALIGN_SIZE != 0) return false;
+    if ((uintptr_t)h->rings[ring_id].task_descriptors % PTO2_ALIGN_SIZE != 0) return false;
 
     // Check flow control pointer sanity
     int32_t current = current_task_index.load(std::memory_order_acquire);

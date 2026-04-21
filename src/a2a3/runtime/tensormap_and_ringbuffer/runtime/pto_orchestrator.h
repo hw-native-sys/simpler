@@ -47,7 +47,7 @@
  */
 struct PTO2OrchestratorState {
     // === SHARED MEMORY ACCESS ===
-    PTO2SharedMemoryHandle *sm_handle;
+    PTO2SharedMemoryHeader *sm_header;
 
     // === PER-RING RESOURCES ===
     PTO2RingSet rings[PTO2_MAX_RING_DEPTH];
@@ -120,13 +120,13 @@ struct PTO2OrchestratorState {
  * Initialize orchestrator state
  *
  * @param orch       Orchestrator state to initialize
- * @param sm_handle  Shared memory handle
+ * @param sm_header  Shared memory header
  * @param gm_heap    GM heap memory for output buffers
  * @param heap_size  Size of GM heap
  * @return true on success
  */
 bool pto2_orchestrator_init(
-    PTO2OrchestratorState *orch, PTO2SharedMemoryHandle *sm_handle, void *gm_heap, uint64_t heap_size,
+    PTO2OrchestratorState *orch, PTO2SharedMemoryHeader *sm_header, void *gm_heap, uint64_t heap_size,
     int32_t dep_pool_capacity = PTO2_DEP_LIST_POOL_SIZE
 );
 

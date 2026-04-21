@@ -398,9 +398,9 @@ struct PTO2FaninPool {
         error_code_ptr = in_error_code_ptr;
     }
 
-    void reclaim(PTO2SharedMemoryHandle &sm_handle, uint8_t ring_id, int32_t sm_last_task_alive);
+    void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive);
 
-    void ensure_space(PTO2SharedMemoryHandle &sm_handle, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
+    void ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
 
     PTO2FaninSpillEntry *alloc() {
         int32_t used = top - tail;
@@ -571,17 +571,16 @@ struct PTO2DepListPool {
      * Reclaim dead entries based on scheduler's slot state dep_pool_mark.
      * Safe to call multiple times — only advances tail forward.
      *
-     * @param sm_handle           Shared memory handle (for reading slot dep_pool_mark)
-     * @param ring_id            Ring layer index
+     * @param ring             Ring header (for reading slot dep_pool_mark)
      * @param sm_last_task_alive Current last_task_alive from shared memory
      */
-    void reclaim(PTO2SharedMemoryHandle &sm_handle, uint8_t ring_id, int32_t sm_last_task_alive);
+    void reclaim(PTO2SharedMemoryRingHeader &ring, int32_t sm_last_task_alive);
 
     /**
      * Ensure dep pool for a specific ring has at least `needed` entries available.
      * Spin-waits for reclamation if under pressure. Detects deadlock if no progress.
      */
-    void ensure_space(PTO2SharedMemoryHandle &sm_handle, PTO2RingFlowControl &fc, uint8_t ring_id, int32_t needed);
+    void ensure_space(PTO2SharedMemoryRingHeader &ring, int32_t needed);
 
     /**
      * Allocate a single entry from the pool (single-thread per pool instance)
