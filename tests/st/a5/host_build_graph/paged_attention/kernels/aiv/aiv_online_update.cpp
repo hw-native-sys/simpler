@@ -232,7 +232,7 @@ extern "C" __aicore__ void kernel_entry(__gm__ int64_t *args) {
     int q_tile_size = static_cast<int>(args[9]);
     int head_dim = static_cast<int>(args[10]);
 
-    if (q_tile_size == 16 && head_dim <= 16) {
+    if (q_tile_size == 16 && head_dim == 16) {
         online_update_impl<16, 16>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
     } else if (q_tile_size == 16) {
         online_update_impl<16, 128>(mij, lij, oi_new, mi, li, oi, is_first, is_last, dst);
