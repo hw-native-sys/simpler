@@ -20,9 +20,9 @@ tensors and does not record them in tensor_pairs.
 
 import torch
 from simpler.task_interface import ArgDirection as D
-from simpler.task_interface import ContinuousTensor, DataType, TaskArgs, TensorArgType, make_tensor_arg
+from simpler.task_interface import ContinuousTensor, DataType, TaskArgs, TensorArgType
 
-from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, scene_test
+from simpler_setup import SceneTestCase, TaskArgsBuilder, Tensor, make_tensor_arg, scene_test
 
 KERNELS_BASE = "../../../../examples/a2a3/tensormap_and_ringbuffer/vector_example/kernels"
 

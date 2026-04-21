@@ -17,7 +17,11 @@ version = "0.1.0"
 requires-python = ">=3.9"
 
 [project.optional-dependencies]
-test = ["pytest>=6.0", "pytest-xdist>=3.0"]
+# ``torch>=2.3`` is required by ``simpler_setup.torch_interop`` (uses
+# ``torch.uint16`` / ``torch.uint32``, added in PyTorch 2.3). CI installs
+# torch via a custom index URL and does not rely on this pin; it is here
+# so ``pip install -e '.[test]'`` resolves a usable version for local devs.
+test = ["pytest>=6.0", "pytest-xdist>=3.0", "torch>=2.3"]
 
 [tool.ruff]
 line-length = 120

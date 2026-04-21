@@ -104,29 +104,40 @@ class TestGetDtypeName:
 
 
 # ============================================================================
-# task_interface.py wrapper (torch integration)
+# torch_interop (canonical torch-aware helpers) + scalar_to_uint64
 # ============================================================================
 
 
-class TestTaskInterfaceWrapper:
+class TestTorchInterop:
     def test_torch_dtype_to_datatype(self):
         import torch  # pyright: ignore[reportMissingImports]
-        from simpler.task_interface import torch_dtype_to_datatype
+
+        from simpler_setup.torch_interop import torch_dtype_to_datatype
 
         assert torch_dtype_to_datatype(torch.float32) == DataType.FLOAT32
         assert torch_dtype_to_datatype(torch.int8) == DataType.INT8
         assert torch_dtype_to_datatype(torch.bfloat16) == DataType.BFLOAT16
 
+    def test_torch_dtype_uint32(self):
+        import torch  # pyright: ignore[reportMissingImports]
+
+        from simpler_setup.torch_interop import torch_dtype_to_datatype
+
+        assert torch_dtype_to_datatype(torch.uint16) == DataType.UINT16
+        assert torch_dtype_to_datatype(torch.uint32) == DataType.UINT32
+
     def test_torch_dtype_unsupported(self):
         import torch  # pyright: ignore[reportMissingImports]
-        from simpler.task_interface import torch_dtype_to_datatype
+
+        from simpler_setup.torch_interop import torch_dtype_to_datatype
 
         with pytest.raises(KeyError):
             torch_dtype_to_datatype(torch.complex64)
 
     def test_make_tensor_arg(self):
         import torch  # pyright: ignore[reportMissingImports]
-        from simpler.task_interface import make_tensor_arg
+
+        from simpler_setup.torch_interop import make_tensor_arg
 
         t = torch.zeros(4, 8, dtype=torch.float32)
         arg = make_tensor_arg(t)
@@ -136,6 +147,8 @@ class TestTaskInterfaceWrapper:
         assert arg.dtype == DataType.FLOAT32
         assert arg.nbytes() == 4 * 8 * 4
 
+
+class TestScalarToUint64:
     def test_scalar_to_uint64_int(self):
         from simpler.task_interface import scalar_to_uint64
 

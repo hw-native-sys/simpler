@@ -212,9 +212,10 @@ def _build_chip_task_args(test_args: TaskArgsBuilder, orch_signature: list):
     from simpler.task_interface import (  # noqa: PLC0415
         ArgDirection,
         ChipStorageTaskArgs,
-        make_tensor_arg,
         scalar_to_uint64,
     )
+
+    from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
 
     chip_args = ChipStorageTaskArgs()
     output_names: list[str] = []
@@ -254,9 +255,10 @@ def _build_l3_task_args(test_args: TaskArgsBuilder, orch_signature: list):
         ArgDirection,
         TaskArgs,
         TensorArgType,
-        make_tensor_arg,
         scalar_to_uint64,
     )
+
+    from simpler_setup.torch_interop import make_tensor_arg  # noqa: PLC0415
 
     _DIR_TO_TAG = {
         ArgDirection.IN: TensorArgType.INPUT,

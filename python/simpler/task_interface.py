@@ -10,10 +10,13 @@
 """Public Python API for task_interface nanobind bindings.
 
 Re-exports the canonical C++ types (DataType, ContinuousTensor, ChipStorageTaskArgs,
-TaskArgs, TensorArgType) and adds torch-aware convenience helpers.
+TaskArgs, TensorArgType) plus ``scalar_to_uint64``. Torch-aware helpers
+(``make_tensor_arg``, ``torch_dtype_to_datatype``) live in
+``simpler_setup.torch_interop`` — this module has no torch dependency.
 
 Usage:
-    from task_interface import DataType, ContinuousTensor, ChipStorageTaskArgs, make_tensor_arg
+    from simpler.task_interface import DataType, ContinuousTensor, ChipStorageTaskArgs
+    from simpler_setup.torch_interop import make_tensor_arg
 """
 
 import ctypes
@@ -65,8 +68,6 @@ __all__ = [
     "ChipCallConfig",
     "ChipWorker",
     "arg_direction_name",
-    "torch_dtype_to_datatype",
-    "make_tensor_arg",
     "scalar_to_uint64",
     # Distributed runtime
     "WorkerType",
@@ -88,56 +89,6 @@ __all__ = [
     "ChipBootstrapConfig",
     "ChipBootstrapResult",
 ]
-
-
-# Lazy-loaded torch dtype → DataType map (avoids importing torch at module load)
-_TORCH_DTYPE_MAP = None
-
-
-def _ensure_torch_map():
-    global _TORCH_DTYPE_MAP
-    if _TORCH_DTYPE_MAP is not None:
-        return
-    import torch  # pyright: ignore[reportMissingImports]
-
-    _TORCH_DTYPE_MAP = {
-        torch.float32: DataType.FLOAT32,
-        torch.float16: DataType.FLOAT16,
-        torch.int32: DataType.INT32,
-        torch.int16: DataType.INT16,
-        torch.int8: DataType.INT8,
-        torch.uint8: DataType.UINT8,
-        torch.bfloat16: DataType.BFLOAT16,
-        torch.int64: DataType.INT64,
-    }
-    # torch.uint16/uint32/uint64 were added in PyTorch 2.3; guard for older versions.
-    if hasattr(torch, "uint16"):
-        _TORCH_DTYPE_MAP[torch.uint16] = DataType.UINT16
-    if hasattr(torch, "uint32"):
-        _TORCH_DTYPE_MAP[torch.uint32] = DataType.UINT32
-
-
-def torch_dtype_to_datatype(dt) -> DataType:
-    """Convert a ``torch.dtype`` to a ``DataType`` enum value.
-
-    Raises ``KeyError`` for unsupported dtypes.
-    """
-    _ensure_torch_map()
-    return _TORCH_DTYPE_MAP[dt]  # pyright: ignore[reportOptionalSubscript]
-
-
-def make_tensor_arg(tensor) -> ContinuousTensor:
-    """Create a ``ContinuousTensor`` from a torch.Tensor.
-
-    The tensor must be CPU-contiguous. Its ``data_ptr()``, shape, and dtype
-    are read and stored in the returned ``ContinuousTensor``.
-    """
-    _ensure_torch_map()
-    dt = _TORCH_DTYPE_MAP.get(tensor.dtype)  # pyright: ignore[reportOptionalMemberAccess]
-    if dt is None:
-        raise ValueError(f"Unsupported tensor dtype for ContinuousTensor: {tensor.dtype}")
-    shapes = tuple(int(s) for s in tensor.shape)
-    return ContinuousTensor.make(tensor.data_ptr(), shapes, dt)
 
 
 def scalar_to_uint64(value) -> int:
