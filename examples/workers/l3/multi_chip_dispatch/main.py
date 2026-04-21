@@ -42,12 +42,12 @@ from simpler.task_interface import (
     CoreCallable,
     TaskArgs,
     TensorArgType,
-    make_tensor_arg,
 )
 from simpler.worker import Worker
 
 from simpler_setup.kernel_compiler import KernelCompiler
 from simpler_setup.pto_isa import ensure_pto_isa_root
+from simpler_setup.torch_interop import make_tensor_arg
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
