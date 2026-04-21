@@ -24,7 +24,7 @@ class TestPagedAttentionUnrollTpushPop(SceneTestCase):
 
     CALLABLE = {
         "orchestration": {
-            "source": "kernels/orchestration/spmd_paged_attention_tpush_orch.cpp",
+            "source": "kernels/orchestration/spmd_paged_attention_orch.cpp",
             "function_name": "aicpu_orchestration_entry",
             "signature": [D.IN, D.IN, D.IN, D.IN, D.IN, D.OUT],
         },
