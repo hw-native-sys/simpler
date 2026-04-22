@@ -37,12 +37,12 @@
 
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
-#include "host/performance_collector.h"
+#include "host/l2_perf_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "runtime.h"
 
@@ -370,7 +370,7 @@ private:
     std::map<int, uint64_t> func_id_to_addr_;  // func_id -> function_bin_addr (device GM)
 
     // Performance profiling
-    PerformanceCollector perf_collector_;
+    L2PerfCollector l2_perf_collector_;
 
     // Tensor dump (independent from profiling)
     TensorDumpCollector dump_collector_;
@@ -411,15 +411,15 @@ private:
     /**
      * Initialize performance profiling device buffers
      *
-     * Allocates PerfSetupHeader and per-core/per-thread buffers on device,
-     * publishes pointers via runtime.perf_data_base.
+     * Allocates L2PerfSetupHeader and per-core/per-thread buffers on device,
+     * publishes pointers via runtime.l2_perf_data_base.
      *
      * @param runtime Runtime instance to configure
      * @param num_aicore Number of AICore instances
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    int init_performance_profiling(Runtime &runtime, int num_aicore, int device_id);
+    int init_l2_perf_collection(Runtime &runtime, int num_aicore, int device_id);
 
     /**
      * Initialize tensor dump device buffers.

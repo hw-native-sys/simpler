@@ -556,13 +556,13 @@ NB_MODULE(_task_interface, m) {
         .def(nb::init<>())
         .def_rw("block_dim", &ChipCallConfig::block_dim)
         .def_rw("aicpu_thread_num", &ChipCallConfig::aicpu_thread_num)
-        .def_rw("enable_profiling", &ChipCallConfig::enable_profiling)
+        .def_rw("enable_l2_swimlane", &ChipCallConfig::enable_l2_swimlane)
         .def_rw("enable_dump_tensor", &ChipCallConfig::enable_dump_tensor)
         .def_rw("enable_pmu", &ChipCallConfig::enable_pmu)
         .def("__repr__", [](const ChipCallConfig &self) -> std::string {
             std::ostringstream os;
             os << "ChipCallConfig(block_dim=" << self.block_dim << ", aicpu_thread_num=" << self.aicpu_thread_num
-               << ", enable_profiling=" << (self.enable_profiling ? "True" : "False")
+               << ", enable_l2_swimlane=" << (self.enable_l2_swimlane ? "True" : "False")
                << ", enable_dump_tensor=" << (self.enable_dump_tensor ? "True" : "False")
                << ", enable_pmu=" << self.enable_pmu << ")";
             return os.str();
@@ -589,34 +589,34 @@ NB_MODULE(_task_interface, m) {
         .def(
             "run_raw",
             [](ChipWorker &self, uint64_t callable, uint64_t args, int block_dim, int aicpu_thread_num,
-               bool enable_profiling, bool enable_dump_tensor, int enable_pmu) {
+               bool enable_l2_swimlane, bool enable_dump_tensor, int enable_pmu) {
                 ChipCallConfig config;
                 config.block_dim = block_dim;
                 config.aicpu_thread_num = aicpu_thread_num;
-                config.enable_profiling = enable_profiling;
+                config.enable_l2_swimlane = enable_l2_swimlane;
                 config.enable_dump_tensor = enable_dump_tensor;
                 config.enable_pmu = enable_pmu;
                 self.run(reinterpret_cast<const void *>(callable), reinterpret_cast<const void *>(args), config);
             },
             nb::arg("callable"), nb::arg("args"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
-            nb::arg("enable_profiling") = false, nb::arg("enable_dump_tensor") = false, nb::arg("enable_pmu") = 0,
+            nb::arg("enable_l2_swimlane") = false, nb::arg("enable_dump_tensor") = false, nb::arg("enable_pmu") = 0,
             "Run with raw pointer arguments (used from forked chip process)."
         )
         .def(
             "run_from_blob",
             [](ChipWorker &self, uint64_t callable, uint64_t blob_ptr, int block_dim, int aicpu_thread_num,
-               bool enable_profiling, bool enable_dump_tensor, int enable_pmu) {
+               bool enable_l2_swimlane, bool enable_dump_tensor, int enable_pmu) {
                 ChipCallConfig config;
                 config.block_dim = block_dim;
                 config.aicpu_thread_num = aicpu_thread_num;
-                config.enable_profiling = enable_profiling;
+                config.enable_l2_swimlane = enable_l2_swimlane;
                 config.enable_dump_tensor = enable_dump_tensor;
                 config.enable_pmu = enable_pmu;
                 TaskArgsView view = read_blob(reinterpret_cast<const uint8_t *>(blob_ptr));
                 self.run(callable, view, config);
             },
             nb::arg("callable"), nb::arg("blob_ptr"), nb::arg("block_dim") = 1, nb::arg("aicpu_thread_num") = 3,
-            nb::arg("enable_profiling") = false, nb::arg("enable_dump_tensor") = false, nb::arg("enable_pmu") = 0,
+            nb::arg("enable_l2_swimlane") = false, nb::arg("enable_dump_tensor") = false, nb::arg("enable_pmu") = 0,
             "Decode a length-prefixed TaskArgs blob ([T][S][tensors][scalars]) at "
             "blob_ptr and dispatch to the runtime. Used from forked chip processes "
             "reading the WorkerThread mailbox."

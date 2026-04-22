@@ -2,7 +2,7 @@
 
 ## Problem
 
-Profiling data (`perf_swimlane_*.json`) identifies tasks by numeric IDs
+Profiling data (`l2_perf_records_*.json`) identifies tasks by numeric IDs
 (e.g., `func_id: 0`).  Without a mapping, swimlane visualizations show
 opaque labels like `func_0_a(t0)` instead of human-readable names like
 `QK(t0)`.
@@ -129,7 +129,7 @@ class TestL3Group(SceneTestCase):
 
 ## Automatic Dump and Consumption
 
-When `--enable-profiling` is used, SceneTest automatically:
+When `--enable-l2-swimlane` is used, SceneTest automatically:
 
 1. Extracts the name mapping from `CALLABLE` via `_extract_name_map()`.
 2. Writes `outputs/name_map_<ClassName_casename>.json`.
@@ -145,13 +145,13 @@ takes precedence over `-k` (kernel_config.py):
 
 ```bash
 # Automatic (via SceneTest profiling)
-pytest tests/st/... --platform a5onboard --enable-profiling
+pytest tests/st/... --platform a5onboard --enable-l2-swimlane
 
 # Manual
-python3 tools/swimlane_converter.py outputs/perf_swimlane_*.json \
+python3 tools/swimlane_converter.py outputs/l2_perf_records_*.json \
     --func-names outputs/name_map_TestPA_basic.json
 
-python3 tools/perf_to_mermaid.py outputs/perf_swimlane_*.json \
+python3 tools/perf_to_mermaid.py outputs/l2_perf_records_*.json \
     --func-names outputs/name_map_TestPA_basic.json
 ```
 
@@ -159,7 +159,7 @@ python3 tools/perf_to_mermaid.py outputs/perf_swimlane_*.json \
 
 ```text
 outputs/
-  perf_swimlane_20260416_151301_TestPA_basic.json   # perf data (runtime)
+  l2_perf_records_20260416_151301_TestPA_basic.json   # perf data (runtime)
   name_map_TestPA_basic.json                        # name mapping (SceneTest)
   merged_swimlane_20260416_151301_TestPA_basic.json # Perfetto trace (converter)
 ```

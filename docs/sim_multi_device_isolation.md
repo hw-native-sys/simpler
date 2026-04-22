@@ -24,7 +24,7 @@ Communication uses a 4096-byte shared-memory mailbox per chip (same pattern as `
 
 ## Why Not Fix the Globals
 
-The global state in `host_runtime.so` spans multiple files (`cpu_sim_context.cpp`, `platform_aicpu_affinity.cpp`, `performance_collector_aicpu.cpp`, `device_log.cpp`) and is deeply embedded in the AICPU/AICore thread model. Fixing each one individually is fragile. Process isolation solves all of them at once with zero platform code changes.
+The global state in `host_runtime.so` spans multiple files (`cpu_sim_context.cpp`, `platform_aicpu_affinity.cpp`, `l2_perf_collector_aicpu.cpp`, `device_log.cpp`) and is deeply embedded in the AICPU/AICore thread model. Fixing each one individually is fragile. Process isolation solves all of them at once with zero platform code changes.
 
 ## Files
 

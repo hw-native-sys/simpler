@@ -118,7 +118,7 @@ size_t size = get_runtime_size();
 run_runtime(ctx, runtime, callable, args, block_dim,
             aicpu_thread_num, device_id,
             aicpu_binary, aicpu_size, aicore_binary, aicore_size,
-            enable_profiling, enable_dump_tensor, enable_pmu);
+            enable_l2_swimlane, enable_dump_tensor, enable_pmu);
 finalize_device(ctx);
 destroy_device_context(ctx);
 ```

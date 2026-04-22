@@ -4,7 +4,7 @@ This document describes the profiling macro hierarchy and logging control in the
 
 ## Overview
 
-PTO Runtime2 uses a hierarchical profiling system with compile-time macros to control profiling code compilation and log output. The `enable_profiling` runtime flag controls data collection (performance buffers, shared memory writes) but does NOT control log output.
+PTO Runtime2 uses a hierarchical profiling system with compile-time macros to control profiling code compilation and log output. The `enable_l2_swimlane` runtime flag controls data collection (performance buffers, shared memory writes) but does NOT control log output.
 
 ## Profiling Macro Hierarchy
 
@@ -13,7 +13,7 @@ PTO2_PROFILING (base level, default=1)
 ├── PTO2_ORCH_PROFILING (orchestrator, default=0, requires PTO2_PROFILING=1)
 |   └──PTO2_TENSORMAP_PROFILING (tensormap, default=0, requires PTO2_ORCH_PROFILING=1)
 ├── PTO2_SCHED_PROFILING (scheduler, default=0, requires PTO2_PROFILING=1)
-└── --enable-profiling (Dump profiling merged swimlane json file for visualization, requires PTO2_PROFILING=1)
+└── --enable-l2-swimlane (Dump profiling merged swimlane json file for visualization, requires PTO2_PROFILING=1)
 
 ```
 
@@ -50,7 +50,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 
 - All `CYCLE_COUNT_*` timing counters (`sched_*_cycle`, orchestrator cost counters)
 - Scheduler/Orchestrator profiling summary logs guarded by `#if PTO2_PROFILING`
-- Performance data collection paths (`enable_profiling` runtime flag becomes ineffective because profiling code is not compiled)
+- Performance data collection paths (`enable_l2_swimlane` runtime flag becomes ineffective because profiling code is not compiled)
 
 **Log output (normal run, no stall):**
 
@@ -71,7 +71,7 @@ Each sub-level macro requires `PTO2_PROFILING=1`:
 - Stage-level orchestration end timestamp (`orch_stage_end`, printed by last orch thread only, marks the moment all orch threads have finished and core transition is about to be requested; only when `orch_to_sched_` is true)
 - PTO2 total submitted tasks count (printed by last orch thread, after orch timing line)
 - Scheduler summary output (`total_time`, `loops`, `tasks_scheduled`)
-- Scheduler lifetime timestamps and cost (`sched_start`, `sched_end`, `sched_cost` — captured inside `SchedulerContext::resolve_and_dispatch()`, printed before Scheduler summary)
+- Scheduler lifetime timestamps and cost (`sched_start`, `sched_end`, `sched_cost` — captured inside `resolve_and_dispatch_pto2()`, printed before Scheduler summary)
 
 **What's NOT compiled:**
 
@@ -123,8 +123,8 @@ Thread 1: Scheduler summary: total_time=168.620us, loops=3880, tasks_scheduled=9
 
 **Note:**
 
-- All logs above are controlled by compile-time macro `PTO2_PROFILING`, not by `enable_profiling`.
-- `enable_profiling` only controls shared-memory data collection / swimlane export.
+- All logs above are controlled by compile-time macro `PTO2_PROFILING`, not by `enable_l2_swimlane`.
+- `enable_l2_swimlane` only controls shared-memory data collection / swimlane export.
 - Enable `orch_to_sched_` via environment variable: `PTO2_ORCH_TO_SCHED=1`.
 
 ---
@@ -199,7 +199,7 @@ Thread X:   scope_end      : XXXus  atomics=XXX
 Thread X:   avg/task       : XXXus
 ```
 
-**Note:** Orchestrator logs always print when `PTO2_ORCH_PROFILING=1`, regardless of `enable_profiling` flag.
+**Note:** Orchestrator logs always print when `PTO2_ORCH_PROFILING=1`, regardless of `enable_l2_swimlane` flag.
 
 ---
 
@@ -227,18 +227,18 @@ Thread X:   overlap checks : XXX, hits=XXX (XX.X%)
 
 ---
 
-## Runtime Flag: enable_profiling
+## Runtime Flag: enable_l2_swimlane
 
-The `runtime->enable_profiling` flag controls **data collection**, NOT log output.
+The `runtime->enable_l2_swimlane` flag controls **data collection**, NOT log output.
 
-### When enable_profiling=true
+### When enable_l2_swimlane=true
 
 - Performance buffers are allocated and written
 - Per-task timing data is collected
 - Phase profiling data is recorded
 - Orchestrator summary is written to shared memory
 
-### When enable_profiling=false
+### When enable_l2_swimlane=false
 
 - No performance data collection
 - No shared memory writes
@@ -248,7 +248,7 @@ The `runtime->enable_profiling` flag controls **data collection**, NOT log outpu
 
 ```cpp
 // Initialize runtime with profiling enabled
-runtime->enable_profiling = true;
+runtime->enable_l2_swimlane = true;
 ```
 
 ---
@@ -344,7 +344,7 @@ add_definitions(-DPTO2_ORCH_PROFILING=1)
    - Logs print when macro is enabled, regardless of runtime flag
 
 2. **Runtime flag controls data collection**
-   - `enable_profiling` controls performance buffer allocation
+   - `enable_l2_swimlane` controls performance buffer allocation
    - Controls shared memory writes for host-side export
    - Does NOT control log output
 
@@ -373,7 +373,7 @@ add_definitions(-DPTO2_ORCH_PROFILING=1)
 ### Runtime overhead
 
 - Logging: Negligible (device logs are asynchronous)
-- Data collection (`enable_profiling=true`): Low to moderate
+- Data collection (`enable_l2_swimlane=true`): Low to moderate
   - Performance buffer writes
   - Shared memory updates
   - Per-task timing measurements

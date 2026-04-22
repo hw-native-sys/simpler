@@ -99,7 +99,7 @@ _OFF_ERROR = 4
 _OFF_CALLABLE = 8
 _OFF_BLOCK_DIM = 16
 _OFF_AICPU_THREAD_NUM = 20
-_OFF_ENABLE_PROFILING = 24
+_OFF_ENABLE_L2_SWIMLANE = 24
 _OFF_ENABLE_DUMP_TENSOR = 28
 _OFF_ENABLE_PMU = 32
 _OFF_ARGS = 64
@@ -279,7 +279,7 @@ def _chip_process_loop(
             callable_ptr = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
             block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
             aicpu_tn = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
-            profiling = struct.unpack_from("i", buf, _OFF_ENABLE_PROFILING)[0]
+            enable_l2_swimlane = struct.unpack_from("i", buf, _OFF_ENABLE_L2_SWIMLANE)[0]
             dump_tensor = struct.unpack_from("i", buf, _OFF_ENABLE_DUMP_TENSOR)[0]
             enable_pmu = struct.unpack_from("i", buf, _OFF_ENABLE_PMU)[0]
 
@@ -291,7 +291,7 @@ def _chip_process_loop(
                     args_ptr,
                     block_dim,
                     aicpu_tn,
-                    bool(profiling),
+                    bool(enable_l2_swimlane),
                     bool(dump_tensor),
                     enable_pmu,
                 )
@@ -399,12 +399,22 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
                 callable_ptr = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
                 block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
                 aicpu_tn = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
-                profiling = struct.unpack_from("i", buf, _OFF_ENABLE_PROFILING)[0]
+                enable_l2_swimlane = struct.unpack_from("i", buf, _OFF_ENABLE_L2_SWIMLANE)[0]
+                dump_tensor = struct.unpack_from("i", buf, _OFF_ENABLE_DUMP_TENSOR)[0]
+                enable_pmu = struct.unpack_from("i", buf, _OFF_ENABLE_PMU)[0]
 
                 code = 0
                 msg = ""
                 try:
-                    cw._impl.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
+                    cw._impl.run_from_blob(
+                        callable_ptr,
+                        args_ptr,
+                        block_dim,
+                        aicpu_tn,
+                        bool(enable_l2_swimlane),
+                        bool(dump_tensor),
+                        enable_pmu,
+                    )
                 except Exception as e:  # noqa: BLE001
                     code = 1
                     msg = _format_exc(f"chip_process dev={device_id}", e)
@@ -485,7 +495,7 @@ def _read_config_from_mailbox(buf: memoryview) -> "ChipCallConfig":
     cfg = ChipCallConfig()
     cfg.block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
     cfg.aicpu_thread_num = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
-    cfg.enable_profiling = bool(struct.unpack_from("i", buf, _OFF_ENABLE_PROFILING)[0])
+    cfg.enable_l2_swimlane = bool(struct.unpack_from("i", buf, _OFF_ENABLE_L2_SWIMLANE)[0])
     cfg.enable_dump_tensor = bool(struct.unpack_from("i", buf, _OFF_ENABLE_DUMP_TENSOR)[0])
     cfg.enable_pmu = struct.unpack_from("i", buf, _OFF_ENABLE_PMU)[0]
     return cfg

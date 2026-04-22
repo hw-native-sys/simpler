@@ -35,9 +35,9 @@
 #include "pto_shared_memory.h"
 
 // Performance profiling headers
-#include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/unified_log.h"
 
 // Register-based communication
@@ -360,7 +360,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
 #if PTO2_PROFILING
-            rt->orchestrator.enable_profiling = runtime->enable_profiling;
+            rt->orchestrator.enable_l2_swimlane = runtime->enable_l2_swimlane;
 #endif
 
             // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
@@ -386,8 +386,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             sched_ctx_.wait_pto2_init_complete();
 
 #if PTO2_PROFILING
-            if (runtime->enable_profiling) {
-                perf_aicpu_set_orch_thread_idx(thread_idx);
+            if (runtime->enable_l2_swimlane) {
+                l2_perf_aicpu_set_orch_thread_idx(thread_idx);
             }
 #endif
 
@@ -471,7 +471,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Write orchestrator summary to shared memory for host-side export (only if profiling enabled)
-            if (runtime->enable_profiling) {
+            if (runtime->enable_l2_swimlane) {
                 AicpuOrchSummary orch_summary = {};
                 orch_summary.start_time = orch_cycle_start;
                 orch_summary.end_time = orch_cycle_end;
@@ -484,7 +484,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 orch_summary.fanin_cycle = p.fanin_cycle;
                 orch_summary.scope_end_cycle = p.scope_end_cycle;
                 orch_summary.submit_count = p.submit_count;
-                perf_aicpu_write_orch_summary(&orch_summary);
+                l2_perf_aicpu_write_orch_summary(&orch_summary);
             }
 #endif
 #endif
@@ -504,8 +504,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             pto2_submitted_tasks = total_tasks;
 #endif
 
-            if (runtime->enable_profiling && total_tasks > 0) {
-                perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(total_tasks));
+            if (runtime->enable_l2_swimlane && total_tasks > 0) {
+                l2_perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(total_tasks));
             }
 
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);

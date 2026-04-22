@@ -9,23 +9,23 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * @file performance_collector_aicore.h
+ * @file l2_perf_collector_aicore.h
  * @brief AICore performance data collection interface
  *
  * Provides lightweight performance recording interface for AICore kernels.
  * Uses dcci for efficient cache management instead of memory barriers.
  */
 
-#ifndef PLATFORM_AICORE_PERFORMANCE_COLLECTOR_AICORE_H_
-#define PLATFORM_AICORE_PERFORMANCE_COLLECTOR_AICORE_H_
+#ifndef PLATFORM_AICORE_L2_PERF_COLLECTOR_AICORE_H_
+#define PLATFORM_AICORE_L2_PERF_COLLECTOR_AICORE_H_
 
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "aicore/aicore.h"
 
 // Include platform-specific timestamp implementation
 // Build system selects the correct inner_kernel.h based on platform:
-// - src/a2a3/platform/onboard/aicore/inner_kernel.h (real hardware)
-// - src/a2a3/platform/sim/aicore/inner_kernel.h (simulation)
+// - src/a5/platform/onboard/aicore/inner_kernel.h (real hardware)
+// - src/a5/platform/sim/aicore/inner_kernel.h (simulation)
 // Both provide unified get_sys_cnt_aicore() interface
 #include "inner_kernel.h"
 
@@ -37,19 +37,19 @@
  * Writes timing metrics to the WIP staging slot (wip[task_id & 1]).
  * Buffer management and final commit are handled by AICPU.
  *
- * AICore writes PerfRecord.task_id as the register dispatch token (low 32 bits, zero-extended).
+ * AICore writes L2PerfRecord.task_id as the register dispatch token (low 32 bits, zero-extended).
  * For multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph), AICPU overwrites
  * with the full (ring_id << 32) | local_id encoding after handshake match.
  *
- * @param perf_buf Performance buffer pointer
+ * @param l2_perf_buf Performance buffer pointer
  * @param task_id Register dispatch id (DATA_MAIN_BASE), stored in task_id low 32 bits
  * @param start_time Start timestamp
  * @param end_time End timestamp
  */
 __aicore__ __attribute__((always_inline)) static inline void
-perf_aicore_record_task(__gm__ PerfBuffer *perf_buf, uint32_t task_id, uint64_t start_time, uint64_t end_time) {
+l2_perf_aicore_record_task(__gm__ L2PerfBuffer *l2_perf_buf, uint32_t task_id, uint64_t start_time, uint64_t end_time) {
     // Write to WIP staging slot — parity alternates with dual-slot dispatch
-    __gm__ PerfRecord *record = &perf_buf->wip[task_id & 1u];
+    __gm__ L2PerfRecord *record = &l2_perf_buf->wip[task_id & 1u];
 
     record->start_time = start_time;
     record->end_time = end_time;
@@ -60,4 +60,4 @@ perf_aicore_record_task(__gm__ PerfBuffer *perf_buf, uint32_t task_id, uint64_t 
     dsb((mem_dsb_t)0);
 }
 
-#endif  // PLATFORM_AICORE_PERFORMANCE_COLLECTOR_AICORE_H_
+#endif  // PLATFORM_AICORE_L2_PERF_COLLECTOR_AICORE_H_

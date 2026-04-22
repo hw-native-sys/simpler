@@ -244,7 +244,7 @@ void ChipWorker::run(const void *callable, const void *args, const ChipCallConfi
 
     int rc = run_runtime_fn_(
         device_ctx_, rt, callable, args, config.block_dim, config.aicpu_thread_num, device_id_, aicpu_binary_.data(),
-        aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_profiling ? 1 : 0,
+        aicpu_binary_.size(), aicore_binary_.data(), aicore_binary_.size(), config.enable_l2_swimlane ? 1 : 0,
         config.enable_dump_tensor ? 1 : 0, config.enable_pmu
     );
     if (rc != 0) {

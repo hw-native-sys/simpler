@@ -13,7 +13,7 @@
  * @file tensor_dump_collector.cpp
  * @brief Host-side tensor dump collector implementation (memcpy-based)
  *
- * Mirrors performance_collector.cpp patterns:
+ * Mirrors l2_perf_collector.cpp patterns:
  * - Allocate device buffers, copy header to device
  * - After stream sync, two-step copy (header then data)
  * - Export to JSON manifest + binary payload

@@ -123,7 +123,7 @@ private:
     SyncStartDrainState drain_state_;
 
 #if PTO2_PROFILING
-    SchedProfilingCounters sched_perf_[MAX_AICPU_THREADS];
+    SchedL2PerfCounters sched_l2_perf_[MAX_AICPU_THREADS];
 #endif
 
     // --- Task-execution tracking ---
@@ -267,7 +267,7 @@ private:
     );
 
 #if PTO2_PROFILING
-    __attribute__((noinline, cold)) void log_profiling_summary(int32_t thread_idx, int32_t cur_thread_completed);
+    __attribute__((noinline, cold)) void log_l2_perf_summary(int32_t thread_idx, int32_t cur_thread_completed);
 #endif
 
     // =========================================================================

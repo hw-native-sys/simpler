@@ -16,7 +16,7 @@
  * Uses read_reg/write_reg from platform_regs for MMIO register access,
  * consistent with the rest of the platform layer.
  *
- * Buffer switching mirrors performance_collector_aicpu.cpp:
+ * Buffer switching mirrors l2_perf_collector_aicpu.cpp:
  *   - SPSC free_queue: Host pushes free PmuBuffers, AICPU pops when switching.
  *   - Per-thread ready_queue: AICPU enqueues full buffers for host collection.
  *   - On free_queue empty or ready_queue full: overwrite current buffer (data lost,

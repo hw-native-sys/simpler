@@ -9,20 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * @file performance_collector_aicpu.h
+ * @file l2_perf_collector_aicpu.h
  * @brief AICPU performance data collection interface
  *
  * Provides performance profiling management interface for AICPU side.
  * Handles buffer initialization and per-record completion. In the memcpy-based
- * collection design, Host pre-allocates one PerfBuffer per core and one
+ * collection design, Host pre-allocates one L2PerfBuffer per core and one
  * PhaseBuffer per thread; AICPU writes directly into them until full, after
  * which further records are silently dropped.
  */
 
-#ifndef PLATFORM_AICPU_PERFORMANCE_COLLECTOR_AICPU_H_
-#define PLATFORM_AICPU_PERFORMANCE_COLLECTOR_AICPU_H_
+#ifndef PLATFORM_AICPU_L2_PERF_COLLECTOR_AICPU_H_
+#define PLATFORM_AICPU_L2_PERF_COLLECTOR_AICPU_H_
 
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "runtime.h"
 
 // Include platform-specific timestamp implementation
@@ -39,18 +39,18 @@
  *
  * @param runtime Runtime instance pointer
  */
-void perf_aicpu_init_profiling(Runtime *runtime);
+void l2_perf_aicpu_init_profiling(Runtime *runtime);
 
 /**
- * Complete a PerfRecord with AICPU-side metadata after AICore task completion
+ * Complete a L2PerfRecord with AICPU-side metadata after AICore task completion
  *
- * Reads perf_buf->count, validates task_id match against the latest record,
+ * Reads l2_perf_buf->count, validates task_id match against the latest record,
  * and fills all AICPU-side fields. Returns -1 and silently drops the record
  * when the buffer is full (count >= PLATFORM_PROF_BUFFER_SIZE). Callers must
  * pre-extract fanout into a plain uint64_t array (platform layer cannot depend
  * on runtime linked-list types).
  *
- * @param perf_buf              PerfBuffer pointer (from handshake perf_records_addr)
+ * @param l2_perf_buf              L2PerfBuffer pointer (from handshake l2_perf_records_addr)
  * @param expected_reg_task_id  Register dispatch token (low 32 bits) to validate
  * @param task_id               Task identifier to write (PTO2 encoding or plain id)
  * @param func_id               Kernel function identifier
@@ -60,8 +60,8 @@ void perf_aicpu_init_profiling(Runtime *runtime);
  * @param fanout                Pre-extracted successor task ID array (nullptr if none)
  * @param fanout_count          Number of entries in fanout array (0 if none)
  */
-int perf_aicpu_complete_record(
-    PerfBuffer *perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
+int l2_perf_aicpu_complete_record(
+    L2PerfBuffer *l2_perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
     uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
 );
 
@@ -74,18 +74,18 @@ int perf_aicpu_complete_record(
  * @param runtime Runtime instance pointer
  * @param total_tasks Current total task count
  */
-void perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks);
+void l2_perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks);
 
 /**
  * Initialize AICPU phase profiling
  *
  * Sets up AicpuPhaseHeader and clears per-thread phase record buffers.
- * Must be called once from thread 0 after perf_aicpu_init_profiling().
+ * Must be called once from thread 0 after l2_perf_aicpu_init_profiling().
  *
  * @param runtime Runtime instance pointer
  * @param num_sched_threads Number of scheduler threads
  */
-void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads);
+void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads);
 
 /**
  * Record a single scheduler phase
@@ -102,7 +102,7 @@ void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads);
  *                        full PTO2 task_id encoding (ring_id << 32) | local_id (orchestrator
  *                        phases in multi-ring runtimes: tensormap_and_ringbuffer, aicpu_build_graph)
  */
-void perf_aicpu_record_phase(
+void l2_perf_aicpu_record_phase(
     int thread_idx, AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
     uint64_t tasks_processed
 );
@@ -115,17 +115,17 @@ void perf_aicpu_record_phase(
  *
  * @param src Pointer to populated AicpuOrchSummary (magic field is set internally)
  */
-void perf_aicpu_write_orch_summary(const AicpuOrchSummary *src);
+void l2_perf_aicpu_write_orch_summary(const AicpuOrchSummary *src);
 
 /**
  * Set orchestrator thread index for per-task phase recording
  *
  * Must be called once from the orchestrator thread before any
- * perf_aicpu_record_orch_phase() calls.
+ * l2_perf_aicpu_record_orch_phase() calls.
  *
  * @param thread_idx Thread index for the orchestrator (typically num_sched_threads)
  */
-void perf_aicpu_set_orch_thread_idx(int thread_idx);
+void l2_perf_aicpu_set_orch_thread_idx(int thread_idx);
 
 /**
  * Record a single orchestrator phase
@@ -141,18 +141,18 @@ void perf_aicpu_set_orch_thread_idx(int thread_idx);
  * full PTO2 encoding: (ring_id << 32) | local_id, enabling cross-view correlation between orchestrator and scheduler
  * swimlanes.
  */
-void perf_aicpu_record_orch_phase(
+void l2_perf_aicpu_record_orch_phase(
     AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id
 );
 
 /**
  * Write core-to-thread assignment mapping to shared memory.
  *
- * Callers invoke `perf_aicpu_init_core_assignments(total_cores)` once, then
- * `perf_aicpu_write_core_assignments_for_thread(t, ids, n)` for every
+ * Callers invoke `l2_perf_aicpu_init_core_assignments(total_cores)` once, then
+ * `l2_perf_aicpu_write_core_assignments_for_thread(t, ids, n)` for every
  * scheduler thread.
  */
-void perf_aicpu_init_core_assignments(int total_cores);
-void perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num);
+void l2_perf_aicpu_init_core_assignments(int total_cores);
+void l2_perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num);
 
-#endif  // PLATFORM_AICPU_PERFORMANCE_COLLECTOR_AICPU_H_
+#endif  // PLATFORM_AICPU_L2_PERF_COLLECTOR_AICPU_H_

@@ -126,7 +126,7 @@ struct DumpMetaBuffer {
 
 /**
  * Single Producer Single Consumer (SPSC) lock-free queue.
- * Same layout and semantics as PerfFreeQueue, separate type for decoupling.
+ * Same layout and semantics as L2PerfFreeQueue, separate type for decoupling.
  *
  * Producer: Host (DumpMemoryManager thread) pushes recycled/new buffers
  * Consumer: Device (AICPU thread) pops buffers when switching
@@ -196,7 +196,7 @@ struct DumpReadyQueueEntry {
  * 1. Per-thread ready queues (circular FIFOs) — one per AICPU thread
  * 2. Metadata (thread count, config)
  *
- * Ready queue design mirrors PerfDataHeader but is independent:
+ * Ready queue design mirrors L2PerfDataHeader but is independent:
  * - Per-thread queues avoid lock contention
  * - Producer: AICPU thread (adds full DumpMetaBuffers)
  * - Consumer: Host DumpMemoryManager thread

@@ -138,7 +138,7 @@ you, plus:
 - Session-level compile cache (kernel not recompiled per case)
 - Parametrized `CASES` and auto-golden comparison
 - Parallel device dispatch via pytest-xdist
-- Integration with `--enable-profiling`, `--rounds`, `--dump-tensor`
+- Integration with `--enable-l2-swimlane`, `--rounds`, `--dump-tensor`
 
 Use the raw API when you're **learning** or **embedding** the runtime in a
 larger Python program; use `@scene_test` for shippable test code.

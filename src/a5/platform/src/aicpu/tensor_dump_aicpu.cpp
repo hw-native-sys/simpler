@@ -15,7 +15,7 @@
  *
  * Simplified version of A2A3's tensor_dump_aicpu.cpp:
  * - No SPSC free queues or ready queues
- * - Per-thread DumpBuffer with count-first layout (like PerfBuffer)
+ * - Per-thread DumpBuffer with count-first layout (like L2PerfBuffer)
  * - Per-thread circular arena for tensor payload data
  * - Silently drops records when DumpBuffer is full
  * - Host copies everything back after stream sync

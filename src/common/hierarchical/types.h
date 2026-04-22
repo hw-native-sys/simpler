@@ -148,7 +148,7 @@ struct TaskSlotState {
     WorkerType worker_type{WorkerType::NEXT_LEVEL};
     uint64_t callable{0};     // NEXT_LEVEL: ChipCallable buffer ptr; SUB: unused
     int32_t callable_id{-1};  // SUB: registered callable id
-    ChipCallConfig config{};  // NEXT_LEVEL config (block_dim, aicpu_thread_num, enable_profiling)
+    ChipCallConfig config{};  // NEXT_LEVEL config (block_dim, aicpu_thread_num, diagnostics sub-features)
 
     // Unified task-args storage: `task_args` is the single-task builder;
     // when `is_group_` is true, `task_args_list` carries one TaskArgs per

@@ -377,11 +377,11 @@ def format_device_range(ids: list[int]) -> str:
     return _device_range_str(ids)
 
 
-def flatten_perf_subdirs(outputs_dir: str | os.PathLike = "outputs") -> int:
-    """Move files from ``outputs/perf_*`` subdirs back up to ``outputs/``.
+def flatten_l2_perf_records_subdirs(outputs_dir: str | os.PathLike = "outputs") -> int:
+    """Move files from ``outputs/l2_perf_records_*`` subdirs back up to ``outputs/``.
 
-    The test dispatcher scopes each subprocess's ``SIMPLER_PERF_OUTPUT_DIR`` to a
-    distinct ``outputs/perf_<tag>/`` subdir so concurrent perf file writes
+    The test dispatcher scopes each subprocess's ``SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR`` to a
+    distinct ``outputs/l2_perf_records_<tag>/`` subdir so concurrent perf file writes
     can't collide on second-precision filenames. After all phases drain,
     call this to flatten the subdirs back to the historical ``outputs/``
     layout so downstream tools (swimlane_converter.py stand-alone, artifact
@@ -400,10 +400,10 @@ def flatten_perf_subdirs(outputs_dir: str | os.PathLike = "outputs") -> int:
     if not root.exists():
         return 0
     moved = 0
-    for sub in sorted(root.glob("perf_*")):
+    for sub in sorted(root.glob("l2_perf_records_*")):
         if not sub.is_dir():
             continue
-        tag = sub.name[len("perf_") :] if sub.name.startswith("perf_") else sub.name
+        tag = sub.name[len("l2_perf_records_") :] if sub.name.startswith("l2_perf_records_") else sub.name
         for f in list(sub.iterdir()):
             if not f.is_file():
                 continue

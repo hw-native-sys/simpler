@@ -32,7 +32,7 @@
 #include <string.h>  // for memset
 
 #include "common/core_type.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "pto2_dispatch_payload.h"
 #include "task_args.h"
@@ -79,9 +79,11 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * The structure is cache-line aligned (64 bytes) to prevent false sharing
  * between cores and optimize cache coherency operations.
  *
- * enable_profiling_flag bit definitions:
+ * enable_profiling_flag bit definitions (umbrella bitmask — "profiling"
+ * is the umbrella, each bit is a parallel diagnostics sub-feature):
  * - bit0: tensor dump enabled
- * - remaining bits: reserved for future runtime controls
+ * - bit1: L2 swimlane enabled
+ * - bit2: PMU enabled
  *
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
@@ -99,12 +101,13 @@ struct Handshake {
     volatile int32_t task_status;             // Task execution status: 0=idle, 1=busy
     volatile int32_t control;                 // Control signal: 0=execute, 1=quit
     volatile CoreType core_type;              // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t perf_records_addr;      // Performance records address
-    volatile uint32_t perf_buffer_status;     // 0 = not full, 1 == full
+    volatile uint64_t l2_perf_records_addr;   // Performance records address
+    volatile uint32_t l2_perf_buffer_status;  // 0 = not full, 1 == full
     volatile uint32_t physical_core_id;       // Physical core ID
     volatile uint32_t aicpu_regs_ready;       // AICPU register init done: 0=pending, 1=done
     volatile uint32_t aicore_regs_ready;      // AICore ID reported: 0=pending, 1=done
-    volatile uint32_t enable_profiling_flag;  // Generic profiling-related flags; bit0=dump tensor
+    volatile uint32_t
+        enable_profiling_flag;  // Umbrella diagnostics bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
 } __attribute__((aligned(64)));
 
 /**
@@ -172,15 +175,15 @@ public:
     // NOTE: Made public for direct access from aicore code
     uint64_t func_id_to_addr_[RUNTIME_MAX_FUNC_ID];
 
-    // Profiling support
-    bool enable_profiling;  // Enable profiling flag
+    // Perf swimlane collection
+    bool enable_l2_swimlane;  // Enable perf swimlane collection
 
     // Orchestrator-to-scheduler transition control
     // When true, orchestrator threads convert to scheduler threads after orchestration completes.
     // When false (default), orchestrator threads exit after orchestration without dispatching tasks.
     // Controlled via PTO2_ORCH_TO_SCHED environment variable.
     bool orch_to_sched;
-    uint64_t perf_data_base;  // Performance data shared memory base address (device-side)
+    uint64_t l2_perf_data_base;  // Performance data shared memory base address (device-side)
 
 private:
     // Tensor pairs for host-device memory tracking

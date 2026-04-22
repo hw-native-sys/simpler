@@ -21,7 +21,7 @@
  *   [task loop]
  *     pmu_aicpu_record_task()   — read counters, write one PmuRecord; switch buffer when full
  *   pmu_aicpu_flush_buffers()   — per-thread: flush each of this thread's non-empty
- *                                 PmuBuffers to the ready_queue (mirrors perf_aicpu_flush_buffers)
+ *                                 PmuBuffers to the ready_queue (mirrors l2_perf_aicpu_flush_buffers)
  *   pmu_aicpu_finalize()        — per-thread: restore CTRL registers on shutdown
  */
 
@@ -77,7 +77,7 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores);
 void pmu_aicpu_record_task(int core_id, int thread_idx, uint64_t task_id, uint32_t func_id, CoreType core_type);
 
 /**
- * Per-thread PMU buffer flush. Mirrors perf_aicpu_flush_buffers().
+ * Per-thread PMU buffer flush. Mirrors l2_perf_aicpu_flush_buffers().
  *
  * For each core in cur_thread_cores, enqueue its non-empty PmuBuffer into the
  * thread's ready_queue so the host collector can pick it up.

@@ -10,27 +10,27 @@
  */
 
 /**
- * @file perf_profiling.h
+ * @file l2_perf_profiling.h
  * @brief Performance profiling data structures
  *
- * Architecture: per-core PerfBuffer + per-thread PhaseBuffer + a single
- * PerfSetupHeader, all allocated on device by Host.
+ * Architecture: per-core L2PerfBuffer + per-thread PhaseBuffer + a single
+ * L2PerfSetupHeader, all allocated on device by Host.
  *
  * Layout (count-first + flexible array):
- *   PerfBuffer  = 64B header (count + padding) + records[capacity]
+ *   L2PerfBuffer  = 64B header (count + padding) + records[capacity]
  *   PhaseBuffer = 64B header (count + padding) + records[capacity]
  *
  * Buffer device pointers + total_tasks + AicpuPhaseHeader (with orch_summary
- * and core_to_thread) are consolidated in PerfSetupHeader. Host copies
- * PerfSetupHeader to device once before execution; AICPU reads pointers in
- * its profiling init. After execution, Host copies PerfSetupHeader back, then
- * does a two-step memcpy (header → count → records) on each PerfBuffer /
+ * and core_to_thread) are consolidated in L2PerfSetupHeader. Host copies
+ * L2PerfSetupHeader to device once before execution; AICPU reads pointers in
+ * its profiling init. After execution, Host copies L2PerfSetupHeader back, then
+ * does a two-step memcpy (header → count → records) on each L2PerfBuffer /
  * PhaseBuffer to reduce transfer to "actual records" instead of full
  * capacity.
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_COMMON_PERF_PROFILING_H_
-#define SRC_A5_PLATFORM_INCLUDE_COMMON_PERF_PROFILING_H_
+#ifndef SRC_A5_PLATFORM_INCLUDE_COMMON_L2_PERF_PROFILING_H_
+#define SRC_A5_PLATFORM_INCLUDE_COMMON_L2_PERF_PROFILING_H_
 
 #include <cstdint>
 #include <vector>
@@ -38,19 +38,19 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 
-// Maximum number of successor tasks per PerfRecord (matches Task::fanout)
+// Maximum number of successor tasks per L2PerfRecord (matches Task::fanout)
 #ifndef RUNTIME_MAX_FANOUT
 #define RUNTIME_MAX_FANOUT 128
 #endif
 
 // =============================================================================
-// PerfRecord - Single Task Execution Record
+// L2PerfRecord - Single Task Execution Record
 // =============================================================================
 
 /**
  * Single task execution record
  */
-struct PerfRecord {
+struct L2PerfRecord {
     // Timing information (device clock timestamps)
     uint64_t start_time;  // Task start timestamp (get_sys_cnt)
     uint64_t end_time;    // Task end timestamp
@@ -73,10 +73,10 @@ struct PerfRecord {
     int32_t fanout_count;                 // Number of successor tasks
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(PerfRecord) % 64 == 0, "PerfRecord must be 64-byte aligned for optimal cache performance");
+static_assert(sizeof(L2PerfRecord) % 64 == 0, "L2PerfRecord must be 64-byte aligned for optimal cache performance");
 
 // =============================================================================
-// PerfBuffer - Record Buffer with Count-First Layout and WIP Staging Slots
+// L2PerfBuffer - Record Buffer with Count-First Layout and WIP Staging Slots
 // =============================================================================
 
 /**
@@ -84,19 +84,19 @@ static_assert(sizeof(PerfRecord) % 64 == 0, "PerfRecord must be 64-byte aligned 
  *
  * Layout: 64B header (count + padding), then wip[2] staging slots,
  * then records[].
- * Actual allocation: sizeof(PerfBuffer) + capacity * sizeof(PerfRecord).
+ * Actual allocation: sizeof(L2PerfBuffer) + capacity * sizeof(L2PerfRecord).
  *
- * Count-first enables two-step collection: Host copies sizeof(PerfBuffer) to
- * read count, then copies only count * sizeof(PerfRecord) of actual data.
+ * Count-first enables two-step collection: Host copies sizeof(L2PerfBuffer) to
+ * read count, then copies only count * sizeof(L2PerfRecord) of actual data.
  *
  * WIP protocol: AICore writes timing to wip[reg_task_id & 1], AICPU copies
  * it into records[count] at completion. Dual-slot parity ensures no overlap.
  */
-struct PerfBuffer {
+struct L2PerfBuffer {
     volatile uint32_t count;  // Current committed record count (at offset 0 for cache-line read)
     uint32_t pad[15];         // Pad to 64B cache line boundary
-    PerfRecord wip[2];        // AICore WIP staging slots (index = reg_task_id & 1)
-    PerfRecord records[];     // Flexible array member (not counted in sizeof)
+    L2PerfRecord wip[2];      // AICore WIP staging slots (index = reg_task_id & 1)
+    L2PerfRecord records[];   // Flexible array member (not counted in sizeof)
 } __attribute__((aligned(64)));
 
 // =============================================================================
@@ -185,7 +185,7 @@ struct PhaseBuffer {
 /**
  * AICPU phase profiling header
  *
- * Embedded in PerfSetupHeader. Contains the magic, per-thread metadata, the
+ * Embedded in L2PerfSetupHeader. Contains the magic, per-thread metadata, the
  * core_id → scheduler thread mapping, and the orchestrator's cumulative
  * cycle summary.
  */
@@ -199,7 +199,7 @@ struct AicpuPhaseHeader {
 } __attribute__((aligned(64)));
 
 // =============================================================================
-// PerfSetupHeader - Host/Device Metadata Exchange
+// L2PerfSetupHeader - Host/Device Metadata Exchange
 // =============================================================================
 
 /**
@@ -210,16 +210,16 @@ struct AicpuPhaseHeader {
  * buffer pointers during init. After execution completes, Host copies
  * this struct back to read total_tasks and phase_header.
  *
- * Memory layout: runtime.perf_data_base points to this struct on device.
+ * Memory layout: runtime.l2_perf_data_base points to this struct on device.
  */
-struct PerfSetupHeader {
+struct L2PerfSetupHeader {
     // Host writes, AICPU reads (init)
     uint32_t num_cores;          // Number of AICore instances
     uint32_t num_phase_threads;  // Number of phase profiling threads
     uint32_t pad0[14];           // Pad to 64B
 
     // Host writes, AICPU reads: per-core / per-thread buffer device pointers
-    uint64_t core_buffer_ptrs[PLATFORM_MAX_CORES];           // PerfBuffer* on device
+    uint64_t core_buffer_ptrs[PLATFORM_MAX_CORES];           // L2PerfBuffer* on device
     uint64_t phase_buffer_ptrs[PLATFORM_MAX_AICPU_THREADS];  // PhaseBuffer* on device
 
     // AICPU writes, host reads back
@@ -239,26 +239,28 @@ extern "C" {
 #endif
 
 /**
- * Get PerfSetupHeader pointer from base address
+ * Get L2PerfSetupHeader pointer from base address
  *
- * @param base_ptr Device base address (runtime.perf_data_base)
- * @return PerfSetupHeader pointer
+ * @param base_ptr Device base address (runtime.l2_perf_data_base)
+ * @return L2PerfSetupHeader pointer
  */
-inline PerfSetupHeader *get_perf_setup_header(void *base_ptr) { return reinterpret_cast<PerfSetupHeader *>(base_ptr); }
+inline L2PerfSetupHeader *get_perf_setup_header(void *base_ptr) {
+    return reinterpret_cast<L2PerfSetupHeader *>(base_ptr);
+}
 
 /**
- * Calculate PerfSetupHeader allocation size
+ * Calculate L2PerfSetupHeader allocation size
  */
-inline size_t calc_perf_setup_size() { return sizeof(PerfSetupHeader); }
+inline size_t calc_l2_perf_setup_size() { return sizeof(L2PerfSetupHeader); }
 
 /**
- * Calculate total bytes for a PerfBuffer with the given capacity
+ * Calculate total bytes for a L2PerfBuffer with the given capacity
  *
- * @param capacity Number of PerfRecord slots (e.g. PLATFORM_PROF_BUFFER_SIZE)
- * @return 64B header + capacity * sizeof(PerfRecord)
+ * @param capacity Number of L2PerfRecord slots (e.g. PLATFORM_PROF_BUFFER_SIZE)
+ * @return 64B header + capacity * sizeof(L2PerfRecord)
  */
-inline size_t calc_perf_buffer_size(int capacity) {
-    return sizeof(PerfBuffer) + static_cast<size_t>(capacity) * sizeof(PerfRecord);
+inline size_t calc_l2_perf_buffer_size(int capacity) {
+    return sizeof(L2PerfBuffer) + static_cast<size_t>(capacity) * sizeof(L2PerfRecord);
 }
 
 /**
@@ -275,4 +277,4 @@ inline size_t calc_phase_buffer_size(int capacity) {
 }
 #endif
 
-#endif  // SRC_A5_PLATFORM_INCLUDE_COMMON_PERF_PROFILING_H_
+#endif  // SRC_A5_PLATFORM_INCLUDE_COMMON_L2_PERF_PROFILING_H_
