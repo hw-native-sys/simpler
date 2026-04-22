@@ -40,13 +40,16 @@ import sys
 from multiprocessing.shared_memory import SharedMemory
 
 from simpler.task_interface import (
+    ArgDirection,
     ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
     ChipCallConfig,
     ChipCommBootstrapConfig,
     ChipContext,
+    ContinuousTensor,
     CoreCallable,
+    DataType,
     HostBufferStaging,
     TaskArgs,
 )
@@ -61,6 +64,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 # Must match ALLREDUCE_COUNT in kernels/aiv/allreduce_kernel.cpp.
 ALLREDUCE_COUNT = 256
 DTYPE_NBYTES = 4  # float32
+NOTIFY_COUNT = 1
+NOTIFY_NBYTES = 4  # int32
 
 
 def parse_device_range(spec: str) -> list[int]:
@@ -77,9 +82,8 @@ def parse_device_range(spec: str) -> list[int]:
 def build_chip_callable(platform: str) -> ChipCallable:
     """Compile the AIV allreduce kernel + its C++ orchestration shim.
 
-    The orchestration forwards 5 scalars (input_ptr, output_ptr, nranks, root,
-    device_ctx) as-is, so the signature slot list is empty and all args flow
-    through TaskArgs.add_scalar at submission time.
+    The kernel consumes 4 tensors (input, recv_window, output, notify_counter)
+    and one scalar (device_ctx).
     """
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
@@ -105,7 +109,12 @@ def build_chip_callable(platform: str) -> ChipCallable:
     )
     core_callable = CoreCallable.build(signature=[], binary=kernel_bytes)
     return ChipCallable.build(
-        signature=[],
+        signature=[
+            ArgDirection.IN,
+            ArgDirection.INOUT,
+            ArgDirection.OUT,
+            ArgDirection.INOUT,
+        ],
         func_name="allreduce_orchestration",
         binary=orch_bytes,
         children=[(0, core_callable)],
@@ -126,10 +135,16 @@ def pack_f32(values: list[float]) -> bytes:
     return struct.pack(f"<{len(values)}f", *values)
 
 
+def pack_i32(values: list[int]) -> bytes:
+    return struct.pack(f"<{len(values)}i", *values)
+
+
 def run(device_ids: list[int]) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
     buffer_nbytes = ALLREDUCE_COUNT * DTYPE_NBYTES
+    recv_window_nbytes = nranks * buffer_nbytes
+    notify_nbytes = NOTIFY_COUNT * NOTIFY_NBYTES
     window_size = 4 * 1024 * 1024  # HCCL may round up; actual size surfaces via ChipContext.
 
     rootinfo_path = f"/tmp/pto_allreduce_distributed_rootinfo_{os.getpid()}.bin"
@@ -145,12 +160,24 @@ def run(device_ids: list[int]) -> int:
     # after worker.init() returns (child has already finished copy_to at that
     # point).
     input_shms: list[SharedMemory] = []
+    recv_window_shms: list[SharedMemory] = []
+    notify_counter_shms: list[SharedMemory] = []
     output_shms: list[SharedMemory] = []
     for rank in range(nranks):
         shm = SharedMemory(create=True, size=buffer_nbytes)
         assert shm.buf is not None
         shm.buf[:buffer_nbytes] = pack_f32(make_rank_input(rank))
         input_shms.append(shm)
+
+        recv_shm = SharedMemory(create=True, size=recv_window_nbytes)
+        assert recv_shm.buf is not None
+        recv_shm.buf[:recv_window_nbytes] = pack_f32([0.0] * (nranks * ALLREDUCE_COUNT))
+        recv_window_shms.append(recv_shm)
+
+        notify_shm = SharedMemory(create=True, size=notify_nbytes)
+        assert notify_shm.buf is not None
+        notify_shm.buf[:notify_nbytes] = pack_i32([0] * NOTIFY_COUNT)
+        notify_counter_shms.append(notify_shm)
 
         out_shm = SharedMemory(create=True, size=buffer_nbytes)
         output_shms.append(out_shm)
@@ -173,6 +200,14 @@ def run(device_ids: list[int]) -> int:
                     load_from_host=True,
                 ),
                 ChipBufferSpec(
+                    name="recv_window",
+                    dtype="float32",
+                    count=nranks * ALLREDUCE_COUNT,
+                    placement="window",
+                    nbytes=recv_window_nbytes,
+                    load_from_host=True,
+                ),
+                ChipBufferSpec(
                     name="output",
                     dtype="float32",
                     count=ALLREDUCE_COUNT,
@@ -180,8 +215,20 @@ def run(device_ids: list[int]) -> int:
                     nbytes=buffer_nbytes,
                     store_to_host=True,
                 ),
+                ChipBufferSpec(
+                    name="notify_counter",
+                    dtype="int32",
+                    count=NOTIFY_COUNT,
+                    placement="window",
+                    nbytes=notify_nbytes,
+                    load_from_host=True,
+                ),
             ],
-            host_inputs=[HostBufferStaging(name="input", shm_name=input_shms[rank].name, size=buffer_nbytes)],
+            host_inputs=[
+                HostBufferStaging(name="input", shm_name=input_shms[rank].name, size=buffer_nbytes),
+                HostBufferStaging(name="recv_window", shm_name=recv_window_shms[rank].name, size=recv_window_nbytes),
+                HostBufferStaging(name="notify_counter", shm_name=notify_counter_shms[rank].name, size=notify_nbytes),
+            ],
             host_outputs=[HostBufferStaging(name="output", shm_name=output_shms[rank].name, size=buffer_nbytes)],
         )
         for rank in range(nranks)
@@ -203,12 +250,20 @@ def run(device_ids: list[int]) -> int:
         print("[allreduce] init worker (forks chip children + bootstraps HCCL)...")
         worker.init()
 
-        # Child has copied input from shm into the window by now. Drop our
+        # Child has copied staged buffers by now. Drop our
         # copies so the shm segments don't outlive the run.
         for shm in input_shms:
             shm.close()
             shm.unlink()
         input_shms.clear()
+        for shm in recv_window_shms:
+            shm.close()
+            shm.unlink()
+        recv_window_shms.clear()
+        for shm in notify_counter_shms:
+            shm.close()
+            shm.unlink()
+        notify_counter_shms.clear()
 
         contexts: list[ChipContext] = worker.chip_contexts
         assert len(contexts) == nranks
@@ -220,16 +275,31 @@ def run(device_ids: list[int]) -> int:
             )
 
         def orch_fn(orch, _args, cfg):
-            # One chip task per rank. All args pass as scalars because the
-            # kernel reinterpret_casts args[i] as raw device pointers — an
-            # approach the Tensor path would corrupt (it rewrites pointers
-            # into Tensor-struct addresses).
             for i, ctx in enumerate(contexts):
                 chip_args = TaskArgs()
-                chip_args.add_scalar(ctx.buffer_ptrs["input"])
-                chip_args.add_scalar(ctx.buffer_ptrs["output"])
-                chip_args.add_scalar(ctx.nranks)
-                chip_args.add_scalar(0)  # root (symmetric allreduce ignores it)
+                chip_args.add_tensor(
+                    ContinuousTensor.make(
+                        ctx.buffer_ptrs["input"], (1, ALLREDUCE_COUNT), DataType.FLOAT32, child_memory=True
+                    )
+                )
+                chip_args.add_tensor(
+                    ContinuousTensor.make(
+                        ctx.buffer_ptrs["recv_window"],
+                        (nranks, ALLREDUCE_COUNT),
+                        DataType.FLOAT32,
+                        child_memory=True,
+                    )
+                )
+                chip_args.add_tensor(
+                    ContinuousTensor.make(
+                        ctx.buffer_ptrs["output"], (1, ALLREDUCE_COUNT), DataType.FLOAT32, child_memory=True
+                    )
+                )
+                chip_args.add_tensor(
+                    ContinuousTensor.make(
+                        ctx.buffer_ptrs["notify_counter"], (NOTIFY_COUNT,), DataType.INT32, child_memory=True
+                    )
+                )
                 chip_args.add_scalar(ctx.device_ctx)
                 orch.submit_next_level(chip_callable, chip_args, cfg, worker=i)
 
@@ -246,6 +316,9 @@ def run(device_ids: list[int]) -> int:
 
             max_diff = max(abs(a - b) for a, b in zip(got, expected))
             print(f"[allreduce] chip {i}: max |out - expected| = {max_diff:.3e}")
+            sample_count = min(8, ALLREDUCE_COUNT)
+            print(f"[allreduce] chip {i}: out[:{sample_count}] = {got[:sample_count]}")
+            print(f"[allreduce] chip {i}: expected[:{sample_count}] = {expected[:sample_count]}")
             if max_diff > 1e-3:
                 ok = False
                 for j in range(min(4, ALLREDUCE_COUNT)):
@@ -259,6 +332,18 @@ def run(device_ids: list[int]) -> int:
     finally:
         worker.close()
         for shm in input_shms:
+            try:
+                shm.close()
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+        for shm in recv_window_shms:
+            try:
+                shm.close()
+                shm.unlink()
+            except FileNotFoundError:
+                pass
+        for shm in notify_counter_shms:
             try:
                 shm.close()
                 shm.unlink()

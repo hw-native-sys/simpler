@@ -9,20 +9,8 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * AllReduce orchestration — all-scalar args path.
- *
- * The kernel reads raw uint64 values from args[] (device pointers into the
- * HCCL window + a few ints) and does its own CommRemotePtr math. Wrapping
- * the pointers as tensors would force the framework to rewrite them as
- * Tensor-struct pointers, breaking that math. So every arg goes through
- * add_scalar, and the orchestration forwards them 1:1.
- *
- * scalar layout (from Python orch_fn via ChipStorageTaskArgs):
- *   [0] input device pointer   (HCCL window, remote-addressable)
- *   [1] output device pointer  (HCCL window, local write)
- *   [2] nranks
- *   [3] root rank              (unused in symmetric allreduce, kept for ABI)
- *   [4] CommContext device pointer
+ * AllReduce orchestration using tensor args for buffers plus one scalar
+ * device-context pointer. This matches the publish/notify/wait kernel ABI.
  */
 
 #include <stdint.h>
@@ -40,12 +28,18 @@ allreduce_orchestration_config(const ChipStorageTaskArgs &orch_args) {
 }
 
 __attribute__((visibility("default"))) void allreduce_orchestration(const ChipStorageTaskArgs &orch_args) {
+    Tensor input = from_tensor_arg(orch_args.tensor(0));
+    Tensor recvWindow = from_tensor_arg(orch_args.tensor(1));
+    Tensor output = from_tensor_arg(orch_args.tensor(2));
+    Tensor notifyCounter = from_tensor_arg(orch_args.tensor(3));
+    uint64_t deviceCtx = orch_args.scalar(0);
+
     Arg params;
-    params.add_scalar(orch_args.scalar(0));
-    params.add_scalar(orch_args.scalar(1));
-    params.add_scalar(orch_args.scalar(2));
-    params.add_scalar(orch_args.scalar(3));
-    params.add_scalar(orch_args.scalar(4));
+    params.add_input(input);
+    params.add_inout(recvWindow);
+    params.add_output(output);
+    params.add_inout(notifyCounter);
+    params.add_scalar(deviceCtx);
     pto2_rt_submit_aiv_task(0, params);
 }
 

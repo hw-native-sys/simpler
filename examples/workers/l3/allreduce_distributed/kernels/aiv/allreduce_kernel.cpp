@@ -9,24 +9,26 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * AllReduce kernel for simpler's kernel_entry signature.
+ * AllReduce kernel using PR #522's publish/notify/wait design.
  *
- * Every rank independently reads all ranks' inputs from the RDMA window,
- * computes the element-wise sum, and writes the result to its own output.
- * This is a symmetric allreduce — no designated root, all ranks active.
+ * Each rank publishes its local input into every peer's recv_window via TPUT,
+ * notifies peers once the publish is issued, waits until all peers have done
+ * the same, then accumulates the slots that landed in its own recv_window.
  *
- * args layout (all uint64_t, cast as needed):
- *   args[0] = __gm__ float* input   (device addr in RDMA window)
- *   args[1] = __gm__ float* output  (device addr, local)
- *   args[2] = int nranks
- *   args[3] = (unused, kept for ABI compatibility)
- *   args[4] = __gm__ CommContext* ctx  (device addr)
+ * args layout:
+ *   args[0] = __gm__ Tensor* input_tensor
+ *   args[1] = __gm__ Tensor* recv_window_tensor
+ *   args[2] = __gm__ Tensor* output_tensor
+ *   args[3] = __gm__ Tensor* notify_counter_tensor
+ *   args[4] = __gm__ CommContext* ctx
  */
 
 #include <cstdint>
+
+#include <pto/common/pto_tile.hpp>
 #include <pto/pto-inst.hpp>
-#include "pto/comm/comm_types.hpp"
 #include "pto/comm/pto_comm_inst.hpp"
+#include "tensor.h"
 #include "platform_comm/comm_context.h"
 
 #ifndef __gm__
@@ -48,57 +50,83 @@ AICORE inline __gm__ T *CommRemotePtr(__gm__ CommContext *ctx, __gm__ T *localPt
 }
 
 extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ int64_t *args) {
-    __gm__ float *input = reinterpret_cast<__gm__ float *>(args[0]);
-    __gm__ float *output = reinterpret_cast<__gm__ float *>(args[1]);
-    int nranks = static_cast<int>(args[2]);
-    int root = static_cast<int>(args[3]);
+    __gm__ Tensor *inputTensor = reinterpret_cast<__gm__ Tensor *>(args[0]);
+    __gm__ Tensor *recvWindowTensor = reinterpret_cast<__gm__ Tensor *>(args[1]);
+    __gm__ Tensor *outputTensor = reinterpret_cast<__gm__ Tensor *>(args[2]);
+    __gm__ Tensor *notifyCounterTensor = reinterpret_cast<__gm__ Tensor *>(args[3]);
     __gm__ CommContext *commCtx = reinterpret_cast<__gm__ CommContext *>(args[4]);
 
-    using ShapeDyn = pto::Shape<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
-    using StrideDyn = pto::Stride<pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC, pto::DYNAMIC>;
-    using Global = pto::GlobalTensor<float, ShapeDyn, StrideDyn, pto::Layout::ND>;
-    using TileData = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
+    __gm__ float *inputPtr =
+        reinterpret_cast<__gm__ float *>(inputTensor->buffer.addr) + inputTensor->start_offset;
+    __gm__ float *recvWindowPtr =
+        reinterpret_cast<__gm__ float *>(recvWindowTensor->buffer.addr) + recvWindowTensor->start_offset;
+    __gm__ float *outputPtr =
+        reinterpret_cast<__gm__ float *>(outputTensor->buffer.addr) + outputTensor->start_offset;
+    __gm__ int32_t *notifyCounterPtr =
+        reinterpret_cast<__gm__ int32_t *>(notifyCounterTensor->buffer.addr) + notifyCounterTensor->start_offset;
 
-    int my_rank = static_cast<int>(commCtx->rankId);
+    using VectorGlobal = pto::GlobalTensor<float, pto::Shape<1, 1, 1, 1, ALLREDUCE_COUNT>,
+        pto::Stride<1, 1, 1, ALLREDUCE_COUNT, 1>>;
+    using VectorTile = pto::Tile<pto::TileType::Vec, float, 1, ALLREDUCE_COUNT, pto::BLayout::RowMajor, -1, -1>;
 
-    ShapeDyn shape(1, 1, 1, 1, ALLREDUCE_COUNT);
-    StrideDyn stride(ALLREDUCE_COUNT, ALLREDUCE_COUNT, ALLREDUCE_COUNT, ALLREDUCE_COUNT, 1);
+    int myRank = static_cast<int>(commCtx->rankId);
+    int nranks = static_cast<int>(commCtx->rankNum);
 
-    TileData accTile(1, ALLREDUCE_COUNT);
-    TileData recvTile(1, ALLREDUCE_COUNT);
-    TASSIGN(accTile, 0x0);
+    VectorGlobal inputGlobal(inputPtr);
+    VectorTile sumTile(1, ALLREDUCE_COUNT);
+    VectorTile recvTile(1, ALLREDUCE_COUNT);
+    VectorTile stagingTile(1, ALLREDUCE_COUNT);
+    TASSIGN(sumTile, 0x0);
     TASSIGN(recvTile, 0x10000);
+    TASSIGN(stagingTile, 0x20000);
 
     if (nranks <= 0 || nranks > kMaxSupportedRanks) {
         pipe_barrier(PIPE_ALL);
         return;
     }
 
-    // Every rank reads all inputs and sums them into its own output.
-    Global outputG(output, shape, stride);
+    TLOAD(sumTile, inputGlobal);
+    pipe_barrier(PIPE_ALL);
 
-    __gm__ float *firstInput = CommRemotePtr(commCtx, input, 0);
-    Global firstG(firstInput, shape, stride);
-    TLOAD(accTile, firstG);
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID0);
+    for (int peer = 0; peer < nranks; ++peer) {
+        if (peer == myRank) {
+            continue;
+        }
+        __gm__ float *remoteRecvWindowBase = CommRemotePtr(commCtx, recvWindowPtr, peer);
+        __gm__ float *remoteSlotPtr = remoteRecvWindowBase + myRank * ALLREDUCE_COUNT;
+        VectorGlobal remoteSlot(remoteSlotPtr);
+        pto::comm::TPUT(remoteSlot, inputGlobal, stagingTile);
+    }
+    pipe_barrier(PIPE_ALL);
 
-    for (int r = 1; r < nranks; ++r) {
-        __gm__ float *remoteInput = CommRemotePtr(commCtx, input, r);
-        Global remoteG(remoteInput, shape, stride);
-        TLOAD(recvTile, remoteG);
-        set_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-        wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID1);
-        TADD(accTile, accTile, recvTile);
-        set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-        wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    for (int peer = 0; peer < nranks; ++peer) {
+        if (peer == myRank) {
+            continue;
+        }
+        __gm__ int32_t *remoteCounter = CommRemotePtr(commCtx, notifyCounterPtr, peer);
+        pto::comm::Signal remoteSignal(remoteCounter);
+        pto::comm::TNOTIFY(remoteSignal, 1, pto::comm::NotifyOp::AtomicAdd);
+    }
+    pipe_barrier(PIPE_ALL);
+
+    pto::comm::Signal localCounter(notifyCounterPtr);
+    pto::comm::TWAIT(localCounter, nranks - 1, pto::comm::WaitCmp::GE);
+    pipe_barrier(PIPE_ALL);
+
+    for (int peer = 0; peer < nranks; ++peer) {
+        if (peer == myRank) {
+            continue;
+        }
+        __gm__ float *recvSlotPtr = recvWindowPtr + peer * ALLREDUCE_COUNT;
+        VectorGlobal recvSlot(recvSlotPtr);
+        TLOAD(recvTile, recvSlot);
+        pipe_barrier(PIPE_ALL);
+        TADD(sumTile, sumTile, recvTile);
+        pipe_barrier(PIPE_ALL);
     }
 
-    set_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE3, EVENT_ID0);
-    TSTORE(outputG, accTile);
-    set_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_MTE3, PIPE_MTE2, EVENT_ID0);
+    VectorGlobal outputGlobal(outputPtr);
+    TSTORE(outputGlobal, sumTile);
 
     pipe_barrier(PIPE_ALL);
 }
