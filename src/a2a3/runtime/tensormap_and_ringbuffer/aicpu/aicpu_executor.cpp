@@ -1125,7 +1125,7 @@ struct AicpuExecutor {
     }
 
     int pop_ready_tasks_batch(
-        PTO2ResourceShape shape, int32_t thread_idx, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out,
+        PTO2ResourceShape shape, int32_t thread_idx, PTO2LocalReadyBuffer *local_buf, PTO2TaskSlotState **out,
         int max_count
     ) {
 #if PTO2_SCHED_PROFILING
@@ -1354,9 +1354,11 @@ struct AicpuExecutor {
     // Dispatch tasks of a given shape during the specified phase (IDLE or PENDING).
     // IDLE: dispatches to idle cores, supports sync_start/drain, multi-block do-while.
     // PENDING: dispatches to pending slots of running cores, skips sync_start tasks.
+    // local_buf: pass nullptr for PENDING phase so tasks just released into the local buffer
+    //   are not immediately re-claimed by the same thread's pending slots.
     void dispatch_shape(
         Runtime *runtime, int32_t thread_idx, PTO2ResourceShape shape, CoreTracker::DispatchPhase phase,
-        PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress,
+        PTO2LocalReadyBuffer *local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress,
         bool &try_pushed
     ) {
 #if PTO2_SCHED_PROFILING
@@ -2098,16 +2100,20 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         // === Two-phase dispatch: idle then pending ===
         for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES && !entered_drain; si++) {
             PTO2ResourceShape shape = dispatch_order[si];
-#if PTO2_DISABLE_DUAL_ISSUE
-            for (auto phase : {CoreTracker::DispatchPhase::IDLE}) {
-#else
-            for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
+            auto &local_buf = local_bufs[static_cast<int32_t>(shape)];
+            // IDLE phase: pull from local buffer first, then global queue.
+            dispatch_shape(
+                runtime, thread_idx, shape, CoreTracker::DispatchPhase::IDLE, &local_buf, tracker, entered_drain,
+                made_progress, try_pushed
+            );
+#if !PTO2_DISABLE_DUAL_ISSUE
+            // PENDING phase: pass nullptr so tasks just released into the local buffer
+            //   are not immediately re-claimed by the same thread's pending slots.
+            dispatch_shape(
+                runtime, thread_idx, shape, CoreTracker::DispatchPhase::PENDING, nullptr, tracker, entered_drain,
+                made_progress, try_pushed
+            );
 #endif
-                dispatch_shape(
-                    runtime, thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
-                    made_progress, try_pushed
-                );
-            }
         }
 
         // requeue in global ready queue

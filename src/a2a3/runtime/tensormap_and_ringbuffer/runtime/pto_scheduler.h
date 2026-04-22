@@ -806,11 +806,13 @@ struct PTO2SchedulerState {
 #endif
 
     int get_ready_tasks_batch(
-        PTO2ResourceShape shape, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count
+        PTO2ResourceShape shape, PTO2LocalReadyBuffer *local_buf, PTO2TaskSlotState **out, int max_count
     ) {
         int count = 0;
-        while (count < max_count && local_buf.count > 0) {
-            out[count++] = local_buf.slot_states[--local_buf.count];
+        if (local_buf) {
+            while (count < max_count && local_buf->count > 0) {
+                out[count++] = local_buf->slot_states[--local_buf->count];
+            }
         }
         int remaining = max_count - count;
         if (remaining > 0) {
@@ -821,13 +823,15 @@ struct PTO2SchedulerState {
 
 #if PTO2_SCHED_PROFILING
     int get_ready_tasks_batch(
-        PTO2ResourceShape shape, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count,
+        PTO2ResourceShape shape, PTO2LocalReadyBuffer *local_buf, PTO2TaskSlotState **out, int max_count,
         uint64_t &atomic_count, uint64_t &wait_cycle, uint64_t &local_dispatch_count
     ) {
         int count = 0;
-        while (count < max_count && local_buf.count > 0) {
-            local_dispatch_count++;
-            out[count++] = local_buf.slot_states[--local_buf.count];
+        if (local_buf) {
+            while (count < max_count && local_buf->count > 0) {
+                local_dispatch_count++;
+                out[count++] = local_buf->slot_states[--local_buf->count];
+            }
         }
         int remaining = max_count - count;
         if (remaining > 0) {
