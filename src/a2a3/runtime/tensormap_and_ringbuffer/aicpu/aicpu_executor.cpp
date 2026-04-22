@@ -55,6 +55,9 @@
 // Scheduler data structures (CoreExecState, CoreTracker, etc.)
 #include "scheduler/scheduler_types.h"
 
+// Scheduler context class
+#include "scheduler/scheduler_context.h"
+
 // Device orchestration function signature (loaded via dlopen).
 // The executor binds the current thread's PTO2Runtime into orchestration TLS
 // before calling the user entry.
