@@ -15,6 +15,16 @@
 
 #include "scheduler/pto_scheduler.h"
 
+// These macros are defined in runtime.h, but we cannot include it here
+// (it pulls in Handshake which we only forward-declare).  Mirror the
+// authoritative values so the class layout compiles standalone.
+#ifndef RUNTIME_MAX_WORKER
+#define RUNTIME_MAX_WORKER 72
+#endif
+#ifndef RUNTIME_MAX_FUNC_ID
+#define RUNTIME_MAX_FUNC_ID 32
+#endif
+
 // Forward declarations — avoid pulling in full headers for pointer/reference params.
 class Runtime;
 struct Handshake;
