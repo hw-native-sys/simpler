@@ -129,7 +129,7 @@ TEST(Ring, SlotStateIsPointerStable) {
     TaskSlotState *p0 = a.slot_state(r0.slot);
     ASSERT_NE(p0, nullptr);
 
-    // Push many more slots through — the deque may grow/chain, but the
+    // Push many more slots through -- the deque may grow/chain, but the
     // pointer we grabbed for slot 0 has to stay valid.
     for (int i = 0; i < 1000; ++i) {
         (void)a.alloc();
@@ -227,7 +227,7 @@ TEST(Ring, ScopeDepthMapsToRingIdx) {
 }
 
 TEST(Ring, PerRingHeapsAreDistinctMmaps) {
-    // Total VA = 4 × 4 KiB; verify each ring has its own mapping.
+    // Total VA = 4 x 4 KiB; verify each ring has its own mapping.
     Ring a;
     a.init(kSmallHeap, kQuickTimeoutMs);
 
@@ -241,7 +241,7 @@ TEST(Ring, PerRingHeapsAreDistinctMmaps) {
     for (int i = 0; i < MAX_RING_DEPTH; ++i) {
         for (int j = i + 1; j < MAX_RING_DEPTH; ++j) {
             EXPECT_NE(bases[i], bases[j])
-                << "rings " << i << " and " << j << " share a mapping — expected 4 separate mmaps";
+                << "rings " << i << " and " << j << " share a mapping -- expected 4 separate mmaps";
         }
     }
 }
@@ -292,7 +292,7 @@ TEST(Ring, RingsReclaimIndependently) {
     EXPECT_EQ(r1a.ring_idx, 1);
     EXPECT_EQ(r1b.ring_idx, 1);
 
-    // Ring 0 is untouched — this must succeed instantly, not time out.
+    // Ring 0 is untouched -- this must succeed instantly, not time out.
     auto r0 = a.alloc(HEAP_ALIGN, /*scope_depth=*/0);
     EXPECT_EQ(r0.ring_idx, 0);
     ASSERT_NE(r0.heap_ptr, nullptr);
@@ -322,7 +322,7 @@ TEST(Ring, InnerRingReclaimsWhileOuterHolds) {
     EXPECT_EQ(a.heap_top(0), HEAP_ALIGN);
     EXPECT_EQ(a.heap_tail(0), 0u);
 
-    // Churn on the inner ring — allocate, release, allocate, release, ...
+    // Churn on the inner ring -- allocate, release, allocate, release, ...
     for (int i = 0; i < 8; ++i) {
         auto inner = a.alloc(HEAP_ALIGN, /*scope_depth=*/1);
         a.release(inner.slot);
@@ -331,7 +331,7 @@ TEST(Ring, InnerRingReclaimsWhileOuterHolds) {
     // Outer ring unchanged (one live slab at offset 0).
     EXPECT_EQ(a.heap_top(0), HEAP_ALIGN);
     EXPECT_EQ(a.heap_tail(0), 0u);
-    // Inner ring reclaimed each slab — tail caught up to top.
+    // Inner ring reclaimed each slab -- tail caught up to top.
     EXPECT_EQ(a.heap_tail(1), a.heap_top(1));
 
     a.release(outer.slot);

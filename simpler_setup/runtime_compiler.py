@@ -78,6 +78,11 @@ class RuntimeCompiler:
             cls._instances[platform] = cls(platform)
         return cls._instances[platform]
 
+    @classmethod
+    def reset_instances(cls) -> None:
+        """Clear the singleton cache. Intended for test isolation."""
+        cls._instances.clear()
+
     def __init__(self, platform: str = "a2a3"):
         self.platform = platform
         self.project_root = PROJECT_ROOT

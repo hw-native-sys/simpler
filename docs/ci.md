@@ -112,7 +112,7 @@ Three hardware tiers, applied to all test categories. See [testing.md](testing.m
 
 ## Test Sources
 
-### `tests/ut/` — Python unit tests (ut-py)
+### `tests/ut/py/` — Python unit tests (ut-py)
 
 Python unit tests. Run via pytest, filtered by `--platform` + `requires_hardware` marker.
 

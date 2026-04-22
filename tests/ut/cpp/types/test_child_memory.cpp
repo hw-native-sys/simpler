@@ -20,6 +20,7 @@
 // ContinuousTensor layout
 // ---------------------------------------------------------------------------
 
+// ABI contract: size must match serialization format.
 TEST(ChildMemory, SizeofUnchanged) { EXPECT_EQ(sizeof(ContinuousTensor), 40u); }
 
 TEST(ChildMemory, DefaultIsZero) {

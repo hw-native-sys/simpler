@@ -41,6 +41,8 @@ struct FakeRuntime {
     std::string last_fatal_message;
 };
 
+static_assert(offsetof(FakeRuntime, ops) == 0);  // Guard: reinterpret_cast below assumes ops is first member.
+
 FakeRuntime *as_fake(PTO2Runtime *rt) { return reinterpret_cast<FakeRuntime *>(rt); }
 
 TaskOutputTensors fake_submit(PTO2Runtime *rt, const MixedKernels &, const Arg &) {
@@ -87,20 +89,20 @@ TaskOutputTensors fake_alloc_tensors(PTO2Runtime *rt, const Arg &) {
 }
 
 const PTO2RuntimeOps kFakeOps = {
-    fake_submit,
-    fake_scope_begin,
-    fake_scope_end,
-    fake_orchestration_done,
-    fake_is_fatal,
-    fake_report_fatal,
-    fake_log,
-    fake_log,
-    fake_log,
-    fake_log,
-    fake_log,
-    fake_get_tensor_data,
-    fake_set_tensor_data,
-    fake_alloc_tensors,
+    .submit_task = fake_submit,
+    .scope_begin = fake_scope_begin,
+    .scope_end = fake_scope_end,
+    .orchestration_done = fake_orchestration_done,
+    .is_fatal = fake_is_fatal,
+    .report_fatal = fake_report_fatal,
+    .log_error = fake_log,
+    .log_warn = fake_log,
+    .log_info = fake_log,
+    .log_debug = fake_log,
+    .log_always = fake_log,
+    .get_tensor_data = fake_get_tensor_data,
+    .set_tensor_data = fake_set_tensor_data,
+    .alloc_tensors = fake_alloc_tensors,
 };
 
 class RuntimeBindingGuard {
@@ -116,7 +118,7 @@ TensorCreateInfo make_ci() {
 
 }  // namespace
 
-TEST(A2A3PTO2Fatal, ApiShortCircuitsAfterFatal) {
+TEST(A5PTO2Fatal, ApiShortCircuitsAfterFatal) {
     FakeRuntime runtime{};
     runtime.ops = &kFakeOps;
     runtime.fatal = true;
@@ -148,7 +150,7 @@ TEST(A2A3PTO2Fatal, ApiShortCircuitsAfterFatal) {
     EXPECT_EQ(runtime.report_fatal_calls, 0);
 }
 
-TEST(A2A3PTO2Fatal, ExplicitFatalRoutesThroughOps) {
+TEST(A5PTO2Fatal, ExplicitFatalRoutesThroughOps) {
     FakeRuntime runtime{};
     runtime.ops = &kFakeOps;
     RuntimeBindingGuard bind(reinterpret_cast<PTO2Runtime *>(&runtime));
@@ -167,7 +169,7 @@ TEST(A2A3PTO2Fatal, ExplicitFatalRoutesThroughOps) {
     EXPECT_EQ(runtime.submit_calls, 0);
 }
 
-TEST(A2A3PTO2Fatal, AllocTensorConvenienceReportsInvalidArgsInsteadOfAsserting) {
+TEST(A5PTO2Fatal, AllocTensorConvenienceReportsInvalidArgsInsteadOfAsserting) {
     FakeRuntime runtime{};
     runtime.ops = &kFakeOps;
     RuntimeBindingGuard bind(reinterpret_cast<PTO2Runtime *>(&runtime));

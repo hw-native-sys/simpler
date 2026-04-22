@@ -8,15 +8,33 @@
 # -----------------------------------------------------------------------------------------------------------
 """Pytest configuration for Python unit tests (tests/ut/py/).
 
-Adds project directories to sys.path so that simpler_setup, task_interface,
-and host_worker modules are importable without installing the package.
+Adds project directories to sys.path so that:
+- ``import simpler_setup`` works (PROJECT_ROOT on path)
+- ``from simpler import env_manager`` works (python/ on path)
+- legacy ``import env_manager`` works (python/simpler/ on path)
 """
 
 import sys
 from pathlib import Path
 
-_ROOT = Path(__file__).resolve().parent.parent.parent.parent
-for _d in [_ROOT, _ROOT / "python"]:
+import pytest
+
+_ROOT = Path(__file__).parent.parent.parent.parent
+
+# Order matters: PROJECT_ROOT first (so ``import simpler_setup`` works as a
+# package), then python/ so ``from simpler import env_manager`` resolves, then
+# python/simpler/ so legacy ``import env_manager`` works.
+for _d in [
+    _ROOT,
+    _ROOT / "python",
+    _ROOT / "python" / "simpler",
+]:
     _s = str(_d)
     if _s not in sys.path:
         sys.path.insert(0, _s)
+
+
+@pytest.fixture
+def project_root():
+    """Return the project root directory."""
+    return _ROOT
