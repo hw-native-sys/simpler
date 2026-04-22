@@ -123,11 +123,11 @@ class ChipCommBootstrapConfig:
     """Per-chip communicator bring-up knobs consumed by `ChipWorker.bootstrap_context`.
 
     A ``ChipBootstrapConfig`` with ``comm=None`` skips the communicator step
-    entirely; in that mode ``cfg.buffers`` must be empty because
-    ``placement="window"`` is the only supported placement and the window
-    only exists once a communicator has been brought up.  Comm-less configs
-    are used by validation / error-path tests that need to trip
-    ``bootstrap_context`` before it reaches any communicator call.
+    entirely; in that mode ``cfg.buffers`` must be empty because buffers are
+    per-rank slices of the HCCL communicator window, and the window only
+    exists once a communicator has been brought up.  Comm-less configs are
+    used by error-path tests that need to trip ``bootstrap_context`` before
+    it reaches any communicator call.
     """
 
     rank: int
@@ -153,7 +153,6 @@ class ChipBufferSpec:
     name: str
     dtype: str
     count: int
-    placement: str
     nbytes: int
     load_from_host: bool = False
     store_to_host: bool = False
@@ -416,8 +415,6 @@ class ChipWorker:
             offset = 0
             buffer_ptrs: list[int] = []
             for spec in cfg.buffers:
-                if spec.placement != "window":
-                    raise ValueError(f"ChipBufferSpec.placement={spec.placement!r}; only 'window' is supported")
                 if cfg.comm is None:
                     raise ValueError("ChipBufferSpec requires comm; cfg.comm is None")
                 if offset + spec.nbytes > actual_size:

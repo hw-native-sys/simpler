@@ -53,7 +53,6 @@ def test_worker_chip_bootstrap(st_device_ids):
                     name="x",
                     dtype="float32",
                     count=buffer_nbytes // 4,
-                    placement="window",
                     nbytes=buffer_nbytes,
                 )
             ],

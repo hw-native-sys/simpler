@@ -7,22 +7,22 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""End-to-end distributed allreduce over the Worker(chip_bootstrap_configs=...) path.
+"""End-to-end distributed allreduce — symmetric 4-phase pattern.
 
-The kernel (ported verbatim from #307) reads every rank's contribution out of
-the HCCL window via CommRemotePtr and sums them into each rank's own window
-slot.  The distributed bring-up stack this exercises, bottom up:
+Each rank owns a private input/output tensor; cross-rank communication happens
+strictly inside the kernel, via a HCCL window scratch slot:
 
-  - HCCL backend                        comm_init / comm_alloc_windows
-  - ChipWorker.comm_* wrappers          host-side bootstrap of the communicator
-  - ChipBootstrapChannel                chip child publishes SUCCESS to the parent
-  - mailbox atomics                     parent/child sync without torn reads
-  - error propagation                   bootstrap failures raise from Worker.init()
-  - ChipWorker.bootstrap_context        one-shot per-chip bring-up
-  - Worker(chip_bootstrap_configs=...)  Worker-level orchestration
+  Phase 1 stage-in      input → my scratch slot (HCCL window)
+  Phase 2 device barrier signal matrix cross-rank sync via TNOTIFY/TWAIT
+  Phase 3 compute       TLOAD every peer's scratch slot, TADD into acc
+  Phase 4 stage-out     TSTORE acc → output
 
-These are the components that compose the bring-up — not framework hierarchy
-levels (see docs/hierarchical_level_runtime.md for the L0–L6 topology).
+input / output are plain per-rank ``torch.share_memory_()`` tensors — the
+parent writes inputs before ``init()`` and reads outputs after ``run()``, and
+the framework's TaskArgs path handles H2D / D2H automatically (same as
+``multi_chip_dispatch``).  Only ``scratch`` uses the chip bootstrap path
+because window buffers can only exist after HCCL ``comm_alloc_windows`` has
+run — that's what ``chip_bootstrap_configs`` is for.
 
 Hardware only.  The sim backend's CommRemotePtr uses a different addressing
 scheme; sim support is out of scope for this demo.
@@ -35,32 +35,45 @@ from __future__ import annotations
 
 import argparse
 import os
-import struct
 import sys
-from multiprocessing.shared_memory import SharedMemory
 
-from simpler.task_interface import (
+# Workaround for the duplicate-libomp abort when homebrew numpy and pip torch
+# coexist in one macOS process. Harmless on Linux. Must be set before
+# ``import torch``. See docs/macos-libomp-collision.md.
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import torch  # noqa: E402
+from simpler.task_interface import (  # noqa: E402
+    ArgDirection,
     ChipBootstrapConfig,
     ChipBufferSpec,
     ChipCallable,
     ChipCallConfig,
     ChipCommBootstrapConfig,
     ChipContext,
+    ContinuousTensor,
     CoreCallable,
-    HostBufferStaging,
+    DataType,
     TaskArgs,
+    TensorArgType,
 )
-from simpler.worker import Worker
+from simpler.worker import Worker  # noqa: E402
 
-from simpler_setup.elf_parser import extract_text_section
-from simpler_setup.kernel_compiler import KernelCompiler
-from simpler_setup.pto_isa import ensure_pto_isa_root
+from simpler_setup.elf_parser import extract_text_section  # noqa: E402
+from simpler_setup.kernel_compiler import KernelCompiler  # noqa: E402
+from simpler_setup.pto_isa import ensure_pto_isa_root  # noqa: E402
+from simpler_setup.torch_interop import make_tensor_arg  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 # Must match ALLREDUCE_COUNT in kernels/aiv/allreduce_kernel.cpp.
 ALLREDUCE_COUNT = 256
 DTYPE_NBYTES = 4  # float32
+BUFFER_NBYTES = ALLREDUCE_COUNT * DTYPE_NBYTES
+# Signal tail: one int32 slot per rank, bounded by kMaxSupportedRanks in
+# the kernel.  Signal area sits at the tail of the scratch buffer.
+SIGNAL_TAIL_NBYTES = 16 * 4
+SCRATCH_NBYTES = BUFFER_NBYTES + SIGNAL_TAIL_NBYTES
 
 
 def parse_device_range(spec: str) -> list[int]:
@@ -77,9 +90,9 @@ def parse_device_range(spec: str) -> list[int]:
 def build_chip_callable(platform: str) -> ChipCallable:
     """Compile the AIV allreduce kernel + its C++ orchestration shim.
 
-    The orchestration forwards 5 scalars (input_ptr, output_ptr, nranks, root,
-    device_ctx) as-is, so the signature slot list is empty and all args flow
-    through TaskArgs.add_scalar at submission time.
+    The orchestration forwards three Tensor args (input / output / scratch)
+    plus two scalars (nranks, CommContext pointer); the kernel reads
+    ``Tensor->buffer.addr + start_offset`` to reach the device pointer.
     """
     kc = KernelCompiler(platform=platform)
     runtime = "tensormap_and_ringbuffer"
@@ -96,25 +109,22 @@ def build_chip_callable(platform: str) -> ChipCallable:
         pto_isa_root=pto_isa_root,
         extra_include_dirs=kernel_include_dirs,
     )
-    # Hardware path: strip the ELF down to the .text section the loader wants.
     kernel_bytes = extract_text_section(kernel_bytes)
 
     orch_bytes = kc.compile_orchestration(
         runtime_name=runtime,
         source_path=os.path.join(HERE, "kernels/orchestration/allreduce_orch.cpp"),
     )
-    core_callable = CoreCallable.build(signature=[], binary=kernel_bytes)
+    core_callable = CoreCallable.build(
+        signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
+        binary=kernel_bytes,
+    )
     return ChipCallable.build(
-        signature=[],
+        signature=[ArgDirection.IN, ArgDirection.OUT, ArgDirection.INOUT],
         func_name="allreduce_orchestration",
         binary=orch_bytes,
         children=[(0, core_callable)],
     )
-
-
-def make_rank_input(rank: int) -> list[float]:
-    """Rank r contributes input[i] = i + r*100; matches PR #307's golden."""
-    return [float(i + rank * 100) for i in range(ALLREDUCE_COUNT)]
 
 
 def expected_output(nranks: int) -> list[float]:
@@ -122,15 +132,12 @@ def expected_output(nranks: int) -> list[float]:
     return [float(nranks * i + 100 * nranks * (nranks - 1) // 2) for i in range(ALLREDUCE_COUNT)]
 
 
-def pack_f32(values: list[float]) -> bytes:
-    return struct.pack(f"<{len(values)}f", *values)
-
-
 def run(device_ids: list[int]) -> int:
     """Core logic — callable from both CLI and pytest."""
     nranks = len(device_ids)
-    buffer_nbytes = ALLREDUCE_COUNT * DTYPE_NBYTES
-    window_size = 4 * 1024 * 1024  # HCCL may round up; actual size surfaces via ChipContext.
+    # HCCL may round up; only needs to hold SCRATCH_NBYTES.  A 4 KB floor
+    # keeps us clear of any HCCL minimum-window-size quirks.
+    window_size = max(SCRATCH_NBYTES, 4 * 1024)
 
     rootinfo_path = f"/tmp/pto_allreduce_distributed_rootinfo_{os.getpid()}.bin"
     try:
@@ -140,21 +147,22 @@ def run(device_ids: list[int]) -> int:
 
     print(f"[allreduce] devices={device_ids} nranks={nranks}")
 
-    # Per-rank input SharedMemory — parent writes the bytes, child reads via
-    # HostBufferStaging during bootstrap_context().  Parent unlinks right
-    # after worker.init() returns (child has already finished copy_to at that
-    # point).
-    input_shms: list[SharedMemory] = []
-    output_shms: list[SharedMemory] = []
-    for rank in range(nranks):
-        shm = SharedMemory(create=True, size=buffer_nbytes)
-        assert shm.buf is not None
-        shm.buf[:buffer_nbytes] = pack_f32(make_rank_input(rank))
-        input_shms.append(shm)
+    # --- Per-rank host tensors (input/output) via torch.share_memory_().
+    # share_memory_() moves the storage into an mmap region that forked
+    # children see at the same virtual address, so ``chip_args.add_tensor``
+    # with TensorArgType.INPUT / OUTPUT_EXISTING can hand the kernel a host
+    # pointer and the framework handles H2D/D2H transparently — no manual
+    # SharedMemory / HostBufferStaging plumbing.
+    host_inputs = [
+        torch.tensor([i + rank * 100 for i in range(ALLREDUCE_COUNT)], dtype=torch.float32).share_memory_()
+        for rank in range(nranks)
+    ]
+    host_outputs = [torch.zeros(ALLREDUCE_COUNT, dtype=torch.float32).share_memory_() for _ in range(nranks)]
 
-        out_shm = SharedMemory(create=True, size=buffer_nbytes)
-        output_shms.append(out_shm)
-
+    # --- Scratch bootstrap: one window buffer per chip.  The window only
+    # exists after HCCL comm_alloc_windows has run, so allocating scratch
+    # during bootstrap is the natural lifecycle — no TaskArgs equivalent
+    # covers it.  No host staging is needed for scratch.
     cfgs = [
         ChipBootstrapConfig(
             comm=ChipCommBootstrapConfig(
@@ -165,24 +173,12 @@ def run(device_ids: list[int]) -> int:
             ),
             buffers=[
                 ChipBufferSpec(
-                    name="input",
+                    name="scratch",
                     dtype="float32",
                     count=ALLREDUCE_COUNT,
-                    placement="window",
-                    nbytes=buffer_nbytes,
-                    load_from_host=True,
-                ),
-                ChipBufferSpec(
-                    name="output",
-                    dtype="float32",
-                    count=ALLREDUCE_COUNT,
-                    placement="window",
-                    nbytes=buffer_nbytes,
-                    store_to_host=True,
+                    nbytes=SCRATCH_NBYTES,
                 ),
             ],
-            host_inputs=[HostBufferStaging(name="input", shm_name=input_shms[rank].name, size=buffer_nbytes)],
-            host_outputs=[HostBufferStaging(name="output", shm_name=output_shms[rank].name, size=buffer_nbytes)],
         )
         for rank in range(nranks)
     ]
@@ -203,53 +199,48 @@ def run(device_ids: list[int]) -> int:
         print("[allreduce] init worker (forks chip children + bootstraps HCCL)...")
         worker.init()
 
-        # Child has copied input from shm into the window by now. Drop our
-        # copies so the shm segments don't outlive the run.
-        for shm in input_shms:
-            shm.close()
-            shm.unlink()
-        input_shms.clear()
-
         contexts: list[ChipContext] = worker.chip_contexts
         assert len(contexts) == nranks
         for i, ctx in enumerate(contexts):
             print(
                 f"[allreduce] chip {i}: device={ctx.device_id} rank={ctx.rank}/{ctx.nranks} "
                 f"window=[0x{ctx.local_window_base:x} +{ctx.actual_window_size}B] "
-                f"buffers={ {k: hex(v) for k, v in ctx.buffer_ptrs.items()} }"
+                f"scratch=0x{ctx.buffer_ptrs['scratch']:x}"
             )
 
         def orch_fn(orch, _args, cfg):
-            # One chip task per rank. All args pass as scalars because the
-            # kernel reinterpret_casts args[i] as raw device pointers — an
-            # approach the Tensor path would corrupt (it rewrites pointers
-            # into Tensor-struct addresses).
             for i, ctx in enumerate(contexts):
                 chip_args = TaskArgs()
-                chip_args.add_scalar(ctx.buffer_ptrs["input"])
-                chip_args.add_scalar(ctx.buffer_ptrs["output"])
+                chip_args.add_tensor(make_tensor_arg(host_inputs[i]), TensorArgType.INPUT)
+                chip_args.add_tensor(make_tensor_arg(host_outputs[i]), TensorArgType.OUTPUT_EXISTING)
+                # Scratch is a device pointer into the HCCL window — not a
+                # host tensor — so wrap it manually with child_memory=True
+                # to skip the runtime's H2D path.
+                chip_args.add_tensor(
+                    ContinuousTensor.make(
+                        data=ctx.buffer_ptrs["scratch"],
+                        shapes=(ALLREDUCE_COUNT,),
+                        dtype=DataType.FLOAT32,
+                        child_memory=True,
+                    ),
+                    TensorArgType.INOUT,
+                )
                 chip_args.add_scalar(ctx.nranks)
-                chip_args.add_scalar(0)  # root (symmetric allreduce ignores it)
                 chip_args.add_scalar(ctx.device_ctx)
                 orch.submit_next_level(chip_callable, chip_args, cfg, worker=i)
 
         print("[allreduce] running 2-chip allreduce DAG...")
         worker.run(orch_fn, args=None, config=ChipCallConfig())
 
-        # Child has flushed store_to_host buffers to SharedMemory by now.
-        expected = expected_output(nranks)
+        expected = torch.tensor(expected_output(nranks), dtype=torch.float32)
         ok = True
         for i in range(nranks):
-            out_shm = output_shms[i]
-            assert out_shm.buf is not None
-            got = list(struct.unpack(f"<{ALLREDUCE_COUNT}f", bytes(out_shm.buf[:buffer_nbytes])))
-
-            max_diff = max(abs(a - b) for a, b in zip(got, expected))
+            max_diff = float(torch.max(torch.abs(host_outputs[i] - expected)))
             print(f"[allreduce] chip {i}: max |out - expected| = {max_diff:.3e}")
             if max_diff > 1e-3:
                 ok = False
                 for j in range(min(4, ALLREDUCE_COUNT)):
-                    print(f"  output[{j}]={got[j]!r} expected={expected[j]!r}")
+                    print(f"  output[{j}]={float(host_outputs[i][j])!r} expected={float(expected[j])!r}")
 
         if not ok:
             print("[allreduce] golden check FAILED")
@@ -258,18 +249,6 @@ def run(device_ids: list[int]) -> int:
         return 0
     finally:
         worker.close()
-        for shm in input_shms:
-            try:
-                shm.close()
-                shm.unlink()
-            except FileNotFoundError:
-                pass
-        for shm in output_shms:
-            try:
-                shm.close()
-                shm.unlink()
-            except FileNotFoundError:
-                pass
         try:
             os.unlink(rootinfo_path)
         except FileNotFoundError:

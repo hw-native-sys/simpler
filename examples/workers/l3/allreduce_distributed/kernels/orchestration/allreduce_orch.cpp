@@ -9,20 +9,20 @@
  * -----------------------------------------------------------------------------------------------------------
  */
 /**
- * AllReduce orchestration — all-scalar args path.
+ * AllReduce orchestration — 4-phase kernel shim.
  *
- * The kernel reads raw uint64 values from args[] (device pointers into the
- * HCCL window + a few ints) and does its own CommRemotePtr math. Wrapping
- * the pointers as tensors would force the framework to rewrite them as
- * Tensor-struct pointers, breaking that math. So every arg goes through
- * add_scalar, and the orchestration forwards them 1:1.
+ * Three Tensor args (the kernel reads ``Tensor->buffer.addr`` + start_offset
+ * to get the real device pointer) plus two scalars:
  *
- * scalar layout (from Python orch_fn via ChipStorageTaskArgs):
- *   [0] input device pointer   (HCCL window, remote-addressable)
- *   [1] output device pointer  (HCCL window, local write)
- *   [2] nranks
- *   [3] root rank              (unused in symmetric allreduce, kept for ABI)
- *   [4] CommContext device pointer
+ *   tensor(0) input   INPUT           (plain device mem, staged in by bootstrap)
+ *   tensor(1) output  OUTPUT_EXISTING (plain device mem, flushed by bootstrap)
+ *   tensor(2) scratch INOUT           (HCCL window slot; cross-rank read/write)
+ *   scalar(0) nranks
+ *   scalar(1) CommContext device pointer
+ *
+ * INOUT on scratch expresses that the kernel both writes (stage-in, Phase 1)
+ * and reads (compute, Phase 3) it — the INOUT tag makes that visible to the
+ * scheduler without tripping INPUT's read-only contract.
  */
 
 #include <stdint.h>
@@ -35,17 +35,21 @@ __attribute__((visibility("default"))) PTO2OrchestrationConfig
 allreduce_orchestration_config(const ChipStorageTaskArgs &orch_args) {
     (void)orch_args;
     return PTO2OrchestrationConfig{
-        .expected_arg_count = 5,
+        .expected_arg_count = 5,  // 3 tensors + 2 scalars
     };
 }
 
 __attribute__((visibility("default"))) void allreduce_orchestration(const ChipStorageTaskArgs &orch_args) {
+    Tensor input = from_tensor_arg(orch_args.tensor(0));
+    Tensor output = from_tensor_arg(orch_args.tensor(1));
+    Tensor scratch = from_tensor_arg(orch_args.tensor(2));
+
     Arg params;
-    params.add_scalar(orch_args.scalar(0));
-    params.add_scalar(orch_args.scalar(1));
-    params.add_scalar(orch_args.scalar(2));
-    params.add_scalar(orch_args.scalar(3));
-    params.add_scalar(orch_args.scalar(4));
+    params.add_input(input);
+    params.add_output(output);
+    params.add_inout(scratch);
+    params.add_scalar(orch_args.scalar(0));  // nranks
+    params.add_scalar(orch_args.scalar(1));  // CommContext
     pto2_rt_submit_aiv_task(0, params);
 }
 

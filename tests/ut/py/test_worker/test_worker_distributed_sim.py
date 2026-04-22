@@ -14,10 +14,11 @@ Covers the two externally-visible guarantees:
   1. Happy path — `Worker(level=3, chip_bootstrap_configs=...)` populates
      `worker.chip_contexts` with one per chip, and `close()` leaves no
      residue behind in `/dev/shm`.
-  2. Error path — a bad `ChipBootstrapConfig` (placement="bogus") trips
-     ValueError inside `bootstrap_context`; the channel publishes ERROR,
-     the parent raises `RuntimeError`, and every forked child is reaped so
-     the test process has no dangling descendants.
+  2. Error path — a bad `ChipBootstrapConfig` (e.g. store_to_host without a
+     matching host_outputs entry) trips ValueError inside
+     `bootstrap_context`; the channel publishes ERROR, the parent raises
+     `RuntimeError`, and every forked child is reaped so the test process
+     has no dangling descendants.
 
 These tests drive the sim backend of `tensormap_and_ringbuffer`, so no
 Ascend NPU is required.  `/dev/shm` only exists on Linux; the sweep
@@ -87,7 +88,6 @@ def _make_configs(nranks: int, rootinfo_path: str, window_size: int = 4096):
                     name="x",
                     dtype="float32",
                     count=16,
-                    placement="window",
                     nbytes=64,
                 ),
             ],
@@ -159,7 +159,7 @@ class TestWorkerBootstrapHappyPath:
 
 
 class TestWorkerBootstrapErrorPath:
-    def test_invalid_placement_fails_init_and_cleans_up(self):
+    def test_bootstrap_value_error_fails_init_and_cleans_up(self):
         """A ValueError inside bootstrap_context → parent RuntimeError → clean teardown."""
         from simpler.task_interface import ChipBootstrapConfig, ChipBufferSpec, ChipCommBootstrapConfig
         from simpler.worker import Worker
@@ -169,22 +169,24 @@ class TestWorkerBootstrapErrorPath:
         rootinfo_path = f"/tmp/pto_worker_l6_sim_{os.getpid()}_err.bin"
         nranks = 2
 
-        # Rank 0 carries a bogus placement, which trips the `placement != 'window'`
-        # guard inside `bootstrap_context` *before* any communicator work —
-        # no peer rank is required to observe the failure.  Rank 1 uses a
-        # valid config; it will either observe ERROR on rank 0 via the
-        # shared sim segment or be reaped by the abort path before it
-        # completes bootstrap.
+        # Rank 0 declares a buffer with ``store_to_host=True`` but no matching
+        # ``HostBufferStaging`` in ``host_outputs`` — this trips the staging
+        # symmetry check inside ``bootstrap_context`` *before* any
+        # communicator work, so no peer rank is required to observe the
+        # failure.  Rank 1 uses a valid config; it will either observe ERROR
+        # on rank 0 via the shared sim segment or be reaped by the abort
+        # path before it completes bootstrap.
         bad = ChipBootstrapConfig(
             comm=ChipCommBootstrapConfig(rank=0, nranks=nranks, rootinfo_path=rootinfo_path, window_size=4096),
             buffers=[
-                ChipBufferSpec(name="x", dtype="float32", count=1, placement="bogus", nbytes=4),
+                ChipBufferSpec(name="x", dtype="float32", count=1, nbytes=4, store_to_host=True),
             ],
+            host_outputs=[],
         )
         good = ChipBootstrapConfig(
             comm=ChipCommBootstrapConfig(rank=1, nranks=nranks, rootinfo_path=rootinfo_path, window_size=4096),
             buffers=[
-                ChipBufferSpec(name="x", dtype="float32", count=1, placement="window", nbytes=4),
+                ChipBufferSpec(name="x", dtype="float32", count=1, nbytes=4),
             ],
         )
 

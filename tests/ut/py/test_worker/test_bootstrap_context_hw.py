@@ -76,7 +76,6 @@ def _bootstrap_rank_entry(  # noqa: PLR0913
                     name="x",
                     dtype="float32",
                     count=buffer_nbytes // 4,
-                    placement="window",
                     nbytes=buffer_nbytes,
                 )
             ],

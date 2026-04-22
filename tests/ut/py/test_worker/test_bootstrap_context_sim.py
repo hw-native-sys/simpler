@@ -215,7 +215,7 @@ def _run_two_rank(
 class TestBootstrapContextHappyPath:
     def test_two_rank_no_host_inputs(self):
         buffer_specs = [
-            {"name": "x", "dtype": "float32", "count": 16, "placement": "window", "nbytes": 64},
+            {"name": "x", "dtype": "float32", "count": 16, "nbytes": 64},
         ]
         results = _run_two_rank(
             window_size=4096,
@@ -253,7 +253,6 @@ class TestBootstrapContextHostStaging:
                     "name": "x",
                     "dtype": "float32",
                     "count": 16,
-                    "placement": "window",
                     "nbytes": nbytes,
                     "load_from_host": True,
                 },
@@ -270,7 +269,6 @@ class TestBootstrapContextHostStaging:
                     "name": "x",
                     "dtype": "float32",
                     "count": 16,
-                    "placement": "window",
                     "nbytes": nbytes,
                     "load_from_host": False,
                 },
@@ -435,7 +433,6 @@ class TestBootstrapContextStoreToHost:
                     "name": "y",
                     "dtype": "float32",
                     "count": 16,
-                    "placement": "window",
                     "nbytes": nbytes,
                     "store_to_host": True,
                 },
@@ -445,7 +442,6 @@ class TestBootstrapContextStoreToHost:
                     "name": "y",
                     "dtype": "float32",
                     "count": 16,
-                    "placement": "window",
                     "nbytes": nbytes,
                     "store_to_host": False,
                 },
@@ -526,7 +522,7 @@ class TestBootstrapContextChannel:
         channels_shm = {rank: SharedMemory(create=True, size=CHIP_BOOTSTRAP_MAILBOX_SIZE) for rank in range(2)}
         try:
             buffer_specs = [
-                {"name": "x", "dtype": "float32", "count": 16, "placement": "window", "nbytes": 64},
+                {"name": "x", "dtype": "float32", "count": 16, "nbytes": 64},
             ]
             channel_shm_names = {rank: shm.name for rank, shm in channels_shm.items()}
             results = _run_two_rank(
@@ -551,120 +547,6 @@ class TestBootstrapContextChannel:
             for shm in channels_shm.values():
                 shm.close()
                 shm.unlink()
-
-
-# ---------------------------------------------------------------------------
-# 4. Error path — invalid placement raises ValueError and writes ERROR.
-# ---------------------------------------------------------------------------
-
-
-def _error_rank_entry(
-    host_lib: str,
-    aicpu_path: str,
-    aicore_path: str,
-    sim_context_path: str,
-    channel_shm_name: str,
-    result_queue: mp.Queue,  # type: ignore[type-arg]
-) -> None:
-    result: dict[str, object] = {"raised": False, "state": None, "message": None}
-    try:
-        from simpler.task_interface import (
-            ChipBootstrapChannel,
-            ChipBootstrapConfig,
-            ChipBufferSpec,
-            ChipWorker,
-        )
-
-        worker = ChipWorker()
-        worker.init(host_lib, aicpu_path, aicore_path, sim_context_path)
-
-        shm = SharedMemory(name=channel_shm_name)
-        try:
-            channel = ChipBootstrapChannel(_shm_addr(shm), max_buffer_count=376)
-
-            # placement="bogus" + comm=None → ValueError on the placement
-            # check, before any communicator work runs.  Single-process is
-            # fine because we never reach comm_alloc_windows.
-            cfg = ChipBootstrapConfig(
-                comm=None,
-                buffers=[
-                    ChipBufferSpec(
-                        name="x",
-                        dtype="float32",
-                        count=1,
-                        placement="bogus",
-                        nbytes=4,
-                    )
-                ],
-            )
-            try:
-                worker.bootstrap_context(device_id=0, cfg=cfg, channel=channel)
-            except ValueError as e:
-                result["raised"] = True
-                result["exc_msg"] = str(e)
-
-            # Read back the channel state from the child's side too — the
-            # parent will also read it, but this catches "did the except-block
-            # actually run" bugs before we cross the process boundary.
-            result["state"] = int(channel.state)
-            result["message"] = channel.error_message
-        finally:
-            shm.close()
-            worker.shutdown_bootstrap()
-            worker.finalize()
-    except Exception:  # noqa: BLE001
-        result["error"] = traceback.format_exc()
-    finally:
-        result_queue.put(result)
-
-
-class TestBootstrapContextError:
-    def test_invalid_placement_publishes_error(self):
-        from _task_interface import (  # pyright: ignore[reportMissingImports]
-            CHIP_BOOTSTRAP_MAILBOX_SIZE,
-            ChipBootstrapChannel,
-            ChipBootstrapMailboxState,
-        )
-
-        bins = _sim_binaries()
-        host_lib = str(bins.host_path)
-        aicpu_path = str(bins.aicpu_path)
-        aicore_path = str(bins.aicore_path)
-        sim_context_path = str(bins.sim_context_path) if bins.sim_context_path else ""
-
-        shm = SharedMemory(create=True, size=CHIP_BOOTSTRAP_MAILBOX_SIZE)
-        # Zero-init the mailbox so state reads IDLE before the child writes.
-        # SharedMemory does not zero the region on attach in all libc variants
-        # — struct.pack_into is explicit and cheap.
-        buf = shm.buf
-        assert buf is not None
-        for off in range(0, CHIP_BOOTSTRAP_MAILBOX_SIZE, 8):
-            struct.pack_into("Q", buf, off, 0)
-        try:
-            ctx = mp.get_context("fork")
-            result_queue: mp.Queue = ctx.Queue()  # type: ignore[type-arg]
-            p = ctx.Process(
-                target=_error_rank_entry,
-                args=(host_lib, aicpu_path, aicore_path, sim_context_path, shm.name, result_queue),
-                daemon=False,
-            )
-            p.start()
-            r = result_queue.get(timeout=60)
-            p.join(timeout=30)
-
-            assert r.get("raised"), f"expected ValueError; got {r}"
-            assert "bogus" in str(r.get("exc_msg", "")), f"exc_msg missing 'bogus': {r.get('exc_msg')}"
-
-            # Parent-side channel read — verifies the mailbox ERROR state
-            # survived the fork and is visible in a fresh ChipBootstrapChannel.
-            channel = ChipBootstrapChannel(_shm_addr(shm), max_buffer_count=376)
-            assert channel.state == ChipBootstrapMailboxState.ERROR
-            assert channel.error_code == 1
-            assert "bogus" in channel.error_message
-            assert channel.error_message.startswith("ValueError: ")
-        finally:
-            shm.close()
-            shm.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -709,7 +591,6 @@ def _missing_output_staging_rank_entry(
                         name="y",
                         dtype="float32",
                         count=1,
-                        placement="window",
                         nbytes=4,
                         store_to_host=True,
                     )
