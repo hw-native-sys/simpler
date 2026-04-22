@@ -13,10 +13,7 @@
  * @brief AICPU performance data collection interface
  *
  * Provides performance profiling management interface for AICPU side.
- * Handles buffer initialization and per-record completion. In the memcpy-based
- * collection design, Host pre-allocates one PerfBuffer per core and one
- * PhaseBuffer per thread; AICPU writes directly into them until full, after
- * which further records are silently dropped.
+ * Handles buffer initialization, switching, and flushing.
  */
 
 #ifndef PLATFORM_AICPU_PERFORMANCE_COLLECTOR_AICPU_H_
@@ -45,10 +42,8 @@ void perf_aicpu_init_profiling(Runtime *runtime);
  * Complete a PerfRecord with AICPU-side metadata after AICore task completion
  *
  * Reads perf_buf->count, validates task_id match against the latest record,
- * and fills all AICPU-side fields. Returns -1 and silently drops the record
- * when the buffer is full (count >= PLATFORM_PROF_BUFFER_SIZE). Callers must
- * pre-extract fanout into a plain uint64_t array (platform layer cannot depend
- * on runtime linked-list types).
+ * and fills all AICPU-side fields. Callers must pre-extract fanout into a
+ * plain uint64_t array (platform layer cannot depend on runtime linked-list types).
  *
  * @param perf_buf              PerfBuffer pointer (from handshake perf_records_addr)
  * @param expected_reg_task_id  Register dispatch token (low 32 bits) to validate
@@ -64,6 +59,31 @@ int perf_aicpu_complete_record(
     PerfBuffer *perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
     uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
 );
+
+/**
+ * Switch performance buffer when current buffer is full
+ *
+ * Enqueues the full buffer to ReadyQueue, pops a new buffer from FreeQueue,
+ * and updates the handshake perf_records_addr. If FreeQueue is empty,
+ * overwrites the current buffer (lossy fallback).
+ *
+ * @param runtime Runtime instance pointer
+ * @param core_id Core ID
+ * @param thread_idx Thread index
+ */
+void perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx);
+
+/**
+ * Flush remaining performance data
+ *
+ * Marks non-empty buffers as ready and enqueues them for host collection.
+ *
+ * @param runtime Runtime instance pointer
+ * @param thread_idx Thread index
+ * @param cur_thread_cores Array of core IDs managed by this thread
+ * @param core_num Number of cores managed by this thread
+ */
+void perf_aicpu_flush_buffers(Runtime *runtime, int thread_idx, const int *cur_thread_cores, int core_num);
 
 /**
  * Update total task count in performance header
@@ -91,7 +111,7 @@ void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads);
  * Record a single scheduler phase
  *
  * Appends an AicpuPhaseRecord to the specified thread's buffer.
- * Silently drops records when the buffer is full.
+ * When the buffer is full, switches to a new buffer via FreeQueue.
  *
  * @param thread_idx Scheduler thread index
  * @param phase_id Phase identifier
@@ -160,5 +180,15 @@ void perf_aicpu_write_core_assignments(
     const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD], const int *core_counts, int num_threads,
     int total_cores
 );
+
+/**
+ * Flush remaining phase records for a thread
+ *
+ * Marks the current WRITING phase buffer as READY and enqueues it
+ * for host collection. Called at thread exit (analogous to perf_aicpu_flush_buffers).
+ *
+ * @param thread_idx Thread index (scheduler thread or orchestrator)
+ */
+void perf_aicpu_flush_phase_buffers(int thread_idx);
 
 #endif  // PLATFORM_AICPU_PERFORMANCE_COLLECTOR_AICPU_H_

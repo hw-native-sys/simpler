@@ -250,6 +250,17 @@ public:
     int export_swimlane_json(const std::string &output_path = "outputs");
 
     /**
+     * Poll and collect performance data from the memory manager's queue
+     *
+     * Runs on a dedicated collector thread. Pulls ready buffers from
+     * ProfMemoryManager, copies records to host vectors, and notifies
+     * the manager to free old device buffers.
+     *
+     * @param expected_tasks Expected total number of tasks
+     */
+    void poll_and_collect_performance_data(int expected_tasks);
+
+    /**
      * Cleanup all resources
      *
      * Frees all device memory, destroys streams, and resets state.

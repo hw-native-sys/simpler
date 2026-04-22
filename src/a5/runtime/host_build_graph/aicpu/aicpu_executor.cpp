@@ -101,6 +101,7 @@ struct AicpuExecutor {
 
     // ===== Performance profiling state =====
     uint64_t dispatch_timestamps_[RUNTIME_MAX_WORKER];  // Per-core AICPU dispatch timestamp
+    int core_dispatch_counts_[RUNTIME_MAX_WORKER];      // Per-core dispatch count for buffer switch
 
     // ===== Dump tensor state =====
     Runtime *runtime_{nullptr};  // Cached for dump_tensor access in try_dispatch_task
@@ -262,6 +263,11 @@ inline bool AicpuExecutor::try_dispatch_task(
 
     // Record the real AICPU dispatch point for this core.
     if (profiling_enabled) {
+        core_dispatch_counts_[core_id]++;
+        if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE - 1) {
+            perf_aicpu_switch_buffer(runtime_, core_id, thread_idx);
+            core_dispatch_counts_[core_id] = 0;
+        }
         dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
     }
 
@@ -327,6 +333,7 @@ int AicpuExecutor::init(Runtime *runtime) {
 
     for (int i = 0; i < RUNTIME_MAX_WORKER; i++) {
         dispatch_timestamps_[i] = 0;
+        core_dispatch_counts_[i] = 0;
     }
     if (runtime->enable_profiling) {
         perf_aicpu_init_profiling(runtime);
@@ -1052,6 +1059,11 @@ int AicpuExecutor::run(Runtime *runtime) {
     int rc = shutdown_aicore(runtime, thread_idx, cur_thread_cores);
     if (rc != 0) {
         return rc;
+    }
+
+    // Flush performance buffers for cores managed by this thread
+    if (runtime->enable_profiling) {
+        perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
 
 #if PTO2_PROFILING

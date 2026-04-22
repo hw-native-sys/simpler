@@ -407,6 +407,10 @@ int DeviceRunner::run(
             LOG_ERROR("init_performance_profiling failed: %d", rc);
             return rc;
         }
+        // Start memory management thread (needs device context)
+        perf_collector_.start_memory_manager([this](std::function<void()> fn) {
+            return create_thread(std::move(fn));
+        });
     }
 
     // Initialize tensor dump if enabled
@@ -452,6 +456,14 @@ int DeviceRunner::run(
         return rc;
     }
 
+    // Launch collector thread before synchronization
+    std::thread collector_thread;
+    if (runtime.enable_profiling) {
+        collector_thread = create_thread([this]() {
+            poll_and_collect_performance_data(0);  // auto-detect task count
+        });
+    }
+
     {
         std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
         // Synchronize streams
@@ -469,10 +481,16 @@ int DeviceRunner::run(
         }
     }
 
-    // After streams are synchronized, pull profiling data back in one batch
-    // (memcpy-based: two-step count-first copy per buffer).
+    // Signal execution complete and wait for collector to finish
     if (runtime.enable_profiling) {
-        perf_collector_.collect_all();
+        perf_collector_.signal_execution_complete();
+        if (collector_thread.joinable()) {
+            collector_thread.join();
+        }
+        perf_collector_.stop_memory_manager();
+        perf_collector_.drain_remaining_buffers();
+        perf_collector_.scan_remaining_perf_buffers();
+        perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
 
@@ -539,9 +557,12 @@ int DeviceRunner::finalize() {
     func_id_to_addr_.clear();
     binaries_loaded_ = false;
 
-    // Cleanup performance profiling (frees PerfSetupHeader + all per-core/per-thread buffers)
+    // Cleanup performance profiling (frees shared memory + all per-core/per-thread buffers)
     if (perf_collector_.is_initialized()) {
-        perf_collector_.finalize();
+        auto free_cb = [](void *dev_ptr) -> int {
+            return rtFree(dev_ptr);
+        };
+        perf_collector_.finalize(nullptr, free_cb);
     }
 
     // Cleanup tensor dump
@@ -714,6 +735,9 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
         return (rc == 0) ? ptr : nullptr;
     };
 
+    // A5 does not support halHostRegister — pass nullptr
+    PerfRegisterCallback register_cb = nullptr;
+
     auto free_cb = [](void *dev_ptr) -> int {
         return rtFree(dev_ptr);
     };
@@ -728,8 +752,12 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
     };
 
     return perf_collector_.initialize(
-        runtime, num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
+        runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
     );
+}
+
+void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
+    perf_collector_.poll_and_collect(expected_tasks);
 }
 
 int DeviceRunner::export_swimlane_json(const std::string &output_path) {

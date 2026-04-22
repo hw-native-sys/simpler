@@ -323,6 +323,8 @@ int DeviceRunner::run(
             LOG_ERROR("init_performance_profiling failed: %d", rc);
             return rc;
         }
+        // Start memory management thread (sim mode: plain std::thread)
+        perf_collector_.start_memory_manager();
     }
 
     // Initialize tensor dump if enabled
@@ -383,6 +385,14 @@ int DeviceRunner::run(
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
     set_enable_dump_tensor_func_(enable_dump_tensor);
 
+    // Launch collector thread before AICPU/AICore threads
+    std::thread collector_thread;
+    if (runtime.enable_profiling) {
+        collector_thread = std::thread([this]() {
+            poll_and_collect_performance_data(0);  // auto-detect task count
+        });
+    }
+
     // Launch AICPU threads (over-launch for affinity gate)
     constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
     LOG_INFO("Launching %d AICPU threads (logical=%d)", over_launch, launch_aicpu_num);
@@ -419,9 +429,16 @@ int DeviceRunner::run(
 
     LOG_INFO("All threads completed");
 
-    // Collect performance data and export
+    // Signal execution complete and collect remaining data
     if (runtime.enable_profiling) {
-        perf_collector_.collect_all();
+        perf_collector_.signal_execution_complete();
+        if (collector_thread.joinable()) {
+            collector_thread.join();
+        }
+        perf_collector_.stop_memory_manager();
+        perf_collector_.drain_remaining_buffers();
+        perf_collector_.scan_remaining_perf_buffers();
+        perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
 
@@ -490,7 +507,11 @@ int DeviceRunner::finalize() {
 
     // Cleanup performance profiling
     if (perf_collector_.is_initialized()) {
-        perf_collector_.finalize();
+        auto free_cb = [](void *dev_ptr) -> int {
+            free(dev_ptr);
+            return 0;
+        };
+        perf_collector_.finalize(nullptr, free_cb);
     }
 
     // Cleanup tensor dump
@@ -632,8 +653,8 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
 // =============================================================================
 
 int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, int device_id) {
-    // Simulation: "device" memory is just host memory, so use malloc/free and
-    // std::memcpy for the copy callbacks.
+    // Simulation: "device" memory is just host memory, so use malloc/free.
+    // No copy callbacks needed (dev_ptr == host_ptr).
     auto alloc_cb = [](size_t size) -> void * {
         return malloc(size);
     };
@@ -643,19 +664,12 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
         return 0;
     };
 
-    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
-        std::memcpy(dev_dst, host_src, size);
-        return 0;
-    };
+    // Sim mode: register_cb = nullptr, copy callbacks = nullptr (dev_ptr == host_ptr)
+    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, nullptr, free_cb, nullptr, nullptr);
+}
 
-    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
-        std::memcpy(host_dst, dev_src, size);
-        return 0;
-    };
-
-    return perf_collector_.initialize(
-        runtime, num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
-    );
+void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
+    perf_collector_.poll_and_collect(expected_tasks);
 }
 
 int DeviceRunner::export_swimlane_json(const std::string &output_path) {

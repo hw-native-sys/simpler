@@ -161,6 +161,13 @@ public:
     int export_swimlane_json(const std::string &output_path = "outputs");
 
     /**
+     * Poll and collect performance data from the memory manager's queue
+     *
+     * @param expected_tasks Expected total number of tasks
+     */
+    void poll_and_collect_performance_data(int expected_tasks);
+
+    /**
      * Cleanup all resources
      *
      * Use this for final cleanup when no more tests will run.

@@ -137,9 +137,10 @@ struct alignas(64) CoreExecState {
     uint8_t pad0_[2];                       // offset 38: alignment padding
 #if PTO2_PROFILING
     // --- Profiling fields (dispatch path, compile-time gated) ---
-    uint64_t running_dispatch_timestamp;  // offset 40: AICPU dispatch timestamp for running task
-    uint64_t pending_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for pending task
-    uint8_t pad1_[8];                     // offset 56: pad to 64 bytes
+    uint32_t dispatch_count;              // offset 40: dispatched task count (buffer mgmt)
+    uint32_t pad1_;                       // offset 44: alignment padding for timestamp
+    uint64_t running_dispatch_timestamp;  // offset 48: AICPU dispatch timestamp for running task
+    uint64_t pending_dispatch_timestamp;  // offset 56: AICPU dispatch timestamp for pending task
 #else
     // --- Cold fields (init/diagnostics only, never in hot path) ---
     int32_t worker_id;          // offset 40: index in runtime.workers[]
@@ -1222,6 +1223,15 @@ struct AicpuExecutor {
             // Mark core as running (was idle)
             tracker.change_core_state(core_offset);
         }
+#if PTO2_PROFILING
+        if (perf.profiling_enabled) {
+            if (core_exec_state.dispatch_count >= PLATFORM_PROF_BUFFER_SIZE) {
+                perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
+                core_exec_state.dispatch_count = 0;
+            }
+            core_exec_state.dispatch_count++;
+        }
+#endif
 
         write_reg(core_exec_state.reg_addr, RegId::DATA_MAIN_BASE, static_cast<uint64_t>(reg_task_id));
 
@@ -2614,6 +2624,13 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 return rc;
             }
         }
+    }
+
+    // Flush performance buffers for cores managed by this thread
+    if (runtime->enable_profiling) {
+        int32_t core_num = core_count_per_thread_[thread_idx];
+        perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
+        perf_aicpu_flush_phase_buffers(thread_idx);
     }
 
     DEV_INFO("Thread %d: Completed", thread_idx);
