@@ -371,9 +371,10 @@ TEST_P(ReadyQueueMPMCTest, NoDuplicateNoLoss) {
 INSTANTIATE_TEST_SUITE_P(
     MPMCVariants, ReadyQueueMPMCTest,
     ::testing::Values(
-        MPMCConfig{2, 2, 200},  // TwoProducersTwoConsumers
-        MPMCConfig{1, 4, 500},  // OneProducerNConsumers
-        MPMCConfig{4, 4, 1250}  // HighContentionStress
+        MPMCConfig{2, 2, 200},   // TwoProducersTwoConsumers
+        MPMCConfig{1, 4, 500},   // OneProducerNConsumers
+        MPMCConfig{4, 4, 1250},  // HighContentionStress
+        MPMCConfig{8, 8, 2000}   // EightProducersEightConsumers
     )
 );
 
@@ -443,4 +444,119 @@ TEST_F(LocalReadyBufferTest, NullBackingBuffer) {
     PTO2TaskSlotState item{};
     EXPECT_FALSE(buf.try_push(&item)) << "Push fails with null backing";
     EXPECT_EQ(buf.pop(), nullptr) << "Pop returns null with null backing";
+}
+
+// =============================================================================
+// High-contention stress tests
+// =============================================================================
+
+class ReadyQueueStressTest : public ::testing::Test {
+protected:
+    static constexpr uint64_t kCapacity = 512;
+    PTO2ReadyQueue queue;
+
+    void SetUp() override { ASSERT_TRUE(ready_queue_init(&queue, kCapacity)); }
+    void TearDown() override { ready_queue_destroy(&queue); }
+};
+
+TEST_F(ReadyQueueStressTest, RapidFillDrainCycles) {
+    constexpr int kCycles = 100;
+    constexpr int kItemsPerCycle = static_cast<int>(kCapacity / 2);
+
+    std::vector<PTO2TaskSlotState> items(kItemsPerCycle);
+    for (int i = 0; i < kItemsPerCycle; i++) {
+        items[i].fanin_count = i;
+    }
+
+    for (int cycle = 0; cycle < kCycles; cycle++) {
+        std::atomic<int> push_done{0};
+        std::atomic<int> popped{0};
+
+        auto producer = [&](int id) {
+            int per_thread = kItemsPerCycle / 4;
+            int base = id * per_thread;
+            for (int i = 0; i < per_thread; i++) {
+                while (!queue.push(&items[base + i])) {}
+            }
+            push_done.fetch_add(1, std::memory_order_release);
+        };
+
+        auto consumer = [&]() {
+            while (true) {
+                PTO2TaskSlotState *s = queue.pop();
+                if (s) {
+                    popped.fetch_add(1, std::memory_order_relaxed);
+                } else if (push_done.load(std::memory_order_acquire) == 4) {
+                    while ((s = queue.pop()) != nullptr) {
+                        popped.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    break;
+                }
+            }
+        };
+
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; i++)
+            threads.emplace_back(producer, i);
+        for (int i = 0; i < 4; i++)
+            threads.emplace_back(consumer);
+        for (auto &t : threads)
+            t.join();
+
+        ASSERT_EQ(popped.load(), kItemsPerCycle) << "Cycle " << cycle << ": lost items";
+    }
+}
+
+TEST_F(ReadyQueueStressTest, PopBatchUnderContention) {
+    constexpr int kBatchSize = 8;
+    constexpr int kBatches = 500;
+    constexpr int kProducers = 4;
+    constexpr int kTotalItems = kBatchSize * kBatches * kProducers;
+
+    std::vector<PTO2TaskSlotState> items(kTotalItems);
+    for (int i = 0; i < kTotalItems; i++)
+        items[i].fanin_count = i;
+
+    std::atomic<int> total_consumed{0};
+    std::atomic<int> producers_done{0};
+
+    auto producer = [&](int id) {
+        int base = id * kBatchSize * kBatches;
+        for (int b = 0; b < kBatches; b++) {
+            PTO2TaskSlotState *ptrs[kBatchSize];
+            for (int i = 0; i < kBatchSize; i++) {
+                ptrs[i] = &items[base + b * kBatchSize + i];
+            }
+            for (int i = 0; i < kBatchSize; i++) {
+                while (!queue.push(ptrs[i])) {}
+            }
+        }
+        producers_done.fetch_add(1, std::memory_order_release);
+    };
+
+    auto consumer = [&]() {
+        while (true) {
+            PTO2TaskSlotState *out[kBatchSize];
+            int n = queue.pop_batch(out, kBatchSize);
+            total_consumed.fetch_add(n, std::memory_order_relaxed);
+            if (n == 0 && producers_done.load(std::memory_order_acquire) == kProducers) {
+                while (true) {
+                    n = queue.pop_batch(out, kBatchSize);
+                    if (n == 0) break;
+                    total_consumed.fetch_add(n, std::memory_order_relaxed);
+                }
+                break;
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kProducers; i++)
+        threads.emplace_back(producer, i);
+    for (int i = 0; i < 4; i++)
+        threads.emplace_back(consumer);
+    for (auto &t : threads)
+        t.join();
+
+    EXPECT_EQ(total_consumed.load(), kTotalItems);
 }

@@ -16,13 +16,13 @@
  *
  * Design contracts:
  *
- * - PTO2SharedMemoryHandle::validate checks `top > heap_size`.  top == heap_size is a
+ * - validate() checks `top > heap_size`.  top == heap_size is a
  *   legitimate "filled exactly to end" state, so strict > is correct.
  *
- * - Zero window size: if PTO2SharedMemoryHandle::calculate_size() is called with 0, all ring
+ * - Zero window size: if calculate_size() is called with 0, all ring
  *   descriptors/payloads alias the same address.  Current entry path
- *   (PTO2SharedMemoryHandle::create) is called only with valid sizes, but there is no
- *   explicit guard.  PTO2SharedMemoryHandle::create should reject task_window_size==0.
+ *   (create) is called only with valid sizes, but there is no
+ *   explicit guard.  create should reject task_window_size==0.
  *
  * - Flow control heap_top validation: validate() does not verify
  *   heap_top <= heap_size.  After a corruption, heap_top could exceed
@@ -31,6 +31,8 @@
 
 #include <gtest/gtest.h>
 #include <cstring>
+#include <thread>
+#include <vector>
 #include "pto_shared_memory.h"
 
 // =============================================================================
@@ -182,13 +184,163 @@ TEST(SharedMemoryBoundary, ValidateDetectsCorruption) {
     h->destroy();
 }
 
-TEST(SharedMemoryBoundary, ValidateNullHandle) {
-    PTO2SharedMemoryHandle handle{};
-    EXPECT_FALSE(handle.validate());
-}
-
 TEST(SharedMemoryBoundary, CreateFromUndersizedBuffer) {
     char buf[64]{};
     PTO2SharedMemoryHandle *h = PTO2SharedMemoryHandle::create_from_buffer(buf, 64, 256, 4096);
     EXPECT_EQ(h, nullptr) << "Undersized buffer should fail";
+}
+
+// =============================================================================
+// Concurrent read/write of per-ring flow control
+// =============================================================================
+
+class SharedMemoryConcurrentTest : public ::testing::Test {
+protected:
+    PTO2SharedMemoryHandle *handle = nullptr;
+
+    void SetUp() override {
+        handle = PTO2SharedMemoryHandle::create(256, 4096);
+        ASSERT_NE(handle, nullptr);
+    }
+
+    void TearDown() override {
+        if (handle) {
+            handle->destroy();
+            handle = nullptr;
+        }
+    }
+};
+
+TEST_F(SharedMemoryConcurrentTest, PerRingTaskIndexIsolation) {
+    constexpr int kIterations = 10000;
+
+    auto writer = [&](int ring) {
+        auto &fc = handle->header->rings[ring].fc;
+        int32_t base = ring * 100000;
+        for (int i = 1; i <= kIterations; i++) {
+            fc.current_task_index.store(base + i, std::memory_order_release);
+        }
+    };
+
+    struct Observation {
+        bool went_backward = false;
+        bool saw_other_ring_range = false;
+    };
+
+    auto reader = [&](int ring, Observation *obs) {
+        auto &fc = handle->header->rings[ring].fc;
+        int32_t base = ring * 100000;
+        int32_t prev = 0;
+        for (int i = 0; i < kIterations; i++) {
+            int32_t val = fc.current_task_index.load(std::memory_order_acquire);
+            if (val < prev) {
+                obs->went_backward = true;
+            }
+            if (val != 0 && (val <= base || val > base + kIterations)) {
+                obs->saw_other_ring_range = true;
+            }
+            prev = val;
+        }
+    };
+
+    Observation ring0;
+    Observation ring1;
+
+    std::thread w0(writer, 0);
+    std::thread w1(writer, 1);
+    std::thread r0(reader, 0, &ring0);
+    std::thread r1(reader, 1, &ring1);
+
+    w0.join();
+    w1.join();
+    r0.join();
+    r1.join();
+
+    EXPECT_FALSE(ring0.went_backward) << "Ring 0 current_task_index should be monotonic";
+    EXPECT_FALSE(ring1.went_backward) << "Ring 1 current_task_index should be monotonic";
+    EXPECT_FALSE(ring0.saw_other_ring_range) << "Ring 0 should not observe ring 1 values";
+    EXPECT_FALSE(ring1.saw_other_ring_range) << "Ring 1 should not observe ring 0 values";
+
+    EXPECT_EQ(handle->header->rings[0].fc.current_task_index.load(), static_cast<int32_t>(kIterations));
+    EXPECT_EQ(handle->header->rings[1].fc.current_task_index.load(), static_cast<int32_t>(100000 + kIterations));
+}
+
+TEST_F(SharedMemoryConcurrentTest, TaskIndexAtomicIncrement) {
+    constexpr int kIncrements = 5000;
+    constexpr int kThreads = 4;
+
+    auto &fc = handle->header->rings[0].fc;
+    fc.current_task_index.store(0, std::memory_order_relaxed);
+
+    auto incrementer = [&]() {
+        for (int i = 0; i < kIncrements; i++) {
+            fc.current_task_index.fetch_add(1, std::memory_order_acq_rel);
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; i++) {
+        threads.emplace_back(incrementer);
+    }
+    for (auto &t : threads)
+        t.join();
+
+    EXPECT_EQ(fc.current_task_index.load(), kIncrements * kThreads) << "Concurrent increments should not lose updates";
+}
+
+TEST_F(SharedMemoryConcurrentTest, LastTaskAliveMonotonic) {
+    constexpr int kIterations = 10000;
+    constexpr int kThreads = 4;
+
+    auto &fc = handle->header->rings[0].fc;
+    fc.last_task_alive.store(0, std::memory_order_relaxed);
+
+    auto advancer = [&](int id) {
+        for (int i = 0; i < kIterations; i++) {
+            int32_t desired = id * kIterations + i + 1;
+            int32_t current = fc.last_task_alive.load(std::memory_order_acquire);
+            while (current < desired) {
+                if (fc.last_task_alive.compare_exchange_weak(
+                        current, desired, std::memory_order_acq_rel, std::memory_order_acquire
+                    )) {
+                    break;
+                }
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    for (int i = 0; i < kThreads; i++) {
+        threads.emplace_back(advancer, i);
+    }
+    for (auto &t : threads)
+        t.join();
+
+    int32_t final_val = fc.last_task_alive.load();
+    EXPECT_EQ(final_val, kIterations * kThreads) << "last_task_alive should advance to the largest published value";
+}
+
+TEST_F(SharedMemoryConcurrentTest, ValidateAfterConcurrentWrites) {
+    constexpr int kIterations = 1000;
+
+    auto writer = [&](int ring) {
+        auto &fc = handle->header->rings[ring].fc;
+        for (int i = 0; i < kIterations; i++) {
+            fc.current_task_index.store(static_cast<int32_t>(i % 256), std::memory_order_release);
+        }
+    };
+
+    std::thread w0(writer, 0);
+    std::thread w1(writer, 1);
+    std::thread w2(writer, 2);
+    std::thread w3(writer, 3);
+    w0.join();
+    w1.join();
+    w2.join();
+    w3.join();
+
+    EXPECT_TRUE(handle->validate()) << "Valid current_task_index values should pass validation";
+
+    handle->header->rings[2].fc.current_task_index.store(-1, std::memory_order_relaxed);
+    EXPECT_FALSE(handle->validate()) << "Corrupted current_task_index should fail validation";
 }

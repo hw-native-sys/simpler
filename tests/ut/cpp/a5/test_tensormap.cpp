@@ -65,6 +65,29 @@ static Tensor make_test_tensor_2d(uint64_t addr, uint32_t s0, uint32_t s1, int32
     return make_tensor_external(reinterpret_cast<void *>(addr), shapes, 2, DataType::FLOAT32, false, version);
 }
 
+static Tensor make_test_tensor_nd(
+    uint64_t addr, uint32_t ndims, const uint32_t shapes[], const uint32_t offsets[] = nullptr, int32_t version = 0
+) {
+    uint32_t seed_shape[1] = {1};
+    Tensor t = make_tensor_external(reinterpret_cast<void *>(addr), seed_shape, 1, DataType::FLOAT32, false, 0);
+    uint32_t s[RUNTIME_MAX_TENSOR_DIMS]{};
+    uint32_t rs[RUNTIME_MAX_TENSOR_DIMS]{};
+    uint32_t o[RUNTIME_MAX_TENSOR_DIMS]{};
+    bool all_zero = true;
+    for (uint32_t i = 0; i < ndims && i < RUNTIME_MAX_TENSOR_DIMS; i++) {
+        s[i] = shapes[i];
+        rs[i] = shapes[i];
+        o[i] = offsets ? offsets[i] : 0;
+        if (o[i] != 0) all_zero = false;
+    }
+    uint64_t total = 4;
+    for (uint32_t i = 0; i < ndims; i++) {
+        total *= (rs[i] + (offsets ? offsets[i] : 0));
+    }
+    t.init(reinterpret_cast<void *>(addr), total, rs, s, o, ndims, DataType::FLOAT32, version, all_zero, true);
+    return t;
+}
+
 // =============================================================================
 // Fixture
 // =============================================================================
@@ -548,4 +571,106 @@ TEST(TaskIdTest, LocalIdMaxValue) {
     auto tid = PTO2TaskId::make(0, UINT32_MAX);
     EXPECT_EQ(tid.ring(), 0);
     EXPECT_EQ(tid.local(), UINT32_MAX);
+}
+
+// =============================================================================
+// Edge cases merged from test_tensormap_overlap.cpp
+// =============================================================================
+
+TEST_F(TensorMapTest, ZeroDimensionTensor) {
+    // ndims=0: fast-path loop doesn't execute, contains=true -> COVERED
+    uint32_t seed_shape[1] = {1};
+    Tensor t = make_tensor_external(reinterpret_cast<void *>(0x2000), seed_shape, 1, DataType::FLOAT32, false, 0);
+    uint32_t s[RUNTIME_MAX_TENSOR_DIMS]{}, o[RUNTIME_MAX_TENSOR_DIMS]{};
+    t.init(reinterpret_cast<void *>(0x2000), 0, s, s, o, 0, DataType::FLOAT32, 0, true, true);
+
+    tmap.insert(t, PTO2TaskId::make(0, 0));
+
+    TestLookupResult result;
+    run_lookup(tmap, t, result);
+    ASSERT_EQ(result.count, 1);
+    EXPECT_EQ(result.entries[0].overlap_status, OverlapStatus::COVERED);
+}
+
+TEST_F(TensorMapTest, TwoZeroDimTensorsSameAddr) {
+    uint32_t seed_shape[1] = {1};
+    Tensor t1 = make_tensor_external(reinterpret_cast<void *>(0x2100), seed_shape, 1, DataType::FLOAT32, false, 0);
+    Tensor t2 = make_tensor_external(reinterpret_cast<void *>(0x2100), seed_shape, 1, DataType::FLOAT32, false, 0);
+    uint32_t s[RUNTIME_MAX_TENSOR_DIMS]{}, o[RUNTIME_MAX_TENSOR_DIMS]{};
+    t1.init(reinterpret_cast<void *>(0x2100), 0, s, s, o, 0, DataType::FLOAT32, 0, true, true);
+    t2.init(reinterpret_cast<void *>(0x2100), 0, s, s, o, 0, DataType::FLOAT32, 0, true, true);
+
+    tmap.insert(t1, PTO2TaskId::make(0, 0));
+    tmap.insert(t2, PTO2TaskId::make(0, 1));
+
+    TestLookupResult result;
+    run_lookup(tmap, t1, result);
+    EXPECT_EQ(result.count, 2);
+    for (int i = 0; i < result.count; i++) {
+        EXPECT_EQ(result.entries[i].overlap_status, OverlapStatus::COVERED)
+            << "0-dim tensors always report COVERED (empty loop -> contains=true)";
+    }
+}
+
+TEST_F(TensorMapTest, AdjacentNoOverlap) {
+    uint32_t prod_shapes[] = {100};
+    Tensor prod = make_test_tensor_nd(0x8000, 1, prod_shapes, nullptr, 0);
+    tmap.insert(prod, PTO2TaskId::make(0, 0));
+
+    uint32_t cons_shapes[] = {100};
+    uint32_t cons_offsets[] = {100};
+    Tensor cons = make_test_tensor_nd(0x8000, 1, cons_shapes, cons_offsets, 0);
+
+    TestLookupResult result;
+    run_lookup(tmap, cons, result);
+    EXPECT_EQ(result.count, 0) << "Adjacent regions [0,100) and [100,200) must not overlap";
+}
+
+TEST_F(TensorMapTest, OneElementOverlap) {
+    uint32_t prod_shapes[] = {100};
+    Tensor prod = make_test_tensor_nd(0x8100, 1, prod_shapes, nullptr, 0);
+    tmap.insert(prod, PTO2TaskId::make(0, 0));
+
+    uint32_t cons_shapes[] = {100};
+    uint32_t cons_offsets[] = {99};
+    Tensor cons = make_test_tensor_nd(0x8100, 1, cons_shapes, cons_offsets, 0);
+
+    TestLookupResult result;
+    run_lookup(tmap, cons, result);
+    ASSERT_EQ(result.count, 1);
+    EXPECT_EQ(result.entries[0].overlap_status, OverlapStatus::OTHER) << "Partial overlap (1 element) -> OTHER";
+}
+
+TEST_F(TensorMapTest, ZeroShapeInDimension) {
+    // Producer: 2D [10, 0] -- zero in dim 1
+    uint32_t prod_shapes[] = {10, 0};
+    Tensor prod = make_test_tensor_nd(0x8200, 2, prod_shapes, nullptr, 0);
+    tmap.insert(prod, PTO2TaskId::make(0, 0));
+
+    // Consumer: 2D [10, 20]
+    uint32_t cons_shapes[] = {10, 20};
+    Tensor cons = make_test_tensor_nd(0x8200, 2, cons_shapes, nullptr, 0);
+
+    TestLookupResult result;
+    run_lookup(tmap, cons, result);
+    ASSERT_EQ(result.count, 1);
+    // Fast path: input.shapes[1](20) >= entry.shapes[1](0) -> contains=true -> COVERED
+    EXPECT_EQ(result.entries[0].overlap_status, OverlapStatus::COVERED)
+        << "Zero-shape producer is COVERED by any consumer (empty production)";
+}
+
+TEST_F(TensorMapTest, FullFiveDimensionalOverlap) {
+    uint32_t prod_shapes[] = {2, 3, 4, 5, 6};
+    Tensor prod = make_test_tensor_nd(0x9200, 5, prod_shapes, nullptr, 0);
+    tmap.insert(prod, PTO2TaskId::make(0, 0));
+
+    // Consumer with larger shapes in all dims -> COVERED
+    uint32_t cons_shapes[] = {4, 6, 8, 10, 12};
+    Tensor cons = make_test_tensor_nd(0x9200, 5, cons_shapes, nullptr, 0);
+
+    TestLookupResult result;
+    run_lookup(tmap, cons, result);
+    ASSERT_EQ(result.count, 1);
+    EXPECT_EQ(result.entries[0].overlap_status, OverlapStatus::COVERED)
+        << "5D consumer covers 5D producer in all dimensions";
 }
