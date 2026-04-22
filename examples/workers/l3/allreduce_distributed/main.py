@@ -11,15 +11,18 @@
 
 The kernel (ported verbatim from #307) reads every rank's contribution out of
 the HCCL window via CommRemotePtr and sums them into each rank's own window
-slot.  This example exercises the full L1a..L6 stack:
+slot.  The distributed bring-up stack this exercises, bottom up:
 
-  L1a  HCCL backend                 comm_init / comm_alloc_windows
-  L1b  ChipWorker.comm_* wrappers   host-side bootstrap of the communicator
-  L2   ChipBootstrapChannel         chip child publishes SUCCESS to the parent
-  L3   mailbox atomics              parent/child sync without torn reads
-  L4   error propagation            bootstrap failures raise from Worker.init()
-  L5   ChipWorker.bootstrap_context one-shot per-chip bring-up
-  L6   Worker(chip_bootstrap_configs=[...])  Worker-level orchestration
+  - HCCL backend                        comm_init / comm_alloc_windows
+  - ChipWorker.comm_* wrappers          host-side bootstrap of the communicator
+  - ChipBootstrapChannel                chip child publishes SUCCESS to the parent
+  - mailbox atomics                     parent/child sync without torn reads
+  - error propagation                   bootstrap failures raise from Worker.init()
+  - ChipWorker.bootstrap_context        one-shot per-chip bring-up
+  - Worker(chip_bootstrap_configs=...)  Worker-level orchestration
+
+These are the components that compose the bring-up — not framework hierarchy
+levels (see docs/hierarchical_level_runtime.md for the L0–L6 topology).
 
 Hardware only.  The sim backend's CommRemotePtr uses a different addressing
 scheme; sim support is out of scope for this demo.

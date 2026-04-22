@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: PLC0415
-"""Hardware UT for ChipWorker.comm_* wrappers (Python surface of the L1a HCCL backend).
+"""Hardware UT for ChipWorker.comm_* wrappers (Python surface of the HCCL backend).
 
 This is the Python twin of tests/ut/cpp/test_hccl_comm.cpp.  It drives the
 full comm lifecycle entirely through ChipWorker's public Python API:
@@ -28,7 +28,7 @@ Each rank runs in a forked subprocess so HCCL sees a distinct device context
 per rank.  The parent only waits on exit codes plus a small result queue used
 to surface CommContext field values.
 
-Known issue inherited from L1a (HCCL 507018): on certain CANN builds
+Known issue inherited from the HCCL backend (HCCL 507018): on certain CANN builds
 `HcclBarrier` + `aclrtSynchronizeStream` report 507018 after ~52s of timeout.
 That is a CANN-coupling bug tracked separately; this test treats a barrier
 failure as a warning and still asserts the non-barrier invariants (init/alloc
@@ -143,10 +143,10 @@ def _rank_entry(
         result["rank_id"] = int(host_ctx.rankId)
         result["rank_num"] = int(host_ctx.rankNum)
 
-        # Barrier.  L1a observed CANN error 507018 here on some builds; that
-        # bug is tracked independently.  Surface the failure to the parent as
-        # a warning and continue with teardown so the non-barrier invariants
-        # above still gate this test.
+        # Barrier.  The C++ HCCL UT observed CANN error 507018 here on some
+        # builds; that bug is tracked independently.  Surface the failure to
+        # the parent as a warning and continue with teardown so the
+        # non-barrier invariants above still gate this test.
         try:
             worker.comm_barrier(comm)
             result["barrier_ok"] = True

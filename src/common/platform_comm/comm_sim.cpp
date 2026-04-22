@@ -19,7 +19,7 @@
  * Shared memory layout (page-aligned header + per-rank windows):
  *   [ SharedHeader (4096 bytes) ][ rank-0 window ][ rank-1 window ] ...
  *
- * L1a contract alignment notes:
+ * HCCL backend contract alignment notes:
  *   - comm_init takes (int rank, int nranks, void *stream, const char *rootinfo_path).
  *     The sim backend ignores `stream` (no ACL/device in simulation).
  *   - nranks is bounds-checked against COMM_MAX_RANK_NUM (64) because the

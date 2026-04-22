@@ -7,9 +7,9 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: PLC0415
-"""Hardware smoke test for ``ChipWorker.bootstrap_context`` (L5).
+"""Hardware smoke test for ``ChipWorker.bootstrap_context``.
 
-Drives the L5 one-shot bring-up against the real ``tensormap_and_ringbuffer``
+Drives the one-shot bring-up against the real ``tensormap_and_ringbuffer``
 runtime on 2 Ascend devices.  The critical assertions are:
 
   1. ``bootstrap_context`` returns a non-null ``device_ctx`` and
@@ -18,13 +18,13 @@ runtime on 2 Ascend devices.  The critical assertions are:
   3. A single ``ChipBufferSpec`` slices the window so
      ``buffer_ptrs[0] == local_window_base``.
 
-Deliberately **no** ``comm_barrier``.  The paired L1b UT
+Deliberately **no** ``comm_barrier``.  The paired ``comm_*`` UT
 (``test_platform_comm.py``) already shows the known HCCL 507018 path fails
 after ~52 s on some CANN builds; ``bootstrap_context`` does not issue a
 barrier, so this test completes on any build.  Cross-rank synchronization
 between the two ranks is already enforced inside
-``HcclCommInitRootInfo`` / the L1a root-info handshake that ``comm_init``
-performs, so the non-barrier invariants above are enough to prove the L5
+``HcclCommInitRootInfo`` / the root-info handshake that ``comm_init``
+performs, so the non-barrier invariants above are enough to prove the
 bring-up crossed both ranks.
 """
 
@@ -89,8 +89,9 @@ def _bootstrap_rank_entry(  # noqa: PLR0913
         result["actual_window_size"] = int(res.actual_window_size)
         result["buffer_ptrs"] = list(res.buffer_ptrs)
 
-        # Teardown mirrors the L6 ordering: shutdown_bootstrap (releases the
-        # HCCL comm handle) then finalize (releases ACL / unloads runtime).
+        # Teardown mirrors the Worker bootstrap loop ordering: shutdown_bootstrap
+        # (releases the HCCL comm handle) then finalize (releases ACL / unloads
+        # runtime).
         worker.shutdown_bootstrap()
         worker.finalize()
         result["ok"] = True
@@ -173,7 +174,7 @@ def test_two_rank_bootstrap_context(st_device_ids):
         assert r["actual_window_size"] >= window_size, (
             f"rank {rank}: actual_window_size={r['actual_window_size']} < requested {window_size}"
         )
-        # 1:1 buffer-to-spec invariant — the contract L6's ChipContext relies on.
+        # 1:1 buffer-to-spec invariant — the contract ChipContext relies on.
         assert r["buffer_ptrs"] == [r["local_window_base"]], (
             f"rank {rank}: buffer_ptrs={r['buffer_ptrs']} != [{r['local_window_base']}]"
         )

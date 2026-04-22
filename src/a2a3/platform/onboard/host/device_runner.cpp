@@ -313,13 +313,13 @@ int DeviceRunner::destroy_comm_stream(void *stream) {
     if (stream == nullptr) return 0;
 
     // Best-effort teardown.  HcclBarrier submits async work on the stream;
-    // if the caller never blocked for completion (or hit the L1a 507018
+    // if the caller never blocked for completion (or hit the HCCL 507018
     // barrier regression), aclrtDestroyStream will refuse with 507901
     // ("stream still has pending tasks").  We try to drain first, then
     // destroy anyway, and log failures without propagating them — leaking
     // a stream at teardown is strictly better than failing the teardown
     // itself, which would block device finalization.  This matches the
-    // cleanup behavior of the L1a C++ hardware UT.
+    // cleanup behavior of the HCCL C++ hardware UT.
     aclError sync_rc = aclrtSynchronizeStream(static_cast<aclrtStream>(stream));
     if (sync_rc != ACL_SUCCESS) {
         LOG_ERROR("aclrtSynchronizeStream during stream teardown failed: %d", static_cast<int>(sync_rc));

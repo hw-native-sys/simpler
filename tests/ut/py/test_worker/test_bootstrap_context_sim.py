@@ -7,7 +7,7 @@
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
 # ruff: noqa: PLC0415
-"""Simulation-backend tests for ``ChipWorker.bootstrap_context`` (L5).
+"""Simulation-backend tests for ``ChipWorker.bootstrap_context``.
 
 These tests run without any Ascend NPU.  They drive the sim backend of the
 ``tensormap_and_ringbuffer`` runtime, whose ``comm_*`` lifecycle is backed by
@@ -126,8 +126,9 @@ def _rank_entry(  # noqa: PLR0913
                 worker.copy_from(ctypes.addressof(host_buf), res.buffer_ptrs[0], readback_nbytes)
                 result["readback"] = bytes(host_buf)
 
-            # shutdown_bootstrap + finalize — matches the L6 teardown order
-            # and leaves the sim shm segment clean for the next test.
+            # shutdown_bootstrap + finalize — matches the Worker bootstrap
+            # loop's teardown order and leaves the sim shm segment clean for
+            # the next test.
             worker.shutdown_bootstrap()
             worker.finalize()
             result["ok"] = True
@@ -227,7 +228,7 @@ class TestBootstrapContextHappyPath:
             assert r is not None and r.get("ok"), f"rank {rank} failed: {r and r.get('error')}"
             assert r["local_window_base"] != 0, f"rank {rank} local_window_base is 0"
             assert r["actual_window_size"] >= 4096
-            # Single buffer at window base — the 1:1 contract L6 relies on.
+            # Single buffer at window base — the 1:1 contract ChipContext relies on.
             assert r["buffer_ptrs"] == [r["local_window_base"]]
 
 
