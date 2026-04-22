@@ -562,8 +562,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
     if (perf.profiling_enabled) {
-        int32_t *core_assignments = nullptr;  // Wired from AicpuExecutor in Phase 6
-        perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments, core_num);
+        perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
         perf_aicpu_flush_phase_buffers(thread_idx);
     }
 #endif

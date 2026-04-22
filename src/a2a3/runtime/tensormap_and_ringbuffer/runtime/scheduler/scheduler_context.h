@@ -85,6 +85,7 @@ public:
     bool orch_to_sched_{false};
     int32_t thread_num_{0};
     int32_t *core_count_per_thread_{nullptr};
+    int32_t (*core_assignments_)[MAX_CORES_PER_THREAD]{nullptr};
 
     // One-time init coordination
     std::atomic<bool> pto2_init_done_{false};
