@@ -29,6 +29,7 @@ import os
 import signal
 import subprocess
 import threading
+import time
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -54,12 +55,25 @@ class JobResult:
     label: str
     returncode: int
     device_ids: list[int]
+    output: str = ""  # Captured combined stdout+stderr
+    duration_s: float = 0.0
+
+
+@dataclass
+class _RunningJob:
+    """Per-subprocess book-keeping held while the job is in flight."""
+
+    job: Job
+    device_ids: list[int]
+    start_time: float
+    output_lines: list[str]
+    pump_thread: threading.Thread
 
 
 @dataclass
 class _RunState:
     free_devices: list[int]
-    running: dict[subprocess.Popen, tuple[Job, list[int]]] = field(default_factory=dict)
+    running: dict[subprocess.Popen, _RunningJob] = field(default_factory=dict)
     results: list[JobResult] = field(default_factory=list)
     failed: bool = False
     cancelled: bool = False
@@ -165,6 +179,19 @@ def run_jobs(
     state = _RunState(free_devices=list(device_ids))
     queue = list(jobs)
 
+    def _pump_stdout(p: subprocess.Popen, sink: list[str]) -> None:
+        """Drain ``p.stdout`` line-by-line into ``sink``.
+
+        Without a continuous reader the child would block once the OS pipe
+        buffer fills up (~64 KB on Linux / macOS) — typical for a verbose
+        pytest run. Runs on its own daemon thread per job so the pump
+        cannot contend with the scheduler loop's ``poll`` cadence.
+        """
+        assert p.stdout is not None
+        for line in iter(p.stdout.readline, ""):
+            sink.append(line)
+        p.stdout.close()
+
     def _try_launch_head() -> bool:
         """Launch queue[0] if it fits; return True if launched or queue empty/blocked."""
         if not queue:
@@ -179,11 +206,31 @@ def run_jobs(
         queue.pop(0)
         cmd = head.build_cmd(allocated)
         try:
-            p = subprocess.Popen(cmd, cwd=head.cwd, env=head.env)
+            # Capture both streams into a single pipe so the buffer we replay
+            # preserves natural interleaving. Without ``text=True`` readline()
+            # would return bytes and we'd have to decode ourselves.
+            p = subprocess.Popen(
+                cmd,
+                cwd=head.cwd,
+                env=head.env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,  # line-buffered; pump sees each line as it's written
+            )
         except Exception:
             _release_devices(state, allocated)
             raise
-        state.running[p] = (head, allocated)
+        output_lines: list[str] = []
+        pump = threading.Thread(target=_pump_stdout, args=(p, output_lines), daemon=True)
+        pump.start()
+        state.running[p] = _RunningJob(
+            job=head,
+            device_ids=allocated,
+            start_time=time.monotonic(),
+            output_lines=output_lines,
+            pump_thread=pump,
+        )
         return True
 
     def _reap_one() -> JobResult | None:
@@ -192,9 +239,19 @@ def run_jobs(
             rc = p.poll()
             if rc is None:
                 continue
-            job, ids = state.running.pop(p)
-            _release_devices(state, ids)
-            res = JobResult(label=job.label, returncode=rc, device_ids=ids)
+            rj = state.running.pop(p)
+            _release_devices(state, rj.device_ids)
+            # Wait for the pump to drain remaining buffer (EOF after the child
+            # exits). ``join`` is essentially instant at this point.
+            rj.pump_thread.join(timeout=2.0)
+            duration = time.monotonic() - rj.start_time
+            res = JobResult(
+                label=rj.job.label,
+                returncode=rc,
+                device_ids=rj.device_ids,
+                output="".join(rj.output_lines),
+                duration_s=duration,
+            )
             state.results.append(res)
             if rc != 0:
                 state.failed = True
@@ -241,9 +298,19 @@ def run_jobs(
                 rc = p.poll()
                 if rc is None:
                     rc = -signal.SIGTERM
-                job, ids = state.running.pop(p)
-                _release_devices(state, ids)
-                state.results.append(JobResult(label=job.label, returncode=rc, device_ids=ids))
+                rj = state.running.pop(p)
+                _release_devices(state, rj.device_ids)
+                rj.pump_thread.join(timeout=2.0)
+                duration = time.monotonic() - rj.start_time
+                state.results.append(
+                    JobResult(
+                        label=rj.job.label,
+                        returncode=rc,
+                        device_ids=rj.device_ids,
+                        output="".join(rj.output_lines),
+                        duration_s=duration,
+                    )
+                )
 
     return state.results
 

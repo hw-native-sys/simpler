@@ -73,6 +73,16 @@ reportRedeclaration = false
 [tool.pytest.ini_options]
 testpaths = ["tests", "examples"]
 addopts = "--import-mode=importlib"
+# Torch's CPU wheel (pytorch.org index) does not pull numpy, so ``import
+# torch`` in CI emits ``UserWarning: Failed to initialize NumPy: No
+# module named 'numpy'`` on every subprocess. Our code never calls
+# ``tensor.numpy()`` / ``torch.from_numpy()`` — we use pure-torch paths
+# (``torch.full``, ``tensor.share_memory_``) — so losing numpy interop
+# is harmless. Silence the warning here rather than pulling in a
+# ~30 MB dependency we don't use.
+filterwarnings = [
+    "ignore:Failed to initialize NumPy:UserWarning",
+]
 
 [tool.scikit-build]
 wheel.packages = ["simpler_setup", "python/simpler"]

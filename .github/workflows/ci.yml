@@ -147,7 +147,10 @@ jobs:
           pip install '.[test]'
 
       - name: Run Python unit tests
-        run: pytest tests -m "not requires_hardware" -v
+        # --clone-protocol https mirrors the ST jobs: GH-hosted runners have
+        # no SSH keys, so the default (ssh) would emit a 'Permission denied
+        # (publickey)' git stderr line before the lazy fallback kicks in.
+        run: pytest tests/ut -m "not requires_hardware" -v --clone-protocol https
 
       - name: Build and run C++ unit tests
         run: |

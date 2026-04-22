@@ -8,13 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Hardware ST for examples/workers/l3/multi_chip_dispatch."""
 
-import os
-from importlib.machinery import SourceFileLoader
-
 import pytest
 
-_main = SourceFileLoader("multi_chip_dispatch_main", os.path.join(os.path.dirname(__file__), "main.py")).load_module()
-run = _main.run
+from .main import run
 
 
 @pytest.mark.platforms(["a2a3sim", "a2a3", "a5sim", "a5"])

@@ -8,13 +8,9 @@
 # -----------------------------------------------------------------------------------------------------------
 """Hardware ST for examples/workers/l3/allreduce_distributed."""
 
-import os
-from importlib.machinery import SourceFileLoader
-
 import pytest
 
-_main = SourceFileLoader("allreduce_distributed_main", os.path.join(os.path.dirname(__file__), "main.py")).load_module()
-run = _main.run
+from .main import run
 
 
 @pytest.mark.requires_hardware
