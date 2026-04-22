@@ -50,6 +50,22 @@ void set_platform_regs(uint64_t regs);
  */
 uint64_t get_platform_regs();
 
+/**
+ * Set the per-core PMU MMIO register base address array.
+ * On hardware this is distinct from set_platform_regs (different HAL addr_type).
+ * On sim this stays 0 (PMU has no hardware model).
+ *
+ * @param pmu_regs  Pointer (as uint64_t) to per-core PMU register base address array, 0 if PMU unsupported
+ */
+void set_platform_pmu_reg_addrs(uint64_t pmu_regs);
+
+/**
+ * Get the per-core PMU MMIO register base address array.
+ *
+ * @return Pointer (as uint64_t) to per-core PMU register base address array, 0 if unset
+ */
+uint64_t get_platform_pmu_reg_addrs();
+
 #ifdef __cplusplus
 }
 #endif

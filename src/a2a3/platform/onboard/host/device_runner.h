@@ -44,6 +44,7 @@
 #include "host/memory_allocator.h"
 #include "host/performance_collector.h"
 #include "host/tensor_dump_collector.h"
+#include "host/pmu_collector.h"
 #include "runtime.h"
 
 /**
@@ -252,7 +253,8 @@ public:
      */
     int
     run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1, bool enable_dump_tensor = false);
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1, bool enable_dump_tensor = false,
+        int enable_pmu = 0);
 
     /**
      * Print handshake results from device
@@ -451,6 +453,8 @@ private:
 
     // Tensor dump (independent shared memory + memory manager)
     TensorDumpCollector dump_collector_;
+    // PMU collector (independent of profiling pipeline)
+    PmuCollectorHost pmu_collector_;
 
     /**
      * Ensure device is initialized (lazy initialization)
@@ -510,6 +514,23 @@ private:
      * @return 0 on success, error code on failure
      */
     int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
+
+    /**
+     * Initialize PMU streaming shared memory.
+     *
+     * Allocates PmuDataHeader + PmuBufferState array + pre-allocated PmuBuffers,
+     * registers them via halHostRegister, and stores the header address in
+     * kernel_args.pmu_data_base.
+     *
+     * @param num_cores  Number of AICore instances
+     * @param num_threads Number of AICPU scheduling threads
+     * @param csv_path   Output CSV file path
+     * @param event_type PMU event type (written to CSV rows)
+     * @param device_id  Device ID for host registration
+     * @return 0 on success, error code on failure
+     */
+    int
+    init_pmu_buffers(int num_cores, int num_threads, const std::string &csv_path, uint32_t event_type, int device_id);
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

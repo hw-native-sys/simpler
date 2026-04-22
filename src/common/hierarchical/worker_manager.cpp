@@ -170,10 +170,12 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     int32_t aicpu_tn = s.config.aicpu_thread_num;
     int32_t profiling = s.config.enable_profiling ? 1 : 0;
     int32_t dump_tensor = s.config.enable_dump_tensor ? 1 : 0;
+    int32_t enable_pmu = s.config.enable_pmu;
     std::memcpy(mbox() + MAILBOX_OFF_BLOCK_DIM, &block_dim, sizeof(int32_t));
     std::memcpy(mbox() + MAILBOX_OFF_AICPU_THREAD_NUM, &aicpu_tn, sizeof(int32_t));
     std::memcpy(mbox() + MAILBOX_OFF_ENABLE_PROFILING, &profiling, sizeof(int32_t));
     std::memcpy(mbox() + MAILBOX_OFF_ENABLE_DUMP_TENSOR, &dump_tensor, sizeof(int32_t));
+    std::memcpy(mbox() + MAILBOX_OFF_ENABLE_PMU, &enable_pmu, sizeof(int32_t));
 
     // Write length-prefixed TaskArgs blob: [T][S][tensors][scalars].
     size_t blob_bytes = TASK_ARGS_BLOB_HEADER_SIZE + static_cast<size_t>(view.tensor_count) * sizeof(ContinuousTensor) +

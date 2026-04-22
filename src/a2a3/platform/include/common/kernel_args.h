@@ -61,6 +61,8 @@ extern "C" {
  *   handshake buffers)
  * - dump_data_base: Written by host, read by AICPU platform layer; zero when
  *   tensor dump is unused
+ * - pmu_data_base: Written by host platform, read by AICPU platform layer;
+ *   zero when PMU is unused
  *
  * Field Access Patterns:
  *       - AICPU: receives KernelArgs* via DynTileFwkBackendKernelServer
@@ -73,6 +75,8 @@ struct KernelArgs {
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
     uint64_t ffts_base_addr{0};                             // FFTS base address for AICore
     uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
+    uint64_t pmu_data_base{0};   // PMU shared memory base address; use explicit flags to detect enablement
+    uint64_t pmu_reg_addrs{0};   // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
 };
 
 #ifdef __cplusplus

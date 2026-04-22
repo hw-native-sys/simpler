@@ -11,6 +11,7 @@
 
 #include "aicore/aicore.h"
 #include "aicore/performance_collector_aicore.h"
+#include "aicore/pmu_collector_aicore.h"
 #include "common/perf_profiling.h"
 #include "common/platform_config.h"  // Register-based communication
 #include "pto2_dispatch_payload.h"
@@ -87,6 +88,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     bool profiling_enabled = runtime->enable_profiling;
     bool dump_tensor_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    bool pmu_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_PMU);
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
@@ -118,8 +120,16 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // Performance profiling: record start time
             uint64_t start_time = get_sys_cnt_aicore();
 
+            if (pmu_enabled) {
+                pmu_aicore_begin();
+            }
+
             // Execute the task
             execute_task(payload);
+
+            if (pmu_enabled) {
+                pmu_aicore_end();
+            }
 
             if (dump_tensor_enabled) {
                 pipe_barrier(PIPE_ALL);

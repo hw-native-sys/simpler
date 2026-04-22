@@ -118,6 +118,16 @@ def pytest_addoption(parser):
         "--enable-profiling", action="store_true", default=False, help="Enable profiling (first round only)"
     )
     parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
+    parser.addoption(
+        "--enable-pmu",
+        nargs="?",
+        const=2,
+        default=0,
+        type=int,
+        metavar="EVENT_TYPE",
+        help="Enable PMU collection. Bare flag = PIPE_UTILIZATION(2). "
+        "Pass event type to override (e.g. --enable-pmu 4)",
+    )
     parser.addoption("--build", action="store_true", default=False, help="Compile runtime from source")
     parser.addoption(
         "--pto-isa-commit",

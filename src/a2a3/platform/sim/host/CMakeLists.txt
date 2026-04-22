@@ -44,6 +44,7 @@ list(APPEND HOST_RUNTIME_SOURCES
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_log_host.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/performance_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/tensor_dump_collector.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/pmu_collector.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../aicpu/platform_aicpu_affinity.cpp"
     "${CMAKE_CURRENT_SOURCE_DIR}/../../../../common/platform_comm/comm_sim.cpp"
 )

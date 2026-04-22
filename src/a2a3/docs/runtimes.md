@@ -54,6 +54,7 @@ See [tensormap_and_ringbuffer/docs/](../runtime/tensormap_and_ringbuffer/docs/):
 - [SUBMIT_BY_CLUSTER.md](../runtime/tensormap_and_ringbuffer/docs/SUBMIT_BY_CLUSTER.md) — Cluster submission design
 - [profiling_levels.md](../runtime/tensormap_and_ringbuffer/docs/profiling_levels.md) — Profiling levels
 - [device_log_profiling.md](../runtime/tensormap_and_ringbuffer/docs/device_log_profiling.md) — Device log profiling guide
+- [pmu-profiling.md](pmu-profiling.md) — a2a3 PMU design and LuoPan CSV usage
 
 ## Shared Components
 

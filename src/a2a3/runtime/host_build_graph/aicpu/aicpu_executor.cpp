@@ -18,6 +18,7 @@
 #include "aicpu/device_time.h"
 #include "aicpu/performance_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
+#include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "callable.h"
 #include "common/memory_barrier.h"
@@ -59,6 +60,12 @@ struct AicpuExecutor {
     CoreInfo aiv_cores_[MAX_CORES_PER_THREAD];
     int aic_count_{0};
     int aiv_count_{0};
+
+#if PTO2_PROFILING
+    // Logical core_id -> hardware physical core id, collected during handshake.
+    // Handed to pmu_aicpu_init() so the platform can resolve per-core PMU MMIO bases.
+    uint32_t physical_core_ids_[RUNTIME_MAX_WORKER];
+#endif
 
     // Fast lookup: core_id -> reg_addr
     uint64_t core_id_to_reg_addr_[MAX_CORES_PER_THREAD];
@@ -337,6 +344,10 @@ int AicpuExecutor::init(Runtime *runtime) {
     if (get_enable_dump_tensor()) {
         dump_tensor_init(thread_num_);
     }
+    if (get_enable_pmu()) {
+        pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+        LOG_INFO("PMU profiling started on %d cores", cores_total_num_);
+    }
 #endif
 
     init_done_.store(true, std::memory_order_release);
@@ -439,6 +450,10 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         }
 
         core_id_to_reg_addr_[i] = reg_addr;
+
+#if PTO2_PROFILING
+        physical_core_ids_[i] = physical_core_id;
+#endif
 
         LOG_INFO(
             "  Core %d: type=%s, physical_id=%u, reg_addr=0x%lx", i, core_type_to_string(type), physical_core_id,
@@ -772,6 +787,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                     );
 
+#if PTO2_PROFILING
+                    if (get_enable_pmu()) {
+                        pmu_aicpu_record_task(
+                            core_id, thread_idx, static_cast<uint64_t>(prev_running_id), prev_running_task->func_id,
+                            h->core_type
+                        );
+                    }
+#endif
+
                     LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
                 }
 
@@ -780,6 +804,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     task, runtime, thread_idx, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
                     cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                 );
+
+#if PTO2_PROFILING
+                if (get_enable_pmu()) {
+                    pmu_aicpu_record_task(
+                        core_id, thread_idx, static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type
+                    );
+                }
+#endif
 
                 made_progress = true;
 
@@ -835,6 +867,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         prev_running_task, runtime, thread_idx, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
                         cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                     );
+
+#if PTO2_PROFILING
+                    if (get_enable_pmu()) {
+                        pmu_aicpu_record_task(
+                            core_id, thread_idx, static_cast<uint64_t>(prev_running_id), prev_running_task->func_id,
+                            h->core_type
+                        );
+                    }
+#endif
 
                     LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
                 }
@@ -894,6 +935,14 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                 );
 
+#if PTO2_PROFILING
+                if (get_enable_pmu()) {
+                    pmu_aicpu_record_task(
+                        core_id, thread_idx, static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type
+                    );
+                }
+#endif
+
                 made_progress = true;
 
                 // Update timestamp if didn't dispatch (try_dispatch_task updates it if dispatched)
@@ -903,7 +952,13 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
             }
 
             // Case 4: Dispatch new task if pending slot is available
+            // With PTO2_DISABLE_DUAL_ISSUE=1, additionally require the running
+            // slot to be empty so each core has at most one outstanding task.
+#if PTO2_DISABLE_DUAL_ISSUE
+            if (pending_task_ids_[core_id] == AICPU_TASK_INVALID && running_task_ids_[core_id] == AICPU_TASK_INVALID) {
+#else
             if (pending_task_ids_[core_id] == AICPU_TASK_INVALID) {
+#endif
                 if (h->core_type == CoreType::AIC && cur_aic_ready_count > 0) {
                     if (try_dispatch_task(
                             core_id, reg_addr, CoreType::AIC, thread_idx, cur_ready_queue_aic, cur_aic_head,
@@ -1051,20 +1106,30 @@ int AicpuExecutor::run(Runtime *runtime) {
     int completed = resolve_and_dispatch(*runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
 
-    int rc = shutdown_aicore(runtime, thread_idx, cur_thread_cores);
-    if (rc != 0) {
-        return rc;
-    }
-
     // Flush performance buffers for cores managed by this thread
     if (runtime->enable_profiling) {
         perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
 #if PTO2_PROFILING
+    if (get_enable_pmu()) {
+        pmu_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
+    }
     if (get_enable_dump_tensor()) {
         dump_tensor_flush(thread_idx);
     }
 #endif
+
+#if PTO2_PROFILING
+    // Restore PMU CTRL registers for this thread's cores before AICore shutdown
+    if (get_enable_pmu()) {
+        pmu_aicpu_finalize(cur_thread_cores, thread_cores_num_[thread_idx]);
+    }
+#endif
+
+    int rc = shutdown_aicore(runtime, thread_idx, cur_thread_cores);
+    if (rc != 0) {
+        return rc;
+    }
 
     LOG_INFO("Thread %d: Completed", thread_idx);
 

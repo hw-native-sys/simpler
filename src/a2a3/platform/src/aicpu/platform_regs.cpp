@@ -31,10 +31,15 @@
 #include "common/platform_config.h"
 
 static uint64_t g_platform_regs = 0;
+static uint64_t g_platform_pmu_reg_addrs = 0;
 
 void set_platform_regs(uint64_t regs) { g_platform_regs = regs; }
 
 uint64_t get_platform_regs() { return g_platform_regs; }
+
+void set_platform_pmu_reg_addrs(uint64_t pmu_regs) { g_platform_pmu_reg_addrs = pmu_regs; }
+
+uint64_t get_platform_pmu_reg_addrs() { return g_platform_pmu_reg_addrs; }
 
 uint64_t read_reg(uint64_t reg_base_addr, RegId reg) {
     volatile uint32_t *ptr = reinterpret_cast<volatile uint32_t *>(reg_base_addr + reg_offset(reg));

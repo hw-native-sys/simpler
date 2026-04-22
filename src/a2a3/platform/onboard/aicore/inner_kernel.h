@@ -57,8 +57,34 @@ __aicore__ inline uint64_t read_reg(RegId reg) {
         __asm__ volatile("MOV %0, DATA_MAIN_BASE\n" : "=l"(val));
         return static_cast<uint64_t>(val);
     }
+    case RegId::CTRL:
+        return static_cast<uint64_t>(get_ctrl());
     case RegId::COND:
     case RegId::FAST_PATH_ENABLE:
+    // PMU MMIO registers are AICPU-only; AICore has no read path for them.
+    case RegId::PMU_CTRL_0:
+    case RegId::PMU_CNT0:
+    case RegId::PMU_CNT1:
+    case RegId::PMU_CNT2:
+    case RegId::PMU_CNT3:
+    case RegId::PMU_CNT4:
+    case RegId::PMU_CNT5:
+    case RegId::PMU_CNT6:
+    case RegId::PMU_CNT7:
+    case RegId::PMU_CNT_TOTAL0:
+    case RegId::PMU_CNT_TOTAL1:
+    case RegId::PMU_START_CYC0:
+    case RegId::PMU_START_CYC1:
+    case RegId::PMU_STOP_CYC0:
+    case RegId::PMU_STOP_CYC1:
+    case RegId::PMU_CNT0_IDX:
+    case RegId::PMU_CNT1_IDX:
+    case RegId::PMU_CNT2_IDX:
+    case RegId::PMU_CNT3_IDX:
+    case RegId::PMU_CNT4_IDX:
+    case RegId::PMU_CNT5_IDX:
+    case RegId::PMU_CNT6_IDX:
+    case RegId::PMU_CNT7_IDX:
         return 0;
     }
 }
@@ -74,8 +100,35 @@ __aicore__ inline void write_reg(RegId reg, uint64_t value) {
     case RegId::COND:
         set_cond(static_cast<uint32_t>(value));
         break;
+    case RegId::CTRL:
+        set_ctrl(value);
+        break;
     case RegId::DATA_MAIN_BASE:
     case RegId::FAST_PATH_ENABLE:
+    // PMU MMIO registers are AICPU-only; AICore has no write path for them.
+    case RegId::PMU_CTRL_0:
+    case RegId::PMU_CNT0:
+    case RegId::PMU_CNT1:
+    case RegId::PMU_CNT2:
+    case RegId::PMU_CNT3:
+    case RegId::PMU_CNT4:
+    case RegId::PMU_CNT5:
+    case RegId::PMU_CNT6:
+    case RegId::PMU_CNT7:
+    case RegId::PMU_CNT_TOTAL0:
+    case RegId::PMU_CNT_TOTAL1:
+    case RegId::PMU_START_CYC0:
+    case RegId::PMU_START_CYC1:
+    case RegId::PMU_STOP_CYC0:
+    case RegId::PMU_STOP_CYC1:
+    case RegId::PMU_CNT0_IDX:
+    case RegId::PMU_CNT1_IDX:
+    case RegId::PMU_CNT2_IDX:
+    case RegId::PMU_CNT3_IDX:
+    case RegId::PMU_CNT4_IDX:
+    case RegId::PMU_CNT5_IDX:
+    case RegId::PMU_CNT6_IDX:
+    case RegId::PMU_CNT7_IDX:
         break;
     }
 }

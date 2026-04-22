@@ -145,6 +145,7 @@ inline double cycles_to_us(uint64_t cycles) {
 // Profiling-related runtime flags shared through AICPU-AICore handshake.
 #define PROFILING_FLAG_NONE 0u
 #define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
+#define PROFILING_FLAG_PMU (1u << 1)
 #define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
 #define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
 #define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
@@ -196,6 +197,36 @@ constexpr int PLATFORM_DUMP_READYQUEUE_SIZE = PLATFORM_MAX_AICPU_THREADS * PLATF
 constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 
 // =============================================================================
+// PMU Profiling Configuration
+// =============================================================================
+
+/**
+ * Number of PmuRecord entries per PmuBuffer.
+ */
+constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 512;
+
+/**
+ * SPSC free_queue slot count for PMU buffers.
+ */
+constexpr int PLATFORM_PMU_SLOT_COUNT = 4;
+
+/**
+ * Pre-allocated PmuBuffer count per AICore.
+ */
+constexpr int PLATFORM_PMU_BUFFERS_PER_CORE = 4;
+
+/**
+ * Ready queue capacity for PMU data collection.
+ * Indexed by AICPU thread; each entry names the core and buffer pointer.
+ */
+constexpr int PLATFORM_PMU_READYQUEUE_SIZE = PLATFORM_MAX_CORES * PLATFORM_PMU_BUFFERS_PER_CORE;
+
+/**
+ * Idle timeout duration for PMU collection (seconds)
+ */
+constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
+
+// =============================================================================
 // Register Communication Configuration
 // =============================================================================
 
@@ -203,6 +234,7 @@ constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 constexpr uint32_t REG_SPR_DATA_MAIN_BASE_OFFSET = 0xA0;  // Task dispatch (AICPU→AICore)
 constexpr uint32_t REG_SPR_COND_OFFSET = 0x4C8;           // Status (AICore→AICPU): 0=IDLE, 1=BUSY
 constexpr uint32_t REG_SPR_FAST_PATH_ENABLE_OFFSET = 0x18;
+constexpr uint32_t REG_SPR_CTRL_OFFSET = 0x0;  // AICore internal CTRL SPR (bit0 = PMU enable)
 
 // Fast path control values
 constexpr uint32_t REG_SPR_FAST_PATH_OPEN = 0xE;
@@ -214,14 +246,92 @@ constexpr uint32_t AICORE_EXIT_SIGNAL = 0x7FFFFFF0;
 // Physical core ID mask for get_coreid()
 constexpr uint32_t AICORE_COREID_MASK = 0x0FFF;
 
+// PMU MMIO register offsets (DAV_2201 / a2a3). Accessed by AICPU through
+// the per-core register block. AICore does not touch these — it only toggles
+// its internal CTRL SPR (REG_SPR_CTRL_OFFSET) for per-task counter gating.
+constexpr uint32_t REG_MMIO_PMU_CTRL_0_OFFSET = 0x200;      // PMU framework enable (GLB_PMU_EN | USER | SAMPLE)
+constexpr uint32_t REG_MMIO_PMU_CNT0_OFFSET = 0x210;        // Event counter 0
+constexpr uint32_t REG_MMIO_PMU_CNT1_OFFSET = 0x218;        // Event counter 1
+constexpr uint32_t REG_MMIO_PMU_CNT2_OFFSET = 0x220;        // Event counter 2
+constexpr uint32_t REG_MMIO_PMU_CNT3_OFFSET = 0x228;        // Event counter 3
+constexpr uint32_t REG_MMIO_PMU_CNT4_OFFSET = 0x230;        // Event counter 4
+constexpr uint32_t REG_MMIO_PMU_CNT5_OFFSET = 0x238;        // Event counter 5
+constexpr uint32_t REG_MMIO_PMU_CNT6_OFFSET = 0x240;        // Event counter 6
+constexpr uint32_t REG_MMIO_PMU_CNT7_OFFSET = 0x248;        // Event counter 7
+constexpr uint32_t REG_MMIO_PMU_CNT_TOTAL0_OFFSET = 0x250;  // Total cycle counter, low 32 bits
+constexpr uint32_t REG_MMIO_PMU_CNT_TOTAL1_OFFSET = 0x254;  // Total cycle counter, high 32 bits
+constexpr uint32_t REG_MMIO_PMU_START_CYC0_OFFSET = 0x2A0;  // Counting-range start cycle, low 32 bits
+constexpr uint32_t REG_MMIO_PMU_START_CYC1_OFFSET = 0x2A4;  // Counting-range start cycle, high 32 bits
+constexpr uint32_t REG_MMIO_PMU_STOP_CYC0_OFFSET = 0x2A8;   // Counting-range stop cycle, low 32 bits
+constexpr uint32_t REG_MMIO_PMU_STOP_CYC1_OFFSET = 0x2AC;   // Counting-range stop cycle, high 32 bits
+constexpr uint32_t REG_MMIO_PMU_CNT0_IDX_OFFSET = 0x1280;   // Event selector for CNT0
+constexpr uint32_t REG_MMIO_PMU_CNT1_IDX_OFFSET = 0x1284;   // Event selector for CNT1
+constexpr uint32_t REG_MMIO_PMU_CNT2_IDX_OFFSET = 0x1288;   // Event selector for CNT2
+constexpr uint32_t REG_MMIO_PMU_CNT3_IDX_OFFSET = 0x128C;   // Event selector for CNT3
+constexpr uint32_t REG_MMIO_PMU_CNT4_IDX_OFFSET = 0x1290;   // Event selector for CNT4
+constexpr uint32_t REG_MMIO_PMU_CNT5_IDX_OFFSET = 0x1294;   // Event selector for CNT5
+constexpr uint32_t REG_MMIO_PMU_CNT6_IDX_OFFSET = 0x1298;   // Event selector for CNT6
+constexpr uint32_t REG_MMIO_PMU_CNT7_IDX_OFFSET = 0x129C;   // Event selector for CNT7
+
+// PMU_CTRL_0 enable value: GLB_PMU_EN | (USER_PMU_MODE_EN << 1) | (SAMPLE_PMU_MODE_EN << 2)
+constexpr uint32_t REG_MMIO_PMU_CTRL_0_ENABLE_VAL = 0x7;
+
 /**
- * Register identifier for unified read_reg/write_reg interface
+ * Register identifier for unified read_reg/write_reg interface.
+ *
+ * The PMU counter slots (PMU_CNT0..PMU_CNT7) and event selector slots
+ * (PMU_CNT0_IDX..PMU_CNT7_IDX) are assigned contiguous values so that
+ * reg_index(base, i) can index into them as arrays. Keep these runs
+ * contiguous — static_asserts below enforce this.
  */
 enum class RegId : uint8_t {
     DATA_MAIN_BASE = 0,    // Task dispatch (AICPU→AICore)
     COND = 1,              // Status (AICore→AICPU)
     FAST_PATH_ENABLE = 2,  // Fast path control
+    CTRL = 3,              // AICore internal CTRL SPR (PMU enable, etc.) — AICore-only
+
+    // PMU framework (AICPU-only; AICore does not access these)
+    PMU_CTRL_0 = 4,
+
+    // PMU counters (8 contiguous slots)
+    PMU_CNT0 = 5,
+    PMU_CNT1 = 6,
+    PMU_CNT2 = 7,
+    PMU_CNT3 = 8,
+    PMU_CNT4 = 9,
+    PMU_CNT5 = 10,
+    PMU_CNT6 = 11,
+    PMU_CNT7 = 12,
+
+    // PMU total cycle counter (64-bit split across two 32-bit regs)
+    PMU_CNT_TOTAL0 = 13,
+    PMU_CNT_TOTAL1 = 14,
+
+    // PMU counting-range start/stop cycle bounds
+    PMU_START_CYC0 = 15,
+    PMU_START_CYC1 = 16,
+    PMU_STOP_CYC0 = 17,
+    PMU_STOP_CYC1 = 18,
+
+    // PMU event selectors (8 contiguous slots, parallel to PMU_CNT0..CNT7)
+    PMU_CNT0_IDX = 19,
+    PMU_CNT1_IDX = 20,
+    PMU_CNT2_IDX = 21,
+    PMU_CNT3_IDX = 22,
+    PMU_CNT4_IDX = 23,
+    PMU_CNT5_IDX = 24,
+    PMU_CNT6_IDX = 25,
+    PMU_CNT7_IDX = 26,
 };
+
+static_assert(
+    static_cast<int>(RegId::PMU_CNT7) - static_cast<int>(RegId::PMU_CNT0) == 7,
+    "PMU_CNT0..PMU_CNT7 must be contiguous for reg_index()"
+);
+static_assert(
+    static_cast<int>(RegId::PMU_CNT7_IDX) - static_cast<int>(RegId::PMU_CNT0_IDX) == 7,
+    "PMU_CNT0_IDX..PMU_CNT7_IDX must be contiguous for reg_index()"
+);
 
 /**
  * Map RegId to hardware register offset
@@ -234,12 +344,71 @@ constexpr uint32_t reg_offset(RegId reg) {
         return REG_SPR_COND_OFFSET;
     case RegId::FAST_PATH_ENABLE:
         return REG_SPR_FAST_PATH_ENABLE_OFFSET;
+    case RegId::CTRL:
+        return REG_SPR_CTRL_OFFSET;
+    case RegId::PMU_CTRL_0:
+        return REG_MMIO_PMU_CTRL_0_OFFSET;
+    case RegId::PMU_CNT0:
+        return REG_MMIO_PMU_CNT0_OFFSET;
+    case RegId::PMU_CNT1:
+        return REG_MMIO_PMU_CNT1_OFFSET;
+    case RegId::PMU_CNT2:
+        return REG_MMIO_PMU_CNT2_OFFSET;
+    case RegId::PMU_CNT3:
+        return REG_MMIO_PMU_CNT3_OFFSET;
+    case RegId::PMU_CNT4:
+        return REG_MMIO_PMU_CNT4_OFFSET;
+    case RegId::PMU_CNT5:
+        return REG_MMIO_PMU_CNT5_OFFSET;
+    case RegId::PMU_CNT6:
+        return REG_MMIO_PMU_CNT6_OFFSET;
+    case RegId::PMU_CNT7:
+        return REG_MMIO_PMU_CNT7_OFFSET;
+    case RegId::PMU_CNT_TOTAL0:
+        return REG_MMIO_PMU_CNT_TOTAL0_OFFSET;
+    case RegId::PMU_CNT_TOTAL1:
+        return REG_MMIO_PMU_CNT_TOTAL1_OFFSET;
+    case RegId::PMU_START_CYC0:
+        return REG_MMIO_PMU_START_CYC0_OFFSET;
+    case RegId::PMU_START_CYC1:
+        return REG_MMIO_PMU_START_CYC1_OFFSET;
+    case RegId::PMU_STOP_CYC0:
+        return REG_MMIO_PMU_STOP_CYC0_OFFSET;
+    case RegId::PMU_STOP_CYC1:
+        return REG_MMIO_PMU_STOP_CYC1_OFFSET;
+    case RegId::PMU_CNT0_IDX:
+        return REG_MMIO_PMU_CNT0_IDX_OFFSET;
+    case RegId::PMU_CNT1_IDX:
+        return REG_MMIO_PMU_CNT1_IDX_OFFSET;
+    case RegId::PMU_CNT2_IDX:
+        return REG_MMIO_PMU_CNT2_IDX_OFFSET;
+    case RegId::PMU_CNT3_IDX:
+        return REG_MMIO_PMU_CNT3_IDX_OFFSET;
+    case RegId::PMU_CNT4_IDX:
+        return REG_MMIO_PMU_CNT4_IDX_OFFSET;
+    case RegId::PMU_CNT5_IDX:
+        return REG_MMIO_PMU_CNT5_IDX_OFFSET;
+    case RegId::PMU_CNT6_IDX:
+        return REG_MMIO_PMU_CNT6_IDX_OFFSET;
+    case RegId::PMU_CNT7_IDX:
+        return REG_MMIO_PMU_CNT7_IDX_OFFSET;
     }
     return 0;  // unreachable: all RegId cases handled above
 }
 
-// Size of simulated register block per core (covers largest offset + 4 bytes)
-constexpr uint32_t SIM_REG_BLOCK_SIZE = 0x500;
+/**
+ * Index into a contiguous RegId run (e.g. reg_index(PMU_CNT0, 3) == PMU_CNT3).
+ * Caller is responsible for keeping `i` within the run's length.
+ */
+constexpr RegId reg_index(RegId base, int i) { return static_cast<RegId>(static_cast<uint8_t>(base) + i); }
+
+// Size of simulated register block per core (covers largest offset + 4 bytes).
+// Bumped from 0x500 to 0x1400 to include DAV_2201 PMU registers:
+//   - CTRL_0 at 0x200, CNT/CNT_TOTAL at 0x210-0x254
+//   - START/STOP_CYC at 0x2A0-0x2AC
+//   - CNT_IDX at 0x1280-0x129C (highest offset + 4 = 0x12A0)
+// 0x1400 rounds up to a 64-byte boundary with headroom.
+constexpr uint32_t SIM_REG_BLOCK_SIZE = 0x1400;
 
 // =============================================================================
 // Hardware Configuration Constants

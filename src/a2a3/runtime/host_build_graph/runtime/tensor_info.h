@@ -18,14 +18,6 @@
 #include "data_type.h"
 #include "tensor_arg.h"
 
-// =============================================================================
-// Profiling Configuration
-// =============================================================================
-
-#ifndef PTO2_PROFILING
-#define PTO2_PROFILING 1
-#endif
-
 struct TensorInfo {
     DataType dtype;
     uint8_t ndims;

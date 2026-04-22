@@ -118,7 +118,7 @@ size_t size = get_runtime_size();
 run_runtime(ctx, runtime, callable, args, block_dim,
             aicpu_thread_num, device_id,
             aicpu_binary, aicpu_size, aicore_binary, aicore_size,
-            enable_profiling);
+            enable_profiling, enable_dump_tensor, enable_pmu);
 finalize_device(ctx);
 destroy_device_context(ctx);
 ```
@@ -135,6 +135,7 @@ worker.set_device(device_id)
 config = ChipCallConfig()
 config.block_dim = 24
 config.aicpu_thread_num = 3
+config.enable_pmu = 0
 worker.run(callable, args, config)
 worker.finalize()
 ```

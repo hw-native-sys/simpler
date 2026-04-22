@@ -83,6 +83,7 @@ static constexpr ptrdiff_t MAILBOX_OFF_BLOCK_DIM = 16;
 static constexpr ptrdiff_t MAILBOX_OFF_AICPU_THREAD_NUM = 20;
 static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_PROFILING = 24;
 static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_DUMP_TENSOR = 28;
+static constexpr ptrdiff_t MAILBOX_OFF_ENABLE_PMU = 32;
 static constexpr ptrdiff_t MAILBOX_OFF_ARGS = 64;
 static constexpr ptrdiff_t MAILBOX_OFF_ERROR_MSG =
     static_cast<ptrdiff_t>(MAILBOX_SIZE) - static_cast<ptrdiff_t>(MAILBOX_ERROR_MSG_SIZE);

@@ -51,6 +51,7 @@
 #include "host/memory_allocator.h"
 #include "host/performance_collector.h"
 #include "host/tensor_dump_collector.h"
+#include "host/pmu_collector.h"
 #include "runtime.h"
 
 /**
@@ -143,7 +144,8 @@ public:
      */
     int
     run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1, bool enable_dump_tensor = false);
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1, bool enable_dump_tensor = false,
+        int enable_pmu = 0);
 
     /**
      * Print handshake results
@@ -236,6 +238,9 @@ private:
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_enable_dump_tensor_func_)(bool){nullptr};
+    void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
+    void (*set_platform_pmu_reg_addrs_func_)(uint64_t){nullptr};
+    void (*set_enable_pmu_func_)(bool){nullptr};
     std::string aicpu_so_path_;
     std::string aicore_so_path_;
 
@@ -244,6 +249,8 @@ private:
 
     // Tensor dump (independent shared memory + memory manager)
     TensorDumpCollector dump_collector_;
+    // PMU collector (independent of profiling pipeline)
+    PmuCollectorHost pmu_collector_;
 
     // Private helper methods
     int ensure_device_initialized(
@@ -267,6 +274,9 @@ private:
     int init_performance_profiling(Runtime &runtime, int num_aicore, int device_id);
 
     int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
+
+    int
+    init_pmu_buffers(int num_cores, int num_threads, const std::string &csv_path, uint32_t event_type, int device_id);
 };
 
 #endif  // SRC_A2A3_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

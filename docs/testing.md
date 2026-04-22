@@ -78,6 +78,7 @@ Scene tests support advanced CLI options for benchmarking, profiling, and runtim
 pytest --platform a2a3sim                                        # default: 1 round + golden
 pytest --platform a2a3 --rounds 100 --skip-golden                # benchmark mode
 pytest --platform a2a3 --enable-profiling                        # profiling (first round)
+pytest --platform a2a3 --enable-pmu                              # PMU CSV (LuoPan)
 pytest --platform a2a3sim --build                                # compile runtime from source
 pytest --platform a2a3sim --log-level debug                        # verbose C++ logging
 ```
@@ -89,6 +90,7 @@ python test_xxx.py -p a2a3sim                                    # default: 1 ro
 python test_xxx.py -p a2a3 -d 0 --rounds 100 --skip-golden       # benchmark mode
 python test_xxx.py -p a2a3 --enable-profiling                    # profiling (first round)
 python test_xxx.py -p a2a3 --dump-tensor                         # dump per-task tensor I/O
+python test_xxx.py -p a2a3 --enable-pmu 4                        # PMU CSV (MEMORY)
 python test_xxx.py -p a2a3sim --build                            # compile runtime from source
 python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ logging
 ```
@@ -107,6 +109,7 @@ python test_xxx.py -p a2a3sim --log-level debug                  # verbose C++ l
 | `--skip-golden` | | false | Skip golden comparison (for benchmarking) |
 | `--enable-profiling` | | false | Enable profiling on first round only. Works under parallelism — each subprocess writes to its own `outputs/perf_*/` subdir, flattened back to `outputs/` on completion. |
 | `--dump-tensor` | | false | Dump per-task tensor I/O during runtime execution |
+| `--enable-pmu [EVENT_TYPE]` | | `0` | Enable a2a3 PMU CSV collection. Bare flag selects `PIPE_UTILIZATION` (`2`); pass an event type such as `4` for `MEMORY`. |
 | `--build` | | false | Compile runtime from source (not pre-built) |
 | `--exitfirst` | `-x` | false | Stop on first failing test (fail-fast, primarily for CI) |
 | `--log-level LEVEL` | | (none) | Set `PTO_LOG_LEVEL` env var (`error`/`warn`/`info`/`debug`) |
@@ -130,7 +133,7 @@ Worked examples:
 | `--rounds` | both | **(none)** | pytest-xdist already uses `-n` for worker count. Standalone originally had `-n` for `--rounds`, creating a letter-level collision whenever a user switched between pytest (`-n 8` = 8 workers) and standalone (`-n 8` = 8 rounds). Removed in [#574](https://github.com/hw-native-sys/simpler/pull/574); do not reintroduce. |
 | `--max-parallel` | both | **(none)** | `-j` would be the natural make-style short, but pytest reserves all lowercase single letters (`parser.addoption` rejects lowercase shorts). Standalone mirrors this to keep both CLIs identical — no short in either, always spell out `--max-parallel`. |
 | `--runtime` / `--level` | both | **(none)** | Internal child-mode markers; users rarely type them. No short keeps them distinctive. |
-| `--build`, `--skip-golden`, `--enable-profiling`, `--dump-tensor`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
+| `--build`, `--skip-golden`, `--enable-profiling`, `--dump-tensor`, `--enable-pmu`, `--manual`, `--case`, `--log-level` | both | **(none)** | Low-frequency; long form reads better in scripts and docs. Not worth reserving letters. |
 
 Practical guidance when adding a new CLI option:
 

@@ -36,6 +36,7 @@
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/perf_profiling.h"
@@ -391,6 +392,14 @@ struct AicpuExecutor {
     int32_t aiv_worker_ids_[MAX_CORES_PER_THREAD];
     int32_t aic_count_{0};
     int32_t aiv_count_{0};
+
+#if PTO2_PROFILING
+    // Logical core_id -> hardware physical core id, collected during handshake.
+    // Handed to pmu_aicpu_init() so the platform can resolve per-core PMU MMIO
+    // bases. Separate storage is required because CoreExecState's 64-byte
+    // cache-line budget has no room for physical_core_id when PTO2_PROFILING=1.
+    uint32_t physical_core_ids_[RUNTIME_MAX_WORKER];
+#endif
 
     // Platform register base address array (set via get_platform_regs())
     uint64_t regs_{0};
@@ -953,6 +962,15 @@ struct AicpuExecutor {
 #if PTO2_SCHED_PROFILING
             perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
 #endif
+        }
+#endif
+
+#if PTO2_PROFILING
+        if (get_enable_pmu()) {
+            pmu_aicpu_record_task(
+                core_id, thread_idx, slot_state.task->task_id.raw,
+                slot_state.task->kernel_id[static_cast<int32_t>(subslot)], hank[core_id].core_type
+            );
         }
 #endif
     }
@@ -1603,6 +1621,12 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         CoreType type = hank->core_type;
 
         core_exec_states_[i].reg_addr = reg_addr;
+
+#if PTO2_PROFILING
+        // Record physical_core_id for PMU init later (CoreExecState has no room
+        // for this field under PTO2_PROFILING).
+        physical_core_ids_[i] = physical_core_id;
+#endif
 #if !PTO2_PROFILING
         core_exec_states_[i].worker_id = i;
         core_exec_states_[i].physical_core_id = physical_core_id;
@@ -1932,6 +1956,14 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         }
 #endif
 
+#if PTO2_PROFILING
+        // Initialize PMU: program events, start counters, and pop initial buffers
+        if (get_enable_pmu()) {
+            pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+            DEV_INFO("PMU profiling started on %d cores", cores_total_num_);
+        }
+#endif
+
         DEV_INFO("Thread %d: one-time init done", thread_idx);
         pto2_init_complete_.store(true, std::memory_order_release);
     } else {
@@ -2069,7 +2101,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         // === Two-phase dispatch: idle then pending ===
         for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES && !entered_drain; si++) {
             PTO2ResourceShape shape = dispatch_order[si];
+#if PTO2_DISABLE_DUAL_ISSUE
+            for (auto phase : {CoreTracker::DispatchPhase::IDLE}) {
+#else
             for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
+#endif
                 dispatch_shape(
                     runtime, thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
                     made_progress, try_pushed
@@ -2175,8 +2211,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
         perf_aicpu_flush_phase_buffers(thread_idx);
     }
-#endif
-#if PTO2_PROFILING
+
+    if (get_enable_pmu()) {
+        pmu_aicpu_flush_buffers(thread_idx, core_assignments_[thread_idx], core_num);
+    }
+
     if (get_enable_dump_tensor()) {
         dump_tensor_flush(thread_idx);
     }
@@ -2632,6 +2671,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         const int32_t *shutdown_cores = core_assignments_[thread_idx];
         int32_t shutdown_count = core_count_per_thread_[thread_idx];
         if (shutdown_count > 0) {
+#if PTO2_PROFILING
+            // Restore PMU CTRL registers for this thread's cores before AICore shutdown
+            if (get_enable_pmu()) {
+                pmu_aicpu_finalize(shutdown_cores, shutdown_count);
+            }
+#endif
             auto rc = shutdown_aicore(runtime, thread_idx, shutdown_cores, shutdown_count);
             if (rc != 0) {
                 return rc;

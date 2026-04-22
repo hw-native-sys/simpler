@@ -27,7 +27,6 @@
 #include "device_runner.h"
 
 #include <stdlib.h>
-#include <sys/stat.h>
 
 #include <atomic>
 #include <cstdio>
@@ -47,6 +46,8 @@ typedef void (*aicore_execute_func_t)(
 typedef void (*set_platform_regs_func_t)(uint64_t regs);
 typedef void (*set_platform_dump_base_func_t)(uint64_t dump_data_base);
 typedef void (*set_enable_dump_tensor_func_t)(bool enable);
+typedef void (*set_platform_pmu_base_func_t)(uint64_t pmu_data_base);
+typedef void (*set_enable_pmu_func_t)(bool enable);
 
 namespace {
 
@@ -160,6 +161,26 @@ int DeviceRunner::ensure_binaries_loaded(
             return -1;
         }
 
+        set_platform_pmu_base_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_pmu_base"));
+        if (set_platform_pmu_base_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_pmu_base: %s", dlerror());
+            return -1;
+        }
+
+        set_platform_pmu_reg_addrs_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_pmu_reg_addrs"));
+        if (set_platform_pmu_reg_addrs_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_platform_pmu_reg_addrs: %s", dlerror());
+            return -1;
+        }
+
+        set_enable_pmu_func_ = reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_enable_pmu"));
+        if (set_enable_pmu_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_enable_pmu: %s", dlerror());
+            return -1;
+        }
+
         LOG_INFO("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
     }
 
@@ -224,8 +245,10 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
 
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor
+    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor, int enable_pmu
 ) {
+    bool pmu_enabled = enable_pmu > 0;
+    uint32_t pmu_event_type = resolve_pmu_event_type(enable_pmu);
     clear_cpu_sim_shared_storage();
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
@@ -290,6 +313,9 @@ int DeviceRunner::run(
     if (enable_dump_tensor) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     }
+    if (pmu_enabled) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -341,6 +367,15 @@ int DeviceRunner::run(
         dump_collector_.start_memory_manager();
     }
 
+    if (pmu_enabled) {
+        rc = init_pmu_buffers(num_aicore, launch_aicpu_num, make_pmu_csv_path(), pmu_event_type, device_id);
+        if (rc != 0) {
+            LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
+            kernel_args_.pmu_data_base = 0;
+            pmu_enabled = false;
+        }
+    }
+
     auto perf_cleanup = RAIIScopeGuard([this]() {
         bool was_initialized = perf_collector_.is_initialized();
         if (was_initialized) {
@@ -383,15 +418,20 @@ int DeviceRunner::run(
     LOG_INFO("Allocated simulated registers: %d cores x 0x%x bytes", num_aicore, SIM_REG_BLOCK_SIZE);
 
     // Check if executors are loaded
-    if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr) {
+    if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr || set_platform_regs_func_ == nullptr ||
+        set_platform_dump_base_func_ == nullptr || set_enable_dump_tensor_func_ == nullptr ||
+        set_platform_pmu_base_func_ == nullptr || set_platform_pmu_reg_addrs_func_ == nullptr ||
+        set_enable_pmu_func_ == nullptr) {
         LOG_ERROR("Executor functions not loaded. Call ensure_binaries_loaded first.");
         return -1;
     }
 
-    // Set platform regs in the AICPU .so before launching threads
     set_platform_regs_func_(kernel_args_.regs);
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
     set_enable_dump_tensor_func_(enable_dump_tensor);
+    set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
+    set_platform_pmu_reg_addrs_func_(kernel_args_.pmu_reg_addrs);  // 0 on sim (no PMU hardware)
+    set_enable_pmu_func_(pmu_enabled);
 
     // Launch AICPU threads (over-launch for affinity gate)
     constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
@@ -431,53 +471,49 @@ int DeviceRunner::run(
         });
     }
 
+    std::thread dump_collector_thread;
     if (enable_dump_tensor) {
-        // Poll and collect dump data in a separate collector thread
-        std::thread dump_collector_thread([this]() {
+        dump_collector_thread = std::thread([this]() {
             dump_collector_.poll_and_collect();
         });
+    }
 
-        // Wait for all threads to complete
-        LOG_INFO("Waiting for threads to complete");
-        for (auto &t : aicpu_threads) {
-            t.join();
-        }
-        for (auto &t : aicore_threads) {
-            t.join();
-        }
+    std::thread pmu_collector_thread;
+    if (pmu_enabled) {
+        pmu_collector_thread = std::thread([this]() {
+            pmu_collector_.poll_and_collect();
+        });
+    }
 
-        // Signal collector that device execution is complete
-        if (runtime.enable_profiling) {
-            perf_collector_.signal_execution_complete();
-        }
+    // Wait for all AICPU and AICore threads to complete
+    LOG_INFO("Waiting for threads to complete");
+    for (auto &t : aicpu_threads) {
+        t.join();
+    }
+    for (auto &t : aicore_threads) {
+        t.join();
+    }
+
+    // Signal all collectors that device execution is complete
+    if (runtime.enable_profiling) {
+        perf_collector_.signal_execution_complete();
+    }
+    if (enable_dump_tensor) {
         dump_collector_.signal_execution_complete();
+    }
+    if (pmu_enabled) {
+        pmu_collector_.signal_execution_complete();
+    }
 
-        // Wait for collector thread if it was launched
-        if (runtime.enable_profiling && collector_thread.joinable()) {
-            collector_thread.join();
-        }
-        if (dump_collector_thread.joinable()) {
-            dump_collector_thread.join();
-        }
-    } else {
-        // Wait for all threads to complete
-        LOG_INFO("Waiting for threads to complete");
-        for (auto &t : aicpu_threads) {
-            t.join();
-        }
-        for (auto &t : aicore_threads) {
-            t.join();
-        }
-
-        // Signal collector that device execution is complete
-        if (runtime.enable_profiling) {
-            perf_collector_.signal_execution_complete();
-        }
-
-        // Wait for collector thread if it was launched
-        if (runtime.enable_profiling && collector_thread.joinable()) {
-            collector_thread.join();
-        }
+    // Wait for all collector threads
+    if (collector_thread.joinable()) {
+        collector_thread.join();
+    }
+    if (dump_collector_thread.joinable()) {
+        dump_collector_thread.join();
+    }
+    if (pmu_collector_thread.joinable()) {
+        pmu_collector_thread.join();
     }
 
     LOG_INFO("All threads completed");
@@ -502,6 +538,10 @@ int DeviceRunner::run(
         dump_collector_.drain_remaining_buffers();
         dump_collector_.scan_remaining_dump_buffers();
         dump_collector_.export_dump_files();
+    }
+
+    if (pmu_enabled && pmu_collector_.is_initialized()) {
+        pmu_collector_.drain_remaining_buffers();
     }
 
     // Print handshake results at end of run
@@ -538,6 +578,9 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_regs_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;
         set_enable_dump_tensor_func_ = nullptr;
+        set_platform_pmu_base_func_ = nullptr;
+        set_platform_pmu_reg_addrs_func_ = nullptr;
+        set_enable_pmu_func_ = nullptr;
     }
     if (!aicpu_so_path_.empty()) {
         std::remove(aicpu_so_path_.c_str());
@@ -579,6 +622,16 @@ int DeviceRunner::finalize() {
         };
 
         dump_collector_.finalize(nullptr, free_cb, nullptr);
+    }
+
+    if (pmu_collector_.is_initialized()) {
+        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+            (void)user_data;
+            free(dev_ptr);
+            return 0;
+        };
+
+        pmu_collector_.finalize(nullptr, free_cb, nullptr);
     }
 
     // Kernel binaries should have been removed by validate_runtime_impl()
@@ -759,4 +812,24 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
 
     kernel_args_.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_shm_device_ptr());
     return 0;
+}
+
+int DeviceRunner::init_pmu_buffers(
+    int num_cores, int num_threads, const std::string &csv_path, uint32_t event_type, int /*device_id*/
+) {
+    auto alloc_cb = [](size_t size, void * /*user_data*/) -> void * {
+        return malloc(size);
+    };
+
+    auto free_cb = [](void *dev_ptr, void * /*user_data*/) -> int {
+        free(dev_ptr);
+        return 0;
+    };
+
+    // Simulation: no halHostRegister needed (dev == host)
+    int rc = pmu_collector_.init(
+        num_cores, num_threads, &kernel_args_.pmu_data_base, csv_path, event_type, alloc_cb, nullptr, free_cb, nullptr,
+        -1
+    );
+    return rc;
 }

@@ -22,6 +22,26 @@
 #include <dlfcn.h>
 #include <iostream>
 
+static int kind_to_addr_type(AicoreRegKind kind) {
+    switch (kind) {
+    case AicoreRegKind::Ctrl:
+        return ADDR_MAP_TYPE_REG_AIC_CTRL;
+    case AicoreRegKind::Pmu:
+        return ADDR_MAP_TYPE_REG_AIC_PMU_CTRL;
+    }
+    return ADDR_MAP_TYPE_REG_AIC_CTRL;
+}
+
+static const char *kind_to_name(AicoreRegKind kind) {
+    switch (kind) {
+    case AicoreRegKind::Ctrl:
+        return "AIC_CTRL";
+    case AicoreRegKind::Pmu:
+        return "AIC_PMU_CTRL";
+    }
+    return "UNKNOWN";
+}
+
 /**
  * Query valid AICore cores via HAL API
  */
@@ -52,7 +72,7 @@ static bool get_pg_mask(uint64_t &valid, int64_t device_id) {
 }
 
 /**
- * Retrieve AICore register base addresses via HAL API
+ * Retrieve AICore register base addresses via HAL API for one addr_type.
  */
 static int
 get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const int &addr_type, int64_t device_id) {
@@ -113,68 +133,71 @@ get_aicore_reg_info(std::vector<int64_t> &aic, std::vector<int64_t> &aiv, const 
     return 0;
 }
 
-static void get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id) {
-    std::vector<int64_t> aiv;
+/**
+ * Get one flat AIC-then-AIV address array for the requested register kind.
+ * Returns a negative code on HAL failure; does NOT generate placeholder
+ * addresses (callers must treat failure as fatal for that kind).
+ */
+static int get_aicore_regs(std::vector<int64_t> &regs, uint64_t device_id, AicoreRegKind kind) {
     std::vector<int64_t> aic;
+    std::vector<int64_t> aiv;
 
-    int rt = get_aicore_reg_info(aic, aiv, ADDR_MAP_TYPE_REG_AIC_CTRL, device_id);
-
-    if (rt != 0) {
-        LOG_ERROR("get_aicore_reg_info failed, using placeholder addresses");
-        // Fallback: generate placeholder addresses
-        for (uint32_t i = 0; i < DAV_2201::PLATFORM_MAX_PHYSICAL_CORES; i++) {
-            aic.push_back(0xDEADBEEF00000000ULL + (i * 0x800000));  // 8M stride
-            aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x100000);
-            aiv.push_back(0xDEADBEEF00000000ULL + (i * 0x800000) + 0x200000);
-        }
+    int rc = get_aicore_reg_info(aic, aiv, kind_to_addr_type(kind), device_id);
+    if (rc != 0) {
+        LOG_ERROR("get_aicore_regs(%s): halMemCtl failed: %d", kind_to_name(kind), rc);
+        return rc;
     }
 
     // AIC cores first, then AIV cores
     regs.insert(regs.end(), aic.begin(), aic.end());
     regs.insert(regs.end(), aiv.begin(), aiv.end());
 
-    LOG_INFO("get_aicore_regs: Retrieved %zu AIC and %zu AIV register addresses", aic.size(), aiv.size());
+    LOG_INFO(
+        "get_aicore_regs(%s): Retrieved %zu AIC and %zu AIV register addresses", kind_to_name(kind), aic.size(),
+        aiv.size()
+    );
+    return 0;
 }
 
-int init_aicore_register_addresses(uint64_t *runtime_regs_ptr, uint64_t device_id, MemoryAllocator &allocator) {
+int init_aicore_register_addresses(
+    uint64_t *runtime_regs_ptr, uint64_t device_id, MemoryAllocator &allocator, AicoreRegKind kind
+) {
     if (runtime_regs_ptr == nullptr) {
-        LOG_ERROR("init_aicore_register_addresses: Invalid parameters");
+        LOG_ERROR("init_aicore_register_addresses(%s): Invalid parameters", kind_to_name(kind));
         return -1;
     }
 
-    LOG_INFO("Retrieving and allocating AICore register addresses...");
+    LOG_INFO("Retrieving and allocating AICore %s register addresses...", kind_to_name(kind));
 
-    // Step 1: Get register addresses from HAL
     std::vector<int64_t> host_regs;
-    get_aicore_regs(host_regs, device_id);
-
+    int rc = get_aicore_regs(host_regs, device_id, kind);
+    if (rc != 0) {
+        return rc;
+    }
     if (host_regs.empty()) {
-        LOG_ERROR("Failed to get AICore register addresses");
+        LOG_ERROR("init_aicore_register_addresses(%s): Empty address array", kind_to_name(kind));
         return -1;
     }
 
-    // Step 2: Allocate device memory for register address array
     size_t regs_size = host_regs.size() * sizeof(int64_t);
     void *reg_ptr = allocator.alloc(regs_size);
     if (reg_ptr == nullptr) {
-        LOG_ERROR("Failed to allocate device memory for register addresses");
+        LOG_ERROR("Failed to allocate device memory for %s register addresses", kind_to_name(kind));
         return -1;
     }
 
-    // Step 3: Copy register addresses to device memory
     int ret = rtMemcpy(reg_ptr, regs_size, host_regs.data(), regs_size, RT_MEMCPY_HOST_TO_DEVICE);
     if (ret != 0) {
-        LOG_ERROR("Failed to copy register addresses to device (rc=%d)", ret);
+        LOG_ERROR("Failed to copy %s register addresses to device (rc=%d)", kind_to_name(kind), ret);
         allocator.free(reg_ptr);
         return -1;
     }
 
-    // Step 4: Store device pointer in output regs field
     *runtime_regs_ptr = reinterpret_cast<uint64_t>(reg_ptr);
 
     LOG_INFO(
-        "Successfully initialized register addresses: %zu addresses at device 0x%llx", host_regs.size(),
-        *runtime_regs_ptr
+        "Successfully initialized %s register addresses: %zu addresses at device 0x%llx", kind_to_name(kind),
+        host_regs.size(), *runtime_regs_ptr
     );
 
     return 0;

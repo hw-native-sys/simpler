@@ -36,6 +36,7 @@
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/perf_profiling.h"
@@ -189,6 +190,13 @@ struct AicpuExecutor {
     CoreInfo aiv_cores_[MAX_CORES_PER_THREAD];
     int32_t aic_count_{0};
     int32_t aiv_count_{0};
+
+#if PTO2_PROFILING
+    // Logical core_id -> hardware physical core id, collected during handshake.
+    // Handed to pmu_aicpu_init() so the platform can resolve per-core PMU MMIO
+    // bases.
+    uint32_t physical_core_ids_[RUNTIME_MAX_WORKER];
+#endif
 
     // Fast lookup: core_id -> reg_addr (for register-based dispatch)
     uint64_t core_id_to_reg_addr_[MAX_CORES_PER_THREAD];
@@ -397,6 +405,15 @@ struct AicpuExecutor {
 #if PTO2_SCHED_PROFILING
                     sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
 #endif
+                }
+#endif
+
+#if PTO2_PROFILING
+                if (get_enable_pmu()) {
+                    pmu_aicpu_record_task(
+                        core_id, thread_idx, slot_state.task->task_id.raw,
+                        slot_state.task->kernel_id[static_cast<int32_t>(subslot)], hank[core_id].core_type
+                    );
                 }
 #endif
 
@@ -650,6 +667,9 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         }
 
         core_id_to_reg_addr_[i] = reg_addr;
+#if PTO2_PROFILING
+        physical_core_ids_[i] = physical_core_id;
+#endif
     }
 
     if (handshake_failed) {
@@ -947,6 +967,14 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #if PTO2_PROFILING
         if (get_enable_dump_tensor()) {
             dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
+        }
+#endif
+
+#if PTO2_PROFILING
+        // Initialize PMU: program events, start counters, and pop initial buffers
+        if (get_enable_pmu()) {
+            pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+            DEV_INFO("PMU profiling started on %d cores", cores_total_num_);
         }
 #endif
 
@@ -1649,6 +1677,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
         perf_aicpu_flush_phase_buffers(thread_idx);
     }
+    if (get_enable_pmu()) {
+        pmu_aicpu_flush_buffers(thread_idx, core_assignments_[thread_idx], core_num);
+    }
 #endif
 #if PTO2_PROFILING
     if (get_enable_dump_tensor()) {
@@ -2035,6 +2066,12 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         }
 #endif
         if (shutdown_count > 0) {
+#if PTO2_PROFILING
+            // Restore PMU CTRL registers for this thread's cores before AICore shutdown
+            if (get_enable_pmu()) {
+                pmu_aicpu_finalize(shutdown_cores, shutdown_count);
+            }
+#endif
             auto rc = shutdown_aicore(runtime, thread_idx, shutdown_cores, shutdown_count);
             if (rc != 0) {
                 return rc;

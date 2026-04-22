@@ -11,7 +11,7 @@
 
 /**
  * ChipCallConfig — per-NEXT_LEVEL-task config (block_dim, aicpu_thread_num,
- * enable_profiling). Lives here (rather than chip_worker.h) so distributed
+ * enable_profiling, enable_dump_tensor, enable_pmu). Lives here (rather than chip_worker.h) so distributed
  * task slot state can store it directly without pulling in the full
  * ChipWorker header (which depends on types.h).
  */
@@ -23,4 +23,5 @@ struct ChipCallConfig {
     int aicpu_thread_num = 3;
     bool enable_profiling = false;
     bool enable_dump_tensor = false;
+    int enable_pmu = 0;  // 0 = disabled; >0 = enabled, value selects event type
 };

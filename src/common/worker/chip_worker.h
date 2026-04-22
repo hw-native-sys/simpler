@@ -99,7 +99,7 @@ private:
     using GetRuntimeSizeFn = size_t (*)();
     using RunRuntimeFn = int (*)(
         void *, void *, const void *, const void *, int, int, int, const uint8_t *, size_t, const uint8_t *, size_t,
-        int, int
+        int, int, int
     );
     using FinalizeDeviceFn = int (*)(void *);
     using EnsureAclReadyFn = int (*)(void *, int);

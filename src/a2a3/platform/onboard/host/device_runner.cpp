@@ -434,8 +434,10 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
 
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor
+    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor, int enable_pmu
 ) {
+    bool pmu_enabled = enable_pmu > 0;
+    uint32_t pmu_event_type = resolve_pmu_event_type(enable_pmu);
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
@@ -494,10 +496,25 @@ int DeviceRunner::run(
     runtime.sche_cpu_num = launch_aicpu_num;
 
     // Get AICore register addresses for register-based task dispatch
-    rc = init_aicore_register_addresses(&kernel_args_.args.regs, static_cast<uint64_t>(device_id), mem_alloc_);
+    rc = init_aicore_register_addresses(
+        &kernel_args_.args.regs, static_cast<uint64_t>(device_id), mem_alloc_, AicoreRegKind::Ctrl
+    );
     if (rc != 0) {
-        LOG_ERROR("init_aicore_register_addresses failed: %d", rc);
+        LOG_ERROR("init_aicore_register_addresses(Ctrl) failed: %d", rc);
         return rc;
+    }
+
+    // Get AICore PMU register addresses (distinct MMIO page from AIC_CTRL).
+    // Failure is non-fatal: PMU will be disabled if this query fails.
+    if (pmu_enabled) {
+        int pmu_rc = init_aicore_register_addresses(
+            &kernel_args_.args.pmu_reg_addrs, static_cast<uint64_t>(device_id), mem_alloc_, AicoreRegKind::Pmu
+        );
+        if (pmu_rc != 0) {
+            LOG_ERROR("init_aicore_register_addresses(Pmu) failed: %d, disabling PMU", pmu_rc);
+            kernel_args_.args.pmu_reg_addrs = 0;
+            pmu_enabled = false;
+        }
     }
 
     // Calculate number of AIC cores (1/3 of total)
@@ -505,6 +522,9 @@ int DeviceRunner::run(
     uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
     if (enable_dump_tensor) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    }
+    if (pmu_enabled) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
 
     for (int i = 0; i < num_aicore; i++) {
@@ -541,6 +561,13 @@ int DeviceRunner::run(
         }
     });
 
+    auto pmu_regs_cleanup = RAIIScopeGuard([this]() {
+        if (kernel_args_.args.pmu_reg_addrs != 0) {
+            mem_alloc_.free(reinterpret_cast<void *>(kernel_args_.args.pmu_reg_addrs));
+            kernel_args_.args.pmu_reg_addrs = 0;
+        }
+    });
+
     auto runtime_args_cleanup = RAIIScopeGuard([this]() {
         kernel_args_.finalize_device_kernel_args();
         kernel_args_.finalize_runtime_args();
@@ -567,6 +594,15 @@ int DeviceRunner::run(
             return rc;
         }
         dump_collector_.start_memory_manager();
+    }
+
+    if (pmu_enabled) {
+        rc = init_pmu_buffers(num_aicore, launch_aicpu_num, make_pmu_csv_path(), pmu_event_type, device_id);
+        if (rc != 0) {
+            LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
+            kernel_args_.args.pmu_data_base = 0;
+            pmu_enabled = false;
+        }
     }
 
     auto perf_cleanup = RAIIScopeGuard([this]() {
@@ -624,7 +660,6 @@ int DeviceRunner::run(
     }
 
     {
-        // Poll and collect performance data in a separate collector thread
         std::thread collector_thread;
         if (runtime.enable_profiling) {
             collector_thread = create_thread([this, &runtime]() {
@@ -632,7 +667,7 @@ int DeviceRunner::run(
             });
         }
         auto thread_guard = RAIIScopeGuard([&]() {
-            if (runtime.enable_profiling && collector_thread.joinable()) {
+            if (collector_thread.joinable()) {
                 collector_thread.join();
             }
         });
@@ -642,20 +677,39 @@ int DeviceRunner::run(
             }
         });
 
+        std::thread dump_collector_thread;
         if (enable_dump_tensor) {
-            // Poll and collect dump data in a separate collector thread
-            std::thread dump_collector_thread([this]() {
+            dump_collector_thread = std::thread([this]() {
                 dump_collector_.poll_and_collect();
             });
-            auto dump_thread_guard = RAIIScopeGuard([&]() {
-                if (dump_collector_thread.joinable()) {
-                    dump_collector_thread.join();
-                }
-            });
-            auto dump_signal_guard = RAIIScopeGuard([this]() {
+        }
+        auto dump_thread_guard = RAIIScopeGuard([&]() {
+            if (dump_collector_thread.joinable()) {
+                dump_collector_thread.join();
+            }
+        });
+        auto dump_signal_guard = RAIIScopeGuard([this, enable_dump_tensor]() {
+            if (enable_dump_tensor) {
                 dump_collector_.signal_execution_complete();
+            }
+        });
+
+        std::thread pmu_collector_thread;
+        if (pmu_enabled) {
+            pmu_collector_thread = std::thread([this]() {
+                pmu_collector_.poll_and_collect();
             });
         }
+        auto pmu_thread_guard = RAIIScopeGuard([&]() {
+            if (pmu_collector_thread.joinable()) {
+                pmu_collector_thread.join();
+            }
+        });
+        auto pmu_signal_guard = RAIIScopeGuard([this, pmu_enabled]() {
+            if (pmu_enabled) {
+                pmu_collector_.signal_execution_complete();
+            }
+        });
 
         std::cout << "\n=== rtStreamSynchronize stream_aicpu_===" << '\n';
         // Synchronize streams
@@ -687,6 +741,10 @@ int DeviceRunner::run(
         dump_collector_.drain_remaining_buffers();
         dump_collector_.scan_remaining_dump_buffers();
         dump_collector_.export_dump_files();
+    }
+
+    if (pmu_enabled && pmu_collector_.is_initialized()) {
+        pmu_collector_.drain_remaining_buffers();
     }
 
     // Print handshake results (reads from device memory, must be before free)
@@ -779,6 +837,24 @@ int DeviceRunner::finalize() {
         };
 
         dump_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
+    }
+
+    if (pmu_collector_.is_initialized()) {
+        auto unregister_cb = [](void *dev_ptr, int device_id, void *user_data) -> int {
+            (void)user_data;
+            HalHostUnregisterFn fn = get_halHostUnregister();
+            if (fn != nullptr) {
+                return fn(dev_ptr, device_id);
+            }
+            return 0;
+        };
+
+        auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+            auto *allocator = static_cast<MemoryAllocator *>(user_data);
+            return allocator->free(dev_ptr);
+        };
+
+        pmu_collector_.finalize(unregister_cb, free_cb, &mem_alloc_);
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
@@ -1025,4 +1101,38 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
 
     kernel_args_.args.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_shm_device_ptr());
     return 0;
+}
+
+int DeviceRunner::init_pmu_buffers(
+    int num_cores, int num_threads, const std::string &csv_path, uint32_t event_type, int device_id
+) {
+    auto alloc_cb = [](size_t size, void *user_data) -> void * {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->alloc(size);
+    };
+
+    auto register_cb = [](void *dev_ptr, size_t size, int device_id, void *user_data, void **host_ptr) -> int {
+        (void)user_data;
+        if (load_hal_if_needed() != 0) {
+            LOG_ERROR("Failed to load ascend_hal for PMU: %s", dlerror());
+            return -1;
+        }
+        HalHostRegisterFn fn = get_halHostRegister();
+        if (fn == nullptr) {
+            LOG_ERROR("halHostRegister symbol not found: %s", dlerror());
+            return -1;
+        }
+        return fn(dev_ptr, size, DEV_SVM_MAP_HOST, device_id, host_ptr);
+    };
+
+    auto free_cb = [](void *dev_ptr, void *user_data) -> int {
+        auto *allocator = static_cast<MemoryAllocator *>(user_data);
+        return allocator->free(dev_ptr);
+    };
+
+    int rc = pmu_collector_.init(
+        num_cores, num_threads, &kernel_args_.args.pmu_data_base, csv_path, event_type, alloc_cb, register_cb, free_cb,
+        &mem_alloc_, device_id
+    );
+    return rc;
 }

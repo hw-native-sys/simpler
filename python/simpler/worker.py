@@ -87,6 +87,7 @@ _OFF_BLOCK_DIM = 16
 _OFF_AICPU_THREAD_NUM = 20
 _OFF_ENABLE_PROFILING = 24
 _OFF_ENABLE_DUMP_TENSOR = 28
+_OFF_ENABLE_PMU = 32
 _OFF_ARGS = 64
 # MAILBOX_OFF_ERROR_MSG / MAILBOX_ERROR_MSG_SIZE come from the C++
 # nanobind module so the two sides cannot drift.
@@ -265,11 +266,21 @@ def _chip_process_loop(
             block_dim = struct.unpack_from("i", buf, _OFF_BLOCK_DIM)[0]
             aicpu_tn = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
             profiling = struct.unpack_from("i", buf, _OFF_ENABLE_PROFILING)[0]
+            dump_tensor = struct.unpack_from("i", buf, _OFF_ENABLE_DUMP_TENSOR)[0]
+            enable_pmu = struct.unpack_from("i", buf, _OFF_ENABLE_PMU)[0]
 
             code = 0
             msg = ""
             try:
-                cw.run_from_blob(callable_ptr, args_ptr, block_dim, aicpu_tn, bool(profiling))
+                cw.run_from_blob(
+                    callable_ptr,
+                    args_ptr,
+                    block_dim,
+                    aicpu_tn,
+                    bool(profiling),
+                    bool(dump_tensor),
+                    enable_pmu,
+                )
             except Exception as e:  # noqa: BLE001
                 code = 1
                 msg = _format_exc(f"chip_process dev={device_id}", e)
@@ -314,6 +325,7 @@ def _read_config_from_mailbox(buf: memoryview) -> "ChipCallConfig":
     cfg.aicpu_thread_num = struct.unpack_from("i", buf, _OFF_AICPU_THREAD_NUM)[0]
     cfg.enable_profiling = bool(struct.unpack_from("i", buf, _OFF_ENABLE_PROFILING)[0])
     cfg.enable_dump_tensor = bool(struct.unpack_from("i", buf, _OFF_ENABLE_DUMP_TENSOR)[0])
+    cfg.enable_pmu = struct.unpack_from("i", buf, _OFF_ENABLE_PMU)[0]
     return cfg
 
 

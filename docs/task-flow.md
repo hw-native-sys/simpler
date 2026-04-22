@@ -29,7 +29,7 @@ Every task flowing through any level carries exactly three pieces of data:
 | ------ | ---- | ---------- |
 | `Callable` | `uint64_t` (opaque) | What the target worker should execute — interpretation depends on the receiving `IWorker` subclass |
 | `TaskArgs` | user builder class | Tensors + scalars + per-tensor tags (IN/OUT/INOUT/etc.) |
-| `CallConfig` | small POD | Execution knobs (block_dim, aicpu_thread_num, enable_profiling, …) |
+| `CallConfig` | small POD | Execution knobs (block_dim, aicpu_thread_num, profiling/dump/PMU flags, …) |
 
 Everything else in the engine is either plumbing (slots, ring, tensormap,
 scheduler) or per-kernel state (stored in `Callable`).
@@ -186,7 +186,9 @@ struct CallConfig {
     int32_t block_dim = 1;
     int32_t aicpu_thread_num = 3;
     bool    enable_profiling = false;
-    // future fields here — same POD used at all levels
+    bool    enable_dump_tensor = false;
+    int32_t enable_pmu = 0;
+    // future fields here - same POD used at all levels
 };
 ```
 
