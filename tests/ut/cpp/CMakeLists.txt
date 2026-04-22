@@ -75,6 +75,49 @@ if(NOT GTEST_LIB OR NOT GTEST_MAIN_LIB)
 endif()
 
 # ---------------------------------------------------------------------------
+# PTO2 runtime sources and stubs for a2a3 ring-buffer / tensormap tests
+# ---------------------------------------------------------------------------
+set(A2A3_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime)
+set(PTO2_STUB_SOURCES ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp)
+set(PTO2_RUNTIME_SOURCES
+    ${A2A3_RUNTIME_DIR}/pto_ring_buffer.cpp
+    ${A2A3_RUNTIME_DIR}/pto_shared_memory.cpp
+    ${A2A3_RUNTIME_DIR}/pto_scheduler.cpp
+    ${A2A3_RUNTIME_DIR}/pto_tensormap.cpp
+)
+
+set(PTO2_COMMON_INCLUDE_DIRS
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/orchestration
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/runtime
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and_ringbuffer/common
+    ${CMAKE_SOURCE_DIR}/../../../src/a2a3/platform/include
+    ${CMAKE_SOURCE_DIR}/../../../src/common/task_interface
+)
+
+function(add_a2a3_pto2_runtime_test name)
+    cmake_parse_arguments(ARG "" "" "SOURCES;EXTRA_SOURCES" ${ARGN})
+    set(_all_sources ${ARG_SOURCES} ${PTO2_STUB_SOURCES})
+    foreach(src ${ARG_SOURCES} ${ARG_EXTRA_SOURCES})
+        if(EXISTS ${src})
+            list(APPEND _all_sources ${src})
+        endif()
+    endforeach()
+    add_executable(${name} ${_all_sources})
+    target_include_directories(${name} PRIVATE
+        ${GTEST_INCLUDE_DIRS}
+        ${PTO2_COMMON_INCLUDE_DIRS}
+    )
+    target_compile_options(${name} PRIVATE -D_GLIBCXX_USE_CXX11_ABI=0)
+    target_link_libraries(${name} PRIVATE
+        ${GTEST_MAIN_LIB}
+        ${GTEST_LIB}
+        pthread
+    )
+    add_test(NAME ${name} COMMAND ${name})
+    set_tests_properties(${name} PROPERTIES LABELS "no_hardware")
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Distributed runtime sources under test
 # ---------------------------------------------------------------------------
 set(HIERARCHICAL_SRC_DIR ${CMAKE_SOURCE_DIR}/../../../src/common/hierarchical)
@@ -151,13 +194,6 @@ function(add_a5_pto2_test name src)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-enable_testing()
-
-add_hierarchical_test(test_tensormap  test_tensormap.cpp)
-add_hierarchical_test(test_ring  test_ring.cpp)
-add_hierarchical_test(test_scope      test_scope.cpp)
-add_hierarchical_test(test_orchestrator test_orchestrator.cpp)
-add_hierarchical_test(test_scheduler  test_scheduler.cpp)
 function(add_task_interface_test name src)
     add_executable(${name} ${src})
     target_include_directories(${name} PRIVATE
@@ -173,9 +209,31 @@ function(add_task_interface_test name src)
     add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
-add_task_interface_test(test_child_memory test_child_memory.cpp)
-add_a2a3_pto2_test(test_a2a3_pto2_fatal test_a2a3_pto2_fatal.cpp)
-add_a5_pto2_test(test_a5_pto2_fatal test_a5_pto2_fatal.cpp)
+enable_testing()
+
+# ---------------------------------------------------------------------------
+# Hierarchical runtime tests (src/common/hierarchical/)
+# ---------------------------------------------------------------------------
+add_hierarchical_test(test_tensormap  hierarchical/test_tensormap.cpp)
+add_hierarchical_test(test_ring  hierarchical/test_ring.cpp)
+add_hierarchical_test(test_scope      hierarchical/test_scope.cpp)
+add_hierarchical_test(test_orchestrator hierarchical/test_orchestrator.cpp)
+add_hierarchical_test(test_scheduler  hierarchical/test_scheduler.cpp)
+
+# ---------------------------------------------------------------------------
+# Types / task_interface tests (src/common/task_interface/)
+# ---------------------------------------------------------------------------
+add_task_interface_test(test_child_memory types/test_child_memory.cpp)
+
+# ---------------------------------------------------------------------------
+# PTO2 A2A3 tests (src/a2a3/runtime/tensormap_and_ringbuffer/)
+# ---------------------------------------------------------------------------
+add_a2a3_pto2_test(test_a2a3_pto2_fatal pto2_a2a3/test_a2a3_pto2_fatal.cpp)
+
+# ---------------------------------------------------------------------------
+# PTO2 A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)
+# ---------------------------------------------------------------------------
+add_a5_pto2_test(test_a5_pto2_fatal pto2_a5/test_a5_pto2_fatal.cpp)
 
 # Hardware-gated tests.  Block is only entered when the project is configured
 # with -DSIMPLER_ENABLE_HARDWARE_TESTS=ON.  CI's no-hw `ut` job does not pass
@@ -238,5 +296,5 @@ if(SIMPLER_ENABLE_HARDWARE_TESTS)
         )
     endfunction()
 
-    add_comm_api_test(test_hccl_comm test_hccl_comm.cpp)
+    add_comm_api_test(test_hccl_comm hardware/test_hccl_comm.cpp)
 endif()
