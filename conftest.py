@@ -667,6 +667,24 @@ def pytest_runtestloop(session):
     return _dispatch_test_phases(session)
 
 
+def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
+    """Drop session-lifetime nanobind references before interpreter shutdown.
+
+    ``simpler_setup.scene_test._compile_cache`` accumulates one
+    ``ChipCallable`` per ``SceneTestCase`` compiled during the run. At
+    interpreter exit the order in which Python clears module globals
+    versus the nanobind module destructor is undefined, which on macOS
+    surfaces as ``nanobind: leaked N instances of type
+    _task_interface.ChipCallable`` on stderr. Clearing the cache here
+    (session scope ends after every fixture teardown, including the L2
+    worker pool) lets those instances die while nanobind is still
+    available.
+    """
+    from simpler_setup.scene_test import clear_compile_cache  # noqa: PLC0415
+
+    clear_compile_cache()
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------

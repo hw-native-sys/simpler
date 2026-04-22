@@ -22,6 +22,7 @@ A scene test class declares three things:
 
 from __future__ import annotations
 
+import gc
 import inspect
 import logging
 import os
@@ -36,6 +37,21 @@ from .pto_isa import ensure_pto_isa_root
 logger = logging.getLogger(__name__)
 
 _compile_cache: dict[tuple[str, str, str], object] = {}
+
+
+def clear_compile_cache() -> None:
+    """Drop every cached ``ChipCallable`` and force a GC pass.
+
+    The cache keeps nanobind-owned ``ChipCallable`` instances alive for the
+    whole pytest session. Module-level dicts are cleared by Python in an
+    order that can outlive the nanobind module destructor, which then
+    prints ``leaked N instances of type _task_interface.ChipCallable`` to
+    stderr at interpreter shutdown. Call this from ``pytest_sessionfinish``
+    (and other session-end paths) so the instances die while the nanobind
+    module is still wired up.
+    """
+    _compile_cache.clear()
+    gc.collect()
 
 
 # ---------------------------------------------------------------------------
