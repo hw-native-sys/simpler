@@ -107,9 +107,8 @@ def build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-def main() -> int:
-    cli = parse_args()
-    device_ids = parse_device_range(cli.device)
+def run(platform: str, device_ids: list[int]) -> int:
+    """Core logic — callable from both CLI and pytest."""
     print(f"[multi_chip_dispatch] devices={device_ids}")
 
     # --- 1. Allocate shared-memory tensors (visible to forked chip processes).
@@ -125,7 +124,7 @@ def main() -> int:
     # --- 2. Worker(level=3, ...) construction. No fork / no ACL yet.
     worker = Worker(
         level=3,
-        platform=cli.platform,
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
         device_ids=device_ids,
         num_sub_workers=1,
@@ -144,8 +143,8 @@ def main() -> int:
     sub_cid = worker.register(subworker)
 
     # --- 4. Compile the ChipCallable once, reused on both chips.
-    print(f"[multi_chip_dispatch] compiling kernels for {cli.platform}...")
-    chip_callable = build_chip_callable(cli.platform)
+    print(f"[multi_chip_dispatch] compiling kernels for {platform}...")
+    chip_callable = build_chip_callable(platform)
 
     # --- 5. init() forks chip + sub child processes, starts C++ scheduler.
     print("[multi_chip_dispatch] init worker...")
@@ -193,6 +192,11 @@ def main() -> int:
         # close() shuts down sub + chip child processes, unlinks shared memory.
         worker.close()
     return 0
+
+
+def main() -> int:
+    cli = parse_args()
+    return run(cli.platform, parse_device_range(cli.device))
 
 
 if __name__ == "__main__":

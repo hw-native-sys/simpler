@@ -7,7 +7,7 @@
 # INCLUDING BUT NOT LIMITED TO NON-INFRINGEMENT, MERCHANTABILITY, OR FITNESS FOR A PARTICULAR PURPOSE.
 # See LICENSE in the root of the software repository for the full text of the License.
 # -----------------------------------------------------------------------------------------------------------
-"""L2 Worker API demo — compile one AIV kernel, run it, verify against numpy.
+"""L2 Worker API demo — compile one AIV kernel, run it, verify against torch.
 
 Pipeline (what the @scene_test framework normally does for you):
 
@@ -21,7 +21,7 @@ Pipeline (what the @scene_test framework normally does for you):
                                           ▼
                               worker.run(chip_callable, task_args, cfg)
                                           │
-    device result ──[worker.copy_from]──► host array ──[numpy compare]
+    device result ──[worker.copy_from]──► host array ──[torch compare]
 
 The code below walks through each stage explicitly so you can see what the
 ``@scene_test`` decorator hides.
@@ -34,7 +34,9 @@ import argparse
 import os
 import sys
 
-import numpy as np
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+import torch  # noqa: E402
 from simpler.task_interface import (
     ArgDirection,
     ChipCallable,
@@ -56,7 +58,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 N_ROWS = 128
 N_COLS = 128
 N_ELEMS = N_ROWS * N_COLS
-NBYTES = N_ELEMS * np.dtype(np.float32).itemsize
+NBYTES = N_ELEMS * 4  # float32
 
 
 def parse_args() -> argparse.Namespace:
@@ -124,22 +126,22 @@ def build_chip_callable(platform: str) -> ChipCallable:
     )
 
 
-def run(worker: Worker, chip_callable: ChipCallable) -> None:
+def _run(worker: Worker, chip_callable: ChipCallable) -> None:
     """Allocate device memory, copy inputs, execute, copy outputs back, verify."""
     # --- 1. Prepare host arrays ---
-    rng = np.random.default_rng(seed=42)
-    host_a = rng.standard_normal((N_ROWS, N_COLS), dtype=np.float32)
-    host_b = rng.standard_normal((N_ROWS, N_COLS), dtype=np.float32)
+    torch.manual_seed(42)
+    host_a = torch.randn(N_ROWS, N_COLS, dtype=torch.float32)
+    host_b = torch.randn(N_ROWS, N_COLS, dtype=torch.float32)
     expected = host_a + host_b
-    host_out = np.zeros((N_ROWS, N_COLS), dtype=np.float32)
+    host_out = torch.zeros(N_ROWS, N_COLS, dtype=torch.float32)
 
     # --- 2. Allocate device buffers + H2D copy ---
     # malloc returns a uint64 device pointer. copy_to takes (dst_dev, src_host, nbytes).
     dev_a = worker.malloc(NBYTES)
     dev_b = worker.malloc(NBYTES)
     dev_out = worker.malloc(NBYTES)
-    worker.copy_to(dev_a, host_a.ctypes.data, NBYTES)
-    worker.copy_to(dev_b, host_b.ctypes.data, NBYTES)
+    worker.copy_to(dev_a, host_a.data_ptr(), NBYTES)
+    worker.copy_to(dev_b, host_b.data_ptr(), NBYTES)
 
     # --- 3. Build TaskArgs describing the tensors visible to the orchestration ---
     # Each tensor is a ContinuousTensor(data_ptr, shape, dtype). Order must
@@ -155,39 +157,44 @@ def run(worker: Worker, chip_callable: ChipCallable) -> None:
     worker.run(chip_callable, args, config)
 
     # --- 5. D2H copy back + verify ---
-    worker.copy_from(host_out.ctypes.data, dev_out, NBYTES)
+    worker.copy_from(host_out.data_ptr(), dev_out, NBYTES)
 
     # --- 6. Free device buffers. Order doesn't matter, but leaking is bad. ---
     worker.free(dev_a)
     worker.free(dev_b)
     worker.free(dev_out)
 
-    max_diff = float(np.max(np.abs(host_out - expected)))
+    max_diff = float(torch.max(torch.abs(host_out - expected)))
     print(f"[vector_add] max |host_out - expected| = {max_diff:.3e}")
-    np.testing.assert_allclose(host_out, expected, rtol=1e-5, atol=1e-5)
-    print("[vector_add] golden check PASSED ✅")
+    assert torch.allclose(host_out, expected, rtol=1e-5, atol=1e-5)
+    print("[vector_add] golden check PASSED")
+
+
+def run(platform: str, device_id: int) -> int:
+    """Core logic — callable from both CLI and pytest."""
+    worker = Worker(
+        level=2,
+        platform=platform,
+        runtime="tensormap_and_ringbuffer",
+        device_id=device_id,
+    )
+
+    print(f"[vector_add] compiling kernels for {platform}...")
+    chip_callable = build_chip_callable(platform)
+    print(f"[vector_add] compiled. binary_size={chip_callable.binary_size} bytes")
+
+    print(f"[vector_add] init worker (device={device_id})...")
+    worker.init()
+    try:
+        _run(worker, chip_callable)
+    finally:
+        worker.close()
+    return 0
 
 
 def main() -> int:
     args = parse_args()
-    worker = Worker(
-        level=2,
-        platform=args.platform,
-        runtime="tensormap_and_ringbuffer",
-        device_id=args.device,
-    )
-
-    print(f"[vector_add] compiling kernels for {args.platform}...")
-    chip_callable = build_chip_callable(args.platform)
-    print(f"[vector_add] compiled. binary_size={chip_callable.binary_size} bytes")
-
-    print(f"[vector_add] init worker (device={args.device})...")
-    worker.init()
-    try:
-        run(worker, chip_callable)
-    finally:
-        worker.close()
-    return 0
+    return run(args.platform, args.device)
 
 
 if __name__ == "__main__":

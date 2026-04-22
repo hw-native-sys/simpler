@@ -49,23 +49,23 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def main() -> int:
-    args = parse_args()
+def run(platform: str, device_id: int) -> int:
+    """Core logic — callable from both CLI and pytest."""
 
     # Worker(level=2, ...) wraps a single C++ ChipWorker. Construction does NOT
     # load any binaries or touch the device — it just stashes config. The heavy
     # work happens in init().
     worker = Worker(
         level=2,
-        platform=args.platform,
+        platform=platform,
         runtime="tensormap_and_ringbuffer",
-        device_id=args.device,
+        device_id=device_id,
     )
 
     # init() resolves ``build/lib/<platform>/tensormap_and_ringbuffer/*`` via
     # RuntimeBuilder, dlopens host_runtime.so, loads aicpu.so + aicore.o, and
     # calls aclrtSetDevice(device_id). If any of those fails this raises.
-    print(f"[hello_worker] init on {args.platform} device={args.device} ...")
+    print(f"[hello_worker] init on {platform} device={device_id} ...")
     worker.init()
 
     try:
@@ -88,6 +88,11 @@ def main() -> int:
         print("[hello_worker] close OK — lifecycle complete.")
 
     return 0
+
+
+def main() -> int:
+    args = parse_args()
+    return run(args.platform, args.device)
 
 
 if __name__ == "__main__":
