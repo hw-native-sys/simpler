@@ -20,6 +20,7 @@ import os
 import signal
 import subprocess
 import sys
+import typing
 
 # macOS libomp collision workaround — must run before any import that may
 # transitively load numpy or torch (i.e. before pytest collects scene test
@@ -319,11 +320,28 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
 
 
 # ---------------------------------------------------------------------------
-# Test dispatcher: L3 phase (device-aware parallel subprocesses) + L2 phase
-# (per-runtime subprocess). Activated only when neither --runtime nor --level
-# is set by the caller. Dispatcher-spawned children set both, so they fall
-# through to pytest's default runtestloop without recursing.
+# Test dispatcher: Resource phase (device-aware parallel subprocesses for L3
+# classes *and* standalone resource-marked functions) + L2 phase (per-runtime
+# subprocess). Activated only when neither --runtime nor --level is set by
+# the caller. Dispatcher-spawned children set both, so they fall through to
+# pytest's default runtestloop without recursing.
 # ---------------------------------------------------------------------------
+
+
+class _ResourceJob(typing.NamedTuple):
+    """One device-allocating subprocess job fed into Resource phase.
+
+    ``kind`` drives only two things: the ``--level 3`` filter added to the
+    child command (for L3 classes) and the ``SIMPLER_PERF_OUTPUT_DIR``
+    prefix. The dispatch itself (bin-pack over ``--device`` pool,
+    ``run_jobs`` scheduling, fail-fast semantics) is identical.
+    """
+
+    kind: str  # "l3" or "standalone"
+    nodeid: str
+    label: str  # class name for "l3", function name for "standalone"
+    runtime: str
+    device_count: int
 
 
 def _collect_st_runtimes(items, level=None):
@@ -340,14 +358,27 @@ def _collect_st_runtimes(items, level=None):
     return sorted(runtimes)
 
 
-def _collect_l3_cases(items, platform):
-    """Collect one job per L3 ``SceneTestCase`` class (not per case).
+def _collect_resource_jobs(items, platform):
+    """Collect every item that needs a dedicated device-allocating subprocess.
 
-    Returns a list of tuples ``(nodeid, cls_name, runtime, max_device_count)``
-    where ``max_device_count`` is the maximum ``device_count`` across the
-    class's matching cases.
+    Two job kinds share one phase:
+
+      - ``l3``:         one per L3 ``SceneTestCase`` class.
+        ``device_count`` is the max across the class's platform-matching
+        non-manual cases.
+      - ``standalone``: one per non-class pytest function that declares its
+        resource needs via ``@pytest.mark.device_count(n)`` +
+        ``@pytest.mark.runtime("...")`` (and optional
+        ``@pytest.mark.platforms([...])``).
+
+    Both are dispatched through the same ``parallel_scheduler.run_jobs``
+    bin-pack, so merging them reduces the dispatcher to a single phase in
+    front of L2.
     """
-    by_nodeid: dict[str, tuple[str, str, int]] = {}
+    jobs: list[_ResourceJob] = []
+
+    # L3 SceneTestCase classes (one job per class, keyed on nodeid).
+    l3_by_nodeid: dict[str, _ResourceJob] = {}
     for item in items:
         if any(m.name == "skip" for m in item.iter_markers()):
             continue
@@ -367,24 +398,17 @@ def _collect_l3_cases(items, platform):
             saw_case = True
             max_dev = max(max_dev, int(case.get("config", {}).get("device_count", 1)))
         if saw_case:
-            by_nodeid[item.nodeid] = (cls.__name__, rt, max_dev)
-    return [(nodeid, cls_name, rt, dev) for nodeid, (cls_name, rt, dev) in by_nodeid.items()]
+            l3_by_nodeid[item.nodeid] = _ResourceJob(
+                kind="l3", nodeid=item.nodeid, label=cls.__name__, runtime=rt, device_count=max_dev
+            )
+    jobs.extend(l3_by_nodeid.values())
 
-
-def _collect_resource_cases(items, platform):
-    """Collect non-``SceneTestCase`` pytest functions that declare resource needs.
-
-    Returns a list of tuples ``(nodeid, func_name, runtime, device_count)``.
-    These run in their own dispatch phase — they don't participate in
-    level-based dispatch.  A function must carry both
-    ``@pytest.mark.device_count(n)`` and ``@pytest.mark.runtime("...")``.
-    """
-    by_nodeid: dict[str, tuple[str, str, int]] = {}
+    # Standalone pytest functions with device_count + runtime markers.
+    standalone_by_nodeid: dict[str, _ResourceJob] = {}
     for item in items:
         if any(m.name == "skip" for m in item.iter_markers()):
             continue
-        cls = getattr(item, "cls", None)
-        if cls is not None:
+        if getattr(item, "cls", None) is not None:
             continue
         dev_marker = item.get_closest_marker("device_count")
         if dev_marker is None:
@@ -396,8 +420,16 @@ def _collect_resource_cases(items, platform):
         if platforms_marker and platform and platform not in platforms_marker.args[0]:
             continue
         dev_count = int(dev_marker.args[0]) if dev_marker.args else 1
-        by_nodeid[item.nodeid] = (item.name, rt_marker.args[0], dev_count)
-    return [(nodeid, label, rt, dev) for nodeid, (label, rt, dev) in by_nodeid.items()]
+        standalone_by_nodeid[item.nodeid] = _ResourceJob(
+            kind="standalone",
+            nodeid=item.nodeid,
+            label=item.name,
+            runtime=rt_marker.args[0],
+            device_count=dev_count,
+        )
+    jobs.extend(standalone_by_nodeid.values())
+
+    return jobs
 
 
 def _base_pytest_argv(session):
@@ -424,8 +456,19 @@ def _resolve_max_parallel(cfg, platform: str, device_ids: list[int]) -> int:
     return val
 
 
-def _dispatch_test_phases(session):  # noqa: PLR0912
-    """Run L3 → Standalone → L2 phases."""
+def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
+    """Run Resource → L2 phases.
+
+    The Resource phase dispatches every item that needs a dedicated
+    device-allocating subprocess — L3 ``SceneTestCase`` classes *and*
+    standalone functions marked with ``@pytest.mark.device_count`` +
+    ``@pytest.mark.runtime``. They share the same ``run_jobs`` bin-pack
+    and fail-fast gate, so they are one phase, not two.
+
+    ``resource_specs`` is pre-collected by ``pytest_runtestloop`` (which
+    already has to inspect the list to decide whether to dispatch) so
+    this function does not walk ``session.items`` a second time.
+    """
     from simpler_setup import parallel_scheduler as _ps  # noqa: PLC0415
 
     cfg = session.config
@@ -439,22 +482,20 @@ def _dispatch_test_phases(session):  # noqa: PLR0912
     base_args = _base_pytest_argv(session)
     cwd = session.config.invocation_params.dir
 
-    # ----- Phase 1: L3 classes (device-bin-packed subprocesses, one per class) -----
-    l3_cases = _collect_l3_cases(session.items, platform)
-    l3_failed = False
-    if l3_cases:
-        # Static check happens inside run_jobs; we translate errors into session failure.
+    # ----- Phase 1: Resource (L3 classes + standalone resource functions) -----
+    resource_failed = False
+    if resource_specs:
         jobs = []
-        for nodeid, cls_name, rt, dev_count in l3_cases:
-            label = f"L3 {cls_name} (rt={rt}, dev={dev_count})"
+        for spec in resource_specs:
+            label = f"{spec.kind} {spec.label} (rt={spec.runtime}, dev={spec.device_count})"
 
-            def _build(ids, _nodeid=nodeid, _rt=rt):
-                # L3 subprocess: only the specific test, not the inherited
+            def _build(ids, _nodeid=spec.nodeid, _rt=spec.runtime, _kind=spec.kind):
+                # Narrow the child to the specific nodeid, not the inherited
                 # directory args (examples tests/st). Passing the directories
-                # would collect every same-level SceneTestCase and run them
-                # inside this subprocess, which has only dev_count devices —
-                # TestL3Group (needs 2) would fail inside TestL3ChildMemory's
-                # subprocess (allocated 1).
+                # would re-collect every SceneTestCase and run them alongside
+                # this job in the same subprocess, which has only this job's
+                # allocated devices — e.g. TestL3Group (needs 2) would fail
+                # inside TestL3ChildMemory's 1-device subprocess.
                 cmd = [
                     sys.executable,
                     "-m",
@@ -462,30 +503,41 @@ def _dispatch_test_phases(session):  # noqa: PLR0912
                     _nodeid,
                     "--runtime",
                     _rt,
-                    "--level",
-                    "3",
                     "--device",
                     _ps.format_device_range(ids),
                 ]
+                if _kind == "l3":
+                    # L3 jobs run inside --level 3 child mode; standalone jobs
+                    # are non-SceneTestCase functions and do not participate
+                    # in level-based dispatch.
+                    cmd.extend(["--level", "3"])
                 if platform:
                     cmd.extend(["--platform", platform])
                 return cmd
 
-            # SIMPLER_PERF_OUTPUT_DIR scopes this L3 case's perf files to its own
-            # subdir so concurrent L3 cases can't collide on filename.
-            safe_nodeid = nodeid.replace("/", "_").replace(":", "_").replace(".", "_")
+            # SIMPLER_PERF_OUTPUT_DIR scopes this job's perf files to its own
+            # subdir so concurrent jobs can't collide on filename.
+            safe_nodeid = spec.nodeid.replace("/", "_").replace(":", "_").replace(".", "_")
             child_env = {
                 **os.environ,
-                "SIMPLER_PERF_OUTPUT_DIR": str(cfg.rootpath / "outputs" / f"perf_l3_{safe_nodeid}"),
+                "SIMPLER_PERF_OUTPUT_DIR": str(cfg.rootpath / "outputs" / f"perf_{spec.kind}_{safe_nodeid}"),
             }
-            jobs.append(_ps.Job(label=label, device_count=dev_count, build_cmd=_build, cwd=str(cwd), env=child_env))
+            jobs.append(
+                _ps.Job(
+                    label=label,
+                    device_count=spec.device_count,
+                    build_cmd=_build,
+                    cwd=str(cwd),
+                    env=child_env,
+                )
+            )
 
         def _on_done(res):
             tag = "PASSED" if res.returncode == 0 else f"FAILED (rc={res.returncode})"
             print(f"\n--- {res.label}: {tag} on devices {res.device_ids} ---\n", flush=True)
 
         print(
-            f"\n{'=' * 60}\n  L3 phase: {len(jobs)} case(s), "
+            f"\n{'=' * 60}\n  Resource phase: {len(jobs)} case(s), "
             f"pool={device_ids}, max_parallel={max_parallel}\n{'=' * 60}\n",
             flush=True,
         )
@@ -498,16 +550,16 @@ def _dispatch_test_phases(session):  # noqa: PLR0912
                 on_job_done=_on_done,
             )
         except ValueError as e:
-            print(f"\n*** L3 phase ABORTED: {e} ***\n", flush=True)
+            print(f"\n*** Resource phase ABORTED: {e} ***\n", flush=True)
             session.testsfailed = 1
             return True
-        l3_failed = any(r.returncode != 0 for r in results)
+        resource_failed = any(r.returncode != 0 for r in results)
         if any(r.returncode == TIMEOUT_EXIT_CODE for r in results):
-            print("\n*** L3 phase: TIMED OUT ***\n", flush=True)
+            print("\n*** Resource phase: TIMED OUT ***\n", flush=True)
             os._exit(TIMEOUT_EXIT_CODE)
 
-        # Fail-fast: stop before L2 phase if any L3 failed.
-        if l3_failed and fail_fast:
+        # Fail-fast: stop before L2 phase if any Resource job failed.
+        if resource_failed and fail_fast:
             session.testsfailed = 1
             return True
 
@@ -553,72 +605,6 @@ def _dispatch_test_phases(session):  # noqa: PLR0912
         else:
             print(f"\n--- L2 runtime {rt}: PASSED ---\n", flush=True)
 
-    # ----- Phase 3: Resource (non-SceneTestCase functions with device_count) -----
-    resource_cases = _collect_resource_cases(session.items, platform)
-    resource_failed = False
-    if resource_cases:
-        jobs = []
-        for nodeid, func_name, rt, dev_count in resource_cases:
-            label = f"resource {func_name} (rt={rt}, dev={dev_count})"
-
-            def _build(ids, _nodeid=nodeid, _rt=rt):
-                # Resource subprocess: only the specific test, not the
-                # inherited directory args (examples tests/st). Passing the
-                # directories would collect every SceneTestCase as well and
-                # run them alongside the resource test inside the subprocess,
-                # causing isolation failures (e.g. test_explicit_fatal_reports
-                # wasn't designed to share a process with other tests).
-                cmd = [
-                    sys.executable,
-                    "-m",
-                    "pytest",
-                    _nodeid,
-                    "--runtime",
-                    _rt,
-                    "--device",
-                    _ps.format_device_range(ids),
-                ]
-                if platform:
-                    cmd.extend(["--platform", platform])
-                return cmd
-
-            safe_nodeid = nodeid.replace("/", "_").replace(":", "_").replace(".", "_")
-            child_env = {
-                **os.environ,
-                "SIMPLER_PERF_OUTPUT_DIR": str(cfg.rootpath / "outputs" / f"perf_rc_{safe_nodeid}"),
-            }
-            jobs.append(_ps.Job(label=label, device_count=dev_count, build_cmd=_build, cwd=str(cwd), env=child_env))
-
-        def _on_rc_done(res):
-            tag = "PASSED" if res.returncode == 0 else f"FAILED (rc={res.returncode})"
-            print(f"\n--- {res.label}: {tag} on devices {res.device_ids} ---\n", flush=True)
-
-        print(
-            f"\n{'=' * 60}\n  Resource phase: {len(jobs)} case(s), "
-            f"pool={device_ids}, max_parallel={max_parallel}\n{'=' * 60}\n",
-            flush=True,
-        )
-        try:
-            results = _ps.run_jobs(
-                jobs,
-                device_ids,
-                max_parallel=max_parallel,
-                fail_fast=fail_fast,
-                on_job_done=_on_rc_done,
-            )
-        except ValueError as e:
-            print(f"\n*** Resource phase ABORTED: {e} ***\n", flush=True)
-            session.testsfailed = 1
-            return True
-        resource_failed = any(r.returncode != 0 for r in results)
-        if any(r.returncode == TIMEOUT_EXIT_CODE for r in results):
-            print("\n*** Resource phase: TIMED OUT ***\n", flush=True)
-            os._exit(TIMEOUT_EXIT_CODE)
-
-        if resource_failed and fail_fast:
-            session.testsfailed = 1
-            return True
-
     # Flatten per-subprocess outputs/perf_*/ subdirs back to outputs/ so
     # downstream tools (swimlane_converter.py, CI artifact upload) find
     # everything in the historical location. Anchor to config.rootpath (not
@@ -626,14 +612,14 @@ def _dispatch_test_phases(session):  # noqa: PLR0912
     # still flushes files into the project's top-level outputs/.
     _ps.flatten_perf_subdirs(cfg.rootpath / "outputs")
 
-    session.testsfailed = 1 if (l3_failed or l2_failed or resource_failed) else 0
-    if not (l3_failed or l2_failed or resource_failed):
+    session.testsfailed = 1 if (resource_failed or l2_failed) else 0
+    if not (resource_failed or l2_failed):
         session.testscollected = sum(1 for _ in session.items)
     return True  # returning True prevents default runtestloop
 
 
 def pytest_runtestloop(session):
-    """Dispatch L3+L2 phases unless caller is already in child mode.
+    """Dispatch Resource + L2 phases unless caller is already in child mode.
 
     Child mode (both --runtime and --level set, or --collect-only) skips the
     dispatcher and falls through to pytest's default runtestloop.
@@ -655,16 +641,20 @@ def pytest_runtestloop(session):
     if not session.items:
         return
 
-    # If only L2 items exist in a single runtime, the dispatcher reduces to a
-    # single L2 subprocess — not worth the extra fork overhead vs. letting
-    # pytest run directly. Skip dispatching in that trivial case.
+    # If only L2 items exist in a single runtime and no resource-dispatched
+    # jobs (L3 classes or standalone resource functions) are collected, the
+    # dispatcher would reduce to a single L2 subprocess — not worth the
+    # fork overhead vs. letting pytest run directly. Skip dispatching in
+    # that trivial case. Collect the specs once and hand them to the
+    # dispatcher to avoid walking ``session.items`` twice.
     level_filter_explicit = level_filter is not None
+    platform = session.config.getoption("--platform")
     runtimes_all = _collect_st_runtimes(session.items)
-    has_l3 = any(getattr(getattr(i, "cls", None), "_st_level", None) == 3 for i in session.items)
-    if not has_l3 and len(runtimes_all) <= 1 and not level_filter_explicit:
+    resource_specs = _collect_resource_jobs(session.items, platform)
+    if not resource_specs and len(runtimes_all) <= 1 and not level_filter_explicit:
         return
 
-    return _dispatch_test_phases(session)
+    return _dispatch_test_phases(session, resource_specs)
 
 
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
