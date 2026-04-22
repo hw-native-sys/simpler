@@ -46,7 +46,7 @@ list(APPEND AICORE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/../../src/host/unified_l
 
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
-        file(GLOB DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
+        file(GLOB_RECURSE DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
         list(APPEND AICORE_SOURCES ${DIR_SOURCES})
     endforeach()
 else()

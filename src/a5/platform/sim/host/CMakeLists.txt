@@ -51,7 +51,7 @@ list(APPEND HOST_RUNTIME_SOURCES
 
 if(DEFINED CUSTOM_SOURCE_DIRS)
     foreach(SRC_DIR ${CUSTOM_SOURCE_DIRS})
-        file(GLOB DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
+        file(GLOB_RECURSE DIR_SOURCES "${SRC_DIR}/*.cpp" "${SRC_DIR}/*.c")
         list(APPEND HOST_RUNTIME_SOURCES ${DIR_SOURCES})
     endforeach()
 else()
