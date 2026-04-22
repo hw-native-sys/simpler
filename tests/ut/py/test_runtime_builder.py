@@ -287,7 +287,7 @@ class TestRuntimeBuilderIntegration:
         from simpler_setup.runtime_compiler import RuntimeCompiler  # noqa: PLC0415
 
         yield
-        RuntimeCompiler._instances.clear()
+        RuntimeCompiler.reset_instances()
 
     def test_get_binaries_returns_valid_paths(self, platform, runtime_name):
         """get_binaries(build=True) produces RuntimeBinaries with existing files."""

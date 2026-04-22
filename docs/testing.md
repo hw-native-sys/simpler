@@ -60,12 +60,12 @@ Three test categories:
 | Category | Abbrev | Location | Runner | Description |
 | -------- | ------ | -------- | ------ | ----------- |
 | System tests | st | `examples/`, `tests/st/` | pytest (`@scene_test`) or standalone `python test_*.py` | Full end-to-end cases (compile + run + validate) |
-| Python unit tests | ut-py | `tests/ut/` | pytest | Unit tests for nanobind-exposed and Python modules |
+| Python unit tests | ut-py | `tests/ut/py/` | pytest | Unit tests for nanobind-exposed and Python modules |
 | C++ unit tests | ut-cpp | `tests/ut/cpp/` | ctest (GoogleTest) | Unit tests for pure C++ modules |
 
 ### Choosing ut-py vs ut-cpp
 
-If a module is exposed via nanobind (used by both C++ and Python), test in **ut-py** (`tests/ut/`).
+If a module is exposed via nanobind (used by both C++ and Python), test in **ut-py** (`tests/ut/py/`).
 If a module is pure C++ with no Python binding, test in **ut-cpp** (`tests/ut/cpp/`).
 
 ## Scene Test CLI Options
@@ -384,9 +384,18 @@ conftest.py            # Root: --platform/--device options, ST fixtures
 
 ### C++ Unit Tests (`tests/ut/cpp/`)
 
-GoogleTest-based tests for shared components (`src/common/task_interface/` and `src/{arch}/runtime/common/`):
+See [ut-test-suite.md](ut-test-suite.md) for the full per-file coverage
+reference (370+ test cases across 52 files).
 
-- `test_data_type.cpp` — DataType enum, get_element_size(), get_dtype_name()
+GoogleTest-based tests organized by component:
+
+| Subdirectory | Component under test |
+| ------------ | -------------------- |
+| `pto2_a2a3/` | PTO2 a2a3 on-chip runtime (`src/a2a3/runtime/tensormap_and_ringbuffer/`) |
+| `pto2_a5/` | PTO2 a5 on-chip runtime (`src/a5/runtime/tensormap_and_ringbuffer/`) |
+| `hierarchical/` | Host-side hierarchical runtime (`src/common/hierarchical/`) |
+| `types/` | Cross-cutting types (`src/common/task_interface/`, `pto_types.h`) |
+| `hardware/` | Tests requiring Ascend hardware (`comm_hccl`, etc.) |
 
 ```bash
 cmake -B tests/ut/cpp/build -S tests/ut/cpp
@@ -394,7 +403,7 @@ cmake --build tests/ut/cpp/build
 ctest --test-dir tests/ut/cpp/build --output-on-failure
 ```
 
-### Python Unit Tests (`tests/ut/`)
+### Python Unit Tests (`tests/ut/py/`)
 
 Tests for the nanobind extension and the Python build pipeline:
 
@@ -403,10 +412,10 @@ Tests for the nanobind extension and the Python build pipeline:
 
 ```bash
 # No-hardware runner (hw tests auto-skip, no-hw tests run)
-pytest tests/ut
+pytest tests/ut/py
 
 # a2a3 hardware runner (no-hw tests skip, hw + a2a3-specific tests run)
-pytest tests/ut --platform a2a3
+pytest tests/ut/py --platform a2a3
 ```
 
 ### Examples (`examples/{arch}/`)
@@ -434,21 +443,26 @@ Hardware-only scene tests for large-scale and feature-rich scenarios that are to
 
 ### New C++ Unit Test
 
-Add a new test file to `tests/ut/cpp/` and register it in `tests/ut/cpp/CMakeLists.txt`:
+Add a new test file to the appropriate subdirectory under `tests/ut/cpp/` and register it in `tests/ut/cpp/CMakeLists.txt`:
+
+| Component | Subdirectory | Helper function |
+| --------- | ------------ | --------------- |
+| PTO2 a2a3 header-only | `pto2_a2a3/` | `add_a2a3_pto2_test` |
+| PTO2 a2a3 runtime-linked | `pto2_a2a3/` | `add_a2a3_pto2_runtime_test` |
+| PTO2 a5 | `pto2_a5/` | `add_a5_pto2_test` |
+| Hierarchical host runtime | `hierarchical/` | `add_hierarchical_test` |
+| Task interface types | `types/` | `add_task_interface_test` |
+| Hardware (CANN) | `hardware/` | `add_comm_api_test` |
 
 ```cmake
-add_executable(test_my_component
-    test_my_component.cpp
-    test_stubs.cpp
-)
-target_include_directories(test_my_component PRIVATE ${COMMON_DIR} ${TMR_RUNTIME_DIR} ${PLATFORM_INCLUDE_DIR})
-target_link_libraries(test_my_component gtest_main)
-add_test(NAME test_my_component COMMAND test_my_component)
+# Example: header-only PTO2 a2a3 test
+add_a2a3_pto2_test(test_my_component pto2_a2a3/test_my_component.cpp)
 
-# If hardware required:
-# set_tests_properties(test_my_component PROPERTIES LABELS "requires_hardware")
-# If specific platform required:
-# set_tests_properties(test_my_component PROPERTIES LABELS "requires_hardware_a2a3")
+# Example: runtime-linked PTO2 a2a3 test
+add_a2a3_pto2_runtime_test(test_my_component
+    SOURCES pto2_a2a3/test_my_component.cpp
+    EXTRA_SOURCES ${PTO2_RUNTIME_SOURCES}
+)
 ```
 
 #### C++ hardware tests needing NPU devices

@@ -12,12 +12,12 @@
 /*
  * Hardware UT guarding the CANN/HCCL-private ABI coupling in comm_hccl.cpp.
  *
- * The call chain (dlopen → create_device_context → ensure_acl_ready_ctx →
- * aclrtCreateStream → comm_init → comm_alloc_windows → ...) is not the
- * interesting part — the interesting part is *what's inside* CommContext
+ * The call chain (dlopen -> create_device_context -> ensure_acl_ready_ctx ->
+ * aclrtCreateStream -> comm_init -> comm_alloc_windows -> ...) is not the
+ * interesting part -- the interesting part is *what's inside* CommContext
  * after comm_alloc_windows returns.  That struct comes from one of:
  *
- *   - MESH topology: `reinterpret_cast<CommContext*>(HCCL's return ptr)` —
+ *   - MESH topology: `reinterpret_cast<CommContext*>(HCCL's return ptr)` --
  *     our layout is *assumed* to match HCCL's internal MESH context.
  *   - RING topology: our parser reads HcclOpResParam / HcclRankRelationResV2
  *     field-by-field using offsetof against reverse-engineered struct defs.
@@ -40,7 +40,7 @@
  * gate SIMPLER_ENABLE_HARDWARE_TESTS.  Device allocation is driven by
  * CTest RESOURCE_GROUPS + --resource-spec-file.
  *
- * Linking strategy: libhost_runtime.so is dlopen'd — it is the subject
+ * Linking strategy: libhost_runtime.so is dlopen'd -- it is the subject
  * under test and mirrors how ChipWorker loads a runtime backend in
  * production.  libascendcl.so is linked directly at compile time because
  * it is generic CANN infra; going through dlsym for acl* here buys nothing
@@ -122,14 +122,14 @@ constexpr int EXIT_WINDOW_SIZE = 50;
 // the CommContext returned by HCCL (MESH reinterpret_cast) or built by our
 // RING parser actually contains the fields we expect at the offsets we
 // expect.  Failure here means our reverse-engineered CANN ABI disagrees with
-// the live HCCL build — the CANN-coupling fragility this test is here for.
+// the live HCCL build -- the CANN-coupling fragility this test is here for.
 constexpr int EXIT_CTX_MEMCPY = 55;
 constexpr int EXIT_CTX_FIELDS = 56;
 constexpr int EXIT_BARRIER = 60;
 constexpr int EXIT_DESTROY = 70;
 
 int run_rank(int rank, int nranks, int device_id, const char *rootinfo_path) {
-    // libhost_runtime.so is the subject under test — dlopen mirrors
+    // libhost_runtime.so is the subject under test -- dlopen mirrors
     // ChipWorker.  libascendcl is linked in, so acl* is available directly.
     void *host_handle = dlopen(PTO_HOST_RUNTIME_LIB_PATH, RTLD_NOW | RTLD_LOCAL);
     if (host_handle == nullptr) {
@@ -215,7 +215,7 @@ int run_rank(int rank, int nranks, int device_id, const char *rootinfo_path) {
                                host_ctx.windowsIn[rank] != local_base) {
                         fprintf(
                             stderr,
-                            "[rank %d] CommContext field mismatch — CANN ABI drift?\n"
+                            "[rank %d] CommContext field mismatch -- CANN ABI drift?\n"
                             "  got:      rankId=%u rankNum=%u winSize=%lu windowsIn[%d]=0x%lx\n"
                             "  expected: rankId=%d rankNum=%d winSize=%zu windowsIn[%d]=0x%lx\n",
                             rank, host_ctx.rankId, host_ctx.rankNum, static_cast<unsigned long>(host_ctx.winSize), rank,
