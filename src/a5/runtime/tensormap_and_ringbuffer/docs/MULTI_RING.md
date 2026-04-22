@@ -84,42 +84,66 @@ struct PTO2RingFlowControl {
     std::atomic<uint64_t> heap_tail;          // heap reclaim pointer
 };
 
-struct PTO2SharedMemoryRingHeader {
+struct alignas(64) PTO2SharedMemoryRingHeader {
     PTO2RingFlowControl fc;
+
+    // Layout metadata (set once at init)
     uint64_t task_window_size;
+    int32_t task_window_mask;       // task_window_size - 1
     uint64_t heap_size;
     uint64_t task_descriptors_offset;
+
+    // Per-ring data pointers (host-side, set by pto2_sm_setup_pointers)
+    PTO2TaskDescriptor *task_descriptors;
+    PTO2TaskPayload *task_payloads;
+    PTO2TaskSlotState *slot_states;
+
+    // Accessors (slot = local_id & task_window_mask)
+    PTO2TaskDescriptor &get_task_by_slot(int32_t slot);
+    PTO2TaskDescriptor &get_task_by_task_id(int32_t local_id);
+    PTO2TaskPayload &get_payload_by_slot(int32_t slot);
+    PTO2TaskPayload &get_payload_by_task_id(int32_t local_id);
+    PTO2TaskSlotState &get_slot_state_by_slot(int32_t slot);
+    PTO2TaskSlotState &get_slot_state_by_task_id(int32_t local_id);
 };
 
 // In header:
 PTO2SharedMemoryRingHeader rings[PTO2_MAX_RING_DEPTH];
 ```
 
-The global `heap_tail_gen` ticket counter is removed; each ring's scheduler state serializes ring-advance via a per-ring try-lock.
+Per-ring try-locks in the scheduler state prevent concurrent scheduler threads from interleaving watermark writes within the same ring. `FaninPool`/`DepListPool` `reclaim`/`ensure_space` take `PTO2SharedMemoryRingHeader&` directly (no `ring_id` or `fc` parameters).
 
-### 4.4 PTO2SharedMemoryHandle (modified)
+### 4.4 PTO2SharedMemoryHandle (lifecycle-only)
 
-Per-ring descriptor and payload arrays:
+Slimmed to lifecycle management only. Per-ring data pointers now live in `PTO2SharedMemoryRingHeader` (§4.3). Runtime components (orchestrator, scheduler) store `PTO2SharedMemoryHeader*` directly, eliminating one indirection on every per-ring access.
 
 ```cpp
-PTO2TaskDescriptor* task_descriptors[PTO2_MAX_RING_DEPTH];
-PTO2TaskPayload*    task_payloads[PTO2_MAX_RING_DEPTH];
+struct PTO2SharedMemoryHandle {
+    void *sm_base;
+    uint64_t sm_size;
+    PTO2SharedMemoryHeader *header;
+    bool is_owner;
+};
 ```
 
 ### 4.5 PTO2SchedulerState (modified)
 
 ```cpp
 struct RingSchedState {
-    PTO2TaskSlotState* slot_states;
-    int32_t task_window_size;
-    int32_t task_window_mask;
-    std::atomic<int32_t> advance_lock;
-    alignas(64) PTO2DepListPool dep_pool;  // fanout wiring dep pool (thread 0 only, cache-isolated)
+    // Cache Line 0: ring pointer (read-only) + hot path (read-write)
+    PTO2SharedMemoryRingHeader *ring;  // direct pointer, no indirection
+    int32_t last_task_alive;
+    std::atomic<int32_t> advance_lock;  // multi-thread CAS
+
+    // Cache Line 1+: Thread 0 only (wiring dep_pool, cache-isolated)
+    alignas(64) PTO2DepListPool dep_pool;
 };
 
 RingSchedState ring_sched_states[PTO2_MAX_RING_DEPTH];
 PTO2SpscQueue wiring_queue;  // global SPSC queue: orchestrator pushes, scheduler thread 0 drains
 ```
+
+`slot_states`, `task_window_size`, and `task_window_mask` are no longer duplicated — callers access them via `ring->get_slot_state_by_*()` and other ring header accessors. The ring pointer shares cache line 0 with `last_task_alive` and `advance_lock`.
 
 ### 4.6 PTO2TensorMap (modified)
 
@@ -154,13 +178,12 @@ bool entry_valid(const PTO2TensorMapEntry& e) {
 Each ring's `last_task_alive` advances independently:
 
 ```text
-advance_ring_pointers(ring_id):
-    la = rings[ring_id].fc.last_task_alive
-    while task_state[la & mask] >= CONSUMED:
-        advance heap_tail from packed_buffer_end
-        reset fanin_refcount
-        CAS(last_task_alive, la, la+1)
+advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
+    la = ring->fc.last_task_alive
+    while ring->get_slot_state_by_task_id(la).task_state >= CONSUMED:
+        reset slot for reuse
         la++
+    sync_to_sm()  // release-store last_task_alive
 ```
 
 Per-ring try-locks in the scheduler state prevent concurrent scheduler threads from interleaving heap_tail writes within the same ring.
@@ -180,9 +203,9 @@ DepPool is exclusively managed by scheduler thread 0 (allocation during wiring, 
 ```text
 // Called by scheduler thread 0 during wiring_queue drain:
 dep_pool_reclaim(ring_id):
-    la = rings[ring_id].fc.last_task_alive
+    la = ring->fc.last_task_alive
     newest_consumed = la - 1
-    mark = slot_states[slot(newest_consumed)].dep_pool_mark
+    mark = ring->get_slot_state_by_task_id(newest_consumed).dep_pool_mark
     if mark > 0:
         ring_sched_states[ring_id].dep_pool.advance_tail(mark)
 ```

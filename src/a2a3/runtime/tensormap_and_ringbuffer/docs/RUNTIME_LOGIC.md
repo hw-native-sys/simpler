@@ -107,11 +107,12 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 
 ```text
 ┌─────────────────────────────┐  offset 0
-│  PTO2SharedMemoryHeader     │  (flow control, config, sync flags)
+│  PTO2SharedMemoryHeader     │  (per-ring flow control + layout, global flags)
 ├─────────────────────────────┤  aligned
-│  PTO2TaskDescriptor[N]      │  N = task_window_size (default 65536)
-├─────────────────────────────┤  aligned
-│  PTO2DepListEntry[M+1]      │  M = dep_list_pool_size (entry 0 = NULL sentinel)
+│  Per-ring regions ×4:       │
+│    PTO2TaskDescriptor[N]    │  N = task_window_size per ring
+│    PTO2TaskPayload[N]       │
+│    PTO2TaskSlotState[N]     │
 └─────────────────────────────┘
 ```
 
@@ -123,13 +124,10 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 | `last_task_alive` | Scheduler | Orchestrator | Oldest still-active task (task ring tail) |
 | `heap_top` | Orchestrator | Scheduler | Heap ring allocation pointer |
 | `heap_tail` | Scheduler | Orchestrator | Heap ring reclamation pointer |
-| `heap_tail_gen` | Scheduler | Scheduler | Ticket counter for serialized `heap_tail` writes |
 | `orchestrator_done` | Orchestrator | Scheduler | Signals orchestration completion |
-| `task_window_size` | Init | Both | Number of task slots |
-| `heap_size` | Init | Both | Heap total size |
-| `dep_list_pool_size` | Init | Both | Dependency list pool size |
-| `task_descriptors_offset` | Init | Both | Offset to TaskDescriptor array in SM |
-| `dep_list_pool_offset` | Init | Both | Offset to DepListPool in SM |
+| `task_window_size` | Init | Both | Number of task slots (per-ring, in `PTO2SharedMemoryRingHeader`) |
+| `heap_size` | Init | Both | Heap total size (per-ring, in `PTO2SharedMemoryRingHeader`) |
+| `task_descriptors_offset` | Init | Both | Offset to TaskDescriptor array in SM (per-ring) |
 | `total_size` | Init | Both | Total shared memory size |
 | `graph_output_ptr` | Orchestrator | Host | Address of final output (packed buffer) |
 | `graph_output_size` | Orchestrator | Host | Size of final output in bytes |
@@ -137,8 +135,10 @@ The orchestrator and schedulers communicate through a contiguous shared memory r
 ### 3.2 Size Calculation
 
 ```text
-total = ALIGN(Header) + ALIGN(window_size * sizeof(TaskDescriptor))
-      + ALIGN((dep_pool_size + 1) * sizeof(DepListEntry))
+total = ALIGN(Header)
+      + Σ_ring [ ALIGN(window_size * sizeof(TaskDescriptor))
+               + ALIGN(window_size * sizeof(TaskPayload))
+               + ALIGN(window_size * sizeof(TaskSlotState)) ]
 ```
 
 Alignment is 64 bytes (`PTO2_ALIGN_SIZE`).
@@ -395,7 +395,7 @@ Key members:
 | 2 | Initialize task descriptor + slot state, copy parameters |
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
-| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >16); increment each producer's `fanout_count` (no lock needed — single writer) |
+| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >16); increment each producer's `fanout_count` (no lock needed — single writer). This step runs **before** `payload.init()`. |
 | 6 | **Push to wiring queue**: push to global `PTO2SpscQueue`; scheduler thread 0 asynchronously wires fanout edges (lock + dep_pool + early_finished check + ready push) |
 
 > **Note**: Fanout wiring (Steps 4–7 in earlier versions) has been moved from the
@@ -489,15 +489,15 @@ Ready queues use a lock-free bounded MPMC (Vyukov) design:
 After a task reaches state CONSUMED (4), the scheduler tries to advance `last_task_alive`:
 
 ```text
-while la < current_task_index:
-    if task_state[la & mask] < CONSUMED: break
-    reset fanin_refcount[la & mask] = 0
-    CAS(last_task_alive, la, la+1)
-    advance heap_tail from task's packed_buffer_end
-    la++
+advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
+    while la < current_task_index:
+        if task_state[la & mask] < CONSUMED: break
+        reset slot for reuse
+        la++
+    sync_to_sm()  // release-store last_task_alive
 ```
 
-This is lock-free (CAS-based) and multiple scheduler threads can attempt it concurrently. The `heap_tail_gen` ticket counter serializes `heap_tail` writes to ensure tasks' buffer regions are freed in order.
+This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, ensuring only one scheduler thread advances a given ring's watermark at a time.
 
 ---
 
