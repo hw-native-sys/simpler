@@ -21,7 +21,7 @@ A single run produces two profiling blocks in the device log:
 | Block | Emitted by | Function | Content |
 | ----- | ---------- | -------- | ------- |
 | **Orchestrator Profiling** | Thread 3 (orchestrator) | `aicpu_orchestration_entry` | Time breakdown of graph construction on device |
-| **PTO2 Scheduler Summary** | Threads 0/1/2 (schedulers) | `resolve_and_dispatch_pto2` | Per-thread scheduling statistics, phase timing, and lock contention |
+| **PTO2 Scheduler Summary** | Threads 0/1/2 (schedulers) | `SchedulerContext::resolve_and_dispatch` | Per-thread scheduling statistics, phase timing, and lock contention |
 
 All timing values are in microseconds (us), converted from AICPU cycle counters.
 

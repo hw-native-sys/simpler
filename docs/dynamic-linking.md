@@ -198,13 +198,15 @@ instead of `static` to avoid generating UNIQUE symbols at the source level.
 
 ## AicpuExecutor::deinit()
 
-The AICPU SO contains a file-scope static `AicpuExecutor g_aicpu_executor`.
+The AICPU SO contains a file-scope static `AicpuExecutor g_aicpu_executor`,
+which in turn holds a `SchedulerContext sched_ctx_` member owning all
+scheduler dispatch state (core trackers, dispatch payloads, drain state).
 When the AICPU SO is dlclosed and re-dlopen'd between tasks, the static is
 reconstructed. But when the AICPU SO is **reused** (same runtime, consecutive
 tasks), `deinit()` must reset all fields. Previously missing resets:
 
 - `cores_total_num_`, `thread_num_`, `sched_thread_num_`
-- `trackers_` / `core_trackers_`, `core_assignments_`, `core_count_per_thread_`
+- `trackers_` / `sched_ctx_.core_trackers_`, `core_assignments_`, `core_count_per_thread_`
 - `orch_func_`, `orch_args_cached_`, `orch_so_handle_`, `orch_so_path_`
 
 Applies to all 5 runtime executors: a2a3 (abg, hbg, tmr), a5 (hbg, tmr).

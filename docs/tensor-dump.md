@@ -213,8 +213,10 @@ Key class (a5):
 
 ### 2.4 Common: where dump calls are wired in
 
-Each runtime's `aicpu_executor.cpp` calls `dump_tensors_for_task` at
-two points in the per-task state machine:
+Each runtime's scheduler dispatch code calls `dump_tensors_for_task` at
+two points in the per-task state machine (for `tensormap_and_ringbuffer`,
+this is in `runtime/scheduler/scheduler_completion.cpp` and
+`runtime/scheduler/scheduler_dispatch.cpp`):
 
 ```text
 ┌──────────────────────────────────────┐
