@@ -22,7 +22,7 @@
 #include <string.h>
 #include <stdlib.h>  // for exit()
 #include "common/unified_log.h"
-#include "pto_scheduler.h"
+#include "scheduler/pto_scheduler.h"
 
 // =============================================================================
 // Fanin Spill Pool Implementation

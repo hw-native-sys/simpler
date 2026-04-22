@@ -40,7 +40,7 @@
 #include "pto_shared_memory.h"
 #include "pto_ring_buffer.h"
 #include "pto_tensormap.h"
-#include "pto_scheduler.h"
+#include "scheduler/pto_scheduler.h"
 #include "pto_orchestrator.h"
 
 // =============================================================================
