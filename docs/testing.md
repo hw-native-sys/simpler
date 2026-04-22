@@ -152,12 +152,16 @@ Both pytest and standalone (`python test_*.py`) walk the same 6-layer hierarchy:
 ```text
 Layer 1  Level axis
 │
-├─ L3 phase (runs first)
-│   One isolated subprocess per case; scheduled by device_count, bin-packed
-│   against the --device pool. CANN isolation is automatic (each case is its
-│   own process). Cross-runtime L3 cases can overlap when their devices don't.
+├─ Resource phase (runs first)
+│   One isolated subprocess per job; scheduled by device_count, bin-packed
+│   against the --device pool. Two job kinds share this phase:
+│     - L3 SceneTestCase classes (one job per class)
+│     - Standalone pytest functions marked with @pytest.mark.device_count
+│       + @pytest.mark.runtime (one job per function)
+│   CANN isolation is automatic (each job is its own process). Cross-runtime
+│   jobs can overlap when their devices don't.
 │
-└─ L2 phase (runs after L3 drains)
+└─ L2 phase (runs after Resource drains)
     │
     ├─ Layer 2  Runtime — serial subprocess per runtime (CANN isolation)
     │   └─ Layer 3  Device — parallel subprocess per device (xdist for pytest,
@@ -227,7 +231,7 @@ This matters on CPU-constrained CI runners. Example: an L3 case needs `device_co
 
 ### Mixed L2 + L3 in one file
 
-A single file can declare both L2 and L3 classes; they're grouped by `(runtime, level)` internally. L3 classes run in the L3 phase (subprocess-per-case), L2 classes run in the L2 phase (shared Worker per device).
+A single file can declare both L2 and L3 classes; they're grouped by `(runtime, level)` internally. L3 classes run in the Resource phase (subprocess-per-case, alongside standalone resource-marked functions), L2 classes run in the L2 phase (shared Worker per device).
 
 ### Profiling under parallelism
 
@@ -598,25 +602,29 @@ When a second runtime launches on the same device (same CANN process context), t
 
 ### Mitigation
 
-The dispatcher spawns a separate subprocess per runtime for L2 work and a separate subprocess per class for L3 work. Every subprocess starts from a clean CANN state, so the stale-`.so` hang is structurally impossible.
+The dispatcher spawns a separate subprocess per runtime for L2 work and a separate subprocess per job for Resource work (L3 classes and standalone resource functions). Every subprocess starts from a clean CANN state, so the stale-`.so` hang is structurally impossible.
 
 ## Device Allocation (Orchestrator + xdist)
 
 When running `pytest --platform a2a3 --device 8-11`, the dispatcher does this:
 
-### L3 phase — device bin-packing
+### Resource phase — device bin-packing
 
-For every collected L3 case, the scheduler (`simpler_setup/parallel_scheduler.py`) maintains a free-device set starting at `[8, 9, 10, 11]`. It pops the next queued case and, if the free set can cover its `device_count`, grabs that many ids and spawns:
+For every collected resource job (L3 ``SceneTestCase`` classes and standalone pytest functions marked with ``@pytest.mark.device_count`` + ``@pytest.mark.runtime``), the scheduler (`simpler_setup/parallel_scheduler.py`) maintains a free-device set starting at `[8, 9, 10, 11]`. It pops the next queued job and, if the free set can cover its `device_count`, grabs that many ids and spawns:
 
 ```text
-pytest <nodeid> --runtime <rt> --level 3 --case <Class::case> --device <alloc-range>
+# L3 class job
+pytest <nodeid> --runtime <rt> --level 3 --device <alloc-range>
+
+# Standalone resource function job
+pytest <nodeid> --runtime <rt> --device <alloc-range>
 ```
 
-When a subprocess completes, its devices return to the free set and the queue is re-tried. Cases that need more devices than currently free **wait**; cases that need more than the whole pool **fail the batch up front**.
+When a subprocess completes, its devices return to the free set and the queue is re-tried. Jobs that need more devices than currently free **wait**; jobs that need more than the whole pool **fail the batch up front**.
 
 ### L2 phase — xdist fanout per device
 
-After L3 drains, one subprocess is spawned per runtime:
+After the Resource phase drains, one subprocess is spawned per runtime:
 
 ```text
 pytest --runtime <rt> --level 2 --device 8-11 -n 4 --dist loadfile
