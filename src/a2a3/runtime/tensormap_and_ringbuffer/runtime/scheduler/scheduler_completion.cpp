@@ -20,6 +20,7 @@
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 
 // =============================================================================
@@ -151,6 +152,15 @@ void SchedulerContext::complete_slot_task(
 #if PTO2_SCHED_PROFILING
         perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
 #endif
+    }
+#endif
+
+#if PTO2_PROFILING
+    if (get_enable_pmu()) {
+        pmu_aicpu_record_task(
+            core_id, thread_idx, slot_state.task->task_id.raw,
+            slot_state.task->kernel_id[static_cast<int32_t>(subslot)], hank[core_id].core_type
+        );
     }
 #endif
 }
@@ -323,7 +333,6 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
         while (valid.has_value() && slot_state->next_block_idx < block_num) {
             dispatch_block(runtime, t, valid.pop_first(), *slot_state, shape, false);
             slot_state->next_block_idx++;
-            if (slot_state->next_block_idx < block_num) valid = core_trackers_[t].get_idle_core_offset_states(shape);
         }
     }
 

@@ -250,6 +250,12 @@ int32_t AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         CoreType type = hank->core_type;
 
         sched_ctx_.core_exec_states_[i].reg_addr = reg_addr;
+
+#if PTO2_PROFILING
+        // Record physical_core_id for PMU init later (CoreExecState has no room
+        // for this field under PTO2_PROFILING).
+        physical_core_ids_[i] = physical_core_id;
+#endif
 #if !PTO2_PROFILING
         sched_ctx_.core_exec_states_[i].worker_id = i;
         sched_ctx_.core_exec_states_[i].physical_core_id = physical_core_id;
@@ -527,6 +533,10 @@ int32_t AicpuExecutor::init(Runtime *runtime) {
     sched_ctx_.thread_num_ = thread_num_;
     sched_ctx_.core_count_per_thread_ = core_count_per_thread_;
     sched_ctx_.core_assignments_ = core_assignments_;
+#if PTO2_PROFILING
+    sched_ctx_.physical_core_ids_ = physical_core_ids_;
+    sched_ctx_.cores_total_num_ = cores_total_num_;
+#endif
     sched_ctx_.emergency_shutdown_fn_ = emergency_shutdown_callback;
 
     init_done_.store(true, std::memory_order_release);

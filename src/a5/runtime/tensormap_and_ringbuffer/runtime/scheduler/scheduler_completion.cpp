@@ -323,7 +323,6 @@ void SchedulerContext::drain_worker_dispatch(Runtime *runtime, int32_t block_num
         while (valid.has_value() && slot_state->next_block_idx < block_num) {
             dispatch_block(runtime, t, valid.pop_first(), *slot_state, shape, false);
             slot_state->next_block_idx++;
-            if (slot_state->next_block_idx < block_num) valid = core_trackers_[t].get_idle_core_offset_states(shape);
         }
     }
 

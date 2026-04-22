@@ -23,6 +23,7 @@
 
 // Performance profiling headers
 #include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 
 // =============================================================================
@@ -340,6 +341,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 #endif
 
+#if PTO2_PROFILING
+        // Initialize PMU: program events, start counters, and pop initial buffers
+        if (get_enable_pmu()) {
+            pmu_aicpu_init(physical_core_ids_, cores_total_num_);
+            DEV_INFO("PMU profiling started on %d cores", cores_total_num_);
+        }
+#endif
+
         DEV_INFO("Thread %d: one-time init done", thread_idx);
         pto2_init_complete_.store(true, std::memory_order_release);
     } else {
@@ -467,7 +476,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         for (int32_t si = 0; si < PTO2_NUM_RESOURCE_SHAPES && !entered_drain; si++) {
             PTO2ResourceShape shape = dispatch_order[si];
+#if PTO2_DISABLE_DUAL_ISSUE
+            for (auto phase : {CoreTracker::DispatchPhase::IDLE}) {
+#else
             for (auto phase : {CoreTracker::DispatchPhase::IDLE, CoreTracker::DispatchPhase::PENDING}) {
+#endif
                 dispatch_shape(
                     runtime, thread_idx, shape, phase, local_bufs[static_cast<int32_t>(shape)], tracker, entered_drain,
                     made_progress, try_pushed
@@ -569,6 +582,11 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_PROFILING
     if (get_enable_dump_tensor()) {
         dump_tensor_flush(thread_idx);
+    }
+#endif
+#if PTO2_PROFILING
+    if (get_enable_pmu()) {
+        pmu_aicpu_flush_buffers(thread_idx, core_assignments_[thread_idx], core_num);
     }
 #endif
 

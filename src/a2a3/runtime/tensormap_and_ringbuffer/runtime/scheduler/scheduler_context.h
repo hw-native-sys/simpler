@@ -87,6 +87,12 @@ public:
     int32_t *core_count_per_thread_{nullptr};
     int32_t (*core_assignments_)[MAX_CORES_PER_THREAD]{nullptr};
 
+#if PTO2_PROFILING
+    // PMU profiling: physical core IDs for PMU MMIO base resolution
+    uint32_t *physical_core_ids_{nullptr};
+    int32_t cores_total_num_{0};
+#endif
+
     // One-time init coordination
     std::atomic<bool> pto2_init_done_{false};
     std::atomic<bool> pto2_init_complete_{false};
