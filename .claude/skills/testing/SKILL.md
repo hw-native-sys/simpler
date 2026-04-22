@@ -7,7 +7,7 @@ description: Testing guide and pre-commit testing strategy for PTO Runtime. Use 
 
 ## Test Types
 
-1. **Python unit tests (ut-py)** (`tests/ut/`): Standard pytest tests for the Python compilation pipeline and nanobind bindings. Run with `pytest tests/ut`. Tests declaring `@pytest.mark.requires_hardware[("<platform>")]` auto-skip unless `--platform` points to a matching device.
+1. **Python unit tests (ut-py)** (`tests/ut/py/`): Standard pytest tests for the Python compilation pipeline and nanobind bindings. Run with `pytest tests/ut/py`. Tests declaring `@pytest.mark.requires_hardware[("<platform>")]` auto-skip unless `--platform` points to a matching device.
 2. **C++ unit tests (ut-cpp)** (`tests/ut/cpp/`): GoogleTest-based tests for pure C++ modules. Run with `cmake -B tests/ut/cpp/build -S tests/ut/cpp && cmake --build tests/ut/cpp/build && ctest --test-dir tests/ut/cpp/build -LE requires_hardware --output-on-failure`. Hardware-required tests carry a `requires_hardware` or `requires_hardware_<platform>` ctest label and are filtered via `-LE`.
 3. **Scene tests** (`examples/{arch}/*/`, `tests/st/{arch}/*/`): End-to-end `@scene_test` classes declared inside `test_*.py`. Sim variants run cross-platform (Linux/macOS); hardware variants require the CANN toolkit and an Ascend device. Discovery is by pytest (batch) or `python test_*.py` (standalone); `#591`'s parallel orchestrator handles device bin-packing and ChipWorker reuse automatically.
 
