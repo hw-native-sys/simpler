@@ -352,7 +352,7 @@ class ChipWorker:
         """Destroy the communicator and release its resources."""
         self._impl.comm_destroy(int(comm_handle))
 
-    def bootstrap_context(
+    def bootstrap_context(  # noqa: PLR0912 -- config validation + comm setup + window carving + H2D staging in one linear flow; splitting would obscure the ordered failure semantics
         self,
         device_id: int,
         cfg: ChipBootstrapConfig,
@@ -374,6 +374,29 @@ class ChipWorker:
         ordering is the caller's responsibility.
         """
         try:
+            # Validate host-staging symmetry up-front — before any device or
+            # communicator state is touched — so a missing staging entry
+            # surfaces as a clean ValueError on the channel rather than a
+            # KeyError from deep inside the flush/H2D loop (which would leave
+            # the parent waiting on a silent chip child).
+            for spec in cfg.buffers:
+                if spec.load_from_host:
+                    try:
+                        cfg.input_staging(spec.name)
+                    except KeyError:
+                        raise ValueError(
+                            f"ChipBufferSpec(name={spec.name!r}, load_from_host=True) requires a "
+                            f"matching HostBufferStaging in host_inputs; none found"
+                        ) from None
+                if spec.store_to_host:
+                    try:
+                        cfg.output_staging(spec.name)
+                    except KeyError:
+                        raise ValueError(
+                            f"ChipBufferSpec(name={spec.name!r}, store_to_host=True) requires a "
+                            f"matching HostBufferStaging in host_outputs; none found"
+                        ) from None
+
             self.set_device(device_id)
 
             device_ctx = 0

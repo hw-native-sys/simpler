@@ -397,19 +397,38 @@ def _chip_process_loop_with_bootstrap(  # noqa: PLR0912
                 except Exception as e:  # noqa: BLE001
                     code = 1
                     msg = _format_exc(f"chip_process dev={device_id}", e)
+
+                # Flush store_to_host buffers *before* publishing TASK_DONE so
+                # the parent cannot observe the mailbox transition (and start
+                # reading the output SharedMemory) while the D2H DMA is still
+                # in flight.  Only flush on a successful kernel run: on
+                # failure the device output region is undefined and stamping
+                # garbage into the parent's SharedMemory would mask the real
+                # error in any post-mortem.
+                if code == 0:
+                    for dev_ptr, staging in _store_to_host:
+                        # Skip zero-byte stagings up-front — mirrors the
+                        # load_from_host H2D path in task_interface.py and
+                        # avoids a spurious ValueError from
+                        # ``ctypes.c_char.from_buffer`` on an empty buffer.
+                        if staging.size == 0:
+                            continue
+                        try:
+                            shm = SharedMemory(name=staging.shm_name)
+                            try:
+                                shm_buf = shm.buf
+                                assert shm_buf is not None
+                                host_ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
+                                cw.copy_from(host_ptr, dev_ptr, staging.size)
+                            finally:
+                                shm.close()
+                        except Exception as e:  # noqa: BLE001
+                            code = 1
+                            msg = _format_exc(f"chip_process dev={device_id} store_to_host={staging.name!r}", e)
+                            break
+
                 _write_error(buf, code, msg)
                 _mailbox_store_i32(state_addr, _TASK_DONE)
-
-                # Post-task: flush store_to_host buffers to SharedMemory.
-                for dev_ptr, staging in _store_to_host:
-                    shm = SharedMemory(name=staging.shm_name)
-                    try:
-                        shm_buf = shm.buf
-                        assert shm_buf is not None
-                        host_ptr = ctypes.addressof(ctypes.c_char.from_buffer(shm_buf))
-                        cw._impl.copy_from(host_ptr, dev_ptr, staging.size)
-                    finally:
-                        shm.close()
             elif state == _CONTROL_REQUEST:
                 sub_cmd = struct.unpack_from("Q", buf, _OFF_CALLABLE)[0]
                 code = 0
