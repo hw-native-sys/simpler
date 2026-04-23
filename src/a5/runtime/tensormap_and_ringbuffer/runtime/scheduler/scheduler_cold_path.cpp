@@ -16,6 +16,7 @@
 #include "aicpu/device_time.h"
 #include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
+#include "aicpu/pmu_collector_aicpu.h"
 #include "common/memory_barrier.h"
 #include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
@@ -349,6 +350,13 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     int32_t core_num = core_trackers_[thread_idx].core_num();
     if (core_num == 0) return 0;
 
+#if PTO2_PROFILING
+    // Restore PMU CTRL registers for this thread's cores before AICore shutdown
+    if (get_enable_pmu()) {
+        pmu_aicpu_finalize(cores, core_num);
+    }
+#endif
+
     DEV_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
     for (int32_t i = 0; i < core_num; i++) {
         int32_t core_id = cores[i];
@@ -427,6 +435,10 @@ int32_t SchedulerContext::handshake_all_cores(Runtime *runtime) {
         CoreType type = hank->core_type;
 
         core_exec_states_[i].reg_addr = reg_addr;
+
+#if PTO2_PROFILING
+        physical_core_ids_[i] = physical_core_id;
+#endif
 
 #if !PTO2_PROFILING
         core_exec_states_[i].worker_id = i;

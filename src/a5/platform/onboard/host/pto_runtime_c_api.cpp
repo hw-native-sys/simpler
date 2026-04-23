@@ -202,7 +202,9 @@ int run_runtime(
 
         std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
         std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);
-        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num, enable_dump_tensor != 0);
+        rc = runner->run(
+            *r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num, enable_dump_tensor != 0, enable_pmu
+        );
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();

@@ -97,6 +97,8 @@ constexpr int RUNTIME_DEFAULT_READY_QUEUE_SHARDS = PLATFORM_MAX_AICPU_THREADS - 
  * - control: Written by AICPU, read by AICore (0 = continue, 1 = quit)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
  * - enable_profiling_flag: Written by host/AICPU init, read by AICore (bitmask)
+ * - pmu_buffer_addr: Written by AICPU at PMU init (before aicpu_regs_ready=1), read by AICore
+ * - pmu_reg_base: Written by AICPU at PMU init (before aicpu_regs_ready=1), read by AICore
  */
 struct Handshake {
     volatile uint32_t aicpu_ready;            // AICPU ready signal: 0=not ready, 1=ready
@@ -111,7 +113,9 @@ struct Handshake {
     volatile uint32_t aicpu_regs_ready;       // AICPU register init done: 0=pending, 1=done
     volatile uint32_t aicore_regs_ready;      // AICore ID reported: 0=pending, 1=done
     volatile uint32_t
-        enable_profiling_flag;  // Generic profiling-related flags; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
+        enable_profiling_flag;          // Generic profiling-related flags; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
+    volatile uint64_t pmu_buffer_addr;  // Per-core PmuBuffer device address (for AICore-side PMU record)
+    volatile uint64_t pmu_reg_base;     // Per-core PMU MMIO base (for AICore-side PMU register reads)
 } __attribute__((aligned(64)));
 
 /**

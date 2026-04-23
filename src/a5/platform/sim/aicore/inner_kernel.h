@@ -114,6 +114,24 @@ typedef int mem_dsb_t;
 #define OUT_OF_ORDER_FULL_BARRIER() __sync_synchronize()
 
 // =============================================================================
+// MMIO Load/Store Intrinsics (sim stubs)
+// =============================================================================
+
+// ld_dev — AICore MMIO load intrinsic. CANN provides this on real AICore
+// (cce_aicore_intrinsics.h):
+//   int64_t ld_dev(int32_t *src, int16_t offset)
+// In simulation we route it through sparse_reg_ptr so PMU MMIO reads land
+// on the same per-core sim register block that AICPU uses (the PMU page
+// covers offsets 0x2400-0x43FF in the sparse layout).
+inline int64_t ld_dev(int32_t *src, int16_t offset) {
+    auto *base = reinterpret_cast<volatile uint8_t *>(src);
+    auto *p = reinterpret_cast<volatile uint32_t *>(sparse_reg_ptr(base, static_cast<uint32_t>(offset)));
+    int64_t val = static_cast<int64_t>(*p);
+    OUT_OF_ORDER_LOAD_BARRIER();
+    return val;
+}
+
+// =============================================================================
 // System Counter Simulation
 // =============================================================================
 

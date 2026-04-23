@@ -159,6 +159,13 @@ int DeviceRunner::ensure_binaries_loaded(
             return -1;
         }
 
+        // PMU bindings — tolerated as optional so a5sim keeps building against
+        // pre-PMU AICPU SOs during the transition. Missing symbols mean PMU
+        // is unavailable on this build and set_enable_pmu_func_ stays null.
+        set_platform_pmu_base_func_ =
+            reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_pmu_base"));
+        set_enable_pmu_func_ = reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_enable_pmu"));
+
         LOG_INFO("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
     }
 
@@ -223,8 +230,10 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
 
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor
+    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor, int enable_pmu
 ) {
+    bool pmu_enabled = enable_pmu > 0;
+    uint32_t pmu_event_type = resolve_pmu_event_type(enable_pmu);
     // Validate launch_aicpu_num
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
@@ -291,6 +300,9 @@ int DeviceRunner::run(
     if (runtime.enable_l2_swimlane) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
     }
+    if (pmu_enabled) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -337,6 +349,15 @@ int DeviceRunner::run(
         }
     }
 
+    // Initialize PMU profiling if enabled
+    if (pmu_enabled) {
+        rc = init_pmu(num_aicore, pmu_event_type);
+        if (rc != 0) {
+            LOG_ERROR("init_pmu failed: %d", rc);
+            return rc;
+        }
+    }
+
     // Allocate simulated register blocks for all AICore cores
     // Using sparse mapping: 2 x 4KB pages per core instead of 24KB contiguous block
     size_t total_reg_size = num_aicore * SIM_REG_TOTAL_SIZE;
@@ -371,9 +392,7 @@ int DeviceRunner::run(
         }
     });
 
-    LOG_INFO(
-        "Allocated simulated registers: %d cores x 0x%x bytes (sparse: 2x4KB pages)", num_aicore, SIM_REG_TOTAL_SIZE
-    );
+    LOG_INFO("Allocated simulated registers: %d cores x 0x%x bytes (sparse: 3 pages)", num_aicore, SIM_REG_TOTAL_SIZE);
 
     // Check if executors are loaded
     if (aicpu_execute_func_ == nullptr || aicore_execute_func_ == nullptr) {
@@ -385,6 +404,16 @@ int DeviceRunner::run(
     set_platform_regs_func_(kernel_args_.regs);
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
     set_enable_dump_tensor_func_(enable_dump_tensor);
+
+    // Publish PMU session state to the AICPU SO (dlsym symbols are optional —
+    // older SOs without PMU support leave these nullptr, which simply turns
+    // PMU into a no-op in the AICPU executors).
+    if (set_platform_pmu_base_func_ != nullptr) {
+        set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
+    }
+    if (set_enable_pmu_func_ != nullptr) {
+        set_enable_pmu_func_(pmu_enabled);
+    }
 
     // Launch AICPU threads (over-launch for affinity gate)
     constexpr int over_launch = PLATFORM_MAX_AICPU_THREADS_JUST_FOR_LAUNCH;
@@ -434,6 +463,12 @@ int DeviceRunner::run(
         dump_collector_.export_dump_files();
     }
 
+    // Collect and export PMU data (sim callbacks are plain memcpy)
+    if (pmu_enabled && pmu_collector_.is_initialized()) {
+        pmu_collector_.collect_all();
+        pmu_collector_.export_csv();
+    }
+
     // Print handshake results at end of run
     print_handshake_results();
 
@@ -468,6 +503,8 @@ void DeviceRunner::unload_executor_binaries() {
         set_platform_regs_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;
         set_enable_dump_tensor_func_ = nullptr;
+        set_platform_pmu_base_func_ = nullptr;
+        set_enable_pmu_func_ = nullptr;
     }
     if (!aicpu_so_path_.empty()) {
         std::remove(aicpu_so_path_.c_str());
@@ -499,6 +536,11 @@ int DeviceRunner::finalize() {
     // Cleanup tensor dump
     if (dump_collector_.is_initialized()) {
         dump_collector_.finalize();
+    }
+
+    // Cleanup PMU profiling
+    if (pmu_collector_.is_initialized()) {
+        pmu_collector_.finalize();
     }
 
     // Kernel binaries should have been removed by validate_runtime_impl()
@@ -696,4 +738,27 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
 
     kernel_args_.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_setup_device_ptr());
     return 0;
+}
+
+int DeviceRunner::init_pmu(int num_aicore, uint32_t event_type) {
+    auto alloc_cb = [](size_t size) -> void * {
+        return malloc(size);
+    };
+    auto free_cb = [](void *dev_ptr) -> int {
+        free(dev_ptr);
+        return 0;
+    };
+    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
+        std::memcpy(dev_dst, host_src, size);
+        return 0;
+    };
+    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
+        std::memcpy(host_dst, dev_src, size);
+        return 0;
+    };
+
+    int rc = pmu_collector_.initialize(
+        num_aicore, event_type, &kernel_args_.pmu_data_base, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
+    );
+    return rc;
 }

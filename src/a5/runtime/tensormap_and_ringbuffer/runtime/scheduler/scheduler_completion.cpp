@@ -20,6 +20,7 @@
 
 // Performance profiling headers
 #include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 
 // =============================================================================
@@ -151,6 +152,20 @@ void SchedulerContext::complete_slot_task(
 #if PTO2_SCHED_PROFILING
         l2_perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
 #endif
+    }
+#endif
+
+#if PTO2_PROFILING
+    if (get_enable_pmu()) {
+        // Slot key must be the 32-bit register token AICore wrote into
+        // dual_issue_slots[task_id & 1].task_id (= DATA_MAIN_BASE value).
+        // task_id.raw is the full PTO2 (ring_id<<32|local_id) encoding —
+        // matching on that would never hit. Pass the PTO2 id separately
+        // for the PmuRecord.
+        pmu_aicpu_complete_record(
+            core_id, thread_idx, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
+            slot_state.task->kernel_id[static_cast<int32_t>(subslot)], hank[core_id].core_type
+        );
     }
 #endif
 }

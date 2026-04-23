@@ -153,6 +153,15 @@ private:
     int32_t aic_count_{0};
     int32_t aiv_count_{0};
 
+#if PTO2_PROFILING
+    // Physical core ids keyed by logical worker id. Populated by
+    // handshake_all_cores() and handed to pmu_aicpu_init() so the platform
+    // can resolve per-core PMU MMIO bases. Only needed when PTO2_PROFILING=1
+    // — without it, PMU is compiled out and core_exec_states_ already
+    // carries the field.
+    uint32_t physical_core_ids_[RUNTIME_MAX_WORKER]{};
+#endif
+
     // Platform AICore-register base array (set by AicpuExecutor before init()).
     uint64_t regs_{0};
 

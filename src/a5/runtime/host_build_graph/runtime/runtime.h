@@ -105,7 +105,7 @@
  * is the umbrella, each bit is a parallel diagnostics sub-feature):
  * - bit0: tensor dump enabled
  * - bit1: L2 swimlane enabled
- * - bit2: PMU enabled (reserved on a5; a2a3 wires through device_runner)
+ * - bit2: PMU enabled
  *
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
@@ -118,6 +118,8 @@
  * - l2_perf_buffer_status: Written by both (AICPU=1 on buffer full, AICore=0 on buffer empty)
  * - physical_core_id: Written by AICPU, read by AICore (physical core ID)
  * - enable_profiling_flag: Written by host/AICPU init, read by AICore (bitmask)
+ * - pmu_buffer_addr: Written by AICPU at PMU init (before aicpu_regs_ready=1), read by AICore
+ * - pmu_reg_base: Written by AICPU at PMU init (before aicpu_regs_ready=1), read by AICore
  */
 struct Handshake {
     volatile uint32_t aicpu_ready;            // AICPU ready signal: 0=not ready, 1=ready
@@ -132,7 +134,9 @@ struct Handshake {
     volatile uint32_t aicpu_regs_ready;       // AICPU register init done: 0=pending, 1=done
     volatile uint32_t aicore_regs_ready;      // AICore ID reported: 0=pending, 1=done
     volatile uint32_t
-        enable_profiling_flag;  // Umbrella diagnostics bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
+        enable_profiling_flag;          // Umbrella diagnostics bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
+    volatile uint64_t pmu_buffer_addr;  // Per-core PmuBuffer device address (for AICore-side PMU record)
+    volatile uint64_t pmu_reg_base;     // Per-core PMU MMIO base (for AICore-side PMU register reads)
 } __attribute__((aligned(64)));
 
 /**

@@ -11,8 +11,10 @@
 
 #include "aicore/aicore.h"
 #include "aicore/l2_perf_collector_aicore.h"
+#include "aicore/pmu_collector_aicore.h"
 #include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"  // Register-based communication
+#include "common/pmu_profiling.h"
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
 
@@ -90,6 +92,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
     bool l2_perf_enabled = runtime->enable_l2_swimlane;
     bool dump_tensor_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
+    bool pmu_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_PMU);
 
     // Phase 4: Main execution loop - poll register for tasks until exit signal
     // Register encoding: AICPU_IDLE_TASK_ID=idle, task_id=task, AICORE_EXIT_SIGNAL=exit
@@ -124,8 +127,21 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
             // Performance profiling: record start time
             uint64_t start_time = get_sys_cnt_aicore();
 
+            if (pmu_enabled) {
+                pmu_aicore_begin();
+            }
+
             // Execute the task
             execute_task(exec_payload);
+
+            if (pmu_enabled) {
+                pmu_aicore_end();
+                // Read pmu_buffer_addr / pmu_reg_base per-task (mirrors how
+                // perf_records_addr is read below): by the time AICPU dispatches
+                // a real task_id, pmu_aicpu_init has already published these.
+                __gm__ PmuBuffer *pmu_buf = reinterpret_cast<__gm__ PmuBuffer *>(my_hank->pmu_buffer_addr);
+                pmu_aicore_record_task(pmu_buf, my_hank->pmu_reg_base, task_id);
+            }
 
             if (dump_tensor_enabled) {
                 pipe_barrier(PIPE_ALL);

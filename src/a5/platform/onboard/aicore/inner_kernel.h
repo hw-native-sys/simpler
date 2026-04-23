@@ -57,7 +57,13 @@ __aicore__ inline uint64_t read_reg(RegId reg) {
         __asm__ volatile("MOV %0, DATA_MAIN_BASE\n" : "=l"(val));
         return static_cast<uint64_t>(val);
     }
+    case RegId::CTRL:
+        return static_cast<uint64_t>(get_ctrl());
     case RegId::COND:
+    default:
+        // PMU MMIO regs are read via ld_dev(base, offset) — see
+        // pmu_collector_aicore.h. This single-arg SPR form only covers
+        // DATA_MAIN_BASE / CTRL / COND.
         return 0;
     }
 }
@@ -73,7 +79,13 @@ __aicore__ inline void write_reg(RegId reg, uint64_t value) {
     case RegId::COND:
         set_cond(static_cast<uint32_t>(value));
         break;
-    case RegId::DATA_MAIN_BASE:
+    case RegId::CTRL:
+        set_ctrl(value);
+        break;
+    default:
+        // DATA_MAIN_BASE is write-only from AICPU; PMU MMIO regs are
+        // written only by AICPU (init/finalize path). AICore does not
+        // need a write path here.
         break;
     }
 }

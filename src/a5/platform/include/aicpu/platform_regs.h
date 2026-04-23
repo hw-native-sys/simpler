@@ -49,6 +49,10 @@ void set_platform_regs(uint64_t regs);
  * Get the platform register base address array.
  * Called by runtime AICPU executor code that needs register access.
  *
+ * On DAV_3510 the per-core halResMap(RES_AICORE) mapping covers both the
+ * AICore SPR page (DATA_MAIN_BASE, COND, CTRL) and the PMU MMIO page, so
+ * PMU helpers also read counters through this same register-base array.
+ *
  * @return Pointer (as uint64_t) to per-core register base address array
  */
 uint64_t get_platform_regs();

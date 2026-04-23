@@ -43,6 +43,7 @@
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
 #include "host/l2_perf_collector.h"
+#include "host/pmu_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "runtime.h"
 
@@ -227,7 +228,8 @@ public:
      */
     int
     run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1, bool enable_dump_tensor = false);
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1, bool enable_dump_tensor = false,
+        int enable_pmu = 0);
 
     /**
      * Print handshake results from device
@@ -375,6 +377,9 @@ private:
     // Tensor dump (independent from profiling)
     TensorDumpCollector dump_collector_;
 
+    // PMU profiling (per-task AICore hardware counters)
+    PmuCollector pmu_collector_;
+
     /**
      * Ensure device is initialized (lazy initialization)
      *
@@ -430,6 +435,18 @@ private:
      * @return 0 on success, error code on failure
      */
     int init_tensor_dump(Runtime &runtime, int num_aicore, int device_id);
+
+    /**
+     * Initialize PMU profiling device buffers.
+     *
+     * Allocates a PmuSetupHeader and one PmuBuffer per core on device, then
+     * publishes the setup-header pointer into kernel_args.pmu_data_base.
+     *
+     * @param num_aicore   Number of AICore instances to profile
+     * @param event_type   Resolved PmuEventType value
+     * @return 0 on success, error code on failure
+     */
+    int init_pmu(int num_aicore, uint32_t event_type);
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

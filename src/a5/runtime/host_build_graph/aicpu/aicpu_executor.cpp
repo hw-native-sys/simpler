@@ -17,6 +17,7 @@
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
@@ -63,6 +64,13 @@ struct AicpuExecutor {
 
     // Fast lookup: core_id -> reg_addr
     uint64_t core_id_to_reg_addr_[MAX_CORES_PER_THREAD];
+
+#if PTO2_PROFILING
+    // Physical core ids keyed by logical worker id. Populated by discover_cores()
+    // and handed to pmu_aicpu_init() so the platform can resolve per-core PMU
+    // MMIO bases from the host-supplied pmu_reg_addrs table.
+    uint32_t physical_core_ids_[MAX_CORES_PER_THREAD]{};
+#endif
 
     // Platform register base address array (set via get_platform_regs())
     uint64_t regs_{0};
@@ -335,6 +343,10 @@ int AicpuExecutor::init(Runtime *runtime) {
     if (get_enable_dump_tensor()) {
         dump_tensor_init(thread_num_);
     }
+    if (get_enable_pmu()) {
+        pmu_aicpu_init(runtime->workers, physical_core_ids_, cores_total_num_);
+        LOG_INFO("PMU profiling started on %d cores", cores_total_num_);
+    }
 #endif
 
     init_done_.store(true, std::memory_order_release);
@@ -437,6 +449,9 @@ int AicpuExecutor::handshake_all_cores(Runtime *runtime) {
         }
 
         core_id_to_reg_addr_[i] = reg_addr;
+#if PTO2_PROFILING
+        physical_core_ids_[i] = physical_core_id;
+#endif
 
         LOG_INFO(
             "  Core %d: type=%s, physical_id=%u, reg_addr=0x%lx", i, core_type_to_string(type), physical_core_id,
@@ -772,6 +787,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                     );
 
+#if PTO2_PROFILING
+                    if (get_enable_pmu()) {
+                        pmu_aicpu_complete_record(
+                            core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
+                            static_cast<uint64_t>(prev_running_id), prev_running_task->func_id, h->core_type
+                        );
+                    }
+#endif
+
                     LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
                 }
 
@@ -780,6 +804,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     task, runtime, thread_idx, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
                     cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                 );
+
+#if PTO2_PROFILING
+                if (get_enable_pmu()) {
+                    pmu_aicpu_complete_record(
+                        core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
+                        static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type
+                    );
+                }
+#endif
 
                 made_progress = true;
 
@@ -835,6 +868,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         prev_running_task, runtime, thread_idx, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
                         cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                     );
+
+#if PTO2_PROFILING
+                    if (get_enable_pmu()) {
+                        pmu_aicpu_complete_record(
+                            core_id, thread_idx, static_cast<uint32_t>(prev_running_id),
+                            static_cast<uint64_t>(prev_running_id), prev_running_task->func_id, h->core_type
+                        );
+                    }
+#endif
 
                     LOG_INFO("Thread %d: Core %d resolved old running task %d", thread_idx, core_id, prev_running_id);
                 }
@@ -895,6 +937,15 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     task, runtime, thread_idx, cur_ready_queue_aic, cur_aic_tail, cur_aic_ready_count,
                     cur_ready_queue_aiv, cur_aiv_tail, cur_aiv_ready_count
                 );
+
+#if PTO2_PROFILING
+                if (get_enable_pmu()) {
+                    pmu_aicpu_complete_record(
+                        core_id, thread_idx, static_cast<uint32_t>(completed_task_id),
+                        static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type
+                    );
+                }
+#endif
 
                 made_progress = true;
 
@@ -1052,6 +1103,13 @@ int AicpuExecutor::run(Runtime *runtime) {
     LOG_INFO("Thread %d: Runtime has %d tasks", thread_idx, runtime->get_task_count());
     int completed = resolve_and_dispatch(*runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
+
+#if PTO2_PROFILING
+    // Restore PMU CTRL registers for this thread's cores before AICore shutdown
+    if (get_enable_pmu()) {
+        pmu_aicpu_finalize(cur_thread_cores, thread_cores_num_[thread_idx]);
+    }
+#endif
 
     int rc = shutdown_aicore(runtime, thread_idx, cur_thread_cores);
     if (rc != 0) {

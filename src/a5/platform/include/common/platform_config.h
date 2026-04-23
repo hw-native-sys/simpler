@@ -116,7 +116,7 @@ inline double cycles_to_us(uint64_t cycles) {
 #define PROFILING_FLAG_NONE 0u
 #define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
 #define PROFILING_FLAG_L2_SWIMLANE (1u << 1)
-#define PROFILING_FLAG_PMU (1u << 2)  // a5: reserved (no PMU support yet)
+#define PROFILING_FLAG_PMU (1u << 2)
 #define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
 #define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
 #define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))
@@ -171,12 +171,30 @@ constexpr int PLATFORM_DUMP_READYQUEUE_SIZE = PLATFORM_MAX_AICPU_THREADS * PLATF
 constexpr int PLATFORM_DUMP_TIMEOUT_SECONDS = 30;
 
 // =============================================================================
+// PMU Profiling Configuration
+// =============================================================================
+
+/**
+ * Number of PmuRecord entries per PmuBuffer.
+ * A5 uses a single pre-allocated PmuBuffer per core (no SPSC free-queue
+ * streaming — device memory is drained via rtMemcpy after stream sync).
+ * Tasks past this count are dropped and counted in the buffer header.
+ */
+constexpr int PLATFORM_PMU_RECORDS_PER_BUFFER = 4096;
+
+/**
+ * Idle timeout duration for PMU collection (seconds)
+ */
+constexpr int PLATFORM_PMU_TIMEOUT_SECONDS = 30;
+
+// =============================================================================
 // Register Communication Configuration
 // =============================================================================
 
 // Register offsets for AICore SPR access
 constexpr uint32_t REG_SPR_DATA_MAIN_BASE_OFFSET = 0xD0;  // Task dispatch (AICPU→AICore)
 constexpr uint32_t REG_SPR_COND_OFFSET = 0x5108;          // Status (AICore→AICPU): 0=IDLE, 1=BUSY
+constexpr uint32_t REG_SPR_CTRL_OFFSET = 0x0;             // AICore internal CTRL SPR (bit0 = PMU enable)
 
 // Exit signal for AICore shutdown
 constexpr uint32_t AICORE_EXIT_SIGNAL = 0x7FFFFFF0;
@@ -184,13 +202,108 @@ constexpr uint32_t AICORE_EXIT_SIGNAL = 0x7FFFFFF0;
 // Physical core ID mask for get_coreid()
 constexpr uint32_t AICORE_COREID_MASK = 0x0FFF;
 
+// DAV_3510 hardware counter count.
+constexpr int PMU_COUNTER_COUNT_A5 = 10;
+
+// PMU MMIO register offsets (DAV_3510 / a5). Values ported from pypto
+// aicore_prof_dav3510_pmu.h. Accessed by AICPU through the per-core PMU
+// register block (separate from the AICore SPR block used for DATA_MAIN_BASE
+// and COND). AICore does not touch these — it only toggles its internal
+// CTRL SPR (REG_SPR_CTRL_OFFSET) for per-task counter gating.
+constexpr uint32_t REG_MMIO_PMU_CTRL_0_OFFSET = 0x4200;      // PMU framework enable (GLB_PMU_EN | USER | SAMPLE)
+constexpr uint32_t REG_MMIO_PMU_CTRL_1_OFFSET = 0x2400;      // PMU secondary control (a5 only)
+constexpr uint32_t REG_MMIO_PMU_CNT0_OFFSET = 0x4210;        // Event counter 0
+constexpr uint32_t REG_MMIO_PMU_CNT1_OFFSET = 0x4218;        // Event counter 1
+constexpr uint32_t REG_MMIO_PMU_CNT2_OFFSET = 0x4220;        // Event counter 2
+constexpr uint32_t REG_MMIO_PMU_CNT3_OFFSET = 0x4228;        // Event counter 3
+constexpr uint32_t REG_MMIO_PMU_CNT4_OFFSET = 0x4230;        // Event counter 4
+constexpr uint32_t REG_MMIO_PMU_CNT5_OFFSET = 0x4238;        // Event counter 5
+constexpr uint32_t REG_MMIO_PMU_CNT6_OFFSET = 0x4240;        // Event counter 6
+constexpr uint32_t REG_MMIO_PMU_CNT7_OFFSET = 0x4248;        // Event counter 7
+constexpr uint32_t REG_MMIO_PMU_CNT8_OFFSET = 0x4250;        // Event counter 8 (a5 only)
+constexpr uint32_t REG_MMIO_PMU_CNT9_OFFSET = 0x4254;        // Event counter 9 (a5 only)
+constexpr uint32_t REG_MMIO_PMU_CNT_TOTAL0_OFFSET = 0x4260;  // Total cycle counter, low 32 bits
+constexpr uint32_t REG_MMIO_PMU_CNT_TOTAL1_OFFSET = 0x4264;  // Total cycle counter, high 32 bits
+constexpr uint32_t REG_MMIO_PMU_START_CYC0_OFFSET = 0x42A0;  // Counting-range start cycle, low 32 bits
+constexpr uint32_t REG_MMIO_PMU_START_CYC1_OFFSET = 0x42A4;  // Counting-range start cycle, high 32 bits
+constexpr uint32_t REG_MMIO_PMU_STOP_CYC0_OFFSET = 0x42A8;   // Counting-range stop cycle, low 32 bits
+constexpr uint32_t REG_MMIO_PMU_STOP_CYC1_OFFSET = 0x42AC;   // Counting-range stop cycle, high 32 bits
+constexpr uint32_t REG_MMIO_PMU_CNT0_IDX_OFFSET = 0x2500;    // Event selector for CNT0
+constexpr uint32_t REG_MMIO_PMU_CNT1_IDX_OFFSET = 0x2504;    // Event selector for CNT1
+constexpr uint32_t REG_MMIO_PMU_CNT2_IDX_OFFSET = 0x2508;    // Event selector for CNT2
+constexpr uint32_t REG_MMIO_PMU_CNT3_IDX_OFFSET = 0x250C;    // Event selector for CNT3
+constexpr uint32_t REG_MMIO_PMU_CNT4_IDX_OFFSET = 0x2510;    // Event selector for CNT4
+constexpr uint32_t REG_MMIO_PMU_CNT5_IDX_OFFSET = 0x2514;    // Event selector for CNT5
+constexpr uint32_t REG_MMIO_PMU_CNT6_IDX_OFFSET = 0x2518;    // Event selector for CNT6
+constexpr uint32_t REG_MMIO_PMU_CNT7_IDX_OFFSET = 0x251C;    // Event selector for CNT7
+constexpr uint32_t REG_MMIO_PMU_CNT8_IDX_OFFSET = 0x2520;    // Event selector for CNT8 (a5 only)
+constexpr uint32_t REG_MMIO_PMU_CNT9_IDX_OFFSET = 0x2524;    // Event selector for CNT9 (a5 only)
+
+// PMU_CTRL_0 enable value: GLB_PMU_EN | (USER_PMU_MODE_EN << 1) | (SAMPLE_PMU_MODE_EN << 2)
+constexpr uint32_t REG_MMIO_PMU_CTRL_0_ENABLE_VAL = 0x7;
+// PMU_CTRL_1 enable value: GLB_PMU_EN (a5 only; second control register)
+constexpr uint32_t REG_MMIO_PMU_CTRL_1_ENABLE_VAL = 0x1;
+
 /**
- * Register identifier for unified read_reg/write_reg interface
+ * Register identifier for unified read_reg/write_reg interface.
+ *
+ * The PMU counter slots (PMU_CNT0..PMU_CNT9) and event selector slots
+ * (PMU_CNT0_IDX..PMU_CNT9_IDX) are assigned contiguous values so that
+ * reg_index(base, i) can index into them as arrays. Keep these runs
+ * contiguous — static_asserts below enforce this.
  */
 enum class RegId : uint8_t {
     DATA_MAIN_BASE = 0,  // Task dispatch (AICPU→AICore)
     COND = 1,            // Status (AICore→AICPU)
+    CTRL = 2,            // AICore internal CTRL SPR (PMU enable, etc.) — AICore-only
+
+    // PMU framework (AICPU-only; AICore does not access these)
+    PMU_CTRL_0 = 3,
+    PMU_CTRL_1 = 4,
+
+    // PMU counters (10 contiguous slots)
+    PMU_CNT0 = 5,
+    PMU_CNT1 = 6,
+    PMU_CNT2 = 7,
+    PMU_CNT3 = 8,
+    PMU_CNT4 = 9,
+    PMU_CNT5 = 10,
+    PMU_CNT6 = 11,
+    PMU_CNT7 = 12,
+    PMU_CNT8 = 13,
+    PMU_CNT9 = 14,
+
+    // PMU total cycle counter (64-bit split across two 32-bit regs)
+    PMU_CNT_TOTAL0 = 15,
+    PMU_CNT_TOTAL1 = 16,
+
+    // PMU counting-range start/stop cycle bounds
+    PMU_START_CYC0 = 17,
+    PMU_START_CYC1 = 18,
+    PMU_STOP_CYC0 = 19,
+    PMU_STOP_CYC1 = 20,
+
+    // PMU event selectors (10 contiguous slots, parallel to PMU_CNT0..CNT9)
+    PMU_CNT0_IDX = 21,
+    PMU_CNT1_IDX = 22,
+    PMU_CNT2_IDX = 23,
+    PMU_CNT3_IDX = 24,
+    PMU_CNT4_IDX = 25,
+    PMU_CNT5_IDX = 26,
+    PMU_CNT6_IDX = 27,
+    PMU_CNT7_IDX = 28,
+    PMU_CNT8_IDX = 29,
+    PMU_CNT9_IDX = 30,
 };
+
+static_assert(
+    static_cast<int>(RegId::PMU_CNT9) - static_cast<int>(RegId::PMU_CNT0) == 9,
+    "PMU_CNT0..PMU_CNT9 must be contiguous for reg_index()"
+);
+static_assert(
+    static_cast<int>(RegId::PMU_CNT9_IDX) - static_cast<int>(RegId::PMU_CNT0_IDX) == 9,
+    "PMU_CNT0_IDX..PMU_CNT9_IDX must be contiguous for reg_index()"
+);
 
 /**
  * Map RegId to hardware register offset
@@ -201,28 +314,97 @@ constexpr uint32_t reg_offset(RegId reg) {
         return REG_SPR_DATA_MAIN_BASE_OFFSET;
     case RegId::COND:
         return REG_SPR_COND_OFFSET;
+    case RegId::CTRL:
+        return REG_SPR_CTRL_OFFSET;
+    case RegId::PMU_CTRL_0:
+        return REG_MMIO_PMU_CTRL_0_OFFSET;
+    case RegId::PMU_CTRL_1:
+        return REG_MMIO_PMU_CTRL_1_OFFSET;
+    case RegId::PMU_CNT0:
+        return REG_MMIO_PMU_CNT0_OFFSET;
+    case RegId::PMU_CNT1:
+        return REG_MMIO_PMU_CNT1_OFFSET;
+    case RegId::PMU_CNT2:
+        return REG_MMIO_PMU_CNT2_OFFSET;
+    case RegId::PMU_CNT3:
+        return REG_MMIO_PMU_CNT3_OFFSET;
+    case RegId::PMU_CNT4:
+        return REG_MMIO_PMU_CNT4_OFFSET;
+    case RegId::PMU_CNT5:
+        return REG_MMIO_PMU_CNT5_OFFSET;
+    case RegId::PMU_CNT6:
+        return REG_MMIO_PMU_CNT6_OFFSET;
+    case RegId::PMU_CNT7:
+        return REG_MMIO_PMU_CNT7_OFFSET;
+    case RegId::PMU_CNT8:
+        return REG_MMIO_PMU_CNT8_OFFSET;
+    case RegId::PMU_CNT9:
+        return REG_MMIO_PMU_CNT9_OFFSET;
+    case RegId::PMU_CNT_TOTAL0:
+        return REG_MMIO_PMU_CNT_TOTAL0_OFFSET;
+    case RegId::PMU_CNT_TOTAL1:
+        return REG_MMIO_PMU_CNT_TOTAL1_OFFSET;
+    case RegId::PMU_START_CYC0:
+        return REG_MMIO_PMU_START_CYC0_OFFSET;
+    case RegId::PMU_START_CYC1:
+        return REG_MMIO_PMU_START_CYC1_OFFSET;
+    case RegId::PMU_STOP_CYC0:
+        return REG_MMIO_PMU_STOP_CYC0_OFFSET;
+    case RegId::PMU_STOP_CYC1:
+        return REG_MMIO_PMU_STOP_CYC1_OFFSET;
+    case RegId::PMU_CNT0_IDX:
+        return REG_MMIO_PMU_CNT0_IDX_OFFSET;
+    case RegId::PMU_CNT1_IDX:
+        return REG_MMIO_PMU_CNT1_IDX_OFFSET;
+    case RegId::PMU_CNT2_IDX:
+        return REG_MMIO_PMU_CNT2_IDX_OFFSET;
+    case RegId::PMU_CNT3_IDX:
+        return REG_MMIO_PMU_CNT3_IDX_OFFSET;
+    case RegId::PMU_CNT4_IDX:
+        return REG_MMIO_PMU_CNT4_IDX_OFFSET;
+    case RegId::PMU_CNT5_IDX:
+        return REG_MMIO_PMU_CNT5_IDX_OFFSET;
+    case RegId::PMU_CNT6_IDX:
+        return REG_MMIO_PMU_CNT6_IDX_OFFSET;
+    case RegId::PMU_CNT7_IDX:
+        return REG_MMIO_PMU_CNT7_IDX_OFFSET;
+    case RegId::PMU_CNT8_IDX:
+        return REG_MMIO_PMU_CNT8_IDX_OFFSET;
+    case RegId::PMU_CNT9_IDX:
+        return REG_MMIO_PMU_CNT9_IDX_OFFSET;
     }
     return 0;  // unreachable: all RegId cases handled above
 }
+
+/**
+ * Index into a contiguous RegId run (e.g. reg_index(PMU_CNT0, 3) == PMU_CNT3).
+ * Caller is responsible for keeping `i` within the run's length.
+ */
+constexpr RegId reg_index(RegId base, int i) { return static_cast<RegId>(static_cast<uint8_t>(base) + i); }
 
 // =============================================================================
 // Simulated Register Sparse Mapping Configuration
 // =============================================================================
 
 /**
- * DAV_3510 register layout is sparse with two non-contiguous pages:
- * - Page 0: 0x0000-0x0FFF (DATA_MAIN_BASE at 0xD0)
- * - Page 1: 0x5000-0x5FFF (COND at 0x5108)
+ * DAV_3510 register layout is sparse with three non-contiguous regions:
+ * - Page 0: 0x0000-0x0FFF  (AICore SPR low: CTRL at 0x0, DATA_MAIN_BASE at 0xD0)
+ * - Page 2: 0x2400-0x43FF  (PMU MMIO: CNT*_IDX 0x2500-0x2524, CTRL_1 0x2400,
+ *                            CTRL_0 0x4200, CNT0-9 0x4210-0x4254, TOTAL 0x4260-64,
+ *                            START/STOP_CYC 0x42A0-0x42AC)
+ * - Page 1: 0x5000-0x5FFF  (AICore SPR high: COND at 0x5108)
  *
- * To save memory, we allocate two separate 4KB pages per core instead of
- * a single 24KB block (which would waste 16KB in the gap 0x1000-0x4FFF).
+ * To save memory, we allocate three separate pages per core instead of
+ * a single 24KB block.
  */
 constexpr uint32_t SIM_REG_PAGE0_SIZE = 0x1000;  // 4KB for page 0x0000-0x0FFF
+constexpr uint32_t SIM_REG_PAGE2_SIZE = 0x2000;  // 8KB for PMU page 0x2400-0x43FF
 constexpr uint32_t SIM_REG_PAGE1_SIZE = 0x1000;  // 4KB for page 0x5000-0x5FFF
-constexpr uint32_t SIM_REG_PAGE1_BASE = 0x5000;  // Base address of page 1
+constexpr uint32_t SIM_REG_PAGE2_BASE = 0x2400;  // Base address of PMU page
+constexpr uint32_t SIM_REG_PAGE1_BASE = 0x5000;  // Base address of SPR high page
 
-// Total size per core (two 4KB pages = 8KB, saves 16KB vs. contiguous mapping)
-constexpr uint32_t SIM_REG_TOTAL_SIZE = SIM_REG_PAGE0_SIZE + SIM_REG_PAGE1_SIZE;
+// Total size per core (three pages = 16KB)
+constexpr uint32_t SIM_REG_TOTAL_SIZE = SIM_REG_PAGE0_SIZE + SIM_REG_PAGE2_SIZE + SIM_REG_PAGE1_SIZE;
 
 /**
  * Calculate actual memory pointer for a hardware register offset in sparse layout
@@ -231,16 +413,19 @@ constexpr uint32_t SIM_REG_TOTAL_SIZE = SIM_REG_PAGE0_SIZE + SIM_REG_PAGE1_SIZE;
  * Callers are responsible for casting to/from uint8_t*.
  *
  * @param reg_base  Base address of the sparse register block (page 0 start)
- * @param offset    Hardware register offset (e.g., 0xD0, 0x5108)
+ * @param offset    Hardware register offset (e.g., 0xD0, 0x2500, 0x4210, 0x5108)
  * @return Pointer to the actual memory location (as uint8_t*)
  */
 inline volatile uint8_t *sparse_reg_ptr(volatile uint8_t *reg_base, uint32_t offset) {
-    if (offset < SIM_REG_PAGE1_BASE) {
+    if (offset < SIM_REG_PAGE2_BASE) {
         // Register in page 0 (0x0000-0x0FFF)
         return reg_base + offset;
+    } else if (offset < SIM_REG_PAGE1_BASE) {
+        // Register in page 2 (PMU, 0x2400-0x43FF)
+        return reg_base + SIM_REG_PAGE0_SIZE + (offset - SIM_REG_PAGE2_BASE);
     } else {
         // Register in page 1 (0x5000-0x5FFF)
-        return reg_base + SIM_REG_PAGE0_SIZE + (offset - SIM_REG_PAGE1_BASE);
+        return reg_base + SIM_REG_PAGE0_SIZE + SIM_REG_PAGE2_SIZE + (offset - SIM_REG_PAGE1_BASE);
     }
 }
 

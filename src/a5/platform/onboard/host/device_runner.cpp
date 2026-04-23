@@ -290,8 +290,10 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
 
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor
+    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor, int enable_pmu
 ) {
+    bool pmu_enabled = enable_pmu > 0;
+    uint32_t pmu_event_type = resolve_pmu_event_type(enable_pmu);
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
@@ -364,6 +366,9 @@ int DeviceRunner::run(
     if (runtime.enable_l2_swimlane) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
     }
+    if (pmu_enabled) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -417,6 +422,15 @@ int DeviceRunner::run(
         rc = init_tensor_dump(runtime, num_aicore, device_id);
         if (rc != 0) {
             LOG_ERROR("init_tensor_dump failed: %d", rc);
+            return rc;
+        }
+    }
+
+    // Initialize PMU profiling if enabled
+    if (pmu_enabled) {
+        rc = init_pmu(num_aicore, pmu_event_type);
+        if (rc != 0) {
+            LOG_ERROR("init_pmu failed: %d", rc);
             return rc;
         }
     }
@@ -485,6 +499,12 @@ int DeviceRunner::run(
         dump_collector_.export_dump_files();
     }
 
+    // Collect and export PMU data (two-step rtMemcpy per core)
+    if (pmu_enabled && pmu_collector_.is_initialized()) {
+        pmu_collector_.collect_all();
+        pmu_collector_.export_csv();
+    }
+
     // Print handshake results (reads from device memory, must be before free)
     print_handshake_results();
 
@@ -550,6 +570,11 @@ int DeviceRunner::finalize() {
     // Cleanup tensor dump
     if (dump_collector_.is_initialized()) {
         dump_collector_.finalize();
+    }
+
+    // Cleanup PMU profiling
+    if (pmu_collector_.is_initialized()) {
+        pmu_collector_.finalize();
     }
 
     // Free all remaining allocations (including handshake buffer and binGmAddr)
@@ -769,4 +794,26 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
 
     kernel_args_.args.dump_data_base = reinterpret_cast<uint64_t>(dump_collector_.get_dump_setup_device_ptr());
     return 0;
+}
+
+int DeviceRunner::init_pmu(int num_aicore, uint32_t event_type) {
+    auto alloc_cb = [](size_t size) -> void * {
+        void *ptr = nullptr;
+        int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);
+        return (rc == 0) ? ptr : nullptr;
+    };
+    auto free_cb = [](void *dev_ptr) -> int {
+        return rtFree(dev_ptr);
+    };
+    auto copy_to_dev_cb = [](void *dev_dst, const void *host_src, size_t size) -> int {
+        return rtMemcpy(dev_dst, size, host_src, size, RT_MEMCPY_HOST_TO_DEVICE);
+    };
+    auto copy_from_dev_cb = [](void *host_dst, const void *dev_src, size_t size) -> int {
+        return rtMemcpy(host_dst, size, dev_src, size, RT_MEMCPY_DEVICE_TO_HOST);
+    };
+
+    int rc = pmu_collector_.initialize(
+        num_aicore, event_type, &kernel_args_.args.pmu_data_base, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
+    );
+    return rc;
 }

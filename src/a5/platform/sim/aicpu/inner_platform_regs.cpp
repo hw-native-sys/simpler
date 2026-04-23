@@ -12,10 +12,11 @@
  * @file inner_platform_regs.cpp
  * @brief AICPU register read/write for simulation (a5sim)
  *
- * Simulated registers are two compact 4KB pages per core (8KB total).
- * sparse_reg_ptr() remaps hardware offsets to this layout:
- *   offset < 0x5000  -> page 0: reg_base + offset
- *   offset >= 0x5000 -> page 1: reg_base + 0x1000 + (offset - 0x5000)
+ * Simulated registers are three compact pages per core (16KB total):
+ *   0x0000-0x0FFF -> page 0 (AICore SPR low: CTRL, DATA_MAIN_BASE)
+ *   0x2400-0x43FF -> page 2 (PMU MMIO)
+ *   0x5000-0x5FFF -> page 1 (AICore SPR high: COND)
+ * sparse_reg_ptr() performs the offset remapping.
  */
 
 #include <cstdint>

@@ -23,6 +23,7 @@
 
 // Performance profiling headers
 #include "aicpu/l2_perf_collector_aicpu.h"
+#include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 
 // =============================================================================
@@ -328,6 +329,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_PROFILING
         if (get_enable_dump_tensor()) {
             dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
+        }
+        if (get_enable_pmu()) {
+            pmu_aicpu_init(runtime->workers, physical_core_ids_, cores_total_num_);
+            DEV_INFO("PMU profiling started on %d cores", cores_total_num_);
         }
 #endif
 
