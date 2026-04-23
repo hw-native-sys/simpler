@@ -43,4 +43,6 @@ if(SKBUILD_MODE)
     install(DIRECTORY ${CMAKE_SOURCE_DIR}/build/lib/
             DESTINATION simpler_setup/_assets/build/lib
             OPTIONAL)
+    install(DIRECTORY ${CMAKE_SOURCE_DIR}/tools/
+            DESTINATION simpler_setup/_assets/tools)
 endif()
