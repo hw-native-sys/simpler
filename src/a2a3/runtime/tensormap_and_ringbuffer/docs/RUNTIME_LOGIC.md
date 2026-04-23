@@ -499,6 +499,30 @@ advance_ring_pointers(ring_id):  // protected by per-ring advance_lock
 
 This is protected by a per-ring try-lock (`advance_lock`) in `RingSchedState`, ensuring only one scheduler thread advances a given ring's watermark at a time.
 
+### 8.5 SchedulerContext
+
+All scheduler-side state and methods live in `SchedulerContext` (`runtime/scheduler/scheduler_context.h`). It is held as a `sched_ctx_` member of `AicpuExecutor`; `AicpuExecutor` is a thin wrapper that owns the lifecycle atomics and the orchestration SO handle, and delegates everything else to `SchedulerContext`.
+
+Public surface (called from `AicpuExecutor::init/run/deinit`):
+
+| Method | Phase | Purpose |
+| ------ | ----- | ------- |
+| `init(runtime, thread_num, sched_thread_num, orch_to_sched, regs_base)` | once per run | Handshake + assign cores, reset counters, latch `regs_base`, bind `func_id_to_addr_` |
+| `bind_runtime(rt)` | device-orch only | Wire `sched_` to `rt->scheduler` once the orchestrator thread creates `rt` |
+| `resolve_and_dispatch(runtime, thread_idx)` | per scheduler thread | Main dispatch loop |
+| `shutdown(thread_idx)` | per thread on exit | `platform_deinit_aicore_regs` for this thread's cores; PMU finalize when enabled |
+| `on_orchestration_done(runtime, rt, thread_idx, total_tasks)` | orchestrator thread | Publish core assignments, latch task count, fold inline-completed tasks, flip `orchestrator_done_`, drive orch→sched core transition (or `emergency_shutdown` on fatal) |
+| `deinit()` | once per run | Reset every scheduler-owned field to its post-construction default |
+| Read-only accessors | various | `aic_count()` / `aiv_count()` / `is_completed()` / `completed_tasks_count()` / `wait_pto2_init_complete()` |
+
+Private internals are split across three .cpp files by responsibility:
+
+- `scheduler_completion.cpp` — completion polling, drain protocol
+- `scheduler_dispatch.cpp` — task dispatch loop and helpers
+- `scheduler_cold_path.cpp` — exit checks, stall diagnostics, profiling, lifecycle (`init/deinit`), core management (`handshake_all_cores` / `assign_cores_to_threads` / `reassign_cores_for_all_threads` / `emergency_shutdown`), and `on_orchestration_done`
+
+`AicpuExecutor` calls neither `handshake_*`, `assign_*`, `reassign_*`, nor `emergency_shutdown` directly — they are private, invoked only by `init` and `on_orchestration_done`.
+
 ---
 
 ## 9. AICore Worker Interaction

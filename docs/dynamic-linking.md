@@ -196,18 +196,30 @@ Applied to all sim compilation paths:
 Additionally, `data_type.h::get_element_size()` uses `constexpr static`
 instead of `static` to avoid generating UNIQUE symbols at the source level.
 
-## AicpuExecutor::deinit()
+## AicpuExecutor::deinit() and SchedulerContext::deinit()
 
 The AICPU SO contains a file-scope static `AicpuExecutor g_aicpu_executor`,
-which in turn holds a `SchedulerContext sched_ctx_` member owning all
-scheduler dispatch state (core trackers, dispatch payloads, drain state).
+which holds a `SchedulerContext sched_ctx_` member owning all scheduler
+state (core trackers, dispatch payloads, drain state, task counters,
+core-transition flags, one-time init coordination, etc.).
+
 When the AICPU SO is dlclosed and re-dlopen'd between tasks, the static is
 reconstructed. But when the AICPU SO is **reused** (same runtime, consecutive
-tasks), `deinit()` must reset all fields. Previously missing resets:
+tasks), `deinit()` must reset all fields. Responsibilities are split so that
+SchedulerContext owns its own teardown:
 
-- `cores_total_num_`, `thread_num_`, `sched_thread_num_`
-- `trackers_` / `sched_ctx_.core_trackers_`, `core_assignments_`, `core_count_per_thread_`
-- `orch_func_`, `orch_args_cached_`, `orch_so_handle_`, `orch_so_path_`
+- `SchedulerContext::deinit()` resets every scheduler-owned field —
+  per-core states, payloads, sync-start drain coordination
+  (`sync_start_pending` / `drain_worker_elected` / `drain_ack_mask` /
+  `pending_task`), task counters, transition flags, worker-id lists,
+  core trackers, `cores_total_num_` / `aic_count_` / `aiv_count_`,
+  `regs_`, `sched_`, `func_id_to_addr_`, and the `pto2_init_*` flags.
+- `AicpuExecutor::deinit()` calls `sched_ctx_.deinit()` first, then resets
+  only its own fields: `thread_num_`, `sched_thread_num_`, `orch_to_sched_`,
+  `orch_func_`, `orch_args_cached_`, `orch_so_handle_`, `orch_so_path_`,
+  `runtime_init_ready_`, and the lifecycle atomics
+  (`initialized_`, `init_done_`, `init_failed_`, `finished_`, `thread_idx_`,
+  `finished_count_`).
 
 Applies to all 5 runtime executors: a2a3 (abg, hbg, tmr), a5 (hbg, tmr).
 

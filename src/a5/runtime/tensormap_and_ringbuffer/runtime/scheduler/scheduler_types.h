@@ -43,7 +43,6 @@
 // =============================================================================
 
 constexpr int32_t MAX_AICPU_THREADS = PLATFORM_MAX_AICPU_THREADS;
-constexpr int32_t MAX_CORES_PER_THREAD = PLATFORM_MAX_CORES_PER_THREAD;
 
 constexpr int32_t MAX_IDLE_ITERATIONS = 800000;       // ~20s idle then scheduler gives up (avoid long hang)
 constexpr int32_t STALL_LOG_INTERVAL = 50000;         // DEV_ALWAYS every N idle iters to debug hang

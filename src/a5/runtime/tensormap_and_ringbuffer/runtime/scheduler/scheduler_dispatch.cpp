@@ -401,7 +401,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_SCHED_PROFILING
             sched_->tasks_completed.fetch_add(completed_this_turn, std::memory_order_relaxed);
 #endif
-            int32_t prev = completed_tasks_ptr_->fetch_add(completed_this_turn, std::memory_order_relaxed);
+            int32_t prev = completed_tasks_.fetch_add(completed_this_turn, std::memory_order_relaxed);
             int32_t new_total = prev + completed_this_turn;
             last_progress_count = new_total;
             if (thread_idx == 0 && task_count > 0) {
@@ -441,7 +441,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
         // Phase 3: Drain wiring queue (thread 0 only)
         if (thread_idx == 0) {
-            int wired = sched_->drain_wiring_queue(*orchestrator_done_ptr_);
+            int wired = sched_->drain_wiring_queue(orchestrator_done_);
             if (wired > 0) {
                 made_progress = true;
 #if PTO2_SCHED_PROFILING
