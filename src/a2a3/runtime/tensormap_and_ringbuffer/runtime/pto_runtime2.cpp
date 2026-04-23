@@ -50,6 +50,12 @@ void pto2_rt_scope_begin(PTO2Runtime *rt) { pto2_scope_begin(&rt->orchestrator);
 
 void pto2_rt_scope_end(PTO2Runtime *rt) { pto2_scope_end(&rt->orchestrator); }
 
+static void pto2_rt_parallel_for_begin(PTO2Runtime *rt) { pto2_parallel_for_begin(&rt->orchestrator); }
+
+static void pto2_rt_parallel_iter_begin(PTO2Runtime *rt) { pto2_parallel_iter_begin(&rt->orchestrator); }
+
+static void pto2_rt_parallel_for_end(PTO2Runtime *rt) { pto2_parallel_for_end(&rt->orchestrator); }
+
 void pto2_rt_orchestration_done(PTO2Runtime *rt) { pto2_orchestrator_done(&rt->orchestrator); }
 
 static bool is_fatal_impl(PTO2Runtime *rt) { return rt->orchestrator.fatal; }
@@ -224,6 +230,9 @@ static const PTO2RuntimeOps s_runtime_ops = {
     .get_tensor_data = pto2_get_tensor_data,
     .set_tensor_data = pto2_set_tensor_data,
     .alloc_tensors = alloc_tensors_impl,
+    .parallel_for_begin = pto2_rt_parallel_for_begin,
+    .parallel_iter_begin = pto2_rt_parallel_iter_begin,
+    .parallel_for_end = pto2_rt_parallel_for_end,
 };
 
 // =============================================================================

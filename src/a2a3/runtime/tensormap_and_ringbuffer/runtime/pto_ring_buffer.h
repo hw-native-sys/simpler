@@ -187,6 +187,7 @@ public:
 
     uint64_t heap_top() const { return heap_top_; }
     uint64_t heap_capacity() const { return heap_size_; }
+    int32_t next_local_id() const { return local_task_id_; }
 
 private:
     // --- Task Ring ---

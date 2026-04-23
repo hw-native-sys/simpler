@@ -107,6 +107,9 @@
 #define PTO2_MAX_SCOPE_DEPTH 64          // Maximum nesting depth
 #define PTO2_SCOPE_TASKS_INIT_CAP 65536  // Initial capacity for scope task buffer
 
+// Parallel for iteration isolation
+#define PTO2_MAX_PARALLEL_DEPTH 8  // Max nesting depth for iteration filtering; deeper levels degrade gracefully
+
 // Ready queue
 #define PTO2_READY_QUEUE_SIZE 65536  // Per-shape queue size
 
