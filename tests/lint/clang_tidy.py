@@ -16,6 +16,8 @@ If no sim build cache exists, the sim runtimes are built first:
     python simpler_setup/build_runtimes.py
 """
 
+from __future__ import annotations
+
 import json
 import os
 import shlex
@@ -125,17 +127,33 @@ def _parse_compile_database(raw: str, db_file: Path) -> list[dict]:
     return entries
 
 
-def _load_compile_database(db_file: Path) -> tuple[str, list[dict]]:
-    """Load a compile database, rebuilding its target cache dir when it is broken."""
-    raw = db_file.read_text()
+def _load_compile_database(db_file: Path) -> tuple[str, list[dict]] | None:
+    """Load a compile database, rebuilding its target cache dir when it is broken.
+
+    Returns None when the database cannot be loaded or rebuilt, allowing
+    callers to skip it gracefully.
+    """
+    try:
+        raw = db_file.read_text()
+    except FileNotFoundError:
+        print(f"WARNING: compile database not found, skipping: {db_file}", file=sys.stderr)
+        return None
     try:
         return raw, _parse_compile_database(raw, db_file)
     except (ValueError, json.JSONDecodeError) as exc:
         print(f"WARNING: invalid compile database detected: {exc}", file=sys.stderr)
-        _reconfigure_compile_database(db_file)
+        try:
+            _reconfigure_compile_database(db_file)
+        except Exception as reconf_exc:
+            print(f"WARNING: reconfiguration failed, skipping: {reconf_exc}", file=sys.stderr)
+            return None
 
-    rebuilt_raw = db_file.read_text()
-    return rebuilt_raw, _parse_compile_database(rebuilt_raw, db_file)
+    try:
+        rebuilt_raw = db_file.read_text()
+        return rebuilt_raw, _parse_compile_database(rebuilt_raw, db_file)
+    except (FileNotFoundError, ValueError, json.JSONDecodeError) as exc:
+        print(f"WARNING: compile database still broken after reconfiguration, skipping: {exc}", file=sys.stderr)
+        return None
 
 
 def _build_file_index() -> dict[str, list[Path]]:
@@ -150,7 +168,10 @@ def _build_file_index() -> dict[str, list[Path]]:
     """
     index: dict[str, list[Path]] = {}
     for db_file in sorted(_CACHE_DIR.glob("*/sim/*/*/compile_commands.json")):
-        raw, entries = _load_compile_database(db_file)
+        result = _load_compile_database(db_file)
+        if result is None:
+            continue
+        raw, entries = result
         needs_filter = any(flag in raw for flag in _GCC_ONLY_FLAGS)
         if needs_filter:
             for entry in entries:
