@@ -71,7 +71,7 @@ public:
 
     // Shutdown AICore registers for this thread's assigned cores.
     // Also runs PMU finalize (PTO2_PROFILING) before deinit when enabled.
-    // Orchestrator threads (core_count_per_thread_[thread_idx] == 0) are a no-op.
+    // Orchestrator threads (core_trackers_[thread_idx].core_num() == 0) are a no-op.
     int32_t shutdown(int32_t thread_idx);
 
     // Run all post-orchestration scheduler bookkeeping:
@@ -146,8 +146,6 @@ private:
     bool orch_to_sched_{false};
     int32_t thread_num_{0};
     int32_t cores_total_num_{0};
-    int32_t core_count_per_thread_[MAX_AICPU_THREADS]{};
-    int32_t core_assignments_[MAX_AICPU_THREADS][RUNTIME_MAX_WORKER]{};
 
     // Cluster-ordered worker_id lists, populated by handshake_all_cores().
     int32_t aic_worker_ids_[RUNTIME_MAX_WORKER]{};

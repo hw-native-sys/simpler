@@ -16,7 +16,6 @@
 
 #include "common/core_type.h"
 #include "common/platform_config.h"
-#include "pto2_dispatch_payload.h"
 #include "pto_runtime2_types.h"
 
 // =============================================================================
@@ -303,6 +302,9 @@ public:
     // --- Bit offset <-> worker_id mapping ---
 
     int32_t get_core_id_by_offset(int32_t offset) const { return core_id_map_[offset]; }
+
+    const int32_t *core_ids() const { return core_id_map_; }
+    int32_t core_num() const { return cluster_count_ * 3; }
 
 private:
     int32_t cluster_count_;

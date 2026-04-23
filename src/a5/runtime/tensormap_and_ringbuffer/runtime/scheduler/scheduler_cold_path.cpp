@@ -132,10 +132,9 @@ void SchedulerContext::log_stall_diagnostics(
     int32_t aic_running = tracker.get_running_count<CoreType::AIC>();
     int32_t aiv_running = tracker.get_running_count<CoreType::AIV>();
     int32_t total_running = aic_running + aiv_running;
-    int32_t core_num = core_count_per_thread_[thread_idx];
     DEV_ALWAYS(
         "  thread=%d running_cores=%d (AIC=%d AIV=%d) core_num=%d", thread_idx, total_running, aic_running, aiv_running,
-        core_num
+        core_trackers_[thread_idx].core_num()
     );
     auto all_running = tracker.get_all_running_cores();
     int32_t dump_count = 0;
@@ -340,13 +339,13 @@ void SchedulerContext::log_profiling_summary(int32_t thread_idx, int32_t cur_thr
 #endif
 
 // =============================================================================
-// Shutdown: deinit AICore regs for this thread's cores (and PMU finalize if enabled).
-// Orchestrator threads have core_count_per_thread_[thread_idx] == 0 -> no-op.
+// Shutdown: deinit AICore regs for this thread's cores.
+// Orchestrator threads have core_trackers_[thread_idx].core_num() == 0 -> no-op.
 // platform_deinit_aicore_regs is idempotent; safe to call after early completion.
 // =============================================================================
 int32_t SchedulerContext::shutdown(int32_t thread_idx) {
-    const int32_t *cores = core_assignments_[thread_idx];
-    int32_t core_num = core_count_per_thread_[thread_idx];
+    const int32_t *cores = core_trackers_[thread_idx].core_ids();
+    int32_t core_num = core_trackers_[thread_idx].core_num();
     if (core_num == 0) return 0;
 
     DEV_INFO("Thread %d: Shutting down %d cores", thread_idx, core_num);
@@ -487,15 +486,12 @@ bool SchedulerContext::assign_cores_to_threads() {
     }
     for (int32_t i = 0; i < active_sched_threads_; i++) {
         core_trackers_[i].init(clusters_per_thread[i]);
-        core_count_per_thread_[i] = 0;
     }
 
-    int32_t core_idx[MAX_AICPU_THREADS] = {};
     int32_t cluster_idx_per_thread[MAX_AICPU_THREADS] = {};
 
     for (int32_t ci = 0; ci < cluster_count; ci++) {
         int32_t t = ci % active_sched_threads_;
-        int32_t &idx = core_idx[t];
 
         int32_t aic_wid = aic_worker_ids_[ci];
         int32_t aiv0_wid = aiv_worker_ids_[2 * ci];
@@ -503,16 +499,14 @@ bool SchedulerContext::assign_cores_to_threads() {
 
         core_trackers_[t].set_cluster(cluster_idx_per_thread[t]++, aic_wid, aiv0_wid, aiv1_wid);
 
-        core_assignments_[t][idx++] = aic_wid;
-        core_assignments_[t][idx++] = aiv0_wid;
-        core_assignments_[t][idx++] = aiv1_wid;
-
         DEV_INFO("Thread %d: cluster %d (AIC=%d, AIV0=%d, AIV1=%d)", t, ci, aic_wid, aiv0_wid, aiv1_wid);
     }
 
     for (int32_t t = 0; t < thread_num_; t++) {
-        core_count_per_thread_[t] = core_idx[t];
-        DEV_INFO("Thread %d: total %d cores (%d clusters)", t, core_idx[t], core_trackers_[t].get_cluster_count());
+        DEV_INFO(
+            "Thread %d: total %d cores (%d clusters)", t, core_trackers_[t].core_num(),
+            core_trackers_[t].get_cluster_count()
+        );
     }
 
     DEV_INFO("Config: threads=%d, cores=%d, cores_per_thread=%d", thread_num_, cores_total_num_, thread_cores_num);
@@ -545,7 +539,6 @@ void SchedulerContext::reassign_cores_for_all_threads() {
     // Re-init all trackers and reset core counts
     for (int32_t i = 0; i < thread_num_; i++) {
         core_trackers_[i].init(clusters_per_thread[i]);
-        core_count_per_thread_[i] = 0;
     }
 
     // Assign clusters round-robin and restore running state
@@ -573,10 +566,6 @@ void SchedulerContext::reassign_cores_for_all_threads() {
             core_trackers_[t].change_core_state(cl_idx * 3 + 2);
             core_trackers_[t].set_pending_occupied(cl_idx * 3 + 2);
         }
-
-        core_assignments_[t][core_count_per_thread_[t]++] = aic_wid;
-        core_assignments_[t][core_count_per_thread_[t]++] = aiv0_wid;
-        core_assignments_[t][core_count_per_thread_[t]++] = aiv1_wid;
     }
 
     // Log final distribution
@@ -585,7 +574,7 @@ void SchedulerContext::reassign_cores_for_all_threads() {
         int32_t aic_running = core_trackers_[t].get_running_count<CoreType::AIC>();
         int32_t aiv_running = core_trackers_[t].get_running_count<CoreType::AIV>();
         DEV_INFO(
-            "  Thread %d: %d cores, %d clusters (AIC running=%d, AIV running=%d)", t, core_count_per_thread_[t],
+            "  Thread %d: %d cores, %d clusters (AIC running=%d, AIV running=%d)", t, core_trackers_[t].core_num(),
             core_trackers_[t].get_cluster_count(), aic_running, aiv_running
         );
     }
@@ -718,8 +707,6 @@ void SchedulerContext::deinit() {
     for (int32_t t = 0; t < MAX_AICPU_THREADS; t++) {
         core_trackers_[t] = CoreTracker{};
     }
-    memset(core_assignments_, 0, sizeof(core_assignments_));
-    memset(core_count_per_thread_, 0, sizeof(core_count_per_thread_));
 
     regs_ = 0;
     sched_ = nullptr;
@@ -742,17 +729,6 @@ void SchedulerContext::bind_runtime(PTO2Runtime *rt) { sched_ = &rt->scheduler; 
 void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
-#if PTO2_PROFILING
-    // Write core-to-thread mapping (one-time, after orchestration)
-    if (runtime->enable_profiling) {
-        perf_aicpu_write_core_assignments(
-            core_assignments_, core_count_per_thread_, sched_thread_num_, cores_total_num_
-        );
-    }
-#else
-    (void)thread_idx;
-#endif
-
     total_tasks_ = total_tasks;
 
     // Fold tasks completed inline during orchestration
@@ -796,4 +772,16 @@ void SchedulerContext::on_orchestration_done(
             reassigned_.store(true, std::memory_order_release);
         }
     }
+
+#if PTO2_PROFILING
+    // Write core-to-thread mapping AFTER reassignment so the profiling data
+    // reflects the final distribution (all active_sched_threads_, including
+    // former orchestrator threads when orch_to_sched_ is enabled).
+    if (runtime->enable_profiling) {
+        perf_aicpu_init_core_assignments(cores_total_num_);
+        for (int32_t t = 0; t < active_sched_threads_; t++) {
+            perf_aicpu_write_core_assignments_for_thread(t, core_trackers_[t].core_ids(), core_trackers_[t].core_num());
+        }
+    }
+#endif
 }

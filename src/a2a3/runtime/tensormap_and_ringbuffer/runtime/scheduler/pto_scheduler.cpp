@@ -131,7 +131,6 @@ bool PTO2SchedulerState::RingSchedState::init(PTO2SharedMemoryHeader *sm_header,
         ring->slot_states[i].reset_for_reuse();
         ring->slot_states[i].fanin_count = 0;
         ring->slot_states[i].active_mask = 0;
-        ring->slot_states[i].subtask_done_mask.store(0, std::memory_order_relaxed);
     }
 
     return true;

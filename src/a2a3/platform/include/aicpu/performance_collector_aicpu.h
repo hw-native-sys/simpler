@@ -164,20 +164,14 @@ void perf_aicpu_record_orch_phase(
 );
 
 /**
- * Write core-to-thread assignment mapping to shared memory
+ * Write core-to-thread assignment mapping to shared memory.
  *
- * Records which scheduler thread manages each core_id.
- * Called once after orchestration completes (not on the scheduler hot path).
- *
- * @param core_assignments 2D array [thread_idx][i] = core_id
- * @param core_counts Per-thread core count array
- * @param num_threads Number of scheduler threads
- * @param total_cores Total number of cores
+ * Callers invoke `perf_aicpu_init_core_assignments(total_cores)` once, then
+ * `perf_aicpu_write_core_assignments_for_thread(t, ids, n)` for every
+ * scheduler thread.
  */
-void perf_aicpu_write_core_assignments(
-    const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD], const int *core_counts, int num_threads,
-    int total_cores
-);
+void perf_aicpu_init_core_assignments(int total_cores);
+void perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num);
 
 /**
  * Flush remaining phase records for a thread

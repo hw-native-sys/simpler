@@ -90,7 +90,7 @@ Rules:
 
 1. `task_id`
 2. `active_mask`
-3. `subtask_done_mask`
+3. `completed_subtasks` (atomic counter, incremented per subtask completion)
 4. `kernel_id[3]` for `(AIC, AIV0, AIV1)`
 5. dependency heads/counters and packed-buffer metadata
 
@@ -128,7 +128,7 @@ Queueing key is normalized resource shape (not raw slot label).
 1. Fanin release/readiness remains dependency-correct and graph-level.
 2. Two-stage completion:
    - `on_subtask_complete(task_id, subslot)`
-   - `on_mixed_task_complete(task_id)` only when `subtask_done_mask == active_mask`
+   - `on_mixed_task_complete(task_id)` only when `completed_subtasks == total_required_subtasks`
 3. Downstream release is triggered once per mixed task completion, not once per subslot.
 
 ## 9. Executor Ownership and Numbering

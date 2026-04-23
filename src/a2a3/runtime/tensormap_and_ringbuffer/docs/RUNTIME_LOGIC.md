@@ -334,7 +334,7 @@ When `pto2_submit_task` processes parameters:
 | `task_id` | Canonical mixed-task ID (64-bit: `ring_id << 32 \| local_id`). See [MULTI_RING.md §3](MULTI_RING.md). |
 | `kernel_id[3]` | Per-slot kernel IDs: `[AIC, AIV0, AIV1]`; `INVALID_KERNEL_ID` = inactive |
 | `active_mask` | Bitmask of active subtask slots: `bit0=AIC`, `bit1=AIV0`, `bit2=AIV1` |
-| `subtask_done_mask` | Atomic bitmask; each subtask sets its done bit on completion |
+| `completed_subtasks` | Atomic counter; each subtask increments on completion. Trigger condition: `completed_subtasks == total_required_subtasks` |
 | `fanin_count` | Number of producer dependencies (set by scheduler during wiring) |
 | `fanout_lock` | Per-task spinlock for concurrent fanout modification (used by scheduler wiring + completion) |
 | `fanout_head` | Head of fanout consumer list (pointer, protected by `fanout_lock`) |
@@ -464,7 +464,7 @@ Each scheduler thread runs a tight loop with two main phases:
 **Phase 1 — Completion Handling**:
 
 - Poll register `COND` on each managed core
-- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(task_id, subslot)` to set the done bit; when `subtask_done_mask == active_mask`, trigger `on_mixed_task_complete(task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
+- When `TASK_FIN_STATE` detected: record completion timestamps, call `on_subtask_complete(task_id, subslot)` to increment the completion counter; when `completed_subtasks == total_required_subtasks`, trigger `on_mixed_task_complete(task_id)` which marks `task_state[slot] = COMPLETED`, acquires fanout lock, traverses fanout list (incrementing consumers' `fanin_refcount`), marks `task_state[slot] = CONSUMED`, and advances `last_task_alive` watermark
 
 **Phase 2 — Dispatch**:
 

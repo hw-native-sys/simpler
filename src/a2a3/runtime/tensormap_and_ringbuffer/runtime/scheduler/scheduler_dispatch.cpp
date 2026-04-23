@@ -304,7 +304,6 @@ void SchedulerContext::dispatch_shape(
 
 int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_idx) {
     always_assert(sched_ != nullptr);
-    int32_t &core_num = core_count_per_thread_[thread_idx];
     CoreTracker &tracker = core_trackers_[thread_idx];
     DEV_INFO("Thread %d: resolve_and_dispatch entry", thread_idx);
 
@@ -358,7 +357,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
     }
 
-    DEV_INFO("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_num);
+    DEV_INFO("Thread %d: PTO2 dispatch starting with %d cores", thread_idx, core_trackers_[thread_idx].core_num());
     int32_t cur_thread_completed = 0;
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
@@ -576,7 +575,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
     if (perf.profiling_enabled) {
-        perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
+        perf_aicpu_flush_buffers(
+            runtime, thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
+        );
         perf_aicpu_flush_phase_buffers(thread_idx);
     }
 #endif
@@ -587,7 +588,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 #if PTO2_PROFILING
     if (get_enable_pmu()) {
-        pmu_aicpu_flush_buffers(thread_idx, core_assignments_[thread_idx], core_num);
+        pmu_aicpu_flush_buffers(
+            thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
+        );
     }
 #endif
 

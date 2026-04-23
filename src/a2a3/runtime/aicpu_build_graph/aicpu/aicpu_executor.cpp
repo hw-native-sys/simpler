@@ -1947,9 +1947,10 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 #if PTO2_PROFILING
             // Write core-to-thread mapping (one-time, after orchestration)
             if (runtime->enable_profiling) {
-                perf_aicpu_write_core_assignments(
-                    core_assignments_, core_count_per_thread_, sched_thread_num_, cores_total_num_
-                );
+                perf_aicpu_init_core_assignments(cores_total_num_);
+                for (int32_t t = 0; t < sched_thread_num_; t++) {
+                    perf_aicpu_write_core_assignments_for_thread(t, core_assignments_[t], core_count_per_thread_[t]);
+                }
                 // Flush orchestrator's phase record buffer
                 perf_aicpu_flush_phase_buffers(thread_idx);
             }

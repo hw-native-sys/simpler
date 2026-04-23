@@ -303,6 +303,9 @@ public:
 
     int32_t get_core_id_by_offset(int32_t offset) const { return core_id_map_[offset]; }
 
+    const int32_t *core_ids() const { return core_id_map_; }
+    int32_t core_num() const { return cluster_count_ * 3; }
+
 private:
     int32_t cluster_count_;
     BitStates aic_mask_;

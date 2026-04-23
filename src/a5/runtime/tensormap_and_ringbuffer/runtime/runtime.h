@@ -284,12 +284,6 @@ public:
     /** @deprecated RT2 uses PTO2DispatchPayload, not Task. Always returns nullptr. */
     Task *get_task(int) { return nullptr; }
 
-    /** @deprecated Use PTO2 dispatch mode */
-    bool get_use_pto2_dispatch() const { return true; }
-
-    /** @deprecated Use PTO2 dispatch mode */
-    void set_use_pto2_dispatch(bool) {}
-
     // =========================================================================
     // Host API (host-only, not copied to device)
     // =========================================================================

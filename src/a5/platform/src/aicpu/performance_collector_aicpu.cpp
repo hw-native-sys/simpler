@@ -236,28 +236,27 @@ void perf_aicpu_record_orch_phase(
     perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
 }
 
-void perf_aicpu_write_core_assignments(
-    const int core_assignments[][PLATFORM_MAX_CORES_PER_THREAD], const int *core_counts, int num_threads,
-    int total_cores
-) {
+void perf_aicpu_init_core_assignments(int total_cores) {
     if (s_setup_header == nullptr) {
         return;
     }
-
     AicpuPhaseHeader *phase_header = &s_setup_header->phase_header;
     memset(phase_header->core_to_thread, -1, sizeof(phase_header->core_to_thread));
     phase_header->num_cores = static_cast<uint32_t>(total_cores);
+    wmb();
+    LOG_INFO("Core-to-thread mapping init: %d cores", total_cores);
+}
 
-    for (int t = 0; t < num_threads; t++) {
-        for (int i = 0; i < core_counts[t]; i++) {
-            int core_id = core_assignments[t][i];
-            if (core_id >= 0 && core_id < PLATFORM_MAX_CORES) {
-                phase_header->core_to_thread[core_id] = static_cast<int8_t>(t);
-            }
+void perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num) {
+    if (s_setup_header == nullptr) {
+        return;
+    }
+    AicpuPhaseHeader *phase_header = &s_setup_header->phase_header;
+    for (int i = 0; i < core_num; i++) {
+        int core_id = core_ids[i];
+        if (core_id >= 0 && core_id < PLATFORM_MAX_CORES) {
+            phase_header->core_to_thread[core_id] = static_cast<int8_t>(thread_idx);
         }
     }
-
     wmb();
-
-    LOG_INFO("Core-to-thread mapping written: %d cores, %d threads", total_cores, num_threads);
 }

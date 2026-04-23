@@ -37,7 +37,7 @@ enum class PTO2SubtaskSlot : uint8_t {
 };
 
 /**
- * Subtask mask bits (for active_mask / subtask_done_mask)
+ * Subtask mask bits (for active_mask)
  */
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIC = (1u << 0);         // 0x1
 inline constexpr uint8_t PTO2_SUBTASK_MASK_AIV0 = (1u << 1);        // 0x2

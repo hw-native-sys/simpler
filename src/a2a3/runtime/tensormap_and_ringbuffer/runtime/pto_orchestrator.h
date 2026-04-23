@@ -209,20 +209,6 @@ TaskOutputTensors pto2_alloc_tensors(PTO2OrchestratorState *orch, const Arg &arg
 void pto2_orchestrator_done(PTO2OrchestratorState *orch);
 
 // =============================================================================
-// Debug Utilities
-// =============================================================================
-
-/**
- * Print orchestrator statistics
- */
-void pto2_orchestrator_print_stats(PTO2OrchestratorState *orch);
-
-/**
- * Print scope stack state
- */
-void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState *orch);
-
-// =============================================================================
 // Orchestrator Profiling Data
 // =============================================================================
 

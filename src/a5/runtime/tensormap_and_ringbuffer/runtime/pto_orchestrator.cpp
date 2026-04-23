@@ -826,48 +826,6 @@ void pto2_orchestrator_done(PTO2OrchestratorState *orch) {
 #endif
 }
 
-// =============================================================================
-// Debug Utilities
-// =============================================================================
-
-void pto2_orchestrator_print_stats(PTO2OrchestratorState *orch) {
-    LOG_INFO("=== Orchestrator Statistics ===");
-#if PTO2_PROFILING
-    LOG_INFO("Tasks submitted:     %" PRId64, orch->tasks_submitted);
-    LOG_INFO("Buffers allocated:   %" PRId64, orch->buffers_allocated);
-    LOG_INFO("Bytes allocated:     %" PRId64, orch->bytes_allocated);
-#endif
-    LOG_INFO("Current scope depth: %d", orch->scope_stack_top + 1);
-    for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
-        int32_t active = orch->rings[r].task_allocator.active_count();
-        if (active > 0) {
-            LOG_INFO("Ring %d task active:  %d", r, active);
-            LOG_INFO(
-                "Ring %d heap used:    %" PRIu64 " / %" PRIu64, r, orch->rings[r].task_allocator.heap_top(),
-                orch->rings[r].task_allocator.heap_capacity()
-            );
-            LOG_INFO(
-                "Ring %d fanin pool:   %d / %d", r, orch->rings[r].fanin_pool.used(), orch->rings[r].fanin_pool.capacity
-            );
-        }
-    }
-    LOG_INFO("TensorMap valid:     %d", orch->tensor_map.valid_count());
-    LOG_INFO("===============================");
-}
-
-void pto2_orchestrator_print_scope_stack(PTO2OrchestratorState *orch) {
-    LOG_INFO("=== Scope Stack ===");
-    LOG_INFO("Depth: %d", orch->scope_stack_top + 1);
-
-    for (int i = 0; i <= orch->scope_stack_top; i++) {
-        int32_t begin = orch->scope_begins[i];
-        int32_t end = (i < orch->scope_stack_top) ? orch->scope_begins[i + 1] : orch->scope_tasks_size;
-        LOG_INFO("  [%d] tasks_owned = %d", i, end - begin);
-    }
-
-    LOG_INFO("==================");
-}
-
 #if PTO2_ORCH_PROFILING
 PTO2OrchProfilingData pto2_orchestrator_get_profiling() {
     PTO2OrchProfilingData d;

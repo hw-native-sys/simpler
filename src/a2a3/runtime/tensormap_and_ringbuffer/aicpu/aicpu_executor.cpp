@@ -509,13 +509,6 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
             sched_ctx_.on_orchestration_done(runtime, rt, thread_idx, total_tasks);
-
-#if PTO2_ORCH_PROFILING
-            uint64_t reassign_cycle_end = get_sys_cnt_aicpu();
-            DEV_ALWAYS(
-                "Thread %d: reassign, cost %.3fus", thread_idx, cycles_to_us(reassign_cycle_end - reassign_cycle_start)
-            );
-#endif
         }
 #if PTO2_PROFILING
         uint64_t orch_end_ts = get_sys_cnt_aicpu();
@@ -549,7 +542,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
     // Always shutdown AICore — even if sched_ctx_.completed_ was already true.
     // platform_deinit_aicore_regs is idempotent; orchestrator threads have
-    // core_count_per_thread_ == 0 so they skip the loop harmlessly.
+    // core_trackers_[thread_idx].core_num() == 0 so they skip the loop harmlessly.
     auto rc = sched_ctx_.shutdown(thread_idx);
     if (rc != 0) {
         return rc;
