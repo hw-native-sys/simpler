@@ -723,6 +723,7 @@ void SchedulerContext::deinit() {
 
     regs_ = 0;
     sched_ = nullptr;
+    rt_ = nullptr;
     func_id_to_addr_ = nullptr;
 }
 
@@ -732,7 +733,10 @@ void SchedulerContext::wait_pto2_init_complete() const {
     }
 }
 
-void SchedulerContext::bind_runtime(PTO2Runtime *rt) { sched_ = &rt->scheduler; }
+void SchedulerContext::bind_runtime(PTO2Runtime *rt) {
+    rt_ = rt;
+    sched_ = &rt->scheduler;
+}
 
 // =============================================================================
 // Post-orchestration bookkeeping. Runs on the orchestrator thread once the

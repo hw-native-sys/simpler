@@ -306,6 +306,16 @@ PTO2Runtime *pto2_runtime_create_custom(
     // Connect orchestrator to scheduler (for simulated mode)
     pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
 
+    rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
+    if (!rt->completion_ingress) {
+        pto2_scheduler_destroy(&rt->scheduler);
+        pto2_orchestrator_destroy(&rt->orchestrator);
+        free(rt->gm_heap);
+        pto2_sm_destroy(rt->sm_handle);
+        free(rt);
+        return NULL;
+    }
+
     return rt;
 }
 
@@ -339,6 +349,14 @@ PTO2Runtime *pto2_runtime_create_from_sm(
 
     pto2_orchestrator_set_scheduler(&rt->orchestrator, &rt->scheduler);
 
+    rt->completion_ingress = static_cast<PTO2CompletionIngressQueue *>(calloc(1, sizeof(PTO2CompletionIngressQueue)));
+    if (!rt->completion_ingress) {
+        pto2_scheduler_destroy(&rt->scheduler);
+        pto2_orchestrator_destroy(&rt->orchestrator);
+        free(rt);
+        return NULL;
+    }
+
     return rt;
 }
 
@@ -347,6 +365,8 @@ void pto2_runtime_destroy(PTO2Runtime *rt) {
 
     pto2_scheduler_destroy(&rt->scheduler);
     pto2_orchestrator_destroy(&rt->orchestrator);
+
+    free(rt->completion_ingress);
 
     if (rt->gm_heap_owned && rt->gm_heap) {
         free(rt->gm_heap);

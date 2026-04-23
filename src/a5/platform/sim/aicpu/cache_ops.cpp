@@ -15,3 +15,7 @@
 void cache_invalidate_range(const void * /* addr */, size_t /* size */) {
     // No-op on simulation: no hardware cache to invalidate
 }
+
+void cache_flush_range(const void * /* addr */, size_t /* size */) {
+    // No-op on simulation: no hardware cache to flush
+}

@@ -46,6 +46,18 @@
 #define PTO2_MAX_INPUTS 16   // Maximum inputs per task
 #define PTO2_MAX_INOUTS 8    // Maximum in-out args per task
 
+typedef enum {
+    PTO2_ASYNC_ENGINE_SDMA = 0,
+    PTO2_ASYNC_ENGINE_ROCE = 1,
+    PTO2_ASYNC_ENGINE_URMA = 2,
+    PTO2_ASYNC_ENGINE_CCU = 3,
+    PTO2_NUM_ASYNC_ENGINES = 4,
+} PTO2AsyncEngine;
+
+enum class PTO2CompletionType : int32_t {
+    COUNTER = 0,
+};
+
 // =============================================================================
 // Task Output Tensors (return value from submit)
 // =============================================================================
@@ -138,11 +150,13 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     bool has_error{false};
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
+    bool complete_in_future{false};
 
     void reset() {
         clear();
         has_error = false;
         error_msg = nullptr;
+        complete_in_future = false;
     }
 
     void set_error(const char *msg) {

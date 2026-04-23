@@ -134,4 +134,15 @@ uint32_t platform_get_physical_cores_count();
  */
 void cache_invalidate_range(const void *addr, size_t size);
 
+/**
+ * Clean data cache for a memory range back to global memory.
+ *
+ * On real hardware (onboard): performs DC CVAC per cache line + DSB/ISB.
+ * On simulation (sim): no-op.
+ *
+ * @param addr  Start address of the memory range
+ * @param size  Size of the memory range in bytes
+ */
+void cache_flush_range(const void *addr, size_t size);
+
 #endif  // PLATFORM_AICPU_PLATFORM_REGS_H_

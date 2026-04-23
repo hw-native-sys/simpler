@@ -52,6 +52,8 @@
 
 #include <stdint.h>
 
+#include "pto_task_id.h"
+
 #ifndef __gm__
 #define __gm__
 #endif
@@ -63,6 +65,8 @@
 /** Number of extra pointer slots appended to the args[] tail (LocalContext + GlobalContext). */
 static constexpr int32_t PTO2_EXT_PARAMS_COUNT = 2;
 
+struct PTO2DeferredCompletionEntry;
+
 /**
  * Args[] suffix indices for context pointers.
  * Derived from MAX_TENSOR_ARGS(16) + MAX_SCALAR_ARGS(32).
@@ -70,6 +74,8 @@ static constexpr int32_t PTO2_EXT_PARAMS_COUNT = 2;
  */
 static constexpr int32_t SPMD_LOCAL_CONTEXT_INDEX = 48;
 static constexpr int32_t SPMD_GLOBAL_CONTEXT_INDEX = 49;
+static constexpr int32_t PAYLOAD_LOCAL_CONTEXT_INDEX = SPMD_LOCAL_CONTEXT_INDEX;
+static constexpr int32_t PAYLOAD_GLOBAL_CONTEXT_INDEX = SPMD_GLOBAL_CONTEXT_INDEX;
 
 /**
  * Per-core global context, stored in PTO2DispatchPayload.
@@ -98,6 +104,10 @@ struct LocalContext {
                           // Currently fixed to 1 (block_dim > 1 not yet implemented).
                           // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                           // which controls how many physical cores the runtime launches.
+    PTO2TaskId task_token;
+    volatile __gm__ PTO2DeferredCompletionEntry *deferred_completion_entries;
+    volatile __gm__ uint32_t *deferred_completion_count;
+    uint32_t deferred_completion_capacity;
 };
 
 /**

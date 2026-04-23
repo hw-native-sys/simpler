@@ -31,7 +31,10 @@
 
 #include <atomic>
 
+#include "pto_constants.h"
 #include "pto_runtime_status.h"
+#include "pto2_dispatch_payload.h"
+#include "pto_completion_ingress.h"
 #include "pto_submit_types.h"
 #include "pto_task_id.h"
 #include "pto_types.h"
@@ -112,11 +115,6 @@
 
 // Wiring queue
 #define PTO2_WRIRING_QUEUE_SIZE 1024  // Per-shape queue size
-
-// Memory alignment
-#define PTO2_ALIGN_SIZE 64             // Cache line alignment
-#define PTO2_PACKED_OUTPUT_ALIGN 1024  // Each output in packed buffer aligned to 1024B; gap is padding
-#define PTO2_ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))
 
 // Fanin storage
 #define PTO2_FANIN_INLINE_CAP 16
@@ -237,6 +235,9 @@ struct PTO2TaskPayload {
     Tensor tensors[MAX_TENSOR_ARGS];
     // === Cache lines 35-38 (256B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
+    bool complete_in_future{false};
+    uint32_t deferred_completion_count{0};
+    PTO2DeferredCompletionEntry deferred_completion_entries[PTO2_MAX_COMPLETIONS_PER_TASK];
 
     // Layout verification (size checks that don't need offsetof).
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
@@ -274,6 +275,8 @@ struct PTO2TaskPayload {
         // Round up to cache line boundary. Both arrays are 1024B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
+        complete_in_future = args.complete_in_future;
+        deferred_completion_count = 0;
     }
 };
 

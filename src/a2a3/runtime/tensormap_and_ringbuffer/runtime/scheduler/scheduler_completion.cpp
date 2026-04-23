@@ -15,6 +15,7 @@
 #include "aicpu/platform_regs.h"
 #include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
+#include "pto_runtime2.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
@@ -90,6 +91,25 @@ void SchedulerContext::complete_slot_task(
             );
         }
 #endif
+        int32_t reg_err = PTO2_ERROR_NONE;
+        PTO2AsyncWaitList::RegisterResult reg_result;
+        do {
+            reg_result = sched_->async_wait_list.register_deferred(slot_state, reg_err);
+        } while (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped);
+
+        if (reg_result == PTO2AsyncWaitList::RegisterResult::Error) {
+            int32_t expected = PTO2_ERROR_NONE;
+            sched_->sm_header->sched_error_code.compare_exchange_strong(
+                expected, reg_err, std::memory_order_acq_rel, std::memory_order_acquire
+            );
+            completed_.store(true, std::memory_order_release);
+            return;
+        }
+
+        if (reg_result == PTO2AsyncWaitList::RegisterResult::Registered) {
+            return;
+        }
+
 #if PTO2_SCHED_PROFILING
         PTO2CompletionStats cstats = sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
         l2_perf.notify_edges_total += cstats.fanout_edges;

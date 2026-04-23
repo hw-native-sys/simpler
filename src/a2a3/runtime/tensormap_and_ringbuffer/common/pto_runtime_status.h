@@ -34,6 +34,9 @@
 
 // Scheduler errors (100+): detected in scheduler threads
 #define PTO2_ERROR_SCHEDULER_TIMEOUT 100
+#define PTO2_ERROR_ASYNC_COMPLETION_INVALID 101
+#define PTO2_ERROR_ASYNC_WAIT_OVERFLOW 102
+#define PTO2_ERROR_ASYNC_REGISTRATION_FAILED 103
 
 static inline int32_t pto2_runtime_status_from_error_codes(int32_t orch_error_code, int32_t sched_error_code) {
     if (orch_error_code != PTO2_ERROR_NONE) {

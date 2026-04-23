@@ -239,6 +239,23 @@ static inline TaskOutputTensors pto2_rt_submit_aiv_task(int32_t kernel_id, const
     return rt->ops->submit_task(rt, mk, args);
 }
 
+static inline TaskOutputTensors pto2_rt_submit_aiv_task_deferred(int32_t kernel_id, Arg &args) {
+    args.complete_in_future = true;
+    return pto2_rt_submit_aiv_task(kernel_id, args);
+}
+
+static inline Tensor
+pto2_rt_submit_notification_wait_task(int32_t kernel_id, uint64_t local_counter_addr, uint32_t expected_value) {
+    uint32_t shape[1] = {1};
+    TensorCreateInfo token_info(shape, 1, DataType::INT32);
+    Arg params;
+    params.add_output(token_info);
+    params.add_scalar(local_counter_addr);
+    params.add_scalar(static_cast<uint64_t>(expected_value));
+    TaskOutputTensors outputs = pto2_rt_submit_aiv_task_deferred(kernel_id, params);
+    return outputs.get_ref(0);
+}
+
 static inline void pto2_rt_scope_begin() {
     PTO2Runtime *rt = pto2_current_runtime();
     if (rt->ops->is_fatal(rt)) {
