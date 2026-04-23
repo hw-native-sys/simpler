@@ -43,7 +43,7 @@ TEST(Scope, SingleScope_ReleasesRegisteredTasks) {
 
 TEST(Scope, RegisterOutsideScopeIsNoop) {
     Scope sc;
-    sc.register_task(5);  // no open scope — should not throw
+    sc.register_task(5);  // no open scope -- should not throw
     EXPECT_EQ(sc.depth(), 0);
 }
 

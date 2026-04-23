@@ -48,7 +48,7 @@ struct OrchestratorFixture : public ::testing::Test {
 
     void TearDown() override { allocator.shutdown(); }
 
-    // Per-slot accessor — slot state lives inside the Ring now.
+    // Per-slot accessor -- slot state lives inside the Ring now.
     TaskSlotState &S(TaskSlot id) { return *allocator.slot_state(id); }
 
     // Helper: build a TaskArgs whose only tensor has the given (data, tag).
@@ -86,7 +86,7 @@ TEST_F(OrchestratorFixture, DependentTaskIsPending) {
     TaskSlot a_slot;
     rq.try_pop(a_slot);
 
-    // Task B reads INPUT at the same key — depends on A
+    // Task B reads INPUT at the same key -- depends on A
     auto args_b = single_tensor_args(0xBEEF, TensorArgType::INPUT);
     auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::PENDING);
@@ -151,7 +151,7 @@ TEST_F(OrchestratorFixture, NoDepTagSkipsDependencyTracking) {
     TaskSlot drain_slot;
     rq.try_pop(drain_slot);
 
-    // Second task references same key but tagged NO_DEP — should be independent
+    // Second task references same key but tagged NO_DEP -- should be independent
     auto args_b = single_tensor_args(0xAAAA, TensorArgType::NO_DEP);
     auto b = orch.submit_next_level(0xDEAD, args_b, cfg);
     EXPECT_EQ(S(b.task_slot).state.load(), TaskState::READY);
@@ -215,7 +215,7 @@ TEST_F(OrchestratorFixture, OutputAutoAllocsFromHeapRing) {
 
 TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {
     // INOUT is the only tag that pulls in the prior writer as a fanin
-    // producer — matching L2's pto_orchestrator.cpp Step B where only
+    // producer -- matching L2's pto_orchestrator.cpp Step B where only
     // INPUT / INOUT do tensor_map.lookup. Users who want a WaW dep on
     // the alloc-slot (so its HeapRing slab stays live while they write)
     // must tag the buffer INOUT.
@@ -250,7 +250,7 @@ TEST_F(OrchestratorFixture, InoutWiresCreatorAsFanin) {
 
 TEST_F(OrchestratorFixture, OutputAndOutputExistingAreInsertOnly) {
     // Contrast with INOUT: plain OUTPUT and OUTPUT_EXISTING are pure
-    // overwrites — insert into TensorMap, no lookup, so no fanin wire
+    // overwrites -- insert into TensorMap, no lookup, so no fanin wire
     // on the prior writer. Matches L2 semantics for both tags. Users
     // who need creator lifetime must tag the buffer INOUT.
     struct Case {

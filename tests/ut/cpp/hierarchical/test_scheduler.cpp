@@ -205,7 +205,7 @@ TEST_F(SchedulerFixture, DependentTaskDispatchedAfterProducerCompletes) {
 }
 
 // ===========================================================================
-// Group task tests — fixture with 2 MockWorkers
+// Group task tests -- fixture with 2 MockWorkers
 // ===========================================================================
 
 struct GroupSchedulerFixture : public ::testing::Test {
@@ -405,7 +405,7 @@ TEST_F(MixedTypeSchedulerFixture, SubTaskDispatchesWhileNextLevelPoolSaturated) 
     EXPECT_TRUE(next_level_worker.is_running.load()) << "chip worker must still be busy";
 
     // Complete the sub task first; it reaches CONSUMED while the chip task
-    // is still running — demonstrating independent per-type dispatch.
+    // is still running -- demonstrating independent per-type dispatch.
     sub_worker.complete();
     wait_consumed(sub.task_slot);
     EXPECT_FALSE(is_consumed(chip.task_slot));
@@ -416,7 +416,7 @@ TEST_F(MixedTypeSchedulerFixture, SubTaskDispatchesWhileNextLevelPoolSaturated) 
 
 TEST_F(GroupSchedulerFixture, GroupDependencyChain) {
     // Group A (2 workers) produces an OUTPUT at key 0xCAFE.
-    // Task B reads INPUT at the same key — depends on group A.
+    // Task B reads INPUT at the same key -- depends on group A.
     TaskArgs a0 = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     TaskArgs a1 = single_tensor_args(0xCAFE, TensorArgType::OUTPUT);
     auto a = orch.submit_next_level_group(0xDEAD, {a0, a1}, cfg);
