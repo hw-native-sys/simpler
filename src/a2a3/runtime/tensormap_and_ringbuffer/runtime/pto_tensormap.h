@@ -216,6 +216,13 @@ struct PTO2TensorMap {
     // Per-ring validity threshold (for lazy invalidation)
     int32_t last_task_alives[PTO2_MAX_RING_DEPTH];  // Cached from shared memory per ring
 
+    // Per-ring active iteration threshold (lookup hot-path cache).
+    //   active_iter_start[r] >= 0  : entries on ring r with local_id < this are filtered.
+    //   active_iter_start[r] == -1 : no active filter on ring r.
+    // active_filter_mask bit r mirrors (active_iter_start[r] >= 0) for a single branch test.
+    int32_t active_iter_start[PTO2_MAX_RING_DEPTH]{};
+    uint32_t active_filter_mask{0};
+
     // Parallel for iteration isolation stack.
     // Each PTO2_PARALLEL_FOR pushes a frame; each iteration updates the frame's
     // iter_start. Lookup filters entries whose local_id < iter_start on the
@@ -235,13 +242,6 @@ struct PTO2TensorMap {
     };
     PTO2IterFrame iter_stack[PTO2_MAX_PARALLEL_DEPTH];
     int32_t iter_stack_top{-1};  // -1 = no active parallel for
-
-    // Per-ring active iteration threshold (lookup hot-path cache).
-    //   active_iter_start[r] >= 0  : entries on ring r with local_id < this are filtered.
-    //   active_iter_start[r] == -1 : no active filter on ring r.
-    // active_filter_mask bit r mirrors (active_iter_start[r] >= 0) for a single branch test.
-    int32_t active_iter_start[PTO2_MAX_RING_DEPTH]{};
-    uint32_t active_filter_mask{0};
 
     // =============================================================================
     // Iter-stack helpers (maintain frames + per-ring cache atomically)
@@ -382,29 +382,12 @@ struct PTO2TensorMap {
 #if PTO2_TENSORMAP_PROFILING
             chain_len++;
 #endif
-            // Skip stale entries (no chain truncation — entries from different
-            // rings can be interleaved, so a stale entry from one ring does NOT
-            // imply subsequent entries from other rings are also stale)
+            // Skip entries that are either stale (producer retired) or from prior
+            // iterations of the current parallel-for. Both checks are unified in
+            // entry_valid() to avoid extracting ring/local twice.
             if (!entry_valid(*cur_entry)) {
                 cur_entry = next_entry;
                 continue;
-            }
-
-            // Parallel for iteration isolation: skip entries from prior iterations.
-            // Fast path: active_filter_mask == 0 (no parallel_for is currently
-            // inside an iteration) collapses to a single branch. Otherwise a
-            // single per-ring compare replaces the full iter_stack scan; the
-            // stack's "innermost frame wins per ring" semantics are denormalized
-            // into active_iter_start[] on push/set/pop.
-            if (active_filter_mask) {
-                uint8_t entry_ring = cur_entry->producer_task_id.ring();
-                if ((active_filter_mask >> entry_ring) & 1u) {
-                    int32_t entry_local = static_cast<int32_t>(cur_entry->producer_task_id.local());
-                    if (entry_local < active_iter_start[entry_ring]) {
-                        cur_entry = next_entry;
-                        continue;
-                    }
-                }
             }
 
             // Entry is valid - check if regions OVERLAP (not just exact match)
@@ -529,10 +512,16 @@ struct PTO2TensorMap {
     }
 
     /**
-     * Check if entry is valid (producer has not retired)
+     * Check if entry is visible in the current execution context:
+     * 1. Producer has not retired (not stale).
+     * 2. Not from a prior iteration of the active parallel-for on the same ring.
      */
     bool entry_valid(const PTO2TensorMapEntry &entry) const {
-        return static_cast<int32_t>(entry.producer_task_id.local()) >= last_task_alives[entry.producer_task_id.ring()];
+        uint8_t ring = entry.producer_task_id.ring();
+        int32_t local = static_cast<int32_t>(entry.producer_task_id.local());
+        if (local < last_task_alives[ring]) return false;
+        if (active_filter_mask && ((active_filter_mask >> ring) & 1u) && local < active_iter_start[ring]) return false;
+        return true;
     }
 
     void remove_entry(PTO2TensorMapEntry &entry) {

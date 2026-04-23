@@ -160,11 +160,11 @@ __attribute__((visibility("default"))) void build_paged_attention_graph(const Ch
     CYCLE_COUNT_LAP(prof_make_tensor);
 #endif
 
-    for (uint64_t b_idx = 0; b_idx < batch; b_idx++) {
+    PTO2_PARALLEL_FOR(b_idx, (int)batch) {
         uint32_t cl_idx[1] = {static_cast<uint32_t>(b_idx)};
         uint64_t cur_seq = static_cast<uint64_t>(get_tensor_data<int32_t>(context_lens, 1, cl_idx));
         uint64_t bn_this_batch = (cur_seq + block_size - 1) / block_size;
-        for (uint64_t q_idx = 0; q_idx < q_loop; q_idx++) {
+        PTO2_PARALLEL_FOR(q_idx, (int)q_loop) {
             CYCLE_COUNT_LAP(prof_scope_and_loop);
             PTO2_SCOPE() {
                 uint64_t cur_offset = b_idx * q_head_num + q_idx * q_tile;
