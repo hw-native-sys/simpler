@@ -1,5 +1,9 @@
+#!/usr/bin/env python3
 """
 Numerical correctness test for the standalone paged attention kernel.
+
+Compares the custom kernel (loaded via ctypes from pa_lib.so) against
+`torch_npu.npu_incre_flash_attention` with paged KV
 """
 from __future__ import annotations
 
@@ -96,18 +100,50 @@ def pack_kv_to_paged(
     return k_page, v_page, bt
 
 
-# ── reference: torch_npu.atb ─────────────────────────────────────────────────
+def kvp_page_to_bsh_layout(
+    k_page: torch.Tensor, v_page: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """[num_blocks, block_size, nkv, D] -> [num_blocks, block_size, nkv*D] for IFA BSH."""
+    nb, bs, nkv, d = k_page.shape
+    return (
+        k_page.reshape(nb, bs, nkv * d).contiguous(),
+        v_page.reshape(nb, bs, nkv * d).contiguous(),
+    )
 
-def run_atb_v2(q, k_page, v_page, bt, ctx_lens, nkv, nq, scale, dtype):
-    out = torch.empty(q.shape, dtype=dtype, device=q.device)
-    torch_npu.atb._npu_paged_attention_v2(
-        q, k_page, bt, ctx_lens,
-        value_cache=v_page,
-        mask=None, num_kv_heads=nkv, num_heads=nq,
-        scale_value=scale, mask_type=0, out=out,
+
+# ── reference: torch_npu.npu_incre_flash_attention (paged KV) ───────────────
+
+def run_incre_flash_paged_ref(
+    q: torch.Tensor,
+    k_page: torch.Tensor,
+    v_page: torch.Tensor,
+    bt: torch.Tensor,
+    ctx_lens: torch.Tensor,
+    nkv: int,
+    nq: int,
+    scale: float,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """BSH paged path; q is [B, nq, D], returns [B, nq, D] like the custom kernel."""
+    b, _, d = q.shape
+    device = q.device
+    block_size = k_page.shape[1]
+    k_bsh, v_bsh = kvp_page_to_bsh_layout(k_page, v_page)
+    q_bsh = q.reshape(b, 1, nq * d).contiguous()
+    out_bsh = torch_npu.npu_incre_flash_attention(
+        q_bsh,
+        k_bsh,
+        v_bsh,
+        num_heads=nq,
+        num_key_value_heads=nkv,
+        input_layout="BSH",
+        scale_value=scale,
+        block_table=bt.to(device),
+        actual_seq_lengths=[int(x) for x in ctx_lens.tolist()],
+        block_size=block_size,
     )
     torch.npu.synchronize()
-    return out
+    return out_bsh.reshape(b, nq, d).to(dtype=dtype)
 
 
 # ── custom kernel runner ──────────────────────────────────────────────────────
@@ -196,8 +232,8 @@ def run_test(lib, case, dtype, device, block_dim,
          at position 0 mod 4 which is the correct FFTS phase for that shape.
       3. Run the CUSTOM kernel FIRST (immediately after warmup, no intervening
          NPU ops).
-      4. Run the ATB reference AFTER – the reference does not need a specific
-         FFTS phase.
+      4. Run the IFA reference (`npu_incre_flash_attention`, paged KV) AFTER –
+         the reference does not need a specific FFTS phase.
       5. Compare.
     """
     name  = case["name"]
@@ -237,8 +273,8 @@ def run_test(lib, case, dtype, device, block_dim,
     out = run_custom(lib, q, k_page, v_page, bt, ctx_lens, nq, nkv, d, d, scale,
                      block_dim, device, dtype, workspace_cache=wscache)
 
-    # ── Step 4: ATB reference AFTER ──
-    ref = run_atb_v2(q, k_page, v_page, bt, ctx_lens, nkv, nq, scale, dtype)
+    # ── Step 4: IFA reference AFTER ──
+    ref = run_incre_flash_paged_ref(q, k_page, v_page, bt, ctx_lens, nkv, nq, scale, dtype)
 
     diff = (out.float() - ref.float()).abs()
     mean_err = diff.mean().item()

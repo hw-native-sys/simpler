@@ -83,7 +83,7 @@ using PagedAttentionInfo = struct PagedAttentionTilingParams {
     int32_t *qSeqLen{nullptr};
     int32_t qHeadOriginal = 0;
     int32_t compressHead = 0;
-    int32_t tBlockAlign = 16; // 算子L1内对齐，fp16 16  int8 32
+    int32_t tBlockAlign = 16; // L1 tile alignment: 16 for fp16, 32 for int8
     int32_t dataShapeType = 0;
 };
 

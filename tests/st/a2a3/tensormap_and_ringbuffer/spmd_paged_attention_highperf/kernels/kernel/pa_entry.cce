@@ -1,12 +1,10 @@
-#include "utils/common.h"
-#include "utils/common_func.h"
-#include "utils/simd.h"
-#include "utils/iterator.h"
-#include "utils/mma.h"
-#include "utils/utils.h"
 #include "pa_kernel.cce"
 
+#ifdef __CCE_KT_TEST__
+#define __aicore__
+#else
 #define __aicore__ [aicore]
+#endif
 
 extern "C" __global__ __aicore__ void paged_attention_mask(
     __gm__ uint8_t *__restrict__ sync,
@@ -34,14 +32,14 @@ extern "C" __global__ __aicore__ void paged_attention_mask(
     __gm__ uint8_t *__restrict__ gm_v16,
     __gm__ uint8_t *__restrict__ tiling_para_gm)
 { 
-    SetFftsBaseAddr((unsigned long)sync);
-    SetAtomicnone();
-    SetMasknorm();
+    set_ffts_base_addr((unsigned long)sync);
+    set_atomic_none();
+    set_mask_norm();
 #ifdef __DAV_C220_VEC__
-    SetVectorMask<int8_t>((uint64_t)-1, (uint64_t)-1);
+    set_vector_mask((uint64_t)-1, (uint64_t)-1);
 #elif __DAV_C220_CUBE__
-    SetPadding<uint64_t>(0);
-    SetNdpara(1, 0, 0);
+    set_padding(0);
+    set_nd_para(1ULL);
 #endif
     // In standalone mode, g_tilingKey is not set by the MKI framework, so we
     // initialize it from the tiling buffer before any TILING_KEY_IS check.
@@ -94,5 +92,5 @@ extern "C" __global__ __aicore__ void paged_attention_mask(
         pa_aiv.Run();
 #endif
     }
-    PIPE_BARRIER(ALL);
+    pipe_barrier(PIPE_ALL);
 }

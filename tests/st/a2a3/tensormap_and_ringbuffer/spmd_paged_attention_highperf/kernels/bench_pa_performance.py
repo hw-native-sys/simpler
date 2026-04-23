@@ -1,6 +1,15 @@
+#!/usr/bin/env python3
 """
+Benchmark the standalone paged-attention kernel (pa_lib.so) vs
+`torch_npu.npu_incre_flash_attention` with paged KV
+
+Metrics:
+  FLOPs : QK + PV matmuls (GQA: nq heads for Q, nkv for K/V)
+  Bytes : logical Q + K + V + O tensors (nkv-wide K/V)
+  Timer : NPU events (benchmark_with_events)
+
 Usage:
-  python bench_pa_standalone.py [--warmup W] [--iters N] [--bf16] [--device ID]
+  python bench_pa_performance.py [--warmup W] [--iters N] [--bf16] [--device ID]
 """
 from __future__ import annotations
 
@@ -68,6 +77,41 @@ def pack_kv_to_paged(k_dense, v_dense, nkv, head_dim, block_size):
           .unsqueeze(0).expand(b, -1).clone()
           + torch.arange(b, dtype=torch.int32, device=dev).unsqueeze(1) * nb)
     return k_page, v_page, bt
+
+
+def kvp_page_to_bsh_layout(k_page: torch.Tensor, v_page: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """[num_blocks, block_size, nkv, D] → [num_blocks, block_size, nkv*D] for npu_incre_flash_attention BSH."""
+    nb, bs, nkv, d = k_page.shape
+    return (
+        k_page.reshape(nb, bs, nkv * d).contiguous(),
+        v_page.reshape(nb, bs, nkv * d).contiguous(),
+    )
+
+
+def run_incre_flash_paged(
+    q_bsh: torch.Tensor,
+    k_page_bsh: torch.Tensor,
+    v_page_bsh: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    scale: float,
+    block_table: torch.Tensor,
+    actual_seq_lengths: list[int],
+    block_size: int,
+):
+    """Same surface as `ifa/bench_ifa_gpa_paged.run_incre_flash_paged`."""
+    return torch_npu.npu_incre_flash_attention(
+        q_bsh,
+        k_page_bsh,
+        v_page_bsh,
+        num_heads=num_heads,
+        num_key_value_heads=num_kv_heads,
+        input_layout="BSH",
+        scale_value=scale,
+        block_table=block_table,
+        actual_seq_lengths=actual_seq_lengths,
+        block_size=block_size,
+    )
 
 
 # ── custom kernel runner ──────────────────────────────────────────────────────
@@ -149,22 +193,27 @@ def bench_case(lib, name, b, nq, nkv, d, s_kv, bs, dtype, device,
     v_dense = torch.randn(b, s_kv, nkv * d, dtype=dtype, device=device)
     k_page, v_page, bt = pack_kv_to_paged(k_dense, v_dense, nkv, d, bs)
     ctx_lens = torch.tensor([s_kv] * b, dtype=torch.int32, device="cpu")
-    out_ref = torch.empty(b, nq, d, dtype=dtype, device=device)
+    k_page_bsh, v_page_bsh = kvp_page_to_bsh_layout(k_page, v_page)
+    q_bsh = q.reshape(b, 1, nq * d).contiguous()
 
-    def forward_atb_v2():
-        torch_npu.atb._npu_paged_attention_v2(
-            q, k_page, bt, ctx_lens,
-            value_cache=v_page, mask=None,
-            num_kv_heads=nkv, num_heads=nq,
-            scale_value=scale, mask_type=0, out=out_ref,
+    def forward_incre_flash():
+        return run_incre_flash_paged(
+            q_bsh,
+            k_page_bsh,
+            v_page_bsh,
+            nq,
+            nkv,
+            scale,
+            bt,
+            [s_kv] * b,
+            bs,
         )
-        return out_ref
 
     runner = CustomPARunner(lib, q, k_page, v_page, bt, ctx_lens,
                              nq, nkv, d, scale, block_dim, device, dtype)
 
-    ms_custom = benchmark_with_events(runner,        warmup_iters=warmup, benchmark_iters=iters)
-    ms_atb_v2 = benchmark_with_events(forward_atb_v2, warmup_iters=warmup, benchmark_iters=iters)
+    ms_custom = benchmark_with_events(runner, warmup_iters=warmup, benchmark_iters=iters)
+    ms_ifa = benchmark_with_events(forward_incre_flash, warmup_iters=warmup, benchmark_iters=iters)
 
     def fmt(label, ms):
         t_s  = ms * 1e-3
@@ -175,9 +224,9 @@ def bench_case(lib, name, b, nq, nkv, d, s_kv, bs, dtype, device,
                 f" {tflops:7.4f} TFLOP/s | {gibs:7.4f} GiB/s | AI={ai:.4f} F/B")
 
     print(fmt("standalone (pa_lib.so)", ms_custom))
-    print(fmt("ATB v2 (_npu_paged_attention_v2)", ms_atb_v2))
-    speedup = ms_atb_v2 / ms_custom if ms_custom > 0 else float("inf")
-    print(f"{name} | speedup standalone/ATB_v2: {speedup:.3f}x")
+    print(fmt("npu_incre_flash_attention (paged)", ms_ifa))
+    speedup = ms_ifa / ms_custom if ms_custom > 0 else float("inf")
+    print(f"{name} | speedup standalone/IFA: {speedup:.3f}x")
     print()
 
 
@@ -204,7 +253,7 @@ DEFAULT_CASES = [
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Standalone PA kernel benchmark vs ATB v2.")
+        description="Standalone PA kernel benchmark vs npu_incre_flash_attention (paged KV).")
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters",  type=int, default=20)
     parser.add_argument("--bf16",   action="store_true")
