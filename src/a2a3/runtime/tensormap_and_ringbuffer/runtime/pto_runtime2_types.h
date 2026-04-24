@@ -128,7 +128,7 @@
 #define PTO2_ALIGN_UP(x, align) (((x) + (align) - 1) & ~((align) - 1))
 
 // Fanin storage
-#define PTO2_FANIN_INLINE_CAP 16
+#define PTO2_FANIN_INLINE_CAP 64
 
 // TensorMap cleanup interval
 #define PTO2_TENSORMAP_CLEANUP_INTERVAL 64  // Cleanup every N retired tasks
@@ -294,9 +294,9 @@ struct PTO2TaskPayload {
 static_assert(
     offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
 );
-static_assert(offsetof(PTO2TaskPayload, tensors) == 192, "tensors must start at byte 192 (cache line 3)");
+static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 192 (cache line 3)");
 static_assert(
-    offsetof(PTO2TaskPayload, scalars) == 192 + MAX_TENSOR_ARGS * sizeof(Tensor),
+    offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor),
     "scalars must immediately follow tensors"
 );
 

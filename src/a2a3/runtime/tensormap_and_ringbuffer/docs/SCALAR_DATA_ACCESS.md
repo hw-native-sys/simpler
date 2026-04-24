@@ -33,7 +33,7 @@ addr null-check → TensorMap lookup → spin-wait producer COMPLETED → comput
 - **addr null-check**: `buffer.addr == 0` means unallocated — log error, return 0
 - **TensorMap lookup**: find producer task by `buffer.addr`
 - **spin-wait**: wait until producer `task_state >= PTO2_TASK_COMPLETED`
-- **No producer** (`lookup_result.count == 0`): skip waiting, read immediately
+- **No producer** (lookup callback never fires): skip waiting, read immediately
 
 ### 3.2 set_tensor_data Flow
 
@@ -116,7 +116,7 @@ Three actors:
 
 **Scenario #3 is the only case requiring special attention**:
 
-TensorMap tracks only producers (OUTPUT/INOUT), not pure INPUT consumers. If a tensor is only registered via `add_input()`, TensorMap has no producer entry for it. `set_tensor_data`'s `wait_for_tensor_ready()` sees `lookup_result.count == 0` and returns immediately — but the kernel may still be reading → **WAR data race**.
+TensorMap tracks only producers (OUTPUT/INOUT), not pure INPUT consumers. If a tensor is only registered via `add_input()`, TensorMap has no producer entry for it. `set_tensor_data`'s `wait_for_tensor_ready()` finds no matching producer (the lookup callback never fires) and returns immediately — but the kernel may still be reading → **WAR data race**.
 
 **Solution**: For tensors that may later be written via `set_tensor_data`, use `add_inout()` instead of `add_input()`. INOUT registers a producer entry in TensorMap, enabling `set_tensor_data` to track all consumers through `fanout_refcount`.
 

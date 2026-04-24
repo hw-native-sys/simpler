@@ -79,90 +79,106 @@ static bool wait_for_tensor_ready(PTO2Runtime *rt, const Tensor &tensor, bool wa
     PTO2TaskId owner = tensor.owner_task_id;
     PTO2OrchestratorState &orch = rt->orchestrator;
 
-    // Collect producer slot states from both maps, deduplicated by pointer.
-    // +1: one creator slot + up to PTO2_LOOKUP_MAX_RESULTS modifier slots.
-    constexpr int kMaxWait = PTO2_LOOKUP_MAX_RESULTS + 1;
-    PTO2TaskSlotState *slots[kMaxWait];
-    int slot_count = 0;
+    // Segmented wait: collect up to kSegmentCap producer slots, then flush by
+    // spinning on each. When the segment fills, we wait for the accumulated
+    // batch before continuing to gather more. Dedup is per-segment only; a
+    // producer that appears in two segments is waited on twice, which is
+    // idempotent (task_state is monotonic) and only adds one atomic load on
+    // the second encounter.
+    constexpr int kSegmentCap = 64;
+    const PTO2TaskSlotState *seg[kSegmentCap];
+    int seg_count = 0;
+    bool signaled = false;
+    bool failed = false;
 
-    // Step A: creator retention — read owner directly from tensor metadata
-    if (owner.is_valid()) {
-        slots[slot_count++] = &orch.sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local());
-    }
-
-    // Step B: modifier writer lookup (OverlapMap)
-    PTO2LookupResult lookup_result;
-    orch.tensor_map.lookup(tensor, lookup_result);
-    for (int r = 0; r < lookup_result.count; r++) {
-        PTO2TaskId pid = lookup_result.entries[r].entry->producer_task_id;
-        PTO2TaskSlotState *s = &orch.sm_header->rings[pid.ring()].get_slot_state_by_task_id(pid.local());
-        bool already = false;
-        for (int j = 0; j < slot_count; j++) {
-            if (slots[j] == s) {
-                already = true;
-                break;
-            }
-        }
-        if (!already && slot_count < kMaxWait) {
-            slots[slot_count++] = s;
-        }
-    }
-
-    // Signal scheduler: orchestrator is about to block, bypass wiring backoff
-    bool signaled = slot_count > 0 && orch.scheduler;
-    if (signaled) {
-        orch.scheduler->wiring.orch_needs_drain.store(true, std::memory_order_release);
-    }
-
-    // Wait for each producer
-    for (int p = 0; p < slot_count; p++) {
-        PTO2TaskSlotState &slot = *slots[p];
+    auto wait_one_producer = [&](const PTO2TaskSlotState &slot) {
         uint8_t ring_id = slot.ring_id;
         int32_t local_id = static_cast<int32_t>(slot.task->task_id.local());
-
         uint64_t t0 = get_sys_cnt_aicpu();
         int32_t spin_count = 0;
         while (slot.task_state.load(std::memory_order_acquire) < PTO2_TASK_COMPLETED) {
             SPIN_WAIT_HINT();
             if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                if (signaled) {
-                    orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
-                }
                 pto2_orch_report_fatal(
                     &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
                     "Timeout (%llu cycles): producer (ring=%d, local=%d) not completed",
                     (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
                 );
-                return false;
+                failed = true;
+                return;
             }
         }
+    };
 
-        if (wait_for_consumers) {
-            t0 = get_sys_cnt_aicpu();
-            spin_count = 0;
-            while (slot.fanout_refcount.load(std::memory_order_acquire) < slot.fanout_count - 1) {
-                SPIN_WAIT_HINT();
-                if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
-                    if (signaled) {
-                        orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
-                    }
-                    pto2_orch_report_fatal(
-                        &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
-                        "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
-                        (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
-                    );
-                    return false;
-                }
+    auto wait_one_consumers = [&](const PTO2TaskSlotState &slot) {
+        uint8_t ring_id = slot.ring_id;
+        int32_t local_id = slot.task->task_id.local();
+        uint64_t t0 = get_sys_cnt_aicpu();
+        int32_t spin_count = 0;
+        while (slot.fanout_refcount.load(std::memory_order_acquire) < slot.fanout_count - 1) {
+            SPIN_WAIT_HINT();
+            if ((++spin_count & 1023) == 0 && get_sys_cnt_aicpu() - t0 > PTO2_TENSOR_DATA_TIMEOUT_CYCLES) {
+                pto2_orch_report_fatal(
+                    &orch, PTO2_ERROR_TENSOR_WAIT_TIMEOUT, caller,
+                    "Timeout (%llu cycles): consumers of producer (ring=%d, local=%d) not done",
+                    (unsigned long long)PTO2_TENSOR_DATA_TIMEOUT_CYCLES, ring_id, local_id
+                );
+                failed = true;
+                return;
             }
         }
-    }
+    };
 
-    // Clear urgency flag: orchestrator no longer blocking
+    auto flush_segment = [&]() {
+        for (int i = 0; i < seg_count; i++) {
+            wait_one_producer(*seg[i]);
+            if (failed) return;
+            if (!wait_for_consumers) continue;
+            wait_one_consumers(*seg[i]);
+            if (failed) return;
+        }
+        seg_count = 0;
+    };
+
+    auto try_push = [&](const PTO2TaskSlotState &s) {
+        for (int j = 0; j < seg_count; j++) {
+            if (seg[j] == &s) return;  // per-segment dedup
+        }
+        if (seg_count == kSegmentCap) {
+            flush_segment();
+            if (failed) return;
+        }
+        seg[seg_count++] = &s;
+        if (!signaled) {
+            orch.scheduler->wiring.orch_needs_drain.store(true, std::memory_order_release);
+            signaled = true;
+        }
+    };
+
+    auto do_wait = [&]() {
+        // Step A: creator retention — read owner directly from tensor metadata
+        if (owner.is_valid()) {
+            auto &s = orch.sm_header->rings[owner.ring()].get_slot_state_by_task_id(owner.local());
+            try_push(s);
+            if (failed) return;
+        }
+
+        // Step B: modifier writer lookup (OverlapMap), direct callback
+        orch.tensor_map.lookup(tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus) -> bool {
+            PTO2TaskId pid = entry.producer_task_id;
+            auto &s = orch.sm_header->rings[pid.ring()].get_slot_state_by_task_id(pid.local());
+            try_push(s);
+            return !failed;
+        });
+        if (failed) return;
+        flush_segment();
+    };
+
+    do_wait();
     if (signaled) {
         orch.scheduler->wiring.orch_needs_drain.store(false, std::memory_order_release);
     }
-
-    return true;
+    return !failed;
 }
 MAYBE_UNINITIALIZED_END
 

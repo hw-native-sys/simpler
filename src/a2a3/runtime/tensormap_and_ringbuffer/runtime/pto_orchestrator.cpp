@@ -614,21 +614,22 @@ pto2_submit_mixed_task(PTO2OrchestratorState *orch, const MixedKernels &mixed_ke
             continue;
         }
 
-        PTO2LookupResult lookup_result;
-        orch->tensor_map.lookup(*tensor, lookup_result);
-
-        for (int r = 0; r < lookup_result.count; r++) {
-            PTO2TensorMapEntry &entry = *lookup_result.entries[r].entry;
-            auto overlap_status = lookup_result.entries[r].overlap_status;
+        bool lookup_fatal = false;
+        orch->tensor_map.lookup(*tensor, [&](PTO2TensorMapEntry &entry, OverlapStatus overlap_status) -> bool {
             auto prod_ring = entry.producer_task_id.ring();
             auto prod_local = entry.producer_task_id.local();
             PTO2TaskSlotState *prod_state = &orch->sm_header->rings[prod_ring].get_slot_state_by_task_id(prod_local);
             if (!pto2_append_fanin_or_fail(orch, prod_state, &fanin_builder, ring_id)) {
-                return result;
+                lookup_fatal = true;
+                return false;
             }
             if (ptype == TensorArgType::INOUT && overlap_status == OverlapStatus::COVERED) {
                 orch->tensor_map.remove_entry(entry);
             }
+            return true;
+        });
+        if (lookup_fatal) {
+            return result;
         }
     }
 

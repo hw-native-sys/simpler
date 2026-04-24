@@ -169,27 +169,9 @@ static_assert(
     offsetof(PTO2TensorMapEntry, prev_in_bucket) == 64, "TensorMapEntry must be exactly 2 cache lines (128 bytes)"
 );
 
-/**
- * Stack-allocated lookup result (avoids heap allocation per lookup)
- */
-#define PTO2_LOOKUP_MAX_RESULTS 16
 // =============================================================================
 // TensorMap Lookup Chain Length Statistics (compile-time toggle)
 // =============================================================================
-struct PTO2LookupResult {
-    struct Entry {
-        PTO2TensorMapEntry *entry;
-        OverlapStatus overlap_status;
-    };
-    Entry entries[PTO2_LOOKUP_MAX_RESULTS];
-    int32_t count{0};
-
-    void push(PTO2TensorMapEntry *entry, OverlapStatus s) {
-        if (count < PTO2_LOOKUP_MAX_RESULTS) {
-            entries[count++] = {entry, s};
-        }
-    }
-};
 
 /**
  * TensorMap structure
@@ -297,18 +279,23 @@ struct PTO2TensorMap {
     /**
      * Lookup producer for a tensor region
      *
-     * Searches the hash table for a matching region.
-     * Returns producer entry if found and valid.
+     * Searches the hash table for matching regions and invokes the callback
+     * for each overlapping valid entry.
      * Stale entries from different rings are skipped (not truncated).
      *
-     * @param tensor  Tensor to look up
-     * @param result  Output: stack-allocated result buffer
+     * The callback receives (PTO2TensorMapEntry &, OverlapStatus) and should
+     * return true to continue iteration, false to stop early. It is safe for
+     * the callback to call remove_entry() on the current entry: next_in_bucket
+     * is latched before invocation.
+     *
+     * @param tensor    Tensor to look up
+     * @param on_match  Callback invoked for each overlapping entry
      */
-    void lookup(const Tensor &tensor, PTO2LookupResult &result) {
+    template <typename Fn>
+    void lookup(const Tensor &tensor, Fn &&on_match) {
         uint32_t bucket_index = hash(tensor.buffer.addr);
         PTO2TensorMapEntry *cur_entry = buckets[bucket_index];
 
-        result.count = 0;
 #if PTO2_TENSORMAP_PROFILING
         g_lookup_count++;
         int32_t chain_len = 0;
@@ -337,10 +324,16 @@ struct PTO2TensorMap {
 #endif
                 auto overlap_status = cur_entry->check_overlap(tensor);
                 if (overlap_status != OverlapStatus::NO_OVERLAP) {
-                    result.push(cur_entry, overlap_status);
 #if PTO2_TENSORMAP_PROFILING
                     g_lookup_overlap_hits++;
 #endif
+                    if (!on_match(*cur_entry, overlap_status)) {
+#if PTO2_TENSORMAP_PROFILING
+                        g_lookup_chain_total += chain_len;
+                        if (chain_len > g_lookup_chain_max) g_lookup_chain_max = chain_len;
+#endif
+                        return;
+                    }
                 }
             }
 
