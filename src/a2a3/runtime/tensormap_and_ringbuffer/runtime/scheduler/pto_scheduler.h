@@ -661,8 +661,19 @@ struct PTO2SchedulerState {
 
         if (wfanin != 0) {
             int32_t early_finished = 0;
+#if PTO2_PROFILING
+            // Snapshot producer task_ids under fanout_lock (same visit order as fanin wiring).
+            // Completion-time perf reads this; avoids orch-time second pass over fanin_builder.
+            int32_t resolved = 0;
+#endif
             pto2_for_each_fanin_slot_state(*wp, [&](PTO2TaskSlotState *producer) {
                 pto2_fanout_lock(*producer);
+#if PTO2_PROFILING
+                if (resolved < PTO2TaskPayload::kMaxFaninResolved) {
+                    wp->fanin_resolved_ids[resolved] = producer->task->task_id.raw;
+                }
+                resolved++;
+#endif
                 int32_t pstate = producer->task_state.load(std::memory_order_acquire);
                 if (pstate >= PTO2_TASK_COMPLETED) {
                     early_finished++;
@@ -672,12 +683,19 @@ struct PTO2SchedulerState {
                 pto2_fanout_unlock(*producer);
             });
 
+#if PTO2_PROFILING
+            wp->fanin_resolved_count =
+                (resolved < PTO2TaskPayload::kMaxFaninResolved) ? resolved : PTO2TaskPayload::kMaxFaninResolved;
+#endif
             int32_t init_rc = early_finished + 1;
             int32_t new_rc = ws->fanin_refcount.fetch_add(init_rc, std::memory_order_acq_rel) + init_rc;
             if (new_rc >= ws->fanin_count) {
                 ready_queues[static_cast<int32_t>(pto2_active_mask_to_shape(ws->active_mask))].push(ws);
             }
         } else {
+#if PTO2_PROFILING
+            wp->fanin_resolved_count = 0;
+#endif
             ws->fanin_refcount.fetch_add(1, std::memory_order_acq_rel);
             ready_queues[static_cast<int32_t>(pto2_active_mask_to_shape(ws->active_mask))].push(ws);
         }

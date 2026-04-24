@@ -42,7 +42,7 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime);
  * Complete a L2PerfRecord with AICPU-side metadata after AICore task completion
  *
  * Reads l2_perf_buf->count, validates task_id match against the latest record,
- * and fills all AICPU-side fields. Callers must pre-extract fanout into a
+ * and fills all AICPU-side fields. Callers must pre-extract dependency tasks into a
  * plain uint64_t array (platform layer cannot depend on runtime linked-list types).
  *
  * @param l2_perf_buf              L2PerfBuffer pointer (from handshake l2_perf_records_addr)
@@ -52,12 +52,13 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime);
  * @param core_type             Core type (AIC/AIV)
  * @param dispatch_time         AICPU timestamp when task was dispatched
  * @param finish_time           AICPU timestamp when task completion was observed
- * @param fanout                Pre-extracted successor task ID array (nullptr if none)
- * @param fanout_count          Number of entries in fanout array (0 if none)
+ * @param fan_tasks             Dependency task ID array (nullptr if none)
+ * @param fan_tasks_count       Number of entries in fan_tasks array (0 if none)
+ * @param is_fanin              true = fan_tasks are producers (fanin), false = successors (fanout)
  */
 int l2_perf_aicpu_complete_record(
     L2PerfBuffer *l2_perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
+    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fan_tasks, int32_t fan_tasks_count, bool is_fanin
 );
 
 /**

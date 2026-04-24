@@ -130,19 +130,15 @@ void SchedulerContext::complete_slot_task(
         uint64_t finish_ts = get_sys_cnt_aicpu();
         L2PerfBuffer *pbuf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
 
-        uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
-        int32_t fanout_n = 0;
-        PTO2DepListEntry *cur = slot_state.fanout_head;
-        while (cur != nullptr && fanout_n < RUNTIME_MAX_FANOUT) {
-            fanout_arr[fanout_n++] = cur->slot_state->task->task_id.raw;
-            cur = cur->next;
-        }
+        // Consumer-side fanin: resolved at submit time in payload (race-free vs fanout_head).
+        const uint64_t *fanin_ids = slot_state.payload->fanin_resolved_ids;
+        int32_t fanin_n = slot_state.payload->fanin_resolved_count;
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
         if (l2_perf_aicpu_complete_record(
                 pbuf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
-                slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
-                fanout_n
+                slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanin_ids,
+                fanin_n, true
             ) != 0) {
             DEV_ERROR(
                 "Core %d: l2_perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,

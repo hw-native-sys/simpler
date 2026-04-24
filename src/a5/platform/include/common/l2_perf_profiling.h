@@ -38,9 +38,9 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 
-// Maximum number of successor tasks per L2PerfRecord (matches Task::fanout)
-#ifndef RUNTIME_MAX_FANOUT
-#define RUNTIME_MAX_FANOUT 128
+// Maximum number of dependency tasks per L2PerfRecord (fanin or fanout depending on runtime)
+#ifndef RUNTIME_MAX_FAN_TASKS
+#define RUNTIME_MAX_FAN_TASKS 128
 #endif
 
 // =============================================================================
@@ -68,9 +68,13 @@ struct L2PerfRecord {
     uint32_t func_id;    // Kernel function identifier
     CoreType core_type;  // Core type (AIC/AIV)
 
-    // Dependency relationship (fanout only)
-    uint64_t fanout[RUNTIME_MAX_FANOUT];  // Successor task task_id array
-    int32_t fanout_count;                 // Number of successor tasks
+    // Dependency relationship (fanin or fanout, indicated by is_fanin).
+    // PTO2 runtimes record consumer-side fanin (producer task_ids).
+    // host_build_graph records producer-side fanout (successor task_ids).
+    // Host exporter normalizes both into fanout edges for swimlane JSON.
+    uint64_t fan_tasks[RUNTIME_MAX_FAN_TASKS];  // Dependent task_id array
+    int32_t fan_tasks_count;                    // Number of dependent tasks recorded
+    uint8_t is_fanin;                           // 1 = fan_tasks are producers, 0 = successors
 } __attribute__((aligned(64)));
 
 static_assert(sizeof(L2PerfRecord) % 64 == 0, "L2PerfRecord must be 64-byte aligned for optimal cache performance");

@@ -476,6 +476,13 @@ void pto2_add_dependency(PTO2OrchestratorState *orch, PTO2TaskId producer_id, PT
         cons_payload->fanin_slot_states[cons_payload->fanin_actual_count] = &prod_state;
         cons_payload->fanin_actual_count++;
     }
+#if PTO2_PROFILING
+    // Resolve producer task_id now while slot_state is still valid.
+    if (cons_payload->fanin_resolved_count < PTO2TaskPayload::kMaxFaninResolved) {
+        cons_payload->fanin_resolved_ids[cons_payload->fanin_resolved_count] = prod_state.task->task_id.raw;
+        cons_payload->fanin_resolved_count++;
+    }
+#endif
 
     // Wire the fanout edge from producer to consumer.
     // Always use fanout_lock: the producer may be from a previous scope

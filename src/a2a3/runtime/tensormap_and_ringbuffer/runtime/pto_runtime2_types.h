@@ -288,6 +288,13 @@ struct PTO2TaskPayload {
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
     }
+
+#if PTO2_PROFILING
+    // Resolved producer task_ids for consumer-side fanin recording (profiling only).
+    static constexpr int32_t kMaxFaninResolved = 128;  // Matches RUNTIME_MAX_FAN_TASKS
+    uint64_t fanin_resolved_ids[kMaxFaninResolved];
+    int32_t fanin_resolved_count{0};
+#endif
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).

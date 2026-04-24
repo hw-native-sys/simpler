@@ -31,6 +31,7 @@
 #include <iomanip>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "common/memory_barrier.h"
@@ -1254,6 +1255,20 @@ int L2PerfCollector::export_swimlane_json(const std::string &output_path_arg) {
     }
 
     // Step 7: Write JSON data
+    // Build producer→consumers map from fanin records (PTO2 runtimes).
+    // Fanout records (host_build_graph) contribute directly per-record.
+    std::unordered_map<uint64_t, std::vector<uint64_t>> producer_to_consumers;
+    producer_to_consumers.reserve(tagged_records.size());
+    for (const auto &tagged : tagged_records) {
+        const auto &rec = *tagged.record;
+        if (!rec.is_fanin) continue;  // fanout records are handled per-record below
+        int safe_count =
+            (rec.fan_tasks_count >= 0 && rec.fan_tasks_count <= RUNTIME_MAX_FAN_TASKS) ? rec.fan_tasks_count : 0;
+        for (int k = 0; k < safe_count; k++) {
+            producer_to_consumers[rec.fan_tasks[k]].push_back(rec.task_id);
+        }
+    }
+
     int version = has_phase_data_ ? 2 : 1;
     outfile << "{\n";
     outfile << "  \"version\": " << version << ",\n";
@@ -1284,16 +1299,35 @@ int L2PerfCollector::export_swimlane_json(const std::string &output_path_arg) {
         outfile << "      \"dispatch_time_us\": " << std::fixed << std::setprecision(3) << dispatch_us << ",\n";
         outfile << "      \"finish_time_us\": " << std::fixed << std::setprecision(3) << finish_us << ",\n";
         outfile << "      \"fanout\": [";
-        int safe_fanout_count =
-            (record.fanout_count >= 0 && record.fanout_count <= RUNTIME_MAX_FANOUT) ? record.fanout_count : 0;
-        for (int j = 0; j < safe_fanout_count; ++j) {
-            outfile << record.fanout[j];
-            if (j < safe_fanout_count - 1) {
-                outfile << ", ";
+        int fanout_emitted = 0;
+        if (!record.is_fanin) {
+            // Direct fanout: fan_tasks[] already contains successor task_ids
+            int safe_count = (record.fan_tasks_count >= 0 && record.fan_tasks_count <= RUNTIME_MAX_FAN_TASKS) ?
+                                 record.fan_tasks_count :
+                                 0;
+            for (int j = 0; j < safe_count; ++j) {
+                if (j > 0) {
+                    outfile << ", ";
+                }
+                outfile << record.fan_tasks[j];
+                fanout_emitted++;
+            }
+        } else {
+            // Inverted fanin: look up from producer_to_consumers map
+            const auto it = producer_to_consumers.find(record.task_id);
+            if (it != producer_to_consumers.end()) {
+                const auto &successors = it->second;
+                for (size_t j = 0; j < successors.size(); ++j) {
+                    if (j > 0) {
+                        outfile << ", ";
+                    }
+                    outfile << successors[j];
+                    fanout_emitted++;
+                }
             }
         }
         outfile << "],\n";
-        outfile << "      \"fanout_count\": " << record.fanout_count << "\n";
+        outfile << "      \"fanout_count\": " << fanout_emitted << "\n";
         outfile << "    }";
         if (i < tagged_records.size() - 1) {
             outfile << ",";

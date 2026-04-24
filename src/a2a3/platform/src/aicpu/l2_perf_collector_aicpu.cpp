@@ -128,7 +128,7 @@ void l2_perf_aicpu_init_profiling(Runtime *runtime) {
 
 int l2_perf_aicpu_complete_record(
     L2PerfBuffer *l2_perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
-    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
+    uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fan_tasks, int32_t fan_tasks_count, bool is_fanin
 ) {
     rmb();
     uint32_t count = l2_perf_buf->count;
@@ -153,15 +153,16 @@ int l2_perf_aicpu_complete_record(
     record->dispatch_time = dispatch_time;
     record->finish_time = finish_time;
 
-    if (fanout != nullptr && fanout_count > 0) {
-        int32_t n = (fanout_count > RUNTIME_MAX_FANOUT) ? RUNTIME_MAX_FANOUT : fanout_count;
+    if (fan_tasks != nullptr && fan_tasks_count > 0) {
+        int32_t n = (fan_tasks_count > RUNTIME_MAX_FAN_TASKS) ? RUNTIME_MAX_FAN_TASKS : fan_tasks_count;
         for (int32_t i = 0; i < n; i++) {
-            record->fanout[i] = fanout[i];
+            record->fan_tasks[i] = fan_tasks[i];
         }
-        record->fanout_count = n;
+        record->fan_tasks_count = n;
     } else {
-        record->fanout_count = 0;
+        record->fan_tasks_count = 0;
     }
+    record->is_fanin = is_fanin;  // bool → uint8_t: true→1, false→0
 
     l2_perf_buf->count = count + 1;
     wmb();

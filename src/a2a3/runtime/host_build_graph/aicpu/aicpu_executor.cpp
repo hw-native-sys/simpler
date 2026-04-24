@@ -726,7 +726,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         if (l2_perf_aicpu_complete_record(
                                 l2_perf_buf, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
+                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count, false
                             ) != 0) {
                             DEV_ERROR(
                                 "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
@@ -745,7 +745,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     if (l2_perf_aicpu_complete_record(
                             l2_perf_buf, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
+                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count, false
                         ) != 0) {
                         DEV_ERROR(
                             "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
@@ -851,7 +851,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                         if (l2_perf_aicpu_complete_record(
                                 l2_perf_buf, static_cast<uint32_t>(prev_running_id),
                                 static_cast<uint64_t>(prev_running_id), prev_task->func_id, h->core_type,
-                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count
+                                dispatch_timestamps_[core_id], finish_ts, fanout_arr, prev_task->fanout_count, false
                             ) != 0) {
                             DEV_ERROR(
                                 "Core %d: l2_perf_aicpu_complete_record failed for implicit task %d", core_id,
@@ -904,7 +904,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
                     if (l2_perf_aicpu_complete_record(
                             l2_perf_buf, static_cast<uint32_t>(completed_task_id),
                             static_cast<uint64_t>(completed_task_id), task->func_id, h->core_type,
-                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count
+                            dispatch_timestamps_[core_id], finish_ts, fanout_arr, task->fanout_count, false
                         ) != 0) {
                         DEV_ERROR(
                             "Core %d: l2_perf_aicpu_complete_record failed for task %d", core_id, completed_task_id
