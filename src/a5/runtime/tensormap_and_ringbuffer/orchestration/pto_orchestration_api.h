@@ -143,12 +143,14 @@ typedef struct PTO2RuntimeOps {
 /**
  * Partial PTO2Runtime definition for orchestration.
  *
- * Only the ops pointer is visible.  The real struct (in pto_runtime2.h)
- * has the same first field, so accessing rt->ops through this definition
- * is well-defined (C struct layout guarantee).
+ * Orchestration only relies on the prefix shared with the full runtime:
+ * the ops pointer plus pending_scope_mode. The real struct
+ * (in pto_runtime2.h) starts with the same fields in the same order,
+ * so accessing that prefix through this definition is well-defined.
  */
 struct PTO2Runtime {
     const PTO2RuntimeOps *ops;
+    PTO2ScopeMode pending_scope_mode;
 };
 
 // =============================================================================
@@ -244,11 +246,12 @@ static inline TaskOutputTensors pto2_rt_submit_aiv_task_deferred(int32_t kernel_
     return pto2_rt_submit_task_impl(mk, args, true);
 }
 
-static inline void pto2_rt_scope_begin() {
+static inline void pto2_rt_scope_begin(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) {
     PTO2Runtime *rt = pto2_current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return;
     }
+    rt->pending_scope_mode = mode;
     rt->ops->scope_begin(rt);
 }
 
@@ -357,9 +360,10 @@ static inline void set_tensor_data(const Tensor &tensor, uint32_t ndims, const u
  */
 class PTO2ScopeGuard {
 public:
-    PTO2ScopeGuard() :
+    explicit PTO2ScopeGuard(PTO2ScopeMode mode = PTO2ScopeMode::AUTO) :
         rt_(pto2_current_runtime()) {
         if (!rt_->ops->is_fatal(rt_)) {
+            rt_->pending_scope_mode = mode;
             rt_->ops->scope_begin(rt_);
         }
     }
@@ -376,7 +380,8 @@ private:
 #define _PTO2_CONCATENATE_IMPL(x, y) x##y
 #define _PTO2_CONCATENATE(x, y) _PTO2_CONCATENATE_IMPL(x, y)
 
-#define PTO2_SCOPE_GUARD() [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__)
+#define PTO2_SCOPE_GUARD(...) \
+    [[maybe_unused]] PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__){__VA_ARGS__}
 
 /**
  * Scoped block macro:
@@ -384,7 +389,7 @@ private:
  *       pto2_rt_submit_task(...);
  *   }
  */
-#define PTO2_SCOPE() if (PTO2_SCOPE_GUARD(); true)
+#define PTO2_SCOPE(...) if (PTO2ScopeGuard _PTO2_CONCATENATE(scope_guard_, __COUNTER__){__VA_ARGS__}; true)
 
 // =============================================================================
 // Orchestration Config

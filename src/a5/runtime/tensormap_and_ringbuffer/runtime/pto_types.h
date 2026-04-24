@@ -62,6 +62,11 @@ enum class PTO2CompletionType : int32_t {
 // Task Output Tensors (return value from submit)
 // =============================================================================
 
+enum class PTO2ScopeMode : uint8_t {
+    AUTO = 0,
+    MANUAL = 1,
+};
+
 /**
  * TaskOutputTensors — returned by submit, holds materialized output Tensors.
  *
