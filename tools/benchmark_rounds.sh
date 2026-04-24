@@ -28,18 +28,12 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # --- tensormap_and_ringbuffer ---
 declare -A TMR_EXAMPLE_CASES=(
-    [alternating_matmul_add]="Case1"
-    [benchmark_bgemm]="Case0"
-    [paged_attention_unroll]="Case1,Case2"
-    [batch_paged_attention]="Case1"
-    [spmd_paged_attention]="Case1,Case2"
+    [spmd_paged_attention-tpush]="Case1,Case2"
+    [spmd_paged_attention-ffts]="Case1,Case2"
 )
 TMR_EXAMPLE_ORDER=(
-    alternating_matmul_add
-    benchmark_bgemm
-    paged_attention_unroll
-    batch_paged_attention
-    spmd_paged_attention
+    spmd_paged_attention-tpush
+    spmd_paged_attention-ffts
 )
 
 # --- aicpu_build_graph ---
