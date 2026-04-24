@@ -65,6 +65,7 @@ struct PTO2OrchestratorState {
     int32_t *scope_begins;            // scope_begins[i] = start index of scope i in scope_tasks
     int32_t scope_stack_top;          // Current top of stack (-1 = no scope open)
     uint64_t scope_stack_capacity;    // Max nesting depth (PTO2_MAX_SCOPE_DEPTH)
+    int32_t manual_begin_depth{PTO2_MAX_SCOPE_DEPTH};
 
     // === SCHEDULER REFERENCE ===
     // Note: In simulated mode, orchestrator and scheduler share address space
@@ -110,6 +111,8 @@ struct PTO2OrchestratorState {
         if (depth < 0) depth = 0;
         return depth < PTO2_MAX_RING_DEPTH ? static_cast<uint8_t>(depth) : PTO2_MAX_RING_DEPTH - 1;
     }
+
+    bool in_manual_scope() const { return scope_stack_top >= manual_begin_depth; }
 };
 
 // =============================================================================
@@ -157,7 +160,7 @@ void pto2_orch_report_fatal(PTO2OrchestratorState *orch, int32_t error_code, con
  * Tasks submitted while this scope is at the top of the stack are
  * owned by it and have their fanout_count initialized to 1.
  */
-void pto2_scope_begin(PTO2OrchestratorState *orch);
+void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode = PTO2ScopeMode::AUTO);
 
 /**
  * End current scope

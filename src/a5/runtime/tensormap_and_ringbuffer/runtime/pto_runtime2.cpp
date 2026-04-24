@@ -47,18 +47,6 @@ static TaskOutputTensors alloc_tensors_impl(PTO2Runtime *rt, const Arg &args) {
     return pto2_alloc_tensors(&rt->orchestrator, args);
 }
 
-static inline void pto2_scope_begin(PTO2OrchestratorState *orch, PTO2ScopeMode mode) {
-    if (mode != PTO2ScopeMode::AUTO) {
-        pto2_orch_report_fatal(
-            orch, PTO2_ERROR_INVALID_ARGS, __FUNCTION__,
-            "scope mode %u is not supported on a5 until Task 2 updates the orchestrator path",
-            static_cast<unsigned>(mode)
-        );
-        return;
-    }
-    pto2_scope_begin(orch);
-}
-
 void pto2_rt_scope_begin(PTO2Runtime *rt) {
     PTO2ScopeMode mode = rt->pending_scope_mode;
     rt->pending_scope_mode = PTO2ScopeMode::AUTO;
