@@ -229,7 +229,11 @@ Thread X:   overlap checks : XXX, hits=XXX (XX.X%)
 
 ## Runtime Flag: enable_l2_swimlane
 
-The `runtime->enable_l2_swimlane` flag controls **data collection**, NOT log output.
+L2 swimlane enablement is published through the handshake
+`enable_profiling_flag` bitmask (bit1 = `PROFILING_FLAG_L2_SWIMLANE`).
+AICPU code reads it via `get_enable_l2_swimlane()` (set at launch time
+by the platform from `kernel_args.l2_perf_data_base` + the bitmask). It
+controls **data collection**, NOT log output.
 
 ### When enable_l2_swimlane=true
 
@@ -247,8 +251,10 @@ The `runtime->enable_l2_swimlane` flag controls **data collection**, NOT log out
 ### Usage
 
 ```cpp
-// Initialize runtime with profiling enabled
-runtime->enable_l2_swimlane = true;
+// AICPU path — read enablement from the platform accessor, not the Runtime struct.
+if (get_enable_l2_swimlane()) {
+    // ... perf-collection code ...
+}
 ```
 
 ---

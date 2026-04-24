@@ -228,8 +228,20 @@ public:
      */
     int
     run(Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1, bool enable_dump_tensor = false,
-        int enable_pmu = 0);
+        const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num = 1);
+
+    /**
+     * Enablement setters for the three diagnostics sub-features. Called by
+     * the c_api entry point before run(); downstream run() paths read the
+     * corresponding `enable_*_` members directly. Moved off the generic
+     * Runtime struct / run() arg list so all three travel the same way.
+     */
+    void set_enable_l2_swimlane(bool enable) { enable_l2_swimlane_ = enable; }
+    void set_enable_dump_tensor(bool enable) { enable_dump_tensor_ = enable; }
+    void set_enable_pmu(int enable_pmu) {
+        enable_pmu_ = (enable_pmu > 0);
+        pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
+    }
 
     /**
      * Print handshake results from device
@@ -238,18 +250,6 @@ public:
      * Must be called after run() and before finalize().
      */
     void print_handshake_results();
-
-    /**
-     * Export performance data to merged_swimlane.json
-     *
-     * Converts collected performance records to Chrome Trace Event Format
-     * and writes to outputs/merged_swimlane.json for visualization in Perfetto.
-     * Should be called after stream synchronization.
-     *
-     * @param output_path Path to output directory (default: "outputs")
-     * @return 0 on success, error code on failure
-     */
-    int export_swimlane_json(const std::string &output_path = "outputs");
 
     /**
      * Cleanup all resources
@@ -416,15 +416,16 @@ private:
     /**
      * Initialize performance profiling device buffers
      *
-     * Allocates L2PerfSetupHeader and per-core/per-thread buffers on device,
-     * publishes pointers via runtime.l2_perf_data_base.
+     * Allocates L2PerfSetupHeader and per-core/per-thread buffers on device;
+     * caller publishes the device pointer via kernel_args.l2_perf_data_base
+     * (AICPU reads it through get_platform_l2_perf_base()).
      *
      * @param runtime Runtime instance to configure
      * @param num_aicore Number of AICore instances
      * @param device_id Device ID
      * @return 0 on success, error code on failure
      */
-    int init_l2_perf_collection(Runtime &runtime, int num_aicore, int device_id);
+    int init_l2_perf_collection(int num_aicore, int device_id);
 
     /**
      * Initialize tensor dump device buffers.
@@ -447,6 +448,14 @@ private:
      * @return 0 on success, error code on failure
      */
     int init_pmu(int num_aicore, uint32_t event_type);
+    // Enablement for the three diagnostics sub-features. Written by the c_api
+    // entry point via set_enable_*() before run(), read inside run() and its
+    // helpers. Moved off Runtime / run() args so all three sub-features use
+    // the same plumbing shape.
+    bool enable_l2_swimlane_{false};
+    bool enable_dump_tensor_{false};
+    bool enable_pmu_{false};
+    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_enable_pmu()
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

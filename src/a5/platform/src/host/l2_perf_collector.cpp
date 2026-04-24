@@ -55,7 +55,7 @@ L2PerfCollector::~L2PerfCollector() {
 }
 
 int L2PerfCollector::initialize(
-    Runtime &runtime, int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfFreeCallback free_cb,
+    int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfFreeCallback free_cb,
     L2PerfCopyToDeviceCallback copy_to_dev_cb, L2PerfCopyFromDeviceCallback copy_from_dev_cb
 ) {
     if (setup_header_dev_ != nullptr) {
@@ -145,10 +145,9 @@ int L2PerfCollector::initialize(
         return rc;
     }
 
-    // Step 5: Publish the device-side header pointer via runtime.l2_perf_data_base.
-    // AICPU reads this on init_profiling to discover per-core / per-thread buffer pointers.
-    runtime.l2_perf_data_base = reinterpret_cast<uint64_t>(setup_header_dev_);
-    LOG_DEBUG("runtime.l2_perf_data_base = 0x%lx", runtime.l2_perf_data_base);
+    // Device-side header pointer is now ready. Caller reads it via
+    // get_l2_perf_setup_device_ptr() and publishes to kernel_args.l2_perf_data_base.
+    LOG_DEBUG("L2PerfSetupHeader on device at 0x%lx", reinterpret_cast<uint64_t>(setup_header_dev_));
 
     LOG_INFO(
         "Performance profiling initialized: %d cores × %zuB L2PerfBuffer, %d threads × %zuB PhaseBuffer", num_aicore_,

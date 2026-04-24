@@ -329,7 +329,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         DEV_INFO("Thread %d: doing one-time init", thread_idx);
 
 #if PTO2_PROFILING
-        if (runtime->enable_l2_swimlane) {
+        if (get_enable_l2_swimlane()) {
             l2_perf_aicpu_init_profiling(runtime);
             l2_perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
             l2_perf_aicpu_set_orch_thread_idx(sched_thread_num_);
@@ -364,7 +364,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_PROFILING
     auto &l2_perf = sched_l2_perf_[thread_idx];
     l2_perf.reset();
-    l2_perf.l2_perf_enabled = runtime->enable_l2_swimlane;
+    l2_perf.l2_perf_enabled = get_enable_l2_swimlane();
 #endif
 
     constexpr int LOCAL_READY_CAP_PER_TYPE = 64;
@@ -576,7 +576,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_PROFILING
     if (l2_perf.l2_perf_enabled) {
         l2_perf_aicpu_flush_buffers(
-            runtime, thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
+            thread_idx, core_trackers_[thread_idx].core_ids(), core_trackers_[thread_idx].core_num()
         );
         l2_perf_aicpu_flush_phase_buffers(thread_idx);
     }

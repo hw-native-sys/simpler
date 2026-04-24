@@ -337,7 +337,7 @@ int AicpuExecutor::init(Runtime *runtime) {
         dispatch_timestamps_[i] = 0;
         core_dispatch_counts_[i] = 0;
     }
-    if (runtime->enable_l2_swimlane) {
+    if (get_enable_l2_swimlane()) {
         l2_perf_aicpu_init_profiling(runtime);
     }
 #if PTO2_PROFILING
@@ -661,7 +661,7 @@ int AicpuExecutor::resolve_and_dispatch(Runtime &runtime, int thread_idx, const 
 
     int verification_warning_count = 0;
     const int MAX_VERIFICATION_WARNINGS = 10;
-    bool l2_perf_enabled = runtime.enable_l2_swimlane;
+    bool l2_perf_enabled = get_enable_l2_swimlane();
 
     // Extract array pointers as local variables for better readability and performance
     int *cur_ready_queue_aic = cur_ready_queue_aic_[thread_idx];
@@ -1111,8 +1111,8 @@ int AicpuExecutor::run(Runtime *runtime) {
     LOG_INFO("Thread %d: Executed %d tasks from runtime", thread_idx, completed);
 
     // Flush performance buffers for cores managed by this thread
-    if (runtime->enable_l2_swimlane) {
-        l2_perf_aicpu_flush_buffers(runtime, thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
+    if (get_enable_l2_swimlane()) {
+        l2_perf_aicpu_flush_buffers(thread_idx, cur_thread_cores, thread_cores_num_[thread_idx]);
     }
 #if PTO2_PROFILING
     if (get_enable_pmu()) {

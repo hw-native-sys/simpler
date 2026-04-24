@@ -81,7 +81,8 @@ using L2PerfCopyFromDeviceCallback = int (*)(void *host_dst, const void *dev_src
  *
  * Lifecycle:
  *   1. initialize() — allocate L2PerfSetupHeader and all per-core/per-thread
- *      buffers on device, publish pointers into runtime.l2_perf_data_base
+ *      buffers on device; caller reads get_l2_perf_setup_device_ptr() and
+ *      sets kernel_args.l2_perf_data_base.
  *   2. (AICore/AICPU run, writing directly into device buffers)
  *   3. collect_all() — after stream sync, copy L2PerfSetupHeader back,
  *      then copy each L2PerfBuffer / PhaseBuffer back using two-step
@@ -99,9 +100,12 @@ public:
     L2PerfCollector &operator=(const L2PerfCollector &) = delete;
 
     /**
-     * Allocate device buffers and publish L2PerfSetupHeader.
+     * Allocate device buffers and initialize the L2PerfSetupHeader.
      *
-     * @param runtime          Runtime to configure (sets runtime.l2_perf_data_base)
+     * After success, call get_l2_perf_setup_device_ptr() to get the device-side
+     * header pointer; the caller must publish this via kernel_args.l2_perf_data_base
+     * so AICPU code can discover it through get_platform_l2_perf_base().
+     *
      * @param num_aicore       Number of AICore instances to profile
      * @param device_id        Device ID (stored for later callbacks)
      * @param alloc_cb         Device memory alloc
@@ -111,7 +115,7 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(
-        Runtime &runtime, int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfFreeCallback free_cb,
+        int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfFreeCallback free_cb,
         L2PerfCopyToDeviceCallback copy_to_dev_cb, L2PerfCopyFromDeviceCallback copy_from_dev_cb
     );
 
@@ -145,6 +149,12 @@ public:
      * Check if the collector has been initialized.
      */
     bool is_initialized() const { return setup_header_dev_ != nullptr; }
+
+    /**
+     * Get the device pointer to the L2PerfSetupHeader.
+     * Used to set kernel_args.l2_perf_data_base after initialize() succeeds.
+     */
+    void *get_l2_perf_setup_device_ptr() const { return setup_header_dev_; }
 
     /**
      * Accessor used by tests.

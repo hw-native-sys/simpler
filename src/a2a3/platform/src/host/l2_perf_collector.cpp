@@ -540,7 +540,7 @@ void *L2PerfCollector::alloc_single_buffer(size_t size, void **host_ptr_out) {
 }
 
 int L2PerfCollector::initialize(
-    Runtime &runtime, int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
+    int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
     L2PerfFreeCallback free_cb
 ) {
     if (perf_shared_mem_host_ != nullptr) {
@@ -690,9 +690,9 @@ int L2PerfCollector::initialize(
 
     wmb();
 
-    // Step 7: Pass base address to Runtime
-    runtime.l2_perf_data_base = reinterpret_cast<uint64_t>(perf_dev_ptr);
-    LOG_DEBUG("Set runtime.l2_perf_data_base = 0x%lx", runtime.l2_perf_data_base);
+    // Step 7: Stash device pointer for the caller to publish via
+    // kernel_args.l2_perf_data_base (read back via get_l2_perf_setup_device_ptr()).
+    LOG_DEBUG("L2 perf device base = 0x%lx", reinterpret_cast<uint64_t>(perf_dev_ptr));
 
     perf_shared_mem_dev_ = perf_dev_ptr;
     perf_shared_mem_host_ = perf_host_ptr;

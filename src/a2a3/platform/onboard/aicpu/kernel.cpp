@@ -14,6 +14,7 @@
 #include "common/kernel_args.h"
 #include "common/platform_config.h"
 #include "aicpu/device_log.h"
+#include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/platform_aicpu_affinity.h"
@@ -86,6 +87,8 @@ extern "C" __attribute__((visibility("default"))) int DynTileFwkBackendKernelSer
     set_platform_regs(k_args->regs);
     set_platform_dump_base(k_args->dump_data_base);
     set_enable_dump_tensor(GET_PROFILING_FLAG(runtime->workers[0].enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR));
+    set_platform_l2_perf_base(k_args->l2_perf_data_base);
+    set_enable_l2_swimlane(GET_PROFILING_FLAG(runtime->workers[0].enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE));
     set_platform_pmu_base(k_args->pmu_data_base);
     set_platform_pmu_reg_addrs(k_args->pmu_reg_addrs);
     set_enable_pmu(GET_PROFILING_FLAG(runtime->workers[0].enable_profiling_flag, PROFILING_FLAG_PMU));

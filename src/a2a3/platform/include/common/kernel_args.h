@@ -74,9 +74,10 @@ struct KernelArgs {
     __may_used_by_aicore__ Runtime *runtime_args{nullptr};  // Task runtime in device memory
     uint64_t regs{0};                                       // Per-core register base address array (platform-specific)
     uint64_t ffts_base_addr{0};                             // FFTS base address for AICore
-    uint64_t dump_data_base{0};  // Dump shared memory base address; use explicit flags to detect enablement
-    uint64_t pmu_data_base{0};   // PMU shared memory base address; use explicit flags to detect enablement
-    uint64_t pmu_reg_addrs{0};   // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
+    uint64_t dump_data_base{0};     // Dump shared memory base address; use explicit flags to detect enablement
+    uint64_t l2_perf_data_base{0};  // L2 perf shared memory base address; use explicit flags to detect enablement
+    uint64_t pmu_data_base{0};      // PMU shared memory base address; use explicit flags to detect enablement
+    uint64_t pmu_reg_addrs{0};      // Per-core PMU MMIO register base address array (onboard only; 0 on sim)
 };
 
 #ifdef __cplusplus

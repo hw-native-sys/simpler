@@ -187,10 +187,12 @@ int run_runtime(
             return rc;
         }
 
-        // Phase 2: perf swimlane collection
-        if (enable_l2_swimlane) {
-            r->enable_l2_swimlane = true;
-        }
+        // Phase 2: publish diagnostics enablement to the DeviceRunner so run()
+        // and its helpers can read the three sub-features uniformly (via
+        // members, not Runtime / run() args).
+        runner->set_enable_l2_swimlane(enable_l2_swimlane != 0);
+        runner->set_enable_dump_tensor(enable_dump_tensor != 0);
+        runner->set_enable_pmu(enable_pmu);
 
         // Phase 3: launch
         std::vector<uint8_t> aicpu_vec;
@@ -201,9 +203,7 @@ int run_runtime(
         if (aicore_binary != NULL && aicore_size > 0) {
             aicore_vec.assign(aicore_binary, aicore_binary + aicore_size);
         }
-        rc = runner->run(
-            *r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num, enable_dump_tensor != 0, enable_pmu
-        );
+        rc = runner->run(*r, block_dim, device_id, aicpu_vec, aicore_vec, aicpu_thread_num);
         if (rc != 0) {
             validate_runtime_impl(r);
             r->~Runtime();

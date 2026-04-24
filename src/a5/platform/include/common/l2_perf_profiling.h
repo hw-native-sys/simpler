@@ -210,7 +210,8 @@ struct AicpuPhaseHeader {
  * buffer pointers during init. After execution completes, Host copies
  * this struct back to read total_tasks and phase_header.
  *
- * Memory layout: runtime.l2_perf_data_base points to this struct on device.
+ * Memory layout: kernel_args.l2_perf_data_base points to this struct on
+ * device (read by AICPU via get_platform_l2_perf_base()).
  */
 struct L2PerfSetupHeader {
     // Host writes, AICPU reads (init)
@@ -241,7 +242,7 @@ extern "C" {
 /**
  * Get L2PerfSetupHeader pointer from base address
  *
- * @param base_ptr Device base address (runtime.l2_perf_data_base)
+ * @param base_ptr Device base address (kernel_args.l2_perf_data_base)
  * @return L2PerfSetupHeader pointer
  */
 inline L2PerfSetupHeader *get_perf_setup_header(void *base_ptr) {

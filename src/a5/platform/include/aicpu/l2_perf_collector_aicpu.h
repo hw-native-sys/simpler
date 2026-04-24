@@ -33,11 +33,24 @@
 // ============= Public Interface =============
 
 /**
+ * L2 perf handshake setters — called by the host (sim) or the AICPU kernel
+ * entry (onboard) before `l2_perf_aicpu_init_profiling()` so AICPU code can
+ * read perf state without reaching into the generic `Runtime` struct.
+ * Mirrors the `set_platform_dump_base` / `set_enable_dump_tensor` pattern
+ * used by tensor dump and PMU.
+ */
+extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base);
+extern "C" uint64_t get_platform_l2_perf_base();
+extern "C" void set_enable_l2_swimlane(bool enable);
+extern "C" bool get_enable_l2_swimlane();
+
+/**
  * Initialize performance profiling
  *
  * Sets up double buffers for each core and initializes tracking state.
+ * Reads the perf device-base pointer published via `set_platform_l2_perf_base()`.
  *
- * @param runtime Runtime instance pointer
+ * @param runtime Runtime instance pointer (used for worker_count / task_count only)
  */
 void l2_perf_aicpu_init_profiling(Runtime *runtime);
 
@@ -71,10 +84,9 @@ int l2_perf_aicpu_complete_record(
  * Allows dynamic update of total_tasks as orchestrator makes progress.
  * Used by tensormap_and_ringbuffer runtime where task count grows incrementally.
  *
- * @param runtime Runtime instance pointer
  * @param total_tasks Current total task count
  */
-void l2_perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks);
+void l2_perf_aicpu_update_total_tasks(uint32_t total_tasks);
 
 /**
  * Initialize AICPU phase profiling
@@ -82,10 +94,9 @@ void l2_perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks);
  * Sets up AicpuPhaseHeader and clears per-thread phase record buffers.
  * Must be called once from thread 0 after l2_perf_aicpu_init_profiling().
  *
- * @param runtime Runtime instance pointer
  * @param num_sched_threads Number of scheduler threads
  */
-void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads);
+void l2_perf_aicpu_init_phase_profiling(int num_sched_threads);
 
 /**
  * Record a single scheduler phase

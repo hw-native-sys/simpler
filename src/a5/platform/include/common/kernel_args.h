@@ -70,6 +70,7 @@ struct KernelArgs {
     Runtime *runtime_args{nullptr};    // Task runtime in device memory
     uint64_t regs{0};                  // Per-core register base address array (platform-specific)
     uint64_t dump_data_base{0};        // Dump shared memory base address; use explicit flags to detect enablement
+    uint64_t l2_perf_data_base{0};     // L2 perf shared memory base address; use explicit flags to detect enablement
     uint64_t pmu_data_base{0};         // PMU buffer base address (device memory); 0 = PMU disabled
 };
 

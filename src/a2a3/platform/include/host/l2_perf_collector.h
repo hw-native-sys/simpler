@@ -279,8 +279,8 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(
-        Runtime &runtime, int num_aicore, int device_id, L2PerfAllocCallback alloc_cb,
-        L2PerfRegisterCallback register_cb, L2PerfFreeCallback free_cb
+        int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfRegisterCallback register_cb,
+        L2PerfFreeCallback free_cb
     );
 
     /**
@@ -331,6 +331,12 @@ public:
      * Check if collector is initialized
      */
     bool is_initialized() const { return perf_shared_mem_host_ != nullptr; }
+
+    /**
+     * Get the device pointer to the L2PerfDataHeader.
+     * Used to set kernel_args.l2_perf_data_base after initialize() succeeds.
+     */
+    void *get_l2_perf_setup_device_ptr() const { return perf_shared_mem_dev_; }
 
     /**
      * Drain remaining buffers from the memory manager's ready queue

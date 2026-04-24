@@ -290,10 +290,8 @@ int DeviceRunner::copy_from_device(void *host_ptr, const void *dev_ptr, size_t b
 
 int DeviceRunner::run(
     Runtime &runtime, int block_dim, int device_id, const std::vector<uint8_t> &aicpu_so_binary,
-    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num, bool enable_dump_tensor, int enable_pmu
+    const std::vector<uint8_t> &aicore_kernel_binary, int launch_aicpu_num
 ) {
-    bool pmu_enabled = enable_pmu > 0;
-    uint32_t pmu_event_type = resolve_pmu_event_type(enable_pmu);
     if (launch_aicpu_num < 1 || launch_aicpu_num > PLATFORM_MAX_AICPU_THREADS) {
         LOG_ERROR("launch_aicpu_num (%d) must be in range [1, %d]", launch_aicpu_num, PLATFORM_MAX_AICPU_THREADS);
         return -1;
@@ -360,13 +358,13 @@ int DeviceRunner::run(
     // Calculate number of AIC cores (1/3 of total)
     int num_aic = block_dim;  // Round up for 1/3
     uint32_t enable_profiling_flag = PROFILING_FLAG_NONE;
-    if (enable_dump_tensor) {
+    if (enable_dump_tensor_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     }
-    if (runtime.enable_l2_swimlane) {
+    if (enable_l2_swimlane_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
     }
-    if (pmu_enabled) {
+    if (enable_pmu_) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
 
@@ -409,8 +407,8 @@ int DeviceRunner::run(
     });
 
     // Initialize performance profiling if enabled
-    if (runtime.enable_l2_swimlane) {
-        rc = init_l2_perf_collection(runtime, num_aicore, device_id);
+    if (enable_l2_swimlane_) {
+        rc = init_l2_perf_collection(num_aicore, device_id);
         if (rc != 0) {
             LOG_ERROR("init_l2_perf_collection failed: %d", rc);
             return rc;
@@ -418,7 +416,7 @@ int DeviceRunner::run(
     }
 
     // Initialize tensor dump if enabled
-    if (enable_dump_tensor) {
+    if (enable_dump_tensor_) {
         rc = init_tensor_dump(runtime, num_aicore, device_id);
         if (rc != 0) {
             LOG_ERROR("init_tensor_dump failed: %d", rc);
@@ -427,8 +425,8 @@ int DeviceRunner::run(
     }
 
     // Initialize PMU profiling if enabled
-    if (pmu_enabled) {
-        rc = init_pmu(num_aicore, pmu_event_type);
+    if (enable_pmu_) {
+        rc = init_pmu(num_aicore, static_cast<uint32_t>(pmu_event_type_));
         if (rc != 0) {
             LOG_ERROR("init_pmu failed: %d", rc);
             return rc;
@@ -488,19 +486,19 @@ int DeviceRunner::run(
 
     // After streams are synchronized, pull profiling data back in one batch
     // (memcpy-based: two-step count-first copy per buffer).
-    if (runtime.enable_l2_swimlane) {
+    if (enable_l2_swimlane_) {
         l2_perf_collector_.collect_all();
-        export_swimlane_json();
+        l2_perf_collector_.export_swimlane_json();
     }
 
     // Collect and export tensor dump data
-    if (enable_dump_tensor) {
+    if (enable_dump_tensor_) {
         dump_collector_.collect_all();
         dump_collector_.export_dump_files();
     }
 
     // Collect and export PMU data (two-step rtMemcpy per core)
-    if (pmu_enabled && pmu_collector_.is_initialized()) {
+    if (enable_pmu_ && pmu_collector_.is_initialized()) {
         pmu_collector_.collect_all();
         pmu_collector_.export_csv();
     }
@@ -734,7 +732,7 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
     LOG_DEBUG("Removed kernel binary: func_id=%d, addr=0x%lx", func_id, function_bin_addr);
 }
 
-int DeviceRunner::init_l2_perf_collection(Runtime &runtime, int num_aicore, int device_id) {
+int DeviceRunner::init_l2_perf_collection(int num_aicore, int device_id) {
     // Device memory allocation via rtMalloc directly
     auto alloc_cb = [](size_t size) -> void * {
         void *ptr = nullptr;
@@ -755,13 +753,12 @@ int DeviceRunner::init_l2_perf_collection(Runtime &runtime, int num_aicore, int 
         return rtMemcpy(host_dst, size, dev_src, size, RT_MEMCPY_DEVICE_TO_HOST);
     };
 
-    return l2_perf_collector_.initialize(
-        runtime, num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
-    );
-}
-
-int DeviceRunner::export_swimlane_json(const std::string &output_path) {
-    return l2_perf_collector_.export_swimlane_json(output_path);
+    int rc = l2_perf_collector_.initialize(num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb);
+    if (rc == 0) {
+        kernel_args_.args.l2_perf_data_base =
+            reinterpret_cast<uint64_t>(l2_perf_collector_.get_l2_perf_setup_device_ptr());
+    }
+    return rc;
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {

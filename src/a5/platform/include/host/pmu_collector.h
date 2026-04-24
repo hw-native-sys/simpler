@@ -130,11 +130,11 @@ private:
 // Utilities
 // ---------------------------------------------------------------------------
 
-inline uint32_t resolve_pmu_event_type(int requested_event_type) {
-    uint32_t resolved = PMU_EVENT_TYPE_DEFAULT;
+inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
+    PmuEventType resolved = PmuEventType::PIPE_UTILIZATION;
     if (requested_event_type > 0 &&
         pmu_resolve_event_config_a5(static_cast<uint32_t>(requested_event_type)) != nullptr) {
-        resolved = static_cast<uint32_t>(requested_event_type);
+        resolved = static_cast<PmuEventType>(requested_event_type);
     } else if (requested_event_type != 0) {
         LOG_WARN(
             "Invalid PMU event type %u, using default (PIPE_UTILIZATION=%u)", requested_event_type,
@@ -147,8 +147,8 @@ inline uint32_t resolve_pmu_event_type(int requested_event_type) {
     }
     int val = std::atoi(pmu_env);
     if (val > 0 && pmu_resolve_event_config_a5(static_cast<uint32_t>(val)) != nullptr) {
-        resolved = static_cast<uint32_t>(val);
-        LOG_INFO("PMU event type set to %u from SIMPLER_PMU_EVENT_TYPE", resolved);
+        resolved = static_cast<PmuEventType>(val);
+        LOG_INFO("PMU event type set to %u from SIMPLER_PMU_EVENT_TYPE", static_cast<uint32_t>(resolved));
         return resolved;
     }
     LOG_WARN("Invalid SIMPLER_PMU_EVENT_TYPE=%s, using default (PIPE_UTILIZATION=%u)", pmu_env, PMU_EVENT_TYPE_DEFAULT);

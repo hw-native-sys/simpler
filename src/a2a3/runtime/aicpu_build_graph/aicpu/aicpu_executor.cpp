@@ -957,7 +957,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #if PTO2_PROFILING
         // Assign perf buffers to cores early so profiling captures all tasks
         // (total_tasks written to header later when orchestrator completes)
-        if (runtime->enable_l2_swimlane) {
+        if (get_enable_l2_swimlane()) {
             l2_perf_aicpu_init_profiling(runtime);
             // Initialize phase profiling for scheduler threads + orchestrator threads
             l2_perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
@@ -991,7 +991,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
 #if PTO2_PROFILING
-    bool l2_perf_enabled = runtime->enable_l2_swimlane;
+    bool l2_perf_enabled = get_enable_l2_swimlane();
 #endif
 
     // Scheduler profiling counters
@@ -1676,7 +1676,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #if PTO2_PROFILING
     // Flush performance buffers for cores managed by this thread
     if (l2_perf_enabled) {
-        l2_perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
+        l2_perf_aicpu_flush_buffers(thread_idx, core_assignments_[thread_idx], core_num);
         l2_perf_aicpu_flush_phase_buffers(thread_idx);
     }
     if (get_enable_pmu()) {
@@ -1850,7 +1850,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
 #if PTO2_PROFILING
-            rt->orchestrator.enable_l2_swimlane = runtime->enable_l2_swimlane;
+            rt->orchestrator.enable_l2_swimlane = get_enable_l2_swimlane();
 #endif
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
@@ -1871,7 +1871,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Each orchestrator thread sets its own phase buffer index (thread-local)
-            if (runtime->enable_l2_swimlane) {
+            if (get_enable_l2_swimlane()) {
                 l2_perf_aicpu_set_orch_thread_idx(thread_idx);
             }
 #endif
@@ -1928,7 +1928,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Write orchestrator summary to shared memory for host-side export (only if profiling enabled)
-            if (runtime->enable_l2_swimlane) {
+            if (get_enable_l2_swimlane()) {
                 AicpuOrchSummary orch_summary = {};
                 orch_summary.start_time = orch_cycle_start;
                 orch_summary.end_time = orch_cycle_end;
@@ -1948,7 +1948,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Write core-to-thread mapping (one-time, after orchestration)
-            if (runtime->enable_l2_swimlane) {
+            if (get_enable_l2_swimlane()) {
                 l2_perf_aicpu_init_core_assignments(cores_total_num_);
                 for (int32_t t = 0; t < sched_thread_num_; t++) {
                     l2_perf_aicpu_write_core_assignments_for_thread(t, core_assignments_[t], core_count_per_thread_[t]);
@@ -1976,8 +1976,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             );
 #endif
             total_tasks_ = pto2_task_count;
-            if (runtime->enable_l2_swimlane && pto2_task_count > 0) {
-                l2_perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(pto2_task_count));
+            if (get_enable_l2_swimlane() && pto2_task_count > 0) {
+                l2_perf_aicpu_update_total_tasks(static_cast<uint32_t>(pto2_task_count));
             }
             orchestrator_done_ = true;
             {

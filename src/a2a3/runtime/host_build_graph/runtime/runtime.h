@@ -212,10 +212,6 @@ public:
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;  // Number of AICPU threads for scheduling
 
-    // Perf swimlane collection
-    bool enable_l2_swimlane;     // Enable perf swimlane collection
-    uint64_t l2_perf_data_base;  // Performance data shared memory base address (device-side)
-
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array
 

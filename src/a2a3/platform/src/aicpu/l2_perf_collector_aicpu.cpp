@@ -41,6 +41,19 @@ static PhaseBuffer *s_current_phase_buf[PLATFORM_MAX_AICPU_THREADS] = {};
 
 static int s_orch_thread_idx = -1;
 
+// L2 perf platform state. Published by the host (via dlsym'd setters on sim)
+// or by the AICPU kernel entry (onboard) before perf init runs, so downstream
+// perf code can discover enablement + device-base without reading the generic
+// Runtime struct. Mirrors the g_platform_dump_base / g_enable_dump_tensor pair
+// in tensor_dump_aicpu.cpp and the PMU equivalents in pmu_collector_aicpu.cpp.
+static uint64_t g_platform_l2_perf_base = 0;
+static bool g_enable_l2_swimlane = false;
+
+extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base) { g_platform_l2_perf_base = l2_perf_data_base; }
+extern "C" uint64_t get_platform_l2_perf_base() { return g_platform_l2_perf_base; }
+extern "C" void set_enable_l2_swimlane(bool enable) { g_enable_l2_swimlane = enable; }
+extern "C" bool get_enable_l2_swimlane() { return g_enable_l2_swimlane; }
+
 /**
  * Enqueue ready buffer to per-thread queue
  *
@@ -76,7 +89,7 @@ static int enqueue_ready_buffer(
 }
 
 void l2_perf_aicpu_init_profiling(Runtime *runtime) {
-    void *l2_perf_base = reinterpret_cast<void *>(runtime->l2_perf_data_base);
+    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         LOG_ERROR("l2_perf_data_base is NULL, cannot initialize profiling");
         return;
@@ -169,7 +182,7 @@ int l2_perf_aicpu_complete_record(
 }
 
 void l2_perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx) {
-    void *l2_perf_base = reinterpret_cast<void *>(runtime->l2_perf_data_base);
+    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         return;
     }
@@ -229,12 +242,12 @@ void l2_perf_aicpu_switch_buffer(Runtime *runtime, int core_id, int thread_idx) 
     LOG_INFO("Thread %d: Core %d switched to new buffer (addr=0x%lx)", thread_idx, core_id, new_buf_ptr);
 }
 
-void l2_perf_aicpu_flush_buffers(Runtime *runtime, int thread_idx, const int *cur_thread_cores, int core_num) {
-    if (!runtime->enable_l2_swimlane) {
+void l2_perf_aicpu_flush_buffers(int thread_idx, const int *cur_thread_cores, int core_num) {
+    if (!g_enable_l2_swimlane) {
         return;
     }
 
-    void *l2_perf_base = reinterpret_cast<void *>(runtime->l2_perf_data_base);
+    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         return;
     }
@@ -279,8 +292,8 @@ void l2_perf_aicpu_flush_buffers(Runtime *runtime, int thread_idx, const int *cu
     LOG_INFO("Thread %d: Performance buffer flush complete, %d buffers flushed", thread_idx, flushed_count);
 }
 
-void l2_perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks) {
-    void *l2_perf_base = reinterpret_cast<void *>(runtime->l2_perf_data_base);
+void l2_perf_aicpu_update_total_tasks(uint32_t total_tasks) {
+    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         return;
     }
@@ -291,7 +304,7 @@ void l2_perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks) {
 }
 
 void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads) {
-    void *l2_perf_base = reinterpret_cast<void *>(runtime->l2_perf_data_base);
+    void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);
     if (l2_perf_base == nullptr) {
         LOG_ERROR("l2_perf_data_base is NULL, cannot initialize phase profiling");
         return;

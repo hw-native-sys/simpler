@@ -45,8 +45,6 @@ Runtime::Runtime() {
     initial_ready_count = 0;
     worker_count = 0;
     sche_cpu_num = 1;
-    enable_l2_swimlane = false;
-    l2_perf_data_base = 0;
     tensor_pair_count = 0;
     tensor_info_storage_ = nullptr;
     tensor_info_storage_bytes_ = 0;
