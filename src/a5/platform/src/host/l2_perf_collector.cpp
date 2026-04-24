@@ -10,11 +10,11 @@
  */
 
 /**
- * @file performance_collector.cpp
+ * @file l2_perf_collector.cpp
  * @brief Host-side performance data collector (memcpy-based) implementation
  */
 
-#include "host/performance_collector.h"
+#include "host/l2_perf_collector.h"
 
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -45,21 +45,21 @@ static bool is_scheduler_phase(AicpuPhaseId id) {
 }
 
 // =============================================================================
-// PerformanceCollector Implementation
+// L2PerfCollector Implementation
 // =============================================================================
 
-PerformanceCollector::~PerformanceCollector() {
+L2PerfCollector::~L2PerfCollector() {
     if (setup_header_dev_ != nullptr) {
-        LOG_WARN("PerformanceCollector destroyed without finalize()");
+        LOG_WARN("L2PerfCollector destroyed without finalize()");
     }
 }
 
-int PerformanceCollector::initialize(
-    Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfFreeCallback free_cb,
-    PerfCopyToDeviceCallback copy_to_dev_cb, PerfCopyFromDeviceCallback copy_from_dev_cb
+int L2PerfCollector::initialize(
+    Runtime &runtime, int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfFreeCallback free_cb,
+    L2PerfCopyToDeviceCallback copy_to_dev_cb, L2PerfCopyFromDeviceCallback copy_from_dev_cb
 ) {
     if (setup_header_dev_ != nullptr) {
-        LOG_ERROR("PerformanceCollector already initialized");
+        LOG_ERROR("L2PerfCollector already initialized");
         return -1;
     }
 
@@ -68,7 +68,7 @@ int PerformanceCollector::initialize(
         return -1;
     }
     if (alloc_cb == nullptr || free_cb == nullptr || copy_to_dev_cb == nullptr || copy_from_dev_cb == nullptr) {
-        LOG_ERROR("PerformanceCollector::initialize: null callback");
+        LOG_ERROR("L2PerfCollector::initialize: null callback");
         return -1;
     }
 
@@ -82,30 +82,30 @@ int PerformanceCollector::initialize(
     copy_to_dev_cb_ = copy_to_dev_cb;
     copy_from_dev_cb_ = copy_from_dev_cb;
 
-    perf_buffer_bytes_ = calc_perf_buffer_size(PLATFORM_PROF_BUFFER_SIZE);
+    l2_perf_buffer_bytes_ = calc_l2_perf_buffer_size(PLATFORM_PROF_BUFFER_SIZE);
     phase_buffer_bytes_ = calc_phase_buffer_size(PLATFORM_PHASE_RECORDS_PER_THREAD);
 
-    LOG_DEBUG("  PerfSetupHeader size: %zu bytes", calc_perf_setup_size());
-    LOG_DEBUG("  PerfBuffer size:      %zu bytes (capacity=%d)", perf_buffer_bytes_, PLATFORM_PROF_BUFFER_SIZE);
+    LOG_DEBUG("  L2PerfSetupHeader size: %zu bytes", calc_l2_perf_setup_size());
+    LOG_DEBUG("  L2PerfBuffer size:      %zu bytes (capacity=%d)", l2_perf_buffer_bytes_, PLATFORM_PROF_BUFFER_SIZE);
     LOG_DEBUG(
         "  PhaseBuffer size:     %zu bytes (capacity=%d)", phase_buffer_bytes_, PLATFORM_PHASE_RECORDS_PER_THREAD
     );
     LOG_DEBUG("  num_aicore:           %d", num_aicore_);
     LOG_DEBUG("  num_phase_threads:    %d", num_phase_threads_);
 
-    // Step 1: Allocate PerfSetupHeader on device
-    setup_header_dev_ = alloc_cb_(calc_perf_setup_size());
+    // Step 1: Allocate L2PerfSetupHeader on device
+    setup_header_dev_ = alloc_cb_(calc_l2_perf_setup_size());
     if (setup_header_dev_ == nullptr) {
-        LOG_ERROR("Failed to allocate PerfSetupHeader (%zu bytes)", calc_perf_setup_size());
+        LOG_ERROR("Failed to allocate L2PerfSetupHeader (%zu bytes)", calc_l2_perf_setup_size());
         return -1;
     }
 
-    // Step 2: Allocate one PerfBuffer per core on device
+    // Step 2: Allocate one L2PerfBuffer per core on device
     core_buffers_dev_.assign(num_aicore_, nullptr);
     for (int i = 0; i < num_aicore_; i++) {
-        void *buf = alloc_cb_(perf_buffer_bytes_);
+        void *buf = alloc_cb_(l2_perf_buffer_bytes_);
         if (buf == nullptr) {
-            LOG_ERROR("Failed to allocate PerfBuffer for core %d (%zu bytes)", i, perf_buffer_bytes_);
+            LOG_ERROR("Failed to allocate L2PerfBuffer for core %d (%zu bytes)", i, l2_perf_buffer_bytes_);
             finalize();
             return -1;
         }
@@ -124,8 +124,8 @@ int PerformanceCollector::initialize(
         phase_buffers_dev_[t] = buf;
     }
 
-    // Step 4: Build PerfSetupHeader on host and copy to device
-    PerfSetupHeader host_header;
+    // Step 4: Build L2PerfSetupHeader on host and copy to device
+    L2PerfSetupHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
     host_header.num_cores = static_cast<uint32_t>(num_aicore_);
     host_header.num_phase_threads = static_cast<uint32_t>(num_phase_threads_);
@@ -140,42 +140,42 @@ int PerformanceCollector::initialize(
 
     int rc = copy_to_dev_cb_(setup_header_dev_, &host_header, sizeof(host_header));
     if (rc != 0) {
-        LOG_ERROR("Failed to copy PerfSetupHeader to device: %d", rc);
+        LOG_ERROR("Failed to copy L2PerfSetupHeader to device: %d", rc);
         finalize();
         return rc;
     }
 
-    // Step 5: Publish the device-side header pointer via runtime.perf_data_base.
+    // Step 5: Publish the device-side header pointer via runtime.l2_perf_data_base.
     // AICPU reads this on init_profiling to discover per-core / per-thread buffer pointers.
-    runtime.perf_data_base = reinterpret_cast<uint64_t>(setup_header_dev_);
-    LOG_DEBUG("runtime.perf_data_base = 0x%lx", runtime.perf_data_base);
+    runtime.l2_perf_data_base = reinterpret_cast<uint64_t>(setup_header_dev_);
+    LOG_DEBUG("runtime.l2_perf_data_base = 0x%lx", runtime.l2_perf_data_base);
 
     LOG_INFO(
-        "Performance profiling initialized: %d cores × %zuB PerfBuffer, %d threads × %zuB PhaseBuffer", num_aicore_,
-        perf_buffer_bytes_, num_phase_threads_, phase_buffer_bytes_
+        "Performance profiling initialized: %d cores × %zuB L2PerfBuffer, %d threads × %zuB PhaseBuffer", num_aicore_,
+        l2_perf_buffer_bytes_, num_phase_threads_, phase_buffer_bytes_
     );
     return 0;
 }
 
-int PerformanceCollector::collect_all() {
+int L2PerfCollector::collect_all() {
     if (setup_header_dev_ == nullptr) {
-        LOG_ERROR("PerformanceCollector::collect_all called before initialize");
+        LOG_ERROR("L2PerfCollector::collect_all called before initialize");
         return -1;
     }
 
     LOG_INFO("Collecting performance data via device→host memcpy");
 
-    // Step 1: Copy back PerfSetupHeader (contains total_tasks and phase_header)
-    PerfSetupHeader host_header;
+    // Step 1: Copy back L2PerfSetupHeader (contains total_tasks and phase_header)
+    L2PerfSetupHeader host_header;
     memset(&host_header, 0, sizeof(host_header));
     int rc = copy_from_dev_cb_(&host_header, setup_header_dev_, sizeof(host_header));
     if (rc != 0) {
-        LOG_ERROR("Failed to copy PerfSetupHeader from device: %d", rc);
+        LOG_ERROR("Failed to copy L2PerfSetupHeader from device: %d", rc);
         return rc;
     }
 
     uint32_t total_tasks = host_header.total_tasks;
-    LOG_DEBUG("PerfSetupHeader: total_tasks=%u", total_tasks);
+    LOG_DEBUG("L2PerfSetupHeader: total_tasks=%u", total_tasks);
 
     // Step 2: Prepare host-side storage
     collected_perf_records_.clear();
@@ -183,41 +183,41 @@ int PerformanceCollector::collect_all() {
     collected_phase_records_.clear();
     collected_phase_records_.resize(num_phase_threads_);
 
-    // Step 3: Two-step copy each PerfBuffer back.
+    // Step 3: Two-step copy each L2PerfBuffer back.
     //   - First copy 64B header → read count
-    //   - Then copy count * sizeof(PerfRecord) of actual data
+    //   - Then copy count * sizeof(L2PerfRecord) of actual data
     uint64_t total_perf_records = 0;
     {
-        // Reusable header buffer (aligned to 64B to match PerfBuffer layout)
-        alignas(64) unsigned char header_buf[sizeof(PerfBuffer)];
+        // Reusable header buffer (aligned to 64B to match L2PerfBuffer layout)
+        alignas(64) unsigned char header_buf[sizeof(L2PerfBuffer)];
         for (int i = 0; i < num_aicore_; i++) {
             void *dev_ptr = core_buffers_dev_[i];
             if (dev_ptr == nullptr) continue;
 
-            rc = copy_from_dev_cb_(header_buf, dev_ptr, sizeof(PerfBuffer));
+            rc = copy_from_dev_cb_(header_buf, dev_ptr, sizeof(L2PerfBuffer));
             if (rc != 0) {
-                LOG_ERROR("Failed to copy PerfBuffer header for core %d: %d", i, rc);
+                LOG_ERROR("Failed to copy L2PerfBuffer header for core %d: %d", i, rc);
                 continue;
             }
 
-            uint32_t count = reinterpret_cast<PerfBuffer *>(header_buf)->count;
+            uint32_t count = reinterpret_cast<L2PerfBuffer *>(header_buf)->count;
             if (count > static_cast<uint32_t>(PLATFORM_PROF_BUFFER_SIZE)) {
                 LOG_WARN(
-                    "Core %d: PerfBuffer count=%u exceeds capacity=%d, clamping", i, count, PLATFORM_PROF_BUFFER_SIZE
+                    "Core %d: L2PerfBuffer count=%u exceeds capacity=%d, clamping", i, count, PLATFORM_PROF_BUFFER_SIZE
                 );
                 count = PLATFORM_PROF_BUFFER_SIZE;
             }
             if (count == 0) {
-                LOG_DEBUG("Core %d: empty PerfBuffer", i);
+                LOG_DEBUG("Core %d: empty L2PerfBuffer", i);
                 continue;
             }
 
             collected_perf_records_[i].resize(count);
-            size_t records_bytes = static_cast<size_t>(count) * sizeof(PerfRecord);
-            void *dev_records = static_cast<unsigned char *>(dev_ptr) + sizeof(PerfBuffer);
+            size_t records_bytes = static_cast<size_t>(count) * sizeof(L2PerfRecord);
+            void *dev_records = static_cast<unsigned char *>(dev_ptr) + sizeof(L2PerfBuffer);
             rc = copy_from_dev_cb_(collected_perf_records_[i].data(), dev_records, records_bytes);
             if (rc != 0) {
-                LOG_ERROR("Failed to copy PerfBuffer records for core %d: %d", i, rc);
+                LOG_ERROR("Failed to copy L2PerfBuffer records for core %d: %d", i, rc);
                 collected_perf_records_[i].clear();
                 continue;
             }
@@ -312,7 +312,7 @@ int PerformanceCollector::collect_all() {
 
     if (total_tasks > 0 && total_perf_records < total_tasks) {
         LOG_WARN(
-            "Incomplete collection: %" PRIu64 " / %u records (some cores may have filled their PerfBuffer)",
+            "Incomplete collection: %" PRIu64 " / %u records (some cores may have filled their L2PerfBuffer)",
             total_perf_records, total_tasks
         );
     }
@@ -320,13 +320,13 @@ int PerformanceCollector::collect_all() {
     return 0;
 }
 
-int PerformanceCollector::export_swimlane_json(const std::string &output_path_arg) {
-    // Step 0: Resolve effective output directory. SIMPLER_PERF_OUTPUT_DIR (when set)
+int L2PerfCollector::export_swimlane_json(const std::string &output_path_arg) {
+    // Step 0: Resolve effective output directory. SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR (when set)
     // overrides the caller-supplied path so the parallel test orchestrator can
     // give each subprocess its own directory — avoids filename collisions when
-    // two concurrent runs produce a perf_swimlane_*.json with the same
+    // two concurrent runs produce a l2_perf_records_*.json with the same
     // second-precision timestamp. Empty env var is treated as unset.
-    const char *env_dir = std::getenv("SIMPLER_PERF_OUTPUT_DIR");
+    const char *env_dir = std::getenv("SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR");
     const std::string output_path = (env_dir != nullptr && env_dir[0] != '\0') ? std::string(env_dir) : output_path_arg;
 
     // Step 1: Validate collected data
@@ -353,7 +353,7 @@ int PerformanceCollector::export_swimlane_json(const std::string &output_path_ar
 
     // Step 3: Flatten per-core vectors into tagged records with core_id derived from index
     struct TaggedRecord {
-        const PerfRecord *record;
+        const L2PerfRecord *record;
         uint32_t core_id;
     };
     std::vector<TaggedRecord> tagged_records;
@@ -404,7 +404,7 @@ int PerformanceCollector::export_swimlane_json(const std::string &output_path_ar
     std::tm *timeinfo = std::localtime(&now);
     char time_buffer[32];
     std::strftime(time_buffer, sizeof(time_buffer), "%Y%m%d_%H%M%S", timeinfo);
-    std::string filepath = output_path + "/perf_swimlane_" + std::string(time_buffer) + ".json";
+    std::string filepath = output_path + "/l2_perf_records_" + std::string(time_buffer) + ".json";
 
     // Step 6: Open JSON file for writing
     std::ofstream outfile(filepath);
@@ -617,14 +617,14 @@ int PerformanceCollector::export_swimlane_json(const std::string &output_path_ar
     return 0;
 }
 
-int PerformanceCollector::finalize() {
+int L2PerfCollector::finalize() {
     if (setup_header_dev_ == nullptr && core_buffers_dev_.empty() && phase_buffers_dev_.empty()) {
         return 0;
     }
 
     LOG_DEBUG("Cleaning up performance profiling resources");
 
-    // Free per-core PerfBuffers
+    // Free per-core L2PerfBuffers
     if (free_cb_ != nullptr) {
         for (void *ptr : core_buffers_dev_) {
             if (ptr != nullptr) {
@@ -644,7 +644,7 @@ int PerformanceCollector::finalize() {
     }
     phase_buffers_dev_.clear();
 
-    // Free PerfSetupHeader
+    // Free L2PerfSetupHeader
     if (free_cb_ != nullptr && setup_header_dev_ != nullptr) {
         free_cb_(setup_header_dev_);
     }
@@ -660,7 +660,7 @@ int PerformanceCollector::finalize() {
     num_aicore_ = 0;
     num_phase_threads_ = 0;
     device_id_ = -1;
-    perf_buffer_bytes_ = 0;
+    l2_perf_buffer_bytes_ = 0;
     phase_buffer_bytes_ = 0;
     alloc_cb_ = nullptr;
     free_cb_ = nullptr;

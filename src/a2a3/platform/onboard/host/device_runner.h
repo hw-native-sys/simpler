@@ -37,12 +37,12 @@
 
 #include "common/kernel_args.h"
 #include "common/memory_barrier.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "common/unified_log.h"
 #include "host/function_cache.h"
 #include "host/memory_allocator.h"
-#include "host/performance_collector.h"
+#include "host/l2_perf_collector.h"
 #include "host/tensor_dump_collector.h"
 #include "host/pmu_collector.h"
 #include "runtime.h"
@@ -449,7 +449,7 @@ private:
     bool acl_ready_{false};
 
     // Performance profiling
-    PerformanceCollector perf_collector_;
+    L2PerfCollector l2_perf_collector_;
 
     // Tensor dump (independent shared memory + memory manager)
     TensorDumpCollector dump_collector_;
@@ -500,7 +500,7 @@ private:
      * @param device_id Device ID for host registration
      * @return 0 on success, error code on failure
      */
-    int init_performance_profiling(Runtime &runtime, int num_aicore, int device_id);
+    int init_l2_perf_collection(Runtime &runtime, int num_aicore, int device_id);
 
     /**
      * Initialize tensor dump shared memory and collector.

@@ -14,7 +14,7 @@
  * @brief Tensor dump data structures for device-to-host tensor collection (memcpy-based)
  *
  * A5 simplified design: pre-allocated buffers + direct write + memcpy collect-after-sync.
- * Mirrors PerformanceCollector pattern — no shared memory, no background threads,
+ * Mirrors L2PerfCollector pattern — no shared memory, no background threads,
  * no SPSC queues.
  *
  * Memory layout (allocated only when enable_dump_tensor=true):
@@ -98,7 +98,7 @@ struct alignas(64) TensorDumpRecord {
 static_assert(sizeof(TensorDumpRecord) == 128, "TensorDumpRecord must be 128 bytes (2 cache lines)");
 
 // =============================================================================
-// DumpBuffer - Per-Thread Record Buffer (count-first, like PerfBuffer)
+// DumpBuffer - Per-Thread Record Buffer (count-first, like L2PerfBuffer)
 // =============================================================================
 
 /**

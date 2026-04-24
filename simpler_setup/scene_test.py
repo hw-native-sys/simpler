@@ -487,32 +487,32 @@ def _project_root() -> Path:
 
 
 def _outputs_dir() -> Path:
-    """Return the directory where perf_swimlane_*.json lands.
+    """Return the directory where l2_perf_records_*.json lands.
 
-    Honors ``SIMPLER_PERF_OUTPUT_DIR`` so the parallel test dispatcher can give each
+    Honors ``SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR`` so the parallel test dispatcher can give each
     subprocess its own isolated output directory. Absolute paths pass through;
     relative paths are interpreted against the project root. Empty/unset env
     var falls back to ``<project>/outputs`` (the historical default).
     """
-    env = os.environ.get("SIMPLER_PERF_OUTPUT_DIR")
+    env = os.environ.get("SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR")
     if env:
         p = Path(env)
         return p if p.is_absolute() else _project_root() / p
     return _project_root() / "outputs"
 
 
-def _snapshot_perf_files() -> set[Path]:
+def _snapshot_l2_perf_records_files() -> set[Path]:
     d = _outputs_dir()
-    return set(d.glob("perf_swimlane_*.json")) if d.exists() else set()
+    return set(d.glob("l2_perf_records_*.json")) if d.exists() else set()
 
 
-def _wait_new_perf_file(before: set[Path], timeout: float = 2.0) -> Path | None:
-    """Wait briefly for a new ``perf_swimlane_*.json`` to appear in outputs/."""
+def _wait_new_l2_perf_records_file(before: set[Path], timeout: float = 2.0) -> Path | None:
+    """Wait briefly for a new ``l2_perf_records_*.json`` to appear in outputs/."""
     import time  # noqa: PLC0415
 
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        new = _snapshot_perf_files() - before
+        new = _snapshot_l2_perf_records_files() - before
         if new:
             return max(new, key=lambda p: p.stat().st_mtime)
         time.sleep(0.1)
@@ -559,7 +559,7 @@ def _run_swimlane_converter(
 
     When ``input_path`` is given, the converter derives its output filename from
     the input's timestamp (see ``tools/swimlane_converter.py::_resolve_output_path``).
-    Without it, the converter auto-selects the latest ``perf_swimlane_*.json``.
+    Without it, the converter auto-selects the latest ``l2_perf_records_*.json``.
     """
     import logging  # noqa: PLC0415
     import subprocess  # noqa: PLC0415
@@ -598,14 +598,14 @@ def _sanitize_for_filename(s: str) -> str:
 def _convert_case_swimlane(
     case_label: str,
     device_id,
-    before_perf: set[Path],
+    before_l2_perf_records: set[Path],
     before_device: set[Path] | None,
     callable_spec: dict | None = None,
 ) -> None:
     """Post-case: rename the new perf file to include ``case_label`` (guarding against
     the runtime's second-precision filename collisions), then invoke the converter.
 
-    The ``perf_swimlane_`` prefix is preserved so the converter's stem-based output
+    The ``l2_perf_records_`` prefix is preserved so the converter's stem-based output
     naming still strips it and produces ``merged_swimlane_<ts>_<case_label>.json``.
 
     When ``callable_spec`` is provided and contains ``"name"`` entries on incores,
@@ -615,17 +615,21 @@ def _convert_case_swimlane(
     import logging  # noqa: PLC0415
 
     logger = logging.getLogger(__name__)
-    perf_file = _wait_new_perf_file(before_perf)
-    if perf_file is None:
-        logger.warning(f"[{case_label}] No new perf_swimlane_*.json produced; skipping conversion")
+    l2_perf_records_file = _wait_new_l2_perf_records_file(before_l2_perf_records)
+    if l2_perf_records_file is None:
+        logger.warning(f"[{case_label}] No new l2_perf_records_*.json produced; skipping conversion")
         return
     safe_label = _sanitize_for_filename(case_label)
-    suffix = perf_file.stem[len("perf_swimlane_") :] if perf_file.stem.startswith("perf_swimlane_") else perf_file.stem
-    renamed = perf_file.with_name(f"perf_swimlane_{suffix}_{safe_label}.json")
+    suffix = (
+        l2_perf_records_file.stem[len("l2_perf_records_") :]
+        if l2_perf_records_file.stem.startswith("l2_perf_records_")
+        else l2_perf_records_file.stem
+    )
+    renamed = l2_perf_records_file.with_name(f"l2_perf_records_{suffix}_{safe_label}.json")
     if renamed.exists():
         logger.warning(f"[{case_label}] target {renamed.name} already exists; overwriting")
         renamed.unlink()
-    perf_file.rename(renamed)
+    l2_perf_records_file.rename(renamed)
 
     # Dump callable name mapping if the CALLABLE spec provides names
     func_names_path = None
@@ -654,7 +658,7 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     is_hardware,
     rounds,
     skip_golden,
-    enable_profiling,
+    enable_l2_swimlane,
     enable_dump_tensor,
     enable_pmu,
 ):
@@ -667,8 +671,8 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
     cls_name = type(cls_inst).__name__
     callable_spec = getattr(type(cls_inst), "CALLABLE", None)
     for case in cases:
-        before_perf = _snapshot_perf_files() if enable_profiling else set()
-        before_device = _snapshot_device_logs(primary_device_id) if enable_profiling and is_hardware else None
+        before_l2_perf_records = _snapshot_l2_perf_records_files() if enable_l2_swimlane else set()
+        before_device = _snapshot_device_logs(primary_device_id) if enable_l2_swimlane and is_hardware else None
         try:
             cls_inst._run_and_validate(
                 worker,
@@ -677,16 +681,16 @@ def run_class_cases(  # noqa: PLR0913 -- shared layer-5 entry; kwargs mirror CLI
                 sub_ids=sub_ids,
                 rounds=rounds,
                 skip_golden=skip_golden,
-                enable_profiling=enable_profiling,
+                enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
             )
         finally:
-            if enable_profiling:
+            if enable_l2_swimlane:
                 _convert_case_swimlane(
                     f"{cls_name}_{case['name']}",
                     primary_device_id,
-                    before_perf,
+                    before_l2_perf_records,
                     before_device,
                     callable_spec=callable_spec,
                 )
@@ -856,13 +860,13 @@ class SceneTestCase:
             return self._compile_l3_callables(platform)
         raise ValueError(f"Unsupported level: {self._st_level}")
 
-    def _build_config(self, config_dict, enable_profiling=False, enable_dump_tensor=False, enable_pmu=0):
+    def _build_config(self, config_dict, enable_l2_swimlane=False, enable_dump_tensor=False, enable_pmu=0):
         from simpler.task_interface import ChipCallConfig  # noqa: PLC0415
 
         config = ChipCallConfig()
         config.block_dim = config_dict.get("block_dim", 1)
         config.aicpu_thread_num = config_dict.get("aicpu_thread_num", 3)
-        config.enable_profiling = enable_profiling
+        config.enable_l2_swimlane = enable_l2_swimlane
         config.enable_dump_tensor = enable_dump_tensor
         config.enable_pmu = enable_pmu  # 0=disabled, >0=enabled with event type
         return config
@@ -892,7 +896,7 @@ class SceneTestCase:
         sub_ids=None,
         rounds=1,
         skip_golden=False,
-        enable_profiling=False,
+        enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
     ):
@@ -903,7 +907,7 @@ class SceneTestCase:
                 case,
                 rounds=rounds,
                 skip_golden=skip_golden,
-                enable_profiling=enable_profiling,
+                enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
             )
@@ -915,7 +919,7 @@ class SceneTestCase:
                 case,
                 rounds=rounds,
                 skip_golden=skip_golden,
-                enable_profiling=enable_profiling,
+                enable_l2_swimlane=enable_l2_swimlane,
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
             )
@@ -927,7 +931,7 @@ class SceneTestCase:
         case,
         rounds=1,
         skip_golden=False,
-        enable_profiling=False,
+        enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
     ):
@@ -959,7 +963,7 @@ class SceneTestCase:
 
             config = self._build_config(
                 config_dict,
-                enable_profiling=(enable_profiling and round_idx == 0),
+                enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
             )
@@ -978,16 +982,16 @@ class SceneTestCase:
         case,
         rounds=1,
         skip_golden=False,
-        enable_profiling=False,
+        enable_l2_swimlane=False,
         enable_dump_tensor=False,
         enable_pmu=0,
     ):
         # Defensive belt-and-braces: the pytest dispatcher and run_module both
-        # block --enable-profiling for L3 at the CLI boundary. Catch any code
+        # block --enable-l2-swimlane for L3 at the CLI boundary. Catch any code
         # path that reaches here with the flag on anyway (direct API use,
         # future refactors) so we fail loud rather than produce garbage perf
         # files. Lift once the runtime embeds device_id in the perf filename.
-        if enable_profiling:
+        if enable_l2_swimlane:
             raise NotImplementedError(
                 "L3 profiling is not supported yet (multi-chip-process perf "
                 "filename collision). Gate at the CLI level in "
@@ -1027,7 +1031,7 @@ class SceneTestCase:
 
             config = self._build_config(
                 config_dict,
-                enable_profiling=(enable_profiling and round_idx == 0),
+                enable_l2_swimlane=(enable_l2_swimlane and round_idx == 0),
                 enable_dump_tensor=enable_dump_tensor,
                 enable_pmu=enable_pmu,
             )
@@ -1054,13 +1058,13 @@ class SceneTestCase:
         manual_mode = request.config.getoption("--manual", default="exclude")
         rounds = request.config.getoption("--rounds", default=1)
         skip_golden = request.config.getoption("--skip-golden", default=False)
-        enable_profiling = request.config.getoption("--enable-profiling", default=False)
+        enable_l2_swimlane = request.config.getoption("--enable-l2-swimlane", default=False)
         enable_dump_tensor = request.config.getoption("--dump-tensor", default=False)
         enable_pmu = request.config.getoption("--enable-pmu", default=0)
         if rounds > 1:
-            if enable_profiling:
+            if enable_l2_swimlane:
                 logger.warning("Profiling disabled: --rounds > 1")
-                enable_profiling = False
+                enable_l2_swimlane = False
             if enable_dump_tensor:
                 logger.warning("Dump tensor disabled: --rounds > 1")
                 enable_dump_tensor = False
@@ -1109,7 +1113,7 @@ class SceneTestCase:
             is_hardware=is_hardware,
             rounds=rounds,
             skip_golden=skip_golden,
-            enable_profiling=enable_profiling,
+            enable_l2_swimlane=enable_l2_swimlane,
             enable_dump_tensor=enable_dump_tensor,
             enable_pmu=enable_pmu,
         )
@@ -1153,7 +1157,9 @@ class SceneTestCase:
         )
         parser.add_argument("--rounds", type=int, default=1, help="Run each case N times (default: 1)")
         parser.add_argument("--skip-golden", action="store_true", help="Skip golden comparison (benchmark mode)")
-        parser.add_argument("--enable-profiling", action="store_true", help="Enable profiling (first round only)")
+        parser.add_argument(
+            "--enable-l2-swimlane", action="store_true", help="Enable perf swimlane collection (first round only)"
+        )
         parser.add_argument("--dump-tensor", action="store_true", help="Dump per-task tensor I/O at runtime")
         parser.add_argument(
             "--enable-pmu",
@@ -1220,9 +1226,9 @@ class SceneTestCase:
             verbose=True,
         )
 
-        if args.rounds > 1 and args.enable_profiling:
+        if args.rounds > 1 and args.enable_l2_swimlane:
             logger.warning("Profiling disabled: --rounds > 1")
-            args.enable_profiling = False
+            args.enable_l2_swimlane = False
 
         from .parallel_scheduler import default_max_parallel, device_range_to_list  # noqa: PLC0415
 
@@ -1251,7 +1257,7 @@ class SceneTestCase:
                 sys.exit(2)
         # Note: profiling + parallelism used to be blocked here because perf
         # files shared a process-global directory. The test dispatcher now scopes
-        # each subprocess to its own SIMPLER_PERF_OUTPUT_DIR so the combination
+        # each subprocess to its own SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR so the combination
         # is safe.
 
         module = sys.modules[module_name]
@@ -1287,14 +1293,14 @@ class SceneTestCase:
 
         # L3 profiling not supported yet (multi-chip-process filename collision).
         # Mirror the pytest-side guard so standalone users get the same early-fail.
-        if args.enable_profiling:
+        if args.enable_l2_swimlane:
             l3_classes = sorted(cls.__name__ for cls in selected_by_cls if cls._st_level == 3)
             if l3_classes:
                 print(
-                    f"ERROR: --enable-profiling is not supported for L3 tests yet — "
+                    f"ERROR: --enable-l2-swimlane is not supported for L3 tests yet — "
                     f"multi-chip-process filename collision unresolved. "
                     f"L3 classes selected: {', '.join(l3_classes)}. "
-                    f"Either drop --enable-profiling or scope to L2 with --level 2.",
+                    f"Either drop --enable-l2-swimlane or scope to L2 with --level 2.",
                     file=sys.stderr,
                 )
                 sys.exit(2)
@@ -1322,9 +1328,9 @@ class SceneTestCase:
             by_rt_level.setdefault((cls._st_runtime, cls._st_level), []).append(cls)
 
         is_hardware = not args.platform.endswith("sim")
-        if args.enable_profiling and is_hardware and "-d" not in sys.argv and "--device" not in sys.argv:
+        if args.enable_l2_swimlane and is_hardware and "-d" not in sys.argv and "--device" not in sys.argv:
             print(
-                f"WARNING: --enable-profiling on hardware platform '{args.platform}' without explicit "
+                f"WARNING: --enable-l2-swimlane on hardware platform '{args.platform}' without explicit "
                 "-d/--device; defaulting to device 0 may point scheduler deep-dive at the wrong log.",
                 file=sys.stderr,
             )
@@ -1352,7 +1358,7 @@ class SceneTestCase:
                                 is_hardware=is_hardware,
                                 rounds=args.rounds,
                                 skip_golden=args.skip_golden,
-                                enable_profiling=args.enable_profiling,
+                                enable_l2_swimlane=args.enable_l2_swimlane,
                                 enable_dump_tensor=args.dump_tensor,
                                 enable_pmu=args.enable_pmu,
                             )
@@ -1391,8 +1397,8 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         common += ["--rounds", str(args.rounds)]
     if args.skip_golden:
         common.append("--skip-golden")
-    if args.enable_profiling:
-        common.append("--enable-profiling")
+    if args.enable_l2_swimlane:
+        common.append("--enable-l2-swimlane")
     if args.dump_tensor:
         common.append("--dump-tensor")
     if args.build:
@@ -1434,7 +1440,9 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
         # own CWD) and Python post-processing agree on the location.
         child_env = {
             **os.environ,
-            "SIMPLER_PERF_OUTPUT_DIR": str(_project_root() / "outputs" / f"perf_l3_{cls.__name__}"),
+            "SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR": str(
+                _project_root() / "outputs" / f"l2_perf_records_l3_{cls.__name__}"
+            ),
         }
         l3_jobs.append(Job(label=label, device_count=class_dev_count, build_cmd=_build, env=child_env))
 
@@ -1537,7 +1545,9 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
             # Python post-processing agree on the filesystem location.
             child_env = {
                 **os.environ,
-                "SIMPLER_PERF_OUTPUT_DIR": str(_project_root() / "outputs" / f"perf_l2_{rt}_dev{dev}"),
+                "SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR": str(
+                    _project_root() / "outputs" / f"l2_perf_records_l2_{rt}_dev{dev}"
+                ),
             }
             l2_jobs.append(Job(label=label, device_count=1, build_cmd=_build, env=child_env))
 
@@ -1567,12 +1577,12 @@ def _dispatch_test_phases_standalone(module_name, selected_by_cls, args):  # noq
             if args.exitfirst:
                 break
 
-    # Flatten per-subprocess outputs/perf_*/ subdirs back to outputs/.
+    # Flatten per-subprocess outputs/l2_perf_records_*/ subdirs back to outputs/.
     # Anchor to _project_root() so flushing works when the user runs a
     # standalone test from a subdirectory.
-    from .parallel_scheduler import flatten_perf_subdirs  # noqa: PLC0415
+    from .parallel_scheduler import flatten_l2_perf_records_subdirs  # noqa: PLC0415
 
-    flatten_perf_subdirs(_project_root() / "outputs")
+    flatten_l2_perf_records_subdirs(_project_root() / "outputs")
 
     return not (l3_failed or l2_failed)
 

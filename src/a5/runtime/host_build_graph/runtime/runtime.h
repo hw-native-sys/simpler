@@ -37,7 +37,7 @@
 #include <atomic>
 
 #include "common/core_type.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "tensor_info.h"
 
@@ -101,9 +101,11 @@
  * The structure is cache-line aligned (64 bytes) to prevent false sharing
  * between cores and optimize cache coherency operations.
  *
- * enable_profiling_flag bit definitions:
+ * enable_profiling_flag bit definitions (umbrella bitmask — "profiling"
+ * is the umbrella, each bit is a parallel diagnostics sub-feature):
  * - bit0: tensor dump enabled
- * - remaining bits: reserved for future runtime controls
+ * - bit1: L2 swimlane enabled
+ * - bit2: PMU enabled (reserved on a5; a2a3 wires through device_runner)
  *
  * Field Access Patterns:
  * - aicpu_ready: Written by AICPU, read by AICore
@@ -112,8 +114,8 @@
  * - task_status: Written by both (AICPU=1 on dispatch, AICore=0 on completion)
  * - control: Written by AICPU, read by AICore (0 = continue, 1 = quit)
  * - core_type: Written by AICPU, read by AICore (CoreType::AIC or CoreType::AIV)
- * - perf_records_addr: Written by AICPU, read by AICore (performance records address)
- * - perf_buffer_status: Written by both (AICPU=1 on buffer full, AICore=0 on buffer empty)
+ * - l2_perf_records_addr: Written by AICPU, read by AICore (performance records address)
+ * - l2_perf_buffer_status: Written by both (AICPU=1 on buffer full, AICore=0 on buffer empty)
  * - physical_core_id: Written by AICPU, read by AICore (physical core ID)
  * - enable_profiling_flag: Written by host/AICPU init, read by AICore (bitmask)
  */
@@ -124,12 +126,13 @@ struct Handshake {
     volatile int32_t task_status;             // Task execution status: 0=idle, 1=busy
     volatile int32_t control;                 // Control signal: 0=execute, 1=quit
     volatile CoreType core_type;              // Core type: CoreType::AIC or CoreType::AIV
-    volatile uint64_t perf_records_addr;      // Performance records address
-    volatile uint32_t perf_buffer_status;     // 0 = not full, 1 = full
+    volatile uint64_t l2_perf_records_addr;   // Performance records address
+    volatile uint32_t l2_perf_buffer_status;  // 0 = not full, 1 = full
     volatile uint32_t physical_core_id;       // Physical core ID
     volatile uint32_t aicpu_regs_ready;       // AICPU register init done: 0=pending, 1=done
     volatile uint32_t aicore_regs_ready;      // AICore ID reported: 0=pending, 1=done
-    volatile uint32_t enable_profiling_flag;  // Generic profiling-related flags; bit0=dump tensor
+    volatile uint32_t
+        enable_profiling_flag;  // Umbrella diagnostics bitmask; bit0=dump_tensor, bit1=l2_swimlane, bit2=pmu
 } __attribute__((aligned(64)));
 
 /**
@@ -208,9 +211,9 @@ public:
     // Execution parameters for AICPU scheduling
     int sche_cpu_num;  // Number of AICPU threads for scheduling
 
-    // Profiling support
-    bool enable_profiling;    // Enable profiling flag
-    uint64_t perf_data_base;  // Performance data shared memory base address (device-side)
+    // Perf swimlane collection
+    bool enable_l2_swimlane;     // Enable perf swimlane collection
+    uint64_t l2_perf_data_base;  // Performance data shared memory base address (device-side)
 
     // Task storage
     Task tasks[RUNTIME_MAX_TASKS];  // Fixed-size task array

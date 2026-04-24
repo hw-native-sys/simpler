@@ -1,223 +1,229 @@
-# Swimlane 性能分析工具
+# Swimlane Performance Analysis Tools
 
-本目录包含 PTO Runtime 的性能分析工具。
+This directory contains performance analysis tools for the PTO Runtime.
 
-## 工具列表
+## Tool List
 
-- **[swimlane_converter.py](#swimlane_converterpy)** - 转换为 Chrome Trace Event 可视化格式
-- **[sched_overhead_analysis.py](#sched_overhead_analysispy)** - Scheduler 开销分析（Tail OH 分解）
-- **[perf_to_mermaid.py](#perf_to_mermaidpy)** - 转换为 Mermaid 依赖图
-- **[benchmark_rounds.sh](#benchmark_roundssh)** - 批量运行 examples 并报告每轮耗时
-- **[device_log_resolver.py](#device_log_resolverpy)** - Device log 路径解析库
+- **[swimlane_converter.py](#swimlane_converterpy)** - Convert to Chrome Trace Event visualization format
+- **[sched_overhead_analysis.py](#sched_overhead_analysispy)** - Scheduler overhead analysis (Tail OH breakdown)
+- **[perf_to_mermaid.py](#perf_to_mermaidpy)** - Convert to Mermaid dependency graph
+- **[benchmark_rounds.sh](#benchmark_roundssh)** - Batch-run examples and report per-round elapsed time
+- **[device_log_resolver.py](#device_log_resolverpy)** - Device log path resolution library
 
 ---
 
 ## swimlane_converter.py
 
-将性能分析数据 JSON 文件转换为 Chrome Trace Event 格式，以便在 Perfetto 中可视化。
+Convert performance profiling JSON files into Chrome Trace Event format for visualization in Perfetto.
 
-### 功能概述
+### Overview
 
-`swimlane_converter.py` 将 PTO Runtime 的性能分析数据（`perf_swimlane_*.json`）转换为可在 Perfetto 跟踪查看器（https://ui.perfetto.dev/）中可视化的格式。同时提供按函数分组的任务执行统计分析，并在解析到 device log 时输出 scheduler overhead deep-dive 报告。
+`swimlane_converter.py` converts PTO Runtime profiling data (`l2_perf_records_*.json`) into a format that can be visualized in the Perfetto trace viewer (<https://ui.perfetto.dev/>). It also produces a task execution statistics summary grouped by function, and emits a scheduler overhead deep-dive report when a device log is resolved.
 
-### 基本用法
+### Basic Usage
 
 ```bash
-# 自动检测 outputs/ 目录中最新的性能分析文件
+# Auto-detect the latest profiling file in the outputs/ directory
 python3 tools/swimlane_converter.py
 
-# 指定输入文件
-python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json
+# Specify an input file
+python3 tools/swimlane_converter.py outputs/l2_perf_records_20260210_143526.json
 
-# 指定输出文件
-python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -o custom_output.json
+# Specify an output file
+python3 tools/swimlane_converter.py outputs/l2_perf_records_20260210_143526.json -o custom_output.json
 
-# 从 kernel_config.py 加载函数名映射
-python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json \
+# Load function name mapping from kernel_config.py
+python3 tools/swimlane_converter.py outputs/l2_perf_records_20260210_143526.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
-# 使用指定 device id 自动选择 device log（device-<id>）
-python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -d 0
+# Select the device log automatically using a specific device id (device-<id>)
+python3 tools/swimlane_converter.py outputs/l2_perf_records_20260210_143526.json -d 0
 
-# 详细模式（用于调试）
-python3 tools/swimlane_converter.py outputs/perf_swimlane_20260210_143526.json -v
+# Verbose mode (for debugging)
+python3 tools/swimlane_converter.py outputs/l2_perf_records_20260210_143526.json -v
 ```
 
-### 命令行选项
+### Command-Line Options
 
-| 选项 | 简写 | 说明 |
-|------|------|------|
-| `input` | | 输入 JSON 文件（perf_swimlane_*.json）。如果省略，使用 outputs/ 中最新的文件 |
-| `--output` | `-o` | 输出 JSON 文件（默认：outputs/merged_swimlane_<timestamp>.json） |
-| `--kernel-config` | `-k` | kernel_config.py 文件路径，用于函数名映射 |
-| `--device-log` | | 设备日志文件/目录/glob 覆盖输入（优先级最高） |
-| `--device-id` | `-d` | 指定 device id，从 `device-<id>` 目录自动选择日志 |
-| `--verbose` | `-v` | 启用详细输出 |
+| Option | Short | Description |
+| ------ | ----- | ----------- |
+| `input` | | Input JSON file (l2_perf_records_*.json). If omitted, the latest file in outputs/ is used |
+| `--output` | `-o` | Output JSON file (default: outputs/merged_swimlane_`<timestamp>`.json) |
+| `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
+| `--device-log` | | Device log file/directory/glob that overrides inputs (highest priority) |
+| `--device-id` | `-d` | Device id used to auto-select the log from the `device-<id>` directory |
+| `--verbose` | `-v` | Enable verbose output |
 
-### device log 选择优先级
+### Device Log Selection Priority
 
-`swimlane_converter.py` 和 `sched_overhead_analysis.py` 使用一致的解析规则（由 `device_log_resolver.py` 提供）：
+`swimlane_converter.py` and `sched_overhead_analysis.py` use the same resolution rules (provided by `device_log_resolver.py`):
 
-1. `--device-log`（文件/目录/glob）显式覆盖
-2. `-d/--device-id` 对应 `device-<id>` 目录
-3. 自动扫描 `device-*`，选择最接近 perf 时间戳的 `.log`
+1. `--device-log` (file/directory/glob) explicit override
+2. `-d/--device-id` maps to the `device-<id>` directory
+3. Auto-scan `device-*`, selecting the `.log` closest to the perf timestamp
 
-log root 解析顺序：
+Log root resolution order:
+
 - `$ASCEND_WORK_PATH/log/debug/`
-- `~/ascend/log/debug/`（fallback）
+- `~/ascend/log/debug/` (fallback)
 
-### 输出内容
+### Outputs
 
-工具生成三类输出：
+The tool produces three kinds of output:
 
-#### 1. Perfetto JSON 文件
+#### 1. Perfetto JSON File
 
-可在 Perfetto 中可视化的 Chrome Trace Event 格式 JSON 文件：
-- 文件位置：`outputs/merged_swimlane_<timestamp>.json`
-- 打开 https://ui.perfetto.dev/ 并拖入文件即可可视化
+A Chrome Trace Event format JSON file that can be visualized in Perfetto:
 
-#### 2. 任务统计信息
+- File location: `outputs/merged_swimlane_<timestamp>.json`
+- Open <https://ui.perfetto.dev/> and drag-and-drop the file to visualize
 
-按函数分组的统计摘要（打印到控制台），包含 Exec/Latency 对比和调度开销分析：
+#### 2. Task Statistics
 
-- **Exec**：AICore 上的 kernel 执行时间（end_time - start_time）
-- **Latency**：AICPU 视角的端到端延迟（finish_time - dispatch_time，包含 head OH + Exec + tail OH）
-- **Head/Tail OH**：调度头部/尾部开销
-- **Exec_%**：Exec / Latency 百分比（kernel 利用率）
+A statistics summary grouped by function (printed to the console), including Exec/Latency comparison and scheduling overhead analysis:
 
-解析到 device log 时，还会输出 Sched CPU（AICPU scheduler 线程实际 CPU 时间 per task）和 Exec/Sched_CPU 比率。
+- **Exec**: kernel execution time on AICore (end_time - start_time)
+- **Latency**: end-to-end latency from the AICPU perspective (finish_time - dispatch_time, including head OH + Exec + tail OH)
+- **Head/Tail OH**: scheduling head/tail overhead
+- **Exec_%**: Exec / Latency percentage (kernel utilization)
 
-#### 3. Scheduler overhead deep-dive（自动）
+When the device log is resolved, Sched CPU (actual CPU time of the AICPU scheduler thread per task) and the Exec/Sched_CPU ratio are also printed.
 
-当 device log 成功解析后，`swimlane_converter.py` 会直接调用 `sched_overhead_analysis` 的分析逻辑，并在同一次运行中输出：
+#### 3. Scheduler Overhead Deep-Dive (Automatic)
+
+When the device log is successfully resolved, `swimlane_converter.py` invokes the `sched_overhead_analysis` logic directly and emits in the same run:
 
 - Part 1: Per-task time breakdown
 - Part 2: AICPU scheduler loop breakdown
 - Part 3: Tail OH distribution & cause analysis
 
-### 与 run_example.py 集成
+### Integration with run_example.py
 
-启用性能分析运行测试时，转换器会自动调用：
+When running a test with profiling enabled, the converter is invoked automatically:
 
 ```bash
-# 运行测试并启用性能分析 - 测试通过后自动生成 merged_swimlane.json
+# Run the test with profiling enabled - merged_swimlane.json is generated automatically after the test passes
 python examples/scripts/run_example.py \
     -k examples/host_build_graph/vector_example/kernels \
     -g examples/host_build_graph/vector_example/golden.py \
-    --enable-profiling
+    --enable-l2-swimlane
 ```
 
-测试通过后，工具将：
-1. 自动检测 outputs/ 中最新的 `perf_swimlane_*.json`
-2. 从 `-k` 指定的 kernel_config.py 加载函数名
-3. 把运行时有效 device id（`-d`）透传给 `swimlane_converter.py`
-4. 自动解析 device log 并输出选择策略
-5. 生成 `merged_swimlane_*.json` 用于可视化
-6. 将任务统计与 scheduler overhead deep-dive 报告打印到控制台
+After the test passes, the tool will:
+
+1. Auto-detect the latest `l2_perf_records_*.json` in outputs/
+2. Load function names from the kernel_config.py specified via `-k`
+3. Propagate the effective runtime device id (`-d`) to `swimlane_converter.py`
+4. Resolve the device log automatically and print the selection strategy
+5. Produce `merged_swimlane_*.json` for visualization
+6. Print the task statistics and scheduler overhead deep-dive report to the console
 
 ---
 
 ## sched_overhead_analysis.py
 
-分析 AICPU scheduler 的调度开销，定量分解 Tail OH（任务完成到 scheduler 确认之间的延迟）的来源。
+Analyze AICPU scheduler overhead and quantitatively decompose the sources of Tail OH (the latency between task completion and scheduler acknowledgement).
 
-### 功能概述
+### Overview
 
-`sched_overhead_analysis.py` 从两个数据源进行分析：
-1. **Perf profiling 数据**（`perf_swimlane_*.json`）：提取每个 task 的 Exec / Head OH / Tail OH 时间分解
-2. **设备日志**（device log）：解析 AICPU scheduler 线程的循环分解（scan / complete / dispatch / idle）、锁竞争和 fanout 统计
+`sched_overhead_analysis.py` analyzes two data sources:
 
-支持三种 device log 格式：
-1. **New two-level tree**（`PTO2_SCHED_PROFILING=1`）：`=== Scheduler Phase Breakdown: total=Xus, Y tasks ===`，后跟各 phase 行
-2. **Legacy detailed**（`PTO2_SCHED_PROFILING=1`）：`completed=X tasks in Yus (Z loops, W tasks/loop)`，后跟 `--- Phase Breakdown ---` 及带 fanout/fanin/pop 统计的 phase 行
-3. **Summary**（`PTO2_SCHED_PROFILING=0`）：`Scheduler summary: total_time=Xus, loops=Y, tasks_scheduled=Z`
+1. **Perf profiling data** (`l2_perf_records_*.json`): extracts per-task Exec / Head OH / Tail OH time breakdowns
+2. **Device log**: parses the AICPU scheduler thread's loop breakdown (scan / complete / dispatch / idle), lock contention, and fanout statistics
 
-### 基本用法
+Three device log formats are supported:
+
+1. **New two-level tree** (`PTO2_SCHED_PROFILING=1`): `=== Scheduler Phase Breakdown: total=Xus, Y tasks ===` followed by per-phase lines
+2. **Legacy detailed** (`PTO2_SCHED_PROFILING=1`): `completed=X tasks in Yus (Z loops, W tasks/loop)` followed by `--- Phase Breakdown ---` with phase lines carrying fanout/fanin/pop statistics
+3. **Summary** (`PTO2_SCHED_PROFILING=0`): `Scheduler summary: total_time=Xus, loops=Y, tasks_scheduled=Z`
+
+### Basic Usage
 
 ```bash
-# 自动选取最新的 perf 数据和设备日志
+# Auto-pick the latest perf data and device log
 python3 tools/sched_overhead_analysis.py
 
-# 指定 device id 自动选取 device-<id> 日志
-python3 tools/sched_overhead_analysis.py --perf-json outputs/perf_swimlane_20260210_143526.json -d 0
+# Use a specific device id to auto-pick the device-<id> log
+python3 tools/sched_overhead_analysis.py --l2-perf-records-json outputs/l2_perf_records_20260210_143526.json -d 0
 
-# 指定文件
+# Specify files explicitly
 python3 tools/sched_overhead_analysis.py \
-    --perf-json outputs/perf_swimlane_20260210_143526.json \
+    --l2-perf-records-json outputs/l2_perf_records_20260210_143526.json \
     --device-log ~/ascend/log/debug/device-0/device-*.log
 ```
 
-### 命令行选项
+### Command-Line Options
 
-| 选项 | 说明 |
-|------|------|
-| `--perf-json` | perf_swimlane_*.json 文件路径。省略时自动选取 outputs/ 中最新的文件 |
-| `--device-log` | 设备日志文件/目录/glob 覆盖输入（优先级最高） |
-| `-d, --device-id` | 指定 device id，从 `device-<id>` 自动选取日志 |
+| Option | Description |
+| ------ | ----------- |
+| `--l2-perf-records-json` | Path to the l2_perf_records_*.json file. If omitted, the latest file in outputs/ is auto-selected |
+| `--device-log` | Device log file/directory/glob that overrides inputs (highest priority) |
+| `-d, --device-id` | Device id used to auto-pick the log from `device-<id>` |
 
-### 输出内容
+### Outputs
 
-分三部分输出：
+Output is emitted in three parts:
 
-- **Part 1：Per-task time breakdown** — Exec / Head OH / Tail OH 各占 Latency 的百分比
-- **Part 2：AICPU scheduler loop breakdown** — 各 scheduler 线程的循环统计、各阶段（scan / complete / dispatch / idle）耗时占比、锁竞争和 fanout/fanin/pop 统计
-- **Part 3：Tail OH distribution & cause analysis** — Tail OH 分位数分布（P10~P99）、scheduler 循环迭代耗时与 Tail OH 的关联分析、主导 phase 的数据驱动洞察
+- **Part 1: Per-task time breakdown** - Exec / Head OH / Tail OH percentages of Latency
+- **Part 2: AICPU scheduler loop breakdown** - per-scheduler-thread loop statistics, per-phase (scan / complete / dispatch / idle) time ratios, lock contention, and fanout/fanin/pop statistics
+- **Part 3: Tail OH distribution & cause analysis** - Tail OH quantile distribution (P10-P99), correlation between scheduler loop iteration time and Tail OH, and data-driven insights into the dominant phase
 
 ---
 
 ## perf_to_mermaid.py
 
-将性能分析数据转换为 Mermaid 流程图格式，可视化任务依赖关系。
+Convert profiling data into Mermaid flowchart format to visualize task dependencies.
 
-### 功能概述
+### Overview
 
-`perf_to_mermaid.py` 将 PTO Runtime 的性能分析数据（`perf_swimlane_*.json`）转换为 Mermaid 流程图格式。生成的 Markdown 文件可以：
-- 在 GitHub/GitLab 中直接渲染
-- 在 https://mermaid.live/ 中查看
-- 在支持 Mermaid 的编辑器中查看（如 VS Code + Mermaid 插件）
+`perf_to_mermaid.py` converts PTO Runtime profiling data (`l2_perf_records_*.json`) into Mermaid flowchart format. The generated Markdown file can be:
 
-### 基本用法
+- Rendered directly in GitHub/GitLab
+- Viewed at <https://mermaid.live/>
+- Viewed in Mermaid-capable editors (e.g., VS Code with the Mermaid plugin)
+
+### Basic Usage
 
 ```bash
-# 自动检测 outputs/ 目录中最新的性能分析文件
+# Auto-detect the latest profiling file in the outputs/ directory
 python3 tools/perf_to_mermaid.py
 
-# 指定输入文件
-python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json
+# Specify an input file
+python3 tools/perf_to_mermaid.py outputs/l2_perf_records_20260210_143526.json
 
-# 指定输出文件
-python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json -o diagram.md
+# Specify an output file
+python3 tools/perf_to_mermaid.py outputs/l2_perf_records_20260210_143526.json -o diagram.md
 
-# 从 kernel_config.py 加载函数名映射
-python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json \
+# Load function name mapping from kernel_config.py
+python3 tools/perf_to_mermaid.py outputs/l2_perf_records_20260210_143526.json \
     -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
 
-# 使用紧凑样式（仅显示任务ID和函数名）
-python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json --style compact
+# Use compact style (only task id and function name)
+python3 tools/perf_to_mermaid.py outputs/l2_perf_records_20260210_143526.json --style compact
 
-# 指定流程图方向（从左到右）
-python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json --direction LR
+# Specify flowchart direction (left to right)
+python3 tools/perf_to_mermaid.py outputs/l2_perf_records_20260210_143526.json --direction LR
 
-# 详细模式
-python3 tools/perf_to_mermaid.py outputs/perf_swimlane_20260210_143526.json -v
+# Verbose mode
+python3 tools/perf_to_mermaid.py outputs/l2_perf_records_20260210_143526.json -v
 ```
 
-### 命令行选项
+### Command-Line Options
 
-| 选项 | 简写 | 说明 |
-|------|------|------|
-| `input` | | 输入 JSON 文件（perf_swimlane_*.json）。如果省略，使用 outputs/ 中最新的文件 |
-| `--output` | `-o` | 输出 Markdown 文件（默认：outputs/mermaid_diagram_<timestamp>.md） |
-| `--kernel-config` | `-k` | kernel_config.py 文件路径，用于函数名映射 |
-| `--style` | | 节点样式：`detailed`（默认，包含函数名和任务ID）或 `compact`（仅任务ID）|
-| `--direction` | | 流程图方向：`TD`（从上到下，默认）或 `LR`（从左到右）|
-| `--verbose` | `-v` | 启用详细输出 |
+| Option | Short | Description |
+| ------ | ----- | ----------- |
+| `input` | | Input JSON file (l2_perf_records_*.json). If omitted, the latest file in outputs/ is used |
+| `--output` | `-o` | Output Markdown file (default: outputs/mermaid_diagram_`<timestamp>`.md) |
+| `--kernel-config` | `-k` | Path to kernel_config.py, used for function name mapping |
+| `--style` | | Node style: `detailed` (default, includes function name and task id) or `compact` (task id only) |
+| `--direction` | | Flowchart direction: `TD` (top-down, default) or `LR` (left-to-right) |
+| `--verbose` | `-v` | Enable verbose output |
 
-### 输出内容
+### Outputs
 
-生成包含 Mermaid 流程图的 Markdown 文件：
+Generates a Markdown file containing a Mermaid flowchart:
 
-#### Detailed 样式（默认）
+#### Detailed Style (Default)
 
 ```mermaid
 flowchart TD
@@ -266,82 +272,85 @@ flowchart TD
 
 ## benchmark_rounds.sh
 
-批量运行预定义的 examples，解析 device log 中的 timing 行并报告每轮耗时。
+Batch-run a predefined set of examples, parse the timing lines from the device log, and report per-round elapsed time.
 
-### 功能概述
+### Overview
 
-`benchmark_rounds.sh` 遍历 `EXAMPLES` 数组中配置的测试用例（位于 `tests/st/tensormap_and_ringbuffer/` 下），依次调用 `run_example.py` 运行每个 example，然后从生成的 device log 中提取 `orch_start` / `orch_end` / `sched_end` 时间戳计算每轮 elapsed 时间。
+`benchmark_rounds.sh` iterates through the test cases configured in the `EXAMPLES` array (located under `tests/st/tensormap_and_ringbuffer/`), invokes `run_example.py` for each example in turn, then extracts the `orch_start` / `orch_end` / `sched_end` timestamps from the generated device log to compute per-round elapsed time.
 
-当前预配置的 examples：
+Currently preconfigured examples:
+
 - `alternating_matmul_add`
 - `benchmark_bgemm`
 - `paged_attention_unroll`
 - `batch_paged_attention`
 - `paged_attention`
 
-### 基本用法
+### Basic Usage
 
 ```bash
-# 使用默认参数（device 0, 10 rounds）
+# Use defaults (device 0, 10 rounds)
 ./tools/benchmark_rounds.sh
 
-# 指定 device 和 rounds
+# Specify device and rounds
 ./tools/benchmark_rounds.sh -d 4 -n 20
 
-# 额外参数透传给 run_example.py
+# Extra arguments are passed through to run_example.py
 ./tools/benchmark_rounds.sh -d 0 -n 5 --case 1
 ```
 
-### 命令行选项
+### Command-Line Options
 
-| 选项 | 简写 | 说明 |
-|------|------|------|
-| `--device` | `-d` | Device ID（默认：0） |
-| `--rounds` | `-n` | 每个 example 的运行轮数（默认：10） |
-| `--help` | `-h` | 显示帮助信息 |
+| Option | Short | Description |
+| ------ | ----- | ----------- |
+| `--device` | `-d` | Device ID (default: 0) |
+| `--rounds` | `-n` | Number of rounds per example (default: 10) |
+| `--help` | `-h` | Show help |
 
-所有未识别的参数会透传给 `run_example.py`。
+All unrecognized arguments are passed through to `run_example.py`.
 
-### 输出内容
+### Outputs
 
-对每个 example 输出：
-- 每轮的 Elapsed 时间（微秒）
-- 平均耗时和总轮数
+For each example it prints:
 
-最终输出汇总：passed / failed 数量。
+- Elapsed time (microseconds) for each round
+- Average time and total round count
 
-### Device log 解析
+A final summary is printed: passed / failed counts.
 
-脚本通过以下方式定位 device log：
-- 优先使用 `$ASCEND_WORK_PATH/log/debug/device-<id>/`
-- Fallback 到 `~/ascend/log/debug/device-<id>/`
-- 在运行前快照已有 log 文件，运行后等待新 log 文件出现（最多 15 秒）
+### Device Log Resolution
+
+The script locates the device log as follows:
+
+- Prefer `$ASCEND_WORK_PATH/log/debug/device-<id>/`
+- Fall back to `~/ascend/log/debug/device-<id>/`
+- Snapshot existing log files before running, then wait for new log files to appear after running (up to 15 seconds)
 
 ---
 
 ## device_log_resolver.py
 
-Device log 路径解析库，被 `swimlane_converter.py` 和 `sched_overhead_analysis.py` 共同使用。
+Device log path resolution library, shared by `swimlane_converter.py` and `sched_overhead_analysis.py`.
 
-### 功能概述
+### Overview
 
-`device_log_resolver.py` 提供确定性的 device log 路径解析逻辑，支持三种选择优先级：
+`device_log_resolver.py` provides deterministic device log path resolution logic, supporting three selection priorities:
 
-1. **显式路径**（`--device-log`）：支持文件、目录、glob 模式
-2. **Device ID**（`--device-id`）：从 `<log_root>/device-<id>/` 选择最新 `.log`
-3. **自动扫描**：遍历所有 `device-*` 目录，选择与 perf 时间戳最接近的 `.log`
+1. **Explicit path** (`--device-log`): supports file, directory, and glob patterns
+2. **Device ID** (`--device-id`): selects the latest `.log` from `<log_root>/device-<id>/`
+3. **Auto-scan**: iterates all `device-*` directories and selects the `.log` closest to the perf timestamp
 
-### 主要函数
+### Main Functions
 
-| 函数 | 说明 |
-|------|------|
-| `get_log_root()` | 返回 log root 路径（`$ASCEND_WORK_PATH/log/debug/` 或 `~/ascend/log/debug/`） |
-| `infer_device_id_from_log_path(log_path)` | 从路径中推断 device id（如 `device-0`） |
-| `resolve_device_log_path(device_id, device_log, perf_path)` | 按优先级解析 device log 路径，返回 `(Path, strategy_string)` |
+| Function | Description |
+| -------- | ----------- |
+| `get_log_root()` | Returns the log root path (`$ASCEND_WORK_PATH/log/debug/` or `~/ascend/log/debug/`) |
+| `infer_device_id_from_log_path(log_path)` | Infers the device id from a path (e.g., `device-0`) |
+| `resolve_device_log_path(device_id, device_log, l2_perf_records_path)` | Resolves the device log path by priority, returning `(Path, strategy_string)` |
 
-### 使用方式
+### Usage
 
-该模块不作为独立命令行工具使用，而是被其他工具导入：
+This module is not used as a standalone command-line tool; it is imported by other tools:
 
 ```python
 from device_log_resolver import resolve_device_log_path
@@ -349,17 +358,17 @@ from device_log_resolver import resolve_device_log_path
 log_path, strategy = resolve_device_log_path(
     device_id="0",
     device_log=None,
-    perf_path=Path("outputs/perf_swimlane_20260210_143526.json"),
+    l2_perf_records_path=Path("outputs/l2_perf_records_20260210_143526.json"),
 )
 ```
 
 ---
 
-## 共同配置
+## Shared Configuration
 
-### 输入文件格式
+### Input File Format
 
-分析工具共用相同的输入格式 - PTO Runtime 生成的 `perf_swimlane_*.json` 文件：
+The analysis tools share the same input format - the `l2_perf_records_*.json` files generated by the PTO Runtime:
 
 ```json
 {
@@ -380,119 +389,128 @@ log_path, strategy = resolve_device_log_path(
 }
 ```
 
-### Kernel Config 格式
+### Kernel Config Format
 
-要在输出中显示有意义的函数名，需要提供 `kernel_config.py` 文件：
+To display meaningful function names in the output, provide a `kernel_config.py` file:
 
 ```python
 KERNELS = [
     {
         "func_id": 0,
         "name": "QK",
-        # ... 其他字段
+        # ... other fields
     },
     {
         "func_id": 1,
         "name": "SF",
-        # ... 其他字段
+        # ... other fields
     },
 ]
 ```
 
-工具从 `KERNELS` 列表中提取 `func_id` 到 `name` 的映射。
+The tools extract the `func_id` to `name` mapping from the `KERNELS` list.
 
 ---
 
-## 工具选择建议
+## Tool Selection Guide
 
-### 使用 swimlane_converter.py 当你需要：
-- 查看详细的时间线执行视图
-- 分析任务在不同核心上的调度情况
-- 查看精确的执行时间和时间间隔
-- 获取任务执行的统计信息
-- 专业的性能分析和优化
+### Use swimlane_converter.py when you need
 
-### 使用 perf_to_mermaid.py 当你需要：
-- 快速查看任务依赖关系
-- 在文档中嵌入依赖图
-- 在代码审查中分享依赖结构
-- 不需要时间线细节，只关注拓扑结构
-- 在 GitHub/GitLab 中直接查看
+- A detailed timeline execution view
+- To analyze task scheduling across different cores
+- To see precise execution times and intervals
+- Task execution statistics
+- Professional performance analysis and optimization
 
-### 使用 benchmark_rounds.sh 当你需要：
-- 批量运行多个 examples 并对比耗时
-- 获取每轮的 elapsed 时间统计
-- 在硬件上做端到端性能回归测试
+### Use perf_to_mermaid.py when you need
 
-### 推荐工作流
+- A quick look at task dependencies
+- To embed a dependency graph in documentation
+- To share dependency structure in a code review
+- Only topological structure, without timeline detail
+- Direct viewing in GitHub/GitLab
+
+### Use benchmark_rounds.sh when you need
+
+- To batch-run multiple examples and compare elapsed time
+- Per-round elapsed time statistics
+- End-to-end performance regression testing on hardware
+
+### Recommended Workflow
 
 ```bash
-# 1. 运行测试获取性能数据
-python examples/scripts/run_example.py -k ./kernels -g ./golden.py --enable-profiling
+# 1. Run the test to produce profiling data
+python examples/scripts/run_example.py -k ./kernels -g ./golden.py --enable-l2-swimlane
 
-# 2. 生成 Perfetto 可视化（自动）
-# → outputs/merged_swimlane_*.json
+# 2. Generate Perfetto visualization (automatic)
+# -> outputs/merged_swimlane_*.json
 
-# 3. 生成 Mermaid 依赖图
+# 3. Generate Mermaid dependency graph
 python3 tools/perf_to_mermaid.py -k ./kernels/kernel_config.py
 
-# 4. 批量 benchmark（硬件上）
+# 4. Batch benchmark (on hardware)
 ./tools/benchmark_rounds.sh -d 0 -n 20
 
-# 5. 分析结果
-# - 详细性能分析：Perfetto (https://ui.perfetto.dev/)
-# - 依赖关系概览：Mermaid 图（GitHub/编辑器）
-# - 统计摘要：控制台输出
+# 5. Analyze results
+# - Detailed performance analysis: Perfetto (https://ui.perfetto.dev/)
+# - Dependency overview: Mermaid diagram (GitHub/editor)
+# - Statistics summary: console output
 ```
 
 ---
 
-## 故障排查
+## Troubleshooting
 
-### 错误：找不到 perf_swimlane_*.json 文件
-- 确保使用 `--enable-profiling` 标志运行了测试
-- 检查 outputs/ 目录是否存在并包含性能分析数据
+### Error: cannot find l2_perf_records_*.json file
 
-### 警告：Kernel entry missing 'func_id' or 'name'
-- 检查 kernel_config.py 文件格式
-- 确保所有 KERNELS 条目都有 'func_id' 和 'name' 字段
+- Make sure the test was run with the `--enable-l2-swimlane` flag
+- Check that the outputs/ directory exists and contains profiling data
 
-### 错误：Unsupported version
-- 工具仅支持版本 1 的性能分析数据格式
-- 使用最新的 runtime 重新生成性能分析数据
+### Warning: Kernel entry missing 'func_id' or 'name'
 
-### 错误：Perf JSON missing required fields for scheduler overhead analysis
-- 该错误表示输入的 `perf_swimlane_*.json` 缺少 deep-dive 分析需要的字段（通常是 `dispatch_time_us` / `finish_time_us`）
-- `swimlane_converter.py` 的基础转换可继续成功，但 deep-dive 会跳过或失败
-- 处理路径：
-  1. 使用 `--enable-profiling` 重新跑一次，生成新的 `outputs/perf_swimlane_*.json`
-  2. 重新执行 `swimlane_converter.py` 或 `sched_overhead_analysis.py`
-  3. 检查 JSON 中每个 task 是否包含 `dispatch_time_us` 和 `finish_time_us`
+- Check the kernel_config.py file format
+- Make sure every KERNELS entry has a 'func_id' and 'name' field
 
-### benchmark_rounds.sh 无 timing 数据
-- 确保运行时启用了 profiling（`PTO2_PROFILING` 环境变量）
-- 检查 device log 目录是否可访问
-- 确认 log 中包含 `orch_start` / `orch_end` / `sched_end` 时间戳行（需要 `PTO2_PROFILING=1`）
+### Error: Unsupported version
 
-### Mermaid 图在 GitHub 上不显示
-- 确保文件是 `.md` 扩展名
-- 检查 Mermaid 语法是否正确
-- GitHub 有时需要刷新才能渲染 Mermaid 图
+- The tools only support version 1 of the profiling data format
+- Regenerate the profiling data with the latest runtime
 
----
+### Error: Perf JSON missing required fields for scheduler overhead analysis
 
-## 输出文件说明
+- This error means the input `l2_perf_records_*.json` lacks fields required by the deep-dive analysis (typically `dispatch_time_us` / `finish_time_us`)
+- The basic conversion in `swimlane_converter.py` can still succeed, but the deep-dive will be skipped or fail
+- Remediation:
+  1. Re-run with `--enable-l2-swimlane` to produce a new `outputs/l2_perf_records_*.json`
+  2. Re-run `swimlane_converter.py` or `sched_overhead_analysis.py`
+  3. Verify that each task in the JSON contains `dispatch_time_us` and `finish_time_us`
 
-| 文件 | 工具 | 用途 | 格式 |
-|------|------|------|------|
-| `perf_swimlane_*.json` | Runtime | 原始性能分析数据 | JSON |
-| `merged_swimlane_*.json` | swimlane_converter.py | Perfetto 可视化 | Chrome Trace Event JSON |
-| `mermaid_diagram_*.md` | perf_to_mermaid.py | 依赖关系图 | Markdown + Mermaid |
+### benchmark_rounds.sh has no timing data
+
+- Make sure profiling is enabled at runtime (`PTO2_PROFILING` environment variable)
+- Check that the device log directory is accessible
+- Confirm the log contains `orch_start` / `orch_end` / `sched_end` timestamp lines (requires `PTO2_PROFILING=1`)
+
+### Mermaid diagram does not render on GitHub
+
+- Make sure the file has the `.md` extension
+- Check that the Mermaid syntax is correct
+- GitHub sometimes needs a refresh before rendering Mermaid diagrams
 
 ---
 
-## 相关资源
+## Output File Reference
+
+| File | Tool | Purpose | Format |
+| ---- | ---- | ------- | ------ |
+| `l2_perf_records_*.json` | Runtime | Raw profiling data | JSON |
+| `merged_swimlane_*.json` | swimlane_converter.py | Perfetto visualization | Chrome Trace Event JSON |
+| `mermaid_diagram_*.md` | perf_to_mermaid.py | Dependency graph | Markdown + Mermaid |
+
+---
+
+## Related Resources
 
 - [Perfetto Trace Viewer](https://ui.perfetto.dev/)
 - [Mermaid Live Editor](https://mermaid.live/)
-- [Mermaid 文档](https://mermaid.js.org/)
+- [Mermaid documentation](https://mermaid.js.org/)

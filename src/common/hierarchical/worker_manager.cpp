@@ -168,12 +168,12 @@ void WorkerThread::dispatch_process(TaskSlotState &s, int32_t group_index) {
     // Write config fields individually to avoid struct-layout portability issues.
     int32_t block_dim = s.config.block_dim;
     int32_t aicpu_tn = s.config.aicpu_thread_num;
-    int32_t profiling = s.config.enable_profiling ? 1 : 0;
+    int32_t perf = s.config.enable_l2_swimlane ? 1 : 0;
     int32_t dump_tensor = s.config.enable_dump_tensor ? 1 : 0;
     int32_t enable_pmu = s.config.enable_pmu;
     std::memcpy(mbox() + MAILBOX_OFF_BLOCK_DIM, &block_dim, sizeof(int32_t));
     std::memcpy(mbox() + MAILBOX_OFF_AICPU_THREAD_NUM, &aicpu_tn, sizeof(int32_t));
-    std::memcpy(mbox() + MAILBOX_OFF_ENABLE_PROFILING, &profiling, sizeof(int32_t));
+    std::memcpy(mbox() + MAILBOX_OFF_ENABLE_L2_SWIMLANE, &perf, sizeof(int32_t));
     std::memcpy(mbox() + MAILBOX_OFF_ENABLE_DUMP_TENSOR, &dump_tensor, sizeof(int32_t));
     std::memcpy(mbox() + MAILBOX_OFF_ENABLE_PMU, &enable_pmu, sizeof(int32_t));
 

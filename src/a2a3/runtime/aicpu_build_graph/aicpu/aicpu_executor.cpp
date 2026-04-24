@@ -35,11 +35,11 @@
 #include "pto_shared_memory.h"
 
 // Performance profiling headers
-#include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 #include "common/memory_barrier.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/unified_log.h"
 
 // Register-based communication
@@ -301,7 +301,7 @@ struct AicpuExecutor {
         int32_t &deferred_release_count, PTO2LocalReadyBuffer *local_bufs
 #if PTO2_PROFILING
         ,
-        bool profiling_enabled, uint32_t &phase_complete_count
+        bool l2_perf_enabled, uint32_t &phase_complete_count
 #endif
 #if PTO2_SCHED_PROFILING
         ,
@@ -320,7 +320,7 @@ struct AicpuExecutor {
             int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
             bool done = reg_task_id == expected_reg_task_id && reg_state == TASK_FIN_STATE;
 #if PTO2_SCHED_PROFILING
-            if (profiling_enabled) {
+            if (l2_perf_enabled) {
                 complete_probe_count++;
                 if (done) {
                     complete_hit_count++;
@@ -374,13 +374,13 @@ struct AicpuExecutor {
                 ct.move_running_to_idle(i);
                 core_idle_[core_id] = true;
 #if PTO2_PROFILING
-                if (profiling_enabled) {
+                if (l2_perf_enabled) {
 #if PTO2_SCHED_PROFILING
                     uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
                     Handshake *h = &hank[core_id];
                     uint64_t finish_ts = get_sys_cnt_aicpu();
-                    PerfBuffer *perf_buf = reinterpret_cast<PerfBuffer *>(h->perf_records_addr);
+                    L2PerfBuffer *l2_perf_buf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
 
                     // Pre-extract fanout (platform layer cannot depend on PTO2DepListEntry)
                     uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
@@ -392,13 +392,13 @@ struct AicpuExecutor {
                     }
 
                     int32_t perf_slot_idx = static_cast<int32_t>(executing_subslot_by_core_[core_id]);
-                    if (perf_aicpu_complete_record(
-                            perf_buf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
+                    if (l2_perf_aicpu_complete_record(
+                            l2_perf_buf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
                             slot_state.task->kernel_id[perf_slot_idx], CT, dispatch_timestamps_[core_id], finish_ts,
                             fanout_arr, fanout_n
                         ) != 0) {
                         DEV_ERROR(
-                            "Core %d: perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
+                            "Core %d: l2_perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
                             static_cast<uint64_t>(slot_state.task->task_id.raw)
                         );
                     }
@@ -530,7 +530,7 @@ struct AicpuExecutor {
         PTO2SubtaskSlot subslot
 #if PTO2_PROFILING
         ,
-        bool profiling_enabled
+        bool l2_perf_enabled
 #endif
 #if PTO2_PROFILING
         ,
@@ -547,10 +547,10 @@ struct AicpuExecutor {
         executing_subslot_by_core_[core_id] = subslot;
         executing_slot_state_by_core_[core_id] = &slot_state;
 #if PTO2_PROFILING
-        if (profiling_enabled) {
+        if (l2_perf_enabled) {
             dispatch_timestamps_[core_id] = get_sys_cnt_aicpu();
             if (core_dispatch_counts_[core_id] >= PLATFORM_PROF_BUFFER_SIZE) {
-                perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
+                l2_perf_aicpu_switch_buffer(runtime, core_id, thread_idx);
                 core_dispatch_counts_[core_id] = 0;
             }
             core_dispatch_counts_[core_id]++;
@@ -957,11 +957,11 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #if PTO2_PROFILING
         // Assign perf buffers to cores early so profiling captures all tasks
         // (total_tasks written to header later when orchestrator completes)
-        if (runtime->enable_profiling) {
-            perf_aicpu_init_profiling(runtime);
+        if (runtime->enable_l2_swimlane) {
+            l2_perf_aicpu_init_profiling(runtime);
             // Initialize phase profiling for scheduler threads + orchestrator threads
-            perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
-            perf_aicpu_set_orch_thread_idx(sched_thread_num_);
+            l2_perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
+            l2_perf_aicpu_set_orch_thread_idx(sched_thread_num_);
         }
 #endif
 #if PTO2_PROFILING
@@ -991,7 +991,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
 #if PTO2_PROFILING
-    bool profiling_enabled = runtime->enable_profiling;
+    bool l2_perf_enabled = runtime->enable_l2_swimlane;
 #endif
 
     // Scheduler profiling counters
@@ -1111,7 +1111,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                 deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                profiling_enabled, phase_complete_count
+                l2_perf_enabled, phase_complete_count
 #endif
 #if PTO2_SCHED_PROFILING
                 ,
@@ -1129,7 +1129,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                 deferred_release_slot_states, deferred_release_count, local_bufs
 #if PTO2_PROFILING
                 ,
-                profiling_enabled, phase_complete_count
+                l2_perf_enabled, phase_complete_count
 #endif
 #if PTO2_SCHED_PROFILING
                 ,
@@ -1161,8 +1161,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             CYCLE_COUNT_LAP(sched_idle_cycle);
         } else {
             CYCLE_COUNT_LAP(sched_complete_cycle);
-            if (profiling_enabled && phase_complete_count > 0) {
-                perf_aicpu_record_phase(
+            if (l2_perf_enabled && phase_complete_count > 0) {
+                l2_perf_aicpu_record_phase(
                     thread_idx, AicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, sched_loop_count, phase_complete_count
                 );
                 _t0_phase = _t1;
@@ -1209,7 +1209,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             runtime, tracker, c.aic_core_id, CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
                             ,
-                            profiling_enabled
+                            l2_perf_enabled
 #endif
 #if PTO2_PROFILING
                             ,
@@ -1223,7 +1223,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             runtime, tracker, aiv0, CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
                             ,
-                            profiling_enabled
+                            l2_perf_enabled
 #endif
 #if PTO2_PROFILING
                             ,
@@ -1236,7 +1236,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                             runtime, tracker, c.aiv_core_ids[1], CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
                             ,
-                            profiling_enabled
+                            l2_perf_enabled
 #endif
 #if PTO2_PROFILING
                             ,
@@ -1318,7 +1318,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                         runtime, tracker, c.aic_core_id, CoreType::AIC, *slot_state, PTO2SubtaskSlot::AIC
 #if PTO2_PROFILING
                         ,
-                        profiling_enabled
+                        l2_perf_enabled
 #endif
 #if PTO2_PROFILING
                         ,
@@ -1332,7 +1332,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                         runtime, tracker, aiv_id, CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV0
 #if PTO2_PROFILING
                         ,
-                        profiling_enabled
+                        l2_perf_enabled
 #endif
 #if PTO2_PROFILING
                         ,
@@ -1345,7 +1345,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                         runtime, tracker, c.aiv_core_ids[1], CoreType::AIV, *slot_state, PTO2SubtaskSlot::AIV1
 #if PTO2_PROFILING
                         ,
-                        profiling_enabled
+                        l2_perf_enabled
 #endif
 #if PTO2_PROFILING
                         ,
@@ -1369,8 +1369,8 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             CYCLE_COUNT_LAP(sched_idle_cycle);
         } else {
             CYCLE_COUNT_LAP(sched_dispatch_cycle);
-            if (profiling_enabled && phase_dispatch_count > 0) {
-                perf_aicpu_record_phase(
+            if (l2_perf_enabled && phase_dispatch_count > 0) {
+                l2_perf_aicpu_record_phase(
                     thread_idx, AicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, sched_loop_count, phase_dispatch_count
                 );
                 _t0_phase = _t1;
@@ -1527,8 +1527,10 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
             }
 #if PTO2_PROFILING
             CYCLE_COUNT_LAP(sched_idle_cycle);
-            if (profiling_enabled) {
-                perf_aicpu_record_phase(thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, sched_loop_count, 0);
+            if (l2_perf_enabled) {
+                l2_perf_aicpu_record_phase(
+                    thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, sched_loop_count, 0
+                );
                 _t0_phase = _t1;
             }
 #endif
@@ -1673,9 +1675,9 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 
 #if PTO2_PROFILING
     // Flush performance buffers for cores managed by this thread
-    if (profiling_enabled) {
-        perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
-        perf_aicpu_flush_phase_buffers(thread_idx);
+    if (l2_perf_enabled) {
+        l2_perf_aicpu_flush_buffers(runtime, thread_idx, core_assignments_[thread_idx], core_num);
+        l2_perf_aicpu_flush_phase_buffers(thread_idx);
     }
     if (get_enable_pmu()) {
         pmu_aicpu_flush_buffers(thread_idx, core_assignments_[thread_idx], core_num);
@@ -1848,7 +1850,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
 #if PTO2_PROFILING
-            rt->orchestrator.enable_profiling = runtime->enable_profiling;
+            rt->orchestrator.enable_l2_swimlane = runtime->enable_l2_swimlane;
 #endif
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
@@ -1869,8 +1871,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Each orchestrator thread sets its own phase buffer index (thread-local)
-            if (runtime->enable_profiling) {
-                perf_aicpu_set_orch_thread_idx(thread_idx);
+            if (runtime->enable_l2_swimlane) {
+                l2_perf_aicpu_set_orch_thread_idx(thread_idx);
             }
 #endif
 
@@ -1926,7 +1928,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Write orchestrator summary to shared memory for host-side export (only if profiling enabled)
-            if (runtime->enable_profiling) {
+            if (runtime->enable_l2_swimlane) {
                 AicpuOrchSummary orch_summary = {};
                 orch_summary.start_time = orch_cycle_start;
                 orch_summary.end_time = orch_cycle_end;
@@ -1939,20 +1941,20 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
                 orch_summary.fanin_cycle = p.fanin_cycle;
                 orch_summary.scope_end_cycle = p.scope_end_cycle;
                 orch_summary.submit_count = p.submit_count;
-                perf_aicpu_write_orch_summary(&orch_summary);
+                l2_perf_aicpu_write_orch_summary(&orch_summary);
             }
 #endif
 #endif
 
 #if PTO2_PROFILING
             // Write core-to-thread mapping (one-time, after orchestration)
-            if (runtime->enable_profiling) {
-                perf_aicpu_init_core_assignments(cores_total_num_);
+            if (runtime->enable_l2_swimlane) {
+                l2_perf_aicpu_init_core_assignments(cores_total_num_);
                 for (int32_t t = 0; t < sched_thread_num_; t++) {
-                    perf_aicpu_write_core_assignments_for_thread(t, core_assignments_[t], core_count_per_thread_[t]);
+                    l2_perf_aicpu_write_core_assignments_for_thread(t, core_assignments_[t], core_count_per_thread_[t]);
                 }
                 // Flush orchestrator's phase record buffer
-                perf_aicpu_flush_phase_buffers(thread_idx);
+                l2_perf_aicpu_flush_phase_buffers(thread_idx);
             }
 #endif
 
@@ -1974,8 +1976,8 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             );
 #endif
             total_tasks_ = pto2_task_count;
-            if (runtime->enable_profiling && pto2_task_count > 0) {
-                perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(pto2_task_count));
+            if (runtime->enable_l2_swimlane && pto2_task_count > 0) {
+                l2_perf_aicpu_update_total_tasks(runtime, static_cast<uint32_t>(pto2_task_count));
             }
             orchestrator_done_ = true;
             {

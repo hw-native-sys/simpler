@@ -89,8 +89,8 @@ constexpr int PLATFORM_MAX_CORES = PLATFORM_MAX_BLOCKDIM * PLATFORM_CORES_PER_BL
 
 /**
  * Performance buffer capacity per core
- * Maximum number of PerfRecord entries per PerfBuffer.
- * Each core gets one PerfBuffer; when full, AICPU silently stops recording.
+ * Maximum number of L2PerfRecord entries per L2PerfBuffer.
+ * Each core gets one L2PerfBuffer; when full, AICPU silently stops recording.
  */
 constexpr int PLATFORM_PROF_BUFFER_SIZE = 10000;
 
@@ -112,8 +112,11 @@ inline double cycles_to_us(uint64_t cycles) {
 }
 
 // Profiling-related runtime flags shared through AICPU-AICore handshake.
+// "Profiling" is the umbrella; each bit is a parallel diagnostics sub-feature.
 #define PROFILING_FLAG_NONE 0u
 #define PROFILING_FLAG_DUMP_TENSOR (1u << 0)
+#define PROFILING_FLAG_L2_SWIMLANE (1u << 1)
+#define PROFILING_FLAG_PMU (1u << 2)  // a5: reserved (no PMU support yet)
 #define GET_PROFILING_FLAG(flags, bit) ((((uint32_t)(flags)) & ((uint32_t)(bit))) != 0u)
 #define SET_PROFILING_FLAG(flags, bit) ((flags) |= (uint32_t)(bit))
 #define CLEAR_PROFILING_FLAG(flags, bit) ((flags) &= ~((uint32_t)(bit)))

@@ -10,26 +10,26 @@
  */
 
 /**
- * @file perf_profiling.h
+ * @file l2_perf_profiling.h
  * @brief Performance profiling data structures
  *
  * Architecture: Fixed header + per-core/thread buffer states + optional phase profiling region
  *
  * Memory layout (shared memory between Host and Device):
  * ┌─────────────────────────────────────────────────────────────┐
- * │ PerfDataHeader (fixed header)                               │
+ * │ L2PerfDataHeader (fixed header)                               │
  * │  - ReadyQueue (FIFO, capacity=PLATFORM_PROF_READYQUEUE_SIZE)│
  * │  - Metadata (num_cores, flags)                              │
  * ├─────────────────────────────────────────────────────────────┤
- * │ PerfBufferState[0] (Core 0)                                 │
+ * │ L2PerfBufferState[0] (Core 0)                                 │
  * │  - free_queue: SPSC queue of available buffer pointers      │
  * │  - current_buf_ptr, current_buf_seq                         │
  * ├─────────────────────────────────────────────────────────────┤
- * │ PerfBufferState[1] (Core 1)                                 │
+ * │ L2PerfBufferState[1] (Core 1)                                 │
  * ├─────────────────────────────────────────────────────────────┤
  * │ ...                                                         │
  * ├─────────────────────────────────────────────────────────────┤
- * │ PerfBufferState[num_cores-1]                                │
+ * │ L2PerfBufferState[num_cores-1]                                │
  * ├─────────────────────────────────────────────────────────────┤
  * │ AicpuPhaseHeader (optional, present when phase profiling)   │
  * │  - magic, num_sched_threads, records_per_thread             │
@@ -44,15 +44,15 @@
  * │ ...                                                         │
  * └─────────────────────────────────────────────────────────────┘
  *
- * Actual PerfBuffer / PhaseBuffer are allocated dynamically by Host
+ * Actual L2PerfBuffer / PhaseBuffer are allocated dynamically by Host
  * and pushed into the per-core/thread free_queue.
  *
- * Base size = sizeof(PerfDataHeader) + num_cores * sizeof(PerfBufferState)
+ * Base size = sizeof(L2PerfDataHeader) + num_cores * sizeof(L2PerfBufferState)
  * With phases = Base + sizeof(AicpuPhaseHeader) + num_threads * sizeof(PhaseBufferState)
  */
 
-#ifndef SRC_A2A3_PLATFORM_INCLUDE_COMMON_PERF_PROFILING_H_
-#define SRC_A2A3_PLATFORM_INCLUDE_COMMON_PERF_PROFILING_H_
+#ifndef SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_PERF_PROFILING_H_
+#define SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_PERF_PROFILING_H_
 
 #include <cstdint>
 #include <vector>
@@ -60,19 +60,19 @@
 #include "common/core_type.h"
 #include "common/platform_config.h"
 
-// Maximum number of successor tasks per PerfRecord (matches Task::fanout)
+// Maximum number of successor tasks per L2PerfRecord (matches Task::fanout)
 #ifndef RUNTIME_MAX_FANOUT
 #define RUNTIME_MAX_FANOUT 128
 #endif
 
 // =============================================================================
-// PerfRecord - Single Task Execution Record
+// L2PerfRecord - Single Task Execution Record
 // =============================================================================
 
 /**
  * Single task execution record
  */
-struct PerfRecord {
+struct L2PerfRecord {
     // Timing information (device clock timestamps)
     uint64_t start_time;  // Task start timestamp (get_sys_cnt)
     uint64_t end_time;    // Task end timestamp
@@ -95,10 +95,10 @@ struct PerfRecord {
     int32_t fanout_count;                 // Number of successor tasks
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(PerfRecord) % 64 == 0, "PerfRecord must be 64-byte aligned for optimal cache performance");
+static_assert(sizeof(L2PerfRecord) % 64 == 0, "L2PerfRecord must be 64-byte aligned for optimal cache performance");
 
 // =============================================================================
-// PerfBuffer - Fixed-Size Record Buffer with WIP Staging Slots
+// L2PerfBuffer - Fixed-Size Record Buffer with WIP Staging Slots
 // =============================================================================
 
 /**
@@ -110,14 +110,14 @@ static_assert(sizeof(PerfRecord) % 64 == 0, "PerfRecord must be 64-byte aligned 
  * WIP protocol: AICore writes timing to wip[reg_task_id & 1], AICPU copies
  * it into records[count] at completion. Dual-slot parity ensures no overlap.
  */
-struct PerfBuffer {
-    PerfRecord wip[2];                              // AICore WIP staging slots (index = reg_task_id & 1)
-    PerfRecord records[PLATFORM_PROF_BUFFER_SIZE];  // Committed records (AICPU writes)
-    volatile uint32_t count;                        // Current committed record count
+struct L2PerfBuffer {
+    L2PerfRecord wip[2];                              // AICore WIP staging slots (index = reg_task_id & 1)
+    L2PerfRecord records[PLATFORM_PROF_BUFFER_SIZE];  // Committed records (AICPU writes)
+    volatile uint32_t count;                          // Current committed record count
 } __attribute__((aligned(64)));
 
 // =============================================================================
-// PerfFreeQueue - SPSC Lock-Free Queue for Free Buffers
+// L2PerfFreeQueue - SPSC Lock-Free Queue for Free Buffers
 // =============================================================================
 
 /**
@@ -135,17 +135,17 @@ struct PerfBuffer {
  * - Device pop: rmb() → read tail → read buffer_ptrs[head % COUNT] → rmb() → write head → wmb()
  * - Host push: write buffer_ptrs[tail % COUNT] → wmb() → write tail → wmb()
  */
-struct PerfFreeQueue {
+struct L2PerfFreeQueue {
     volatile uint64_t buffer_ptrs[PLATFORM_PROF_SLOT_COUNT];  // Free buffer addresses
     volatile uint32_t head;                                   // Consumer read position (Device increments)
     volatile uint32_t tail;                                   // Producer write position (Host increments)
     uint32_t pad[13];                                         // Pad to 128 bytes (aligned to cache line)
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(PerfFreeQueue) == 128, "PerfFreeQueue must be 128 bytes for cache alignment");
+static_assert(sizeof(L2PerfFreeQueue) == 128, "L2PerfFreeQueue must be 128 bytes for cache alignment");
 
 // =============================================================================
-// PerfBufferState - Per-Core/Thread Buffer State (Unified for PerfRecord and Phase)
+// L2PerfBufferState - Per-Core/Thread Buffer State (Unified for L2PerfRecord and Phase)
 // =============================================================================
 
 /**
@@ -157,7 +157,7 @@ static_assert(sizeof(PerfFreeQueue) == 128, "PerfFreeQueue must be 128 bytes for
  * - current_buf_seq: Monotonic sequence number for ordering
  *
  * Used in two contexts:
- * - Per-core PerfRecord profiling (current_buf_ptr → PerfBuffer)
+ * - Per-core L2PerfRecord profiling (current_buf_ptr → L2PerfBuffer)
  * - Per-thread Phase profiling (current_buf_ptr → PhaseBuffer)
  *
  * Writers:
@@ -166,17 +166,17 @@ static_assert(sizeof(PerfFreeQueue) == 128, "PerfFreeQueue must be 128 bytes for
  * - current_buf_ptr: Device writes (after pop), Host reads (for flush/collect)
  * - current_buf_seq: Device writes (monotonic counter)
  */
-struct PerfBufferState {
-    PerfFreeQueue free_queue;           // SPSC queue of free buffer addresses
+struct L2PerfBufferState {
+    L2PerfFreeQueue free_queue;         // SPSC queue of free buffer addresses
     volatile uint64_t current_buf_ptr;  // Current active buffer (0 = none)
     volatile uint32_t current_buf_seq;  // Sequence number for ordering
     uint32_t pad[13];                   // Pad to 192 bytes (aligned to cache line)
 } __attribute__((aligned(64)));
 
-static_assert(sizeof(PerfBufferState) == 192, "PerfBufferState must be 192 bytes for cache alignment");
+static_assert(sizeof(L2PerfBufferState) == 192, "L2PerfBufferState must be 192 bytes for cache alignment");
 
 // Type alias for semantic clarity in Phase profiling context
-using PhaseBufferState = PerfBufferState;  // Per-thread Phase profiling
+using PhaseBufferState = L2PerfBufferState;  // Per-thread Phase profiling
 
 // =============================================================================
 // ReadyQueueEntry - Queue Entry for Ready Buffers
@@ -189,19 +189,19 @@ using PhaseBufferState = PerfBufferState;  // Per-thread Phase profiling
  * Host memory manager retrieves entries from the queue.
  *
  * Entry types (distinguished by is_phase flag):
- * - PerfRecord entry: core_index = core ID, is_phase = 0
+ * - L2PerfRecord entry: core_index = core ID, is_phase = 0
  * - Phase entry:      core_index = thread_idx, is_phase = 1
  */
 struct ReadyQueueEntry {
     uint32_t core_index;  // Core index (0 ~ num_cores-1), or thread_idx for phase entries
-    uint32_t is_phase;    // 0 = PerfRecord, 1 = Phase
+    uint32_t is_phase;    // 0 = L2PerfRecord, 1 = Phase
     uint64_t buffer_ptr;  // Device pointer to the full buffer
     uint32_t buffer_seq;  // Sequence number for ordering
     uint32_t pad;         // Alignment padding
 } __attribute__((aligned(32)));
 
 // =============================================================================
-// PerfDataHeader - Fixed Header
+// L2PerfDataHeader - Fixed Header
 // =============================================================================
 
 /**
@@ -220,7 +220,7 @@ struct ReadyQueueEntry {
  * - Queue empty: head == tail
  * - Queue full: (tail + 1) % capacity == head
  */
-struct PerfDataHeader {
+struct L2PerfDataHeader {
     // Per-thread ready queues (FIFO Circular Buffers)
     // Each AICPU thread has its own queue to avoid lock contention
     ReadyQueueEntry queues[PLATFORM_MAX_AICPU_THREADS][PLATFORM_PROF_READYQUEUE_SIZE];
@@ -305,7 +305,7 @@ constexpr uint32_t AICPU_PHASE_MAGIC = 0x41435048;        // "ACPH"
 constexpr int PLATFORM_PHASE_RECORDS_PER_THREAD = 16384;  // ~512KB per thread
 
 /**
- * Fixed-size phase record buffer (analogous to PerfBuffer)
+ * Fixed-size phase record buffer (analogous to L2PerfBuffer)
  *
  * Capacity: PLATFORM_PHASE_RECORDS_PER_THREAD
  * Allocated dynamically by Host, pushed into per-thread free_queue.
@@ -318,7 +318,7 @@ struct PhaseBuffer {
 /**
  * AICPU phase profiling header
  *
- * Located after the PerfBufferState array in shared memory.
+ * Located after the L2PerfBufferState array in shared memory.
  * Contains metadata and per-thread tracking.
  */
 struct AicpuPhaseHeader {
@@ -342,41 +342,41 @@ extern "C" {
  * Calculate total memory size for performance data (buffer states only, no buffers)
  *
  * Formula: Total size = Fixed header + Dynamic tail
- *                     = sizeof(PerfDataHeader) + num_cores × sizeof(PerfBufferState)
+ *                     = sizeof(L2PerfDataHeader) + num_cores × sizeof(L2PerfBufferState)
  *
  * @param num_cores Number of cores (block_dim × PLATFORM_CORES_PER_BLOCKDIM)
  * @return Total bytes for header + buffer states
  */
 inline size_t calc_perf_data_size(int num_cores) {
-    return sizeof(PerfDataHeader) + num_cores * sizeof(PerfBufferState);
+    return sizeof(L2PerfDataHeader) + num_cores * sizeof(L2PerfBufferState);
 }
 
 /**
  * Get header pointer
  *
  * @param base_ptr Shared memory base address (device_ptr or host_ptr)
- * @return PerfDataHeader pointer
+ * @return L2PerfDataHeader pointer
  */
-inline PerfDataHeader *get_perf_header(void *base_ptr) { return reinterpret_cast<PerfDataHeader *>(base_ptr); }
+inline L2PerfDataHeader *get_l2_perf_header(void *base_ptr) { return reinterpret_cast<L2PerfDataHeader *>(base_ptr); }
 
 /**
- * Get PerfBufferState array start address
+ * Get L2PerfBufferState array start address
  *
  * @param base_ptr Shared memory base address
- * @return PerfBufferState array pointer
+ * @return L2PerfBufferState array pointer
  */
-inline PerfBufferState *get_perf_buffer_states(void *base_ptr) {
-    return reinterpret_cast<PerfBufferState *>(reinterpret_cast<char *>(base_ptr) + sizeof(PerfDataHeader));
+inline L2PerfBufferState *get_perf_buffer_states(void *base_ptr) {
+    return reinterpret_cast<L2PerfBufferState *>(reinterpret_cast<char *>(base_ptr) + sizeof(L2PerfDataHeader));
 }
 
 /**
- * Get PerfBufferState for specified core
+ * Get L2PerfBufferState for specified core
  *
  * @param base_ptr Shared memory base address
  * @param core_index Core index (0 ~ num_cores-1)
- * @return PerfBufferState pointer
+ * @return L2PerfBufferState pointer
  */
-inline PerfBufferState *get_perf_buffer_state(void *base_ptr, int core_index) {
+inline L2PerfBufferState *get_perf_buffer_state(void *base_ptr, int core_index) {
     return &get_perf_buffer_states(base_ptr)[core_index];
 }
 
@@ -392,7 +392,7 @@ inline size_t calc_perf_data_size_with_phases(int num_cores, int num_sched_threa
 }
 
 /**
- * Get AicpuPhaseHeader pointer (located after PerfBufferState array)
+ * Get AicpuPhaseHeader pointer (located after L2PerfBufferState array)
  *
  * @param base_ptr Shared memory base address
  * @param num_cores Number of AICore instances
@@ -431,4 +431,4 @@ inline PhaseBufferState *get_phase_buffer_state(void *base_ptr, int num_cores, i
 }
 #endif
 
-#endif  // SRC_A2A3_PLATFORM_INCLUDE_COMMON_PERF_PROFILING_H_
+#endif  // SRC_A2A3_PLATFORM_INCLUDE_COMMON_L2_PERF_PROFILING_H_

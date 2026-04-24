@@ -10,9 +10,9 @@
  */
 
 #include "aicore/aicore.h"
-#include "aicore/performance_collector_aicore.h"
+#include "aicore/l2_perf_collector_aicore.h"
 #include "aicore/pmu_collector_aicore.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"  // Register-based communication
 #include "pto2_dispatch_payload.h"
 #include "runtime.h"
@@ -86,7 +86,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
     // Cache payload address (set once by AICPU during initialization, never changes)
     __gm__ PTO2DispatchPayload *payload = reinterpret_cast<__gm__ PTO2DispatchPayload *>(my_hank->task);
 
-    bool profiling_enabled = runtime->enable_profiling;
+    bool l2_perf_enabled = runtime->enable_l2_swimlane;
     bool dump_tensor_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     bool pmu_enabled = GET_PROFILING_FLAG(my_hank->enable_profiling_flag, PROFILING_FLAG_PMU);
 
@@ -137,10 +137,10 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             // Performance profiling: record task execution
             // (func_id and core_type are filled by AICPU at completion time)
-            if (profiling_enabled) {
+            if (l2_perf_enabled) {
                 uint64_t end_time = get_sys_cnt_aicore();
-                __gm__ PerfBuffer *perf_buf = (__gm__ PerfBuffer *)my_hank->perf_records_addr;
-                perf_aicore_record_task(perf_buf, task_id, start_time, end_time);
+                __gm__ L2PerfBuffer *l2_perf_buf = (__gm__ L2PerfBuffer *)my_hank->l2_perf_records_addr;
+                l2_perf_aicore_record_task(l2_perf_buf, task_id, start_time, end_time);
             }
 
             last_reg_val = reg_val;

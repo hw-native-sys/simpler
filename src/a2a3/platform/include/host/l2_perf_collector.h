@@ -10,20 +10,20 @@
  */
 
 /**
- * @file performance_collector.h
+ * @file l2_perf_collector.h
  * @brief Platform-agnostic performance data collector with dynamic memory management
  *
  * Architecture:
  * - ProfMemoryManager: Dedicated thread that polls ReadyQueue, allocates new
  *   device buffers, and replaces full buffers in slot arrays.
- * - PerformanceCollector: Main thread collects data from ProfMemoryManager's
+ * - L2PerfCollector: Main thread collects data from ProfMemoryManager's
  *   internal queue, copies records to host vectors, and exports results.
  *
  * Design Pattern: Dependency Injection via Callbacks for memory operations.
  */
 
-#ifndef SRC_A2A3_PLATFORM_INCLUDE_HOST_PERFORMANCE_COLLECTOR_H_
-#define SRC_A2A3_PLATFORM_INCLUDE_HOST_PERFORMANCE_COLLECTOR_H_
+#ifndef SRC_A2A3_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_
+#define SRC_A2A3_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_
 
 #include <atomic>
 #include <condition_variable>
@@ -35,7 +35,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "runtime.h"
 
@@ -45,7 +45,7 @@
  * @param size Memory size in bytes
  * @return Allocated device memory pointer, or nullptr on failure
  */
-using PerfAllocCallback = void *(*)(size_t size);
+using L2PerfAllocCallback = void *(*)(size_t size);
 
 /**
  * Memory registration callback (for Host-Device shared memory)
@@ -56,7 +56,7 @@ using PerfAllocCallback = void *(*)(size_t size);
  * @param[out] host_ptr Host-mapped pointer
  * @return 0 on success, error code on failure
  */
-using PerfRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
+using L2PerfRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, void **host_ptr);
 
 /**
  * Memory unregister callback
@@ -65,7 +65,7 @@ using PerfRegisterCallback = int (*)(void *dev_ptr, size_t size, int device_id, 
  * @param device_id Device ID
  * @return 0 on success, error code on failure
  */
-using PerfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
+using L2PerfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
 
 /**
  * Memory free callback
@@ -73,7 +73,7 @@ using PerfUnregisterCallback = int (*)(void *dev_ptr, int device_id);
  * @param dev_ptr Device memory pointer
  * @return 0 on success, error code on failure
  */
-using PerfFreeCallback = int (*)(void *dev_ptr);
+using L2PerfFreeCallback = int (*)(void *dev_ptr);
 
 /**
  * Thread factory callback for creating threads with device binding
@@ -134,14 +134,14 @@ public:
     ProfMemoryManager(const ProfMemoryManager &) = delete;
     ProfMemoryManager &operator=(const ProfMemoryManager &) = delete;
 
-    // Allow PerformanceCollector to register initial buffer mappings
-    friend class PerformanceCollector;
+    // Allow L2PerfCollector to register initial buffer mappings
+    friend class L2PerfCollector;
 
     /**
      * Start the memory management thread
      *
      * @param shared_mem_host Host-mapped shared memory base address
-     * @param num_cores Number of AICore instances (PerfBufferState count)
+     * @param num_cores Number of AICore instances (L2PerfBufferState count)
      * @param num_phase_threads Number of phase profiling threads (PhaseBufferState count)
      * @param alloc_cb Device memory allocation callback
      * @param register_cb Host-device mapping callback (nullptr for simulation)
@@ -150,8 +150,8 @@ public:
      * @param thread_factory Thread factory for creating device-bound threads (empty to use std::thread)
      */
     void start(
-        void *shared_mem_host, int num_cores, int num_phase_threads, PerfAllocCallback alloc_cb,
-        PerfRegisterCallback register_cb, PerfFreeCallback free_cb, int device_id,
+        void *shared_mem_host, int num_cores, int num_phase_threads, L2PerfAllocCallback alloc_cb,
+        L2PerfRegisterCallback register_cb, L2PerfFreeCallback free_cb, int device_id,
         const ThreadFactory &thread_factory = {}
     );
 
@@ -200,9 +200,9 @@ private:
     int num_phase_threads_{0};
 
     // Callbacks
-    PerfAllocCallback alloc_cb_{nullptr};
-    PerfRegisterCallback register_cb_{nullptr};
-    PerfFreeCallback free_cb_{nullptr};
+    L2PerfAllocCallback alloc_cb_{nullptr};
+    L2PerfRegisterCallback register_cb_{nullptr};
+    L2PerfFreeCallback free_cb_{nullptr};
     int device_id_{-1};
 
     // Management thread → main thread (ready buffers)
@@ -237,11 +237,11 @@ private:
     void register_mapping(void *dev_ptr, void *host_ptr);
 
     // Process one ReadyQueue entry
-    void process_ready_entry(PerfDataHeader *header, int thread_idx, const ReadyQueueEntry &entry);
+    void process_ready_entry(L2PerfDataHeader *header, int thread_idx, const ReadyQueueEntry &entry);
 };
 
 // =============================================================================
-// PerformanceCollector - Main Collector
+// L2PerfCollector - Main Collector
 // =============================================================================
 
 /**
@@ -255,14 +255,14 @@ private:
  *
  * Platform-agnostic: Memory management delegated to callbacks
  */
-class PerformanceCollector {
+class L2PerfCollector {
 public:
-    PerformanceCollector() = default;
-    ~PerformanceCollector();
+    L2PerfCollector() = default;
+    ~L2PerfCollector();
 
     // Disable copy and move
-    PerformanceCollector(const PerformanceCollector &) = delete;
-    PerformanceCollector &operator=(const PerformanceCollector &) = delete;
+    L2PerfCollector(const L2PerfCollector &) = delete;
+    L2PerfCollector &operator=(const L2PerfCollector &) = delete;
 
     /**
      * Initialize performance profiling
@@ -279,8 +279,8 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(
-        Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfRegisterCallback register_cb,
-        PerfFreeCallback free_cb
+        Runtime &runtime, int num_aicore, int device_id, L2PerfAllocCallback alloc_cb,
+        L2PerfRegisterCallback register_cb, L2PerfFreeCallback free_cb
     );
 
     /**
@@ -325,7 +325,7 @@ public:
      * @param free_cb Memory free callback
      * @return 0 on success, error code on failure
      */
-    int finalize(PerfUnregisterCallback unregister_cb, PerfFreeCallback free_cb);
+    int finalize(L2PerfUnregisterCallback unregister_cb, L2PerfFreeCallback free_cb);
 
     /**
      * Check if collector is initialized
@@ -352,7 +352,7 @@ public:
     void collect_phase_data();
 
     /**
-     * Scan PerfBufferState::current_buf_ptr for all cores to recover
+     * Scan L2PerfBufferState::current_buf_ptr for all cores to recover
      * partial records not delivered through the pipeline.
      *
      * Must be called after device execution completes and after
@@ -370,7 +370,7 @@ public:
     /**
      * Get collected records (for testing)
      */
-    const std::vector<std::vector<PerfRecord>> &get_records() const { return collected_perf_records_; }
+    const std::vector<std::vector<L2PerfRecord>> &get_records() const { return collected_perf_records_; }
 
 private:
     // Shared memory pointers
@@ -383,15 +383,15 @@ private:
     int num_aicore_{0};
 
     // Callbacks (stored for memory manager)
-    PerfAllocCallback alloc_cb_{nullptr};
-    PerfRegisterCallback register_cb_{nullptr};
-    PerfFreeCallback free_cb_{nullptr};
+    L2PerfAllocCallback alloc_cb_{nullptr};
+    L2PerfRegisterCallback register_cb_{nullptr};
+    L2PerfFreeCallback free_cb_{nullptr};
 
     // Memory manager
     ProfMemoryManager memory_manager_;
 
     // Collected data (per-core vectors, indexed by core_index)
-    std::vector<std::vector<PerfRecord>> collected_perf_records_;
+    std::vector<std::vector<L2PerfRecord>> collected_perf_records_;
 
     // AICPU phase profiling data (per-thread, mixed sched + orch records)
     std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
@@ -404,8 +404,8 @@ private:
     // Signal from device_runner that execution is complete
     std::atomic<bool> execution_complete_{false};
 
-    // Allocate a single buffer (PerfBuffer or PhaseBuffer) and register it
+    // Allocate a single buffer (L2PerfBuffer or PhaseBuffer) and register it
     void *alloc_single_buffer(size_t size, void **host_ptr_out);
 };
 
-#endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_PERFORMANCE_COLLECTOR_H_
+#endif  // SRC_A2A3_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_

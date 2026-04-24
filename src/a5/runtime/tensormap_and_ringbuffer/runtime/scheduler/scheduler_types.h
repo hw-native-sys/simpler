@@ -333,8 +333,8 @@ struct SlotTransition {
 // =============================================================================
 
 #if PTO2_PROFILING
-struct alignas(64) SchedProfilingCounters {
-    bool profiling_enabled{false};
+struct alignas(64) SchedL2PerfCounters {
+    bool l2_perf_enabled{false};
     uint64_t sched_start_ts{0};
     uint64_t sched_scan_cycle{0};
     uint64_t sched_complete_cycle{0};
@@ -361,7 +361,7 @@ struct alignas(64) SchedProfilingCounters {
     uint64_t sched_dispatch_pop_cycle{0};
     uint64_t sched_dispatch_setup_cycle{0};
 #endif
-    void reset() { *this = SchedProfilingCounters{}; }
+    void reset() { *this = SchedL2PerfCounters{}; }
 };
 #endif
 

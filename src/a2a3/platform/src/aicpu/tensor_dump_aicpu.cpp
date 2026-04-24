@@ -13,7 +13,7 @@
  * @file tensor_dump_aicpu.cpp
  * @brief AICPU tensor dump collection implementation
  *
- * Mirrors performance_collector_aicpu.cpp patterns:
+ * Mirrors l2_perf_collector_aicpu.cpp patterns:
  * - Per-thread DumpBufferState with SPSC free queues
  * - Per-thread ready queue for handing off full metadata buffers
  * - Per-thread circular arena for tensor payload data

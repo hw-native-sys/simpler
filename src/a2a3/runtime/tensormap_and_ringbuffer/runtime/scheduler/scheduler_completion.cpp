@@ -13,13 +13,13 @@
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
 // Performance profiling headers
-#include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 
@@ -71,7 +71,7 @@ void SchedulerContext::complete_slot_task(
 #endif
 ) {
 #if PTO2_PROFILING
-    auto &perf = sched_perf_[thread_idx];
+    auto &l2_perf = sched_l2_perf_[thread_idx];
 #else
     (void)hank;
 #endif
@@ -92,14 +92,14 @@ void SchedulerContext::complete_slot_task(
 #endif
 #if PTO2_SCHED_PROFILING
         PTO2CompletionStats cstats = sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
-        perf.notify_edges_total += cstats.fanout_edges;
-        if (cstats.fanout_edges > perf.notify_max_degree) perf.notify_max_degree = cstats.fanout_edges;
-        perf.notify_tasks_enqueued += cstats.tasks_enqueued;
-        perf.phase_complete_count++;
+        l2_perf.notify_edges_total += cstats.fanout_edges;
+        if (cstats.fanout_edges > l2_perf.notify_max_degree) l2_perf.notify_max_degree = cstats.fanout_edges;
+        l2_perf.notify_tasks_enqueued += cstats.tasks_enqueued;
+        l2_perf.phase_complete_count++;
 #else
         sched_->on_mixed_task_complete(slot_state, local_bufs);
 #if PTO2_PROFILING
-        perf.phase_complete_count++;
+        l2_perf.phase_complete_count++;
 #endif
 #endif
         if (deferred_release_count < 256) {
@@ -110,8 +110,8 @@ void SchedulerContext::complete_slot_task(
 #if PTO2_SCHED_PROFILING
                 int32_t fe =
                     sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-                perf.fanin_edges_total += fe;
-                if (fe > perf.fanin_max_degree) perf.fanin_max_degree = fe;
+                l2_perf.fanin_edges_total += fe;
+                if (fe > l2_perf.fanin_max_degree) l2_perf.fanin_max_degree = fe;
 #else
                 sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
@@ -122,13 +122,13 @@ void SchedulerContext::complete_slot_task(
     }
 
 #if PTO2_PROFILING
-    if (perf.profiling_enabled) {
+    if (l2_perf.l2_perf_enabled) {
 #if PTO2_SCHED_PROFILING
         uint64_t t_perf_start = get_sys_cnt_aicpu();
 #endif
         Handshake *h = &hank[core_id];
         uint64_t finish_ts = get_sys_cnt_aicpu();
-        PerfBuffer *pbuf = reinterpret_cast<PerfBuffer *>(h->perf_records_addr);
+        L2PerfBuffer *pbuf = reinterpret_cast<L2PerfBuffer *>(h->l2_perf_records_addr);
 
         uint64_t fanout_arr[RUNTIME_MAX_FANOUT];
         int32_t fanout_n = 0;
@@ -139,18 +139,18 @@ void SchedulerContext::complete_slot_task(
         }
 
         int32_t perf_slot_idx = static_cast<int32_t>(subslot);
-        if (perf_aicpu_complete_record(
+        if (l2_perf_aicpu_complete_record(
                 pbuf, static_cast<uint32_t>(expected_reg_task_id), slot_state.task->task_id.raw,
                 slot_state.task->kernel_id[perf_slot_idx], hank[core_id].core_type, dispatch_ts, finish_ts, fanout_arr,
                 fanout_n
             ) != 0) {
             DEV_ERROR(
-                "Core %d: perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
+                "Core %d: l2_perf_aicpu_complete_record failed for task 0x%" PRIx64, core_id,
                 static_cast<uint64_t>(slot_state.task->task_id.raw)
             );
         }
 #if PTO2_SCHED_PROFILING
-        perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
+        l2_perf.sched_complete_perf_cycle += (get_sys_cnt_aicpu() - t_perf_start);
 #endif
     }
 #endif
@@ -189,7 +189,7 @@ void SchedulerContext::check_running_cores_for_completion(
     PTO2LocalReadyBuffer *local_bufs
 ) {
 #if PTO2_SCHED_PROFILING
-    auto &perf = sched_perf_[thread_idx];
+    auto &l2_perf = sched_l2_perf_[thread_idx];
 #endif
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto running_core_states = tracker.get_all_running_cores();
@@ -204,8 +204,8 @@ void SchedulerContext::check_running_cores_for_completion(
         int32_t reg_state = EXTRACT_TASK_STATE(reg_val);
 
 #if PTO2_SCHED_PROFILING
-        if (perf.profiling_enabled) {
-            perf.complete_probe_count++;
+        if (l2_perf.l2_perf_enabled) {
+            l2_perf.complete_probe_count++;
         }
 #endif
 
@@ -214,8 +214,8 @@ void SchedulerContext::check_running_cores_for_completion(
         if (!t.matched) continue;
 
 #if PTO2_SCHED_PROFILING
-        if (perf.profiling_enabled && (t.running_done || t.pending_done)) {
-            perf.complete_hit_count++;
+        if (l2_perf.l2_perf_enabled && (t.running_done || t.pending_done)) {
+            l2_perf.complete_hit_count++;
         }
 #endif
 

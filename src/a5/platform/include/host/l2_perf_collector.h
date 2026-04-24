@@ -10,18 +10,18 @@
  */
 
 /**
- * @file performance_collector.h
+ * @file l2_perf_collector.h
  * @brief Host-side performance data collector (memcpy-based)
  *
  * Design:
- *   1. Host pre-allocates one PerfBuffer per core and one PhaseBuffer per
- *      AICPU thread on device, plus a single PerfSetupHeader that stores
+ *   1. Host pre-allocates one L2PerfBuffer per core and one PhaseBuffer per
+ *      AICPU thread on device, plus a single L2PerfSetupHeader that stores
  *      all buffer pointers, total_tasks, and the AicpuPhaseHeader.
- *   2. During execution, AICore writes timing into PerfBuffers and AICPU
+ *   2. During execution, AICore writes timing into L2PerfBuffers and AICPU
  *      completes records + writes phase data directly into device memory.
  *      When a buffer fills up, records are silently dropped (AICPU-side
  *      early return).
- *   3. After stream sync, Host copies PerfSetupHeader, each PerfBuffer, and
+ *   3. After stream sync, Host copies L2PerfSetupHeader, each L2PerfBuffer, and
  *      each PhaseBuffer back via rtMemcpy (two-step: 64B header → read
  *      count → copy count*sizeof(record) actual data).
  *
@@ -29,14 +29,14 @@
  * depended on halHostRegister, which A5 hardware does not support.
  */
 
-#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_PERFORMANCE_COLLECTOR_H_
-#define SRC_A5_PLATFORM_INCLUDE_HOST_PERFORMANCE_COLLECTOR_H_
+#ifndef SRC_A5_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_
+#define SRC_A5_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_
 
 #include <cstddef>
 #include <string>
 #include <vector>
 
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "runtime.h"
 
@@ -46,7 +46,7 @@
  * @param size      Memory size in bytes
  * @return Allocated device memory pointer, or nullptr on failure
  */
-using PerfAllocCallback = void *(*)(size_t size);
+using L2PerfAllocCallback = void *(*)(size_t size);
 
 /**
  * Device memory free callback.
@@ -54,7 +54,7 @@ using PerfAllocCallback = void *(*)(size_t size);
  * @param dev_ptr   Device memory pointer
  * @return 0 on success, error code on failure
  */
-using PerfFreeCallback = int (*)(void *dev_ptr);
+using L2PerfFreeCallback = int (*)(void *dev_ptr);
 
 /**
  * Host -> Device copy callback (rtMemcpy HOST_TO_DEVICE / memcpy in sim).
@@ -64,7 +64,7 @@ using PerfFreeCallback = int (*)(void *dev_ptr);
  * @param size      Number of bytes to copy
  * @return 0 on success, error code on failure
  */
-using PerfCopyToDeviceCallback = int (*)(void *dev_dst, const void *host_src, size_t size);
+using L2PerfCopyToDeviceCallback = int (*)(void *dev_dst, const void *host_src, size_t size);
 
 /**
  * Device -> Host copy callback (rtMemcpy DEVICE_TO_HOST / memcpy in sim).
@@ -74,34 +74,34 @@ using PerfCopyToDeviceCallback = int (*)(void *dev_dst, const void *host_src, si
  * @param size      Number of bytes to copy
  * @return 0 on success, error code on failure
  */
-using PerfCopyFromDeviceCallback = int (*)(void *host_dst, const void *dev_src, size_t size);
+using L2PerfCopyFromDeviceCallback = int (*)(void *host_dst, const void *dev_src, size_t size);
 
 /**
  * Host-side performance data collector.
  *
  * Lifecycle:
- *   1. initialize() — allocate PerfSetupHeader and all per-core/per-thread
- *      buffers on device, publish pointers into runtime.perf_data_base
+ *   1. initialize() — allocate L2PerfSetupHeader and all per-core/per-thread
+ *      buffers on device, publish pointers into runtime.l2_perf_data_base
  *   2. (AICore/AICPU run, writing directly into device buffers)
- *   3. collect_all() — after stream sync, copy PerfSetupHeader back,
- *      then copy each PerfBuffer / PhaseBuffer back using two-step
+ *   3. collect_all() — after stream sync, copy L2PerfSetupHeader back,
+ *      then copy each L2PerfBuffer / PhaseBuffer back using two-step
  *      count-first memcpy. Fills collected_*_records_ vectors.
  *   4. export_swimlane_json() — serialize collected data to Chrome Trace
  *      Event Format JSON. Logic unchanged from previous design.
  *   5. finalize() — free all device buffers.
  */
-class PerformanceCollector {
+class L2PerfCollector {
 public:
-    PerformanceCollector() = default;
-    ~PerformanceCollector();
+    L2PerfCollector() = default;
+    ~L2PerfCollector();
 
-    PerformanceCollector(const PerformanceCollector &) = delete;
-    PerformanceCollector &operator=(const PerformanceCollector &) = delete;
+    L2PerfCollector(const L2PerfCollector &) = delete;
+    L2PerfCollector &operator=(const L2PerfCollector &) = delete;
 
     /**
-     * Allocate device buffers and publish PerfSetupHeader.
+     * Allocate device buffers and publish L2PerfSetupHeader.
      *
-     * @param runtime          Runtime to configure (sets runtime.perf_data_base)
+     * @param runtime          Runtime to configure (sets runtime.l2_perf_data_base)
      * @param num_aicore       Number of AICore instances to profile
      * @param device_id        Device ID (stored for later callbacks)
      * @param alloc_cb         Device memory alloc
@@ -111,8 +111,8 @@ public:
      * @return 0 on success, error code on failure
      */
     int initialize(
-        Runtime &runtime, int num_aicore, int device_id, PerfAllocCallback alloc_cb, PerfFreeCallback free_cb,
-        PerfCopyToDeviceCallback copy_to_dev_cb, PerfCopyFromDeviceCallback copy_from_dev_cb
+        Runtime &runtime, int num_aicore, int device_id, L2PerfAllocCallback alloc_cb, L2PerfFreeCallback free_cb,
+        L2PerfCopyToDeviceCallback copy_to_dev_cb, L2PerfCopyFromDeviceCallback copy_from_dev_cb
     );
 
     /**
@@ -149,7 +149,7 @@ public:
     /**
      * Accessor used by tests.
      */
-    const std::vector<std::vector<PerfRecord>> &get_records() const { return collected_perf_records_; }
+    const std::vector<std::vector<L2PerfRecord>> &get_records() const { return collected_perf_records_; }
 
 private:
     // Device-side allocations
@@ -163,17 +163,17 @@ private:
     int device_id_{-1};
 
     // Sizes (computed once in initialize)
-    size_t perf_buffer_bytes_{0};
+    size_t l2_perf_buffer_bytes_{0};
     size_t phase_buffer_bytes_{0};
 
     // Callbacks
-    PerfAllocCallback alloc_cb_{nullptr};
-    PerfFreeCallback free_cb_{nullptr};
-    PerfCopyToDeviceCallback copy_to_dev_cb_{nullptr};
-    PerfCopyFromDeviceCallback copy_from_dev_cb_{nullptr};
+    L2PerfAllocCallback alloc_cb_{nullptr};
+    L2PerfFreeCallback free_cb_{nullptr};
+    L2PerfCopyToDeviceCallback copy_to_dev_cb_{nullptr};
+    L2PerfCopyFromDeviceCallback copy_from_dev_cb_{nullptr};
 
     // Host-side collected data (indexed by core / thread)
-    std::vector<std::vector<PerfRecord>> collected_perf_records_;
+    std::vector<std::vector<L2PerfRecord>> collected_perf_records_;
     std::vector<std::vector<AicpuPhaseRecord>> collected_phase_records_;
     AicpuOrchSummary collected_orch_summary_{};
     bool has_phase_data_{false};
@@ -182,4 +182,4 @@ private:
     std::vector<int8_t> core_to_thread_;
 };
 
-#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_PERFORMANCE_COLLECTOR_H_
+#endif  // SRC_A5_PLATFORM_INCLUDE_HOST_L2_PERF_COLLECTOR_H_

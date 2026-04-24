@@ -68,8 +68,8 @@ struct PTO2OrchestratorState {
     // In real mode, they communicate via shared memory only
     PTO2SchedulerState *scheduler;  // For simulated mode only
 #if PTO2_PROFILING
-    // Runtime profiling switch copied from Runtime::enable_profiling.
-    bool enable_profiling;
+    // Runtime profiling switch copied from Runtime::enable_l2_swimlane.
+    bool enable_l2_swimlane;
 #endif
 
     // === GM HEAP (for output buffers) ===

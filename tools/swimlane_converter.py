@@ -14,11 +14,11 @@ Converts performance data JSON (.json) to Chrome Trace Event Format JSON
 for visualization in Perfetto (https://ui.perfetto.dev/).
 
 Usage:
-    python3 swimlane_converter.py  # Uses latest perf_swimlane_*.json in outputs/
-    python3 swimlane_converter.py perf_swimlane_20260210_143526.json
-    python3 swimlane_converter.py perf_swimlane_20260210_143526.json -o custom_output.json
-    python3 swimlane_converter.py perf_swimlane_20260210_143526.json -k kernel_config.py
-    python3 swimlane_converter.py perf_swimlane_20260210_143526.json -v
+    python3 swimlane_converter.py  # Uses latest l2_perf_records_*.json in outputs/
+    python3 swimlane_converter.py l2_perf_records_20260210_143526.json
+    python3 swimlane_converter.py l2_perf_records_20260210_143526.json -o custom_output.json
+    python3 swimlane_converter.py l2_perf_records_20260210_143526.json -k kernel_config.py
+    python3 swimlane_converter.py l2_perf_records_20260210_143526.json -v
 """
 
 import argparse
@@ -1123,17 +1123,17 @@ def _build_parser():
         epilog="""
 Examples:
   %(prog)s                                       # Use latest .json in outputs/, output to outputs/
-  %(prog)s perf_swimlane_20260210_143526.json   # Output: outputs/merged_swimlane_20260210_143526.json
-  %(prog)s perf_swimlane_20260210_143526.json -o custom_output.json
-  %(prog)s perf_swimlane_20260210_143526.json -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
-  %(prog)s perf_swimlane_20260210_143526.json -d 0
-  %(prog)s perf_swimlane_20260210_143526.json -v
+  %(prog)s l2_perf_records_20260210_143526.json   # Output: outputs/merged_swimlane_20260210_143526.json
+  %(prog)s l2_perf_records_20260210_143526.json -o custom_output.json
+  %(prog)s l2_perf_records_20260210_143526.json -k examples/host_build_graph/paged_attention/kernels/kernel_config.py
+  %(prog)s l2_perf_records_20260210_143526.json -d 0
+  %(prog)s l2_perf_records_20260210_143526.json -v
         """,
     )
     parser.add_argument(
         "input",
         nargs="?",
-        help="Input JSON file (.json). If not specified, uses the latest perf_swimlane_*.json in outputs/",
+        help="Input JSON file (.json). If not specified, uses the latest l2_perf_records_*.json in outputs/",
     )
     parser.add_argument("-o", "--output", help="Output JSON file (default: outputs/merged_swimlane_<timestamp>.json)")
     parser.add_argument(
@@ -1152,7 +1152,7 @@ Examples:
 
 
 def _resolve_input_path(args):
-    """Resolve input path, auto-selecting latest perf_swimlane_*.json if not specified."""
+    """Resolve input path, auto-selecting latest l2_perf_records_*.json if not specified."""
     if args.input is not None:
         input_path = Path(args.input)
         if not input_path.exists():
@@ -1161,9 +1161,9 @@ def _resolve_input_path(args):
         return input_path
 
     outputs_dir = Path(__file__).parent.parent / "outputs"
-    json_files = list(outputs_dir.glob("perf_swimlane_*.json"))
+    json_files = list(outputs_dir.glob("l2_perf_records_*.json"))
     if not json_files:
-        print(f"Error: No perf_swimlane_*.json files found in {outputs_dir}", file=sys.stderr)
+        print(f"Error: No l2_perf_records_*.json files found in {outputs_dir}", file=sys.stderr)
         print("Please specify an input file or ensure .json files exist in outputs/", file=sys.stderr)
         return None
 
@@ -1179,8 +1179,8 @@ def _resolve_output_path(args, input_path):
         return Path(args.output)
 
     input_stem = input_path.stem
-    if input_stem.startswith("perf_swimlane_"):
-        timestamp_part = input_stem[len("perf_swimlane_") :]
+    if input_stem.startswith("l2_perf_records_"):
+        timestamp_part = input_stem[len("l2_perf_records_") :]
     else:
         timestamp_part = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1287,7 +1287,7 @@ def main():
         resolved_device_log, log_strategy = resolve_device_log_path(
             device_id=args.device_id,
             device_log=args.device_log,
-            perf_path=input_path,
+            l2_perf_records_path=input_path,
         )
 
         generate_chrome_trace_json(

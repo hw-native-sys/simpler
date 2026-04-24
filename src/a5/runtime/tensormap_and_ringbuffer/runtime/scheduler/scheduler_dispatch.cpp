@@ -16,13 +16,13 @@
 #include "aicpu/device_time.h"
 #include "aicpu/platform_regs.h"
 #include "callable.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "runtime.h"
 #include "spin_hint.h"
 
 // Performance profiling headers
-#include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/tensor_dump_aicpu.h"
 
 // =============================================================================
@@ -59,18 +59,18 @@ int SchedulerContext::pop_ready_tasks_batch(
     PTO2ResourceShape shape, int32_t thread_idx, PTO2LocalReadyBuffer &local_buf, PTO2TaskSlotState **out, int max_count
 ) {
 #if PTO2_SCHED_PROFILING
-    auto &perf = sched_perf_[thread_idx];
+    auto &l2_perf = sched_l2_perf_[thread_idx];
     extern uint64_t g_sched_pop_atomic_count[], g_sched_pop_wait_cycle[];
     uint64_t t_pop_start = get_sys_cnt_aicpu();
     int count = sched_->get_ready_tasks_batch(
         shape, local_buf, out, max_count, g_sched_pop_atomic_count[thread_idx], g_sched_pop_wait_cycle[thread_idx],
-        perf.local_dispatch_count
+        l2_perf.local_dispatch_count
     );
-    perf.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
+    l2_perf.sched_dispatch_pop_cycle += (get_sys_cnt_aicpu() - t_pop_start);
     if (count > 0) {
-        perf.pop_hit += count;
+        l2_perf.pop_hit += count;
     } else {
-        perf.pop_miss++;
+        l2_perf.pop_miss++;
     }
 #else
     (void)thread_idx;
@@ -107,7 +107,7 @@ void SchedulerContext::dispatch_subtask_to_core(
     CoreTracker &tracker = core_trackers_[thread_idx];
     auto core_id = tracker.get_core_id_by_offset(core_offset);
 #if PTO2_PROFILING
-    auto &perf = sched_perf_[thread_idx];
+    auto &l2_perf = sched_l2_perf_[thread_idx];
     (void)runtime;
 #else
     (void)runtime;
@@ -132,7 +132,7 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.pending_slot_state = &slot_state;
         core_exec_state.pending_reg_task_id = static_cast<int32_t>(reg_task_id);
 #if PTO2_PROFILING
-        if (perf.profiling_enabled) {
+        if (l2_perf.l2_perf_enabled) {
             core_exec_state.pending_dispatch_timestamp = get_sys_cnt_aicpu();
         }
 #endif
@@ -141,7 +141,7 @@ void SchedulerContext::dispatch_subtask_to_core(
         core_exec_state.running_slot_state = &slot_state;
         core_exec_state.running_reg_task_id = static_cast<int32_t>(reg_task_id);
 #if PTO2_PROFILING
-        if (perf.profiling_enabled) {
+        if (l2_perf.l2_perf_enabled) {
             core_exec_state.running_dispatch_timestamp = get_sys_cnt_aicpu();
         }
 #endif
@@ -205,7 +205,7 @@ void SchedulerContext::dispatch_block(
         dispatch_subtask_to_core(runtime, thread_idx, core_offset, slot_state, PTO2SubtaskSlot::AIV0, to_pending);
     }
 #if PTO2_PROFILING
-    sched_perf_[thread_idx].phase_dispatch_count += __builtin_popcount(pto2_core_mask(slot_state.active_mask));
+    sched_l2_perf_[thread_idx].phase_dispatch_count += __builtin_popcount(pto2_core_mask(slot_state.active_mask));
 #endif
 }
 
@@ -214,7 +214,7 @@ void SchedulerContext::dispatch_shape(
     PTO2LocalReadyBuffer &local_buf, CoreTracker &tracker, bool &entered_drain, bool &made_progress, bool &try_pushed
 ) {
 #if PTO2_SCHED_PROFILING
-    auto &perf = sched_perf_[thread_idx];
+    auto &l2_perf = sched_l2_perf_[thread_idx];
 #endif
     if (entered_drain) return;
 
@@ -277,7 +277,7 @@ void SchedulerContext::dispatch_shape(
             }
             made_progress = true;
 #if PTO2_SCHED_PROFILING
-            perf.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
+            l2_perf.sched_dispatch_setup_cycle += (get_sys_cnt_aicpu() - t_setup_start);
 #endif
         }
 
@@ -319,10 +319,10 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         DEV_INFO("Thread %d: doing one-time init", thread_idx);
 
 #if PTO2_PROFILING
-        if (runtime->enable_profiling) {
-            perf_aicpu_init_profiling(runtime);
-            perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
-            perf_aicpu_set_orch_thread_idx(sched_thread_num_);
+        if (runtime->enable_l2_swimlane) {
+            l2_perf_aicpu_init_profiling(runtime);
+            l2_perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
+            l2_perf_aicpu_set_orch_thread_idx(sched_thread_num_);
         }
 #endif
 #if PTO2_PROFILING
@@ -344,9 +344,9 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
 #if PTO2_PROFILING
-    auto &perf = sched_perf_[thread_idx];
-    perf.reset();
-    perf.profiling_enabled = runtime->enable_profiling;
+    auto &l2_perf = sched_l2_perf_[thread_idx];
+    l2_perf.reset();
+    l2_perf.l2_perf_enabled = runtime->enable_l2_swimlane;
 #endif
 
     constexpr int LOCAL_READY_CAP_PER_TYPE = 64;
@@ -361,14 +361,14 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     bool cores_released = false;
 
 #if PTO2_PROFILING
-    perf.sched_start_ts = get_sys_cnt_aicpu();
+    l2_perf.sched_start_ts = get_sys_cnt_aicpu();
 #endif
 
     while (true) {
         bool made_progress = false;
 #if PTO2_PROFILING
         CYCLE_COUNT_START();
-        perf.sched_loop_count++;
+        l2_perf.sched_loop_count++;
         uint64_t _t0_phase = _t0;
 #endif
         int32_t task_count = 0;
@@ -383,7 +383,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 
 #if PTO2_PROFILING
-        CYCLE_COUNT_LAP(perf.sched_idle_cycle);
+        CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
 #endif
 
         // Phase 1: Check running cores for completion
@@ -416,16 +416,16 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
         if (!try_completed) {
-            CYCLE_COUNT_LAP(perf.sched_idle_cycle);
+            CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
         } else {
-            CYCLE_COUNT_LAP(perf.sched_complete_cycle);
-            if (perf.profiling_enabled && perf.phase_complete_count > 0) {
-                perf_aicpu_record_phase(
-                    thread_idx, AicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, perf.sched_loop_count,
-                    perf.phase_complete_count
+            CYCLE_COUNT_LAP(l2_perf.sched_complete_cycle);
+            if (l2_perf.l2_perf_enabled && l2_perf.phase_complete_count > 0) {
+                l2_perf_aicpu_record_phase(
+                    thread_idx, AicpuPhaseId::SCHED_COMPLETE, _t0_phase, _t1, l2_perf.sched_loop_count,
+                    l2_perf.phase_complete_count
                 );
                 _t0_phase = _t1;
-                perf.phase_complete_count = 0;
+                l2_perf.phase_complete_count = 0;
             }
         }
 #endif
@@ -444,12 +444,12 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             if (wired > 0) {
                 made_progress = true;
 #if PTO2_SCHED_PROFILING
-                perf.phase_wiring_count += wired;
+                l2_perf.phase_wiring_count += wired;
 #endif
             }
         }
 #if PTO2_PROFILING
-        CYCLE_COUNT_LAP(perf.sched_wiring_cycle);
+        CYCLE_COUNT_LAP(l2_perf.sched_wiring_cycle);
 #endif
 
         // Phase 4: Two-phase dispatch (idle then pending)
@@ -472,7 +472,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
             auto &local_buf = local_bufs[static_cast<int32_t>(shape)];
             auto &ready_queue = sched_->ready_queues[static_cast<int32_t>(shape)];
 #if PTO2_SCHED_PROFILING
-            perf.local_overflow_count += local_buf.count;
+            l2_perf.local_overflow_count += local_buf.count;
 #endif
             if (local_buf.count > 0) {
                 ready_queue.push_batch(local_buf.slot_states, local_buf.count);
@@ -482,16 +482,16 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 
 #if PTO2_PROFILING
         if (!try_pushed) {
-            CYCLE_COUNT_LAP(perf.sched_idle_cycle);
+            CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
         } else {
-            CYCLE_COUNT_LAP(perf.sched_dispatch_cycle);
-            if (perf.profiling_enabled && perf.phase_dispatch_count > 0) {
-                perf_aicpu_record_phase(
-                    thread_idx, AicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, perf.sched_loop_count,
-                    perf.phase_dispatch_count
+            CYCLE_COUNT_LAP(l2_perf.sched_dispatch_cycle);
+            if (l2_perf.l2_perf_enabled && l2_perf.phase_dispatch_count > 0) {
+                l2_perf_aicpu_record_phase(
+                    thread_idx, AicpuPhaseId::SCHED_DISPATCH, _t0_phase, _t1, l2_perf.sched_loop_count,
+                    l2_perf.phase_dispatch_count
                 );
                 _t0_phase = _t1;
-                perf.phase_dispatch_count = 0;
+                l2_perf.phase_dispatch_count = 0;
             }
         }
 #endif
@@ -508,8 +508,8 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_SCHED_PROFILING
                 int32_t fe =
                     sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count], thread_idx);
-                perf.fanin_edges_total += fe;
-                if (fe > perf.fanin_max_degree) perf.fanin_max_degree = fe;
+                l2_perf.fanin_edges_total += fe;
+                if (fe > l2_perf.fanin_max_degree) l2_perf.fanin_max_degree = fe;
 #else
                 sched_->on_task_release(*deferred_release_slot_states[--deferred_release_count]);
 #endif
@@ -529,17 +529,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
                     thread_idx, idle_iterations
 #if PTO2_PROFILING
                     ,
-                    perf.sched_start_ts
+                    l2_perf.sched_start_ts
 #endif
                 );
             } else {
                 SPIN_WAIT_HINT();
             }
 #if PTO2_PROFILING
-            CYCLE_COUNT_LAP(perf.sched_idle_cycle);
-            if (perf.profiling_enabled) {
-                perf_aicpu_record_phase(
-                    thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, perf.sched_loop_count, 0
+            CYCLE_COUNT_LAP(l2_perf.sched_idle_cycle);
+            if (l2_perf.l2_perf_enabled) {
+                l2_perf_aicpu_record_phase(
+                    thread_idx, AicpuPhaseId::SCHED_IDLE_WAIT, _t0_phase, _t1, l2_perf.sched_loop_count, 0
                 );
                 _t0_phase = _t1;
             }
@@ -548,7 +548,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
     }
 
 #if PTO2_PROFILING
-    log_profiling_summary(thread_idx, cur_thread_completed);
+    log_l2_perf_summary(thread_idx, cur_thread_completed);
 #endif
 
 #if PTO2_PROFILING

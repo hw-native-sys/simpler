@@ -10,16 +10,16 @@
  */
 
 /**
- * @file performance_collector_aicpu.cpp
+ * @file l2_perf_collector_aicpu.cpp
  * @brief AICPU performance data collection implementation (memcpy-based)
  *
- * Host pre-allocates one PerfBuffer per core and one PhaseBuffer per thread
+ * Host pre-allocates one L2PerfBuffer per core and one PhaseBuffer per thread
  * on the device. AICPU writes records directly into them via cached pointers.
  * When a buffer fills up, subsequent records are silently dropped — there is
  * no buffer switching or flushing.
  */
 
-#include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/l2_perf_collector_aicpu.h"
 
 #include <cinttypes>
 #include <cstring>
@@ -30,43 +30,43 @@
 #include "common/unified_log.h"
 
 // Cached pointers for hot-path access (set during init)
-static PerfSetupHeader *s_setup_header = nullptr;
+static L2PerfSetupHeader *s_setup_header = nullptr;
 
 // Per-thread PhaseBuffer cache
 static PhaseBuffer *s_current_phase_buf[PLATFORM_MAX_AICPU_THREADS] = {};
 
 static int s_orch_thread_idx = -1;
 
-void perf_aicpu_init_profiling(Runtime *runtime) {
-    void *perf_base = reinterpret_cast<void *>(runtime->perf_data_base);
-    if (perf_base == nullptr) {
-        LOG_ERROR("perf_data_base is NULL, cannot initialize profiling");
+void l2_perf_aicpu_init_profiling(Runtime *runtime) {
+    void *l2_perf_base = reinterpret_cast<void *>(runtime->l2_perf_data_base);
+    if (l2_perf_base == nullptr) {
+        LOG_ERROR("l2_perf_data_base is NULL, cannot initialize profiling");
         return;
     }
 
-    s_setup_header = get_perf_setup_header(perf_base);
+    s_setup_header = get_perf_setup_header(l2_perf_base);
 
     int32_t task_count = runtime->get_task_count();
     s_setup_header->total_tasks = static_cast<uint32_t>(task_count);
 
     LOG_INFO("Initializing performance profiling for %d cores (memcpy-based)", runtime->worker_count);
 
-    // Initialize each core's PerfBuffer and publish the pointer to the handshake
+    // Initialize each core's L2PerfBuffer and publish the pointer to the handshake
     for (int i = 0; i < runtime->worker_count; i++) {
         Handshake *h = &runtime->workers[i];
         uint64_t buf_ptr = s_setup_header->core_buffer_ptrs[i];
 
         if (buf_ptr == 0) {
             LOG_ERROR("Core %d: core_buffer_ptrs[%d] is NULL during init!", i, i);
-            h->perf_records_addr = 0;
+            h->l2_perf_records_addr = 0;
             continue;
         }
 
-        PerfBuffer *buf = reinterpret_cast<PerfBuffer *>(buf_ptr);
+        L2PerfBuffer *buf = reinterpret_cast<L2PerfBuffer *>(buf_ptr);
         buf->count = 0;
-        h->perf_records_addr = buf_ptr;
+        h->l2_perf_records_addr = buf_ptr;
 
-        LOG_DEBUG("Core %d: PerfBuffer at 0x%lx", i, buf_ptr);
+        LOG_DEBUG("Core %d: L2PerfBuffer at 0x%lx", i, buf_ptr);
     }
 
     wmb();
@@ -74,25 +74,25 @@ void perf_aicpu_init_profiling(Runtime *runtime) {
     LOG_INFO("Performance profiling initialized for %d cores", runtime->worker_count);
 }
 
-int perf_aicpu_complete_record(
-    PerfBuffer *perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
+int l2_perf_aicpu_complete_record(
+    L2PerfBuffer *l2_perf_buf, uint32_t expected_reg_task_id, uint64_t task_id, uint32_t func_id, CoreType core_type,
     uint64_t dispatch_time, uint64_t finish_time, const uint64_t *fanout, int32_t fanout_count
 ) {
     rmb();
-    uint32_t count = perf_buf->count;
+    uint32_t count = l2_perf_buf->count;
     // Buffer-full check lives here (AICore does not branch on capacity); return -1
     // silently drops the record, caller ignores the failure.
     if (count >= PLATFORM_PROF_BUFFER_SIZE) return -1;
 
     // Read from WIP staging slot (AICore writes here, parity = reg_task_id & 1)
-    PerfRecord *wip = &perf_buf->wip[expected_reg_task_id & 1u];
-    // One PoC cache line: matches AICore perf_aicore_record_task() dcci(..., SINGLE_CACHE_LINE, ...)
+    L2PerfRecord *wip = &l2_perf_buf->wip[expected_reg_task_id & 1u];
+    // One PoC cache line: matches AICore l2_perf_aicore_record_task() dcci(..., SINGLE_CACHE_LINE, ...)
     // and aicpu/cache_ops.cpp step size; wip timing fields live in the first line.
     cache_invalidate_range(wip, 64);
     if (static_cast<uint32_t>(wip->task_id) != expected_reg_task_id) return -1;
 
     // Copy AICore timing to committed record slot
-    PerfRecord *record = &perf_buf->records[count];
+    L2PerfRecord *record = &l2_perf_buf->records[count];
     record->start_time = wip->start_time;
     record->end_time = wip->end_time;
 
@@ -113,30 +113,30 @@ int perf_aicpu_complete_record(
         record->fanout_count = 0;
     }
 
-    perf_buf->count = count + 1;
+    l2_perf_buf->count = count + 1;
     wmb();
     return 0;
 }
 
-void perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks) {
-    void *perf_base = reinterpret_cast<void *>(runtime->perf_data_base);
-    if (perf_base == nullptr) {
+void l2_perf_aicpu_update_total_tasks(Runtime *runtime, uint32_t total_tasks) {
+    void *l2_perf_base = reinterpret_cast<void *>(runtime->l2_perf_data_base);
+    if (l2_perf_base == nullptr) {
         return;
     }
 
-    PerfSetupHeader *header = get_perf_setup_header(perf_base);
+    L2PerfSetupHeader *header = get_perf_setup_header(l2_perf_base);
     header->total_tasks = total_tasks;
     wmb();
 }
 
-void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads) {
-    void *perf_base = reinterpret_cast<void *>(runtime->perf_data_base);
-    if (perf_base == nullptr) {
-        LOG_ERROR("perf_data_base is NULL, cannot initialize phase profiling");
+void l2_perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads) {
+    void *l2_perf_base = reinterpret_cast<void *>(runtime->l2_perf_data_base);
+    if (l2_perf_base == nullptr) {
+        LOG_ERROR("l2_perf_data_base is NULL, cannot initialize phase profiling");
         return;
     }
 
-    s_setup_header = get_perf_setup_header(perf_base);
+    s_setup_header = get_perf_setup_header(l2_perf_base);
 
     AicpuPhaseHeader *phase_header = &s_setup_header->phase_header;
     phase_header->magic = AICPU_PHASE_MAGIC;
@@ -181,7 +181,7 @@ void perf_aicpu_init_phase_profiling(Runtime *runtime, int num_sched_threads) {
     );
 }
 
-void perf_aicpu_record_phase(
+void l2_perf_aicpu_record_phase(
     int thread_idx, AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t loop_iter,
     uint64_t tasks_processed
 ) {
@@ -208,7 +208,7 @@ void perf_aicpu_record_phase(
     buf->count = idx + 1;
 }
 
-void perf_aicpu_write_orch_summary(const AicpuOrchSummary *src) {
+void l2_perf_aicpu_write_orch_summary(const AicpuOrchSummary *src) {
     if (s_setup_header == nullptr) {
         return;
     }
@@ -227,16 +227,16 @@ void perf_aicpu_write_orch_summary(const AicpuOrchSummary *src) {
     );
 }
 
-void perf_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
+void l2_perf_aicpu_set_orch_thread_idx(int thread_idx) { s_orch_thread_idx = thread_idx; }
 
-void perf_aicpu_record_orch_phase(
+void l2_perf_aicpu_record_orch_phase(
     AicpuPhaseId phase_id, uint64_t start_time, uint64_t end_time, uint32_t submit_idx, uint64_t task_id
 ) {
     if (s_orch_thread_idx < 0 || s_setup_header == nullptr) return;
-    perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
+    l2_perf_aicpu_record_phase(s_orch_thread_idx, phase_id, start_time, end_time, submit_idx, task_id);
 }
 
-void perf_aicpu_init_core_assignments(int total_cores) {
+void l2_perf_aicpu_init_core_assignments(int total_cores) {
     if (s_setup_header == nullptr) {
         return;
     }
@@ -247,7 +247,7 @@ void perf_aicpu_init_core_assignments(int total_cores) {
     LOG_INFO("Core-to-thread mapping init: %d cores", total_cores);
 }
 
-void perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num) {
+void l2_perf_aicpu_write_core_assignments_for_thread(int thread_idx, const int *core_ids, int core_num) {
     if (s_setup_header == nullptr) {
         return;
     }

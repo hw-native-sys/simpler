@@ -117,7 +117,10 @@ def pytest_addoption(parser):
         "--skip-golden", action="store_true", default=False, help="Skip golden comparison (benchmark mode)"
     )
     parser.addoption(
-        "--enable-profiling", action="store_true", default=False, help="Enable profiling (first round only)"
+        "--enable-l2-swimlane",
+        action="store_true",
+        default=False,
+        help="Enable perf swimlane collection (first round only)",
     )
     parser.addoption("--dump-tensor", action="store_true", default=False, help="Dump per-task tensor I/O at runtime")
     parser.addoption(
@@ -235,21 +238,23 @@ def pytest_configure(config):
         if 0 <= idx < len(ids):
             config.option.device = str(ids[idx])
         # Each xdist worker gets its own perf output dir so parallel profiling
-        # runs don't fight over the same perf_swimlane_*.json filename (the
+        # runs don't fight over the same l2_perf_records_*.json filename (the
         # runtime's timestamp is second-precision). Anchor to config.rootpath
         # so the C++ runtime (which resolves the path against its own CWD) and
         # Python post-processing always point at the same filesystem location
         # regardless of where pytest was invoked. Only set if the parent
         # hasn't already scoped us into a subprocess dir.
-        if "SIMPLER_PERF_OUTPUT_DIR" not in os.environ:
-            os.environ["SIMPLER_PERF_OUTPUT_DIR"] = str(config.rootpath / "outputs" / f"perf_{worker_id}")
+        if "SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR" not in os.environ:
+            os.environ["SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR"] = str(
+                config.rootpath / "outputs" / f"l2_perf_records_{worker_id}"
+            )
         # else: more xdist workers than devices — fall through with original range;
         # DevicePool will fail clearly if the test tries to allocate.
 
     # Note: profiling + parallelism used to be blocked here because perf files
     # shared a process-global directory. The test dispatcher now scopes each
-    # subprocess to its own SIMPLER_PERF_OUTPUT_DIR (see _dispatch_test_phases and
-    # the xdist slicing above) and flatten_perf_subdirs reassembles outputs/
+    # subprocess to its own SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR (see _dispatch_test_phases and
+    # the xdist slicing above) and flatten_l2_perf_records_subdirs reassembles outputs/
     # at the end, so the combination is now safe.
 
 
@@ -347,11 +352,11 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
 
     items.sort(key=sort_key)
 
-    # L3 profiling is not supported yet: a single L3 case forks N chip-processes
-    # that all write perf_swimlane_<ts>.json to the same directory with
+    # L3 perf collection is not supported yet: a single L3 case forks N chip-processes
+    # that all write l2_perf_records_<ts>.json to the same directory with
     # second-precision timestamps, so they trample each other. Block the
     # combination up front; waiting for a proper device-id-in-filename fix.
-    if config.getoption("--enable-profiling", default=False):
+    if config.getoption("--enable-l2-swimlane", default=False):
         l3_items = [
             i
             for i in items
@@ -362,10 +367,10 @@ def pytest_collection_modifyitems(session, config, items):  # noqa: PLR0912
             sample = ", ".join(sorted({i.nodeid for i in l3_items})[:3])
             more = "" if len(l3_items) <= 3 else f" (+{len(l3_items) - 3} more)"
             raise pytest.UsageError(
-                f"--enable-profiling is not supported for L3 tests yet — "
+                f"--enable-l2-swimlane is not supported for L3 tests yet — "
                 f"multi-chip-process filename collision unresolved. "
                 f"L3 items in this session: {sample}{more}. "
-                f"Either drop --enable-profiling or scope to L2 with --level 2."
+                f"Either drop --enable-l2-swimlane or scope to L2 with --level 2."
             )
 
 
@@ -382,7 +387,7 @@ class _ResourceJob(typing.NamedTuple):
     """One device-allocating subprocess job fed into Resource phase.
 
     ``kind`` drives only two things: the ``--level 3`` filter added to the
-    child command (for L3 classes) and the ``SIMPLER_PERF_OUTPUT_DIR``
+    child command (for L3 classes) and the ``SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR``
     prefix. The dispatch itself (bin-pack over ``--device`` pool,
     ``run_jobs`` scheduling, fail-fast semantics) is identical.
     """
@@ -578,12 +583,14 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
                     cmd.extend(["--platform", platform])
                 return cmd
 
-            # SIMPLER_PERF_OUTPUT_DIR scopes this job's perf files to its own
+            # SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR scopes this job's perf files to its own
             # subdir so concurrent jobs can't collide on filename.
             safe_nodeid = spec.nodeid.replace("/", "_").replace(":", "_").replace(".", "_")
             child_env = {
                 **os.environ,
-                "SIMPLER_PERF_OUTPUT_DIR": str(cfg.rootpath / "outputs" / f"perf_{spec.kind}_{safe_nodeid}"),
+                "SIMPLER_L2_PERF_RECORDS_OUTPUT_DIR": str(
+                    cfg.rootpath / "outputs" / f"l2_perf_records_{spec.kind}_{safe_nodeid}"
+                ),
             }
             jobs.append(
                 _ps.Job(
@@ -679,12 +686,12 @@ def _dispatch_test_phases(session, resource_specs):  # noqa: PLR0912
             if fail_fast:
                 break
 
-    # Flatten per-subprocess outputs/perf_*/ subdirs back to outputs/ so
+    # Flatten per-subprocess outputs/l2_perf_records_*/ subdirs back to outputs/ so
     # downstream tools (swimlane_converter.py, CI artifact upload) find
     # everything in the historical location. Anchor to config.rootpath (not
     # invocation_params.dir) so a user running pytest from a subdirectory
     # still flushes files into the project's top-level outputs/.
-    _ps.flatten_perf_subdirs(cfg.rootpath / "outputs")
+    _ps.flatten_l2_perf_records_subdirs(cfg.rootpath / "outputs")
 
     session.testsfailed = 1 if (resource_failed or l2_failed) else 0
     if not (resource_failed or l2_failed):

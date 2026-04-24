@@ -288,6 +288,9 @@ int DeviceRunner::run(
     if (enable_dump_tensor) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     }
+    if (runtime.enable_l2_swimlane) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+    }
 
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
@@ -317,10 +320,10 @@ int DeviceRunner::run(
     last_runtime_ = &runtime;
 
     // Initialize performance profiling if enabled
-    if (runtime.enable_profiling) {
-        rc = init_performance_profiling(runtime, num_aicore, device_id);
+    if (runtime.enable_l2_swimlane) {
+        rc = init_l2_perf_collection(runtime, num_aicore, device_id);
         if (rc != 0) {
-            LOG_ERROR("init_performance_profiling failed: %d", rc);
+            LOG_ERROR("init_l2_perf_collection failed: %d", rc);
             return rc;
         }
     }
@@ -420,8 +423,8 @@ int DeviceRunner::run(
     LOG_INFO("All threads completed");
 
     // Collect performance data and export
-    if (runtime.enable_profiling) {
-        perf_collector_.collect_all();
+    if (runtime.enable_l2_swimlane) {
+        l2_perf_collector_.collect_all();
         export_swimlane_json();
     }
 
@@ -489,8 +492,8 @@ int DeviceRunner::finalize() {
     }
 
     // Cleanup performance profiling
-    if (perf_collector_.is_initialized()) {
-        perf_collector_.finalize();
+    if (l2_perf_collector_.is_initialized()) {
+        l2_perf_collector_.finalize();
     }
 
     // Cleanup tensor dump
@@ -631,7 +634,7 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
 // Performance Profiling Implementation
 // =============================================================================
 
-int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, int device_id) {
+int DeviceRunner::init_l2_perf_collection(Runtime &runtime, int num_aicore, int device_id) {
     // Simulation: "device" memory is just host memory, so use malloc/free and
     // std::memcpy for the copy callbacks.
     auto alloc_cb = [](size_t size) -> void * {
@@ -653,13 +656,13 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
         return 0;
     };
 
-    return perf_collector_.initialize(
+    return l2_perf_collector_.initialize(
         runtime, num_aicore, device_id, alloc_cb, free_cb, copy_to_dev_cb, copy_from_dev_cb
     );
 }
 
 int DeviceRunner::export_swimlane_json(const std::string &output_path) {
-    return perf_collector_.export_swimlane_json(output_path);
+    return l2_perf_collector_.export_swimlane_json(output_path);
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {

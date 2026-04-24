@@ -38,12 +38,12 @@
 //   - with CACHELINE_OUT: write-back/flush (write to memory) -> release semantics
 // On aarch64, acquire-only fences do NOT prevent store-store reordering across the
 // barrier, so using acquire for the flush direction causes a race: the AICPU can
-// observe the COND register FIN signal before perf_buf->count is visible.
+// observe the COND register FIN signal before l2_perf_buf->count is visible.
 // Using seq_cst (dmb ish / full barrier) covers both directions safely.
 // Use variadic macro to support both 2-arg and 3-arg calls.
 #define dcci(...) std::atomic_thread_fence(std::memory_order_seq_cst)
 
-// dsb / mem_dsb_t — CANN provides these on real AICore; perf_collector uses them after dcci flush.
+// dsb / mem_dsb_t — CANN provides these on real AICore; l2_perf_collector uses them after dcci flush.
 // Simulation: full fence (same strength as dcci above) so AICPU ordering matches hardware intent.
 typedef int mem_dsb_t;
 #define dsb(_kind)                                           \

@@ -185,7 +185,7 @@ call.
 struct CallConfig {
     int32_t block_dim = 1;
     int32_t aicpu_thread_num = 3;
-    bool    enable_profiling = false;
+    bool    enable_l2_swimlane = false;
     bool    enable_dump_tensor = false;
     int32_t enable_pmu = 0;
     // future fields here - same POD used at all levels

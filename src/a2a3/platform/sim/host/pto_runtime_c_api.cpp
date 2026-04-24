@@ -158,7 +158,7 @@ int copy_from_device_ctx(DeviceContextHandle ctx, void *host_ptr, const void *de
 int run_runtime(
     DeviceContextHandle ctx, RuntimeHandle runtime, const void *callable, const void *args, int block_dim,
     int aicpu_thread_num, int device_id, const uint8_t *aicpu_binary, size_t aicpu_size, const uint8_t *aicore_binary,
-    size_t aicore_size, int enable_profiling, int enable_dump_tensor, int enable_pmu
+    size_t aicore_size, int enable_l2_swimlane, int enable_dump_tensor, int enable_pmu
 ) {
     if (ctx == NULL || runtime == NULL) return -1;
 
@@ -188,8 +188,8 @@ int run_runtime(
         }
 
         // Phase 2: profiling
-        if (enable_profiling) {
-            r->enable_profiling = true;
+        if (enable_l2_swimlane) {
+            r->enable_l2_swimlane = true;
         }
 
         // Phase 3: launch

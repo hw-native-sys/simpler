@@ -17,7 +17,7 @@
  * Software License 2.0). Register offsets live in platform_config.h and are
  * accessed via RegId / reg_index().
  *
- * Streaming buffer design (mirrors perf_profiling.h):
+ * Streaming buffer design (mirrors l2_perf_profiling.h):
  *   PmuFreeQueue    — SPSC queue: Host pushes free PmuBuffers, AICPU pops them.
  *   PmuBufferState  — Per-core state: current active buffer pointer + free_queue.
  *   PmuDataHeader   — Fixed shared-memory header: per-thread ready queues.
@@ -53,7 +53,7 @@ constexpr uint32_t PMU_EVENT_TYPE_DEFAULT = static_cast<uint32_t>(PmuEventType::
 
 /**
  * Event ID table for a single event type.
- * `event_ids[i]` programs PMU_CNTi_IDX; `counters[i]` in the PerfRecord is the
+ * `event_ids[i]` programs PMU_CNTi_IDX; `counters[i]` in the L2PerfRecord is the
  * value of PMU_CNTi after the task completes.
  * `counter_names[i]` is the human-readable CSV column name for counter i.
  * Empty string ("") marks an unused slot.
@@ -135,7 +135,7 @@ inline const PmuEventConfig *pmu_resolve_event_config_a2a3(uint32_t event_type) 
  * Per-task PMU snapshot written by AICPU after each AICore task FIN.
  */
 struct PmuRecord {
-    uint64_t task_id;                               // Same encoding as PerfRecord.task_id
+    uint64_t task_id;                               // Same encoding as L2PerfRecord.task_id
     uint32_t func_id;                               // Kernel function identifier
     CoreType core_type;                             // AIC or AIV
     uint64_t pmu_total_cycles;                      // PMU_CNT_TOTAL (64-bit combined)
@@ -143,7 +143,7 @@ struct PmuRecord {
 } __attribute__((aligned(64)));
 
 // =============================================================================
-// PMU Streaming Buffer Structures (mirrors perf_profiling.h)
+// PMU Streaming Buffer Structures (mirrors l2_perf_profiling.h)
 // =============================================================================
 
 /**

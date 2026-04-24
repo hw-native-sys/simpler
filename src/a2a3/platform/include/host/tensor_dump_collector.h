@@ -16,7 +16,7 @@
  * Fully decoupled from profiling: uses its own shared memory region,
  * ready queues, and memory manager thread.
  *
- * Mirrors PerformanceCollector architecture:
+ * Mirrors L2PerfCollector architecture:
  * - DumpMemoryManager: Background thread that polls dump ready queues,
  *   recycles metadata buffers, and hands off full buffers to the main thread.
  * - TensorDumpCollector: Main thread copies tensor data from arenas,

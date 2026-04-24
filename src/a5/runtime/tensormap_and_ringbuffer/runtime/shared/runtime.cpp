@@ -40,8 +40,8 @@ Runtime::Runtime() {
     orch_to_sched = false;
 
     // Initialize profiling state
-    enable_profiling = false;
-    perf_data_base = 0;
+    enable_l2_swimlane = false;
+    l2_perf_data_base = 0;
 
     // Initialize tensor pairs
     tensor_pair_count = 0;

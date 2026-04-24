@@ -14,11 +14,11 @@
 
 #include "aicpu/device_log.h"
 #include "aicpu/device_time.h"
-#include "aicpu/performance_collector_aicpu.h"
+#include "aicpu/l2_perf_collector_aicpu.h"
 #include "aicpu/platform_regs.h"
 #include "aicpu/pmu_collector_aicpu.h"
 #include "common/memory_barrier.h"
-#include "common/perf_profiling.h"
+#include "common/l2_perf_profiling.h"
 #include "common/platform_config.h"
 #include "pto_runtime2.h"
 #include "pto_shared_memory.h"
@@ -186,29 +186,29 @@ int32_t SchedulerContext::handle_timeout_exit(
 }
 
 #if PTO2_PROFILING
-void SchedulerContext::log_profiling_summary(int32_t thread_idx, int32_t cur_thread_completed) {
-    auto &perf = sched_perf_[thread_idx];
+void SchedulerContext::log_l2_perf_summary(int32_t thread_idx, int32_t cur_thread_completed) {
+    auto &l2_perf = sched_l2_perf_[thread_idx];
     uint64_t sched_end_ts = get_sys_cnt_aicpu();
     DEV_ALWAYS(
         "Thread %d: sched_start=%" PRIu64 " sched_end=%" PRIu64 " sched_cost=%.3fus", thread_idx,
-        static_cast<uint64_t>(perf.sched_start_ts), static_cast<uint64_t>(sched_end_ts),
-        cycles_to_us(sched_end_ts - perf.sched_start_ts)
+        static_cast<uint64_t>(l2_perf.sched_start_ts), static_cast<uint64_t>(sched_end_ts),
+        cycles_to_us(sched_end_ts - l2_perf.sched_start_ts)
     );
 
-    uint64_t sched_total = perf.sched_wiring_cycle + perf.sched_complete_cycle + perf.sched_scan_cycle +
-                           perf.sched_dispatch_cycle + perf.sched_idle_cycle;
+    uint64_t sched_total = l2_perf.sched_wiring_cycle + l2_perf.sched_complete_cycle + l2_perf.sched_scan_cycle +
+                           l2_perf.sched_dispatch_cycle + l2_perf.sched_idle_cycle;
     if (sched_total == 0) sched_total = 1;
 
 #if PTO2_SCHED_PROFILING
     {
         PTO2SchedProfilingData sp = pto2_scheduler_get_profiling(thread_idx);
         uint64_t otc_total = sp.lock_cycle + sp.fanout_cycle + sp.fanin_cycle + sp.self_consumed_cycle;
-        uint64_t complete_poll = (perf.sched_complete_cycle > otc_total + perf.sched_complete_perf_cycle) ?
-                                     (perf.sched_complete_cycle - otc_total - perf.sched_complete_perf_cycle) :
+        uint64_t complete_poll = (l2_perf.sched_complete_cycle > otc_total + l2_perf.sched_complete_perf_cycle) ?
+                                     (l2_perf.sched_complete_cycle - otc_total - l2_perf.sched_complete_perf_cycle) :
                                      0;
         uint64_t dispatch_poll =
-            (perf.sched_dispatch_cycle > perf.sched_dispatch_pop_cycle + perf.sched_dispatch_setup_cycle) ?
-                (perf.sched_dispatch_cycle - perf.sched_dispatch_pop_cycle - perf.sched_dispatch_setup_cycle) :
+            (l2_perf.sched_dispatch_cycle > l2_perf.sched_dispatch_pop_cycle + l2_perf.sched_dispatch_setup_cycle) ?
+                (l2_perf.sched_dispatch_cycle - l2_perf.sched_dispatch_pop_cycle - l2_perf.sched_dispatch_setup_cycle) :
                 0;
 
         DEV_ALWAYS(
@@ -217,28 +217,28 @@ void SchedulerContext::log_profiling_summary(int32_t thread_idx, int32_t cur_thr
         );
 
         double notify_avg =
-            cur_thread_completed > 0 ? static_cast<double>(perf.notify_edges_total) / cur_thread_completed : 0.0;
+            cur_thread_completed > 0 ? static_cast<double>(l2_perf.notify_edges_total) / cur_thread_completed : 0.0;
         double fanin_avg =
-            cur_thread_completed > 0 ? static_cast<double>(perf.fanin_edges_total) / cur_thread_completed : 0.0;
+            cur_thread_completed > 0 ? static_cast<double>(l2_perf.fanin_edges_total) / cur_thread_completed : 0.0;
         DEV_ALWAYS(
             "Thread %d:   complete       : %.3fus (%.1f%%)  [fanout: edges=%" PRIu64
             ", max_degree=%d, avg=%.1f]  [fanin: "
             "edges=%" PRIu64 ", max_degree=%d, avg=%.1f]",
-            thread_idx, cycles_to_us(perf.sched_complete_cycle), perf.sched_complete_cycle * 100.0 / sched_total,
-            static_cast<uint64_t>(perf.notify_edges_total), perf.notify_max_degree, notify_avg,
-            static_cast<uint64_t>(perf.fanin_edges_total), perf.fanin_max_degree, fanin_avg
+            thread_idx, cycles_to_us(l2_perf.sched_complete_cycle), l2_perf.sched_complete_cycle * 100.0 / sched_total,
+            static_cast<uint64_t>(l2_perf.notify_edges_total), l2_perf.notify_max_degree, notify_avg,
+            static_cast<uint64_t>(l2_perf.fanin_edges_total), l2_perf.fanin_max_degree, fanin_avg
         );
 
-        uint64_t c_parent = perf.sched_complete_cycle > 0 ? perf.sched_complete_cycle : 1;
-        uint64_t complete_miss_count = (perf.complete_probe_count > perf.complete_hit_count) ?
-                                           (perf.complete_probe_count - perf.complete_hit_count) :
+        uint64_t c_parent = l2_perf.sched_complete_cycle > 0 ? l2_perf.sched_complete_cycle : 1;
+        uint64_t complete_miss_count = (l2_perf.complete_probe_count > l2_perf.complete_hit_count) ?
+                                           (l2_perf.complete_probe_count - l2_perf.complete_hit_count) :
                                            0;
         double complete_hit_rate =
-            perf.complete_probe_count > 0 ? perf.complete_hit_count * 100.0 / perf.complete_probe_count : 0.0;
+            l2_perf.complete_probe_count > 0 ? l2_perf.complete_hit_count * 100.0 / l2_perf.complete_probe_count : 0.0;
         DEV_ALWAYS(
             "Thread %d:     poll         : %.3fus (%.1f%%)  hit=%" PRIu64 ", miss=%" PRIu64 ", hit_rate=%.1f%%",
             thread_idx, cycles_to_us(complete_poll), complete_poll * 100.0 / c_parent,
-            static_cast<uint64_t>(perf.complete_hit_count), static_cast<uint64_t>(complete_miss_count),
+            static_cast<uint64_t>(l2_perf.complete_hit_count), static_cast<uint64_t>(complete_miss_count),
             complete_hit_rate
         );
         DEV_ALWAYS(
@@ -264,77 +264,78 @@ void SchedulerContext::log_profiling_summary(int32_t thread_idx, int32_t cur_thr
             static_cast<uint64_t>(sp.self_atomic_count)
         );
         DEV_ALWAYS(
-            "Thread %d:     perf         : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.sched_complete_perf_cycle),
-            perf.sched_complete_perf_cycle * 100.0 / c_parent
+            "Thread %d:     perf         : %.3fus (%.1f%%)", thread_idx,
+            cycles_to_us(l2_perf.sched_complete_perf_cycle), l2_perf.sched_complete_perf_cycle * 100.0 / c_parent
         );
 
-        uint64_t pop_total = perf.pop_hit + perf.pop_miss;
-        double pop_hit_rate = pop_total > 0 ? perf.pop_hit * 100.0 / pop_total : 0.0;
+        uint64_t pop_total = l2_perf.pop_hit + l2_perf.pop_miss;
+        double pop_hit_rate = pop_total > 0 ? l2_perf.pop_hit * 100.0 / pop_total : 0.0;
         DEV_ALWAYS(
             "Thread %d:   dispatch       : %.3fus (%.1f%%)  [pop: hit=%" PRIu64 ", miss=%" PRIu64 ", hit_rate=%.1f%%]",
-            thread_idx, cycles_to_us(perf.sched_dispatch_cycle), perf.sched_dispatch_cycle * 100.0 / sched_total,
-            static_cast<uint64_t>(perf.pop_hit), static_cast<uint64_t>(perf.pop_miss), pop_hit_rate
+            thread_idx, cycles_to_us(l2_perf.sched_dispatch_cycle), l2_perf.sched_dispatch_cycle * 100.0 / sched_total,
+            static_cast<uint64_t>(l2_perf.pop_hit), static_cast<uint64_t>(l2_perf.pop_miss), pop_hit_rate
         );
-        uint64_t global_dispatch_count = perf.pop_hit - perf.local_dispatch_count;
-        uint64_t total_dispatched = perf.local_dispatch_count + global_dispatch_count;
-        double local_hit_rate = total_dispatched > 0 ? perf.local_dispatch_count * 100.0 / total_dispatched : 0.0;
+        uint64_t global_dispatch_count = l2_perf.pop_hit - l2_perf.local_dispatch_count;
+        uint64_t total_dispatched = l2_perf.local_dispatch_count + global_dispatch_count;
+        double local_hit_rate = total_dispatched > 0 ? l2_perf.local_dispatch_count * 100.0 / total_dispatched : 0.0;
         DEV_ALWAYS(
             "Thread %d:     local_disp   : local=%" PRIu64 ", global=%" PRIu64 ", overflow=%" PRIu64
             ", local_rate=%.1f%%",
-            thread_idx, static_cast<uint64_t>(perf.local_dispatch_count), static_cast<uint64_t>(global_dispatch_count),
-            static_cast<uint64_t>(perf.local_overflow_count), local_hit_rate
+            thread_idx, static_cast<uint64_t>(l2_perf.local_dispatch_count),
+            static_cast<uint64_t>(global_dispatch_count), static_cast<uint64_t>(l2_perf.local_overflow_count),
+            local_hit_rate
         );
 
-        uint64_t d_parent = perf.sched_dispatch_cycle > 0 ? perf.sched_dispatch_cycle : 1;
+        uint64_t d_parent = l2_perf.sched_dispatch_cycle > 0 ? l2_perf.sched_dispatch_cycle : 1;
         DEV_ALWAYS(
             "Thread %d:     poll         : %.3fus (%.1f%%)", thread_idx, cycles_to_us(dispatch_poll),
             dispatch_poll * 100.0 / d_parent
         );
         DEV_ALWAYS(
             "Thread %d:     pop          : %.3fus (%.1f%%)  work=%.3fus wait=%.3fus  atomics=%" PRIu64 "", thread_idx,
-            cycles_to_us(perf.sched_dispatch_pop_cycle), perf.sched_dispatch_pop_cycle * 100.0 / d_parent,
-            cycles_to_us(perf.sched_dispatch_pop_cycle - sp.pop_wait_cycle), cycles_to_us(sp.pop_wait_cycle),
+            cycles_to_us(l2_perf.sched_dispatch_pop_cycle), l2_perf.sched_dispatch_pop_cycle * 100.0 / d_parent,
+            cycles_to_us(l2_perf.sched_dispatch_pop_cycle - sp.pop_wait_cycle), cycles_to_us(sp.pop_wait_cycle),
             static_cast<uint64_t>(sp.pop_atomic_count)
         );
         DEV_ALWAYS(
-            "Thread %d:     setup        : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.sched_dispatch_setup_cycle),
-            perf.sched_dispatch_setup_cycle * 100.0 / d_parent
+            "Thread %d:     setup        : %.3fus (%.1f%%)", thread_idx,
+            cycles_to_us(l2_perf.sched_dispatch_setup_cycle), l2_perf.sched_dispatch_setup_cycle * 100.0 / d_parent
         );
 
         DEV_ALWAYS(
-            "Thread %d:   scan           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.sched_scan_cycle),
-            perf.sched_scan_cycle * 100.0 / sched_total
+            "Thread %d:   scan           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_perf.sched_scan_cycle),
+            l2_perf.sched_scan_cycle * 100.0 / sched_total
         );
 
 #if PTO2_SCHED_PROFILING
         DEV_ALWAYS(
             "Thread %d:   wiring         : %.3fus (%.1f%%)  tasks=%d", thread_idx,
-            cycles_to_us(perf.sched_wiring_cycle), perf.sched_wiring_cycle * 100.0 / sched_total,
-            perf.phase_wiring_count
+            cycles_to_us(l2_perf.sched_wiring_cycle), l2_perf.sched_wiring_cycle * 100.0 / sched_total,
+            l2_perf.phase_wiring_count
         );
 #else
         DEV_ALWAYS(
-            "Thread %d:   wiring         : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.sched_wiring_cycle),
-            perf.sched_wiring_cycle * 100.0 / sched_total
+            "Thread %d:   wiring         : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_perf.sched_wiring_cycle),
+            l2_perf.sched_wiring_cycle * 100.0 / sched_total
         );
 #endif
 
         DEV_ALWAYS(
-            "Thread %d:   idle           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(perf.sched_idle_cycle),
-            perf.sched_idle_cycle * 100.0 / sched_total
+            "Thread %d:   idle           : %.3fus (%.1f%%)", thread_idx, cycles_to_us(l2_perf.sched_idle_cycle),
+            l2_perf.sched_idle_cycle * 100.0 / sched_total
         );
 
         if (cur_thread_completed > 0) {
             DEV_ALWAYS(
                 "Thread %d:   avg/complete   : %.3fus", thread_idx,
-                cycles_to_us(perf.sched_complete_cycle) / cur_thread_completed
+                cycles_to_us(l2_perf.sched_complete_cycle) / cur_thread_completed
             );
         }
     }
 #endif
     DEV_ALWAYS(
         "Thread %d: Scheduler summary: total_time=%.3fus, loops=%" PRIu64 ", tasks_scheduled=%d", thread_idx,
-        cycles_to_us(sched_total), static_cast<uint64_t>(perf.sched_loop_count), cur_thread_completed
+        cycles_to_us(sched_total), static_cast<uint64_t>(l2_perf.sched_loop_count), cur_thread_completed
     );
 }
 #endif
@@ -742,9 +743,9 @@ void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
 #if PTO2_PROFILING
-    if (runtime->enable_profiling) {
+    if (runtime->enable_l2_swimlane) {
         // Flush orchestrator's phase record buffer
-        perf_aicpu_flush_phase_buffers(thread_idx);
+        l2_perf_aicpu_flush_phase_buffers(thread_idx);
     }
 #endif
 
@@ -796,10 +797,12 @@ void SchedulerContext::on_orchestration_done(
     // Write core-to-thread mapping AFTER reassignment so the profiling data
     // reflects the final distribution (all active_sched_threads_, including
     // former orchestrator threads when orch_to_sched_ is enabled).
-    if (runtime->enable_profiling) {
-        perf_aicpu_init_core_assignments(cores_total_num_);
+    if (runtime->enable_l2_swimlane) {
+        l2_perf_aicpu_init_core_assignments(cores_total_num_);
         for (int32_t t = 0; t < active_sched_threads_; t++) {
-            perf_aicpu_write_core_assignments_for_thread(t, core_trackers_[t].core_ids(), core_trackers_[t].core_num());
+            l2_perf_aicpu_write_core_assignments_for_thread(
+                t, core_trackers_[t].core_ids(), core_trackers_[t].core_num()
+            );
         }
     }
 #endif

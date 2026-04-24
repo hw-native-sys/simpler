@@ -523,6 +523,9 @@ int DeviceRunner::run(
     if (enable_dump_tensor) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_DUMP_TENSOR);
     }
+    if (runtime.enable_l2_swimlane) {
+        SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_L2_SWIMLANE);
+    }
     if (pmu_enabled) {
         SET_PROFILING_FLAG(enable_profiling_flag, PROFILING_FLAG_PMU);
     }
@@ -536,8 +539,8 @@ int DeviceRunner::run(
         // Set core type: first 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
         runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
-        runtime.workers[i].perf_records_addr = static_cast<uint64_t>(0);
-        runtime.workers[i].perf_buffer_status = 0;
+        runtime.workers[i].l2_perf_records_addr = static_cast<uint64_t>(0);
+        runtime.workers[i].l2_perf_buffer_status = 0;
     }
 
     // Set function_bin_addr for all tasks: func_id_to_addr_[] stores CoreCallable
@@ -574,14 +577,14 @@ int DeviceRunner::run(
     });
 
     // Initialize performance profiling if enabled
-    if (runtime.enable_profiling) {
-        rc = init_performance_profiling(runtime, num_aicore, device_id);
+    if (runtime.enable_l2_swimlane) {
+        rc = init_l2_perf_collection(runtime, num_aicore, device_id);
         if (rc != 0) {
-            LOG_ERROR("init_performance_profiling failed: %d", rc);
+            LOG_ERROR("init_l2_perf_collection failed: %d", rc);
             return rc;
         }
         // Start memory management thread
-        perf_collector_.start_memory_manager([this](std::function<void()> fn) {
+        l2_perf_collector_.start_memory_manager([this](std::function<void()> fn) {
             return create_thread(std::move(fn));
         });
     }
@@ -606,9 +609,9 @@ int DeviceRunner::run(
     }
 
     auto perf_cleanup = RAIIScopeGuard([this]() {
-        bool was_initialized = perf_collector_.is_initialized();
+        bool was_initialized = l2_perf_collector_.is_initialized();
         if (was_initialized) {
-            perf_collector_.stop_memory_manager();
+            l2_perf_collector_.stop_memory_manager();
         }
     });
 
@@ -661,7 +664,7 @@ int DeviceRunner::run(
 
     {
         std::thread collector_thread;
-        if (runtime.enable_profiling) {
+        if (runtime.enable_l2_swimlane) {
             collector_thread = create_thread([this, &runtime]() {
                 poll_and_collect_performance_data(runtime.get_task_count());
             });
@@ -672,8 +675,8 @@ int DeviceRunner::run(
             }
         });
         auto collector_signal_guard = RAIIScopeGuard([this, &runtime]() {
-            if (runtime.enable_profiling) {
-                perf_collector_.signal_execution_complete();
+            if (runtime.enable_l2_swimlane) {
+                l2_perf_collector_.signal_execution_complete();
             }
         });
 
@@ -728,11 +731,11 @@ int DeviceRunner::run(
     }
 
     // Stop memory management, drain remaining buffers, collect phase data, export
-    if (runtime.enable_profiling) {
-        perf_collector_.stop_memory_manager();
-        perf_collector_.drain_remaining_buffers();
-        perf_collector_.scan_remaining_perf_buffers();
-        perf_collector_.collect_phase_data();
+    if (runtime.enable_l2_swimlane) {
+        l2_perf_collector_.stop_memory_manager();
+        l2_perf_collector_.drain_remaining_buffers();
+        l2_perf_collector_.scan_remaining_perf_buffers();
+        l2_perf_collector_.collect_phase_data();
         export_swimlane_json();
     }
 
@@ -805,7 +808,7 @@ int DeviceRunner::finalize() {
     binaries_loaded_ = false;
 
     // Cleanup performance profiling
-    if (perf_collector_.is_initialized()) {
+    if (l2_perf_collector_.is_initialized()) {
         auto unregister_cb = [](void *dev_ptr, int device_id) -> int {
             HalHostUnregisterFn fn = get_halHostUnregister();
             if (fn != nullptr) {
@@ -818,7 +821,7 @@ int DeviceRunner::finalize() {
             return rtFree(dev_ptr);
         };
 
-        perf_collector_.finalize(unregister_cb, free_cb);
+        l2_perf_collector_.finalize(unregister_cb, free_cb);
     }
 
     if (dump_collector_.is_initialized()) {
@@ -1024,7 +1027,7 @@ void DeviceRunner::remove_kernel_binary(int func_id) {
     LOG_DEBUG("Removed kernel binary: func_id=%d, addr=0x%lx", func_id, function_bin_addr);
 }
 
-int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, int device_id) {
+int DeviceRunner::init_l2_perf_collection(Runtime &runtime, int num_aicore, int device_id) {
     // Define allocation callback (a2a3: use rtMalloc directly)
     auto alloc_cb = [](size_t size) -> void * {
         void *ptr = nullptr;
@@ -1050,15 +1053,15 @@ int DeviceRunner::init_performance_profiling(Runtime &runtime, int num_aicore, i
         return rtFree(dev_ptr);
     };
 
-    return perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb);
+    return l2_perf_collector_.initialize(runtime, num_aicore, device_id, alloc_cb, register_cb, free_cb);
 }
 
 void DeviceRunner::poll_and_collect_performance_data(int expected_tasks) {
-    perf_collector_.poll_and_collect(expected_tasks);
+    l2_perf_collector_.poll_and_collect(expected_tasks);
 }
 
 int DeviceRunner::export_swimlane_json(const std::string &output_path) {
-    return perf_collector_.export_swimlane_json(output_path);
+    return l2_perf_collector_.export_swimlane_json(output_path);
 }
 
 int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_id) {

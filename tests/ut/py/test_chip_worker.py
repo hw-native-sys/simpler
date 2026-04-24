@@ -21,22 +21,39 @@ class TestChipCallConfig:
         config = ChipCallConfig()
         assert config.block_dim == 24
         assert config.aicpu_thread_num == 3
-        assert config.enable_profiling is False
+        assert config.enable_l2_swimlane is False
+        assert config.enable_dump_tensor is False
+        assert config.enable_pmu == 0
 
     def test_setters(self):
         config = ChipCallConfig()
         config.block_dim = 32
         config.aicpu_thread_num = 4
-        config.enable_profiling = True
+        config.enable_l2_swimlane = True
         assert config.block_dim == 32
         assert config.aicpu_thread_num == 4
-        assert config.enable_profiling is True
+        assert config.enable_l2_swimlane is True
+
+    def test_diagnostics_subfeatures_are_parallel(self):
+        # Guard against drift: the three diagnostics sub-features under the
+        # profiling umbrella must all round-trip through the nanobind surface.
+        config = ChipCallConfig()
+        config.enable_l2_swimlane = True
+        config.enable_dump_tensor = True
+        config.enable_pmu = 2
+        assert config.enable_l2_swimlane is True
+        assert config.enable_dump_tensor is True
+        assert config.enable_pmu == 2
+        r = repr(config)
+        assert "enable_l2_swimlane=True" in r
+        assert "enable_dump_tensor=True" in r
+        assert "enable_pmu=2" in r
 
     def test_repr(self):
         config = ChipCallConfig()
         r = repr(config)
         assert "block_dim=24" in r
-        assert "enable_profiling=False" in r
+        assert "enable_l2_swimlane=False" in r
 
 
 # ============================================================================

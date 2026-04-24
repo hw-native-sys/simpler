@@ -14,11 +14,11 @@ Converts performance data JSON (.json) to Mermaid flowchart format
 for visualizing task dependencies.
 
 Usage:
-    python3 perf_to_mermaid.py  # Uses latest perf_swimlane_*.json in outputs/
-    python3 perf_to_mermaid.py perf_swimlane_20260210_143526.json
-    python3 perf_to_mermaid.py perf_swimlane_20260210_143526.json -o dependency_graph.md
-    python3 perf_to_mermaid.py perf_swimlane_20260210_143526.json -k kernel_config.py
-    python3 perf_to_mermaid.py perf_swimlane_20260210_143526.json --style compact
+    python3 perf_to_mermaid.py  # Uses latest l2_perf_records_*.json in outputs/
+    python3 perf_to_mermaid.py l2_perf_records_20260210_143526.json
+    python3 perf_to_mermaid.py l2_perf_records_20260210_143526.json -o dependency_graph.md
+    python3 perf_to_mermaid.py l2_perf_records_20260210_143526.json -k kernel_config.py
+    python3 perf_to_mermaid.py l2_perf_records_20260210_143526.json --style compact
 """
 
 import argparse
@@ -223,12 +223,12 @@ def _build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s                                       # latest perf_swimlane_*.json under outputs/
-  %(prog)s perf_swimlane_20260210_143526.json   # -> outputs/mermaid_diagram_20260210_143526.md
-  %(prog)s perf_swimlane_20260210_143526.json -o custom_diagram.md
-  %(prog)s perf_swimlane_20260210_143526.json -k kernel_config.py
-  %(prog)s perf_swimlane_20260210_143526.json --style compact
-  %(prog)s perf_swimlane_20260210_143526.json -v
+  %(prog)s                                       # latest l2_perf_records_*.json under outputs/
+  %(prog)s l2_perf_records_20260210_143526.json   # -> outputs/mermaid_diagram_20260210_143526.md
+  %(prog)s l2_perf_records_20260210_143526.json -o custom_diagram.md
+  %(prog)s l2_perf_records_20260210_143526.json -k kernel_config.py
+  %(prog)s l2_perf_records_20260210_143526.json --style compact
+  %(prog)s l2_perf_records_20260210_143526.json -v
 
 View the Mermaid diagram:
   1. GitHub/GitLab Markdown preview
@@ -239,7 +239,7 @@ View the Mermaid diagram:
     parser.add_argument(
         "input",
         nargs="?",
-        help="Input JSON (.json). If omitted, use the newest perf_swimlane_*.json under outputs/",
+        help="Input JSON (.json). If omitted, use the newest l2_perf_records_*.json under outputs/",
     )
     parser.add_argument(
         "-o",
@@ -272,7 +272,7 @@ View the Mermaid diagram:
 
 
 def _resolve_input_path(args):
-    """Resolve input path, auto-selecting latest perf_swimlane_*.json if not specified."""
+    """Resolve input path, auto-selecting latest l2_perf_records_*.json if not specified."""
     if args.input is not None:
         input_path = Path(args.input)
         if not input_path.exists():
@@ -281,9 +281,9 @@ def _resolve_input_path(args):
         return input_path
 
     outputs_dir = Path(__file__).parent.parent / "outputs"
-    json_files = list(outputs_dir.glob("perf_swimlane_*.json"))
+    json_files = list(outputs_dir.glob("l2_perf_records_*.json"))
     if not json_files:
-        print(f"Error: no perf_swimlane_*.json under {outputs_dir}", file=sys.stderr)
+        print(f"Error: no l2_perf_records_*.json under {outputs_dir}", file=sys.stderr)
         print("Specify an input file or add .json files under outputs/", file=sys.stderr)
         return None
 
@@ -299,8 +299,8 @@ def _resolve_output_path(args, input_path):
         return Path(args.output)
 
     input_stem = input_path.stem
-    if input_stem.startswith("perf_swimlane_"):
-        timestamp_part = input_stem[len("perf_swimlane_") :]
+    if input_stem.startswith("l2_perf_records_"):
+        timestamp_part = input_stem[len("l2_perf_records_") :]
     else:
         timestamp_part = datetime.now().strftime("%Y%m%d_%H%M%S")
 
