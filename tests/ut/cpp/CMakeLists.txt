@@ -81,8 +81,8 @@ set(A2A3_RUNTIME_DIR ${CMAKE_SOURCE_DIR}/../../../src/a2a3/runtime/tensormap_and
 set(A2A3_STUB_SOURCES ${CMAKE_SOURCE_DIR}/stubs/test_stubs.cpp)
 set(A2A3_RUNTIME_SOURCES
     ${A2A3_RUNTIME_DIR}/pto_ring_buffer.cpp
-    ${A2A3_RUNTIME_DIR}/pto_shared_memory.cpp
-    ${A2A3_RUNTIME_DIR}/pto_scheduler.cpp
+    ${A2A3_RUNTIME_DIR}/shared/pto_shared_memory.cpp
+    ${A2A3_RUNTIME_DIR}/scheduler/pto_scheduler.cpp
     ${A2A3_RUNTIME_DIR}/pto_tensormap.cpp
 )
 
@@ -229,6 +229,48 @@ add_task_interface_test(test_child_memory types/test_child_memory.cpp)
 # A2A3 tests (src/a2a3/runtime/tensormap_and_ringbuffer/)
 # ---------------------------------------------------------------------------
 add_a2a3_test(test_a2a3_fatal a2a3/test_a2a3_fatal.cpp)
+
+# PTO2 runtime-linked tests
+add_a2a3_runtime_test(test_task_allocator
+    SOURCES a2a3/test_task_allocator.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_dep_list_pool
+    SOURCES a2a3/test_dep_list_pool.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_scheduler_state
+    SOURCES a2a3/test_scheduler_state.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_task_state
+    SOURCES a2a3/test_task_state.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_ready_queue
+    SOURCES a2a3/test_ready_queue.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_shared_memory
+    SOURCES a2a3/test_shared_memory.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_a2a3_tensormap
+    SOURCES a2a3/test_tensormap.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_fanin_pool
+    SOURCES a2a3/test_fanin_pool.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_spsc_queue
+    SOURCES a2a3/test_spsc_queue.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
+add_a2a3_runtime_test(test_wiring
+    SOURCES a2a3/test_wiring.cpp
+    EXTRA_SOURCES ${A2A3_RUNTIME_SOURCES}
+)
 
 # ---------------------------------------------------------------------------
 # A5 tests (src/a5/runtime/tensormap_and_ringbuffer/)

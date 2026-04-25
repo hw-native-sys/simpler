@@ -8,6 +8,12 @@
  * See LICENSE in the root of the software repository for the full text of the License.
  * -----------------------------------------------------------------------------------------------------------
  */
+/**
+ * Unit tests for PTO2 A2A3 fatal error handling.
+ *
+ * Tests API short-circuit after fatal state, explicit fatal routing,
+ * and allocation with invalid arguments.
+ */
 
 #include <gtest/gtest.h>
 
