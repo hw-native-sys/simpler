@@ -232,25 +232,23 @@ struct PTO2TaskDescriptor {
 /**
  * Task payload data (cold path - only accessed during orchestration and dispatch)
  *
- * Layout: metadata + inline fanin packed in the first 3 cache lines, followed
+ * Layout: metadata + inline fanin packed in the first 9 cache lines, followed
  * by bulk tensor and scalar data. Small fanins stay fully inline; larger
  * fanins spill into a per-ring ring buffer slice.
  */
 struct PTO2TaskPayload {
-    // === Cache lines 0-2 (192B) — metadata ===
+    // === Cache lines 0-8 (576B) — metadata + inline fanin ===
     int32_t tensor_count{0};
     int32_t scalar_count{0};
     int32_t fanin_actual_count{0};  // Actual fanin count (without the +1 redundance)
     int32_t fanin_spill_start{0};   // Linear start index in fanin spill pool (0 = no spill)
+    bool complete_in_future{false};
     PTO2FaninPool *fanin_spill_pool{nullptr};
     PTO2TaskSlotState *fanin_inline_slot_states[PTO2_FANIN_INLINE_CAP];
-    // === Cache lines 3-34 (2048B) — tensors (alignas(64) forces alignment) ===
+    // === Cache lines 9-40 (2048B) — tensors (alignas(64) forces alignment) ===
     Tensor tensors[MAX_TENSOR_ARGS];
-    // === Cache lines 35-38 (256B) — scalars ===
+    // === Cache lines 41-44 (256B) — scalars ===
     uint64_t scalars[MAX_SCALAR_ARGS];
-    bool complete_in_future{false};
-    uint32_t deferred_completion_count{0};
-    PTO2DeferredCompletionEntry deferred_completion_entries[PTO2_MAX_COMPLETIONS_PER_TASK];
 
     // Layout verification (size checks that don't need offsetof).
     static_assert(sizeof(Tensor) == 128, "Tensor must be 2 cache lines");
@@ -292,18 +290,23 @@ struct PTO2TaskPayload {
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
         complete_in_future = complete_in_future_flag;
-        deferred_completion_count = 0;
     }
 };
 
 // PTO2TaskPayload layout verification (offsetof requires complete type).
+static_assert(offsetof(PTO2TaskPayload, complete_in_future) == 16, "deferred flag must stay in the first cache line");
+static_assert(offsetof(PTO2TaskPayload, fanin_spill_pool) == 24, "spill pool pointer layout drift");
 static_assert(
-    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 24, "inline fanin array must follow spill metadata"
+    offsetof(PTO2TaskPayload, fanin_inline_slot_states) == 32, "inline fanin array must follow spill metadata"
 );
-static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 192 (cache line 3)");
+static_assert(offsetof(PTO2TaskPayload, tensors) == 576, "tensors must start at byte 576 (cache line 9)");
 static_assert(
     offsetof(PTO2TaskPayload, scalars) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor),
     "scalars must immediately follow tensors"
+);
+static_assert(
+    sizeof(PTO2TaskPayload) == 576 + MAX_TENSOR_ARGS * sizeof(Tensor) + MAX_SCALAR_ARGS * sizeof(uint64_t),
+    "PTO2TaskPayload size must stay on the baseline cache-line footprint"
 );
 
 /**

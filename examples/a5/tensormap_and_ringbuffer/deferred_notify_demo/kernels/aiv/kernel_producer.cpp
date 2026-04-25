@@ -49,6 +49,15 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     for (uint32_t i = 0; i < n; ++i) {
         peer_mailbox[i] = partial[i];
     }
+#if defined(__CCE_KT_TEST__) || defined(__CCE_AICORE__) || defined(__DAV_C220__)
+    dcci((__gm__ int32_t *)peer_mailbox, ENTIRE_DATA_CACHE, CACHELINE_OUT);
+#if defined(__CPU_SIM)
+    dsb(0);
+#else
+    dsb(DSB_DDR);
+#endif
+    pipe_barrier(PIPE_ALL);
+#endif
 
     __gm__ int32_t *peer_counter = comm_remote_ptr(ctx, local_counter, peer_rank);
     pto::comm::Signal peer_signal(peer_counter);

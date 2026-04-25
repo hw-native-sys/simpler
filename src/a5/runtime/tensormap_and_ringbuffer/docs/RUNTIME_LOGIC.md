@@ -395,7 +395,7 @@ Key members:
 | 2 | Initialize task descriptor + slot state, copy parameters |
 | 3 | **Lookup**: for each INPUT/INOUT param, search TensorMap for producers; collect producer pointers in `PTO2FaninBuilder` |
 | 4 | **Insert**: register OUTPUT/INOUT args in TensorMap |
-| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >16); increment each producer's `fanout_count` (no lock needed — single writer). This step runs **before** `payload.init()`. |
+| 5 | **Record fanin metadata**: store producer pointers in `payload->fanin_inline_slot_states[]` (+ spill pool if >64); increment each producer's `fanout_count` (no lock needed — single writer). This step runs **before** `payload.init()`. |
 | 6 | **Push to wiring queue**: push to global `PTO2SpscQueue`; scheduler thread 0 asynchronously wires fanout edges (lock + dep_pool + early_finished check + ready push) |
 
 > **Note**: Fanout wiring (Steps 4–7 in earlier versions) has been moved from the

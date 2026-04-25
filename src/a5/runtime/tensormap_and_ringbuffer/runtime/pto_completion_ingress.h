@@ -56,6 +56,18 @@ struct PTO2DeferredCompletionEntry {
 
 static_assert(sizeof(PTO2DeferredCompletionEntry) == 24, "PTO2DeferredCompletionEntry layout drift");
 
+struct PTO2DeferredCompletionIngressBuffer {
+    alignas(PTO2_ALIGN_SIZE) volatile uint32_t count;
+    volatile int32_t error_code;
+    uint8_t _header_pad[PTO2_ALIGN_SIZE - sizeof(uint32_t) - sizeof(int32_t)];
+    alignas(PTO2_ALIGN_SIZE) PTO2DeferredCompletionEntry entries[PTO2_MAX_COMPLETIONS_PER_TASK];
+};
+
+static_assert(
+    sizeof(PTO2DeferredCompletionIngressBuffer) % PTO2_ALIGN_SIZE == 0,
+    "PTO2DeferredCompletionIngressBuffer size must be cache-line aligned"
+);
+
 struct PTO2CompletionIngressQueue {
     alignas(PTO2_ALIGN_SIZE) volatile uint64_t head;
     uint8_t _head_pad[PTO2_ALIGN_SIZE - sizeof(uint64_t)];

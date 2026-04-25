@@ -1041,7 +1041,7 @@ inline PTO2AsyncPollResult PTO2AsyncWaitList::poll_and_complete(
             }
         }
 
-        if (entry.waiting_completion_count <= 0) {
+        if (entry.normal_done && entry.waiting_completion_count <= 0) {
             if (deferred_release_count >= deferred_release_capacity) {
                 result.error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
                 result.failed_slot_state = entry.slot_state;

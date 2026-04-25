@@ -107,6 +107,7 @@ struct PTO2AsyncWaitEntry {
     PTO2CompletionCondition conditions[PTO2_MAX_COMPLETIONS_PER_TASK];
     int32_t condition_count{0};
     int32_t waiting_completion_count{0};
+    bool normal_done{false};
 };
 
 struct PTO2PendingCompletion {
@@ -249,7 +250,26 @@ struct PTO2AsyncWaitList {
 
     enum class RegisterResult { Registered, NotDeferred, Skipped, Error };
 
-    RegisterResult register_deferred(PTO2TaskSlotState &slot_state, int32_t &error_code) {
+    bool append_condition_locked(
+        PTO2AsyncWaitEntry &entry, uint64_t addr, uint32_t expected_value, PTO2AsyncEngine engine, int32_t &error_code
+    ) {
+        if (entry.condition_count >= PTO2_MAX_COMPLETIONS_PER_TASK) {
+            error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
+            return false;
+        }
+        PTO2CompletionCondition &cond = entry.conditions[entry.condition_count++];
+        cond.engine = engine;
+        cond.satisfied = false;
+        cond.counter_addr = reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(addr));
+        cond.expected_value = expected_value;
+        entry.waiting_completion_count++;
+        return true;
+    }
+
+    RegisterResult register_deferred(
+        PTO2TaskSlotState &slot_state, volatile PTO2DeferredCompletionIngressBuffer *ingress, bool normal_done,
+        int32_t &error_code
+    ) {
         error_code = PTO2_ERROR_NONE;
         PTO2TaskPayload *payload = slot_state.payload;
         if (payload == nullptr || !payload->complete_in_future) {
@@ -258,41 +278,67 @@ struct PTO2AsyncWaitList {
 
         if (!try_lock()) return RegisterResult::Skipped;
 
-        if (count >= PTO2_MAX_ASYNC_WAITS) {
-            error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
-            unlock();
-            return RegisterResult::Error;
+        uint32_t deferred_count = 0;
+        if (ingress != nullptr) {
+            cache_invalidate_range(
+                const_cast<const void *>(reinterpret_cast<volatile void *>(ingress)), PTO2_ALIGN_SIZE
+            );
+            if (ingress->error_code != PTO2_ERROR_NONE) {
+                error_code = ingress->error_code;
+                unlock();
+                return RegisterResult::Error;
+            }
+            deferred_count = ingress->count;
         }
-
-        PTO2AsyncWaitEntry &entry = entries[count++];
-        entry.slot_state = &slot_state;
-        entry.task_token = slot_state.task->task_id;
-        entry.condition_count = 0;
-        entry.waiting_completion_count = 0;
-
-        cache_invalidate_range(&payload->deferred_completion_count, sizeof(payload->deferred_completion_count));
-        uint32_t deferred_count = payload->deferred_completion_count;
         if (deferred_count > PTO2_MAX_COMPLETIONS_PER_TASK) {
             error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
             unlock();
             return RegisterResult::Error;
         }
-        if (deferred_count > 0) {
+        if (deferred_count > 0 && ingress != nullptr) {
             cache_invalidate_range(
-                payload->deferred_completion_entries, deferred_count * sizeof(PTO2DeferredCompletionEntry)
+                const_cast<const void *>(reinterpret_cast<volatile void *>(ingress->entries)),
+                deferred_count * sizeof(PTO2DeferredCompletionEntry)
             );
         }
-        for (uint32_t i = 0; i < deferred_count; ++i) {
-            const PTO2DeferredCompletionEntry &deferred = payload->deferred_completion_entries[i];
-            PTO2CompletionCondition &cond = entry.conditions[entry.condition_count++];
-            cond.engine = static_cast<PTO2AsyncEngine>(deferred.engine);
-            cond.satisfied = false;
-            cond.counter_addr = reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(deferred.addr));
-            cond.expected_value = deferred.expected_value;
-            entry.waiting_completion_count++;
+        PTO2AsyncWaitEntry *entry = find_entry_by_token(slot_state.task->task_id);
+        if (entry == nullptr) {
+            if (!normal_done && deferred_count == 0) {
+                unlock();
+                return RegisterResult::Registered;
+            }
+            if (count >= PTO2_MAX_ASYNC_WAITS) {
+                error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
+                unlock();
+                return RegisterResult::Error;
+            }
+            entry = &entries[count++];
+            entry->slot_state = &slot_state;
+            entry->task_token = slot_state.task->task_id;
+            entry->condition_count = 0;
+            entry->waiting_completion_count = 0;
+            entry->normal_done = false;
+        }
+        if (normal_done) {
+            entry->normal_done = true;
         }
 
-        absorb_pending_completions_locked(entry);
+        for (uint32_t i = 0; i < deferred_count; ++i) {
+            volatile PTO2DeferredCompletionEntry *deferred = &ingress->entries[i];
+            volatile uint32_t *counter = reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(deferred->addr));
+            cache_invalidate_range(
+                reinterpret_cast<const void *>(pto2_completion_ingress_cache_line(counter)), sizeof(uint32_t)
+            );
+            if (!append_condition_locked(
+                    *entry, deferred->addr, deferred->expected_value, static_cast<PTO2AsyncEngine>(deferred->engine),
+                    error_code
+                )) {
+                unlock();
+                return RegisterResult::Error;
+            }
+        }
+
+        absorb_pending_completions_locked(*entry);
         unlock();
         return RegisterResult::Registered;
     }

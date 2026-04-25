@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import os
 import tempfile
+from multiprocessing.shared_memory import SharedMemory
 
 import torch
 from simpler.task_interface import (
@@ -27,6 +28,7 @@ from simpler.task_interface import (
     ContinuousTensor,
     CoreCallable,
     DataType,
+    HostBufferStaging,
     TaskArgs,
     TensorArgType,
 )
@@ -118,6 +120,12 @@ def run(
 
     partial = [torch.full((N,), float(rank + 1), dtype=torch.float32).share_memory_() for rank in range(nranks)]
     result = [torch.zeros(N, dtype=torch.float32).share_memory_() for _ in range(nranks)]
+    counter_init_shms = [SharedMemory(create=True, size=counter_nbytes) for _ in range(nranks)]
+    for shm in counter_init_shms:
+        buf = shm.buf
+        if buf is None:
+            raise RuntimeError("SharedMemory buffer is unavailable")
+        buf[:counter_nbytes] = b"\x00" * counter_nbytes
 
     cfgs = [
         ChipBootstrapConfig(
@@ -126,7 +134,16 @@ def run(
             ),
             buffers=[
                 ChipBufferSpec(name="mailbox", dtype="float32", count=N, nbytes=mailbox_nbytes),
-                ChipBufferSpec(name="notify_counter", dtype="int32", count=1, nbytes=counter_nbytes),
+                ChipBufferSpec(
+                    name="notify_counter",
+                    dtype="int32",
+                    count=1,
+                    nbytes=counter_nbytes,
+                    load_from_host=True,
+                ),
+            ],
+            host_inputs=[
+                HostBufferStaging(name="notify_counter", shm_name=counter_init_shms[rank].name, size=counter_nbytes)
             ],
         )
         for rank in range(nranks)
@@ -187,6 +204,9 @@ def run(
             os.unlink(rootinfo_path)
         except FileNotFoundError:
             pass
+        for shm in counter_init_shms:
+            shm.close()
+            shm.unlink()
 
 
 def test_deferred_notify_demo() -> None:

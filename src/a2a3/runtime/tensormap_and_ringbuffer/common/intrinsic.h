@@ -65,7 +65,7 @@
 /** Number of extra pointer slots appended to the args[] tail (LocalContext + GlobalContext). */
 static constexpr int32_t PTO2_EXT_PARAMS_COUNT = 2;
 
-struct PTO2DeferredCompletionEntry;
+struct PTO2DeferredCompletionIngressBuffer;
 
 /**
  * Args[] suffix indices for context pointers.
@@ -102,8 +102,7 @@ struct LocalContext {
                         // NOT the same as RUNTIME_CONFIG.block_dim in kernel_config.py,
                         // which controls how many physical cores the runtime launches.
     PTO2TaskId task_token;
-    volatile __gm__ PTO2DeferredCompletionEntry *deferred_completion_entries;
-    volatile __gm__ uint32_t *deferred_completion_count;
+    volatile __gm__ PTO2DeferredCompletionIngressBuffer *deferred_ingress;
     uint32_t deferred_completion_capacity;
 };
 

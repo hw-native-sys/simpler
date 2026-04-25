@@ -81,24 +81,14 @@ void SchedulerContext::complete_slot_task(
     (void)hank;
 #endif
     bool mixed_complete = sched_->on_subtask_complete(slot_state);
-    if (mixed_complete) {
-#if PTO2_PROFILING
-        if (get_enable_dump_tensor()) {
-            dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
-                thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
-                [](uint8_t active_mask, uint8_t raw_subtask_id) {
-                    return pto2_subtask_active(active_mask, static_cast<PTO2SubtaskSlot>(raw_subtask_id));
-                },
-                [this](int32_t func_id) {
-                    return get_function_bin_addr(func_id);
-                }
-            );
-        }
-#endif
+    if (slot_state.payload != nullptr && slot_state.payload->complete_in_future) {
         int32_t reg_err = PTO2_ERROR_NONE;
         PTO2AsyncWaitList::RegisterResult reg_result;
+        volatile PTO2DeferredCompletionIngressBuffer *deferred_ingress =
+            &deferred_ingress_per_core_[core_id][expected_reg_task_id & 1];
         do {
-            reg_result = sched_->async_wait_list.register_deferred(slot_state, reg_err);
+            reg_result =
+                sched_->async_wait_list.register_deferred(slot_state, deferred_ingress, mixed_complete, reg_err);
             if (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped) {
                 SPIN_WAIT_HINT();
             }
@@ -113,10 +103,24 @@ void SchedulerContext::complete_slot_task(
             return;
         }
 
-        if (reg_result == PTO2AsyncWaitList::RegisterResult::Registered) {
+        if (mixed_complete && reg_result == PTO2AsyncWaitList::RegisterResult::Registered) {
             return;
         }
-
+    }
+    if (mixed_complete) {
+#if PTO2_PROFILING
+        if (get_enable_dump_tensor()) {
+            dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
+                thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
+                [](uint8_t active_mask, uint8_t raw_subtask_id) {
+                    return pto2_subtask_active(active_mask, static_cast<PTO2SubtaskSlot>(raw_subtask_id));
+                },
+                [this](int32_t func_id) {
+                    return get_function_bin_addr(func_id);
+                }
+            );
+        }
+#endif
 #if PTO2_SCHED_PROFILING
         PTO2CompletionStats cstats = sched_->on_mixed_task_complete(slot_state, thread_idx, local_bufs);
         l2_perf.notify_edges_total += cstats.fanout_edges;

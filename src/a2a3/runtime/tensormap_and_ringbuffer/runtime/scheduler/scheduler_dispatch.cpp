@@ -17,6 +17,7 @@
 #include "aicpu/platform_regs.h"
 #include "callable.h"
 #include "common/l2_perf_profiling.h"
+#include "common/memory_barrier.h"
 #include "common/platform_config.h"
 #include "pto_runtime2.h"
 #include "runtime.h"
@@ -86,7 +87,8 @@ int SchedulerContext::pop_ready_tasks_batch(
 }
 
 void SchedulerContext::build_payload(
-    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot
+    PTO2DispatchPayload &dispatch_payload, PTO2TaskSlotState &slot_state, PTO2SubtaskSlot subslot,
+    PTO2DeferredCompletionIngressBuffer *deferred_ingress
 ) {
     int32_t slot_idx = static_cast<int32_t>(subslot);
     uint64_t callable_addr = get_function_bin_addr(slot_state.task->kernel_id[slot_idx]);
@@ -104,10 +106,7 @@ void SchedulerContext::build_payload(
     dispatch_payload.local_context.block_num = slot_state.logical_block_num;
     dispatch_payload.local_context.task_token =
         payload.complete_in_future ? slot_state.task->task_id : PTO2TaskId::invalid();
-    dispatch_payload.local_context.deferred_completion_entries =
-        payload.complete_in_future ? payload.deferred_completion_entries : nullptr;
-    dispatch_payload.local_context.deferred_completion_count =
-        payload.complete_in_future ? &payload.deferred_completion_count : nullptr;
+    dispatch_payload.local_context.deferred_ingress = payload.complete_in_future ? deferred_ingress : nullptr;
     dispatch_payload.local_context.deferred_completion_capacity =
         payload.complete_in_future ? PTO2_MAX_COMPLETIONS_PER_TASK : 0;
     dispatch_payload.args[PAYLOAD_LOCAL_CONTEXT_INDEX] = reinterpret_cast<uint64_t>(&dispatch_payload.local_context);
@@ -138,7 +137,15 @@ void SchedulerContext::dispatch_subtask_to_core(
 
     uint32_t buf_idx = reg_task_id & 1u;
     PTO2DispatchPayload &payload = payload_per_core_[core_id][buf_idx];
-    build_payload(payload, slot_state, subslot);
+    PTO2DeferredCompletionIngressBuffer *deferred_ingress = nullptr;
+    if (slot_state.payload != nullptr && slot_state.payload->complete_in_future) {
+        deferred_ingress = &deferred_ingress_per_core_[core_id][buf_idx];
+        deferred_ingress->count = 0;
+        deferred_ingress->error_code = PTO2_ERROR_NONE;
+        OUT_OF_ORDER_STORE_BARRIER();
+        cache_flush_range(deferred_ingress, PTO2_ALIGN_SIZE);
+    }
+    build_payload(payload, slot_state, subslot, deferred_ingress);
 
     if (to_pending) {
         core_exec_state.pending_subslot = subslot;
@@ -446,8 +453,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         }
 
         if (rt_ != nullptr && rt_->completion_ingress != nullptr &&
-            (sched_->async_wait_list.count > 0 || sched_->async_wait_list.pending_completion_count > 0 ||
-             pto2_completion_ingress_has_pending(rt_->completion_ingress))) {
+            (sched_->async_wait_list.count > 0 || sched_->async_wait_list.pending_completion_count > 0)) {
             PTO2AsyncPollResult poll_result = sched_->async_wait_list.poll_and_complete<false>(
                 rt_->completion_ingress, sched_, local_bufs, deferred_release_slot_states, deferred_release_count,
                 PTO2_DEFERRED_RELEASE_CAP

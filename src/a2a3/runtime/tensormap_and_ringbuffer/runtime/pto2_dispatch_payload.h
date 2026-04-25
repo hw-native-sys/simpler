@@ -81,9 +81,13 @@ struct alignas(64) PTO2DispatchPayload {
      *  args[SPMD_GLOBAL_CONTEXT_INDEX] points here. */
     GlobalContext global_context;
 
+    uint8_t reserved_payload_abi_pad[8];
+
     static_assert(sizeof(args[0]) == 8);
     static_assert(
         PTO2_ALIGN_UP((MAX_TENSOR_ARGS + MAX_SCALAR_ARGS) * sizeof(args[0]), 64) ==
         (MAX_TENSOR_ARGS + MAX_SCALAR_ARGS) * sizeof(args[0])
     );
 };
+
+static_assert(sizeof(PTO2DispatchPayload) == 512, "PTO2DispatchPayload hardware ABI size drift");
