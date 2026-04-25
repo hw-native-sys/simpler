@@ -13,7 +13,7 @@
  * @file pmu_collector_aicpu.h
  * @brief AICPU-side PMU collection interface (a5)
  *
- * Split of duties (mirrors a2a3 perf):
+ * Split of duties:
  *   - AICPU owns init (event selectors, PMU_CTRL_0/1 start) and finalize
  *     (CTRL restore). It also publishes per-core pmu_buffer_addr /
  *     pmu_reg_base into Handshake at init time so AICore can do the
@@ -51,8 +51,8 @@
 
 extern "C" void set_platform_pmu_base(uint64_t pmu_data_base);
 extern "C" uint64_t get_platform_pmu_base();
-extern "C" void set_enable_pmu(bool enable);
-extern "C" bool get_enable_pmu();
+extern "C" void set_pmu_enabled(bool enable);
+extern "C" bool is_pmu_enabled();
 
 /**
  * Initialize PMU for all cores.
@@ -95,8 +95,6 @@ void pmu_aicpu_init(Handshake *handshakes, const uint32_t *physical_core_ids, in
  * Every call bumps PmuBufferState::total_record_count so host can cross-check
  * collected + dropped against the AICPU's attempted-commit count.
  * No-op if PMU is not enabled or the core has no PMU buffer bound.
- *
- * Mirrors a2a3's perf_aicpu_complete_record.
  *
  * @param core_id     Logical core index
  * @param thread_idx  AICPU thread index (reserved; not used on a5 memcpy path)

@@ -602,7 +602,7 @@ def _convert_case_swimlane(
     the runtime's second-precision filename collisions), then invoke the converter.
 
     The ``l2_perf_records_`` prefix is preserved so the converter's stem-based output
-    naming still strips it and produces ``merged_swimlane_<ts>_<case_label>.json``.
+    naming still strips it and produces ``merged_swimlane_<case_label>_<ts>.json``.
 
     When ``callable_spec`` is provided and contains ``"name"`` entries on incores,
     a ``func_id_names_<label>.json`` sidecar is written and passed to the converter
@@ -616,12 +616,12 @@ def _convert_case_swimlane(
         logger.warning(f"[{case_label}] No new l2_perf_records_*.json produced; skipping conversion")
         return
     safe_label = _sanitize_for_filename(case_label)
-    suffix = (
+    timestamp = (
         l2_perf_records_file.stem[len("l2_perf_records_") :]
         if l2_perf_records_file.stem.startswith("l2_perf_records_")
         else l2_perf_records_file.stem
     )
-    renamed = l2_perf_records_file.with_name(f"l2_perf_records_{suffix}_{safe_label}.json")
+    renamed = l2_perf_records_file.with_name(f"l2_perf_records_{safe_label}_{timestamp}.json")
     if renamed.exists():
         logger.warning(f"[{case_label}] target {renamed.name} already exists; overwriting")
         renamed.unlink()

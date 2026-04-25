@@ -81,7 +81,7 @@ public:
      * @return 0 on success
      */
     int initialize(
-        int num_cores, uint32_t event_type, uint64_t *kernel_args_pmu_data_base, PmuAllocCallback alloc_cb,
+        int num_cores, PmuEventType event_type, uint64_t *kernel_args_pmu_data_base, PmuAllocCallback alloc_cb,
         PmuFreeCallback free_cb, PmuCopyToDeviceCallback copy_to_dev_cb, PmuCopyFromDeviceCallback copy_from_dev_cb
     );
 
@@ -110,7 +110,7 @@ private:
     std::vector<void *> core_buffers_dev_;  // PmuBuffer* per core (device)
 
     int num_cores_{0};
-    uint32_t event_type_{0};
+    PmuEventType event_type_{PmuEventType::PIPE_UTILIZATION};
     size_t pmu_buffer_bytes_{0};
     size_t setup_region_bytes_{0};
 
@@ -133,7 +133,7 @@ private:
 inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
     PmuEventType resolved = PmuEventType::PIPE_UTILIZATION;
     if (requested_event_type > 0 &&
-        pmu_resolve_event_config_a5(static_cast<uint32_t>(requested_event_type)) != nullptr) {
+        pmu_resolve_event_config_a5(static_cast<PmuEventType>(requested_event_type)) != nullptr) {
         resolved = static_cast<PmuEventType>(requested_event_type);
     } else if (requested_event_type != 0) {
         LOG_WARN(
@@ -146,7 +146,7 @@ inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
         return resolved;
     }
     int val = std::atoi(pmu_env);
-    if (val > 0 && pmu_resolve_event_config_a5(static_cast<uint32_t>(val)) != nullptr) {
+    if (val > 0 && pmu_resolve_event_config_a5(static_cast<PmuEventType>(val)) != nullptr) {
         resolved = static_cast<PmuEventType>(val);
         LOG_INFO("PMU event type set to %u from SIMPLER_PMU_EVENT_TYPE", static_cast<uint32_t>(resolved));
         return resolved;

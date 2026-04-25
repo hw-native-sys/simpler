@@ -351,7 +351,7 @@ int32_t SchedulerContext::shutdown(int32_t thread_idx) {
     if (core_num == 0) return 0;
 
 #if PTO2_PROFILING
-    if (get_enable_pmu()) {
+    if (is_pmu_enabled()) {
         pmu_aicpu_finalize(cores, core_num);
     }
 #endif
@@ -743,7 +743,7 @@ void SchedulerContext::on_orchestration_done(
     Runtime *runtime, PTO2Runtime *rt, int32_t thread_idx, int32_t total_tasks
 ) {
 #if PTO2_PROFILING
-    if (get_enable_l2_swimlane()) {
+    if (is_l2_swimlane_enabled()) {
         // Flush orchestrator's phase record buffer
         l2_perf_aicpu_flush_phase_buffers(thread_idx);
     }
@@ -797,7 +797,7 @@ void SchedulerContext::on_orchestration_done(
     // Write core-to-thread mapping AFTER reassignment so the profiling data
     // reflects the final distribution (all active_sched_threads_, including
     // former orchestrator threads when orch_to_sched_ is enabled).
-    if (get_enable_l2_swimlane()) {
+    if (is_l2_swimlane_enabled()) {
         l2_perf_aicpu_init_core_assignments(cores_total_num_);
         for (int32_t t = 0; t < active_sched_threads_; t++) {
             l2_perf_aicpu_write_core_assignments_for_thread(

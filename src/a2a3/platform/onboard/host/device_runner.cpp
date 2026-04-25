@@ -532,14 +532,11 @@ int DeviceRunner::run(
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
         runtime.workers[i].aicore_done = 0;
-        runtime.workers[i].control = 0;
         runtime.workers[i].task = 0;
-        runtime.workers[i].task_status = 0;
         // Set core type: first 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
         runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
         runtime.workers[i].l2_perf_records_addr = static_cast<uint64_t>(0);
-        runtime.workers[i].l2_perf_buffer_status = 0;
     }
 
     // Set function_bin_addr for all tasks: func_id_to_addr_[] stores CoreCallable
@@ -599,9 +596,7 @@ int DeviceRunner::run(
     }
 
     if (enable_pmu_) {
-        rc = init_pmu_buffers(
-            num_aicore, launch_aicpu_num, make_pmu_csv_path(), static_cast<uint32_t>(pmu_event_type_), device_id
-        );
+        rc = init_pmu_buffers(num_aicore, launch_aicpu_num, make_pmu_csv_path(), pmu_event_type_, device_id);
         if (rc != 0) {
             LOG_ERROR("PMU init failed: %d, disabling PMU for this run", rc);
             kernel_args_.args.pmu_data_base = 0;
@@ -778,8 +773,8 @@ void DeviceRunner::print_handshake_results() {
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
     for (int i = 0; i < worker_count_; i++) {
         LOG_DEBUG(
-            "  Core %d: aicore_done=%d aicpu_ready=%d control=%d task=%d", i, workers[i].aicore_done,
-            workers[i].aicpu_ready, workers[i].control, workers[i].task
+            "  Core %d: aicore_done=%d aicpu_ready=%d task=%d", i, workers[i].aicore_done, workers[i].aicpu_ready,
+            workers[i].task
         );
     }
 }
@@ -1180,7 +1175,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
 }
 
 int DeviceRunner::init_pmu_buffers(
-    int num_cores, int num_threads, const std::string &csv_path, uint32_t event_type, int device_id
+    int num_cores, int num_threads, const std::string &csv_path, PmuEventType event_type, int device_id
 ) {
     auto alloc_cb = [](size_t size, void *user_data) -> void * {
         auto *allocator = static_cast<MemoryAllocator *>(user_data);

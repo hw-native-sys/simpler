@@ -79,8 +79,8 @@ struct L2PerfRecord {
     uint64_t duration;    // Execution duration (end - start)
 
     // AICPU-side timestamps (written by AICPU, not AICore)
-    uint64_t dispatch_time;  // AICPU timestamp: when task was dispatched to AICore (task_status set to 1)
-    uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion (task_status back to 0)
+    uint64_t dispatch_time;  // AICPU timestamp: when task was dispatched to AICore
+    uint64_t finish_time;    // AICPU timestamp: when AICPU observed task completion
 
     // AICore writes the register dispatch token (low 32 bits only) zero-extended into task_id.
     // For multi-ring runtimes (tensormap_and_ringbuffer, aicpu_build_graph), AICPU overwrites

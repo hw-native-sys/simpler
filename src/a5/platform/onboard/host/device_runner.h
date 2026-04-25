@@ -236,9 +236,9 @@ public:
      * corresponding `enable_*_` members directly. Moved off the generic
      * Runtime struct / run() arg list so all three travel the same way.
      */
-    void set_enable_l2_swimlane(bool enable) { enable_l2_swimlane_ = enable; }
-    void set_enable_dump_tensor(bool enable) { enable_dump_tensor_ = enable; }
-    void set_enable_pmu(int enable_pmu) {
+    void set_l2_swimlane_enabled(bool enable) { enable_l2_swimlane_ = enable; }
+    void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
+    void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
@@ -459,7 +459,7 @@ private:
      * @param event_type   Resolved PmuEventType value
      * @return 0 on success, error code on failure
      */
-    int init_pmu(int num_aicore, uint32_t event_type);
+    int init_pmu(int num_aicore, PmuEventType event_type);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use
@@ -467,7 +467,7 @@ private:
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_enable_pmu()
+    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
 };
 
 #endif  // RUNTIME_DEVICERUNNER_H

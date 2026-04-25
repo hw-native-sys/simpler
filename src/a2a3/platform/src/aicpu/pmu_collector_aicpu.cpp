@@ -16,11 +16,11 @@
  * Uses read_reg/write_reg from platform_regs for MMIO register access,
  * consistent with the rest of the platform layer.
  *
- * Buffer switching mirrors l2_perf_collector_aicpu.cpp:
+ * Buffer switching:
  *   - SPSC free_queue: Host pushes free PmuBuffers, AICPU pops when switching.
  *   - Per-thread ready_queue: AICPU enqueues full buffers for host collection.
  *   - On free_queue empty or ready_queue full: overwrite current buffer (data lost,
- *     same policy as perf profiling — avoids blocking the AICPU dispatch loop).
+ *     avoids blocking the AICPU dispatch loop).
  */
 
 #include "aicpu/pmu_collector_aicpu.h"
@@ -51,9 +51,9 @@ extern "C" void set_platform_pmu_base(uint64_t pmu_data_base) { g_platform_pmu_b
 
 extern "C" uint64_t get_platform_pmu_base() { return g_platform_pmu_base; }
 
-extern "C" void set_enable_pmu(bool enable) { g_enable_pmu = enable; }
+extern "C" void set_pmu_enabled(bool enable) { g_enable_pmu = enable; }
 
-extern "C" bool get_enable_pmu() { return g_enable_pmu; }
+extern "C" bool is_pmu_enabled() { return g_enable_pmu; }
 
 // ---------------------------------------------------------------------------
 // Low-level MMIO helpers (internal use only)
@@ -201,7 +201,7 @@ void pmu_aicpu_init(const uint32_t *physical_core_ids, int num_cores) {
     }
 
     // Program event selectors and start PMU counters on all cores
-    const PmuEventConfig *evt = pmu_resolve_event_config_a2a3(pmu_event_type);
+    const PmuEventConfig *evt = pmu_resolve_event_config_a2a3(static_cast<PmuEventType>(pmu_event_type));
     if (evt == nullptr) {
         evt = &PMU_EVENTS_A2A3_PIPE_UTIL;
     }

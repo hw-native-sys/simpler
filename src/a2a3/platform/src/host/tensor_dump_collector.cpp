@@ -13,7 +13,6 @@
  * @file tensor_dump_collector.cpp
  * @brief Host-side tensor dump collector implementation
  *
- * Mirrors l2_perf_collector.cpp patterns:
  * - DumpMemoryManager: background thread polling dump ready queues
  * - TensorDumpCollector: lifecycle management, arena reads, file export
  */

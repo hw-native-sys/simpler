@@ -14,8 +14,7 @@
  * @brief Tensor dump data structures for device-to-host tensor collection (memcpy-based)
  *
  * A5 simplified design: pre-allocated buffers + direct write + memcpy collect-after-sync.
- * Mirrors L2PerfCollector pattern — no shared memory, no background threads,
- * no SPSC queues.
+ * No shared memory, no background threads, no SPSC queues.
  *
  * Memory layout (allocated only when enable_dump_tensor=true):
  *

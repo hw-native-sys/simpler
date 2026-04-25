@@ -89,6 +89,7 @@ __aicore__ __attribute__((weak)) void aicore_execute(__gm__ Runtime *runtime, in
 
             if (pmu_enabled) {
                 pmu_aicore_end();
+                dcci(my_hank, SINGLE_CACHE_LINE);
                 // Read pmu_buffer_addr / pmu_reg_base per-task (mirrors how
                 // perf_records_addr is read below): by the time AICPU dispatches
                 // a real task_id, pmu_aicpu_init has already published these.

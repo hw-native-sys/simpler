@@ -23,7 +23,7 @@ PmuCollector::~PmuCollector() {
 }
 
 int PmuCollector::initialize(
-    int num_cores, uint32_t event_type, uint64_t *kernel_args_pmu_data_base, PmuAllocCallback alloc_cb,
+    int num_cores, PmuEventType event_type, uint64_t *kernel_args_pmu_data_base, PmuAllocCallback alloc_cb,
     PmuFreeCallback free_cb, PmuCopyToDeviceCallback copy_to_dev_cb, PmuCopyFromDeviceCallback copy_from_dev_cb
 ) {
     if (num_cores <= 0 || num_cores > PLATFORM_MAX_CORES || kernel_args_pmu_data_base == nullptr ||
@@ -42,7 +42,7 @@ int PmuCollector::initialize(
     setup_region_bytes_ = calc_pmu_setup_size(num_cores_);
 
     // Allocate the [PmuSetupHeader][PmuBufferState[num_cores]] shared region
-    // on device, mirroring a2a3's single-allocation layout.
+    // on device in a single allocation.
     setup_header_dev_ = alloc_cb_(setup_region_bytes_);
     if (setup_header_dev_ == nullptr) {
         LOG_ERROR("PmuCollector::initialize: failed to alloc PMU setup region (%zu bytes)", setup_region_bytes_);
@@ -54,7 +54,7 @@ int PmuCollector::initialize(
     std::vector<uint8_t> host_setup(setup_region_bytes_, 0);
     PmuSetupHeader *host_header = get_pmu_setup_header(host_setup.data());
     host_header->num_cores = static_cast<uint32_t>(num_cores_);
-    host_header->event_type = event_type_;
+    host_header->event_type = static_cast<uint32_t>(event_type_);
     for (int i = 0; i < num_cores_; ++i) {
         void *buf_dev = alloc_cb_(pmu_buffer_bytes_);
         if (buf_dev == nullptr) {
@@ -86,8 +86,8 @@ int PmuCollector::initialize(
 
     *kernel_args_pmu_data_base = reinterpret_cast<uint64_t>(setup_header_dev_);
     LOG_INFO(
-        "PMU collector initialized: %d cores, event_type=%u, setup_header=0x%lx", num_cores_, event_type_,
-        static_cast<unsigned long>(*kernel_args_pmu_data_base)
+        "PMU collector initialized: %d cores, event_type=%u, setup_header=0x%lx", num_cores_,
+        static_cast<uint32_t>(event_type_), static_cast<unsigned long>(*kernel_args_pmu_data_base)
     );
     return 0;
 }
@@ -209,7 +209,7 @@ int PmuCollector::export_csv(const std::string &output_dir) {
             for (int i = 0; i < named_count; ++i) {
                 csv << "," << rec.pmu_counters[i];
             }
-            csv << "," << event_type_ << "\n";
+            csv << "," << static_cast<uint32_t>(event_type_) << "\n";
             ++total_rows;
         }
         total_dropped += dropped_counts_[core_id];
@@ -218,8 +218,7 @@ int PmuCollector::export_csv(const std::string &output_dir) {
     csv.flush();
     LOG_INFO("PMU CSV written to %s", csv_path.c_str());
 
-    // Cross-check device-side totals against what we wrote to CSV. Mirrors
-    // the a2a3 host collector. Invariant:
+    // Cross-check device-side totals against what we wrote to CSV. Invariant:
     //   device_total == collected + dropped (buffer-full) + slot-mismatch
     // collected + dropped should account for every commit attempt; any
     // remainder is silent slot-mismatch loss (AICore not yet published).
@@ -270,7 +269,7 @@ int PmuCollector::finalize() {
     setup_header_dev_ = nullptr;
 
     num_cores_ = 0;
-    event_type_ = 0;
+    event_type_ = PmuEventType::PIPE_UTILIZATION;
     pmu_buffer_bytes_ = 0;
     setup_region_bytes_ = 0;
     collected_records_.clear();

@@ -33,13 +33,11 @@
  * L2 perf handshake setters — called by the host (sim) or the AICPU kernel
  * entry (onboard) before `l2_perf_aicpu_init_profiling()` so AICPU code can
  * read perf state without reaching into the generic `Runtime` struct.
- * Mirrors the `set_platform_dump_base` / `set_enable_dump_tensor` pattern
- * used by tensor dump and PMU.
  */
 extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base);
 extern "C" uint64_t get_platform_l2_perf_base();
-extern "C" void set_enable_l2_swimlane(bool enable);
-extern "C" bool get_enable_l2_swimlane();
+extern "C" void set_l2_swimlane_enabled(bool enable);
+extern "C" bool is_l2_swimlane_enabled();
 
 /**
  * Initialize performance profiling

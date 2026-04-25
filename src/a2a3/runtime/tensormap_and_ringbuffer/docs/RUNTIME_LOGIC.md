@@ -539,7 +539,7 @@ Each AICore worker has a `Handshake` struct in shared memory:
 
 ### 9.2 Register-Based Dispatch
 
-Instead of polling `Handshake.task_status`, the production protocol uses hardware registers.
+Instead of polling a shared-memory status flag, the production protocol uses hardware registers.
 
 > **Multi-ring note**: `task_id` is 64-bit but registers are 32-bit. A per-core monotonic dispatch counter (`s_dispatch_seq`) replaces `task_id` in register writes to prevent collisions. See [MULTI_RING.md §6](MULTI_RING.md).
 

@@ -12,7 +12,7 @@
  * @file pmu_collector_aicore.h
  * @brief AICore-side PMU gate + per-task MMIO record (a5)
  *
- * Split of duties (mirrors a2a3 perf):
+ * Split of duties:
  *   - AICPU programs event selectors + starts PMU_CTRL_0/1 once at init,
  *     and restores them at finalize.
  *   - AICore gates counting around each kernel execution via CTRL SPR bit 0
@@ -25,8 +25,7 @@
  *
  * The two dual_issue_slots exist because AICore's dual-issue dispatch
  * can have up to two tasks in flight per core — the parity task_id & 1
- * keeps N and N+1 from colliding. This is the same reason a2a3 perf
- * uses wip[2].
+ * keeps N and N+1 from colliding.
  */
 
 #ifndef PLATFORM_AICORE_PMU_COLLECTOR_AICORE_H_
@@ -60,8 +59,7 @@ __aicore__ __attribute__((always_inline)) static inline void pmu_aicore_end() {
  * Must be called after pmu_aicore_end() has frozen the counters.
  * AICPU picks up the slot and commits it via pmu_aicpu_complete_record.
  *
- * Leaves func_id and core_type untouched — those are AICPU-owned fields,
- * mirroring the a2a3 perf producer/consumer split.
+ * Leaves func_id and core_type untouched — those are AICPU-owned fields.
  *
  * @param buf       Per-core PmuBuffer (from Handshake.pmu_buffer_addr)
  * @param reg_base  Per-core PMU MMIO base (from Handshake.pmu_reg_base)

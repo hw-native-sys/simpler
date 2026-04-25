@@ -78,7 +78,7 @@ void SchedulerContext::complete_slot_task(
     bool mixed_complete = sched_->on_subtask_complete(slot_state);
     if (mixed_complete) {
 #if PTO2_PROFILING
-        if (get_enable_dump_tensor()) {
+        if (is_dump_tensor_enabled()) {
             dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                 thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
                 [](uint8_t active_mask, uint8_t raw_subtask_id) {
@@ -156,7 +156,7 @@ void SchedulerContext::complete_slot_task(
 #endif
 
 #if PTO2_PROFILING
-    if (get_enable_pmu()) {
+    if (is_pmu_enabled()) {
         // Slot key must be the 32-bit register token AICore wrote into
         // dual_issue_slots[task_id & 1].task_id (= DATA_MAIN_BASE value).
         // task_id.raw is the full PTO2 (ring_id<<32|local_id) encoding —

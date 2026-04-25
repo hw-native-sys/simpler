@@ -409,7 +409,7 @@ struct AicpuExecutor {
 #endif
 
 #if PTO2_PROFILING
-                if (get_enable_pmu()) {
+                if (is_pmu_enabled()) {
                     pmu_aicpu_record_task(
                         core_id, thread_idx, slot_state.task->task_id.raw,
                         slot_state.task->kernel_id[static_cast<int32_t>(subslot)], hank[core_id].core_type
@@ -424,7 +424,7 @@ struct AicpuExecutor {
                 cur_thread_completed++;
                 if (mixed_complete) {
 #if PTO2_PROFILING
-                    if (get_enable_dump_tensor()) {
+                    if (is_dump_tensor_enabled()) {
                         dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                             thread_idx, slot_state, TensorDumpStage::AFTER_COMPLETION,
                             [](uint8_t active_mask, uint8_t raw_subtask_id) {
@@ -957,7 +957,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #if PTO2_PROFILING
         // Assign perf buffers to cores early so profiling captures all tasks
         // (total_tasks written to header later when orchestrator completes)
-        if (get_enable_l2_swimlane()) {
+        if (is_l2_swimlane_enabled()) {
             l2_perf_aicpu_init_profiling(runtime);
             // Initialize phase profiling for scheduler threads + orchestrator threads
             l2_perf_aicpu_init_phase_profiling(runtime, sched_thread_num_);
@@ -965,14 +965,14 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         }
 #endif
 #if PTO2_PROFILING
-        if (get_enable_dump_tensor()) {
+        if (is_dump_tensor_enabled()) {
             dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
         }
 #endif
 
 #if PTO2_PROFILING
         // Initialize PMU: program events, start counters, and pop initial buffers
-        if (get_enable_pmu()) {
+        if (is_pmu_enabled()) {
             pmu_aicpu_init(physical_core_ids_, cores_total_num_);
             DEV_INFO("PMU profiling started on %d cores", cores_total_num_);
         }
@@ -991,7 +991,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
     int32_t idle_iterations = 0;
     int32_t last_progress_count = 0;
 #if PTO2_PROFILING
-    bool l2_perf_enabled = get_enable_l2_swimlane();
+    bool l2_perf_enabled = is_l2_swimlane_enabled();
 #endif
 
     // Scheduler profiling counters
@@ -1192,7 +1192,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
 #endif
                     ResourceCount rc = shape_resource_count(shape);
 #if PTO2_PROFILING
-                    if (get_enable_dump_tensor()) {
+                    if (is_dump_tensor_enabled()) {
                         dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                             thread_idx, *slot_state, TensorDumpStage::BEFORE_DISPATCH,
                             [](uint8_t active_mask, uint8_t raw_subtask_id) {
@@ -1301,7 +1301,7 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
                 Cluster &c = tracker.clusters[ci];
                 ResourceCount rc = shape_resource_count(shape);
 #if PTO2_PROFILING
-                if (get_enable_dump_tensor()) {
+                if (is_dump_tensor_enabled()) {
                     dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
                         thread_idx, *slot_state, TensorDumpStage::BEFORE_DISPATCH,
                         [](uint8_t active_mask, uint8_t raw_subtask_id) {
@@ -1679,12 +1679,12 @@ int32_t AicpuExecutor::resolve_and_dispatch_pto2(Runtime *runtime, int32_t threa
         l2_perf_aicpu_flush_buffers(thread_idx, core_assignments_[thread_idx], core_num);
         l2_perf_aicpu_flush_phase_buffers(thread_idx);
     }
-    if (get_enable_pmu()) {
+    if (is_pmu_enabled()) {
         pmu_aicpu_flush_buffers(thread_idx, core_assignments_[thread_idx], core_num);
     }
 #endif
 #if PTO2_PROFILING
-    if (get_enable_dump_tensor()) {
+    if (is_dump_tensor_enabled()) {
         dump_tensor_flush(thread_idx);
     }
 #endif
@@ -1866,7 +1866,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
 #if PTO2_PROFILING
-            rt->orchestrator.enable_l2_swimlane = get_enable_l2_swimlane();
+            rt->orchestrator.enable_l2_swimlane = is_l2_swimlane_enabled();
 #endif
 
             // With multi-ring, slot_states are per-ring inside the scheduler.
@@ -1887,7 +1887,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Each orchestrator thread sets its own phase buffer index (thread-local)
-            if (get_enable_l2_swimlane()) {
+            if (is_l2_swimlane_enabled()) {
                 l2_perf_aicpu_set_orch_thread_idx(thread_idx);
             }
 #endif
@@ -1944,7 +1944,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Write orchestrator summary to shared memory for host-side export (only if profiling enabled)
-            if (get_enable_l2_swimlane()) {
+            if (is_l2_swimlane_enabled()) {
                 AicpuOrchSummary orch_summary = {};
                 orch_summary.start_time = orch_cycle_start;
                 orch_summary.end_time = orch_cycle_end;
@@ -1964,7 +1964,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Write core-to-thread mapping (one-time, after orchestration)
-            if (get_enable_l2_swimlane()) {
+            if (is_l2_swimlane_enabled()) {
                 l2_perf_aicpu_init_core_assignments(cores_total_num_);
                 for (int32_t t = 0; t < sched_thread_num_; t++) {
                     l2_perf_aicpu_write_core_assignments_for_thread(t, core_assignments_[t], core_count_per_thread_[t]);
@@ -1992,7 +1992,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             );
 #endif
             total_tasks_ = pto2_task_count;
-            if (get_enable_l2_swimlane() && pto2_task_count > 0) {
+            if (is_l2_swimlane_enabled() && pto2_task_count > 0) {
                 l2_perf_aicpu_update_total_tasks(static_cast<uint32_t>(pto2_task_count));
             }
             orchestrator_done_ = true;
@@ -2090,7 +2090,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
         if (shutdown_count > 0) {
 #if PTO2_PROFILING
             // Restore PMU CTRL registers for this thread's cores before AICore shutdown
-            if (get_enable_pmu()) {
+            if (is_pmu_enabled()) {
                 pmu_aicpu_finalize(shutdown_cores, shutdown_count);
             }
 #endif

@@ -196,9 +196,9 @@ int run_runtime(
             return rc;
         }
 
-        runner->set_enable_l2_swimlane(enable_l2_swimlane != 0);
-        runner->set_enable_dump_tensor(enable_dump_tensor != 0);
-        runner->set_enable_pmu(enable_pmu);
+        runner->set_l2_swimlane_enabled(enable_l2_swimlane != 0);
+        runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
+        runner->set_pmu_enabled(enable_pmu);
 
         std::vector<uint8_t> aicpu_vec(aicpu_binary, aicpu_binary + aicpu_size);
         std::vector<uint8_t> aicore_vec(aicore_binary, aicore_binary + aicore_size);

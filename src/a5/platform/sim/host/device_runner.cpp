@@ -152,10 +152,10 @@ int DeviceRunner::ensure_binaries_loaded(
             return -1;
         }
 
-        set_enable_dump_tensor_func_ =
-            reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_enable_dump_tensor"));
-        if (set_enable_dump_tensor_func_ == nullptr) {
-            LOG_ERROR("dlsym failed for set_enable_dump_tensor: %s", dlerror());
+        set_dump_tensor_enabled_func_ =
+            reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_dump_tensor_enabled"));
+        if (set_dump_tensor_enabled_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_dump_tensor_enabled: %s", dlerror());
             return -1;
         }
 
@@ -166,19 +166,19 @@ int DeviceRunner::ensure_binaries_loaded(
             return -1;
         }
 
-        set_enable_l2_swimlane_func_ =
-            reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_enable_l2_swimlane"));
-        if (set_enable_l2_swimlane_func_ == nullptr) {
-            LOG_ERROR("dlsym failed for set_enable_l2_swimlane: %s", dlerror());
+        set_l2_swimlane_enabled_func_ =
+            reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_l2_swimlane_enabled"));
+        if (set_l2_swimlane_enabled_func_ == nullptr) {
+            LOG_ERROR("dlsym failed for set_l2_swimlane_enabled: %s", dlerror());
             return -1;
         }
 
         // PMU bindings — tolerated as optional so a5sim keeps building against
         // pre-PMU AICPU SOs during the transition. Missing symbols mean PMU
-        // is unavailable on this build and set_enable_pmu_func_ stays null.
+        // is unavailable on this build and set_pmu_enabled_func_ stays null.
         set_platform_pmu_base_func_ =
             reinterpret_cast<void (*)(uint64_t)>(dlsym(aicpu_so_handle_, "set_platform_pmu_base"));
-        set_enable_pmu_func_ = reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_enable_pmu"));
+        set_pmu_enabled_func_ = reinterpret_cast<void (*)(bool)>(dlsym(aicpu_so_handle_, "set_pmu_enabled"));
 
         aicpu_so_loaded_ = true;
         LOG_INFO("DeviceRunner(sim): Loaded aicpu_execute from %s", aicpu_so_path_.c_str());
@@ -332,9 +332,7 @@ int DeviceRunner::run(
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
         runtime.workers[i].aicore_done = 0;
-        runtime.workers[i].control = 0;
         runtime.workers[i].task = 0;
-        runtime.workers[i].task_status = 0;
         // First 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
         runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
@@ -382,7 +380,7 @@ int DeviceRunner::run(
 
     // Initialize PMU profiling if enabled
     if (enable_pmu_) {
-        rc = init_pmu(num_aicore, static_cast<uint32_t>(pmu_event_type_));
+        rc = init_pmu(num_aicore, pmu_event_type_);
         if (rc != 0) {
             LOG_ERROR("init_pmu failed: %d", rc);
             return rc;
@@ -434,9 +432,9 @@ int DeviceRunner::run(
     // Set platform regs in the AICPU .so before launching threads
     set_platform_regs_func_(kernel_args_.regs);
     set_platform_dump_base_func_(kernel_args_.dump_data_base);
-    set_enable_dump_tensor_func_(enable_dump_tensor_);
+    set_dump_tensor_enabled_func_(enable_dump_tensor_);
     set_platform_l2_perf_base_func_(kernel_args_.l2_perf_data_base);
-    set_enable_l2_swimlane_func_(enable_l2_swimlane_);
+    set_l2_swimlane_enabled_func_(enable_l2_swimlane_);
 
     // Publish PMU session state to the AICPU SO (dlsym symbols are optional —
     // older SOs without PMU support leave these nullptr, which simply turns
@@ -444,8 +442,8 @@ int DeviceRunner::run(
     if (set_platform_pmu_base_func_ != nullptr) {
         set_platform_pmu_base_func_(kernel_args_.pmu_data_base);
     }
-    if (set_enable_pmu_func_ != nullptr) {
-        set_enable_pmu_func_(enable_pmu_);
+    if (set_pmu_enabled_func_ != nullptr) {
+        set_pmu_enabled_func_(enable_pmu_);
     }
 
     // Launch AICPU threads (over-launch for affinity gate)
@@ -530,8 +528,8 @@ void DeviceRunner::print_handshake_results() {
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
     for (int i = 0; i < worker_count_; i++) {
         LOG_DEBUG(
-            "  Core %d: aicore_done=%d aicpu_ready=%d control=%d task=%d", i, last_runtime_->workers[i].aicore_done,
-            last_runtime_->workers[i].aicpu_ready, last_runtime_->workers[i].control, last_runtime_->workers[i].task
+            "  Core %d: aicore_done=%d aicpu_ready=%d task=%d", i, last_runtime_->workers[i].aicore_done,
+            last_runtime_->workers[i].aicpu_ready, last_runtime_->workers[i].task
         );
     }
 }
@@ -543,11 +541,11 @@ void DeviceRunner::unload_executor_binaries() {
         aicpu_execute_func_ = nullptr;
         set_platform_regs_func_ = nullptr;
         set_platform_dump_base_func_ = nullptr;
-        set_enable_dump_tensor_func_ = nullptr;
+        set_dump_tensor_enabled_func_ = nullptr;
         set_platform_l2_perf_base_func_ = nullptr;
-        set_enable_l2_swimlane_func_ = nullptr;
+        set_l2_swimlane_enabled_func_ = nullptr;
         set_platform_pmu_base_func_ = nullptr;
-        set_enable_pmu_func_ = nullptr;
+        set_pmu_enabled_func_ = nullptr;
         aicpu_so_loaded_ = false;
     }
     if (!aicpu_so_path_.empty()) {
@@ -836,7 +834,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
     return 0;
 }
 
-int DeviceRunner::init_pmu(int num_aicore, uint32_t event_type) {
+int DeviceRunner::init_pmu(int num_aicore, PmuEventType event_type) {
     auto alloc_cb = [](size_t size) -> void * {
         return malloc(size);
     };

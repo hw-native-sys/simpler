@@ -196,7 +196,7 @@ struct DumpReadyQueueEntry {
  * 1. Per-thread ready queues (circular FIFOs) — one per AICPU thread
  * 2. Metadata (thread count, config)
  *
- * Ready queue design mirrors L2PerfDataHeader but is independent:
+ * Ready queue design:
  * - Per-thread queues avoid lock contention
  * - Producer: AICPU thread (adds full DumpMetaBuffers)
  * - Consumer: Host DumpMemoryManager thread

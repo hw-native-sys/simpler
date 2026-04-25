@@ -1165,13 +1165,13 @@ def _resolve_output_path(args, input_path):
 
     input_stem = input_path.stem
     if input_stem.startswith("l2_perf_records_"):
-        timestamp_part = input_stem[len("l2_perf_records_") :]
+        suffix_part = input_stem[len("l2_perf_records_") :]
     else:
-        timestamp_part = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix_part = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     outputs_dir = Path.cwd() / "outputs"
     outputs_dir.mkdir(exist_ok=True)
-    return outputs_dir / f"merged_swimlane_{timestamp_part}.json"
+    return outputs_dir / f"merged_swimlane_{suffix_part}.json"
 
 
 def _print_verbose_data_info(data, verbose):

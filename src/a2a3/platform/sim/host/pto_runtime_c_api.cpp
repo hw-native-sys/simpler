@@ -190,9 +190,9 @@ int run_runtime(
         // Phase 2: publish diagnostics enablement to the DeviceRunner so run()
         // and its helpers can read the three sub-features uniformly (via
         // members, not Runtime / run() args).
-        runner->set_enable_l2_swimlane(enable_l2_swimlane != 0);
-        runner->set_enable_dump_tensor(enable_dump_tensor != 0);
-        runner->set_enable_pmu(enable_pmu);
+        runner->set_l2_swimlane_enabled(enable_l2_swimlane != 0);
+        runner->set_dump_tensor_enabled(enable_dump_tensor != 0);
+        runner->set_pmu_enabled(enable_pmu);
 
         // Phase 3: launch
         std::vector<uint8_t> aicpu_vec;

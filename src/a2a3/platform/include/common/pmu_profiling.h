@@ -105,8 +105,8 @@ constexpr PmuEventConfig PMU_EVENTS_A2A3_L2_CACHE = {
  * Resolve an event type to the DAV_2201 event table. Returns nullptr for
  * unknown values (caller falls back to PIPE_UTILIZATION).
  */
-inline const PmuEventConfig *pmu_resolve_event_config_a2a3(uint32_t event_type) {
-    switch (static_cast<PmuEventType>(event_type)) {
+inline const PmuEventConfig *pmu_resolve_event_config_a2a3(PmuEventType event_type) {
+    switch (event_type) {
     case PmuEventType::ARITHMETIC_UTILIZATION:
         return &PMU_EVENTS_A2A3_ARITHMETIC;
     case PmuEventType::PIPE_UTILIZATION:

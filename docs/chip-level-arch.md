@@ -237,20 +237,17 @@ AICPU and AICore cores coordinate via **handshake buffers** (one per core):
 struct Handshake {
     volatile uint32_t aicpu_ready;   // AICPU→AICore: scheduler ready
     volatile uint32_t aicore_done;   // AICore→AICPU: core ready
-    volatile uint64_t task;          // AICPU→AICore: task pointer
-    volatile int32_t task_status;    // Task state: 1=busy, 0=done
-    volatile int32_t control;        // AICPU→AICore: 1=quit
+    volatile uint64_t task;          // AICPU→AICore: task pointer (init only; runtime uses DATA_MAIN_BASE)
 };
 ```
 
 **Flow:**
 
 1. AICPU finds a ready task
-2. AICPU writes task pointer to handshake buffer and sets `aicpu_ready`
-3. AICore polls buffer, sees task, reads from device memory
-4. AICore sets `task_status = 1` (busy) and executes
-5. AICore sets `task_status = 0` (done) and `aicore_done`
-6. AICPU reads result and continues
+2. AICPU writes task pointer to handshake buffer and signals via DATA_MAIN_BASE register
+3. AICore polls DATA_MAIN_BASE, reads the task, executes
+4. AICore writes FIN to COND; AICPU observes completion
+5. AICPU reads result and continues
 
 ## Platform Backends
 

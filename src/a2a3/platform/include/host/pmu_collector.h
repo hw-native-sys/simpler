@@ -104,7 +104,7 @@ public:
      */
     int init(
         int num_cores, int num_threads, uint64_t *kernel_args_pmu_data_base, const std::string &csv_path,
-        uint32_t event_type, PmuAllocCallback alloc_cb, PmuRegisterCallback register_cb, PmuFreeCallback free_cb,
+        PmuEventType event_type, PmuAllocCallback alloc_cb, PmuRegisterCallback register_cb, PmuFreeCallback free_cb,
         void *user_data, int device_id
     );
 
@@ -140,7 +140,7 @@ private:
     int num_cores_ = 0;
     int num_threads_ = 0;
     int device_id_ = -1;
-    uint32_t event_type_ = 0;
+    PmuEventType event_type_{PmuEventType::PIPE_UTILIZATION};
 
     // Shared memory region (PmuDataHeader + PmuBufferState[])
     void *shm_dev_ = nullptr;
@@ -196,7 +196,7 @@ private:
 inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
     PmuEventType resolved = PmuEventType::PIPE_UTILIZATION;
     if (requested_event_type > 0 &&
-        pmu_resolve_event_config_a2a3(static_cast<uint32_t>(requested_event_type)) != nullptr) {
+        pmu_resolve_event_config_a2a3(static_cast<PmuEventType>(requested_event_type)) != nullptr) {
         resolved = static_cast<PmuEventType>(requested_event_type);
     } else if (requested_event_type != 0) {
         // 0 means PMU disabled (enable_pmu == 0), not an invalid type — only warn for nonzero
@@ -210,7 +210,7 @@ inline PmuEventType resolve_pmu_event_type(int requested_event_type) {
         return resolved;
     }
     int val = std::atoi(pmu_env);
-    if (val > 0 && pmu_resolve_event_config_a2a3(static_cast<uint32_t>(val)) != nullptr) {
+    if (val > 0 && pmu_resolve_event_config_a2a3(static_cast<PmuEventType>(val)) != nullptr) {
         resolved = static_cast<PmuEventType>(val);
         LOG_INFO("PMU event type set to %u from SIMPLER_PMU_EVENT_TYPE", static_cast<uint32_t>(resolved));
         return resolved;

@@ -32,7 +32,7 @@ PmuCollectorHost::~PmuCollectorHost() = default;
 
 int PmuCollectorHost::init(
     int num_cores, int num_threads, uint64_t *kernel_args_pmu_data_base, const std::string &csv_path,
-    uint32_t event_type, PmuAllocCallback alloc_cb, PmuRegisterCallback register_cb, PmuFreeCallback free_cb,
+    PmuEventType event_type, PmuAllocCallback alloc_cb, PmuRegisterCallback register_cb, PmuFreeCallback free_cb,
     void *user_data, int device_id
 ) {
     if (num_cores <= 0 || num_threads <= 0 || kernel_args_pmu_data_base == nullptr || alloc_cb == nullptr ||
@@ -87,7 +87,7 @@ int PmuCollectorHost::init(
     std::memset(shm_host_, 0, shm_size_);
 
     // Write event_type into header so AICPU can read it from SHM
-    get_pmu_header(shm_host_)->event_type = event_type;
+    get_pmu_header(shm_host_)->event_type = static_cast<uint32_t>(event_type);
 
     // Publish device address to KernelArgs
     *kernel_args_pmu_data_base = reinterpret_cast<uint64_t>(shm_dev_);
@@ -224,7 +224,7 @@ void PmuCollectorHost::write_buffer_to_csv(int core_id, int thread_idx, const vo
             }
             csv_file_ << ',' << r.pmu_counters[k];
         }
-        csv_file_ << ',' << event_type_ << '\n';
+        csv_file_ << ',' << static_cast<uint32_t>(event_type_) << '\n';
     }
     csv_file_.flush();
 }

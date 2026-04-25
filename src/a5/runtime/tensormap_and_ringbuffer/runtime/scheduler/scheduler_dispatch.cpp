@@ -186,7 +186,7 @@ void SchedulerContext::dispatch_block(
     bool to_pending
 ) {
 #if PTO2_PROFILING
-    if (get_enable_dump_tensor()) {
+    if (is_dump_tensor_enabled()) {
         dump_tensors_for_task<PTO2_SUBTASK_SLOT_COUNT>(
             thread_idx, slot_state, TensorDumpStage::BEFORE_DISPATCH,
             [](uint8_t active_mask, uint8_t raw_subtask_id) {
@@ -320,17 +320,17 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
         DEV_INFO("Thread %d: doing one-time init", thread_idx);
 
 #if PTO2_PROFILING
-        if (get_enable_l2_swimlane()) {
+        if (is_l2_swimlane_enabled()) {
             l2_perf_aicpu_init_profiling(runtime);
             l2_perf_aicpu_init_phase_profiling(sched_thread_num_);
             l2_perf_aicpu_set_orch_thread_idx(sched_thread_num_);
         }
 #endif
 #if PTO2_PROFILING
-        if (get_enable_dump_tensor()) {
+        if (is_dump_tensor_enabled()) {
             dump_tensor_init(orch_to_sched_ ? thread_num_ : sched_thread_num_);
         }
-        if (get_enable_pmu()) {
+        if (is_pmu_enabled()) {
             pmu_aicpu_init(runtime->workers, physical_core_ids_, cores_total_num_);
             DEV_INFO("PMU profiling started on %d cores", cores_total_num_);
         }
@@ -351,7 +351,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #if PTO2_PROFILING
     auto &l2_perf = sched_l2_perf_[thread_idx];
     l2_perf.reset();
-    l2_perf.l2_perf_enabled = get_enable_l2_swimlane();
+    l2_perf.l2_perf_enabled = is_l2_swimlane_enabled();
 #endif
 
     constexpr int LOCAL_READY_CAP_PER_TYPE = 64;
@@ -557,7 +557,7 @@ int32_t SchedulerContext::resolve_and_dispatch(Runtime *runtime, int32_t thread_
 #endif
 
 #if PTO2_PROFILING
-    if (get_enable_dump_tensor()) {
+    if (is_dump_tensor_enabled()) {
         dump_tensor_flush(thread_idx);
     }
 #endif

@@ -372,14 +372,11 @@ int DeviceRunner::run(
     for (int i = 0; i < num_aicore; i++) {
         runtime.workers[i].aicpu_ready = 0;
         runtime.workers[i].aicore_done = 0;
-        runtime.workers[i].control = 0;
         runtime.workers[i].task = 0;
-        runtime.workers[i].task_status = 0;
         // Set core type: first 1/3 are AIC, remaining 2/3 are AIV
         runtime.workers[i].core_type = (i < num_aic) ? CoreType::AIC : CoreType::AIV;
         runtime.workers[i].enable_profiling_flag = enable_profiling_flag;
         runtime.workers[i].l2_perf_records_addr = static_cast<uint64_t>(0);
-        runtime.workers[i].l2_perf_buffer_status = 0;
     }
 
     // Set function_bin_addr for all tasks: func_id_to_addr_[] stores CoreCallable
@@ -427,7 +424,7 @@ int DeviceRunner::run(
 
     // Initialize PMU profiling if enabled
     if (enable_pmu_) {
-        rc = init_pmu(num_aicore, static_cast<uint32_t>(pmu_event_type_));
+        rc = init_pmu(num_aicore, pmu_event_type_);
         if (rc != 0) {
             LOG_ERROR("init_pmu failed: %d", rc);
             return rc;
@@ -528,8 +525,8 @@ void DeviceRunner::print_handshake_results() {
     LOG_DEBUG("Handshake results for %d cores:", worker_count_);
     for (int i = 0; i < worker_count_; i++) {
         LOG_DEBUG(
-            "  Core %d: aicore_done=%d aicpu_ready=%d control=%d task=%d", i, workers[i].aicore_done,
-            workers[i].aicpu_ready, workers[i].control, workers[i].task
+            "  Core %d: aicore_done=%d aicpu_ready=%d task=%d", i, workers[i].aicore_done, workers[i].aicpu_ready,
+            workers[i].task
         );
     }
 }
@@ -860,7 +857,7 @@ int DeviceRunner::init_tensor_dump(Runtime &runtime, int num_aicore, int device_
     return 0;
 }
 
-int DeviceRunner::init_pmu(int num_aicore, uint32_t event_type) {
+int DeviceRunner::init_pmu(int num_aicore, PmuEventType event_type) {
     auto alloc_cb = [](size_t size) -> void * {
         void *ptr = nullptr;
         int rc = rtMalloc(&ptr, size, RT_MEMORY_HBM, 0);

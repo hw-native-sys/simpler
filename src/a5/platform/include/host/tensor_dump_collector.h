@@ -13,7 +13,6 @@
  * @file tensor_dump_collector.h
  * @brief Host-side tensor dump collector (memcpy-based)
  *
- * Mirrors L2PerfCollector architecture:
  * - Host allocates per-thread DumpBuffers + arenas on device
  * - AICPU writes records and payload during execution
  * - After stream sync, host copies everything back via rtMemcpy/memcpy
@@ -87,7 +86,7 @@ struct DumpedTensor {
 /**
  * Host-side tensor dump collector.
  *
- * Lifecycle (mirrors L2PerfCollector):
+ * Lifecycle:
  *   1. initialize() — allocate DumpSetupHeader + per-thread DumpBuffers + arenas,
  *      caller reads get_dump_setup_device_ptr() and sets kernel_args.dump_data_base
  *   2. (AICPU execution writes records and payload data)

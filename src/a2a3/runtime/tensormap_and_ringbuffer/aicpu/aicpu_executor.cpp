@@ -445,7 +445,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             }
 
 #if PTO2_PROFILING
-            rt->orchestrator.enable_l2_swimlane = get_enable_l2_swimlane();
+            rt->orchestrator.enable_l2_swimlane = is_l2_swimlane_enabled();
 #endif
 
             // Total core counts = aic_count_ / aiv_count_ (set once at runtime init).
@@ -467,7 +467,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             sched_ctx_.wait_pto2_init_complete();
 
 #if PTO2_PROFILING
-            if (get_enable_l2_swimlane()) {
+            if (is_l2_swimlane_enabled()) {
                 l2_perf_aicpu_set_orch_thread_idx(thread_idx);
             }
 #endif
@@ -552,7 +552,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
 
 #if PTO2_PROFILING
             // Write orchestrator summary to shared memory for host-side export (only if profiling enabled)
-            if (get_enable_l2_swimlane()) {
+            if (is_l2_swimlane_enabled()) {
                 AicpuOrchSummary orch_summary = {};
                 orch_summary.start_time = orch_cycle_start;
                 orch_summary.end_time = orch_cycle_end;
@@ -585,7 +585,7 @@ int32_t AicpuExecutor::run(Runtime *runtime) {
             pto2_submitted_tasks = total_tasks;
 #endif
 
-            if (get_enable_l2_swimlane() && total_tasks > 0) {
+            if (is_l2_swimlane_enabled() && total_tasks > 0) {
                 l2_perf_aicpu_update_total_tasks(static_cast<uint32_t>(total_tasks));
             }
 

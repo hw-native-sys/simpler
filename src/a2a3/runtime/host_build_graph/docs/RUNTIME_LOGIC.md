@@ -21,8 +21,8 @@ The host_build_graph runtime builds a static task graph on the host, copies the 
 ## Execution Flow (Device)
 
 1. `aicpu_executor.cpp` performs core discovery, handshake initialization, and ready-queue seeding using `Runtime::get_initial_ready_tasks`.
-2. Scheduler threads maintain per-core and global ready queues. When a task is ready, the scheduler writes its pointer to the core's `Handshake` and sets `task_status=1`.
-3. AICore reads the handshake, executes the kernel at `Task::function_bin_addr`, and writes `task_status=0` on completion.
+2. Scheduler threads maintain per-core and global ready queues. When a task is ready, the scheduler publishes the task pointer and signals the core via `DATA_MAIN_BASE`.
+3. AICore reads the task_id from `DATA_MAIN_BASE`, executes the kernel at `Task::function_bin_addr`, and writes FIN to `COND` on completion.
 4. AICPU observes completion, resolves dependencies by decrementing fanin, and enqueues newly-ready tasks.
 5. The executor shuts down cores by setting `Handshake::control=1` after all tasks complete.
 

@@ -40,15 +40,14 @@ static int s_orch_thread_idx = -1;
 // L2 perf platform state. Published by the host (via dlsym'd setters on sim)
 // or by the AICPU kernel entry (onboard) before perf init runs, so downstream
 // perf code can discover enablement + device-base without reading the generic
-// Runtime struct. Mirrors the g_platform_dump_base / g_enable_dump_tensor pair
-// in tensor_dump_aicpu.cpp and the PMU equivalents in pmu_collector_aicpu.cpp.
+// Runtime struct.
 static uint64_t g_platform_l2_perf_base = 0;
 static bool g_enable_l2_swimlane = false;
 
 extern "C" void set_platform_l2_perf_base(uint64_t l2_perf_data_base) { g_platform_l2_perf_base = l2_perf_data_base; }
 extern "C" uint64_t get_platform_l2_perf_base() { return g_platform_l2_perf_base; }
-extern "C" void set_enable_l2_swimlane(bool enable) { g_enable_l2_swimlane = enable; }
-extern "C" bool get_enable_l2_swimlane() { return g_enable_l2_swimlane; }
+extern "C" void set_l2_swimlane_enabled(bool enable) { g_enable_l2_swimlane = enable; }
+extern "C" bool is_l2_swimlane_enabled() { return g_enable_l2_swimlane; }
 
 void l2_perf_aicpu_init_profiling(Runtime *runtime) {
     void *l2_perf_base = reinterpret_cast<void *>(g_platform_l2_perf_base);

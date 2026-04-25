@@ -56,14 +56,14 @@ uint64_t get_platform_dump_base();
  *
  * @param enable true to enable tensor dump, false to disable
  */
-void set_enable_dump_tensor(bool enable);
+void set_dump_tensor_enabled(bool enable);
 
 /**
  * Get whether tensor dump is enabled for this execution.
  *
  * @return true if tensor dump is enabled
  */
-bool get_enable_dump_tensor();
+bool is_dump_tensor_enabled();
 
 #ifdef __cplusplus
 }

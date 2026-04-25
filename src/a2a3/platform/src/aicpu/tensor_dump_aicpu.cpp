@@ -13,7 +13,6 @@
  * @file tensor_dump_aicpu.cpp
  * @brief AICPU tensor dump collection implementation
  *
- * Mirrors l2_perf_collector_aicpu.cpp patterns:
  * - Per-thread DumpBufferState with SPSC free queues
  * - Per-thread ready queue for handing off full metadata buffers
  * - Per-thread circular arena for tensor payload data
@@ -55,9 +54,9 @@ extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
 
 static bool g_enable_dump_tensor = false;
 
-extern "C" void set_enable_dump_tensor(bool enable) { g_enable_dump_tensor = enable; }
+extern "C" void set_dump_tensor_enabled(bool enable) { g_enable_dump_tensor = enable; }
 
-extern "C" bool get_enable_dump_tensor() { return g_enable_dump_tensor; }
+extern "C" bool is_dump_tensor_enabled() { return g_enable_dump_tensor; }
 
 bool get_tensor_dump_role_from_direction(ArgDirection dir, TensorDumpRole *role) {
     switch (dir) {

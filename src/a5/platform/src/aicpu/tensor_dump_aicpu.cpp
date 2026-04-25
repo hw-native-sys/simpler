@@ -52,9 +52,9 @@ extern "C" void set_platform_dump_base(uint64_t dump_data_base) { g_platform_dum
 
 extern "C" uint64_t get_platform_dump_base() { return g_platform_dump_base; }
 
-extern "C" void set_enable_dump_tensor(bool enable) { g_enable_dump_tensor = enable; }
+extern "C" void set_dump_tensor_enabled(bool enable) { g_enable_dump_tensor = enable; }
 
-extern "C" bool get_enable_dump_tensor() { return g_enable_dump_tensor; }
+extern "C" bool is_dump_tensor_enabled() { return g_enable_dump_tensor; }
 
 // =============================================================================
 // Helper Functions (same as A2A3)

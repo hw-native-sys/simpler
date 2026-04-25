@@ -150,9 +150,9 @@ public:
      * corresponding `enable_*_` members directly. Moved off the generic
      * Runtime struct / run() arg list so all three travel the same way.
      */
-    void set_enable_l2_swimlane(bool enable) { enable_l2_swimlane_ = enable; }
-    void set_enable_dump_tensor(bool enable) { enable_dump_tensor_ = enable; }
-    void set_enable_pmu(int enable_pmu) {
+    void set_l2_swimlane_enabled(bool enable) { enable_l2_swimlane_ = enable; }
+    void set_dump_tensor_enabled(bool enable) { enable_dump_tensor_ = enable; }
+    void set_pmu_enabled(int enable_pmu) {
         enable_pmu_ = (enable_pmu > 0);
         pmu_event_type_ = resolve_pmu_event_type(enable_pmu);
     }
@@ -232,10 +232,10 @@ private:
     void (*set_platform_regs_func_)(uint64_t){nullptr};
     void (*set_platform_dump_base_func_)(uint64_t){nullptr};
     void (*set_platform_pmu_base_func_)(uint64_t){nullptr};
-    void (*set_enable_dump_tensor_func_)(bool){nullptr};
+    void (*set_dump_tensor_enabled_func_)(bool){nullptr};
     void (*set_platform_l2_perf_base_func_)(uint64_t){nullptr};
-    void (*set_enable_l2_swimlane_func_)(bool){nullptr};
-    void (*set_enable_pmu_func_)(bool){nullptr};
+    void (*set_l2_swimlane_enabled_func_)(bool){nullptr};
+    void (*set_pmu_enabled_func_)(bool){nullptr};
     std::string aicpu_so_path_;
     std::string aicore_so_path_;
 
@@ -287,7 +287,7 @@ private:
      * the setup-header pointer into kernel_args.pmu_data_base. pmu_reg_addrs
      * stays 0 on sim (no hardware PMU model).
      */
-    int init_pmu(int num_aicore, uint32_t event_type);
+    int init_pmu(int num_aicore, PmuEventType event_type);
     // Enablement for the three diagnostics sub-features. Written by the c_api
     // entry point via set_enable_*() before run(), read inside run() and its
     // helpers. Moved off Runtime / run() args so all three sub-features use
@@ -295,7 +295,7 @@ private:
     bool enable_l2_swimlane_{false};
     bool enable_dump_tensor_{false};
     bool enable_pmu_{false};
-    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_enable_pmu()
+    PmuEventType pmu_event_type_{PmuEventType::PIPE_UTILIZATION};  // resolved from set_pmu_enabled()
 };
 
 #endif  // SRC_A5_PLATFORM_SIM_HOST_DEVICE_RUNNER_H_

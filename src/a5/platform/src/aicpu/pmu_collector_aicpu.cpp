@@ -54,9 +54,9 @@ extern "C" void set_platform_pmu_base(uint64_t pmu_data_base) { g_platform_pmu_b
 
 extern "C" uint64_t get_platform_pmu_base() { return g_platform_pmu_base; }
 
-extern "C" void set_enable_pmu(bool enable) { g_enable_pmu = enable; }
+extern "C" void set_pmu_enabled(bool enable) { g_enable_pmu = enable; }
 
-extern "C" bool get_enable_pmu() { return g_enable_pmu; }
+extern "C" bool is_pmu_enabled() { return g_enable_pmu; }
 
 // ---------------------------------------------------------------------------
 // Low-level MMIO helpers (internal use only)
@@ -128,7 +128,7 @@ void pmu_aicpu_init(Handshake *handshakes, const uint32_t *physical_core_ids, in
 
     // Program event selectors and start PMU counters on all cores with a valid
     // PMU reg base.
-    const PmuEventConfig *evt = pmu_resolve_event_config_a5(pmu_event_type);
+    const PmuEventConfig *evt = pmu_resolve_event_config_a5(static_cast<PmuEventType>(pmu_event_type));
     if (evt == nullptr) {
         evt = &PMU_EVENTS_A5_PIPE_UTIL;
     }
@@ -168,8 +168,7 @@ void pmu_aicpu_complete_record(
 
     // Stamp thread ownership on every commit. a5 binds each core to a fixed
     // AICPU scheduler thread at init time, so this value is stable — host
-    // reads it at collect time to emit the CSV thread_id column (mirrors
-    // a2a3's per-queue thread association).
+    // reads it at collect time to emit the CSV thread_id column.
     state->owning_thread_id = static_cast<uint32_t>(thread_idx);
 
     // Account for every commit attempt so host can detect silent slot loss.

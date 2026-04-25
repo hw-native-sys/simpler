@@ -51,7 +51,7 @@ def _extract_l2_perf_records_timestamp(l2_perf_records_path: Path | None) -> dat
     if l2_perf_records_path is None:
         return None
 
-    filename_match = re.search(r"l2_perf_records_(\d{8}_\d{6})", l2_perf_records_path.name)
+    filename_match = re.search(r"(\d{8}_\d{6})\.json$", l2_perf_records_path.name)
     if filename_match:
         try:
             return datetime.strptime(filename_match.group(1), "%Y%m%d_%H%M%S")
