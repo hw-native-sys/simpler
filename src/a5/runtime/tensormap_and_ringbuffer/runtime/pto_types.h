@@ -28,6 +28,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#include <utility>
+
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
@@ -152,7 +154,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     template <typename... Args>
     void add_input(Args &&...args) {
-        if (!check_add_tensor_valid<false>(args...)) {
+        if (!check_add_tensor_valid<false>(std::forward<Args>(args)...)) {
             return;
         }
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::INPUT, tensor_count_++), ...);
@@ -163,7 +165,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     ///   add_output(t1, t2)           — write-only existing tensors (OUTPUT_EXISTING)
     template <typename... Args>
     void add_output(Args &&...args) {
-        if (!check_add_tensor_valid<true>(args...)) return;
+        if (!check_add_tensor_valid<true>(std::forward<Args>(args)...)) return;
         if constexpr ((std::is_same_v<std::decay_t<Args>, TensorCreateInfo> && ...)) {
             ((tensors_[tensor_count_].create_info = &args, tags_[tensor_count_] = TensorArgType::OUTPUT,
               tensor_count_++),
@@ -177,7 +179,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
 
     template <typename... Args>
     void add_inout(Args &&...args) {
-        if (!check_add_tensor_valid<false>(args...)) {
+        if (!check_add_tensor_valid<false>(std::forward<Args>(args)...)) {
             return;
         }
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::INOUT, tensor_count_++), ...);
@@ -186,7 +188,7 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     /// No-dependency existing tensor: skips OverlapMap lookup, depends on creator only.
     template <typename... Args>
     void add_no_dep(Args &&...args) {
-        if (!check_add_tensor_valid<false>(args...)) return;
+        if (!check_add_tensor_valid<false>(std::forward<Args>(args)...)) return;
         ((tensors_[tensor_count_].ptr = &args, tags_[tensor_count_] = TensorArgType::NO_DEP, tensor_count_++), ...);
     }
 
