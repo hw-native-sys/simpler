@@ -46,7 +46,14 @@ __attribute__((visibility("default"))) void async_notify_orchestration(const Chi
     params_producer.add_scalar(reinterpret_cast<uint64_t>(comm_ctx));
     pto2_rt_submit_aiv_task(0, params_producer);
 
-    Tensor notify_token = pto2_rt_submit_notification_wait_task(2, notify_counter.buffer.addr, 1);
+    uint32_t notify_token_shape[1] = {1};
+    TensorCreateInfo notify_token_info(notify_token_shape, 1, DataType::INT32);
+    Arg params_notify;
+    params_notify.add_output(notify_token_info);
+    params_notify.add_scalar(notify_counter.buffer.addr);
+    params_notify.add_scalar(static_cast<uint64_t>(1));
+    TaskOutputTensors notify_outputs = pto2_rt_submit_aiv_task_deferred(2, params_notify);
+    Tensor notify_token = notify_outputs.get_ref(0);
 
     Arg params_consumer;
     params_consumer.add_input(notify_token);

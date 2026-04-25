@@ -266,7 +266,10 @@ struct PTO2TaskPayload {
      * @param args                Task arguments (tensors + scalars)
      * @param result  Materialized output tensors (from TensorCreateInfo path)
      */
-    void init(const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout) {
+    void init(
+        const Arg &args, TaskOutputTensors &result, PTO2TaskAllocResult &alloc_result, PTO2OutputLayout &layout,
+        bool complete_in_future_flag
+    ) {
         tensor_count = args.tensor_count();
         scalar_count = args.scalar_count();
 
@@ -288,7 +291,7 @@ struct PTO2TaskPayload {
         // Round up to cache line boundary. Both arrays are 1024B so no overrun.
         // Eliminates branches; extra bytes within the same CL have zero additional cost.
         memcpy(scalars, args.scalars(), PTO2_ALIGN_UP(args.scalar_count() * sizeof(uint64_t), 64));
-        complete_in_future = args.complete_in_future;
+        complete_in_future = complete_in_future_flag;
         deferred_completion_count = 0;
     }
 };

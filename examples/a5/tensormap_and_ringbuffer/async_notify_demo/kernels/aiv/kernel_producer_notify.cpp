@@ -18,10 +18,9 @@
 #define __aicore__ [aicore]
 #endif
 
+#include <pto/pto-inst.hpp>
 #include <pto/comm/comm_types.hpp>
 #include <pto/comm/pto_comm_inst.hpp>
-#include <pto/pto-inst.hpp>
-#include "pto/common/pto_tile.hpp"
 
 #include "platform_comm/comm_context.h"
 #include "tensor.h"

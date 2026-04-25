@@ -150,13 +150,11 @@ struct Arg : TaskArgsTpl<TensorRef, uint64_t, MAX_TENSOR_ARGS, MAX_SCALAR_ARGS, 
     bool has_error{false};
     const char *error_msg{nullptr};
     PTO2LaunchSpec launch_spec;  // SPMD launch parameters (block_num, etc.)
-    bool complete_in_future{false};
 
     void reset() {
         clear();
         has_error = false;
         error_msg = nullptr;
-        complete_in_future = false;
     }
 
     void set_error(const char *msg) {

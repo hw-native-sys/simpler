@@ -170,55 +170,58 @@ struct PTO2AsyncWaitList {
                 const_cast<const void *>(reinterpret_cast<volatile void *>(&completion_ingress->head)),
                 sizeof(completion_ingress->head)
             );
-            uint64_t head = __atomic_load_n(&completion_ingress->head, __ATOMIC_ACQUIRE);
-            if (tail >= head) break;
-            pto2_completion_ingress_invalidate_entries(completion_ingress, tail, head);
+            uint64_t head_snapshot = __atomic_load_n(&completion_ingress->head, __ATOMIC_ACQUIRE);
+            if (tail >= head_snapshot) break;
+            pto2_completion_ingress_invalidate_entries(completion_ingress, tail, head_snapshot);
 
-            volatile PTO2CompletionIngressEntry *slot =
-                &completion_ingress->entries[tail & PTO2_COMPLETION_INGRESS_MASK];
-            uint64_t expected_seq = tail + 1;
-            uint64_t seq = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
-            if (seq != expected_seq) break;
+            while (tail < head_snapshot) {
+                volatile PTO2CompletionIngressEntry *slot =
+                    &completion_ingress->entries[tail & PTO2_COMPLETION_INGRESS_MASK];
+                uint64_t expected_seq = tail + 1;
+                uint64_t seq = __atomic_load_n(&slot->seq, __ATOMIC_ACQUIRE);
+                if (seq != expected_seq) return drained;
 
-            PTO2TaskId token{slot->task_token.raw};
-            uint64_t addr = slot->addr;
-            uint32_t expected_value = slot->expected_value;
-            PTO2AsyncEngine engine = static_cast<PTO2AsyncEngine>(slot->engine);
+                PTO2TaskId token{slot->task_token.raw};
+                uint64_t addr = slot->addr;
+                uint32_t expected_value = slot->expected_value;
+                PTO2AsyncEngine engine = static_cast<PTO2AsyncEngine>(slot->engine);
 
-            slot->seq = 0;
-            completion_ingress->tail = tail + 1;
-            OUT_OF_ORDER_STORE_BARRIER();
-            cache_flush_range(const_cast<const void *>(reinterpret_cast<volatile void *>(slot)), sizeof(*slot));
-            cache_flush_range(
-                const_cast<const void *>(reinterpret_cast<volatile void *>(&completion_ingress->tail)),
-                sizeof(completion_ingress->tail)
-            );
-            drained++;
+                slot->seq = 0;
+                completion_ingress->tail = tail + 1;
+                OUT_OF_ORDER_STORE_BARRIER();
+                cache_flush_range(const_cast<const void *>(reinterpret_cast<volatile void *>(slot)), sizeof(*slot));
+                cache_flush_range(
+                    const_cast<const void *>(reinterpret_cast<volatile void *>(&completion_ingress->tail)),
+                    sizeof(completion_ingress->tail)
+                );
+                drained++;
+                tail++;
 
-            PTO2AsyncWaitEntry *entry = find_entry_by_token(token);
-            if (entry != nullptr) {
-                if (entry->condition_count >= PTO2_MAX_COMPLETIONS_PER_TASK) {
-                    error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
+                PTO2AsyncWaitEntry *entry = find_entry_by_token(token);
+                if (entry != nullptr) {
+                    if (entry->condition_count >= PTO2_MAX_COMPLETIONS_PER_TASK) {
+                        error_code = PTO2_ERROR_ASYNC_REGISTRATION_FAILED;
+                        return drained;
+                    }
+                    PTO2CompletionCondition &cond = entry->conditions[entry->condition_count++];
+                    cond.engine = engine;
+                    cond.satisfied = false;
+                    cond.counter_addr = reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(addr));
+                    cond.expected_value = expected_value;
+                    entry->waiting_completion_count++;
+                    continue;
+                }
+
+                if (pending_completion_count >= PTO2_MAX_PENDING_COMPLETIONS) {
+                    error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
                     return drained;
                 }
-                PTO2CompletionCondition &cond = entry->conditions[entry->condition_count++];
-                cond.engine = engine;
-                cond.satisfied = false;
-                cond.counter_addr = reinterpret_cast<volatile uint32_t *>(static_cast<uintptr_t>(addr));
-                cond.expected_value = expected_value;
-                entry->waiting_completion_count++;
-                continue;
+                PTO2PendingCompletion &pending = pending_completions[pending_completion_count++];
+                pending.task_token = token;
+                pending.addr = addr;
+                pending.expected_value = expected_value;
+                pending.engine = engine;
             }
-
-            if (pending_completion_count >= PTO2_MAX_PENDING_COMPLETIONS) {
-                error_code = PTO2_ERROR_ASYNC_WAIT_OVERFLOW;
-                return drained;
-            }
-            PTO2PendingCompletion &pending = pending_completions[pending_completion_count++];
-            pending.task_token = token;
-            pending.addr = addr;
-            pending.expected_value = expected_value;
-            pending.engine = engine;
         }
         return drained;
     }

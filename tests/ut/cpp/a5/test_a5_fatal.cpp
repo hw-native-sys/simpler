@@ -45,7 +45,7 @@ static_assert(offsetof(FakeRuntime, ops) == 0);  // Guard: reinterpret_cast belo
 
 FakeRuntime *as_fake(PTO2Runtime *rt) { return reinterpret_cast<FakeRuntime *>(rt); }
 
-TaskOutputTensors fake_submit(PTO2Runtime *rt, const MixedKernels &, const Arg &) {
+TaskOutputTensors fake_submit(PTO2Runtime *rt, const MixedKernels &, const Arg &, bool) {
     as_fake(rt)->submit_calls++;
     return TaskOutputTensors{};
 }

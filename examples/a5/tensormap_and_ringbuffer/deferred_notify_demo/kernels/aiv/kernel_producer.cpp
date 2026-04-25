@@ -12,6 +12,8 @@
 #include <cstdint>
 
 #include <pto/pto-inst.hpp>
+#include <pto/comm/comm_types.hpp>
+#include <pto/comm/pto_comm_inst.hpp>
 
 #ifndef __gm__
 #define __gm__
@@ -49,5 +51,6 @@ extern "C" __aicore__ __attribute__((always_inline)) void kernel_entry(__gm__ in
     }
 
     __gm__ int32_t *peer_counter = comm_remote_ptr(ctx, local_counter, peer_rank);
-    __atomic_add_fetch(reinterpret_cast<int32_t *>(peer_counter), 1, __ATOMIC_RELEASE);
+    pto::comm::Signal peer_signal(peer_counter);
+    pto::comm::TNOTIFY(peer_signal, (int32_t)1, pto::comm::NotifyOp::AtomicAdd);
 }

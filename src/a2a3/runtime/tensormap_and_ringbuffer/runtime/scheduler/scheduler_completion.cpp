@@ -28,6 +28,10 @@
 // Dual-slot state machine helpers
 // =============================================================================
 
+namespace {
+inline constexpr int32_t PTO2_DEFERRED_RELEASE_CAP = 256;
+}
+
 // Pure function: read register result -> SlotTransition (no side effects).
 SlotTransition SchedulerContext::decide_slot_transition(
     int32_t reg_task_id, int32_t reg_state, int32_t running_id, int32_t pending_id
@@ -95,6 +99,9 @@ void SchedulerContext::complete_slot_task(
         PTO2AsyncWaitList::RegisterResult reg_result;
         do {
             reg_result = sched_->async_wait_list.register_deferred(slot_state, reg_err);
+            if (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped) {
+                SPIN_WAIT_HINT();
+            }
         } while (reg_result == PTO2AsyncWaitList::RegisterResult::Skipped);
 
         if (reg_result == PTO2AsyncWaitList::RegisterResult::Error) {
@@ -122,7 +129,7 @@ void SchedulerContext::complete_slot_task(
         l2_perf.phase_complete_count++;
 #endif
 #endif
-        if (deferred_release_count < 256) {
+        if (deferred_release_count < PTO2_DEFERRED_RELEASE_CAP) {
             deferred_release_slot_states[deferred_release_count++] = &slot_state;
         } else {
             DEV_ALWAYS("Thread %d: release", thread_idx);

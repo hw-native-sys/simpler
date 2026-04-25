@@ -115,7 +115,9 @@ void pto2_framework_bind_runtime(PTO2Runtime *rt);
  * Populated by the runtime; called by orchestration through inline wrappers.
  */
 typedef struct PTO2RuntimeOps {
-    TaskOutputTensors (*submit_task)(PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args);
+    TaskOutputTensors (*submit_task)(
+        PTO2Runtime *rt, const MixedKernels &mixed_kernels, const Arg &args, bool complete_in_future
+    );
     void (*scope_begin)(PTO2Runtime *rt);
     void (*scope_end)(PTO2Runtime *rt);
     void (*orchestration_done)(PTO2Runtime *rt);
@@ -205,55 +207,41 @@ static inline TaskOutputTensors alloc_tensors(const CIs &...cis) {
     return alloc_tensors(args);
 }
 
-static inline TaskOutputTensors pto2_rt_submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
+static inline TaskOutputTensors
+pto2_rt_submit_task_impl(const MixedKernels &mixed_kernels, const Arg &args, bool complete_in_future) {
     PTO2Runtime *rt = pto2_current_runtime();
     if (rt->ops->is_fatal(rt)) {
         return TaskOutputTensors{};
     }
-    return rt->ops->submit_task(rt, mixed_kernels, args);
+    return rt->ops->submit_task(rt, mixed_kernels, args, complete_in_future);
+}
+
+static inline TaskOutputTensors pto2_rt_submit_task(const MixedKernels &mixed_kernels, const Arg &args) {
+    return pto2_rt_submit_task_impl(mixed_kernels, args, false);
 }
 
 /**
  * Convenience wrapper: submit an AIC-only task.
  */
 static inline TaskOutputTensors pto2_rt_submit_aic_task(int32_t kernel_id, const Arg &args) {
-    PTO2Runtime *rt = pto2_current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return TaskOutputTensors{};
-    }
     MixedKernels mk;
     mk.aic_kernel_id = kernel_id;
-    return rt->ops->submit_task(rt, mk, args);
+    return pto2_rt_submit_task_impl(mk, args, false);
 }
 
 /**
  * Convenience wrapper: submit an AIV-only task (uses AIV0 slot).
  */
 static inline TaskOutputTensors pto2_rt_submit_aiv_task(int32_t kernel_id, const Arg &args) {
-    PTO2Runtime *rt = pto2_current_runtime();
-    if (rt->ops->is_fatal(rt)) {
-        return TaskOutputTensors{};
-    }
     MixedKernels mk;
     mk.aiv0_kernel_id = kernel_id;
-    return rt->ops->submit_task(rt, mk, args);
+    return pto2_rt_submit_task_impl(mk, args, false);
 }
 
-static inline TaskOutputTensors pto2_rt_submit_aiv_task_deferred(int32_t kernel_id, Arg &args) {
-    args.complete_in_future = true;
-    return pto2_rt_submit_aiv_task(kernel_id, args);
-}
-
-static inline Tensor
-pto2_rt_submit_notification_wait_task(int32_t kernel_id, uint64_t local_counter_addr, uint32_t expected_value) {
-    uint32_t shape[1] = {1};
-    TensorCreateInfo token_info(shape, 1, DataType::INT32);
-    Arg params;
-    params.add_output(token_info);
-    params.add_scalar(local_counter_addr);
-    params.add_scalar(static_cast<uint64_t>(expected_value));
-    TaskOutputTensors outputs = pto2_rt_submit_aiv_task_deferred(kernel_id, params);
-    return outputs.get_ref(0);
+static inline TaskOutputTensors pto2_rt_submit_aiv_task_deferred(int32_t kernel_id, const Arg &args) {
+    MixedKernels mk;
+    mk.aiv0_kernel_id = kernel_id;
+    return pto2_rt_submit_task_impl(mk, args, true);
 }
 
 static inline void pto2_rt_scope_begin() {
