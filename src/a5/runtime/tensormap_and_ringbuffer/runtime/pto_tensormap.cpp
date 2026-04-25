@@ -129,7 +129,10 @@ bool PTO2TensorMap::init(
     for (int r = 0; r < PTO2_MAX_RING_DEPTH; r++) {
         last_task_alives[r] = 0;
         last_cleanup[r] = 0;
+        active_iter_start[r] = -1;
     }
+    iter_stack_top = -1;
+    active_filter_mask = 0;
 
     return true;
 }

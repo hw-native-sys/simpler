@@ -198,6 +198,68 @@ struct PTO2TensorMap {
     // Per-ring validity threshold (for lazy invalidation)
     int32_t last_task_alives[PTO2_MAX_RING_DEPTH];  // Cached from shared memory per ring
 
+    // Per-ring active iteration threshold (lookup hot-path cache).
+    //   active_iter_start[r] >= 0  : entries on ring r with local_id < this are filtered.
+    //   active_iter_start[r] == -1 : no active filter on ring r.
+    // active_filter_mask bit r mirrors (active_iter_start[r] >= 0) for a single branch test.
+    int32_t active_iter_start[PTO2_MAX_RING_DEPTH]{};
+    uint32_t active_filter_mask{0};
+
+    // Parallel for iteration isolation stack.
+    // Each PTO2_PARALLEL_FOR pushes a frame; each iteration updates the frame's
+    // iter_start. Lookup filters entries whose local_id < iter_start on the
+    // matching ring. Nesting beyond PTO2_MAX_PARALLEL_DEPTH degrades gracefully
+    // (no filtering for the overflow level, full dependency visibility).
+    //
+    // The stack itself is the source of truth for nesting/pop semantics; lookup,
+    // however, consumes a denormalized per-ring cache (active_iter_start +
+    // active_filter_mask) so the hot path is O(1) regardless of stack depth.
+    // For same-ring nesting, the inner frame's threshold dominates (it is always
+    // >= the outer's since next_local_id() is monotonic), so the cache simply
+    // tracks the innermost frame per ring; on pop we restore the saved outer.
+    struct PTO2IterFrame {
+        int32_t iter_start_local_id;    // -1 = before first iter; >= 0 = boundary
+        int32_t saved_prev_iter_start;  // value of active_iter_start[ring_id] before this frame
+        uint8_t ring_id;                // ring this parallel for operates on
+    };
+    PTO2IterFrame iter_stack[PTO2_MAX_PARALLEL_DEPTH];
+    int32_t iter_stack_top{-1};  // -1 = no active parallel for
+
+    // =============================================================================
+    // Iter-stack helpers (maintain frames + per-ring cache atomically)
+    // =============================================================================
+
+    // Push a frame on parallel_for_begin. New frame has no active threshold yet
+    // (iter_start_local_id == -1); active_iter_start[ring] is unchanged. The
+    // previous value is saved in the frame so pop can restore it.
+    void push_iter_frame(uint8_t ring_id) {
+        int32_t top = ++iter_stack_top;
+        if (top >= PTO2_MAX_PARALLEL_DEPTH) return;  // overflow: see class comment
+        iter_stack[top] = {-1, active_iter_start[ring_id], ring_id};
+    }
+
+    // Update the top frame's iter_start on parallel_iter_begin.
+    void set_iter_start(int32_t iter_start_local_id) {
+        int32_t top = iter_stack_top;
+        if (top < 0 || top >= PTO2_MAX_PARALLEL_DEPTH) return;
+        uint8_t ring_id = iter_stack[top].ring_id;
+        iter_stack[top].iter_start_local_id = iter_start_local_id;
+        active_iter_start[ring_id] = iter_start_local_id;
+        active_filter_mask |= (1u << ring_id);
+    }
+
+    // Pop a frame on parallel_for_end, restoring the outer threshold.
+    void pop_iter_frame() {
+        int32_t top = iter_stack_top--;
+        if (top < 0 || top >= PTO2_MAX_PARALLEL_DEPTH) return;
+        const PTO2IterFrame &frame = iter_stack[top];
+        uint8_t ring_id = frame.ring_id;
+        active_iter_start[ring_id] = frame.saved_prev_iter_start;
+        if (frame.saved_prev_iter_start < 0) {
+            active_filter_mask &= ~(1u << ring_id);
+        }
+    }
+
     // Per-ring cleanup progress (for periodic cleanup_retired)
     int32_t last_cleanup[PTO2_MAX_RING_DEPTH]{};
 
@@ -307,9 +369,9 @@ struct PTO2TensorMap {
 #if PTO2_TENSORMAP_PROFILING
             chain_len++;
 #endif
-            // Skip stale entries (no chain truncation — entries from different
-            // rings can be interleaved, so a stale entry from one ring does NOT
-            // imply subsequent entries from other rings are also stale)
+            // Skip entries that are either stale (producer retired) or from prior
+            // iterations of the current parallel-for. Both checks are unified in
+            // entry_valid() to avoid extracting ring/local twice.
             if (!entry_valid(*cur_entry)) {
                 cur_entry = next_entry;
                 continue;
@@ -443,10 +505,16 @@ struct PTO2TensorMap {
     }
 
     /**
-     * Check if entry is valid (producer has not retired)
+     * Check if entry is visible in the current execution context:
+     * 1. Producer has not retired (not stale).
+     * 2. Not from a prior iteration of the active parallel-for on the same ring.
      */
     bool entry_valid(const PTO2TensorMapEntry &entry) const {
-        return static_cast<int32_t>(entry.producer_task_id.local()) >= last_task_alives[entry.producer_task_id.ring()];
+        uint8_t ring = entry.producer_task_id.ring();
+        int32_t local = static_cast<int32_t>(entry.producer_task_id.local());
+        if (local < last_task_alives[ring]) return false;
+        if (active_filter_mask && ((active_filter_mask >> ring) & 1u) && local < active_iter_start[ring]) return false;
+        return true;
     }
 
     void remove_entry(PTO2TensorMapEntry &entry) {

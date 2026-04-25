@@ -487,6 +487,30 @@ void pto2_scope_end(PTO2OrchestratorState *orch) {
 }
 
 // =============================================================================
+// Parallel For Iteration Isolation
+// =============================================================================
+
+void pto2_parallel_for_begin(PTO2OrchestratorState *orch) {
+    if (orch->fatal) return;
+    orch->tensor_map.push_iter_frame(orch->current_ring_id());
+}
+
+void pto2_parallel_iter_begin(PTO2OrchestratorState *orch) {
+    if (orch->fatal) return;
+    auto &tm = orch->tensor_map;
+    // If stack overflowed, skip filtering — run as a plain for loop.
+    if (tm.iter_stack_top < 0 || tm.iter_stack_top >= PTO2_MAX_PARALLEL_DEPTH) return;
+    uint8_t ring_id = orch->current_ring_id();
+    int32_t next_id = orch->rings[ring_id].task_allocator.next_local_id();
+    tm.set_iter_start(next_id);
+}
+
+void pto2_parallel_for_end(PTO2OrchestratorState *orch) {
+    if (orch->fatal) return;
+    orch->tensor_map.pop_iter_frame();
+}
+
+// =============================================================================
 // Task Submission
 // =============================================================================
 TaskOutputTensors

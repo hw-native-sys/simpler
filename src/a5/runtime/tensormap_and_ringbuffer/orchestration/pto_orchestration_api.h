@@ -136,6 +136,11 @@ typedef struct PTO2RuntimeOps {
         PTO2Runtime *rt, const Tensor &tensor, uint32_t ndims, const uint32_t indices[], uint64_t value
     );
     TaskOutputTensors (*alloc_tensors)(PTO2Runtime *rt, const Arg &args);
+
+    // Parallel for iteration isolation
+    void (*parallel_for_begin)(PTO2Runtime *rt);
+    void (*parallel_iter_begin)(PTO2Runtime *rt);
+    void (*parallel_for_end)(PTO2Runtime *rt);
 } PTO2RuntimeOps;
 
 /**
@@ -253,6 +258,21 @@ static inline void pto2_rt_scope_end() {
         return;
     }
     rt->ops->scope_end(rt);
+}
+
+static inline void pto2_rt_parallel_for_begin() {
+    PTO2Runtime *rt = pto2_current_runtime();
+    rt->ops->parallel_for_begin(rt);
+}
+
+static inline void pto2_rt_parallel_iter_begin() {
+    PTO2Runtime *rt = pto2_current_runtime();
+    rt->ops->parallel_iter_begin(rt);
+}
+
+static inline void pto2_rt_parallel_for_end() {
+    PTO2Runtime *rt = pto2_current_runtime();
+    rt->ops->parallel_for_end(rt);
 }
 
 static inline void pto2_rt_orchestration_done() {
@@ -380,6 +400,41 @@ private:
  *   }
  */
 #define PTO2_SCOPE() if (PTO2_SCOPE_GUARD(); true)
+
+/**
+ * Combined RAII guard + loop controller for PTO2_PARALLEL_FOR.
+ * Construction calls parallel_for_begin; destruction calls parallel_for_end.
+ * next() drives per-iteration parallel_iter_begin bookkeeping.
+ */
+class PTO2ParallelForLoop {
+public:  // NOLINT(whitespace/indent)
+    explicit PTO2ParallelForLoop(int count) :
+        rt_(pto2_current_runtime()),
+        count_(count) {
+        rt_->ops->parallel_for_begin(rt_);
+    }
+    ~PTO2ParallelForLoop() { rt_->ops->parallel_for_end(rt_); }
+    bool next(int var) {
+        if (var >= count_) return false;
+        rt_->ops->parallel_iter_begin(rt_);
+        return true;
+    }
+
+private:  // NOLINT(whitespace/indent)
+    PTO2Runtime *rt_;
+    int count_;
+};
+
+/**
+ * Parallel for loop with automatic iteration isolation:
+ *   PTO2_PARALLEL_FOR(i, N) {
+ *       submit_iter_tasks(i);
+ *   }
+ * Body is a genuine for-loop body; break/continue work naturally.
+ */
+#define PTO2_PARALLEL_FOR(var, count)                \
+    if (PTO2ParallelForLoop _pfl_##var(count); true) \
+        for (int var = 0; _pfl_##var.next(var); ++var)
 
 // =============================================================================
 // Orchestration Config

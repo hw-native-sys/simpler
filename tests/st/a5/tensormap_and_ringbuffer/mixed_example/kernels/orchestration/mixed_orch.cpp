@@ -74,7 +74,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
 
     LOG_INFO("[mixed_orch] num_iters=%d", num_iters);
 
-    for (int i = 0; i < num_iters; i++) {
+    PTO2_PARALLEL_FOR(i, num_iters) {
         PTO2_SCOPE() {
             uint32_t view_shapes[1] = {TILE_ELEMS};
             uint32_t view_offsets[1] = {static_cast<uint32_t>(i) * TILE_ELEMS};

@@ -198,6 +198,68 @@ struct PTO2TensorMap {
     // Per-ring validity threshold (for lazy invalidation)
     int32_t last_task_alives[PTO2_MAX_RING_DEPTH];  // Cached from shared memory per ring
 
+    // Parallel for iteration isolation stack.
+    // Each PTO2_PARALLEL_FOR pushes a frame; each iteration updates the frame's
+    // iter_start. Lookup filters entries whose local_id < iter_start on the
+    // matching ring. Nesting beyond PTO2_MAX_PARALLEL_DEPTH degrades gracefully
+    // (no filtering for the overflow level, full dependency visibility).
+    //
+    // The stack itself is the source of truth for nesting/pop semantics; lookup,
+    // however, consumes a denormalized per-ring cache (active_iter_start +
+    // active_filter_mask) so the hot path is O(1) regardless of stack depth.
+    // For same-ring nesting, the inner frame's threshold dominates (it is always
+    // >= the outer's since next_local_id() is monotonic), so the cache simply
+    // tracks the innermost frame per ring; on pop we restore the saved outer.
+    struct PTO2IterFrame {
+        int32_t iter_start_local_id;    // -1 = before first iter; >= 0 = boundary
+        int32_t saved_prev_iter_start;  // value of active_iter_start[ring_id] before this frame
+        uint8_t ring_id;                // ring this parallel for operates on
+    };
+    PTO2IterFrame iter_stack[PTO2_MAX_PARALLEL_DEPTH];
+    int32_t iter_stack_top{-1};  // -1 = no active parallel for
+
+    // Per-ring active iteration threshold (lookup hot-path cache).
+    //   active_iter_start[r] >= 0  : entries on ring r with local_id < this are filtered.
+    //   active_iter_start[r] == -1 : no active filter on ring r.
+    // active_filter_mask bit r mirrors (active_iter_start[r] >= 0) for a single branch test.
+    int32_t active_iter_start[PTO2_MAX_RING_DEPTH]{};
+    uint32_t active_filter_mask{0};
+
+    // =============================================================================
+    // Iter-stack helpers (maintain frames + per-ring cache atomically)
+    // =============================================================================
+
+    // Push a frame on parallel_for_begin. New frame has no active threshold yet
+    // (iter_start_local_id == -1); active_iter_start[ring] is unchanged. The
+    // previous value is saved in the frame so pop can restore it.
+    void push_iter_frame(uint8_t ring_id) {
+        int32_t top = ++iter_stack_top;
+        if (top >= PTO2_MAX_PARALLEL_DEPTH) return;  // overflow: see class comment
+        iter_stack[top] = {-1, active_iter_start[ring_id], ring_id};
+    }
+
+    // Update the top frame's iter_start on parallel_iter_begin.
+    void set_iter_start(int32_t iter_start_local_id) {
+        int32_t top = iter_stack_top;
+        if (top < 0 || top >= PTO2_MAX_PARALLEL_DEPTH) return;
+        uint8_t ring_id = iter_stack[top].ring_id;
+        iter_stack[top].iter_start_local_id = iter_start_local_id;
+        active_iter_start[ring_id] = iter_start_local_id;
+        active_filter_mask |= (1u << ring_id);
+    }
+
+    // Pop a frame on parallel_for_end, restoring the outer threshold.
+    void pop_iter_frame() {
+        int32_t top = iter_stack_top--;
+        if (top < 0 || top >= PTO2_MAX_PARALLEL_DEPTH) return;
+        const PTO2IterFrame &frame = iter_stack[top];
+        uint8_t ring_id = frame.ring_id;
+        active_iter_start[ring_id] = frame.saved_prev_iter_start;
+        if (frame.saved_prev_iter_start < 0) {
+            active_filter_mask &= ~(1u << ring_id);
+        }
+    }
+
     // Per-ring cleanup progress (for periodic cleanup_retired)
     int32_t last_cleanup[PTO2_MAX_RING_DEPTH]{};
 
@@ -313,6 +375,23 @@ struct PTO2TensorMap {
             if (!entry_valid(*cur_entry)) {
                 cur_entry = next_entry;
                 continue;
+            }
+
+            // Parallel for iteration isolation: skip entries from prior iterations.
+            // Fast path: active_filter_mask == 0 (no parallel_for is currently
+            // inside an iteration) collapses to a single branch. Otherwise a
+            // single per-ring compare replaces the full iter_stack scan; the
+            // stack's "innermost frame wins per ring" semantics are denormalized
+            // into active_iter_start[] on push/set/pop.
+            if (active_filter_mask) {
+                uint8_t entry_ring = cur_entry->producer_task_id.ring();
+                if ((active_filter_mask >> entry_ring) & 1u) {
+                    int32_t entry_local = static_cast<int32_t>(cur_entry->producer_task_id.local());
+                    if (entry_local < active_iter_start[entry_ring]) {
+                        cur_entry = next_entry;
+                        continue;
+                    }
+                }
             }
 
             // Entry is valid - check if regions OVERLAP (not just exact match)

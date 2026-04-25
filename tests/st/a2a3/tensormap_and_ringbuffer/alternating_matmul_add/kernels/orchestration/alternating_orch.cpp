@@ -79,7 +79,7 @@ __attribute__((visibility("default"))) void aicpu_orchestration_entry(const Chip
     int max_groups = num_matmul_groups > num_add_groups ? num_matmul_groups : num_add_groups;
 
     // Interleaved submit: matmul and add groups alternate
-    for (int group_idx = 0; group_idx < max_groups; group_idx++) {
+    PTO2_PARALLEL_FOR(group_idx, max_groups) {
         if (group_idx < num_matmul_groups) {
             int start_task_idx = group_idx * matmul_batch;
             uint64_t offset = static_cast<uint64_t>(start_task_idx) * MATMUL_ELEMS;

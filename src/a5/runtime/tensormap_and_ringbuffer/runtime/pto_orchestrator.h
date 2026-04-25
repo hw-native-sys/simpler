@@ -169,6 +169,29 @@ void pto2_scope_begin(PTO2OrchestratorState *orch);
 void pto2_scope_end(PTO2OrchestratorState *orch);
 
 // =============================================================================
+// Parallel For Iteration Isolation
+// =============================================================================
+
+/**
+ * Begin a parallel for region.
+ * Pushes an iteration frame onto the iter_stack.
+ */
+void pto2_parallel_for_begin(PTO2OrchestratorState *orch);
+
+/**
+ * Begin a parallel for iteration.
+ * Records the current ring's next local_id as the iteration boundary.
+ * Does NOT create a scope — scope management is fully explicit.
+ */
+void pto2_parallel_iter_begin(PTO2OrchestratorState *orch);
+
+/**
+ * End a parallel for region.
+ * Pops the iteration frame from the iter_stack.
+ */
+void pto2_parallel_for_end(PTO2OrchestratorState *orch);
+
+// =============================================================================
 // Task Submission
 // =============================================================================
 
